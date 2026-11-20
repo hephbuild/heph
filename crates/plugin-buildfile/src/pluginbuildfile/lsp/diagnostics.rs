@@ -436,7 +436,6 @@ mod tests {
                 self.root().to_path_buf(),
                 self.function_registry(),
                 what,
-                0,
             )
         }
     }

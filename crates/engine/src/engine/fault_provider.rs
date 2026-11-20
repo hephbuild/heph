@@ -96,6 +96,10 @@ pub struct Faults {
     /// `scope_ended` records the call, then takes a permit from this before it
     /// answers: a hook the test holds open.
     pub scope_ended_gate: Option<Arc<tokio::sync::Semaphore>>,
+    /// `scope_ended` answers `Released` instead of forwarding to the wrapped
+    /// static provider (whose default is `Unsupported`): a provider with
+    /// scoped caches.
+    pub release_scope: bool,
 }
 
 /// The cache scopes a [`FaultProvider`] was called in and told about,
@@ -513,6 +517,9 @@ impl Provider for FaultProvider {
             }
             if self.faults.fail_scope_ended {
                 anyhow::bail!("dropping the caches of scope {}: disk on fire", ended.scope);
+            }
+            if self.faults.release_scope {
+                return Ok(ScopeEndedAck::Released);
             }
             self.inner.scope_ended(ended).await
         })

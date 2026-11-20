@@ -233,15 +233,18 @@ the classification:
   kept;
 - one `candidate: "<name>" from <provider>` per entry kept;
 - one `skipped:` line per thing the listing left out (`<stage> <provider>
-  <scope>: <cause>`);
+  <scope>: <cause>`), at most five per stage and provider, then `<stage>
+  <provider> …and N more` for the rest;
 - one `scope ended: <provider> <outcome>` per provider told the scope ended,
   awaited: `released` (it dropped the scope's caches), `unsupported` (it keeps
   none, or predates scopes), `failed`, `panicked` or `timed_out`.
 
 When the engine cannot be built, or the listing fails, a `listing failed:`
 line says why. `--json` puts the same under a `listing` key: `query`,
-`prefix`, `scope`, `listed`, `candidates` (`name`, `provider`), `skipped`,
-`scope_ended` (`provider`, `outcome`), or `error`.
+`prefix`, `scope`, `listed`, `candidates` (`name`, `provider`), `skipped`
+(`stage`, `provider`, `count`, `examples` of `scope` and `cause`: the groups
+`heph query` reports for what it skipped), `scope_ended` (`provider`, `outcome`), or
+`error`.
 
 ```console
 $ heph tool build-lsp --explain a/BUILD:1:64

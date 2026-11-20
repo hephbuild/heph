@@ -161,8 +161,15 @@ impl HephLspContext {
         let _rt = self.runtime.enter();
         match futures::executor::block_on(fut) {
             Ok(listed) => {
-                for skipped in &listed.skipped {
-                    tracing::debug!(scope = listed.scope, skipped, "lsp: listing left out");
+                for gap in &listed.skipped {
+                    tracing::debug!(
+                        scope = listed.scope.get(),
+                        stage = gap.stage,
+                        provider = gap.provider,
+                        count = gap.count,
+                        examples = ?gap.examples,
+                        "lsp: listing left out"
+                    );
                 }
                 Some(listed)
             }
@@ -226,13 +233,12 @@ pub(crate) fn packages_under(prefix: &str) -> Listing {
 /// A test engine's [`LspEngine::list`]: a fresh buildfile provider over
 /// `root` per call, which is what a fresh cache scope gives the real one.
 /// Every entry is attributed to `buildfile`; no provider is told the scope
-/// ended.
+/// ended. The scope is a real, distinct id that no provider ever sees.
 #[cfg(any(test, feature = "test-support"))]
 pub fn list_with_fresh_buildfile_provider(
     root: PathBuf,
     registry: Arc<FunctionRegistry>,
     what: Listing,
-    scope: u64,
 ) -> futures::future::BoxFuture<'static, anyhow::Result<Listed>> {
     use hcore::hasync::StdCancellationToken;
     use hmodel::htpkg::PkgBuf;
@@ -279,7 +285,7 @@ pub fn list_with_fresh_buildfile_provider(
         names.sort_unstable();
         names.dedup();
         Ok(Listed {
-            scope,
+            scope: hplugin::scope::CacheScope::mint(|_, _| {}).id(),
             entries: names
                 .into_iter()
                 .map(|name| hplugin::lsp::ListedEntry {
@@ -574,7 +580,6 @@ mod tests {
                 self.root.clone(),
                 self.function_registry(),
                 what,
-                0,
             )
         }
     }

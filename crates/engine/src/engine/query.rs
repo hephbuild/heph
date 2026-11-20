@@ -599,25 +599,39 @@ impl Engine {
         rs: &Arc<RequestState>,
         gaps: &Gaps,
     ) -> anyhow::Result<(Vec<String>, bool)> {
-        let mut listed = Vec::with_capacity(self.providers.len());
-        let mut skipped = false;
+        let listed = self.provider_packages_keep_going(m, rs, gaps).await?;
+        let skipped = listed.len() < self.providers.len();
+        let blocks: Vec<_> = listed.into_iter().map(|(_, block)| block).collect();
+        Ok((merge_packages(m, &blocks), skipped))
+    }
+
+    /// [`packages_keep_going`](Self::packages_keep_going) before the merge:
+    /// each provider whose listing succeeded, in registration order, as its
+    /// index in `self.providers` and its sorted block (see
+    /// [`provider_packages`](Self::provider_packages)). Each failed listing is
+    /// recorded in `gaps` and left out; a cancellation ends the walk with its
+    /// error.
+    pub(crate) async fn provider_packages_keep_going(
+        &self,
+        m: &htmatcher::Matcher,
+        rs: &Arc<RequestState>,
+        gaps: &Gaps,
+    ) -> anyhow::Result<Vec<(usize, Arc<Vec<String>>)>> {
         let lists = self.provider_packages(m, rs).await;
-        for (provider, res) in self.providers.iter().zip(lists) {
+        let mut listed = Vec::with_capacity(lists.len());
+        for (i, (provider, res)) in self.providers.iter().zip(lists).enumerate() {
             match res {
-                Ok(pkgs) => listed.push(pkgs),
+                Ok(pkgs) => listed.push((i, pkgs)),
                 Err(e) if is_cancellation(rs, &e) => return Err(e),
-                Err(e) => {
-                    skipped = true;
-                    gaps.record(
-                        Stage::Packages,
-                        &provider.name,
-                        "all packages".to_string(),
-                        &e,
-                    );
-                }
+                Err(e) => gaps.record(
+                    Stage::Packages,
+                    &provider.name,
+                    "all packages".to_string(),
+                    &e,
+                ),
             }
         }
-        Ok((merge_packages(m, &listed), skipped))
+        Ok(listed)
     }
 
     /// [`Engine::query`] one tier up: the **spec** of every target matching `m`,

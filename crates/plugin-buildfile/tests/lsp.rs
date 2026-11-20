@@ -209,7 +209,6 @@ impl LspEngine for FakeEngine {
             self.root.clone(),
             Arc::clone(&self.registry),
             what,
-            0,
         )
     }
 }

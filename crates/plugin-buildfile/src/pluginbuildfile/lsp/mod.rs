@@ -266,7 +266,7 @@ impl ExplainedListing {
             } => serde_json::json!({
                 "query": listing_json(what),
                 "prefix": prefix,
-                "scope": listed_out.scope,
+                "scope": listed_out.scope.get(),
                 "listed": listed,
                 "candidates": listed_out
                     .entries
@@ -276,7 +276,9 @@ impl ExplainedListing {
                 "skipped": listed_out.skipped,
                 "scope_ended": acks
                     .iter()
-                    .map(|a| serde_json::json!({ "provider": a.provider, "outcome": a.outcome }))
+                    .map(|a| {
+                        serde_json::json!({ "provider": a.provider, "outcome": a.outcome.as_str() })
+                    })
                     .collect::<Vec<_>>(),
             }),
         }
@@ -306,8 +308,20 @@ impl ExplainedListing {
                 for e in &listed_out.entries {
                     out.push_str(&format!("\n  candidate: {:?} from {}", e.name, e.provider));
                 }
-                for s in &listed_out.skipped {
-                    out.push_str(&format!("\n  skipped: {s}"));
+                for g in &listed_out.skipped {
+                    for e in &g.examples {
+                        out.push_str(&format!(
+                            "\n  skipped: {} {} {}: {}",
+                            g.stage, g.provider, e.scope, e.cause
+                        ));
+                    }
+                    let more = g.count.saturating_sub(g.examples.len());
+                    if more > 0 {
+                        out.push_str(&format!(
+                            "\n  skipped: {} {} …and {more} more",
+                            g.stage, g.provider
+                        ));
+                    }
                 }
                 if acks.is_empty() {
                     out.push_str("\n  scope ended: no provider was told");

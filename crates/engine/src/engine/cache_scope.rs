@@ -20,24 +20,37 @@ use crate::engine::Engine;
 use crate::engine::engine::Provider;
 use crate::engine::sandbox_cleaner::PendingCounter;
 use futures::FutureExt;
-use hplugin::lsp::ScopeEndAck;
+use hplugin::lsp::{ScopeEndAck, ScopeEndOutcome};
 use hplugin::scope::{CacheScope, ScopeEnded, ScopeEndedAck};
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+/// Who waits on one scope's end, and what it is sent: each provider's answer,
+/// in registration order, or an empty list when no provider was told.
+///
+/// Attached when the scope is minted (`Engine::new_watched_state`) and owned
+/// by the scope's end hook, so it can neither outlive its scope nor be
+/// registered for one that already ended. A sender dropped unanswered (the
+/// engine went first, or the runtime was shut down) reads as the empty list.
+pub(crate) type ScopeEndWatcher = tokio::sync::oneshot::Sender<Vec<ScopeEndAck>>;
+
 impl Engine {
     /// A new cache scope for a root request whose background work is counted
-    /// on `bg_pending`.
+    /// on `bg_pending`; `watcher`, when given, is answered once it ends.
     ///
     /// Captures the engine weakly (a request state must not keep its engine
     /// alive) and the counter strongly (the drain must see the hook).
-    pub(crate) fn mint_cache_scope(self: &Arc<Self>, bg_pending: &PendingCounter) -> CacheScope {
+    pub(crate) fn mint_cache_scope(
+        self: &Arc<Self>,
+        bg_pending: &PendingCounter,
+        watcher: Option<ScopeEndWatcher>,
+    ) -> CacheScope {
         let engine = Arc::downgrade(self);
         let bg_pending = Arc::clone(bg_pending);
         let scope = CacheScope::mint(move |ended, touched| {
-            end_scope(&engine, &bg_pending, ended, touched);
+            end_scope(&engine, &bg_pending, ended, touched, watcher);
         });
         tracing::debug!(scope = scope.id().get(), "cache scope started");
         scope
@@ -46,85 +59,69 @@ impl Engine {
 
 /// A scope's last holder dropped. Runs synchronously inside that `Drop`, so it
 /// never calls a provider itself: it spawns the calls and returns.
-fn end_scope(engine: &Weak<Engine>, bg_pending: &PendingCounter, ended: ScopeEnded, touched: bool) {
+fn end_scope(
+    engine: &Weak<Engine>,
+    bg_pending: &PendingCounter,
+    ended: ScopeEnded,
+    touched: bool,
+    watcher: Option<ScopeEndWatcher>,
+) {
     let scope = ended.scope.get();
-    let Some(engine) = engine.upgrade() else {
-        tracing::debug!(
-            scope,
-            "cache scope ended after its engine; no provider told"
-        );
-        return;
-    };
-    // Taken on every way out, so a watcher never outlives its scope: dropped
-    // unanswered, it reads as "no provider told".
-    let watcher = engine.take_scope_end_watcher(scope);
     // No request was ever built with the scope: no provider can hold anything
     // for it. Its id already left the live set, so the watermark the next
     // touched scope sends covers it.
     if !touched {
         tracing::trace!(scope, "cache scope ended untouched; no provider told");
+        answer(watcher, Vec::new());
         return;
     }
+    let Some(engine) = engine.upgrade() else {
+        tracing::debug!(
+            scope,
+            "cache scope ended after its engine; no provider told"
+        );
+        answer(watcher, Vec::new());
+        return;
+    };
     // The provider list, not the engine: the spawned task must not keep the
     // engine alive.
     let providers = engine.providers.clone();
     let runtime = engine.runtime.clone();
     drop(engine);
     if providers.is_empty() {
+        answer(watcher, Vec::new());
         return;
     }
     let slot = PendingSlot::take(bg_pending);
     // A runtime that is already shut down drops the task unpolled; the slot
-    // drops with it, so the counter cannot stay up.
+    // and the watcher drop with it, so the counter cannot stay up and the
+    // watcher reads "no provider told".
     drop(runtime.spawn(async move {
         let _slot = slot;
-        let acks = send_scope_ended(&providers, ended).await;
+        let outcomes = send_scope_ended(&providers, ended).await;
+        // Names are copied only for a watcher: this runs at the end of every
+        // root request, and almost none has one.
         if let Some(watcher) = watcher {
-            // The watcher may have stopped listening; nothing to do then.
-            drop(watcher.send(acks));
+            let acks = providers
+                .iter()
+                .zip(outcomes)
+                .map(|(provider, outcome)| ScopeEndAck {
+                    provider: provider.name.clone(),
+                    outcome,
+                })
+                .collect();
+            answer(Some(watcher), acks);
         }
     }));
 }
 
-impl Engine {
-    /// Resolves once cache scope `scope` ended and every provider answered
-    /// `scope_ended`, to what each answered; empty if no provider was told
-    /// (the scope was never used, or the engine went first). For "which
-    /// providers dropped their caches?" (`heph tool build-lsp --explain`).
-    ///
-    /// Register while the scope is live: one that already ended is never
-    /// answered, and resolves empty only when the engine drops.
-    pub(crate) fn watch_scope_end(
-        &self,
-        scope: u64,
-    ) -> futures::future::BoxFuture<'static, Vec<ScopeEndAck>> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.scope_end_watchers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(scope, tx);
-        Box::pin(async move { rx.await.unwrap_or_default() })
-    }
-
-    fn take_scope_end_watcher(
-        &self,
-        scope: u64,
-    ) -> Option<tokio::sync::oneshot::Sender<Vec<ScopeEndAck>>> {
-        let mut watchers = self
-            .scope_end_watchers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if watchers.is_empty() {
-            return None;
-        }
-        watchers.remove(&scope)
+/// Send `acks` to `watcher`, if there is one. It may have stopped listening;
+/// nothing to do then.
+fn answer(watcher: Option<ScopeEndWatcher>, acks: Vec<ScopeEndAck>) {
+    if let Some(watcher) = watcher {
+        drop(watcher.send(acks));
     }
 }
-
-/// Engine-side registry behind [`Engine::watch_scope_end`].
-pub(crate) type ScopeEndWatchers = std::sync::Mutex<
-    std::collections::HashMap<u64, tokio::sync::oneshot::Sender<Vec<ScopeEndAck>>>,
->;
 
 /// How long one provider's `scope_ended` may take before the hook gives up on
 /// it. The hook is counted on the request's background counter, which process
@@ -134,22 +131,20 @@ const SCOPE_ENDED_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Tell every provider that `ended` ended, concurrently. One provider erroring,
 /// panicking or overrunning [`SCOPE_ENDED_TIMEOUT`] is logged and does not stop
-/// the others. Returns each provider's answer, in registration order.
-async fn send_scope_ended(providers: &[Arc<Provider>], ended: ScopeEnded) -> Vec<ScopeEndAck> {
+/// the others. Returns each provider's outcome, in registration order.
+async fn send_scope_ended(providers: &[Arc<Provider>], ended: ScopeEnded) -> Vec<ScopeEndOutcome> {
     let scope = ended.scope.get();
-    futures::future::join_all(providers.iter().map(|provider| async move {
-        let outcome = end_one(provider, ended, scope).await;
-        ScopeEndAck {
-            provider: provider.name.clone(),
-            outcome,
-        }
-    }))
+    futures::future::join_all(
+        providers
+            .iter()
+            .map(|provider| end_one(provider, ended, scope)),
+    )
     .await
 }
 
 /// [`send_scope_ended`] for one provider: the call, its log line, and what it
 /// answered.
-async fn end_one(provider: &Provider, ended: ScopeEnded, scope: u64) -> &'static str {
+async fn end_one(provider: &Provider, ended: ScopeEnded, scope: u64) -> ScopeEndOutcome {
     // The call itself inside the guarded future, so a provider that panics
     // before returning its future is caught too.
     let outcome = tokio::time::timeout(
@@ -166,7 +161,7 @@ async fn end_one(provider: &Provider, ended: ScopeEnded, scope: u64) -> &'static
             "provider {name} did not finish ending cache scope {scope} in time; gave up \
              waiting, it may keep that scope's caches"
         );
-        return "timed_out";
+        return ScopeEndOutcome::TimedOut;
     };
     match outcome {
         Ok(Ok(ScopeEndedAck::Unsupported)) => {
@@ -186,16 +181,27 @@ async fn end_one(provider: &Provider, ended: ScopeEnded, scope: u64) -> &'static
                      never told to drop"
                 );
             }
-            "unsupported"
+            ScopeEndOutcome::Unsupported
         }
-        Ok(Ok(_)) => {
+        Ok(Ok(ScopeEndedAck::Released)) => {
             tracing::debug!(
                 scope,
                 provider = name,
                 ack = "released",
                 "cache scope ended"
             );
-            "released"
+            ScopeEndOutcome::Released
+        }
+        // An ack this engine predates claims nothing it can check, so it is
+        // not read as a release.
+        Ok(Ok(ack)) => {
+            tracing::debug!(
+                scope,
+                provider = name,
+                ?ack,
+                "cache scope ended with an ack this engine does not know; read as unsupported"
+            );
+            ScopeEndOutcome::Unsupported
         }
         Ok(Err(e)) => {
             tracing::warn!(
@@ -204,7 +210,7 @@ async fn end_one(provider: &Provider, ended: ScopeEnded, scope: u64) -> &'static
                 error = %format!("{e:#}"),
                 "provider failed to end a cache scope; it may keep that scope's caches"
             );
-            "failed"
+            ScopeEndOutcome::Failed
         }
         Err(_) => {
             tracing::warn!(
@@ -212,7 +218,7 @@ async fn end_one(provider: &Provider, ended: ScopeEnded, scope: u64) -> &'static
                 provider = name,
                 "provider panicked ending a cache scope; it may keep that scope's caches"
             );
-            "panicked"
+            ScopeEndOutcome::Panicked
         }
     }
 }
@@ -618,6 +624,211 @@ mod tests {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(log.ended().is_empty(), "{:?}", log.ended());
+        Ok(())
+    }
+
+    /// A watched scope no provider request was built with still answers its
+    /// watcher: with no acks, at once, and without counting a hook.
+    #[tokio::test]
+    async fn untouched_watched_scope_answers_empty() -> anyhow::Result<()> {
+        let (engine, _root, log) = engine()?;
+        let (rs, scope_ended) = engine.new_watched_state();
+        let bg = rs.bg_pending();
+        drop(rs);
+        let acks = tokio::time::timeout(Duration::from_secs(30), scope_ended)
+            .await
+            .expect("an untouched scope answers its watcher");
+        assert!(acks.is_empty(), "{acks:?}");
+        assert_eq!(bg.load(Ordering::Acquire), 0, "a hook was counted");
+        assert!(log.ended().is_empty(), "{:?}", log.ended());
+        Ok(())
+    }
+
+    /// The watcher's acks, as `(provider, outcome)`, after checking it heard
+    /// every registered provider (the builtins included) once, in
+    /// registration order.
+    async fn heard(
+        engine: &Arc<Engine>,
+        scope_ended: futures::future::BoxFuture<'static, Vec<ScopeEndAck>>,
+    ) -> Vec<(String, ScopeEndOutcome)> {
+        let acks = tokio::time::timeout(SCOPE_ENDED_TIMEOUT * 4, scope_ended)
+            .await
+            .expect("the watcher is answered");
+        let registered: Vec<&str> = engine.providers.iter().map(|p| p.name.as_str()).collect();
+        let named: Vec<&str> = acks.iter().map(|a| a.provider.as_str()).collect();
+        assert_eq!(named, registered, "{acks:?}");
+        acks.into_iter().map(|a| (a.provider, a.outcome)).collect()
+    }
+
+    /// What a touched, watched scope's watcher hears from provider `p`
+    /// misbehaving as `faults` says.
+    async fn outcome_of(faults: Faults) -> anyhow::Result<ScopeEndOutcome> {
+        let paused = faults.scope_ended_gate.is_some();
+        let (engine, _root, _logs) = engine_with(vec![named("p", faults)])?;
+        let (rs, scope_ended) = engine.new_watched_state();
+        touch(&engine, &rs).await;
+        if paused {
+            // A hook held for good: let the timeout elapse in virtual time.
+            tokio::time::pause();
+        }
+        drop(rs);
+        let acks = heard(&engine, scope_ended).await;
+        let outcome = acks.iter().find(|(name, _)| name == "p").map(|(_, o)| *o);
+        Ok(outcome.expect("p answered"))
+    }
+
+    #[tokio::test]
+    async fn watcher_hears_released() -> anyhow::Result<()> {
+        let outcome = outcome_of(Faults {
+            release_scope: true,
+            ..Default::default()
+        })
+        .await?;
+        assert_eq!(outcome, ScopeEndOutcome::Released);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn watcher_hears_unsupported() -> anyhow::Result<()> {
+        let outcome = outcome_of(Faults::default()).await?;
+        assert_eq!(outcome, ScopeEndOutcome::Unsupported);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn watcher_hears_failed() -> anyhow::Result<()> {
+        let outcome = outcome_of(Faults {
+            fail_scope_ended: true,
+            ..Default::default()
+        })
+        .await?;
+        assert_eq!(outcome, ScopeEndOutcome::Failed);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn watcher_hears_panicked() -> anyhow::Result<()> {
+        let outcome = outcome_of(Faults {
+            panic_scope_ended: true,
+            ..Default::default()
+        })
+        .await?;
+        assert_eq!(outcome, ScopeEndOutcome::Panicked);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn watcher_hears_timed_out() -> anyhow::Result<()> {
+        let outcome = outcome_of(Faults {
+            // Never given a permit: the hook hangs for good.
+            scope_ended_gate: Some(Arc::new(tokio::sync::Semaphore::new(0))),
+            ..Default::default()
+        })
+        .await?;
+        assert_eq!(outcome, ScopeEndOutcome::TimedOut);
+        Ok(())
+    }
+
+    /// Several providers: each ack names its own provider, in registration
+    /// order, whatever order they finished in.
+    #[tokio::test]
+    async fn watcher_pairs_each_provider_with_its_outcome() -> anyhow::Result<()> {
+        let (engine, _root, _logs) = engine_with(vec![
+            named(
+                "released",
+                Faults {
+                    release_scope: true,
+                    ..Default::default()
+                },
+            ),
+            named(
+                "failed",
+                Faults {
+                    fail_scope_ended: true,
+                    ..Default::default()
+                },
+            ),
+            named("unsupported", Faults::default()),
+            named(
+                "panicked",
+                Faults {
+                    panic_scope_ended: true,
+                    ..Default::default()
+                },
+            ),
+        ])?;
+        let (rs, scope_ended) = engine.new_watched_state();
+        touch(&engine, &rs).await;
+        drop(rs);
+        let acks = heard(&engine, scope_ended).await;
+        let got: Vec<(&str, &str)> = acks
+            .iter()
+            // The builtin providers are in `heard`'s order check; their
+            // outcomes are not this test's.
+            .filter(|(name, _)| !["query", "fs"].contains(&name.as_str()))
+            .map(|(name, outcome)| (name.as_str(), outcome.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("released", "released"),
+                ("failed", "failed"),
+                ("unsupported", "unsupported"),
+                ("panicked", "panicked"),
+            ]
+        );
+        Ok(())
+    }
+
+    /// An LSP listing dropped mid-walk (the editor gave up on the completion)
+    /// still ends its scope once the work it started lets go, each provider is
+    /// told once, and nothing — the engine, the watcher's sender, a hook —
+    /// is left behind.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_listing_still_ends_its_scope() -> anyhow::Result<()> {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let (engine, _root, mut logs) = engine_with(vec![Faults {
+            slow_list: Some(("live".to_string(), Duration::from_millis(200))),
+            gate: Some(Arc::clone(&started)),
+            ..Default::default()
+        }])?;
+        let log = logs.pop().expect("one provider");
+        let listing = Arc::clone(&engine).lsp_list(hplugin::lsp::Listing::Targets {
+            package: "live".to_string(),
+        });
+        tokio::select! {
+            res = listing => panic!("the listing finished before the slow list started: {res:?}"),
+            () = started.notified() => {}
+        }
+        let scope = log
+            .seen()
+            .into_iter()
+            .flatten()
+            .next()
+            .expect("the provider was called in the listing's scope");
+        ended_once(&log, scope).await;
+        eventually("nothing holds the engine", || {
+            Arc::strong_count(&engine) == 1
+        })
+        .await;
+        Ok(())
+    }
+
+    /// A watcher that stopped listening before its scope ended costs the hook
+    /// nothing: it still tells every provider, and retires its slot.
+    #[tokio::test]
+    async fn abandoned_watcher_does_not_hold_the_hook() -> anyhow::Result<()> {
+        let (engine, _root, log) = engine()?;
+        let (rs, scope_ended) = engine.new_watched_state();
+        let scope = rs.cache_scope().id();
+        let bg = rs.bg_pending();
+        touch(&engine, &rs).await;
+        drop(scope_ended);
+        drop(rs);
+        ended_once(&log, scope).await;
+        tokio::time::timeout(Duration::from_secs(30), bg.wait_drained())
+            .await
+            .expect("the hook retired its slot");
         Ok(())
     }
 
