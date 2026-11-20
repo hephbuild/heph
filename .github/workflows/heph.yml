@@ -55,7 +55,7 @@ concurrency:
   group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-# kache config shared by every compiling job. RUSTC_WRAPPER=kache is set by the
+# kache config shared by every compiling job. RUSTC_WRAPPER=kache-rustc is set by the
 # devenv shell; the storage backend (R2, or local disk on fork PRs) and the
 # daemon that talks to it are wired up by the setup-nix action. Incremental
 # compilation is off because kache caches whole artifacts rather than
@@ -419,7 +419,7 @@ jobs:
     name: Build ${{ matrix.os }}/${{ matrix.arch }}
     runs-on: ${{ matrix.runs-on }}
     # A backstop for a hung job, not a budget: a cold cache (a PR whose
-    # `kache-pr/v2` objects expired) took 18-19 min on linux and over 30 on
+    # `kache-pr/v3` objects expired) took 18-19 min on linux and over 30 on
     # darwin, and that has to fit with room to spare.
     timeout-minutes: 90
     needs: [gen, govet, prerelease_create]
@@ -813,8 +813,9 @@ jobs:
 
           # Waits (up to 35s) for the daemon to drain its upload queue and
           # exit. Failing means it was still uploading, and what is left dies
-          # with the runner. It also fails on fork PRs, which have no remote
-          # (no `KACHE_CONFIG`) and so no daemon; that one is not worth a word.
+          # with the runner. Stopping a daemon that is not running succeeds;
+          # on fork PRs (no `KACHE_CONFIG`, no remote) any failure is not
+          # worth a word, since there is nothing to upload.
           kache daemon stop || {
             [ -z "${KACHE_CONFIG:-}" ] ||
               echo "::warning title=kache::daemon did not stop cleanly — uploads still queued are lost"
@@ -1097,8 +1098,9 @@ jobs:
 
           # Waits (up to 35s) for the daemon to drain its upload queue and
           # exit. Failing means it was still uploading, and what is left dies
-          # with the runner. It also fails on fork PRs, which have no remote
-          # (no `KACHE_CONFIG`) and so no daemon; that one is not worth a word.
+          # with the runner. Stopping a daemon that is not running succeeds;
+          # on fork PRs (no `KACHE_CONFIG`, no remote) any failure is not
+          # worth a word, since there is nothing to upload.
           kache daemon stop || {
             [ -z "${KACHE_CONFIG:-}" ] ||
               echo "::warning title=kache::daemon did not stop cleanly — uploads still queued are lost"
@@ -1285,8 +1287,9 @@ jobs:
 
           # Waits (up to 35s) for the daemon to drain its upload queue and
           # exit. Failing means it was still uploading, and what is left dies
-          # with the runner. It also fails on fork PRs, which have no remote
-          # (no `KACHE_CONFIG`) and so no daemon; that one is not worth a word.
+          # with the runner. Stopping a daemon that is not running succeeds;
+          # on fork PRs (no `KACHE_CONFIG`, no remote) any failure is not
+          # worth a word, since there is nothing to upload.
           kache daemon stop || {
             [ -z "${KACHE_CONFIG:-}" ] ||
               echo "::warning title=kache::daemon did not stop cleanly — uploads still queued are lost"
@@ -1407,8 +1410,9 @@ jobs:
           log=${log/#\~/$HOME}
           # Waits (up to 35s) for the daemon to drain its upload queue and
           # exit. Failing means it was still uploading, and what is left dies
-          # with the runner. It also fails on fork PRs, which have no remote
-          # (no `KACHE_CONFIG`) and so no daemon; that one is not worth a word.
+          # with the runner. Stopping a daemon that is not running succeeds;
+          # on fork PRs (no `KACHE_CONFIG`, no remote) any failure is not
+          # worth a word, since there is nothing to upload.
           kache daemon stop || {
             [ -z "${KACHE_CONFIG:-}" ] ||
               echo "::warning title=kache::daemon did not stop cleanly — uploads still queued are lost"
@@ -1634,8 +1638,9 @@ jobs:
 
           # Waits (up to 35s) for the daemon to drain its upload queue and
           # exit. Failing means it was still uploading, and what is left dies
-          # with the runner. It also fails on fork PRs, which have no remote
-          # (no `KACHE_CONFIG`) and so no daemon; that one is not worth a word.
+          # with the runner. Stopping a daemon that is not running succeeds;
+          # on fork PRs (no `KACHE_CONFIG`, no remote) any failure is not
+          # worth a word, since there is nothing to upload.
           kache daemon stop || {
             [ -z "${KACHE_CONFIG:-}" ] ||
               echo "::warning title=kache::daemon did not stop cleanly — uploads still queued are lost"
@@ -1785,8 +1790,9 @@ jobs:
 
           # Waits (up to 35s) for the daemon to drain its upload queue and
           # exit. Failing means it was still uploading, and what is left dies
-          # with the runner. It also fails on fork PRs, which have no remote
-          # (no `KACHE_CONFIG`) and so no daemon; that one is not worth a word.
+          # with the runner. Stopping a daemon that is not running succeeds;
+          # on fork PRs (no `KACHE_CONFIG`, no remote) any failure is not
+          # worth a word, since there is nothing to upload.
           kache daemon stop || {
             [ -z "${KACHE_CONFIG:-}" ] ||
               echo "::warning title=kache::daemon did not stop cleanly — uploads still queued are lost"

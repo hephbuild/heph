@@ -46,5 +46,6 @@ scripts:
     # wrapper binary and its env come from devenv.nix, which the `gen` line
     # above already warmed. A new worktree therefore starts with a fully warm
     # cache and nothing to install or initialize. Locally there is no remote
-    # and so no daemon to start either; CI is where the R2 remote and its
-    # daemon get wired up (.github/actions/setup-nix).
+    # and no daemon to start by hand (kache starts its own when it wants one);
+    # CI is where the R2 remote and its daemon get wired up
+    # (.github/actions/setup-nix).

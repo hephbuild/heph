@@ -19,19 +19,31 @@ the system linker" — `bin`, `dylib`, `cdylib`, `proc-macro` — i.e. the `heph
 binary, the three plugin cdylibs, every proc-macro and every test harness.
 
 - **Local** is a local-disk store only, at `~/.cache/kache` (Linux) or
-  `~/Library/Caches/kache` (macOS). No remote, and therefore **no daemon needed** —
-  the wrapper reads and writes the store directly. On a copy-on-write filesystem
-  (APFS, btrfs, XFS-with-reflink) restores are reflinks, so a restored `target/`
-  costs almost no additional disk and blobs are shared across worktrees.
+  `~/Library/Caches/kache` (macOS), shared by every worktree. On a
+  copy-on-write filesystem (APFS, btrfs, XFS-with-reflink) restores are
+  reflinks, so a restored `target/` costs almost no additional disk. Since
+  kache 2 a **daemon** (`kache-engine daemon run`) also serves local builds: a
+  compile can start one for the store, and it stays up (no idle timeout by
+  default) until `kache daemon stop`. Nothing depends on it locally — a compile
+  that cannot reach it uses a local engine. A new worktree's `target/` is seeded
+  from the others' (registry units, and incremental state for workspace crates;
+  `KACHE_SEED_INCREMENTAL=0` turns the latter off).
+- **One kache release per store.** `kache` and `kache-engine` are a pair from
+  one release. A shell still on an older `devenv.nix` shares the store with a
+  newer one; a newer client replaces an older release's daemon, and the store's
+  index is migrated in place. After pulling a kache bump, restart every devenv
+  shell, then `kache daemon restart`.
 - **CI** points the same wrapper at the shared R2 bucket through a kache config
-  file (`KACHE_CONFIG`, written by `.github/actions/setup-nix`) and runs the
+  file (`KACHE_CONFIG`, written by `.github/actions/setup-nix`) and starts the
   daemon. The remote is inert without the daemon: it owns remote lookups and
   background uploads. Each compiling job ends with `kache daemon stop`, which
-  waits for the upload queue to drain before the runner is torn down.
+  gives the upload queue 30s to drain (the command waits up to 35s and fails if
+  it is still draining) before the runner is torn down.
 - **Who writes**: kache only publishes from a push to a protected branch, so
-  `master` writes `kache/v2`. A PR run reads `kache/v2`, then `kache-pr/v2`, and
-  writes only `kache-pr/v2`: a PR's later pushes reuse its earlier ones, and
-  nothing a PR compiled reaches `master`'s prefix.
+  `master` writes `kache/v3`. A PR run reads `kache/v3`, then `kache-pr/v3`, and
+  writes only `kache-pr/v3`: a PR's later pushes reuse its earlier ones, and
+  nothing a PR compiled reaches `master`'s prefix. The prefix version moves
+  with kache's cache-key version (`v3` is key version 35, kache 2.2).
 - **C is not cached, on purpose.** `RUSTC_WRAPPER` is `kache-rustc`, a symlink
   to `kache`, because the `cc` crate would take a wrapper named `kache` as its C
   wrapper too. Fetching build scripts' ~490 C objects from R2 measured slower
@@ -40,15 +52,20 @@ binary, the three plugin cdylibs, every proc-macro and every test harness.
 - `kache report` counts every build-script *run* as a miss (`build_script_run`,
   ~100 per job, milliseconds each). Leave them out when reading a hit rate.
 - A cache hit can still show up as a miss: the wrapper gives the daemon 3s per
-  remote lookup, and an R2 round trip over that compiles the crate instead.
-  Misses at ~3,050 ms of overhead in `kache report` are these.
+  remote lookup (`cache.demand_timeout_secs`, default 3), and an R2 round trip
+  over that compiles the crate instead. Misses at ~3,050 ms of overhead in
+  `kache report` are these.
 - To share CI's cache locally, write the same `[cache.remote]` table into a
   kache config file, export `KACHE_S3_ACCESS_KEY` / `KACHE_S3_SECRET_KEY`, and
-  run `kache daemon start`.
+  run `kache daemon restart` (a running daemon keeps the environment it
+  started with).
 
-`kache stats` for a summary, `kache monitor` for a live TUI, `kache why-miss <crate>`
-to explain a miss, `KACHE_PROGRESS=verbose` for per-crate stderr lines, and
-`kache doctor` when something looks wrong. `KACHE_DISABLED=1` bypasses it entirely.
+`kache stats` for a summary (`--last-build` for the latest build), `kache monitor`
+for a live TUI, `kache explain <crate>` to explain a miss, `kache key explain` /
+`kache key diff` to compare one invocation's key inputs across hosts,
+`KACHE_PROGRESS=verbose` for per-crate stderr lines, and `kache doctor` (`--probe`
+for a real miss-then-hit) when something looks wrong. `KACHE_DISABLED=1` bypasses
+it entirely.
 
 ## Commands
 
