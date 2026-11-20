@@ -94,7 +94,14 @@ use xxhash_rust::xxh3::Xxh3;
 /// empty one) — but every result produced under a session runner before that
 /// was built without the environment, so they have to re-derive rather than be
 /// served from the cache.
-const FORMAT_VERSION: u32 = 2;
+///
+/// 3: a run roots one store path covering every store path `runner.json` names
+/// and declares it in `host_paths`. An entry cached before that declares
+/// nothing, so a garbage-collected path under it would never be noticed; the
+/// bump re-runs each runner once. The `runner.json` bytes are unchanged (this
+/// reaches the def hash only, not the fingerprint), so consumers keep their
+/// keys.
+const FORMAT_VERSION: u32 = 3;
 
 /// The file a runner target must produce.
 const OUT_FILE: &str = "runner.json";
