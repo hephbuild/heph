@@ -27,24 +27,25 @@ let
   #
   # A bump that changes kache's cache key format also wants a new R2 prefix
   # (`.github/actions/setup-nix`), so the old entries age out instead of
-  # sitting next to ones nothing can hit.
-  kacheVersion = "1.2.2";
+  # sitting next to ones nothing can hit. The release notes say when it moves
+  # ("Cache keys move from version N to M"); 2.2.0 is key version 35.
+  kacheVersion = "2.2.0";
   kacheAssets = {
     aarch64-darwin = {
       target = "aarch64-apple-darwin";
-      hash = "sha256-ENCeFGhSqN+Hls9kLKWIchB6fzkbdkfsjMJTzyia8Kk=";
+      hash = "sha256-gJZJLch4eW22p5/vBfPhWsivRQBZxZ2x9UbuwA2Bw/U=";
     };
     x86_64-darwin = {
       target = "x86_64-apple-darwin";
-      hash = "sha256-mhw+zInPNrI1Eqk4aCJhQNRvH3DPbLZIv+CO6vslo2g=";
+      hash = "sha256-y3bv1cIwI7/yfLK314exObGP0MhR3ahPRbX3ESjDiw4=";
     };
     x86_64-linux = {
       target = "x86_64-unknown-linux-musl";
-      hash = "sha256-8vZVXe5QlFwqkKf7eTwghKAMxkWdCKwjBtONkFBkMhs=";
+      hash = "sha256-7rbnK59V0OnWHK4Hif+o86uMM77xZrevZVzAgGRH66w=";
     };
     aarch64-linux = {
       target = "aarch64-unknown-linux-musl";
-      hash = "sha256-OIVs7mE/buDsV5CZ/JIFuECgtFu3Y/S4+ngtJdk8GO8=";
+      hash = "sha256-mcdOkzKpLo8G1vvbB3r/U2XzZNW15tac8BP6YW6IfyI=";
     };
   };
   kacheAsset =
@@ -57,16 +58,22 @@ let
       url = "https://github.com/kunobi-ninja/kache/releases/download/v${kacheVersion}/kache-${kacheAsset.target}.tar.gz";
       inherit (kacheAsset) hash;
     };
-    # The tarball is a single `kache` at the root — no directory to strip.
+    # Files at the tarball's root, no directory to strip: `kache` (the client
+    # every compile runs), `kache-engine` (the daemon and the client's local
+    # fallback), and the `kache-cl`/`kache-clang-cl` C launchers. Since 2.0 the
+    # client and engine are a pair: they must come from the same release and
+    # sit in the same directory, where the client looks for the engine.
     sourceRoot = ".";
     dontBuild = true;
     # Static musl / already-signed Mach-O. patchelf would only break the former
     # (there is no interpreter to rewrite) and invalidate the latter's signature.
     dontPatchELF = true;
     dontStrip = true;
-    # `kache-rustc` is the name `RUSTC_WRAPPER` uses — see there for why.
+    # `kache-rustc` is the name `RUSTC_WRAPPER` uses — see there for why. The C
+    # launchers are left out: C is not cached here, on purpose (same place).
     installPhase = ''
       install -Dm755 kache $out/bin/kache
+      install -Dm755 kache-engine $out/bin/kache-engine
       ln -s kache $out/bin/kache-rustc
     '';
   };
@@ -268,12 +275,18 @@ in
   # ahead of the Rust hits for the daemon's download slots. A warm run went from
   # 30 to 37 minutes. kache only cares that argv[0] is not a compiler name.
   #
-  # No remote is configured here, so a local shell is a local-disk cache and
-  # needs no daemon. CI points the same wrapper at R2 through a kache config
-  # file (see `.github/actions/setup-nix`). To share CI's cache locally, write
-  # the same `[cache.remote]` table, export `KACHE_S3_ACCESS_KEY` /
-  # `KACHE_S3_SECRET_KEY`, and run `kache daemon start` — the remote is inert
-  # without the daemon.
+  # No remote is configured here, so a local shell is a local-disk cache. Since
+  # kache 2 the daemon (`kache-engine daemon run`) coordinates local compiles
+  # too: the first rustc through the wrapper starts one for the store if none
+  # is running — even cargo's `rustc -vV` probe, so `cargo tree` will do — and
+  # it outlives the shell (idle shutdown is off by default) until
+  # `kache daemon stop`. It is not required: a compile that cannot reach it
+  # falls back to a local engine on the same store. CI points the same wrapper at R2
+  # through a kache config file (see `.github/actions/setup-nix`). To share
+  # CI's cache locally, write the same `[cache.remote]` table, export
+  # `KACHE_S3_ACCESS_KEY` / `KACHE_S3_SECRET_KEY`, and run
+  # `kache daemon restart` — the daemon owns every remote lookup and upload,
+  # and one already running keeps the environment it started with.
   env.RUSTC_WRAPPER = "kache-rustc";
 
   # Use the shell's Go, always. With the default (`auto`), a go.mod that asks for
@@ -283,7 +296,7 @@ in
 
   # Cache linked `bin` and `--test` executables on macOS too, not just Linux.
   #
-  # kache 1.x defaults this on everywhere; it is set explicitly because kache
+  # kache 1.x and 2.x default this on everywhere; it is set explicitly because kache
   # 0.x defaulted it off for macOS, and the reason to want it on there is not
   # obvious. A Mach-O binary carries
   # only a *debug map* (`N_OSO` entries naming each `.o` by path + mtime) rather
