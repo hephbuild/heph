@@ -20,6 +20,7 @@ use crate::engine::Engine;
 use crate::engine::engine::Provider;
 use crate::engine::sandbox_cleaner::PendingCounter;
 use futures::FutureExt;
+use hplugin::lsp::ScopeEndAck;
 use hplugin::scope::{CacheScope, ScopeEnded, ScopeEndedAck};
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::Ordering;
@@ -47,13 +48,6 @@ impl Engine {
 /// never calls a provider itself: it spawns the calls and returns.
 fn end_scope(engine: &Weak<Engine>, bg_pending: &PendingCounter, ended: ScopeEnded, touched: bool) {
     let scope = ended.scope.get();
-    // No request was ever built with the scope: no provider can hold anything
-    // for it. Its id already left the live set, so the watermark the next
-    // touched scope sends covers it.
-    if !touched {
-        tracing::trace!(scope, "cache scope ended untouched; no provider told");
-        return;
-    }
     let Some(engine) = engine.upgrade() else {
         tracing::debug!(
             scope,
@@ -61,6 +55,16 @@ fn end_scope(engine: &Weak<Engine>, bg_pending: &PendingCounter, ended: ScopeEnd
         );
         return;
     };
+    // Taken on every way out, so a watcher never outlives its scope: dropped
+    // unanswered, it reads as "no provider told".
+    let watcher = engine.take_scope_end_watcher(scope);
+    // No request was ever built with the scope: no provider can hold anything
+    // for it. Its id already left the live set, so the watermark the next
+    // touched scope sends covers it.
+    if !touched {
+        tracing::trace!(scope, "cache scope ended untouched; no provider told");
+        return;
+    }
     // The provider list, not the engine: the spawned task must not keep the
     // engine alive.
     let providers = engine.providers.clone();
@@ -74,9 +78,53 @@ fn end_scope(engine: &Weak<Engine>, bg_pending: &PendingCounter, ended: ScopeEnd
     // drops with it, so the counter cannot stay up.
     drop(runtime.spawn(async move {
         let _slot = slot;
-        send_scope_ended(&providers, ended).await;
+        let acks = send_scope_ended(&providers, ended).await;
+        if let Some(watcher) = watcher {
+            // The watcher may have stopped listening; nothing to do then.
+            drop(watcher.send(acks));
+        }
     }));
 }
+
+impl Engine {
+    /// Resolves once cache scope `scope` ended and every provider answered
+    /// `scope_ended`, to what each answered; empty if no provider was told
+    /// (the scope was never used, or the engine went first). For "which
+    /// providers dropped their caches?" (`heph tool build-lsp --explain`).
+    ///
+    /// Register while the scope is live: one that already ended is never
+    /// answered, and resolves empty only when the engine drops.
+    pub(crate) fn watch_scope_end(
+        &self,
+        scope: u64,
+    ) -> futures::future::BoxFuture<'static, Vec<ScopeEndAck>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.scope_end_watchers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(scope, tx);
+        Box::pin(async move { rx.await.unwrap_or_default() })
+    }
+
+    fn take_scope_end_watcher(
+        &self,
+        scope: u64,
+    ) -> Option<tokio::sync::oneshot::Sender<Vec<ScopeEndAck>>> {
+        let mut watchers = self
+            .scope_end_watchers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if watchers.is_empty() {
+            return None;
+        }
+        watchers.remove(&scope)
+    }
+}
+
+/// Engine-side registry behind [`Engine::watch_scope_end`].
+pub(crate) type ScopeEndWatchers = std::sync::Mutex<
+    std::collections::HashMap<u64, tokio::sync::oneshot::Sender<Vec<ScopeEndAck>>>,
+>;
 
 /// How long one provider's `scope_ended` may take before the hook gives up on
 /// it. The hook is counted on the request's background counter, which process
@@ -86,73 +134,87 @@ const SCOPE_ENDED_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Tell every provider that `ended` ended, concurrently. One provider erroring,
 /// panicking or overrunning [`SCOPE_ENDED_TIMEOUT`] is logged and does not stop
-/// the others.
-async fn send_scope_ended(providers: &[Arc<Provider>], ended: ScopeEnded) {
+/// the others. Returns each provider's answer, in registration order.
+async fn send_scope_ended(providers: &[Arc<Provider>], ended: ScopeEnded) -> Vec<ScopeEndAck> {
     let scope = ended.scope.get();
     futures::future::join_all(providers.iter().map(|provider| async move {
-        // The call itself inside the guarded future, so a provider that
-        // panics before returning its future is caught too.
-        let outcome = tokio::time::timeout(
-            SCOPE_ENDED_TIMEOUT,
-            AssertUnwindSafe(async { provider.provider.scope_ended(ended).await }).catch_unwind(),
-        )
-        .await;
-        let name = provider.name.as_str();
-        let Ok(outcome) = outcome else {
+        let outcome = end_one(provider, ended, scope).await;
+        ScopeEndAck {
+            provider: provider.name.clone(),
+            outcome,
+        }
+    }))
+    .await
+}
+
+/// [`send_scope_ended`] for one provider: the call, its log line, and what it
+/// answered.
+async fn end_one(provider: &Provider, ended: ScopeEnded, scope: u64) -> &'static str {
+    // The call itself inside the guarded future, so a provider that panics
+    // before returning its future is caught too.
+    let outcome = tokio::time::timeout(
+        SCOPE_ENDED_TIMEOUT,
+        AssertUnwindSafe(async { provider.provider.scope_ended(ended).await }).catch_unwind(),
+    )
+    .await;
+    let name = provider.name.as_str();
+    let Ok(outcome) = outcome else {
+        tracing::warn!(
+            scope,
+            provider = name,
+            timeout_secs = SCOPE_ENDED_TIMEOUT.as_secs(),
+            "provider {name} did not finish ending cache scope {scope} in time; gave up \
+             waiting, it may keep that scope's caches"
+        );
+        return "timed_out";
+    };
+    match outcome {
+        Ok(Ok(ScopeEndedAck::Unsupported)) => {
+            tracing::debug!(
+                scope,
+                provider = name,
+                ack = "unsupported",
+                "cache scope ended"
+            );
+            if !provider
+                .scope_ended_unsupported_reported
+                .swap(true, Ordering::Relaxed)
+            {
+                tracing::debug!(
+                    provider = name,
+                    "provider {name} does not implement scope_ended; caches it keeps are \
+                     never told to drop"
+                );
+            }
+            "unsupported"
+        }
+        Ok(Ok(_)) => {
+            tracing::debug!(
+                scope,
+                provider = name,
+                ack = "released",
+                "cache scope ended"
+            );
+            "released"
+        }
+        Ok(Err(e)) => {
             tracing::warn!(
                 scope,
                 provider = name,
-                timeout_secs = SCOPE_ENDED_TIMEOUT.as_secs(),
-                "provider {name} did not finish ending cache scope {scope} in time; gave up \
-                 waiting, it may keep that scope's caches"
+                error = %format!("{e:#}"),
+                "provider failed to end a cache scope; it may keep that scope's caches"
             );
-            return;
-        };
-        match outcome {
-            Ok(Ok(ScopeEndedAck::Unsupported)) => {
-                tracing::debug!(
-                    scope,
-                    provider = name,
-                    ack = "unsupported",
-                    "cache scope ended"
-                );
-                if !provider
-                    .scope_ended_unsupported_reported
-                    .swap(true, Ordering::Relaxed)
-                {
-                    tracing::debug!(
-                        provider = name,
-                        "provider {name} does not implement scope_ended; caches it keeps are \
-                         never told to drop"
-                    );
-                }
-            }
-            Ok(Ok(_)) => {
-                tracing::debug!(
-                    scope,
-                    provider = name,
-                    ack = "released",
-                    "cache scope ended"
-                );
-            }
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    scope,
-                    provider = name,
-                    error = %format!("{e:#}"),
-                    "provider failed to end a cache scope; it may keep that scope's caches"
-                );
-            }
-            Err(_) => {
-                tracing::warn!(
-                    scope,
-                    provider = name,
-                    "provider panicked ending a cache scope; it may keep that scope's caches"
-                );
-            }
+            "failed"
         }
-    }))
-    .await;
+        Err(_) => {
+            tracing::warn!(
+                scope,
+                provider = name,
+                "provider panicked ending a cache scope; it may keep that scope's caches"
+            );
+            "panicked"
+        }
+    }
 }
 
 /// One job counted on a request's background counter, retired on drop — when

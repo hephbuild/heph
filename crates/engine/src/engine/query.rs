@@ -197,6 +197,19 @@ impl Engine {
         m: &'a htmatcher::Matcher,
         discovery: Discovery,
     ) -> impl Stream<Item = anyhow::Result<Addr>> + 'a {
+        self.query_listed(rs, m, discovery)
+            .map_ok(|(addr, _lister)| addr)
+    }
+
+    /// [`Engine::query`], each match with the provider that listed it — the
+    /// first in registration order, when several did — as its index in
+    /// `self.providers`.
+    pub(crate) fn query_listed<'a>(
+        self: Arc<Self>,
+        rs: Arc<RequestState>,
+        m: &'a htmatcher::Matcher,
+        discovery: Discovery,
+    ) -> impl Stream<Item = anyhow::Result<(Addr, usize)>> + 'a {
         // Merging costs a few map entries and a facts clone (reference-count
         // bumps) per candidate, plus an `Addr` clone per candidate for the
         // selection dedup: only worth it for a walk that will read a fact.
@@ -486,12 +499,12 @@ impl Engine {
                 } else {
                     scan.candidates
                 };
-                for Candidate { addr, facts, .. } in candidates {
+                for Candidate { addr, facts, lister } in candidates {
                     let facts = if facts_usable { &facts } else { &ListedFacts::UNKNOWN };
                     let verdict = m.matches_listed(&addr, facts);
                     match verdict {
                         MatchResult::MatchYes => {
-                            if seen.insert(addr.clone()) { yield addr; }
+                            if seen.insert(addr.clone()) { yield (addr, lister); }
                         }
                         MatchResult::MatchNo => {}
                         MatchResult::MatchShrug => {
@@ -525,7 +538,7 @@ impl Engine {
                             }
                             match by_spec {
                                 MatchResult::MatchYes => {
-                                    if seen.insert(addr.clone()) { yield addr; }
+                                    if seen.insert(addr.clone()) { yield (addr, lister); }
                                 }
                                 MatchResult::MatchNo => {}
                                 MatchResult::MatchShrug => {
@@ -552,7 +565,7 @@ impl Engine {
                                     ) == MatchResult::MatchYes
                                         && seen.insert(addr.clone())
                                     {
-                                        yield addr;
+                                        yield (addr, lister);
                                     }
                                 }
                             }

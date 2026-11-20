@@ -378,6 +378,10 @@ pub struct Engine {
     /// dead-process ones swept) on first use. Lazy, so an ordinary build never
     /// creates it.
     pub(crate) scratch_audit_ready: tokio::sync::OnceCell<PathBuf>,
+
+    /// Who waits on which cache scope's end (`Engine::watch_scope_end`).
+    /// Empty unless something asked; each entry leaves when its scope ends.
+    pub(crate) scope_end_watchers: crate::engine::cache_scope::ScopeEndWatchers,
 }
 
 /// Per-process FUSE sandbox state. Owns the `<home>/sandboxfuse<pid>/`
@@ -992,6 +996,7 @@ impl Engine {
             function_slot: FunctionSlot::new(),
             remote_tmp_ready: tokio::sync::OnceCell::new(),
             scratch_audit_ready: tokio::sync::OnceCell::new(),
+            scope_end_watchers: Default::default(),
         };
         // Ended hephs' run logs, off the hot path: never awaited by a build.
         engine.run_logs.start_sweep(&engine.runtime);
@@ -1629,6 +1634,13 @@ impl hplugin::lsp::LspEngine for Engine {
                     .map(|p| p.options)
             })
             .unwrap_or_default()
+    }
+
+    fn list(
+        self: Arc<Self>,
+        what: hplugin::lsp::Listing,
+    ) -> futures::future::BoxFuture<'static, anyhow::Result<hplugin::lsp::Listed>> {
+        Box::pin(self.lsp_list(what))
     }
 }
 

@@ -57,6 +57,7 @@ mod local_cache_fs;
 mod local_cache_mem;
 mod local_cache_spill;
 mod local_cache_sqlite;
+mod lsp_listing;
 pub use cache_db_space::{
     CacheDbSpace, CompactAction, CompactReport, ReclaimPolicy, SpaceShortfall, VacuumMode,
 };
