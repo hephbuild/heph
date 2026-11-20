@@ -45,6 +45,23 @@
 //! Given a pinned input environment the output is deterministic, which is what
 //! makes taking the captured environment wholesale (minus per-process noise)
 //! sound rather than a denylist gamble.
+//!
+//! # Keeping what `runner.json` names alive
+//!
+//! A `wrap` runner's `runner.json` names this host's nix store paths, and it is
+//! cached. Nothing roots them: devenv's own root, `.devenv/gc/shell`, lives in
+//! the runner target's sandbox and dangles once the sandbox is deleted, so any
+//! `nix-collect-garbage` can delete what a cached `runner.json` hands every
+//! consumer, and they fail with exit 127 while the cache keeps serving it.
+//!
+//! So each run roots **one** store path whose closure covers every store path
+//! `runner.json` names, under `<home>/devenv-runner/gcroots/<addr hash>`, and
+//! declares that one path in `host_paths`. The engine checks it on every local
+//! hit and re-runs the runner when it is gone (see
+//! [`root_store_paths`](Driver::root_store_paths) for which path, and why none
+//! of devenv's own outputs would do). None of it reaches a hash: the root, its
+//! store path and the `nix` that made it are outside the def hash, and
+//! `runner.json` does not change.
 
 use anyhow::Context as _;
 use async_trait::async_trait;
@@ -56,15 +73,15 @@ use hexecrunner::RunnerRef;
 use hplugin::driver::targetdef::path::{CodegenMode, Content, Path as OutPath};
 use hplugin::driver::targetdef::{CacheConfig, Input, InputMode, Output, TargetDef};
 use hplugin::driver::{
-    ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
-    ParseResponse, TargetAddr,
+    ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, HostPath,
+    ParseRequest, ParseResponse, TargetAddr,
 };
 use hplugin::error::ProcessFailed;
 use hplugin::htspec::{FromSpecValue, Spec};
 use hproc::proc_exec;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3;
 
@@ -146,6 +163,124 @@ const CAPTURE_DENY: &[&str] = &[
 /// The variable carrying devenv's resolved profile — a content-addressed nix
 /// store path, and the strongest fingerprint available.
 const DEVENV_PROFILE: &str = "DEVENV_PROFILE";
+
+/// The nix store, where every path a run roots lives.
+const NIX_STORE_DIR: &str = "/nix/store";
+
+/// This driver's directory under heph's home, and the gcroots inside it.
+const HOME_SUBDIR: &str = "devenv-runner";
+const GCROOTS_SUBDIR: &str = "gcroots";
+
+/// The name of the store path a run roots.
+const ROOT_NAME: &str = "heph-devenv-env";
+
+/// The expression file the root is built from, in the runner's sandbox.
+const ROOT_EXPR_FILE: &str = "heph-devenv-env.nix";
+
+/// The alphabet of a store path's hash part: nix's base32, which has no `e`,
+/// `o`, `t` or `u`. A dev environment's output placeholders
+/// (`/nix/store/eeee…-name`) are not drawn from it, so they never match.
+const NIX32: &[u8] = b"0123456789abcdfghijklmnpqrsvwxyz";
+
+/// The length of a store path's hash part.
+const STORE_HASH_LEN: usize = 32;
+
+/// Whether nix allows `b` in a store path's name.
+fn is_store_name_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"+-._?=".contains(&b)
+}
+
+/// Every store path `text` names under `store_dir`, as its top-level
+/// `<store_dir>/<hash>-<name>`, each once.
+///
+/// A store path ends where its name does, and the name runs as far as the bytes
+/// nix allows in one. A path followed by a byte nix also allows in a name is
+/// therefore read too long — `-fmacro-prefix-map=<path>=<other>` reads as
+/// `<path>=` — and [`resolve_store_paths`] trims it against the store.
+fn store_path_tokens<'a>(text: &'a str, store_dir: &str) -> BTreeSet<&'a str> {
+    let prefix = format!("{store_dir}/");
+    let bytes = text.as_bytes();
+    text.match_indices(prefix.as_str())
+        .filter_map(|(start, _)| {
+            let hash_start = start + prefix.len();
+            let name_start = hash_start + STORE_HASH_LEN + 1;
+            let hash = bytes.get(hash_start..hash_start + STORE_HASH_LEN)?;
+            if !hash.iter().all(|b| NIX32.contains(b)) || bytes.get(name_start - 1) != Some(&b'-') {
+                return None;
+            }
+            let name_len = bytes
+                .get(name_start..)?
+                .iter()
+                .take_while(|b| is_store_name_byte(**b))
+                .count();
+            if name_len == 0 {
+                return None;
+            }
+            text.get(start..name_start + name_len)
+        })
+        .collect()
+}
+
+/// The store paths among `tokens` that exist, each trimmed to the path it names.
+///
+/// A token that does not exist is retried without each `=`-suffix of its name,
+/// longest first, which undoes [`store_path_tokens`]'s over-long read. One that
+/// still does not exist is left out: a path that is not in the store now cannot
+/// go missing from it, and nix refuses to root it.
+fn resolve_store_paths(tokens: Vec<String>, store_dir_len: usize) -> BTreeSet<String> {
+    // `<store_dir>/<hash>-` and one byte of name: an `=` before it leaves no name.
+    let min_len = store_dir_len + 1 + STORE_HASH_LEN + 2;
+    tokens
+        .into_iter()
+        .filter_map(|token| {
+            let cuts = token
+                .bytes()
+                .enumerate()
+                .filter(|&(i, b)| b == b'=' && i >= min_len)
+                .map(|(i, _)| i)
+                .rev();
+            let found = std::iter::once(token.len()).chain(cuts).find_map(|end| {
+                let path = token.get(..end)?;
+                std::fs::symlink_metadata(path).is_ok().then_some(end)
+            });
+            match found {
+                Some(end) => {
+                    let mut token = token;
+                    token.truncate(end);
+                    Some(token)
+                }
+                None => {
+                    tracing::debug!(
+                        path = %token,
+                        "devenv_runner: runner.json names a store path that is not in the store; \
+                         nothing to root"
+                    );
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
+/// The nix expression for the root: a store path whose references, and so
+/// whose closure, are `paths`.
+///
+/// `builtins.toFile` records a reference for every store path in its text's
+/// context, and `builtins.storePath` puts a path in that context. The paths are
+/// embedded literally: [`store_path_tokens`] admits only nix32 and the bytes
+/// nix allows in a name, none of which a nix string escapes.
+fn root_expr(paths: &BTreeSet<String>) -> String {
+    let mut expr = format!(
+        "builtins.toFile \"{ROOT_NAME}\" (builtins.concatStringsSep \"\\n\" (map builtins.storePath [\n"
+    );
+    for path in paths {
+        expr.push_str("  \"");
+        expr.push_str(path);
+        expr.push_str("\"\n");
+    }
+    expr.push_str("]))\n");
+    expr
+}
 
 /// Strip per-invocation noise from *inside* a value.
 ///
@@ -260,29 +395,35 @@ pub struct Driver {
     /// The `devenv` binary. From the driver's `bin:` option so a workspace can
     /// pin it; `devenv` off `PATH` otherwise.
     devenv_bin: String,
-}
-
-impl Default for Driver {
-    fn default() -> Self {
-        Self::new()
-    }
+    /// The `nix` that roots the environment, found on the runner's `pass_env`
+    /// `PATH` as `devenv` is. Never hashed: it decides what is kept alive, not
+    /// what `runner.json` says.
+    nix_bin: String,
+    /// `<home>/devenv-runner/gcroots`, one root per runner address.
+    gcroots_dir: PathBuf,
+    /// The store `runner.json` is scanned for; [`NIX_STORE_DIR`] outside tests.
+    store_dir: String,
 }
 
 impl Driver {
-    pub fn new() -> Self {
+    /// A driver keeping its gcroots under heph's `home`.
+    pub fn new(home: &Path) -> Self {
         Self {
             devenv_bin: "devenv".to_string(),
+            nix_bin: "nix".to_string(),
+            gcroots_dir: home.join(HOME_SUBDIR).join(GCROOTS_SUBDIR),
+            store_dir: NIX_STORE_DIR.to_string(),
         }
     }
 
-    pub fn from_options(opts: &hplugin::config::Options) -> anyhow::Result<Self> {
+    pub fn from_options(opts: &hplugin::config::Options, home: &Path) -> anyhow::Result<Self> {
         hplugin::config::deny_unknown("devenv_runner driver", opts, &["bin"])?;
         let bin: Option<String> = hplugin::config::decode_opt(opts, "devenv_runner driver", "bin")?;
-        Ok(Self {
-            devenv_bin: bin
-                .filter(|b| !b.is_empty())
-                .unwrap_or_else(|| "devenv".to_string()),
-        })
+        let mut driver = Self::new(home);
+        if let Some(bin) = bin.filter(|b| !b.is_empty()) {
+            driver.devenv_bin = bin;
+        }
+        Ok(driver)
     }
 }
 
@@ -441,13 +582,36 @@ impl ManagedDriver for Driver {
             "config": config,
         });
 
+        let bytes = serde_json::to_vec_pretty(&doc).context("encoding runner.json")?;
+
+        // Rooted before the file is written, so a run that cannot keep what the
+        // file names alive leaves no file behind.
+        let host_paths = self
+            .root_store_paths(
+                &bytes,
+                &def,
+                &req.request.target.addr.hash_str(),
+                &req.sandbox_dir,
+                log.as_mut(),
+                ctoken,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "rooting the nix store paths {OUT_FILE} names, so `nix-collect-garbage` \
+                     cannot delete them while the runner stays cached. `{}` is looked up on \
+                     the runner's `pass_env` PATH, as `{}` is.",
+                    self.nix_bin, self.devenv_bin
+                )
+            })?;
+
         let out = req.sandbox_pkg_dir.join(OUT_FILE);
-        tokio::fs::write(&out, serde_json::to_vec_pretty(&doc)?)
+        tokio::fs::write(&out, &bytes)
             .await
             .with_context(|| format!("write {out:?}"))?;
 
         Ok(ManagedRunResponse {
-            host_paths: Vec::new(),
+            host_paths,
             artifacts: vec![],
         })
     }
@@ -556,27 +720,187 @@ impl Driver {
             ctty: false,
         };
 
-        let captured = log.is_some();
-        let out = match log {
-            Some(log) => {
-                log.output(RunnerRef::local(), spec, Streams::STDERR, ctoken)
-                    .await
-            }
-            None => hexecrunner::output(RunnerRef::local(), spec, ctoken).await,
-        }
-        .with_context(|| format!("run `{} shell -- env -0`", self.devenv_bin))?;
-        if !out.status.success() {
-            let what = format!("`{} shell` failed in {root:?}", self.devenv_bin);
-            if captured {
-                return Err(
-                    anyhow::Error::new(ProcessFailed::from_status(out.status)).context(what)
-                );
-            }
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            anyhow::bail!("{what}: {stderr}");
-        }
-        Ok(parse_env0(&out.stdout))
+        let stdout = run_tool(
+            spec,
+            log,
+            ctoken,
+            || format!("run `{} shell -- env -0`", self.devenv_bin),
+            || format!("`{} shell` failed in {root:?}", self.devenv_bin),
+        )
+        .await?;
+        Ok(parse_env0(&stdout))
     }
+
+    /// Root one store path whose closure covers every store path `doc` (the
+    /// `runner.json` bytes) names, and return it to be declared.
+    ///
+    /// # Which path
+    ///
+    /// A path this run builds itself: `builtins.toFile` over
+    /// `builtins.storePath` of every store path `doc` names, so its references
+    /// are exactly those paths and its closure covers them by construction.
+    /// `nix build --out-link` writes and roots it in one step, so it is never
+    /// unrooted for a garbage collection to take.
+    ///
+    /// None of devenv's own outputs covers what a captured environment names
+    /// (measured on devenv 2.4):
+    ///
+    /// - `DEVENV_PROFILE` is the `packages` buildEnv. Its closure misses what
+    ///   the shell sets outside `packages`: `stdenv`, a `RUST_SRC_PATH`, the
+    ///   `-env` JSON.
+    /// - `.devenv/gc/shell` (the `mkShell` output, devenv's own root) misses the
+    ///   `-env` JSON that `out` names.
+    /// - The `-env` JSON misses the `PATH` entries devenv's wrapper prepends for
+    ///   its own closure (`devenv`, `cachix`, `nixd`).
+    /// - None covers a store path that reaches the capture through `pass_env`,
+    ///   such as a `PATH` inherited from an outer nix shell.
+    ///
+    /// Each is also a devenv implementation detail that has moved between
+    /// versions; the root depends only on what `runner.json` says.
+    ///
+    /// # What is scanned
+    ///
+    /// The output, not the capture: a `session` runner's file names its launch
+    /// argv and the real tree, not the environment, so it roots only a `bin:`
+    /// that is a store path. A file that names no store path roots nothing,
+    /// declares nothing, and runs no `nix`.
+    async fn root_store_paths(
+        &self,
+        doc: &[u8],
+        def: &DevenvDef,
+        addr_hash: &str,
+        sandbox_dir: &Path,
+        log: Option<&mut RunLog<'_>>,
+        ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> anyhow::Result<Vec<HostPath>> {
+        let text = std::str::from_utf8(doc).context("runner.json is not UTF-8")?;
+        let tokens: Vec<String> = store_path_tokens(text, &self.store_dir)
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        let store_dir_len = self.store_dir.len();
+        let paths = hcore::blocking::run(move || resolve_store_paths(tokens, store_dir_len)).await;
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        tokio::fs::create_dir_all(&self.gcroots_dir)
+            .await
+            .with_context(|| format!("create gcroots dir {:?}", self.gcroots_dir))?;
+        // One root per address: a run replaces the root its last run made, and
+        // an entry whose path a GC then takes re-runs on its next hit.
+        let gcroot = self.gcroots_dir.join(addr_hash);
+        // `nix build --out-link` refuses to overwrite an existing path.
+        match tokio::fs::remove_file(&gcroot).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("remove stale gcroot {gcroot:?}")),
+        }
+
+        // A file, not `--expr`: an environment can name hundreds of paths, and
+        // Linux caps one argv string at 128 KiB.
+        let expr_file = sandbox_dir.join(ROOT_EXPR_FILE);
+        tokio::fs::write(&expr_file, root_expr(&paths))
+            .await
+            .with_context(|| format!("write {expr_file:?}"))?;
+
+        let spec = proc_exec::Spec {
+            program: PathBuf::from(&self.nix_bin),
+            args: vec![
+                OsString::from("--extra-experimental-features"),
+                OsString::from("nix-command"),
+                OsString::from("build"),
+                // `builtins.storePath` is refused under pure evaluation.
+                OsString::from("--impure"),
+                OsString::from("--file"),
+                expr_file.into_os_string(),
+                OsString::from("--out-link"),
+                gcroot.clone().into_os_string(),
+                OsString::from("--print-out-paths"),
+            ],
+            // The hashed snapshot devenv ran under, so `nix` is the one on the
+            // runner's PATH and talks to the same store.
+            env: def
+                .pass_env
+                .iter()
+                .map(|(k, v)| (OsString::from(k), OsString::from(v)))
+                .collect(),
+            cwd: sandbox_dir.to_path_buf(),
+            stdin: proc_exec::StdioSpec::Null,
+            stdout: proc_exec::StdioSpec::Piped,
+            stderr: proc_exec::StdioSpec::Piped,
+            setsid: true,
+            ctty: false,
+        };
+        let stdout = run_tool(
+            spec,
+            log,
+            ctoken,
+            || format!("run `{} build` to root the environment", self.nix_bin),
+            || {
+                format!(
+                    "`{} build` failed rooting {} store paths",
+                    self.nix_bin,
+                    paths.len()
+                )
+            },
+        )
+        .await?;
+
+        let printed = std::str::from_utf8(&stdout).context("nix build stdout is not UTF-8")?;
+        let mut lines = printed.lines().filter(|l| !l.is_empty());
+        let (Some(root), None) = (lines.next(), lines.next()) else {
+            anyhow::bail!("nix build printed {printed:?}, expected exactly one store path");
+        };
+        anyhow::ensure!(
+            root.strip_prefix(&self.store_dir)
+                .is_some_and(|rest| rest.starts_with('/')),
+            "nix build printed {root:?}, which is not under {}",
+            self.store_dir
+        );
+        tracing::debug!(
+            root,
+            gcroot = %gcroot.display(),
+            paths = paths.len(),
+            "devenv_runner: rooted the store paths runner.json names"
+        );
+        Ok(vec![HostPath::new(root)?])
+    }
+}
+
+/// Run a tool the driver needs and return its stdout.
+///
+/// Under `log_capture` (`log` is `Some`) its stderr reaches the run's log as it
+/// is written, and a failure is the exit status with no log path. Its stdout is
+/// data, never the log. Without a log, a failure carries stderr in its message.
+async fn run_tool(
+    spec: proc_exec::Spec,
+    log: Option<&mut RunLog<'_>>,
+    ctoken: &(dyn Cancellable + Send + Sync),
+    spawn_what: impl FnOnce() -> String,
+    fail_what: impl FnOnce() -> String,
+) -> anyhow::Result<Vec<u8>> {
+    let captured = log.is_some();
+    let out = match log {
+        Some(log) => {
+            log.output(RunnerRef::local(), spec, Streams::STDERR, ctoken)
+                .await
+        }
+        None => hexecrunner::output(RunnerRef::local(), spec, ctoken).await,
+    }
+    .with_context(spawn_what)?;
+    if !out.status.success() {
+        let what = fail_what();
+        if captured {
+            return Err(anyhow::Error::new(ProcessFailed::from_status(out.status)).context(what));
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!("{what}: {stderr}");
+    }
+    Ok(out.stdout)
 }
 
 /// Reject a `root` that would escape the sandbox.
@@ -711,7 +1035,7 @@ mod tests {
     /// same capture) is what the consumer's cache key rests on either way.
     #[test]
     fn wrap_carries_the_environment_and_session_carries_the_way_in() {
-        let d = Driver::new();
+        let d = Driver::new(Path::new("/home"));
 
         let wrap = d.runner_config(&def(Mode::Wrap), "/ws".to_string(), captured());
         assert_eq!(wrap["env"]["APP_CHANNEL"], "stable");
@@ -733,7 +1057,7 @@ mod tests {
     /// is cached.
     #[test]
     fn a_session_launch_points_at_the_real_tree() {
-        let cfg = Driver::new().runner_config(
+        let cfg = Driver::new(Path::new("/home")).runner_config(
             &def(Mode::Session),
             "/real/tree".to_string(),
             BTreeMap::new(),
@@ -875,12 +1199,13 @@ mod tests {
             "bin".to_string(),
             serde_yaml::from_str("\"/nix/store/x/bin/devenv\"").expect("yaml"),
         );
-        let d = Driver::from_options(&opts).expect("options");
+        let d = Driver::from_options(&opts, Path::new("/home")).expect("options");
         assert_eq!(d.devenv_bin, "/nix/store/x/bin/devenv");
+        assert_eq!(d.gcroots_dir, Path::new("/home/devenv-runner/gcroots"));
 
         let mut bad = hplugin::config::Options::new();
         bad.insert("bogus".to_string(), serde_yaml::Value::Bool(true));
-        Driver::from_options(&bad).expect_err("unknown key must be rejected");
+        Driver::from_options(&bad, Path::new("/home")).expect_err("unknown key must be rejected");
     }
 }
 
@@ -893,38 +1218,75 @@ mod log_tests {
     use hplugin::driver::RunRequest;
     use std::sync::Arc;
 
-    /// A stand-in `devenv` running `body` under `/bin/sh`.
-    fn fake(dir: &std::path::Path, body: &str) -> Driver {
-        let bin = dir.join("devenv");
-        std::fs::write(&bin, format!("#!/bin/sh\n{body}\n")).expect("write devenv");
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        Driver {
-            devenv_bin: bin.to_string_lossy().into_owned(),
+    /// Write an executable `/bin/sh` script running `body` at `path`.
+    pub(super) fn script(path: &std::path::Path, body: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("mkdir script dir");
         }
+        std::fs::write(path, format!("#!/bin/sh\n{body}\n")).expect("write script");
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
     }
 
-    /// Run `driver`; returns the result and what reached the request's stdout
-    /// and stderr writers.
-    async fn run(
-        driver: &Driver,
-        dir: &std::path::Path,
-        log_capture: bool,
-    ) -> (anyhow::Result<ManagedRunResponse>, String, String) {
+    /// A stand-in `devenv` running `body` under `/bin/sh`, with heph's home at
+    /// `dir/home`, the store at `dir/store` and `nix` at `dir/nix` (which only a
+    /// test that writes it has).
+    pub(super) fn fake(dir: &std::path::Path, body: &str) -> Driver {
+        let bin = dir.join("devenv");
+        script(&bin, body);
+        let mut driver = Driver::new(&dir.join("home"));
+        driver.devenv_bin = bin.to_string_lossy().into_owned();
+        driver.nix_bin = dir.join("nix").to_string_lossy().into_owned();
+        driver.store_dir = dir.join("store").to_string_lossy().into_owned();
+        driver
+    }
+
+    /// The runner target `//pkg:env`, parsed, with `mode` if one is given.
+    pub(super) async fn parse(driver: &Driver, mode: Option<&str>) -> TargetDef {
+        let config = mode
+            .map(|m| {
+                (
+                    "mode".to_string(),
+                    hcore::htvalue::Value::String(m.to_string()),
+                )
+            })
+            .into_iter()
+            .collect();
         let parse = ParseRequest {
             request_id: "test".to_string(),
             target_spec: Arc::new(hplugin::provider::TargetSpec {
                 addr: hmodel::htaddr::parse_addr("//pkg:env").expect("addr"),
                 driver: "devenv_runner".to_string(),
+                config,
                 ..Default::default()
             }),
         };
-        let ctoken = StdCancellationToken::new();
-        let def = driver
-            .parse(parse, &ctoken)
+        driver
+            .parse(parse, &StdCancellationToken::new())
             .await
             .expect("parse")
-            .target_def;
+            .target_def
+    }
+
+    /// Run `driver`; returns the result and what reached the request's stdout
+    /// and stderr writers.
+    pub(super) async fn run(
+        driver: &Driver,
+        dir: &std::path::Path,
+        log_capture: bool,
+    ) -> (anyhow::Result<ManagedRunResponse>, String, String) {
+        run_mode(driver, dir, log_capture, None).await
+    }
+
+    /// [`run`], in `mode`.
+    pub(super) async fn run_mode(
+        driver: &Driver,
+        dir: &std::path::Path,
+        log_capture: bool,
+        mode: Option<&str>,
+    ) -> (anyhow::Result<ManagedRunResponse>, String, String) {
+        let ctoken = StdCancellationToken::new();
+        let def = parse(driver, mode).await;
         let id = "test".to_string();
         let sandbox = dir.join("sandbox");
         let pkg = sandbox.join("ws/pkg");
@@ -1011,5 +1373,361 @@ mod log_tests {
             "{msg}"
         );
         assert_eq!((out.as_str(), err.as_str()), ("", ""));
+    }
+}
+
+/// The run roots one store path covering every store path `runner.json` names,
+/// and declares exactly that one. A fake `nix` stands in for the real one: it
+/// writes the root as `builtins.toFile` would (one line per reference) and
+/// makes the out-link, so the root's references are readable back.
+#[cfg(test)]
+mod root_tests {
+    use super::log_tests::{fake, parse, run, run_mode, script};
+    use super::*;
+
+    /// A valid hash part: nix32 rotated by `n`.
+    fn hash(n: usize) -> String {
+        let mut h = NIX32.to_vec();
+        h.rotate_left(n % NIX32.len());
+        String::from_utf8(h).expect("ascii")
+    }
+
+    /// The store path the fake `nix` writes the root to.
+    fn root_path(dir: &Path) -> String {
+        format!("{}/{}-{ROOT_NAME}", dir.join("store").display(), hash(31))
+    }
+
+    /// A fake `nix` at `dir/nix` that records its argv in `dir/nix.args`, writes
+    /// the root with the expression's store paths as its references, and links
+    /// it at `--out-link`. `ln -s` fails on an existing link, as `nix build
+    /// --out-link` refuses one.
+    fn fake_nix(dir: &Path) {
+        fake_nix_rooting_in(dir, dir);
+    }
+
+    /// [`fake_nix`] at `dir`, writing the root into `store_owner`'s store.
+    fn fake_nix_rooting_in(dir: &Path, store_owner: &Path) {
+        let root = root_path(store_owner);
+        let args = dir.join("nix.args");
+        script(
+            &dir.join("nix"),
+            &format!(
+                r#"printf '%s\n' "$@" > '{args}'
+file=; link=
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --file) file=$2; shift;;
+    --out-link) link=$2; shift;;
+  esac
+  shift
+done
+grep '^  "' "$file" | tr -d ' "' > '{root}' || exit 1
+ln -s '{root}' "$link" || exit 1
+echo '{root}'"#,
+                args = args.display(),
+            ),
+        );
+    }
+
+    /// The root's references, as the fake `nix` recorded them.
+    fn references(root: &str) -> BTreeSet<String> {
+        std::fs::read_to_string(root)
+            .expect("read root")
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// A store path under `dir/store` that exists, as a directory.
+    fn store_dir_path(dir: &Path, n: usize, name: &str) -> String {
+        let p = format!("{}/{}-{name}", dir.join("store").display(), hash(n));
+        std::fs::create_dir_all(&p).expect("mkdir store path");
+        p
+    }
+
+    /// A fake `devenv` body printing `env` as `env -0` would.
+    fn print_env(env: &[(&str, String)]) -> String {
+        let records: String = env.iter().map(|(k, v)| format!("{k}={v}\\0")).collect();
+        format!("printf '{records}'")
+    }
+
+    /// A captured environment naming store paths everywhere a real one does: a
+    /// `PATH` with `/bin` suffixes and a repeat, `-isystem`, a
+    /// `-fmacro-prefix-map=<path>=<placeholder>` whose path is followed by a
+    /// byte nix allows in a name, the profile, a file, a path that is not in
+    /// the store, and a placeholder. Returns the body and the paths that exist.
+    fn env_naming_store_paths(dir: &Path) -> (String, BTreeSet<String>) {
+        let bash = store_dir_path(dir, 0, "bash-5.3");
+        let cc = store_dir_path(dir, 1, "clang-wrapper-21");
+        let libc = store_dir_path(dir, 2, "libcxx-21-dev");
+        let python = store_dir_path(dir, 3, "python3-3.14.8");
+        let profile = store_dir_path(dir, 4, "devenv-profile");
+        let json = format!(
+            "{}/{}-devenv-shell-env",
+            dir.join("store").display(),
+            hash(5)
+        );
+        std::fs::write(&json, "{}").expect("write a store file");
+        let store = dir.join("store").display().to_string();
+        let gone = format!("{store}/{}-collected-1.0", hash(6));
+        let placeholder = format!("{store}/{}-out", "e".repeat(STORE_HASH_LEN));
+        let body = print_env(&[
+            ("PATH", format!("{bash}/bin:{cc}/bin:/usr/bin:{bash}/bin")),
+            (
+                "NIX_CFLAGS_COMPILE",
+                format!("-isystem {libc}/include -fmacro-prefix-map={python}={placeholder}"),
+            ),
+            ("DEVENV_PROFILE", profile.clone()),
+            ("out", json.clone()),
+            ("STALE", format!("{gone}/lib")),
+        ]);
+        let exist = [bash, cc, libc, python, profile, json]
+            .into_iter()
+            .collect();
+        (body, exist)
+    }
+
+    /// The covering path's closure holds every store path `runner.json` names,
+    /// and nothing it does not: each existing path once, an over-long read
+    /// trimmed back to the path, the path that is not in the store and the
+    /// placeholder left out.
+    #[tokio::test]
+    async fn every_store_path_runner_json_names_is_in_the_declared_closure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (body, exist) = env_naming_store_paths(dir.path());
+        let driver = fake(dir.path(), &body);
+        fake_nix(dir.path());
+
+        let (res, _, _) = run(&driver, dir.path(), false).await;
+        let res = res.expect("run");
+        let [root] = res.host_paths.as_slice() else {
+            panic!("exactly one declared path: {:?}", res.host_paths)
+        };
+        let mut closure = references(root.as_str());
+        closure.insert(root.as_str().to_owned());
+
+        let doc = std::fs::read_to_string(dir.path().join("sandbox/ws/pkg").join(OUT_FILE))
+            .expect("runner.json");
+        for path in &exist {
+            assert!(doc.contains(path.as_str()), "the fixture names {path}");
+            assert!(
+                closure.contains(path),
+                "{path} is named but outside the closure"
+            );
+        }
+        assert_eq!(
+            references(root.as_str()),
+            exist,
+            "the root references exactly what runner.json names and the store has"
+        );
+    }
+
+    /// The declared path is the one `nix build` printed and rooted, and the root
+    /// is a link to it at `<home>/devenv-runner/gcroots/<addr hash>`. A link an
+    /// earlier run left there is replaced, not refused.
+    #[tokio::test]
+    async fn declares_exactly_the_covering_path_and_roots_it_under_home() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (body, _) = env_naming_store_paths(dir.path());
+        let driver = fake(dir.path(), &body);
+        fake_nix(dir.path());
+        let addr_hash = hmodel::htaddr::parse_addr("//pkg:env")
+            .expect("addr")
+            .hash_str();
+        let gcroot = dir
+            .path()
+            .join("home/devenv-runner/gcroots")
+            .join(&addr_hash);
+        std::fs::create_dir_all(gcroot.parent().expect("parent")).expect("mkdir gcroots");
+        std::os::unix::fs::symlink("/nix/store/an-earlier-run", &gcroot).expect("stale gcroot");
+
+        let (res, _, _) = run(&driver, dir.path(), false).await;
+        let res = res.expect("run");
+
+        let root = root_path(dir.path());
+        assert_eq!(
+            res.host_paths
+                .iter()
+                .map(HostPath::as_str)
+                .collect::<Vec<_>>(),
+            [root.as_str()]
+        );
+        assert_eq!(
+            std::fs::read_link(&gcroot).expect("gcroot"),
+            Path::new(&root),
+            "the gcroot links the declared path"
+        );
+        let args = std::fs::read_to_string(dir.path().join("nix.args")).expect("nix ran");
+        let args: Vec<&str> = args.lines().collect();
+        for want in ["build", "--impure", "--print-out-paths"] {
+            assert!(args.contains(&want), "{want} in {args:?}");
+        }
+        let link = args
+            .iter()
+            .position(|a| *a == "--out-link")
+            .and_then(|i| args.get(i + 1));
+        assert_eq!(link, Some(&gcroot.to_str().expect("utf-8")));
+    }
+
+    /// A `runner.json` naming no store path costs nothing: no `nix`, no gcroot,
+    /// nothing declared.
+    #[tokio::test]
+    async fn an_output_naming_no_store_path_roots_nothing_and_runs_no_nix() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let driver = fake(dir.path(), "printf 'APP_CHANNEL=stable\\0PATH=/usr/bin\\0'");
+        fake_nix(dir.path());
+
+        let (res, _, _) = run(&driver, dir.path(), false).await;
+        assert!(res.expect("run").host_paths.is_empty());
+        assert!(!dir.path().join("nix.args").exists(), "nix never ran");
+        assert!(!dir.path().join("home/devenv-runner").exists());
+    }
+
+    /// A `session` runner's file names its launch, not the environment: the
+    /// environment's store paths are not rooted, and a `bin:` in the store is.
+    #[tokio::test]
+    async fn a_session_runner_roots_what_its_launch_names_not_the_capture() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (body, _) = env_naming_store_paths(dir.path());
+        let mut driver = fake(dir.path(), &body);
+        fake_nix(dir.path());
+
+        let (res, _, _) = run_mode(&driver, dir.path(), false, Some("session")).await;
+        assert!(res.expect("run").host_paths.is_empty());
+        assert!(!dir.path().join("nix.args").exists(), "nix never ran");
+
+        let devenv = store_dir_path(dir.path(), 7, "devenv-2.4.0");
+        let bin = format!("{devenv}/bin/devenv");
+        script(Path::new(&bin), &body);
+        driver.devenv_bin = bin;
+        let (res, _, _) = run_mode(&driver, dir.path(), false, Some("session")).await;
+        let res = res.expect("run");
+        let [root] = res.host_paths.as_slice() else {
+            panic!("exactly one declared path: {:?}", res.host_paths)
+        };
+        assert_eq!(references(root.as_str()), BTreeSet::from([devenv]));
+    }
+
+    /// I1: rooting reaches no hash. The def hash and the `runner.json` bytes are
+    /// the same whether a run roots or not, whichever home it roots under and
+    /// whichever `nix` does it.
+    #[tokio::test]
+    async fn rooting_reaches_neither_the_def_hash_nor_runner_json() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (body, _) = env_naming_store_paths(dir.path());
+        let rooting = fake(dir.path(), &body);
+        fake_nix(dir.path());
+
+        let other = tempfile::tempdir().expect("tempdir");
+        let mut elsewhere = fake(other.path(), &body);
+        // The same `devenv` and store, through another `nix` under another home.
+        // (`bin:` is hashed, rightly: it decides what the capture is.)
+        elsewhere.devenv_bin = rooting.devenv_bin.clone();
+        elsewhere.store_dir = rooting.store_dir.clone();
+        fake_nix_rooting_in(other.path(), dir.path());
+
+        let mut not_rooting = fake(dir.path(), &body);
+        not_rooting.store_dir = "/nowhere".to_string();
+
+        let doc =
+            |d: &Path| std::fs::read(d.join("sandbox/ws/pkg").join(OUT_FILE)).expect("runner.json");
+        let (res, _, _) = run(&rooting, dir.path(), false).await;
+        assert_eq!(res.expect("run").host_paths.len(), 1);
+        let rooted = doc(dir.path());
+        let (res, _, _) = run(&elsewhere, other.path(), false).await;
+        assert_eq!(res.expect("run").host_paths.len(), 1);
+        assert_eq!(doc(other.path()), rooted);
+        let (res, _, _) = run(&not_rooting, dir.path(), false).await;
+        assert!(res.expect("run").host_paths.is_empty());
+        assert_eq!(doc(dir.path()), rooted);
+
+        let hash = parse(&rooting, None).await.hash;
+        assert_eq!(parse(&elsewhere, None).await.hash, hash);
+        assert_eq!(parse(&not_rooting, None).await.hash, hash);
+    }
+
+    /// A root that cannot be made fails the run with what it was for, and no
+    /// `runner.json` is left behind to be cached unrooted.
+    #[tokio::test]
+    async fn a_failed_root_fails_the_run_and_writes_no_runner_json() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (body, _) = env_naming_store_paths(dir.path());
+        let driver = fake(dir.path(), &body);
+        script(
+            &dir.path().join("nix"),
+            "echo 'error: cannot connect to socket' >&2; exit 1",
+        );
+
+        let (res, _, _) = run(&driver, dir.path(), false).await;
+        let Err(e) = res else {
+            panic!("the root fails")
+        };
+        let msg = format!("{e:#}");
+        assert!(msg.contains("nix-collect-garbage"), "{msg}");
+        assert!(msg.contains("cannot connect to socket"), "{msg}");
+        assert!(
+            !dir.path().join("sandbox/ws/pkg").join(OUT_FILE).exists(),
+            "no runner.json"
+        );
+    }
+
+    /// The scanner reads a store path only where one is well formed, and reads
+    /// its name as far as nix allows.
+    #[test]
+    fn store_path_tokens_read_only_well_formed_store_paths() {
+        let h = hash(0);
+        let s = "/nix/store";
+        let good = format!("{s}/{h}-bash-5.3");
+        let cases: Vec<(String, Vec<String>)> = vec![
+            (good.clone(), vec![good.clone()]),
+            (format!("{good}/bin/bash"), vec![good.clone()]),
+            (format!("x:{good}:y"), vec![good.clone()]),
+            (format!("\"{good}\""), vec![good.clone()]),
+            (format!("{good} {good}"), vec![good.clone()]),
+            (format!("{good}=/x"), vec![format!("{good}=")]),
+            (format!("{good}é"), vec![good.clone()]),
+            (
+                format!("{s}/{h}-a+b?c=d_e.f"),
+                vec![format!("{s}/{h}-a+b?c=d_e.f")],
+            ),
+            // Not a store path.
+            (format!("{s}X/{h}-bash"), vec![]),
+            (format!("/nix/stor/{h}-bash"), vec![]),
+            (format!("{s}/{}-bash", "e".repeat(STORE_HASH_LEN)), vec![]),
+            (format!("{s}/{}-bash", h.get(..31).expect("31")), vec![]),
+            (format!("{s}/{h}bash"), vec![]),
+            (format!("{s}/{h}-"), vec![]),
+            (format!("{s}/{h}-/bin"), vec![]),
+            (format!("{s}/{h}"), vec![]),
+            (s.to_string(), vec![]),
+            (String::new(), vec![]),
+        ];
+        for (text, want) in cases {
+            let got: Vec<&str> = store_path_tokens(&text, s).into_iter().collect();
+            assert_eq!(got, want, "scanning {text:?}");
+        }
+    }
+
+    /// An over-long read is trimmed back to the path the store has, a name that
+    /// really holds `=` is kept whole, and a path the store does not have is
+    /// left out.
+    #[test]
+    fn resolving_trims_an_over_long_read_and_drops_what_the_store_lacks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plain = store_dir_path(dir.path(), 0, "python3-3.14.8");
+        let with_eq = store_dir_path(dir.path(), 1, "a=b");
+        let store_len = dir.path().join("store").to_string_lossy().len();
+        let gone = format!("{}/{}-gone", dir.path().join("store").display(), hash(2));
+        let tokens = vec![
+            format!("{plain}="),
+            format!("{plain}=x=y"),
+            with_eq.clone(),
+            format!("{with_eq}="),
+            gone,
+        ];
+        assert_eq!(
+            resolve_store_paths(tokens, store_len),
+            BTreeSet::from([plain, with_eq])
+        );
     }
 }

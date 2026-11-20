@@ -92,10 +92,12 @@ pub extern "C" fn heph_plugin_set_runner_host(host: DynRunnerHost) {
 }
 
 fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
-    let opts = create_config_from_bytes(cfg)?.options;
+    let cfg = create_config_from_bytes(cfg)?;
     let mut drivers = stabby::vec::Vec::new();
+    // `home` is where the driver roots the store paths a runner names.
     drivers.push(named_managed_driver(plugindevenv::Driver::from_options(
-        &opts,
+        &cfg.options,
+        &cfg.home,
     )?)?);
 
     Ok(PluginComponents {
