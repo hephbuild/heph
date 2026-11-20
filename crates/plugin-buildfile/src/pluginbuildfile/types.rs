@@ -168,6 +168,23 @@ pub(crate) fn get(name: &str) -> Option<&'static Alias> {
     aliases().iter().find(|a| a.name == name)
 }
 
+/// The alias for a parameter named like a `target()` field (`deps`, `labels`,
+/// `pass_env`, …): the one built from that whole field. The annotation check
+/// suggests it on an unannotated parameter of that name.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "suggested by the lint driver, which lands in a later layer of this stack"
+    )
+)]
+pub(crate) fn for_param(param: &str) -> Option<&'static Alias> {
+    let def = DEFS
+        .iter()
+        .find(|d| !d.single && d.path.last() == Some(&param))?;
+    get(def.name)
+}
+
 /// Why `heph.types.<name>` names nothing, naming the aliases that exist; `None`
 /// when it is an alias.
 pub(crate) fn unknown_alias(name: &str) -> Option<String> {

@@ -2,6 +2,10 @@
 //! `build-format` (docs/BUILDFILE_CHECKS.md).
 //!
 //! - [`loads`]: the parse-only load walk (I8) and the ownership rule (I1).
+//! - [`annotations`]: the `requireTypeAnnotations` rule, shared with the LSP.
+//! - [`lint`]: the static typecheck over a walk, without executing (I4).
+//! - [`format`]: the format check and fix, on `xstarlark-fmt`'s one rule.
+//! - [`report`]: findings and the failure text, which is the contract.
 
 #![cfg_attr(
     not(test),
@@ -11,7 +15,11 @@
     )
 )]
 
+pub(crate) mod annotations;
+pub(crate) mod format;
+pub(crate) mod lint;
 pub(crate) mod loads;
+pub(crate) mod report;
 
 #[cfg(test)]
 mod load_edges;
@@ -321,4 +329,82 @@ fn fs_addr_round_trip() {
         })
         .collect();
     assert_eq!(back, ["a b/BUILD", "c=d@e:f,g/defs.star"]);
+}
+
+/// The failure text is the contract: one line per finding sorted by file,
+/// line and column with its stable prefix and fix, the count, and the footer
+/// for the kind of check — the `requireTypeAnnotations` line only when an
+/// `annotation:` finding is present.
+#[cfg(test)]
+#[test]
+fn failure_format() {
+    use report::{ANNOTATIONS_FOOTER, Finding, Kind, format_failure, lint_failure};
+    let at = |file: &str, line, col, kind, message: &str| Finding {
+        file: file.to_string(),
+        line,
+        col,
+        kind,
+        message: message.to_string(),
+    };
+    let annotation = at(
+        "pkg/BUILD",
+        3,
+        9,
+        Kind::Annotation,
+        "parameter `x` of `make_lib` has no type; add `: <type>`",
+    );
+    let type_error = at(
+        "pkg/defs.BUILD",
+        12,
+        5,
+        Kind::TypeError,
+        "Expected type `str` but got `int`",
+    );
+    let earlier = at(
+        "pkg/BUILD",
+        3,
+        2,
+        Kind::TypeError,
+        "Expected type `int` but got `str`",
+    );
+
+    // Given out of order: printed sorted by file, line, column.
+    assert_eq!(
+        lint_failure(
+            "pkg",
+            &[type_error.clone(), annotation.clone(), earlier.clone()]
+        )
+        .expect("fails"),
+        format!(
+            "pkg/BUILD:3:2: type-error: Expected type `int` but got `str`\n\
+             pkg/BUILD:3:9: annotation: parameter `x` of `make_lib` has no type; add `: <type>`\n\
+             pkg/defs.BUILD:12:5: type-error: Expected type `str` but got `int`\n\
+             3 findings in //pkg\n\
+             {ANNOTATIONS_FOOTER}"
+        )
+    );
+    assert_eq!(
+        ANNOTATIONS_FOOTER,
+        "annotations are required by requireTypeAnnotations in .hephconfig (plugins: buildfile, options)"
+    );
+    // No annotation finding: no footer.
+    assert_eq!(
+        lint_failure("pkg", &[type_error.clone()]).expect("fails"),
+        "pkg/defs.BUILD:12:5: type-error: Expected type `str` but got `int`\n1 finding in //pkg"
+    );
+    assert_eq!(lint_failure("pkg", &[]), None);
+
+    let unformatted = at(
+        "a/b/BUILD",
+        4,
+        1,
+        Kind::Format,
+        "not formatted; this is the first line that differs from the formatter's output",
+    );
+    assert_eq!(
+        format_failure("a/b", &[unformatted]).expect("fails"),
+        "a/b/BUILD:4:1: format: not formatted; this is the first line that differs from the \
+         formatter's output\n1 finding in //a/b\nrun heph run //a/b:build-format to fix"
+    );
+    assert_eq!(format_failure("a/b", &[]), None);
 }

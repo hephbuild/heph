@@ -92,6 +92,33 @@ pub fn format(filename: &str, src: &str, config: Config) -> Result<String, FmtEr
     Ok(printer.into_string())
 }
 
+/// What [`reformat`] decided for one file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reformat {
+    /// Nothing to write: the file is already formatted, or opens with the
+    /// `heph:fmt skip-file` directive (which counts as formatted).
+    Unchanged,
+    /// The formatted text, which differs from the source.
+    Changed(String),
+}
+
+/// The one formatting rule every BUILD-file formatter in heph applies:
+/// `heph tool build-fmt` (and its `--check`), and the `build-format` /
+/// `build-format-check` targets. Formats `src`, naming the file `filename`
+/// in errors.
+///
+/// A file that does not parse (a syntax error, or tab indentation, which the
+/// dialect rejects) is an error naming the file: it cannot be formatted, and
+/// it must fail rather than read as formatted.
+pub fn reformat(filename: &str, src: &str, config: Config) -> anyhow::Result<Reformat> {
+    match format(filename, src, config) {
+        Ok(out) if out == src => Ok(Reformat::Unchanged),
+        Ok(out) => Ok(Reformat::Changed(out)),
+        Err(FmtError::Skip) => Ok(Reformat::Unchanged),
+        Err(e) => Err(anyhow::Error::new(e).context(format!("formatting {filename}"))),
+    }
+}
+
 /// Top-level statements: the children of the synthetic `Statements` node that
 /// wraps a parsed module, or the single statement itself.
 fn top_level_stmts(stmt: &AstStmt) -> &[AstStmt] {
@@ -109,4 +136,42 @@ fn starts_with_skip(codemap: &CodeMap, spans: &[starlark::codemap::Span], first:
         let line = codemap.resolve_span(span).begin.line;
         line < first_line && codemap.source_span(span).contains(COMMENT_SKIP_FILE)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reformat_skip_file_counts_as_formatted() {
+        let src = "# heph:fmt skip-file\nx    =   1\n";
+        assert_eq!(
+            reformat("BUILD", src, Config::default()).expect("formats"),
+            Reformat::Unchanged
+        );
+    }
+
+    #[test]
+    fn reformat_reports_changes_only() {
+        let cfg = Config::default();
+        let Reformat::Changed(out) = reformat("BUILD", "x    =   1\n", cfg).expect("formats")
+        else {
+            panic!("an unformatted file is changed");
+        };
+        assert_eq!(out, "x = 1\n");
+        assert_eq!(
+            reformat("BUILD", &out, cfg).expect("formats"),
+            Reformat::Unchanged
+        );
+    }
+
+    #[test]
+    fn reformat_parse_error_names_the_file() {
+        let err = reformat("pkg/BUILD", "x = (\n", Config::default()).expect_err("does not parse");
+        let text = format!("{err:#}");
+        assert!(
+            text.starts_with("formatting pkg/BUILD: parse error"),
+            "{text}"
+        );
+    }
 }

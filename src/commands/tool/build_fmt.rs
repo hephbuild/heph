@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use async_trait::async_trait;
-use hxstarlark_fmt::{Config, FmtError};
+use hxstarlark_fmt::{Config, Reformat};
 
 use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
@@ -17,12 +17,19 @@ use crate::htpkg::{self, PkgBuf};
 use crate::pluginbuildfile::{FormatSettings, build_files_in_dir};
 use crate::tui::{self, App, AppContext, LogSink};
 
+/// Points at the cached targets that apply the same rule (docs/BUILDFILE_CHECKS.md).
+const AFTER_HELP: &str = "\
+Every package also has cached targets applying the same rule:
+  heph run //<pkg>:build-format         rewrite the package's BUILD files
+  heph run format-check //...           check every package, as CI does";
+
 /// The argument value that selects stdin → stdout mode.
 const STDIN_MARKER: &str = "-";
 
 #[derive(clap::Args, Clone)]
 #[command(
-    override_usage = "heph tool build-fmt\n       heph tool build-fmt <PACKAGE_MATCHER>\n       heph tool build-fmt -"
+    override_usage = "heph tool build-fmt\n       heph tool build-fmt <PACKAGE_MATCHER>\n       heph tool build-fmt -",
+    after_help = AFTER_HELP
 )]
 pub struct Args {
     /// Package matcher (e.g. //pkg/...); omit to format every package's BUILD
@@ -59,17 +66,17 @@ fn format_stdin() -> anyhow::Result<()> {
         .read_to_string(&mut src)
         .context("reading stdin")?;
 
-    let out = match hxstarlark_fmt::format(
+    // A skipped or already formatted file is emitted unchanged, matching
+    // in-place behavior.
+    let out = match hxstarlark_fmt::reformat(
         "<stdin>",
         &src,
         Config {
             indent_size: indent,
         },
-    ) {
-        Ok(out) => out,
-        // A skipped file is emitted unchanged, matching in-place behavior.
-        Err(FmtError::Skip) => src,
-        Err(e) => return Err(anyhow::anyhow!(e).context("formatting stdin")),
+    )? {
+        Reformat::Unchanged => src,
+        Reformat::Changed(out) => out,
     };
 
     let stdout = std::io::stdout();
@@ -136,23 +143,13 @@ impl App for BuildFmtApp {
                 let src = std::fs::read_to_string(path)
                     .with_context(|| format!("reading {}", path.display()))?;
 
-                let out_text = match hxstarlark_fmt::format(&path.to_string_lossy(), &src, cfg) {
-                    Ok(text) => text,
-                    // The `heph:fmt skip-file` directive: leave untouched.
-                    Err(FmtError::Skip) => continue,
-                    // A file that doesn't parse (a syntax error, or tab
-                    // indentation, which heph's Starlark dialect rejects) can't
-                    // be reformatted — fail the run so it's fixed, not hidden.
-                    Err(e) => {
-                        return Err(
-                            anyhow::anyhow!(e).context(format!("formatting {}", path.display()))
-                        );
-                    }
+                // The rule the `build-format-check` target applies too: a
+                // skip-file directive counts as formatted, and a file that
+                // doesn't parse fails the run, named, rather than being hidden.
+                let out_text = match hxstarlark_fmt::reformat(&path.to_string_lossy(), &src, cfg)? {
+                    Reformat::Unchanged => continue,
+                    Reformat::Changed(text) => text,
                 };
-
-                if out_text == src {
-                    continue;
-                }
 
                 if self.check {
                     tracing::warn!("{label} is not formatted");

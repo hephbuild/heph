@@ -38,26 +38,8 @@ pub(super) fn walk(root: &Path, pkg: &str) -> anyhow::Result<LoadWalk> {
 /// evaluated (workspace-relative): the package's own BUILD files and every
 /// file a `load()` reached, read off a file cache no other evaluation shares.
 pub(super) fn eval(root: &Path, pkg: &str) -> anyhow::Result<BTreeSet<String>> {
-    let patterns = default_build_file_patterns();
-    let walker = Arc::new(CachedWalker::disabled());
     let file_cache: Arc<Mutex<HashMap<PathBuf, Arc<RunResult>>>> = Arc::default();
-    let loader = BuildFileLoader::new(
-        root.to_path_buf(),
-        patterns.clone(),
-        Arc::clone(&file_cache),
-        Arc::default(),
-        Arc::new(FunctionRegistry::default()),
-        Arc::new(OnceLock::new()),
-        Arc::clone(&walker),
-        Arc::new(PackageList::new(
-            root.to_path_buf(),
-            patterns,
-            Arc::new(hwalk::Ignore::default()),
-            walker,
-        )),
-        Arc::default(),
-    );
-    loader.load_pkg(pkg)?;
+    loader(root, Arc::clone(&file_cache)).load_pkg(pkg)?;
     let opened = file_cache
         .lock()
         .expect("file cache")
@@ -71,6 +53,37 @@ pub(super) fn eval(root: &Path, pkg: &str) -> anyhow::Result<BTreeSet<String>> {
         })
         .collect();
     Ok(opened)
+}
+
+/// Evaluate `pkg` as the provider does: its BUILD files merged into one module.
+pub(super) fn eval_pkg(root: &Path, pkg: &str) -> anyhow::Result<Arc<RunResult>> {
+    loader(root, Arc::default()).load_pkg(pkg)
+}
+
+/// A loader over `root` with the default BUILD patterns, caching evaluated
+/// files in `file_cache`.
+fn loader(
+    root: &Path,
+    file_cache: Arc<Mutex<HashMap<PathBuf, Arc<RunResult>>>>,
+) -> BuildFileLoader {
+    let patterns = default_build_file_patterns();
+    let walker = Arc::new(CachedWalker::disabled());
+    BuildFileLoader::new(
+        root.to_path_buf(),
+        patterns.clone(),
+        file_cache,
+        Arc::default(),
+        Arc::new(FunctionRegistry::default()),
+        Arc::new(OnceLock::new()),
+        Arc::clone(&walker),
+        Arc::new(PackageList::new(
+            root.to_path_buf(),
+            patterns,
+            Arc::new(hwalk::Ignore::default()),
+            walker,
+        )),
+        Arc::default(),
+    )
 }
 
 /// Every message in `err`'s chain, joined.

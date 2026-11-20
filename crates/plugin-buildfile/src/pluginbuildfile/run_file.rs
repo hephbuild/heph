@@ -289,9 +289,41 @@ fn render_builtin_hover(
 }
 
 pub(crate) fn build_globals(registry: &FunctionRegistry) -> Globals {
-    let mut builder = GlobalsBuilder::standard();
-    builder = builder.with(starlark_module);
-    builder
+    heph_globals(|hb| {
+        // One `heph.<plugin>` namespace per plugin with functions; each
+        // function becomes a native callable bridging into its async `PluginFn`.
+        for (provider, fns) in registry.plugins() {
+            hb.namespace(provider, |nb| {
+                for (name, rf) in fns {
+                    // Each plugin function carries per-fn state (its async
+                    // `PluginFn` + declared signature), so it's registered as a
+                    // custom callable value rather than `set_function` (whose
+                    // 0.14 `NativeFuncFn` is a stateless `fn` pointer). The
+                    // engine-side validator in `invoke` is the canonical guard
+                    // for arity/types/return; the LSP proxy renders hover and
+                    // completion for these from the registry.
+                    nb.set(
+                        name.as_str(),
+                        ProviderNativeFn {
+                            display: format!("heph.{provider}.{name}"),
+                            signature: Arc::clone(&rf.signature),
+                            func: Arc::clone(&rf.func),
+                        },
+                    );
+                }
+            });
+        }
+    })
+}
+
+/// The globals every BUILD file sees: the static `starlark_module` builtins
+/// (`target`, …), `heph.core` and `heph.types`, plus whatever `plugins` adds
+/// to the `heph` namespace. Evaluation adds callable plugin functions
+/// ([`build_globals`]); the lint check adds opaque stand-ins by name, so both
+/// see the same static surface.
+pub(crate) fn heph_globals(plugins: impl Fn(&mut GlobalsBuilder)) -> Globals {
+    GlobalsBuilder::standard()
+        .with(starlark_module)
         .with_namespace("heph", |hb| {
             // Static `heph.core` host/platform builtins.
             hb.namespace("core", heph_core_module);
@@ -300,31 +332,17 @@ pub(crate) fn build_globals(registry: &FunctionRegistry) -> Globals {
                 crate::pluginbuildfile::types::NAMESPACE,
                 crate::pluginbuildfile::types::register,
             );
-            // One `heph.<plugin>` namespace per plugin with functions; each
-            // function becomes a native callable bridging into its async `PluginFn`.
-            for (provider, fns) in registry.plugins() {
-                hb.namespace(provider, |nb| {
-                    for (name, rf) in fns {
-                        // Each plugin function carries per-fn state (its async
-                        // `PluginFn` + declared signature), so it's registered as a
-                        // custom callable value rather than `set_function` (whose
-                        // 0.14 `NativeFuncFn` is a stateless `fn` pointer). The
-                        // engine-side validator in `invoke` is the canonical guard
-                        // for arity/types/return; the LSP proxy renders hover and
-                        // completion for these from the registry.
-                        nb.set(
-                            name.as_str(),
-                            ProviderNativeFn {
-                                display: format!("heph.{provider}.{name}"),
-                                signature: Arc::clone(&rf.signature),
-                                func: Arc::clone(&rf.func),
-                            },
-                        );
-                    }
-                });
-            }
+            plugins(hb);
         })
         .build()
+}
+
+/// Whether a top-level name of a loaded module is exported: everything but a
+/// `_`-prefixed name. The one rule shared by evaluation's directory-load merge
+/// ([`merge_pkg_results`]) and the lint check's merge of the same files'
+/// interfaces, so the two cannot disagree on what a `load("//dir")` sees.
+pub(crate) fn is_exported(name: &str) -> bool {
+    !name.starts_with('_')
 }
 
 /// Map a [`ParamType`] to the Starlark `Ty` used for native param/return typing
@@ -826,7 +844,7 @@ fn merge_pkg_results(parts: &[Arc<RunResult>]) -> anyhow::Result<RunResult> {
             for name in part.module.names() {
                 let name_str = name.as_str();
                 // Skip underscore-prefixed (private) symbols — never re-exportable.
-                if name_str.starts_with('_') {
+                if !is_exported(name_str) {
                     continue;
                 }
                 if let Some(owned) = part.module.get_option(name_str)? {
@@ -2029,6 +2047,20 @@ pub(crate) fn rel_display(root: &Path, path: &Path) -> String {
 /// parse both evaluation and the load walk go through.
 pub(crate) fn parse_build_file(path: &Path) -> anyhow::Result<AstModule> {
     AstModule::parse_file(path, &Dialect::Extended).map_err(starlark::Error::into_anyhow)
+}
+
+/// [`parse_build_file`] over source already read, named `name` in spans and
+/// errors: the lint check reads a sandbox file and names it by its
+/// workspace-relative path. Same dialect as evaluation.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "called by the lint driver, which lands in a later layer of this stack"
+    )
+)]
+pub(crate) fn parse_build_source(name: &str, src: String) -> anyhow::Result<AstModule> {
+    AstModule::parse(name, src, &Dialect::Extended).map_err(starlark::Error::into_anyhow)
 }
 
 /// Resolve a `load()` path argument to an absolute filesystem path, rejecting
