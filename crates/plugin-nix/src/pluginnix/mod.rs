@@ -9,8 +9,8 @@ use hmodel::htpkg::PkgBuf;
 use hplugin::driver::targetdef::path::{CodegenMode, Content, Path as TPath};
 use hplugin::driver::targetdef::{CacheConfig, Input, InputMode, Output, TargetDef};
 use hplugin::driver::{
-    ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
-    ParseResponse, TargetAddr,
+    ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, HostPath,
+    ParseRequest, ParseResponse, TargetAddr,
 };
 use hplugin::error::ProcessFailed;
 use hplugin::htspec::Spec;
@@ -30,7 +30,13 @@ pub const DRIVER_NAME: &str = "nix";
 /// each with 1 FilePath, so the tool can be referenced without a `|<program>`
 /// selector. Cached v1 entries have a single-group shape that the new code
 /// path treats as one binary — bump to force recompute.
-const DRIVER_FORMAT_VERSION: u32 = 2;
+///
+/// v3: the run declares the env's store path as a host path, so the engine
+/// rebuilds an entry whose store path is gone instead of serving it; and each
+/// wrapper checks its program exists before exec'ing it, exiting 127 with a
+/// `heph run --force` hint when it does not. A v2 entry declares nothing and
+/// would never be checked, so it is rebuilt once.
+const DRIVER_FORMAT_VERSION: u32 = 3;
 
 const NIX_TOOL_ADDR: &str = "//@heph/bin:nix";
 
@@ -261,6 +267,40 @@ fn sanitize_env_name(addr_str: &str) -> String {
     out
 }
 
+/// The one store path `nix build --print-out-paths` printed. `buildEnv` has a
+/// single output, so anything but one non-empty line is refused rather than
+/// guessed at.
+fn parse_out_path(stdout: &[u8]) -> anyhow::Result<&str> {
+    let text = std::str::from_utf8(stdout).context("nix build stdout not utf-8")?;
+    let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+    let path = lines
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("nix build produced empty store path"))?;
+    anyhow::ensure!(
+        lines.next().is_none(),
+        "nix build printed more than one store path: {text:?}"
+    );
+    Ok(path)
+}
+
+/// Quote `s` as one POSIX shell word.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// The wrapper for one program. It checks the program is still there before
+/// exec'ing it: a store path collected after the entry was cached would
+/// otherwise fail as a bare "not found", with nothing pointing at the fix.
+fn wrapper_script(target_bin: &str, addr: &str) -> String {
+    let bin = sh_quote(target_bin);
+    let missing = sh_quote(&format!("{target_bin} missing; heph run --force {addr}"));
+    format!(
+        "#!/bin/sh\n\
+         [ -e {bin} ] || {{ printf '%s\\n' {missing} >&2; exit 127; }}\n\
+         exec {bin} \"$@\"\n"
+    )
+}
+
 #[async_trait]
 impl ManagedDriver for Driver {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
@@ -479,13 +519,13 @@ impl ManagedDriver for Driver {
             ));
         }
 
-        let store_path = std::str::from_utf8(&output.stdout)
-            .context("nix build stdout not utf-8")?
-            .trim()
-            .to_string();
-        if store_path.is_empty() {
-            anyhow::bail!("nix build produced empty store path");
-        }
+        let store_path = parse_out_path(&output.stdout)?;
+        // The env's store path is the one host path the outputs depend on:
+        // every wrapper execs under it, and its closure holds everything the
+        // programs reference, which nix never collects while it is live (I2).
+        let env_path = HostPath::new(store_path).with_context(|| {
+            format!("nix build for {addr_str} printed store path {store_path:?}")
+        })?;
 
         // Write one wrapper per program into the sandbox so the bridge can
         // collect them into the output tar.
@@ -495,11 +535,11 @@ impl ManagedDriver for Driver {
             .with_context(|| format!("create {:?}", bin_dir))?;
 
         for program in &def.programs {
-            let target_bin = format!("{store_path}/bin/{program}");
+            let target_bin = format!("{}/bin/{program}", env_path.as_str());
             tokio::fs::metadata(&target_bin).await.with_context(|| {
                 format!("program `{program}` not present at {target_bin} after nix build")
             })?;
-            let wrapper = format!("#!/bin/sh\nexec {target_bin} \"$@\"\n");
+            let wrapper = wrapper_script(&target_bin, &addr_str);
             let wrapper_path = bin_dir.join(program);
             tokio::fs::write(&wrapper_path, wrapper.as_bytes())
                 .await
@@ -516,7 +556,7 @@ impl ManagedDriver for Driver {
         // The bridge appends the collected tar artifact based on `outputs[]`
         // with `collect: true`. Nothing to add here.
         Ok(ManagedRunResponse {
-            host_paths: Vec::new(),
+            host_paths: vec![env_path],
             artifacts: vec![],
         })
     }
@@ -859,10 +899,12 @@ mod tests {
     }
 }
 
-/// Where nix's output goes: its stderr is the run's log, its stdout (flake
-/// metadata, a store path) is data and never the log.
+/// A stand-in `nix` for the run tests: a shell script handed to the driver as
+/// its staged `nix` tool, plus a fake store path holding `rg` and `fd`. Its
+/// behaviour is read from control files at each call, so one test can change
+/// it between runs, and it appends each call's arguments to `calls`.
 #[cfg(test)]
-mod log_tests {
+mod fake {
     use super::*;
     use hcore::hasync::StdCancellationToken;
     use hcore::htvalue::Value;
@@ -872,63 +914,101 @@ mod log_tests {
     use hplugin::provider::TargetSpec;
     use std::collections::HashMap;
 
-    const STORE_TOKEN: &str = "STORE-PATH-MARKER";
+    pub(super) const STORE_TOKEN: &str = "STORE-PATH-MARKER";
+    pub(super) const REF: &str = "github:o/r/main";
+    pub(super) const LOCKED: &str = "github:o/r/STORE-PATH-MARKER-locked";
 
-    /// A stand-in `nix` (shell script) plus a fake store path holding `rg`.
-    struct Fake {
-        dir: tempfile::TempDir,
-        nix: PathBuf,
-        store: PathBuf,
+    pub(super) struct Fake {
+        pub(super) dir: tempfile::TempDir,
+        pub(super) nix: PathBuf,
+        pub(super) store: PathBuf,
     }
 
     impl Fake {
-        /// The build prints a progress line, then the store path — or, when
-        /// `build_fails`, an error line and exits 1.
-        fn new(build_fails: bool) -> Self {
+        /// `flake metadata` prints a progress line, then `{"url": LOCKED}`.
+        /// The build prints a progress line, then the store path.
+        pub(super) fn new() -> Self {
             let dir = tempfile::tempdir().expect("tempdir");
             let store = dir.path().join(format!("{STORE_TOKEN}-env"));
             std::fs::create_dir_all(store.join("bin")).expect("mkdir store");
-            std::fs::write(store.join("bin/rg"), b"").expect("write rg");
-            let build = if build_fails {
-                "echo 'error: builder for env failed' >&2; exit 1".to_string()
-            } else {
-                format!("echo '{}'", store.display())
-            };
+            for p in ["rg", "fd"] {
+                std::fs::write(store.join("bin").join(p), b"").expect("write program");
+            }
+            let d = sh_quote(&dir.path().display().to_string());
+            let s = sh_quote(&store.display().to_string());
             let nix = dir.path().join("nix");
             std::fs::write(
                 &nix,
                 format!(
-                    "#!/bin/sh\ncase \"$*\" in\n\
-                     *'flake metadata'*) echo 'fetching flake' >&2; \
-                     echo '{{\"url\":\"github:o/r/{STORE_TOKEN}-locked\"}}' ;;\n\
-                     *build*) echo 'building env' >&2; {build} ;;\n\
+                    "#!/bin/sh\n\
+                     d={d}\n\
+                     printf '%s\\n' \"$*\" >> \"$d/calls\"\n\
+                     case \"$*\" in\n\
+                     *'flake metadata'*) echo 'fetching flake' >&2; cat \"$d/meta.json\" ;;\n\
+                     *build*) echo 'building env' >&2\n\
+                       if [ -e \"$d/build_sleep\" ]; then sleep 30; fi\n\
+                       if [ -e \"$d/build_fail\" ]; then \
+                         echo 'error: builder for env failed' >&2; exit 1; fi\n\
+                       echo {s} ;;\n\
                      esac\n"
                 ),
             )
             .expect("write nix");
             use std::os::unix::fs::PermissionsExt as _;
             std::fs::set_permissions(&nix, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-            Self { dir, nix, store }
+            let fake = Self { dir, nix, store };
+            fake.set_meta(&format!("{{\"url\":\"{LOCKED}\"}}"));
+            fake
         }
 
-        fn sandbox(&self) -> PathBuf {
+        fn flag(&self, name: &str, on: bool) {
+            let p = self.dir.path().join(name);
+            if on {
+                std::fs::write(&p, b"").expect("set flag");
+            } else if p.exists() {
+                std::fs::remove_file(&p).expect("clear flag");
+            }
+        }
+
+        /// The build prints an error line and exits 1.
+        pub(super) fn fail_build(&self, on: bool) {
+            self.flag("build_fail", on);
+        }
+
+        /// What `nix flake metadata --json` prints.
+        pub(super) fn set_meta(&self, json: &str) {
+            std::fs::write(self.dir.path().join("meta.json"), json).expect("write meta");
+        }
+
+        pub(super) fn sandbox(&self) -> PathBuf {
             self.dir.path().join("sandbox")
+        }
+
+        /// The driver's home, `<home>/nix-driver` in production.
+        pub(super) fn home(&self) -> PathBuf {
+            self.dir.path().join("home")
         }
     }
 
-    async fn target_def() -> TargetDef {
+    pub(super) async fn target_def() -> TargetDef {
+        target_def_with(&["rg"]).await
+    }
+
+    pub(super) async fn target_def_with(programs: &[&str]) -> TargetDef {
         let config = HashMap::from([
-            (
-                "nixpkgs".to_string(),
-                Value::String("github:o/r/main".to_string()),
-            ),
+            ("nixpkgs".to_string(), Value::String(REF.to_string())),
             (
                 "packages".to_string(),
                 Value::List(vec![Value::String("pkgs.ripgrep".to_string())]),
             ),
             (
                 "programs".to_string(),
-                Value::List(vec![Value::String("rg".to_string())]),
+                Value::List(
+                    programs
+                        .iter()
+                        .map(|p| Value::String((*p).to_string()))
+                        .collect(),
+                ),
             ),
         ]);
         let req = ParseRequest {
@@ -949,11 +1029,22 @@ mod log_tests {
 
     /// Run the driver against `fake`; returns the result and what reached the
     /// request's stdout and stderr writers.
-    async fn run(
+    pub(super) async fn run(
         fake: &Fake,
         log_capture: bool,
     ) -> (anyhow::Result<ManagedRunResponse>, String, String) {
         let def = target_def().await;
+        run_def(fake, &def, log_capture, false, &StdCancellationToken::new()).await
+    }
+
+    /// Run `def` against `fake` with the request's `force` bit and `ctoken`.
+    pub(super) async fn run_def(
+        fake: &Fake,
+        def: &TargetDef,
+        log_capture: bool,
+        force: bool,
+        ctoken: &StdCancellationToken,
+    ) -> (anyhow::Result<ManagedRunResponse>, String, String) {
         let id = "test".to_string();
         let sandbox = fake.sandbox();
         let pkg = sandbox.join("ws/pkg");
@@ -961,8 +1052,9 @@ mod log_tests {
         let list = sandbox.join("nix.list");
         std::fs::write(&list, format!("{}\n", fake.nix.display())).expect("write list");
         let (mut out, mut err) = (Vec::<u8>::new(), Vec::<u8>::new());
-        let mut request = RunRequest::new(&id, &def, &sandbox);
+        let mut request = RunRequest::new(&id, def, &sandbox);
         request.log_capture = log_capture;
+        request.force = force;
         request.stdout = Some(&mut out);
         request.stderr = Some(&mut err);
         let req = ManagedRunRequest {
@@ -996,23 +1088,28 @@ mod log_tests {
                 unpack_root: sandbox.join("ws"),
             }],
         };
-        let home = fake.dir.path().join("home");
-        let res = Driver::new(home)
-            .run(req, &StdCancellationToken::new())
-            .await;
+        let res = Driver::new(fake.home()).run(req, ctoken).await;
         (
             res,
             String::from_utf8_lossy(&out).into_owned(),
             String::from_utf8_lossy(&err).into_owned(),
         )
     }
+}
+
+/// Where nix's output goes: its stderr is the run's log, its stdout (flake
+/// metadata, a store path) is data and never the log.
+#[cfg(test)]
+mod log_tests {
+    use super::fake::{Fake, STORE_TOKEN, run};
+    use super::*;
 
     /// Under `log_capture` the flake lock's and the build's progress reach the
     /// log; the flake metadata and the store path (stdout) never do, and the
     /// driver still builds from them.
     #[tokio::test]
     async fn nix_progress_reaches_the_log_and_its_answers_never_do() {
-        let fake = Fake::new(false);
+        let fake = Fake::new();
         let (res, out, err) = run(&fake, true).await;
         let res = res.expect("run");
         assert!(res.artifacts.is_empty(), "no Log artifact crosses");
@@ -1034,7 +1131,8 @@ mod log_tests {
     /// writers see nothing.
     #[tokio::test]
     async fn a_failed_build_is_logged_under_log_capture_and_unchanged_without() {
-        let fake = Fake::new(true);
+        let fake = Fake::new();
+        fake.fail_build(true);
         let (res, out, err) = run(&fake, true).await;
         let Err(e) = res else {
             panic!("the build fails")
@@ -1067,5 +1165,91 @@ mod log_tests {
         );
         assert_eq!((out.as_str(), err.as_str()), ("", ""));
         assert!(!fake.sandbox().join("log.txt").exists());
+    }
+}
+
+/// The env's store path is declared as the run's one host path, and every
+/// wrapper depends on nothing outside it.
+#[cfg(test)]
+mod host_path_tests {
+    use super::fake::{Fake, run, run_def, target_def_with};
+    use super::*;
+    use hcore::hasync::StdCancellationToken;
+
+    /// The run response carries exactly the path `--print-out-paths` printed.
+    #[tokio::test]
+    async fn nix_declares_env_path() {
+        let fake = Fake::new();
+        let (res, _, _) = run(&fake, false).await;
+        let res = res.expect("run");
+        let store = fake.store.to_str().expect("utf-8 store path");
+        assert_eq!(
+            res.host_paths,
+            vec![HostPath::new(store).expect("host path")]
+        );
+    }
+
+    /// The program path each wrapper checks and execs.
+    fn wrapper_target(wrapper: &str) -> &str {
+        let exec = wrapper
+            .lines()
+            .find_map(|l| l.strip_prefix("exec '"))
+            .unwrap_or_else(|| panic!("no exec line in {wrapper}"));
+        exec.strip_suffix("' \"$@\"")
+            .unwrap_or_else(|| panic!("unexpected exec line in {wrapper}"))
+    }
+
+    /// Every wrapper execs a program under the declared path, so the one path
+    /// covers the whole output (I2).
+    #[tokio::test]
+    async fn nix_wrappers_all_under_declared_path() {
+        let fake = Fake::new();
+        let def = target_def_with(&["rg", "fd"]).await;
+        let (res, _, _) = run_def(&fake, &def, false, false, &StdCancellationToken::new()).await;
+        let res = res.expect("run");
+        let [declared] = res.host_paths.as_slice() else {
+            panic!("one host path, got {:?}", res.host_paths)
+        };
+        let under = format!("{}/", declared.as_str());
+        for program in ["fd", "rg"] {
+            let wrapper = std::fs::read_to_string(fake.sandbox().join("ws/pkg/bin").join(program))
+                .expect("wrapper");
+            let target = wrapper_target(&wrapper);
+            assert!(target.starts_with(&under), "{target} not under {under}");
+            assert_eq!(target, format!("{under}bin/{program}"));
+        }
+    }
+
+    /// A wrapper whose program is gone exits 127, naming the path and the
+    /// command that rebuilds it; with the program present it execs it.
+    #[tokio::test]
+    async fn wrapper_checks_its_program_before_exec() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let program = dir.path().join("it's here");
+        std::fs::write(&program, "#!/bin/sh\necho ran \"$@\"\n").expect("write program");
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let program = program.to_str().expect("utf-8");
+        let wrapper = dir.path().join("wrapper");
+        std::fs::write(&wrapper, wrapper_script(program, "//pkg:t")).expect("write wrapper");
+
+        let out = std::process::Command::new("/bin/sh")
+            .arg(&wrapper)
+            .arg("a b")
+            .output()
+            .expect("run wrapper");
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "ran a b\n");
+
+        std::fs::remove_file(program).expect("remove program");
+        let out = std::process::Command::new("/bin/sh")
+            .arg(&wrapper)
+            .output()
+            .expect("run wrapper");
+        assert_eq!(out.status.code(), Some(127), "{out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            format!("{program} missing; heph run --force //pkg:t\n")
+        );
     }
 }
