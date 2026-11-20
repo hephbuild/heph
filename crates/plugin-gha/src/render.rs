@@ -889,6 +889,7 @@ mod tests {
         BuildEventKind::CacheOutcome {
             addr: addr.into(),
             outcome,
+            reason: None,
         }
     }
 
