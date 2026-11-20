@@ -428,6 +428,17 @@ mod tests {
         fn provider_options(&self, _name: &str) -> hplugin::config::Options {
             Default::default()
         }
+        fn list(
+            self: std::sync::Arc<Self>,
+            what: hplugin::lsp::Listing,
+        ) -> futures::future::BoxFuture<'static, anyhow::Result<hplugin::lsp::Listed>> {
+            super::super::context::list_with_fresh_buildfile_provider(
+                self.root().to_path_buf(),
+                self.function_registry(),
+                what,
+                0,
+            )
+        }
     }
 
     /// Validate `content` the way the server does: its tokens and overlay

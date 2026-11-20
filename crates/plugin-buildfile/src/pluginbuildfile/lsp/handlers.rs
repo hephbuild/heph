@@ -1288,6 +1288,17 @@ mod tests {
         fn provider_options(&self, _: &str) -> hplugin::config::Options {
             hplugin::config::Options::default()
         }
+        fn list(
+            self: std::sync::Arc<Self>,
+            what: hplugin::lsp::Listing,
+        ) -> futures::future::BoxFuture<'static, anyhow::Result<hplugin::lsp::Listed>> {
+            super::super::context::list_with_fresh_buildfile_provider(
+                self.root().to_path_buf(),
+                self.function_registry(),
+                what,
+                0,
+            )
+        }
     }
 
     #[test]

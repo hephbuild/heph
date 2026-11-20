@@ -23,6 +23,8 @@ mod server;
 pub(crate) mod site;
 
 #[cfg(feature = "test-support")]
+pub use context::list_with_fresh_buildfile_provider;
+#[cfg(feature = "test-support")]
 pub use server::{RunOptions, run_with};
 
 use hplugin::lsp::LspEngine;
@@ -32,9 +34,9 @@ use std::sync::Arc;
 /// Serve the BUILD-file LSP over stdio until the client disconnects.
 ///
 /// Must be called with a tokio runtime context entered: the LSP context
-/// captures `Handle::current()` at construction (its listing provider's
-/// memoizer spawns on it). `build_lsp.rs` enters the command runtime before
-/// calling in.
+/// captures `Handle::current()` at construction (the engine's listings and the
+/// per-buffer loader's walk run on it). `build_lsp.rs` enters the command
+/// runtime before calling in.
 pub fn serve_stdio(engine: Arc<dyn LspEngine>) -> anyhow::Result<()> {
     // `_io_threads` is intentionally never joined — see the `process::exit` note
     // below. Kept bound (not dropped) so the stdout writer thread stays alive to

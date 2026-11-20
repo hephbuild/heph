@@ -201,6 +201,17 @@ impl LspEngine for FakeEngine {
     fn provider_options(&self, _name: &str) -> hplugin::config::Options {
         hplugin::config::Options::default()
     }
+    fn list(
+        self: Arc<Self>,
+        what: hplugin::lsp::Listing,
+    ) -> futures::future::BoxFuture<'static, anyhow::Result<hplugin::lsp::Listed>> {
+        plugin_buildfile::pluginbuildfile::lsp_list_with_fresh_buildfile_provider(
+            self.root.clone(),
+            Arc::clone(&self.registry),
+            what,
+            0,
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2533,6 +2544,20 @@ fn site_is_a_function_of_the_prefix() {
                 .filter_map(|i| i["label"].as_str().map(str::to_string))
                 .collect()
         };
+        // Every document this fixture opens is on disk before the original
+        // completion: each listing sees the workspace as it is now, so a
+        // package created between two completions would show in one and not
+        // the other.
+        let opened: Vec<_> = variants(fixture, *skip_c)
+            .into_iter()
+            .map(|(v, text)| {
+                // Opened fresh, and reached by didChange from the original
+                // (only the second has a stale AST to exercise).
+                let fresh = lsp.open(&format!("v{n}{v}/BUILD"), &text);
+                let edited_base = lsp.open(&format!("e{n}{v}/BUILD"), fixture);
+                (v, text, fresh, edited_base)
+            })
+            .collect();
         let doc = lsp.open(&format!("o{n}/BUILD"), fixture);
         let original = lsp.explain(&doc);
         let original_labels = heph_labels(&lsp.completion(&doc));
@@ -2541,11 +2566,7 @@ fn site_is_a_function_of_the_prefix() {
             kind(&original).as_str(),
             "target_key" | "state_key" | "arg_key"
         );
-        for (v, text) in variants(fixture, *skip_c) {
-            // Opened fresh, and reached by didChange from the original (only
-            // the second has a stale AST to exercise).
-            let fresh = lsp.open(&format!("v{n}{v}/BUILD"), &text);
-            let edited_base = lsp.open(&format!("e{n}{v}/BUILD"), fixture);
+        for (v, text, fresh, edited_base) in opened {
             let edited = lsp.change(&edited_base, &text);
             for (how, d) in [("fresh", &fresh), ("didChange", &edited)] {
                 let explained = lsp.explain(d);

@@ -5,16 +5,14 @@
 //! proxy uses for the provenance hover and driver-schema completion.
 
 use super::index::{DocIndex, SharedState};
+#[cfg(any(test, feature = "test-support"))]
 use crate::pluginbuildfile::Provider;
 use crate::pluginbuildfile::provider::PackageList;
 use crate::pluginbuildfile::run_file::{
     BuildFileLoader, build_globals, eval_source, resolve_load_target,
 };
-use hcore::hasync::StdCancellationToken;
-use hmodel::htpkg::PkgBuf;
 use hplugin::function::FunctionRegistry;
-use hplugin::lsp::LspEngine;
-use hplugin::provider::{ListPackagesRequest, ListRequest, Provider as EProvider};
+use hplugin::lsp::{Listed, Listing, LspEngine};
 use starlark::docs::DocModule;
 use starlark::environment::Globals;
 use starlark::errors::EvalMessage;
@@ -22,17 +20,10 @@ use starlark::syntax::{AstModule, Dialect};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
 use vendored_starlark_lsp::completion::{StringCompletionResult, StringCompletionType};
 use vendored_starlark_lsp::error::eval_message_to_lsp_diagnostic;
 use vendored_starlark_lsp::server::{LspContext, LspEvalResult, LspUri, StringLiteralResult};
 use vendored_starlark_lsp::uri::file_path_to_uri;
-
-/// How long a listing provider (and its internal package/target memoization) is
-/// reused before being rebuilt. Bursts of completion requests (keystrokes) within
-/// the window are served from its cache; after it, a fresh provider re-walks the
-/// workspace so newly-added packages/targets show up without restarting the LSP.
-const LISTING_TTL: Duration = Duration::from_secs(2);
 
 pub(crate) struct HephLspContext {
     root: PathBuf,
@@ -44,12 +35,9 @@ pub(crate) struct HephLspContext {
     /// BUILD-file name patterns, from the buildfile provider's `patterns` config
     /// option (defaulting to `BUILD`). Used for both listing and load resolution.
     patterns: Vec<glob::Pattern>,
-    /// Buildfile provider used only for package/target listing during completion,
-    /// with its build timestamp. Rebuilt after [`LISTING_TTL`] (see [`Self::provider`]).
-    provider: Mutex<(Instant, Arc<Provider>)>,
-    /// The runtime the listing provider's memoizer spawns on — captured at
-    /// construction (the LSP context is built on the server's runtime), so
-    /// TTL rebuilds from sync callers don't have to discover one.
+    /// The runtime the engine's listing and the buffer evaluation spawn on —
+    /// captured at construction (the LSP context is built on the server's
+    /// runtime), so sync callers don't have to discover one.
     runtime: tokio::runtime::Handle,
     pub(crate) shared: Arc<SharedState>,
 }
@@ -63,7 +51,6 @@ impl HephLspContext {
         let builtin_hovers = crate::pluginbuildfile::run_file::BuiltinHovers::new(&doc_globals);
         let patterns = buildfile_patterns(&*engine);
         let runtime = tokio::runtime::Handle::current();
-        let provider = build_listing_provider(&root, &patterns, &registry, runtime.clone());
         let shared = SharedState::new(
             engine,
             root.clone(),
@@ -77,7 +64,6 @@ impl HephLspContext {
             doc_globals,
             globals: Arc::new(OnceLock::new()),
             patterns,
-            provider: Mutex::new((Instant::now(), provider)),
             runtime,
             shared,
         }
@@ -86,26 +72,6 @@ impl HephLspContext {
     /// The documentation of the global `name` (a builtin), if it has any.
     pub(crate) fn doc_global(&self, name: &str) -> Option<&starlark::docs::DocItem> {
         self.doc_globals.members.get(name)
-    }
-
-    /// The listing provider, rebuilt if older than [`LISTING_TTL`]. Reuse within
-    /// the window keeps repeated completion requests fast (served from the
-    /// provider's own memoization); a rebuild drops that cache so the next walk
-    /// reflects the current workspace.
-    fn provider(&self) -> Arc<Provider> {
-        let mut cell = self.provider.lock().expect("provider lock");
-        if cell.0.elapsed() >= LISTING_TTL {
-            *cell = (
-                Instant::now(),
-                build_listing_provider(
-                    &self.root,
-                    &self.patterns,
-                    &self.registry,
-                    self.runtime.clone(),
-                ),
-            );
-        }
-        Arc::clone(&cell.1)
     }
 
     /// Package name for a BUILD file path (its parent dir, workspace-relative,
@@ -180,60 +146,54 @@ impl HephLspContext {
         )
     }
 
-    /// List package names beginning with `prefix` (no leading `//`).
-    pub(crate) fn list_packages(&self, prefix: &str) -> Vec<String> {
-        let provider = self.provider();
-        let ctoken = StdCancellationToken::new();
-        let fut = provider.list_packages(
-            ListPackagesRequest::new("lsp", PkgBuf::from(prefix)),
-            &ctoken,
-        );
+    /// What the engine lists for `what`, in a cache scope of its own (see
+    /// [`LspEngine::list`]). `None` when the listing failed; the error is
+    /// logged, since it is the only explanation an empty completion list will
+    /// ever get.
+    pub(crate) fn listing(&self, what: Listing) -> Option<Listed> {
+        let fut = Arc::clone(&self.shared.engine).list(what.clone());
         // Entered, not spawned: this runs on the LSP server's sync request
-        // thread, which has no runtime context of its own, and the provider's
-        // walk calls `hcore::blocking::run` — which requires one
-        // (`spawn_blocking` under the hood). Entering the captured server
-        // runtime satisfies it; the block_on itself parks only this thread.
+        // thread, which has no runtime context of its own, and the listing
+        // spawns package tasks and reaches `hcore::blocking::run`, which need
+        // one. Entering the captured server runtime satisfies them; the
+        // block_on itself parks only this thread.
         // `listing_works_from_a_thread_with_no_ambient_runtime` pins it.
         let _rt = self.runtime.enter();
         match futures::executor::block_on(fut) {
-            Ok(iter) => iter
-                .filter_map(Result::ok)
-                .map(|r| r.pkg.to_string())
-                .filter(|p| p.starts_with(prefix))
-                .collect(),
-            // Completion degrades to "no suggestions" rather than failing the
-            // request, but the walk error is the only explanation the user will
-            // ever get for an empty list — never drop it.
+            Ok(listed) => {
+                for skipped in &listed.skipped {
+                    tracing::debug!(scope = listed.scope, skipped, "lsp: listing left out");
+                }
+                Some(listed)
+            }
             Err(e) => {
-                tracing::warn!(error = ?e, prefix, "lsp: package walk failed");
-                Vec::new()
+                tracing::warn!(error = ?e, ?what, "lsp: listing failed");
+                None
             }
         }
     }
 
-    /// List target names in `package`.
+    /// Package names beginning with `prefix` (no leading `//`).
+    pub(crate) fn list_packages(&self, prefix: &str) -> Vec<String> {
+        let Some(listed) = self.listing(packages_under(prefix)) else {
+            return Vec::new();
+        };
+        listed
+            .entries
+            .into_iter()
+            .map(|e| e.name)
+            .filter(|p| p.starts_with(prefix))
+            .collect()
+    }
+
+    /// Target names in `package`.
     pub(crate) fn list_targets(&self, package: &str) -> Vec<String> {
-        let provider = self.provider();
-        let ctoken = StdCancellationToken::new();
-        let fut = provider.list(
-            ListRequest::new(
-                "lsp",
-                PkgBuf::from(package),
-                vec![],
-                std::sync::Arc::new(hplugin::provider::NoopExecutor),
-            ),
-            &ctoken,
-        );
-        // Same contract as `list_packages`: the provider may reach
-        // `hcore::blocking::run`, which needs a runtime context.
-        let _rt = self.runtime.enter();
-        match futures::executor::block_on(fut) {
-            Ok(iter) => iter
-                .filter_map(Result::ok)
-                .map(|r| r.addr.name.clone())
-                .collect(),
-            Err(_) => Vec::new(),
-        }
+        let Some(listed) = self.listing(Listing::Targets {
+            package: package.to_string(),
+        }) else {
+            return Vec::new();
+        };
+        listed.entries.into_iter().map(|e| e.name).collect()
     }
 
     /// The on-disk BUILD file URL for a package.
@@ -252,22 +212,85 @@ fn first_build_file(dir: &Path, patterns: &[glob::Pattern]) -> Option<PathBuf> {
         .next()
 }
 
-/// Build a fresh buildfile provider for package/target listing, configured with
-/// the same patterns the engine's provider uses and the aggregated function
-/// registry (so `list(pkg)` can evaluate BUILD files).
-fn build_listing_provider(
-    root: &Path,
-    patterns: &[glob::Pattern],
-    registry: &Arc<FunctionRegistry>,
-    runtime: tokio::runtime::Handle,
-) -> Arc<Provider> {
-    let provider = Provider {
-        root: root.to_path_buf(),
-        build_file_patterns: patterns.to_vec(),
-        ..Provider::base(runtime)
+/// The listing that holds every package starting with `prefix`: the packages
+/// under its last whole path segment (`foo/ba` → under `foo`, `@heph/go/g` →
+/// under `@heph/go`, `fo` → under the root). The engine's package matcher
+/// works in whole segments, so the partial one is the caller's filter.
+pub(crate) fn packages_under(prefix: &str) -> Listing {
+    let under = prefix.rsplit_once('/').map_or("", |(dir, _)| dir);
+    Listing::Packages {
+        under: under.to_string(),
     }
-    .with_function_registry(Arc::clone(registry));
-    Arc::new(provider)
+}
+
+/// A test engine's [`LspEngine::list`]: a fresh buildfile provider over
+/// `root` per call, which is what a fresh cache scope gives the real one.
+/// Every entry is attributed to `buildfile`; no provider is told the scope
+/// ended.
+#[cfg(any(test, feature = "test-support"))]
+pub fn list_with_fresh_buildfile_provider(
+    root: PathBuf,
+    registry: Arc<FunctionRegistry>,
+    what: Listing,
+    scope: u64,
+) -> futures::future::BoxFuture<'static, anyhow::Result<Listed>> {
+    use hcore::hasync::StdCancellationToken;
+    use hmodel::htpkg::PkgBuf;
+    use hplugin::provider::{ListPackagesRequest, ListRequest, Provider as _};
+    Box::pin(async move {
+        let provider = Provider {
+            root,
+            build_file_patterns: crate::pluginbuildfile::provider::default_build_file_patterns(),
+            ..Provider::base(tokio::runtime::Handle::current())
+        }
+        .with_function_registry(registry);
+        let ctoken = StdCancellationToken::new();
+        let mut names: Vec<String> = match &what {
+            Listing::Packages { under } => provider
+                .list_packages(
+                    ListPackagesRequest::new("lsp-test", PkgBuf::from(under.as_str())),
+                    &ctoken,
+                )
+                .await?
+                .filter_map(Result::ok)
+                .map(|r| r.pkg.to_string())
+                .filter(|p| {
+                    under.is_empty()
+                        || p == under
+                        || p.strip_prefix(under.as_str())
+                            .is_some_and(|rest| rest.starts_with('/'))
+                })
+                .collect(),
+            Listing::Targets { package } => provider
+                .list(
+                    ListRequest::new(
+                        "lsp-test",
+                        PkgBuf::from(package.as_str()),
+                        vec![],
+                        Arc::new(hplugin::provider::NoopExecutor),
+                    ),
+                    &ctoken,
+                )
+                .await?
+                .filter_map(Result::ok)
+                .map(|r| r.addr.name.clone())
+                .collect(),
+        };
+        names.sort_unstable();
+        names.dedup();
+        Ok(Listed {
+            scope,
+            entries: names
+                .into_iter()
+                .map(|name| hplugin::lsp::ListedEntry {
+                    name,
+                    provider: "buildfile".to_string(),
+                })
+                .collect(),
+            skipped: Vec::new(),
+            scope_ended: Box::pin(async { Vec::new() }),
+        })
+    })
 }
 
 /// BUILD-file name patterns from the workspace's buildfile-provider config,
@@ -542,6 +565,17 @@ mod tests {
         }
         fn provider_options(&self, _name: &str) -> Options {
             Options::default()
+        }
+        fn list(
+            self: Arc<Self>,
+            what: hplugin::lsp::Listing,
+        ) -> futures::future::BoxFuture<'static, anyhow::Result<hplugin::lsp::Listed>> {
+            super::list_with_fresh_buildfile_provider(
+                self.root.clone(),
+                self.function_registry(),
+                what,
+                0,
+            )
         }
     }
 

@@ -51,6 +51,7 @@ mod label_select;
 mod listed_facts;
 mod log_api;
 mod log_cmd;
+mod lsp_listing;
 mod oci;
 mod oci_docker;
 mod oci_image;
