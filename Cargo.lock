@@ -5179,6 +5179,7 @@ dependencies = [
  "serde_yaml",
  "tempfile",
  "tokio",
+ "tracing",
  "xxhash-rust",
 ]
 
