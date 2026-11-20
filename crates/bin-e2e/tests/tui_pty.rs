@@ -1247,7 +1247,9 @@ fn dashboard_flag_without_tty() {
 }
 
 /// Shrink and grow on the line and on the dashboard: each redraw fills the
-/// window it has, once, with nothing left over from the old size.
+/// window it has, once, with nothing left over from the old size — a shrink
+/// and a grow back inside one tick included, which ends at the size heph last
+/// drew at, on a screen the terminal reflowed in between.
 #[test]
 fn resize_in_each_mode() {
     let mut g = Gated::start("", &[]);
@@ -1265,6 +1267,12 @@ fn resize_in_each_mode() {
         Step::Until("the dashboard filling 20x80", dashboard_fits),
         Step::Resize(40, 140),
         Step::Until("the dashboard filling 40x140", dashboard_fits),
+        Step::Resize(20, 80),
+        Step::Resize(40, 140),
+        Step::Until(
+            "the dashboard filling 40x140 after a round trip",
+            dashboard_fits,
+        ),
         Step::Resize(24, 100),
         Step::Keys(ESC),
         Step::Settle,
