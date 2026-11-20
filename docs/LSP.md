@@ -45,6 +45,50 @@ used. A BUILD file opened outside the repo gets the stock answers only, with
 start; until that snapshot lands, heph answers with the stock results and
 `reason: providers_loading`.
 
+## Listing packages and targets
+
+An `address` or `load_path` completion asks the engine, through
+`LspEngine::list`, for what `heph query` would list: `//pkg` and `load("//pkg`
+list the packages under the typed prefix's last whole segment (`//foo/ba` lists
+under `//foo` and keeps what starts with `foo/ba`), `//pkg:` and `:` list one
+package's targets. Every registered provider answers, with its states and
+probes, so `//@heph/go/gocache:modcache` and `//@heph/oci:blobs` complete like
+any BUILD target.
+
+- **A fresh root request per completion, so a fresh cache scope.** An editor
+  session holds one engine for hours; a scope per call is what makes a package
+  created, a target renamed or a BUILD file fixed on disk show on the next
+  completion. Nothing about a listing outlives its call: when it returns, the
+  scope ends and each provider is told (`scope_ended`). There is no TTL and no
+  LSP-side cache of the listing. Within one buffer evaluation the per-buffer
+  `loader()` still dedupes the package walk.
+- **`Discovery::KeepGoing`.** A provider that fails, or a package that does
+  not evaluate, costs only its own entries. The rest still complete, and what
+  was left out is logged at `debug` (`lsp: listing left out`) and shown by
+  `--explain`.
+- **Provenance.** Each entry names the provider it came from: for a package,
+  the first provider in registration order that listed it (the merge `heph
+  query` walks); for a target, the provider that listed it.
+
+Diagnostics open no scope: they check the document against the driver and
+provider schemas with a fresh per-parse loader and never call a provider
+through the engine.
+
+A scope per completion was measured before settling on no debounce (release
+build, 2000 BUILD packages of 4 targets each,
+`crates/e2e/tests/e2e/lsp_listing.rs::scope_per_completion_cost`):
+
+| Listing | Warm median |
+|---|---|
+| Every package in the workspace (`//`) | 76 ms |
+| A subtree's packages (`//d3/e4/`) | 38 ms |
+| One package's targets (`//d3/e4/p5:`) | 38 ms |
+
+Completions are not debounced: the costliest listing, the whole workspace,
+stays under 100 ms at 2000 packages, and the common case, a subtree or one
+package, costs half that. A workspace where `//` grows well past this is the
+point to revisit it.
+
 ## Site kinds
 
 | Site kind | Detected from | Completion | Hover | Definition |
@@ -176,6 +220,45 @@ $ heph tool build-lsp --explain BUILD:12:20 --json
 ```
 
 Line and column are 1-based, the column counted in characters.
+
+At an `address` or `load_path` site, `--explain` then runs the listing that
+site's completion runs, on the engine `heph` builds for the workspace (only
+there: classifying any other position needs no workspace), and prints after
+the classification:
+
+- `listing`: what was listed (`packages under //foo`, `targets in //foo`) and
+  the prefix a candidate must start with;
+- `scope`: the id of the cache scope the listing ran in;
+- `listed` / `candidates`: how many entries came back, and how many the prefix
+  kept;
+- one `candidate: "<name>" from <provider>` per entry kept;
+- one `skipped:` line per thing the listing left out (`<stage> <provider>
+  <scope>: <cause>`);
+- one `scope ended: <provider> <outcome>` per provider told the scope ended,
+  awaited: `released` (it dropped the scope's caches), `unsupported` (it keeps
+  none, or predates scopes), `failed`, `panicked` or `timed_out`.
+
+When the engine cannot be built, or the listing fails, a `listing failed:`
+line says why. `--json` puts the same under a `listing` key: `query`,
+`prefix`, `scope`, `listed`, `candidates` (`name`, `provider`), `skipped`,
+`scope_ended` (`provider`, `outcome`), or `error`.
+
+```console
+$ heph tool build-lsp --explain a/BUILD:1:64
+a/BUILD:1:64
+  site: address
+  prefix: "//b:"
+  quote: "closed"
+  reason: none (heph answers here)
+  listing: targets in //b, kept if starting with ""
+  scope: 1
+  listed: 1, candidates: 1
+  candidate: "x" from buildfile
+  scope ended: query unsupported
+  scope ended: fs unsupported
+  scope ended: hostbin unsupported
+  scope ended: buildfile released
+```
 
 ## Adding a site kind
 

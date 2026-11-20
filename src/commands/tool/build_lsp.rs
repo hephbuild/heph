@@ -14,8 +14,11 @@ use crate::tui::LogSink;
 pub struct Args {
     /// Instead of serving, print how the server classifies one position of a
     /// BUILD file: the site, why heph's answer there would be empty, and what
-    /// a present answer could not do in full. Line and column are 1-based,
-    /// the column counted in characters.
+    /// a present answer could not do in full. At an address or load path, also
+    /// the listing its completion runs: the cache scope, each candidate with
+    /// its provider, what was left out, and how each provider answered the
+    /// scope's end. Line and column are 1-based, the column counted in
+    /// characters.
     #[arg(long, value_name = "FILE:LINE:COL")]
     explain: Option<String>,
 
@@ -31,7 +34,21 @@ pub fn execute(
     global: &GlobalOptions,
 ) -> anyhow::Result<()> {
     if let Some(target) = &args.explain {
-        let out = crate::pluginbuildfile::lsp_explain(target, args.json)?;
+        // The engine is built only at a site that lists (an address or a load
+        // path), so classifying any other position needs no workspace. The
+        // runtime is cheap and the listing needs one entered.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .context("building tokio runtime for build-lsp --explain")?;
+        let _guard = runtime.enter();
+        let mut shutdown = None;
+        let out = crate::pluginbuildfile::lsp_explain(target, args.json, || {
+            let (engine, trigger) = bootstrap::new_engine(global, session)?;
+            shutdown = Some(trigger);
+            Ok(engine as Arc<dyn hplugin::lsp::LspEngine>)
+        })?;
+        drop(shutdown);
         println!("{out}");
         return Ok(());
     }

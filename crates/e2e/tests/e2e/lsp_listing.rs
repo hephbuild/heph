@@ -133,6 +133,85 @@ target(name = "kept", driver = "bash", run = "true")"#,
     Ok(())
 }
 
+/// `heph tool build-lsp --explain FILE:LINE:COL` at `needle`'s end in `app`'s
+/// BUILD file, through the engine the closure hands it (`None`: no engine,
+/// and calling for one fails the explain).
+async fn explain(
+    ws: &htestkit::Workspace,
+    text: &str,
+    needle: &str,
+    json: bool,
+    engine: Option<Arc<heph::engine::Engine>>,
+) -> anyhow::Result<String> {
+    ws.write_build_file("app", text);
+    let file = ws.dir.path().join("app/BUILD");
+    let offset = text
+        .find(needle)
+        .map(|i| i + needle.len())
+        .unwrap_or_default();
+    let (line, col) = text
+        .get(..offset)
+        .map(|before| {
+            let line = before.matches('\n').count() + 1;
+            let col = before.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+            (line, col)
+        })
+        .unwrap_or((1, 1));
+    let target = format!("{}:{line}:{col}", file.display());
+    // `--explain` blocks on the listing, as the command's main thread does;
+    // a blocking thread keeps this runtime's workers free to run it.
+    tokio::task::spawn_blocking(move || {
+        heph::pluginbuildfile::lsp_explain(&target, json, || match engine {
+            Some(engine) => Ok(engine as Arc<dyn hplugin::lsp::LspEngine>),
+            None => anyhow::bail!("this site must not build an engine"),
+        })
+    })
+    .await?
+}
+
+/// `--explain` at an address shows the listing its completion runs: the
+/// scope, each candidate with the provider it came from, and how each
+/// provider answered the end of that scope. `:name` lists the document's own
+/// package; a site that lists nothing never builds an engine.
+#[tokio::test(flavor = "multi_thread")]
+async fn explain_names_the_scope_and_each_candidates_provider() -> anyhow::Result<()> {
+    let ws = workspace()?;
+    let text = r#"target(name = "t", driver = "bash", run = "true", deps = ["//@heph/go/gocache:mod", ":t"])"#;
+
+    let out = explain(&ws, text, ":mod", true, Some(Arc::clone(&ws.engine))).await?;
+    let v: serde_json::Value = serde_json::from_str(&out)?;
+    let listing = &v["listing"];
+    assert_eq!(listing["query"]["targets_in"], "@heph/go/gocache", "{out}");
+    assert!(listing["scope"].as_u64().is_some_and(|s| s > 0), "{out}");
+    assert_eq!(
+        listing["candidates"],
+        serde_json::json!([{ "name": "modcache", "provider": "go" }]),
+        "{out}"
+    );
+    let acks = listing["scope_ended"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        acks.iter()
+            .any(|a| a["provider"] == "go" && a["outcome"].is_string()),
+        "every provider told the scope ended answers: {out}"
+    );
+
+    // The text form, and `:t` resolved against the document's package.
+    let out = explain(&ws, text, "\":t", false, Some(Arc::clone(&ws.engine))).await?;
+    assert!(out.contains("site: address"), "{out}");
+    assert!(out.contains("listing: targets in //app"), "{out}");
+    assert!(out.contains("\n  scope: "), "{out}");
+    assert!(out.contains("candidate: \"t\" from buildfile"), "{out}");
+    assert!(out.contains("scope ended: "), "{out}");
+
+    // Not an address: classified without an engine.
+    let out = explain(&ws, text, "driver = \"ba", false, None).await?;
+    assert!(!out.contains("listing"), "{out}");
+    Ok(())
+}
+
 /// A generated workspace of `D * E * P` BUILD packages, `d<i>/e<j>/p<k>`, each
 /// with [`TARGETS_PER_PKG`] targets.
 const D: usize = 10;

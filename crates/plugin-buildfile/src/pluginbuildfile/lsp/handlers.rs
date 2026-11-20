@@ -21,7 +21,7 @@
 //! The renderers and item builders here moved from the old response proxy;
 //! they gained the resolver's [`Site`] as input instead of re-scanning text.
 
-use super::context::HephLspContext;
+use super::context::{HephLspContext, packages_under};
 use super::index::SharedState;
 use super::lex::{self, Bracket, Kind, NO_LINK, Tok, Tokens};
 use super::position::{self, Encoding};
@@ -29,7 +29,7 @@ use super::site::{ArgCall, Builtin, Call, Quote, Site, Str};
 use crate::pluginbuildfile::run_file::{resolve_load_target, target_base_fields};
 use crate::pluginbuildfile::{DEFAULT_INDENT, build_file_indent_from_options};
 use hplugin::driver::DriverSchema;
-use hplugin::lsp::LspEngine;
+use hplugin::lsp::{Listing, LspEngine};
 use hplugin::provider::StateSchema;
 use lsp_types::{
     CompletionItem, CompletionItemKind, CompletionTextEdit, Documentation, Hover, HoverContents,
@@ -823,6 +823,49 @@ fn load_paths(prefix: &str, ctx: &Ctx<'_>) -> Vec<Candidate> {
             label: format!("//{p}"),
         })
         .collect()
+}
+
+/// The engine listing a completion at `site` runs, for `--explain`.
+pub(crate) struct ListingQuery {
+    pub listing: Listing,
+    /// What the completion keeps of the listing: the names starting with it.
+    pub prefix: String,
+    /// Whether the root package (`""`) is a candidate: not for a load path.
+    pub root_package: bool,
+}
+
+/// The listing [`addresses`] and [`load_paths`] run at `site`, and how they
+/// filter it; `package` is the open document's package, asked only for a
+/// `:name`. `None` for a site that lists nothing.
+pub(crate) fn listing_query(site: &Site, package: impl FnOnce() -> String) -> Option<ListingQuery> {
+    let (listing, prefix, root_package) = match site {
+        Site::Address { value } => match value.prefix.strip_prefix(':') {
+            Some(rel) => (Listing::Targets { package: package() }, rel, true),
+            None => {
+                let rest = value.prefix.strip_prefix("//")?;
+                match rest.split_once(':') {
+                    Some((pkg, name)) => (
+                        Listing::Targets {
+                            package: pkg.to_string(),
+                        },
+                        name,
+                        true,
+                    ),
+                    None => (packages_under(rest), rest, true),
+                }
+            }
+        },
+        Site::LoadPath { value } => {
+            let rest = value.prefix.strip_prefix("//").unwrap_or("");
+            (packages_under(rest), rest, false)
+        }
+        _ => return None,
+    };
+    Some(ListingQuery {
+        listing,
+        prefix: prefix.to_string(),
+        root_package,
+    })
 }
 
 /// The files a load path names: every BUILD file of a package directory, or
