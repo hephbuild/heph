@@ -8,8 +8,8 @@ let
   # pins below move with it.
   goPkgs = import inputs.nixpkgs-go { system = pkgs.stdenv.system; };
   go =
-    assert lib.assertMsg (goPkgs.go_1_27.version == "1.27.3")
-      "nixpkgs-go has go ${goPkgs.go_1_27.version}, but heph pins 1.27.3: move DEFAULT_GO_VERSION (crates/plugin-go/src/plugingo/toolchain.rs), the hermetic checksums in crates/plugingo-e2e/tests/common/mod.rs and the repo's go.mod files with it";
+    assert lib.assertMsg (goPkgs.go_1_27.version == "1.27.4")
+      "nixpkgs-go has go ${goPkgs.go_1_27.version}, but heph pins 1.27.4: move DEFAULT_GO_VERSION (crates/plugin-go/src/plugingo/toolchain.rs), the hermetic checksums in crates/plugingo-e2e/tests/common/mod.rs and the repo's go.mod files with it";
     goPkgs.go_1_27;
 
   # kache — the `RUSTC_WRAPPER` (see `env.RUSTC_WRAPPER` below). Not in nixpkgs,
@@ -183,7 +183,7 @@ in
     # A `gotool = "<version>"` workspace downloads its own hermetic SDK and is
     # unaffected by this; only the `host` toolchain reads it.
     #
-    # Pinned to exactly 1.27.3, the same as `DEFAULT_GO_VERSION` and the repo's
+    # Pinned to exactly 1.27.4, the same as `DEFAULT_GO_VERSION` and the repo's
     # own go.mod files, from its own input (`nixpkgs-go` in devenv.yaml): the
     # shell's nixpkgs had no 1.27, and bumping it re-resolves everything else.
     # `GOTOOLCHAIN=local` below makes a go.mod that needs a newer Go fail
