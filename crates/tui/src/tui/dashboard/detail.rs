@@ -446,7 +446,11 @@ mod tests {
     fn the_cache_row_reads_the_outcome_not_the_tiers() {
         use hcore::events::{CacheHitKind, CacheOutcomeKind};
         let a = || "//p:x".to_owned();
-        let outcome = |outcome| BuildEventKind::CacheOutcome { addr: a(), outcome };
+        let outcome = |outcome| BuildEventKind::CacheOutcome {
+            addr: a(),
+            outcome,
+            reason: None,
+        };
         let cases = [
             (
                 vec![

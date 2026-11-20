@@ -451,6 +451,13 @@ pub enum BuildEventKind {
     CacheOutcome {
         addr: String,
         outcome: CacheOutcomeKind,
+        /// Why the outcome is what it is, when that is not the obvious
+        /// "nothing was cached". Today only a [`Miss`](CacheOutcomeKind::Miss)
+        /// on a local entry whose declared host path is gone carries one
+        /// ("stale: host path … is gone"). A reason, not a kind: a reader
+        /// that predates it still counts the miss.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     /// A target whose [`CacheOutcome`](Self::CacheOutcome) was a hit is being
     /// rebuilt after all: the revision's manifest outlived its blobs. At most
@@ -459,6 +466,14 @@ pub enum BuildEventKind {
     CacheHitRebuilt {
         addr: String,
         was: CacheHitKind,
+    },
+    /// A target rebuilt because its local entry was stale (its
+    /// [`CacheOutcome`](Self::CacheOutcome) carried the reason) produced
+    /// different outputs than the entry it replaced, so its dependents
+    /// rebuild too. At most once per addr per request, after the run. Counts
+    /// nothing. An older consumer reads it as [`BuildEventKind::Unknown`].
+    StaleOutputChanged {
+        addr: String,
     },
     /// Start of writing a target's artifacts to the local cache. Paired with
     /// `LocalCacheWriteEnd` via `emit_scope` (fires on completion, `?`, or
@@ -1101,6 +1116,7 @@ pub mod test_support {
         let outcome = |addr: &str, outcome| BuildEventKind::CacheOutcome {
             addr: addr.to_string(),
             outcome,
+            reason: None,
         };
         let start = |addr: &str| BuildEventKind::ResultStart {
             addr: addr.to_string(),
@@ -1584,6 +1600,33 @@ mod tests {
             }
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    /// `CacheOutcome` from a host predating `reason` decodes with none, and
+    /// an outcome without one encodes as it always did, so an older reader
+    /// sees the same frame.
+    #[test]
+    fn an_old_cache_outcome_has_no_reason() {
+        let old = r#"{"at_unix_ms":1,"kind":{"type":"CacheOutcome","addr":"//a:x",
+            "outcome":"miss"}}"#;
+        let ev: BuildEvent = serde_json::from_str(old).expect("old frame must decode");
+        match &ev.kind {
+            BuildEventKind::CacheOutcome { reason, .. } => assert_eq!(*reason, None),
+            other => panic!("wrong variant: {other:?}"),
+        }
+        let back = serde_json::to_string(&ev).expect("encode");
+        assert!(!back.contains("reason"), "{back}");
+
+        let stale = BuildEventKind::CacheOutcome {
+            addr: "//a:x".into(),
+            outcome: CacheOutcomeKind::Miss,
+            reason: Some("stale".into()),
+        };
+        let json = serde_json::to_string(&stale).expect("encode");
+        let again: BuildEventKind = serde_json::from_str(&json).expect("decode");
+        assert!(
+            matches!(again, BuildEventKind::CacheOutcome { reason: Some(r), .. } if r == "stale")
+        );
     }
 
     /// `RequestConfig` from a host predating `scratch_disabled`.
@@ -2215,6 +2258,7 @@ mod tests {
         BuildEventKind::CacheOutcome {
             addr: "//a:x".into(),
             outcome: o,
+            reason: None,
         }
     }
 

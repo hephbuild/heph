@@ -180,7 +180,7 @@ async fn try_run(ws: &Ws, m: &Matcher) -> anyhow::Result<Run> {
     let mut ok = BTreeSet::new();
     while let Ok(ev) = rx.try_recv() {
         match ev.kind {
-            BuildEventKind::CacheOutcome { addr, outcome } => {
+            BuildEventKind::CacheOutcome { addr, outcome, .. } => {
                 outcomes.insert(addr, outcome);
             }
             BuildEventKind::ResultEnd {

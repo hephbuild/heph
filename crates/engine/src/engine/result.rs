@@ -4400,6 +4400,7 @@ impl Engine {
                             rs.emit(crate::engine::event::BuildEventKind::CacheOutcome {
                                 addr: addr_s,
                                 outcome: hcore::events::CacheOutcomeKind::RemoteHit,
+                                reason: None,
                             });
                             // The one place the answer is already in hand: this cell
                             // just located the revision, so the lazy cell starts
@@ -4425,6 +4426,7 @@ impl Engine {
                             rs.emit(crate::engine::event::BuildEventKind::CacheOutcome {
                                 addr: addr_s,
                                 outcome: hcore::events::CacheOutcomeKind::Miss,
+                                reason: None,
                             });
                             let (cached, meta) = self
                                 .clone()
@@ -5993,6 +5995,7 @@ impl Engine {
             rs.emit(crate::engine::event::BuildEventKind::CacheOutcome {
                 addr: addr_s,
                 outcome: hcore::events::CacheOutcomeKind::LocalHit,
+                reason: None,
             });
         }
         Ok(hit)
@@ -8374,7 +8377,7 @@ mod tests {
         assert_eq!(
             count_kind(&events, |e| matches!(
                 e,
-                BuildEventKind::CacheOutcome { addr, outcome: hcore::events::CacheOutcomeKind::RemoteHit }
+                BuildEventKind::CacheOutcome { addr, outcome: hcore::events::CacheOutcomeKind::RemoteHit, .. }
                     if addr == "//pkg:t"
             )),
             1,
@@ -11888,7 +11891,7 @@ mod tests {
     ) -> usize {
         count_kind(
             events,
-            |e| matches!(e, BuildEventKind::CacheOutcome { addr: a, outcome: o } if a == addr && *o == outcome),
+            |e| matches!(e, BuildEventKind::CacheOutcome { addr: a, outcome: o, .. } if a == addr && *o == outcome),
         )
     }
 

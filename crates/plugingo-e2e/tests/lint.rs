@@ -311,7 +311,9 @@ async fn outcomes(
         .await?;
     let mut v = Vec::new();
     while let Ok(ev) = rx.try_recv() {
-        if let BuildEventKind::CacheOutcome { addr: a, outcome } = &ev.kind
+        if let BuildEventKind::CacheOutcome {
+            addr: a, outcome, ..
+        } = &ev.kind
             && a == addr
         {
             v.push(*outcome);
