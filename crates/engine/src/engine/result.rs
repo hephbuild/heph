@@ -7987,7 +7987,7 @@ mod tests {
             &self,
             key: &str,
         ) -> anyhow::Result<Option<Pin<Box<dyn tokio::io::AsyncRead + Send>>>> {
-            if !key.ends_with(crate::engine::local_cache::MANIFEST_V2) {
+            if !key.ends_with(crate::engine::remote_cache::REMOTE_MANIFEST) {
                 // The blob is gone, even though `exists` still claims otherwise.
                 return Ok(None);
             }
@@ -8123,7 +8123,7 @@ mod tests {
     /// the hit degrades to a rebuild like any other unobtainable blob.
     #[tokio::test]
     async fn local_v1_manifest_over_a_v2_remote_rebuilds() -> anyhow::Result<()> {
-        use crate::engine::local_cache::{MANIFEST_V1, Manifest};
+        use crate::engine::local_cache::{MANIFEST_V1, ManifestV2};
 
         let remote = tempdir()?;
         let remote_uri = format!("file://{}", remote.path().display());
@@ -8151,15 +8151,19 @@ mod tests {
 
         // What an older heph's lazy mirror left behind: a v1 manifest with the
         // same hashouts, bare names, raw encoding, and no blobs.
-        let v1 = Manifest {
+        let v1 = ManifestV2 {
             version: "1.0.0".to_string(),
+            target: seeded.target.clone(),
+            created_at_nanos: seeded.created_at_nanos,
+            hashin: seeded.hashin.clone(),
             artifacts: seeded
                 .artifacts
                 .iter()
                 .map(|a| {
+                    let v2_name = crate::engine::cache_codec::remote_entry_name(&a.name);
                     let bare = crate::engine::cache_codec::V2_SUFFIXES
                         .iter()
-                        .find_map(|s| a.name.strip_suffix(s))
+                        .find_map(|s| v2_name.strip_suffix(s))
                         .expect("every v2 name is suffixed");
                     crate::engine::local_cache::ManifestArtifact {
                         name: bare.to_string(),
@@ -8168,7 +8172,6 @@ mod tests {
                     }
                 })
                 .collect(),
-            ..seeded.clone()
         };
         let (engine, _home) = engine_with_remote_bash(vec![out_target("//pkg:t")], &remote_uri)?;
         let mut w = engine.local_cache.writer(&addr, hashin, MANIFEST_V1)?;
@@ -8226,7 +8229,7 @@ mod tests {
             &self,
             key: &str,
         ) -> anyhow::Result<Option<Pin<Box<dyn tokio::io::AsyncRead + Send>>>> {
-            if key.ends_with(crate::engine::local_cache::MANIFEST_V2) {
+            if key.ends_with(crate::engine::remote_cache::REMOTE_MANIFEST) {
                 self.metadata.fetch_add(1, Ordering::SeqCst);
             } else {
                 self.blobs.fetch_add(1, Ordering::SeqCst);
@@ -8681,7 +8684,7 @@ mod tests {
             if path.is_dir() {
                 removed += evict_remote_blobs(&path);
             } else if path.file_name().and_then(|n| n.to_str())
-                != Some(crate::engine::local_cache::MANIFEST_V2)
+                != Some(crate::engine::remote_cache::REMOTE_MANIFEST)
             {
                 std::fs::remove_file(&path).expect("evict blob");
                 removed += 1;
@@ -8705,7 +8708,7 @@ mod tests {
                 continue;
             }
             if path.file_name().and_then(|n| n.to_str())
-                != Some(crate::engine::local_cache::MANIFEST_V2)
+                != Some(crate::engine::remote_cache::REMOTE_MANIFEST)
             {
                 continue;
             }
