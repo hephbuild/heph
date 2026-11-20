@@ -178,6 +178,16 @@ fn nix_failed(output: &std::process::Output, captured: bool, what: String) -> an
     anyhow::anyhow!("{what}: {stderr}")
 }
 
+/// A flake ref resolved by `nix flake metadata`.
+#[derive(Debug)]
+struct LockedFlake {
+    /// The immutable URL, rev / narHash included.
+    url: String,
+    /// The ref names something on this host (a `path:` or `git+file:` flake),
+    /// whose content can change under the same URL: never recorded (O8).
+    local: bool,
+}
+
 /// Resolve a (possibly mutable) flake URL to its locked form via
 /// `nix flake metadata --json`. Output `.url` is the immutable URL containing
 /// the resolved rev / narHash, suitable for `getFlake` in pure-eval mode.
@@ -186,7 +196,7 @@ async fn lock_flake_url(
     url: &str,
     log: Option<&mut RunLog<'_>>,
     ctoken: &(dyn Cancellable + Send + Sync),
-) -> anyhow::Result<String> {
+) -> anyhow::Result<LockedFlake> {
     let args: Vec<OsString> = [
         "--extra-experimental-features",
         "nix-command flakes",
@@ -232,7 +242,169 @@ async fn lock_flake_url(
         .get("url")
         .and_then(|x| x.as_str())
         .ok_or_else(|| anyhow::anyhow!("nix flake metadata json missing `url` field"))?;
-    Ok(locked.to_string())
+    let path_type = v
+        .get("locked")
+        .and_then(|l| l.get("type"))
+        .and_then(|t| t.as_str())
+        == Some("path");
+    Ok(LockedFlake {
+        url: locked.to_string(),
+        local: path_type || is_local_url(locked),
+    })
+}
+
+/// A flake URL whose scheme reads from this host's filesystem: `path:`,
+/// `file:`, or any `<fetcher>+file:` (`git+file:`, `tarball+file:`, …). A URL
+/// with no scheme cannot be told apart, so it counts as local too.
+fn is_local_url(url: &str) -> bool {
+    match url.split_once(':') {
+        Some((scheme, _)) => scheme == "path" || scheme == "file" || scheme.ends_with("+file"),
+        None => true,
+    }
+}
+
+// The nixpkgs lock record (I9, Decision 10).
+//
+// A target resolves its nixpkgs ref once per def hash: the first successful
+// run writes `<nix home>/locks/<addr hash>/<def hash>`, and every later run of
+// that def builds the recorded URL without calling `nix flake metadata`. A
+// stale-cache re-run then rebuilds the same input-addressed store path, so the
+// wrappers' bytes, and every dependent's key, stay put. Only a forced run
+// (`RunRequest::force`) resolves again and replaces it.
+//
+// The record is two lines, the ref and the locked URL. It carries no version
+// tag: any change to what a record means bumps `DRIVER_FORMAT_VERSION`, which
+// moves the def hash and so the record's name. It never reaches a hash (I1).
+
+/// The most bytes a record may hold; a bigger one is not ours.
+const MAX_LOCK_RECORD: u64 = 16 * 1024;
+
+/// Where `def`'s lock record lives under the driver's home.
+fn lock_record_path(nix_home: &std::path::Path, def: &TargetDef) -> anyhow::Result<PathBuf> {
+    // `parse` makes the def hash a lowercase hex string; anything else would
+    // not be a safe file name.
+    let def_hash = std::str::from_utf8(&def.hash)
+        .ok()
+        .filter(|h| !h.is_empty() && h.bytes().all(|b| b.is_ascii_alphanumeric()))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "nix driver: def hash of {} is not a file name: {:?}",
+                def.addr.format(),
+                def.hash
+            )
+        })?;
+    Ok(nix_home
+        .join("locks")
+        .join(def.addr.hash_str())
+        .join(def_hash))
+}
+
+/// Why `url` cannot be built from a record, if it cannot. It is spliced into a
+/// nix string literal and passed as one argument, so it must be one plain
+/// token; and a local flake is never recorded (O8).
+fn locked_url_problem(url: &str) -> Option<&'static str> {
+    if url.is_empty() {
+        Some("the locked URL is empty")
+    } else if url.starts_with('-') {
+        Some("the locked URL starts with '-'")
+    } else if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        Some("the locked URL holds whitespace or a control character")
+    } else if url.contains(['"', '\\', '$']) {
+        Some("the locked URL holds a character a nix string cannot carry verbatim")
+    } else if is_local_url(url) {
+        Some("the locked URL names a local flake")
+    } else {
+        None
+    }
+}
+
+/// The locked URL a record holds for `nixpkgs`, or why it holds none.
+fn parse_lock_record(bytes: &[u8], nixpkgs: &str) -> Result<String, &'static str> {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return Err("the record is not UTF-8");
+    };
+    let body = text
+        .strip_suffix('\n')
+        .ok_or("the record does not end in a newline")?;
+    let (recorded_ref, url) = body.split_once('\n').ok_or("the record is not two lines")?;
+    if url.contains('\n') {
+        return Err("the record is more than two lines");
+    }
+    if recorded_ref != nixpkgs {
+        return Err("the record is for another ref");
+    }
+    match locked_url_problem(url) {
+        Some(problem) => Err(problem),
+        None => Ok(url.to_owned()),
+    }
+}
+
+/// What a read of a lock record found.
+#[derive(Debug, PartialEq, Eq)]
+enum Recorded {
+    Absent,
+    Valid(String),
+    /// Present, but not a record this driver would have written: treated as
+    /// absent, and overwritten by the run.
+    Invalid(String),
+}
+
+/// Read the lock record at `path` for `nixpkgs`. Blocking.
+fn read_lock_record(path: &std::path::Path, nixpkgs: &str) -> Recorded {
+    use std::io::Read as _;
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Recorded::Absent,
+        Err(e) => return Recorded::Invalid(format!("opening it failed: {e}")),
+    };
+    let mut bytes = Vec::new();
+    if let Err(e) = file.take(MAX_LOCK_RECORD + 1).read_to_end(&mut bytes) {
+        return Recorded::Invalid(format!("reading it failed: {e}"));
+    }
+    if bytes.len() as u64 > MAX_LOCK_RECORD {
+        return Recorded::Invalid(format!("it is over {MAX_LOCK_RECORD} bytes"));
+    }
+    match parse_lock_record(&bytes, nixpkgs) {
+        Ok(url) => Recorded::Valid(url),
+        Err(reason) => Recorded::Invalid(reason.to_owned()),
+    }
+}
+
+/// Why a fresh resolution of `nixpkgs` is not recorded, if it is not. The
+/// build still uses it; the next run resolves again, as before records.
+fn unrecordable(nixpkgs: &str, locked: &LockedFlake) -> Option<&'static str> {
+    if locked.local {
+        Some("the ref is a local flake")
+    } else if nixpkgs.contains(['\n', '\r']) {
+        Some("the ref holds a line break")
+    } else {
+        locked_url_problem(&locked.url)
+    }
+}
+
+/// Write `nixpkgs`'s lock record at `path`: a temp file in the same directory,
+/// renamed into place, so a reader sees a whole record or none and two writers
+/// never share a temp name. The last rename wins. Blocking.
+fn write_lock_record(path: &std::path::Path, nixpkgs: &str, url: &str) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    let dir = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("lock record {} has no parent", path.display()))?;
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    // A directory where the record goes is a bad record; the rename below
+    // cannot replace it.
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()) {
+        std::fs::remove_dir_all(path)
+            .with_context(|| format!("remove the directory at {}", path.display()))?;
+    }
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)
+        .with_context(|| format!("create a temp file in {}", dir.display()))?;
+    tmp.write_all(format!("{nixpkgs}\n{url}\n").as_bytes())
+        .with_context(|| format!("write {}", tmp.path().display()))?;
+    tmp.persist(path)
+        .map_err(|e| e.error)
+        .with_context(|| format!("rename the record into {}", path.display()))?;
+    Ok(())
 }
 
 fn build_nix_expr(
@@ -471,9 +643,55 @@ impl ManagedDriver for Driver {
         // eval cache (the single biggest avoidable eval cost — jvns).
         // `nix flake metadata --json <url>` resolves to an immutable URL
         // (containing rev / narHash) which `getFlake` accepts in pure mode.
-        let locked_flake_url = lock_flake_url(&nix_bin, &def.nixpkgs, log.as_mut(), ctoken)
-            .await
-            .with_context(|| format!("lock flake url {}", def.nixpkgs))?;
+        //
+        // A def resolves once: a recorded lock is built as is, and only a
+        // forced run resolves again (I9).
+        let target = &req.request.target;
+        let record_path = lock_record_path(&self.home_dir, target)?;
+        let recorded = if req.request.force {
+            None
+        } else {
+            let (path, nixpkgs) = (record_path.clone(), def.nixpkgs.clone());
+            match hcore::blocking::run(move || read_lock_record(&path, &nixpkgs)).await {
+                Recorded::Absent => None,
+                Recorded::Valid(url) => Some(url),
+                Recorded::Invalid(reason) => {
+                    tracing::warn!(
+                        addr = %addr_str,
+                        record = %record_path.display(),
+                        %reason,
+                        "ignoring the recorded nixpkgs lock; resolving {} again",
+                        def.nixpkgs
+                    );
+                    None
+                }
+            }
+        };
+        let from_record = recorded.is_some();
+        let (locked_flake_url, record) = match recorded {
+            Some(url) => {
+                tracing::info!(addr = %addr_str, url = %url, "building from recorded lock {url}");
+                (url, false)
+            }
+            None => {
+                let locked = lock_flake_url(&nix_bin, &def.nixpkgs, log.as_mut(), ctoken)
+                    .await
+                    .with_context(|| format!("lock flake url {}", def.nixpkgs))?;
+                let record = match unrecordable(&def.nixpkgs, &locked) {
+                    None => true,
+                    Some(reason) => {
+                        tracing::debug!(
+                            addr = %addr_str,
+                            url = %locked.url,
+                            reason,
+                            "not recording the nixpkgs lock"
+                        );
+                        false
+                    }
+                };
+                (locked.url, record)
+            }
+        };
 
         let env_name = sanitize_env_name(&addr_str);
         let expr = build_nix_expr(&locked_flake_url, &def.system, &def.packages, &env_name);
@@ -512,11 +730,19 @@ impl ManagedDriver for Driver {
             .with_context(|| format!("wait for nix build for {addr_str}"))?;
 
         if !output.status.success() {
-            return Err(nix_failed(
-                &output,
-                log.is_some(),
-                format!("nix build failed for {addr_str}"),
-            ));
+            // A recorded lock is never re-resolved behind the user's back: a
+            // fallback would move the store path, and every dependent's key,
+            // without anyone asking for it.
+            let what = if from_record {
+                format!(
+                    "nix build failed for {addr_str} from its recorded lock {locked_flake_url}; \
+                     `heph run --force {addr_str}` resolves {} again",
+                    def.nixpkgs
+                )
+            } else {
+                format!("nix build failed for {addr_str}")
+            };
+            return Err(nix_failed(&output, log.is_some(), what));
         }
 
         let store_path = parse_out_path(&output.stdout)?;
@@ -551,6 +777,28 @@ impl ManagedDriver for Driver {
                 perm.set_mode(0o755);
                 tokio::fs::set_permissions(&wrapper_path, perm).await?;
             }
+        }
+
+        // Last, once everything else succeeded: a failed or cancelled run
+        // never leaves a record, and a failed write fails the run (I9).
+        if record {
+            anyhow::ensure!(
+                !ctoken.is_cancelled(),
+                "nix driver: {addr_str} was cancelled before its nixpkgs lock was recorded"
+            );
+            let (path, nixpkgs, url) = (
+                record_path.clone(),
+                def.nixpkgs.clone(),
+                locked_flake_url.clone(),
+            );
+            hcore::blocking::run(move || write_lock_record(&path, &nixpkgs, &url))
+                .await
+                .with_context(|| {
+                    format!(
+                        "record the nixpkgs lock of {addr_str} at {}",
+                        record_path.display()
+                    )
+                })?;
         }
 
         // The bridge appends the collected tar artifact based on `outputs[]`
@@ -946,7 +1194,7 @@ mod fake {
                      case \"$*\" in\n\
                      *'flake metadata'*) echo 'fetching flake' >&2; cat \"$d/meta.json\" ;;\n\
                      *build*) echo 'building env' >&2\n\
-                       if [ -e \"$d/build_sleep\" ]; then sleep 30; fi\n\
+                       if [ -e \"$d/build_sleep\" ]; then exec sleep 30; fi\n\
                        if [ -e \"$d/build_fail\" ]; then \
                          echo 'error: builder for env failed' >&2; exit 1; fi\n\
                        echo {s} ;;\n\
@@ -975,9 +1223,38 @@ mod fake {
             self.flag("build_fail", on);
         }
 
+        /// The build becomes a 30s sleep, so a test can cancel it mid-build;
+        /// `exec`, so the kill reaches the sleep itself.
+        pub(super) fn sleep_build(&self, on: bool) {
+            self.flag("build_sleep", on);
+        }
+
         /// What `nix flake metadata --json` prints.
         pub(super) fn set_meta(&self, json: &str) {
             std::fs::write(self.dir.path().join("meta.json"), json).expect("write meta");
+        }
+
+        fn calls(&self) -> Vec<String> {
+            match std::fs::read_to_string(self.dir.path().join("calls")) {
+                Ok(s) => s.lines().map(str::to_owned).collect(),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                Err(e) => panic!("read calls: {e}"),
+            }
+        }
+
+        pub(super) fn metadata_calls(&self) -> usize {
+            self.calls()
+                .iter()
+                .filter(|c| c.contains("flake metadata"))
+                .count()
+        }
+
+        /// Every `nix build` call's arguments, oldest first.
+        pub(super) fn build_calls(&self) -> Vec<String> {
+            self.calls()
+                .into_iter()
+                .filter(|c| c.contains(" build "))
+                .collect()
         }
 
         pub(super) fn sandbox(&self) -> PathBuf {
@@ -1251,5 +1528,352 @@ mod host_path_tests {
             String::from_utf8_lossy(&out.stderr),
             format!("{program} missing; heph run --force //pkg:t\n")
         );
+    }
+}
+
+/// The nixpkgs lock record (I9): a def resolves once, every later run builds
+/// what it recorded, and only a forced run resolves again.
+#[cfg(test)]
+mod lock_record_tests {
+    use super::fake::{Fake, LOCKED, REF, run_def, target_def, target_def_with};
+    use super::*;
+    use hcore::hasync::StdCancellationToken;
+
+    const RECORDED: &str = "github:o/r/recorded-rev";
+
+    fn record_of(fake: &Fake, def: &TargetDef) -> PathBuf {
+        lock_record_path(&fake.home(), def).expect("record path")
+    }
+
+    fn plant(path: &std::path::Path, bytes: &[u8]) {
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(path, bytes).expect("plant record");
+    }
+
+    fn read(path: &std::path::Path) -> Option<String> {
+        match std::fs::read_to_string(path) {
+            Ok(s) => Some(s),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => panic!("read {}: {e}", path.display()),
+        }
+    }
+
+    fn record_text(url: &str) -> String {
+        format!("{REF}\n{url}\n")
+    }
+
+    async fn run(fake: &Fake, def: &TargetDef, force: bool) -> anyhow::Result<()> {
+        run_def(fake, def, false, force, &StdCancellationToken::new())
+            .await
+            .0
+            .map(drop)
+    }
+
+    /// The record sits at `<nix home>/locks/<addr hash>/<def hash>`.
+    #[tokio::test]
+    async fn lock_record_path_is_keyed_by_addr_and_def_hash() {
+        let def = target_def().await;
+        let path = lock_record_path(std::path::Path::new("/h/nix-driver"), &def).expect("path");
+        let def_hash = std::str::from_utf8(&def.hash).expect("hex");
+        assert_eq!(
+            path,
+            PathBuf::from(format!(
+                "/h/nix-driver/locks/{}/{def_hash}",
+                def.addr.hash_str()
+            ))
+        );
+    }
+
+    /// With a record present, the run builds the recorded URL and never calls
+    /// `nix flake metadata`.
+    #[tokio::test]
+    async fn nix_reuses_recorded_lock() {
+        let fake = Fake::new();
+        let def = target_def().await;
+        let path = record_of(&fake, &def);
+        plant(&path, record_text(RECORDED).as_bytes());
+
+        run(&fake, &def, false).await.expect("run");
+        assert_eq!(fake.metadata_calls(), 0);
+        let builds = fake.build_calls();
+        assert_eq!(builds.len(), 1, "{builds:?}");
+        assert!(builds[0].contains(RECORDED), "{}", builds[0]);
+        assert!(!builds[0].contains(LOCKED), "{}", builds[0]);
+        assert_eq!(read(&path), Some(record_text(RECORDED)), "kept as is");
+    }
+
+    /// Without a record, the run resolves, builds, then records; the next run
+    /// reuses it. A failed build writes none.
+    #[tokio::test]
+    async fn nix_records_lock_after_build() {
+        let fake = Fake::new();
+        let def = target_def().await;
+        let path = record_of(&fake, &def);
+
+        fake.fail_build(true);
+        run(&fake, &def, false).await.expect_err("the build fails");
+        assert_eq!(read(&path), None, "a failed build records nothing");
+
+        fake.fail_build(false);
+        run(&fake, &def, false).await.expect("run");
+        assert_eq!(fake.metadata_calls(), 2);
+        assert_eq!(read(&path), Some(record_text(LOCKED)));
+
+        fake.set_meta(r#"{"url":"github:o/r/moved"}"#);
+        run(&fake, &def, false).await.expect("run");
+        assert_eq!(fake.metadata_calls(), 2, "the record is reused");
+        let builds = fake.build_calls();
+        assert!(builds[2].contains(LOCKED), "{}", builds[2]);
+    }
+
+    /// A forced run ignores the record, resolves again and replaces it.
+    #[tokio::test]
+    async fn nix_force_reresolves() {
+        let fake = Fake::new();
+        let def = target_def().await;
+        let path = record_of(&fake, &def);
+        plant(&path, record_text(RECORDED).as_bytes());
+
+        run(&fake, &def, true).await.expect("forced run");
+        assert_eq!(fake.metadata_calls(), 1);
+        let builds = fake.build_calls();
+        assert!(builds[0].contains(LOCKED), "{}", builds[0]);
+        assert!(!builds[0].contains(RECORDED), "{}", builds[0]);
+        assert_eq!(read(&path), Some(record_text(LOCKED)));
+    }
+
+    /// Each bad record counts as absent: the run resolves and overwrites it.
+    #[tokio::test]
+    async fn nix_bad_record_handled() {
+        let cases: &[(&str, Vec<u8>)] = &[
+            ("empty", b"".to_vec()),
+            ("whitespace only", b"  \n \n".to_vec()),
+            ("quote", format!("{REF}\ngithub:o/r/a\"b\n").into_bytes()),
+            (
+                "embedded newline",
+                format!("{REF}\ngithub:o/r/a\nb\n").into_bytes(),
+            ),
+            (
+                "non-UTF-8",
+                [REF.as_bytes(), b"\ngithub:o/r/\xff\xfe\n"].concat(),
+            ),
+            (
+                "leading '-'",
+                format!("{REF}\n-github:o/r/a\n").into_bytes(),
+            ),
+            (
+                "another ref",
+                b"github:o/other/main\ngithub:o/other/rev\n".to_vec(),
+            ),
+            (
+                "no trailing newline",
+                format!("{REF}\n{RECORDED}").into_bytes(),
+            ),
+            (
+                "local URL",
+                format!("{REF}\npath:/x?narHash=y\n").into_bytes(),
+            ),
+            ("too big", vec![b'a'; MAX_LOCK_RECORD as usize + 1]),
+        ];
+        let def = target_def().await;
+        for (name, bytes) in cases {
+            assert!(
+                parse_lock_record(bytes, REF).is_err(),
+                "{name}: parses as a record"
+            );
+            let fake = Fake::new();
+            let path = record_of(&fake, &def);
+            plant(&path, bytes);
+            assert!(
+                matches!(read_lock_record(&path, REF), Recorded::Invalid(_)),
+                "{name}"
+            );
+            run(&fake, &def, false)
+                .await
+                .unwrap_or_else(|e| panic!("{name}: {e:#}"));
+            assert_eq!(fake.metadata_calls(), 1, "{name}: resolves");
+            assert_eq!(read(&path), Some(record_text(LOCKED)), "{name}");
+        }
+
+        // A directory in its place.
+        let fake = Fake::new();
+        let path = record_of(&fake, &def);
+        std::fs::create_dir_all(path.join("sub")).expect("mkdir");
+        assert!(matches!(read_lock_record(&path, REF), Recorded::Invalid(_)));
+        run(&fake, &def, false).await.expect("run");
+        assert_eq!(fake.metadata_calls(), 1);
+        assert_eq!(read(&path), Some(record_text(LOCKED)));
+    }
+
+    /// The recorded URL fails to build: the run fails naming the command that
+    /// resolves again, never calls `nix flake metadata`, and keeps the record.
+    #[tokio::test]
+    async fn nix_recorded_url_unfetchable_fails_with_force_hint() {
+        let def = target_def().await;
+        for log_capture in [false, true] {
+            let fake = Fake::new();
+            let path = record_of(&fake, &def);
+            plant(&path, record_text(RECORDED).as_bytes());
+            fake.fail_build(true);
+            let (res, _, _) = run_def(
+                &fake,
+                &def,
+                log_capture,
+                false,
+                &StdCancellationToken::new(),
+            )
+            .await;
+            let msg = format!("{:#}", res.err().expect("the build fails"));
+            assert!(msg.contains("heph run --force //pkg:t"), "{msg}");
+            assert!(msg.contains(RECORDED), "{msg}");
+            assert_eq!(fake.metadata_calls(), 0, "no fallback to resolving");
+            assert_eq!(fake.build_calls().len(), 1, "no second build");
+            assert_eq!(read(&path), Some(record_text(RECORDED)));
+        }
+    }
+
+    /// A run that fails after `nix build` (a program the env lacks) writes no
+    /// record; forced over an existing one, it keeps the old record.
+    #[tokio::test]
+    async fn nix_missing_program_writes_no_record() {
+        let fake = Fake::new();
+        let def = target_def_with(&["rg", "nope"]).await;
+        let path = record_of(&fake, &def);
+        let e = run(&fake, &def, false).await.expect_err("no `nope`");
+        assert!(
+            format!("{e:#}").contains("program `nope` not present"),
+            "{e:#}"
+        );
+        assert_eq!(fake.metadata_calls(), 1);
+        assert_eq!(read(&path), None);
+
+        plant(&path, record_text(RECORDED).as_bytes());
+        run(&fake, &def, true).await.expect_err("no `nope`");
+        assert_eq!(fake.metadata_calls(), 2);
+        assert_eq!(read(&path), Some(record_text(RECORDED)));
+    }
+
+    /// A run cancelled mid-build writes no record, and a forced one cancelled
+    /// mid-build keeps the old record.
+    #[tokio::test]
+    async fn nix_cancelled_run_writes_no_record() {
+        let def = target_def().await;
+        for force in [false, true] {
+            let fake = Fake::new();
+            let path = record_of(&fake, &def);
+            let old = force.then(|| record_text(RECORDED));
+            if let Some(old) = &old {
+                plant(&path, old.as_bytes());
+            }
+            fake.sleep_build(true);
+            let ctoken = StdCancellationToken::new();
+            // Cancel once the build has started (the fake logs its call
+            // before sleeping).
+            let cancel = {
+                let ctoken = ctoken.clone();
+                let calls = fake.dir.path().join("calls");
+                tokio::spawn(async move {
+                    for _ in 0..1000 {
+                        let started = std::fs::read_to_string(&calls)
+                            .is_ok_and(|c| c.lines().any(|l| l.contains(" build ")));
+                        if started {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    ctoken.cancel();
+                })
+            };
+            let (res, _, _) = tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                run_def(&fake, &def, false, force, &ctoken),
+            )
+            .await
+            .expect("the cancel stops the build");
+            cancel.await.expect("cancel task");
+            assert!(res.is_err(), "a cancelled run fails");
+            assert_eq!(fake.build_calls().len(), 1);
+            assert_eq!(read(&path), old, "force={force}");
+        }
+    }
+
+    /// A forced run whose build fails keeps the old record.
+    #[tokio::test]
+    async fn nix_forced_failed_build_keeps_old_record() {
+        let fake = Fake::new();
+        let def = target_def().await;
+        let path = record_of(&fake, &def);
+        plant(&path, record_text(RECORDED).as_bytes());
+        fake.fail_build(true);
+        run(&fake, &def, true).await.expect_err("the build fails");
+        assert_eq!(fake.metadata_calls(), 1, "forced runs resolve");
+        assert_eq!(read(&path), Some(record_text(RECORDED)));
+    }
+
+    /// N concurrent writers leave exactly one of their values, whole, and no
+    /// temp file.
+    #[test]
+    fn nix_concurrent_runs_record_one_whole_value() {
+        const N: usize = 16;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("locks/addr/def");
+        // Long values, so a torn write could not pass for a whole one.
+        let urls: Vec<String> = (0..N)
+            .map(|i| format!("github:o/r/{}", i.to_string().repeat(512)))
+            .collect();
+        let barrier = std::sync::Barrier::new(N);
+        std::thread::scope(|s| {
+            for url in &urls {
+                let (path, barrier) = (&path, &barrier);
+                s.spawn(move || {
+                    barrier.wait();
+                    write_lock_record(path, REF, url).expect("write record");
+                });
+            }
+        });
+        let Recorded::Valid(url) = read_lock_record(&path, REF) else {
+            panic!("not a whole record: {:?}", std::fs::read(&path))
+        };
+        assert!(urls.contains(&url), "{url}");
+        let entries: Vec<_> = std::fs::read_dir(path.parent().expect("parent"))
+            .expect("read dir")
+            .map(|e| e.expect("entry").file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("def")]);
+    }
+
+    /// A ref whose metadata reports a path or git+file flake is never recorded,
+    /// so the next run resolves again (O8).
+    #[tokio::test]
+    async fn nix_local_ref_not_recorded() {
+        let def = target_def().await;
+        for meta in [
+            r#"{"url":"path:/src/nixpkgs?narHash=sha256-a","locked":{"type":"path","path":"/src/nixpkgs"}}"#,
+            r#"{"url":"git+file:///src/nixpkgs?rev=abc","locked":{"type":"git","url":"file:///src/nixpkgs"}}"#,
+        ] {
+            let fake = Fake::new();
+            fake.set_meta(meta);
+            let path = record_of(&fake, &def);
+            run(&fake, &def, false).await.expect("run");
+            assert_eq!(read(&path), None, "{meta}");
+            run(&fake, &def, false).await.expect("run");
+            assert_eq!(fake.metadata_calls(), 2, "{meta}: resolves every run");
+        }
+    }
+
+    #[test]
+    fn local_urls() {
+        for url in [
+            "path:/x",
+            "git+file:///x",
+            "tarball+file:///x.tgz",
+            "file:///x",
+            "/x",
+        ] {
+            assert!(is_local_url(url), "{url}");
+        }
+        for url in ["github:o/r/rev", "git+https://x/y?rev=a", "https://x/y.tgz"] {
+            assert!(!is_local_url(url), "{url}");
+        }
     }
 }
