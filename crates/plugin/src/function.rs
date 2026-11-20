@@ -321,6 +321,14 @@ pub trait FunctionCaller: Send + Sync {
     ) -> anyhow::Result<FnOutcome>;
 }
 
+/// The `heph.<name>` namespaces heph itself provides in BUILD files, beside the
+/// one per plugin: `heph.core` (host and platform builtins) and `heph.types`
+/// (type aliases for `target()`'s fields). The one list every user reads: the
+/// engine refuses these as plugin names, at registration, so a plugin can never
+/// shadow one; the buildfile provider lets them through its function-reference
+/// check; the LSP completes them as namespaces.
+pub const STATIC_NAMESPACES: &[&str] = &["core", "types"];
+
 /// Every plugin's exposed functions: plugin name → function name → handler.
 /// Built by the engine while plugins register, then sealed (see
 /// [`FunctionSlot`]). Ordered maps, so every listing is sorted by plugin, then

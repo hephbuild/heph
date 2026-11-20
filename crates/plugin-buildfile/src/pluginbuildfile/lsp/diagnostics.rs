@@ -31,6 +31,7 @@
 //! shadowed name is skipped entirely.
 
 use super::site::{self, Doc};
+use crate::pluginbuildfile::ast::walk_expr;
 use crate::pluginbuildfile::run_file::target_base_fields;
 use hcore::htvalue::Value;
 use hcore::htvalue::signature::ParamType;
@@ -88,13 +89,6 @@ pub(crate) fn validate(ast: &AstModule, doc: &Doc<'_>, engine: &dyn LspEngine) -
         });
     });
     out
-}
-
-/// Visit `e` and every expression nested within it.
-pub(crate) fn walk_expr<'a>(e: &'a AstExpr, f: &mut impl FnMut(&'a AstExpr)) {
-    f(e);
-    // `Expr::visit_expr` is one level deep; recurse to reach the whole subtree.
-    e.visit_expr(|child| walk_expr(child, f));
 }
 
 /// `selected` is the call's string-literal `driver = "…"` (or `provider =
@@ -813,43 +807,5 @@ mod tests {
                 .any(|m| m.contains("missing required field `cmd`")),
             "unrelated bindings must not disable the missing-required check, got {msgs:?}"
         );
-    }
-
-    #[test]
-    fn bound_names_collects_every_binding_form() {
-        let content = "\
-load(\"//lib\", \"imported\", alias = \"exported\")
-assigned = 1
-tuple_a, tuple_b = 1, 2
-augmented = 0
-augmented += 1
-for loop_var in [1]:
-    pass
-
-def fn_name(param, *args_param, **kwargs_param):
-    pass
-";
-        let ast = AstModule::parse("BUILD", content.to_string(), &Dialect::Extended).unwrap();
-        let names = site::bound_names(&ast);
-        for expected in [
-            "imported",
-            "alias",
-            "assigned",
-            "tuple_a",
-            "tuple_b",
-            "augmented",
-            "loop_var",
-            "fn_name",
-            "param",
-            "args_param",
-            "kwargs_param",
-        ] {
-            assert!(
-                names.contains(expected),
-                "missing binding {expected}: {names:?}"
-            );
-        }
-        // `exported` is the name in the *other* module, not a local binding.
-        assert!(!names.contains("exported"), "load alias source: {names:?}");
     }
 }

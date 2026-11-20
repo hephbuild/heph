@@ -1270,4 +1270,26 @@ mod tests {
         assert_eq!(resolve_path("rel/path", base), base.join("rel/path"));
         assert_eq!(resolve_path("~bob/x", base), base.join("~bob/x"));
     }
+
+    /// A cdylib whose manifest names it `types` is refused before anything is
+    /// loaded: `heph.types` is heph's own namespace, like `heph.core`.
+    #[cfg(unix)]
+    #[test]
+    fn types_name_reserved() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest = dir.path().join("types-plugin.json");
+        std::fs::write(&manifest, br#"{"name": "types", "artifacts": []}"#).expect("write");
+        let src = super::config_yaml::PluginIdentifier::Path(manifest.display().to_string());
+        let err = super::resolve_manifest_dylib(&src, None, dir.path())
+            .err()
+            .expect("types is reserved");
+        assert_eq!(
+            format!("{err:#}"),
+            format!(
+                "plugin manifest {}: plugin name \"types\" is reserved (it is the built-in \
+                 `heph.types` namespace); choose another name",
+                manifest.display()
+            )
+        );
+    }
 }

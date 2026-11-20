@@ -27,8 +27,10 @@ use super::lex::{self, Bracket, Kind, NO_LINK, Tok, Tokens};
 use super::position::{self, Encoding};
 use super::site::{ArgCall, Builtin, Call, Quote, Site, Str};
 use crate::pluginbuildfile::run_file::{resolve_load_target, target_base_fields};
+use crate::pluginbuildfile::types;
 use crate::pluginbuildfile::{DEFAULT_INDENT, build_file_indent_from_options};
 use hplugin::driver::DriverSchema;
+use hplugin::function::STATIC_NAMESPACES;
 use hplugin::lsp::LspEngine;
 use hplugin::provider::StateSchema;
 use lsp_types::{
@@ -693,11 +695,11 @@ fn provider_doc(name: &str, schema: &StateSchema) -> String {
     md
 }
 
-/// `heph.` → the plugin namespaces plus `core`.
+/// `heph.` → the plugin namespaces plus heph's static ones (`core`, `types`).
 fn namespaces(ctx: &Ctx<'_>) -> Vec<Candidate> {
     let registry = ctx.shared.engine.function_registry();
     let mut names: Vec<String> = registry.plugins().map(|(p, _)| p.to_string()).collect();
-    names.push("core".to_string());
+    names.extend(STATIC_NAMESPACES.iter().map(|n| n.to_string()));
     names.sort();
     names.dedup();
     names
@@ -711,8 +713,20 @@ fn namespaces(ctx: &Ctx<'_>) -> Vec<Candidate> {
         .collect()
 }
 
-/// `heph.<plugin>.` → that plugin's functions (`heph.core.` → the builtins).
+/// `heph.<plugin>.` → that plugin's functions (`heph.core.` → the builtins,
+/// `heph.types.` → the type aliases).
 fn members(plugin: &str, ctx: &Ctx<'_>) -> Vec<Candidate> {
+    if plugin == types::NAMESPACE {
+        return types::aliases()
+            .iter()
+            .map(|a| Candidate {
+                label: a.name.to_string(),
+                detail: Some(a.expansion()),
+                doc: a.markdown(),
+                insert: a.name.to_string(),
+            })
+            .collect();
+    }
     if plugin == "core" {
         return ctx
             .shared
@@ -956,7 +970,9 @@ pub(crate) fn hover(site: &Site, ctx: &Ctx<'_>) -> Option<Hover> {
         }
         Site::PluginMember { plugin, edit, .. } => {
             let name = ctx.text.get(edit.clone())?;
-            let md = if plugin == "core" {
+            let md = if plugin == types::NAMESPACE {
+                types::get(name)?.markdown()
+            } else if plugin == "core" {
                 ctx.shared
                     .core_members
                     .iter()

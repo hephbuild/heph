@@ -1,8 +1,10 @@
+mod ast;
 mod lsp;
 mod provider;
 mod run_file;
 #[cfg(test)]
 mod starlark_patch;
+mod types;
 
 /// The transport-free LSP loop, for the editor-shaped harness in `tests/lsp.rs`.
 #[cfg(feature = "test-support")]

@@ -1101,10 +1101,56 @@ fn completion_after_heph_dot_lists_plugins_and_core() {
     let mut lsp = Lsp::start();
     let doc = lsp.open("BUILD", "x = heph.│\n");
     let result = lsp.completion(&doc);
-    assert_eq!(labels(&result), vec!["core", "fs"], "sorted, nothing else");
+    assert_eq!(
+        labels(&result),
+        vec!["core", "fs", "types"],
+        "sorted, nothing else"
+    );
     for item in items(&result) {
         assert_eq!(item["kind"], json!(9), "MODULE kind: {item}");
     }
+}
+
+#[test]
+fn types_completion_and_hover() {
+    let mut lsp = Lsp::start();
+    let doc = lsp.open("BUILD", "def f(deps: heph.types.│):\n    pass\n");
+    let result = lsp.completion(&doc);
+    assert_eq!(
+        labels(&result),
+        vec![
+            "Addr",
+            "Deps",
+            "Env",
+            "Labels",
+            "PassEnv",
+            "RuntimePassEnv",
+            "Tools"
+        ],
+        "every alias, nothing else"
+    );
+    let deps = item(&result, "Deps");
+    let expansion = deps["detail"].as_str().expect("detail").to_string();
+    assert!(
+        expansion.contains("list[str]") && expansion.contains("None"),
+        "the detail is the expansion: {deps}"
+    );
+
+    let doc = lsp.open(
+        "hover/BUILD",
+        "def f(deps: heph.types.De│ps = None):\n    pass\n",
+    );
+    let hover = lsp.hover(&doc);
+    let text = hover_text(&hover);
+    assert!(text.contains("heph.types.Deps"), "{text}");
+    assert!(
+        text.contains(&expansion),
+        "hover shows the expansion: {text}"
+    );
+    assert_eq!(
+        hover["contents"]["value"], deps["documentation"]["value"],
+        "hover and completion render the same doc"
+    );
 }
 
 #[test]
@@ -2233,7 +2279,7 @@ fn broken_unclosed_load_offers_symbols() {
 fn broken_plugin_namespace_with_broken_tail() {
     let mut lsp = Lsp::start();
     let doc = lsp.open("BUILD", "x = heph.│\ny = (\n");
-    assert_eq!(labels(&lsp.completion(&doc)), vec!["core", "fs"]);
+    assert_eq!(labels(&lsp.completion(&doc)), vec!["core", "fs", "types"]);
 }
 
 /// A field of literals completes its value to them, quoted the way a driver

@@ -295,6 +295,11 @@ pub(crate) fn build_globals(registry: &FunctionRegistry) -> Globals {
         .with_namespace("heph", |hb| {
             // Static `heph.core` host/platform builtins.
             hb.namespace("core", heph_core_module);
+            // Static `heph.types` aliases for `target()`'s fields.
+            hb.namespace(
+                crate::pluginbuildfile::types::NAMESPACE,
+                crate::pluginbuildfile::types::register,
+            );
             // One `heph.<plugin>` namespace per plugin with functions; each
             // function becomes a native callable bridging into its async `PluginFn`.
             for (provider, fns) in registry.plugins() {
@@ -867,7 +872,7 @@ pub(crate) struct Extra<'a> {
 /// value where a plain value is expected) — never a programming error, so
 /// this must return an error rather than panic: it runs inside the LSP, which
 /// must survive a malformed BUILD file rather than crash the whole server.
-fn starlark_to_rust(v: &Value) -> anyhow::Result<htvalue::Value> {
+pub(crate) fn starlark_to_rust(v: &Value) -> anyhow::Result<htvalue::Value> {
     if v.is_none() {
         return Ok(htvalue::Value::Null());
     }
@@ -1105,7 +1110,11 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
                         Ok(None)
                     }
                     "labels" => {
-                        if let Some(s) = e.1.unpack_str() {
+                        // `None` is the field left out, as `heph.types.Labels`
+                        // promises: a wrapper passes its `labels = None` through.
+                        if e.1.is_none() {
+                            labels = vec![];
+                        } else if let Some(s) = e.1.unpack_str() {
                             labels = vec![s.to_string()];
                         } else {
                             labels = UnpackList::<String>::unpack_value_err(*e.1)
@@ -2028,7 +2037,10 @@ pub(crate) fn eval_source(
 }
 
 /// The name closest to `name` among `candidates`, if any is a plausible typo.
-fn closest<'a>(name: &str, candidates: impl Iterator<Item = &'a str>) -> Option<&'a str> {
+pub(crate) fn closest<'a>(
+    name: &str,
+    candidates: impl Iterator<Item = &'a str>,
+) -> Option<&'a str> {
     candidates
         .map(|c| (strsim::levenshtein(name, c), c))
         .filter(|(d, c)| *d <= 2.max(name.len().max(c.len()) / 3))
@@ -2039,15 +2051,17 @@ fn closest<'a>(name: &str, candidates: impl Iterator<Item = &'a str>) -> Option<
 /// Every `heph.<plugin>.<fn>` a BUILD file names must exist. Checked against the
 /// registry before evaluation, so an unknown plugin or function fails with the
 /// file and line and what does exist — an agent recovers from the text alone,
-/// instead of reading Starlark's "object has no attribute". `heph.core.*` is the
-/// static namespace, not a plugin's; a file that binds `heph` itself is left
+/// instead of reading Starlark's "object has no attribute". heph's static
+/// namespaces ([`STATIC_NAMESPACES`](hplugin::function::STATIC_NAMESPACES)) are
+/// not a plugin's: `heph.types.<alias>` is checked against the aliases, and
+/// `heph.core.*` is left to evaluation. A file that binds `heph` itself is left
 /// alone.
 pub(crate) fn check_function_refs(
     ast: &AstModule,
     registry: &FunctionRegistry,
 ) -> anyhow::Result<()> {
-    use crate::pluginbuildfile::lsp::diagnostics::walk_expr;
-    use crate::pluginbuildfile::lsp::site::bound_names;
+    use crate::pluginbuildfile::ast::{bound_names, walk_expr};
+    use crate::pluginbuildfile::types;
     use starlark::syntax::ast::Expr;
 
     if bound_names(ast).contains("heph") {
@@ -2078,7 +2092,14 @@ pub(crate) fn check_function_refs(
             let Some(plugin) = plugin else {
                 return;
             };
-            if plugin == "core" {
+            if hplugin::function::STATIC_NAMESPACES.contains(&plugin) {
+                if plugin == types::NAMESPACE
+                    && let Some(alias) = func
+                    && let Some(why) = types::unknown_alias(alias)
+                {
+                    let at = ast.file_span(span);
+                    problem = Some(format!("{at}: heph.{plugin}.{alias}: {why}"));
+                }
                 return;
             }
             let at = ast.file_span(span);
@@ -2198,7 +2219,7 @@ fn eval_ast(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::pluginbuildfile::provider::FunctionSource;
     use hcore::htvalue::signature::Param;
@@ -2535,7 +2556,7 @@ mod tests {
         Arc::new(reg)
     }
 
-    fn source_loader(root: PathBuf) -> BuildFileLoader {
+    pub(crate) fn source_loader(root: PathBuf) -> BuildFileLoader {
         let patterns = vec![glob::Pattern::new("BUILD").unwrap()];
         let walker = Arc::new(CachedWalker::disabled());
         BuildFileLoader::new(
