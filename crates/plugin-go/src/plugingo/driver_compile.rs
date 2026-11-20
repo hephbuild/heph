@@ -724,7 +724,10 @@ impl ManagedDriver for GoCompileDriver {
                 .await?;
             }
 
-            Ok(ManagedRunResponse { artifacts: vec![] })
+            Ok(ManagedRunResponse {
+                host_paths: Vec::new(),
+                artifacts: vec![],
+            })
         }
         .await;
         // `go tool` output is captured, not streamed: see `echo_failure_log`.

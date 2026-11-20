@@ -140,12 +140,22 @@ message RunRequest {
   // dependency path — the def hash covers the *unresolved* reference, which is
   // what keeps `heph query` and `heph inspect def` from triggering a build.
   map<string, string> deferred = 13;
+  // `heph run --force` forced this target (since 0.21.2): the driver drops any
+  // state that freezes a resolution (the nix driver's lock record) and resolves
+  // again. Never part of any hash, and never reaches the target's process.
+  // Absent — what every older host sends — is false.
+  bool force = 14;
 }
 
 // fuse_slot_guards and sandbox_cleanup are non-transferable host RAII,
 // constructed host-side after the remote run returns.
 message RunResponse {
   repeated OutputArtifactRef artifacts = 1;
+  // Host paths the run's outputs name (since 0.21.2): absolute, normalized,
+  // UTF-8, at most 64. The host stores them with the cache entry and treats a
+  // local hit whose path is gone as a miss. Never part of any hash. An older
+  // host ignores it.
+  repeated string host_paths = 2;
 }
 
 // ---- Managed run (driver-support ManagedDriver layer) ----
@@ -225,6 +235,9 @@ message ManagedRunRequest {
   // log as before. Sent only to a plugin at 0.21.1 or later, and only for a
   // captured run.
   bool log_capture = 17;
+  // As RunRequest.force (since 0.21.2). Sent only to a plugin at 0.21.2 or
+  // later, and only when true.
+  bool force = 18;
 }
 
 // Mirrors driver::RunOptions. Every field is absent unless set, and absence is
@@ -309,6 +322,9 @@ message ExitStatus {
 
 message ManagedRunResponse {
   repeated OutputArtifactRef artifacts = 1;
+  // As RunResponse.host_paths (since 0.21.2). Decoded through the same
+  // validation as an in-process driver's list; an older host ignores it.
+  repeated string host_paths = 2;
 }
 
 // ---- Bidi run streams (DriverMethod RUN over StableManagedDriver::invoke_bidi) ----

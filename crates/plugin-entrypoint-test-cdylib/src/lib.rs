@@ -150,7 +150,10 @@ impl ManagedDriver for Tool {
         }
         .context("wait for the tool")?;
         if exit == Exit::Code(0) {
-            return Ok(ManagedRunResponse { artifacts: vec![] });
+            return Ok(ManagedRunResponse {
+                host_paths: Vec::new(),
+                artifacts: vec![],
+            });
         }
         Err(hplugin::error::ProcessFailed::new(format!("{exit:?}"), Some(exit)).into())
     }
@@ -238,7 +241,10 @@ impl ManagedDriver for Allot {
             std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
         }
         std::fs::write(&out, seen).with_context(|| format!("write {}", out.display()))?;
-        Ok(ManagedRunResponse { artifacts: vec![] })
+        Ok(ManagedRunResponse {
+            host_paths: Vec::new(),
+            artifacts: vec![],
+        })
     }
 }
 
@@ -329,7 +335,10 @@ impl ManagedDriver for Stream {
             let exit = Exit::Code(3);
             return Err(hplugin::error::ProcessFailed::new(format!("{exit:?}"), Some(exit)).into());
         }
-        Ok(ManagedRunResponse { artifacts: vec![] })
+        Ok(ManagedRunResponse {
+            host_paths: Vec::new(),
+            artifacts: vec![],
+        })
     }
 }
 

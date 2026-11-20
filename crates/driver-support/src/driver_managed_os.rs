@@ -1,5 +1,5 @@
 use crate::driver_managed::{
-    ManagedDriver, ManagedRunInput, ShellFallback, collect_outputs,
+    ManagedDriver, ManagedRunInput, ManagedRunResponse, ShellFallback, collect_outputs,
     detect_output_collisions_blocking, invoke_inner, list_path_for, resolve_unpack_root,
     unpack_blocking, write_source_map_blocking,
 };
@@ -161,7 +161,7 @@ impl ManagedDriverOs {
             &self.shell_fallback,
         )
         .await;
-        let mut res = match invoked {
+        let res = match invoked {
             Ok(res) => res,
             // Here, while the sandbox is live and before the stage holds drop:
             // a staged input the target listed is still linked.
@@ -198,15 +198,23 @@ impl ManagedDriverOs {
             .map(|h| Box::new(h) as hplugin::driver::SandboxGuard)
             .collect();
 
+        // Exhaustive, so a field added to the managed response cannot be
+        // dropped here without the compiler saying so.
+        let ManagedRunResponse {
+            mut artifacts,
+            host_paths,
+        } = res;
+
         if shell {
             return Ok(RunResponse {
                 artifacts: vec![],
+                host_paths,
                 sandbox_cleanup: sandbox_cleanup.take(),
                 sandbox_guards,
             });
         }
 
-        res.artifacts.extend(
+        artifacts.extend(
             collect_outputs(
                 target,
                 hashin,
@@ -219,7 +227,8 @@ impl ManagedDriverOs {
         );
 
         Ok(RunResponse {
-            artifacts: res.artifacts,
+            artifacts,
+            host_paths,
             sandbox_cleanup: sandbox_cleanup.take(),
             sandbox_guards,
         })
@@ -281,7 +290,7 @@ mod tests {
             fs::write(req.sandbox_pkg_dir.join("report.txt"), "report")?;
             match self.0 {
                 Some(fail) => Err(fail()),
-                None => Ok(ManagedRunResponse { artifacts: vec![] }),
+                None => Ok(ManagedRunResponse::default()),
             }
         }
         fn supports_shell(&self) -> bool {

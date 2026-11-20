@@ -554,7 +554,7 @@ impl ManagedDriver for GoDownloadDriver {
             )
         })?;
 
-        Ok(ManagedRunResponse { artifacts: vec![] })
+        Ok(ManagedRunResponse { host_paths: Vec::new(), artifacts: vec![] })
         }
         .await;
         // `go mod download`'s output is captured, not streamed: see

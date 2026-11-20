@@ -419,7 +419,10 @@ impl ManagedDriver for Driver {
         }
         .with_context(|| format!("write the pulled image to {out_path:?}"))?;
 
-        Ok(ManagedRunResponse { artifacts: vec![] })
+        Ok(ManagedRunResponse {
+            host_paths: Vec::new(),
+            artifacts: vec![],
+        })
     }
 }
 

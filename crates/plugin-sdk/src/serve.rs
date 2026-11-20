@@ -1724,6 +1724,9 @@ struct RunStart {
     /// The run's stdout/stderr frames are its log (see
     /// [`RunRequest::log_capture`]); `false` from a host before 0.21.1.
     log_capture: bool,
+    /// `heph run --force` forced the target (see [`RunRequest::force`]);
+    /// `false` from a host before 0.21.2.
+    force: bool,
 }
 
 impl RunStart {
@@ -1742,6 +1745,7 @@ impl RunStart {
                 .context("decoding the run's allotment")?,
             shell: req.shell.unwrap_or(false),
             log_capture: req.log_capture.unwrap_or(false),
+            force: req.force.unwrap_or(false),
             target: convert::target_def_from_pb(required_msg(
                 req.target,
                 "ManagedRunRequest.target",
@@ -1819,6 +1823,7 @@ async fn run_once(
     rr.deferred = start.deferred;
     rr.options = start.options;
     rr.allotment = start.allotment;
+    rr.force = start.force;
     let mrr = ManagedRunRequest {
         request: rr,
         sandbox_dir: start.sandbox_dir,
@@ -1841,6 +1846,11 @@ async fn run_once(
             Ok(artifacts) => pb::RunOutFrame {
                 msg: Some(pb::run_out_frame::Msg::from(pb::ManagedRunResponse {
                     artifacts,
+                    host_paths: resp
+                        .host_paths
+                        .into_iter()
+                        .map(|p| p.into_string())
+                        .collect(),
                     ..Default::default()
                 })),
                 ..Default::default()
@@ -2845,7 +2855,10 @@ mod tests {
                 _r: ManagedRunRequest<'a, 'io>,
                 _c: &(dyn Cancellable + Send + Sync),
             ) -> Result<ManagedRunResponse> {
-                Ok(ManagedRunResponse { artifacts: vec![] })
+                Ok(ManagedRunResponse {
+                    host_paths: Vec::new(),
+                    artifacts: vec![],
+                })
             }
         }
 
@@ -4182,7 +4195,7 @@ mod tests {
                     biased;
                     () = ct.cancelled() => {}
                     () = self.release_b.notified() => {
-                        return Ok(hdriver_support::driver_managed::ManagedRunResponse {
+                        return Ok(hdriver_support::driver_managed::ManagedRunResponse { host_paths: Vec::new(),
                             artifacts: vec![],
                         });
                     }
@@ -4473,7 +4486,10 @@ mod tests {
                     w.flush().await?;
                 }
             }
-            Ok(hdriver_support::driver_managed::ManagedRunResponse { artifacts: vec![] })
+            Ok(hdriver_support::driver_managed::ManagedRunResponse {
+                host_paths: Vec::new(),
+                artifacts: vec![],
+            })
         }
     }
 

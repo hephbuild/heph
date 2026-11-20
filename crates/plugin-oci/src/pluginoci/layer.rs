@@ -476,7 +476,10 @@ impl ManagedDriver for Driver {
         write_layer(&out_path, &entries, def.mode)
             .with_context(|| format!("write the layer to {out_path:?}"))?;
 
-        Ok(ManagedRunResponse { artifacts: vec![] })
+        Ok(ManagedRunResponse {
+            host_paths: Vec::new(),
+            artifacts: vec![],
+        })
     }
 }
 

@@ -12250,6 +12250,7 @@ mod tests {
         ) -> anyhow::Result<RunResponse> {
             self.exec_count.fetch_add(1, Ordering::SeqCst);
             Ok(RunResponse {
+                host_paths: Vec::new(),
                 artifacts: self
                     .outputs
                     .iter()
@@ -15259,6 +15260,7 @@ mod tests {
                 .context("driver run"));
             }
             Ok(RunResponse {
+                host_paths: Vec::new(),
                 artifacts: vec![outputartifact::OutputArtifact {
                     group: "main".to_string(),
                     name: "out".to_string(),
@@ -15281,6 +15283,7 @@ mod tests {
         ) -> anyhow::Result<RunResponse> {
             self.shell_runs.fetch_add(1, Ordering::SeqCst);
             Ok(RunResponse {
+                host_paths: Vec::new(),
                 artifacts: vec![],
                 sandbox_cleanup: None,
                 sandbox_guards: vec![],

@@ -2799,7 +2799,10 @@ impl Driver {
             return if writes_log {
                 log_response(&output_log_path)
             } else {
-                Ok(ManagedRunResponse { artifacts: vec![] })
+                Ok(ManagedRunResponse {
+                    host_paths: Vec::new(),
+                    artifacts: vec![],
+                })
             };
         }
         // A build target's `--shell` has no log: `output_log` is `None` there,
@@ -3162,7 +3165,10 @@ impl Driver {
         if writes_log {
             log_response(&output_log_path)
         } else {
-            Ok(ManagedRunResponse { artifacts: vec![] })
+            Ok(ManagedRunResponse {
+                host_paths: Vec::new(),
+                artifacts: vec![],
+            })
         }
     }
 }
@@ -3170,6 +3176,7 @@ impl Driver {
 /// A run's response: its one `log.txt` artifact.
 fn log_response(output_log_path: &std::path::Path) -> anyhow::Result<ManagedRunResponse> {
     Ok(ManagedRunResponse {
+        host_paths: Vec::new(),
         artifacts: vec![outputartifact::OutputArtifact {
             group: "".to_string(),
             name: "log.txt".to_string(),

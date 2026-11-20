@@ -583,12 +583,20 @@ fn drain_run(
         };
         match frame.msg {
             Some(pb::run_out_frame::Msg::Response(r)) => {
+                // The list is validated again on this side of the seam: a
+                // plugin's own check is not the host's.
+                let host_paths = {
+                    use anyhow::Context as _;
+                    hplugin::driver::HostPath::list(&r.host_paths)
+                        .context("decoding the run's host_paths")?
+                };
                 return Ok(ManagedRunResponse {
                     artifacts: r
                         .artifacts
                         .into_iter()
                         .map(convert::output_artifact_from_pb)
                         .collect::<anyhow::Result<_>>()?,
+                    host_paths,
                 });
             }
             // The message is the plugin's whole rendered chain, unchanged; a
@@ -924,6 +932,9 @@ pub struct StableRemoteManagedDriver {
     /// later). An older one is never sent it: it keeps writing and returning
     /// its own log, which the host imports.
     log_capture: bool,
+    /// The plugin reads `ManagedRunRequest.force` (ABI 0.21.2 and later). An
+    /// older one is never sent it.
+    force: bool,
 }
 
 impl StableRemoteManagedDriver {
@@ -945,6 +956,7 @@ impl StableRemoteManagedDriver {
             schema: Arc::new(schema),
             cancel_keys: true,
             log_capture: true,
+            force: true,
         })
     }
 
@@ -957,8 +969,15 @@ impl StableRemoteManagedDriver {
     pub fn with_plugin_abi(mut self, reported: Option<&str>) -> Self {
         self.cancel_keys = reported.is_some_and(reads_cancel_key);
         self.log_capture = reported.is_some_and(reads_log_capture);
+        self.force = reported.is_some_and(reads_force);
         self
     }
+}
+
+/// Whether a plugin reporting ABI `reported` reads `ManagedRunRequest.force`.
+/// A version that does not parse is taken not to.
+fn reads_force(reported: &str) -> bool {
+    abi_at_least(reported, plugin_abi::FORCE_SINCE)
 }
 
 /// Whether a plugin reporting ABI `reported` reads `ManagedRunRequest.cancel_key`.
@@ -1185,6 +1204,9 @@ impl StableRemoteManagedDriver {
             // Only to a plugin that reads it, and only when set: absent reads
             // as `false` on the plugin's side either way.
             log_capture: (self.log_capture && req.request.log_capture).then_some(true),
+            // Same rule as `log_capture`: only to a plugin that reads it, and
+            // only when set.
+            force: (self.force && req.request.force).then_some(true),
             ..Default::default()
         };
         // `run` is bidi: the request stream carries the run request (RunInFrame),
@@ -1667,6 +1689,22 @@ mod tests {
             ("not a version", false),
         ] {
             assert_eq!(reads_log_capture(v), reads, "{v}");
+        }
+    }
+
+    /// `force` is sent only to a plugin from 0.21.2 on; an older one, or one
+    /// whose version does not parse, never learns a run was forced.
+    #[test]
+    fn only_a_plugin_from_0_21_2_reads_force() {
+        for (v, reads) in [
+            ("0.21.1", false),
+            ("0.21.2-rc.1", false),
+            ("0.21.2", true),
+            ("0.21.20", true),
+            (plugin_abi::ABI_SEMVER, true),
+            ("not a version", false),
+        ] {
+            assert_eq!(reads_force(v), reads, "{v}");
         }
     }
 

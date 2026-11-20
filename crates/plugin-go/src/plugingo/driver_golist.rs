@@ -530,7 +530,10 @@ impl ManagedDriver for GoGolistDriver {
                     .context("encode package_addrs.bin")?;
             std::fs::write(req.sandbox_pkg_dir.join("package_addrs.bin"), &addrs_bin)
                 .context("write package_addrs.bin")?;
-            return Ok(ManagedRunResponse { artifacts: vec![] });
+            return Ok(ManagedRunResponse {
+                host_paths: Vec::new(),
+                artifacts: vec![],
+            });
         }
 
         let args: Vec<OsString> = golist_args(def).iter().map(OsString::from).collect();
@@ -660,7 +663,10 @@ impl ManagedDriver for GoGolistDriver {
         std::fs::write(req.sandbox_pkg_dir.join("package_addrs.bin"), &addrs_bin)
             .context("write package_addrs.bin")?;
 
-        Ok(ManagedRunResponse { artifacts: vec![] })
+        Ok(ManagedRunResponse {
+            host_paths: Vec::new(),
+            artifacts: vec![],
+        })
     }
 }
 
@@ -1102,7 +1108,10 @@ mod tests {
                 _: ManagedRunRequest<'a, 'io>,
                 _: &(dyn Cancellable + Send + Sync),
             ) -> anyhow::Result<ManagedRunResponse> {
-                Ok(ManagedRunResponse { artifacts: vec![] })
+                Ok(ManagedRunResponse {
+                    host_paths: Vec::new(),
+                    artifacts: vec![],
+                })
             }
         }
 

@@ -224,7 +224,10 @@ impl ManagedDriver for Driver {
             () = ctoken.cancelled() => anyhow::bail!("http_fetch: {} cancelled", def.url),
         }
 
-        Ok(ManagedRunResponse { artifacts: vec![] })
+        Ok(ManagedRunResponse {
+            host_paths: Vec::new(),
+            artifacts: vec![],
+        })
     }
 }
 

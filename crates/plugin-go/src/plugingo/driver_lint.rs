@@ -487,7 +487,7 @@ impl ManagedDriver for GoLintDriver {
             );
         }
 
-        Ok(ManagedRunResponse { artifacts: vec![] })
+        Ok(ManagedRunResponse { host_paths: Vec::new(), artifacts: vec![] })
         }
         .await;
         // heph-govet's output is captured, not streamed: see `echo_failure_log`.
@@ -847,7 +847,10 @@ impl ManagedDriver for GoLintGateDriver {
                 findings.join("\n")
             );
         }
-        Ok(ManagedRunResponse { artifacts: vec![] })
+        Ok(ManagedRunResponse {
+            host_paths: Vec::new(),
+            artifacts: vec![],
+        })
     }
 }
 
@@ -1222,7 +1225,10 @@ impl ManagedDriver for GoLintFixDriver {
             }
         }
 
-        Ok(ManagedRunResponse { artifacts: vec![] })
+        Ok(ManagedRunResponse {
+            host_paths: Vec::new(),
+            artifacts: vec![],
+        })
     }
 }
 

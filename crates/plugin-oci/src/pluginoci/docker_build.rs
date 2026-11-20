@@ -1148,7 +1148,10 @@ impl ManagedDriver for Driver {
             .await
             .with_context(|| format!("write digest {digest_path:?}"))?;
 
-        Ok(ManagedRunResponse { artifacts: vec![] })
+        Ok(ManagedRunResponse {
+            host_paths: Vec::new(),
+            artifacts: vec![],
+        })
     }
 }
 

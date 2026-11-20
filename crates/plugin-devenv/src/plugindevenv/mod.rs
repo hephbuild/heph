@@ -446,7 +446,10 @@ impl ManagedDriver for Driver {
             .await
             .with_context(|| format!("write {out:?}"))?;
 
-        Ok(ManagedRunResponse { artifacts: vec![] })
+        Ok(ManagedRunResponse {
+            host_paths: Vec::new(),
+            artifacts: vec![],
+        })
     }
 }
 

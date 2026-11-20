@@ -264,7 +264,10 @@ impl ManagedDriver for GoTestmainDriver {
         std::fs::write(req.sandbox_pkg_dir.join("testmain.go"), content)
             .context("write testmain.go")?;
 
-        Ok(ManagedRunResponse { artifacts: vec![] })
+        Ok(ManagedRunResponse {
+            host_paths: Vec::new(),
+            artifacts: vec![],
+        })
     }
 }
 

@@ -205,7 +205,10 @@ async fn echo_failure(
     if let Err(e) = &res {
         hdriver_support::driver_managed::echo_failure_log(&mut req.request, e).await;
     }
-    res.map(|()| ManagedRunResponse { artifacts: vec![] })
+    res.map(|()| ManagedRunResponse {
+        host_paths: Vec::new(),
+        artifacts: vec![],
+    })
 }
 
 /// Shared config for both format drivers.
@@ -412,7 +415,10 @@ impl ManagedDriver for GoFormatDriver {
         let (bin, env) = govet_bin_and_config(&req, &def.deps)?;
         let files = def.deps.staged_paths(&req, "")?;
         if files.is_empty() {
-            return Ok(ManagedRunResponse { artifacts: vec![] });
+            return Ok(ManagedRunResponse {
+                host_paths: Vec::new(),
+                artifacts: vec![],
+            });
         }
         let args = vec![OsString::from("-format"), arg_file(pkg_dir, &files)?];
 
@@ -532,7 +538,10 @@ impl ManagedDriver for GoFormatCheckDriver {
         let (bin, env) = govet_bin_and_config(&req, &def.deps)?;
         let files = def.deps.staged_paths(&req, "")?;
         if files.is_empty() {
-            return Ok(ManagedRunResponse { artifacts: vec![] });
+            return Ok(ManagedRunResponse {
+                host_paths: Vec::new(),
+                artifacts: vec![],
+            });
         }
         let args = vec![
             OsString::from("-format"),

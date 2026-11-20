@@ -515,7 +515,10 @@ impl ManagedDriver for Driver {
 
         // The bridge appends the collected tar artifact based on `outputs[]`
         // with `collect: true`. Nothing to add here.
-        Ok(ManagedRunResponse { artifacts: vec![] })
+        Ok(ManagedRunResponse {
+            host_paths: Vec::new(),
+            artifacts: vec![],
+        })
     }
 }
 

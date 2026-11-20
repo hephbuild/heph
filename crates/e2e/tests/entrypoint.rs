@@ -701,6 +701,7 @@ impl hplugin::driver::Driver for RecordingEntrypoint {
         });
         anyhow::ensure!(req.sandbox_dir.is_dir(), "the sandbox exists for the run");
         Ok(hplugin::driver::RunResponse {
+            host_paths: Vec::new(),
             artifacts: vec![],
             sandbox_cleanup: None,
             sandbox_guards: vec![],
@@ -1814,7 +1815,10 @@ impl heph::engine::driver_managed::ManagedDriver for ForegroundTool {
             .await
             .context("wait for the tool")?;
         if exit == Exit::Code(0) {
-            return Ok(heph::engine::driver_managed::ManagedRunResponse { artifacts: vec![] });
+            return Ok(heph::engine::driver_managed::ManagedRunResponse {
+                host_paths: Vec::new(),
+                artifacts: vec![],
+            });
         }
         Err(hplugin::error::ProcessFailed::new(format!("{exit:?}"), Some(exit)).into())
     }

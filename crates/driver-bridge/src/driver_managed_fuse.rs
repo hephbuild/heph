@@ -2,7 +2,7 @@ use anyhow::Context;
 use hcore::hartifactcontent::tar_index::TarIndex;
 use hcore::hasync::Cancellable;
 use hdriver_support::driver_managed::{
-    ManagedDriver, ManagedRunInput, ShellFallback, collect_outputs,
+    ManagedDriver, ManagedRunInput, ManagedRunResponse, ShellFallback, collect_outputs,
     detect_output_collisions_blocking, invoke_inner, list_path_for, resolve_unpack_root,
     unpack_blocking, write_source_map_blocking,
 };
@@ -162,7 +162,7 @@ impl ManagedDriverFuse {
             &self.shell_fallback,
         )
         .await;
-        let mut res = match invoked {
+        let res = match invoked {
             Ok(res) => res,
             // Read through the mount while the slot guards still hold the
             // inputs; packed under the *plain* sandbox dir, a real directory
@@ -211,20 +211,29 @@ impl ManagedDriverFuse {
                 .collect()
         };
 
+        // Exhaustive, so a field added to the managed response cannot be
+        // dropped here without the compiler saying so.
+        let ManagedRunResponse {
+            mut artifacts,
+            host_paths,
+        } = res;
+
         if shell {
             return Ok(RunResponse {
                 artifacts: vec![],
+                host_paths,
                 sandbox_cleanup: sandbox_cleanup.take(),
                 sandbox_guards: erase(std::mem::take(&mut slot_guards)),
             });
         }
 
-        res.artifacts
+        artifacts
             // FUSE shows inputs as real directories: no stage links to follow.
             .extend(collect_outputs(target, hashin, &ws_dir, &sandbox_dir, None, ctoken).await?);
 
         Ok(RunResponse {
-            artifacts: res.artifacts,
+            artifacts,
+            host_paths,
             sandbox_cleanup: sandbox_cleanup.take(),
             sandbox_guards: erase(slot_guards),
         })

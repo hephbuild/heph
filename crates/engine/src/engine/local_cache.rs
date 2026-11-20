@@ -3155,6 +3155,7 @@ mod tests {
             if !self.fail.load(std::sync::atomic::Ordering::SeqCst) {
                 std::fs::write(&out, b"pass")?;
                 return Ok(crate::engine::driver::RunResponse {
+                    host_paths: Vec::new(),
                     artifacts: vec![sandbox_file("main", "out", Type::Output, &out)],
                     sandbox_cleanup: None,
                     sandbox_guards: vec![],

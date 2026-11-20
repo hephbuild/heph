@@ -306,7 +306,10 @@ mod shell_fallback_tests {
             _: &(dyn Cancellable + Send + Sync),
         ) -> anyhow::Result<ManagedRunResponse> {
             self.run_shell_called.store(true, Ordering::SeqCst);
-            Ok(ManagedRunResponse { artifacts: vec![] })
+            Ok(ManagedRunResponse {
+                host_paths: Vec::new(),
+                artifacts: vec![],
+            })
         }
     }
 
