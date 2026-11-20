@@ -1979,7 +1979,13 @@ mod tests {
             .await
             .expect("probe")
             .expect("remote hit while intact");
-        let blob_names: Vec<String> = manifest.artifacts.iter().map(|a| a.name.clone()).collect();
+        // The probe returns the mirrored local manifest, whose V3 names are
+        // local only: the remote keys its objects by V2's name.
+        let blob_names: Vec<String> = manifest
+            .artifacts
+            .iter()
+            .map(|a| crate::engine::cache_codec::remote_entry_name(&a.name).to_string())
+            .collect();
         let removed = evict_objects(remote.path(), &blob_names);
         assert!(removed > 0, "test must actually evict a blob");
 
@@ -3424,6 +3430,53 @@ mod tests {
             decoded_output(&engine, &def, "FIXPOINTKEY").await,
             decoded_output(&engine, &def, V2_FIXTURE_HASHIN).await
         );
+    }
+
+    /// The upload backstop (I6): an entry that declares host paths never
+    /// reaches the remote, whatever the target's `cache.remote` said.
+    #[tokio::test]
+    async fn an_entry_with_host_paths_is_never_uploaded() {
+        let remote = tempfile::tempdir().expect("remote dir");
+        let remote_uri = format!("file://{}", remote.path().display());
+        let ctoken = StdCancellationToken::new();
+        let addr = test_addr();
+        let (engine, dir) = engine_with_remote(&remote_uri);
+        engine
+            .cache_locally_with_host_paths(
+                &ctoken,
+                &addr,
+                "HOSTLOCAL",
+                vec![raw_artifact("a", b"host-local payload")],
+                &[host_path(dir.path(), "store")],
+                false,
+            )
+            .await
+            .expect("cache_locally");
+        engine.upload_to_remote(&addr, "HOSTLOCAL").await;
+
+        let (other, _o) = engine_with_remote(&remote_uri);
+        assert!(
+            other
+                .remote_caches
+                .fetch_manifest(&ctoken, &addr, "HOSTLOCAL")
+                .await
+                .expect("fetch")
+                .is_none(),
+            "the remote holds no manifest for a host-local entry"
+        );
+        let mut stored = Vec::new();
+        let mut stack = vec![remote.path().to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).expect("read remote dir") {
+                let p = e.expect("entry").path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else {
+                    stored.push(p);
+                }
+            }
+        }
+        assert!(stored.is_empty(), "the remote received {stored:?}");
     }
 
     fn drain_reader(mut r: Box<dyn io::Read>) -> Vec<u8> {

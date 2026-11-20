@@ -136,6 +136,20 @@ pub(crate) fn v3_entry_name(base: &str, encoding: &ManifestArtifactEncoding) -> 
     format!("{V3_PREFIX}{}", entry_name(base, encoding))
 }
 
+/// The name the remote stores the local blob `local` under. V3's names are
+/// local only: the remote keeps v2's [`entry_name`] keys, so its object keys
+/// and manifests are the same whichever version uploaded them. A v1 or v2 name
+/// is returned as is.
+pub(crate) fn remote_entry_name(local: &str) -> &str {
+    local.strip_prefix(V3_PREFIX).unwrap_or(local)
+}
+
+/// The local v3 name of the remote blob `remote`, the inverse of
+/// [`remote_entry_name`]: what a revision mirrored from the remote names.
+pub(crate) fn local_entry_name_of_remote(remote: &str) -> String {
+    format!("{V3_PREFIX}{remote}")
+}
+
 /// A pair of bases among one target's artifacts that an older heph and this one
 /// would store under one key: `b` and `b<suffix>`. This version stores `b` as
 /// `b<suffix>`, which is the name an older heph gives the artifact whose base is

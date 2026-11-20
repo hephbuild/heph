@@ -58,8 +58,9 @@
 //! starve the metadata a build is actually blocked on.
 
 use crate::engine::Engine;
+use crate::engine::cache_codec::{local_entry_name_of_remote, remote_entry_name};
 use crate::engine::local_cache::{
-    MANIFEST_V2, MANIFEST_V2_VERSION, Manifest, ManifestArtifact, ManifestArtifactContentType,
+    MANIFEST_CURRENT, MANIFEST_V3_VERSION, Manifest, ManifestArtifact, ManifestArtifactContentType,
     ManifestArtifactEncoding, ManifestArtifactType,
 };
 use crate::engine::remote_cache_latency::{UNREACHABLE, load_order, store_order};
@@ -80,7 +81,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{OnceCell, Semaphore};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Max blobs of a *single* revision transferred concurrently, on both the pull
 /// and the push side.
@@ -1010,8 +1011,16 @@ pub(crate) struct RemoteManifestArtifact {
 
 /// Remote manifest format version — independent of the local manifest's, so the
 /// two can evolve separately. Informational, like the local one: the object
-/// name (`manifest-v2.borsh`) is what keeps an older heph from reading it.
+/// name ([`REMOTE_MANIFEST`]) is what keeps an older heph from reading it.
 const REMOTE_MANIFEST_VERSION: &str = "2.0.0";
+
+/// The object name of a revision's manifest on the remote. Its own constant,
+/// not the local [`MANIFEST_CURRENT`]: the local manifest moved to v3 (host
+/// paths, v3 blob names) while the remote format did not, so every heph reads
+/// and writes the remote under the same keys. The blob keys stay v2's
+/// [`entry_name`](crate::engine::cache_codec::entry_name) too (see
+/// [`remote_entry_name`]).
+pub(crate) const REMOTE_MANIFEST: &str = "manifest-v2.borsh";
 
 /// A revision *located* on one remote cache — the decision half of a remote hit.
 ///
@@ -1034,17 +1043,23 @@ impl RemoteRevision {
     /// different blobs: a `manifest-v1.borsh` an older heph mirrored names bare
     /// blobs, while the remote now holds a v2 revision whose names are suffixed.
     /// The caller checks this before pulling, and rebuilds when it is `false`.
+    ///
+    /// `name` is the local name: a v3 one is compared under its
+    /// [`remote_entry_name`].
     pub(crate) fn names_blob(&self, name: &str) -> bool {
-        self.manifest.artifacts.iter().any(|a| a.name == name)
+        let remote = remote_entry_name(name);
+        self.manifest.artifacts.iter().any(|a| a.name == remote)
     }
 
-    /// The artifact entry for `name`, or an error if the manifest never named it
-    /// — a caller asking for a blob outside the revision is a bug, not a miss.
+    /// The artifact entry for the local name `name`, or an error if the manifest
+    /// never named it — a caller asking for a blob outside the revision is a
+    /// bug, not a miss.
     fn artifact(&self, name: &str) -> anyhow::Result<&RemoteManifestArtifact> {
+        let remote = remote_entry_name(name);
         self.manifest
             .artifacts
             .iter()
-            .find(|a| a.name == name)
+            .find(|a| a.name == remote)
             .with_context(|| {
                 format!(
                     "remote manifest for {} does not name blob {name}",
@@ -1541,7 +1556,7 @@ impl RemoteCacheSet {
                 return;
             }
             // Manifest last: its presence implies every blob is already stored.
-            let manifest_key = Self::key(addr, hashin, MANIFEST_V2);
+            let manifest_key = Self::key(addr, hashin, REMOTE_MANIFEST);
             match cache
                 .meta_op(
                     &format!("write remote manifest {manifest_key}"),
@@ -1577,7 +1592,7 @@ impl RemoteCacheSet {
         // v2 only. A v1 entry (written gzip by an older heph) is not read: a
         // fallback would cost a second round trip on every miss, which is most
         // lookups of a cold build, to save one rebuild per target on upgrade.
-        let manifest_key = Self::key(addr, hashin, MANIFEST_V2);
+        let manifest_key = Self::key(addr, hashin, REMOTE_MANIFEST);
 
         // Locate the manifest in the fastest cache that has it. Skip caches the
         // breaker has tripped; record success/failure so a flaky cache trips.
@@ -1657,6 +1672,9 @@ impl RemoteCacheSet {
     /// that is tens of thousands of round trips, every one of them on the critical
     /// path under a per-addr lock, which is enough to make a healthy cache look
     /// broken. Listing keeps the fail-soft guarantee at O(1) per revision.
+    ///
+    /// `names` are local names, looked up under their [`remote_entry_name`];
+    /// so is [`Self::fetch_blob`]'s `name`.
     pub(crate) async fn blobs_exist(
         &self,
         ctoken: &dyn Cancellable,
@@ -1690,11 +1708,11 @@ impl RemoteCacheSet {
         };
         cache.note_ok();
         // Compare in key space: the listing returns the segment `Self::key` wrote,
-        // which is `key_segment(name)`, not the logical artifact name.
+        // which is `key_segment` of the blob's remote name, not the local name.
         let present: std::collections::HashSet<&str> = present.iter().map(String::as_str).collect();
         names
             .iter()
-            .all(|name| present.contains(key_segment(name).as_str()))
+            .all(|name| present.contains(key_segment(remote_entry_name(name)).as_str()))
     }
 
     /// Stream one blob of `rev` from the cache that served its manifest into a
@@ -1721,7 +1739,7 @@ impl RemoteCacheSet {
         // Bulk half of the request budget, held for the whole stream — the
         // download *is* the slot's occupancy.
         let _slot = cache.bulk_slot(name).await?;
-        let key = Self::key(addr, hashin, name);
+        let key = Self::key(addr, hashin, remote_entry_name(name));
         let reader = match cache.open_bounded(&key, "remote blob", name).await {
             Ok(Some(reader)) => reader,
             // Manifest names a blob the cache no longer has → incomplete.
@@ -2166,6 +2184,19 @@ impl Engine {
         let Some(manifest) = manifest else {
             return Ok(());
         };
+        // A revision whose outputs name host paths is valid only on a host that
+        // has them, so it never leaves this one (I6). The run already fails a
+        // target that declares paths with `cache.remote` on; this refuses an
+        // entry that reached here anyway, whatever `cache.remote` says.
+        if !manifest.host_paths.is_empty() {
+            info!(
+                %addr,
+                hashin,
+                host_paths = manifest.host_paths.len(),
+                "not uploading a cache entry that declares host paths",
+            );
+            return Ok(());
+        }
 
         let tmp_dir = self.remote_tmp_dir().await?;
 
@@ -2220,7 +2251,8 @@ impl Engine {
             .await?;
 
         // Build the remote manifest from the local one, in its order, each
-        // artifact keeping the encoding its blob is stored in.
+        // artifact keeping the encoding its blob is stored in, under its remote
+        // name.
         let remote_manifest = RemoteManifest {
             version: REMOTE_MANIFEST_VERSION.to_string(),
             target: manifest.target.clone(),
@@ -2231,7 +2263,7 @@ impl Engine {
                 .map(|a| RemoteManifestArtifact {
                     hashout: a.hashout.clone(),
                     group: a.group.clone(),
-                    name: a.name.clone(),
+                    name: remote_entry_name(&a.name).to_owned(),
                     size: a.size,
                     r#type: a.r#type.clone(),
                     content_type: a.content_type.clone(),
@@ -2244,7 +2276,12 @@ impl Engine {
 
         let temps: Vec<(String, PathBuf)> = prepared
             .iter()
-            .map(|(name, temp)| (name.clone(), temp.path().to_path_buf()))
+            .map(|(name, temp)| {
+                (
+                    remote_entry_name(name).to_owned(),
+                    temp.path().to_path_buf(),
+                )
+            })
             .collect();
         self.remote_caches
             .put_revision(addr, hashin, &manifest_bytes, &temps)
@@ -2315,7 +2352,7 @@ impl Engine {
         hcore::blocking::run(move || {
             use std::io::Write;
             let mut w = local_cache
-                .writer(&addr_owned, &hashin_owned, MANIFEST_V2)
+                .writer(&addr_owned, &hashin_owned, MANIFEST_CURRENT)
                 .context("open local writer for remote manifest")?;
             w.write_all(&bytes).context("write remote manifest")?;
             w.commit().context("commit remote manifest")?;
@@ -2323,6 +2360,11 @@ impl Engine {
         })
         .await
         .with_context(|| format!("mirror remote manifest for {addr} {hashin}"))?;
+        debug!(
+            %addr,
+            hashin,
+            "mirrored a remote revision with no host paths; its local hits are unchecked",
+        );
 
         Ok(Some((local_manifest, rev)))
     }
@@ -2434,11 +2476,17 @@ impl Engine {
     }
 }
 
-/// The local view of a remote manifest: the same artifacts under the same
-/// names and encodings, since a download stores the remote bytes verbatim.
+/// The local view of a remote manifest: a [`MANIFEST_CURRENT`] revision with the
+/// same artifacts and encodings, since a download stores the remote bytes
+/// verbatim, each under its local v3 name
+/// ([`local_entry_name_of_remote`]).
+///
+/// It declares no host paths: the remote carries none (an entry that declares
+/// some is never uploaded), so a mirrored revision is served without a liveness
+/// check.
 pub(crate) fn local_manifest_from_remote(remote: &RemoteManifest, hashin: &str) -> Manifest {
     Manifest {
-        version: MANIFEST_V2_VERSION.to_string(),
+        version: MANIFEST_V3_VERSION.to_string(),
         target: remote.target.clone(),
         created_at_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(0),
         hashin: hashin.to_string(),
@@ -2448,13 +2496,14 @@ pub(crate) fn local_manifest_from_remote(remote: &RemoteManifest, hashin: &str) 
             .map(|a| ManifestArtifact {
                 hashout: a.hashout.clone(),
                 group: a.group.clone(),
-                name: a.name.clone(),
+                name: local_entry_name_of_remote(&a.name),
                 size: a.size,
                 r#type: a.r#type.clone(),
                 content_type: a.content_type.clone(),
                 encoding: a.encoding.clone(),
             })
             .collect(),
+        host_paths: Vec::new(),
     }
 }
 
@@ -3391,7 +3440,7 @@ mod tests {
                 .acquire_owned()
                 .await
                 .context("budget closed")?;
-            if key.ends_with(MANIFEST_V2) {
+            if key.ends_with(REMOTE_MANIFEST) {
                 return Ok(Some(Box::pin(HeldReader {
                     inner: std::io::Cursor::new(self.manifest.clone()),
                     _permit: permit,
@@ -3863,7 +3912,7 @@ mod tests {
 
         let mut objects = std::collections::HashMap::new();
         objects.insert(
-            RemoteCacheSet::key(&addr, "h", MANIFEST_V2),
+            RemoteCacheSet::key(&addr, "h", REMOTE_MANIFEST),
             borsh::to_vec(&manifest).expect("serialize manifest"),
         );
         for a in &artifacts {
@@ -4006,7 +4055,7 @@ mod tests {
             opened.len()
         );
         assert!(
-            !opened.iter().any(|k| k.ends_with(MANIFEST_V2)),
+            !opened.iter().any(|k| k.ends_with(REMOTE_MANIFEST)),
             "the manifest must not be written after a failed blob"
         );
     }
@@ -4032,7 +4081,7 @@ mod tests {
                     .wait_for(|n| *n >= self.others)
                     .await
                     .context("others_opened closed")?;
-            } else if !key.ends_with(MANIFEST_V2) {
+            } else if !key.ends_with(REMOTE_MANIFEST) {
                 self.others_opened.send_modify(|n| *n += 1);
             }
             Ok(self.objects.get(key).map(|b| {
@@ -4080,7 +4129,7 @@ mod tests {
         };
         let mut objects = std::collections::HashMap::new();
         objects.insert(
-            RemoteCacheSet::key(&addr, "h", MANIFEST_V2),
+            RemoteCacheSet::key(&addr, "h", REMOTE_MANIFEST),
             borsh::to_vec(&manifest).expect("serialize manifest"),
         );
         for a in &artifacts {
@@ -4173,7 +4222,7 @@ mod tests {
                 .map(|a| RemoteManifestArtifact {
                     hashout: a.hashout.clone(),
                     group: a.group.clone(),
-                    name: a.name.clone(),
+                    name: remote_entry_name(&a.name).to_string(),
                     size: a.size,
                     r#type: a.r#type.clone(),
                     content_type: a.content_type.clone(),
@@ -4208,7 +4257,7 @@ mod tests {
             };
             set_with(
                 Arc::new(Self {
-                    manifest_key: RemoteCacheSet::key(addr, "h", MANIFEST_V2),
+                    manifest_key: RemoteCacheSet::key(addr, "h", REMOTE_MANIFEST),
                     manifest: borsh::to_vec(&manifest).expect("serialize manifest"),
                 }),
                 home,
@@ -4633,7 +4682,7 @@ mod tests {
         };
         let mut objects = std::collections::HashMap::new();
         objects.insert(
-            RemoteCacheSet::key(&addr, "h", MANIFEST_V2),
+            RemoteCacheSet::key(&addr, "h", REMOTE_MANIFEST),
             borsh::to_vec(&manifest).expect("serialize manifest"),
         );
         objects.insert(RemoteCacheSet::key(&addr, "h", "big.tar"), blob.clone());
@@ -4742,7 +4791,7 @@ mod tests {
         async fn open_write(&self, key: &str) -> anyhow::Result<Pin<Box<dyn AsyncWrite + Send>>> {
             // Manifests are written after their cache's blobs, so they must not
             // join the blob rendezvous — only blob writes do.
-            if !key.ends_with(MANIFEST_V2) {
+            if !key.ends_with(REMOTE_MANIFEST) {
                 self.barrier.wait().await;
             }
             Ok(Box::pin(tokio::io::sink()))
