@@ -140,6 +140,34 @@ async fn clean_removes_the_revision_gc_deliberately_keeps() -> anyhow::Result<()
     Ok(())
 }
 
+/// The nix driver's lock records (`<home>/nix-driver/locks/`) pin a target's
+/// resolved nixpkgs ref so a stale-cache rebuild reproduces the same store
+/// path. Neither `clean` nor GC may take them: only `heph run --force` refreshes
+/// a record (I9).
+#[tokio::test]
+async fn clean_keeps_lock_records() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "c",
+        r#"target(name = "t", driver = "bash", run = "printf 'x' > $OUT", out = "out.txt")"#,
+    );
+    let record = ws.engine.home.join("nix-driver/locks/addrhash/defhash");
+    std::fs::create_dir_all(record.parent().expect("parent"))?;
+    std::fs::write(&record, "github:o/r/main\ngithub:o/r/rev\n")?;
+    run_and_settle(&ws, "//c:t").await?;
+
+    let stats = clean(&ws, &Matcher::PackagePrefix(PkgBuf::from(""))).await?;
+    assert_eq!(stats.revisions_removed, 1, "{stats:?}");
+    let sweeper = ws.reopen()?;
+    sweeper.clone().gc_all(sweeper.new_state()).await?;
+
+    assert_eq!(
+        std::fs::read_to_string(&record)?,
+        "github:o/r/main\ngithub:o/r/rev\n"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn a_package_matcher_cleans_its_subtree_and_nothing_else() -> anyhow::Result<()> {
     let ws = Workspace::new();
