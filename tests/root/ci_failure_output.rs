@@ -89,24 +89,35 @@ fn ci_run_prints_a_target_failure_once() {
     }
 }
 
-/// A failure with no live block — here a dep that does not exist, so the
-/// target never ran — still gets the full box at the end, and a target
-/// taken down by another still gets its line in the summary.
+/// A failure before the target ran — here a dep that does not exist, so its
+/// def never resolved — is printed live too, once, saying no log was kept;
+/// the end of the run does not box it again. It used to print nothing live
+/// and reach only the end box: no event announced it.
 #[test]
-fn ci_run_boxes_a_failure_that_printed_nothing_live() {
+fn ci_run_prints_a_failure_before_the_run_once_live() {
     let ws = Ws::new();
     let (out, err) = ws.run("//p:nodep");
     assert_eq!(out.status.code(), Some(1), "{err}");
+    assert_eq!(err.matches("✗ //p:nodep\n").count(), 1, "{err}");
+    let live = err.find("✗ //p:nodep").expect("the live block");
+    let rest = err.get(live..).unwrap_or_default();
     assert!(
-        err.contains("× target failed: //p:nodep\n╰─▶ ") && err.contains("target not found"),
+        rest.contains("target not found: //p:nope") && rest.contains("  log: none kept\n"),
         "{err}"
     );
-    assert!(!err.contains("✗ //p:nodep"), "nothing live: {err}");
+    assert!(!err.contains("target failed"), "no end box: {err}");
+    assert!(err.contains("err 1"), "counted: {err}");
+}
 
+/// A target taken down by another prints no block of its own: the root's
+/// block explains it, and the summary counts both. It used to print a
+/// `meta: dependency failed (root: …)` block as if it were a root.
+#[test]
+fn ci_run_prints_no_block_for_a_target_taken_down() {
+    let ws = Ws::new();
     let (out, err) = ws.run("//p:down");
     assert_eq!(out.status.code(), Some(1), "{err}");
-    assert!(
-        err.contains("✗ //p:down\n  │ meta: dependency failed (root: //p:bad)"),
-        "{err}"
-    );
+    assert!(!err.contains("✗ //p:down"), "collateral: {err}");
+    assert_eq!(err.matches("✗ //p:bad").count(), 1, "the root's: {err}");
+    assert!(err.contains("err 2"), "both counted: {err}");
 }
