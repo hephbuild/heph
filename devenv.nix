@@ -8,8 +8,8 @@ let
   # pins below move with it.
   goPkgs = import inputs.nixpkgs-go { system = pkgs.stdenv.system; };
   go =
-    assert lib.assertMsg (goPkgs.go_1_27.version == "1.27.3")
-      "nixpkgs-go has go ${goPkgs.go_1_27.version}, but heph pins 1.27.3: move DEFAULT_GO_VERSION (crates/plugin-go/src/plugingo/toolchain.rs), the hermetic checksums in crates/plugingo-e2e/tests/common/mod.rs and the repo's go.mod files with it";
+    assert lib.assertMsg (goPkgs.go_1_27.version == "1.27.4")
+      "nixpkgs-go has go ${goPkgs.go_1_27.version}, but heph pins 1.27.4: move DEFAULT_GO_VERSION (crates/plugin-go/src/plugingo/toolchain.rs), the hermetic checksums in crates/plugingo-e2e/tests/common/mod.rs and the repo's go.mod files with it";
     goPkgs.go_1_27;
 
   # kache — the `RUSTC_WRAPPER` (see `env.RUSTC_WRAPPER` below). Not in nixpkgs,
@@ -76,28 +76,30 @@ let
   # passes `-Wl,--fix-cortex-a53-843419` to the linker for
   # aarch64-unknown-linux-gnu; cargo-zigbuild < 0.23 forwards it to zig as is,
   # zig rejects it ("unsupported linker arg"), and the linux/arm64 cross build
-  # dies at link. 0.23 strips it. The nixpkgs input is held at a revision whose
-  # cargo-zigbuild is 0.22.3 (its newer LLVM miscompiles aws-lc-sys — see the
-  # `devenv.lock` commit that holds it), so take the published release binary
-  # the same way as kache: static musl on Linux, Mach-O on darwin. Unlike
+  # dies at link. 0.23 strips it. nixpkgs' cargo-zigbuild trails upstream (the
+  # rolling input ships 0.23.4 while this pins 0.24.1, whose fixes for zig 0.17
+  # — no `-Wl,-O1`, response-file quoting — the cross build wants), so take the
+  # published release binary the same way as kache, and the version moves only
+  # here: static musl on Linux, Mach-O on darwin. Unlike
   # kache's, the tarball has a `cargo-zigbuild-<target>/` directory at the
   # root, which the default unpack enters, so no `sourceRoot` here.
   #
   # Only the systems that run it get the prebuilt: x86_64-linux (CI
   # cross-compiles both Linux targets on the amd64 runner) and aarch64-darwin
-  # (the local shell). Upstream ships no aarch64-linux asset, and that system
-  # never cross-compiles, so it — and anything else — keeps nixpkgs' package.
+  # (the local shell). Upstream ships no static musl aarch64-linux asset (only
+  # a glibc one), and that system never cross-compiles, so it — and anything
+  # else — keeps nixpkgs' package.
   # Bumping: as for kache above (`<asset>.sha256` next to each release asset,
   # `nix hash convert` to SRI).
-  cargoZigbuildVersion = "0.23.4";
+  cargoZigbuildVersion = "0.24.1";
   cargoZigbuildAssets = {
     aarch64-darwin = {
       target = "aarch64-apple-darwin";
-      hash = "sha256-yiNprhqZlVQiBqbBjdNyrP+U3d6518B+Cb+3WUGXzqM=";
+      hash = "sha256-440qMKqPTCe/njztJmquH0fk29a+k5hS7AfYZi7sQI4=";
     };
     x86_64-linux = {
       target = "x86_64-unknown-linux-musl";
-      hash = "sha256-njz3NIXtvUWQXIqtvA/fhpx93DhI8MiYIp8mgNtS5Es=";
+      hash = "sha256-8JsYClF68OTdS//JIbuI5atwVFKp3ZSMYeSJswIMaMI=";
     };
   };
   cargoZigbuildPrebuilt = asset: pkgs.stdenvNoCC.mkDerivation {
@@ -183,7 +185,7 @@ in
     # A `gotool = "<version>"` workspace downloads its own hermetic SDK and is
     # unaffected by this; only the `host` toolchain reads it.
     #
-    # Pinned to exactly 1.27.3, the same as `DEFAULT_GO_VERSION` and the repo's
+    # Pinned to exactly 1.27.4, the same as `DEFAULT_GO_VERSION` and the repo's
     # own go.mod files, from its own input (`nixpkgs-go` in devenv.yaml): the
     # shell's nixpkgs had no 1.27, and bumping it re-resolves everything else.
     # `GOTOOLCHAIN=local` below makes a go.mod that needs a newer Go fail
@@ -193,7 +195,7 @@ in
     (buffaPlugin "protoc-gen-buffa" buffaAsset.gen)
     (buffaPlugin "protoc-gen-buffa-packaging" buffaAsset.packaging)
     pkgs.zig
-    # 0.23.4 prebuilt where the cross build runs; see `cargoZigbuild` above.
+    # 0.24.1 prebuilt where the cross build runs; see `cargoZigbuild` above.
     cargoZigbuild
     pkgs.tokio-console
     kache
