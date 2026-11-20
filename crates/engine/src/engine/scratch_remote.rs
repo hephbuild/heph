@@ -43,7 +43,7 @@
 //! parent it was last seeded from, and `heph tool scratch push` is the commit.
 
 use crate::engine::Engine;
-use crate::engine::remote_cache::RemoteCacheBackend;
+use crate::engine::remote_cache::{RemoteCacheBackend, ScratchSource};
 use anyhow::Context as _;
 use borsh::{BorshDeserialize, BorshSerialize};
 use std::path::{Path, PathBuf};
@@ -54,7 +54,7 @@ const KEY_PREFIX: &str = "scratch/v1";
 
 /// Payload-format version, independent of the key layout above: one covers where
 /// entries live, the other what is inside them.
-const SNAPSHOT_FORMAT: u32 = 1;
+pub(crate) const SNAPSHOT_FORMAT: u32 = 1;
 
 /// What a published snapshot is, beside its bytes.
 ///
@@ -212,8 +212,8 @@ impl Engine {
         scope: &str,
         fallbacks: &[String],
     ) -> Option<RemoteHead> {
-        let backends = self.remote_caches().readable_backends().await;
-        if backends.is_empty() {
+        let sources = self.remote_caches().scratch_sources().await;
+        if sources.is_empty() {
             return None;
         }
         let mut scopes = vec![scope.to_string()];
@@ -221,8 +221,8 @@ impl Engine {
 
         for scope in scopes {
             let mut best: Option<RemoteHead> = None;
-            for (name, backend) in &backends {
-                for head in heads_in(backend.as_ref(), name, slot, &scope).await {
+            for source in &sources {
+                for head in heads_in(source, slot, &scope).await {
                     if best.as_ref().is_none_or(|b| better(&head, b).is_lt()) {
                         best = Some(head);
                     }
@@ -248,15 +248,15 @@ impl Engine {
         scope: &str,
         fallbacks: &[String],
     ) -> Vec<(String, Option<RemoteHead>)> {
-        let backends = self.remote_caches().readable_backends().await;
+        let sources = self.remote_caches().scratch_sources().await;
         let mut scopes = vec![scope.to_string()];
         scopes.extend(fallbacks.iter().cloned());
 
         let mut out = Vec::with_capacity(scopes.len());
         for scope in scopes {
             let mut best: Option<RemoteHead> = None;
-            for (name, backend) in &backends {
-                for head in heads_in(backend.as_ref(), name, slot, &scope).await {
+            for source in &sources {
+                for head in heads_in(source, slot, &scope).await {
                     if best.as_ref().is_none_or(|b| better(&head, b).is_lt()) {
                         best = Some(head);
                     }
@@ -269,23 +269,18 @@ impl Engine {
 
     /// Fetch a head's snapshot and unpack it into `dir`.
     pub async fn scratch_pull(&self, head: &RemoteHead, dir: &Path) -> anyhow::Result<u64> {
-        let backends = self.remote_caches().readable_backends().await;
-        let (_, backend) = backends
+        let sources = self.remote_caches().scratch_sources().await;
+        let source = sources
             .iter()
-            .find(|(n, _)| *n == head.cache)
-            .ok_or_else(|| anyhow::anyhow!("remote cache `{}` is gone", head.cache))?;
+            .find(|s| s.name() == head.cache)
+            .ok_or_else(|| anyhow::anyhow!("remote cache `{}` is gone or paused", head.cache))?;
 
         let key = format!("{}.tar.gz", head.stem);
-        let mut reader = backend
-            .open_read(&key)
+        let bytes = source
+            .read_snapshot(&key)
             .await
             .with_context(|| format!("read scratch snapshot {key}"))?
             .ok_or_else(|| anyhow::anyhow!("scratch snapshot {key} vanished"))?;
-
-        let mut bytes = Vec::new();
-        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut bytes)
-            .await
-            .with_context(|| format!("download scratch snapshot {key}"))?;
 
         let dir = dir.to_path_buf();
         let n = bytes.len() as u64;
@@ -385,14 +380,9 @@ async fn write_all(
 /// A meta that will not decode, or one from a format this build does not know, is
 /// skipped rather than failing the listing: it is a cache, and one bad entry must
 /// not make the rest unreachable.
-async fn heads_in(
-    backend: &dyn RemoteCacheBackend,
-    cache: &str,
-    slot: &str,
-    scope: &str,
-) -> Vec<RemoteHead> {
+async fn heads_in(source: &ScratchSource<'_>, slot: &str, scope: &str) -> Vec<RemoteHead> {
     let prefix = scope_prefix(slot, scope);
-    let Ok(names) = backend.list_names(&prefix).await else {
+    let Ok(names) = source.list_names(&prefix).await else {
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -407,16 +397,9 @@ async fn heads_in(
         } else {
             format!("{prefix}{stem}")
         };
-        let Ok(Some(mut r)) = backend.open_read(&format!("{stem}.meta")).await else {
+        let Ok(Some(buf)) = source.read_small(&format!("{stem}.meta")).await else {
             continue;
         };
-        let mut buf = Vec::new();
-        if tokio::io::AsyncReadExt::read_to_end(&mut r, &mut buf)
-            .await
-            .is_err()
-        {
-            continue;
-        }
         let Ok(meta) = SnapshotMeta::try_from_slice(&buf) else {
             continue;
         };
@@ -424,7 +407,7 @@ async fn heads_in(
             continue;
         }
         out.push(RemoteHead {
-            cache: cache.to_string(),
+            cache: source.name().to_string(),
             stem,
             meta,
         });
