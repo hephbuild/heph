@@ -35,6 +35,9 @@ pub struct ErrorDetail {
     /// `format!("{e:#}")` — the whole cause chain on one line.
     pub message: String,
     /// The root, when this target failed only because a dependency did.
+    /// Never read off the chain ([`from_error`](Self::from_error) leaves it
+    /// `None`): the result scope fills it from the failure classifier, the
+    /// one rule that also decides what the run records as a root.
     pub upstream_of: Option<String>,
     /// The subprocess's exit status as the OS reported it.
     pub exit_status: Option<String>,
@@ -75,7 +78,7 @@ impl ErrorDetail {
     /// some failures: a target can fail before it ever starts a process, and an
     /// internal engine error is neither upstream damage nor a subprocess.
     pub fn from_error(e: &anyhow::Error) -> Self {
-        use hplugin::error::{ProcessFailed, TargetFailure, UpstreamFailed};
+        use hplugin::error::{ProcessFailed, TargetFailure};
         let slot =
             hcore::hmemoizer::downcast_chain_ref::<crate::engine::failure_slot::FailureSlot>(e);
         let mut d = Self {
@@ -96,11 +99,6 @@ impl ErrorDetail {
             ..Self::default()
         };
         for cause in e.chain() {
-            if d.upstream_of.is_none()
-                && let Some(u) = cause.downcast_ref::<UpstreamFailed>()
-            {
-                d.upstream_of = Some(u.root.format());
-            }
             if d.log_tail.is_none()
                 && let Some(t) = cause.downcast_ref::<TargetFailure>()
                 && let Some(tail) = &t.log_tail

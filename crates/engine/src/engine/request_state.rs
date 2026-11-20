@@ -947,9 +947,16 @@ impl RequestState {
 
     /// Records a genuinely-failing target's rich diagnostic. First-writer-wins:
     /// if `addr` already has an entry (e.g. shared via the memoizer to multiple
-    /// waiters), the existing one is kept.
-    pub fn record_failure(&self, addr: Addr, failure: Arc<TargetFailure>) {
-        self.data.failures.lock().entry(addr).or_insert(failure);
+    /// waiters), the existing one is kept. Whether this call was the one
+    /// that recorded it.
+    pub fn record_failure(&self, addr: Addr, failure: Arc<TargetFailure>) -> bool {
+        match self.data.failures.lock().entry(addr) {
+            indexmap::map::Entry::Occupied(_) => false,
+            indexmap::map::Entry::Vacant(v) => {
+                v.insert(failure);
+                true
+            }
+        }
     }
 
     /// Drains and returns all recorded failures in insertion order, leaving the

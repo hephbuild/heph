@@ -2062,10 +2062,22 @@ fn classify_failure(
     interactive: bool,
     e: anyhow::Error,
 ) -> anyhow::Error {
+    classify_failure_fresh(rs, addr, interactive, e).0
+}
+
+/// [`classify_failure`], also saying whether this call recorded the failure:
+/// false for collateral, a propagated error, or an own failure another
+/// caller recorded first.
+fn classify_failure_fresh(
+    rs: &RequestState,
+    addr: &Addr,
+    interactive: bool,
+    e: anyhow::Error,
+) -> (anyhow::Error, bool) {
     match failure_fate(addr, &e) {
-        FailureFate::Propagate => return e,
-        FailureFate::Upstream(root) => return UpstreamFailed { root }.into(),
-        FailureFate::Shell(shell) => return anyhow::Error::new(shell.clone()),
+        FailureFate::Propagate => return (e, false),
+        FailureFate::Upstream(root) => return (UpstreamFailed { root }.into(), false),
+        FailureFate::Shell(shell) => return (anyhow::Error::new(shell.clone()), false),
         FailureFate::Own => {}
     }
 
@@ -2083,7 +2095,7 @@ fn classify_failure(
     let slot = downcast_chain_ref::<crate::engine::failure_slot::FailureSlot>(&e);
     let fixes = slot.and_then(|s| s.fixes.clone());
     let sandbox = slot.and_then(|s| s.sandbox.clone());
-    rs.record_failure(
+    let fresh = rs.record_failure(
         addr.clone(),
         Arc::new(
             TargetFailure::new(addr.clone(), log_tail, e)
@@ -2093,7 +2105,61 @@ fn classify_failure(
                 .with_sandbox(sandbox),
         ),
     );
-    UpstreamFailed { root: addr.clone() }.into()
+    (UpstreamFailed { root: addr.clone() }.into(), fresh)
+}
+
+/// `addr`'s `ResultEnd`, for its result scope and for a failure
+/// [`Engine::fail_unscoped`] reports outside one: one builder, so the two
+/// cannot disagree on what a consumer learns. `upstream_of` is
+/// [`failure_fate`]'s root, never read off the error: the chain hides a
+/// marker behind the memoizer's shared wrapper (a `meta:` context over a
+/// dependency's failure) or inside an aggregation, and an end that missed it
+/// called collateral damage a root failure.
+fn result_end_event(
+    rs: &RequestState,
+    addr: String,
+    error: Option<crate::engine::event::ErrorDetail>,
+    upstream_of: Option<String>,
+    interactive: bool,
+    log_readable: Option<bool>,
+) -> crate::engine::event::BuildEventKind {
+    match error {
+        Some(mut d) => {
+            d.upstream_of = upstream_of;
+            let cancelled = rs.end_is_cancelled(&addr, &d);
+            // The final report's `took down:` row reads the same
+            // `upstream_of` the event carries.
+            if let Some(root) = &d.upstream_of
+                && !cancelled
+            {
+                rs.record_took_down(root, &addr);
+            }
+            crate::engine::event::BuildEventKind::ResultEnd {
+                addr,
+                error: Some(d.message),
+                upstream_of: d.upstream_of,
+                exit_status: d.exit_status,
+                log_tail: crate::engine::event::ErrorDetail::result_log_tail(
+                    d.log_tail,
+                    d.log.as_ref(),
+                    interactive,
+                ),
+                timed_out: d.timed_out,
+                cancelled,
+                left_behind: left_behind(d.left_behind, log_readable, interactive),
+            }
+        }
+        None => crate::engine::event::BuildEventKind::ResultEnd {
+            cancelled: false,
+            addr,
+            error: None,
+            upstream_of: None,
+            exit_status: None,
+            log_tail: None,
+            timed_out: None,
+            left_behind: None,
+        },
+    }
 }
 
 /// What [`classify_failure`] does with an error, decided on a borrow so the
@@ -2272,6 +2338,44 @@ impl Engine {
         self.result_addr_impl(rs, addr, outputs, opts)
     }
 
+    /// [`classify_failure`] for a failure `result_addr` meets outside the
+    /// result scope `inner_result_addr` opens: the def that never resolved,
+    /// a transparent group's own failure. Without a scope nothing announced
+    /// it, so every live view (the TUI's rows and Log tab, the CI line's
+    /// block, a session, a hook) missed a failure the end-of-run report then
+    /// printed. When it is this target's own and this call recorded it, it
+    /// gets the `ResultStart`/`ResultEnd` pair the scope would have emitted;
+    /// a failure another caller recorded first was announced by that caller.
+    async fn fail_unscoped(
+        self: &Arc<Self>,
+        rs: &RequestState,
+        addr: &Addr,
+        interactive: bool,
+        e: anyhow::Error,
+    ) -> anyhow::Error {
+        let detail = matches!(failure_fate(addr, &e), FailureFate::Own)
+            .then(|| crate::engine::event::ErrorDetail::from_error(&e));
+        let (e, fresh) = classify_failure_fresh(rs, addr, interactive, e);
+        if let Some(detail) = detail
+            && fresh
+        {
+            let addr_str = addr.format();
+            rs.emit(crate::engine::event::BuildEventKind::ResultStart {
+                addr: addr_str.clone(),
+            });
+            let readable = self.log_readable(addr).await;
+            rs.emit(result_end_event(
+                rs,
+                addr_str,
+                Some(detail),
+                None,
+                interactive,
+                Some(readable),
+            ));
+        }
+        e
+    }
+
     #[async_recursion]
     async fn result_addr_impl(
         self: Arc<Self>,
@@ -2342,11 +2446,10 @@ impl Engine {
         let def = match Arc::clone(&self).get_def_no_track(rs.clone(), addr).await {
             Ok(def) => def,
             Err(e) => {
-                return Err(surface_top(
-                    is_top,
-                    &rs,
-                    classify_failure(&rs, addr, opts.interactive.is_some(), e),
-                ));
+                let e = self
+                    .fail_unscoped(&rs, addr, opts.interactive.is_some(), e)
+                    .await;
+                return Err(surface_top(is_top, &rs, e));
             }
         };
         if def.target_def.transparent {
@@ -2433,11 +2536,10 @@ impl Engine {
                 match crate::engine::fanout::join_all_failable(futures, rs.fail_fast()).await {
                     Ok(results) => results,
                     Err(e) => {
-                        return Err(surface_top(
-                            is_top,
-                            &rs,
-                            classify_failure(&rs, addr, opts.interactive.is_some(), e),
-                        ));
+                        let e = self
+                            .fail_unscoped(&rs, addr, opts.interactive.is_some(), e)
+                            .await;
+                        return Err(surface_top(is_top, &rs, e));
                     }
                 };
             let mut merged = EResult::default();
@@ -2869,8 +2971,20 @@ impl Engine {
                     // An entrypoint is invoked on its own, never as one of a
                     // selection — refused before any of it builds (I8).
                     let r = match engine.refuse_entrypoint_in_selection(&rs, &addr).await {
-                        Ok(()) => engine.result_addr(rs, &addr, outputs, &opts).await,
-                        Err(e) => Err(e),
+                        Err(e)
+                            if downcast_chain_ref::<crate::engine::invoke::EntrypointNotBuildable>(
+                                &e,
+                            )
+                            .is_some() =>
+                        {
+                            Err(e)
+                        }
+                        // A def that does not resolve is not known to be an
+                        // entrypoint: the build reports it, as it does for a
+                        // single addr (`heph run`), and `result_addr` announces
+                        // it with a `ResultEnd` the live views show. Returned
+                        // from here, it reached only the end-of-run report.
+                        Ok(()) | Err(_) => engine.result_addr(rs, &addr, outputs, &opts).await,
                     };
                     (addr, r)
                 }),
@@ -3003,6 +3117,10 @@ impl Engine {
         // never for collateral (a marker, thousands of them).
         let readable: Arc<std::sync::OnceLock<bool>> = Arc::default();
         let end_readable = Arc::clone(&readable);
+        // The root a collateral failure names, decided by the classifier's
+        // own rule when the scope fails, before its end is built.
+        let upstream: Arc<std::sync::OnceLock<String>> = Arc::default();
+        let end_upstream = Arc::clone(&upstream);
         let log_engine = Arc::clone(&self);
         crate::engine::event::emit_scope_with(
             &rs,
@@ -3013,48 +3131,23 @@ impl Engine {
             // a consumer learns a target's outcome, so it is where `upstream_of`
             // (root vs collateral), the exit status, the log tail and a timeout
             // belong.
-            move |error| match error {
-                Some(d) => {
-                    let cancelled = end_rs.end_is_cancelled(&addr_str, &d);
-                    // The final report's `took down:` row reads the same
-                    // `upstream_of` the event carries.
-                    if let Some(root) = &d.upstream_of
-                        && !cancelled
-                    {
-                        end_rs.record_took_down(root, &addr_str);
-                    }
-                    crate::engine::event::BuildEventKind::ResultEnd {
-                        addr: addr_str,
-                        error: Some(d.message),
-                        upstream_of: d.upstream_of,
-                        exit_status: d.exit_status,
-                        log_tail: crate::engine::event::ErrorDetail::result_log_tail(
-                            d.log_tail,
-                            d.log.as_ref(),
-                            interactive,
-                        ),
-                        timed_out: d.timed_out,
-                        cancelled,
-                        left_behind: left_behind(
-                            d.left_behind,
-                            end_readable.get().copied(),
-                            interactive,
-                        ),
-                    }
-                }
-                None => crate::engine::event::BuildEventKind::ResultEnd {
-                    cancelled: false,
-                    addr: addr_str,
-                    error: None,
-                    upstream_of: None,
-                    exit_status: None,
-                    log_tail: None,
-                    timed_out: None,
-                    left_behind: None,
-                },
+            move |error| {
+                result_end_event(
+                    &end_rs,
+                    addr_str,
+                    error,
+                    end_upstream.get().cloned(),
+                    interactive,
+                    end_readable.get().copied(),
+                )
             },
             |e| {
-                matches!(failure_fate(addr, e), FailureFate::Own).then(|| async move {
+                let fate = failure_fate(addr, e);
+                if let FailureFate::Upstream(root) = &fate {
+                    // Set once: this scope ends once.
+                    let _first: Result<(), String> = upstream.set(root.format());
+                }
+                matches!(fate, FailureFate::Own).then(|| async move {
                     // Set once: this scope ends once.
                     let _first: Result<(), bool> =
                         readable.set(log_engine.log_readable(addr).await);
