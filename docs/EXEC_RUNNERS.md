@@ -365,6 +365,17 @@ describes the environment rather than the paperwork.
 Cached locally, never remotely: the captured environment names this machine's
 nix store paths.
 
+Those paths are kept alive. Each run builds one store path whose closure covers
+every store path its `runner.json` names, roots it at
+`<home>/devenv-runner/gcroots/<addr hash>`, and declares it in `host_paths`, so
+if a garbage collection takes it anyway the engine turns the cached runner into
+a cache miss and re-runs it rather than serving an environment that points at
+deleted paths. Rooting needs `nix` on the runner's `pass_env` PATH whenever its
+output names a store path; without one the run fails and writes no
+`runner.json`. Runners cached before this declared nothing, so the driver's
+format version moved with it: each devenv runner re-runs once after the
+upgrade. Its `runner.json` bytes are unchanged, so consumers keep their keys.
+
 ## Containers
 
 ```python
