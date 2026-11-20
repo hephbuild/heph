@@ -520,11 +520,22 @@ fn on_dashboard(s: &vt100::Screen) -> bool {
     s.alternate_screen() && count_rows(s, DASHBOARD_HINT) == 1
 }
 
-/// The dashboard fills the window it has now: its hint row is the last row,
-/// and there is one of it.
+/// The dashboard fills the window it has now: its title is the first row,
+/// its hint row the last, and there is one of it.
+///
+/// Both ends, because the terminal reflows on a resize before heph draws
+/// anything: shrinking with the cursor on the bottom row keeps the bottom
+/// rows and pushes the top ones off (xterm, and vt100 from 0.18), so the old
+/// frame's hint row lands on the new last row by itself. Only heph's own
+/// repaint puts the title back on top: ` Running //pkg:ok   1s · 0 / 1 done`,
+/// from its first column. A diff draw over the wreck writes the clock and the
+/// count but not the unchanged words before them.
 fn dashboard_fits(s: &vt100::Screen) -> bool {
-    let last = rows_of(s).last().unwrap_or_default();
-    on_dashboard(s) && last.contains(DASHBOARD_HINT)
+    let mut rows = rows_of(s);
+    let first = rows.next().unwrap_or_default();
+    let last = rows.last().unwrap_or_default();
+    let title = first.contains(" done") && first.starts_with(' ') && !first.starts_with("  ");
+    on_dashboard(s) && title && last.contains(DASHBOARD_HINT)
 }
 
 fn on_finished_dashboard(s: &vt100::Screen) -> bool {
