@@ -7,5 +7,5 @@ edition = "2024"
 workspace = true
 
 [dependencies]
-anyhow = "1.0.102"
+anyhow = "1.0.104"
 minijinja = "3"

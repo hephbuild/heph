@@ -10,7 +10,7 @@ workspace = true
 hcore = { package = "core", path = "../core" }
 hmodel = { package = "model", path = "../model" }
 hproc = { package = "proc", path = "../proc" }
-anyhow = "1.0.102"
+anyhow = "1.0.104"
 async-trait = "0.1"
 tracing = "0.1"
 serde = { version = "1.0", features = ["derive"] }
@@ -18,8 +18,8 @@ serde_json = "1.0"
 rustix = { version = "1.1", features = ["net", "fs", "process"] }
 libc = "0.2"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
-tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
+tokio = { version = "1.54.1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
 
 [dev-dependencies]
 tempfile = "3"
-tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "macros"] }
+tokio = { version = "1.54.1", features = ["rt", "rt-multi-thread", "macros"] }

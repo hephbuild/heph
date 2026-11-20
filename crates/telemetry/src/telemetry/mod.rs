@@ -866,9 +866,13 @@ enum FlushOutcome {
     Sent(usize),
 }
 
-/// Sends one batch, returning once the endpoint confirmed it. `Send +
+/// Sends one batch, returning once the endpoint answered: the UUIDs of the
+/// events it did not confirm, which stay spooled for a later flush. `Send +
 /// 'static` because it runs on its own thread (see [`SendWorker`]).
-type Sender = Box<dyn FnMut(Vec<SpooledEvent>) -> anyhow::Result<()> + Send>;
+type Sender = Box<dyn FnMut(Vec<SpooledEvent>) -> anyhow::Result<Unconfirmed> + Send>;
+
+/// The UUIDs, as spooled, of the events a send did not get confirmed.
+type Unconfirmed = Vec<String>;
 
 /// Take the flusher lock as `mode` says, giving up at `deadline`. `false`:
 /// another flusher holds it.
@@ -902,7 +906,7 @@ fn take_lock(
 /// is sent again, under the same UUIDs, by a later flush.
 struct SendWorker {
     batches: std::sync::mpsc::Sender<Vec<SpooledEvent>>,
-    results: std::sync::mpsc::Receiver<anyhow::Result<()>>,
+    results: std::sync::mpsc::Receiver<anyhow::Result<Unconfirmed>>,
 }
 
 impl SendWorker {
@@ -922,8 +926,9 @@ impl SendWorker {
         Ok(Self { batches, results })
     }
 
-    /// Send one batch; an error if it failed, or if `deadline` came first.
-    fn send(&self, batch: Vec<SpooledEvent>, deadline: Instant) -> anyhow::Result<()> {
+    /// Send one batch; what it did not get confirmed, or an error if it
+    /// failed, or if `deadline` came first.
+    fn send(&self, batch: Vec<SpooledEvent>, deadline: Instant) -> anyhow::Result<Unconfirmed> {
         use std::sync::mpsc::RecvTimeoutError;
         self.batches
             .send(batch)
@@ -1013,12 +1018,27 @@ fn drain(dir: &Path, deadline: Instant, send: Sender) -> anyhow::Result<usize> {
         let Some(worker) = worker.as_ref() else {
             anyhow::bail!("telemetry sender thread missing");
         };
-        let (ids, events): (Vec<i64>, Vec<SpooledEvent>) = batch.into_iter().unzip();
-        worker.send(events, deadline)?;
-        // Confirmed: drop exactly these rows. A crash before this commits
-        // re-sends them next time under the same UUIDs (deduped server-side).
-        spool.delete(&ids)?;
-        sent += ids.len();
+        let rows: Vec<(i64, String)> = batch.iter().map(|(id, e)| (*id, e.uuid.clone())).collect();
+        let events = batch.into_iter().map(|(_, e)| e).collect();
+        let unconfirmed = worker.send(events, deadline)?;
+        // Drop exactly the confirmed rows. A crash before this commits re-sends
+        // them next time under the same UUIDs (deduped server-side).
+        let confirmed: Vec<i64> = rows
+            .iter()
+            .filter(|(_, uuid)| !unconfirmed.contains(uuid))
+            .map(|(id, _)| *id)
+            .collect();
+        spool.delete(&confirmed)?;
+        sent += confirmed.len();
+        // The endpoint answered but kept some events back: stop as a failed
+        // send would, and leave them for the next flush.
+        if !unconfirmed.is_empty() {
+            anyhow::bail!(
+                "telemetry endpoint did not confirm {} of {} events; they stay spooled",
+                unconfirmed.len(),
+                rows.len()
+            );
+        }
     }
     Ok(sent)
 }
@@ -1085,9 +1105,12 @@ fn endpoint_from(raw: Option<&std::ffi::OsStr>) -> anyhow::Result<Endpoint> {
 
 /// The production sender: one PostHog client (and the runtime it needs) for the
 /// whole flush, built on the first batch.
-fn posthog_sender(host: String) -> impl FnMut(Vec<SpooledEvent>) -> anyhow::Result<()> + Send {
+fn posthog_sender(
+    host: String,
+) -> impl FnMut(Vec<SpooledEvent>) -> anyhow::Result<Unconfirmed> + Send {
     let mut client: Option<(tokio::runtime::Runtime, posthog_rs::Client)> = None;
     move |rows| {
+        let spooled: Vec<String> = rows.iter().map(|r| r.uuid.clone()).collect();
         let events = rows
             .into_iter()
             .map(rebuild_event)
@@ -1111,18 +1134,39 @@ fn posthog_sender(host: String) -> impl FnMut(Vec<SpooledEvent>) -> anyhow::Resu
         let Some((rt, c)) = client.as_ref() else {
             anyhow::bail!("telemetry client unavailable");
         };
-        // `capture_batch_immediate`, not `capture_batch`: as of posthog-rs 0.21
-        // the latter is fire-and-forget (returns `()`, enqueues onto a
-        // background transport). We must not delete the spooled rows until the
-        // send is *confirmed*, or a failed flush silently loses the batch. The
-        // returned `CaptureSummary` is discarded on purpose: its
-        // `not_persisted()` is only ever non-zero under the non-default
-        // `capture-v1` feature, so on the v0 pipeline an `Ok` already means the
-        // whole batch persisted.
-        rt.block_on(c.capture_batch_immediate(events, false))
-            .map(|_| ())
-            .map_err(|e| anyhow::anyhow!("telemetry batch capture failed: {e}"))
+        // `capture_batch_immediate`, not `capture_batch`: the latter is
+        // fire-and-forget (returns `()`, enqueues onto a background transport).
+        // We must not delete the spooled rows until the send is *confirmed*, or
+        // a failed flush silently loses the batch. And an `Ok` is not a
+        // confirmation on its own: capture v1 answers `2xx` with a verdict per
+        // event, so a row is deleted only on its own verdict.
+        let summary = rt
+            .block_on(c.capture_batch_immediate(events, false))
+            .map_err(|e| anyhow::anyhow!("telemetry batch capture failed: {e}"))?;
+        Ok(unconfirmed(spooled, summary.event_results()))
     }
+}
+
+/// The spooled UUIDs a capture did not settle: those PostHog answered `retry`
+/// for — the SDK already spent its own retries on them — and those it left out
+/// of its answer. `ok`/`warning` mean persisted. `drop` is a refusal that
+/// resending cannot change (an invalid event, a quota), so it settles the row
+/// too, rather than resend it on every flush. A verdict this SDK does not know
+/// counts as settled for the same reason.
+fn unconfirmed(
+    spooled: Vec<String>,
+    verdicts: &std::collections::HashMap<uuid::Uuid, posthog_rs::EventResult>,
+) -> Unconfirmed {
+    spooled
+        .into_iter()
+        .filter(|s| {
+            let verdict = uuid::Uuid::parse_str(s).ok().and_then(|u| verdicts.get(&u));
+            match verdict {
+                None => true,
+                Some(v) => matches!(v.result, posthog_rs::EventStatus::Retry),
+            }
+        })
+        .collect()
 }
 
 /// Partition the args explicitly set on the command line at one match level into
@@ -1901,7 +1945,7 @@ mod flush_tests {
 
     /// A sender that confirms every batch.
     fn ok_sender() -> Sender {
-        Box::new(|_| Ok(()))
+        Box::new(|_| Ok(Vec::new()))
     }
 
     /// The thresholds: five minutes of age, or a full batch of events.
@@ -1988,7 +2032,7 @@ mod flush_tests {
             far(),
             Box::new(move |_| {
                 *counted.lock().expect("lock") += 1;
-                Ok(())
+                Ok(Vec::new())
             }),
         )
         .expect("flush");
@@ -2050,7 +2094,7 @@ mod flush_tests {
             started + Duration::from_millis(200),
             Box::new(|_| {
                 std::thread::sleep(Duration::from_secs(30));
-                Ok(())
+                Ok(Vec::new())
             }),
         )
         .expect_err("the deadline passed mid-send");
@@ -2127,7 +2171,7 @@ mod flush_tests {
                     .lock()
                     .expect("lock")
                     .extend(batch.into_iter().map(|e| e.uuid));
-                Ok(())
+                Ok(Vec::new())
             }),
         )
         .expect("flush");
@@ -2202,7 +2246,7 @@ mod flush_tests {
                     .lock()
                     .expect("lock")
                     .extend(batch.into_iter().map(|e| e.uuid));
-                Ok(())
+                Ok(Vec::new())
             }),
         )
         .expect("next flush");
@@ -2244,6 +2288,29 @@ mod flush_tests {
     /// A PostHog stand-in on loopback: answers every request `200` and hands
     /// each request body to the test.
     fn loopback_sink() -> (String, std::sync::mpsc::Receiver<String>) {
+        loopback_sink_answering(|_| Some("ok"))
+    }
+
+    /// PostHog capture v1's answer to `body`: `verdict(uuid)` for each event
+    /// in the batch, the event left out of the answer where it is `None`.
+    fn capture_v1_reply(body: &[u8], verdict: fn(&str) -> Option<&'static str>) -> Vec<u8> {
+        let batch: serde_json::Value = serde_json::from_slice(body).expect("batch json");
+        let results: serde_json::Map<String, serde_json::Value> = batch["batch"]
+            .as_array()
+            .expect("a batch request")
+            .iter()
+            .filter_map(|e| {
+                let uuid = e["uuid"].as_str().expect("an event uuid");
+                verdict(uuid).map(|v| (uuid.to_string(), serde_json::json!({ "result": v })))
+            })
+            .collect();
+        serde_json::to_vec(&serde_json::json!({ "results": results })).expect("reply json")
+    }
+
+    /// [`loopback_sink`], answering each event with `verdict(uuid)`.
+    fn loopback_sink_answering(
+        verdict: fn(&str) -> Option<&'static str>,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
         use std::io::{Read as _, Write as _};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind sink");
         let url = format!("http://{}", listener.local_addr().expect("sink addr"));
@@ -2278,14 +2345,14 @@ mod flush_tests {
                     }
                 };
                 let Some(body) = body else { continue };
-                let reply = br#"{"status":1}"#;
+                let reply = capture_v1_reply(&body, verdict);
                 let head = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
                      Content-Length: {}\r\nConnection: close\r\n\r\n",
                     reply.len()
                 );
                 drop(stream.write_all(head.as_bytes()));
-                drop(stream.write_all(reply));
+                drop(stream.write_all(&reply));
                 if tx
                     .send(String::from_utf8_lossy(&body).into_owned())
                     .is_err()
@@ -2327,6 +2394,54 @@ mod flush_tests {
             assert!(body.contains(&e.uuid), "{} missing from {body}", e.uuid);
         }
         assert_spool_gone(dir.path());
+    }
+
+    /// Capture v1 answers `200` with a verdict per event, so a `200` alone
+    /// confirms nothing. Persisted (`ok`, `warning`) and refused (`drop`) rows
+    /// are settled and deleted; a `retry` the SDK could not get through, and an
+    /// event the answer left out, stay spooled for the next flush — which
+    /// stops here, as a failed send does.
+    #[test]
+    fn a_flush_deletes_only_the_events_capture_settled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spool = spool_in(dir.path());
+        for n in 1..=5 {
+            spool
+                .enqueue(&SpooledEvent {
+                    uuid: format!("00000000-0000-4000-8000-00000000000{n}"),
+                    ..ev_sendable(n)
+                })
+                .expect("enqueue");
+        }
+        drop(spool);
+        let (url, _bodies) = loopback_sink_answering(|uuid| match uuid.chars().last() {
+            Some('1') => Some("ok"),
+            Some('2') => Some("warning"),
+            Some('3') => Some("drop"),
+            Some('4') => Some("retry"),
+            _ => None,
+        });
+
+        let err = run_flush(
+            dir.path(),
+            LockMode::Wait,
+            far(),
+            Box::new(posthog_sender(url)),
+        )
+        .expect_err("two events were not confirmed");
+        assert!(
+            format!("{err:#}").contains("did not confirm 2 of 5"),
+            "{err:#}"
+        );
+        let mut left = remaining(dir.path());
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                "00000000-0000-4000-8000-000000000004",
+                "00000000-0000-4000-8000-000000000005",
+            ]
+        );
     }
 
     /// Opted out with the sink unreachable: the one send fails, and the spool
@@ -2437,7 +2552,7 @@ mod flush_tests {
         let ci = hand_off_opt_out(dir.path(), true, NOW + 2, no_spawn, move || {
             Ok(Box::new(move |rows: Vec<SpooledEvent>| {
                 *counted.lock().expect("lock") += rows.len();
-                Ok(())
+                Ok(Vec::new())
             }) as Sender)
         })
         .expect("ci");

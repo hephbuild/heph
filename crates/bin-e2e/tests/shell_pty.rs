@@ -836,7 +836,7 @@ fn entrypoint_shell_pty() {
         session.output_lossy()
     );
 
-    let mut screen = vt100::Parser::new(40, 140, 0);
+    let mut screen = common::pty::parser(40, 140);
     screen.process(&session.output_snapshot());
     assert!(
         !screen.screen().alternate_screen(),

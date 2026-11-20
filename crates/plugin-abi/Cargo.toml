@@ -11,7 +11,7 @@ hproto-gen = { package = "proto-gen", path = "../../gen/proto" }
 # The generated code's runtime, already linked through `hproto-gen`; named here
 # for `decode`'s options.
 buffa = { workspace = true }
-anyhow = "1.0.102"
+anyhow = "1.0.104"
 # convert feature: conversions between pb wire types and the in-process
 # hplugin/hmodel/hcore types. Optional so the bare wire crate stays light.
 hplugin = { package = "plugin", path = "../plugin", optional = true }

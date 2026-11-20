@@ -118,9 +118,22 @@ anything `get_stabbied` would reject:
   translation of its own filter into one: it must never send a narrower filter
   than it applies (`hostlog::plain_directives`, and the test beside it that
   checks it against `EnvFilter`).
-- Change the `stabby` dependency version in any crate that links the boundary
-  (`plugin-stabby`, `plugin-sdk`, `plugin-go-cdylib`). stabby keys its type reports
-  to its own version; a mismatch fails `get_stabbied`.
+- Change the `stabby` dependency to a release that changes stabby's own ABI, in
+  any crate that links the boundary (`plugin-stabby`, `plugin-sdk`,
+  `plugin-go-cdylib`). stabby's major version is its ABI (72.x is `abi=2.0.0`),
+  and a new one reshapes the type reports `get_stabbied` compares, so every
+  plugin built on the old one is refused.
+
+  A stabby release that keeps its ABI (a 72.x patch whose changelog leaves
+  `abi=` unchanged) is a **patch** bump, not a break: a `TypeReport` carries a
+  type's name, module path, fields and invariant `version`, never the stabby
+  crate version, so an unchanged layout produces the same reports and old
+  plugins keep loading. Diff the two releases' `stabby-abi` and `stabby-macros`
+  sources for any change to a `#[stabby]` type, a report or a layout before
+  calling it one; if the reports did move after all, `get_stabbied` still
+  refuses the plugin with the "different heph ABI" message rather than loading
+  it. `scripts/abi-check.sh` cannot tell the two apart, so any pin change makes
+  `ABI_SEMVER` move. 0.21.2 (stabby 72.1.8 → 72.1.16) is the precedent.
 
 A **removed** or **renumbered** proto field (vs an added one) is wire-breaking →
 also major — with one exception, below.

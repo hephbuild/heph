@@ -17,21 +17,21 @@ hbuiltins = { package = "builtins", path = "../builtins" }
 hdriver-support = { package = "driver-support", path = "../driver-support" }
 hplugin-exec = { package = "plugin-exec", path = "../plugin-exec" }
 hplugin-query = { package = "plugin-query", path = "../plugin-query" }
-anyhow = "1.0.102"
+anyhow = "1.0.104"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
-async-trait = "0.1.89"
+async-trait = "0.1.92"
 async-recursion = "1"
-futures = "0.3.32"
+futures = "0.3.34"
 enclose = "1"
-parking_lot = "0.12"
-borsh = { version = "1.6.1", features = ["derive"] }
+parking_lot = "0.13"
+borsh = { version = "1.8.1", features = ["derive"] }
 glob = "0.3"
 # `wax::escape` for the `format` sources glob: the fs walker compiles that
 # pattern with this same wax, so its escaping is the authority.
 wax = "0.7"
-xxhash-rust = { version = "0.8.15", features = ["xxh3", "std"] }
-tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "io-util", "process", "macros", "sync", "fs"] }
+xxhash-rust = { version = "0.8.21", features = ["xxh3", "std"] }
+tokio = { version = "1.54.1", features = ["rt", "rt-multi-thread", "io-util", "process", "macros", "sync", "fs"] }
 # Hermetic Go toolchain provisioning: download (hfetch), checksum (sha2),
 # and extract (flate2 + tar) the pinned Go SDK tarball so the build never
 # reads a `go` binary or GOROOT from the host.
@@ -41,7 +41,7 @@ sha2 = "0.11"
 # `LowerHex`, so the old `format!("{:x}", ..)` is out. `hex::encode` emits the
 # same lowercase, unseparated digest, which these checksum comparisons rely on.
 hex = "0.4"
-flate2 = "1.1.9"
+flate2 = "1.1.11"
 tar = "0.4"
 tracing = "0.1"
 

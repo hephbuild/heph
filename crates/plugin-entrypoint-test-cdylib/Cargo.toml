@@ -19,10 +19,10 @@ hplugin = { package = "plugin", path = "../plugin" }
 hcore = { package = "core", path = "../core" }
 hdriver-support = { package = "driver-support", path = "../driver-support" }
 plugin-sdk = { path = "../plugin-sdk", features = ["stabby"] }
-stabby = "72.1.8"
-anyhow = "1.0.102"
+stabby = "72.1.16"
+anyhow = "1.0.104"
 async-trait = "0.1"
 tracing = "0.1"
 # `stream`: its writers are `AsyncWrite`s, and its gate waits on a thread whose
 # answer comes back through a oneshot — a cdylib has no reactor for a timer.
-tokio = { version = "1.52", features = ["sync", "io-util"] }
+tokio = { version = "1.54", features = ["sync", "io-util"] }

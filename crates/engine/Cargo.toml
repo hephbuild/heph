@@ -31,16 +31,16 @@ hplugin-query = { package = "plugin-query", path = "../plugin-query" }
 hplugin-stabby = { package = "plugin-stabby", path = "../plugin-stabby", features = ["host"] }
 hplugin-abi = { package = "plugin-abi", path = "../plugin-abi", features = ["convert"] }
 htelemetry = { package = "telemetry", path = "../telemetry" }
-anyhow = "1.0.102"
+anyhow = "1.0.104"
 async-recursion = "1"
 async-stream = "0.3"
-async-trait = "0.1.89"
-borsh = { version = "1.6.1", features = ["derive"] }
+async-trait = "0.1.92"
+borsh = { version = "1.8.1", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
 crossbeam-channel = "0.5"
 enclose = "1"
-flate2 = "1.1.9"
-futures = "0.3.32"
+flate2 = "1.1.11"
+futures = "0.3.34"
 glob = "0.3"
 # GCP auth that understands `external_account` ADC (workload identity
 # federation), which object_store's GCS builder cannot decode. Used only to mint
@@ -48,14 +48,14 @@ glob = "0.3"
 # credential type stays on object_store's native path. `default-features = false`
 # drops the id-token backend (pulls aws-lc C build) we don't need; we install the
 # ring rustls provider ourselves (see `ensure_rustls_provider_installed`).
-google-cloud-auth = { version = "1.13", default-features = false }
+google-cloud-auth = { version = "1.19", default-features = false }
 indexmap = "2"
 memoize = "0.6.0"
-object_store = { version = "0.14.1", features = ["aws", "gcp", "azure", "http", "tokio"] }
-parking_lot = "0.12"
+object_store = { version = "0.14.2", features = ["aws", "gcp", "azure", "http", "tokio"] }
+parking_lot = "0.13"
 quick_cache = "0.7"
 r2d2 = "0.8"
-r2d2_sqlite = "0.35"
+r2d2_sqlite = "0.37"
 rayon = "1.12.0"
 # Two jobs, one client crate:
 #  - `blocking`: downloading `url:` plugin manifests/cdylibs. Blocking runs on
@@ -73,7 +73,8 @@ rayon = "1.12.0"
 # gzip/brotli features → responses are not auto-decompressed (cache blobs stay
 # raw).
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls", "http2", "stream"] }
-rusqlite = { version = "0.40", features = ["bundled", "blob"] }
+# Held at the release r2d2_sqlite is built against (see the root Cargo.toml).
+rusqlite = { version = "0.42", features = ["bundled", "blob"] }
 rustc-hash = "2"
 # `statvfs` and `access` for `heph tool gc`'s cache.db conversion space check;
 # one call on Linux and macOS alike (already in the tree via execrunner).
@@ -95,20 +96,20 @@ smart-default = "0.7.1"
 stacker = "0.1"
 strsim = "0.11.1"
 tar = "0.4"
-tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "io-util", "io-std", "process", "macros", "sync", "signal", "fs", "test-util", "tracing", "net"] }
-tokio-util = { version = "0.7.18", features = ["io", "io-util"] }
+tokio = { version = "1.54.1", features = ["rt", "rt-multi-thread", "io-util", "io-std", "process", "macros", "sync", "signal", "fs", "test-util", "tracing", "net"] }
+tokio-util = { version = "0.7.20", features = ["io", "io-util"] }
 tracing = "0.1"
 url = "2.5.8"
-uuid = { version = "1.23.3", features = ["v4"] }
+uuid = { version = "1.29.3", features = ["v4"] }
 wax = "0.7"
-which = "8.0.3"
-xxhash-rust = { version = "0.8.15", features = ["xxh3", "std"] }
-thiserror = "2.0.18"
+which = "8.0.6"
+xxhash-rust = { version = "0.8.21", features = ["xxh3", "std"] }
+thiserror = "2.0.21"
 libc = "0.2"
 xattr = "1"
 tempfile = "3.27"
 derivative = "2.2.0"
-humantime = "2.3.0"
+humantime = "2.4.0"
 
 [dev-dependencies]
 hplugin-buildfile = { package = "plugin-buildfile", path = "../plugin-buildfile" }

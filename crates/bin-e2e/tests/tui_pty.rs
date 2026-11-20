@@ -499,7 +499,7 @@ impl Gated {
 }
 
 fn rows_of(s: &vt100::Screen) -> impl Iterator<Item = String> + '_ {
-    s.rows(0, s.size().1)
+    common::pty::screen_rows(s)
 }
 
 fn count_rows(s: &vt100::Screen, needle: &str) -> usize {
@@ -520,11 +520,22 @@ fn on_dashboard(s: &vt100::Screen) -> bool {
     s.alternate_screen() && count_rows(s, DASHBOARD_HINT) == 1
 }
 
-/// The dashboard fills the window it has now: its hint row is the last row,
-/// and there is one of it.
+/// The dashboard fills the window it has now: its title is the first row,
+/// its hint row the last, and there is one of it.
+///
+/// Both ends, because the terminal reflows on a resize before heph draws
+/// anything: shrinking with the cursor on the bottom row keeps the bottom
+/// rows and pushes the top ones off (xterm, and vt100 from 0.18), so the old
+/// frame's hint row lands on the new last row by itself. Only heph's own
+/// repaint puts the title back on top: ` Running //pkg:ok   1s · 0 / 1 done`,
+/// from its first column. A diff draw over the wreck writes the clock and the
+/// count but not the unchanged words before them.
 fn dashboard_fits(s: &vt100::Screen) -> bool {
-    let last = rows_of(s).last().unwrap_or_default();
-    on_dashboard(s) && last.contains(DASHBOARD_HINT)
+    let mut rows = rows_of(s);
+    let first = rows.next().unwrap_or_default();
+    let last = rows.last().unwrap_or_default();
+    let title = first.contains(" done") && first.starts_with(' ') && !first.starts_with("  ");
+    on_dashboard(s) && title && last.contains(DASHBOARD_HINT)
 }
 
 fn on_finished_dashboard(s: &vt100::Screen) -> bool {
@@ -1236,7 +1247,9 @@ fn dashboard_flag_without_tty() {
 }
 
 /// Shrink and grow on the line and on the dashboard: each redraw fills the
-/// window it has, once, with nothing left over from the old size.
+/// window it has, once, with nothing left over from the old size — a shrink
+/// and a grow back inside one tick included, which ends at the size heph last
+/// drew at, on a screen the terminal reflowed in between.
 #[test]
 fn resize_in_each_mode() {
     let mut g = Gated::start("", &[]);
@@ -1254,6 +1267,12 @@ fn resize_in_each_mode() {
         Step::Until("the dashboard filling 20x80", dashboard_fits),
         Step::Resize(40, 140),
         Step::Until("the dashboard filling 40x140", dashboard_fits),
+        Step::Resize(20, 80),
+        Step::Resize(40, 140),
+        Step::Until(
+            "the dashboard filling 40x140 after a round trip",
+            dashboard_fits,
+        ),
         Step::Resize(24, 100),
         Step::Keys(ESC),
         Step::Settle,
@@ -1443,6 +1462,7 @@ fn terminal_restored_on_every_exit() {
 /// it counts as the two columns it takes.
 fn find_cell(s: &vt100::Screen, needle: &str) -> Option<(u16, u16)> {
     let (rows, cols) = s.size();
+    let (rows, cols) = (rows.get(), cols.get());
     (0..rows).find_map(|row| {
         let mut text = String::new();
         let mut cols_at = Vec::new();
@@ -2270,7 +2290,7 @@ fn drive_pty(
     let sent_input = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sent_flag = Arc::clone(&sent_input);
     let pump = std::thread::spawn(move || {
-        let mut parser = vt100::Parser::new(ROWS, COLS, 0);
+        let mut parser = common::pty::parser(ROWS, COLS);
         let mut buf = [0u8; 8192];
         // A pty is a pipe, not a terminal: nothing on this end answers queries.
         // The TUI asks where the cursor is (DSR) while setting up its inline

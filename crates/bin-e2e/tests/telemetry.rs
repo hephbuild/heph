@@ -112,9 +112,30 @@ fn read_request(stream: &mut TcpStream) -> Vec<u8> {
         .to_vec()
 }
 
-/// A PostHog stand-in on loopback. Answers every request `200`, handing each
-/// body to the test — except the first, which it holds unanswered until the
-/// test releases it.
+/// PostHog capture v1's answer to `body`: an `ok` verdict for every event in
+/// the batch, which is what confirms an event; a bare `200` confirms nothing.
+fn persisted_reply(body: &[u8]) -> Vec<u8> {
+    let batch: serde_json::Value = serde_json::from_slice(body).expect("batch json");
+    let results: serde_json::Map<String, serde_json::Value> = batch
+        .get("batch")
+        .and_then(serde_json::Value::as_array)
+        .expect("a batch request")
+        .iter()
+        .map(|e| {
+            let uuid = e
+                .get("uuid")
+                .and_then(serde_json::Value::as_str)
+                .expect("an event uuid")
+                .to_string();
+            (uuid, serde_json::json!({ "result": "ok" }))
+        })
+        .collect();
+    serde_json::to_vec(&serde_json::json!({ "results": results })).expect("reply json")
+}
+
+/// A PostHog stand-in on loopback. Answers every request `200`, every event
+/// persisted, handing each body to the test — except the first, which it
+/// holds unanswered until the test releases it.
 struct Sink {
     url: String,
     bodies: mpsc::Receiver<Vec<u8>>,
@@ -133,20 +154,20 @@ impl Sink {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
                 let body = read_request(&mut stream);
+                let reply = persisted_reply(&body);
                 if body_tx.send(body).is_err() {
                     return;
                 }
                 if std::mem::take(&mut first) && release_rx.recv().is_err() {
                     return;
                 }
-                let reply = br#"{"status":1}"#;
                 let head = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
                      Content-Length: {}\r\nConnection: close\r\n\r\n",
                     reply.len()
                 );
                 drop(stream.write_all(head.as_bytes()));
-                drop(stream.write_all(reply));
+                drop(stream.write_all(&reply));
             }
         });
         Self {
@@ -209,7 +230,7 @@ fn the_flusher_outlives_the_command_and_sends_the_spool() {
         .recv_timeout(Duration::from_secs(30))
         .expect("the flusher never posted to the sink");
     let batch: serde_json::Value = serde_json::from_slice(&body).expect("batch json");
-    let events = batch["batch"].as_array().expect("a /batch/ request");
+    let events = batch["batch"].as_array().expect("a capture batch request");
     assert_eq!(events.len(), FLUSH_AT_EVENTS, "one full batch: {batch}");
     for e in events {
         assert_eq!(e["event"], "cli_command", "{e}");
@@ -366,7 +387,7 @@ fn the_env_opt_out_sends_the_spool_once_then_deletes_it() {
         .recv_timeout(Duration::from_secs(30))
         .expect("the opt-out flusher never posted to the sink");
     let batch: serde_json::Value = serde_json::from_slice(&body).expect("batch json");
-    let events = batch["batch"].as_array().expect("a /batch/ request");
+    let events = batch["batch"].as_array().expect("a capture batch request");
     assert_eq!(events.len(), 1, "the one seeded event: {batch}");
     let event = events.first().expect("one event");
     assert_eq!(event["properties"]["command"], "version", "{batch}");

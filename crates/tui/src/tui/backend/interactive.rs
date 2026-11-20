@@ -101,6 +101,9 @@ fn write_stderr(bytes: &[u8]) -> io::Result<()> {
 /// costs a cursor query, which must not run while the input stream is live.
 struct FullScreen {
     terminal: StderrTerminal,
+    /// The terminal was resized since the last draw: the next one repaints
+    /// every cell, not only the ones that changed. See [`FullScreen::draw`].
+    resized: bool,
 }
 
 impl FullScreen {
@@ -120,7 +123,10 @@ impl FullScreen {
         ALT_SCREEN_UP.store(true, Ordering::Release);
         // Built before the write: from here on dropping it is the restore,
         // the `?` below included.
-        let screen = Self { terminal };
+        let screen = Self {
+            terminal,
+            resized: false,
+        };
         crossterm::execute!(io::stderr(), EnterAlternateScreen)
             .context("entering the alternate screen")?;
         if mouse {
@@ -128,6 +134,26 @@ impl FullScreen {
             write_stderr(MOUSE_ON).context("capturing the mouse")?;
         }
         Ok(screen)
+    }
+
+    /// Draw a frame. After a resize every cell is written, not only the
+    /// ones that changed since the last draw.
+    ///
+    /// ratatui repaints in full only when the size it reads as it draws
+    /// differs from the one it last drew at. Two resizes inside one tick
+    /// that end at that size (a window shrunk and grown back, a zoom
+    /// toggled) look like no resize to it, but the terminal reflowed its
+    /// screen at the size in between — cut rows, pushed the top off — and
+    /// a diff draw leaves that wreck up for good. `resize` to the current
+    /// size clears the screen and drops ratatui's idea of what is on it;
+    /// unlike `clear`, it sends no cursor query, which must not race the
+    /// input stream.
+    fn draw(&mut self, frame: impl FnOnce(&mut ratatui::Frame<'_>)) -> io::Result<()> {
+        if std::mem::take(&mut self.resized) {
+            let size = self.terminal.size()?;
+            self.terminal.resize(size.into())?;
+        }
+        self.terminal.draw(frame).map(drop)
     }
 }
 
@@ -679,6 +705,9 @@ pub async fn run<A: App + 'static>(
                         cols = w.max(1);
                         term_height = h.max(1);
                         needs_resize = true;
+                        if let Some(f) = full.as_mut() {
+                            f.resized = true;
+                        }
                     }
                     _ => {}
                 }
@@ -802,9 +831,10 @@ pub async fn run<A: App + 'static>(
                     // A resize while the full screen is up re-anchors the
                     // inline rows once back on the line: `needs_resize`
                     // stays set. The full-screen terminal sizes itself from
-                    // the ioctl as it draws.
+                    // the ioctl as it draws, and repaints every cell after
+                    // a resize.
                     let now = now_unix_ms();
-                    drop(f.terminal.draw(|fr| {
+                    drop(f.draw(|fr| {
                         let area = fr.area();
                         let lines = view.render_full(now, area.width, area.height);
                         fr.render_widget(Paragraph::new(Text::from(lines)), area);

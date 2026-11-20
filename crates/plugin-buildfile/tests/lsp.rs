@@ -462,13 +462,10 @@ impl Lsp {
 
     /// Send a request and return its `result`, failing on an error response.
     fn request(&mut self, method: &str, params: Value) -> Value {
-        let resp = self.request_raw(method, params);
-        assert!(
-            resp.error.is_none(),
-            "{method} answered with an error: {:?}",
-            resp.error
-        );
-        resp.result.unwrap_or(Value::Null)
+        match self.request_raw(method, params).response_result {
+            Ok(result) => result,
+            Err(e) => panic!("{method} answered with an error: {e:?}"),
+        }
     }
 
     fn initialize_with(&mut self, capabilities: Value) -> Value {
@@ -499,7 +496,7 @@ impl Lsp {
     /// Send `shutdown` then `exit`, and return what the server loop returned.
     fn shutdown_and_exit(&mut self) -> anyhow::Result<()> {
         let resp = self.request_raw("shutdown", Value::Null);
-        if let Some(e) = resp.error {
+        if let Err(e) = resp.response_result {
             anyhow::bail!("shutdown answered with an error: {e:?}");
         }
         self.notify("exit", Value::Null);
@@ -525,7 +522,10 @@ impl Lsp {
 
     /// The error code of a request's response, if it failed.
     fn error_code(&mut self, method: &str, params: Value) -> Option<i32> {
-        self.request_raw(method, params).error.map(|e| e.code)
+        self.request_raw(method, params)
+            .response_result
+            .err()
+            .map(|e| e.code)
     }
 
     /// Open `rel` with the fixture's text (cursor marker stripped). The file
@@ -2637,7 +2637,7 @@ fn request_after_shutdown_is_rejected() {
     let mut lsp = Lsp::start();
     let doc = lsp.open("BUILD", "target(│)\n");
     let resp = lsp.request_raw("shutdown", Value::Null);
-    assert!(resp.error.is_none(), "{resp:?}");
+    assert!(resp.response_result.is_ok(), "{resp:?}");
     let params = lsp.at(&doc);
     assert_eq!(
         lsp.error_code("textDocument/completion", params),

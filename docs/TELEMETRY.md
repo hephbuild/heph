@@ -50,7 +50,10 @@ heph __telemetry-flush /path/to/the/workspace
 
 That is the line you may see in `ps`. It runs in its own session, with its
 input and output on `/dev/null` and its working directory at `/`, sends the
-spool in batches of 50, deletes exactly what PostHog confirmed, and exits. The
+spool in batches of 50, deletes exactly what PostHog settled, and exits. PostHog
+answers with a verdict per event: one it persisted, or refused for good (an
+invalid event, a quota), is deleted; one it asked to retry, or left out of its
+answer, stays spooled for the next flush. The
 path is the workspace of the command that started it, whose config the flusher
 re-checks for an opt-out before sending. It gives up sending after **30
 seconds** (whatever is unsent stays spooled for the next one), and a watchdog
@@ -162,7 +165,8 @@ path against a local sink without touching production.
 
 It accepts **loopback URLs only** — `http://` or `https://` with host
 `127.0.0.1` (any `127.x.y.z`), `[::1]` or `localhost`, any port and path; heph
-posts the same PostHog batch request to `<url>/batch/`. It cannot redirect your
+posts the same PostHog capture request to `<url>/i/v1/analytics/events`, and
+reads the same per-event verdicts back. It cannot redirect your
 events off the machine. Any other value — empty, malformed, another host —
 disables sending entirely (the flush fails and records why, visible in
 `status`) rather than falling back to PostHog, since whoever set it meant
