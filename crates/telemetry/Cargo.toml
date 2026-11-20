@@ -16,8 +16,7 @@ sha2 = "0.11"
 hex = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.29.3", features = ["v4"] }
-# Held on 0.x; see the root Cargo.toml.
-posthog-rs = "0.27.1"
+posthog-rs = "1.3.0"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
 tracing = "0.1"
 clap = { version = "4.6.9", features = ["derive"] }
