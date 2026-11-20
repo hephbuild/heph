@@ -1,4 +1,5 @@
 mod ast;
+mod checks;
 mod lsp;
 mod provider;
 mod run_file;

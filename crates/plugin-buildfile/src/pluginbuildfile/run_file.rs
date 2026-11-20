@@ -1654,7 +1654,7 @@ impl BuildFileLoader {
     /// itself bound to the workspace (a package segment may contain `..`), so this
     /// is the chokepoint that keeps `root.join(pkg)` from walking outside the
     /// workspace for a crafted address like `//../../etc:x`.
-    fn load_pkg(&self, pkg: &str) -> anyhow::Result<Arc<RunResult>> {
+    pub(crate) fn load_pkg(&self, pkg: &str) -> anyhow::Result<Arc<RunResult>> {
         if hmodel::htpkg::join_rel_checked("", pkg).is_err() {
             return Ok(Arc::new(empty_run_result()?));
         }
@@ -1666,10 +1666,12 @@ impl BuildFileLoader {
         if files.is_empty() {
             return Ok(Arc::new(empty_run_result()?));
         }
-        self.load_dir(&dir, pkg)
+        self.load_dir(&dir, pkg, &files)
     }
 
-    fn load_dir(&self, dir: &Path, pkg: &str) -> anyhow::Result<Arc<RunResult>> {
+    /// Evaluate the package in `dir` from its BUILD `files`, as listed by
+    /// [`find_build_files`] (non-empty, sorted).
+    fn load_dir(&self, dir: &Path, pkg: &str, files: &[PathBuf]) -> anyhow::Result<Arc<RunResult>> {
         if let Some(cached) = self
             .dir_cache
             .lock()
@@ -1677,16 +1679,6 @@ impl BuildFileLoader {
             .get(dir)
         {
             return Ok(cached.clone());
-        }
-
-        let files = find_build_files(&self.walker, dir, &self.patterns)?;
-        if files.is_empty() {
-            let pats: Vec<&str> = self.patterns.iter().map(glob::Pattern::as_str).collect();
-            anyhow::bail!(
-                "no BUILD file in {} matching patterns {:?}",
-                dir.display(),
-                pats
-            );
         }
 
         // Cycle guard on the dir entry itself so that load("//a") -> load("//a") is caught
@@ -1697,7 +1689,7 @@ impl BuildFileLoader {
                 .lock()
                 .map_err(|_e| anyhow::anyhow!("in_flight lock poisoned"))?;
             if !in_flight.insert(dir.to_path_buf()) {
-                anyhow::bail!("load() cycle detected at {}", dir.display());
+                return Err(load_cycle(&self.root, dir));
             }
         }
         let _guard = InFlightGuard {
@@ -1706,7 +1698,7 @@ impl BuildFileLoader {
         };
 
         let mut parts = Vec::with_capacity(files.len());
-        for file in &files {
+        for file in files {
             parts.push(
                 self.load_file(file, pkg)
                     .with_context(|| format!("file: {}", file.display()))?,
@@ -1740,7 +1732,7 @@ impl BuildFileLoader {
                     .lock()
                     .map_err(|_e| anyhow::anyhow!("in_flight lock poisoned"))?;
                 if !in_flight.insert(file_path.to_path_buf()) {
-                    anyhow::bail!("load() cycle detected at {}", file_path.display());
+                    return Err(load_cycle(&self.root, file_path));
                 }
             }
             let _guard = InFlightGuard {
@@ -1758,6 +1750,7 @@ impl BuildFileLoader {
                 // The other chain finished: re-check the cache. If it *failed*,
                 // the cache is still empty and this chain takes its turn.
                 Claim::Retry => continue,
+                Claim::Cycle => return Err(load_cycle(&self.root, file_path)),
             };
 
             let result = Arc::new(
@@ -1817,6 +1810,9 @@ enum Claim {
     Owned,
     /// Another chain finished (or failed) it — re-check the cache and retry.
     Retry,
+    /// The owner is (transitively) waiting on this chain: a `load()` cycle
+    /// spread across two chains. The caller raises [`load_cycle`].
+    Cycle,
 }
 
 impl LoadRegistry {
@@ -1848,7 +1844,7 @@ impl LoadRegistry {
             loop {
                 if at == chain {
                     state.waiting.remove(&chain);
-                    anyhow::bail!("load() cycle detected at {}", path.display());
+                    return Ok(Claim::Cycle);
                 }
                 match state.waiting.get(&at).and_then(|p| state.holder.get(p)) {
                     Some(&next) => at = next,
@@ -1931,30 +1927,108 @@ impl FileLoader for ScopedLoader<'_> {
 
 impl BuildFileLoader {
     fn load_resolved(&self, path: &str, current_pkg: &str) -> anyhow::Result<FrozenModule> {
-        let candidate = resolve_load_target(&self.root, current_pkg, path)?;
-        let meta = std::fs::metadata(&candidate)
-            .with_context(|| format!("stat load path {}", candidate.display()))?;
-        let result = if meta.is_file() {
-            let pkg = candidate
-                .parent()
-                .and_then(|p| p.strip_prefix(&self.root).ok())
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default();
-            self.load_file(&candidate, &pkg)?
-        } else if meta.is_dir() {
-            let pkg = candidate
-                .strip_prefix(&self.root)
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default();
-            self.load_dir(&candidate, &pkg)?
-        } else {
-            anyhow::bail!(
-                "load() path {} is neither file nor directory",
-                candidate.display()
-            )
-        };
+        let result =
+            match resolve_load(&self.root, &self.walker, current_pkg, path, &self.patterns)? {
+                Resolved::File { path, pkg } => self.load_file(&path, &pkg)?,
+                Resolved::Dir { dir, pkg, files } => self.load_dir(&dir, &pkg, &files)?,
+            };
         Ok(result.module.clone())
     }
+}
+
+/// What one `load()` argument reads: the single source of truth for both
+/// evaluation ([`BuildFileLoader`]) and the parse-only load walk
+/// (`checks::loads`), so the two cannot disagree on which files a load names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Resolved {
+    /// `load("//pkg/defs.star")`: one file, evaluated in `pkg`, the
+    /// workspace-relative directory holding it.
+    File { path: PathBuf, pkg: String },
+    /// `load("//pkg")`: every file in `dir` matching the BUILD patterns
+    /// (sorted, non-empty), evaluated in `pkg` and merged.
+    Dir {
+        dir: PathBuf,
+        pkg: String,
+        files: Vec<PathBuf>,
+    },
+}
+
+/// Resolve the `load()` argument `path`, written in a file of `current_pkg`,
+/// to the files it reads.
+///
+/// Owns the path rules ([`resolve_load_target`]), the file/directory decision,
+/// the BUILD-pattern listing of a directory ([`find_build_files`]), the package
+/// each resolved file is evaluated in, and the error text of each, which names
+/// paths relative to `root`. A symlinked file is followed for the decision but
+/// keeps its link path (and so the link's package).
+pub(crate) fn resolve_load(
+    root: &Path,
+    walker: &CachedWalker,
+    current_pkg: &str,
+    path: &str,
+    patterns: &[glob::Pattern],
+) -> anyhow::Result<Resolved> {
+    let candidate = resolve_load_target(root, current_pkg, path)?;
+    let meta = std::fs::metadata(&candidate)
+        .with_context(|| format!("stat load path {}", rel_display(root, &candidate)))?;
+    if meta.is_file() {
+        let pkg = candidate
+            .parent()
+            .and_then(|p| p.strip_prefix(root).ok())
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        Ok(Resolved::File {
+            path: candidate,
+            pkg,
+        })
+    } else if meta.is_dir() {
+        let pkg = candidate
+            .strip_prefix(root)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let files = find_build_files(walker, &candidate, patterns)?;
+        if files.is_empty() {
+            let pats: Vec<&str> = patterns.iter().map(glob::Pattern::as_str).collect();
+            anyhow::bail!(
+                "no BUILD file in {} matching patterns {:?}",
+                rel_display(root, &candidate),
+                pats
+            );
+        }
+        Ok(Resolved::Dir {
+            dir: candidate,
+            pkg,
+            files,
+        })
+    } else {
+        anyhow::bail!(
+            "load() path {} is neither file nor directory",
+            rel_display(root, &candidate)
+        )
+    }
+}
+
+/// The error for a `load()` that re-enters a file or directory still being
+/// loaded on the same chain. Evaluation and the load walk both raise it, so a
+/// cycle reads the same from either.
+pub(crate) fn load_cycle(root: &Path, at: &Path) -> anyhow::Error {
+    anyhow::anyhow!("load() cycle detected at {}", rel_display(root, at))
+}
+
+/// `path` relative to the workspace `root` for an error message; `.` for the
+/// root itself, and the path unchanged when it is outside the root.
+pub(crate) fn rel_display(root: &Path, path: &Path) -> String {
+    match path.strip_prefix(root) {
+        Ok(rel) if rel.as_os_str().is_empty() => ".".to_string(),
+        Ok(rel) => rel.display().to_string(),
+        Err(_) => path.display().to_string(),
+    }
+}
+
+/// Parse a BUILD (or `load()`ed) file in the dialect evaluation uses. The one
+/// parse both evaluation and the load walk go through.
+pub(crate) fn parse_build_file(path: &Path) -> anyhow::Result<AstModule> {
+    AstModule::parse_file(path, &Dialect::Extended).map_err(starlark::Error::into_anyhow)
 }
 
 /// Resolve a `load()` path argument to an absolute filesystem path, rejecting
@@ -1993,7 +2067,7 @@ pub(crate) fn resolve_load_target(
 /// Enumerate every file in `dir` whose name matches any of `patterns`.
 /// Result is sorted for deterministic ordering across runs. Propagates IO errors,
 /// including "directory does not exist".
-fn find_build_files(
+pub(crate) fn find_build_files(
     walker: &CachedWalker,
     dir: &Path,
     patterns: &[glob::Pattern],
@@ -2015,8 +2089,7 @@ fn find_build_files(
 }
 
 fn eval_file(path: &Path, pkg: &str, loader: &BuildFileLoader) -> anyhow::Result<RunResult> {
-    let ast: AstModule =
-        AstModule::parse_file(path, &Dialect::Extended).map_err(starlark::Error::into_anyhow)?;
+    let ast = parse_build_file(path)?;
     // Normal build path: provenance capture off (walking the call stack per
     // target() is needless overhead unless tooling asks for it).
     eval_ast(ast, pkg, loader, false)
