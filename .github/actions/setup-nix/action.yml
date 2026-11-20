@@ -110,7 +110,10 @@ runs:
     # Same bucket and API token as the sccache setup this replaced. kache's
     # object layout (`<prefix>/v3/packs/…`, `<prefix>/v3/manifests/…`) shares no
     # keys with sccache's, so the two never collide. Bump both prefixes to
-    # invalidate every cached object at once; `v1` was kache 0.13's key format.
+    # invalidate every cached object at once, and whenever a kache upgrade moves
+    # its cache-key version, so the old entries age out instead of sitting next
+    # to ones nothing can hit. `v1` was kache 0.13's key format, `v2` kache
+    # 1.x's (key version 33), `v3` is kache 2.2's (key version 35).
     #
     # Who writes where. On GitHub Actions kache refuses remote writes unless the
     # job is a push to a protected branch, whatever the credential allows — so
@@ -133,8 +136,9 @@ runs:
       run: |
         if [ -z "$R2_SECRET" ]; then
           # Fork PRs are not given secrets. kache still caches to local disk
-          # without a remote (and without a daemon — see the next step), so
-          # rustc keeps a working wrapper; it is cold and dies with the job.
+          # without a remote, so rustc keeps a working wrapper; it is cold and
+          # dies with the job. (The first compile starts a local-only daemon
+          # on its own — see the next step.)
           echo "::notice title=kache::no R2 credentials — local disk only (cold cache)"
           exit 0
         fi
@@ -152,8 +156,8 @@ runs:
         bucket = "heph-sscache"
         region = "auto"
         endpoint = "https://b9d7099532d2613531d6f54b60211d0c.r2.cloudflarestorage.com"
-        prefix = "kache/v2"
-        pull_request_prefix = "kache-pr/v2"
+        prefix = "kache/v3"
+        pull_request_prefix = "kache-pr/v3"
         EOF
         {
           echo "KACHE_CONFIG=$config"
@@ -173,8 +177,9 @@ runs:
     # `devenv shell`, not bare `kache`: the binary lives in the devenv profile
     # (see devenv.nix), which is not on the job's default PATH.
     #
-    # Skipped without credentials — a local-only kache needs no daemon, and the
-    # matching drain step in each job tolerates one not running.
+    # Skipped without credentials: there is nothing to upload, and since kache
+    # 2 the first compile starts a local-only daemon by itself anyway. The
+    # matching drain step in each job stops whichever daemon is running.
     #
     # The daemon is started here but drained *there*: every compiling job ends
     # with its own `kache stats + drain uploads` step. That asymmetry is not a
