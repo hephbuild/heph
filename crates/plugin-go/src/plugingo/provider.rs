@@ -1008,6 +1008,18 @@ impl InScope {
                     >)
             };
 
+            // The module cache is the one gocache target a BUILD file names
+            // bare (`scratch = ["//@heph/go/gocache:modcache"]`), so it is
+            // listed: editors complete it and `//...` finds it. Running it is
+            // inert, as for any scratch declaration. The build cache is not:
+            // it only exists with the factor args the provider picks.
+            if gocache::is_gocache_pkg(req.package.as_str()) {
+                return Ok(Box::new(std::iter::once(Ok(ListResponse::addr_only(
+                    gocache::modcache_addr(),
+                ))))
+                    as Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>);
+            }
+
             let kind = match self.sc.pkgs.decode(&req.package) {
                 Some(k) => k,
                 None => return empty(),
@@ -1214,9 +1226,17 @@ impl InScope {
         Box::pin(async move {
             let prefix = req.prefix.as_str();
 
-            // Can't enumerate stdlib or thirdparty packages
-            if prefix.starts_with("@heph/go/") {
-                return Ok(Box::new(std::iter::empty())
+            // Of the synthetic `@heph/go/` packages only the gocache one is
+            // listed (it holds `modcache`, see `list`), under any prefix it
+            // starts with. Stdlib, thirdparty and toolchain packages cannot be
+            // enumerated.
+            let cache_pkg = gocache::GOCACHE_PKG.starts_with(prefix).then(|| {
+                Ok(ListPackageResponse {
+                    pkg: PkgBuf::from(gocache::GOCACHE_PKG),
+                })
+            });
+            if prefix.starts_with("@heph/") {
+                return Ok(Box::new(cache_pkg.into_iter())
                     as Box<
                         dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send,
                     >);
@@ -1229,7 +1249,7 @@ impl InScope {
             };
 
             if !search_dir.exists() {
-                return Ok(Box::new(std::iter::empty())
+                return Ok(Box::new(cache_pkg.into_iter())
                     as Box<
                         dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send,
                     >);
@@ -1247,7 +1267,7 @@ impl InScope {
             )
             .await;
 
-            Ok(Box::new(packages.into_iter())
+            Ok(Box::new(packages.into_iter().chain(cache_pkg))
                 as Box<
                     dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send,
                 >)
@@ -7023,6 +7043,47 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         assert!(names.is_empty(), "@heph/bin must list nothing: {names:?}");
         let result = provider_get(&p, make_addr("@heph/bin", "build_lib")).await;
         assert!(matches!(result, Err(GetError::NotFound)));
+    }
+
+    /// The gocache package is listed under every prefix it starts with, and
+    /// lists its module cache, so an editor completes
+    /// `//@heph/go/gocache:modcache` and `//...` finds it. The build cache,
+    /// which only exists with factor args, is not listed; nor is any other
+    /// `@heph/go/` package.
+    #[tokio::test]
+    async fn lists_the_gocache_package_and_its_module_cache() {
+        require_go!();
+        let sandbox = copy_fixture("simple_lib");
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
+        let packages = |prefix: &str| {
+            let req = ListPackagesRequest::new("test", PkgBuf::from(prefix));
+            let p = &p;
+            async move {
+                p.list_packages(req, &hcore::hasync::StdCancellationToken::new())
+                    .await
+                    .expect("list_packages")
+                    .map(|r| r.expect("item").pkg.to_string())
+                    .collect::<Vec<_>>()
+            }
+        };
+        let all = packages("").await;
+        assert!(all.iter().any(|p| p == gocache::GOCACHE_PKG), "{all:?}");
+        assert!(all.len() > 1, "the walk still lists Go packages: {all:?}");
+        for prefix in ["@", "@heph", "@heph/go/", "@heph/go/gocache"] {
+            assert_eq!(
+                packages(prefix).await,
+                vec![gocache::GOCACHE_PKG],
+                "{prefix}"
+            );
+        }
+        for prefix in ["@heph/go/std", "@heph/bin", "@other"] {
+            assert!(packages(prefix).await.is_empty(), "{prefix}");
+        }
+
+        assert_eq!(
+            provider_list_with_states(&p, gocache::GOCACHE_PKG, vec![]).await,
+            vec![gocache::GOMODCACHE_NAME]
+        );
     }
 
     // ---- non-Go package ----
