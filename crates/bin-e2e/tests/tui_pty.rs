@@ -499,7 +499,7 @@ impl Gated {
 }
 
 fn rows_of(s: &vt100::Screen) -> impl Iterator<Item = String> + '_ {
-    s.rows(0, s.size().1)
+    common::pty::screen_rows(s)
 }
 
 fn count_rows(s: &vt100::Screen, needle: &str) -> usize {
@@ -1443,6 +1443,7 @@ fn terminal_restored_on_every_exit() {
 /// it counts as the two columns it takes.
 fn find_cell(s: &vt100::Screen, needle: &str) -> Option<(u16, u16)> {
     let (rows, cols) = s.size();
+    let (rows, cols) = (rows.get(), cols.get());
     (0..rows).find_map(|row| {
         let mut text = String::new();
         let mut cols_at = Vec::new();
@@ -2270,7 +2271,7 @@ fn drive_pty(
     let sent_input = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sent_flag = Arc::clone(&sent_input);
     let pump = std::thread::spawn(move || {
-        let mut parser = vt100::Parser::new(ROWS, COLS, 0);
+        let mut parser = common::pty::parser(ROWS, COLS);
         let mut buf = [0u8; 8192];
         // A pty is a pipe, not a terminal: nothing on this end answers queries.
         // The TUI asks where the cursor is (DSR) while setting up its inline

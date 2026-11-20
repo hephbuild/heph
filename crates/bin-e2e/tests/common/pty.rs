@@ -17,6 +17,7 @@ use super::Dist;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::ffi::OsStr;
 use std::io::{Read as _, Write as _};
+use std::num::NonZeroU16;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,6 +27,22 @@ use std::time::{Duration, Instant};
 pub const ROWS: u16 = 40;
 pub const COLS: u16 = 140;
 const POLL: Duration = Duration::from_millis(20);
+
+/// A terminal dimension as vt100 (0.18+) takes it.
+pub fn dim(n: u16) -> NonZeroU16 {
+    NonZeroU16::new(n).expect("a terminal dimension is non-zero")
+}
+
+/// A vt100 emulator of `rows` × `cols`, with no scrollback.
+pub fn parser(rows: u16, cols: u16) -> vt100::Parser {
+    vt100::Parser::new(dim(rows), dim(cols), 0)
+}
+
+/// Each row of `s`, trailing blanks dropped.
+pub fn screen_rows(s: &vt100::Screen) -> impl Iterator<Item = String> + '_ {
+    s.rows(0, s.size().1.get())
+}
+
 /// How long the reader blocks before looking whether the terminal was closed.
 const READER_TICK_US: libc::suseconds_t = 50_000;
 
@@ -184,7 +201,7 @@ impl Pty {
             pair.master.take_writer().expect("take pty writer"),
         )));
         let shared = Arc::new(Mutex::new(Shared {
-            parser: vt100::Parser::new(ROWS, COLS, 0),
+            parser: parser(ROWS, COLS),
             seen: String::new(),
             output: Vec::new(),
             dsr_queries: 0,
@@ -268,7 +285,7 @@ impl Pty {
 
     /// Each row of the screen as it is now, trailing blanks dropped.
     pub fn rows(&self) -> Vec<String> {
-        self.with_screen(|s| s.rows(0, s.size().1).collect())
+        self.with_screen(|s| screen_rows(s).collect())
     }
 
     /// Block until the screen as it is now satisfies `ok`, or panic naming
@@ -349,7 +366,7 @@ impl Pty {
             .expect("screen lock")
             .parser
             .screen_mut()
-            .set_size(rows, cols);
+            .set_size(dim(rows), dim(cols));
     }
 
     /// Close the terminal, as closing its window does: every descriptor of the

@@ -81,7 +81,7 @@ echo "after-attach=$?="; read -r _
 const DASHBOARD_HINT: &str = "↑/↓ select";
 
 fn on_dashboard(s: &vt100::Screen) -> bool {
-    s.alternate_screen() && s.rows(0, s.size().1).any(|r| r.contains(DASHBOARD_HINT))
+    s.alternate_screen() && common::pty::screen_rows(s).any(|r| r.contains(DASHBOARD_HINT))
 }
 
 /// `//pkg:gated` runs until `open` exists; `//pkg:fails` until `fail` does,
