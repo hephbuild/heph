@@ -11,17 +11,17 @@ workspace = true
 test-support = []
 
 [dependencies]
-anyhow = "1.0.102"
+anyhow = "1.0.104"
 serde = { version = "1", features = ["derive"] }
 tar = "0.4"
 wax = "0.7"
-futures = "0.3.32"
+futures = "0.3.34"
 enclose = "1"
-xxhash-rust = { version = "0.8.15", features = ["xxh3", "std"] }
+xxhash-rust = { version = "0.8.21", features = ["xxh3", "std"] }
 rustc-hash = "2"
 stacker = "0.1"
 libc = "0.2"
-tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "test-util"] }
+tokio = { version = "1.54.1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "test-util"] }
 tracing = "0.1"
 
 [dev-dependencies]

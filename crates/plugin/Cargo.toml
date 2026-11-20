@@ -12,20 +12,20 @@ hconfig = { package = "config", path = "../config" }
 hmodel = { package = "model", path = "../model" }
 hwalk = { package = "walk", path = "../walk" }
 htspec-derive = { path = "../htspec-derive" }
-anyhow = "1.0.102"
+anyhow = "1.0.104"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
-async-trait = "0.1.89"
+async-trait = "0.1.92"
 erased-serde = "0.4"
 smart-default = "0.7.1"
 itertools = "0.15.0"
-futures = "0.3.32"
+futures = "0.3.34"
 glob = "0.3"
-tokio = { version = "1.52.3", features = ["io-util", "sync"] }
+tokio = { version = "1.54.1", features = ["io-util", "sync"] }
 
 [dev-dependencies]
-tokio = { version = "1.52.3", features = ["io-util", "sync", "rt", "macros"] }
+tokio = { version = "1.54.1", features = ["io-util", "sync", "rt", "macros"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
 tempfile = "3"

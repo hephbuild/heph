@@ -7,9 +7,9 @@ edition = "2024"
 workspace = true
 
 [dependencies]
-anyhow = "1.0.102"
+anyhow = "1.0.104"
 htemplate = { package = "template", path = "../template" }
-xxhash-rust = { version = "0.8.15", features = ["xxh3", "std"] }
+xxhash-rust = { version = "0.8.21", features = ["xxh3", "std"] }
 uu_b2sum = "0.12"
 uu_basename = "0.12"
 uu_base64 = "0.12"
@@ -64,7 +64,7 @@ uu_unlink = "0.12"
 uu_wc = "0.12"
 uu_whoami = "0.12"
 uu_yes = "0.12"
-which = "8.0.3"
+which = "8.0.6"
 findutils = "0.10"
 grep-cli = "0.1"
 grep-printer = "0.3"

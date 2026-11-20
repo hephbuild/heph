@@ -11,12 +11,12 @@ hcore = { package = "core", path = "../core" }
 hmodel = { package = "model", path = "../model" }
 hplugin = { package = "plugin", path = "../plugin" }
 hdriver-support = { package = "driver-support", path = "../driver-support" }
-anyhow = "1.0.102"
+anyhow = "1.0.104"
 serde = { version = "1", features = ["derive"] }
-async-trait = "0.1.89"
+async-trait = "0.1.92"
 hfetch = { package = "fetch", path = "../fetch" }
-xxhash-rust = { version = "0.8.15", features = ["xxh3", "std"] }
-tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "macros", "sync"] }
+xxhash-rust = { version = "0.8.21", features = ["xxh3", "std"] }
+tokio = { version = "1.54.1", features = ["rt", "rt-multi-thread", "macros", "sync"] }
 tracing = "0.1"
 
 [dev-dependencies]

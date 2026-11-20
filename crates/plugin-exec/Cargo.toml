@@ -13,15 +13,15 @@ hplugin = { package = "plugin", path = "../plugin" }
 hproc = { package = "proc", path = "../proc" }
 hexecrunner = { package = "execrunner", path = "../execrunner" }
 hdriver-support = { package = "driver-support", path = "../driver-support" }
-anyhow = "1.0.102"
+anyhow = "1.0.104"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
-async-trait = "0.1.89"
+async-trait = "0.1.92"
 glob = "0.3"
 tar = "0.4"
 libc = "0.2"
-which = "8.0.3"
-xxhash-rust = { version = "0.8.15", features = ["xxh3", "std"] }
+which = "8.0.6"
+xxhash-rust = { version = "0.8.21", features = ["xxh3", "std"] }
 # `serde`: minijinja 3 converts only `Into<Value>` by default; `InitLine`
 # reaches the template through the `Serde` wrapper.
 minijinja = { version = "3", features = ["serde"] }
@@ -29,7 +29,7 @@ minijinja = { version = "3", features = ["serde"] }
 # renders through it, so it is part of the toolbox's identity in the def hash.
 htemplate = { package = "template", path = "../template" }
 tracing = "0.1"
-tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "io-util", "io-std", "process", "macros", "sync", "signal", "fs", "net"] }
+tokio = { version = "1.54.1", features = ["rt", "rt-multi-thread", "io-util", "io-std", "process", "macros", "sync", "signal", "fs", "net"] }
 
 [dev-dependencies]
 enclose = "1"

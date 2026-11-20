@@ -11,6 +11,6 @@ hcore = { package = "core", path = "../core" }
 hmodel = { package = "model", path = "../model" }
 hplugin = { package = "plugin", path = "../plugin" }
 hbuiltins = { package = "builtins", path = "../builtins" }
-anyhow = "1.0.102"
-async-trait = "0.1.89"
-futures = "0.3.32"
+anyhow = "1.0.104"
+async-trait = "0.1.92"
+futures = "0.3.34"

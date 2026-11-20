@@ -9,10 +9,10 @@ workspace = true
 [dependencies]
 # libloading must match the version stabby's `StabbyLibrary::get_stabbied`
 # extension trait is implemented for, or the method won't resolve on our handle.
-stabby = { version = "72.1.8", features = ["libloading"] }
+stabby = { version = "72.1.16", features = ["libloading"] }
 libloading = "0.9"
-anyhow = "1.0.102"
-futures = "0.3.32"
+anyhow = "1.0.104"
+futures = "0.3.34"
 hplugin = { package = "plugin", path = "../plugin", optional = true }
 hmodel = { package = "model", path = "../model", optional = true }
 hcore = { package = "core", path = "../core", optional = true }
@@ -28,12 +28,12 @@ buffa = { workspace = true, optional = true }
 # The load-time ABI check compares the plugin's reported version against the
 # host's accepted range.
 semver = { version = "1", optional = true }
-async-trait = { version = "0.1.89", optional = true }
+async-trait = { version = "0.1.92", optional = true }
 # Host side encodes BuildEvents as serde-JSON to stream into a hook plugin.
 serde_json = { version = "1", optional = true }
 # Host spawns one background task per hook to drive its client-stream RPC to the
 # plugin (it runs concurrently with event production).
-tokio = { version = "1.52", features = ["rt", "sync", "io-util", "macros"], optional = true }
+tokio = { version = "1.54", features = ["rt", "sync", "io-util", "macros"], optional = true }
 # Re-emit a loaded plugin's forwarded tracing events on the host subscriber.
 tracing = { version = "0.1", optional = true }
 # Builds a callsite per plugin target at runtime (`hostlog`): tracing-core's
@@ -46,6 +46,6 @@ tracing-core = { version = "0.1", optional = true }
 host = ["dep:hplugin", "dep:hmodel", "dep:hcore", "dep:hdriver-support", "dep:hproc", "dep:hexecrunner", "dep:plugin-abi", "dep:buffa", "dep:semver", "dep:async-trait", "dep:serde_json", "dep:tokio", "dep:tracing", "dep:tracing-core"]
 
 [dev-dependencies]
-futures = "0.3.32"
+futures = "0.3.34"
 tempfile = "3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

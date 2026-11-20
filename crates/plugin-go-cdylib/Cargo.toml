@@ -18,6 +18,6 @@ plugin-sdk = { path = "../plugin-sdk", features = ["stabby"] }
 hplugin = { package = "plugin", path = "../plugin" }
 hwalk = { package = "walk", path = "../walk" }
 hdriver-support = { package = "driver-support", path = "../driver-support" }
-stabby = "72.1.8"
-anyhow = "1.0.102"
+stabby = "72.1.16"
+anyhow = "1.0.104"
 tracing = "0.1"

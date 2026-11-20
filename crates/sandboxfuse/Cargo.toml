@@ -8,10 +8,10 @@ workspace = true
 
 [dependencies]
 hcore = { package = "core", path = "../core" }
-anyhow = "1.0.102"
+anyhow = "1.0.104"
 libc = "0.2"
 tar = "0.4"
-parking_lot = "0.12"
+parking_lot = "0.13"
 crossbeam-channel = "0.5"
 
 # Linux uses fuser's pure-Rust backend (no `libfuse` feature): mounting shells
@@ -19,6 +19,9 @@ crossbeam-channel = "0.5"
 # dependency. That lets the cross-compiled (zigbuild) arm64 release binary link
 # cleanly — there is no C library to find for the target arch.
 [target.'cfg(target_os = "linux")'.dependencies]
+# Held at 0.18: 0.19 changes teardown (dropping `BackgroundSession` now waits
+# for the session to end) and forwards macOS `renamex_np` flags to `rename`,
+# which must then refuse the ones it does not implement. Its own change.
 fuser = { version = "0.18", optional = true }
 
 # macOS has no pure-Rust mount path, so it must link libfuse (macFUSE). The

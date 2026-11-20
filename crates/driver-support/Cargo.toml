@@ -15,18 +15,18 @@ hlock = { package = "lock", path = "../lock" }
 hproc = { package = "proc", path = "../proc" }
 # `run_log::RunLog::output` spawns a plugin's tool through the exec-runner seam.
 hexecrunner = { package = "execrunner", path = "../execrunner" }
-anyhow = "1.0.102"
-async-trait = "0.1.89"
+anyhow = "1.0.104"
+async-trait = "0.1.92"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
 tar = "0.4"
 glob = "0.3"
 walkdir = "2"
 tracing = "0.1"
-xxhash-rust = { version = "0.8.15", features = ["xxh3", "std"] }
+xxhash-rust = { version = "0.8.21", features = ["xxh3", "std"] }
 # `macros`/`time`: `RunLog::drive` bounds the drain after a child exits, as
 # `proc_exec::output` does (hproc enables both already).
-tokio = { version = "1.52.3", features = ["rt", "io-util", "fs", "process", "macros", "time"] }
+tokio = { version = "1.54.1", features = ["rt", "io-util", "fs", "process", "macros", "time"] }
 # A fresh, uniquely named file per collected output tar (see
 # `driver_managed::pack_to_artifact_tar`).
 tempfile = "3"
@@ -40,4 +40,4 @@ memchr = "2.8"
 libc = "0.2"
 
 [dev-dependencies]
-tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "macros", "time"] }
+tokio = { version = "1.54.1", features = ["rt", "rt-multi-thread", "macros", "time"] }

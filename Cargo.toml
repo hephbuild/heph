@@ -122,9 +122,9 @@ workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
-borsh = { version = "1.6.1", features = ["derive"] }
+borsh = { version = "1.8.1", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
-clap = { version = "4.6.1", features = ["derive"] }
+clap = { version = "4.6.9", features = ["derive"] }
 clap_complete = { version = "4.6", features = ["unstable-dynamic"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -156,24 +156,24 @@ hplugin-stabby = { package = "plugin-stabby", path = "crates/plugin-stabby", fea
 hxstarlark-fmt = { package = "xstarlark-fmt", path = "crates/xstarlark-fmt" }
 htspec-derive = { path = "crates/htspec-derive" }
 nom = { version = "8", default-features = false, features = ["std"] }
-anyhow = "1.0.102"
+anyhow = "1.0.104"
 memoize = "0.6.0"
-tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "io-util", "io-std", "process", "macros", "sync", "signal", "fs", "test-util", "tracing", "net"] }
+tokio = { version = "1.54.1", features = ["rt", "rt-multi-thread", "io-util", "io-std", "process", "macros", "sync", "signal", "fs", "test-util", "tracing", "net"] }
 # `frame-pointer` swaps pprof's stack walk from `_Unwind_Backtrace` (not
 # async-signal-safe — it faulted the process it was profiling) to a frame-pointer
 # chain walk that probes every address before dereferencing it. It needs the
 # frame pointers `-Cforce-frame-pointers=yes` in `.cargo/config.toml` emits; see
 # `src/pprof_dump.rs`.
 pprof = { version = "0.15", features = ["prost-codec", "frame-pointer"] }
-futures = "0.3.32"
-async-trait = "0.1.89"
+futures = "0.3.34"
+async-trait = "0.1.92"
 async-recursion = "1"
 stacker = "0.1"
 async-stream = "0.3"
 smart-default = "0.7.1"
-humantime = "2.3.0"
-tokio-util = { version = "0.7.18", features = ["io", "io-util"] }
-xxhash-rust = { version = "0.8.15" , features = ["xxh3", "std"]}
+humantime = "2.4.0"
+tokio-util = { version = "0.7.20", features = ["io", "io-util"] }
+xxhash-rust = { version = "0.8.21" , features = ["xxh3", "std"]}
 itertools = "0.15.0"
 tar = "0.4"
 glob = "0.3"
@@ -183,14 +183,16 @@ xattr = "1"
 similar = "3"
 shlex = "2"
 tempfile = "3.27"
-thiserror = "2.0.18"
+thiserror = "2.0.21"
 derivative = "2.2.0"
 enclose = "1"
-which = "8.0.3"
-rusqlite = { version = "0.40", features = ["bundled", "blob"] }
+which = "8.0.6"
+# Held at the release r2d2_sqlite is built against: a newer rusqlite is a
+# second copy whose `Connection`/`Params` don't unify with the pool's.
+rusqlite = { version = "0.42", features = ["bundled", "blob"] }
 r2d2 = "0.8"
-r2d2_sqlite = "0.35"
-parking_lot = "0.12"
+r2d2_sqlite = "0.37"
+parking_lot = "0.13"
 rustc-hash = "2"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm", "macros", "scrolling-regions"] }
 ansi-to-tui = "8"
@@ -202,12 +204,16 @@ erased-serde = "0.4"
 crossbeam-channel = "0.5"
 quick_cache = "0.7"
 indexmap = "2"
-posthog-rs = "0.27.0"
+# Held on 0.x: 1.0 removes the v0 capture pipeline, so an `Ok` from
+# `capture_batch_immediate` no longer means every event persisted (see
+# `posthog_sender`), and the wire format the bin-e2e telemetry sink reads
+# changes. Its own change.
+posthog-rs = "0.27.1"
 mimalloc = { version = "0.1", default-features = false }
-uuid = { version = "1.23.3", features = ["v4"] }
-object_store = { version = "0.14.1", features = ["aws", "gcp", "azure", "http", "tokio"] }
+uuid = { version = "1.29.3", features = ["v4"] }
+object_store = { version = "0.14.2", features = ["aws", "gcp", "azure", "http", "tokio"] }
 url = "2.5.8"
-flate2 = "1.1.9"
+flate2 = "1.1.11"
 
 [features]
 # FUSE sandbox is on by default. The FUSE machinery (and its `fuser`/libfuse

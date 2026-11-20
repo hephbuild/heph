@@ -19,11 +19,11 @@ htelemetry = { package = "telemetry", path = "../telemetry" }
 # enabled at the engine/`heph` bin; the types used here (LayeredFs, Layer,
 # SlotGuard) are feature-independent.
 hsandboxfuse = { package = "sandboxfuse", path = "../sandboxfuse", default-features = false }
-anyhow = "1.0.102"
-async-trait = "0.1.89"
+anyhow = "1.0.104"
+async-trait = "0.1.92"
 rayon = "1.12.0"
 
 [dev-dependencies]
 hmodel = { package = "model", path = "../model" }
 tempfile = "3"
-tokio = { version = "1.52.3", features = ["rt", "macros", "io-util", "fs"] }
+tokio = { version = "1.54.1", features = ["rt", "macros", "io-util", "fs"] }

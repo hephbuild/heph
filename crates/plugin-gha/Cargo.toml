@@ -10,7 +10,7 @@ workspace = true
 # The hook contract + option decoding — transport-agnostic, same as any plugin.
 hplugin = { package = "plugin", path = "../plugin" }
 hcore = { package = "core", path = "../core" }
-anyhow = "1.0.102"
+anyhow = "1.0.104"
 tracing = "0.1"
 # Live sticky-PR-comment updates over the GitHub REST API. Blocking client (the
 # hook runs its updates on a plain thread, not an async runtime); rustls to match

@@ -10,20 +10,20 @@ workspace = true
 hcore = { package = "core", path = "../core" }
 htelemetry = { package = "telemetry", path = "../telemetry" }
 hproc = { package = "proc", path = "../proc" }
-anyhow = "1.0.102"
-futures = "0.3.32"
+anyhow = "1.0.104"
+futures = "0.3.34"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-async-trait = "0.1.89"
+async-trait = "0.1.92"
 libc = "0.2"
 unicode-width = "0.2"
 # The dashboard's address interner: a table of `u32` ids hashed by the
 # address they name, so each address is stored once (already in the tree).
-hashbrown = { version = "0.16", default-features = false }
+hashbrown = { version = "0.17", default-features = false }
 ansi-to-tui = "8"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm", "macros", "scrolling-regions"] }
 crossterm = { version = "0.29", features = ["event-stream"] }
-tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "io-util", "io-std", "macros", "sync", "time", "net", "signal"] }
+tokio = { version = "1.54.1", features = ["rt", "rt-multi-thread", "io-util", "io-std", "macros", "sync", "time", "net", "signal"] }
 # Session recording (`tui::session`): the on-disk records, the atomic
 # `meta.json`/`status.json` writes, and the random half of a session id.
 serde = { version = "1", features = ["derive"] }
@@ -34,7 +34,7 @@ tempfile = "3"
 # A failure's `log:` row quotes the addr and the restore hint its paths, as
 # the CI box does (`failure_rows`).
 shlex = "2"
-uuid = { version = "1.23.3", features = ["v4"] }
+uuid = { version = "1.29.3", features = ["v4"] }
 
 # With stdin not a terminal, crossterm reads /dev/tty, and macOS kqueue refuses
 # that with EINVAL (measured), so `heph … < file` and `… | heph` timed out on the
@@ -43,5 +43,5 @@ uuid = { version = "1.23.3", features = ["v4"] }
 crossterm = { version = "0.29", features = ["use-dev-tty"] }
 
 [dev-dependencies]
-tokio = { version = "1.52.3", features = ["test-util"] }
+tokio = { version = "1.54.1", features = ["test-util"] }
 hcore = { package = "core", path = "../core", features = ["test-support"] }
