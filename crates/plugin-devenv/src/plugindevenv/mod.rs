@@ -848,7 +848,22 @@ impl Driver {
                 )
             },
         )
-        .await?;
+        .await
+        .map_err(|e| {
+            let missing = e.chain().any(|c| {
+                c.downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+            });
+            if missing {
+                e.context(format!(
+                    "`{}` was not found. A devenv runner whose output names nix store paths \
+                     needs `nix` on its `pass_env` PATH to root them",
+                    self.nix_bin
+                ))
+            } else {
+                e
+            }
+        })?;
 
         let printed = std::str::from_utf8(&stdout).context("nix build stdout is not UTF-8")?;
         let mut lines = printed.lines().filter(|l| !l.is_empty());
@@ -1665,6 +1680,30 @@ echo '{root}'"#,
         let msg = format!("{e:#}");
         assert!(msg.contains("nix-collect-garbage"), "{msg}");
         assert!(msg.contains("cannot connect to socket"), "{msg}");
+        assert!(
+            !dir.path().join("sandbox/ws/pkg").join(OUT_FILE).exists(),
+            "no runner.json"
+        );
+    }
+
+    /// An output naming store paths with no `nix` to root them fails the run,
+    /// saying what was missing and what it was for, and leaves no `runner.json`
+    /// to be cached unrooted.
+    #[tokio::test]
+    async fn missing_nix_fails_with_a_clear_message() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (body, _) = env_naming_store_paths(dir.path());
+        // `fake` points `nix` at `dir/nix`, which nothing writes here.
+        let driver = fake(dir.path(), &body);
+
+        let (res, _, _) = run(&driver, dir.path(), false).await;
+        let Err(e) = res else {
+            panic!("the run fails without nix")
+        };
+        let msg = format!("{e:#}");
+        assert!(msg.contains("not found"), "{msg}");
+        assert!(msg.contains("pass_env"), "{msg}");
+        assert!(msg.contains("nix-collect-garbage"), "{msg}");
         assert!(
             !dir.path().join("sandbox/ws/pkg").join(OUT_FILE).exists(),
             "no runner.json"
