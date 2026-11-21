@@ -916,6 +916,22 @@ def app() -> None:
         );
     }
 
+    /// Outside `**kwargs`, a `Kwargs` value types as a dict: membership,
+    /// union and `.get` are clean.
+    #[test]
+    fn driver_kwargs_as_a_dict() {
+        let src = "\
+def f(k: heph.types.bash.Kwargs):
+    if \"run\" in k:
+        pass
+    m = k | {}
+    r = k.get(\"run\")
+    return [m, r]
+";
+        let tmp = ws(&[("pkg/BUILD", src)]);
+        assert_eq!(lint_pkg(tmp.path(), "pkg", true), []);
+    }
+
     /// The lint key covers the derived kwargs: a key's type change moves it,
     /// a doc or `required` change does not, and the run refuses kwargs whose
     /// digest is not the def's. An ordinary target's spec, and so its def
