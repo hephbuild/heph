@@ -12,6 +12,10 @@
 //! The third, `stream`, writes its log through the writers of a run handed
 //! `log_capture` in gated phases, for `run_log.rs`'s `log_capture_streams_live`.
 //!
+//! The fourth, `hostpaths`, declares the host path its target names, for
+//! `plugin_dylib.rs`'s `cdylib_host_paths_cross_abi`; [`OLD_ABI_ENV`] makes
+//! the whole cdylib report ABI 0.21.1, as a plugin from before host paths.
+//!
 //! The first driver, `tool`: its own `parse` declares the entrypoint (no exec
 //! underneath), and its `run` spawns `/bin/sh -c SCRIPT sh <args>` through the
 //! SDK's foreground spawn with everything the run's `RunOptions` carry. It is
@@ -352,6 +356,137 @@ async fn wait_for_gate(gate: std::path::PathBuf) -> anyhow::Result<()> {
     rx.await.context("stream: the gate thread ended")?
 }
 
+/// Set in heph's environment, this cdylib reports ABI `0.21.1` instead of its
+/// own, and its `hostpaths` driver behaves as a plugin from before 0.21.3: it
+/// declares no host paths. A test fixture's knob, read from the process
+/// environment it shares with the host; a real plugin assumes nothing there.
+const OLD_ABI_ENV: &str = "HEPH_TEST_PLUGIN_ABI_0_21_1";
+
+/// An ABI from before host paths (0.21.3).
+const OLD_ABI: &std::ffi::CStr = c"0.21.1";
+
+fn old_abi() -> bool {
+    std::env::var_os(OLD_ABI_ENV).is_some()
+}
+
+/// The `hostpaths` driver's output, relative to the target's package.
+const HOSTPATHS_OUT: &str = "hostpaths.txt";
+
+/// The fourth driver, `hostpaths`: declares the host path its target names
+/// (`path = "/abs/path"`) on the run response, so `cdylib_host_paths_cross_abi`
+/// sees the list reach the manifest across a real `dlopen`. Its one output,
+/// `hostpaths.txt`, is `run=<nanoseconds>`: a value that differs on every
+/// run, so a test tells a hit from a re-run by the bytes.
+struct HostPaths;
+
+#[async_trait::async_trait]
+impl ManagedDriver for HostPaths {
+    fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
+        Ok(ConfigResponse {
+            name: "hostpaths".to_string(),
+        })
+    }
+
+    fn schema(&self) -> DriverSchema {
+        DriverSchema {
+            fields: vec![hplugin::driver::DriverField {
+                name: "path".to_string(),
+                ty: hcore::htvalue::signature::ParamType::String,
+                doc: "The absolute host path the run declares.".to_string(),
+                required: true,
+            }],
+            ..Default::default()
+        }
+    }
+
+    async fn parse(
+        &self,
+        req: ParseRequest,
+        _ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> anyhow::Result<ParseResponse> {
+        let addr = &req.target_spec.addr;
+        let Some(hcore::htvalue::Value::String(path)) = req.target_spec.config.get("path") else {
+            anyhow::bail!("{}: `path` must be a string", addr.format());
+        };
+        let pkg = addr.package.as_str();
+        let out = if pkg.is_empty() {
+            HOSTPATHS_OUT.to_string()
+        } else {
+            format!("{pkg}/{HOSTPATHS_OUT}")
+        };
+        let mut hash = b"entrypoint-test-hostpaths\0".to_vec();
+        hash.extend_from_slice(path.as_bytes());
+        Ok(ParseResponse {
+            target_def: TargetDef {
+                addr: addr.clone(),
+                outputs: vec![Output {
+                    group: String::new(),
+                    paths: vec![Path {
+                        content: Content::FilePath(out),
+                        codegen_tree: CodegenMode::None,
+                        collect: true,
+                    }],
+                }],
+                // A target declaring host paths keeps its remote cache off (I6).
+                cache: CacheConfig::on(false),
+                raw_def: std::sync::Arc::new(path.clone()),
+                hash,
+                ..Default::default()
+            },
+        })
+    }
+
+    async fn apply_transitive(
+        &self,
+        req: ApplyTransitiveRequest,
+        _ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> anyhow::Result<ApplyTransitiveResponse> {
+        Ok(ApplyTransitiveResponse {
+            target_def: req.target_def,
+        })
+    }
+
+    async fn run<'a, 'io>(
+        &self,
+        req: ManagedRunRequest<'a, 'io>,
+        _ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> anyhow::Result<ManagedRunResponse> {
+        let target = &req.request.target;
+        let path = target.def_de::<String>();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .context("clock before the epoch")?
+            .as_nanos();
+        let pkg = target.addr.package.as_str();
+        let out = if pkg.is_empty() {
+            req.sandbox_ws_dir.join(HOSTPATHS_OUT)
+        } else {
+            req.sandbox_ws_dir.join(pkg).join(HOSTPATHS_OUT)
+        };
+        if let Some(dir) = out.parent() {
+            std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+        }
+        std::fs::write(&out, format!("run={nanos}\n"))
+            .with_context(|| format!("write {}", out.display()))?;
+        // A rebuild brings a collected store path back; the host refuses to
+        // write an entry naming a path that does not exist.
+        if !std::path::Path::new(path).exists() {
+            std::fs::write(path, b"").with_context(|| format!("create {path}"))?;
+        }
+        let host_paths = if old_abi() {
+            Vec::new()
+        } else {
+            vec![hplugin::driver::HostPath::from_path(std::path::Path::new(
+                path,
+            ))?]
+        };
+        Ok(ManagedRunResponse {
+            host_paths,
+            artifacts: vec![],
+        })
+    }
+}
+
 /// Stable ABI create entry. The create config also records the host's
 /// capabilities for the SDK, which refuses an entrypoint on a host without
 /// them.
@@ -366,6 +501,7 @@ pub extern "C" fn heph_plugin_create(
             named_managed_driver(Tool)?,
             named_managed_driver(Allot)?,
             named_managed_driver(Stream)?,
+            named_managed_driver(HostPaths)?,
         ])
     });
     match created {
@@ -380,6 +516,40 @@ pub extern "C" fn heph_plugin_create(
     }
 }
 
-// The supervisor entry tracks the tool's pid with the host's sidecar through
-// this cdylib's own copy of `proc`.
-plugin_sdk::export_host_entries!();
+// The host entries `plugin_sdk::export_host_entries!` exports, written out:
+// `heph_plugin_abi_semver` reports [`OLD_ABI`] under [`OLD_ABI_ENV`], which
+// the macro's fixed version cannot. The supervisor entry tracks the tool's
+// pid with the host's sidecar through this cdylib's own copy of `proc`.
+
+/// ABI version entry, read by the host before anything else.
+#[unsafe(no_mangle)]
+pub extern "C" fn heph_plugin_abi_semver() -> *const std::ffi::c_char {
+    if old_abi() {
+        return OLD_ABI.as_ptr();
+    }
+    plugin_sdk::stabby::abi_semver()
+}
+
+/// Stable ABI log-sink entry: this cdylib's own `tracing` forwards to the host.
+#[stabby::export]
+pub extern "C" fn heph_plugin_set_log_sink(sink: plugin_sdk::stabby::abi::DynLogSink) {
+    plugin_sdk::stabby::install_log_sink(sink);
+}
+
+/// Stable ABI log-filter entry.
+#[stabby::export]
+pub extern "C" fn heph_plugin_set_log_filter(filter: stabby::vec::Vec<u8>) {
+    plugin_sdk::stabby::install_log_filter(&filter);
+}
+
+/// Stable ABI supervisor entry.
+#[stabby::export]
+pub extern "C" fn heph_plugin_set_supervisor(sup: plugin_sdk::stabby::abi::DynSupervisor) {
+    plugin_sdk::stabby::install_supervisor(sup);
+}
+
+/// Stable ABI exec-runner entry, for parity with the shipped cdylibs.
+#[stabby::export]
+pub extern "C" fn heph_plugin_set_runner_host(host: plugin_sdk::stabby::abi::DynRunnerHost) {
+    plugin_sdk::stabby::install_runner_host(host);
+}
