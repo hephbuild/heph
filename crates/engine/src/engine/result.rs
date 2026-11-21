@@ -5122,6 +5122,9 @@ impl Engine {
         let interactive = opts.interactive.clone();
         let shell = opts.shell;
         let no_scratch = opts.no_scratch;
+        // The target's effective `force` (the `Selection`'s answer for it),
+        // not the request's flag: it becomes the run request's force bit.
+        let force = opts.force;
         let key = (AddrKey(addr.clone()), hashin.clone());
 
         rs.data
@@ -5164,6 +5167,7 @@ impl Engine {
                                 shell,
                                 no_scratch,
                                 outputs_are_material: false,
+                                force,
                             },
                         )
                         .await

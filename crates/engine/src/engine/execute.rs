@@ -23,6 +23,12 @@ pub(crate) struct ExecuteFlags {
     /// This target's outputs are credential material. The one thing it
     /// changes is the failure path — see the `Err` arm in `execute`.
     pub outputs_are_material: bool,
+    /// `heph run --force` forced this target: its effective `force`
+    /// (`ExecuteOptions.force`, from the request's `Selection`), never the
+    /// request-wide flag, so a dependency reached only as one is unforced.
+    /// Becomes `RunRequest.force` on a build run that is not a `--shell`
+    /// (O7, O9). Never hashed, never handed to the target's process.
+    pub force: bool,
 }
 
 /// What one run of [`Engine::execute`] produced, and the guards its caller
@@ -61,6 +67,7 @@ impl Engine {
             shell,
             no_scratch,
             outputs_are_material,
+            force,
         } = flags;
         let driver = self
             .drivers_by_name
@@ -278,6 +285,7 @@ impl Engine {
                             deferred,
                             wrapper: exec_wrapper,
                             shell,
+                            force,
                             options: crate::engine::driver::RunOptions::default(),
                             allotment: Some(allotment),
                             log: live.as_ref().map(|(log, _)| Arc::clone(log)),
@@ -704,6 +712,7 @@ impl Engine {
             deferred,
             wrapper,
             shell,
+            force,
             options,
             allotment,
             log,
@@ -801,6 +810,10 @@ impl Engine {
                     req.deferred = deferred;
                     req.options = options;
                     req.allotment = allotment;
+                    // A `--shell` writes no entry and leaves driver state as
+                    // it found it, so even `--shell --force` reuses what a
+                    // driver recorded (O9).
+                    req.force = force && !shell;
                     // A plain driver spawns straight from `run`; a managed
                     // one materializes first and its layer fires it.
                     if !driver.managed {
@@ -1238,6 +1251,9 @@ pub(crate) struct SandboxRun {
     pub deferred: std::collections::BTreeMap<String, crate::engine::driver::DeferredValue>,
     pub wrapper: Option<InteractiveWrapper>,
     pub shell: bool,
+    /// See [`ExecuteFlags::force`]. `RunRequest.force` is this, off under
+    /// `shell`.
+    pub force: bool,
     pub options: crate::engine::driver::RunOptions,
     /// What the run is told it may use (`RunRequest.allotment`): a build's
     /// reservation, an invocation's full cpu capacity.

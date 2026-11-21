@@ -538,6 +538,9 @@ impl Engine {
                     deferred,
                     wrapper: req.wrapper,
                     shell: req.shell,
+                    // An invocation runs a tool; it writes no entry and has no
+                    // driver state for `--force` to drop.
+                    force: false,
                     options,
                     allotment: Some(allotment),
                     // An entrypoint's run is never logged (R22).
