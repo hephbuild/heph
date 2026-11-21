@@ -578,5 +578,128 @@ def f() -> None:
         // The name is what the checker knows: an unknown plugin is reported.
         let found = lint(&graph, &mut read_under(tmp.path()), &[], true).expect("checks");
         assert!(!found.is_empty(), "heph.p is unknown without its name");
+
+        // The hash half: only the names reach the def hash, sorted and
+        // deduplicated, so nothing about a function but its name can move it.
+        let hash = |fns: &[(&str, &str)]| lint_hash(&graph, false, "v1", fns, &patterns());
+        let base = hash(&[("p", "make"), ("q", "other")]);
+        assert_eq!(base, hash(&[("q", "other"), ("p", "make"), ("p", "make")]));
+        assert_ne!(base, hash(&[("p", "make")]));
+        assert_ne!(base, hash(&[("p", "make2"), ("q", "other")]));
+    }
+
+    fn patterns() -> Vec<glob::Pattern> {
+        crate::pluginbuildfile::default_build_file_patterns()
+    }
+
+    /// The def hash of `walk`'s `build-lint-check`, as the provider's spec and
+    /// the driver's parse give it.
+    fn lint_hash(
+        walk: &LoadWalk,
+        require: bool,
+        version: &str,
+        fns: &[(&str, &str)],
+        patterns: &[glob::Pattern],
+    ) -> Vec<u8> {
+        use crate::pluginbuildfile::checks::targets::{ChecksOptions, lint_spec};
+        let addr = hmodel::htaddr::Addr::new(
+            hmodel::htpkg::PkgBuf::from(walk.pkg.as_str()),
+            "build-lint-check".to_string(),
+            Default::default(),
+        );
+        let opts = ChecksOptions {
+            require_type_annotations: require,
+            ..ChecksOptions::default()
+        };
+        let spec = lint_spec(addr, walk, opts, patterns, fns.iter().copied()).expect("spec");
+        crate::pluginbuildfile::checks::drivers::parse_spec(spec, version).hash
+    }
+
+    #[test]
+    fn def_hash_inputs() {
+        use crate::pluginbuildfile::checks::targets::{ChecksOptions, lint_spec};
+        let tmp = ws(&[
+            ("pkg/BUILD", "load(\"//lib/defs.star\", \"X\")\n"),
+            ("lib/defs.star", "X = 1\n"),
+        ]);
+        let graph = walk(tmp.path(), "pkg").expect("walk");
+        let fns = [("p", "f")];
+        let base = lint_hash(&graph, false, "v1", &fns, &patterns());
+        assert_eq!(base, lint_hash(&graph, false, "v1", &fns, &patterns()));
+        assert_ne!(
+            base,
+            lint_hash(&graph, true, "v1", &fns, &patterns()),
+            "option"
+        );
+        assert_ne!(
+            base,
+            lint_hash(&graph, false, "v2", &fns, &patterns()),
+            "version"
+        );
+        assert_ne!(
+            base,
+            lint_hash(&graph, false, "v1", &[("p", "g")], &patterns()),
+            "fns"
+        );
+        let build_only = [glob::Pattern::new("BUILD").expect("pattern")];
+        assert_ne!(
+            base,
+            lint_hash(&graph, false, "v1", &fns, &build_only),
+            "patterns"
+        );
+
+        // The edges: the same files, a load resolved elsewhere.
+        let mut moved = graph.clone();
+        let edge = moved
+            .files
+            .get_mut("pkg/BUILD")
+            .expect("pkg/BUILD")
+            .loads
+            .get_mut("//lib/defs.star")
+            .expect("edge");
+        *edge = LoadEdge::File {
+            path: "lib/defs.star".to_string(),
+            pkg: "elsewhere".to_string(),
+        };
+        assert_ne!(
+            base,
+            lint_hash(&moved, false, "v1", &fns, &patterns()),
+            "edges"
+        );
+
+        // Not with `indent`, which only the formatter reads.
+        let addr = hmodel::htaddr::Addr::new(
+            hmodel::htpkg::PkgBuf::from("pkg"),
+            "build-lint-check".to_string(),
+            Default::default(),
+        );
+        let wide = ChecksOptions {
+            indent: 8,
+            ..ChecksOptions::default()
+        };
+        let spec = lint_spec(addr, &graph, wide, &patterns(), fns.iter().copied()).expect("spec");
+        assert_eq!(
+            base,
+            crate::pluginbuildfile::checks::drivers::parse_spec(spec, "v1").hash,
+            "indent"
+        );
+    }
+
+    #[test]
+    fn patterns_order_irrelevant() {
+        let tmp = ws(&[("pkg/BUILD", "X = 1\n")]);
+        let graph = walk(tmp.path(), "pkg").expect("walk");
+        let p = |s: &str| glob::Pattern::new(s).expect("pattern");
+        let base = lint_hash(&graph, false, "v1", &[], &[p("BUILD"), p("*.BUILD")]);
+        assert_eq!(
+            base,
+            lint_hash(
+                &graph,
+                false,
+                "v1",
+                &[],
+                &[p("*.BUILD"), p("BUILD"), p("BUILD")]
+            )
+        );
     }
 }

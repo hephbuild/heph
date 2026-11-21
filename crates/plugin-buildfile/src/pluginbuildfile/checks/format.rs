@@ -69,6 +69,35 @@ mod tests {
 
     const CFG: Config = Config { indent_size: 4 };
 
+    /// The format kinds' def hash moves with `indent` and heph's version, and
+    /// not with `requireTypeAnnotations`, which only lint reads.
+    #[test]
+    fn def_hash_inputs() {
+        use crate::pluginbuildfile::checks::drivers::parse_spec;
+        use crate::pluginbuildfile::checks::targets::{CheckKind, ChecksOptions, format_spec};
+        use crate::pluginbuildfile::checks::test_ws::{walk, ws};
+        let tmp = ws(&[("pkg/BUILD", "X = 1\n"), ("pkg/more.BUILD", "Y = 1\n")]);
+        let graph = walk(tmp.path(), "pkg").expect("walk");
+        for kind in [CheckKind::FormatCheck, CheckKind::Format] {
+            let hash = |indent: usize, require: bool, version: &str| {
+                let addr = hmodel::htaddr::Addr::new(
+                    hmodel::htpkg::PkgBuf::from("pkg"),
+                    kind.name().to_string(),
+                    Default::default(),
+                );
+                let opts = ChecksOptions {
+                    require_type_annotations: require,
+                    indent,
+                };
+                parse_spec(format_spec(addr, kind, &graph, opts), version).hash
+            };
+            let base = hash(4, false, "v1");
+            assert_ne!(base, hash(2, false, "v1"), "{kind:?}: indent");
+            assert_ne!(base, hash(4, false, "v2"), "{kind:?}: version");
+            assert_eq!(base, hash(4, true, "v1"), "{kind:?}: option");
+        }
+    }
+
     /// Every formatter fixture's input and expected output.
     fn fixtures() -> Vec<(String, String)> {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../xstarlark-fmt/testdata");

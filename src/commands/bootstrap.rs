@@ -228,19 +228,25 @@ pub fn register_builtin_factories(
 ) -> anyhow::Result<()> {
     use engine::PluginParts;
     e.register_plugin_factory("buildfile", |init, opts| {
-        Ok(PluginParts::default().with_provider(Box::new(
-            pluginbuildfile::Provider::from_options(
-                init.root.to_path_buf(),
-                &init.skip_dirs,
-                &init.skip_globs,
-                opts,
-                init.runtime.clone(),
-            )?
-            .with_walker(init.walker.clone())
-            // `heph.<plugin>.<fn>`: read from this engine's registry once
-            // sealed, before the first BUILD evaluation.
-            .with_functions(Arc::clone(&init.functions)),
-        )))
+        // The provider (with the check targets) and the drivers that run
+        // them, from one decode of the options.
+        let parts = pluginbuildfile::plugin_parts(
+            pluginbuildfile::PartsInit {
+                root: init.root.to_path_buf(),
+                skip_dirs: &init.skip_dirs,
+                skip_globs: &init.skip_globs,
+                runtime: init.runtime.clone(),
+                walker: init.walker.clone(),
+                // `heph.<plugin>.<fn>`: read from this engine's registry once
+                // sealed, before the first BUILD evaluation.
+                functions: Arc::clone(&init.functions),
+            },
+            opts,
+        )?;
+        Ok(parts.drivers.into_iter().fold(
+            PluginParts::default().with_provider(Box::new(parts.provider)),
+            PluginParts::with_managed_driver,
+        ))
     })?;
     // The exec and bash drivers take a closure rather than the path itself, so
     // `plugin-exec` — which most of the workspace links — does not have to
@@ -915,6 +921,10 @@ plugins:
             [
                 "auth.credential",
                 "bash",
+                // The BUILD-file check targets' drivers.
+                "buildfile.format",
+                "buildfile.format_check",
+                "buildfile.lint_check",
                 "exec",
                 "fs",
                 "group",

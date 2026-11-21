@@ -5334,6 +5334,7 @@ dependencies = [
  "builtins",
  "config",
  "core",
+ "driver-support",
  "enclose",
  "futures",
  "glob",
@@ -5357,6 +5358,7 @@ dependencies = [
  "vendored-starlark-lsp",
  "walk",
  "xstarlark-fmt",
+ "xxhash-rust",
 ]
 
 [[package]]

@@ -50,6 +50,7 @@ impl LoadEdge {
     }
 
     /// The package the loaded files are evaluated in.
+    #[cfg(test)]
     pub(crate) fn pkg(&self) -> &str {
         match self {
             Self::File { pkg, .. } | Self::Dir { pkg, .. } => pkg,

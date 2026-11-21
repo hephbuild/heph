@@ -2052,13 +2052,6 @@ pub(crate) fn parse_build_file(path: &Path) -> anyhow::Result<AstModule> {
 /// [`parse_build_file`] over source already read, named `name` in spans and
 /// errors: the lint check reads a sandbox file and names it by its
 /// workspace-relative path. Same dialect as evaluation.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "called by the lint driver, which lands in a later layer of this stack"
-    )
-)]
 pub(crate) fn parse_build_source(name: &str, src: String) -> anyhow::Result<AstModule> {
     AstModule::parse(name, src, &Dialect::Extended).map_err(starlark::Error::into_anyhow)
 }

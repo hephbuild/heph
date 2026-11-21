@@ -6,20 +6,16 @@
 //! - [`lint`]: the static typecheck over a walk, without executing (I4).
 //! - [`format`]: the format check and fix, on `xstarlark-fmt`'s one rule.
 //! - [`report`]: findings and the failure text, which is the contract.
-
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the walk is consumed by the check targets, which land in a later layer of this stack"
-    )
-)]
+//! - [`targets`]: the three targets' names, labels, drivers and specs.
+//! - [`drivers`]: the three drivers that run them.
 
 pub(crate) mod annotations;
+pub(crate) mod drivers;
 pub(crate) mod format;
 pub(crate) mod lint;
 pub(crate) mod loads;
 pub(crate) mod report;
+pub(crate) mod targets;
 
 #[cfg(test)]
 mod load_edges;
@@ -407,4 +403,65 @@ fn failure_format() {
          formatter's output\n1 finding in //a/b\nrun heph run //a/b:build-format to fix"
     );
     assert_eq!(format_failure("a/b", &[]), None);
+}
+
+/// I7: all three are cached locally, never remotely. Only `build-format` has
+/// outputs, each an `in_place` file at the path of one of its fs inputs, so
+/// the engine's in-place guard pairs them exactly; the two read-only checks
+/// declare nothing.
+#[cfg(test)]
+#[test]
+fn cache_and_codegen_flags() {
+    use hplugin::driver::targetdef::path::CodegenMode;
+    use targets::{CheckKind, ChecksOptions, format_spec, lint_spec};
+    let tmp = ws(&[
+        ("pkg/BUILD", "load(\"//lib/defs.star\", \"X\")\n"),
+        ("pkg/more.BUILD", "Y = 1\n"),
+        ("lib/defs.star", "X = 1\n"),
+    ]);
+    let walk = walk(tmp.path(), "pkg").expect("walk");
+    for kind in CheckKind::ALL {
+        let addr = hmodel::htaddr::Addr::new(
+            hmodel::htpkg::PkgBuf::from("pkg"),
+            kind.name().to_string(),
+            Default::default(),
+        );
+        let opts = ChecksOptions::default();
+        let spec = match kind {
+            CheckKind::LintCheck => {
+                lint_spec(addr, &walk, opts, &[], std::iter::empty()).expect("spec")
+            }
+            kind => format_spec(addr, kind, &walk, opts),
+        };
+        let def = drivers::parse_spec(spec, "v1");
+        assert!(def.cache.enabled, "{kind:?}");
+        assert!(!def.cache.remote_enabled, "{kind:?}");
+        let inputs: Vec<String> = def.inputs.iter().map(|i| i.r#ref.r#ref.format()).collect();
+        let reads: Vec<&str> = match kind {
+            CheckKind::LintCheck => walk.inputs().collect(),
+            _ => walk.owned().collect(),
+        };
+        let want: Vec<String> = reads
+            .iter()
+            .map(|p| hbuiltins::pluginfs::file_addr(p).format())
+            .collect();
+        assert_eq!(inputs, want, "{kind:?}");
+
+        let paths: Vec<_> = def.outputs.iter().flat_map(|o| &o.paths).collect();
+        if kind != CheckKind::Format {
+            assert!(paths.is_empty(), "{kind:?}");
+            continue;
+        }
+        let outs: Vec<String> = paths
+            .iter()
+            .map(|p| {
+                assert!(matches!(p.codegen_tree, CodegenMode::InPlace { .. }));
+                assert!(p.collect);
+                hbuiltins::pluginfs::output_fs_addr(&p.content)
+                    .expect("fs addr")
+                    .format()
+            })
+            .collect();
+        assert_eq!(outs, want);
+    }
 }
