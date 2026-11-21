@@ -53,7 +53,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash -c 'NAME=$(jq -r .name); DIR=\"$CLAUDE_PROJECT_DIR/.claude/worktrees/$NAME\"; git fetch; git worktree add \"$DIR\" -b \"worktree-$NAME\" origin/master >&2 && echo \"$DIR\"'"
+            "command": "bash -c 'NAME=$(jq -r .name); DIR=\"$CLAUDE_PROJECT_DIR/.claude/worktrees/$NAME\"; git fetch; git worktree add --no-track \"$DIR\" -b \"worktree-$NAME\" origin/master >&2 && echo \"$DIR\"'"
           }
         ]
       }

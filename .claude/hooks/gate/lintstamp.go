@@ -17,7 +17,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"strings"
 
 	"mvdan.cc/sh/v3/syntax"
@@ -46,34 +45,9 @@ func shQuote(s string) string {
 // the command is left byte for byte as written. A `lint` inside `bash -c '…'`
 // is not reached: that run is simply not stamped.
 func stampLint(cmd, wrapper string) string {
-	file, err := parse(cmd)
-	if err != nil {
-		return ""
-	}
-	var words []*syntax.Word
-	syntax.Walk(file, func(node syntax.Node) bool {
-		if call, ok := node.(*syntax.CallExpr); ok {
-			args := literals(call)
-			rest := unwrap(args, map[string]bool{})
-			if len(rest) > 0 && rest[0] == "lint" {
-				words = append(words, call.Args[len(args)-len(rest)])
-			}
-		}
-		return true
-	})
-	if len(words) == 0 {
-		return ""
-	}
-	slices.SortFunc(words, func(a, b *syntax.Word) int { return int(a.Pos().Offset()) - int(b.Pos().Offset()) })
-	var b strings.Builder
-	last := uint(0)
-	for _, w := range words {
-		b.WriteString(cmd[last:w.Pos().Offset()])
-		b.WriteString(wrapper)
-		last = w.End().Offset()
-	}
-	b.WriteString(cmd[last:])
-	return b.String()
+	return splice(cmd, func(_ *syntax.CallExpr, rest []string, _ map[string]bool) bool {
+		return rest[0] == "lint"
+	}, func(string) string { return wrapper })
 }
 
 // runLint runs `lint args...` in dir and stamps the tree it checked when it
@@ -84,20 +58,7 @@ func runLint(dir string, args []string) int {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "gate: this lint run will not be recorded for push: %v\n", err)
 	}
-	cmd := exec.Command("lint", args...)
-	cmd.Dir = dir
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	code := 0
-	if err := cmd.Run(); err != nil {
-		var exit *exec.ExitError
-		if !errors.As(err, &exit) {
-			fmt.Fprintf(os.Stderr, "gate: running lint: %v\n", err)
-			return 127
-		}
-		if code = exit.ExitCode(); code <= 0 {
-			code = 1 // killed by a signal
-		}
-	}
+	code := run(dir, append([]string{"lint"}, args...))
 	if code == 0 && tree != "" {
 		if err := writeStamp(gitDir, tree); err != nil {
 			fmt.Fprintf(os.Stderr, "gate: lint passed but recording it failed: %v\n", err)
@@ -167,6 +128,26 @@ func lintStamp(dir string) string {
 		return ""
 	}
 	return fmt.Sprintf(unlintedReason, "HEAD is not the tree `lint` last passed on — something was committed or edited after it ran")
+}
+
+// run runs args in dir on this process's stdio and returns its exit code: 1
+// for a signal, 127 when it cannot start.
+func run(dir string, args []string) int {
+	cmd := exec.Command(args[0], args[1:]...)
+	cmd.Dir = dir
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	if err := cmd.Run(); err != nil {
+		var exit *exec.ExitError
+		if !errors.As(err, &exit) {
+			fmt.Fprintf(os.Stderr, "gate: running %s: %v\n", args[0], err)
+			return 127
+		}
+		if code := exit.ExitCode(); code > 0 {
+			return code
+		}
+		return 1 // killed by a signal
+	}
+	return 0
 }
 
 // git runs git in dir with env (nil: inherit) and returns its trimmed stdout.
