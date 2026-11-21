@@ -11,9 +11,15 @@
 //	    -checksum-from ~/.heph/plugins/go/heph-go-plugin.dylib \
 //	    -out ~/.heph/plugins/go/heph-go-plugin.json
 //
-//	# every per-os/arch artifact in a release dir, by URL (CI upload_artifacts):
+//	# every per-os/arch artifact a GitHub release holds, by URL, each checksum
+//	# the asset's own digest (CI: .github/workflows/publish-plugin-manifests.sh):
 //	go run . -name go -version "$V" -prefix heph-go-plugin \
-//	    -from-dir dist -url-base "$BASE" -out dist/heph-go-plugin.json
+//	    -from-assets assets.tsv -url-base "$BASE" -out heph-go-plugin.json
+//
+// `-from-assets` reads one `<name>\t<digest>` line per release asset, as the
+// GitHub releases API reports them. The digest is GitHub's `sha256:<hex>` of the
+// stored bytes, the same string this tool would compute from the file, so the
+// manifest is built without downloading a single cdylib.
 //
 // `os`/`arch` use Go's runtime spelling (darwin/linux, amd64/arm64), which is
 // exactly the manifest spelling heph's resolver matches against.
@@ -54,9 +60,9 @@ func main() {
 	out := flag.String("out", "", "output file (default stdout)")
 	hostPath := flag.String("host-path", "", "single-artifact mode: the artifact `path` recorded in the manifest (resolved by heph relative to the manifest dir, so normally just the sibling basename)")
 	checksumFrom := flag.String("checksum-from", "", "single-artifact mode: local file to read for the checksum (defaults to -host-path). Use when the dylib lives elsewhere than the host-path the manifest should record, e.g. an install dir distinct from this tool's cwd")
-	fromDir := flag.String("from-dir", "", "scan mode: dir of <prefix>_<os>_<arch>.{so,dylib} artifacts")
-	prefix := flag.String("prefix", "", "scan mode: artifact filename prefix (e.g. heph-go-plugin)")
-	urlBase := flag.String("url-base", "", "scan mode: URL base each artifact is published under")
+	fromAssets := flag.String("from-assets", "", "release mode: file of `<name>\\t<digest>` lines, one per release asset; the <prefix>_<os>_<arch>.{so,dylib} ones become the manifest")
+	prefix := flag.String("prefix", "", "release mode: artifact filename prefix (e.g. heph-go-plugin)")
+	urlBase := flag.String("url-base", "", "release mode: URL base each artifact is published under")
 	flag.Parse()
 
 	if *name == "" {
@@ -76,16 +82,16 @@ func main() {
 			csFrom = *hostPath
 		}
 		arts = []artifact{{OS: runtime.GOOS, Arch: runtime.GOARCH, Path: *hostPath, Checksum: checksumFile(csFrom)}}
-	case *fromDir != "":
+	case *fromAssets != "":
 		if *prefix == "" || *urlBase == "" {
-			fatal("-from-dir requires -prefix and -url-base")
+			fatal("-from-assets requires -prefix and -url-base")
 		}
-		arts = scan(*fromDir, *prefix, *urlBase)
+		arts = fromReleaseAssets(*fromAssets, *prefix, *urlBase)
 		if len(arts) == 0 {
-			fatal("no %s_<os>_<arch>.{so,dylib} artifacts found in %s", *prefix, *fromDir)
+			fatal("no %s_<os>_<arch>.{so,dylib} assets listed in %s", *prefix, *fromAssets)
 		}
 	default:
-		fatal("need -host-path or -from-dir")
+		fatal("need -host-path or -from-assets")
 	}
 
 	b, err := json.MarshalIndent(manifest{Name: *name, Version: *version, Artifacts: arts}, "", "  ")
@@ -131,20 +137,27 @@ func sha256Bytes(data []byte) []byte {
 	return sum[:]
 }
 
-// scan finds `<prefix>_<os>_<arch>.{so,dylib}` files in dir and maps each to a
-// URL under base. Sorted for a deterministic manifest. Each artifact keeps its
-// native cdylib extension (Linux `.so` / macOS `.dylib`); the manifest records
-// each one's URL explicitly, so the host resolver never has to guess the suffix.
-func scan(dir, prefix, base string) []artifact {
-	entries, err := os.ReadDir(dir)
+// fromReleaseAssets reads the `<name>\t<digest>` listing at path and maps each
+// `<prefix>_<os>_<arch>.{so,dylib}` asset to a URL under base, its checksum the
+// asset's digest. Sorted for a deterministic manifest: every CI job that writes
+// this manifest must produce the same bytes from the same listing, since the
+// publishing script decides "already published" by comparing digests. Each
+// artifact keeps its native cdylib extension (Linux `.so` / macOS `.dylib`); the
+// manifest records each one's URL explicitly, so the host resolver never has to
+// guess the suffix.
+//
+// A matching asset without a `sha256:` digest is fatal rather than skipped: a
+// manifest that silently dropped a platform would be published as current.
+func fromReleaseAssets(path, prefix, base string) []artifact {
+	data, err := os.ReadFile(path)
 	if err != nil {
-		fatal("read dir %s: %v", dir, err)
+		fatal("read asset listing %s: %v", path, err)
 	}
 	base = strings.TrimRight(base, "/")
 	pre := prefix + "_"
 	var arts []artifact
-	for _, e := range entries {
-		fn := e.Name()
+	for _, line := range strings.Split(string(data), "\n") {
+		fn, digest, _ := strings.Cut(strings.TrimRight(line, "\r"), "\t")
 		mid, ok := strings.CutPrefix(fn, pre)
 		if !ok {
 			continue
@@ -163,7 +176,11 @@ func scan(dir, prefix, base string) []artifact {
 		if !ok || goos == "" || arch == "" {
 			continue
 		}
-		arts = append(arts, artifact{OS: goos, Arch: arch, URL: base + "/" + fn, Checksum: checksumFile(filepath.Join(dir, fn))})
+		hexSum, ok := strings.CutPrefix(digest, "sha256:")
+		if _, err := hex.DecodeString(hexSum); !ok || err != nil || len(hexSum) != sha256.Size*2 {
+			fatal("asset %s has no sha256 digest (got %q)", fn, digest)
+		}
+		arts = append(arts, artifact{OS: goos, Arch: arch, URL: base + "/" + fn, Checksum: digest})
 	}
 	sort.Slice(arts, func(i, j int) bool {
 		return arts[i].OS+"/"+arts[i].Arch < arts[j].OS+"/"+arts[j].Arch
