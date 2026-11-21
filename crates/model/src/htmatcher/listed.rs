@@ -16,6 +16,9 @@ pub const MAX_LISTED_DRIVER_LEN: usize = 256;
 /// provider may put facts on an entry `get` later declines. The engine trusts a
 /// listed **No** (it drops the candidate without `get`) and treats a listed
 /// **Yes** as a candidate whose existence is confirmed exactly as for any other.
+/// One reader does not confirm it: listed labels also feed `heph inspect
+/// labels` (unless `--exact`), which prints them without checking that the
+/// target exists.
 ///
 /// Normalized at construction — labels sorted and deduplicated, an empty or
 /// oversized driver stored as unknown — so equality is set equality and no

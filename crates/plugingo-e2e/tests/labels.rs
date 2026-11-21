@@ -320,7 +320,7 @@ async fn buildfile_target_shadowing_a_go_listing_is_selected_by_its_own_labels()
     Ok(())
 }
 
-// `heph i labels --resolve` resolves the *spec* of every addr the providers
+// `heph i labels --exact` resolves the *spec* of every addr the providers
 // list, so a listed addr that no provider can `get` used to abort the whole
 // walk with `target not found`. The go provider lists a candidate set on purpose — which
 // targets a Go package really has is only known once `go list` has run — and a
@@ -332,7 +332,7 @@ async fn test_labels_over_a_module_with_no_go_files() -> anyhow::Result<()> {
     let dir = fixture("mod_no_go_files")?;
     let ws = make_workspace(dir)?;
     let rs = ws.engine.new_state();
-    // Whole-graph walk — exactly what `heph i labels --resolve` with no
+    // Whole-graph walk — exactly what `heph i labels --exact` with no
     // matcher does.
     let labels = ws
         .engine
@@ -355,5 +355,59 @@ async fn test_labels_over_a_module_with_no_go_files() -> anyhow::Result<()> {
         labels.contains("marker"),
         "labels must include the buildfile target's label: {labels:?}"
     );
+    Ok(())
+}
+
+/// The labels walk over `//...` with `source`, and every `_golist` built on
+/// the way (see [`select_counting_golist`]).
+async fn labels_counting_golist(
+    ws: &htestkit::Workspace,
+    source: heph::engine::LabelSource,
+) -> anyhow::Result<(BTreeSet<String>, Vec<String>)> {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let rs = ws.engine.new_state_with_events(true, Some(tx));
+    let labels = ws
+        .engine
+        .clone()
+        .labels(
+            rs.clone(),
+            &Matcher::PackagePrefix(PkgBuf::from("")),
+            heph::engine::Discovery::Complete,
+            source,
+        )
+        .await?;
+    drop(rs);
+    let mut golists = BTreeSet::new();
+    while let Ok(ev) = rx.try_recv() {
+        if let heph::engine::event::BuildEventKind::ResultStart { addr, .. } = &ev.kind
+            && addr.contains(":_golist")
+        {
+            golists.insert(addr.clone());
+        }
+    }
+    Ok((labels, golists.into_iter().collect()))
+}
+
+// Plain `heph i labels` reads the labels the providers list: over the same
+// module with no `.go` file, it finds every label `--exact` does (and may
+// add a label only a listed target that does not exist carries), without
+// running a single `go list`.
+#[tokio::test]
+async fn listed_labels_over_a_module_with_no_go_files_run_no_go_list() -> anyhow::Result<()> {
+    require_go!();
+    let ws = make_workspace(fixture("mod_no_go_files")?)?;
+    let (resolved, resolved_golists) =
+        labels_counting_golist(&ws, heph::engine::LabelSource::Resolved).await?;
+    // Not vacuous: resolving the go targets does run `go list`.
+    assert!(!resolved_golists.is_empty(), "{resolved:?}");
+
+    let ws = make_workspace(fixture("mod_no_go_files")?)?;
+    let (listed, listed_golists) =
+        labels_counting_golist(&ws, heph::engine::LabelSource::Listed).await?;
+    assert!(
+        listed.is_superset(&resolved),
+        "listed {listed:?} must hold every resolved label {resolved:?}"
+    );
+    assert_eq!(listed_golists, Vec::<String>::new(), "{listed:?}");
     Ok(())
 }

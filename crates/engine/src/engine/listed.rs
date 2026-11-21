@@ -12,8 +12,8 @@
 //! One reader goes further and trusts a listed Yes: `heph inspect labels`
 //! (`LabelSource::Listed`) folds each candidate's listed labels without
 //! confirming the candidate exists, so a label only an unresolvable listing
-//! carries is printed. It prints, and never selects or builds; `--resolve`
-//! is the exact answer.
+//! carries is printed. It prints, and never selects or builds; `--exact`
+//! (`LabelSource::Resolved`) is the exact answer.
 
 use crate::engine::Engine;
 use crate::engine::discovery::{Discovery, Stage, is_cancellation, provider_of};
