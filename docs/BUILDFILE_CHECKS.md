@@ -105,6 +105,21 @@ Only `build-lint-check` checks these types. Evaluation (`heph run`, `query`,
 `validate`) checks annotations alone, so it still accepts any argument for a
 parameter typed only by its default.
 
+### Allowing `None`
+
+A parameter takes `None` only when its annotation says `| None`, or when its
+annotation is a field alias, which includes `None`. An inferred type never
+includes `None`.
+
+| Parameter | Takes `None` | Type checked by |
+|---|---|---|
+| `s: str` | no | lint and evaluation |
+| `s: str \| None = None` | yes | lint and evaluation |
+| `s = ""` | no | lint only |
+| `s = None` | yes, and any other value | nothing; `requireTypeAnnotations` reports it |
+| `deps: heph.types.Deps = None` | yes | lint and evaluation |
+| `n: heph.types.Number \| None = None` | yes; `heph.types.Number` alone does not | lint and evaluation |
+
 ## Failure output
 
 There is one line per finding, sorted by file, line and column. Each line
