@@ -93,6 +93,60 @@ async fn completion_lists_the_go_gocache_package_and_modcache() -> anyhow::Resul
     Ok(())
 }
 
+/// A Go package's targets complete from the Go provider, credited to `go`:
+/// a module at the root, a package with one `.go` file and no BUILD file,
+/// and a root `provider_state` declaring the variants the provider lists
+/// build targets for: the host's and a cross one. The provider lists an addr
+/// per variant; the completion gets each name once.
+#[tokio::test(flavor = "multi_thread")]
+async fn completion_lists_a_go_packages_targets() -> anyhow::Result<()> {
+    let ws = workspace()?;
+    ws.write_file("go.mod", "module example.com/m\n\ngo 1.21\n");
+    let (os, arch) = (hcore::htplatform::os(), hcore::htplatform::arch());
+    let cross_arch = if arch == "arm64" { "amd64" } else { "arm64" };
+    ws.write_build_file(
+        "",
+        &format!(
+            "provider_state(provider = \"go\", variants = {{\
+             \"host\": {{\"goos\": \"{os}\", \"goarch\": \"{arch}\"}}, \
+             \"cross\": {{\"goos\": \"linux\", \"goarch\": \"{cross_arch}\"}}}})\n",
+        ),
+    );
+    ws.write_file("lib/x.go", "package lib\n\nfunc F() int { return 1 }\n");
+
+    let listed = list(&ws, packages("")).await?;
+    let lib = listed
+        .entries
+        .iter()
+        .find(|e| e.name == "lib")
+        .unwrap_or_else(|| panic!("{:?} skipped {:?}", names(&listed), listed.skipped));
+    assert_eq!(&*lib.provider, "go");
+
+    let listed = list(&ws, targets("lib")).await?;
+    assert!(listed.skipped.is_empty(), "{:?}", listed.skipped);
+    let got: Vec<(&str, &str)> = listed
+        .entries
+        .iter()
+        .map(|e| (e.name.as_str(), &*e.provider))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("_golist", "go"),
+            ("build", "go"),
+            ("build_lib", "go"),
+            ("build_test", "go"),
+            ("build_xtest", "go"),
+            ("test", "go"),
+            ("test_race", "go"),
+            ("xtest", "go"),
+            ("xtest_race", "go"),
+        ],
+        "{got:?}"
+    );
+    Ok(())
+}
+
 /// `//@heph/oci:` completes to the OCI plugin's blob store, the synthetic
 /// target a BUILD file names bare (`scratch = ["//@heph/oci:blobs"]`), both
 /// from the engine and through the site's listing choice.
