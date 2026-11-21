@@ -18,7 +18,8 @@ use super::loads::LoadWalk;
 use super::report::{self, Failure};
 use super::targets::{CheckKind, format_keys, lint_keys, plugin_fns_digest};
 use crate::htspec::Spec;
-use crate::pluginbuildfile::provider::FunctionSource;
+use crate::pluginbuildfile::provider::{DriverSource, FunctionSource};
+use crate::pluginbuildfile::types::DriverKwargs;
 use anyhow::Context;
 use async_trait::async_trait;
 use hcore::debug_hash::DebugHasher;
@@ -60,6 +61,10 @@ struct LintSpec {
     /// knows; the driver reads the names from the function registry.
     #[spec(rename = "pluginFnsDigest", required)]
     plugin_fns_digest: String,
+    /// [`DriverKwargs::digest`] of the `heph.types.<driver>.Kwargs` the checker
+    /// sees; the driver rebuilds them from the engine's driver schemas.
+    #[spec(rename = "driverKwargsDigest", required)]
+    driver_kwargs_digest: String,
 }
 
 /// The format kinds' config, as the provider writes it.
@@ -79,6 +84,8 @@ struct LintDef {
     /// [`plugin_fns_digest`] of the names: sorted and deduplicated, by name
     /// only.
     plugin_fns_digest: String,
+    /// [`DriverKwargs::digest`] of every driver's `Kwargs`.
+    driver_kwargs_digest: String,
     /// Sorted and deduplicated.
     patterns: Vec<String>,
     /// Heph's version, `hcore::version::current()`.
@@ -99,6 +106,11 @@ struct LintDef {
 ///   anything: a function's signature cannot move the verdict, only whether
 ///   `heph.<plugin>.<fn>` exists. The run checks that the registry it reads
 ///   the names from has this digest.
+/// - Every driver's `heph.types.<driver>.Kwargs`, as one digest
+///   ([`DriverKwargs::digest`]): each key and its Starlark type, so a schema
+///   change the checker sees re-runs every package's lint, and a doc or
+///   `required` change does not. The run checks the kwargs it rebuilds have
+///   this digest.
 /// - The BUILD patterns, sorted and deduplicated: their order is not
 ///   semantic.
 /// - The walk's edges: what each `load()` string resolved to.
@@ -107,6 +119,7 @@ impl Hash for LintDef {
         self.require_type_annotations.hash(state);
         self.version.hash(state);
         self.plugin_fns_digest.hash(state);
+        self.driver_kwargs_digest.hash(state);
         self.patterns.hash(state);
         self.walk.hash(state);
     }
@@ -210,6 +223,7 @@ fn parse_lint(req: &ParseRequest, version: &str) -> anyhow::Result<ParseResponse
         walk,
         require_type_annotations: spec.require_type_annotations,
         plugin_fns_digest: spec.plugin_fns_digest,
+        driver_kwargs_digest: spec.driver_kwargs_digest,
         patterns: patterns.into_iter().collect(),
         version: version.to_string(),
     };
@@ -308,15 +322,30 @@ fn registry_fns<'r>(
     Ok(names)
 }
 
+/// `kwargs`, checked against the digest the def was keyed on, as
+/// [`registry_fns`] checks the function names.
+fn checked_kwargs<'k>(kwargs: &'k DriverKwargs, digest: &str) -> anyhow::Result<&'k DriverKwargs> {
+    let actual = kwargs.digest();
+    if actual != digest {
+        anyhow::bail!(
+            "the driver schemas changed between the check's parse and its run \
+             (`heph.types.<driver>.Kwargs` digest {digest}, now {actual}); run it again"
+        );
+    }
+    Ok(kwargs)
+}
+
 fn run_lint(
     def: &LintDef,
     ws: &Path,
     plugin_fns: &[(&str, &str)],
+    kwargs: &DriverKwargs,
 ) -> anyhow::Result<Option<Failure>> {
     let findings = lint(
         &def.walk,
         &mut read_under(ws),
         plugin_fns,
+        kwargs,
         def.require_type_annotations,
     )?;
     Ok(report::lint_failure(&def.walk.pkg, &findings))
@@ -407,6 +436,9 @@ pub(crate) struct CheckDriver {
     /// the same source as the provider's, whose spec carries only their
     /// digest.
     functions: FunctionSource,
+    /// Where it reads the driver schemas `heph.types.<driver>.Kwargs` is
+    /// built from: the provider's source, so both build them once.
+    drivers: DriverSource,
 }
 
 impl std::fmt::Debug for CheckDriver {
@@ -418,8 +450,12 @@ impl std::fmt::Debug for CheckDriver {
 }
 
 impl CheckDriver {
-    pub(crate) fn new(kind: CheckKind, functions: FunctionSource) -> Self {
-        Self { kind, functions }
+    pub(crate) fn new(kind: CheckKind, functions: FunctionSource, drivers: DriverSource) -> Self {
+        Self {
+            kind,
+            functions,
+            drivers,
+        }
     }
 }
 
@@ -470,9 +506,14 @@ impl ManagedDriver for CheckDriver {
                     .functions
                     .registry()
                     .context("reading the `heph.<plugin>.<fn>` names for build-lint-check")?;
+                let kwargs = self
+                    .drivers
+                    .kwargs()
+                    .context("reading `heph.types.<driver>.Kwargs` for build-lint-check")?;
                 hcore::blocking::run(move || {
                     let fns = registry_fns(&registry, &def.plugin_fns_digest)?;
-                    run_lint(&def, &ws, &fns)
+                    let kwargs = checked_kwargs(&kwargs, &def.driver_kwargs_digest)?;
+                    run_lint(&def, &ws, &fns, kwargs)
                 })
                 .await?
             }
@@ -556,5 +597,19 @@ mod tests {
         let other = plugin_fns_digest([("p", "f")]);
         let err = registry_fns(&registry, &other).expect_err("mismatch");
         assert!(format!("{err:#}").contains("changed"), "{err:#}");
+    }
+
+    /// The lint run refuses driver kwargs whose digest is not the def's.
+    #[test]
+    fn kwargs_digest_checked() {
+        let none = DriverKwargs::default();
+        let digest = none.digest().to_string();
+        checked_kwargs(&none, &digest).expect("matches");
+        let some = crate::pluginbuildfile::types::tests::test_kwargs();
+        let err = checked_kwargs(&some, &digest).expect_err("mismatch");
+        assert!(
+            format!("{err:#}").contains("driver schemas changed"),
+            "{err:#}"
+        );
     }
 }

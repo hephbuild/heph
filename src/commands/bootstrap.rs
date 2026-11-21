@@ -252,6 +252,9 @@ pub fn register_builtin_factories_with(
                 // `heph.<plugin>.<fn>`: read from this engine's registry once
                 // sealed, before the first BUILD evaluation.
                 functions: Arc::clone(&init.functions),
+                // `heph.types.<driver>.Kwargs`: from this engine's driver
+                // schemas, sealed with the function registry.
+                drivers: Arc::clone(&init.drivers),
                 shadowed: shadowed.clone(),
             },
             opts,

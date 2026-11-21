@@ -17,6 +17,7 @@ use super::loads::{LoadEdge, LoadWalk, owns};
 use super::report::{Finding, Kind};
 use crate::pluginbuildfile::ast::bound_names;
 use crate::pluginbuildfile::run_file::{heph_globals, is_exported, parse_build_source};
+use crate::pluginbuildfile::types::DriverKwargs;
 use allocative::Allocative;
 use anyhow::Context;
 use starlark::any::ProvidesStaticType;
@@ -37,6 +38,8 @@ use std::path::Path;
 ///   `heph.<plugin>.<fn>`. The checker sees each as an opaque callable taking
 ///   anything and returning anything, so a plugin function's signature cannot
 ///   move the verdict, and only the names reach the def hash.
+/// - `kwargs` are every driver's `heph.types.<driver>.Kwargs`, typed per key
+///   as evaluation types them; their digest is in the def hash.
 ///
 /// Returns the owned files' findings, sorted. An error means the check could
 /// not run (an unreadable or unparseable file, a load the walk does not name),
@@ -45,9 +48,10 @@ pub(crate) fn lint(
     walk: &LoadWalk,
     read: &mut dyn FnMut(&str) -> anyhow::Result<String>,
     plugin_fns: &[(&str, &str)],
+    kwargs: &DriverKwargs,
     require_annotations: bool,
 ) -> anyhow::Result<Vec<Finding>> {
-    let globals = check_globals(plugin_fns);
+    let globals = check_globals(plugin_fns, kwargs);
     let mut checked: HashMap<&str, Checked> = HashMap::with_capacity(walk.files.len());
     let mut findings = Vec::new();
 
@@ -166,14 +170,14 @@ fn type_error(path: &str, e: &starlark::Error) -> Finding {
 }
 
 /// The globals the checker typechecks against: evaluation's static surface
-/// (`target()` and the other builtins, `heph.core`, `heph.types`) plus one
-/// [`OpaquePluginFn`] per plugin function name.
-fn check_globals(plugin_fns: &[(&str, &str)]) -> Globals {
+/// (`target()` and the other builtins, `heph.core`, `heph.types` with each
+/// driver's `Kwargs`) plus one [`OpaquePluginFn`] per plugin function name.
+fn check_globals(plugin_fns: &[(&str, &str)], kwargs: &DriverKwargs) -> Globals {
     let mut by_plugin: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
     for &(plugin, func) in plugin_fns {
         by_plugin.entry(plugin).or_default().insert(func);
     }
-    heph_globals(|hb| {
+    heph_globals(kwargs, |hb| {
         for (plugin, fns) in &by_plugin {
             hb.namespace(plugin, |nb| {
                 for func in fns {
@@ -217,10 +221,18 @@ pub(super) mod tests {
     use super::*;
     use crate::pluginbuildfile::checks::test_ws::{chain, walk, ws};
 
-    /// `lint` over `pkg` in the workspace at `root`, with `heph.fs.glob` known.
+    /// `lint` over `pkg` in the workspace at `root`, with `heph.fs.glob` and
+    /// the test drivers' `Kwargs` known.
     fn run(root: &Path, pkg: &str, require: bool) -> anyhow::Result<Vec<Finding>> {
         let walk = walk(root, pkg)?;
-        lint(&walk, &mut read_under(root), &[("fs", "glob")], require)
+        let kwargs = crate::pluginbuildfile::types::tests::test_kwargs();
+        lint(
+            &walk,
+            &mut read_under(root),
+            &[("fs", "glob")],
+            &kwargs,
+            require,
+        )
     }
 
     /// The findings of `pkg`, which must check.
@@ -330,7 +342,8 @@ pub(super) mod tests {
         // records an approximation, which must not fail the check.
         let src = "def f(d: dict[str, list[int]]) -> None:\n    d[\"k\"][0] = 1\n";
         let ast = parse_build_source("pkg/BUILD", src.to_string()).expect("parses");
-        let (errors, _, _, approximations) = ast.typecheck(&check_globals(&[]), &HashMap::new());
+        let (errors, _, _, approximations) =
+            ast.typecheck(&check_globals(&[], &none()), &HashMap::new());
         assert!(errors.is_empty(), "{errors:?}");
         assert!(!approximations.is_empty(), "the fixture must approximate");
 
@@ -351,7 +364,8 @@ pub(super) mod tests {
         ]);
         let mut graph = walk(tmp.path(), "pkg").expect("walk");
         graph.files.remove("lib/defs.star");
-        let err = lint(&graph, &mut read_under(tmp.path()), &[], false).expect_err("fails");
+        let err =
+            lint(&graph, &mut read_under(tmp.path()), &[], &none(), false).expect_err("fails");
         assert!(chain(&err).contains("lib/defs.star"), "{}", chain(&err));
     }
 
@@ -364,7 +378,7 @@ pub(super) mod tests {
         let graph = walk(tmp.path(), "pkg").expect("walk");
         // The sandbox holds the package's file but not the one it loads.
         let sandbox = ws(&[("pkg/BUILD", "load(\"//lib/defs.star\", \"X\")\n")]);
-        let err = lint(&graph, &mut read_under(sandbox.path()), &[], false)
+        let err = lint(&graph, &mut read_under(sandbox.path()), &[], &none(), false)
             .expect_err("a missing loaded file fails");
         assert!(
             chain(&err).contains("reading lib/defs.star"),
@@ -434,7 +448,8 @@ TOP = heph.core.os()
             .expect("pkg/BUILD")
             .loads
             .insert("//lib/other.star".to_string(), edge);
-        let err = lint(&graph, &mut read_under(tmp.path()), &[], false).expect_err("fails");
+        let err =
+            lint(&graph, &mut read_under(tmp.path()), &[], &none(), false).expect_err("fails");
         let text = chain(&err);
         assert!(
             text.contains("load(\"//lib/defs.star\") is not in the package's load graph"),
@@ -517,7 +532,7 @@ TOP = heph.core.os()
 
         // The interface the checker builds for `load("//lib")`...
         let mut read = read_under(tmp.path());
-        let globals = check_globals(&[]);
+        let globals = check_globals(&[], &none());
         let mut checked = HashMap::new();
         let mut universe: BTreeSet<String> = BTreeSet::new();
         for path in files {
@@ -610,10 +625,10 @@ def f() -> None:
         let tmp = ws(&[("pkg/BUILD", src)]);
         let graph = walk(tmp.path(), "pkg").expect("walk");
         let fns = [("p", "make")];
-        let found = lint(&graph, &mut read_under(tmp.path()), &fns, true).expect("checks");
+        let found = lint(&graph, &mut read_under(tmp.path()), &fns, &none(), true).expect("checks");
         assert_eq!(found, []);
         // The name is what the checker knows: an unknown plugin is reported.
-        let found = lint(&graph, &mut read_under(tmp.path()), &[], true).expect("checks");
+        let found = lint(&graph, &mut read_under(tmp.path()), &[], &none(), true).expect("checks");
         assert!(!found.is_empty(), "heph.p is unknown without its name");
 
         // The hash half: only the names reach the def hash, sorted and
@@ -641,6 +656,7 @@ def f() -> None:
             ChecksOptions::default(),
             &patterns(),
             many.iter().map(|(p, f)| (p.as_str(), f.as_str())),
+            none().digest(),
         )
         .expect("spec");
         let Some(hcore::htvalue::Value::String(digest)) =
@@ -661,6 +677,11 @@ def f() -> None:
         crate::pluginbuildfile::default_build_file_patterns()
     }
 
+    /// No driver `Kwargs`.
+    fn none() -> std::sync::Arc<DriverKwargs> {
+        DriverKwargs::empty()
+    }
+
     /// The def hash of `walk`'s `build-lint-check`, as the provider's spec and
     /// the driver's parse give it.
     fn lint_hash(
@@ -669,6 +690,18 @@ def f() -> None:
         version: &str,
         fns: &[(&str, &str)],
         patterns: &[glob::Pattern],
+    ) -> Vec<u8> {
+        lint_hash_with(walk, require, version, fns, patterns, none().digest())
+    }
+
+    /// [`lint_hash`], with the driver kwargs' digest.
+    fn lint_hash_with(
+        walk: &LoadWalk,
+        require: bool,
+        version: &str,
+        fns: &[(&str, &str)],
+        patterns: &[glob::Pattern],
+        kwargs_digest: &str,
     ) -> Vec<u8> {
         use crate::pluginbuildfile::checks::targets::{ChecksOptions, lint_spec};
         let addr = hmodel::htaddr::Addr::new(
@@ -680,7 +713,15 @@ def f() -> None:
             require_type_annotations: require,
             ..ChecksOptions::default()
         };
-        let spec = lint_spec(addr, walk, opts, patterns, fns.iter().copied()).expect("spec");
+        let spec = lint_spec(
+            addr,
+            walk,
+            opts,
+            patterns,
+            fns.iter().copied(),
+            kwargs_digest,
+        )
+        .expect("spec");
         crate::pluginbuildfile::checks::drivers::parse_spec(spec, version).hash
     }
 
@@ -746,11 +787,110 @@ def f() -> None:
             indent: 8,
             ..ChecksOptions::default()
         };
-        let spec = lint_spec(addr, &graph, wide, &patterns(), fns.iter().copied()).expect("spec");
+        let spec = lint_spec(
+            addr,
+            &graph,
+            wide,
+            &patterns(),
+            fns.iter().copied(),
+            none().digest(),
+        )
+        .expect("spec");
         assert_eq!(
             base,
             crate::pluginbuildfile::checks::drivers::parse_spec(spec, "v1").hash,
             "indent"
+        );
+    }
+
+    /// The spec's Goal example: a known key passes, a wrong value and an
+    /// unknown key are each a finding.
+    #[test]
+    fn driver_kwargs_typed() {
+        let src = "\
+def lib(name: str, **kwargs: heph.types.bash.Kwargs):
+    target(name = name, driver = \"bash\", **kwargs)
+
+def app():
+    lib(name = \"a\", run = \"echo\")
+    lib(name = \"a\", run = 1)
+    lib(name = \"a\", rnu = \"echo\")
+";
+        let tmp = ws(&[("pkg/BUILD", src)]);
+        assert_eq!(
+            lines(&lint_pkg(tmp.path(), "pkg", false)),
+            [
+                "pkg/BUILD:6:21: type-error: Expected type `None | str | list[str]` but got `int`",
+                "pkg/BUILD:7:21: type-error: Unexpected parameter named `rnu`",
+            ]
+        );
+    }
+
+    /// Forwarding `**kwargs` to `target()` typechecks, annotations required.
+    #[test]
+    fn driver_kwargs_forwarding_clean() {
+        let src = "\
+def lib(name: str, **kwargs: heph.types.oci.image.Kwargs) -> str:
+    return target(name = name, driver = \"oci.image\", **kwargs)
+
+def app() -> None:
+    lib(name = \"a\", base = \"b\", labels = [\"l\"], scale = 1.5)
+";
+        let tmp = ws(&[("pkg/BUILD", src)]);
+        assert_eq!(lint_pkg(tmp.path(), "pkg", true), []);
+    }
+
+    /// The lint key covers the derived kwargs: a key's type change moves it,
+    /// a doc or `required` change does not, and the run refuses kwargs whose
+    /// digest is not the def's. An ordinary target's spec, and so its def
+    /// hash, is the same whatever the drivers' kwargs (I2).
+    #[test]
+    fn driver_kwargs_digest_in_lint_key() {
+        use crate::pluginbuildfile::types::tests::test_schemas;
+        use hcore::htvalue::signature::ParamType;
+        let base = test_schemas();
+        let digest =
+            |s: &hplugin::driver::DriverSchemas| DriverKwargs::from_schemas(s).digest().to_string();
+        let edit = |f: &dyn Fn(&mut hplugin::driver::DriverField)| {
+            let mut s = base.clone();
+            let run = s
+                .get_mut("bash")
+                .and_then(|d| d.fields.iter_mut().find(|f| f.name == "run"))
+                .expect("bash.run");
+            f(run);
+            s
+        };
+        let d0 = digest(&base);
+        assert_eq!(d0, digest(&base), "stable");
+        let retyped = digest(&edit(&|f| f.ty = ParamType::Int));
+        assert_ne!(d0, retyped, "a key's type");
+        assert_eq!(d0, digest(&edit(&|f| f.doc = "other".into())), "doc");
+        assert_eq!(d0, digest(&edit(&|f| f.required = true)), "required");
+
+        let tmp = ws(&[("pkg/BUILD", "X = 1\n")]);
+        let graph = walk(tmp.path(), "pkg").expect("walk");
+        let hash = |d: &str| lint_hash_with(&graph, false, "v1", &[], &patterns(), d);
+        assert_ne!(hash(&d0), hash(&retyped), "the digest is in the lint key");
+
+        // An ordinary target: the same spec with or without the kwargs.
+        let src = "target(name = \"a\", driver = \"bash\", run = \"echo\")\n";
+        let eval = |kwargs: std::sync::Arc<DriverKwargs>| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let loader =
+                crate::pluginbuildfile::run_file::tests::source_loader(dir.path().to_path_buf())
+                    .with_driver_kwargs(kwargs);
+            let r = crate::pluginbuildfile::run_file::eval_source(
+                "BUILD",
+                src.to_string(),
+                "pkg",
+                &loader,
+            )
+            .expect("evaluates");
+            format!("{:?}", r.targets)
+        };
+        assert_eq!(
+            eval(none()),
+            eval(crate::pluginbuildfile::types::tests::test_kwargs())
         );
     }
 

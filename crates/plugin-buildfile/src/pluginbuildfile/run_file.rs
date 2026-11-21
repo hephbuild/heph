@@ -289,8 +289,11 @@ fn render_builtin_hover(
     md
 }
 
-pub(crate) fn build_globals(registry: &FunctionRegistry) -> Globals {
-    heph_globals(|hb| {
+pub(crate) fn build_globals(
+    registry: &FunctionRegistry,
+    kwargs: &crate::pluginbuildfile::types::DriverKwargs,
+) -> Globals {
+    heph_globals(kwargs, |hb| {
         // One `heph.<plugin>` namespace per plugin with functions; each
         // function becomes a native callable bridging into its async `PluginFn`.
         for (provider, fns) in registry.plugins() {
@@ -318,21 +321,25 @@ pub(crate) fn build_globals(registry: &FunctionRegistry) -> Globals {
 }
 
 /// The globals every BUILD file sees: the static `starlark_module` builtins
-/// (`target`, …), `heph.core` and `heph.types`, plus whatever `plugins` adds
-/// to the `heph` namespace. Evaluation adds callable plugin functions
-/// ([`build_globals`]); the lint check adds opaque stand-ins by name, so both
-/// see the same static surface.
-pub(crate) fn heph_globals(plugins: impl Fn(&mut GlobalsBuilder)) -> Globals {
+/// (`target`, …), `heph.core` and `heph.types` (with `kwargs`, each driver's
+/// `heph.types.<driver>.Kwargs`), plus whatever `plugins` adds to the `heph`
+/// namespace. Evaluation adds callable plugin functions ([`build_globals`]);
+/// the lint check adds opaque stand-ins by name, so both see the same static
+/// surface.
+pub(crate) fn heph_globals(
+    kwargs: &crate::pluginbuildfile::types::DriverKwargs,
+    plugins: impl Fn(&mut GlobalsBuilder),
+) -> Globals {
     GlobalsBuilder::standard()
         .with(starlark_module)
         .with_namespace("heph", |hb| {
             // Static `heph.core` host/platform builtins.
             hb.namespace("core", heph_core_module);
-            // Static `heph.types` aliases for `target()`'s fields.
-            hb.namespace(
-                crate::pluginbuildfile::types::NAMESPACE,
-                crate::pluginbuildfile::types::register,
-            );
+            // `heph.types`: aliases for `target()`'s fields, and the
+            // per-driver kwargs types.
+            hb.namespace(crate::pluginbuildfile::types::NAMESPACE, |tb| {
+                crate::pluginbuildfile::types::register(tb, kwargs)
+            });
             plugins(hb);
         })
         .build()
@@ -1547,6 +1554,10 @@ impl Provider {
             .functions
             .registry()
             .context("building the `heph.<plugin>.<fn>` namespace for BUILD evaluation")?;
+        let kwargs = self
+            .drivers
+            .kwargs()
+            .context("building `heph.types.<driver>.Kwargs` for BUILD evaluation")?;
         let globals = self.globals.clone();
         let walker = self.walker.clone();
         let packages = self.packages();
@@ -1588,7 +1599,8 @@ impl Provider {
                         // mid-await holding the permit.
                         let _slot = slot;
                         let loader =
-                            BuildFileLoader::new(root, patterns, file_cache, dir_cache, registry, globals, walker, packages, loads);
+                            BuildFileLoader::new(root, patterns, file_cache, dir_cache, registry, globals, walker, packages, loads)
+                                .with_driver_kwargs(kwargs);
                         loader
                             .load_pkg(&key)
                             .with_context(|| format!("pkg: `{}`", key))
@@ -1614,6 +1626,10 @@ pub(crate) struct BuildFileLoader {
     /// Plugin functions exposed as `heph.<plugin>.<fn>`. Used to build `globals`,
     /// and to check every `heph.<plugin>.<fn>` a BUILD file names.
     registry: Arc<FunctionRegistry>,
+    /// Every driver's `heph.types.<driver>.Kwargs`. Used to build `globals`, and
+    /// to check every `heph.types.<…>` a BUILD file names. None by default
+    /// ([`Self::with_driver_kwargs`]).
+    kwargs: Arc<crate::pluginbuildfile::types::DriverKwargs>,
     /// Lazily-built, provider-lifetime Starlark globals (shared across loaders so
     /// the registry-driven namespace is built at most once).
     globals: Arc<OnceLock<Globals>>,
@@ -1655,6 +1671,7 @@ impl BuildFileLoader {
             dir_cache,
             in_flight: Mutex::new(HashSet::new()),
             registry,
+            kwargs: crate::pluginbuildfile::types::DriverKwargs::empty(),
             globals,
             walker,
             packages,
@@ -1663,9 +1680,22 @@ impl BuildFileLoader {
         }
     }
 
-    /// The Starlark globals for this loader, built once from the function registry.
+    /// Expose `kwargs` as `heph.types.<driver>.Kwargs`. Set it before the
+    /// shared `globals` are first built: they are built once, from whichever
+    /// loader gets there first.
+    pub(crate) fn with_driver_kwargs(
+        mut self,
+        kwargs: Arc<crate::pluginbuildfile::types::DriverKwargs>,
+    ) -> Self {
+        self.kwargs = kwargs;
+        self
+    }
+
+    /// The Starlark globals for this loader, built once from the function
+    /// registry and the driver kwargs.
     fn globals(&self) -> &Globals {
-        self.globals.get_or_init(|| build_globals(&self.registry))
+        self.globals
+            .get_or_init(|| build_globals(&self.registry, &self.kwargs))
     }
 
     /// Top-level entry: evaluate every BUILD file in `pkg`'s directory matching the
@@ -2214,12 +2244,13 @@ pub(crate) fn closest<'a>(
 /// file and line and what does exist — an agent recovers from the text alone,
 /// instead of reading Starlark's "object has no attribute". heph's static
 /// namespaces ([`STATIC_NAMESPACES`](hplugin::function::STATIC_NAMESPACES)) are
-/// not a plugin's: `heph.types.<alias>` is checked against the aliases, and
-/// `heph.core.*` is left to evaluation. A file that binds `heph` itself is left
-/// alone.
+/// not a plugin's: `heph.types.<alias>` and `heph.types.<driver…>.Kwargs` are
+/// checked against the aliases and `kwargs`, and `heph.core.*` is left to
+/// evaluation. A file that binds `heph` itself is left alone.
 pub(crate) fn check_function_refs(
     ast: &AstModule,
     registry: &FunctionRegistry,
+    kwargs: &crate::pluginbuildfile::types::DriverKwargs,
 ) -> anyhow::Result<()> {
     use crate::pluginbuildfile::ast::{bound_names, walk_expr};
     use crate::pluginbuildfile::types;
@@ -2227,6 +2258,27 @@ pub(crate) fn check_function_refs(
 
     if bound_names(ast).contains("heph") {
         return Ok(());
+    }
+    // `heph.types.a.b.c` → `["a", "b", "c"]`; `None` for anything else,
+    // `heph.types` alone included.
+    fn types_path(e: &starlark::syntax::ast::AstExpr) -> Option<Vec<&str>> {
+        let mut segs = Vec::new();
+        let mut cur = e;
+        while let Expr::Dot(inner, name) = &cur.node {
+            segs.push(name.node.as_str());
+            cur = inner;
+        }
+        match &cur.node {
+            Expr::Identifier(id) if id.node.ident == "heph" => {}
+            _ => return None,
+        }
+        segs.reverse();
+        match segs.split_first() {
+            Some((first, rest)) if *first == types::NAMESPACE && !rest.is_empty() => {
+                Some(rest.to_vec())
+            }
+            _ => None,
+        }
     }
     // `heph.<plugin>` → the plugin; `heph.<plugin>.<fn>` → also the function.
     fn plugin_ref(e: &starlark::syntax::ast::AstExpr) -> Option<&str> {
@@ -2244,6 +2296,19 @@ pub(crate) fn check_function_refs(
             if problem.is_some() {
                 return;
             }
+            // The outermost node of a `heph.types.…` chain is visited first,
+            // so the whole path is judged before any prefix of it.
+            if let Some(path) = types_path(e) {
+                if let Some(why) = kwargs.unknown_member(&path) {
+                    let at = ast.file_span(e.span);
+                    problem = Some(format!(
+                        "{at}: heph.{}.{}: {why}",
+                        types::NAMESPACE,
+                        path.join(".")
+                    ));
+                }
+                return;
+            }
             let (plugin, func, span) = match &e.node {
                 Expr::Dot(inner, func) if plugin_ref(inner).is_some() => {
                     (plugin_ref(inner), Some(func.node.as_str()), e.span)
@@ -2254,13 +2319,6 @@ pub(crate) fn check_function_refs(
                 return;
             };
             if hplugin::function::STATIC_NAMESPACES.contains(&plugin) {
-                if plugin == types::NAMESPACE
-                    && let Some(alias) = func
-                    && let Some(why) = types::unknown_alias(alias)
-                {
-                    let at = ast.file_span(span);
-                    problem = Some(format!("{at}: heph.{plugin}.{alias}: {why}"));
-                }
                 return;
             }
             let at = ast.file_span(span);
@@ -2311,7 +2369,7 @@ fn eval_ast(
     loader: &BuildFileLoader,
     capture_provenance: bool,
 ) -> anyhow::Result<RunResult> {
-    check_function_refs(&ast, &loader.registry)?;
+    check_function_refs(&ast, &loader.registry, &loader.kwargs)?;
     let globals = loader.globals();
 
     let targets = std::rc::Rc::new(std::cell::RefCell::new(vec![]));
@@ -2389,7 +2447,13 @@ pub(crate) mod tests {
     use tempfile::tempdir;
 
     fn hovers() -> BuiltinHovers {
-        BuiltinHovers::new(&build_globals(&FunctionRegistry::default()).documentation())
+        BuiltinHovers::new(
+            &build_globals(
+                &FunctionRegistry::default(),
+                &crate::pluginbuildfile::types::DriverKwargs::default(),
+            )
+            .documentation(),
+        )
     }
 
     #[test]
@@ -2749,7 +2813,8 @@ pub(crate) mod tests {
             // The provider's own registry, not a fresh one: two concurrent
             // `run_pkg` calls share it, and that sharing is the point.
             provider.loads.clone(),
-        );
+        )
+        .with_driver_kwargs(provider.drivers.kwargs()?);
         loader.load_pkg(pkg)
     }
 

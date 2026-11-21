@@ -59,7 +59,12 @@ impl HephLspContext {
     pub(crate) fn new(engine: Arc<dyn LspEngine>) -> HephLspContext {
         let root = engine.root().to_path_buf();
         let registry = engine.function_registry();
-        let doc_globals = build_globals(&registry).documentation();
+        // No driver kwargs yet: the LSP does not read the driver schemas.
+        let doc_globals = build_globals(
+            &registry,
+            &crate::pluginbuildfile::types::DriverKwargs::default(),
+        )
+        .documentation();
         let core_members = crate::pluginbuildfile::run_file::heph_core_members(&doc_globals);
         let builtin_hovers = crate::pluginbuildfile::run_file::BuiltinHovers::new(&doc_globals);
         let patterns = buildfile_patterns(&*engine);

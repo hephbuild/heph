@@ -435,7 +435,11 @@ for i in []:
         use std::collections::HashMap;
 
         let ast = parse_build_source("pkg/BUILD", src.to_string()).expect("parses");
-        let (errors, _, interface, _) = ast.typecheck(&heph_globals(|_| {}), &HashMap::new());
+        let globals = heph_globals(
+            &crate::pluginbuildfile::types::DriverKwargs::default(),
+            |_| {},
+        );
+        let (errors, _, interface, _) = ast.typecheck(&globals, &HashMap::new());
         assert!(!exempt || errors.is_empty(), "{src}: {errors:?}");
         let ty = interface.get("f").expect("f in the interface").to_string();
         !ty.contains("x: typing.Any")

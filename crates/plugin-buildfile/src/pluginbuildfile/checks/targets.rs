@@ -228,6 +228,7 @@ pub(crate) mod lint_keys {
     pub(crate) const REQUIRE: &str = "requireTypeAnnotations";
     pub(crate) const PATTERNS: &str = "patterns";
     pub(crate) const PLUGIN_FNS_DIGEST: &str = "pluginFnsDigest";
+    pub(crate) const DRIVER_KWARGS_DIGEST: &str = "driverKwargsDigest";
 }
 
 /// One digest of the `(plugin, fn)` names the checker knows, sorted and
@@ -269,15 +270,17 @@ fn spec(addr: Addr, kind: CheckKind, config: HashMap<String, Value>) -> TargetSp
 }
 
 /// `build-lint-check`'s spec: the package's load walk (its edges and every
-/// file it reads), the option, the BUILD patterns and the
+/// file it reads), the option, the BUILD patterns, the
 /// [digest](plugin_fns_digest) of the plugin function names the checker
-/// knows.
+/// knows, and the [digest](crate::pluginbuildfile::types::DriverKwargs::digest)
+/// of every `heph.types.<driver>.Kwargs` it sees.
 pub(crate) fn lint_spec<'a>(
     addr: Addr,
     walk: &LoadWalk,
     opts: ChecksOptions,
     patterns: &[glob::Pattern],
     plugin_fns: impl IntoIterator<Item = (&'a str, &'a str)>,
+    driver_kwargs_digest: &str,
 ) -> anyhow::Result<TargetSpec> {
     let walk = serde_json::to_string(walk).context("encoding the load walk")?;
     let config = HashMap::from([
@@ -293,6 +296,10 @@ pub(crate) fn lint_spec<'a>(
         (
             lint_keys::PLUGIN_FNS_DIGEST.to_string(),
             Value::String(plugin_fns_digest(plugin_fns)),
+        ),
+        (
+            lint_keys::DRIVER_KWARGS_DIGEST.to_string(),
+            Value::String(driver_kwargs_digest.to_string()),
         ),
     ]);
     Ok(spec(addr, CheckKind::LintCheck, config))
