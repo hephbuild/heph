@@ -2061,67 +2061,22 @@ fn shell_target_without_terminal(rs: &RequestState) -> Option<ShellNeedsSingleTa
         })
 }
 
-/// Whether this frame actually receives the terminal — which is what
-/// `classify_failure` needs in order to decide that a target's output already
+/// Whether this frame actually receives the terminal. The one rule: the
+/// terminal chokepoint in `inner_result_addr` hands out `ExecuteOptions` from
+/// it, and `classify_failure` reads it to decide that a target's output already
 /// streamed and its captured log tail is redundant.
 ///
-/// Mirrors the `(shell, interactive)` chokepoint in `inner_result_addr`, and
-/// must keep mirroring it: `opts.interactive` alone answers the wrong question
-/// once `--shell=ADDR` is in play, because the chokepoint withholds the terminal
-/// from every frame that is not the named addr. Believing `opts` there says a
-/// silent target streamed, which drops the process-log tail of a failing one and
-/// renders an empty failure box — the regression #225 fixed for group members,
-/// re-entered through the other door.
+/// `opts.interactive` alone answers the wrong question once `--shell=ADDR` is
+/// in play: the terminal is then the request's, and only the named addr gets
+/// it. Believing `opts` in `classify_failure` says a silent target streamed,
+/// which drops the process-log tail of a failing one and renders an empty
+/// failure box — the regression #225 fixed for group members, re-entered
+/// through the other door.
 fn frame_gets_terminal(rs: &RequestState, addr: &Addr, opts: &ResultOptions) -> bool {
     match rs.shell_target() {
         Some(target) => target.addr == *addr,
         None => opts.interactive.is_some(),
     }
-}
-
-/// Report a `--shell=ADDR` that no frame of this run entered.
-///
-/// A **warning, not a failure**: `--shell` is an interactive convenience, and a
-/// target that turns out not to be in the run does not justify failing a build
-/// that otherwise did exactly what was asked. The build's outputs are real and
-/// cached either way.
-///
-/// It still has to be loud. The failure mode this permits is a typo that
-/// silently costs the user the shell they asked for, so the message names the
-/// address, says plainly that no shell was opened, and gives the command that
-/// lists what the run *does* contain.
-///
-/// Only the frame owning the whole request may judge this, and only once the run
-/// has **otherwise succeeded**: an unreached shell target on a failed run is a
-/// consequence of that failure, not a separate fact worth a second diagnostic.
-/// `fail_fast` defaults to off, so a per-target failure reaches the caller in the
-/// batch's `errors` rather than as an `Err` — hence `run_succeeded` rather than
-/// relying on the `?` above.
-///
-/// `request` is built lazily — the call sites sit on the success path of every
-/// frame in the graph, and formatting an addr there would be one heap allocation
-/// per resolved target for an argument that is almost never used.
-pub(crate) fn report_unentered_shell_target(
-    rs: &RequestState,
-    owns_run: bool,
-    run_succeeded: bool,
-    request: impl FnOnce() -> String,
-) {
-    if !owns_run || !run_succeeded || rs.shell_settled() {
-        return;
-    }
-    let Some(target) = rs.shell_target() else {
-        return;
-    };
-    rs.settle_shell();
-    let request = request();
-    tracing::warn!(
-        shell = %target.addr.format(),
-        request = %request,
-        "--shell target was not part of this run, so no shell was opened; \
-         nothing in the run resolved that address — list what it does contain \
-         with `heph query <selection>`",
-    );
 }
 
 /// Single classifier chokepoint for any target error.
@@ -2496,15 +2451,6 @@ impl Engine {
             });
         }
 
-        // "This frame is the whole request", which `is_top` cannot say: each
-        // matched target of a batch is also `is_top`. Only the owner may judge
-        // that a `--shell=ADDR` went unclaimed, and only the owner pre-flights
-        // it — one spec resolution, memoized, so the run below reuses it.
-        let owns_run = rs.claim_request_owner();
-        if owns_run {
-            Arc::clone(&self).preflight_shell_target(&rs).await;
-        }
-
         // Directly-requested target (no parent) — the outermost frame. Used below
         // to surface the rich recorded failure to the caller instead of the
         // internal `UpstreamFailed` marker.
@@ -2655,7 +2601,6 @@ impl Engine {
                     .artifacts_meta
                     .extend(r.artifacts_meta.iter().cloned());
             }
-            report_unentered_shell_target(&rs, owns_run, true, || addr.format());
             return Ok(Arc::new(merged));
         }
 
@@ -2705,14 +2650,12 @@ impl Engine {
             // the read for as long as its artifacts live. See `GuardSlot`.
             Ok(v) => {
                 let handed = handoff.lock().take();
-                let v = v.claim(&self, &rs, handed).await.map_err(|e| {
+                v.claim(&self, &rs, handed).await.map_err(|e| {
                     // A failed claim (the revision changed under a lapsed read,
                     // a cancelled re-acquire) is this addr's failure, classified
                     // like the computation's own.
                     surface_top(is_top, &rs, classify_failure(&rs, addr, interactive, e))
-                })?;
-                report_unentered_shell_target(&rs, owns_run, true, || addr.format());
-                Ok(v)
+                })
             }
             Err(e) => Err(surface_top(is_top, &rs, e)),
         }
@@ -2803,55 +2746,6 @@ impl Engine {
         }
     }
 
-    /// Warn about a `--shell=ADDR` naming an address no target has, *before* the
-    /// run rather than after it.
-    ///
-    /// Splits the two ways the value can be wrong. A typo is decidable in one
-    /// memoized spec lookup; graph membership is not — that needs the walk,
-    /// which is the run — so only the second half is left to
-    /// [`report_unentered_shell_target`]. Warning early is strictly better than
-    /// warning late even though neither is fatal: the user learns they will not
-    /// get a shell while the build is still running, instead of after waiting
-    /// for it.
-    ///
-    /// Neither case fails the run. `--shell` is an interactive convenience, and
-    /// a bad value for it is not a reason to throw away a build that is
-    /// otherwise exactly what was asked for.
-    ///
-    /// The lookup is not wasted work on the happy path: `mem_spec` is keyed by
-    /// addr, so the run reuses this exact cell.
-    pub(crate) async fn preflight_shell_target(self: Arc<Self>, rs: &Arc<RequestState>) {
-        let Some(target) = rs.shell_target() else {
-            return;
-        };
-        let addr = target.addr.clone();
-        let Err(e) = self.get_spec(rs.clone(), &addr).await else {
-            return;
-        };
-        // Settle either way: the address will not be entered, and the end-of-run
-        // check must not say so a second time.
-        rs.settle_shell();
-        if downcast_chain_ref::<TargetNotFoundError>(&e).is_some() {
-            tracing::warn!(
-                shell = %addr.format(),
-                "--shell names no known target, so no shell will be opened; \
-                 the build continues — check the address with `heph query //{}`",
-                addr.package,
-            );
-            return;
-        }
-        // Resolving it failed for some other reason. Still not fatal: if the
-        // address is genuinely part of the run, the run hits the same error on
-        // its own terms and reports it properly; if it is not, a diagnostic
-        // lookup has no business failing the build.
-        tracing::warn!(
-            shell = %addr.format(),
-            error = %format!("{e:#}"),
-            "could not resolve the --shell target, so no shell will be opened; \
-             the build continues",
-        );
-    }
-
     /// Resolve every addr a matcher selects, admitting a bounded number at a
     /// time (see `top_level_spawn_limit`).
     ///
@@ -2922,14 +2816,6 @@ impl Engine {
         rs.announce_request_config(self.max_workers, opts.no_scratch, || {
             self.pool_announcement()
         });
-
-        // "This batch is the whole request" — see `RequestState::claim_request_owner`.
-        // Only the owner pre-flights the shell target, and only the owner may
-        // later judge that no frame claimed it.
-        let owns_run = rs.claim_request_owner();
-        if owns_run {
-            Arc::clone(&self).preflight_shell_target(&rs).await;
-        }
 
         let fail_fast = rs.fail_fast();
         let mut set: JoinSet<(Addr, anyhow::Result<Arc<EResult>>)> = JoinSet::new();
@@ -3240,19 +3126,6 @@ impl Engine {
         if rs.ctoken().is_cancelled() {
             return Err(CancelledError.into());
         }
-        // Every matched target is `is_top`, so `result_addr` cannot tell which of
-        // them was the whole request; the batch owner decides here instead.
-        //
-        // `errors` is part of "otherwise succeeded": with `fail_fast` off — the
-        // default — a per-target failure lands there rather than in `fatal`, and
-        // one of the failures this very feature raises is
-        // `ShellNeedsSingleTarget` from a `--shell=<group>` frame. Warning about
-        // an unentered target on top of that would talk over the message that
-        // names the group's members and the exact command to run, with a "not
-        // part of this run" whose every clause would be false.
-        report_unentered_shell_target(&rs, owns_run, errors.is_empty(), || {
-            hmodel::htquery::format(matcher)
-        });
 
         Ok(BatchResult { ok, errors })
     }
@@ -3391,9 +3264,9 @@ impl Engine {
                 //
                 // The single chokepoint: this is the only `ExecuteOptions` built
                 // from a frame's options (`resolve_locked` only copies this
-                // one into its memoized cell), so deriving both here — from the request for the
-                // addressed form, from this frame's options for the bare one —
-                // keeps the two forms from having to agree anywhere else.
+                // one into its memoized cell). Whether this frame holds the
+                // terminal is `frame_gets_terminal`'s answer — the same call
+                // `classify_failure` reads — so the two cannot drift.
                 //
                 // Reading `--shell=ADDR` from the request rather than from `opts`
                 // is what lets it reach a target that is only a *dependency*, and
@@ -3402,13 +3275,25 @@ impl Engine {
                 // one is named, no other addr may hold a terminal at all —
                 // that is the at-most-one-terminal invariant, restated for the
                 // form that names its target instead of inferring it.
+                let gets_terminal = frame_gets_terminal(&rs, addr, opts);
                 let (shell, interactive) = match rs.shell_target() {
-                    Some(target) if target.addr == *addr => {
-                        rs.settle_shell();
-                        (true, target.terminal.clone())
+                    // The addressed form: the terminal is the request's, and the
+                    // frame that holds it is the one entered.
+                    Some(target) => {
+                        if gets_terminal {
+                            rs.mark_shell_entered();
+                        }
+                        (
+                            gets_terminal,
+                            target.terminal.clone().filter(|_| gets_terminal),
+                        )
                     }
-                    Some(_) => (false, None),
-                    None => (opts.shell, opts.interactive.clone()),
+                    // The bare form: the frame's own options, which only the
+                    // selected target's frame carries.
+                    None => (
+                        opts.shell,
+                        opts.interactive.clone().filter(|_| gets_terminal),
+                    ),
                 };
 
                 let result = self
@@ -15509,6 +15394,17 @@ mod tests {
                 req.target_spec.config.get("fail"),
                 Some(hcore::htvalue::Value::Bool(true))
             );
+            // `entrypoint = true`: invoked through `Engine::invoke`, not built.
+            let entrypoint = matches!(
+                req.target_spec.config.get("entrypoint"),
+                Some(hcore::htvalue::Value::Bool(true))
+            )
+            .then(|| {
+                crate::engine::driver::targetdef::Entrypoint::new(
+                    false,
+                    crate::engine::driver::targetdef::Workdir::Sandbox,
+                )
+            });
             Ok(ParseResponse {
                 target_def: TargetDef {
                     addr: req.target_spec.addr.clone(),
@@ -15533,6 +15429,7 @@ mod tests {
                     },
                     hash: req.target_spec.addr.format().into_bytes(),
                     transparent,
+                    entrypoint,
                     ..Default::default()
                 },
             })
@@ -15764,90 +15661,6 @@ mod tests {
         })
     }
 
-    /// Every `WARN`-or-worse event this process has emitted, as flat text.
-    ///
-    /// A warning is *delivered*, not returned, so asserting on one means
-    /// intercepting `tracing`. The subscriber is global and installed once
-    /// because the events fire on tokio worker threads, where a thread-local
-    /// (`with_default`) subscriber would never be consulted — and a global can
-    /// only be set once per process. The buffer is therefore shared by every
-    /// test in the binary, which is why each `--shell` test names an address no
-    /// other test uses: `find`/`count` filter by that address.
-    #[derive(Clone)]
-    struct WarnLog(SArc<std::sync::Mutex<Vec<String>>>);
-
-    impl WarnLog {
-        /// The first captured warning mentioning `needle`, if any.
-        fn find(&self, needle: &str) -> Option<String> {
-            self.0
-                .lock()
-                .expect("warn log")
-                .iter()
-                .find(|line| line.contains(needle))
-                .cloned()
-        }
-
-        /// How many captured warnings mention `needle`.
-        fn count(&self, needle: &str) -> usize {
-            self.0
-                .lock()
-                .expect("warn log")
-                .iter()
-                .filter(|line| line.contains(needle))
-                .count()
-        }
-    }
-
-    /// Flattens an event's fields (including `message`) into one string.
-    struct WarnVisitor(String);
-
-    impl tracing::field::Visit for WarnVisitor {
-        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            use std::fmt::Write;
-            let _ = write!(self.0, " {}={:?}", field.name(), value);
-        }
-        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-            use std::fmt::Write;
-            let _ = write!(self.0, " {}={}", field.name(), value);
-        }
-    }
-
-    struct WarnLayer(WarnLog);
-
-    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnLayer {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            if *event.metadata().level() > tracing::Level::WARN {
-                return;
-            }
-            let mut visitor = WarnVisitor(String::new());
-            event.record(&mut visitor);
-            self.0.0.lock().expect("warn log").push(visitor.0);
-        }
-    }
-
-    /// Install the capturing subscriber (once) and hand back the shared buffer.
-    fn capture_warnings() -> WarnLog {
-        use tracing_subscriber::layer::SubscriberExt;
-        use tracing_subscriber::util::SubscriberInitExt;
-
-        static LOG: std::sync::OnceLock<WarnLog> = std::sync::OnceLock::new();
-        LOG.get_or_init(|| {
-            let log = WarnLog(SArc::new(std::sync::Mutex::new(Vec::new())));
-            // `try_init` rather than `init`: another test binary entry point may
-            // have installed one first, and a panic here would be a confusing
-            // way to learn that.
-            let _ = tracing_subscriber::registry()
-                .with(WarnLayer(log.clone()))
-                .try_init();
-            log
-        })
-        .clone()
-    }
-
     impl TerminalHarness {
         fn opts(&self, shell: bool) -> ResultOptions {
             ResultOptions {
@@ -15865,6 +15678,27 @@ mod tests {
                 addr: hmodel::htaddr::parse_addr(addr)?,
                 terminal: Some(probe_wrapper(SArc::clone(&self.probe))),
             })
+        }
+
+        /// A request naming `--shell=addr`, built the way `heph run` builds
+        /// one: the shell target is fixed at construction.
+        fn state_with_shell(
+            &self,
+            addr: &str,
+            fail_fast: bool,
+        ) -> anyhow::Result<Arc<RequestState>> {
+            Ok(self.state_with(self.shell_target(addr)?, fail_fast))
+        }
+
+        fn state_with(&self, target: ShellTarget, fail_fast: bool) -> Arc<RequestState> {
+            self.engine.new_state_with_shell(
+                fail_fast,
+                None,
+                hcore::pending::Pending::new_counter(),
+                Engine::DEFAULT_LOG_TAIL_LINES,
+                None,
+                Some(target),
+            )
         }
     }
 
@@ -16597,12 +16431,11 @@ mod tests {
             leaf_spec("//pkg:a", false)?,
             leaf_spec("//pkg:b", false)?,
         ])?;
-        let rs = h.engine.new_state();
-        rs.set_shell_target(h.shell_target("//pkg:a")?);
+        let rs = h.state_with_shell("//pkg:a", true)?;
         let addr = hmodel::htaddr::parse_addr("//pkg:g")?;
 
         Arc::clone(&h.engine)
-            .result_addr(rs, &addr, OutputMatcher::All, &h.opts(false))
+            .result_addr(rs.clone(), &addr, OutputMatcher::All, &h.opts(false))
             .await?;
 
         assert_eq!(
@@ -16610,6 +16443,7 @@ mod tests {
             1,
             "the named member is entered",
         );
+        assert!(rs.shell_entered(), "…and the request records that it was");
         assert_eq!(
             h.runs.load(Ordering::SeqCst),
             1,
@@ -16633,12 +16467,11 @@ mod tests {
             leaf_spec("//pkg:a", false)?,
             leaf_spec("//pkg:b", false)?,
         ])?;
-        let rs = h.engine.new_state();
-        rs.set_shell_target(h.shell_target("//pkg:b")?);
+        let rs = h.state_with_shell("//pkg:b", true)?;
         let matcher = Matcher::Package(PkgBuf::from("pkg"));
 
         Arc::clone(&h.engine)
-            .result(rs, &matcher, OutputMatcher::All, &h.opts(false))
+            .result(rs.clone(), &matcher, OutputMatcher::All, &h.opts(false))
             .await?;
 
         assert_eq!(
@@ -16646,6 +16479,7 @@ mod tests {
             1,
             "the named target is entered",
         );
+        assert!(rs.shell_entered(), "…and the request records that it was");
         assert_eq!(
             h.runs.load(Ordering::SeqCst),
             1,
@@ -16671,12 +16505,11 @@ mod tests {
             leaf_spec("//pkg:a", false)?,
             leaf_spec("//pkg:b", false)?,
         ])?;
-        let rs = h.engine.new_state();
-        rs.set_shell_target(h.shell_target("//pkg:a")?);
+        let rs = h.state_with_shell("//pkg:a", true)?;
         let addr = hmodel::htaddr::parse_addr("//pkg:root")?;
 
         Arc::clone(&h.engine)
-            .result_addr(rs, &addr, OutputMatcher::All, &h.opts(false))
+            .result_addr(rs.clone(), &addr, OutputMatcher::All, &h.opts(false))
             .await?;
 
         assert_eq!(
@@ -16684,11 +16517,53 @@ mod tests {
             1,
             "a dependency named with --shell= is entered",
         );
+        assert!(rs.shell_entered(), "…and the request records that it was");
         assert_eq!(
             h.probe.calls.load(Ordering::SeqCst),
             1,
             "and it is the only holder of the terminal",
         );
+        Ok(())
+    }
+
+    /// The same through `Engine::invoke`: `--shell=<dep of an entrypoint>`
+    /// enters the dep as the entrypoint's closure builds, and the entrypoint
+    /// then runs as asked. The request records the entry, so `heph run` has no
+    /// "not part of this run" to say about a target that plainly was.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shell_target_reaches_a_dependency_of_an_entrypoint() -> anyhow::Result<()> {
+        let mut tool = leaf_with_deps_spec("//pkg:tool", &["//pkg:lib"])?;
+        tool.config
+            .insert("entrypoint".to_string(), hcore::htvalue::Value::Bool(true));
+        let h = terminal_harness(vec![tool, leaf_spec("//pkg:lib", false)?])?;
+        let rs = h.state_with_shell("//pkg:lib", true)?;
+        let cwd = tempdir()?;
+        let req = crate::engine::invoke::InvokeRequest::new(
+            hmodel::htaddr::parse_addr("//pkg:tool")?,
+            cwd.path(),
+            Vec::new(),
+        );
+
+        let outcome = Arc::clone(&h.engine).invoke(rs.clone(), req).await?;
+
+        assert!(
+            matches!(
+                outcome,
+                crate::engine::invoke::InvokeOutcome::Exited(hcore::process::Exit::Code(0))
+            ),
+            "the entrypoint runs to completion: {outcome:?}",
+        );
+        assert_eq!(
+            h.shell_runs.load(Ordering::SeqCst),
+            1,
+            "the dependency named with --shell= is entered",
+        );
+        assert_eq!(
+            h.runs.load(Ordering::SeqCst),
+            1,
+            "…and the entrypoint runs instead of shelling",
+        );
+        assert!(rs.shell_entered(), "the request records the entry");
         Ok(())
     }
 
@@ -16703,8 +16578,7 @@ mod tests {
             leaf_spec("//pkg:a", false)?,
             leaf_spec("//pkg:b", false)?,
         ])?;
-        let rs = h.engine.new_state();
-        rs.set_shell_target(h.shell_target("//pkg:g")?);
+        let rs = h.state_with_shell("//pkg:g", true)?;
         let addr = hmodel::htaddr::parse_addr("//pkg:g")?;
 
         let err = Arc::clone(&h.engine)
@@ -16730,25 +16604,24 @@ mod tests {
         Ok(())
     }
 
-    /// An address nothing in the run resolves is **warned about, not fatal**:
-    /// `--shell` is an interactive convenience, and a target that turns out not
-    /// to be in the run is no reason to throw away a build that did exactly what
-    /// was asked. What it may never be is *silent* — the user asked for a shell
-    /// and has to be told they are not getting one.
+    /// An address that exists but that nothing in the run resolves is **not
+    /// fatal**: `--shell` is an interactive convenience, and a target that turns
+    /// out not to be in the run is no reason to throw away a build that did
+    /// exactly what was asked. What it may never be is *silent*: the request
+    /// reports that nothing was entered, and `heph run` warns on that
+    /// (`commands::run`'s tests own the warning itself).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn shell_target_outside_the_run_warns_and_the_build_still_succeeds() -> anyhow::Result<()>
-    {
-        let logs = capture_warnings();
+    async fn shell_target_outside_the_run_is_not_entered_and_the_build_still_succeeds()
+    -> anyhow::Result<()> {
         let h = terminal_harness(vec![
             leaf_spec("//pkg:outside-a", false)?,
             leaf_spec("//pkg:outside-b", false)?,
         ])?;
-        let rs = h.engine.new_state();
-        rs.set_shell_target(h.shell_target("//pkg:outside-b")?);
+        let rs = h.state_with_shell("//pkg:outside-b", true)?;
         let addr = hmodel::htaddr::parse_addr("//pkg:outside-a")?;
 
         Arc::clone(&h.engine)
-            .result_addr(rs, &addr, OutputMatcher::All, &h.opts(false))
+            .result_addr(rs.clone(), &addr, OutputMatcher::All, &h.opts(false))
             .await
             .expect("a --shell target outside the run must not fail the build");
 
@@ -16758,32 +16631,27 @@ mod tests {
             0,
             "nothing was entered",
         );
-        let warning = logs
-            .find("//pkg:outside-b")
-            .expect("the user must be told their --shell target was not reached");
         assert!(
-            warning.contains("no shell was opened"),
-            "the warning must name the consequence, not just the fact: {warning}",
+            !rs.shell_entered(),
+            "the request must say the --shell target was not entered",
         );
         Ok(())
     }
 
-    /// …and the same on the batch path, where each matched target is `is_top`
-    /// and only the batch owner can tell that no frame entered the address.
+    /// …and the same on the batch path, where every matched target is `is_top`
+    /// and no single frame sees the whole run.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn shell_target_outside_a_selection_warns_once() -> anyhow::Result<()> {
-        let logs = capture_warnings();
+    async fn shell_target_outside_a_selection_is_not_entered() -> anyhow::Result<()> {
         let h = terminal_harness(vec![
             leaf_spec("//pkg:sel-a", false)?,
             leaf_spec("//pkg:sel-b", false)?,
             leaf_spec("//other:sel-c", false)?,
         ])?;
-        let rs = h.engine.new_state();
-        rs.set_shell_target(h.shell_target("//other:sel-c")?);
+        let rs = h.state_with_shell("//other:sel-c", true)?;
         let matcher = Matcher::Package(PkgBuf::from("pkg"));
 
         Arc::clone(&h.engine)
-            .result(rs, &matcher, OutputMatcher::All, &h.opts(false))
+            .result(rs.clone(), &matcher, OutputMatcher::All, &h.opts(false))
             .await
             .expect("a --shell target outside the selection must not fail the batch");
 
@@ -16792,31 +16660,24 @@ mod tests {
             2,
             "the selection still built"
         );
-        assert_eq!(
-            logs.count("//other:sel-c"),
-            1,
-            "exactly one warning — the batch owner's, not one per matched target",
-        );
+        assert!(!rs.shell_entered(), "nothing in the selection entered it");
         Ok(())
     }
 
-    /// An address no target has is decidable in one memoized spec lookup, so the
-    /// user hears about it *before* the run rather than after waiting one out.
-    /// Still only a warning, and the build proceeds — which the target count
-    /// proves, since a bail would leave it at zero.
+    /// An address no target has does not fail the build either: the engine
+    /// neither refuses it nor enters anything. (`heph run` looks it up before
+    /// the run and warns; that lookup is not the engine's.)
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn shell_target_that_does_not_exist_warns_before_the_run() -> anyhow::Result<()> {
-        let logs = capture_warnings();
+    async fn shell_target_that_does_not_exist_does_not_fail_the_build() -> anyhow::Result<()> {
         let h = terminal_harness(vec![
             leaf_spec("//pkg:typo-a", false)?,
             leaf_spec("//pkg:typo-b", false)?,
         ])?;
-        let rs = h.engine.new_state();
-        rs.set_shell_target(h.shell_target("//pkg:nosuchtarget")?);
+        let rs = h.state_with_shell("//pkg:nosuchtarget", true)?;
         let matcher = Matcher::Package(PkgBuf::from("pkg"));
 
         Arc::clone(&h.engine)
-            .result(rs, &matcher, OutputMatcher::All, &h.opts(false))
+            .result(rs.clone(), &matcher, OutputMatcher::All, &h.opts(false))
             .await
             .expect("a mistyped --shell target must not fail the build");
 
@@ -16825,20 +16686,7 @@ mod tests {
             2,
             "the build proceeds; a bail would have left this at 0",
         );
-        let warning = logs
-            .find("//pkg:nosuchtarget")
-            .expect("a mistyped --shell target must be reported");
-        assert!(
-            warning.contains("names no known target"),
-            "warning: {warning}",
-        );
-        assert!(
-            warning.contains("heph query //pkg"),
-            "the warning must name how to find the right address: {warning}",
-        );
-        // The pre-flight settles the question, so the end-of-run check must not
-        // say the same thing again about the same address.
-        assert_eq!(logs.count("//pkg:nosuchtarget"), 1, "warned exactly once");
+        assert!(!rs.shell_entered());
         Ok(())
     }
 
@@ -16846,10 +16694,10 @@ mod tests {
     ///
     /// `fail_fast` is off by default, so that refusal lands in the batch's
     /// `errors` rather than short-circuiting as `fatal` — and the shell target
-    /// (the group) is then never claimed. Judging the claim anyway replaced the
-    /// message that names the group's members and the exact command to run with
-    /// "was not part of it", every clause of which is false for a group the run
-    /// demonstrably reached.
+    /// (the group) is then never entered. It must still reach the caller as the
+    /// message that names the group's members and the exact command to run, so
+    /// that `heph run`, which warns about an unentered target only after a
+    /// successful run, sees a failed one here.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_shell_refusal_survives_a_batch_that_did_not_fail_fast() -> anyhow::Result<()> {
         let h = terminal_harness(vec![
@@ -16857,8 +16705,7 @@ mod tests {
             leaf_spec("//pkg:a", false)?,
             leaf_spec("//pkg:b", false)?,
         ])?;
-        let rs = h.engine.new_state_with_fail_fast(false);
-        rs.set_shell_target(h.shell_target("//pkg:g")?);
+        let rs = h.state_with_shell("//pkg:g", false)?;
         let matcher = Matcher::Package(PkgBuf::from("pkg"));
 
         let batch = Arc::clone(&h.engine)
@@ -16896,8 +16743,7 @@ mod tests {
         root.config
             .insert("fail".to_string(), hcore::htvalue::Value::Bool(true));
         let h = terminal_harness(vec![root, leaf_spec("//pkg:lib", false)?])?;
-        let rs = h.engine.new_state();
-        rs.set_shell_target(h.shell_target("//pkg:lib")?);
+        let rs = h.state_with_shell("//pkg:lib", true)?;
         let addr = hmodel::htaddr::parse_addr("//pkg:root")?;
         let failing = addr.clone();
 
@@ -16923,11 +16769,13 @@ mod tests {
     #[tokio::test]
     async fn shell_target_without_a_terminal_is_refused() -> anyhow::Result<()> {
         let h = terminal_harness(vec![leaf_spec("//pkg:a", false)?])?;
-        let rs = h.engine.new_state();
-        rs.set_shell_target(ShellTarget {
-            addr: hmodel::htaddr::parse_addr("//pkg:a")?,
-            terminal: None,
-        });
+        let rs = h.state_with(
+            ShellTarget {
+                addr: hmodel::htaddr::parse_addr("//pkg:a")?,
+                terminal: None,
+            },
+            true,
+        );
         let addr = hmodel::htaddr::parse_addr("//pkg:a")?;
 
         let err = Arc::clone(&h.engine)

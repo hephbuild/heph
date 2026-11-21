@@ -575,6 +575,134 @@ fn shell_for_selection(shell: ShellFlag, matcher: &Matcher) -> ShellFlag {
     }
 }
 
+/// How looking up a `--shell=ADDRESS` target before the run came out.
+///
+/// `heph run` owns both `--shell=` warnings because it owns the whole request:
+/// it is the only place that sees the run start and end. The engine records
+/// one fact, [`RequestState::shell_entered`]; everything said to the user is
+/// decided here, from that fact and this lookup.
+///
+/// [`RequestState::shell_entered`]: crate::engine::request_state::RequestState::shell_entered
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellLookup {
+    /// A target has the address. Whether the run reaches it is known only
+    /// after the run.
+    Found,
+    /// No target has it: warned about before the run.
+    NotFound,
+    /// Resolving it failed some other way: warned about before the run. If
+    /// the address is part of the run, the run hits the same error and reports
+    /// it on its own terms.
+    Failed,
+}
+
+impl ShellLookup {
+    fn of<T>(lookup: &anyhow::Result<T>) -> Self {
+        match lookup {
+            Ok(_) => Self::Found,
+            Err(e)
+                if crate::hmemoizer::downcast_chain_ref::<hplugin::error::TargetNotFoundError>(
+                    e,
+                )
+                .is_some() =>
+            {
+                Self::NotFound
+            }
+            Err(_) => Self::Failed,
+        }
+    }
+}
+
+/// Warn, before the run, about a `--shell=ADDRESS` the lookup did not find.
+/// Nothing for one it found.
+///
+/// A typo is decidable in one memoized spec lookup, so the user hears about it
+/// while the build is still running rather than after waiting one out. Neither
+/// case fails the run: `--shell` is an interactive convenience, and a bad value
+/// for it is no reason to throw away a build that is otherwise what was asked.
+fn warn_shell_lookup(addr: &crate::htaddr::Addr, lookup: &anyhow::Result<impl Sized>) {
+    let Err(e) = lookup else {
+        return;
+    };
+    if ShellLookup::of(lookup) == ShellLookup::NotFound {
+        tracing::warn!(
+            shell = %addr.format(),
+            "--shell names no known target, so no shell will be opened; \
+             the build continues — check the address with `heph query //{}`",
+            addr.package,
+        );
+        return;
+    }
+    tracing::warn!(
+        shell = %addr.format(),
+        error = %format!("{e:#}"),
+        "could not resolve the --shell target, so no shell will be opened; \
+         the build continues",
+    );
+}
+
+/// Whether to warn, after the run, that `--shell=ADDRESS` was not part of it.
+///
+/// Only for an address the lookup found: one it did not was warned about
+/// before the run, so each warning fires at most once by construction. Only
+/// after a run that **succeeded**: an unreached shell target on a failed run is
+/// a consequence of that failure, and a "not part of this run" on top of, say,
+/// the refusal of `--shell=<group>` would talk over the message that names the
+/// group's members.
+fn warn_not_in_run(lookup: ShellLookup, run_succeeded: bool, entered: bool) -> bool {
+    lookup == ShellLookup::Found && run_succeeded && !entered
+}
+
+/// The after-run warning. Loud on purpose: the failure mode a warning permits is
+/// a typo quietly costing the user their shell, so it names the address, says
+/// no shell was opened, and gives the command that lists what the run holds.
+fn warn_shell_not_in_run(addr: &crate::htaddr::Addr, request: &str) {
+    tracing::warn!(
+        shell = %addr.format(),
+        request = %request,
+        "--shell target was not part of this run, so no shell was opened; \
+         nothing in the run resolved that address — list what it does contain \
+         with `heph query <selection>`",
+    );
+}
+
+/// A `--shell=ADDRESS` checked before the run, to be judged after it.
+#[derive(Debug)]
+struct ShellCheck {
+    addr: crate::htaddr::Addr,
+    lookup: ShellLookup,
+}
+
+impl ShellCheck {
+    /// Look the request's `--shell=` target up and warn now if no target has
+    /// it. `None` when the request names none, or has no terminal for it: the
+    /// engine refuses that request outright, and the refusal is the message.
+    ///
+    /// The lookup is not wasted work on the happy path: `mem_spec` is keyed by
+    /// addr, so the run reuses this exact cell.
+    async fn before(
+        engine: &Arc<Engine>,
+        rs: &Arc<crate::engine::request_state::RequestState>,
+    ) -> Option<Self> {
+        let target = rs.shell_target().filter(|t| t.terminal.is_some())?;
+        let addr = target.addr.clone();
+        let lookup = Arc::clone(engine).get_spec(Arc::clone(rs), &addr).await;
+        warn_shell_lookup(&addr, &lookup);
+        Some(Self {
+            lookup: ShellLookup::of(&lookup),
+            addr,
+        })
+    }
+
+    /// Once the run is over: warn if the address exists, the run succeeded, and
+    /// no frame entered it.
+    fn after(&self, run_succeeded: bool, entered: bool, request: &str) {
+        if warn_not_in_run(self.lookup, run_succeeded, entered) {
+            warn_shell_not_in_run(&self.addr, request);
+        }
+    }
+}
+
 struct RunApp {
     args: RunArgs,
     engine: Arc<Engine>,
@@ -916,19 +1044,24 @@ impl App for RunApp {
                 self.auto_approve,
             ))
         };
-        let rs = self.engine.new_state_full(
+        // The shell target is fixed when the request is built: no frame may
+        // resolve before it is known (see `ShellTarget`).
+        let rs = self.engine.new_state_with_shell(
             self.fail_fast,
             ctx.event_sender(),
             ctx.bg_pending(),
             self.args.log_lines,
             Some(approval),
-        );
-        if let Some(addr) = shell_target {
-            rs.set_shell_target(crate::engine::ShellTarget {
+            shell_target.map(|addr| crate::engine::ShellTarget {
                 addr,
                 terminal: shell_terminal,
-            });
-        }
+            }),
+        );
+        // Both `--shell=` warnings are this command's: the one before the run
+        // here, the one after it below, on the entrypoint path and the build
+        // path alike.
+        let shell_check = ShellCheck::before(&self.engine, &rs).await;
+        let request = self.selection();
 
         // An entrypoint is invoked, not built: it takes its own path from here.
         // An unresolvable address falls through, so the build path reports it
@@ -939,7 +1072,13 @@ impl App for RunApp {
             match self.engine.is_entrypoint(&rs, addr).await {
                 Ok(true) => {
                     let addr = addr.clone();
-                    return self.invoke(ctx, rs, addr).await;
+                    let outcome = self.invoke(ctx, Arc::clone(&rs), addr).await;
+                    if let Some(check) = &shell_check {
+                        // `Some(exit)` is a tool that ran: everything it
+                        // depends on resolved, whatever its own status.
+                        check.after(matches!(outcome, Ok(Some(_))), rs.shell_entered(), &request);
+                    }
+                    return outcome;
                 }
                 Err(e) if !self.args.args.is_empty() => {
                     let res: anyhow::Result<()> = Err(e);
@@ -991,6 +1130,12 @@ impl App for RunApp {
                     crate::commands::errors::require_non_empty_unless_incomplete(results, &gaps)
                 }),
         };
+
+        // A run with gaps skipped part of the graph, so it did not succeed:
+        // the shell target may be in what it skipped.
+        if let Some(check) = &shell_check {
+            check.after(res.is_ok() && gaps.is_empty(), rs.shell_entered(), &request);
+        }
 
         // On success print `--cat-out` / `--list-out`; failures/cancellation are
         // rendered and turned into the right exit by the macro.
@@ -1633,6 +1778,100 @@ mod tests {
             ShellFlag::Target(crate::htaddr::parse_addr("//cmd/server:bin")?),
         );
         Ok(())
+    }
+
+    /// The after-run warning fires only for an address that exists, on a run
+    /// that succeeded, when no frame entered it. Each other row is a case where
+    /// it would be wrong: the address was entered; the run failed (an unreached
+    /// target is then a consequence, and a `--shell=<group>` refusal must not
+    /// be talked over); the address was already warned about before the run.
+    #[test]
+    fn warn_not_in_run_only_for_a_found_target_a_successful_run_never_entered() {
+        use ShellLookup::{Failed, Found, NotFound};
+        for (lookup, succeeded, entered, warns) in [
+            (Found, true, false, true),
+            (Found, true, true, false),
+            (Found, false, false, false),
+            (Found, false, true, false),
+            (NotFound, true, false, false),
+            (NotFound, false, false, false),
+            (Failed, true, false, false),
+            (Failed, false, false, false),
+        ] {
+            assert_eq!(
+                warn_not_in_run(lookup, succeeded, entered),
+                warns,
+                "lookup={lookup:?} succeeded={succeeded} entered={entered}",
+            );
+        }
+    }
+
+    /// The lookup tells a missing target from one that failed to resolve: only
+    /// the first is "names no known target", and only `Found` is judged after.
+    #[test]
+    fn shell_lookup_classifies_the_spec_lookup() {
+        let addr = crate::htaddr::parse_addr("//pkg:typo").expect("addr");
+        let found: anyhow::Result<()> = Ok(());
+        assert_eq!(ShellLookup::of(&found), ShellLookup::Found);
+        let missing: anyhow::Result<()> = Err(anyhow::Error::new(
+            hplugin::error::TargetNotFoundError { addr },
+        )
+        .context("resolve spec"));
+        assert_eq!(ShellLookup::of(&missing), ShellLookup::NotFound);
+        let broken: anyhow::Result<()> = Err(anyhow::anyhow!("BUILD file does not parse"));
+        assert_eq!(ShellLookup::of(&broken), ShellLookup::Failed);
+    }
+
+    /// The warnings are really emitted, with the address, the consequence and
+    /// the command that finds the right address — and the before/after pair
+    /// says each thing once: a target the lookup did not find is warned about
+    /// before the run, and never again after it.
+    #[test]
+    fn shell_warnings_are_emitted_once_each() {
+        let typo = crate::htaddr::parse_addr("//pkg:typo").expect("addr");
+        let missing: anyhow::Result<()> =
+            Err(anyhow::Error::new(hplugin::error::TargetNotFoundError {
+                addr: typo.clone(),
+            }));
+        let log = captured_log(|| {
+            warn_shell_lookup(&typo, &missing);
+            ShellCheck {
+                addr: typo.clone(),
+                lookup: ShellLookup::of(&missing),
+            }
+            .after(true, false, "//pkg:a");
+        });
+        assert_eq!(log.matches("//pkg:typo").count(), 1, "log: {log}");
+        assert!(log.contains("names no known target"), "log: {log}");
+        assert!(log.contains("no shell will be opened"), "log: {log}");
+        assert!(log.contains("heph query //pkg"), "log: {log}");
+
+        let outside = crate::htaddr::parse_addr("//pkg:b").expect("addr");
+        let found: anyhow::Result<()> = Ok(());
+        let log = captured_log(|| {
+            warn_shell_lookup(&outside, &found);
+            let check = ShellCheck {
+                addr: outside.clone(),
+                lookup: ShellLookup::of(&found),
+            };
+            check.after(true, false, "//pkg:a");
+        });
+        assert_eq!(log.matches("shell=//pkg:b").count(), 1, "log: {log}");
+        assert!(log.contains("was not part of this run"), "log: {log}");
+        assert!(log.contains("no shell was opened"), "log: {log}");
+        assert!(log.contains("request=//pkg:a"), "log: {log}");
+
+        let log = captured_log(|| {
+            ShellCheck {
+                addr: outside.clone(),
+                lookup: ShellLookup::Found,
+            }
+            .after(true, true, "//pkg:a");
+        });
+        assert!(
+            log.is_empty(),
+            "an entered target is not warned about: {log}"
+        );
     }
 
     /// An unparseable value fails, with the value in the message — never a

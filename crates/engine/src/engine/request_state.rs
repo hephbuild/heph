@@ -17,7 +17,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::HashSet;
 use std::ops::Deref;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 type ArcErr = Arc<anyhow::Error>;
@@ -466,32 +466,18 @@ pub struct RequestStateData {
     selection: std::sync::OnceLock<Selection>,
     /// `--shell=ADDR`: the one target of this request that is entered instead of
     /// run, and the terminal handed to it. See [`ShellTarget`].
-    shell: OnceLock<ShellTarget>,
-    /// Whether the fate of [`shell`] is decided — either a frame handed it the
-    /// terminal, or the user has already been told they will not get one.
     ///
-    /// One flag for both because they are the same question ("does this request
-    /// still owe the user an answer about their `--shell`?"), and because two
-    /// would let a `--shell=` address that names no target be reported twice:
-    /// once by the pre-flight and again by the end-of-run check that finds it
-    /// unclaimed.
+    /// Fixed when the request is constructed and never changed: "does this
+    /// frame shell?" must be a pure function of the addr for the request's whole
+    /// lifetime, so no frame can resolve before it is known.
+    shell: Option<ShellTarget>,
+    /// Whether a frame took the terminal for [`shell`]: the one fact the engine
+    /// records about it. What to tell the user when no frame did is the caller's
+    /// call — it owns the whole request, so it is the only one that knows when
+    /// the run is over.
     ///
     /// [`shell`]: RequestStateData::shell
-    shell_settled: std::sync::atomic::AtomicBool,
-    /// Guards "this frame *is* the whole request" — claimed by whichever entry
-    /// point (`Engine::result` or the single-addr `result_addr`) is reached
-    /// first, so exactly one frame decides whether the run's `--shell=ADDR` went
-    /// unclaimed.
-    ///
-    /// Separate from [`matched_announced`] deliberately, even though today they
-    /// are claimed by the same frame: one is about an event stream and the other
-    /// about who reports on the shell. Sharing the flag would mean a future entry
-    /// point that emits a provisional `Matched` before delegating silently turns
-    /// the shell check into a no-op everywhere — and `--shell=ADDR` back into a
-    /// discarded value, with no test failing.
-    ///
-    /// [`matched_announced`]: RequestStateData::matched_announced
-    request_owned: std::sync::atomic::AtomicBool,
+    shell_entered: std::sync::atomic::AtomicBool,
     /// Post-write `cache.history` trims held back until this request's cache
     /// read guards are gone.
     ///
@@ -1264,52 +1250,34 @@ impl RequestState {
             .swap(true, std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Name the target `--shell=ADDR` selected.
-    ///
-    /// **Must be called before any resolution starts on this request.** The
-    /// whole design rests on `shell_target()` being constant for the request's
-    /// lifetime, so that "does this frame shell?" is a pure function of the addr
-    /// and every `mem_result` cell of one addr feeds the addr-keyed
-    /// `mem_locked_result` cell the same answer (see [`ShellTarget`]). A *first*
-    /// call made after frames have already resolved breaks exactly that: earlier
-    /// frames computed one answer and later ones another, which is the memoizer
-    /// divergence this avoids. Set-once only guards the second call, which is a
-    /// harmless no-op — a nested `result` cannot redirect the terminal mid-run.
-    pub fn set_shell_target(&self, target: ShellTarget) {
-        drop(self.data.shell.set(target));
-    }
-
-    /// Claims "this frame is the whole request". Returns `true` exactly once per
-    /// request, for whichever entry point is reached first. See
-    /// [`RequestStateData::request_owned`].
-    pub(crate) fn claim_request_owner(&self) -> bool {
-        !self
-            .data
-            .request_owned
-            .swap(true, std::sync::atomic::Ordering::Relaxed)
-    }
-
     /// The target `--shell=ADDR` named, if any. `None` for bare `--shell`, whose
     /// single-target rule is enforced by `Engine::result` and the
-    /// transparent-group gate instead.
+    /// transparent-group gate instead. Fixed at construction
+    /// ([`Engine::new_state_with_shell`]).
     pub fn shell_target(&self) -> Option<&ShellTarget> {
-        self.data.shell.get()
+        self.data.shell.as_ref()
     }
 
-    /// Record that the request no longer owes the user an answer about their
-    /// `--shell=` — a frame took the terminal, or they have been told they will
-    /// not get one. See [`RequestStateData::shell_settled`].
-    pub(crate) fn settle_shell(&self) {
+    /// Record that a frame took the terminal for the [`shell_target`].
+    ///
+    /// [`shell_target`]: Self::shell_target
+    pub(crate) fn mark_shell_entered(&self) {
+        // `Relaxed`: the flag publishes no data, and the caller reads it only
+        // after the request's futures have completed.
         self.data
-            .shell_settled
+            .shell_entered
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Whether the shell question is settled. Read at the outermost frame once
-    /// the run is otherwise successful.
-    pub(crate) fn shell_settled(&self) -> bool {
+    /// Whether any frame of this request took the terminal for the
+    /// [`shell_target`]. Meaningful once the request has finished: a caller
+    /// that sees `false` after a successful run knows `--shell=ADDR` named
+    /// something the run never resolved.
+    ///
+    /// [`shell_target`]: Self::shell_target
+    pub fn shell_entered(&self) -> bool {
         self.data
-            .shell_settled
+            .shell_entered
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -1591,11 +1559,13 @@ impl hbuiltins::pluginfs::CodegenReport for EngineCodegenReport {
 
 /// How a request built by `Engine::new_state_inner` behaves beyond its
 /// front-end options.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 struct RequestMode {
     /// See [`RequestStateData::hash_only`].
     hash_only: bool,
     listed_facts_trust: crate::engine::listed::ListedFactsTrust,
+    /// See [`RequestStateData::shell`].
+    shell: Option<ShellTarget>,
 }
 
 impl Engine {
@@ -1638,6 +1608,35 @@ impl Engine {
         log_tail_lines: usize,
         approval: Option<Arc<dyn crate::engine::approval::ApprovalHandler>>,
     ) -> Arc<RequestState> {
+        self.new_state_with_shell(
+            fail_fast,
+            events,
+            bg_pending,
+            log_tail_lines,
+            approval,
+            None,
+        )
+    }
+
+    /// [`new_state_full`](Self::new_state_full) for a request that may name a
+    /// `--shell=ADDR` target.
+    ///
+    /// The shell target is an argument of construction, not something set
+    /// afterwards, because the whole design rests on it being constant for the
+    /// request's lifetime: "does this frame shell?" is then a pure function of
+    /// the addr, and every `mem_result` cell of one addr feeds the addr-keyed
+    /// `mem_locked_result` cell the same answer (see [`ShellTarget`]). A request
+    /// that exists before its shell target is known could resolve a frame
+    /// first.
+    pub fn new_state_with_shell(
+        self: &Arc<Self>,
+        fail_fast: bool,
+        events: Option<crate::engine::event::EventSender>,
+        bg_pending: crate::engine::sandbox_cleaner::PendingCounter,
+        log_tail_lines: usize,
+        approval: Option<Arc<dyn crate::engine::approval::ApprovalHandler>>,
+        shell: Option<ShellTarget>,
+    ) -> Arc<RequestState> {
         self.new_state_inner(
             fail_fast,
             events,
@@ -1647,6 +1646,7 @@ impl Engine {
             RequestMode {
                 hash_only: false,
                 listed_facts_trust: self.cfg.listed_facts_trust,
+                shell,
             },
         )
     }
@@ -1666,6 +1666,7 @@ impl Engine {
             RequestMode {
                 hash_only: false,
                 listed_facts_trust: trust,
+                shell: None,
             },
         )
     }
@@ -1698,6 +1699,8 @@ impl Engine {
             RequestMode {
                 hash_only: true,
                 listed_facts_trust,
+                // A hash-only request never builds, so it never enters anything.
+                shell: None,
             },
         )
         .with_parent(parent)
@@ -1713,6 +1716,7 @@ impl Engine {
         RequestMode {
             hash_only,
             listed_facts_trust,
+            shell,
         }: RequestMode,
     ) -> Arc<RequestState> {
         // A request is past registration by construction (the engine is
@@ -1763,9 +1767,8 @@ impl Engine {
             approval,
             hash_only,
             selection: std::sync::OnceLock::new(),
-            shell: OnceLock::new(),
-            shell_settled: std::sync::atomic::AtomicBool::new(false),
-            request_owned: std::sync::atomic::AtomicBool::new(false),
+            shell,
+            shell_entered: std::sync::atomic::AtomicBool::new(false),
             deferred_trims: DeferredTrims {
                 engine: Arc::downgrade(self),
                 bg_pending,
