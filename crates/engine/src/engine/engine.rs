@@ -65,6 +65,12 @@ pub struct PluginInit {
     /// Every registered driver's schema, sealed with [`Self::functions`]: an
     /// error to read before. The buildfile plugin builds
     /// `heph.types.<driver>.Kwargs` from it.
+    ///
+    /// **A plugin must never fold it into a def hash**, nor into anything an
+    /// ordinary target's def is built from: every def would then move when any
+    /// plugin adds, drops or retypes a driver field. Only a target whose output
+    /// is a verdict over the schemas (the buildfile lint check) may key on a
+    /// digest of what it reads from them.
     pub drivers: Arc<hplugin::driver::DriverSchemaSlot>,
 }
 
@@ -2143,6 +2149,39 @@ mod tests {
             let registry = slot.get().expect("sealed");
             assert!(registry.get("early", "f").is_some());
             assert!(registry.get("fs", "glob").is_some());
+        }
+
+        /// The driver schema slot every plugin gets errs until the seal, then
+        /// holds exactly each registered driver's `schema()`, by name.
+        #[tokio::test]
+        async fn driver_schemas_sealed_with_registered_drivers() {
+            let (_root, mut e) = engine();
+            let mut seen = None;
+            e.register_plugin("early", |init| {
+                seen = Some(Arc::clone(&init.drivers));
+                Ok(PluginParts::default())
+            })
+            .expect("register");
+            let slot = seen.expect("init carries the slot");
+            let err = slot.get().expect_err("read before the seal");
+            assert!(
+                format!("{err:#}").contains("before every plugin was registered"),
+                "{err:#}"
+            );
+
+            e.seal_functions();
+            let sealed = slot.get().expect("sealed");
+            let names: Vec<String> = sealed.keys().cloned().collect();
+            assert_eq!(names, e.driver_names());
+            assert!(!names.is_empty(), "the builtins register drivers");
+            assert!(
+                sealed.values().any(|s| !s.fields.is_empty()),
+                "some driver has a field to compare"
+            );
+            for (name, schema) in sealed.iter() {
+                let registered = e.driver_schema(name).expect("registered");
+                assert_eq!(format!("{schema:?}"), format!("{registered:?}"), "{name}");
+            }
         }
 
         /// D6: once the registry is sealed, registering a plugin is an error

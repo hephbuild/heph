@@ -3026,10 +3026,6 @@ impl DriverSchemaSlot {
         }
     }
 
-    pub fn is_sealed(&self) -> bool {
-        self.sealed.get().is_some()
-    }
-
     /// The sealed schemas.
     pub fn get(&self) -> anyhow::Result<std::sync::Arc<DriverSchemas>> {
         self.sealed.get().cloned().ok_or_else(|| {
@@ -3038,6 +3034,40 @@ impl DriverSchemaSlot {
                  they are readable once the engine has finished loading plugins"
             )
         })
+    }
+}
+
+#[cfg(test)]
+mod schema_slot_tests {
+    use super::*;
+
+    fn one(name: &str) -> DriverSchemas {
+        DriverSchemas::from([(name.to_string(), DriverSchema::default())])
+    }
+
+    /// Read before the seal, the slot errs and stays unsealed: the seal that
+    /// follows is what every later read sees.
+    #[test]
+    fn read_before_seal_errs_then_seals() {
+        let slot = DriverSchemaSlot::new();
+        let err = slot.get().expect_err("unsealed");
+        assert!(
+            format!("{err:#}").contains("before every plugin was registered"),
+            "{err:#}"
+        );
+        assert!(slot.get().is_err(), "an error is not cached as a value");
+        slot.seal_with(|| one("a"));
+        let keys: Vec<String> = slot.get().expect("sealed").keys().cloned().collect();
+        assert_eq!(keys, ["a"]);
+    }
+
+    /// The first seal wins: a second `seal_with` never calls its closure.
+    #[test]
+    fn second_seal_not_called() {
+        let slot = DriverSchemaSlot::sealed(one("a"));
+        slot.seal_with(|| panic!("a sealed slot builds nothing"));
+        let keys: Vec<String> = slot.get().expect("sealed").keys().cloned().collect();
+        assert_eq!(keys, ["a"]);
     }
 }
 
