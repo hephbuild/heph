@@ -49,7 +49,8 @@ pub(crate) struct HephLspContext {
 
 /// How long a completion waits for the engine's listing. Past it, the
 /// completion answers stock with `reason: listing_timed_out`, and the
-/// listing is dropped, which ends its scope.
+/// listing is dropped: the engine cancels its request, so its package tasks
+/// stop and its scope ends.
 pub(crate) const LISTING_WAIT: Duration = Duration::from_secs(2);
 
 /// Why a completion got no listing.
@@ -168,9 +169,10 @@ impl HephLspContext {
 
     /// What the engine lists for `what`, in a cache scope of its own (see
     /// [`LspEngine::list`]), waiting at most the listing wait for it. Past
-    /// the wait the listing is dropped, which ends its scope. Either failure
-    /// is logged, since it is the only explanation a stock answer at an
-    /// address will ever get.
+    /// the wait the listing is dropped, which cancels its walk and ends its
+    /// scope. Either failure is logged here, and the server also tells the
+    /// editor (`window/logMessage`), since it is the only explanation a stock
+    /// answer at an address will ever get.
     pub(crate) fn listing(&self, what: Listing) -> Result<Listed, ListingError> {
         let fut = Arc::clone(&self.shared.engine).list(what.clone());
         // Entered, not spawned: this runs on the LSP server's sync request

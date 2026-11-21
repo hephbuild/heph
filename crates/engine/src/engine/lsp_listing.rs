@@ -16,6 +16,7 @@ use crate::engine::packages::merge_packages;
 use crate::engine::request_state::RequestState;
 use anyhow::Context as _;
 use futures::TryStreamExt as _;
+use hcore::hasync::StdCancellationToken;
 use hmodel::htmatcher::Matcher;
 use hmodel::htpkg::PkgBuf;
 use hplugin::lsp::{Listed, ListedEntry, Listing};
@@ -34,6 +35,11 @@ impl Engine {
         // ends — answered, failed or dropped mid-listing — the scope ends with
         // its last holder and the watcher goes with it.
         let (rs, scope_ended) = self.new_watched_state();
+        // The package tasks the walk spawns hold the request, and so its
+        // scope, past this future: a caller that gives up (the LSP's
+        // `LISTING_WAIT`) must stop them too, or the scope stays open until
+        // the slowest provider finishes on its own.
+        let cancel_on_drop = CancelOnDrop(Some(rs.ctoken().clone()));
         let scope = rs.cache_scope().id();
         let (gaps, entries) = match &what {
             Listing::Packages { under } => {
@@ -47,6 +53,7 @@ impl Engine {
                 (gaps, entries)
             }
         };
+        cancel_on_drop.disarm();
         // The scope ends once this was its last holder; `scope_ended` resolves
         // when every provider heard it.
         drop(rs);
@@ -141,12 +148,33 @@ impl Engine {
     }
 }
 
+/// Cancels a listing's request when dropped, unless the listing answered
+/// first: a listing dropped mid-walk, or one that failed, stops the work it
+/// spawned instead of leaving it to finish for nobody.
+struct CancelOnDrop(Option<StdCancellationToken>);
+
+impl CancelOnDrop {
+    /// The listing answered: leave its request alone.
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if let Some(token) = self.0.take() {
+            token.cancel();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::engine::Config;
     use crate::engine::fault_provider::{FaultProvider, Faults};
     use hbuiltins::pluginstatictarget;
+    use std::time::Duration;
 
     fn target(addr: &str) -> pluginstatictarget::Target {
         pluginstatictarget::Target {
@@ -223,6 +251,60 @@ mod tests {
             [("only_second", "second"), ("t", "first")],
             "{targets:?}"
         );
+        Ok(())
+    }
+
+    /// A listing dropped mid-walk (the LSP giving up after `LISTING_WAIT`)
+    /// cancels its request: the package task it spawned, parked in a provider
+    /// until the request is cancelled, lets go, and the scope ends promptly
+    /// instead of when the provider finishes on its own (here: never).
+    #[tokio::test]
+    async fn a_dropped_listing_cancels_its_walk_and_ends_its_scope() -> anyhow::Result<()> {
+        use crate::engine::discovery::Stage;
+        let root = tempfile::tempdir()?;
+        let mut engine = Engine::new(Config {
+            parallelism: None,
+            ..Config::for_tests(root.path())
+        })?;
+        engine
+            .register_managed_driver(|_| Box::new(hplugin_exec::pluginexec::Driver::new_exec()))?;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let provider = FaultProvider::new(
+            vec![target("//p:t")],
+            Faults {
+                name: Some("parked"),
+                cancel_at: Some((Stage::List, "p".to_string(), Arc::clone(&started))),
+                ..Default::default()
+            },
+        )?;
+        let scopes = provider.scopes();
+        engine.register_provider(move |_| Box::new(provider))?;
+        let engine = Arc::new(engine);
+
+        let listing = Arc::clone(&engine).lsp_list(Listing::Targets {
+            package: "p".to_string(),
+        });
+        // Walk until the provider is parked in `list`, then drop the listing.
+        tokio::select! {
+            res = listing => panic!("the parked listing answered: {res:?}"),
+            () = started.notified() => {}
+        }
+        assert!(scopes.ended().is_empty(), "{:?}", scopes.ended());
+        // The provider only returns once the request is cancelled; the scope
+        // ends once it has, and every provider heard it.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while scopes.ended().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("the dropped listing's scope never ended")?;
+        let seen: Vec<_> = scopes.seen().into_iter().flatten().collect();
+        let ended = scopes.ended();
+        let [ended] = ended.as_slice() else {
+            panic!("one scope ended: {ended:?}");
+        };
+        assert!(seen.contains(&ended.scope), "{seen:?} vs {ended:?}");
         Ok(())
     }
 
