@@ -334,6 +334,8 @@ struct Lsp {
     diagnostics: Vec<Value>,
     /// Every `window/showMessage` params object received, in order.
     messages: Vec<Value>,
+    /// Every `window/logMessage` params object received, in order.
+    logs: Vec<Value>,
     /// The position encoding the server chose at `initialize`.
     encoding: String,
 }
@@ -412,6 +414,7 @@ impl Lsp {
             next_id: 0,
             diagnostics: Vec::new(),
             messages: Vec::new(),
+            logs: Vec::new(),
             encoding: "utf-16".to_string(),
         }
     }
@@ -466,6 +469,12 @@ impl Lsp {
 
     /// Send a request and wait for its response, collecting notifications.
     fn request_raw(&mut self, method: &str, params: Value) -> lsp_server::Response {
+        let id = self.send_request(method, params);
+        self.wait_response(&id)
+    }
+
+    /// Send a request without waiting for its response.
+    fn send_request(&mut self, method: &str, params: Value) -> RequestId {
         self.next_id += 1;
         let id = RequestId::from(self.next_id);
         self.send(Message::Request(Request {
@@ -473,7 +482,7 @@ impl Lsp {
             method: method.to_string(),
             params,
         }));
-        self.wait_response(&id)
+        id
     }
 
     fn wait_response(&mut self, id: &RequestId) -> lsp_server::Response {
@@ -489,6 +498,7 @@ impl Lsp {
                 Message::Notification(n) => match n.method.as_str() {
                     "textDocument/publishDiagnostics" => self.diagnostics.push(n.params),
                     "window/showMessage" => self.messages.push(n.params),
+                    "window/logMessage" => self.logs.push(n.params),
                     _ => {}
                 },
             }
@@ -1164,18 +1174,81 @@ fn completion_and_hover_on_plugin_function() {
 
 /// A listing that never answers costs a completion the listing wait: the
 /// editor gets the stock answer (empty inside a string) and is not held.
+///
+/// Back to back, each completion costs one wait, not the sum of the ones
+/// before it: a dropped listing holds nothing the next one queues behind.
+/// Each also tells the editor's log why it answered stock.
 #[test]
 fn a_hung_listing_answers_stock_after_the_wait() {
-    let mut lsp = Lsp::with_hanging_listing(Duration::from_millis(200));
+    const WAIT: Duration = Duration::from_millis(300);
+    // Generous: a loaded CI runner, not the server, is what overruns it.
+    const SLACK: Duration = Duration::from_secs(3);
+    let mut lsp = Lsp::with_hanging_listing(WAIT);
+    let doc = lsp.open("BUILD", "target(name = \"x\", deps = [\"//l│\"])\n");
+    for round in 1..=3 {
+        let started = std::time::Instant::now();
+        let result = lsp.completion(&doc);
+        let took = started.elapsed();
+        assert!(heph_items(&result).is_empty(), "round {round}: {result}");
+        assert!(
+            took >= WAIT && took < WAIT + SLACK,
+            "round {round} took {took:?}"
+        );
+        assert_eq!(lsp.logs.len(), round, "one log line each: {:?}", lsp.logs);
+    }
+    let log = &lsp.logs[0];
+    assert_eq!(log["type"], json!(2), "a warning: {log}");
+    let message = log["message"].as_str().unwrap_or("");
+    assert!(
+        message.contains("did not answer within 300ms") && message.contains("--explain"),
+        "{message}"
+    );
+}
+
+/// The server answers one request at a time, so completions an editor sends
+/// without waiting (three keystrokes) against a hung listing are answered in
+/// order, one wait apart: the third arrives after three waits. Pinned so a
+/// change to it is deliberate.
+#[test]
+fn pipelined_completions_against_a_hung_listing_are_serial() {
+    const WAIT: Duration = Duration::from_millis(300);
+    let mut lsp = Lsp::with_hanging_listing(WAIT);
     let doc = lsp.open("BUILD", "target(name = \"x\", deps = [\"//l│\"])\n");
     let started = std::time::Instant::now();
-    let result = lsp.completion(&doc);
-    assert!(heph_items(&result).is_empty(), "{result}");
-    assert!(
-        started.elapsed() < Duration::from_secs(5),
-        "{:?}",
-        started.elapsed()
+    let ids: Vec<RequestId> = (0..3)
+        .map(|_| {
+            let params = lsp.at(&doc);
+            lsp.send_request("textDocument/completion", params)
+        })
+        .collect();
+    let mut arrived = Vec::new();
+    for id in &ids {
+        let resp = lsp.wait_response(id);
+        assert!(resp.response_result.is_ok(), "{resp:?}");
+        arrived.push(started.elapsed());
+    }
+    for (i, at) in arrived.iter().enumerate() {
+        let waits = u32::try_from(i + 1).expect("small");
+        assert!(*at >= WAIT * waits, "answer {i} at {at:?}: {arrived:?}");
+    }
+}
+
+/// A hung listing at `:` still offers the names the open document declares:
+/// heph knows them without the engine.
+#[test]
+fn a_hung_listing_at_colon_still_offers_the_documents_own_names() {
+    let mut lsp = Lsp::with_hanging_listing(Duration::from_millis(200));
+    let doc = lsp.open(
+        "lib/BUILD",
+        "target(name = \"util\", driver = \"exec\", cmd = \"true\")\ntarget(name = \"y\", deps = [\":│\"])\n",
     );
+    let result = lsp.completion(&doc);
+    assert!(has(&result, ":util") && has(&result, ":y"), "{result}");
+    let doc = lsp.open(
+        "lib/BUILD",
+        "target(name = \"util\", driver = \"exec\", cmd = \"true\")\ntarget(name = \"y\", deps = [\":u│\"])\n",
+    );
+    assert_eq!(labels(&lsp.completion(&doc)), vec![":util"], "filtered");
 }
 
 #[test]

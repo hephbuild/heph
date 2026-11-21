@@ -710,10 +710,14 @@ impl Server<'_> {
                 match answer {
                     Some(Ok(items)) => items,
                     // The listing timed out or failed: stock, under that
-                    // reason, as while the providers load.
-                    Some(Err(reason)) => {
+                    // reason, as while the providers load, after what heph
+                    // still knows without it (the document's own names at
+                    // `:name`).
+                    Some(Err(handlers::Fallback { reason, mut items })) => {
+                        self.log_listing_fallback(&reason);
                         located.resolution = Resolution::none(reason);
-                        self.stock_completion(params, &located)
+                        items.extend(self.stock_completion(params, &located));
+                        items
                     }
                     None => Vec::new(),
                 }
@@ -721,6 +725,36 @@ impl Server<'_> {
         };
         self.log("completion", &located, items.len(), started);
         serde_json::to_value(items).unwrap_or_else(|_| serde_json::json!([]))
+    }
+
+    /// Tell the editor's log (`window/logMessage`, which editors keep in the
+    /// server's output panel, not a popup) why a completion answered without
+    /// its listing: the popup itself gives the user no sign of it.
+    fn log_listing_fallback(&self, reason: &site::Reason) {
+        const EXPLAIN: &str =
+            "`heph tool build-lsp --explain FILE:LINE:COL` runs the listing and shows why";
+        let message = match reason {
+            site::Reason::ListingTimedOut { waited_ms } => format!(
+                "heph: the completion's listing did not answer within {waited_ms}ms, so it \
+                 answered without it; {EXPLAIN}"
+            ),
+            site::Reason::ListingFailed { message } => format!(
+                "heph: the completion's listing failed, so it answered without it: \
+                 {message}; {EXPLAIN}"
+            ),
+            _ => return,
+        };
+        // The client hung up: the loop sees the closed channel next.
+        let _sent = self
+            .connection
+            .sender
+            .send(Message::Notification(Notification::new(
+                "window/logMessage".to_string(),
+                lsp_types::LogMessageParams {
+                    typ: lsp_types::MessageType::WARNING,
+                    message,
+                },
+            )));
     }
 
     fn stock_completion(

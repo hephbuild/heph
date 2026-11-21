@@ -184,11 +184,21 @@ fn item_kind(site: &Site) -> CompletionItemKind {
     }
 }
 
+/// Heph could not answer a site in full: its listing timed out or failed.
+#[derive(Debug)]
+pub(crate) struct Fallback {
+    /// Why; the caller answers stock under it, as while the providers load.
+    pub reason: Reason,
+    /// What heph still offers without the listing, conventions applied, to
+    /// put before the stock items: at `:name`, the names the open document
+    /// declares.
+    pub items: Vec<CompletionItem>,
+}
+
 /// The heph completion items for a site, conventions applied. `Err` when
-/// heph cannot answer after all (the site's listing timed out or failed):
-/// the caller answers stock, under that reason, as it does while the
-/// providers load.
-pub(crate) fn items(site: &Site, ctx: &Ctx<'_>) -> Result<Vec<CompletionItem>, Reason> {
+/// heph cannot answer in full after all (the site's listing timed out or
+/// failed).
+pub(crate) fn items(site: &Site, ctx: &Ctx<'_>) -> Result<Vec<CompletionItem>, Fallback> {
     let (candidates, edit, value): (Vec<Candidate>, Bytes<usize>, Option<&Str>) = match site {
         // Not a replace site: its items come from `prepend` / `field_value`,
         // which also see the stock ones.
@@ -242,9 +252,15 @@ pub(crate) fn items(site: &Site, ctx: &Ctx<'_>) -> Result<Vec<CompletionItem>, R
         ),
         Site::PluginNamespace { edit, .. } => (namespaces(ctx), edit.clone(), None),
         Site::PluginMember { plugin, edit, .. } => (members(plugin, ctx), edit.clone(), None),
-        Site::Address { value } | Site::LoadPath { value } => {
-            (listed(site, ctx)?, value.edit.clone(), Some(value))
-        }
+        Site::Address { value } | Site::LoadPath { value } => match listed(site, ctx) {
+            Ok(candidates) => (candidates, value.edit.clone(), Some(value)),
+            Err((reason, candidates)) => {
+                return Err(Fallback {
+                    reason,
+                    items: render(site, candidates, value.edit.clone(), Some(value), ctx),
+                });
+            }
+        },
         Site::LoadSymbol { path, value } => {
             (load_symbols(path, ctx), value.edit.clone(), Some(value))
         }
@@ -764,8 +780,10 @@ fn names_in(text: &str, tokens: &Tokens) -> Vec<String> {
 /// the names the open document declares, `load("//…` → package paths.
 ///
 /// A typed path that would leave the workspace lists nothing (and says so
-/// at `debug`); a listing that timed out or failed is the caller's `Err`.
-fn listed(site: &Site, ctx: &Ctx<'_>) -> Result<Vec<Candidate>, Reason> {
+/// at `debug`); a listing that timed out or failed is the caller's `Err`,
+/// carrying what heph still knows without it: at `:…`, the names the open
+/// document declares.
+fn listed(site: &Site, ctx: &Ctx<'_>) -> Result<Vec<Candidate>, (Reason, Vec<Candidate>)> {
     let query = match listing_query(site, || ctx.package()) {
         None => return Ok(Vec::new()),
         Some(Err(refused)) => {
@@ -778,18 +796,21 @@ fn listed(site: &Site, ctx: &Ctx<'_>) -> Result<Vec<Candidate>, Reason> {
         }
         Some(Ok(query)) => query,
     };
-    let listed = ctx
-        .listing
-        .listing(query.listing.clone())
-        .map_err(|e| match e {
-            ListingError::TimedOut(waited) => Reason::ListingTimedOut {
+    let (mut names, failed): (Vec<String>, _) = match ctx.listing.listing(query.listing.clone()) {
+        Ok(listed) => (listed.entries.into_iter().map(|e| e.name).collect(), None),
+        Err(ListingError::TimedOut(waited)) => (
+            Vec::new(),
+            Some(Reason::ListingTimedOut {
                 waited_ms: u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
-            },
-            ListingError::Failed(e) => Reason::ListingFailed {
+            }),
+        ),
+        Err(ListingError::Failed(e)) => (
+            Vec::new(),
+            Some(Reason::ListingFailed {
                 message: format!("{e:#}"),
-            },
-        })?;
-    let mut names: Vec<String> = listed.entries.into_iter().map(|e| e.name).collect();
+            }),
+        ),
+    };
     if query.relative {
         names.extend(names_in(ctx.text, ctx.tokens));
         names.sort_unstable();
@@ -821,11 +842,15 @@ fn listed(site: &Site, ctx: &Ctx<'_>) -> Result<Vec<Candidate>, Reason> {
             label: format!("//{n}"),
         },
     };
-    Ok(names
+    let candidates = names
         .into_iter()
         .filter(|n| query.drops(n).is_none())
         .map(candidate)
-        .collect())
+        .collect();
+    match failed {
+        None => Ok(candidates),
+        Some(reason) => Err((reason, candidates)),
+    }
 }
 
 /// The engine listing a completion at an `address` or `load_path` site runs,
