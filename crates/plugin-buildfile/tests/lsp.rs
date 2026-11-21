@@ -62,6 +62,8 @@ struct FakeEngine {
     root: PathBuf,
     registry: Arc<FunctionRegistry>,
     gate: Option<Arc<Gate>>,
+    /// `list` never answers, as a provider that hangs.
+    list_hangs: bool,
 }
 
 impl FakeEngine {
@@ -205,6 +207,9 @@ impl LspEngine for FakeEngine {
         self: Arc<Self>,
         what: hplugin::lsp::Listing,
     ) -> futures::future::BoxFuture<'static, anyhow::Result<hplugin::lsp::Listed>> {
+        if self.list_hangs {
+            return Box::pin(futures::future::pending());
+        }
         plugin_buildfile::pluginbuildfile::lsp_list_with_fresh_buildfile_provider(
             self.root.clone(),
             Arc::clone(&self.registry),
@@ -339,7 +344,23 @@ impl Lsp {
         Lsp::with(
             None,
             plugin_buildfile::pluginbuildfile::LspRunOptions::default(),
+            false,
         )
+    }
+
+    /// A server whose engine listing never answers, and whose completions
+    /// wait `wait` for it.
+    fn with_hanging_listing(wait: Duration) -> Lsp {
+        let mut lsp = Lsp::with(
+            None,
+            plugin_buildfile::pluginbuildfile::LspRunOptions {
+                listing_wait: wait,
+                ..Default::default()
+            },
+            true,
+        );
+        lsp.initialize();
+        lsp
     }
 
     /// A server whose registry snapshot waits on the returned gate, and whose
@@ -350,7 +371,9 @@ impl Lsp {
             Some(Arc::clone(&gate)),
             plugin_buildfile::pluginbuildfile::LspRunOptions {
                 registry_wait: Duration::ZERO,
+                ..Default::default()
             },
+            false,
         );
         (lsp, gate)
     }
@@ -358,6 +381,7 @@ impl Lsp {
     fn with(
         gate: Option<Arc<Gate>>,
         options: plugin_buildfile::pluginbuildfile::LspRunOptions,
+        list_hangs: bool,
     ) -> Lsp {
         let dir = tempfile::tempdir().expect("tempdir");
         // Canonical, so macOS `/var` vs `/private/var` never splits a path.
@@ -371,6 +395,7 @@ impl Lsp {
             root,
             registry: registry(),
             gate: gate.clone(),
+            list_hangs,
         });
         let (client, server_end) = Connection::memory();
         let handle = rt.handle().clone();
@@ -1137,6 +1162,22 @@ fn completion_and_hover_on_plugin_function() {
     assert!(hover_text(&hover).contains("Join two path segments."));
 }
 
+/// A listing that never answers costs a completion the listing wait: the
+/// editor gets the stock answer (empty inside a string) and is not held.
+#[test]
+fn a_hung_listing_answers_stock_after_the_wait() {
+    let mut lsp = Lsp::with_hanging_listing(Duration::from_millis(200));
+    let doc = lsp.open("BUILD", "target(name = \"x\", deps = [\"//l│\"])\n");
+    let started = std::time::Instant::now();
+    let result = lsp.completion(&doc);
+    assert!(heph_items(&result).is_empty(), "{result}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
 #[test]
 fn completion_and_definition_on_colon_and_slash_addresses() {
     let mut lsp = Lsp::workspace();
@@ -1817,6 +1858,35 @@ fn empty_results_carry_a_reason() {
         std::thread::sleep(Duration::from_millis(5));
     }
     assert!(has(&lsp.completion(&doc), "driver"));
+}
+
+/// An address, a load path and a load symbol read the engine's listing and
+/// the files, never the driver/provider registry, so they answer while its
+/// snapshot is still loading.
+#[test]
+fn addresses_and_loads_complete_while_providers_load() {
+    let (mut lsp, _gate) = Lsp::new_gated();
+    lsp.initialize();
+    lsp.write(
+        "lib/BUILD",
+        "target(name = \"util\", driver = \"exec\", cmd = \"true\")\n",
+    );
+    lsp.write("x/y.star", "def foo():\n    pass\n");
+
+    // The registry is held: a registry site is still `providers_loading`.
+    let doc = lsp.open("BUILD", "target(│)\n");
+    assert_eq!(
+        reason(&lsp.explain(&doc)).as_deref(),
+        Some("providers_loading")
+    );
+
+    let doc = lsp.open("a/BUILD", "target(name = \"x\", deps = [\"//lib:│\"])\n");
+    assert_eq!(reason(&lsp.explain(&doc)), None);
+    assert_eq!(labels(&lsp.completion(&doc)), vec!["//lib:util"]);
+    let doc = lsp.open("b/BUILD", "target(name = \"x\", deps = [\"//l│\"])\n");
+    assert_eq!(labels(&lsp.completion(&doc)), vec!["//lib"]);
+    let doc = lsp.open("c/BUILD", "load(\"//x:y.star\", \"f│\")\n");
+    assert_eq!(labels(&lsp.completion(&doc)), vec!["foo"]);
 }
 
 #[test]
