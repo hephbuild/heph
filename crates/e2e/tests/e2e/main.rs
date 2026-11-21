@@ -43,6 +43,7 @@ mod go_format_glob;
 mod group;
 mod group_relocate;
 mod home_dir;
+mod host_paths;
 mod http_fetch;
 mod inspect_failure;
 mod label_select;
