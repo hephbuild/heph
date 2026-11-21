@@ -12560,6 +12560,469 @@ mod tests {
         Ok((Arc::new(engine), dir, addr))
     }
 
+    // ----------------------------------------------------------------------
+    // Declared host paths: the write check (I6, I8) and the stale miss (I4, I5).
+    // ----------------------------------------------------------------------
+
+    /// Raw driver whose run declares `paths` as host paths. They are kept raw
+    /// and turned into `HostPath`s inside `run`, so a path of the wrong shape
+    /// fails the run the way it fails a real driver's.
+    struct HostPathDriver {
+        exec_count: SArc<AtomicUsize>,
+        paths: Vec<std::path::PathBuf>,
+        cache: CacheConfig,
+        /// Each run's output is `out-<n>`, `n` the run's index, instead of a
+        /// constant: a re-run's `hashout` differs from the entry it replaces.
+        vary_hashout: bool,
+        /// `run` creates every declared path before declaring it, the way a
+        /// rebuild brings a collected store path back.
+        create: bool,
+    }
+
+    impl HostPathDriver {
+        fn new(exec_count: SArc<AtomicUsize>, paths: Vec<std::path::PathBuf>) -> Self {
+            Self {
+                exec_count,
+                paths,
+                cache: CacheConfig::on(false),
+                vary_hashout: false,
+                create: false,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl RawDriver for HostPathDriver {
+        fn config(&self, _req: DriverConfigRequest) -> anyhow::Result<DriverConfigResponse> {
+            Ok(DriverConfigResponse {
+                name: "hostpaths".to_string(),
+            })
+        }
+        fn schema(&self) -> crate::engine::driver::DriverSchema {
+            crate::engine::driver::DriverSchema::default()
+        }
+        async fn parse(
+            &self,
+            req: ParseRequest,
+            _ctoken: &(dyn Cancellable + Send + Sync),
+        ) -> anyhow::Result<ParseResponse> {
+            Ok(ParseResponse {
+                target_def: TargetDef {
+                    addr: req.target_spec.addr.clone(),
+                    outputs: vec![Output {
+                        group: "main".to_string(),
+                        paths: vec![],
+                    }],
+                    cache: self.cache,
+                    hash: vec![1, 2, 3, 4],
+                    ..Default::default()
+                },
+            })
+        }
+        async fn apply_transitive(
+            &self,
+            req: ApplyTransitiveRequest,
+            _ctoken: &(dyn Cancellable + Send + Sync),
+        ) -> anyhow::Result<ApplyTransitiveResponse> {
+            Ok(ApplyTransitiveResponse {
+                target_def: req.target_def,
+            })
+        }
+        async fn run<'a, 'io>(
+            &self,
+            _req: RunRequest<'a, 'io>,
+            _ctoken: &(dyn Cancellable + Send + Sync),
+        ) -> anyhow::Result<RunResponse> {
+            let n = self.exec_count.fetch_add(1, Ordering::SeqCst);
+            if self.create {
+                for p in &self.paths {
+                    std::fs::write(p, b"").with_context(|| format!("creating {}", p.display()))?;
+                }
+            }
+            let host_paths = self
+                .paths
+                .iter()
+                .map(|p| hplugin::driver::HostPath::from_path(p))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let hashout = if self.vary_hashout {
+                format!("out-{n}")
+            } else {
+                "feedface".to_string()
+            };
+            Ok(RunResponse {
+                host_paths,
+                artifacts: vec![outputartifact::OutputArtifact {
+                    group: "main".to_string(),
+                    name: "out".to_string(),
+                    r#type: outputartifact::Type::Output,
+                    content: outputartifact::Content::Raw(outputartifact::ContentRaw {
+                        data: hashout.as_bytes().to_vec(),
+                        path: "out".to_string(),
+                        x: false,
+                    }),
+                    hashout,
+                }],
+                ..Default::default()
+            })
+        }
+        async fn run_shell<'a, 'io>(
+            &self,
+            _req: RunRequest<'a, 'io>,
+            _ctoken: &(dyn Cancellable + Send + Sync),
+        ) -> anyhow::Result<RunResponse> {
+            anyhow::bail!("run_shell not supported by HostPathDriver")
+        }
+    }
+
+    /// Engine whose single target `//pkg:a` is driven by `driver`, over a
+    /// sqlite-direct cache so a test reads back exactly what was written.
+    fn host_path_engine(
+        driver: HostPathDriver,
+    ) -> anyhow::Result<(Arc<Engine>, tempfile::TempDir, Addr)> {
+        let dir = tempdir()?;
+        let mut engine = Engine::new(Config {
+            parallelism: None,
+            mem_cache: crate::engine::MemCacheOptions {
+                capacity_bytes: 0,
+                ..Default::default()
+            },
+            ..Config::for_tests(dir.path())
+        })?;
+        engine.register_driver(move |_| Box::new(driver))?;
+        let addr = Addr::new(PkgBuf::from("pkg"), "a".to_string(), Default::default());
+        let spec = TargetSpec {
+            addr: addr.clone(),
+            driver: "hostpaths".to_string(),
+            ..Default::default()
+        };
+        engine.register_provider(move |_| Box::new(OneTargetProvider { spec }))?;
+        Ok((Arc::new(engine), dir, addr))
+    }
+
+    /// One request for `addr`, its result dropped at once.
+    async fn run_host_path_target(
+        engine: &Arc<Engine>,
+        rs: Arc<RequestState>,
+        addr: &Addr,
+    ) -> anyhow::Result<()> {
+        engine
+            .clone()
+            .result_addr(rs, addr, OutputMatcher::All, &ResultOptions::default())
+            .await
+            .map(drop)
+    }
+
+    /// Every manifest the cache holds for `addr`.
+    fn manifests_of(engine: &Engine, addr: &Addr) -> anyhow::Result<Vec<Manifest>> {
+        let mut out = Vec::new();
+        for hashin in engine.local_cache.list_target_entries(addr)? {
+            if let Some(m) = Engine::read_manifest_from(&engine.local_cache, addr, &hashin)? {
+                out.push(m);
+            }
+        }
+        Ok(out)
+    }
+
+    fn path_str(p: &std::path::Path) -> String {
+        p.to_str().expect("utf-8 tempdir").to_owned()
+    }
+
+    /// I8's adversarial table, and I6: every refused list fails the run and
+    /// leaves no manifest; every accepted one is stored deduplicated, sorted
+    /// and normalized.
+    #[tokio::test]
+    async fn host_paths_refused() -> anyhow::Result<()> {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::path::PathBuf;
+
+        let dir = tempdir()?;
+        let existing = |name: &str| -> anyhow::Result<PathBuf> {
+            let p = dir.path().join(name);
+            std::fs::write(&p, b"")?;
+            Ok(p)
+        };
+        let many = |k: usize| -> anyhow::Result<Vec<PathBuf>> {
+            (0..k).map(|i| existing(&format!("p{i}"))).collect()
+        };
+        let f = existing("f")?;
+        let root = path_str(dir.path());
+
+        // (case, paths, remote on, what the error says)
+        let refused: Vec<(&str, Vec<PathBuf>, bool, String)> = vec![
+            (
+                "relative",
+                vec![PathBuf::from("nix/store/x")],
+                false,
+                "is not absolute".into(),
+            ),
+            (
+                "dot-dot",
+                vec![PathBuf::from(format!("{root}/x/../f"))],
+                false,
+                "is not normalized".into(),
+            ),
+            ("empty", vec![PathBuf::new()], false, "is empty".into()),
+            (
+                "NUL byte",
+                vec![PathBuf::from(format!("{root}/f\0g"))],
+                false,
+                "contains a NUL byte".into(),
+            ),
+            (
+                "non-UTF-8",
+                vec![PathBuf::from(std::ffi::OsStr::from_bytes(
+                    &[root.as_bytes(), b"/\xff"].concat(),
+                ))],
+                false,
+                "is not UTF-8".into(),
+            ),
+            (
+                "missing at write",
+                vec![f.clone(), dir.path().join("missing")],
+                false,
+                format!(
+                    "declares host path {}, which does not exist",
+                    path_str(&dir.path().join("missing"))
+                ),
+            ),
+            (
+                "65 paths",
+                many(65)?,
+                false,
+                "65 host paths declared, at most 64".into(),
+            ),
+            (
+                "remote on",
+                vec![f.clone()],
+                true,
+                format!(
+                    "declares host paths ({}) with `cache.remote` on",
+                    path_str(&f)
+                ),
+            ),
+        ];
+        for (case, paths, remote, says) in refused {
+            let count = SArc::new(AtomicUsize::new(0));
+            let mut driver = HostPathDriver::new(count.clone(), paths);
+            driver.cache = CacheConfig::on(remote);
+            let (engine, _home, addr) = host_path_engine(driver)?;
+            let err = run_host_path_target(&engine, engine.new_state(), &addr)
+                .await
+                .expect_err(case);
+            let msg = format!("{err:#}");
+            assert!(msg.contains(&addr.format()), "{case}: {msg}");
+            assert!(msg.contains(&says), "{case}: expected {says:?} in {msg}");
+            assert_eq!(count.load(Ordering::SeqCst), 1, "{case}: ran once");
+            assert!(
+                engine.local_cache.list_target_entries(&addr)?.is_empty(),
+                "{case}: a refused list leaves no entry"
+            );
+        }
+
+        let sixty_four = many(64)?;
+        let mut sixty_four_strs: Vec<String> = sixty_four.iter().map(|p| path_str(p)).collect();
+        sixty_four_strs.sort();
+        let mut with_dup = sixty_four.clone();
+        with_dup.push(sixty_four[0].clone());
+
+        // (case, paths, the list the manifest stores)
+        let accepted: Vec<(&str, Vec<PathBuf>, Vec<String>)> = vec![
+            (
+                "trailing slash",
+                vec![PathBuf::from(format!("{}/", path_str(&f)))],
+                vec![path_str(&f)],
+            ),
+            ("exactly 64", sixty_four, sixty_four_strs.clone()),
+            ("65 with one duplicate", with_dup, sixty_four_strs),
+            (
+                "the same path twice",
+                vec![f.clone(), f.clone()],
+                vec![path_str(&f)],
+            ),
+        ];
+        for (case, paths, stored) in accepted {
+            let count = SArc::new(AtomicUsize::new(0));
+            let (engine, _home, addr) =
+                host_path_engine(HostPathDriver::new(count.clone(), paths))?;
+            run_host_path_target(&engine, engine.new_state(), &addr)
+                .await
+                .with_context(|| case.to_string())?;
+            let manifests = manifests_of(&engine, &addr)?;
+            assert_eq!(manifests.len(), 1, "{case}: one entry");
+            assert_eq!(manifests[0].host_paths, stored, "{case}");
+            // And the entry is live: a second request hits.
+            run_host_path_target(&engine, engine.new_state(), &addr).await?;
+            assert_eq!(
+                count.load(Ordering::SeqCst),
+                1,
+                "{case}: the second run hit"
+            );
+        }
+        Ok(())
+    }
+
+    /// I4: a declared path the engine cannot stat (`EACCES`, here a parent
+    /// directory with no permissions) fails the target on a warm run rather
+    /// than calling the entry stale and rebuilding it on every run.
+    #[tokio::test]
+    async fn host_path_stat_error_fails() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // SAFETY: `geteuid` takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping host_path_stat_error_fails: root ignores permissions");
+            return Ok(());
+        }
+
+        /// Gives the locked directory its permissions back before the
+        /// `TempDir` holding it is removed, even when an assertion fails.
+        struct Unlock(std::path::PathBuf);
+        impl Drop for Unlock {
+            fn drop(&mut self) {
+                drop(std::fs::set_permissions(
+                    &self.0,
+                    std::fs::Permissions::from_mode(0o755),
+                ));
+            }
+        }
+
+        let dir = tempdir()?;
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked)?;
+        let path = locked.join("x");
+        std::fs::write(&path, b"")?;
+
+        let count = SArc::new(AtomicUsize::new(0));
+        let (engine, _home, addr) =
+            host_path_engine(HostPathDriver::new(count.clone(), vec![path.clone()]))?;
+        run_host_path_target(&engine, engine.new_state(), &addr).await?;
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))?;
+        let _unlock = Unlock(locked.clone());
+        let err = run_host_path_target(&engine, engine.new_state(), &addr)
+            .await
+            .expect_err("a stat error fails the target");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&format!("checking host path {}", path_str(&path))),
+            "{msg}"
+        );
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "a stat error is not a stale miss: nothing re-runs"
+        );
+        Ok(())
+    }
+
+    /// Run `fut` with a thread-local subscriber at `info` capturing into the
+    /// returned string. A `#[tokio::test]` runtime is current-thread, so every
+    /// engine task is polled, and logs, on this thread.
+    async fn capture_info_logs<F: std::future::Future>(fut: F) -> (F::Output, String) {
+        use tracing_subscriber::util::SubscriberInitExt as _;
+
+        #[derive(Clone, Default)]
+        struct Captured(SArc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .map_err(|e| std::io::Error::other(e.to_string()))?
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let log = Captured::default();
+        let writer = log.clone();
+        let out = {
+            // A second live dispatcher keeps tracing from caching a callsite's
+            // interest from whichever dispatcher saw it first, as in
+            // `crates/e2e`'s `capture_logs`.
+            let _second = tracing_subscriber::registry().set_default();
+            let _guard = tracing_subscriber::fmt()
+                .with_writer(move || writer.clone())
+                .with_ansi(false)
+                .with_max_level(tracing_subscriber::filter::LevelFilter::INFO)
+                .set_default();
+            fut.await
+        };
+        let text = String::from_utf8_lossy(&log.0.lock().expect("log buffer")).into_owned();
+        (out, text)
+    }
+
+    /// I5, Decision 12: a stale entry is a miss with its reason, its re-run
+    /// overwrites it, and a re-run whose `hashout` differs from the entry it
+    /// replaced logs at `info` and emits `StaleOutputChanged`. One whose
+    /// `hashout` is unchanged does neither.
+    #[tokio::test]
+    async fn rerun_hashout_change_logs_info() -> anyhow::Result<()> {
+        const CHANGED: &str = "rebuilt a stale cache entry and its output changed";
+        for vary_hashout in [true, false] {
+            let store = tempdir()?;
+            let path = store.path().join("x");
+            let count = SArc::new(AtomicUsize::new(0));
+            let mut driver = HostPathDriver::new(count.clone(), vec![path.clone()]);
+            driver.vary_hashout = vary_hashout;
+            driver.create = true;
+            let (engine, _home, addr) = host_path_engine(driver)?;
+
+            run_host_path_target(&engine, engine.new_state(), &addr).await?;
+            std::fs::remove_file(&path)?;
+
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let rs = engine.new_state_with_events(true, Some(tx));
+            let (res, log) =
+                capture_info_logs(run_host_path_target(&engine, rs.clone(), &addr)).await;
+            res?;
+            drop(rs);
+            let mut events = Vec::new();
+            while let Ok(ev) = rx.try_recv() {
+                events.push(ev.kind);
+            }
+
+            assert_eq!(count.load(Ordering::SeqCst), 2, "the stale entry re-ran");
+            let outcomes: Vec<_> = events
+                .iter()
+                .filter_map(|e| match e {
+                    BuildEventKind::CacheOutcome {
+                        outcome, reason, ..
+                    } => Some((*outcome, reason.clone())),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                outcomes,
+                vec![(
+                    hcore::events::CacheOutcomeKind::Miss,
+                    Some(crate::engine::host_paths::stale_reason(&path_str(&path)))
+                )],
+                "{events:?}"
+            );
+            let changed = events.iter().filter(|e| {
+                matches!(e, BuildEventKind::StaleOutputChanged { addr: a } if *a == addr.format())
+            });
+            assert_eq!(
+                changed.count(),
+                usize::from(vary_hashout),
+                "vary_hashout={vary_hashout}: {events:?}"
+            );
+            assert_eq!(
+                log.contains(CHANGED),
+                vary_hashout,
+                "vary_hashout={vary_hashout}: {log}"
+            );
+
+            // The re-run overwrote the entry, and its path exists again: a hit.
+            run_host_path_target(&engine, engine.new_state(), &addr).await?;
+            assert_eq!(count.load(Ordering::SeqCst), 2, "the rewritten entry hits");
+        }
+        Ok(())
+    }
+
     /// What the target of [`resolve_one_artifact_at_spill`] emits.
     enum SpillOutput {
         /// A container the content scan stores as is (a 2 MiB tar of gzip

@@ -114,3 +114,4 @@ humantime = "2.3.0"
 hplugin-buildfile = { package = "plugin-buildfile", path = "../plugin-buildfile" }
 serde-jsonlines = "0.7.0"
 tempfile = "3"
+tracing-subscriber = "0.3"
