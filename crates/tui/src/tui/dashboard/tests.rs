@@ -1111,6 +1111,97 @@ fn log_tab_says_a_driver_does_not_stream_its_log_until_the_run_ends() {
     assert!(!f.iter().any(|l| l.contains("does not stream")), "{f:#?}");
 }
 
+/// A failing `ResultEnd` no exit status explains: a `meta:`, a def that
+/// did not resolve, an output the run never wrote.
+fn failed_without_status(addr: &str, error: &str) -> BuildEventKind {
+    BuildEventKind::ResultEnd {
+        left_behind: None,
+        cancelled: false,
+        addr: addr.into(),
+        error: Some(error.into()),
+        upstream_of: None,
+        exit_status: None,
+        log_tail: None,
+        timed_out: None,
+    }
+}
+
+/// The Log tab shows a failure's whole error when no exit status explains
+/// it, wrapped rather than cut to the status line's reason, and says no log
+/// was kept rather than that the target has not run. It was told only by
+/// the end-of-run report. A failure its exit status explains shows its log
+/// alone: the log is the story.
+#[test]
+fn log_tab_shows_the_whole_error_of_a_failure_no_exit_status_explains() {
+    let wide = "#".repeat(300);
+    let error = format!("meta: get_def: //e:dep: {wide}\nthe second line");
+    let s = fold(&[
+        at(0, start("//e:early")),
+        at(10, failed_without_status("//e:early", &error)),
+        at(0, start("//e:ran")),
+        at(0, exec("//e:ran")),
+        at(
+            500,
+            end("//e:ran", Some("execute //e:ran: exit status: 101"), None),
+        ),
+    ]);
+    let reader = Arc::new(StubReader::default());
+    reader.set_log("//e:ran", b"compiling\nerror: mismatched types\n");
+    let r = Redact::default();
+
+    let mut t = open_on(&s, "//e:early", TargetTab::Log, Some(reader.clone()));
+    let f = target_frame_until(&s, &mut t, &r, |f| {
+        f.iter().any(|l| l.contains("log: none kept"))
+    });
+    // Wrapped whole under the status line, which cuts it: every `#` is on
+    // screen, then the second line.
+    let wide: usize = f
+        .iter()
+        .filter(|l| !l.starts_with(" ✗"))
+        .map(|l| l.matches('#').count())
+        .sum();
+    assert_eq!(wide, 300, "{f:#?}");
+    assert!(
+        f.iter().any(|l| l.contains("meta: get_def: //e:dep:")),
+        "{f:#?}"
+    );
+    assert!(f.iter().any(|l| l.contains("the second line")), "{f:#?}");
+    assert!(!f.iter().any(|l| l.contains("has not run")), "{f:#?}");
+
+    let mut t = open_on(&s, "//e:ran", TargetTab::Log, Some(reader));
+    let f = target_frame_until(&s, &mut t, &r, |f| {
+        f.iter().any(|l| l.contains("mismatched types"))
+    });
+    assert!(!f.iter().any(|l| l.contains("execute //e:ran")), "{f:#?}");
+}
+
+/// An error longer than half the Log tab's body is cut there, the last row
+/// saying how much was left out and where the rest is: the log keeps the
+/// other half.
+#[test]
+fn log_tab_cuts_a_long_error_to_half_the_body() {
+    let error = (0..100)
+        .map(|i| format!("cause {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let s = fold(&[
+        at(0, start("//e:long")),
+        at(10, failed_without_status("//e:long", &error)),
+    ]);
+    let r = Redact::default();
+    let mut t = open_on(&s, "//e:long", TargetTab::Log, None);
+    let f = target_frame(&s, &mut t, 1_000, &r);
+    let causes = f.iter().filter(|l| l.starts_with(" cause ")).count();
+    // 30 rows less the chrome's 6 is a 24-row body: 12 rows, the last the
+    // note.
+    assert_eq!(causes, 11, "{f:#?}");
+    assert!(
+        f.iter()
+            .any(|l| l.contains("… 89 more rows") && l.contains("end-of-run report")),
+        "{f:#?}"
+    );
+}
+
 #[test]
 fn frame_does_no_io_target_screens() {
     let s = fold(&[

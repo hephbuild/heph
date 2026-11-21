@@ -33,6 +33,7 @@ mod discovery;
 mod engine_core;
 mod engine_sanity;
 mod execrunner;
+mod failure_events;
 mod failure_out;
 mod failure_report;
 mod failure_slot;
