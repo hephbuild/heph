@@ -85,14 +85,22 @@ any BUILD target.
   run the one check, `hplugin::lsp::check_path`. A partial last segment
   only filters, so `//..` is a prefix of nothing, not a traversal.
 - **A bounded wait.** A completion waits `LISTING_WAIT` (2s) for its
-  listing. Past it, the listing is dropped (which ends its scope) and the
+  listing. Past it, the listing is dropped, and `Engine::list` cancels its
+  request when dropped before it answers: the package tasks it spawned stop
+  (`KeepGoing` treats a cancellation as fatal) and its scope ends. The
   completion answers stock with `reason: listing_timed_out` (`waited_ms`);
   a listing that returns an error answers stock with `reason:
-  listing_failed` (`message`). Both are logged at `warn`. Stock string
-  completion is empty: every string it would complete is an address or a
-  load path, so there is nothing to fall back to. At `:name` that means a
-  failed or timed-out listing also loses the names the open document
-  declares, which are only merged into a listing that came back.
+  listing_failed` (`message`). Stock string completion is empty: every
+  string it would complete is an address or a load path. So the editor
+  user sees an empty popup at `//…` and `load("//…`, and at `:name` only
+  the names the open document declares, which heph knows without the
+  listing. The server answers one request at a time, so each completion
+  against a hung listing costs one wait, and completions sent without
+  waiting are answered in order, one wait apart.
+- **A failed listing says so.** Either failure is logged at `warn`, and the
+  server sends the editor a `window/logMessage` warning (editors keep it in
+  the server's output panel, not a popup) naming the wait or the error and
+  pointing at `--explain`, which runs the same listing and shows why.
 - **No wait for the registry.** Address, load-path and load-symbol sites
   read the engine's listing and the files, never the driver/provider
   registry, so they answer before its snapshot lands; only the sites that
@@ -270,12 +278,12 @@ Line and column are 1-based, the column counted in characters.
 
 At an `address` or `load_path` site, `--explain` then runs the listing that
 site's completion runs, on the engine `heph` builds for the workspace (only
-there: classifying any other position needs no workspace), and prints after
+there: classifying any other position needs no workspace). The listing is
+the one the completion chooses (`handlers::listing_query`, shared by both),
+filtered by the same rule, so what `--explain` shows is what the completion
+offers. It waits up to 30s for the listing (`EXPLAIN_LISTING_WAIT`, far past
+the completion's 2s, so a slow listing is seen to finish), and prints after
 the classification:
-
-The listing is the one the completion chooses (`handlers::listing_query`,
-shared by both), filtered by the same rule, so what `--explain` shows is
-what the completion offers.
 
 - `listing`: what was listed (`packages under //foo`, `targets in //foo`) and
   the prefix a candidate must start with;
@@ -300,15 +308,24 @@ what the completion offers.
   `timed_out`. The set may grow; treat an unknown outcome as "not
   released". `--explain` waits 10s for the acks (past the engine's own 5s
   bound on one provider); a scope still held then prints `scope N still held
-  after 10s`.
+  after 10s`. `unsupported` covers two different providers, one that keeps
+  no cache and one built before scopes; telling them apart is a follow-up
+  that changes the plugin ABI (a new `ScopeEndedAck` variant, #602).
 
 `--json` puts the same under a `listing` key: `query` (`packages_under` or
 `targets_in`), `prefix`, `scope`, `listed`, `elapsed_ms`, `candidates`
 (`name`, `provider`), `dropped` (`name`, `provider`, `reason`: `prefix` or
 `root_package`), `skipped` (`stage`, `provider`, `count`, `examples` of
 `scope` and `cause`: the groups `heph query` reports for what it skipped),
-and `scope_ended` (`provider`, `outcome`; `null` when the scope was still
-held).
+and `scope_ended` (`provider`, `outcome`). On an unchanged workspace,
+`elapsed_ms` and `scope` are the only fields that change between runs, so
+two outputs diff to what moved.
+
+**`scope_ended: null` means the scope was still held** after the 10s wait:
+something kept the listing's request alive, and no provider has been told
+yet. It is not the same as `scope_ended: []`, which means the scope ended
+and no provider needed telling (the listing built no provider request, or
+the engine had gone).
 
 When no listing came back, the `listing` key holds `query` (`null` when the
 listing was never chosen) and `error` instead: `stage` says where it
@@ -318,7 +335,7 @@ stopped, `message` says why, and a refused path adds `reason`.
 |---|---|---|
 | `path` | the typed path would leave the workspace; no engine was built, no provider asked | `absolute`, `dot_segment`, `empty_segment`, `control_byte` |
 | `engine_build` | the workspace failed to load (a bad `.hephconfig`, a missing plugin) | — |
-| `list` | the engine's listing returned an error | — |
+| `list` | the engine's listing returned an error, or did not answer within 30s (`the listing did not answer within 30s`; it was cancelled) | — |
 
 The command still exits 0: `--explain` reports on a position, and a failed
 listing is part of the report.
