@@ -291,6 +291,14 @@ impl Engine {
         req: InvokeRequest,
     ) -> anyhow::Result<InvokeOutcome> {
         let addr = req.addr.clone();
+        // The entrypoint's own frame never reaches the terminal chokepoint in
+        // `inner_result_addr`: a `--shell=` naming it is answered by
+        // `req.shell`, the driver's `run_shell` on the handover's PTY. A
+        // `--shell=` naming one of its deps is entered at the chokepoint, as
+        // those deps build below.
+        if req.shell && rs.shell_target().is_some_and(|target| target.addr == addr) {
+            rs.mark_shell_entered();
+        }
         rs.track_dep(&addr).map_err(anyhow::Error::new)?;
         let rs = rs.with_parent(addr.clone());
 

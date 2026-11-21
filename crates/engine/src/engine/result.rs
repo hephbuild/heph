@@ -2047,6 +2047,38 @@ fn distinct_members(inputs: &[Input]) -> Vec<Addr> {
     out
 }
 
+/// The refusal for `--shell=ADDR` asked for when the client has no terminal.
+///
+/// The addressed form's terminal rides on the request rather than on `opts`
+/// (see `ShellTarget`), so both entry points check it alongside the bare form —
+/// and it must be a refusal, not a silent plain build, or `--shell=ADDR` would
+/// be discarded exactly the way this feature exists to stop.
+fn shell_target_without_terminal(rs: &RequestState) -> Option<ShellNeedsSingleTarget> {
+    rs.shell_target()
+        .filter(|target| target.terminal.is_none())
+        .map(|target| ShellNeedsSingleTarget::NotInteractive {
+            addr: target.addr.clone(),
+        })
+}
+
+/// Whether this frame actually receives the terminal. The one rule: the
+/// terminal chokepoint in `inner_result_addr` hands out `ExecuteOptions` from
+/// it, and `classify_failure` reads it to decide that a target's output already
+/// streamed and its captured log tail is redundant.
+///
+/// `opts.interactive` alone answers the wrong question once `--shell=ADDR` is
+/// in play: the terminal is then the request's, and only the named addr gets
+/// it. Believing `opts` in `classify_failure` says a silent target streamed,
+/// which drops the process-log tail of a failing one and renders an empty
+/// failure box — the regression #225 fixed for group members, re-entered
+/// through the other door.
+fn frame_gets_terminal(rs: &RequestState, addr: &Addr, opts: &ResultOptions) -> bool {
+    match rs.shell_target() {
+        Some(target) => target.addr == *addr,
+        None => opts.interactive.is_some(),
+    }
+}
+
 /// Single classifier chokepoint for any target error.
 ///
 /// Decides whether an error is this target's **own** failure (record it once in
@@ -2387,6 +2419,9 @@ impl Engine {
         if opts.shell && opts.interactive.is_none() {
             return Err(ShellNeedsSingleTarget::NotInteractive { addr: addr.clone() }.into());
         }
+        if let Some(refusal) = shell_target_without_terminal(&rs) {
+            return Err(refusal.into());
+        }
 
         // Stop the moment the request is cancelled (Ctrl-C). Every queued
         // target in a batch enters here; bailing before spec/def resolution
@@ -2447,13 +2482,27 @@ impl Engine {
             Ok(def) => def,
             Err(e) => {
                 let e = self
-                    .fail_unscoped(&rs, addr, opts.interactive.is_some(), e)
+                    .fail_unscoped(&rs, addr, frame_gets_terminal(&rs, addr, opts), e)
                     .await;
                 return Err(surface_top(is_top, &rs, e));
             }
         };
         if def.target_def.transparent {
             let mut opts = opts.clone();
+            // `--shell=<this group>`. A transparent target never executes, so it
+            // has no sandbox to enter — and unlike bare `--shell`, which reaches
+            // the member by simply riding the inlining, an address matches one
+            // addr and this is not one that can ever run. Refuse it here, where
+            // the members are in hand, rather than letting the run finish and
+            // report the addr as "not part of this run": naming them is what
+            // makes the message actionable.
+            if rs.shell_target().is_some_and(|target| target.addr == *addr) {
+                return Err(ShellNeedsSingleTarget::Group {
+                    addr: addr.clone(),
+                    members: distinct_members(&def.target_def.inputs),
+                }
+                .into());
+            }
             // Dependencies are never interactive. The terminal goes to the
             // single target the user named — never to something the engine
             // pulled in on its behalf.
@@ -2537,7 +2586,7 @@ impl Engine {
                     Ok(results) => results,
                     Err(e) => {
                         let e = self
-                            .fail_unscoped(&rs, addr, opts.interactive.is_some(), e)
+                            .fail_unscoped(&rs, addr, frame_gets_terminal(&rs, addr, &opts), e)
                             .await;
                         return Err(surface_top(is_top, &rs, e));
                     }
@@ -2573,8 +2622,8 @@ impl Engine {
         // cache (keyed by hashin, not is_top) so it costs a re-filter, not a
         // re-execute. Collapsing it is a separate simplification.
         let key = (AddrKey(addr.clone()), key_outputs, is_top);
+        let interactive = frame_gets_terminal(&rs, addr, opts);
         let opts = opts.clone();
-        let interactive = opts.interactive.is_some();
         // Filled only if this call creates the cell: the read the computation
         // ran under, passed beside the memoized value rather than inside it.
         let handoff = Handoff::default();
@@ -2734,13 +2783,24 @@ impl Engine {
         opts: &ResultOptions,
     ) -> anyhow::Result<BatchResult> {
         let mut opts = opts.clone();
+        // Refused once, before anything resolves, rather than once per matched
+        // target by `result_addr_impl`.
+        if let Some(refusal) = shell_target_without_terminal(&rs) {
+            return Err(refusal.into());
+        }
         // First leg of the one-target rule: a selection is many targets, so no
         // target gets the terminal (see the transparent-group gate in
-        // `result_addr_impl` for the full rationale). `--shell` has nothing to
-        // attach to once it is gone, so refuse it here — once, naming the
+        // `result_addr_impl` for the full rationale). Bare `--shell` has nothing
+        // to attach to once it is gone, so refuse it here — once, naming the
         // selection — rather than letting every matched target hit the
         // "non-interactive mode" guard below and tell a user sitting at a
         // terminal that they are not on one.
+        //
+        // `--shell=ADDR` is the answer to that refusal and is not caught by it:
+        // it names the one target that gets the terminal, so the selection is no
+        // longer ambiguous. Clearing `opts.interactive` is still right — the
+        // shell target's terminal rides on the request, and every *other*
+        // matched target must remain non-interactive.
         if !matches!(matcher, Matcher::Addr(_)) {
             if opts.shell && opts.interactive.is_some() {
                 return Err(ShellNeedsSingleTarget::Selection {
@@ -3200,6 +3260,42 @@ impl Engine {
                     }
                 }?;
 
+                // Who gets the terminal, and who is entered instead of run.
+                //
+                // The single chokepoint: this is the only `ExecuteOptions` built
+                // from a frame's options (`resolve_locked` only copies this
+                // one into its memoized cell). Whether this frame holds the
+                // terminal is `frame_gets_terminal`'s answer — the same call
+                // `classify_failure` reads — so the two cannot drift.
+                //
+                // Reading `--shell=ADDR` from the request rather than from `opts`
+                // is what lets it reach a target that is only a *dependency*, and
+                // what makes the answer independent of which frame won the
+                // addr-keyed `mem_locked_result` race (see `ShellTarget`). When
+                // one is named, no other addr may hold a terminal at all —
+                // that is the at-most-one-terminal invariant, restated for the
+                // form that names its target instead of inferring it.
+                let gets_terminal = frame_gets_terminal(&rs, addr, opts);
+                let (shell, interactive) = match rs.shell_target() {
+                    // The addressed form: the terminal is the request's, and the
+                    // frame that holds it is the one entered.
+                    Some(target) => {
+                        if gets_terminal {
+                            rs.mark_shell_entered();
+                        }
+                        (
+                            gets_terminal,
+                            target.terminal.clone().filter(|_| gets_terminal),
+                        )
+                    }
+                    // The bare form: the frame's own options, which only the
+                    // selected target's frame carries.
+                    None => (
+                        opts.shell,
+                        opts.interactive.clone().filter(|_| gets_terminal),
+                    ),
+                };
+
                 let result = self
                     .execute_and_cache(
                         rs.clone(),
@@ -3210,8 +3306,8 @@ impl Engine {
                             spec: &spec,
                             def: &def,
                             force,
-                            interactive: opts.interactive.clone(),
-                            shell: opts.shell,
+                            interactive,
+                            shell,
                             no_scratch,
                         },
                     )
@@ -6471,6 +6567,7 @@ mod tests {
         ConfigRequest, ConfigResponse, ListPackageResponse, ListPackagesRequest, ListResponse,
         ProbeRequest, ProbeResponse,
     };
+    use crate::engine::request_state::ShellTarget;
     use crate::engine::result_lock::{LockBackend, ResultLock};
     use futures::future::BoxFuture;
     use hcore::hasync::{Cancellable, StdCancellationToken};
@@ -15297,6 +15394,17 @@ mod tests {
                 req.target_spec.config.get("fail"),
                 Some(hcore::htvalue::Value::Bool(true))
             );
+            // `entrypoint = true`: invoked through `Engine::invoke`, not built.
+            let entrypoint = matches!(
+                req.target_spec.config.get("entrypoint"),
+                Some(hcore::htvalue::Value::Bool(true))
+            )
+            .then(|| {
+                crate::engine::driver::targetdef::Entrypoint::new(
+                    false,
+                    crate::engine::driver::targetdef::Workdir::Sandbox,
+                )
+            });
             Ok(ParseResponse {
                 target_def: TargetDef {
                     addr: req.target_spec.addr.clone(),
@@ -15321,6 +15429,7 @@ mod tests {
                     },
                     hash: req.target_spec.addr.format().into_bytes(),
                     transparent,
+                    entrypoint,
                     ..Default::default()
                 },
             })
@@ -15560,6 +15669,37 @@ mod tests {
                 ..Default::default()
             }
         }
+
+        /// `--shell=addr`, as the CLI builds it: the address to enter plus the
+        /// terminal it gets — the same probe wrapper `opts` hands out, so both
+        /// forms are counted the same way.
+        fn shell_target(&self, addr: &str) -> anyhow::Result<ShellTarget> {
+            Ok(ShellTarget {
+                addr: hmodel::htaddr::parse_addr(addr)?,
+                terminal: Some(probe_wrapper(SArc::clone(&self.probe))),
+            })
+        }
+
+        /// A request naming `--shell=addr`, built the way `heph run` builds
+        /// one: the shell target is fixed at construction.
+        fn state_with_shell(
+            &self,
+            addr: &str,
+            fail_fast: bool,
+        ) -> anyhow::Result<Arc<RequestState>> {
+            Ok(self.state_with(self.shell_target(addr)?, fail_fast))
+        }
+
+        fn state_with(&self, target: ShellTarget, fail_fast: bool) -> Arc<RequestState> {
+            self.engine.new_state_with_shell(
+                fail_fast,
+                None,
+                hcore::pending::Pending::new_counter(),
+                Engine::DEFAULT_LOG_TAIL_LINES,
+                None,
+                Some(target),
+            )
+        }
     }
 
     /// Reproduction for the shared-tty bug: a group with two uncached members
@@ -15659,7 +15799,12 @@ mod tests {
             "msg: {msg}"
         );
         assert!(msg.contains("members: //pkg:a, //pkg:b"), "msg: {msg}");
-        assert!(msg.contains("try: heph run --shell //pkg:a"), "msg: {msg}");
+        // The action must be the form that actually resolves the ambiguity being
+        // reported — the flag value, applied to the run the user asked for.
+        assert!(
+            msg.contains("try: heph run --shell=//pkg:a //pkg:g"),
+            "msg: {msg}"
+        );
         assert_eq!(
             h.probe.calls.load(Ordering::SeqCst),
             0,
@@ -15876,8 +16021,10 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("is a group with 0 members"), "msg: {msg}");
         assert!(msg.contains("the group is empty"), "msg: {msg}");
+        // No member to name, so the action is discovery — and, like every other
+        // `try:` line, runnable verbatim rather than a template.
         assert!(
-            msg.contains("try: heph run --shell"),
+            msg.contains("try: heph query //pkg"),
             "an actionable message must still name an action: {msg}",
         );
         Ok(())
@@ -16249,6 +16396,400 @@ mod tests {
                 .is_some_and(|e| e.contains("changed while it ran")),
             "the guard's own sentence"
         );
+        Ok(())
+    }
+
+    /// Bare `--shell` on a plain single target enters it. The baseline the
+    /// addressed form is measured against: no group, no selection, nothing to
+    /// disambiguate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bare_shell_on_a_single_target_enters_it() -> anyhow::Result<()> {
+        let h = terminal_harness(vec![leaf_spec("//pkg:a", false)?])?;
+        let rs = h.engine.new_state();
+        let addr = hmodel::htaddr::parse_addr("//pkg:a")?;
+
+        Arc::clone(&h.engine)
+            .result_addr(rs, &addr, OutputMatcher::All, &h.opts(true))
+            .await?;
+
+        assert_eq!(h.shell_runs.load(Ordering::SeqCst), 1, "the target shells");
+        assert_eq!(h.runs.load(Ordering::SeqCst), 0, "…instead of running");
+        Ok(())
+    }
+
+    /// `--shell=ADDR` is the answer to the multi-member group refusal: the group
+    /// still runs, and the named member is entered instead of run while its
+    /// sibling builds normally.
+    ///
+    /// The refusal's own message names this command, so if the value were
+    /// discarded the guidance would be a lie: the run would build both members
+    /// and hand nobody a terminal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shell_target_picks_which_group_member_is_entered() -> anyhow::Result<()> {
+        let h = terminal_harness(vec![
+            group_spec("//pkg:g", &["//pkg:a", "//pkg:b"])?,
+            leaf_spec("//pkg:a", false)?,
+            leaf_spec("//pkg:b", false)?,
+        ])?;
+        let rs = h.state_with_shell("//pkg:a", true)?;
+        let addr = hmodel::htaddr::parse_addr("//pkg:g")?;
+
+        Arc::clone(&h.engine)
+            .result_addr(rs.clone(), &addr, OutputMatcher::All, &h.opts(false))
+            .await?;
+
+        assert_eq!(
+            h.shell_runs.load(Ordering::SeqCst),
+            1,
+            "the named member is entered",
+        );
+        assert!(rs.shell_entered(), "…and the request records that it was");
+        assert_eq!(
+            h.runs.load(Ordering::SeqCst),
+            1,
+            "…and only the other member runs",
+        );
+        assert_eq!(
+            h.probe.calls.load(Ordering::SeqCst),
+            1,
+            "exactly one target may hold the terminal",
+        );
+        assert_eq!(h.probe.max_live.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    /// Same for a multi-target selection, which bare `--shell` refuses outright.
+    /// The named target is entered; every other matched target builds with no
+    /// terminal at all, so the one-live-wrapper invariant holds unchanged.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shell_target_picks_which_selected_target_is_entered() -> anyhow::Result<()> {
+        let h = terminal_harness(vec![
+            leaf_spec("//pkg:a", false)?,
+            leaf_spec("//pkg:b", false)?,
+        ])?;
+        let rs = h.state_with_shell("//pkg:b", true)?;
+        let matcher = Matcher::Package(PkgBuf::from("pkg"));
+
+        Arc::clone(&h.engine)
+            .result(rs.clone(), &matcher, OutputMatcher::All, &h.opts(false))
+            .await?;
+
+        assert_eq!(
+            h.shell_runs.load(Ordering::SeqCst),
+            1,
+            "the named target is entered",
+        );
+        assert!(rs.shell_entered(), "…and the request records that it was");
+        assert_eq!(
+            h.runs.load(Ordering::SeqCst),
+            1,
+            "…and the rest of the selection still builds",
+        );
+        assert_eq!(
+            h.probe.calls.load(Ordering::SeqCst),
+            1,
+            "a selection hands the terminal to the named target and nobody else",
+        );
+        Ok(())
+    }
+
+    /// The case `ResultOptions` structurally cannot reach: a target that is only
+    /// a *dependency* of the run. `meta` has no `opts` in scope and
+    /// `inputs_result_exec` re-fetches with `ResultOptions::default()`, so a
+    /// per-frame shell flag would be gone by the time the dep resolves — which
+    /// is why the shell target rides on the request instead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shell_target_reaches_a_dependency_of_the_run() -> anyhow::Result<()> {
+        let h = terminal_harness(vec![
+            leaf_with_deps_spec("//pkg:root", &["//pkg:a", "//pkg:b"])?,
+            leaf_spec("//pkg:a", false)?,
+            leaf_spec("//pkg:b", false)?,
+        ])?;
+        let rs = h.state_with_shell("//pkg:a", true)?;
+        let addr = hmodel::htaddr::parse_addr("//pkg:root")?;
+
+        Arc::clone(&h.engine)
+            .result_addr(rs.clone(), &addr, OutputMatcher::All, &h.opts(false))
+            .await?;
+
+        assert_eq!(
+            h.shell_runs.load(Ordering::SeqCst),
+            1,
+            "a dependency named with --shell= is entered",
+        );
+        assert!(rs.shell_entered(), "…and the request records that it was");
+        assert_eq!(
+            h.probe.calls.load(Ordering::SeqCst),
+            1,
+            "and it is the only holder of the terminal",
+        );
+        Ok(())
+    }
+
+    /// The same through `Engine::invoke`: `--shell=<dep of an entrypoint>`
+    /// enters the dep as the entrypoint's closure builds, and the entrypoint
+    /// then runs as asked. The request records the entry, so `heph run` has no
+    /// "not part of this run" to say about a target that plainly was.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shell_target_reaches_a_dependency_of_an_entrypoint() -> anyhow::Result<()> {
+        let mut tool = leaf_with_deps_spec("//pkg:tool", &["//pkg:lib"])?;
+        tool.config
+            .insert("entrypoint".to_string(), hcore::htvalue::Value::Bool(true));
+        let h = terminal_harness(vec![tool, leaf_spec("//pkg:lib", false)?])?;
+        let rs = h.state_with_shell("//pkg:lib", true)?;
+        let cwd = tempdir()?;
+        let req = crate::engine::invoke::InvokeRequest::new(
+            hmodel::htaddr::parse_addr("//pkg:tool")?,
+            cwd.path(),
+            Vec::new(),
+        );
+
+        let outcome = Arc::clone(&h.engine).invoke(rs.clone(), req).await?;
+
+        assert!(
+            matches!(
+                outcome,
+                crate::engine::invoke::InvokeOutcome::Exited(hcore::process::Exit::Code(0))
+            ),
+            "the entrypoint runs to completion: {outcome:?}",
+        );
+        assert_eq!(
+            h.shell_runs.load(Ordering::SeqCst),
+            1,
+            "the dependency named with --shell= is entered",
+        );
+        assert_eq!(
+            h.runs.load(Ordering::SeqCst),
+            1,
+            "…and the entrypoint runs instead of shelling",
+        );
+        assert!(rs.shell_entered(), "the request records the entry");
+        Ok(())
+    }
+
+    /// `--shell=ADDR` naming a group is refused where the members are in hand.
+    /// A transparent target never executes, so there is no sandbox to enter —
+    /// and the actionable answer is one of its members, which only this frame
+    /// knows.
+    #[tokio::test]
+    async fn shell_target_naming_a_group_names_its_members_instead() -> anyhow::Result<()> {
+        let h = terminal_harness(vec![
+            group_spec("//pkg:g", &["//pkg:a", "//pkg:b"])?,
+            leaf_spec("//pkg:a", false)?,
+            leaf_spec("//pkg:b", false)?,
+        ])?;
+        let rs = h.state_with_shell("//pkg:g", true)?;
+        let addr = hmodel::htaddr::parse_addr("//pkg:g")?;
+
+        let err = Arc::clone(&h.engine)
+            .result_addr(rs, &addr, OutputMatcher::All, &h.opts(false))
+            .await
+            .err()
+            .expect("--shell= naming a group must fail");
+        assert!(
+            downcast_chain_ref::<ShellNeedsSingleTarget>(&err).is_some(),
+            "err: {err:#}",
+        );
+        let msg = format!("{err:#}");
+        assert!(msg.contains("members: //pkg:a, //pkg:b"), "msg: {msg}");
+        assert!(
+            msg.contains("try: heph run --shell=//pkg:a //pkg:g"),
+            "msg: {msg}",
+        );
+        assert_eq!(
+            h.runs.load(Ordering::SeqCst),
+            0,
+            "nothing may run once --shell is refused",
+        );
+        Ok(())
+    }
+
+    /// An address that exists but that nothing in the run resolves is **not
+    /// fatal**: `--shell` is an interactive convenience, and a target that turns
+    /// out not to be in the run is no reason to throw away a build that did
+    /// exactly what was asked. What it may never be is *silent*: the request
+    /// reports that nothing was entered, and `heph run` warns on that
+    /// (`commands::run`'s tests own the warning itself).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shell_target_outside_the_run_is_not_entered_and_the_build_still_succeeds()
+    -> anyhow::Result<()> {
+        let h = terminal_harness(vec![
+            leaf_spec("//pkg:outside-a", false)?,
+            leaf_spec("//pkg:outside-b", false)?,
+        ])?;
+        let rs = h.state_with_shell("//pkg:outside-b", true)?;
+        let addr = hmodel::htaddr::parse_addr("//pkg:outside-a")?;
+
+        Arc::clone(&h.engine)
+            .result_addr(rs.clone(), &addr, OutputMatcher::All, &h.opts(false))
+            .await
+            .expect("a --shell target outside the run must not fail the build");
+
+        assert_eq!(h.runs.load(Ordering::SeqCst), 1, "the build still ran");
+        assert_eq!(
+            h.shell_runs.load(Ordering::SeqCst),
+            0,
+            "nothing was entered",
+        );
+        assert!(
+            !rs.shell_entered(),
+            "the request must say the --shell target was not entered",
+        );
+        Ok(())
+    }
+
+    /// …and the same on the batch path, where every matched target is `is_top`
+    /// and no single frame sees the whole run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shell_target_outside_a_selection_is_not_entered() -> anyhow::Result<()> {
+        let h = terminal_harness(vec![
+            leaf_spec("//pkg:sel-a", false)?,
+            leaf_spec("//pkg:sel-b", false)?,
+            leaf_spec("//other:sel-c", false)?,
+        ])?;
+        let rs = h.state_with_shell("//other:sel-c", true)?;
+        let matcher = Matcher::Package(PkgBuf::from("pkg"));
+
+        Arc::clone(&h.engine)
+            .result(rs.clone(), &matcher, OutputMatcher::All, &h.opts(false))
+            .await
+            .expect("a --shell target outside the selection must not fail the batch");
+
+        assert_eq!(
+            h.runs.load(Ordering::SeqCst),
+            2,
+            "the selection still built"
+        );
+        assert!(!rs.shell_entered(), "nothing in the selection entered it");
+        Ok(())
+    }
+
+    /// An address no target has does not fail the build either: the engine
+    /// neither refuses it nor enters anything. (`heph run` looks it up before
+    /// the run and warns; that lookup is not the engine's.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shell_target_that_does_not_exist_does_not_fail_the_build() -> anyhow::Result<()> {
+        let h = terminal_harness(vec![
+            leaf_spec("//pkg:typo-a", false)?,
+            leaf_spec("//pkg:typo-b", false)?,
+        ])?;
+        let rs = h.state_with_shell("//pkg:nosuchtarget", true)?;
+        let matcher = Matcher::Package(PkgBuf::from("pkg"));
+
+        Arc::clone(&h.engine)
+            .result(rs.clone(), &matcher, OutputMatcher::All, &h.opts(false))
+            .await
+            .expect("a mistyped --shell target must not fail the build");
+
+        assert_eq!(
+            h.runs.load(Ordering::SeqCst),
+            2,
+            "the build proceeds; a bail would have left this at 0",
+        );
+        assert!(!rs.shell_entered());
+        Ok(())
+    }
+
+    /// A `--shell=` refusal raised by one matched target must survive the batch.
+    ///
+    /// `fail_fast` is off by default, so that refusal lands in the batch's
+    /// `errors` rather than short-circuiting as `fatal` — and the shell target
+    /// (the group) is then never entered. It must still reach the caller as the
+    /// message that names the group's members and the exact command to run, so
+    /// that `heph run`, which warns about an unentered target only after a
+    /// successful run, sees a failed one here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_shell_refusal_survives_a_batch_that_did_not_fail_fast() -> anyhow::Result<()> {
+        let h = terminal_harness(vec![
+            group_spec("//pkg:g", &["//pkg:a", "//pkg:b"])?,
+            leaf_spec("//pkg:a", false)?,
+            leaf_spec("//pkg:b", false)?,
+        ])?;
+        let rs = h.state_with_shell("//pkg:g", false)?;
+        let matcher = Matcher::Package(PkgBuf::from("pkg"));
+
+        let batch = Arc::clone(&h.engine)
+            .result(rs, &matcher, OutputMatcher::All, &h.opts(false))
+            .await?;
+        let (_, err) = batch
+            .errors
+            .into_iter()
+            .next()
+            .expect("the group frame must report the --shell refusal");
+        assert!(
+            downcast_chain_ref::<ShellNeedsSingleTarget>(&err).is_some(),
+            "the actionable refusal must not be replaced: {err:#}",
+        );
+        assert!(
+            !format!("{err:#}").contains("was not part of it"),
+            "err: {err:#}",
+        );
+        Ok(())
+    }
+
+    /// The `Matcher::Addr` leg of `--shell=ADDR`: every target that is not the
+    /// shell target runs with no terminal, so a failing one must keep its
+    /// process-log tail.
+    ///
+    /// `classify_failure` drops the tail for interactive targets on the grounds
+    /// their output already streamed. Leaving the wrapper in `ResultOptions`
+    /// while the chokepoint withholds it from every non-shell frame told it the
+    /// opposite of the truth, and the failure box came out empty — the same
+    /// regression #225 fixed for group members.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_failing_sibling_of_the_shell_target_keeps_its_log_tail() -> anyhow::Result<()> {
+        // `root` fails; `lib` is the shell target, so `root` never streamed.
+        let mut root = leaf_with_deps_spec("//pkg:root", &["//pkg:lib"])?;
+        root.config
+            .insert("fail".to_string(), hcore::htvalue::Value::Bool(true));
+        let h = terminal_harness(vec![root, leaf_spec("//pkg:lib", false)?])?;
+        let rs = h.state_with_shell("//pkg:lib", true)?;
+        let addr = hmodel::htaddr::parse_addr("//pkg:root")?;
+        let failing = addr.clone();
+
+        Arc::clone(&h.engine)
+            .result_addr(rs.clone(), &addr, OutputMatcher::All, &h.opts(false))
+            .await
+            .err()
+            .expect("the failing root must fail the run");
+
+        let recorded = rs.get_failure(&failing).expect("failure must be recorded");
+        let tail = recorded
+            .log_tail
+            .as_ref()
+            .expect("a target that never streamed keeps its process log tail");
+        assert!(tail.text.contains("line12"), "tail: {}", tail.text);
+        Ok(())
+    }
+
+    /// `--shell=ADDR` with no terminal to hand over is refused, not quietly
+    /// downgraded to a plain build. The bare form has had this guard since it
+    /// existed; the addressed form carries its terminal on the request, so it
+    /// needs its own.
+    #[tokio::test]
+    async fn shell_target_without_a_terminal_is_refused() -> anyhow::Result<()> {
+        let h = terminal_harness(vec![leaf_spec("//pkg:a", false)?])?;
+        let rs = h.state_with(
+            ShellTarget {
+                addr: hmodel::htaddr::parse_addr("//pkg:a")?,
+                terminal: None,
+            },
+            true,
+        );
+        let addr = hmodel::htaddr::parse_addr("//pkg:a")?;
+
+        let err = Arc::clone(&h.engine)
+            .result_addr(rs, &addr, OutputMatcher::All, &ResultOptions::default())
+            .await
+            .err()
+            .expect("--shell= without a terminal must fail");
+        let typed = downcast_chain_ref::<ShellNeedsSingleTarget>(&err)
+            .expect("must be the typed shell error, not a bare anyhow string");
+        assert!(
+            matches!(typed, ShellNeedsSingleTarget::NotInteractive { addr } if addr.format() == "//pkg:a"),
+            "the error must carry the addr that was refused: {err:#}"
+        );
+        assert_eq!(h.runs.load(Ordering::SeqCst), 0, "nothing may run");
         Ok(())
     }
 

@@ -464,6 +464,20 @@ pub struct RequestStateData {
     /// request sees it, and a [`hash_only`](Self::hash_only) request — which is
     /// a separate `RequestStateData` — never does.
     selection: std::sync::OnceLock<Selection>,
+    /// `--shell=ADDR`: the one target of this request that is entered instead of
+    /// run, and the terminal handed to it. See [`ShellTarget`].
+    ///
+    /// Fixed when the request is constructed and never changed: "does this
+    /// frame shell?" must be a pure function of the addr for the request's whole
+    /// lifetime, so no frame can resolve before it is known.
+    shell: Option<ShellTarget>,
+    /// Whether a frame took the terminal for [`shell`]: the one fact the engine
+    /// records about it. What to tell the user when no frame did is the caller's
+    /// call — it owns the whole request, so it is the only one that knows when
+    /// the run is over.
+    ///
+    /// [`shell`]: RequestStateData::shell
+    shell_entered: std::sync::atomic::AtomicBool,
     /// Post-write `cache.history` trims held back until this request's cache
     /// read guards are gone.
     ///
@@ -644,6 +658,46 @@ impl Drop for DeferredTrims {
             }),
             Arc::clone(&self.bg_pending),
         );
+    }
+}
+
+/// The target `--shell=ADDR` named, and the terminal it gets.
+///
+/// Request-scoped rather than carried in `ResultOptions`, for two reasons that
+/// both reduce to "a `ResultOptions` does not reach every frame":
+///
+/// - It travels down the selection and group-inlining legs only. Dependency
+///   resolution deliberately resets it (`ResultOptions::default()`) and `meta`
+///   has no `opts` in scope at all, so an addr named with `--shell=` would be
+///   unreachable the moment it appeared as a dependency — and "the flag you
+///   passed did nothing" is the bug this feature exists to fix.
+/// - `mem_locked_result` is keyed by `Addr` alone. If "does this frame shell?"
+///   were a function of the *frame's* options, an addr reached both as a
+///   selected target and as some sibling's dependency would bake whichever of
+///   the two won that memoizer race. Read from the request it is a pure
+///   function of the addr, so every frame agrees.
+///
+/// The at-most-one-terminal invariant that `Engine::result` and the
+/// transparent-group gate enforce for bare `--shell` holds here by
+/// construction: exactly one address matches, and every frame that is not it
+/// resolves with no terminal at all.
+pub struct ShellTarget {
+    /// The address to enter. Matched by equality against every addr the request
+    /// resolves.
+    pub addr: Addr,
+    /// `None` when the client has no terminal to hand over. The request is then
+    /// refused up front — building without the shell would discard the flag.
+    pub terminal: Option<crate::engine::result::InteractiveWrapper>,
+}
+
+impl std::fmt::Debug for ShellTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `InteractiveWrapper` is an `Arc<dyn Fn>`; its presence is the only part
+        // that is meaningful to a reader anyway.
+        f.debug_struct("ShellTarget")
+            .field("addr", &self.addr)
+            .field("terminal", &self.terminal.is_some())
+            .finish()
     }
 }
 
@@ -1196,6 +1250,37 @@ impl RequestState {
             .swap(true, std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// The target `--shell=ADDR` named, if any. `None` for bare `--shell`, whose
+    /// single-target rule is enforced by `Engine::result` and the
+    /// transparent-group gate instead. Fixed at construction
+    /// ([`Engine::new_state_with_shell`]).
+    pub fn shell_target(&self) -> Option<&ShellTarget> {
+        self.data.shell.as_ref()
+    }
+
+    /// Record that a frame took the terminal for the [`shell_target`].
+    ///
+    /// [`shell_target`]: Self::shell_target
+    pub(crate) fn mark_shell_entered(&self) {
+        // `Relaxed`: the flag publishes no data, and the caller reads it only
+        // after the request's futures have completed.
+        self.data
+            .shell_entered
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether any frame of this request took the terminal for the
+    /// [`shell_target`]. Meaningful once the request has finished: a caller
+    /// that sees `false` after a successful run knows `--shell=ADDR` named
+    /// something the run never resolved.
+    ///
+    /// [`shell_target`]: Self::shell_target
+    pub fn shell_entered(&self) -> bool {
+        self.data
+            .shell_entered
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Hands a cloned sender to `emit_scope`'s drop-guard.
     pub(crate) fn events_sender(&self) -> Option<crate::engine::event::EventSender> {
         self.data.events.clone()
@@ -1474,11 +1559,13 @@ impl hbuiltins::pluginfs::CodegenReport for EngineCodegenReport {
 
 /// How a request built by `Engine::new_state_inner` behaves beyond its
 /// front-end options.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 struct RequestMode {
     /// See [`RequestStateData::hash_only`].
     hash_only: bool,
     listed_facts_trust: crate::engine::listed::ListedFactsTrust,
+    /// See [`RequestStateData::shell`].
+    shell: Option<ShellTarget>,
 }
 
 impl Engine {
@@ -1521,6 +1608,35 @@ impl Engine {
         log_tail_lines: usize,
         approval: Option<Arc<dyn crate::engine::approval::ApprovalHandler>>,
     ) -> Arc<RequestState> {
+        self.new_state_with_shell(
+            fail_fast,
+            events,
+            bg_pending,
+            log_tail_lines,
+            approval,
+            None,
+        )
+    }
+
+    /// [`new_state_full`](Self::new_state_full) for a request that may name a
+    /// `--shell=ADDR` target.
+    ///
+    /// The shell target is an argument of construction, not something set
+    /// afterwards, because the whole design rests on it being constant for the
+    /// request's lifetime: "does this frame shell?" is then a pure function of
+    /// the addr, and every `mem_result` cell of one addr feeds the addr-keyed
+    /// `mem_locked_result` cell the same answer (see [`ShellTarget`]). A request
+    /// that exists before its shell target is known could resolve a frame
+    /// first.
+    pub fn new_state_with_shell(
+        self: &Arc<Self>,
+        fail_fast: bool,
+        events: Option<crate::engine::event::EventSender>,
+        bg_pending: crate::engine::sandbox_cleaner::PendingCounter,
+        log_tail_lines: usize,
+        approval: Option<Arc<dyn crate::engine::approval::ApprovalHandler>>,
+        shell: Option<ShellTarget>,
+    ) -> Arc<RequestState> {
         self.new_state_inner(
             fail_fast,
             events,
@@ -1530,6 +1646,7 @@ impl Engine {
             RequestMode {
                 hash_only: false,
                 listed_facts_trust: self.cfg.listed_facts_trust,
+                shell,
             },
         )
     }
@@ -1549,6 +1666,7 @@ impl Engine {
             RequestMode {
                 hash_only: false,
                 listed_facts_trust: trust,
+                shell: None,
             },
         )
     }
@@ -1581,6 +1699,8 @@ impl Engine {
             RequestMode {
                 hash_only: true,
                 listed_facts_trust,
+                // A hash-only request never builds, so it never enters anything.
+                shell: None,
             },
         )
         .with_parent(parent)
@@ -1596,6 +1716,7 @@ impl Engine {
         RequestMode {
             hash_only,
             listed_facts_trust,
+            shell,
         }: RequestMode,
     ) -> Arc<RequestState> {
         // A request is past registration by construction (the engine is
@@ -1646,6 +1767,8 @@ impl Engine {
             approval,
             hash_only,
             selection: std::sync::OnceLock::new(),
+            shell,
+            shell_entered: std::sync::atomic::AtomicBool::new(false),
             deferred_trims: DeferredTrims {
                 engine: Arc::downgrade(self),
                 bg_pending,
