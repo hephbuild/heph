@@ -35,7 +35,7 @@ they are exempt.
 
 | Target | Does | Writes | Labels |
 |---|---|---|---|
-| `//<pkg>:build-lint-check` | Static typecheck of the files the package owns; with `requireTypeAnnotations`, every `def` parameter (`*args`, `**kwargs` included) must have a type. The return type may be left out | nothing | `build-lint-check`, `lint-check` |
+| `//<pkg>:build-lint-check` | Static typecheck of the files the package owns; with `requireTypeAnnotations`, every `def` parameter (`*args`, `**kwargs` included) must have a type. The return type may be left out, and so may the type of a parameter with a literal default (see [Inferred types](#inferred-types)) | nothing | `build-lint-check`, `lint-check` |
 | `//<pkg>:build-format-check` | Fails when an owned file differs from the formatter's output, the same rule as `heph tool build-fmt --check` | nothing | `build-format-check`, `format-check` |
 | `//<pkg>:build-format` | Rewrites owned files to the formatter's output (`codegen = in_place`) | owned files | `build-format`, `format`, `fix` |
 
@@ -67,6 +67,22 @@ The typechecker always runs. Only the annotation rule sits behind the option.
 A profile does not merge plugin options key by key. A profile's
 `builtin: buildfile` entry replaces the base entry wholesale, so it must repeat
 `requireTypeAnnotations` (and `patterns`, `indent`) to keep them.
+
+## Inferred types
+
+heph's starlark infers two types the rule would otherwise ask for, so their
+annotations stay optional and calls are still checked against them:
+
+- **The return type** of a top-level `def`: the union of what its `return`s
+  give, plus `None` when the body can run off its end.
+- **A parameter with a literal default** takes the literal's type. `1` and
+  `-1` give `int`, `1.5` gives `float`, `"s"` gives `str`, `True` and `False`
+  give `bool`. A list, dict or tuple display gives a list, dict or tuple whose
+  elements are unchecked: `xs = ["a"]` is an example, not a schema.
+
+These defaults infer nothing, so the parameter still needs an annotation:
+`None` (it means "optional something"; write `x: str | None = None`), a name
+(`x = DEFAULT`), a call, and an operator (`1 + 1`, `not True`).
 
 ## Failure output
 
@@ -191,6 +207,9 @@ completes `heph.types.` and shows each alias's expansion on hover.
   type errors or bad formatting that were never checked before.
 - A call to an unannotated def is now checked against its inferred return
   type, which can report findings in code that used to pass.
+- A parameter with a literal default now has that literal's type: after
+  `def f(n = 1)`, `f(n = "s")` is a type error, and so is using `n` as a
+  `str` inside `f`.
 - A plugin named `types` no longer loads. The name is reserved for
   `heph.types`, like `core`.
 - `target(labels = None)` is now accepted and means labels left out, so a

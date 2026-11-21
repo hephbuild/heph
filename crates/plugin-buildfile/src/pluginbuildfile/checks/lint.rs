@@ -291,6 +291,39 @@ pub(super) mod tests {
         assert_eq!((found[0].file.as_str(), found[0].line), ("pkg/BUILD", 7));
     }
 
+    /// A literal default types its parameter, across a load: a caller passing
+    /// another type is a type error, and the parameter needs no annotation.
+    #[test]
+    fn literal_default_types_param() {
+        let tmp = ws(&[
+            (
+                "pkg/BUILD",
+                "load(\"//lib/defs.star\", \"make\")\n\ndef ok():\n    make(n = 2)\n\n\
+                 def bad():\n    make(n = \"s\")\n",
+            ),
+            (
+                "lib/defs.star",
+                "def make(n = 1, opt = None) -> None:\n    pass\n",
+            ),
+            // Makes `lib` a package owning `defs.star`.
+            ("lib/BUILD", "load(\"//lib/defs.star\", \"make\")\n"),
+        ]);
+        let found = lint_pkg(tmp.path(), "pkg", false);
+        assert_eq!(
+            lines(&found),
+            ["pkg/BUILD:7:10: type-error: Expected type `int` but got `str`"]
+        );
+        // With annotations required, `lib` reports only `opt`, whose `None`
+        // default types nothing.
+        let lib = lint_pkg(tmp.path(), "lib", true);
+        assert_eq!(
+            lines(&lib),
+            [
+                "lib/defs.star:1:17: annotation: parameter `opt` of `make` has no type; add `: <type>`"
+            ]
+        );
+    }
+
     #[test]
     fn approximation_ignored() {
         // Assigning through an indexed expression is beyond the checker: it

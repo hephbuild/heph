@@ -1,6 +1,7 @@
 //! What heph's `[patch.crates-io]` of `starlark` (root `Cargo.toml`) adds to
 //! 0.14.2, held here so an upgrade that loses it fails a test instead of
-//! quietly typing every unannotated `def` as returning `Any` again.
+//! quietly typing every unannotated `def` as returning `Any` again, or every
+//! parameter with a literal default as `Any`.
 
 use std::collections::HashMap;
 
@@ -53,4 +54,25 @@ def use():
 "#,
     );
     assert_eq!(errors, ["Expected type `int` but got `None | str`"]);
+}
+
+#[test]
+fn unannotated_param_typed_from_literal_default() {
+    let errors = type_errors(
+        r#"
+def make(n = 1, opt = None):
+    s: str = n
+
+def use():
+    make(n = "s")
+    make(opt = 1)
+"#,
+    );
+    assert_eq!(
+        errors,
+        [
+            "Expected type `str` but got `int`",
+            "Expected type `int` but got `str`"
+        ]
+    );
 }
