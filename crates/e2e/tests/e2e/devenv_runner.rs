@@ -88,9 +88,9 @@ fn workspace() -> htestkit::Workspace {
         .with_managed_driver(Box::new(
             heph::pluginexec::Driver::new_bash().with_host_path(),
         ))
-        .with_plugin("devenv", |_| {
+        .with_plugin("devenv", |init| {
             Ok(heph::engine::PluginParts::default()
-                .with_managed_driver(Box::new(plugindevenv::Driver::new())))
+                .with_managed_driver(Box::new(plugindevenv::Driver::new(&init.home))))
         })
         .build()
         .expect("build workspace")
