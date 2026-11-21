@@ -1609,6 +1609,15 @@ impl hplugin::lsp::LspEngine for Engine {
         Engine::driver_names(self)
     }
 
+    fn driver_schemas(&self) -> hplugin::driver::DriverSchemas {
+        // The set the plugins read (`PluginInit.drivers`), sealed on demand.
+        self.seal_functions();
+        self.driver_schema_slot
+            .get()
+            .map(|s| (*s).clone())
+            .unwrap_or_default()
+    }
+
     fn provider_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self
             .providers_by_name

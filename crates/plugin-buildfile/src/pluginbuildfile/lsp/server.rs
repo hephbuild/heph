@@ -205,6 +205,9 @@ pub fn run_with(
         Err(RecvTimeoutError::Disconnected) => RegistryState::Failed,
     };
     let ctx = HephLspContext::new(engine);
+    if let RegistryState::Ready(r) = &registry {
+        ctx.set_drivers(r.driver_source.clone());
+    }
     let shared = Arc::clone(&ctx.shared);
     let result = serde_json::json!({
         "capabilities": capabilities(encoding),
@@ -442,6 +445,9 @@ impl Server<'_> {
         // same token array the requests will.
         let tokens = Arc::new(lex::lex(&text));
         self.shared.stage_tokens(key.clone(), Arc::clone(&tokens));
+        // Never waits: a snapshot that has landed hands its drivers to the
+        // evaluation below.
+        let _ready = self.registry();
         let (stock, parsed) = self.backend.validate(&key, text.clone());
         let ast_version = if parsed {
             Some(version)
@@ -514,11 +520,15 @@ impl Server<'_> {
             )));
     }
 
-    /// The registry, once its snapshot has landed.
+    /// The registry, once its snapshot has landed. Its drivers reach the
+    /// context's evaluation as it lands.
     fn registry(&mut self) -> Option<Arc<Registry>> {
         if let RegistryState::Loading(rx) = &self.registry {
             match rx.try_recv() {
-                Ok(r) => self.registry = RegistryState::Ready(Arc::new(r)),
+                Ok(r) => {
+                    self.backend.context.set_drivers(r.driver_source.clone());
+                    self.registry = RegistryState::Ready(Arc::new(r));
+                }
                 Err(std::sync::mpsc::TryRecvError::Empty) => return None,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     self.registry = RegistryState::Failed;

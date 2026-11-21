@@ -226,9 +226,14 @@ pub(crate) enum Site {
         edit: Range<usize>,
         prefix: String,
     },
-    /// After `heph.<plugin>.`, or on the function name.
+    /// After `heph.<plugin>.`, or on the function name. Under `heph.types`
+    /// also deeper, in a driver namespace: `heph.types.oci.image.│` has
+    /// `path` `["oci", "image"]`.
     PluginMember {
         plugin: String,
+        /// The segments between the plugin and the member; empty but under
+        /// `heph.types`.
+        path: Vec<String>,
         edit: Range<usize>,
         prefix: String,
     },
@@ -359,8 +364,11 @@ impl Site {
             map.insert("edit".to_string(), span(edit));
             map.insert("token".to_string(), span(edit));
         }
-        if let (Site::PluginMember { plugin, .. }, Some(map)) = (self, out.as_object_mut()) {
+        if let (Site::PluginMember { plugin, path, .. }, Some(map)) = (self, out.as_object_mut()) {
             map.insert("plugin".to_string(), json!(plugin));
+            if !path.is_empty() {
+                map.insert("path".to_string(), json!(path));
+            }
         }
         out
     }
@@ -1091,11 +1099,15 @@ fn dotted_site(
             edit: edit.clone(),
             prefix: prefix.to_string(),
         }),
-        ["heph", plugin] => Some(Site::PluginMember {
-            plugin: (*plugin).to_string(),
-            edit: edit.clone(),
-            prefix: prefix.to_string(),
-        }),
+        // A driver's `Kwargs` nests one namespace per segment of its name.
+        ["heph", plugin, path @ ..] if path.is_empty() || *plugin == "types" => {
+            Some(Site::PluginMember {
+                plugin: (*plugin).to_string(),
+                path: path.iter().map(|s| (*s).to_string()).collect(),
+                edit: edit.clone(),
+                prefix: prefix.to_string(),
+            })
+        }
         _ => None,
     }
 }
@@ -1280,6 +1292,42 @@ mod tests {
         assert!(at_position(text, 9, 0).is_none(), "past the last line");
         let r = at_position(text, 0, 10).expect("end of line is a position");
         assert_eq!(kind(&r), "target_key");
+    }
+
+    #[test]
+    fn site_plugin_member_path_only_under_types() {
+        let member = |fixture: &str| match at(fixture).site {
+            Site::PluginMember {
+                plugin,
+                path,
+                prefix,
+                ..
+            } => Some((plugin, path, prefix)),
+            _ => None,
+        };
+        let s = |v: &[&str]| v.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            member("x = heph.types.│\n"),
+            Some(("types".to_string(), s(&[]), String::new()))
+        );
+        assert_eq!(
+            member("def f(**kw: heph.types.oci.image.Kw│):\n"),
+            Some(("types".to_string(), s(&["oci", "image"]), "Kw".to_string()))
+        );
+        assert_eq!(
+            member("x = heph.types.bash.Kwa│rgs\n"),
+            Some(("types".to_string(), s(&["bash"]), "Kwa".to_string())),
+            "on the member, the prefix runs to the cursor"
+        );
+        assert_eq!(
+            member("x = heph.fs.│\n"),
+            Some(("fs".to_string(), s(&[]), String::new()))
+        );
+        assert_eq!(
+            member("x = heph.fs.join.│\n"),
+            None,
+            "a plugin function has no members"
+        );
     }
 
     #[test]

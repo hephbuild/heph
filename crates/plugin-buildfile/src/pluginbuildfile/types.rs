@@ -232,6 +232,22 @@ impl Kwargs {
     fn segments(&self) -> impl Iterator<Item = &str> {
         self.driver.split('.')
     }
+
+    /// Hover / completion markdown: the type, what it is for, and each key
+    /// with its type.
+    pub(crate) fn markdown(&self) -> String {
+        let mut md = format!(
+            "**`heph.{NAMESPACE}.{}.{KWARGS}`**\n\n\
+             The keyword arguments `target(driver = \"{}\")` takes, for a wrapper's \
+             `**kwargs`. Closed: any other key is a type error. Every key is optional \
+             and accepts `None`.\n",
+            self.driver, self.driver
+        );
+        for (key, ty) in &self.keys {
+            md.push_str(&format!("\n- `{key}`: `{ty}`"));
+        }
+        md
+    }
 }
 
 /// Every registered driver's `heph.types.<driver>.Kwargs`, built once from
@@ -310,6 +326,23 @@ impl DriverKwargs {
         &self.digest
     }
 
+    /// The `Kwargs` of the driver whose name is `segments` joined by dots.
+    pub(crate) fn at(&self, segments: &[&str]) -> Option<&Kwargs> {
+        self.drivers
+            .iter()
+            .find(|k| k.segments().eq(segments.iter().copied()))
+    }
+
+    /// The driver namespaces directly under `heph.types.<prefix>`: the next
+    /// segment of every driver name that continues `prefix`, sorted.
+    pub(crate) fn children(&self, prefix: &[&str]) -> BTreeSet<&str> {
+        self.drivers
+            .iter()
+            .filter(|k| k.segments().take(prefix.len()).eq(prefix.iter().copied()))
+            .filter_map(|k| k.segments().nth(prefix.len()))
+            .collect()
+    }
+
     /// Fill `heph.types` with one nested namespace per driver name segment,
     /// holding `Kwargs` where a driver's name ends.
     fn register(&self, builder: &mut GlobalsBuilder) {
@@ -346,11 +379,7 @@ impl DriverKwargs {
     /// stops; `None` when it is an alias, a `Kwargs`, a driver namespace, or
     /// an attribute of one of those (evaluation's to judge).
     pub(crate) fn unknown_member(&self, path: &[&str]) -> Option<String> {
-        let is_driver = |p: &[&str]| {
-            self.drivers
-                .iter()
-                .any(|k| k.segments().eq(p.iter().copied()))
-        };
+        let is_driver = |p: &[&str]| self.at(p).is_some();
         let is_namespace = |p: &[&str]| {
             self.drivers
                 .iter()
@@ -376,12 +405,7 @@ impl DriverKwargs {
     /// is `heph.types.<name>`, read as a flat alias rather than a driver.
     fn not_a_member(&self, prefix: &[&str], name: &str, alone: bool) -> String {
         let depth = prefix.len();
-        let next: BTreeSet<&str> = self
-            .drivers
-            .iter()
-            .filter(|k| k.segments().take(depth).eq(prefix.iter().copied()))
-            .filter_map(|k| k.segments().nth(depth))
-            .collect();
+        let next = self.children(prefix);
         let hint = |candidates: &[&str]| {
             closest(name, candidates.iter().copied())
                 .map(|c| format!(" (did you mean \"{c}\"?)"))
@@ -416,11 +440,7 @@ impl DriverKwargs {
             );
         }
         let mut members: Vec<&str> = Vec::with_capacity(next.len() + 1);
-        if self
-            .drivers
-            .iter()
-            .any(|k| k.segments().eq(prefix.iter().copied()))
-        {
+        if self.at(prefix).is_some() {
             members.push(KWARGS);
         }
         members.extend(next);
