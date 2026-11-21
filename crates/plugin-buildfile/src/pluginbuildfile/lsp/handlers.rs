@@ -21,11 +21,11 @@
 //! The renderers and item builders here moved from the old response proxy;
 //! they gained the resolver's [`Site`] as input instead of re-scanning text.
 
-use super::context::{HephLspContext, packages_under};
+use super::context::{BadPath, HephLspContext, ListingError, packages_under, targets_in};
 use super::index::SharedState;
 use super::lex::{self, Bracket, Kind, NO_LINK, Tok, Tokens};
 use super::position::{self, Encoding};
-use super::site::{ArgCall, Builtin, Call, Quote, Site, Str};
+use super::site::{ArgCall, Builtin, Call, Quote, Reason, Site, Str};
 use crate::pluginbuildfile::run_file::{resolve_load_target, target_base_fields};
 use crate::pluginbuildfile::{DEFAULT_INDENT, build_file_indent_from_options};
 use hplugin::driver::DriverSchema;
@@ -184,12 +184,15 @@ fn item_kind(site: &Site) -> CompletionItemKind {
     }
 }
 
-/// The heph completion items for a site, conventions applied.
-pub(crate) fn items(site: &Site, ctx: &Ctx<'_>) -> Vec<CompletionItem> {
+/// The heph completion items for a site, conventions applied. `Err` when
+/// heph cannot answer after all (the site's listing timed out or failed):
+/// the caller answers stock, under that reason, as it does while the
+/// providers load.
+pub(crate) fn items(site: &Site, ctx: &Ctx<'_>) -> Result<Vec<CompletionItem>, Reason> {
     let (candidates, edit, value): (Vec<Candidate>, Bytes<usize>, Option<&Str>) = match site {
         // Not a replace site: its items come from `prepend` / `field_value`,
         // which also see the stock ones.
-        Site::None | Site::Callee { .. } | Site::FieldValue { .. } => return Vec::new(),
+        Site::None | Site::Callee { .. } | Site::FieldValue { .. } => return Ok(Vec::new()),
         Site::TargetKey { call, edit, .. } => (target_keys(call, ctx), edit.clone(), None),
         Site::StateKey { call, edit, .. } => (state_keys(call, ctx), edit.clone(), None),
         Site::ArgKey { call, edit, .. } => (
@@ -239,21 +242,14 @@ pub(crate) fn items(site: &Site, ctx: &Ctx<'_>) -> Vec<CompletionItem> {
         ),
         Site::PluginNamespace { edit, .. } => (namespaces(ctx), edit.clone(), None),
         Site::PluginMember { plugin, edit, .. } => (members(plugin, ctx), edit.clone(), None),
-        Site::Address { value } => (
-            addresses(&value.prefix, ctx),
-            value.edit.clone(),
-            Some(value),
-        ),
-        Site::LoadPath { value } => (
-            load_paths(&value.prefix, ctx),
-            value.edit.clone(),
-            Some(value),
-        ),
+        Site::Address { value } | Site::LoadPath { value } => {
+            (listed(site, ctx)?, value.edit.clone(), Some(value))
+        }
         Site::LoadSymbol { path, value } => {
             (load_symbols(path, ctx), value.edit.clone(), Some(value))
         }
     };
-    render(site, candidates, edit, value, ctx)
+    Ok(render(site, candidates, edit, value, ctx))
 }
 
 /// The keyword-argument completion of a call to a function whose parameters
@@ -762,109 +758,166 @@ fn names_in(text: &str, tokens: &Tokens) -> Vec<String> {
         .collect()
 }
 
-/// `//…` → packages, then `//pkg:…` targets; `:…` → this package's targets.
-fn addresses(prefix: &str, ctx: &Ctx<'_>) -> Vec<Candidate> {
-    if let Some(rel) = prefix.strip_prefix(':') {
-        let mut names = ctx.listing.list_targets(&ctx.package());
-        names.extend(names_in(ctx.text, ctx.tokens));
-        names.sort();
-        names.dedup();
-        return names
-            .into_iter()
-            .filter(|n| n.starts_with(rel))
-            .map(|n| Candidate {
-                doc: format!("Target `:{n}` in this package."),
-                detail: Some("target".to_string()),
-                insert: format!(":{n}"),
-                label: format!(":{n}"),
-            })
-            .collect();
-    }
-    let Some(rest) = prefix.strip_prefix("//") else {
-        return Vec::new();
+/// The candidates of an `address` or `load_path` site: the listing
+/// [`listing_query`] chooses, filtered as it says. `//…` → packages,
+/// `//pkg:…` → that package's targets, `:…` → this package's targets plus
+/// the names the open document declares, `load("//…` → package paths.
+///
+/// A typed path that would leave the workspace lists nothing (and says so
+/// at `debug`); a listing that timed out or failed is the caller's `Err`.
+fn listed(site: &Site, ctx: &Ctx<'_>) -> Result<Vec<Candidate>, Reason> {
+    let query = match listing_query(site, || ctx.package()) {
+        None => return Ok(Vec::new()),
+        Some(Err(refused)) => {
+            tracing::debug!(
+                path = refused.path,
+                why = refused.why.as_str(),
+                "lsp: typed path not listed"
+            );
+            return Ok(Vec::new());
+        }
+        Some(Ok(query)) => query,
     };
-    match rest.split_once(':') {
-        Some((pkg, _)) => ctx
-            .listing
-            .list_targets(pkg)
-            .into_iter()
-            .map(|n| Candidate {
-                doc: format!("Target `//{pkg}:{n}`."),
-                detail: Some("target".to_string()),
-                insert: format!("//{pkg}:{n}"),
-                label: format!("//{pkg}:{n}"),
-            })
-            .collect(),
-        None => ctx
-            .listing
-            .list_packages(rest)
-            .into_iter()
-            .map(|p| Candidate {
-                doc: format!("Package `//{p}`."),
-                detail: Some("package".to_string()),
-                insert: format!("//{p}"),
-                label: format!("//{p}"),
-            })
-            .collect(),
+    let listed = ctx
+        .listing
+        .listing(query.listing.clone())
+        .map_err(|e| match e {
+            ListingError::TimedOut(waited) => Reason::ListingTimedOut {
+                waited_ms: u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
+            },
+            ListingError::Failed(e) => Reason::ListingFailed {
+                message: format!("{e:#}"),
+            },
+        })?;
+    let mut names: Vec<String> = listed.entries.into_iter().map(|e| e.name).collect();
+    if query.relative {
+        names.extend(names_in(ctx.text, ctx.tokens));
+        names.sort_unstable();
+        names.dedup();
     }
-}
-
-/// `load("//…` → package paths.
-fn load_paths(prefix: &str, ctx: &Ctx<'_>) -> Vec<Candidate> {
-    let rest = prefix.strip_prefix("//").unwrap_or("");
-    ctx.listing
-        .list_packages(rest)
-        .into_iter()
-        .filter(|p| !p.is_empty())
-        .map(|p| Candidate {
-            doc: format!("Load from package `//{p}`."),
+    let candidate = |n: String| match (&query.listing, site) {
+        (Listing::Targets { .. }, _) if query.relative => Candidate {
+            doc: format!("Target `:{n}` in this package."),
+            detail: Some("target".to_string()),
+            insert: format!(":{n}"),
+            label: format!(":{n}"),
+        },
+        (Listing::Targets { package }, _) => Candidate {
+            doc: format!("Target `//{package}:{n}`."),
+            detail: Some("target".to_string()),
+            insert: format!("//{package}:{n}"),
+            label: format!("//{package}:{n}"),
+        },
+        (Listing::Packages { .. }, Site::LoadPath { .. }) => Candidate {
+            doc: format!("Load from package `//{n}`."),
             detail: Some("package".to_string()),
-            insert: format!("//{p}"),
-            label: format!("//{p}"),
-        })
-        .collect()
+            insert: format!("//{n}"),
+            label: format!("//{n}"),
+        },
+        (Listing::Packages { .. }, _) => Candidate {
+            doc: format!("Package `//{n}`."),
+            detail: Some("package".to_string()),
+            insert: format!("//{n}"),
+            label: format!("//{n}"),
+        },
+    };
+    Ok(names
+        .into_iter()
+        .filter(|n| query.drops(n).is_none())
+        .map(candidate)
+        .collect())
 }
 
-/// The engine listing a completion at `site` runs, for `--explain`.
+/// The engine listing a completion at an `address` or `load_path` site runs,
+/// and how the completion filters it. Completion and `--explain` both get
+/// it from [`listing_query`], so they cannot disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ListingQuery {
     pub listing: Listing,
     /// What the completion keeps of the listing: the names starting with it.
     pub prefix: String,
     /// Whether the root package (`""`) is a candidate: not for a load path.
     pub root_package: bool,
+    /// `:name`: the open document's own targets, inserted relative.
+    pub relative: bool,
 }
 
-/// The listing [`addresses`] and [`load_paths`] run at `site`, and how they
-/// filter it; `package` is the open document's package, asked only for a
-/// `:name`. `None` for a site that lists nothing.
-pub(crate) fn listing_query(site: &Site, package: impl FnOnce() -> String) -> Option<ListingQuery> {
-    let (listing, prefix, root_package) = match site {
+/// Why the completion leaves a listed name out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Dropped {
+    /// It does not start with the typed prefix.
+    Prefix,
+    /// It is the root package, which a load path cannot name.
+    RootPackage,
+}
+
+impl Dropped {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Prefix => "prefix",
+            Self::RootPackage => "root_package",
+        }
+    }
+}
+
+impl ListingQuery {
+    /// Why the completion leaves `name` out; `None` when it is a candidate.
+    pub(crate) fn drops(&self, name: &str) -> Option<Dropped> {
+        if !self.root_package && name.is_empty() {
+            Some(Dropped::RootPackage)
+        } else if !name.starts_with(&self.prefix) {
+            Some(Dropped::Prefix)
+        } else {
+            None
+        }
+    }
+}
+
+/// A typed path no listing runs for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Refused {
+    /// The path as typed, without its `//`.
+    pub path: String,
+    pub why: BadPath,
+}
+
+/// The listing an `address` or `load_path` site runs, and how its
+/// completion filters it: the one choice completion and `--explain` share.
+/// `package` is the open document's package ([`pkg_of`]), asked only for a
+/// `:name`. `None` for a site that lists nothing; `Some(Err)` for a typed
+/// path that would leave the workspace, which no provider is asked about.
+pub(crate) fn listing_query(
+    site: &Site,
+    package: impl FnOnce() -> String,
+) -> Option<Result<ListingQuery, Refused>> {
+    let (listing, prefix, root_package, relative, typed) = match site {
         Site::Address { value } => match value.prefix.strip_prefix(':') {
-            Some(rel) => (Listing::Targets { package: package() }, rel, true),
+            Some(rel) => {
+                let package = package();
+                (targets_in(&package), rel, true, true, package)
+            }
             None => {
                 let rest = value.prefix.strip_prefix("//")?;
                 match rest.split_once(':') {
-                    Some((pkg, name)) => (
-                        Listing::Targets {
-                            package: pkg.to_string(),
-                        },
-                        name,
-                        true,
-                    ),
-                    None => (packages_under(rest), rest, true),
+                    Some((pkg, name)) => (targets_in(pkg), name, true, false, pkg.to_string()),
+                    None => (packages_under(rest), rest, true, false, rest.to_string()),
                 }
             }
         },
         Site::LoadPath { value } => {
             let rest = value.prefix.strip_prefix("//").unwrap_or("");
-            (packages_under(rest), rest, false)
+            (packages_under(rest), rest, false, false, rest.to_string())
         }
         _ => return None,
     };
-    Some(ListingQuery {
-        listing,
-        prefix: prefix.to_string(),
-        root_package,
+    Some(match listing {
+        Ok(listing) => Ok(ListingQuery {
+            listing,
+            prefix: prefix.to_string(),
+            root_package,
+            relative,
+        }),
+        Err(why) => Err(Refused { path: typed, why }),
     })
 }
 
@@ -1296,12 +1349,19 @@ pub(crate) fn package_build_files(dir: &Path, patterns: &[glob::Pattern]) -> Vec
 /// Package name for a BUILD-file path: its parent dir, workspace-relative,
 /// forward-slashed (empty at the root).
 pub(crate) fn pkg_of(root: &Path, path: &Path) -> String {
+    let slashed = |p: &Path| p.to_string_lossy().replace('\\', "/");
     let parent = path.parent().unwrap_or(path);
+    if let Ok(rel) = parent.strip_prefix(root) {
+        return slashed(rel);
+    }
+    // The root and the file may differ by a symlink (macOS `/var` vs
+    // `/private/var`): compare them canonical before giving up. A file
+    // outside the root keeps its absolute path, which no listing accepts.
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let parent = canon(parent);
     parent
-        .strip_prefix(root)
-        .unwrap_or(parent)
-        .to_string_lossy()
-        .replace('\\', "/")
+        .strip_prefix(canon(root))
+        .map_or_else(|_| slashed(&parent), slashed)
 }
 
 #[cfg(test)]

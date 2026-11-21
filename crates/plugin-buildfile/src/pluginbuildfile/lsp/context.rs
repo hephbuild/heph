@@ -12,7 +12,8 @@ use crate::pluginbuildfile::run_file::{
     BuildFileLoader, build_globals, eval_source, resolve_load_target,
 };
 use hplugin::function::FunctionRegistry;
-use hplugin::lsp::{Listed, Listing, LspEngine};
+pub(crate) use hplugin::lsp::BadPath;
+use hplugin::lsp::{Listed, Listing, LspEngine, check_path};
 use starlark::docs::DocModule;
 use starlark::environment::Globals;
 use starlark::errors::EvalMessage;
@@ -20,6 +21,7 @@ use starlark::syntax::{AstModule, Dialect};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use vendored_starlark_lsp::completion::{StringCompletionResult, StringCompletionType};
 use vendored_starlark_lsp::error::eval_message_to_lsp_diagnostic;
 use vendored_starlark_lsp::server::{LspContext, LspEvalResult, LspUri, StringLiteralResult};
@@ -39,11 +41,28 @@ pub(crate) struct HephLspContext {
     /// captured at construction (the LSP context is built on the server's
     /// runtime), so sync callers don't have to discover one.
     runtime: tokio::runtime::Handle,
+    /// How long a completion waits for the engine's listing before it
+    /// answers stock ([`LISTING_WAIT`] unless a test shortens it).
+    listing_wait: Duration,
     pub(crate) shared: Arc<SharedState>,
 }
 
+/// How long a completion waits for the engine's listing. Past it, the
+/// completion answers stock with `reason: listing_timed_out`, and the
+/// listing is dropped, which ends its scope.
+pub(crate) const LISTING_WAIT: Duration = Duration::from_secs(2);
+
+/// Why a completion got no listing.
+#[derive(Debug)]
+pub(crate) enum ListingError {
+    /// The listing did not answer within the wait.
+    TimedOut(Duration),
+    /// The engine's listing returned an error.
+    Failed(anyhow::Error),
+}
+
 impl HephLspContext {
-    pub(crate) fn new(engine: Arc<dyn LspEngine>) -> HephLspContext {
+    pub(crate) fn new(engine: Arc<dyn LspEngine>, listing_wait: Duration) -> HephLspContext {
         let root = engine.root().to_path_buf();
         let registry = engine.function_registry();
         let doc_globals = build_globals(&registry).documentation();
@@ -65,6 +84,7 @@ impl HephLspContext {
             globals: Arc::new(OnceLock::new()),
             patterns,
             runtime,
+            listing_wait,
             shared,
         }
     }
@@ -97,7 +117,7 @@ impl HephLspContext {
     ) -> Option<u32> {
         let filename = file.to_string_lossy();
         // A helper loaded from another file may reach the walk, which needs a
-        // runtime context (see `list_packages`).
+        // runtime context (see `listing`).
         let _rt = self.runtime.enter();
         let result = eval_source(&filename, text, pkg, &self.loader()).ok()?;
         let target = result.targets.iter().find(|t| t.name == name)?;
@@ -147,20 +167,21 @@ impl HephLspContext {
     }
 
     /// What the engine lists for `what`, in a cache scope of its own (see
-    /// [`LspEngine::list`]). `None` when the listing failed; the error is
-    /// logged, since it is the only explanation an empty completion list will
-    /// ever get.
-    pub(crate) fn listing(&self, what: Listing) -> Option<Listed> {
+    /// [`LspEngine::list`]), waiting at most the listing wait for it. Past
+    /// the wait the listing is dropped, which ends its scope. Either failure
+    /// is logged, since it is the only explanation a stock answer at an
+    /// address will ever get.
+    pub(crate) fn listing(&self, what: Listing) -> Result<Listed, ListingError> {
         let fut = Arc::clone(&self.shared.engine).list(what.clone());
         // Entered, not spawned: this runs on the LSP server's sync request
         // thread, which has no runtime context of its own, and the listing
         // spawns package tasks and reaches `hcore::blocking::run`, which need
-        // one. Entering the captured server runtime satisfies them; the
-        // block_on itself parks only this thread.
+        // one. Entering the captured server runtime satisfies them; the wait
+        // itself parks only this thread.
         // `listing_works_from_a_thread_with_no_ambient_runtime` pins it.
         let _rt = self.runtime.enter();
-        match futures::executor::block_on(fut) {
-            Ok(listed) => {
+        match block_on_timeout(fut, self.listing_wait) {
+            Some(Ok(listed)) => {
                 for gap in &listed.skipped {
                     tracing::debug!(
                         scope = listed.scope.get(),
@@ -171,36 +192,21 @@ impl HephLspContext {
                         "lsp: listing left out"
                     );
                 }
-                Some(listed)
+                Ok(listed)
             }
-            Err(e) => {
+            Some(Err(e)) => {
                 tracing::warn!(error = ?e, ?what, "lsp: listing failed");
-                None
+                Err(ListingError::Failed(e))
+            }
+            None => {
+                tracing::warn!(
+                    waited_ms = self.listing_wait.as_millis() as u64,
+                    ?what,
+                    "lsp: listing timed out"
+                );
+                Err(ListingError::TimedOut(self.listing_wait))
             }
         }
-    }
-
-    /// Package names beginning with `prefix` (no leading `//`).
-    pub(crate) fn list_packages(&self, prefix: &str) -> Vec<String> {
-        let Some(listed) = self.listing(packages_under(prefix)) else {
-            return Vec::new();
-        };
-        listed
-            .entries
-            .into_iter()
-            .map(|e| e.name)
-            .filter(|p| p.starts_with(prefix))
-            .collect()
-    }
-
-    /// Target names in `package`.
-    pub(crate) fn list_targets(&self, package: &str) -> Vec<String> {
-        let Some(listed) = self.listing(Listing::Targets {
-            package: package.to_string(),
-        }) else {
-            return Vec::new();
-        };
-        listed.entries.into_iter().map(|e| e.name).collect()
     }
 
     /// The on-disk BUILD file URL for a package.
@@ -223,10 +229,62 @@ fn first_build_file(dir: &Path, patterns: &[glob::Pattern]) -> Option<PathBuf> {
 /// under its last whole path segment (`foo/ba` → under `foo`, `@heph/go/g` →
 /// under `@heph/go`, `fo` → under the root). The engine's package matcher
 /// works in whole segments, so the partial one is the caller's filter.
-pub(crate) fn packages_under(prefix: &str) -> Listing {
+///
+/// `prefix` is typed text and the path reaches every provider, some of which
+/// join it to the workspace root and walk the result, so a prefix that does
+/// not name a place inside the workspace is refused ([`check_path`], which
+/// the engine runs again on every listing it is handed). The
+/// partial segment only filters, so only its bytes are checked.
+pub(crate) fn packages_under(prefix: &str) -> Result<Listing, BadPath> {
     let under = prefix.rsplit_once('/').map_or("", |(dir, _)| dir);
-    Listing::Packages {
+    check_path(prefix, under)?;
+    Ok(Listing::Packages {
         under: under.to_string(),
+    })
+}
+
+/// The listing of `package`'s targets; `package` is checked as
+/// [`packages_under`] checks a prefix, every segment of it whole.
+pub(crate) fn targets_in(package: &str) -> Result<Listing, BadPath> {
+    let listing = Listing::Targets {
+        package: package.to_string(),
+    };
+    listing.check()?;
+    Ok(listing)
+}
+
+/// Polls `fut` on this thread until it is ready or `wait` has passed;
+/// `None` on the latter, with `fut` dropped. `futures::executor::block_on`
+/// with a deadline, so no runtime timer is involved: the thread parks until
+/// the future wakes it or the deadline comes.
+pub(crate) fn block_on_timeout<F: std::future::Future>(
+    fut: F,
+    wait: Duration,
+) -> Option<F::Output> {
+    use std::task::{Context, Poll, Wake, Waker};
+    struct Unpark(std::thread::Thread);
+    impl Wake for Unpark {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let deadline = Instant::now() + wait;
+    let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = std::pin::pin!(fut);
+    loop {
+        if let Poll::Ready(out) = fut.as_mut().poll(&mut cx) {
+            return Some(out);
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return None;
+        }
+        // A spurious return only costs one more poll.
+        std::thread::park_timeout(left);
     }
 }
 
@@ -251,6 +309,7 @@ pub fn list_with_fresh_buildfile_provider(
         }
         .with_function_registry(registry);
         let ctoken = StdCancellationToken::new();
+        let mut skipped = Vec::new();
         let mut names: Vec<String> = match &what {
             Listing::Packages { under } => provider
                 .list_packages(
@@ -267,7 +326,9 @@ pub fn list_with_fresh_buildfile_provider(
                             .is_some_and(|rest| rest.starts_with('/'))
                 })
                 .collect(),
-            Listing::Targets { package } => provider
+            // A package that does not evaluate costs only its own entries and
+            // is reported, as `Discovery::KeepGoing` makes it in the engine.
+            Listing::Targets { package } => match provider
                 .list(
                     ListRequest::new(
                         "lsp-test",
@@ -277,23 +338,39 @@ pub fn list_with_fresh_buildfile_provider(
                     ),
                     &ctoken,
                 )
-                .await?
-                .filter_map(Result::ok)
-                .map(|r| r.addr.name.clone())
-                .collect(),
+                .await
+            {
+                Ok(listed) => listed
+                    .filter_map(Result::ok)
+                    .map(|r| r.addr.name.clone())
+                    .collect(),
+                Err(e) => {
+                    skipped.push(hcore::events::SelectionGap {
+                        stage: "list".to_string(),
+                        provider: "buildfile".to_string(),
+                        count: 1,
+                        examples: vec![hcore::events::SelectionGapExample {
+                            scope: format!("//{package}"),
+                            cause: format!("{e:#}"),
+                        }],
+                    });
+                    Vec::new()
+                }
+            },
         };
         names.sort_unstable();
         names.dedup();
+        let buildfile: Arc<str> = Arc::from("buildfile");
         Ok(Listed {
             scope: hplugin::scope::CacheScope::mint(|_, _| {}).id(),
             entries: names
                 .into_iter()
                 .map(|name| hplugin::lsp::ListedEntry {
                     name,
-                    provider: "buildfile".to_string(),
+                    provider: Arc::clone(&buildfile),
                 })
                 .collect(),
-            skipped: Vec::new(),
+            skipped,
             scope_ended: Box::pin(async { Vec::new() }),
         })
     })
@@ -479,75 +556,63 @@ impl LspContext for HephLspContext {
     fn get_string_completion_options(
         &self,
         _document_uri: &LspUri,
-        kind: StringCompletionType,
-        current_value: &str,
+        _kind: StringCompletionType,
+        _current_value: &str,
         _workspace_root: Option<&Path>,
     ) -> Result<Vec<StringCompletionResult>, String> {
-        // The first argument of a `load(...)`: complete package paths (`//pkg`),
-        // which heph resolves to that package's BUILD file.
-        if matches!(kind, StringCompletionType::LoadPath) {
-            let prefix = current_value.strip_prefix("//").unwrap_or("");
-            return Ok(self
-                .list_packages(prefix)
-                .into_iter()
-                .filter(|p| !p.is_empty())
-                .map(|pkg| StringCompletionResult {
-                    value: format!("//{pkg}"),
-                    insert_text: None,
-                    insert_text_offset: 0,
-                    kind: lsp_types::CompletionItemKind::MODULE,
-                })
-                .collect());
-        }
-
-        let Some(rest) = current_value.strip_prefix("//") else {
-            return Ok(vec![]);
-        };
-
-        let results = match rest.split_once(':') {
-            // After the colon: complete target names in the (typed) package.
-            Some((pkg, name_prefix)) => self
-                .list_targets(pkg)
-                .into_iter()
-                .filter(|n| n.starts_with(name_prefix))
-                .map(|name| StringCompletionResult {
-                    value: format!("//{pkg}:{name}"),
-                    insert_text: None,
-                    insert_text_offset: 0,
-                    kind: lsp_types::CompletionItemKind::VALUE,
-                })
-                .collect(),
-            // Before the colon: complete package names.
-            None => self
-                .list_packages(rest)
-                .into_iter()
-                .map(|pkg| StringCompletionResult {
-                    value: format!("//{pkg}"),
-                    insert_text: None,
-                    insert_text_offset: 0,
-                    kind: lsp_types::CompletionItemKind::MODULE,
-                })
-                .collect(),
-        };
-        Ok(results)
+        // Every string the stock analysis completes (a load path, an
+        // address) is a heph `load_path` / `address` site, answered from the
+        // site's one listing choice (`handlers::listing_query`). The stock
+        // answer is reached there only when heph steps aside (outside the
+        // root, a listing that timed out or failed), and listing again then
+        // would be a second classifier of the string, and a second wait.
+        Ok(Vec::new())
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{HephLspContext, LspContext as _, first_build_file};
+pub(super) mod tests {
+    use super::{
+        BadPath, HephLspContext, LISTING_WAIT, ListingError, LspContext as _, first_build_file,
+        packages_under, targets_in,
+    };
     use hplugin::config::Options;
     use hplugin::driver::DriverSchema;
     use hplugin::function::FunctionRegistry;
-    use hplugin::lsp::LspEngine;
+    use hplugin::lsp::{Listing, LspEngine};
     use hplugin::provider::StateSchema;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    /// How a [`FakeEngine`]'s `list` answers.
+    #[derive(Clone, Copy, Debug, Default)]
+    pub(crate) enum ListMode {
+        /// A fresh buildfile provider over the root, as a fresh scope gives.
+        #[default]
+        Fresh,
+        /// An error, as an engine whose listing failed returns.
+        Fails,
+        /// Never, as a provider that hangs.
+        Hangs,
+        /// A fresh listing whose scope never ends.
+        ScopeHeld,
+    }
 
     /// Minimal `LspEngine` over a workspace root: enough for the listing
     /// provider, which is all the walk path needs.
-    struct FakeEngine {
-        root: PathBuf,
+    pub(crate) struct FakeEngine {
+        pub(crate) root: PathBuf,
+        pub(crate) list: ListMode,
+    }
+
+    impl FakeEngine {
+        pub(crate) fn new(root: &Path) -> FakeEngine {
+            FakeEngine {
+                root: root.to_path_buf(),
+                list: ListMode::Fresh,
+            }
+        }
     }
 
     impl LspEngine for FakeEngine {
@@ -576,12 +641,134 @@ mod tests {
             self: Arc<Self>,
             what: hplugin::lsp::Listing,
         ) -> futures::future::BoxFuture<'static, anyhow::Result<hplugin::lsp::Listed>> {
-            super::list_with_fresh_buildfile_provider(
-                self.root.clone(),
-                self.function_registry(),
-                what,
-            )
+            use futures::FutureExt as _;
+            let fresh =
+                super::list_with_fresh_buildfile_provider(self.root.clone(), Arc::default(), what);
+            match self.list {
+                ListMode::Fresh => fresh,
+                ListMode::Fails => {
+                    Box::pin(async { Err(anyhow::anyhow!("the provider exploded")) })
+                }
+                ListMode::Hangs => Box::pin(futures::future::pending()),
+                ListMode::ScopeHeld => fresh
+                    .map(|listed| {
+                        listed.map(|mut l| {
+                            l.scope_ended = Box::pin(futures::future::pending());
+                            l
+                        })
+                    })
+                    .boxed(),
+            }
         }
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime")
+    }
+
+    /// The typed prefix → what reaches the providers. Whatever would leave
+    /// the workspace once a provider joins it to the root is refused before
+    /// any provider sees it.
+    #[test]
+    fn packages_under_lists_only_paths_inside_the_workspace() {
+        let under = |u: &str| {
+            Ok(Listing::Packages {
+                under: u.to_string(),
+            })
+        };
+        let cases: [(&str, Result<Listing, BadPath>); 14] = [
+            ("", under("")),
+            ("fo", under("")),
+            ("foo/", under("foo")),
+            ("foo/ba", under("foo")),
+            ("a/b/c/d", under("a/b/c")),
+            ("@heph/go/g", under("@heph/go")),
+            ("héllo/wörld", under("héllo")),
+            // The partial segment only filters: `..` there names nothing.
+            ("foo/..", under("foo")),
+            ("a//b", Err(BadPath::EmptySegment)),
+            ("../..", Err(BadPath::DotSegment)),
+            ("./x", Err(BadPath::DotSegment)),
+            ("/etc", Err(BadPath::Absolute)),
+            ("/etc/x", Err(BadPath::Absolute)),
+            ("a\0b/c", Err(BadPath::ControlByte)),
+        ];
+        for (prefix, want) in cases {
+            assert_eq!(packages_under(prefix), want, "prefix {prefix:?}");
+        }
+        // A package is all whole segments.
+        assert!(targets_in("").is_ok(), "the root package");
+        assert!(targets_in("@heph/oci").is_ok());
+        assert_eq!(targets_in("a/"), Err(BadPath::EmptySegment));
+        assert_eq!(targets_in("a/../.."), Err(BadPath::DotSegment));
+        assert_eq!(targets_in("/etc"), Err(BadPath::Absolute));
+        assert_eq!(targets_in("a\tb"), Err(BadPath::ControlByte));
+    }
+
+    /// A provider that hangs costs a completion the listing wait, not the
+    /// editor: the listing is dropped and the caller told it timed out.
+    #[test]
+    fn a_hung_listing_is_given_up_after_the_wait() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let rt = runtime();
+        let wait = Duration::from_millis(100);
+        let ctx = rt.block_on(async {
+            HephLspContext::new(
+                Arc::new(FakeEngine {
+                    root: dir.path().to_path_buf(),
+                    list: ListMode::Hangs,
+                }),
+                wait,
+            )
+        });
+        let started = Instant::now();
+        let got = std::thread::spawn(move || {
+            ctx.listing(Listing::Targets {
+                package: String::new(),
+            })
+        })
+        .join()
+        .expect("no panic");
+        assert!(
+            matches!(got, Err(ListingError::TimedOut(w)) if w == wait),
+            "{got:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A listing that errs reaches the caller as `Failed`, with its cause.
+    #[test]
+    fn a_failed_listing_keeps_its_cause() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let rt = runtime();
+        let ctx = rt.block_on(async {
+            HephLspContext::new(
+                Arc::new(FakeEngine {
+                    root: dir.path().to_path_buf(),
+                    list: ListMode::Fails,
+                }),
+                LISTING_WAIT,
+            )
+        });
+        let got = std::thread::spawn(move || {
+            ctx.listing(Listing::Targets {
+                package: String::new(),
+            })
+        })
+        .join()
+        .expect("no panic");
+        assert!(
+            matches!(&got, Err(ListingError::Failed(e)) if format!("{e:#}").contains("exploded")),
+            "{got:?}"
+        );
     }
 
     /// The LSP's listing calls must work from its own request thread, which has
@@ -612,17 +799,20 @@ mod tests {
             .build()
             .expect("runtime");
         let ctx = rt.block_on(async {
-            HephLspContext::new(Arc::new(FakeEngine {
-                root: dir.path().to_path_buf(),
-            }))
+            HephLspContext::new(Arc::new(FakeEngine::new(dir.path())), LISTING_WAIT)
         });
 
-        let packages = std::thread::spawn(move || ctx.list_packages(""))
-            .join()
-            .expect("the listing thread must not panic for want of a runtime");
+        let listed = std::thread::spawn(move || {
+            ctx.listing(Listing::Packages {
+                under: String::new(),
+            })
+        })
+        .join()
+        .expect("the listing thread must not panic for want of a runtime")
+        .expect("the listing answers");
         assert!(
-            packages.iter().any(|p| p == "mypkg"),
-            "the package walk must reach the LSP caller: {packages:?}"
+            listed.entries.iter().any(|e| e.name == "mypkg"),
+            "the package walk must reach the LSP caller: {listed:?}"
         );
     }
 
@@ -642,9 +832,7 @@ mod tests {
             .build()
             .expect("runtime");
         let ctx = rt.block_on(async {
-            HephLspContext::new(Arc::new(FakeEngine {
-                root: dir.path().to_path_buf(),
-            }))
+            HephLspContext::new(Arc::new(FakeEngine::new(dir.path())), LISTING_WAIT)
         });
 
         // `//lib` does not exist, so the load fails and the whole evaluation

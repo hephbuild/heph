@@ -48,6 +48,88 @@ pub enum Listing {
     Targets { package: String },
 }
 
+impl Listing {
+    /// Whether the path names a place inside the workspace ([`check_path`],
+    /// every segment whole). The path reaches every provider, some of which
+    /// join it to the workspace root and walk the result, so the LSP checks
+    /// what it types and the engine checks again what it is handed.
+    pub fn check(&self) -> Result<(), BadPath> {
+        match self {
+            Self::Packages { under: path } | Self::Targets { package: path } => {
+                check_path(path, path)
+            }
+        }
+    }
+}
+
+/// Why a package path is not listed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BadPath {
+    /// It starts with `/` (`///etc` types `/etc`).
+    Absolute,
+    /// A whole segment is `.` or `..`.
+    DotSegment,
+    /// Two slashes in a row (`a//b`), or one at the end of a package.
+    EmptySegment,
+    /// A NUL or other control character.
+    ControlByte,
+}
+
+impl BadPath {
+    /// The stable name `--explain --json` reports.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Absolute => "absolute",
+            Self::DotSegment => "dot_segment",
+            Self::EmptySegment => "empty_segment",
+            Self::ControlByte => "control_byte",
+        }
+    }
+
+    /// Why, in a sentence.
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::Absolute => "an absolute path is outside the workspace",
+            Self::DotSegment => "a `.` or `..` segment does not name a package",
+            Self::EmptySegment => "an empty segment (`//` inside the path) does not name a package",
+            Self::ControlByte => "a control character does not belong in a package path",
+        }
+    }
+}
+
+impl std::fmt::Display for BadPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({})", self.message(), self.as_str())
+    }
+}
+
+impl std::error::Error for BadPath {}
+
+/// Checks the package path `text` whose whole segments are `whole` (a
+/// prefix of it; the rest is a partial segment that only filters): no
+/// control character anywhere, no leading `/`, and each whole segment
+/// neither empty nor `.` nor `..`. Anything else stays inside the workspace
+/// when a provider joins it to the root.
+pub fn check_path(text: &str, whole: &str) -> Result<(), BadPath> {
+    if text.chars().any(char::is_control) {
+        return Err(BadPath::ControlByte);
+    }
+    if text.starts_with('/') {
+        return Err(BadPath::Absolute);
+    }
+    if whole.is_empty() {
+        return Ok(());
+    }
+    for seg in whole.split('/') {
+        match seg {
+            "" => return Err(BadPath::EmptySegment),
+            "." | ".." => return Err(BadPath::DotSegment),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// One [`LspEngine::list`] answer.
 pub struct Listed {
     /// The cache scope the listing ran in.
@@ -79,8 +161,10 @@ impl std::fmt::Debug for Listed {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListedEntry {
     pub name: String,
-    /// The provider that listed it first, in registration order.
-    pub provider: String,
+    /// The provider that listed it first, in registration order. Shared, not
+    /// owned: every entry from one provider points at one name, so a listing
+    /// costs no allocation per entry for a field completion never reads.
+    pub provider: Arc<str>,
 }
 
 /// How one provider answered the end of a cache scope.

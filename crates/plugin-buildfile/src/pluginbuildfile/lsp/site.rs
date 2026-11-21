@@ -448,6 +448,14 @@ pub(crate) enum Reason {
     ProvidersLoading,
     /// The document lies outside the repo the server is bound to.
     OutsideRoot,
+    /// The site's engine listing did not answer within the wait.
+    ListingTimedOut {
+        waited_ms: u64,
+    },
+    /// The site's engine listing returned an error.
+    ListingFailed {
+        message: String,
+    },
 }
 
 impl Reason {
@@ -469,6 +477,12 @@ impl Reason {
             Reason::NotASite => json!({"reason": "not_a_site"}),
             Reason::ProvidersLoading => json!({"reason": "providers_loading"}),
             Reason::OutsideRoot => json!({"reason": "outside_root"}),
+            Reason::ListingTimedOut { waited_ms } => {
+                json!({"reason": "listing_timed_out", "waited_ms": waited_ms})
+            }
+            Reason::ListingFailed { message } => {
+                json!({"reason": "listing_failed", "message": message})
+            }
         }
     }
 }

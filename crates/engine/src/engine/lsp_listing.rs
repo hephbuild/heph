@@ -73,6 +73,7 @@ impl Engine {
             .await?
             .into_iter()
             .unzip();
+        let names = self.lister_names();
         let mut entries: Vec<ListedEntry> = merge_packages(&m, &blocks)
             .into_iter()
             .map(|pkg| {
@@ -83,9 +84,8 @@ impl Engine {
                     .iter()
                     .zip(&indices)
                     .find(|(block, _)| block.binary_search(&pkg).is_ok())
-                    .and_then(|(_, &i)| self.providers.get(i))
-                    .map(|p| p.name.clone())
-                    .unwrap_or_default();
+                    .and_then(|(_, &i)| names.get(i))
+                    .map_or_else(|| Arc::from(""), Arc::clone);
                 ListedEntry {
                     name: pkg,
                     provider,
@@ -115,17 +115,23 @@ impl Engine {
         // so the dedup keeps the earliest-registered one.
         found.sort_unstable();
         found.dedup_by(|a, b| a.0 == b.0);
+        let names = self.lister_names();
         Ok(found
             .into_iter()
             .map(|(name, lister)| ListedEntry {
-                provider: self
-                    .providers
-                    .get(lister)
-                    .map(|p| p.name.clone())
-                    .unwrap_or_default(),
+                provider: names.get(lister).map_or_else(|| Arc::from(""), Arc::clone),
                 name,
             })
             .collect())
+    }
+
+    /// Each provider's name, by registration index, once per listing: every
+    /// entry shares its provider's, instead of a copy per entry.
+    fn lister_names(&self) -> Vec<Arc<str>> {
+        self.providers
+            .iter()
+            .map(|p| Arc::from(p.name.as_str()))
+            .collect()
     }
 }
 
@@ -192,7 +198,7 @@ mod tests {
             pkgs.entries,
             [ListedEntry {
                 name: "p".to_string(),
-                provider: "first".to_string()
+                provider: Arc::from("first")
             }],
             "{pkgs:?}"
         );
@@ -204,7 +210,7 @@ mod tests {
         let got: Vec<(&str, &str)> = targets
             .entries
             .iter()
-            .map(|e| (e.name.as_str(), e.provider.as_str()))
+            .map(|e| (e.name.as_str(), &*e.provider))
             .collect();
         assert_eq!(
             got,
