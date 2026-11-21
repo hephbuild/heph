@@ -2547,9 +2547,13 @@ mod tests {
             ..Provider::default()
         });
 
+        // The unscoped bucket's registry: `run_pkg_blocking` evaluates both
+        // packages in that bucket.
+        let caches = provider.caches(None);
+
         // `a` misses the cache for the shared file; before it claims, `b`
         // evaluates it, caches it and releases it.
-        provider.loads.set_before_claim_hook(
+        caches.loads.set_before_claim_hook(
             shared.clone(),
             enclose!((provider) move || {
                 run_pkg_blocking(&provider, "b").expect("evaluate package b");
@@ -2560,7 +2564,7 @@ mod tests {
         // `a/BUILD`, `b/BUILD` and `shared.BUILD` once each. Four is the shared
         // file evaluated by both packages.
         assert_eq!(
-            provider.loads.started(),
+            caches.loads.started(),
             3,
             "the shared file must be evaluated once, not again by the chain that missed before it was cached",
         );
