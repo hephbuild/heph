@@ -63,7 +63,8 @@ pub(crate) struct HephLspContext {
 /// engine, and the context is built on the loop's thread, which must not.
 /// The server hands the snapshot's [`DriverSource`] over when it lands
 /// ([`HephLspContext::set_drivers`]); until then a file that names a
-/// driver's `Kwargs` does not evaluate, so it gets no provenance.
+/// driver's `Kwargs` does not evaluate, so it gets no provenance. The server
+/// re-evaluates every open document as it lands.
 struct Drivers {
     source: DriverSource,
     /// Lazily built, shared across per-buffer evaluations; replaced with the

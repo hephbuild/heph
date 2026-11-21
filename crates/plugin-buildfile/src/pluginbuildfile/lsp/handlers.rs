@@ -64,6 +64,9 @@ impl Registry {
         let driver_schemas = engine.driver_schemas();
         let drivers = driver_schemas.keys().cloned().collect();
         let driver_source = DriverSource::fixed(driver_schemas.clone());
+        // Built here, on the snapshot's thread: the first handler or
+        // evaluation to ask would otherwise build it on the loop.
+        let _built = driver_source.kwargs();
         let providers = engine.provider_names();
         let provider_schemas = providers
             .iter()

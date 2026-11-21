@@ -1270,7 +1270,18 @@ fn driver_kwargs_reach_evaluation_when_the_registry_lands_late() {
     let (mut lsp, gate) = Lsp::new_gated();
     lsp.initialize();
     lsp.write("tools/BUILD", KWARGS_BUILD);
+    // Opened, and so evaluated, before the drivers land; never edited after.
+    let early = lsp.open(
+        "tools/BUILD",
+        &KWARGS_BUILD.replace("lib(\"a\"", "li│b(\"a\""),
+    );
     let doc = lsp.open("user/BUILD", "x = [\"//tools:│\"]\n");
+    // Both opens are handled before the gate opens.
+    lsp.barrier();
+    assert_eq!(
+        reason(&lsp.explain(&doc)).as_deref(),
+        Some("providers_loading")
+    );
     gate.release();
     let deadline = std::time::Instant::now() + TIMEOUT;
     while reason(&lsp.explain(&doc)).is_some() {
@@ -1285,6 +1296,24 @@ fn driver_kwargs_reach_evaluation_when_the_registry_lands_late() {
         vec!["//tools:a"],
         "the listing evaluates with the drivers that landed"
     );
+    // The early document was re-evaluated as the drivers landed: its
+    // diagnostics were republished clean for its version, and its call's
+    // provenance, which needs the file to evaluate, is there.
+    lsp.barrier();
+    let republished = lsp
+        .diagnostics
+        .iter()
+        .filter(|d| d["uri"] == json!(early.uri))
+        .count();
+    assert!(
+        republished >= 2,
+        "republished as the drivers landed: {:?}",
+        lsp.diagnostics
+    );
+    let diagnostics = lsp.last_diagnostics(&early).expect("diagnostics published");
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    let text = hover_text(&lsp.hover(&early));
+    assert!(text.contains("//tools:a"), "the call's targets: {text}");
 }
 
 #[test]
