@@ -1714,7 +1714,20 @@ mod tests {
         let (late, _late_guard) = logs.create();
         drop(logs);
         assert!(!dir.exists(), "the engine removes its own directory");
-        assert!(lock.try_lock().is_ok());
+        // `flock` belongs to the open file description, and a `fork` copies
+        // every fd: another test's spawn on another thread holds the engine's
+        // lock until its child execs. So wait for the lock rather than try it,
+        // bounded so a lock the engine never lets go fails instead of hanging.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // A gone receiver already failed the test.
+            let _sent = tx.send(lock.lock().map(|()| lock));
+        });
+        let freed = rx.recv_timeout(std::time::Duration::from_secs(60));
+        assert!(
+            matches!(freed, Ok(Ok(_))),
+            "the engine lets its lock go: {freed:?}"
+        );
         // A run that outlives the engine writes its first byte: nothing is
         // made again, and the log keeps the error.
         late.write_chunk(Stream::Stdout, b"late", None);
