@@ -43,15 +43,22 @@ pub enum InspectCommands {
     Packages(packages::Args),
     /// List the unique labels declared across matching targets
     ///
-    /// Enumerates every target in the packages matching the given matcher,
-    /// collects the labels each declares, and prints the sorted, deduplicated
-    /// set one per line. With no argument, scans the whole workspace.
+    /// Enumerates the targets in the packages matching the given matcher and
+    /// prints the sorted, deduplicated set of their labels one per line. With
+    /// no argument, scans the whole workspace.
+    ///
+    /// By default the labels are the ones providers list, read without
+    /// resolving any target: fast, but a listed target that does not exist
+    /// can contribute a label. `--exact` resolves every target and prints
+    /// the exact set.
     ///
     /// Examples:
     ///
     /// `heph inspect labels`
     ///
     /// `heph inspect labels //cmd/...`
+    ///
+    /// `heph inspect labels --exact`
     Labels(labels::Args),
     /// Print a target's input hash
     ///

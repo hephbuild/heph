@@ -50,6 +50,7 @@ pub use hplugin::hook;
 mod cache_codec;
 pub mod event;
 mod labels;
+pub use labels::LabelSource;
 pub mod listed;
 mod local_cache;
 mod local_cache_fs;

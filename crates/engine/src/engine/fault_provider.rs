@@ -55,11 +55,12 @@ pub struct Faults {
     pub fail_list_packages: bool,
     /// `list` of this package sleeps this long first.
     pub slow_list: Option<(String, Duration)>,
-    /// Signalled when the slow `list` starts. Every failing `get` waits for it
-    /// (or for the request to be cancelled), so the slow package is provably in
-    /// flight when the walk meets its first error, however loaded the machine
-    /// is. Set it only with `slow_list` naming a package the walk lists, or the
-    /// failing `get`s wait until cancelled.
+    /// Signalled when the slow `list` starts. Every failing `get` and
+    /// `fail_list` `list` waits for it (or for the request to be cancelled),
+    /// so the slow package is provably in flight when the walk meets its first
+    /// error, however loaded the machine is. Set it only with `slow_list`
+    /// naming a package the walk lists, or the failing calls wait until
+    /// cancelled.
     pub gate: Option<Arc<tokio::sync::Notify>>,
     /// At this stage, for this package or addr (ignored for
     /// [`Stage::Packages`]): signal the `Notify`, wait for the request to be
@@ -261,6 +262,13 @@ impl Provider for FaultProvider {
                 panic!("list blew up in {pkg}");
             }
             if self.faults.fail_list.contains(&pkg) {
+                if let Some(gate) = &self.faults.gate {
+                    tokio::select! {
+                        // Pass the permit on, as a failing `get` does.
+                        () = gate.notified() => gate.notify_one(),
+                        () = ctoken.cancelled() => {}
+                    }
+                }
                 anyhow::bail!("evaluating {pkg}/BUILD: syntax error");
             }
             if self.hidden(&pkg) {

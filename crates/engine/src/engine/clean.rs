@@ -94,24 +94,6 @@ struct TargetOutcome {
     bytes: u64,
 }
 
-/// Whether every node of `m` can be decided from an address alone — i.e. whether
-/// the cache's own keys are enough and the graph need not be walked.
-///
-/// [`Matcher::Label`], [`Matcher::Driver`] and [`Matcher::TreeOutputTo`] are the
-/// ones that cannot: they answer [`MatchResult::MatchShrug`] on an addr, because
-/// a label set, a driver and a target's output paths only exist on its spec or
-/// def. Decided by node kind
-/// on the whole tree, so a composite of allowed kinds (`//a/... && !//b/...`)
-/// still takes the fast path.
-fn is_addr_only(m: &Matcher) -> bool {
-    match m {
-        Matcher::Label(_) | Matcher::Driver(_) | Matcher::TreeOutputTo(_) => false,
-        Matcher::Or(terms) | Matcher::And(terms) => terms.iter().all(is_addr_only),
-        Matcher::Not(inner) => is_addr_only(inner),
-        Matcher::Addr(_) | Matcher::Package(_) | Matcher::PackagePrefix(_) => true,
-    }
-}
-
 impl Engine {
     /// Delete every locally cached revision of every target `matcher` selects.
     ///
@@ -119,7 +101,7 @@ impl Engine {
     /// whole local cache.
     ///
     /// The selection is evaluated against the cache's own keys when the matcher
-    /// is decidable from an address ([`is_addr_only`]), and against the resolved
+    /// is decidable from an address ([`Matcher::is_addr_only`]), and against the resolved
     /// graph otherwise — see the module docs for why, and for what each path can
     /// reach. Only [`MatchResult::MatchYes`] selects on the addr-only path: a
     /// `MatchShrug` is unreachable there today, and skipping rather than guessing
@@ -151,7 +133,7 @@ impl Engine {
             stats: CleanStats::default(),
         };
 
-        if is_addr_only(matcher) {
+        if matcher.is_addr_only() {
             // Drive off the cache's own enumeration: the only targets that can
             // possibly be cleaned are the ones it names, and the matcher decides
             // each from its addr.
@@ -610,31 +592,6 @@ mod tests {
 
         assert_eq!(stats, CleanStats::default());
         assert!(present(&engine, &addr("t"), "h1"), "nothing was touched");
-    }
-
-    #[test]
-    fn only_label_and_tree_output_need_the_graph() {
-        // Which path a selection takes is decided by node kind over the whole
-        // tree — the property `clean` relies on to skip resolution for every
-        // form a user can write without naming a label.
-        assert!(is_addr_only(&everything()));
-        assert!(is_addr_only(&Matcher::Addr(addr("t"))));
-        assert!(is_addr_only(&Matcher::And(vec![
-            everything(),
-            Matcher::Not(Box::new(Matcher::PackagePrefix(PkgBuf::from("vendor")))),
-        ])));
-
-        assert!(!is_addr_only(&Matcher::Label("test".to_string())));
-        assert!(!is_addr_only(&Matcher::TreeOutputTo(PkgBuf::from("gen"))));
-        assert!(!is_addr_only(&Matcher::Driver("bash".to_string())));
-        // Nested under any combinator, it still forces the graph walk.
-        assert!(!is_addr_only(&Matcher::Not(Box::new(Matcher::Label(
-            "test".to_string()
-        )))));
-        assert!(!is_addr_only(&Matcher::And(vec![
-            everything(),
-            Matcher::Label("test".to_string()),
-        ])));
     }
 
     #[tokio::test]

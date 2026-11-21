@@ -14,14 +14,31 @@ use crate::tui::{self, App, AppContext, BufferedStdout, LogSink};
 pub struct Args {
     /// Package matcher (defaults to all packages)
     pub matcher: Option<String>,
+    /// Exact: only labels of targets that exist, at the cost of resolving
+    /// every target. Without it, labels come from what providers list — fast,
+    /// but a label carried only by a listed target that does not resolve (a Go
+    /// `test` in a package without tests) is printed too.
+    #[arg(long)]
+    pub exact: bool,
     #[command(flatten)]
     pub dashboard: crate::commands::progress_app::DashboardArgs,
+}
+
+impl Args {
+    fn source(&self) -> crate::engine::LabelSource {
+        if self.exact {
+            crate::engine::LabelSource::Resolved
+        } else {
+            crate::engine::LabelSource::Listed
+        }
+    }
 }
 
 struct LabelsApp {
     engine: Arc<Engine>,
     matcher: Matcher,
     fail_fast: bool,
+    source: crate::engine::LabelSource,
 }
 
 #[async_trait]
@@ -56,10 +73,19 @@ impl App for LabelsApp {
                     rs.clone(),
                     &self.matcher,
                     crate::engine::Discovery::keep_going_unless(self.fail_fast, &gaps),
+                    self.source,
                 )
                 .await?
             {
                 out.println(label);
+            }
+            // To the log (stderr), never stdout: the label set stays the whole
+            // of the output. A matcher an addr cannot decide was resolved.
+            if self.source == crate::engine::LabelSource::Listed && self.matcher.is_addr_only() {
+                tracing::info!(
+                    "labels read from provider listings, which may include labels of \
+                     targets that do not exist; --exact prints the exact set"
+                );
             }
             Ok(())
         }
@@ -94,6 +120,7 @@ async fn execute_async(
         engine,
         matcher,
         fail_fast: global.fail_fast,
+        source: args.source(),
     };
     let interactive = tui::should_use_tui(global.no_tui);
     tui::run_app_with(
@@ -105,4 +132,26 @@ async fn execute_async(
         shutdown,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(clap::Parser)]
+    struct Cli {
+        #[command(flatten)]
+        args: Args,
+    }
+
+    /// Listed labels unless `--exact` asks for the exact set.
+    #[test]
+    fn exact_flag_picks_the_label_source() -> anyhow::Result<()> {
+        let plain = Cli::try_parse_from(["labels", "//foo/..."])?.args;
+        assert_eq!(plain.source(), crate::engine::LabelSource::Listed);
+        let exact = Cli::try_parse_from(["labels", "--exact", "//foo/..."])?.args;
+        assert_eq!(exact.source(), crate::engine::LabelSource::Resolved);
+        Ok(())
+    }
 }

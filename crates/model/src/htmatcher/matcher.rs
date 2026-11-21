@@ -120,6 +120,24 @@ impl Matcher {
         self.matches_listed(addr, &ListedFacts::UNKNOWN)
     }
 
+    /// Whether every node of `self` can be decided from an address alone, so
+    /// [`matches_addr`](Self::matches_addr) never shrugs and nothing about a
+    /// target need be resolved to select it.
+    ///
+    /// [`Matcher::Label`], [`Matcher::Driver`] and [`Matcher::TreeOutputTo`]
+    /// are the ones that cannot: a label set, a driver and a target's output
+    /// paths only exist on its spec or def. Decided by node kind on the whole
+    /// tree, so a composite of allowed kinds (`//a/... && !//b/...`) still
+    /// counts.
+    pub fn is_addr_only(&self) -> bool {
+        match self {
+            Matcher::Label(_) | Matcher::Driver(_) | Matcher::TreeOutputTo(_) => false,
+            Matcher::Or(terms) | Matcher::And(terms) => terms.iter().all(Matcher::is_addr_only),
+            Matcher::Not(inner) => inner.is_addr_only(),
+            Matcher::Addr(_) | Matcher::Package(_) | Matcher::PackagePrefix(_) => true,
+        }
+    }
+
     /// Whether evaluating `self` can read a listed fact. A walk merges listings
     /// only for a matcher that will act on them — an `Addr` clone and a map
     /// entry per candidate otherwise bought nothing.
@@ -254,6 +272,30 @@ mod tests {
         let a = addr("foo/bar", "baz");
         let b = addr("foo/bar", "qux");
         assert_eq!(Matcher::Addr(a).matches_addr(&b), MatchResult::MatchNo);
+    }
+
+    #[test]
+    fn only_label_driver_and_tree_output_are_not_addr_only() {
+        // Decided by node kind over the whole tree — the property `clean` and
+        // `labels` rely on to skip resolution for every form a user can write
+        // without naming a label.
+        let everything = Matcher::PackagePrefix(PkgBuf::from(""));
+        assert!(everything.is_addr_only());
+        assert!(Matcher::Addr(addr("", "t")).is_addr_only());
+        assert!(
+            Matcher::And(vec![
+                everything.clone(),
+                Matcher::Not(Box::new(Matcher::PackagePrefix(PkgBuf::from("vendor")))),
+            ])
+            .is_addr_only()
+        );
+
+        assert!(!Matcher::Label("test".to_string()).is_addr_only());
+        assert!(!Matcher::TreeOutputTo(PkgBuf::from("gen")).is_addr_only());
+        assert!(!Matcher::Driver("bash".to_string()).is_addr_only());
+        // Nested under any combinator, it still needs the target.
+        assert!(!Matcher::Not(Box::new(Matcher::Label("test".to_string()))).is_addr_only());
+        assert!(!Matcher::And(vec![everything, Matcher::Label("test".to_string())]).is_addr_only());
     }
 
     #[test]

@@ -6,7 +6,7 @@ use crate::engine::provider::ListRequest;
 use crate::engine::request_state::RequestState;
 use crate::engine::spec::EngineTargetSpec;
 use enclose::enclose;
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::{FutureExt, Stream, StreamExt, TryStreamExt};
 use hcore::hmemoizer::downcast_chain_ref;
 use hmodel::htaddr::Addr;
 use hmodel::htmatcher;
@@ -216,35 +216,14 @@ impl Engine {
             // Multiple providers can surface the same addr (or the same package
             // from `packages()`), so dedup before yielding.
             let mut seen: FxHashSet<Addr> = FxHashSet::default();
-            // Callback surface handed to each `list` so a provider can gather
-            // config beyond the package ancestry (e.g. the go module variant
-            // universe via `states_under`). `for_list`, so a reentrant
-            // `executor.query()` called from inside a `list()` is caught rather
-            // than silently nested — see its doc comment in `result.rs`.
-            let executor: Arc<dyn hplugin::provider::ProviderExecutor> = Arc::new(
-                crate::engine::result::EngineProviderExecutor::for_list(Arc::downgrade(&self), rs.clone()),
-            );
             // A provider whose package listing failed covers every package this
             // walk visits (its prefix is the matcher's), so its listings are
             // missing from all of them: a gap must mean "results missing",
             // never a fact decided without a co-lister's say.
-            let mut packages_gap = false;
-            let pkgs: Vec<String> = match &gaps {
-                None => self.packages(m, &rs).await?.collect::<anyhow::Result<_>>()?,
-                Some(gaps) => {
-                    let (pkgs, skipped) = self.packages_keep_going(m, &rs, gaps).await?;
-                    skipped_any |= skipped;
-                    packages_gap = skipped;
-                    pkgs
-                }
-            };
+            let (pkgs, packages_gap) = self.walk_packages(m, &rs, gaps.as_deref()).await?;
+            skipped_any |= packages_gap;
 
-            // Set when the walk is abandoning. `Buffered` refills its queue from
-            // the underlying iterator on every poll, so a drain still *visits*
-            // all N packages — what this flag removes is the cost of each: a
-            // package that has not started falls straight through instead of
-            // paying a whole-package Starlark evaluation for a walk whose answer
-            // nobody wants. O(N) cheap poll-throughs, not O(N) evaluations.
+            // Set when the walk is abandoning; see `package_scans`.
             let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
             // Discovery splits in two, and the split is not cosmetic.
@@ -308,151 +287,13 @@ impl Engine {
             // `EngineProviderExecutor::query` makes the same choice for a
             // stronger reason: its order carries through `pluginquery`'s `deps`
             // into `plugingroup`, which folds them in order into a def hash.)
-            let per_pkg = futures::stream::iter(pkgs.into_iter()
-                // Ends the source once the walk is abandoning, rather than
-                // letting `Buffered` keep refilling from it. `Buffered` pulls a
-                // replacement on every poll, and each pull *spawns*, so a plain
-                // drain over a 20k-package workspace would spawn 20k tasks just
-                // to have each one bail. Ending the iterator makes the drain
-                // await only the <=K handles already spawned.
-                .take_while(enclose!((stop) move |_| !stop.load(std::sync::atomic::Ordering::Relaxed)))
-                .map(|pkg_str| {
-                let pkg = PkgBuf::from(pkg_str);
-
-                // No package-scope prune here: `packages()` above already
-                // returns only packages `m` can match, whatever the provider
-                // did with `ListPackagesRequest::prefix`. That matters because
-                // `list` is a whole-package Starlark evaluation for the
-                // buildfile provider — a scoped selector (`//foo/...`,
-                // `label(l) && //foo/...`, a bare `//foo:bar`) must not pay to
-                // evaluate every BUILD file in the repo only to throw the
-                // results away at the addr check below.
-                //
-                // Spawned here rather than through a later `.map()`: handing the
-                // async block to a generic fn through a combinator makes its
-                // captured lifetimes late-bound and trips "implementation of
-                // `FnOnce` is not general enough".
-                hcore::hmemoizer::spawn_with_cycle_ctx(enclose!((self => engine, rs, executor, stop) async move {
-                    // An abandoned walk must not start evaluating packages it has
-                    // not reached yet — that is what keeps the drains below (and
-                    // in `Engine::result`) to a cheap poll per remaining package
-                    // instead of a package evaluation per remaining package.
-                    //
-                    // `Err`, never `Ok` with nothing in it: an empty package and a
-                    // package the walk never looked at must not read the same.
-                    // Under `KeepGoing` a package that could not be scanned is
-                    // a recorded skip the command reports; a cancelled one is
-                    // neither, it ends the walk.
-                    if rs.ctoken().is_cancelled()
-                        || stop.load(std::sync::atomic::Ordering::Relaxed)
-                    {
-                        return Err(anyhow::Error::new(CancelledError));
-                    }
-                    let mut scan = PackageScan::default();
-                    let states = match Arc::clone(&engine).probe_segments(&rs, &pkg).await {
-                        Ok(states) => states,
-                        Err(e) if keep_going && !is_cancellation(&rs, &e) => {
-                            scan.skipped.push(Skip {
-                                stage: Stage::Probe,
-                                provider: provider_of(&e).to_string(),
-                                scope: format!("//{pkg}"),
-                                error: e,
-                            });
-                            return Ok(scan);
-                        }
-                        Err(e) => return Err(e),
-                    };
-
-                    for (lister, provider) in engine.providers.iter().enumerate() {
-                        let listed = provider.provider.list(ListRequest {
-                            request_id: rs.request_id().to_string(),
-                            package: pkg.clone(),
-                            states: states
-                                .iter()
-                                .filter(|s| s.provider == provider.name)
-                                .cloned()
-                                .collect(),
-                            executor: Arc::clone(&executor),
-                        }, rs.ctoken()).await
-                            // Drained before the next await.
-                            .and_then(|it| it.collect::<anyhow::Result<Vec<_>>>());
-                        let raw = match listed {
-                            Ok(raw) => raw,
-                            // The other providers' candidates in this package
-                            // are still good.
-                            Err(e) if keep_going && !is_cancellation(&rs, &e) => {
-                                scan.skipped.push(Skip {
-                                    stage: Stage::List,
-                                    provider: provider.name.clone(),
-                                    scope: format!("//{pkg}"),
-                                    error: e,
-                                });
-                                scan.listing_gap = true;
-                                continue;
-                            }
-                            Err(e) => return Err(e),
-                        };
-
-                        for item in raw {
-                            if item.addr.package == pkg {
-                                scan.candidates.push(Candidate {
-                                    addr: item.addr,
-                                    facts: item.facts,
-                                    lister,
-                                });
-                            }
-                        }
-                    }
-
-                    anyhow::Ok(scan)
-                }))
-            }))
-            // Each package runs as its own task, not merely as a future inside
-            // `Buffered`. That is what makes the serial consumer below safe.
             //
-            // Both `query` walks must be polled inside a tokio runtime because of
-            // it. Every caller today is (the commands, `Engine::result`'s walk
-            // task, `pluginquery::get`, and the stabby host's `DynFuture`, which
-            // host workers poll) — but the surrounding code is otherwise
-            // runtime-agnostic, and `HostExecutor::note_dep` already drives an
-            // engine future with `block_on` across the synchronous seam, so state
-            // the precondition rather than leave it to be rediscovered.
-            //
-            // `pluginbuildfile::probe`/`list` reach `run_pkg`, which takes a
-            // `PKG_EVAL_SLOTS` permit (a global semaphore sized `cores`). When
-            // this walk was written the permit was held across `run_pkg`'s
-            // `blocking::run(..).await`, and as plain futures the holders
-            // advanced only when the consumer polled this stream — while the
-            // consumer stops polling it the moment it awaits
-            // `get_spec`/`get_def` in the `MatchShrug` arm, which itself can
-            // need a permit for another package. `Semaphore` is FIFO: the
-            // consumer queued behind `cores` futures that could not advance.
-            // Deadlock. `run_pkg` has since moved the permit *into* the
-            // blocking job (released on the pool thread, no poll required —
-            // see its comment), which makes that specific wedge impossible on
-            // its own. Spawning stays as the structural half of the fix:
-            // `run_pkg` is reachable from arbitrary provider code, and this
-            // walk cannot know what those bodies acquire and hold across an
-            // await — spawned, they are polled by the runtime regardless of
-            // what the consumer is doing, so no such resource can wedge the
-            // walk again. It also keeps packages progressing while the
-            // consumer parks in the `MatchShrug` arm.
-            // `discovery_fanout_does_not_starve_the_matcher_consumer` models
-            // the original shape.
-            //
-            // `spawn_with_cycle_ctx`, not bare `tokio::spawn`, for the reason
-            // `Engine::result` uses it one level up: the body calls
-            // `Memoizer::once`, and without the inherited frame those calls get
-            // no wait-for edge, so a cycle through them hangs instead of
-            // reporting `MemoizerCycleError`.
-            //
-            // `buffered` over `JoinHandle`s still yields in submission order, so
-            // the emitted sequence is unchanged.
-            .buffered(crate::engine::fanout::discovery_concurrency())
-            .map(|joined| match joined {
-                Ok(res) => res,
-                Err(e) => Err(anyhow::Error::new(e).context("package discovery task panicked")),
-            });
+            // Each package is its own spawned task (`package_scans` says why),
+            // and `buffered` over those `JoinHandle`s still yields in
+            // submission order, so the emitted sequence is unchanged.
+            let per_pkg = Arc::clone(&self)
+                .package_scans(rs.clone(), pkgs, keep_going, Arc::clone(&stop))
+                .buffered(crate::engine::fanout::discovery_concurrency());
             futures::pin_mut!(per_pkg);
 
             // Every way out of the walk on an error goes through this one value,
@@ -573,6 +414,331 @@ impl Engine {
         }
     }
 
+    /// The packages a walk over `m` scans: [`Engine::packages`], or under
+    /// keep-going (`gaps`) [`Engine::packages_keep_going`]. The `bool` is
+    /// whether a provider's package listing was skipped — then its listings
+    /// are missing from every package the walk visits.
+    async fn walk_packages(
+        &self,
+        m: &htmatcher::Matcher,
+        rs: &Arc<RequestState>,
+        gaps: Option<&Gaps>,
+    ) -> anyhow::Result<(Vec<String>, bool)> {
+        match gaps {
+            None => Ok((
+                self.packages(m, rs).await?.collect::<anyhow::Result<_>>()?,
+                false,
+            )),
+            Some(gaps) => self.packages_keep_going(m, rs, gaps).await,
+        }
+    }
+
+    /// The producer half of a package walk ([`Engine::query`],
+    /// [`Engine::listed_candidates`]): one future per package of `pkgs`, in
+    /// order, each a spawned [`Engine::scan_package`] task. The caller picks
+    /// `buffered` (order matters) or `buffer_unordered` and consumes the scans.
+    ///
+    /// `stop` is set by the caller when the walk is abandoning. `Buffered`
+    /// refills its queue from the underlying iterator on every poll, so a
+    /// drain would still *visit* all N packages — what the flag removes is the
+    /// cost of each: it ends the source, and a package that has not started
+    /// falls straight through instead of paying a whole-package Starlark
+    /// evaluation for a walk whose answer nobody wants.
+    ///
+    /// No package-scope prune here: `pkgs` (from [`Engine::walk_packages`])
+    /// holds only packages `m` can match, whatever the provider did with
+    /// `ListPackagesRequest::prefix`. That matters because `list` is a
+    /// whole-package Starlark evaluation for the buildfile provider — a scoped
+    /// selector (`//foo/...`, `label(l) && //foo/...`, a bare `//foo:bar`) must
+    /// not pay to evaluate every BUILD file in the repo only to throw the
+    /// results away at the addr check.
+    ///
+    /// Each package runs as its own task, not merely as a future inside the
+    /// buffer. That is what makes `query`'s serial consumer safe.
+    ///
+    /// Both walks must be polled inside a tokio runtime because of it. Every
+    /// caller today is (the commands, `Engine::result`'s walk task,
+    /// `pluginquery::get`, and the stabby host's `DynFuture`, which host
+    /// workers poll) — but the surrounding code is otherwise runtime-agnostic,
+    /// and `HostExecutor::note_dep` already drives an engine future with
+    /// `block_on` across the synchronous seam, so state the precondition rather
+    /// than leave it to be rediscovered.
+    ///
+    /// `pluginbuildfile::probe`/`list` reach `run_pkg`, which takes a
+    /// `PKG_EVAL_SLOTS` permit (a global semaphore sized `cores`). When `query`
+    /// was written the permit was held across `run_pkg`'s
+    /// `blocking::run(..).await`, and as plain futures the holders advanced
+    /// only when the consumer polled the stream — while `query`'s consumer
+    /// stops polling it the moment it awaits `get_spec`/`get_def` in the
+    /// `MatchShrug` arm, which itself can need a permit for another package.
+    /// `Semaphore` is FIFO: the consumer queued behind `cores` futures that
+    /// could not advance. Deadlock. `run_pkg` has since moved the permit
+    /// *into* the blocking job (released on the pool thread, no poll required —
+    /// see its comment), which makes that specific wedge impossible on its
+    /// own. Spawning stays as the structural half of the fix: `run_pkg` is
+    /// reachable from arbitrary provider code, and the walk cannot know what
+    /// those bodies acquire and hold across an await — spawned, they are
+    /// polled by the runtime regardless of what the consumer is doing, so no
+    /// such resource can wedge the walk again. It also keeps packages
+    /// progressing while the consumer parks in the `MatchShrug` arm.
+    /// `discovery_fanout_does_not_starve_the_matcher_consumer` models the
+    /// original shape.
+    ///
+    /// `spawn_with_cycle_ctx`, not bare `tokio::spawn`, for the reason
+    /// `Engine::result` uses it one level up: the body calls
+    /// `Memoizer::once`, and without the inherited frame those calls get no
+    /// wait-for edge, so a cycle through them hangs instead of reporting
+    /// `MemoizerCycleError`.
+    fn package_scans(
+        self: Arc<Self>,
+        rs: Arc<RequestState>,
+        pkgs: Vec<String>,
+        keep_going: bool,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+    ) -> impl Stream<Item = impl Future<Output = anyhow::Result<PackageScan>> + Send> + Send + use<>
+    {
+        // Callback surface handed to each `list` so a provider can gather
+        // config beyond the package ancestry (e.g. the go module variant
+        // universe via `states_under`). `for_list`, so a reentrant
+        // `executor.query()` called from inside a `list()` is caught rather
+        // than silently nested — see its doc comment in `result.rs`.
+        let executor: Arc<dyn hplugin::provider::ProviderExecutor> =
+            Arc::new(crate::engine::result::EngineProviderExecutor::for_list(
+                Arc::downgrade(&self),
+                rs.clone(),
+            ));
+        futures::stream::iter(
+            pkgs.into_iter()
+                // Ends the source once the walk is abandoning, rather than
+                // letting the buffer keep refilling from it. It pulls a
+                // replacement on every poll, and each pull *spawns*, so a plain
+                // drain over a 20k-package workspace would spawn 20k tasks just
+                // to have each one bail. Ending the iterator makes the drain
+                // await only the <=K handles already spawned.
+                .take_while(
+                    enclose!((stop) move |_| !stop.load(std::sync::atomic::Ordering::Relaxed)),
+                )
+                .map(move |pkg_str| {
+                    let pkg = PkgBuf::from(pkg_str);
+                    // Spawned here rather than through a later `.map()`:
+                    // handing the async block to a generic fn through a
+                    // combinator makes its captured lifetimes late-bound and
+                    // trips "implementation of `FnOnce` is not general enough".
+                    hcore::hmemoizer::spawn_with_cycle_ctx(
+                        enclose!((self => engine, rs, executor, stop) async move {
+                            // An abandoned walk must not start evaluating packages
+                            // it has not reached yet — that is what keeps the
+                            // callers' drains (and `Engine::result`'s) to a cheap
+                            // poll per remaining package instead of a package
+                            // evaluation per remaining package.
+                            //
+                            // `Err`, never `Ok` with nothing in it: an empty
+                            // package and a package the walk never looked at must
+                            // not read the same. Under `KeepGoing` a package that
+                            // could not be scanned is a recorded skip the command
+                            // reports; a cancelled one is neither, it ends the walk.
+                            if rs.ctoken().is_cancelled()
+                                || stop.load(std::sync::atomic::Ordering::Relaxed)
+                            {
+                                return Err(anyhow::Error::new(CancelledError));
+                            }
+                            engine.scan_package(&rs, &executor, pkg, keep_going).await
+                        }),
+                    )
+                    .map(|joined| match joined {
+                        Ok(res) => res,
+                        Err(e) => {
+                            Err(anyhow::Error::new(e).context("package discovery task panicked"))
+                        }
+                    })
+                }),
+        )
+    }
+
+    /// Probe `pkg` and collect every provider's listing of it, in provider
+    /// order. Under keep-going (`keep_going`) a failed probe or `list` is a
+    /// recorded skip in the scan rather than an error.
+    async fn scan_package(
+        self: Arc<Self>,
+        rs: &Arc<RequestState>,
+        executor: &Arc<dyn hplugin::provider::ProviderExecutor>,
+        pkg: PkgBuf,
+        keep_going: bool,
+    ) -> anyhow::Result<PackageScan> {
+        let mut scan = PackageScan::default();
+        let states = match Arc::clone(&self).probe_segments(rs, &pkg).await {
+            Ok(states) => states,
+            Err(e) if keep_going && !is_cancellation(rs, &e) => {
+                scan.skipped.push(Skip {
+                    stage: Stage::Probe,
+                    provider: provider_of(&e).to_string(),
+                    scope: format!("//{pkg}"),
+                    error: e,
+                });
+                return Ok(scan);
+            }
+            Err(e) => return Err(e),
+        };
+
+        for (lister, provider) in self.providers.iter().enumerate() {
+            let listed = provider
+                .provider
+                .list(
+                    ListRequest {
+                        request_id: rs.request_id().to_string(),
+                        package: pkg.clone(),
+                        states: states
+                            .iter()
+                            .filter(|s| s.provider == provider.name)
+                            .cloned()
+                            .collect(),
+                        executor: Arc::clone(executor),
+                    },
+                    rs.ctoken(),
+                )
+                .await
+                // Drained before the next await.
+                .and_then(|it| it.collect::<anyhow::Result<Vec<_>>>());
+            let raw = match listed {
+                Ok(raw) => raw,
+                // The other providers' candidates in this package are still
+                // good.
+                Err(e) if keep_going && !is_cancellation(rs, &e) => {
+                    scan.skipped.push(Skip {
+                        stage: Stage::List,
+                        provider: provider.name.clone(),
+                        scope: format!("//{pkg}"),
+                        error: e,
+                    });
+                    scan.listing_gap = true;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+
+            for item in raw {
+                if item.addr.package == pkg {
+                    scan.candidates.push(Candidate {
+                        addr: item.addr,
+                        facts: item.facts,
+                        lister,
+                    });
+                }
+            }
+        }
+
+        Ok(scan)
+    }
+
+    /// Every candidate a provider lists for an address-decidable `m`, one per
+    /// addr, with its merged listed facts, and **without resolving any of
+    /// them**: a listed candidate may not exist. This is the walk behind the
+    /// fast `heph inspect labels`, which reads each candidate's listed labels
+    /// instead of its spec.
+    ///
+    /// A candidate's facts are [`ListedFacts::UNKNOWN`] when they cannot be
+    /// trusted: the request ignores listed facts (`HEPH_NO_LISTED_FACTS=1`), or
+    /// a provider's package listing or its `list` of this package was skipped
+    /// under keep-going, so a co-lister that could disagree is missing.
+    ///
+    /// `m` must be decidable from an addr ([`htmatcher::Matcher::is_addr_only`]),
+    /// or the stream is a single error before anything is listed; a candidate
+    /// the addr does not select is dropped. Packages are yielded in completion
+    /// order.
+    ///
+    /// A whole-graph `m` driven to completion with nothing skipped records the
+    /// graph size, as [`Engine::query`] does: the count of candidates yielded.
+    pub(crate) fn listed_candidates<'a>(
+        self: Arc<Self>,
+        rs: Arc<RequestState>,
+        m: &'a htmatcher::Matcher,
+        discovery: Discovery,
+    ) -> impl Stream<Item = anyhow::Result<Candidate>> + 'a {
+        let trusted = rs.listed_facts_trust().trusts();
+        let whole_graph = matches!(m, htmatcher::Matcher::PackagePrefix(p) if p.is_empty());
+        async_stream::try_stream! {
+            if !m.is_addr_only() {
+                Err(anyhow::anyhow!(
+                    "listed_candidates: {m:?} cannot be decided from an addr"
+                ))?;
+            }
+            let gaps = discovery.gaps().cloned();
+            let keep_going = gaps.is_some();
+            let (pkgs, packages_gap) = self.walk_packages(m, &rs, gaps.as_deref()).await?;
+            let mut skipped_any = packages_gap;
+            let mut yielded: u64 = 0;
+
+            // Spawned like `query`'s packages, and on an error raised inside
+            // this walk, joined before it propagates: a package task must not
+            // outlive the walk holding the request state. (A consumer that
+            // drops the stream early detaches the tasks in flight, as it does
+            // for `query`'s.)
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let per_pkg = Arc::clone(&self)
+                .package_scans(rs.clone(), pkgs, keep_going, Arc::clone(&stop))
+                .buffer_unordered(crate::engine::fanout::discovery_concurrency());
+            futures::pin_mut!(per_pkg);
+
+            let fatal: Option<anyhow::Error> = loop {
+                let scan = match per_pkg.next().await {
+                    None => break None,
+                    Some(Ok(scan)) => scan,
+                    Some(Err(e)) => break Some(e),
+                };
+                if let Some(gaps) = &gaps {
+                    for skip in scan.skipped {
+                        skipped_any = true;
+                        gaps.record(skip.stage, &skip.provider, skip.scope, &skip.error);
+                    }
+                }
+                let facts_usable = trusted && !packages_gap && !scan.listing_gap;
+                for mut c in merge_listings(scan.candidates) {
+                    // Addr-only (checked above), so never a shrug.
+                    if m.matches_addr(&c.addr) != MatchResult::MatchYes {
+                        continue;
+                    }
+                    if !facts_usable {
+                        c.facts = ListedFacts::UNKNOWN;
+                    }
+                    yielded += 1;
+                    yield c;
+                }
+            };
+
+            if let Some(e) = fatal {
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                while per_pkg.next().await.is_some() {}
+                Err(e)?;
+            }
+
+            if whole_graph && !skipped_any {
+                htelemetry::telemetry::record_graph_size(yielded);
+            }
+        }
+    }
+
+    /// The spec of a candidate [`Engine::query`] or
+    /// [`Engine::listed_candidates`] yielded, or `None` when it does not exist
+    /// (see [`skip_unresolvable`]) or, under keep-going, cannot be resolved —
+    /// then the failure is recorded in `gaps`.
+    pub(crate) async fn resolve_candidate_spec(
+        self: Arc<Self>,
+        rs: Arc<RequestState>,
+        gaps: Option<Arc<Gaps>>,
+        addr: Addr,
+    ) -> anyhow::Result<Option<Arc<EngineTargetSpec>>> {
+        match skip_unresolvable(&addr, self.get_spec(rs.clone(), &addr).await) {
+            Err(e) => match &gaps {
+                Some(gaps) if !is_cancellation(&rs, &e) => {
+                    gaps.record(Stage::Spec, provider_of(&e), addr.format(), &e);
+                    Ok(None)
+                }
+                _ => Err(e),
+            },
+            res => res,
+        }
+    }
+
     /// [`Engine::packages`] for a keep-going walk: every provider whose listing
     /// succeeded, merged the same way, with each failed listing recorded in
     /// `gaps`. The `bool` is whether anything was recorded.
@@ -630,27 +796,13 @@ impl Engine {
     ) -> impl Stream<Item = anyhow::Result<Arc<EngineTargetSpec>>> + 'a {
         // Cap in-flight spec resolutions; the engine's own semaphores gate the
         // real work, this just bounds the orchestration set held off the stream.
-        let concurrency = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .saturating_mul(2);
+        let concurrency = crate::engine::fanout::discovery_concurrency();
         let gaps = discovery.gaps().cloned();
 
         Arc::clone(&self)
             .query(rs.clone(), m, discovery)
             .map_ok(move |addr| {
-                enclose!((self => engine, rs, gaps) async move {
-                    match skip_unresolvable(&addr, engine.get_spec(rs.clone(), &addr).await) {
-                        Err(e) => match &gaps {
-                            Some(gaps) if !is_cancellation(&rs, &e) => {
-                                gaps.record(Stage::Spec, provider_of(&e), addr.format(), &e);
-                                Ok(None)
-                            }
-                            _ => Err(e),
-                        },
-                        res => res,
-                    }
-                })
+                Arc::clone(&self).resolve_candidate_spec(rs.clone(), gaps.clone(), addr)
             })
             .try_buffer_unordered(concurrency)
             .try_filter_map(|spec| std::future::ready(Ok(spec)))
