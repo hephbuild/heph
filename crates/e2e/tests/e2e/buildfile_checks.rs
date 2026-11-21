@@ -16,6 +16,7 @@
 
 use futures::TryStreamExt as _;
 use hcore::events::CacheOutcomeKind;
+use hcore::htvalue::Value;
 use heph::commands::bootstrap;
 use heph::commands::inspect::failure::failure_view;
 use heph::engine::config_yaml;
@@ -26,6 +27,7 @@ use heph::htmatcher::Matcher;
 use heph::htpkg::PkgBuf;
 use heph::pluginbuildfile::ShadowedChecks;
 use std::collections::{BTreeMap, BTreeSet};
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::sync::Arc;
 
 /// The documented CI selector (docs/BUILDFILE_CHECKS.md), the `-e` argument of
@@ -65,10 +67,27 @@ impl Ws {
         std::fs::read_to_string(self.dir.path().join(rel)).expect("read")
     }
 
-    fn mtime(&self, rel: &str) -> std::time::SystemTime {
+    /// What a write-back would change even with the same bytes: the mtime,
+    /// and the inode a replace-by-rename gives the file.
+    fn stamp(&self, rel: &str) -> (std::time::SystemTime, u64) {
+        let meta = std::fs::metadata(self.dir.path().join(rel)).expect("stat");
+        (meta.modified().expect("mtime"), meta.ino())
+    }
+
+    fn mode(&self, rel: &str) -> u32 {
         std::fs::metadata(self.dir.path().join(rel))
-            .and_then(|m| m.modified())
-            .expect("mtime")
+            .expect("stat")
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    fn set_mode(&self, rel: &str, mode: u32) {
+        std::fs::set_permissions(
+            self.dir.path().join(rel),
+            std::fs::Permissions::from_mode(mode),
+        )
+        .expect("chmod");
     }
 
     /// Rewrite `.hephconfig` with the buildfile plugin's `options`.
@@ -119,6 +138,11 @@ impl Run {
 
 /// `heph run <m>` on a fresh engine over `ws`, keeping going past failures.
 async fn run(ws: &Ws, m: &Matcher) -> Run {
+    try_run(ws, m).await.expect("the selection resolves")
+}
+
+/// [`run`], or why the selection itself did not resolve.
+async fn try_run(ws: &Ws, m: &Matcher) -> anyhow::Result<Run> {
     let engine = ws.engine();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let rs = engine.new_state_with_events(false, Some(tx));
@@ -129,8 +153,14 @@ async fn run(ws: &Ws, m: &Matcher) -> Run {
             OutputMatcher::All,
             &ResultOptions::default(),
         )
-        .await
-        .expect("the selection resolves");
+        .await;
+    let batch = match batch {
+        Ok(batch) => batch,
+        Err(e) => {
+            crate::common::drain(rs).await;
+            return Err(e);
+        }
+    };
     let failed = batch
         .errors
         .iter()
@@ -155,11 +185,11 @@ async fn run(ws: &Ws, m: &Matcher) -> Run {
             _ => {}
         }
     }
-    Run {
+    Ok(Run {
         failed,
         ok,
         outcomes,
-    }
+    })
 }
 
 async fn run_addr(ws: &Ws, addr: &str) -> Run {
@@ -438,13 +468,20 @@ async fn query_target_sees_checks() {
         .get_spec(engine.new_state(), &addr)
         .await
         .expect("resolve the query");
-    let deps = format!("{:?}", spec.config.get("deps").expect("deps"));
-    for want in ["//pkg:t", "//pkg:build-lint-check"] {
-        assert!(deps.contains(want), "{want} not selected: {deps}");
-    }
-    assert!(
-        !deps.contains("build-format"),
-        "only the lint-check label: {deps}"
+    let Some(Value::List(deps)) = spec.config.get("deps") else {
+        panic!("deps is a list: {:?}", spec.config.get("deps"));
+    };
+    let deps: BTreeSet<String> = deps
+        .iter()
+        .map(|d| match d {
+            Value::String(s) => parse_addr(s).expect("a dep addr").format(),
+            other => panic!("a dep is an addr string: {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        deps,
+        BTreeSet::from(["//pkg:build-lint-check".to_string(), "//pkg:t".to_string()]),
+        "the lint-check label selects the user's target and the lint check only"
     );
 }
 
@@ -472,7 +509,7 @@ async fn second_run_all_hits() {
     assert!(cold.failed.is_empty(), "{cold:#?}");
     let before: Vec<_> = CLEAN
         .iter()
-        .map(|(p, _)| (ws.read(p), ws.mtime(p)))
+        .map(|(p, _)| (ws.read(p), ws.stamp(p)))
         .collect();
 
     let warm = run(&ws, &everything()).await;
@@ -489,7 +526,7 @@ async fn second_run_all_hits() {
     }
     let after: Vec<_> = CLEAN
         .iter()
-        .map(|(p, _)| (ws.read(p), ws.mtime(p)))
+        .map(|(p, _)| (ws.read(p), ws.stamp(p)))
         .collect();
     assert_eq!(before, after, "a warm build-format writes nothing back");
 }
@@ -531,6 +568,71 @@ async fn format_writes_back_idempotent() {
         "//pkg:build-format",
     );
     assert_eq!(ws.read("pkg/BUILD"), formatted, "formatting is idempotent");
+}
+
+/// A package with one unparseable file is not formatted at all: the run
+/// fails naming that file, and neither file changes on disk, the formattable
+/// one included. The package evaluates every `*.BUILD`, so here evaluation
+/// refuses the file before `build-format` runs; the driver's own refusal of
+/// an unparseable file, for one that changes between parse and run, is
+/// `drivers::tests::format_unparseable_names_file`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn format_unparseable_leaves_package_untouched() {
+    let unformatted = "target(name=\"t\",driver=\"textfile\",text=\"x\")\n";
+    let unparseable = "x = (\n";
+    let ws = Ws::new(
+        &[("pkg/BUILD", unformatted), ("pkg/bad.BUILD", unparseable)],
+        "",
+    );
+    let before = [ws.stamp("pkg/BUILD"), ws.stamp("pkg/bad.BUILD")];
+
+    let m = Matcher::Addr(parse_addr("//pkg:build-format").expect("addr"));
+    let err = match try_run(&ws, &m).await {
+        Err(e) => format!("{e:#}"),
+        Ok(r) => {
+            assert_fails(&r, "//pkg:build-format");
+            r.failed["//pkg:build-format"].clone()
+        }
+    };
+    assert!(err.contains("pkg/bad.BUILD"), "names the file: {err}");
+
+    assert_eq!(ws.read("pkg/BUILD"), unformatted);
+    assert_eq!(ws.read("pkg/bad.BUILD"), unparseable);
+    assert_eq!(
+        [ws.stamp("pkg/BUILD"), ws.stamp("pkg/bad.BUILD")],
+        before,
+        "nothing was written back"
+    );
+}
+
+/// Through the real sandbox and in-place write-back, `build-format` keeps
+/// each rewritten file's mode on disk: an executable stays executable, and
+/// neither becomes read-only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn format_keeps_mode_on_disk() {
+    let ws = Ws::new(
+        &[
+            ("pkg/BUILD", "x    =  1\n"),
+            ("pkg/more.BUILD", "y    =  2\n"),
+        ],
+        "",
+    );
+    ws.set_mode("pkg/BUILD", 0o755);
+    ws.set_mode("pkg/more.BUILD", 0o644);
+
+    assert_passes(
+        &run_addr(&ws, "//pkg:build-format").await,
+        "//pkg:build-format",
+    );
+    assert_eq!(ws.read("pkg/BUILD"), "x = 1\n");
+    assert_eq!(ws.read("pkg/more.BUILD"), "y = 2\n");
+    assert_eq!(ws.mode("pkg/BUILD"), 0o755, "{:o}", ws.mode("pkg/BUILD"));
+    assert_eq!(
+        ws.mode("pkg/more.BUILD"),
+        0o644,
+        "{:o}",
+        ws.mode("pkg/more.BUILD")
+    );
 }
 
 /// `indent` is in the format def hash (I6): a pass cached at the default

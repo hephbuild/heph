@@ -14,20 +14,32 @@ pub(crate) fn check_file(rel: &str, src: &str, config: Config) -> anyhow::Result
         Reformat::Unchanged => return Ok(None),
         Reformat::Changed(formatted) => formatted,
     };
+    Ok(Some(Finding {
+        file: rel.to_owned(),
+        line: first_differing_line(src, &formatted),
+        col: 1,
+        kind: Kind::Format,
+        message: "not formatted; this is the first line that differs from the formatter's output"
+            .to_owned(),
+    }))
+}
+
+/// `build-format-check`'s verdict on one file, for a caller outside the
+/// plugin (`heph tool build-fmt`'s agreement test): `None` when the check
+/// passes it, else its finding line. A file that does not parse is an error.
+pub fn check_verdict(rel: &str, src: &str, indent_size: usize) -> anyhow::Result<Option<String>> {
+    Ok(check_file(rel, src, Config { indent_size })?.map(|f| f.to_string()))
+}
+
+/// The 1-based line of `src` where `formatted` first differs from it.
+fn first_differing_line(src: &str, formatted: &str) -> usize {
     let mut ours = src.split_inclusive('\n');
     let mut theirs = formatted.split_inclusive('\n');
     let mut line = 1;
     while ours.next() == theirs.next() {
         line += 1;
     }
-    Ok(Some(Finding {
-        file: rel.to_owned(),
-        line,
-        col: 1,
-        kind: Kind::Format,
-        message: "not formatted; this is the first line that differs from the formatter's output"
-            .to_owned(),
-    }))
+    line
 }
 
 /// What `build-format` does with one owned file.
@@ -151,38 +163,35 @@ mod tests {
         }
     }
 
+    /// The finding names the first line that differs, and only that line
+    /// (agreement with `heph tool build-fmt` is
+    /// `commands::tool::build_fmt::tests::check_matches_build_fmt`).
     #[test]
-    fn check_matches_build_fmt() {
-        let mut cases = fixtures();
-        cases.push((
-            "skip-file".into(),
-            "# heph:fmt skip-file\nx    =  1\n".into(),
-        ));
-        cases.push(("unformatted".into(), "x    =  1\n".into()));
-        for (name, src) in cases {
-            // `heph tool build-fmt --check` reports a file exactly when
-            // `reformat` says it changes.
-            let build_fmt_flags = matches!(
-                hxstarlark_fmt::reformat("pkg/BUILD", &src, CFG),
-                Ok(Reformat::Changed(_))
-            );
-            let check = check_file("pkg/BUILD", &src, CFG).expect("parses");
-            assert_eq!(check.is_some(), build_fmt_flags, "{name}");
-            if let Some(finding) = check {
-                assert!(
-                    finding.to_string().starts_with(&format!(
-                        "pkg/BUILD:{}:1: format: not formatted",
-                        finding.line
-                    )),
-                    "{name}: {finding}"
-                );
-            }
-        }
-        // The first differing line is the one reported.
-        let finding = check_file("pkg/BUILD", "a = 1\nb   = 2\n", CFG)
+    fn first_differing_line_reported() {
+        assert_eq!(first_differing_line("a\n", "b\n"), 1);
+        assert_eq!(first_differing_line("a\nb\n", "a\nc\n"), 2);
+        // Only a line missing at the end.
+        assert_eq!(first_differing_line("a\n", "a\nb\n"), 2);
+        assert_eq!(first_differing_line("a\nb", "a\nb\n"), 2);
+        let finding = check_file("pkg/BUILD", "a = 1\nb   = 2\nc   = 3\n", CFG)
             .expect("parses")
             .expect("unformatted");
         assert_eq!(finding.line, 2);
+        assert_eq!(
+            check_verdict("pkg/BUILD", "a = 1\nb   = 2\n", 4).expect("parses"),
+            Some(finding_line(2))
+        );
+        assert_eq!(
+            check_verdict("pkg/BUILD", "a = 1\n", 4).expect("parses"),
+            None
+        );
+    }
+
+    fn finding_line(line: usize) -> String {
+        format!(
+            "pkg/BUILD:{line}:1: format: not formatted; this is the first line that differs \
+             from the formatter's output"
+        )
     }
 
     #[test]

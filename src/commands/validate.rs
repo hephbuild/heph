@@ -32,13 +32,18 @@ pub struct ValidateArgs {
 }
 
 struct ValidateApp {
+    validate: Validate,
+    fail_fast: bool,
+}
+
+/// What validate checks, and against which engine.
+struct Validate {
     engine: Arc<Engine>,
     /// Targets to validate — whole workspace or the user-scoped matcher.
     matcher: Matcher,
     /// True when the user passed a matcher; the gitignore check is then skipped.
     scoped: bool,
     root: PathBuf,
-    fail_fast: bool,
     /// The buildfile provider's record of shadowed check targets (I2).
     shadowed: ShadowedChecks,
 }
@@ -59,19 +64,46 @@ impl App for ValidateApp {
 
     async fn run(self, ctx: AppContext) -> anyhow::Result<()> {
         let ValidateApp {
+            validate,
+            fail_fast,
+        } = self;
+        let rs = validate
+            .engine
+            .new_state_with_events(fail_fast, ctx.event_sender());
+        // One sink for the link and overlap walks: a candidate both skip counts
+        // once. The `.gitignore` check stays complete — a short set would report
+        // a correct file as out of date.
+        let gaps = Gaps::new(crate::htquery::format(&validate.matcher));
+        let discovery = Discovery::keep_going_unless(fail_fast, &gaps);
+
+        let out = BufferedStdout::new(&ctx);
+        let res = validate
+            .check(&rs, discovery, &|line: &str| out.println(line))
+            .await;
+        out.close().await;
+
+        crate::commands::errors::finalize!(ctx, rs, res, gaps = &gaps)
+    }
+}
+
+impl Validate {
+    /// Every check, in order, on `rs`: the body of [`ValidateApp::run`]
+    /// without the TUI. Warnings go to `println`; the problems come back as
+    /// one error.
+    async fn check(
+        &self,
+        rs: &Arc<RequestState>,
+        discovery: Discovery,
+        println: &(dyn Fn(&str) + Sync),
+    ) -> anyhow::Result<()> {
+        let Validate {
             engine,
             matcher,
             scoped,
             root,
-            fail_fast,
             shadowed,
         } = self;
-        let rs = engine.new_state_with_events(fail_fast, ctx.event_sender());
-        // One sink for the link and overlap walks: a candidate both skip counts
-        // once. The `.gitignore` check stays complete — a short set would report
-        // a correct file as out of date.
-        let gaps = Gaps::new(crate::htquery::format(&matcher));
-        let discovery = Discovery::keep_going_unless(fail_fast, &gaps);
+        let scoped = *scoped;
 
         // Overlap detection scopes to the user matcher when scoped, else uses the
         // codegen-tree selector (same one the gitignore enumeration uses).
@@ -81,8 +113,7 @@ impl App for ValidateApp {
             Matcher::TreeOutputTo(PkgBuf::from(""))
         };
 
-        let out = BufferedStdout::new(&ctx);
-        let res: anyhow::Result<()> = async {
+        async {
             // Each check runs to completion before the next begins, and that is
             // a correctness requirement rather than a style choice.
             //
@@ -118,8 +149,8 @@ impl App for ValidateApp {
             // 1. Link every in-scope target: parse + resolve its runtime inputs.
             //    No execution — proves the graph is well-formed.
             let link_res: anyhow::Result<()> = async {
-                let addrs: Vec<Addr> = Arc::clone(&engine)
-                    .query(rs.clone(), &matcher, discovery.clone())
+                let addrs: Vec<Addr> = Arc::clone(engine)
+                    .query(rs.clone(), matcher, discovery.clone())
                     .try_collect()
                     .await?;
                 let futs = addrs.iter().map(|addr| {
@@ -150,7 +181,7 @@ impl App for ValidateApp {
             .await;
 
             // 2. Detect overlapping `codegen = copy` outputs.
-            let overlap_res = Arc::clone(&engine)
+            let overlap_res = Arc::clone(engine)
                 .codegen_copy_overlaps(rs.clone(), &overlap_matcher, discovery.clone())
                 .await;
 
@@ -158,7 +189,7 @@ impl App for ValidateApp {
             let codegen = if scoped {
                 CodegenFindings::default()
             } else {
-                codegen_findings(&engine, &rs, &root).await
+                codegen_findings(engine, rs, root).await
             };
             let CodegenFindings {
                 failures: gitignore_res,
@@ -168,15 +199,15 @@ impl App for ValidateApp {
             // 4. Every provider lists exactly the facts its targets resolve to,
             //    and lists only what it resolves. The walks trust a listed No
             //    and never check it; this does.
-            let listed_facts_res = Arc::clone(&engine)
-                .listed_fact_mismatches(rs.clone(), &matcher, discovery.clone())
+            let listed_facts_res = Arc::clone(engine)
+                .listed_fact_mismatches(rs.clone(), matcher, discovery.clone())
                 .await
                 .map(|mismatches| mismatches.iter().map(ToString::to_string).collect());
 
             // 5. No target shadows a BUILD-file check target (I2). The provider
             //    records each as it lists a package, and check 1's walk listed
             //    every package in scope. Run and query never read the record.
-            let shadowed_res = Ok(shadowed_check_problems(&shadowed, &matcher));
+            let shadowed_res = Ok(shadowed_check_problems(shadowed, matcher));
 
             let overlap_res = overlap_res.map(|overlaps| {
                 overlaps
@@ -193,7 +224,7 @@ impl App for ValidateApp {
                     .collect::<Vec<String>>()
             });
             for w in &local_warnings {
-                out.println(w);
+                println(w);
             }
 
             finish(vec![
@@ -206,14 +237,11 @@ impl App for ValidateApp {
 
             // Success prints nothing; only the scoped-skip warning is emitted.
             if scoped {
-                out.println("warning: skipped .gitignore freshness check (validation is scoped)");
+                println("warning: skipped .gitignore freshness check (validation is scoped)");
             }
             Ok(())
         }
-        .await;
-        out.close().await;
-
-        crate::commands::errors::finalize!(ctx, rs, res, gaps = &gaps)
+        .await
     }
 }
 
@@ -351,12 +379,14 @@ async fn execute_async(
     };
     let (engine, shutdown, shadowed) = bootstrap::new_validate_engine(&global, session)?;
     let app = ValidateApp {
-        engine,
-        matcher,
-        scoped,
-        root,
+        validate: Validate {
+            engine,
+            matcher,
+            scoped,
+            root,
+            shadowed,
+        },
         fail_fast: global.fail_fast,
-        shadowed,
     };
     let interactive = tui::should_use_tui(global.no_tui);
     tui::run_app_with(
@@ -572,6 +602,68 @@ mod tests {
     }
 
     const FIX: &str = "rename the target, or remove it to get the check back";
+
+    /// The wiring, end to end in-process: the engine `heph validate` builds
+    /// hands validate the same record the buildfile provider writes to, and
+    /// validate's own check sequence turns a shadow into its failure.
+    #[tokio::test]
+    async fn validate_engine_reports_shadow() {
+        use crate::engine::gitignore::{BEGIN_MARKER, END_MARKER};
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (path, content) in [
+            (
+                ".hephconfig",
+                "plugins:\n  - builtin: buildfile\ntelemetry:\n  enabled: false\n",
+            ),
+            (
+                "pkg/BUILD",
+                "target(name = \"build-format\", driver = \"textfile\", text = \"mine\")\n",
+            ),
+            (
+                "clean/BUILD",
+                "target(name = \"t\", driver = \"textfile\", text = \"x\")\n",
+            ),
+        ] {
+            let abs = dir.path().join(path);
+            std::fs::create_dir_all(abs.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&abs, content).expect("write");
+        }
+        // Fresh, so the shadow is the only problem.
+        std::fs::write(
+            dir.path().join(".gitignore"),
+            format!("{BEGIN_MARKER}\n{END_MARKER}\n"),
+        )
+        .expect("write .gitignore");
+        let (engine, _shutdown, shadowed) = crate::commands::bootstrap::new_validate_engine_at(
+            dir.path(),
+            &crate::commands::GlobalOptions::default(),
+            None,
+        )
+        .expect("validate engine");
+        let validate = super::Validate {
+            engine: Arc::clone(&engine),
+            matcher: Matcher::PackagePrefix(PkgBuf::from("")),
+            scoped: false,
+            root: dir.path().to_path_buf(),
+            shadowed,
+        };
+        let gaps = crate::engine::Gaps::new("//...".to_string());
+        let err = validate
+            .check(
+                &engine.new_state(),
+                Discovery::keep_going_unless(false, &gaps),
+                &|_| {},
+            )
+            .await
+            .expect_err("a shadowed check fails validate");
+        assert_eq!(
+            format!("{err:#}"),
+            format!(
+                "validation failed: //pkg:build-format, declared at pkg/BUILD:1, shadows the \
+                 BUILD-file check `build-format`: {FIX}"
+            )
+        );
+    }
 
     #[tokio::test]
     async fn shadowed_check_target_fails() {

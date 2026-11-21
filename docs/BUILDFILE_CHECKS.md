@@ -4,6 +4,10 @@ Every package with a BUILD file gets three targets: `build-lint-check`,
 `build-format-check` and `build-format`. They are always on. The code lives in
 `crates/plugin-buildfile/src/pluginbuildfile/checks/`.
 
+Upgrading changes what `heph run //...` does: it now rewrites BUILD files and
+fails on type errors and unformatted files. See
+[What changes on upgrade](#what-changes-on-upgrade).
+
 ## What is not checked
 
 `build-lint-check` runs Starlark's static typechecker without executing
@@ -80,9 +84,17 @@ annotations are required by requireTypeAnnotations in .hephconfig (plugins: buil
 The last line appears only when there is an `annotation:` finding. When a
 parameter is named like a `heph.types` alias (`deps`, `labels`, …), its finding
 suggests that alias. `build-format-check` prints `format: not formatted` lines
-and ends with `run heph run //pkg:build-format to fix`. The text goes to the
-target's failure log (`heph inspect failure <addr>`). The run's error is the
-count line. The line format is the contract. There is no `--json`.
+and ends with `run heph run //pkg:build-format to fix`.
+
+A format finding names the first line that differs from the formatter's
+output, and only that line. There is no diff, on purpose: the fix is to run
+`build-format`, not to edit by hand, and one line is enough to find the spot.
+
+The text goes to the target's failure log (`heph inspect failure <addr>`). The
+run's error is the count line. The line format is the contract. The checks
+have no `--json` of their own. For a machine-readable route,
+`heph inspect failure --json <addr>` gives the path of the failure log, which
+holds these lines.
 
 ## CI
 
@@ -109,6 +121,12 @@ loading package, but its interface still types the calls made to it.
   that only other packages load, or a loaded file in a directory with no BUILD
   file. It is still an input of every check that loads it, so editing it
   re-runs them. Finding these files would take a workspace-wide scan.
+- **A symlinked file is never owned**, even in the package's own directory.
+  `build-format` neither reads nor rewrites it, since a rewrite would land on
+  the link's target, which another package may own. Lint discards its
+  findings, but its interface still types the calls made to it. Like the gap
+  above, it is checked only by the package that owns the link's target, if
+  one does.
 
 ## Shadowing
 
@@ -140,7 +158,7 @@ can type the parameters it passes through instead of falling back to
 
 ```python
 def lib(name: str, deps: heph.types.Deps = None, labels: heph.types.Labels = None):
-    target(name = name, driver = "bash", deps = deps, labels = labels, run = "true")
+    target(name = name, driver = "bash", run = "true", labels = labels, transitive = {"deps": deps})
 ```
 
 The aliases are `Addr`, `Deps`, `Env`, `Labels`, `PassEnv`, `RuntimePassEnv`
@@ -160,12 +178,15 @@ completes `heph.types.` and shows each alias's expansion on hover.
 
 ## What changes on upgrade
 
+- **`heph run //...` now rewrites BUILD files and can fail where it used to
+  pass.** `//...` includes `build-format`, which rewrites every unformatted
+  BUILD file in place. It also includes `build-format-check`, which fails on
+  an unformatted file, and `build-lint-check`, which fails on a type error.
 - Every workspace with the buildfile plugin gains three targets per package.
   A target already named `build-format`, `build-format-check` or
   `build-lint-check` keeps working and shadows the check. `heph validate`
   fails until it is renamed.
-- `label(fix)` and `label(format)` now include `build-format`, which rewrites
-  BUILD files in place. `//...` includes all three.
+- `label(fix)` and `label(format)` now include `build-format` too.
 - `label(lint-check)` and `label(format-check)` now fail on BUILD files with
   type errors or bad formatting that were never checked before.
 - A call to an unannotated def is now checked against its inferred return

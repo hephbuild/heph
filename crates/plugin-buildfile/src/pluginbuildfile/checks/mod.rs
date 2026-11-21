@@ -281,6 +281,68 @@ fn ownership() {
     );
 }
 
+/// I1: a symlinked file is never owned, even in the package's own directory:
+/// `build-format` neither reads nor writes it (a rewrite would land on the
+/// link's target, which another package may own), and lint discards its
+/// findings. Its interface still types the package's calls into it.
+#[cfg(test)]
+#[test]
+fn symlinked_file_not_owned() {
+    use targets::{CheckKind, ChecksOptions, format_spec};
+    let tmp = ws(&[
+        (
+            "pkg/BUILD",
+            "load(\"./helper.star\", \"make\")\n\ndef ok():\n    make(1)\n\n\
+             def bad():\n    make(\"s\")\n",
+        ),
+        (
+            "lib/real.star",
+            "def make(n: int) -> None:\n    own: int = \"s\"\n",
+        ),
+    ]);
+    std::os::unix::fs::symlink("../lib/real.star", tmp.path().join("pkg/helper.star"))
+        .expect("symlink");
+
+    let walk = walk(tmp.path(), "pkg").expect("walk");
+    assert!(walk.files["pkg/helper.star"].symlink);
+    assert_eq!(walk.files["pkg/helper.star"].pkg, "pkg");
+    assert_eq!(walk.owned().collect::<Vec<_>>(), ["pkg/BUILD"]);
+    assert_eq!(
+        walk.inputs().collect::<Vec<_>>(),
+        ["pkg/BUILD", "pkg/helper.star"]
+    );
+
+    let addr = hmodel::htaddr::Addr::new(
+        hmodel::htpkg::PkgBuf::from("pkg"),
+        CheckKind::Format.name().to_string(),
+        Default::default(),
+    );
+    let def = drivers::parse_spec(
+        format_spec(addr, CheckKind::Format, &walk, ChecksOptions::default()),
+        "v1",
+    );
+    let build = hbuiltins::pluginfs::file_addr("pkg/BUILD").format();
+    let inputs: Vec<String> = def.inputs.iter().map(|i| i.r#ref.r#ref.format()).collect();
+    assert_eq!(inputs, [build.clone()]);
+    let outs: Vec<String> = def
+        .outputs
+        .iter()
+        .flat_map(|o| &o.paths)
+        .map(|p| {
+            hbuiltins::pluginfs::output_fs_addr(&p.content)
+                .expect("fs addr")
+                .format()
+        })
+        .collect();
+    assert_eq!(outs, [build]);
+
+    // The helper's own type error is discarded; the bad call is pkg's.
+    let found = lint::tests::lint_pkg(tmp.path(), "pkg", false);
+    let at: Vec<(&str, usize)> = found.iter().map(|f| (f.file.as_str(), f.line)).collect();
+    assert_eq!(at, [("pkg/BUILD", 7)], "{found:#?}");
+    assert_eq!(found[0].kind, report::Kind::TypeError);
+}
+
 /// Each walked file becomes an fs dep `//@heph/fs:file@f=<path>`: the address
 /// must parse back to the same path whatever the path holds.
 #[cfg(test)]

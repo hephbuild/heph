@@ -1949,6 +1949,12 @@ provider_state(provider = "go", root = "src", strict = True)
             fs::create_dir_all(abs.parent().expect("parent")).expect("mkdir");
             fs::write(&abs, content).expect("write");
         }
+        let provider = checks_provider(tmp.path(), checks);
+        (tmp, provider)
+    }
+
+    /// A fresh provider over `root`, as the next `heph` invocation builds.
+    fn checks_provider(root: &std::path::Path, checks: bool) -> Provider {
         let mut opts = Options::new();
         opts.insert(
             "defaultDriver".to_string(),
@@ -1958,15 +1964,13 @@ provider_state(provider = "go", root = "src", strict = True)
             "skip".to_string(),
             serde_yaml::from_str("[skipped]").expect("yaml"),
         );
-        let provider =
-            Provider::from_options(tmp.path().to_path_buf(), &[], &[], &opts, test_runtime())
-                .expect("provider");
-        let provider = if checks {
+        let provider = Provider::from_options(root.to_path_buf(), &[], &[], &opts, test_runtime())
+            .expect("provider");
+        if checks {
             provider.with_checks(ChecksOptions::default())
         } else {
             provider
-        };
-        (tmp, provider)
+        }
     }
 
     async fn listed(provider: &Provider, pkg: &str) -> Vec<hplugin::provider::ListResponse> {
@@ -2186,6 +2190,35 @@ provider_state(provider = "go", root = "src", strict = True)
                 .collect::<Vec<_>>(),
             ["build-format"]
         );
+    }
+
+    /// The shadow record follows the BUILD file: once the conflict is fixed,
+    /// listing the package again clears what was recorded for it. `run_pkg`
+    /// is memoized per provider, so the second list is a fresh provider (the
+    /// next `heph` invocation) writing to the same record.
+    #[tokio::test]
+    async fn shadow_record_cleared_when_fixed() {
+        let shadowed = ShadowedChecks::default();
+        let (tmp, provider) = checks_ws(
+            &[(
+                "pkg/BUILD",
+                "target(name = \"build-format\", driver = \"mine\")\n",
+            )],
+            true,
+        );
+        let provider = provider.with_shadowed_checks(shadowed.clone());
+        listed(&provider, "pkg").await;
+        let found: Vec<String> = shadowed.all().iter().map(|s| s.addr.format()).collect();
+        assert_eq!(found, ["//pkg:build-format"]);
+
+        fs::write(
+            tmp.path().join("pkg/BUILD"),
+            "target(name = \"fmt\", driver = \"mine\")\n",
+        )
+        .expect("fix the BUILD file");
+        let provider = checks_provider(tmp.path(), true).with_shadowed_checks(shadowed.clone());
+        listed(&provider, "pkg").await;
+        assert!(shadowed.all().is_empty(), "{:?}", shadowed.all());
     }
 
     #[test]

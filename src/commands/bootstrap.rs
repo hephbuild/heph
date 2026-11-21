@@ -325,10 +325,32 @@ pub fn new_validate_engine(
     ShutdownTrigger,
     pluginbuildfile::ShadowedChecks,
 )> {
+    new_validate_engine_at(&workspace_root()?, global, Some(session))
+}
+
+/// [`new_validate_engine`] over the workspace at `root` instead of the one
+/// the cwd resolves to (`get_root` is memoized from the cwd), so a test can
+/// build validate's engine through the same path.
+pub fn new_validate_engine_at(
+    root: &std::path::Path,
+    global: &super::GlobalOptions,
+    session: Option<&Arc<SessionSlot>>,
+) -> anyhow::Result<(
+    Arc<engine::Engine>,
+    ShutdownTrigger,
+    pluginbuildfile::ShadowedChecks,
+)> {
     let shadowed = pluginbuildfile::ShadowedChecks::default();
-    let (engine, trigger) =
-        new_engine_with(global, BadEnv::Refuse, Some(session), shadowed.clone())?;
+    let (engine, trigger) = new_engine_at(root, global, BadEnv::Refuse, session, shadowed.clone())?;
     Ok((engine, trigger, shadowed))
+}
+
+/// The workspace root resolved from the cwd.
+fn workspace_root() -> anyhow::Result<std::path::PathBuf> {
+    match engine::get_root() {
+        Ok(r) => Ok(r),
+        Err(inner) => anyhow::bail!("Error: {}", inner),
+    }
 }
 
 /// The engine for a caller with no command line of its own: shell
@@ -441,12 +463,17 @@ fn new_engine_with(
     session: Option<&Arc<SessionSlot>>,
     shadowed: pluginbuildfile::ShadowedChecks,
 ) -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
-    let root = match engine::get_root() {
-        Ok(r) => r,
-        Err(inner) => anyhow::bail!("Error: {}", inner),
-    };
+    new_engine_at(&workspace_root()?, global, bad_env, session, shadowed)
+}
 
-    let (file, config) = engine_config(&root, global, bad_env, std::env::vars_os())?;
+fn new_engine_at(
+    root: &std::path::Path,
+    global: &super::GlobalOptions,
+    bad_env: BadEnv,
+    session: Option<&Arc<SessionSlot>>,
+    shadowed: pluginbuildfile::ShadowedChecks,
+) -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
+    let (file, config) = engine_config(root, global, bad_env, std::env::vars_os())?;
 
     // Point `SIGQUIT` dumps at the resolved home as soon as it is known — before
     // the engine is built and plugins are downloaded and loaded, which is where
@@ -458,7 +485,7 @@ fn new_engine_with(
     // and the cwd heph resolved it from (`HEPH_CWD` when set).
     let cwd = engine::get_cwd().context("resolving the working directory")?;
     if let Some(session) = session {
-        session.set_workspace(&cwd, &root, &config.home_dir);
+        session.set_workspace(&cwd, root, &config.home_dir);
     }
 
     // Captured before `config` is moved into the engine: the nix driver's state

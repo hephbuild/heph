@@ -7,6 +7,7 @@ mod run_file;
 mod starlark_patch;
 mod types;
 
+pub use checks::format::check_verdict as format_check_verdict;
 pub use checks::targets::{ChecksOptions, ShadowedCheck, ShadowedChecks};
 /// The transport-free LSP loop, for the editor-shaped harness in `tests/lsp.rs`.
 #[cfg(feature = "test-support")]

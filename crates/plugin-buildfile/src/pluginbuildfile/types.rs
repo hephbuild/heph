@@ -447,6 +447,29 @@ lib(\"b\", deps = [\"//x:y\"], labels = \"l\")
         assert!(format!("{err:#}").contains("`x`"), "{err:#}");
     }
 
+    /// The wrapper docs/BUILDFILE_CHECKS.md shows under `heph.types`, read
+    /// verbatim from the doc, evaluates and passes its params through.
+    #[test]
+    fn doc_example_evaluates() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/BUILDFILE_CHECKS.md");
+        let doc = std::fs::read_to_string(&path).expect("read the doc");
+        let (_, section) = doc.split_once("## `heph.types`").expect("the section");
+        let (_, block) = section.split_once("```python\n").expect("its example");
+        let (example, _) = block.split_once("```").expect("the example's end");
+        let (_tmp, loader) = source_loader();
+        let src =
+            format!("{example}\nlib(\"a\")\nlib(\"b\", deps = [\"//x:y\"], labels = \"l\")\n");
+        let result = eval_source("BUILD", src, "pkg", &loader)
+            .unwrap_or_else(|e| panic!("the doc's example: {e:#}\n{example}"));
+        let names: Vec<&str> = result.targets.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["a", "b"]);
+        let b = &result.targets[1];
+        assert_eq!(b.labels, ["l"], "{b:#?}");
+        let transitive = format!("{:?}", b.transitive);
+        assert!(transitive.contains("//x:y"), "deps passed through: {b:#?}");
+    }
+
     #[test]
     fn alias_across_load() {
         let (errors, lib) = typecheck(
