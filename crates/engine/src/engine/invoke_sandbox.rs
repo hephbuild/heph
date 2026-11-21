@@ -515,10 +515,47 @@ mod tests {
 
     /// The env var under which the test re-execs itself as a lock holder.
     const HOLDER: &str = "HEPH_TEST_INVOKE_OWNER_HOLDER";
+    /// The env var under which a sweep test runs in its own process.
+    const ALONE: &str = "HEPH_TEST_INVOKE_SWEEP_ALONE";
+    const STALE_TEST: &str = "engine::invoke_sandbox::tests::stale_invoke_sandbox_swept";
+    const SWEEP_ALL_TEST: &str = "engine::invoke_sandbox::tests::sweep_all_finds_every_package";
+
+    /// Re-run the test `name` alone in a fresh process of this test binary,
+    /// and fail if it fails there. `Ok(true)` in the calling process, which
+    /// has nothing left to do; `Ok(false)` in the re-run, which runs the body.
+    ///
+    /// A test that releases a `.owner` lock and then counts what a sweep
+    /// removes needs this. `flock` belongs to the open file description and
+    /// `fork` copies every fd, so a child that another test forks on another
+    /// thread holds a copy of the lock until it execs. The sweep then sees that
+    /// sandbox as live and keeps it, which is right: its lock is held.
+    /// `cargo test` runs every test of the binary in one process; nextest's
+    /// one process per test never shows it.
+    fn rerun_alone(name: &str) -> anyhow::Result<bool> {
+        if std::env::var_os(ALONE).is_some() {
+            return Ok(false);
+        }
+        let out = std::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", name, "--test-threads=1"])
+            .env(ALONE, "1")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .with_context(|| format!("re-run {name} alone"))?;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // `--exact` with a name that matches nothing runs no test and exits 0.
+        anyhow::ensure!(
+            out.status.success() && stdout.contains(" 1 passed;"),
+            "{name}, re-run alone, failed ({}):\n{stdout}\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Ok(true)
+    }
 
     /// A crash leftover is swept; a live one — held in this process or in
     /// another — is not; nothing without `.owner` or behind a symlink is
-    /// touched (R11's adversarial rows).
+    /// touched (R11's adversarial rows). Runs in its own process
+    /// ([`rerun_alone`]).
     #[test]
     fn stale_invoke_sandbox_swept() -> anyhow::Result<()> {
         // The cross-process holder: lock `.owner`, say so, wait for EOF.
@@ -531,6 +568,9 @@ mod tests {
             let mut sink = String::new();
             drop(std::io::stdin().read_line(&mut sink));
             std::process::exit(0);
+        }
+        if rerun_alone(STALE_TEST)? {
+            return Ok(());
         }
 
         let tmp = tempfile::tempdir()?;
@@ -582,10 +622,7 @@ mod tests {
         let other_dir = other.dir().to_path_buf();
         drop(other);
         let mut holder = std::process::Command::new(std::env::current_exe()?)
-            .args([
-                "--exact",
-                "engine::invoke_sandbox::tests::stale_invoke_sandbox_swept",
-            ])
+            .args(["--exact", STALE_TEST])
             .args(["--nocapture", "--test-threads=1"])
             .env(HOLDER, other_dir.join(OWNER))
             .stdin(std::process::Stdio::piped())
@@ -636,8 +673,12 @@ mod tests {
 
     /// `heph gc`'s walk finds leftovers in any package, steps over a build's
     /// sandbox and over a package component named `__invoke`'s own targets.
+    /// Runs in its own process ([`rerun_alone`]).
     #[test]
     fn sweep_all_finds_every_package() -> anyhow::Result<()> {
+        if rerun_alone(SWEEP_ALL_TEST)? {
+            return Ok(());
+        }
         let tmp = tempfile::tempdir()?;
         let root = tmp.path().join("sandbox");
         let a = InvokeSandbox::create(&root.join("a/__invoke/t"), None)?;
