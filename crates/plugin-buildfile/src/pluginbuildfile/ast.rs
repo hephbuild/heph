@@ -24,9 +24,14 @@ pub(crate) fn walk_expr<'a>(e: &'a AstExpr, f: &mut impl FnMut(&'a AstExpr)) {
 /// targets, and `load(...)` imports.
 ///
 /// Deliberately flat — a name bound anywhere counts as bound everywhere, with no
-/// scope tracking. Over-approximating errs toward silence, and the alternative
-/// (a real scope analysis) would buy nothing: a buffer that defines its own
-/// `target` almost certainly means it at every call site.
+/// scope tracking. Which way over-approximating errs depends on the caller: for
+/// the LSP and the function-reference check it errs toward silence (a name the
+/// buffer binds is not reported as heph's), while for `annotations::missing` it
+/// errs toward a finding (a `True` rebound anywhere stops exempting a `= True`
+/// parameter, although the typechecker still types it where the rebinding is
+/// local to another def). The alternative (a real scope analysis) would buy
+/// nothing: a buffer that defines its own `target` almost certainly means it at
+/// every call site.
 pub(crate) fn bound_names(ast: &AstModule) -> HashSet<&str> {
     let mut names = HashSet::new();
     walk_stmt(ast.statement(), &mut |s| match &s.node {

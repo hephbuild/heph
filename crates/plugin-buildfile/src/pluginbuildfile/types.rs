@@ -14,6 +14,10 @@
 //! struct-shaped field (`transitive`, `approval`) does not: Starlark has no
 //! fixed-key dict type, so its alias would accept keys `target()` refuses.
 //!
+//! One alias is not built from a field: `heph.types.Number` is `int | float`,
+//! the type a float default (`scale = 1.0`) gives an unannotated parameter. It
+//! does not include `None`, and no parameter name suggests it.
+//!
 //! Each alias is a small [`StarlarkValue`] wrapping a [`Ty`], whose
 //! `eval_type()` returns it: the evaluator checks it at runtime and the AST
 //! typechecker statically, from the same value.
@@ -30,60 +34,73 @@ use std::sync::LazyLock;
 /// The `heph.<name>` namespace the aliases live in.
 pub(crate) const NAMESPACE: &str = "types";
 
-/// One shipped alias: its name and where in `target()`'s schema it comes from.
+/// One shipped alias: its name and what it stands for.
 struct AliasDef {
     name: &'static str,
-    /// The field, then the struct field within it (`["transitive", "deps"]`).
-    path: &'static [&'static str],
-    /// Take the bare-string member of the field's union rather than the whole
-    /// field: one address out of `deps`.
-    single: bool,
+    source: Source,
     doc: &'static str,
+}
+
+/// What an alias stands for.
+enum Source {
+    /// A field of `target()`'s schema.
+    Field {
+        /// The field, then the struct field within it (`["transitive", "deps"]`).
+        path: &'static [&'static str],
+        /// Take the bare-string member of the field's union rather than the
+        /// whole field: one address out of `deps`.
+        single: bool,
+    },
+    /// A fixed type, not a field: no `None`, and no parameter name suggests it.
+    Fixed(fn() -> Ty),
+}
+
+const fn field(path: &'static [&'static str], single: bool) -> Source {
+    Source::Field { path, single }
 }
 
 /// Sorted by name; `types::alias_names_snapshot` pins the list.
 const DEFS: &[AliasDef] = &[
     AliasDef {
         name: "Addr",
-        path: &["transitive", "deps"],
-        single: true,
+        source: field(&["transitive", "deps"], true),
         doc: "One target address, `//pkg:name`: what `target()` returns, and one entry of \
               `deps` or `tools`.",
     },
     AliasDef {
         name: "Deps",
-        path: &["transitive", "deps"],
-        single: false,
+        source: field(&["transitive", "deps"], false),
         doc: "A `deps` value: an address, a list of them, or a `{group: addr | [addr]}` map.",
     },
     AliasDef {
         name: "Env",
-        path: &["transitive", "env"],
-        single: false,
+        source: field(&["transitive", "env"], false),
         doc: "An `env` value: a `{name: value}` map of environment variables.",
     },
     AliasDef {
         name: "Labels",
-        path: &["labels"],
-        single: false,
+        source: field(&["labels"], false),
         doc: "A `labels` value: a label, or a list of them.",
     },
     AliasDef {
+        name: "Number",
+        source: Source::Fixed(|| Ty::union2(Ty::int(), Ty::float())),
+        doc: "A number: an `int` or a `float`. The type a float default (`scale = 1.0`) gives \
+              an unannotated parameter. `None` is not a `Number`.",
+    },
+    AliasDef {
         name: "PassEnv",
-        path: &["transitive", "pass_env"],
-        single: false,
+        source: field(&["transitive", "pass_env"], false),
         doc: "A `pass_env` value: a variable name, or a list of them.",
     },
     AliasDef {
         name: "RuntimePassEnv",
-        path: &["transitive", "runtime_pass_env"],
-        single: false,
+        source: field(&["transitive", "runtime_pass_env"], false),
         doc: "A `runtime_pass_env` value: a variable name, or a list of them.",
     },
     AliasDef {
         name: "Tools",
-        path: &["transitive", "tools"],
-        single: false,
+        source: field(&["transitive", "tools"], false),
         doc: "A `tools` value: an address, a list of them, or a `{group: addr | [addr]}` map.",
     },
 ];
@@ -139,11 +156,19 @@ fn field_type(path: &[&str], single: bool) -> Option<ParamType> {
     Some(ty)
 }
 
-/// What the alias `d` accepts, as the field's schema says it: the field's type
+/// What a field alias accepts, as the field's schema says it: the field's type
 /// or `None`.
-fn alias_param(d: &AliasDef) -> Option<ParamType> {
-    let field = field_type(d.path, d.single)?;
+fn field_param(path: &[&str], single: bool) -> Option<ParamType> {
+    let field = field_type(path, single)?;
     Some(ParamType::union(vec![field, ParamType::Null]))
+}
+
+/// What the alias `d` accepts, as a Starlark type.
+fn alias_ty(d: &AliasDef) -> Option<Ty> {
+    match &d.source {
+        Source::Field { path, single } => Some(param_type_to_ty(&field_param(path, *single)?)),
+        Source::Fixed(ty) => Some(ty()),
+    }
 }
 
 static ALIASES: LazyLock<Vec<Alias>> = LazyLock::new(|| {
@@ -151,7 +176,7 @@ static ALIASES: LazyLock<Vec<Alias>> = LazyLock::new(|| {
         .filter_map(|d| {
             Some(Alias {
                 name: d.name,
-                ty: param_type_to_ty(&alias_param(d)?),
+                ty: alias_ty(d)?,
                 doc: d.doc,
             })
         })
@@ -172,9 +197,10 @@ pub(crate) fn get(name: &str) -> Option<&'static Alias> {
 /// `pass_env`, …): the one built from that whole field. The annotation check
 /// suggests it on an unannotated parameter of that name.
 pub(crate) fn for_param(param: &str) -> Option<&'static Alias> {
-    let def = DEFS
-        .iter()
-        .find(|d| !d.single && d.path.last() == Some(&param))?;
+    let def = DEFS.iter().find(|d| match &d.source {
+        Source::Field { path, single } => !single && path.last() == Some(&param),
+        Source::Fixed(_) => false,
+    })?;
     get(def.name)
 }
 
@@ -277,6 +303,7 @@ mod tests {
                 "Deps",
                 "Env",
                 "Labels",
+                "Number",
                 "PassEnv",
                 "RuntimePassEnv",
                 "Tools"
@@ -287,9 +314,51 @@ mod tests {
         assert_eq!(names.len(), DEFS.len());
     }
 
+    /// The aliases built from a `target()` field.
+    fn field_aliases() -> impl Iterator<Item = &'static Alias> {
+        aliases().iter().filter(|a| {
+            DEFS.iter()
+                .any(|d| d.name == a.name && matches!(d.source, Source::Field { .. }))
+        })
+    }
+
+    /// `heph.types.Number` is `int | float`: both numbers pass, `None` and a
+    /// string do not, statically and at runtime; no parameter name suggests it.
+    #[test]
+    fn number_alias() {
+        let (errors, _) = typecheck(
+            "def f(x: heph.types.Number):\n    pass\n\ndef ok():\n    f(1)\n    f(1.5)\n\n\
+             def bad():\n    f(\"s\")\n",
+            &HashMap::new(),
+        );
+        assert_eq!(errors.len(), 1, "exactly the str call: {errors:#?}");
+        assert!(errors[0].contains("str"), "{errors:#?}");
+        // A float default infers the same type: the default fits the alias.
+        let (errors, _) = typecheck(
+            "def g(scale = 1.0):\n    n: heph.types.Number = scale\n",
+            &HashMap::new(),
+        );
+        assert!(errors.is_empty(), "{errors:#?}");
+
+        let (_tmp, loader) = source_loader();
+        let src = "def f(x: heph.types.Number = 1):\n    return x\n\nf()\nf(2)\nf(1.5)\n\
+                   y = heph.types.Number\n";
+        eval_source("BUILD", src.to_string(), "pkg", &loader).expect("evaluates");
+        for arg in ["\"s\"", "None"] {
+            let src = format!("def f(x: heph.types.Number = 1):\n    pass\nf({arg})\n");
+            assert!(
+                eval_source("BUILD", src, "pkg", &loader).is_err(),
+                "{arg} is not a Number"
+            );
+        }
+        for name in ["number", "Number", "n", "scale"] {
+            assert!(for_param(name).is_none(), "{name}");
+        }
+    }
+
     #[test]
     fn aliases_typecheck() {
-        for a in aliases() {
+        for a in field_aliases() {
             let name = a.name;
             let (errors, _) = typecheck(
                 &format!(
@@ -369,9 +438,15 @@ mod tests {
             "{1: \"a\"}",
             "{\"k\": [\"a\", None]}",
         ];
+        // `Number` is no field: nothing to agree with.
         let params: Vec<(&str, ParamType)> = DEFS
             .iter()
-            .map(|d| (d.name, alias_param(d).expect("derives")))
+            .filter_map(|d| match &d.source {
+                Source::Field { path, single } => {
+                    Some((d.name, field_param(path, *single).expect("derives")))
+                }
+                Source::Fixed(_) => None,
+            })
             .collect();
         let mut candidates: Vec<String> = params.iter().flat_map(|(_, p)| samples(p)).collect();
         candidates.extend(near_misses.iter().map(|s| s.to_string()));
@@ -416,7 +491,7 @@ mod tests {
     #[test]
     fn aliases_evaluate() {
         let (_tmp, loader) = source_loader();
-        for a in aliases() {
+        for a in field_aliases() {
             let name = a.name;
             let src = format!(
                 "def f(x: heph.types.{name} = None):\n    return x\n\nf()\nf(None)\n\
@@ -504,7 +579,7 @@ lib(\"b\", deps = [\"//x:y\"], labels = \"l\")
             assert!(
                 msg.contains(
                     "heph.types.Nope: no type alias named \"Nope\"; heph.types has: Addr, Deps, \
-                     Env, Labels, PassEnv, RuntimePassEnv, Tools"
+                     Env, Labels, Number, PassEnv, RuntimePassEnv, Tools"
                 ),
                 "{msg}"
             );

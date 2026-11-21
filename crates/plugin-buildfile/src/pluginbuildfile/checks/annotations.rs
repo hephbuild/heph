@@ -346,8 +346,21 @@ for i in []:
         ("", "{k: 1 for k in []}", false),
         ("", "1 if True else 2", false),
         ("", "lambda: 1", false),
+        // `+`/`-` only on a number literal, and only once.
+        ("", "--1", false),
+        ("", "-\"a\"", false),
+        ("", "-True", false),
+        ("", "-[]", false),
+        ("", "+1.5", true),
+        ("", "-(1)", true),
+        ("", "0x10", true),
+        ("", "10000000000000000000000", true),
+        // A literal, but not one that types: heph's dialect has types, so `...`
+        // parses. (It has no f-strings: see `literal_default_typed`.)
+        ("", "...", false),
         // A rebound `True` is not the global.
         ("True = 0\n", "True", false),
+        ("True = 0\n", "False", true),
         ("False = 0\n", "True", true),
         ("False = 0\n", "False", false),
     ];
@@ -356,35 +369,96 @@ for i in []:
         format!("{prelude}def f(x = {default}) -> None:\n    pass\n")
     }
 
+    /// Other parameter shapes for `x` in a top-level `def f`, and whether its
+    /// default types it.
+    const SHAPES: &[(&str, bool)] = &[
+        ("def f(*, x = 1) -> None:\n    pass\n", true),
+        ("def f(*, x = None) -> None:\n    pass\n", false),
+        ("def f(*args: int, x = 1) -> None:\n    pass\n", true),
+        ("def f(*args: int, x = None) -> None:\n    pass\n", false),
+        ("def f(x = 1, **kwargs: int) -> None:\n    pass\n", true),
+    ];
+
+    /// Modules that bind `True` somewhere before `def f(x = True)`: the rule
+    /// reports `x` in each. In the last, the typechecker still types `x`
+    /// (the rebinding is local to `g`), so the rule is stricter than it by
+    /// design: `bound_names` is flat.
+    const STRICTER: &[&str] = &[
+        "load(\"//lib/defs.star\", True = \"t\")\n",
+        "for True in []:\n    pass\n",
+        "True, a = 0, 1\n",
+        "def True():\n    pass\n",
+        "def g():\n    True = 0\n",
+    ];
+
+    fn stricter_src(prelude: &str) -> String {
+        src(prelude, "True")
+    }
+
     #[test]
     fn literal_default_typed() {
         for (prelude, default, typed) in DEFAULTS {
             let found = lines(&src(prelude, default));
             assert_eq!(found.is_empty(), *typed, "default `{default}`: {found:?}");
         }
+        for (src, typed) in SHAPES {
+            let found = lines(src);
+            assert_eq!(found.is_empty(), *typed, "{src}: {found:?}");
+        }
+        for prelude in STRICTER {
+            let found = lines(&stricter_src(prelude));
+            assert!(
+                matches!(found.as_slice(), [one] if one.contains("parameter `x` of `f`")),
+                "{prelude}: {found:?}"
+            );
+        }
+        // A nested def follows the same rule.
+        let none = Vec::<String>::new();
+        let nested = |default: &str| {
+            lines(&format!(
+                "def outer() -> None:\n    def f(x = {default}) -> None:\n        pass\n"
+            ))
+        };
+        assert_eq!(nested("1"), none);
+        assert_eq!(nested("None").len(), 1);
+        // heph's dialect has no f-strings; a dialect that adds them needs a row.
+        assert!(parse_build_source("pkg/BUILD", "def f(x = f\"a\"):\n    pass\n".into()).is_err());
         // `*args` and `**kwargs` have no default to type them.
         assert_eq!(lines("def f(*args, **kwargs):\n    pass\n").len(), 2);
     }
 
-    /// The rule and heph's starlark agree on every row: a parameter the rule
-    /// passes is one the typechecker does not see as `Any`.
-    #[test]
-    fn rule_agrees_with_the_typechecker() {
+    /// Whether heph's starlark types `x` of the top-level `f` in `src`. A row
+    /// the rule exempts must typecheck cleanly.
+    fn typechecker_types_x(src: &str, exempt: bool) -> bool {
         use crate::pluginbuildfile::run_file::heph_globals;
         use starlark::typing::AstModuleTypecheck;
         use std::collections::HashMap;
 
-        let globals = heph_globals(|_| {});
-        for (prelude, default, typed) in DEFAULTS {
-            let ast = parse_build_source("pkg/BUILD", src(prelude, default)).expect("parses");
-            let (errors, _, interface, _) = ast.typecheck(&globals, &HashMap::new());
-            assert!(errors.is_empty(), "default `{default}`: {errors:?}");
-            let ty = interface.get("f").expect("f in the interface").to_string();
-            assert_eq!(
-                !ty.contains("x: typing.Any"),
-                *typed,
-                "default `{default}`: starlark typed f as `{ty}`"
-            );
+        let ast = parse_build_source("pkg/BUILD", src.to_string()).expect("parses");
+        let (errors, _, interface, _) = ast.typecheck(&heph_globals(|_| {}), &HashMap::new());
+        assert!(!exempt || errors.is_empty(), "{src}: {errors:?}");
+        let ty = interface.get("f").expect("f in the interface").to_string();
+        !ty.contains("x: typing.Any")
+    }
+
+    /// The rule exempts `x` exactly when heph's starlark types it, on every
+    /// `DEFAULTS` and `SHAPES` row. On the `STRICTER` rows only one direction
+    /// holds: the rule never exempts a parameter the typechecker sees as `Any`.
+    #[test]
+    fn rule_agrees_with_the_typechecker() {
+        let exact = DEFAULTS
+            .iter()
+            .map(|(prelude, default, typed)| (src(prelude, default), *typed))
+            .chain(SHAPES.iter().map(|(s, typed)| (s.to_string(), *typed)));
+        for (src, typed) in exact {
+            assert_eq!(typechecker_types_x(&src, typed), typed, "{src}");
+        }
+        for prelude in STRICTER {
+            let src = stricter_src(prelude);
+            let exempt = lines(&src).is_empty();
+            if exempt {
+                assert!(typechecker_types_x(&src, true), "{src}");
+            }
         }
     }
 }

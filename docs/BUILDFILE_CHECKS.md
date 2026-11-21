@@ -35,7 +35,7 @@ they are exempt.
 
 | Target | Does | Writes | Labels |
 |---|---|---|---|
-| `//<pkg>:build-lint-check` | Static typecheck of the files the package owns; with `requireTypeAnnotations`, every `def` parameter (`*args`, `**kwargs` included) must have a type. The return type may be left out, and so may the type of a parameter with a literal default (see [Inferred types](#inferred-types)) | nothing | `build-lint-check`, `lint-check` |
+| `//<pkg>:build-lint-check` | Static typecheck of the files the package owns; with `requireTypeAnnotations`, every `def` parameter (`*args`, `**kwargs` included) must have a type. The return type may be left out, and so may the type of a parameter with a literal default (not `None`; see [Inferred types](#inferred-types)) | nothing | `build-lint-check`, `lint-check` |
 | `//<pkg>:build-format-check` | Fails when an owned file differs from the formatter's output, the same rule as `heph tool build-fmt --check` | nothing | `build-format-check`, `format-check` |
 | `//<pkg>:build-format` | Rewrites owned files to the formatter's output (`codegen = in_place`) | owned files | `build-format`, `format`, `fix` |
 
@@ -76,13 +76,34 @@ annotations stay optional and calls are still checked against them:
 - **The return type** of a top-level `def`: the union of what its `return`s
   give, plus `None` when the body can run off its end.
 - **A parameter with a literal default** takes the literal's type. `1` and
-  `-1` give `int`, `1.5` gives `float`, `"s"` gives `str`, `True` and `False`
-  give `bool`. A list, dict or tuple display gives a list, dict or tuple whose
+  `-1` give `int`. `1.5` and `-1.5` give `int | float`, the same type as
+  `heph.types.Number`, so `f(2)` passes against `scale = 1.0`. `"s"` gives
+  `str`, and `True` and `False` give `bool`. A list display (`[]`), a dict
+  display (`{}`) or a tuple display (`()`) gives a list, dict or tuple whose
   elements are unchecked: `xs = ["a"]` is an example, not a schema.
+
+`True` and `False` count only while the module does not rebind them anywhere
+(an assignment, a `for`, a `load`, a `def`, even one local to another def).
+Where it does, annotate the parameter.
 
 These defaults infer nothing, so the parameter still needs an annotation:
 `None` (it means "optional something"; write `x: str | None = None`), a name
-(`x = DEFAULT`), a call, and an operator (`1 + 1`, `not True`).
+(`x = DEFAULT`), a call, an operator (`1 + 1`, `not True`), `+` or `-` on
+anything but a number (`-True`, `--1`), and `...`.
+
+To accept more than the default's type, annotate the parameter. An annotation
+always wins over the default: `n: heph.types.Number = 1` takes a float too,
+and `name: str | None = ""` takes `None`.
+
+A wrapper parameter that forwards to a `target()` field (`deps`, `labels`,
+`env`, `tools`, `pass_env`, `runtime_pass_env`) should be annotated with its
+`heph.types` alias rather than typed by its default. `deps = []` infers `list`,
+so a call from another def that passes one address (`deps = "//a:b"`) or a
+group map is a type error, although `target()` accepts both.
+
+Only `build-lint-check` checks these types. Evaluation (`heph run`, `query`,
+`validate`) checks annotations alone, so it still accepts any argument for a
+parameter typed only by its default.
 
 ## Failure output
 
@@ -99,8 +120,21 @@ annotations are required by requireTypeAnnotations in .hephconfig (plugins: buil
 
 The last line appears only when there is an `annotation:` finding. When a
 parameter is named like a `heph.types` alias (`deps`, `labels`, …), its finding
-suggests that alias. `build-format-check` prints `format: not formatted` lines
-and ends with `run heph run //pkg:build-format to fix`.
+suggests that alias.
+
+The expected type in a `type-error:` may come from a parameter's default
+rather than from an annotation. After `def f(n = 1)` on line 1, a call
+`f("s")` at line 5 of another def reports:
+
+```
+pkg/BUILD:5:7: type-error: Expected type `int` but got `str`
+```
+
+To accept a `str` there too, annotate `n` (see
+[Inferred types](#inferred-types)).
+
+`build-format-check` prints `format: not formatted` lines and ends with
+`run heph run //pkg:build-format to fix`.
 
 A format finding names the first line that differs from the formatter's
 output, and only that line. There is no diff, on purpose: the fix is to run
@@ -177,17 +211,22 @@ def lib(name: str, deps: heph.types.Deps = None, labels: heph.types.Labels = Non
     target(name = name, driver = "bash", run = "true", labels = labels, transitive = {"deps": deps})
 ```
 
-The aliases are `Addr`, `Deps`, `Env`, `Labels`, `PassEnv`, `RuntimePassEnv`
-and `Tools`. The contract is:
+The field aliases are `Addr`, `Deps`, `Env`, `Labels`, `PassEnv`,
+`RuntimePassEnv` and `Tools`. The contract is:
 
-- An alias means what `target()` accepts for that field at this heph version,
-  **`None` included**, since every field is optional.
-- An alias widens with its field and never narrows. Once a name ships, it is
-  removed only through a deprecation.
-- Aliases are built from `target()`'s own fields only, never from a driver's
-  schema, which would have to enter the lint key.
+- A field alias means what `target()` accepts for that field at this heph
+  version, **`None` included**, since every field is optional.
+- A field alias widens with its field and never narrows. Once a name ships, it
+  is removed only through a deprecation.
+- Field aliases are built from `target()`'s own fields only, never from a
+  driver's schema, which would have to enter the lint key.
 - `transitive` and `approval` have no alias. No Starlark type expresses a dict
   with fixed keys, so an alias would accept keys `target()` refuses.
+
+One more alias is not built from a field: `heph.types.Number` is
+`int | float`, the type a float default gives a parameter (see
+[Inferred types](#inferred-types)). It does not include `None`, and no
+annotation finding suggests it.
 
 `heph.types.Nope` fails before evaluation, naming the known aliases. The editor
 completes `heph.types.` and shows each alias's expansion on hover.
@@ -209,7 +248,11 @@ completes `heph.types.` and shows each alias's expansion on hover.
   type, which can report findings in code that used to pass.
 - A parameter with a literal default now has that literal's type: after
   `def f(n = 1)`, `f(n = "s")` is a type error, and so is using `n` as a
-  `str` inside `f`.
+  `str` inside `f`. The commonest new findings are `f(1.5)` against `n = 1`,
+  `f(None)` against `name = ""`, and a def passing `deps = "//a:b"` to a
+  wrapper declared with `deps = []`. Annotate the parameter to widen it
+  (`n: heph.types.Number = 1`, `name: str | None = ""`,
+  `deps: heph.types.Deps = []`).
 - A plugin named `types` no longer loads. The name is reserved for
   `heph.types`, like `core`.
 - `target(labels = None)` is now accepted and means labels left out, so a

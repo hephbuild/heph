@@ -1139,6 +1139,7 @@ fn types_completion_and_hover() {
             "Deps",
             "Env",
             "Labels",
+            "Number",
             "PassEnv",
             "RuntimePassEnv",
             "Tools"
@@ -2929,6 +2930,24 @@ fn require_annotations_diagnostic() {
     assert!(
         annotation_diagnostics(false, text).is_empty(),
         "nothing when the option is off"
+    );
+}
+
+#[test]
+fn require_annotations_exempts_a_literal_default() {
+    // `n = 1` is typed by its default; `o = None` is not.
+    let on = annotation_diagnostics(true, "def f(n = 1, o = None):\n    pass\n");
+    let marks: Vec<(&str, &Value)> = on
+        .iter()
+        .map(|d| (d["message"].as_str().unwrap_or(""), &d["range"]["start"]))
+        .collect();
+    assert_eq!(
+        marks,
+        [(
+            "parameter `o` of `f` has no type; add `: <type>`",
+            &json!({"line": 0, "character": 13}),
+        )],
+        "a mark on `o` only"
     );
 }
 

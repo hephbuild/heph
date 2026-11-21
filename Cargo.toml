@@ -245,12 +245,14 @@ crossterm = { git = "https://github.com/hephbuild/crossterm.git", branch = "fix-
 # starlark 0.14.2 plus two fixes to the static typechecker, where it used `Any`:
 # - it infers the return type of a top-level `def` without a return annotation;
 # - it types an unannotated parameter from a literal default (`n = 1` is an
-#   `int`; `None` and non-literals still give `Any`).
+#   `int`, `x = 1.5` is `int | float`; `None` and non-literals still give
+#   `Any`).
 # So under the buildfile plugin's `requireTypeAnnotations`, return annotations
 # and those parameters' annotations stay optional, and calls are still checked
-# against the inferred types. Only the AST typechecker heph uses infers; the
-# one evaluation runs (`enable_static_typechecking`) still sees `Any`. The branch keeps
-# starlark's own dependencies on crates.io, so heph links one starlark_syntax.
+# against the inferred types. Both are lint-only: only the AST typechecker heph
+# uses infers, and the one evaluation runs (`enable_static_typechecking`, or
+# `@starlark-rust: typecheck`) still sees `Any`. The branch keeps starlark's
+# own dependencies on crates.io, so heph links one starlark_syntax.
 # To be proposed to meta/starlark-rust; drop this once a release carries it.
 # `crates/plugin-buildfile/src/pluginbuildfile/starlark_patch.rs` fails without it.
 starlark = { git = "https://github.com/hephbuild/starlark-rust.git", branch = "heph/v0.14.2" }
