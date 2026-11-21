@@ -18,6 +18,7 @@
 mod common;
 
 mod approval_gate;
+mod buildfile_checks;
 mod cache_load;
 mod cache_outcome;
 mod clean;

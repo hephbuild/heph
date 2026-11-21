@@ -30,7 +30,7 @@ request ──> position.rs (UTF-16/8/32 → byte, once)
 | `handlers.rs` | The site-kind table and the merge policy; the renderers and item builders |
 | `position.rs` | Position encoding, converted at the request boundary and nowhere else |
 | `context.rs` | The vendored analysis's `LspContext`: load resolution, listing, evaluation for the index |
-| `diagnostics.rs` | AST checks of `target(` / `provider_state(` keyword arguments |
+| `diagnostics.rs` | AST checks of `target(` / `provider_state(` keyword arguments; with `requireTypeAnnotations` on, each `def` parameter missing a type, from the checker `build-lint-check` runs (type errors are not shown; see `docs/BUILDFILE_CHECKS.md`) |
 | `index.rs` | The evaluation side channel (provenance "Targets" hover, undocumented `def` signatures) and the per-document shared state |
 | `crates/vendored-starlark-lsp` | `starlark_lsp` 0.14.2's analysis modules, owned by heph; its `NOTICE` lists every divergence |
 
@@ -56,8 +56,8 @@ start; until that snapshot lands, heph answers with the stock results and
 | `target_key` | a keyword-name position inside `target(` | base fields + the selected driver's, minus keys present | the field's type and doc | — |
 | `state_key` | a keyword-name position inside `provider_state(` | `provider` + the selected provider's schema, minus keys present | the field's type and doc | — |
 | `arg_key` | a keyword-name position inside a call to any other plain-named function (`my_rule(`, `glob(`; not `x.f(`, not a `def`'s parameters) | the callee's unwritten parameters, each inserting `name = `, ranked first; then stock (see below) | stock | stock |
-| `plugin_namespace` | after `heph.` | plugins and `core` | — | — |
-| `plugin_member` | after `heph.<plugin>.`, or on the function name | the plugin's functions | the function's signature and doc | — |
+| `plugin_namespace` | after `heph.` | plugins, `core` and `types` | — | — |
+| `plugin_member` | after `heph.<plugin>.`, or on the function name | the plugin's functions; under `heph.types.`, every type alias | the function's signature and doc; for an alias, its expansion | — |
 | `address` | a string starting `//` or `:`, inside a call or not | packages, then targets, both forms | — | the call that declared the target (see below), or the package's BUILD file |
 | `load_path` | the first argument of `load(` | package paths | — | the loaded file |
 | `load_symbol` | a later string argument of `load(` | the loaded file's exported `def`s | — | the `def` line, from the loaded file's AST |

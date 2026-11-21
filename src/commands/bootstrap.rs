@@ -231,7 +231,9 @@ pub fn register_builtin_factories(
 
 /// [`register_builtin_factories`], with the buildfile provider recording its
 /// shadowed check targets into `shadowed`, which `heph validate` reads.
-pub(crate) fn register_builtin_factories_with(
+/// Public so `crates/e2e` builds the buildfile plugin through this factory
+/// and reads the same record.
+pub fn register_builtin_factories_with(
     e: &mut engine::Engine,
     home_dir: &std::path::Path,
     shadowed: pluginbuildfile::ShadowedChecks,

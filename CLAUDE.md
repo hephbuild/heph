@@ -287,6 +287,18 @@ itself, or depends on the file evaluating, brings back the bugs this design
 removed. A site kind ships with its editor-shaped test in `tests/lsp.rs`.
 `heph tool build-lsp --explain FILE:LINE:COL` prints the classification.
 
+### BUILD-file checks
+
+`docs/BUILDFILE_CHECKS.md`. Every package with a BUILD file gets
+`build-lint-check` (static typecheck of def bodies, never top-level code),
+`build-format-check` and `build-format`, built by one `plugin_parts` factory.
+
+The one thing to know going in: the lint driver **never resolves a load**.
+The provider's parse-only walk resolves each edge once, through evaluation's
+own resolver, and passes the edges in the def. Resolving again inside the
+sandbox gives a different answer from the same code. And nothing about
+`requireTypeAnnotations` may reach an ordinary target's def.
+
 ### The `.hephconfig` schema
 
 `docs/CONFIG_SCHEMA.md`. `heph tool config-schema` prints a schema derived from
