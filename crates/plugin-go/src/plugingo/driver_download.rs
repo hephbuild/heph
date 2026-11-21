@@ -44,15 +44,18 @@ pub struct GoDownloadDriver {
     /// target's own `runner` field overrides it. See [`crate::plugingo::runner`].
     default_runner: Option<String>,
     /// Host `go` resolved in whatever environment the runner names. Only ever
-    /// touched by `gotool = "host"`.
-    host_go: crate::plugingo::toolchain::HostGoCache,
+    /// touched by `gotool = "host"`. Shared with the provider, whose
+    /// `scope_ended` clears it.
+    host_go: Arc<crate::plugingo::toolchain::HostGoCache>,
 }
 
 impl GoDownloadDriver {
-    pub fn new() -> Self {
+    /// `host_go` is the Go provider's ([`crate::plugingo::Provider::host_go`]),
+    /// so the provider's `scope_ended` clears what this driver probed.
+    pub fn new(host_go: Arc<crate::plugingo::toolchain::HostGoCache>) -> Self {
         Self {
             default_runner: None,
-            host_go: Default::default(),
+            host_go,
         }
     }
 
@@ -62,12 +65,6 @@ impl GoDownloadDriver {
     pub fn with_default_runner(mut self, runner: Option<String>) -> Self {
         self.default_runner = runner;
         self
-    }
-}
-
-impl Default for GoDownloadDriver {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -628,9 +625,12 @@ mod tests {
 
     #[tokio::test]
     async fn parse_collects_the_whole_package_under_a_glob() {
-        let def = parse_def(&GoDownloadDriver::new(), spec("gopkg.in/yaml.v2", "v2.4.0"))
-            .await
-            .unwrap();
+        let def = parse_def(
+            &GoDownloadDriver::new(Default::default()),
+            spec("gopkg.in/yaml.v2", "v2.4.0"),
+        )
+        .await
+        .unwrap();
         assert_eq!(def.outputs.len(), 1);
         assert_eq!(def.outputs[0].group, "");
         assert!(
@@ -645,9 +645,12 @@ mod tests {
 
     #[tokio::test]
     async fn parse_stages_the_sdk_read_only_and_hashed() {
-        let def = parse_def(&GoDownloadDriver::new(), spec("gopkg.in/yaml.v2", "v2.4.0"))
-            .await
-            .unwrap();
+        let def = parse_def(
+            &GoDownloadDriver::new(Default::default()),
+            spec("gopkg.in/yaml.v2", "v2.4.0"),
+        )
+        .await
+        .unwrap();
         let sdk = def
             .inputs
             .iter()
@@ -665,9 +668,12 @@ mod tests {
     /// The module cache is a scratch: a warm cache must not change the key.
     #[tokio::test]
     async fn parse_references_the_modcache_as_an_unhashed_scratch() {
-        let def = parse_def(&GoDownloadDriver::new(), spec("gopkg.in/yaml.v2", "v2.4.0"))
-            .await
-            .unwrap();
+        let def = parse_def(
+            &GoDownloadDriver::new(Default::default()),
+            spec("gopkg.in/yaml.v2", "v2.4.0"),
+        )
+        .await
+        .unwrap();
         let scratch = def
             .inputs
             .iter()
@@ -682,8 +688,8 @@ mod tests {
 
     #[tokio::test]
     async fn parse_applies_the_default_runner() {
-        let driver =
-            GoDownloadDriver::new().with_default_runner(Some("//tools/devenv:runner".to_string()));
+        let driver = GoDownloadDriver::new(Default::default())
+            .with_default_runner(Some("//tools/devenv:runner".to_string()));
         let def = parse_def(&driver, spec("gopkg.in/yaml.v2", "v2.4.0"))
             .await
             .unwrap();
@@ -699,7 +705,7 @@ mod tests {
     #[tokio::test]
     async fn parse_hash_follows_module_and_version() {
         let hash = |m: &'static str, v: &'static str| async move {
-            parse_def(&GoDownloadDriver::new(), spec(m, v))
+            parse_def(&GoDownloadDriver::new(Default::default()), spec(m, v))
                 .await
                 .unwrap()
                 .hash
@@ -713,7 +719,7 @@ mod tests {
         other_go
             .config
             .insert("go_version".to_string(), Value::String("1.0.0".to_string()));
-        let other = parse_def(&GoDownloadDriver::new(), other_go)
+        let other = parse_def(&GoDownloadDriver::new(Default::default()), other_go)
             .await
             .unwrap()
             .hash;
@@ -724,9 +730,12 @@ mod tests {
     /// declared one replaces it, and neither moves the def hash.
     #[tokio::test]
     async fn parse_defaults_resources_to_a_tenth_of_a_cpu_unhashed() {
-        let plain = parse_def(&GoDownloadDriver::new(), spec("gopkg.in/yaml.v2", "v2.4.0"))
-            .await
-            .unwrap();
+        let plain = parse_def(
+            &GoDownloadDriver::new(Default::default()),
+            spec("gopkg.in/yaml.v2", "v2.4.0"),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             plain.resources.declared("cpu"),
             Some(hplugin::driver::Resources::IO_CPU)
@@ -736,7 +745,9 @@ mod tests {
             "resources".to_string(),
             Value::Map(HashMap::from([("cpu".to_string(), Value::Int(2))])),
         );
-        let heavy = parse_def(&GoDownloadDriver::new(), declared).await.unwrap();
+        let heavy = parse_def(&GoDownloadDriver::new(Default::default()), declared)
+            .await
+            .unwrap();
         assert_eq!(heavy.resources.declared("cpu"), Some("2"));
         assert_eq!(heavy.hash, plain.hash);
     }
@@ -744,7 +755,7 @@ mod tests {
     #[tokio::test]
     async fn parse_refuses_a_missing_module_or_version() {
         for (m, v, needle) in [("", "v1", "module"), ("a.b/c", "", "version")] {
-            let err = parse_def(&GoDownloadDriver::new(), spec(m, v))
+            let err = parse_def(&GoDownloadDriver::new(Default::default()), spec(m, v))
                 .await
                 .err()
                 .expect("must refuse");

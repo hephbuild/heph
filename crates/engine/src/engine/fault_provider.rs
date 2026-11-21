@@ -22,6 +22,7 @@ use hbuiltins::pluginstatictarget;
 use hcore::hasync::Cancellable;
 use hmodel::htaddr::Addr;
 use hmodel::htpkg::PkgBuf;
+use hplugin::scope::{ScopeEnded, ScopeEndedAck, ScopeId};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -88,6 +89,52 @@ pub struct Faults {
     /// Every `get` sleeps this long first, so overlapping calls are visible
     /// in [`FaultProvider::max_concurrent_gets`].
     pub slow_get: Option<Duration>,
+    /// `scope_ended` fails (after recording the call).
+    pub fail_scope_ended: bool,
+    /// `scope_ended` panics (after recording the call).
+    pub panic_scope_ended: bool,
+    /// `scope_ended` records the call, then takes a permit from this before it
+    /// answers: a hook the test holds open.
+    pub scope_ended_gate: Option<Arc<tokio::sync::Semaphore>>,
+}
+
+/// The cache scopes a [`FaultProvider`] was called in and told about,
+/// readable after the provider is handed to the engine.
+#[derive(Debug, Default)]
+pub struct ScopeLog {
+    seen: parking_lot::Mutex<Vec<Option<ScopeId>>>,
+    ended: parking_lot::Mutex<Vec<(ScopeEnded, std::thread::ThreadId)>>,
+}
+
+impl ScopeLog {
+    /// The scope each `list_packages`, `list`, `get` and `probe` carried, in
+    /// call order.
+    pub fn seen(&self) -> Vec<Option<ScopeId>> {
+        self.seen.lock().clone()
+    }
+
+    /// Every `scope_ended` call, in call order.
+    pub fn ended(&self) -> Vec<ScopeEnded> {
+        self.ended.lock().iter().map(|(e, _)| *e).collect()
+    }
+
+    /// How many times `scope_ended` was called for `scope`.
+    pub fn ended_count(&self, scope: ScopeId) -> usize {
+        self.ended
+            .lock()
+            .iter()
+            .filter(|(e, _)| e.scope == scope)
+            .count()
+    }
+
+    /// The thread each `scope_ended` call started on, in call order.
+    pub fn ended_threads(&self) -> Vec<std::thread::ThreadId> {
+        self.ended.lock().iter().map(|(_, t)| *t).collect()
+    }
+
+    fn saw(&self, scope: Option<ScopeId>) {
+        self.seen.lock().push(scope);
+    }
 }
 
 /// [`Faults::listed_facts`]: what `list` says about an entry.
@@ -116,6 +163,7 @@ pub struct FaultProvider {
     list_packages_calls: Arc<AtomicUsize>,
     list_calls: Arc<AtomicUsize>,
     gets: Arc<GetLog>,
+    scopes: Arc<ScopeLog>,
 }
 
 /// What reached `get`, readable after the provider is handed to the engine.
@@ -164,7 +212,14 @@ impl FaultProvider {
             list_packages_calls: Arc::new(AtomicUsize::new(0)),
             list_calls: Arc::new(AtomicUsize::new(0)),
             gets: Arc::default(),
+            scopes: Arc::default(),
         })
+    }
+
+    /// The scopes it was called in and told about, readable after the
+    /// provider has been handed to the engine.
+    pub fn scopes(&self) -> Arc<ScopeLog> {
+        Arc::clone(&self.scopes)
     }
 
     /// How many times `list` was called, readable after the provider has been
@@ -239,6 +294,7 @@ impl Provider for FaultProvider {
     ) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>>
     {
         self.list_calls.fetch_add(1, Ordering::SeqCst);
+        self.scopes.saw(req.cache_scope());
         Box::pin(async move {
             let pkg = req.package.as_str().to_string();
             let states = req.states.clone();
@@ -331,6 +387,7 @@ impl Provider for FaultProvider {
         anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>>,
     > {
         self.list_packages_calls.fetch_add(1, Ordering::SeqCst);
+        self.scopes.saw(req.cache_scope());
         Box::pin(async move {
             if let Some(e) = self.cancelled(Stage::Packages, "", ctoken).await {
                 return Err(e);
@@ -364,6 +421,7 @@ impl Provider for FaultProvider {
         req: GetRequest,
         ctoken: &'a (dyn Cancellable + Send + Sync),
     ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
+        self.scopes.saw(req.cache_scope());
         Box::pin(async move {
             let _in_flight = InFlight::enter(&self.gets, &req.addr);
             if let Some(d) = self.faults.slow_get {
@@ -406,6 +464,7 @@ impl Provider for FaultProvider {
         req: ProbeRequest,
         ctoken: &'a (dyn Cancellable + Send + Sync),
     ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
+        self.scopes.saw(req.cache_scope());
         Box::pin(async move {
             let pkg = req.package.as_str().to_string();
             if let Some(e) = self.cancelled(Stage::Probe, &pkg, ctoken).await {
@@ -428,6 +487,34 @@ impl Provider for FaultProvider {
             let mut res = self.inner.probe(req, ctoken).await?;
             res.states.extend(declared);
             Ok(res)
+        })
+    }
+
+    /// Records the call, misbehaves as `Faults` says, then forwards to the
+    /// static provider it wraps and answers with its ack.
+    fn scope_ended<'a>(
+        &'a self,
+        ended: ScopeEnded,
+    ) -> BoxFuture<'a, anyhow::Result<ScopeEndedAck>> {
+        Box::pin(async move {
+            self.scopes
+                .ended
+                .lock()
+                .push((ended, std::thread::current().id()));
+            if let Some(gate) = &self.faults.scope_ended_gate {
+                let _permit = gate.acquire().await;
+            }
+            #[expect(
+                clippy::panic,
+                reason = "`panic_scope_ended` exists to make the hook panic"
+            )]
+            if self.faults.panic_scope_ended {
+                panic!("scope_ended blew up for scope {}", ended.scope);
+            }
+            if self.faults.fail_scope_ended {
+                anyhow::bail!("dropping the caches of scope {}: disk on fire", ended.scope);
+            }
+            self.inner.scope_ended(ended).await
         })
     }
 }

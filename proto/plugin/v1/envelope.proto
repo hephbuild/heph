@@ -111,6 +111,9 @@ message Frame {
     // call_function request crosses as raw CallFunctionRequest bytes (like
     // list/get); only the response rides a frame body.
     CallFunctionResponse call_function_resp = 55;
+    // Since 0.21.3: the reply to PROVIDER_METHOD_SCOPE_ENDED (its request
+    // crosses as raw ScopeEndedRequest bytes).
+    ScopeEndedResponse scope_ended_resp = 56;
 
     // host-exported callbacks (plugin->host request / host->plugin response)
     ResultRequest result_req = 40;

@@ -433,3 +433,85 @@ func TestAllotment(t *testing.T) {
         .context("the Go test checks N and GOMAXPROCS itself")?;
     Ok(())
 }
+
+/// What one fresh root request did to `_golist` targets while resolving
+/// `addr`'s def: how many it executed (`go list` ran) and how many it read
+/// back from the local cache.
+async fn golist_activity(ws: &htestkit::Workspace, addr: &str) -> anyhow::Result<(usize, usize)> {
+    use heph::engine::event::BuildEventKind;
+    let parsed = heph::htaddr::parse_addr(addr)?;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let rs = ws.engine.new_state_with_events(false, Some(tx));
+    ws.engine.clone().get_def(rs, &parsed).await?;
+    let (mut executed, mut hits) = (0, 0);
+    while let Ok(ev) = rx.try_recv() {
+        match &ev.kind {
+            BuildEventKind::ExecuteStart { driver, .. } if driver == "go.golist" => executed += 1,
+            BuildEventKind::CacheOutcome { addr, outcome }
+                if addr.contains(":_golist")
+                    && *outcome == hcore::events::CacheOutcomeKind::LocalHit =>
+            {
+                hits += 1;
+            }
+            _ => {}
+        }
+    }
+    Ok((executed, hits))
+}
+
+/// The Go provider's caches live for one cache scope, so a second root request
+/// re-reads every `_golist` it needs. On an unchanged tree that is a local
+/// cache hit on the target, never `go list` again: two roots execute each
+/// `_golist` once in total.
+#[tokio::test]
+async fn golist_not_rerun_in_next_scope() -> anyhow::Result<()> {
+    require_go!();
+    let ws = make_workspace(fixture("with_dep")?)?;
+
+    let (first_runs, _) = golist_activity(&ws, "//cmd:build@v=host").await?;
+    assert!(
+        first_runs >= 2,
+        "cmd and lib each run `go list` once: {first_runs}"
+    );
+
+    let (second_runs, second_hits) = golist_activity(&ws, "//cmd:build@v=host").await?;
+    assert_eq!(
+        second_runs, 0,
+        "the next scope must not run `go list` again"
+    );
+    assert!(
+        second_hits >= first_runs,
+        "the next scope reads each `_golist` again, from the local cache \
+         ({second_hits} hits, {first_runs} executed first)"
+    );
+    Ok(())
+}
+
+/// I8 through the engine: a Go `get` that resolves a binary's transitive libs
+/// (through `libs_cache`, whose computation captures the request's executor)
+/// leaves its scope's bucket alive in the provider, and the request's state is
+/// still freed once its caller drops it. The scope is a field of that state,
+/// so this is what lets the scope end and its hook fire (the engine's
+/// `cache_scope` tests cover the hook from there).
+#[tokio::test]
+async fn go_request_state_is_freed_after_a_go_get() -> anyhow::Result<()> {
+    require_go!();
+    let ws = make_workspace(fixture("with_dep")?)?;
+    let rs = ws.engine.new_state();
+    let request = std::sync::Arc::downgrade(&rs);
+    ws.engine
+        .clone()
+        .get_def(rs, &heph::htaddr::parse_addr("//cmd:build@v=host")?)
+        .await?;
+
+    // Background work the request started (cache writes) holds it briefly.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while request.upgrade().is_some() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        request.upgrade().is_none(),
+        "something kept the request state alive after its caller dropped it"
+    );
+    Ok(())
+}

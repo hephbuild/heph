@@ -149,13 +149,7 @@ impl Engine {
         if slots.is_empty() {
             return (dead, kept, errored);
         }
-        let resolve_rs = self.new_state_full(
-            false,
-            rs.events_sender(),
-            rs.bg_pending(),
-            Self::DEFAULT_LOG_TAIL_LINES,
-            None,
-        );
+        let resolve_rs = self.new_nested_state(rs);
         resolve_rs.suppress_deferred_trims();
 
         let limit = self.max_workers.max(1);

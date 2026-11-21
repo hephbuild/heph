@@ -48,6 +48,7 @@ pub use hplugin::driver;
 pub use hplugin::error;
 pub use hplugin::hook;
 mod cache_codec;
+mod cache_scope;
 pub mod event;
 mod labels;
 pub mod listed;

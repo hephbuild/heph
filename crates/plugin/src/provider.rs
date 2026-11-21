@@ -15,6 +15,11 @@ pub struct ConfigResponse {
     pub name: String,
 }
 
+pub use crate::scope::{CacheScope, ScopeEnded, ScopeEndedAck, ScopeId, ScopeMap};
+
+/// Built with [`ListRequest::new`]; non-exhaustive so the next field is not
+/// another source break for every call site.
+#[non_exhaustive]
 pub struct ListRequest {
     pub request_id: String,
     pub package: PkgBuf,
@@ -25,7 +30,62 @@ pub struct ListRequest {
     /// Providers that don't need it ignore it; non-engine call sites (LSP, tests)
     /// pass [`NoopExecutor`].
     pub executor: Arc<dyn ProviderExecutor>,
+    cache_scope: Option<ScopeId>,
 }
+
+impl ListRequest {
+    pub fn new(
+        request_id: impl Into<String>,
+        package: PkgBuf,
+        states: Vec<State>,
+        executor: Arc<dyn ProviderExecutor>,
+    ) -> Self {
+        Self {
+            request_id: request_id.into(),
+            package,
+            states,
+            executor,
+            cache_scope: None,
+        }
+    }
+}
+
+/// The cache-scope accessors every provider request shares: the host sets the
+/// scope from its [`CacheScope`] (marking it touched, so it is never sent
+/// unmarked), a transport from the id it decoded.
+macro_rules! cache_scope_accessors {
+    ($($req:ty),*) => {$(
+        impl $req {
+            /// Run this call in `scope`, and mark the scope touched so its end
+            /// is sent to the providers.
+            #[must_use]
+            pub fn with_cache_scope(mut self, scope: &CacheScope) -> Self {
+                scope.mark_touched();
+                self.cache_scope = Some(scope.id());
+                self
+            }
+
+            /// The scope a transport decoded for this call — for the plugin
+            /// SDK's decode, where the host already marked it. `None` is a
+            /// call with no scope (the provider's unscoped bucket).
+            #[must_use]
+            pub fn with_decoded_scope(mut self, scope: Option<ScopeId>) -> Self {
+                self.cache_scope = scope;
+                self
+            }
+
+            /// The cache scope this call belongs to; `None` when none was sent
+            /// (a call that is not the engine's, or a host that predates
+            /// scopes). A provider keys its workspace caches by it through a
+            /// [`ScopeMap`].
+            pub fn cache_scope(&self) -> Option<ScopeId> {
+                self.cache_scope
+            }
+        }
+    )*};
+}
+
+cache_scope_accessors!(ListRequest, ListPackagesRequest, GetRequest, ProbeRequest);
 pub use hmodel::htmatcher::ListedFacts;
 
 /// Built with [`ListResponse::addr_only`] or [`ListResponse::with_facts`];
@@ -55,8 +115,24 @@ impl ListResponse {
     }
 }
 
+/// Built with [`ListPackagesRequest::new`].
+#[non_exhaustive]
 pub struct ListPackagesRequest {
+    /// The engine request this listing runs under (what a cancel names).
+    /// Empty when an older host sent none.
+    pub request_id: String,
     pub prefix: PkgBuf,
+    cache_scope: Option<ScopeId>,
+}
+
+impl ListPackagesRequest {
+    pub fn new(request_id: impl Into<String>, prefix: PkgBuf) -> Self {
+        Self {
+            request_id: request_id.into(),
+            prefix,
+            cache_scope: None,
+        }
+    }
 }
 #[derive(Clone)]
 pub struct ListPackageResponse {
@@ -319,19 +395,53 @@ pub trait ScopedExecutor: Send + Sync {
     ) -> BoxFuture<'a, anyhow::Result<Vec<Addr>>>;
 }
 
+/// Built with [`GetRequest::new`].
+#[non_exhaustive]
 pub struct GetRequest {
     pub request_id: String,
     pub addr: Addr,
     pub states: Vec<State>,
     pub executor: Arc<dyn ProviderExecutor>,
+    cache_scope: Option<ScopeId>,
 }
+
+impl GetRequest {
+    pub fn new(
+        request_id: impl Into<String>,
+        addr: Addr,
+        states: Vec<State>,
+        executor: Arc<dyn ProviderExecutor>,
+    ) -> Self {
+        Self {
+            request_id: request_id.into(),
+            addr,
+            states,
+            executor,
+            cache_scope: None,
+        }
+    }
+}
+
 pub struct GetResponse {
     pub target_spec: TargetSpec,
 }
 
+/// Built with [`ProbeRequest::new`].
+#[non_exhaustive]
 pub struct ProbeRequest {
     pub request_id: String,
     pub package: PkgBuf,
+    cache_scope: Option<ScopeId>,
+}
+
+impl ProbeRequest {
+    pub fn new(request_id: impl Into<String>, package: PkgBuf) -> Self {
+        Self {
+            request_id: request_id.into(),
+            package,
+            cache_scope: None,
+        }
+    }
 }
 pub struct ProbeResponse {
     pub states: Vec<State>,
@@ -460,5 +570,26 @@ pub trait Provider: Send + Sync {
     /// complete and document them. Default: none.
     fn state_schema(&self) -> Option<StateSchema> {
         None
+    }
+
+    /// A cache scope ended: drop what this provider holds for `ended.scope`
+    /// (and, through a [`ScopeMap`], every scope below `ended.ended_below`).
+    ///
+    /// Sent once per scope after its last request state drops, off the
+    /// dropping thread, and only for a scope some request was built with. A
+    /// provider that caches workspace state (BUILD contents, package lists,
+    /// module files) must key it by [`ListRequest::cache_scope`] and the like,
+    /// and release it here; a long-lived engine (the BUILD-file LSP) otherwise
+    /// answers every later request from its first snapshot. A call for the
+    /// scope may still be in flight, or arrive later: it is answered uncached
+    /// and must never recreate the scope's entries.
+    ///
+    /// A provider that wraps another forwards this to it. The default keeps
+    /// nothing per scope and says so: [`ScopeEndedAck::Unsupported`].
+    fn scope_ended<'a>(
+        &'a self,
+        _ended: ScopeEnded,
+    ) -> BoxFuture<'a, anyhow::Result<ScopeEndedAck>> {
+        Box::pin(async { Ok(ScopeEndedAck::Unsupported) })
     }
 }

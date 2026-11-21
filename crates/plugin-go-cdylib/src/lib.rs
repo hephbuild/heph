@@ -129,6 +129,10 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
     // `heph.go.*`: built from the same options as the provider, exported
     // beside it — functions are the plugin's, not the provider's.
     let (functions, function_handle) = make_plugin_functions(&cfg.name, provider.functions())?;
+    // One host-`go` cache for the provider and the three drivers that run
+    // `go`: their run requests carry no cache scope, so the provider's
+    // `scope_ended` is what clears it.
+    let host_go = provider.host_go();
     let provider: Arc<dyn hplugin::provider::Provider> = Arc::new(provider);
 
     let mut drivers = stabby::vec::Vec::new();
@@ -138,7 +142,7 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
     // point, since the plugin also stops owning the eviction, the locking and
     // the visibility it never had.
     let golist: Arc<dyn ManagedDriver> =
-        Arc::new(GoGolistDriver::new().with_default_runner(go_runner.clone()));
+        Arc::new(GoGolistDriver::new(Arc::clone(&host_go)).with_default_runner(go_runner.clone()));
     drivers.push(NamedDriver {
         name: "golist".into(),
         driver: make_dyn_managed_driver(golist),
@@ -151,13 +155,13 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
         driver: make_dyn_managed_driver(toolchain),
     });
     let compile: Arc<dyn ManagedDriver> =
-        Arc::new(GoCompileDriver::new().with_default_runner(go_runner.clone()));
+        Arc::new(GoCompileDriver::new(Arc::clone(&host_go)).with_default_runner(go_runner.clone()));
     drivers.push(NamedDriver {
         name: "compile".into(),
         driver: make_dyn_managed_driver(compile),
     });
     let download: Arc<dyn ManagedDriver> =
-        Arc::new(GoDownloadDriver::new().with_default_runner(go_runner.clone()));
+        Arc::new(GoDownloadDriver::new(host_go).with_default_runner(go_runner.clone()));
     drivers.push(NamedDriver {
         name: "download".into(),
         driver: make_dyn_managed_driver(download),

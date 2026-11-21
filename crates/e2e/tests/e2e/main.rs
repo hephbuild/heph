@@ -20,6 +20,7 @@ mod common;
 mod approval_gate;
 mod cache_load;
 mod cache_outcome;
+mod cache_scopes;
 mod clean;
 mod codegen_commands;
 mod codegen_in_place;

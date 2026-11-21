@@ -1,4 +1,4 @@
-use crate::pluginbuildfile::provider::{PackageList, Provider};
+use crate::pluginbuildfile::provider::{PackageList, Provider, ScopeCaches};
 use anyhow::Context;
 use enclose::enclose;
 use hcore::hmemoizer::unwrap_arc_err;
@@ -1483,7 +1483,14 @@ fn pkg_eval_slots() -> usize {
 }
 
 impl Provider {
-    pub(crate) async fn run_pkg(&self, pkg: &str) -> anyhow::Result<Arc<RunResult>> {
+    /// Evaluate `pkg` in the cache scope `caches` belongs to. The caller (an
+    /// entry point) resolved the bucket once: this runs millions of times on a
+    /// large workspace and must not look the scope up per call.
+    pub(crate) async fn run_pkg(
+        &self,
+        caches: &ScopeCaches,
+        pkg: &str,
+    ) -> anyhow::Result<Arc<RunResult>> {
         // Answer a completed entry before building anything. Everything below
         // this point exists only to construct the closure `once` runs on a
         // *miss* — a `PathBuf` clone, a full clone of the function registry,
@@ -1500,23 +1507,24 @@ impl Provider {
         // calls, 11.4M of them from `probe` — against 13 BUILD files in the
         // tree. The evaluation itself was already memoized; the preamble was
         // not, and it was ~4% of the run's CPU.
-        if let Some(hit) = self.pkg_cache.peek(pkg) {
+        if let Some(hit) = caches.pkg_cache.peek(pkg) {
             return hit.map_err(unwrap_arc_err);
         }
         let key = pkg.to_string();
         let root = self.root.clone();
         let patterns = self.build_file_patterns.clone();
-        let file_cache = self.file_cache.clone();
-        let dir_cache = self.dir_cache.clone();
+        let file_cache = caches.file_cache.clone();
+        let dir_cache = caches.dir_cache.clone();
         let registry = self
             .functions
             .registry()
             .context("building the `heph.<plugin>.<fn>` namespace for BUILD evaluation")?;
         let globals = self.globals.clone();
         let walker = self.walker.clone();
-        let packages = self.packages();
-        let loads = self.loads.clone();
-        self.pkg_cache
+        let packages = Arc::clone(&caches.packages);
+        let loads = caches.loads.clone();
+        caches
+            .pkg_cache
             .once(
                 key.clone(),
                 enclose!((key) move || async move {
@@ -1587,8 +1595,8 @@ pub(crate) struct BuildFileLoader {
     walker: Arc<CachedWalker>,
     /// The sorted workspace package list backing `heph.core.packages()`, bound to
     /// the root/patterns/skip/walker it is walked from. Scoped to whatever built
-    /// it: the engine shares one per provider (a loader is built per package
-    /// evaluation, so the tree is walked once for the whole run and both the
+    /// it: the engine shares one per cache scope (a loader is built per package
+    /// evaluation, so the tree is walked once for the whole scope and both the
     /// Starlark and `Provider::list_packages` paths see one order), while the LSP
     /// deliberately builds a fresh one per loader.
     packages: Arc<PackageList>,
@@ -2488,8 +2496,9 @@ mod tests {
             }
         });
 
+        let caches = provider.caches(None);
         assert!(
-            provider
+            caches
                 .file_cache
                 .lock()
                 .unwrap()
@@ -2500,7 +2509,7 @@ mod tests {
         // evaluations is one apiece. Four would be the shared file evaluated
         // twice, which is the defect.
         assert_eq!(
-            provider.loads.started(),
+            caches.loads.started(),
             3,
             "the shared file must be evaluated once, not once per package",
         );
@@ -2538,9 +2547,13 @@ mod tests {
             ..Provider::default()
         });
 
+        // The unscoped bucket's registry: `run_pkg_blocking` evaluates both
+        // packages in that bucket.
+        let caches = provider.caches(None);
+
         // `a` misses the cache for the shared file; before it claims, `b`
         // evaluates it, caches it and releases it.
-        provider.loads.set_before_claim_hook(
+        caches.loads.set_before_claim_hook(
             shared.clone(),
             enclose!((provider) move || {
                 run_pkg_blocking(&provider, "b").expect("evaluate package b");
@@ -2551,7 +2564,7 @@ mod tests {
         // `a/BUILD`, `b/BUILD` and `shared.BUILD` once each. Four is the shared
         // file evaluated by both packages.
         assert_eq!(
-            provider.loads.started(),
+            caches.loads.started(),
             3,
             "the shared file must be evaluated once, not again by the chain that missed before it was cached",
         );
@@ -2610,18 +2623,21 @@ mod tests {
 
     fn run_pkg_blocking(provider: &Provider, pkg: &str) -> anyhow::Result<Arc<RunResult>> {
         let registry = provider.functions.registry()?;
+        // The unscoped bucket: every call of a test shares it, as calls in one
+        // engine scope do.
+        let caches = provider.caches(None);
         let loader = BuildFileLoader::new(
             provider.root.clone(),
             provider.build_file_patterns.clone(),
-            provider.file_cache.clone(),
-            provider.dir_cache.clone(),
+            caches.file_cache.clone(),
+            caches.dir_cache.clone(),
             registry,
             provider.globals.clone(),
             provider.walker.clone(),
-            provider.packages(),
-            // The provider's own registry, not a fresh one: two concurrent
+            Arc::clone(&caches.packages),
+            // The bucket's own registry, not a fresh one: two concurrent
             // `run_pkg` calls share it, and that sharing is the point.
-            provider.loads.clone(),
+            caches.loads.clone(),
         );
         loader.load_pkg(pkg)
     }
@@ -3204,7 +3220,8 @@ target(
             .await
             .expect("hold every evaluation slot");
 
-        let eval = provider.run_pkg(&pkg_name);
+        let caches = provider.caches(None);
+        let eval = provider.run_pkg(&caches, &pkg_name);
         tokio::pin!(eval);
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(250), &mut eval)
@@ -3219,6 +3236,71 @@ target(
             .expect("releasing the slots must let the evaluation through")
             .unwrap();
         assert_eq!(result.targets.len(), 1);
+    }
+
+    /// Each cache scope owns its package memoizer: a call in scope 2 that
+    /// arrives while scope 1's evaluation of the same package is in flight
+    /// evaluates the package itself rather than joining scope 1's — a joiner
+    /// across scopes would hand scope 2 an answer from scope 1's snapshot. A
+    /// second caller in the *same* scope still joins.
+    ///
+    /// Every evaluation slot is held so both evaluations are provably in
+    /// flight at once. Counted at each bucket's load registry, which counts the
+    /// files that bucket evaluated.
+    #[tokio::test]
+    async fn memoizer_joiner_across_scopes() {
+        let tmp_dir = tempdir().unwrap();
+        let pkg_path = tmp_dir.path().join("mypkg");
+        fs::create_dir_all(&pkg_path).unwrap();
+        fs::write(
+            pkg_path.join("BUILD"),
+            r#"target(name = "t", driver = "d")"#,
+        )
+        .unwrap();
+        let provider = Provider {
+            root: tmp_dir.path().to_path_buf(),
+            build_file_patterns: vec![glob::Pattern::new("BUILD").unwrap()],
+            ..Provider::default()
+        };
+        let (s1, s2) = (
+            hplugin::scope::ScopeId::new(1),
+            hplugin::scope::ScopeId::new(2),
+        );
+        let (c1, c2) = (provider.caches(s1), provider.caches(s2));
+
+        let held = PKG_EVAL_SLOTS
+            .acquire_many(u32::try_from(pkg_eval_slots()).unwrap())
+            .await
+            .expect("hold every evaluation slot");
+        let first = provider.run_pkg(&c1, "mypkg");
+        let joiner = provider.run_pkg(&c1, "mypkg");
+        let other = provider.run_pkg(&c2, "mypkg");
+        tokio::pin!(first, joiner, other);
+        for fut in [first.as_mut(), joiner.as_mut(), other.as_mut()] {
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(50), fut)
+                    .await
+                    .is_err(),
+                "every evaluation must be waiting for a slot",
+            );
+        }
+        drop(held);
+        let timeout = std::time::Duration::from_secs(30);
+        let (first, joiner, other) = tokio::try_join!(
+            tokio::time::timeout(timeout, first),
+            tokio::time::timeout(timeout, joiner),
+            tokio::time::timeout(timeout, other),
+        )
+        .expect("releasing the slots must let the evaluations through");
+        let (first, joiner, other) = (first.unwrap(), joiner.unwrap(), other.unwrap());
+
+        assert!(Arc::ptr_eq(&first, &joiner), "one scope, one evaluation");
+        assert!(
+            !Arc::ptr_eq(&first, &other),
+            "scope 2 must not join scope 1's evaluation",
+        );
+        assert_eq!(c1.loads.started(), 1, "scope 1 evaluated the package once");
+        assert_eq!(c2.loads.started(), 1, "scope 2 evaluated it itself");
     }
 
     /// `LoadRegistry::claim` parks its blocking job on a condvar until the
@@ -3264,7 +3346,10 @@ target(
             ..Provider::default()
         };
 
-        let result = provider.run_pkg(&pkg_name).await.unwrap();
+        let result = provider
+            .run_pkg(&provider.caches(None), &pkg_name)
+            .await
+            .unwrap();
 
         assert_eq!(result.targets.len(), 1);
         assert_eq!(result.targets[0].name, "mytarget");

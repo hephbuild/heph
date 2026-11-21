@@ -178,9 +178,8 @@ impl Engine {
         // serial loop always blamed the earliest-registered failing provider;
         // taking the lowest-index error in `packages` keeps that.
         futures::future::join_all(self.providers.iter().map(|provider| {
-            let req = ListPackagesRequest {
-                prefix: prefix.clone(),
-            };
+            let req = ListPackagesRequest::new(rs.request_id(), prefix.clone())
+                .with_cache_scope(rs.cache_scope());
             let key = format!("{}:{}", provider.name, prefix);
 
             async move {

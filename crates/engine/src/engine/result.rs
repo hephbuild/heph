@@ -414,16 +414,17 @@ impl ProviderExecutor for EngineProviderExecutor {
                             let list_iter = provider
                                 .provider
                                 .list(
-                                    ListRequest {
-                                        request_id: rs.request_id().to_string(),
-                                        package: pkg.clone(),
-                                        states: states
+                                    ListRequest::new(
+                                        rs.request_id(),
+                                        pkg.clone(),
+                                        states
                                             .iter()
                                             .filter(|s| s.provider == provider.name)
                                             .cloned()
                                             .collect(),
-                                        executor: Arc::clone(&executor),
-                                    },
+                                        Arc::clone(&executor),
+                                    )
+                                    .with_cache_scope(rs.cache_scope()),
                                     rs.ctoken(),
                                 )
                                 .await?;
@@ -5429,8 +5430,10 @@ impl Engine {
         // reads below re-stat the tree instead of answering from this run's
         // snapshot: `cached_glob_walk` is keyed by `request_id`, and
         // `CachedWalker::file_hash` revalidates. Nothing else is resolved under
-        // it, which is the entire difference from what this used to cost.
-        let fresh = self.new_hash_only_state(addr.clone(), rs.listed_facts_trust());
+        // it, which is the entire difference from what this used to cost. It
+        // shares this run's provider cache scope: BUILD files are not
+        // re-evaluated for it, only the fs reads are fresh.
+        let fresh = self.new_hash_only_state(rs, addr.clone(), rs.listed_facts_trust());
         for input_addr in watched {
             let before = Arc::clone(&self)
                 .input_hashout(rs.clone(), &input_addr)
@@ -5664,8 +5667,11 @@ impl Engine {
     /// the transformed files back to the tree. We recompute the target's `hashin`
     /// against that post-write-back state using a *fresh* request (the `@heph/fs`
     /// inputs are cache-off and memoized per request, so a new request re-reads
-    /// the just-written files and yields exactly the `hashin` the next run will
-    /// see), then duplicate this run's primary cache revision under it.
+    /// the just-written files), then duplicate this run's primary cache revision
+    /// under it. The fresh request shares this run's provider cache scope, so
+    /// that is exactly the `hashin` the next run will see only when the
+    /// write-back touches nothing a provider reads; otherwise the next run
+    /// computes another key and the duplicate is simply never hit.
     ///
     /// This is faithful to how `@heph/fs` actually hashes inputs (content +
     /// exec-bit): the key is derived from the real tree, not from output content
@@ -5716,9 +5722,14 @@ impl Engine {
         }
 
         let addr = def.target.addr.clone();
-        // Fresh request → fs inputs re-stat the post-write-back tree, yielding the
-        // exact hashin the NEXT run will compute.
-        let fresh = self.new_hash_only_state(addr.clone(), rs.listed_facts_trust());
+        // Fresh request → fs inputs re-stat the post-write-back tree. It shares
+        // this run's provider cache scope, so specs, package listings and
+        // probes answer from this run's snapshot, not the post-write tree. The
+        // recompute is therefore the exact hashin the NEXT run will compute
+        // only when the write-back touches nothing a provider reads (a BUILD
+        // file, a `go.mod`, a directory a provider lists); when it does, the
+        // next run computes another key and does not hit this entry.
+        let fresh = self.new_hash_only_state(rs, addr.clone(), rs.listed_facts_trust());
         let fixpoint = match Arc::clone(&self).meta(fresh.clone(), &addr).await {
             Ok(m) => m.hashin,
             Err(e) => {
@@ -6262,10 +6273,8 @@ impl Engine {
                     let res = provider
                         .provider
                         .probe(
-                            ProbeRequest {
-                                request_id: rs.request_id().to_string(),
-                                package: pkg.clone(),
-                            },
+                            ProbeRequest::new(rs.request_id(), pkg.clone())
+                                .with_cache_scope(rs.cache_scope()),
                             rs.ctoken(),
                         )
                         .await
@@ -6337,16 +6346,17 @@ impl Engine {
             let spec = match provider
                 .provider
                 .get(
-                    GetRequest {
-                        request_id: rs.request_id().to_string(),
-                        addr: addr.clone(),
-                        states: states
+                    GetRequest::new(
+                        rs.request_id(),
+                        addr.clone(),
+                        states
                             .iter()
                             .filter(|s| s.provider == provider.name)
                             .cloned()
                             .collect(),
-                        executor: Arc::clone(&executor),
-                    },
+                        Arc::clone(&executor),
+                    )
+                    .with_cache_scope(rs.cache_scope()),
                     rs.ctoken(),
                 )
                 .await
@@ -9508,6 +9518,12 @@ mod tests {
         ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
             self.inner.probe(req, ctoken)
         }
+        fn scope_ended<'a>(
+            &'a self,
+            ended: hplugin::scope::ScopeEnded,
+        ) -> BoxFuture<'a, anyhow::Result<hplugin::scope::ScopeEndedAck>> {
+            self.inner.scope_ended(ended)
+        }
     }
 
     /// `Engine::result` used to spawn one task per matched addr as fast as the
@@ -9831,6 +9847,12 @@ mod tests {
             ctoken: &'a (dyn Cancellable + Send + Sync),
         ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
             self.inner.probe(req, ctoken)
+        }
+        fn scope_ended<'a>(
+            &'a self,
+            ended: hplugin::scope::ScopeEnded,
+        ) -> BoxFuture<'a, anyhow::Result<hplugin::scope::ScopeEndedAck>> {
+            self.inner.scope_ended(ended)
         }
     }
 
@@ -13252,7 +13274,7 @@ mod tests {
         // Nothing is cached yet, so resolving for real would execute `//pkg:dep`.
         let err = Arc::clone(&engine)
             .meta(
-                engine.new_hash_only_state(addr.clone(), Default::default()),
+                engine.new_hash_only_state(&engine.new_state(), addr.clone(), Default::default()),
                 &addr,
             )
             .await
@@ -13278,7 +13300,7 @@ mod tests {
         drop(rs);
         Arc::clone(&engine)
             .meta(
-                engine.new_hash_only_state(addr.clone(), Default::default()),
+                engine.new_hash_only_state(&engine.new_state(), addr.clone(), Default::default()),
                 &addr,
             )
             .await
@@ -13348,7 +13370,7 @@ mod tests {
         // be "hash unknown"), it settles no target's cache outcome.
         let _ = Arc::clone(&engine)
             .meta(
-                engine.new_hash_only_state(addr.clone(), Default::default()),
+                engine.new_hash_only_state(&engine.new_state(), addr.clone(), Default::default()),
                 &addr,
             )
             .await;
@@ -13378,7 +13400,11 @@ mod tests {
         for _ in 0..3 {
             Arc::clone(&engine)
                 .meta(
-                    engine.new_hash_only_state(addr.clone(), Default::default()),
+                    engine.new_hash_only_state(
+                        &engine.new_state(),
+                        addr.clone(),
+                        Default::default(),
+                    ),
                     &addr,
                 )
                 .await
@@ -16765,6 +16791,7 @@ mod tests {
             assert!(rs.selection().is_some());
 
             let nested = engine.new_hash_only_state(
+                &rs,
                 hmodel::htaddr::parse_addr("//x:d")?,
                 rs.listed_facts_trust(),
             );

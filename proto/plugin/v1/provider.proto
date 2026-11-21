@@ -29,14 +29,25 @@ enum ProviderMethod {
   PROVIDER_METHOD_PROBE = 4;
   PROVIDER_METHOD_STATE_SCHEMA = 7;
   PROVIDER_METHOD_CONFIG = 9; // sync metadata (StableMeta::meta)
+  // Since 0.21.3, unary over `invoke`: ScopeEndedRequest -> ScopeEndedResponse.
+  // Sent only to a plugin at SCOPE_SINCE or later; an older one is never asked.
+  PROVIDER_METHOD_SCOPE_ENDED = 10;
 }
 
-// Every request's `request_id` (what a cancel names) and addressing fields
-// (`package`, `prefix`, `addr`) are required; so is every response's payload.
+// The addressing fields (`package`, `prefix`, `addr`) are required, and so is
+// the `request_id` (what a cancel names) of `ListRequest`, `GetRequest` and
+// `ProbeRequest`; so is every response's payload. `ListPackagesRequest`'s
+// `request_id` is optional: a host before 0.21.3 sends none.
+//
+// `cache_scope` (since 0.21.3) is the engine cache scope the call belongs to:
+// minted from 1, so a present 0 is refused; absent means no scope, and the
+// provider answers from its one unscoped cache (a host before 0.21.3).
+// Never hashed.
 message ListRequest {
   string request_id = 1;
   string package = 2;
   repeated State states = 3;
+  uint64 cache_scope = 4;
 }
 // A set whose presence carries meaning: absent = unknown, present and empty = known empty.
 // A bare `repeated` field can't tell the two apart.
@@ -72,6 +83,8 @@ message ListResponse {
 
 message ListPackagesRequest {
   string prefix = 1;
+  string request_id = 2;
+  uint64 cache_scope = 3;
 }
 message ListPackageResponse {
   string pkg = 1;
@@ -83,6 +96,7 @@ message GetRequest {
   string request_id = 1;
   Addr addr = 2;
   repeated State states = 3;
+  uint64 cache_scope = 4;
 }
 message GetResponse {
   TargetSpec target_spec = 1;
@@ -104,9 +118,22 @@ message GetError {
 message ProbeRequest {
   string request_id = 1;
   string package = 2;
+  uint64 cache_scope = 3;
 }
 message ProbeResponse {
   repeated State states = 1;
+}
+
+// PROVIDER_METHOD_SCOPE_ENDED: the cache scope `scope` ended. Both fields are
+// required and `scope` is never 0. `ended_below` is the host's watermark:
+// every scope with a lower id has ended, whether or not its own end was sent.
+message ScopeEndedRequest {
+  uint64 scope = 1;
+  uint64 ended_below = 2;
+}
+// Absent `released` reads as false: the provider keeps nothing per scope.
+message ScopeEndedResponse {
+  bool released = 1;
 }
 
 // Mirrors hcore::htvalue::signature::ParamType (recursive). Shared by function

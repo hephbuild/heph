@@ -283,12 +283,7 @@ target(name = "c", run = "echo c")
     let listed: Vec<_> = ws.engine.providers_by_name["buildfile"]
         .provider
         .list(
-            ListRequest {
-                request_id: "t".to_string(),
-                package: PkgBuf::from("p"),
-                states: vec![],
-                executor: Arc::new(NoopExecutor),
-            },
+            ListRequest::new("t", PkgBuf::from("p"), vec![], Arc::new(NoopExecutor)),
             &tok,
         )
         .await?

@@ -19,7 +19,7 @@ use crate::plugingo::target_modfiles;
 use crate::plugingo::target_std;
 use crate::plugingo::target_test;
 use crate::plugingo::thirdparty;
-use crate::plugingo::toolchain;
+use crate::plugingo::toolchain::{self, HostGoCache};
 use crate::plugingo::variant;
 use anyhow::Context;
 use async_recursion::async_recursion;
@@ -39,6 +39,7 @@ use hplugin::provider::{
     ListPackagesRequest, ListRequest, ListResponse, ListedFacts, Provider as ProviderTrait,
     ProviderExecutor, State,
 };
+use hplugin::scope::{ScopeEnded, ScopeEndedAck, ScopeId, ScopeMap};
 use hwalk::{CachedWalker, EntryKind, Ignore};
 use parking_lot::RwLock;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -136,10 +137,13 @@ pub struct Provider {
 
 pub(crate) struct ProviderInner {
     workspace_root: PathBuf,
-    /// heph package → Go package decoding and `go.mod` lookups, memoized for
-    /// this provider's `workspace_root`. An `Arc` because the package walk
-    /// carries it into a blocking task.
-    pkgs: Arc<GoPkgResolver>,
+    /// What this provider read of the workspace, one bucket per cache scope
+    /// (see [`GoScope`]). Each entry point (`list`, `list_packages`, `get`)
+    /// resolves its bucket once with [`ProviderInner::in_scope`] and hands it
+    /// down.
+    scopes: ScopeMap<GoScope>,
+    /// The runtime each scope's memoizers spawn their computations on.
+    runtime: tokio::runtime::Handle,
     /// Go release the hermetic toolchain is pinned to (see [`Config::go_version`]).
     go_version: String,
     /// Expected SDK tarball checksums by [`toolchain::checksum_key`] (see
@@ -159,6 +163,35 @@ pub(crate) struct ProviderInner {
     walker: Arc<CachedWalker>,
     /// See [`Config::foreign_name_guard`].
     foreign_name_guard: bool,
+    /// The host `go` the drivers probed, shared with them ([`Provider::host_go`]).
+    /// Keyed on the request id rather than the scope (the drivers' run requests
+    /// carry no scope to pick a bucket with); cleared whenever a scope ends so
+    /// finished requests' entries do not accumulate.
+    host_go: Arc<HostGoCache>,
+}
+
+/// Everything the provider read of the workspace for one cache scope (one
+/// engine root request and the states derived from it), for every address
+/// class: first-party, stdlib and thirdparty alike. A long-lived engine (the
+/// BUILD-file LSP) then sees a package that gained files, a `go.mod` that
+/// appeared, or a variant edit at its next request, and one request sees one
+/// snapshot. Dropped whole when the scope ends ([`Provider::scope_ended`]).
+///
+/// What a new scope costs: each `_golist` read is one local-cache hit on the
+/// target (its hashin names everything `go list` read) plus one `package.bin`
+/// decode — `go list` itself does not run again on an unchanged tree.
+///
+/// Nothing here may hold a request handle (an executor, a request state): a
+/// bucket would keep its own scope alive and the scope would never end. The
+/// memoizers spawn their computations as tasks, and a finished cell keeps only
+/// the value, so a closure that captures an executor lives only as long as the
+/// computation runs.
+pub(crate) struct GoScope {
+    /// heph package → Go package decoding and `go.mod` lookups for this
+    /// scope. Caches negative answers too (no `go.mod` above a directory), so
+    /// it must not outlive the scope: a `go.mod` added later would stay unseen.
+    /// An `Arc` because the package walk carries it into a blocking task.
+    pkgs: Arc<GoPkgResolver>,
     /// Cache: golist addr → parsed GoPackage. Memoizes the artifact parse only;
     /// the underlying `executor.result(golist_addr)` is always called outside
     /// the `once` closure so every caller (owner + waiter) registers the
@@ -186,6 +219,50 @@ pub(crate) struct ProviderInner {
     /// the same `go.mod` is otherwise read+parsed hundreds of times per build.
     /// Race-tolerant; parse is sync, idempotent, µs-scale — no Memoizer needed.
     go_mod_cache: RwLock<HashMap<PathBuf, Arc<GoModData>>>,
+}
+
+impl GoScope {
+    fn new(workspace_root: &Path, runtime: &tokio::runtime::Handle) -> Self {
+        Self {
+            pkgs: Arc::new(GoPkgResolver::new(workspace_root.to_path_buf())),
+            pkg_cache: Memoizer::with_tag_task("pkg_cache", runtime.clone()),
+            pkg_addrs_cache: Memoizer::with_tag_task("pkg_addrs_cache", runtime.clone()),
+            libs_cache: Memoizer::with_tag_task("libs_cache", runtime.clone()),
+            import_closure_cache: Memoizer::with_tag_task("import_closure_cache", runtime.clone()),
+            go_mod_cache: RwLock::new(HashMap::new()),
+        }
+    }
+}
+
+/// One entry point's view of the provider: its configuration plus the scope
+/// bucket the entry point resolved. Cheap to clone (two `Arc`s); the methods
+/// that read a scope's caches live on it, and everything else derefs to
+/// [`ProviderInner`].
+#[derive(Clone)]
+pub(crate) struct InScope {
+    inner: Arc<ProviderInner>,
+    sc: Arc<GoScope>,
+}
+
+impl std::ops::Deref for InScope {
+    type Target = ProviderInner;
+    fn deref(&self) -> &ProviderInner {
+        &self.inner
+    }
+}
+
+impl ProviderInner {
+    /// The bucket of `scope`, made on its first call. Each entry point calls
+    /// this once, before its first await, and hands the result down.
+    pub(crate) fn in_scope(self: &Arc<Self>, scope: Option<ScopeId>) -> InScope {
+        let sc = self
+            .scopes
+            .enter_with(scope, || GoScope::new(&self.workspace_root, &self.runtime));
+        InScope {
+            inner: Arc::clone(self),
+            sc,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -362,8 +439,9 @@ impl Provider {
     ) -> anyhow::Result<Self> {
         Ok(Self {
             inner: Arc::new(ProviderInner {
-                pkgs: Arc::new(GoPkgResolver::new(workspace_root.clone())),
                 workspace_root,
+                scopes: ScopeMap::new("go"),
+                runtime,
                 go_version: config.go_version,
                 sdk_checksums: config.sdk_checksums,
                 govet: config.govet,
@@ -372,13 +450,16 @@ impl Provider {
                 skip: config.skip,
                 walker: config.walker,
                 foreign_name_guard: config.foreign_name_guard,
-                pkg_cache: Memoizer::with_tag_task("pkg_cache", runtime.clone()),
-                pkg_addrs_cache: Memoizer::with_tag_task("pkg_addrs_cache", runtime.clone()),
-                libs_cache: Memoizer::with_tag_task("libs_cache", runtime.clone()),
-                import_closure_cache: Memoizer::with_tag_task("import_closure_cache", runtime),
-                go_mod_cache: RwLock::new(HashMap::new()),
+                host_go: Arc::default(),
             }),
         })
+    }
+
+    /// The host-toolchain cache the `golist`, `compile` and `download` drivers
+    /// must be built with, so this provider's `scope_ended` clears what they
+    /// probed. See [`HostGoCache`] for the key and the lifetime.
+    pub fn host_go(&self) -> Arc<HostGoCache> {
+        Arc::clone(&self.inner.host_go)
     }
 }
 
@@ -477,7 +558,8 @@ impl ProviderTrait for Provider {
         ctoken: &'a (dyn Cancellable + Send + Sync),
     ) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>>
     {
-        self.inner.list(req, ctoken)
+        let s = self.inner.in_scope(req.cache_scope());
+        Box::pin(async move { s.list(req, ctoken).await })
     }
 
     fn list_packages<'a>(
@@ -488,7 +570,8 @@ impl ProviderTrait for Provider {
         'a,
         anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>>,
     > {
-        self.inner.list_packages(req, ctoken)
+        let s = self.inner.in_scope(req.cache_scope());
+        Box::pin(async move { s.list_packages(req, ctoken).await })
     }
 
     fn get<'a>(
@@ -496,9 +579,10 @@ impl ProviderTrait for Provider {
         req: GetRequest,
         _ctoken: &'a (dyn Cancellable + Send + Sync),
     ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
-        let inner = Arc::clone(&self.inner);
+        let s = self.inner.in_scope(req.cache_scope());
         Box::pin(async move {
-            let mut resp = Arc::clone(&inner).handle_get(req).await?;
+            let inner = Arc::clone(&s.inner);
+            let mut resp = s.handle_get(req).await?;
             // Every target this provider generates, in one place. Doing it at
             // each construction site meant 23 of them and a new target type
             // silently opting out; here a generated target cannot escape the
@@ -514,6 +598,16 @@ impl ProviderTrait for Provider {
         ctoken: &'a (dyn Cancellable + Send + Sync),
     ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
         self.inner.probe(req, ctoken)
+    }
+
+    /// Drops everything this provider read for the scope (and every scope
+    /// below the host's watermark). A call still holding a bucket keeps it
+    /// alive until it returns; what that call writes afterwards dies with it.
+    fn scope_ended<'a>(
+        &'a self,
+        ended: ScopeEnded,
+    ) -> BoxFuture<'a, anyhow::Result<ScopeEndedAck>> {
+        self.inner.scope_ended(ended)
     }
 
     fn state_schema(&self) -> Option<hplugin::provider::StateSchema> {
@@ -897,7 +991,9 @@ impl ProviderInner {
             name: "go".to_string(),
         })
     }
+}
 
+impl InScope {
     fn list<'a>(
         &'a self,
         req: ListRequest,
@@ -912,7 +1008,7 @@ impl ProviderInner {
                     >)
             };
 
-            let kind = match self.pkgs.decode(&req.package) {
+            let kind = match self.sc.pkgs.decode(&req.package) {
                 Some(k) => k,
                 None => return empty(),
             };
@@ -966,7 +1062,7 @@ impl ProviderInner {
                     .states_under(&hmodel::htpkg::PkgBuf::from(module_root.as_str()))
                     .await?
                     .into_iter()
-                    .filter(|s| pkg_in_module(s.package.as_str(), &module_root, &self.pkgs))
+                    .filter(|s| pkg_in_module(s.package.as_str(), &module_root, &self.sc.pkgs))
                     .collect();
                 variant::universe_variants(&module_states)?
             } else {
@@ -1143,7 +1239,7 @@ impl ProviderInner {
             // that cannot compile must fail here, not prune nothing.
             self.skip.ensure_compiled()?;
             let packages = hcore::blocking::run(
-                enclose!((self.pkgs => pkgs, self.skip => skip, self.walker => walker) move || {
+                enclose!((self.sc.pkgs => pkgs, self.skip => skip, self.walker => walker) move || {
                     let mut packages = Vec::new();
                     collect_go_packages(&walker, &search_dir, &pkgs, false, &skip, &mut packages);
                     packages
@@ -1157,13 +1253,35 @@ impl ProviderInner {
                 >)
         })
     }
+}
 
+impl ProviderInner {
     fn probe<'a>(
         &'a self,
         _req: ProbeRequest,
         _ctoken: &'a (dyn Cancellable + Send + Sync),
     ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
         Box::pin(async move { Ok(ProbeResponse { states: vec![] }) })
+    }
+
+    /// Drop the scope's bucket (and every bucket below the host's watermark),
+    /// and forget the drivers' host-`go` probes. The probes are keyed on the
+    /// request, not the scope, so clearing them is memory hygiene only.
+    fn scope_ended<'a>(
+        &'a self,
+        ended: ScopeEnded,
+    ) -> BoxFuture<'a, anyhow::Result<ScopeEndedAck>> {
+        Box::pin(async move {
+            self.host_go.clear();
+            let released = self.scopes.end(ended).await;
+            tracing::debug!(
+                provider = "go",
+                scope = ended.scope.get(),
+                released,
+                "cache scope released",
+            );
+            Ok(ScopeEndedAck::Released)
+        })
     }
 }
 
@@ -1931,8 +2049,8 @@ fn pkg_static_embed_glob_addr(pkg_str: &str) -> String {
     pluginfs::glob_addr(&glob, &["**/*.go"]).format()
 }
 
-impl ProviderInner {
-    async fn handle_get(self: Arc<Self>, req: GetRequest) -> Result<GetResponse, GetError> {
+impl InScope {
+    async fn handle_get(self, req: GetRequest) -> Result<GetResponse, GetError> {
         let addr = &req.addr;
 
         // Hermetic Go toolchain: `//@heph/go/toolchain/<version>:go` downloads
@@ -2022,7 +2140,7 @@ impl ProviderInner {
             return Ok(GetResponse { target_spec: spec });
         }
 
-        let kind = match self.pkgs.decode(&addr.package) {
+        let kind = match self.sc.pkgs.decode(&addr.package) {
             Some(k) => k,
             None => return Err(GetError::NotFound),
         };
@@ -2137,7 +2255,8 @@ impl ProviderInner {
             if pick_lint_skip(&req.states, addr.package.as_str()) {
                 return Err(GetError::NotFound);
             }
-            return Arc::clone(&self)
+            return self
+                .clone()
                 .get_lint_aggregate(&req, &kind, &module_root)
                 .await;
         }
@@ -2237,7 +2356,7 @@ impl ProviderInner {
             GoPackageKind::FirstParty { .. } => addr
                 .args
                 .get("vp")
-                .is_some_and(|vp| pkg_in_module(vp, &module_root, &self.pkgs)),
+                .is_some_and(|vp| pkg_in_module(vp, &module_root, &self.sc.pkgs)),
         };
         let (factors, vref) = variant::resolve(
             addr,
@@ -2339,7 +2458,8 @@ impl ProviderInner {
                 if pkg.go_files.is_empty() {
                     return Err(GetError::NotFound);
                 }
-                let transitive = Arc::clone(&self)
+                let transitive = self
+                    .clone()
                     .collect_direct_libs(Arc::clone(&req.executor), &pkg, &[], &vref, &module_root)
                     .await
                     .map_err(GetError::Other)?;
@@ -2368,7 +2488,7 @@ impl ProviderInner {
                         embed_golist,
                         &pkg_addrs.embed_files,
                         &self.go_version,
-                        &module_of_pkg(&addr.package, &self.pkgs),
+                        &module_of_pkg(&addr.package, &self.sc.pkgs),
                     ),
                     _ => {
                         // `go_embed_src` assets (kept out of `_golist`) are staged
@@ -2394,7 +2514,7 @@ impl ProviderInner {
                             &transitive.libs,
                             &pkg_addrs.go_files,
                             &self.go_version,
-                            &module_of_pkg(&addr.package, &self.pkgs),
+                            &module_of_pkg(&addr.package, &self.sc.pkgs),
                             embed_golist,
                             &pkg_addrs.embed_files,
                             &embed_src_addrs,
@@ -2412,7 +2532,8 @@ impl ProviderInner {
                 if pkg.go_files.is_empty() {
                     return Err(GetError::NotFound);
                 }
-                let transitive = Arc::clone(&self)
+                let transitive = self
+                    .clone()
                     .collect_direct_libs(Arc::clone(&req.executor), &pkg, &[], &vref, &module_root)
                     .await
                     .map_err(GetError::Other)?;
@@ -2433,6 +2554,7 @@ impl ProviderInner {
                     .filter(|(_, dep)| {
                         is_firstparty_pkg(dep.package.as_str())
                             && self
+                                .sc
                                 .pkgs
                                 .find_go_mod(&self.workspace_root.join(dep.package.as_str()))
                                 .is_some_and(|(dep_module_root, _)| {
@@ -2489,7 +2611,8 @@ impl ProviderInner {
                 }
 
                 let own_lib_addr = self.build_lib_addr(addr, &vref);
-                let mut transitive = Arc::clone(&self)
+                let mut transitive = self
+                    .clone()
                     .collect_transitive_libs(
                         Arc::clone(&req.executor),
                         &pkg,
@@ -2564,7 +2687,8 @@ impl ProviderInner {
                     return Err(GetError::NotFound);
                 }
                 let test_extra: Vec<String> = pkg.test_imports.clone();
-                let transitive = Arc::clone(&self)
+                let transitive = self
+                    .clone()
                     .collect_direct_libs(
                         Arc::clone(&req.executor),
                         &pkg,
@@ -2617,7 +2741,7 @@ impl ProviderInner {
                     &test_embed_files,
                     &embed_src_addrs,
                     &self.go_version,
-                    &module_of_pkg(&addr.package, &self.pkgs),
+                    &module_of_pkg(&addr.package, &self.sc.pkgs),
                 );
                 Ok(GetResponse { target_spec: spec })
             }
@@ -2663,7 +2787,8 @@ impl ProviderInner {
                 //     nothing can import P normally.
                 //   - both empty (xtest-only) → drop P from importcfg; xtest
                 //     source can't reference symbols that don't exist.
-                let transitive = Arc::clone(&self)
+                let transitive = self
+                    .clone()
                     .collect_direct_libs(
                         Arc::clone(&req.executor),
                         &xtest_imports_pkg,
@@ -2717,7 +2842,7 @@ impl ProviderInner {
                     &pkg_addrs.xtest_embed_files,
                     &embed_src_addrs,
                     &self.go_version,
-                    &module_of_pkg(&addr.package, &self.pkgs),
+                    &module_of_pkg(&addr.package, &self.sc.pkgs),
                 );
                 Ok(GetResponse { target_spec: spec })
             }
@@ -2729,7 +2854,8 @@ impl ProviderInner {
                 }
                 let testmain_imports = ["os", "reflect", "testing", "testing/internal/testdeps"];
                 let testmain_pkg = make_testmain_pkg(&pkg, &testmain_imports);
-                let mut transitive = Arc::clone(&self)
+                let mut transitive = self
+                    .clone()
                     .collect_direct_libs(
                         Arc::clone(&req.executor),
                         &testmain_pkg,
@@ -2752,7 +2878,7 @@ impl ProviderInner {
                     &testmain_src_addr,
                     &transitive.libs,
                     &self.go_version,
-                    &module_of_pkg(&addr.package, &self.pkgs),
+                    &module_of_pkg(&addr.package, &self.sc.pkgs),
                 );
                 Ok(GetResponse { target_spec: spec })
             }
@@ -2764,7 +2890,8 @@ impl ProviderInner {
                 }
                 let testmain_imports = ["os", "reflect", "testing", "testing/internal/testdeps"];
                 let testmain_pkg = make_testmain_pkg(&pkg, &testmain_imports);
-                let mut transitive = Arc::clone(&self)
+                let mut transitive = self
+                    .clone()
                     .collect_direct_libs(
                         Arc::clone(&req.executor),
                         &testmain_pkg,
@@ -2792,7 +2919,7 @@ impl ProviderInner {
                     &testmain_src_addr,
                     &transitive.libs,
                     &self.go_version,
-                    &module_of_pkg(&addr.package, &self.pkgs),
+                    &module_of_pkg(&addr.package, &self.sc.pkgs),
                 );
                 Ok(GetResponse { target_spec: spec })
             }
@@ -2816,7 +2943,8 @@ impl ProviderInner {
                     .chain(race_link_imports(&factors).iter())
                     .cloned()
                     .collect();
-                let transitive = Arc::clone(&self)
+                let transitive = self
+                    .clone()
                     .collect_transitive_libs(
                         Arc::clone(&req.executor),
                         &pkg,
@@ -2904,7 +3032,8 @@ impl ProviderInner {
                     incomplete: false,
                     error: None,
                 };
-                let transitive = Arc::clone(&self)
+                let transitive = self
+                    .clone()
                     .collect_transitive_libs(
                         Arc::clone(&req.executor),
                         &xtest_root,
@@ -3129,12 +3258,12 @@ impl ProviderInner {
         // `result()`, which would re-run the engine's whole result pipeline plus
         // a lease round-trip for every edge — the dominant cost on the remote
         // resolve path (every transitive import hits this).
-        if let Some(cached) = self.pkg_cache.peek(golist_addr) {
+        if let Some(cached) = self.sc.pkg_cache.peek(golist_addr) {
             executor.note_dep(golist_addr).await?;
             return cached.map_err(unwrap_arc_err);
         }
         let result = executor.result(golist_addr).await?;
-        self.pkg_cache
+        self.sc.pkg_cache
             .once(
                 golist_addr.clone(),
                 enclose!((result) move || async move {
@@ -3187,12 +3316,12 @@ impl ProviderInner {
         // executor.result is called outside the once closure so waiters register
         // the dep edge, not just the cache owner. Cache hit: cheap edge-only
         // note_dep (see read_golist_package).
-        if let Some(cached) = self.pkg_addrs_cache.peek(golist_addr) {
+        if let Some(cached) = self.sc.pkg_addrs_cache.peek(golist_addr) {
             executor.note_dep(golist_addr).await?;
             return cached.map_err(unwrap_arc_err);
         }
         let result = executor.result(golist_addr).await?;
-        self.pkg_addrs_cache
+        self.sc.pkg_addrs_cache
             .once(
                 golist_addr.clone(),
                 enclose!((result) move || async move {
@@ -3221,7 +3350,9 @@ impl ProviderInner {
             .await
             .map_err(unwrap_arc_err)
     }
+}
 
+impl ProviderInner {
     fn build_lib_addr(&self, addr: &Addr, vref: &VariantRef) -> Addr {
         self.make_addr_with_name(&addr.package, "build_lib", vref)
     }
@@ -3438,7 +3569,9 @@ impl ProviderInner {
         }
         Ok(false)
     }
+}
 
+impl InScope {
     /// Spec for the user-facing `lint-check` (gate) and `lint` (fixer) targets:
     /// one bare addr per package that aggregates the per-variant `_lint-analyze`
     /// units of every module-bounded ancestry variant.
@@ -3456,7 +3589,7 @@ impl ProviderInner {
     /// that resolves to `NotFound`. All variants skipped (or none declared) →
     /// `NotFound`, matching what the per-variant targets did.
     async fn get_lint_aggregate(
-        self: Arc<Self>,
+        self,
         req: &GetRequest,
         kind: &GoPackageKind,
         module_root: &str,
@@ -3504,7 +3637,7 @@ impl ProviderInner {
         // One `_golist` read per variant, fanned out: they are independent and
         // engine-cached (the `_lint-analyze` targets read the very same ones).
         let per_variant = futures::future::try_join_all(vrefs.iter().map(|vref| {
-            let this = Arc::clone(&self);
+            let this = self.clone();
             let executor = Arc::clone(&req.executor);
             let golist_addr = self.make_addr_with_name(&addr.package, "_golist", vref);
             async move {
@@ -3577,7 +3710,9 @@ impl ProviderInner {
         );
         Ok(GetResponse { target_spec: spec })
     }
+}
 
+impl ProviderInner {
     /// The addr of the module's golangci-lint config, if the module root (the
     /// `go.mod` directory) holds one. Lint/format targets exist ONLY for modules
     /// that have such a config — the presence of a `.golangci.yml`/`.golangci.yaml`
@@ -3594,7 +3729,9 @@ impl ProviderInner {
         }
         None
     }
+}
 
+impl InScope {
     /// Build the cache key for `collect_*_libs`. Imports are sorted+deduped so
     /// distinct caller-side orderings of the same logical input set hash to one entry.
     fn libs_key(
@@ -3623,14 +3760,14 @@ impl ProviderInner {
     ///
     /// Each BFS frontier is processed concurrently via `try_join_all`. Each dep's
     /// `_golist` target is fetched via `executor.result` (engine pipeline with disk
-    /// cache), memoized in `pkg_cache` for the Provider lifetime so repeated calls
+    /// cache), memoized in `pkg_cache` for the cache scope so repeated calls
     /// for the same dep cost nothing after the first resolution.
     ///
     /// The full BFS result is itself memoized via `libs_cache`, deduping calls
     /// across `build_lib`/`build`/`build_test`/`build_test_lib` etc. for the same
-    /// root pkg + factors within a single Provider lifetime.
+    /// root pkg + factors within one cache scope.
     async fn collect_transitive_libs(
-        self: Arc<Self>,
+        self,
         executor: Arc<dyn ProviderExecutor>,
         root_pkg: &GoPackage,
         extra_imports: &[String],
@@ -3643,7 +3780,7 @@ impl ProviderInner {
 
     /// Resolve direct imports only (no recursion) — correct for compile steps.
     async fn collect_direct_libs(
-        self: Arc<Self>,
+        self,
         executor: Arc<dyn ProviderExecutor>,
         root_pkg: &GoPackage,
         extra_imports: &[String],
@@ -3655,7 +3792,7 @@ impl ProviderInner {
     }
 
     async fn collect_libs(
-        self: Arc<Self>,
+        self,
         executor: Arc<dyn ProviderExecutor>,
         root_pkg: &GoPackage,
         extra_imports: &[String],
@@ -3667,6 +3804,7 @@ impl ProviderInner {
         let extra = extra_imports.to_vec();
         let module_root = module_root.to_path_buf();
         let arc = self
+            .sc
             .libs_cache
             .once(
                 key,
@@ -3690,7 +3828,7 @@ impl ProviderInner {
 
     fn load_go_mod(&self, module_root: &Path) -> anyhow::Result<Arc<GoModData>> {
         let go_mod_path = module_root.join("go.mod");
-        if let Some(hit) = self.go_mod_cache.read().get(&go_mod_path) {
+        if let Some(hit) = self.sc.go_mod_cache.read().get(&go_mod_path) {
             return Ok(Arc::clone(hit));
         }
         let data = if go_mod_path.exists() {
@@ -3735,7 +3873,7 @@ impl ProviderInner {
                 module_path: String::new(),
             })
         };
-        let mut w = self.go_mod_cache.write();
+        let mut w = self.sc.go_mod_cache.write();
         Ok(Arc::clone(
             w.entry(go_mod_path).or_insert_with(|| Arc::clone(&data)),
         ))
@@ -3752,7 +3890,7 @@ impl ProviderInner {
     /// hits the same cache, so the work for any subtree is amortized.
     #[async_recursion]
     async fn import_closure(
-        self: Arc<Self>,
+        self,
         executor: Arc<dyn ProviderExecutor>,
         import_path: String,
         vref: VariantRef,
@@ -3764,7 +3902,7 @@ impl ProviderInner {
             vref: vref.clone(),
             module_root: module_root.clone(),
         };
-        self.import_closure_cache
+        self.sc.import_closure_cache
             .once(
                 key,
                 enclose!((self => me, executor, import_path, vref, go_mod, module_root) move || async move {
@@ -3787,7 +3925,7 @@ impl ProviderInner {
                             .into_iter()
                             .filter(|s| s != "unsafe" && s != "C")
                             .map(|sub| {
-                                Arc::clone(&me).import_closure(
+                                me.clone().import_closure(
                                     Arc::clone(&executor),
                                     sub,
                                     vref.clone(),
@@ -3812,7 +3950,7 @@ impl ProviderInner {
     }
 
     async fn collect_libs_inner(
-        self: Arc<Self>,
+        self,
         executor: Arc<dyn ProviderExecutor>,
         root_imports: &[String],
         extra_imports: &[String],
@@ -3840,7 +3978,7 @@ impl ProviderInner {
 
             let module_root_buf = module_root.to_path_buf();
             let sub_closures = try_join_all(unique_imports.into_iter().map(|ip| {
-                Arc::clone(&self).import_closure(
+                self.clone().import_closure(
                     Arc::clone(&executor),
                     ip,
                     vref.clone(),
@@ -4989,12 +5127,12 @@ mod tests {
     }
 
     fn make_get_req(addr: Addr, workspace_root: &std::path::Path) -> GetRequest {
-        GetRequest {
-            request_id: "test".to_string(),
+        GetRequest::new(
+            "test",
             addr,
-            states: vec![host_variant_state()],
-            executor: test_executor(workspace_root),
-        }
+            vec![host_variant_state()],
+            test_executor(workspace_root),
+        )
     }
 
     async fn provider_get(p: &Provider, addr: Addr) -> Result<GetResponse, GetError> {
@@ -5025,7 +5163,11 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         .unwrap();
 
         let p = Provider::new(dir.path().to_path_buf(), test_runtime()).expect("provider");
-        let data = p.inner.load_go_mod(dir.path()).expect("load_go_mod");
+        let data = p
+            .inner
+            .in_scope(None)
+            .load_go_mod(dir.path())
+            .expect("load_go_mod");
 
         let net = find_module_for_import("golang.org/x/net/context/ctxhttp", &data.requires)
             .expect("x/net must resolve via go.sum even though go.mod omits it");
@@ -5083,16 +5225,16 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         // _golist should return a spec without calling executor
         let ctoken = StdCancellationToken::new();
-        let req = GetRequest {
-            request_id: "test".to_string(),
-            addr: make_addr("", "_golist"),
-            states: vec![host_variant_state()],
-            executor: Arc::new(GoListTestExecutor {
+        let req = GetRequest::new(
+            "test",
+            make_addr("", "_golist"),
+            vec![host_variant_state()],
+            Arc::new(GoListTestExecutor {
                 workspace_root: sandbox.path().to_path_buf(),
                 source_map: HashMap::new(),
                 states: vec![host_variant_state()],
             }),
-        };
+        );
         let resp = p.get(req, &ctoken).await.unwrap();
         assert_eq!(resp.target_spec.driver, "go.golist");
         let out = match resp.target_spec.config.get("out").unwrap() {
@@ -5146,12 +5288,11 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let golist = make_addr("", "_golist");
 
-        p.inner
-            .read_golist_package(Arc::clone(&executor), &golist)
+        let s = p.inner.in_scope(None);
+        s.read_golist_package(Arc::clone(&executor), &golist)
             .await
             .unwrap();
-        p.inner
-            .read_golist_package(Arc::clone(&executor), &golist)
+        s.read_golist_package(Arc::clone(&executor), &golist)
             .await
             .unwrap();
 
@@ -5207,12 +5348,12 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             calls: Arc::clone(&calls),
         });
         let ctoken = StdCancellationToken::new();
-        let req = GetRequest {
-            request_id: "test".to_string(),
-            addr: make_addr("", "codegen_gen"),
-            states: vec![host_variant_state()],
+        let req = GetRequest::new(
+            "test",
+            make_addr("", "codegen_gen"),
+            vec![host_variant_state()],
             executor,
-        };
+        );
 
         let res = p.get(req, &ctoken).await;
         assert!(
@@ -5280,12 +5421,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             inner: test_executor(&workspace),
             seen: Arc::clone(&seen),
         });
-        let req = GetRequest {
-            request_id: "test".to_string(),
-            addr,
-            states: vec![host_variant_state()],
-            executor,
-        };
+        let req = GetRequest::new("test", addr, vec![host_variant_state()], executor);
         (
             async move {
                 let ctoken = StdCancellationToken::new();
@@ -5748,16 +5884,16 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let ctoken = StdCancellationToken::new();
         let workspace = p.inner.workspace_root.clone();
         p.get(
-            GetRequest {
-                request_id: "test".to_string(),
+            GetRequest::new(
+                "test",
                 addr,
-                states: states.clone(),
-                executor: Arc::new(GoListTestExecutor {
+                states.clone(),
+                Arc::new(GoListTestExecutor {
                     workspace_root: workspace,
                     source_map: HashMap::new(),
                     states,
                 }),
-            },
+            ),
             &ctoken,
         )
         .await
@@ -5933,12 +6069,12 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
                 ])),
             )]),
         }];
-        let req = ListRequest {
-            request_id: "test".to_string(),
-            package: PkgBuf::from("cmd"),
+        let req = ListRequest::new(
+            "test",
+            PkgBuf::from("cmd"),
             states,
-            executor: test_executor(&p.inner.workspace_root),
-        };
+            test_executor(&p.inner.workspace_root),
+        );
         let addrs: Vec<Addr> = p
             .list(req, &StdCancellationToken::new())
             .await
@@ -6748,12 +6884,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             "build_lib".to_string(),
             VariantRef::new("x", "").to_args(),
         );
-        let req = GetRequest {
-            request_id: "test".to_string(),
-            addr,
-            states: vec![state],
-            executor: test_executor(sandbox.path()),
-        };
+        let req = GetRequest::new("test", addr, vec![state], test_executor(sandbox.path()));
         let resp = p.get(req, &StdCancellationToken::new()).await.unwrap();
         let cfg = &resp.target_spec.config;
         assert!(matches!(cfg.get("goos"), Some(Value::String(s)) if s == "linux"));
@@ -6919,16 +7050,16 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         states: Vec<State>,
     ) -> Vec<String> {
         let ctoken = StdCancellationToken::new();
-        let req = ListRequest {
-            request_id: "test".to_string(),
-            package: PkgBuf::from(package),
-            states: states.clone(),
-            executor: Arc::new(GoListTestExecutor {
+        let req = ListRequest::new(
+            "test",
+            PkgBuf::from(package),
+            states.clone(),
+            Arc::new(GoListTestExecutor {
                 workspace_root: p.inner.workspace_root.clone(),
                 source_map: HashMap::new(),
                 states,
             }),
-        };
+        );
         p.list(req, &ctoken)
             .await
             .unwrap()
@@ -6985,12 +7116,8 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             }
         }
 
-        let req = ListRequest {
-            request_id: "test".to_string(),
-            package: PkgBuf::from(""),
-            states: vec![], // no ancestry variants for this package
-            executor: Arc::new(SiblingUniverse),
-        };
+        // No ancestry variants for this package.
+        let req = ListRequest::new("test", PkgBuf::from(""), vec![], Arc::new(SiblingUniverse));
         let addrs: Vec<Addr> = p
             .list(req, &StdCancellationToken::new())
             .await
@@ -7077,12 +7204,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             }
         }
 
-        let req = ListRequest {
-            request_id: "test".to_string(),
-            package: PkgBuf::from(""),
-            states: vec![],
-            executor: Arc::new(NestedUniverse),
-        };
+        let req = ListRequest::new("test", PkgBuf::from(""), vec![], Arc::new(NestedUniverse));
         let addrs: Vec<Addr> = p
             .list(req, &StdCancellationToken::new())
             .await
@@ -8291,15 +8413,15 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let sandbox = copy_fixture("with_test");
         let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let ctoken = StdCancellationToken::new();
-        let req = ListRequest {
-            request_id: "test".to_string(),
-            package: PkgBuf::from("pkg"),
-            states: vec![
+        let req = ListRequest::new(
+            "test",
+            PkgBuf::from("pkg"),
+            vec![
                 with_recursive(state_with_test_skip("", true)),
                 host_variant_state(),
             ],
-            executor: test_executor(sandbox.path()),
-        };
+            test_executor(sandbox.path()),
+        );
         let names: Vec<String> = p
             .list(req, &ctoken)
             .await
@@ -8399,12 +8521,12 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             }
         }
 
-        let req = ListRequest {
-            request_id: "test".to_string(),
-            package: PkgBuf::from("pkg"),
-            states: vec![two.clone()],
-            executor: Arc::new(TwoVariantUniverse(two)),
-        };
+        let req = ListRequest::new(
+            "test",
+            PkgBuf::from("pkg"),
+            vec![two.clone()],
+            Arc::new(TwoVariantUniverse(two)),
+        );
         let addrs: Vec<Addr> = p
             .list(req, &StdCancellationToken::new())
             .await
@@ -8494,12 +8616,12 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
                 )])),
             )]),
         };
-        let req = GetRequest {
-            request_id: "test".to_string(),
-            addr: Addr::new(PkgBuf::from("cmd"), "build".to_string(), Default::default()),
-            states: vec![cross],
-            executor: test_executor(sandbox.path()),
-        };
+        let req = GetRequest::new(
+            "test",
+            Addr::new(PkgBuf::from("cmd"), "build".to_string(), Default::default()),
+            vec![cross],
+            test_executor(sandbox.path()),
+        );
         let res = p.get(req, &StdCancellationToken::new()).await;
         assert!(
             matches!(res, Err(GetError::NotFound)),
@@ -8578,15 +8700,15 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let ctoken = StdCancellationToken::new();
         for name in ["test", "build_test", "xtest", "build_xtest"] {
-            let req = GetRequest {
-                request_id: "test".to_string(),
-                addr: make_addr("pkg", name),
-                states: vec![
+            let req = GetRequest::new(
+                "test",
+                make_addr("pkg", name),
+                vec![
                     with_recursive(state_with_test_skip("", true)),
                     host_variant_state(),
                 ],
-                executor: test_executor(sandbox.path()),
-            };
+                test_executor(sandbox.path()),
+            );
             let res = p.get(req, &ctoken).await;
             assert!(
                 matches!(res, Err(GetError::NotFound)),
@@ -8601,16 +8723,16 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let sandbox = copy_fixture("with_test");
         let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let ctoken = StdCancellationToken::new();
-        let req = GetRequest {
-            request_id: "test".to_string(),
-            addr: make_addr("pkg", "build_test"),
-            states: vec![
+        let req = GetRequest::new(
+            "test",
+            make_addr("pkg", "build_test"),
+            vec![
                 with_recursive(state_with_test_skip("", true)),
                 state_with_test_skip("pkg", false),
                 host_variant_state(),
             ],
-            executor: test_executor(sandbox.path()),
-        };
+            test_executor(sandbox.path()),
+        );
         let res = p.get(req, &ctoken).await;
         assert!(res.is_ok(), "deeper test.skip=False must override");
     }
@@ -8637,16 +8759,16 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         require_go!();
         let sandbox = copy_fixture("simple_lib");
         let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
-        let req = GetRequest {
-            request_id: "test".to_string(),
-            addr: make_addr("", "_golist"),
-            states: vec![host_variant_state()],
-            executor: Arc::new(GoListTestExecutor {
+        let req = GetRequest::new(
+            "test",
+            make_addr("", "_golist"),
+            vec![host_variant_state()],
+            Arc::new(GoListTestExecutor {
                 workspace_root: sandbox.path().to_path_buf(),
                 source_map: HashMap::new(),
                 states: vec![host_variant_state()],
             }),
-        };
+        );
         let resp = p.get(req, &StdCancellationToken::new()).await.unwrap();
         let srcfiles = extract_srcfiles(&resp);
         let go_src_query = srcfiles
@@ -8685,16 +8807,16 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             provider: "go".to_string(),
             state: state_map,
         };
-        let req = GetRequest {
-            request_id: "test".to_string(),
-            addr: make_addr("", "_golist"),
-            states: vec![state, host_variant_state()],
-            executor: Arc::new(GoListTestExecutor {
+        let req = GetRequest::new(
+            "test",
+            make_addr("", "_golist"),
+            vec![state, host_variant_state()],
+            Arc::new(GoListTestExecutor {
                 workspace_root: sandbox.path().to_path_buf(),
                 source_map: HashMap::new(),
                 states: vec![host_variant_state()],
             }),
-        };
+        );
         let resp = p.get(req, &StdCancellationToken::new()).await.unwrap();
         let srcfiles = extract_srcfiles(&resp);
         let go_src_query = srcfiles
@@ -8872,16 +8994,16 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             provider: "go".to_string(),
             state: state_map,
         };
-        let req = GetRequest {
-            request_id: "test".to_string(),
-            addr: make_addr("", "_golist"),
-            states: vec![state, host_variant_state()],
-            executor: Arc::new(GoListTestExecutor {
+        let req = GetRequest::new(
+            "test",
+            make_addr("", "_golist"),
+            vec![state, host_variant_state()],
+            Arc::new(GoListTestExecutor {
                 workspace_root: sandbox.path().to_path_buf(),
                 source_map: HashMap::new(),
                 states: vec![host_variant_state()],
             }),
-        };
+        );
         let resp = p.get(req, &StdCancellationToken::new()).await.unwrap();
         let srcfiles = extract_srcfiles(&resp);
         assert!(
@@ -8969,5 +9091,319 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         assert!(ty("test").matches(&test), "{}", ty("test").render());
         assert!(ty("link").matches(&m(vec![("flags", s("-s"))])));
         assert!(ty("go_embed_deps").matches(&s("//assets:bundle")));
+    }
+
+    // ---- cache scopes ----
+
+    mod scopes {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        fn scope(n: u64) -> Option<ScopeId> {
+            let id = ScopeId::new(n);
+            assert!(id.is_some(), "a non-zero scope id");
+            id
+        }
+
+        async fn scoped_get(
+            p: &Provider,
+            addr: Addr,
+            sc: Option<ScopeId>,
+        ) -> Result<GetResponse, GetError> {
+            let ctoken = StdCancellationToken::new();
+            let req = make_get_req(addr, &p.inner.workspace_root).with_decoded_scope(sc);
+            p.get(req, &ctoken).await
+        }
+
+        /// Answers every `_golist` with a package the test scripts: `Some(files)`
+        /// is a package with those Go files, `None` a `package.bin` that does
+        /// not decode. It is what the engine hands back for the same addr after
+        /// an edit (a variant's `goos`, a source file) re-ran `go list`.
+        struct ScriptedGolist {
+            go_files: parking_lot::Mutex<Option<Vec<String>>>,
+            results: AtomicUsize,
+        }
+
+        impl ScriptedGolist {
+            fn new(go_files: Option<&[&str]>) -> Arc<Self> {
+                Arc::new(Self {
+                    go_files: parking_lot::Mutex::new(Self::files(go_files)),
+                    results: AtomicUsize::new(0),
+                })
+            }
+
+            fn files(go_files: Option<&[&str]>) -> Option<Vec<String>> {
+                go_files.map(|f| f.iter().map(|s| (*s).to_string()).collect())
+            }
+
+            fn set(&self, go_files: Option<&[&str]>) {
+                *self.go_files.lock() = Self::files(go_files);
+            }
+        }
+
+        impl ProviderExecutor for ScriptedGolist {
+            fn result<'a>(
+                &'a self,
+                _addr: &'a Addr,
+            ) -> BoxFuture<'a, anyhow::Result<Arc<EResult>>> {
+                self.results.fetch_add(1, Ordering::SeqCst);
+                let go_files = self.go_files.lock().clone();
+                Box::pin(async move {
+                    let bytes = match go_files {
+                        Some(go_files) => {
+                            crate::plugingo::pkg_analysis::encode_go_package(&GoPackage {
+                                import_path: "example.com/dep".to_string(),
+                                go_files,
+                                ..Default::default()
+                            })?
+                        }
+                        None => b"not a package".to_vec(),
+                    };
+                    let artifact: Arc<dyn Content> = Arc::new(BinaryArtifact {
+                        path: PathBuf::from("package.bin"),
+                        bytes,
+                        hashout: "scripted".to_string(),
+                    });
+                    Ok(Arc::new(EResult {
+                        artifacts_meta: vec![ArtifactMeta {
+                            hashout: "scripted".to_string(),
+                        }],
+                        artifacts: vec![artifact],
+                        support_artifacts: vec![],
+                    }))
+                })
+            }
+
+            fn query<'a>(
+                &'a self,
+                _m: &'a hmodel::htmatcher::Matcher,
+                _extra_skip: &'a [String],
+            ) -> BoxFuture<'a, anyhow::Result<Vec<Addr>>> {
+                Box::pin(async { Ok(vec![]) })
+            }
+        }
+
+        /// A thirdparty `_golist` under a variant whose definition the test
+        /// edits between scopes: the addr stays `…:_golist@v=host`, its answer
+        /// does not.
+        fn thirdparty_golist() -> Addr {
+            make_addr("@heph/go/thirdparty/example.com/dep@v1.0.0", "_golist")
+        }
+
+        async fn read_files(
+            p: &Provider,
+            exec: &Arc<ScriptedGolist>,
+            sc: Option<ScopeId>,
+        ) -> anyhow::Result<Vec<String>> {
+            let executor: Arc<dyn ProviderExecutor> = Arc::<ScriptedGolist>::clone(exec);
+            let pkg = p
+                .inner
+                .in_scope(sc)
+                .read_golist_package(executor, &thirdparty_golist())
+                .await?;
+            Ok(pkg.go_files.clone())
+        }
+
+        /// A package that had no Go files is not found; once it gains one, the
+        /// scope that saw it empty keeps its snapshot and the next scope builds
+        /// it.
+        #[tokio::test]
+        async fn next_scope_sees_a_package_gain_go_files() {
+            require_go!();
+            let sandbox = copy_fixture("simple_lib");
+            std::fs::create_dir_all(sandbox.path().join("sub")).unwrap();
+            std::fs::write(sandbox.path().join("sub/README"), "no Go here\n").unwrap();
+            let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
+            let addr = || make_addr("sub", "build_lib");
+
+            let before = scoped_get(&p, addr(), scope(1)).await;
+            assert!(
+                matches!(before, Err(GetError::NotFound)),
+                "a package with no Go files is not found: {:?}",
+                before.map(|r| r.target_spec.driver.clone())
+            );
+
+            std::fs::write(
+                sandbox.path().join("sub/sub.go"),
+                "package sub\n\nfunc F() {}\n",
+            )
+            .unwrap();
+            assert!(
+                matches!(
+                    scoped_get(&p, addr(), scope(1)).await,
+                    Err(GetError::NotFound)
+                ),
+                "one scope is one snapshot"
+            );
+            let resp = scoped_get(&p, addr(), scope(2))
+                .await
+                .expect("the next scope reads the package again and finds sub.go");
+            assert_eq!(resp.target_spec.driver, "go.compile");
+        }
+
+        /// A `go.mod` added under a directory that had none: the negative
+        /// answer the resolver cached stays with the scope that asked.
+        #[tokio::test]
+        async fn first_party_decode_not_stale_across_scopes() {
+            require_go!();
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join("m")).unwrap();
+            std::fs::write(dir.path().join("m/m.go"), "package m\n").unwrap();
+            let p = Provider::new(dir.path().to_path_buf(), test_runtime()).unwrap();
+            let pkg = PkgBuf::from("m");
+            let decode = |n| p.inner.in_scope(scope(n)).sc.pkgs.decode(&pkg);
+
+            assert!(decode(1).is_none(), "no go.mod above m yet");
+            std::fs::write(
+                dir.path().join("m/go.mod"),
+                "module example.com/m\n\ngo 1.21\n",
+            )
+            .unwrap();
+            assert!(
+                decode(1).is_none(),
+                "the scope keeps its negative answer: one snapshot"
+            );
+            let kind = decode(2).expect("the next scope finds the new go.mod");
+            assert!(
+                matches!(&*kind, GoPackageKind::FirstParty { import_path, .. } if import_path == "example.com/m"),
+                "{kind:?}"
+            );
+        }
+
+        /// Editing a variant re-runs a thirdparty `_golist` under the same addr.
+        /// The scope that read it first keeps that listing; the next scope reads
+        /// the new one. (Thirdparty listings used to be cached for the
+        /// provider's lifetime, keyed by an addr that does not name the
+        /// variant's definition.)
+        #[tokio::test]
+        async fn variant_edit_refreshes_thirdparty_listing() {
+            require_go!();
+            let dir = tempfile::tempdir().unwrap();
+            let p = Provider::new(dir.path().to_path_buf(), test_runtime()).unwrap();
+            let exec = ScriptedGolist::new(Some(&["dep_linux.go"]));
+
+            assert_eq!(
+                read_files(&p, &exec, scope(1)).await.unwrap(),
+                ["dep_linux.go"]
+            );
+            exec.set(Some(&["dep_darwin.go"]));
+            assert_eq!(
+                read_files(&p, &exec, scope(1)).await.unwrap(),
+                ["dep_linux.go"],
+                "one scope is one snapshot"
+            );
+            assert_eq!(
+                read_files(&p, &exec, scope(2)).await.unwrap(),
+                ["dep_darwin.go"],
+                "the next scope reads the edited listing"
+            );
+        }
+
+        /// The Go half of `sticky_error_does_not_leak_to_next_scope`: a
+        /// `_golist` that failed to decode stays failed for its scope (callers
+        /// in one request agree), and the next scope reads it afresh.
+        #[tokio::test]
+        async fn sticky_error_does_not_leak_to_next_scope() {
+            require_go!();
+            let dir = tempfile::tempdir().unwrap();
+            let p = Provider::new(dir.path().to_path_buf(), test_runtime()).unwrap();
+            let exec = ScriptedGolist::new(None);
+
+            read_files(&p, &exec, scope(1))
+                .await
+                .expect_err("an undecodable package.bin fails");
+            exec.set(Some(&["dep.go"]));
+            read_files(&p, &exec, scope(1))
+                .await
+                .expect_err("the failure is sticky within its scope");
+            assert_eq!(
+                read_files(&p, &exec, scope(2)).await.unwrap(),
+                ["dep.go"],
+                "the next scope does not inherit the failure"
+            );
+        }
+
+        /// I8: nothing a scope's bucket keeps holds the request that filled it.
+        /// A `get` of a binary goes through `libs_cache` (whose computation
+        /// captures the executor); once the call returns and the request is
+        /// gone, the executor is freed while the bucket is still alive, so the
+        /// request's end (and with it the hook) cannot wait on the bucket.
+        #[tokio::test]
+        async fn scope_bucket_does_not_retain_its_request() {
+            require_go!();
+            let sandbox = copy_fixture("with_dep");
+            let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
+            let executor = test_executor(sandbox.path());
+            let request = Arc::downgrade(&executor);
+            let req = GetRequest::new(
+                "test",
+                make_addr("cmd", "build"),
+                vec![host_variant_state()],
+                executor,
+            )
+            .with_decoded_scope(scope(1));
+            let resp = p
+                .get(req, &StdCancellationToken::new())
+                .await
+                .expect("cmd build resolves through libs_cache");
+            drop(resp);
+
+            // A memoizer task drops its closure just after it hands the value
+            // over, so allow it a moment.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while request.upgrade().is_some() && std::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(
+                request.upgrade().is_none(),
+                "the scope's bucket kept its request's executor alive"
+            );
+            assert_eq!(
+                p.inner.scopes.live_scopes(),
+                1,
+                "the bucket is still live, so it was not its drop that freed the executor"
+            );
+
+            let ack = p
+                .scope_ended(ScopeEnded::new(scope(1).unwrap(), 0))
+                .await
+                .unwrap();
+            assert_eq!(ack, ScopeEndedAck::Released);
+            assert_eq!(p.inner.scopes.live_scopes(), 0);
+        }
+
+        /// The trait wrapper forwards `scope_ended` to the provider's buckets:
+        /// the ended scope's bucket goes, another scope's stays, and the call
+        /// answers `Released` (the trait default would answer `Unsupported`,
+        /// and the host would report the provider as keeping its caches).
+        #[tokio::test]
+        async fn go_wrapper_forwards_scope_ended() {
+            require_go!();
+            let dir = tempfile::tempdir().unwrap();
+            let p = Provider::new(dir.path().to_path_buf(), test_runtime()).unwrap();
+            let exec = ScriptedGolist::new(Some(&["dep.go"]));
+            read_files(&p, &exec, scope(1)).await.unwrap();
+            read_files(&p, &exec, scope(2)).await.unwrap();
+            assert_eq!(p.inner.scopes.live_scopes(), 2);
+
+            let ack = p
+                .scope_ended(ScopeEnded::new(scope(1).unwrap(), 0))
+                .await
+                .unwrap();
+            assert_eq!(ack, ScopeEndedAck::Released);
+            assert_eq!(p.inner.scopes.live_scopes(), 1, "scope 2 is still live");
+
+            // An ended scope is never recreated: a late call is answered from a
+            // throwaway bucket, so it reads the package as it is now, and
+            // nothing it read is kept.
+            exec.set(Some(&["late.go"]));
+            assert_eq!(read_files(&p, &exec, scope(1)).await.unwrap(), ["late.go"]);
+            assert_eq!(p.inner.scopes.live_scopes(), 1);
+            assert_eq!(
+                read_files(&p, &exec, scope(2)).await.unwrap(),
+                ["dep.go"],
+                "scope 2 keeps its own snapshot"
+            );
+        }
     }
 }

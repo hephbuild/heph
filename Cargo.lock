@@ -5298,12 +5298,14 @@ dependencies = [
  "htspec-derive",
  "itertools 0.15.0",
  "model",
+ "parking_lot 0.12.5",
  "serde",
  "serde_json",
  "serde_yaml",
  "smart-default",
  "tempfile",
  "tokio",
+ "tracing",
  "walk",
 ]
 

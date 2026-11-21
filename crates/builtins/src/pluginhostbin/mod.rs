@@ -231,12 +231,7 @@ mod tests {
         let addr = parse_addr("//other/pkg:sh").unwrap();
         let result = provider
             .get(
-                GetRequest {
-                    request_id: "test".to_string(),
-                    addr,
-                    states: vec![],
-                    executor: std::sync::Arc::new(NoopExecutor),
-                },
+                GetRequest::new("test", addr, vec![], std::sync::Arc::new(NoopExecutor)),
                 &ctoken,
             )
             .await;
@@ -250,12 +245,7 @@ mod tests {
         let addr = parse_addr("//@heph/bin:definitely_not_installed_xyz").unwrap();
         let result = provider
             .get(
-                GetRequest {
-                    request_id: "test".to_string(),
-                    addr,
-                    states: vec![],
-                    executor: std::sync::Arc::new(NoopExecutor),
-                },
+                GetRequest::new("test", addr, vec![], std::sync::Arc::new(NoopExecutor)),
                 &ctoken,
             )
             .await
@@ -269,12 +259,7 @@ mod tests {
         let provider = Provider;
         let ctoken = make_ctoken();
         let result = provider
-            .list_packages(
-                ListPackagesRequest {
-                    prefix: PkgBuf::from(""),
-                },
-                &ctoken,
-            )
+            .list_packages(ListPackagesRequest::new("test", PkgBuf::from("")), &ctoken)
             .await
             .unwrap();
         let pkgs: Vec<_> = result.map(|r| r.unwrap().pkg).collect();
@@ -288,12 +273,12 @@ mod tests {
         let ctoken = make_ctoken();
         let result = provider
             .list(
-                ListRequest {
-                    request_id: "test".to_string(),
-                    package: PkgBuf::from(PKG),
-                    states: vec![],
-                    executor: std::sync::Arc::new(hplugin::provider::NoopExecutor),
-                },
+                ListRequest::new(
+                    "test",
+                    PkgBuf::from(PKG),
+                    vec![],
+                    std::sync::Arc::new(hplugin::provider::NoopExecutor),
+                ),
                 &ctoken,
             )
             .await

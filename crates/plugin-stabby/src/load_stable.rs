@@ -32,7 +32,7 @@ use hplugin::hook::Hook;
 use hplugin::provider::{
     ConfigRequest, ConfigResponse, GetError, GetRequest, GetResponse, ListPackageResponse,
     ListPackagesRequest, ListRequest, ListResponse, ProbeRequest, ProbeResponse, Provider,
-    StateSchema,
+    ScopeEnded, ScopeEndedAck, ScopeId, StateSchema,
 };
 use plugin_abi::convert::{required, required_enum, required_msg};
 use plugin_abi::pb::frame::Body;
@@ -400,7 +400,9 @@ pub fn load(
     // `provider` is optional: hook-only / driver-only plugins export `None`.
     let provider: std::option::Option<DynProvider> = provider.into();
     let host_provider = provider
-        .map(|p| StableRemoteProvider::new(p, name))
+        .map(|p| {
+            StableRemoteProvider::new(p, name).map(|p| p.with_plugin_abi(reported_abi.as_deref()))
+        })
         .transpose()
         .with_context(|| format!("loading plugin {name:?}"))?;
 
@@ -682,6 +684,9 @@ pub struct StableRemoteProvider {
     /// Decoded once, at load: `state_schema` has no error channel, and the
     /// plugin's answer never changes.
     state_schema: Option<Arc<StateSchema>>,
+    /// The plugin answers `PROVIDER_METHOD_SCOPE_ENDED` (ABI
+    /// [`plugin_abi::SCOPE_SINCE`] and later), so a scope's end is sent to it.
+    scope_ended: bool,
 }
 
 impl StableRemoteProvider {
@@ -701,12 +706,28 @@ impl StableRemoteProvider {
             inner: Arc::new(inner),
             name,
             state_schema,
+            scope_ended: true,
         })
+    }
+
+    /// The ABI version the plugin reported at load (`None`: it reported none).
+    /// Decides whether a scope's end is sent to it: only from
+    /// [`plugin_abi::SCOPE_SINCE`] on. The provider is taken to be at this
+    /// host's ABI until this says otherwise.
+    #[must_use]
+    pub fn with_plugin_abi(mut self, reported: Option<&str>) -> Self {
+        self.scope_ended = reported.is_some_and(|v| abi_at_least(v, plugin_abi::SCOPE_SINCE));
+        self
     }
 
     pub fn name(&self) -> &str {
         &self.name
     }
+}
+
+/// A request's scope, as it crosses the wire: the raw id, or absent.
+fn scope_to_pb(scope: Option<ScopeId>) -> Option<u64> {
+    scope.map(ScopeId::get)
 }
 
 impl Provider for StableRemoteProvider {
@@ -724,6 +745,7 @@ impl Provider for StableRemoteProvider {
     {
         Box::pin(async move {
             let pb_req = pb::ListRequest {
+                cache_scope: scope_to_pb(req.cache_scope()),
                 request_id: Some(req.request_id),
                 package: Some(req.package.as_str().to_string()),
                 states: req.states.iter().map(convert::state_to_pb).collect(),
@@ -760,6 +782,8 @@ impl Provider for StableRemoteProvider {
         Box::pin(async move {
             let pb_req = pb::ListPackagesRequest {
                 prefix: Some(req.prefix.as_str().to_string()),
+                request_id: Some(req.request_id.clone()),
+                cache_scope: scope_to_pb(req.cache_scope()),
                 ..Default::default()
             }
             .encode_to_vec();
@@ -788,6 +812,7 @@ impl Provider for StableRemoteProvider {
                 request_id: Some(req.request_id.clone()),
                 addr: convert::addr_to_pb(&req.addr).into(),
                 states: req.states.iter().map(convert::state_to_pb).collect(),
+                cache_scope: scope_to_pb(req.cache_scope()),
                 ..Default::default()
             }
             .encode_to_vec();
@@ -840,6 +865,7 @@ impl Provider for StableRemoteProvider {
         Box::pin(async move {
             let request_id = req.request_id.clone();
             let pb_req = pb::ProbeRequest {
+                cache_scope: scope_to_pb(req.cache_scope()),
                 request_id: Some(req.request_id),
                 package: Some(req.package.as_str().to_string()),
                 ..Default::default()
@@ -861,6 +887,48 @@ impl Provider for StableRemoteProvider {
 
     fn state_schema(&self) -> Option<StateSchema> {
         self.state_schema.as_deref().cloned()
+    }
+
+    /// Sent only to a plugin at [`plugin_abi::SCOPE_SINCE`] or later; an older
+    /// one is never asked and reads as [`ScopeEndedAck::Unsupported`]. Of the
+    /// errors, only `Unimplemented` is ignored — and logged, since a plugin
+    /// that reported this ABI should implement the method.
+    fn scope_ended<'a>(
+        &'a self,
+        ended: ScopeEnded,
+    ) -> BoxFuture<'a, anyhow::Result<ScopeEndedAck>> {
+        Box::pin(async move {
+            if !self.scope_ended {
+                return Ok(ScopeEndedAck::Unsupported);
+            }
+            let pb_req = pb::ScopeEndedRequest {
+                scope: Some(ended.scope.get()),
+                ended_below: Some(ended.ended_below),
+                ..Default::default()
+            }
+            .encode_to_vec();
+            let bytes = self
+                .inner
+                .invoke(pb::ProviderMethod::ScopeEnded as u32, sv(&pb_req))
+                .await;
+            match decode_unary(&bytes)? {
+                Body::ScopeEndedResp(r) => Ok(if r.released.unwrap_or(false) {
+                    ScopeEndedAck::Released
+                } else {
+                    ScopeEndedAck::Unsupported
+                }),
+                Body::Error(e) if e.kind == Some(pb::error::Kind::Unimplemented.into()) => {
+                    tracing::warn!(
+                        provider = %self.name,
+                        message = %error_text(*e),
+                        "plugin reported an ABI that has scope_ended but does not implement it",
+                    );
+                    Ok(ScopeEndedAck::Unsupported)
+                }
+                Body::Error(e) => anyhow::bail!("{}", error_text(*e)),
+                other => anyhow::bail!("unexpected scope_ended response: {other:?}"),
+            }
+        })
     }
 }
 
@@ -973,7 +1041,8 @@ fn reads_log_capture(reported: &str) -> bool {
     abi_at_least(reported, plugin_abi::LOG_CAPTURE_SINCE)
 }
 
-/// `reported >= since`, as semver; `false` when either does not parse.
+/// Whether a plugin reporting ABI `reported` is at `since` or later. A version
+/// that does not parse is taken not to be.
 fn abi_at_least(reported: &str, since: &str) -> bool {
     match (
         semver::Version::parse(reported),

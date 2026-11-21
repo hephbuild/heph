@@ -429,12 +429,12 @@ mod tests {
         let addr = hmodel::htaddr::parse_addr(&blobs_addr()).expect("addr");
         let resp = Provider::new("oci")
             .get(
-                GetRequest {
-                    request_id: "req".to_string(),
+                GetRequest::new(
+                    "req",
                     addr,
-                    states: vec![],
-                    executor: std::sync::Arc::new(hplugin::provider::NoopExecutor),
-                },
+                    vec![],
+                    std::sync::Arc::new(hplugin::provider::NoopExecutor),
+                ),
                 &StdCancellationToken::new(),
             )
             .await
@@ -452,12 +452,12 @@ mod tests {
         let addr = hmodel::htaddr::parse_addr(&addr_for(None)).expect("addr");
         let resp = Provider::new("containers")
             .get(
-                GetRequest {
-                    request_id: "req".to_string(),
+                GetRequest::new(
+                    "req",
                     addr,
-                    states: vec![],
-                    executor: std::sync::Arc::new(hplugin::provider::NoopExecutor),
-                },
+                    vec![],
+                    std::sync::Arc::new(hplugin::provider::NoopExecutor),
+                ),
                 &StdCancellationToken::new(),
             )
             .await

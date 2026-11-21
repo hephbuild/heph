@@ -47,15 +47,17 @@ pub struct GoCompileDriver {
     default_runner: Option<String>,
     /// Host `go` resolved in whatever environment the runner names — see
     /// [`crate::plugingo::toolchain::HostGoCache`]. Only ever touched by
-    /// `gotool = "host"`.
-    host_go: crate::plugingo::toolchain::HostGoCache,
+    /// `gotool = "host"`. Shared with the provider, whose `scope_ended` clears it.
+    host_go: Arc<crate::plugingo::toolchain::HostGoCache>,
 }
 
 impl GoCompileDriver {
-    pub fn new() -> Self {
+    /// `host_go` is the Go provider's ([`crate::plugingo::Provider::host_go`]),
+    /// so the provider's `scope_ended` clears what this driver probed.
+    pub fn new(host_go: Arc<crate::plugingo::toolchain::HostGoCache>) -> Self {
         Self {
             default_runner: None,
-            host_go: Default::default(),
+            host_go,
         }
     }
 
@@ -65,12 +67,6 @@ impl GoCompileDriver {
     pub fn with_default_runner(mut self, runner: Option<String>) -> Self {
         self.default_runner = runner;
         self
-    }
-}
-
-impl Default for GoCompileDriver {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -1075,7 +1071,7 @@ mod log_tests {
         log: &mut ToolLog<'_>,
     ) -> anyhow::Result<()> {
         let ct = hcore::hasync::StdCancellationToken::new();
-        GoCompileDriver::new()
+        GoCompileDriver::new(Default::default())
             .exec_go(
                 go,
                 vec![OsString::from("tool"), OsString::from("compile")],
@@ -1182,7 +1178,7 @@ mod driver_tests {
 
     async fn parse_def(spec: TargetSpec) -> TargetDef {
         let ct = hcore::hasync::StdCancellationToken::new();
-        GoCompileDriver::new()
+        GoCompileDriver::new(Default::default())
             .parse(
                 ParseRequest {
                     request_id: "t".to_string(),
@@ -1201,7 +1197,7 @@ mod driver_tests {
     #[tokio::test]
     async fn the_driver_default_runner_reaches_the_parsed_inputs() {
         let ct = hcore::hasync::StdCancellationToken::new();
-        let def = GoCompileDriver::new()
+        let def = GoCompileDriver::new(Default::default())
             .with_default_runner(Some("//tools/devenv:runner".to_string()))
             .parse(
                 ParseRequest {
@@ -1439,7 +1435,7 @@ mod driver_tests {
             Value::String("c-archive".to_string()),
         );
         let ct = hcore::hasync::StdCancellationToken::new();
-        let Err(err) = GoCompileDriver::new()
+        let Err(err) = GoCompileDriver::new(Default::default())
             .parse(
                 ParseRequest {
                     request_id: "t".to_string(),

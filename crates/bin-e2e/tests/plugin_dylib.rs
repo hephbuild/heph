@@ -337,6 +337,80 @@ fn shipped_go_cdylib_list_calls_back_states_under_across_the_seam() {
     );
 }
 
+/// The end of a request's cache scope reaches a REAL cdylib provider. The go
+/// plugin answers `scope_ended` with `Released`, while a provider that never
+/// received the call answers through the trait default, `Unsupported` — so the
+/// host's `ack="released"` for `provider="go"` proves the call crossed the
+/// seam and the plugin's own hook ran. In-process tests structurally cannot
+/// cover this: the provider is the struct itself there, never the ABI shim.
+///
+/// The hook is fire-and-forget from the request's drop, counted on the
+/// renderer's background counter; the line is only on stderr if the CLI
+/// drains that counter before exiting, so this also holds `heph query` to it.
+/// Same offline fixture as the `states_under` test above: `--candidates`
+/// lists without running `go list`.
+#[test]
+fn go_cdylib_receives_scope_ended() {
+    let dist = Dist::locate();
+    let ws = Workspace::new().expect("workspace");
+    let dylib = dist.plugin("go");
+    assert!(dylib.is_file(), "missing {}", dylib.display());
+
+    let manifest = ws.root().join("heph-go-plugin.json");
+    let sum = sha256_file(&dylib).expect("hash go cdylib");
+    write_manifest(&manifest, "go", &dylib, Some(&sum)).expect("write manifest");
+    ws.config(&format!(
+        "{BASE_CONFIG}  - path: {}\n    options:\n      gotool: \"host\"\n",
+        manifest.display()
+    ))
+    .expect("write config");
+    ws.write("go.mod", "module example.com/scope\n\ngo 1.21\n")
+        .expect("write go.mod");
+    ws.write(
+        "lib/lib.go",
+        "package lib\n\nfunc Greet() string { return \"hi\" }\n",
+    )
+    .expect("write lib.go");
+    // `gotool: host` lists nothing without a declared variant.
+    ws.write(
+        "cmd/BUILD",
+        "provider_state(\n    provider = \"go\",\n    variants = {\"release\": {\"goos\": \"linux\", \"goarch\": \"amd64\"}},\n)\n",
+    )
+    .expect("write BUILD");
+
+    let child = ws
+        .cmd(&dist, &["query", "--candidates", "-e", "//lib/..."])
+        .env("HEPH_LOG", "warn,engine::engine::cache_scope=debug")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn heph query");
+    let out = common::wait_output(child, common::RUN_DEADLINE).expect("heph query");
+    assert!(out.status.success(), "{}", describe(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("//lib:build_lib@v=release"),
+        "the listing must have reached the go provider, or no scope was touched: {}",
+        describe(&out)
+    );
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let go_ended: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.contains("cache scope ended") && l.contains(r#"provider="go""#))
+        .collect();
+    assert!(
+        !go_ended.is_empty(),
+        "the host must log the go provider's answer to scope_ended before exit: {}",
+        describe(&out)
+    );
+    assert!(
+        go_ended.iter().all(|l| l.contains(r#"ack="released""#)),
+        "the cdylib's own hook answers Released; Unsupported is the trait default \
+         a provider that never got the call returns: {go_ended:#?}"
+    );
+}
+
 /// Listed facts cross the REAL cdylib seam: the go plugin's `list` carries
 /// each entry's driver, and the host decides `driver(...)` from it without a
 /// single `get`. `get` of any go target runs `_golist`, which needs `go`; the

@@ -92,9 +92,17 @@ impl App for QueryApp {
     }
 
     async fn run(self, ctx: AppContext) -> anyhow::Result<()> {
-        let rs = self
-            .engine
-            .new_state_with_events(self.fail_fast, ctx.event_sender());
+        // The renderer's background counter, not a private one: the providers'
+        // `scope_ended` hook for this request counts on it, and the renderer
+        // drains it before the process exits — a private counter would let
+        // `heph query` exit with the hook still in flight.
+        let rs = self.engine.new_state_full(
+            self.fail_fast,
+            ctx.event_sender(),
+            ctx.bg_pending(),
+            Engine::DEFAULT_LOG_TAIL_LINES,
+            None,
+        );
         // What matched goes to stdout as it is found; what the walk could not
         // resolve is reported on stderr at the end, and fails the command.
         let gaps = Gaps::new(crate::htquery::format(&self.matcher));
@@ -159,4 +167,72 @@ async fn execute_async(
         shutdown,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::Config;
+    use crate::engine::fault_provider::{FaultProvider, Faults};
+    use crate::htpkg::PkgBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    /// `heph query` does not return while its request's `scope_ended` hook is
+    /// in flight: the hook is counted on the renderer's background counter
+    /// (`ctx.bg_pending()`), which the line backend drains before `run_app`
+    /// returns. The provider's hook is held open until it has started and a
+    /// further 500ms have passed; a query that counted the hook anywhere else
+    /// returns inside that window, before the gate opens.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn query_drains_the_scope_hook_before_returning() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let provider = FaultProvider::new(
+            vec![crate::pluginstatictarget::Target {
+                addr: "//q:t".to_string(),
+                driver: "exec".to_string(),
+                run: Some("true".to_string()),
+                ..Default::default()
+            }],
+            Faults {
+                scope_ended_gate: Some(Arc::clone(&gate)),
+                ..Default::default()
+            },
+        )?;
+        let log = provider.scopes();
+        let mut engine = Engine::new(Config::for_tests(root.path()))?;
+        engine.register_provider(move |_| Box::new(provider))?;
+
+        let opened = Arc::new(AtomicBool::new(false));
+        let opener = {
+            let opened = Arc::clone(&opened);
+            tokio::spawn(async move {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+                while log.ended().is_empty() && tokio::time::Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                opened.store(true, Ordering::SeqCst);
+                gate.add_permits(1);
+            })
+        };
+
+        let app = QueryApp {
+            engine: Arc::new(engine),
+            matcher: Matcher::PackagePrefix(PkgBuf::from("")),
+            fail_fast: false,
+            candidates: true,
+        };
+        let session = Arc::new(SessionSlot::new());
+        let sink = LogSink::new_direct_with(Arc::clone(&session));
+        let (shutdown, _rx) = hcore::shutdown::ShutdownTrigger::new();
+        tui::run_app(app, sink, &session, false, shutdown).await?;
+        assert!(
+            opened.load(Ordering::SeqCst),
+            "heph query returned with its scope_ended hook still in flight"
+        );
+        opener.await?;
+        Ok(())
+    }
 }

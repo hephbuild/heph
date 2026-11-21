@@ -541,19 +541,24 @@ fn workspace_builder(
             init.runtime.clone(),
         )
         .context("plugingo provider")?;
+        // One host-`go` cache for the provider and the drivers that run `go`,
+        // as the cdylib shares it: the provider's `scope_ended` clears it.
+        let host_go = provider.host_go();
         Ok(PluginParts::default()
             // `heph.go.*`, exported beside the provider as the cdylib does.
             .with_functions(provider.functions())
             .with_provider(Box::new(provider))
             .with_managed_driver(Box::new(
-                plugingo::GoGolistDriver::new().with_default_runner(r.clone()),
+                plugingo::GoGolistDriver::new(std::sync::Arc::clone(&host_go))
+                    .with_default_runner(r.clone()),
             ))
             .with_managed_driver(Box::new(plugingo::GoToolchainDriver))
             .with_managed_driver(Box::new(
-                plugingo::GoCompileDriver::new().with_default_runner(r.clone()),
+                plugingo::GoCompileDriver::new(std::sync::Arc::clone(&host_go))
+                    .with_default_runner(r.clone()),
             ))
             .with_managed_driver(Box::new(
-                plugingo::GoDownloadDriver::new().with_default_runner(r.clone()),
+                plugingo::GoDownloadDriver::new(host_go).with_default_runner(r.clone()),
             ))
             .with_managed_driver(Box::new(plugingo::GoTestmainDriver))
             .with_managed_driver(Box::new(

@@ -364,16 +364,16 @@ impl Engine {
                     };
 
                     for (lister, provider) in engine.providers.iter().enumerate() {
-                        let listed = provider.provider.list(ListRequest {
-                            request_id: rs.request_id().to_string(),
-                            package: pkg.clone(),
-                            states: states
+                        let listed = provider.provider.list(ListRequest::new(
+                            rs.request_id(),
+                            pkg.clone(),
+                            states
                                 .iter()
                                 .filter(|s| s.provider == provider.name)
                                 .cloned()
                                 .collect(),
-                            executor: Arc::clone(&executor),
-                        }, rs.ctoken()).await
+                            Arc::clone(&executor),
+                        ).with_cache_scope(rs.cache_scope()), rs.ctoken()).await
                             // Drained before the next await.
                             .and_then(|it| it.collect::<anyhow::Result<Vec<_>>>());
                         let raw = match listed {

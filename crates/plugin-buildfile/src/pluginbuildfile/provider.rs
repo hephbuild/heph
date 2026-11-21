@@ -12,6 +12,7 @@ use hplugin::provider::{
     ListPackagesRequest, ListRequest, ListResponse, ListedFacts, ProbeRequest, ProbeResponse,
     Provider as EProvider, State, TargetSpec,
 };
+use hplugin::scope::{ScopeEnded, ScopeEndedAck, ScopeId, ScopeMap};
 use hwalk::{CachedWalker, Ignore};
 use once_cell::sync::OnceCell;
 use starlark::environment::Globals;
@@ -128,7 +129,77 @@ pub fn build_files_in_dir(dir: &Path, patterns: &[glob::Pattern]) -> Vec<PathBuf
     paths
 }
 
-pub struct RequestState {}
+/// Evaluated packages, keyed by package name. Errors are cached too: within
+/// one cache scope a failed parse stays failed.
+pub(crate) type PkgCache = Memoizer<String, Result<Arc<RunResult>, Arc<anyhow::Error>>>;
+
+/// Everything the provider read of the workspace for one cache scope: the
+/// package list and every evaluated BUILD file. A scope is one engine root
+/// request (plus the states derived from it), so a long-lived engine (the
+/// BUILD-file LSP) sees the workspace as it is at each new request, and one
+/// request sees a single snapshot of it. Dropped as a whole when the scope
+/// ends ([`EProvider::scope_ended`]).
+///
+/// Every entry point resolves its bucket once ([`Provider::caches`]) and hands
+/// it down: `run_pkg` runs millions of times on a large workspace and never
+/// looks the scope up itself, and a `heph.core.packages()` call inside an
+/// evaluation reads the same bucket's list as the entry point that started it.
+///
+/// Nothing here may hold a request handle: a bucket would then keep its own
+/// scope alive and the scope would never end.
+pub(crate) struct ScopeCaches {
+    /// pkg name → evaluated BUILD result. Avoids re-parsing the Starlark AST on
+    /// every `list`/`get`/`probe` call for the same package (3+ calls per pkg in
+    /// a typical run), and dedupes concurrent in-flight parses on the same pkg.
+    /// Caches errors too — a failed parse stays failed for the rest of the
+    /// scope (one snapshot per scope); the next scope evaluates it again.
+    ///
+    /// Never persisted past the scope, and that is load-bearing: an evaluated
+    /// package can contain targets a *plugin function* declared
+    /// (`heph.<plugin>.<fn>(…)`), so its content depends on the code of that
+    /// plugin — which may be upgraded — and not only on the BUILD files.
+    /// Persist a package result across invocations and the declaring plugin's
+    /// identity becomes part of that entry's key; keyed on BUILD content alone,
+    /// an upgraded plugin's new declarations would never be seen.
+    pub(crate) pkg_cache: PkgCache,
+    /// The sorted workspace package list, walked once per scope. Shared with
+    /// every [`BuildFileLoader`] of the scope so `heph.core.packages()` reads the
+    /// same list from any package's evaluation instead of re-walking the tree
+    /// per call, and read by [`EProvider::list_packages`] so there is exactly
+    /// one walk and one order for the whole scope.
+    ///
+    /// [`BuildFileLoader`]: crate::pluginbuildfile::run_file::BuildFileLoader
+    pub(crate) packages: Arc<PackageList>,
+    /// Resolved BUILD-file path → parsed result. Populated during Starlark
+    /// evaluation (top-level `run_pkg` and transitive `load(...)` resolution
+    /// share it, so a file is parsed at most once per scope).
+    pub(crate) file_cache: Arc<Mutex<HashMap<PathBuf, Arc<RunResult>>>>,
+    /// Package directory → merged result across every matching BUILD file in
+    /// that dir. Reused by both `run_pkg` and `load("//pkg", ...)`.
+    pub(crate) dir_cache: Arc<Mutex<HashMap<PathBuf, Arc<RunResult>>>>,
+    /// Single-flights file evaluation so concurrently-evaluating packages that
+    /// `load()` the same shared build-file helper evaluate it once between them.
+    pub(crate) loads: Arc<crate::pluginbuildfile::run_file::LoadRegistry>,
+}
+
+impl ScopeCaches {
+    /// An empty bucket, its package list bound to `provider`'s configured
+    /// `root`/`patterns`/`skip`/`walker`.
+    fn new(provider: &Provider) -> Self {
+        Self {
+            pkg_cache: Memoizer::with_tag_task("buildfile_pkg", provider.runtime.clone()),
+            packages: Arc::new(PackageList::new(
+                provider.root.clone(),
+                provider.build_file_patterns.clone(),
+                Arc::clone(&provider.skip),
+                Arc::clone(&provider.walker),
+            )),
+            file_cache: Arc::default(),
+            dir_cache: Arc::default(),
+            loads: Arc::default(),
+        }
+    }
+}
 
 pub struct Provider {
     pub root: std::path::PathBuf,
@@ -140,45 +211,13 @@ pub struct Provider {
     /// Set via the `defaultDriver` provider option. `None` means a target with no
     /// driver is an error.
     pub default_driver: Option<String>,
-    pub requests: Mutex<HashMap<String, RequestState>>,
-    /// Cache: pkg name → parsed BUILD file result. Avoids re-parsing the Starlark
-    /// AST on every `list`/`get`/`probe` call for the same package (3+ calls per
-    /// pkg in a typical run), and dedupes concurrent in-flight parses on the same
-    /// pkg. Caches errors too — a failed parse stays failed for the lifetime of
-    /// the provider (BUILD file contents don't change mid-session).
-    ///
-    /// Every cache here lives for one invocation, and that is load-bearing: an
-    /// evaluated package can contain targets a *plugin function* declared
-    /// (`heph.<plugin>.<fn>(…)`), so its content depends on the code of that
-    /// plugin — which may be upgraded — and not only on the BUILD
-    /// files. Persist a package result across invocations and the declaring
-    /// plugin's identity becomes part of that entry's key; keyed on BUILD
-    /// content alone, an upgraded plugin's new declarations would never be seen.
-    pub(crate) pkg_cache: Memoizer<String, Result<Arc<RunResult>, Arc<anyhow::Error>>>,
-    /// The sorted workspace package list, walked once. Shared with every
-    /// [`BuildFileLoader`] so `heph.core.packages()` reads the same list from any
-    /// package's evaluation instead of re-walking the tree per call, and reused
-    /// by [`Self::list_packages`] so there is exactly one walk and one order for
-    /// the whole session.
-    ///
-    /// Built lazily by [`Self::packages`] rather than stored directly: the
-    /// `Provider` is assembled with struct-update syntax (`..Self::default()`)
-    /// and further mutated by [`Self::with_walker`], so a field initialized at
-    /// construction time would capture the *defaults* of `root`/`patterns`/
-    /// `skip`/`walker` rather than the configured values.
-    ///
-    /// [`BuildFileLoader`]: crate::pluginbuildfile::run_file::BuildFileLoader
-    pub(crate) packages: OnceLock<Arc<PackageList>>,
-    /// Sync cache: resolved BUILD-file path → parsed result. Populated during Starlark
-    /// evaluation (both top-level `run_pkg` and transitive `load(...)` resolution share
-    /// the same cache, so a file is parsed at most once per provider lifetime).
-    pub(crate) file_cache: Arc<Mutex<HashMap<PathBuf, Arc<RunResult>>>>,
-    /// Sync cache: package directory → merged result across every matching BUILD file
-    /// in that dir. Loaded once and reused by both `run_pkg` and `load("//pkg", ...)`.
-    pub(crate) dir_cache: Arc<Mutex<HashMap<PathBuf, Arc<RunResult>>>>,
-    /// Single-flights file evaluation so concurrently-evaluating packages that
-    /// `load()` the same shared build-file helper evaluate it once between them.
-    pub(crate) loads: Arc<crate::pluginbuildfile::run_file::LoadRegistry>,
+    /// The runtime each scope's package memoizer spawns its evaluations on.
+    pub(crate) runtime: tokio::runtime::Handle,
+    /// What this provider read of the workspace, one bucket per cache scope
+    /// (see [`ScopeCaches`]). Buckets are built on a scope's first call from
+    /// the provider's configuration at that time, so struct-update assembly
+    /// (`..Self::base(..)`) and [`Self::with_walker`] configure them correctly.
+    pub(crate) scopes: ScopeMap<ScopeCaches>,
     /// Where the `heph.<plugin>.<fn>` Starlark namespace comes from: the
     /// engine's function slot in production ([`Provider::with_functions`]), or a
     /// finished registry (the LSP, tests).
@@ -198,20 +237,14 @@ pub struct Provider {
 impl Provider {
     /// Field defaults shared by the real constructors (which inject the
     /// memoizer's runtime) and the test-only `Default`.
-    pub(crate) fn base(
-        pkg_cache: Memoizer<String, Result<Arc<RunResult>, Arc<anyhow::Error>>>,
-    ) -> Self {
+    pub(crate) fn base(runtime: tokio::runtime::Handle) -> Self {
         Self {
             root: std::path::PathBuf::from("/"),
             build_file_patterns: default_build_file_patterns(),
             skip: Arc::new(Ignore::default()),
             default_driver: None,
-            requests: Mutex::new(HashMap::new()),
-            pkg_cache,
-            packages: OnceLock::new(),
-            file_cache: Arc::new(Mutex::new(HashMap::new())),
-            dir_cache: Arc::new(Mutex::new(HashMap::new())),
-            loads: Arc::default(),
+            runtime,
+            scopes: ScopeMap::new("buildfile"),
             functions: FunctionSource::default(),
             globals: Arc::new(OnceLock::new()),
             walker: Arc::new(CachedWalker::disabled()),
@@ -237,7 +270,7 @@ impl Default for Provider {
             })
             .handle()
             .clone();
-        Self::base(Memoizer::with_tag_task("buildfile_pkg", handle))
+        Self::base(handle)
     }
 }
 
@@ -252,7 +285,7 @@ impl Provider {
     ) -> Self {
         Self {
             root,
-            ..Self::base(Memoizer::with_tag_task("buildfile_pkg", runtime))
+            ..Self::base(runtime)
         }
         .with_functions(functions)
     }
@@ -278,25 +311,18 @@ impl Provider {
     /// live every run (the in-process package list only dedupes within a run).
     pub fn with_walker(mut self, walker: Arc<CachedWalker>) -> Self {
         self.walker = walker;
-        // The package list binds to the walker it was built from, so a builder
-        // call after one exists must discard it rather than leave a cell whose
-        // contents no longer match the provider's configuration. Free: nothing
-        // has been walked yet at any real call site.
-        self.packages = OnceLock::new();
+        // A scope's package list binds to the walker it was built from, so a
+        // builder call after one exists must discard it rather than leave a
+        // bucket whose contents no longer match the provider's configuration.
+        // Free: nothing has been walked yet at any real call site.
+        self.scopes = ScopeMap::new("buildfile");
         self
     }
 
-    /// The shared, sorted package list, bound on first use to this provider's
-    /// configured `root`/`patterns`/`skip`/`walker`.
-    pub(crate) fn packages(&self) -> Arc<PackageList> {
-        Arc::clone(self.packages.get_or_init(|| {
-            Arc::new(PackageList::new(
-                self.root.clone(),
-                self.build_file_patterns.clone(),
-                Arc::clone(&self.skip),
-                Arc::clone(&self.walker),
-            ))
-        }))
+    /// The bucket of `scope`, made on its first call. Each entry point calls
+    /// this once, before its first await, and hands the bucket down.
+    pub(crate) fn caches(&self, scope: Option<ScopeId>) -> Arc<ScopeCaches> {
+        self.scopes.enter_with(scope, || ScopeCaches::new(self))
     }
 
     pub fn from_options(
@@ -326,13 +352,13 @@ impl Provider {
             build_file_patterns: compiled,
             skip: Arc::new(skip),
             default_driver,
-            ..Self::base(Memoizer::with_tag_task("buildfile_pkg", runtime))
+            ..Self::base(runtime)
         })
     }
 }
 
 /// The workspace package list: one BUILD-file walk, **sorted**, computed at most
-/// once and shared by every consumer.
+/// once per cache scope and shared by every consumer in that scope.
 ///
 /// # Why sorted
 ///
@@ -426,9 +452,9 @@ impl PackageList {
     /// different package sets — a codegen target writing into the tree between
     /// them — so a def hash could depend on evaluation order) at the cost of a
     /// visible semantic change: a package that appears mid-run stays invisible
-    /// for the rest of it. The bound that makes this safe is that a provider
-    /// lives for one CLI invocation; a long-lived engine (a daemon, a watch mode)
-    /// would have to revisit it.
+    /// for the rest of it. The bound that makes this safe is that a list lives
+    /// for one cache scope (one engine root request, see [`ScopeCaches`]): a
+    /// long-lived engine (the BUILD-file LSP) walks again in its next scope.
     ///
     /// `get_or_try_init` is a blocking single-flight: concurrent callers park,
     /// exactly one walk runs, and the steady state is a lock-free read. A failed
@@ -549,6 +575,7 @@ impl EProvider for Provider {
         _ctoken: &'a (dyn Cancellable + Send + Sync),
     ) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>>
     {
+        let caches = self.caches(req.cache_scope());
         Box::pin(async move {
             // A package inside a skipped subtree lists nothing — matching what the
             // package walk would have surfaced.
@@ -559,7 +586,7 @@ impl EProvider for Provider {
                 return Ok(Box::new(std::iter::empty())
                     as Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>);
             }
-            let res = self.run_pkg(req.package.as_str()).await?;
+            let res = self.run_pkg(&caches, req.package.as_str()).await?;
 
             let items: Vec<anyhow::Result<ListResponse>> = res
                 .targets
@@ -597,17 +624,18 @@ impl EProvider for Provider {
 
     fn list_packages<'a>(
         &'a self,
-        _req: ListPackagesRequest,
+        req: ListPackagesRequest,
         _ctoken: &'a (dyn Cancellable + Send + Sync),
     ) -> BoxFuture<
         'a,
         anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>>,
     > {
+        let caches = self.caches(req.cache_scope());
         Box::pin(async move {
-            // The same sorted cell `heph.core.packages()` reads: one walk, one
-            // order, one error policy for the whole session. `PackageList` is its
-            // own single-flight, so no memoizer is needed in front of it.
-            let list = self.packages();
+            // The same sorted cell `heph.core.packages()` reads in this scope:
+            // one walk, one order, one error policy per scope. `PackageList` is
+            // its own single-flight, so no memoizer is needed in front of it.
+            let list = Arc::clone(&caches.packages);
             let packages = match list.cached() {
                 // Already walked: a lock-free read, not worth a pool round-trip.
                 Some(packages) => packages,
@@ -639,6 +667,7 @@ impl EProvider for Provider {
         req: GetRequest,
         _ctoken: &'a (dyn Cancellable + Send + Sync),
     ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
+        let caches = self.caches(req.cache_scope());
         Box::pin(async move {
             // A target inside a skipped subtree does not resolve — including one
             // under a `.heph*` dir, a name reserved for heph's own state. A plain
@@ -652,7 +681,7 @@ impl EProvider for Provider {
                 return Err(NotFound);
             }
             let res = self
-                .run_pkg(req.addr.package.as_str())
+                .run_pkg(&caches, req.addr.package.as_str())
                 .await
                 .map_err(|e: anyhow::Error| GetError::Other(e))?;
 
@@ -690,8 +719,9 @@ impl EProvider for Provider {
         req: ProbeRequest,
         _ctoken: &'a (dyn Cancellable + Send + Sync),
     ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
+        let caches = self.caches(req.cache_scope());
         Box::pin(async move {
-            let res = self.run_pkg(req.package.as_str()).await?;
+            let res = self.run_pkg(&caches, req.package.as_str()).await?;
 
             Ok(ProbeResponse {
                 states: res
@@ -704,6 +734,25 @@ impl EProvider for Provider {
                     })
                     .collect(),
             })
+        })
+    }
+
+    /// Drops everything this provider read for the scope (and every scope below
+    /// the host's watermark). A call still holding a bucket keeps it alive until
+    /// it returns; what that call writes afterwards dies with it.
+    fn scope_ended<'a>(
+        &'a self,
+        ended: ScopeEnded,
+    ) -> BoxFuture<'a, anyhow::Result<ScopeEndedAck>> {
+        Box::pin(async move {
+            let released = self.scopes.end(ended).await;
+            tracing::debug!(
+                provider = "buildfile",
+                scope = ended.scope.get(),
+                released,
+                "cache scope released",
+            );
+            Ok(ScopeEndedAck::Released)
         })
     }
 }
@@ -800,12 +849,7 @@ mod tests {
 
         let ctoken = StdCancellationToken::new();
         let listed: Vec<String> = provider
-            .list_packages(
-                ListPackagesRequest {
-                    prefix: PkgBuf::from(""),
-                },
-                &ctoken,
-            )
+            .list_packages(ListPackagesRequest::new("test", PkgBuf::from("")), &ctoken)
             .await
             .unwrap()
             .map(|r| r.unwrap().pkg.to_string())
@@ -816,7 +860,10 @@ mod tests {
         expected.sort();
         assert_eq!(listed, expected);
 
-        let result = provider.run_pkg("").await.expect("eval root package");
+        let result = provider
+            .run_pkg(&provider.caches(None), "")
+            .await
+            .expect("eval root package");
         let from_builtin: Vec<String> = match result.targets[0].config.get("pkgs").unwrap() {
             hcore::htvalue::Value::List(v) => v
                 .iter()
@@ -850,12 +897,7 @@ mod tests {
         let list = |p: Provider| async move {
             let ctoken = StdCancellationToken::new();
             let res = p
-                .list_packages(
-                    ListPackagesRequest {
-                        prefix: PkgBuf::from(""),
-                    },
-                    &ctoken,
-                )
+                .list_packages(ListPackagesRequest::new("test", PkgBuf::from("")), &ctoken)
                 .await
                 .unwrap();
             // Drop the always-present synthetic LSP package; this test covers the
@@ -920,12 +962,7 @@ mod tests {
         };
         let ctoken = StdCancellationToken::new();
         let listed: Vec<String> = provider
-            .list_packages(
-                ListPackagesRequest {
-                    prefix: PkgBuf::from(""),
-                },
-                &ctoken,
-            )
+            .list_packages(ListPackagesRequest::new("test", PkgBuf::from("")), &ctoken)
             .await
             .unwrap()
             .map(|r| r.unwrap().pkg.to_string())
@@ -937,7 +974,10 @@ mod tests {
 
         // Consistent with the listing: actually loading the package (as
         // `find_build_files` would for evaluation) finds no build files either.
-        let result = provider.run_pkg("linked").await.expect("eval package");
+        let result = provider
+            .run_pkg(&provider.caches(None), "linked")
+            .await
+            .expect("eval package");
         assert!(result.targets.is_empty(), "{:?}", result.targets);
     }
 
@@ -1092,12 +1132,12 @@ mod tests {
     }
 
     fn get_req(pkg: &str, name: &str) -> GetRequest {
-        GetRequest {
-            request_id: "test".to_string(),
-            addr: Addr::new(PkgBuf::from(pkg), name.to_string(), Default::default()),
-            states: vec![],
-            executor: Arc::new(NoopExecutor),
-        }
+        GetRequest::new(
+            "test",
+            Addr::new(PkgBuf::from(pkg), name.to_string(), Default::default()),
+            vec![],
+            Arc::new(NoopExecutor),
+        )
     }
 
     #[test]
@@ -1213,12 +1253,7 @@ mod tests {
 
         let ctoken = StdCancellationToken::new();
         let res = provider
-            .list_packages(
-                ListPackagesRequest {
-                    prefix: PkgBuf::from(""),
-                },
-                &ctoken,
-            )
+            .list_packages(ListPackagesRequest::new("test", PkgBuf::from("")), &ctoken)
             .await
             .unwrap();
         let packages: Vec<String> = res.map(|r| r.unwrap().pkg.to_string()).collect();
@@ -1259,12 +1294,7 @@ mod tests {
 
         let ctoken = StdCancellationToken::new();
         let res = provider
-            .list_packages(
-                ListPackagesRequest {
-                    prefix: PkgBuf::from(""),
-                },
-                &ctoken,
-            )
+            .list_packages(ListPackagesRequest::new("test", PkgBuf::from("")), &ctoken)
             .await
             .unwrap();
         let packages: Vec<String> = res.map(|r| r.unwrap().pkg.to_string()).collect();
@@ -1304,12 +1334,7 @@ mod tests {
 
         let ctoken = StdCancellationToken::new();
         let res = provider
-            .list_packages(
-                ListPackagesRequest {
-                    prefix: PkgBuf::from(""),
-                },
-                &ctoken,
-            )
+            .list_packages(ListPackagesRequest::new("test", PkgBuf::from("")), &ctoken)
             .await
             .unwrap();
         let packages: Vec<String> = res.map(|r| r.unwrap().pkg.to_string()).collect();
@@ -1353,12 +1378,12 @@ mod tests {
 
         let listed = provider
             .list(
-                ListRequest {
-                    request_id: "test".to_string(),
-                    package: PkgBuf::from("vendor/dep"),
-                    states: vec![],
-                    executor: std::sync::Arc::new(hplugin::provider::NoopExecutor),
-                },
+                ListRequest::new(
+                    "test",
+                    PkgBuf::from("vendor/dep"),
+                    vec![],
+                    std::sync::Arc::new(hplugin::provider::NoopExecutor),
+                ),
                 &ctoken,
             )
             .await
@@ -1394,9 +1419,7 @@ mod tests {
             ..Provider::default()
         };
 
-        let req = ListPackagesRequest {
-            prefix: PkgBuf::from(""),
-        };
+        let req = ListPackagesRequest::new("test", PkgBuf::from(""));
         let ctoken = StdCancellationToken::new();
         let res = provider.list_packages(req, &ctoken).await.unwrap();
         let packages: Vec<String> = res.map(|r| r.unwrap().pkg.to_string()).collect();
@@ -1459,12 +1482,7 @@ mod tests {
         };
         let ctoken = StdCancellationToken::new();
         let err = provider
-            .list_packages(
-                ListPackagesRequest {
-                    prefix: PkgBuf::from(""),
-                },
-                &ctoken,
-            )
+            .list_packages(ListPackagesRequest::new("test", PkgBuf::from("")), &ctoken)
             .await
             .err()
             .expect("a package dir heph cannot name must fail, not disappear from the list");
@@ -1496,12 +1514,7 @@ mod tests {
         };
         let ctoken = StdCancellationToken::new();
         let err = provider
-            .list_packages(
-                ListPackagesRequest {
-                    prefix: PkgBuf::from(""),
-                },
-                &ctoken,
-            )
+            .list_packages(ListPackagesRequest::new("test", PkgBuf::from("")), &ctoken)
             .await
             .err()
             .expect("two directories that render to one lossy name must not become one package");
@@ -1558,12 +1571,7 @@ mod tests {
         };
         let ctoken = StdCancellationToken::new();
         let res = provider
-            .list_packages(
-                ListPackagesRequest {
-                    prefix: PkgBuf::from(""),
-                },
-                &ctoken,
-            )
+            .list_packages(ListPackagesRequest::new("test", PkgBuf::from("")), &ctoken)
             .await
             .unwrap();
         let packages: Vec<String> = res.map(|r| r.unwrap().pkg.to_string()).collect();
@@ -1603,9 +1611,7 @@ mod tests {
             ..Provider::default()
         };
 
-        let req = ListPackagesRequest {
-            prefix: PkgBuf::from(""),
-        };
+        let req = ListPackagesRequest::new("test", PkgBuf::from(""));
         let ctoken = StdCancellationToken::new();
         let res = provider.list_packages(req, &ctoken).await.unwrap();
         let packages: Vec<String> = res.map(|r| r.unwrap().pkg.to_string()).collect();
@@ -1646,9 +1652,7 @@ mod tests {
             ..Provider::default()
         };
 
-        let req = ListPackagesRequest {
-            prefix: PkgBuf::from(""),
-        };
+        let req = ListPackagesRequest::new("test", PkgBuf::from(""));
         let ctoken = StdCancellationToken::new();
         let res = provider.list_packages(req, &ctoken).await.unwrap();
         let packages: Vec<String> = res.map(|r| r.unwrap().pkg.to_string()).collect();
@@ -1686,9 +1690,7 @@ mod tests {
             ..Provider::default()
         };
 
-        let req = ListPackagesRequest {
-            prefix: PkgBuf::from(""),
-        };
+        let req = ListPackagesRequest::new("test", PkgBuf::from(""));
         let ctoken = StdCancellationToken::new();
         let res = provider.list_packages(req, &ctoken).await.unwrap();
         let packages: Vec<String> = res.map(|r| r.unwrap().pkg.to_string()).collect();
@@ -1720,7 +1722,10 @@ target(
             ..Provider::default()
         };
 
-        let result = provider.run_pkg(&pkg_name).await.unwrap();
+        let result = provider
+            .run_pkg(&provider.caches(None), &pkg_name)
+            .await
+            .unwrap();
         assert_eq!(result.targets.len(), 1);
         assert_eq!(result.targets[0].name, "globtarget");
     }
@@ -1746,13 +1751,7 @@ provider_state(provider = "go", root = "src", strict = True)
 
         let ctoken = StdCancellationToken::new();
         let res = provider
-            .probe(
-                ProbeRequest {
-                    request_id: "test".to_string(),
-                    package: PkgBuf::from(pkg_name),
-                },
-                &ctoken,
-            )
+            .probe(ProbeRequest::new("test", PkgBuf::from(pkg_name)), &ctoken)
             .await
             .unwrap();
 
@@ -1779,13 +1778,7 @@ provider_state(provider = "go", root = "src", strict = True)
         };
         let ctoken = StdCancellationToken::new();
         let err = match provider
-            .probe(
-                ProbeRequest {
-                    request_id: "test".to_string(),
-                    package: PkgBuf::from(pkg_name),
-                },
-                &ctoken,
-            )
+            .probe(ProbeRequest::new("test", PkgBuf::from(pkg_name)), &ctoken)
             .await
         {
             Ok(_) => panic!("missing provider must error"),

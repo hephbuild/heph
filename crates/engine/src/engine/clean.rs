@@ -238,13 +238,7 @@ impl Engine {
         matcher: &Matcher,
         discovery: Discovery,
     ) -> Result<Vec<Addr>> {
-        let resolve_rs = self.new_state_full(
-            false,
-            rs.events_sender(),
-            rs.bg_pending(),
-            Self::DEFAULT_LOG_TAIL_LINES,
-            None,
-        );
+        let resolve_rs = self.new_nested_state(rs);
         resolve_rs.suppress_deferred_trims();
 
         let mut addrs = Vec::new();
