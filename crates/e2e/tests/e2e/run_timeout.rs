@@ -1112,14 +1112,38 @@ async fn a_run_holding_its_pipes_is_stopped_at_its_timeout_on_a_multi_thread_run
 /// The shape of a test runner: a parent waiting on workers that share its
 /// output, and print on their way out when interrupted. Their lines, the
 /// last ones printed after the cancel included, reach the tail.
+///
+/// bash starts a `&` job with SIGINT ignored until the job's own `trap`
+/// runs. A SIGINT landing in that window is lost: the worker never prints,
+/// and only the SIGKILL after the cancel grace ends it. That took a
+/// runner stalled for the whole 1s timeout at that instant, once in CI
+/// (run 44826814881). An attempt that shows it, killed only after the
+/// grace with no interrupt line, did not test the tail and is run again.
+/// A tail that loses the line comes from a worker that exited on the
+/// SIGINT, well inside the grace, and still fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_runners_workers_output_survives_its_timeout_on_a_multi_thread_runtime()
 -> anyhow::Result<()> {
-    let (took, timed_out, tail) = timed_out_on_multi_thread(
-        "( trap 'echo worker interrupted; exit 1' INT; \
-         for i in $(seq 1 30); do echo worker $i; done; sleep 60 & wait ) & wait",
-    )
-    .await?;
+    const ATTEMPTS: usize = 3;
+    let missed_trap = Duration::from_secs(1) + heph::proc_exec::CANCEL_GRACE;
+    let mut attempt = 1;
+    let (took, timed_out, tail) = loop {
+        let (took, timed_out, tail) = timed_out_on_multi_thread(
+            "( trap 'echo worker interrupted; exit 1' INT; \
+             for i in $(seq 1 30); do echo worker $i; done; sleep 60 & wait ) & wait",
+        )
+        .await?;
+        let interrupted = tail
+            .as_ref()
+            .is_some_and(|t| t.text.contains("worker interrupted"));
+        if interrupted || took < missed_trap || attempt == ATTEMPTS {
+            break (took, timed_out, tail);
+        }
+        eprintln!(
+            "attempt {attempt}: the SIGINT landed before the worker's trap (took {took:?}); running again"
+        );
+        attempt += 1;
+    };
     assert!(
         took < STOPPED_WITHIN,
         "stopped at its timeout: took {took:?}"

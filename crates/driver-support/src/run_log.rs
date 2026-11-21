@@ -709,7 +709,20 @@ mod tests {
         );
     }
 
-    /// The same against a real child: a background `yes` that keeps the
+    /// A background job that keeps writing to stderr after the shell exits.
+    ///
+    /// It writes its first line before the shell may exit: the shell waits on
+    /// the fifo the job opens only after that write. `yes >&2 & exit 0` let
+    /// the shell exit first, and on a loaded runner `yes` had not written
+    /// within the drain's 500ms after the reap, so the drain gave up on a
+    /// quiet pipe with nothing read (linux/arm64, run 44844861205). The loop
+    /// runs in the job itself rather than an exec'd `yes`, so no new process
+    /// starts between that line and the flood.
+    const FLOOD_AFTER_EXIT: &str = "mkfifo ready; \
+        ( echo y; echo > ready; while :; do echo y; done ) >&2 & \
+        read _ < ready; exit 0";
+
+    /// The same against a real child: a background job that keeps the
     /// stderr pipe full after the shell exits does not hold the run open.
     #[test]
     fn drive_returns_when_a_descendant_floods_the_pipe() {
@@ -728,7 +741,7 @@ mod tests {
                 let dir = tempfile::tempdir().expect("tempdir");
                 let (spawned, _) = hexecrunner::spawn_io(
                     hexecrunner::RunnerRef::local(),
-                    sh(dir.path(), "yes >&2 & exit 0"),
+                    sh(dir.path(), FLOOD_AFTER_EXIT),
                     &ctoken,
                 )
                 .await
