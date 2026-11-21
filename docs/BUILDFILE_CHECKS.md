@@ -35,7 +35,7 @@ they are exempt.
 
 | Target | Does | Writes | Labels |
 |---|---|---|---|
-| `//<pkg>:build-lint-check` | Static typecheck of the files the package owns; with `requireTypeAnnotations`, every `def` parameter (`*args`, `**kwargs` included) must have a type. The return type may be left out, and so may the type of a parameter with a literal default (not `None`; see [Inferred types](#inferred-types)) | nothing | `build-lint-check`, `lint-check` |
+| `//<pkg>:build-lint-check` | Static typecheck of the files the package owns; with `requireTypeAnnotations`, every `def` parameter (`*args`, `**kwargs` included) must have a type. The return type may be left out, and so may the type of a parameter with a scalar literal default (not `None`, and not a list, dict or tuple display; see [Inferred types](#inferred-types)) | nothing | `build-lint-check`, `lint-check` |
 | `//<pkg>:build-format-check` | Fails when an owned file differs from the formatter's output, the same rule as `heph tool build-fmt --check` | nothing | `build-format-check`, `format-check` |
 | `//<pkg>:build-format` | Rewrites owned files to the formatter's output (`codegen = in_place`) | owned files | `build-format`, `format`, `fix` |
 
@@ -82,13 +82,19 @@ annotations stay optional and calls are still checked against them:
 - **A parameter with a literal default** takes the literal's type. `1` and
   `-1` give `int`. `1.5` and `-1.5` give `int | float`, the same type as
   `heph.types.Number`, so `f(2)` passes against `scale = 1.0`. `"s"` gives
-  `str`, and `True` and `False` give `bool`. A list display (`[]`), a dict
-  display (`{}`) or a tuple display (`()`) gives a list, dict or tuple whose
-  elements are unchecked: `xs = ["a"]` is an example, not a schema.
+  `str`, and `True` and `False` give `bool`.
 
 `True` and `False` count only while the module does not rebind them anywhere
 (an assignment, a `for`, a `load`, a `def`, even one local to another def).
 Where it does, annotate the parameter.
+
+A list display (`[]`, `["a"]`), a dict display (`{}`) or a tuple display
+(`()`), empty or not, gives a `list`, `dict` or `tuple` of `Any`: the checker
+holds callers to the container, never to its elements. That type describes
+nothing, since a display does not say what goes in it, so
+`requireTypeAnnotations` still asks for an annotation with no `Any` in it:
+write `srcs: list[str] = []`. Only a type a default gives is held to that; an
+annotation you write may contain `Any`.
 
 These defaults infer nothing, so the parameter still needs an annotation:
 `None` (it means "optional something"; write `x: str | None = None`), a name
@@ -100,10 +106,9 @@ always wins over the default: `n: heph.types.Number = 1` takes a float too,
 and `name: str | None = ""` takes `None`.
 
 A wrapper parameter that forwards to a `target()` field (`deps`, `labels`,
-`env`, `tools`, `pass_env`, `runtime_pass_env`) should be annotated with its
-`heph.types` alias rather than typed by its default. `deps = []` infers `list`,
-so a call from another def that passes one address (`deps = "//a:b"`) or a
-group map is a type error, although `target()` accepts both.
+`env`, `tools`, `pass_env`, `runtime_pass_env`) takes its `heph.types` alias:
+`deps: heph.types.Deps = []`. With `requireTypeAnnotations` on, an
+unannotated `deps = []` gets a finding that suggests the alias.
 
 Only `build-lint-check` checks these types. Evaluation (`heph run`, `query`,
 `validate`) checks annotations alone, so it still accepts any argument for a
@@ -132,14 +137,17 @@ line follows:
 
 ```
 pkg/BUILD:3:9: annotation: parameter `x` of `make_lib` has no type; add `: <type>`
+pkg/BUILD:7:10: annotation: parameter `srcs` of `make_bin` is typed `list` by its default, a list of `Any`; add a type with no `Any`, e.g. `: list[str]`
 pkg/defs.BUILD:12:5: type-error: Expected type `str` but got `int`
-2 findings in //pkg
+3 findings in //pkg
 annotations are required by requireTypeAnnotations in .hephconfig (plugins: buildfile, options)
 ```
 
 The last line appears only when there is an `annotation:` finding. When a
 parameter is named like a `heph.types` alias (`deps`, `labels`, …), its finding
-suggests that alias.
+suggests that alias: `deps = []` ends with ``add `: heph.types.Deps` ``. A
+dict default suggests `dict[str, str]` and a tuple default
+`tuple[str, ...]`; put in the element types the parameter really takes.
 
 The expected type in a `type-error:` may come from a parameter's default
 rather than from an annotation. After `def f(n = 1)` on line 1, a call
@@ -343,9 +351,13 @@ reading only: the key stays optional in the type.
   `def f(n = 1)`, `f(n = "s")` is a type error, and so is using `n` as a
   `str` inside `f`. The commonest new findings are `f(1.5)` against `n = 1`,
   `f(None)` against `name = ""`, and a def passing `deps = "//a:b"` to a
-  wrapper declared with `deps = []`. Annotate the parameter to widen it
-  (`n: heph.types.Number = 1`, `name: str | None = ""`,
+  wrapper declared with `deps = []`, which types it `list`. Annotate the
+  parameter to widen it (`n: heph.types.Number = 1`, `name: str | None = ""`,
   `deps: heph.types.Deps = []`).
+- With `requireTypeAnnotations` on, a parameter whose default is a list, dict
+  or tuple display (`srcs = []`, `creds = {}`, `t = ()`) now needs an
+  annotation with no `Any` in it, although its default types it. The finding
+  says what the default types it as and suggests a fix.
 - A plugin named `types` no longer loads. The name is reserved for
   `heph.types`, like `core`.
 - `target(labels = None)` is now accepted and means labels left out, so a

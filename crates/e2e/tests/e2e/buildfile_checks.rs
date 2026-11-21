@@ -301,6 +301,40 @@ async fn unowned_file_unreported() {
     );
 }
 
+/// A container display default types its parameter as a container of `Any`:
+/// lint passes it without `requireTypeAnnotations`, and with it the finding
+/// names the type and asks for one with no `Any`, under the same count line
+/// and footer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn require_annotations_container_default() {
+    let ws = Ws::new(
+        &[(
+            "pkg/BUILD",
+            "def make_bin(srcs = [], deps = []):\n    pass\n",
+        )],
+        "",
+    );
+    assert_passes(
+        &run_addr(&ws, "//pkg:build-lint-check").await,
+        "//pkg:build-lint-check",
+    );
+
+    ws.set_options("requireTypeAnnotations: true");
+    let r = run_addr(&ws, "//pkg:build-lint-check").await;
+    assert_fails(&r, "//pkg:build-lint-check");
+    assert_eq!(
+        failure_log(&ws, "//pkg:build-lint-check").trim_end(),
+        format!(
+            "pkg/BUILD:1:14: annotation: parameter `srcs` of `make_bin` is typed `list` by its \
+             default, a list of `Any`; add a type with no `Any`, e.g. `: list[str]`\n\
+             pkg/BUILD:1:25: annotation: parameter `deps` of `make_bin` is typed `list` by its \
+             default, a list of `Any`; add `: heph.types.Deps`\n\
+             2 findings in //pkg\n\
+             {FOOTER_ANNOTATIONS}"
+        )
+    );
+}
+
 /// `requireTypeAnnotations` gates an untyped `def` parameter: green without
 /// it, a failure with the spec's text and footer with it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

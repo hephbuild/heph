@@ -3113,6 +3113,33 @@ fn require_annotations_exempts_a_literal_default() {
 }
 
 #[test]
+fn require_annotations_marks_a_container_default() {
+    // A container display types its parameter as a container of `Any`, which
+    // the rule does not accept: the mark says so, as `build-lint-check` does.
+    let on = annotation_diagnostics(true, "def f(n = 1, srcs = [], deps = []):\n    pass\n");
+    let marks: Vec<(&str, &Value)> = on
+        .iter()
+        .map(|d| (d["message"].as_str().unwrap_or(""), &d["range"]["start"]))
+        .collect();
+    assert_eq!(
+        marks,
+        [
+            (
+                "parameter `srcs` of `f` is typed `list` by its default, a list of `Any`; \
+                 add a type with no `Any`, e.g. `: list[str]`",
+                &json!({"line": 0, "character": 13}),
+            ),
+            (
+                "parameter `deps` of `f` is typed `list` by its default, a list of `Any`; \
+                 add `: heph.types.Deps`",
+                &json!({"line": 0, "character": 24}),
+            ),
+        ],
+        "a mark on each container default, none on `n`"
+    );
+}
+
+#[test]
 fn parity_builtin_hover() {
     let mut lsp = Lsp::start();
     let doc = lsp.open("BUILD", "x = l│en([1])\n");
