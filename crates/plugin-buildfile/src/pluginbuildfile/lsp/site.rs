@@ -24,6 +24,7 @@
 //! never misplaced.
 
 use super::lex::{Bracket, ErrorKind, Kind, NO_LINK, Tok, Tokens, line_end, line_start};
+use crate::pluginbuildfile::ast::bound_names;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -36,68 +37,6 @@ pub(crate) struct Overlay {
     pub rebound: HashSet<String>,
     /// Each loaded local name → (load path, exported name).
     pub loaded: HashMap<String, (String, String)>,
-}
-
-/// Visit `s` and every statement nested within it.
-fn walk_stmt<'a>(
-    s: &'a starlark::syntax::ast::AstStmt,
-    f: &mut impl FnMut(&'a starlark::syntax::ast::AstStmt),
-) {
-    f(s);
-    // `Stmt::visit_stmt` is one level deep; recurse to reach the whole subtree.
-    s.visit_stmt(|child| walk_stmt(child, f));
-}
-
-/// Every name the module binds: `def`s and their parameters, assignment and loop
-/// targets, and `load(...)` imports.
-///
-/// Deliberately flat — a name bound anywhere counts as bound everywhere, with no
-/// scope tracking. Over-approximating errs toward silence, and the alternative
-/// (a real scope analysis) would buy nothing: a buffer that defines its own
-/// `target` almost certainly means it at every call site.
-pub(crate) fn bound_names(ast: &starlark::syntax::AstModule) -> HashSet<&str> {
-    use starlark::syntax::ast::Stmt;
-    let mut names = HashSet::new();
-    walk_stmt(ast.statement(), &mut |s| match &s.node {
-        Stmt::Def(def) => {
-            names.insert(def.name.node.ident.as_str());
-            names.extend(
-                def.params
-                    .iter()
-                    .filter_map(|p| p.ident())
-                    .map(|i| i.node.ident.as_str()),
-            );
-        }
-        Stmt::Load(load) => {
-            names.extend(load.args.iter().map(|a| a.local.node.ident.as_str()));
-        }
-        Stmt::Assign(assign) => collect_assign_target(&assign.lhs, &mut names),
-        Stmt::AssignModify(target, _, _) => collect_assign_target(target, &mut names),
-        Stmt::For(for_stmt) => collect_assign_target(&for_stmt.var, &mut names),
-        _ => {}
-    });
-    names
-}
-
-/// Add the identifiers an assignment or loop target binds (`a`, `a, b`, `[a, b]`).
-/// Index and attribute targets (`a[0] = …`, `a.b = …`) mutate an existing
-/// binding rather than introducing one, so they bind nothing.
-fn collect_assign_target<'a>(
-    target: &'a starlark::syntax::ast::AstAssignTarget,
-    names: &mut HashSet<&'a str>,
-) {
-    use starlark::syntax::ast::AssignTarget;
-    match &target.node {
-        AssignTarget::Identifier(id) => {
-            names.insert(id.node.ident.as_str());
-        }
-        AssignTarget::Tuple(items) => {
-            for item in items {
-                collect_assign_target(item, names);
-            }
-        }
-        AssignTarget::Index(_) | AssignTarget::Dot(_, _) => {}
-    }
 }
 
 /// The overlay of a parsed module: its bound names and its `load` imports.

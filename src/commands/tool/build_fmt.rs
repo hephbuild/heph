@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use async_trait::async_trait;
-use hxstarlark_fmt::{Config, FmtError};
+use hxstarlark_fmt::{Config, Reformat};
 
 use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
@@ -17,12 +17,19 @@ use crate::htpkg::{self, PkgBuf};
 use crate::pluginbuildfile::{FormatSettings, build_files_in_dir};
 use crate::tui::{self, App, AppContext, LogSink};
 
+/// Points at the cached targets that apply the same rule (docs/BUILDFILE_CHECKS.md).
+const AFTER_HELP: &str = "\
+Every package also has cached targets applying the same rule:
+  heph run //<pkg>:build-format         rewrite the package's BUILD files
+  heph run format-check //...           check every package, as CI does";
+
 /// The argument value that selects stdin → stdout mode.
 const STDIN_MARKER: &str = "-";
 
 #[derive(clap::Args, Clone)]
 #[command(
-    override_usage = "heph tool build-fmt\n       heph tool build-fmt <PACKAGE_MATCHER>\n       heph tool build-fmt -"
+    override_usage = "heph tool build-fmt\n       heph tool build-fmt <PACKAGE_MATCHER>\n       heph tool build-fmt -",
+    after_help = AFTER_HELP
 )]
 pub struct Args {
     /// Package matcher (e.g. //pkg/...); omit to format every package's BUILD
@@ -59,18 +66,16 @@ fn format_stdin() -> anyhow::Result<()> {
         .read_to_string(&mut src)
         .context("reading stdin")?;
 
-    let out = match hxstarlark_fmt::format(
+    // A skipped or already formatted file is emitted unchanged, matching
+    // in-place behavior.
+    let out = decide(
         "<stdin>",
         &src,
         Config {
             indent_size: indent,
         },
-    ) {
-        Ok(out) => out,
-        // A skipped file is emitted unchanged, matching in-place behavior.
-        Err(FmtError::Skip) => src,
-        Err(e) => return Err(anyhow::anyhow!(e).context("formatting stdin")),
-    };
+    )?
+    .unwrap_or(src);
 
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
@@ -136,23 +141,9 @@ impl App for BuildFmtApp {
                 let src = std::fs::read_to_string(path)
                     .with_context(|| format!("reading {}", path.display()))?;
 
-                let out_text = match hxstarlark_fmt::format(&path.to_string_lossy(), &src, cfg) {
-                    Ok(text) => text,
-                    // The `heph:fmt skip-file` directive: leave untouched.
-                    Err(FmtError::Skip) => continue,
-                    // A file that doesn't parse (a syntax error, or tab
-                    // indentation, which heph's Starlark dialect rejects) can't
-                    // be reformatted — fail the run so it's fixed, not hidden.
-                    Err(e) => {
-                        return Err(
-                            anyhow::anyhow!(e).context(format!("formatting {}", path.display()))
-                        );
-                    }
-                };
-
-                if out_text == src {
+                let Some(out_text) = decide(&path.to_string_lossy(), &src, cfg)? else {
                     continue;
-                }
+                };
 
                 if self.check {
                     tracing::warn!("{label} is not formatted");
@@ -181,6 +172,18 @@ impl App for BuildFmtApp {
 
         crate::commands::errors::finalize!(ctx, rs, res)
     }
+}
+
+/// What `build-fmt` does with one file whose source is `src`: the formatted
+/// bytes to write (and, under `--check`, the file to report), or `None` to
+/// leave it. The rule the `build-format-check` target applies too: a
+/// skip-file directive counts as formatted, and a file that doesn't parse
+/// fails the run, named, rather than being hidden.
+fn decide(name: &str, src: &str, cfg: Config) -> anyhow::Result<Option<String>> {
+    Ok(match hxstarlark_fmt::reformat(name, src, cfg)? {
+        Reformat::Unchanged => None,
+        Reformat::Changed(text) => Some(text),
+    })
 }
 
 /// Render a BUILD file path as a workspace-relative label for output.
@@ -220,4 +223,79 @@ async fn execute_async(
         shutdown,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Config, decide};
+    use std::path::PathBuf;
+
+    /// Every formatter fixture's input and expected output.
+    fn fixtures() -> Vec<(String, String)> {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("crates/xstarlark-fmt/testdata");
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(&dir).expect("read testdata") {
+            let path = entry.expect("entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("txt") {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .expect("name")
+                .to_string_lossy()
+                .to_string();
+            let content = std::fs::read_to_string(&path).expect("read fixture");
+            // Work-in-progress fixtures, which the golden test skips too.
+            if content.contains("# skip") {
+                continue;
+            }
+            let (input, expected) = content.split_once("----\n").expect("separator");
+            out.push((format!("{name} input"), input.to_owned()));
+            out.push((format!("{name} expected"), expected.to_owned()));
+        }
+        assert!(
+            out.len() > 20,
+            "found almost no fixtures in {}",
+            dir.display()
+        );
+        out
+    }
+
+    /// `heph tool build-fmt --check` reports a file exactly when the
+    /// `build-format-check` target fails it, at every indent.
+    #[test]
+    fn check_matches_build_fmt() {
+        let mut cases = fixtures();
+        cases.push((
+            "skip-file".into(),
+            "# heph:fmt skip-file\nx    =  1\n".into(),
+        ));
+        cases.push(("unformatted".into(), "x    =  1\n".into()));
+        let mut flagged = 0;
+        for indent_size in [2, 4] {
+            for (name, src) in &cases {
+                let build_fmt = decide("pkg/BUILD", src, Config { indent_size }).expect("parses");
+                let check =
+                    crate::pluginbuildfile::format_check_verdict("pkg/BUILD", src, indent_size)
+                        .expect("parses");
+                assert_eq!(
+                    check.is_some(),
+                    build_fmt.is_some(),
+                    "{name} (indent {indent_size}): build-fmt {build_fmt:?}, check {check:?}"
+                );
+                if let Some(line) = check {
+                    flagged += 1;
+                    assert!(
+                        line.starts_with("pkg/BUILD:")
+                            && line.contains(":1: format: not formatted"),
+                        "{name}: {line}"
+                    );
+                }
+            }
+        }
+        assert!(
+            flagged > 0,
+            "no case needed formatting, so nothing was compared"
+        );
+    }
 }

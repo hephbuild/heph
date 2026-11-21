@@ -5334,6 +5334,7 @@ dependencies = [
  "builtins",
  "config",
  "core",
+ "driver-support",
  "enclose",
  "futures",
  "glob",
@@ -5357,6 +5358,7 @@ dependencies = [
  "vendored-starlark-lsp",
  "walk",
  "xstarlark-fmt",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -7239,7 +7241,7 @@ dependencies = [
 [[package]]
 name = "starlark"
 version = "0.14.2"
-source = "git+https://github.com/hephbuild/starlark-rust.git?branch=heph%2Fv0.14.2#a24ea81cf8852add4a37ad77b7b4ef338d40b6cc"
+source = "git+https://github.com/hephbuild/starlark-rust.git?branch=heph%2Fv0.14.2#c92fffc8226d8b496b38367e7fed68674a81c4d7"
 dependencies = [
  "allocative",
  "anyhow",

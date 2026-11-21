@@ -17,3 +17,7 @@
 )]
 
 pub mod pluginbuildfile;
+
+// The `htspec` derive macros expand to `crate::htvalue` / `crate::htspec`.
+pub(crate) use hcore::htvalue;
+pub(crate) use hplugin::htspec;

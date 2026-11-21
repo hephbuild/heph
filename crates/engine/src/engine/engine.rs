@@ -160,8 +160,9 @@ pub const PLUGIN_NAME_RULE: &str = "[a-z_][a-z0-9_]*";
 /// named after the component they construct — so not known until it exists.
 const BARE_PLUGIN_NAME: &str = "";
 
-/// Names no plugin may take: `core` is the static `heph.core` namespace.
-const RESERVED_PLUGIN_NAMES: &[&str] = &["core"];
+/// Names no plugin may take: heph's own static `heph.<name>` namespaces
+/// (`core`, `types`), which a plugin's namespace would collide with.
+const RESERVED_PLUGIN_NAMES: &[&str] = hplugin::function::STATIC_NAMESPACES;
 
 fn is_valid_name_segment(name: &str) -> bool {
     let mut chars = name.chars();
@@ -1943,6 +1944,30 @@ mod tests {
                  the built-in `heph.core` namespace); choose another name"
             );
             assert!(!e.plugins.contains_key("core"));
+        }
+
+        /// `types` is the static `heph.types` namespace, reserved like `core`:
+        /// a builtin is refused at registration (a cdylib's manifest name goes
+        /// through the same `validate_plugin_name`, see `plugin_load`).
+        #[tokio::test]
+        async fn types_name_reserved() {
+            let (_root, mut e) = engine();
+            let err = e
+                .register_plugin("types", |_| Ok(PluginParts::default()))
+                .expect_err("types is reserved");
+            assert_eq!(
+                format!("{err:#}"),
+                "registering builtin plugin \"types\": plugin name \"types\" is reserved (it is \
+                 the built-in `heph.types` namespace); choose another name"
+            );
+            assert!(!e.plugins.contains_key("types"));
+            let err = e
+                .register_plugin_factory("types", |_, _| Ok(PluginParts::default()))
+                .expect_err("a factory named types is reserved too");
+            assert!(
+                format!("{err:#}").contains("plugin name \"types\" is reserved"),
+                "{err:#}"
+            );
         }
 
         #[tokio::test]

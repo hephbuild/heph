@@ -1,3 +1,4 @@
+use crate::pluginbuildfile::checks::targets::CheckKind;
 use crate::pluginbuildfile::provider::{PackageList, Provider};
 use anyhow::Context;
 use enclose::enclose;
@@ -289,37 +290,60 @@ fn render_builtin_hover(
 }
 
 pub(crate) fn build_globals(registry: &FunctionRegistry) -> Globals {
-    let mut builder = GlobalsBuilder::standard();
-    builder = builder.with(starlark_module);
-    builder
+    heph_globals(|hb| {
+        // One `heph.<plugin>` namespace per plugin with functions; each
+        // function becomes a native callable bridging into its async `PluginFn`.
+        for (provider, fns) in registry.plugins() {
+            hb.namespace(provider, |nb| {
+                for (name, rf) in fns {
+                    // Each plugin function carries per-fn state (its async
+                    // `PluginFn` + declared signature), so it's registered as a
+                    // custom callable value rather than `set_function` (whose
+                    // 0.14 `NativeFuncFn` is a stateless `fn` pointer). The
+                    // engine-side validator in `invoke` is the canonical guard
+                    // for arity/types/return; the LSP proxy renders hover and
+                    // completion for these from the registry.
+                    nb.set(
+                        name.as_str(),
+                        ProviderNativeFn {
+                            display: format!("heph.{provider}.{name}"),
+                            signature: Arc::clone(&rf.signature),
+                            func: Arc::clone(&rf.func),
+                        },
+                    );
+                }
+            });
+        }
+    })
+}
+
+/// The globals every BUILD file sees: the static `starlark_module` builtins
+/// (`target`, …), `heph.core` and `heph.types`, plus whatever `plugins` adds
+/// to the `heph` namespace. Evaluation adds callable plugin functions
+/// ([`build_globals`]); the lint check adds opaque stand-ins by name, so both
+/// see the same static surface.
+pub(crate) fn heph_globals(plugins: impl Fn(&mut GlobalsBuilder)) -> Globals {
+    GlobalsBuilder::standard()
+        .with(starlark_module)
         .with_namespace("heph", |hb| {
             // Static `heph.core` host/platform builtins.
             hb.namespace("core", heph_core_module);
-            // One `heph.<plugin>` namespace per plugin with functions; each
-            // function becomes a native callable bridging into its async `PluginFn`.
-            for (provider, fns) in registry.plugins() {
-                hb.namespace(provider, |nb| {
-                    for (name, rf) in fns {
-                        // Each plugin function carries per-fn state (its async
-                        // `PluginFn` + declared signature), so it's registered as a
-                        // custom callable value rather than `set_function` (whose
-                        // 0.14 `NativeFuncFn` is a stateless `fn` pointer). The
-                        // engine-side validator in `invoke` is the canonical guard
-                        // for arity/types/return; the LSP proxy renders hover and
-                        // completion for these from the registry.
-                        nb.set(
-                            name.as_str(),
-                            ProviderNativeFn {
-                                display: format!("heph.{provider}.{name}"),
-                                signature: Arc::clone(&rf.signature),
-                                func: Arc::clone(&rf.func),
-                            },
-                        );
-                    }
-                });
-            }
+            // Static `heph.types` aliases for `target()`'s fields.
+            hb.namespace(
+                crate::pluginbuildfile::types::NAMESPACE,
+                crate::pluginbuildfile::types::register,
+            );
+            plugins(hb);
         })
         .build()
+}
+
+/// Whether a top-level name of a loaded module is exported: everything but a
+/// `_`-prefixed name. The one rule shared by evaluation's directory-load merge
+/// ([`merge_pkg_results`]) and the lint check's merge of the same files'
+/// interfaces, so the two cannot disagree on what a `load("//dir")` sees.
+pub(crate) fn is_exported(name: &str) -> bool {
+    !name.starts_with('_')
 }
 
 /// Map a [`ParamType`] to the Starlark `Ty` used for native param/return typing
@@ -527,7 +551,12 @@ impl<'v> starlark::values::StarlarkValue<'v> for ProviderNativeFn {
         }
 
         if !targets.is_empty() {
-            let provenance = if extra.capture_provenance {
+            // As `target()`: a shadowed check's call site, for `heph validate`.
+            let provenance = if extra.capture_provenance
+                || targets
+                    .iter()
+                    .any(|t| CheckKind::from_name(&t.name).is_some())
+            {
                 capture_provenance(eval)
             } else {
                 Vec::new()
@@ -821,7 +850,7 @@ fn merge_pkg_results(parts: &[Arc<RunResult>]) -> anyhow::Result<RunResult> {
             for name in part.module.names() {
                 let name_str = name.as_str();
                 // Skip underscore-prefixed (private) symbols — never re-exportable.
-                if name_str.starts_with('_') {
+                if !is_exported(name_str) {
                     continue;
                 }
                 if let Some(owned) = part.module.get_option(name_str)? {
@@ -867,7 +896,7 @@ pub(crate) struct Extra<'a> {
 /// value where a plain value is expected) — never a programming error, so
 /// this must return an error rather than panic: it runs inside the LSP, which
 /// must survive a malformed BUILD file rather than crash the whole server.
-fn starlark_to_rust(v: &Value) -> anyhow::Result<htvalue::Value> {
+pub(crate) fn starlark_to_rust(v: &Value) -> anyhow::Result<htvalue::Value> {
     if v.is_none() {
         return Ok(htvalue::Value::Null());
     }
@@ -1105,7 +1134,11 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
                         Ok(None)
                     }
                     "labels" => {
-                        if let Some(s) = e.1.unpack_str() {
+                        // `None` is the field left out, as `heph.types.Labels`
+                        // promises: a wrapper passes its `labels = None` through.
+                        if e.1.is_none() {
+                            labels = vec![];
+                        } else if let Some(s) = e.1.unpack_str() {
                             labels = vec![s.to_string()];
                         } else {
                             labels = UnpackList::<String>::unpack_value_err(*e.1)
@@ -1136,7 +1169,9 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
         // An empty driver is allowed here: the provider resolves it against the
         // configured `defaultDriver` (and errors if neither is set).
 
-        let provenance = if extra.capture_provenance {
+        let provenance = if extra.capture_provenance || CheckKind::from_name(&name).is_some() {
+            // A target named like a check shadows it, and `heph validate`
+            // names where it was declared (I2). Rare, so worth the walk.
             capture_provenance(eval)
         } else {
             Vec::new()
@@ -1645,7 +1680,7 @@ impl BuildFileLoader {
     /// itself bound to the workspace (a package segment may contain `..`), so this
     /// is the chokepoint that keeps `root.join(pkg)` from walking outside the
     /// workspace for a crafted address like `//../../etc:x`.
-    fn load_pkg(&self, pkg: &str) -> anyhow::Result<Arc<RunResult>> {
+    pub(crate) fn load_pkg(&self, pkg: &str) -> anyhow::Result<Arc<RunResult>> {
         if hmodel::htpkg::join_rel_checked("", pkg).is_err() {
             return Ok(Arc::new(empty_run_result()?));
         }
@@ -1657,10 +1692,12 @@ impl BuildFileLoader {
         if files.is_empty() {
             return Ok(Arc::new(empty_run_result()?));
         }
-        self.load_dir(&dir, pkg)
+        self.load_dir(&dir, pkg, &files)
     }
 
-    fn load_dir(&self, dir: &Path, pkg: &str) -> anyhow::Result<Arc<RunResult>> {
+    /// Evaluate the package in `dir` from its BUILD `files`, as listed by
+    /// [`find_build_files`] (non-empty, sorted).
+    fn load_dir(&self, dir: &Path, pkg: &str, files: &[PathBuf]) -> anyhow::Result<Arc<RunResult>> {
         if let Some(cached) = self
             .dir_cache
             .lock()
@@ -1668,16 +1705,6 @@ impl BuildFileLoader {
             .get(dir)
         {
             return Ok(cached.clone());
-        }
-
-        let files = find_build_files(&self.walker, dir, &self.patterns)?;
-        if files.is_empty() {
-            let pats: Vec<&str> = self.patterns.iter().map(glob::Pattern::as_str).collect();
-            anyhow::bail!(
-                "no BUILD file in {} matching patterns {:?}",
-                dir.display(),
-                pats
-            );
         }
 
         // Cycle guard on the dir entry itself so that load("//a") -> load("//a") is caught
@@ -1688,7 +1715,7 @@ impl BuildFileLoader {
                 .lock()
                 .map_err(|_e| anyhow::anyhow!("in_flight lock poisoned"))?;
             if !in_flight.insert(dir.to_path_buf()) {
-                anyhow::bail!("load() cycle detected at {}", dir.display());
+                return Err(load_cycle(&self.root, dir));
             }
         }
         let _guard = InFlightGuard {
@@ -1697,7 +1724,7 @@ impl BuildFileLoader {
         };
 
         let mut parts = Vec::with_capacity(files.len());
-        for file in &files {
+        for file in files {
             parts.push(
                 self.load_file(file, pkg)
                     .with_context(|| format!("file: {}", file.display()))?,
@@ -1731,7 +1758,7 @@ impl BuildFileLoader {
                     .lock()
                     .map_err(|_e| anyhow::anyhow!("in_flight lock poisoned"))?;
                 if !in_flight.insert(file_path.to_path_buf()) {
-                    anyhow::bail!("load() cycle detected at {}", file_path.display());
+                    return Err(load_cycle(&self.root, file_path));
                 }
             }
             let _guard = InFlightGuard {
@@ -1752,6 +1779,7 @@ impl BuildFileLoader {
                 // The other chain finished: re-check the cache. If it *failed*,
                 // the cache is still empty and this chain takes its turn.
                 Claim::Retry => continue,
+                Claim::Cycle => return Err(load_cycle(&self.root, file_path)),
             };
             // Owning the path does not mean nobody evaluated it: the chain that
             // did may have cached it and released between this chain's cache
@@ -1832,6 +1860,9 @@ enum Claim {
     Owned,
     /// Another chain finished (or failed) it — re-check the cache and retry.
     Retry,
+    /// The owner is (transitively) waiting on this chain: a `load()` cycle
+    /// spread across two chains. The caller raises [`load_cycle`].
+    Cycle,
 }
 
 impl LoadRegistry {
@@ -1861,7 +1892,7 @@ impl LoadRegistry {
             loop {
                 if at == chain {
                     state.waiting.remove(&chain);
-                    anyhow::bail!("load() cycle detected at {}", path.display());
+                    return Ok(Claim::Cycle);
                 }
                 match state.waiting.get(&at).and_then(|p| state.holder.get(p)) {
                     Some(&next) => at = next,
@@ -1977,30 +2008,115 @@ impl FileLoader for ScopedLoader<'_> {
 
 impl BuildFileLoader {
     fn load_resolved(&self, path: &str, current_pkg: &str) -> anyhow::Result<FrozenModule> {
-        let candidate = resolve_load_target(&self.root, current_pkg, path)?;
-        let meta = std::fs::metadata(&candidate)
-            .with_context(|| format!("stat load path {}", candidate.display()))?;
-        let result = if meta.is_file() {
-            let pkg = candidate
-                .parent()
-                .and_then(|p| p.strip_prefix(&self.root).ok())
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default();
-            self.load_file(&candidate, &pkg)?
-        } else if meta.is_dir() {
-            let pkg = candidate
-                .strip_prefix(&self.root)
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default();
-            self.load_dir(&candidate, &pkg)?
-        } else {
-            anyhow::bail!(
-                "load() path {} is neither file nor directory",
-                candidate.display()
-            )
-        };
+        let result =
+            match resolve_load(&self.root, &self.walker, current_pkg, path, &self.patterns)? {
+                Resolved::File { path, pkg } => self.load_file(&path, &pkg)?,
+                Resolved::Dir { dir, pkg, files } => self.load_dir(&dir, &pkg, &files)?,
+            };
         Ok(result.module.clone())
     }
+}
+
+/// What one `load()` argument reads: the single source of truth for both
+/// evaluation ([`BuildFileLoader`]) and the parse-only load walk
+/// (`checks::loads`), so the two cannot disagree on which files a load names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Resolved {
+    /// `load("//pkg/defs.star")`: one file, evaluated in `pkg`, the
+    /// workspace-relative directory holding it.
+    File { path: PathBuf, pkg: String },
+    /// `load("//pkg")`: every file in `dir` matching the BUILD patterns
+    /// (sorted, non-empty), evaluated in `pkg` and merged.
+    Dir {
+        dir: PathBuf,
+        pkg: String,
+        files: Vec<PathBuf>,
+    },
+}
+
+/// Resolve the `load()` argument `path`, written in a file of `current_pkg`,
+/// to the files it reads.
+///
+/// Owns the path rules ([`resolve_load_target`]), the file/directory decision,
+/// the BUILD-pattern listing of a directory ([`find_build_files`]), the package
+/// each resolved file is evaluated in, and the error text of each, which names
+/// paths relative to `root`. A symlinked file is followed for the decision but
+/// keeps its link path (and so the link's package).
+pub(crate) fn resolve_load(
+    root: &Path,
+    walker: &CachedWalker,
+    current_pkg: &str,
+    path: &str,
+    patterns: &[glob::Pattern],
+) -> anyhow::Result<Resolved> {
+    let candidate = resolve_load_target(root, current_pkg, path)?;
+    let meta = std::fs::metadata(&candidate)
+        .with_context(|| format!("stat load path {}", rel_display(root, &candidate)))?;
+    if meta.is_file() {
+        let pkg = candidate
+            .parent()
+            .and_then(|p| p.strip_prefix(root).ok())
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        Ok(Resolved::File {
+            path: candidate,
+            pkg,
+        })
+    } else if meta.is_dir() {
+        let pkg = candidate
+            .strip_prefix(root)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let files = find_build_files(walker, &candidate, patterns)?;
+        if files.is_empty() {
+            let pats: Vec<&str> = patterns.iter().map(glob::Pattern::as_str).collect();
+            anyhow::bail!(
+                "no BUILD file in {} matching patterns {:?}",
+                rel_display(root, &candidate),
+                pats
+            );
+        }
+        Ok(Resolved::Dir {
+            dir: candidate,
+            pkg,
+            files,
+        })
+    } else {
+        anyhow::bail!(
+            "load() path {} is neither file nor directory",
+            rel_display(root, &candidate)
+        )
+    }
+}
+
+/// The error for a `load()` that re-enters a file or directory still being
+/// loaded on the same chain. Evaluation and the load walk both raise it, so a
+/// cycle reads the same from either.
+pub(crate) fn load_cycle(root: &Path, at: &Path) -> anyhow::Error {
+    anyhow::anyhow!("load() cycle detected at {}", rel_display(root, at))
+}
+
+/// `path` relative to the workspace `root` for an error message; `.` for the
+/// root itself, and the path unchanged when it is outside the root.
+pub(crate) fn rel_display(root: &Path, path: &Path) -> String {
+    match path.strip_prefix(root) {
+        Ok(rel) if rel.as_os_str().is_empty() => ".".to_string(),
+        Ok(rel) => rel.display().to_string(),
+        Err(_) => path.display().to_string(),
+    }
+}
+
+/// Parse a BUILD (or `load()`ed) file in the dialect evaluation uses. The one
+/// parse both evaluation and the load walk go through.
+pub(crate) fn parse_build_file(path: &Path) -> anyhow::Result<AstModule> {
+    AstModule::parse_file(path, &Dialect::Extended).map_err(starlark::Error::into_anyhow)
+}
+
+/// [`parse_build_file`] over source already read, named `name` in spans and
+/// errors: the lint check reads a sandbox file and names it by its
+/// workspace-relative path. Same dialect as evaluation.
+pub(crate) fn parse_build_source(name: &str, src: String) -> anyhow::Result<AstModule> {
+    AstModule::parse(name, src, &Dialect::Extended).map_err(starlark::Error::into_anyhow)
 }
 
 /// Resolve a `load()` path argument to an absolute filesystem path, rejecting
@@ -2039,7 +2155,7 @@ pub(crate) fn resolve_load_target(
 /// Enumerate every file in `dir` whose name matches any of `patterns`.
 /// Result is sorted for deterministic ordering across runs. Propagates IO errors,
 /// including "directory does not exist".
-fn find_build_files(
+pub(crate) fn find_build_files(
     walker: &CachedWalker,
     dir: &Path,
     patterns: &[glob::Pattern],
@@ -2061,8 +2177,7 @@ fn find_build_files(
 }
 
 fn eval_file(path: &Path, pkg: &str, loader: &BuildFileLoader) -> anyhow::Result<RunResult> {
-    let ast: AstModule =
-        AstModule::parse_file(path, &Dialect::Extended).map_err(starlark::Error::into_anyhow)?;
+    let ast = parse_build_file(path)?;
     // Normal build path: provenance capture off (walking the call stack per
     // target() is needless overhead unless tooling asks for it).
     eval_ast(ast, pkg, loader, false)
@@ -2083,7 +2198,10 @@ pub(crate) fn eval_source(
 }
 
 /// The name closest to `name` among `candidates`, if any is a plausible typo.
-fn closest<'a>(name: &str, candidates: impl Iterator<Item = &'a str>) -> Option<&'a str> {
+pub(crate) fn closest<'a>(
+    name: &str,
+    candidates: impl Iterator<Item = &'a str>,
+) -> Option<&'a str> {
     candidates
         .map(|c| (strsim::levenshtein(name, c), c))
         .filter(|(d, c)| *d <= 2.max(name.len().max(c.len()) / 3))
@@ -2094,15 +2212,17 @@ fn closest<'a>(name: &str, candidates: impl Iterator<Item = &'a str>) -> Option<
 /// Every `heph.<plugin>.<fn>` a BUILD file names must exist. Checked against the
 /// registry before evaluation, so an unknown plugin or function fails with the
 /// file and line and what does exist — an agent recovers from the text alone,
-/// instead of reading Starlark's "object has no attribute". `heph.core.*` is the
-/// static namespace, not a plugin's; a file that binds `heph` itself is left
+/// instead of reading Starlark's "object has no attribute". heph's static
+/// namespaces ([`STATIC_NAMESPACES`](hplugin::function::STATIC_NAMESPACES)) are
+/// not a plugin's: `heph.types.<alias>` is checked against the aliases, and
+/// `heph.core.*` is left to evaluation. A file that binds `heph` itself is left
 /// alone.
 pub(crate) fn check_function_refs(
     ast: &AstModule,
     registry: &FunctionRegistry,
 ) -> anyhow::Result<()> {
-    use crate::pluginbuildfile::lsp::diagnostics::walk_expr;
-    use crate::pluginbuildfile::lsp::site::bound_names;
+    use crate::pluginbuildfile::ast::{bound_names, walk_expr};
+    use crate::pluginbuildfile::types;
     use starlark::syntax::ast::Expr;
 
     if bound_names(ast).contains("heph") {
@@ -2133,7 +2253,14 @@ pub(crate) fn check_function_refs(
             let Some(plugin) = plugin else {
                 return;
             };
-            if plugin == "core" {
+            if hplugin::function::STATIC_NAMESPACES.contains(&plugin) {
+                if plugin == types::NAMESPACE
+                    && let Some(alias) = func
+                    && let Some(why) = types::unknown_alias(alias)
+                {
+                    let at = ast.file_span(span);
+                    problem = Some(format!("{at}: heph.{plugin}.{alias}: {why}"));
+                }
                 return;
             }
             let at = ast.file_span(span);
@@ -2253,7 +2380,7 @@ fn eval_ast(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::pluginbuildfile::provider::FunctionSource;
     use hcore::htvalue::signature::Param;
@@ -2641,7 +2768,7 @@ mod tests {
         Arc::new(reg)
     }
 
-    fn source_loader(root: PathBuf) -> BuildFileLoader {
+    pub(crate) fn source_loader(root: PathBuf) -> BuildFileLoader {
         let patterns = vec![glob::Pattern::new("BUILD").unwrap()];
         let walker = Arc::new(CachedWalker::disabled());
         BuildFileLoader::new(

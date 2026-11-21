@@ -226,21 +226,40 @@ pub fn register_builtin_factories(
     e: &mut engine::Engine,
     home_dir: &std::path::Path,
 ) -> anyhow::Result<()> {
+    register_builtin_factories_with(e, home_dir, pluginbuildfile::ShadowedChecks::default())
+}
+
+/// [`register_builtin_factories`], with the buildfile provider recording its
+/// shadowed check targets into `shadowed`, which `heph validate` reads.
+/// Public so `crates/e2e` builds the buildfile plugin through this factory
+/// and reads the same record.
+pub fn register_builtin_factories_with(
+    e: &mut engine::Engine,
+    home_dir: &std::path::Path,
+    shadowed: pluginbuildfile::ShadowedChecks,
+) -> anyhow::Result<()> {
     use engine::PluginParts;
-    e.register_plugin_factory("buildfile", |init, opts| {
-        Ok(PluginParts::default().with_provider(Box::new(
-            pluginbuildfile::Provider::from_options(
-                init.root.to_path_buf(),
-                &init.skip_dirs,
-                &init.skip_globs,
-                opts,
-                init.runtime.clone(),
-            )?
-            .with_walker(init.walker.clone())
-            // `heph.<plugin>.<fn>`: read from this engine's registry once
-            // sealed, before the first BUILD evaluation.
-            .with_functions(Arc::clone(&init.functions)),
-        )))
+    e.register_plugin_factory("buildfile", move |init, opts| {
+        // The provider (with the check targets) and the drivers that run
+        // them, from one decode of the options.
+        let parts = pluginbuildfile::plugin_parts(
+            pluginbuildfile::PartsInit {
+                root: init.root.to_path_buf(),
+                skip_dirs: &init.skip_dirs,
+                skip_globs: &init.skip_globs,
+                runtime: init.runtime.clone(),
+                walker: init.walker.clone(),
+                // `heph.<plugin>.<fn>`: read from this engine's registry once
+                // sealed, before the first BUILD evaluation.
+                functions: Arc::clone(&init.functions),
+                shadowed: shadowed.clone(),
+            },
+            opts,
+        )?;
+        Ok(parts.drivers.into_iter().fold(
+            PluginParts::default().with_provider(Box::new(parts.provider)),
+            PluginParts::with_managed_driver,
+        ))
     })?;
     // The exec and bash drivers take a closure rather than the path itself, so
     // `plugin-exec` — which most of the workspace links — does not have to
@@ -287,7 +306,51 @@ pub fn new_engine(
     global: &super::GlobalOptions,
     session: &Arc<SessionSlot>,
 ) -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
-    new_engine_with(global, BadEnv::Refuse, Some(session))
+    new_engine_with(
+        global,
+        BadEnv::Refuse,
+        Some(session),
+        pluginbuildfile::ShadowedChecks::default(),
+    )
+}
+
+/// [`new_engine`] for `heph validate`: also returns the record the buildfile
+/// provider keeps of every check target a package's own target shadows (I2),
+/// filled as the provider lists each package.
+pub fn new_validate_engine(
+    global: &super::GlobalOptions,
+    session: &Arc<SessionSlot>,
+) -> anyhow::Result<(
+    Arc<engine::Engine>,
+    ShutdownTrigger,
+    pluginbuildfile::ShadowedChecks,
+)> {
+    new_validate_engine_at(&workspace_root()?, global, Some(session))
+}
+
+/// [`new_validate_engine`] over the workspace at `root` instead of the one
+/// the cwd resolves to (`get_root` is memoized from the cwd), so a test can
+/// build validate's engine through the same path.
+pub fn new_validate_engine_at(
+    root: &std::path::Path,
+    global: &super::GlobalOptions,
+    session: Option<&Arc<SessionSlot>>,
+) -> anyhow::Result<(
+    Arc<engine::Engine>,
+    ShutdownTrigger,
+    pluginbuildfile::ShadowedChecks,
+)> {
+    let shadowed = pluginbuildfile::ShadowedChecks::default();
+    let (engine, trigger) = new_engine_at(root, global, BadEnv::Refuse, session, shadowed.clone())?;
+    Ok((engine, trigger, shadowed))
+}
+
+/// The workspace root resolved from the cwd.
+fn workspace_root() -> anyhow::Result<std::path::PathBuf> {
+    match engine::get_root() {
+        Ok(r) => Ok(r),
+        Err(inner) => anyhow::bail!("Error: {}", inner),
+    }
 }
 
 /// The engine for a caller with no command line of its own: shell
@@ -296,7 +359,12 @@ pub fn new_engine(
 /// with a warning there rather than breaking `<TAB>` or `git push`; the next
 /// real command still refuses it. They record no session.
 pub fn new_helper_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
-    new_engine_with(&super::GlobalOptions::default(), BadEnv::Ignore, None)
+    new_engine_with(
+        &super::GlobalOptions::default(),
+        BadEnv::Ignore,
+        None,
+        pluginbuildfile::ShadowedChecks::default(),
+    )
 }
 
 /// An engine over `root`'s home that only reads what other hephs wrote
@@ -393,13 +461,19 @@ fn new_engine_with(
     global: &super::GlobalOptions,
     bad_env: BadEnv,
     session: Option<&Arc<SessionSlot>>,
+    shadowed: pluginbuildfile::ShadowedChecks,
 ) -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
-    let root = match engine::get_root() {
-        Ok(r) => r,
-        Err(inner) => anyhow::bail!("Error: {}", inner),
-    };
+    new_engine_at(&workspace_root()?, global, bad_env, session, shadowed)
+}
 
-    let (file, config) = engine_config(&root, global, bad_env, std::env::vars_os())?;
+fn new_engine_at(
+    root: &std::path::Path,
+    global: &super::GlobalOptions,
+    bad_env: BadEnv,
+    session: Option<&Arc<SessionSlot>>,
+    shadowed: pluginbuildfile::ShadowedChecks,
+) -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
+    let (file, config) = engine_config(root, global, bad_env, std::env::vars_os())?;
 
     // Point `SIGQUIT` dumps at the resolved home as soon as it is known — before
     // the engine is built and plugins are downloaded and loaded, which is where
@@ -411,7 +485,7 @@ fn new_engine_with(
     // and the cwd heph resolved it from (`HEPH_CWD` when set).
     let cwd = engine::get_cwd().context("resolving the working directory")?;
     if let Some(session) = session {
-        session.set_workspace(&cwd, &root, &config.home_dir);
+        session.set_workspace(&cwd, root, &config.home_dir);
     }
 
     // Captured before `config` is moved into the engine: the nix driver's state
@@ -443,7 +517,7 @@ fn new_engine_with(
     // `fs` (provider + driver) is registered by `Engine::new` itself, with the
     // engine's own skip dirs. The remaining built-ins have no config.
     register_builtin_plugins(&mut e, &home_dir)?;
-    register_builtin_factories(&mut e, &home_dir)?;
+    register_builtin_factories_with(&mut e, &home_dir, shadowed)?;
 
     // Apply every `plugins:` entry: a `builtin:` instantiates the matching
     // factory above; a `path:`/`url:` resolves a manifest, loads the cdylib, and
@@ -915,6 +989,10 @@ plugins:
             [
                 "auth.credential",
                 "bash",
+                // The BUILD-file check targets' drivers.
+                "buildfile.format",
+                "buildfile.format_check",
+                "buildfile.lint_check",
                 "exec",
                 "fs",
                 "group",

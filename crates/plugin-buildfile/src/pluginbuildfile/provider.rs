@@ -1,3 +1,5 @@
+use crate::pluginbuildfile::checks::loads::walk_package;
+use crate::pluginbuildfile::checks::targets::{self, CheckKind, ChecksOptions, ShadowedChecks};
 use crate::pluginbuildfile::run_file::RunResult;
 use anyhow::Context;
 use futures::future::BoxFuture;
@@ -193,6 +195,16 @@ pub struct Provider {
     ///
     /// [`with_walker`]: Provider::with_walker
     pub(crate) walker: Arc<CachedWalker>,
+    /// The check targets (`build-lint-check`, `build-format-check`,
+    /// `build-format`) and their options, or `None`: a provider built alone
+    /// synthesizes nothing, since only [`plugin_parts`] also registers the
+    /// drivers that run them.
+    ///
+    /// [`plugin_parts`]: crate::pluginbuildfile::plugin_parts
+    pub(crate) checks: Option<ChecksOptions>,
+    /// Where `list` records each check target a package's own target
+    /// shadows (I2), for `heph validate`. Written only with the checks on.
+    pub(crate) shadowed: ShadowedChecks,
 }
 
 impl Provider {
@@ -215,6 +227,8 @@ impl Provider {
             functions: FunctionSource::default(),
             globals: Arc::new(OnceLock::new()),
             walker: Arc::new(CachedWalker::disabled()),
+            checks: None,
+            shadowed: ShadowedChecks::default(),
         }
     }
 }
@@ -286,6 +300,75 @@ impl Provider {
         self
     }
 
+    /// List and resolve the three check targets in every package with a
+    /// BUILD file. Only [`plugin_parts`](crate::pluginbuildfile::plugin_parts)
+    /// calls this, beside registering the drivers that run them.
+    pub(crate) fn with_checks(mut self, opts: ChecksOptions) -> Self {
+        self.checks = Some(opts);
+        self
+    }
+
+    /// Record shadowed check targets into `shadowed`, a handle the caller
+    /// keeps (`heph validate` reads it).
+    pub(crate) fn with_shadowed_checks(mut self, shadowed: ShadowedChecks) -> Self {
+        self.shadowed = shadowed;
+        self
+    }
+
+    /// Whether `pkg`'s directory holds a BUILD file: what decides that it
+    /// gets the check targets. The same rule [`walk_package`] and evaluation
+    /// apply.
+    async fn has_build_file(&self, pkg: &str) -> anyhow::Result<bool> {
+        if hmodel::htpkg::join_rel_checked("", pkg).is_err() {
+            return Ok(false);
+        }
+        let dir = self.root.join(pkg);
+        let walker = Arc::clone(&self.walker);
+        let patterns = self.build_file_patterns.clone();
+        hcore::blocking::run(move || {
+            if !dir.is_dir() {
+                return Ok(false);
+            }
+            Ok(
+                !crate::pluginbuildfile::run_file::find_build_files(&walker, &dir, &patterns)?
+                    .is_empty(),
+            )
+        })
+        .await
+    }
+
+    /// The spec of check `kind` in `pkg`: the package's load walk, run off
+    /// the async workers, then the kind's spec. The walk is not cached, so
+    /// it runs once per check target `get`: three times per package when all
+    /// three checks resolve (perf-measurement decides whether that needs a
+    /// cache).
+    async fn check_spec(
+        &self,
+        addr: &Addr,
+        kind: CheckKind,
+        opts: ChecksOptions,
+    ) -> anyhow::Result<TargetSpec> {
+        let root = self.root.clone();
+        let walker = Arc::clone(&self.walker);
+        let patterns = self.build_file_patterns.clone();
+        let pkg = addr.package.as_str().to_string();
+        let walk = hcore::blocking::run(move || walk_package(&root, &walker, &pkg, &patterns))
+            .await
+            .with_context(|| format!("walking the loads of //{}", addr.package.as_str()))?;
+        match kind {
+            CheckKind::LintCheck => {
+                let registry = self
+                    .functions
+                    .registry()
+                    .context("reading the `heph.<plugin>.<fn>` names for build-lint-check")?;
+                // Only their digest reaches the spec.
+                let fns = registry.iter().map(|(p, f, _)| (p, f));
+                targets::lint_spec(addr.clone(), &walk, opts, &self.build_file_patterns, fns)
+            }
+            kind => Ok(targets::format_spec(addr.clone(), kind, &walk, opts)),
+        }
+    }
+
     /// The shared, sorted package list, bound on first use to this provider's
     /// configured `root`/`patterns`/`skip`/`walker`.
     pub(crate) fn packages(&self) -> Arc<PackageList> {
@@ -309,7 +392,13 @@ impl Provider {
         hplugin::config::deny_unknown(
             "buildfile provider",
             opts,
-            &["patterns", "skip", "defaultDriver", "indent"],
+            &[
+                "patterns",
+                "skip",
+                "defaultDriver",
+                "indent",
+                "requireTypeAnnotations",
+            ],
         )?;
         let compiled = build_file_patterns_from_options(opts)?;
         // Engine-wide `fs.skip` globs are merged ahead of this provider's own
@@ -561,6 +650,39 @@ impl EProvider for Provider {
             }
             let res = self.run_pkg(req.package.as_str()).await?;
 
+            // The check targets, in every package with a BUILD file, but for
+            // one a target of the package shadows (I2): that name is listed
+            // once, as the user's, and recorded for `heph validate`.
+            let mut checks = Vec::new();
+            if self.checks.is_some() && self.has_build_file(req.package.as_str()).await? {
+                let shadowed = targets::shadowed(res.targets.iter().map(|t| t.name.as_str()));
+                self.shadowed.record(
+                    req.package.as_str(),
+                    targets::shadowed_checks(
+                        &self.root,
+                        &req.package,
+                        res.targets
+                            .iter()
+                            .map(|t| (t.name.as_str(), t.provenance.as_slice())),
+                    ),
+                );
+                checks.extend(
+                    CheckKind::ALL
+                        .into_iter()
+                        .filter(|k| !shadowed.contains(k.name()))
+                        .map(|k| {
+                            Ok(ListResponse::with_facts(
+                                Addr::new(
+                                    req.package.clone(),
+                                    k.name().to_string(),
+                                    Default::default(),
+                                ),
+                                k.facts(),
+                            ))
+                        }),
+                );
+            }
+
             let items: Vec<anyhow::Result<ListResponse>> = res
                 .targets
                 .iter()
@@ -586,6 +708,7 @@ impl EProvider for Provider {
                         facts,
                     ))
                 })
+                .chain(checks)
                 .collect();
 
             Ok(Box::new(items.into_iter())
@@ -679,6 +802,24 @@ impl EProvider for Provider {
                         },
                     });
                 }
+            }
+
+            // No target of the package has the name, so a check's name is
+            // the check (a user target with it was answered above, I2). The
+            // package was evaluated first: a BUILD file that fails to
+            // evaluate fails `get` of a check with its error.
+            if let (Some(opts), Some(kind)) = (self.checks, CheckKind::from_name(&req.addr.name))
+                && req.addr.args.is_empty()
+                && self
+                    .has_build_file(req.addr.package.as_str())
+                    .await
+                    .map_err(GetError::Other)?
+            {
+                let target_spec = self
+                    .check_spec(&req.addr, kind, opts)
+                    .await
+                    .map_err(GetError::Other)?;
+                return Ok(GetResponse { target_spec });
             }
 
             Err(NotFound)
@@ -1793,5 +1934,316 @@ provider_state(provider = "go", root = "src", strict = True)
         };
         let msg = format!("{err:#}");
         assert!(msg.contains("missing provider"), "{msg}");
+    }
+
+    // ---- the check targets ------------------------------------------------
+
+    const CHECKS: [&str; 3] = ["build-lint-check", "build-format-check", "build-format"];
+
+    /// A workspace holding `files`, and a provider over it with the checks on
+    /// (as `plugin_parts` builds it) or off (`Provider` alone).
+    fn checks_ws(files: &[(&str, &str)], checks: bool) -> (tempfile::TempDir, Provider) {
+        let tmp = tempdir().expect("tempdir");
+        for (path, content) in files {
+            let abs = tmp.path().join(path);
+            fs::create_dir_all(abs.parent().expect("parent")).expect("mkdir");
+            fs::write(&abs, content).expect("write");
+        }
+        let provider = checks_provider(tmp.path(), checks);
+        (tmp, provider)
+    }
+
+    /// A fresh provider over `root`, as the next `heph` invocation builds.
+    fn checks_provider(root: &std::path::Path, checks: bool) -> Provider {
+        let mut opts = Options::new();
+        opts.insert(
+            "defaultDriver".to_string(),
+            serde_yaml::Value::String("exec".to_string()),
+        );
+        opts.insert(
+            "skip".to_string(),
+            serde_yaml::from_str("[skipped]").expect("yaml"),
+        );
+        let provider = Provider::from_options(root.to_path_buf(), &[], &[], &opts, test_runtime())
+            .expect("provider");
+        if checks {
+            provider.with_checks(ChecksOptions::default())
+        } else {
+            provider
+        }
+    }
+
+    async fn listed(provider: &Provider, pkg: &str) -> Vec<hplugin::provider::ListResponse> {
+        provider
+            .list(
+                ListRequest {
+                    request_id: "test".to_string(),
+                    package: PkgBuf::from(pkg),
+                    states: vec![],
+                    executor: Arc::new(NoopExecutor),
+                },
+                &StdCancellationToken::new(),
+            )
+            .await
+            .expect("list")
+            .map(|r| r.expect("entry"))
+            .collect()
+    }
+
+    fn names(listed: &[hplugin::provider::ListResponse]) -> Vec<String> {
+        listed.iter().map(|r| r.addr.name.clone()).collect()
+    }
+
+    async fn get_check(
+        provider: &Provider,
+        pkg: &str,
+        name: &str,
+    ) -> Result<GetResponse, GetError> {
+        provider
+            .get(get_req(pkg, name), &StdCancellationToken::new())
+            .await
+    }
+
+    #[tokio::test]
+    async fn lists_check_targets() {
+        let (_tmp, provider) = checks_ws(&[("pkg/BUILD", "target(name = \"t\")\n")], true);
+        let listed = listed(&provider, "pkg").await;
+        assert_eq!(names(&listed), ["t", CHECKS[0], CHECKS[1], CHECKS[2]]);
+        let facts = |name: &str| {
+            &listed
+                .iter()
+                .find(|r| r.addr.name == name)
+                .expect("listed")
+                .facts
+        };
+        for (name, labels, driver, codegen) in [
+            (
+                "build-lint-check",
+                &["build-lint-check", "lint-check"][..],
+                "buildfile.lint_check",
+                false,
+            ),
+            (
+                "build-format-check",
+                &["build-format-check", "format-check"][..],
+                "buildfile.format_check",
+                false,
+            ),
+            (
+                "build-format",
+                &["build-format", "fix", "format"][..],
+                "buildfile.format",
+                true,
+            ),
+        ] {
+            let f = facts(name);
+            let labels: Vec<String> = labels.iter().map(|l| (*l).to_string()).collect();
+            assert_eq!(f.labels(), Some(&labels[..]), "{name}");
+            assert_eq!(f.driver(), Some(driver), "{name}");
+            assert_eq!(f.has_codegen(), Some(codegen), "{name}");
+        }
+    }
+
+    /// Every fact `list` reports for a check equals what `get` and the
+    /// driver's `parse` give: the labels and driver from the spec, and
+    /// `has_codegen` from whether the def has an `in_place` output.
+    #[tokio::test]
+    async fn check_listed_facts_equal_spec_and_def() {
+        use hplugin::driver::targetdef::path::CodegenMode;
+        let (_tmp, provider) = checks_ws(
+            &[
+                ("pkg/BUILD", "load(\"//lib/defs.star\", \"X\")\n"),
+                ("lib/defs.star", "X = 1\n"),
+            ],
+            true,
+        );
+        for entry in listed(&provider, "pkg").await {
+            let spec = get_check(&provider, "pkg", &entry.addr.name)
+                .await
+                .expect("get")
+                .target_spec;
+            let mut labels = spec.labels.clone();
+            labels.sort();
+            assert_eq!(entry.facts.labels(), Some(&labels[..]));
+            assert_eq!(entry.facts.driver(), Some(spec.driver.as_str()));
+            let spec_labels = spec.labels.clone();
+            let def = crate::pluginbuildfile::checks::drivers::parse_spec(spec, "v1");
+            assert_eq!(def.labels, spec_labels);
+            let codegen = def
+                .outputs
+                .iter()
+                .flat_map(|o| &o.paths)
+                .any(|p| p.codegen_tree != CodegenMode::None);
+            assert_eq!(
+                entry.facts.has_codegen(),
+                Some(codegen),
+                "{}",
+                entry.addr.name
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn lists_check_targets_without_targets() {
+        let (_tmp, provider) = checks_ws(
+            &[
+                ("empty/BUILD", "# nothing\n"),
+                ("helper/defs.BUILD", "X = 1\n"),
+            ],
+            true,
+        );
+        assert_eq!(names(&listed(&provider, "empty").await), CHECKS);
+        assert_eq!(names(&listed(&provider, "helper").await), CHECKS);
+        for name in CHECKS {
+            get_check(&provider, "helper", name)
+                .await
+                .expect("resolves");
+        }
+    }
+
+    #[tokio::test]
+    async fn check_targets_not_found() {
+        let (_tmp, provider) = checks_ws(
+            &[
+                ("pkg/BUILD", "X = 1\n"),
+                ("nobuild/defs.star", "X = 1\n"),
+                ("skipped/BUILD", "X = 1\n"),
+            ],
+            true,
+        );
+        for (pkg, name) in [
+            ("nobuild", "build-lint-check"),
+            ("missing", "build-format"),
+            ("pkg", "build-lint-checkx"),
+            ("pkg", "build-lint"),
+            ("skipped", "build-format-check"),
+        ] {
+            assert!(
+                matches!(get_check(&provider, pkg, name).await, Err(NotFound)),
+                "//{pkg}:{name}"
+            );
+        }
+        assert!(listed(&provider, "nobuild").await.is_empty());
+        assert!(listed(&provider, "skipped").await.is_empty());
+        // A check addr with args is not a check.
+        let mut req = get_req("pkg", "build-format");
+        req.addr = Addr::new(
+            PkgBuf::from("pkg"),
+            "build-format".to_string(),
+            std::collections::BTreeMap::from([("x".to_string(), "1".to_string())]),
+        );
+        assert!(matches!(
+            provider.get(req, &StdCancellationToken::new()).await,
+            Err(NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn bare_provider_lists_no_checks() {
+        let (_tmp, provider) = checks_ws(&[("pkg/BUILD", "target(name = \"t\")\n")], false);
+        assert_eq!(names(&listed(&provider, "pkg").await), ["t"]);
+        for name in CHECKS {
+            assert!(matches!(
+                get_check(&provider, "pkg", name).await,
+                Err(NotFound)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn eval_error_not_not_found() {
+        let (_tmp, provider) = checks_ws(&[("pkg/BUILD", "fail(\"broken here\")\n")], true);
+        for name in CHECKS {
+            match get_check(&provider, "pkg", name).await {
+                Err(GetError::Other(e)) => {
+                    let msg = format!("{e:#}");
+                    assert!(msg.contains("broken here"), "{name}: {msg}");
+                }
+                Err(NotFound) => panic!("{name}: NotFound"),
+                Ok(_) => panic!("{name}: resolved"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn user_target_shadows_check() {
+        let (_tmp, provider) = checks_ws(
+            &[(
+                "pkg/BUILD",
+                "target(name = \"build-format\", driver = \"mine\")\n",
+            )],
+            true,
+        );
+        let listed = listed(&provider, "pkg").await;
+        assert_eq!(
+            names(&listed),
+            ["build-format", "build-lint-check", "build-format-check"]
+        );
+        let spec = get_check(&provider, "pkg", "build-format")
+            .await
+            .expect("get")
+            .target_spec;
+        assert_eq!(spec.driver, "mine");
+        assert_eq!(
+            crate::pluginbuildfile::checks::targets::shadowed(["build-format", "t"])
+                .into_iter()
+                .collect::<Vec<_>>(),
+            ["build-format"]
+        );
+    }
+
+    /// The shadow record follows the BUILD file: once the conflict is fixed,
+    /// listing the package again clears what was recorded for it. `run_pkg`
+    /// is memoized per provider, so the second list is a fresh provider (the
+    /// next `heph` invocation) writing to the same record.
+    #[tokio::test]
+    async fn shadow_record_cleared_when_fixed() {
+        let shadowed = ShadowedChecks::default();
+        let (tmp, provider) = checks_ws(
+            &[(
+                "pkg/BUILD",
+                "target(name = \"build-format\", driver = \"mine\")\n",
+            )],
+            true,
+        );
+        let provider = provider.with_shadowed_checks(shadowed.clone());
+        listed(&provider, "pkg").await;
+        let found: Vec<String> = shadowed.all().iter().map(|s| s.addr.format()).collect();
+        assert_eq!(found, ["//pkg:build-format"]);
+
+        fs::write(
+            tmp.path().join("pkg/BUILD"),
+            "target(name = \"fmt\", driver = \"mine\")\n",
+        )
+        .expect("fix the BUILD file");
+        let provider = checks_provider(tmp.path(), true).with_shadowed_checks(shadowed.clone());
+        listed(&provider, "pkg").await;
+        assert!(shadowed.all().is_empty(), "{:?}", shadowed.all());
+    }
+
+    #[test]
+    fn option_decodes() {
+        let decode = |yaml: &str| {
+            let opts: Options = serde_yaml::from_str(yaml).expect("yaml");
+            ChecksOptions::from_options(&opts)
+        };
+        assert_eq!(decode("{}").expect("ok"), ChecksOptions::default());
+        assert!(!ChecksOptions::default().require_type_annotations);
+        assert!(
+            decode("{requireTypeAnnotations: true}")
+                .expect("ok")
+                .require_type_annotations
+        );
+        assert_eq!(decode("{indent: 2}").expect("ok").indent, 2);
+        let err = decode("{requireTypeAnnotations: \"yes\"}").expect_err("a string is refused");
+        assert!(
+            format!("{err:#}").contains("requireTypeAnnotations"),
+            "{err:#}"
+        );
+        // The provider accepts the key.
+        let dir = tempdir().expect("tempdir");
+        let opts: Options = serde_yaml::from_str("{requireTypeAnnotations: true}").expect("yaml");
+        Provider::from_options(dir.path().to_path_buf(), &[], &[], &opts, test_runtime())
+            .expect("accepted");
     }
 }

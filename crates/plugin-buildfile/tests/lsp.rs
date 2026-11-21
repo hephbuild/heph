@@ -62,6 +62,8 @@ struct FakeEngine {
     root: PathBuf,
     registry: Arc<FunctionRegistry>,
     gate: Option<Arc<Gate>>,
+    /// The buildfile plugin's `options:`.
+    buildfile: hplugin::config::Options,
 }
 
 impl FakeEngine {
@@ -198,8 +200,12 @@ impl LspEngine for FakeEngine {
             ],
         })
     }
-    fn provider_options(&self, _name: &str) -> hplugin::config::Options {
-        hplugin::config::Options::default()
+    fn provider_options(&self, name: &str) -> hplugin::config::Options {
+        if name == "buildfile" {
+            self.buildfile.clone()
+        } else {
+            hplugin::config::Options::default()
+        }
     }
 }
 
@@ -349,6 +355,15 @@ impl Lsp {
         gate: Option<Arc<Gate>>,
         options: plugin_buildfile::pluginbuildfile::LspRunOptions,
     ) -> Lsp {
+        Lsp::with_buildfile(gate, options, hplugin::config::Options::default())
+    }
+
+    /// [`Lsp::with`], the workspace's buildfile options set to `buildfile`.
+    fn with_buildfile(
+        gate: Option<Arc<Gate>>,
+        options: plugin_buildfile::pluginbuildfile::LspRunOptions,
+        buildfile: hplugin::config::Options,
+    ) -> Lsp {
         let dir = tempfile::tempdir().expect("tempdir");
         // Canonical, so macOS `/var` vs `/private/var` never splits a path.
         let root = dir.path().canonicalize().expect("canonical root");
@@ -361,6 +376,7 @@ impl Lsp {
             root,
             registry: registry(),
             gate: gate.clone(),
+            buildfile,
         });
         let (client, server_end) = Connection::memory();
         let handle = rt.handle().clone();
@@ -1101,10 +1117,57 @@ fn completion_after_heph_dot_lists_plugins_and_core() {
     let mut lsp = Lsp::start();
     let doc = lsp.open("BUILD", "x = heph.│\n");
     let result = lsp.completion(&doc);
-    assert_eq!(labels(&result), vec!["core", "fs"], "sorted, nothing else");
+    assert_eq!(
+        labels(&result),
+        vec!["core", "fs", "types"],
+        "sorted, nothing else"
+    );
     for item in items(&result) {
         assert_eq!(item["kind"], json!(9), "MODULE kind: {item}");
     }
+}
+
+#[test]
+fn types_completion_and_hover() {
+    let mut lsp = Lsp::start();
+    let doc = lsp.open("BUILD", "def f(deps: heph.types.│):\n    pass\n");
+    let result = lsp.completion(&doc);
+    assert_eq!(
+        labels(&result),
+        vec![
+            "Addr",
+            "Deps",
+            "Env",
+            "Labels",
+            "Number",
+            "PassEnv",
+            "RuntimePassEnv",
+            "Tools"
+        ],
+        "every alias, nothing else"
+    );
+    let deps = item(&result, "Deps");
+    let expansion = deps["detail"].as_str().expect("detail").to_string();
+    assert!(
+        expansion.contains("list[str]") && expansion.contains("None"),
+        "the detail is the expansion: {deps}"
+    );
+
+    let doc = lsp.open(
+        "hover/BUILD",
+        "def f(deps: heph.types.De│ps = None):\n    pass\n",
+    );
+    let hover = lsp.hover(&doc);
+    let text = hover_text(&hover);
+    assert!(text.contains("heph.types.Deps"), "{text}");
+    assert!(
+        text.contains(&expansion),
+        "hover shows the expansion: {text}"
+    );
+    assert_eq!(
+        hover["contents"]["value"], deps["documentation"]["value"],
+        "hover and completion render the same doc"
+    );
 }
 
 #[test]
@@ -2233,7 +2296,7 @@ fn broken_unclosed_load_offers_symbols() {
 fn broken_plugin_namespace_with_broken_tail() {
     let mut lsp = Lsp::start();
     let doc = lsp.open("BUILD", "x = heph.│\ny = (\n");
-    assert_eq!(labels(&lsp.completion(&doc)), vec!["core", "fs"]);
+    assert_eq!(labels(&lsp.completion(&doc)), vec!["core", "fs", "types"]);
 }
 
 /// A field of literals completes its value to them, quoted the way a driver
@@ -2802,6 +2865,90 @@ fn parity_diagnostics_published_and_cleared_on_close() {
         .last_diagnostics(&doc)
         .expect("diagnostics re-published");
     assert!(cleared.is_empty(), "closing clears them: {cleared:?}");
+}
+
+/// The heph diagnostics for `text`, opened as a BUILD file in a server whose
+/// workspace sets `requireTypeAnnotations` to `on`.
+fn annotation_diagnostics(on: bool, text: &str) -> Vec<Value> {
+    let mut opts = hplugin::config::Options::default();
+    opts.insert(
+        "requireTypeAnnotations".to_string(),
+        serde_yaml::Value::Bool(on),
+    );
+    let mut lsp = Lsp::with_buildfile(
+        None,
+        plugin_buildfile::pluginbuildfile::LspRunOptions::default(),
+        opts,
+    );
+    lsp.initialize();
+    let doc = lsp.open("pkg/BUILD", text);
+    lsp.barrier();
+    lsp.last_diagnostics(&doc)
+        .expect("diagnostics published")
+        .into_iter()
+        .filter(|d| d["source"] == json!("heph"))
+        .collect()
+}
+
+#[test]
+fn require_annotations_diagnostic() {
+    // One untyped parameter, one typed; a type error in a def body; and a
+    // call the document cannot evaluate (an unknown name), so the marks come
+    // from the parse alone.
+    let text = "def make(name, count: int):\n    \
+                x: str = 1\n    \
+                return undefined_fn(name)\n\n\
+                def wrap(*args, **kwargs):\n    pass\n";
+    let on = annotation_diagnostics(true, text);
+    let marks: Vec<(String, Value)> = on
+        .iter()
+        .map(|d| {
+            (
+                d["message"].as_str().unwrap_or("").to_string(),
+                d["range"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        marks,
+        [
+            (
+                "parameter `name` of `make` has no type; add `: <type>`".to_string(),
+                json!({"start": {"line": 0, "character": 9}, "end": {"line": 0, "character": 13}}),
+            ),
+            (
+                "parameter `*args` of `wrap` has no type; add `: <type>`".to_string(),
+                json!({"start": {"line": 4, "character": 9}, "end": {"line": 4, "character": 14}}),
+            ),
+            (
+                "parameter `**kwargs` of `wrap` has no type; add `: <type>`".to_string(),
+                json!({"start": {"line": 4, "character": 16}, "end": {"line": 4, "character": 24}}),
+            ),
+        ],
+        "each missing annotation, at its parameter, and never the type error (E3)"
+    );
+    assert!(
+        annotation_diagnostics(false, text).is_empty(),
+        "nothing when the option is off"
+    );
+}
+
+#[test]
+fn require_annotations_exempts_a_literal_default() {
+    // `n = 1` is typed by its default; `o = None` is not.
+    let on = annotation_diagnostics(true, "def f(n = 1, o = None):\n    pass\n");
+    let marks: Vec<(&str, &Value)> = on
+        .iter()
+        .map(|d| (d["message"].as_str().unwrap_or(""), &d["range"]["start"]))
+        .collect();
+    assert_eq!(
+        marks,
+        [(
+            "parameter `o` of `f` has no type; add `: <type>`",
+            &json!({"line": 0, "character": 13}),
+        )],
+        "a mark on `o` only"
+    );
 }
 
 #[test]
