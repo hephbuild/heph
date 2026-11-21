@@ -132,6 +132,15 @@ fn until(rx: &mpsc::Receiver<String>, want: &str) -> String {
     seen
 }
 
+/// Read `rx` until a line containing `want`, returning that line.
+fn line_with(rx: &mpsc::Receiver<String>, want: &str) -> String {
+    let seen = until(rx, want);
+    seen.lines()
+        .find(|line| line.contains(want))
+        .unwrap_or_default()
+        .to_owned()
+}
+
 const LOG: &[u8] = b"l1\nl2\n\x1b[31mred\x1b[0m\nl4\nl5\n";
 
 /// `//p:t` prints [`LOG`], an escape sequence included; `//p:nonl` a log
@@ -322,7 +331,11 @@ fn log_cmd_follow_says_how_the_run_ended() {
             .expect("spawn heph run");
         let (mut stopped, stopped_err) = follow(&ws, addr);
         let (mut to_end, to_end_err) = follow(&ws, addr);
-        let status = until(&to_end_err, "· following");
+        // A follower that comes in after the run started but before its
+        // first byte says "· no output yet · following" first, and the line
+        // naming when it started only once that byte is there: wait for
+        // that one, not the first "following".
+        let status = line_with(&to_end_err, ", since ");
         assert!(
             status.contains(&format!("{addr} · running ")) && status.contains(", since 20"),
             "{addr}: when it started: {status}"
@@ -331,8 +344,11 @@ fn log_cmd_follow_says_how_the_run_ended() {
             status.contains(&format!("(heph run {addr}, pid ")),
             "{addr}: the session's command and pid: {status}"
         );
+        assert!(status.ends_with("· following"), "{addr}: {status}");
 
-        until(&stopped_err, "· following");
+        // Before the first byte there is no log yet, and ctrl-c would say it
+        // stopped before a run started (exit 1): wait for the log.
+        line_with(&stopped_err, ", since ");
         kill(stopped.id(), libc::SIGINT);
         let status = wait_exit(&mut stopped, "heph log -f after ctrl-c");
         assert!(status.success(), "{addr}: a log was found: {status}");
