@@ -976,6 +976,29 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
+    /// A source over an unsealed slot errs, and the error is not cached: the
+    /// same source (and every clone of it) builds the `Kwargs` once sealed.
+    #[test]
+    fn driver_source_read_before_seal() {
+        let slot = DriverSchemaSlot::new();
+        let source = DriverSource::engine(Arc::clone(&slot));
+        let clone = source.clone();
+        let err = source.kwargs().expect_err("unsealed");
+        assert!(
+            format!("{err:#}").contains("before every plugin was registered"),
+            "{err:#}"
+        );
+        assert!(source.kwargs.get().is_none(), "nothing cached");
+        let schemas = crate::pluginbuildfile::types::tests::test_schemas();
+        slot.seal_with(|| schemas);
+        let k = source.kwargs().expect("sealed");
+        assert!(k.at(&["bash"]).is_some());
+        assert!(
+            Arc::ptr_eq(&k, &clone.kwargs().expect("sealed")),
+            "built once, shared by clones"
+        );
+    }
+
     /// `Provider::list_packages` and the `heph.core.packages()` builtin are one
     /// list in one order.
     ///

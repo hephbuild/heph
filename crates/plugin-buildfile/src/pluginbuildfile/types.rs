@@ -37,7 +37,7 @@ use starlark::environment::GlobalsBuilder;
 use starlark::typing::{Ty, TyTypedKwargs};
 use starlark::values::{NoSerialize, StarlarkValue, starlark_value};
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 /// The `heph.<name>` namespace the aliases live in.
 pub(crate) const NAMESPACE: &str = "types";
@@ -261,8 +261,27 @@ impl Kwargs {
 pub(crate) struct DriverKwargs {
     /// Sorted by driver name.
     drivers: Vec<Kwargs>,
-    /// [`Self::digest`].
-    digest: String,
+    /// [`Self::digest`], built on first use.
+    digest: OnceLock<String>,
+}
+
+/// Why the driver `name` cannot be written as an attribute path under
+/// `heph.types`, or `None` when it can: an empty segment, a `Kwargs` segment,
+/// or a first segment that is a flat alias (`heph.types.Deps`), which keeps
+/// its meaning.
+fn unwritable(name: &str) -> Option<&'static str> {
+    for (i, s) in name.split('.').enumerate() {
+        if s.is_empty() {
+            return Some("an empty name segment");
+        }
+        if s == KWARGS {
+            return Some("a `Kwargs` name segment");
+        }
+        if i == 0 && get(s).is_some() {
+            return Some("a first segment named like a heph.types alias");
+        }
+    }
+    None
 }
 
 impl Default for DriverKwargs {
@@ -276,9 +295,8 @@ impl DriverKwargs {
     /// The `Kwargs` of every driver in `schemas`.
     ///
     /// A driver whose name cannot be written as an attribute path under
-    /// `heph.types` is left out: an empty segment, a `Kwargs` segment, or a
-    /// first segment that is a flat alias (`heph.types.Deps`), which keeps its
-    /// meaning. Registry names are lowercase, so none is in practice.
+    /// `heph.types` is left out, with a warning ([`unwritable`]). Registry
+    /// names follow the engine's `PLUGIN_NAME_RULE`, so none is in practice.
     pub(crate) fn from_schemas(schemas: &DriverSchemas) -> Self {
         let base = target_base_fields();
         let base_keys: Vec<(String, Ty)> = base
@@ -288,11 +306,17 @@ impl DriverKwargs {
             .collect();
         let drivers: Vec<Kwargs> = schemas
             .iter()
-            .filter(|(driver, _)| {
-                driver
-                    .split('.')
-                    .enumerate()
-                    .all(|(i, s)| !s.is_empty() && s != KWARGS && (i > 0 || get(s).is_none()))
+            .filter(|(driver, _)| match unwritable(driver) {
+                None => true,
+                Some(why) => {
+                    tracing::warn!(
+                        driver = driver.as_str(),
+                        reason = why,
+                        "driver has no heph.types.<driver>.Kwargs: its name is not an \
+                         attribute path under heph.types"
+                    );
+                    false
+                }
             })
             .map(|(driver, schema)| {
                 let mut keys: BTreeMap<String, Ty> = base_keys.iter().cloned().collect();
@@ -309,8 +333,10 @@ impl DriverKwargs {
                 }
             })
             .collect();
-        let digest = kwargs_digest(&drivers);
-        Self { drivers, digest }
+        Self {
+            drivers,
+            digest: OnceLock::new(),
+        }
     }
 
     /// No driver, shared: what a loader built without the engine's drivers sees.
@@ -322,8 +348,9 @@ impl DriverKwargs {
     /// The lint key's `driverKwargsDigest`: every `Kwargs` the checker sees,
     /// by driver name, then each key and its Starlark type. Only what reaches
     /// the checker: a schema's docs or `required` never move it.
+    /// Computed on the first call: only the lint check's spec and run read it.
     pub(crate) fn digest(&self) -> &str {
-        &self.digest
+        self.digest.get_or_init(|| kwargs_digest(&self.drivers))
     }
 
     /// The `Kwargs` of the driver whose name is `segments` joined by dots.
@@ -430,7 +457,9 @@ impl DriverKwargs {
             }
             let drivers: Vec<&str> = self.drivers.iter().map(|k| k.driver.as_str()).collect();
             return format!(
-                "no driver named \"{name}\"{}; heph.{NAMESPACE}.<driver>.{KWARGS} exists for: {}",
+                "no driver named \"{name}\"{}; heph.{NAMESPACE}.<driver>.{KWARGS} exists for: {}; \
+                 drivers come from the plugins listed in .hephconfig (`plugins:`): is \"{name}\" \
+                 named there?",
                 hint(&roots),
                 if drivers.is_empty() {
                     "(no driver is registered)".to_string()
@@ -456,11 +485,13 @@ impl DriverKwargs {
 /// The type of a `Kwargs` key for a field of type `t`: the field's type or
 /// `None`. A struct-shaped field (`transitive`, `approval`) is a
 /// `dict[str, typing.Any]`, at any depth: no Starlark type has fixed keys, and
-/// the key must accept everything the field does.
+/// the key must accept everything the field does. A float is `int | float`, at
+/// any depth: heph takes an int where a float is expected (`heph.types.Number`).
 fn key_ty(t: &ParamType) -> Ty {
     fn field(t: &ParamType) -> Ty {
         match t {
             ParamType::Struct(_) => Ty::dict(Ty::string(), Ty::any()),
+            ParamType::Float => Ty::union2(Ty::int(), Ty::float()),
             ParamType::Union(members) => Ty::unions(members.iter().map(field).collect()),
             ParamType::List(inner) => Ty::list(field(inner)),
             ParamType::Map(value) => Ty::dict(Ty::string(), field(value)),
@@ -615,14 +646,22 @@ pub(crate) mod tests {
         tempfile::TempDir,
         crate::pluginbuildfile::run_file::BuildFileLoader,
     ) {
-        let (tmp, loader) = source_loader();
-        (tmp, loader.with_driver_kwargs(test_kwargs()))
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let loader = crate::pluginbuildfile::run_file::tests::source_loader_with(
+            tmp.path().to_path_buf(),
+            test_kwargs(),
+        );
+        (tmp, loader)
     }
 
     /// The field each key is built from, by driver: `target()`'s, else the
     /// driver's.
     fn key_fields(driver: &str) -> BTreeMap<String, ParamType> {
-        let schemas = test_schemas();
+        key_fields_in(&test_schemas(), driver)
+    }
+
+    /// [`key_fields`], for `driver` in `schemas`.
+    fn key_fields_in(schemas: &DriverSchemas, driver: &str) -> BTreeMap<String, ParamType> {
         let base = target_base_fields();
         let mut fields: BTreeMap<String, ParamType> = schemas[driver]
             .fields
@@ -690,13 +729,52 @@ pub(crate) mod tests {
         eval_source("BUILD", src.to_string(), "pkg", &loader).expect("evaluates");
     }
 
+    /// What heph accepts for a field of type `t`: the schema, with an int
+    /// wherever a float is expected (`value_matches` in the LSP's diagnostics,
+    /// `heph.types.Number`).
+    fn heph_accepts(t: &ParamType) -> ParamType {
+        match t {
+            ParamType::Float => ParamType::union(vec![ParamType::Int, ParamType::Float]),
+            ParamType::List(inner) => ParamType::list(heph_accepts(inner)),
+            ParamType::Map(value) => ParamType::map(heph_accepts(value)),
+            ParamType::Union(members) => {
+                ParamType::union(members.iter().map(heph_accepts).collect())
+            }
+            ParamType::Struct(fields) => ParamType::Struct(
+                fields
+                    .iter()
+                    .map(|f| hcore::htvalue::signature::StructField {
+                        name: f.name.clone(),
+                        ty: heph_accepts(&f.ty),
+                    })
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
+    }
+
     /// Every value a field accepts passes its key, at runtime: a key is never
     /// narrower than its field (I3).
     #[test]
     fn kwargs_key_never_narrower_than_field() {
-        let near_misses = ["1", "1.5", "True", "[1]", "{\"k\": 1}", "\"s\"", "(\"a\",)"];
         let kwargs = test_kwargs();
-        let globals = build_globals(&FunctionRegistry::default(), &kwargs);
+        assert_never_narrower(&kwargs, &test_schemas());
+    }
+
+    /// [`kwargs_key_never_narrower_than_field`] over `kwargs`, built from
+    /// `schemas`.
+    fn assert_never_narrower(kwargs: &DriverKwargs, schemas: &DriverSchemas) {
+        let near_misses = [
+            "1",
+            "1.5",
+            "True",
+            "[1]",
+            "[1, 1.5]",
+            "{\"k\": 1}",
+            "\"s\"",
+            "(\"a\",)",
+        ];
+        let globals = build_globals(&FunctionRegistry::default(), kwargs);
         let eval_with = |src: &str| {
             Module::with_temp_heap(|module| {
                 let mut ev = Evaluator::new(&module);
@@ -706,7 +784,8 @@ pub(crate) mod tests {
             })
         };
         for k in &kwargs.drivers {
-            for (name, field) in key_fields(&k.driver) {
+            for (name, field) in key_fields_in(schemas, &k.driver) {
+                let field = heph_accepts(&field);
                 let mut candidates = samples(&field);
                 candidates.extend(near_misses.iter().map(|s| s.to_string()));
                 candidates.push("None".to_string());
@@ -754,7 +833,17 @@ pub(crate) mod tests {
             msg.contains(
                 "BUILD:1:5-27: heph.types.nope.Kwargs: no driver named \"nope\"; \
                  heph.types.<driver>.Kwargs exists for: bash, buildfile.format, \
-                 buildfile.format_check, buildfile.lint_check, oci, oci.image"
+                 buildfile.format_check, buildfile.lint_check, oci, oci.image; drivers come \
+                 from the plugins listed in .hephconfig (`plugins:`): is \"nope\" named there?"
+            ),
+            "{msg}"
+        );
+        // A namespace with no driver at that path has no `Kwargs`.
+        let msg = fails("x = heph.types.buildfile.Kwargs\n");
+        assert!(
+            msg.contains(
+                "heph.types.buildfile.Kwargs: heph.types.buildfile has no member \"Kwargs\"; \
+                 it has: format, format_check, lint_check"
             ),
             "{msg}"
         );
@@ -785,6 +874,164 @@ pub(crate) mod tests {
         // A driver namespace is a value; an attribute of a type is evaluation's.
         let src = "x = heph.types.oci\ny = heph.types.oci.image\n";
         eval_source("BUILD", src.to_string(), "pkg", &loader).expect("namespaces evaluate");
+        // No driver at all: the same hint.
+        let msg = DriverKwargs::default()
+            .unknown_member(&["nope", "Kwargs"])
+            .expect("unknown");
+        assert_eq!(
+            msg,
+            "no driver named \"nope\"; heph.types.<driver>.Kwargs exists for: (no driver is \
+             registered); drivers come from the plugins listed in .hephconfig (`plugins:`): is \
+             \"nope\" named there?"
+        );
+    }
+
+    fn schema_of(fields: Vec<(&str, ParamType)>) -> hplugin::driver::DriverSchema {
+        hplugin::driver::DriverSchema {
+            fields: fields
+                .into_iter()
+                .map(|(name, ty)| hplugin::driver::DriverField {
+                    name: name.to_string(),
+                    ty,
+                    doc: String::new(),
+                    required: false,
+                })
+                .collect(),
+            accepts_deferred: false,
+        }
+    }
+
+    /// A float field's key takes an int too, bare or nested (I3): heph takes
+    /// an int wherever it expects a float.
+    #[test]
+    fn kwargs_float_key_takes_int() {
+        let schemas = DriverSchemas::from([(
+            "num".to_string(),
+            schema_of(vec![
+                ("scale", ParamType::Float),
+                ("ratios", ParamType::list(ParamType::Float)),
+                ("weights", ParamType::map(ParamType::Float)),
+            ]),
+        )]);
+        let kwargs = DriverKwargs::from_schemas(&schemas);
+        let num = kwargs.at(&["num"]).expect("num");
+        let ty = |key: &str| {
+            num.keys
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, t)| t.to_string())
+                .expect("key")
+        };
+        assert_eq!(ty("scale"), "None | float | int");
+        assert_eq!(ty("ratios"), "None | list[float | int]");
+        assert_eq!(ty("weights"), "None | dict[str, float | int]");
+        assert_never_narrower(&kwargs, &schemas);
+        let globals = build_globals(&FunctionRegistry::default(), &kwargs);
+        let src = "def f(**kwargs: heph.types.num.Kwargs):\n    pass\n\
+                   f(scale = 1, ratios = [1, 1.5], weights = {\"k\": 2})\nf(scale = 1.5)\n";
+        Module::with_temp_heap(|module| {
+            let mut ev = Evaluator::new(&module);
+            ev.eval_module(parse("BUILD", src), &globals)
+                .map(drop)
+                .map_err(|e| format!("{e:#}"))
+        })
+        .expect("an int passes a float key");
+    }
+
+    /// A driver with no schema field: its keys are `target()`'s, but `driver`.
+    #[test]
+    fn kwargs_zero_field_driver() {
+        let schemas = DriverSchemas::from([("bare".to_string(), schema_of(vec![]))]);
+        let kwargs = DriverKwargs::from_schemas(&schemas);
+        let keys: Vec<&str> = kwargs
+            .at(&["bare"])
+            .expect("bare")
+            .keys
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .collect();
+        let mut base: Vec<String> = target_base_fields()
+            .into_iter()
+            .map(|f| f.name)
+            .filter(|n| n != "driver")
+            .collect();
+        base.sort();
+        assert_eq!(keys, base);
+    }
+
+    /// Each reason a driver gets no `Kwargs`, alone in a set with a driver
+    /// that does: it is left out, and the rest are kept.
+    #[test]
+    fn kwargs_unwritable_drivers_skipped() {
+        for (name, why) in [
+            ("", "an empty name segment"),
+            ("a..b", "an empty name segment"),
+            ("a.", "an empty name segment"),
+            ("Kwargs", "a `Kwargs` name segment"),
+            ("oci.Kwargs", "a `Kwargs` name segment"),
+            ("Deps", "a first segment named like a heph.types alias"),
+            ("Labels.x", "a first segment named like a heph.types alias"),
+        ] {
+            assert_eq!(unwritable(name), Some(why), "{name:?}");
+            let schemas = DriverSchemas::from([
+                (name.to_string(), schema_of(vec![])),
+                ("bash".to_string(), schema_of(vec![])),
+            ]);
+            let kwargs = DriverKwargs::from_schemas(&schemas);
+            let drivers: Vec<&str> = kwargs.drivers.iter().map(|k| k.driver.as_str()).collect();
+            assert_eq!(drivers, ["bash"], "{name:?} is skipped");
+        }
+        // A later segment may be named like an alias: only the first is read
+        // as one.
+        assert_eq!(unwritable("oci.Deps"), None);
+        assert_eq!(unwritable("buildfile.lint_check"), None);
+    }
+
+    /// The engine's `PLUGIN_NAME_RULE` (`crates/engine/src/engine/engine.rs`),
+    /// which every driver's name segments follow: duplicated, since this crate
+    /// does not depend on the engine. Keep the two in step.
+    const PLUGIN_NAME_RULE: &str = "[a-z_][a-z0-9_]*";
+
+    /// Whether `s` matches [`PLUGIN_NAME_RULE`].
+    fn matches_name_rule(s: &str) -> bool {
+        let mut chars = s.chars();
+        matches!(chars.next(), Some(c) if c.is_ascii_lowercase() || c == '_')
+            && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    }
+
+    /// No real driver name hits [`unwritable`]: no flat alias, and not
+    /// `Kwargs`, can be a segment the naming rule allows, nor can an empty one.
+    #[test]
+    fn unwritable_names_break_the_name_rule() {
+        assert!(matches_name_rule("bash") && matches_name_rule("_x1"));
+        assert!(!matches_name_rule(""));
+        assert!(
+            !matches_name_rule(KWARGS),
+            "{KWARGS} matches `{PLUGIN_NAME_RULE}`"
+        );
+        for a in aliases() {
+            assert!(
+                !matches_name_rule(a.name),
+                "{} matches `{PLUGIN_NAME_RULE}`",
+                a.name
+            );
+        }
+    }
+
+    /// `heph.types.<driver>.Kwargs` on an ordinary (not `**`) parameter is a
+    /// dict type at evaluation: known keys pass, an unknown key fails.
+    #[test]
+    fn kwargs_alias_on_plain_param() {
+        let (_tmp, loader) = kwargs_loader();
+        let def = "def f(k: heph.types.bash.Kwargs):\n    pass\n\n";
+        let ok = format!("{def}f({{\"run\": \"echo\", \"labels\": [\"l\"]}})\nf({{}})\n");
+        eval_source("BUILD", ok, "pkg", &loader).expect("known keys evaluate");
+        let bad = format!("{def}f({{\"rnu\": \"echo\"}})\n");
+        let Err(err) = eval_source("BUILD", bad, "pkg", &loader) else {
+            panic!("an unknown key evaluated");
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("`k`"), "names the parameter: {msg}");
     }
 
     /// The Goal example at evaluation: an unknown key and a wrong value each

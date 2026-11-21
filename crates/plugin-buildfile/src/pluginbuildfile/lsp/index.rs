@@ -286,6 +286,7 @@ mod tests {
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(hplugin::function::FunctionRegistry::default()),
+            crate::pluginbuildfile::types::DriverKwargs::empty(),
             Arc::new(std::sync::OnceLock::new()),
             Arc::clone(&walker),
             Arc::new(crate::pluginbuildfile::provider::PackageList::new(

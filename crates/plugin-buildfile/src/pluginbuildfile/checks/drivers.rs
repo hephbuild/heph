@@ -324,6 +324,12 @@ fn registry_fns<'r>(
 
 /// `kwargs`, checked against the digest the def was keyed on, as
 /// [`registry_fns`] checks the function names.
+///
+/// Today the provider and this driver share one `DriverSource`, built once, so
+/// the check compares a value with itself and a re-read can never trip it. It
+/// guards what would make the two differ: a future split of the source (the
+/// provider and the driver each building their own), or a def handed from one
+/// engine to another whose drivers differ.
 fn checked_kwargs<'k>(kwargs: &'k DriverKwargs, digest: &str) -> anyhow::Result<&'k DriverKwargs> {
     let actual = kwargs.digest();
     if actual != digest {

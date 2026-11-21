@@ -1599,8 +1599,7 @@ impl Provider {
                         // mid-await holding the permit.
                         let _slot = slot;
                         let loader =
-                            BuildFileLoader::new(root, patterns, file_cache, dir_cache, registry, globals, walker, packages, loads)
-                                .with_driver_kwargs(kwargs);
+                            BuildFileLoader::new(root, patterns, file_cache, dir_cache, registry, kwargs, globals, walker, packages, loads);
                         loader
                             .load_pkg(&key)
                             .with_context(|| format!("pkg: `{}`", key))
@@ -1627,8 +1626,9 @@ pub(crate) struct BuildFileLoader {
     /// and to check every `heph.<plugin>.<fn>` a BUILD file names.
     registry: Arc<FunctionRegistry>,
     /// Every driver's `heph.types.<driver>.Kwargs`. Used to build `globals`, and
-    /// to check every `heph.types.<…>` a BUILD file names. None by default
-    /// ([`Self::with_driver_kwargs`]).
+    /// to check every `heph.types.<…>` a BUILD file names. Every loader sharing
+    /// one `globals` must be given the same set: the globals are built once,
+    /// from whichever loader gets there first.
     kwargs: Arc<crate::pluginbuildfile::types::DriverKwargs>,
     /// Lazily-built, provider-lifetime Starlark globals (shared across loaders so
     /// the registry-driven namespace is built at most once).
@@ -1658,6 +1658,7 @@ impl BuildFileLoader {
         file_cache: Arc<Mutex<HashMap<PathBuf, Arc<RunResult>>>>,
         dir_cache: Arc<Mutex<HashMap<PathBuf, Arc<RunResult>>>>,
         registry: Arc<FunctionRegistry>,
+        kwargs: Arc<crate::pluginbuildfile::types::DriverKwargs>,
         globals: Arc<OnceLock<Globals>>,
         walker: Arc<CachedWalker>,
         packages: Arc<PackageList>,
@@ -1671,24 +1672,13 @@ impl BuildFileLoader {
             dir_cache,
             in_flight: Mutex::new(HashSet::new()),
             registry,
-            kwargs: crate::pluginbuildfile::types::DriverKwargs::empty(),
+            kwargs,
             globals,
             walker,
             packages,
             loads,
             chain,
         }
-    }
-
-    /// Expose `kwargs` as `heph.types.<driver>.Kwargs`. Set it before the
-    /// shared `globals` are first built: they are built once, from whichever
-    /// loader gets there first.
-    pub(crate) fn with_driver_kwargs(
-        mut self,
-        kwargs: Arc<crate::pluginbuildfile::types::DriverKwargs>,
-    ) -> Self {
-        self.kwargs = kwargs;
-        self
     }
 
     /// The Starlark globals for this loader, built once from the function
@@ -2260,25 +2250,35 @@ pub(crate) fn check_function_refs(
         return Ok(());
     }
     // `heph.types.a.b.c` → `["a", "b", "c"]`; `None` for anything else,
-    // `heph.types` alone included.
+    // `heph.types` alone included. The chain is judged before anything is
+    // allocated: every `Dot` node of the file comes through here.
     fn types_path(e: &starlark::syntax::ast::AstExpr) -> Option<Vec<&str>> {
-        let mut segs = Vec::new();
+        // Down to the root: how deep, and the segment right after it.
+        let mut depth = 0usize;
+        let mut first = None;
         let mut cur = e;
         while let Expr::Dot(inner, name) = &cur.node {
-            segs.push(name.node.as_str());
+            depth += 1;
+            first = Some(name.node.as_str());
             cur = inner;
         }
         match &cur.node {
             Expr::Identifier(id) if id.node.ident == "heph" => {}
             _ => return None,
         }
-        segs.reverse();
-        match segs.split_first() {
-            Some((first, rest)) if *first == types::NAMESPACE && !rest.is_empty() => {
-                Some(rest.to_vec())
-            }
-            _ => None,
+        if depth < 2 || first != Some(types::NAMESPACE) {
+            return None;
         }
+        let mut segs = Vec::with_capacity(depth - 1);
+        let mut cur = e;
+        while let Expr::Dot(inner, name) = &cur.node {
+            if matches!(&inner.node, Expr::Dot(..)) {
+                segs.push(name.node.as_str());
+            }
+            cur = inner;
+        }
+        segs.reverse();
+        Some(segs)
     }
     // `heph.<plugin>` → the plugin; `heph.<plugin>.<fn>` → also the function.
     fn plugin_ref(e: &starlark::syntax::ast::AstExpr) -> Option<&str> {
@@ -2807,14 +2807,14 @@ pub(crate) mod tests {
             provider.file_cache.clone(),
             provider.dir_cache.clone(),
             registry,
+            provider.drivers.kwargs()?,
             provider.globals.clone(),
             provider.walker.clone(),
             provider.packages(),
             // The provider's own registry, not a fresh one: two concurrent
             // `run_pkg` calls share it, and that sharing is the point.
             provider.loads.clone(),
-        )
-        .with_driver_kwargs(provider.drivers.kwargs()?);
+        );
         loader.load_pkg(pkg)
     }
 
@@ -2834,6 +2834,14 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn source_loader(root: PathBuf) -> BuildFileLoader {
+        source_loader_with(root, crate::pluginbuildfile::types::DriverKwargs::empty())
+    }
+
+    /// [`source_loader`], exposing `kwargs` as `heph.types.<driver>.Kwargs`.
+    pub(crate) fn source_loader_with(
+        root: PathBuf,
+        kwargs: Arc<crate::pluginbuildfile::types::DriverKwargs>,
+    ) -> BuildFileLoader {
         let patterns = vec![glob::Pattern::new("BUILD").unwrap()];
         let walker = Arc::new(CachedWalker::disabled());
         BuildFileLoader::new(
@@ -2842,6 +2850,7 @@ pub(crate) mod tests {
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(FunctionRegistry::default()),
+            kwargs,
             Arc::new(OnceLock::new()),
             Arc::clone(&walker),
             Arc::new(PackageList::new(

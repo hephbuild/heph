@@ -214,6 +214,7 @@ impl HephLspContext {
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(HashMap::new())),
             Arc::clone(&self.registry),
+            kwargs,
             globals,
             Arc::clone(&walker),
             // Fresh package list per call, for the same reason: a session-lifetime
@@ -238,7 +239,6 @@ impl HephLspContext {
             )),
             Arc::default(),
         )
-        .with_driver_kwargs(kwargs)
     }
 
     /// List package names beginning with `prefix` (no leading `//`).

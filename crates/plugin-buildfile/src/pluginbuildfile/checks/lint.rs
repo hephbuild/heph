@@ -840,6 +840,82 @@ def app() -> None:
         assert_eq!(lint_pkg(tmp.path(), "pkg", true), []);
     }
 
+    /// A wrapper in a loaded `.star` file of another package: its `Kwargs`
+    /// cross the load, so both findings land at the caller's lines.
+    #[test]
+    fn driver_kwargs_through_load() {
+        let lib = "\
+def lib(name: str, **kwargs: heph.types.bash.Kwargs) -> None:
+    target(name = name, driver = \"bash\", **kwargs)
+";
+        let caller = "\
+load(\"//lib/defs.star\", \"lib\")
+
+def app() -> None:
+    lib(name = \"a\", run = 1)
+    lib(name = \"a\", rnu = \"echo\")
+";
+        let tmp = ws(&[
+            ("pkg/BUILD", caller),
+            ("lib/defs.star", lib),
+            // Makes `lib` a package owning `defs.star`.
+            ("lib/BUILD", "load(\"//lib/defs.star\", \"lib\")\n"),
+        ]);
+        assert_eq!(
+            lines(&lint_pkg(tmp.path(), "pkg", true)),
+            [
+                "pkg/BUILD:4:21: type-error: Expected type `None | str | list[str]` but got `int`",
+                "pkg/BUILD:5:21: type-error: Unexpected parameter named `rnu`",
+            ]
+        );
+        assert_eq!(lint_pkg(tmp.path(), "lib", true), []);
+    }
+
+    /// Evaluation through the same loaded wrapper: a known key builds the
+    /// target, an unknown one fails the call naming the key.
+    #[test]
+    fn driver_kwargs_eval_through_load() {
+        use crate::pluginbuildfile::checks::test_ws::eval_pkg;
+        let lib = "\
+def lib(name: str, **kwargs: heph.types.bash.Kwargs) -> None:
+    target(name = name, driver = \"bash\", **kwargs)
+";
+        let call = |args: &str| {
+            ws(&[
+                (
+                    "pkg/BUILD",
+                    &format!("load(\"//lib/defs.star\", \"lib\")\n\nlib(name = \"t\", {args})\n"),
+                ),
+                ("lib/defs.star", lib),
+            ])
+        };
+        let ok = call("run = \"echo\"");
+        let result = eval_pkg(ok.path(), "pkg").unwrap_or_else(|e| panic!("{}", chain(&e)));
+        assert_eq!(result.targets.len(), 1);
+        let bad = call("rnu = \"echo\"");
+        let err = chain(&eval_pkg(bad.path(), "pkg").expect_err("an unknown key"));
+        assert!(err.contains("`rnu`"), "names the key: {err}");
+    }
+
+    /// An explicit parameter beside `**kwargs` wins its key: forwarding it is
+    /// clean, and a call is judged by the parameter's own type.
+    #[test]
+    fn driver_kwargs_explicit_param() {
+        let src = "\
+def lib(name: str, run: str, **kwargs: heph.types.bash.Kwargs) -> None:
+    target(name = name, driver = \"bash\", run = run, **kwargs)
+
+def app() -> None:
+    lib(name = \"a\", run = \"echo\", labels = [\"l\"])
+    lib(name = \"a\", run = 1)
+";
+        let tmp = ws(&[("pkg/BUILD", src)]);
+        assert_eq!(
+            lines(&lint_pkg(tmp.path(), "pkg", true)),
+            ["pkg/BUILD:6:21: type-error: Expected type `str` but got `int`"]
+        );
+    }
+
     /// The lint key covers the derived kwargs: a key's type change moves it,
     /// a doc or `required` change does not, and the run refuses kwargs whose
     /// digest is not the def's. An ordinary target's spec, and so its def
@@ -876,9 +952,10 @@ def app() -> None:
         let src = "target(name = \"a\", driver = \"bash\", run = \"echo\")\n";
         let eval = |kwargs: std::sync::Arc<DriverKwargs>| {
             let dir = tempfile::tempdir().expect("tempdir");
-            let loader =
-                crate::pluginbuildfile::run_file::tests::source_loader(dir.path().to_path_buf())
-                    .with_driver_kwargs(kwargs);
+            let loader = crate::pluginbuildfile::run_file::tests::source_loader_with(
+                dir.path().to_path_buf(),
+                kwargs,
+            );
             let r = crate::pluginbuildfile::run_file::eval_source(
                 "BUILD",
                 src.to_string(),

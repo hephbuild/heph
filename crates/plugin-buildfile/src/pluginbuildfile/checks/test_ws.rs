@@ -60,8 +60,8 @@ pub(super) fn eval_pkg(root: &Path, pkg: &str) -> anyhow::Result<Arc<RunResult>>
     loader(root, Arc::default()).load_pkg(pkg)
 }
 
-/// A loader over `root` with the default BUILD patterns, caching evaluated
-/// files in `file_cache`.
+/// A loader over `root` with the default BUILD patterns and the test drivers'
+/// `Kwargs`, caching evaluated files in `file_cache`.
 fn loader(
     root: &Path,
     file_cache: Arc<Mutex<HashMap<PathBuf, Arc<RunResult>>>>,
@@ -74,6 +74,7 @@ fn loader(
         file_cache,
         Arc::default(),
         Arc::new(FunctionRegistry::default()),
+        crate::pluginbuildfile::types::tests::test_kwargs(),
         Arc::new(OnceLock::new()),
         Arc::clone(&walker),
         Arc::new(PackageList::new(
