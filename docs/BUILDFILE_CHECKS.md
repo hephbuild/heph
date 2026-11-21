@@ -46,7 +46,11 @@ package. `//...` includes `build-format`, and so do `label(fix)` and
 
 The lint key is the owned files, every file they load (transitively, by
 content), `requireTypeAnnotations`, heph's version, the names of the plugin
-functions, and the BUILD `patterns`. The format key is the owned files,
+functions, `driverKwargsDigest` and the BUILD `patterns`.
+`driverKwargsDigest` covers the [`Kwargs`](#driver-kwargs) types of every
+registered driver: each driver's name, keys and key types. A driver schema
+change that leaves those types alone, a doc edit say, does not re-run lint.
+The format key is the owned files,
 `indent` and heph's version. Nothing about either reaches an ordinary target:
 turning the option on or off leaves every other def hash unchanged.
 
@@ -233,8 +237,8 @@ The field aliases are `Addr`, `Deps`, `Env`, `Labels`, `PassEnv`,
   version, **`None` included**, since every field is optional.
 - A field alias widens with its field and never narrows. Once a name ships, it
   is removed only through a deprecation.
-- Field aliases are built from `target()`'s own fields only, never from a
-  driver's schema, which would have to enter the lint key.
+- Field aliases are built from `target()`'s own fields only. A driver's
+  fields are typed by its [`Kwargs`](#driver-kwargs) instead.
 - `transitive` and `approval` have no alias. No Starlark type expresses a dict
   with fixed keys, so an alias would accept keys `target()` refuses.
 
@@ -243,8 +247,66 @@ One more alias is not built from a field: `heph.types.Number` is
 [Inferred types](#inferred-types)). It does not include `None`, and no
 annotation finding suggests it.
 
-`heph.types.Nope` fails before evaluation, naming the known aliases. The editor
-completes `heph.types.` and shows each alias's expansion on hover.
+`heph.types.Nope` fails before evaluation, naming the known aliases and the
+driver namespaces. The editor completes `heph.types.` with the aliases, then
+the driver namespaces, and shows each alias's expansion on hover.
+
+### Driver kwargs
+
+`heph.types.<driver>.Kwargs` types a wrapper's `**kwargs` per key, for one
+driver. `<driver>` is the name `target(driver = …)` takes, dots included
+(`heph.types.bash.Kwargs`, `heph.types.oci.image.Kwargs`):
+
+```python
+def lib(name: str, **kwargs: heph.types.bash.Kwargs):
+    target(name = name, driver = "bash", **kwargs)
+
+def app():
+    lib(name = "a", run = "echo")   # ok
+    lib(name = "a", run = 1)        # type-error: `run` expects the field's type
+    lib(name = "a", rnu = "echo")   # type-error: unknown key `rnu`
+```
+
+The contract is:
+
+- The keys are `target()`'s own fields except `driver`, plus the driver's
+  fields. A driver field named like a `target()` field is `target()`'s.
+- `Kwargs` is closed. A key it does not list is a type error.
+- Every key is optional and accepts `None`. A wrapper supplies some fields
+  itself, and `target()` reports a missing required field at evaluation.
+- `driver` is not a key. The wrapper writes it, and the name of the type
+  already fixes it.
+- A struct-shaped field (`transitive`, `approval`) is
+  `dict[str, typing.Any]`, since no Starlark type has fixed keys.
+- A key is never narrower than its field. Lint may miss what evaluation
+  catches, never the reverse.
+- Inside the def, `kwargs` is a dict of the keys' types, so forwarding it to
+  `target()` typechecks.
+- Lint checks every call, and so does evaluation.
+
+The two report differently. Lint reports at the argument and does not name the
+key:
+
+```
+pkg/BUILD:6:21: type-error: Expected type `None | str | list[str]` but got `int`
+pkg/BUILD:7:21: type-error: Unexpected parameter named `rnu`
+```
+
+Evaluation fails the call and names the key:
+``Unexpected key `rnu` for argument `kwargs`; known keys: …``, or
+``Value `1` of type `int` for key `run` does not match the type annotation …``.
+
+`heph.types.<driver>` exists for every driver the engine registers, and only
+those. A builtin factory such as `bash` registers its driver only when
+`plugins:` names it. `heph.types.nope.Kwargs` fails before evaluation, naming
+the drivers that have one, and `heph.types.bash.Nope` names the members that
+exist. A driver whose name cannot be written as an attribute path gets no
+namespace: one with an empty segment, a segment named `Kwargs`, or a first
+segment named like a field alias (`Deps`, …). Registry names are lowercase, so
+none is in practice.
+
+The editor completes `heph.types.<driver…>.` with `Kwargs` and the namespaces
+under it, and hovering `Kwargs` lists its keys and their types.
 
 ## What changes on upgrade
 

@@ -728,3 +728,62 @@ async fn shadow_runs_user_target_validate_fails() {
         ]
     );
 }
+
+/// `heph.types.bash.Kwargs` is built from the schema of the `bash` driver the
+/// shipped engine registers: a wrong-typed key is a lint finding in the
+/// spec's line format, the fixed call passes and builds through the real
+/// driver, and an unknown key fails evaluation naming the key (D8).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn driver_kwargs_real_driver() {
+    const LIB: &str = "\
+def lib(name: str, **kwargs: heph.types.bash.Kwargs):
+    target(name = name, driver = \"bash\", **kwargs)
+";
+    let ws = Ws::new(
+        &[(
+            "pkg/BUILD",
+            &format!("{LIB}\ndef app():\n    lib(name = \"a\", run = 1)\n"),
+        )],
+        "",
+    );
+    // `bash` is a factory: its driver exists only when `plugins:` names it.
+    ws.write(
+        ".hephconfig",
+        "plugins:\n  - builtin: buildfile\n  - builtin: bash\n",
+    );
+    let r = run_addr(&ws, "//pkg:build-lint-check").await;
+    assert_fails(&r, "//pkg:build-lint-check");
+    assert_eq!(
+        failure_log(&ws, "//pkg:build-lint-check").trim_end(),
+        "pkg/BUILD:5:21: type-error: Expected type `None | str | list[str]` but got `int`\n\
+         1 finding in //pkg"
+    );
+
+    ws.write(
+        "pkg/BUILD",
+        &format!(
+            "{LIB}\ndef app():\n    lib(name = \"a\", run = \"true\")\n\n\
+             lib(name = \"t\", run = \"true\")\n"
+        ),
+    );
+    let r = run(&ws, &everything()).await;
+    assert_passes(&r, "//pkg:build-lint-check");
+    assert_passes(&r, "//pkg:t");
+
+    ws.write(
+        "pkg/BUILD",
+        &format!("{LIB}\nlib(name = \"t\", rnu = \"true\")\n"),
+    );
+    let m = Matcher::Addr(parse_addr("//pkg:build-lint-check").expect("addr"));
+    let err = match try_run(&ws, &m).await {
+        Err(e) => format!("{e:#}"),
+        Ok(r) => {
+            assert_fails(&r, "//pkg:build-lint-check");
+            r.failed["//pkg:build-lint-check"].clone()
+        }
+    };
+    assert!(
+        err.contains("Unexpected key `rnu` for argument `kwargs`"),
+        "names the key: {err}"
+    );
+}
