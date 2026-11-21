@@ -62,6 +62,8 @@ struct FakeEngine {
     root: PathBuf,
     registry: Arc<FunctionRegistry>,
     gate: Option<Arc<Gate>>,
+    /// `list` never answers, as a provider that hangs.
+    list_hangs: bool,
 }
 
 impl FakeEngine {
@@ -201,6 +203,19 @@ impl LspEngine for FakeEngine {
     fn provider_options(&self, _name: &str) -> hplugin::config::Options {
         hplugin::config::Options::default()
     }
+    fn list(
+        self: Arc<Self>,
+        what: hplugin::lsp::Listing,
+    ) -> futures::future::BoxFuture<'static, anyhow::Result<hplugin::lsp::Listed>> {
+        if self.list_hangs {
+            return Box::pin(futures::future::pending());
+        }
+        plugin_buildfile::pluginbuildfile::lsp_list_with_fresh_buildfile_provider(
+            self.root.clone(),
+            Arc::clone(&self.registry),
+            what,
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -319,6 +334,8 @@ struct Lsp {
     diagnostics: Vec<Value>,
     /// Every `window/showMessage` params object received, in order.
     messages: Vec<Value>,
+    /// Every `window/logMessage` params object received, in order.
+    logs: Vec<Value>,
     /// The position encoding the server chose at `initialize`.
     encoding: String,
 }
@@ -329,7 +346,23 @@ impl Lsp {
         Lsp::with(
             None,
             plugin_buildfile::pluginbuildfile::LspRunOptions::default(),
+            false,
         )
+    }
+
+    /// A server whose engine listing never answers, and whose completions
+    /// wait `wait` for it.
+    fn with_hanging_listing(wait: Duration) -> Lsp {
+        let mut lsp = Lsp::with(
+            None,
+            plugin_buildfile::pluginbuildfile::LspRunOptions {
+                listing_wait: wait,
+                ..Default::default()
+            },
+            true,
+        );
+        lsp.initialize();
+        lsp
     }
 
     /// A server whose registry snapshot waits on the returned gate, and whose
@@ -340,7 +373,9 @@ impl Lsp {
             Some(Arc::clone(&gate)),
             plugin_buildfile::pluginbuildfile::LspRunOptions {
                 registry_wait: Duration::ZERO,
+                ..Default::default()
             },
+            false,
         );
         (lsp, gate)
     }
@@ -348,6 +383,7 @@ impl Lsp {
     fn with(
         gate: Option<Arc<Gate>>,
         options: plugin_buildfile::pluginbuildfile::LspRunOptions,
+        list_hangs: bool,
     ) -> Lsp {
         let dir = tempfile::tempdir().expect("tempdir");
         // Canonical, so macOS `/var` vs `/private/var` never splits a path.
@@ -361,6 +397,7 @@ impl Lsp {
             root,
             registry: registry(),
             gate: gate.clone(),
+            list_hangs,
         });
         let (client, server_end) = Connection::memory();
         let handle = rt.handle().clone();
@@ -377,6 +414,7 @@ impl Lsp {
             next_id: 0,
             diagnostics: Vec::new(),
             messages: Vec::new(),
+            logs: Vec::new(),
             encoding: "utf-16".to_string(),
         }
     }
@@ -431,6 +469,12 @@ impl Lsp {
 
     /// Send a request and wait for its response, collecting notifications.
     fn request_raw(&mut self, method: &str, params: Value) -> lsp_server::Response {
+        let id = self.send_request(method, params);
+        self.wait_response(&id)
+    }
+
+    /// Send a request without waiting for its response.
+    fn send_request(&mut self, method: &str, params: Value) -> RequestId {
         self.next_id += 1;
         let id = RequestId::from(self.next_id);
         self.send(Message::Request(Request {
@@ -438,7 +482,7 @@ impl Lsp {
             method: method.to_string(),
             params,
         }));
-        self.wait_response(&id)
+        id
     }
 
     fn wait_response(&mut self, id: &RequestId) -> lsp_server::Response {
@@ -454,6 +498,7 @@ impl Lsp {
                 Message::Notification(n) => match n.method.as_str() {
                     "textDocument/publishDiagnostics" => self.diagnostics.push(n.params),
                     "window/showMessage" => self.messages.push(n.params),
+                    "window/logMessage" => self.logs.push(n.params),
                     _ => {}
                 },
             }
@@ -1125,6 +1170,85 @@ fn completion_and_hover_on_plugin_function() {
         "hover and completion render the same doc"
     );
     assert!(hover_text(&hover).contains("Join two path segments."));
+}
+
+/// A listing that never answers costs a completion the listing wait: the
+/// editor gets the stock answer (empty inside a string) and is not held.
+///
+/// Back to back, each completion costs one wait, not the sum of the ones
+/// before it: a dropped listing holds nothing the next one queues behind.
+/// Each also tells the editor's log why it answered stock.
+#[test]
+fn a_hung_listing_answers_stock_after_the_wait() {
+    const WAIT: Duration = Duration::from_millis(300);
+    // Generous: a loaded CI runner, not the server, is what overruns it.
+    const SLACK: Duration = Duration::from_secs(3);
+    let mut lsp = Lsp::with_hanging_listing(WAIT);
+    let doc = lsp.open("BUILD", "target(name = \"x\", deps = [\"//l│\"])\n");
+    for round in 1..=3 {
+        let started = std::time::Instant::now();
+        let result = lsp.completion(&doc);
+        let took = started.elapsed();
+        assert!(heph_items(&result).is_empty(), "round {round}: {result}");
+        assert!(
+            took >= WAIT && took < WAIT + SLACK,
+            "round {round} took {took:?}"
+        );
+        assert_eq!(lsp.logs.len(), round, "one log line each: {:?}", lsp.logs);
+    }
+    let log = &lsp.logs[0];
+    assert_eq!(log["type"], json!(2), "a warning: {log}");
+    let message = log["message"].as_str().unwrap_or("");
+    assert!(
+        message.contains("did not answer within 300ms") && message.contains("--explain"),
+        "{message}"
+    );
+}
+
+/// The server answers one request at a time, so completions an editor sends
+/// without waiting (three keystrokes) against a hung listing are answered in
+/// order, one wait apart: the third arrives after three waits. Pinned so a
+/// change to it is deliberate.
+#[test]
+fn pipelined_completions_against_a_hung_listing_are_serial() {
+    const WAIT: Duration = Duration::from_millis(300);
+    let mut lsp = Lsp::with_hanging_listing(WAIT);
+    let doc = lsp.open("BUILD", "target(name = \"x\", deps = [\"//l│\"])\n");
+    let started = std::time::Instant::now();
+    let ids: Vec<RequestId> = (0..3)
+        .map(|_| {
+            let params = lsp.at(&doc);
+            lsp.send_request("textDocument/completion", params)
+        })
+        .collect();
+    let mut arrived = Vec::new();
+    for id in &ids {
+        let resp = lsp.wait_response(id);
+        assert!(resp.response_result.is_ok(), "{resp:?}");
+        arrived.push(started.elapsed());
+    }
+    for (i, at) in arrived.iter().enumerate() {
+        let waits = u32::try_from(i + 1).expect("small");
+        assert!(*at >= WAIT * waits, "answer {i} at {at:?}: {arrived:?}");
+    }
+}
+
+/// A hung listing at `:` still offers the names the open document declares:
+/// heph knows them without the engine.
+#[test]
+fn a_hung_listing_at_colon_still_offers_the_documents_own_names() {
+    let mut lsp = Lsp::with_hanging_listing(Duration::from_millis(200));
+    let doc = lsp.open(
+        "lib/BUILD",
+        "target(name = \"util\", driver = \"exec\", cmd = \"true\")\ntarget(name = \"y\", deps = [\":│\"])\n",
+    );
+    let result = lsp.completion(&doc);
+    assert!(has(&result, ":util") && has(&result, ":y"), "{result}");
+    let doc = lsp.open(
+        "lib/BUILD",
+        "target(name = \"util\", driver = \"exec\", cmd = \"true\")\ntarget(name = \"y\", deps = [\":u│\"])\n",
+    );
+    assert_eq!(labels(&lsp.completion(&doc)), vec![":util"], "filtered");
 }
 
 #[test]
@@ -1807,6 +1931,35 @@ fn empty_results_carry_a_reason() {
         std::thread::sleep(Duration::from_millis(5));
     }
     assert!(has(&lsp.completion(&doc), "driver"));
+}
+
+/// An address, a load path and a load symbol read the engine's listing and
+/// the files, never the driver/provider registry, so they answer while its
+/// snapshot is still loading.
+#[test]
+fn addresses_and_loads_complete_while_providers_load() {
+    let (mut lsp, _gate) = Lsp::new_gated();
+    lsp.initialize();
+    lsp.write(
+        "lib/BUILD",
+        "target(name = \"util\", driver = \"exec\", cmd = \"true\")\n",
+    );
+    lsp.write("x/y.star", "def foo():\n    pass\n");
+
+    // The registry is held: a registry site is still `providers_loading`.
+    let doc = lsp.open("BUILD", "target(│)\n");
+    assert_eq!(
+        reason(&lsp.explain(&doc)).as_deref(),
+        Some("providers_loading")
+    );
+
+    let doc = lsp.open("a/BUILD", "target(name = \"x\", deps = [\"//lib:│\"])\n");
+    assert_eq!(reason(&lsp.explain(&doc)), None);
+    assert_eq!(labels(&lsp.completion(&doc)), vec!["//lib:util"]);
+    let doc = lsp.open("b/BUILD", "target(name = \"x\", deps = [\"//l│\"])\n");
+    assert_eq!(labels(&lsp.completion(&doc)), vec!["//lib"]);
+    let doc = lsp.open("c/BUILD", "load(\"//x:y.star\", \"f│\")\n");
+    assert_eq!(labels(&lsp.completion(&doc)), vec!["foo"]);
 }
 
 #[test]
@@ -2533,6 +2686,20 @@ fn site_is_a_function_of_the_prefix() {
                 .filter_map(|i| i["label"].as_str().map(str::to_string))
                 .collect()
         };
+        // Every document this fixture opens is on disk before the original
+        // completion: each listing sees the workspace as it is now, so a
+        // package created between two completions would show in one and not
+        // the other.
+        let opened: Vec<_> = variants(fixture, *skip_c)
+            .into_iter()
+            .map(|(v, text)| {
+                // Opened fresh, and reached by didChange from the original
+                // (only the second has a stale AST to exercise).
+                let fresh = lsp.open(&format!("v{n}{v}/BUILD"), &text);
+                let edited_base = lsp.open(&format!("e{n}{v}/BUILD"), fixture);
+                (v, text, fresh, edited_base)
+            })
+            .collect();
         let doc = lsp.open(&format!("o{n}/BUILD"), fixture);
         let original = lsp.explain(&doc);
         let original_labels = heph_labels(&lsp.completion(&doc));
@@ -2541,11 +2708,7 @@ fn site_is_a_function_of_the_prefix() {
             kind(&original).as_str(),
             "target_key" | "state_key" | "arg_key"
         );
-        for (v, text) in variants(fixture, *skip_c) {
-            // Opened fresh, and reached by didChange from the original (only
-            // the second has a stale AST to exercise).
-            let fresh = lsp.open(&format!("v{n}{v}/BUILD"), &text);
-            let edited_base = lsp.open(&format!("e{n}{v}/BUILD"), fixture);
+        for (v, text, fresh, edited_base) in opened {
             let edited = lsp.change(&edited_base, &text);
             for (how, d) in [("fresh", &fresh), ("didChange", &edited)] {
                 let explained = lsp.explain(d);

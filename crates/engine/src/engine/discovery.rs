@@ -254,27 +254,32 @@ pub struct GapReport {
 impl GapReport {
     /// The report as the one `SelectionIncomplete` event a command emits.
     pub fn to_event(&self) -> crate::engine::event::BuildEventKind {
-        use hcore::events::{SelectionGap, SelectionGapExample};
         crate::engine::event::BuildEventKind::SelectionIncomplete {
             skipped: self.skipped,
-            groups: self
-                .groups
-                .iter()
-                .map(|g| SelectionGap {
-                    stage: g.stage.as_str().to_string(),
-                    provider: g.provider.clone(),
-                    count: g.count,
-                    examples: g
-                        .examples
-                        .iter()
-                        .map(|e| SelectionGapExample {
-                            scope: e.scope.clone(),
-                            cause: e.cause.clone(),
-                        })
-                        .collect(),
-                })
-                .collect(),
+            groups: self.selection_gaps(),
         }
+    }
+
+    /// The groups in their wire shape: what the event carries, and what an
+    /// LSP listing reports as skipped.
+    pub fn selection_gaps(&self) -> Vec<hcore::events::SelectionGap> {
+        use hcore::events::{SelectionGap, SelectionGapExample};
+        self.groups
+            .iter()
+            .map(|g| SelectionGap {
+                stage: g.stage.as_str().to_string(),
+                provider: g.provider.clone(),
+                count: g.count,
+                examples: g
+                    .examples
+                    .iter()
+                    .map(|e| SelectionGapExample {
+                        scope: e.scope.clone(),
+                        cause: e.cause.clone(),
+                    })
+                    .collect(),
+            })
+            .collect()
     }
 }
 

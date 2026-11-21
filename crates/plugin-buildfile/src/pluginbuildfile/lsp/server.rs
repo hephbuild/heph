@@ -47,12 +47,16 @@ pub struct RunOptions {
     /// before answering anyway; until it lands, heph answers with the stock
     /// results and `reason: providers_loading`.
     pub registry_wait: Duration,
+    /// How long an `address` / `load_path` completion waits for the engine's
+    /// listing before answering stock with `reason: listing_timed_out`.
+    pub listing_wait: Duration,
 }
 
 impl Default for RunOptions {
     fn default() -> RunOptions {
         RunOptions {
             registry_wait: Duration::from_secs(5),
+            listing_wait: super::context::LISTING_WAIT,
         }
     }
 }
@@ -124,6 +128,21 @@ impl Root {
             || p.canonicalize()
                 .is_ok_and(|pc| self.canonical.as_ref().is_some_and(|c| pc.starts_with(c)))
     }
+}
+
+/// Whether heph's answer at `site` reads the driver/provider registry, so
+/// waits for its snapshot (`reason: providers_loading` until then). The
+/// stock sites never do; an address, a load path and a load symbol read the
+/// engine's listing and the files, never the registry.
+fn needs_registry(site: &Site) -> bool {
+    !matches!(
+        site,
+        Site::None
+            | Site::ArgKey { .. }
+            | Site::Address { .. }
+            | Site::LoadPath { .. }
+            | Site::LoadSymbol { .. }
+    )
 }
 
 /// Serve on `connection` until `exit`, or until the client hangs up.
@@ -204,7 +223,7 @@ pub fn run_with(
         Err(RecvTimeoutError::Timeout) => RegistryState::Loading(rx),
         Err(RecvTimeoutError::Disconnected) => RegistryState::Failed,
     };
-    let ctx = HephLspContext::new(engine);
+    let ctx = HephLspContext::new(engine, options.listing_wait);
     let shared = Arc::clone(&ctx.shared);
     let result = serde_json::json!({
         "capabilities": capabilities(encoding),
@@ -570,7 +589,7 @@ impl Server<'_> {
         );
         let resolution = if doc.outside_root {
             Resolution::none(site::Reason::OutsideRoot)
-        } else if !ready && !matches!(resolution.site, Site::None | Site::ArgKey { .. }) {
+        } else if !ready && needs_registry(&resolution.site) {
             Resolution::none(site::Reason::ProvidersLoading)
         } else {
             resolution
@@ -623,7 +642,7 @@ impl Server<'_> {
     fn completion(&mut self, params: CompletionParams) -> Value {
         let started = Instant::now();
         let uri = params.text_document_position.text_document.uri.clone();
-        let Some(located) = self.locate(&uri, params.text_document_position.position) else {
+        let Some(mut located) = self.locate(&uri, params.text_document_position.position) else {
             return serde_json::json!([]);
         };
         // A trigger character on a non-site returns at once, without the
@@ -675,17 +694,67 @@ impl Server<'_> {
                     None => stock,
                 }
             }
-            Merge::Replace => match self.registry() {
-                Some(registry) => self
-                    .with_ctx(&located.key, &registry, |ctx| {
+            Merge::Replace => {
+                // A site that needs no registry (an address, a load path)
+                // answers while it loads (see `needs_registry`).
+                let registry = match self.registry() {
+                    Some(registry) => Some(registry),
+                    None if !needs_registry(&located.resolution.site) => Some(Arc::default()),
+                    None => None,
+                };
+                let answer = registry.and_then(|registry| {
+                    self.with_ctx(&located.key, &registry, |ctx| {
                         handlers::items(&located.resolution.site, ctx)
                     })
-                    .unwrap_or_default(),
-                None => Vec::new(),
-            },
+                });
+                match answer {
+                    Some(Ok(items)) => items,
+                    // The listing timed out or failed: stock, under that
+                    // reason, as while the providers load, after what heph
+                    // still knows without it (the document's own names at
+                    // `:name`).
+                    Some(Err(handlers::Fallback { reason, mut items })) => {
+                        self.log_listing_fallback(&reason);
+                        located.resolution = Resolution::none(reason);
+                        items.extend(self.stock_completion(params, &located));
+                        items
+                    }
+                    None => Vec::new(),
+                }
+            }
         };
         self.log("completion", &located, items.len(), started);
         serde_json::to_value(items).unwrap_or_else(|_| serde_json::json!([]))
+    }
+
+    /// Tell the editor's log (`window/logMessage`, which editors keep in the
+    /// server's output panel, not a popup) why a completion answered without
+    /// its listing: the popup itself gives the user no sign of it.
+    fn log_listing_fallback(&self, reason: &site::Reason) {
+        const EXPLAIN: &str =
+            "`heph tool build-lsp --explain FILE:LINE:COL` runs the listing and shows why";
+        let message = match reason {
+            site::Reason::ListingTimedOut { waited_ms } => format!(
+                "heph: the completion's listing did not answer within {waited_ms}ms, so it \
+                 answered without it; {EXPLAIN}"
+            ),
+            site::Reason::ListingFailed { message } => format!(
+                "heph: the completion's listing failed, so it answered without it: \
+                 {message}; {EXPLAIN}"
+            ),
+            _ => return,
+        };
+        // The client hung up: the loop sees the closed channel next.
+        let _sent = self
+            .connection
+            .sender
+            .send(Message::Notification(Notification::new(
+                "window/logMessage".to_string(),
+                lsp_types::LogMessageParams {
+                    typ: lsp_types::MessageType::WARNING,
+                    message,
+                },
+            )));
     }
 
     fn stock_completion(

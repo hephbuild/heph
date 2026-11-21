@@ -42,8 +42,104 @@ repo the server was started in. A folder outside it is an `initialize` error;
 more than one folder gets a `window/showMessage` warning and only the first is
 used. A BUILD file opened outside the repo gets the stock answers only, with
 `reason: outside_root`. The driver/provider registry is read once per server
-start; until that snapshot lands, heph answers with the stock results and
-`reason: providers_loading`.
+start; until that snapshot lands, a site that reads it answers with the
+stock results and `reason: providers_loading`. Address, load-path and
+load-symbol sites do not read it, so they answer at once.
+
+## Listing packages and targets
+
+An `address` or `load_path` completion asks the engine, through
+`LspEngine::list`, for what `heph query` would list: `//pkg` and `load("//pkg`
+list the packages under the typed prefix's last whole segment (`//foo/ba` lists
+under `//foo` and keeps what starts with `foo/ba`), `//pkg:` and `:` list one
+package's targets. Every registered provider answers, with its states and
+probes, so `//@heph/go/gocache:modcache` and `//@heph/oci:blobs` complete like
+any BUILD target.
+
+- **A fresh root request per completion, so a fresh cache scope.** An editor
+  session holds one engine for hours; a scope per call is what makes a package
+  created, a target renamed or a BUILD file fixed on disk show on the next
+  completion. No provider cache outlives its call: when it returns, the scope
+  ends and each provider is told (`scope_ended`). There is no TTL and no
+  LSP-side cache of the listing. Within one buffer evaluation the per-buffer
+  `loader()` still dedupes the package walk.
+- **Directory reads are shared, and checked.** A listing walks through the
+  engine's `CachedWalker`, as a build does, so a directory read is stored in
+  `<home>/cache/fswalk.db` and reused by the next listing (and the next
+  build) while it is still valid. What keeps that from serving a stale
+  answer is the walker's own rule (#601): a read is stored only when it was
+  taken 2s or more after the entry's mtime and ctime, so an edit landing in
+  the same clock tick as the read is never stored; and a stored read is
+  reused only while the entry's mtime, ctime and inode all still match, so
+  an mtime-preserving writer (`cp -p`, `rsync -a`, `tar`) or a replaced
+  directory re-reads it.
+- **Paths that leave the workspace are refused, twice.** A typed path whose
+  whole segments are absolute (`///etc`), `.` or `..` (`//../..`), or empty
+  (`//a//b`, a package ending in `/`), or that holds a control character,
+  lists nothing: some providers join the path to the workspace root and walk
+  the result. The completion refuses it before it asks (the listing choice
+  in `handlers::listing_query`, logged at `debug` as `lsp: typed path not
+  listed`), and `Engine::list` refuses it again for any caller,
+  `Packages.under` and `Targets.package` alike, with an error naming the
+  reason (`absolute`, `dot_segment`, `empty_segment`, `control_byte`). Both
+  run the one check, `hplugin::lsp::check_path`. A partial last segment
+  only filters, so `//..` is a prefix of nothing, not a traversal.
+- **A bounded wait.** A completion waits `LISTING_WAIT` (2s) for its
+  listing. Past it, the listing is dropped, and `Engine::list` cancels its
+  request when dropped before it answers: the package tasks it spawned stop
+  (`KeepGoing` treats a cancellation as fatal) and its scope ends. The
+  completion answers stock with `reason: listing_timed_out` (`waited_ms`);
+  a listing that returns an error answers stock with `reason:
+  listing_failed` (`message`). Stock string completion is empty: every
+  string it would complete is an address or a load path. So the editor
+  user sees an empty popup at `//…` and `load("//…`, and at `:name` only
+  the names the open document declares, which heph knows without the
+  listing. The server answers one request at a time, so each completion
+  against a hung listing costs one wait, and completions sent without
+  waiting are answered in order, one wait apart.
+- **A failed listing says so.** Either failure is logged at `warn`, and the
+  server sends the editor a `window/logMessage` warning (editors keep it in
+  the server's output panel, not a popup) naming the wait or the error and
+  pointing at `--explain`, which runs the same listing and shows why.
+- **No wait for the registry.** Address, load-path and load-symbol sites
+  read the engine's listing and the files, never the driver/provider
+  registry, so they answer before its snapshot lands; only the sites that
+  read schemas answer `providers_loading` until then.
+- **`Discovery::KeepGoing`.** A provider that fails, or a package that does
+  not evaluate, costs only its own entries. The rest still complete, and what
+  was left out is logged at `debug` (`lsp: listing left out`) and shown by
+  `--explain`.
+- **Provenance.** Each entry names the provider it came from: for a package,
+  the first provider in registration order that listed it (the merge `heph
+  query` walks); for a target name, the first provider in registration order
+  that listed a target of that name. Never whichever answered first.
+
+Diagnostics open no scope: they check the document against the driver and
+provider schemas with a fresh per-parse loader and never call a provider
+through the engine.
+
+A scope per completion was measured before settling on no debounce (release
+build, macOS arm64,
+`crates/e2e/tests/e2e/lsp_listing.rs::scope_per_completion_cost`, the
+median of 20 warm calls after one cold one). Two workspaces: 2000 BUILD
+packages of 4 targets each, and a Go module at the root with 300 packages
+of one `.go` file each, a root `provider_state` declaring one variant and
+5 more `provider_state` BUILD files:
+
+| Workspace | Listing | Cold | Warm median |
+|---|---|---|---|
+| BUILD | Every package in the workspace (`//`) | 74 ms | 73 ms |
+| BUILD | A subtree's packages (`//d3/e4/`) | 38 ms | 41 ms |
+| BUILD | One package's targets (`//d3/e4/p5:`) | 48 ms | 41 ms |
+| Go | Every package in the workspace (`//`) | 7 ms | 7 ms |
+| Go | One package's targets (`//g3/p5:`) | 16 ms | 17 ms |
+| Go | One package's targets, under a state (`//g1/p1:`) | 16 ms | 17 ms |
+
+Completions are not debounced: the costliest listing, the whole workspace,
+stays under 100 ms at 2000 packages, and the common case, a subtree or one
+package, costs half that. A Go package's targets cost about 17 ms warm, so
+the Go provider keeps no cross-scope cache for the LSP. A workspace where
+`//` grows well past this is the point to revisit it.
 
 ## Site kinds
 
@@ -162,7 +258,10 @@ reason, degradations, item count and time:
   `target`), `in_lex_error` (with the root cause's kind, span, line and
   message), `not_a_site`, `providers_loading` (the registry snapshot has not
   landed; the stock answer stands in), `outside_root` (the document lies
-  outside the repo the server is bound to).
+  outside the repo the server is bound to), `listing_timed_out` (with
+  `waited_ms`: the listing took longer than `LISTING_WAIT`) and
+  `listing_failed` (with `message`: the listing returned an error), at an
+  address or load path; the stock answer stands in for both.
 - `degraded` says what a present answer could not do in full:
   `call_extent_guessed` (with the line the extent stopped at),
   `edit_to_word_end`, `ast_stale` (with the versions behind), `ast_absent`,
@@ -176,6 +275,108 @@ $ heph tool build-lsp --explain BUILD:12:20 --json
 ```
 
 Line and column are 1-based, the column counted in characters.
+
+At an `address` or `load_path` site, `--explain` then runs the listing that
+site's completion runs, on the engine `heph` builds for the workspace (only
+there: classifying any other position needs no workspace). The listing is
+the one the completion chooses (`handlers::listing_query`, shared by both),
+filtered by the same rule, so what `--explain` shows is what the completion
+offers. It waits up to 30s for the listing (`EXPLAIN_LISTING_WAIT`, far past
+the completion's 2s, so a slow listing is seen to finish), and prints after
+the classification:
+
+- `listing`: what was listed (`packages under //foo`, `targets in //foo`) and
+  the prefix a candidate must start with;
+- `scope`: the id of the cache scope the listing ran in. It is an opaque,
+  per-process counter, for matching against `debug` logs of the same run;
+  it means nothing across runs;
+- `listed` / `candidates`: how many entries came back, how many the
+  completion kept, and how long the listing took;
+- one `candidate: "<name>" from <provider>` per entry kept, sorted by name;
+- one `dropped: "<name>" from <provider> (<why>)` per entry listed but not
+  offered: it does not start with the prefix, or it is the root package at a
+  load path. The text form prints the first 20 and `…and N more`;
+- one `skipped:` line per thing the listing left out (`<stage> <provider>
+  <scope>: <cause>`), at most five per stage and provider, then `<stage>
+  <provider> …and N more` for the rest;
+- `no provider listed //foo` (or `… a package under //foo`) when nothing
+  came back at all, and a `note:` when the listing took longer than the
+  completion's `LISTING_WAIT`, so the completion answered stock;
+- one `scope ended: <provider> <outcome>` per provider told the scope ended,
+  in registration order: `released` (it dropped the scope's caches),
+  `unsupported` (it keeps none, or predates scopes), `failed`, `panicked` or
+  `timed_out`. The set may grow; treat an unknown outcome as "not
+  released". `--explain` waits 10s for the acks (past the engine's own 5s
+  bound on one provider); a scope still held then prints `scope N still held
+  after 10s`. `unsupported` covers two different providers, one that keeps
+  no cache and one built before scopes; telling them apart is a follow-up
+  that changes the plugin ABI (a new `ScopeEndedAck` variant, #602).
+
+`--json` puts the same under a `listing` key: `query` (`packages_under` or
+`targets_in`), `prefix`, `scope`, `listed`, `elapsed_ms`, `candidates`
+(`name`, `provider`), `dropped` (`name`, `provider`, `reason`: `prefix` or
+`root_package`), `skipped` (`stage`, `provider`, `count`, `examples` of
+`scope` and `cause`: the groups `heph query` reports for what it skipped),
+and `scope_ended` (`provider`, `outcome`). On an unchanged workspace,
+`elapsed_ms` and `scope` are the only fields that change between runs, so
+two outputs diff to what moved.
+
+**`scope_ended: null` means the scope was still held** after the 10s wait:
+something kept the listing's request alive, and no provider has been told
+yet. It is not the same as `scope_ended: []`, which means the scope ended
+and no provider needed telling (the listing built no provider request, or
+the engine had gone).
+
+When no listing came back, the `listing` key holds `query` (`null` when the
+listing was never chosen) and `error` instead: `stage` says where it
+stopped, `message` says why, and a refused path adds `reason`.
+
+| `stage` | Meaning | `reason` |
+|---|---|---|
+| `path` | the typed path would leave the workspace; no engine was built, no provider asked | `absolute`, `dot_segment`, `empty_segment`, `control_byte` |
+| `engine_build` | the workspace failed to load (a bad `.hephconfig`, a missing plugin) | — |
+| `list` | the engine's listing returned an error, or did not answer within 30s (`the listing did not answer within 30s`; it was cancelled) | — |
+
+The command still exits 0: `--explain` reports on a position, and a failed
+listing is part of the report.
+
+```console
+$ heph tool build-lsp --explain app/BUILD:1:14
+app/BUILD:1:14
+  site: address
+  prefix: "//../.."
+  quote: "closed"
+  reason: none (heph answers here)
+  error (path): //../.. is not listed: a `.` or `..` segment does not name a package
+```
+
+```json
+"listing": {
+  "query": null,
+  "error": {
+    "stage": "path",
+    "message": "//../.. is not listed: a `.` or `..` segment does not name a package",
+    "reason": "dot_segment"
+  }
+}
+```
+
+```console
+$ heph tool build-lsp --explain a/BUILD:1:64
+a/BUILD:1:64
+  site: address
+  prefix: "//b:"
+  quote: "closed"
+  reason: none (heph answers here)
+  listing: targets in //b, kept if starting with ""
+  scope: 1
+  listed: 1, candidates: 1 (in 4ms)
+  candidate: "x" from buildfile
+  scope ended: query unsupported
+  scope ended: fs unsupported
+  scope ended: hostbin unsupported
+  scope ended: buildfile released
+```
 
 ## Adding a site kind
 

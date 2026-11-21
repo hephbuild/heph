@@ -1506,10 +1506,12 @@ impl hbuiltins::pluginfs::CodegenReport for EngineCodegenReport {
 }
 
 /// Where a new request's provider cache scope comes from.
-#[derive(Clone, Copy)]
 enum ScopeSource<'a> {
     /// A root request: a scope of its own.
     Mint,
+    /// A root request whose scope answers this watcher when it ends (see
+    /// [`Engine::new_watched_state`]).
+    MintWatched(crate::engine::cache_scope::ScopeEndWatcher),
     /// A request nested inside another (the in_place re-read, gc's phase 1,
     /// clean's selection walk, failure-gc's resolution): the enclosing
     /// request's scope, so providers answer it from the same snapshot.
@@ -1518,7 +1520,6 @@ enum ScopeSource<'a> {
 
 /// How a request built by `Engine::new_state_inner` behaves beyond its
 /// front-end options.
-#[derive(Clone, Copy)]
 struct RequestMode<'a> {
     /// See [`RequestStateData::hash_only`].
     hash_only: bool,
@@ -1623,6 +1624,37 @@ impl Engine {
         )
     }
 
+    /// [`new_state`](Self::new_state), plus a future that resolves once the
+    /// request's cache scope ended and every provider answered `scope_ended`:
+    /// to each one's answer, in registration order, or to an empty list when
+    /// no provider was told (no provider request was built in the scope, or
+    /// the engine went first). For "which providers dropped their caches?"
+    /// (`heph tool build-lsp --explain`).
+    ///
+    /// The watcher is attached as the scope is minted, so there is no way to
+    /// watch a scope that already ended, and nothing outlives the scope.
+    pub(crate) fn new_watched_state(
+        self: &Arc<Self>,
+    ) -> (
+        Arc<RequestState>,
+        futures::future::BoxFuture<'static, Vec<hplugin::lsp::ScopeEndAck>>,
+    ) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let rs = self.new_state_inner(
+            true,
+            None,
+            hcore::pending::Pending::new_counter(),
+            Self::DEFAULT_LOG_TAIL_LINES,
+            None,
+            RequestMode {
+                hash_only: false,
+                listed_facts_trust: self.cfg.listed_facts_trust,
+                scope: ScopeSource::MintWatched(tx),
+            },
+        );
+        (rs, Box::pin(async move { rx.await.unwrap_or_default() }))
+    }
+
     /// A request that re-reads the tree from *inside* an in-flight resolution.
     ///
     /// `parent` is the addr being resolved, and is not optional: `meta`'s dep walk
@@ -1694,7 +1726,8 @@ impl Engine {
         let n = NEXT_REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let request_id = format!("req-{n}");
         let cache_scope = match scope {
-            ScopeSource::Mint => self.mint_cache_scope(&bg_pending),
+            ScopeSource::Mint => self.mint_cache_scope(&bg_pending, None),
+            ScopeSource::MintWatched(watcher) => self.mint_cache_scope(&bg_pending, Some(watcher)),
             ScopeSource::Inherit(outer) => outer.cache_scope().clone(),
         };
         let data = Arc::new(RequestStateData {

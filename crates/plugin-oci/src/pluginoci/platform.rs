@@ -44,6 +44,7 @@ use async_trait::async_trait;
 use futures::future::BoxFuture;
 use hcore::hasync::Cancellable;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
+use hmodel::htaddr::Addr;
 use hmodel::htpkg::PkgBuf;
 use hplugin::driver::targetdef::path::{CodegenMode, Content, Path as OutPath};
 use hplugin::driver::targetdef::{CacheConfig, Output, TargetDef};
@@ -155,15 +156,24 @@ impl EProvider for Provider {
 
     fn list<'a>(
         &'a self,
-        _req: ListRequest,
+        req: ListRequest,
         _ctoken: &'a (dyn Cancellable + Send + Sync),
     ) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>>
     {
-        // Deliberately not listed: the probe is an implementation detail an
-        // `docker_build` depends on, not something a user builds by name, and it
-        // would otherwise show up in every `heph query //...`.
+        // Only the blob store is listed: a BUILD file names it
+        // (`scratch = ["//@heph/oci:blobs"]`), so editors complete it and
+        // `//...` finds it, and running a scratch declaration is inert. The
+        // probe is not: it is an implementation detail a `docker_build`
+        // depends on, and running it under `heph run //...` would ask Docker.
+        let blobs = (req.package == PKG).then(|| {
+            Ok(ListResponse::addr_only(Addr::new(
+                PkgBuf::from(PKG),
+                BLOBS_TARGET.to_string(),
+                Default::default(),
+            )))
+        });
         Box::pin(async move {
-            Ok(Box::new(std::iter::empty())
+            Ok(Box::new(blobs.into_iter())
                 as Box<
                     dyn Iterator<Item = anyhow::Result<ListResponse>> + Send,
                 >)
@@ -441,6 +451,30 @@ mod tests {
             .expect("the provider serves the blob store");
         hbuiltins::pluginscratch::parse_declaration(&resp.target_spec)
             .expect("the blobs spec must parse as a scratch declaration");
+    }
+
+    /// The blob store is listed, so an editor completes `//@heph/oci:blobs`
+    /// and `//...` finds it; the probe is not, since running it asks Docker.
+    #[tokio::test]
+    async fn lists_the_blob_store_and_not_the_probe() {
+        let list = |package: &str| {
+            let req = ListRequest::new(
+                "req",
+                PkgBuf::from(package),
+                vec![],
+                std::sync::Arc::new(hplugin::provider::NoopExecutor),
+            );
+            async move {
+                Provider::new("oci")
+                    .list(req, &StdCancellationToken::new())
+                    .await
+                    .expect("list")
+                    .map(|r| r.expect("item").addr.to_string())
+                    .collect::<Vec<_>>()
+            }
+        };
+        assert_eq!(list(PKG).await, vec![blobs_addr()]);
+        assert!(list("some/pkg").await.is_empty());
     }
 
     /// The probe target names its driver under the plugin's *actual* name. A

@@ -197,6 +197,19 @@ impl Engine {
         m: &'a htmatcher::Matcher,
         discovery: Discovery,
     ) -> impl Stream<Item = anyhow::Result<Addr>> + 'a {
+        self.query_listed(rs, m, discovery)
+            .map_ok(|(addr, _lister)| addr)
+    }
+
+    /// [`Engine::query`], each match with the provider that listed it — the
+    /// first in registration order, when several did — as its index in
+    /// `self.providers`.
+    pub(crate) fn query_listed<'a>(
+        self: Arc<Self>,
+        rs: Arc<RequestState>,
+        m: &'a htmatcher::Matcher,
+        discovery: Discovery,
+    ) -> impl Stream<Item = anyhow::Result<(Addr, usize)>> + 'a {
         // Merging costs a few map entries and a facts clone (reference-count
         // bumps) per candidate, plus an `Addr` clone per candidate for the
         // selection dedup: only worth it for a walk that will read a fact.
@@ -486,12 +499,12 @@ impl Engine {
                 } else {
                     scan.candidates
                 };
-                for Candidate { addr, facts, .. } in candidates {
+                for Candidate { addr, facts, lister } in candidates {
                     let facts = if facts_usable { &facts } else { &ListedFacts::UNKNOWN };
                     let verdict = m.matches_listed(&addr, facts);
                     match verdict {
                         MatchResult::MatchYes => {
-                            if seen.insert(addr.clone()) { yield addr; }
+                            if seen.insert(addr.clone()) { yield (addr, lister); }
                         }
                         MatchResult::MatchNo => {}
                         MatchResult::MatchShrug => {
@@ -525,7 +538,7 @@ impl Engine {
                             }
                             match by_spec {
                                 MatchResult::MatchYes => {
-                                    if seen.insert(addr.clone()) { yield addr; }
+                                    if seen.insert(addr.clone()) { yield (addr, lister); }
                                 }
                                 MatchResult::MatchNo => {}
                                 MatchResult::MatchShrug => {
@@ -552,7 +565,7 @@ impl Engine {
                                     ) == MatchResult::MatchYes
                                         && seen.insert(addr.clone())
                                     {
-                                        yield addr;
+                                        yield (addr, lister);
                                     }
                                 }
                             }
@@ -586,25 +599,39 @@ impl Engine {
         rs: &Arc<RequestState>,
         gaps: &Gaps,
     ) -> anyhow::Result<(Vec<String>, bool)> {
-        let mut listed = Vec::with_capacity(self.providers.len());
-        let mut skipped = false;
+        let listed = self.provider_packages_keep_going(m, rs, gaps).await?;
+        let skipped = listed.len() < self.providers.len();
+        let blocks: Vec<_> = listed.into_iter().map(|(_, block)| block).collect();
+        Ok((merge_packages(m, &blocks), skipped))
+    }
+
+    /// [`packages_keep_going`](Self::packages_keep_going) before the merge:
+    /// each provider whose listing succeeded, in registration order, as its
+    /// index in `self.providers` and its sorted block (see
+    /// [`provider_packages`](Self::provider_packages)). Each failed listing is
+    /// recorded in `gaps` and left out; a cancellation ends the walk with its
+    /// error.
+    pub(crate) async fn provider_packages_keep_going(
+        &self,
+        m: &htmatcher::Matcher,
+        rs: &Arc<RequestState>,
+        gaps: &Gaps,
+    ) -> anyhow::Result<Vec<(usize, Arc<Vec<String>>)>> {
         let lists = self.provider_packages(m, rs).await;
-        for (provider, res) in self.providers.iter().zip(lists) {
+        let mut listed = Vec::with_capacity(lists.len());
+        for (i, (provider, res)) in self.providers.iter().zip(lists).enumerate() {
             match res {
-                Ok(pkgs) => listed.push(pkgs),
+                Ok(pkgs) => listed.push((i, pkgs)),
                 Err(e) if is_cancellation(rs, &e) => return Err(e),
-                Err(e) => {
-                    skipped = true;
-                    gaps.record(
-                        Stage::Packages,
-                        &provider.name,
-                        "all packages".to_string(),
-                        &e,
-                    );
-                }
+                Err(e) => gaps.record(
+                    Stage::Packages,
+                    &provider.name,
+                    "all packages".to_string(),
+                    &e,
+                ),
             }
         }
-        Ok((merge_packages(m, &listed), skipped))
+        Ok(listed)
     }
 
     /// [`Engine::query`] one tier up: the **spec** of every target matching `m`,

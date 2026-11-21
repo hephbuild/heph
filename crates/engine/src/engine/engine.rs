@@ -1630,6 +1630,13 @@ impl hplugin::lsp::LspEngine for Engine {
             })
             .unwrap_or_default()
     }
+
+    fn list(
+        self: Arc<Self>,
+        what: hplugin::lsp::Listing,
+    ) -> futures::future::BoxFuture<'static, anyhow::Result<hplugin::lsp::Listed>> {
+        Box::pin(self.lsp_list(what))
+    }
 }
 
 /// The free `cpu` capacity in whole CPUs, for the diag gauges; all of it

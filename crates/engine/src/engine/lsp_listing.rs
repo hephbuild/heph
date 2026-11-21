@@ -1,0 +1,408 @@
+//! The engine's answer to the BUILD-file LSP's listings ([`LspEngine::list`]).
+//!
+//! The LSP completes `//pkg` and `//pkg:name` from what `heph query` would
+//! list: every registered provider, with its states and probes, under
+//! [`Discovery::KeepGoing`], so one failing provider costs only its own
+//! entries. Each call is its own root request, so its own cache scope: an
+//! editor session holds one engine for hours, and a scope per call is what
+//! makes a package created, a target renamed or a BUILD file fixed show up
+//! on the next completion (see `docs/LSP.md`).
+//!
+//! [`LspEngine::list`]: hplugin::lsp::LspEngine::list
+
+use crate::engine::Engine;
+use crate::engine::discovery::{Discovery, Gaps};
+use crate::engine::packages::merge_packages;
+use crate::engine::request_state::RequestState;
+use anyhow::Context as _;
+use futures::TryStreamExt as _;
+use hcore::hasync::StdCancellationToken;
+use hmodel::htmatcher::Matcher;
+use hmodel::htpkg::PkgBuf;
+use hplugin::lsp::{Listed, ListedEntry, Listing};
+use std::sync::Arc;
+
+impl Engine {
+    /// [`LspEngine::list`](hplugin::lsp::LspEngine::list): `what`, in a cache
+    /// scope of its own.
+    pub(crate) async fn lsp_list(self: Arc<Self>, what: Listing) -> anyhow::Result<Listed> {
+        // The LSP refuses these paths before it asks; the engine refuses them
+        // again, before any provider joins one to the workspace root and
+        // walks outside it.
+        what.check()
+            .with_context(|| format!("refusing to list {what:?}"))?;
+        // The watcher rides on the scope from its mint: however this future
+        // ends — answered, failed or dropped mid-listing — the scope ends with
+        // its last holder and the watcher goes with it.
+        let (rs, scope_ended) = self.new_watched_state();
+        // The package tasks the walk spawns hold the request, and so its
+        // scope, past this future: a caller that gives up (the LSP's
+        // `LISTING_WAIT`) must stop them too, or the scope stays open until
+        // the slowest provider finishes on its own.
+        let cancel_on_drop = CancelOnDrop(Some(rs.ctoken().clone()));
+        let scope = rs.cache_scope().id();
+        let (gaps, entries) = match &what {
+            Listing::Packages { under } => {
+                let gaps = Gaps::new(format!("//{under}/..."));
+                let entries = self.lsp_packages(&rs, under, &gaps).await?;
+                (gaps, entries)
+            }
+            Listing::Targets { package } => {
+                let gaps = Gaps::new(format!("//{package}:*"));
+                let entries = Arc::clone(&self).lsp_targets(&rs, package, &gaps).await?;
+                (gaps, entries)
+            }
+        };
+        cancel_on_drop.disarm();
+        // The scope ends once this was its last holder; `scope_ended` resolves
+        // when every provider heard it.
+        drop(rs);
+        let skipped = gaps.report().selection_gaps();
+        tracing::debug!(
+            scope = scope.get(),
+            listing = ?what,
+            entries = entries.len(),
+            "lsp listing"
+        );
+        Ok(Listed {
+            scope,
+            entries,
+            skipped,
+            scope_ended,
+        })
+    }
+
+    /// The packages at or below `under`, each with the first provider (in
+    /// registration order) that listed it: the merge `heph query` walks.
+    async fn lsp_packages(
+        &self,
+        rs: &Arc<RequestState>,
+        under: &str,
+        gaps: &Gaps,
+    ) -> anyhow::Result<Vec<ListedEntry>> {
+        let m = Matcher::PackagePrefix(PkgBuf::from(under));
+        let (indices, blocks): (Vec<usize>, Vec<_>) = self
+            .provider_packages_keep_going(&m, rs, gaps)
+            .await?
+            .into_iter()
+            .unzip();
+        let names = self.lister_names();
+        let mut entries: Vec<ListedEntry> = merge_packages(&m, &blocks)
+            .into_iter()
+            .map(|pkg| {
+                // Each block is sorted, so membership is a binary search; the
+                // blocks are in registration order, so the first hit is the
+                // first lister.
+                let provider = blocks
+                    .iter()
+                    .zip(&indices)
+                    .find(|(block, _)| block.binary_search(&pkg).is_ok())
+                    .and_then(|(_, &i)| names.get(i))
+                    .map_or_else(|| Arc::from(""), Arc::clone);
+                ListedEntry {
+                    name: pkg,
+                    provider,
+                }
+            })
+            .collect();
+        entries.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        Ok(entries)
+    }
+
+    /// The targets in `package`, each name once, with the first provider (in
+    /// registration order) that listed a target of that name.
+    async fn lsp_targets(
+        self: Arc<Self>,
+        rs: &Arc<RequestState>,
+        package: &str,
+        gaps: &Arc<Gaps>,
+    ) -> anyhow::Result<Vec<ListedEntry>> {
+        let m = Matcher::Package(PkgBuf::from(package));
+        let mut found: Vec<(String, usize)> = Arc::clone(&self)
+            .query_listed(Arc::clone(rs), &m, Discovery::KeepGoing(Arc::clone(gaps)))
+            .map_ok(|(addr, lister)| (addr.name.clone(), lister))
+            .try_collect()
+            .await?;
+        // Several addrs can share a name (variants), each from its own lister,
+        // in whatever order the walk completed: order by name, then by lister,
+        // so the dedup keeps the earliest-registered one.
+        found.sort_unstable();
+        found.dedup_by(|a, b| a.0 == b.0);
+        let names = self.lister_names();
+        Ok(found
+            .into_iter()
+            .map(|(name, lister)| ListedEntry {
+                provider: names.get(lister).map_or_else(|| Arc::from(""), Arc::clone),
+                name,
+            })
+            .collect())
+    }
+
+    /// Each provider's name, by registration index, once per listing: every
+    /// entry shares its provider's, instead of a copy per entry.
+    fn lister_names(&self) -> Vec<Arc<str>> {
+        self.providers
+            .iter()
+            .map(|p| Arc::from(p.name.as_str()))
+            .collect()
+    }
+}
+
+/// Cancels a listing's request when dropped, unless the listing answered
+/// first: a listing dropped mid-walk, or one that failed, stops the work it
+/// spawned instead of leaving it to finish for nobody.
+struct CancelOnDrop(Option<StdCancellationToken>);
+
+impl CancelOnDrop {
+    /// The listing answered: leave its request alone.
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if let Some(token) = self.0.take() {
+            token.cancel();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::Config;
+    use crate::engine::fault_provider::{FaultProvider, Faults};
+    use hbuiltins::pluginstatictarget;
+    use std::time::Duration;
+
+    fn target(addr: &str) -> pluginstatictarget::Target {
+        pluginstatictarget::Target {
+            addr: addr.to_string(),
+            driver: "exec".to_string(),
+            run: Some("true".to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// An engine with one fault provider per `(name, targets, faults)`, in
+    /// that registration order.
+    fn engine_with(
+        providers: Vec<(&'static str, Vec<&str>, Faults)>,
+    ) -> anyhow::Result<(Arc<Engine>, tempfile::TempDir)> {
+        let root = tempfile::tempdir()?;
+        let mut engine = Engine::new(Config {
+            parallelism: None,
+            ..Config::for_tests(root.path())
+        })?;
+        engine
+            .register_managed_driver(|_| Box::new(hplugin_exec::pluginexec::Driver::new_exec()))?;
+        for (name, targets, faults) in providers {
+            let provider = FaultProvider::new(
+                targets.into_iter().map(target).collect(),
+                Faults {
+                    name: Some(name),
+                    ..faults
+                },
+            )?;
+            engine.register_provider(move |_| Box::new(provider))?;
+        }
+        Ok((Arc::new(engine), root))
+    }
+
+    /// Two providers listing the same package and the same target name: each
+    /// entry is credited to the first one registered, whichever answered
+    /// first.
+    #[tokio::test]
+    async fn credit_goes_to_the_first_lister() -> anyhow::Result<()> {
+        let (engine, _root) = engine_with(vec![
+            ("first", vec!["//p:t"], Faults::default()),
+            (
+                "second",
+                vec!["//p:t", "//p:only_second"],
+                Faults::default(),
+            ),
+        ])?;
+        let pkgs = Arc::clone(&engine)
+            .lsp_list(Listing::Packages {
+                under: "p".to_string(),
+            })
+            .await?;
+        assert_eq!(
+            pkgs.entries,
+            [ListedEntry {
+                name: "p".to_string(),
+                provider: Arc::from("first")
+            }],
+            "{pkgs:?}"
+        );
+        let targets = Arc::clone(&engine)
+            .lsp_list(Listing::Targets {
+                package: "p".to_string(),
+            })
+            .await?;
+        let got: Vec<(&str, &str)> = targets
+            .entries
+            .iter()
+            .map(|e| (e.name.as_str(), &*e.provider))
+            .collect();
+        assert_eq!(
+            got,
+            [("only_second", "second"), ("t", "first")],
+            "{targets:?}"
+        );
+        Ok(())
+    }
+
+    /// A listing dropped mid-walk (the LSP giving up after `LISTING_WAIT`)
+    /// cancels its request: the package task it spawned, parked in a provider
+    /// until the request is cancelled, lets go, and the scope ends promptly
+    /// instead of when the provider finishes on its own (here: never).
+    #[tokio::test]
+    async fn a_dropped_listing_cancels_its_walk_and_ends_its_scope() -> anyhow::Result<()> {
+        use crate::engine::discovery::Stage;
+        let root = tempfile::tempdir()?;
+        let mut engine = Engine::new(Config {
+            parallelism: None,
+            ..Config::for_tests(root.path())
+        })?;
+        engine
+            .register_managed_driver(|_| Box::new(hplugin_exec::pluginexec::Driver::new_exec()))?;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let provider = FaultProvider::new(
+            vec![target("//p:t")],
+            Faults {
+                name: Some("parked"),
+                cancel_at: Some((Stage::List, "p".to_string(), Arc::clone(&started))),
+                ..Default::default()
+            },
+        )?;
+        let scopes = provider.scopes();
+        engine.register_provider(move |_| Box::new(provider))?;
+        let engine = Arc::new(engine);
+
+        let listing = Arc::clone(&engine).lsp_list(Listing::Targets {
+            package: "p".to_string(),
+        });
+        // Walk until the provider is parked in `list`, then drop the listing.
+        tokio::select! {
+            res = listing => panic!("the parked listing answered: {res:?}"),
+            () = started.notified() => {}
+        }
+        assert!(scopes.ended().is_empty(), "{:?}", scopes.ended());
+        // The provider only returns once the request is cancelled; the scope
+        // ends once it has, and every provider heard it.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while scopes.ended().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("the dropped listing's scope never ended")?;
+        let seen: Vec<_> = scopes.seen().into_iter().flatten().collect();
+        let ended = scopes.ended();
+        let [ended] = ended.as_slice() else {
+            panic!("one scope ended: {ended:?}");
+        };
+        assert!(seen.contains(&ended.scope), "{seen:?} vs {ended:?}");
+        Ok(())
+    }
+
+    /// A path that would leave the workspace is refused before any provider
+    /// sees it, for both listings, with the reason in the error.
+    #[tokio::test]
+    async fn paths_outside_the_workspace_are_refused() -> anyhow::Result<()> {
+        use hplugin::lsp::BadPath;
+        // A healthy provider answers any path with `Ok` (empty, at worst), so
+        // an `Err` is the engine's refusal.
+        let (engine, _root) = engine_with(vec![("only", vec!["//p:t"], Faults::default())])?;
+        let cases = [
+            ("../..", BadPath::DotSegment),
+            ("p/./q", BadPath::DotSegment),
+            ("/etc", BadPath::Absolute),
+            ("p//q", BadPath::EmptySegment),
+            ("p/", BadPath::EmptySegment),
+            ("p\0q", BadPath::ControlByte),
+            ("p\nq", BadPath::ControlByte),
+        ];
+        for (path, why) in cases {
+            for what in [
+                Listing::Packages {
+                    under: path.to_string(),
+                },
+                Listing::Targets {
+                    package: path.to_string(),
+                },
+            ] {
+                let err = match Arc::clone(&engine).lsp_list(what.clone()).await {
+                    Ok(listed) => panic!("{what:?} listed: {listed:?}"),
+                    Err(err) => err,
+                };
+                assert_eq!(
+                    err.downcast_ref::<BadPath>(),
+                    Some(&why),
+                    "{what:?}: {err:#}"
+                );
+                assert!(format!("{err:#}").contains(why.as_str()), "{err:#}");
+            }
+        }
+        Ok(())
+    }
+
+    /// A listing's skips reach `Listed.skipped` typed, one group per stage and
+    /// provider.
+    #[tokio::test]
+    async fn skipped_is_typed_per_stage_and_provider() -> anyhow::Result<()> {
+        let (engine, _root) = engine_with(vec![
+            (
+                "broken",
+                vec!["//a:t"],
+                Faults {
+                    fail_list_packages: true,
+                    ..Default::default()
+                },
+            ),
+            ("healthy", vec!["//b:t"], Faults::default()),
+        ])?;
+        let listed = Arc::clone(&engine)
+            .lsp_list(Listing::Packages {
+                under: "b".to_string(),
+            })
+            .await?;
+        assert_eq!(listed.entries.len(), 1, "{listed:?}");
+        let [gap] = listed.skipped.as_slice() else {
+            panic!("one group: {listed:?}");
+        };
+        assert_eq!(
+            (gap.stage.as_str(), gap.provider.as_str(), gap.count),
+            ("packages", "broken", 1)
+        );
+        assert_eq!(gap.examples.len(), 1, "{gap:?}");
+        assert_eq!(gap.examples[0].scope, "all packages");
+        assert!(!gap.examples[0].cause.is_empty(), "{gap:?}");
+        Ok(())
+    }
+
+    /// More skips in one group than it keeps examples of: the group keeps
+    /// [`EXAMPLES_PER_GROUP`] of them and the exact count, so the rest are
+    /// not silently lost. (`lsp_list` reports `selection_gaps` as is; no
+    /// single listing the fault provider can stage skips more than one scope
+    /// per group.)
+    ///
+    /// [`EXAMPLES_PER_GROUP`]: crate::engine::discovery::EXAMPLES_PER_GROUP
+    #[test]
+    fn skipped_carries_the_count_past_the_examples() {
+        use crate::engine::discovery::{EXAMPLES_PER_GROUP, Stage};
+        let gaps = Gaps::new("//...");
+        let err = anyhow::anyhow!("boom");
+        for i in 0..EXAMPLES_PER_GROUP + 3 {
+            gaps.record(Stage::Spec, "go", format!("//p:t{i}"), &err);
+        }
+        let skipped = gaps.report().selection_gaps();
+        let [gap] = skipped.as_slice() else {
+            panic!("one group: {skipped:?}");
+        };
+        assert_eq!(gap.count, EXAMPLES_PER_GROUP + 3, "{gap:?}");
+        assert_eq!(gap.examples.len(), EXAMPLES_PER_GROUP, "{gap:?}");
+    }
+}
