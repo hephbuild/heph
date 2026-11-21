@@ -283,7 +283,7 @@ target(
 /// Whether `pid` no longer runs: reaped, or a zombie. A killed orphan is
 /// reparented to whichever ancestor reaps orphans, and until that one gets to
 /// it `kill(pid, 0)` still succeeds; the zombie runs nothing, so it counts.
-fn process_gone(pid: libc::pid_t) -> bool {
+pub(crate) fn process_gone(pid: libc::pid_t) -> bool {
     // SAFETY: signal 0 only checks that the pid exists; nothing is sent.
     let rc = unsafe { libc::kill(pid, 0) };
     if rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {

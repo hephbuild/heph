@@ -65,6 +65,8 @@ use std::time::Instant;
 use futures::FutureExt as _;
 use rustc_hash::FxHashMap;
 
+use crate::hasync::StdCancellationToken;
+
 /// One memoized computation. `Running` while the spawned task lives; `Done`
 /// once `done` is set (at which point `task` is empty — a completed cell pins
 /// no dead task harness).
@@ -98,6 +100,55 @@ pub(crate) struct TaskCell<V> {
     /// as "stranded": during it the cell is genuinely being driven, just by the
     /// caller's own stack rather than by a spawned task.
     inline: AtomicBool,
+    /// Cancelled when the cell is abandoned, just before its task is aborted
+    /// ([`super::abandoned_token`]). Created on first use, by the body asking
+    /// for it or by the abandonment, whichever comes first, so a cell nobody
+    /// asks about allocates nothing.
+    ///
+    /// `abort()` alone does not stop a body that never yields: one parked in
+    /// `block_in_place` (exec's output on macOS) is never `Pending`, so the
+    /// abort lands only once it returns, and the work it waits on is never
+    /// told to stop. A token is heard from a task of its own.
+    abandoned: OnceLock<StdCancellationToken>,
+}
+
+/// What a running body can reach of its own cell, without its value type.
+trait AbandonSignal: Send + Sync {
+    fn abandoned_token(&self) -> StdCancellationToken;
+    /// Without creating the token: an abandonment always creates it, so a
+    /// cell with none was not abandoned.
+    fn is_abandoned(&self) -> bool;
+}
+
+impl<V: Send + Sync> AbandonSignal for TaskCell<V> {
+    fn abandoned_token(&self) -> StdCancellationToken {
+        self.abandoned
+            .get_or_init(StdCancellationToken::new)
+            .clone()
+    }
+
+    fn is_abandoned(&self) -> bool {
+        self.abandoned
+            .get()
+            .is_some_and(StdCancellationToken::is_cancelled)
+    }
+}
+
+tokio::task_local! {
+    /// The cell whose body the current task is running. Scoped around the
+    /// body in [`BodyTask::run`], so it holds on the inline poll as on the
+    /// spawned task, and a nested cell's body sees its own.
+    static CURRENT_CELL: Arc<dyn AbandonSignal>;
+}
+
+/// The abandonment token of the cell whose body is running on this task.
+pub(crate) fn current_abandoned_token() -> Option<StdCancellationToken> {
+    CURRENT_CELL.try_with(|c| c.abandoned_token()).ok()
+}
+
+/// Whether the cell whose body is running on this task was abandoned.
+pub(crate) fn current_is_abandoned() -> bool {
+    CURRENT_CELL.try_with(|c| c.is_abandoned()).unwrap_or(false)
 }
 
 impl<V> TaskCell<V> {
@@ -421,6 +472,7 @@ where
                 created: Instant::now(),
                 restarts,
                 inline: AtomicBool::new(inline_first()),
+                abandoned: OnceLock::new(),
             });
             cell.acquire_interest();
             let body = BodyTask {
@@ -589,6 +641,12 @@ where
             restarts = cell.restarts,
             "memoized computation abandoned; aborting its task"
         );
+        // Before the abort, which a body that never yields does not see: the
+        // token is how such a body learns it is unwanted. Initialised here if
+        // the body has not asked yet, so asking later finds it cancelled.
+        cell.abandoned
+            .get_or_init(StdCancellationToken::new)
+            .cancel();
         abort.abort();
     }
 }
@@ -652,7 +710,8 @@ where
                 }
             }
         }
-        let v = fut.await;
+        let cell: Arc<dyn AbandonSignal> = Arc::clone(&self.cell) as _;
+        let v = CURRENT_CELL.scope(cell, fut).await;
         self.publish(v);
     }
 
@@ -882,6 +941,182 @@ mod tests {
         tokio::time::timeout(TIMEOUT, fut)
             .await
             .expect("test future must complete within the timeout")
+    }
+
+    /// Spin on this thread, without yielding, until `cond` holds or 10s pass
+    /// (so a red test still lets the runtime shut down).
+    fn spin_until(mut cond: impl FnMut() -> bool) {
+        let start = Instant::now();
+        while !cond() && start.elapsed() < Duration::from_secs(10) {
+            std::thread::yield_now();
+        }
+    }
+
+    type Joiner = std::pin::Pin<Box<dyn Future<Output = u32> + Send>>;
+
+    /// Start `body` as the sole joiner of key `k`, returning the joiner once
+    /// the body has spawned (it must yield first) and set `entered`.
+    async fn sole_joiner<B>(
+        m: &Arc<TaskInner<String, u32>>,
+        entered: &AtomicBool,
+        body: B,
+    ) -> Joiner
+    where
+        B: Future<Output = u32> + Send + 'static,
+    {
+        let m = Arc::clone(m);
+        let mut joiner: Joiner =
+            Box::pin(async move { m.process("k".to_string(), move || body).await });
+        assert!(futures::poll!(&mut joiner).is_pending());
+        within(async {
+            while !entered.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        joiner
+    }
+
+    /// The point of the abandonment token: a body that holds its thread
+    /// (as exec's `block_in_place` output park does) never sees its abort, but
+    /// it hears the token, which is cancelled when its last joiner leaves.
+    /// A successor under the same key gets a fresh, live token.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn abandoning_a_cell_cancels_the_token_of_a_body_holding_its_thread() {
+        let m: Arc<TaskInner<String, u32>> = Arc::new(inner("abandon-token"));
+        let entered = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel::<bool>();
+        let joiner = sole_joiner(&m, &entered, {
+            let entered = Arc::clone(&entered);
+            async move {
+                tokio::task::yield_now().await;
+                let token = current_abandoned_token().expect("inside a body");
+                entered.store(true, Ordering::SeqCst);
+                spin_until(|| token.is_cancelled());
+                let _sent = tx.send(token.is_cancelled());
+                futures::future::pending::<()>().await;
+                0
+            }
+        })
+        .await;
+        drop(joiner);
+        let heard = tokio::task::spawn_blocking(move || rx.recv_timeout(TIMEOUT))
+            .await
+            .expect("join")
+            .expect("the body reports");
+        assert!(heard, "the body never heard its cell abandoned");
+
+        let fresh = within(m.process("k".to_string(), || async {
+            tokio::task::yield_now().await;
+            u32::from(
+                current_abandoned_token()
+                    .expect("inside a body")
+                    .is_cancelled(),
+            )
+        }))
+        .await;
+        assert_eq!(fresh, 0, "a successor inherits a cancelled token");
+    }
+
+    /// A body that asks only after it was abandoned finds the token already
+    /// cancelled: the abandonment creates it when nobody asked yet.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn asking_after_the_abandonment_finds_the_token_cancelled() {
+        let m: Arc<TaskInner<String, u32>> = Arc::new(inner("abandon-late"));
+        let entered = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel::<(bool, bool)>();
+        let joiner = sole_joiner(&m, &entered, {
+            let (entered, dropped) = (Arc::clone(&entered), Arc::clone(&dropped));
+            async move {
+                tokio::task::yield_now().await;
+                entered.store(true, Ordering::SeqCst);
+                spin_until(|| dropped.load(Ordering::SeqCst));
+                let peeked = current_is_abandoned();
+                let token = current_abandoned_token().expect("inside a body");
+                let _sent = tx.send((peeked, token.is_cancelled()));
+                futures::future::pending::<()>().await;
+                0
+            }
+        })
+        .await;
+        drop(joiner);
+        dropped.store(true, Ordering::SeqCst);
+        let (peeked, cancelled) = tokio::task::spawn_blocking(move || rx.recv_timeout(TIMEOUT))
+            .await
+            .expect("join")
+            .expect("the body reports");
+        assert!(peeked, "is_abandoned missed the abandonment");
+        assert!(cancelled, "a token asked for after the abandonment is live");
+    }
+
+    /// A joiner leaving while another still waits abandons nothing, and
+    /// publishing cancels nothing: the token fires only for a cell nobody
+    /// wants.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_remaining_joiner_or_a_publish_never_cancels_the_token() {
+        let m: Arc<TaskInner<String, u32>> = Arc::new(inner("abandon-shared"));
+        let (token_tx, token_rx) = tokio::sync::oneshot::channel::<StdCancellationToken>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let first = tokio::spawn({
+            let m = Arc::clone(&m);
+            async move {
+                m.process("k".to_string(), move || async move {
+                    tokio::task::yield_now().await;
+                    drop(token_tx.send(current_abandoned_token().expect("inside a body")));
+                    drop(release_rx.await);
+                    7
+                })
+                .await
+            }
+        });
+        let token = within(token_rx).await.expect("the body sends its token");
+        // The body waits on the release, so this joins its cell.
+        let second = tokio::spawn({
+            let m = Arc::clone(&m);
+            async move { m.process("k".to_string(), || async { 0 }).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        first.abort();
+        drop(first.await);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !token.is_cancelled(),
+            "a joiner still waits; nothing is abandoned"
+        );
+        let _sent = release_tx.send(());
+        assert_eq!(within(second).await.expect("join"), 7);
+        assert!(!token.is_cancelled(), "a published cell is not abandoned");
+    }
+
+    /// Each body sees its own cell's token, a nested one included, and its
+    /// own again once the nested call returns. Outside a body, and in a task
+    /// the body spawns, there is none.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_body_sees_its_own_cells_token_and_nothing_leaks_outside() {
+        assert!(current_abandoned_token().is_none(), "outside any body");
+        let outer: Arc<TaskInner<String, u32>> = Arc::new(inner("abandon-outer"));
+        let nested: Arc<TaskInner<String, u32>> = Arc::new(inner("abandon-nested"));
+        let v = within(outer.process("o".to_string(), move || async move {
+            tokio::task::yield_now().await;
+            let mine = current_abandoned_token().expect("outer body");
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            nested
+                .process("n".to_string(), move || async move {
+                    tokio::task::yield_now().await;
+                    drop(tx.send(current_abandoned_token().expect("nested body")));
+                    0
+                })
+                .await;
+            let theirs = rx.await.expect("nested token");
+            let again = current_abandoned_token().expect("outer body, after");
+            let spawned = tokio::spawn(async { current_abandoned_token().is_none() })
+                .await
+                .expect("join");
+            u32::from(!mine.ptr_eq(&theirs) && mine.ptr_eq(&again) && spawned)
+        }))
+        .await;
+        assert_eq!(v, 1);
     }
 
     /// A borrowed key must reach the same shard as the owned key it borrows

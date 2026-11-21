@@ -5,9 +5,10 @@
 //! everything else is here, so a driver — a cdylib above all — cannot opt out
 //! of it by ignoring it, or by ignoring cancellation:
 //!
-//! 1. The run gets a cancellation token of its own, which the request's token
-//!    is forwarded into. A run without a timeout is handed the request's token
-//!    directly and pays nothing.
+//! 1. The run gets a cancellation token of its own, which its [`RunStop`]
+//!    (the request's token, and the abandonment of the execute it runs in) is
+//!    forwarded into. A run without a timeout is handed the [`RunStop`]
+//!    directly.
 //! 2. When the timeout elapses, that token is cancelled, as timed out
 //!    ([`Cancellable::timed_out`](hcore::hasync::Cancellable::timed_out)):
 //!    the driver's own cancellation path runs (exec kills the process group),
@@ -49,11 +50,13 @@
 //! env, a file): a run that can read its limit can produce something that
 //! depends on it.
 
-use hcore::hasync::{Cancellable as _, StdCancellationToken};
+use hcore::hasync::{Cancellable, StdCancellationToken};
 use hmodel::htaddr::Addr;
 use hplugin::driver::{RunClockState, Timeout};
 use std::fmt;
 use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 
@@ -186,6 +189,75 @@ impl Drop for AbortOnDrop {
     }
 }
 
+/// The token a run is handed: cancelled when the request's token is, or when
+/// nobody wants the execute it runs in any more.
+///
+/// Fail-fast stops a running sibling by dropping its last caller, which
+/// evicts its memo cell and aborts the cell's task. The abort lands at the
+/// task's next yield, and a run that holds its thread instead never reaches
+/// one while its process lives: exec's output park on macOS is a
+/// `block_in_place`. The process then ran to its own end, and a failure it
+/// reached after the stop was kept as the target's.
+///
+/// So the run's token is the pair: the request's token and the cell's
+/// [`abandoned_token`](hcore::hmemoizer::abandoned_token), which the memoizer
+/// cancels before it aborts the task. Whoever holds a clone (exec's process
+/// wait, on a task of its own) hears either one directly, so the driver's
+/// cancellation path runs (exec kills the process group) whether or not the
+/// run ever yields, and however soon its future is dropped after the abort:
+/// nothing has to be forwarded by a task that the same drop could abort.
+///
+/// Outside a memoized body there is nothing to be abandoned by, and the pair
+/// is the request's token alone.
+#[derive(Clone)]
+pub(crate) struct RunStop {
+    request: StdCancellationToken,
+    abandoned: Option<StdCancellationToken>,
+}
+
+impl RunStop {
+    /// Taken on the execute's own task, where its memo cell is visible.
+    pub(crate) fn new(request: &StdCancellationToken) -> Self {
+        Self {
+            request: request.clone(),
+            abandoned: hcore::hmemoizer::abandoned_token(),
+        }
+    }
+}
+
+impl Cancellable for RunStop {
+    fn is_cancelled(&self) -> bool {
+        self.request.is_cancelled() || self.abandoned.as_ref().is_some_and(|a| a.is_cancelled())
+    }
+
+    /// A stop is never a timeout: `enforce` times a run out on a token of
+    /// its own. The request's token is never cancelled as timed out either;
+    /// it is read rather than assumed.
+    fn timed_out(&self) -> bool {
+        self.request.timed_out()
+    }
+
+    fn cancelled(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        match &self.abandoned {
+            None => self.request.cancelled(),
+            Some(abandoned) => Box::pin(async move {
+                futures::future::select(self.request.cancelled(), abandoned.cancelled()).await;
+            }),
+        }
+    }
+
+    fn clone_arc(&self) -> Arc<dyn Cancellable + Send + Sync> {
+        Arc::new(self.clone())
+    }
+}
+
+/// Whether the run in progress on this task was told to stop rather than
+/// left to finish: the request was cancelled, or the execute it runs in was
+/// abandoned (see [`RunStop`]).
+pub(crate) fn stop_requested(request: &StdCancellationToken) -> bool {
+    request.is_cancelled() || hcore::hmemoizer::is_abandoned()
+}
+
 /// Await `run`, which was started with `run_token`, holding it to `timeout`.
 ///
 /// `parent` (the request's token) cancelling is forwarded into `run_token`,
@@ -200,15 +272,18 @@ impl Drop for AbortOnDrop {
 /// [`RunClock`](hplugin::driver::RunClock) when the driver arms one: the
 /// timeout then runs only while the driver says its process runs. `None`
 /// times the whole of `run`.
-pub(crate) async fn enforce<T>(
+pub(crate) async fn enforce<T, P>(
     run: impl Future<Output = anyhow::Result<T>>,
     run_token: &StdCancellationToken,
-    parent: &StdCancellationToken,
+    parent: &P,
     addr: &Addr,
     timeout: Timeout,
     grace: Duration,
     clock: Option<watch::Receiver<RunClockState>>,
-) -> anyhow::Result<T> {
+) -> anyhow::Result<T>
+where
+    P: Cancellable + Clone + Send + Sync + 'static,
+{
     let mut guard = CancelOnDrop {
         token: run_token,
         armed: true,
@@ -834,5 +909,126 @@ mod tests {
             .expect_err("times out");
         assert_eq!(started.elapsed(), Duration::from_secs(10));
         assert!(is_timed_out(&err), "{err:#}");
+    }
+
+    type StopMemo = hcore::hmemoizer::Memoizer<String, Result<(), Arc<anyhow::Error>>>;
+
+    /// Outside a memoized body a run's stop is its request's token alone.
+    #[tokio::test]
+    async fn outside_a_memoized_body_the_stop_is_the_requests_token() {
+        let request = StdCancellationToken::new();
+        let stop = RunStop::new(&request);
+        assert!(stop.abandoned.is_none());
+        let held = stop.clone_arc();
+        assert!(!stop.is_cancelled() && !stop_requested(&request));
+        request.cancel();
+        assert!(stop.is_cancelled() && held.is_cancelled() && stop_requested(&request));
+        assert!(!stop.timed_out());
+    }
+
+    /// The race the stop is built for: fail-fast drops the last caller of an
+    /// execute whose driver handed its token to a task of its own (exec's
+    /// process wait). However soon the body is dropped after the abort, that
+    /// task's clone hears the stop, and the request's token is untouched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_abandoned_execute_stops_a_clone_its_driver_handed_away() {
+        let memo: StopMemo = hcore::hmemoizer::Memoizer::with_tag_task(
+            "run-stop",
+            tokio::runtime::Handle::current(),
+        );
+        let request = StdCancellationToken::new();
+        let (tx, rx) = tokio::sync::oneshot::channel::<Arc<dyn Cancellable + Send + Sync>>();
+        let caller = tokio::spawn(enclose::enclose!((request) async move {
+            memo.once("k".to_string(), move || async move {
+                tokio::task::yield_now().await;
+                let stop = RunStop::new(&request);
+                let _sent = tx.send(stop.clone_arc());
+                futures::future::pending::<()>().await;
+                Ok(())
+            })
+            .await
+        }));
+        let held = tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("in time")
+            .expect("the body hands its token away");
+        assert!(!held.is_cancelled());
+        caller.abort();
+        tokio::time::timeout(Duration::from_secs(5), held.cancelled())
+            .await
+            .expect("the handed-away token never heard the abandonment");
+        assert!(!held.timed_out());
+        assert!(!request.is_cancelled(), "only this execute stops");
+    }
+
+    /// On the abandoned execute's own task, the failure that follows its stop
+    /// is a stop: `stop_requested` reads the abandonment while the body still
+    /// holds its thread, before any abort could land.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_abandoned_execute_reads_as_stop_requested_on_its_own_task() {
+        let memo: StopMemo = hcore::hmemoizer::Memoizer::with_tag_task(
+            "run-stop-own",
+            tokio::runtime::Handle::current(),
+        );
+        let request = StdCancellationToken::new();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel::<bool>();
+        let caller = tokio::spawn(enclose::enclose!((request) async move {
+            memo.once("k".to_string(), move || async move {
+                tokio::task::yield_now().await;
+                let stop = RunStop::new(&request);
+                let _sent = started_tx.send(());
+                let start = std::time::Instant::now();
+                while !stop.is_cancelled() && start.elapsed() < Duration::from_secs(10) {
+                    std::thread::yield_now();
+                }
+                let _sent = seen_tx.send(stop_requested(&request));
+                futures::future::pending::<()>().await;
+                Ok(())
+            })
+            .await
+        }));
+        tokio::time::timeout(Duration::from_secs(5), started_rx)
+            .await
+            .expect("in time")
+            .expect("the body starts");
+        caller.abort();
+        let seen =
+            tokio::task::spawn_blocking(move || seen_rx.recv_timeout(Duration::from_secs(5)))
+                .await
+                .expect("join")
+                .expect("the body reports");
+        assert!(seen, "an abandoned execute's failure reads as a failure");
+        assert!(!request.is_cancelled());
+    }
+
+    /// Abandoned before its timeout, a timed run that holds its thread is
+    /// stopped as a cancellation, not timed out: `enforce` forwards the stop
+    /// as it forwards a request cancel.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_abandoned_timed_run_is_a_cancel_not_a_timeout() {
+        let abandoned = StdCancellationToken::new();
+        let stop = RunStop {
+            request: StdCancellationToken::new(),
+            abandoned: Some(abandoned.clone()),
+        };
+        let token = StdCancellationToken::new();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            abandoned.cancel();
+        });
+        let err = enforce(
+            async { parked(&token, Duration::from_secs(30)) },
+            &token,
+            &stop,
+            &addr(),
+            secs(3600),
+            GRACE,
+            None,
+        )
+        .await
+        .expect_err("stopped");
+        assert!(token.is_cancelled() && !token.timed_out());
+        assert!(!is_timed_out(&err), "a stop, not a timeout: {err:#}");
     }
 }
