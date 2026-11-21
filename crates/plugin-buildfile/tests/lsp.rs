@@ -1207,6 +1207,22 @@ fn driver_kwargs_completion_and_hover() {
         assert!(text.contains(key), "{key} in {text}");
     }
     assert!(!text.contains("`driver`"), "`driver` is not a key: {text}");
+    // The schema's `required` is marked; the key's type stays optional.
+    let line = |key: &str| {
+        text.lines()
+            .find(|l| l.starts_with(&format!("- `{key}`:")))
+            .unwrap_or_else(|| panic!("{key} in {text}"))
+            .to_string()
+    };
+    assert_eq!(
+        line("cmd"),
+        "- `cmd`: `None | str` (required by the driver)"
+    );
+    assert_eq!(line("env"), "- `env`: `None | dict[str, str]`");
+    assert!(
+        !line("name").contains("required"),
+        "`target()`'s own required fields are not the driver's: {text}"
+    );
     assert_eq!(
         hover["contents"]["value"], kwargs["documentation"]["value"],
         "hover and completion render the same doc"

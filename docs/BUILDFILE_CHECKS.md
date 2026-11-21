@@ -267,6 +267,10 @@ def app():
     lib(name = "a", rnu = "echo")   # type-error: unknown key `rnu`
 ```
 
+`heph.types.<driver>` exists for every driver the engine registers, and only
+those. A builtin factory such as `bash` registers its driver only when
+`.hephconfig` `plugins:` names it, so the example needs `bash` listed there.
+
 The contract is:
 
 - The keys are `target()`'s own fields except `driver`, plus the driver's
@@ -278,6 +282,7 @@ The contract is:
   already fixes it.
 - A struct-shaped field (`transitive`, `approval`) is
   `dict[str, typing.Any]`, since no Starlark type has fixed keys.
+- A float field's key is `int | float`. It accepts an int, as the field does.
 - A key is never narrower than its field. Lint may miss what evaluation
   catches, never the reverse.
 - Inside the def, `kwargs` is a dict of the keys' types, so forwarding it to
@@ -296,17 +301,28 @@ Evaluation fails the call and names the key:
 ``Unexpected key `rnu` for argument `kwargs`; known keys: …``, or
 ``Value `1` of type `int` for key `run` does not match the type annotation …``.
 
-`heph.types.<driver>` exists for every driver the engine registers, and only
-those. A builtin factory such as `bash` registers its driver only when
-`plugins:` names it. `heph.types.nope.Kwargs` fails before evaluation, naming
-the drivers that have one, and `heph.types.bash.Nope` names the members that
-exist. A driver whose name cannot be written as an attribute path gets no
-namespace: one with an empty segment, a segment named `Kwargs`, or a first
-segment named like a field alias (`Deps`, …). Registry names are lowercase, so
-none is in practice.
+`heph.types.nope.Kwargs` fails before evaluation. The error names the drivers
+that have one and points at `.hephconfig` `plugins:`, where drivers come from.
+`heph.types.bash.Nope` names the members that exist. A driver whose name
+cannot be written as an attribute path gets no namespace: one with an empty
+segment, a segment named `Kwargs`, or a first segment named like a field alias
+(`Deps`, …). Registry names are lowercase, so none is in practice.
+
+`Kwargs` tracks the registered driver. It is not a frozen copy:
+
+- A driver removed, renamed or left out of `plugins:` fails every file that
+  names its `Kwargs`, before evaluation. That includes a file that only
+  `load()`s a wrapper using it, even if the wrapper is never called.
+- A call that passes a removed or narrowed driver field fails at evaluation,
+  naming the key. Lint reports it at the argument.
+- A driver field added widens the type.
+- A `target()` field added later retypes a driver key of the same name: the
+  key becomes `target()`'s.
 
 The editor completes `heph.types.<driver…>.` with `Kwargs` and the namespaces
-under it, and hovering `Kwargs` lists its keys and their types.
+under it. Hovering `Kwargs` lists its keys and their types, and marks each key
+the driver's schema requires with `(required by the driver)`. The mark is for
+reading only: the key stays optional in the type.
 
 ## What changes on upgrade
 

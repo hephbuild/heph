@@ -225,6 +225,9 @@ pub(crate) struct Kwargs {
     pub keys: Vec<(String, Ty)>,
     /// `keys` as one closed typed-kwargs type, every key optional.
     pub ty: Ty,
+    /// The keys the driver's schema declares `required`, sorted. Display only
+    /// (the hover marks them): never in [`Self::ty`] or the digest.
+    pub required: Vec<String>,
 }
 
 impl Kwargs {
@@ -234,7 +237,7 @@ impl Kwargs {
     }
 
     /// Hover / completion markdown: the type, what it is for, and each key
-    /// with its type.
+    /// with its type, marked when the driver requires it.
     pub(crate) fn markdown(&self) -> String {
         let mut md = format!(
             "**`heph.{NAMESPACE}.{}.{KWARGS}`**\n\n\
@@ -245,6 +248,9 @@ impl Kwargs {
         );
         for (key, ty) in &self.keys {
             md.push_str(&format!("\n- `{key}`: `{ty}`"));
+            if self.required.binary_search(key).is_ok() {
+                md.push_str(" (required by the driver)");
+            }
         }
         md
     }
@@ -326,10 +332,21 @@ impl DriverKwargs {
                     }
                 }
                 let keys: Vec<(String, Ty)> = keys.into_iter().collect();
+                // A required field named like a `target()` field is still a
+                // key the driver needs; only `driver` is not a key.
+                let mut required: Vec<String> = schema
+                    .fields
+                    .iter()
+                    .filter(|f| f.required && f.name != "driver")
+                    .map(|f| f.name.clone())
+                    .collect();
+                required.sort_unstable();
+                required.dedup();
                 Kwargs {
                     driver: driver.clone(),
                     ty: TyTypedKwargs::new(keys.iter().cloned()),
                     keys,
+                    required,
                 }
             })
             .collect();
