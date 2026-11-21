@@ -291,6 +291,20 @@ impl Engine {
         req: InvokeRequest,
     ) -> anyhow::Result<InvokeOutcome> {
         let addr = req.addr.clone();
+        // The invocation is the whole request (see
+        // `RequestState::claim_request_owner`). Claimed before any dep resolves:
+        // otherwise the first dep frame takes it and judges the run's
+        // `--shell=ADDR` from its own subtree alone.
+        let owns_run = rs.claim_request_owner();
+        if owns_run {
+            Arc::clone(&self).preflight_shell_target(&rs).await;
+        }
+        // The entrypoint's own frame never reaches the terminal chokepoint in
+        // `inner_result_addr`: a `--shell=` naming it is answered by
+        // `req.shell`, the driver's `run_shell` on the handover's PTY.
+        if req.shell && rs.shell_target().is_some_and(|target| target.addr == addr) {
+            rs.settle_shell();
+        }
         rs.track_dep(&addr).map_err(anyhow::Error::new)?;
         let rs = rs.with_parent(addr.clone());
 
@@ -309,7 +323,7 @@ impl Engine {
         };
 
         let res = self
-            .invoke_resolved(&rs, &spec, target, entrypoint, req)
+            .invoke_resolved(&rs, &spec, target, entrypoint, req, owns_run)
             .await;
         Ok(match res {
             Ok(Ok(())) => InvokeOutcome::Exited(Exit::Code(0)),
@@ -329,7 +343,8 @@ impl Engine {
     }
 
     /// Everything after resolution. The outer `Err` is heph's; the inner one
-    /// is the driver's run.
+    /// is the driver's run. `owns_run`: this invocation claimed the request,
+    /// so it judges whether the run's `--shell=ADDR` was entered.
     async fn invoke_resolved(
         self: &Arc<Self>,
         rs: &Arc<RequestState>,
@@ -337,6 +352,7 @@ impl Engine {
         target: Arc<crate::engine::driver::targetdef::TargetDef>,
         entrypoint: crate::engine::driver::targetdef::Entrypoint,
         req: InvokeRequest,
+        owns_run: bool,
     ) -> anyhow::Result<anyhow::Result<()>> {
         let addr = &req.addr;
         // After the def resolves, before any dep builds: a flagless release
@@ -408,6 +424,10 @@ impl Engine {
         .await;
         let inputs = inputs?;
         hash_only?;
+        // Every frame that could have entered the `--shell=` target has
+        // resolved. Said now, before the tool takes the terminal, rather than
+        // after it exits.
+        crate::engine::result::report_unentered_shell_target(rs, owns_run, true, || addr.format());
 
         // The process may exit as soon as the tool does, without the teardown
         // that would otherwise flush what these builds queued: drain it now,
