@@ -32,7 +32,7 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// the new `x.y.0`. The 0.14.0 and 0.15.0 entries below predate it — they were
 /// additive minors, and there was no version check to read them.
 ///
-/// 0.21.2 (additive, a patch): per-request provider caches. Every provider
+/// 0.21.3 (additive, a patch): per-request provider caches. Every provider
 /// request carries `cache_scope` (`uint64`: `ListRequest`/`GetRequest` 4,
 /// `ProbeRequest` 3, `ListPackagesRequest` 3), the engine cache scope the
 /// call belongs to — minted from 1, a present 0 refused, absent = no scope.
@@ -43,11 +43,11 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// that scope's caches (`Provider::scope_ended`). Nothing about a scope is
 /// hashed.
 ///
-/// The skew, both ways: a 0.21.0 or 0.21.1 plugin ignores `cache_scope` and is
-/// never sent method 10 (the host checks [`SCOPE_SINCE`]); if it were, it
-/// would answer `Unimplemented`, which the host ignores. Its caches stay what
-/// they were, provider-lifetime. A 0.21.2 plugin on a 0.21.0 or 0.21.1 host
-/// decodes every request as unscoped: one unscoped cache that never evicts
+/// The skew, both ways: a plugin from 0.21.0 to 0.21.2 ignores `cache_scope`
+/// and is never sent method 10 (the host checks [`SCOPE_SINCE`]); if it were,
+/// it would answer `Unimplemented`, which the host ignores. Its caches stay
+/// what they were, provider-lifetime. A 0.21.3 plugin on a host from 0.21.0 to
+/// 0.21.2 decodes every request as unscoped: one unscoped cache that never evicts
 /// (today's behaviour), and the SDK warns once per provider. No plugin must be
 /// rebuilt. A Rust source break for plugin authors: the four provider request
 /// structs are `#[non_exhaustive]` and are built with `new`.
@@ -357,7 +357,7 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// 0.3.0: `PluginComponents` gained a `hooks` field (a layout change to the
 /// create-entry struct) for the Hook plugin kind — a hard break, so every plugin
 /// must be rebuilt against this ABI.
-pub const ABI_SEMVER: &str = "0.21.2";
+pub const ABI_SEMVER: &str = "0.21.3";
 
 /// The start of the ABI lane this host loads: a plugin is accepted iff its
 /// version matches the caret requirement `^MIN_PLUGIN_ABI` — pre-1.0, one
@@ -374,7 +374,7 @@ pub const MIN_PLUGIN_ABI: &str = "0.21.0";
 
 /// [`ABI_SEMVER`], NUL-terminated: what a plugin's `heph_plugin_abi_semver`
 /// entry returns a pointer to. Bumped with it; a test holds the two equal.
-pub const ABI_SEMVER_C: &std::ffi::CStr = c"0.21.2";
+pub const ABI_SEMVER_C: &std::ffi::CStr = c"0.21.3";
 
 /// The first plugin ABI that reads `ManagedRunRequest.log_capture`. The host
 /// sends it only to a plugin at this version or later; an older one returns
@@ -390,7 +390,7 @@ pub const CANCEL_KEY_SINCE: &str = "0.19.1";
 /// The first plugin ABI that answers `PROVIDER_METHOD_SCOPE_ENDED`. The host
 /// sends a scope's end only to a plugin at this version or later; an older one
 /// is never told, and keeps its caches for the provider's lifetime.
-pub const SCOPE_SINCE: &str = "0.21.2";
+pub const SCOPE_SINCE: &str = "0.21.3";
 
 /// The prefix of every `ManagedRunRequest.cancel_key`. A plugin sees cancels
 /// for request ids and for run keys through the one `cancel` entry; one with
