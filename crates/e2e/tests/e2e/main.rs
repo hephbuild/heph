@@ -37,6 +37,7 @@ mod failure_out;
 mod failure_report;
 mod failure_slot;
 mod force;
+mod force_bit;
 mod fs_glob;
 mod glob_metachar_package;
 mod go_format_glob;
