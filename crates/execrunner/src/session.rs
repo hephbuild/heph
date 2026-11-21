@@ -1,15 +1,26 @@
 //! The builtin `session` runner: hold an environment open, run targets in it.
 //!
-//! Its config is one field — the argv that runs a command *inside* the
-//! environment:
+//! Its config is the argv that runs a command *inside* the environment, plus
+//! the environment that argv itself is started with:
 //!
 //! ```json
-//! { "runner": "session", "config": { "launch": ["devenv", "shell", "--"] } }
+//! { "runner": "session",
+//!   "config": { "launch": ["devenv", "shell", "--"], "env": {"PATH": "…"} } }
 //! ```
 //!
 //! The runner appends `heph __runner-agent --socket S` to that, so the agent
 //! ends up living inside whatever `launch` sets up. Everything after is the
 //! protocol in [`crate::agent`].
+//!
+//! # The launch starts from nothing
+//!
+//! The launch command runs under `env_clear` plus the config's `env`, never
+//! with heph's own environment. A launch like `devenv shell --` passes what it
+//! was started with through to the agent, and the agent's environment is every
+//! target's base — so an inherited launch handed each target whatever the user
+//! had exported in the shell that ran heph, and none of it was in any key: two
+//! machines differing only in an exported `GOFLAGS` shared one artifact. `env`
+//! lives in `runner.json`, so the runner target's hashout covers it.
 //!
 //! # The environment is the agent's, not a declaration
 //!
@@ -38,7 +49,7 @@ use crate::agent::{AGENT_SUBCOMMAND, CLIENT_SUBCOMMAND, SOCK_ENV};
 use crate::registry::{ExecRunner, RunnerCtx};
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -68,6 +79,16 @@ pub struct SessionConfig {
     /// the devenv root has to say where the root is.
     #[serde(default)]
     pub cwd: Option<String>,
+    /// The *launch* command's whole environment, over `env_clear`.
+    ///
+    /// Not the targets' environment, which is whatever the launch then puts the
+    /// agent inside; this is what the launch needs to get there (`PATH` to find
+    /// `devenv`, `HOME` for nix's settings). **Hashed**: it lives in
+    /// `runner.json`, so the runner target's hashout, and through it every
+    /// consumer's key, covers it. Nothing of heph's own environment reaches the
+    /// launch any other way.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
 }
 
 /// A live agent.
@@ -215,14 +236,8 @@ impl SessionRunner {
         //
         // `Child::try_wait` is non-blocking and needs no thread at all, which
         // removes the dependency entirely.
-        let mut cmd = std::process::Command::new(&program);
-        cmd.args(&args)
-            .current_dir(
-                cfg.cwd.as_ref().map(PathBuf::from).unwrap_or_else(|| {
-                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
-                }),
-            )
-            .env(SOCK_ENV, &socket)
+        let mut cmd = launch_command(cfg, &program, &args, &socket);
+        cmd
             // Piped, emphatically not inherited. An inherited descriptor makes
             // the agent a co-owner of heph's own stdout and stderr, and the
             // agent outlives the request that started it — so anything reading
@@ -360,6 +375,31 @@ fn build_launch_argv(
     args.push(OsString::from("--socket"));
     args.push(socket.as_os_str().to_os_string());
     Ok((PathBuf::from(head), args))
+}
+
+/// The launch `Command`'s argv, cwd and environment.
+///
+/// `env_clear`, then the config's `env`, then [`SOCK_ENV`] last so a config
+/// cannot point the agent at another socket. Nothing of heph's own environment
+/// gets through: see the module docs for why that would be a cache leak.
+fn launch_command(
+    cfg: &SessionConfig,
+    program: &Path,
+    args: &[OsString],
+    socket: &Path,
+) -> std::process::Command {
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args)
+        .current_dir(
+            cfg.cwd
+                .as_ref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))),
+        )
+        .env_clear()
+        .envs(&cfg.env)
+        .env(SOCK_ENV, socket);
+    cmd
 }
 
 /// A short, stable name for this runner's socket.
@@ -599,7 +639,7 @@ mod tests {
     fn launch_argv_appends_the_agent_invocation() {
         let cfg = SessionConfig {
             launch: vec!["devenv".to_string(), "shell".to_string(), "--".to_string()],
-            cwd: None,
+            ..SessionConfig::default()
         };
         let (program, args) = build_launch_argv(
             &cfg,
@@ -676,11 +716,53 @@ mod tests {
 
     #[test]
     fn an_empty_launch_argv_is_rejected() {
-        let cfg = SessionConfig {
-            launch: vec![],
-            cwd: None,
-        };
+        let cfg = SessionConfig::default();
         build_launch_argv(&cfg, Path::new("/heph"), Path::new("/s.sock"))
             .expect_err("an empty launch argv has no command to run");
+    }
+
+    /// The launch sees the config's `env` and the socket, and nothing of this
+    /// process's environment (issue #580). Run for real through `/usr/bin/env`
+    /// rather than read back from the `Command`, which cannot say whether it
+    /// was cleared. The test process always has `PATH` and `HOME`, so their
+    /// absence is the proof.
+    #[test]
+    fn the_launch_gets_its_declared_env_and_nothing_inherited() {
+        assert!(
+            std::env::var_os("PATH").is_some(),
+            "the test needs an ambient variable to be absent from the launch"
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = SessionConfig {
+            launch: vec!["/usr/bin/env".to_string()],
+            cwd: Some(dir.path().to_string_lossy().into_owned()),
+            env: BTreeMap::from([
+                ("XR_DECLARED".to_string(), "yes".to_string()),
+                (SOCK_ENV.to_string(), "/not/this.sock".to_string()),
+            ]),
+        };
+        let out = launch_command(&cfg, Path::new("/usr/bin/env"), &[], Path::new("/s.sock"))
+            .output()
+            .expect("run env");
+        assert!(out.status.success(), "{out:?}");
+
+        let mut got: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![format!("{SOCK_ENV}=/s.sock"), "XR_DECLARED=yes".to_string()],
+            "the launch's environment is exactly what the config declares, with heph's socket"
+        );
+    }
+
+    /// `env` is optional, so a `runner.json` written before it still parses.
+    #[test]
+    fn a_config_without_env_parses() {
+        let cfg: SessionConfig =
+            serde_json::from_str(r#"{"launch":["devenv","shell","--"]}"#).expect("parse");
+        assert!(cfg.env.is_empty());
     }
 }

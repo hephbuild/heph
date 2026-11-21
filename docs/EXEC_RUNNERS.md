@@ -127,13 +127,27 @@ absent because every absolute path the driver computed — tool symlinks, `$OUT`
   invocation is appended to it.
 - `cwd` — where to run `launch`. Not where targets run; they get their own
   sandbox.
+- `env` — the *launch command's* whole environment, over `env_clear`: what
+  `launch` needs to start (`PATH` to find `devenv`, `HOME` for nix's settings).
+  **Hashed**, because it lives in the runner target's output. Nothing of heph's
+  own environment reaches the launch any other way.
 
-There is no `env`, deliberately. The agent is a process the launch put *inside*
-the environment, so its own `environ` **is** the environment — a declared copy
-would be a second thing to keep in sync with the first. That is sound for the
-cache because a consumer names the runner *target*, whose hashout is one of its
-hashed inputs: whatever the environment provides is already in the consumer's
-cache key by construction.
+`env` is not the targets' environment. The agent is a process the launch put
+*inside* the environment, so its own `environ` **is** the environment — a
+declared copy would be a second thing to keep in sync with the first. That is
+sound for the cache because a consumer names the runner *target*, whose hashout
+is one of its hashed inputs: whatever the environment provides is already in
+the consumer's cache key by construction.
+
+That argument only holds if the launch starts from what the runner declared.
+A launch like `devenv shell --` passes the environment it was started with
+through to the agent, so a launch that inherited heph's environment handed
+every target whatever the user had exported in the shell that ran heph —
+`GOFLAGS`, `CGO_ENABLED` — in no key at all (#580). Hence `env_clear` plus
+`env`. The devenv runner fills `env` with the same `pass_env` snapshot its
+capture runs under, so the session enters the environment the fingerprint
+describes. A hand-written session runner declares at least `PATH`, or its
+launch finds only `/bin:/usr/bin`, and so does every target under it.
 
 ## The environment a target actually gets
 
@@ -187,7 +201,7 @@ base, the target's half goes on top**:
   │             config `runtime_pass_env`  (not) │
   │   session   the agent's own environ — what-  │
   │   (devenv,    ever the launch argv put it in │
-  │    nix)                                      │
+  │    nix)       (launch: config `env`, hashed) │
   │   oci       the image's Config.Env           │
   │             (target's half via docker -e)    │
   ├──────────────────────────────────────────────┤

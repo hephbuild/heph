@@ -77,7 +77,11 @@ use xxhash_rust::xxh3::Xxh3;
 /// empty one) — but every result produced under a session runner before that
 /// was built without the environment, so they have to re-derive rather than be
 /// served from the cache.
-const FORMAT_VERSION: u32 = 2;
+///
+/// 3: a `session` config carries the launch's `env` (the `pass_env` snapshot).
+/// The session runner now starts the launch from an empty environment, so a
+/// runner cached without it would launch `devenv` with no `PATH` (#580).
+const FORMAT_VERSION: u32 = 3;
 
 /// The file a runner target must produce.
 const OUT_FILE: &str = "runner.json";
@@ -480,6 +484,11 @@ impl Driver {
                 launch.push("--".to_string());
                 serde_json::json!({
                     "launch": launch,
+                    // The same hashed snapshot the capture ran under, so the
+                    // session enters the environment the fingerprint
+                    // describes — and nothing else of heph's environment
+                    // reaches it (the session runner clears the rest).
+                    "env": def.pass_env,
                     // The launch resolves its environment relative to where it
                     // runs, and the runner target's sandbox is gone by then —
                     // so point it at the real tree, not the sandbox copy.
@@ -706,6 +715,9 @@ mod tests {
     /// environment — declaring a copy would be a second thing to keep in sync
     /// with the first, and the fingerprint (which both modes derive from the
     /// same capture) is what the consumer's cache key rests on either way.
+    ///
+    /// What `session` does carry is the launch's own environment: the
+    /// `pass_env` snapshot the capture ran under, never the captured result.
     #[test]
     fn wrap_carries_the_environment_and_session_carries_the_way_in() {
         let d = Driver::new();
@@ -713,15 +725,18 @@ mod tests {
         let wrap = d.runner_config(&def(Mode::Wrap), "/ws".to_string(), captured());
         assert_eq!(wrap["env"]["APP_CHANNEL"], "stable");
 
-        let session = d.runner_config(&def(Mode::Session), "/ws".to_string(), captured());
+        let mut session_def = def(Mode::Session);
+        session_def.pass_env = BTreeMap::from([("PATH".to_string(), "/host/bin".to_string())]);
+        let session = d.runner_config(&session_def, "/ws".to_string(), captured());
         assert_eq!(session["cwd"], "/ws");
         assert_eq!(
             session["launch"],
             serde_json::json!(["devenv", "shell", "--"])
         );
-        assert!(
-            session.get("env").is_none(),
-            "the agent's own environ is the environment; a declared copy would drift from it"
+        assert_eq!(
+            session["env"],
+            serde_json::json!({"PATH": "/host/bin"}),
+            "the launch runs under the capture's input snapshot, not the captured environment"
         );
     }
 
