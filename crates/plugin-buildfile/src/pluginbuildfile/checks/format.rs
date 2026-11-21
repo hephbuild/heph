@@ -45,6 +45,7 @@ pub(crate) enum Fix {
 impl Fix {
     /// The bytes to write for a file whose source is `src`: the formatted
     /// text, or `src` itself, untouched.
+    #[cfg(test)]
     pub(crate) fn bytes<'a>(&'a self, src: &'a str) -> &'a str {
         match self {
             Fix::Rewrite(out) => out,

@@ -64,6 +64,9 @@ impl std::fmt::Debug for Parts {
 /// target.
 pub fn plugin_parts(init: PartsInit<'_>, opts: &hplugin::config::Options) -> anyhow::Result<Parts> {
     let checks = ChecksOptions::from_options(opts)?;
+    // The lint driver reads the function names from the same slot the
+    // provider digests them from.
+    let functions = provider::FunctionSource::Engine(Arc::clone(&init.functions));
     let provider = Provider::from_options(
         init.root,
         init.skip_dirs,
@@ -77,7 +80,10 @@ pub fn plugin_parts(init: PartsInit<'_>, opts: &hplugin::config::Options) -> any
     .with_shadowed_checks(init.shadowed);
     let drivers = checks::targets::CheckKind::ALL
         .into_iter()
-        .map(|k| Box::new(checks::drivers::CheckDriver::new(k)) as Box<dyn ManagedDriver>)
+        .map(|k| {
+            Box::new(checks::drivers::CheckDriver::new(k, functions.clone()))
+                as Box<dyn ManagedDriver>
+        })
         .collect();
     Ok(Parts { provider, drivers })
 }

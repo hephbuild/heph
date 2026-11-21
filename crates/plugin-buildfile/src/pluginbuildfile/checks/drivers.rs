@@ -6,7 +6,8 @@
 //! (`//@heph/fs:file@f=<path>`), staged at its workspace-relative path. The
 //! work runs under `hcore::blocking::run`. A failure's text
 //! ([`report`](super::report)) goes to the run's log, so it reaches the
-//! target's failure log; the error itself is the count line.
+//! target's failure log; the error itself is the count line, with a pointer
+//! to `heph inspect failure`.
 //!
 //! All three are cached locally and never remotely (I7): a check costs
 //! milliseconds.
@@ -14,9 +15,10 @@
 use super::format::{Fix, check_file, fix_file};
 use super::lint::{lint, read_under};
 use super::loads::LoadWalk;
-use super::report;
-use super::targets::{CheckKind, format_keys, lint_keys};
+use super::report::{self, Failure};
+use super::targets::{CheckKind, format_keys, lint_keys, plugin_fns_digest};
 use crate::htspec::Spec;
+use crate::pluginbuildfile::provider::FunctionSource;
 use anyhow::Context;
 use async_trait::async_trait;
 use hcore::debug_hash::DebugHasher;
@@ -30,7 +32,7 @@ use hplugin::driver::{
     ParseResponse, RunRequest, TargetAddr,
 };
 use hproc::proc_exec::StreamId;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::Arc;
@@ -54,9 +56,10 @@ struct LintSpec {
     require_type_annotations: bool,
     /// The BUILD-file patterns the walk resolved directory loads with.
     patterns: Vec<String>,
-    /// The `heph.<plugin>.<fn>` names the checker knows, by plugin.
-    #[spec(rename = "pluginFns")]
-    plugin_fns: HashMap<String, Vec<String>>,
+    /// [`plugin_fns_digest`] of the `heph.<plugin>.<fn>` names the checker
+    /// knows; the driver reads the names from the function registry.
+    #[spec(rename = "pluginFnsDigest", required)]
+    plugin_fns_digest: String,
 }
 
 /// The format kinds' config, as the provider writes it.
@@ -73,8 +76,9 @@ struct FormatSpec {
 struct LintDef {
     walk: LoadWalk,
     require_type_annotations: bool,
-    /// Sorted and deduplicated.
-    plugin_fns: Vec<(String, String)>,
+    /// [`plugin_fns_digest`] of the names: sorted and deduplicated, by name
+    /// only.
+    plugin_fns_digest: String,
     /// Sorted and deduplicated.
     patterns: Vec<String>,
     /// Heph's version, `hcore::version::current()`.
@@ -89,10 +93,12 @@ struct LintDef {
 ///   fork). A dev build always reports `v0.0.0-dev`, so it can reuse its own
 ///   stale local verdict after a checker change (E2): local only (I7), so no
 ///   other machine reads it, and a stamped build is exact.
-/// - The `(plugin, fn)` names, sorted and deduplicated. Plugin functions are
-///   hashed by name only because the checker sees each as an opaque callable
-///   taking and returning anything: a function's signature cannot move the
-///   verdict, only whether `heph.<plugin>.<fn>` exists.
+/// - The `(plugin, fn)` names, sorted and deduplicated, as one digest
+///   ([`plugin_fns_digest`]). Plugin functions are hashed by name only
+///   because the checker sees each as an opaque callable taking and returning
+///   anything: a function's signature cannot move the verdict, only whether
+///   `heph.<plugin>.<fn>` exists. The run checks that the registry it reads
+///   the names from has this digest.
 /// - The BUILD patterns, sorted and deduplicated: their order is not
 ///   semantic.
 /// - The walk's edges: what each `load()` string resolved to.
@@ -100,7 +106,7 @@ impl Hash for LintDef {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.require_type_annotations.hash(state);
         self.version.hash(state);
-        self.plugin_fns.hash(state);
+        self.plugin_fns_digest.hash(state);
         self.patterns.hash(state);
         self.walk.hash(state);
     }
@@ -199,16 +205,11 @@ fn parse_lint(req: &ParseRequest, version: &str) -> anyhow::Result<ParseResponse
     let spec = LintSpec::from(&req.target_spec.config).context("parsing build-lint-check")?;
     let walk: LoadWalk = serde_json::from_str(&spec.walk)
         .with_context(|| format!("decoding `{}`", lint_keys::WALK))?;
-    let plugin_fns: BTreeSet<(String, String)> = spec
-        .plugin_fns
-        .into_iter()
-        .flat_map(|(p, fns)| fns.into_iter().map(move |f| (p.clone(), f)))
-        .collect();
     let patterns: BTreeSet<String> = spec.patterns.into_iter().collect();
     let def = LintDef {
         walk,
         require_type_annotations: spec.require_type_annotations,
-        plugin_fns: plugin_fns.into_iter().collect(),
+        plugin_fns_digest: spec.plugin_fns_digest,
         patterns: patterns.into_iter().collect(),
         version: version.to_string(),
     };
@@ -263,24 +264,24 @@ fn parse_format(
     })
 }
 
-/// End a run: `failure`, when there is one, goes to the run's log (so it is
-/// the target's failure log) and the run fails with its count line.
+/// End a run: `failure`, when there is one, has its log text written to the
+/// run's log (so it is the target's failure log), and the run fails with its
+/// summary line plus where to find that log. The pointer is on the error
+/// only, never in the log, whose text is the contract.
 async fn finish(
     req: &mut RunRequest<'_, '_>,
-    failure: Option<String>,
+    failure: Option<Failure>,
 ) -> anyhow::Result<ManagedRunResponse> {
-    let Some(text) = failure else {
+    let Some(Failure { log: text, summary }) = failure else {
         return Ok(ManagedRunResponse { artifacts: vec![] });
     };
     let mut log = RunLog::from_request(req, LOG_NAME);
     log.write(StreamId::Stderr, format!("{text}\n").as_bytes())
         .await;
-    let summary = text
-        .lines()
-        .find(|l| l.contains(" in //"))
-        .unwrap_or("check failed")
-        .to_string();
-    let err = anyhow::anyhow!(summary);
+    let err = anyhow::anyhow!(
+        "{summary} (see heph inspect failure {})",
+        req.target.addr.format()
+    );
     let err = match log.log_artifact() {
         Some(artifact) => hplugin::error::with_failure_artifacts(err, vec![artifact]),
         None => err,
@@ -289,24 +290,39 @@ async fn finish(
     Err(err)
 }
 
-/// Run `f` off the async workers.
-async fn blocking<T: Send + 'static>(
-    f: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
-) -> anyhow::Result<T> {
-    hcore::blocking::run(f).await
+/// The `(plugin, fn)` names in `registry`, checked against the digest the
+/// def was keyed on: a verdict is only ever computed against the names its
+/// key covers.
+fn registry_fns<'r>(
+    registry: &'r hplugin::function::FunctionRegistry,
+    digest: &str,
+) -> anyhow::Result<Vec<(&'r str, &'r str)>> {
+    let names: Vec<(&str, &str)> = registry.iter().map(|(p, f, _)| (p, f)).collect();
+    let actual = plugin_fns_digest(names.iter().copied());
+    if actual != digest {
+        anyhow::bail!(
+            "the plugin functions changed between the check's parse and its run \
+             (digest {digest}, now {actual}); run it again"
+        );
+    }
+    Ok(names)
 }
 
-fn run_lint(def: &LintDef, ws: &Path) -> anyhow::Result<Option<String>> {
+fn run_lint(
+    def: &LintDef,
+    ws: &Path,
+    plugin_fns: &[(&str, &str)],
+) -> anyhow::Result<Option<Failure>> {
     let findings = lint(
         &def.walk,
         &mut read_under(ws),
-        &def.plugin_fns,
+        plugin_fns,
         def.require_type_annotations,
     )?;
     Ok(report::lint_failure(&def.walk.pkg, &findings))
 }
 
-fn run_format_check(def: &FormatDef, pkg: &str, ws: &Path) -> anyhow::Result<Option<String>> {
+fn run_format_check(def: &FormatDef, pkg: &str, ws: &Path) -> anyhow::Result<Option<Failure>> {
     let config = hxstarlark_fmt::Config {
         indent_size: def.indent as usize,
     };
@@ -318,41 +334,92 @@ fn run_format_check(def: &FormatDef, pkg: &str, ws: &Path) -> anyhow::Result<Opt
     Ok(report::format_failure(pkg, &findings))
 }
 
-/// Rewrite every unformatted owned file in the sandbox. An unparseable file
-/// fails the run, named; nothing is written back then.
-fn run_format(def: &FormatDef, ws: &Path) -> anyhow::Result<Option<String>> {
+/// Rewrite every unformatted owned file in the sandbox. A file that does not
+/// parse, or whose formatted text would change if formatted again, fails the
+/// run, named; nothing is written back then. The engine's in-place write-back
+/// trusts the formatter to be idempotent (I5), so this is where a formatter
+/// bug that breaks it stops, rather than flipping a file on every run.
+fn run_format(def: &FormatDef, pkg: &str, ws: &Path) -> anyhow::Result<Option<Failure>> {
     let config = hxstarlark_fmt::Config {
         indent_size: def.indent as usize,
     };
-    let mut errors = Vec::new();
+    let mut log = Vec::new();
+    let mut unparseable = Vec::new();
+    let mut unstable = Vec::new();
     for file in &def.files {
         let src = read_under(ws)(file)?;
-        let fix = fix_file(file, &src, config);
-        match &fix {
+        match fix_file(file, &src, config) {
             Fix::Unchanged => {}
-            Fix::Rewrite(_) => {
-                let path = ws.join(file);
-                // Replace rather than truncate: a staged input may share its
-                // inode with a stage entry.
-                std::fs::remove_file(&path)
-                    .and_then(|()| std::fs::write(&path, fix.bytes(&src)))
-                    .with_context(|| format!("writing {file}"))?;
+            Fix::Rewrite(out) => {
+                if !matches!(fix_file(file, &out, config), Fix::Unchanged) {
+                    log.push(format!(
+                        "{file}: formatting it twice gives different output; this is a \
+                         formatter bug, the file is left as it is"
+                    ));
+                    unstable.push(file.as_str());
+                    continue;
+                }
+                rewrite(ws, file, &out)?;
             }
-            Fix::Unparseable(e) => errors.push(format!("{file}: {e:#}")),
+            Fix::Unparseable(e) => {
+                log.push(format!("{file}: {e:#}"));
+                unparseable.push(file.as_str());
+            }
         }
     }
-    Ok((!errors.is_empty()).then(|| errors.join("\n")))
+    let summary = match (unparseable.is_empty(), unstable.is_empty()) {
+        (true, true) => return Ok(None),
+        (false, _) => format!(
+            "cannot format //{pkg}: {} does not parse; nothing was written",
+            unparseable.join(", ")
+        ),
+        (true, false) => format!(
+            "cannot format //{pkg}: the formatter is not idempotent on {}; nothing was written",
+            unstable.join(", ")
+        ),
+    };
+    Ok(Some(Failure {
+        log: log.join("\n"),
+        summary,
+    }))
+}
+
+/// Replace the sandbox file `rel` with `text`, keeping its mode: the
+/// in-place write-back copies the sandbox file's mode onto the user's, so a
+/// dropped exec bit would reach the workspace.
+fn rewrite(ws: &Path, rel: &str, text: &str) -> anyhow::Result<()> {
+    let path = ws.join(rel);
+    let perms = std::fs::metadata(&path)
+        .with_context(|| format!("reading the mode of {rel}"))?
+        .permissions();
+    // Replace rather than truncate: a staged input may share its inode with a
+    // stage entry.
+    std::fs::remove_file(&path)
+        .and_then(|()| std::fs::write(&path, text))
+        .with_context(|| format!("writing {rel}"))?;
+    std::fs::set_permissions(&path, perms).with_context(|| format!("setting the mode of {rel}"))
 }
 
 /// A check driver: one per [`CheckKind`].
-#[derive(Debug)]
 pub(crate) struct CheckDriver {
     kind: CheckKind,
+    /// Where `build-lint-check` reads the `heph.<plugin>.<fn>` names from:
+    /// the same source as the provider's, whose spec carries only their
+    /// digest.
+    functions: FunctionSource,
+}
+
+impl std::fmt::Debug for CheckDriver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CheckDriver")
+            .field("kind", &self.kind)
+            .finish_non_exhaustive()
+    }
 }
 
 impl CheckDriver {
-    pub(crate) fn new(kind: CheckKind) -> Self {
-        Self { kind }
+    pub(crate) fn new(kind: CheckKind, functions: FunctionSource) -> Self {
+        Self { kind, functions }
     }
 }
 
@@ -399,17 +466,95 @@ impl ManagedDriver for CheckDriver {
         let failure = match self.kind {
             CheckKind::LintCheck => {
                 let def = req.request.target.def_de::<LintDef>().clone();
-                blocking(move || run_lint(&def, &ws)).await?
+                let registry = self
+                    .functions
+                    .registry()
+                    .context("reading the `heph.<plugin>.<fn>` names for build-lint-check")?;
+                hcore::blocking::run(move || {
+                    let fns = registry_fns(&registry, &def.plugin_fns_digest)?;
+                    run_lint(&def, &ws, &fns)
+                })
+                .await?
             }
             CheckKind::FormatCheck => {
                 let def = req.request.target.def_de::<FormatDef>().clone();
-                blocking(move || run_format_check(&def, &pkg, &ws)).await?
+                hcore::blocking::run(move || run_format_check(&def, &pkg, &ws)).await?
             }
             CheckKind::Format => {
                 let def = req.request.target.def_de::<FormatDef>().clone();
-                blocking(move || run_format(&def, &ws)).await?
+                hcore::blocking::run(move || run_format(&def, &pkg, &ws)).await?
             }
         };
         finish(&mut req.request, failure).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// `build-format` keeps the mode of the file it rewrites: the in-place
+    /// write-back copies the sandbox file's mode onto the user's file.
+    #[test]
+    fn format_keeps_file_mode() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ws = tmp.path();
+        std::fs::create_dir_all(ws.join("pkg")).expect("mkdir");
+        for (file, mode) in [("pkg/BUILD", 0o755), ("pkg/more.BUILD", 0o644)] {
+            let path = ws.join(file);
+            std::fs::write(&path, "x    =  1\n").expect("write");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+        }
+        let def = FormatDef {
+            files: vec!["pkg/BUILD".into(), "pkg/more.BUILD".into()],
+            indent: 4,
+            version: "v1".into(),
+        };
+        assert_eq!(run_format(&def, "pkg", ws).expect("runs"), None);
+        for (file, mode) in [("pkg/BUILD", 0o755), ("pkg/more.BUILD", 0o644)] {
+            let path = ws.join(file);
+            assert_eq!(std::fs::read_to_string(&path).expect("read"), "x = 1\n");
+            let got = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+            assert_eq!(got, mode, "{file}: {got:o}");
+        }
+    }
+
+    /// An unparseable file fails the run with an error line naming it, and
+    /// the log carries the parse error.
+    #[test]
+    fn format_unparseable_names_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ws = tmp.path();
+        std::fs::create_dir_all(ws.join("pkg")).expect("mkdir");
+        std::fs::write(ws.join("pkg/BUILD"), "x    =  1\n").expect("write");
+        std::fs::write(ws.join("pkg/bad.BUILD"), "x = (\n").expect("write");
+        let def = FormatDef {
+            files: vec!["pkg/BUILD".into(), "pkg/bad.BUILD".into()],
+            indent: 4,
+            version: "v1".into(),
+        };
+        let failure = run_format(&def, "pkg", ws).expect("runs").expect("fails");
+        assert_eq!(
+            failure.summary,
+            "cannot format //pkg: pkg/bad.BUILD does not parse; nothing was written"
+        );
+        assert!(
+            failure.log.starts_with("pkg/bad.BUILD: "),
+            "{}",
+            failure.log
+        );
+    }
+
+    /// The lint run reads the names from the registry, and refuses one whose
+    /// digest is not the one the def was keyed on.
+    #[test]
+    fn registry_digest_checked() {
+        let registry = hplugin::function::FunctionRegistry::default();
+        let empty = plugin_fns_digest(std::iter::empty());
+        assert_eq!(registry_fns(&registry, &empty).expect("matches"), []);
+        let other = plugin_fns_digest([("p", "f")]);
+        let err = registry_fns(&registry, &other).expect_err("mismatch");
+        assert!(format!("{err:#}").contains("changed"), "{err:#}");
     }
 }

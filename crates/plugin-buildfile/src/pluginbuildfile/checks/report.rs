@@ -1,7 +1,8 @@
 //! What a failed check prints: one line per finding, sorted by file, line and
 //! column, each with a stable prefix and the edit that fixes it, then a count
 //! line and the footer for the kind of check. The text is the contract
-//! (docs/BUILDFILE_CHECKS.md); `checks::failure_format` pins it.
+//! (docs/BUILDFILE_CHECKS.md); `checks::failure_format` pins it. The count
+//! line is also returned on its own, as the run's error.
 
 use std::fmt;
 
@@ -59,9 +60,20 @@ impl fmt::Display for Finding {
 /// rule it breaks is switched on.
 pub(crate) const ANNOTATIONS_FOOTER: &str = "annotations are required by requireTypeAnnotations in .hephconfig (plugins: buildfile, options)";
 
-/// `build-lint-check`'s failure text for `pkg`, or `None` when there is no
+/// A failed check: the text for its failure log, and the one line that is the
+/// run's error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Failure {
+    /// The failure log: one line per finding, the count line, the footer.
+    pub log: String,
+    /// The run's error: the count line (`N findings in //pkg`), or for a run
+    /// that could not finish, a line naming why.
+    pub summary: String,
+}
+
+/// `build-lint-check`'s failure for `pkg`, or `None` when there is no
 /// finding.
-pub(crate) fn lint_failure(pkg: &str, findings: &[Finding]) -> Option<String> {
+pub(crate) fn lint_failure(pkg: &str, findings: &[Finding]) -> Option<Failure> {
     let footer = findings
         .iter()
         .any(|f| f.kind == Kind::Annotation)
@@ -69,30 +81,31 @@ pub(crate) fn lint_failure(pkg: &str, findings: &[Finding]) -> Option<String> {
     failure(pkg, findings, footer)
 }
 
-/// `build-format-check`'s failure text for `pkg`, or `None` when every file is
+/// `build-format-check`'s failure for `pkg`, or `None` when every file is
 /// formatted.
-pub(crate) fn format_failure(pkg: &str, findings: &[Finding]) -> Option<String> {
+pub(crate) fn format_failure(pkg: &str, findings: &[Finding]) -> Option<Failure> {
     let footer = format!("run heph run //{pkg}:build-format to fix");
     failure(pkg, findings, Some(&footer))
 }
 
-fn failure(pkg: &str, findings: &[Finding], footer: Option<&str>) -> Option<String> {
+fn failure(pkg: &str, findings: &[Finding], footer: Option<&str>) -> Option<Failure> {
     if findings.is_empty() {
         return None;
     }
     let mut sorted: Vec<&Finding> = findings.iter().collect();
     sorted.sort();
-    let mut out = String::new();
+    let mut log = String::new();
     for finding in sorted {
-        out.push_str(&finding.to_string());
-        out.push('\n');
+        log.push_str(&finding.to_string());
+        log.push('\n');
     }
     let n = findings.len();
     let noun = if n == 1 { "finding" } else { "findings" };
-    out.push_str(&format!("{n} {noun} in //{pkg}"));
+    let summary = format!("{n} {noun} in //{pkg}");
+    log.push_str(&summary);
     if let Some(footer) = footer {
-        out.push('\n');
-        out.push_str(footer);
+        log.push('\n');
+        log.push_str(footer);
     }
-    Some(out)
+    Some(Failure { log, summary })
 }

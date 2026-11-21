@@ -227,7 +227,24 @@ pub(crate) mod lint_keys {
     pub(crate) const WALK: &str = "walk";
     pub(crate) const REQUIRE: &str = "requireTypeAnnotations";
     pub(crate) const PATTERNS: &str = "patterns";
-    pub(crate) const PLUGIN_FNS: &str = "pluginFns";
+    pub(crate) const PLUGIN_FNS_DIGEST: &str = "pluginFnsDigest";
+}
+
+/// One digest of the `(plugin, fn)` names the checker knows, sorted and
+/// deduplicated. The lint spec carries it instead of the names, so a spec
+/// costs the same however many functions the plugins export; the driver
+/// reads the names themselves from the plugin function registry and checks
+/// them against it.
+///
+/// Plugin functions are hashed by name only: the checker sees each as an
+/// opaque callable taking and returning anything, so a function's signature
+/// cannot move the verdict, only whether `heph.<plugin>.<fn>` exists.
+pub(crate) fn plugin_fns_digest<'a>(names: impl IntoIterator<Item = (&'a str, &'a str)>) -> String {
+    use std::hash::Hash;
+    let names: BTreeSet<(&str, &str)> = names.into_iter().collect();
+    let mut h = xxhash_rust::xxh3::Xxh3Default::new();
+    names.hash(&mut h);
+    format!("{:032x}", h.digest128())
 }
 
 /// The format kinds' spec config keys.
@@ -252,8 +269,9 @@ fn spec(addr: Addr, kind: CheckKind, config: HashMap<String, Value>) -> TargetSp
 }
 
 /// `build-lint-check`'s spec: the package's load walk (its edges and every
-/// file it reads), the option, the BUILD patterns and the plugin function
-/// names the checker knows.
+/// file it reads), the option, the BUILD patterns and the
+/// [digest](plugin_fns_digest) of the plugin function names the checker
+/// knows.
 pub(crate) fn lint_spec<'a>(
     addr: Addr,
     walk: &LoadWalk,
@@ -262,14 +280,6 @@ pub(crate) fn lint_spec<'a>(
     plugin_fns: impl IntoIterator<Item = (&'a str, &'a str)>,
 ) -> anyhow::Result<TargetSpec> {
     let walk = serde_json::to_string(walk).context("encoding the load walk")?;
-    let mut fns: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
-    for (plugin, func) in plugin_fns {
-        fns.entry(plugin).or_default().insert(func);
-    }
-    let fns = fns
-        .into_iter()
-        .map(|(p, f)| (p.to_string(), strings(f)))
-        .collect();
     let config = HashMap::from([
         (lint_keys::WALK.to_string(), Value::String(walk)),
         (
@@ -280,7 +290,10 @@ pub(crate) fn lint_spec<'a>(
             lint_keys::PATTERNS.to_string(),
             strings(patterns.iter().map(glob::Pattern::as_str)),
         ),
-        (lint_keys::PLUGIN_FNS.to_string(), Value::Map(fns)),
+        (
+            lint_keys::PLUGIN_FNS_DIGEST.to_string(),
+            Value::String(plugin_fns_digest(plugin_fns)),
+        ),
     ]);
     Ok(spec(addr, CheckKind::LintCheck, config))
 }

@@ -365,12 +365,15 @@ fn failure_format() {
     );
 
     // Given out of order: printed sorted by file, line, column.
+    let failure = lint_failure(
+        "pkg",
+        &[type_error.clone(), annotation.clone(), earlier.clone()],
+    )
+    .expect("fails");
+    // The count line is the run's error, on its own.
+    assert_eq!(failure.summary, "3 findings in //pkg");
     assert_eq!(
-        lint_failure(
-            "pkg",
-            &[type_error.clone(), annotation.clone(), earlier.clone()]
-        )
-        .expect("fails"),
+        failure.log,
         format!(
             "pkg/BUILD:3:2: type-error: Expected type `int` but got `str`\n\
              pkg/BUILD:3:9: annotation: parameter `x` of `make_lib` has no type; add `: <type>`\n\
@@ -384,10 +387,12 @@ fn failure_format() {
         "annotations are required by requireTypeAnnotations in .hephconfig (plugins: buildfile, options)"
     );
     // No annotation finding: no footer.
+    let failure = lint_failure("pkg", &[type_error.clone()]).expect("fails");
     assert_eq!(
-        lint_failure("pkg", &[type_error.clone()]).expect("fails"),
+        failure.log,
         "pkg/defs.BUILD:12:5: type-error: Expected type `str` but got `int`\n1 finding in //pkg"
     );
+    assert_eq!(failure.summary, "1 finding in //pkg");
     assert_eq!(lint_failure("pkg", &[]), None);
 
     let unformatted = at(
@@ -397,11 +402,13 @@ fn failure_format() {
         Kind::Format,
         "not formatted; this is the first line that differs from the formatter's output",
     );
+    let failure = format_failure("a/b", &[unformatted]).expect("fails");
     assert_eq!(
-        format_failure("a/b", &[unformatted]).expect("fails"),
+        failure.log,
         "a/b/BUILD:4:1: format: not formatted; this is the first line that differs from the \
          formatter's output\n1 finding in //a/b\nrun heph run //a/b:build-format to fix"
     );
+    assert_eq!(failure.summary, "1 finding in //a/b");
     assert_eq!(format_failure("a/b", &[]), None);
 }
 

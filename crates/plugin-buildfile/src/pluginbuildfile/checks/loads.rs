@@ -3,7 +3,9 @@
 //! It parses a package's BUILD files and everything they `load()`,
 //! transitively, without evaluating any of them, and resolves every edge
 //! through evaluation's own resolver ([`resolve_load`]). The provider runs it
-//! once per package and hands the edges to the lint driver in its def, so the
+//! once per check target `get` (so three times per package when all three
+//! checks resolve; it is not cached) and hands the edges to the lint driver
+//! in its def, so the
 //! driver never resolves a load: the sandbox stages read-only inputs as
 //! symlinked subtrees, which [`find_build_files`](super::super::run_file::find_build_files)
 //! skips, so resolving again there would give a different answer from the
@@ -67,6 +69,12 @@ pub(crate) struct WalkedFile {
     /// Each distinct `load()` string in the file, literally as written, and
     /// what it resolved to.
     pub loads: BTreeMap<String, LoadEdge>,
+    /// The path is a symbolic link. A linked file is never owned (I1): its
+    /// target may be outside the workspace, or the same physical file as
+    /// another package's, so neither formatting it nor reporting it is any
+    /// one package's. It is still read, and its interface still used.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub symlink: bool,
 }
 
 /// A package's load graph: its BUILD files and every file they load,
@@ -91,7 +99,8 @@ impl LoadWalk {
     /// i.e. held by its directory. That is its BUILD files (`*.BUILD` helpers
     /// included) and any file of its own directory it loads, never a file it
     /// only loads from another package. A file of this directory the package
-    /// does not load is not reached, so not owned by anyone (E1).
+    /// does not load is not reached, so not owned by anyone (E1); nor is a
+    /// symlinked file ([`WalkedFile::symlink`]).
     pub(crate) fn owned(&self) -> impl Iterator<Item = &str> {
         self.files
             .iter()
@@ -127,7 +136,8 @@ impl LoadWalk {
                 .get(path)
                 .with_context(|| format!("load graph names {path}, which it does not record"))?;
             if !stack.insert(path) {
-                anyhow::bail!("load() cycle detected at {path}");
+                // Paths here are workspace-relative already: the root is "".
+                return Err(load_cycle(Path::new(""), Path::new(path)));
             }
             for edge in file.loads.values() {
                 for dep in edge.files() {
@@ -152,9 +162,9 @@ impl LoadWalk {
 
 /// The ownership rule (I1): `pkg` owns `file` exactly when the file is
 /// evaluated in `pkg`, which [`resolve_load`] decides from the directory
-/// holding it.
+/// holding it, and is not a symlink.
 pub(crate) fn owns(pkg: &str, file: &WalkedFile) -> bool {
-    file.pkg == pkg
+    file.pkg == pkg && !file.symlink
 }
 
 /// Walk `pkg`'s load graph: parse its BUILD files (those matching `patterns`)
@@ -236,6 +246,10 @@ impl Walker<'_> {
         if !self.in_flight.insert(path.to_path_buf()) {
             return Err(load_cycle(self.root, path));
         }
+        let symlink = std::fs::symlink_metadata(path)
+            .with_context(|| format!("stat {rel}"))?
+            .file_type()
+            .is_symlink();
         let ast = parse_build_file(path)?;
         let mut loads = BTreeMap::new();
         for load in ast.loads() {
@@ -254,6 +268,7 @@ impl Walker<'_> {
             WalkedFile {
                 pkg: pkg.to_string(),
                 loads,
+                symlink,
             },
         );
         Ok(())

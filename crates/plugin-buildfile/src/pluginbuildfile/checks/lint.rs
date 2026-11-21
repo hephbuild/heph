@@ -21,7 +21,8 @@ use allocative::Allocative;
 use anyhow::Context;
 use starlark::any::ProvidesStaticType;
 use starlark::environment::Globals;
-use starlark::typing::{AstModuleTypecheck, Interface, ParamSpec, Ty};
+use starlark::typing::{AstModuleTypecheck, Interface, Ty};
+use starlark::values::typing::{StarlarkCallableParamAny, StarlarkCallableParamSpec};
 use starlark::values::{NoSerialize, StarlarkValue, starlark_value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
@@ -43,7 +44,7 @@ use std::path::Path;
 pub(crate) fn lint(
     walk: &LoadWalk,
     read: &mut dyn FnMut(&str) -> anyhow::Result<String>,
-    plugin_fns: &[(String, String)],
+    plugin_fns: &[(&str, &str)],
     require_annotations: bool,
 ) -> anyhow::Result<Vec<Finding>> {
     let globals = check_globals(plugin_fns);
@@ -55,7 +56,7 @@ pub(crate) fn lint(
             .files
             .get(path)
             .with_context(|| format!("load graph orders {path}, which it does not record"))?;
-        let src = read(path).with_context(|| format!("reading {path}"))?;
+        let src = read(path)?;
         let ast = parse_build_source(path, src)?;
 
         let mut loads = HashMap::new();
@@ -86,6 +87,17 @@ pub(crate) fn lint(
 
         // Approximations mark where the checker gave up, not wrong code.
         let (errors, _types, iface, _approximations) = ast.typecheck(&globals, &loads);
+        // An internal error is the checker failing, not the code: the check
+        // could not run, whichever file it is in.
+        if let Some(e) = errors
+            .iter()
+            .find(|e| matches!(e.kind(), starlark::ErrorKind::Internal(_)))
+        {
+            anyhow::bail!(
+                "the typechecker failed on {path}: {}",
+                e.without_diagnostic()
+            );
+        }
         if owned {
             findings.extend(errors.iter().map(|e| type_error(path, e)));
         }
@@ -96,12 +108,10 @@ pub(crate) fn lint(
     Ok(findings)
 }
 
-/// Read workspace-relative paths under `root` (the driver's sandbox).
+/// Read workspace-relative paths under `root` (the driver's sandbox). An
+/// error names the workspace-relative path, never the sandbox's.
 pub(crate) fn read_under(root: &Path) -> impl FnMut(&str) -> anyhow::Result<String> + '_ {
-    move |rel| {
-        let path = root.join(rel);
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))
-    }
+    move |rel| std::fs::read_to_string(root.join(rel)).with_context(|| format!("reading {rel}"))
 }
 
 /// A typechecked file: its interface, and the exported names it binds at the
@@ -158,9 +168,9 @@ fn type_error(path: &str, e: &starlark::Error) -> Finding {
 /// The globals the checker typechecks against: evaluation's static surface
 /// (`target()` and the other builtins, `heph.core`, `heph.types`) plus one
 /// [`OpaquePluginFn`] per plugin function name.
-fn check_globals(plugin_fns: &[(String, String)]) -> Globals {
+fn check_globals(plugin_fns: &[(&str, &str)]) -> Globals {
     let mut by_plugin: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
-    for (plugin, func) in plugin_fns {
+    for &(plugin, func) in plugin_fns {
         by_plugin.entry(plugin).or_default().insert(func);
     }
     heph_globals(|hb| {
@@ -197,9 +207,8 @@ starlark::starlark_simple_value!(OpaquePluginFn);
 #[starlark_value(type = "provider_function")]
 impl<'v> StarlarkValue<'v> for OpaquePluginFn {
     fn typechecker_ty(&self) -> Option<Ty> {
-        let any = ParamSpec::new_parts([], [], Some(Ty::any()), [], Some(Ty::any()))
-            .unwrap_or_else(|_| ParamSpec::empty());
-        Some(Ty::callable(any, Ty::any()))
+        // `*args: Any, **kwargs: Any`.
+        Some(Ty::callable(StarlarkCallableParamAny::params(), Ty::any()))
     }
 }
 
@@ -211,12 +220,7 @@ pub(super) mod tests {
     /// `lint` over `pkg` in the workspace at `root`, with `heph.fs.glob` known.
     fn run(root: &Path, pkg: &str, require: bool) -> anyhow::Result<Vec<Finding>> {
         let walk = walk(root, pkg)?;
-        lint(
-            &walk,
-            &mut read_under(root),
-            &[("fs".to_string(), "glob".to_string())],
-            require,
-        )
+        lint(&walk, &mut read_under(root), &[("fs", "glob")], require)
     }
 
     /// The findings of `pkg`, which must check.
@@ -572,7 +576,7 @@ def f() -> None:
 ";
         let tmp = ws(&[("pkg/BUILD", src)]);
         let graph = walk(tmp.path(), "pkg").expect("walk");
-        let fns = [("p".to_string(), "make".to_string())];
+        let fns = [("p", "make")];
         let found = lint(&graph, &mut read_under(tmp.path()), &fns, true).expect("checks");
         assert_eq!(found, []);
         // The name is what the checker knows: an unknown plugin is reported.
@@ -586,6 +590,38 @@ def f() -> None:
         assert_eq!(base, hash(&[("q", "other"), ("p", "make"), ("p", "make")]));
         assert_ne!(base, hash(&[("p", "make")]));
         assert_ne!(base, hash(&[("p", "make2"), ("q", "other")]));
+
+        // The spec carries one digest, not the names: its size does not grow
+        // with the number of plugin functions.
+        use crate::pluginbuildfile::checks::targets::{ChecksOptions, lint_keys, lint_spec};
+        let addr = hmodel::htaddr::Addr::new(
+            hmodel::htpkg::PkgBuf::from("pkg"),
+            "build-lint-check".to_string(),
+            Default::default(),
+        );
+        let many: Vec<(String, String)> = (0..500)
+            .map(|i| (format!("p{i}"), format!("f{i}")))
+            .collect();
+        let spec = lint_spec(
+            addr,
+            &graph,
+            ChecksOptions::default(),
+            &patterns(),
+            many.iter().map(|(p, f)| (p.as_str(), f.as_str())),
+        )
+        .expect("spec");
+        let Some(hcore::htvalue::Value::String(digest)) =
+            spec.config.get(lint_keys::PLUGIN_FNS_DIGEST)
+        else {
+            panic!("a digest string: {:?}", spec.config);
+        };
+        assert_eq!(digest.len(), 32, "{digest}");
+        assert!(
+            !spec
+                .config
+                .values()
+                .any(|v| format!("{v:?}").contains("p499"))
+        );
     }
 
     fn patterns() -> Vec<glob::Pattern> {

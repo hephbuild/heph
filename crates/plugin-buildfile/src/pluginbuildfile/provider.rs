@@ -338,7 +338,10 @@ impl Provider {
     }
 
     /// The spec of check `kind` in `pkg`: the package's load walk, run off
-    /// the async workers, then the kind's spec.
+    /// the async workers, then the kind's spec. The walk is not cached, so
+    /// it runs once per check target `get`: three times per package when all
+    /// three checks resolve (perf-measurement decides whether that needs a
+    /// cache).
     async fn check_spec(
         &self,
         addr: &Addr,
@@ -358,9 +361,8 @@ impl Provider {
                     .functions
                     .registry()
                     .context("reading the `heph.<plugin>.<fn>` names for build-lint-check")?;
-                let fns = registry
-                    .plugins()
-                    .flat_map(|(p, fns)| fns.keys().map(move |f| (p, f.as_str())));
+                // Only their digest reaches the spec.
+                let fns = registry.iter().map(|(p, f, _)| (p, f));
                 targets::lint_spec(addr.clone(), &walk, opts, &self.build_file_patterns, fns)
             }
             kind => Ok(targets::format_spec(addr.clone(), kind, &walk, opts)),
