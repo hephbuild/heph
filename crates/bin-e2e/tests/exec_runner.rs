@@ -42,7 +42,7 @@ target(
 {{"version": 1,
  "fingerprint": "e2e-passthrough-v1",
  "runner": "session",
- "config": {{"launch": ["/usr/bin/env"]}}}}
+ "config": {{"launch": ["/usr/bin/env"], "launch_env": {{"PATH": "/usr/bin:/bin"}}}}}}
 JSON""",
     out = "runner.json",
 )
@@ -329,8 +329,9 @@ wait""",
 /// A session runner whose launch script sets up an environment before handing
 /// over to the agent.
 ///
-/// Nothing about the environment is declared in `runner.json` — that is the
-/// point of agent mode. The script exports variables and extends `PATH`, then
+/// Nothing about the targets' environment is declared in `runner.json` — that
+/// is the point of agent mode; `launch_env` is only what the launch itself starts
+/// with. The script exports variables and extends `PATH`, then
 /// `exec "$@"`s the agent, so the agent's own `environ` *is* the environment,
 /// exactly as `devenv shell --` or `docker run` would leave it.
 ///
@@ -353,7 +354,7 @@ cat > $OUT <<'JSON'
 {{"version": 1,
  "fingerprint": "e2e-env-runner-v1",
  "runner": "session",
- "config": {{"launch": ["/bin/sh", "{script}"]}}}}
+ "config": {{"launch": ["/bin/sh", "{script}"], "launch_env": {{"PATH": "/usr/bin:/bin"}}}}}}
 JSON""",
     out = "runner.json",
 )
@@ -404,6 +405,56 @@ target(
         got.trim(),
         "from-the-environment-from-the-target",
         "the runner's environment must reach the target, and the target's own value must win\n{}",
+        describe(&out)
+    );
+}
+
+/// A variable exported in the shell that runs heph does not reach a target
+/// under a session runner (#580).
+///
+/// The launch passes its environment through to the agent, as `devenv shell
+/// --` does, and the agent's environment is every target's base. A launch that
+/// inherited heph's environment therefore leaked the user's exports into every
+/// target, in no cache key: two hosts differing only in an exported `GOFLAGS`
+/// shared one artifact.
+#[test]
+fn a_host_export_does_not_reach_a_session_target() {
+    let dist = Dist::locate();
+    let ws = Workspace::new().expect("workspace");
+    let marker = ws.root().join("leak.txt");
+
+    let mut build = passthrough_runner("runner");
+    build.push_str(&format!(
+        r#"
+target(
+    name = "reads_env",
+    driver = "bash",
+    run = "echo ${{XR_HOST_ONLY:-absent}} > {}",
+    out = [],
+    runner = "//xr:runner",
+)
+"#,
+        marker.display()
+    ));
+    ws.write("xr/BUILD", &build).expect("write BUILD");
+
+    let child = ws
+        .cmd(&dist, &["run", "//xr:reads_env"])
+        .env("XR_HOST_ONLY", "leaked-from-the-host")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn heph");
+    let out = common::wait_output(child, common::RUN_DEADLINE).expect("run");
+    assert!(out.status.success(), "{}", describe(&out));
+
+    let got = std::fs::read_to_string(&marker)
+        .unwrap_or_else(|e| panic!("the target never ran ({e})\n{}", describe(&out)));
+    assert_eq!(
+        got.trim(),
+        "absent",
+        "a variable exported to heph must not reach a session target\n{}",
         describe(&out)
     );
 }

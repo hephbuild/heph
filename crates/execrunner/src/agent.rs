@@ -901,7 +901,9 @@ async fn handle_conn(conn: UnixStream, fds: [OwnedFd; 3], in_flight: Arc<InFligh
 /// `env_clear` + the runner's environment + the target's.
 ///
 /// The runner's half is this process's own `environ` — whatever the launch
-/// command (`devenv shell --`, `docker run …`) put the agent inside. The
+/// command (`devenv shell --`, `docker run …`) put the agent inside. The launch
+/// itself starts from `env_clear` plus the session config's hashed `launch_env`
+/// ([`crate::session`]), so heph's own environment is no part of it. The
 /// target's half is `request`, which is the client's `environ` and therefore
 /// exactly the environment heph built for the target.
 ///

@@ -1,15 +1,28 @@
 //! The builtin `session` runner: hold an environment open, run targets in it.
 //!
-//! Its config is one field — the argv that runs a command *inside* the
-//! environment:
+//! Its config is the argv that runs a command *inside* the environment, plus
+//! the environment that argv itself is started with:
 //!
 //! ```json
-//! { "runner": "session", "config": { "launch": ["devenv", "shell", "--"] } }
+//! { "runner": "session",
+//!   "config": { "launch": ["devenv", "shell", "--"],
+//!               "launch_env": {"PATH": "…"}, "cwd": "/repo" } }
 //! ```
 //!
 //! The runner appends `heph __runner-agent --socket S` to that, so the agent
 //! ends up living inside whatever `launch` sets up. Everything after is the
 //! protocol in [`crate::agent`].
+//!
+//! # The launch starts from nothing
+//!
+//! The launch command runs under `env_clear` plus the config's `launch_env`,
+//! in the config's `cwd` (or `/`), never with heph's own environment or
+//! working directory. A launch like `devenv shell --` passes what it
+//! was started with through to the agent, and the agent's environment is every
+//! target's base — so an inherited launch handed each target whatever the user
+//! had exported in the shell that ran heph, and none of it was in any key: two
+//! machines differing only in an exported `GOFLAGS` shared one artifact.
+//! `launch_env` lives in `runner.json`, so the runner target's hashout covers it.
 //!
 //! # The environment is the agent's, not a declaration
 //!
@@ -38,7 +51,7 @@ use crate::agent::{AGENT_SUBCOMMAND, CLIENT_SUBCOMMAND, SOCK_ENV};
 use crate::registry::{ExecRunner, RunnerCtx};
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -66,8 +79,22 @@ pub struct SessionConfig {
     /// their own sandbox cwd from the request. `devenv shell` resolves its
     /// environment relative to where it runs, so a runner target that is not in
     /// the devenv root has to say where the root is.
+    ///
+    /// Unset means `/`, never the directory heph was invoked from: that would
+    /// make the environment the launch enters depend on where the user stood,
+    /// in no key.
     #[serde(default)]
     pub cwd: Option<String>,
+    /// The *launch* command's whole environment, over `env_clear`.
+    ///
+    /// Not the targets' environment, which is whatever the launch then puts the
+    /// agent inside; this is what the launch needs to get there (`PATH` to find
+    /// `devenv`, `HOME` for nix's settings). **Hashed**: it lives in
+    /// `runner.json`, so the runner target's hashout, and through it every
+    /// consumer's key, covers it. Nothing of heph's own environment reaches the
+    /// launch any other way.
+    #[serde(default)]
+    pub launch_env: BTreeMap<String, String>,
 }
 
 /// A live agent.
@@ -200,7 +227,8 @@ impl SessionRunner {
         let socket = socket_path(&self.socket_root, &name)
             .with_context(|| format!("runner {}: place the agent socket", ctx.addr))?;
 
-        let (program, args) = build_launch_argv(cfg, &exe, &socket)?;
+        let (program, args) = build_launch_argv(cfg, &exe, &socket)
+            .with_context(|| format!("runner {}", ctx.addr))?;
 
         // `std::process::Command`, not `proc_exec`, and the reason is the whole
         // shape of this function.
@@ -215,14 +243,8 @@ impl SessionRunner {
         //
         // `Child::try_wait` is non-blocking and needs no thread at all, which
         // removes the dependency entirely.
-        let mut cmd = std::process::Command::new(&program);
-        cmd.args(&args)
-            .current_dir(
-                cfg.cwd.as_ref().map(PathBuf::from).unwrap_or_else(|| {
-                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
-                }),
-            )
-            .env(SOCK_ENV, &socket)
+        let mut cmd = launch_command(cfg, &program, &args, &socket);
+        cmd
             // Piped, emphatically not inherited. An inherited descriptor makes
             // the agent a co-owner of heph's own stdout and stderr, and the
             // agent outlives the request that started it — so anything reading
@@ -255,8 +277,12 @@ impl SessionRunner {
         unsafe { cmd.pre_exec(new_session) };
 
         let mut child = cmd.spawn().map_err(|e| {
+            // Names only: a value can be a credential (a proxy URL).
+            let keys: Vec<&str> = cfg.launch_env.keys().map(String::as_str).collect();
             anyhow::anyhow!(
-                "runner {}: start the session agent via {:?}: {e}",
+                "runner {}: start the session agent via {:?}: {e}\n\
+                 hint: the launch runs with only the runner's `launch_env` ({keys:?}), \
+                 not heph's environment",
                 ctx.addr,
                 cfg.launch
             )
@@ -354,12 +380,43 @@ fn build_launch_argv(
     let head = it
         .next()
         .ok_or_else(|| anyhow::anyhow!("empty `launch` argv"))?;
+    // Refused here rather than left to `execvp`, which would search libc's
+    // default path and report a bare `No such file or directory` for a program
+    // that is on the user's `PATH` — pointing at the tool, not at the cause.
+    if !head.contains('/') && !cfg.launch_env.contains_key("PATH") {
+        anyhow::bail!(
+            "the `launch` program {head:?} is a bare name, but `launch_env` declares no PATH to \
+             find it on. The launch starts from an empty environment, not heph's: add \"PATH\" \
+             to `launch_env`, or give `launch` an absolute path"
+        );
+    }
     let mut args: Vec<OsString> = it.map(OsString::from).collect();
     args.push(exe.as_os_str().to_os_string());
     args.push(OsString::from(AGENT_SUBCOMMAND));
     args.push(OsString::from("--socket"));
     args.push(socket.as_os_str().to_os_string());
     Ok((PathBuf::from(head), args))
+}
+
+/// The launch `Command`'s argv, cwd and environment.
+///
+/// `env_clear`, then the config's `launch_env`, then [`SOCK_ENV`] last so a
+/// config cannot point the agent at another socket; the config's `cwd`, or `/`.
+/// Nothing of heph's own environment or working directory gets through: see the
+/// module docs for why that would be a cache leak.
+fn launch_command(
+    cfg: &SessionConfig,
+    program: &Path,
+    args: &[OsString],
+    socket: &Path,
+) -> std::process::Command {
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args)
+        .current_dir(cfg.cwd.as_deref().unwrap_or("/"))
+        .env_clear()
+        .envs(&cfg.launch_env)
+        .env(SOCK_ENV, socket);
+    cmd
 }
 
 /// A short, stable name for this runner's socket.
@@ -599,7 +656,8 @@ mod tests {
     fn launch_argv_appends_the_agent_invocation() {
         let cfg = SessionConfig {
             launch: vec!["devenv".to_string(), "shell".to_string(), "--".to_string()],
-            cwd: None,
+            launch_env: BTreeMap::from([("PATH".to_string(), "/bin".to_string())]),
+            ..SessionConfig::default()
         };
         let (program, args) = build_launch_argv(
             &cfg,
@@ -676,11 +734,95 @@ mod tests {
 
     #[test]
     fn an_empty_launch_argv_is_rejected() {
-        let cfg = SessionConfig {
-            launch: vec![],
-            cwd: None,
-        };
+        let cfg = SessionConfig::default();
         build_launch_argv(&cfg, Path::new("/heph"), Path::new("/s.sock"))
             .expect_err("an empty launch argv has no command to run");
+    }
+
+    /// The launch sees the config's `launch_env` and the socket, and nothing of this
+    /// process's environment (issue #580). Run for real through `/usr/bin/env`
+    /// rather than read back from the `Command`, which cannot say whether it
+    /// was cleared. The test process always has `PATH` and `HOME`, so their
+    /// absence is the proof.
+    #[test]
+    fn the_launch_gets_its_declared_env_and_nothing_inherited() {
+        assert!(
+            std::env::var_os("PATH").is_some(),
+            "the test needs an ambient variable to be absent from the launch"
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = SessionConfig {
+            launch: vec!["/usr/bin/env".to_string()],
+            cwd: Some(dir.path().to_string_lossy().into_owned()),
+            launch_env: BTreeMap::from([
+                ("XR_DECLARED".to_string(), "yes".to_string()),
+                (SOCK_ENV.to_string(), "/not/this.sock".to_string()),
+            ]),
+        };
+        let out = launch_command(&cfg, Path::new("/usr/bin/env"), &[], Path::new("/s.sock"))
+            .output()
+            .expect("run env");
+        assert!(out.status.success(), "{out:?}");
+
+        let mut got: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![format!("{SOCK_ENV}=/s.sock"), "XR_DECLARED=yes".to_string()],
+            "the launch's environment is exactly what the config declares, with heph's socket"
+        );
+    }
+
+    /// `launch_env` is optional, so a `runner.json` written before it still
+    /// parses.
+    #[test]
+    fn a_config_without_launch_env_parses() {
+        let cfg: SessionConfig =
+            serde_json::from_str(r#"{"launch":["/usr/bin/env"]}"#).expect("parse");
+        assert!(cfg.launch_env.is_empty());
+    }
+
+    /// A bare launch program with no declared `PATH` would be searched for on
+    /// libc's default path and fail as a bare ENOENT. It is refused up front,
+    /// naming the cause — the case a `runner.json` written before `launch_env`
+    /// hits first.
+    #[test]
+    fn a_bare_launch_program_without_a_declared_path_is_refused_with_the_cause() {
+        let cfg = SessionConfig {
+            launch: vec!["devenv".to_string(), "shell".to_string(), "--".to_string()],
+            launch_env: BTreeMap::from([("HOME".to_string(), "/h".to_string())]),
+            ..SessionConfig::default()
+        };
+        let err = build_launch_argv(&cfg, Path::new("/heph"), Path::new("/s.sock"))
+            .expect_err("a bare name needs a PATH to be found on");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("\"devenv\""), "{msg}");
+        assert!(msg.contains("launch_env"), "{msg}");
+        assert!(msg.contains("PATH"), "{msg}");
+
+        // An absolute program needs no PATH.
+        let cfg = SessionConfig {
+            launch: vec!["/usr/bin/env".to_string()],
+            ..SessionConfig::default()
+        };
+        build_launch_argv(&cfg, Path::new("/heph"), Path::new("/s.sock")).expect("absolute");
+    }
+
+    /// No `cwd` means `/`, not the directory heph was started from: the
+    /// environment a launch like `devenv shell` enters depends on where it runs.
+    #[test]
+    fn a_launch_without_cwd_runs_in_root() {
+        let cfg = SessionConfig {
+            launch: vec!["/bin/pwd".to_string()],
+            ..SessionConfig::default()
+        };
+        let out = launch_command(&cfg, Path::new("/bin/pwd"), &[], Path::new("/s.sock"))
+            .output()
+            .expect("run pwd");
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "/");
     }
 }
