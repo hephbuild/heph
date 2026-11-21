@@ -393,26 +393,88 @@ async fn scope_per_completion_cost() -> anyhow::Result<()> {
         }
     }
     let total = D * E * P;
-
-    let calls = [
-        ("Packages under \"\"", packages("")),
-        ("Packages under \"d3/e4\"", packages("d3/e4")),
-        ("Targets in d3/e4/p5", targets("d3/e4/p5")),
-    ];
     println!("\n{total} packages, {TARGETS_PER_PKG} targets each");
+    time_calls(
+        &ws,
+        [
+            ("Packages under \"\"", packages("")),
+            ("Packages under \"d3/e4\"", packages("d3/e4")),
+            ("Targets in d3/e4/p5", targets("d3/e4/p5")),
+        ],
+    )
+    .await?;
+
+    // A Go module at the root: `GO_GROUPS * GO_PKGS` packages with a `.go`
+    // file each, no BUILD file but the root's (the variant the Go provider
+    // lists build targets for) and a handful of `provider_state` ones, so
+    // the Go provider's walk and its `states_under` both carry the cost.
+    let ws = workspace()?;
+    ws.write_file("go.mod", "module example.com/bench\n\ngo 1.21\n");
+    ws.write_build_file(
+        "",
+        &format!(
+            "provider_state(provider = \"go\", variants = {{\"host\": {{\"goos\": \"{}\", \"goarch\": \"{}\"}}}})\n",
+            hcore::htplatform::os(),
+            hcore::htplatform::arch(),
+        ),
+    );
+    for g in 0..GO_GROUPS {
+        for p in 0..GO_PKGS {
+            ws.write_file(
+                &format!("g{g}/p{p}/x.go"),
+                &format!("package p{p}\n\nfunc F() int {{ return {p} }}\n"),
+            );
+        }
+    }
+    for g in 0..GO_STATES {
+        ws.write_build_file(
+            &format!("g{g}/p{g}"),
+            "provider_state(provider = \"go\", test = {\"pre_run\": [\"true\"]})\n",
+        );
+    }
+    println!(
+        "\nGo module: {} packages, {GO_STATES} provider_state BUILD files",
+        GO_GROUPS * GO_PKGS
+    );
+    time_calls(
+        &ws,
+        [
+            ("Go: Packages under \"\"", packages("")),
+            ("Go: Targets in g3/p5", targets("g3/p5")),
+            ("Go: Targets in g1/p1 (has a state)", targets("g1/p1")),
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
+/// The Go section of [`scope_per_completion_cost`]: `g<i>/p<j>`.
+const GO_GROUPS: usize = 15;
+const GO_PKGS: usize = 20;
+/// How many of the Go packages (`g<i>/p<i>`) carry a `provider_state` BUILD
+/// file.
+const GO_STATES: usize = 5;
+
+/// Prints one table row per call: its entries, the first call's time and the
+/// median, min and max of [`WARM_REPEATS`] more.
+async fn time_calls<const N: usize>(
+    ws: &htestkit::Workspace,
+    calls: [(&str, Listing); N],
+) -> anyhow::Result<()> {
     println!("| call | entries | cold | warm median | warm min | warm max |");
     println!("|---|---|---|---|---|---|");
     for (label, what) in calls {
         let start = Instant::now();
-        let listed = list(&ws, what.clone()).await?;
+        let listed = list(ws, what.clone()).await?;
         let cold = start.elapsed();
         let entries = listed.entries.len();
         assert!(listed.skipped.is_empty(), "{:?}", listed.skipped);
-        let mut warm: Vec<Duration> = Vec::with_capacity(WARM_REPEATS);
-        for _ in 0..WARM_REPEATS {
+        // An array, so the constant indexes below are checked at compile time.
+        let mut warm = [Duration::ZERO; WARM_REPEATS];
+        for slot in &mut warm {
             let start = Instant::now();
-            let listed = list(&ws, what.clone()).await?;
-            warm.push(start.elapsed());
+            let listed = list(ws, what.clone()).await?;
+            *slot = start.elapsed();
             assert_eq!(listed.entries.len(), entries);
         }
         warm.sort_unstable();
