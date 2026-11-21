@@ -78,7 +78,7 @@ use xxhash_rust::xxh3::Xxh3;
 /// was built without the environment, so they have to re-derive rather than be
 /// served from the cache.
 ///
-/// 3: a `session` config carries the launch's `env` (the `pass_env` snapshot).
+/// 3: a `session` config carries `launch_env` (the `pass_env` snapshot).
 /// The session runner now starts the launch from an empty environment, so a
 /// runner cached without it would launch `devenv` with no `PATH` (#580).
 const FORMAT_VERSION: u32 = 3;
@@ -485,10 +485,10 @@ impl Driver {
                 serde_json::json!({
                     "launch": launch,
                     // The same hashed snapshot the capture ran under, so the
-                    // session enters the environment the fingerprint
-                    // describes — and nothing else of heph's environment
-                    // reaches it (the session runner clears the rest).
-                    "env": def.pass_env,
+                    // session is launched the way the fingerprinted capture
+                    // was — and nothing else of heph's environment reaches it
+                    // (the session runner clears the rest).
+                    "launch_env": def.pass_env,
                     // The launch resolves its environment relative to where it
                     // runs, and the runner target's sandbox is gone by then —
                     // so point it at the real tree, not the sandbox copy.
@@ -734,7 +734,7 @@ mod tests {
             serde_json::json!(["devenv", "shell", "--"])
         );
         assert_eq!(
-            session["env"],
+            session["launch_env"],
             serde_json::json!({"PATH": "/host/bin"}),
             "the launch runs under the capture's input snapshot, not the captured environment"
         );

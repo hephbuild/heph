@@ -126,13 +126,23 @@ absent because every absolute path the driver computed — tool symlinks, `$OUT`
 - `launch` — argv that runs a command *inside* the environment. The agent
   invocation is appended to it.
 - `cwd` — where to run `launch`. Not where targets run; they get their own
-  sandbox.
-- `env` — the *launch command's* whole environment, over `env_clear`: what
-  `launch` needs to start (`PATH` to find `devenv`, `HOME` for nix's settings).
-  **Hashed**, because it lives in the runner target's output. Nothing of heph's
-  own environment reaches the launch any other way.
+  sandbox. Unset means `/`, never the directory heph was invoked from.
+- `launch_env` — the *launch command's* whole environment, over `env_clear`:
+  what `launch` needs to start (`PATH` to find `devenv`, `HOME` for nix's
+  settings). **Hashed**, because it lives in the runner target's output.
+  Nothing of heph's own environment reaches the launch any other way.
+  **A hand-written runner declares at least `PATH`** unless `launch` names an
+  absolute program; a bare name with no `PATH` is refused before anything
+  runs.
 
-`env` is not the targets' environment. The agent is a process the launch put
+```json
+{ "version": 1, "fingerprint": "…", "runner": "session",
+  "config": { "launch": ["devenv", "shell", "--"], "cwd": "/repo",
+              "launch_env": { "PATH": "/run/current-system/sw/bin:/usr/bin:/bin",
+                              "HOME": "/home/me" } } }
+```
+
+`launch_env` is not the targets' environment. The agent is a process the launch put
 *inside* the environment, so its own `environ` **is** the environment — a
 declared copy would be a second thing to keep in sync with the first. That is
 sound for the cache because a consumer names the runner *target*, whose hashout
@@ -144,10 +154,19 @@ A launch like `devenv shell --` passes the environment it was started with
 through to the agent, so a launch that inherited heph's environment handed
 every target whatever the user had exported in the shell that ran heph —
 `GOFLAGS`, `CGO_ENABLED` — in no key at all (#580). Hence `env_clear` plus
-`env`. The devenv runner fills `env` with the same `pass_env` snapshot its
-capture runs under, so the session enters the environment the fingerprint
-describes. A hand-written session runner declares at least `PATH`, or its
-launch finds only `/bin:/usr/bin`, and so does every target under it.
+`launch_env`, and a fixed `cwd` for the same reason. The devenv runner fills
+`launch_env` with the same `pass_env` snapshot its fingerprinted capture runs
+under, so the session is launched exactly as that capture was.
+
+What stays unhashed is what sits *behind* those strings: the tools in the
+directories `PATH` names, and the files under `HOME`. A changed binary behind
+an unchanged `PATH` moves no key. That is the same exemption every runner whose
+environment names host directories has, `wrap` included.
+
+Note that a variable `launch_env` leaves out is absent from the targets too, not
+merely from the launch: a launch that passes its environment through has
+nothing to pass. A target that needs a host directory on `PATH` gets it through
+the runner, or declares it itself.
 
 ## The environment a target actually gets
 
@@ -201,7 +220,7 @@ base, the target's half goes on top**:
   │             config `runtime_pass_env`  (not) │
   │   session   the agent's own environ — what-  │
   │   (devenv,    ever the launch argv put it in │
-  │    nix)       (launch: config `env`, hashed) │
+  │    nix)       (launch: `launch_env`, hashed) │
   │   oci       the image's Config.Env           │
   │             (target's half via docker -e)    │
   ├──────────────────────────────────────────────┤

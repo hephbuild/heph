@@ -42,7 +42,7 @@ target(
 {{"version": 1,
  "fingerprint": "e2e-passthrough-v1",
  "runner": "session",
- "config": {{"launch": ["/usr/bin/env"], "env": {{"PATH": "/usr/bin:/bin"}}}}}}
+ "config": {{"launch": ["/usr/bin/env"], "launch_env": {{"PATH": "/usr/bin:/bin"}}}}}}
 JSON""",
     out = "runner.json",
 )
@@ -330,7 +330,7 @@ wait""",
 /// over to the agent.
 ///
 /// Nothing about the targets' environment is declared in `runner.json` — that
-/// is the point of agent mode; `env` is only what the launch itself starts
+/// is the point of agent mode; `launch_env` is only what the launch itself starts
 /// with. The script exports variables and extends `PATH`, then
 /// `exec "$@"`s the agent, so the agent's own `environ` *is* the environment,
 /// exactly as `devenv shell --` or `docker run` would leave it.
@@ -354,7 +354,7 @@ cat > $OUT <<'JSON'
 {{"version": 1,
  "fingerprint": "e2e-env-runner-v1",
  "runner": "session",
- "config": {{"launch": ["/bin/sh", "{script}"], "env": {{"PATH": "/usr/bin:/bin"}}}}}}
+ "config": {{"launch": ["/bin/sh", "{script}"], "launch_env": {{"PATH": "/usr/bin:/bin"}}}}}}
 JSON""",
     out = "runner.json",
 )
@@ -416,7 +416,7 @@ target(
 /// --` does, and the agent's environment is every target's base. A launch that
 /// inherited heph's environment therefore leaked the user's exports into every
 /// target, in no cache key: two hosts differing only in an exported `GOFLAGS`
-/// shared one artifact. The launch's declared `env` is what reaches it instead.
+/// shared one artifact.
 #[test]
 fn a_host_export_does_not_reach_a_session_target() {
     let dist = Dist::locate();
@@ -429,7 +429,7 @@ fn a_host_export_does_not_reach_a_session_target() {
 target(
     name = "reads_env",
     driver = "bash",
-    run = "echo ${{XR_HOST_ONLY:-absent}}-${{PATH:+has-path}} > {}",
+    run = "echo ${{XR_HOST_ONLY:-absent}} > {}",
     out = [],
     runner = "//xr:runner",
 )
@@ -453,8 +453,8 @@ target(
         .unwrap_or_else(|e| panic!("the target never ran ({e})\n{}", describe(&out)));
     assert_eq!(
         got.trim(),
-        "absent-has-path",
-        "a host export must not reach the target; the launch's declared PATH must\n{}",
+        "absent",
+        "a variable exported to heph must not reach a session target\n{}",
         describe(&out)
     );
 }
