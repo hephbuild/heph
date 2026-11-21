@@ -14,6 +14,7 @@ use crate::engine::Engine;
 use crate::engine::discovery::{Discovery, Gaps};
 use crate::engine::packages::merge_packages;
 use crate::engine::request_state::RequestState;
+use anyhow::Context as _;
 use futures::TryStreamExt as _;
 use hmodel::htmatcher::Matcher;
 use hmodel::htpkg::PkgBuf;
@@ -24,6 +25,11 @@ impl Engine {
     /// [`LspEngine::list`](hplugin::lsp::LspEngine::list): `what`, in a cache
     /// scope of its own.
     pub(crate) async fn lsp_list(self: Arc<Self>, what: Listing) -> anyhow::Result<Listed> {
+        // The LSP refuses these paths before it asks; the engine refuses them
+        // again, before any provider joins one to the workspace root and
+        // walks outside it.
+        what.check()
+            .with_context(|| format!("refusing to list {what:?}"))?;
         // The watcher rides on the scope from its mint: however this future
         // ends — answered, failed or dropped mid-listing — the scope ends with
         // its last holder and the watcher goes with it.
@@ -217,6 +223,47 @@ mod tests {
             [("only_second", "second"), ("t", "first")],
             "{targets:?}"
         );
+        Ok(())
+    }
+
+    /// A path that would leave the workspace is refused before any provider
+    /// sees it, for both listings, with the reason in the error.
+    #[tokio::test]
+    async fn paths_outside_the_workspace_are_refused() -> anyhow::Result<()> {
+        use hplugin::lsp::BadPath;
+        // A healthy provider answers any path with `Ok` (empty, at worst), so
+        // an `Err` is the engine's refusal.
+        let (engine, _root) = engine_with(vec![("only", vec!["//p:t"], Faults::default())])?;
+        let cases = [
+            ("../..", BadPath::DotSegment),
+            ("p/./q", BadPath::DotSegment),
+            ("/etc", BadPath::Absolute),
+            ("p//q", BadPath::EmptySegment),
+            ("p/", BadPath::EmptySegment),
+            ("p\0q", BadPath::ControlByte),
+            ("p\nq", BadPath::ControlByte),
+        ];
+        for (path, why) in cases {
+            for what in [
+                Listing::Packages {
+                    under: path.to_string(),
+                },
+                Listing::Targets {
+                    package: path.to_string(),
+                },
+            ] {
+                let err = match Arc::clone(&engine).lsp_list(what.clone()).await {
+                    Ok(listed) => panic!("{what:?} listed: {listed:?}"),
+                    Err(err) => err,
+                };
+                assert_eq!(
+                    err.downcast_ref::<BadPath>(),
+                    Some(&why),
+                    "{what:?}: {err:#}"
+                );
+                assert!(format!("{err:#}").contains(why.as_str()), "{err:#}");
+            }
+        }
         Ok(())
     }
 
