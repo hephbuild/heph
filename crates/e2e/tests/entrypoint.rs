@@ -1195,13 +1195,17 @@ async fn concurrent_invocations_run_in_parallel() -> anyhow::Result<()> {
     let ws = Workspace::new();
     let markers = tempfile::tempdir()?;
     let counter = ws.dir.path().join("dep-built.txt");
+    // Each tool writes its sandbox path to `t-$$` and renames it to `m-$$`:
+    // `>` creates the file before `printf` fills it, so a marker written in
+    // place can be listed — and read — empty, and the test then checks
+    // that "" survives gc.
     ws.write_build_file(
         "app",
         &format!(
             r#"
 target(name = "dep", driver = "bash", run = "echo x >> {counter} && printf d > $OUT", out = "d")
 target(name = "ep", driver = "bash", entrypoint = True, deps = {{"d": ":dep"}},
-       run = "d={markers}; printf '%s' \"$WORKSPACE_ROOT\" > \"$d/m-$$\"; i=0; while [ \"$(ls \"$d\" | grep -c '^m-')\" -lt {N} ] || [ ! -e \"$d/go\" ]; do i=$((i+1)); [ $i -gt 2400 ] && exit 7; sleep 0.05; done; [ \"$(cat \"$SRC_D\")\" = d ] || exit 8")
+       run = "d={markers}; printf '%s' \"$WORKSPACE_ROOT\" > \"$d/t-$$\"; mv \"$d/t-$$\" \"$d/m-$$\"; i=0; while [ \"$(ls \"$d\" | grep -c '^m-')\" -lt {N} ] || [ ! -e \"$d/go\" ]; do i=$((i+1)); [ $i -gt 2400 ] && exit 7; sleep 0.05; done; [ \"$(cat \"$SRC_D\")\" = d ] || exit 8")
 "#,
             counter = counter.display(),
             markers = markers.path().display(),
