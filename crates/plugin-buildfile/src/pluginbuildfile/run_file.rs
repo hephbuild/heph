@@ -1,3 +1,4 @@
+use crate::pluginbuildfile::checks::targets::CheckKind;
 use crate::pluginbuildfile::provider::{PackageList, Provider};
 use anyhow::Context;
 use enclose::enclose;
@@ -550,7 +551,12 @@ impl<'v> starlark::values::StarlarkValue<'v> for ProviderNativeFn {
         }
 
         if !targets.is_empty() {
-            let provenance = if extra.capture_provenance {
+            // As `target()`: a shadowed check's call site, for `heph validate`.
+            let provenance = if extra.capture_provenance
+                || targets
+                    .iter()
+                    .any(|t| CheckKind::from_name(&t.name).is_some())
+            {
                 capture_provenance(eval)
             } else {
                 Vec::new()
@@ -1163,7 +1169,9 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
         // An empty driver is allowed here: the provider resolves it against the
         // configured `defaultDriver` (and errors if neither is set).
 
-        let provenance = if extra.capture_provenance {
+        let provenance = if extra.capture_provenance || CheckKind::from_name(&name).is_some() {
+            // A target named like a check shadows it, and `heph validate`
+            // names where it was declared (I2). Rare, so worth the walk.
             capture_provenance(eval)
         } else {
             Vec::new()

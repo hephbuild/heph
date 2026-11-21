@@ -9,24 +9,43 @@
 use super::report::{Finding, Kind};
 use crate::pluginbuildfile::ast::walk_stmt;
 use crate::pluginbuildfile::types;
+use starlark::codemap::Span;
 use starlark::syntax::AstModule;
 use starlark::syntax::ast::{AstParameter, ParameterP, Stmt};
 
 /// Every unannotated `def` parameter in `ast`, nested defs included, in
 /// source order. Positions are 1-based, columns counted in characters.
 pub(crate) fn check(ast: &AstModule) -> Vec<Finding> {
-    let mut findings = Vec::new();
+    missing(ast).into_iter().map(|m| finding(ast, m)).collect()
+}
+
+/// One unannotated parameter: where it is, and what to say about it.
+#[derive(Debug)]
+pub(crate) struct Missing {
+    /// The parameter's span, as written (`x = 1`, `*args`).
+    pub span: Span,
+    /// What is wrong and the edit that fixes it.
+    pub message: String,
+}
+
+/// [`check`]'s findings as spans, for a caller that marks them in place
+/// (the BUILD-file LSP), in source order.
+pub(crate) fn missing(ast: &AstModule) -> Vec<Missing> {
+    let mut out = Vec::new();
     walk_stmt(ast.statement(), &mut |s| {
         let Stmt::Def(def) = &s.node else {
             return;
         };
         for param in &def.params {
             if let Some(name) = unannotated(param) {
-                findings.push(finding(ast, param, &def.name.node.ident, &name));
+                out.push(Missing {
+                    span: param.span,
+                    message: message(&def.name.node.ident, &name),
+                });
             }
         }
     });
-    findings
+    out
 }
 
 /// The parameter as written (`x`, `*args`, `**kwargs`) when it has no type.
@@ -44,21 +63,25 @@ fn unannotated(param: &AstParameter) -> Option<String> {
     }
 }
 
-fn finding(ast: &AstModule, param: &AstParameter, def: &str, name: &str) -> Finding {
-    let span = ast.file_span(param.span);
-    let begin = span.resolve_span().begin;
+fn message(def: &str, name: &str) -> String {
     // A parameter named like a `target()` field passes it through: suggest the
     // alias that types it as `target()` accepts it.
     let fix = match types::for_param(name) {
         Some(alias) => format!("heph.{}.{}", types::NAMESPACE, alias.name),
         None => "<type>".to_string(),
     };
+    format!("parameter `{name}` of `{def}` has no type; add `: {fix}`")
+}
+
+fn finding(ast: &AstModule, missing: Missing) -> Finding {
+    let span = ast.file_span(missing.span);
+    let begin = span.resolve_span().begin;
     Finding {
         file: span.filename().to_string(),
         line: begin.line + 1,
         col: begin.column + 1,
         kind: Kind::Annotation,
-        message: format!("parameter `{name}` of `{def}` has no type; add `: {fix}`"),
+        message: missing.message,
     }
 }
 

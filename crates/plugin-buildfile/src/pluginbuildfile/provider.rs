@@ -1,5 +1,5 @@
 use crate::pluginbuildfile::checks::loads::walk_package;
-use crate::pluginbuildfile::checks::targets::{self, CheckKind, ChecksOptions};
+use crate::pluginbuildfile::checks::targets::{self, CheckKind, ChecksOptions, ShadowedChecks};
 use crate::pluginbuildfile::run_file::RunResult;
 use anyhow::Context;
 use futures::future::BoxFuture;
@@ -202,6 +202,9 @@ pub struct Provider {
     ///
     /// [`plugin_parts`]: crate::pluginbuildfile::plugin_parts
     pub(crate) checks: Option<ChecksOptions>,
+    /// Where `list` records each check target a package's own target
+    /// shadows (I2), for `heph validate`. Written only with the checks on.
+    pub(crate) shadowed: ShadowedChecks,
 }
 
 impl Provider {
@@ -225,6 +228,7 @@ impl Provider {
             globals: Arc::new(OnceLock::new()),
             walker: Arc::new(CachedWalker::disabled()),
             checks: None,
+            shadowed: ShadowedChecks::default(),
         }
     }
 }
@@ -301,6 +305,13 @@ impl Provider {
     /// calls this, beside registering the drivers that run them.
     pub(crate) fn with_checks(mut self, opts: ChecksOptions) -> Self {
         self.checks = Some(opts);
+        self
+    }
+
+    /// Record shadowed check targets into `shadowed`, a handle the caller
+    /// keeps (`heph validate` reads it).
+    pub(crate) fn with_shadowed_checks(mut self, shadowed: ShadowedChecks) -> Self {
+        self.shadowed = shadowed;
         self
     }
 
@@ -639,10 +650,20 @@ impl EProvider for Provider {
 
             // The check targets, in every package with a BUILD file, but for
             // one a target of the package shadows (I2): that name is listed
-            // once, as the user's.
+            // once, as the user's, and recorded for `heph validate`.
             let mut checks = Vec::new();
             if self.checks.is_some() && self.has_build_file(req.package.as_str()).await? {
                 let shadowed = targets::shadowed(res.targets.iter().map(|t| t.name.as_str()));
+                self.shadowed.record(
+                    req.package.as_str(),
+                    targets::shadowed_checks(
+                        &self.root,
+                        &req.package,
+                        res.targets
+                            .iter()
+                            .map(|t| (t.name.as_str(), t.provenance.as_slice())),
+                    ),
+                );
                 checks.extend(
                     CheckKind::ALL
                         .into_iter()

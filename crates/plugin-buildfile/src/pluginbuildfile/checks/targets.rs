@@ -10,8 +10,9 @@ use super::loads::LoadWalk;
 use anyhow::Context;
 use hcore::htvalue::Value;
 use hmodel::htaddr::Addr;
-use hplugin::provider::{ListedFacts, TargetSpec};
+use hplugin::provider::{ListedFacts, ProvenanceFrame, TargetSpec};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::{Arc, Mutex, PoisonError};
 
 /// The plugin the check drivers belong to; a driver's full name is
 /// `<plugin>.<local>`.
@@ -98,6 +99,94 @@ pub(crate) fn shadowed<'a>(
         .filter_map(CheckKind::from_name)
         .map(CheckKind::name)
         .collect()
+}
+
+/// A target that shadows a check target (I2), as `heph validate` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShadowedCheck {
+    /// The user's target, which `list` and `get` answer for the check's name.
+    pub addr: Addr,
+    /// Where it was declared: the innermost call site (`target()`, or the
+    /// plugin function's call), and the outermost one when that is elsewhere
+    /// (a macro in a loaded file, called from the BUILD file). `None` only if
+    /// evaluation recorded no call site.
+    pub declared_at: Option<String>,
+    /// The check it shadows, its target name.
+    pub check: &'static str,
+}
+
+impl std::fmt::Display for ShadowedCheck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.addr.format())?;
+        if let Some(at) = &self.declared_at {
+            write!(f, ", declared at {at},")?;
+        }
+        write!(
+            f,
+            " shadows the BUILD-file check `{}`: rename the target, or remove it to get the check back",
+            self.check
+        )
+    }
+}
+
+/// The [`ShadowedCheck`]s of `pkg`'s targets, given each target's name and
+/// call-site provenance (outermost frame first, as evaluation captures it).
+/// Paths are shown relative to `root`.
+pub(crate) fn shadowed_checks<'a>(
+    root: &std::path::Path,
+    pkg: &hmodel::htpkg::PkgBuf,
+    targets: impl IntoIterator<Item = (&'a str, &'a [ProvenanceFrame])>,
+) -> Vec<ShadowedCheck> {
+    let site = |f: &ProvenanceFrame| {
+        let file = std::path::Path::new(&f.file);
+        let shown = file.strip_prefix(root).unwrap_or(file);
+        format!("{}:{}", shown.display(), f.line_start)
+    };
+    targets
+        .into_iter()
+        .filter_map(|(name, provenance)| {
+            let check = CheckKind::from_name(name)?;
+            let declared_at = match (provenance.last(), provenance.first()) {
+                (Some(inner), Some(outer)) if inner != outer => {
+                    Some(format!("{} (called from {})", site(inner), site(outer)))
+                }
+                (Some(inner), _) => Some(site(inner)),
+                (None, _) => None,
+            };
+            Some(ShadowedCheck {
+                addr: Addr::new(pkg.clone(), name.to_string(), Default::default()),
+                declared_at,
+                check: check.name(),
+            })
+        })
+        .collect()
+}
+
+/// Every [`ShadowedCheck`] the provider found, per package, recorded as it
+/// lists each one. A cheap handle: clones share the record. `heph validate`
+/// reads it after its walks have listed every package in scope; nothing else
+/// does, so `heph run` and `query` stay quiet about a deliberate shadow.
+#[derive(Debug, Clone, Default)]
+pub struct ShadowedChecks(Arc<Mutex<BTreeMap<String, Vec<ShadowedCheck>>>>);
+
+impl ShadowedChecks {
+    /// Replace what is recorded for `pkg`: a package listed again (a later
+    /// request, a fixed BUILD file) never reports a stale conflict twice.
+    pub(crate) fn record(&self, pkg: &str, found: Vec<ShadowedCheck>) {
+        let mut map = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if found.is_empty() {
+            map.remove(pkg);
+        } else {
+            map.insert(pkg.to_string(), found);
+        }
+    }
+
+    /// Every conflict recorded, sorted by package, then in the package's
+    /// target order.
+    pub fn all(&self) -> Vec<ShadowedCheck> {
+        let map = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        map.values().flatten().cloned().collect()
+    }
 }
 
 /// The buildfile options the checks read, decoded once by `plugin_parts`.

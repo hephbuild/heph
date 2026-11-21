@@ -29,9 +29,16 @@
 //! `def target(name, **kwargs)` macro legitimately takes any key. Checking such
 //! a call against the builtin's schema would underline valid code, so a
 //! shadowed name is skipped entirely.
+//!
+//! With the buildfile option `requireTypeAnnotations` on, each `def`
+//! parameter without a type is marked too, from the same checker
+//! `build-lint-check` runs (`checks::annotations`). Type errors are not shown
+//! here (E3 in the BUILD-file checks spec).
 
 use super::site::{self, Doc};
 use crate::pluginbuildfile::ast::walk_expr;
+use crate::pluginbuildfile::checks::annotations;
+use crate::pluginbuildfile::checks::targets::ChecksOptions;
 use crate::pluginbuildfile::run_file::target_base_fields;
 use hcore::htvalue::Value;
 use hcore::htvalue::signature::ParamType;
@@ -88,7 +95,26 @@ pub(crate) fn validate(ast: &AstModule, doc: &Doc<'_>, engine: &dyn LspEngine) -
             }
         });
     });
+    // `requireTypeAnnotations`: each unannotated `def` parameter, marked at
+    // the parameter, from the checker `build-lint-check` runs. It reads the
+    // parse only, so a document that does not evaluate is marked too. Type
+    // errors stay out of the editor (E3).
+    if requires_annotations(engine) {
+        out.extend(
+            annotations::missing(ast)
+                .into_iter()
+                .map(|m| diag(ast, m.span, m.message)),
+        );
+    }
     out
+}
+
+/// Whether the workspace's buildfile options turn `requireTypeAnnotations`
+/// on. An option that does not decode reads as off here: the engine refuses
+/// it at startup, which is where that error belongs.
+fn requires_annotations(engine: &dyn LspEngine) -> bool {
+    ChecksOptions::from_options(&engine.provider_options("buildfile"))
+        .is_ok_and(|o| o.require_type_annotations)
 }
 
 /// `selected` is the call's string-literal `driver = "…"` (or `provider =

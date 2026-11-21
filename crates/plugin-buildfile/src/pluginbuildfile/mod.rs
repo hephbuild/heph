@@ -7,7 +7,7 @@ mod run_file;
 mod starlark_patch;
 mod types;
 
-pub use checks::targets::ChecksOptions;
+pub use checks::targets::{ChecksOptions, ShadowedCheck, ShadowedChecks};
 /// The transport-free LSP loop, for the editor-shaped harness in `tests/lsp.rs`.
 #[cfg(feature = "test-support")]
 pub use lsp::{RunOptions as LspRunOptions, run as lsp_run, run_with as lsp_run_with};
@@ -36,6 +36,9 @@ pub struct PartsInit<'a> {
     pub walker: Arc<hwalk::CachedWalker>,
     /// The engine's function slot, read on the first evaluation.
     pub functions: Arc<hplugin::function::FunctionSlot>,
+    /// Where the provider records every check target a package's own target
+    /// shadows (I2); the caller keeps a clone to read (`heph validate`).
+    pub shadowed: ShadowedChecks,
 }
 
 /// The buildfile plugin: its provider, which lists the check targets, and
@@ -70,7 +73,8 @@ pub fn plugin_parts(init: PartsInit<'_>, opts: &hplugin::config::Options) -> any
     )?
     .with_walker(init.walker)
     .with_functions(init.functions)
-    .with_checks(checks);
+    .with_checks(checks)
+    .with_shadowed_checks(init.shadowed);
     let drivers = checks::targets::CheckKind::ALL
         .into_iter()
         .map(|k| Box::new(checks::drivers::CheckDriver::new(k)) as Box<dyn ManagedDriver>)

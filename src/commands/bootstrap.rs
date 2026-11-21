@@ -226,8 +226,18 @@ pub fn register_builtin_factories(
     e: &mut engine::Engine,
     home_dir: &std::path::Path,
 ) -> anyhow::Result<()> {
+    register_builtin_factories_with(e, home_dir, pluginbuildfile::ShadowedChecks::default())
+}
+
+/// [`register_builtin_factories`], with the buildfile provider recording its
+/// shadowed check targets into `shadowed`, which `heph validate` reads.
+pub(crate) fn register_builtin_factories_with(
+    e: &mut engine::Engine,
+    home_dir: &std::path::Path,
+    shadowed: pluginbuildfile::ShadowedChecks,
+) -> anyhow::Result<()> {
     use engine::PluginParts;
-    e.register_plugin_factory("buildfile", |init, opts| {
+    e.register_plugin_factory("buildfile", move |init, opts| {
         // The provider (with the check targets) and the drivers that run
         // them, from one decode of the options.
         let parts = pluginbuildfile::plugin_parts(
@@ -240,6 +250,7 @@ pub fn register_builtin_factories(
                 // `heph.<plugin>.<fn>`: read from this engine's registry once
                 // sealed, before the first BUILD evaluation.
                 functions: Arc::clone(&init.functions),
+                shadowed: shadowed.clone(),
             },
             opts,
         )?;
@@ -293,7 +304,29 @@ pub fn new_engine(
     global: &super::GlobalOptions,
     session: &Arc<SessionSlot>,
 ) -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
-    new_engine_with(global, BadEnv::Refuse, Some(session))
+    new_engine_with(
+        global,
+        BadEnv::Refuse,
+        Some(session),
+        pluginbuildfile::ShadowedChecks::default(),
+    )
+}
+
+/// [`new_engine`] for `heph validate`: also returns the record the buildfile
+/// provider keeps of every check target a package's own target shadows (I2),
+/// filled as the provider lists each package.
+pub fn new_validate_engine(
+    global: &super::GlobalOptions,
+    session: &Arc<SessionSlot>,
+) -> anyhow::Result<(
+    Arc<engine::Engine>,
+    ShutdownTrigger,
+    pluginbuildfile::ShadowedChecks,
+)> {
+    let shadowed = pluginbuildfile::ShadowedChecks::default();
+    let (engine, trigger) =
+        new_engine_with(global, BadEnv::Refuse, Some(session), shadowed.clone())?;
+    Ok((engine, trigger, shadowed))
 }
 
 /// The engine for a caller with no command line of its own: shell
@@ -302,7 +335,12 @@ pub fn new_engine(
 /// with a warning there rather than breaking `<TAB>` or `git push`; the next
 /// real command still refuses it. They record no session.
 pub fn new_helper_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
-    new_engine_with(&super::GlobalOptions::default(), BadEnv::Ignore, None)
+    new_engine_with(
+        &super::GlobalOptions::default(),
+        BadEnv::Ignore,
+        None,
+        pluginbuildfile::ShadowedChecks::default(),
+    )
 }
 
 /// An engine over `root`'s home that only reads what other hephs wrote
@@ -399,6 +437,7 @@ fn new_engine_with(
     global: &super::GlobalOptions,
     bad_env: BadEnv,
     session: Option<&Arc<SessionSlot>>,
+    shadowed: pluginbuildfile::ShadowedChecks,
 ) -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     let root = match engine::get_root() {
         Ok(r) => r,
@@ -449,7 +488,7 @@ fn new_engine_with(
     // `fs` (provider + driver) is registered by `Engine::new` itself, with the
     // engine's own skip dirs. The remaining built-ins have no config.
     register_builtin_plugins(&mut e, &home_dir)?;
-    register_builtin_factories(&mut e, &home_dir)?;
+    register_builtin_factories_with(&mut e, &home_dir, shadowed)?;
 
     // Apply every `plugins:` entry: a `builtin:` instantiates the matching
     // factory above; a `path:`/`url:` resolves a manifest, loads the cdylib, and

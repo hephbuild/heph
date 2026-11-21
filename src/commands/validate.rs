@@ -16,8 +16,9 @@ use crate::engine::query::skip_unresolvable;
 use crate::engine::request_state::RequestState;
 use crate::engine::{Discovery, Engine, Gaps, get_cwp, get_root, gitignore};
 use crate::htaddr::Addr;
-use crate::htmatcher::Matcher;
+use crate::htmatcher::{MatchResult, Matcher};
 use crate::htpkg::{self, PkgBuf};
+use crate::pluginbuildfile::ShadowedChecks;
 use crate::tui::{self, App, AppContext, BufferedStdout, LogSink};
 
 #[derive(clap::Args, Clone)]
@@ -38,6 +39,8 @@ struct ValidateApp {
     scoped: bool,
     root: PathBuf,
     fail_fast: bool,
+    /// The buildfile provider's record of shadowed check targets (I2).
+    shadowed: ShadowedChecks,
 }
 
 #[async_trait]
@@ -61,6 +64,7 @@ impl App for ValidateApp {
             scoped,
             root,
             fail_fast,
+            shadowed,
         } = self;
         let rs = engine.new_state_with_events(fail_fast, ctx.event_sender());
         // One sink for the link and overlap walks: a candidate both skip counts
@@ -169,6 +173,11 @@ impl App for ValidateApp {
                 .await
                 .map(|mismatches| mismatches.iter().map(ToString::to_string).collect());
 
+            // 5. No target shadows a BUILD-file check target (I2). The provider
+            //    records each as it lists a package, and check 1's walk listed
+            //    every package in scope. Run and query never read the record.
+            let shadowed_res = Ok(shadowed_check_problems(&shadowed, &matcher));
+
             let overlap_res = overlap_res.map(|overlaps| {
                 overlaps
                     .iter()
@@ -192,6 +201,7 @@ impl App for ValidateApp {
                 overlap_res,
                 gitignore_res,
                 listed_facts_res,
+                shadowed_res,
             ])?;
 
             // Success prints nothing; only the scoped-skip warning is emitted.
@@ -283,6 +293,18 @@ fn local_findings_warnings(report: &StatusReport) -> Vec<String> {
     out
 }
 
+/// One problem per check target a target in `matcher`'s scope shadows (I2),
+/// in package order. Empty without the buildfile plugin, which is the only
+/// writer of `shadowed`.
+fn shadowed_check_problems(shadowed: &ShadowedChecks, matcher: &Matcher) -> Vec<String> {
+    shadowed
+        .all()
+        .iter()
+        .filter(|s| !matches!(matcher.matches_addr(&s.addr), MatchResult::MatchNo))
+        .map(ToString::to_string)
+        .collect()
+}
+
 /// Fold the outcome of every validate check into a single result. Each check
 /// contributes either a list of human-readable problem strings (`Ok`) or a hard
 /// error (`Err`); a check's `Err` that is itself a [`MultiError`] is flattened
@@ -327,13 +349,14 @@ async fn execute_async(
         Some(s) => (htpkg::parse(&s, &get_cwp()?)?, true),
         None => (Matcher::PackagePrefix(PkgBuf::from("")), false),
     };
-    let (engine, shutdown) = bootstrap::new_engine(&global, session)?;
+    let (engine, shutdown, shadowed) = bootstrap::new_validate_engine(&global, session)?;
     let app = ValidateApp {
         engine,
         matcher,
         scoped,
         root,
         fail_fast: global.fail_fast,
+        shadowed,
     };
     let interactive = tui::should_use_tui(global.no_tui);
     tui::run_app_with(
@@ -460,5 +483,167 @@ mod tests {
         .unwrap_err();
         assert!(err.downcast_ref::<MultiError>().is_none());
         assert!(format!("{err:#}").contains("lonely overlap"));
+    }
+
+    // ---- shadowed check targets (I2) ---------------------------------------
+
+    use super::shadowed_check_problems;
+    use crate::engine::{Config, Discovery, Engine, PluginParts};
+    use crate::htmatcher::Matcher;
+    use crate::htpkg::PkgBuf;
+    use crate::pluginbuildfile::ShadowedChecks;
+    use futures::TryStreamExt;
+    use hcore::htvalue::Value;
+    use hcore::htvalue::signature::{FnSignature, Param, ParamType};
+    use hplugin::function::{
+        DeclaredTarget, FnArgs, FnCallContext, FnOutcome, PluginFn, PluginFnDef,
+    };
+    use std::sync::Arc;
+
+    /// `heph.codegen.rule(name = …)`: declares an `exec` target named `name`.
+    struct RuleFn;
+
+    #[async_trait::async_trait]
+    impl PluginFn for RuleFn {
+        async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<FnOutcome> {
+            let Some(Value::String(name)) = args.named.get("name") else {
+                anyhow::bail!("rule: `name` must be a string");
+            };
+            let mut outcome = FnOutcome::from(Value::String(format!("//{}:{name}", ctx.pkg)));
+            outcome.declare_target(DeclaredTarget {
+                name: name.clone(),
+                driver: "exec".to_string(),
+                ..Default::default()
+            });
+            Ok(outcome)
+        }
+    }
+
+    /// The files under `root`, an engine over them with the buildfile plugin
+    /// built by the binary's own factory and a declaring `heph.codegen.rule`,
+    /// and the shadow record that factory was given.
+    fn shadow_ws(files: &[(&str, &str)]) -> (tempfile::TempDir, Arc<Engine>, ShadowedChecks) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (path, content) in files {
+            let abs = dir.path().join(path);
+            std::fs::create_dir_all(abs.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&abs, content).expect("write");
+        }
+        let mut e = Engine::new(Config::for_tests(dir.path().to_path_buf())).expect("engine");
+        let shadowed = ShadowedChecks::default();
+        crate::commands::bootstrap::register_builtin_factories_with(
+            &mut e,
+            dir.path(),
+            shadowed.clone(),
+        )
+        .expect("factories");
+        e.register_plugin("codegen", |_| {
+            Ok(PluginParts::default().with_functions(vec![PluginFnDef {
+                name: "rule".to_string(),
+                signature: FnSignature {
+                    positional: vec![],
+                    named: vec![Param::required("name", ParamType::String)],
+                    variadic: None,
+                    returns: ParamType::String,
+                },
+                doc: "Declare an exec target.".to_string(),
+                func: Arc::new(RuleFn),
+            }]))
+        })
+        .expect("codegen plugin");
+        e.apply_builtin("buildfile", &Default::default())
+            .expect("buildfile");
+        (dir, Arc::new(e), shadowed)
+    }
+
+    /// Run validate's link walk over `matcher` (which lists every package in
+    /// scope), then its shadow check.
+    async fn shadow_problems(
+        engine: &Arc<Engine>,
+        shadowed: &ShadowedChecks,
+        matcher: &Matcher,
+    ) -> Vec<String> {
+        let _: Vec<_> = Arc::clone(engine)
+            .query(engine.new_state(), matcher, Discovery::Complete)
+            .try_collect()
+            .await
+            .expect("query");
+        shadowed_check_problems(shadowed, matcher)
+    }
+
+    const FIX: &str = "rename the target, or remove it to get the check back";
+
+    #[tokio::test]
+    async fn shadowed_check_target_fails() {
+        let (_dir, engine, shadowed) = shadow_ws(&[
+            (
+                "pkg/BUILD",
+                "target(name = \"t\", driver = \"exec\")\n\
+                 target(name = \"build-lint-check\", driver = \"exec\")\n",
+            ),
+            (
+                "other/BUILD",
+                "target(name = \"build-format\", driver = \"exec\")\n",
+            ),
+            ("clean/BUILD", "target(name = \"t\", driver = \"exec\")\n"),
+        ]);
+        let all = Matcher::PackagePrefix(PkgBuf::from(""));
+        let problems = shadow_problems(&engine, &shadowed, &all).await;
+        assert_eq!(
+            problems,
+            [
+                format!(
+                    "//other:build-format, declared at other/BUILD:1, shadows the BUILD-file \
+                     check `build-format`: {FIX}"
+                ),
+                format!(
+                    "//pkg:build-lint-check, declared at pkg/BUILD:2, shadows the BUILD-file \
+                     check `build-lint-check`: {FIX}"
+                ),
+            ]
+        );
+        // validate fails on them, naming each.
+        let err = super::finish(vec![Ok(problems)]).expect_err("validate fails");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("//pkg:build-lint-check"), "{msg}");
+        assert!(msg.contains("//other:build-format"), "{msg}");
+
+        // A scoped validate reports only its own scope.
+        let scoped = Matcher::PackagePrefix(PkgBuf::from("pkg"));
+        assert_eq!(
+            shadow_problems(&engine, &shadowed, &scoped).await.len(),
+            1,
+            "only //pkg's conflict is in scope"
+        );
+    }
+
+    #[tokio::test]
+    async fn shadow_from_function_and_loaded_file() {
+        let (_dir, engine, shadowed) = shadow_ws(&[
+            (
+                "pkg/BUILD",
+                "load(\"//lib/defs.star\", \"mk\")\n\
+                 heph.codegen.rule(name = \"build-format\")\n\
+                 mk()\n",
+            ),
+            (
+                "lib/defs.star",
+                "def mk():\n    target(name = \"build-format-check\", driver = \"exec\")\n",
+            ),
+        ]);
+        let all = Matcher::PackagePrefix(PkgBuf::from(""));
+        assert_eq!(
+            shadow_problems(&engine, &shadowed, &all).await,
+            [
+                format!(
+                    "//pkg:build-format, declared at pkg/BUILD:2, shadows the BUILD-file \
+                     check `build-format`: {FIX}"
+                ),
+                format!(
+                    "//pkg:build-format-check, declared at lib/defs.star:2 (called from \
+                     pkg/BUILD:3), shadows the BUILD-file check `build-format-check`: {FIX}"
+                ),
+            ]
+        );
     }
 }
