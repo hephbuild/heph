@@ -201,6 +201,30 @@ fn phases() -> &'static Mutex<HashMap<u64, &'static str>> {
     PHASES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// A token cancelled once nobody awaits the memoized computation the caller is
+/// running in: its last joiner left, so the cell was evicted and its task
+/// aborted. `None` outside a memoized body.
+///
+/// The abort stops the body at its next yield. A body that holds its thread
+/// instead (a `block_in_place` wait) never reaches one while it waits, so
+/// work it started and waits on must be stopped through this token, heard
+/// from a task of its own. Only the body's own task sees it: a task the body
+/// spawns does not inherit it.
+///
+/// It reaches a body only once that body has suspended: during the inline
+/// first poll the caller that holds the cell's only interest is the one
+/// driving it, so the cell cannot be abandoned until the body yields.
+pub fn abandoned_token() -> Option<crate::hasync::StdCancellationToken> {
+    task_cell::current_abandoned_token()
+}
+
+/// Whether the memoized computation the caller is running in was abandoned
+/// (see [`abandoned_token`]); `false` outside a memoized body. Creates no
+/// token.
+pub fn is_abandoned() -> bool {
+    task_cell::current_is_abandoned()
+}
+
 /// Tag the calling invocation with its next-await `phase`. No-op when
 /// `HEPH_PHASE_TRACE` is unset or when invoked outside any `once()` scope.
 pub fn set_phase(phase: &'static str) {

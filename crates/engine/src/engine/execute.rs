@@ -349,11 +349,12 @@ impl Engine {
                         // A cancelled run did not fail: nothing to keep. A
                         // driver may report a cancellation as an error of its
                         // own (exec's bare "cancelled", log attached so that a
-                        // timeout keeps it), so the request's token decides —
-                        // except for a timeout, which is a failure even when
-                        // the request was cancelled during its grace.
+                        // timeout keeps it), so the stop decides — the
+                        // request's token, or this execute abandoned by
+                        // fail-fast — except for a timeout, which is a failure
+                        // even when the request was cancelled during its grace.
                         let cancelled = hplugin::error::is_cancelled(&err)
-                            || (rs.ctoken().is_cancelled()
+                            || (crate::engine::run_timeout::stop_requested(rs.ctoken())
                                 && !crate::engine::run_timeout::is_timed_out(&err));
                         let kept = if cancelled {
                             None
@@ -718,6 +719,10 @@ impl Engine {
         // included.
         let inherit = matches!(options.stdio, crate::engine::driver::RunStdio::Inherit(_));
 
+        // Taken here, on the execute's own task: the wrapper may run `inner`
+        // anywhere, and only this task can see the memo cell it would be
+        // abandoned through.
+        let stop = crate::engine::run_timeout::RunStop::new(rs.ctoken());
         let inner: InteractiveInner = Box::new(enclose!(
             (rs, self => engine, sandbox_dir)
             move |stdin, stdout, stderr, winsize| {
@@ -773,10 +778,10 @@ impl Engine {
                         req.options.fire_handover().context("handing over the terminal")?;
                     }
                     // A `--shell` is a person at a prompt: never timed. A
-                    // run without a timeout gets the request's token as is.
+                    // run without a timeout gets its stop as is.
                     let res = match target.timeout {
-                        _ if shell => driver.driver.run_shell(req, rs.ctoken()).await,
-                        None => driver.driver.run(req, rs.ctoken()).await,
+                        _ if shell => driver.driver.run_shell(req, &stop).await,
+                        None => driver.driver.run(req, &stop).await,
                         Some(timeout) => {
                             let run_token = hcore::hasync::StdCancellationToken::new();
                             // A driver that arms the clock is timed from its
@@ -791,7 +796,7 @@ impl Engine {
                             crate::engine::run_timeout::enforce(
                                 run,
                                 &run_token,
-                                rs.ctoken(),
+                                &stop,
                                 &target.addr,
                                 timeout,
                                 engine.timeout_grace,

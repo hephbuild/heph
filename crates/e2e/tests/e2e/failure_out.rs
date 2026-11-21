@@ -12,6 +12,7 @@
 
 use crate::common::{self, Workspace};
 use crate::failure_slot::{failures, files_containing, removed, render, slot_exists};
+use crate::run_timeout::process_gone;
 use heph::engine::failure_slot::{LOG, OUT};
 use heph::engine::{Engine, OutputMatcher, ResultOptions};
 use heph::htaddr::parse_addr;
@@ -122,12 +123,20 @@ fn read(path: impl AsRef<Path>) -> String {
 }
 
 /// Wait until `cond` holds, or fail after `secs`.
-async fn eventually(secs: u64, what: &str, mut cond: impl FnMut() -> bool) {
+async fn eventually(secs: u64, what: &str, cond: impl FnMut() -> bool) {
+    assert!(wait_until(secs, cond).await, "{what}");
+}
+
+/// Wait until `cond` holds, for at most `secs`: whether it did.
+async fn wait_until(secs: u64, mut cond: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + Duration::from_secs(secs);
     while !cond() {
-        assert!(Instant::now() < deadline, "{what}");
+        if Instant::now() >= deadline {
+            return false;
+        }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    true
 }
 
 #[tokio::test]
@@ -255,8 +264,28 @@ async fn collected_on_timeout() -> anyhow::Result<()> {
 
 /// Fail-fast cancels a running sibling: its process is killed, and that is a
 /// cancellation, not a failure, so it keeps nothing.
+///
+/// The sibling never ends on its own: only being killed stops it. Fail-fast
+/// drops its last caller, and the abort of its execute cannot land while exec
+/// holds the thread for the process's output (`block_in_place`, on macOS), so
+/// the kill has to come through the run's token, from the memo cell being
+/// abandoned. Without that, the process ran until it was released, and a
+/// failure it reached after the stop could be kept as its own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn nothing_on_cancel() -> anyhow::Result<()> {
+    nothing_on_cancel_of("").await
+}
+
+/// The same with a timeout on the sibling: its run goes through the timeout
+/// watchdog, which must forward the stop too, and the stop is a cancellation,
+/// not a timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nothing_on_cancel_of_a_timed_sibling() -> anyhow::Result<()> {
+    nothing_on_cancel_of(" timeout = 600,").await
+}
+
+/// `slow_attrs` is spliced into the cancelled sibling's `target(…)`.
+async fn nothing_on_cancel_of(slow_attrs: &str) -> anyhow::Result<()> {
     let ws = Workspace::new();
     let ctl = tempfile::tempdir()?;
     let c = ctl.path().display();
@@ -264,8 +293,8 @@ async fn nothing_on_cancel() -> anyhow::Result<()> {
         "p",
         &format!(
             r#"
-target(name = "slow", driver = "bash", cache = False, failure_out = "slow.txt",
-       run = "printf slow > slow.txt; printf '' > {c}/started; while [ ! -f {c}/release ]; do sleep 0.05; done; printf '' > {c}/outlived; exit 1")
+target(name = "slow", driver = "bash", cache = False, failure_out = "slow.txt",{slow_attrs}
+       run = "printf slow > slow.txt; printf $$ > {c}/pid.tmp; mv {c}/pid.tmp {c}/pid; printf '' > {c}/started; while [ ! -f {c}/release ]; do sleep 0.05; done; exit 1")
 target(name = "fast", driver = "bash", cache = False, failure_out = "fast.txt",
        run = "while [ ! -f {c}/started ]; do sleep 0.05; done; printf fast > fast.txt; exit 1")
 target(name = "grp", driver = "group", deps = [":slow", ":fast"])
@@ -288,20 +317,29 @@ target(name = "grp", driver = "group", deps = [":slow", ":fast"])
     drop(res);
     common::drain(rs).await;
     assert!(ctl.path().join("started").exists(), "the sibling ran");
-    // A sibling process that outlived its cancellation would now exit 1 on its
-    // own; without the release it would hold the runtime's shutdown open.
-    std::fs::write(ctl.path().join("release"), "")?;
+    let pid: libc::pid_t = read(ctl.path().join("pid")).trim().parse()?;
     // The cancelled sibling's execute may unwind after the request returned.
     // A fill happens under its execute lock, so once that lock is free again
     // any late (wrong) fill has landed.
     let slow = parse_addr("//p:slow")?;
-    eventually(30, "the cancelled sibling's execute never let go", || {
+    let let_go = wait_until(30, || {
         matches!(ws.engine.result_lock().try_lock_execute(&slow), Ok(Some(_)))
     })
     .await;
-    if ctl.path().join("outlived").exists() {
-        eprintln!("nothing_on_cancel: the cancelled sibling's process outlived its cancellation");
+    let killed = let_go && wait_until(10, || process_gone(pid)).await;
+    if !killed {
+        // Let a process that outlived its cancellation end, so it does not
+        // hold the runtime's shutdown open, before failing.
+        std::fs::write(ctl.path().join("release"), "")?;
+        wait_until(30, || {
+            matches!(ws.engine.result_lock().try_lock_execute(&slow), Ok(Some(_)))
+        })
+        .await;
     }
+    assert!(
+        killed,
+        "the cancelled sibling's process {pid} outlived its cancellation (execute let go: {let_go})"
+    );
     assert_eq!(
         read(out_dir(&ws.engine, "//p:fast").join("p/fast.txt")),
         "fast"
