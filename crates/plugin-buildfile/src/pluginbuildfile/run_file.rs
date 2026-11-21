@@ -1739,6 +1739,9 @@ impl BuildFileLoader {
                 path: file_path.to_path_buf(),
             };
 
+            #[cfg(test)]
+            self.loads.run_before_claim_hook(file_path);
+
             // Another package may be evaluating this very file — see
             // `LoadRegistry`. Wait for it rather than repeating the work.
             let _claim = match self.loads.claim(file_path, self.chain)? {
@@ -1750,6 +1753,19 @@ impl BuildFileLoader {
                 // the cache is still empty and this chain takes its turn.
                 Claim::Retry => continue,
             };
+            // Owning the path does not mean nobody evaluated it: the chain that
+            // did may have cached it and released between this chain's cache
+            // check above and its claim, leaving no holder to wait on. Its insert
+            // happens before its release, so the cache shows it now.
+            if let Some(cached) = self
+                .file_cache
+                .lock()
+                .map_err(|_e| anyhow::anyhow!("file_cache lock poisoned"))?
+                .get(file_path)
+            {
+                return Ok(cached.clone());
+            }
+            self.loads.evaluation_started();
 
             let result = Arc::new(
                 eval_file(file_path, pkg, self)
@@ -1789,10 +1805,18 @@ pub(crate) struct LoadRegistry {
     state: Mutex<LoadRegistryState>,
     progress: std::sync::Condvar,
     next_chain: std::sync::atomic::AtomicU64,
-    /// Evaluations actually started, i.e. claims granted. The number this type
-    /// exists to keep at one per file however many packages want it.
+    /// Evaluations actually started: claims granted whose post-claim cache
+    /// check missed. The number this type exists to keep at one per file
+    /// however many packages want it.
     started: std::sync::atomic::AtomicU64,
+    /// Runs once, in the chain that reaches the claim for this path, between its
+    /// cache miss and its claim: the window another chain can finish in.
+    #[cfg(test)]
+    before_claim: Mutex<Option<BeforeClaimHook>>,
 }
+
+#[cfg(test)]
+type BeforeClaimHook = (PathBuf, Box<dyn FnOnce() + Send>);
 
 #[derive(Default)]
 struct LoadRegistryState {
@@ -1828,8 +1852,6 @@ impl LoadRegistry {
             let Some(&owner) = state.holder.get(path) else {
                 state.holder.insert(path.to_path_buf(), chain);
                 state.waiting.remove(&chain);
-                self.started
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Ok(Claim::Owned);
             };
             // Follow the wait-for edges from the owner. Reaching this chain means
@@ -1861,6 +1883,13 @@ impl LoadRegistry {
         }
     }
 
+    /// Counts an evaluation the claiming chain is about to run, after its
+    /// post-claim cache check missed.
+    fn evaluation_started(&self) {
+        self.started
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Evaluations started since this registry was created.
     ///
     /// Only the single-flight tests read this; the counter itself is always
@@ -1868,6 +1897,32 @@ impl LoadRegistry {
     #[cfg(test)]
     pub(crate) fn started(&self) -> u64 {
         self.started.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Arms the hook `load_file` runs between its cache miss for `path` and its
+    /// claim on it.
+    #[cfg(test)]
+    fn set_before_claim_hook(&self, path: PathBuf, hook: impl FnOnce() + Send + 'static) {
+        *self.before_claim.lock().unwrap() = Some((path, Box::new(hook)));
+    }
+
+    #[cfg(test)]
+    fn run_before_claim_hook(&self, path: &Path) {
+        // Taken under the lock, run outside it: the hook evaluates packages,
+        // which reach this function again.
+        let hook = {
+            let mut armed = self.before_claim.lock().unwrap();
+            match armed.take() {
+                Some((p, hook)) if p == path => Some(hook),
+                other => {
+                    *armed = other;
+                    None
+                }
+            }
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     fn release(&self, path: &Path) {
@@ -2448,6 +2503,57 @@ mod tests {
             provider.loads.started(),
             3,
             "the shared file must be evaluated once, not once per package",
+        );
+    }
+
+    /// A shared file evaluated and released by another chain between this
+    /// chain's cache miss and its claim must not be evaluated again.
+    ///
+    /// The claim finds no holder — the other chain is gone — so it is granted,
+    /// and before the post-claim cache check the file was evaluated a second
+    /// time: wasted work, and two packages seeing two snapshots of it if it
+    /// changed in between. `concurrent_packages_evaluate_a_shared_load_once`
+    /// cannot see it, because its slow shared file keeps the window shut; a
+    /// trivial one hit it under load on CI. The hook runs package `b` to
+    /// completion inside package `a`'s window, so this is deterministic.
+    #[test]
+    fn a_shared_load_finished_between_miss_and_claim_is_not_evaluated_again() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let shared = root.join("shared.BUILD");
+        fs::write(&shared, "N = 1\n").unwrap();
+        for pkg in ["a", "b"] {
+            let p = root.join(pkg);
+            fs::create_dir_all(&p).unwrap();
+            fs::write(
+                p.join("BUILD"),
+                "load(\"//shared.BUILD\", \"N\")\ntarget(name = \"t\", driver = \"d\")\n",
+            )
+            .unwrap();
+        }
+
+        let provider = Arc::new(Provider {
+            root: root.to_path_buf(),
+            build_file_patterns: vec![glob::Pattern::new("BUILD").unwrap()],
+            ..Provider::default()
+        });
+
+        // `a` misses the cache for the shared file; before it claims, `b`
+        // evaluates it, caches it and releases it.
+        provider.loads.set_before_claim_hook(
+            shared.clone(),
+            enclose!((provider) move || {
+                run_pkg_blocking(&provider, "b").expect("evaluate package b");
+            }),
+        );
+        run_pkg_blocking(&provider, "a").expect("evaluate package a");
+
+        // `a/BUILD`, `b/BUILD` and `shared.BUILD` once each. Four is the shared
+        // file evaluated by both packages.
+        assert_eq!(
+            provider.loads.started(),
+            3,
+            "the shared file must be evaluated once, not again by the chain that missed before it was cached",
         );
     }
 
