@@ -348,63 +348,7 @@ impl Engine {
                     {
                         return Err(anyhow::Error::new(CancelledError));
                     }
-                    let mut scan = PackageScan::default();
-                    let states = match Arc::clone(&engine).probe_segments(&rs, &pkg).await {
-                        Ok(states) => states,
-                        Err(e) if keep_going && !is_cancellation(&rs, &e) => {
-                            scan.skipped.push(Skip {
-                                stage: Stage::Probe,
-                                provider: provider_of(&e).to_string(),
-                                scope: format!("//{pkg}"),
-                                error: e,
-                            });
-                            return Ok(scan);
-                        }
-                        Err(e) => return Err(e),
-                    };
-
-                    for (lister, provider) in engine.providers.iter().enumerate() {
-                        let listed = provider.provider.list(ListRequest {
-                            request_id: rs.request_id().to_string(),
-                            package: pkg.clone(),
-                            states: states
-                                .iter()
-                                .filter(|s| s.provider == provider.name)
-                                .cloned()
-                                .collect(),
-                            executor: Arc::clone(&executor),
-                        }, rs.ctoken()).await
-                            // Drained before the next await.
-                            .and_then(|it| it.collect::<anyhow::Result<Vec<_>>>());
-                        let raw = match listed {
-                            Ok(raw) => raw,
-                            // The other providers' candidates in this package
-                            // are still good.
-                            Err(e) if keep_going && !is_cancellation(&rs, &e) => {
-                                scan.skipped.push(Skip {
-                                    stage: Stage::List,
-                                    provider: provider.name.clone(),
-                                    scope: format!("//{pkg}"),
-                                    error: e,
-                                });
-                                scan.listing_gap = true;
-                                continue;
-                            }
-                            Err(e) => return Err(e),
-                        };
-
-                        for item in raw {
-                            if item.addr.package == pkg {
-                                scan.candidates.push(Candidate {
-                                    addr: item.addr,
-                                    facts: item.facts,
-                                    lister,
-                                });
-                            }
-                        }
-                    }
-
-                    anyhow::Ok(scan)
+                    engine.scan_package(&rs, &executor, pkg, keep_going).await
                 }))
             }))
             // Each package runs as its own task, not merely as a future inside
@@ -573,6 +517,198 @@ impl Engine {
         }
     }
 
+    /// Probe `pkg` and collect every provider's listing of it, in provider
+    /// order. Under keep-going (`keep_going`) a failed probe or `list` is a
+    /// recorded skip in the scan rather than an error.
+    async fn scan_package(
+        self: Arc<Self>,
+        rs: &Arc<RequestState>,
+        executor: &Arc<dyn hplugin::provider::ProviderExecutor>,
+        pkg: PkgBuf,
+        keep_going: bool,
+    ) -> anyhow::Result<PackageScan> {
+        let mut scan = PackageScan::default();
+        let states = match Arc::clone(&self).probe_segments(rs, &pkg).await {
+            Ok(states) => states,
+            Err(e) if keep_going && !is_cancellation(rs, &e) => {
+                scan.skipped.push(Skip {
+                    stage: Stage::Probe,
+                    provider: provider_of(&e).to_string(),
+                    scope: format!("//{pkg}"),
+                    error: e,
+                });
+                return Ok(scan);
+            }
+            Err(e) => return Err(e),
+        };
+
+        for (lister, provider) in self.providers.iter().enumerate() {
+            let listed = provider
+                .provider
+                .list(
+                    ListRequest {
+                        request_id: rs.request_id().to_string(),
+                        package: pkg.clone(),
+                        states: states
+                            .iter()
+                            .filter(|s| s.provider == provider.name)
+                            .cloned()
+                            .collect(),
+                        executor: Arc::clone(executor),
+                    },
+                    rs.ctoken(),
+                )
+                .await
+                // Drained before the next await.
+                .and_then(|it| it.collect::<anyhow::Result<Vec<_>>>());
+            let raw = match listed {
+                Ok(raw) => raw,
+                // The other providers' candidates in this package are still
+                // good.
+                Err(e) if keep_going && !is_cancellation(rs, &e) => {
+                    scan.skipped.push(Skip {
+                        stage: Stage::List,
+                        provider: provider.name.clone(),
+                        scope: format!("//{pkg}"),
+                        error: e,
+                    });
+                    scan.listing_gap = true;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+
+            for item in raw {
+                if item.addr.package == pkg {
+                    scan.candidates.push(Candidate {
+                        addr: item.addr,
+                        facts: item.facts,
+                        lister,
+                    });
+                }
+            }
+        }
+
+        Ok(scan)
+    }
+
+    /// Every candidate a provider lists for an address-decidable `m`, one per
+    /// addr, with its merged listed facts, and **without resolving any of
+    /// them**: a listed candidate may not exist. This is the walk behind the
+    /// fast `heph inspect labels`, which reads each candidate's listed labels
+    /// instead of its spec.
+    ///
+    /// A candidate's facts are [`ListedFacts::UNKNOWN`] when they cannot be
+    /// trusted: the request ignores listed facts (`HEPH_NO_LISTED_FACTS=1`), or
+    /// a provider's package listing or its `list` of this package was skipped
+    /// under keep-going, so a co-lister that could disagree is missing.
+    ///
+    /// `m` must be decidable from an addr (see `clean::is_addr_only`): a
+    /// candidate the addr does not select is dropped, and one the addr cannot
+    /// decide is an error. Packages are yielded in completion order.
+    pub(crate) fn listed_candidates<'a>(
+        self: Arc<Self>,
+        rs: Arc<RequestState>,
+        m: &'a htmatcher::Matcher,
+        discovery: Discovery,
+    ) -> impl Stream<Item = anyhow::Result<Candidate>> + 'a {
+        let trusted = rs.listed_facts_trust().trusts();
+        async_stream::try_stream! {
+            let gaps = discovery.gaps().cloned();
+            let keep_going = gaps.is_some();
+            let executor: Arc<dyn hplugin::provider::ProviderExecutor> = Arc::new(
+                crate::engine::result::EngineProviderExecutor::for_list(Arc::downgrade(&self), rs.clone()),
+            );
+            let (pkgs, packages_gap): (Vec<String>, bool) = match &gaps {
+                None => (self.packages(m, &rs).await?.collect::<anyhow::Result<_>>()?, false),
+                Some(gaps) => self.packages_keep_going(m, &rs, gaps).await?,
+            };
+
+            // Spawned and joined before an error propagates, for the reasons
+            // `query` gives: a package task must not outlive the walk holding
+            // the request state, and an abandoned walk starts no new package.
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let per_pkg = futures::stream::iter(pkgs.into_iter()
+                .take_while(enclose!((stop) move |_| !stop.load(std::sync::atomic::Ordering::Relaxed)))
+                .map(|pkg| {
+                    let pkg = PkgBuf::from(pkg);
+                    hcore::hmemoizer::spawn_with_cycle_ctx(enclose!((self => engine, rs, executor, stop) async move {
+                        if rs.ctoken().is_cancelled()
+                            || stop.load(std::sync::atomic::Ordering::Relaxed)
+                        {
+                            return Err(anyhow::Error::new(CancelledError));
+                        }
+                        engine.scan_package(&rs, &executor, pkg, keep_going).await
+                    }))
+                }))
+                .buffer_unordered(crate::engine::fanout::discovery_concurrency())
+                .map(|joined| match joined {
+                    Ok(res) => res,
+                    Err(e) => Err(anyhow::Error::new(e).context("package discovery task panicked")),
+                });
+            futures::pin_mut!(per_pkg);
+
+            let fatal: Option<anyhow::Error> = 'walk: loop {
+                let scan = match per_pkg.next().await {
+                    None => break 'walk None,
+                    Some(Ok(scan)) => scan,
+                    Some(Err(e)) => break 'walk Some(e),
+                };
+                if let Some(gaps) = &gaps {
+                    for skip in scan.skipped {
+                        gaps.record(skip.stage, &skip.provider, skip.scope, &skip.error);
+                    }
+                }
+                let facts_usable = trusted && !packages_gap && !scan.listing_gap;
+                let mut candidates = merge_listings(scan.candidates);
+                if !facts_usable {
+                    for c in &mut candidates {
+                        c.facts = ListedFacts::UNKNOWN;
+                    }
+                }
+                for c in candidates {
+                    match m.matches_listed(&c.addr, &ListedFacts::UNKNOWN) {
+                        MatchResult::MatchYes => yield c,
+                        MatchResult::MatchNo => {}
+                        MatchResult::MatchShrug => {
+                            break 'walk Some(anyhow::anyhow!(
+                                "listed_candidates: {m:?} cannot decide {} from its addr",
+                                c.addr.format()
+                            ));
+                        }
+                    }
+                }
+            };
+
+            if let Some(e) = fatal {
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                while per_pkg.next().await.is_some() {}
+                Err(e)?;
+            }
+        }
+    }
+
+    /// The spec of a candidate `query` yielded, or `None` when it does not
+    /// exist (see [`skip_unresolvable`]) or, under keep-going, cannot be
+    /// resolved — then the failure is recorded in `gaps`.
+    pub(crate) async fn resolve_candidate_spec(
+        self: Arc<Self>,
+        rs: Arc<RequestState>,
+        gaps: Option<Arc<Gaps>>,
+        addr: Addr,
+    ) -> anyhow::Result<Option<Arc<EngineTargetSpec>>> {
+        match skip_unresolvable(&addr, self.get_spec(rs.clone(), &addr).await) {
+            Err(e) => match &gaps {
+                Some(gaps) if !is_cancellation(&rs, &e) => {
+                    gaps.record(Stage::Spec, provider_of(&e), addr.format(), &e);
+                    Ok(None)
+                }
+                _ => Err(e),
+            },
+            res => res,
+        }
+    }
+
     /// [`Engine::packages`] for a keep-going walk: every provider whose listing
     /// succeeded, merged the same way, with each failed listing recorded in
     /// `gaps`. The `bool` is whether anything was recorded.
@@ -639,18 +775,7 @@ impl Engine {
         Arc::clone(&self)
             .query(rs.clone(), m, discovery)
             .map_ok(move |addr| {
-                enclose!((self => engine, rs, gaps) async move {
-                    match skip_unresolvable(&addr, engine.get_spec(rs.clone(), &addr).await) {
-                        Err(e) => match &gaps {
-                            Some(gaps) if !is_cancellation(&rs, &e) => {
-                                gaps.record(Stage::Spec, provider_of(&e), addr.format(), &e);
-                                Ok(None)
-                            }
-                            _ => Err(e),
-                        },
-                        res => res,
-                    }
-                })
+                Arc::clone(&self).resolve_candidate_spec(rs.clone(), gaps.clone(), addr)
             })
             .try_buffer_unordered(concurrency)
             .try_filter_map(|spec| std::future::ready(Ok(spec)))

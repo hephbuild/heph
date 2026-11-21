@@ -14,6 +14,12 @@ use crate::tui::{self, App, AppContext, BufferedStdout, LogSink};
 pub struct Args {
     /// Package matcher (defaults to all packages)
     pub matcher: Option<String>,
+    /// Resolve every target instead of reading the labels providers list.
+    /// Slower, but only targets that exist count: without it, a label carried
+    /// only by a listed target that does not resolve (a Go `test` in a package
+    /// without tests) is printed too.
+    #[arg(long)]
+    pub resolve: bool,
     #[command(flatten)]
     pub dashboard: crate::commands::progress_app::DashboardArgs,
 }
@@ -22,6 +28,7 @@ struct LabelsApp {
     engine: Arc<Engine>,
     matcher: Matcher,
     fail_fast: bool,
+    source: crate::engine::LabelSource,
 }
 
 #[async_trait]
@@ -56,6 +63,7 @@ impl App for LabelsApp {
                     rs.clone(),
                     &self.matcher,
                     crate::engine::Discovery::keep_going_unless(self.fail_fast, &gaps),
+                    self.source,
                 )
                 .await?
             {
@@ -94,6 +102,11 @@ async fn execute_async(
         engine,
         matcher,
         fail_fast: global.fail_fast,
+        source: if args.resolve {
+            crate::engine::LabelSource::Resolved
+        } else {
+            crate::engine::LabelSource::Listed
+        },
     };
     let interactive = tui::should_use_tui(global.no_tui);
     tui::run_app_with(

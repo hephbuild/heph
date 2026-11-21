@@ -103,7 +103,7 @@ struct TargetOutcome {
 /// def. Decided by node kind
 /// on the whole tree, so a composite of allowed kinds (`//a/... && !//b/...`)
 /// still takes the fast path.
-fn is_addr_only(m: &Matcher) -> bool {
+pub(crate) fn is_addr_only(m: &Matcher) -> bool {
     match m {
         Matcher::Label(_) | Matcher::Driver(_) | Matcher::TreeOutputTo(_) => false,
         Matcher::Or(terms) | Matcher::And(terms) => terms.iter().all(is_addr_only),

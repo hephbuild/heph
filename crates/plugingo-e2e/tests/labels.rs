@@ -320,9 +320,9 @@ async fn buildfile_target_shadowing_a_go_listing_is_selected_by_its_own_labels()
     Ok(())
 }
 
-// `heph i labels` resolves the *spec* of every addr the providers list, so a
-// listed addr that no provider can `get` used to abort the whole walk with
-// `target not found`. The go provider lists a candidate set on purpose — which
+// `heph i labels --resolve` resolves the *spec* of every addr the providers
+// list, so a listed addr that no provider can `get` used to abort the whole
+// walk with `target not found`. The go provider lists a candidate set on purpose — which
 // targets a Go package really has is only known once `go list` has run — and a
 // directory holding a `go.mod`/`go.sum` and no `.go` file at all has none of
 // them. The walk must skip those and still report the labels it did find.
@@ -332,7 +332,8 @@ async fn test_labels_over_a_module_with_no_go_files() -> anyhow::Result<()> {
     let dir = fixture("mod_no_go_files")?;
     let ws = make_workspace(dir)?;
     let rs = ws.engine.new_state();
-    // Whole-graph walk — exactly what `heph i labels` with no matcher does.
+    // Whole-graph walk — exactly what `heph i labels --resolve` with no
+    // matcher does.
     let labels = ws
         .engine
         .clone()
@@ -340,6 +341,7 @@ async fn test_labels_over_a_module_with_no_go_files() -> anyhow::Result<()> {
             rs,
             &Matcher::PackagePrefix(PkgBuf::from("")),
             heph::engine::Discovery::Complete,
+            heph::engine::LabelSource::Resolved,
         )
         .await?;
 
