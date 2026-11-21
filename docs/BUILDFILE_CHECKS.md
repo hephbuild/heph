@@ -230,7 +230,7 @@ def lib(name: str, deps: heph.types.Deps = None, labels: heph.types.Labels = Non
     target(name = name, driver = "bash", run = "true", labels = labels, transitive = {"deps": deps})
 ```
 
-The field aliases are `Addr`, `Deps`, `Env`, `Labels`, `PassEnv`,
+The field aliases are `Deps`, `Env`, `Labels`, `PassEnv`,
 `RuntimePassEnv` and `Tools`. The contract is:
 
 - A field alias means what `target()` accepts for that field at this heph

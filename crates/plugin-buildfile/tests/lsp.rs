@@ -1135,7 +1135,6 @@ fn types_completion_and_hover() {
     assert_eq!(
         labels(&result),
         vec![
-            "Addr",
             "Deps",
             "Env",
             "Labels",

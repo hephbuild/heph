@@ -55,39 +55,30 @@ enum Source {
     Field {
         /// The field, then the struct field within it (`["transitive", "deps"]`).
         path: &'static [&'static str],
-        /// Take the bare-string member of the field's union rather than the
-        /// whole field: one address out of `deps`.
-        single: bool,
     },
     /// A fixed type, not a field: no `None`, and no parameter name suggests it.
     Fixed(fn() -> Ty),
 }
 
-const fn field(path: &'static [&'static str], single: bool) -> Source {
-    Source::Field { path, single }
+const fn field(path: &'static [&'static str]) -> Source {
+    Source::Field { path }
 }
 
 /// Sorted by name; `types::alias_names_snapshot` pins the list.
 const DEFS: &[AliasDef] = &[
     AliasDef {
-        name: "Addr",
-        source: field(&["transitive", "deps"], true),
-        doc: "One target address, `//pkg:name`: what `target()` returns, and one entry of \
-              `deps` or `tools`.",
-    },
-    AliasDef {
         name: "Deps",
-        source: field(&["transitive", "deps"], false),
+        source: field(&["transitive", "deps"]),
         doc: "A `deps` value: an address, a list of them, or a `{group: addr | [addr]}` map.",
     },
     AliasDef {
         name: "Env",
-        source: field(&["transitive", "env"], false),
+        source: field(&["transitive", "env"]),
         doc: "An `env` value: a `{name: value}` map of environment variables.",
     },
     AliasDef {
         name: "Labels",
-        source: field(&["labels"], false),
+        source: field(&["labels"]),
         doc: "A `labels` value: a label, or a list of them.",
     },
     AliasDef {
@@ -98,17 +89,17 @@ const DEFS: &[AliasDef] = &[
     },
     AliasDef {
         name: "PassEnv",
-        source: field(&["transitive", "pass_env"], false),
+        source: field(&["transitive", "pass_env"]),
         doc: "A `pass_env` value: a variable name, or a list of them.",
     },
     AliasDef {
         name: "RuntimePassEnv",
-        source: field(&["transitive", "runtime_pass_env"], false),
+        source: field(&["transitive", "runtime_pass_env"]),
         doc: "A `runtime_pass_env` value: a variable name, or a list of them.",
     },
     AliasDef {
         name: "Tools",
-        source: field(&["transitive", "tools"], false),
+        source: field(&["transitive", "tools"]),
         doc: "A `tools` value: an address, a list of them, or a `{group: addr | [addr]}` map.",
     },
 ];
@@ -142,7 +133,7 @@ impl Alias {
 
 /// The type of `target()`'s field at `path`, or `None` when the schema no
 /// longer has it (the snapshot test then fails on the missing alias).
-fn field_type(path: &[&str], single: bool) -> Option<ParamType> {
+fn field_type(path: &[&str]) -> Option<ParamType> {
     let (first, rest) = path.split_first()?;
     let mut ty = target_base_fields()
         .into_iter()
@@ -154,27 +145,20 @@ fn field_type(path: &[&str], single: bool) -> Option<ParamType> {
         };
         ty = fields.into_iter().find(|f| f.name == *name)?.ty;
     }
-    if single {
-        let members = match ty {
-            ParamType::Union(members) => members,
-            other => vec![other],
-        };
-        ty = members.into_iter().find(|t| *t == ParamType::String)?;
-    }
     Some(ty)
 }
 
 /// What a field alias accepts, as the field's schema says it: the field's type
 /// or `None`.
-fn field_param(path: &[&str], single: bool) -> Option<ParamType> {
-    let field = field_type(path, single)?;
+fn field_param(path: &[&str]) -> Option<ParamType> {
+    let field = field_type(path)?;
     Some(ParamType::union(vec![field, ParamType::Null]))
 }
 
 /// What the alias `d` accepts, as a Starlark type.
 fn alias_ty(d: &AliasDef) -> Option<Ty> {
     match &d.source {
-        Source::Field { path, single } => Some(param_type_to_ty(&field_param(path, *single)?)),
+        Source::Field { path } => Some(param_type_to_ty(&field_param(path)?)),
         Source::Fixed(ty) => Some(ty()),
     }
 }
@@ -206,7 +190,7 @@ pub(crate) fn get(name: &str) -> Option<&'static Alias> {
 /// suggests it on an unannotated parameter of that name.
 pub(crate) fn for_param(param: &str) -> Option<&'static Alias> {
     let def = DEFS.iter().find(|d| match &d.source {
-        Source::Field { path, single } => !single && path.last() == Some(&param),
+        Source::Field { path } => path.last() == Some(&param),
         Source::Fixed(_) => false,
     })?;
     get(def.name)
@@ -882,7 +866,7 @@ pub(crate) mod tests {
         let msg = fails("x = heph.types.Nope\n");
         assert!(
             msg.contains(
-                "heph.types.Nope: no type alias named \"Nope\"; heph.types has: Addr, Deps, Env, \
+                "heph.types.Nope: no type alias named \"Nope\"; heph.types has: Deps, Env, \
                  Labels, Number, PassEnv, RuntimePassEnv, Tools; driver namespaces: bash, \
                  buildfile, oci"
             ),
@@ -1099,7 +1083,6 @@ pub(crate) mod tests {
         assert_eq!(
             names,
             [
-                "Addr",
                 "Deps",
                 "Env",
                 "Labels",
@@ -1242,9 +1225,7 @@ pub(crate) mod tests {
         let params: Vec<(&str, ParamType)> = DEFS
             .iter()
             .filter_map(|d| match &d.source {
-                Source::Field { path, single } => {
-                    Some((d.name, field_param(path, *single).expect("derives")))
-                }
+                Source::Field { path } => Some((d.name, field_param(path).expect("derives"))),
                 Source::Fixed(_) => None,
             })
             .collect();
@@ -1378,7 +1359,7 @@ lib(\"b\", deps = [\"//x:y\"], labels = \"l\")
             let msg = format!("{err:#}");
             assert!(
                 msg.contains(
-                    "heph.types.Nope: no type alias named \"Nope\"; heph.types has: Addr, Deps, \
+                    "heph.types.Nope: no type alias named \"Nope\"; heph.types has: Deps, \
                      Env, Labels, Number, PassEnv, RuntimePassEnv, Tools"
                 ),
                 "{msg}"
