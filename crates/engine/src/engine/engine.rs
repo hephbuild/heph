@@ -62,6 +62,10 @@ pub struct PluginInit {
     /// plugins register — reading it then is an error — and sealed before the
     /// first BUILD evaluation. Per engine: never share it across engines.
     pub functions: Arc<FunctionSlot>,
+    /// Every registered driver's schema, sealed with [`Self::functions`]: an
+    /// error to read before. The buildfile plugin builds
+    /// `heph.types.<driver>.Kwargs` from it.
+    pub drivers: Arc<hplugin::driver::DriverSchemaSlot>,
 }
 
 /// True if `entry` contains wax glob metacharacters — used to split `fs.skip`
@@ -369,6 +373,9 @@ pub struct Engine {
     /// The handle every plugin is given (in `PluginInit`, or behind a cdylib's
     /// registry handle). An error to read before [`Self::seal_functions`].
     pub(crate) function_slot: Arc<FunctionSlot>,
+    /// Every registered driver's schema, sealed by [`Self::seal_functions`]
+    /// and handed to every plugin in `PluginInit.drivers`.
+    pub(crate) driver_schema_slot: Arc<hplugin::driver::DriverSchemaSlot>,
 
     /// The remote cache's temp directory, created and swept of abandoned temps
     /// on first use (`Engine::remote_tmp_dir`). Lazy, so a build with no
@@ -988,6 +995,7 @@ impl Engine {
             remote_caches,
             functions: Arc::new(FunctionRegistry::default()),
             function_slot: FunctionSlot::new(),
+            driver_schema_slot: hplugin::driver::DriverSchemaSlot::new(),
             remote_tmp_ready: tokio::sync::OnceCell::new(),
             scratch_audit_ready: tokio::sync::OnceCell::new(),
         };
@@ -1106,6 +1114,14 @@ impl Engine {
     /// shared engine no longer hands out).
     pub(crate) fn seal_functions(&self) {
         self.function_slot.seal(&self.functions);
+        // The driver schemas are sealed at the same point, built once: the
+        // buildfile plugin's `heph.types.<driver>.Kwargs` read them.
+        self.driver_schema_slot.seal_with(|| {
+            self.drivers_by_name
+                .iter()
+                .map(|(name, d)| (name.clone(), d.driver.schema()))
+                .collect()
+        });
     }
 
     /// The config schema a registered driver exposes. Used by the BUILD-file LSP
@@ -1164,6 +1180,7 @@ impl Engine {
             codegen_index: Arc::clone(&self.codegen_index),
             runtime: self.runtime.clone(),
             functions: Arc::clone(&self.function_slot),
+            drivers: Arc::clone(&self.driver_schema_slot),
         }
     }
 
