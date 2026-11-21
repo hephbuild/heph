@@ -76,6 +76,21 @@ pub fn run(connection: Connection, engine: Arc<dyn LspEngine>) -> anyhow::Result
 /// `timed_out`, and "still held" means the scope itself never ended.
 const SCOPE_END_WAIT: Duration = Duration::from_secs(10);
 
+/// How long `--explain` waits for the listing itself before it reports a
+/// `list` error. Far past a completion's `LISTING_WAIT` (2s): `--explain` is
+/// where a slow listing is diagnosed, so it waits long enough to see one
+/// finish, and only a provider that hangs runs into this.
+const EXPLAIN_LISTING_WAIT: Duration = Duration::from_secs(30);
+
+/// How long `--explain` waits on the engine.
+#[derive(Clone, Copy, Debug)]
+struct Waits {
+    /// For the listing to answer ([`EXPLAIN_LISTING_WAIT`]).
+    listing: Duration,
+    /// For the listing's scope to end once it answered ([`SCOPE_END_WAIT`]).
+    scope_end: Duration,
+}
+
 /// How many `dropped:` lines the text form prints; `--json` lists them all.
 const DROPPED_SHOWN: usize = 20;
 
@@ -98,15 +113,23 @@ pub fn explain(
     json: bool,
     engine: impl FnOnce() -> anyhow::Result<Arc<dyn LspEngine>>,
 ) -> anyhow::Result<String> {
-    explain_with(target, json, engine, SCOPE_END_WAIT)
+    explain_with(
+        target,
+        json,
+        engine,
+        Waits {
+            listing: EXPLAIN_LISTING_WAIT,
+            scope_end: SCOPE_END_WAIT,
+        },
+    )
 }
 
-/// [`explain`], waiting `scope_end_wait` for the scope to end.
+/// [`explain`], waiting on the engine as `waits` says.
 fn explain_with(
     target: &str,
     json: bool,
     engine: impl FnOnce() -> anyhow::Result<Arc<dyn LspEngine>>,
-    scope_end_wait: Duration,
+    waits: Waits,
 ) -> anyhow::Result<String> {
     use anyhow::Context as _;
     let mut parts = target.rsplitn(3, ':');
@@ -147,7 +170,7 @@ fn explain_with(
         None => site::Resolution::none(site::Reason::NotASite),
     };
     let value = resolution.to_json();
-    let listing = explain_listing(file, &resolution.site, engine, scope_end_wait);
+    let listing = explain_listing(file, &resolution.site, engine, waits);
     if json {
         let mut out = serde_json::json!({ "file": file, "line": line, "col": col });
         if let (Some(map), serde_json::Value::Object(r)) = (out.as_object_mut(), value) {
@@ -188,7 +211,7 @@ fn explain_with(
         out.push_str(&format!("\n  degraded: {d}"));
     }
     if let Some(listing) = &listing {
-        listing.render(&mut out, scope_end_wait);
+        listing.render(&mut out, waits.scope_end);
     }
     Ok(out)
 }
@@ -257,7 +280,7 @@ fn explain_listing(
     file: &str,
     site: &site::Site,
     engine: impl FnOnce() -> anyhow::Result<Arc<dyn LspEngine>>,
-    scope_end_wait: Duration,
+    waits: Waits,
 ) -> Option<ExplainedListing> {
     // Whether the site lists, and whether a typed path is refused, is known
     // before the engine is built; only a `:name` needs it, for the open
@@ -285,9 +308,22 @@ fn explain_listing(
     };
     let started = Instant::now();
     let fut = Arc::clone(&engine).list(query.listing.clone());
-    let listed = match futures::executor::block_on(fut) {
-        Ok(listed) => listed,
-        Err(e) => {
+    // Dropped on the deadline, which cancels the engine's walk.
+    let listed = match context::block_on_timeout(fut, waits.listing) {
+        Some(Ok(listed)) => listed,
+        None => {
+            return Some(ExplainedListing::Failed {
+                what: Some(query.listing),
+                stage: FailStage::List,
+                message: format!(
+                    "the listing did not answer within {:?}: a provider may be hanging; \
+                     it was cancelled",
+                    waits.listing
+                ),
+                reason: None,
+            });
+        }
+        Some(Err(e)) => {
             return Some(ExplainedListing::Failed {
                 what: Some(query.listing),
                 stage: FailStage::List,
@@ -303,7 +339,7 @@ fn explain_listing(
         skipped,
         scope_ended,
     } = listed;
-    let acks = context::block_on_timeout(scope_ended, scope_end_wait);
+    let acks = context::block_on_timeout(scope_ended, waits.scope_end);
     let listed = entries.len();
     let mut candidates = Vec::with_capacity(listed);
     let mut dropped = Vec::new();
@@ -505,6 +541,13 @@ mod tests {
         json: bool,
         engine: Option<ListMode>,
     ) -> String {
+        // Short only where the listing hangs: a real listing on a loaded
+        // machine (the whole suite in parallel) overran 200ms.
+        let listing = if matches!(engine, Some(ListMode::Hangs)) {
+            Duration::from_millis(200)
+        } else {
+            super::EXPLAIN_LISTING_WAIT
+        };
         let dir = tempfile::tempdir().expect("tempdir");
         for (path, body) in files {
             let path = dir.path().join(path);
@@ -535,7 +578,10 @@ mod tests {
                 Some(list) => Ok(Arc::new(FakeEngine { root, list }) as Arc<dyn LspEngine>),
                 None => anyhow::bail!("config: no such plugin \"nope\""),
             },
-            Duration::from_millis(200),
+            super::Waits {
+                listing,
+                scope_end: Duration::from_millis(200),
+            },
         )
         .expect("explain answers")
     }
@@ -584,6 +630,36 @@ mod tests {
         assert!(out.contains("listing: targets in //app"), "{out}");
         assert!(
             out.contains("error (list): the listing failed: the provider exploded"),
+            "{out}"
+        );
+    }
+
+    /// A listing that never answers is a `list` error once the listing wait
+    /// passes, naming the query and the wait, not a command that hangs.
+    #[test]
+    fn a_listing_that_hangs_is_a_list_error_after_the_wait() {
+        let files = [("app/BUILD", "x = [\"//app:\"]\n")];
+        let started = std::time::Instant::now();
+        let v = json(&explain_at(
+            &files,
+            "app/BUILD",
+            "//app:",
+            true,
+            Some(ListMode::Hangs),
+        ));
+        assert!(started.elapsed() < Duration::from_secs(10), "{v}");
+        assert_eq!(v["listing"]["query"]["targets_in"], "app", "{v}");
+        assert_eq!(v["listing"]["error"]["stage"], "list", "{v}");
+        let msg = v["listing"]["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            msg.starts_with("the listing did not answer within 200ms"),
+            "{msg}"
+        );
+
+        let out = explain_at(&files, "app/BUILD", "//app:", false, Some(ListMode::Hangs));
+        assert!(out.contains("listing: targets in //app"), "{out}");
+        assert!(
+            out.contains("error (list): the listing did not answer within 200ms"),
             "{out}"
         );
     }
