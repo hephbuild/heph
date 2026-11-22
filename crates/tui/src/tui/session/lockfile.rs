@@ -81,6 +81,20 @@ pub(crate) fn try_lock_free(path: &Path) -> io::Result<Option<File>> {
     Ok(flock_nb(&file, libc::LOCK_EX)?.then_some(file))
 }
 
+/// Take `LOCK_SH` on an existing lock file without waiting, for a viewer
+/// copying a lost recording: a cleanup's exclusive seal waits while it is
+/// held, and every probe still reads the session as not live.
+/// `Ok(None)`: held exclusively (the owner, or a cleanup sealing it), or
+/// missing.
+pub(crate) fn try_lock_shared(path: &Path) -> io::Result<Option<File>> {
+    let file = match OpenOptions::new().read(true).open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    Ok(flock_nb(&file, libc::LOCK_SH)?.then_some(file))
+}
+
 /// Whether some open file description holds `path`'s lock, by the same
 /// `LOCK_SH` probe `hlock::FLock::is_path_held` uses. For tests and callers in
 /// this crate; a viewer in the root crate uses `FLock::is_path_held` itself.

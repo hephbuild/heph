@@ -6,6 +6,11 @@ edition = "2024"
 [lints]
 workspace = true
 
+[features]
+# `tui::session::testing`: recordings written without a recorder, for the
+# session tests of the root crate and `crates/e2e`.
+test-support = []
+
 [dependencies]
 hcore = { package = "core", path = "../core" }
 htelemetry = { package = "telemetry", path = "../telemetry" }
@@ -26,8 +31,9 @@ ratatui = { version = "0.30", default-features = false, features = ["crossterm",
 # terminal (its base64 dependency is already in the tree).
 crossterm = { version = "0.29", features = ["event-stream", "osc52"] }
 tokio = { version = "1.54.1", features = ["rt", "rt-multi-thread", "io-util", "io-std", "macros", "sync", "time", "net", "signal"] }
-# Session recording (`tui::session`): the on-disk records, the atomic
-# `meta.json`/`status.json` writes, and the random half of a session id.
+# Session recording (`tui::session`): the record bodies and status snapshot
+# in `session.db`, the atomic `inflight.txt` write, and the random half of a
+# session id.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # `derive(Shape)` on the session types `heph session --json` nests, so the
@@ -40,6 +46,10 @@ tempfile = "3"
 # the CI box does (`failure_rows`).
 shlex = "2"
 uuid = { version = "1.29.3", features = ["v4"] }
+# `session.db`, the recording; and its trace id (SHA-256 of the session id).
+rusqlite = { version = "0.42", features = ["bundled", "blob"] }
+sha2 = "0.11"
+hex = "0.4"
 
 # With stdin not a terminal, crossterm reads /dev/tty, and macOS kqueue refuses
 # that with EINVAL (measured), so `heph … < file` and `… | heph` timed out on the

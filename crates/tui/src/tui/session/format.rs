@@ -37,15 +37,10 @@ pub const CAPABILITY_INFLIGHT: &str = "inflight";
 
 /// File names inside a session directory. Frozen for every format: cleanup and
 /// `list` of a newer format's directory depend on `lock` meaning the same thing.
+/// The recording itself is [`super::store::FILE`].
 pub mod files {
-    /// Written once at start, atomically.
-    pub const META: &str = "meta.json";
     /// `flock(LOCK_EX)` held by the owner for its whole life. Held = alive.
     pub const LOCK: &str = "lock";
-    /// The append-only record log, one JSON record per line.
-    pub const EVENTS: &str = "events.ndjson";
-    /// The latest [`super::SessionSnapshot`], rewritten atomically.
-    pub const STATUS: &str = "status.json";
     /// Created by a viewer to ask for an in-flight report; the only file a
     /// viewer ever writes.
     pub const INFLIGHT_REQUEST: &str = "inflight.request";
@@ -157,13 +152,13 @@ impl SessionMeta {
     }
 }
 
-/// One line of `events.ndjson`.
+/// One record: the `body` of a row of `session.db`'s `records` table.
 ///
 /// Both keys optional: a build event has `kind` (a [`BuildEventKind`] encoded
 /// exactly as on the plugin wire, so a `BuildEvent`'s own JSON *is* a valid
-/// record), a session record has `session`. A line with neither is skipped by
+/// record), a session record has `session`. A body with neither is skipped by
 /// a reader; one that does not decode is skipped and counted
-/// ([`super::reader::RecordReader`]).
+/// ([`super::store::RecordCursor`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRecord {
     pub at_unix_ms: u64,
@@ -220,11 +215,12 @@ pub enum SessionRecordKind {
         #[serde(default)]
         panicked: bool,
     },
-    /// `events.ndjson` reached its size cap; no build event follows (`End`,
-    /// `InflightWritten`, `Finished`, `Output`, `Label`, `RunLog` and an
-    /// `Approval` clearing the prompt still do). `Log` records follow it
-    /// until the bytes they add past the cap reach `LOG_CEILING` (256 MiB),
-    /// and are dropped beyond. `status.json` keeps updating.
+    /// The recording reached a size cap (D15). The first marks
+    /// [`FULL_CAP`](super::recorder::FULL_CAP): only the
+    /// [`is_critical`](super::recorder::is_critical) kinds follow it (no
+    /// `Log`, `Output` or progress-only event). A second marks the
+    /// [`CEILING`](super::recorder::CEILING): derivation stops at it, and only
+    /// `End` follows. The `status` row keeps updating.
     Truncated,
     /// The owner answered an in-flight request: `inflight.txt` is fresh.
     InflightWritten,
@@ -274,6 +270,15 @@ pub enum SessionRecordKind {
     /// the session's lock is held and no `ExecuteEnd` for the addr follows
     /// it; read through [`super::run_logs`], never by joining `file` itself.
     RunLog(Box<RunLogRecord>),
+    /// The run named the session behind a lock holder's pid when it first
+    /// waited on it (D6): what a viewer names the holder by, so no viewer
+    /// scans for pids, and a recording read elsewhere still names it.
+    LockHolder {
+        pid: u32,
+        /// `None`: no live session on this machine had that pid.
+        #[serde(default)]
+        session: Option<String>,
+    },
     /// A record a newer heph writes.
     #[serde(other)]
     Unknown,
