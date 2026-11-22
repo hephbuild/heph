@@ -58,6 +58,7 @@ which reads as a pass.
    | `dns error`, `operation timed out`, `peer closed connection without sending TLS close_notify` on an outbound fetch (go.dev SDK, `hephbuild/heph-artifacts-v1` release assets) | `Test darwin/arm64`, Linux green | macOS runner network drop |
    | `top_level_resolution_is_admission_controlled` or another test with a wall-clock budget | `Test darwin/arm64` | slow runner; `master` shows it too |
    | `No space left on device (os error 28)` | `plugingo-e2e`, locally under full `tst` | disk pressure. Check `df -h .` and rerun the one test alone |
+   | `never saw "sleep-was-cut" within 30s`, screen only `fgwork-ready`, in `relay_reaches_the_foreground_group` | `Binary E2E darwin/arm64` | **Fixed by #634.** A test race: the SIGINT reached bash before its foreground `sleep` existed, so bash deferred its trap for the 100s sleep. A FLAKE only on a branch without #634; on one with it, REAL |
 
    Before calling something a flake, check whether `master` is green: `gh run list --branch master --workflow heph.yml --limit 3`.
    A flake is red on one platform with the other two green. **The same failure on all three is never a flake.**
