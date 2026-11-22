@@ -18,6 +18,17 @@ use std::path::Path;
 /// (`<home>/runs/<engine-id>/<n>.log`).
 pub const RUNS_DIR: &str = "runs";
 
+/// `HEPH_SESSION_EXPORT_DIR=<absolute dir>`: at seal, a session also writes
+/// `<dir>/<id>.hephsession`, so a CI job keeps every heph run it contains.
+///
+/// It is heph's, never a target's input (spec I1, E4). The exec driver strips
+/// it from the `pass_env = ["*"]` and `runtime_pass_env = ["*"]` wildcards
+/// and refuses it in a named `pass_env` (directly or through a dependency's
+/// hashed `transitive` env), where it would reach the def hash; the session
+/// runner removes it from its launch and its targets' base environment. Only
+/// a named `runtime_pass_env`, which is not hashed, passes it to a target.
+pub const SESSION_EXPORT_DIR_ENV: &str = "HEPH_SESSION_EXPORT_DIR";
+
 /// A run's live log came into being: `addr` is running at `hashin`, and its
 /// output is being appended to `file`.
 ///

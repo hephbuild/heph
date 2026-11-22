@@ -6,6 +6,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use hcore::debug_hash::DebugHasher;
 use hcore::hasync::Cancellable;
+use hcore::session_record::SESSION_EXPORT_DIR_ENV;
 use hdriver_support::driver_managed::{ManagedRunRequest, ManagedRunResponse};
 use hdriver_support::redact;
 use hexecrunner::RunnerRef;
@@ -479,13 +480,53 @@ pub(crate) const TOOLS_DIR_KEY: &str = "HEPH_TOOLS_DIR";
 /// sandbox, which is what lets [`TOOLS_DIR_KEY`] have a single value.
 const TOOLS_UNPACK_ROOT: &str = "tools";
 
-/// The host environment a `"*"` passthrough carries: all of it except
-/// [`TOOLS_DIR_KEY`], which only ever names the tools of the heph target this
-/// process runs inside, never anything of this target's. Left in, a nested
-/// heph would refuse every target with tools under `pass_env = ["*"]`, and
-/// hand a target without tools another sandbox's tool tree.
+/// The host environment a `"*"` passthrough carries: [`wildcard_env`] over
+/// this process's environment.
 fn host_env_for_wildcard() -> impl Iterator<Item = (String, String)> {
-    std::env::vars().filter(|(k, _)| k != TOOLS_DIR_KEY)
+    wildcard_env(std::env::vars())
+}
+
+/// What a `"*"` passthrough keeps of `env`: all of it except the names that
+/// are heph's own and never a target's input.
+///
+/// - [`TOOLS_DIR_KEY`] only ever names the tools of the heph target this
+///   process runs inside, never anything of this target's. Left in, a nested
+///   heph would refuse every target with tools under `pass_env = ["*"]`, and
+///   hand a target without tools another sandbox's tool tree.
+/// - [`SESSION_EXPORT_DIR_ENV`] is where this heph's session exports go (spec
+///   E4). Under `pass_env = ["*"]` it would move the def hash with the CI
+///   job's directory; under either wildcard a nested heph would write its
+///   export there unasked. A target that wants it names it in
+///   `runtime_pass_env`.
+fn wildcard_env(
+    env: impl Iterator<Item = (String, String)>,
+) -> impl Iterator<Item = (String, String)> {
+    env.filter(|(k, _)| k != TOOLS_DIR_KEY && k != SESSION_EXPORT_DIR_ENV)
+}
+
+/// Refuse [`SESSION_EXPORT_DIR_ENV`] among the names a target hashes: a named
+/// `pass_env`, or a dependency's `transitive` env passed with `hash: true`
+/// (`source` says which). It would put the CI job's export directory into
+/// the def hash. Its own check, run for every target: unlike
+/// [`check_tool_root_keys`] it does not depend on the target having tools.
+fn refuse_hashed_session_export_dir<'a>(
+    addr: &hmodel::htaddr::Addr,
+    source: &str,
+    hashed: impl IntoIterator<Item = &'a str>,
+) -> anyhow::Result<()> {
+    if hashed
+        .into_iter()
+        .any(|name| name == SESSION_EXPORT_DIR_ENV)
+    {
+        anyhow::bail!(
+            "{}: `{SESSION_EXPORT_DIR_ENV}` is passed by {source}, which is hashed, but it is \
+             heph's session export directory, not an input: it would move the def hash with \
+             the directory a CI job picked. Name it in `runtime_pass_env` instead (or pass it \
+             with `hash: false`), which hands it to the process without hashing it",
+            addr.format(),
+        );
+    }
+    Ok(())
 }
 
 /// Refuse a target whose `$TOOL_<G>_ROOT` would be ambiguous, at parse rather
@@ -1703,7 +1744,13 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
         // parse time and hashed like any other pass_env (so the input hash
         // captures the whole environment — only use it on uncached targets).
         // A name listed beside `"*"` is passed as named, so the one name the
-        // wildcard leaves out (`HEPH_TOOLS_DIR`) is still checked when written.
+        // wildcard leaves out (`HEPH_TOOLS_DIR`) is still checked when written,
+        // and `HEPH_SESSION_EXPORT_DIR` is refused when written.
+        refuse_hashed_session_export_dir(
+            &req.target_spec.addr,
+            "the target's `pass_env`",
+            spec.pass_env.iter().map(String::as_str),
+        )?;
         let named = spec
             .pass_env
             .iter()
@@ -1907,6 +1954,20 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
             &mut xdef.dep_group_inputs,
             &mut xdef.runtime_dep_group_inputs,
         );
+        // A dependency's hashed `Pass` would copy the export directory into
+        // `pass_env`, and so the def hash. An entrypoint runs on the caller's
+        // whole environment and hashes no pass, so it is not refused.
+        if !is_entrypoint {
+            refuse_hashed_session_export_dir(
+                &def.addr,
+                "a dependency's `transitive` env",
+                req.sandbox
+                    .env
+                    .iter()
+                    .filter(|(_, env)| env.hash && matches!(env.value, EnvValue::Pass))
+                    .map(|(name, _)| name.as_str()),
+            )?;
+        }
         // A dependency's `transitive` tools may add groups, and its env names
         // (a transitive `Pass` among them, whatever the host has). The
         // target's own names, the `pass_env` snapshot included, are rechecked
@@ -3748,6 +3809,128 @@ mod tests {
         .ok_or_else(|| anyhow::anyhow!("parsed although HEPH_TOOLS_DIR is named"))?;
         let err = format!("{err:#}");
         assert!(err.contains("`HEPH_TOOLS_DIR` is set by the host"), "{err}");
+        Ok(())
+    }
+
+    /// Spec E4: a `"*"` passthrough, hashed or not, never carries the session
+    /// export directory (nor `HEPH_TOOLS_DIR`); a near-miss name is kept.
+    /// The strip is a function over an environment, so no `set_var`.
+    #[test]
+    fn wildcard_strips_the_session_export_dir() {
+        let host = [
+            (SESSION_EXPORT_DIR_ENV, "/ci/sessions"),
+            (TOOLS_DIR_KEY, "/outer/tools"),
+            ("HEPH_SESSION_EXPORT_DIRS", "near miss"),
+            ("heph_session_export_dir", "other case"),
+            ("PATH", "/bin"),
+        ]
+        .map(|(k, v)| (k.to_string(), v.to_string()));
+        let kept: Vec<String> = wildcard_env(host.into_iter()).map(|(k, _)| k).collect();
+        assert_eq!(
+            kept,
+            [
+                "HEPH_SESSION_EXPORT_DIRS",
+                "heph_session_export_dir",
+                "PATH"
+            ]
+        );
+    }
+
+    /// Spec E4: named in a hashed `pass_env`, the export directory is refused
+    /// at parse, whether the host has it or not and beside `"*"` too; named
+    /// in `runtime_pass_env`, which is not hashed, it is allowed.
+    #[tokio::test]
+    async fn export_dir_is_refused_in_a_named_pass_env() -> anyhow::Result<()> {
+        let list = |items: &[&str]| {
+            hcore::htvalue::Value::List(
+                items
+                    .iter()
+                    .map(|s| hcore::htvalue::Value::String((*s).to_string()))
+                    .collect(),
+            )
+        };
+        for named in [
+            &[SESSION_EXPORT_DIR_ENV][..],
+            &["*", SESSION_EXPORT_DIR_ENV],
+        ] {
+            let err = parse_with(HashMap::from([("pass_env".to_string(), list(named))]))
+                .await
+                .err()
+                .ok_or_else(|| anyhow::anyhow!("{named:?}: parsed with the export dir hashed"))?;
+            let err = format!("{err:#}");
+            assert!(
+                err.contains(&format!(
+                    "`{SESSION_EXPORT_DIR_ENV}` is passed by the target's `pass_env`"
+                )) && err.contains("`runtime_pass_env`"),
+                "{err}"
+            );
+        }
+        let parsed = parse_with(HashMap::from([(
+            "runtime_pass_env".to_string(),
+            list(&[SESSION_EXPORT_DIR_ENV]),
+        )]))
+        .await?;
+        assert_eq!(
+            parsed.def::<TargetDef>().runtime_pass_env,
+            [SESSION_EXPORT_DIR_ENV]
+        );
+        Ok(())
+    }
+
+    /// Spec row `transitive_cannot_hash_the_export_dir`: a dependency passing
+    /// the export directory through `transitive` env with `hash: true` is
+    /// refused in `apply_transitive` (an always-run check, here on a target
+    /// with no tools); with `hash: false` it lands in `runtime_pass_env`.
+    #[tokio::test]
+    async fn transitive_cannot_hash_the_export_dir() -> anyhow::Result<()> {
+        use hplugin::driver::sandbox::{Env, Sandbox};
+        let sandbox = |hash: bool| {
+            let mut sb = Sandbox::default();
+            sb.env.insert(
+                SESSION_EXPORT_DIR_ENV.to_string(),
+                Env {
+                    value: EnvValue::Pass,
+                    hash,
+                    append: false,
+                    append_prefix: String::new(),
+                },
+            );
+            sb
+        };
+        let driver = Driver::new_exec();
+        let apply = |hash: bool| {
+            let driver = &driver;
+            async move {
+                let parsed = parse_with_driver(driver, HashMap::new()).await?;
+                driver
+                    .apply_transitive(
+                        ApplyTransitiveRequest {
+                            request_id: "test".to_string(),
+                            target_def: parsed,
+                            sandbox: sandbox(hash),
+                        },
+                        &StdCancellationToken::new(),
+                    )
+                    .await
+            }
+        };
+
+        let err = apply(true)
+            .await
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("a hashed transitive pass of the export dir applied"))?;
+        let err = format!("{err:#}");
+        assert!(
+            err.contains(&format!(
+                "`{SESSION_EXPORT_DIR_ENV}` is passed by a dependency's `transitive` env"
+            )),
+            "{err}"
+        );
+
+        let applied = apply(false).await?;
+        let def = applied.target_def.def::<TargetDef>();
+        assert_eq!(def.runtime_pass_env, [SESSION_EXPORT_DIR_ENV]);
+        assert!(!def.pass_env.contains_key(SESSION_EXPORT_DIR_ENV));
         Ok(())
     }
 

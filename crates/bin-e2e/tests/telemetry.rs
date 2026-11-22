@@ -308,6 +308,7 @@ fn a_disabled_flusher_does_nothing() {
         .env("HEPH_DISABLE_TELEMETRY", "1")
         .env("HEPH_TELEMETRY_ENDPOINT", DEAD_ENDPOINT)
         .env("HEPH_NO_SELF_UPDATE", "1")
+        .env_remove(common::SESSION_EXPORT_DIR_ENV)
         .stdin(Stdio::null())
         .output()
         .expect("spawn heph __telemetry-flush");

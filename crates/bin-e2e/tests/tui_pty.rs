@@ -2347,6 +2347,7 @@ fn drive_pty(
     cmd.env("HEPH_CWD", cwd);
     cmd.env("HEPH_NO_SELF_UPDATE", "1");
     cmd.env("HEPH_DISABLE_TELEMETRY", "1");
+    cmd.env_remove(common::SESSION_EXPORT_DIR_ENV);
     cmd.env("RUST_BACKTRACE", "1");
     // crossterm needs a terminfo-resolvable TERM; the CI runner's inherited
     // value may be `dumb` or unset.

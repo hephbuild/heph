@@ -415,6 +415,9 @@ fn launch_command(
         .current_dir(cfg.cwd.as_deref().unwrap_or("/"))
         .env_clear()
         .envs(&cfg.launch_env)
+        // heph's session export directory is never the environment's (spec
+        // E4), even when `launch_env` names it: every target would inherit it.
+        .env_remove(hcore::session_record::SESSION_EXPORT_DIR_ENV)
         .env(SOCK_ENV, socket);
     cmd
 }
@@ -774,6 +777,31 @@ mod tests {
             vec![format!("{SOCK_ENV}=/s.sock"), "XR_DECLARED=yes".to_string()],
             "the launch's environment is exactly what the config declares, with heph's socket"
         );
+    }
+
+    /// Spec E4: the session export directory never reaches the launch, even
+    /// named in `launch_env`.
+    #[test]
+    fn the_launch_never_carries_the_session_export_dir() {
+        let key = hcore::session_record::SESSION_EXPORT_DIR_ENV;
+        let cfg = SessionConfig {
+            launch: vec!["/usr/bin/env".to_string()],
+            cwd: None,
+            launch_env: BTreeMap::from([
+                (key.to_string(), "/ci/sessions".to_string()),
+                ("XR_DECLARED".to_string(), "yes".to_string()),
+            ]),
+        };
+        let out = launch_command(&cfg, Path::new("/usr/bin/env"), &[], Path::new("/s.sock"))
+            .output()
+            .expect("run env");
+        assert!(out.status.success(), "{out:?}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !stdout.lines().any(|l| l.starts_with(&format!("{key}="))),
+            "{stdout}"
+        );
+        assert!(stdout.lines().any(|l| l == "XR_DECLARED=yes"), "{stdout}");
     }
 
     /// `launch_env` is optional, so a `runner.json` written before it still
