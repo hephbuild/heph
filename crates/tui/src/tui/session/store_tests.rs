@@ -833,10 +833,13 @@ fn immutable_only_on_a_rollback_header() {
 }
 
 /// I3: a viewer copying a lost session holds its lock shared, so a cleanup
-/// trying to seal it then leaves it alone; once the viewer is done the copy
-/// held every committed row and the next cleanup seals it. And a viewer
-/// arriving while a cleanup holds the lock to seal reads in place, read-only,
-/// rather than copying a file being rewritten.
+/// trying to seal it then leaves it alone (to the next cleanup: it does not
+/// wait); once the viewer is done the copy held every committed row and the
+/// next cleanup seals it. The viewer is parked inside `open_copy` itself,
+/// after its lock and before its copy, so an `open_copy` that copied before
+/// locking, or without locking, has the cleanup seal under it and fails
+/// here. And a viewer arriving while a cleanup holds the lock to seal reads
+/// in place, read-only, rather than copying a file being rewritten.
 #[test]
 fn copy_holds_the_lock_shared() {
     let root = tempfile::tempdir().expect("tempdir");
@@ -847,14 +850,32 @@ fn copy_holds_the_lock_shared() {
     let lock = dir.join(files::LOCK);
     let later = SystemTime::now() + 2 * cleanup::STARTING;
 
-    let copying = lockfile::try_lock_shared(&lock)
-        .expect("lock shared")
-        .expect("free");
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel::<()>();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let go_rx = std::sync::Mutex::new(go_rx);
+    store::copy_gate::set(&lock, move || {
+        let _ = locked_tx.send(());
+        let _ = go_rx.lock().expect("gate").recv();
+    });
+    let viewer = std::thread::spawn({
+        let dir = dir.clone();
+        move || {
+            let opened = tests::open(&dir);
+            assert!(opened.is_copy(), "{opened:?}");
+            let mut cursor = store::RecordCursor::new(opened);
+            std::iter::from_fn(|| cursor.next_record().expect("read")).count()
+        }
+    });
+    locked_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the viewer reaches its copy");
     let report = cleanup::cleanup(root.path(), later, Retention::default()).expect("cleanup");
     assert!(report.sealed.is_empty(), "{report:?}");
     assert!(report.removed.is_empty(), "{report:?}");
     assert!(header(&dir).wal, "not sealed under the viewer");
-    drop(copying);
+    go_tx.send(()).expect("release the viewer");
+    assert_eq!(viewer.join().expect("viewer"), records.len());
+    store::copy_gate::set(&lock, || {});
 
     let sealing = lockfile::try_lock_free(&lock)
         .expect("lock exclusive")
@@ -875,6 +896,65 @@ fn copy_holds_the_lock_shared() {
     let report = cleanup::cleanup(root.path(), later, Retention::default()).expect("cleanup");
     assert_eq!(report.sealed, vec![id]);
     assert!(!header(&dir).wal);
+}
+
+/// I3, raced for real: a cleanup sealing a lost session and a viewer opening
+/// it start together, many times over. Whichever wins, the viewer reads every
+/// committed record or is told to try again (never a short or failed read),
+/// the cleanup seals it or leaves it for the next one, and the next cleanup
+/// always ends with it sealed and whole.
+#[test]
+fn seal_lost_races_open_local() {
+    let records: Vec<SessionRecord> = events().into_iter().map(event_record).collect();
+    let later = SystemTime::now() + 2 * cleanup::STARTING;
+    let mut outcomes = BTreeMap::<&str, usize>::new();
+    for round in 0..40u8 {
+        let root = tempfile::tempdir().expect("tempdir");
+        let id = now_id(round);
+        let dir = session_dir(root.path(), id);
+        tests::unsealed_recording(&dir, id, &records);
+        let start = Arc::new(Barrier::new(2));
+        let viewer = std::thread::spawn({
+            let (root, dir, start) = (root.path().to_path_buf(), dir.clone(), Arc::clone(&start));
+            move || {
+                start.wait();
+                match store::open_local(&root, &dir) {
+                    Ok(opened) => {
+                        let how = if opened.is_copy() {
+                            "copy"
+                        } else if opened.live {
+                            "in place"
+                        } else {
+                            "sealed"
+                        };
+                        let mut cursor = store::RecordCursor::new(opened);
+                        let n = std::iter::from_fn(|| cursor.next_record().expect("read")).count();
+                        (how, n)
+                    }
+                    Err(store::OpenError::Other(e)) if format!("{e:#}").contains("try again") => {
+                        ("try again", 0)
+                    }
+                    Err(e) => panic!("round {round}: {e:?}"),
+                }
+            }
+        });
+        start.wait();
+        let first = cleanup::cleanup(root.path(), later, Retention::default()).expect("cleanup");
+        let (how, n) = viewer.join().expect("viewer");
+        if how != "try again" {
+            assert_eq!(n, records.len(), "round {round}: read {how}");
+        }
+        *outcomes.entry(how).or_default() += 1;
+        assert!(first.removed.is_empty(), "round {round}: {first:?}");
+        if first.sealed.is_empty() {
+            let again = cleanup::cleanup(root.path(), later, Retention::default()).expect("cleanup");
+            assert_eq!(again.sealed, vec![id], "round {round}");
+        }
+        assert!(!header(&dir).wal, "round {round}: sealed");
+        let (read, skipped) = read_records(&dir);
+        assert_eq!((read.len(), skipped), (records.len(), 0), "round {round}");
+    }
+    eprintln!("seal_lost_races_open_local: {outcomes:?}");
 }
 
 /// A cursor reads past more undecodable bodies than one page holds: a page

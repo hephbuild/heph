@@ -423,6 +423,8 @@ fn open_copy(root: &Path, dir: &Path, lock: &Path) -> Result<Opened, OpenError> 
             ))),
         };
     }
+    #[cfg(test)]
+    copy_gate::hit(lock);
     let base = tmp.join(format!(
         "copy-{}-{}.db",
         std::process::id(),
@@ -451,6 +453,38 @@ fn open_copy(root: &Path, dir: &Path, lock: &Path) -> Result<Opened, OpenError> 
         live: false,
         copy: Some(copy),
     })
+}
+
+/// A test's hold on [`open_copy`], between taking a session's lock and
+/// copying its files, so a test can run a cleanup in that window. Keyed by
+/// the lock's path, so tests running beside each other do not meet.
+#[cfg(test)]
+pub(crate) mod copy_gate {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+
+    type Hook = Arc<dyn Fn() + Send + Sync>;
+    static HOOKS: Mutex<Vec<(PathBuf, Hook)>> = Mutex::new(Vec::new());
+
+    /// Run `hook` each time [`super::open_copy`] holds `lock` and has not
+    /// copied yet.
+    pub(crate) fn set(lock: &Path, hook: impl Fn() + Send + Sync + 'static) {
+        let mut hooks = HOOKS.lock().unwrap_or_else(|e| e.into_inner());
+        hooks.retain(|(p, _)| p != lock);
+        hooks.push((lock.to_path_buf(), Arc::new(hook)));
+    }
+
+    pub(super) fn hit(lock: &Path) {
+        let hook = HOOKS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|(p, _)| p == lock)
+            .map(|(_, h)| Arc::clone(h));
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
 }
 
 /// `path` with `suffix` appended to its file name (`-wal`, `-shm`).
