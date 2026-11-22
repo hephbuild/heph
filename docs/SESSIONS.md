@@ -30,13 +30,13 @@ prefix.
 
 | Command | Does | Exit |
 | --- | --- | --- |
-| `list` | One row per session of this workspace (`--all`: every workspace; outside a workspace, every one, with a note on stderr), live first: ID, WORKTREE, COMMAND, STATE, EXIT, PROGRESS, NOW. Reads `meta.json` and `status.json` only. | 0 |
-| `show <id>` | The TUI's frame printed once as text, then a "Stuck on" block: lock waits naming the session that holds the lock (followed to the root of the chain, falling back to the pid), admission waits, targets running over 30s, and one `Next:` line. | 0 |
+| `list` | One row per session of this workspace (`--all`: every workspace; outside a workspace, every one, with a note on stderr), live first: ID, WORKTREE, COMMAND, STATE, EXIT, PROGRESS, NOW. Reads each recording's `session` and `status` rows only, never `records`. | 0 |
+| `show <id>` | The TUI's frame printed once as text, then a "Stuck on" block: lock waits naming the session that holds the lock (followed to the root of the chain, falling back to the pid), admission waits, targets running over 30s, and one `Next:` line. An ended session adds one line per bounded resource pool (see [Pools](#pools)). | 0 |
 | `attach <id>` | The interactive TUI on the session, following it until it ends; `q` or Ctrl-C detaches and never cancels it. Without a terminal it follows in line form. | the session's exit code; 0 on detach |
 | `inflight <id>` | The session's in-flight report (what the `SIGQUIT` dump carries), asked for through the session directory; waits 5s. | 0 |
 
 Every error of `heph session` itself exits **125**: no such session, an
-ambiguous id, a directory format newer than this heph, a lost session for
+ambiguous id, a recording format newer than this heph, a lost session for
 `attach`, a session whose `End` carries no exit code, an `inflight` that is
 not answered or is asked of an ended session. By code alone 125 is ambiguous:
 a session can exit 125 itself (an entrypoint whose heph-side setup failed, or
@@ -95,8 +95,9 @@ other. Where it lands depends on what the target passes through:
 - With `HOME` pointed inside the target's sandbox (a test that gives heph a
   scratch home), the nested heph writes `.heph/sessions/<id>/` there, inside
   the sandbox. A directory or glob output that covers it captures the session
-  directory into the target's outputs, and with it a fresh id and timestamps
-  on every run. Set `HEPH_NO_SESSION=1`, or use `--raw`.
+  directory (its `session.db` included) into the target's outputs, and with
+  it a fresh id and timestamps on every run. Set `HEPH_NO_SESSION=1`, or use
+  `--raw`.
 
 Either way the outer run is unaffected: nothing about its session reaches the
 target (I1), so the nested run is a separate session, never a child of the
@@ -111,36 +112,174 @@ that also holds the plugin cache; `hcore::userdir`). `heph tool clean` and
 `gc` work on the cache by target and never touch `sessions/`, even for a
 workspace rooted at `$HOME`, whose home is `~/.heph`.
 
+```
+~/.heph/sessions/
+  .tmp/                      readers' copies of lost recordings (swept after 10 minutes)
+  .removing-<id>-<pid>/      a removal in progress (a tomb)
+  <id>/
+    lock                     flock held while alive (frozen for every format)
+    session.db               the recording (+ -wal, -shm while live)
+    inflight.request         by a viewer, temp + rename; the owner consumes it
+    inflight.txt             by the owner, temp + rename: the last in-flight report
+```
+
 | File | Written | Holds |
 | --- | --- | --- |
-| `meta.json` | once at start, temp + rename | `format`, id, `owner_pid`, start time, heph version, argv, cwd (`HEPH_CWD` when set), workspace root and home, label, interactive, `capabilities` |
-| `lock` | `flock` taken at start, held until exit | nothing: held means alive |
-| `events.ndjson` | appended, flushed every 250ms and at exit | one record per line |
-| `status.json` | temp + rename, at most once a second, only when changed | a `SessionSnapshot`, each list capped at its first 100 entries |
-| `inflight.request` | by a viewer, temp + rename | nothing; the owner consumes it |
-| `inflight.txt` | by the owner, temp + rename | the last in-flight report |
+| `lock` | `flock` taken at start, held until the recording is sealed or the process exits | nothing: held means alive |
+| `session.db` | by the owner's recorder only, one transaction per 250ms flush tick and at exit | the whole recording: see [The recording](#the-recording-sessiondb) |
+| `inflight.request` | by a viewer | nothing |
+| `inflight.txt` | by the owner | the last in-flight report |
 
-`status.json` keeps at most the first 100 entries of each list (`running`,
-`waiting`, `failed`, `lock_waits`, `admission_waits`), plus
+`session.db` is created under a temporary name (`.session.db.creating`) with
+its schema, format stamp and session row in place, closed, renamed, and
+reopened by its final name, so no viewer ever opens a half-made file and no
+`-wal` is ever left named after the temporary name. A filesystem that
+refuses WAL mode (some network filesystems) stops the recorder before the
+rename, with its one `warn!` (see [Recording](#recording)).
+
+The `status` row keeps at most the first 100 entries of each list
+(`running`, `waiting`, `failed`, `lock_waits`, `admission_waits`), plus
 `totals.<list> = {total, truncated}` with the full length. This reverses A17
 (user decision), the design amendment that kept full lists: a 50k-target
 build that fails wide would otherwise rewrite megabytes every second, and
 `list` reads it for every session. The counts (`counts`, including
 `running_unblocked`, which `waiting` is derived from) are over the full
-lists. A `status.json` without `running_unblocked` (a writer from before the
+lists. A snapshot without `running_unblocked` (a writer from before the
 field) is read by comparing the `running` and `waiting` lists, as it was
-before the cap. `list` reads only `status.json` and stays cheap; `show` (text and
-`--json`) and `attach` fold `events.ndjson` and have every entry. Past the
-event log's 64 MiB cap a fold is short of the run, so `show --json` prints
-`status.json` instead, capped, and its `totals` say so.
+before the cap. `list` reads only the `session` and `status` rows and stays
+cheap; `show` (text and `--json`) and `attach` fold `records` and have every
+entry. Past the recording's 256 MiB full cap (a `Truncated` record) a fold
+is short of the run, so `show --json` prints the `status` row instead,
+capped, and its `totals` say so.
 
 The id is 10 Crockford base32 characters: 42 bits of start time in ms, then 8
 random bits, so ids sort by start. Uniqueness comes from `create_dir` (not
 `create_dir_all`), regenerated on `EEXIST`.
 
+## The recording: `session.db`
+
+One SQLite file per session. Its header says what it is:
+`PRAGMA application_id` is `0x48455048` ("HEPH") on every heph recording,
+`PRAGMA user_version` is its format (1), and bytes 18–19 say whether it is
+still in WAL mode (live, or a seal cut short) or sealed (rollback mode).
+
+| Table | Holds |
+| --- | --- |
+| `session` | exactly one row: id, `format`, heph version, owner pid, `host`, `user`, `actor_kind` (`human`, `agent`, `ci`), `actor_name` (`claude-code`, `github-actions`, `unknown`), `ci_run_url`, `command`, `argv` (a JSON array), `cwd` (`HEPH_CWD` when set), workspace root and home, `git_head` (always NULL for now), label, interactive, `capabilities`, `lossy` (argv or cwd lost bytes: a NUL or invalid UTF-8 stored as U+FFFD), `started_ms`, `ended_ms`, `exit_code`, `panicked`, `truncated` and `truncated_seq`, `derivation`, `sealed` |
+| `records` | the source of truth, in stream order: `seq`, `at_ms`, `kind` (the record's variant name), `addr`, and `body`, the record as JSON (see [Records](#records)) |
+| `status` | one row: the latest `SessionSnapshot`, upserted at most once a second and only when changed, and the final one at exit |
+| `notices`, `failure_logs` | empty in a local recording; filled only by an export (a later PR) |
+| `spans`, `span_events`, `metrics` | the explorer tables, derived from `records` (see [The explorer](#the-explorer)) |
+| `logs`, `sessions`, `targets` | explorer views over `records`, `session` and `spans` |
+
+Actor detection reads the environment only, never sets it: `CLAUDECODE=1` is
+an agent (`claude-code`), before `GITHUB_ACTIONS=true` (CI,
+`github-actions`, with `ci_run_url` from `GITHUB_SERVER_URL`,
+`GITHUB_REPOSITORY` and `GITHUB_RUN_ID`), before `CI` set to anything but
+empty, `0`, `false` or `no` (CI, `unknown`); anything else is `human`. None
+of the session row's fields reaches a hash, or a target's argv, env or files
+(I1).
+
+The six explorer names (`sessions`, `spans`, `span_events`, `metrics`,
+`logs`, `targets`) are the public contract (I9, below). The tables behind
+them (`session`, `records`, `status`, `notices`, `failure_logs`) are
+internal and may change within a format.
+
+### The explorer
+
+`spans`, `span_events` and `metrics` are OpenTelemetry-shaped rows derived
+from `records` as they arrive, by one deriver that serves the live recorder
+and a re-derivation from `records` alone, so the two write the same rows
+(I4). `session.derivation` names the version of the code that derived them.
+
+```
+heph.session                     root, span_id 1; trace id derived from the session id
+├─ heph.startup                   session start -> first ResultStart
+├─ heph.result  //p:t            ResultStart..ResultEnd; addr, driver, outcome
+│  └─ phase spans                 from ResultEnd.spans: heph.deps, heph.resolve, ...
+└─ heph.teardown                  last ResultEnd -> End
+```
+
+- **Spans stay flat.** Every `heph.result` is parented by the session span,
+  never by a dependent, so a memoized result reached from several dependents
+  is drawn once. `outcome` is `ran`, `hit`, `failed` or `cancelled` (a result
+  still open at the end has none); `status` is `ok`, `error` or `unset`.
+  Attributes: `heph.cache` (the cache outcome), `heph.upstream_of`,
+  `heph.timed_out`, `heph.resources.declared.<pool>` and
+  `heph.resources.reserved.<pool>` (from `ExecuteStart`, in the pool's unit;
+  only for a target that ran, and only from a host that reports them), and
+  `heph.admission.queued_ms`.
+- **Phase spans** are the children of a result, read from the optional
+  `ResultEnd.spans` list (`{name, start_unix_us, end_unix_us}`). They are
+  read tolerantly from the record's body: a result from a host that does not
+  send them simply has no children. `class` is assigned by name:
+  `heph.process` is `target`, `heph.driver.run` is `driver`;
+  `heph.resolve`, `heph.cache.read`, `heph.stage`, `heph.collect` and
+  `heph.cache.write` are `heph`; `heph.deps`, `heph.lock_wait`,
+  `heph.admission` and `heph.scratch` are `waiting`. A name this heph does
+  not know is recorded with no class.
+- **Span events**: `heph.cache.local_hit`, `heph.cache.local_miss`,
+  `heph.cache.remote_hit`, `heph.cache.remote_miss` and
+  `heph.cache.hit_rebuilt` (attribute `heph.cache.was`) on the result's span;
+  `heph.codegen.excluded` (`heph.codegen.path`, `.status`, `.reason`);
+  `heph.lock_holder` (`heph.lock.holder_pid`, `heph.lock.holder_session`),
+  `heph.approval.asked`, `heph.approval.answered` and `heph.truncated` on the
+  session span.
+- **Metrics** (see [Pools](#pools)): `heph.pool.capacity`, `heph.pool.held`,
+  `heph.pool.waiting` and, for the `sandbox` pool, `heph.pool.removals_pending`,
+  gauges from each `PoolUsage` event, attribute `heph.pool`; at the end, per
+  pool, `heph.session.pool.held.mean` (time-weighted),
+  `heph.session.pool.held.peak` and `heph.session.pool.waiting_us` (time with
+  at least one waiter), and `heph.session.results` per outcome (attribute
+  `heph.outcome`). A pool's unit comes from `RequestConfig.units`: a `cpu`
+  pool in CPUs (`{cpu}`, the engine's micro-CPUs over 10^6), a `bytes` pool in
+  `By`, anything else `1`.
+- **Views**: `logs` (`Log` and `Output` records: `session_id`, `seq`,
+  `time_us`, `severity`, `body`), `sessions` (the session row as resource
+  attributes, plus `schema_version`), and `targets` (`session_id`, `addr`,
+  `outcome`, `duration_us`: one row per `heph.result`, cache hits included).
+
+The trace id is the first 16 bytes of SHA-256 over `heph.trace.v1:`
+followed by the session id; a span id is written as its 8-byte big-endian
+value, never 0. Both are frozen, as are released span and metric names.
+Enumerations (`class`, `status`, `outcome`, `metrics.kind`) are open: a
+consumer handles a value it does not know.
+
+Two recipes:
+
+```sql
+-- Where did time go, by class and phase (busy time, not wall time)?
+SELECT class, name, count(*) AS n, sum(duration_us) / 1e6 AS busy_s
+FROM spans WHERE class IS NOT NULL
+GROUP BY class, name ORDER BY busy_s DESC;
+
+-- How did //p:t end, and who ran it?
+SELECT s.started_ms, s.user, s.actor_name, s.argv, r.outcome, r.duration_us / 1e3 AS ms
+FROM spans r JOIN sessions s USING (session_id)
+WHERE r.name = 'heph.result' AND r.addr = '//p:t';
+```
+
+There is no query command yet; `sqlite3` on a sealed recording (or a copy of
+a live one) answers them.
+
+### Pools
+
+`show` on an ended session prints one line per bounded pool that had rows,
+from the `heph.session.pool.*` metrics and the last `heph.pool.capacity`:
+
+```
+docker pool 4: held 3 mean (75%), 4 peak; requests waited 1s
+cpu pool 8: held 7.6 mean (95%), 8 peak; nothing waited for it
+```
+
+A live session has none yet (the rows come at its end), and neither does a
+build that admitted nothing (an all-hit build). These rows are read from
+events the engine already emits; nothing flows back into admission, a
+target, or a hash.
+
 ## Records
 
-One line of `events.ndjson` is
+One row of `records` has a `body` like
 
 ```json
 {"at_unix_ms": 1794666004822, "kind": {"type": "ExecuteStart", "addr": "//p:t", …}}
@@ -154,14 +293,15 @@ seq}` (every line the terminal shows, at the terminal's own filter, so
 `debug!` lines under `-v` too, and diagnostics with an empty `level`; lossy
 UTF-8, stored verbatim and escaped by the viewer on output; `seq` numbers the
 sink's lines from 1), `End {exit_code,
-panicked}`, `Truncated`, `InflightWritten`, and
-`Unknown` for anything newer. Both keys are optional; a line with neither is
-skipped.
+panicked}`, `Truncated`, `InflightWritten`, `LockHolder {pid, session}` (the
+run resolved a lock holder's pid to a session, or found none: see [The run's
+own lock-wait notice](#the-runs-own-lock-wait-notice)), and `Unknown` for
+anything newer. Both keys are optional; a body with neither is skipped.
 
 What the run's terminal showed besides events and log lines is recorded too,
 so `attach` draws it (see [Attach](#attach)):
 
-- `Label {label}`: the TUI's bottom label changed (`meta.json` holds the first).
+- `Label {label}`: the TUI's bottom label changed (the session row holds the first).
 - `Approval {prompt, standing}`: the approval banner changed; `prompt` is
   `{queue: [{seq, addr, queued_at_unix_ms, notices: [{name, sources: [{addr,
   origin}]}]}]}`, every pending request oldest first (the front one is what
@@ -175,7 +315,7 @@ so `attach` draws it (see [Attach](#attach)):
   viewer read it from the store by `sources`, through the same reader
   (`ApprovalPromptNotice::read` with the engine's `read_notice_from_store`:
   read-only, no build, no fetch, no write), rooted at the session's home and
-  at `meta.workspace_root`. A `cache = False` input, whose revision would
+  at the session row's `workspace_root`. A `cache = False` input, whose revision would
   otherwise live only in the run's memory, is spilled into the durable local
   cache before the gate asks, under its own `{hashin}_{nanos}` key, which no
   lookup hits. The reader stops at 4 MiB (`NOTICE_READ_CAP`); past it the
@@ -193,34 +333,42 @@ so `attach` draws it (see [Attach](#attach)):
   line when it was cut.
 
 `RunLog {addr, hashin, file}` says where a running target's live log is:
-`file` is relative to `meta.json`'s home (`runs/<id>/<n>.log`), written when
-the run's first byte creates it, and past the cap. A session with no
+`file` is relative to the session row's home (`runs/<id>/<n>.log`), written when
+the run's first byte creates it, and past the full cap. A session with no
 `RunLog` of an addr (a heph from before them, say) simply has no live log
 of it. A reader (`tui::session::find_run_log`) trusts it
-only for a session whose `meta.json` names its own home, while that
+only for a session whose session row names its own home, while that
 session's lock is held and no `ExecuteEnd` for the addr follows it; a file
 gone under such a record means the run ended. `file` must be
 `runs/<dir>/<name>`, reached through no symlink, or it reads as absent.
 
-All four were added without a format bump: a heph from before them decodes
-each as `Unknown` and skips it. A reader skips and counts a complete line that does not decode and
-never stops on one, and waits for a trailing partial line to complete. `Log`
-and `End` never become `BuildEventKind` variants: a plugin hook must not
-receive them.
+A heph that does not know a record kind decodes it as `Unknown` and skips
+it. A reader skips and counts a body that does not decode and never stops on
+one; `show` says how many it skipped, and `show --json` carries the count as
+`skipped`. `Log`, `End` and `LockHolder` never become `BuildEventKind`
+variants: a plugin hook must not receive them.
 
 ## Versioning
 
 Three things are versioned separately, and each is bumped only on an
 incompatible change:
 
-- **`meta.json` `format`** versions the directory contract: file names, the
-  lock, the id scheme, cleanup. `show`/`attach`/`inflight` refuse a newer
-  format naming both versions; `list` shows a placeholder row ("format N,
-  needs newer heph") and exits 0. `show` run by a heph older than
-  `meta.heph_version` warns that the session may be shown incomplete;
-  `list`, `attach` and `inflight` do not warn.
-- **`SessionSnapshot.version`** versions `status.json` on disk, and nothing
-  else: `show --json` leaves it out (its stability is the CLI's, below).
+- **The recording's format**, `PRAGMA user_version` in its header (the
+  session row repeats it; the header wins), versions the directory contract
+  and the recording: file names, the lock, the id scheme, cleanup, the
+  schema. A reader decides from the header alone: a file whose
+  `application_id` is not heph's is "not a heph session"; a newer format is
+  refused by name, by `show`/`attach`/`inflight` naming both versions,
+  while `list` shows a placeholder row ("format N, needs newer heph") and
+  exits 0; every older format is read, back to 1. Each released format has a
+  committed fixture that a test opens
+  (`crates/tui/src/tui/session/testdata/format-N/session.db`), and a format
+  bump adds one. `show` run by a heph older than the session row's
+  `heph_version` warns that the session may be shown incomplete; `list`,
+  `attach` and `inflight` do not warn.
+- **`SessionSnapshot.version`** versions the `status` row on disk, and
+  nothing else: `show --json` leaves it out (its stability is the CLI's,
+  below).
   It is still 1 with the list cap and `totals`, because no heph has shipped a
   snapshot yet: version 1 is what the first release carries, cap included.
   The cap is not an additive change, since it changes what the existing lists
@@ -228,14 +376,62 @@ incompatible change:
   `totals` would misread a cut list as whole. From the first release on, a
   change of meaning like that bumps the version; only new fields come without
   one.
-- **`events.ndjson`** only grows additively: new record kinds and fields,
+- **Record bodies** only grow additively: new record kinds and fields,
   never a changed meaning.
+- **The explorer contract** (I9) is `sessions.schema_version` (1). Within a
+  format the six names only gain tables, columns, names and enum values; a
+  derivation bump may add rows or attributes, and may correct a value that
+  was wrong.
 
 New fields are `#[serde(default)]` and unknown ones are ignored. Two things
 are frozen for **every** format: the `lock` file name and its `flock`
-meaning. That is what lets cleanup, which never parses `meta.json`, work on a
-session of a format it cannot read: a held lock with an unreadable `meta.json`
-is a live session of unknown format.
+meaning. That is what lets cleanup, which reads at most a recording's
+100-byte header, work on a session of a format it cannot read: a held lock
+over an unreadable recording is a live session of unknown format.
+
+There is no reader for the `meta.json` / `events.ndjson` / `status.json`
+directories an earlier heph wrote (spec D9): it has no `session.db`, so
+`list` skips it, `show` does not find it, and retention removes it by age.
+
+## Reading
+
+A viewer opens a local recording one of three ways, from the lock and the
+header (`store::open_local`):
+
+| Lock | Header | Opened as |
+| --- | --- | --- |
+| held | WAL | **live**: a read-only connection with a 1s `busy_timeout`. A follower re-reads `records WHERE seq > last` whenever `PRAGMA data_version` moves, and drops its connection as soon as a batch holds `End`, so the owner can seal. |
+| any | rollback | **sealed**: `immutable=1` (no `-shm`, no locks, works on a read-only copy). A held lock over a rollback-mode header is a cleanup that just sealed it: read as ended. `sealed=1` alone never chooses `immutable=1`. |
+| free | WAL | **copy**: a lost session, or a seal cut short. The viewer takes the session's `lock` **shared** while it copies `session.db` and its `-wal` into `<sessions root>/.tmp/`, releases it, and opens the copy (WAL recovery runs on the copy). The shared lock makes a cleanup's exclusive seal wait, while every other probe still reads the session as not live. The copy is removed when the viewer is done; an orphan is swept by cleanup after 10 minutes. |
+
+None of the three writes the original: a live WAL reader's only file write
+is SQLite's `-shm` index (I3). No reader opens with `SQLITE_OPEN_CREATE`, so
+none creates a recording.
+
+## Liveness and sealing
+
+A session is alive exactly while its `lock` is `flock`ed (I2). SQLite's own
+locks are `fcntl` locks, released when any fd on the file closes, so they
+never carry liveness.
+
+At exit the owner writes `End`, the final `status`, and the session row's
+`ended_ms`, `exit_code`, `panicked` and `sealed=1` in the last WAL
+transaction; then it **seals** the file: `wal_checkpoint(TRUNCATE)`,
+checking its busy column (a viewer mid-read makes it busy with rc OK), then
+`journal_mode=DELETE`, checking the mode it returns. It retries while a
+viewer is in the way, within the exit's 3s bound less a 250ms margin, then
+releases the lock. Nothing writes the file after the mode switch, so the
+rollback-mode header is the only seal test: `sealed=1` in a WAL-mode file
+means the seal was cut short, and readers take the copy path for it.
+
+A session killed before its seal (`SIGKILL`, a second Ctrl-C) leaves a
+WAL-mode recording with no `End` and a free lock: `lost`. The next cleanup
+past [`STARTING`](#retention) **seals** it under its lock taken exclusively:
+`ended_ms` is its last record's `at_ms`, `exit_code` stays NULL, the
+explorer rows are re-derived from `records` (so they hold the session-wide
+rows a crash never wrote), and the file is switched to rollback mode. It
+refuses beside a `-journal`, and it never seals a format it does not know.
+A seal cut short there leaves the file for the next cleanup.
 
 ### `--json`
 
@@ -250,7 +446,7 @@ absolute unix ms; `[]` when there is no session:
 
 - `progress` is PROGRESS as numbers, `{done, total, total_complete,
   running_ops, failed}`, `null` before the session wrote its first
-  `status.json`:
+  `status` row:
   - `total` is the matched targets: `null` before the matcher reported,
     provisional until `total_complete`.
   - `done` is `counts.matched_done` (matched targets that finished) once
@@ -266,9 +462,9 @@ absolute unix ms; `[]` when there is no session:
 - `panicked` is true when the session ended in a panic, whatever its
   `exit_code`.
 - `blocked_on` entries are `{kind: "lock", addr, holder_pid, holder_session}`
-  or `{kind: "admission", addr, pool}`. From `status.json`, so at most the
+  or `{kind: "admission", addr, pool}`. From the `status` row, so at most the
   first 100 of each kind.
-- `format` appears only on the row of a session in a newer directory format,
+- `format` appears only on the row of a session in a newer recording format,
   which this heph reads no further: that row has `owner_pid: null`, empty
   `argv`, `null` progress and `state: "unknown"`. `owner_pid` is never `null`
   otherwise.
@@ -278,13 +474,20 @@ absolute unix ms; `[]` when there is no session:
 (`approval_standing`, present only while a standing approval decision acts on
 the build, `first_event_unix_ms`, `last_event_unix_ms`, `counts`, `running`,
 `waiting`, `failed`, `lock_waits`, `admission_waits`, `totals`, `truncated`,
-`end`). The snapshot's own `version` is not printed: it versions `status.json`
-on disk, not this output. The snapshot is folded from the event log, every
-list in full, unless the log reached its 64 MiB cap: then it is `status.json`,
-each list capped at 100 entries, and `totals` says which were cut.
-`blocked_on` has `list --json`'s shape, but from that same snapshot, so it is
-in full where `list`'s, which comes from `status.json`, has at most 100
-entries of each kind. `chain_root` is the id of the session at the root of
+`end`), then `skipped` and `pools`. The snapshot's own `version` is not
+printed: it versions the `status` row on disk, not this output. The snapshot
+is folded from `records`, every list in full, unless the recording reached
+its 256 MiB full cap: then it is the `status` row, each list capped at 100
+entries, and `totals` says which were cut. `blocked_on` has `list --json`'s
+shape, but from that same snapshot, so it is in full where `list`'s, which
+comes from the `status` row, has at most 100 entries of each kind. `skipped`
+is the number of records that did not decode and were skipped (0 normally).
+`pools` is `[{pool, unit, capacity, held_mean, held_peak, waiting_us}]`, one
+per bounded pool with rows (see [Pools](#pools)): empty while the session is
+live, and for a build that admitted nothing. `capacity` is `null` when no
+row gave one. The comparison with machine samples (`declared_above_use_us`
+and the rest) comes later, as added fields. `chain_root` is the id of the
+session at the root of
 the first lock chain, `null` when no chain leads to a session. `next` is
 `{kind, command, argv, cwd, reason}`; `kind` is one of `attach`, `show_holder`, `inflight`,
 `inspect_failure`, `rerun`, `list`, `none` and may gain values.
@@ -317,19 +520,20 @@ stable signal for "has it gone silent".
 | # | Rule |
 | --- | --- |
 | I1 | Watching never changes the build. The recorder reaches no hash and no target's argv, env or files; a recording failure never fails, blocks or slows a build task. The session id and directory are **never exported to the environment**: a session runner or `pass_env = ["*"]` would carry them into targets. |
-| I2 | A session is alive exactly while its lock is held. The fd is `O_CLOEXEC`, so a child outliving heph cannot keep it alive. |
-| I3 | Only the owning process writes a session directory, and only it cleans. A viewer's **only** write is `inflight.request`. |
-| I4 | `events.ndjson` is append-only, one complete record per line; a reader ignores a trailing partial line until it is complete. |
-| I5 | A record's `kind` is a `BuildEvent` exactly as on the plugin wire; `meta.json` carries its format, and a viewer refuses a newer one by name. |
+| I2 | A session is alive exactly while its lock is held. The fd is `O_CLOEXEC`, so a child outliving heph cannot keep it alive. The `lock` name and meaning are frozen for every format; SQLite's locks never carry liveness. |
+| I3 | While the lock is held only the owner writes `session.db`. After that, only a cleanup holding the lock exclusively writes it, to seal it or remove it. A viewer writes no row; its file writes are `inflight.request` and, for a live WAL reader, SQLite's `-shm` index. |
+| I4 | `records` is the one source of truth. `status` and the explorer tables are derived from `records` plus the session row, and a re-derivation from `records` alone writes exactly what the recorder wrote live, a capped recording included. |
+| I5 | A record's `kind` is a `BuildEvent` exactly as on the plugin wire. The recording names its format in its header; a reader refuses a newer one by name and reads every older one, and each released format has a committed fixture a test opens. |
 | I6 | A session holds nothing the terminal would not have shown (argv, log lines, failing log tails), user-only. |
-| I7 | A viewer **never signals** a process. `inflight` drops `inflight.request`; the owner's diag sweeper (one `stat` per 200ms tick) writes `inflight.txt`, removes the request and records `InflightWritten`, which the viewer waits for. `meta.json`'s `capabilities` must list `inflight`. |
+| I7 | A viewer **never signals** a process. `inflight` drops `inflight.request`; the owner's diag sweeper (one `stat` per 200ms tick) writes `inflight.txt`, removes the request and records `InflightWritten`, which the viewer waits for. The session row's `capabilities` must list `inflight`. |
+| I9 | The six explorer names (`sessions`, `spans`, `span_events`, `metrics`, `logs`, `targets`) are the public contract. Within a format they only gain tables, columns, names and enum values; released span and metric names, the trace-id rule and the span-id encoding never change. |
 
 ### Recording
 
 The process's session is a `SessionSlot` that `main` owns: there is no
 process-wide instance. `main` configures it and hands it to whatever records
 into it — every command, as its own argument beside the sink;
-`bootstrap::new_engine` (the workspace for `meta.json`); the `LogSink`, which
+`bootstrap::new_engine` (the workspace for the session row); the `LogSink`, which
 keeps a reference only to tee its lines into the open session; the diag
 sweeper; and the error renderer. `tui::run_app` takes the session as an
 explicit argument (a debug build asserts it is the sink's slot) and opens it
@@ -340,44 +544,59 @@ backends consume a tapped receiver that moves each event to the recorder right
 after the view folds it, so what is recorded is what was shown, paused TUI
 included. The recorder is its own OS thread behind an unbounded channel:
 
-- It writes `End`, flushes, writes `status.json`, **then** releases the lock,
-  so "lock free and no `End`" means exactly "crashed". A panic unwinding
-  through `run_app` writes `End {panicked: true}`. The join at exit is bounded
-  (3s).
-- On a write failure it latches "stopped" before its one `warn!` (which the
-  log tap would otherwise feed back to it) and drops its receiver; it stops the
-  same way past 500k pending events. A stopped recorder keeps its lock until
-  the process exits, so the session reads as live while it is.
-- `events.ndjson` stops at **64 MiB** with a `Truncated` record; `status.json`
-  keeps updating. Past it, only what a viewer needs at the end is appended:
-  `End`, `InflightWritten`, `Finished`, the failure report (`Output`), a
-  `Label` change, and every `Approval` (a few short records per gated target,
-  carrying the notices' sources and the standing decision). An `Output`
-  record keeps at most the first 1 MiB of its text, then a line saying how
-  many bytes were left out, so the report a process prints (at most twice)
-  overshoots the cap by a bounded amount. `Log` records outlive the cap too,
-  up to **256 MiB** of them past it; the first one over that ceiling ends
-  them, and no later line is written even if it would fit.
+- Records go into one transaction per flush tick, committed 250ms after the
+  first uncommitted record and at exit, with the explorer rows they complete
+  (`journal_mode=WAL`, `synchronous=OFF`: a process crash loses nothing
+  committed). The `status` row is upserted in the same transaction, at most
+  once a second and only when something changed.
+- At exit it writes `End`, the final `status` and the session row's end, and
+  seals the file (see [Liveness and sealing](#liveness-and-sealing)),
+  **then** releases the lock, so "lock free and no `End`" means exactly
+  "crashed". A panic unwinding through `run_app` writes `End {panicked:
+  true}`. The join at exit is bounded (3s). A seal cut short is only a
+  `debug!`: `End` is committed, and the next cleanup seals the file.
+- On a write failure it rolls back the open transaction and latches
+  "stopped" before its one `warn!` (which the log tap would otherwise feed
+  back to it) and drops its receiver; it stops the same way past 500k pending
+  events, and when the filesystem refuses WAL mode. A stopped recorder keeps
+  its lock until the process exits, so the session reads as live while it is.
+- **Caps.** The first **256 MiB** of record bodies is a full recording. Past
+  it, a `Truncated` record marks the point and only the critical kinds are
+  kept: every kind an explorer row is derived from (`RequestConfig`,
+  `ResultStart`, `ResultEnd`, `ExecuteStart`, the cache-tier, cache-outcome,
+  lock-wait, admission-wait and scratch events, `PoolUsage`,
+  `CodegenExcluded`, `LockHolder`) and what a viewer needs at the end
+  (`End`, `InflightWritten`, `Finished`, a `Label` change, every `Approval`,
+  `RunLog`). `Log`, `Output` and progress-only kinds (`Matched`,
+  `ExecuteEnd`, cache-write and remote read/write progress, …) are dropped.
+  At the
+  **1 GiB** ceiling (record bodies plus explorer rows) a second `Truncated`
+  record stops the recording; derivation stops at that same record, and
+  `truncated=1` and `truncated_seq` are set in the session row, so a
+  re-derivation from `records` is exact (I4). Only `End` follows, and the
+  `status` row keeps updating. `show` then says the recording is
+  incomplete. An `Output` record keeps at most the first 1 MiB of its text,
+  then a line saying how many bytes were left out.
 - The `LogSink` numbers every line it takes, a log line at the terminal's
   filter or a diagnostic, and records it as `Log {seq}`. Numbering, sending
   the record and handing the line to the printer are one critical section of
-  the sink's lock, so the printer and `events.ndjson` see the same numbers in
+  the sink's lock, so the printer and `records` see the same numbers in
   the same order, none reused or skipped.
 - `SessionTap::flush` waits (bounded) until every record sent before it is on
   disk, and fails at once on a stopped or finished recorder rather than
   waiting for it.
 - While a full screen is up the printer keeps only line numbers. Closing it
   replays from disk (`LogSink::replay`): take the latest number, flush through
-  it, then read `Log` records from the offset noted when the screen opened
+  it, then read `Log` records after the `seq` noted when the screen opened
   and print exactly those numbered after the last line printed and up to that
-  latest, once each. Lines missing from disk (past the ceiling, dropped by a
+  latest, once each. Lines missing from disk (past the full cap, dropped by a
   stopped recorder) are counted, and one `WARN` says how many were skipped.
   This holds under `HEPH_NO_SESSION=1`, whose private session is what the
   replay reads.
 
 What a run loses: a process wedged before its first flush loses at most 250ms
 of events; a second Ctrl-C, `SIGTERM`/`SIGHUP` or `SIGKILL` loses what came
-after the last flush and writes no `End` (`lost`).
+after the last commit and writes no `End` (`lost`, sealed later by cleanup).
 
 ### The run's own lock-wait notice
 
@@ -386,7 +605,7 @@ backends: `held by session <id> (pid N)` (the TUI row says `locked by …`) when
 live session other than its own is recorded for the pid, and `held by pid N`
 otherwise. The events carry only the pid, so the engine stays unaware of
 sessions: the pid is resolved with the same rule as `list`/`show` (a live
-session, not this one, whose `meta.json` names the pid). The backend's event
+session, not this one, whose session row names the pid). The backend's event
 receiver does it, once per distinct pid, on a detached thread, before it folds
 the event that first carries the pid; that event waits for the scan, later
 events queue behind it, and the build itself never waits. The wait is at most
@@ -394,12 +613,18 @@ events queue behind it, and the build itself never waits. The wait is at most
 pid is not scanned again, and an answer that comes later still names it from
 then on. The thread is detached rather than on the blocking pool because a
 runtime's shutdown waits for its blocking tasks: a hung scan never holds up the
-exit. The scan reads each
-session's `meta.json` and probes the matching one's lock, never `status.json`.
-The view only reads the cached answer, so neither the fold nor a render does
-IO. The directory comes from `HOME` alone, so a run
+exit. The scan probes each
+session's lock first and opens only the live ones' recordings, reading
+their session row, never `records` or `status`; so it never copies an ended
+recording. The view only reads the cached answer, so neither the fold nor a
+render does IO. The directory comes from `HOME` alone, so a run
 with `HEPH_NO_SESSION` still names other sessions; with no `HOME`, or any read
 error, the notice is the pid.
+
+The run records each answer once per pid as a `LockHolder {pid, session}`
+record (`session` absent when no live session holds it, or when the scan did
+not answer within the 200ms; a later answer is not recorded again), so a
+viewer names holders from the recording instead of scanning (spec D6).
 
 ## Attach
 
@@ -414,7 +639,7 @@ the only things that differ between the two:
 | Approval banner | shared `approval_banner`, with the keys and the `enter view` preview | the same banner from the recorded `Approval`, with no keys and no preview |
 | `q` while running | nothing (Ctrl-C cancels the run) | detaches (Ctrl-C detaches too) |
 | Help row | the keys | the keys, then ` · session <id> · q detach` |
-| Bottom label | the header model's | the latest recorded `Label`, else `meta.json`'s |
+| Bottom label | the header model's | the latest recorded `Label`, else the session row's |
 | Summary clock (`set_finished`) | the run's teardown | the recorded `Finished`, else `End` |
 
 Anything else that differs is a bug: `session/view_tests.rs` records a run's
@@ -445,38 +670,73 @@ SGR on output) for `attach`'s replayed `Log` and `Output` text only; `list`,
 `show` and `inflight` still drop SGR (`escape_replayed` vs `escape_text` in
 `src/commands/session/mod.rs`).
 
-Lock holders are named as the run named them (above): the viewer scans the
-same sessions directory (`SessionSource::holder_names`), excluding the
-attached session itself. The residual: the viewer resolves a pid when it
-folds that wait, possibly long after the run did, so a holder that has
-exited by then is shown as `pid N` where the run showed its session.
+Lock holders are named exactly as the run named them: `SessionFeed` fills
+its holder names from the recorded `LockHolder` records as it routes them,
+and no viewer scans for pids. A holder that has exited since is still shown
+by the session the run saw.
+
+`attach` follows the recording with a `RecordCursor`, in batches of up to
+256 records, and drops its connection as soon as a batch holds `End`,
+before it hands the batch on, so a slow terminal never holds up the owner's
+seal.
 
 On a terminal, `attach` always draws the TUI, even for a session the run
-recorded with the line backend (`meta.json` `interactive: false`): the viewer's
+recorded with the line backend (session row `interactive: false`): the viewer's
 terminal decides, not the run's. Without a terminal it follows in line form,
 which for a line-backend session is its recorded log lines alone.
 
 ## Retention
 
 Cleanup runs only at session start, on the new session's recorder thread;
-`list` and every other viewer stay read-only. It decides on lock state and
-modification times only, **never** on `meta.json`. An ended session (lock
-free) is kept while it was last written under **10 minutes** ago and is among
-the **20** most recent ended sessions; then the oldest ended ones go until
-the ended sessions total at most **256 MiB**. A live session is never removed
-or counted. A directory with no `lock` yet, younger than 10 minutes, is a
-session being created and is left alone. Removal takes the session's lock
-exclusively, so two cleanups racing never both remove one session: the
-second finds the lock taken and moves on. A removal renames the directory to
-a tomb (`.removing-<id>-<pid>`) and then deletes it; a tomb older than 10
-minutes, left by a removal that failed or died, is deleted outright with no
-lock. Two cleanups can race on that one, both deleting the same tomb, which is
-harmless: one finishes, the other sees it gone.
+`list` and every other viewer stay read-only. It decides on lock state,
+modification times and a recording's 100-byte header, **never** on its
+contents.
 
-Every start also cleans `~/.heph/private-sessions/` with nothing kept: an
-ended private session (lock free, so a killed run's) goes whatever its age,
-a live one is never touched, and one still being created is left alone as
-above.
+| What | Kept | Then |
+| --- | --- | --- |
+| An ended recording (lock free) | while last written under **7 days** ago, and among the newest that total at most **2 GiB** | the session directory is removed |
+| A live session (lock held) | always | never counted, never touched |
+| A session still starting: a free `lock` younger than **60s** (`STARTING`), or no `lock` and written under 60s ago | always | neither counted, sealed nor removed |
+| A tomb (`.removing-*`) or a reader copy in `.tmp/` | **10 minutes** (`SCRATCH_GRACE`) | deleted with no lock |
+
+- There is no count cap. The byte budget counts only sealed recordings in a
+  format this heph knows, measured after any seal: the oldest go until the
+  rest fit.
+- A **lost** recording (lock free, WAL mode, a known format) that age keeps
+  is sealed first (see [Liveness and sealing](#liveness-and-sealing)), then
+  counted. One that age removes is removed without the seal work.
+- A recording heph cannot seal (an unknown format, not a heph recording,
+  zero bytes or no schema, a seal that failed or was cut short, or a lock a
+  viewer holds) is never written: it is removed by age only, and left out of
+  the byte budget.
+- Sealing and removal take the session's lock exclusively, so two cleanups
+  racing never both seal or remove one session: the second finds the lock
+  taken and moves on, and a session cannot start in a directory being
+  removed (ids are never reused). A removal renames the directory to a tomb
+  (`.removing-<id>-<pid>`) and then deletes it. Two cleanups can race on a
+  stale tomb or reader copy, both deleting it, which is harmless.
+
+Both windows are set in `.hephconfig`:
+
+```yaml
+session:
+  keep: 7d          # how long an ended recording is kept; a bare number is seconds
+  keepBytes: 2G     # the most bytes of ended recordings kept, newest first
+```
+
+`keep` takes a duration (`7d`, `36h`, `90m`), `keepBytes` a size (`2G`,
+`500MiB`, `1048576`). `0` keeps no ended recording. A value that does not
+parse (`-1`, `5x`, a number past 2^64) is a warning naming its key, and that
+field keeps its default: retention is never a reason to fail a build.
+`keep` above 90 days is clamped to 90 days, with one warning naming
+`session.keep`. The keys are camelCase, like every other `.hephconfig` key;
+`keep_bytes` is refused as unknown.
+Profiles override each field separately.
+
+Every start also cleans `~/.heph/private-sessions/` with nothing kept
+(`Retention::PRIVATE`): an ended private session (lock free, so a killed
+run's) goes whatever its age and is never sealed, a live one is never
+touched, and one still starting is left alone as above.
 
 ## Run logs
 
@@ -513,10 +773,11 @@ not the commands, the snapshot format or the viewer. Under it one process has
 many sessions (a session is a request, and a pid can no longer name it), lock
 waits become joined memoized work, and the CLI talks to the daemon over a
 socket — while each CLI client still receives its event stream and keeps
-writing these files. That is why the id is opaque and carries no pid, why
+writing its recording. That is why the id is opaque and carries no pid, why
 the commands read through a `SessionSource` trait (`list`, `snapshot`,
-`subscribe`, `inflight`; the files are its first implementation), why one
-versioned `SessionSnapshot` serves `status.json`, `--json` and later the
+`subscribe`, `inflight`, `pools`; the recordings are its first
+implementation), why one versioned `SessionSnapshot` serves the `status`
+row, `--json` and later the
 daemon's reply, and why `inflight` is defined per session rather than as a
 signal to a pid. Nothing here assumes one session per process beyond the
 file source itself.
