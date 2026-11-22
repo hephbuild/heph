@@ -2885,6 +2885,7 @@ impl CIAppView for CiProgressView {
                 timed_out,
                 cancelled: false,
                 left_behind,
+                spans: _,
             } if !self.failures_printed.contains(addr) => {
                 self.failures_printed.insert(addr.clone());
                 let block = with_left_behind(
@@ -3165,6 +3166,7 @@ mod tests {
     }
     fn result_end(addr: &str, error: Option<String>) -> BuildEventKind {
         BuildEventKind::ResultEnd {
+            spans: Vec::new(),
             left_behind: None,
             cancelled: false,
             addr: addr.into(),
@@ -4455,6 +4457,7 @@ mod tests {
         tail: Option<&str>,
     ) -> BuildEventKind {
         BuildEventKind::ResultEnd {
+            spans: Vec::new(),
             left_behind: None,
             addr: addr.into(),
             error: Some(format!("{addr}: exit status: 1")),
@@ -4508,6 +4511,7 @@ mod tests {
     #[test]
     fn ci_view_live_block_carries_the_box_rows() {
         let end = BuildEventKind::ResultEnd {
+            spans: Vec::new(),
             addr: "//a:b".into(),
             error: Some("//a:b: exit status: 1".into()),
             upstream_of: None,
@@ -4571,6 +4575,7 @@ mod tests {
     #[test]
     fn ci_view_live_block_words_and_sanitizing() {
         let timed_out = BuildEventKind::ResultEnd {
+            spans: Vec::new(),
             left_behind: None,
             addr: "//e2e:it".into(),
             error: Some("timed out".into()),
@@ -4603,6 +4608,7 @@ mod tests {
         );
 
         let no_status = BuildEventKind::ResultEnd {
+            spans: Vec::new(),
             left_behind: None,
             addr: "//a:\x1b[2Jb".into(),
             error: Some("staging\x1b[2J failed".into()),
@@ -5959,6 +5965,7 @@ mod tests {
                 });
             }
             ev(BuildEventKind::ResultEnd {
+                spans: Vec::new(),
                 left_behind: None,
                 cancelled: false,
                 addr: a,

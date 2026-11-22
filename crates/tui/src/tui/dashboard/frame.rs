@@ -93,6 +93,7 @@ mod tests {
             ev(BuildEventKind::ResultStart { addr: a.into() });
         }
         ev(BuildEventKind::ResultEnd {
+            spans: Vec::new(),
             left_behind: None,
             cancelled: false,
             addr: "//a:one".into(),

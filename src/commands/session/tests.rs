@@ -526,6 +526,7 @@ async fn commands_run_against_any_source() {
                             T0 + 5_500,
                             BuildEventKind::ResultEnd {
                                 left_behind: None,
+                                spans: Vec::new(),
                                 cancelled: false,
                                 addr: "//x:y".into(),
                                 error: None,
@@ -763,6 +764,7 @@ async fn next_is_structured_for_every_state() {
                 T0 + 2,
                 BuildEventKind::ResultEnd {
                     left_behind: None,
+                    spans: Vec::new(),
                     cancelled: false,
                     addr: addr.into(),
                     error: Some("boom".to_owned()),
@@ -1248,6 +1250,7 @@ async fn status_lists_are_capped_and_show_has_them_all() {
             T0 + 2,
             BuildEventKind::ResultEnd {
                 left_behind: None,
+                spans: Vec::new(),
                 cancelled: false,
                 addr,
                 error: Some("boom".to_owned()),

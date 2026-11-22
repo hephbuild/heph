@@ -650,6 +650,7 @@ mod tests {
         SessionRecord {
             at_unix_ms: at,
             kind: Some(BuildEventKind::ResultEnd {
+                spans: Vec::new(),
                 addr: addr.into(),
                 error: None,
                 upstream_of: None,

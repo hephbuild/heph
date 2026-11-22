@@ -1229,6 +1229,7 @@ mod tests {
                     _ => (Some("boom".to_owned()), Some(addr(rng)), false),
                 };
                 BuildEventKind::ResultEnd {
+                    spans: Vec::new(),
                     left_behind: None,
                     cancelled,
                     addr: addr(rng),
