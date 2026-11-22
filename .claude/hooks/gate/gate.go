@@ -171,6 +171,25 @@ func pushes(args []string) bool {
 	return false
 }
 
+// gitSubcommand is the index of a git command line's subcommand, past git's
+// global options (-C and -c take a value), or -1 when args is not one.
+func gitSubcommand(args []string) int {
+	if len(args) == 0 || args[0] != "git" {
+		return -1
+	}
+	i := 1
+	for i < len(args) && strings.HasPrefix(args[i], "-") {
+		if args[i] == "-C" || args[i] == "-c" {
+			i++
+		}
+		i++
+	}
+	if i >= len(args) {
+		return -1
+	}
+	return i
+}
+
 // cargoValueFlags are cargo's global options whose value is the next argument.
 var cargoValueFlags = map[string]bool{"--color": true, "--config": true, "-C": true, "-Z": true}
 
