@@ -50,6 +50,11 @@ uuid = { version = "1.29.3", features = ["v4"] }
 rusqlite = { version = "0.42", features = ["bundled", "blob"] }
 sha2 = "0.11"
 hex = "0.4"
+# Opening a `.hephsession` (`session::hephsession`): a zstd frame of a sealed
+# `session.db`, or a zip (a browser download of a CI artifact) holding one.
+# Deflate only, through the flate2 already in the tree.
+zstd = "0.14"
+zip = { version = "9.8", default-features = false, features = ["deflate-flate2"] }
 
 # With stdin not a terminal, crossterm reads /dev/tty, and macOS kqueue refuses
 # that with EINVAL (measured), so `heph … < file` and `… | heph` timed out on the

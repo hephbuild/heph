@@ -7903,6 +7903,8 @@ dependencies = [
  "tracing-subscriber",
  "unicode-width 0.2.3",
  "uuid",
+ "zip",
+ "zstd",
 ]
 
 [[package]]

@@ -35,6 +35,7 @@ pub mod cleanup;
 pub mod derive;
 pub mod feed;
 pub mod format;
+pub mod hephsession;
 pub mod holder;
 pub mod id;
 pub mod lockfile;
