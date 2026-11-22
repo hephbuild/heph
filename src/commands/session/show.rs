@@ -1,11 +1,13 @@
 //! `heph session show`: one frame of a session, printed once, plus what it is
 //! stuck on and what to do next (A16).
 //!
-//! The body comes from folding `events.ndjson` into the same view the TUI
-//! draws, up to what was recorded when the command ran (A18); an ended session
-//! is drawn at the time of its `End`, so its elapsed times stay what they were.
-//! It is the line, then the dashboard's All list capped at 15 rows, then what
-//! the run is stuck on and what to do next.
+//! The body comes from folding the recording's `records` into the same view
+//! the TUI draws, up to what was recorded when the command ran (A18); an ended
+//! session is drawn at the time of its `End`, so its elapsed times stay what
+//! they were. It is the line, then the dashboard's All list capped at 15 rows,
+//! then one line per bounded pool (D30, from the session-wide
+//! `heph.session.pool.*` rows of an ended session), then what the run is stuck
+//! on and what to do next.
 
 use std::collections::HashSet;
 
@@ -24,6 +26,7 @@ use crate::tui::session::{
         AdmissionWaitEntry, ListTotals, LockWaitEntry, RunningTarget, SessionEnd, SnapshotCounts,
     },
     holder_session,
+    store::PoolSummary,
 };
 use crate::tui::{self, TUIAppView as _};
 
@@ -172,10 +175,20 @@ pub struct ShowView<'a> {
     truncated: bool,
     /// How the session ended; `null` while it runs.
     end: Option<&'a SessionEnd>,
+    /// Records that could not be decoded and were skipped by the fold.
+    skipped: u64,
+    /// One entry per bounded pool the session admitted from, by name; empty
+    /// while it runs (the summaries are written at its end). PR 5 adds the
+    /// `resources_vs_machine` totals to each entry.
+    pools: &'a [PoolSummary],
 }
 
 impl<'a> ShowView<'a> {
     /// Every field of `snapshot` but its `version`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one argument per field of the output that is not the snapshot's"
+    )]
     fn new(
         id: String,
         state: SessionState,
@@ -183,6 +196,8 @@ impl<'a> ShowView<'a> {
         chain_root: Option<String>,
         next: Next,
         approval_standing: Option<ApprovalStanding>,
+        skipped: u64,
+        pools: &'a [PoolSummary],
         snapshot: &'a SessionSnapshot,
     ) -> Self {
         // Destructured, so a field added to the snapshot is a compile error
@@ -219,6 +234,8 @@ impl<'a> ShowView<'a> {
             totals,
             truncated: *truncated,
             end: end.as_ref(),
+            skipped,
+            pools,
         }
     }
 }
@@ -286,6 +303,7 @@ pub(crate) async fn show(
         folded.view.set_finished(end.at_unix_ms);
     }
     let snapshot = current_snapshot(&folded, entry.status.as_ref());
+    let pools = source.pools(entry.id).await?;
     let every = list_all(sources).await?;
     let every: Vec<&SessionEntry> = every.iter().map(|(_, e)| e).collect();
     // The stuck-on block is drawn whatever the output, for the chain root.
@@ -316,6 +334,8 @@ pub(crate) async fn show(
             chain_root.map(|r| r.id.encode()),
             next,
             standing,
+            folded.skipped,
+            &pools,
             &snapshot,
         );
         return json
@@ -356,12 +376,16 @@ pub(crate) async fn show(
         );
     }
     if folded.truncated || entry.status.as_ref().is_some_and(|s| s.truncated) {
-        text.push_str("the event log reached its size cap: the progress below stops there\n");
+        text.push_str(
+            "incomplete: the recording reached its size cap, so the progress below stops there\n",
+        );
     }
     if folded.skipped > 0 {
         text.push_str(&format!(
-            "{} recorded line(s) could not be read and were skipped\n",
-            folded.skipped
+            "{} recorded record{} could not be read and {} skipped\n",
+            folded.skipped,
+            if folded.skipped == 1 { "" } else { "s" },
+            if folded.skipped == 1 { "was" } else { "were" },
         ));
     }
     // Drawn at the time of the `End` for an ended session, of the last record
@@ -380,6 +404,9 @@ pub(crate) async fn show(
         }
     }
 
+    for pool in &pools {
+        text.push_str(&pool_line(pool));
+    }
     if let Some(standing) = standing {
         text.push_str(&standing_line(standing));
     }
@@ -393,6 +420,45 @@ pub(crate) async fn show(
     out.write_all(text.as_bytes())
         .context("writing the session")?;
     Ok(())
+}
+
+/// One bounded pool's line, e.g.
+/// `cpu pool 8: held 7.6 mean (95%), 8 peak; requests waited 1m2s`.
+/// PR 5 adds the machine comparison after the peak.
+fn pool_line(p: &PoolSummary) -> String {
+    let amount = |v: f64| {
+        if p.unit == "By" {
+            hcore::units::human_bytes(u64::try_from(v as i64).unwrap_or(0))
+        } else if (v - v.round()).abs() < 0.05 {
+            format!("{v:.0}")
+        } else {
+            format!("{v:.1}")
+        }
+    };
+    let mut line = format!("{} pool", escape(&p.pool));
+    let share = match p.capacity {
+        Some(cap) => {
+            line.push(' ');
+            line.push_str(&amount(cap));
+            (cap > 0.0).then(|| format!(" ({:.0}%)", p.held_mean / cap * 100.0))
+        }
+        None => None,
+    };
+    line.push_str(&format!(
+        ": held {} mean{}, {} peak; ",
+        amount(p.held_mean),
+        share.unwrap_or_default(),
+        amount(p.held_peak),
+    ));
+    if p.waiting_us == 0 {
+        line.push_str("nothing waited for it\n");
+    } else {
+        line.push_str(&format!(
+            "requests waited {}\n",
+            hcore::units::human_duration(std::time::Duration::from_micros(p.waiting_us))
+        ));
+    }
+    line
 }
 
 /// The snapshot `show` reasons from and `show --json` prints: the fold of the
