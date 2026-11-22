@@ -40,6 +40,7 @@ pub mod holder;
 pub mod id;
 pub mod lockfile;
 pub mod recorder;
+pub mod recording;
 pub mod run_logs;
 pub mod source;
 pub mod store;
