@@ -119,6 +119,8 @@ struct Shared {
     stopped: AtomicBool,
     /// Messages sent and not yet received.
     pending: AtomicUsize,
+    /// [`MAX_PENDING`], or a test's smaller cap.
+    max_pending: usize,
     /// The owner finished the session: every later send is dropped, silently.
     finished: AtomicBool,
     /// The owner's `flock`, held until `End` is on disk. Here rather than on the
@@ -206,7 +208,7 @@ impl SessionTap {
         if self.shared.is_stopped() || self.shared.finished.load(Ordering::Acquire) {
             return (false, None);
         }
-        if self.shared.pending.fetch_add(1, Ordering::Relaxed) >= MAX_PENDING {
+        if self.shared.pending.fetch_add(1, Ordering::Relaxed) >= self.shared.max_pending {
             self.shared.pending.fetch_sub(1, Ordering::Relaxed);
             let notice = self.shared.latch().then_some(StopNotice(FELL_BEHIND));
             return (false, notice);
@@ -645,6 +647,8 @@ pub(crate) struct Faults {
     pub(crate) full_cap: Option<u64>,
     /// [`CEILING`] in its place.
     pub(crate) ceiling: Option<u64>,
+    /// [`MAX_PENDING`] in its place, so a test falls behind with a few sends.
+    pub(crate) max_pending: Option<usize>,
     /// Refuse WAL mode when creating the recording, as some filesystems do.
     pub(crate) refuse_wal: bool,
 }
@@ -706,6 +710,7 @@ impl Recorder {
         let shared = Arc::new(Shared {
             stopped: AtomicBool::new(false),
             pending: AtomicUsize::new(0),
+            max_pending: start.faults.max_pending.unwrap_or(MAX_PENDING),
             finished: AtomicBool::new(false),
             lock: Mutex::new(Some(start.lock)),
         });

@@ -481,6 +481,135 @@ fn enospc_warns_once() {
     assert!(!lockfile::is_held(&lock).expect("probe"));
 }
 
+/// I1: a write that fails half way through a batch (the record went in, the
+/// explorer row it completes did not) lands none of that batch. A trigger
+/// refuses the `spans` row of `//boom`'s `ResultEnd`, after its record was
+/// inserted in the same transaction. What is on disk afterwards is whole
+/// batches: `//boom`'s `ResultEnd` record is not there, and every
+/// `ResultEnd` record that is has its `heph.result` span. A fail path that
+/// committed what it had (or a writer in autocommit) leaves the record
+/// without its span and fails here.
+#[test]
+fn failed_derived_insert_rolls_back_the_batch() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let captured = Captured::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(captured.clone())
+        .with_ansi(false)
+        .finish();
+    let session_dir = tracing::subscriber::with_default(subscriber, || {
+        let rec = recorder_with(dir.path(), Faults::default());
+        let tap = rec.tap();
+        let result = |addr: &str| {
+            tap.event(BuildEvent {
+                at_unix_ms: hcore::events::now_unix_ms(),
+                kind: BuildEventKind::ResultStart { addr: addr.into() },
+            });
+            tap.event(BuildEvent {
+                at_unix_ms: hcore::events::now_unix_ms(),
+                kind: BuildEventKind::ResultEnd {
+                    addr: addr.into(),
+                    error: None,
+                    upstream_of: None,
+                    exit_status: None,
+                    log_tail: None,
+                    timed_out: None,
+                    cancelled: false,
+                    left_behind: None,
+                },
+            });
+        };
+        result("//p:before");
+        tap.flush(Duration::from_secs(10)).expect("flush");
+        alter(rec.dir())
+            .execute_batch(
+                "CREATE TRIGGER boom BEFORE INSERT ON spans WHEN NEW.addr = '//boom'
+                 BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+            )
+            .expect("the trigger");
+        result("//p:same_batch");
+        result("//boom");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !tap.is_stopped() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(tap.is_stopped(), "the failure latched");
+        rec.recorder.finish(Some(0), false, Duration::from_secs(1));
+        rec.dir().to_path_buf()
+    });
+    let log = captured.settled_log();
+    assert_eq!(log.matches("WARN").count(), 1, "{log}");
+    assert!(log.contains("injected"), "{log}");
+
+    let opened = open(&session_dir);
+    let ends: Vec<String> = opened
+        .conn
+        .prepare("SELECT addr FROM records WHERE kind = 'ResultEnd' ORDER BY seq")
+        .expect("prepare")
+        .query_map([], |r| r.get(0))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("rows");
+    let spans: Vec<String> = opened
+        .conn
+        .prepare("SELECT addr FROM spans WHERE name = 'heph.result' ORDER BY span_id")
+        .expect("prepare")
+        .query_map([], |r| r.get(0))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("rows");
+    assert!(ends.iter().any(|a| a == "//p:before"), "{ends:?}");
+    assert!(!ends.iter().any(|a| a == "//boom"), "{ends:?}");
+    assert_eq!(ends, spans, "every committed ResultEnd has its span");
+}
+
+/// I1/A8: a recorder that falls more than its cap of messages behind stops
+/// with one warning naming it, every later send is dropped without blocking,
+/// and finish still releases the lock. (The cap lowered to 8 here; the write
+/// gate keeps the thread from draining.)
+#[test]
+fn falling_behind_the_pending_cap_stops_once() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let captured = Captured::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(captured.clone())
+        .with_ansi(false)
+        .finish();
+    let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let lock = tracing::subscriber::with_default(subscriber, || {
+        let rec = recorder_with(
+            dir.path(),
+            Faults {
+                gate: Some(Arc::clone(&gate)),
+                max_pending: Some(8),
+                ..Faults::default()
+            },
+        );
+        let tap = rec.tap();
+        let mut sent = 0;
+        while !tap.is_stopped() && sent < 100 {
+            for ev in events() {
+                tap.event(ev);
+                sent += 1;
+            }
+        }
+        assert!(tap.is_stopped(), "a full queue latched the stop");
+        assert!(sent < 100, "stopped after {sent} sends, cap 8");
+        for ev in events() {
+            tap.event(ev);
+        }
+        let (open, cv) = &*gate;
+        *open.lock().expect("gate") = true;
+        cv.notify_all();
+        rec.recorder.finish(Some(0), false, Duration::from_secs(5));
+        rec.dir().join(files::LOCK)
+    });
+    let log = captured.settled_log();
+    assert_eq!(log.matches("WARN").count(), 1, "{log}");
+    assert!(log.contains("fell more than"), "{log}");
+    assert!(!lockfile::is_held(&lock).expect("probe"));
+}
+
 /// A send after `finish` (a log line on the way out: `--pprof-cpu`'s, the
 /// telemetry's) is dropped silently. `End` is counted like any other message,
 /// so the pending count cannot underflow into a false "fell behind" stop.
