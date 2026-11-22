@@ -6,10 +6,11 @@
 
 use super::index::{DocIndex, SharedState};
 use crate::pluginbuildfile::Provider;
-use crate::pluginbuildfile::provider::PackageList;
+use crate::pluginbuildfile::provider::{DriverSource, PackageList};
 use crate::pluginbuildfile::run_file::{
     BuildFileLoader, build_globals, eval_source, resolve_load_target,
 };
+use crate::pluginbuildfile::types::DriverKwargs;
 use hcore::hasync::StdCancellationToken;
 use hcore::hmemoizer::Memoizer;
 use hmodel::htpkg::PkgBuf;
@@ -40,8 +41,8 @@ pub(crate) struct HephLspContext {
     registry: Arc<FunctionRegistry>,
     /// Docs for the heph globals; drives `starlark_lsp`'s builtin completion/hover.
     doc_globals: DocModule,
-    /// Lazily-built Starlark globals, shared across per-buffer evaluations.
-    globals: Arc<OnceLock<Globals>>,
+    /// The drivers evaluation sees, and the globals built with them.
+    drivers: Mutex<Drivers>,
     /// BUILD-file name patterns, from the buildfile provider's `patterns` config
     /// option (defaulting to `BUILD`). Used for both listing and load resolution.
     patterns: Vec<glob::Pattern>,
@@ -55,16 +56,51 @@ pub(crate) struct HephLspContext {
     pub(crate) shared: Arc<SharedState>,
 }
 
+/// The registered drivers as evaluation sees them (`heph.types.<driver>.Kwargs`),
+/// with the Starlark globals built from them.
+///
+/// None until the registry snapshot lands: reading the schemas blocks on the
+/// engine, and the context is built on the loop's thread, which must not.
+/// The server hands the snapshot's [`DriverSource`] over when it lands
+/// ([`HephLspContext::set_drivers`]); until then a file that names a
+/// driver's `Kwargs` does not evaluate, so it gets no provenance. The server
+/// re-evaluates every open document as it lands.
+struct Drivers {
+    source: DriverSource,
+    /// Lazily built, shared across per-buffer evaluations; replaced with the
+    /// source, since globals built before it would lack the `Kwargs`.
+    globals: Arc<OnceLock<Globals>>,
+}
+
+impl Drivers {
+    fn new(source: DriverSource) -> Drivers {
+        Drivers {
+            source,
+            globals: Arc::new(OnceLock::new()),
+        }
+    }
+}
+
 impl HephLspContext {
     pub(crate) fn new(engine: Arc<dyn LspEngine>) -> HephLspContext {
         let root = engine.root().to_path_buf();
         let registry = engine.function_registry();
-        let doc_globals = build_globals(&registry).documentation();
+        // Without the driver kwargs: they arrive with the registry snapshot,
+        // and the stock analysis never answers under `heph.types` (heph's
+        // `plugin_member` site replaces it there).
+        let doc_globals = build_globals(&registry, &DriverKwargs::default()).documentation();
         let core_members = crate::pluginbuildfile::run_file::heph_core_members(&doc_globals);
         let builtin_hovers = crate::pluginbuildfile::run_file::BuiltinHovers::new(&doc_globals);
         let patterns = buildfile_patterns(&*engine);
         let runtime = tokio::runtime::Handle::current();
-        let provider = build_listing_provider(&root, &patterns, &registry, runtime.clone());
+        let drivers = Drivers::new(DriverSource::default());
+        let provider = build_listing_provider(
+            &root,
+            &patterns,
+            &registry,
+            &drivers.source,
+            runtime.clone(),
+        );
         let shared = SharedState::new(
             engine,
             root.clone(),
@@ -76,7 +112,7 @@ impl HephLspContext {
             root,
             registry,
             doc_globals,
-            globals: Arc::new(OnceLock::new()),
+            drivers: Mutex::new(drivers),
             patterns,
             provider: Mutex::new((Instant::now(), provider)),
             runtime,
@@ -96,17 +132,30 @@ impl HephLspContext {
     fn provider(&self) -> Arc<Provider> {
         let mut cell = self.provider.lock().expect("provider lock");
         if cell.0.elapsed() >= LISTING_TTL {
-            *cell = (
-                Instant::now(),
-                build_listing_provider(
-                    &self.root,
-                    &self.patterns,
-                    &self.registry,
-                    self.runtime.clone(),
-                ),
-            );
+            *cell = (Instant::now(), self.fresh_provider());
         }
         Arc::clone(&cell.1)
+    }
+
+    fn fresh_provider(&self) -> Arc<Provider> {
+        let source = self.drivers.lock().expect("drivers lock").source.clone();
+        build_listing_provider(
+            &self.root,
+            &self.patterns,
+            &self.registry,
+            &source,
+            self.runtime.clone(),
+        )
+    }
+
+    /// Evaluate with `source`'s drivers from now on: the registry snapshot
+    /// landed. The globals and the listing provider built without them are
+    /// dropped, so neither serves a file that names a driver's `Kwargs` as
+    /// one that does not evaluate.
+    pub(crate) fn set_drivers(&self, source: DriverSource) {
+        *self.drivers.lock().expect("drivers lock") = Drivers::new(source);
+        let provider = self.fresh_provider();
+        *self.provider.lock().expect("provider lock") = (Instant::now(), provider);
     }
 
     /// Package name for a BUILD file path (its parent dir, workspace-relative,
@@ -146,6 +195,17 @@ impl HephLspContext {
     }
 
     fn loader(&self) -> BuildFileLoader {
+        let (kwargs, globals) = {
+            let drivers = self.drivers.lock().expect("drivers lock");
+            (
+                // A fixed source never fails; no driver stands in if it did.
+                drivers
+                    .source
+                    .kwargs()
+                    .unwrap_or_else(|_| DriverKwargs::empty()),
+                Arc::clone(&drivers.globals),
+            )
+        };
         let walker = Arc::new(hwalk::CachedWalker::disabled());
         BuildFileLoader::new(
             self.root.clone(),
@@ -155,7 +215,8 @@ impl HephLspContext {
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(HashMap::new())),
             Arc::clone(&self.registry),
-            Arc::clone(&self.globals),
+            kwargs,
+            globals,
             Arc::clone(&walker),
             // Fresh package list per call, for the same reason: a session-lifetime
             // one would freeze editor results — create a package and it would
@@ -257,11 +318,12 @@ fn first_build_file(dir: &Path, patterns: &[glob::Pattern]) -> Option<PathBuf> {
 
 /// Build a fresh buildfile provider for package/target listing, configured with
 /// the same patterns the engine's provider uses and the aggregated function
-/// registry (so `list(pkg)` can evaluate BUILD files).
+/// registry and drivers (so `list(pkg)` can evaluate BUILD files).
 fn build_listing_provider(
     root: &Path,
     patterns: &[glob::Pattern],
     registry: &Arc<FunctionRegistry>,
+    drivers: &DriverSource,
     runtime: tokio::runtime::Handle,
 ) -> Arc<Provider> {
     let provider = Provider {
@@ -269,7 +331,8 @@ fn build_listing_provider(
         build_file_patterns: patterns.to_vec(),
         ..Provider::base(Memoizer::with_tag_task("buildfile_pkg", runtime))
     }
-    .with_function_registry(Arc::clone(registry));
+    .with_function_registry(Arc::clone(registry))
+    .with_drivers(drivers.clone());
     Arc::new(provider)
 }
 

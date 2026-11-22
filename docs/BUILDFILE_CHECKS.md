@@ -35,7 +35,7 @@ they are exempt.
 
 | Target | Does | Writes | Labels |
 |---|---|---|---|
-| `//<pkg>:build-lint-check` | Static typecheck of the files the package owns; with `requireTypeAnnotations`, every `def` parameter (`*args`, `**kwargs` included) must have a type. The return type may be left out, and so may the type of a parameter with a literal default (not `None`; see [Inferred types](#inferred-types)) | nothing | `build-lint-check`, `lint-check` |
+| `//<pkg>:build-lint-check` | Static typecheck of the files the package owns; with `requireTypeAnnotations`, every `def` parameter (`*args`, `**kwargs` included) must have a type. The return type may be left out, and so may the type of a parameter with a scalar literal default (not `None`, and not a list, dict or tuple display; see [Inferred types](#inferred-types)) | nothing | `build-lint-check`, `lint-check` |
 | `//<pkg>:build-format-check` | Fails when an owned file differs from the formatter's output, the same rule as `heph tool build-fmt --check` | nothing | `build-format-check`, `format-check` |
 | `//<pkg>:build-format` | Rewrites owned files to the formatter's output (`codegen = in_place`) | owned files | `build-format`, `format`, `fix` |
 
@@ -46,7 +46,11 @@ package. `//...` includes `build-format`, and so do `label(fix)` and
 
 The lint key is the owned files, every file they load (transitively, by
 content), `requireTypeAnnotations`, heph's version, the names of the plugin
-functions, and the BUILD `patterns`. The format key is the owned files,
+functions, `driverKwargsDigest` and the BUILD `patterns`.
+`driverKwargsDigest` covers the [`Kwargs`](#driver-kwargs) types of every
+registered driver: each driver's name, keys and key types. A driver schema
+change that leaves those types alone, a doc edit say, does not re-run lint.
+The format key is the owned files,
 `indent` and heph's version. Nothing about either reaches an ordinary target:
 turning the option on or off leaves every other def hash unchanged.
 
@@ -78,13 +82,19 @@ annotations stay optional and calls are still checked against them:
 - **A parameter with a literal default** takes the literal's type. `1` and
   `-1` give `int`. `1.5` and `-1.5` give `int | float`, the same type as
   `heph.types.Number`, so `f(2)` passes against `scale = 1.0`. `"s"` gives
-  `str`, and `True` and `False` give `bool`. A list display (`[]`), a dict
-  display (`{}`) or a tuple display (`()`) gives a list, dict or tuple whose
-  elements are unchecked: `xs = ["a"]` is an example, not a schema.
+  `str`, and `True` and `False` give `bool`.
 
 `True` and `False` count only while the module does not rebind them anywhere
 (an assignment, a `for`, a `load`, a `def`, even one local to another def).
 Where it does, annotate the parameter.
+
+A list display (`[]`, `["a"]`), a dict display (`{}`) or a tuple display
+(`()`), empty or not, gives a `list`, `dict` or `tuple` of `Any`: the checker
+holds callers to the container, never to its elements. That type describes
+nothing, since a display does not say what goes in it, so
+`requireTypeAnnotations` still asks for an annotation with no `Any` in it:
+write `srcs: list[str] = []`. Only a type a default gives is held to that; an
+annotation you write may contain `Any`.
 
 These defaults infer nothing, so the parameter still needs an annotation:
 `None` (it means "optional something"; write `x: str | None = None`), a name
@@ -96,10 +106,9 @@ always wins over the default: `n: heph.types.Number = 1` takes a float too,
 and `name: str | None = ""` takes `None`.
 
 A wrapper parameter that forwards to a `target()` field (`deps`, `labels`,
-`env`, `tools`, `pass_env`, `runtime_pass_env`) should be annotated with its
-`heph.types` alias rather than typed by its default. `deps = []` infers `list`,
-so a call from another def that passes one address (`deps = "//a:b"`) or a
-group map is a type error, although `target()` accepts both.
+`env`, `tools`, `pass_env`, `runtime_pass_env`) takes its `heph.types` alias:
+`deps: heph.types.Deps = []`. With `requireTypeAnnotations` on, an
+unannotated `deps = []` gets a finding that suggests the alias.
 
 Only `build-lint-check` checks these types. Evaluation (`heph run`, `query`,
 `validate`) checks annotations alone, so it still accepts any argument for a
@@ -128,14 +137,17 @@ line follows:
 
 ```
 pkg/BUILD:3:9: annotation: parameter `x` of `make_lib` has no type; add `: <type>`
+pkg/BUILD:7:10: annotation: parameter `srcs` of `make_bin` is typed `list` by its default, a list of `Any`; add a type with no `Any`, e.g. `: list[str]`
 pkg/defs.BUILD:12:5: type-error: Expected type `str` but got `int`
-2 findings in //pkg
+3 findings in //pkg
 annotations are required by requireTypeAnnotations in .hephconfig (plugins: buildfile, options)
 ```
 
 The last line appears only when there is an `annotation:` finding. When a
 parameter is named like a `heph.types` alias (`deps`, `labels`, …), its finding
-suggests that alias.
+suggests that alias: `deps = []` ends with ``add `: heph.types.Deps` ``. A
+dict default suggests `dict[str, str]` and a tuple default
+`tuple[str, ...]`; put in the element types the parameter really takes.
 
 The expected type in a `type-error:` may come from a parameter's default
 rather than from an annotation. After `def f(n = 1)` on line 1, a call
@@ -226,15 +238,15 @@ def lib(name: str, deps: heph.types.Deps = None, labels: heph.types.Labels = Non
     target(name = name, driver = "bash", run = "true", labels = labels, transitive = {"deps": deps})
 ```
 
-The field aliases are `Addr`, `Deps`, `Env`, `Labels`, `PassEnv`,
+The field aliases are `Deps`, `Env`, `Labels`, `PassEnv`,
 `RuntimePassEnv` and `Tools`. The contract is:
 
 - A field alias means what `target()` accepts for that field at this heph
   version, **`None` included**, since every field is optional.
 - A field alias widens with its field and never narrows. Once a name ships, it
   is removed only through a deprecation.
-- Field aliases are built from `target()`'s own fields only, never from a
-  driver's schema, which would have to enter the lint key.
+- Field aliases are built from `target()`'s own fields only. A driver's
+  fields are typed by its [`Kwargs`](#driver-kwargs) instead.
 - `transitive` and `approval` have no alias. No Starlark type expresses a dict
   with fixed keys, so an alias would accept keys `target()` refuses.
 
@@ -243,8 +255,82 @@ One more alias is not built from a field: `heph.types.Number` is
 [Inferred types](#inferred-types)). It does not include `None`, and no
 annotation finding suggests it.
 
-`heph.types.Nope` fails before evaluation, naming the known aliases. The editor
-completes `heph.types.` and shows each alias's expansion on hover.
+`heph.types.Nope` fails before evaluation, naming the known aliases and the
+driver namespaces. The editor completes `heph.types.` with the aliases, then
+the driver namespaces, and shows each alias's expansion on hover.
+
+### Driver kwargs
+
+`heph.types.<driver>.Kwargs` types a wrapper's `**kwargs` per key, for one
+driver. `<driver>` is the name `target(driver = …)` takes, dots included
+(`heph.types.bash.Kwargs`, `heph.types.oci.image.Kwargs`):
+
+```python
+def lib(name: str, **kwargs: heph.types.bash.Kwargs):
+    target(name = name, driver = "bash", **kwargs)
+
+def app():
+    lib(name = "a", run = "echo")   # ok
+    lib(name = "a", run = 1)        # type-error: `run` expects the field's type
+    lib(name = "a", rnu = "echo")   # type-error: unknown key `rnu`
+```
+
+`heph.types.<driver>` exists for every driver the engine registers, and only
+those. A builtin factory such as `bash` registers its driver only when
+`.hephconfig` `plugins:` names it, so the example needs `bash` listed there.
+
+The contract is:
+
+- The keys are `target()`'s own fields except `driver`, plus the driver's
+  fields. A driver field named like a `target()` field is `target()`'s.
+- `Kwargs` is closed. A key it does not list is a type error.
+- Every key is optional and accepts `None`. A wrapper supplies some fields
+  itself, and `target()` reports a missing required field at evaluation.
+- `driver` is not a key. The wrapper writes it, and the name of the type
+  already fixes it.
+- A struct-shaped field (`transitive`, `approval`) is
+  `dict[str, typing.Any]`, since no Starlark type has fixed keys.
+- A float field's key is `int | float`. It accepts an int, as the field does.
+- A key is never narrower than its field. Lint may miss what evaluation
+  catches, never the reverse.
+- Inside the def, `kwargs` is a dict of the keys' types, so forwarding it to
+  `target()` typechecks.
+- Lint checks every call, and so does evaluation.
+
+The two report differently. Lint reports at the argument and does not name the
+key:
+
+```
+pkg/BUILD:6:21: type-error: Expected type `None | str | list[str]` but got `int`
+pkg/BUILD:7:21: type-error: Unexpected parameter named `rnu`
+```
+
+Evaluation fails the call and names the key:
+``Unexpected key `rnu` for argument `kwargs`; known keys: …``, or
+``Value `1` of type `int` for key `run` does not match the type annotation …``.
+
+`heph.types.nope.Kwargs` fails before evaluation. The error names the drivers
+that have one and points at `.hephconfig` `plugins:`, where drivers come from.
+`heph.types.bash.Nope` names the members that exist. A driver whose name
+cannot be written as an attribute path gets no namespace: one with an empty
+segment, a segment named `Kwargs`, or a first segment named like a field alias
+(`Deps`, …). Registry names are lowercase, so none is in practice.
+
+`Kwargs` tracks the registered driver. It is not a frozen copy:
+
+- A driver removed, renamed or left out of `plugins:` fails every file that
+  names its `Kwargs`, before evaluation. That includes a file that only
+  `load()`s a wrapper using it, even if the wrapper is never called.
+- A call that passes a removed or narrowed driver field fails at evaluation,
+  naming the key. Lint reports it at the argument.
+- A driver field added widens the type.
+- A `target()` field added later retypes a driver key of the same name: the
+  key becomes `target()`'s.
+
+The editor completes `heph.types.<driver…>.` with `Kwargs` and the namespaces
+under it. Hovering `Kwargs` lists its keys and their types, and marks each key
+the driver's schema requires with `(required by the driver)`. The mark is for
+reading only: the key stays optional in the type.
 
 ## What changes on upgrade
 
@@ -265,9 +351,13 @@ completes `heph.types.` and shows each alias's expansion on hover.
   `def f(n = 1)`, `f(n = "s")` is a type error, and so is using `n` as a
   `str` inside `f`. The commonest new findings are `f(1.5)` against `n = 1`,
   `f(None)` against `name = ""`, and a def passing `deps = "//a:b"` to a
-  wrapper declared with `deps = []`. Annotate the parameter to widen it
-  (`n: heph.types.Number = 1`, `name: str | None = ""`,
+  wrapper declared with `deps = []`, which types it `list`. Annotate the
+  parameter to widen it (`n: heph.types.Number = 1`, `name: str | None = ""`,
   `deps: heph.types.Deps = []`).
+- With `requireTypeAnnotations` on, a parameter whose default is a list, dict
+  or tuple display (`srcs = []`, `creds = {}`, `t = ()`) now needs an
+  annotation with no `Any` in it, although its default types it. The finding
+  says what the default types it as and suggests a fix.
 - A plugin named `types` no longer loads. The name is reserved for
   `heph.types`, like `core`.
 - `target(labels = None)` is now accepted and means labels left out, so a

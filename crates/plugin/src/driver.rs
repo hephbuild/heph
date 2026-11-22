@@ -2986,6 +2986,91 @@ pub struct DriverSchema {
     pub accepts_deferred: bool,
 }
 
+/// Every registered driver's [`DriverSchema`], by registry name: sorted, so a
+/// listing or a digest over it never depends on registration order.
+pub type DriverSchemas = std::collections::BTreeMap<String, DriverSchema>;
+
+/// The engine's registered drivers' schemas, as a plugin reads them: the
+/// buildfile plugin builds `heph.types.<driver>.Kwargs` from them.
+///
+/// Sealed once, when the engine seals its function registry (every plugin is
+/// registered by then); reading it before is an error, never an empty set,
+/// for the same reason as `FunctionSlot`: a plugin that cached an empty set
+/// would serve it for its whole life. Unlike the function registry, the
+/// schemas are plain data that keep nothing alive, so the slot holds them
+/// strongly.
+#[derive(Debug, Default)]
+pub struct DriverSchemaSlot {
+    sealed: std::sync::OnceLock<std::sync::Arc<DriverSchemas>>,
+}
+
+impl DriverSchemaSlot {
+    pub fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self::default())
+    }
+
+    /// A slot already sealed with `schemas`: for callers (the LSP, tests) that
+    /// hold the schemas rather than an engine.
+    pub fn sealed(schemas: DriverSchemas) -> std::sync::Arc<Self> {
+        let slot = Self::new();
+        slot.seal_with(|| schemas);
+        slot
+    }
+
+    /// Seal the slot with what `schemas` returns, called only if it is not
+    /// sealed yet: the first seal wins, so a sealed slot costs one load.
+    pub fn seal_with(&self, schemas: impl FnOnce() -> DriverSchemas) {
+        if self.sealed.get().is_none() {
+            // A concurrent seal may win; both read the same registered drivers.
+            let _won = self.sealed.set(std::sync::Arc::new(schemas()));
+        }
+    }
+
+    /// The sealed schemas.
+    pub fn get(&self) -> anyhow::Result<std::sync::Arc<DriverSchemas>> {
+        self.sealed.get().cloned().ok_or_else(|| {
+            anyhow::anyhow!(
+                "the driver schemas were read before every plugin was registered; \
+                 they are readable once the engine has finished loading plugins"
+            )
+        })
+    }
+}
+
+#[cfg(test)]
+mod schema_slot_tests {
+    use super::*;
+
+    fn one(name: &str) -> DriverSchemas {
+        DriverSchemas::from([(name.to_string(), DriverSchema::default())])
+    }
+
+    /// Read before the seal, the slot errs and stays unsealed: the seal that
+    /// follows is what every later read sees.
+    #[test]
+    fn read_before_seal_errs_then_seals() {
+        let slot = DriverSchemaSlot::new();
+        let err = slot.get().expect_err("unsealed");
+        assert!(
+            format!("{err:#}").contains("before every plugin was registered"),
+            "{err:#}"
+        );
+        assert!(slot.get().is_err(), "an error is not cached as a value");
+        slot.seal_with(|| one("a"));
+        let keys: Vec<String> = slot.get().expect("sealed").keys().cloned().collect();
+        assert_eq!(keys, ["a"]);
+    }
+
+    /// The first seal wins: a second `seal_with` never calls its closure.
+    #[test]
+    fn second_seal_not_called() {
+        let slot = DriverSchemaSlot::sealed(one("a"));
+        slot.seal_with(|| panic!("a sealed slot builds nothing"));
+        let keys: Vec<String> = slot.get().expect("sealed").keys().cloned().collect();
+        assert_eq!(keys, ["a"]);
+    }
+}
+
 /// A driver option whose value may arrive late.
 ///
 /// The problem it solves: a driver option's value has to be a literal in the

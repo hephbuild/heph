@@ -106,6 +106,11 @@ impl Ws {
 
     /// The engine the next `heph` invocation over this workspace builds.
     fn engine(&self) -> Arc<Engine> {
+        self.engine_with(|_| {})
+    }
+
+    /// [`Self::engine`], with `extra` registering more before it is shared.
+    fn engine_with(&self, extra: impl FnOnce(&mut Engine)) -> Arc<Engine> {
         let root = self.dir.path();
         let file = config_yaml::load_from_root(root).expect("load .hephconfig");
         let config = file.resolve(root).expect("resolve config");
@@ -115,6 +120,7 @@ impl Ws {
         bootstrap::register_builtin_factories_with(&mut e, &home, self.shadowed.clone())
             .expect("builtin factories");
         e.register_plugins(&file.plugins).expect("plugins:");
+        extra(&mut e);
         let e = Arc::new(e);
         e.install_exec_runner_host();
         e
@@ -292,6 +298,40 @@ async fn unowned_file_unreported() {
             .chain(r.failed.keys())
             .any(|a| a.starts_with("//tools:")),
         "no package owns tools/: {r:#?}"
+    );
+}
+
+/// A container display default types its parameter as a container of `Any`:
+/// lint passes it without `requireTypeAnnotations`, and with it the finding
+/// names the type and asks for one with no `Any`, under the same count line
+/// and footer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn require_annotations_container_default() {
+    let ws = Ws::new(
+        &[(
+            "pkg/BUILD",
+            "def make_bin(srcs = [], deps = []):\n    pass\n",
+        )],
+        "",
+    );
+    assert_passes(
+        &run_addr(&ws, "//pkg:build-lint-check").await,
+        "//pkg:build-lint-check",
+    );
+
+    ws.set_options("requireTypeAnnotations: true");
+    let r = run_addr(&ws, "//pkg:build-lint-check").await;
+    assert_fails(&r, "//pkg:build-lint-check");
+    assert_eq!(
+        failure_log(&ws, "//pkg:build-lint-check").trim_end(),
+        format!(
+            "pkg/BUILD:1:14: annotation: parameter `srcs` of `make_bin` is typed `list` by its \
+             default, a list of `Any`; add a type with no `Any`, e.g. `: list[str]`\n\
+             pkg/BUILD:1:25: annotation: parameter `deps` of `make_bin` is typed `list` by its \
+             default, a list of `Any`; add `: heph.types.Deps`\n\
+             2 findings in //pkg\n\
+             {FOOTER_ANNOTATIONS}"
+        )
     );
 }
 
@@ -727,4 +767,175 @@ async fn shadow_runs_user_target_validate_fails() {
           `build-lint-check`: rename the target, or remove it to get the check back"
         ]
     );
+}
+
+/// `heph.types.bash.Kwargs` is built from the schema of the `bash` driver the
+/// shipped engine registers: a wrong-typed key is a lint finding in the
+/// spec's line format, the fixed call passes and builds through the real
+/// driver, and an unknown key fails evaluation naming the key (D8).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn driver_kwargs_real_driver() {
+    const LIB: &str = "\
+def lib(name: str, **kwargs: heph.types.bash.Kwargs):
+    target(name = name, driver = \"bash\", **kwargs)
+";
+    let ws = Ws::new(
+        &[(
+            "pkg/BUILD",
+            &format!("{LIB}\ndef app():\n    lib(name = \"a\", run = 1)\n"),
+        )],
+        "",
+    );
+    // `bash` is a factory: its driver exists only when `plugins:` names it.
+    ws.write(
+        ".hephconfig",
+        "plugins:\n  - builtin: buildfile\n  - builtin: bash\n",
+    );
+    let r = run_addr(&ws, "//pkg:build-lint-check").await;
+    assert_fails(&r, "//pkg:build-lint-check");
+    assert_eq!(
+        failure_log(&ws, "//pkg:build-lint-check").trim_end(),
+        "pkg/BUILD:5:21: type-error: Expected type `None | str | list[str]` but got `int`\n\
+         1 finding in //pkg"
+    );
+
+    ws.write(
+        "pkg/BUILD",
+        &format!(
+            "{LIB}\ndef app():\n    lib(name = \"a\", run = \"true\")\n\n\
+             lib(name = \"t\", run = \"true\")\n"
+        ),
+    );
+    let r = run(&ws, &everything()).await;
+    assert_passes(&r, "//pkg:build-lint-check");
+    assert_passes(&r, "//pkg:t");
+
+    ws.write(
+        "pkg/BUILD",
+        &format!("{LIB}\nlib(name = \"t\", rnu = \"true\")\n"),
+    );
+    let m = Matcher::Addr(parse_addr("//pkg:build-lint-check").expect("addr"));
+    let err = match try_run(&ws, &m).await {
+        Err(e) => format!("{e:#}"),
+        Ok(r) => {
+            assert_fails(&r, "//pkg:build-lint-check");
+            r.failed["//pkg:build-lint-check"].clone()
+        }
+    };
+    assert!(
+        err.contains("Unexpected key `rnu` for argument `kwargs`"),
+        "names the key: {err}"
+    );
+}
+
+/// The managed bash driver registered as `kw`, its schema with one more
+/// field when `extra`: two engines whose driver schemas differ by a field.
+struct KwBash {
+    inner: heph::pluginexec::Driver,
+    extra: bool,
+}
+
+#[async_trait::async_trait]
+impl heph::engine::driver_managed::ManagedDriver for KwBash {
+    fn config(
+        &self,
+        _req: hplugin::driver::ConfigRequest,
+    ) -> anyhow::Result<hplugin::driver::ConfigResponse> {
+        Ok(hplugin::driver::ConfigResponse {
+            name: "kw".to_string(),
+        })
+    }
+    fn schema(&self) -> hplugin::driver::DriverSchema {
+        let mut schema = heph::engine::driver_managed::ManagedDriver::schema(&self.inner);
+        if self.extra {
+            schema.fields.push(hplugin::driver::DriverField {
+                name: "extra".to_string(),
+                ty: hcore::htvalue::signature::ParamType::String,
+                doc: "a field only one engine's driver has".to_string(),
+                required: false,
+            });
+        }
+        schema
+    }
+    async fn parse(
+        &self,
+        req: hplugin::driver::ParseRequest,
+        ctoken: &(dyn hcore::hasync::Cancellable + Send + Sync),
+    ) -> anyhow::Result<hplugin::driver::ParseResponse> {
+        heph::engine::driver_managed::ManagedDriver::parse(&self.inner, req, ctoken).await
+    }
+    async fn apply_transitive(
+        &self,
+        req: hplugin::driver::ApplyTransitiveRequest,
+        ctoken: &(dyn hcore::hasync::Cancellable + Send + Sync),
+    ) -> anyhow::Result<hplugin::driver::ApplyTransitiveResponse> {
+        heph::engine::driver_managed::ManagedDriver::apply_transitive(&self.inner, req, ctoken)
+            .await
+    }
+    async fn run<'a, 'io>(
+        &self,
+        req: heph::engine::driver_managed::ManagedRunRequest<'a, 'io>,
+        ctoken: &(dyn hcore::hasync::Cancellable + Send + Sync),
+    ) -> anyhow::Result<heph::engine::driver_managed::ManagedRunResponse> {
+        heph::engine::driver_managed::ManagedDriver::run(&self.inner, req, ctoken).await
+    }
+}
+
+/// I2: the drivers' `Kwargs` reach no ordinary target. One wrapper, typed
+/// `**kwargs: heph.types.kw.Kwargs` or bare, under driver schemas that differ
+/// by a field: the target's spec and def hash are the same all four ways.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn driver_kwargs_reach_no_target_def() {
+    let ws = Ws::new(&[], "");
+    let addr = parse_addr("//pkg:t").expect("addr");
+    let mut seen = Vec::new();
+    for annotation in [": heph.types.kw.Kwargs", ""] {
+        ws.write(
+            "pkg/BUILD",
+            &format!(
+                "def lib(name: str, **kwargs{annotation}):\n    \
+                 target(name = name, driver = \"kw\", **kwargs)\n\n\
+                 lib(name = \"t\", run = \"echo hi > $OUT\", out = \"o.txt\")\n"
+            ),
+        );
+        for extra in [false, true] {
+            let engine = ws.engine_with(|e| {
+                e.register_managed_driver(move |_| {
+                    Box::new(KwBash {
+                        inner: heph::pluginexec::Driver::new_bash().with_host_path(),
+                        extra,
+                    })
+                })
+                .expect("register kw");
+            });
+            assert_eq!(
+                engine
+                    .driver_schema("kw")
+                    .expect("kw")
+                    .fields
+                    .iter()
+                    .any(|f| f.name == "extra"),
+                extra
+            );
+            let spec = Arc::clone(&engine)
+                .get_spec(engine.new_state(), &addr)
+                .await
+                .unwrap_or_else(|e| panic!("{annotation:?}, extra {extra}: {e:#}"));
+            let def = Arc::clone(&engine)
+                .get_def(engine.new_state(), &addr)
+                .await
+                .unwrap_or_else(|e| panic!("{annotation:?}, extra {extra}: {e:#}"));
+            seen.push((
+                format!("{annotation:?}, extra {extra}"),
+                // A JSON value: its maps are sorted, the spec's `config` is not.
+                serde_json::to_value(&*spec.spec).expect("spec to json"),
+                def.target_def.hash.clone(),
+            ));
+        }
+    }
+    let (first, rest) = seen.split_first().expect("four evaluations");
+    for (label, spec, hash) in rest {
+        assert_eq!(spec, &first.1, "{label}: spec, against {}", first.0);
+        assert_eq!(hash, &first.2, "{label}: def hash, against {}", first.0);
+    }
 }

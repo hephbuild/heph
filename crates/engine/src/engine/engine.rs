@@ -62,6 +62,16 @@ pub struct PluginInit {
     /// plugins register — reading it then is an error — and sealed before the
     /// first BUILD evaluation. Per engine: never share it across engines.
     pub functions: Arc<FunctionSlot>,
+    /// Every registered driver's schema, sealed with [`Self::functions`]: an
+    /// error to read before. The buildfile plugin builds
+    /// `heph.types.<driver>.Kwargs` from it.
+    ///
+    /// **A plugin must never fold it into a def hash**, nor into anything an
+    /// ordinary target's def is built from: every def would then move when any
+    /// plugin adds, drops or retypes a driver field. Only a target whose output
+    /// is a verdict over the schemas (the buildfile lint check) may key on a
+    /// digest of what it reads from them.
+    pub drivers: Arc<hplugin::driver::DriverSchemaSlot>,
 }
 
 /// True if `entry` contains wax glob metacharacters — used to split `fs.skip`
@@ -369,6 +379,9 @@ pub struct Engine {
     /// The handle every plugin is given (in `PluginInit`, or behind a cdylib's
     /// registry handle). An error to read before [`Self::seal_functions`].
     pub(crate) function_slot: Arc<FunctionSlot>,
+    /// Every registered driver's schema, sealed by [`Self::seal_functions`]
+    /// and handed to every plugin in `PluginInit.drivers`.
+    pub(crate) driver_schema_slot: Arc<hplugin::driver::DriverSchemaSlot>,
 
     /// The remote cache's temp directory, created and swept of abandoned temps
     /// on first use (`Engine::remote_tmp_dir`). Lazy, so a build with no
@@ -988,6 +1001,7 @@ impl Engine {
             remote_caches,
             functions: Arc::new(FunctionRegistry::default()),
             function_slot: FunctionSlot::new(),
+            driver_schema_slot: hplugin::driver::DriverSchemaSlot::new(),
             remote_tmp_ready: tokio::sync::OnceCell::new(),
             scratch_audit_ready: tokio::sync::OnceCell::new(),
         };
@@ -1106,6 +1120,14 @@ impl Engine {
     /// shared engine no longer hands out).
     pub(crate) fn seal_functions(&self) {
         self.function_slot.seal(&self.functions);
+        // The driver schemas are sealed at the same point, built once: the
+        // buildfile plugin's `heph.types.<driver>.Kwargs` read them.
+        self.driver_schema_slot.seal_with(|| {
+            self.drivers_by_name
+                .iter()
+                .map(|(name, d)| (name.clone(), d.driver.schema()))
+                .collect()
+        });
     }
 
     /// The config schema a registered driver exposes. Used by the BUILD-file LSP
@@ -1164,6 +1186,7 @@ impl Engine {
             codegen_index: Arc::clone(&self.codegen_index),
             runtime: self.runtime.clone(),
             functions: Arc::clone(&self.function_slot),
+            drivers: Arc::clone(&self.driver_schema_slot),
         }
     }
 
@@ -1590,6 +1613,15 @@ impl hplugin::lsp::LspEngine for Engine {
 
     fn driver_names(&self) -> Vec<String> {
         Engine::driver_names(self)
+    }
+
+    fn driver_schemas(&self) -> hplugin::driver::DriverSchemas {
+        // The set the plugins read (`PluginInit.drivers`), sealed on demand.
+        self.seal_functions();
+        self.driver_schema_slot
+            .get()
+            .map(|s| (*s).clone())
+            .unwrap_or_default()
     }
 
     fn provider_names(&self) -> Vec<String> {
@@ -2117,6 +2149,39 @@ mod tests {
             let registry = slot.get().expect("sealed");
             assert!(registry.get("early", "f").is_some());
             assert!(registry.get("fs", "glob").is_some());
+        }
+
+        /// The driver schema slot every plugin gets errs until the seal, then
+        /// holds exactly each registered driver's `schema()`, by name.
+        #[tokio::test]
+        async fn driver_schemas_sealed_with_registered_drivers() {
+            let (_root, mut e) = engine();
+            let mut seen = None;
+            e.register_plugin("early", |init| {
+                seen = Some(Arc::clone(&init.drivers));
+                Ok(PluginParts::default())
+            })
+            .expect("register");
+            let slot = seen.expect("init carries the slot");
+            let err = slot.get().expect_err("read before the seal");
+            assert!(
+                format!("{err:#}").contains("before every plugin was registered"),
+                "{err:#}"
+            );
+
+            e.seal_functions();
+            let sealed = slot.get().expect("sealed");
+            let names: Vec<String> = sealed.keys().cloned().collect();
+            assert_eq!(names, e.driver_names());
+            assert!(!names.is_empty(), "the builtins register drivers");
+            assert!(
+                sealed.values().any(|s| !s.fields.is_empty()),
+                "some driver has a field to compare"
+            );
+            for (name, schema) in sealed.iter() {
+                let registered = e.driver_schema(name).expect("registered");
+                assert_eq!(format!("{schema:?}"), format!("{registered:?}"), "{name}");
+            }
         }
 
         /// D6: once the registry is sealed, registering a plugin is an error

@@ -60,6 +60,8 @@ impl Default for RunOptions {
 /// One open document: its text and everything derived from it, freed on
 /// `didClose`.
 struct Document {
+    /// The URI as the client sent it: what its diagnostics are published to.
+    uri: Uri,
     text: String,
     version: i32,
     tokens: Arc<Tokens>,
@@ -205,6 +207,9 @@ pub fn run_with(
         Err(RecvTimeoutError::Disconnected) => RegistryState::Failed,
     };
     let ctx = HephLspContext::new(engine);
+    if let RegistryState::Ready(r) = &registry {
+        ctx.set_drivers(r.driver_source.clone());
+    }
     let shared = Arc::clone(&ctx.shared);
     let result = serde_json::json!({
         "capabilities": capabilities(encoding),
@@ -441,17 +446,48 @@ impl Server<'_> {
         // Lexed once per edit: the parse below (and its diagnostics) reads the
         // same token array the requests will.
         let tokens = Arc::new(lex::lex(&text));
-        self.shared.stage_tokens(key.clone(), Arc::clone(&tokens));
-        let (stock, parsed) = self.backend.validate(&key, text.clone());
+        // Never waits: a snapshot that has landed hands its drivers to the
+        // evaluation below (and re-evaluates the other open documents).
+        let _ready = self.registry();
+        let parsed = self.diagnose(&key, &client_uri, &text, &tokens, version);
         let ast_version = if parsed {
             Some(version)
         } else {
             self.documents.get(&key).and_then(|d| d.ast_version)
         };
+        let outside_root = match self.documents.get(&key) {
+            Some(prev) => prev.outside_root,
+            None => matches!(&key, LspUri::File(p) if !self.root.contains(p)),
+        };
+        self.documents.insert(
+            key,
+            Document {
+                uri: client_uri,
+                text,
+                version,
+                tokens,
+                ast_version,
+                outside_root,
+            },
+        );
+    }
+
+    /// Parse and evaluate `text`, the open document `key` at `version`, and
+    /// publish its diagnostics. Whether it parsed.
+    fn diagnose(
+        &self,
+        key: &LspUri,
+        client_uri: &Uri,
+        text: &str,
+        tokens: &Arc<Tokens>,
+        version: i32,
+    ) -> bool {
+        self.shared.stage_tokens(key.clone(), Arc::clone(tokens));
+        let (stock, parsed) = self.backend.validate(key, text.to_owned());
         let mut diagnostics: Vec<Diagnostic> = stock
             .into_iter()
             .map(|mut d| {
-                d.range = self.stock_range(d.range, &text);
+                d.range = self.stock_range(d.range, text);
                 d
             })
             .collect();
@@ -462,8 +498,8 @@ impl Server<'_> {
                 continue;
             };
             let range = Range::new(
-                position::to_position(&text, t.start as usize, self.encoding),
-                position::to_position(&text, t.end as usize, self.encoding),
+                position::to_position(text, t.start as usize, self.encoding),
+                position::to_position(text, t.end as usize, self.encoding),
             );
             if diagnostics.iter().any(|d| d.range.start == range.start) {
                 continue;
@@ -476,21 +512,27 @@ impl Server<'_> {
                 ..Default::default()
             });
         }
-        self.publish(client_uri, diagnostics, Some(version));
-        let outside_root = match self.documents.get(&key) {
-            Some(prev) => prev.outside_root,
-            None => matches!(&key, LspUri::File(p) if !self.root.contains(p)),
-        };
-        self.documents.insert(
-            key,
-            Document {
-                text,
-                version,
-                tokens,
-                ast_version,
-                outside_root,
-            },
-        );
+        self.publish(client_uri.clone(), diagnostics, Some(version));
+        parsed
+    }
+
+    /// Re-evaluate every open document and republish its diagnostics: the
+    /// registry snapshot just landed, and each was evaluated without the
+    /// drivers' `Kwargs`, with no edit coming to correct it.
+    fn rediagnose_open_documents(&mut self) {
+        let parsed: Vec<(LspUri, bool)> = self
+            .documents
+            .iter()
+            .map(|(key, doc)| {
+                let parsed = self.diagnose(key, &doc.uri, &doc.text, &doc.tokens, doc.version);
+                (key.clone(), parsed)
+            })
+            .collect();
+        for (key, parsed) in parsed {
+            if parsed && let Some(doc) = self.documents.get_mut(&key) {
+                doc.ast_version = Some(doc.version);
+            }
+        }
     }
 
     fn close(&mut self, client_uri: Uri) {
@@ -514,11 +556,17 @@ impl Server<'_> {
             )));
     }
 
-    /// The registry, once its snapshot has landed.
+    /// The registry, once its snapshot has landed. Its drivers reach the
+    /// context's evaluation as it lands, and every open document is
+    /// re-evaluated with them.
     fn registry(&mut self) -> Option<Arc<Registry>> {
         if let RegistryState::Loading(rx) = &self.registry {
             match rx.try_recv() {
-                Ok(r) => self.registry = RegistryState::Ready(Arc::new(r)),
+                Ok(r) => {
+                    self.backend.context.set_drivers(r.driver_source.clone());
+                    self.registry = RegistryState::Ready(Arc::new(r));
+                    self.rediagnose_open_documents();
+                }
                 Err(std::sync::mpsc::TryRecvError::Empty) => return None,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     self.registry = RegistryState::Failed;

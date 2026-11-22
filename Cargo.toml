@@ -251,7 +251,13 @@ crossterm = { git = "https://github.com/hephbuild/crossterm.git", branch = "fix-
 # and those parameters' annotations stay optional, and calls are still checked
 # against the inferred types. Both are lint-only: only the AST typechecker heph
 # uses infers, and the one evaluation runs (`enable_static_typechecking`, or
-# `@starlark-rust: typecheck`) still sees `Any`. The branch keeps starlark's
+# `@starlark-rust: typecheck`) still sees `Any`.
+# And a third change, a typed-kwargs type (`starlark::typing::TyTypedKwargs`,
+# Python's `**kwargs: Unpack[TypedDict]`): `**kwargs: T` with T built by
+# `TyTypedKwargs::new` checks each key against its own type and rejects an
+# unknown key, in both typecheckers and at evaluation; outside `**kwargs` it
+# types as a dict (`in`, `|`, index, `.get`). heph builds one per
+# driver as `heph.types.<driver>.Kwargs`. The branch keeps starlark's
 # own dependencies on crates.io, so heph links one starlark_syntax.
 # To be proposed to meta/starlark-rust; drop this once a release carries it.
 # `crates/plugin-buildfile/src/pluginbuildfile/starlark_patch.rs` fails without it.

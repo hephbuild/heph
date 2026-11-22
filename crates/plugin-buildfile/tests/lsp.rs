@@ -1135,16 +1135,17 @@ fn types_completion_and_hover() {
     assert_eq!(
         labels(&result),
         vec![
-            "Addr",
             "Deps",
             "Env",
             "Labels",
             "Number",
             "PassEnv",
             "RuntimePassEnv",
-            "Tools"
+            "Tools",
+            "exec",
+            "go_binary"
         ],
-        "every alias, nothing else"
+        "every alias, then every driver namespace, nothing else"
     );
     let deps = item(&result, "Deps");
     let expansion = deps["detail"].as_str().expect("detail").to_string();
@@ -1168,6 +1169,166 @@ fn types_completion_and_hover() {
         hover["contents"]["value"], deps["documentation"]["value"],
         "hover and completion render the same doc"
     );
+}
+
+#[test]
+fn driver_kwargs_completion_and_hover() {
+    let mut lsp = Lsp::start();
+    let doc = lsp.open(
+        "BUILD",
+        "def f(name: str, **kwargs: heph.types.exec.│):\n    pass\n",
+    );
+    let result = lsp.completion(&doc);
+    assert_eq!(
+        labels(&result),
+        vec!["Kwargs"],
+        "the driver's type, nothing else"
+    );
+    let kwargs = item(&result, "Kwargs");
+
+    // Mid-word, a broken document: the prefix filters, the tail is ignored.
+    let doc = lsp.open("mid/BUILD", "def f(**kwargs: heph.types.ex│\n");
+    assert_eq!(labels(&lsp.completion(&doc)), vec!["exec"]);
+
+    let doc = lsp.open(
+        "hover/BUILD",
+        "def f(**kwargs: heph.types.exec.Kw│args):\n    pass\n",
+    );
+    let hover = lsp.hover(&doc);
+    let text = hover_text(&hover);
+    assert!(text.contains("heph.types.exec.Kwargs"), "{text}");
+    for key in [
+        "- `cmd`: `None | str`",
+        "- `env`: `None | dict[str, str]`",
+        "- `labels`: ",
+        "- `transitive`: `None | dict[str, typing.Any]`",
+    ] {
+        assert!(text.contains(key), "{key} in {text}");
+    }
+    assert!(!text.contains("`driver`"), "`driver` is not a key: {text}");
+    // The schema's `required` is marked; the key's type stays optional.
+    let line = |key: &str| {
+        text.lines()
+            .find(|l| l.starts_with(&format!("- `{key}`:")))
+            .unwrap_or_else(|| panic!("{key} in {text}"))
+            .to_string()
+    };
+    assert_eq!(
+        line("cmd"),
+        "- `cmd`: `None | str` (required by the driver)"
+    );
+    assert_eq!(line("env"), "- `env`: `None | dict[str, str]`");
+    assert!(
+        !line("name").contains("required"),
+        "`target()`'s own required fields are not the driver's: {text}"
+    );
+    assert_eq!(
+        hover["contents"]["value"], kwargs["documentation"]["value"],
+        "hover and completion render the same doc"
+    );
+
+    let doc = lsp.open(
+        "ns/BUILD",
+        "def f(**kwargs: heph.types.ex│ec.Kwargs):\n    pass\n",
+    );
+    let text = hover_text(&lsp.hover(&doc));
+    assert!(
+        text.contains("heph.types.exec") && text.contains("`Kwargs`"),
+        "a driver namespace lists its members: {text}"
+    );
+}
+
+/// A BUILD file whose wrapper types its `**kwargs` with a driver's `Kwargs`.
+const KWARGS_BUILD: &str = "def lib(name: str, **kwargs: heph.types.exec.Kwargs):\n    \
+    return target(name = name, driver = \"exec\", **kwargs)\n\n\
+    lib(\"a\", cmd = \"true\")\n";
+
+#[test]
+fn driver_kwargs_document_evaluates_with_no_diagnostic() {
+    let mut opts = hplugin::config::Options::default();
+    opts.insert(
+        "requireTypeAnnotations".to_string(),
+        serde_yaml::Value::Bool(true),
+    );
+    let mut lsp = Lsp::with_buildfile(
+        None,
+        plugin_buildfile::pluginbuildfile::LspRunOptions::default(),
+        opts,
+    );
+    lsp.initialize();
+    let doc = lsp.open("tools/BUILD", KWARGS_BUILD);
+    lsp.barrier();
+    let diagnostics = lsp.last_diagnostics(&doc).expect("diagnostics published");
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+
+    // Each answer below needs the file to evaluate: the open document's
+    // provenance, the listing, and the declaring call.
+    let hover_doc = lsp.open(
+        "tools/BUILD",
+        &KWARGS_BUILD.replace("lib(\"a\"", "li│b(\"a\""),
+    );
+    let text = hover_text(&lsp.hover(&hover_doc));
+    assert!(text.contains("//tools:a"), "the call's targets: {text}");
+    let doc = lsp.open("user/BUILD", "x = [\"//tools:│\"]\n");
+    assert_eq!(labels(&lsp.completion(&doc)), vec!["//tools:a"]);
+    let doc = lsp.open("user/BUILD", "x = [\"//tools:│a\"]\n");
+    let found = targets(&lsp.definition(&doc));
+    assert_eq!(
+        found,
+        vec![(lsp.uri("tools/BUILD"), 3)],
+        "the wrapper's call, not the BUILD file"
+    );
+}
+
+#[test]
+fn driver_kwargs_reach_evaluation_when_the_registry_lands_late() {
+    let (mut lsp, gate) = Lsp::new_gated();
+    lsp.initialize();
+    lsp.write("tools/BUILD", KWARGS_BUILD);
+    // Opened, and so evaluated, before the drivers land; never edited after.
+    let early = lsp.open(
+        "tools/BUILD",
+        &KWARGS_BUILD.replace("lib(\"a\"", "li│b(\"a\""),
+    );
+    let doc = lsp.open("user/BUILD", "x = [\"//tools:│\"]\n");
+    // Both opens are handled before the gate opens.
+    lsp.barrier();
+    assert_eq!(
+        reason(&lsp.explain(&doc)).as_deref(),
+        Some("providers_loading")
+    );
+    gate.release();
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    while reason(&lsp.explain(&doc)).is_some() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the registry never landed"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        labels(&lsp.completion(&doc)),
+        vec!["//tools:a"],
+        "the listing evaluates with the drivers that landed"
+    );
+    // The early document was re-evaluated as the drivers landed: its
+    // diagnostics were republished clean for its version, and its call's
+    // provenance, which needs the file to evaluate, is there.
+    lsp.barrier();
+    let republished = lsp
+        .diagnostics
+        .iter()
+        .filter(|d| d["uri"] == json!(early.uri))
+        .count();
+    assert!(
+        republished >= 2,
+        "republished as the drivers landed: {:?}",
+        lsp.diagnostics
+    );
+    let diagnostics = lsp.last_diagnostics(&early).expect("diagnostics published");
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    let text = hover_text(&lsp.hover(&early));
+    assert!(text.contains("//tools:a"), "the call's targets: {text}");
 }
 
 #[test]
@@ -2948,6 +3109,33 @@ fn require_annotations_exempts_a_literal_default() {
             &json!({"line": 0, "character": 13}),
         )],
         "a mark on `o` only"
+    );
+}
+
+#[test]
+fn require_annotations_marks_a_container_default() {
+    // A container display types its parameter as a container of `Any`, which
+    // the rule does not accept: the mark says so, as `build-lint-check` does.
+    let on = annotation_diagnostics(true, "def f(n = 1, srcs = [], deps = []):\n    pass\n");
+    let marks: Vec<(&str, &Value)> = on
+        .iter()
+        .map(|d| (d["message"].as_str().unwrap_or(""), &d["range"]["start"]))
+        .collect();
+    assert_eq!(
+        marks,
+        [
+            (
+                "parameter `srcs` of `f` is typed `list` by its default, a list of `Any`; \
+                 add a type with no `Any`, e.g. `: list[str]`",
+                &json!({"line": 0, "character": 13}),
+            ),
+            (
+                "parameter `deps` of `f` is typed `list` by its default, a list of `Any`; \
+                 add `: heph.types.Deps`",
+                &json!({"line": 0, "character": 24}),
+            ),
+        ],
+        "a mark on each container default, none on `n`"
     );
 }
 

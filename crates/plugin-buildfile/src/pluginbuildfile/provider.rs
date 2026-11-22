@@ -1,12 +1,14 @@
 use crate::pluginbuildfile::checks::loads::walk_package;
 use crate::pluginbuildfile::checks::targets::{self, CheckKind, ChecksOptions, ShadowedChecks};
 use crate::pluginbuildfile::run_file::RunResult;
+use crate::pluginbuildfile::types::DriverKwargs;
 use anyhow::Context;
 use futures::future::BoxFuture;
 use hcore::hasync::Cancellable;
 use hcore::hmemoizer::Memoizer;
 use hmodel::htaddr::Addr;
 use hmodel::htpkg::PkgBuf;
+use hplugin::driver::{DriverSchemaSlot, DriverSchemas};
 use hplugin::function::{FunctionRegistry, FunctionSlot};
 use hplugin::provider::GetError::NotFound;
 use hplugin::provider::{
@@ -185,7 +187,11 @@ pub struct Provider {
     /// engine's function slot in production ([`Provider::with_functions`]), or a
     /// finished registry (the LSP, tests).
     pub(crate) functions: FunctionSource,
-    /// Lazily-built Starlark globals (built from `functions` on first eval),
+    /// Where `heph.types.<driver>.Kwargs` comes from: the engine's driver
+    /// schema slot in production ([`Provider::with_drivers`]), or a fixed set.
+    pub(crate) drivers: DriverSource,
+    /// Lazily-built Starlark globals (built from `functions` and `drivers` on
+    /// first eval),
     /// shared with every `BuildFileLoader` so the namespace is built at most once.
     pub(crate) globals: Arc<OnceLock<Globals>>,
     /// Shared cross-run filesystem-walk cache. The package-discovery walk reads
@@ -225,6 +231,7 @@ impl Provider {
             dir_cache: Arc::new(Mutex::new(HashMap::new())),
             loads: Arc::default(),
             functions: FunctionSource::default(),
+            drivers: DriverSource::default(),
             globals: Arc::new(OnceLock::new()),
             walker: Arc::new(CachedWalker::disabled()),
             checks: None,
@@ -284,6 +291,13 @@ impl Provider {
     /// LSP and for tests that run the provider without an engine.
     pub fn with_function_registry(mut self, registry: Arc<FunctionRegistry>) -> Self {
         self.functions = FunctionSource::Fixed(registry);
+        self
+    }
+
+    /// Build `heph.types.<driver>.Kwargs` from `drivers`: the engine's slot
+    /// (`PluginInit.drivers`) in production. Without it, no driver has one.
+    pub fn with_drivers(mut self, drivers: DriverSource) -> Self {
+        self.drivers = drivers;
         self
     }
 
@@ -361,9 +375,20 @@ impl Provider {
                     .functions
                     .registry()
                     .context("reading the `heph.<plugin>.<fn>` names for build-lint-check")?;
-                // Only their digest reaches the spec.
+                let kwargs = self
+                    .drivers
+                    .kwargs()
+                    .context("reading `heph.types.<driver>.Kwargs` for build-lint-check")?;
+                // Only their digests reach the spec.
                 let fns = registry.iter().map(|(p, f, _)| (p, f));
-                targets::lint_spec(addr.clone(), &walk, opts, &self.build_file_patterns, fns)
+                targets::lint_spec(
+                    addr.clone(),
+                    &walk,
+                    opts,
+                    &self.build_file_patterns,
+                    fns,
+                    kwargs.digest(),
+                )
             }
             kind => Ok(targets::format_spec(addr.clone(), kind, &walk, opts)),
         }
@@ -878,6 +903,54 @@ impl FunctionSource {
     }
 }
 
+/// Where a buildfile provider reads the registered drivers' schemas from, and
+/// the `heph.types.<driver>.Kwargs` built from them: once per source, shared
+/// by every clone (the provider and the lint driver), since every file's
+/// evaluation and every lint run reads them.
+#[derive(Clone, Debug)]
+pub struct DriverSource {
+    /// The engine's slot (`PluginInit.drivers`), or one sealed with a fixed
+    /// set (the LSP, tests).
+    slot: Arc<DriverSchemaSlot>,
+    kwargs: Arc<OnceLock<Arc<DriverKwargs>>>,
+}
+
+impl Default for DriverSource {
+    /// No drivers: every `heph.types.<driver>` fails as an unknown driver,
+    /// naming that none is registered.
+    fn default() -> Self {
+        Self::fixed(DriverSchemas::new())
+    }
+}
+
+impl DriverSource {
+    /// The engine's slot, read on first use: an error before the engine
+    /// seals it, never an empty set cached for the provider's life.
+    pub fn engine(slot: Arc<DriverSchemaSlot>) -> Self {
+        Self {
+            slot,
+            kwargs: Arc::default(),
+        }
+    }
+
+    /// A fixed set of schemas, for callers without an engine.
+    pub fn fixed(schemas: DriverSchemas) -> Self {
+        Self::engine(DriverSchemaSlot::sealed(schemas))
+    }
+
+    /// Every driver's `Kwargs`, built on the first call. Never blocks on
+    /// anything but that first build.
+    pub(crate) fn kwargs(&self) -> anyhow::Result<Arc<DriverKwargs>> {
+        if let Some(k) = self.kwargs.get() {
+            return Ok(Arc::clone(k));
+        }
+        let schemas = self.slot.get()?;
+        Ok(Arc::clone(self.kwargs.get_or_init(|| {
+            Arc::new(DriverKwargs::from_schemas(&schemas))
+        })))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// Handle for sync tests constructing the provider: one shared runtime,
@@ -902,6 +975,29 @@ mod tests {
     use hplugin::provider::GetRequest;
     use std::fs;
     use tempfile::tempdir;
+
+    /// A source over an unsealed slot errs, and the error is not cached: the
+    /// same source (and every clone of it) builds the `Kwargs` once sealed.
+    #[test]
+    fn driver_source_read_before_seal() {
+        let slot = DriverSchemaSlot::new();
+        let source = DriverSource::engine(Arc::clone(&slot));
+        let clone = source.clone();
+        let err = source.kwargs().expect_err("unsealed");
+        assert!(
+            format!("{err:#}").contains("before every plugin was registered"),
+            "{err:#}"
+        );
+        assert!(source.kwargs.get().is_none(), "nothing cached");
+        let schemas = crate::pluginbuildfile::types::tests::test_schemas();
+        slot.seal_with(|| schemas);
+        let k = source.kwargs().expect("sealed");
+        assert!(k.at(&["bash"]).is_some());
+        assert!(
+            Arc::ptr_eq(&k, &clone.kwargs().expect("sealed")),
+            "built once, shared by clones"
+        );
+    }
 
     /// `Provider::list_packages` and the `heph.core.packages()` builtin are one
     /// list in one order.

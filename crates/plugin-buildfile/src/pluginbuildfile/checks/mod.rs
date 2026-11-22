@@ -498,7 +498,7 @@ fn cache_and_codegen_flags() {
         let opts = ChecksOptions::default();
         let spec = match kind {
             CheckKind::LintCheck => {
-                lint_spec(addr, &walk, opts, &[], std::iter::empty()).expect("spec")
+                lint_spec(addr, &walk, opts, &[], std::iter::empty(), "kwargs").expect("spec")
             }
             kind => format_spec(addr, kind, &walk, opts),
         };

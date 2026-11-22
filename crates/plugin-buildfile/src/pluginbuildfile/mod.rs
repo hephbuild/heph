@@ -37,6 +37,9 @@ pub struct PartsInit<'a> {
     pub walker: Arc<hwalk::CachedWalker>,
     /// The engine's function slot, read on the first evaluation.
     pub functions: Arc<hplugin::function::FunctionSlot>,
+    /// The engine's driver schema slot, read on the first evaluation:
+    /// `heph.types.<driver>.Kwargs` is built from it.
+    pub drivers: Arc<hplugin::driver::DriverSchemaSlot>,
     /// Where the provider records every check target a package's own target
     /// shadows (I2); the caller keeps a clone to read (`heph validate`).
     pub shadowed: ShadowedChecks,
@@ -68,6 +71,9 @@ pub fn plugin_parts(init: PartsInit<'_>, opts: &hplugin::config::Options) -> any
     // The lint driver reads the function names from the same slot the
     // provider digests them from.
     let functions = provider::FunctionSource::Engine(Arc::clone(&init.functions));
+    // And the driver kwargs from the same source as the provider, built once
+    // for both.
+    let drivers = provider::DriverSource::engine(init.drivers);
     let provider = Provider::from_options(
         init.root,
         init.skip_dirs,
@@ -77,14 +83,21 @@ pub fn plugin_parts(init: PartsInit<'_>, opts: &hplugin::config::Options) -> any
     )?
     .with_walker(init.walker)
     .with_functions(init.functions)
+    .with_drivers(drivers.clone())
     .with_checks(checks)
     .with_shadowed_checks(init.shadowed);
-    let drivers = checks::targets::CheckKind::ALL
+    let check_drivers = checks::targets::CheckKind::ALL
         .into_iter()
         .map(|k| {
-            Box::new(checks::drivers::CheckDriver::new(k, functions.clone()))
-                as Box<dyn ManagedDriver>
+            Box::new(checks::drivers::CheckDriver::new(
+                k,
+                functions.clone(),
+                drivers.clone(),
+            )) as Box<dyn ManagedDriver>
         })
         .collect();
-    Ok(Parts { provider, drivers })
+    Ok(Parts {
+        provider,
+        drivers: check_drivers,
+    })
 }

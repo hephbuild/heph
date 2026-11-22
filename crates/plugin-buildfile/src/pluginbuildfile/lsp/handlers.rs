@@ -26,10 +26,11 @@ use super::index::SharedState;
 use super::lex::{self, Bracket, Kind, NO_LINK, Tok, Tokens};
 use super::position::{self, Encoding};
 use super::site::{ArgCall, Builtin, Call, Quote, Site, Str};
+use crate::pluginbuildfile::provider::DriverSource;
 use crate::pluginbuildfile::run_file::{resolve_load_target, target_base_fields};
-use crate::pluginbuildfile::types;
+use crate::pluginbuildfile::types::{self, DriverKwargs};
 use crate::pluginbuildfile::{DEFAULT_INDENT, build_file_indent_from_options};
-use hplugin::driver::DriverSchema;
+use hplugin::driver::{DriverSchema, DriverSchemas};
 use hplugin::function::STATIC_NAMESPACES;
 use hplugin::lsp::LspEngine;
 use hplugin::provider::StateSchema;
@@ -41,6 +42,7 @@ use starlark::syntax::{AstModule, Dialect};
 use std::collections::{HashMap, HashSet};
 use std::ops::Range as Bytes;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use vendored_starlark_lsp::server::LspUri;
 use vendored_starlark_lsp::uri::file_path_to_uri;
 
@@ -48,18 +50,23 @@ use vendored_starlark_lsp::uri::file_path_to_uri;
 #[derive(Debug, Default)]
 pub(crate) struct Registry {
     pub drivers: Vec<String>,
-    pub driver_schemas: HashMap<String, DriverSchema>,
+    pub driver_schemas: DriverSchemas,
+    /// The drivers' `heph.types.<driver>.Kwargs`, built once per server start
+    /// from `driver_schemas`: the handlers read them, and the context's
+    /// evaluation picks them up when the snapshot lands.
+    pub driver_source: DriverSource,
     pub providers: Vec<String>,
     pub provider_schemas: HashMap<String, StateSchema>,
 }
 
 impl Registry {
     pub(crate) fn snapshot(engine: &dyn LspEngine) -> Registry {
-        let drivers = engine.driver_names();
-        let driver_schemas = drivers
-            .iter()
-            .filter_map(|d| engine.driver_schema(d).map(|s| (d.clone(), s)))
-            .collect();
+        let driver_schemas = engine.driver_schemas();
+        let drivers = driver_schemas.keys().cloned().collect();
+        let driver_source = DriverSource::fixed(driver_schemas.clone());
+        // Built here, on the snapshot's thread: the first handler or
+        // evaluation to ask would otherwise build it on the loop.
+        let _built = driver_source.kwargs();
         let providers = engine.provider_names();
         let provider_schemas = providers
             .iter()
@@ -68,9 +75,18 @@ impl Registry {
         Registry {
             drivers,
             driver_schemas,
+            driver_source,
             providers,
             provider_schemas,
         }
+    }
+
+    /// The drivers' `Kwargs`: none before the snapshot lands.
+    fn kwargs(&self) -> Arc<DriverKwargs> {
+        // A fixed source never fails; an empty set stands in if it did.
+        self.driver_source
+            .kwargs()
+            .unwrap_or_else(|_| DriverKwargs::empty())
     }
 }
 
@@ -240,7 +256,9 @@ pub(crate) fn items(site: &Site, ctx: &Ctx<'_>) -> Vec<CompletionItem> {
             Some(value),
         ),
         Site::PluginNamespace { edit, .. } => (namespaces(ctx), edit.clone(), None),
-        Site::PluginMember { plugin, edit, .. } => (members(plugin, ctx), edit.clone(), None),
+        Site::PluginMember {
+            plugin, path, edit, ..
+        } => (members(plugin, path, ctx), edit.clone(), None),
         Site::Address { value } => (
             addresses(&value.prefix, ctx),
             value.edit.clone(),
@@ -714,18 +732,12 @@ fn namespaces(ctx: &Ctx<'_>) -> Vec<Candidate> {
 }
 
 /// `heph.<plugin>.` → that plugin's functions (`heph.core.` → the builtins,
-/// `heph.types.` → the type aliases).
-fn members(plugin: &str, ctx: &Ctx<'_>) -> Vec<Candidate> {
+/// `heph.types.` → the type aliases and the driver namespaces,
+/// `heph.types.<path>.` → that driver's `Kwargs` and the namespaces under it).
+fn members(plugin: &str, path: &[String], ctx: &Ctx<'_>) -> Vec<Candidate> {
     if plugin == types::NAMESPACE {
-        return types::aliases()
-            .iter()
-            .map(|a| Candidate {
-                label: a.name.to_string(),
-                detail: Some(a.expansion()),
-                doc: a.markdown(),
-                insert: a.name.to_string(),
-            })
-            .collect();
+        let path: Vec<&str> = path.iter().map(String::as_str).collect();
+        return types_members(&ctx.registry.kwargs(), &path);
     }
     if plugin == "core" {
         return ctx
@@ -755,6 +767,61 @@ fn members(plugin: &str, ctx: &Ctx<'_>) -> Vec<Candidate> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// `heph.types.<path>.`: the flat aliases at the top, then `Kwargs` where
+/// `path` names a driver, then the driver namespaces under `path`.
+fn types_members(kwargs: &DriverKwargs, path: &[&str]) -> Vec<Candidate> {
+    let mut out: Vec<Candidate> = Vec::new();
+    if path.is_empty() {
+        out.extend(types::aliases().iter().map(|a| Candidate {
+            label: a.name.to_string(),
+            detail: Some(a.expansion()),
+            doc: a.markdown(),
+            insert: a.name.to_string(),
+        }));
+    }
+    if let Some(k) = kwargs.at(path) {
+        out.push(Candidate {
+            label: types::KWARGS.to_string(),
+            detail: Some(format!("**kwargs of the `{}` driver", k.driver)),
+            doc: k.markdown(),
+            insert: types::KWARGS.to_string(),
+        });
+    }
+    out.extend(kwargs.children(path).into_iter().map(|seg| Candidate {
+        label: seg.to_string(),
+        detail: Some("driver namespace".to_string()),
+        doc: driver_namespace_doc(kwargs, path, seg),
+        insert: seg.to_string(),
+    }));
+    out
+}
+
+/// The hover of `heph.types.<path>.<name>`: the same doc its completion item
+/// carries ([`types_members`]).
+fn types_member_doc(kwargs: &DriverKwargs, path: &[&str], name: &str) -> Option<String> {
+    types_members(kwargs, path)
+        .into_iter()
+        .find(|c| c.label == name)
+        .map(|c| c.doc)
+}
+
+/// The doc of the driver namespace `heph.types.<path>.<seg>`: its members.
+fn driver_namespace_doc(kwargs: &DriverKwargs, path: &[&str], seg: &str) -> String {
+    let mut full: Vec<&str> = path.to_vec();
+    full.push(seg);
+    let name = full.join(".");
+    let mut members: Vec<String> = Vec::new();
+    if kwargs.at(&full).is_some() {
+        members.push(format!("`{}`", types::KWARGS));
+    }
+    members.extend(kwargs.children(&full).into_iter().map(|c| format!("`{c}`")));
+    format!(
+        "**`heph.{}.{name}`**\n\nA driver namespace. Members: {}.",
+        types::NAMESPACE,
+        members.join(", ")
+    )
 }
 
 /// Target names declared in the open document: `name = "…"` keyword arguments.
@@ -968,10 +1035,13 @@ pub(crate) fn hover(site: &Site, ctx: &Ctx<'_>) -> Option<Hover> {
             };
             (md, edit.clone())
         }
-        Site::PluginMember { plugin, edit, .. } => {
+        Site::PluginMember {
+            plugin, path, edit, ..
+        } => {
             let name = ctx.text.get(edit.clone())?;
             let md = if plugin == types::NAMESPACE {
-                types::get(name)?.markdown()
+                let path: Vec<&str> = path.iter().map(String::as_str).collect();
+                types_member_doc(&ctx.registry.kwargs(), &path, name)?
             } else if plugin == "core" {
                 ctx.shared
                     .core_members
@@ -1353,6 +1423,55 @@ mod tests {
         let root = Path::new("/ws");
         assert_eq!(pkg_of(root, Path::new("/ws/a/b/BUILD")), "a/b");
         assert_eq!(pkg_of(root, Path::new("/ws/BUILD")), "");
+    }
+
+    #[test]
+    fn types_members_nest_by_driver_name_segment() {
+        let kwargs = crate::pluginbuildfile::types::tests::test_kwargs();
+        let labels = |path: &[&str]| -> Vec<String> {
+            types_members(&kwargs, path)
+                .into_iter()
+                .map(|c| c.label)
+                .collect()
+        };
+        let top = labels(&[]);
+        let aliases: Vec<String> = types::aliases()
+            .iter()
+            .map(|a| a.name.to_string())
+            .collect();
+        assert_eq!(
+            top.get(..aliases.len()),
+            Some(aliases.as_slice()),
+            "aliases first"
+        );
+        assert_eq!(
+            top.get(aliases.len()..),
+            Some(["bash", "buildfile", "oci"].map(String::from).as_slice()),
+            "then each driver name's first segment, once"
+        );
+        assert_eq!(labels(&["bash"]), ["Kwargs"]);
+        assert_eq!(
+            labels(&["oci"]),
+            ["Kwargs", "image"],
+            "a driver that is also a namespace"
+        );
+        assert_eq!(labels(&["oci", "image"]), ["Kwargs"]);
+        assert!(labels(&["nope"]).is_empty());
+        assert!(labels(&["oci", "image", "Kwargs"]).is_empty());
+
+        let hover = types_member_doc(&kwargs, &["oci", "image"], "Kwargs").expect("Kwargs hover");
+        assert!(hover.contains("heph.types.oci.image.Kwargs"), "{hover}");
+        assert!(
+            hover.contains("- `base`: `None | str`"),
+            "each key with its type: {hover}"
+        );
+        assert!(!hover.contains("`driver`"), "driver is not a key: {hover}");
+        let ns = types_member_doc(&kwargs, &[], "oci").expect("namespace hover");
+        assert!(ns.contains("`Kwargs`, `image`"), "{ns}");
+        assert!(
+            types_member_doc(&kwargs, &["bash"], "Deps").is_none(),
+            "a flat alias lives at the top only"
+        );
     }
 
     #[test]

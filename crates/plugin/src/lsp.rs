@@ -4,7 +4,7 @@
 //! `Arc<dyn LspEngine>`.
 
 use crate::config::Options;
-use crate::driver::DriverSchema;
+use crate::driver::{DriverSchema, DriverSchemas};
 use crate::function::FunctionRegistry;
 use crate::provider::StateSchema;
 use std::path::Path;
@@ -20,6 +20,22 @@ pub trait LspEngine: Send + Sync {
     fn driver_schema(&self, name: &str) -> Option<DriverSchema>;
     /// All registered driver names, sorted (for target-kind completion).
     fn driver_names(&self) -> Vec<String>;
+    /// Every registered driver's schema, by name (for
+    /// `heph.types.<driver>.Kwargs`). Blocks like [`Self::driver_names`]:
+    /// the LSP reads it off its loop, with the rest of the registry snapshot.
+    ///
+    /// The default derives it from the two methods above; the engine returns
+    /// the set it sealed for its plugins, so the editor's `Kwargs` are
+    /// evaluation's.
+    fn driver_schemas(&self) -> DriverSchemas {
+        self.driver_names()
+            .into_iter()
+            .filter_map(|name| {
+                let schema = self.driver_schema(&name)?;
+                Some((name, schema))
+            })
+            .collect()
+    }
     /// The registered providers that declare a state schema, sorted (for
     /// `provider_state(provider = "…")` completion).
     fn provider_names(&self) -> Vec<String>;

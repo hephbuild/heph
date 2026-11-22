@@ -43,7 +43,9 @@ more than one folder gets a `window/showMessage` warning and only the first is
 used. A BUILD file opened outside the repo gets the stock answers only, with
 `reason: outside_root`. The driver/provider registry is read once per server
 start; until that snapshot lands, heph answers with the stock results and
-`reason: providers_loading`.
+`reason: providers_loading`. A document evaluated before it lands lacks the
+drivers' `heph.types.<driver>.Kwargs`, so when it lands every open document is
+evaluated again and its diagnostics are republished, with no edit needed.
 
 ## Site kinds
 
@@ -57,7 +59,7 @@ start; until that snapshot lands, heph answers with the stock results and
 | `state_key` | a keyword-name position inside `provider_state(` | `provider` + the selected provider's schema, minus keys present | the field's type and doc | — |
 | `arg_key` | a keyword-name position inside a call to any other plain-named function (`my_rule(`, `glob(`; not `x.f(`, not a `def`'s parameters) | the callee's unwritten parameters, each inserting `name = `, ranked first; then stock (see below) | stock | stock |
 | `plugin_namespace` | after `heph.` | plugins, `core` and `types` | — | — |
-| `plugin_member` | after `heph.<plugin>.`, or on the function name | the plugin's functions; under `heph.types.`, every type alias | the function's signature and doc; for an alias, its expansion | — |
+| `plugin_member` | after `heph.<plugin>.`, or on the function name | the plugin's functions; under `heph.types.`, every type alias, then the driver namespaces; under `heph.types.<driver…>.`, `Kwargs` where the path names a driver, then the namespaces under it | the function's signature and doc; for an alias, its expansion; for `Kwargs`, its keys and their types, each key the driver requires marked `(required by the driver)` | — |
 | `address` | a string starting `//` or `:`, inside a call or not | packages, then targets, both forms | — | the call that declared the target (see below), or the package's BUILD file |
 | `load_path` | the first argument of `load(` | package paths | — | the loaded file |
 | `load_symbol` | a later string argument of `load(` | the loaded file's exported `def`s | — | the `def` line, from the loaded file's AST |
