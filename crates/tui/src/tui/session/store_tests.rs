@@ -641,7 +641,9 @@ fn spans_stay_flat() {
             },
         }),
     );
-    for addr in ["//d:shared", "//d:a", "//d:b", "//d:top"] {
+    // Two result scopes of `//d:shared` (one per output selection), each
+    // with its own end: two flat spans, never one nested in another.
+    for addr in ["//d:shared", "//d:shared", "//d:a", "//d:b", "//d:top"] {
         insert(&mut writer, &end_record(tick(), addr));
     }
     let conn = writer.finish(tick(), Some(0), false).expect("finish");
@@ -659,6 +661,7 @@ fn spans_stay_flat() {
         vec![
             ("//d:a".to_owned(), session),
             ("//d:b".to_owned(), session),
+            ("//d:shared".to_owned(), session),
             ("//d:shared".to_owned(), session),
             ("//d:top".to_owned(), session),
         ]

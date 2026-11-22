@@ -10,7 +10,8 @@
 //! never by a dependent, so a memoized result reached from several
 //! dependents is drawn once.
 
-use std::collections::{BTreeMap, HashMap};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use hcore::events::BuildEventKind;
 use serde_json::{Map, Value};
@@ -59,12 +60,13 @@ pub fn phase_class(name: &str) -> Option<&'static str> {
     })
 }
 
+/// A `spans` row. Every row of one [`Deriver`] is its session's, so the
+/// session id is the writer's to add, not a copy per row.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SpanRow {
-    pub session_id: String,
     pub span_id: i64,
     pub parent_span_id: Option<i64>,
-    pub name: String,
+    pub name: Cow<'static, str>,
     pub class: Option<&'static str>,
     pub addr: Option<String>,
     pub driver: Option<String>,
@@ -77,7 +79,6 @@ pub(crate) struct SpanRow {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct EventRow {
-    pub session_id: String,
     pub span_id: i64,
     pub name: &'static str,
     pub time_us: i64,
@@ -86,7 +87,6 @@ pub(crate) struct EventRow {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct MetricRow {
-    pub session_id: String,
     pub name: &'static str,
     pub kind: &'static str,
     pub unit: &'static str,
@@ -141,6 +141,31 @@ struct OpenResult {
     attrs: Map<String, Value>,
 }
 
+/// The open results of one addr: one per result scope (one per output
+/// selection asked of it), oldest first. A `ResultEnd` closes the oldest,
+/// as the engine pairs them (`ResultEnd.spans`: "pair each `ResultStart`
+/// with the next `ResultEnd` of the same addr, in stream order").
+#[derive(Debug, Default)]
+struct OpenAddr {
+    results: VecDeque<OpenResult>,
+    /// The driver of the run these overlapping results share, once one
+    /// started: a result that waited on it ran too.
+    ran: Option<String>,
+    /// The outcome counted once the last of them closes.
+    outcome: Option<&'static str>,
+}
+
+/// Which of two outcomes a target's overlapping results count as: the one
+/// that says the most about the run (the `targets` view picks the same).
+fn outcome_rank(outcome: &str) -> u8 {
+    match outcome {
+        "failed" => 0,
+        "ran" => 1,
+        "cancelled" => 2,
+        _ => 3,
+    }
+}
+
 #[derive(Debug)]
 struct PoolAcc {
     unit: &'static str,
@@ -193,7 +218,7 @@ pub(crate) struct Deriver {
     session_id: String,
     started_us: i64,
     next_span: i64,
-    open: HashMap<String, OpenResult>,
+    open: HashMap<String, OpenAddr>,
     first_result_us: Option<i64>,
     last_result_end_us: Option<i64>,
     units: BTreeMap<String, String>,
@@ -232,24 +257,39 @@ impl Deriver {
         id
     }
 
-    fn open_result(&mut self, addr: &str, t: i64) -> &mut OpenResult {
-        let next = &mut self.next_span;
-        self.open.entry(addr.to_owned()).or_insert_with(|| {
-            let span_id = *next;
-            *next += 1;
-            OpenResult {
-                span_id,
-                start_us: t,
-                driver: None,
-                executed: false,
-                attrs: Map::new(),
-            }
-        })
+    /// The session id every row of this deriver belongs to.
+    pub(crate) fn session_id(&self) -> &str {
+        &self.session_id
     }
 
-    fn event(&self, span_id: i64, name: &'static str, t: i64, attributes: Option<String>) -> Row {
+    /// Open a result of `addr` behind any already open. One that joins a
+    /// run already started shares it.
+    fn start_result(&mut self, addr: &str, t: i64) {
+        let span_id = self.alloc();
+        if !self.open.contains_key(addr) {
+            self.open.insert(addr.to_owned(), OpenAddr::default());
+        }
+        if let Some(entry) = self.open.get_mut(addr) {
+            entry.results.push_back(OpenResult {
+                span_id,
+                start_us: t,
+                driver: entry.ran.clone(),
+                executed: entry.ran.is_some(),
+                attrs: Map::new(),
+            });
+        }
+    }
+
+    /// The oldest open result of `addr`: the one an addr's run, cache
+    /// probes and outcome attach to. Of overlapping results of one target,
+    /// the first to start is the one that started the lookup; the later ones
+    /// found it in flight and waited on it.
+    fn oldest(&mut self, addr: &str) -> Option<&mut OpenResult> {
+        self.open.get_mut(addr)?.results.front_mut()
+    }
+
+    fn event(span_id: i64, name: &'static str, t: i64, attributes: Option<String>) -> Row {
         Row::Event(EventRow {
-            session_id: self.session_id.clone(),
             span_id,
             name,
             time_us: t,
@@ -258,11 +298,33 @@ impl Deriver {
     }
 
     fn span_of(&self, addr: &str) -> i64 {
-        self.open.get(addr).map_or(SESSION_SPAN, |o| o.span_id)
+        self.open
+            .get(addr)
+            .and_then(|e| e.results.front())
+            .map_or(SESSION_SPAN, |o| o.span_id)
+    }
+
+    /// Count a closed result's outcome toward `heph.session.results`, once
+    /// per target per resolution: overlapping results of one addr count once,
+    /// when the last of them closes, as the outcome [`outcome_rank`] ranks
+    /// first.
+    fn close_outcome(&mut self, addr: &str, outcome: &'static str) {
+        let Some(entry) = self.open.get_mut(addr) else {
+            *self.outcomes.entry(outcome).or_default() += 1;
+            return;
+        };
+        let best = match entry.outcome {
+            Some(o) if outcome_rank(o) <= outcome_rank(outcome) => o,
+            _ => outcome,
+        };
+        entry.outcome = Some(best);
+        if entry.results.is_empty() {
+            self.open.remove(addr);
+            *self.outcomes.entry(best).or_default() += 1;
+        }
     }
 
     fn metric(
-        &self,
         name: &'static str,
         kind: &'static str,
         unit: &'static str,
@@ -271,7 +333,6 @@ impl Deriver {
         attributes: Option<String>,
     ) -> Row {
         Row::Metric(MetricRow {
-            session_id: self.session_id.clone(),
             name,
             kind,
             unit,
@@ -307,7 +368,12 @@ impl Deriver {
                 if let Some(s) = session {
                     a.insert("heph.lock.holder_session".into(), Value::from(s.as_str()));
                 }
-                rows.push(self.event(SESSION_SPAN, "heph.lock_holder", t, attrs_json(&a)));
+                rows.push(Self::event(
+                    SESSION_SPAN,
+                    "heph.lock_holder",
+                    t,
+                    attrs_json(&a),
+                ));
             }
             SessionRecordKind::Approval { prompt, .. } => {
                 let name = if prompt.is_some() {
@@ -315,10 +381,10 @@ impl Deriver {
                 } else {
                     "heph.approval.answered"
                 };
-                rows.push(self.event(SESSION_SPAN, name, t, None));
+                rows.push(Self::event(SESSION_SPAN, name, t, None));
             }
             SessionRecordKind::Truncated => {
-                rows.push(self.event(SESSION_SPAN, "heph.truncated", t, None));
+                rows.push(Self::event(SESSION_SPAN, "heph.truncated", t, None));
             }
             SessionRecordKind::Log { .. }
             | SessionRecordKind::End { .. }
@@ -337,7 +403,7 @@ impl Deriver {
             K::RequestConfig { units, .. } => self.units.clone_from(units),
             K::ResultStart { addr } => {
                 self.first_result_us.get_or_insert(t);
-                self.open_result(addr, t);
+                self.start_result(addr, t);
             }
             K::ExecuteStart {
                 addr,
@@ -347,16 +413,30 @@ impl Deriver {
                 queued_ms,
                 ..
             } => {
-                let units = self.units.clone();
-                let open = self.open_result(addr, t);
-                open.executed = true;
-                open.driver = Some(driver.clone());
+                if self.span_of(addr) == SESSION_SPAN {
+                    // A run with no result open: a span of its own.
+                    self.start_result(addr, t);
+                }
+                let Some(entry) = self.open.get_mut(addr.as_str()) else {
+                    return;
+                };
+                // Every open result of the addr waits on this one run; the
+                // oldest is the one that started it, and carries what it
+                // reserved.
+                for r in &mut entry.results {
+                    r.executed = true;
+                    r.driver = Some(driver.clone());
+                }
+                entry.ran = Some(driver.clone());
+                let Some(open) = entry.results.front_mut() else {
+                    return;
+                };
                 for (prefix, amounts) in [
                     ("heph.resources.declared.", declared),
                     ("heph.resources.reserved.", reserved),
                 ] {
                     for (pool, amount) in amounts.iter().flatten() {
-                        let (_, div) = pool_unit(&units, pool);
+                        let (_, div) = pool_unit(&self.units, pool);
                         let v = *amount as f64 / div;
                         open.attrs.insert(format!("{prefix}{pool}"), Value::from(v));
                     }
@@ -367,20 +447,40 @@ impl Deriver {
                 }
             }
             K::LocalCacheHit { addr } => {
-                rows.push(self.event(self.span_of(addr), "heph.cache.local_hit", t, None));
+                rows.push(Self::event(
+                    self.span_of(addr),
+                    "heph.cache.local_hit",
+                    t,
+                    None,
+                ));
             }
             K::LocalCacheMiss { addr } => {
-                rows.push(self.event(self.span_of(addr), "heph.cache.local_miss", t, None));
+                rows.push(Self::event(
+                    self.span_of(addr),
+                    "heph.cache.local_miss",
+                    t,
+                    None,
+                ));
             }
             K::RemoteCacheHit { addr, .. } => {
-                rows.push(self.event(self.span_of(addr), "heph.cache.remote_hit", t, None));
+                rows.push(Self::event(
+                    self.span_of(addr),
+                    "heph.cache.remote_hit",
+                    t,
+                    None,
+                ));
             }
             K::RemoteCacheMiss { addr, .. } => {
-                rows.push(self.event(self.span_of(addr), "heph.cache.remote_miss", t, None));
+                rows.push(Self::event(
+                    self.span_of(addr),
+                    "heph.cache.remote_miss",
+                    t,
+                    None,
+                ));
             }
             K::CacheOutcome { addr, outcome } => {
                 let v = serde_json::to_value(outcome).unwrap_or(Value::Null);
-                if let Some(open) = self.open.get_mut(addr.as_str()) {
+                if let Some(open) = self.oldest(addr) {
                     open.attrs.insert("heph.cache".into(), v);
                 }
             }
@@ -390,7 +490,7 @@ impl Deriver {
                     "heph.cache.was".into(),
                     serde_json::to_value(was).unwrap_or(Value::Null),
                 );
-                rows.push(self.event(
+                rows.push(Self::event(
                     self.span_of(addr),
                     "heph.cache.hit_rebuilt",
                     t,
@@ -410,7 +510,12 @@ impl Deriver {
                     a.insert("heph.codegen.reason".into(), Value::from(r.as_str()));
                 }
                 let span = addr.as_deref().map_or(SESSION_SPAN, |a| self.span_of(a));
-                rows.push(self.event(span, "heph.codegen.excluded", t, attrs_json(&a)));
+                rows.push(Self::event(
+                    span,
+                    "heph.codegen.excluded",
+                    t,
+                    attrs_json(&a),
+                ));
             }
             K::PoolUsage {
                 pool,
@@ -438,7 +543,11 @@ impl Deriver {
                 ..
             } => {
                 self.last_result_end_us = Some(t);
-                let open = self.open.remove(addr.as_str());
+                // The oldest open result of the addr is the one this ends.
+                let open = self
+                    .open
+                    .get_mut(addr.as_str())
+                    .and_then(|e| e.results.pop_front());
                 let (span_id, start_us, driver, executed, mut attrs) = match open {
                     Some(o) => (o.span_id, o.start_us, o.driver, o.executed, o.attrs),
                     None => (self.alloc(), t, None, false, Map::new()),
@@ -452,7 +561,7 @@ impl Deriver {
                 } else {
                     "hit"
                 };
-                *self.outcomes.entry(outcome).or_default() += 1;
+                self.close_outcome(addr, outcome);
                 if let Some(u) = upstream_of {
                     attrs.insert("heph.upstream_of".into(), Value::from(u.as_str()));
                 }
@@ -460,10 +569,9 @@ impl Deriver {
                     attrs.insert("heph.timed_out".into(), Value::from(true));
                 }
                 rows.push(Row::Span(SpanRow {
-                    session_id: self.session_id.clone(),
                     span_id,
                     parent_span_id: Some(SESSION_SPAN),
-                    name: "heph.result".to_owned(),
+                    name: Cow::Borrowed("heph.result"),
                     class: None,
                     addr: Some(addr.clone()),
                     driver: driver.clone(),
@@ -519,11 +627,10 @@ impl Deriver {
         for p in k.spans {
             let span_id = self.alloc();
             rows.push(Row::Span(SpanRow {
-                session_id: self.session_id.clone(),
                 span_id,
                 parent_span_id: Some(parent),
                 class: phase_class(&p.name),
-                name: p.name,
+                name: Cow::Owned(p.name),
                 addr: Some(addr.to_owned()),
                 driver: driver.map(str::to_owned),
                 outcome: None,
@@ -547,9 +654,23 @@ impl Deriver {
         a.insert("heph.pool".into(), Value::from(pool));
         let attrs = attrs_json(&a);
         let (held_v, cap_v) = (held as f64 / div, capacity as f64 / div);
-        rows.push(self.metric("heph.pool.capacity", "gauge", unit, t, cap_v, attrs.clone()));
-        rows.push(self.metric("heph.pool.held", "gauge", unit, t, held_v, attrs.clone()));
-        rows.push(self.metric(
+        rows.push(Self::metric(
+            "heph.pool.capacity",
+            "gauge",
+            unit,
+            t,
+            cap_v,
+            attrs.clone(),
+        ));
+        rows.push(Self::metric(
+            "heph.pool.held",
+            "gauge",
+            unit,
+            t,
+            held_v,
+            attrs.clone(),
+        ));
+        rows.push(Self::metric(
             "heph.pool.waiting",
             "gauge",
             "1",
@@ -558,7 +679,7 @@ impl Deriver {
             attrs.clone(),
         ));
         if pool == "sandbox" {
-            rows.push(self.metric(
+            rows.push(Self::metric(
                 "heph.pool.removals_pending",
                 "gauge",
                 "1",
@@ -589,14 +710,20 @@ impl Deriver {
     /// counters.
     pub(crate) fn finish(&mut self, ended_ms: u64, rows: &mut Vec<Row>) {
         let end = us(ended_ms).max(self.started_us);
-        let mut open: Vec<(String, OpenResult)> = self.open.drain().collect();
+        let mut open: Vec<(String, OpenResult)> = Vec::new();
+        for (addr, entry) in self.open.drain() {
+            // Some of a target's overlapping results closed: it resolved.
+            if let Some(outcome) = entry.outcome {
+                *self.outcomes.entry(outcome).or_default() += 1;
+            }
+            open.extend(entry.results.into_iter().map(|o| (addr.clone(), o)));
+        }
         open.sort_by_key(|(_, o)| o.span_id);
         for (addr, o) in open {
             rows.push(Row::Span(SpanRow {
-                session_id: self.session_id.clone(),
                 span_id: o.span_id,
                 parent_span_id: Some(SESSION_SPAN),
-                name: "heph.result".to_owned(),
+                name: Cow::Borrowed("heph.result"),
                 class: None,
                 addr: Some(addr),
                 driver: o.driver,
@@ -607,12 +734,11 @@ impl Deriver {
                 attributes: attrs_json(&o.attrs),
             }));
         }
-        let span = |id: i64, parent: Option<i64>, name: &str, start: i64, stop: i64| {
+        let span = |id: i64, parent: Option<i64>, name: &'static str, start: i64, stop: i64| {
             Row::Span(SpanRow {
-                session_id: self.session_id.clone(),
                 span_id: id,
                 parent_span_id: parent,
-                name: name.to_owned(),
+                name: Cow::Borrowed(name),
                 class: None,
                 addr: None,
                 driver: None,
@@ -659,10 +785,8 @@ impl Deriver {
             };
             let peak = acc.peak as f64 / acc.div;
             let (unit, waiting) = (acc.unit, acc.waiting_us);
-            let session_id = self.session_id.clone();
             let m = |name, kind, unit, value| {
                 Row::Metric(MetricRow {
-                    session_id: session_id.clone(),
                     name,
                     kind,
                     unit,
@@ -683,7 +807,7 @@ impl Deriver {
         for (outcome, n) in &self.outcomes {
             let mut a = Map::new();
             a.insert("heph.outcome".into(), Value::from(*outcome));
-            rows.push(self.metric(
+            rows.push(Self::metric(
                 "heph.session.results",
                 "counter",
                 "1",

@@ -914,7 +914,7 @@ impl Writer {
         if self.rows.is_empty() {
             return Ok(());
         }
-        let bytes = write_rows(&self.conn, &mut self.rows)?;
+        let bytes = write_rows(&self.conn, self.deriver.session_id(), &mut self.rows)?;
         self.explorer_bytes = self.explorer_bytes.saturating_add(bytes);
         Ok(())
     }
@@ -986,7 +986,7 @@ impl Writer {
 }
 
 /// Insert derived rows; the bytes they add, roughly, toward the ceiling.
-fn write_rows(conn: &Connection, rows: &mut Vec<Row>) -> rusqlite::Result<u64> {
+fn write_rows(conn: &Connection, session_id: &str, rows: &mut Vec<Row>) -> rusqlite::Result<u64> {
     let mut bytes = 0u64;
     for row in rows.drain(..) {
         bytes = bytes.saturating_add(row.approx_bytes());
@@ -998,17 +998,17 @@ fn write_rows(conn: &Connection, rows: &mut Vec<Row>) -> rusqlite::Result<u64> {
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 )?
                 .execute(params![
-                    s.session_id,
+                    session_id,
                     s.span_id,
                     s.parent_span_id,
-                    s.name,
+                    s.name.as_ref(),
                     s.class,
                     s.addr,
                     s.driver,
                     s.outcome,
                     s.start_us,
                     s.end_us,
-                    s.end_us - s.start_us,
+                    s.end_us.saturating_sub(s.start_us),
                     s.status,
                     s.attributes,
                 ])?;
@@ -1019,7 +1019,7 @@ fn write_rows(conn: &Connection, rows: &mut Vec<Row>) -> rusqlite::Result<u64> {
                      VALUES (?1, ?2, ?3, ?4, ?5)",
                 )?
                 .execute(params![
-                    e.session_id,
+                    session_id,
                     e.span_id,
                     e.name,
                     e.time_us,
@@ -1032,7 +1032,7 @@ fn write_rows(conn: &Connection, rows: &mut Vec<Row>) -> rusqlite::Result<u64> {
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 )?
                 .execute(params![
-                    m.session_id,
+                    session_id,
                     m.name,
                     m.kind,
                     m.unit,
@@ -1080,12 +1080,12 @@ pub fn rederive(conn: &Connection) -> rusqlite::Result<()> {
                 &body,
                 &mut rows,
             );
-            write_rows(conn, &mut rows)?;
+            write_rows(conn, &id, &mut rows)?;
         }
     }
     let end = ended.and_then(|e| u64::try_from(e).ok()).unwrap_or(last_at);
     deriver.finish(end, &mut rows);
-    write_rows(conn, &mut rows)?;
+    write_rows(conn, &id, &mut rows)?;
     conn.execute("UPDATE session SET derivation = ?1", params![DERIVATION])?;
     Ok(())
 }
