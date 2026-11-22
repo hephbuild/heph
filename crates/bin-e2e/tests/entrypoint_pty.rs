@@ -136,8 +136,7 @@ while true; do sleep 0.05 2>/dev/null || true; done
 """)
 target(name = "fgwork", driver = "bash", entrypoint = True, run = """
 trap 'echo "got-""int"' INT
-echo "fgwork-""ready"
-sleep 100 || true
+( echo "fgwork-""ready"; exec sleep 100 ) || true
 echo "sleep-was-""cut"
 exit 9
 """)
@@ -1241,6 +1240,13 @@ fn default_run_signals_forwarded_once() -> anyhow::Result<()> {
 /// A signal to heph reaches the tool's whole group, so a `sleep` in the
 /// foreground of a script is cut short: bash only runs its trap once that child
 /// is gone, and it is sleeping well past the deadline.
+///
+/// The foreground child prints the ready line itself, from a subshell that then
+/// `exec`s the sleep. Printed by bash before `sleep 100`, the line could reach
+/// us before the sleep existed: bash takes the signal itself in that window and
+/// defers its trap until the sleep, which never got it, ends 100s later. That is
+/// what flaked on darwin/arm64, where the fork is slow. The subshell's INT is
+/// back to its default once it runs, so from its line on a signal ends it.
 #[test]
 fn relay_reaches_the_foreground_group() -> anyhow::Result<()> {
     let dist = Dist::locate();
