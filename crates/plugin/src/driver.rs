@@ -2318,10 +2318,12 @@ pub struct RunRequest<'a, 'io> {
     /// `ManagedRunRequest.allotment` (since 0.17.4).
     pub allotment: Option<Allotment>,
     /// The clock the target's `timeout` runs on, for a driver that
-    /// [arms it](Driver::arms_run_clock). Inert (the default) for every other
-    /// run: a target with no timeout, a `--shell`, a driver that does not arm
-    /// it. In-process only: it never crosses the plugin seam, so a cdylib
-    /// driver's run is timed whole.
+    /// [arms it](Driver::arms_run_clock), and the spawn and exit its phase
+    /// spans read. Live whenever either is wanted: a target with a timeout,
+    /// or a request something listens to (a run without a timeout keeps its
+    /// own stop, nothing enforced). Inert (the default) for a `--shell` and a
+    /// driver that does not arm it. In-process only: it never crosses the
+    /// plugin seam, so a cdylib driver's run is timed whole.
     pub clock: RunClock,
     /// The [`stdout`](Self::stdout) / [`stderr`](Self::stderr) writers *are*
     /// the run's log: the host scrubs secrets out of them, stores the bytes
@@ -2365,24 +2367,41 @@ pub enum RunClockState {
 /// default is inert: both calls do nothing.
 ///
 /// Nothing here reaches the run: the driver must not tell the process when
-/// its clock started, any more than its limit (`docs/TIMEOUTS.md`).
+/// its clock started, any more than its limit (`docs/TIMEOUTS.md`). The
+/// instants the state changed at ([`spawned_at`](Self::spawned_at),
+/// [`exited_at`](Self::exited_at)) are the engine's, for the phase spans a
+/// `ResultEnd` carries, and are recorded beside the state, never sent.
 #[derive(Debug, Clone, Default)]
-pub struct RunClock(Option<std::sync::Arc<tokio::sync::watch::Sender<RunClockState>>>);
+pub struct RunClock(Option<std::sync::Arc<RunClockInner>>);
+
+#[derive(Debug)]
+struct RunClockInner {
+    tx: tokio::sync::watch::Sender<RunClockState>,
+    spawned: std::sync::OnceLock<std::time::Instant>,
+    exited: std::sync::OnceLock<std::time::Instant>,
+}
 
 impl RunClock {
     /// A live clock, and the engine's end of it.
     pub fn new() -> (Self, tokio::sync::watch::Receiver<RunClockState>) {
         let (tx, rx) = tokio::sync::watch::channel(RunClockState::Idle);
-        (Self(Some(std::sync::Arc::new(tx))), rx)
+        let inner = RunClockInner {
+            tx,
+            spawned: std::sync::OnceLock::new(),
+            exited: std::sync::OnceLock::new(),
+        };
+        (Self(Some(std::sync::Arc::new(inner))), rx)
     }
 
     /// The target's process has been spawned: its timeout runs from here.
     pub fn start(&self) {
-        if let Some(tx) = &self.0 {
-            tx.send_if_modified(|s| {
+        if let Some(inner) = &self.0 {
+            inner.tx.send_if_modified(|s| {
                 let idle = *s == RunClockState::Idle;
                 if idle {
                     *s = RunClockState::Running;
+                    // Set once: the clock leaves `Idle` once.
+                    let _first: Result<(), _> = inner.spawned.set(std::time::Instant::now());
                 }
                 idle
             });
@@ -2391,13 +2410,74 @@ impl RunClock {
 
     /// The target's process has exited: its timeout no longer runs.
     pub fn stop(&self) {
-        if let Some(tx) = &self.0 {
-            tx.send_if_modified(|s| {
+        if let Some(inner) = &self.0 {
+            inner.tx.send_if_modified(|s| {
                 let changed = *s != RunClockState::Stopped;
+                if changed {
+                    // Set once: the clock reaches `Stopped` once.
+                    let _first: Result<(), _> = inner.exited.set(std::time::Instant::now());
+                }
                 *s = RunClockState::Stopped;
                 changed
             });
         }
+    }
+
+    /// When [`start`](Self::start) moved the clock to running: `None` for an
+    /// inert clock, or one that never started (stopped first, or not yet).
+    pub fn spawned_at(&self) -> Option<std::time::Instant> {
+        self.0.as_ref().and_then(|i| i.spawned.get().copied())
+    }
+
+    /// When [`stop`](Self::stop) stopped the clock: `None` for an inert
+    /// clock, or one not stopped yet.
+    pub fn exited_at(&self) -> Option<std::time::Instant> {
+        self.0.as_ref().and_then(|i| i.exited.get().copied())
+    }
+}
+
+#[cfg(test)]
+mod run_clock_tests {
+    use super::*;
+
+    #[test]
+    fn instants_mark_the_state_changes_only() {
+        let (clock, rx) = RunClock::new();
+        assert_eq!((clock.spawned_at(), clock.exited_at()), (None, None));
+
+        clock.start();
+        let spawned = clock.spawned_at().expect("set when the clock starts");
+        assert_eq!(clock.exited_at(), None, "not stopped yet");
+        // A second start changes no state, so it moves no instant.
+        clock.start();
+        assert_eq!(clock.spawned_at(), Some(spawned));
+
+        clock.stop();
+        let exited = clock.exited_at().expect("set when the clock stops");
+        assert!(exited >= spawned);
+        clock.stop();
+        clock.start();
+        assert_eq!(clock.exited_at(), Some(exited));
+        assert_eq!(clock.spawned_at(), Some(spawned));
+        assert_eq!(*rx.borrow(), RunClockState::Stopped);
+    }
+
+    #[test]
+    fn a_clock_that_never_started_has_no_spawn() {
+        // Stopped before the process spawned (a failed spawn, a cancel).
+        let (clock, _rx) = RunClock::new();
+        clock.stop();
+        assert_eq!(clock.spawned_at(), None);
+        assert!(clock.exited_at().is_some());
+        // Too late to start: the state never leaves `Stopped`.
+        clock.start();
+        assert_eq!(clock.spawned_at(), None);
+
+        // An inert clock records nothing.
+        let inert = RunClock::default();
+        inert.start();
+        inert.stop();
+        assert_eq!((inert.spawned_at(), inert.exited_at()), (None, None));
     }
 }
 
