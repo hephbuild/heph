@@ -877,6 +877,118 @@ fn copy_holds_the_lock_shared() {
     assert!(!header(&dir).wal);
 }
 
+/// A cursor reads past more undecodable bodies than one page holds: a page
+/// that decodes to nothing is not the end of the recording. (1100 bodies:
+/// the first page also holds the first record, so the second is all
+/// undecodable.)
+#[test]
+fn cursor_reads_past_a_page_of_undecodable_bodies() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let id = now_id(10);
+    let dir = session_dir(root.path(), id);
+    tests::unsealed_recording(&dir, id, &[start_record(1, "//p:a")]);
+    let last = start_record(3, "//p:b");
+    let body = serde_json::to_string(&last).expect("encode");
+    let conn = tests::alter(&dir);
+    conn.execute_batch(
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1100)
+         INSERT INTO records (at_ms, kind, body) SELECT 2, 'Event', 'not json' FROM n",
+    )
+    .expect("undecodable bodies");
+    conn.execute(
+        "INSERT INTO records (at_ms, kind, body) VALUES (3, 'Event', ?1)",
+        [&body],
+    )
+    .expect("last record");
+    drop(conn);
+
+    let (read, skipped) = read_records(&dir);
+    assert_eq!(skipped, 1100);
+    let bodies: Vec<String> = read
+        .iter()
+        .map(|r| serde_json::to_string(r).expect("encode"))
+        .collect();
+    let first = serde_json::to_string(&start_record(1, "//p:a")).expect("encode");
+    assert_eq!(bodies, vec![first, body]);
+}
+
+/// Creating a recording is one transaction: when a statement of the schema
+/// fails, nothing before it is left behind (no session table, no format
+/// stamp) and the file is never renamed into place.
+#[test]
+fn create_is_one_transaction() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let id = now_id(9);
+    let dir = session_dir(root.path(), id);
+    let tmp = dir.join(store::CREATING);
+    // The schema's last table, already there: its CREATE fails.
+    rusqlite::Connection::open(&tmp)
+        .expect("open")
+        .execute_batch("CREATE TABLE metrics (x)")
+        .expect("pre-create");
+
+    let err = store::create(&dir, &meta_for(id), &store::Provenance::default(), false)
+        .expect_err("the schema cannot be created");
+    assert!(format!("{err:#}").contains("schema"), "{err:#}");
+    assert!(!dir.join(store::FILE).exists());
+    let conn = rusqlite::Connection::open(&tmp).expect("reopen");
+    let tables: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name = 'session'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("count");
+    assert_eq!(tables, 0, "a failed schema left its first tables behind");
+    let format: u32 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .expect("user_version");
+    assert_eq!(format, 0);
+}
+
+/// A viewer arriving while the lock holder seals (the session row already
+/// says `sealed=1`, the header is still WAL) reads the session as ended, not
+/// live, and holds nothing open meanwhile: the seal finishes and the viewer
+/// reads it sealed in place. If the holder lets go without sealing, the
+/// viewer reads a copy.
+#[test]
+fn viewer_during_a_seal_reads_it_ended() {
+    for seal_it in [true, false] {
+        let root = tempfile::tempdir().expect("tempdir");
+        let id = now_id(8);
+        let dir = session_dir(root.path(), id);
+        let records: Vec<SessionRecord> = events().into_iter().map(event_record).collect();
+        tests::unsealed_recording(&dir, id, &records);
+        let sealing = lockfile::try_lock_free(&dir.join(files::LOCK))
+            .expect("lock exclusive")
+            .expect("free");
+        // What seal_lost commits before its checkpoint and mode switch.
+        let conn = tests::alter(&dir);
+        conn.execute("UPDATE session SET sealed = 1", [])
+            .expect("mark sealed");
+
+        let viewer = std::thread::spawn({
+            let dir = dir.clone();
+            move || tests::open(&dir)
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        if seal_it {
+            let sealed = store::seal(conn, Duration::from_millis(500)).expect("seal");
+            assert_eq!(sealed, store::Sealed::Done, "the viewer cut the seal short");
+        } else {
+            drop(conn);
+        }
+        drop(sealing);
+        let opened = viewer.join().expect("viewer thread");
+        assert!(!opened.live, "a session being sealed read as live");
+        assert_eq!(opened.is_copy(), !seal_it, "{opened:?}");
+        assert!(sealed_column(&opened.conn));
+        drop(opened);
+        let (read, skipped) = read_records(&dir);
+        assert_eq!((read.len(), skipped), (records.len(), 0));
+    }
+}
+
 /// I2: a session still starting (a free lock file younger than a minute,
 /// with or without a recording) is neither sealed nor given a recording;
 /// a lock file with no recording never gets one; and two cleanups sealing

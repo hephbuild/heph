@@ -32,7 +32,7 @@ use super::lockfile;
 pub const FILE: &str = "session.db";
 /// The name a recording is created under, renamed to [`FILE`] once its schema
 /// is in place, so no viewer ever opens a half-made file.
-const CREATING: &str = ".session.db.creating";
+pub(crate) const CREATING: &str = ".session.db.creating";
 /// `PRAGMA application_id` of every heph recording ("HEPH").
 pub const APPLICATION_ID: u32 = 0x4845_5048;
 /// `PRAGMA user_version`: the recording's format. A reader reads every format
@@ -283,7 +283,10 @@ pub const TMP_DIR: &str = ".tmp";
 /// and the header (`docs/SESSIONS.md`, "Reading"):
 ///
 /// - lock held: the owner is writing it; a read-only WAL connection. (A held
-///   lock over a rollback-mode header is a cleanup sealing it: read as ended.)
+///   lock over a rollback-mode header is a cleanup sealing it: read as ended.
+///   So is a held lock whose session row already says `sealed=1`: the
+///   holder is sealing, and this waits for it rather than hold a connection
+///   that would cut the seal short.)
 /// - lock free, rollback-mode header: sealed; `immutable=1`.
 /// - lock free, WAL-mode header (lost, or a seal cut short): take the lock
 ///   shared while copying the file and its `-wal` into [`tmp_dir`], and open
@@ -310,13 +313,68 @@ pub fn open_local(root: &Path, dir: &Path) -> Result<Opened, OpenError> {
         });
     }
     if live {
-        return Ok(Opened {
-            conn: open_live(&path)?,
-            live: true,
-            copy: None,
-        });
+        let conn = open_live(&path)?;
+        if !session_sealed(&conn)? {
+            return Ok(Opened {
+                conn,
+                live: true,
+                copy: None,
+            });
+        }
+        // `sealed=1` under a held lock: whoever holds it (the owner after
+        // `End`, a cleanup sealing a lost session) is folding the WAL in. The
+        // session has ended, and an open connection would cut the seal short.
+        drop(conn);
+        return open_after_seal(root, dir, &lock, &path);
     }
     open_copy(root, dir, &lock)
+}
+
+/// The session row's `sealed` column: `End` (or a cleanup's end) is
+/// committed. One read, no transaction left open.
+fn session_sealed(conn: &Connection) -> rusqlite::Result<bool> {
+    conn.query_row("SELECT sealed FROM session", [], |r| r.get(0))
+}
+
+/// A recording whose lock holder is sealing it: wait, holding nothing open,
+/// for the header to turn rollback (read it sealed) or the lock to free (a
+/// seal cut short or abandoned: read a copy), as long as a seal may retry.
+/// Past that, read it in place, as ended.
+fn open_after_seal(
+    root: &Path,
+    dir: &Path,
+    lock: &Path,
+    path: &Path,
+) -> Result<Opened, OpenError> {
+    let deadline = Instant::now() + SEAL_TIMEOUT;
+    loop {
+        match read_header(path) {
+            Ok(Some(h)) if !h.wal => {
+                return Ok(Opened {
+                    conn: open_sealed(path)?,
+                    live: false,
+                    copy: None,
+                });
+            }
+            Ok(_) => {}
+            Err(e) => {
+                return Err(OpenError::Other(
+                    anyhow::Error::new(e).context(format!("reading {}", path.display())),
+                ));
+            }
+        }
+        if !lockfile::is_held(lock).with_context(|| format!("probing {}", lock.display()))? {
+            return open_copy(root, dir, lock);
+        }
+        if Instant::now() >= deadline {
+            return Ok(Opened {
+                conn: open_live(path)?,
+                live: false,
+                copy: None,
+            });
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn check_header(header: Header) -> Result<(), OpenError> {
@@ -530,13 +588,15 @@ pub(crate) fn create(
         if refuse_wal || !mode.eq_ignore_ascii_case("wal") {
             anyhow::bail!("the filesystem refused WAL mode (journal_mode is {mode})");
         }
-        conn.execute_batch(SCHEMA)
-            .context("creating the recording's schema")?;
-        conn.execute_batch(&format!(
-            "PRAGMA application_id={APPLICATION_ID}; PRAGMA user_version={FORMAT};"
-        ))
-        .context("stamping the recording's format")?;
-        insert_session_row(&conn, meta, provenance).context("writing the session row")?;
+        // Runs on the main thread of every command: one unsynced commit, not
+        // one synced commit per statement. A crash before the rename leaves
+        // only the temp name, which nothing reads.
+        conn.execute_batch("PRAGMA synchronous=OFF;")
+            .context("configuring the new recording")?;
+        init(&conn, meta, provenance)?;
+        conn.close()
+            .map_err(|(_, e)| e)
+            .with_context(|| format!("closing {}", tmp.display()))?;
     }
     let path = dir.join(FILE);
     std::fs::rename(&tmp, &path)
@@ -545,6 +605,22 @@ pub(crate) fn create(
     conn.execute_batch("PRAGMA synchronous=OFF;")
         .context("configuring the recording")?;
     Ok(conn)
+}
+
+/// The schema, the format stamp and the session row, in one transaction: a
+/// recording has all of them or none.
+fn init(conn: &Connection, meta: &SessionMeta, provenance: &Provenance) -> anyhow::Result<()> {
+    let tx = conn
+        .unchecked_transaction()
+        .context("starting the recording's schema")?;
+    tx.execute_batch(SCHEMA)
+        .context("creating the recording's schema")?;
+    tx.execute_batch(&format!(
+        "PRAGMA application_id={APPLICATION_ID}; PRAGMA user_version={FORMAT};"
+    ))
+    .context("stamping the recording's format")?;
+    insert_session_row(&tx, meta, provenance).context("writing the session row")?;
+    tx.commit().context("committing the recording's schema")
 }
 
 /// A lossy string, and whether it lost anything (a NUL counts).
@@ -1251,8 +1327,17 @@ impl RecordCursor {
         if self.exhausted && !self.changed().map_err(io::Error::other)? {
             return Ok(None);
         }
-        self.fill(kind).map_err(io::Error::other)?;
-        Ok(self.buf.pop_front())
+        // A full page can decode to nothing (every body skipped): read on
+        // until a record turns up or the table runs out.
+        loop {
+            self.fill(kind).map_err(io::Error::other)?;
+            if let Some(r) = self.buf.pop_front() {
+                return Ok(Some(r));
+            }
+            if self.exhausted {
+                return Ok(None);
+            }
+        }
     }
 
     /// Whether another connection committed since the last read.
