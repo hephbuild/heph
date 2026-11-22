@@ -19,6 +19,8 @@ use hcore::events::BuildEventKind;
 use super::format::{
     ApprovalPrompt, ApprovalStanding, RunLogRecord, SessionRecord, SessionRecordKind,
 };
+use super::holder::HolderNames;
+use super::id::SessionId;
 
 /// The recorded view state an attached [`TuiProgressView`] reads while it
 /// renders. Cloned between the app that routes records and the view.
@@ -55,6 +57,9 @@ struct FeedState {
     /// `ExecuteStart`'s time, until the run's first byte (its `RunLog`) or
     /// its `ResultEnd`: `run_logs.rs`'s rule, off the same stream.
     not_streamed: std::collections::HashMap<String, u64>,
+    /// The names the view gives lock holders, filled from the session's
+    /// `LockHolder` records (D6).
+    holders: HolderNames,
 }
 
 /// An addr's newest `RunLog` in the followed session.
@@ -83,6 +88,15 @@ pub enum Routed {
 }
 
 impl SessionFeed {
+    /// A feed that names lock holders into `holders` as the session's
+    /// `LockHolder` records arrive: the names the attached view reads.
+    pub fn with_holders(holders: HolderNames) -> Self {
+        Self(Arc::new(Mutex::new(FeedState {
+            holders,
+            ..FeedState::default()
+        })))
+    }
+
     fn lock(&self) -> MutexGuard<'_, FeedState> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -175,6 +189,15 @@ impl SessionFeed {
                         },
                     );
                 }
+                return Routed::Nothing;
+            }
+            // The run's own name for the holder, so the view names it the
+            // same; an id that does not parse names nothing.
+            SessionRecordKind::LockHolder { pid, session } => {
+                s.holders.insert(
+                    pid,
+                    session.as_deref().and_then(|id| SessionId::parse(id).ok()),
+                );
                 return Routed::Nothing;
             }
             SessionRecordKind::Truncated

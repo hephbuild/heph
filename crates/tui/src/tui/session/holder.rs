@@ -15,10 +15,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 use hcore::events::{BuildEvent, BuildEventKind};
 
 use super::SessionRoot;
-use super::format::{SessionMeta, files};
+use super::format::files;
 use super::id::SessionId;
-use super::lockfile;
 use super::source::SessionEntry;
+use super::{lockfile, store};
 
 /// The live session, other than `own`, whose process is `pid`.
 pub fn holder_session<'a>(
@@ -156,10 +156,16 @@ impl HolderNames {
         true
     }
 
+    /// Record what a session's `LockHolder` record says names `pid` (D6): a
+    /// viewer names a holder exactly as the run did, with no scan of its own.
+    /// Never does IO.
+    pub fn insert(&self, pid: u32, session: Option<SessionId>) {
+        self.known().insert(pid, Answer::Found(session));
+    }
+
     /// The session holding for `pid`, scanning the sessions directory unless
-    /// this pid has been resolved already. Blocking: reads each session's
-    /// `meta.json` and probes the lock of the one whose pid matches, never
-    /// `status.json` or `events.ndjson`.
+    /// this pid has been resolved already. Blocking: probes each session's
+    /// lock and reads the session row of the live ones, never their records.
     pub fn resolve_blocking(&self, pid: u32) -> Option<SessionId> {
         if let Some(Answer::Found(found)) = self.known().get(&pid) {
             return *found;
@@ -223,16 +229,14 @@ fn scan(root: &Path, pid: u32, own: Option<SessionId>) -> Option<SessionId> {
             return None;
         }
         let dir = entry.path();
-        // A missing, unreadable or too-new meta.json names no pid.
-        let meta = SessionMeta::decode(&std::fs::read(dir.join(files::META)).ok()?).ok()?;
-        if meta.owner_pid != pid {
+        // Only a live session holds a lock; an ended one with a reused pid
+        // does not. Probed first: a live recording is read in place, where
+        // an ended unsealed one would be copied to be read.
+        if !lockfile::is_held(&dir.join(files::LOCK)).ok()? {
             return None;
         }
-        // Only a live session holds a lock; an ended one with a reused pid
-        // does not.
-        lockfile::is_held(&dir.join(files::LOCK))
-            .ok()
-            .filter(|live| *live)
-            .map(|_| id)
+        // A missing, unreadable or too-new recording names no pid.
+        let meta = store::read_meta_in(root, &dir).ok()?;
+        (meta.owner_pid == pid).then_some(id)
     })
 }

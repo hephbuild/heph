@@ -3,68 +3,80 @@
 //! Everything a build task does to feed it is one `std::sync::mpsc` send (I1):
 //! the channel is unbounded, the thread does all the IO, and a recording failure
 //! only ever stops the recording. The thread folds its own [`BuildState`], so
-//! `status.json` does not depend on which view the command drew.
+//! the `status` row does not depend on which view the command drew.
 //!
-//! Files (all `0600`, every fd `O_CLOEXEC`):
+//! It owns the one write connection on `session.db` ([`store::Writer`]):
 //!
-//! - `events.ndjson`: through a `BufWriter`, flushed 250ms after the first
-//!   unflushed byte and at exit; capped at [`EVENTS_CAP`] with a `Truncated`
-//!   record, after which only `End`/`InflightWritten`, `RunLog`, the view records
-//!   [`outlives_cap`] names, and `Log` records up to [`LOG_CEILING`] bytes of
-//!   them, are appended.
-//! - `status.json`: at most once a second and only when something changed,
-//!   written to a temp file and renamed over.
+//! - Records go into one transaction per flush tick, committed 250ms after
+//!   the first uncommitted record and at exit, with the explorer rows they
+//!   complete.
+//! - The `status` row is upserted inside the open transaction, at most once a
+//!   second and only when something changed.
+//! - Caps (D15): everything up to [`FULL_CAP`] bytes of records; past it a
+//!   `Truncated` record, then only the [`is_critical`] kinds; at the
+//!   [`CEILING`] (records plus explorer rows) a second `Truncated`, derivation
+//!   stops at it, and only `End` follows.
 //!
-//! Shutdown (design amendment A8): `End` is appended and flushed, then the final
-//! `status.json` (carrying the exit) is written, and only then is the lock
-//! released — so "lock free and no `End`" means exactly "crashed". The caller
-//! waits for that with a timeout, never a bare `join`.
+//! Shutdown (design amendment A8): `End` is appended, the final `status`
+//! (carrying the exit) upserted, the session row's end and `sealed=1` written
+//! in the last transaction, the file sealed ([`store::seal`], bounded), and
+//! only then is the lock released — so "lock free and no `End`" means exactly
+//! "crashed". The caller waits for that with a timeout, never a bare `join`.
 //!
-//! Failure (A9): the "stopped" latch is set *before* the single `warn!`, because
-//! that `warn!` reaches the log tap, which would otherwise feed the recorder
-//! that is failing. Then the thread drops its receiver, so every later send fails
-//! at once and the backlog is freed. The thread must not panic: the process's
-//! panic hook leaves raw mode under a live TUI.
+//! Failure (A9): the open transaction is rolled back, then the "stopped" latch
+//! is set *before* the single `warn!`, because that `warn!` reaches the log
+//! tap, which would otherwise feed the recorder that is failing. Then the
+//! thread drops its receiver, so every later send fails at once and the
+//! backlog is freed. The thread must not panic: the process's panic hook
+//! leaves raw mode under a live TUI.
 
+use std::collections::HashSet;
 use std::fs::File;
-use std::io::{self, BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::io;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
-use hcore::events::{BuildEvent, EventReceiver, now_unix_ms};
+use hcore::events::{BuildEvent, BuildEventKind, EventReceiver, now_unix_ms};
+use rusqlite::Connection;
 use tokio::sync::mpsc::error::TryRecvError;
 
 use super::cleanup::{self, Retention};
 use super::format::{
-    ApprovalPrompt, ApprovalStanding, SessionEnd, SessionRecord, SessionRecordKind,
-    SessionSnapshot, files,
+    ApprovalPrompt, ApprovalStanding, SessionEnd, SessionRecord, SessionRecordKind, SessionSnapshot,
 };
 use super::holder::{HolderNames, event_holder_pid};
+use super::id::SessionId;
+use super::store;
 use crate::tui::app::TUIAppView;
 use crate::tui::progress::BuildState;
 
-/// `events.ndjson` stops growing past this (A10), except for the records a
-/// viewer needs at the end and for `Log` records, up to [`LOG_CEILING`].
-pub const EVENTS_CAP: u64 = 64 * 1024 * 1024;
+/// Bytes of record bodies recorded in full (D15). Past it a `Truncated`
+/// record marks the point, and only the [`is_critical`] kinds are kept: `Log`,
+/// `Output` and progress-only events are what make a recording large.
+pub const FULL_CAP: u64 = 256 * 1024 * 1024;
 
-/// How many bytes of `Log` records are written past [`EVENTS_CAP`]. A replay
-/// after a full screen reads heph's own lines from disk, so they outlive the
-/// cap; past this they are dropped, and the replay says how many it skipped.
-pub const LOG_CEILING: u64 = 256 * 1024 * 1024;
+/// Bytes of record bodies plus explorer rows past which the recording stops
+/// (D15): a second `Truncated`, derivation stops at the same record (I4), and
+/// only `End` is written after it.
+pub const CEILING: u64 = 1024 * 1024 * 1024;
 
 /// Messages queued and not yet taken by the recorder past which it stops: a
 /// disk slower than the event rate must not grow the process without bound.
 pub const MAX_PENDING: usize = 500_000;
 
-/// Delay from the first unflushed byte to its flush.
+/// Delay from the first uncommitted record to its commit.
 const FLUSH_EVERY: Duration = Duration::from_millis(250);
-/// Minimum gap between two `status.json` writes.
+/// Minimum gap between two `status` upserts.
 const STATUS_EVERY: Duration = Duration::from_secs(1);
-/// How long the exiting process waits for `End` to be written.
+/// How long the exiting process waits for `End` to be written and the
+/// recording sealed.
 pub const FINISH_TIMEOUT: Duration = Duration::from_secs(3);
+/// What the seal leaves of [`FINISH_TIMEOUT`] for the answer to reach the
+/// finisher, so it is not cut short while the seal still runs.
+const FINISH_MARGIN: Duration = Duration::from_millis(250);
 
 /// What the recorder thread is sent.
 #[derive(Debug)]
@@ -94,6 +106,8 @@ enum Msg {
         at_unix_ms: u64,
         exit_code: Option<i32>,
         panicked: bool,
+        /// When the finisher stops waiting: the seal is bounded under it.
+        deadline: Instant,
         ack: mpsc::SyncSender<()>,
     },
 }
@@ -232,7 +246,7 @@ impl SessionTap {
     }
 
     /// Wait, at most `timeout`, until every record sent before this call is
-    /// in `events.ndjson`. Fails at once when the recording stopped or the
+    /// committed to `session.db`. Fails at once when the recording stopped or the
     /// session finished: a caller must not wait on a recorder that is gone.
     pub fn flush(&self, timeout: Duration) -> Result<(), FlushFailed> {
         let (ack, acked) = mpsc::sync_channel(1);
@@ -310,6 +324,9 @@ pub struct TappedReceiver {
     /// not in the `recv` future, so a `recv` dropped by a `select!` loses
     /// nothing: the next call picks it up first.
     parked: Option<Parked>,
+    /// Holder pids already recorded as a `LockHolder` record (D6): each is
+    /// recorded once, before the first event that carries it.
+    recorded_holders: HashSet<u32>,
 }
 
 /// How long the receiver holds an event for its holder's scan before folding
@@ -357,6 +374,7 @@ impl TappedReceiver {
             tap,
             holders,
             parked: None,
+            recorded_holders: HashSet::new(),
         }
     }
 
@@ -433,9 +451,23 @@ impl TappedReceiver {
         Some(())
     }
 
-    fn fold(&self, ev: BuildEvent, apply: impl FnOnce(&BuildEvent)) {
+    fn fold(&mut self, ev: BuildEvent, apply: impl FnOnce(&BuildEvent)) {
         apply(&ev);
         if let Some(tap) = &self.tap {
+            // D6: the run names the holder, once per pid, ahead of the event
+            // that first carries it, so a viewer (here or on another machine)
+            // names it from the recording and never scans for pids.
+            if let Some(pid) = event_holder_pid(&ev)
+                && self.recorded_holders.insert(pid)
+            {
+                tap.view(
+                    ev.at_unix_ms,
+                    SessionRecordKind::LockHolder {
+                        pid,
+                        session: self.holders.get(pid).map(SessionId::encode),
+                    },
+                );
+            }
             tap.event(ev);
         }
     }
@@ -448,7 +480,7 @@ impl TappedReceiver {
 #[derive(Debug)]
 pub(crate) struct ViewTap {
     tap: SessionTap,
-    /// The label last recorded (`meta.json` holds the first).
+    /// The label last recorded (the session row holds the first).
     label: String,
     approval: Option<ApprovalPrompt>,
     standing: Option<ApprovalStanding>,
@@ -514,54 +546,108 @@ fn injected_panic() {
 #[cfg(not(test))]
 fn injected_panic() {}
 
-/// View records written past the cap, like `End`: what a truncated session
-/// still needs to read right at its end. `Finished` (when the summary was
-/// measured), `Output` (the failure report, once per run), a `Label` change
-/// (one short line), and every `Approval`: a few short lines per gated
-/// target, carrying the sources its notices are rendered again from and the standing
-/// Y/N decision, which a viewer needs however long the build ran (and its
-/// clear, so a prompt recorded earlier does not stay on a viewer's screen).
-///
-/// `RunLog` too: one short line per run that writes anything, and the only
-/// way a follower finds the log of a run that starts after the cap.
-fn outlives_cap(kind: &SessionRecordKind) -> bool {
-    match kind {
-        SessionRecordKind::Finished { .. }
-        | SessionRecordKind::Output { .. }
-        | SessionRecordKind::Label { .. }
-        | SessionRecordKind::RunLog(_)
-        | SessionRecordKind::Approval { .. } => true,
-        SessionRecordKind::Log { .. }
-        | SessionRecordKind::End { .. }
-        | SessionRecordKind::Truncated
-        | SessionRecordKind::InflightWritten
-        | SessionRecordKind::Unknown => false,
+/// The kinds kept past [`FULL_CAP`] (D15): every record an explorer row is
+/// derived from (so a re-derivation stays exact, I4), and what a viewer needs
+/// at the end of a truncated session — `End`, the view records (`Label`,
+/// `Approval`, `Finished`), `RunLog` (the only way a follower finds the log
+/// of a run that starts after the cap) and `InflightWritten`. `Log`, `Output`
+/// and progress-only events are dropped. Exhaustive on purpose: a new kind
+/// must say which side it is on.
+pub(crate) fn is_critical(record: &SessionRecord) -> bool {
+    use BuildEventKind as K;
+    if let Some(kind) = &record.kind {
+        return match kind {
+            K::RequestConfig { .. }
+            | K::ResultStart { .. }
+            | K::ResultEnd { .. }
+            | K::ExecuteStart { .. }
+            | K::LocalCacheHit { .. }
+            | K::LocalCacheMiss { .. }
+            | K::RemoteCacheHit { .. }
+            | K::RemoteCacheMiss { .. }
+            | K::CacheOutcome { .. }
+            | K::CacheHitRebuilt { .. }
+            | K::ResultLockWaitStart { .. }
+            | K::ResultLockWaitEnd { .. }
+            | K::AdmissionWaitStart { .. }
+            | K::AdmissionWaitEnd { .. }
+            | K::ScratchLockWaitStart { .. }
+            | K::ScratchLockWaitEnd { .. }
+            | K::ScratchPrepareStart { .. }
+            | K::ScratchPrepareEnd { .. }
+            | K::PoolUsage { .. }
+            | K::CodegenExcluded { .. } => true,
+            K::Matched { .. }
+            | K::SelectionIncomplete { .. }
+            | K::ResultOutputs { .. }
+            | K::ExecuteEnd { .. }
+            | K::LocalCacheWriteStart { .. }
+            | K::LocalCacheWriteEnd { .. }
+            | K::RemoteCacheReadStart { .. }
+            | K::RemoteCacheReadEnd { .. }
+            | K::RemoteCacheWriteStart { .. }
+            | K::RemoteCacheWriteEnd { .. }
+            | K::GcTargetSwept { .. }
+            | K::GcFailureLogsSwept { .. }
+            | K::GcCacheDb { .. }
+            | K::CodegenImported { .. }
+            | K::Unknown => false,
+        };
+    }
+    match &record.session {
+        Some(
+            SessionRecordKind::End { .. }
+            | SessionRecordKind::Truncated
+            | SessionRecordKind::InflightWritten
+            | SessionRecordKind::Label { .. }
+            | SessionRecordKind::Approval { .. }
+            | SessionRecordKind::Finished { .. }
+            | SessionRecordKind::RunLog(_)
+            | SessionRecordKind::LockHolder { .. },
+        ) => true,
+        Some(
+            SessionRecordKind::Log { .. }
+            | SessionRecordKind::Output { .. }
+            | SessionRecordKind::Unknown,
+        )
+        | None => false,
     }
 }
 
+/// A test's stand-in for a write that hangs: every record write waits until
+/// the flag is set.
+pub(crate) type Gate = Arc<(Mutex<bool>, std::sync::Condvar)>;
+
 /// Test-only fault injection. Always default outside tests.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct Faults {
     /// Panic on the first event, as a bug in the recorder would.
     pub(crate) panic_on_event: bool,
     /// Fail to take the session's lock, as an NFS `ENOLCK` would.
     pub(crate) fail_lock: bool,
-    /// [`EVENTS_CAP`] in its place, so a test reaches it with a few records.
-    pub(crate) events_cap: Option<u64>,
-    /// [`LOG_CEILING`] in its place.
-    pub(crate) log_ceiling: Option<u64>,
+    /// Fail every record write, as a full disk would.
+    pub(crate) fail_writes: bool,
+    /// Hold every record write until the gate opens, as a hung disk would.
+    pub(crate) gate: Option<Gate>,
+    /// [`FULL_CAP`] in its place, so a test reaches it with a few records.
+    pub(crate) full_cap: Option<u64>,
+    /// [`CEILING`] in its place.
+    pub(crate) ceiling: Option<u64>,
+    /// Refuse WAL mode when creating the recording, as some filesystems do.
+    pub(crate) refuse_wal: bool,
 }
 
 /// What the recorder thread starts with.
 pub(crate) struct RecorderStart {
-    pub(crate) dir: PathBuf,
     /// The sessions root, cleaned before recording starts.
-    pub(crate) root: PathBuf,
+    pub(crate) root: std::path::PathBuf,
     pub(crate) lock: File,
-    pub(crate) events: Box<dyn Write + Send>,
+    /// The write connection on the session's freshly created `session.db`.
+    pub(crate) conn: Connection,
+    pub(crate) session_id: SessionId,
     pub(crate) retention: Retention,
     /// A private-sessions root to sweep of every ended session too.
-    pub(crate) private_root: Option<PathBuf>,
+    pub(crate) private_root: Option<std::path::PathBuf>,
     pub(crate) faults: Faults,
 }
 
@@ -572,8 +658,8 @@ pub struct Recorder {
 }
 
 impl Recorder {
-    /// Spawn the recorder thread. The caller has created the directory, written
-    /// `meta.json` and taken the lock.
+    /// Spawn the recorder thread. The caller has created the directory, taken
+    /// the lock and created `session.db`.
     pub(crate) fn spawn(start: RecorderStart) -> io::Result<Self> {
         let (tx, rx) = mpsc::channel();
         let shared = Arc::new(Shared {
@@ -587,9 +673,9 @@ impl Recorder {
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
         let thread_shared = Arc::clone(&shared);
         let RecorderStart {
-            dir,
             root,
-            events,
+            conn,
+            session_id,
             retention,
             private_root,
             faults,
@@ -600,8 +686,14 @@ impl Recorder {
             .spawn(move || {
                 let _dispatch = tracing::dispatcher::set_default(&dispatch);
                 match cleanup::cleanup(&root, SystemTime::now(), retention) {
-                    Ok(report) if !report.removed.is_empty() => {
-                        tracing::debug!(removed = report.removed.len(), "cleaned ended sessions");
+                    Ok(report) if report != cleanup::CleanupReport::default() => {
+                        tracing::debug!(
+                            removed = report.removed.len(),
+                            sealed = report.sealed.len(),
+                            tombs = report.tombs,
+                            tmp = report.tmp,
+                            "cleaned ended sessions"
+                        );
                     }
                     Ok(_) => {}
                     Err(e) => tracing::debug!(error = %e, "cannot clean ended sessions"),
@@ -609,26 +701,23 @@ impl Recorder {
                 // A killed `HEPH_NO_SESSION` run's directory: nobody else
                 // reads it, so it goes whatever its age. Missing is normal.
                 if let Some(private) = &private_root
-                    && let Err(e) =
-                        cleanup::cleanup(private, SystemTime::now(), super::private_retention())
+                    && let Err(e) = cleanup::cleanup(private, SystemTime::now(), Retention::PRIVATE)
                     && e.kind() != io::ErrorKind::NotFound
                 {
                     tracing::debug!(error = %e, "cannot clean ended private sessions");
                 }
                 let mut thread = RecorderThread {
-                    dir,
-                    events: BufWriter::new(events),
-                    events_bytes: 0,
-                    events_cap: faults.events_cap.unwrap_or(EVENTS_CAP),
-                    truncated: false,
-                    log_bytes_past_cap: 0,
-                    log_ceiling: faults.log_ceiling.unwrap_or(LOG_CEILING),
-                    unflushed_since: None,
+                    writer: Some(store::Writer::new(conn, session_id)),
+                    record_bytes: 0,
+                    full_cap: faults.full_cap.unwrap_or(FULL_CAP),
+                    ceiling: faults.ceiling.unwrap_or(CEILING),
+                    phase: Phase::Full,
+                    uncommitted_since: None,
                     state: BuildState::new(),
                     end: None,
                     dirty: true,
                     last_status: None,
-                    line: Vec::new(),
+                    line: String::new(),
                     shared: thread_shared,
                     faults,
                 };
@@ -644,8 +733,9 @@ impl Recorder {
         self.tap.clone()
     }
 
-    /// Write `End` and release the lock, waiting at most `timeout` for the
-    /// recorder to say it did. Idempotent: only the first call does anything.
+    /// Write `End`, seal the recording and release the lock, waiting at most
+    /// `timeout` for the recorder to say it did; the seal is bounded under
+    /// it. Idempotent: only the first call does anything.
     ///
     /// If the recorder stopped, or does not answer in time, the lock is released
     /// here with no `End` on disk — a viewer reads that as a lost session, which
@@ -668,6 +758,7 @@ impl Recorder {
                     at_unix_ms: now_unix_ms(),
                     exit_code,
                     panicked,
+                    deadline: Instant::now() + timeout,
                     ack,
                 })
                 .is_ok();
@@ -688,24 +779,34 @@ impl Recorder {
     }
 }
 
+/// Where the recording is against its caps (D15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    /// Under [`FULL_CAP`]: every record is kept.
+    Full,
+    /// Past [`FULL_CAP`]: only the [`is_critical`] kinds.
+    Critical,
+    /// Past the [`CEILING`]: only `End`.
+    Stopped,
+}
+
 struct RecorderThread {
-    dir: PathBuf,
-    events: BufWriter<Box<dyn Write + Send>>,
-    events_bytes: u64,
-    events_cap: u64,
-    truncated: bool,
-    /// Bytes of `Log` records written past the cap, at most `log_ceiling`.
-    log_bytes_past_cap: u64,
-    log_ceiling: u64,
-    /// When the oldest unflushed byte was written.
-    unflushed_since: Option<Instant>,
+    /// `None` once `End` is written and the recording sealed.
+    writer: Option<store::Writer>,
+    /// Bytes of record bodies inserted, toward the caps.
+    record_bytes: u64,
+    full_cap: u64,
+    ceiling: u64,
+    phase: Phase,
+    /// When the oldest uncommitted record was inserted.
+    uncommitted_since: Option<Instant>,
     state: BuildState,
     end: Option<SessionEnd>,
-    /// The state changed since `status.json` was last written.
+    /// The state changed since the `status` row was last upserted.
     dirty: bool,
     last_status: Option<Instant>,
     /// Reused serialization buffer.
-    line: Vec<u8>,
+    line: String,
     shared: Arc<Shared>,
     faults: Faults,
 }
@@ -739,11 +840,14 @@ impl RecorderThread {
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {}
-                // Every tap dropped without an `End`: flush what there is and
+                // Every tap dropped without an `End`: commit what there is and
                 // stop. The lock stays with whoever finishes the session.
                 Err(RecvTimeoutError::Disconnected) => {
-                    if self.flush().is_ok() {
-                        drop(self.write_status());
+                    if let Err(e) = self.upsert_status() {
+                        tracing::debug!(error = %e, "cannot write the session's last status");
+                    }
+                    if let Err(e) = self.commit() {
+                        tracing::debug!(error = %e, "cannot commit the session's last records");
                     }
                     return;
                 }
@@ -751,9 +855,9 @@ impl RecorderThread {
         }
     }
 
-    /// The next instant something is due: a flush or a status write.
+    /// The next instant something is due: a commit or a status upsert.
     fn next_deadline(&self) -> Option<Instant> {
-        let flush = self.unflushed_since.map(|t| t + FLUSH_EVERY);
+        let flush = self.uncommitted_since.map(|t| t + FLUSH_EVERY);
         let status = self.dirty.then(|| {
             self.last_status
                 .map_or_else(Instant::now, |t| t + STATUS_EVERY)
@@ -767,16 +871,17 @@ impl RecorderThread {
     /// Do whatever is due.
     fn tick(&mut self) -> Flow {
         let now = Instant::now();
-        if self.unflushed_since.is_some_and(|t| now >= t + FLUSH_EVERY)
-            && let Err(e) = self.flush()
-        {
-            return self.fail("cannot write the session's events", &e);
-        }
-        if self.dirty
-            && self.last_status.is_none_or(|t| now >= t + STATUS_EVERY)
-            && let Err(e) = self.write_status()
-        {
+        let commit_due = self
+            .uncommitted_since
+            .is_some_and(|t| now >= t + FLUSH_EVERY);
+        let status_due = self.dirty && self.last_status.is_none_or(|t| now >= t + STATUS_EVERY);
+        if status_due && let Err(e) = self.upsert_status() {
             return self.fail("cannot write the session's status", &e);
+        }
+        if (commit_due || status_due)
+            && let Err(e) = self.commit()
+        {
+            return self.fail("cannot write the session's records", &e);
         }
         Flow::Continue
     }
@@ -789,14 +894,18 @@ impl RecorderThread {
                 }
                 self.state.apply(&ev);
                 self.dirty = true;
-                self.append_capped(&ev)
+                self.record(&SessionRecord {
+                    at_unix_ms: ev.at_unix_ms,
+                    kind: Some(ev.kind),
+                    session: None,
+                })
             }
             Msg::Log {
                 at_unix_ms,
                 seq,
                 level,
                 msg,
-            } => self.append_log(&SessionRecord::session(
+            } => self.record(&SessionRecord::session(
                 at_unix_ms,
                 SessionRecordKind::Log {
                     level: level.to_owned(),
@@ -805,30 +914,28 @@ impl RecorderThread {
                 },
             )),
             Msg::Flush { ack } => {
-                let flushed = self.flush();
+                let committed = self.commit();
                 // The asker may have timed out and gone.
-                ack.send(flushed.is_ok()).unwrap_or_default();
-                flushed
+                ack.send(committed.is_ok()).unwrap_or_default();
+                committed
             }
             Msg::InflightWritten { at_unix_ms } => self
-                .append(&SessionRecord::session(
+                .record(&SessionRecord::session(
                     at_unix_ms,
                     SessionRecordKind::InflightWritten,
                 ))
-                .and_then(|()| self.flush()),
-            Msg::View { at_unix_ms, kind } if outlives_cap(&kind) => {
-                self.append(&SessionRecord::session(at_unix_ms, kind))
-            }
+                .and_then(|()| self.commit()),
             Msg::View { at_unix_ms, kind } => {
-                self.append_capped(&SessionRecord::session(at_unix_ms, kind))
+                self.record(&SessionRecord::session(at_unix_ms, kind))
             }
             Msg::End {
                 at_unix_ms,
                 exit_code,
                 panicked,
+                deadline,
                 ack,
             } => {
-                self.end_session(rx, at_unix_ms, exit_code, panicked);
+                self.end_session(rx, at_unix_ms, exit_code, panicked, deadline);
                 // The finisher may have timed out and gone; nothing to tell it.
                 ack.send(()).unwrap_or_default();
                 return Flow::Stop;
@@ -840,14 +947,16 @@ impl RecorderThread {
         }
     }
 
-    /// Everything queued before `End`, then `End`, the flush, the final status
-    /// and the lock — in that order.
+    /// Everything queued before `End`, then `End`, the final status and the
+    /// session row's end in the last transaction, the seal, and the lock — in
+    /// that order.
     fn end_session(
         &mut self,
         rx: &mpsc::Receiver<Msg>,
         at_unix_ms: u64,
         exit_code: Option<i32>,
         panicked: bool,
+        deadline: Instant,
     ) {
         while let Ok(msg) = rx.try_recv() {
             self.shared.pending.fetch_sub(1, Ordering::Relaxed);
@@ -863,7 +972,7 @@ impl RecorderThread {
                 panicked,
             },
         );
-        if let Err(e) = self.append(&end).and_then(|()| self.flush()) {
+        if let Err(e) = self.record(&end) {
             self.fail("cannot write the session's end", &e);
             return;
         }
@@ -872,144 +981,185 @@ impl RecorderThread {
             exit_code,
             panicked,
         });
-        if let Err(e) = self.write_status() {
+        self.dirty = true;
+        if let Err(e) = self.upsert_status() {
             self.fail("cannot write the session's status", &e);
             return;
+        }
+        let Some(writer) = self.writer.take() else {
+            return;
+        };
+        let conn = match writer.finish(at_unix_ms, exit_code, panicked) {
+            Ok(conn) => conn,
+            Err(e) => {
+                self.fail("cannot write the session's end", &io::Error::other(e));
+                return;
+            }
+        };
+        // `End` is committed: whatever the seal does, the lock may go. A seal
+        // cut short leaves the file in WAL mode for the next cleanup.
+        let budget = deadline
+            .saturating_duration_since(Instant::now())
+            .saturating_sub(FINISH_MARGIN);
+        match store::seal(conn, budget) {
+            Ok(store::Sealed::Done) => {}
+            Ok(store::Sealed::CutShort) => {
+                tracing::debug!("a reader kept the session's recording from being sealed");
+            }
+            Err(e) => tracing::debug!(error = %e, "cannot seal the session's recording"),
         }
         self.shared.release_lock();
     }
 
-    fn fail(&self, why: &str, error: &io::Error) -> Flow {
+    /// Roll back the open transaction, then latch and report the failure.
+    fn fail(&mut self, why: &str, error: &io::Error) -> Flow {
+        if let Some(writer) = self.writer.as_mut() {
+            writer.rollback();
+        }
         self.shared.stop(why, Some(error));
         Flow::Stop
     }
 
-    /// Append a build event or log line, unless the cap is reached; the first
-    /// record over it is replaced by `Truncated`.
-    fn append_capped(&mut self, record: &impl serde::Serialize) -> io::Result<()> {
-        if self.truncated {
-            return Ok(());
+    /// Record one message under the caps (D15):
+    ///
+    /// - [`Phase::Full`]: kept. The record that would cross [`FULL_CAP`] is
+    ///   preceded by a `Truncated`, and kept only if [`is_critical`].
+    /// - [`Phase::Critical`]: kept only if [`is_critical`].
+    /// - A record that would take records plus explorer rows past the
+    ///   [`CEILING`] is replaced by a second `Truncated`, at which derivation
+    ///   stops (I4); [`Phase::Stopped`] keeps only `End`.
+    fn record(&mut self, record: &SessionRecord) -> io::Result<()> {
+        let is_end = matches!(record.session, Some(SessionRecordKind::End { .. }));
+        match self.phase {
+            Phase::Stopped if !is_end => return Ok(()),
+            Phase::Critical if !is_critical(record) => return Ok(()),
+            _ => {}
         }
-        if !self.encode(record) {
-            return Ok(());
-        }
-        if self.over_cap() {
-            return self.truncate();
-        }
-        self.write_line()
-    }
-
-    /// Append a `Log` record: under the cap like any record, past it (after
-    /// the `Truncated`) while the Log bytes written past it stay within the
-    /// ceiling, and dropped beyond — a replay counts the numbers it misses.
-    fn append_log(&mut self, record: &SessionRecord) -> io::Result<()> {
-        if !self.encode(record) {
-            return Ok(());
-        }
-        if !self.truncated {
-            if !self.over_cap() {
-                return self.write_line();
-            }
-            // `truncate` reuses the line buffer: encode the Log again after.
-            self.truncate()?;
-            if !self.encode(record) {
+        self.encode(record)?;
+        if self.phase == Phase::Full
+            && self.record_bytes.saturating_add(self.line_len()) > self.full_cap
+        {
+            self.truncate(Phase::Critical)?;
+            if !is_critical(record) {
                 return Ok(());
             }
         }
-        let len = u64::try_from(self.line.len()).unwrap_or(u64::MAX);
-        let past = self.log_bytes_past_cap.saturating_add(len);
-        if past > self.log_ceiling {
-            // Latched: a shorter line after this one would still fit, but
-            // the ceiling is where Log records stop, not a gap they resume
-            // after — the numbers on disk past the cap stay a prefix.
-            self.log_bytes_past_cap = u64::MAX;
-            return Ok(());
+        if !is_end && self.phase != Phase::Stopped {
+            let explorer = self.writer.as_ref().map_or(0, |w| w.explorer_bytes);
+            let total = self
+                .record_bytes
+                .saturating_add(self.line_len())
+                .saturating_add(explorer);
+            if total > self.ceiling {
+                return self.truncate(Phase::Stopped);
+            }
         }
-        self.log_bytes_past_cap = past;
-        self.write_line()
+        self.insert(record)
     }
 
-    /// The encoded line would take the file past the cap.
-    fn over_cap(&self) -> bool {
-        let len = u64::try_from(self.line.len()).unwrap_or(u64::MAX);
-        self.events_bytes.saturating_add(len) > self.events_cap
+    /// Insert a `Truncated` and enter `next`, leaving the line buffer as it
+    /// was. Into [`Phase::Stopped`], derivation stops first, so this
+    /// `Truncated` is the session row's `truncated_seq` and no derivation,
+    /// live or rebuilt, applies it.
+    fn truncate(&mut self, next: Phase) -> io::Result<()> {
+        let pending = std::mem::take(&mut self.line);
+        let inserted = self.insert_truncated(next);
+        self.line = pending;
+        inserted
     }
 
-    /// Write `Truncated` in place of the first record over the cap.
-    fn truncate(&mut self) -> io::Result<()> {
-        self.truncated = true;
+    fn insert_truncated(&mut self, next: Phase) -> io::Result<()> {
+        if next == Phase::Stopped
+            && let Some(writer) = self.writer.as_mut()
+        {
+            writer
+                .stop_deriving(writer.next_seq())
+                .map_err(io::Error::other)?;
+        }
+        self.phase = next;
         self.dirty = true;
-        self.append(&SessionRecord::session(
-            now_unix_ms(),
-            SessionRecordKind::Truncated,
-        ))
+        let truncated = SessionRecord::session(now_unix_ms(), SessionRecordKind::Truncated);
+        self.encode(&truncated)?;
+        self.insert(&truncated)
     }
 
-    /// Append a record regardless of the cap (`End`, `Truncated`,
-    /// `InflightWritten`, and what [`outlives_cap`] lets through: a viewer
-    /// needs them).
-    fn append(&mut self, record: &impl serde::Serialize) -> io::Result<()> {
-        if !self.encode(record) {
+    /// Serialize `record` into the line buffer, reusing its allocation.
+    fn encode(&mut self, record: &SessionRecord) -> io::Result<()> {
+        let mut buf = std::mem::take(&mut self.line).into_bytes();
+        buf.clear();
+        serde_json::to_writer(&mut buf, record).map_err(io::Error::other)?;
+        self.line = String::from_utf8(buf).map_err(io::Error::other)?;
+        Ok(())
+    }
+
+    fn line_len(&self) -> u64 {
+        u64::try_from(self.line.len()).unwrap_or(u64::MAX)
+    }
+
+    /// Insert `record`, already encoded in the line buffer, into the open
+    /// transaction.
+    fn insert(&mut self, record: &SessionRecord) -> io::Result<()> {
+        self.injected_write_faults()?;
+        let Some(writer) = self.writer.as_mut() else {
             return Ok(());
-        }
-        self.write_line()
-    }
-
-    /// Serialize `record` into the line buffer. `false` (and nothing written)
-    /// for a record that does not serialize, which no record type here does.
-    fn encode(&mut self, record: &impl serde::Serialize) -> bool {
-        self.line.clear();
-        if let Err(e) = serde_json::to_writer(&mut self.line, record) {
-            tracing::debug!(error = %e, "skipping an unserializable session record");
-            return false;
-        }
-        self.line.push(b'\n');
-        true
-    }
-
-    fn write_line(&mut self) -> io::Result<()> {
-        self.events.write_all(&self.line)?;
-        self.events_bytes = self
-            .events_bytes
-            .saturating_add(u64::try_from(self.line.len()).unwrap_or(u64::MAX));
-        if self.unflushed_since.is_none() {
-            self.unflushed_since = Some(Instant::now());
+        };
+        writer
+            .insert(record, &self.line)
+            .map_err(io::Error::other)?;
+        self.record_bytes = self.record_bytes.saturating_add(self.line_len());
+        if self.uncommitted_since.is_none() {
+            self.uncommitted_since = Some(Instant::now());
         }
         Ok(())
     }
 
-    fn flush(&mut self) -> io::Result<()> {
-        self.unflushed_since = None;
-        self.events.flush()
+    /// A full disk or a hung one, for tests. No-op outside them.
+    fn injected_write_faults(&self) -> io::Result<()> {
+        if let Some(gate) = &self.faults.gate {
+            let (open, opened) = &**gate;
+            let mut open = open.lock().unwrap_or_else(PoisonError::into_inner);
+            while !*open {
+                open = opened.wait(open).unwrap_or_else(PoisonError::into_inner);
+            }
+        }
+        if self.faults.fail_writes {
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                "no space left on device (injected)",
+            ));
+        }
+        Ok(())
     }
 
-    fn write_status(&mut self) -> io::Result<()> {
+    /// Commit the open transaction: records and status reach readers.
+    fn commit(&mut self) -> io::Result<()> {
+        self.uncommitted_since = None;
+        match self.writer.as_mut() {
+            Some(writer) => writer.commit().map_err(io::Error::other),
+            None => Ok(()),
+        }
+    }
+
+    /// Upsert the `status` row inside the open transaction.
+    fn upsert_status(&mut self) -> io::Result<()> {
         let mut snapshot: SessionSnapshot =
             self.state.snapshot_capped(super::format::STATUS_LIST_CAP);
-        snapshot.truncated = self.truncated;
+        snapshot.truncated = self.phase != Phase::Full;
         snapshot.end = self.end.clone();
-        write_atomically(&self.dir, files::STATUS, &snapshot)?;
+        let json = serde_json::to_string(&snapshot).map_err(io::Error::other)?;
+        if let Some(writer) = self.writer.as_mut() {
+            writer
+                .upsert_status(now_unix_ms(), &json)
+                .map_err(io::Error::other)?;
+        }
         self.dirty = false;
         self.last_status = Some(Instant::now());
         Ok(())
     }
 }
 
-/// Write `value` as JSON to `dir/name` through a `0600` temp file renamed over
-/// it, so a reader sees the old file or the new one, never half of one.
-///
-/// Encoded into memory first: serde_json writes token by token, and straight
-/// into the file that is one `write(2)` per token.
-pub(crate) fn write_atomically(
-    dir: &Path,
-    name: &str,
-    value: &impl serde::Serialize,
-) -> io::Result<()> {
-    let bytes = serde_json::to_vec(value).map_err(io::Error::other)?;
-    write_bytes_atomically(dir, name, &bytes)
-}
-
-/// [`write_atomically`] for bytes already encoded, or not JSON
+/// Write `bytes` to `dir/name` through a `0600` temp file renamed over it, so
+/// a reader sees the old file or the new one, never half of one
 /// (`inflight.txt`).
 pub fn write_bytes_atomically(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
     let mut tmp = tempfile::NamedTempFile::new_in(dir)?;

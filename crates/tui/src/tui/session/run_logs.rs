@@ -6,7 +6,7 @@
 //! it here. The rules (spec I4, "Who is followed"):
 //!
 //! - **Only this workspace.** Sessions are per user, across checkouts: a
-//!   session counts only when its `meta.json` names the reader's own home,
+//!   session counts only when its session row names the reader's own home,
 //!   exactly. A build of the same address in another checkout never
 //!   answers.
 //! - **Only a live session.** A record is trusted only while the session's
@@ -24,8 +24,8 @@
 //!   `O_NONBLOCK`, so a planted FIFO cannot hang the reader) and must be a
 //!   regular file. Anything else reads as absent.
 //!
-//! Past the event log's 64 MiB cap, `RunLog` is still written but
-//! `ExecuteEnd` is not, so there a run's end shows only as its file being
+//! Past the recording's [`FULL_CAP`](super::recorder::FULL_CAP), `RunLog` is
+//! still written but `ExecuteEnd` is not, so there a run's end shows only as its file being
 //! gone (or, for a `cache = false` success, whose file stays until the heph
 //! exits, as the session ending).
 
@@ -39,7 +39,8 @@ use hcore::events::BuildEventKind;
 use hcore::session_record::{LiveRunLogLocator, LocatedRunLog};
 
 use super::format::{RunLogRecord, SessionMeta, SessionRecordKind, files};
-use super::{RecordReader, SessionId, SessionRoot, lockfile};
+use super::store::{self, OpenError, RecordCursor};
+use super::{SessionId, SessionRoot, lockfile};
 
 /// What a live session says about an addr's newest run log.
 #[derive(Debug)]
@@ -113,8 +114,8 @@ pub enum RunLogLookup {
 /// A session that cannot be read is skipped (logged at debug), never an
 /// error: only an unreadable `root` is.
 ///
-/// Blocking: probes each session's lock and reads the `events.ndjson` of
-/// those that are live and in this workspace.
+/// Blocking: probes each session's lock and reads the records of those that
+/// are live and in this workspace.
 pub fn find_run_log(
     root: &SessionRoot,
     home: &Path,
@@ -241,29 +242,23 @@ fn session_lookup(dir: &Path, home: &Path, addr: &str) -> anyhow::Result<Session
     if !lockfile::is_held(&dir.join(files::LOCK)).context("probing the session's lock")? {
         return Ok(SessionLookup::Nothing);
     }
-    let meta = match std::fs::read(dir.join(files::META)) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(SessionLookup::Nothing),
-        Err(e) => return Err(e).context("reading meta.json"),
+    let root = dir.parent().unwrap_or(dir);
+    let opened = match store::open_local(root, dir) {
+        Ok(opened) => opened,
+        // Not created yet, a newer format or not a recording: not one this
+        // heph follows.
+        Err(OpenError::Missing | OpenError::NotASession | OpenError::TooNew { .. }) => {
+            return Ok(SessionLookup::Nothing);
+        }
+        Err(OpenError::Other(e)) => return Err(e.context("opening the session's recording")),
     };
-    // A newer format or a corrupt file: not one this heph follows.
-    let Ok(meta) = SessionMeta::decode(&meta) else {
+    let Ok(meta) = store::read_meta(&opened.conn) else {
         return Ok(SessionLookup::Nothing);
     };
     if meta.home_dir.as_deref().map(Path::new) != Some(home) {
         return Ok(SessionLookup::Nothing);
     }
-    let events = match File::open(dir.join(files::EVENTS)) {
-        Ok(f) => f,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(SessionLookup::Nothing),
-        Err(e) => return Err(e).context("opening events.ndjson"),
-    };
-    let mut reader = RecordReader::new(events);
-    // Every record below is about `addr`, and the recorder writes compact
-    // JSON: a line that does not hold the addr as a JSON string is not
-    // decoded. The closing quote keeps `//p:a` from finding `//p:ab`.
-    let quoted = serde_json::to_vec(addr).context("encoding the addr")?;
-    let needle = memchr::memmem::Finder::new(&quoted);
+    let mut reader = RecordCursor::new(opened);
     let mut newest: Option<(u64, RunLogRecord)> = None;
     let mut ended = false;
     // The `ExecuteStart` of a run of the addr not followed by its end: it
@@ -275,8 +270,8 @@ fn session_lookup(dir: &Path, home: &Path, addr: &str) -> anyhow::Result<Session
     // the two come from different writers, so file order is not run order.
     let mut not_streamed: Option<u64> = None;
     while let Some(rec) = reader
-        .next_containing(&needle)
-        .context("reading events.ndjson")?
+        .next_record()
+        .context("reading the session's records")?
     {
         match (rec.kind, rec.session) {
             (_, Some(SessionRecordKind::RunLog(run)))
@@ -408,11 +403,11 @@ impl LiveRunLogLocator for SessionRunLogLocator {
 
 /// The log API's [`LiveRunLogLocator`] for `heph session attach`: the one
 /// session it follows, answered from the `RunLog` records its stream already
-/// carried ([`SessionFeed::run_log`]) instead of rescanning `events.ndjson`,
+/// carried ([`SessionFeed::run_log`]) instead of rescanning its records,
 /// so the LAST LINE column can ask for every visible row each batch.
 ///
 /// The rules are this module's, applied to that one session: only for the
-/// home its `meta.json` names, only a live session, the newest record wins,
+/// home its session row names, only a live session, the newest record wins,
 /// an `ExecuteEnd` after it or a file gone means ended, and `file` is opened
 /// as [`find_run_log`] opens it.
 ///
@@ -428,7 +423,7 @@ impl LiveRunLogLocator for SessionRunLogLocator {
 pub struct FeedRunLogLocator {
     feed: super::SessionFeed,
     id: SessionId,
-    /// The session's home, from its `meta.json`.
+    /// The session's home, from its session row.
     home: PathBuf,
     /// Its lock was held when the viewer probed it, before reading it.
     live: bool,
@@ -564,15 +559,18 @@ mod tests {
 
     const ADDR: &str = "//p:t";
 
-    /// A session directory as a recording heph leaves it: `meta.json` for
-    /// `home`, `events.ndjson` holding `records`, and its lock, held while
-    /// the returned file is.
+    /// A session directory as a recording heph leaves it: its lock, held
+    /// while the returned file is, and a `session.db` for `home` holding
+    /// `records`.
     fn session(root: &Path, n: u8, home: &Path, records: &[SessionRecord]) -> (PathBuf, File) {
         let id = SessionId::new(1_800_000_000_000 + u64::from(n), n);
         let dir = root.join(id.encode());
         std::fs::create_dir_all(&dir).expect("session dir");
         let lock = lockfile::acquire_owner_lock(&dir.join(files::LOCK)).expect("lock");
-        recorder::write_atomically(&dir, files::META, &meta(id, home)).expect("meta");
+        drop(
+            store::create(&dir, &meta(id, home), &store::Provenance::default(), false)
+                .expect("create the recording"),
+        );
         append(&dir, records);
         (dir, lock)
     }
@@ -595,14 +593,23 @@ mod tests {
         }
     }
 
+    /// Commit `records` after whatever `dir`'s recording holds, as the owner
+    /// does.
     fn append(dir: &Path, records: &[SessionRecord]) {
-        let mut f = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join(files::EVENTS))
-            .expect("events");
+        let conn = rusqlite::Connection::open(dir.join(store::FILE)).expect("open rw");
         for r in records {
-            writeln!(f, "{}", serde_json::to_string(r).expect("encode")).expect("write");
+            let (kind, addr) = store::kind_and_addr(r);
+            conn.execute(
+                "INSERT INTO records (seq, at_ms, kind, addr, body)
+                 VALUES ((SELECT coalesce(max(seq), 0) + 1 FROM records), ?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    i64::try_from(r.at_unix_ms).expect("at"),
+                    kind,
+                    addr,
+                    serde_json::to_string(r).expect("encode"),
+                ],
+            )
+            .expect("insert");
         }
     }
 
@@ -739,12 +746,11 @@ mod tests {
         );
     }
 
-    /// The lookup passes over lines that do not hold the addr as a JSON
-    /// string. A longer addr it is a prefix of (`//p:a` in `//p:ab`) never
-    /// ends or answers for it, and an addr JSON has to escape (a quote, a
-    /// backslash, non-ASCII) is still found.
+    /// A longer addr it is a prefix of (`//p:a` in `//p:ab`) never ends or
+    /// answers for it, and an addr JSON has to escape (a quote, a backslash,
+    /// non-ASCII) is still found.
     #[test]
-    fn run_log_lookup_prefilter_near_misses_and_escapes() {
+    fn run_log_lookup_near_misses_and_escapes() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let home = tmp.path().join("home");
         let root = tmp.path().join("sessions");
@@ -1210,35 +1216,45 @@ mod tests {
         absent(7, &home, "runs/e/0.log");
     }
 
-    /// Past the 64 MiB cap (`Truncated` written), a run that starts still
-    /// writes its `RunLog` record through the session slot, and a follower
-    /// finds it; once the session ends, it reads as absent.
+    /// Past the full cap (injected small; `Truncated` written), a run that
+    /// starts still writes its `RunLog` record through the session slot, and
+    /// a follower finds it; once the session ends, it reads as absent.
     #[test]
     fn run_log_record_outlives_cap() {
+        const MIB: usize = 1024 * 1024;
         let user = tempfile::tempdir().expect("tempdir");
         let ws = tempfile::tempdir().expect("tempdir");
         let home = ws.path().join(".heph");
         let slot = Arc::new(SessionSlot::new());
-        let root = SessionRoot::from_env(None, Some(user.path().as_os_str()));
-        let sessions = root.clone().expect("root").expect("recording on");
-        slot.configure(root, vec!["heph".into()]);
-        slot.set_workspace(ws.path(), ws.path(), &home);
-        let opened = slot
-            .open(
-                SessionHeader {
+        let sessions = SessionRoot::new(user.path().join("sessions"));
+        let session = super::super::Session::open_with(
+            &sessions,
+            super::super::SessionStart {
+                header: SessionHeader {
                     kind: super::super::HeaderKind::Build,
                     label: "run".into(),
                 },
-                false,
-            )
-            .expect("a session opened");
-        // Build events, not log lines: those outlive the cap.
-        let big = "x".repeat(1024 * 1024);
-        let laps = recorder::EVENTS_CAP / (1024 * 1024) + 6;
-        for _ in 0..laps {
-            opened.tap.event(hcore::events::BuildEvent {
+                home_dir: Some(home.to_string_lossy().into_owned()),
+                ..super::super::SessionStart::default()
+            },
+            super::super::cleanup::Retention::default(),
+            recorder::Faults {
+                full_cap: Some(4 * 1024 * 1024),
+                ..recorder::Faults::default()
+            },
+        )
+        .expect("open");
+        let (id, tap) = (session.id(), session.tap());
+        slot.install(session);
+        // Progress-only build events, which the cap drops.
+        let big = "x".repeat(MIB);
+        for _ in 0..6 {
+            tap.event(hcore::events::BuildEvent {
                 at_unix_ms: 1,
-                kind: hcore::events::BuildEventKind::ResultStart { addr: big.clone() },
+                kind: hcore::events::BuildEventKind::Matched {
+                    addrs: vec![big.clone()],
+                    complete: false,
+                },
             });
         }
         // A gated target past the cap: its prompt carries the notice's
@@ -1253,7 +1269,7 @@ mod tests {
                 hashout: "o1".into(),
             },
         }];
-        opened.tap.view(
+        tap.view(
             2,
             SessionRecordKind::Approval {
                 prompt: Some(Box::new(super::super::ApprovalPrompt {
@@ -1285,14 +1301,15 @@ mod tests {
             assert!(Instant::now() < deadline, "the RunLog record never landed");
             std::thread::sleep(Duration::from_millis(20));
         };
-        assert_eq!(found.session, opened.id);
+        assert_eq!(found.session, id);
         assert!(
             matches!(&found.log, SessionRunLog::Live { record, .. } if record.hashin == "h0"),
             "{found:?}"
         );
         let dir = slot.dir().expect("dir");
-        let file = File::open(dir.join(files::EVENTS)).expect("events");
-        let mut r = RecordReader::new(file);
+        let mut r = RecordCursor::new(
+            store::open_local(sessions.path(), &dir).expect("open the recording"),
+        );
         let kinds: Vec<_> = std::iter::from_fn(|| r.next_record().expect("read"))
             .filter_map(|rec| rec.session)
             .filter(|k| !matches!(k, SessionRecordKind::Log { .. }))
@@ -1312,6 +1329,7 @@ mod tests {
             prompt.queue[0].notices[0].sources, sources,
             "the notice's sources are recorded past the cap"
         );
+        drop(r);
 
         slot.finish(Some(0));
         assert!(
@@ -1322,10 +1340,8 @@ mod tests {
         );
     }
 
-    /// The lookup's prefilter searches for the addr as `serde_json` quotes it,
-    /// which holds only while the recorder writes compact JSON through
-    /// `serde_json` too. Pinned here against the real recorder, not the test
-    /// fixture's own encoding: an addr JSON has to escape is found.
+    /// Pinned against the real recorder, not the test fixture's own encoding:
+    /// an addr JSON has to escape is found.
     #[test]
     fn recorded_run_log_of_an_escaped_addr_is_found() {
         let user = tempfile::tempdir().expect("tempdir");
