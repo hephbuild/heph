@@ -18,7 +18,7 @@ use heph::htaddr::parse_addr;
 use heph::htmatcher::Matcher;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
 fn write_build(root: &Path, content: &str) {
     let dir = root.join("p");
@@ -507,23 +507,28 @@ async fn lock_wait_lasts_while_the_lock_is_held() -> anyhow::Result<()> {
         let engine = Arc::clone(&engine);
         async move { run_drain_events(&engine, &target("//p:t")).await }
     });
-    let held = Duration::from_millis(600);
-    tokio::time::sleep(held).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let released_us = u64::try_from(UNIX_EPOCH.elapsed()?.as_micros())?;
     drop(write);
     let (res, events) = tokio::time::timeout(Duration::from_secs(30), run).await??;
     res?;
 
+    // However late the fresh engine reached the lock, its wait started
+    // before the release and lasted until it.
     let (spans, _, _) = one_result(&events, "//p:t");
     assert_well_formed(&spans);
-    let waited = spans
+    let lock_wait = spans
         .iter()
         .filter(|s| s.phase() == Some(Phase::LockWait))
-        .map(PhaseSpan::duration_us)
-        .max()
+        .max_by_key(|s| s.duration_us())
         .expect("a lock_wait span");
     assert!(
-        waited >= 400_000,
-        "waited most of the {held:?} the lock was held: {waited}us in {spans:?}"
+        lock_wait.start_unix_us < released_us,
+        "the wait started before the lock was released at {released_us}us: {lock_wait:?} in {spans:?}"
+    );
+    assert!(
+        lock_wait.end_unix_us + SLACK_US >= released_us,
+        "the wait lasted until the lock was released at {released_us}us: {lock_wait:?} in {spans:?}"
     );
     Ok(())
 }

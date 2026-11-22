@@ -3403,17 +3403,21 @@ impl Engine {
                 // `heph.deps` around the wait on the dependencies' hashouts —
                 // and `link` runs beside it, so it marks none. What `link`
                 // still had to do once `meta` was done is resolution too.
+                // The clock is read only when something listens.
+                let listening = phases.is_some();
+                let stamp = move || listening.then(std::time::Instant::now);
                 let link_fut = futures::FutureExt::map(
                     Arc::clone(&self).link(rs.clone(), def.target_def.clone()),
-                    |res| (res, std::time::Instant::now()),
+                    move |res| (res, stamp()),
                 );
                 let meta_fut = futures::FutureExt::map(
                     Arc::clone(&self).meta_with_phases(rs.clone(), addr, phases.clone()),
-                    |res| (res, std::time::Instant::now()),
+                    move |res| (res, stamp()),
                 );
                 let ((link_res, link_done), (meta_res, meta_done)) =
                     tokio::join!(link_fut, meta_fut);
                 if let Some(rec) = phases.as_deref()
+                    && let (Some(link_done), Some(meta_done)) = (link_done, meta_done)
                     && link_done > meta_done
                 {
                     rec.record(Phase::Resolve, meta_done, link_done);

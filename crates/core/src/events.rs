@@ -992,6 +992,24 @@ impl PhaseSpan {
     }
 }
 
+/// Declares `Phase` and `Phase::ALL` from one list of variants, so a variant
+/// cannot be left out of `ALL`.
+macro_rules! phases {
+    (
+        $(#[$attr:meta])*
+        pub enum Phase { $($(#[$vattr:meta])* $variant:ident,)+ }
+    ) => {
+        $(#[$attr])*
+        pub enum Phase { $($(#[$vattr])* $variant,)+ }
+
+        impl Phase {
+            /// Every phase, in declaration order.
+            pub const ALL: [Phase; [$(Phase::$variant),+].len()] = [$(Phase::$variant),+];
+        }
+    };
+}
+
+phases! {
 /// The phases the engine measures in a target's result, named only when a
 /// `ResultEnd` is built ([`PhaseSpan`]).
 ///
@@ -1001,10 +1019,11 @@ impl PhaseSpan {
 /// whose meaning changes gets a new name too.
 ///
 /// `Deps`, `LockWait`, `Admission` and `Scratch` are waits on something
-/// else; the rest is heph's or the target's own work. The process time of different drivers is not comparable: a driver
-/// that arms the run clock gets `Stage` / `Process` / `Collect`, one that
-/// does not — every cdylib driver, for one — gets `Stage` and a whole
-/// `DriverRun`, its own setup and teardown inside it.
+/// else; the rest is heph's or the target's own work. The process time of
+/// different drivers is not comparable: a driver that arms the run clock
+/// gets `Stage` / `Process` / `Collect`, one that does not — every cdylib
+/// driver, for one — gets `Stage` and a whole `DriverRun`, its own setup
+/// and teardown inside it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Phase {
     /// Waiting on the results of the target's dependencies, and only that:
@@ -1041,23 +1060,9 @@ pub enum Phase {
     /// Writing the run's outputs to the cache.
     CacheWrite,
 }
+}
 
 impl Phase {
-    /// Every phase, in declaration order.
-    pub const ALL: [Phase; 11] = [
-        Phase::Deps,
-        Phase::Resolve,
-        Phase::LockWait,
-        Phase::CacheRead,
-        Phase::Admission,
-        Phase::Scratch,
-        Phase::Stage,
-        Phase::Process,
-        Phase::DriverRun,
-        Phase::Collect,
-        Phase::CacheWrite,
-    ];
-
     /// The span name, as `ResultEnd.spans` spells it. Frozen once released.
     pub const fn name(self) -> &'static str {
         match self {
@@ -2190,29 +2195,6 @@ mod tests {
             assert_eq!(Phase::from_name(p.name()), Some(p));
         }
         assert_eq!(Phase::from_name("heph.something_later"), None);
-    }
-
-    /// `Phase::ALL` is hand-kept: a new variant fails to compile here until
-    /// it has an index, and the test fails until `ALL` holds it there, so
-    /// `from_name` can never miss a phase the engine records.
-    #[test]
-    fn phase_all_is_exhaustive() {
-        let index = |p: Phase| match p {
-            Phase::Deps => 0,
-            Phase::Resolve => 1,
-            Phase::LockWait => 2,
-            Phase::CacheRead => 3,
-            Phase::Admission => 4,
-            Phase::Scratch => 5,
-            Phase::Stage => 6,
-            Phase::Process => 7,
-            Phase::DriverRun => 8,
-            Phase::Collect => 9,
-            Phase::CacheWrite => 10,
-        };
-        for (i, p) in Phase::ALL.into_iter().enumerate() {
-            assert_eq!(index(p), i, "{p:?} out of place in Phase::ALL");
-        }
     }
 
     /// A reader built before `ResultEnd.spans` decodes a frame that carries
