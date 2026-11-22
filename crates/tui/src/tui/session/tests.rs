@@ -816,6 +816,17 @@ fn caps_truncate_twice() {
         u64::try_from(bodies).expect("size") <= 16 * MIB + 1024,
         "{bodies}"
     );
+    // The caps count record bodies (and the explorer rows' estimated bytes),
+    // not SQLite's pages: the sealed file is larger than what was counted,
+    // by its page overhead, but stays in proportion to it. Here, with 1 MiB
+    // bodies, within a quarter over the ceiling (SESSIONS.md, Recording).
+    let on_disk = std::fs::metadata(dir.join(store::FILE))
+        .expect("stat")
+        .len();
+    assert!(
+        on_disk <= 16 * MIB + 16 * MIB / 4,
+        "{on_disk} bytes on disk for a 16 MiB ceiling"
+    );
     let truncated: Vec<i64> = opened
         .conn
         .prepare("SELECT seq FROM records WHERE kind = 'Truncated' ORDER BY seq")
@@ -1772,11 +1783,21 @@ fn explorer_rows(conn: &rusqlite::Connection) -> Vec<String> {
 }
 
 /// I4: re-deriving a sealed recording from its records gives exactly the
-/// explorer rows the owner derived live — for a whole run, and for one cut
-/// at the ceiling, where both stop at the same record.
+/// explorer rows the owner derived live — for a whole run, for one past its
+/// full cap only (derivation goes on over the critical kinds), and for one
+/// cut at the ceiling, where both stop at the same record. Each case checks
+/// it reached the cap it claims (the `Truncated` count, `truncated_seq`
+/// set only at the ceiling), and that past the full cap only critical kinds
+/// were kept, so a cap that stopped firing turns a capped case into a whole
+/// run and fails here rather than passing vacuously.
 #[test]
 fn rederive_matches_the_live_derivation() {
-    for faults in [Faults::default(), capped(2 * MIB, 4 * MIB)] {
+    let cases = [
+        (Faults::default(), 0),
+        (capped(2 * MIB, 64 * MIB), 1),
+        (capped(2 * MIB, 4 * MIB), 2),
+    ];
+    for (faults, cuts) in cases {
         let root = tempfile::tempdir().expect("tempdir");
         let rec = recorder_with(root.path(), faults.clone());
         let tap = rec.tap();
@@ -1796,8 +1817,40 @@ fn rederive_matches_the_live_derivation() {
             }
             tap.event(end);
         }
+        // Progress-only and a log line: dropped once past the full cap.
+        tap.event(events().remove(0));
+        assert!(tap.log(1, "INFO", "late".into()).is_none());
         rec.recorder.finish(Some(1), false, Duration::from_secs(10));
+
+        let (records, skipped) = read_records(rec.dir());
+        assert_eq!(skipped, 0);
+        let truncated: Vec<usize> = records
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.session == Some(SessionRecordKind::Truncated))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(truncated.len(), cuts, "{faults:?}");
+        if let Some(&first) = truncated.first() {
+            assert!(
+                records[first + 1..].iter().all(recorder::is_critical),
+                "only critical kinds past the full cap ({faults:?})"
+            );
+            assert!(
+                records[first + 1..]
+                    .iter()
+                    .any(|r| matches!(r.kind, Some(BuildEventKind::ResultEnd { .. }))),
+                "a critical kind is kept past the full cap ({faults:?})"
+            );
+        }
         let conn = alter(rec.dir());
+        let end = store::read_row_end(&conn).expect("row end");
+        // The session row's `truncated` is the ceiling's mark (I8); the
+        // full cap alone shows in the `status` row and a `Truncated` record.
+        assert_eq!(end.truncated, cuts == 2, "{faults:?}");
+        assert_eq!(end.truncated_seq.is_some(), cuts == 2, "{faults:?}");
+        let (_, status) = read_status(rec.dir()).expect("a status row");
+        assert_eq!(status.truncated, cuts > 0, "{faults:?}");
         let live = explorer_rows(&conn);
         assert!(
             live.iter().any(|r| r.starts_with("spans: ")),

@@ -165,7 +165,7 @@ still in WAL mode (live, or a seal cut short) or sealed (rollback mode).
 
 | Table | Holds |
 | --- | --- |
-| `session` | exactly one row: id, `format`, heph version, owner pid, `host`, `user`, `actor_kind` (`human`, `agent`, `ci`), `actor_name` (`claude-code`, `github-actions`, `unknown`), `ci_run_url`, `command`, `argv` (a JSON array), `cwd` (`HEPH_CWD` when set), workspace root and home, `git_head` (always NULL for now), label, interactive, `capabilities`, `lossy` (argv or cwd lost bytes: a NUL or invalid UTF-8 stored as U+FFFD), `started_ms`, `ended_ms`, `exit_code`, `panicked`, `truncated` and `truncated_seq`, `derivation`, `sealed`, `snapshot` (0 in a local recording; 1 in an export taken of a session still running, a later PR) |
+| `session` | exactly one row: id, `format`, heph version, owner pid, `host`, `user`, `actor_kind` (`human`, `agent`, `ci`), `actor_name` (`claude-code`, `github-actions`, `unknown`), `ci_run_url`, `command`, `argv` (a JSON array), `cwd` (`HEPH_CWD` when set), workspace root and home, `git_head` (always NULL for now), label, interactive, `capabilities`, `lossy` (argv or cwd lost bytes: a NUL or invalid UTF-8 stored as U+FFFD), `started_ms`, `ended_ms`, `exit_code`, `panicked`, `truncated` and `truncated_seq` (set once the recording reached its 1 GiB ceiling; passing only the 256 MiB full cap shows as the first `heph.truncated` span event and in `status`), `derivation`, `sealed`, `snapshot` (0 in a local recording; 1 in an export taken of a session still running, a later PR) |
 | `records` | the source of truth, in stream order: `seq`, `at_ms`, `kind` (the record's variant name), `addr`, and `body`, the record as JSON (see [Records](#records)) |
 | `status` | one row: the latest `SessionSnapshot`, upserted at most once a second and only when changed, and the final one at exit |
 | `notices`, `failure_logs` | empty in a local recording; filled only by an export (a later PR) |
@@ -646,7 +646,12 @@ included. The recorder is its own OS thread behind an unbounded channel:
   re-derivation from `records` is exact (I4). Only `End` follows, and the
   `status` row keeps updating. `show` then says the recording is
   incomplete. An `Output` record keeps at most the first 1 MiB of its text,
-  then a line saying how many bytes were left out.
+  then a line saying how many bytes were left out. Both caps count record
+  bodies (the ceiling adds an estimate of the explorer rows' bytes), not
+  SQLite's pages, indexes or `-wal`: `session.db` on disk is larger than the
+  bytes counted by its page overhead, under 1% with large records and more
+  with many small ones, and `keepBytes` counts the files as they are on
+  disk.
 - The `LogSink` numbers every line it takes, a log line at the terminal's
   filter or a diagnostic, and records it as `Log {seq}`. Numbering, sending
   the record and handing the line to the printer are one critical section of
