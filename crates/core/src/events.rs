@@ -399,10 +399,38 @@ pub enum BuildEventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         left_behind: Option<Box<LeftBehindData>>,
         /// Where the result's time went, phase by phase ([`PhaseSpan`]),
-        /// ordered by start. Measured only for a request something listens
-        /// to; empty from a host that predates it, for a result that ended
-        /// before any phase began, and for a failure reported outside a
-        /// result's scope. Never on a result, a cache entry or any hash.
+        /// ordered by start. Never on a result, a cache entry or any hash.
+        ///
+        /// - **Per `ResultEnd`, never per addr.** A target can end more than
+        ///   once in one request: one result scope per output selection
+        ///   asked of it (its hashout for one consumer, its outputs for
+        ///   another), each with its own `ResultStart`/`ResultEnd` and its
+        ///   own spans. Exactly one of them did the lookup and the run; the
+        ///   others waited on it. There is no scope id: pair each
+        ///   `ResultStart` with the next `ResultEnd` of the same addr, in
+        ///   stream order, take the spans from that `ResultEnd`, and sum
+        ///   spans per `ResultEnd`. Summed per addr, a target's time counts
+        ///   twice; a `ResultEnd` with no run phases does not mean the
+        ///   target was free.
+        /// - **They do not tile the result.** The time between `ResultStart`
+        ///   and `ResultEnd` is more than the sum of the spans. Known gaps:
+        ///   waiting on a computation another scope started (a shared
+        ///   cell: the scope that created it records its phases, the others
+        ///   record the wait as nothing), acquiring the target's
+        ///   credentials, and waiting for an approval gate.
+        /// - **Sequential and non-overlapping** within one `ResultEnd`:
+        ///   each span starts at or after the previous one's end.
+        /// - **Names repeat.** A phase entered twice is two spans (the
+        ///   result lock's wait and the execute lock's, both
+        ///   `heph.lock_wait`), and start order is the only thing that tells
+        ///   them apart. Collapse same-named spans only for a total.
+        /// - **May be truncated.** A result records a bounded number of
+        ///   spans; one that goes past it (a run retried for lapsing
+        ///   credentials, a contended lock) drops its latest phases.
+        /// - **Empty means unknown, not zero:** a host that predates the
+        ///   field, a request nothing listened to (spans are measured only
+        ///   then), a result that ended before any phase began, or a failure
+        ///   reported outside a result's scope.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         spans: Vec<PhaseSpan>,
     },
@@ -938,7 +966,13 @@ pub struct TimedOutData {
 /// `name` is one of [`Phase::name`] from this build, or a name a newer host
 /// added: a consumer keeps a span it does not know rather than dropping it.
 /// A name may repeat (a phase entered twice is two spans, never one that
-/// covers what ran between).
+/// covers what ran between), and the spans' start order is the only thing
+/// that tells repeats apart.
+///
+/// The spans of one `ResultEnd` are sequential and never overlap, but they
+/// need not be contiguous and need not cover the whole result, and the list
+/// may be truncated: see `ResultEnd.spans` for how to read them, and why a
+/// consumer sums them per `ResultEnd`, never per addr.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PhaseSpan {
     pub name: std::borrow::Cow<'static, str>,
@@ -965,14 +999,27 @@ impl PhaseSpan {
 /// recipes and its OTLP export key on them, and a name, once released, never
 /// changes meaning. A new phase is a new variant with a new name; a phase
 /// whose meaning changes gets a new name too.
+///
+/// `Deps`, `LockWait`, `Admission` and `Scratch` are waits on something
+/// else; the rest is heph's or the target's own work. The process time of different drivers is not comparable: a driver
+/// that arms the run clock gets `Stage` / `Process` / `Collect`, one that
+/// does not — every cdylib driver, for one — gets `Stage` and a whole
+/// `DriverRun`, its own setup and teardown inside it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Phase {
-    /// Waiting on the results of the target's dependencies: the ones its
-    /// cache key folds in, and the runtime ones its run reads.
+    /// Waiting on the results of the target's dependencies, and only that:
+    /// the ones its cache key folds in (their hashouts), and the runtime
+    /// ones its run reads (their outputs). A target with no dependency has
+    /// no such span. heph's own work around the wait is `Resolve`.
     Deps,
-    /// Resolving the target's spec and def.
+    /// heph working out what the target is and what its cache key is: its
+    /// spec and def, its expanded inputs and the defs they name, and the
+    /// hash over its dependencies' hashouts. The wait on those
+    /// dependencies splits it, so a result usually has more than one.
     Resolve,
     /// Waiting on another holder of the target's result or execute lock.
+    /// The first is the result lock's, a later one the execute lock's (or
+    /// a re-taken read on the result); only their order tells them apart.
     LockWait,
     /// Reading the cache: probing for a revision and, on a hit, reading it.
     CacheRead,
@@ -2143,6 +2190,90 @@ mod tests {
             assert_eq!(Phase::from_name(p.name()), Some(p));
         }
         assert_eq!(Phase::from_name("heph.something_later"), None);
+    }
+
+    /// `Phase::ALL` is hand-kept: a new variant fails to compile here until
+    /// it has an index, and the test fails until `ALL` holds it there, so
+    /// `from_name` can never miss a phase the engine records.
+    #[test]
+    fn phase_all_is_exhaustive() {
+        let index = |p: Phase| match p {
+            Phase::Deps => 0,
+            Phase::Resolve => 1,
+            Phase::LockWait => 2,
+            Phase::CacheRead => 3,
+            Phase::Admission => 4,
+            Phase::Scratch => 5,
+            Phase::Stage => 6,
+            Phase::Process => 7,
+            Phase::DriverRun => 8,
+            Phase::Collect => 9,
+            Phase::CacheWrite => 10,
+        };
+        for (i, p) in Phase::ALL.into_iter().enumerate() {
+            assert_eq!(index(p), i, "{p:?} out of place in Phase::ALL");
+        }
+    }
+
+    /// A reader built before `ResultEnd.spans` decodes a frame that carries
+    /// them: the field is ignored, and everything it knew reads as before.
+    #[test]
+    fn result_end_spans_decode_in_an_older_reader() {
+        #[derive(Deserialize)]
+        struct OldEvent {
+            at_unix_ms: u64,
+            kind: OldKind,
+        }
+        /// `ResultEnd` as it was before `spans`.
+        #[derive(Deserialize)]
+        #[serde(tag = "type")]
+        enum OldKind {
+            ResultEnd {
+                addr: String,
+                error: Option<String>,
+                #[serde(default)]
+                timed_out: Option<TimedOutData>,
+                #[serde(default)]
+                cancelled: bool,
+                #[serde(default)]
+                left_behind: Option<Box<LeftBehindData>>,
+            },
+        }
+
+        let ev = BuildEvent {
+            at_unix_ms: 9,
+            kind: BuildEventKind::ResultEnd {
+                spans: vec![PhaseSpan {
+                    name: Phase::Process.name().into(),
+                    start_unix_us: 100,
+                    end_unix_us: 250,
+                }],
+                left_behind: None,
+                addr: "//a:x".into(),
+                error: Some("boom".into()),
+                upstream_of: None,
+                exit_status: None,
+                log_tail: None,
+                timed_out: None,
+                cancelled: true,
+            },
+        };
+        let json = serde_json::to_string(&ev).expect("encode");
+        assert!(json.contains(r#""spans":["#), "{json}");
+        let old: OldEvent = serde_json::from_str(&json).expect("an older reader decodes it");
+        assert_eq!(old.at_unix_ms, 9);
+        let OldKind::ResultEnd {
+            addr,
+            error,
+            timed_out,
+            cancelled,
+            left_behind,
+        } = old.kind;
+        assert_eq!(addr, "//a:x");
+        assert_eq!(error.as_deref(), Some("boom"));
+        assert!(timed_out.is_none());
+        assert!(cancelled);
+        assert!(left_behind.is_none());
     }
 
     /// `ResultEnd.spans` is additive on the wire (D21): an empty list is not

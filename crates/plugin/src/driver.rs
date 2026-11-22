@@ -2425,12 +2425,18 @@ impl RunClock {
 
     /// When [`start`](Self::start) moved the clock to running: `None` for an
     /// inert clock, or one that never started (stopped first, or not yet).
+    ///
+    /// Engine-only, for the phase spans. A driver must not read it, nor
+    /// [`exited_at`](Self::exited_at), let alone branch on them: whether the
+    /// clock is live depends on whether anything listens to the build, so
+    /// anything a run decided from them would change with a listener.
     pub fn spawned_at(&self) -> Option<std::time::Instant> {
         self.0.as_ref().and_then(|i| i.spawned.get().copied())
     }
 
     /// When [`stop`](Self::stop) stopped the clock: `None` for an inert
-    /// clock, or one not stopped yet.
+    /// clock, or one not stopped yet. Engine-only, like
+    /// [`spawned_at`](Self::spawned_at).
     pub fn exited_at(&self) -> Option<std::time::Instant> {
         self.0.as_ref().and_then(|i| i.exited.get().copied())
     }

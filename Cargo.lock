@@ -1886,7 +1886,6 @@ dependencies = [
  "model",
  "object_store",
  "parking_lot 0.13.0",
- "pin-project-lite",
  "plugin",
  "plugin-abi",
  "plugin-buildfile",
