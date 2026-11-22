@@ -1,3 +1,5 @@
+use crate::engine::driver::targetdef::Input;
+use crate::engine::phase_spans::{self, PhaseRecorder};
 use crate::engine::request_state::{AddrKey, RequestState};
 use crate::engine::result::ExtendedTargetDef;
 use crate::engine::{EResult, Engine, OutputMatcher, ResultOptions};
@@ -5,6 +7,7 @@ use anyhow::Context;
 use async_recursion::async_recursion;
 use enclose::enclose;
 use hcore::debug_hash::DebugHasher;
+use hcore::events::Phase;
 use hcore::hmemoizer::unwrap_arc_err;
 use hmodel::htaddr::Addr;
 use std::hash::Hasher;
@@ -22,13 +25,27 @@ impl Engine {
         rs: Arc<RequestState>,
         addr: &Addr,
     ) -> anyhow::Result<ResultMeta> {
+        self.meta_with_phases(rs, addr, None).await
+    }
+
+    /// [`meta`](Self::meta), marking its phases on `phases` when this call is
+    /// the one that computes it: `heph.resolve` for its own work, `heph.deps`
+    /// around the wait on the dependencies' results. A call that finds the
+    /// computation already under way marks nothing; its wait is a gap in its
+    /// scope's spans.
+    pub(crate) async fn meta_with_phases(
+        self: Arc<Self>,
+        rs: Arc<RequestState>,
+        addr: &Addr,
+        phases: Option<Arc<PhaseRecorder>>,
+    ) -> anyhow::Result<ResultMeta> {
         let res = rs
             .data
             .mem_meta
             .once(
                 AddrKey(addr.clone()),
                 enclose!((self => engine, rs, addr) move || async move {
-                    engine.inner_meta(rs, &addr).await
+                    engine.inner_meta(rs, &addr, phases.as_deref()).await
                 }),
             )
             .await
@@ -59,11 +76,27 @@ impl Engine {
         self: Arc<Self>,
         rs: Arc<RequestState>,
         addr: &Addr,
+        phases: Option<&PhaseRecorder>,
     ) -> anyhow::Result<ResultMeta> {
+        // Resolution, then the wait on the dependencies, then the hash: three
+        // phases in sequence, never overlapping.
+        let resolving = phase_spans::open(phases, Phase::Resolve);
         // _no_track: meta is invoked from inner_result_addr after parent was
         // already set to addr — tracked get_def would record addr→addr.
         let def = Arc::clone(&self).get_def_no_track(rs.clone(), addr).await?;
-        let results = self.clone().inputs_result_meta(rs.clone(), addr).await?;
+        let inputs = Arc::clone(&self)
+            .expanded_inputs_for(rs.clone(), addr)
+            .await?;
+        drop(resolving);
+        // A target with no hashed input waits on nothing.
+        let waits = inputs.iter().any(|input| input.hashed);
+        let results = phase_spans::timed(
+            phases.filter(|_| waits),
+            Phase::Deps,
+            self.clone().inputs_result_meta(rs.clone(), &inputs),
+        )
+        .await?;
+        let _resolving = phase_spans::open(phases, Phase::Resolve);
 
         // Borrow the input hashouts rather than cloning each `String`: they live
         // in `results` (held until `hashin` returns) and the hash only reads their
@@ -110,12 +143,8 @@ impl Engine {
     async fn inputs_result_meta(
         self: Arc<Self>,
         rc: Arc<RequestState>,
-        addr: &Addr,
+        inputs: &[Input],
     ) -> anyhow::Result<Vec<Arc<EResult>>> {
-        let inputs = Arc::clone(&self)
-            .expanded_inputs_for(rc.clone(), addr)
-            .await?;
-
         let fail_fast = rc.fail_fast();
         // Only `hashed=true` inputs contribute their hashout to the parent's
         // hashin. `runtime_deps` (hashed=false) are still materialized via

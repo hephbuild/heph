@@ -16,6 +16,7 @@
 //! on an `EResult`, a memo value or key, the cache, or any hash; and nothing
 //! about them reaches a target's argv, env or files.
 
+use futures::FutureExt;
 use hcore::events::{Phase, PhaseSpan};
 use std::future::Future;
 use std::time::{Instant, SystemTime};
@@ -50,9 +51,10 @@ impl ClockAnchor {
     }
 }
 
-/// How many phases one result records. A result enters about a dozen on its
-/// longest path; marks past this are dropped, never grown into.
-const CAPACITY: usize = 24;
+/// How many phases one result records: the longest path a result can take
+/// marks 23 (`tests::worst_path_fits`), and the rest is margin. Marks past
+/// this are dropped, never grown into.
+const CAPACITY: usize = 32;
 
 /// An end offset not yet recorded: the phase is still open.
 const OPEN: u64 = u64::MAX;
@@ -67,6 +69,8 @@ struct Mark {
 #[derive(Debug)]
 struct Marks {
     len: usize,
+    /// A mark has been dropped at capacity (and logged).
+    overflowed: bool,
     buf: [Mark; CAPACITY],
 }
 
@@ -83,6 +87,7 @@ impl PhaseRecorder {
             anchor,
             marks: parking_lot::Mutex::new(Marks {
                 len: 0,
+                overflowed: false,
                 buf: [Mark {
                     phase: Phase::Deps,
                     start_ns: 0,
@@ -92,11 +97,24 @@ impl PhaseRecorder {
         }
     }
 
-    /// Append a mark; `None` once the array is full.
+    /// Append a mark; `None` once the array is full. The first mark dropped
+    /// says so once, at debug: the spans this result's `ResultEnd` carries
+    /// are truncated.
     fn push(&self, phase: Phase, start_ns: u64, end_ns: u64) -> Option<usize> {
         let mut marks = self.marks.lock();
         let idx = marks.len;
-        let slot = marks.buf.get_mut(idx)?;
+        let Some(slot) = marks.buf.get_mut(idx) else {
+            if !marks.overflowed {
+                marks.overflowed = true;
+                drop(marks);
+                tracing::debug!(
+                    phase = phase.name(),
+                    capacity = CAPACITY,
+                    "phase spans full; dropping this result's later phases"
+                );
+            }
+            return None;
+        };
         *slot = Mark {
             phase,
             start_ns,
@@ -127,12 +145,18 @@ impl PhaseRecorder {
     /// twice is two spans.
     pub(crate) fn spans(&self) -> Vec<PhaseSpan> {
         let now_ns = self.anchor.offset_ns(Instant::now());
-        let marks = self.marks.lock();
-        let mut taken: Vec<Mark> = marks.buf.iter().take(marks.len).copied().collect();
-        drop(marks);
+        // Copied out on the stack, so the lock is not held while sorting and
+        // the `Vec` below is the only allocation.
+        let (len, mut buf) = {
+            let marks = self.marks.lock();
+            (marks.len, marks.buf)
+        };
+        let taken = buf.get_mut(..len).unwrap_or_default();
+        // Stable, so two marks at the same instants keep the order they were
+        // opened in; at this length the sort's scratch is on the stack.
         taken.sort_by_key(|m| (m.start_ns, m.end_ns));
         taken
-            .into_iter()
+            .iter()
             .map(|m| {
                 let end_ns = if m.end_ns == OPEN { now_ns } else { m.end_ns };
                 PhaseSpan {
@@ -156,43 +180,19 @@ pub(crate) fn open(rec: Option<&PhaseRecorder>, phase: Phase) -> PhaseGuard<'_> 
 }
 
 /// `fut`, timed as `phase` on `rec`: the phase opens now and closes when the
-/// returned future completes or is dropped. Await it at once.
+/// returned future completes — not when the caller gets round to dropping
+/// it — or when it is dropped unfinished. Await it at once.
 ///
-/// A struct, not an `async fn`: an `async fn` keeps its argument and the
+/// A combinator, not an `async fn`: an `async fn` keeps its argument and the
 /// future it awaits as two slots, doubling the size of every caller's future
 /// that wraps a large one (`clippy::large_futures`).
-pub(crate) fn timed<F: Future>(rec: Option<&PhaseRecorder>, phase: Phase, fut: F) -> Timed<'_, F> {
-    Timed {
-        fut,
-        _phase: open(rec, phase),
-    }
-}
-
-pin_project_lite::pin_project! {
-    /// See [`timed`].
-    #[must_use = "a future does nothing unless awaited"]
-    pub(crate) struct Timed<'a, F> {
-        #[pin]
-        fut: F,
-        _phase: PhaseGuard<'a>,
-    }
-}
-
-impl<F: Future> Future for Timed<'_, F> {
-    type Output = F::Output;
-
-    fn poll(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<F::Output> {
-        let this = self.project();
-        let polled = this.fut.poll(cx);
-        if polled.is_ready() {
-            // Closed at completion, not when the caller drops the future.
-            this._phase.close();
-        }
-        polled
-    }
+pub(crate) fn timed<F: Future>(
+    rec: Option<&PhaseRecorder>,
+    phase: Phase,
+    fut: F,
+) -> impl Future<Output = F::Output> {
+    let guard = open(rec, phase);
+    fut.inspect(move |_| drop(guard))
 }
 
 /// Closes its phase on drop. See [`open`].
@@ -302,6 +302,47 @@ mod tests {
     fn no_recorder_is_a_no_op() {
         let guard = open(None, Phase::Deps);
         drop(guard);
+    }
+
+    /// The most marks one result scope can make, site by site: a cold,
+    /// cacheable target with dependencies and a scratch slot, on a remote
+    /// cache, contended on its result lock, whose credentials lapse in
+    /// admission until the last allowed round, and whose riding read lapsed
+    /// before its outputs were read. It fits with room to spare, so no
+    /// phase is dropped on any path. A new mark site extends this list.
+    #[test]
+    fn worst_path_fits() {
+        use Phase::*;
+        let worst: &[Phase] = &[
+            // result.rs `result_addr_inner`: spec and def.
+            Resolve, // meta.rs `inner_meta`: inputs, the wait on deps, hashin.
+            Resolve, Deps, Resolve, // result.rs: `link` outlasting `meta`.
+            Resolve,
+            // result.rs `resolve_locked`: the read, its probe, the
+            // contended write, the re-check, the remote probe.
+            LockWait, CacheRead, LockWait, CacheRead, CacheRead,
+            // execute.rs `execute`: the runtime deps, the scratch slots.
+            Deps, Scratch,
+            // execute.rs `admit_with_credentials`, three rounds
+            // (`MAX_CREDENTIAL_ROUNDS`).
+            LockWait, Admission, LockWait, Admission, LockWait, Admission,
+            // execute.rs `RunPhases`.
+            Stage, Process, Collect,
+            // result.rs: the cache write, then a re-taken riding read.
+            CacheWrite, LockWait,
+        ];
+        assert_eq!(worst.len(), 23, "update CAPACITY's doc");
+        assert!(worst.len() + 8 <= CAPACITY, "keep a margin of 8");
+
+        let t0 = Instant::now();
+        let rec = PhaseRecorder::new(anchor(t0, 0));
+        for (i, &p) in worst.iter().enumerate() {
+            let at = t0 + Duration::from_micros(u64::try_from(i).expect("small"));
+            rec.record(p, at, at);
+        }
+        let spans = rec.spans();
+        assert_eq!(spans.len(), worst.len(), "nothing dropped");
+        assert_eq!(spans.last().and_then(PhaseSpan::phase), Some(LockWait));
     }
 
     /// Past the fixed capacity marks are dropped, never grown into; a guard

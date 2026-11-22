@@ -1691,8 +1691,9 @@ struct ExecuteOptions<'a> {
     /// directory.
     no_scratch: bool,
     /// The result scope's phase recorder, `None` when nothing listens. A
-    /// diagnostic: it decides nothing, and the shared cells below record
-    /// into the recorder of the scope that created them.
+    /// diagnostic: it decides nothing a target observes; its presence arms
+    /// the run's `RunClock` (see `run_in_sandbox`). The shared cells below
+    /// record into the recorder of the scope that created them.
     phases: Option<&'a Arc<PhaseRecorder>>,
 }
 
@@ -3397,14 +3398,26 @@ impl Engine {
                 // via `tokio::join!` so the shorter one isn't gated on the longer.
                 // Uses `join!` (stack-pinned futures, no per-branch boxing) rather
                 // than `try_join_all` — overhead is negligible on the hot path.
-                let link_fut = Arc::clone(&self).link(rs.clone(), def.target_def.clone());
-                let meta_fut = Arc::clone(&self).meta(rs.clone(), addr);
-                // `meta` waits on the dependencies' hashouts, so the join is
-                // the wait on the deps the key folds in (`heph.deps`), not
-                // resolution: the two phases never overlap.
-                let waiting = phase_spans::open(phases.as_deref(), Phase::Deps);
-                let (link_res, meta_res) = tokio::join!(link_fut, meta_fut);
-                drop(waiting);
+                //
+                // `meta` marks its own phases — `heph.resolve` around its work,
+                // `heph.deps` around the wait on the dependencies' hashouts —
+                // and `link` runs beside it, so it marks none. What `link`
+                // still had to do once `meta` was done is resolution too.
+                let link_fut = futures::FutureExt::map(
+                    Arc::clone(&self).link(rs.clone(), def.target_def.clone()),
+                    |res| (res, std::time::Instant::now()),
+                );
+                let meta_fut = futures::FutureExt::map(
+                    Arc::clone(&self).meta_with_phases(rs.clone(), addr, phases.clone()),
+                    |res| (res, std::time::Instant::now()),
+                );
+                let ((link_res, link_done), (meta_res, meta_done)) =
+                    tokio::join!(link_fut, meta_fut);
+                if let Some(rec) = phases.as_deref()
+                    && link_done > meta_done
+                {
+                    rec.record(Phase::Resolve, meta_done, link_done);
+                }
                 let def = Arc::new(link_res.with_context(|| "link")?);
                 let meta = meta_res.with_context(|| "meta")?;
 
@@ -3680,7 +3693,11 @@ impl Engine {
         // manifest read whenever the resolution's read had lapsed.
         let riding = match (&locked.guard, handed) {
             (Some(_), Some(read)) => Some(read),
-            (Some(slot), None) if !outputs.is_empty() => Some(slot.hold(&self, &rs).await?),
+            // The resolution's read lapsed: taking a fresh one waits behind any
+            // writer of the slot, so it is a lock wait.
+            (Some(slot), None) if !outputs.is_empty() => Some(
+                phase_spans::timed(opts.phases(), Phase::LockWait, slot.hold(&self, &rs)).await?,
+            ),
             _ => None,
         };
         let (cached, meta): (Vec<ResultArtifact>, Vec<ArtifactMeta>) = match &locked.executed {
@@ -3702,8 +3719,12 @@ impl Engine {
                 // announced.
                 let manifest = locked.manifest.as_deref();
                 // The hit's read, and only it: a rebuild of bytes that went
-                // missing below is timed by its own phases.
-                let reading = phase_spans::open(opts.phases(), Phase::CacheRead);
+                // missing below is timed by its own phases. A hashout-only
+                // caller reads no bytes, so it opens no read.
+                let reading = phase_spans::open(
+                    opts.phases().filter(|_| !outputs.is_empty()),
+                    Phase::CacheRead,
+                );
                 let res = match manifest {
                     Some(manifest) => {
                         // Lazy materialization: probe just the blobs THIS caller
@@ -4413,6 +4434,10 @@ impl Engine {
                     },
                     ctoken,
                 );
+                // Known limitation: the cache re-probe a reader runs whenever it
+                // gets the lock back is inside `contended`, so it is counted as
+                // lock wait, not `heph.cache.read`. Splitting it out would take
+                // a mark per wake-up for a probe that is a manifest stat.
                 match phase_spans::timed(
                     opts.phases(),
                     Phase::LockWait,
@@ -5457,7 +5482,8 @@ impl Engine {
                     // `--auto-approve`). Single-flighted by this memoizer cell, so
                     // a target prompts at most once per request. Runs before the
                     // execute semaphore is acquired, so a waiting prompt holds no
-                    // worker permit.
+                    // worker permit. Untimed on purpose: a gap in the phase
+                    // spans (documented on `ResultEnd.spans`).
                     engine
                         .gate_approval(&rs, &spec, &def)
                         .await

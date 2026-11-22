@@ -84,8 +84,9 @@ impl Engine {
         }
 
         hcore::hmemoizer::set_phase("execute:inputs_result_exec");
+        // A target with no runtime input waits on nothing.
         let deps_result = phase_spans::timed(
-            phases.as_deref(),
+            phases.as_deref().filter(|_| !def.inputs.is_empty()),
             Phase::Deps,
             self.clone().inputs_result_exec(rs.clone(), &def.inputs),
         )
@@ -99,7 +100,16 @@ impl Engine {
         //
         // The guards ride to the end of the run and drop with `_scratch_guards`.
         hcore::hmemoizer::set_phase("execute:scratch_acquire");
-        let scratching = phase_spans::open(phases.as_deref(), Phase::Scratch);
+        // Only a target with a scratch slot has a scratch phase.
+        let scratching = phase_spans::open(
+            phases.as_deref().filter(|_| {
+                def.target
+                    .inputs
+                    .iter()
+                    .any(crate::engine::scratch::is_scratch_input)
+            }),
+            Phase::Scratch,
+        );
         let resolved_scratch = self
             .resolve_scratch(&rs, addr, &def.target.inputs)
             .await
@@ -993,6 +1003,9 @@ impl Engine {
         loop {
             round += 1;
             hcore::hmemoizer::set_phase("execute:credential_acquire");
+            // Untimed on purpose: a gap in the phase spans (documented on
+            // `ResultEnd.spans`). It can build a credential's producer, whose
+            // time is its own result's.
             let credentials = self
                 .acquire_credentials(rs, addr, resolved)
                 .await
@@ -1296,7 +1309,8 @@ pub(crate) struct SandboxRun {
     pub log: Option<Arc<crate::engine::run_log::RunLog>>,
     /// The result scope's phase recorder, which the run marks `heph.stage`,
     /// `heph.process` / `heph.driver.run` and `heph.collect` on. `None` when
-    /// nothing listens, and for an invocation (no `ResultEnd`).
+    /// nothing listens, and for an invocation (no `ResultEnd`). It decides
+    /// nothing a target observes; its presence arms the run's `RunClock`.
     pub phases: Option<Arc<PhaseRecorder>>,
 }
 
@@ -1812,5 +1826,125 @@ mod tests {
         assert_eq!(a.iter().collect::<Vec<_>>(), [("cpu", "3")], "rounded up");
         let a = entrypoint_allotment(0, &req(&[]), units);
         assert_eq!(a.iter().collect::<Vec<_>>(), [("cpu", "1")], "at least 1");
+    }
+}
+
+#[cfg(test)]
+mod run_phases_tests {
+    use super::*;
+    use crate::engine::phase_spans::ClockAnchor;
+    use hcore::events::PhaseSpan;
+    use hplugin::driver::RunClock;
+    use std::time::Duration;
+
+    /// A pause long enough that each phase is measurably non-empty.
+    fn pause() {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    /// Drives a `RunPhases` through `steps` and returns what it recorded.
+    fn spans_of(steps: impl FnOnce(&mut RunPhases)) -> Vec<PhaseSpan> {
+        let rec = Arc::new(PhaseRecorder::new(ClockAnchor::now()));
+        let mut phases = RunPhases::new(Arc::clone(&rec));
+        steps(&mut phases);
+        drop(phases);
+        rec.spans()
+    }
+
+    fn names(spans: &[PhaseSpan]) -> Vec<&str> {
+        spans.iter().map(|s| s.name.as_ref()).collect()
+    }
+
+    /// Each span starts where the one before it ended: the run's phases
+    /// tile it, in order, with no overlap.
+    fn assert_contiguous(spans: &[PhaseSpan]) {
+        for pair in spans.windows(2) {
+            assert_eq!(pair[0].end_unix_us, pair[1].start_unix_us, "{spans:?}");
+        }
+    }
+
+    /// An armed driver that spawned and exited: staging to the spawn, the
+    /// process to the exit, collection to the end.
+    #[test]
+    fn armed_and_complete_is_stage_process_collect() {
+        let spans = spans_of(|p| {
+            let (clock, _rx) = RunClock::new();
+            pause();
+            p.running(Some(clock.clone()));
+            pause();
+            clock.start();
+            pause();
+            clock.stop();
+            pause();
+        });
+        assert_eq!(
+            names(&spans),
+            ["heph.stage", "heph.process", "heph.collect"]
+        );
+        assert_contiguous(&spans);
+        assert!(spans.iter().all(|s| s.duration_us() > 0), "{spans:?}");
+    }
+
+    /// An armed driver cancelled, or failing to spawn, before its process
+    /// started: the whole run was staging, and there is no process.
+    #[test]
+    fn armed_but_never_spawned_is_all_stage() {
+        let spans = spans_of(|p| {
+            let (clock, _rx) = RunClock::new();
+            p.running(Some(clock));
+            pause();
+        });
+        assert_eq!(names(&spans), ["heph.stage"]);
+    }
+
+    /// A clock stopped without ever starting is the same: no spawn instant,
+    /// so no process.
+    #[test]
+    fn armed_stopped_before_start_is_all_stage() {
+        let spans = spans_of(|p| {
+            let (clock, _rx) = RunClock::new();
+            p.running(Some(clock.clone()));
+            clock.stop();
+            clock.start();
+        });
+        assert_eq!(names(&spans), ["heph.stage"]);
+    }
+
+    /// An armed run abandoned with its process still going (a timeout past
+    /// its grace, a cancellation): the process runs to the end, and there
+    /// is nothing to collect.
+    #[test]
+    fn armed_without_exit_is_process_to_the_end() {
+        let spans = spans_of(|p| {
+            let (clock, _rx) = RunClock::new();
+            p.running(Some(clock.clone()));
+            clock.start();
+            pause();
+        });
+        assert_eq!(names(&spans), ["heph.stage", "heph.process"]);
+        assert_contiguous(&spans);
+    }
+
+    /// A driver with no clock armed (a cdylib, or one that spawns nothing),
+    /// finishing or failing alike: staging up to its `run`, then the whole
+    /// of the `run` as `heph.driver.run` — never `heph.process`.
+    #[test]
+    fn unarmed_is_stage_then_driver_run() {
+        let spans = spans_of(|p| {
+            pause();
+            p.running(None);
+            pause();
+        });
+        assert_eq!(names(&spans), ["heph.stage", "heph.driver.run"]);
+        assert_contiguous(&spans);
+    }
+
+    /// A run that failed or was cancelled before the driver was called:
+    /// staging only.
+    #[test]
+    fn never_called_is_all_stage() {
+        let spans = spans_of(|_| pause());
+        assert_eq!(names(&spans), ["heph.stage"]);
+        assert!(spans[0].duration_us() > 0);
     }
 }
