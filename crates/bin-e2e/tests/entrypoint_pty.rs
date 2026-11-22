@@ -31,6 +31,14 @@ const SHORT: Duration = Duration::from_secs(30);
 /// `-e`, so a `sleep` killed by SIGINT would end the tool with 130. It ignores
 /// SIGHUP so that, once heph (the PTY's session leader) is gone, only the
 /// supervisor can end it.
+///
+/// Its traps print through `say`, which retries the write once and never fails.
+/// When two signals land together (the kernel's group TERM and the relay's), the
+/// second interrupts the first trap's `echo` mid-write: `write error:
+/// Interrupted system call`. Under `-e` a failing command in a trap ends the
+/// script, so the tool exited 1 and the next Ctrl-C found nothing to reach.
+/// The retry prints the counter's value then, which the second trap may already
+/// have moved: a count can show twice, never one past the signals sent.
 const BUILD: &str = r#"
 target(name = "slow", driver = "bash", run = "sleep 1", cache = False)
 target(name = "tty", driver = "bash", entrypoint = True, deps = {"s": ":slow"}, run = """
@@ -38,12 +46,13 @@ if [ -t 0 ] && [ -t 1 ] && [ -t 2 ]; then echo "tool-sees-a-""tty"; fi
 exit 0
 """)
 target(name = "trapper", driver = "bash", entrypoint = True, run = """
+say() { echo "$1" || echo "$1" || true; }
 n=0
-trap 'n=$((n+1)); echo "got-int-$n"; [ "$n" -ge 2 ] && exit 7' INT
+trap 'n=$((n+1)); say "got-int-$n"; [ "$n" -ge 2 ] && exit 7' INT
 m=0
-trap 'm=$((m+1)); echo "got-usr1-$m"' USR1
+trap 'm=$((m+1)); say "got-usr1-$m"' USR1
 t=0
-trap 't=$((t+1)); echo "got-term-$t"' TERM
+trap 't=$((t+1)); say "got-term-$t"' TERM
 trap '' HUP
 echo "tool-pid-$$."
 echo "trap-""ready"
