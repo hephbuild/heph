@@ -854,8 +854,9 @@ fn copy_holds_the_lock_shared() {
     let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
     let go_rx = std::sync::Mutex::new(go_rx);
     store::copy_gate::set(&lock, move || {
-        let _ = locked_tx.send(());
-        let _ = go_rx.lock().expect("gate").recv();
+        // Later opens (after the test let go) find no one listening.
+        locked_tx.send(()).unwrap_or_default();
+        go_rx.lock().expect("gate").recv().unwrap_or_default();
     });
     let viewer = std::thread::spawn({
         let dir = dir.clone();
@@ -947,7 +948,8 @@ fn seal_lost_races_open_local() {
         *outcomes.entry(how).or_default() += 1;
         assert!(first.removed.is_empty(), "round {round}: {first:?}");
         if first.sealed.is_empty() {
-            let again = cleanup::cleanup(root.path(), later, Retention::default()).expect("cleanup");
+            let again =
+                cleanup::cleanup(root.path(), later, Retention::default()).expect("cleanup");
             assert_eq!(again.sealed, vec![id], "round {round}");
         }
         assert!(!header(&dir).wal, "round {round}: sealed");
