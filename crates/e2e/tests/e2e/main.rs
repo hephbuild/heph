@@ -60,6 +60,7 @@ mod oci_docker;
 mod oci_image;
 mod oci_runner;
 mod output_links;
+mod phase_spans;
 mod plugin_buildfile;
 mod plugin_fn_declarations;
 mod plugin_functions;
