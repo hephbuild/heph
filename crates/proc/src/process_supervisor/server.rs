@@ -8,7 +8,13 @@ use crate::process_supervisor::protocol::Msg;
 
 /// Signals the sidecar ignores: everything a terminal or a process-group
 /// `kill` sends that would otherwise end or stop it.
-const IGNORED_SIGNALS: [libc::c_int; 9] = [
+///
+/// `spawn_sidecar` starts the sidecar with these blocked, and they stay blocked
+/// until [`run_supervisor_main`] has ignored them. Exec'ing and loading the
+/// binary takes long enough for the terminal's Ctrl-C to land first. With the
+/// default disposition still in place, that Ctrl-C killed the sidecar, and a
+/// later `kill -9` of heph left nothing to reap the tool.
+pub(super) const IGNORED_SIGNALS: [libc::c_int; 9] = [
     libc::SIGINT,
     libc::SIGQUIT,
     libc::SIGHUP,
@@ -45,6 +51,23 @@ pub fn run_supervisor_main(ipc_fd: i32) -> ! {
         unsafe {
             libc::signal(sig, libc::SIG_IGN);
         }
+    }
+    // Only now unblock what `spawn_sidecar` blocked. A signal that arrived
+    // during startup is pending, and ignoring a pending signal discards it
+    // (POSIX `sigaction`), so it can no longer end or stop the sidecar.
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "building the set and applying it share one initialised sigset_t"
+    )]
+    // SAFETY: a zeroed sigset_t is valid input to sigemptyset, which fully
+    // initialises it; pthread_sigmask on the only thread, with a live set.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        for sig in IGNORED_SIGNALS {
+            libc::sigaddset(&mut set, sig);
+        }
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
     }
 
     // SAFETY: ipc_fd was inherited from the parent across exec as the child
