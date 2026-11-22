@@ -1,8 +1,9 @@
 //! Removing ended sessions.
 //!
-//! Runs only at session start, on the recorder thread (design amendment A7):
-//! the owner of a new session is the only writer of the sessions directory, and
-//! a viewer stays strictly read-only.
+//! Runs only at session start, on a thread of its own beside the recorder's
+//! (design amendment A7; its own so a slow seal never holds up the record
+//! loop, I1): the owner of a new session is the only writer of the sessions
+//! directory, and a viewer stays strictly read-only.
 //!
 //! The decision reads the lock, modification times and a recording's 100-byte
 //! header, never its contents. The `lock` file name and its `flock` meaning are

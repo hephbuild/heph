@@ -427,11 +427,14 @@ means the seal was cut short, and readers take the copy path for it.
 A session killed before its seal (`SIGKILL`, a second Ctrl-C) leaves a
 WAL-mode recording with no `End` and a free lock: `lost`. The next cleanup
 past [`STARTING`](#retention) **seals** it under its lock taken exclusively:
-`ended_ms` is its last record's `at_ms`, `exit_code` stays NULL, the
-explorer rows are re-derived from `records` (so they hold the session-wide
-rows a crash never wrote), and the file is switched to rollback mode. It
-refuses beside a `-journal`, and it never seals a format it does not know.
-A seal cut short there leaves the file for the next cleanup.
+`ended_ms` is its last record's `at_ms`, `exit_code` stays NULL, and the
+file is switched to rollback mode. Cleanup runs during a build, so it
+repairs nothing (I1): the explorer rows stay what the crash left, without
+the session-wide rows it never wrote, and `session.derivation` is set to
+`0` (older than any real derivation) so that a session command re-derives
+the recording before it reads explorer rows from it. It refuses beside a
+`-journal`, and it never seals a format it does not know. A seal cut short
+there leaves the file for the next cleanup.
 
 ### `--json`
 
@@ -554,7 +557,11 @@ included. The recorder is its own OS thread behind an unbounded channel:
   **then** releases the lock, so "lock free and no `End`" means exactly
   "crashed". A panic unwinding through `run_app` writes `End {panicked:
   true}`. The join at exit is bounded (3s). A seal cut short is only a
-  `debug!`: `End` is committed, and the next cleanup seals the file.
+  `debug!`: `End` is committed, and the next cleanup seals the file. A join
+  that times out leaves the lock with the recorder thread, which still holds
+  the write connection: it releases the lock once its `End` and seal are done
+  (or failed), and the process's exit releases it otherwise. The lock never
+  goes free while a writer may still commit.
 - On a write failure it rolls back the open transaction and latches
   "stopped" before its one `warn!` (which the log tap would otherwise feed
   back to it) and drops its receiver; it stops the same way past 500k pending
@@ -687,8 +694,9 @@ which for a line-backend session is its recorded log lines alone.
 
 ## Retention
 
-Cleanup runs only at session start, on the new session's recorder thread;
-`list` and every other viewer stay read-only. It decides on lock state,
+Cleanup runs only at session start, on a thread of its own beside the new
+session's recorder, so a slow seal never holds up the recording; `list` and
+every other viewer stay read-only. It decides on lock state,
 modification times and a recording's 100-byte header, **never** on its
 contents.
 

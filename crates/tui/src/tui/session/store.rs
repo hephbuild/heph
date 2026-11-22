@@ -40,6 +40,10 @@ pub const APPLICATION_ID: u32 = 0x4845_5048;
 pub const FORMAT: u32 = 1;
 /// The version of the code that derives the explorer rows (D14).
 pub const DERIVATION: u32 = 1;
+/// The derivation of a lost recording cleanup sealed: older than any real
+/// one, so a session command re-derives it before reading its explorer rows
+/// (D14), as it does a recording an older heph derived.
+pub const STALE_DERIVATION: u32 = 0;
 /// The explorer contract's version, `sessions.schema_version` (I9).
 pub const SCHEMA_VERSION: u32 = 1;
 /// How long a connection waits on a transient `SQLITE_BUSY`.
@@ -1044,8 +1048,9 @@ fn write_rows(conn: &Connection, rows: &mut Vec<Row>) -> rusqlite::Result<u64> {
 
 /// Derive the explorer tables again from `records` and the session row
 /// alone, replacing what is there (I4). Stops where the recording's ceiling
-/// stopped derivation (`truncated_seq`).
-pub(crate) fn rederive(conn: &Connection) -> rusqlite::Result<()> {
+/// stopped derivation (`truncated_seq`). A session command's repair (D14);
+/// a build never calls it (I1).
+pub fn rederive(conn: &Connection) -> rusqlite::Result<()> {
     let (id, started, ended, stop): (String, i64, Option<i64>, Option<i64>) = conn.query_row(
         "SELECT id, started_ms, ended_ms, truncated_seq FROM session",
         [],
@@ -1143,8 +1148,13 @@ fn seal_once(conn: &Connection) -> rusqlite::Result<bool> {
 
 /// Seal a lost session's recording (cleanup; the caller holds its lock
 /// exclusively). Only a known format; never creates the file; refuses beside
-/// a `-journal`. Re-derives the explorer rows so they hold the session-wide
-/// rows a crash never wrote.
+/// a `-journal`.
+///
+/// It runs during a build, so it repairs nothing (I1, D14): one small
+/// transaction (the end time, `sealed`, and [`STALE_DERIVATION`] in place of
+/// the derivation, since a crash never wrote the session-wide rows), then the
+/// checkpoint and mode switch. The explorer rows stay as the crash left them
+/// until a session command re-derives the recording.
 pub(crate) fn seal_lost(path: &Path) -> anyhow::Result<Sealed> {
     let header = read_header(path)
         .with_context(|| format!("reading {}", path.display()))?
@@ -1167,8 +1177,10 @@ pub(crate) fn seal_lost(path: &Path) -> anyhow::Result<Sealed> {
             "UPDATE session SET ended_ms = (SELECT max(at_ms) FROM records) WHERE ended_ms IS NULL",
             [],
         )?;
-        rederive(&conn)?;
-        conn.execute("UPDATE session SET sealed = 1", [])?;
+        conn.execute(
+            "UPDATE session SET sealed = 1, derivation = ?1",
+            params![STALE_DERIVATION],
+        )?;
     }
     conn.execute_batch("COMMIT")?;
     Ok(seal(conn, SEAL_TIMEOUT)?)

@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use hcore::events::{BuildEvent, BuildEventKind};
 
 use super::cleanup::{self, Retention};
-use super::recorder::{Faults, RecorderStart};
+use super::recorder::{Faults, Gate, RecorderStart};
 use super::*;
 use crate::tui::app::{App, AppContext, CIAppView, TUIAppView};
 use crate::tui::progress::BuildState;
@@ -541,10 +541,105 @@ fn recorder_blocked_write_does_not_block_app() {
         finishing.elapsed() < Duration::from_secs(2),
         "finish is bounded"
     );
-    assert!(!lockfile::is_held(&rec.dir().join(files::LOCK)).expect("probe"));
+    // I2, I3: the thread still holds the write connection and will commit
+    // `End`, so the lock stays held until it has.
+    let lock_path = rec.dir().join(files::LOCK);
+    assert!(
+        lockfile::is_held(&lock_path).expect("probe"),
+        "a timed-out finish released the lock under a live writer"
+    );
     let (lock, cv) = &*gate;
     *lock.lock().expect("lock") = true;
     cv.notify_all();
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while lockfile::is_held(&lock_path).expect("probe") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the recorder thread never released the lock"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let opened = open(rec.dir());
+    assert!(!opened.is_copy(), "the thread sealed it");
+    let end = store::read_row_end(&opened.conn).expect("end");
+    assert!(end.sealed, "{end:?}");
+    drop(opened);
+    let (read, _) = read_records(rec.dir());
+    assert!(
+        matches!(
+            read.last().and_then(|r| r.session.as_ref()),
+            Some(SessionRecordKind::End { .. })
+        ),
+        "End landed last"
+    );
+}
+
+/// I1: a lost recording left beside a new session is cleanup's to seal, on
+/// its own thread. With that cleanup held up, the new session's records still
+/// commit at once and its `finish` seals it without waiting.
+#[test]
+fn cleanup_does_not_hold_up_the_recording() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let lost = SessionId::new(hcore::events::now_unix_ms() - 120_000, 7);
+    let lost_dir = root.path().join(lost.encode());
+    std::fs::create_dir(&lost_dir).expect("mkdir");
+    let lost_lock = lost_dir.join(files::LOCK);
+    std::fs::write(&lost_lock, b"").expect("lock");
+    let records: Vec<SessionRecord> = (0..200).flat_map(|_| events()).map(event_record).collect();
+    unsealed_recording(&lost_dir, lost, &records);
+    // Past the start grace: cleanup seals it.
+    std::fs::File::options()
+        .write(true)
+        .open(&lost_lock)
+        .and_then(|f| f.set_modified(std::time::SystemTime::now() - Duration::from_secs(120)))
+        .expect("age the lock");
+    let lost_wal = || {
+        store::read_header(&lost_dir.join(store::FILE))
+            .expect("header")
+            .expect("heph")
+            .wal
+    };
+    assert!(lost_wal(), "precondition: lost and unsealed");
+
+    let gate: Gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let rec = recorder_with(
+        root.path(),
+        Faults {
+            cleanup_gate: Some(Arc::clone(&gate)),
+            ..Faults::default()
+        },
+    );
+    let tap = rec.tap();
+    for ev in events() {
+        tap.event(ev);
+    }
+    tap.flush(Duration::from_secs(5))
+        .expect("the first records commit while cleanup is held up");
+    assert_eq!(read_records(rec.dir()).0.len(), events().len());
+    let finishing = std::time::Instant::now();
+    rec.recorder.finish(Some(0), false, Duration::from_secs(5));
+    assert!(
+        finishing.elapsed() < Duration::from_secs(2),
+        "finish waited on cleanup: {:?}",
+        finishing.elapsed()
+    );
+    let opened = open(rec.dir());
+    assert!(!opened.is_copy(), "the new session sealed");
+    assert!(store::read_row_end(&opened.conn).expect("end").sealed);
+    drop(opened);
+    assert!(lost_wal(), "cleanup is still held up");
+
+    let (open_gate, cv) = &*gate;
+    *open_gate.lock().expect("gate") = true;
+    cv.notify_all();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while lost_wal() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "cleanup never sealed the lost session"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// I1: a recorder that panics costs the recording, not the run.
@@ -1586,7 +1681,9 @@ fn rederive_matches_the_live_derivation() {
 
 /// A recording a `kill -9` left (WAL mode, no `End`, `sealed=0`) is sealed
 /// in place by `seal_lost`: rollback mode, `sealed`, its last record's time
-/// as its end, no exit code, and its explorer rows derived.
+/// as its end, no exit code. It runs during a build, so it repairs nothing
+/// (I1, D14): the explorer rows stay what the crash left, and the derivation
+/// is stamped stale for a session command to re-derive.
 #[test]
 fn seal_lost_seals_a_killed_recording() {
     let root = tempfile::tempdir().expect("tempdir");
@@ -1597,6 +1694,15 @@ fn seal_lost_seals_a_killed_recording() {
     let records: Vec<SessionRecord> = events().into_iter().map(event_record).collect();
     unsealed_recording(&dir, id, &records);
     let path = dir.join(store::FILE);
+    let before = {
+        let conn = alter(&dir);
+        let rows = explorer_rows(&conn);
+        assert!(
+            rows.iter().any(|r| r.starts_with("spans: ")),
+            "precondition: the live derivation wrote result spans"
+        );
+        rows
+    };
     assert!(
         store::read_header(&path)
             .expect("header")
@@ -1623,12 +1729,16 @@ fn seal_lost_seals_a_killed_recording() {
         .query_row("SELECT exit_code FROM session", [], |r| r.get(0))
         .expect("exit code");
     assert_eq!(exit, None);
-    assert!(
-        explorer_rows(&opened.conn)
-            .iter()
-            .any(|r| r.starts_with("spans: ")),
-        "derived on seal"
+    assert_eq!(
+        explorer_rows(&opened.conn),
+        before,
+        "a build's cleanup re-derives nothing"
     );
+    let derivation: u32 = opened
+        .conn
+        .query_row("SELECT derivation FROM session", [], |r| r.get(0))
+        .expect("derivation");
+    assert_eq!(derivation, store::STALE_DERIVATION);
     drop(opened);
     let (read, _) = read_records(&dir);
     assert_eq!(read.len(), records.len(), "every record kept");

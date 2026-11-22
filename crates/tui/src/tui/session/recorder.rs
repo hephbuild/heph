@@ -618,6 +618,15 @@ pub(crate) fn is_critical(record: &SessionRecord) -> bool {
 /// the flag is set.
 pub(crate) type Gate = Arc<(Mutex<bool>, std::sync::Condvar)>;
 
+/// Block until `gate` opens.
+fn wait_for(gate: &Gate) {
+    let (open, opened) = &**gate;
+    let mut open = open.lock().unwrap_or_else(PoisonError::into_inner);
+    while !*open {
+        open = opened.wait(open).unwrap_or_else(PoisonError::into_inner);
+    }
+}
+
 /// Test-only fault injection. Always default outside tests.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct Faults {
@@ -629,6 +638,9 @@ pub(crate) struct Faults {
     pub(crate) fail_writes: bool,
     /// Hold every record write until the gate opens, as a hung disk would.
     pub(crate) gate: Option<Gate>,
+    /// Hold the start-of-session cleanup until the gate opens, as a slow
+    /// seal of a large lost recording would.
+    pub(crate) cleanup_gate: Option<Gate>,
     /// [`FULL_CAP`] in its place, so a test reaches it with a few records.
     pub(crate) full_cap: Option<u64>,
     /// [`CEILING`] in its place.
@@ -639,7 +651,7 @@ pub(crate) struct Faults {
 
 /// What the recorder thread starts with.
 pub(crate) struct RecorderStart {
-    /// The sessions root, cleaned before recording starts.
+    /// The sessions root, cleaned on its own thread while recording starts.
     pub(crate) root: std::path::PathBuf,
     pub(crate) lock: File,
     /// The write connection on the session's freshly created `session.db`.
@@ -649,6 +661,35 @@ pub(crate) struct RecorderStart {
     /// A private-sessions root to sweep of every ended session too.
     pub(crate) private_root: Option<std::path::PathBuf>,
     pub(crate) faults: Faults,
+}
+
+/// The start-of-session cleanup of `root`, then of `private_root`.
+fn clean_ended(
+    root: &std::path::Path,
+    retention: Retention,
+    private_root: Option<&std::path::Path>,
+) {
+    match cleanup::cleanup(root, SystemTime::now(), retention) {
+        Ok(report) if report != cleanup::CleanupReport::default() => {
+            tracing::debug!(
+                removed = report.removed.len(),
+                sealed = report.sealed.len(),
+                tombs = report.tombs,
+                tmp = report.tmp,
+                "cleaned ended sessions"
+            );
+        }
+        Ok(_) => {}
+        Err(e) => tracing::debug!(error = %e, "cannot clean ended sessions"),
+    }
+    // A killed `HEPH_NO_SESSION` run's directory: nobody else reads it, so it
+    // goes whatever its age. Missing is normal.
+    if let Some(private) = private_root
+        && let Err(e) = cleanup::cleanup(private, SystemTime::now(), Retention::PRIVATE)
+        && e.kind() != io::ErrorKind::NotFound
+    {
+        tracing::debug!(error = %e, "cannot clean ended private sessions");
+    }
 }
 
 /// The owner's handle on a running recorder.
@@ -681,31 +722,27 @@ impl Recorder {
             faults,
             ..
         } = start;
+        // Cleanup on its own thread: sealing another session's recording can
+        // wait on that file's viewers, and the record loop must not (I1). It
+        // is detached; an exit mid-cleanup leaves what the next one finishes.
+        let cleanup_gate = faults.cleanup_gate.clone();
+        let cleanup_dispatch = dispatch.clone();
+        let spawned = std::thread::Builder::new()
+            .name("heph-session-cleanup".to_owned())
+            .spawn(move || {
+                let _dispatch = tracing::dispatcher::set_default(&cleanup_dispatch);
+                if let Some(gate) = &cleanup_gate {
+                    wait_for(gate);
+                }
+                clean_ended(&root, retention, private_root.as_deref());
+            });
+        if let Err(e) = spawned {
+            tracing::debug!(error = %e, "cannot start the session cleanup");
+        }
         std::thread::Builder::new()
             .name("heph-session-recorder".to_owned())
             .spawn(move || {
                 let _dispatch = tracing::dispatcher::set_default(&dispatch);
-                match cleanup::cleanup(&root, SystemTime::now(), retention) {
-                    Ok(report) if report != cleanup::CleanupReport::default() => {
-                        tracing::debug!(
-                            removed = report.removed.len(),
-                            sealed = report.sealed.len(),
-                            tombs = report.tombs,
-                            tmp = report.tmp,
-                            "cleaned ended sessions"
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(e) => tracing::debug!(error = %e, "cannot clean ended sessions"),
-                }
-                // A killed `HEPH_NO_SESSION` run's directory: nobody else
-                // reads it, so it goes whatever its age. Missing is normal.
-                if let Some(private) = &private_root
-                    && let Err(e) = cleanup::cleanup(private, SystemTime::now(), Retention::PRIVATE)
-                    && e.kind() != io::ErrorKind::NotFound
-                {
-                    tracing::debug!(error = %e, "cannot clean ended private sessions");
-                }
                 let mut thread = RecorderThread {
                     writer: Some(store::Writer::new(conn, session_id)),
                     record_bytes: 0,
@@ -737,9 +774,11 @@ impl Recorder {
     /// `timeout` for the recorder to say it did; the seal is bounded under
     /// it. Idempotent: only the first call does anything.
     ///
-    /// If the recorder stopped, or does not answer in time, the lock is released
+    /// If the recorder stopped, or its thread is gone, the lock is released
     /// here with no `End` on disk — a viewer reads that as a lost session, which
-    /// is the truth about its records.
+    /// is the truth about its records. If it does not answer in time, the lock
+    /// stays held: the thread releases it once its `End` and seal are done (or
+    /// failed), else this process's exit does.
     pub fn finish(&self, exit_code: Option<i32>, panicked: bool, timeout: Duration) {
         let shared = &self.tap.shared;
         // From here every tap drops its sends: nothing may follow `End`.
@@ -768,10 +807,17 @@ impl Recorder {
             if sent {
                 match acked.recv_timeout(timeout) {
                     Ok(()) | Err(RecvTimeoutError::Disconnected) => {}
-                    Err(RecvTimeoutError::Timeout) => tracing::debug!(
-                        timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
-                        "session recorder did not finish in time"
-                    ),
+                    // The thread still holds the write connection and may yet
+                    // commit `End` and seal: the lock stays with it (I2, I3).
+                    // Its own release after the seal, or this process's exit,
+                    // frees it.
+                    Err(RecvTimeoutError::Timeout) => {
+                        tracing::debug!(
+                            timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+                            "session recorder did not finish in time"
+                        );
+                        return;
+                    }
                 }
             }
         }
@@ -936,6 +982,9 @@ impl RecorderThread {
                 ack,
             } => {
                 self.end_session(rx, at_unix_ms, exit_code, panicked, deadline);
+                // Whether `End` landed or failed, the session is over: a
+                // finisher that timed out left the lock to this thread.
+                self.shared.release_lock();
                 // The finisher may have timed out and gone; nothing to tell it.
                 ack.send(()).unwrap_or_default();
                 return Flow::Stop;
@@ -1116,11 +1165,7 @@ impl RecorderThread {
     /// A full disk or a hung one, for tests. No-op outside them.
     fn injected_write_faults(&self) -> io::Result<()> {
         if let Some(gate) = &self.faults.gate {
-            let (open, opened) = &**gate;
-            let mut open = open.lock().unwrap_or_else(PoisonError::into_inner);
-            while !*open {
-                open = opened.wait(open).unwrap_or_else(PoisonError::into_inner);
-            }
+            wait_for(gate);
         }
         if self.faults.fail_writes {
             return Err(io::Error::new(
