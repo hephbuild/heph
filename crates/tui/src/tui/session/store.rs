@@ -94,7 +94,14 @@ CREATE VIEW sessions AS
     sealed, 1 AS recorded, 0 AS snapshot
   FROM session;
 CREATE VIEW targets AS
-  SELECT session_id, addr, outcome, duration_us FROM spans WHERE name = 'heph.result';
+  SELECT session_id, addr, outcome, duration_us FROM (
+    SELECT session_id, addr, outcome, duration_us, row_number() OVER (
+      PARTITION BY session_id, addr
+      ORDER BY CASE outcome WHEN 'failed' THEN 0 WHEN 'ran' THEN 1
+        WHEN 'cancelled' THEN 2 WHEN 'hit' THEN 3 ELSE 4 END, span_id
+    ) AS n
+    FROM spans WHERE name = 'heph.result'
+  ) WHERE n = 1;
 ";
 
 /// What a recording's header says, read from its first 100 bytes.
@@ -340,12 +347,7 @@ fn session_sealed(conn: &Connection) -> rusqlite::Result<bool> {
 /// for the header to turn rollback (read it sealed) or the lock to free (a
 /// seal cut short or abandoned: read a copy), as long as a seal may retry.
 /// Past that, read it in place, as ended.
-fn open_after_seal(
-    root: &Path,
-    dir: &Path,
-    lock: &Path,
-    path: &Path,
-) -> Result<Opened, OpenError> {
+fn open_after_seal(root: &Path, dir: &Path, lock: &Path, path: &Path) -> Result<Opened, OpenError> {
     let deadline = Instant::now() + SEAL_TIMEOUT;
     loop {
         match read_header(path) {

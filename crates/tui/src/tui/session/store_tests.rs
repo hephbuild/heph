@@ -1939,6 +1939,89 @@ fn result_span_carries_declared_and_reserved() {
     assert_eq!(attrs("//r:hit"), BTreeMap::new());
 }
 
+/// Two overlapping results of one addr (two scopes resolving `//p:x` at
+/// once, one run between them), frozen: each `ResultEnd` closes the oldest
+/// open result (FIFO); the run's attributes, its cache events and its phase
+/// spans go on the oldest; the waiter reads `ran` with the driver and no
+/// resource attributes; `heph.session.results` counts the target once; and
+/// `targets` gives one row.
+#[test]
+fn overlapping_results_of_one_addr() {
+    let id = SessionId::new(FIXTURE_STARTED_MS, 2);
+    let s = FIXTURE_STARTED_MS;
+    let mut records = vec![
+        ev(s, request_config(&[("cpu", "cpu")])),
+        start_record(s + 1, "//p:x"),
+        start_record(s + 2, "//p:x"),
+        ev(
+            s + 3,
+            BuildEventKind::LocalCacheMiss {
+                addr: "//p:x".into(),
+            },
+        ),
+        ev(
+            s + 4,
+            execute_start(
+                "//p:x",
+                Some(&[("cpu", 1_000_000)]),
+                Some(&[("cpu", 1_000_000)]),
+            ),
+        ),
+    ];
+    let root = tempfile::tempdir().expect("tempdir");
+    let dir = session_dir(root.path(), id);
+    let mut writer = writer_in(&dir, id);
+    for r in records.drain(..) {
+        insert(&mut writer, &r);
+    }
+    // The first ResultEnd carries the run's phase spans.
+    let end = end_record(s + 7, "//p:x");
+    let mut body = serde_json::to_value(&end).expect("encode");
+    let spans = serde_json::json!([
+        {"name": "heph.process", "start_unix_us": (s + 4) * 1000, "end_unix_us": (s + 6) * 1000},
+    ]);
+    body.get_mut("kind")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("a build event")
+        .insert("spans".into(), spans);
+    writer
+        .insert(&end, &body.to_string())
+        .expect("insert ResultEnd");
+    insert(&mut writer, &end_record(s + 8, "//p:x"));
+    let conn = writer.finish(s + 9, Some(0), false).expect("finish");
+
+    let result_spans = "SELECT span_id, parent_span_id, name, addr, driver, outcome, \
+         start_us - 1700000000000000, end_us - 1700000000000000, attributes \
+         FROM spans WHERE name NOT IN ('heph.session', 'heph.startup', 'heph.teardown') \
+         ORDER BY span_id";
+    assert_eq!(
+        dump(&conn, result_spans),
+        [
+            r#"2|1|heph.result|//p:x|exec|ran|1000|7000|{"heph.resources.declared.cpu":1.0,"heph.resources.reserved.cpu":1.0}"#,
+            "3|1|heph.result|//p:x|exec|ran|2000|8000|NULL",
+            "4|2|heph.process|//p:x|exec|NULL|4000|6000|NULL",
+        ]
+    );
+    assert_eq!(
+        dump(
+            &conn,
+            "SELECT span_id, name FROM span_events ORDER BY time_us, rowid"
+        ),
+        ["2|heph.cache.local_miss"]
+    );
+    assert_eq!(
+        dump(
+            &conn,
+            "SELECT value, attributes FROM metrics WHERE name = 'heph.session.results'"
+        ),
+        [r#"1.0|{"heph.outcome":"ran"}"#]
+    );
+    assert_eq!(
+        dump(&conn, "SELECT addr, outcome, duration_us FROM targets"),
+        ["//p:x|ran|6000"]
+    );
+}
+
 /// D30, the recording's half: per pool, a time-weighted held mean, the held
 /// peak and the time anything waited, written at the end and read back by
 /// [`store::read_pools`]. A value holds until the next row, and the last one

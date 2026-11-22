@@ -209,6 +209,16 @@ heph.session                     root, span_id 1; trace id derived from the sess
   `heph.resources.reserved.<pool>` (from `ExecuteStart`, in the pool's unit;
   only for a target that ran, and only from a host that reports them), and
   `heph.admission.queued_ms`.
+- **Several results of one addr.** Two scopes in one process (two requests,
+  or a request and the TUI's own) can resolve the same addr at once and
+  share one run. Each `ResultStart` opens a `heph.result` span, and each
+  `ResultEnd` closes the **oldest** span still open for that addr (FIFO);
+  phase spans become children of the span it closes. The oldest open span
+  carries the run: the resource and admission attributes, the cache tier
+  events, `heph.cache` and `heph.cache.hit_rebuilt`. Every span open when
+  `ExecuteStart` arrives (and one that opens later while any of them is
+  still open) reads outcome `ran` with the driver: a waiter shares the run,
+  so it is not a hit.
 - **Phase spans** are the children of a result, read from the optional
   `ResultEnd.spans` list (`{name, start_unix_us, end_unix_us}`). They are
   read tolerantly from the record's body: a result from a host that does not
@@ -231,13 +241,22 @@ heph.session                     root, span_id 1; trace id derived from the sess
   pool, `heph.session.pool.held.mean` (time-weighted),
   `heph.session.pool.held.peak` and `heph.session.pool.waiting_us` (time with
   at least one waiter), and `heph.session.results` per outcome (attribute
-  `heph.outcome`). A pool's unit comes from `RequestConfig.units`: a `cpu`
+  `heph.outcome`). `heph.session.results` counts a target once per
+  resolution, not once per `ResultEnd`: overlapping results of one addr count
+  once, when the last of them closes, with the worst outcome among them
+  (`failed`, then `ran`, `cancelled`, `hit`); the same addr resolved again
+  after they all closed (a second request in the same process) counts again.
+  A pool's unit comes from `RequestConfig.units`: a `cpu`
   pool in CPUs (`{cpu}`, the engine's micro-CPUs over 10^6), a `bytes` pool in
   `By`, anything else `1`.
 - **Views**: `logs` (`Log` and `Output` records: `session_id`, `seq`,
   `time_us`, `severity`, `body`), `sessions` (the session row as resource
   attributes, plus `schema_version`), and `targets` (`session_id`, `addr`,
-  `outcome`, `duration_us`: one row per `heph.result`, cache hits included).
+  `outcome`, `duration_us`: one row per target per session, cache hits
+  included). Where an addr has several `heph.result` spans, `targets` keeps
+  the one with the worst outcome (`failed`, then `ran`, `cancelled`, `hit`,
+  then none), the oldest among equals (the run's carrier); `spans` keeps
+  them all.
 
 The trace id is the first 16 bytes of SHA-256 over `heph.trace.v1:`
 followed by the session id; a span id is written as its 8-byte big-endian
@@ -400,7 +419,7 @@ header (`store::open_local`):
 
 | Lock | Header | Opened as |
 | --- | --- | --- |
-| held | WAL | **live**: a read-only connection with a 1s `busy_timeout`. A follower re-reads `records WHERE seq > last` whenever `PRAGMA data_version` moves, and drops its connection as soon as a batch holds `End`, so the owner can seal. |
+| held | WAL | **live**: a read-only connection with a 1s `busy_timeout`. A follower re-reads `records WHERE seq > last` whenever `PRAGMA data_version` moves, and drops its connection as soon as a batch holds `End`, so the owner can seal. If the session row already says `sealed=1`, the holder (the owner after `End`, or a cleanup) is sealing: the viewer closes the connection, which would cut the seal short, and waits up to 3s for the header to turn rollback (read **sealed**) or the lock to free (read a **copy**); past that it reads in place, as ended. Never **live**. |
 | any | rollback | **sealed**: `immutable=1` (no `-shm`, no locks, works on a read-only copy). A held lock over a rollback-mode header is a cleanup that just sealed it: read as ended. `sealed=1` alone never chooses `immutable=1`. |
 | free | WAL | **copy**: a lost session, or a seal cut short. The viewer takes the session's `lock` **shared** while it copies `session.db` and its `-wal` into `<sessions root>/.tmp/`, releases it, and opens the copy (WAL recovery runs on the copy). The shared lock makes a cleanup's exclusive seal wait, while every other probe still reads the session as not live. The copy is removed when the viewer is done; an orphan is swept by cleanup after 10 minutes. |
 
