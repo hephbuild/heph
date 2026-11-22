@@ -786,6 +786,15 @@ contents.
   removed (ids are never reused). A removal renames the directory to a tomb
   (`.removing-<id>-<pid>`) and then deletes it. Two cleanups can race on a
   stale tomb or reader copy, both deleting it, which is harmless.
+- Each removal of an ended recording logs one `info` line, `removed an
+  ended session recording`, with its `id`, its `age` and the `reason`:
+  `keep` (older than `session.keep`) or `keep_bytes` (past
+  `session.keepBytes`). A private session's removal logs at `debug`, reason
+  `private`.
+- A session command given an id that matches nothing says that an ended
+  recording is removed past `session.keep`, or sooner past
+  `session.keepBytes`, with the values in force for the viewing heph, and
+  points here.
 
 Both windows are set in `.hephconfig`:
 
@@ -808,6 +817,89 @@ Every start also cleans `~/.heph/private-sessions/` with nothing kept
 (`Retention::PRIVATE`): an ended private session (lock free, so a killed
 run's) goes whatever its age and is never sealed, a live one is never
 touched, and one still starting is left alone as above.
+
+## Recipes
+
+The questions asked most, and what answers each. The SQL runs with `sqlite3`
+on a sealed recording, or on a copy of a live one (see [Reading](#reading)).
+[Exit codes](#commands-and-exit-codes) say which failures are `heph
+session`'s own (125).
+
+**A run just failed: what does an agent run first?** `heph session show <id>
+--json`, where `<id>` is the run's start line, or the newest row of `heph
+session list --json`. Its `state`, `exit_code` and `incomplete` say how the
+run ended and whether the recording covers all of it; `next` is the command
+to run after it, with `argv` and `cwd` to run it as is. For a failed run
+that is `heph inspect failure <addr>` on its first failed target, which names
+the target's log and kept outputs (`--json` for the paths alone). The failed targets and the one each failure came from:
+
+```sql
+SELECT t.addr, t.outcome,
+       json_extract(r.attributes, '$."heph.upstream_of"') AS upstream_of
+FROM targets t JOIN spans r ON r.name = 'heph.result' AND r.addr = t.addr
+WHERE t.outcome IN ('failed', 'cancelled');
+```
+
+A row with `upstream_of` failed only because that target did; the rows
+without one are what to fix.
+
+**Why is my session `incomplete`?** It passed a size cap (`show --json`:
+`incomplete_reason` is `size_cap`). Past the 256 MiB full cap, output and log
+lines and progress-only events were dropped; past the 1 GiB ceiling, nothing
+but its `End` was recorded. `show` names the cap and how far into the run it
+was passed; the same, from the rows:
+
+```sql
+SELECT name, (time_us - (SELECT start_us FROM spans WHERE span_id = 1)) / 1e6
+       AS seconds_into_run
+FROM span_events WHERE name = 'heph.truncated';
+```
+
+The first row is the full cap, a second one the ceiling. The run itself was
+not affected; a target's whole log is still in its
+[run log](#run-logs) or `heph inspect failure`.
+
+**Why is my session `lost`?** Its lock is free and it has no `End`: the
+process was killed (`SIGKILL`, a second Ctrl-C, the OOM killer, the machine
+going down) or crashed before it could finish. Everything it committed until
+then is readable. The next session start seals it (see
+[Liveness and sealing](#liveness-and-sealing)): `ended_ms` becomes its last
+record's time and `exit_code` stays `null`, so a lost session never reads as
+a pass.
+
+**My session id is gone.** An ended recording is removed once it is older
+than `session.keep` (7 days), or sooner when all of them together pass
+`session.keepBytes` (2 GiB), oldest first; `heph session show` on a missing id
+says which values were in force, and each removal logs an `info` line with
+its reason (see [Retention](#retention)). Raise either key in
+`.hephconfig` to keep more.
+
+**Are my `resources` declarations the limit, or the machine?** The pool rows
+say how much of each pool was held and how long something waited for it:
+
+```sql
+SELECT json_extract(m.attributes, '$."heph.pool"') AS pool,
+       (SELECT value FROM metrics c WHERE c.name = 'heph.pool.capacity'
+          AND c.attributes = m.attributes ORDER BY c.time_us DESC LIMIT 1) AS capacity,
+       max(CASE WHEN m.name = 'heph.session.pool.held.mean' THEN m.value END) AS held_mean,
+       max(CASE WHEN m.name = 'heph.session.pool.held.peak' THEN m.value END) AS held_peak,
+       max(CASE WHEN m.name = 'heph.session.pool.waiting_us' THEN m.value END) / 1e6 AS waiting_s
+FROM metrics m WHERE m.name LIKE 'heph.session.pool.%'
+GROUP BY pool;
+
+-- Which targets waited longest for admission, and what they declared.
+SELECT addr,
+       json_extract(attributes, '$."heph.admission.queued_ms"') AS queued_ms,
+       json_extract(attributes, '$."heph.resources.declared.cpu"') AS declared_cpu
+FROM spans WHERE name = 'heph.result'
+ORDER BY queued_ms DESC;
+```
+
+A pool held near its capacity with a long `waiting_s` held work back. Whether
+the machine had room while it did needs the machine's own usage beside these
+rows, which this heph does not record yet: until it does, compare with the
+machine's load over the same window by hand. Nothing here flows back into
+admission (see [Pools](#pools)).
 
 ## Run logs
 

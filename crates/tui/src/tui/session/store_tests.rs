@@ -1586,6 +1586,23 @@ fn explorer_golden_rows() {
         ),
         end_record(s + 10, "//q:a"),
         session_record(s + 11, SessionRecordKind::Truncated),
+        start_record(s + 11, "//q:b"),
+        ev(
+            s + 11,
+            BuildEventKind::ResultEnd {
+                addr: "//q:b".into(),
+                error: Some("dep failed".into()),
+                upstream_of: Some("//q:a".into()),
+                exit_status: None,
+                log_tail: None,
+                timed_out: Some(TimedOutData {
+                    timeout_ms: 1000,
+                    abandoned: false,
+                }),
+                cancelled: false,
+                left_behind: None,
+            },
+        ),
     ];
     let (_root, conn) = derived(id, &records, s + 12);
     assert_eq!(
@@ -1602,6 +1619,52 @@ fn explorer_golden_rows() {
             "1|heph.truncated|11000|NULL",
         ]
     );
+
+    // The attribute keys the two streams write are exactly the documented
+    // ones: a key the deriver starts writing without a row in the table, or
+    // a documented key nothing writes, fails here.
+    let committed = tests::open(&committed);
+    let mut written: BTreeSet<String> = attribute_keys(&committed.conn);
+    written.extend(attribute_keys(&conn));
+    assert_eq!(written, documented_attribute_keys());
+}
+
+/// Every attribute key in `spans`, `span_events` and `metrics`, with a
+/// per-pool suffix written as `<pool>`, as the documentation spells it.
+fn attribute_keys(conn: &rusqlite::Connection) -> BTreeSet<String> {
+    let sql = "SELECT DISTINCT j.key FROM spans, json_each(spans.attributes) j \
+         UNION SELECT DISTINCT j.key FROM span_events, json_each(span_events.attributes) j \
+         UNION SELECT DISTINCT j.key FROM metrics, json_each(metrics.attributes) j";
+    dump(conn, sql)
+        .into_iter()
+        .map(|key| {
+            ["heph.resources.declared.", "heph.resources.reserved."]
+                .into_iter()
+                .find(|p| key.starts_with(p))
+                .map_or(key.clone(), |p| format!("{p}<pool>"))
+        })
+        .collect()
+}
+
+/// The keys in the first column of docs/SESSIONS.md's "Attribute keys" table.
+fn documented_attribute_keys() -> BTreeSet<String> {
+    let doc = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/SESSIONS.md");
+    let text = std::fs::read_to_string(&doc).expect("read docs/SESSIONS.md");
+    let table = text
+        .split("#### Attribute keys\n")
+        .nth(1)
+        .expect("an Attribute keys section in docs/SESSIONS.md");
+    let keys: BTreeSet<String> = table
+        .lines()
+        .skip_while(|l| !l.starts_with('|'))
+        .take_while(|l| l.starts_with('|'))
+        .skip(2)
+        .filter_map(|row| row.split('|').nth(1))
+        .flat_map(|cell| cell.split(','))
+        .map(|key| key.trim().trim_matches('`').to_owned())
+        .collect();
+    assert!(keys.len() > 10, "{keys:?}");
+    keys
 }
 
 /// I5, the store's half: a SQLite file that is not a heph recording, an
