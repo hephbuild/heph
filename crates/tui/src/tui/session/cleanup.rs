@@ -705,6 +705,63 @@ mod tests {
         assert!(sealed);
     }
 
+    /// `session.keep: 0` keeps no ended recording: at the next session start
+    /// every ended one past the start grace goes, however young, while a live
+    /// one stays (one still starting stays too, as under
+    /// `private_retention_keeps_nothing_ended`, the same zero retention).
+    /// `keepBytes: 0` removes every sealed recording it can count, however
+    /// young (one it cannot count is left to age:
+    /// `cleanup_leaves_unknown_recordings_to_age`). Zero is a value, never
+    /// "unset" or "unlimited".
+    #[test]
+    fn zero_retention_keeps_no_ended_recording() {
+        let now = SystemTime::now();
+        for retention in [
+            Retention::from_config(Some(Duration::ZERO), None),
+            Retention::from_config(None, Some(0)),
+        ] {
+            let root = tempfile::tempdir().expect("tempdir");
+            let young = ended(root.path(), now, Duration::ZERO, 1, 100);
+            let live = ended(root.path(), now, Duration::ZERO, 2, 100);
+            let lock = hold(root.path(), live);
+            // Two minutes after its files were written: past the start grace,
+            // and far younger than any default.
+            let report = cleanup(root.path(), now + 2 * MIN, retention).expect("cleanup");
+            assert_eq!(report.removed, vec![young], "{retention:?}");
+            assert_eq!(remaining(root.path()), vec![live.encode()], "{retention:?}");
+            drop(lock);
+        }
+    }
+
+    /// `Retention::from_config` sets each field from its own key, and an
+    /// unset key keeps its own default.
+    #[test]
+    fn retention_from_config_fields() {
+        let default = Retention::default();
+        assert_eq!(Retention::from_config(None, None), default);
+        assert_eq!(
+            Retention::from_config(Some(DAY), Some(5)),
+            Retention {
+                max_age: DAY,
+                max_bytes: 5
+            }
+        );
+        assert_eq!(
+            Retention::from_config(Some(DAY), None),
+            Retention {
+                max_age: DAY,
+                ..default
+            }
+        );
+        assert_eq!(
+            Retention::from_config(None, Some(5)),
+            Retention {
+                max_bytes: 5,
+                ..default
+            }
+        );
+    }
+
     /// The private root keeps no ended session, but leaves one that may still
     /// be starting.
     #[test]

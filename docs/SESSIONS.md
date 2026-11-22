@@ -805,7 +805,11 @@ session:
 ```
 
 `keep` takes a duration (`7d`, `36h`, `90m`), `keepBytes` a size (`2G`,
-`500MiB`, `1048576`). `0` keeps no ended recording. A value that does not
+`500MiB`, `1048576`). `0` is zero, never "unset" or "no limit": `keep: 0`
+keeps no ended recording, so the next session start removes every ended one
+past the 60s start grace however young, and `keepBytes: 0` removes every
+sealed one it can count (one it cannot count still goes by age). Live and
+starting sessions are untouched either way. A value that does not
 parse (`-1`, `5x`, a number past 2^64) is a warning naming its key, and that
 field keeps its default: retention is never a reason to fail a build.
 `keep` above 90 days is clamped to 90 days, with one warning naming
