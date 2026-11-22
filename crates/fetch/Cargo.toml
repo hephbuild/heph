@@ -14,4 +14,6 @@ bytes = "1.12"
 hex = "0.4"
 sha2 = "0.11"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+# The capped download lands in a temp file deleted on drop.
+tempfile = "3"
 tokio = { version = "1.54.1", features = ["rt", "time"] }
