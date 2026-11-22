@@ -732,7 +732,7 @@ fn seal_with_a_viewer_open() {
         }
         // Held through the seal and the reads after it, or dropped by a
         // thread partway through the seal.
-        let (held, gone) = if matches!(viewer, Viewer::GoneMidSeal) {
+        let (mut held, gone) = if matches!(viewer, Viewer::GoneMidSeal) {
             let t = std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_millis(200));
                 drop(cursor);
@@ -746,10 +746,67 @@ fn seal_with_a_viewer_open() {
             t.join().expect("viewer thread");
             assert_eq!(sealed, store::Sealed::Done, "the viewer left in time");
         }
+        // The viewer that stayed reads on after the seal: the next record
+        // its cursor yields is the owner's `End`, and nothing after it.
+        if let Some(cursor) = held.as_mut() {
+            if matches!(viewer, Viewer::MidRead) {
+                cursor.conn().execute_batch("COMMIT").expect("end the read");
+            }
+            let after: Vec<SessionRecord> =
+                std::iter::from_fn(|| cursor.next_record().expect("read after the seal")).collect();
+            assert_eq!(after.len(), 1, "only End was written after the first read");
+            assert!(
+                matches!(
+                    after.first().and_then(|r| r.session.as_ref()),
+                    Some(SessionRecordKind::End { .. })
+                ),
+                "the held cursor reads End after the seal: {after:?}"
+            );
+        }
         let mid_read = matches!(viewer, Viewer::MidRead);
         check_sealed(&dir, owner, sealed, records.len(), mid_read);
         drop(held);
+        if mid_read {
+            seal_lost_after_cut_short(&dir);
+        }
     }
+}
+
+/// A cut-short seal leaves `sealed=1` under a WAL-mode header. The cleanup
+/// then seals the file without rewriting the session row: `sealed=1` means
+/// `End` (and the owner's end fields) was committed, so `seal_lost` keeps
+/// the owner's `ended_ms` and `exit_code` and does not stamp the derivation
+/// stale; it only finishes the checkpoint and the mode switch.
+fn seal_lost_after_cut_short(dir: &Path) {
+    let path = dir.join(store::FILE);
+    let row = |conn: &rusqlite::Connection| -> (Option<i64>, Option<i64>, u32) {
+        conn.query_row(
+            "SELECT ended_ms, exit_code, derivation FROM session",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .expect("session row")
+    };
+    let before = row(&tests::alter(dir));
+    assert!(
+        header(dir).wal,
+        "precondition: the cut-short seal left WAL mode"
+    );
+    assert_eq!(before.1, Some(0), "precondition: the owner's exit code");
+    assert_ne!(before.2, store::STALE_DERIVATION, "precondition: derived");
+
+    assert_eq!(
+        store::seal_lost(&path).expect("seal_lost"),
+        store::Sealed::Done
+    );
+    assert!(!header(dir).wal, "seal_lost finished the mode switch");
+    let opened = tests::open(dir);
+    assert!(!opened.is_copy(), "sealed: read in place");
+    assert_eq!(
+        row(&opened.conn),
+        before,
+        "a session the owner sealed keeps its end time, exit code and derivation"
+    );
 }
 
 /// The owner's end: `End`, the session row's end fields and `sealed=1` in
@@ -1384,6 +1441,21 @@ fn opens_format_1_fixture() {
         let opened = tests::open(&dir);
         assert!(!opened.is_copy() && !opened.live, "format {n}: sealed");
         assert!(sealed_column(&opened.conn));
+        if n == store::FORMAT {
+            // The current format's schema is the fixture's: a table, view,
+            // index or trigger edited without a format bump fails here.
+            let fresh_root = tempfile::tempdir().expect("tempdir");
+            let fresh_dir = session_dir(fresh_root.path(), SessionId::new(FIXTURE_STARTED_MS, 1));
+            write_fixture(&fresh_dir);
+            let fresh = store::open_sealed(&fresh_dir.join(store::FILE)).expect("open fresh");
+            assert_eq!(
+                dump(&opened.conn, SCHEMA_SQL),
+                dump(&fresh, SCHEMA_SQL),
+                "format {n}'s schema moved from its fixture: bump store::FORMAT and run \
+                 `cargo test -p tui generate_format_fixture -- --ignored` (or, if format {n} \
+                 was never released, delete its fixture and regenerate it)"
+            );
+        }
         for sql in &recipes {
             let rows = count_rows(&opened.conn, sql);
             assert!(rows > 0, "format {n}: no rows from {sql}");
@@ -1406,6 +1478,9 @@ fn opens_format_1_fixture() {
         );
     }
 }
+
+/// Every schema object of a recording, as SQLite stores its definition.
+const SCHEMA_SQL: &str = "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name";
 
 /// How many rows `sql` returns.
 fn count_rows(conn: &rusqlite::Connection, sql: &str) -> usize {
@@ -2305,4 +2380,74 @@ fn actor_from_env() {
     assert_eq!((partial.kind, partial.ci_run_url), ("ci", None));
     let unknown_ci = with(&[("CI", "1")]);
     assert_eq!(unknown_ci.ci_run_url, None, "no URL off GitHub Actions");
+
+    // Only empty, `0`, `false` and `no` (trimmed, any case) say "not CI";
+    // every other value is CI, including ones that read as "no" to a human.
+    for v in ["off", "n", "OFF", "yes", "\t", "\u{1b}[0m", "\u{0}"] {
+        let actor = store::Actor::from_env([("CI".into(), v.into())]);
+        let expect = if v.trim().is_empty() { "human" } else { "ci" };
+        assert_eq!(actor.kind, expect, "CI={v:?}");
+    }
+
+    // The run URL is whole or nothing: a missing, empty or control-byte
+    // part drops it; a long part is kept whole.
+    let gh_with = |server: &str, repo: &str, run: &str| {
+        store::Actor::from_env(
+            [
+                ("GITHUB_ACTIONS", "true"),
+                ("GITHUB_SERVER_URL", server),
+                ("GITHUB_REPOSITORY", repo),
+                ("GITHUB_RUN_ID", run),
+            ]
+            .map(|(k, v)| (k.to_owned(), v.to_owned())),
+        )
+    };
+    for (server, repo, run) in [
+        ("", "o/r", "42"),
+        ("https://github.com", "", "42"),
+        ("https://github.com", "o/r", ""),
+        ("https://github.com\u{1b}]8;;x\u{7}", "o/r", "42"),
+        ("https://github.com", "o/r\n", "42"),
+        ("https://github.com", "o/r", "4\u{0}2"),
+        ("https://github.com", "o/r", "42\u{7f}"),
+    ] {
+        let actor = gh_with(server, repo, run);
+        assert_eq!(
+            (actor.kind, actor.name, actor.ci_run_url),
+            ("ci", Some("github-actions"), None),
+            "{server:?} {repo:?} {run:?}"
+        );
+    }
+    let long_repo = format!("o/{}", "r".repeat(64 * 1024));
+    let long = gh_with("https://github.com", &long_repo, "42");
+    assert_eq!(
+        long.ci_run_url,
+        Some(format!("https://github.com/{long_repo}/actions/runs/42")),
+        "a long part is kept whole"
+    );
+    let unicode = gh_with("https://gïthub.example", "ö/r", "42");
+    assert_eq!(
+        unicode.ci_run_url.as_deref(),
+        Some("https://gïthub.example/ö/r/actions/runs/42"),
+        "non-ASCII is not a control byte"
+    );
+}
+
+/// O5, `Provenance::detect`'s filter: a variable whose name or value is not
+/// UTF-8 is skipped whole, never decoded lossily into a match.
+#[test]
+fn actor_env_skips_non_utf8() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    let bad = |b: &[u8]| OsString::from_vec(b.to_vec());
+    let env = [
+        (OsString::from("CLAUDECODE"), bad(b"1\xff")),
+        (bad(b"GITHUB_ACTIONS\xff"), OsString::from("true")),
+        (OsString::from("CI"), bad(b"\xfe")),
+        (OsString::from("USER_OK"), OsString::from("x")),
+    ];
+    let kept: Vec<(String, String)> = store::utf8_env(env.clone()).collect();
+    assert_eq!(kept, [("USER_OK".to_owned(), "x".to_owned())]);
+    let actor = store::Actor::from_env(store::utf8_env(env));
+    assert_eq!((actor.kind, actor.name), ("human", None));
 }

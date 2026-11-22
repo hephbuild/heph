@@ -517,12 +517,19 @@ impl Provenance {
         Self {
             host: host_name(),
             user: std::env::var("USER").ok().filter(|u| !u.is_empty()),
-            actor: Actor::from_env(
-                std::env::vars_os()
-                    .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))),
-            ),
+            actor: Actor::from_env(utf8_env(std::env::vars_os())),
         }
     }
+}
+
+/// The variables whose name and value are both UTF-8. A non-UTF-8 one is
+/// skipped whole, never decoded lossily: `CLAUDECODE=1` with a stray byte is
+/// not `CLAUDECODE=1`.
+pub(crate) fn utf8_env(
+    env: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> impl Iterator<Item = (String, String)> {
+    env.into_iter()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
 }
 
 impl Actor {
@@ -550,8 +557,13 @@ impl Actor {
                 _ => {}
             }
         }
+        // Whole or nothing: a part that is empty or holds a control byte
+        // (a terminal escape for whoever prints the row) drops the URL. A
+        // long part is kept whole, never cut.
+        let part =
+            |v: Option<String>| v.filter(|v| !v.is_empty() && !v.chars().any(char::is_control));
         let ci_run_url = if github {
-            match (server, repo, run) {
+            match (part(server), part(repo), part(run)) {
                 (Some(s), Some(r), Some(id)) => Some(format!("{s}/{r}/actions/runs/{id}")),
                 _ => None,
             }

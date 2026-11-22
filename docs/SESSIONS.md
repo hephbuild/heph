@@ -175,8 +175,11 @@ still in WAL mode (live, or a seal cut short) or sealed (rollback mode).
 Actor detection reads the environment only, never sets it: `CLAUDECODE=1` is
 an agent (`claude-code`), before `GITHUB_ACTIONS=true` (CI,
 `github-actions`, with `ci_run_url` from `GITHUB_SERVER_URL`,
-`GITHUB_REPOSITORY` and `GITHUB_RUN_ID`), before `CI` set to anything but
-empty, `0`, `false` or `no` (CI, `unknown`); anything else is `human`. None
+`GITHUB_REPOSITORY` and `GITHUB_RUN_ID`, left NULL when any of the three is
+missing, empty or holds a control character), before `CI` set to anything
+but empty, `0`, `false` or `no` (CI, `unknown`; so `CI=off` is CI);
+anything else is `human`. A variable whose name or value is not UTF-8 is
+ignored. None
 of the session row's fields reaches a hash, or a target's argv, env or files
 (I1).
 
@@ -474,6 +477,10 @@ viewer is in the way, within the exit's 3s bound less a 250ms margin, then
 releases the lock. Nothing writes the file after the mode switch, so the
 rollback-mode header is the only seal test: `sealed=1` in a WAL-mode file
 means the seal was cut short, and readers take the copy path for it.
+`sealed=1` therefore means `End` and the session row's end fields are
+committed, not that the file is immutable: a cleanup that later seals such
+a file only finishes the checkpoint and mode switch, and keeps the owner's
+`ended_ms`, `exit_code` and `derivation`.
 
 A session killed before its seal (`SIGKILL`, a second Ctrl-C) leaves a
 WAL-mode recording with no `End` and a free lock: `lost`. The next cleanup
