@@ -471,13 +471,6 @@ pub struct RequestStateData {
     /// frame shell?" must be a pure function of the addr for the request's whole
     /// lifetime, so no frame can resolve before it is known.
     shell: Option<ShellTarget>,
-    /// Whether a frame took the terminal for [`shell`]: the one fact the engine
-    /// records about it. What to tell the user when no frame did is the caller's
-    /// call — it owns the whole request, so it is the only one that knows when
-    /// the run is over.
-    ///
-    /// [`shell`]: RequestStateData::shell
-    shell_entered: std::sync::atomic::AtomicBool,
     /// Post-write `cache.history` trims held back until this request's cache
     /// read guards are gone.
     ///
@@ -1258,29 +1251,6 @@ impl RequestState {
         self.data.shell.as_ref()
     }
 
-    /// Record that a frame took the terminal for the [`shell_target`].
-    ///
-    /// [`shell_target`]: Self::shell_target
-    pub(crate) fn mark_shell_entered(&self) {
-        // `Relaxed`: the flag publishes no data, and the caller reads it only
-        // after the request's futures have completed.
-        self.data
-            .shell_entered
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Whether any frame of this request took the terminal for the
-    /// [`shell_target`]. Meaningful once the request has finished: a caller
-    /// that sees `false` after a successful run knows `--shell=ADDR` named
-    /// something the run never resolved.
-    ///
-    /// [`shell_target`]: Self::shell_target
-    pub fn shell_entered(&self) -> bool {
-        self.data
-            .shell_entered
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
     /// Hands a cloned sender to `emit_scope`'s drop-guard.
     pub(crate) fn events_sender(&self) -> Option<crate::engine::event::EventSender> {
         self.data.events.clone()
@@ -1768,7 +1738,6 @@ impl Engine {
             hash_only,
             selection: std::sync::OnceLock::new(),
             shell,
-            shell_entered: std::sync::atomic::AtomicBool::new(false),
             deferred_trims: DeferredTrims {
                 engine: Arc::downgrade(self),
                 bg_pending,

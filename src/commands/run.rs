@@ -2,6 +2,7 @@ use crate::tui::session::SessionSlot;
 use std::ffi::OsString;
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -578,11 +579,10 @@ fn shell_for_selection(shell: ShellFlag, matcher: &Matcher) -> ShellFlag {
 /// How looking up a `--shell=ADDRESS` target before the run came out.
 ///
 /// `heph run` owns both `--shell=` warnings because it owns the whole request:
-/// it is the only place that sees the run start and end. The engine records
-/// one fact, [`RequestState::shell_entered`]; everything said to the user is
-/// decided here, from that fact and this lookup.
-///
-/// [`RequestState::shell_entered`]: crate::engine::request_state::RequestState::shell_entered
+/// it is the only place that sees the run start and end. Whether the target
+/// was entered is observed on the terminal it hands the engine
+/// ([`record_entry`]); everything said to the user is decided here, from that
+/// and this lookup. The engine keeps no state about it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ShellLookup {
     /// A target has the address. Whether the run reaches it is known only
@@ -664,6 +664,22 @@ fn warn_shell_not_in_run(addr: &crate::htaddr::Addr, request: &str) {
          nothing in the run resolved that address — list what it does contain \
          with `heph query <selection>`",
     );
+}
+
+/// The `--shell=` terminal, recording into `entered` when the engine calls it.
+///
+/// The engine calls a [`ShellTarget`]'s terminal only from the one frame that
+/// takes it for the shell, so a call is exactly "the shell was entered" — a
+/// target that did not exist, or that the run never reached, never calls it.
+///
+/// [`ShellTarget`]: crate::engine::ShellTarget
+fn record_entry(terminal: InteractiveWrapper, entered: Arc<AtomicBool>) -> InteractiveWrapper {
+    Arc::new(move |inner| {
+        // `Relaxed`: the flag publishes no data, and it is read only after the
+        // request's futures have completed.
+        entered.store(true, Ordering::Relaxed);
+        terminal(inner)
+    })
 }
 
 /// A `--shell=ADDRESS` checked before the run, to be judged after it.
@@ -1014,8 +1030,15 @@ impl App for RunApp {
             ShellFlag::Target(addr) => Some(addr.clone()),
             ShellFlag::Absent | ShellFlag::Infer => None,
         };
+        // Whether the `--shell=` target was entered is observed here, on the
+        // terminal this command hands over: the engine calls it exactly when a
+        // frame takes the terminal for the shell, and for nothing else.
+        let shell_entered = Arc::new(AtomicBool::new(false));
         let (shell_terminal, interactive) = match &shell_target {
-            Some(_) => (interactive, None),
+            Some(_) => (
+                interactive.map(|terminal| record_entry(terminal, Arc::clone(&shell_entered))),
+                None,
+            ),
             None => (None, interactive),
         };
         let opts = ResultOptions {
@@ -1076,7 +1099,11 @@ impl App for RunApp {
                     if let Some(check) = &shell_check {
                         // `Some(exit)` is a tool that ran: everything it
                         // depends on resolved, whatever its own status.
-                        check.after(matches!(outcome, Ok(Some(_))), rs.shell_entered(), &request);
+                        check.after(
+                            matches!(outcome, Ok(Some(_))),
+                            shell_entered.load(Ordering::Relaxed),
+                            &request,
+                        );
                     }
                     return outcome;
                 }
@@ -1134,7 +1161,11 @@ impl App for RunApp {
         // A run with gaps skipped part of the graph, so it did not succeed:
         // the shell target may be in what it skipped.
         if let Some(check) = &shell_check {
-            check.after(res.is_ok() && gaps.is_empty(), rs.shell_entered(), &request);
+            check.after(
+                res.is_ok() && gaps.is_empty(),
+                shell_entered.load(Ordering::Relaxed),
+                &request,
+            );
         }
 
         // On success print `--cat-out` / `--list-out`; failures/cancellation are
@@ -1785,6 +1816,41 @@ mod tests {
     /// it would be wrong: the address was entered; the run failed (an unreached
     /// target is then a consequence, and a `--shell=<group>` refusal must not
     /// be talked over); the address was already warned about before the run.
+    /// The engine calling the handed-over terminal is the only signal that the
+    /// `--shell=` target was entered, so the wrapper must record the call and
+    /// still hand the target the real terminal: a wrapper that records but does
+    /// not pass through would open no shell, and one that passes through
+    /// without recording would warn "not part of this run" over a shell the
+    /// user just used.
+    #[tokio::test]
+    async fn record_entry_records_the_call_and_passes_it_through() -> anyhow::Result<()> {
+        let reached = Arc::new(AtomicBool::new(false));
+        let terminal: InteractiveWrapper =
+            Arc::new(|inner: crate::engine::InteractiveInner| inner(None, None, None, None));
+        let entered = Arc::new(AtomicBool::new(false));
+        let wrapped = record_entry(terminal, Arc::clone(&entered));
+        assert!(
+            !entered.load(Ordering::Relaxed),
+            "building the wrapper enters nothing"
+        );
+
+        let target = Arc::clone(&reached);
+        wrapped(Box::new(move |_, _, _, _| {
+            Box::pin(async move {
+                target.store(true, Ordering::Relaxed);
+                Ok(())
+            })
+        }))
+        .await?;
+
+        assert!(entered.load(Ordering::Relaxed), "a call is an entry");
+        assert!(
+            reached.load(Ordering::Relaxed),
+            "…and the target got the terminal"
+        );
+        Ok(())
+    }
+
     #[test]
     fn warn_not_in_run_only_for_a_found_target_a_successful_run_never_entered() {
         use ShellLookup::{Failed, Found, NotFound};

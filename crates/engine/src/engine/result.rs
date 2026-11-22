@@ -3279,15 +3279,10 @@ impl Engine {
                 let (shell, interactive) = match rs.shell_target() {
                     // The addressed form: the terminal is the request's, and the
                     // frame that holds it is the one entered.
-                    Some(target) => {
-                        if gets_terminal {
-                            rs.mark_shell_entered();
-                        }
-                        (
-                            gets_terminal,
-                            target.terminal.clone().filter(|_| gets_terminal),
-                        )
-                    }
+                    Some(target) => (
+                        gets_terminal,
+                        target.terminal.clone().filter(|_| gets_terminal),
+                    ),
                     // The bare form: the frame's own options, which only the
                     // selected target's frame carries.
                     None => (
@@ -16443,7 +16438,11 @@ mod tests {
             1,
             "the named member is entered",
         );
-        assert!(rs.shell_entered(), "…and the request records that it was");
+        assert_eq!(
+            h.probe.calls.load(Ordering::SeqCst),
+            1,
+            "…through the terminal the caller handed over, which is how it knows",
+        );
         assert_eq!(
             h.runs.load(Ordering::SeqCst),
             1,
@@ -16479,7 +16478,11 @@ mod tests {
             1,
             "the named target is entered",
         );
-        assert!(rs.shell_entered(), "…and the request records that it was");
+        assert_eq!(
+            h.probe.calls.load(Ordering::SeqCst),
+            1,
+            "…through the terminal the caller handed over, which is how it knows",
+        );
         assert_eq!(
             h.runs.load(Ordering::SeqCst),
             1,
@@ -16517,7 +16520,11 @@ mod tests {
             1,
             "a dependency named with --shell= is entered",
         );
-        assert!(rs.shell_entered(), "…and the request records that it was");
+        assert_eq!(
+            h.probe.calls.load(Ordering::SeqCst),
+            1,
+            "…through the terminal the caller handed over, which is how it knows",
+        );
         assert_eq!(
             h.probe.calls.load(Ordering::SeqCst),
             1,
@@ -16563,7 +16570,11 @@ mod tests {
             1,
             "…and the entrypoint runs instead of shelling",
         );
-        assert!(rs.shell_entered(), "the request records the entry");
+        assert_eq!(
+            h.probe.calls.load(Ordering::SeqCst),
+            1,
+            "the caller's terminal is what the dependency was entered through",
+        );
         Ok(())
     }
 
@@ -16631,9 +16642,10 @@ mod tests {
             0,
             "nothing was entered",
         );
-        assert!(
-            !rs.shell_entered(),
-            "the request must say the --shell target was not entered",
+        assert_eq!(
+            h.probe.calls.load(Ordering::SeqCst),
+            0,
+            "the caller's terminal must not be called for a target outside the run",
         );
         Ok(())
     }
@@ -16660,7 +16672,11 @@ mod tests {
             2,
             "the selection still built"
         );
-        assert!(!rs.shell_entered(), "nothing in the selection entered it");
+        assert_eq!(
+            h.probe.calls.load(Ordering::SeqCst),
+            0,
+            "nothing in the selection took the caller's terminal",
+        );
         Ok(())
     }
 
@@ -16686,7 +16702,7 @@ mod tests {
             2,
             "the build proceeds; a bail would have left this at 0",
         );
-        assert!(!rs.shell_entered());
+        assert_eq!(h.probe.calls.load(Ordering::SeqCst), 0);
         Ok(())
     }
 
