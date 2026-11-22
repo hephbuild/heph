@@ -1,6 +1,6 @@
-//! The log sink's numbered lines, through a real recorder and the file it
-//! writes: numbering across threads at the terminal's filter, `Log` records
-//! past the cap up to the ceiling, and the replay a closed full screen prints
+//! The log sink's numbered lines, through a real recorder and the recording
+//! it writes: numbering across threads at the terminal's filter, `Log`
+//! records up to the full cap, and the replay a closed full screen prints
 //! (I3).
 
 use std::path::Path;
@@ -123,19 +123,18 @@ fn numbering_across_threads_at_the_terminal_filter() {
     slot.finish(Some(0));
 }
 
-/// `Log` records keep being written past the cap (after `Truncated`), up to
-/// the ceiling (both injected small), and stop there: past it no later line
-/// is written, even a shorter one that would fit. The replay prints the lines
-/// on disk, in order, and one WARN with the count it skipped.
+/// `Log` records are written up to the full cap (injected small) and dropped
+/// past it, after `Truncated` (D15): no later line is written, even a shorter
+/// one that would fit. The replay prints the lines on disk, in order, and one
+/// WARN with the count it skipped.
 #[test]
-fn log_records_outlive_the_cap_up_to_the_ceiling() {
-    const CEILING: u64 = 4096;
+fn log_records_stop_at_the_full_cap() {
+    const FULL_CAP: u64 = 4096;
     let root = tempfile::tempdir().expect("tempdir");
     let slot = slot_with(
         root.path(),
         Faults {
-            events_cap: Some(4096),
-            log_ceiling: Some(CEILING),
+            full_cap: Some(FULL_CAP),
             ..Faults::default()
         },
     );
@@ -144,7 +143,7 @@ fn log_records_outlive_the_cap_up_to_the_ceiling() {
     let (queued, mark) = sink.replay_mark(&mut rx);
     assert!(queued.is_empty());
     assert_eq!(mark.last_printed, 0);
-    // Long enough that the room left under the ceiling fits a short line.
+    // Long enough that the room left under the cap fits a short line.
     let pad = "x".repeat(1000);
     for i in 0..100 {
         sink.write_diagnostic(&format!("long {i:03} {pad}\n"));
@@ -166,28 +165,31 @@ fn log_records_outlive_the_cap_up_to_the_ceiling() {
     });
 
     let dir = slot.dir().expect("a session");
-    let events = std::fs::read_to_string(dir.join(files::EVENTS)).expect("events");
-    let (before, past) = events
-        .split_once("\"Truncated\"")
+    let (records, _) = read_records(&dir);
+    let cut = records
+        .iter()
+        .position(|r| r.session == Some(SessionRecordKind::Truncated))
         .expect("the cap was reached");
-    let past = past.split_once('\n').expect("a line").1;
-    assert!(before.contains("long 000"), "under the cap");
-    let past_bytes: usize = past.lines().map(|l| l.len() + 1).sum();
-    assert!(past.contains("\"Log\""), "Log records outlive the cap");
+    let is_log = |r: &SessionRecord| matches!(r.session, Some(SessionRecordKind::Log { .. }));
+    assert!(records[..cut].iter().any(is_log), "under the cap");
     assert!(
-        u64::try_from(past_bytes).expect("fits") <= CEILING,
-        "{past_bytes} bytes past the cap"
+        !records[cut..].iter().any(is_log),
+        "no Log record past the cap"
+    );
+    let before: usize = records[..cut]
+        .iter()
+        .map(|r| serde_json::to_string(r).expect("encode").len())
+        .sum();
+    assert!(
+        u64::try_from(before).expect("fits") <= FULL_CAP,
+        "{before} bytes under the cap"
     );
 
     let logs = log_records(&slot);
     let kept = u64::try_from(logs.len()).expect("fits");
     let seqs: Vec<u64> = logs.iter().map(|l| l.0).collect();
-    assert_eq!(
-        seqs,
-        (1..=kept).collect::<Vec<_>>(),
-        "stopped at the ceiling"
-    );
-    assert!(kept < 100, "the ceiling dropped some: {kept}");
+    assert_eq!(seqs, (1..=kept).collect::<Vec<_>>(), "stopped at the cap");
+    assert!(kept > 0 && kept < 100, "the cap dropped some: {kept}");
     let on_disk: Vec<String> = logs.iter().map(|l| format!("{}\n", l.2)).collect();
     assert_eq!(printed, on_disk);
     assert_eq!(

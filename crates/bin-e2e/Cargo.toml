@@ -24,3 +24,6 @@ portable-pty = "0.9"
 vt100 = "0.18"
 # Signals sent at heph's pid, and whether a tool's pid is still alive.
 libc = "0.2"
+# Reading a session's `session.db` from the outside, as a second terminal
+# would (the version and features heph records it with).
+rusqlite = { version = "0.42", features = ["bundled", "blob"] }

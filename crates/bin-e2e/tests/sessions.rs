@@ -8,7 +8,9 @@
 
 mod common;
 
-use common::session::{Bg, SHORT, id_in, last_end, list_entry, lock_free, sessions_dir};
+use common::session::{
+    Bg, SHORT, id_in, last_end, list_entry, lock_free, recorded_dirs, sessions_dir,
+};
 use common::{Dist, Workspace, describe, signal, wait_until};
 
 /// `exit3` is an entrypoint, so heph exits with its tool's code — 3, which no
@@ -243,7 +245,7 @@ fn no_session_env() {
     assert!(last_end(&session_of(&ws, &out)).is_some());
 }
 
-/// The shipped binary records where it ran: `meta.json` carries the
+/// The shipped binary records where it ran: the session row carries the
 /// workspace root and the directory heph was started in. `list` uses them:
 /// inside a workspace it shows that workspace's sessions, `--all` every one
 /// under the same `HOME`.
@@ -278,17 +280,16 @@ fn list_filters_by_workspace() {
         let id = id_in(&String::from_utf8_lossy(&out.stderr));
         assert!(id.is_some(), "no session announced\n{}", describe(&out));
         let id = id.unwrap_or_default();
-        let meta: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(sessions_dir(home).join(&id).join("meta.json")).expect("meta.json"),
-        )
-        .expect("meta.json parses");
-        for (field, want) in [("workspace_root", ws.root()), ("cwd", cwd.as_path())] {
-            let got = meta[field].as_str();
-            assert!(got.is_some(), "{field} recorded: {meta}");
+        let (root, at) = recorded_dirs(&sessions_dir(home).join(&id));
+        for (field, got, want) in [
+            ("workspace_root", root, ws.root()),
+            ("cwd", at, cwd.as_path()),
+        ] {
+            assert!(got.is_some(), "{field} recorded");
             assert_eq!(
-                canonical(std::path::Path::new(got.unwrap_or_default())),
+                canonical(std::path::Path::new(&got.unwrap_or_default())),
                 canonical(want),
-                "{field}: {meta}"
+                "{field}"
             );
         }
         ids.push(id);

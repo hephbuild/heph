@@ -118,10 +118,8 @@ fn events(holder_pid: u32) -> Vec<BuildEvent> {
 }
 
 fn read_records(dir: &Path) -> Vec<SessionRecord> {
-    let file = std::fs::File::open(dir.join(files::EVENTS)).expect("events");
-    let mut r = RecordReader::new(file);
-    let recs: Vec<_> = std::iter::from_fn(|| r.next_record().expect("read")).collect();
-    assert_eq!(r.skipped(), 0, "every record reads back");
+    let (recs, skipped) = super::tests::read_records(dir);
+    assert_eq!(skipped, 0, "every record reads back");
     recs
 }
 
@@ -432,14 +430,18 @@ fn attached_frames_match_live() {
     // here are applied by hand, so resolve up front.
     let live_names = HolderNames::new(Some(session_root.clone()), Some(rec.id()));
     live_names.resolve_blocking(std::process::id());
-    live.name_lock_holders(live_names);
+    live.name_lock_holders(live_names.clone());
     let tap = rec.tap();
     let mut view_tap = ViewTap::new(tap.clone(), &live);
 
+    // Through the backend's receiver, which records the holder's name (a
+    // `LockHolder` record) ahead of the event that first carries its pid.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut receiver = TappedReceiver::new(rx, Some(tap.clone()), live_names.clone());
     for e in events(std::process::id()) {
-        live.apply(&e);
-        tap.event(e);
+        tx.send(e).expect("send");
     }
+    while receiver.try_recv(|e| live.apply(e)).is_ok() {}
     *label.lock().unwrap_or_else(PoisonError::into_inner) = "run //a:... (4 matched)".into();
     let build = center.build();
     let gate = center.request(
@@ -482,11 +484,12 @@ fn attached_frames_match_live() {
     let live_final = live.final_line().expect("a summary");
 
     // The viewer: the same view, attached, fed from the recording.
-    let feed = SessionFeed::default();
+    // Its holder names come from the recording's `LockHolder` records alone,
+    // routed through the feed as `attach` wires it: no scan for pids.
+    let attached_names = FileSource::new(root.path()).holder_names(rec.id());
+    let feed = SessionFeed::with_holders(attached_names.clone());
     let mut attached = TuiProgressView::new("run //a:...").attached(rec.id(), feed.clone(), || {});
     attached.open_dashboard();
-    let attached_names = FileSource::new(root.path()).holder_names(rec.id());
-    attached_names.resolve_blocking(std::process::id());
     attached.name_lock_holders(attached_names);
     let mut checkpoints = Vec::new();
     for record in read_records(rec.dir()) {

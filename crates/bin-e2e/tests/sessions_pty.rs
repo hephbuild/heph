@@ -217,7 +217,7 @@ echo "after-end=$?="; read -r _
 }
 
 /// While a target holds the terminal the TUI is paused, and the run still
-/// records: the target's `ExecuteStart` reaches `events.ndjson` while it runs.
+/// records: the target's `ExecuteStart` reaches `session.db` while it runs.
 ///
 /// A lone target sends nothing between its pause and its resume, so this sees
 /// what was queued as the pause began; a run that builds while paused has no

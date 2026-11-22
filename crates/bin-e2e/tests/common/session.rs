@@ -26,14 +26,48 @@ pub fn sessions_dir(home: &Path) -> PathBuf {
     home.join(".heph").join("sessions")
 }
 
-/// Every complete record of a session's `events.ndjson`, in order.
+/// A read-only connection on a session's `session.db`, as a viewer opens
+/// it; `None` while the owner has not created it yet.
+fn open(dir: &Path) -> Option<rusqlite::Connection> {
+    let path = dir.join("session.db");
+    if !path.exists() {
+        return None;
+    }
+    let conn = rusqlite::Connection::open_with_flags(
+        &path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    conn.busy_timeout(Duration::from_secs(1)).ok()?;
+    Some(conn)
+}
+
+/// Every committed record of a session's recording, in order. Empty while
+/// there is no recording yet.
 pub fn records(dir: &Path) -> Vec<serde_json::Value> {
-    let text = std::fs::read_to_string(dir.join("events.ndjson")).unwrap_or_default();
-    let complete = text.rsplit_once('\n').map_or("", |(done, _)| done);
-    complete
-        .lines()
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect()
+    let Some(conn) = open(dir) else {
+        return Vec::new();
+    };
+    let Ok(mut stmt) = conn.prepare("SELECT body FROM records ORDER BY seq") else {
+        return Vec::new();
+    };
+    stmt.query_map([], |r| r.get::<_, String>(0))
+        .map(|rows| {
+            rows.filter_map(Result::ok)
+                .filter_map(|body| serde_json::from_str(&body).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The directories a session's row records: `(workspace_root, cwd)`.
+pub fn recorded_dirs(dir: &Path) -> (Option<String>, Option<String>) {
+    open(dir)
+        .expect("the session's recording")
+        .query_row("SELECT workspace_root, cwd FROM session", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .expect("the session row")
 }
 
 /// The `End` record, if it is the last one.

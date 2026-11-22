@@ -1826,7 +1826,7 @@ mod tests {
     /// Two halves, because `run` itself needs a real terminal. This one drives
     /// the real recording path (`Session`, its tap, `TappedReceiver`) through a
     /// loop shaped like `run`'s: a `Control::Pause` is taken first, then every
-    /// build event sent after it must reach `events.ndjson`.
+    /// build event sent after it must reach the recording.
     /// `run_does_not_gate_the_build_event_arm_on_pause` checks that `run`'s
     /// own build-event arm carries no pause guard, the edit that would stop
     /// recording while this loop still passed.
@@ -1834,8 +1834,8 @@ mod tests {
     async fn a_paused_loop_still_records_build_events() {
         use crate::tui::app::{Control, PauseFor};
         use crate::tui::session::{
-            HeaderKind, HolderNames, RecordReader, Session, SessionHeader, SessionRecord,
-            SessionRoot, SessionStart, TappedReceiver, files,
+            HeaderKind, HolderNames, Session, SessionHeader, SessionRecord, SessionRoot,
+            SessionStart, TappedReceiver, store,
         };
         use hcore::events::{BuildEvent, BuildEventKind};
         use tokio::sync::{mpsc, oneshot};
@@ -1910,8 +1910,9 @@ mod tests {
         session.finish(Some(0), false);
 
         assert_eq!(folded_while_paused, SENT, "every event folded while paused");
-        let file = std::fs::File::open(session.dir().join(files::EVENTS)).expect("events");
-        let mut reader = RecordReader::new(file);
+        let mut reader = store::RecordCursor::new(
+            store::open_local(root.path(), session.dir()).expect("open the recording"),
+        );
         let recorded = std::iter::from_fn(|| reader.next_record().expect("read"))
             .filter(|r: &SessionRecord| r.build_event().is_some())
             .count();

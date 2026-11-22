@@ -16,12 +16,13 @@ use heph::engine::{
 };
 use heph::hartifactcontent::WalkEntryKind;
 use heph::htaddr::parse_addr;
+use heph::tui::session::testing::Recording;
 use heph::tui::session::{
-    HeaderKind, RunLogRecord, SessionHeader, SessionId, SessionRecord, SessionRecordKind,
-    SessionRoot, SessionRunLogLocator, SessionSlot,
+    HeaderKind, OpenedSession, RunLogRecord, SessionHeader, SessionId, SessionRecord,
+    SessionRecordKind, SessionRoot, SessionRunLogLocator, SessionSlot,
 };
 use heph::{pluginbuildfile, pluginexec};
-use std::io::{Read as _, Write as _};
+use std::io::Read as _;
 use std::os::fd::AsRawFd as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -573,7 +574,7 @@ fn session_slot(user: &Path) -> (Arc<SessionSlot>, SessionRoot) {
 }
 
 /// Open `slot`'s session for `engine`'s workspace.
-fn open_session(slot: &SessionSlot, engine: &Engine, ws: &Path) -> SessionId {
+fn open_session(slot: &SessionSlot, engine: &Engine, ws: &Path) -> OpenedSession {
     slot.set_workspace(ws, ws, &engine.home);
     slot.open(
         SessionHeader {
@@ -583,20 +584,32 @@ fn open_session(slot: &SessionSlot, engine: &Engine, ws: &Path) -> SessionId {
         false,
     )
     .expect("a session opened")
-    .id
 }
 
-/// Copy the session directory `from` under `sessions` as session `id`: what
-/// a process that died with that session open leaves (its lock free).
-fn copy_session(from: &Path, sessions: &SessionRoot, id: SessionId) -> PathBuf {
-    let to = sessions.path().join(id.encode());
-    std::fs::create_dir_all(&to).expect("session dir");
-    for f in std::fs::read_dir(from).expect("read session").flatten() {
-        if f.file_type().expect("type").is_file() {
-            std::fs::copy(f.path(), to.join(f.file_name())).expect("copy");
-        }
-    }
-    to
+/// A recording of session `id` under `sessions`, recorded as the session in
+/// `like` was (same workspace and owner) and holding only `records`: what a
+/// process that died with that session open leaves (its lock free).
+fn recording_like(
+    like: &Path,
+    sessions: &SessionRoot,
+    id: SessionId,
+    records: &[SessionRecord],
+) -> Recording {
+    let mut meta =
+        heph::tui::session::store::read_meta_in(sessions.path(), like).expect("like's meta");
+    meta.id = id;
+    meta.started_unix_ms = id.started_unix_ms();
+    Recording::create(&sessions.path().join(id.encode()), &meta, records, None)
+        .expect("a recording")
+}
+
+/// Record `kind` in the live session behind `tap`, committed.
+fn record_event(tap: &heph::tui::session::SessionTap, kind: BuildEventKind) {
+    tap.event(hcore::events::BuildEvent {
+        at_unix_ms: hcore::events::now_unix_ms(),
+        kind,
+    });
+    tap.flush(Duration::from_secs(30)).expect("flushed");
 }
 
 /// Hold `dir`'s session lock, as its live owner does.
@@ -614,18 +627,10 @@ fn hold_lock(dir: &Path) -> std::fs::File {
     f
 }
 
-fn append_record(dir: &Path, record: &SessionRecord) {
-    let mut f = std::fs::OpenOptions::new()
-        .append(true)
-        .open(dir.join(heph::tui::session::files::EVENTS))
-        .expect("events");
-    writeln!(f, "{}", serde_json::to_string(record).expect("encode")).expect("write");
-}
-
 /// spec `log_follow_across_engines`: two engines on one home, each with a
 /// session. The second follows a run in the first to its end through the
 /// first's `RunLog` record; a record left by a killed process (lock free)
-/// reads as absent; a session whose `meta.json` names another workspace is
+/// reads as absent; a session whose session row names another workspace is
 /// ignored; a live session that recorded no `RunLog` reads as no log.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn log_follow_across_engines() -> anyhow::Result<()> {
@@ -637,7 +642,8 @@ async fn log_follow_across_engines() -> anyhow::Result<()> {
 
     let (slot_a, sessions) = session_slot(user.path());
     let a = engine(ws.path(), Some(&slot_a))?;
-    let id_a = open_session(&slot_a, &a, ws.path());
+    let opened_a = open_session(&slot_a, &a, ws.path());
+    let id_a = opened_a.id;
     let (slot_b, _) = session_slot(user.path());
     let b = engine(ws.path(), Some(&slot_b))?;
     open_session(&slot_b, &b, ws.path());
@@ -670,24 +676,25 @@ async fn log_follow_across_engines() -> anyhow::Result<()> {
     // A killed process's record: a live file and a record of it, in a
     // session whose lock nobody holds.
     let dir_a = slot_a.dir().expect("a's session dir");
-    let dead = copy_session(&dir_a, &sessions, SessionId::new(1_700_000_000_000, 7));
     std::fs::create_dir_all(a.home.join("runs/dead"))?;
     std::fs::write(a.home.join("runs/dead/0.log"), "dead\n")?;
-    append_record(
-        &dead,
-        &SessionRecord::session(
+    let dead = recording_like(
+        &dir_a,
+        &sessions,
+        SessionId::new(1_700_000_000_000, 7),
+        &[SessionRecord::session(
             hcore::events::now_unix_ms(),
             SessionRecordKind::RunLog(Box::new(RunLogRecord {
                 addr: "//p:dead".into(),
                 hashin: "h-dead".into(),
                 file: "runs/dead/0.log".into(),
             })),
-        ),
+        )],
     );
     assert_eq!(open(&b, "//p:dead", &located).await?, None, "lock free");
     {
         // The same record under a held lock is followed: the lock decides.
-        let _held = hold_lock(&dead);
+        let _held = hold_lock(dead.dir());
         assert_eq!(
             open(&b, "//p:dead", &located).await?,
             Some((
@@ -703,7 +710,7 @@ async fn log_follow_across_engines() -> anyhow::Result<()> {
     // Another workspace's session, recording a file that exists here.
     let (slot_c, _) = session_slot(user.path());
     let other = engine(elsewhere.path(), Some(&slot_c))?;
-    open_session(&slot_c, &other, elsewhere.path());
+    let opened_c = open_session(&slot_c, &other, elsewhere.path());
     std::fs::create_dir_all(a.home.join("runs/c"))?;
     std::fs::write(a.home.join("runs/c/0.log"), "elsewhere\n")?;
     hcore::session_record::RunLogAnnouncer::run_log_created(
@@ -714,24 +721,16 @@ async fn log_follow_across_engines() -> anyhow::Result<()> {
             file: "runs/c/0.log".into(),
         },
     );
-    let events_c = slot_c
-        .dir()
-        .expect("c's dir")
-        .join(heph::tui::session::files::EVENTS);
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while !std::fs::read_to_string(&events_c)
-        .unwrap_or_default()
-        .contains("//p:elsewhere")
-    {
-        assert!(Instant::now() < deadline, "c's record never landed");
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    opened_c
+        .tap
+        .flush(Duration::from_secs(30))
+        .expect("c's record landed");
     assert_eq!(open(&b, "//p:elsewhere", &located).await?, None);
 
     // A live session of this workspace that recorded no `RunLog` (an older
     // heph's): nothing of it is followed, and no log reads as no log.
-    let old = copy_session(&dir_a, &sessions, SessionId::new(1_700_000_000_001, 8));
-    let held = hold_lock(&old);
+    let old = recording_like(&dir_a, &sessions, SessionId::new(1_700_000_000_001, 8), &[]);
+    let held = hold_lock(old.dir());
     assert_eq!(open(&b, "//p:never", &located).await?, None);
     assert!(
         b.follow_log(&parse_addr("//p:never")?, &located, false)
@@ -745,14 +744,9 @@ async fn log_follow_across_engines() -> anyhow::Result<()> {
     );
     // A run going on in A that has written nothing yet: "no output yet".
     let quiet = parse_addr("//p:quiet")?;
-    let execute = |kind| SessionRecord {
-        at_unix_ms: hcore::events::now_unix_ms(),
-        kind: Some(kind),
-        session: None,
-    };
-    append_record(
-        &dir_a,
-        &execute(BuildEventKind::ExecuteStart {
+    record_event(
+        &opened_a.tap,
+        BuildEventKind::ExecuteStart {
             addr: quiet.format(),
             driver: "bash".into(),
             cache: true,
@@ -762,7 +756,7 @@ async fn log_follow_across_engines() -> anyhow::Result<()> {
             admitted: None,
             output_groups: Vec::new(),
             log_not_streamed: false,
-        }),
+        },
     );
     let err = b
         .open_log(&quiet, &located)
@@ -803,12 +797,12 @@ async fn log_follow_across_engines() -> anyhow::Result<()> {
         .expect("a follower");
     assert_eq!(f.started_in(), Some(id_a.encode().as_str()));
     assert_eq!(f.poll()?, FollowStep::Idle);
-    append_record(
-        &dir_a,
-        &execute(BuildEventKind::ExecuteEnd {
+    record_event(
+        &opened_a.tap,
+        BuildEventKind::ExecuteEnd {
             addr: quiet.format(),
             error: None,
-        }),
+        },
     );
     let mut got = Vec::new();
     assert!(poll_until(&mut f, &mut got, |_| false).await);
