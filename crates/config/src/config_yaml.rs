@@ -134,6 +134,10 @@ pub struct ConfigYaml {
     /// Anonymous usage telemetry; on unless `enabled: false`.
     #[serde(default)]
     pub telemetry: Option<TelemetryConfig>,
+    /// How long the session recordings under `~/.heph/sessions` are kept. See
+    /// [`SessionConfig`].
+    #[serde(default)]
+    pub session: Option<SessionConfig>,
     /// Resource pools, one entry per pool: `{unit: <count|cpu|bytes>, value:
     /// <amount>}`, or the amount alone for `cpu` (CPUs, or `50%` of the
     /// parallelism), `memory` (a size, or a percentage of the memory this
@@ -624,6 +628,16 @@ impl ConfigYaml {
         if other.telemetry.is_some() {
             self.telemetry = other.telemetry;
         }
+        // Per field: a profile that sets `keep` keeps the base's `keepBytes`.
+        if let Some(session) = other.session {
+            let base = self.session.get_or_insert_with(SessionConfig::default);
+            if session.keep.is_some() {
+                base.keep = session.keep;
+            }
+            if session.keep_bytes.is_some() {
+                base.keep_bytes = session.keep_bytes;
+            }
+        }
 
         // Caches deep-merge by key: a profile patches individual fields (e.g.
         // flips read/write) while inheriting the rest of the base entry.
@@ -647,6 +661,101 @@ fn merge_plugins(base: &mut Vec<PluginSpec>, inc: Vec<PluginSpec>) {
             Some(existing) => *existing = entry,
             None => base.push(entry),
         }
+    }
+}
+
+/// Session-recording retention (`session:` in `.hephconfig`): how long, and how
+/// many bytes of, ended recordings the cleanup at each session start keeps
+/// (`docs/SESSIONS.md`, "Retention"). Unset fields take heph's defaults (7 days,
+/// 2 GiB). The values are strings, parsed by [`SessionConfig::keep`] and
+/// [`SessionConfig::keep_bytes`] when the workspace bootstraps. A bad one is
+/// warned about and the default kept ([`SessionConfig::retention`]): how long
+/// old recordings stay is never a reason to fail a build. A `keep` above 90
+/// days is clamped to 90 days, with a warning.
+///
+/// The recordings are per user while `.hephconfig` is per workspace: the
+/// cleanup a session runs applies its own workspace's values to every
+/// recording under the user's sessions directory.
+#[derive(Debug, Deserialize, Default, Clone, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SessionConfig {
+    #[schemars(
+        description = "How long an ended session's recording is kept, e.g. `7d`, `36h`, `90m` \
+                       (a bare number is seconds). Default `7d`; at most `90d`, a longer \
+                       value is clamped to it."
+    )]
+    #[serde(default)]
+    pub keep: Option<String>,
+    #[schemars(
+        description = "The most bytes of ended recordings kept, newest first, e.g. `2G`, \
+                       `500MiB`, `1048576`. Default `2G`."
+    )]
+    #[serde(default)]
+    pub keep_bytes: Option<String>,
+}
+
+impl SessionConfig {
+    /// `keep`, parsed. `None` when unset.
+    pub fn keep(&self) -> anyhow::Result<Option<std::time::Duration>> {
+        self.keep
+            .as_deref()
+            .map(|s| hcore::units::parse_duration(s).context("in .hephconfig `session.keep`"))
+            .transpose()
+    }
+
+    /// `keepBytes`, parsed. `None` when unset.
+    pub fn keep_bytes(&self) -> anyhow::Result<Option<u64>> {
+        self.keep_bytes
+            .as_deref()
+            .map(|s| hcore::units::parse_size(s).context("in .hephconfig `session.keepBytes`"))
+            .transpose()
+    }
+
+    /// The longest `keep` honoured. A longer one is clamped to it, with a
+    /// warning: the catalog keeps its rows for 90 days, and a recording kept
+    /// longer would outlive the rows that list it.
+    pub const KEEP_MAX: std::time::Duration = std::time::Duration::from_secs(90 * 86_400);
+
+    /// `keep` and `keepBytes`, each `None` when unset or invalid. An invalid
+    /// one is a `warn!` naming its key, and the caller keeps the default. A
+    /// `keep` above [`Self::KEEP_MAX`] is a `warn!` naming its key, and
+    /// [`Self::KEEP_MAX`].
+    pub fn retention(&self) -> (Option<std::time::Duration>, Option<u64>) {
+        fn or_warn<T>(
+            key: &str,
+            value: Option<&str>,
+            parsed: anyhow::Result<Option<T>>,
+        ) -> Option<T> {
+            parsed.unwrap_or_else(|e| {
+                tracing::warn!(
+                    key,
+                    value = value.unwrap_or_default(),
+                    error = %format!("{e:#}"),
+                    "ignoring an invalid .hephconfig value; keeping the default"
+                );
+                None
+            })
+        }
+        let keep = or_warn("session.keep", self.keep.as_deref(), self.keep()).map(|keep| {
+            if keep > Self::KEEP_MAX {
+                tracing::warn!(
+                    key = "session.keep",
+                    value = self.keep.as_deref().unwrap_or_default(),
+                    "a .hephconfig value above 90 days; keeping recordings for 90 days"
+                );
+                Self::KEEP_MAX
+            } else {
+                keep
+            }
+        });
+        (
+            keep,
+            or_warn(
+                "session.keepBytes",
+                self.keep_bytes.as_deref(),
+                self.keep_bytes(),
+            ),
+        )
     }
 }
 
@@ -1496,6 +1605,190 @@ caches:
         let yaml = "telemetry:\n  bogus: 1\n";
         let err = serde_yaml::from_str::<ConfigYaml>(yaml).expect_err("must reject");
         assert!(err.to_string().contains("bogus"), "{err}");
+    }
+
+    /// Log output collected for a test, to count warnings.
+    #[derive(Clone, Default)]
+    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self {
+            self.clone()
+        }
+    }
+
+    impl Captured {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().expect("lock").clone()).expect("utf8")
+        }
+    }
+
+    /// `session.keep` is a duration and `session.keepBytes` a size, each in
+    /// the forms people type, a bare number included; unset is `None`, and a
+    /// bad value names its key. [`SessionConfig::retention`] turns a bad value
+    /// into one warning and `None` (the default), never an error, and clamps a
+    /// `keep` above 90 days to 90 days with one warning.
+    #[test]
+    fn retention_config_parsing() {
+        let cases: &[(&str, Option<u64>, Option<u64>)] = &[
+            ("", None, None),
+            ("session: {}\n", None, None),
+            ("session:\n  keep: 7d\n", Some(7 * 86_400), None),
+            ("session:\n  keep: 90d\n", Some(90 * 86_400), None),
+            ("session:\n  keepBytes: 0\n", None, Some(0)),
+            ("session:\n  keep: 1h30m\n", Some(5_400), None),
+            ("session:\n  keep: 600\n", Some(600), None),
+            ("session:\n  keep: 0\n", Some(0), None),
+            (
+                "session:\n  keepBytes: 2G\n",
+                None,
+                Some(2 * 1024 * 1024 * 1024),
+            ),
+            (
+                "session:\n  keepBytes: 500MiB\n",
+                None,
+                Some(500 * 1024 * 1024),
+            ),
+            ("session:\n  keepBytes: 1048576\n", None, Some(1_048_576)),
+            (
+                "session: {keep: 2d, keepBytes: 1G}\n",
+                Some(2 * 86_400),
+                Some(1 << 30),
+            ),
+        ];
+        for (yaml, keep, bytes) in cases {
+            // The loader reads an empty file as the default without parsing it.
+            let cfg: ConfigYaml = if yaml.is_empty() {
+                ConfigYaml::default()
+            } else {
+                serde_yaml::from_str(yaml).expect(yaml)
+            };
+            let session = cfg.session.unwrap_or_default();
+            assert_eq!(
+                session.keep().expect(yaml).map(|d| d.as_secs()),
+                *keep,
+                "{yaml:?}"
+            );
+            assert_eq!(session.keep_bytes().expect(yaml), *bytes, "{yaml:?}");
+            let (k, b) = session.retention();
+            assert_eq!((k.map(|d| d.as_secs()), b), (*keep, *bytes), "{yaml:?}");
+        }
+
+        for (yaml, key) in [
+            ("session:\n  keep: soon\n", "session.keep"),
+            ("session:\n  keep: 1.5h\n", "session.keep"),
+            ("session:\n  keep: -1\n", "session.keep"),
+            ("session:\n  keep: 5x\n", "session.keep"),
+            ("session:\n  keep: ''\n", "session.keep"),
+            ("session:\n  keep: 99999999999999999999d\n", "session.keep"),
+            ("session:\n  keepBytes: lots\n", "session.keepBytes"),
+            ("session:\n  keepBytes: 2PB\n", "session.keepBytes"),
+            ("session:\n  keepBytes: -1\n", "session.keepBytes"),
+            ("session:\n  keepBytes: 5x\n", "session.keepBytes"),
+            (
+                "session:\n  keepBytes: 99999999999999999999\n",
+                "session.keepBytes",
+            ),
+            ("session:\n  keepBytes: 99999999999T\n", "session.keepBytes"),
+        ] {
+            let session: ConfigYaml = serde_yaml::from_str(yaml).expect(yaml);
+            let session = session.session.expect("session");
+            let err = session
+                .keep()
+                .and_then(|_| session.keep_bytes())
+                .expect_err(yaml);
+            assert!(format!("{err:#}").contains(key), "{yaml:?}: {err:#}");
+
+            // Lenient: one warning naming the key, and the default.
+            let log = Captured::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(log.clone())
+                .with_ansi(false)
+                .finish();
+            let resolved = tracing::subscriber::with_default(subscriber, || session.retention());
+            assert_eq!(resolved, (None, None), "{yaml:?}");
+            let log = log.text();
+            assert_eq!(log.matches("WARN").count(), 1, "{yaml:?}: {log}");
+            assert!(log.contains(key), "{yaml:?}: {log}");
+        }
+
+        // `keep` above 90 days: parsed as written, clamped to 90 days by
+        // `retention()` with one warning naming the key. 90 days itself is
+        // neither clamped nor warned about.
+        for (yaml, written, warnings) in [
+            ("session:\n  keep: 99999d\n", 99_999 * 86_400, 1),
+            ("session:\n  keep: 2161h\n", 2_161 * 3_600, 1),
+            ("session:\n  keep: 90d\n", 90 * 86_400, 0),
+        ] {
+            let session: ConfigYaml = serde_yaml::from_str(yaml).expect(yaml);
+            let session = session.session.expect("session");
+            assert_eq!(
+                session.keep().expect(yaml).map(|d| d.as_secs()),
+                Some(written),
+                "{yaml:?}"
+            );
+            let log = Captured::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(log.clone())
+                .with_ansi(false)
+                .finish();
+            let resolved = tracing::subscriber::with_default(subscriber, || session.retention());
+            assert_eq!(
+                resolved,
+                (
+                    Some(std::time::Duration::from_secs(written.min(90 * 86_400))),
+                    None
+                ),
+                "{yaml:?}"
+            );
+            let log = log.text();
+            assert_eq!(log.matches("WARN").count(), warnings, "{yaml:?}: {log}");
+            if warnings > 0 {
+                assert!(log.contains("session.keep"), "{yaml:?}: {log}");
+            }
+        }
+
+        // A bad field keeps only its own default: the other one still applies.
+        let session: ConfigYaml =
+            serde_yaml::from_str("session: {keep: 5x, keepBytes: 1G}\n").expect("parse");
+        assert_eq!(
+            session.session.expect("session").retention(),
+            (None, Some(1 << 30))
+        );
+
+        let err = serde_yaml::from_str::<ConfigYaml>("session:\n  keep_bytes: 1G\n")
+            .expect_err("snake case is not a key");
+        assert!(err.to_string().contains("keep_bytes"), "{err}");
+    }
+
+    /// A profile sets one retention field and keeps the base's other.
+    #[test]
+    fn merge_session_per_field() {
+        let mut base: ConfigYaml =
+            serde_yaml::from_str("session: {keep: 3d, keepBytes: 1G}\n").expect("base");
+        base.merge(serde_yaml::from_str("session: {keepBytes: 5G}\n").expect("overlay"));
+        base.merge(serde_yaml::from_str("telemetry: {enabled: false}\n").expect("overlay"));
+        assert_eq!(
+            base.session,
+            Some(SessionConfig {
+                keep: Some("3d".into()),
+                keep_bytes: Some("5G".into()),
+            })
+        );
     }
 
     #[test]

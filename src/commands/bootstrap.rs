@@ -496,6 +496,13 @@ fn new_engine_at(
     let cwd = engine::get_cwd().context("resolving the working directory")?;
     if let Some(session) = session {
         session.set_workspace(&cwd, root, &config.home_dir);
+        if let Some(retention) = &file.session {
+            // An invalid value is warned about and the default kept.
+            let (keep, keep_bytes) = retention.retention();
+            session.set_retention(crate::tui::session::cleanup::Retention::from_config(
+                keep, keep_bytes,
+            ));
+        }
     }
 
     // Captured before `config` is moved into the engine: the nix driver's state

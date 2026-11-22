@@ -370,6 +370,7 @@ mod tests {
             "caches:\n  m:\n    bogus: 1\n",
         ),
         ("/$defs/ScratchConfig", "scratch:\n  bogus: 1\n"),
+        ("/$defs/SessionConfig", "session:\n  bogus: 1\n"),
         (
             "/$defs/ResourcesConfig/properties/cpu/anyOf/1",
             "resources:\n  cpu:\n    bogus: 1\n",
@@ -675,6 +676,10 @@ mod tests {
         "lock:\n  backend: fs\n",
         "telemetry:\n  enabled: false\n",
         "telemetry: {}\n",
+        "session:\n  keep: 7d\n  keepBytes: 2G\n",
+        "session: {}\n",
+        "session: ~\n",
+        "session: {keep: ~, keepBytes: ~}\n",
         "scratch:\n  scope: ${git:branch}\n  restoreScopes: [master]\n  seedOnFork: false\n",
         "plugins: []\n",
         "plugins:\n  - builtin: buildfile\n    options:\n      patterns: [BUILD]\n  - builtin: go\n",
@@ -759,6 +764,7 @@ mod tests {
         ),
         ("scratch:\n  bogus: 1\n", "unknown key in scratch"),
         ("telemetry:\n  bogus: 1\n", "unknown key in telemetry"),
+        ("session:\n  bogus: 1\n", "unknown key in session"),
         (
             "plugins:\n- builtin: exec\n  bogus: 1\n",
             "unknown key in a plugin",
@@ -937,6 +943,9 @@ mod tests {
         "scratch:\n  scope: true\n",
         "caches:\n  c:\n    region: 1\n",
         "scratch:\n  restoreScopes: [~]\n",
+        // Loads (a bare number is seconds, or bytes); an editor asks for `1h`
+        // or `1G`, the form the docs show.
+        "session:\n  keep: 3600\n  keepBytes: 1073741824\n",
     ];
 
     #[test]

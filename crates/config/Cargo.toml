@@ -26,3 +26,4 @@ tracing = "0.1"
 [dev-dependencies]
 jsonschema = { version = "0.61.2", default-features = false }
 tempfile = "3.27"
+tracing-subscriber = "0.3"
