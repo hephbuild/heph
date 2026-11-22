@@ -156,9 +156,13 @@ const SIDECAR_IPC_FD: RawFd = 3;
 /// spawns heph's first child, with the runtime's other threads live, and
 /// `posix_spawn` neither duplicates the parent's address space nor runs any of
 /// its code in the child. The `dup2` file action is what carries the socket
-/// end across — the `dup2`'d copy has `CLOEXEC` clear in the child only — and
-/// the signal mask is reset, since the calling worker's mask is not the main
-/// thread's. The child is never waited on: it outlives this process by design,
+/// end across — the `dup2`'d copy has `CLOEXEC` clear in the child only.
+///
+/// The signal mask is set rather than inherited, because the calling worker's
+/// mask is not the main thread's. It holds exactly the signals the sidecar
+/// ignores: until `run_supervisor_main` has ignored them, a terminal's Ctrl-C
+/// sent during the exec stays pending instead of killing the sidecar. The child
+/// is never waited on: it outlives this process by design,
 /// and is reparented and reaped once heph is gone.
 fn spawn_sidecar(exe: &std::path::Path, child_end: &std::os::fd::OwnedFd) -> anyhow::Result<i32> {
     use std::ffi::CString;
@@ -242,10 +246,13 @@ fn spawn_sidecar(exe: &std::path::Path, child_end: &std::os::fd::OwnedFd) -> any
                 "posix_spawn: stdio to /dev/null",
             )?;
         }
-        let mut empty: libc::sigset_t = std::mem::zeroed();
-        libc::sigemptyset(&mut empty);
+        let mut mask: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut mask);
+        for sig in server::IGNORED_SIGNALS {
+            libc::sigaddset(&mut mask, sig);
+        }
         check(
-            libc::posix_spawnattr_setsigmask(&mut attr.0, &empty),
+            libc::posix_spawnattr_setsigmask(&mut attr.0, &mask),
             "posix_spawn: signal mask",
         )?;
         check(
@@ -666,6 +673,52 @@ mod tests {
         drop(on_3);
         assert_sidecar_echoes(&parent, SIDECAR_IPC_FD + 1);
         println!("FD3_CASE_DONE");
+    }
+
+    /// A signal from the terminal or a group `kill` that reaches the sidecar
+    /// before `run_supervisor_main` has ignored it must not end it. The fake
+    /// sidecar's one-second sleep stands in for a slow exec and load. The
+    /// signals are sent as soon as `posix_spawn` returns, each of which ends a
+    /// process by default. The sidecar must still exit by itself, with 0.
+    ///
+    /// The fake is perl, not `/bin/sh`: dash, Ubuntu's `/bin/sh`, clears the
+    /// signal mask when it starts, which heph's own startup never does, so a
+    /// shell fake dies of the pending SIGHUP with or without the fix.
+    /// `/usr/bin/perl` keeps the mask it inherited, on Linux and macOS alike.
+    #[test]
+    fn a_signal_during_the_sidecars_startup_does_not_kill_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let exe = dir.path().join("slow-sidecar");
+        std::fs::write(
+            &exe,
+            "#!/usr/bin/perl\nselect(undef, undef, undef, 1);\nexit 0;\n",
+        )
+        .expect("write slow sidecar");
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod slow sidecar");
+        let (_parent, child_end) = socketpair();
+
+        let pid = spawn_sidecar(&exe, &child_end).expect("spawn the slow sidecar");
+        for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGUSR1] {
+            // SAFETY: kill(2) on the pid of the child we just spawned and have
+            // not reaped, so the pid cannot have been reused.
+            let rc = unsafe { libc::kill(pid, sig) };
+            assert_eq!(rc, 0, "signal {sig}: {}", std::io::Error::last_os_error());
+        }
+
+        let mut status: libc::c_int = 0;
+        // SAFETY: waitpid on our own unreaped child, with a live out pointer.
+        let rc = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(rc, pid, "waitpid: {}", std::io::Error::last_os_error());
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "the sidecar died during startup: {}",
+            if libc::WIFSIGNALED(status) {
+                format!("killed by signal {}", libc::WTERMSIG(status))
+            } else {
+                format!("raw wait status {status}")
+            }
+        );
     }
 
     #[test]
