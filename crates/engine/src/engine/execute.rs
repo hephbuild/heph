@@ -3,6 +3,7 @@ use crate::engine::driver::outputartifact::OutputArtifact;
 use crate::engine::driver::{RunInput, RunRequest, RunResponse};
 use crate::engine::error::SandboxFate;
 use crate::engine::link::{LinkedTargetDef, LinkedTargetDefInput};
+use crate::engine::phase_spans::{self, PhaseRecorder};
 use crate::engine::provider::TargetSpec;
 use crate::engine::request_state::RequestState;
 use crate::engine::result::{OutputMatcher, ResultOptions};
@@ -10,6 +11,7 @@ use crate::engine::{Engine, InteractiveInner, InteractiveWrapper};
 use anyhow::Context;
 use async_recursion::async_recursion;
 use enclose::enclose;
+use hcore::events::Phase;
 use hmodel::htaddr::Addr;
 use std::sync::Arc;
 
@@ -56,6 +58,8 @@ impl Engine {
         hashin: &str,
         exec_wrapper: Option<InteractiveWrapper>,
         flags: ExecuteFlags,
+        // The result scope's phase recorder; `None` when nothing listens.
+        phases: Option<Arc<PhaseRecorder>>,
     ) -> anyhow::Result<Executed> {
         let ExecuteFlags {
             shell,
@@ -80,10 +84,12 @@ impl Engine {
         }
 
         hcore::hmemoizer::set_phase("execute:inputs_result_exec");
-        let deps_result = self
-            .clone()
-            .inputs_result_exec(rs.clone(), &def.inputs)
-            .await?;
+        let deps_result = phase_spans::timed(
+            phases.as_deref(),
+            Phase::Deps,
+            self.clone().inputs_result_exec(rs.clone(), &def.inputs),
+        )
+        .await?;
 
         // Scratch slots, between dep resolution and the worker permit — see
         // `acquire_scratch` for why both sides of that sandwich are load-bearing.
@@ -93,6 +99,7 @@ impl Engine {
         //
         // The guards ride to the end of the run and drop with `_scratch_guards`.
         hcore::hmemoizer::set_phase("execute:scratch_acquire");
+        let scratching = phase_spans::open(phases.as_deref(), Phase::Scratch);
         let resolved_scratch = self
             .resolve_scratch(&rs, addr, &def.target.inputs)
             .await
@@ -101,6 +108,7 @@ impl Engine {
             .acquire_scratch(&rs, addr, &resolved_scratch, no_scratch)
             .await
             .with_context(|| format!("acquire scratch for {addr}"))?;
+        drop(scratching);
 
         // Deferred option values. The producers are already built — they are
         // `hashed` inputs, so `hashin` waited on them — and what is left here is
@@ -129,7 +137,14 @@ impl Engine {
             sandbox_slot,
             queued_ms,
         } = self
-            .admit_with_credentials(&rs, addr, &driver, def, resolved_credentials)
+            .admit_with_credentials(
+                &rs,
+                addr,
+                &driver,
+                def,
+                resolved_credentials,
+                phases.as_deref(),
+            )
             .await?;
 
         // This target resolves again: its last failure no longer describes it.
@@ -281,6 +296,7 @@ impl Engine {
                             options: crate::engine::driver::RunOptions::default(),
                             allotment: Some(allotment),
                             log: live.as_ref().map(|(log, _)| Arc::clone(log)),
+                            phases,
                         },
                     )
                     .await;
@@ -709,7 +725,13 @@ impl Engine {
             options,
             allotment,
             log,
+            phases,
         } = run;
+        // `heph.stage` runs from here to the process's spawn (or to the
+        // driver's `run`, for a driver that does not arm the clock). Recorded
+        // when the guard drops, so a run that fails or is cancelled anywhere
+        // below still gets its spans.
+        let mut run_phases = phases.map(RunPhases::new);
         // N6/N9: only an entrypoint's run is ever sent anything but the
         // default options, whichever path assembled them.
         if !options.is_default() && target.entrypoint.is_none() {
@@ -812,8 +834,23 @@ impl Engine {
                     if !driver.managed {
                         req.options.fire_handover().context("handing over the terminal")?;
                     }
+                    // The run clock, for a driver that arms it, whenever
+                    // something reads it: a timeout's deadline, or the
+                    // phase spans (spawn and exit). Never for a `--shell`.
+                    let clock = (!shell
+                        && driver.driver.arms_run_clock()
+                        && (target.timeout.is_some() || run_phases.is_some()))
+                    .then(|| {
+                        let (clock, reader) = hplugin::driver::RunClock::new();
+                        req.clock = clock.clone();
+                        (clock, reader)
+                    });
+                    if let Some(p) = run_phases.as_mut() {
+                        p.running(clock.as_ref().map(|(clock, _)| clock.clone()));
+                    }
                     // A `--shell` is a person at a prompt: never timed. A
-                    // run without a timeout gets its stop as is.
+                    // run without a timeout gets its stop as is, whether or
+                    // not its clock is armed for the spans.
                     let res = match target.timeout {
                         _ if shell => driver.driver.run_shell(req, &stop).await,
                         None => driver.driver.run(req, &stop).await,
@@ -822,11 +859,7 @@ impl Engine {
                             // A driver that arms the clock is timed from its
                             // process's spawn to its exit; any other, over
                             // its whole `run`.
-                            let clock = driver.driver.arms_run_clock().then(|| {
-                                let (clock, reader) = hplugin::driver::RunClock::new();
-                                req.clock = clock;
-                                reader
-                            });
+                            let clock = clock.as_ref().map(|(_, reader)| reader.clone());
                             let run = driver.driver.run(req, &run_token);
                             crate::engine::run_timeout::enforce(
                                 run,
@@ -840,6 +873,7 @@ impl Engine {
                             .await
                         }
                     };
+                    drop(run_phases);
                     // The run returned: each stream's held-back tail goes to
                     // the sinks as well as the file. Not after an abandoned
                     // run, whose process may still be writing.
@@ -947,6 +981,7 @@ impl Engine {
         driver: &crate::engine::engine::Driver,
         def: &LinkedTargetDef,
         resolved: Vec<crate::engine::ResolvedCredential>,
+        phases: Option<&PhaseRecorder>,
     ) -> anyhow::Result<Admitted> {
         /// Acquisitions before a run whose material keeps lapsing fails.
         const MAX_CREDENTIAL_ROUNDS: usize = 3;
@@ -969,14 +1004,17 @@ impl Engine {
             // Returned to the caller, which holds it until the outputs are
             // cached. See `ResultLock::lock_execute`.
             hcore::hmemoizer::set_phase("execute:execute_lock");
-            let execute_guard = self
-                .acquire_with_notice(
+            let execute_guard = phase_spans::timed(
+                phases,
+                Phase::LockWait,
+                self.acquire_with_notice(
                     rs,
                     addr,
                     None,
                     self.result_lock().lock_execute(addr, rs.ctoken()),
-                )
-                .await?;
+                ),
+            )
+            .await?;
 
             // Admission AFTER dep resolution so nothing is reserved while
             // waiting for deps — prevents the classic diamond deadlock where
@@ -984,9 +1022,12 @@ impl Engine {
             // some.
             hcore::hmemoizer::set_phase("execute:semaphore_acquire");
             let admit_started = std::time::Instant::now();
-            let mut reservation = self
-                .admit(rs, addr, &def.target.demand, driver.managed)
-                .await?;
+            let mut reservation = phase_spans::timed(
+                phases,
+                Phase::Admission,
+                self.admit(rs, addr, &def.target.demand, driver.managed),
+            )
+            .await?;
             // On `ExecuteStart`, so a wait under the notice threshold (which
             // announces nothing) is still answerable from the stream.
             let queued_ms = elapsed_ms(admit_started);
@@ -1253,6 +1294,69 @@ pub(crate) struct SandboxRun {
     /// driver is told `log_capture`. `None` for an invocation, a `--shell`
     /// and a credential source (see [`Engine::execute`]).
     pub log: Option<Arc<crate::engine::run_log::RunLog>>,
+    /// The result scope's phase recorder, which the run marks `heph.stage`,
+    /// `heph.process` / `heph.driver.run` and `heph.collect` on. `None` when
+    /// nothing listens, and for an invocation (no `ResultEnd`).
+    pub phases: Option<Arc<PhaseRecorder>>,
+}
+
+/// A run's phases, recorded when it drops: `heph.stage` from the start of
+/// [`Engine::run_in_sandbox`] to the process's spawn, `heph.process` from the
+/// spawn to the exit, `heph.collect` from the exit to the end; for a driver
+/// with no clock armed, `heph.stage` up to its `run` and `heph.driver.run`
+/// over the whole of it. A run cut short records what it reached, each phase
+/// closed at the drop.
+struct RunPhases {
+    rec: Arc<PhaseRecorder>,
+    staged_from: std::time::Instant,
+    /// Set once the driver is called, with its clock when one is armed.
+    running: Option<(std::time::Instant, Option<hplugin::driver::RunClock>)>,
+}
+
+impl RunPhases {
+    fn new(rec: Arc<PhaseRecorder>) -> Self {
+        Self {
+            rec,
+            staged_from: std::time::Instant::now(),
+            running: None,
+        }
+    }
+
+    /// The driver is being called, now.
+    fn running(&mut self, clock: Option<hplugin::driver::RunClock>) {
+        self.running = Some((std::time::Instant::now(), clock));
+    }
+}
+
+impl Drop for RunPhases {
+    fn drop(&mut self) {
+        let end = std::time::Instant::now();
+        let rec = &self.rec;
+        let Some((run_from, clock)) = self.running.take() else {
+            rec.record(Phase::Stage, self.staged_from, end);
+            return;
+        };
+        let Some(clock) = clock else {
+            rec.record(Phase::Stage, self.staged_from, run_from);
+            rec.record(Phase::DriverRun, run_from, end);
+            return;
+        };
+        // Armed: staging lasts until the spawn, whatever the driver did
+        // before it. A run that never spawned was all staging.
+        let Some(spawned) = clock.spawned_at() else {
+            rec.record(Phase::Stage, self.staged_from, end);
+            return;
+        };
+        rec.record(Phase::Stage, self.staged_from, spawned);
+        match clock.exited_at() {
+            Some(exited) => {
+                rec.record(Phase::Process, spawned, exited);
+                rec.record(Phase::Collect, exited, end);
+            }
+            // Cancelled, abandoned, or a driver that never stopped it.
+            None => rec.record(Phase::Process, spawned, end),
+        }
+    }
 }
 
 /// What a managed run is admitted with on top of what it declares: one

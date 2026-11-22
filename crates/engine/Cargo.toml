@@ -52,6 +52,7 @@ google-cloud-auth = { version = "1.19", default-features = false }
 indexmap = "2"
 object_store = { version = "0.14.2", features = ["aws", "gcp", "azure", "http", "tokio"] }
 parking_lot = "0.13"
+pin-project-lite = "0.2"
 quick_cache = "0.7"
 r2d2 = "0.8"
 r2d2_sqlite = "0.37"

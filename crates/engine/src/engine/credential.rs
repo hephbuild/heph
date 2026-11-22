@@ -1028,6 +1028,9 @@ impl Engine {
                     outputs_are_material: true,
                     ..Default::default()
                 },
+                // Acquired for a consumer's run, outside any result scope of
+                // its own: no `ResultEnd` would carry the phases.
+                None,
             )
             .await;
 
