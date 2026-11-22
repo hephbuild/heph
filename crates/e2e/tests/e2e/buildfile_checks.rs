@@ -806,7 +806,16 @@ def lib(name: str, **kwargs: heph.types.bash.Kwargs):
              lib(name = \"t\", run = \"true\")\n"
         ),
     );
-    let r = run(&ws, &everything()).await;
+    // Only the two targets under test: this BUILD is not formatted, so
+    // `everything()` would run `build-format`, whose write-back races the
+    // lint check's copy of the same file ("modified after it was hashed").
+    let m = Matcher::Or(
+        ["//pkg:build-lint-check", "//pkg:t"]
+            .into_iter()
+            .map(|a| Matcher::Addr(parse_addr(a).expect("addr")))
+            .collect(),
+    );
+    let r = run(&ws, &m).await;
     assert_passes(&r, "//pkg:build-lint-check");
     assert_passes(&r, "//pkg:t");
 
