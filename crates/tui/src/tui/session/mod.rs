@@ -482,6 +482,12 @@ impl SessionSlot {
         self.with(|s| s.retention = retention);
     }
 
+    /// What [`Self::set_retention`] set, else [`Retention::default`]: what a
+    /// viewer names when a session it is asked for is gone.
+    pub fn retention(&self) -> Retention {
+        self.with(|s| s.retention)
+    }
+
     /// The faults the session opened after this injects.
     #[cfg(test)]
     pub(crate) fn set_faults(&self, faults: Faults) {

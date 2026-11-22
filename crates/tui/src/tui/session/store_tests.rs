@@ -1477,7 +1477,7 @@ fn explorer_golden_rows() {
     let events = [
         "3|heph.cache.local_hit|4000|NULL",
         "2|heph.cache.local_miss|5000|NULL",
-        r#"1|heph.lock_holder|8000|{"heph.lock.holder_pid":99}"#,
+        r#"1|heph.lock.holder_seen|8000|{"heph.lock.holder_pid":99}"#,
     ];
     let cpu = r#"{"heph.pool":"cpu"}"#;
     let docker = r#"{"heph.pool":"docker"}"#;
@@ -1596,9 +1596,9 @@ fn explorer_golden_rows() {
             r#"2|heph.cache.hit_rebuilt|4000|{"heph.cache.was":"remote"}"#,
             r#"2|heph.codegen.excluded|5000|{"heph.codegen.path":"gen.rs","heph.codegen.reason":"released","heph.codegen.status":"stale"}"#,
             r#"1|heph.codegen.excluded|6000|{"heph.codegen.path":"old.rs","heph.codegen.status":"unknown"}"#,
-            "1|heph.approval.asked|7000|NULL",
-            "1|heph.approval.answered|8000|NULL",
-            r#"1|heph.lock_holder|9000|{"heph.lock.holder_pid":7,"heph.lock.holder_session":"cbszjpg002"}"#,
+            "1|heph.approval.prompt|7000|NULL",
+            "1|heph.approval.cleared|8000|NULL",
+            r#"1|heph.lock.holder_seen|9000|{"heph.lock.holder_pid":7,"heph.lock.holder_session":"cbszjpg002"}"#,
             "1|heph.truncated|11000|NULL",
         ]
     );

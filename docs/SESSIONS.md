@@ -165,7 +165,7 @@ still in WAL mode (live, or a seal cut short) or sealed (rollback mode).
 
 | Table | Holds |
 | --- | --- |
-| `session` | exactly one row: id, `format`, heph version, owner pid, `host`, `user`, `actor_kind` (`human`, `agent`, `ci`), `actor_name` (`claude-code`, `github-actions`, `unknown`), `ci_run_url`, `command`, `argv` (a JSON array), `cwd` (`HEPH_CWD` when set), workspace root and home, `git_head` (always NULL for now), label, interactive, `capabilities`, `lossy` (argv or cwd lost bytes: a NUL or invalid UTF-8 stored as U+FFFD), `started_ms`, `ended_ms`, `exit_code`, `panicked`, `truncated` and `truncated_seq`, `derivation`, `sealed` |
+| `session` | exactly one row: id, `format`, heph version, owner pid, `host`, `user`, `actor_kind` (`human`, `agent`, `ci`), `actor_name` (`claude-code`, `github-actions`, `unknown`), `ci_run_url`, `command`, `argv` (a JSON array), `cwd` (`HEPH_CWD` when set), workspace root and home, `git_head` (always NULL for now), label, interactive, `capabilities`, `lossy` (argv or cwd lost bytes: a NUL or invalid UTF-8 stored as U+FFFD), `started_ms`, `ended_ms`, `exit_code`, `panicked`, `truncated` and `truncated_seq`, `derivation`, `sealed`, `snapshot` (0 in a local recording; 1 in an export taken of a session still running, a later PR) |
 | `records` | the source of truth, in stream order: `seq`, `at_ms`, `kind` (the record's variant name), `addr`, and `body`, the record as JSON (see [Records](#records)) |
 | `status` | one row: the latest `SessionSnapshot`, upserted at most once a second and only when changed, and the final one at exit |
 | `notices`, `failure_logs` | empty in a local recording; filled only by an export (a later PR) |
@@ -204,11 +204,7 @@ heph.session                     root, span_id 1; trace id derived from the sess
   never by a dependent, so a memoized result reached from several dependents
   is drawn once. `outcome` is `ran`, `hit`, `failed` or `cancelled` (a result
   still open at the end has none); `status` is `ok`, `error` or `unset`.
-  Attributes: `heph.cache` (the cache outcome), `heph.upstream_of`,
-  `heph.timed_out`, `heph.resources.declared.<pool>` and
-  `heph.resources.reserved.<pool>` (from `ExecuteStart`, in the pool's unit;
-  only for a target that ran, and only from a host that reports them), and
-  `heph.admission.queued_ms`.
+  Its attributes are listed under [Attribute keys](#attribute-keys).
 - **Several results of one addr.** Two scopes in one process (two requests,
   or a request and the TUI's own) can resolve the same addr at once and
   share one run. Each `ResultStart` opens a `heph.result` span, and each
@@ -228,20 +224,36 @@ heph.session                     root, span_id 1; trace id derived from the sess
   `heph.cache.write` are `heph`; `heph.deps`, `heph.lock_wait`,
   `heph.admission` and `heph.scratch` are `waiting`. A name this heph does
   not know is recorded with no class.
-- **Span events**: `heph.cache.local_hit`, `heph.cache.local_miss`,
-  `heph.cache.remote_hit`, `heph.cache.remote_miss` and
-  `heph.cache.hit_rebuilt` (attribute `heph.cache.was`) on the result's span;
-  `heph.codegen.excluded` (`heph.codegen.path`, `.status`, `.reason`);
-  `heph.lock_holder` (`heph.lock.holder_pid`, `heph.lock.holder_session`),
-  `heph.approval.asked`, `heph.approval.answered` and `heph.truncated` on the
-  session span.
+- **Span events**, each with the record's time:
+  - On the result's span: `heph.cache.local_hit`, `heph.cache.local_miss`,
+    `heph.cache.remote_hit` and `heph.cache.remote_miss`, one per cache tier
+    probed (a probe, not the outcome: the span's `heph.cache` attribute is
+    the canonical outcome, and a consumer reads that); `heph.cache.hit_rebuilt`
+    (attribute `heph.cache.was`, the hit's tier) when a target whose outcome
+    was a hit is rebuilt after all because the manifest outlived its blobs.
+    `heph.cache` keeps the hit; this event on the span means it became a
+    miss.
+  - `heph.codegen.excluded` on the result's span, or the session span when
+    no result is open: a generated file kept out of a glob.
+  - On the session span: `heph.lock.holder_seen`, once per pid the first
+    time this run sees it holding a lock it waits on; `heph.truncated` at
+    each cap the recording passed (full cap, then ceiling).
+  - `heph.approval.prompt` and `heph.approval.cleared`, on the session span.
+    An `Approval` record is written each time the approval banner's state
+    changes: the pending prompt (its queue of targets) or the standing Y/N
+    decision. `heph.approval.prompt` is a record with a prompt on screen (a
+    new prompt, or one whose queue changed); `heph.approval.cleared` is a
+    record with none (the prompt was answered, or only the standing decision
+    changed with no prompt up).
 - **Metrics** (see [Pools](#pools)): `heph.pool.capacity`, `heph.pool.held`,
   `heph.pool.waiting` and, for the `sandbox` pool, `heph.pool.removals_pending`,
   gauges from each `PoolUsage` event, attribute `heph.pool`; at the end, per
-  pool, `heph.session.pool.held.mean` (time-weighted),
-  `heph.session.pool.held.peak` and `heph.session.pool.waiting_us` (time with
-  at least one waiter), and `heph.session.results` per outcome (attribute
-  `heph.outcome`). `heph.session.results` counts a target once per
+  pool, `heph.session.pool.held.mean` (time-weighted over the pool's in-use
+  window: from its first `PoolUsage` row to the session's end, not from the
+  session's start), `heph.session.pool.held.peak` and
+  `heph.session.pool.waiting_us` (the time with at least one request
+  waiting, not the sum of every request's wait), and `heph.session.results`
+  per outcome (attribute `heph.outcome`). `heph.session.results` counts a target once per
   resolution, not once per `ResultEnd`: overlapping results of one addr count
   once, when the last of them closes, with the worst outcome among them
   (`failed`, then `ran`, `cancelled`, `hit`); the same addr resolved again
@@ -257,6 +269,22 @@ heph.session                     root, span_id 1; trace id derived from the sess
   the one with the worst outcome (`failed`, then `ran`, `cancelled`, `hit`,
   then none), the oldest among equals (the run's carrier); `spans` keeps
   them all.
+
+#### Attribute keys
+
+| Key | On | Value |
+| --- | --- | --- |
+| `heph.cache` | `heph.result` span | the cache outcome: `local_hit`, `remote_hit`, `miss` (open) |
+| `heph.upstream_of` | `heph.result` span | the addr whose failure stopped this one |
+| `heph.timed_out` | `heph.result` span | `true` when its run timed out |
+| `heph.resources.declared.<pool>` | `heph.result` span | what the target declared of `<pool>`, in the pool's unit |
+| `heph.resources.reserved.<pool>` | `heph.result` span | what admission reserved of `<pool>`, in the pool's unit |
+| `heph.admission.queued_ms` | `heph.result` span | how long it waited for admission |
+| `heph.cache.was` | `heph.cache.hit_rebuilt` event | the hit's tier |
+| `heph.codegen.path`, `heph.codegen.status`, `heph.codegen.reason` | `heph.codegen.excluded` event | the file, why it was excluded (`reason` optional) |
+| `heph.lock.holder_pid`, `heph.lock.holder_session` | `heph.lock.holder_seen` event | the holder's pid, and its session id when known |
+| `heph.pool` | `heph.pool.*`, `heph.session.pool.*` metrics | the pool's name |
+| `heph.outcome` | `heph.session.results` metric | `ran`, `hit`, `failed`, `cancelled` |
 
 The trace id is the first 16 bytes of SHA-256 over `heph.trace.v1:`
 followed by the session id; a span id is written as its 8-byte big-endian
@@ -287,9 +315,13 @@ a live one) answers them.
 from the `heph.session.pool.*` metrics and the last `heph.pool.capacity`:
 
 ```
-docker pool 4: held 3 mean (75%), 4 peak; requests waited 1s
-cpu pool 8: held 7.6 mean (95%), 8 peak; nothing waited for it
+docker pool (capacity 4): held 3 mean while in use (75%), 4 peak; something was waiting for 1s
+cpu pool (capacity 8): held 7.6 mean while in use (95%), 8 peak; nothing waited for it
 ```
+
+"While in use": the mean is over the pool's in-use window, from its first
+row to the session's end. "Something was waiting" is `waiting_us`, the time
+with at least one request queued, not the sum of every request's wait.
 
 A live session has none yet (the rows come at its end), and neither does a
 build that admitted nothing (an all-hit build). These rows are read from
@@ -463,8 +495,8 @@ lists each command's fields.
 
 `list --json` is an array, one element per session, `[{id, owner_pid, argv,
 workspace_root, cwd, state, started_unix_ms, last_event_unix_ms, exit_code,
-panicked, progress, now, blocked_on, format}]`, sorted by id, times in
-absolute unix ms; `[]` when there is no session:
+panicked, progress, now, blocked_on, incomplete, format}]`, sorted by id,
+times in absolute unix ms; `[]` when there is no session:
 
 - `progress` is PROGRESS as numbers, `{done, total, total_complete,
   running_ops, failed}`, `null` before the session wrote its first
@@ -486,6 +518,9 @@ absolute unix ms; `[]` when there is no session:
 - `blocked_on` entries are `{kind: "lock", addr, holder_pid, holder_session}`
   or `{kind: "admission", addr, pool}`. From the `status` row, so at most the
   first 100 of each kind.
+- `incomplete` is true when the recording passed its size cap and so is
+  short of the run (the table adds `incomplete` to PROGRESS); `null` on a
+  newer-format row. `show --json`'s `incomplete_reason` says why.
 - `format` appears only on the row of a session in a newer recording format,
   which this heph reads no further: that row has `owner_pid: null`, empty
   `argv`, `null` progress and `state: "unknown"`. `owner_pid` is never `null`
@@ -496,15 +531,24 @@ absolute unix ms; `[]` when there is no session:
 (`approval_standing`, present only while a standing approval decision acts on
 the build, `first_event_unix_ms`, `last_event_unix_ms`, `counts`, `running`,
 `waiting`, `failed`, `lock_waits`, `admission_waits`, `totals`, `truncated`,
-`end`), then `skipped` and `pools`. The snapshot's own `version` is not
-printed: it versions the `status` row on disk, not this output. The snapshot
-is folded from `records`, every list in full, unless the recording reached
-its 256 MiB full cap: then it is the `status` row, each list capped at 100
-entries, and `totals` says which were cut. `blocked_on` has `list --json`'s
-shape, but from that same snapshot, so it is in full where `list`'s, which
-comes from the `status` row, has at most 100 entries of each kind. `skipped`
-is the number of records that did not decode and were skipped (0 normally).
-`pools` is `[{pool, unit, capacity, held_mean, held_peak, waiting_us}]`, one
+`end`), then `skipped`, `incomplete`, `incomplete_reason` and `pools`. The
+snapshot's own `version` is not printed: it versions the `status` row on
+disk, not this output. The snapshot is folded from `records`, every list in
+full, unless the recording reached its 256 MiB full cap: then it is the
+`status` row, each list capped at 100 entries, and `totals` says which were
+cut. `blocked_on` has `list --json`'s shape, but from that same snapshot, so
+it is in full where `list`'s, which comes from the `status` row, has at most
+100 entries of each kind. `skipped` is the number of records that did not
+decode and were skipped (0 normally). `incomplete` is true when the
+recording is short of the run, and `incomplete_reason` says why, `null` when
+it is not. It is an open enum: a consumer reads a value it does not know as
+"incomplete" and the text as the reason. Today the only value is `size_cap`:
+the recording passed its 256 MiB full cap, so output and log lines (and
+progress-only events) were dropped from there, and if it then reached its
+1 GiB ceiling, nothing but its `End` was recorded after that (see
+[Recording](#recording)). The text says which cap, how far into the run, and
+what was dropped. `pools` is `[{pool, unit, capacity, held_mean, held_peak,
+waiting_us}]`, one
 per bounded pool with rows (see [Pools](#pools)): empty while the session is
 live, and for a build that admitted nothing. `capacity` is `null` when no
 row gave one. The comparison with machine samples (`declared_above_use_us`

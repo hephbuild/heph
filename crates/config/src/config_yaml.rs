@@ -716,27 +716,43 @@ impl SessionConfig {
     /// longer would outlive the rows that list it.
     pub const KEEP_MAX: std::time::Duration = std::time::Duration::from_secs(90 * 86_400);
 
+    /// What an unset or invalid `keep` means: 7 days. The session cleanup's
+    /// `Retention::default` is the same value (a root-crate test holds them
+    /// together).
+    pub const KEEP_DEFAULT: std::time::Duration = std::time::Duration::from_secs(7 * 86_400);
+
+    /// What an unset or invalid `keepBytes` means: 2 GiB.
+    pub const KEEP_BYTES_DEFAULT: u64 = 2 * 1024 * 1024 * 1024;
+
     /// `keep` and `keepBytes`, each `None` when unset or invalid. An invalid
-    /// one is a `warn!` naming its key, and the caller keeps the default. A
-    /// `keep` above [`Self::KEEP_MAX`] is a `warn!` naming its key, and
-    /// [`Self::KEEP_MAX`].
+    /// one is a `warn!` naming its key, its value and the default the caller
+    /// keeps. A `keep` above [`Self::KEEP_MAX`] is a `warn!` naming its key,
+    /// and [`Self::KEEP_MAX`].
     pub fn retention(&self) -> (Option<std::time::Duration>, Option<u64>) {
         fn or_warn<T>(
             key: &str,
             value: Option<&str>,
+            default: &str,
             parsed: anyhow::Result<Option<T>>,
         ) -> Option<T> {
             parsed.unwrap_or_else(|e| {
                 tracing::warn!(
                     key,
                     value = value.unwrap_or_default(),
+                    default,
                     error = %format!("{e:#}"),
                     "ignoring an invalid .hephconfig value; keeping the default"
                 );
                 None
             })
         }
-        let keep = or_warn("session.keep", self.keep.as_deref(), self.keep()).map(|keep| {
+        let keep = or_warn(
+            "session.keep",
+            self.keep.as_deref(),
+            &hcore::units::human_duration(Self::KEEP_DEFAULT),
+            self.keep(),
+        )
+        .map(|keep| {
             if keep > Self::KEEP_MAX {
                 tracing::warn!(
                     key = "session.keep",
@@ -753,6 +769,7 @@ impl SessionConfig {
             or_warn(
                 "session.keepBytes",
                 self.keep_bytes.as_deref(),
+                &hcore::units::human_bytes(Self::KEEP_BYTES_DEFAULT),
                 self.keep_bytes(),
             ),
         )
@@ -1724,6 +1741,22 @@ caches:
             let log = log.text();
             assert_eq!(log.matches("WARN").count(), 1, "{yaml:?}: {log}");
             assert!(log.contains(key), "{yaml:?}: {log}");
+            // ...its value as written, and the default applied instead.
+            let written = yaml.rsplit(": ").next().unwrap_or_default().trim();
+            let written = written.trim_matches('\'');
+            assert!(
+                log.contains(&format!("value=\"{written}\"")),
+                "{yaml:?}: {log}"
+            );
+            let default = if key == "session.keep" {
+                hcore::units::human_duration(SessionConfig::KEEP_DEFAULT)
+            } else {
+                hcore::units::human_bytes(SessionConfig::KEEP_BYTES_DEFAULT)
+            };
+            assert!(
+                log.contains(&format!("default=\"{default}\"")),
+                "{yaml:?}: {log}"
+            );
         }
 
         // `keep` above 90 days: parsed as written, clamped to 90 days by
@@ -1772,7 +1805,9 @@ caches:
 
         let err = serde_yaml::from_str::<ConfigYaml>("session:\n  keep_bytes: 1G\n")
             .expect_err("snake case is not a key");
+        // Refused by name, and the message offers the right spelling.
         assert!(err.to_string().contains("keep_bytes"), "{err}");
+        assert!(err.to_string().contains("`keepBytes`"), "{err}");
     }
 
     /// A profile sets one retention field and keeps the base's other.

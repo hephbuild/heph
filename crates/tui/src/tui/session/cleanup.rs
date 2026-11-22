@@ -184,7 +184,8 @@ pub fn cleanup(
         if starting {
             continue;
         }
-        let keep = age(now, last_write) < retention.max_age;
+        let since = age(now, last_write);
+        let keep = since < retention.max_age;
         // Sealing one that age removes anyway would be wasted work.
         let budgeted = if keep && lock_written.is_some() {
             seal_if_lost(&dir, id, &mut report)
@@ -201,7 +202,9 @@ pub fn cleanup(
             id,
             dir,
             bytes,
+            age: since,
             keep,
+            over_budget: false,
             budgeted,
         });
     }
@@ -218,13 +221,30 @@ pub fn cleanup(
         }
         if e.keep && e.budgeted {
             e.keep = false;
+            e.over_budget = true;
             total = total.saturating_sub(e.bytes);
         }
     }
 
+    let private = retention == Retention::PRIVATE;
     for e in ended.iter().filter(|e| !e.keep) {
         if remove(root, e) {
             report.removed.push(e.id);
+            let reason = if private {
+                "private"
+            } else if e.over_budget {
+                "keep_bytes"
+            } else {
+                "keep"
+            };
+            let age = hcore::units::human_duration(e.age);
+            // A private session is gone by design; a listed one is a
+            // recording someone may come looking for (`no session <id>`).
+            if private {
+                tracing::debug!(id = %e.id, age, reason, "removed an ended session recording");
+            } else {
+                tracing::info!(id = %e.id, age, reason, "removed an ended session recording");
+            }
         }
     }
     Ok(report)
@@ -236,7 +256,11 @@ struct Ended {
     id: SessionId,
     dir: PathBuf,
     bytes: u64,
+    /// Since its last write.
+    age: Duration,
     keep: bool,
+    /// Removed by the byte budget, not by age.
+    over_budget: bool,
     /// A sealed recording in a format this heph knows: counted in the byte
     /// budget. Anything else is removed by age only.
     budgeted: bool,
@@ -538,6 +562,46 @@ mod tests {
             v
         });
         drop(lock);
+    }
+
+    /// "Where did my session go?": each removal is one `info` line naming
+    /// the id, its age and which setting removed it.
+    #[test]
+    fn removals_are_logged_with_their_reason() {
+        use super::super::tests::Captured;
+        let root = tempfile::tempdir().expect("tempdir");
+        let now = SystemTime::now();
+        let old = ended(root.path(), now, 2 * MIN, 1, 100);
+        let new = ended(root.path(), now, MIN, 2, 100);
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let retention = Retention {
+                max_bytes: 150,
+                ..Retention::default()
+            };
+            let report = cleanup(root.path(), now + 2 * MIN, retention).expect("cleanup");
+            assert_eq!(report.removed, vec![old]);
+            let report = cleanup(root.path(), now + 8 * DAY, retention).expect("cleanup");
+            assert_eq!(report.removed, vec![new]);
+        });
+        let log = captured.settled_log();
+        let lines: Vec<&str> = log.lines().filter(|l| l.contains(" INFO ")).collect();
+        assert_eq!(lines.len(), 2, "{log}");
+        assert!(
+            lines[0].contains(&format!("id={old}")) && lines[0].contains("reason=\"keep_bytes\""),
+            "{log}"
+        );
+        assert!(
+            lines[1].contains(&format!("id={new}"))
+                && lines[1].contains("reason=\"keep\"")
+                // Written just after `now`, so a hair under 8 days.
+                && lines[1].contains("age=\"7d23h\""),
+            "{log}"
+        );
     }
 
     /// Cleanup never writes or budgets what it cannot seal: garbage, a

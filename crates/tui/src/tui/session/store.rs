@@ -62,7 +62,8 @@ CREATE TABLE session (
   exit_code INTEGER, panicked INTEGER,
   truncated INTEGER NOT NULL DEFAULT 0, truncated_seq INTEGER,
   derivation INTEGER NOT NULL,
-  sealed INTEGER NOT NULL DEFAULT 0
+  sealed INTEGER NOT NULL DEFAULT 0,
+  snapshot INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE records (
   seq INTEGER PRIMARY KEY, at_ms INTEGER NOT NULL,
@@ -91,7 +92,7 @@ CREATE VIEW sessions AS
   SELECT id AS session_id, 1 AS schema_version, format, heph_version, owner_pid, host, user,
     actor_kind, actor_name, ci_run_url, command, argv, cwd, workspace_root, home, git_head,
     label, interactive, started_ms, ended_ms, exit_code, panicked, truncated, truncated_seq,
-    sealed, 1 AS recorded, 0 AS snapshot
+    sealed, 1 AS recorded, snapshot
   FROM session;
 CREATE VIEW targets AS
   SELECT session_id, addr, outcome, duration_us FROM (
@@ -781,10 +782,12 @@ pub struct PoolSummary {
     pub unit: String,
     /// The pool's capacity at its last row; `None` when no row gave one.
     pub capacity: Option<f64>,
-    /// Held, time-weighted over the session.
+    /// Held, time-weighted over the pool's in-use window: from its first
+    /// `PoolUsage` row to the session's end (not from the session's start).
     pub held_mean: f64,
     pub held_peak: f64,
-    /// Time with at least one request waiting for the pool.
+    /// Time with at least one request waiting for the pool (the queue was
+    /// not empty), not the sum of every request's wait.
     pub waiting_us: u64,
 }
 

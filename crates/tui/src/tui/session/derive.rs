@@ -166,6 +166,10 @@ fn outcome_rank(outcome: &str) -> u8 {
     }
 }
 
+/// One pool's running totals for the session-wide rows. The mean is
+/// time-weighted over the pool's in-use window, `first_us` (its first
+/// `PoolUsage`) to the session's end; `waiting_us` is the time with at least
+/// one waiter.
 #[derive(Debug)]
 struct PoolAcc {
     unit: &'static str,
@@ -370,16 +374,19 @@ impl Deriver {
                 }
                 rows.push(Self::event(
                     SESSION_SPAN,
-                    "heph.lock_holder",
+                    "heph.lock.holder_seen",
                     t,
                     attrs_json(&a),
                 ));
             }
             SessionRecordKind::Approval { prompt, .. } => {
+                // An `Approval` record is the banner's state each time it
+                // changes: a prompt on screen, or none (answered, or the run
+                // moved past it).
                 let name = if prompt.is_some() {
-                    "heph.approval.asked"
+                    "heph.approval.prompt"
                 } else {
-                    "heph.approval.answered"
+                    "heph.approval.cleared"
                 };
                 rows.push(Self::event(SESSION_SPAN, name, t, None));
             }

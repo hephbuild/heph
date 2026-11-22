@@ -27,6 +27,7 @@ fn opts() -> ViewOpts {
         now_ms: NOW,
         stall: Duration::from_secs(60),
         version: "v0.48.1",
+        retention: crate::tui::session::cleanup::Retention::default(),
     }
 }
 
@@ -1128,6 +1129,17 @@ async fn ids_resolve_prefix_suffix_pid() {
         .await
         .expect_err("an ended session's pid is not an id");
     assert!(format!("{err:#}").contains("no session 5151"), "{err:#}");
+    // A well-formed id that is gone: retention is the likely reason, named.
+    let gone = SessionId::new(T0 - 30 * 86_400_000, 9).encode();
+    let err = resolve_id(gone.clone()).await.expect_err("gone");
+    assert_eq!(
+        format!("{err:#}"),
+        format!(
+            "no session {gone} (`heph session list --all` lists them): an ended recording is \
+             removed once it is older than 7d00h (`session.keep`), or sooner when all of them \
+             together pass 2.0 GiB (`session.keepBytes`); see docs/SESSIONS.md#retention"
+        )
+    );
     let err = resolve_id("zz-not!".to_owned())
         .await
         .expect_err("not an id");
@@ -2050,6 +2062,7 @@ async fn list_shows_newer_format_placeholder() {
     // Nothing more is read of it: no pid, no progress.
     assert_eq!(s["owner_pid"], serde_json::Value::Null);
     assert_eq!(s["progress"], serde_json::Value::Null);
+    assert_eq!(s["incomplete"], serde_json::Value::Null);
     assert_eq!(s["panicked"], false);
 
     let err = run_show(&sources, &id.encode(), false)
@@ -2178,9 +2191,13 @@ async fn show_prints_pool_usage() {
     let out = run_show(&sources, &id.encode(), false).await.expect("show");
     let line = out
         .lines()
-        .find(|l| l.starts_with("docker pool 4: held "))
+        .find(|l| l.starts_with("docker pool (capacity 4): held "))
         .unwrap_or_else(|| panic!("no pool line: {out}"));
-    assert!(line.contains(", 4 peak; requests waited "), "{line}");
+    assert!(line.contains(" mean while in use ("), "{line}");
+    assert!(
+        line.ends_with(", 4 peak; something was waiting for 1s"),
+        "{line}"
+    );
 
     let json: serde_json::Value = serde_json::from_str(
         &run_show(&sources, &id.encode(), true)
@@ -2219,7 +2236,7 @@ async fn show_says_incomplete_when_truncated() {
     let id = SessionId::new(T0, 1);
     let mut records = build_records("//a:b", T0, None);
     records.push(SessionRecord::session(
-        T0 + 50,
+        T0 + 5_000,
         SessionRecordKind::Truncated,
     ));
     let source = FakeSource {
@@ -2238,14 +2255,45 @@ async fn show_says_incomplete_when_truncated() {
     };
     let sources: [&dyn SessionSource; 1] = [&source];
     let out = run_show(&sources, &id.encode(), false).await.expect("show");
+    // The cap, how far into the run, and what was dropped.
     assert!(
-        out.contains("\nincomplete: the recording reached its size cap"),
+        out.contains(
+            "\nincomplete: the recording passed its 256.0 MiB size cap 5s into the run: \
+             output and log lines were dropped from there"
+        ),
         "{out}"
     );
     let json: serde_json::Value =
         serde_json::from_str(&run_show(&sources, &id.encode(), true).await.expect("show"))
             .expect("json");
     assert_eq!(json["truncated"], true, "{json}");
+    assert_eq!(json["incomplete"], true, "{json}");
+    assert_eq!(json["incomplete_reason"], "size_cap", "{json}");
+    let listed = run_list(&sources, Workspace::All, true).await;
+    let listed: serde_json::Value = serde_json::from_str(&listed).expect("list json");
+    assert_eq!(listed["sessions"][0]["incomplete"], true, "{listed}");
+    let table = run_list(&sources, Workspace::All, false).await;
+    assert!(table.contains("  incomplete"), "{table}");
+
+    // Cut twice: the ceiling too, with when it stopped.
+    let mut records = build_records("//a:b", T0, None);
+    records.push(SessionRecord::session(
+        T0 + 5_000,
+        SessionRecordKind::Truncated,
+    ));
+    records.push(SessionRecord::session(
+        T0 + 20_000,
+        SessionRecordKind::Truncated,
+    ));
+    let twice = FakeSource {
+        sessions: vec![(source.sessions[0].0.clone(), records)],
+    };
+    let sources: [&dyn SessionSource; 1] = [&twice];
+    let out = run_show(&sources, &id.encode(), false).await.expect("show");
+    assert!(
+        out.contains("it reached its 1.0 GiB ceiling 20s into the run and recorded nothing after"),
+        "{out}"
+    );
 
     // Not cut: no such line.
     let whole = FakeSource {
@@ -2261,6 +2309,14 @@ async fn show_says_incomplete_when_truncated() {
     let sources: [&dyn SessionSource; 1] = [&whole];
     let out = run_show(&sources, &id.encode(), false).await.expect("show");
     assert!(!out.contains("incomplete"), "{out}");
+    let json: serde_json::Value =
+        serde_json::from_str(&run_show(&sources, &id.encode(), true).await.expect("show"))
+            .expect("json");
+    assert_eq!(json["incomplete"], false, "{json}");
+    assert_eq!(json["incomplete_reason"], serde_json::Value::Null, "{json}");
+    let listed = run_list(&sources, Workspace::All, true).await;
+    let listed: serde_json::Value = serde_json::from_str(&listed).expect("list json");
+    assert_eq!(listed["sessions"][0]["incomplete"], false, "{listed}");
 }
 
 /// A record that does not decode is skipped, counted in the text and in
@@ -2286,7 +2342,10 @@ async fn show_reports_skipped_records() {
     let sources: [&dyn SessionSource; 1] = [&file];
     let out = run_show(&sources, &id.encode(), false).await.expect("show");
     assert!(
-        out.contains("\n1 recorded record could not be read and was skipped\n"),
+        out.contains(
+            "\n1 record could not be read and was skipped, so the progress below leaves it out: \
+             damaged, or written in a shape this heph does not know (a newer heph may read it)\n"
+        ),
         "{out}"
     );
     let json: serde_json::Value =
@@ -2294,4 +2353,19 @@ async fn show_reports_skipped_records() {
             .expect("json");
     assert_eq!(json["skipped"], 1, "{json}");
     assert_eq!(json["pools"], serde_json::json!([]), "{json}");
+}
+
+/// The `.hephconfig` defaults a bad value's warning names are the ones the
+/// cleanup applies.
+#[test]
+fn retention_defaults_agree() {
+    use crate::engine::config_yaml::SessionConfig;
+    use crate::tui::session::cleanup::Retention;
+    assert_eq!(
+        Retention::default(),
+        Retention {
+            max_age: SessionConfig::KEEP_DEFAULT,
+            max_bytes: SessionConfig::KEEP_BYTES_DEFAULT,
+        }
+    );
 }
