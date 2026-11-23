@@ -119,7 +119,7 @@ fn text(l: &Line<'_>) -> String {
 
 /// One frame of `tab`'s list at `T0 + now`, 120 columns by 20 rows.
 fn frame(s: &BuildState, st: &mut ListState, tab: Tab, now: u64) -> Vec<String> {
-    frame_with(s, st, tab, now, &LastLines::default(), &Redact::default())
+    frame_with(s, st, tab, now, &LastLines::default())
 }
 
 fn frame_with(
@@ -128,7 +128,6 @@ fn frame_with(
     tab: Tab,
     now: u64,
     lines: &LastLines,
-    redact: &Redact,
 ) -> Vec<String> {
     st.set_tab(tab);
     let inp = ListInputs {
@@ -136,7 +135,6 @@ fn frame_with(
         waits: s,
         lines,
         now_ms: T0 + now,
-        redact,
     };
     list_lines(&inp, st, 120, 20).iter().map(text).collect()
 }
@@ -1096,7 +1094,7 @@ fn no_home_path_on_any_screen_dashboard_and_target() {
     let mut lines = LastLines::default();
     let mut st = ListState::default();
     for tab in [Tab::All, Tab::Failed, Tab::Pending] {
-        frame_with(&s, &mut st, tab, 1_000, &lines, &redact);
+        frame_with(&s, &mut st, tab, 1_000, &lines);
         let ids: Vec<Id> = st.visible().to_vec();
         lines.apply(
             ids.iter()
@@ -1108,8 +1106,9 @@ fn no_home_path_on_any_screen_dashboard_and_target() {
                 })
                 .collect(),
             &ids,
+            &redact,
         );
-        let f = frame_with(&s, &mut st, tab, 1_000, &lines, &redact);
+        let f = frame_with(&s, &mut st, tab, 1_000, &lines);
         if tab != Tab::Pending {
             assert!(f.iter().any(|r| r.contains("main.rs:3")), "{tab:?}: {f:#?}");
         }

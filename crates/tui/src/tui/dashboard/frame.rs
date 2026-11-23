@@ -125,7 +125,6 @@ mod tests {
             waits: &NoWaits,
             lines: &lines,
             now_ms: 2_000,
-            redact: &Redact::default(),
         };
         let title = Title {
             command: "heph r build //...",

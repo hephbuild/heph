@@ -1643,7 +1643,6 @@ impl TuiProgressView {
                 waits: &self.state,
                 lines: &LastLines::default(),
                 now_ms,
-                redact: &self.state.redact,
             };
             // The titles, the rows and the position; not the rows the list
             // pads its window with, which a print has no window for.
@@ -1845,14 +1844,14 @@ impl TuiProgressView {
         // What the background reader found since the last frame, for the
         // rows that frame showed.
         if let Some(updates) = self.tails.as_mut().and_then(|t| t.poll()) {
-            self.last_lines.apply(updates, self.list.visible());
+            self.last_lines
+                .apply(updates, self.list.visible(), &self.state.redact);
         }
         let inputs = ListInputs {
             model: &self.state.dash,
             waits: &self.state,
             lines: &self.last_lines,
             now_ms: self.clock_at(now_ms),
-            redact: &self.state.redact,
         };
         let out = dashboard_frame(&title, &inputs, &mut self.list, &hints, cols, rows);
         // The rows this frame shows, for the reader to (re)read off this task.

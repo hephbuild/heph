@@ -9,6 +9,7 @@
 //! and twice across the other tabs. A stopped target (`○`) is the other way
 //! round, in All only.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use ratatui::style::{Color, Modifier, Style};
@@ -153,14 +154,25 @@ impl LastLines {
             .collect()
     }
 
-    /// Take the reader's results; forget rows no longer on screen.
-    pub fn apply(&mut self, updates: Vec<TailUpdate>, visible: &[Id]) {
+    /// Take the reader's results, each line with `redact`'s paths taken out
+    /// (I9) once here rather than on every frame; forget rows no longer on
+    /// screen.
+    pub fn apply(
+        &mut self,
+        updates: Vec<TailUpdate>,
+        visible: &[Id],
+        redact: &crate::tui::text::Redact,
+    ) {
         for u in updates {
             match (self.lines.get_mut(&u.id), u.line) {
                 (Some(k), None) => {
                     k.finished = u.finished;
                 }
                 (_, Some(line)) => {
+                    let line = match redact.apply(&line) {
+                        Cow::Borrowed(_) => line,
+                        Cow::Owned(redacted) => redacted.into_boxed_str(),
+                    };
                     self.lines.insert(
                         u.id,
                         Kept {
@@ -562,10 +574,9 @@ impl ListState {
 pub struct ListInputs<'a> {
     pub model: &'a Model,
     pub waits: &'a dyn Waits,
+    /// The LAST LINE column, heph's home already taken out (I9).
     pub lines: &'a LastLines,
     pub now_ms: u64,
-    /// Takes heph's home out of the LAST LINE column (I9).
-    pub redact: &'a crate::tui::text::Redact,
 }
 
 /// Column widths for a `cols`-wide list.
@@ -631,51 +642,54 @@ fn whole(ms: u64) -> String {
 /// A LAST LINE cell whose line is unknown.
 const UNKNOWN_LINE: &str = "–";
 
-/// One row's PHASE, TIME and LAST LINE.
-fn row_words(inp: &ListInputs<'_>, id: Id, r: &Record) -> (String, String, String) {
+/// One row's PHASE, TIME and LAST LINE, borrowed where the words already
+/// exist.
+fn row_words<'a>(
+    inp: &ListInputs<'a>,
+    id: Id,
+    r: &Record,
+) -> (Cow<'a, str>, Cow<'a, str>, Cow<'a, str>) {
     let m = inp.model;
     // `–` when no line is known: not read yet, no log, or none this viewer
     // can read (an attached viewer reads its own session's logs only). A
     // blank would read as a log that printed nothing.
-    let log = || match inp.lines.get(id) {
-        Some(line) => inp.redact.apply(line).into_owned(),
-        None => UNKNOWN_LINE.to_owned(),
-    };
+    let log = || Cow::Borrowed(inp.lines.get(id).unwrap_or(UNKNOWN_LINE));
+    let none = || Cow::Borrowed("");
     match r.state {
-        RowState::Queued => ("pending".into(), String::new(), String::new()),
+        RowState::Queued => ("pending".into(), none(), none()),
         RowState::Blocked => match inp.waits.wait_words(m.addr(id), inp.now_ms) {
-            Some(w) => (w.phase, whole(w.waited_ms), w.row_detail),
-            None => ("waiting".into(), String::new(), String::new()),
+            Some(w) => (
+                w.phase.into(),
+                whole(w.waited_ms).into(),
+                w.row_detail.into(),
+            ),
+            None => ("waiting".into(), none(), none()),
         },
         RowState::Running => {
-            let phase = r
-                .op()
-                .map(|op| format!("{} {}", op.icon(), op.phase()))
-                .unwrap_or_else(|| "running".into());
+            let phase = r.op().map_or(Cow::Borrowed("running"), |op| {
+                format!("{} {}", op.icon(), op.phase()).into()
+            });
             let time = whole(inp.now_ms.saturating_sub(r.op_since_ms));
-            (phase, time, log())
+            (phase, time.into(), log())
         }
-        RowState::Done => ("done".into(), secs_tenths(r.total_ms()), log()),
+        RowState::Done => ("done".into(), secs_tenths(r.total_ms()).into(), log()),
         RowState::Cached if r.remote_hit() => {
             let ms = r.op_ms(crate::tui::progress::Op::RemoteCacheRead);
-            ("cached ↓ remote".into(), secs_tenths(ms), log())
+            ("cached ↓ remote".into(), secs_tenths(ms).into(), log())
         }
-        RowState::Cached => ("cached local".into(), String::new(), log()),
+        RowState::Cached => ("cached local".into(), none(), log()),
         RowState::Failed => {
             let time = match r.total_ms() {
-                0 => String::new(),
-                ms => secs_tenths(ms),
+                0 => none(),
+                ms => secs_tenths(ms).into(),
             };
-            (m.reason(id).unwrap_or("failed").to_owned(), time, log())
+            (m.reason(id).unwrap_or("failed").into(), time, log())
         }
         RowState::DepFailed => {
-            let root = m
-                .root_of(id)
-                .map(|a| format!("root {a}"))
-                .unwrap_or_default();
-            ("dep failed".into(), String::new(), root)
+            let root = m.root_of(id).map_or(none(), |a| format!("root {a}").into());
+            ("dep failed".into(), none(), root)
         }
-        RowState::Stopped => ("stopped".into(), String::new(), String::new()),
+        RowState::Stopped => ("stopped".into(), none(), none()),
     }
 }
 
@@ -862,7 +876,6 @@ mod tests {
             waits: &NoWaits,
             lines,
             now_ms: 2_000,
-            redact: &Redact::default(),
         };
         list_lines(&inp, st, cols, 20)
             .iter()
@@ -1185,7 +1198,7 @@ mod tests {
         let background = |lines: &mut LastLines, st: &ListState| {
             let requests = lines.requests(&m, st.visible());
             let updates = read_tails(&reader, &requests);
-            lines.apply(updates, st.visible());
+            lines.apply(updates, st.visible(), &Redact::default());
             requests.len()
         };
         assert_eq!(background(&mut lines, &st), 2);
