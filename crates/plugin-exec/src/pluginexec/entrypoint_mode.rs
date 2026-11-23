@@ -72,11 +72,6 @@ const REFUSED_FIELDS: &[(&str, &str)] = &[
         "an entrypoint has no outputs: it runs in your world, and nothing it writes is collected \
          or cached. Drop `out`; to produce files for other targets, make a separate build target",
     ),
-    (
-        "failure_out",
-        "an entrypoint keeps nothing from a failed run: it runs in your world, where whatever it \
-         wrote is already where it wrote it. Drop `failure_out`",
-    ),
     ("cache", "an entrypoint is never cached. Drop `cache`"),
     (
         "resources",
@@ -140,6 +135,17 @@ pub(crate) fn refuse_fields(
              (`entrypoint = True`), unless it runs in its sandbox: a scratch is mounted in the \
              sandbox package dir, which is the working directory only with \
              `workdir = \"sandbox\"`. Set that, or drop `scratch`"
+        );
+    }
+    // Kept from the sandbox, which the invocation removes: in the tree,
+    // whatever the program wrote is already where it wrote it.
+    if config.contains_key("failure_out") && !sandbox_workdir {
+        anyhow::bail!(
+            "`failure_out` is not accepted on {addr}, an entrypoint `{driver}` target \
+             (`entrypoint = True`), unless it runs in its sandbox: what a failed invocation \
+             wrote is kept from its sandbox package dir, which is the working directory only \
+             with `workdir = \"sandbox\"`. Anywhere else, what it wrote is already where it \
+             wrote it. Set that, or drop `failure_out`"
         );
     }
     Ok(())
@@ -274,7 +280,35 @@ mod tests {
             ),
             (
                 vec![flag(), ("failure_out", s("test-results/"))],
-                &["`failure_out`", "keeps nothing", "Drop `failure_out`"],
+                &[
+                    "`failure_out`",
+                    "workdir = \"sandbox\"",
+                    "drop `failure_out`",
+                ],
+            ),
+            (
+                vec![
+                    flag(),
+                    ("failure_out", s("test-results/")),
+                    ("workdir", s("caller")),
+                ],
+                &["`failure_out`", "workdir = \"sandbox\""],
+            ),
+            (
+                vec![
+                    flag(),
+                    ("failure_out", s("test-results/")),
+                    ("workdir", s("tree_root")),
+                ],
+                &["`failure_out`", "workdir = \"sandbox\""],
+            ),
+            (
+                vec![
+                    flag(),
+                    ("failure_out", s("test-results/")),
+                    ("workdir", s("tree_package")),
+                ],
+                &["`failure_out`", "workdir = \"sandbox\""],
             ),
             (
                 vec![flag(), ("cache", Value::Bool(true))],
@@ -427,6 +461,11 @@ mod tests {
             vec![
                 flag(),
                 ("scratch", Value::List(vec![s("//c:gocache")])),
+                ("workdir", s("sandbox")),
+            ],
+            vec![
+                flag(),
+                ("failure_out", s("test-results/")),
                 ("workdir", s("sandbox")),
             ],
             vec![flag(), ("workdir", s("caller"))],

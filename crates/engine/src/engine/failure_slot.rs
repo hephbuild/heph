@@ -198,6 +198,10 @@ pub(crate) struct Fill<'a> {
     /// What the run's `in_place` write-back on failure did. Written paths
     /// become the slot's `fixes.txt`.
     pub fixes: Option<hplugin::error::FailureFixes>,
+    /// Keep the failure's `Log` artifact. False for an entrypoint's
+    /// invocation, which is never logged (R22): its slot holds `out/` only,
+    /// whatever its driver attached.
+    pub keep_log: bool,
 }
 
 /// The slots of one home, as one engine sees them.
@@ -322,7 +326,8 @@ impl FailureSlots {
             Some(file) => file
                 .filter(|f| f.metadata().is_ok_and(|m| m.len() > 0))
                 .map(LogSource::Fd),
-            None => select_log(fill.addr, fill.err),
+            None if fill.keep_log => select_log(fill.addr, fill.err),
+            None => None,
         };
         let out = hplugin::error::failure_out_tar(fill.err).cloned();
         let mut fixes = fill.fixes;
@@ -1061,6 +1066,7 @@ mod tests {
                 lines: 10,
                 material: false,
                 fixes: None,
+                keep_log: true,
             })
             .await;
         slot.log.map(|l| l.tail().expect("tail").text)
@@ -1140,6 +1146,7 @@ mod tests {
                 lines: 10,
                 material: true,
                 fixes: None,
+                keep_log: true,
             })
             .await;
         let log = slot.log.expect("a tail");
@@ -1169,6 +1176,7 @@ mod tests {
                 lines: 10,
                 material: false,
                 fixes: None,
+                keep_log: true,
             })
             .await;
         let log = slot.log.clone().expect("the tail, in memory");
@@ -1236,6 +1244,7 @@ mod tests {
                     lines: 10,
                     material,
                     fixes: None,
+                    keep_log: true,
                 },
                 None,
                 ops,
@@ -1263,6 +1272,7 @@ mod tests {
                 err: &err,
                 lines: 10,
                 material: false,
+                keep_log: true,
                 fixes: Some(FailureFixes::Written {
                     root: root.clone(),
                     paths: paths.clone(),
@@ -1294,6 +1304,7 @@ mod tests {
                 err: &err,
                 lines: 10,
                 material: false,
+                keep_log: true,
                 fixes: Some(FailureFixes::NotWritten(FixesNotWritten::Frozen)),
             })
             .await;
@@ -1468,6 +1479,7 @@ mod tests {
                     err: &err,
                     lines: 10,
                     material: true,
+                    keep_log: true,
                     fixes: Some(FailureFixes::Written {
                         root: sandbox.path().to_path_buf(),
                         paths: paths.clone(),

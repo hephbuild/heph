@@ -171,8 +171,8 @@ the paths in the BUILD file; the slot does not split by group.
     `*` and `**` (such as `**` or `./**/*`). Name what to keep instead, such
     as `test-results/`.
 
-  An entrypoint refuses `failure_out` altogether: what it wrote is already
-  where it wrote it.
+  An entrypoint accepts `failure_out` only with `workdir = "sandbox"`
+  ([Entrypoints](#entrypoints)).
 - **Never written into the tree.** A `failure_out` path that falls inside an
   `in_place` output is left out of the write-back on failure: it lands only in
   the slot's `out/`.
@@ -214,6 +214,39 @@ heph does not filter `failure_out`. Whatever a target lists there is kept,
 including for a target whose outputs are credential material (`out =
 {"credential": …}`). Such a target keeps no `log.txt`, but its `out/` is kept.
 Keeping secrets out of `failure_out` is the target author's responsibility.
+
+### Entrypoints
+
+An entrypoint (`entrypoint = True`, see [`ENTRYPOINTS.md`](ENTRYPOINTS.md))
+takes `failure_out` only with `workdir = "sandbox"`. That is the only mode
+whose writes are lost: the invocation's sandbox is removed when the tool
+exits. In the other modes the tool runs in your tree or your cwd, and whatever
+it wrote is already where it wrote it, so parse refuses `failure_out` there.
+
+```python
+target(
+    name = "e2e",
+    driver = "bash",
+    entrypoint = True,
+    workdir = "sandbox",
+    failure_out = ["test-results/"],
+    run = "playwright test",
+)
+```
+
+It keeps what a build keeps, read the same way, with these differences:
+
+- **`out/` only, never a log.** An invocation's output goes to your terminal
+  and is never logged, so its slot has no `log.txt`.
+- **Copied before the teardown.** The matches go into the slot before the
+  invocation's sandbox is removed, so the slot is there by the time
+  `heph run` exits with the tool's own status. Nothing is printed;
+  `heph inspect failure <addr>` says where they are.
+- **Cleared when the next invocation starts**, once its closure is built.
+  Two invocations of the same target running at once share one slot: the
+  last failure to finish is the one kept.
+- **No revision.** An invocation is never hashed, so the manifest's `hashin`
+  is empty.
 
 ## `heph inspect failure`
 

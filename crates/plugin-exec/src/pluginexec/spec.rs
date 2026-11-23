@@ -206,8 +206,8 @@ pub(crate) struct TargetSpec {
     /// for a build, in a sandbox of the invocation's own removed when it
     /// exits, and `$SRC_<group>`, `$TOOL_<group>` and `$WORKSPACE_ROOT` name
     /// paths inside it (`$HEPH_ROOT` is the real workspace root). What only a
-    /// build uses is refused: `out`, `failure_out`, `cache`, `codegen`, `support_files`, the
-    /// `*_env` fields, `runner`, and `scratch` outside `workdir = "sandbox"`. An `exec`
+    /// build uses is refused: `out`, `cache`, `codegen`, `support_files`, the `*_env`
+    /// fields, `runner`, and `scratch` and `failure_out` outside `workdir = "sandbox"`. An `exec`
     /// argv cannot name `$SRC_<group>` (there is no shell): use
     /// `${src://pkg:name}`, or `driver = "bash"`.
     pub entrypoint: bool,
