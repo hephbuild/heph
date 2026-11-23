@@ -78,7 +78,10 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3Default;
 
-use super::{archive::Layout, basename, dep_single_file, ws_path};
+use super::{
+    archive::{Blob, Layout},
+    basename, dep_single_file, ws_path,
+};
 
 const IMAGE_ORIGIN: &str = "image";
 
@@ -481,14 +484,15 @@ impl ManagedDriver for Driver {
         .context("convert the image to a docker-format archive")?;
 
         let docker = connect_daemon()?;
-        let bytes = tokio::fs::read(&docker_tar)
-            .await
+        // Mapped, not read: the archive is the whole image, and reading it would
+        // make the image's size the driver's peak heap.
+        let bytes = super::registry::blob_body(&Blob::File(docker_tar.clone()))
             .with_context(|| format!("read {docker_tar:?}"))?;
 
         use futures::StreamExt as _;
         let mut stream = docker.import_image(
             bollard::query_parameters::ImportImageOptions::default(),
-            bollard::body_full(bytes.into()),
+            bollard::body_full(bytes),
             None,
         );
         // The daemon narrates the load and names what it loaded; that name is
