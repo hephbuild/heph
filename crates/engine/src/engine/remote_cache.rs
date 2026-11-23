@@ -761,6 +761,37 @@ impl ConfiguredCache {
             .with_context(|| format!("{what} timed out after {METADATA_TIMEOUT:?}"))?
     }
 
+    /// A slot from the bulk half of the request budget, for a transfer of the
+    /// object `id`, held for as long as its bytes move. Reported to the
+    /// saturation watchdog before queueing (see [`observe_transfer_slots`]).
+    ///
+    /// Keeping transfers out of the metadata reserve is what stops a wide pull
+    /// from starving the manifest reads and presence checks that decide every
+    /// other target's hit (see [`META_SLOT_RESERVE`]).
+    async fn bulk_slot(&self, id: &str) -> anyhow::Result<tokio::sync::SemaphorePermit<'_>> {
+        observe_transfer_slots(self);
+        self.shared_slots
+            .acquire()
+            .await
+            .with_context(|| format!("acquire remote cache blob slot for {id}"))
+    }
+
+    /// Open `key` for a bulk read under [`METADATA_TIMEOUT`]: the open is a
+    /// request/response round trip with no body yet, while the body that
+    /// follows is bounded by the backend's inactivity reader. Without a bound
+    /// here a wedged GET rides `object_store`'s full retry budget while holding
+    /// a bulk slot. A timeout reads `open <kind> <id> timed out after …`.
+    async fn open_bounded(
+        &self,
+        key: &str,
+        kind: &str,
+        id: &str,
+    ) -> anyhow::Result<Option<Pin<Box<dyn AsyncRead + Send>>>> {
+        tokio::time::timeout(METADATA_TIMEOUT, self.backend.open_read(key))
+            .await
+            .with_context(|| format!("open {kind} {id} timed out after {METADATA_TIMEOUT:?}"))?
+    }
+
     /// Whether the cache's breaker is currently open and it should be skipped.
     fn broken(&self) -> bool {
         if self.health.auth_failed.load(Ordering::Relaxed) {
@@ -1070,18 +1101,11 @@ impl ScratchSource<'_> {
     /// not a large transfer.
     pub async fn read_small(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
         let what = format!("read remote scratch meta {key}");
-        let read = async {
-            let Some(mut r) = self.cache.backend.open_read(key).await? else {
-                return Ok(None);
-            };
-            let mut buf = Vec::new();
-            tokio::io::AsyncReadExt::read_to_end(&mut r, &mut buf)
-                .await
-                .with_context(|| format!("read remote object {key}"))?;
-            Ok(Some(buf))
-        };
-        self.checked("scratch meta read", self.cache.meta_op(&what, read))
-            .await
+        self.checked(
+            "scratch meta read",
+            self.cache.meta_op(&what, read_small_inner(self.cache, key)),
+        )
+        .await
     }
 
     /// A snapshot, streamed into `dest`: the number of bytes written, or `None`
@@ -1107,20 +1131,11 @@ impl ScratchSource<'_> {
         W: AsyncWrite + Unpin + ?Sized,
     {
         let read = async {
-            observe_transfer_slots(self.cache);
-            let _slot = self
+            let _slot = self.cache.bulk_slot(key).await?;
+            let opened = self
                 .cache
-                .shared_slots
-                .acquire()
-                .await
-                .with_context(|| format!("acquire remote cache blob slot for {key}"))?;
-            let opened = tokio::time::timeout(METADATA_TIMEOUT, self.cache.backend.open_read(key))
-                .await
-                .with_context(|| {
-                    format!(
-                        "open remote scratch snapshot {key} timed out after {METADATA_TIMEOUT:?}"
-                    )
-                })??;
+                .open_bounded(key, "remote scratch snapshot", key)
+                .await?;
             let Some(mut r) = opened else {
                 return Ok(None);
             };
@@ -1506,11 +1521,7 @@ impl RemoteCacheSet {
                     async move {
                         // Uploads are bulk too, and background: they must never
                         // hold a slot a critical-path metadata read needs.
-                        observe_transfer_slots(cache);
-                        let _slot =
-                            cache.shared_slots.acquire().await.with_context(|| {
-                                format!("acquire remote cache blob slot for {key}")
-                            })?;
+                        let _slot = cache.bulk_slot(&key).await?;
                         stream_file_to_backend(cache.backend.as_ref(), &key, path).await
                     }
                 })
@@ -1708,27 +1719,10 @@ impl RemoteCacheSet {
             .get(rev.cache_idx)
             .context("remote cache index out of range")?;
         // Bulk half of the request budget, held for the whole stream — the
-        // download *is* the slot's occupancy. Keeping it out of the metadata
-        // reserve is what stops a wide pull from starving the manifest reads and
-        // presence checks that decide every other target's hit
-        // (see `META_SLOT_RESERVE`).
-        observe_transfer_slots(cache);
-        let _slot = cache
-            .shared_slots
-            .acquire()
-            .await
-            .with_context(|| format!("acquire remote cache blob slot for {name}"))?;
+        // download *is* the slot's occupancy.
+        let _slot = cache.bulk_slot(name).await?;
         let key = Self::key(addr, hashin, name);
-        // Opening the stream is a request/response round trip with no body yet, so
-        // it gets the metadata bound — the body that follows is covered by
-        // `InactivityReader`. Without a bound here a wedged GET rides
-        // object_store's full retry budget while holding a bulk slot.
-        let opened = tokio::time::timeout(METADATA_TIMEOUT, cache.backend.open_read(&key))
-            .await
-            .with_context(|| {
-                format!("open remote blob {name} timed out after {METADATA_TIMEOUT:?}")
-            });
-        let reader = match opened.and_then(|r| r) {
+        let reader = match cache.open_bounded(&key, "remote blob", name).await {
             Ok(Some(reader)) => reader,
             // Manifest names a blob the cache no longer has → incomplete.
             Ok(None) => return Ok(None),
@@ -1801,8 +1795,9 @@ fn observe_transfer_slots(cache: &ConfiguredCache) {
         .observe(cache.shared_slots.available_permits(), d.now_ms());
 }
 
-/// The unbounded body of [`RemoteCacheSet::read_small`], split out so the
-/// timeout can wrap it as a single future.
+/// The unbounded body of [`RemoteCacheSet::read_small`] and
+/// [`ScratchSource::read_small`], split out so the timeout can wrap it as a
+/// single future.
 async fn read_small_inner(cache: &ConfiguredCache, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
     use tokio::io::AsyncReadExt;
     match cache.backend.open_read(key).await? {
@@ -2929,6 +2924,49 @@ mod tests {
         assert!(
             set.caches.first().expect("cache").broken(),
             "cache must be circuit-broken after {FAILURE_THRESHOLD} consecutive failures"
+        );
+    }
+
+    /// A bulk open that fails is routed by its caller: a blob fetch notes it on
+    /// the cache and degrades to "cannot serve" (`Ok(None)`), while a scratch
+    /// snapshot read returns the error.
+    #[tokio::test]
+    async fn a_failed_bulk_open_is_a_blob_miss_and_a_snapshot_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Not an auth failure, which would disable the cache at once.
+        let set = RemoteCacheSet::with_backend(
+            Arc::new(CountingFailBackend::default()),
+            dir.path().to_path_buf(),
+        );
+        let addr = addr();
+        let rev = RemoteRevision {
+            cache_idx: 0,
+            manifest: RemoteManifest {
+                version: REMOTE_MANIFEST_VERSION.to_string(),
+                target: addr.format(),
+                hashin: "h".to_string(),
+                artifacts: vec![probe_artifact(0)],
+            },
+        };
+
+        let sources = set.scratch_sources().await;
+        let err = sources[0]
+            .read_snapshot("scratch/v1/snap")
+            .await
+            .expect_err("a failed snapshot open is an error");
+        assert!(format!("{err:#}").contains("unreachable"), "{err:#}");
+
+        for _ in 1..FAILURE_THRESHOLD {
+            assert!(!set.caches[0].broken(), "broken before the threshold");
+            let temp = set
+                .fetch_blob(&never(), &rev, &addr, "h", "blob-0", dir.path())
+                .await
+                .expect("a failed blob open is not a hard error");
+            assert!(temp.is_none(), "a failed blob open cannot serve the blob");
+        }
+        assert!(
+            set.caches[0].broken(),
+            "both reads count towards the cache's breaker"
         );
     }
 
