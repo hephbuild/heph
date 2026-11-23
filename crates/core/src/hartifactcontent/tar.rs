@@ -5,24 +5,32 @@ use std::io::{self, Cursor, Read, Write};
 use std::mem;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-struct PoisonableReader {
-    inner: Box<dyn Read>,
-    poisoned: Arc<AtomicBool>,
+/// A file entry's data, readable only while it is the walker's current entry.
+///
+/// `generation` is the walker's own counter, shared by every reader it hands
+/// out; `at` is its value when this entry was yielded. The walker bumps it
+/// whenever it moves on (and when it is dropped), so a reader whose `at` no
+/// longer matches refuses to read rather than reading through a borrow of the
+/// archive that has moved past it.
+struct EntryReader {
+    entry: tar::Entry<'static, Box<dyn Read>>,
+    generation: Arc<AtomicU64>,
+    at: u64,
 }
 
-impl Read for PoisonableReader {
+impl Read for EntryReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.poisoned.load(Ordering::Acquire) {
+        if self.generation.load(Ordering::Acquire) != self.at {
             return Err(io::Error::other(
                 "stale tar entry: next() advanced past this entry",
             ));
         }
-        self.inner.read(buf)
+        self.entry.read(buf)
     }
 }
 
@@ -31,7 +39,16 @@ impl Read for PoisonableReader {
 pub struct TarWalker {
     entries: tar::Entries<'static, Box<dyn Read>>,
     _archive: Box<tar::Archive<Box<dyn Read>>>,
-    current_poison: Option<Arc<AtomicBool>>,
+    /// Moves on every `next()` and on drop; see [`EntryReader`].
+    generation: Arc<AtomicU64>,
+}
+
+impl Drop for TarWalker {
+    /// The archive a reader borrows from is freed with the walker, so a reader
+    /// that outlives it must go stale too.
+    fn drop(&mut self) {
+        self.generation.fetch_add(1, Ordering::Release);
+    }
 }
 
 impl TarWalker {
@@ -49,7 +66,7 @@ impl TarWalker {
         Ok(Self {
             entries,
             _archive: archive,
-            current_poison: None,
+            generation: Arc::new(AtomicU64::new(0)),
         })
     }
 }
@@ -58,9 +75,8 @@ impl Iterator for TarWalker {
     type Item = anyhow::Result<WalkEntry>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(poison) = self.current_poison.take() {
-            poison.store(true, Ordering::Release);
-        }
+        // Every reader handed out so far is now stale.
+        let at = self.generation.fetch_add(1, Ordering::Release) + 1;
         loop {
             let entry = match self.entries.next()? {
                 Ok(e) => e,
@@ -104,20 +120,25 @@ impl Iterator for TarWalker {
             let x = mode & 0o111 != 0;
             // Straight off the header we just parsed — no extra read.
             let size = entry.header().size().unwrap_or(0);
-            let poison = Arc::new(AtomicBool::new(false));
-            self.current_poison = Some(poison.clone());
             // SAFETY: entry borrows from entries which borrows from archive's stable heap allocation.
-            // PoisonableReader poisons on next(), preventing reads after the stream advances.
-            let reader: Box<dyn Read> = unsafe {
-                let entry = mem::transmute::<
-                    tar::Entry<'_, Box<dyn Read>>,
-                    tar::Entry<'static, Box<dyn Read>>,
-                >(entry);
-                Box::new(PoisonableReader {
-                    inner: Box::new(entry),
-                    poisoned: poison,
-                })
+            // EntryReader refuses to read once the walker advances or is dropped.
+            // A reader may also outlive the walker: dropping it drops the
+            // `tar::Entry`, which has no `Drop` impl and holds only borrows and
+            // owned buffers, so the drop never touches the freed archive.
+            // (Follow-up, predates this: under Stacked Borrows, moving the
+            // `Box` archive into the walker retags it while `entries` still
+            // borrows through `ptr`; owning it as a raw pointer would avoid
+            // that.)
+            let entry = unsafe {
+                mem::transmute::<tar::Entry<'_, Box<dyn Read>>, tar::Entry<'static, Box<dyn Read>>>(
+                    entry,
+                )
             };
+            let reader: Box<dyn Read> = Box::new(EntryReader {
+                entry,
+                generation: Arc::clone(&self.generation),
+                at,
+            });
             return Some(Ok(WalkEntry {
                 path,
                 kind: WalkEntryKind::File {
@@ -608,6 +629,7 @@ fn is_executable(_meta: &std::fs::Metadata) -> bool {
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+    use std::sync::atomic::AtomicBool;
 
     #[test]
     fn pack_relative_symlink_included() {
@@ -678,6 +700,79 @@ mod tests {
             }
         }
         assert!(saw_symlink && saw_file);
+    }
+
+    /// A tar of `a` ("first"), a symlink `l` → `a`, and `b` ("second").
+    fn two_files_and_a_link() -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut buf);
+            for (path, data) in [("a", &b"first"[..]), ("b", &b"second"[..])] {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(data.len() as u64);
+                header.set_mode(0o644);
+                builder.append_data(&mut header, path, data).unwrap();
+                if path == "a" {
+                    let mut header = tar::Header::new_gnu();
+                    header.set_size(0);
+                    header.set_entry_type(tar::EntryType::Symlink);
+                    header.set_mode(0o777);
+                    builder.append_link(&mut header, "l", "a").unwrap();
+                }
+            }
+            builder.finish().unwrap();
+        }
+        buf
+    }
+
+    fn file_data(entry: anyhow::Result<WalkEntry>) -> Box<dyn Read> {
+        match entry.expect("entry").kind {
+            WalkEntryKind::File { data, .. } => Some(data),
+            WalkEntryKind::Symlink { .. } => None,
+        }
+        .expect("expected a file")
+    }
+
+    const STALE: &str = "stale tar entry: next() advanced past this entry";
+
+    /// A file's reader is valid until the walker moves on — past a symlink,
+    /// another file or the end — and refuses every read after that, while the
+    /// current entry's reader still reads.
+    #[test]
+    fn a_reader_is_stale_once_the_walker_advances() {
+        let mut walker = TarWalker::new(Cursor::new(two_files_and_a_link())).expect("walker");
+
+        let mut a = file_data(walker.next().expect("a"));
+        let mut head = [0u8; 2];
+        a.read_exact(&mut head).expect("read a while current");
+        assert_eq!(&head, b"fi");
+
+        let link = walker.next().expect("l").expect("l");
+        assert!(matches!(link.kind, WalkEntryKind::Symlink { .. }));
+        let err = a.read(&mut head).expect_err("a is stale past the link");
+        assert_eq!(err.to_string(), STALE);
+
+        let mut b = file_data(walker.next().expect("b"));
+        let err = a.read(&mut head).expect_err("a stays stale");
+        assert_eq!(err.to_string(), STALE);
+        let mut got = String::new();
+        b.read_to_string(&mut got).expect("read b while current");
+        assert_eq!(got, "second");
+
+        assert!(walker.next().is_none());
+        let err = b.read(&mut head).expect_err("b is stale past the end");
+        assert_eq!(err.to_string(), STALE);
+    }
+
+    /// The archive a reader borrows from goes with the walker, so a reader
+    /// that outlives its walker is stale rather than a read of freed memory.
+    #[test]
+    fn a_reader_is_stale_once_the_walker_is_dropped() {
+        let mut walker = TarWalker::new(Cursor::new(two_files_and_a_link())).expect("walker");
+        let mut a = file_data(walker.next().expect("a"));
+        drop(walker);
+        let err = a.read(&mut [0u8; 4]).expect_err("a is stale past drop");
+        assert_eq!(err.to_string(), STALE);
     }
 
     #[test]
