@@ -797,17 +797,18 @@ pub(crate) fn create(
         .with_context(|| format!("creating {}", tmp.display()))?;
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
             .with_context(|| format!("making {} user-only", tmp.display()))?;
+        // Runs on the main thread of every command: one unsynced commit, not
+        // one synced commit per statement, and set before the switch to WAL
+        // so the switch does not sync either. A crash before the rename
+        // leaves only the temp name, which nothing reads.
+        conn.execute_batch("PRAGMA synchronous=OFF;")
+            .context("configuring the new recording")?;
         let mode: String = conn
             .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
             .context("switching the recording to WAL")?;
         if refuse_wal || !mode.eq_ignore_ascii_case("wal") {
             anyhow::bail!("the filesystem refused WAL mode (journal_mode is {mode})");
         }
-        // Runs on the main thread of every command: one unsynced commit, not
-        // one synced commit per statement. A crash before the rename leaves
-        // only the temp name, which nothing reads.
-        conn.execute_batch("PRAGMA synchronous=OFF;")
-            .context("configuring the new recording")?;
         init(&conn, meta, provenance)?;
         conn.close()
             .map_err(|(_, e)| e)
@@ -1344,7 +1345,12 @@ fn write_rows(conn: &Connection, session_id: &str, rows: &mut Vec<Row>) -> rusql
 /// alone, replacing what is there (I4). Stops where the recording's ceiling
 /// stopped derivation (`truncated_seq`). A session command's repair (D14);
 /// a build never calls it (I1).
-pub fn rederive(conn: &Connection) -> rusqlite::Result<()> {
+///
+/// Nothing re-derives on open yet, so today only the tests call it, as the
+/// oracle the live derivation is compared against. Re-derivation on open
+/// drops the `cfg(test)`.
+#[cfg(test)]
+pub(crate) fn rederive(conn: &Connection) -> rusqlite::Result<()> {
     let (id, started, ended, stop): (String, i64, Option<i64>, Option<i64>) = conn.query_row(
         "SELECT id, started_ms, ended_ms, truncated_seq FROM session",
         [],
