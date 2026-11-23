@@ -4,6 +4,7 @@
 //! effect of evaluating each opened buffer — populates the per-document index the
 //! proxy uses for the provenance hover and driver-schema completion.
 
+use super::handlers::pkg_of;
 use super::index::{DocIndex, SharedState};
 use crate::pluginbuildfile::Provider;
 use crate::pluginbuildfile::provider::{DriverSource, PackageList};
@@ -156,14 +157,6 @@ impl HephLspContext {
         *self.drivers.lock().expect("drivers lock") = Drivers::new(source);
         let provider = self.fresh_provider();
         *self.provider.lock().expect("provider lock") = (Instant::now(), provider);
-    }
-
-    /// Package name for a BUILD file path (its parent dir, workspace-relative,
-    /// forward-slashed). Empty string for a BUILD file at the workspace root.
-    fn path_to_pkg(&self, path: &Path) -> String {
-        let parent = path.parent().unwrap_or(path);
-        let rel = parent.strip_prefix(&self.root).unwrap_or(parent);
-        rel.to_string_lossy().replace('\\', "/")
     }
 
     /// The 0-based line in `file` of the outermost call that declared target
@@ -405,7 +398,7 @@ impl LspContext for HephLspContext {
         // the source and its `load(...)` imports survive, so completion, hover
         // and goto-definition keep working. We do not surface eval errors as
         // diagnostics (they would be noisy while typing).
-        let pkg = self.path_to_pkg(&path);
+        let pkg = pkg_of(&self.root, &path);
         if let Ok(result) = eval_parsed(ast.clone(), &pkg, &self.loader()) {
             self.shared
                 .set_index(uri.clone(), DocIndex::build(&result, &pkg, content));
@@ -429,7 +422,7 @@ impl LspContext for HephLspContext {
         // Resolve exactly as the buildfile loader does (`//pkg`, `//pkg/x.BUILD`,
         // `./rel`, `../rel`), so loaded symbols point at the same file heph reads.
         let current_pkg = match current_file {
-            LspUri::File(p) => self.path_to_pkg(p),
+            LspUri::File(p) => pkg_of(&self.root, p),
             _ => String::new(),
         };
         let resolved =
@@ -454,7 +447,7 @@ impl LspContext for HephLspContext {
     ) -> Result<String, String> {
         match target {
             LspUri::File(target_path) => {
-                let pkg = self.path_to_pkg(target_path);
+                let pkg = pkg_of(&self.root, target_path);
                 let file = target_path
                     .file_name()
                     .map(|f| f.to_string_lossy().to_string())
@@ -478,7 +471,7 @@ impl LspContext for HephLspContext {
             rest.split_once(':').map(|(p, _)| p.to_string())
         } else if let Some(_name) = literal.strip_prefix(':') {
             match current_file {
-                LspUri::File(p) => Some(self.path_to_pkg(p)),
+                LspUri::File(p) => Some(pkg_of(&self.root, p)),
                 _ => None,
             }
         } else {
