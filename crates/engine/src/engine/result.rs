@@ -2467,7 +2467,7 @@ impl Engine {
         // Directly-requested target (no parent) — the outermost frame. Used below
         // to surface the rich recorded failure to the caller instead of the
         // internal `UpstreamFailed` marker.
-        let is_top = rs.parent.is_none();
+        let is_top = rs.parent().is_none();
         // `--frozen` is a property of the run, not of one frame: the `copy`
         // write-back fires on dependency frames too, and those resolve with
         // `ResultOptions::default()`. Record it from the only frame that carries
@@ -11359,7 +11359,7 @@ mod tests {
         // Pre-populate dag with addr→addr already there is overkill; just call result_addr
         // twice with the same parent set, but result_addr sets parent via with_parent so the
         // second invocation inside the same parent chain triggers cycle. Simulate by manually
-        // setting rs.parent = addr before calling result_addr(addr).
+        // making addr the parent before calling result_addr(addr).
         let rs = engine.new_state().with_parent(addr.clone());
         let result = engine
             .clone()
