@@ -2259,6 +2259,17 @@ pub(crate) fn eval_source(
 ) -> anyhow::Result<RunResult> {
     let ast: AstModule = AstModule::parse(filename, content, &Dialect::Extended)
         .map_err(starlark::Error::into_anyhow)?;
+    eval_parsed(ast, pkg, loader)
+}
+
+/// [`eval_source`] over a buffer the caller has already parsed: the LSP
+/// keeps the AST for its own analysis and hands evaluation a clone, which is
+/// cheaper than lexing and parsing the buffer again.
+pub(crate) fn eval_parsed(
+    ast: AstModule,
+    pkg: &str,
+    loader: &BuildFileLoader,
+) -> anyhow::Result<RunResult> {
     eval_ast(ast, pkg, loader, true)
 }
 
