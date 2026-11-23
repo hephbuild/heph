@@ -352,7 +352,7 @@ impl ExecRunner for OciRunner {
         ctx: &RunnerCtx<'_>,
         rewrite: SpecRewrite,
     ) -> anyhow::Result<SpecRewrite> {
-        let cfg: OciConfig = serde_json::from_value(ctx.config.clone())
+        let cfg = OciConfig::deserialize(ctx.config)
             .map_err(|e| anyhow::anyhow!("oci runner {}: parse config: {e}", ctx.addr))?;
         let (id, image_path) = self.container(ctx, &cfg)?;
 

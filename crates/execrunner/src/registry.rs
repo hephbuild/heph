@@ -20,6 +20,7 @@
 use crate::SpecRewrite;
 use crate::config::{RunnerConfig, WrapConfig};
 use hcore::hasync::Cancellable;
+use serde::Deserialize as _;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::sync::Arc;
@@ -223,7 +224,7 @@ impl ExecRunner for WrapRunner {
         ctx: &RunnerCtx<'_>,
         mut rewrite: SpecRewrite,
     ) -> anyhow::Result<SpecRewrite> {
-        let cfg: WrapConfig = serde_json::from_value(ctx.config.clone())
+        let cfg = WrapConfig::deserialize(ctx.config)
             .map_err(|e| anyhow::anyhow!("runner {}: parse wrap config: {e}", ctx.addr))?;
 
         if !cfg.prefix.is_empty() {
@@ -482,6 +483,30 @@ mod tests {
         .await
         .expect("wrap");
         assert!(!out.env.iter().any(|(k, _)| k == "XR_DEFINITELY_UNSET_9f2c"));
+    }
+
+    /// A bad wrap config fails with the whole message pinned: the runner, what
+    /// was being parsed, and serde's own words for an unknown key and a wrong
+    /// type, whatever path the config takes into the deserializer.
+    #[tokio::test]
+    async fn a_bad_wrap_config_names_the_runner_and_the_fault() {
+        for (config, want) in [
+            (
+                serde_json::json!({"pass_env": ["HOME"]}),
+                "runner //x:r: parse wrap config: unknown field `pass_env`, expected one of \
+                 `prefix`, `env`, `runtime_pass_env`",
+            ),
+            (
+                serde_json::json!({"prefix": "sh"}),
+                "runner //x:r: parse wrap config: invalid type: string \"sh\", expected a \
+                 sequence",
+            ),
+        ] {
+            let err = run(&cfg("wrap", config), rewrite())
+                .await
+                .expect_err("a bad wrap config must fail");
+            assert_eq!(format!("{err:#}"), want);
+        }
     }
 
     #[tokio::test]
