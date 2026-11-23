@@ -894,7 +894,17 @@ going down) or crashed before it could finish. Everything it committed until
 then is readable. The next session start seals it (see
 [Liveness and sealing](#liveness-and-sealing)): `ended_ms` becomes its last
 record's time and `exit_code` stays `null`, so a lost session never reads as
-a pass.
+a pass. What it was doing when it went, from `records` alone (a lost
+recording's explorer rows stop where it did, and it has no session-wide
+rows): the targets that started and never ended, and how far into the run
+each started:
+
+```sql
+SELECT addr, (min(at_ms) - (SELECT started_ms FROM session)) / 1e3
+       AS started_s_into_run
+FROM records WHERE kind IN ('ResultStart', 'ResultEnd')
+GROUP BY addr HAVING sum(kind = 'ResultStart') > sum(kind = 'ResultEnd');
+```
 
 **My session id is gone.** An ended recording is removed once it is older
 than `session.keep` (7 days), or sooner when all of them together pass

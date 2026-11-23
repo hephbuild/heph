@@ -2379,6 +2379,158 @@ async fn show_reports_skipped_records() {
 
 /// The `.hephconfig` defaults a bad value's warning names are the ones the
 /// cleanup applies.
+/// A lost session sealed by cleanup carries `derivation` 0: no
+/// `heph.session` span and no session-wide rows (re-derivation on open does
+/// not exist yet). `list` and `show`, text and `--json`, still read it with
+/// no error and say `lost`. What comes from the session-wide rows is absent,
+/// not zero: `pools` is `[]` and `show` prints no pool line, although the
+/// recording holds `PoolUsage` records. The documented "Why is my session
+/// `lost`?" recipe runs on the sealed file and names the target that was
+/// still running.
+#[tokio::test]
+async fn a_lost_session_sealed_by_cleanup_still_reads() {
+    use crate::tui::session::cleanup::{self, Retention};
+    use crate::tui::session::store;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().join("sessions");
+    let now_ms = hcore::events::now_unix_ms();
+    let id = SessionId::new(now_ms - 5_000, 1);
+    let at = id.started_unix_ms();
+    let mut records = build_records("//a:done", at, None);
+    records.push(record(
+        at + 20,
+        BuildEventKind::ResultEnd {
+            left_behind: None,
+            cancelled: false,
+            addr: "//a:done".into(),
+            error: None,
+            upstream_of: None,
+            exit_status: None,
+            log_tail: None,
+            timed_out: None,
+        },
+    ));
+    records.push(record(
+        at + 30,
+        BuildEventKind::ResultStart {
+            addr: "//a:running".into(),
+        },
+    ));
+    records.push(record(
+        at + 40,
+        BuildEventKind::PoolUsage {
+            pool: "docker".into(),
+            held: 1,
+            capacity: 4,
+            waiting: 0,
+            removals_pending: 0,
+        },
+    ));
+    let dir = Recording::create(
+        &root.join(id.encode()),
+        &meta(id, 1, &["heph", "run", "//a:..."]),
+        &records,
+        None,
+    )
+    .expect("recording")
+    .abandon();
+    // Past the start grace, so cleanup reads it as lost and seals it.
+    let later = std::time::SystemTime::now() + 2 * cleanup::STARTING;
+    let report = cleanup::cleanup(&root, later, Retention::default()).expect("cleanup");
+    assert_eq!(report.sealed, vec![id], "{report:?}");
+
+    let db = store::open_sealed(&dir.join(store::FILE)).expect("open sealed");
+    let (derivation, sealed, exit_code): (i64, i64, Option<i64>) = db
+        .query_row(
+            "SELECT derivation, sealed, exit_code FROM session",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .expect("session row");
+    assert_eq!((derivation, sealed, exit_code), (0, 1, None));
+    let session_wide: i64 = db
+        .query_row(
+            "SELECT (SELECT count(*) FROM spans WHERE name = 'heph.session')
+                  + (SELECT count(*) FROM metrics WHERE name LIKE 'heph.session.%')",
+            [],
+            |r| r.get(0),
+        )
+        .expect("count");
+    assert_eq!(session_wide, 0, "cleanup seals, it does not derive");
+
+    // The recipe, as documented.
+    let doc =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/SESSIONS.md"))
+            .expect("read docs/SESSIONS.md");
+    let recipe = doc
+        .split("**Why is my session `lost`?**")
+        .nth(1)
+        .and_then(|rest| rest.split("```sql\n").nth(1))
+        .and_then(|rest| rest.split("```").next())
+        .expect("the lost recipe's sql block");
+    let mut stmt = db.prepare(recipe).expect("the recipe compiles");
+    let running: Vec<(String, f64)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .expect("the recipe runs")
+        .collect::<Result<_, _>>()
+        .expect("rows");
+    assert_eq!(running, vec![("//a:running".to_owned(), 0.03)]);
+    drop(stmt);
+    drop(db);
+
+    let opts = || ViewOpts {
+        now_ms: hcore::events::now_unix_ms(),
+        ..opts()
+    };
+    let file = crate::tui::session::FileSource::new(&root);
+    let sources: [&dyn SessionSource; 1] = [&file];
+
+    let mut out = Vec::new();
+    list::list(&sources, opts(), Workspace::All, false, &mut out)
+        .await
+        .expect("list");
+    let table = String::from_utf8(out).expect("utf-8");
+    let row = table
+        .lines()
+        .find(|l| l.contains(&id.encode()))
+        .unwrap_or_else(|| panic!("no row: {table}"));
+    assert!(row.contains("lost"), "{table}");
+
+    let mut out = Vec::new();
+    list::list(&sources, opts(), Workspace::All, true, &mut out)
+        .await
+        .expect("list --json");
+    let json: serde_json::Value = serde_json::from_slice(&out).expect("json");
+    let s = &json["sessions"][0];
+    assert_eq!(s["id"], id.encode(), "{json}");
+    assert_eq!(s["state"], "lost", "{s}");
+    assert_eq!(s["exit_code"], serde_json::Value::Null, "{s}");
+
+    let mut out = Vec::new();
+    show::show(&sources, opts(), &id.encode(), false, &mut out)
+        .await
+        .expect("show");
+    let text = String::from_utf8(out).expect("utf-8");
+    assert!(
+        text.contains("the process went away without recording its end"),
+        "{text}"
+    );
+    assert!(
+        !text.contains(" pool "),
+        "no pool line without the rows: {text}"
+    );
+
+    let mut out = Vec::new();
+    show::show(&sources, opts(), &id.encode(), true, &mut out)
+        .await
+        .expect("show --json");
+    let json: serde_json::Value = serde_json::from_slice(&out).expect("json");
+    assert_eq!(json["state"], "lost", "{json}");
+    assert_eq!(json["pools"], serde_json::json!([]), "{json}");
+    assert_eq!(json["incomplete"], false, "{json}");
+}
+
 #[test]
 fn retention_defaults_agree() {
     use crate::engine::config_yaml::SessionConfig;
