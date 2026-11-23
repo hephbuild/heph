@@ -2951,7 +2951,7 @@ mod tests {
 
         let sources = set.scratch_sources().await;
         let err = sources[0]
-            .read_snapshot("scratch/v1/snap")
+            .read_snapshot_into("scratch/v1/snap", &mut tokio::io::sink())
             .await
             .expect_err("a failed snapshot open is an error");
         assert!(format!("{err:#}").contains("unreachable"), "{err:#}");
