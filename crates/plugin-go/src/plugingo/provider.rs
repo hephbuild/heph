@@ -2341,7 +2341,13 @@ impl ProviderInner {
                     return Err(GetError::NotFound);
                 }
                 let transitive = Arc::clone(&self)
-                    .collect_direct_libs(Arc::clone(&req.executor), &pkg, &[], &vref, &module_root)
+                    .collect_direct_libs(
+                        Arc::clone(&req.executor),
+                        &pkg.imports,
+                        &[],
+                        &vref,
+                        &module_root,
+                    )
                     .await
                     .map_err(GetError::Other)?;
 
@@ -2414,7 +2420,13 @@ impl ProviderInner {
                     return Err(GetError::NotFound);
                 }
                 let transitive = Arc::clone(&self)
-                    .collect_direct_libs(Arc::clone(&req.executor), &pkg, &[], &vref, &module_root)
+                    .collect_direct_libs(
+                        Arc::clone(&req.executor),
+                        &pkg.imports,
+                        &[],
+                        &vref,
+                        &module_root,
+                    )
                     .await
                     .map_err(GetError::Other)?;
 
@@ -2493,7 +2505,7 @@ impl ProviderInner {
                 let mut transitive = Arc::clone(&self)
                     .collect_transitive_libs(
                         Arc::clone(&req.executor),
-                        &pkg,
+                        &pkg.imports,
                         &race_link_imports(&factors),
                         &vref,
                         &module_root,
@@ -2564,12 +2576,11 @@ impl ProviderInner {
                 if !has_tests && !has_go {
                     return Err(GetError::NotFound);
                 }
-                let test_extra: Vec<String> = pkg.test_imports.clone();
                 let transitive = Arc::clone(&self)
                     .collect_direct_libs(
                         Arc::clone(&req.executor),
-                        &pkg,
-                        &test_extra,
+                        &pkg.imports,
+                        &pkg.test_imports,
                         &vref,
                         &module_root,
                     )
@@ -2627,30 +2638,6 @@ impl ProviderInner {
                 if pkg.xtest_go_files.is_empty() {
                     return Err(GetError::NotFound);
                 }
-                let xtest_imports_pkg = GoPackage {
-                    import_path: format!("{}_test", import_path),
-                    dir: pkg.dir.clone(),
-                    name: pkg.name.clone(),
-                    go_files: vec![],
-                    s_files: vec![],
-                    h_files: vec![],
-                    test_go_files: vec![],
-                    xtest_go_files: vec![],
-                    embed_patterns: vec![],
-                    embed_files: vec![],
-                    test_embed_patterns: vec![],
-                    test_embed_files: vec![],
-                    xtest_embed_patterns: vec![],
-                    xtest_embed_files: vec![],
-                    imports: pkg.xtest_imports.clone(),
-                    test_imports: vec![],
-                    xtest_imports: vec![],
-                    standard: false,
-                    module: pkg.module.clone(),
-                    match_: vec![],
-                    incomplete: false,
-                    error: None,
-                };
                 // xtest (`package P_test`) imports P as a normal external import.
                 // Normally xtest_lib's compile uses P=normal build_lib so its
                 // embedded fingerprint matches the xtest bin's link-time view
@@ -2667,7 +2654,7 @@ impl ProviderInner {
                 let transitive = Arc::clone(&self)
                     .collect_direct_libs(
                         Arc::clone(&req.executor),
-                        &xtest_imports_pkg,
+                        &pkg.xtest_imports,
                         &[],
                         &vref,
                         &module_root,
@@ -2728,12 +2715,10 @@ impl ProviderInner {
                 if pkg.test_go_files.is_empty() {
                     return Err(GetError::NotFound);
                 }
-                let testmain_imports = ["os", "reflect", "testing", "testing/internal/testdeps"];
-                let testmain_pkg = make_testmain_pkg(&pkg, &testmain_imports);
                 let mut transitive = Arc::clone(&self)
                     .collect_direct_libs(
                         Arc::clone(&req.executor),
-                        &testmain_pkg,
+                        &TESTMAIN_IMPORTS.map(String::from),
                         &[],
                         &vref,
                         &module_root,
@@ -2763,12 +2748,10 @@ impl ProviderInner {
                 if pkg.xtest_go_files.is_empty() {
                     return Err(GetError::NotFound);
                 }
-                let testmain_imports = ["os", "reflect", "testing", "testing/internal/testdeps"];
-                let testmain_pkg = make_testmain_pkg(&pkg, &testmain_imports);
                 let mut transitive = Arc::clone(&self)
                     .collect_direct_libs(
                         Arc::clone(&req.executor),
-                        &testmain_pkg,
+                        &TESTMAIN_IMPORTS.map(String::from),
                         &[],
                         &vref,
                         &module_root,
@@ -2807,20 +2790,14 @@ impl ProviderInner {
                 let test_extra: Vec<String> = pkg
                     .test_imports
                     .iter()
-                    .chain(
-                        ["os", "reflect", "testing", "testing/internal/testdeps"]
-                            .iter()
-                            .map(|s| (*s).to_string())
-                            .collect::<Vec<_>>()
-                            .iter(),
-                    )
-                    .chain(race_link_imports(&factors).iter())
                     .cloned()
+                    .chain(TESTMAIN_IMPORTS.map(String::from))
+                    .chain(race_link_imports(&factors))
                     .collect();
                 let transitive = Arc::clone(&self)
                     .collect_transitive_libs(
                         Arc::clone(&req.executor),
-                        &pkg,
+                        &pkg.imports,
                         &test_extra,
                         &vref,
                         &module_root,
@@ -2864,51 +2841,21 @@ impl ProviderInner {
                 if pkg.xtest_go_files.is_empty() {
                     return Err(GetError::NotFound);
                 }
-                let xtest_extra: Vec<String> = pkg
+                let xtest_root_imports: Vec<String> = pkg
                     .xtest_imports
                     .iter()
                     .chain(&pkg.imports)
-                    .chain(
-                        ["os", "reflect", "testing", "testing/internal/testdeps"]
-                            .iter()
-                            .map(|s| (*s).to_string())
-                            .collect::<Vec<_>>()
-                            .iter(),
-                    )
-                    .chain(race_link_imports(&factors).iter())
                     .cloned()
+                    .chain(TESTMAIN_IMPORTS.map(String::from))
+                    .chain(race_link_imports(&factors))
                     .collect();
-                // Walk from a synthetic pkg whose imports are xtest_extra; pkg.imports
-                // are already in there, so the transitive closure covers everything
-                // both P (normal) and P_test (xtest_lib) need.
-                let xtest_root = GoPackage {
-                    import_path: format!("{}_test", import_path),
-                    dir: pkg.dir.clone(),
-                    name: pkg.name.clone(),
-                    go_files: vec![],
-                    s_files: vec![],
-                    h_files: vec![],
-                    test_go_files: vec![],
-                    xtest_go_files: vec![],
-                    embed_patterns: vec![],
-                    embed_files: vec![],
-                    test_embed_patterns: vec![],
-                    test_embed_files: vec![],
-                    xtest_embed_patterns: vec![],
-                    xtest_embed_files: vec![],
-                    imports: xtest_extra.clone(),
-                    test_imports: vec![],
-                    xtest_imports: vec![],
-                    standard: false,
-                    module: pkg.module.clone(),
-                    match_: vec![],
-                    incomplete: false,
-                    error: None,
-                };
+                // Walk from the xtest root's imports; pkg.imports are already in
+                // there, so the transitive closure covers everything both P
+                // (normal) and P_test (xtest_lib) need.
                 let transitive = Arc::clone(&self)
                     .collect_transitive_libs(
                         Arc::clone(&req.executor),
-                        &xtest_root,
+                        &xtest_root_imports,
                         &[],
                         &vref,
                         &module_root,
@@ -3599,13 +3546,13 @@ impl ProviderInner {
     /// Build the cache key for `collect_*_libs`. Imports are sorted+deduped so
     /// distinct caller-side orderings of the same logical input set hash to one entry.
     fn libs_key(
-        root_pkg: &GoPackage,
+        root_imports: &[String],
         extra_imports: &[String],
         vref: &VariantRef,
         module_root: &Path,
         transitive: bool,
     ) -> LibsKey {
-        let mut imports: Vec<String> = root_pkg.imports.clone();
+        let mut imports: Vec<String> = root_imports.to_vec();
         imports.sort();
         imports.dedup();
         let mut extra: Vec<String> = extra_imports.to_vec();
@@ -3620,7 +3567,8 @@ impl ProviderInner {
         }
     }
 
-    /// Collect all transitive lib addresses for a package's imports, recursively.
+    /// Collect all transitive lib addresses for a package's imports
+    /// (`root_imports`, plus `extra_imports`), recursively.
     ///
     /// Each BFS frontier is processed concurrently via `try_join_all`. Each dep's
     /// `_golist` target is fetched via `executor.result` (engine pipeline with disk
@@ -3633,45 +3581,60 @@ impl ProviderInner {
     async fn collect_transitive_libs(
         self: Arc<Self>,
         executor: Arc<dyn ProviderExecutor>,
-        root_pkg: &GoPackage,
+        root_imports: &[String],
         extra_imports: &[String],
         vref: &VariantRef,
         module_root: &Path,
     ) -> anyhow::Result<TransitiveDeps> {
-        self.collect_libs(executor, root_pkg, extra_imports, vref, module_root, true)
-            .await
+        self.collect_libs(
+            executor,
+            root_imports,
+            extra_imports,
+            vref,
+            module_root,
+            true,
+        )
+        .await
     }
 
     /// Resolve direct imports only (no recursion) — correct for compile steps.
     async fn collect_direct_libs(
         self: Arc<Self>,
         executor: Arc<dyn ProviderExecutor>,
-        root_pkg: &GoPackage,
+        root_imports: &[String],
         extra_imports: &[String],
         vref: &VariantRef,
         module_root: &Path,
     ) -> anyhow::Result<TransitiveDeps> {
-        self.collect_libs(executor, root_pkg, extra_imports, vref, module_root, false)
-            .await
+        self.collect_libs(
+            executor,
+            root_imports,
+            extra_imports,
+            vref,
+            module_root,
+            false,
+        )
+        .await
     }
 
     async fn collect_libs(
         self: Arc<Self>,
         executor: Arc<dyn ProviderExecutor>,
-        root_pkg: &GoPackage,
+        root_imports: &[String],
         extra_imports: &[String],
         vref: &VariantRef,
         module_root: &Path,
         transitive: bool,
     ) -> anyhow::Result<TransitiveDeps> {
-        let key = Self::libs_key(root_pkg, extra_imports, vref, module_root, transitive);
+        let key = Self::libs_key(root_imports, extra_imports, vref, module_root, transitive);
         let extra = extra_imports.to_vec();
+        let root_imports = root_imports.to_vec();
         let module_root = module_root.to_path_buf();
         let arc = self
             .libs_cache
             .once(
                 key,
-                enclose!((self => me, executor, vref, root_pkg.imports => root_imports) move || async move {
+                enclose!((self => me, executor, vref) move || async move {
                     me.collect_libs_inner(
                         executor,
                         &root_imports,
@@ -4041,35 +4004,9 @@ impl ProviderInner {
     }
 }
 
-/// Build a synthetic `GoPackage` representing the `main` package of a
-/// testmain.go file. Only `imports` is set — used to drive
-/// `collect_direct_libs` resolution.
-fn make_testmain_pkg(pkg: &GoPackage, imports: &[&str]) -> GoPackage {
-    GoPackage {
-        import_path: "main".to_string(),
-        dir: pkg.dir.clone(),
-        name: Some("main".to_string()),
-        go_files: vec![],
-        s_files: vec![],
-        h_files: vec![],
-        test_go_files: vec![],
-        xtest_go_files: vec![],
-        embed_patterns: vec![],
-        embed_files: vec![],
-        test_embed_patterns: vec![],
-        test_embed_files: vec![],
-        xtest_embed_patterns: vec![],
-        xtest_embed_files: vec![],
-        imports: imports.iter().map(|s| (*s).to_string()).collect(),
-        test_imports: vec![],
-        xtest_imports: vec![],
-        standard: false,
-        module: pkg.module.clone(),
-        match_: vec![],
-        incomplete: false,
-        error: None,
-    }
-}
+/// The packages a generated testmain.go imports, besides the package under
+/// test: the roots of a testmain lib's direct libs, and part of a test link's.
+const TESTMAIN_IMPORTS: [&str; 4] = ["os", "reflect", "testing", "testing/internal/testdeps"];
 
 fn build_testmain_spec(
     addr: Addr,
