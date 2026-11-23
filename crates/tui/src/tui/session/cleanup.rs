@@ -617,14 +617,21 @@ mod tests {
         })
         .expect("cleanup");
         assert_eq!(report.removed, vec![old]);
-        let report = cleanup_with(root.path(), now + 8 * DAY, retention, &mut |r| {
+        // The age is measured from the recording's last write, not from
+        // `now`: pin the clock to that write. Its mtime comes from the
+        // kernel's coarse clock (Linux stamps inode times at tick
+        // granularity), which can read behind `SystemTime::now()`, so `now +
+        // 8 days` was sometimes exactly 8 days after the write ("8d00h") and
+        // sometimes a hair under ("7d23h").
+        let (written, _) = last_write_and_size(&root.path().join(new.encode()));
+        let at = written + 8 * DAY - 30 * MIN;
+        let report = cleanup_with(root.path(), at, retention, &mut |r| {
             removals.push(r.clone());
         })
         .expect("cleanup");
         assert_eq!(report.removed, vec![new]);
         let named: Vec<_> = removals.iter().map(|r| (r.id, r.reason)).collect();
         assert_eq!(named, vec![(old, "keep_bytes"), (new, "keep")]);
-        // Written just after `now`, so a hair under 8 days.
         assert_eq!(removals[1].age, "7d23h");
 
         // A private root's removals say so.
