@@ -366,7 +366,7 @@ pub(crate) async fn show(
     arg: &str,
     json: &output::JsonArgs<ShowView<'static>>,
     out: Out<'_>,
-    opener: &Opener<'_>,
+    opener: &Opener,
 ) -> anyhow::Result<()> {
     match open_ref(sources, arg, opts, opener).await? {
         Resolved::Local { index, entry } => {

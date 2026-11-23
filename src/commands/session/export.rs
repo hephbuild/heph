@@ -58,7 +58,7 @@ pub(crate) async fn export_ref(
     args: &ExportArgs,
     read: ReadNotice,
     stdout: &mut dyn Write,
-    opener: &Opener<'_>,
+    opener: &Opener,
 ) -> anyhow::Result<Exported> {
     let sources: [&dyn SessionSource; 1] = [file];
     let rec = match open_ref(&sources, &args.reference, opts, opener).await? {

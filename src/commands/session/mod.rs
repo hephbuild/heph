@@ -344,10 +344,11 @@ fn execute(
     let tmp_dir = crate::tui::session::store::tmp_dir(&root);
     let file = FileSource::new(root);
     let sources: [&dyn SessionSource; 1] = [&file];
-    let download = hfetch::Fetcher::https_capped(crate::tui::session::hephsession::URL_CAP);
     let opener = reference::Opener {
-        tmp_dir: &tmp_dir,
-        download: &download,
+        tmp_dir: tmp_dir.into(),
+        download: Arc::new(hfetch::Fetcher::https_capped(
+            crate::tui::session::hephsession::URL_CAP,
+        )),
     };
     let opts = ViewOpts {
         now_ms: hcore::events::now_unix_ms(),

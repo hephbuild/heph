@@ -51,7 +51,7 @@ pub(crate) async fn attach(
     sink: LogSink,
     session: &Arc<SessionSlot>,
     global: &crate::commands::GlobalOptions,
-    opener: &Opener<'_>,
+    opener: &Opener,
 ) -> anyhow::Result<()> {
     match open_ref(sources, arg, opts, opener).await? {
         Resolved::Local { index, entry } => {

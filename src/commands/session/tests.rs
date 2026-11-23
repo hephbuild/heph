@@ -208,10 +208,10 @@ impl reference::Download for NoDownload {
 
 /// An opener for tests that name sessions by id: nothing is downloaded, and
 /// a path `<ref>` puts its temp files in a directory that does not exist.
-fn no_opener() -> reference::Opener<'static> {
+fn no_opener() -> reference::Opener {
     reference::Opener {
-        tmp_dir: Path::new("/nonexistent/heph-session-tmp"),
-        download: &NoDownload,
+        tmp_dir: Path::new("/nonexistent/heph-session-tmp").into(),
+        download: Arc::new(NoDownload),
     }
 }
 

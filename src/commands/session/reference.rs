@@ -13,6 +13,7 @@
 //! itself, even when it came from this machine.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::Context as _;
 
@@ -84,10 +85,11 @@ impl Download for hfetch::Fetcher {
 }
 
 /// How a foreign `<ref>` is opened: where temp files go, and the download.
-pub(crate) struct Opener<'a> {
+/// Owned, because the opening runs on a blocking thread.
+pub(crate) struct Opener {
     /// Downloads and decompressed copies: the sessions root's `.tmp/`.
-    pub tmp_dir: &'a Path,
-    pub download: &'a dyn Download,
+    pub tmp_dir: Arc<Path>,
+    pub download: Arc<dyn Download>,
 }
 
 /// A resolved `<ref>`.
@@ -105,9 +107,12 @@ pub(crate) async fn open_ref(
     sources: &[&dyn SessionSource],
     arg: &str,
     opts: ViewOpts,
-    opener: &Opener<'_>,
+    opener: &Opener,
 ) -> anyhow::Result<Resolved> {
     let arg = arg.trim();
+    // A download, a 4 GiB decompression and the SQLite checks are blocking
+    // work: on the blocking pool, never on a runtime worker.
+    let tmp_dir = Arc::clone(&opener.tmp_dir);
     match classify(arg)? {
         RefKind::Id(id) => {
             let (index, entry) = resolve(sources, id, opts).await?;
@@ -115,10 +120,14 @@ pub(crate) async fn open_ref(
             Ok(Resolved::Local { index, entry })
         }
         RefKind::Path(path) => {
-            ensure_tmp(opener.tmp_dir)?;
-            Recording::open_foreign(path, opener.tmp_dir)
-                .map(Resolved::Foreign)
-                .map_err(|e| foreign_error(e, &path.display().to_string()))
+            let path = path.to_owned();
+            hcore::blocking::run(move || {
+                ensure_tmp(&tmp_dir)?;
+                Recording::open_foreign(&path, &tmp_dir)
+                    .map(Resolved::Foreign)
+                    .map_err(|e| foreign_error(e, &path.display().to_string()))
+            })
+            .await
         }
         RefKind::Url(url) => {
             let origin = redact_url(url);
@@ -133,16 +142,17 @@ pub(crate) async fn open_ref(
                     ),
                 ));
             }
-            ensure_tmp(opener.tmp_dir)?;
-            let file = opener
-                .download
-                .get_to_temp(url, opener.tmp_dir)
-                .map_err(|e| {
+            let (url, download) = (url.to_owned(), Arc::clone(&opener.download));
+            hcore::blocking::run(move || {
+                ensure_tmp(&tmp_dir)?;
+                let file = download.get_to_temp(&url, &tmp_dir).map_err(|e| {
                     kinded(ErrorKind::Fetch, e.context(format!("downloading {origin}")))
                 })?;
-            Recording::open_download(file, origin.clone(), opener.tmp_dir)
-                .map(Resolved::Foreign)
-                .map_err(|e| foreign_error(e, &origin))
+                Recording::open_download(file, origin.clone(), &tmp_dir)
+                    .map(Resolved::Foreign)
+                    .map_err(|e| foreign_error(e, &origin))
+            })
+            .await
         }
     }
 }
