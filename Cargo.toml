@@ -157,7 +157,6 @@ hxstarlark-fmt = { package = "xstarlark-fmt", path = "crates/xstarlark-fmt" }
 htspec-derive = { path = "crates/htspec-derive" }
 nom = { version = "8", default-features = false, features = ["std"] }
 anyhow = "1.0.104"
-memoize = "0.6.0"
 tokio = { version = "1.54.1", features = ["rt", "rt-multi-thread", "io-util", "io-std", "process", "macros", "sync", "signal", "fs", "test-util", "tracing", "net"] }
 # `frame-pointer` swaps pprof's stack walk from `_Unwind_Backtrace` (not
 # async-signal-safe — it faulted the process it was profiling) to a frame-pointer
@@ -184,7 +183,6 @@ similar = "3"
 shlex = "2"
 tempfile = "3.27"
 thiserror = "2.0.21"
-derivative = "2.2.0"
 enclose = "1"
 which = "8.0.6"
 # Held at the release r2d2_sqlite is built against: a newer rusqlite is a

@@ -35,6 +35,7 @@ const LAYOUTS: &[Layout] = &[
             "handle_drop_reaps.rs",
             "wait_with_output_pipe.rs",
             "process_watcher_stress.rs",
+            "heph_cwd.rs",
         ],
         support: &[],
     },

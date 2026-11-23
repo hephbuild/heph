@@ -1,20 +1,17 @@
 use crate::config_yaml::{CONFIG_FILE_NAME, CONFIG_FILE_NAMES};
 use crate::home_dir::normalize;
 use anyhow::anyhow;
-use memoize::memoize;
 use std::env;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 /// Current working directory heph operates from. Honors `HEPH_CWD` (used by tests
 /// and tooling to point heph at another tree) before falling back to the real
-/// process cwd.
+/// process cwd. Resolved once per process.
 pub fn get_cwd() -> anyhow::Result<PathBuf> {
-    get_cwd_inner().map_err(|e| anyhow!(e))
-}
-
-#[memoize]
-fn get_cwd_inner() -> Result<PathBuf, String> {
-    cwd_from(env::var_os("HEPH_CWD").as_deref())
+    static CWD: LazyLock<Result<PathBuf, String>> =
+        LazyLock::new(|| cwd_from(env::var_os("HEPH_CWD").as_deref()));
+    CWD.clone().map_err(|e| anyhow!(e))
 }
 
 /// The cwd for a `HEPH_CWD` value, made absolute and normalized the same way the
@@ -31,13 +28,13 @@ fn cwd_from(heph_cwd: Option<&std::ffi::OsStr>) -> Result<PathBuf, String> {
 
 /// Walk up from [`get_cwd`] until a workspace config file is found, returning the
 /// directory that holds it (the workspace root). Errors if none is found in any
-/// parent.
+/// parent. Resolved once per process.
 pub fn get_root() -> anyhow::Result<PathBuf> {
-    get_root_inner().map_err(|e| anyhow!(e))
+    static ROOT: LazyLock<Result<PathBuf, String>> = LazyLock::new(find_root);
+    ROOT.clone().map_err(|e| anyhow!(e))
 }
 
-#[memoize]
-fn get_root_inner() -> Result<PathBuf, String> {
+fn find_root() -> Result<PathBuf, String> {
     let cwd = get_cwd().map_err(|e| e.to_string())?;
     let mut current = Path::new(&cwd).to_path_buf();
 

@@ -13,7 +13,6 @@ test-support = []
 [dependencies]
 anyhow = "1.0.104"
 hcore = { package = "core", path = "../core" }
-memoize = "0.6.0"
 # The `.hephconfig` JSON Schema editors validate against: derived from the
 # serde types, except four hand-written impls (`src/schema.rs`); the schema's
 # tests against the parser are what keep the two from drifting.

@@ -4,7 +4,7 @@
 //! `heph`. They are modules of one harness now; select a file with a name
 //! filter: `cargo test --test root ci_gate::`.
 //!
-//! Four files stay separate binaries under `tests/`, because they touch state
+//! Five files stay separate binaries under `tests/`, because they touch state
 //! that belongs to the whole process and libtest runs a binary's tests as
 //! threads of one process:
 //!
@@ -15,7 +15,9 @@
 //!     `process_watcher_stress.rs` exercise the process-wide child watcher
 //!     (reaping, the kqueue/pidfd registrations, a burst of concurrent
 //!     children), and are timing-sensitive regressions for it: any other
-//!     test spawning children in the same process changes what they measure.
+//!     test spawning children in the same process changes what they measure;
+//!   - `heph_cwd.rs` sets `HEPH_CWD`, which the cwd, root and cwd package
+//!     read once per process: its test must be the first to resolve them.
 //!
 //! `test_layout::every_test_file_is_compiled` holds that list, and fails when
 //! a file under an aggregated directory is not declared by its `main.rs`.

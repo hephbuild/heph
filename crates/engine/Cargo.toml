@@ -50,7 +50,6 @@ glob = "0.3"
 # ring rustls provider ourselves (see `ensure_rustls_provider_installed`).
 google-cloud-auth = { version = "1.19", default-features = false }
 indexmap = "2"
-memoize = "0.6.0"
 object_store = { version = "0.14.2", features = ["aws", "gcp", "azure", "http", "tokio"] }
 parking_lot = "0.13"
 quick_cache = "0.7"
@@ -108,7 +107,6 @@ thiserror = "2.0.21"
 libc = "0.2"
 xattr = "1"
 tempfile = "3.27"
-derivative = "2.2.0"
 humantime = "2.4.0"
 
 [dev-dependencies]
