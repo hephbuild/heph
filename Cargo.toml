@@ -205,6 +205,9 @@ tempfile = "3"
 hengine = { package = "engine", path = "crates/engine", features = ["test-support"] }
 # `tui::session::testing` for the session command tests.
 htui = { package = "tui", path = "crates/tui", features = ["test-support"] }
+# Writes a recording in a format heph does not read, for the session tests.
+# The release `tui` links.
+rusqlite = { version = "0.42", features = ["bundled"] }
 
 # Fork with three fixes the TUI depends on:
 # - `cursor::position_to(writer)`: send the `ESC[6n` query to stderr, so a piped

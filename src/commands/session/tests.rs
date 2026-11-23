@@ -2506,6 +2506,13 @@ async fn export_is_self_contained() {
             &home.join("failures").join("k2").join("log.txt"),
         ),
         failed("//a:outside", None, &outside),
+        SessionRecord::session(
+            T0 + 10,
+            SessionRecordKind::End {
+                exit_code: Some(1),
+                panicked: false,
+            },
+        ),
     ];
     write_ended(sessions.path(), &m, &records, &ended(Some(1), T0 + 10));
 
@@ -2591,6 +2598,81 @@ async fn export_is_self_contained() {
     );
     assert!(f.failure_logs("//a:root").expect("logs").is_empty());
     assert_eq!(rec.meta().expect("meta").id, id);
+    drop(rec);
+
+    // The viewers, by path and by URL, with nothing local to read.
+    let empty = FakeSource::default();
+    let sources: [&dyn SessionSource; 1] = [&empty];
+    let by_path = refs::opener_in(ftmp.path(), NoDownload);
+    let full_arg = full.display().to_string();
+    let text = refs::show_with(&sources, &full_arg, false, &by_path)
+        .await
+        .expect("show the export");
+    assert_eq!(
+        text.lines().next(),
+        Some(format!("read from {full_arg}").as_str()),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "approval notice plan of request 1 for //a:gate:\n{NOTICE}\n"
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("log of //a:root (its first {CUT} B left out):\n")),
+        "{text}"
+    );
+    assert!(!text.contains("//a:collateral (its") && !text.contains("log of //a:outside"));
+    assert!(!text.contains("the process went away"), "{text}");
+    let v: serde_json::Value = serde_json::from_str(
+        &refs::show_with(&sources, &full_arg, true, &by_path)
+            .await
+            .expect("show --json"),
+    )
+    .expect("json");
+    let foreign = &v["foreign"];
+    assert_eq!(foreign["origin"], full_arg.as_str(), "{v}");
+    assert!(foreign["partial"].is_null(), "{v}");
+    assert_eq!(
+        foreign["notices"],
+        serde_json::json!([{"addr": "//a:gate", "seq": 1, "name": "plan", "text": NOTICE}]),
+        "{v}"
+    );
+    assert_eq!(foreign["failure_logs"][0]["addr"], "//a:root", "{v}");
+    assert_eq!(foreign["failure_logs"][0]["cut_bytes"], CUT, "{v}");
+    assert_eq!(
+        foreign["failure_logs"].as_array().map(Vec::len),
+        Some(1),
+        "{v}"
+    );
+    assert_eq!(v["next"]["kind"], "none", "{v}");
+    // Without logs, nothing of either.
+    let text = refs::show_with(&sources, &bare.display().to_string(), false, &by_path)
+        .await
+        .expect("show the bare export");
+    assert!(!text.contains(NOTICE) && !text.contains("log of"), "{text}");
+    // The same bytes served over https.
+    const URL: &str = "https://example.invalid/full.hephsession";
+    let by_url = refs::opener_in(
+        ftmp.path(),
+        refs::Serve(std::fs::read(&full).expect("read the export")),
+    );
+    let text = refs::show_with(&sources, URL, false, &by_url)
+        .await
+        .expect("show the download");
+    assert_eq!(
+        text.lines().next(),
+        Some(format!("read from {URL}").as_str()),
+        "{text}"
+    );
+    // attach replays it to its end and mirrors the recorded exit code.
+    let (res, printed) = refs::attach_captured(&sources, &full_arg, &by_path).await;
+    assert_eq!(exit_code(&res.expect_err("exit 1")), Some(1));
+    assert!(
+        printed.starts_with(&format!("heph: replaying {full_arg}\n")),
+        "{printed}"
+    );
 }
 
 /// `-o` as given, `-` for stdout, else `./heph-<id>.hephsession`.
@@ -2806,3 +2888,5 @@ fn retention_defaults_agree() {
         }
     );
 }
+
+mod refs;
