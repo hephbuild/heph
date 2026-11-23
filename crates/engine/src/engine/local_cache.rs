@@ -1075,14 +1075,21 @@ impl Engine {
                 return Err(e).with_context(|| format!("read {name} for {addr} {hashin}"));
             }
         };
-        let mut buf = Vec::with_capacity(sized.size as usize);
-        sized
-            .reader
-            .take(sized.size)
-            .read_to_end(&mut buf)
-            .with_context(|| format!("read manifest bytes for {addr} {hashin}"))?;
-        let manifest = borsh::from_slice::<Manifest>(&buf)
-            .with_context(|| format!("deserialize manifest for {addr} {hashin}"))?;
+        let manifest = match &sized.bytes {
+            // Already in memory (an inline sqlite blob, a mem-tier hit): decode
+            // it where it is rather than draining a copy.
+            Some(bytes) => borsh::from_slice::<Manifest>(bytes),
+            None => {
+                let mut buf = Vec::with_capacity(sized.size as usize);
+                sized
+                    .reader
+                    .take(sized.size)
+                    .read_to_end(&mut buf)
+                    .with_context(|| format!("read manifest bytes for {addr} {hashin}"))?;
+                borsh::from_slice::<Manifest>(&buf)
+            }
+        }
+        .with_context(|| format!("deserialize manifest for {addr} {hashin}"))?;
         Ok(Some(manifest))
     }
 
@@ -2431,6 +2438,63 @@ mod tests {
                 Arc::clone(&engine.local_cache),
             );
             assert_eq!(fields(w), fields(&hit));
+        }
+    }
+
+    /// A manifest decodes the same whether the backend hands back its bytes in
+    /// memory (an inline sqlite blob) or only a stream (above the inline
+    /// threshold).
+    #[test]
+    fn a_manifest_decodes_from_bytes_and_from_a_stream() {
+        use crate::engine::local_cache_sqlite::{DEFAULT_MAX_CONCURRENT_PIPES, LocalCacheSQLite};
+
+        let addr = test_addr();
+        let manifest = Manifest {
+            version: MANIFEST_V2_VERSION.to_string(),
+            target: addr.format(),
+            created_at_nanos: 42,
+            hashin: "H".to_string(),
+            artifacts: vec![ManifestArtifact {
+                hashout: "ho".to_string(),
+                group: "g".to_string(),
+                name: "out_a.tar.zst".to_string(),
+                size: 7,
+                r#type: ManifestArtifactType::Output,
+                content_type: ManifestArtifactContentType::Tar,
+                encoding: ManifestArtifactEncoding::Zstd,
+            }],
+        };
+        let encoded = borsh::to_vec(&manifest).expect("encode");
+
+        for (path, inline_threshold, in_memory) in
+            [("bytes", 1024 * 1024, true), ("stream", 0, false)]
+        {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let cache: Arc<dyn LocalCache> = Arc::new(
+                LocalCacheSQLite::with_pipe_limit(
+                    dir.path().join("cache.db"),
+                    inline_threshold,
+                    DEFAULT_MAX_CONCURRENT_PIPES,
+                )
+                .expect("sqlite"),
+            );
+            let mut w = cache.writer(&addr, "H", MANIFEST_V2).expect("writer");
+            w.write_all(&encoded).expect("write");
+            w.commit().expect("commit");
+            assert_eq!(
+                cache
+                    .reader(&addr, "H", MANIFEST_V2)
+                    .expect("reader")
+                    .bytes
+                    .is_some(),
+                in_memory,
+                "{path}: the fixture must take the intended path"
+            );
+
+            let read = Engine::read_named_manifest(&cache, &addr, "H", MANIFEST_V2)
+                .expect("read")
+                .expect("present");
+            assert_eq!(borsh::to_vec(&read).expect("encode"), encoded, "{path}");
         }
     }
 
