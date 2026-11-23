@@ -159,6 +159,25 @@ impl Shared {
     }
 }
 
+/// Releases the lock when the record loop exits, however it exits (a stop, a
+/// panic), if the owner has already finished the session. A finisher that
+/// timed out left the lock to the thread; a thread that then stops before it
+/// reaches `End` would otherwise keep a long-lived process's session looking
+/// live until that process exits. The session is over either way, and with no
+/// `End` on disk a viewer reads it as lost, which is the truth.
+///
+/// If the owner has not finished yet, the lock stays: `finish` releases it.
+#[derive(Debug)]
+struct ReleaseOnExit(Arc<Shared>);
+
+impl Drop for ReleaseOnExit {
+    fn drop(&mut self) {
+        if self.0.finished.load(Ordering::Acquire) {
+            self.0.release_lock();
+        }
+    }
+}
+
 const FELL_BEHIND: &str = "the session recorder fell more than 500000 records behind";
 
 /// A recording stop latched by a send made inside the log sink's lock, where
@@ -755,6 +774,9 @@ impl Recorder {
             .name("heph-session-recorder".to_owned())
             .spawn(move || {
                 let _dispatch = tracing::dispatcher::set_default(&dispatch);
+                // Declared before the thread state, so it drops after the
+                // write connection and its registration.
+                let _exit = ReleaseOnExit(Arc::clone(&thread_shared));
                 let (conn, rw) = write;
                 let mut thread = RecorderThread {
                     writer: Some(store::Writer::new(conn, session_id)),
@@ -792,7 +814,7 @@ impl Recorder {
     /// here with no `End` on disk — a viewer reads that as a lost session, which
     /// is the truth about its records. If it does not answer in time, the lock
     /// stays held: the thread releases it once its `End` and seal are done (or
-    /// failed), else this process's exit does.
+    /// failed), or when it exits without reaching `End`.
     pub fn finish(&self, exit_code: Option<i32>, panicked: bool, timeout: Duration) {
         let shared = &self.tap.shared;
         // From here every tap drops its sends: nothing may follow `End`.

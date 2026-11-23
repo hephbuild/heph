@@ -703,6 +703,50 @@ fn recorder_blocked_write_does_not_block_app() {
     );
 }
 
+/// A finish that timed out leaves the lock to the recorder thread. If the
+/// thread then stops before it reaches `End` (here: the hung write fails), it
+/// releases the lock as it exits, so a process that lives on after `finish`
+/// does not keep its session looking live. The session reads as lost: no
+/// `End` landed.
+#[test]
+fn a_stop_after_a_timed_out_finish_releases_the_lock() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let rec = recorder_with(
+        dir.path(),
+        Faults {
+            gate: Some(Arc::clone(&gate)),
+            fail_writes: true,
+            ..Faults::default()
+        },
+    );
+    let tap = rec.tap();
+    for ev in events() {
+        tap.event(ev);
+    }
+    rec.recorder
+        .finish(Some(0), false, Duration::from_millis(200));
+    let lock_path = rec.dir().join(files::LOCK);
+    assert!(
+        lockfile::is_held(&lock_path).expect("probe"),
+        "a timed-out finish released the lock under a live writer"
+    );
+    // The hung write now fails: the thread stops without handling `End`.
+    let (lock, cv) = &*gate;
+    *lock.lock().expect("lock") = true;
+    cv.notify_all();
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while lockfile::is_held(&lock_path).expect("probe") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the stopped recorder thread kept the lock while the process lives on"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // `rec` (and so the recorder's shared state) is still alive here.
+    drop(rec);
+}
+
 /// I1: a lost recording left beside a new session is cleanup's to seal, on
 /// its own thread. With that cleanup held up, the new session's records still
 /// commit at once and its `finish` seals it without waiting.
