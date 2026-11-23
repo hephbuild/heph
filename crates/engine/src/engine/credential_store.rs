@@ -227,13 +227,7 @@ impl CredentialStore {
             if pid == std::process::id() as i32 {
                 continue;
             }
-            // SAFETY: `kill` with signal 0 performs the permission check and
-            // returns, sending nothing. It takes a plain `pid_t` and touches no
-            // memory we own. ESRCH means no such process; EPERM means it exists
-            // and belongs to someone else, which still counts as alive.
-            let alive = unsafe { libc::kill(pid, 0) } == 0
-                || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
-            if !alive {
+            if !hproc::pid_alive(pid) {
                 drop(std::fs::remove_dir_all(entry.path()));
             }
         }

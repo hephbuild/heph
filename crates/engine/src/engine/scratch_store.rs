@@ -195,15 +195,7 @@ pub(crate) fn sweep_dead_audit_dirs(root: &Path) -> (usize, u64) {
         let Ok(pid) = name.split('-').next().unwrap_or_default().parse::<i32>() else {
             continue;
         };
-        // SAFETY: `kill` with signal 0 performs the permission check and
-        // returns, sending nothing. It takes a plain `pid_t` and touches no
-        // memory we own, so there is no pointer or lifetime obligation.
-        //
-        // ESRCH means no such process; EPERM means it exists and belongs to
-        // someone else, which still counts as alive.
-        let alive = unsafe { libc::kill(pid, 0) } == 0
-            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
-        if alive {
+        if hproc::pid_alive(pid) {
             continue;
         }
         let (bytes, _) = measure(&entry.path());
