@@ -83,19 +83,34 @@ pub fn join_rel_checked(pkg: &str, rel: &str) -> anyhow::Result<String> {
     if is_normal(&joined) {
         return Ok(joined);
     }
+    Ok(finish(&collapse(&joined)?, &joined))
+}
+
+/// Lexically normalize a workspace-relative, forward-slash `path`: empty and
+/// `.` segments are dropped and `..` segments are resolved against earlier
+/// components. Unlike [`join_rel_checked`], a trailing slash is **not** kept.
+/// Errors when a `..` would escape the workspace root.
+pub fn collapse_rel(path: &str) -> anyhow::Result<String> {
+    Ok(collapse(path)?.join("/"))
+}
+
+/// The segments of `path` with empty and `.` segments dropped and each `..`
+/// popping the segment before it. The one definition of "workspace-relative,
+/// never escapes": a `..` with nothing left to pop is an error.
+fn collapse(path: &str) -> anyhow::Result<Vec<&str>> {
     let mut out: Vec<&str> = Vec::new();
-    for c in joined.split('/') {
+    for c in path.split('/') {
         match c {
             "" | "." => {}
             ".." => {
                 if out.pop().is_none() {
-                    anyhow::bail!("path '{joined}' escapes workspace root");
+                    anyhow::bail!("path '{path}' escapes workspace root");
                 }
             }
             other => out.push(other),
         }
     }
-    Ok(finish(&out, &joined))
+    Ok(out)
 }
 
 /// Like [`join_rel_checked`], but for building a [`PkgBuf`] rather than a
@@ -359,6 +374,57 @@ mod tests {
             ] {
                 assert_eq!(got.to_string(), *want, "({pkg:?}, {rel:?})");
             }
+        }
+    }
+
+    /// Pins `collapse_rel`, the fs driver's pattern normalization: its output
+    /// feeds that driver's def hash, so each spelling here must stay
+    /// byte-identical. Unlike the joins, a trailing slash is dropped.
+    #[test]
+    fn collapse_rel_pin() {
+        let cases: &[(&str, &str)] = &[
+            ("", ""),
+            ("a", "a"),
+            ("a/b", "a/b"),
+            ("a/", "a"),
+            ("/a", "a"),
+            ("a//b", "a/b"),
+            ("./a", "a"),
+            ("a/./b", "a/b"),
+            ("a/b/../c", "a/c"),
+            ("a/..", ""),
+            (".", ""),
+            ("/", ""),
+            ("a/**/*.go", "a/**/*.go"),
+            ("a/./**/../*.go", "a/*.go"),
+            ("a/..b/.c", "a/..b/.c"),
+            ("é/ü/", "é/ü"),
+        ];
+        for (path, want) in cases {
+            assert_eq!(collapse_rel(path).unwrap(), *want, "collapse_rel({path:?})");
+        }
+    }
+
+    #[test]
+    fn collapse_rel_errors_on_escape() {
+        let escapes: &[(&str, &str)] = &[
+            ("..", "path '..' escapes workspace root"),
+            ("../", "path '../' escapes workspace root"),
+            ("../a", "path '../a' escapes workspace root"),
+            ("a/../..", "path 'a/../..' escapes workspace root"),
+            (
+                "some/../../file",
+                "path 'some/../../file' escapes workspace root",
+            ),
+            ("/..", "path '/..' escapes workspace root"),
+            ("./..", "path './..' escapes workspace root"),
+        ];
+        for (path, want) in escapes {
+            assert_eq!(
+                collapse_rel(path).unwrap_err().to_string(),
+                *want,
+                "collapse_rel({path:?})"
+            );
         }
     }
 

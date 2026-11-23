@@ -5,7 +5,7 @@ use hcore::hasync::Cancellable;
 use hcore::htvalue::Value;
 use hcore::htvalue::signature::{FnSignature, Param, ParamType};
 use hmodel::htaddr::Addr;
-use hmodel::htpkg::PkgBuf;
+use hmodel::htpkg::{PkgBuf, collapse_rel};
 use hplugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
     ParseResponse, RunRequest, RunResponse,
@@ -798,32 +798,6 @@ fn literal_prefix(pattern: &str) -> (std::borrow::Cow<'_, str>, usize) {
     (std::borrow::Cow::Owned(unescaped), end)
 }
 
-/// Collapses `.`, empty, and `..` components in a forward-slash path.
-///
-/// `wax` accepts patterns like `a/./b` or `a/b/../c` at parse time but its
-/// walker matches them against on-disk paths that never contain literal `.` or
-/// `..` segments, so the pattern matches nothing. Normalizing before compile +
-/// hash keeps semantically equivalent patterns behaving identically and stable
-/// in the cache.
-///
-/// Fails if `..` would pop past the root — the fs root is the heph workspace
-/// root and targets must not escape it.
-fn normalize_path(path: &str) -> anyhow::Result<String> {
-    let mut out: Vec<&str> = Vec::new();
-    for c in path.split('/') {
-        match c {
-            "" | "." => {}
-            ".." => {
-                if out.pop().is_none() {
-                    anyhow::bail!("path '{}' escapes workspace root", path);
-                }
-            }
-            other => out.push(other),
-        }
-    }
-    Ok(out.join("/"))
-}
-
 struct CompiledGlob {
     /// The whole normalized pattern. Read only for the one match the split
     /// below cannot answer on its own — see [`pattern_matches`].
@@ -1479,14 +1453,20 @@ impl hplugin::driver::Driver for Driver {
     ) -> anyhow::Result<ParseResponse> {
         let spec = FsSpec::from(&req.target_spec.config).context("parse fs config")?;
 
+        // `wax` accepts patterns like `a/./b` or `a/b/../c` at parse time, but
+        // its walker matches them against on-disk paths that never contain a
+        // literal `.` or `..` segment, so such a pattern matches nothing.
+        // Normalizing before compile + hash keeps equivalent spellings behaving
+        // identically and stable in the cache. The fs root is the workspace
+        // root, so a `..` that pops past it is an error.
         let file_path = spec
             .f
-            .map(|p| normalize_path(&p))
+            .map(|p| collapse_rel(&p))
             .transpose()
             .context("normalizing fs file path")?;
         let glob_pattern = spec
             .p
-            .map(|p| normalize_path(&p))
+            .map(|p| collapse_rel(&p))
             .transpose()
             .context("normalizing fs glob pattern")?;
         let exclude_raw = spec.e.unwrap_or_default();
