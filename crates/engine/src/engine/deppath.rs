@@ -84,10 +84,7 @@ impl Engine {
 
         // Cap in-flight def resolutions; the engine's own semaphores gate the
         // real work, this just bounds the level's orchestration set.
-        let concurrency = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .saturating_mul(2);
+        let concurrency = crate::engine::fanout::discovery_concurrency();
 
         // `parents[dep] = node` — the node that first reached `dep`, i.e. the
         // predecessor on a shortest chain from `from`. Its keys, plus `from`,
