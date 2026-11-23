@@ -262,9 +262,7 @@ impl ResourcePool {
         request: &Demand,
         implicit: &[(PoolName, u64)],
     ) -> Result<Acquire, AcquireError> {
-        let (mut need, clamped) = self.resolve(request, implicit)?;
-        // One spelling per shape: `resolve` lists pools in declaration order.
-        need.sort_unstable_by_key(|&(idx, _)| idx);
+        let (need, clamped) = self.resolve(request, implicit)?;
         if self.main.frees_bounded(&need) {
             return Ok(self.main.enqueue(need, clamped));
         }
@@ -300,8 +298,8 @@ impl ResourcePool {
     }
 
     /// The request plus `implicit` as `(pool index, granted amount)` in the
-    /// main lane, empty when it reserves nothing anywhere; and whether any
-    /// amount was clamped.
+    /// main lane, sorted by pool index (one spelling per shape), empty when
+    /// it reserves nothing anywhere; and whether any amount was clamped.
     fn resolve(
         &self,
         request: &Demand,
@@ -314,41 +312,46 @@ impl ResourcePool {
                 .saturating_add(1)
                 .saturating_add(implicit.len()),
         );
-        let mut clamped = false;
-        // One entry per pool: `fits` checks each entry on its own, so a pool
-        // listed twice could be granted past its capacity. So every pool's
-        // entry is its whole amount: the declaration (for an undeclared
-        // `cpu`, the default one CPU) plus every implicit entry naming it.
-        let implicit_of = |pool: &str| {
-            implicit
-                .iter()
-                .filter(|(p, _)| p.as_str() == pool)
-                .fold(0u64, |acc, (_, n)| acc.saturating_add(*n))
-        };
+        // Each entry is checked in this order, so the first error names the
+        // first pool that fails: the declaration, the undeclared `cpu`'s
+        // default one CPU, then `implicit`.
         for (pool, amount) in request.iter() {
-            let amount = amount.saturating_add(implicit_of(pool.as_str()));
-            lane.grant(lane.index(pool.as_str()), amount, &mut need, &mut clamped)
+            let idx = lane
+                .check(lane.index(pool.as_str()))
                 .map_err(|e| e.naming(pool.clone()))?;
+            need.push((idx, amount));
         }
         if request.declared(PoolName::CPU).is_none() {
-            let amount = Resources::DEFAULT_CPU_MICROS.saturating_add(implicit_of(PoolName::CPU));
-            lane.grant(lane.cpu_idx, amount, &mut need, &mut clamped)
+            let idx = lane
+                .check(lane.cpu_idx)
                 .map_err(|e| e.naming(PoolName::cpu()))?;
+            need.push((idx, Resources::DEFAULT_CPU_MICROS));
         }
-        for (i, (pool, _)) in implicit.iter().enumerate() {
-            // Already granted: declared (`cpu` always is, by default), or an
-            // earlier entry of `implicit` named it and took them all.
-            let earlier = implicit.iter().take(i).any(|(p, _)| p == pool);
-            if earlier
-                || pool.as_str() == PoolName::CPU
-                || request.declared(pool.as_str()).is_some()
-            {
-                continue;
-            }
-            let amount = implicit_of(pool.as_str());
-            lane.grant(lane.index(pool.as_str()), amount, &mut need, &mut clamped)
+        for (pool, amount) in implicit {
+            let idx = lane
+                .check(lane.index(pool.as_str()))
                 .map_err(|e| e.naming(pool.clone()))?;
+            need.push((idx, *amount));
         }
+        // One entry per pool: `fits` checks each entry on its own, so a pool
+        // listed twice could be granted past its capacity. So every pool's
+        // entry is its whole amount, then clamped; a zero amount adds
+        // nothing.
+        need.sort_unstable();
+        need.dedup_by(|next, kept| {
+            let same = next.0 == kept.0;
+            if same {
+                kept.1 = kept.1.saturating_add(next.1);
+            }
+            same
+        });
+        let mut clamped = false;
+        need.retain_mut(|(idx, amount)| {
+            let granted = lane.clamp(*idx, *amount);
+            clamped |= granted < *amount;
+            *amount = granted;
+            granted != 0
+        });
         Ok((need, clamped))
     }
 }
@@ -958,26 +961,22 @@ impl Lane {
         self.names.binary_search_by(|p| p.as_str().cmp(pool)).ok()
     }
 
-    /// Adds `amount` of pool `idx` to `need`, clamped to a bounded capacity
-    /// (setting `clamped`); a zero amount is checked but adds nothing.
-    fn grant(
-        &self,
-        idx: Option<usize>,
-        amount: u64,
-        need: &mut Vec<(usize, u64)>,
-        clamped: &mut bool,
-    ) -> Result<(), GrantError> {
+    /// Pool `idx`, if it can grant anything: it is a pool and its capacity
+    /// is not 0.
+    fn check(&self, idx: Option<usize>) -> Result<usize, GrantError> {
         let idx = idx.ok_or(GrantError::Unknown)?;
-        let granted = match self.capacity.get(idx).copied() {
-            Some(Limit::Unbounded) => amount,
-            Some(Limit::Bounded(0)) | None => return Err(GrantError::ZeroCapacity),
-            Some(Limit::Bounded(capacity)) => amount.min(capacity),
-        };
-        if amount != 0 {
-            *clamped |= granted < amount;
-            need.push((idx, granted));
+        match self.capacity.get(idx) {
+            Some(Limit::Bounded(0)) | None => Err(GrantError::ZeroCapacity),
+            Some(_) => Ok(idx),
         }
-        Ok(())
+    }
+
+    /// `amount` of pool `idx`, clamped to its capacity when bounded.
+    fn clamp(&self, idx: usize, amount: u64) -> u64 {
+        match self.capacity.get(idx) {
+            Some(&Limit::Bounded(capacity)) => amount.min(capacity),
+            _ => amount,
+        }
     }
 
     /// A fresh grant of `granted`: whole (no `origin`) and armed, so its drop
@@ -2742,6 +2741,80 @@ mod tests {
         );
     }
 
+    /// All three at once: `implicit` names a declared pool, `cpu` beside the
+    /// undeclared default, and an undeclared pool twice. Each pool's sum is
+    /// one entry, clamped as a whole; the first pool that fails, in the order
+    /// declaration, default `cpu`, `implicit`, is the one the error names.
+    #[test]
+    fn implicit_naming_declared_cpu_and_a_duplicate_coalesces() {
+        let p = pool(&[("cpu", 4 * CPU), ("gpu", 4), ("sandbox", 4)]);
+        let implicit = |pairs: &[(&str, u64)]| -> Vec<(PoolName, u64)> {
+            pairs.iter().map(|&(n, a)| (name(n), a)).collect()
+        };
+        let mut both = p
+            .acquire_with(
+                &req(&[("gpu", 1)]),
+                &implicit(&[("sandbox", 1), ("gpu", 2), ("cpu", CPU), ("sandbox", 2)]),
+            )
+            .unwrap();
+        let both = granted(&mut both).expect("granted at once");
+        assert!(!both.clamped());
+        assert_eq!(
+            both.iter().collect::<Vec<_>>(),
+            [
+                (&name("cpu"), 2 * CPU),
+                (&name("gpu"), 3),
+                (&name("sandbox"), 3)
+            ],
+            "one entry per pool, in pool order"
+        );
+        drop(both);
+
+        let mut over = p
+            .acquire_with(
+                &req(&[("gpu", 3)]),
+                &implicit(&[("sandbox", 3), ("gpu", 3), ("sandbox", 3)]),
+            )
+            .unwrap();
+        let over = granted(&mut over).expect("clamped, so it fits");
+        assert!(over.clamped(), "each sum is clamped, not each entry");
+        assert_eq!(
+            over.iter().collect::<Vec<_>>(),
+            [
+                (&name("cpu"), CPU),
+                (&name("gpu"), 4),
+                (&name("sandbox"), 4)
+            ]
+        );
+        drop(over);
+
+        let err = p
+            .acquire_with(
+                &req(&[("docker", 1)]),
+                &implicit(&[("gpu", 1), ("tpu", 1), ("docker", 1)]),
+            )
+            .unwrap_err();
+        assert_eq!(
+            err,
+            AcquireError::UnknownPool {
+                pool: name("docker")
+            },
+            "the declaration is checked first"
+        );
+        let err = p
+            .acquire_with(&req(&[("gpu", 1)]), &implicit(&[("tpu", 1), ("docker", 1)]))
+            .unwrap_err();
+        assert_eq!(
+            err,
+            AcquireError::UnknownPool { pool: name("tpu") },
+            "then `implicit`, in order"
+        );
+        assert_eq!(
+            (free(&p, "cpu"), free(&p, "gpu"), free(&p, "sandbox")),
+            (4 * CPU, 4, 4)
+        );
+    }
+
     // ---- Step 3: a waiter that fits passes the head -----------------------
 
     #[test]
@@ -4037,8 +4110,8 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(|(s, shape)| {
-                    let (mut need, _) = pool.resolve(shape, implicit(s >= managed_from)).unwrap();
-                    need.sort_unstable();
+                    let (need, _) = pool.resolve(shape, implicit(s >= managed_from)).unwrap();
+                    assert!(need.is_sorted_by_key(|&(i, _)| i), "resolve sorts by pool");
                     need
                 })
                 .collect();
