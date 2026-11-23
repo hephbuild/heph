@@ -288,21 +288,37 @@ pub fn bytes_hashout(bytes: &[u8], x: bool) -> String {
     h.finish(x)
 }
 
-/// The one content hash [`file_hashout`], [`bytes_hashout`] and
-/// [`CachedWalker::file_hash`] share, so they cannot drift: the content
-/// streamed in, then the exec marker folded in after it.
-struct ContentHasher(Xxh3);
+/// The one content hash [`file_hashout`], [`bytes_hashout`],
+/// [`CachedWalker::file_hash`] and the engine's passthrough verification
+/// share, so they cannot drift: the content streamed in, then the exec marker
+/// folded in after it. It feeds cache keys, so its bytes never change.
+pub struct ContentHasher(Xxh3);
+
+impl std::fmt::Debug for ContentHasher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ContentHasher").finish_non_exhaustive()
+    }
+}
+
+impl Default for ContentHasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl ContentHasher {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self(Xxh3::new())
     }
 
-    fn update(&mut self, bytes: &[u8]) {
+    /// Stream the next `bytes` of the content in.
+    pub fn update(&mut self, bytes: &[u8]) {
         self.0.update(bytes);
     }
 
-    fn finish(mut self, x: bool) -> String {
+    /// The hashout of the content streamed in, for a file whose exec bit is
+    /// `x`.
+    pub fn finish(mut self, x: bool) -> String {
         self.0.update(&[x as u8]);
         format!("{:x}", self.0.digest())
     }
@@ -1351,6 +1367,24 @@ mod tests {
         std::fs::write(&f, &body).unwrap();
         assert_eq!(file_hashout(&f, false).unwrap(), "c25fbb19f343cf66");
         assert_eq!(file_hashout(&f, true).unwrap(), "82a2c1fe43996d65");
+    }
+
+    /// The content hash feeds cache keys and every recorded hashout, so its
+    /// bytes are pinned: xxh3-64 over the content then one exec-bit byte, in
+    /// lowercase hex without padding, however the content is chunked.
+    #[test]
+    fn content_hasher_bytes_are_pinned() {
+        for (x, want) in [(false, "3a944c9bd3adc9bc"), (true, "755faaf580db378f")] {
+            let mut h = ContentHasher::new();
+            h.update(b"hel");
+            h.update(b"");
+            h.update(b"lo\n");
+            let got = h.finish(x);
+            let mut oneshot = b"hello\n".to_vec();
+            oneshot.push(u8::from(x));
+            assert_eq!(got, format!("{:x}", xxhash_rust::xxh3::xxh3_64(&oneshot)));
+            assert_eq!(got, want, "x={x}");
+        }
     }
 
     /// Opening a walker opens no database, and a walker that never walked

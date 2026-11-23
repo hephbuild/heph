@@ -36,8 +36,8 @@ pub mod codegen_index;
 pub mod gitignore_section;
 pub mod migrate_lock;
 pub use cached_walker::{
-    CachedWalker, DirEntry, DirListing, EntryKind, FileHash, bytes_hashout, file_hashout,
-    fs_entry_hashout,
+    CachedWalker, ContentHasher, DirEntry, DirListing, EntryKind, FileHash, bytes_hashout,
+    file_hashout, fs_entry_hashout,
 };
 
 /// Directory + glob ignore rules for a filesystem walk. See the module docs.

@@ -827,12 +827,11 @@ impl PassthroughContent {
         Ok((
             VerifyingReader {
                 inner: Box::new(file),
-                hasher: xxhash_rust::xxh3::Xxh3::new(),
+                hasher: Some(hwalk::ContentHasher::new()),
                 x: self.x,
                 expected: self.expected.clone(),
                 source_path: self.source_path.clone(),
                 out_path: self.out_path.clone(),
-                verified: false,
             },
             size,
         ))
@@ -879,10 +878,8 @@ impl Content for PassthroughContent {
 
 /// A `Read` adapter that hashes the bytes it passes through and, at EOF, verifies
 /// the digest matches the expected hashout — failing the read (and so the
-/// consuming target) otherwise. The content digest is identical to
-/// [`hwalk::file_hashout`]: xxh3 over the content followed by a single exec-bit
-/// marker byte. `passthrough_reader_matches_file_hashout` pins the two together
-/// so they cannot silently drift.
+/// consuming target) otherwise. The content digest is [`hwalk::file_hashout`]'s
+/// by construction: both are an [`hwalk::ContentHasher`].
 ///
 /// The recorded hashout takes one of two forms, and both are accepted: the
 /// content hash bound to the artifact's `out_path` by [`hwalk::fs_entry_hashout`]
@@ -896,13 +893,13 @@ impl Content for PassthroughContent {
 /// that needs none.
 struct VerifyingReader {
     inner: Box<dyn std::io::Read>,
-    hasher: xxhash_rust::xxh3::Xxh3,
+    /// The content hashed so far; taken at EOF, so the check runs once.
+    hasher: Option<hwalk::ContentHasher>,
     x: bool,
     expected: String,
     source_path: String,
     /// The artifact's `out_path`, for the path-bound (`fs` source file) form.
     out_path: String,
-    verified: bool,
 }
 
 impl std::io::Read for VerifyingReader {
@@ -912,10 +909,8 @@ impl std::io::Read for VerifyingReader {
             // EOF: finalize and verify exactly once. A reader read to completion
             // (the materialization copy always is) triggers this; a partial read
             // that is dropped early simply does not verify.
-            if !self.verified {
-                self.verified = true;
-                self.hasher.update(&[self.x as u8]);
-                let got = format!("{:x}", self.hasher.digest());
+            if let Some(hasher) = self.hasher.take() {
+                let got = hasher.finish(self.x);
                 if got != self.expected
                     && hwalk::fs_entry_hashout(&self.out_path, &got) != self.expected
                 {
@@ -932,8 +927,8 @@ impl std::io::Read for VerifyingReader {
             }
             return Ok(0);
         }
-        if let Some(chunk) = buf.get(..n) {
-            self.hasher.update(chunk);
+        if let (Some(hasher), Some(chunk)) = (&mut self.hasher, buf.get(..n)) {
+            hasher.update(chunk);
         }
         Ok(n)
     }
@@ -6687,11 +6682,10 @@ mod tests {
         assert!(err.to_string().contains("modified after it was hashed"));
     }
 
-    /// The verifying reader must compute byte-for-byte the same digest as
-    /// [`hwalk::file_hashout`] — they are two implementations of one hash and
-    /// would silently break passthrough verification if they drifted. Reading an
-    /// unmodified file through the reader (with the canonical hash as `expected`)
-    /// succeeds; with any other `expected` it fails.
+    /// The verifying reader computes byte-for-byte the same digest as
+    /// [`hwalk::file_hashout`], streamed over the reader's own chunks. Reading
+    /// an unmodified file through the reader (with the canonical hash as
+    /// `expected`) succeeds; with any other `expected` it fails.
     #[tokio::test]
     async fn passthrough_reader_matches_file_hashout() {
         let dir = tempdir().expect("tempdir");
