@@ -231,6 +231,63 @@ fn ensure_supervisor_for(program: &std::path::Path) -> io::Result<()> {
     })
 }
 
+/// The command `spec` describes, ready to spawn, and whether the child will
+/// lead its own process group (`spec.setsid`). The process supervisor is
+/// started before this returns (see [`ensure_supervisor_for`]), so the
+/// caller only has to spawn it.
+///
+/// Both platforms spawn from this one builder, so the child gets the same
+/// argv, environment, cwd, descriptors and fork-time setup on each.
+fn build_command(spec: Spec) -> io::Result<(std::process::Command, bool)> {
+    use std::os::unix::process::CommandExt as _;
+
+    let Spec {
+        program,
+        args,
+        env,
+        cwd,
+        stdin,
+        stdout,
+        stderr,
+        setsid,
+        ctty,
+    } = spec;
+    let mut cmd = std::process::Command::new(&program);
+    cmd.args(&args)
+        .env_clear()
+        .envs(env.iter().map(|(k, v)| (k, v)))
+        .current_dir(&cwd)
+        .stdin(stdin.into_stdio())
+        .stdout(stdout.into_stdio())
+        .stderr(stderr.into_stdio());
+
+    if setsid || ctty {
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "pre_exec + setsid + ioctl must share one unsafe context"
+        )]
+        // SAFETY: pre_exec runs between fork and exec; only async-signal-safe
+        // syscalls (setsid, ioctl) are invoked.
+        unsafe {
+            cmd.pre_exec(move || {
+                if setsid && libc::setsid() < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if ctty && libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
+    // The supervisor must be up before the child exists, or a hard kill of heph
+    // in between would leave it unreaped (it starts lazily; see
+    // `process_supervisor::init`).
+    ensure_supervisor_for(&program)?;
+    Ok((cmd, setsid))
+}
+
 pub use imp::{Handle, OutputReader, StdinPump};
 
 impl Handle {

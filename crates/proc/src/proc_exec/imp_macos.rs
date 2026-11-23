@@ -15,8 +15,7 @@ use crate::process_watcher;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError};
 use hcore::hasync::Cancellable;
 use std::io::{self, Write as _};
-use std::os::unix::process::CommandExt as _;
-use std::process::{Child, ChildStdin, Command, ExitStatus, Output};
+use std::process::{Child, ChildStdin, ExitStatus, Output};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -607,50 +606,7 @@ pub(super) fn spawn(spec: Spec) -> io::Result<Handle> {
 }
 
 fn spawn_with(spec: Spec, capacity: DrainCapacity) -> io::Result<Handle> {
-    let Spec {
-        program,
-        args,
-        env,
-        cwd,
-        stdin,
-        stdout,
-        stderr,
-        setsid,
-        ctty,
-    } = spec;
-    let mut cmd = Command::new(&program);
-    cmd.args(&args)
-        .env_clear()
-        .envs(env.iter().map(|(k, v)| (k, v)))
-        .current_dir(&cwd)
-        .stdin(stdin.into_stdio())
-        .stdout(stdout.into_stdio())
-        .stderr(stderr.into_stdio());
-
-    if setsid || ctty {
-        #[expect(
-            clippy::multiple_unsafe_ops_per_block,
-            reason = "pre_exec + setsid + ioctl must share one unsafe context"
-        )]
-        // SAFETY: pre_exec runs between fork and exec; only async-signal-safe
-        // syscalls (setsid, ioctl) are invoked.
-        unsafe {
-            cmd.pre_exec(move || {
-                if setsid && libc::setsid() < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                if ctty && libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-    }
-
-    // The supervisor must be up before the child exists, or a hard kill of heph
-    // in between would leave it unreaped (it starts lazily; see
-    // `process_supervisor::init`).
-    super::ensure_supervisor_for(&program)?;
+    let (mut cmd, own_group) = super::build_command(spec)?;
     // A `pre_exec` closure makes this a `fork`: see `fork_safety`.
     crate::fork_safety::prime();
     let mut child = cmd.spawn()?;
@@ -689,7 +645,7 @@ fn spawn_with(spec: Spec, capacity: DrainCapacity) -> io::Result<Handle> {
 
     Ok(Handle {
         pid,
-        own_group: setsid,
+        own_group,
         child: Some(child),
         stdin: stdin_pump,
         output,
