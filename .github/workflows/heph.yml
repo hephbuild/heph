@@ -1221,12 +1221,17 @@ jobs:
           cache-suffix: "-test"
           r2-secret: ${{ secrets.CF_SSCACHE }}
 
+      # HEPH_SESSION_EXPORT_DIR: every `heph` this step spawns (the root
+      # crate's CLI tests run the real binary) writes `<id>.hephsession` there
+      # when its session seals; uploaded below. Never reaches a target
+      # (docs/SESSIONS.md, "In CI"), and the bin-e2e harness strips it.
       - name: Test
         id: test
         shell: devenv shell bash -- -e {0}
         env:
           RUST_BACKTRACE: "1"
           TST_SCOPE: "--workspace --exclude bin-e2e --exclude plugingo-e2e"
+          HEPH_SESSION_EXPORT_DIR: ${{ runner.temp }}/heph-sessions
         run: tst
 
       # The rest of `plugingo-e2e` checks heph's own Go logic (go list parsing,
@@ -1261,6 +1266,18 @@ jobs:
             echo "| tests | $(mark "$TESTS") |"
             echo "| Go smoke tests | $(mark "$SMOKE") |"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # The Test step's session recordings, for `heph session show|attach
+      # <file>` after `gh run download`. Named `sessions-*`, never `heph*`:
+      # `bin_e2e` and the release download `heph*_<os>_<arch>*` by pattern.
+      - name: Upload session recordings
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sessions-${{ github.job }}-${{ matrix.os }}-${{ matrix.arch }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/heph-sessions
+          if-no-files-found: ignore
+          retention-days: 7
 
       # Also the upload barrier, which is why it is `always()` and why every
       # compiling job needs one. The daemon uploads to R2 in the background so

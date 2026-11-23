@@ -7,9 +7,10 @@ attaches the same TUI to it. Nothing has to be decided before the run starts.
 
 ```
 heph session list [--all] [--json]
-heph session show <id> [--json]
-heph session attach <id>
+heph session show <ref> [--json]
+heph session attach <ref>
 heph session inflight <id> [--json]
+heph session export <ref> [-o PATH|-] [--no-logs]
 ```
 
 The line backend announces the session on stderr when it starts, never on
@@ -24,19 +25,22 @@ or suffix of an id; an ambiguous one lists the candidates. Give the suffix
 (the last 4–5 characters, `heph session attach 02kf5`) or the pid: an id
 is 42 bits of start time over 8 random bits, so its leading characters are
 the time, and two runs started within about 2 minutes share a 5-character
-prefix.
+prefix. `show`, `attach` and `export` also take a `.hephsession` file, by
+path or `https://` URL (see [Opening a recording: `<ref>`](#opening-a-recording-ref)).
 
 ## Commands and exit codes
 
 | Command | Does | Exit |
 | --- | --- | --- |
 | `list` | One row per session of this workspace (`--all`: every workspace; outside a workspace, every one, with a note on stderr), live first: ID, WORKTREE, COMMAND, STATE, EXIT, PROGRESS, NOW. Reads each recording's `session` and `status` rows only, never `records`. | 0 |
-| `show <id>` | The TUI's frame printed once as text, then a "Stuck on" block: lock waits naming the session that holds the lock (followed to the root of the chain, falling back to the pid), admission waits, targets running over 30s, and one `Next:` line. An ended session adds one line per bounded resource pool (see [Pools](#pools)). | 0 |
-| `attach <id>` | The interactive TUI on the session, following it until it ends; `q` or Ctrl-C detaches and never cancels it. Without a terminal it follows in line form. | the session's exit code; 0 on detach |
-| `inflight <id>` | The session's in-flight report (what the `SIGQUIT` dump carries), asked for through the session directory; waits 5s. | 0 |
+| `show <ref>` | The TUI's frame printed once as text, then a "Stuck on" block: lock waits naming the session that holds the lock (followed to the root of the chain, falling back to the pid), admission waits, targets running over 30s, and one `Next:` line. An ended session adds one line per bounded resource pool (see [Pools](#pools)). | 0 |
+| `attach <ref>` | The interactive TUI on the session, following it until it ends; `q` or Ctrl-C detaches and never cancels it. Without a terminal it follows in line form. | the session's exit code; 0 on detach |
+| `inflight <id>` | The session's in-flight report (what the `SIGQUIT` dump carries), asked for through the session directory; waits 5s. Local sessions only. | 0 |
+| `export <ref>` | Writes the recording as one self-contained `.hephsession` file and prints its path (see [Export](#export-hephsession)). | 0 |
 
 Every error of `heph session` itself exits **125**: no such session, an
-ambiguous id, a recording format newer than this heph, a lost session for
+ambiguous id, a file that is not a heph session, a URL refused or not
+downloaded, a recording format newer than this heph, a lost session for
 `attach`, a session whose `End` carries no exit code, an `inflight` that is
 not answered or is asked of an ended session. By code alone 125 is ambiguous:
 a session can exit 125 itself (an entrypoint whose heph-side setup failed, or
@@ -47,6 +51,22 @@ an exit status (0-255); exiting 125` for a recorded code outside 0-255. A
 session whose `End` carries no code (killed by a signal, or it panicked) is
 reported as an error with that reason. An agent tells "the run failed" from
 "the wait failed" by that line, or by `heph session show <id> --json`.
+
+Under `--json` (`list`, `show`, `inflight`), an error of `heph session`
+itself also prints one line on stdout, `{"error":{"kind":…,"message":…}}`,
+beside the usual line on stderr; the exit stays 125. `kind` says which
+failure it is, and is an open enum: a consumer reads a value it does not know
+as a failure, with `message` saying what.
+
+| `kind` | When |
+| --- | --- |
+| `not_found` | no session matches the `<ref>`; for digits, neither a live pid nor an id prefix or suffix |
+| `ambiguous` | several sessions match; the message lists them |
+| `not_a_session` | the file or download is not a heph recording (an HTML error page, a zip without exactly one `.hephsession`, a truncated file) |
+| `format_too_new` | a heph recording in a format newer than this heph reads; the message names both formats |
+| `fetch` | an `http://` URL, a URL carrying credentials, or a download that failed or passed its cap |
+| `io` | a file could not be read or written |
+| `other` | anything else; the message says what |
 
 STATE is computed by the viewer, never stored: `running`; `waiting` (every
 open target is in a lock or admission wait); `quiet` (no event for longer
@@ -116,7 +136,9 @@ workspace rooted at `$HOME`, whose home is `~/.heph`.
 ```
 ~/.heph/sessions/
   .cleanup                   its mtime: when the last cleanup was claimed (at most hourly)
-  .tmp/                      readers' copies of lost recordings (swept after 10 minutes)
+  .tmp/                      readers' copies of lost recordings, downloaded and
+                             decompressed .hephsession files (swept by the hourly
+                             cleanup once older than 10 minutes)
   .removing-<id>-<pid>/      a removal in progress (a tomb)
   <id>/
     lock                     flock held while alive (frozen for every format)
@@ -170,10 +192,10 @@ still in WAL mode (live, or a seal cut short) or sealed (rollback mode).
 
 | Table | Holds |
 | --- | --- |
-| `session` | exactly one row: id, `format`, heph version, owner pid, `host`, `user`, `actor_kind` (`human`, `agent`, `ci`), `actor_name` (`claude-code`, `github-actions`, `unknown`), `ci_run_url`, `command`, `argv` (a JSON array), `cwd` (`HEPH_CWD` when set), workspace root and home, `git_head` (always NULL for now), label, interactive, `capabilities`, `lossy` (argv or cwd lost bytes: a NUL or invalid UTF-8 stored as U+FFFD), `started_ms`, `ended_ms`, `exit_code`, `panicked`, `truncated` and `truncated_seq` (set once the recording reached its 1 GiB ceiling; passing only the 256 MiB full cap shows as the first `heph.truncated` span event and in `status`), `derivation`, `sealed`, `snapshot` (0 in a local recording; 1 in an export taken of a session still running, a later PR) |
+| `session` | exactly one row: id, `format`, heph version, owner pid, `host`, `user`, `actor_kind` (`human`, `agent`, `ci`), `actor_name` (`claude-code`, `github-actions`, `unknown`), `ci_run_url`, `command`, `argv` (a JSON array), `cwd` (`HEPH_CWD` when set), workspace root and home, `git_head` (always NULL for now), label, interactive, `capabilities`, `lossy` (argv or cwd lost bytes: a NUL or invalid UTF-8 stored as U+FFFD), `started_ms`, `ended_ms`, `exit_code`, `panicked`, `truncated` and `truncated_seq` (set once the recording reached its 1 GiB ceiling; passing only the 256 MiB full cap shows as the first `heph.truncated` span event and in `status`), `derivation`, `sealed`, `snapshot` (0 in a local recording; 1 in an export taken of a session still running) |
 | `records` | the source of truth, in stream order: `seq`, `at_ms`, `kind` (the record's variant name), `addr`, and `body`, the record as JSON (see [Records](#records)) |
 | `status` | one row: the latest `SessionSnapshot`, upserted at most once a second and only when changed, and the final one at exit |
-| `notices`, `failure_logs` | empty in a local recording; filled only by an export (a later PR) |
+| `notices`, `failure_logs` | empty in a local recording; filled only by an export (see [Export](#export-hephsession)) |
 | `spans`, `span_events`, `metrics` | the explorer tables, derived from `records` (see [The explorer](#the-explorer)) |
 | `logs`, `sessions`, `targets` | explorer views over `records`, `session` and `spans` |
 
@@ -799,6 +821,150 @@ recorded with the line backend (session row `interactive: false`): the viewer's
 terminal decides, not the run's. Without a terminal it follows in line form,
 which for a line-backend session is its recorded log lines alone.
 
+## Export: `.hephsession`
+
+```
+heph session export <ref> [-o PATH|-] [--no-logs]
+```
+
+A `.hephsession` file is one session's recording, made to be read on another
+machine: a zstd frame whose content is a sealed `session.db` (format 1, the
+same tables as a local recording). `export` takes a consistent copy with
+`VACUUM INTO` a temp file, fills the two tables a local recording leaves
+empty, compresses it, and renames it into place:
+
+- `-o PATH` writes `PATH`, replacing a file already there; the default is
+  `./heph-<id>.hephsession`. `-o -` writes the bytes to stdout, and is
+  refused when stdout is a terminal (`-o ./-` is a file named `-`). On
+  success it prints the path written on stdout.
+- A **running** session exports too: the copy is a snapshot of it so far,
+  its session row says `snapshot = 1`, `export` says so on stderr, and every
+  viewer of the file says "snapshot of a running session".
+- `notices` holds the text of each approval notice the session showed, read
+  as the live banner would, at most 4 MiB per notice.
+- `failure_logs` holds the failure log of each **root** failure (never the
+  collateral ones failed by it), its last 1 MiB each and 32 MiB in all, with
+  `cut_bytes` saying how much of its start was left out.
+- `--no-logs` leaves both tables empty, for a file that leaves the machine
+  without the text of a notice or a log. The records themselves (addresses,
+  argv, cwd, the log lines the run printed) are still in it.
+
+A `<ref>` that is already a file is written again: its own `notices` and
+`failure_logs` are kept, or emptied by `--no-logs`.
+
+A reader sniffs the leading bytes, never the name:
+
+| Leading bytes | Read as |
+| --- | --- |
+| `28 B5 2F FD` (zstd) | decompressed into the sessions root's `.tmp/` (at most 4 GiB), then opened |
+| `SQLite format 3\0` | opened in place |
+| `PK 03 04` (zip: what a browser download of a CI artifact gives) | the one `*.hephsession` entry inside; zero or several is an error that lists the entries |
+| anything else | an error, `not_a_session` |
+
+Every file is opened read-only and `immutable=1`, with `trusted_schema` off,
+and its text reaches the terminal escaped, as a live recording's does.
+
+## Opening a recording: `<ref>`
+
+`show`, `attach` and `export` take a `<ref>`, resolved once, in this order:
+
+1. **`https://…`** is a URL: downloaded into the sessions root's `.tmp/`
+   (at most 1 GiB), then sniffed. `http://` is refused, and so is a URL
+   carrying credentials (`https://user:token@…`), so a token never reaches
+   an error message. There is no URL authentication: for a private CI
+   artifact, download it first and open the file (see [In CI](#in-ci)).
+2. **Anything with a `/` or a `.`** is a path. Ids are Crockford base32 and
+   pids are digits, so neither ever has one; `./02kf5` forces a path, and
+   `02kf5.hephsession` is a path by its `.`. Nothing is probed on disk to
+   decide: a bare `02kf5` is always an id, even beside a file of that name.
+3. **Otherwise** a session of this user's sessions directory: the full id,
+   the pid of a live session, or a unique prefix or suffix of an id. Digits
+   are a live pid first, then part of an id; with neither, the error names
+   both readings.
+
+A recording opened by id is **local**. One opened by path or URL is
+**foreign**, even when it was exported on this machine, and is read only from
+itself: no lock probe, no `inflight`, no run-log or failure-slot lookup, no
+read of a notice's source. Its state comes from its session row: `ok` or
+`failed` when it was sealed with an exit code, otherwise incomplete (a
+snapshot, or a recording copied out of a run that never finished).
+
+- `show <file>` starts with `read from <origin>`, adding `: snapshot of a
+  running session` or `: incomplete`; prints each recorded notice and each
+  root failure log after the "Stuck on" block; and its `Next:` is `none`,
+  since every other next step reads local state. `show --json` adds
+  `foreign: {origin, partial, notices: [{addr, seq, name, text}],
+  failure_logs: [{addr, log, cut_bytes}]}`, where `partial` is `snapshot`,
+  `incomplete` or `null`; the field is absent for a local session. `state`
+  is derived as for a local one, so a snapshot reads `lost`, and `partial`
+  says why.
+- `attach <file>` says `heph: replaying <origin>` on stderr, replays the
+  recording once, and exits with its recorded code. A recording with no
+  `End` exits 125 ("has no recorded end"), never `lost`.
+
+Downloads and decompressed copies live in the sessions root's `.tmp/` while
+the command runs, and are removed when it ends; one a killed command left
+behind is swept by the first cleanup after it is 10 minutes old, and
+cleanup runs at most once an hour (see
+[Retention](#retention)).
+
+## In CI
+
+```
+HEPH_SESSION_EXPORT_DIR=<absolute dir>
+```
+
+With the variable set, every session that seals also writes
+`<dir>/<id>.hephsession`: one file per session, named by its id, so every heph
+in the job adds its own, nested ones included, and none overwrites another. A
+workflow sets it on the step that runs heph and uploads the directory with
+`if: always()`, so a failed job keeps its recordings:
+
+```yaml
+- name: Build
+  env:
+    HEPH_SESSION_EXPORT_DIR: ${{ runner.temp }}/heph-sessions
+  run: heph run //...
+- name: Upload session recordings
+  if: always()
+  uses: actions/upload-artifact@v7
+  with:
+    name: heph-sessions
+    path: ${{ runner.temp }}/heph-sessions
+    if-no-files-found: ignore
+```
+
+To read one, download it and open the file (the artifact URL needs
+authentication, which `<ref>` does not do):
+
+```
+gh run download <run-id> -n heph-sessions -D sessions
+heph session attach sessions/<id>.hephsession
+```
+
+- The path must be **absolute**: a relative one is warned about once when
+  the session opens and exports nothing; an empty one is off. The directory
+  is created if missing.
+- A browser download of an artifact is a zip; a zip holding one
+  `.hephsession` opens as it is, one holding several must be extracted first.
+- The export runs after the recording's write connection closes, with its
+  own 30s bound outside the recorder's 3s join. Past it the temp file is
+  removed and one `warn!` says so. It prints nothing on success, and a
+  failure is one `warn!` that never changes the exit code.
+- It includes the notices and root failure logs, as `export` does without
+  `--no-logs`. A private session (`HEPH_NO_SESSION=1`) and `--raw` export
+  nothing.
+- It **never reaches a target**. heph strips it from `pass_env = ["*"]`,
+  `runtime_pass_env = ["*"]` and a session runner's launch, and refuses it by
+  name in `pass_env` (and in a dependency's `transitive` env passed with
+  `hash: true`), where it would move the def hash with the directory a job
+  picked. A target that wants it names it in `runtime_pass_env`, which is not
+  hashed. An `entrypoint` target runs on the caller's whole environment, so a
+  heph it starts writes its own file there, as intended.
+- **Don't point it inside a target's outputs** (or anywhere a target reads):
+  a heph run by that target would add a new file with a new id on every run,
+  and the outputs would differ every time.
+
 ## Retention
 
 Cleanup runs only at session start, on a thread of its own beside the new
@@ -841,7 +1007,7 @@ lost recording not yet sealed is read through a copy (see
 | An ended recording (lock free) | while last written under **7 days** ago, and among the newest that total at most **2 GiB** | the session directory is removed |
 | A live session (lock held) | always | never counted, never touched |
 | A session still starting: a free `lock` younger than **60s** (`STARTING`), or no `lock` and written under 60s ago | always | neither counted, sealed nor removed |
-| A tomb (`.removing-*`) or a reader copy in `.tmp/` | **10 minutes** (`SCRATCH_GRACE`) | deleted with no lock |
+| A tomb (`.removing-*`) or a reader copy, download or decompressed file in `.tmp/` | **10 minutes** (`SCRATCH_GRACE`) | deleted with no lock |
 
 - There is no count cap. The byte budget counts only sealed recordings in a
   format this heph knows, measured after any seal: the oldest go until the
