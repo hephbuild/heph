@@ -16,7 +16,7 @@
 //! everything that decides *where* a workspace lives is in one crate.
 
 use std::ops::Deref;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
@@ -98,18 +98,7 @@ impl HomeDir {
 pub fn normalize(path: &Path) -> anyhow::Result<PathBuf> {
     let abs =
         std::path::absolute(path).with_context(|| format!("making {} absolute", path.display()))?;
-    let mut out = PathBuf::new();
-    for c in abs.components() {
-        match c {
-            Component::CurDir => {}
-            // `pop` at the root is a no-op, which is `/..` == `/`.
-            Component::ParentDir => {
-                out.pop();
-            }
-            other => out.push(other),
-        }
-    }
-    Ok(out)
+    Ok(hcore::paths::lexical(&abs))
 }
 
 impl Deref for HomeDir {
