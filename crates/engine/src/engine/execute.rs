@@ -835,8 +835,8 @@ impl Engine {
     ) -> anyhow::Result<Vec<RunInput>> {
         let fail_fast = rc.fail_fast();
         let futs = inputs.iter().map(|input| {
-            enclose!((self => engine, rc, input) async move {
-                let res = engine.result_addr(rc, &input.target.addr, OutputMatcher::Exact(input.output_names), &ResultOptions::default()).await?;
+            enclose!((self => engine, rc) async move {
+                let res = engine.result_addr(rc, &input.target.addr, OutputMatcher::Exact(input.output_names.clone()), &ResultOptions::default()).await?;
                 let dep_inputs = res.artifacts.iter().map(|art| RunInput {
                     artifact: InputArtifact {
                         r#type: Type::Dep,

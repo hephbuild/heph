@@ -6177,7 +6177,7 @@ impl Engine {
             })
             .enumerate()
             .map(|(i, input)| {
-                let input_ref = input.r#ref.clone();
+                let input_ref = &input.r#ref;
                 enclose!((self => engine, rs) async move {
                     let spec = Arc::clone(&engine)
                         .get_spec(rs.clone(), &input_ref.r#ref)
