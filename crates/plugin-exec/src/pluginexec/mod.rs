@@ -1925,7 +1925,7 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
         req: ApplyTransitiveRequest,
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ApplyTransitiveResponse> {
-        let mut def = req.target_def.clone();
+        let mut def = req.target_def;
         let mut xdef = def.def::<TargetDef>().clone();
         let is_entrypoint = xdef.entrypoint.is_some();
         fold_transitive_inputs(
