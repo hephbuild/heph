@@ -386,67 +386,65 @@ pub fn header_top(title: &Title<'_>, gauges: &[&Gauge], cols: u16) -> ([Line<'st
     let inner = cols.saturating_sub(1);
     let mut lv = Levels::default();
 
-    // Title row: full with the gauges beside it while both fit.
+    // Title row: full with the gauges beside it while both fit. Each row
+    // is built once: the full title is level 0, and the cells row not
+    // drawn beside it is the gauge row's first try.
     let full = title_spans(title, 0, None);
     let cells_row = gauges_row(gauges, true, &[]);
     let side = !gauges.is_empty()
         && spans_width(&full) + GAUGE_GAP.len() + spans_width(&cells_row) <= inner;
-    let mut title_row = if side {
+    let (mut title_row, cells_down) = if side {
         let mut row = full;
         // Right-align the gauges.
         let gap = inner - spans_width(&row) - spans_width(&cells_row);
         row.push(Span::raw(" ".repeat(gap)));
         row.extend(cells_row);
-        row
+        (row, None)
     } else {
         lv.gauges_down = !gauges.is_empty();
-        let mut chosen = None;
-        for level in 0..3u8 {
-            let row = title_spans(title, level, None);
-            if spans_width(&row) <= inner {
-                lv.title = level;
-                chosen = Some(row);
-                break;
-            }
+        let mut row = full;
+        while spans_width(&row) > inner && lv.title < 2 {
+            lv.title += 1;
+            row = title_spans(title, lv.title, None);
         }
-        chosen.unwrap_or_else(|| {
+        if spans_width(&row) > inner {
             lv.title = 3;
             // What the command may keep: the rest, with the clock whole.
             let rest = spans_width(&title_spans(title, 2, Some(0)));
             let room = inner.saturating_sub(rest + 3);
-            title_spans(title, 2, Some(room))
-        })
+            row = title_spans(title, 2, Some(room));
+        }
+        (row, Some(cells_row))
     };
     if title_row.is_empty() {
         title_row.push(Span::raw(""));
     }
 
     // Gauge row.
-    let gauge_row = if lv.gauges_down {
-        let numbers = gauges_row(gauges, false, &[]);
-        let cells_row = gauges_row(gauges, true, &[]);
-        if spans_width(&cells_row) <= inner {
-            cells_row
-        } else if spans_width(&numbers) <= inner {
-            lv.gauges = 1;
-            numbers
-        } else {
-            lv.gauges = 2;
-            let mut folded = vec![false; gauges.len()];
-            let mut row = numbers;
-            for i in fold_order(gauges) {
-                if spans_width(&row) <= inner {
-                    break;
+    let gauge_row = match cells_down {
+        _ if !lv.gauges_down => Vec::new(),
+        Some(cells_row) if spans_width(&cells_row) <= inner => cells_row,
+        _ => {
+            let numbers = gauges_row(gauges, false, &[]);
+            if spans_width(&numbers) <= inner {
+                lv.gauges = 1;
+                numbers
+            } else {
+                lv.gauges = 2;
+                let mut folded = vec![false; gauges.len()];
+                let mut row = numbers;
+                for i in fold_order(gauges) {
+                    if spans_width(&row) <= inner {
+                        break;
+                    }
+                    if let Some(f) = folded.get_mut(i) {
+                        *f = true;
+                    }
+                    row = gauges_row(gauges, false, &folded);
                 }
-                if let Some(f) = folded.get_mut(i) {
-                    *f = true;
-                }
-                row = gauges_row(gauges, false, &folded);
+                row
             }
-            row
         }
-    } else {
-        Vec::new()
     };
 
     let lead = |mut spans: Vec<Span<'static>>| {
