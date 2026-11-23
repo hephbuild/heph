@@ -1,9 +1,11 @@
 use crate::htpkg::PkgBuf;
-use rustc_hash::{FxHashSet, FxHasher};
+use hashbrown::HashTable;
+use hashbrown::hash_table::Entry;
+use rustc_hash::FxBuildHasher;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::fmt::{Debug, Display};
-use std::hash::{Hash, Hasher};
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::ops::Deref;
 use std::sync::{Arc, OnceLock, RwLock};
 use xxhash_rust::xxh3::Xxh3Default;
@@ -29,41 +31,63 @@ impl Hash for AddrInner {
 #[derive(Clone)]
 pub struct Addr(Arc<AddrInner>);
 
-// Sharded intern table. Pre-hash the inner once, route to one of `SHARDS`
-// `RwLock<FxHashSet>` shards by the low bits of the hash. Reads take the
-// shard's read lock; insertions take its write lock with a double-check.
-// Eliminates the global-mutex contention that dominated `Addr::new` under
-// many workers.
+// Sharded intern table. Hash the inner once, route to one of `SHARDS`
+// `RwLock<HashTable>` shards by that hash, and hand the same hash to the
+// table. Reads take the shard's read lock; insertions take its write lock with
+// a double-check. Eliminates the global-mutex contention that dominated
+// `Addr::new` under many workers.
+//
+// The in-memory table only: nothing here reaches `Addr`'s `Hash`, which is
+// what def hashes see.
 const SHARDS: usize = 64;
+/// `SHARDS.trailing_zeros()`.
+const SHARD_BITS: u32 = 6;
+/// The top bits hashbrown keeps as each slot's control byte (its "h2").
+const H2_BITS: u32 = 7;
 
-static INTERNED: OnceLock<[RwLock<FxHashSet<Arc<AddrInner>>>; SHARDS]> = OnceLock::new();
+type InternShard = RwLock<HashTable<Arc<AddrInner>>>;
 
-fn intern_shards() -> &'static [RwLock<FxHashSet<Arc<AddrInner>>>; SHARDS] {
-    INTERNED.get_or_init(|| std::array::from_fn(|_| RwLock::new(FxHashSet::default())))
+static INTERNED: OnceLock<[InternShard; SHARDS]> = OnceLock::new();
+
+fn intern_shards() -> &'static [InternShard; SHARDS] {
+    INTERNED.get_or_init(|| std::array::from_fn(|_| RwLock::new(HashTable::new())))
+}
+
+fn intern_hash(inner: &AddrInner) -> u64 {
+    FxBuildHasher.hash_one(inner)
+}
+
+/// The shard owning a key of hash `hash`.
+///
+/// Taken from the bits just below the top `H2_BITS`, which no shard table
+/// reads: the table picks a key's home bucket from the low bits, so sharding
+/// on those would start every key of a shard in the same 1/`SHARDS` of its
+/// buckets; and it keeps the top bits as the control byte that filters a probe,
+/// so sharding on those would leave every key of a shard with nearly the same
+/// control byte.
+fn shard_index(hash: u64) -> usize {
+    (hash >> (u64::BITS - H2_BITS - SHARD_BITS)) as usize & (SHARDS - 1)
 }
 
 fn intern(inner: AddrInner) -> Arc<AddrInner> {
-    let mut h = FxHasher::default();
-    inner.hash(&mut h);
-    let hash = h.finish();
+    let hash = intern_hash(&inner);
     let shard = intern_shards()
-        .get((hash as usize) & (SHARDS - 1))
+        .get(shard_index(hash))
         .expect("shard index masked to SHARDS range");
+    let is_inner = |e: &Arc<AddrInner>| **e == inner;
 
     {
         let r = shard.read().expect("addr intern shard poisoned");
-        if let Some(existing) = r.get(&inner) {
+        if let Some(existing) = r.find(hash, is_inner) {
             return existing.clone();
         }
     }
 
     let mut w = shard.write().expect("addr intern shard poisoned");
-    if let Some(existing) = w.get(&inner) {
-        return existing.clone();
+    match w.entry(hash, is_inner, |e| intern_hash(e)) {
+        Entry::Occupied(e) => e.get().clone(),
+        Entry::Vacant(e) => e.insert(Arc::new(inner)).get().clone(),
     }
-    let arc = Arc::new(inner);
-    w.insert(arc.clone());
-    arc
 }
 
 impl Addr {
@@ -193,5 +217,77 @@ mod tests {
         for a in &addrs[1..] {
             assert!(Arc::ptr_eq(&first.0, &a.0));
         }
+    }
+
+    /// Many threads interning an overlapping set of distinct addrs, so the
+    /// shards' tables grow (and rehash) while other threads read them: every
+    /// equal addr must still come back as the one instance.
+    #[test]
+    fn intern_concurrent_distinct_inserts_share_arcs() {
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    (0..2000)
+                        .map(|i| {
+                            Addr::new(
+                                PkgBuf::from("concurrent/many"),
+                                format!("t{i}"),
+                                BTreeMap::new(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let runs: Vec<Vec<Addr>> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        for run in &runs[1..] {
+            for (a, b) in runs[0].iter().zip(run) {
+                assert!(Arc::ptr_eq(&a.0, &b.0), "{a} interned twice");
+            }
+        }
+    }
+
+    /// The shard index shares no bit with what each shard's table reads of
+    /// the same hash: the low bits (home bucket) and the top `H2_BITS`
+    /// (control byte). Sharing either would confine every key of a shard to a
+    /// slice of its buckets or of its control-byte values.
+    #[test]
+    fn shard_index_is_disjoint_from_the_tables_bits() {
+        let low = (1u64 << (u64::BITS - H2_BITS - SHARD_BITS)) - 1;
+        let h2 = !0u64 << (u64::BITS - H2_BITS);
+        for i in 0..4096u64 {
+            let hash = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            assert_eq!(shard_index(hash), shard_index(hash ^ low), "{hash:#x}");
+            assert_eq!(shard_index(hash), shard_index(hash ^ h2), "{hash:#x}");
+        }
+    }
+
+    /// Real addrs spread across the shards, and the keys of one shard spread
+    /// across that shard's home buckets: the property the shard index exists
+    /// to keep.
+    #[test]
+    fn intern_hashes_spread_across_shards_and_within_one() {
+        let mut shards = std::collections::HashSet::new();
+        let mut homes_in_shard0 = std::collections::HashSet::new();
+        for i in 0..8192 {
+            let inner = AddrInner {
+                package: PkgBuf::from(format!("pkg/{}", i % 97)),
+                name: format!("target{i}"),
+                args: BTreeMap::new(),
+            };
+            let hash = intern_hash(&inner);
+            shards.insert(shard_index(hash));
+            if shard_index(hash) == 0 {
+                homes_in_shard0.insert(hash & (SHARDS as u64 - 1));
+            }
+        }
+        assert_eq!(shards.len(), SHARDS, "addrs reached only {shards:?}");
+        // ~128 keys land in shard 0; with the shard taken from the low bits,
+        // they would all share one value here.
+        assert!(
+            homes_in_shard0.len() > SHARDS / 2,
+            "shard 0's keys start in only {} of {SHARDS} bucket positions",
+            homes_in_shard0.len()
+        );
     }
 }

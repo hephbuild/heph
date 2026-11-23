@@ -4267,6 +4267,7 @@ name = "model"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "hashbrown 0.17.1",
  "nom 8.0.0",
  "rustc-hash",
  "serde",
