@@ -2,12 +2,27 @@ use crate::engine::local_cache::{EntryWriter, Existence, LocalCache, SizedReader
 use anyhow::{Context, Result};
 use hcore::hartifactcontent;
 use hmodel::htaddr::Addr;
-use quick_cache::Weighter;
 use quick_cache::sync::Cache;
+use quick_cache::{Equivalent, Weighter};
 use std::io;
 use std::sync::Arc;
 
-type Key = (String, String, String);
+/// An entry's key: the target, its input hash and the blob name. Built only to
+/// insert; lookups use [`KeyRef`].
+type Key = (Addr, String, String);
+
+/// A borrowed [`Key`], so a lookup allocates nothing. It must hash exactly as
+/// the tuple does, which the derive gives: the fields in order, and `&str`
+/// hashes as `String`. `Addr` compares by its interned pointer, so equality is
+/// equality of the address's parts.
+#[derive(Hash)]
+struct KeyRef<'a>(&'a Addr, &'a str, &'a str);
+
+impl Equivalent<Key> for KeyRef<'_> {
+    fn equivalent(&self, key: &Key) -> bool {
+        *self.0 == key.0 && self.1 == key.1 && self.2 == key.2
+    }
+}
 
 #[derive(Clone)]
 struct ByteWeighter;
@@ -35,17 +50,23 @@ impl LocalCacheMem {
         }
     }
 
-    fn key(addr: &Addr, hashin: &str, name: &str) -> Key {
-        (addr.format(), hashin.to_string(), name.to_string())
+    /// The resident entry for a key, without bumping its recency: a presence or
+    /// size check is not a use.
+    fn resident(&self, addr: &Addr, hashin: &str, name: &str) -> Option<Arc<[u8]>> {
+        self.cache.peek(&KeyRef(addr, hashin, name))
+    }
+
+    /// Make `buf` the key's resident entry; the one place a [`Key`] is built.
+    fn insert(&self, addr: &Addr, hashin: &str, name: &str, buf: Arc<[u8]>) {
+        self.cache
+            .insert((addr.clone(), hashin.to_string(), name.to_string()), buf);
     }
 }
 
 impl LocalCache for LocalCacheMem {
     fn reader(&self, addr: &Addr, hashin: &str, name: &str) -> Result<SizedReader> {
-        let key = Self::key(addr, hashin, name);
-
         // Hit: skip the inner backend entirely.
-        if let Some(buf) = self.cache.get(&key) {
+        if let Some(buf) = self.cache.get(&KeyRef(addr, hashin, name)) {
             let size = buf.len() as u64;
             return Ok(SizedReader {
                 size,
@@ -65,7 +86,7 @@ impl LocalCache for LocalCacheMem {
         // Fast path: inner already produced an in-memory buffer (e.g. SQLite
         // inline-read path). Cache the Arc directly, no drain.
         if let Some(arc) = sized.bytes.clone() {
-            self.cache.insert(key, arc);
+            self.insert(addr, hashin, name, arc);
             return Ok(sized);
         }
 
@@ -75,7 +96,7 @@ impl LocalCache for LocalCacheMem {
         let mut rdr = sized.reader;
         io::copy(&mut rdr, &mut buf).with_context(|| format!("draining {name} into mem cache"))?;
         let arc: Arc<[u8]> = Arc::from(buf);
-        self.cache.insert(key, arc.clone());
+        self.insert(addr, hashin, name, arc.clone());
         Ok(SizedReader {
             size: arc.len() as u64,
             reader: Box::new(io::Cursor::new(arc.clone())),
@@ -84,12 +105,11 @@ impl LocalCache for LocalCacheMem {
     }
 
     fn writer(&self, addr: &Addr, hashin: &str, name: &str) -> Result<Box<dyn EntryWriter>> {
-        let key = Self::key(addr, hashin, name);
         // Invalidate before forwarding, at open rather than at commit. A reader
         // arriving after this point misses the mem cache and falls through to the
         // inner backend, which is responsible for its own read-after-write
         // ordering (e.g. LocalCacheSQLite's PendingTracker).
-        self.cache.remove(&key);
+        self.cache.remove(&KeyRef(addr, hashin, name));
         self.inner.writer(addr, hashin, name)
     }
 
@@ -106,40 +126,35 @@ impl LocalCache for LocalCacheMem {
         name: &str,
         src: &std::path::Path,
     ) -> Result<bool> {
-        let key = Self::key(addr, hashin, name);
-        self.cache.remove(&key);
+        self.cache.remove(&KeyRef(addr, hashin, name));
         self.inner.adopt_file(addr, hashin, name, src)
     }
 
     fn exists(&self, addr: &Addr, hashin: &str, name: &str) -> Result<bool> {
-        let key = Self::key(addr, hashin, name);
-        // peek avoids bumping the cache recency for a presence check.
-        if self.cache.peek(&key).is_some() {
+        if self.resident(addr, hashin, name).is_some() {
             return Ok(true);
         }
         self.inner.exists(addr, hashin, name)
     }
 
     fn existence(&self, addr: &Addr, hashin: &str, name: &str) -> Result<Existence> {
-        let key = Self::key(addr, hashin, name);
         // Must mirror `exists`, not just delegate. A resident entry is readable
         // from this tier alone, and the durable row behind it can disappear
         // without this process's `writer`/`delete` seeing it — another `heph`
         // GC'ing the shared sqlite DB. Delegating blind would then answer absent
         // for a key `exists` (and `reader`) still serve, and
         // `artifacts_from_manifest` would silently degrade a hit to a rebuild.
-        if self.cache.peek(&key).is_some() {
+        if self.resident(addr, hashin, name).is_some() {
             return Ok(Existence::Committed(true));
         }
         self.inner.existence(addr, hashin, name)
     }
 
     fn exists_committed(&self, addr: &Addr, hashin: &str, name: &str) -> Result<bool> {
-        let key = Self::key(addr, hashin, name);
         // Mirrors `exists`/`existence`, peek included: a resident entry is
         // served by `reader` from this tier alone, so it is committed as far as
         // any caller is concerned, whatever the durable backend's queue says.
-        if self.cache.peek(&key).is_some() {
+        if self.resident(addr, hashin, name).is_some() {
             return Ok(true);
         }
         self.inner.exists_committed(addr, hashin, name)
@@ -149,15 +164,14 @@ impl LocalCache for LocalCacheMem {
     /// large blob into this tier only to measure it. A resident entry holds the
     /// stored bytes verbatim, so its length answers without the inner backend.
     fn stored_size(&self, addr: &Addr, hashin: &str, name: &str) -> Result<Option<u64>> {
-        if let Some(buf) = self.cache.peek(&Self::key(addr, hashin, name)) {
+        if let Some(buf) = self.resident(addr, hashin, name) {
             return Ok(Some(buf.len() as u64));
         }
         self.inner.stored_size(addr, hashin, name)
     }
 
     fn delete(&self, addr: &Addr, hashin: &str, name: &str) -> Result<()> {
-        let key = Self::key(addr, hashin, name);
-        self.cache.remove(&key);
+        self.cache.remove(&KeyRef(addr, hashin, name));
         self.inner.delete(addr, hashin, name)
     }
 
@@ -184,9 +198,8 @@ impl LocalCache for LocalCacheMem {
         hashin: &str,
         name: &str,
     ) -> Result<Option<Box<dyn hartifactcontent::ReadSeek + Send>>> {
-        let key = Self::key(addr, hashin, name);
         // Cache hit: serve a Cursor over the cached Arc<[u8]>. Read+Seek+Send.
-        if let Some(buf) = self.cache.get(&key) {
+        if let Some(buf) = self.cache.get(&KeyRef(addr, hashin, name)) {
             return Ok(Some(Box::new(io::Cursor::new(buf))));
         }
         // Miss: delegate. Inner cache (SQLite) returns a connection-bound
@@ -234,9 +247,12 @@ mod tests {
     /// In-memory LocalCache backing used to instrument call counts.
     /// Internals are wrapped in Arcs so writer closures can capture them
     /// without needing back-references to the outer cache.
+    /// The double's own key, by formatted address like the durable backends.
+    type StoreKey = (String, String, String);
+
     #[derive(Default, Clone)]
     struct CountingCache {
-        store: Arc<Mutex<HashMap<Key, Vec<u8>>>>,
+        store: Arc<Mutex<HashMap<StoreKey, Vec<u8>>>>,
         reader_calls: Arc<AtomicUsize>,
         writer_calls: Arc<AtomicUsize>,
         delete_calls: Arc<AtomicUsize>,
@@ -245,14 +261,14 @@ mod tests {
     }
 
     impl CountingCache {
-        fn key(addr: &Addr, hashin: &str, name: &str) -> Key {
+        fn key(addr: &Addr, hashin: &str, name: &str) -> StoreKey {
             (addr.format(), hashin.to_string(), name.to_string())
         }
     }
 
     struct VecWriter {
-        store: Arc<Mutex<HashMap<Key, Vec<u8>>>>,
-        key: Key,
+        store: Arc<Mutex<HashMap<StoreKey, Vec<u8>>>>,
+        key: StoreKey,
         buf: Vec<u8>,
     }
 
@@ -450,6 +466,46 @@ mod tests {
         let r = dec.reader(&addr, "h1", "small").expect("r2");
         assert_eq!(drain(r.reader), b"hello");
         assert_eq!(inner.reader_calls.load(Ordering::Relaxed), 1);
+    }
+
+    /// The key holds the `Addr` and lookups borrow one, so an address built
+    /// again from the same parts (a separate `Addr::new`, as each request does)
+    /// must find the entry: equal by interning, and hashing the same as the
+    /// stored key. A different address or hashin must not.
+    #[test]
+    fn a_rebuilt_addr_hits_the_entry_another_wrote() {
+        let inner = Arc::new(CountingCache::default());
+        let dec = LocalCacheMem::new(inner.clone(), 1024, 64 * 1024);
+        write_blob(&dec, &make_addr(), "small", b"hello");
+        drain(
+            dec.reader(&make_addr(), "h1", "small")
+                .expect("fill")
+                .reader,
+        );
+        assert_eq!(inner.reader_calls.load(Ordering::Relaxed), 1);
+
+        let again = make_addr();
+        let r = dec.reader(&again, "h1", "small").expect("hit");
+        assert_eq!(drain(r.reader), b"hello");
+        assert_eq!(
+            inner.reader_calls.load(Ordering::Relaxed),
+            1,
+            "a rebuilt, equal addr must hit the mem tier"
+        );
+        assert_eq!(
+            dec.stored_size(&again, "h1", "small").expect("size"),
+            Some(5)
+        );
+        assert!(dec.resident(&again, "h1", "small").is_some());
+
+        let other = Addr::new(
+            hmodel::htpkg::PkgBuf::from("pkg"),
+            "other".to_string(),
+            Default::default(),
+        );
+        assert!(dec.resident(&other, "h1", "small").is_none());
+        assert!(dec.resident(&again, "h2", "small").is_none());
+        assert!(dec.resident(&again, "h1", "smal").is_none());
     }
 
     #[test]
