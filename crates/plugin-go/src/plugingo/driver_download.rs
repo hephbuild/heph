@@ -472,17 +472,7 @@ impl ManagedDriver for GoDownloadDriver {
         )
         .await?;
 
-        let gomodcache = req
-            .request
-            .scratch
-            .iter()
-            .find(|m| m.env == "GOMODCACHE")
-            .map(|m| m.dir.clone())
-            .context(
-                "no GOMODCACHE scratch mount: the host resolves and locks one for every \
-                 target that references the shared cache, and `--no-scratch` supplies an \
-                 empty one rather than none",
-            )?;
+        let gomodcache = crate::plugingo::toolchain::scratch_dir(&req, "GOMODCACHE")?;
 
         let env = download_env(def.runner.is_some(), &goroot, &gomodcache, |n| {
             std::env::var(n).ok()

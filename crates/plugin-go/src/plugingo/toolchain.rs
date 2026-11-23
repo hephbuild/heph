@@ -266,6 +266,70 @@ impl HostGoCache {
     }
 }
 
+/// The directory of the scratch mount the host resolved and locked for `env`
+/// (`GOCACHE`, `GOMODCACHE`). Always present for a target that references the
+/// scratch: `--no-scratch` supplies an empty mount rather than none, so there is
+/// nothing to fall back to and nothing to guess.
+pub(crate) fn scratch_dir(
+    req: &ManagedRunRequest<'_, '_>,
+    env: &str,
+) -> anyhow::Result<std::path::PathBuf> {
+    req.request
+        .scratch
+        .iter()
+        .find(|m| m.env == env)
+        .map(|m| m.dir.clone())
+        .with_context(|| {
+            format!(
+                "no {env} scratch mount: the host resolves and locks one for every \
+                 target that references the shared cache, and `--no-scratch` supplies an \
+                 empty one rather than none"
+            )
+        })
+}
+
+/// The base environment `go list` and `go tool compile` run under: the target
+/// platform, the staged `GOROOT`, the shared `GOCACHE`, and the build config
+/// pinned so it is the same in every sandbox. Each caller adds its own `PATH`
+/// rule (and `go list` its fetch environment).
+///
+/// - `GOTOOLCHAIN=local` and `GOWORK=off` pin the toolchain to the staged SDK
+///   and ignore any workspace `go.work`, whatever the host config.
+/// - `CGO_ENABLED` is pinned rather than autodetected: autodetection is
+///   `PATH`-dependent and drifts across hosts (an Ubuntu host with gcc on `PATH`
+///   pulls `runtime/cgo` into the listing, but later link steps run without it,
+///   breaking importcfg). It is `0` for every ordinary build and `1` only for a
+///   race build off darwin ([`crate::plugingo::factors::cgo_required`]), the
+///   same in the golist, compile and link sandboxes.
+/// - `GOEXPERIMENT` only when the variant sets one.
+pub(crate) fn go_tool_env(
+    goos: &str,
+    goarch: &str,
+    race: bool,
+    goexperiment: &[String],
+    goroot: &std::path::Path,
+    gocache: &std::path::Path,
+) -> HashMap<String, String> {
+    let mut env: HashMap<String, String> = HashMap::new();
+    env.insert("GOOS".to_string(), goos.to_string());
+    env.insert("GOARCH".to_string(), goarch.to_string());
+    env.insert("GOROOT".to_string(), goroot.to_string_lossy().into_owned());
+    env.insert(
+        "GOCACHE".to_string(),
+        gocache.to_string_lossy().into_owned(),
+    );
+    env.insert("GOTOOLCHAIN".to_string(), "local".to_string());
+    env.insert("GOWORK".to_string(), "off".to_string());
+    env.insert(
+        "CGO_ENABLED".to_string(),
+        crate::plugingo::factors::cgo_enabled_value(goos, race).to_string(),
+    );
+    if !goexperiment.is_empty() {
+        env.insert("GOEXPERIMENT".to_string(), goexperiment.join(","));
+    }
+    env
+}
+
 /// Ask the environment where its Go lives. See [`HostGoCache`].
 async fn probe_host_go(
     runner: hexecrunner::RunnerRef<'_>,
@@ -1277,5 +1341,53 @@ mod tests {
             "nothing may be unpacked from an unverified tarball"
         );
         assert!(!tarball.exists(), "the tarball must be removed");
+    }
+
+    /// The base env `go list` and `go tool compile` share: exactly these keys,
+    /// with `CGO_ENABLED` pinned per platform and race, and no host `PATH`.
+    #[test]
+    fn go_tool_env_is_the_pinned_base() {
+        let env = |goos: &str, race: bool, goexperiment: &[String]| {
+            let mut kv: Vec<(String, String)> = go_tool_env(
+                goos,
+                "amd64",
+                race,
+                goexperiment,
+                std::path::Path::new("/goroot"),
+                std::path::Path::new("/gocache"),
+            )
+            .into_iter()
+            .collect();
+            kv.sort();
+            kv
+        };
+        let pairs = |kv: &[(&str, &str)]| -> Vec<(String, String)> {
+            kv.iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        assert_eq!(
+            env("linux", false, &[]),
+            pairs(&[
+                ("CGO_ENABLED", "0"),
+                ("GOARCH", "amd64"),
+                ("GOCACHE", "/gocache"),
+                ("GOOS", "linux"),
+                ("GOROOT", "/goroot"),
+                ("GOTOOLCHAIN", "local"),
+                ("GOWORK", "off"),
+            ])
+        );
+        let racy = env(
+            "linux",
+            true,
+            &["loopvar".to_string(), "rangefunc".to_string()],
+        );
+        assert!(racy.contains(&("CGO_ENABLED".to_string(), "1".to_string())));
+        assert!(racy.contains(&("GOEXPERIMENT".to_string(), "loopvar,rangefunc".to_string())));
+        assert!(
+            env("darwin", true, &[]).contains(&("CGO_ENABLED".to_string(), "0".to_string())),
+            "a darwin race build does not need cgo"
+        );
     }
 }

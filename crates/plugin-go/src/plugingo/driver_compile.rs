@@ -414,42 +414,19 @@ impl ManagedDriver for GoCompileDriver {
             )
             .await?;
 
-            // Resolved and locked by the host from this target's scratch reference,
-            // always — `--no-scratch` supplies an empty mount rather than none, so
-            // there is nothing to fall back to and nothing to guess.
-            let gocache = req
-                .request
-                .scratch
-                .iter()
-                .find(|m| m.env == "GOCACHE")
-                .map(|m| m.dir.clone())
-                .context(
-                    "no GOCACHE scratch mount: the host resolves and locks one for every \
-                 target that references the shared cache, and `--no-scratch` supplies an \
-                 empty one rather than none",
-                )?;
+            let gocache = crate::plugingo::toolchain::scratch_dir(&req, "GOCACHE")?;
 
-            let mut env: HashMap<String, String> = HashMap::new();
-            env.insert("GOOS".to_string(), def.goos.clone());
-            env.insert("GOARCH".to_string(), def.goarch.clone());
-            env.insert("GOROOT".to_string(), goroot.to_string_lossy().into_owned());
-            env.insert(
-                "GOCACHE".to_string(),
-                gocache.to_string_lossy().into_owned(),
+            // The archives this driver produces are pure Go whatever
+            // `CGO_ENABLED` is; it is pinned so `go tool compile`'s view of the
+            // build config matches everyone else's.
+            let mut env = crate::plugingo::toolchain::go_tool_env(
+                &def.goos,
+                &def.goarch,
+                def.race,
+                &def.goexperiment,
+                &goroot,
+                &gocache,
             );
-            env.insert("GOTOOLCHAIN".to_string(), "local".to_string());
-            env.insert("GOWORK".to_string(), "off".to_string());
-            // `1` only for a race build off darwin, matching the golist and link
-            // sandboxes — see `factors::cgo_required`. The archives this driver
-            // produces are pure Go either way; the setting exists so `go tool
-            // compile`'s view of the build config matches everyone else's.
-            env.insert(
-                "CGO_ENABLED".to_string(),
-                crate::plugingo::factors::cgo_enabled_value(&def.goos, def.race).to_string(),
-            );
-            if !def.goexperiment.is_empty() {
-                env.insert("GOEXPERIMENT".to_string(), def.goexperiment.join(","));
-            }
             // Non-hermetic toolchains (host, or a hostbin/nix target wrapper) may need
             // PATH; hermetic mode omits it to stay PATH-independent.
             if !matches!(

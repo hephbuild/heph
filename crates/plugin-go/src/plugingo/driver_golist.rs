@@ -179,31 +179,14 @@ fn golist_env(
     gocache: &std::path::Path,
     host: impl Fn(&str) -> Option<String>,
 ) -> HashMap<String, String> {
-    let mut env: HashMap<String, String> = HashMap::new();
-    env.insert("GOOS".to_string(), def.goos.clone());
-    env.insert("GOARCH".to_string(), def.goarch.clone());
-    env.insert("GOROOT".to_string(), goroot.to_string_lossy().into_owned());
-    env.insert(
-        "GOCACHE".to_string(),
-        gocache.to_string_lossy().into_owned(),
+    let mut env = crate::plugingo::toolchain::go_tool_env(
+        &def.goos,
+        &def.goarch,
+        def.race,
+        &def.goexperiment,
+        goroot,
+        gocache,
     );
-    // Pin the toolchain to the staged SDK and ignore any workspace go.work so
-    // resolution is reproducible regardless of host config.
-    env.insert("GOTOOLCHAIN".to_string(), "local".to_string());
-    env.insert("GOWORK".to_string(), "off".to_string());
-    // Pin CGO_ENABLED rather than letting Go autodetect it: autodetection is
-    // PATH-dependent and drifts across hosts — e.g. an Ubuntu host with gcc on
-    // PATH pulls runtime/cgo in here but later link steps run without it,
-    // breaking importcfg. The value must match what the compile/link sandboxes
-    // use, which is `0` for every ordinary build and `1` only for a race build
-    // off darwin (see `factors::cgo_required`).
-    env.insert(
-        "CGO_ENABLED".to_string(),
-        crate::plugingo::factors::cgo_enabled_value(&def.goos, def.race).to_string(),
-    );
-    if !def.goexperiment.is_empty() {
-        env.insert("GOEXPERIMENT".to_string(), def.goexperiment.join(","));
-    }
     add_fetch_env(&mut env, &host);
     for name in GOLIST_ONLY_PASS_ENV {
         if let Some(v) = host(name) {
@@ -439,17 +422,7 @@ impl ManagedDriver for GoGolistDriver {
         // to write anyway — Go reads `~/.cache/go-build` when `GOCACHE` is unset,
         // so inventing a sandbox-local directory would be guessing at what the
         // host already decided.
-        let gocache = req
-            .request
-            .scratch
-            .iter()
-            .find(|m| m.env == "GOCACHE")
-            .map(|m| m.dir.clone())
-            .context(
-                "no GOCACHE scratch mount: the host resolves and locks one for every \
-                 target that references the shared cache, and `--no-scratch` supplies an \
-                 empty one rather than none",
-            )?;
+        let gocache = crate::plugingo::toolchain::scratch_dir(&req, "GOCACHE")?;
 
         let env = golist_env(def, &goroot, &gocache, |n| std::env::var(n).ok());
 
