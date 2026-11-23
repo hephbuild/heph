@@ -553,3 +553,54 @@ async fn test_indirect_cyclic_dep_detected() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// `link` checks every runtime input's named output. Under keep-going it
+/// reports each one that does not exist; under fail-fast, the first in input
+/// order.
+#[tokio::test]
+async fn link_reports_each_missing_named_output() -> anyhow::Result<()> {
+    let ws = Workspace::with_static(vec![
+        target("//link:a", "echo a > $OUT", Some("a.txt")),
+        target("//link:b", "echo b > $OUT", Some("b.txt")),
+        target_with_deps(
+            "//link:consumer",
+            "true",
+            None,
+            HashMap::from([(
+                "dep".to_string(),
+                vec!["//link:a|nope_a".to_string(), "//link:b|nope_b".to_string()],
+            )]),
+        ),
+    ])?;
+    let addr = heph::htaddr::parse_addr("//link:consumer")?;
+    let link = |fail_fast: bool| {
+        let engine = std::sync::Arc::clone(&ws.engine);
+        let addr = addr.clone();
+        async move {
+            let rs = engine.new_state_with_fail_fast(fail_fast);
+            let def = std::sync::Arc::clone(&engine)
+                .get_def(rs.clone(), &addr)
+                .await?;
+            std::sync::Arc::clone(&engine)
+                .link(rs, std::sync::Arc::clone(&def.target_def))
+                .await
+                .map(|_linked| ())
+        }
+    };
+    let missing_a = "Output 'nope_a' not found in target '//link:a'";
+    let missing_b = "Output 'nope_b' not found in target '//link:b'";
+
+    let err = link(false)
+        .await
+        .err()
+        .context("keep-going link must fail")?;
+    let multi = err
+        .downcast_ref::<heph::engine::error::MultiError>()
+        .with_context(|| format!("want a MultiError, got: {err:#}"))?;
+    let msgs: Vec<String> = multi.0.iter().map(|e| format!("{e:#}")).collect();
+    assert_eq!(msgs, [missing_a, missing_b]);
+
+    let err = link(true).await.err().context("fail-fast link must fail")?;
+    assert_eq!(format!("{err:#}"), missing_a);
+    Ok(())
+}

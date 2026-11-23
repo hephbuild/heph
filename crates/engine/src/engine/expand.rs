@@ -190,24 +190,51 @@ impl ParentOverride {
     }
 }
 
-/// A target's inputs with its groups expanded, as
+/// A target's inputs with its groups expanded, and the def of each, as
 /// [`Engine::expanded_inputs_for`] memoizes them. Reads as the input slice.
-pub(crate) enum ExpandedInputs {
+pub(crate) struct ExpandedInputs {
+    inputs: InputList,
+    /// The def of each input, index for index. Expansion resolved every one
+    /// of them on this request, so `link` reads them here instead of
+    /// resolving each runtime input again.
+    defs: Vec<Arc<ExtendedTargetDef>>,
+}
+
+enum InputList {
     /// No input is a group: the def's own list, shared rather than copied.
     Declared(Arc<TargetDef>),
     /// At least one input was a group, replaced in place by its members.
     Expanded(Vec<Input>),
 }
 
+impl ExpandedInputs {
+    /// Each input with its def, in order.
+    pub(crate) fn with_defs(&self) -> impl Iterator<Item = (&Input, &Arc<ExtendedTargetDef>)> {
+        self.iter().zip(&self.defs)
+    }
+}
+
 impl std::ops::Deref for ExpandedInputs {
     type Target = [Input];
 
     fn deref(&self) -> &[Input] {
-        match self {
-            Self::Declared(def) => &def.inputs,
-            Self::Expanded(inputs) => inputs,
+        match &self.inputs {
+            InputList::Declared(def) => &def.inputs,
+            InputList::Expanded(inputs) => inputs,
         }
     }
+}
+
+/// What a group's expansion appends to, and the path it is on.
+struct GroupWalk<'a> {
+    /// The target's expanded inputs so far.
+    inputs: &'a mut Vec<Input>,
+    /// The def of each of `inputs`, index for index.
+    defs: &'a mut Vec<Arc<ExtendedTargetDef>>,
+    /// The groups on the path being expanded, to refuse one that contains
+    /// itself. Expansion is sequential within one task, so the walk borrows
+    /// it mutably across the recursion.
+    visited: &'a mut FxHashSet<Addr>,
 }
 
 impl Engine {
@@ -235,42 +262,37 @@ impl Engine {
                     let def = Arc::clone(&engine)
                         .get_def_no_track(rs.clone(), &addr)
                         .await?;
-                    let mut visited = FxHashSet::default();
                     let expanded = Arc::clone(&engine)
-                        .expand_inputs(rs, &def.target_def.inputs, &mut visited)
+                        .expand_inputs(rs, &def.target_def)
                         .await
                         .map_err(|e| EntrypointAsInput::name_consumer(e, &addr))?;
-                    Ok(Arc::new(match expanded {
-                        Some(inputs) => ExpandedInputs::Expanded(inputs),
-                        None => ExpandedInputs::Declared(Arc::clone(&def.target_def)),
-                    }))
+                    Ok(Arc::new(expanded))
                 }),
             )
             .await
             .map_err(unwrap_arc_err)
     }
 
-    /// Expands the transparent (group) inputs among `inputs`, replacing each
+    /// Expands the transparent (group) inputs of `declared`, replacing each
     /// group with its constituent deps in place. Non-transparent inputs pass
-    /// through unchanged and in order.
+    /// through unchanged and in order. Each input comes with its def.
     ///
-    /// `None` when no input is a group: `inputs` stand as they are and nothing
-    /// is copied, which is the common case. Otherwise the result is allocated
-    /// the first time a group is met, with the inputs before it copied in.
-    ///
-    /// `visited` holds the groups on the path being expanded, to refuse a
-    /// group that contains itself. Expansion is sequential within one task, so
-    /// it is borrowed mutably across the recursion.
+    /// When no input is a group, the result shares `declared`'s list and
+    /// nothing is copied, which is the common case. Otherwise the list is
+    /// allocated the first time a group is met, with the inputs before it
+    /// copied in.
     pub(crate) async fn expand_inputs(
         self: Arc<Self>,
         rs: Arc<RequestState>,
-        inputs: &[Input],
-        visited: &mut FxHashSet<Addr>,
-    ) -> anyhow::Result<Option<Vec<Input>>> {
+        declared: &Arc<TargetDef>,
+    ) -> anyhow::Result<ExpandedInputs> {
+        let inputs = &declared.inputs;
         let mut expanded: Option<Vec<Input>> = None;
+        let mut defs = Vec::with_capacity(inputs.len());
+        let mut visited = FxHashSet::default();
 
-        let mut defs = self.input_defs(&rs, inputs).enumerate();
-        while let Some((idx, next)) = defs.next().await {
+        let mut resolved = self.input_defs(&rs, inputs).enumerate();
+        while let Some((idx, next)) = resolved.next().await {
             let (input, def) = next?;
 
             if def.target_def.transparent {
@@ -279,28 +301,39 @@ impl Engine {
                     v.extend_from_slice(inputs.get(..idx).unwrap_or_default());
                     v
                 });
+                let mut walk = GroupWalk {
+                    inputs: out,
+                    defs: &mut defs,
+                    visited: &mut visited,
+                };
                 Arc::clone(&self)
                     .expand_group_into(
                         rs.clone(),
                         input,
                         &def.target_def.inputs,
                         &ParentOverride::of(input),
-                        out,
-                        visited,
+                        &mut walk,
                     )
                     .await?;
-            } else if let Some(out) = expanded.as_mut() {
-                // A group earlier in the list allocated the result: copy this
-                // pass-through into it.
-                out.push(input.clone());
+            } else {
+                if let Some(out) = expanded.as_mut() {
+                    // A group earlier in the list allocated the result: copy
+                    // this pass-through into it.
+                    out.push(input.clone());
+                }
+                defs.push(def);
             }
         }
 
-        Ok(expanded)
+        let inputs = match expanded {
+            Some(inputs) => InputList::Expanded(inputs),
+            None => InputList::Declared(Arc::clone(declared)),
+        };
+        Ok(ExpandedInputs { inputs, defs })
     }
 
-    /// Appends the `members` of `group` to `out`, each routed by `routing`,
-    /// expanding a nested group in place.
+    /// Appends the `members` of `group` to the walk, each routed by `routing`
+    /// and with its def, expanding a nested group in place.
     ///
     /// `routing` carries the origin_id, mode and annotations of the group's
     /// reference in the target's own input list, so that exec driver grouping
@@ -314,16 +347,15 @@ impl Engine {
         group: &Input,
         members: &[Input],
         routing: &ParentOverride,
-        out: &mut Vec<Input>,
-        visited: &mut FxHashSet<Addr>,
+        walk: &mut GroupWalk<'_>,
     ) -> anyhow::Result<()> {
         let addr = &group.r#ref.r#ref;
-        if !visited.insert(addr.clone()) {
+        if !walk.visited.insert(addr.clone()) {
             anyhow::bail!("circular group dependency at '{}'", addr.format());
         }
 
-        let mut defs = self.input_defs(&rs, members);
-        while let Some(next) = defs.next().await {
+        let mut resolved = self.input_defs(&rs, members);
+        while let Some(next) = resolved.next().await {
             let (member, def) = next?;
             if def.target_def.transparent {
                 Arc::clone(&self)
@@ -332,16 +364,16 @@ impl Engine {
                         member,
                         &def.target_def.inputs,
                         &routing.nested(member),
-                        out,
-                        visited,
+                        walk,
                     )
                     .await?;
             } else {
-                out.push(routing.apply(member));
+                walk.inputs.push(routing.apply(member));
+                walk.defs.push(def);
             }
         }
 
-        visited.remove(addr);
+        walk.visited.remove(addr);
         Ok(())
     }
 
@@ -515,6 +547,14 @@ mod tests {
         Ok((Arc::new(engine), root))
     }
 
+    /// A def declaring `inputs`, for [`Engine::expand_inputs`].
+    fn declaring(inputs: Vec<Input>) -> Arc<TargetDef> {
+        Arc::new(TargetDef {
+            inputs,
+            ..Default::default()
+        })
+    }
+
     fn input(addr: &str, origin: &str, ann: &[(&str, &str)]) -> Input {
         Input {
             r#ref: TargetAddr::parse(addr, &PkgBuf::from("")).expect("parse addr"),
@@ -542,14 +582,14 @@ mod tests {
         ])?;
 
         let rs = engine.new_state();
-        let mut visited = FxHashSet::default();
 
-        let inputs = vec![input("//pkg:grp", "tool|cc|0", &[("unpack_root", "tools")])];
+        let inputs = declaring(vec![input(
+            "//pkg:grp",
+            "tool|cc|0",
+            &[("unpack_root", "tools")],
+        )]);
 
-        let expanded = Arc::clone(&engine)
-            .expand_inputs(rs, &inputs, &mut visited)
-            .await?
-            .context("a group input is expanded")?;
+        let expanded = Arc::clone(&engine).expand_inputs(rs, &inputs).await?;
 
         assert_eq!(expanded.len(), 1, "group → one child");
         let child = &expanded[0];
@@ -579,12 +619,18 @@ mod tests {
             .await?;
         let def = Arc::clone(&engine).get_def_no_track(rs, &addr).await?;
 
-        let ExpandedInputs::Declared(shared) = &*expanded else {
+        let InputList::Declared(shared) = &expanded.inputs else {
             panic!("no group, yet the inputs were copied");
         };
         assert!(Arc::ptr_eq(shared, &def.target_def));
-        let addrs: Vec<String> = expanded.iter().map(|i| i.r#ref.r#ref.format()).collect();
-        assert_eq!(addrs, ["//pkg:a", "//pkg:b"]);
+        let addrs: Vec<(String, String)> = expanded
+            .with_defs()
+            .map(|(i, d)| (i.r#ref.r#ref.format(), d.target_def.addr.format()))
+            .collect();
+        assert_eq!(
+            addrs,
+            [("//pkg:a", "//pkg:a"), ("//pkg:b", "//pkg:b")].map(|(i, d)| (i.into(), d.into()))
+        );
         Ok(())
     }
 
@@ -603,40 +649,39 @@ mod tests {
             exec_spec("//pkg:m3"),
         ])?;
         let rs = engine.new_state();
-        let mut visited = FxHashSet::default();
-        let inputs = vec![
+        let inputs = declaring(vec![
             input("//pkg:x", "x|0", &[]),
             input("//pkg:outer", "outer|1", &[("unpack_root", "tools")]),
             input("//pkg:y", "y|2", &[]),
-        ];
-        let expanded = Arc::clone(&engine)
-            .expand_inputs(rs, &inputs, &mut visited)
-            .await?
-            .context("a group input is expanded")?;
+        ]);
+        let expanded = Arc::clone(&engine).expand_inputs(rs, &inputs).await?;
 
-        let got: Vec<(String, &str)> = expanded
-            .iter()
-            .map(|i| (i.r#ref.r#ref.format(), i.origin_id.as_str()))
+        // Each input with its own def, index for index.
+        let got: Vec<(String, &str, String)> = expanded
+            .with_defs()
+            .map(|(i, d)| {
+                (
+                    i.r#ref.r#ref.format(),
+                    i.origin_id.as_str(),
+                    d.target_def.addr.format(),
+                )
+            })
             .collect();
-        assert_eq!(
-            got,
-            [
-                ("//pkg:x".to_string(), "x|0"),
-                ("//pkg:m1".to_string(), "outer|1"),
-                ("//pkg:m2".to_string(), "outer|1"),
-                ("//pkg:m3".to_string(), "outer|1"),
-                ("//pkg:y".to_string(), "y|2"),
-            ]
-        );
+        let want = [
+            ("//pkg:x", "x|0"),
+            ("//pkg:m1", "outer|1"),
+            ("//pkg:m2", "outer|1"),
+            ("//pkg:m3", "outer|1"),
+            ("//pkg:y", "y|2"),
+        ]
+        .map(|(a, o)| (a.to_string(), o, a.to_string()));
+        assert_eq!(got, want);
+        assert_eq!(expanded.len(), expanded.defs.len());
         assert!(
             expanded[1..4]
                 .iter()
                 .all(|i| i.annotations.get("unpack_root").map(String::as_str) == Some("tools")),
             "every member, nested or not, carries the reference's annotations"
-        );
-        assert!(
-            visited.is_empty(),
-            "a finished walk leaves no group on its path"
         );
         Ok(())
     }
@@ -652,11 +697,10 @@ mod tests {
             group_spec("//pkg:b", &["//pkg:a"]),
         ])?;
         let rs = engine.new_state();
-        let mut visited = FxHashSet::default();
-        let inputs = vec![input("//pkg:a", "dep|0", &[])];
+        let inputs = declaring(vec![input("//pkg:a", "dep|0", &[])]);
         let res = tokio::time::timeout(
             std::time::Duration::from_secs(60),
-            Arc::clone(&engine).expand_inputs(rs, &inputs, &mut visited),
+            Arc::clone(&engine).expand_inputs(rs, &inputs),
         )
         .await
         .context("a circular group hangs the expansion")?;
@@ -688,17 +732,13 @@ mod tests {
             exec_spec("//pkg:leaf"),
         ])?;
         let rs = engine.new_state();
-        let mut visited = FxHashSet::default();
         // Both keys come from the parent; leaf has none → parent values win.
-        let inputs = vec![input(
+        let inputs = declaring(vec![input(
             "//pkg:grp",
             "tool|cc|0",
             &[("unpack_root", "tools"), ("custom", "p")],
-        )];
-        let expanded = Arc::clone(&engine)
-            .expand_inputs(rs, &inputs, &mut visited)
-            .await?
-            .context("a group input is expanded")?;
+        )]);
+        let expanded = Arc::clone(&engine).expand_inputs(rs, &inputs).await?;
         assert_eq!(
             expanded[0].annotations.get("custom").map(String::as_str),
             Some("p"),
@@ -756,14 +796,13 @@ mod tests {
         let engine = Arc::new(engine);
 
         let rs = engine.new_state();
-        let mut visited = FxHashSet::default();
-        let inputs = vec![
+        let inputs = declaring(vec![
             input("//pkg:ep", "dep|0", &[]),
             input("//pkg:bad", "dep|1", &[]),
-        ];
+        ]);
         let res = tokio::time::timeout(
             std::time::Duration::from_secs(60),
-            Arc::clone(&engine).expand_inputs(rs, &inputs, &mut visited),
+            Arc::clone(&engine).expand_inputs(rs, &inputs),
         )
         .await
         .map_err(|_elapsed| {
