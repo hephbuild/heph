@@ -3,7 +3,7 @@
 //! compiled — no transport or host deps — so the guest SDK can use them with
 //! `default-features = false`.
 
-use crate::abi::{DynItemStream, StableItemStream};
+use crate::abi::{DynItemStream, PluginComponents, StableItemStream};
 use crate::vtable::dynify;
 use stabby::vec::Vec as SVec;
 use std::sync::Mutex;
@@ -82,6 +82,26 @@ impl buffa::EncodeSink for SVecSink<'_> {
     #[inline]
     fn put_u64_le(&mut self, value: u64) {
         self.0.copy_extend(&value.to_le_bytes());
+    }
+}
+
+// Kept out of `abi.rs`, the guarded stabby surface (`scripts/abi-check.sh`):
+// an inherent constructor adds no layout or vtable entry, so it does not move
+// `ABI_SEMVER`.
+impl PluginComponents {
+    /// A bundle that exports nothing. A plugin fills in what it has with
+    /// struct-update syntax (`PluginComponents { drivers, ..PluginComponents::empty() }`),
+    /// and a create entry whose construction failed hands it back whole.
+    pub fn empty() -> Self {
+        Self {
+            provider: stabby::option::Option::None(),
+            drivers: SVec::new(),
+            functions: SVec::new(),
+            function_handle: stabby::option::Option::None(),
+            hooks: SVec::new(),
+            runners: SVec::new(),
+            meta: SVec::new(),
+        }
     }
 }
 

@@ -41,13 +41,8 @@ use hplugin::driver::{
     ParseRequest, ParseResponse, Resources, RunStdio,
 };
 use plugin_sdk::foreground::{ForegroundCommand, PathPolicy, RunnerRef, spawn_foreground};
-use plugin_sdk::stabby::abi::{
-    DynFunctionRegistry, DynLogSink, DynRunnerHost, DynSupervisor, PluginComponents,
-};
-use plugin_sdk::stabby::{
-    create_config_from_bytes, install_log_sink, install_runner_host, install_supervisor,
-    named_managed_driver,
-};
+use plugin_sdk::stabby::abi::{DynFunctionRegistry, PluginComponents};
+use plugin_sdk::stabby::{create_config_from_bytes, named_managed_driver};
 use std::ffi::OsString;
 
 const SCRIPT: &str = r#"
@@ -380,43 +375,11 @@ pub extern "C" fn heph_plugin_create(
         Err(e) => tracing::error!(error = %format!("{e:#}"), "entrypoint test plugin: create"),
     }
     PluginComponents {
-        provider: stabby::option::Option::None(),
         drivers,
-        functions: stabby::vec::Vec::new(),
-        function_handle: stabby::option::Option::None(),
-        hooks: stabby::vec::Vec::new(),
-        runners: stabby::vec::Vec::new(),
-        meta: stabby::vec::Vec::new(),
+        ..PluginComponents::empty()
     }
 }
 
-/// Stable ABI log-sink entry: this cdylib's own `tracing` forwards to the host.
-#[stabby::export]
-pub extern "C" fn heph_plugin_set_log_sink(sink: DynLogSink) {
-    install_log_sink(sink);
-}
-
-/// ABI version entry, read by the host before anything else.
-#[unsafe(no_mangle)]
-pub extern "C" fn heph_plugin_abi_semver() -> *const std::ffi::c_char {
-    plugin_sdk::stabby::abi_semver()
-}
-
-/// Stable ABI log-filter entry.
-#[stabby::export]
-pub extern "C" fn heph_plugin_set_log_filter(filter: stabby::vec::Vec<u8>) {
-    plugin_sdk::stabby::install_log_filter(&filter);
-}
-
-/// Stable ABI supervisor entry: the tool's pid is tracked with the host's
-/// sidecar through this cdylib's own copy of `proc`.
-#[stabby::export]
-pub extern "C" fn heph_plugin_set_supervisor(sup: DynSupervisor) {
-    install_supervisor(sup);
-}
-
-/// Stable ABI exec-runner entry, for parity with the shipped cdylibs.
-#[stabby::export]
-pub extern "C" fn heph_plugin_set_runner_host(host: DynRunnerHost) {
-    install_runner_host(host);
-}
+// The supervisor entry tracks the tool's pid with the host's sidecar through
+// this cdylib's own copy of `proc`.
+plugin_sdk::export_host_entries!();
