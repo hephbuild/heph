@@ -534,7 +534,7 @@ fn new_engine_at(
     // per-event cost. Non-event signals (execute_ms, artifacts, graph size, the
     // CLI invocation) are still recorded via direct `telemetry::record_*` calls,
     // and the synchronous `snapshot()` read the engine uses stays direct.
-    if crate::telemetry::is_enabled(file.telemetry_enabled()) {
+    if crate::telemetry::is_enabled(|| file.telemetry_enabled()) {
         e.register_hook(Arc::new(TelemetryHook))?;
     }
 

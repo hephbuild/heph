@@ -210,12 +210,13 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // Telemetry decision is taken up front (config read), but the event is
+    // Telemetry decision is taken up front (the env kill switch, then the
+    // config read only when the switch is unset), but the event is
     // recorded at exit: spooled, and handed to a detached flusher when the
     // spool is due — never waited on. On CI the runner — and its spool — is
     // ephemeral and kills detached processes, so CI sends synchronously.
     let telemetry_on =
-        heph::telemetry::is_enabled(commands::bootstrap::telemetry_enabled_from_config());
+        heph::telemetry::is_enabled(commands::bootstrap::telemetry_enabled_from_config);
     // Warm the repo fingerprint off the hot path: the git root walk runs on a
     // detached thread now so the exit-time flush only reads the cached result.
     if telemetry_on {

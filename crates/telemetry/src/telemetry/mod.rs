@@ -274,9 +274,17 @@ fn ci_from(lookup: impl Fn(&str) -> Option<String>) -> bool {
 
 /// Whether telemetry should run, combining the config flag with the env kill
 /// switch. The env var wins so CI and the project's own e2e binaries can opt out
-/// without touching a config file.
-pub fn is_enabled(config_enabled: bool) -> bool {
-    config_enabled && std::env::var_os(DISABLE_ENV).is_none()
+/// without touching a config file. The env is checked first, so the config —
+/// a `.hephconfig` parse at startup — is only read when the kill switch is
+/// unset.
+pub fn is_enabled(config_enabled: impl FnOnce() -> bool) -> bool {
+    enabled_with(std::env::var_os(DISABLE_ENV).is_some(), config_enabled)
+}
+
+/// [`is_enabled`] over an injected kill-switch state, testable without
+/// mutating the process environment.
+fn enabled_with(env_disabled: bool, config_enabled: impl FnOnce() -> bool) -> bool {
+    !env_disabled && config_enabled()
 }
 
 /// Machine-level config dir holding the install id and the spool:
@@ -1606,12 +1614,27 @@ mod tests {
     fn env_kill_switch_overrides_enabled() {
         // SAFETY: single-threaded test; no other thread reads the env here.
         unsafe { std::env::set_var(DISABLE_ENV, "1") };
-        assert!(!is_enabled(true));
+        assert!(!is_enabled(|| true));
         // SAFETY: as above.
         unsafe { std::env::remove_var(DISABLE_ENV) };
-        assert!(is_enabled(true));
+        assert!(is_enabled(|| true));
         // Config opt-out alone also disables.
-        assert!(!is_enabled(false));
+        assert!(!is_enabled(|| false));
+    }
+
+    #[test]
+    fn env_kill_switch_skips_the_config_read() {
+        // Set, the switch decides alone: the config (a `.hephconfig` parse in
+        // the binary) is never read.
+        assert!(!enabled_with(true, || panic!(
+            "config read under the kill switch"
+        )));
+        let mut read = false;
+        assert!(enabled_with(false, || {
+            read = true;
+            true
+        }));
+        assert!(read, "config read when the switch is unset");
     }
 
     #[test]
