@@ -258,14 +258,14 @@ pub fn fs_entry_hashout(out_path: &str, content_hashout: &str) -> String {
 /// used only as a *cache validation* fast-path, never as the identity.)
 pub fn file_hashout(path: &Path, x: bool) -> Result<String> {
     use std::io::Read as _;
-    let file = std::fs::File::open(path)
+    let mut file = std::fs::File::open(path)
         .with_context(|| format!("open file for hashing '{}'", path.display()))?;
-    let mut reader = std::io::BufReader::new(file);
     let mut h = ContentHasher::new();
-    // Stream in chunks so large inputs never load wholesale into memory.
+    // Stream in chunks so large inputs never load wholesale into memory. The
+    // chunks are large enough that a BufReader would add nothing.
     let mut buf = [0u8; 64 * 1024];
     loop {
-        let n = reader
+        let n = file
             .read(&mut buf)
             .with_context(|| format!("read file for hashing '{}'", path.display()))?;
         if n == 0 {
@@ -1338,6 +1338,19 @@ mod tests {
             }
         }
         assert_ne!(bytes_hashout(b"a", false), bytes_hashout(b"a", true));
+    }
+
+    /// The hashout of a file over several read chunks is pinned: it reaches
+    /// every input's hashin, so a change to how the file is read must not
+    /// move it.
+    #[test]
+    fn file_hashout_over_several_chunks_is_pinned() {
+        let tmp = tempdir().unwrap();
+        let f = tmp.path().join("big");
+        let body: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&f, &body).unwrap();
+        assert_eq!(file_hashout(&f, false).unwrap(), "c25fbb19f343cf66");
+        assert_eq!(file_hashout(&f, true).unwrap(), "82a2c1fe43996d65");
     }
 
     /// Opening a walker opens no database, and a walker that never walked
