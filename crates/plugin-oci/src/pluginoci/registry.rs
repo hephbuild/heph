@@ -17,7 +17,7 @@ use oci_client::client::{ClientConfig, ClientProtocol};
 use oci_client::manifest::OciImageIndex;
 use oci_client::{Client, Reference};
 
-use super::archive::{Blob, Layout};
+use super::archive::{self, Blob, Layout};
 use super::auth::RegistryCredentials;
 
 /// A blob as one request body, without copying a file-backed blob onto the heap.
@@ -177,26 +177,11 @@ pub(crate) async fn push_layout(
     // index, and a list naming a digest the registry never received is rejected
     // with MANIFEST_BLOB_UNKNOWN.
     let manifests = entries
-        .iter()
-        .map(
-            |(platform, digest, size)| oci_client::manifest::ImageIndexEntry {
-                media_type: oci_client::manifest::OCI_IMAGE_MEDIA_TYPE.to_string(),
-                artifact_type: None,
-                digest: digest.clone(),
-                size: *size,
-                platform: platform.clone(),
-                annotations: None,
-            },
-        )
+        .into_iter()
+        .map(|(platform, digest, size)| archive::image_manifest_entry(digest, size, platform))
         .collect();
 
-    let index = OciImageIndex {
-        schema_version: 2,
-        media_type: Some(oci_client::manifest::OCI_IMAGE_INDEX_MEDIA_TYPE.to_string()),
-        artifact_type: None,
-        manifests,
-        annotations: None,
-    };
+    let index = archive::oci_index(manifests);
     client
         .push_manifest_list(&reference, &auth, index)
         .await
@@ -294,20 +279,11 @@ pub(crate) async fn pull_layout(
                 serde_json::from_slice(&raw).context("parse image manifest")?;
             blobs.insert(digest.clone(), Blob::Bytes(raw.to_vec()));
             pull_one(&client, &reference, &manifest, blob_dir, &mut blobs).await?;
-            let index = OciImageIndex {
-                schema_version: 2,
-                media_type: Some(oci_client::manifest::OCI_IMAGE_INDEX_MEDIA_TYPE.to_string()),
-                artifact_type: None,
-                manifests: vec![oci_client::manifest::ImageIndexEntry {
-                    media_type: oci_client::manifest::OCI_IMAGE_MEDIA_TYPE.to_string(),
-                    artifact_type: None,
-                    digest,
-                    size: raw.len() as i64,
-                    platform: None,
-                    annotations: None,
-                }],
-                annotations: None,
-            };
+            let index = archive::oci_index(vec![archive::image_manifest_entry(
+                digest,
+                raw.len() as i64,
+                None,
+            )]);
             return Ok(Pulled {
                 index,
                 blobs,
@@ -335,13 +311,7 @@ pub(crate) async fn pull_layout(
         pull_one(&client, &reference, &manifest, blob_dir, &mut blobs).await?;
     }
 
-    let index = OciImageIndex {
-        schema_version: 2,
-        media_type: Some(oci_client::manifest::OCI_IMAGE_INDEX_MEDIA_TYPE.to_string()),
-        artifact_type: None,
-        manifests: entries,
-        annotations: None,
-    };
+    let index = archive::oci_index(entries);
     Ok(Pulled {
         index,
         blobs,

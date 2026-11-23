@@ -50,7 +50,7 @@ use hplugin::driver::{
     ParseResponse, TargetAddr,
 };
 use hplugin::htspec::{Spec, TargetSpecCache};
-use oci_client::manifest::{ImageIndexEntry, OciImageIndex};
+use oci_client::manifest::ImageIndexEntry;
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
@@ -711,12 +711,10 @@ impl ManagedDriver for Driver {
             let manifest_bytes = serde_json::to_vec(&manifest).context("encode the manifest")?;
             let manifest_digest = archive::sha256_digest(&manifest_bytes);
             let (os, arch) = split_platform(platform)?;
-            entries.push(ImageIndexEntry {
-                media_type: oci_client::manifest::OCI_IMAGE_MEDIA_TYPE.to_string(),
-                artifact_type: None,
-                digest: manifest_digest.clone(),
-                size: manifest_bytes.len() as i64,
-                platform: Some(oci_client::manifest::Platform {
+            entries.push(archive::image_manifest_entry(
+                manifest_digest.clone(),
+                manifest_bytes.len() as i64,
+                Some(oci_client::manifest::Platform {
                     os: os.into(),
                     architecture: arch.into(),
                     os_version: None,
@@ -724,19 +722,12 @@ impl ManagedDriver for Driver {
                     variant: None,
                     features: None,
                 }),
-                annotations: None,
-            });
+            ));
             blobs.insert(manifest_digest, Blob::Bytes(manifest_bytes));
         }
 
         let layout = archive::Layout {
-            index: OciImageIndex {
-                schema_version: 2,
-                media_type: Some(oci_client::manifest::OCI_IMAGE_INDEX_MEDIA_TYPE.to_string()),
-                artifact_type: None,
-                manifests: entries.clone(),
-                annotations: None,
-            },
+            index: archive::oci_index(entries),
             blobs,
         };
         let index = &layout.index;
@@ -752,7 +743,7 @@ impl ManagedDriver for Driver {
 
         // A single image reports its own manifest digest; several report the
         // list's, which is what a registry files the tag under.
-        let digest = match entries.as_slice() {
+        let digest = match index.manifests.as_slice() {
             [only] => only.digest.clone(),
             _ => {
                 let raw = serde_json::to_vec(index).context("encode the manifest list")?;
@@ -1095,12 +1086,10 @@ mod tests {
         }))
         .expect("encode manifest");
         let manifest_digest = archive::sha256_digest(&manifest);
-        let entry = ImageIndexEntry {
-            media_type: oci_client::manifest::OCI_IMAGE_MEDIA_TYPE.to_string(),
-            artifact_type: None,
-            digest: manifest_digest.clone(),
-            size: manifest.len() as i64,
-            platform: Some(oci_client::manifest::Platform {
+        let entry = archive::image_manifest_entry(
+            manifest_digest.clone(),
+            manifest.len() as i64,
+            Some(oci_client::manifest::Platform {
                 os: "linux".into(),
                 architecture: "amd64".into(),
                 os_version: None,
@@ -1108,17 +1097,10 @@ mod tests {
                 variant: None,
                 features: None,
             }),
-            annotations: None,
-        };
+        );
         blobs.insert(manifest_digest, Blob::Bytes(manifest));
         archive::Layout {
-            index: OciImageIndex {
-                schema_version: 2,
-                media_type: Some(oci_client::manifest::OCI_IMAGE_INDEX_MEDIA_TYPE.to_string()),
-                artifact_type: None,
-                manifests: vec![entry],
-                annotations: None,
-            },
+            index: archive::oci_index(vec![entry]),
             blobs,
         }
     }
