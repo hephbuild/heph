@@ -3251,7 +3251,6 @@ impl Engine {
                 let result = self
                     .execute_and_cache(
                         rs.clone(),
-                        &def,
                         output_names,
                         &ExecuteOptions {
                             hashin: &meta.hashin,
@@ -3466,11 +3465,11 @@ impl Engine {
     async fn execute_and_cache(
         self: Arc<Self>,
         rs: Arc<RequestState>,
-        def: &LinkedTargetDef,
         outputs: Vec<String>,
         opts: &ExecuteOptions<'_>,
     ) -> anyhow::Result<(MemoResult, Option<Arc<ResultReadGuard>>)> {
-        let (locked, handed) = self.clone().resolve_locked(rs.clone(), def, opts).await?;
+        let def = opts.def;
+        let (locked, handed) = self.clone().resolve_locked(rs.clone(), opts).await?;
         // This caller's riding read, held across everything below (output
         // reads, codegen write-back) and handed on beside the result to the
         // caller that created this cell — never kept by the memoized value.
@@ -3890,10 +3889,9 @@ impl Engine {
     async fn resolve_locked(
         self: Arc<Self>,
         rs: Arc<RequestState>,
-        def: &LinkedTargetDef,
         opts: &ExecuteOptions<'_>,
     ) -> anyhow::Result<(Arc<LockedResolution>, Option<Arc<ResultReadGuard>>)> {
-        let addr = def.target.addr.clone();
+        let addr = opts.def.target.addr.clone();
         // Filled only if this call creates the cell. See `GuardSlot`.
         let handoff = Handoff::default();
         // Owned copies so the memoizer closure is `'static`.
@@ -4093,7 +4091,7 @@ impl Engine {
                 self.result_lock().read(addr, hashin, ctoken),
             )
             .await?;
-        if let Some(manifest) = self.probe_cache_manifest(&rs, def, opts).await? {
+        if let Some(manifest) = self.probe_cache_manifest(&rs, addr, hashin).await? {
             // A. Hit — share this read; each caller reads its own outputs under
             // it and offers the codegen write-back / fixpoint in
             // `execute_and_cache` (once per addr, under this riding read). The
@@ -4167,7 +4165,7 @@ impl Engine {
                         let read = engine.result_lock().read(addr, hashin, ctoken).await?;
                         Ok(
                             match engine
-                                .probe_cache_manifest(rs_ref, def, opts)
+                                .probe_cache_manifest(rs_ref, addr, hashin)
                                 .await
                                 .with_context(|| format!("probing the local cache for {addr}"))
                             {
@@ -4217,7 +4215,7 @@ impl Engine {
         // race-win we share without executing; otherwise we execute + cache the
         // full set, which `build_eresult` filters per caller.
         let (executed, manifest, remote, hit) =
-            match self.probe_cache_manifest(&rs, def, opts).await? {
+            match self.probe_cache_manifest(&rs, addr, hashin).await? {
                 // Same as branch A: where the blobs live stays unresolved until a
                 // caller needs them.
                 Some(manifest) => (
@@ -5888,11 +5886,9 @@ impl Engine {
     async fn probe_cache_manifest(
         &self,
         rs: &Arc<RequestState>,
-        def: &LinkedTargetDef,
-        opts: &ExecuteOptions<'_>,
+        addr: &Addr,
+        hashin: &str,
     ) -> anyhow::Result<Option<Arc<Manifest>>> {
-        let addr = &def.target.addr;
-        let hashin = opts.hashin.as_str();
         let hit = self
             .read_manifest_blocking(rs.ctoken(), addr, hashin)
             .await?
