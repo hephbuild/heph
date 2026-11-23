@@ -711,6 +711,66 @@ pub fn list_path_for(input: &RunInput, list_dir: &Path) -> Option<PathBuf> {
     }
 }
 
+/// A run's sandbox skeleton, as both sandbox runners lay it out: the `ws` and
+/// `list` dirs, created, and the inputs grouped by unpack root.
+#[derive(Debug)]
+pub struct GroupedInputs {
+    pub ws_dir: PathBuf,
+    pub list_dir: PathBuf,
+    /// Each input under its [`resolve_unpack_root`], in input order within a
+    /// root; the map orders the roots.
+    pub groups: BTreeMap<PathBuf, Vec<RunInput>>,
+}
+
+/// Creates `<sandbox_dir>/ws` and `<sandbox_dir>/list` and groups `inputs` by
+/// where each materializes. Shared by the OS and FUSE runners, so the grouping
+/// both the collision check and the unpack rely on has one definition.
+pub fn group_inputs(inputs: Vec<RunInput>, sandbox_dir: &Path) -> anyhow::Result<GroupedInputs> {
+    let ws_dir = sandbox_dir.join("ws");
+    fs::create_dir_all(&ws_dir).with_context(|| format!("create ws dir {:?}", ws_dir))?;
+
+    let list_dir = sandbox_dir.join("list");
+    fs::create_dir_all(&list_dir).with_context(|| format!("create list dir {:?}", list_dir))?;
+
+    let mut groups: BTreeMap<PathBuf, Vec<RunInput>> = BTreeMap::new();
+    for input in inputs {
+        let unpack_root = resolve_unpack_root(&input, sandbox_dir, &ws_dir);
+        groups.entry(unpack_root).or_default().push(input);
+    }
+    Ok(GroupedInputs {
+        ws_dir,
+        list_dir,
+        groups,
+    })
+}
+
+/// Writes `input`'s tree into `unpack_root` through [`unpack_blocking`] (off the
+/// worker, stopped by the run's cancellation), with the error context both
+/// sandbox runners give a failed unpack.
+pub async fn unpack_input(
+    input: &RunInput,
+    unpack_root: &Path,
+    list_path: Option<PathBuf>,
+    ctoken: &(dyn Cancellable + Send + Sync),
+) -> anyhow::Result<()> {
+    unpack_blocking(
+        Arc::clone(&input.artifact.content),
+        unpack_root.to_path_buf(),
+        list_path,
+        input.filters.clone(),
+        ctoken,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "unpack input origin_id={} source_addr={} into {:?}",
+            input.origin_id,
+            input.source_addr.format(),
+            unpack_root,
+        )
+    })
+}
+
 /// Reject two *different* producer targets writing the same file into one
 /// sandbox. Keyed on producer identity (`source_addr`), per the sandbox
 /// isolation model: a materialized path has exactly one owning target. A path

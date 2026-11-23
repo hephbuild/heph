@@ -1,12 +1,11 @@
 use crate::driver_managed::{
-    ManagedDriver, ManagedRunInput, ShellFallback, collect_outputs,
-    detect_output_collisions_blocking, invoke_inner, list_path_for, resolve_unpack_root,
-    unpack_blocking, write_source_map_blocking,
+    GroupedInputs, ManagedDriver, ManagedRunInput, ShellFallback, collect_outputs,
+    detect_output_collisions_blocking, group_inputs, invoke_inner, list_path_for, unpack_input,
+    write_source_map_blocking,
 };
 use anyhow::Context;
 use hcore::hasync::Cancellable;
-use hplugin::driver::{RunInput, RunRequest, RunResponse};
-use std::collections::BTreeMap;
+use hplugin::driver::{RunRequest, RunResponse};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -51,17 +50,11 @@ impl ManagedDriverOs {
             Some(Box::new(move || {
                 hcore::fsutil::remove_dir_all(&cleanup_dir)
             }));
-        let ws_dir = sandbox_dir.join("ws");
-        fs::create_dir_all(&ws_dir).with_context(|| format!("create ws dir {:?}", ws_dir))?;
-
-        let list_dir = sandbox_dir.join("list");
-        fs::create_dir_all(&list_dir).with_context(|| format!("create list dir {:?}", list_dir))?;
-
-        let mut groups: BTreeMap<PathBuf, Vec<RunInput>> = BTreeMap::new();
-        for input in std::mem::take(&mut req.inputs) {
-            let unpack_root = resolve_unpack_root(&input, &sandbox_dir, &ws_dir);
-            groups.entry(unpack_root).or_default().push(input);
-        }
+        let GroupedInputs {
+            ws_dir,
+            list_dir,
+            groups,
+        } = group_inputs(std::mem::take(&mut req.inputs), &sandbox_dir)?;
 
         // Reject two distinct targets producing the same sandbox file before we
         // materialize anything — the copy path would otherwise silently
@@ -111,25 +104,8 @@ impl ManagedDriverOs {
                         holds.extend(hold);
                     }
                     _ => {
-                        // Writes the input's entire tree to disk — off the
-                        // worker, and stopped by the run's cancellation, see
-                        // `unpack_blocking`.
-                        unpack_blocking(
-                            Arc::clone(&input.artifact.content),
-                            unpack_root.clone(),
-                            list_path.clone(),
-                            input.filters.clone(),
-                            ctoken,
-                        )
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "unpack input origin_id={} source_addr={} into {:?}",
-                                input.origin_id,
-                                input.source_addr.format(),
-                                unpack_root,
-                            )
-                        })?;
+                        // Writes the input's entire tree to disk.
+                        unpack_input(&input, &unpack_root, list_path.clone(), ctoken).await?;
                     }
                 }
                 inputs.push(ManagedRunInput {
@@ -240,8 +216,9 @@ mod tests {
     use hplugin::driver::targetdef::TargetDef;
     use hplugin::driver::{
         ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse,
-        ParseRequest, ParseResponse,
+        ParseRequest, ParseResponse, RunInput,
     };
+    use std::collections::BTreeMap;
 
     /// A driver whose run writes `report.txt` into its package dir, then
     /// succeeds (`None`) or fails with the error the function makes.

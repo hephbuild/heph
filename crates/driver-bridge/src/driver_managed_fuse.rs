@@ -2,8 +2,8 @@ use anyhow::Context;
 use hcore::hartifactcontent::tar_index::{IndexEntryKind, TarIndex};
 use hcore::hasync::Cancellable;
 use hdriver_support::driver_managed::{
-    ManagedDriver, ManagedRunInput, OutputClaims, ShellFallback, collect_outputs, invoke_inner,
-    list_path_for, resolve_unpack_root, unpack_blocking, write_source_map_blocking,
+    GroupedInputs, ManagedDriver, ManagedRunInput, OutputClaims, ShellFallback, collect_outputs,
+    group_inputs, invoke_inner, list_path_for, unpack_input, write_source_map_blocking,
 };
 use hdriver_support::stop;
 use hplugin::driver::{RunInput, RunRequest, RunResponse, SandboxGuard};
@@ -54,17 +54,11 @@ impl ManagedDriverFuse {
                 hcore::fsutil::remove_dir_all(&upper_cleanup_dir)
             }));
 
-        let ws_dir = sandbox_dir.join("ws");
-        fs::create_dir_all(&ws_dir).with_context(|| format!("create ws dir {:?}", ws_dir))?;
-
-        let list_dir = sandbox_dir.join("list");
-        fs::create_dir_all(&list_dir).with_context(|| format!("create list dir {:?}", list_dir))?;
-
-        let mut groups: BTreeMap<PathBuf, Vec<RunInput>> = BTreeMap::new();
-        for input in std::mem::take(&mut req.inputs) {
-            let unpack_root = resolve_unpack_root(&input, &sandbox_dir, &ws_dir);
-            groups.entry(unpack_root).or_default().push(input);
-        }
+        let GroupedInputs {
+            ws_dir,
+            list_dir,
+            groups,
+        } = group_inputs(std::mem::take(&mut req.inputs), &sandbox_dir)?;
 
         // Build every group's layers, then reject two distinct targets
         // producing the same sandbox file, before we register any slot —
@@ -107,25 +101,8 @@ impl ManagedDriverFuse {
                     // into the FUSE upper layer just like OS mode.
                     for input in group {
                         let list_path = list_path_for(&input, &list_dir);
-                        // Off the worker and stopped by the run's
-                        // cancellation, through the same shared helper the OS
-                        // runner uses — see `unpack_blocking`.
-                        unpack_blocking(
-                            Arc::clone(&input.artifact.content),
-                            unpack_root.clone(),
-                            list_path.clone(),
-                            input.filters.clone(),
-                            ctoken,
-                        )
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "unpack input origin_id={} source_addr={} into {:?}",
-                                input.origin_id,
-                                input.source_addr.format(),
-                                unpack_root,
-                            )
-                        })?;
+                        // The same shared helper the OS runner uses.
+                        unpack_input(&input, &unpack_root, list_path.clone(), ctoken).await?;
                         inputs.push(ManagedRunInput {
                             input,
                             list_path,
