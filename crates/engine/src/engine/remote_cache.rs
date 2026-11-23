@@ -202,6 +202,25 @@ where
 /// tell its own residue from anything else that ends up in the directory.
 const TEMP_BLOB_EXT: &str = "blob";
 
+/// Write buffer in front of a downloading blob's temp file. Bounded memory: one
+/// per in-flight download, and downloads are capped by the bulk slots.
+const BLOB_TEMP_WRITE_BUFFER: usize = 1 << 20;
+
+/// The smallest such buffer: `tokio::io::copy`'s own chunk, below which a
+/// buffer saves no write.
+const BLOB_TEMP_WRITE_BUFFER_MIN: usize = 8 * 1024;
+
+/// The write buffer for a blob the manifest says is `size` bytes: no larger
+/// than the blob, so a small blob does not allocate a whole
+/// [`BLOB_TEMP_WRITE_BUFFER`], and never under [`BLOB_TEMP_WRITE_BUFFER_MIN`].
+/// `size` is the decoded size; the stored bytes of a zstd blob are usually
+/// fewer, and a buffer that ends up a little short costs one more write.
+fn blob_temp_write_buffer(size: u64) -> usize {
+    usize::try_from(size)
+        .unwrap_or(usize::MAX)
+        .clamp(BLOB_TEMP_WRITE_BUFFER_MIN, BLOB_TEMP_WRITE_BUFFER)
+}
+
 /// A transient file under `remote-tmp`, unlinked when dropped.
 ///
 /// Every temp here is consumed and discarded within the operation that made it —
@@ -1683,9 +1702,24 @@ impl RemoteCacheSet {
         // future — unlinks the partial temp through `TempBlob`'s drop.
         let temp = TempBlob::new(dest_dir);
         // Temp-file I/O is local and genuinely fatal — propagate.
-        let mut file = tokio::fs::File::create(temp.path())
+        //
+        // Buffered because `tokio::io::copy` writes in 8 KiB chunks and every
+        // `poll_write` on a bare `tokio::fs::File` is a `spawn_blocking` round
+        // trip: ~131k blocking-pool dispatches per GiB pulled. The buffer turns
+        // that into one per MiB, or one per reader stall (`copy` flushes when
+        // the reader is pending). `shutdown` below flushes the tail.
+        let file = tokio::fs::File::create(temp.path())
             .await
             .with_context(|| format!("create temp for remote blob {name}"))?;
+        // Sized to the blob when the manifest says it is smaller than the
+        // buffer; a name it does not list (callers check first) gets the whole.
+        let buffer = rev
+            .manifest
+            .artifacts
+            .iter()
+            .find(|a| a.name == name)
+            .map_or(BLOB_TEMP_WRITE_BUFFER, |a| blob_temp_write_buffer(a.size));
+        let mut file = tokio::io::BufWriter::with_capacity(buffer, file);
         let mut reader = reader;
         // Race the transfer against cancellation. Without this a Ctrl-C during a
         // large pull is ignored until the copy ends — and the copy is exactly
@@ -4140,6 +4174,67 @@ mod tests {
                 .expect("blob present");
             assert_eq!(&std::fs::read(temp.path()).expect("read"), want, "{name}");
         }
+    }
+
+    /// A small blob gets a buffer its own size, not a whole MiB; a tiny one
+    /// gets the floor, and a large one the cap.
+    #[test]
+    fn a_blob_temp_buffer_is_sized_to_the_blob_within_bounds() {
+        assert_eq!(blob_temp_write_buffer(0), BLOB_TEMP_WRITE_BUFFER_MIN);
+        assert_eq!(blob_temp_write_buffer(100), BLOB_TEMP_WRITE_BUFFER_MIN);
+        assert_eq!(blob_temp_write_buffer(100_000), 100_000);
+        assert_eq!(
+            blob_temp_write_buffer(BLOB_TEMP_WRITE_BUFFER as u64),
+            BLOB_TEMP_WRITE_BUFFER
+        );
+        assert_eq!(blob_temp_write_buffer(u64::MAX), BLOB_TEMP_WRITE_BUFFER);
+    }
+
+    /// A blob larger than the temp file's write buffer, whose size is not a
+    /// multiple of it, lands whole: the buffered tail is flushed before the
+    /// temp is handed back.
+    #[tokio::test]
+    async fn a_blob_larger_than_the_write_buffer_lands_whole() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let addr = addr();
+        let len = 3 * BLOB_TEMP_WRITE_BUFFER + 12_345;
+        let blob: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let manifest = RemoteManifest {
+            version: REMOTE_MANIFEST_VERSION.to_string(),
+            target: addr.format(),
+            hashin: "h".to_string(),
+            artifacts: vec![remote_artifact(
+                "big.tar",
+                len as u64,
+                ManifestArtifactEncoding::None,
+            )],
+        };
+        let mut objects = std::collections::HashMap::new();
+        objects.insert(
+            RemoteCacheSet::key(&addr, "h", MANIFEST_V2),
+            borsh::to_vec(&manifest).expect("serialize manifest"),
+        );
+        objects.insert(RemoteCacheSet::key(&addr, "h", "big.tar"), blob.clone());
+        let backend = Arc::new(ReadProbeBackend {
+            objects,
+            in_flight: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+        });
+        let set = set_with(backend, dir.path().to_path_buf());
+
+        let rev = set
+            .fetch_manifest(&never(), &addr, "h")
+            .await
+            .expect("fetch manifest")
+            .expect("hit");
+        let temp = set
+            .fetch_blob(&never(), &rev, &addr, "h", "big.tar", dir.path())
+            .await
+            .expect("fetch blob")
+            .expect("blob present");
+        let got = std::fs::read(temp.path()).expect("read temp");
+        assert_eq!(got.len(), len, "every byte, the buffered tail included");
+        assert!(got == blob, "blob bytes must round-trip unchanged");
     }
 
     /// A v2 manifest naming a gzip blob is a miss: downloads store bytes
