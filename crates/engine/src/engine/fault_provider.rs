@@ -89,6 +89,12 @@ pub struct Faults {
     /// Every `get` sleeps this long first, so overlapping calls are visible
     /// in [`FaultProvider::max_concurrent_gets`].
     pub slow_get: Option<Duration>,
+    /// A `get` of any of these addrs waits at the barrier before doing
+    /// anything else, so it returns only once every one of them is in flight
+    /// at the same time: a test of concurrent resolution that cannot pass by
+    /// timing. Size the barrier to the addr count; resolving them one at a
+    /// time hangs, so wrap the call in a timeout.
+    pub rendezvous: Option<(Vec<Addr>, Arc<tokio::sync::Barrier>)>,
 }
 
 /// [`Faults::listed_facts`]: what `list` says about an entry.
@@ -374,6 +380,11 @@ impl Provider for FaultProvider {
     ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
         Box::pin(async move {
             let _in_flight = InFlight::enter(&self.gets, &req.addr);
+            if let Some((addrs, barrier)) = &self.faults.rendezvous
+                && addrs.contains(&req.addr)
+            {
+                barrier.wait().await;
+            }
             if let Some(d) = self.faults.slow_get {
                 tokio::time::sleep(d).await;
             }
