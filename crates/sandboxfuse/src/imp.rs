@@ -23,7 +23,7 @@ use fuser::{
 use hcore::hartifactcontent::ReadSeek;
 use hcore::hartifactcontent::tar_index::{IndexEntryKind, TarIndex};
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
@@ -76,9 +76,9 @@ pub type LayerOpener = Box<dyn Fn() -> anyhow::Result<Box<dyn ReadSeek + Send>> 
 pub struct Layer {
     pub index: TarIndex,
     open: LayerOpener,
-    /// Pre-computed directory children: dir path → vec of (child name, kind).
+    /// Pre-computed directory children: dir path → its children by name.
     /// Includes implicit ancestor dirs that have no explicit tar entry.
-    dirs: HashMap<PathBuf, Vec<(OsString, IndexEntryKind)>>,
+    dirs: HashMap<PathBuf, LayerDirChildren>,
     /// The layer's key in the chunk cache; unique for the process.
     id: u64,
     chunking: Option<Chunking>,
@@ -128,35 +128,52 @@ impl Drop for Layer {
     }
 }
 
-fn build_layer_dirs(index: &TarIndex) -> HashMap<PathBuf, Vec<(OsString, IndexEntryKind)>> {
-    let mut dirs: HashMap<PathBuf, Vec<(OsString, IndexEntryKind)>> = HashMap::new();
-    dirs.entry(PathBuf::new()).or_default();
-    for (path, entry) in &index.entries {
-        let mut ancestor = PathBuf::new();
-        let parts: Vec<&OsStr> = path.components().map(|c| c.as_os_str()).collect();
-        if parts.is_empty() {
-            continue;
-        }
-        for &comp in parts.iter().take(parts.len() - 1) {
-            let comp_os: OsString = comp.to_os_string();
-            let children = dirs.entry(ancestor.clone()).or_default();
-            if !children.iter().any(|(n, _)| n == &comp_os) {
-                children.push((comp_os.clone(), IndexEntryKind::Dir));
-            }
-            ancestor.push(&comp_os);
-            dirs.entry(ancestor.clone()).or_default();
-        }
-        let Some(last) = parts.last() else { continue };
-        let name = (*last).to_os_string();
-        if name.is_empty() {
-            continue;
-        }
-        let children = dirs.entry(ancestor).or_default();
-        if !children.iter().any(|(n, _)| n == &name) {
-            children.push((name, entry.kind.clone()));
+/// One directory's children in a layer, `(name, kind)` sorted by name, each
+/// name once: a lookup is a binary search. Where two entries give the same name
+/// (an implicit parent and an explicit entry), the first one seen wins.
+///
+/// A slice, not the map it is built in: a layer keeps one per directory for as
+/// long as it is mounted, and a map's nodes cost several times a narrow
+/// directory's few entries.
+type LayerDirChildren = Box<[(OsString, IndexEntryKind)]>;
+
+fn build_layer_dirs(index: &TarIndex) -> HashMap<PathBuf, LayerDirChildren> {
+    /// One directory's children while the index is walked: deduplicated by
+    /// name in `O(log n)`, and already in the order the slice keeps.
+    type Building = BTreeMap<OsString, IndexEntryKind>;
+
+    /// Record `name` under `children` unless an earlier entry already did.
+    fn add_child(children: &mut Building, name: &OsStr, kind: impl FnOnce() -> IndexEntryKind) {
+        if !children.contains_key(name) {
+            children.insert(name.to_os_string(), kind());
         }
     }
-    dirs
+
+    let mut dirs: HashMap<PathBuf, Building> = HashMap::new();
+    dirs.entry(PathBuf::new()).or_default();
+    for (path, entry) in &index.entries {
+        let parts: Vec<&OsStr> = path.components().map(|c| c.as_os_str()).collect();
+        let Some((&last, parents)) = parts.split_last() else {
+            continue;
+        };
+        let mut ancestor = PathBuf::new();
+        for &comp in parents {
+            add_child(dirs.entry(ancestor.clone()).or_default(), comp, || {
+                IndexEntryKind::Dir
+            });
+            ancestor.push(comp);
+            dirs.entry(ancestor.clone()).or_default();
+        }
+        if last.is_empty() {
+            continue;
+        }
+        add_child(dirs.entry(ancestor).or_default(), last, || {
+            entry.kind.clone()
+        });
+    }
+    dirs.into_iter()
+        .map(|(dir, children)| (dir, children.into_iter().collect()))
+        .collect()
 }
 
 /// One registered overlay region on a multi-tenant LayeredFs. The `prefix`
@@ -1873,19 +1890,105 @@ mod tests {
         });
     }
 
+    /// Whether `children` names `name`, found by the binary search its sort
+    /// order promises.
+    fn has_child(children: &LayerDirChildren, name: &str) -> bool {
+        children
+            .binary_search_by(|(n, _)| n.as_os_str().cmp(OsStr::new(name)))
+            .is_ok()
+    }
+
     #[test]
     fn build_layer_dirs_materializes_implicit_parents() {
         let layer = layer_from_tar(pack(&[("a/b/c.txt", b"x"), ("a/d.txt", b"y")]));
         let root_children = layer.dirs.get(Path::new("")).expect("root");
-        let names: Vec<_> = root_children.iter().map(|(n, _)| n.clone()).collect();
-        assert!(names.iter().any(|n| n == "a"), "got {names:?}");
+        assert!(has_child(root_children, "a"), "got {root_children:?}");
         let a_children = layer.dirs.get(Path::new("a")).expect("a dir");
-        let a_names: Vec<_> = a_children.iter().map(|(n, _)| n.clone()).collect();
-        assert!(a_names.iter().any(|n| n == "b"));
-        assert!(a_names.iter().any(|n| n == "d.txt"));
+        assert!(has_child(a_children, "b"));
+        assert!(has_child(a_children, "d.txt"));
+        assert!(
+            !has_child(a_children, "c.txt"),
+            "a grandchild is not a child"
+        );
         let b_children = layer.dirs.get(Path::new("a/b")).expect("a/b dir");
-        let b_names: Vec<_> = b_children.iter().map(|(n, _)| n.clone()).collect();
-        assert!(b_names.iter().any(|n| n == "c.txt"));
+        assert!(has_child(b_children, "c.txt"));
+    }
+
+    /// Each directory's children are sorted by name with no name twice, the
+    /// order a binary search relies on, whatever order the tar lists them in.
+    #[test]
+    fn build_layer_dirs_sorts_each_directory_by_name() {
+        let layer = layer_from_tar(pack(&[
+            ("d/z.txt", b"1"),
+            ("d/a.txt", b"2"),
+            ("d/m/x.txt", b"3"),
+            ("d/b.txt", b"4"),
+            ("d/m/y.txt", b"5"),
+        ]));
+        let names: Vec<_> = layer
+            .dirs
+            .get(Path::new("d"))
+            .expect("d dir")
+            .iter()
+            .map(|(n, _)| n.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["a.txt", "b.txt", "m", "z.txt"]);
+    }
+
+    /// A directory named both by its own tar entry and as the parent of
+    /// other entries is listed once, as a directory, and holds every child.
+    #[test]
+    fn build_layer_dirs_merges_explicit_and_implicit_dirs() {
+        let mut buf = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut buf);
+            let mut append_dir = |path: &str| {
+                let mut h = tar::Header::new_gnu();
+                h.set_entry_type(tar::EntryType::Directory);
+                h.set_size(0);
+                h.set_mode(0o755);
+                b.append_data(&mut h, path, std::io::empty())
+                    .expect("append dir");
+            };
+            append_dir("a/");
+            append_dir("a/c/");
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(tar::EntryType::Regular);
+            h.set_size(1);
+            h.set_mode(0o644);
+            b.append_data(&mut h, "a/b.txt", &b"x"[..])
+                .expect("append file");
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(tar::EntryType::Regular);
+            h.set_size(1);
+            h.set_mode(0o644);
+            b.append_data(&mut h, "a/c/d.txt", &b"y"[..])
+                .expect("append file");
+            b.finish().expect("finish");
+        }
+        let layer = layer_from_tar(buf);
+        let kinds = |dir: &str| -> Vec<(String, &'static str)> {
+            layer
+                .dirs
+                .get(Path::new(dir))
+                .unwrap_or_else(|| panic!("{dir:?} has no children"))
+                .iter()
+                .map(|(n, k)| {
+                    let k = match k {
+                        IndexEntryKind::File => "file",
+                        IndexEntryKind::Symlink(_) => "symlink",
+                        IndexEntryKind::Dir => "dir",
+                    };
+                    (n.to_string_lossy().into_owned(), k)
+                })
+                .collect()
+        };
+        assert_eq!(kinds(""), [("a".to_string(), "dir")]);
+        assert_eq!(
+            kinds("a"),
+            [("b.txt".to_string(), "file"), ("c".to_string(), "dir")]
+        );
+        assert_eq!(kinds("a/c"), [("d.txt".to_string(), "file")]);
     }
 
     #[test]
