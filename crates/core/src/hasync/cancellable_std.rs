@@ -1,5 +1,5 @@
 use crate::hasync::Cancellable;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -36,7 +36,9 @@ struct SharedState {
     // concurrent waiters don't clobber each other. A single `Option<Waker>`
     // slot would only ever wake the last registered waiter — the bug this
     // map fixes.
-    wakers: Mutex<HashMap<u64, Waker>>,
+    // Fx, not SipHash: the keys are our own sequential ids, never attacker
+    // input, and the map is hit under a lock shared by the whole request.
+    wakers: Mutex<FxHashMap<u64, Waker>>,
     next_id: AtomicU64,
 }
 
@@ -51,7 +53,7 @@ impl StdCancellationToken {
         Self {
             inner: Arc::new(SharedState {
                 state: AtomicU8::new(LIVE),
-                wakers: Mutex::new(HashMap::new()),
+                wakers: Mutex::new(FxHashMap::default()),
                 next_id: AtomicU64::new(0),
             }),
         }
@@ -115,6 +117,12 @@ impl StdCancellationToken {
 struct Cancelled {
     state: Arc<SharedState>,
     id: Option<u64>,
+    /// The waker last put in the map under `id`. Lets a poll with a waker that
+    /// would wake the same task return without the request-wide lock: inside a
+    /// `select!` this future is re-polled on every wake of its siblings (each
+    /// chunk of a copy, each driver wake), and the lock is shared by every
+    /// target of the request.
+    registered: Option<Waker>,
 }
 
 impl Future for Cancelled {
@@ -124,6 +132,20 @@ impl Future for Cancelled {
         let this = self.get_mut();
         if this.state.state.load(Ordering::SeqCst) != LIVE {
             return Poll::Ready(());
+        }
+        // Our entry is still in the map, holding a waker for this task, unless
+        // `cancel` drained it. Either way this task is woken on cancel without
+        // touching the map. What makes the drained case sound is `Waker::wake`'s
+        // contract: each `wake()` is followed by a poll of the task, and that
+        // wake happens-before the poll it causes. `cancel` stores the state
+        // before it drains and wakes, so the store happens-before that next
+        // poll, whose load above sees it and returns `Ready`.
+        if this
+            .registered
+            .as_ref()
+            .is_some_and(|w| w.will_wake(cx.waker()))
+        {
+            return Poll::Pending;
         }
 
         // The mutex is never poisoned (see `cancel`).
@@ -141,7 +163,9 @@ impl Future for Cancelled {
         let id = *this
             .id
             .get_or_insert_with(|| this.state.next_id.fetch_add(1, Ordering::Relaxed));
-        guard.insert(id, cx.waker().clone());
+        let waker = cx.waker().clone();
+        guard.insert(id, waker.clone());
+        this.registered = Some(waker);
         Poll::Pending
     }
 }
@@ -170,6 +194,7 @@ impl Cancellable for StdCancellationToken {
         Box::pin(Cancelled {
             state: Arc::clone(&self.inner),
             id: None,
+            registered: None,
         })
     }
 
@@ -242,6 +267,123 @@ mod tests {
         plain.cancel();
         plain.cancel_timed_out();
         assert!(plain.is_cancelled() && !plain.timed_out());
+    }
+
+    /// Counts its wakes, so a test can tell which of two wakers `cancel` used.
+    struct CountingWaker(AtomicU64);
+
+    impl std::task::Wake for CountingWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn counting_waker() -> (Arc<CountingWaker>, Waker) {
+        let counter = Arc::new(CountingWaker(AtomicU64::new(0)));
+        (Arc::clone(&counter), Waker::from(counter))
+    }
+
+    /// A re-poll with a waker that wakes the same task does not take the
+    /// request-wide lock, and the waker registered by the first poll is still
+    /// the one `cancel` wakes.
+    #[test]
+    fn a_repoll_with_the_same_waker_skips_the_lock() {
+        let token = StdCancellationToken::new();
+        let (counter, waker) = counting_waker();
+        let mut fut = token.cancelled();
+        assert!(
+            fut.as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+
+        // Hold the lock while another thread re-polls: a poll that took it
+        // would block until the timeout. The guard is dropped before any
+        // assertion, so a failure unblocks the poller instead of hanging the
+        // scope's join.
+        std::thread::scope(|s| {
+            let guard = token.inner.wakers.lock().unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (fut, waker) = (&mut fut, &waker);
+            s.spawn(move || {
+                let pending = fut
+                    .as_mut()
+                    .poll(&mut Context::from_waker(waker))
+                    .is_pending();
+                tx.send(pending).unwrap();
+            });
+            let polled = rx.recv_timeout(Duration::from_secs(5));
+            let registered = guard.len();
+            drop(guard);
+            assert_eq!(
+                polled,
+                Ok(true),
+                "a same-waker re-poll blocked on the waker lock"
+            );
+            assert_eq!(registered, 1);
+        });
+
+        token.cancel();
+        assert_eq!(counter.0.load(Ordering::SeqCst), 1);
+    }
+
+    /// A poll with a waker for a different task replaces the registered one:
+    /// `cancel` wakes the new waker, not the stale one, and the map still
+    /// holds one entry for the future.
+    #[test]
+    fn a_repoll_with_a_new_waker_replaces_the_registered_one() {
+        let token = StdCancellationToken::new();
+        let (old_counter, old) = counting_waker();
+        let (new_counter, new) = counting_waker();
+        let mut fut = token.cancelled();
+        assert!(
+            fut.as_mut()
+                .poll(&mut Context::from_waker(&old))
+                .is_pending()
+        );
+        assert!(
+            fut.as_mut()
+                .poll(&mut Context::from_waker(&new))
+                .is_pending()
+        );
+        assert_eq!(token.inner.wakers.lock().unwrap().len(), 1);
+
+        token.cancel();
+        assert_eq!(old_counter.0.load(Ordering::SeqCst), 0, "stale waker woken");
+        assert_eq!(
+            new_counter.0.load(Ordering::SeqCst),
+            1,
+            "new waker not woken"
+        );
+        assert!(fut.as_mut().poll(&mut Context::from_waker(&new)).is_ready());
+    }
+
+    /// Cancelled while a waiter keeps re-polling with the same waker: the
+    /// fast path must never park it past the cancel.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_waiter_repolled_by_its_siblings_still_sees_cancel() {
+        for _ in 0..200 {
+            let token = StdCancellationToken::new();
+            let waiter = token.clone();
+            let task = tokio::spawn(async move {
+                // A sibling that wakes this task on every poll keeps the
+                // `select!` re-polling `cancelled()` with the same waker.
+                let busy = std::future::poll_fn(|cx| {
+                    cx.waker().wake_by_ref();
+                    Poll::<()>::Pending
+                });
+                tokio::select! {
+                    () = waiter.cancelled() => {}
+                    () = busy => {}
+                }
+            });
+            tokio::task::yield_now().await;
+            token.cancel();
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("waiter missed the cancel")
+                .expect("waiter task panicked");
+        }
     }
 
     #[test]
