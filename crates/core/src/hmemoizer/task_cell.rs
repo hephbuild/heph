@@ -281,7 +281,7 @@ struct Grave {
     restarts: u32,
 }
 
-/// Independent cell maps the key space is split across. See [`Maps::cells`].
+/// Independent shards the key space is split across. See [`Shard::cells`].
 ///
 /// Only has to exceed the runtime's worker count by enough that two workers
 /// rarely collide, so it is sized for a machine larger than any heph runs on
@@ -295,8 +295,15 @@ const SHARD_BITS: u32 = 6;
 /// The memoizer's shared state, behind ONE `Arc`: every spawned body clones a
 /// single pointer instead of two, and the inventory holds a single `Weak`.
 pub(crate) struct Maps<K, V> {
-    /// Live cells, sharded by key hash. Also the arbiter lock between publish
-    /// and the cancel decision (module docs).
+    /// Sharded by key hash; every key's cell and grave live in the one shard
+    /// [`Maps::shard`] picks for it.
+    shards: [Shard<K, V>; SHARDS],
+}
+
+/// One shard of [`Maps`]: the cells and graves of the keys hashing to it.
+struct Shard<K, V> {
+    /// Live cells. Also the arbiter lock between publish and the cancel
+    /// decision (module docs).
     ///
     /// Sharded because the arbiter was the last process-wide serialization
     /// point on the resolution path, and it is taken on *every* memoized call —
@@ -310,20 +317,34 @@ pub(crate) struct Maps<K, V> {
     /// publish, evict), so per-key locking is not a weakening of the arbiter: it
     /// *is* the arbiter, since publish and the cancel decision for a given key
     /// land on the same shard. Nothing takes two shards at once, so the nesting
-    /// discipline (cache → task-slot, cache → graves) is unchanged and no
-    /// shard-order deadlock is reachable.
-    cells: [Mutex<FxHashMap<K, Arc<TaskCell<V>>>>; SHARDS],
+    /// discipline (cells → task-slot, cells → graves, both within one shard)
+    /// is unchanged and no shard-order deadlock is reachable.
+    cells: Mutex<FxHashMap<K, Arc<TaskCell<V>>>>,
     /// Aborted-but-possibly-still-dying predecessors, per key. Entries are
     /// consumed by the next caller for the key; unconsumed entries die with
     /// the memoizer (bounded by cancelled keys per request).
     ///
-    /// Deliberately *not* sharded: it is touched only on the cancellation path,
-    /// which is rare, and it is empty in the steady state.
+    /// Taken on every cold call, not only on cancellation: the vacant arm of
+    /// `process` looks for a grave while it holds `cells`, and every spawned
+    /// body checks again before it runs. Sharded with the cells for that
+    /// reason — one map would serialize every miss in the process on one
+    /// lock. A key's grave lives in the same shard as its cell, so the
+    /// "vacant map ⇒ grave visible" argument (module docs) still runs under
+    /// one shard's `cells` lock.
     graves: Mutex<FxHashMap<K, Grave>>,
 }
 
 impl<K, V> Maps<K, V> {
-    /// The shard owning `key`.
+    fn new() -> Self {
+        Self {
+            shards: std::array::from_fn(|_| Shard {
+                cells: Mutex::new(FxHashMap::default()),
+                graves: Mutex::new(FxHashMap::default()),
+            }),
+        }
+    }
+
+    /// The shard owning `key`: its cell and its grave.
     ///
     /// Generic over a borrowed form of `K` for the same reason `HashMap::get`
     /// is: the hit path looks a key up without owning one. `Borrow`'s contract
@@ -340,13 +361,23 @@ impl<K, V> Maps<K, V> {
                   2^SHARD_BITS - 1 = SHARDS - 1, so the index is in range by \
                   construction"
     )]
-    fn shard<Q>(&self, key: &Q) -> &Mutex<FxHashMap<K, Arc<TaskCell<V>>>>
+    fn shard<Q>(&self, key: &Q) -> &Shard<K, V>
     where
         Q: std::hash::Hash + ?Sized,
     {
         use std::hash::BuildHasher as _;
         let h = rustc_hash::FxBuildHasher.hash_one(key);
-        &self.cells[(h >> (u64::BITS - SHARD_BITS)) as usize]
+        &self.shards[(h >> (u64::BITS - SHARD_BITS)) as usize]
+    }
+}
+
+impl<K, V> Shard<K, V> {
+    fn cells(&self) -> MutexGuard<'_, FxHashMap<K, Arc<TaskCell<V>>>> {
+        self.cells.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn graves(&self) -> MutexGuard<'_, FxHashMap<K, Grave>> {
+        self.graves.lock().unwrap_or_else(|p| p.into_inner())
     }
 }
 
@@ -369,10 +400,7 @@ where
     V: Clone + Send + Sync + 'static,
 {
     pub(crate) fn new(tag: &'static str, handle: tokio::runtime::Handle) -> Self {
-        let maps = Arc::new(Maps {
-            cells: std::array::from_fn(|_| Mutex::new(FxHashMap::default())),
-            graves: Mutex::new(FxHashMap::default()),
-        });
+        let maps = Arc::new(Maps::new());
         super::register_source(Box::new(TaskSource {
             tag,
             maps: Arc::downgrade(&maps),
@@ -397,7 +425,7 @@ where
         }
     }
 
-    /// Lock the arbiter shard owning `key` (see [`Maps::cells`]).
+    /// Lock the arbiter shard owning `key` (see [`Shard::cells`]).
     ///
     /// Borrowed-key generic like `HashMap::get`, so the hit path need not build
     /// an owned key just to find its shard.
@@ -406,10 +434,7 @@ where
         K: std::borrow::Borrow<Q>,
         Q: std::hash::Hash + Eq + ?Sized,
     {
-        self.maps
-            .shard(key)
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        self.maps.shard(key).cells()
     }
 
     /// Borrowed-key generic like `HashMap::get`, so a hit needs no owned key.
@@ -429,7 +454,10 @@ where
         Fut: Future<Output = V> + Send + 'static,
     {
         let cell = 'cell: {
-            let mut cache = self.cache_lock(&key);
+            // Hashed once for both locks this arm may take: the cell's and,
+            // on a miss, the grave's.
+            let shard = self.maps.shard(&key);
+            let mut cache = shard.cells();
             // The hit path *borrows* the key. `entry` needs an owned one, so
             // asking for it up front cloned on every call — including the
             // hits, which are the common case — to look up a key the map
@@ -457,12 +485,7 @@ where
             // next caller would then spawn against a still-dying
             // predecessor with nothing to serialize on.
             let fut = f();
-            let grave = self
-                .maps
-                .graves
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .remove(&key);
+            let grave = shard.graves().remove(&key);
             let restarts = grave.as_ref().map_or(0, |g| g.restarts + 1);
             let cell = Arc::new(TaskCell {
                 outcome: OnceLock::new(),
@@ -598,7 +621,8 @@ where
     /// worker here, never on this stack).
     fn cancel_abandoned(&self, key: &K, cell: &Arc<TaskCell<V>>) {
         let abort = {
-            let mut cache = self.cache_lock(key);
+            let shard = self.maps.shard(key);
+            let mut cache = shard.cells();
             if cell.interest() != 0 || cell.is_done() {
                 return;
             }
@@ -622,17 +646,13 @@ where
             // may re-park a predecessor under this key — that insert must find
             // ours already present, never overwrite-race it.
             let abort = task.abort_handle();
-            self.maps
-                .graves
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .insert(
-                    key.clone(),
-                    Grave {
-                        handle: task,
-                        restarts: cell.restarts,
-                    },
-                );
+            shard.graves().insert(
+                key.clone(),
+                Grave {
+                    handle: task,
+                    restarts: cell.restarts,
+                },
+            );
             abort
         };
         tracing::debug!(
@@ -685,6 +705,7 @@ where
         //
         // Whatever is currently being awaited sits in `self.grave`, so this
         // task's own abort re-parks it for the next generation.
+        let shard = self.maps.shard(&self.key);
         loop {
             match self.grave.as_mut() {
                 Some(g) => {
@@ -697,12 +718,7 @@ where
                     self.grave = None;
                 }
                 None => {
-                    let next = self
-                        .maps
-                        .graves
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .remove(&self.key);
+                    let next = shard.graves().remove(&self.key);
                     match next {
                         Some(g) => self.grave = Some(g),
                         None => break,
@@ -721,11 +737,7 @@ where
         // cell holds no dead task harness. (Dropping one's own JoinHandle is a
         // detach, which is exactly right — the task is finishing.)
         {
-            let _arbiter = self
-                .maps
-                .shard(&self.key)
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
+            let _arbiter = self.maps.shard(&self.key).cells();
             let _first_publish = self.cell.outcome.set(Ok(v));
             *self.cell.task_slot() = None;
         }
@@ -754,9 +766,8 @@ where
             // generation died too, and the next one's counter must say so.
             g.restarts = self.cell.restarts;
             self.maps
-                .graves
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
+                .shard(&self.key)
+                .graves()
                 .insert(self.key.clone(), g);
         }
         if self.cell.outcome.get().is_some() {
@@ -893,12 +904,12 @@ where
         // Shard by shard, and one at a time: the dump must never hold two of
         // the arbiter's locks at once, or it would be the only thing in the
         // process that can order them against each other.
-        for shard in &maps.cells {
+        for shard in &maps.shards {
             // `try_lock`: never block a diagnostic dump on the process being
             // dumped. A contended shard is skipped rather than abandoning the
             // whole dump — the other 63 still have cells worth naming, and the
             // one being written to is the *least* likely to be stuck.
-            let map = match shard.try_lock() {
+            let map = match shard.cells.try_lock() {
                 Ok(m) => m,
                 Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
                 Err(std::sync::TryLockError::WouldBlock) => continue,
@@ -1136,10 +1147,7 @@ mod tests {
     /// keys even with the property broken.
     #[test]
     fn a_borrowed_key_and_its_owned_form_share_a_shard() {
-        let maps: Maps<String, ()> = Maps {
-            cells: std::array::from_fn(|_| Mutex::new(FxHashMap::default())),
-            graves: Mutex::new(FxHashMap::default()),
-        };
+        let maps: Maps<String, ()> = Maps::new();
         let mut seen = std::collections::HashSet::new();
         for i in 0..512 {
             let owned = format!("//pkg/{i}:target@v=host");
@@ -1728,8 +1736,10 @@ mod repro {
             };
             entered.notified().await; // body1 is inside its occupancy section
 
-            // Hold the graves lock so the canceller parks between evict and insert.
-            let graves_guard = m.maps.graves.lock().unwrap();
+            // Hold the key's graves lock so the canceller parks between evict
+            // and insert. Graves are sharded like the cells, so only this
+            // key's shard is held — which is the one the canceller needs.
+            let graves_guard = m.maps.shard(&key).graves.lock().unwrap();
 
             // Canceller on its own OS thread: evicts under the cache lock, then
             // blocks on graves.lock() *before* issuing the abort.
@@ -1764,7 +1774,7 @@ mod repro {
                 );
             }
             // Drain the grave (if the canceller won) so rounds stay independent.
-            m.maps.graves.lock().unwrap().remove(&format!("k{round}"));
+            m.maps.shard(&key).graves.lock().unwrap().remove(&key);
         }
     }
 }
