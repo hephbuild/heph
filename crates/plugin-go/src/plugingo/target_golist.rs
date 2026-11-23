@@ -17,14 +17,10 @@ pub fn build_spec_firstparty(
     go_module: &str,
     go_mod_addr: &Addr,
     go_src_addr: &Addr,
-    go_src_query_addr: Option<&Addr>,
     non_go_src_addrs: &[String],
     has_test_files: bool,
 ) -> anyhow::Result<TargetSpec> {
     let mut srcfiles: Vec<String> = vec![go_src_addr.format()];
-    if let Some(q) = go_src_query_addr {
-        srcfiles.push(q.format());
-    }
     srcfiles.extend_from_slice(non_go_src_addrs);
     let mut spec = build_spec_inner(
         addr,
@@ -253,7 +249,6 @@ mod tests {
             "svc",
             &go_mod_addr(),
             &go_src_addr(),
-            None,
             &[],
             false,
         )
@@ -285,7 +280,6 @@ mod tests {
             "",
             &go_mod_addr(),
             &go_src_addr(),
-            None,
             &[],
             true,
         )
@@ -303,7 +297,6 @@ mod tests {
             "",
             &go_mod_addr(),
             &go_src_addr(),
-            None,
             &[],
             true,
         )
@@ -326,7 +319,6 @@ mod tests {
             "",
             &go_mod_addr(),
             &go_src_addr(),
-            None,
             &[],
             true,
         )
@@ -350,7 +342,6 @@ mod tests {
             "",
             &go_mod_addr(),
             &go_src_addr(),
-            None,
             &[],
             true,
         )
@@ -436,7 +427,6 @@ mod tests {
                 "",
                 &go_mod_addr(),
                 &go_src_addr(),
-                None,
                 &[],
                 has_tests,
             )
@@ -459,7 +449,6 @@ mod tests {
             "",
             &go_mod_addr(),
             &go_src_addr(),
-            None,
             &[],
             true,
         )
@@ -485,7 +474,6 @@ mod tests {
             "",
             &go_mod_addr(),
             &go_src_addr(),
-            None,
             &[],
             true,
         )
@@ -505,7 +493,6 @@ mod tests {
             "",
             &go_mod_addr(),
             &go_src_addr(),
-            None,
             &[],
             true,
         )

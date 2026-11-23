@@ -3062,7 +3062,6 @@ impl ProviderInner {
                     &module_root_rel.to_string_lossy(),
                     &go_mod_addr,
                     &go_src_glob_addr,
-                    None,
                     &extra_src_addrs,
                     has_test_files,
                 )?
