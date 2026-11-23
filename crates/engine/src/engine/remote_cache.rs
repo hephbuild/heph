@@ -1023,6 +1023,10 @@ impl RemoteRevision {
     }
 }
 
+/// Buffer a scratch snapshot is streamed through, both ways: what a pull or a
+/// push holds in memory instead of the whole archive.
+pub(crate) const SNAPSHOT_STREAM_BUF: usize = 128 * 1024;
+
 /// One readable cache as the scratch lineage reads it, handed out by
 /// [`RemoteCacheSet::scratch_sources`].
 ///
@@ -1080,13 +1084,28 @@ impl ScratchSource<'_> {
             .await
     }
 
-    /// A snapshot, whole. `None` when it is absent.
+    /// A snapshot, streamed into `dest`: the number of bytes written, or `None`
+    /// when it is absent.
+    ///
+    /// Streamed rather than returned whole because a snapshot is a whole
+    /// compressed cache, and holding one in memory makes the peak RSS of a pull
+    /// the size of the cache.
     ///
     /// Read as a blob is: a bulk slot held for the stream, the open under
     /// [`METADATA_TIMEOUT`] (it is a round trip with no body yet), and the body
     /// under the backend's inactivity bound, which a large snapshot on a slow
     /// link can outlast legitimately and a stalled one cannot.
-    pub async fn read_snapshot(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+    ///
+    /// A failure to write `dest` is reported but not held against the cache:
+    /// only the remote side's failures feed its breaker.
+    pub async fn read_snapshot_into<W>(
+        &self,
+        key: &str,
+        dest: &mut W,
+    ) -> anyhow::Result<Option<u64>>
+    where
+        W: AsyncWrite + Unpin + ?Sized,
+    {
         let read = async {
             observe_transfer_slots(self.cache);
             let _slot = self
@@ -1105,13 +1124,33 @@ impl ScratchSource<'_> {
             let Some(mut r) = opened else {
                 return Ok(None);
             };
-            let mut buf = Vec::new();
-            tokio::io::AsyncReadExt::read_to_end(&mut r, &mut buf)
-                .await
-                .with_context(|| format!("download remote scratch snapshot {key}"))?;
-            Ok(Some(buf))
+            // Copied by hand rather than with `tokio::io::copy` so a local write
+            // failure is told apart from a remote one: it ends the copy as an
+            // `Ok` the breaker does not count.
+            let mut buf = vec![0u8; SNAPSHOT_STREAM_BUF];
+            let mut written = 0u64;
+            loop {
+                let n = tokio::io::AsyncReadExt::read(&mut r, &mut buf)
+                    .await
+                    .with_context(|| format!("download remote scratch snapshot {key}"))?;
+                if n == 0 {
+                    break;
+                }
+                let chunk = buf.get(..n).context("short read from scratch snapshot")?;
+                if let Err(e) = dest.write_all(chunk).await {
+                    return Ok(Some(Err(e)));
+                }
+                written += n as u64;
+            }
+            Ok(Some(Ok(written)))
         };
-        self.checked("scratch pull", read).await
+        match self.checked("scratch pull", read).await? {
+            None => Ok(None),
+            Some(Ok(written)) => Ok(Some(written)),
+            Some(Err(e)) => {
+                Err(e).with_context(|| format!("write remote scratch snapshot {key} locally"))
+            }
+        }
     }
 
     /// Run `fut` unless the breaker opened since this source was handed out,
@@ -2752,6 +2791,105 @@ mod tests {
             backend.lists.load(Ordering::SeqCst),
             FAILURE_THRESHOLD,
             "no request reaches a paused cache",
+        );
+    }
+
+    /// Backend serving one healthy object for every key.
+    struct OneBodyBackend(Vec<u8>);
+
+    #[async_trait]
+    impl RemoteCacheBackend for OneBodyBackend {
+        async fn open_read(
+            &self,
+            _key: &str,
+        ) -> anyhow::Result<Option<Pin<Box<dyn AsyncRead + Send>>>> {
+            Ok(Some(Box::pin(std::io::Cursor::new(self.0.clone()))))
+        }
+        async fn open_write(&self, _key: &str) -> anyhow::Result<Pin<Box<dyn AsyncWrite + Send>>> {
+            anyhow::bail!("read-only")
+        }
+        async fn exists(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        async fn list_names(&self, _prefix: &str) -> anyhow::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// A local sink that accepts `room` bytes, then fails every write.
+    struct FullDisk {
+        room: usize,
+    }
+
+    impl AsyncWrite for FullDisk {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            if self.room == 0 {
+                return std::task::Poll::Ready(Err(std::io::Error::other("no space left")));
+            }
+            let n = buf.len().min(self.room);
+            self.room -= n;
+            std::task::Poll::Ready(Ok(n))
+        }
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A snapshot pull that fails on the local side — the disk filled up part
+    /// way — names the local write, and is not held against the cache: the
+    /// remote served every byte asked of it, so the breaker must not count it.
+    ///
+    /// Counted, `FAILURE_THRESHOLD` full disks in a row would pause a healthy
+    /// cache for every artifact and scratch read in the run.
+    #[tokio::test]
+    async fn a_local_write_failure_on_a_snapshot_pull_spares_the_breaker() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let body = vec![7u8; 3 * SNAPSHOT_STREAM_BUF];
+        let set =
+            RemoteCacheSet::with_backend(Arc::new(OneBodyBackend(body)), dir.path().to_path_buf());
+        let sources = set.scratch_sources().await;
+        assert_eq!(sources.len(), 1);
+
+        for _ in 0..FAILURE_THRESHOLD {
+            let mut dest = FullDisk {
+                room: SNAPSHOT_STREAM_BUF + 17,
+            };
+            let err = sources[0]
+                .read_snapshot_into("k.tar.gz", &mut dest)
+                .await
+                .expect_err("the local sink fills up part way");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("write remote scratch snapshot k.tar.gz locally")
+                    && msg.contains("no space left"),
+                "the error names the local write and its cause: {msg}",
+            );
+        }
+
+        let cache = set.caches.first().expect("one cache");
+        assert_eq!(
+            cache.health.consecutive_failures.load(Ordering::Relaxed),
+            0,
+            "a local write failure is not a remote failure",
+        );
+        assert!(!cache.broken(), "the breaker stays closed");
+        assert_eq!(
+            set.scratch_sources().await.len(),
+            1,
+            "the cache is still handed to the scratch lineage",
         );
     }
 
