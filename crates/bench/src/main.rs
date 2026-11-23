@@ -360,63 +360,93 @@ async fn run_run(cmd: RunCmd) -> Result<()> {
     }
 }
 
-/// Prepares both sides once, then interleaves `reps` measured rounds
+/// One side of a baseline-vs-candidate comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Side {
+    Candidate,
+    Baseline,
+}
+
+impl Side {
+    fn name(self) -> &'static str {
+        match self {
+            Side::Candidate => "candidate",
+            Side::Baseline => "baseline",
+        }
+    }
+
+    /// `candidate` or `baseline`, whichever this side is.
+    fn pick<T>(self, candidate: T, baseline: T) -> T {
+        match self {
+            Side::Candidate => candidate,
+            Side::Baseline => baseline,
+        }
+    }
+}
+
+/// Runs `warmup` prepare rounds, then interleaves `reps` measured rounds
 /// (candidate, baseline, candidate, baseline, ...) so a systematic drift on
 /// the runner — thermal state ramping up, a noisy neighbor arriving
 /// mid-job — lands on both sides symmetrically instead of biasing whichever
-/// side happens to run its whole batch second. `blocking spawn` per rep is
-/// deliberate: there is nothing to overlap (the whole point is serialized,
-/// alternating timing), so async buys nothing here.
+/// side happens to run its whole batch second. Round `i` measures both
+/// sides with seed `i`. Returns the (candidate, baseline) timings, in rep
+/// order.
+fn interleave(
+    warmup: usize,
+    reps: usize,
+    mut prepare: impl FnMut(Side) -> Result<()>,
+    mut measure: impl FnMut(Side, u64) -> Result<f64>,
+) -> Result<(Vec<f64>, Vec<f64>)> {
+    for _ in 0..warmup {
+        prepare(Side::Candidate)?;
+        prepare(Side::Baseline)?;
+    }
+
+    let mut candidate_ms = Vec::with_capacity(reps);
+    let mut baseline_ms = Vec::with_capacity(reps);
+    for i in 0..reps {
+        let seed = i as u64;
+        candidate_ms.push(measure(Side::Candidate, seed)?);
+        baseline_ms.push(measure(Side::Baseline, seed)?);
+    }
+    Ok((candidate_ms, baseline_ms))
+}
+
+/// [`interleave`]s spawns of each side's `measure-inprocess`. `blocking
+/// spawn` per rep is deliberate: there is nothing to overlap (the whole
+/// point is serialized, alternating timing), so async buys nothing here.
 async fn run_inprocess_both(args: RunInprocessArgs) -> Result<()> {
     let corpus = args
         .corpus
         .canonicalize()
         .with_context(|| format!("canonicalize {}", args.corpus.display()))?;
 
-    for _ in 0..args.warmup {
-        spawn_measure_inprocess(
-            &args.candidate_bin,
-            &corpus,
-            args.scenario,
-            MeasureMode::Prepare,
-            0,
-        )
-        .context("prepare candidate")?;
-        spawn_measure_inprocess(
-            &args.baseline_bin,
-            &corpus,
-            args.scenario,
-            MeasureMode::Prepare,
-            0,
-        )
-        .context("prepare baseline")?;
-    }
-
-    let mut candidate_ms = Vec::with_capacity(args.reps);
-    let mut baseline_ms = Vec::with_capacity(args.reps);
-    for i in 0..args.reps {
-        let seed = i as u64;
-        let cand = spawn_measure_inprocess(
-            &args.candidate_bin,
-            &corpus,
-            args.scenario,
-            MeasureMode::Once,
-            seed,
-        )
-        .context("measure candidate")?
-        .context("candidate measure-inprocess printed no timing")?;
-        candidate_ms.push(cand);
-        let base = spawn_measure_inprocess(
-            &args.baseline_bin,
-            &corpus,
-            args.scenario,
-            MeasureMode::Once,
-            seed,
-        )
-        .context("measure baseline")?
-        .context("baseline measure-inprocess printed no timing")?;
-        baseline_ms.push(base);
-    }
+    let (candidate_ms, baseline_ms) = interleave(
+        args.warmup,
+        args.reps,
+        |side| {
+            spawn_measure_inprocess(
+                side.pick(&args.candidate_bin, &args.baseline_bin),
+                &corpus,
+                args.scenario,
+                MeasureMode::Prepare,
+                0,
+            )
+            .with_context(|| format!("prepare {}", side.name()))?;
+            Ok(())
+        },
+        |side, seed| {
+            spawn_measure_inprocess(
+                side.pick(&args.candidate_bin, &args.baseline_bin),
+                &corpus,
+                args.scenario,
+                MeasureMode::Once,
+                seed,
+            )
+            .with_context(|| format!("measure {}", side.name()))?
+            .with_context(|| format!("{} measure-inprocess printed no timing", side.name()))
+        },
+    )?;
 
     write_results(
         &args.out_candidate,
@@ -433,7 +463,7 @@ async fn run_inprocess_both(args: RunInprocessArgs) -> Result<()> {
     Ok(())
 }
 
-/// Same interleaving shape as `run_inprocess_both`, calling straight into
+/// The same [`interleave`] as `run_inprocess_both`, calling straight into
 /// `dist::prepare`/`measure_once` (no subprocess spawn of `heph-bench`
 /// itself needed — see `RunDistArgs`'s doc comment for why).
 fn run_dist_both(args: RunDistArgs) -> Result<()> {
@@ -446,29 +476,33 @@ fn run_dist_both(args: RunDistArgs) -> Result<()> {
     let candidate = dist::Dist::locate(&args.candidate_dist).context("locate candidate dist")?;
     let baseline = dist::Dist::locate(&args.baseline_dist).context("locate baseline dist")?;
 
-    for _ in 0..args.warmup {
-        dist::prepare(&candidate, &corpus, &manifest, args.scenario)
-            .context("prepare candidate")?;
-        dist::prepare(&baseline, &corpus, &manifest, args.scenario).context("prepare baseline")?;
-    }
-
-    let mut candidate_ms = Vec::with_capacity(args.reps);
-    let mut baseline_ms = Vec::with_capacity(args.reps);
-    for i in 0..args.reps {
-        let seed = i as u64;
-        if args.scenario.times_index_lookups() {
-            dist::check_populated_index(&candidate, &corpus, &manifest)
-                .context("the candidate's codegen index before its rep")?;
-        }
-        candidate_ms.push(
-            dist::measure_once(&candidate, &corpus, &manifest, args.scenario, seed)
-                .context("measure candidate")?,
-        );
-        baseline_ms.push(
-            dist::measure_once(&baseline, &corpus, &manifest, args.scenario, seed)
-                .context("measure baseline")?,
-        );
-    }
+    let (candidate_ms, baseline_ms) = interleave(
+        args.warmup,
+        args.reps,
+        |side| {
+            dist::prepare(
+                side.pick(&candidate, &baseline),
+                &corpus,
+                &manifest,
+                args.scenario,
+            )
+            .with_context(|| format!("prepare {}", side.name()))
+        },
+        |side, seed| {
+            if side == Side::Candidate && args.scenario.times_index_lookups() {
+                dist::check_populated_index(&candidate, &corpus, &manifest)
+                    .context("the candidate's codegen index before its rep")?;
+            }
+            dist::measure_once(
+                side.pick(&candidate, &baseline),
+                &corpus,
+                &manifest,
+                args.scenario,
+                seed,
+            )
+            .with_context(|| format!("measure {}", side.name()))
+        },
+    )?;
 
     write_results(
         &args.out_candidate,
@@ -527,4 +561,88 @@ fn run_compare(args: CompareArgs) -> Result<()> {
         anyhow::bail!("regression detected — see table above");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Side, interleave};
+    use std::cell::RefCell;
+
+    #[derive(Debug, PartialEq)]
+    enum Call {
+        Prepare(Side),
+        Measure(Side, u64),
+    }
+
+    /// Every warmup prepares candidate then baseline, and every rep measures
+    /// candidate then baseline with the rep's index as seed: the alternation
+    /// that keeps a drifting runner from biasing one side.
+    #[test]
+    fn interleave_alternates_sides_in_order() {
+        let calls = RefCell::new(Vec::new());
+        let (candidate, baseline) = interleave(
+            2,
+            3,
+            |side| {
+                calls.borrow_mut().push(Call::Prepare(side));
+                Ok(())
+            },
+            |side, seed| {
+                calls.borrow_mut().push(Call::Measure(side, seed));
+                Ok(side.pick(100.0, 200.0) + seed as f64)
+            },
+        )
+        .expect("interleave");
+
+        use Side::{Baseline as B, Candidate as C};
+        assert_eq!(
+            calls.into_inner(),
+            [
+                Call::Prepare(C),
+                Call::Prepare(B),
+                Call::Prepare(C),
+                Call::Prepare(B),
+                Call::Measure(C, 0),
+                Call::Measure(B, 0),
+                Call::Measure(C, 1),
+                Call::Measure(B, 1),
+                Call::Measure(C, 2),
+                Call::Measure(B, 2),
+            ]
+        );
+        assert_eq!(candidate, [100.0, 101.0, 102.0]);
+        assert_eq!(baseline, [200.0, 201.0, 202.0]);
+    }
+
+    /// A failure stops the run where it happened: nothing after it runs.
+    #[test]
+    fn interleave_stops_at_the_first_failure() {
+        let calls = RefCell::new(Vec::new());
+        let err = interleave(
+            1,
+            2,
+            |side| {
+                calls.borrow_mut().push(Call::Prepare(side));
+                Ok(())
+            },
+            |side, seed| {
+                calls.borrow_mut().push(Call::Measure(side, seed));
+                if side == Side::Baseline {
+                    anyhow::bail!("boom");
+                }
+                Ok(1.0)
+            },
+        )
+        .expect_err("baseline measure fails");
+        assert_eq!(err.to_string(), "boom");
+        assert_eq!(
+            calls.into_inner(),
+            [
+                Call::Prepare(Side::Candidate),
+                Call::Prepare(Side::Baseline),
+                Call::Measure(Side::Candidate, 0),
+                Call::Measure(Side::Baseline, 0),
+            ]
+        );
+    }
 }
