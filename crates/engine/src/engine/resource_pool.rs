@@ -980,20 +980,31 @@ impl Lane {
         Ok(())
     }
 
+    /// A fresh grant of `granted`: whole (no `origin`) and armed, so its drop
+    /// releases it as the shape it was admitted as.
+    fn reservation(
+        self: &Arc<Self>,
+        granted: Shape,
+        clamped: bool,
+        admitted: Admitted,
+    ) -> Reservation {
+        Reservation {
+            lane: Arc::clone(self),
+            granted,
+            origin: None,
+            clamped,
+            admitted,
+            armed: true,
+        }
+    }
+
     /// Grant `need` now, past the queue. Only for a need that always fits
     /// (unbounded pools only, or nothing at all); an empty one takes no lock.
     fn grant_now(self: &Arc<Self>, need: Shape, clamped: bool) -> Reservation {
         if !need.is_empty() {
             take(&mut self.change().held, &need);
         }
-        Reservation {
-            lane: Arc::clone(self),
-            granted: need,
-            origin: None,
-            clamped,
-            admitted: Admitted::Arrival,
-            armed: true,
-        }
+        self.reservation(need, clamped, Admitted::Arrival)
     }
 
     /// Whether `amounts` holds something of a bounded pool: the only thing a
@@ -1032,14 +1043,7 @@ impl Lane {
                     take(&mut st.held, &need);
                     drop(guard);
                     return Acquire {
-                        state: AcquireState::Ready(Some(Reservation {
-                            lane: Arc::clone(self),
-                            granted: need,
-                            origin: None,
-                            clamped,
-                            admitted,
-                            armed: true,
-                        })),
+                        state: AcquireState::Ready(Some(self.reservation(need, clamped, admitted))),
                     };
                 }
                 let class = st.next_class;
@@ -1090,14 +1094,8 @@ impl Lane {
         let Some(waiter) = st.remove(seq) else {
             return Offer::Refused;
         };
-        let reservation = Reservation {
-            lane: Arc::clone(self),
-            granted: Arc::clone(&need),
-            origin: None,
-            clamped: waiter.clamped,
-            admitted: if is_head { Admitted::Head } else { how },
-            armed: true,
-        };
+        let admitted = if is_head { Admitted::Head } else { how };
+        let reservation = self.reservation(Arc::clone(&need), waiter.clamped, admitted);
         if let Err(mut unobserved) = waiter.tx.send(reservation) {
             unobserved.armed = false;
             return Offer::Gone;
