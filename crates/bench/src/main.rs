@@ -216,29 +216,22 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Corpus(args) => run_corpus(args),
-        Cmd::Run { cmd } => {
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .context("build tokio runtime")?;
-            rt.block_on(run_run(cmd))
-        }
-        Cmd::MeasureInprocess(args) => {
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .context("build tokio runtime")?;
-            rt.block_on(run_measure_inprocess(args))
-        }
+        Cmd::Run { cmd } => run_run(cmd),
+        Cmd::MeasureInprocess(args) => block_on(run_measure_inprocess(args)),
         Cmd::Compare(args) => run_compare(args),
-        Cmd::CheckCodegen(args) => {
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .context("build tokio runtime")?;
-            rt.block_on(run_check_codegen(args))
-        }
+        Cmd::CheckCodegen(args) => block_on(run_check_codegen(args)),
     }
+}
+
+/// Drive `f` to completion on a fresh multi-threaded runtime — for the
+/// commands that run the engine in-process. The `run` orchestrators only
+/// spawn and wait, so they get none.
+fn block_on(f: impl Future<Output = Result<()>>) -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime")?
+        .block_on(f)
 }
 
 async fn run_check_codegen(args: CheckCodegenArgs) -> Result<()> {
@@ -353,9 +346,9 @@ fn spawn_measure_inprocess(
     }
 }
 
-async fn run_run(cmd: RunCmd) -> Result<()> {
+fn run_run(cmd: RunCmd) -> Result<()> {
     match cmd {
-        RunCmd::Inprocess(args) => run_inprocess_both(args).await,
+        RunCmd::Inprocess(args) => run_inprocess_both(args),
         RunCmd::Dist(args) => run_dist_both(args),
     }
 }
@@ -415,7 +408,7 @@ fn interleave(
 /// [`interleave`]s spawns of each side's `measure-inprocess`. `blocking
 /// spawn` per rep is deliberate: there is nothing to overlap (the whole
 /// point is serialized, alternating timing), so async buys nothing here.
-async fn run_inprocess_both(args: RunInprocessArgs) -> Result<()> {
+fn run_inprocess_both(args: RunInprocessArgs) -> Result<()> {
     let corpus = args
         .corpus
         .canonicalize()
