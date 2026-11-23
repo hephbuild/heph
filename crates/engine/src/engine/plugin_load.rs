@@ -524,22 +524,7 @@ fn verify_artifact_checksum(
 /// The lowercase hex sha256 of everything left to read from `file`.
 #[cfg(unix)]
 fn sha256_hex(file: &mut std::fs::File) -> std::io::Result<String> {
-    struct Hasher(sha2::Sha256);
-    impl std::io::Write for Hasher {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            sha2::Digest::update(&mut self.0, buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut hasher = Hasher(sha2::Digest::new());
-    std::io::copy(
-        &mut std::io::BufReader::with_capacity(256 * 1024, file),
-        &mut hasher,
-    )?;
-    Ok(hex::encode(sha2::Digest::finalize(hasher.0)))
+    hfetch::sha256_hex_of(file).map(|(hex, _len)| hex)
 }
 
 /// [`verify_artifact_checksum`] with its stamp policy and its hash function

@@ -13,6 +13,8 @@ hplugin = { package = "plugin", path = "../plugin" }
 hproc = { package = "proc", path = "../proc" }
 hexecrunner = { package = "execrunner", path = "../execrunner" }
 hdriver-support = { package = "driver-support", path = "../driver-support" }
+# `sha256_hex_of`, the one streaming file hasher.
+hfetch = { package = "fetch", path = "../fetch" }
 futures = "0.3.34"
 anyhow = "1.0.104"
 serde = { version = "1", features = ["derive"] }

@@ -5433,6 +5433,7 @@ dependencies = [
  "docker_credential",
  "driver-support",
  "execrunner",
+ "fetch",
  "futures",
  "hex",
  "memmap2",

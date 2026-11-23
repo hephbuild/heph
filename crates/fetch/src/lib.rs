@@ -12,7 +12,7 @@
 //! [`get`], [`get_sha256`]) run that same future on a runtime of their own.
 
 use std::future::Future;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -175,6 +175,21 @@ pub async fn get_sha256_async(url: &str, w: &mut (impl Write + Send)) -> anyhow:
     Ok(hex::encode(hw.hasher.finalize()))
 }
 
+/// The lowercase hex SHA-256 of everything left to read from `reader`, and how
+/// many bytes that was. Streams in 256 KiB reads, so a large file is hashed
+/// without being held in memory.
+pub fn sha256_hex_of(reader: impl Read) -> std::io::Result<(String, u64)> {
+    let mut hw = HashingWriter {
+        inner: std::io::sink(),
+        hasher: Sha256::new(),
+    };
+    let n = std::io::copy(
+        &mut std::io::BufReader::with_capacity(256 * 1024, reader),
+        &mut hw,
+    )?;
+    Ok((hex::encode(hw.hasher.finalize()), n))
+}
+
 /// Writes through to `inner`, hashing every byte that lands.
 struct HashingWriter<W> {
     inner: W,
@@ -250,7 +265,6 @@ impl<W: Write> Sha256Writer<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
 
     /// Serve one HTTP response on a local port: headers announcing `len` body
     /// bytes, then `body` one byte every `gap`, then hold the connection open
@@ -315,6 +329,34 @@ mod tests {
         assert_eq!(
             got,
             "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+        );
+    }
+
+    /// FIPS 180-2 vectors: empty input, `abc`, and a million `a`s, which spans
+    /// several 256 KiB reads and ends on a partial one.
+    #[test]
+    fn sha256_hex_of_matches_fixed_vectors() {
+        assert_eq!(
+            sha256_hex_of(&b""[..]).unwrap(),
+            (
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
+                0
+            )
+        );
+        assert_eq!(
+            sha256_hex_of(&b"abc"[..]).unwrap(),
+            (
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".to_string(),
+                3
+            )
+        );
+        let million = vec![b'a'; 1_000_000];
+        assert_eq!(
+            sha256_hex_of(million.as_slice()).unwrap(),
+            (
+                "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0".to_string(),
+                1_000_000
+            )
         );
     }
 

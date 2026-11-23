@@ -422,26 +422,9 @@ fn append_blob<W: std::io::Write>(
 
 /// The sha256 of a file, without reading it into memory.
 pub(crate) fn sha256_file(path: &Path) -> anyhow::Result<(String, u64)> {
-    use sha2::{Digest as _, Sha256};
-    let mut f = std::fs::File::open(path).with_context(|| format!("open {path:?}"))?;
-    let mut h = HashWriter(Sha256::new());
-    let n = std::io::copy(&mut f, &mut h).with_context(|| format!("hash {path:?}"))?;
-    Ok((format!("sha256:{}", hex::encode(h.0.finalize())), n))
-}
-
-/// `io::Write` over a hasher, so `io::copy` can stream a file into it: digest
-/// 0.11 dropped the `Write` impl the hashers used to carry.
-struct HashWriter(sha2::Sha256);
-
-impl std::io::Write for HashWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        sha2::Digest::update(&mut self.0, buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
+    let f = std::fs::File::open(path).with_context(|| format!("open {path:?}"))?;
+    let (hex, n) = hfetch::sha256_hex_of(f).with_context(|| format!("hash {path:?}"))?;
+    Ok((format!("sha256:{hex}"), n))
 }
 
 fn blob_path(digest: &str) -> anyhow::Result<String> {
