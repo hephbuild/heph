@@ -367,36 +367,41 @@ pub(crate) fn host_goroot(go_bin: &std::path::Path) -> anyhow::Result<std::path:
     Ok(std::path::PathBuf::from(goroot))
 }
 
+/// The input a target-ref toolchain (`gotool = "//pkg:go"`) staged its `gosdk`
+/// dep as. The group holds exactly the one dep [`go_sdk_dep`] declares, so its
+/// origin is the group's first.
+///
+/// [`go_sdk_dep`]: crate::plugingo::addr_util::go_sdk_dep
+fn staged_gosdk(inputs: &[ManagedRunInput]) -> anyhow::Result<&ManagedRunInput> {
+    let origin = crate::plugingo::deps::dep_origin(crate::plugingo::addr_util::GO_SDK_DEP_GROUP, 0);
+    inputs
+        .iter()
+        .find(|m| m.input.origin_id == origin)
+        .context("go toolchain: target `gosdk` dep not staged")
+}
+
 /// Resolve the `go` binary from a target-ref toolchain (`gotool = "//pkg:go"`)
 /// staged into this sandbox via the `gosdk` dep. The dep's output is either a
 /// full GOROOT tree (we pick its `bin/go`) or a single `go` binary (a hostbin or
 /// nix wrapper); when both shapes appear, prefer a `.../bin/go`.
 ///
-/// The group holds exactly the one dep [`go_sdk_dep`] declares, so its origin is
-/// the group's first.
-///
-/// [`go_sdk_dep`]: crate::plugingo::addr_util::go_sdk_dep
-pub(crate) fn resolve_target_go(inputs: &[ManagedRunInput]) -> anyhow::Result<std::path::PathBuf> {
-    let origin = crate::plugingo::deps::dep_origin(crate::plugingo::addr_util::GO_SDK_DEP_GROUP, 0);
-    let gosdk = inputs
-        .iter()
-        .find(|m| m.input.origin_id == origin)
-        .context("go toolchain: target `gosdk` dep not staged")?;
-
+/// Synchronous and I/O-bound (it scans the dep's entry index): callers run it
+/// on the blocking pool. `gosdk` is the content of the input [`staged_gosdk`]
+/// picked, `unpack_root` where that input is staged.
+pub(crate) fn resolve_target_go(
+    gosdk: &dyn hcore::hartifactcontent::Content,
+    unpack_root: &std::path::Path,
+) -> anyhow::Result<std::path::PathBuf> {
     // Only paths are needed to locate the `go` binary — `entry_paths` is
     // header-only for tar-backed content, so we don't read the whole SDK tree
     // (~thousands of files) just to match a filename.
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
     for rel in gosdk
-        .input
-        .artifact
-        .content
-        .as_ref()
         .entry_paths()
         .context("enumerate target toolchain output")?
     {
         if rel.file_name().and_then(|n| n.to_str()) == Some("go") {
-            candidates.push(gosdk.unpack_root.join(&rel));
+            candidates.push(unpack_root.join(&rel));
         }
     }
 
@@ -440,9 +445,18 @@ pub(crate) async fn resolve_toolchain_go(
     match classify(version) {
         Toolchain::Host => host_go.resolve(runner, driver, ctoken).await,
         Toolchain::Target(_) => {
-            let go_bin = resolve_target_go(inputs)?;
-            let goroot = host_goroot(&go_bin)?;
-            Ok((goroot, go_bin))
+            let gosdk = staged_gosdk(inputs)?;
+            let content = std::sync::Arc::clone(&gosdk.input.artifact.content);
+            let unpack_root = gosdk.unpack_root.clone();
+            // Both steps block: the scan of the SDK's entry index for `go`,
+            // then a spawn-and-wait on it. On the blocking pool, so neither
+            // pins a runtime worker.
+            hcore::blocking::run(move || {
+                let go_bin = resolve_target_go(content.as_ref(), &unpack_root)?;
+                let goroot = host_goroot(&go_bin)?;
+                Ok((goroot, go_bin))
+            })
+            .await
         }
         Toolchain::Hermetic(v) => {
             let goroot = sandbox_ws_dir.join(staged_goroot(v));
@@ -941,6 +955,85 @@ mod host_go_tests {
             .await
             .expect("two");
         assert_eq!(probes.load(Ordering::SeqCst), 2);
+    }
+
+    /// Content listing a fixed set of paths; the target-ref resolver reads
+    /// only `entry_paths`. Records whether that scan ran inside a
+    /// `hcore::blocking::run` job (`None` until it runs).
+    struct Paths(Vec<std::path::PathBuf>, std::sync::Mutex<Option<bool>>);
+
+    impl hcore::hartifactcontent::Content for Paths {
+        fn reader(&self) -> anyhow::Result<Box<dyn std::io::Read>> {
+            anyhow::bail!("unused")
+        }
+        fn walk(
+            &self,
+        ) -> anyhow::Result<
+            Box<dyn Iterator<Item = anyhow::Result<hcore::hartifactcontent::WalkEntry>> + '_>,
+        > {
+            anyhow::bail!("unused")
+        }
+        fn hashout(&self) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+        fn entry_paths(&self) -> anyhow::Result<Vec<std::path::PathBuf>> {
+            *self.1.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(hcore::blocking::in_blocking_job());
+            Ok(self.0.clone())
+        }
+    }
+
+    /// `gotool = "//pkg:go"`: the staged `go` is asked for its GOROOT, and the
+    /// binary is the staged one. Both the scan of the SDK's entry index and the
+    /// probe run on the blocking pool, not on a runtime worker.
+    #[tokio::test]
+    async fn target_mode_asks_the_staged_go_for_goroot() {
+        use hplugin::driver::inputartifact::{InputArtifact, Type};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let go = fake_go(dir.path(), "/staged/goroot");
+        std::fs::rename(&go, dir.path().join("go")).expect("rename fake go");
+        let origin =
+            crate::plugingo::deps::dep_origin(crate::plugingo::addr_util::GO_SDK_DEP_GROUP, 0);
+        let paths = Arc::new(Paths(
+            vec![std::path::PathBuf::from("go")],
+            std::sync::Mutex::new(None),
+        ));
+        let input = ManagedRunInput {
+            input: hplugin::driver::RunInput {
+                artifact: InputArtifact {
+                    r#type: Type::Dep,
+                    origin_id: origin.clone(),
+                    content: Arc::clone(&paths) as Arc<dyn hcore::hartifactcontent::Content>,
+                },
+                origin_id: origin,
+                source_addr: addr(),
+                filters: vec![],
+                annotations: Default::default(),
+            },
+            list_path: None,
+            unpack_root: dir.path().to_path_buf(),
+        };
+
+        let ct = hcore::hasync::StdCancellationToken::new();
+        let (goroot, go_bin) = resolve_toolchain_go(
+            "//tools:go",
+            std::slice::from_ref(&input),
+            dir.path(),
+            "go.golist",
+            RunnerRef::local(),
+            &HostGoCache::default(),
+            &ct,
+        )
+        .await
+        .expect("resolve");
+        assert_eq!(goroot, std::path::PathBuf::from("/staged/goroot"));
+        assert_eq!(go_bin, dir.path().join("go"));
+        let scanned_in_job = *paths.1.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            scanned_in_job,
+            Some(true),
+            "the SDK entry scan must run inside a blocking::run job (None = never scanned)"
+        );
     }
 }
 
