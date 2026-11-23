@@ -41,21 +41,33 @@ fn foreign_recording_touches_no_local_state() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let dir = session_dir(
         tmp.path(),
-        "UPDATE session SET sealed = 1, exit_code = 3, panicked = 0;
+        "UPDATE session SET sealed = 0, exit_code = NULL, panicked = 0;
          INSERT INTO notices VALUES ('//p:deploy', 1, 'plan', 'the plan text');
          INSERT INTO failure_logs VALUES ('//p:t', 0, x'6f6f7073', 12);
          PRAGMA journal_mode = WAL;",
     );
     let _owner = lockfile::acquire_owner_lock(&dir.join(files::LOCK)).expect("hold the lock");
+    let file = dir.join(store::FILE);
+    let tmp_dir = tmp.path().join(".tmp");
 
-    // Opened as local, a held lock over a WAL header is a live owner.
+    // Opened as local, a held lock over an unsealed WAL file is a live owner.
+    // (Over a `sealed=1` row, a held lock is the owner sealing: not live.)
     let local = Recording::open_local(tmp.path(), &dir).expect("open local");
     assert_eq!(local.state().expect("state"), RecordingState::Live);
     drop(local);
-
-    let rec = Recording::open_foreign(&dir.join(store::FILE), &tmp.path().join(".tmp"))
-        .expect("open foreign");
+    // Opened by path, the same file under the same held lock is read from its
+    // row alone: unsealed is incomplete, never live.
+    let rec = Recording::open_foreign(&file, &tmp_dir).expect("open foreign");
     assert!(rec.is_foreign());
+    assert_eq!(rec.state().expect("state"), RecordingState::Incomplete);
+    drop(rec);
+
+    // Sealed with an exit code, the row is all a foreign reader goes by.
+    let conn = Connection::open(&file).expect("open the copy");
+    conn.execute_batch("UPDATE session SET sealed = 1, exit_code = 3;")
+        .expect("seal the copy");
+    drop(conn);
+    let rec = Recording::open_foreign(&file, &tmp_dir).expect("open foreign");
     assert_eq!(
         rec.state().expect("state"),
         RecordingState::Finished {

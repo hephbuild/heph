@@ -16,6 +16,7 @@
 //! `attach` names a mirrored 125 on stderr. See [`SessionExit`].
 
 mod attach;
+mod export;
 pub(crate) mod list;
 pub(crate) mod show;
 #[cfg(test)]
@@ -111,6 +112,22 @@ pub enum SessionCommands {
     ///
     /// `heph session inflight 02kf5`
     Inflight(InflightArgs),
+    /// Write a session as one `.hephsession` file, to read on another machine
+    ///
+    /// The file is self-contained: it also holds the text of each approval
+    /// notice the session showed and the last 1 MiB of each root failure's
+    /// log (32 MiB in all), which a reader elsewhere could not look up.
+    /// `--no-logs` leaves both out. A running session exports too: the file
+    /// is a snapshot, and says so. Prints the path written.
+    ///
+    /// Examples:
+    ///
+    /// `heph session export 02kf5`
+    ///
+    /// `heph session export 48213 -o build.hephsession --no-logs`
+    ///
+    /// `heph session export 02kf5 -o -`
+    Export(ExportArgs),
 }
 
 #[derive(Args, Clone, Debug)]
@@ -171,6 +188,20 @@ pub struct InflightArgs {
 pub(crate) struct Out<'a> {
     pub w: &'a mut dyn Write,
     pub style: output::Style,
+}
+
+#[derive(Args, Clone, Debug)]
+pub struct ExportArgs {
+    /// Session id, its last 4–5 characters, or a live session's pid (any
+    /// unique prefix or suffix of an id works).
+    pub id: String,
+    /// The file to write, replaced if it exists; `-` writes to stdout.
+    /// Default: `./heph-<id>.hephsession`.
+    #[arg(short = 'o', long = "output", value_name = "PATH")]
+    pub output: Option<std::path::PathBuf>,
+    /// Leave out approval notice text and root-failure logs.
+    #[arg(long)]
+    pub no_logs: bool,
 }
 
 impl SessionArgs {
@@ -251,6 +282,24 @@ fn execute(
             a.refuse_dashboard()?;
             drop(stdout);
             bootstrap::block_on(attach::attach(&sources, opts, &a.id, sink, session, global))?
+        }
+        SessionCommands::Export(a) => {
+            let exported = bootstrap::block_on(export::export_ref(
+                &file,
+                opts,
+                a,
+                crate::engine::approval::read_notice_from_store,
+                &mut stdout,
+            ))??;
+            if exported.snapshot {
+                sink.write_diagnostic(
+                    "the session is still running: the export is a snapshot of it so far",
+                );
+            }
+            if let Some(path) = exported.path {
+                writeln!(stdout, "{}", path.display()).context("writing the path")?;
+            }
+            Ok(())
         }
     }
 }

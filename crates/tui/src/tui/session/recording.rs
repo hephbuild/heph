@@ -47,9 +47,24 @@ pub enum RecordingState {
         exit_code: Option<i32>,
         panicked: bool,
     },
+    /// An export taken while its session ran (E3): the session row says
+    /// `snapshot=1` and the copy has no end.
+    Snapshot,
     /// No end recorded: not sealed, or sealed by cleanup after its owner
     /// died. A foreign recording never says live: it cannot know.
     Incomplete,
+}
+
+impl RecordingState {
+    /// What a viewer says of a recording that is not a whole session, on its
+    /// first line: `None` for a live or finished one.
+    pub fn caveat(self) -> Option<&'static str> {
+        match self {
+            Self::Snapshot => Some("snapshot of a running session"),
+            Self::Incomplete => Some("incomplete"),
+            Self::Live | Self::Finished { .. } => None,
+        }
+    }
 }
 
 impl Recording {
@@ -167,16 +182,20 @@ impl Foreign {
 
 /// A recording's state from its session row alone.
 fn row_state(conn: &Connection) -> rusqlite::Result<RecordingState> {
-    let (sealed, exit_code, panicked): (bool, Option<i32>, Option<bool>) =
-        conn.query_row("SELECT sealed, exit_code, panicked FROM session", [], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-        })?;
+    let (sealed, exit_code, panicked, snapshot): (bool, Option<i32>, Option<bool>, bool) = conn
+        .query_row(
+            "SELECT sealed, exit_code, panicked, snapshot FROM session",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?;
     let panicked = panicked.unwrap_or(false);
     Ok(if sealed && (exit_code.is_some() || panicked) {
         RecordingState::Finished {
             exit_code,
             panicked,
         }
+    } else if snapshot {
+        RecordingState::Snapshot
     } else {
         RecordingState::Incomplete
     })

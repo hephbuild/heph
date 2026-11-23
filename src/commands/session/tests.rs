@@ -2377,6 +2377,213 @@ async fn show_reports_skipped_records() {
     assert_eq!(json["pools"], serde_json::json!([]), "{json}");
 }
 
+/// Spec row `export_is_self_contained` (I6, I7): an export carries what a
+/// reader elsewhere cannot look up — each approval notice's text, read by the
+/// engine's reader, and the tail of each root failure's log — and opens with
+/// the sessions root, the home and the workspace gone. A collateral failure's
+/// log and a log outside the failure slots are not exported; `--no-logs`
+/// leaves both tables empty; `-o -` writes the same file to stdout.
+///
+/// Viewing it through `show` comes with `<ref>` resolution; this reads the
+/// foreign recording's tables, which is what `show` will render.
+#[tokio::test(flavor = "multi_thread")]
+async fn export_is_self_contained() {
+    use crate::tui::session::export::FAILURE_LOG_CAP;
+    use crate::tui::session::recording::Recording as Opened;
+    use crate::tui::session::{ApprovalPrompt, ApprovalPromptNotice, ApprovalQueued, FileSource};
+    use hcore::events::LeftBehindData;
+
+    const NOTICE: &str = "drop the table";
+    let ws = tempfile::tempdir().expect("tempdir");
+    std::fs::write(ws.path().join(".hephconfig"), "").expect("write .hephconfig");
+    let global = crate::commands::GlobalOptions::default();
+    let (engine, home) =
+        crate::commands::bootstrap::new_reader_engine(&global, ws.path()).expect("reader engine");
+    drop(engine);
+    std::fs::write(ws.path().join("PLAN"), NOTICE).expect("write the notice source");
+    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+    hasher.update(NOTICE.as_bytes());
+    hasher.update(&[0]);
+    let notice = ApprovalPromptNotice {
+        name: "plan".to_owned(),
+        sources: vec![hcore::approval_notice::NoticeSource {
+            addr: "//a:plan".to_owned(),
+            origin: hcore::approval_notice::NoticeOrigin::File {
+                path: "PLAN".to_owned(),
+                out_path: "PLAN".to_owned(),
+                x: false,
+                hashout: format!("{:x}", hasher.digest()),
+            },
+        }],
+    };
+
+    // The root failure's log is longer than what an export keeps of it.
+    const CUT: u64 = 100;
+    let root_log = home.join("failures").join("k1").join("log.txt");
+    let mut log = vec![b'a'; usize::try_from(CUT).expect("small")];
+    log.extend((0..FAILURE_LOG_CAP).map(|i| b'0' + u8::try_from(i % 10).expect("digit")));
+    for (path, bytes) in [
+        (&root_log, log.as_slice()),
+        (
+            &home.join("failures").join("k2").join("log.txt"),
+            b"collateral",
+        ),
+    ] {
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(path, bytes).expect("write a log");
+    }
+    let outside = ws.path().join("outside.log");
+    std::fs::write(&outside, b"not a failure slot").expect("write");
+    let failed = |addr: &str, upstream_of: Option<&str>, log: &Path| SessionRecord {
+        at_unix_ms: T0,
+        kind: Some(BuildEventKind::ResultEnd {
+            addr: addr.to_owned(),
+            error: Some("exit status: 1".to_owned()),
+            upstream_of: upstream_of.map(str::to_owned),
+            exit_status: None,
+            log_tail: None,
+            timed_out: None,
+            cancelled: false,
+            left_behind: Some(Box::new(LeftBehindData {
+                log_path: Some(log.display().to_string()),
+                ..LeftBehindData::default()
+            })),
+        }),
+        session: None,
+    };
+
+    let sessions = tempfile::tempdir().expect("tempdir");
+    let id = SessionId::new(T0, 7);
+    let mut m = meta(id, 1, &["heph", "run"]);
+    m.workspace_root = Some(ws.path().display().to_string());
+    m.home_dir = Some(home.display().to_string());
+    let records = [
+        SessionRecord::session(
+            T0,
+            SessionRecordKind::Approval {
+                prompt: Some(Box::new(ApprovalPrompt {
+                    queue: vec![ApprovalQueued {
+                        seq: 1,
+                        addr: "//a:gate".to_owned(),
+                        queued_at_unix_ms: T0,
+                        notices: vec![notice],
+                    }],
+                })),
+                standing: None,
+            },
+        ),
+        failed("//a:root", None, &root_log),
+        failed(
+            "//a:collateral",
+            Some("//a:root"),
+            &home.join("failures").join("k2").join("log.txt"),
+        ),
+        failed("//a:outside", None, &outside),
+    ];
+    write_ended(sessions.path(), &m, &records, &ended(Some(1), T0 + 10));
+
+    let out = tempfile::tempdir().expect("tempdir");
+    let file = FileSource::new(sessions.path());
+    let export = |output: PathBuf, no_logs: bool| {
+        let args = ExportArgs {
+            id: id.encode(),
+            output: Some(output),
+            no_logs,
+        };
+        let file = &file;
+        async move {
+            let mut stdout = Vec::new();
+            let exported = export::export_ref(
+                file,
+                opts(),
+                &args,
+                crate::engine::approval::read_notice_from_store,
+                &mut stdout,
+            )
+            .await
+            .expect("export");
+            assert!(stdout.is_empty(), "a file export writes nothing to stdout");
+            assert!(!exported.snapshot);
+            exported.path.expect("a path")
+        }
+    };
+    let full = export(out.path().join("full.hephsession"), false).await;
+    let bare = export(out.path().join("bare.hephsession"), true).await;
+    // `-o -`: the same export, on stdout.
+    let piped = out.path().join("piped.hephsession");
+    {
+        let rec = Opened::open_local(sessions.path(), &sessions.path().join(id.encode()))
+            .expect("open local");
+        let mut stdout = Vec::new();
+        let exported = export::export(
+            &rec,
+            export::Dest::Stdout,
+            Some(crate::engine::approval::read_notice_from_store),
+            &crate::tui::session::store::tmp_dir(sessions.path()),
+            &mut stdout,
+        )
+        .expect("export to stdout");
+        assert!(exported.path.is_none());
+        std::fs::write(&piped, stdout).expect("write");
+    }
+
+    // Nothing local is left to look anything up in.
+    drop((sessions, ws));
+    assert!(!home.exists(), "the home was under the workspace");
+    let ftmp = tempfile::tempdir().expect("tempdir");
+    for path in [&full, &piped] {
+        let rec = Opened::open_foreign(path, ftmp.path()).expect("open the export");
+        let Opened::Foreign(f) = &rec else {
+            panic!("foreign")
+        };
+        assert_eq!(
+            f.recorded_notice("//a:gate", 1, "plan").expect("notice"),
+            Some(NOTICE.to_owned()),
+            "{}",
+            path.display()
+        );
+        let kept = log
+            .get(usize::try_from(CUT).expect("small")..)
+            .expect("tail");
+        assert_eq!(
+            f.failure_logs("//a:root").expect("logs"),
+            [(kept.to_vec(), CUT)],
+            "the root failure's last 1 MiB, and how much came before it"
+        );
+        assert!(f.failure_logs("//a:collateral").expect("logs").is_empty());
+        assert!(f.failure_logs("//a:outside").expect("logs").is_empty());
+    }
+    let rec = Opened::open_foreign(&bare, ftmp.path()).expect("open the export");
+    let Opened::Foreign(f) = &rec else {
+        panic!("foreign")
+    };
+    assert_eq!(
+        f.recorded_notice("//a:gate", 1, "plan").expect("notice"),
+        None
+    );
+    assert!(f.failure_logs("//a:root").expect("logs").is_empty());
+    assert_eq!(rec.meta().expect("meta").id, id);
+}
+
+/// `-o` as given, `-` for stdout, else `./heph-<id>.hephsession`.
+#[test]
+fn export_destination() {
+    let id = SessionId::new(T0, 7);
+    assert_eq!(
+        export::Dest::from_arg(None, id),
+        export::Dest::File(PathBuf::from(format!("heph-{}.hephsession", id.encode())))
+    );
+    assert_eq!(
+        export::Dest::from_arg(Some(Path::new("-")), id),
+        export::Dest::Stdout
+    );
+    // A file named `-` is spelled `./-`.
+    assert_eq!(
+        export::Dest::from_arg(Some(Path::new("./-")), id),
+        export::Dest::File(PathBuf::from("./-"))
+    );
+}
+
 /// The `.hephconfig` defaults a bad value's warning names are the ones the
 /// cleanup applies.
 /// A lost session sealed by cleanup carries `derivation` 0: no
