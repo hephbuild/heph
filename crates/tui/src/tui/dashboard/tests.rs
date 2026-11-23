@@ -440,8 +440,9 @@ fn wait_text_is_the_shared_formatter_pending_row() {
     };
     for (pool, removals, yields) in [
         ("cpu", None, None),
-        ("cpu", None, Some(yielding)),
+        ("cpu", None, Some(yielding.clone())),
         ("sandbox", Some(2), None),
+        ("sandbox", Some(2), Some(yielding)),
     ] {
         let s = fold(&[
             at(0, start("//w:a")),
@@ -476,19 +477,28 @@ fn wait_text_is_the_shared_formatter_pending_row() {
             "{words:?}"
         );
         assert!(!words.row_detail.contains("41s"), "{words:?}");
-        match (pool, &yields) {
-            ("cpu", None) => assert_eq!(words.row_detail, "(2 free)"),
-            (_, Some(_)) => assert!(
+        match (removals, &yields) {
+            (None, None) => assert_eq!(words.row_detail, "(2 free)"),
+            (None, Some(_)) => assert!(
                 words
                     .row_detail
                     .starts_with("(2 free, yielding to a memory ")
                     && words.row_detail.ends_with(" run)"),
                 "{words:?}"
             ),
-            _ => assert!(
+            (Some(_), None) => assert!(
                 words
                     .row_detail
-                    .ends_with(") — cleanup is behind: 2 removals pending"),
+                    .ends_with(" free) — cleanup is behind: 2 removals pending"),
+                "{words:?}"
+            ),
+            // Both: the time goes from inside the brackets, the cleanup
+            // cause stays after them.
+            (Some(_), Some(_)) => assert!(
+                words.row_detail.ends_with(
+                    " free, yielding to a memory 1.0 GiB run) — cleanup is behind: 2 removals \
+                     pending"
+                ),
                 "{words:?}"
             ),
         }

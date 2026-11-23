@@ -161,25 +161,70 @@ pub fn admission_wait_text(
     removals_pending: Option<u64>,
     waited: &str,
 ) -> String {
-    let yielding = match yielding_to {
-        Some((to, to_unit)) => format!(
-            "yielding to a {} {} run, ",
-            to.pool,
-            display_amount(to_unit, to.need)
-        ),
-        None => String::new(),
+    let words = AdmissionWaitWords {
+        pool,
+        unit,
+        need,
+        free,
+        yielding_to,
+        removals_pending,
     };
-    let text = format!(
-        "{addr} waits for {pool} {} ({} free, {yielding}{waited})",
-        display_amount(unit, need),
-        display_amount(unit, free)
-    );
-    match removals_pending {
-        Some(n @ 1..) => {
-            let noun = if n == 1 { "removal" } else { "removals" };
-            format!("{text} — cleanup is behind: {n} {noun} pending")
-        }
-        _ => text,
+    format!(
+        "{addr} waits for {} {}",
+        words.wants(),
+        words.detail(Some(waited))
+    )
+}
+
+/// The pieces [`admission_wait_text`] joins, for a renderer that lays them
+/// out apart (the TUI's PHASE and LAST LINE columns) instead of reparsing
+/// the joined text.
+#[derive(Debug, Clone, Copy)]
+pub struct AdmissionWaitWords<'a> {
+    pub pool: &'a str,
+    /// `pool`'s unit.
+    pub unit: Unit,
+    pub need: u64,
+    pub free: u64,
+    /// The oldest waiter this one is held back for, with the unit of its
+    /// pool.
+    pub yielding_to: Option<(&'a YieldingToData, Unit)>,
+    pub removals_pending: Option<u64>,
+}
+
+impl AdmissionWaitWords<'_> {
+    /// What the row waits for: `cpu 4`.
+    pub fn wants(&self) -> impl std::fmt::Display + '_ {
+        std::fmt::from_fn(|f| write!(f, "{} {}", self.pool, display_amount(self.unit, self.need)))
+    }
+
+    /// The rest of the row: `(3 free, yielding to a cpu 8 run, 41s)`, then
+    /// `— cleanup is behind: 3 removals pending` when removals are pending.
+    /// Without `waited`, the time is left out: `(3 free, yielding to a cpu
+    /// 8 run)`.
+    pub fn detail<'s>(&'s self, waited: Option<&'s str>) -> impl std::fmt::Display + 's {
+        std::fmt::from_fn(move |f| {
+            write!(f, "({} free", display_amount(self.unit, self.free))?;
+            if let Some((to, to_unit)) = self.yielding_to {
+                write!(
+                    f,
+                    ", yielding to a {} {} run",
+                    to.pool,
+                    display_amount(to_unit, to.need)
+                )?;
+            }
+            if let Some(waited) = waited {
+                write!(f, ", {waited}")?;
+            }
+            f.write_str(")")?;
+            match self.removals_pending {
+                Some(n @ 1..) => {
+                    let noun = if n == 1 { "removal" } else { "removals" };
+                    write!(f, " — cleanup is behind: {n} {noun} pending")
+                }
+                _ => Ok(()),
+            }
+        })
     }
 }
 
