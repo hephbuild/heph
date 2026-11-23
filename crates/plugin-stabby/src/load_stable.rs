@@ -9,12 +9,11 @@ use crate::abi::{
     DynPluginFunctions, DynProvider, NamedDriver, NamedFunction, SET_LOG_FILTER_SYMBOL,
     SET_LOG_SINK_SYMBOL, SET_RUNNER_HOST_SYMBOL, SET_SUPERVISOR_SYMBOL, SetLogFilterFn,
     SetLogSinkFn, SetRunnerHostFn, SetSupervisorFn, StableCancelDyn, StableHookDyn,
-    StableItemStream, StableItemStreamDyn, StableManagedDriverDyn, StableMetaDyn,
-    StablePluginFunctionsDyn, StableProviderDyn,
+    StableItemStreamDyn, StableManagedDriverDyn, StableMetaDyn, StablePluginFunctionsDyn,
+    StableProviderDyn,
 };
 use crate::host::HostExecutor;
-use crate::seam::encode_svec;
-use crate::vtable::dynify;
+use crate::seam::{encode_svec, item_stream};
 use async_trait::async_trait;
 use futures::future::BoxFuture;
 use hcore::hasync::Cancellable;
@@ -1354,22 +1353,8 @@ impl StableRemoteManagedDriver {
 /// host pushes the next event frame (or all senders drop == clean end). The guest
 /// pulls it on a blocking thread, so the blocking `recv` is sound (mirrors how the
 /// guest drains run output on a blocking task).
-struct HostChannelItemStream {
-    rx: std::sync::Mutex<std::sync::mpsc::Receiver<SVec<u8>>>,
-}
-
-impl StableItemStream for HostChannelItemStream {
-    extern "C" fn next(&self) -> SVec<u8> {
-        let rx = self.rx.lock().unwrap_or_else(|e| e.into_inner());
-        // `Err` == every sender dropped (stream closed cleanly) => empty SVec.
-        rx.recv().unwrap_or_default()
-    }
-}
-
 fn host_channel_item_stream(rx: std::sync::mpsc::Receiver<SVec<u8>>) -> DynItemStream {
-    dynify(stabby::boxed::Box::new(HostChannelItemStream {
-        rx: std::sync::Mutex::new(rx),
-    }))
+    item_stream(rx.into_iter())
 }
 
 /// One build event, framed as the envelope `StreamItem` carrying its serde-JSON
@@ -1533,6 +1518,7 @@ fn managed_input_to_pb(mi: &ManagedRunInput) -> pb::ManagedRunInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vtable::dynify;
     use buffa::Message;
 
     fn refusal(reported: Option<&str>) -> String {

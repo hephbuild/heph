@@ -26,15 +26,16 @@ use hplugin::provider::{
 };
 use hplugin_stabby::abi::{
     DynExecutor, DynFunctionRegistry, DynItemStream, DynPluginFunctions, NamedFunction,
-    StableCancel, StableFunctionRegistryDyn, StableHook, StableItemStream, StableItemStreamDyn,
-    StableManagedDriver, StableMeta, StablePluginFunctions, StableProvider,
+    StableCancel, StableFunctionRegistryDyn, StableHook, StableItemStreamDyn, StableManagedDriver,
+    StableMeta, StablePluginFunctions, StableProvider,
 };
-use hplugin_stabby::seam::{encode_svec, panic_text};
+use hplugin_stabby::seam::{encode_svec, item_stream, panic_text};
 use hplugin_stabby::vtable::dynify;
 use plugin_abi::convert;
 use plugin_abi::convert::{absent_not_empty, required, required_msg};
 use plugin_abi::pb;
 use plugin_abi::pb::frame::Body;
+use plugin_abi::{error_body, wire_error};
 use stabby::future::DynFutureUnsync as DynFuture;
 use stabby::vec::Vec as SVec;
 use std::collections::{HashMap, HashSet};
@@ -196,47 +197,19 @@ fn decode_req<M: buffa::Message>(bytes: &[u8], what: &str) -> Result<M> {
     plugin_abi::decode::<M>(bytes).with_context(|| format!("decoding {what}"))
 }
 
-fn unary(body: Body) -> SVec<u8> {
-    frame_bytes(body)
-}
-
-/// Encode one `pb::Frame` carrying `body` (one frame per stream `next`).
+/// Encode `body` as the `pb::Frame` that crosses the seam: a unary reply, or
+/// one item of a response stream.
 fn frame_bytes(body: Body) -> SVec<u8> {
-    encode_svec(&pb::Frame {
-        id: Some(0),
-        body: Some(body),
-        ..Default::default()
-    })
+    encode_svec(&plugin_abi::frame(body))
 }
 
-fn wire_error(kind: pb::error::Kind, message: String) -> pb::Error {
-    pb::Error {
-        kind: Some(kind.into()),
-        message: Some(message),
-        ..Default::default()
-    }
-}
-
-/// Guest-side response stream: pulls items from a provider iterator lazily and
-/// frames each on demand — nothing is buffered at the seam. `Mutex` (not `RefCell`
-/// like [`HostRead`]) so the handle is `Send + Sync`, since list results flow into
-/// the host engine, which requires `Send`.
-struct GuestItemStream {
-    frames: std::sync::Mutex<Box<dyn Iterator<Item = SVec<u8>> + Send>>,
-}
-
-impl StableItemStream for GuestItemStream {
-    extern "C" fn next(&self) -> SVec<u8> {
-        let mut frames = self.frames.lock().unwrap_or_else(|e| e.into_inner());
-        // Empty == stream exhausted; otherwise one encoded `pb::Frame`.
-        frames.next().unwrap_or_default()
-    }
-}
-
-fn make_item_stream(frames: Box<dyn Iterator<Item = SVec<u8>> + Send>) -> DynItemStream {
-    dynify(stabby::boxed::Box::new(GuestItemStream {
-        frames: std::sync::Mutex::new(frames),
-    }))
+/// A reply known before any plugin code runs (a request that does not decode,
+/// an unimplemented method), as the future an entry point returns.
+fn ready<'a, T>(value: T) -> DynFuture<'a, T>
+where
+    T: stabby::IStable + stabby::abi::IDeterminantProvider<()> + Send + 'a,
+{
+    dynify(stabby::boxed::Box::new(std::future::ready(value)))
 }
 
 /// Lazily map a provider's fallible item iterator into encoded `StreamItem` frames,
@@ -245,9 +218,9 @@ fn make_item_stream(frames: Box<dyn Iterator<Item = SVec<u8>> + Send>) -> DynIte
 fn frame_iter<T: 'static>(
     mut iter: Box<dyn Iterator<Item = Result<T>> + Send>,
     encode_item: fn(T) -> Vec<u8>,
-) -> Box<dyn Iterator<Item = SVec<u8>> + Send> {
+) -> impl Iterator<Item = SVec<u8>> + Send + 'static {
     let mut done = false;
-    Box::new(std::iter::from_fn(move || {
+    std::iter::from_fn(move || {
         if done {
             return None;
         }
@@ -265,12 +238,12 @@ fn frame_iter<T: 'static>(
                 None
             }
         }
-    }))
+    })
 }
 
 /// A response stream that fails immediately with `msg` (one `StreamEnd{error}`).
 fn error_item_stream(msg: String) -> DynItemStream {
-    make_item_stream(Box::new(std::iter::once(frame_bytes(stream_err(msg)))))
+    item_stream(std::iter::once(frame_bytes(stream_err(msg))))
 }
 
 /// A response stream for an unimplemented streaming method — the stream-shaped
@@ -285,11 +258,7 @@ fn unimplemented_item_stream(method: u32) -> DynItemStream {
         .into(),
         ..Default::default()
     });
-    make_item_stream(Box::new(std::iter::once(frame_bytes(body))))
-}
-
-fn err_body(message: String) -> Body {
-    Body::from(wire_error(pb::error::Kind::Other, message))
+    item_stream(std::iter::once(frame_bytes(body)))
 }
 
 /// Serialize an error for transmission across the ABI boundary. Uses anyhow's
@@ -305,12 +274,8 @@ fn err_message(e: &anyhow::Error) -> String {
     hcore::hmemoizer::chain_message(e)
 }
 
-fn is_cycle(e: &anyhow::Error) -> bool {
-    hcore::hmemoizer::downcast_chain_ref::<hplugin::error::CycleError>(e).is_some()
-}
-
 fn get_error_kind(e: &anyhow::Error) -> pb::get_error::Kind {
-    if is_cycle(e) {
+    if convert::is_cycle(e) {
         pb::get_error::Kind::Cycle
     } else if hplugin::error::is_cancelled(e) {
         pb::get_error::Kind::Cancelled
@@ -611,7 +576,7 @@ impl StableCancel for StableProviderImpl {
 /// calling a method this (older) plugin predates gets this back and falls back —
 /// the mechanism that keeps added dispatch methods additive (see ABI_VERSIONING.md).
 fn unimplemented(method: u32) -> SVec<u8> {
-    unary(Body::from(wire_error(
+    frame_bytes(Body::from(wire_error(
         pb::error::Kind::Unimplemented,
         format!("dispatch method {method} not implemented"),
     )))
@@ -645,7 +610,7 @@ async fn provider_list_stream(
         Err(e) => return error_item_stream(err_message(&e)),
     };
     match provider.list(lreq, &tok).await {
-        Ok(iter) => make_item_stream(frame_iter(iter, |lr| {
+        Ok(iter) => item_stream(frame_iter(iter, |lr| {
             pb::ListResponse {
                 addr: convert::addr_to_pb(&lr.addr).into(),
                 facts: convert::listed_facts_to_pb(&lr.facts).into(),
@@ -670,7 +635,7 @@ async fn provider_list_packages_stream(
         prefix: PkgBuf::from(prefix),
     };
     match provider.list_packages(lreq, &tok).await {
-        Ok(iter) => make_item_stream(frame_iter(iter, |lpr| {
+        Ok(iter) => item_stream(frame_iter(iter, |lpr| {
             pb::ListPackageResponse {
                 pkg: Some(lpr.pkg.as_str().to_string()),
                 ..Default::default()
@@ -698,7 +663,7 @@ async fn provider_get(
     })();
     let greq = match greq {
         Ok(r) => r,
-        Err(e) => return unary(get_err(pb::get_error::Kind::Other, err_message(&e))),
+        Err(e) => return frame_bytes(get_err(pb::get_error::Kind::Other, err_message(&e))),
     };
     let guard = cancels.enter(&greq.request_id);
     let body = match provider.get(greq, guard.token()).await {
@@ -709,7 +674,7 @@ async fn provider_get(
         Err(GetError::NotFound) => get_err(pb::get_error::Kind::NotFound, String::new()),
         Err(GetError::Other(e)) => get_err(get_error_kind(&e), err_message(&e)),
     };
-    unary(body)
+    frame_bytes(body)
 }
 
 fn get_err(kind: pb::get_error::Kind, message: String) -> Body {
@@ -733,7 +698,7 @@ async fn provider_probe(
     })();
     let preq = match preq {
         Ok(r) => r,
-        Err(e) => return unary(err_body(err_message(&e))),
+        Err(e) => return frame_bytes(error_body(err_message(&e))),
     };
     let guard = cancels.enter(&preq.request_id);
     let body = match provider.probe(preq, guard.token()).await {
@@ -741,9 +706,9 @@ async fn provider_probe(
             states: pr.states.iter().map(convert::state_to_pb).collect(),
             ..Default::default()
         }),
-        Err(e) => err_body(err_message(&e)),
+        Err(e) => error_body(err_message(&e)),
     };
-    unary(body)
+    frame_bytes(body)
 }
 
 /// Serve one `FUNCTION_METHOD_CALL`: run the named handler guest-side (it is not
@@ -756,7 +721,7 @@ async fn plugin_call_function(
     let call = match FunctionCall::from_pb(req) {
         Ok(c) => c,
         Err(e) => {
-            return unary(err_body(err_message(
+            return frame_bytes(error_body(err_message(
                 &e.context(format!("the call of plugin function {name:?}")),
             )));
         }
@@ -790,9 +755,9 @@ async fn plugin_call_function(
     };
     let body = match res {
         Ok(resp) => Body::from(resp),
-        Err(e) => err_body(err_message(&e)),
+        Err(e) => error_body(err_message(&e)),
     };
-    unary(body)
+    frame_bytes(body)
 }
 
 /// A `CallFunctionRequest`, decoded. `pkg` and `root` are required — a
@@ -905,20 +870,20 @@ impl StablePluginFunctions for StablePluginFunctionsImpl {
             Some(pb::FunctionMethod::Call) => {
                 let name = name.to_string();
                 let Some(func) = self.fns.get(&name).cloned() else {
-                    let body = unary(err_body(format!(
+                    let body = frame_bytes(error_body(format!(
                         "plugin {} has no function {name:?}",
                         self.name
                     )));
-                    return dynify(stabby::boxed::Box::new(async move { body }));
+                    return ready(body);
                 };
                 let req =
                     match decode_req::<pb::CallFunctionRequest>(&req[..], "CallFunctionRequest") {
                         Ok(r) => r,
                         Err(e) => {
-                            let body = unary(err_body(format!(
+                            let body = frame_bytes(error_body(format!(
                                 "decoding the call of function {name:?}: {e:#}"
                             )));
-                            return dynify(stabby::boxed::Box::new(async move { body }));
+                            return ready(body);
                         }
                     };
                 dynify(stabby::boxed::Box::new(spawn_seam(
@@ -926,12 +891,10 @@ impl StablePluginFunctions for StablePluginFunctionsImpl {
                     "call_function",
                     name.clone(),
                     plugin_call_function(func, name, req),
-                    |m| unary(err_body(m)),
+                    |m| frame_bytes(error_body(m)),
                 )))
             }
-            _ => dynify(stabby::boxed::Box::new(
-                async move { unimplemented(method) },
-            )),
+            _ => ready(unimplemented(method)),
         }
     }
 }
@@ -971,8 +934,8 @@ impl StableProvider for StableProviderImpl {
                 let req = match decode_req::<pb::ProbeRequest>(&req[..], "ProbeRequest") {
                     Ok(r) => r,
                     Err(e) => {
-                        let body = unary(err_body(err_message(&e)));
-                        return dynify(stabby::boxed::Box::new(async move { body }));
+                        let body = frame_bytes(error_body(err_message(&e)));
+                        return ready(body);
                     }
                 };
                 let key = req.package.clone().unwrap_or_default();
@@ -981,12 +944,10 @@ impl StableProvider for StableProviderImpl {
                     "probe",
                     key,
                     provider_probe(provider, req, Arc::clone(&self.cancels)),
-                    |m| unary(err_body(m)),
+                    |m| frame_bytes(error_body(m)),
                 )))
             }
-            _ => dynify(stabby::boxed::Box::new(
-                async move { unimplemented(method) },
-            )),
+            _ => ready(unimplemented(method)),
         }
     }
 
@@ -1004,7 +965,7 @@ impl StableProvider for StableProviderImpl {
                         Ok(r) => r,
                         Err(e) => {
                             let stream = error_item_stream(err_message(&e));
-                            return dynify(stabby::boxed::Box::new(async move { stream }));
+                            return ready(stream);
                         }
                     };
                 let key = req.prefix.clone().unwrap_or_default();
@@ -1016,9 +977,7 @@ impl StableProvider for StableProviderImpl {
                     error_item_stream,
                 )))
             }
-            _ => dynify(stabby::boxed::Box::new(async move {
-                unimplemented_item_stream(method)
-            })),
+            _ => ready(unimplemented_item_stream(method)),
         }
     }
 
@@ -1035,7 +994,7 @@ impl StableProvider for StableProviderImpl {
                     Ok(r) => r,
                     Err(e) => {
                         let stream = error_item_stream(err_message(&e));
-                        return dynify(stabby::boxed::Box::new(async move { stream }));
+                        return ready(stream);
                     }
                 };
                 let key = req.package.clone().unwrap_or_default();
@@ -1047,9 +1006,7 @@ impl StableProvider for StableProviderImpl {
                     error_item_stream,
                 )))
             }
-            _ => dynify(stabby::boxed::Box::new(async move {
-                unimplemented_item_stream(method)
-            })),
+            _ => ready(unimplemented_item_stream(method)),
         }
     }
 
@@ -1059,9 +1016,7 @@ impl StableProvider for StableProviderImpl {
         // No client-streaming provider RPC yet; the request stream is dropped.
         _req: DynItemStream,
     ) -> DynFuture<'a, SVec<u8>> {
-        dynify(stabby::boxed::Box::new(
-            async move { unimplemented(method) },
-        ))
+        ready(unimplemented(method))
     }
 
     extern "C" fn invoke_bidi<'a>(
@@ -1069,9 +1024,7 @@ impl StableProvider for StableProviderImpl {
         method: u32,
         _req: DynItemStream,
     ) -> DynFuture<'a, DynItemStream> {
-        dynify(stabby::boxed::Box::new(async move {
-            unimplemented_item_stream(method)
-        }))
+        ready(unimplemented_item_stream(method))
     }
 
     extern "C" fn invoke_exec<'a>(
@@ -1086,8 +1039,9 @@ impl StableProvider for StableProviderImpl {
                 let req = match decode_req::<pb::GetRequest>(&req[..], "GetRequest") {
                     Ok(r) => r,
                     Err(e) => {
-                        let body = unary(get_err(pb::get_error::Kind::Other, err_message(&e)));
-                        return dynify(stabby::boxed::Box::new(async move { body }));
+                        let body =
+                            frame_bytes(get_err(pb::get_error::Kind::Other, err_message(&e)));
+                        return ready(body);
                     }
                 };
                 let key = pb_addr_key(req.addr.as_option());
@@ -1098,12 +1052,10 @@ impl StableProvider for StableProviderImpl {
                     provider_get(provider, req, exec, Arc::clone(&self.cancels)),
                     // A panic/abort is a GetErr (not a bare Error) so the host's
                     // `get` decode surfaces the message as-is.
-                    |m| unary(get_err(pb::get_error::Kind::Other, m)),
+                    |m| frame_bytes(get_err(pb::get_error::Kind::Other, m)),
                 )))
             }
-            _ => dynify(stabby::boxed::Box::new(
-                async move { unimplemented(method) },
-            )),
+            _ => ready(unimplemented(method)),
         }
     }
 }
@@ -1204,7 +1156,7 @@ async fn driver_parse(
     })();
     let preq = match preq {
         Ok(r) => r,
-        Err(e) => return unary(err_body(err_message(&e))),
+        Err(e) => return frame_bytes(error_body(err_message(&e))),
     };
     let guard = cancels.enter(&preq.request_id);
     let body = match driver.parse(preq, guard.token()).await {
@@ -1213,11 +1165,11 @@ async fn driver_parse(
                 target_def: td.into(),
                 ..Default::default()
             }),
-            Err(e) => err_body(err_message(&e)),
+            Err(e) => error_body(err_message(&e)),
         },
-        Err(e) => err_body(err_message(&e)),
+        Err(e) => error_body(err_message(&e)),
     };
-    unary(body)
+    frame_bytes(body)
 }
 
 async fn driver_apply_transitive(
@@ -1242,7 +1194,7 @@ async fn driver_apply_transitive(
     })();
     let areq = match areq {
         Ok(r) => r,
-        Err(e) => return unary(err_body(err_message(&e))),
+        Err(e) => return frame_bytes(error_body(err_message(&e))),
     };
     let guard = cancels.enter(&areq.request_id);
     let body = match driver.apply_transitive(areq, guard.token()).await {
@@ -1251,11 +1203,11 @@ async fn driver_apply_transitive(
                 target_def: td.into(),
                 ..Default::default()
             }),
-            Err(e) => err_body(err_message(&e)),
+            Err(e) => error_body(err_message(&e)),
         },
-        Err(e) => err_body(err_message(&e)),
+        Err(e) => error_body(err_message(&e)),
     };
-    unary(body)
+    frame_bytes(body)
 }
 
 impl StableMeta for StableManagedDriverImpl {
@@ -1286,8 +1238,8 @@ impl StableManagedDriver for StableManagedDriverImpl {
                 let req = match decode_req::<pb::ParseRequest>(&req[..], "ParseRequest") {
                     Ok(r) => r,
                     Err(e) => {
-                        let body = unary(err_body(err_message(&e)));
-                        return dynify(stabby::boxed::Box::new(async move { body }));
+                        let body = frame_bytes(error_body(err_message(&e)));
+                        return ready(body);
                     }
                 };
                 let key = pb_addr_key(req.target_spec.as_option().and_then(|t| t.addr.as_option()));
@@ -1296,7 +1248,7 @@ impl StableManagedDriver for StableManagedDriverImpl {
                     "parse",
                     key,
                     driver_parse(driver, req, Arc::clone(&self.cancels)),
-                    |m| unary(err_body(m)),
+                    |m| frame_bytes(error_body(m)),
                 )))
             }
             Some(pb::DriverMethod::ApplyTransitive) => {
@@ -1306,8 +1258,8 @@ impl StableManagedDriver for StableManagedDriverImpl {
                 ) {
                     Ok(r) => r,
                     Err(e) => {
-                        let body = unary(err_body(err_message(&e)));
-                        return dynify(stabby::boxed::Box::new(async move { body }));
+                        let body = frame_bytes(error_body(err_message(&e)));
+                        return ready(body);
                     }
                 };
                 let key = pb_addr_key(req.target_def.as_option().and_then(|t| t.addr.as_option()));
@@ -1316,12 +1268,10 @@ impl StableManagedDriver for StableManagedDriverImpl {
                     "apply_transitive",
                     key,
                     driver_apply_transitive(driver, req, Arc::clone(&self.cancels)),
-                    |m| unary(err_body(m)),
+                    |m| frame_bytes(error_body(m)),
                 )))
             }
-            _ => dynify(stabby::boxed::Box::new(
-                async move { unimplemented(method) },
-            )),
+            _ => ready(unimplemented(method)),
         }
     }
 
@@ -1331,9 +1281,7 @@ impl StableManagedDriver for StableManagedDriverImpl {
         method: u32,
         _req: SVec<u8>,
     ) -> DynFuture<'a, DynItemStream> {
-        dynify(stabby::boxed::Box::new(async move {
-            unimplemented_item_stream(method)
-        }))
+        ready(unimplemented_item_stream(method))
     }
 
     extern "C" fn invoke_client_stream<'a>(
@@ -1341,9 +1289,7 @@ impl StableManagedDriver for StableManagedDriverImpl {
         method: u32,
         _req: DynItemStream,
     ) -> DynFuture<'a, SVec<u8>> {
-        dynify(stabby::boxed::Box::new(
-            async move { unimplemented(method) },
-        ))
+        ready(unimplemented(method))
     }
 
     // `run` is the one bidi RPC: request stream = RunInFrame (run request, then live
@@ -1367,21 +1313,8 @@ impl StableManagedDriver for StableManagedDriverImpl {
 /// Guest-side response stream backed by an mpsc the run task feeds. `blocking_recv`
 /// is sound because the host drains run output on a blocking task (it cannot ride
 /// the host's async workers), matching how `run` already parks threads per chunk.
-struct ChannelItemStream {
-    rx: Mutex<tokio::sync::mpsc::Receiver<SVec<u8>>>,
-}
-
-impl StableItemStream for ChannelItemStream {
-    extern "C" fn next(&self) -> SVec<u8> {
-        let mut rx = self.rx.lock().unwrap_or_else(|e| e.into_inner());
-        rx.blocking_recv().unwrap_or_default()
-    }
-}
-
-fn make_channel_item_stream(rx: tokio::sync::mpsc::Receiver<SVec<u8>>) -> DynItemStream {
-    dynify(stabby::boxed::Box::new(ChannelItemStream {
-        rx: Mutex::new(rx),
-    }))
+fn make_channel_item_stream(mut rx: tokio::sync::mpsc::Receiver<SVec<u8>>) -> DynItemStream {
+    item_stream(std::iter::from_fn(move || rx.blocking_recv()))
 }
 
 fn run_out_err(msg: String) -> pb::RunOutFrame {
@@ -1400,7 +1333,7 @@ fn run_out_failure_frame(failure: pb::RunFailure) -> pb::RunOutFrame {
 
 /// A run response stream that fails immediately (one `RunOutFrame{failure}`).
 fn run_error_stream(msg: String) -> DynItemStream {
-    make_item_stream(Box::new(std::iter::once(encode_svec(&run_out_err(msg)))))
+    item_stream(std::iter::once(encode_svec(&run_out_err(msg))))
 }
 
 /// The run request a run's start frame carries, with what names it.
@@ -2102,7 +2035,7 @@ mod tests {
             msg: Some(pb::run_in_frame::Msg::StdinChunk(b"s3cr3t".to_vec())),
             ..Default::default()
         };
-        let stream = make_item_stream(Box::new(std::iter::once(encode_svec(&frame))));
+        let stream = item_stream(std::iter::once(encode_svec(&frame)));
         let err = pull_run_start(&stream).expect_err("not a start frame");
         let msg = format!("{err:#}");
         assert!(msg.contains("stdin chunk (6 bytes)"), "{msg}");
@@ -2822,7 +2755,7 @@ mod tests {
 
         let dynd = make_dyn_managed_driver(Arc::new(NoopDriver) as Arc<dyn ManagedDriver>);
         let start = start_frame(wire_run(wire_target()));
-        let req_stream = make_item_stream(Box::new(std::iter::once(start)));
+        let req_stream = item_stream(std::iter::once(start));
 
         let resp =
             futures::executor::block_on(dynd.invoke_bidi(pb::DriverMethod::Run as u32, req_stream));
@@ -2912,7 +2845,7 @@ mod tests {
         let dynd = make_dyn_managed_driver(Arc::new(ChainErrDriver) as Arc<dyn ManagedDriver>);
         // A valid request so decoding succeeds and `driver.run` is reached.
         let start = start_frame(wire_run(wire_target()));
-        let req_stream = make_item_stream(Box::new(std::iter::once(start)));
+        let req_stream = item_stream(std::iter::once(start));
 
         let resp =
             futures::executor::block_on(dynd.invoke_bidi(pb::DriverMethod::Run as u32, req_stream));
@@ -4118,7 +4051,7 @@ mod tests {
             let mut req = wire_run(wire_target());
             req.cancel_key = key;
             let frame = start_frame(req);
-            pull_run_start(&make_item_stream(Box::new(std::iter::once(frame))))
+            pull_run_start(&item_stream(std::iter::once(frame)))
         };
         let got = pull(Some(cancel_key(7))).expect("keyed");
         assert_eq!(got.request_id, "r");

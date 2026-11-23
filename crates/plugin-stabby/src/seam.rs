@@ -3,7 +3,34 @@
 //! compiled — no transport or host deps — so the guest SDK can use them with
 //! `default-features = false`.
 
+use crate::abi::{DynItemStream, StableItemStream};
+use crate::vtable::dynify;
 use stabby::vec::Vec as SVec;
+use std::sync::Mutex;
+
+/// An item stream whose `next` pulls the next frame from `items`, on demand —
+/// nothing is buffered at the seam. An exhausted iterator reads as the empty
+/// frame that ends the stream.
+///
+/// `items` may block in `next` (a channel receive) only where the other side
+/// pulls the stream on a thread of its own, as it does a run's and a hook's.
+pub fn item_stream<I>(items: I) -> DynItemStream
+where
+    I: Iterator<Item = SVec<u8>> + Send + 'static,
+{
+    dynify(stabby::boxed::Box::new(IterItemStream(Mutex::new(items))))
+}
+
+/// `Mutex` (not `RefCell`) so the handle is `Send + Sync`: list results flow
+/// into the host engine, which requires `Send`.
+struct IterItemStream<I>(Mutex<I>);
+
+impl<I: Iterator<Item = SVec<u8>> + Send> StableItemStream for IterItemStream<I> {
+    extern "C" fn next(&self) -> SVec<u8> {
+        let mut items = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        items.next().unwrap_or_default()
+    }
+}
 
 /// Encode `m` straight into the `SVec` that crosses the seam.
 ///

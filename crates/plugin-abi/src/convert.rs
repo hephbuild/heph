@@ -1806,6 +1806,12 @@ pub fn exit_from_pb(
     }
 }
 
+/// Whether `e` is a dependency cycle anywhere in its chain — the one error
+/// kind each side of the seam carries as a `Cycle` rather than as text.
+pub fn is_cycle(e: &anyhow::Error) -> bool {
+    hcore::hmemoizer::downcast_chain_ref::<hplugin::error::CycleError>(e).is_some()
+}
+
 /// A run's failure as the wire carries it: `message` (the plugin's whole
 /// rendered chain), plus the process exit and the
 /// [`FailureArtifacts`](hplugin::error::FailureArtifacts) and

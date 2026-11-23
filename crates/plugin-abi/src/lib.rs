@@ -388,6 +388,30 @@ pub fn decode<M: buffa::Message>(bytes: &[u8]) -> Result<M, buffa::DecodeError> 
         .decode_from_slice(bytes)
 }
 
+/// The `pb::Frame` a reply crosses the seam in: a unary reply, or one item of a
+/// response stream. Both sides frame through here.
+pub fn frame(body: pb::frame::Body) -> pb::Frame {
+    pb::Frame {
+        id: Some(0),
+        body: Some(body),
+        ..Default::default()
+    }
+}
+
+/// A wire `pb::Error` of `kind` carrying `message`.
+pub fn wire_error(kind: pb::error::Kind, message: String) -> pb::Error {
+    pb::Error {
+        kind: Some(kind.into()),
+        message: Some(message),
+        ..Default::default()
+    }
+}
+
+/// A frame body failing the call with `message` (`Error{Other}`).
+pub fn error_body(message: String) -> pb::frame::Body {
+    pb::frame::Body::from(wire_error(pb::error::Kind::Other, message))
+}
+
 #[cfg(feature = "convert")]
 pub mod convert;
 
