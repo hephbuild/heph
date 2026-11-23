@@ -516,25 +516,40 @@ pub fn incrementalize(
     seed: u64,
 ) -> Result<usize> {
     let mut rng = Rng::new(seed ^ 0xACE1);
-    let n = fraction_count(manifest.bash_packages.len(), fraction);
-    let mut touched = std::collections::HashSet::new();
-    while touched.len() < n {
-        touched.insert(rng.below(manifest.bash_packages.len()));
-    }
+    let len = manifest.bash_packages.len();
+    let touched = pick_distinct(&mut rng, len, fraction_count(len, fraction));
 
     for &idx in &touched {
         let pkg = manifest
             .bash_packages
             .get(idx)
             .expect("idx drawn from below.len() == bash_packages.len()");
-        let path: PathBuf = root.join(pkg).join("BUILD");
-        let mut src =
-            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-        src.push_str(&format!("\n# bench-mutated seed={seed}\n"));
-        std::fs::write(&path, src).with_context(|| format!("rewrite {}", path.display()))?;
+        append_line(
+            &root.join(pkg).join("BUILD"),
+            &format!("# bench-mutated seed={seed}"),
+        )?;
     }
 
     Ok(touched.len())
+}
+
+/// `n` distinct indices below `len` (`n <= len`), drawn from `rng`: the
+/// incremental scenarios' choice of what to mutate.
+fn pick_distinct(rng: &mut Rng, len: usize, n: usize) -> std::collections::HashSet<usize> {
+    let mut picked = std::collections::HashSet::new();
+    while picked.len() < n {
+        picked.insert(rng.below(len));
+    }
+    picked
+}
+
+/// Append `line`, on a line of its own, to the file at `path`: the
+/// incremental scenarios' one mutation, a trailing comment.
+fn append_line(path: &Path, line: &str) -> Result<()> {
+    let mut src =
+        std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    src.push_str(&format!("\n{line}\n"));
+    std::fs::write(path, src).with_context(|| format!("rewrite {}", path.display()))
 }
 
 fn collect_go_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
@@ -566,20 +581,13 @@ pub fn incrementalize_go(go_root: &Path, fraction: f64, seed: u64) -> Result<usi
     files.sort();
 
     let mut rng = Rng::new(seed ^ 0x0B0A_B0AB);
-    let n = fraction_count(files.len(), fraction);
-    let mut touched = std::collections::HashSet::new();
-    while touched.len() < n {
-        touched.insert(rng.below(files.len()));
-    }
+    let touched = pick_distinct(&mut rng, files.len(), fraction_count(files.len(), fraction));
 
     for &idx in &touched {
         let path = files
             .get(idx)
-            .expect("idx drawn from files.len() in the loop above");
-        let mut src =
-            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-        src.push_str(&format!("\n// bench-mutated seed={seed}\n"));
-        std::fs::write(path, src).with_context(|| format!("rewrite {}", path.display()))?;
+            .expect("idx drawn from files.len() in pick_distinct");
+        append_line(path, &format!("// bench-mutated seed={seed}"))?;
     }
 
     Ok(touched.len())
