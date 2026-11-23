@@ -1,16 +1,14 @@
 use crate::tui::session::SessionSlot;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use clap_complete::engine::ArgValueCompleter;
 
 use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
 use crate::commands::completion::complete_target_addr;
+use crate::commands::progress_app::run_engine_command;
 use crate::commands::utils::parse_addr_arg;
-use crate::engine::Engine;
-use crate::htaddr::Addr;
-use crate::tui::{self, App, AppContext, LogSink};
+use crate::tui::LogSink;
 
 #[derive(clap::Args, Clone)]
 pub struct Args {
@@ -19,40 +17,6 @@ pub struct Args {
     pub addr: String,
     #[command(flatten)]
     pub dashboard: crate::commands::progress_app::DashboardArgs,
-}
-
-struct HashinApp {
-    engine: Arc<Engine>,
-    addr: Addr,
-    fail_fast: bool,
-}
-
-#[async_trait]
-impl App for HashinApp {
-    type Output = ();
-    type TuiView = crate::tui::TuiProgressView;
-    type CiView = crate::tui::CiProgressView;
-
-    fn tui_view(&self) -> Self::TuiView {
-        crate::tui::TuiProgressView::new(format!("Hashin {}", self.addr.format()))
-    }
-
-    fn ci_view(&self) -> Self::CiView {
-        crate::tui::CiProgressView::new(format!("Hashin {}", self.addr.format()))
-    }
-
-    async fn run(self, ctx: AppContext) -> anyhow::Result<()> {
-        let rs = self
-            .engine
-            .new_state_with_events(self.fail_fast, ctx.event_sender());
-        // `meta` may run provider targets, recording rich failures in `rs`;
-        // `finalize` prefers those over the returned error and prints on success.
-        let res = self.engine.clone().meta(rs.clone(), &self.addr).await;
-        crate::commands::errors::finalize!(ctx, rs, res, meta => {
-            println!("{}", meta.hashin);
-            Ok(())
-        })
-    }
 }
 
 pub fn execute(
@@ -71,20 +35,22 @@ async fn execute_async(
     global: GlobalOptions,
 ) -> anyhow::Result<()> {
     let addr = parse_addr_arg(&args.addr)?;
-    let (engine, shutdown) = bootstrap::new_engine(&global, session)?;
-    let app = HashinApp {
-        engine,
-        addr,
-        fail_fast: global.fail_fast,
-    };
-    let interactive = tui::should_use_tui(global.no_tui);
-    tui::run_app_with(
-        app,
+    run_engine_command(
+        format!("Hashin {}", addr.format()),
         sink,
         session,
-        interactive,
+        &global,
+        global.no_tui,
         args.dashboard.dashboard,
-        shutdown,
+        move |engine, rs, ctx| async move {
+            // `meta` may run provider targets, recording rich failures in `rs`;
+            // `finalize` prefers those over the returned error and prints on success.
+            let res = Arc::clone(&engine).meta(rs.clone(), &addr).await;
+            crate::commands::errors::finalize!(ctx, rs, res, meta => {
+                println!("{}", meta.hashin);
+                Ok(())
+            })
+        },
     )
     .await
 }

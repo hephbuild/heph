@@ -1,14 +1,11 @@
 use crate::tui::session::SessionSlot;
 use std::sync::Arc;
 
-use async_trait::async_trait;
-
 use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
+use crate::commands::progress_app::run_engine_command;
 use crate::commands::utils::package_matcher_or_all;
-use crate::engine::Engine;
-use crate::htmatcher::Matcher;
-use crate::tui::{self, App, AppContext, BufferedStdout, LogSink};
+use crate::tui::{BufferedStdout, LogSink};
 
 #[derive(clap::Args, Clone)]
 pub struct Args {
@@ -16,47 +13,6 @@ pub struct Args {
     pub matcher: Option<String>,
     #[command(flatten)]
     pub dashboard: crate::commands::progress_app::DashboardArgs,
-}
-
-struct PackagesApp {
-    engine: Arc<Engine>,
-    matcher: Matcher,
-    fail_fast: bool,
-}
-
-#[async_trait]
-impl App for PackagesApp {
-    type Output = ();
-    type TuiView = crate::tui::TuiProgressView;
-    type CiView = crate::tui::CiProgressView;
-
-    fn tui_view(&self) -> Self::TuiView {
-        crate::tui::TuiProgressView::new(format!("Packages {:?}", self.matcher))
-    }
-
-    fn ci_view(&self) -> Self::CiView {
-        crate::tui::CiProgressView::new(format!("Packages {:?}", self.matcher))
-    }
-
-    async fn run(self, ctx: AppContext) -> anyhow::Result<()> {
-        let rs = self
-            .engine
-            .new_state_with_events(self.fail_fast, ctx.event_sender());
-
-        // Output is incremental; listing may run provider targets, recording rich
-        // failures in `rs`, which `finalize` prefers over the returned error.
-        let out = BufferedStdout::new(&ctx);
-        let res: anyhow::Result<()> = async {
-            for p in self.engine.packages(&self.matcher, &rs).await? {
-                out.println(p);
-            }
-            Ok(())
-        }
-        .await;
-        out.close().await;
-
-        crate::commands::errors::finalize!(ctx, rs, res)
-    }
 }
 
 pub fn execute(
@@ -75,20 +31,27 @@ async fn execute_async(
     global: GlobalOptions,
 ) -> anyhow::Result<()> {
     let matcher = package_matcher_or_all(args.matcher.as_deref())?;
-    let (engine, shutdown) = bootstrap::new_engine(&global, session)?;
-    let app = PackagesApp {
-        engine,
-        matcher,
-        fail_fast: global.fail_fast,
-    };
-    let interactive = tui::should_use_tui(global.no_tui);
-    tui::run_app_with(
-        app,
+    run_engine_command(
+        format!("Packages {matcher:?}"),
         sink,
         session,
-        interactive,
+        &global,
+        global.no_tui,
         args.dashboard.dashboard,
-        shutdown,
+        move |engine, rs, ctx| async move {
+            // Output is incremental; listing may run provider targets, recording rich
+            // failures in `rs`, which `finalize` prefers over the returned error.
+            let out = BufferedStdout::new(&ctx);
+            let res: anyhow::Result<()> = async {
+                for p in engine.packages(&matcher, &rs).await? {
+                    out.println(p);
+                }
+                Ok(())
+            }
+            .await;
+            out.close().await;
+            crate::commands::errors::finalize!(ctx, rs, res)
+        },
     )
     .await
 }

@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use crate::commands::{GlobalOptions, bootstrap};
 use crate::engine::Engine;
 use crate::engine::request_state::RequestState;
 use crate::tui::{self, App, AppContext, LogSink};
@@ -92,6 +93,49 @@ where
     tui::run_app_with(app, sink, session, interactive, dashboard, shutdown).await
 }
 
+/// Build the engine `global` describes, then run `body` on it under
+/// [`run_with_progress`]. `body` gets the engine and a request on it from
+/// [`engine_request`]; the exit code is the body's.
+///
+/// `no_tui` is the command's, which is `global.no_tui` unless the command
+/// turns the TUI off itself (`--json`). `dashboard` is its `-D`.
+pub(crate) async fn run_engine_command<F, Fut>(
+    label: impl Into<String>,
+    sink: LogSink,
+    session: &Arc<SessionSlot>,
+    global: &GlobalOptions,
+    no_tui: bool,
+    dashboard: bool,
+    body: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce(Arc<Engine>, Arc<RequestState>, AppContext) -> Fut + Send + 'static,
+    Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    let (engine, shutdown) = bootstrap::new_engine(global, session)?;
+    let fail_fast = global.fail_fast;
+    run_with_progress(
+        label,
+        sink,
+        session,
+        no_tui,
+        dashboard,
+        shutdown,
+        move |ctx| {
+            let rs = engine_request(&engine, fail_fast, &ctx);
+            body(engine, rs, ctx)
+        },
+    )
+    .await
+}
+
+/// The request a [`run_engine_command`] body runs on: its build events reach
+/// `ctx`'s view, and it is fail-fast as the command line says (`fail_fast`),
+/// unlike [`request_state`].
+fn engine_request(engine: &Arc<Engine>, fail_fast: bool, ctx: &AppContext) -> Arc<RequestState> {
+    engine.new_state_with_events(fail_fast, ctx.event_sender())
+}
+
 /// A request whose build events reach `ctx`'s view, and whose sandbox cleanups
 /// the renderer waits on before it tears down.
 ///
@@ -142,6 +186,36 @@ mod tests {
         )
         .await
         .expect("a passing body passes");
+    }
+
+    /// An engine command's request is fail-fast exactly when the command line
+    /// says so — not always, as [`request_state`]'s is — so `--fail-fast`
+    /// (and its absence) reaches `inspect`, `query` and the rest unchanged.
+    #[tokio::test]
+    async fn engine_request_takes_fail_fast_from_the_command_line() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let engine = Arc::new(Engine::new(crate::engine::Config::for_tests(root.path()))?);
+        for fail_fast in [false, true] {
+            let session = Arc::new(SessionSlot::new());
+            let sink = LogSink::new_direct_with(Arc::clone(&session));
+            let (shutdown, _rx) = hcore::shutdown::ShutdownTrigger::new();
+            let engine = Arc::clone(&engine);
+            run_with_progress(
+                "t",
+                sink,
+                &session,
+                true,
+                false,
+                shutdown,
+                move |ctx| async move {
+                    let rs = engine_request(&engine, fail_fast, &ctx);
+                    assert_eq!(rs.fail_fast(), fail_fast);
+                    Ok(())
+                },
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     /// The whole command line, as `main` parses it.

@@ -2,17 +2,16 @@ use crate::tui::session::SessionSlot;
 use std::sync::Arc;
 
 use anyhow::Context;
-use async_trait::async_trait;
 use clap_complete::engine::ArgValueCompleter;
 use serde::Serialize;
 
 use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
 use crate::commands::completion::complete_target_addr;
+use crate::commands::progress_app::run_engine_command;
 use crate::commands::utils::parse_addr_arg;
-use crate::engine::{Engine, OutputMatcher, ResultOptions};
-use crate::htaddr::Addr;
-use crate::tui::{self, App, AppContext, LogSink};
+use crate::engine::{OutputMatcher, ResultOptions};
+use crate::tui::LogSink;
 
 #[derive(clap::Args, Clone)]
 pub struct Args {
@@ -33,83 +32,6 @@ struct OutputsView {
     support_paths: Vec<String>,
 }
 
-struct OutputsApp {
-    engine: Arc<Engine>,
-    addr: Addr,
-    json: bool,
-    fail_fast: bool,
-    /// `--no-scratch`: run against empty scratch caches. Implies a rebuild.
-    no_scratch: bool,
-}
-
-#[async_trait]
-impl App for OutputsApp {
-    type Output = ();
-    type TuiView = crate::tui::TuiProgressView;
-    type CiView = crate::tui::CiProgressView;
-
-    fn tui_view(&self) -> Self::TuiView {
-        crate::tui::TuiProgressView::new(format!("Outputs {}", self.addr.format()))
-    }
-
-    fn ci_view(&self) -> Self::CiView {
-        crate::tui::CiProgressView::new(format!("Outputs {}", self.addr.format()))
-    }
-
-    async fn run(self, ctx: AppContext) -> anyhow::Result<()> {
-        let rs = self
-            .engine
-            .new_state_with_events(self.fail_fast, ctx.event_sender());
-        // `OutputMatcher::All` rather than `None`: the paths live inside the
-        // artifacts, and `None` resolves hashouts without handing any back.
-        let res = self
-            .engine
-            .clone()
-            .result_addr(
-                rs.clone(),
-                &self.addr,
-                OutputMatcher::All,
-                &ResultOptions {
-                    no_scratch: self.no_scratch,
-                    ..Default::default()
-                },
-            )
-            .await;
-        let addr = self.addr.format();
-        let json = self.json;
-        crate::commands::errors::finalize!(ctx, rs, res, result => {
-            // `entry_paths` is header-only for tar-backed cache artifacts, so
-            // listing a target's outputs does not read their bytes.
-            let collect = |arts: &[Arc<dyn hcore::hartifactcontent::Content>]| -> anyhow::Result<Vec<String>> {
-                let mut out = Vec::new();
-                for art in arts {
-                    for p in art.entry_paths().context("enumerate artifact paths")? {
-                        out.push(p.to_string_lossy().into_owned());
-                    }
-                }
-                out.sort();
-                out.dedup();
-                Ok(out)
-            };
-            let paths = collect(&result.artifacts)?;
-            let support_paths = collect(&result.support_artifacts)?;
-
-            if json {
-                let view = OutputsView { addr, paths, support_paths };
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&view).context("serialize outputs")?
-                );
-            } else {
-                for p in &paths {
-                    println!("{p}");
-                }
-            }
-            Ok(())
-        })
-    }
-}
-
 pub fn execute(
     args: &Args,
     sink: LogSink,
@@ -126,22 +48,62 @@ async fn execute_async(
     global: GlobalOptions,
 ) -> anyhow::Result<()> {
     let addr = parse_addr_arg(&args.addr)?;
-    let (engine, shutdown) = bootstrap::new_engine(&global, session)?;
-    let app = OutputsApp {
-        engine,
-        addr,
-        json: args.json,
-        fail_fast: global.fail_fast,
-        no_scratch: global.no_scratch,
-    };
-    let interactive = tui::should_use_tui(global.no_tui);
-    tui::run_app_with(
-        app,
+    let json = args.json;
+    // `--no-scratch`: run against empty scratch caches. Implies a rebuild.
+    let no_scratch = global.no_scratch;
+    run_engine_command(
+        format!("Outputs {}", addr.format()),
         sink,
         session,
-        interactive,
+        &global,
+        global.no_tui,
         args.dashboard.dashboard,
-        shutdown,
+        move |engine, rs, ctx| async move {
+            // `OutputMatcher::All` rather than `None`: the paths live inside the
+            // artifacts, and `None` resolves hashouts without handing any back.
+            let res = Arc::clone(&engine)
+                .result_addr(
+                    rs.clone(),
+                    &addr,
+                    OutputMatcher::All,
+                    &ResultOptions {
+                        no_scratch,
+                        ..Default::default()
+                    },
+                )
+                .await;
+            let addr = addr.format();
+            crate::commands::errors::finalize!(ctx, rs, res, result => {
+                // `entry_paths` is header-only for tar-backed cache artifacts, so
+                // listing a target's outputs does not read their bytes.
+                let collect = |arts: &[Arc<dyn hcore::hartifactcontent::Content>]| -> anyhow::Result<Vec<String>> {
+                    let mut out = Vec::new();
+                    for art in arts {
+                        for p in art.entry_paths().context("enumerate artifact paths")? {
+                            out.push(p.to_string_lossy().into_owned());
+                        }
+                    }
+                    out.sort();
+                    out.dedup();
+                    Ok(out)
+                };
+                let paths = collect(&result.artifacts)?;
+                let support_paths = collect(&result.support_artifacts)?;
+
+                if json {
+                    let view = OutputsView { addr, paths, support_paths };
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&view).context("serialize outputs")?
+                    );
+                } else {
+                    for p in &paths {
+                        println!("{p}");
+                    }
+                }
+                Ok(())
+            })
+        },
     )
     .await
 }

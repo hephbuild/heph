@@ -1,16 +1,14 @@
 use crate::tui::session::SessionSlot;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use clap_complete::engine::ArgValueCompleter;
 
 use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
 use crate::commands::completion::complete_target_addr;
+use crate::commands::progress_app::run_engine_command;
 use crate::commands::utils::parse_addr_arg;
-use crate::engine::Engine;
-use crate::htaddr::Addr;
-use crate::tui::{self, App, AppContext, LogSink};
+use crate::tui::{self, LogSink};
 
 #[derive(clap::Args, Clone)]
 pub struct Args {
@@ -22,42 +20,6 @@ pub struct Args {
     pub interactive: bool,
     #[command(flatten)]
     pub dashboard: crate::commands::progress_app::DashboardArgs,
-}
-
-struct DepsApp {
-    engine: Arc<Engine>,
-    addr: Addr,
-    fail_fast: bool,
-}
-
-#[async_trait]
-impl App for DepsApp {
-    type Output = ();
-    type TuiView = crate::tui::TuiProgressView;
-    type CiView = crate::tui::CiProgressView;
-
-    fn tui_view(&self) -> Self::TuiView {
-        crate::tui::TuiProgressView::new(format!("Deps {}", self.addr.format()))
-    }
-
-    fn ci_view(&self) -> Self::CiView {
-        crate::tui::CiProgressView::new(format!("Deps {}", self.addr.format()))
-    }
-
-    async fn run(self, ctx: AppContext) -> anyhow::Result<()> {
-        let rs = self
-            .engine
-            .new_state_with_events(self.fail_fast, ctx.event_sender());
-        // `get_def` may run provider targets, recording rich failures in `rs`;
-        // `finalize` prefers those over the returned error and prints on success.
-        let res = self.engine.clone().get_def(rs.clone(), &self.addr).await;
-        crate::commands::errors::finalize!(ctx, rs, res, def => {
-            for input in &def.target_def.inputs {
-                println!("{}", input.r#ref);
-            }
-            Ok(())
-        })
-    }
 }
 
 pub fn execute(
@@ -76,28 +38,33 @@ async fn execute_async(
     global: GlobalOptions,
 ) -> anyhow::Result<()> {
     let addr = parse_addr_arg(&args.addr)?;
-    let (engine, shutdown) = bootstrap::new_engine(&global, session)?;
-    let interactive = tui::should_use_tui(global.no_tui);
 
     if args.interactive {
-        if !interactive {
+        let (engine, shutdown) = bootstrap::new_engine(&global, session)?;
+        if !tui::should_use_tui(global.no_tui) {
             anyhow::bail!("--interactive requires a terminal (stderr is not a TTY)");
         }
         return super::deps_explorer::run(engine, addr, sink, shutdown).await;
     }
 
-    let app = DepsApp {
-        engine,
-        addr,
-        fail_fast: global.fail_fast,
-    };
-    tui::run_app_with(
-        app,
+    run_engine_command(
+        format!("Deps {}", addr.format()),
         sink,
         session,
-        interactive,
+        &global,
+        global.no_tui,
         args.dashboard.dashboard,
-        shutdown,
+        move |engine, rs, ctx| async move {
+            // `get_def` may run provider targets, recording rich failures in `rs`;
+            // `finalize` prefers those over the returned error and prints on success.
+            let res = Arc::clone(&engine).get_def(rs.clone(), &addr).await;
+            crate::commands::errors::finalize!(ctx, rs, res, def => {
+                for input in &def.target_def.inputs {
+                    println!("{}", input.r#ref);
+                }
+                Ok(())
+            })
+        },
     )
     .await
 }
