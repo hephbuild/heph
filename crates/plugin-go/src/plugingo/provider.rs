@@ -1168,7 +1168,8 @@ impl ProviderInner {
     }
 }
 
-#[derive(Clone)]
+/// Shared through `libs_cache`: a caller that needs to add to `libs` copies it.
+#[derive(Debug)]
 struct TransitiveDeps {
     /// `(import_path, build_lib_addr)` for every reachable dep (for importcfg).
     libs: Vec<(String, Addr)>,
@@ -2502,7 +2503,7 @@ impl ProviderInner {
                 }
 
                 let own_lib_addr = self.build_lib_addr(addr, &vref);
-                let mut transitive = Arc::clone(&self)
+                let transitive = Arc::clone(&self)
                     .collect_transitive_libs(
                         Arc::clone(&req.executor),
                         &pkg.imports,
@@ -2512,9 +2513,10 @@ impl ProviderInner {
                     )
                     .await
                     .map_err(GetError::Other)?;
-                transitive
-                    .libs
-                    .insert(0, (import_path.clone(), own_lib_addr));
+                let libs: Vec<(String, Addr)> =
+                    std::iter::once((import_path.clone(), own_lib_addr))
+                        .chain(transitive.libs.iter().cloned())
+                        .collect();
 
                 let link =
                     pick_link(&req.states, addr.package.as_str()).map_err(GetError::Other)?;
@@ -2522,7 +2524,7 @@ impl ProviderInner {
                     addr.clone(),
                     &import_path,
                     &factors,
-                    &transitive.libs,
+                    &libs,
                     &link,
                     &self.go_version,
                 );
@@ -2665,13 +2667,17 @@ impl ProviderInner {
                 let p_lib_name = pick_xtest_p_lib_name(&pkg);
                 let rewritten_libs: Vec<(String, Addr)> = transitive
                     .libs
-                    .into_iter()
+                    .iter()
                     .filter_map(|(ip, a)| {
-                        if ip != import_path {
-                            return Some((ip, a));
+                        if *ip != import_path {
+                            return Some((ip.clone(), a.clone()));
                         }
-                        p_lib_name
-                            .map(|name| (ip, self.make_addr_with_name(&addr.package, name, &vref)))
+                        p_lib_name.map(|name| {
+                            (
+                                ip.clone(),
+                                self.make_addr_with_name(&addr.package, name, &vref),
+                            )
+                        })
                     })
                     .collect();
 
@@ -2715,7 +2721,7 @@ impl ProviderInner {
                 if pkg.test_go_files.is_empty() {
                     return Err(GetError::NotFound);
                 }
-                let mut transitive = Arc::clone(&self)
+                let transitive = Arc::clone(&self)
                     .collect_direct_libs(
                         Arc::clone(&req.executor),
                         &TESTMAIN_IMPORTS.map(String::from),
@@ -2728,7 +2734,8 @@ impl ProviderInner {
                 // testmain imports `_test "P"` → importcfg needs P→test_lib.
                 let test_lib_addr =
                     self.make_addr_with_name(&addr.package, "build_test_lib", &vref);
-                transitive.libs.push((import_path.clone(), test_lib_addr));
+                let mut libs = transitive.libs.clone();
+                libs.push((import_path.clone(), test_lib_addr));
 
                 let testmain_src_addr =
                     Addr::new(addr.package.clone(), "testmain".to_string(), vref.to_args());
@@ -2736,7 +2743,7 @@ impl ProviderInner {
                     addr.clone(),
                     &factors,
                     &testmain_src_addr,
-                    &transitive.libs,
+                    &libs,
                     &self.go_version,
                     &module_of_pkg(&addr.package, &self.pkgs),
                 );
@@ -2748,7 +2755,7 @@ impl ProviderInner {
                 if pkg.xtest_go_files.is_empty() {
                     return Err(GetError::NotFound);
                 }
-                let mut transitive = Arc::clone(&self)
+                let transitive = Arc::clone(&self)
                     .collect_direct_libs(
                         Arc::clone(&req.executor),
                         &TESTMAIN_IMPORTS.map(String::from),
@@ -2761,9 +2768,8 @@ impl ProviderInner {
                 // testmain imports `_xtest "P_test"` → importcfg needs P_test→xtest_lib.
                 let xtest_lib_addr =
                     self.make_addr_with_name(&addr.package, "build_xtest_lib", &vref);
-                transitive
-                    .libs
-                    .push((format!("{}_test", import_path), xtest_lib_addr));
+                let mut libs = transitive.libs.clone();
+                libs.push((format!("{}_test", import_path), xtest_lib_addr));
 
                 let testmain_src_addr = Addr::new(
                     addr.package.clone(),
@@ -2774,7 +2780,7 @@ impl ProviderInner {
                     addr.clone(),
                     &factors,
                     &testmain_src_addr,
-                    &transitive.libs,
+                    &libs,
                     &self.go_version,
                     &module_of_pkg(&addr.package, &self.pkgs),
                 );
@@ -2807,13 +2813,13 @@ impl ProviderInner {
 
                 // Assemble flat importcfg list: dedup by importpath, then add P→test_lib.
                 let mut all_libs: Vec<(String, Addr)> = Vec::new();
-                let mut seen: HashSet<String> = HashSet::new();
-                for (ip, a) in transitive.libs {
-                    if ip == import_path {
+                let mut seen: HashSet<&str> = HashSet::new();
+                for (ip, a) in &transitive.libs {
+                    if *ip == import_path {
                         continue; // P slot reserved for test_lib below
                     }
-                    if seen.insert(ip.clone()) {
-                        all_libs.push((ip, a));
+                    if seen.insert(ip) {
+                        all_libs.push((ip.clone(), a.clone()));
                     }
                 }
                 let test_lib_addr =
@@ -2864,7 +2870,7 @@ impl ProviderInner {
                     .map_err(GetError::Other)?;
 
                 let mut all_libs: Vec<(String, Addr)> = Vec::new();
-                let mut seen: HashSet<String> = HashSet::new();
+                let mut seen: HashSet<&str> = HashSet::new();
                 // P's flavor in xtest bin must match xtest_lib's compile-time
                 // view (see `pick_xtest_p_lib_name`). For pure xtest-only
                 // packages P has no lib at all — skip the slot entirely so we
@@ -2872,18 +2878,18 @@ impl ProviderInner {
                 if let Some(p_lib_name) = pick_xtest_p_lib_name(&pkg) {
                     let p_addr = self.make_addr_with_name(&addr.package, p_lib_name, &vref);
                     all_libs.push((import_path.clone(), p_addr));
-                    seen.insert(import_path.clone());
+                    seen.insert(&import_path);
                 } else {
                     // Still reserve the slot so a transitive resolution of P
                     // (resolves to build_lib addr that doesn't exist) doesn't
                     // sneak into the importcfg.
-                    seen.insert(import_path.clone());
+                    seen.insert(&import_path);
                 }
                 let p_test = format!("{}_test", import_path);
-                seen.insert(p_test.clone()); // reserve for xtest_lib below
-                for (ip, a) in transitive.libs {
-                    if seen.insert(ip.clone()) {
-                        all_libs.push((ip, a));
+                seen.insert(&p_test); // reserve for xtest_lib below
+                for (ip, a) in &transitive.libs {
+                    if seen.insert(ip) {
+                        all_libs.push((ip.clone(), a.clone()));
                     }
                 }
                 let xtest_lib_addr =
@@ -3585,7 +3591,7 @@ impl ProviderInner {
         extra_imports: &[String],
         vref: &VariantRef,
         module_root: &Path,
-    ) -> anyhow::Result<TransitiveDeps> {
+    ) -> anyhow::Result<Arc<TransitiveDeps>> {
         self.collect_libs(
             executor,
             root_imports,
@@ -3605,7 +3611,7 @@ impl ProviderInner {
         extra_imports: &[String],
         vref: &VariantRef,
         module_root: &Path,
-    ) -> anyhow::Result<TransitiveDeps> {
+    ) -> anyhow::Result<Arc<TransitiveDeps>> {
         self.collect_libs(
             executor,
             root_imports,
@@ -3625,13 +3631,12 @@ impl ProviderInner {
         vref: &VariantRef,
         module_root: &Path,
         transitive: bool,
-    ) -> anyhow::Result<TransitiveDeps> {
+    ) -> anyhow::Result<Arc<TransitiveDeps>> {
         let key = Self::libs_key(root_imports, extra_imports, vref, module_root, transitive);
         let extra = extra_imports.to_vec();
         let root_imports = root_imports.to_vec();
         let module_root = module_root.to_path_buf();
-        let arc = self
-            .libs_cache
+        self.libs_cache
             .once(
                 key,
                 enclose!((self => me, executor, vref) move || async move {
@@ -3648,8 +3653,7 @@ impl ProviderInner {
                 }),
             )
             .await
-            .map_err(unwrap_arc_err)?;
-        Ok((*arc).clone())
+            .map_err(unwrap_arc_err)
     }
 
     fn load_go_mod(&self, module_root: &Path) -> anyhow::Result<Arc<GoModData>> {
@@ -3786,27 +3790,27 @@ impl ProviderInner {
     ) -> anyhow::Result<TransitiveDeps> {
         let go_mod = self.load_go_mod(module_root)?;
 
-        if transitive {
-            // Pre-dedupe the top-level set so we don't fan out the same
-            // import_path twice (also halves cache lookups for repeated entries
-            // between `root_imports` and `extra_imports`).
-            let mut unique_imports: Vec<String> = root_imports
-                .iter()
-                .chain(extra_imports.iter())
-                .filter(|i| *i != "unsafe" && *i != "C")
-                .cloned()
-                .collect::<HashSet<_>>()
-                .into_iter()
-                .collect();
-            // HashSet iteration order is randomized per process; sort so the
-            // resulting transitive lib order is deterministic run-to-run.
-            unique_imports.sort();
+        // Dedupe the top-level set so we don't fan out the same import_path
+        // twice (also halves cache lookups for repeated entries between
+        // `root_imports` and `extra_imports`), and sort it so the resulting lib
+        // order is deterministic. The go_compile cache key sorts at the hash
+        // boundary too, but keeping both lanes deterministic avoids surprising
+        // any other consumer of `TransitiveDeps.libs`.
+        let mut imports: Vec<&str> = root_imports
+            .iter()
+            .chain(extra_imports)
+            .map(String::as_str)
+            .filter(|i| *i != "unsafe" && *i != "C")
+            .collect();
+        imports.sort_unstable();
+        imports.dedup();
 
+        if transitive {
             let module_root_buf = module_root.to_path_buf();
-            let sub_closures = try_join_all(unique_imports.into_iter().map(|ip| {
+            let sub_closures = try_join_all(imports.into_iter().map(|ip| {
                 Arc::clone(&self).import_closure(
                     Arc::clone(&executor),
-                    ip,
+                    ip.to_string(),
                     vref.clone(),
                     Arc::clone(&go_mod),
                     module_root_buf.clone(),
@@ -3827,22 +3831,7 @@ impl ProviderInner {
         let go_mod_requires = &go_mod.requires;
         let workspace_module_path = go_mod.module_path.as_str();
 
-        let mut imports: Vec<String> = root_imports
-            .iter()
-            .chain(extra_imports.iter())
-            .filter(|i| *i != "unsafe" && *i != "C")
-            .cloned()
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-        // HashSet iteration order is randomized per process; sort so the
-        // resulting `libs` order is deterministic run-to-run (mirrors the
-        // transitive branch above). The go_compile cache key sorts at the hash
-        // boundary too, but keeping this lane deterministic avoids surprising any
-        // other consumer of `TransitiveDeps.libs`.
-        imports.sort();
-
-        let results = try_join_all(imports.iter().map(|ip| {
+        let results = try_join_all(imports.into_iter().map(|ip| {
             self.resolve_import(
                 Arc::clone(&executor),
                 ip,
