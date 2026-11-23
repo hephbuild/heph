@@ -389,10 +389,9 @@ fn hand_off_opt_out(
     // flusher, or an opt-out one still within its deadline) holds this off,
     // and of two opted-out commands only the one that claims the spawn starts
     // a flusher.
-    let spawned_recently = state.last_spawn_ms.is_some_and(|last| {
-        (0..millis(FLUSH_RETRY_INTERVAL)).contains(&now_ms.saturating_sub(last))
-    });
-    if spawned_recently || !spool.claim_spawn(state.last_spawn_ms, now_ms)? {
+    if spawned_recently(state.last_spawn_ms, now_ms)
+        || !spool.claim_spawn(state.last_spawn_ms, now_ms)?
+    {
         return Ok(OptOutHandOff::Pending);
     }
     drop(spool);
@@ -603,10 +602,7 @@ fn flush_due(s: SpoolState, now_ms: i64) -> bool {
     if s.count == 0 {
         return false;
     }
-    let spawned_recently = s.last_spawn_ms.is_some_and(|last| {
-        (0..millis(FLUSH_RETRY_INTERVAL)).contains(&now_ms.saturating_sub(last))
-    });
-    if spawned_recently {
+    if spawned_recently(s.last_spawn_ms, now_ms) {
         return false;
     }
     s.count >= FLUSH_AT_EVENTS
@@ -634,6 +630,16 @@ fn next_flush_due(s: SpoolState, now_ms: i64) -> Option<i64> {
         .filter(|&last| last <= now_ms)
         .map(|last| last.saturating_add(millis(FLUSH_RETRY_INTERVAL)));
     Some(retry.map_or(ready, |r| ready.max(r)))
+}
+
+/// Whether a flusher was spawned within the last [`FLUSH_RETRY_INTERVAL`] of
+/// `now_ms`, which holds the next spawn off. A spawn stamp from the *future*
+/// (the clock stepped back) does not count: it would otherwise suppress spawns
+/// until the clock caught up.
+fn spawned_recently(last_spawn_ms: Option<i64>, now_ms: i64) -> bool {
+    last_spawn_ms.is_some_and(|last| {
+        (0..millis(FLUSH_RETRY_INTERVAL)).contains(&now_ms.saturating_sub(last))
+    })
 }
 
 /// `d` in whole milliseconds, saturating.
@@ -2008,6 +2014,18 @@ mod flush_tests {
             state(FLUSH_AT_EVENTS, 10 * MIN, Some(-10 * MIN)),
             NOW
         ));
+    }
+
+    /// The window both spawn gates (a due flush, an opt-out hand-off) share:
+    /// half-open `[last, last + retry)`, and a future stamp never holds off.
+    #[test]
+    fn spawned_recently_window_boundaries() {
+        let retry = i64::try_from(FLUSH_RETRY_INTERVAL.as_millis()).expect("ms");
+        assert!(!spawned_recently(None, NOW));
+        assert!(spawned_recently(Some(NOW), NOW));
+        assert!(spawned_recently(Some(NOW - (retry - 1)), NOW));
+        assert!(!spawned_recently(Some(NOW - retry), NOW));
+        assert!(!spawned_recently(Some(NOW + 1), NOW));
     }
 
     /// Of several commands that find a flush due at once, exactly one claims
