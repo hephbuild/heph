@@ -164,3 +164,86 @@ fn a_foreign_state_comes_from_the_row() {
         assert_eq!(rec.state().expect("state"), want, "{sql}");
     }
 }
+
+/// A foreign recording's notices and failure logs are cut as an export cuts
+/// them, whichever way they are read: a 10 MiB notice to `NOTICE_READ_CAP`,
+/// a 5 MiB log to its last `FAILURE_LOG_CAP` with the rest counted as cut.
+#[test]
+fn foreign_notices_and_logs_are_cut() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = session_dir(
+        tmp.path(),
+        "INSERT INTO notices VALUES ('//p:a', 1, 'plan', hex(zeroblob(5 * 1024 * 1024)));
+         INSERT INTO failure_logs VALUES ('//p:a', 0, zeroblob(5 * 1024 * 1024), 7);",
+    );
+    let rec = Recording::open_foreign(&dir.join(store::FILE), &tmp.path().join(".tmp"))
+        .expect("open foreign");
+    let Recording::Foreign(f) = &rec else {
+        panic!("foreign")
+    };
+    let notice = f
+        .recorded_notice("//p:a", 1, "plan")
+        .expect("notice")
+        .expect("a row");
+    assert_eq!(notice.len(), NOTICE_READ_CAP);
+    let cut = u64::try_from(5 << 20).expect("small") - FAILURE_LOG_CAP + 7;
+    let logs = f.failure_logs("//p:a").expect("logs");
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs.first().map(|(l, c)| (l.len() as u64, *c)), Some((FAILURE_LOG_CAP, cut)));
+
+    let source = rec.into_source().expect("source");
+    let notices = source.notices();
+    let text = notices
+        .get(&("//p:a".to_owned(), 1, "plan".to_owned()))
+        .expect("the notice");
+    assert_eq!(text.len(), NOTICE_READ_CAP);
+    let [log] = source.failure_logs() else {
+        panic!("one log")
+    };
+    assert_eq!((log.log.len() as u64, log.cut_bytes), (FAILURE_LOG_CAP, cut));
+}
+
+/// Every row costs the budget its addr and name too, and a constant: rows
+/// of empty text (or no text at all) are not free, so a file of many rows
+/// loads only what the budget holds.
+#[test]
+fn foreign_rows_are_charged_in_full() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = session_dir(
+        tmp.path(),
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1000)
+         INSERT INTO notices SELECT printf('//p:%0100d', i), 1, 'plan', '' FROM n;
+         WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1000)
+         INSERT INTO failure_logs SELECT printf('//p:%0100d', i), 0, x'', 0 FROM n;",
+    );
+    let rec = Recording::open_foreign(&dir.join(store::FILE), &tmp.path().join(".tmp"))
+        .expect("open foreign");
+    let budget = 10_000;
+    let notices = read_notices(rec.conn(), budget).expect("notices");
+    let charged: usize = notices
+        .iter()
+        .map(|((addr, _, name), text)| addr.len() + name.len() + text.len() + ROW_COST)
+        .sum();
+    assert!(!notices.is_empty() && charged <= budget, "{} rows, {charged} bytes", notices.len());
+    let logs = read_failure_logs(rec.conn(), None, budget as u64).expect("logs");
+    let charged: usize = logs.iter().map(|l| l.addr.len() + l.log.len() + ROW_COST).sum();
+    assert!(!logs.is_empty() && charged <= budget, "{} rows, {charged} bytes", logs.len());
+}
+
+/// A value past the foreign length limit is refused with an error, not read
+/// into memory.
+#[test]
+fn an_oversized_foreign_value_is_refused() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let over = hephsession::VALUE_CAP + 1;
+    let dir = session_dir(
+        tmp.path(),
+        &format!("INSERT INTO notices VALUES ('//p:a', 1, 'plan', zeroblob({over}));"),
+    );
+    let rec = Recording::open_foreign(&dir.join(store::FILE), &tmp.path().join(".tmp"))
+        .expect("open foreign");
+    let Err(err) = rec.into_source() else {
+        panic!("a value past the limit was read")
+    };
+    assert!(format!("{err:#}").contains("too big"), "{err:#}");
+}

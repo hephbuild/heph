@@ -179,7 +179,7 @@ impl Foreign {
     }
 
     /// The text an export recorded for notice `name` of request `seq` of
-    /// `addr`.
+    /// `addr`, cut to `NOTICE_READ_CAP` bytes.
     pub fn recorded_notice(
         &self,
         addr: &str,
@@ -187,33 +187,29 @@ impl Foreign {
         name: &str,
     ) -> rusqlite::Result<Option<String>> {
         let seq = i64::try_from(seq).unwrap_or(i64::MAX);
-        self.file
+        let cap = i64::try_from(NOTICE_READ_CAP).unwrap_or(i64::MAX);
+        let text = self
+            .file
             .conn
             .query_row(
-                "SELECT text FROM notices WHERE addr = ?1 AND seq = ?2 AND name = ?3
-                 ORDER BY rowid LIMIT 1",
-                params![addr, seq, name],
-                |r| r.get::<_, Option<String>>(0),
+                "SELECT CAST(substr(CAST(text AS BLOB), 1, ?4) AS BLOB) FROM notices
+                 WHERE addr = ?1 AND seq = ?2 AND name = ?3 ORDER BY rowid LIMIT 1",
+                params![addr, seq, name, cap],
+                |r| r.get::<_, Option<Vec<u8>>>(0),
             )
-            .optional()
-            .map(Option::flatten)
+            .optional()?
+            .flatten();
+        Ok(text.map(|t| String::from_utf8_lossy(&t).into_owned()))
     }
 
     /// The root failure logs an export recorded for `addr`, in order: each
-    /// log's kept tail and how many bytes were cut before it.
+    /// log's kept tail and how many bytes were cut before it, cut as a
+    /// viewer cuts them.
     pub fn failure_logs(&self, addr: &str) -> rusqlite::Result<Vec<(Vec<u8>, u64)>> {
-        let mut stmt = self.file.conn.prepare(
-            "SELECT log, cut_bytes FROM failure_logs WHERE addr = ?1 ORDER BY nth, rowid",
-        )?;
-        stmt.query_map(params![addr], |r| {
-            Ok((
-                r.get::<_, Option<Vec<u8>>>(0)?.unwrap_or_default(),
-                r.get::<_, Option<i64>>(1)?
-                    .and_then(|c| u64::try_from(c).ok())
-                    .unwrap_or(0),
-            ))
-        })?
-        .collect()
+        Ok(read_failure_logs(&self.file.conn, Some(addr), FAILURE_LOGS_CAP)?
+            .into_iter()
+            .map(|l| (l.log, l.cut_bytes))
+            .collect())
     }
 
     /// What the user named: the path, or the URL without its credentials.
@@ -287,8 +283,8 @@ impl ForeignSource {
             None => (None, false),
         };
         let pools = store::read_pools(conn).with_context(what)?;
-        let notices = read_notices(conn).with_context(what)?;
-        let failure_logs = read_failure_logs(conn).with_context(what)?;
+        let notices = read_notices(conn, RECORDED_NOTICES_CAP).with_context(what)?;
+        let failure_logs = read_failure_logs(conn, None, FAILURE_LOGS_CAP).with_context(what)?;
         let Foreign {
             file,
             download,
@@ -433,9 +429,17 @@ fn replay(mut cursor: RecordCursor, tx: &tokio::sync::mpsc::Sender<anyhow::Resul
     })));
 }
 
+/// What one row costs a budget beyond its bytes, so a row of empty strings
+/// (or of NULLs, skipped) is not free.
+const ROW_COST: usize = 64;
+
 /// The `notices` table, each text cut to `NOTICE_READ_CAP` bytes, until
-/// [`RECORDED_NOTICES_CAP`] in all.
-fn read_notices(conn: &Connection) -> rusqlite::Result<HashMap<(String, u64, String), String>> {
+/// `budget` bytes in all: every row is charged its addr, name, text and
+/// [`ROW_COST`].
+fn read_notices(
+    conn: &Connection,
+    budget: usize,
+) -> rusqlite::Result<HashMap<(String, u64, String), String>> {
     let mut stmt = conn.prepare(
         "SELECT addr, seq, name, CAST(substr(CAST(text AS BLOB), 1, ?1) AS BLOB) FROM notices \
          ORDER BY rowid",
@@ -443,52 +447,64 @@ fn read_notices(conn: &Connection) -> rusqlite::Result<HashMap<(String, u64, Str
     let cap = i64::try_from(NOTICE_READ_CAP).unwrap_or(i64::MAX);
     let mut rows = stmt.query(params![cap])?;
     let mut out = HashMap::new();
-    let mut left = RECORDED_NOTICES_CAP;
+    let mut left = budget;
     while let Some(r) = rows.next()? {
-        let (Some(addr), Some(seq), Some(name)) = (
-            r.get::<_, Option<String>>(0)?,
-            r.get::<_, Option<i64>>(1)?
-                .and_then(|s| u64::try_from(s).ok()),
-            r.get::<_, Option<String>>(2)?,
-        ) else {
-            continue;
-        };
+        let addr = r.get::<_, Option<String>>(0)?;
+        let seq = r.get::<_, Option<i64>>(1)?;
+        let name = r.get::<_, Option<String>>(2)?;
         let text = r.get::<_, Option<Vec<u8>>>(3)?.unwrap_or_default();
-        let Some(rest) = left.checked_sub(text.len()) else {
+        let cost = [addr.as_ref().map_or(0, String::len), name.as_ref().map_or(0, String::len)]
+            .iter()
+            .fold(text.len().saturating_add(ROW_COST), |a, b| a.saturating_add(*b));
+        let Some(rest) = left.checked_sub(cost) else {
             break;
         };
         left = rest;
+        let (Some(addr), Some(seq), Some(name)) =
+            (addr, seq.and_then(|s| u64::try_from(s).ok()), name)
+        else {
+            continue;
+        };
         out.entry((addr, seq, name))
             .or_insert_with(|| String::from_utf8_lossy(&text).into_owned());
     }
     Ok(out)
 }
 
-/// The `failure_logs` table, each log cut to its last `FAILURE_LOG_CAP`
-/// bytes, until `FAILURE_LOGS_CAP` in all.
-fn read_failure_logs(conn: &Connection) -> rusqlite::Result<Vec<FailureLog>> {
+/// The `failure_logs` table (only `addr`'s rows, given one), each log cut to
+/// its last `FAILURE_LOG_CAP` bytes, until `budget` bytes in all: every row
+/// is charged its addr, kept log and [`ROW_COST`].
+fn read_failure_logs(
+    conn: &Connection,
+    addr: Option<&str>,
+    budget: u64,
+) -> rusqlite::Result<Vec<FailureLog>> {
     let cap = i64::try_from(FAILURE_LOG_CAP).unwrap_or(i64::MAX);
     let mut stmt = conn.prepare(
         "SELECT addr, substr(CAST(log AS BLOB), -?1), cut_bytes, length(CAST(log AS BLOB)) \
-         FROM failure_logs ORDER BY nth, rowid",
+         FROM failure_logs WHERE ?2 IS NULL OR addr = ?2 ORDER BY nth, rowid",
     )?;
-    let mut rows = stmt.query(params![cap])?;
+    let mut rows = stmt.query(params![cap, addr])?;
     let mut out = Vec::new();
-    let mut left = FAILURE_LOGS_CAP;
+    let mut left = budget;
     while let Some(r) = rows.next()? {
-        let Some(addr) = r.get::<_, Option<String>>(0)? else {
+        let addr = r.get::<_, Option<String>>(0)?;
+        let log = r.get::<_, Option<Vec<u8>>>(1)?.unwrap_or_default();
+        let kept = log.len() as u64;
+        let cost = (ROW_COST as u64)
+            .saturating_add(kept)
+            .saturating_add(addr.as_ref().map_or(0, |a| a.len() as u64));
+        let Some(rest) = left.checked_sub(cost) else {
+            break;
+        };
+        left = rest;
+        let Some(addr) = addr else {
             continue;
         };
-        let log = r.get::<_, Option<Vec<u8>>>(1)?.unwrap_or_default();
         let len = r
             .get::<_, Option<i64>>(3)?
             .and_then(|l| u64::try_from(l).ok())
             .unwrap_or(0);
-        let kept = log.len() as u64;
-        let Some(rest) = left.checked_sub(kept) else {
-            break;
-        };
-        left = rest;
         let cut = r
             .get::<_, Option<i64>>(2)?
             .and_then(|c| u64::try_from(c).ok())

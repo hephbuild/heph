@@ -24,8 +24,11 @@
 use std::fs::File;
 use std::io::{self, Read, Seek as _, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rusqlite::Connection;
+use rusqlite::limits::Limit;
 
 use super::store;
 
@@ -37,6 +40,20 @@ pub const DECOMPRESS_CAP: u64 = 4 << 30;
 
 /// The most a `<ref>` URL may download (`hfetch::Fetcher::https_capped`).
 pub const URL_CAP: u64 = 1 << 30;
+
+/// The largest string or blob a foreign connection reads
+/// (`SQLITE_LIMIT_LENGTH`): a bigger one is an error, never loaded. An
+/// export's own values are far smaller (a notice is cut at 4 MiB, a failure
+/// log at 1 MiB, a record body at the recorder's line).
+pub const VALUE_CAP: i32 = 64 << 20;
+
+/// The most of a zip `ZipArchive::new` may read: the end record search and
+/// the central directory. Past it the zip is refused before its directory
+/// is held in memory.
+pub const ZIP_DIRECTORY_CAP: u64 = 8 << 20;
+
+/// The most entries a zip may hold.
+pub const ZIP_ENTRIES_CAP: usize = 10_000;
 
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
@@ -288,8 +305,29 @@ fn decompress(
 
 /// The one `*.hephsession` entry of a zip, read by content into a temp file.
 fn from_zip(file: File, tmp_dir: &Path, cap: u64) -> Result<tempfile::NamedTempFile, ForeignError> {
-    let mut archive = zip::ZipArchive::new(file)
-        .map_err(|e| not_a_session(format!("cannot read the zip: {e}")))?;
+    let budget = Arc::new(AtomicU64::new(ZIP_DIRECTORY_CAP));
+    let reader = Budgeted {
+        inner: file,
+        left: Arc::clone(&budget),
+    };
+    let mut archive = zip::ZipArchive::new(reader).map_err(|e| {
+        if budget.load(Ordering::Relaxed) == 0 {
+            not_a_session(format!(
+                "its central directory is past the {} MiB cap",
+                ZIP_DIRECTORY_CAP >> 20
+            ))
+        } else {
+            not_a_session(format!("cannot read the zip: {e}"))
+        }
+    })?;
+    // The directory is read: the entry's content is capped by `cap`.
+    budget.store(u64::MAX, Ordering::Relaxed);
+    if archive.len() > ZIP_ENTRIES_CAP {
+        return Err(not_a_session(format!(
+            "the zip holds {} entries, past the cap of {ZIP_ENTRIES_CAP}",
+            archive.len()
+        )));
+    }
     // Raw names, by index: a name is only ever matched and quoted, never a
     // path, and an entry is then read by its index.
     let names: Vec<String> = archive
@@ -334,6 +372,36 @@ fn from_zip(file: File, tmp_dir: &Path, cap: u64) -> Result<tempfile::NamedTempF
             "{what} starts with {}, which is neither a zstd frame nor a SQLite file",
             describe_lead(&lead)
         ))),
+    }
+}
+
+/// A reader that fails once it has read `left` bytes: what bounds the
+/// memory a zip's central directory takes while `ZipArchive::new` parses
+/// it, whatever its end record claims. Shared, so the caller lifts it once
+/// the directory is read.
+struct Budgeted {
+    inner: File,
+    left: Arc<AtomicU64>,
+}
+
+impl Read for Budgeted {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let left = self.left.load(Ordering::Relaxed);
+        if left == 0 && !buf.is_empty() {
+            return Err(io::Error::other("the zip's central directory is past its cap"));
+        }
+        let want = buf.len().min(usize::try_from(left).unwrap_or(usize::MAX));
+        let n = self.inner.read(buf.get_mut(..want).unwrap_or_default())?;
+        if left != u64::MAX {
+            self.left.store(left - n as u64, Ordering::Relaxed);
+        }
+        Ok(n)
+    }
+}
+
+impl io::Seek for Budgeted {
+    fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+        self.inner.seek(pos)
     }
 }
 
@@ -408,6 +476,7 @@ fn open_db(db: &Path) -> Result<Connection, ForeignError> {
     let conn = store::open_sealed(db)
         .map_err(|e| not_a_session(format!("cannot open it as SQLite: {e}")))?;
     conn.execute_batch("PRAGMA trusted_schema=OFF; PRAGMA query_only=1;")
+        .and_then(|()| conn.set_limit(Limit::SQLITE_LIMIT_LENGTH, VALUE_CAP).map(drop))
         .map_err(|e| not_a_session(format!("cannot open it as SQLite: {e}")))?;
     let has_session: bool = conn
         .query_row(

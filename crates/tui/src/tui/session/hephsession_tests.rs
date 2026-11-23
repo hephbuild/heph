@@ -362,3 +362,24 @@ fn a_missing_file_is_an_io_error() {
         other => panic!("expected an IO error, got {other:?}"),
     }
 }
+
+/// A zip's central directory is bounded before it is held in memory: past
+/// `ZIP_ENTRIES_CAP` entries, or past `ZIP_DIRECTORY_CAP` bytes of it (a few
+/// entries with long names), the zip is refused, a local path's included.
+#[test]
+fn a_zip_directory_is_capped() {
+    let case = Case::new();
+    let many: Vec<(String, &[u8])> = (0..=ZIP_ENTRIES_CAP)
+        .map(|i| (format!("f{i}"), &b""[..]))
+        .collect();
+    let refs: Vec<(&str, &[u8])> = many.iter().map(|(n, b)| (n.as_str(), *b)).collect();
+    let why = not_a_session_why(case.open(&zip_of(&refs, zip::CompressionMethod::Stored)));
+    assert!(why.contains("past the cap of"), "{why}");
+
+    let long: Vec<(String, &[u8])> = (0..150)
+        .map(|i| (format!("{i:0>60000}"), &b""[..]))
+        .collect();
+    let refs: Vec<(&str, &[u8])> = long.iter().map(|(n, b)| (n.as_str(), *b)).collect();
+    let why = not_a_session_why(case.open(&zip_of(&refs, zip::CompressionMethod::Stored)));
+    assert!(why.contains("central directory is past"), "{why}");
+}
