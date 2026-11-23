@@ -288,7 +288,6 @@ mod imp {
     use super::{UPGRADED_ENV, binary_name, download_url, host_os_arch};
     use anyhow::{Context, anyhow};
     use std::io::{IsTerminal, Write};
-    use std::os::unix::io::AsRawFd;
     use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -319,7 +318,7 @@ mod imp {
 
         // Serialize concurrent downloads of this version across heph processes,
         // then re-check — another run may have installed it while we waited.
-        let _lock = lock_exclusive(&dir.join("download.lock"))?;
+        let _lock = hcore::fsutil::lock_file_exclusive(&dir.join("download.lock"))?;
         if dest.exists() {
             return Ok(dest);
         }
@@ -501,38 +500,6 @@ mod imp {
         }
         let err = cmd.exec();
         Err(err).with_context(|| format!("exec into {}", binary.display()))
-    }
-
-    /// An exclusive, advisory, cross-process file lock (`flock(2)`), released on
-    /// drop. Serializes concurrent downloads of the same version across processes.
-    struct FileLock {
-        file: std::fs::File,
-    }
-
-    impl Drop for FileLock {
-        fn drop(&mut self) {
-            // SAFETY: `self.file` owns a valid fd for the lifetime of this guard.
-            unsafe {
-                libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
-            }
-        }
-    }
-
-    fn lock_exclusive(path: &Path) -> anyhow::Result<FileLock> {
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(path)
-            .with_context(|| format!("open lock file {}", path.display()))?;
-        // Blocking exclusive acquire; advisory and tied to the open file description.
-        // SAFETY: `file` owns the fd; `flock` is valid for the call's duration.
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-        if rc != 0 {
-            return Err(std::io::Error::last_os_error())
-                .with_context(|| format!("flock LOCK_EX on {}", path.display()));
-        }
-        Ok(FileLock { file })
     }
 
     #[cfg(test)]

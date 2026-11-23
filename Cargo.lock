@@ -6623,7 +6623,6 @@ dependencies = [
  "config",
  "core",
  "fetch",
- "libc",
  "tempfile",
  "thiserror 2.0.21",
  "tracing",

@@ -694,44 +694,6 @@ fn host_os_arch() -> (String, String) {
     (os.to_string(), arch.to_string())
 }
 
-/// An exclusive, advisory, cross-process file lock (`flock(2)`), released on drop.
-/// Serializes concurrent plugin downloads of the same artifact across heph
-/// processes so two runs don't fetch (or half-write) the same file at once.
-#[cfg(unix)]
-struct FileLock {
-    file: std::fs::File,
-}
-
-#[cfg(unix)]
-impl Drop for FileLock {
-    fn drop(&mut self) {
-        use std::os::unix::io::AsRawFd;
-        // SAFETY: `self.file` owns a valid fd for the lifetime of this guard.
-        unsafe {
-            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
-        }
-    }
-}
-
-#[cfg(unix)]
-fn lock_exclusive(path: &std::path::Path) -> anyhow::Result<FileLock> {
-    use std::os::unix::io::AsRawFd;
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(path)
-        .with_context(|| format!("open lock file {}", path.display()))?;
-    // Blocking exclusive acquire; advisory and tied to the open file description.
-    // SAFETY: `file` owns the fd; `flock` is valid for the call's duration.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("flock LOCK_EX on {}", path.display()));
-    }
-    Ok(FileLock { file })
-}
-
 /// The user-global plugin download cache: `~/.heph/plugins/<os>-<arch>/`. Plugins
 /// are workspace-independent, so they're cached once per user (not per repo).
 #[cfg(unix)]
@@ -795,7 +757,7 @@ fn download_plugin(url: &str) -> anyhow::Result<std::path::PathBuf> {
     // Serialize concurrent downloads of this artifact (across processes too): hold
     // an exclusive lock for the fetch, then re-check — another run may have just
     // installed it while we waited.
-    let _lock = lock_exclusive(&dir.join(format!("{name}.lock")))?;
+    let _lock = hcore::fsutil::lock_file_exclusive(&dir.join(format!("{name}.lock")))?;
     if dest.exists() {
         return Ok(dest);
     }

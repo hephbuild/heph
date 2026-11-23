@@ -127,6 +127,40 @@ fn finish_executable(file: fs::File, path: &Path) -> anyhow::Result<()> {
     close_ensure_ro_fd(file, path)
 }
 
+/// An exclusive, advisory, cross-process lock (`flock(2)`) on a file, taken by
+/// [`lock_file_exclusive`] and released on drop.
+#[derive(Debug)]
+pub struct FileLock {
+    file: fs::File,
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        // Unlock explicitly rather than leave it to the close: a forked child
+        // still holding an inherited copy of the fd would otherwise keep the
+        // lock until it reaches `execve`.
+        drop(self.file.unlock());
+    }
+}
+
+/// Open (creating it if needed) the lock file at `path` and take an exclusive
+/// lock on it, blocking until any other holder releases it. Advisory, and tied
+/// to the open file description.
+///
+/// No timeout: callers hold it for a download, and a waiter should wait for
+/// that download rather than start its own.
+pub fn lock_file_exclusive(path: &Path) -> anyhow::Result<FileLock> {
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("open lock file {}", path.display()))?;
+    file.lock()
+        .with_context(|| format!("flock LOCK_EX on {}", path.display()))?;
+    Ok(FileLock { file })
+}
+
 /// `remove_dir_all` that recovers from `PermissionDenied`. Read-only dirs
 /// (e.g. a 0555 codegen output tree) make the kernel refuse to unlink their
 /// children until the dir is writable. On the first permission failure we
@@ -505,6 +539,43 @@ mod tests {
         assert_eq!(format!("{err:#}"), "download interrupted");
         let mode = fs::metadata(&script).expect("stat").permissions().mode();
         assert_eq!(mode & 0o111, 0, "a failed write must not be executable");
+    }
+
+    /// A second `lock_file_exclusive` on the same path blocks while the first
+    /// guard lives, and takes the lock once it is dropped.
+    #[test]
+    fn lock_file_exclusive_blocks_until_the_holder_drops() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("download.lock");
+
+        let held = lock_file_exclusive(&path).expect("first lock");
+        let (tx, rx) = mpsc::channel();
+        let waiter = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let lock = lock_file_exclusive(&path).expect("second lock");
+                tx.send(()).expect("send");
+                lock
+            }
+        });
+
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "the second lock must wait for the first"
+        );
+        drop(held);
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("the second lock is taken once the first is dropped");
+        let second = waiter.join().expect("waiter");
+
+        // While the second guard lives, an independent fd cannot lock it.
+        let probe = fs::File::open(&path).expect("open probe");
+        assert!(
+            matches!(probe.try_lock(), Err(fs::TryLockError::WouldBlock)),
+            "the second guard holds the lock"
+        );
+        drop(second);
+        probe.try_lock().expect("released on drop");
     }
 
     /// The barrier must fail loudly, naming the step, if the file it is asked to
