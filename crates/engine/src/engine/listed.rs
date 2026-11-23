@@ -18,13 +18,17 @@
 use crate::engine::Engine;
 use crate::engine::discovery::{Discovery, Stage, is_cancellation, provider_of};
 use crate::engine::driver::targetdef::TargetDef;
-use crate::engine::provider::{ListRequest, TargetSpec};
-use crate::engine::query::skip_unresolvable;
+use crate::engine::provider::TargetSpec;
+use crate::engine::query::{Candidate, skip_unresolvable};
 use crate::engine::request_state::RequestState;
+use crate::engine::result::EngineProviderExecutor;
+use anyhow::Context as _;
 use futures::StreamExt;
 use hmodel::htaddr::Addr;
 use hmodel::htmatcher::{ListedFacts, MatchResult, Matcher};
 use hmodel::htpkg::PkgBuf;
+use hplugin::provider::ProviderExecutor;
+use rustc_hash::FxHashSet;
 use std::fmt;
 use std::sync::Arc;
 
@@ -193,13 +197,6 @@ impl fmt::Display for ListedFactMismatch {
 
 impl std::error::Error for ListedFactMismatch {}
 
-/// One provider's listing of one addr, with at least one known fact.
-struct Listing {
-    provider: Arc<str>,
-    addr: Addr,
-    facts: ListedFacts,
-}
-
 impl Engine {
     /// Every listing in scope of `m` whose known facts differ from what its
     /// target resolves to, and every listing with a known fact for an addr
@@ -218,15 +215,22 @@ impl Engine {
     ) -> anyhow::Result<Vec<ListedFactMismatch>> {
         let gaps = discovery.gaps().cloned();
         let pkgs = self.packages(m, &rs).await?;
+        // One `list` callback surface for the whole walk, as `query` builds
+        // it: stateless apart from the engine handle and the request.
+        let executor: Arc<dyn ProviderExecutor> = Arc::new(EngineProviderExecutor::for_list(
+            Arc::downgrade(&self),
+            Arc::clone(&rs),
+        ));
         let per_pkg = futures::stream::iter(pkgs)
             .map(|pkg| {
                 let engine = Arc::clone(&self);
                 let rs = Arc::clone(&rs);
+                let executor = Arc::clone(&executor);
                 let gaps = gaps.clone();
                 async move {
                     let pkg = PkgBuf::from(pkg);
                     let res = Arc::clone(&engine)
-                        .package_mismatches(&rs, m, &pkg, gaps.as_deref())
+                        .package_mismatches(&rs, &executor, m, &pkg, gaps.as_deref())
                         .await;
                     match (res, &gaps) {
                         (Err(e), Some(gaps)) if !is_cancellation(&rs, &e) => {
@@ -250,70 +254,47 @@ impl Engine {
     async fn package_mismatches(
         self: Arc<Self>,
         rs: &Arc<RequestState>,
+        executor: &Arc<dyn ProviderExecutor>,
         m: &Matcher,
         pkg: &PkgBuf,
         gaps: Option<&crate::engine::discovery::Gaps>,
     ) -> anyhow::Result<Vec<ListedFactMismatch>> {
-        let states = Arc::clone(&self).probe_segments(rs, pkg).await?;
-        let executor: Arc<dyn hplugin::provider::ProviderExecutor> =
-            Arc::new(crate::engine::result::EngineProviderExecutor::for_list(
-                Arc::downgrade(&self),
-                Arc::clone(rs),
-            ));
+        // Not keep-going: a package whose probe or `list` fails is one gap,
+        // recorded whole by the caller.
+        let scan = Arc::clone(&self)
+            .scan_package(rs, executor, pkg.clone(), false)
+            .await?;
 
         // Each provider's own claims, one per distinct (provider, addr,
         // facts): a provider listing an addr twice the same way is one claim,
         // twice differently is two.
-        let mut listings: Vec<Listing> = Vec::new();
-        for provider in &self.providers {
-            let name: Arc<str> = Arc::from(provider.name.as_str());
-            let items = provider
-                .provider
-                .list(
-                    ListRequest {
-                        request_id: rs.request_id().to_string(),
-                        package: pkg.clone(),
-                        states: states
-                            .iter()
-                            .filter(|s| s.provider == provider.name)
-                            .cloned()
-                            .collect(),
-                        executor: Arc::clone(&executor),
-                    },
-                    rs.ctoken(),
-                )
-                .await?;
-            for item in items {
-                let item = item?;
-                if item.addr.package != *pkg
-                    || item.facts.is_unknown()
-                    || m.matches_addr(&item.addr) == MatchResult::MatchNo
-                {
-                    continue;
-                }
-                let duplicate = listings
-                    .iter()
-                    .any(|l| *l.provider == *name && l.addr == item.addr && l.facts == item.facts);
-                if !duplicate {
-                    listings.push(Listing {
-                        provider: Arc::clone(&name),
-                        addr: item.addr,
-                        facts: item.facts,
-                    });
-                }
-            }
-        }
+        let mut seen = FxHashSet::default();
+        let listings: Vec<&Candidate> = scan
+            .candidates
+            .iter()
+            .filter(|c| {
+                !c.facts.is_unknown()
+                    && m.matches_addr(&c.addr) != MatchResult::MatchNo
+                    && seen.insert((c.lister, &c.addr, &c.facts))
+            })
+            .collect();
 
         let mut out = Vec::new();
-        for Listing {
-            provider,
+        for Candidate {
             addr,
             facts,
+            lister,
         } in listings
         {
+            let provider = self
+                .providers
+                .get(*lister)
+                .context("a candidate's lister is a provider index")?
+                .name
+                .as_str();
             let spec = match skip_unresolvable(
-                &addr,
-                Arc::clone(&self).get_spec(Arc::clone(rs), &addr).await,
+                addr,
+                Arc::clone(&self).get_spec(Arc::clone(rs), addr).await,
             ) {
                 Ok(Some(spec)) => spec,
                 Ok(None) => continue,
@@ -325,19 +306,17 @@ impl Engine {
                     _ => return Err(e),
                 },
             };
-            if spec.provider.as_str() != &*provider {
+            if spec.provider != provider {
                 out.push(ListedFactMismatch::NotResolver {
-                    addr,
+                    addr: addr.clone(),
                     provider: provider.to_string(),
                     resolved_by: spec.provider.clone(),
                 });
                 continue;
             }
             let def = if facts.has_codegen().is_some() {
-                match skip_unresolvable(
-                    &addr,
-                    Arc::clone(&self).get_def(Arc::clone(rs), &addr).await,
-                ) {
+                match skip_unresolvable(addr, Arc::clone(&self).get_def(Arc::clone(rs), addr).await)
+                {
                     Ok(def) => def,
                     Err(e) => match gaps {
                         Some(gaps) if !is_cancellation(rs, &e) => {
@@ -351,7 +330,7 @@ impl Engine {
                 None
             };
             let def = def.as_ref().map(|d| d.target_def.as_ref());
-            for (field, listed, resolved) in listed_differences(&facts, &spec, def) {
+            for (field, listed, resolved) in listed_differences(facts, &spec, def) {
                 out.push(ListedFactMismatch::Field {
                     addr: addr.clone(),
                     provider: provider.to_string(),

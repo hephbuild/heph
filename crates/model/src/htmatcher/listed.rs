@@ -24,7 +24,7 @@ pub const MAX_LISTED_DRIVER_LEN: usize = 256;
 /// oversized driver stored as unknown — so equality is set equality and no
 /// illegal value exists.
 #[non_exhaustive]
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ListedFacts {
     labels: Option<Arc<[String]>>,
     driver: Option<Arc<str>>,

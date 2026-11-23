@@ -18,8 +18,8 @@ use std::sync::Arc;
 /// What one package's discovery task found: its candidates, in provider order,
 /// and under [`Discovery::KeepGoing`] whatever it could not resolve.
 #[derive(Default)]
-struct PackageScan {
-    candidates: Vec<Candidate>,
+pub(super) struct PackageScan {
+    pub(super) candidates: Vec<Candidate>,
     skipped: Vec<Skip>,
     /// A provider's `list` of this package failed and was skipped: its
     /// listings are missing, so no merged fact here can be trusted.
@@ -555,7 +555,7 @@ impl Engine {
     /// Probe `pkg` and collect every provider's listing of it, in provider
     /// order. Under keep-going (`keep_going`) a failed probe or `list` is a
     /// recorded skip in the scan rather than an error.
-    async fn scan_package(
+    pub(super) async fn scan_package(
         self: Arc<Self>,
         rs: &Arc<RequestState>,
         executor: &Arc<dyn hplugin::provider::ProviderExecutor>,
