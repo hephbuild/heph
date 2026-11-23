@@ -732,22 +732,15 @@ impl BuildState {
     /// The count fields for one frame — see [`Counts`]. `O(1)`: every field
     /// is a bucket length in the dashboard's fold, the one source of the
     /// line's, the box's and the tabs' counts.
+    ///
+    /// Done is Done + Cached (a failure is not done); the total is every
+    /// target in scope, `~`-prefixed while the matcher streams. Before any
+    /// `Matched` event the matched scope has no total: `{done} done`.
     pub fn counts(&self, scope: CountScope) -> Counts {
-        self.counts_of(&self.dash.counts(scope), scope)
-    }
-
-    /// [`Counts`] from the tabs' counts. Done is Done + Cached (a failure is
-    /// not done); the total is every target in scope, `~`-prefixed while
-    /// the matcher streams. Before any `Matched` event the matched scope has
-    /// no total: `{done} done`.
-    fn counts_of(&self, tabs: &crate::tui::dashboard::TabCounts, scope: CountScope) -> Counts {
-        let total = self.total_of(tabs, scope).map(|(n, provisional)| {
-            if provisional {
-                format!("~{n}")
-            } else {
-                n.to_string()
-            }
-        });
+        let tabs = self.dash.counts(scope);
+        let total = self
+            .total_of(&tabs, scope)
+            .map(|(n, provisional)| line::total(n, provisional).to_string());
         Counts {
             done: tabs.finished_ok().to_string(),
             total,
@@ -1930,10 +1923,9 @@ impl TuiProgressView {
             // The same `TabCounts` the dashboard's tabs read, so the line
             // and the tabs cannot disagree.
             let tabs = self.state.dash.counts(scope);
-            let Counts { done, total, .. } = self.state.counts_of(&tabs, scope);
             line::Body::Build(line::BuildCounts {
-                done,
-                total,
+                done: tabs.finished_ok(),
+                total: self.state.total_of(&tabs, scope),
                 cached: tabs.cached,
                 waiting: tabs.blocked,
                 failed: tabs.failed_total(),

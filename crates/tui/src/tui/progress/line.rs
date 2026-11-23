@@ -51,19 +51,28 @@ pub(super) enum Status<'a> {
     },
 }
 
-/// What a build's line counts. Strings where the box's header already
-/// formats them (`~` while the matcher streams).
+/// What a build's line counts.
 #[derive(Debug)]
 pub(super) struct BuildCounts {
-    pub(super) done: String,
-    /// `None` before any `Matched` event: `{done} done`.
-    pub(super) total: Option<String>,
+    pub(super) done: usize,
+    /// The total and whether it is provisional (`~`, the matcher still
+    /// streams). `None` before any `Matched` event: `{done} done`.
+    pub(super) total: Option<(usize, bool)>,
     pub(super) cached: usize,
     /// Admission, result-lock and scratch-lock waits together.
     pub(super) waiting: usize,
     pub(super) failed: usize,
     /// `cpu 11/12`: what the running targets reserved, of the pool.
     pub(super) cpu: Option<String>,
+}
+
+/// A total as the line and the box spell it: `412`, or `~412` while it is
+/// provisional.
+pub(super) fn total(n: usize, provisional: bool) -> impl std::fmt::Display {
+    std::fmt::from_fn(move |f| match provisional {
+        true => write!(f, "~{n}"),
+        false => write!(f, "{n}"),
+    })
 }
 
 /// What the line shows after the clock.
@@ -212,11 +221,13 @@ fn counts(m: &LineModel<'_>, tier: Tier) -> Vec<Seg> {
         // Cut to fit by the caller: a gc segment is one piece of text.
         Body::Text(_) => {}
         Body::Build(c) => {
-            let done = match (&c.total, tier) {
-                (Some(t), Tier::Full | Tier::NoSpot) => format!("{} / {t} done", c.done),
-                (Some(t), _) => format!("{}/{t}", c.done),
+            let done = match (c.total, tier) {
+                (Some((n, p)), Tier::Full | Tier::NoSpot) => {
+                    format!("{} / {} done", c.done, total(n, p))
+                }
+                (Some((n, p)), _) => format!("{}/{}", c.done, total(n, p)),
                 (None, Tier::Full | Tier::NoSpot) => format!("{} done", c.done),
-                (None, _) => c.done.clone(),
+                (None, _) => c.done.to_string(),
             };
             segs.push(Seg::plain(done));
             if tier != Tier::Compact {
@@ -388,9 +399,9 @@ fn bare(m: &LineModel<'_>, cols: usize) -> Line<'static> {
     let running = matches!(m.status, Status::Running(_));
     let text = match &m.body {
         Body::Build(c) => {
-            let done = match &c.total {
-                Some(t) => format!("{}/{t}", c.done),
-                None => c.done.clone(),
+            let done = match c.total {
+                Some((n, p)) => format!("{}/{}", c.done, total(n, p)),
+                None => c.done.to_string(),
             };
             match running {
                 true => format!("{} {done} {}w {}f", m.clock, c.waiting, c.failed),
@@ -416,8 +427,8 @@ mod tests {
             clock: "1m05s".to_owned(),
             label: None,
             body: Body::Build(BuildCounts {
-                done: "128".to_owned(),
-                total: Some("412".to_owned()),
+                done: 128,
+                total: Some((412, false)),
                 cached: 96,
                 waiting: 3,
                 failed: 0,
@@ -496,6 +507,37 @@ mod tests {
                 "{cols}: the hint sits right"
             );
         }
+    }
+
+    /// A provisional total reads `~` at every tier, the bare one included;
+    /// with no total yet, only the done count shows.
+    #[test]
+    fn done_count_spells_the_total() {
+        let with_total = |total| {
+            let mut m = model(None);
+            if let Body::Build(c) = &mut m.body {
+                c.total = total;
+            }
+            m
+        };
+        let provisional = with_total(Some((412, true)));
+        let at = |m: &LineModel<'_>, cols: u16| text(&render(m, cols));
+        assert!(
+            at(&provisional, 120).contains(" 128 / ~412 done "),
+            "{}",
+            at(&provisional, 120)
+        );
+        assert!(
+            at(&provisional, 60).contains(" 128/~412 "),
+            "{}",
+            at(&provisional, 60)
+        );
+        // Bare is cut hard: the `~` costs the last column.
+        assert_eq!(at(&provisional, 19), "1m05s 128/~412 3w 0");
+        let none = with_total(None);
+        assert!(at(&none, 120).contains(" 128 done "), "{}", at(&none, 120));
+        assert!(at(&none, 60).contains(" 128 · "), "{}", at(&none, 60));
+        assert_eq!(at(&none, 19), "1m05s 128 3w 0f");
     }
 
     #[test]
