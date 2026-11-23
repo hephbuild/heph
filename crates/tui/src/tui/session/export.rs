@@ -51,20 +51,30 @@ pub fn file_name(id: SessionId) -> String {
 
 /// Stops an export from another thread: what the seal-time export's bound
 /// uses. The export checks it between steps and while compressing; an
-/// abort also interrupts a running SQLite statement and removes the temp
-/// file it is writing.
+/// abort also interrupts a running SQLite statement and removes every temp
+/// file the export holds.
 #[derive(Debug, Clone, Default)]
 pub struct Abort(Arc<AbortInner>);
 
 #[derive(Default)]
 struct AbortInner {
+    /// Set by [`Abort::abort`] under `temps`' lock.
     aborted: AtomicBool,
     /// The statement to interrupt: the connection the export runs on now.
     sqlite: Mutex<Option<rusqlite::InterruptHandle>>,
-    /// The temp file being written beside the destination.
-    temp: Mutex<Option<PathBuf>>,
+    /// Every temp file the export made and still holds. A temp is made, and
+    /// the destination written, under this lock after checking `aborted`,
+    /// so once [`Abort::abort`] returns nothing more appears.
+    temps: Mutex<Temps>,
     /// A test's slow export: held before compressing until it opens.
     gate: Option<super::recorder::Gate>,
+}
+
+#[derive(Debug, Default)]
+struct Temps {
+    files: Vec<PathBuf>,
+    /// The destination is written: an abort now stops nothing.
+    written: bool,
 }
 
 impl std::fmt::Debug for AbortInner {
@@ -85,9 +95,18 @@ impl Abort {
         }))
     }
 
-    /// Stop the export: interrupt its statement, remove its temp file.
-    pub fn abort(&self) {
-        self.0.aborted.store(true, Ordering::Release);
+    /// Stop the export: interrupt its statement, remove every temp file it
+    /// holds. `false` when it had already written its destination (it
+    /// finished at the bound): nothing was stopped.
+    pub fn abort(&self) -> bool {
+        let files = {
+            let mut temps = self.temps();
+            if temps.written {
+                return false;
+            }
+            self.0.aborted.store(true, Ordering::Release);
+            std::mem::take(&mut temps.files)
+        };
         if let Some(h) = self
             .0
             .sqlite
@@ -97,18 +116,20 @@ impl Abort {
         {
             h.interrupt();
         }
-        let temp = self
-            .0
-            .temp
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        if let Some(temp) = temp
-            && let Err(e) = std::fs::remove_file(&temp)
-            && e.kind() != io::ErrorKind::NotFound
-        {
-            tracing::debug!(file = %temp.display(), error = %e, "cannot remove an export's temp file");
+        // Removed after the lock: the export, if it is waiting on it, finds
+        // itself aborted and makes nothing new.
+        for temp in files {
+            if let Err(e) = std::fs::remove_file(&temp)
+                && e.kind() != io::ErrorKind::NotFound
+            {
+                tracing::debug!(file = %temp.display(), error = %e, "cannot remove an export's temp file");
+            }
         }
+        true
+    }
+
+    fn temps(&self) -> std::sync::MutexGuard<'_, Temps> {
+        self.0.temps.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn check(&self) -> anyhow::Result<()> {
@@ -119,6 +140,21 @@ impl Abort {
         Ok(())
     }
 
+    /// Run `make` (which makes temp files, or writes the destination) unless
+    /// the export is aborted, holding the lock [`Abort::abort`] takes: what
+    /// `make` adds to the list is removed by an abort, and an abort that
+    /// comes after it waits for it.
+    fn guarded<T>(&self, make: impl FnOnce(&mut Temps) -> anyhow::Result<T>) -> anyhow::Result<T> {
+        let mut temps = self.temps();
+        self.check()?;
+        make(&mut temps)
+    }
+
+    /// Stop tracking `files`: removed (or renamed into place) by their owner.
+    fn release(&self, files: &[PathBuf]) {
+        self.temps().files.retain(|f| !files.contains(f));
+    }
+
     /// Interrupt `conn` on an abort from now on.
     fn watch(&self, conn: &Connection) -> anyhow::Result<()> {
         *self.0.sqlite.lock().unwrap_or_else(PoisonError::into_inner) =
@@ -126,10 +162,17 @@ impl Abort {
         // An abort that came before the handle was set interrupted nothing.
         self.check()
     }
+}
 
-    fn set_temp(&self, temp: Option<PathBuf>) {
-        *self.0.temp.lock().unwrap_or_else(PoisonError::into_inner) = temp;
+/// `path` and the files SQLite may make beside it while writing it.
+fn with_journals(path: &Path) -> Vec<PathBuf> {
+    let mut files = vec![path.to_path_buf()];
+    for suffix in ["-journal", "-wal", "-shm"] {
+        let mut name = path.as_os_str().to_owned();
+        name.push(suffix);
+        files.push(PathBuf::from(name));
     }
+    files
 }
 
 /// A self-contained copy of `rec`, uncompressed, in a temp file under
@@ -145,12 +188,16 @@ pub fn snapshot(
 ) -> anyhow::Result<tempfile::TempPath> {
     std::fs::create_dir_all(tmp_dir).with_context(|| format!("creating {}", tmp_dir.display()))?;
     // `VACUUM INTO` takes a missing or empty file.
-    let temp = tempfile::Builder::new()
-        .prefix("export-")
-        .suffix(".db")
-        .tempfile_in(tmp_dir)
-        .with_context(|| format!("creating a temp file in {}", tmp_dir.display()))?
-        .into_temp_path();
+    let temp = abort.guarded(|temps| {
+        let temp = tempfile::Builder::new()
+            .prefix("export-")
+            .suffix(".db")
+            .tempfile_in(tmp_dir)
+            .with_context(|| format!("creating a temp file in {}", tmp_dir.display()))?
+            .into_temp_path();
+        temps.files.extend(with_journals(&temp));
+        Ok(temp)
+    })?;
     let target = temp
         .to_str()
         .with_context(|| format!("{} is not UTF-8", temp.display()))?;
@@ -404,26 +451,38 @@ pub fn write_file(db: &Path, dest: &Path, noclobber: bool, abort: &Abort) -> any
     let mut prefix = std::ffi::OsString::from(".");
     prefix.push(name);
     prefix.push(".");
-    let mut temp = tempfile::Builder::new()
-        .prefix(&prefix)
-        .suffix(".tmp")
-        .tempfile_in(parent)
-        .with_context(|| format!("creating a temp file in {}", parent.display()))?;
-    abort.set_temp(Some(temp.path().to_path_buf()));
+    let mut temp = abort.guarded(|temps| {
+        let temp = tempfile::Builder::new()
+            .prefix(&prefix)
+            .suffix(".tmp")
+            .tempfile_in(parent)
+            .with_context(|| format!("creating a temp file in {}", parent.display()))?;
+        temps.files.push(temp.path().to_path_buf());
+        Ok(temp)
+    })?;
+    let path = temp.path().to_path_buf();
     let written = compress(db, io::BufWriter::new(temp.as_file_mut()), abort)
-        .and_then(|()| temp.as_file().sync_all().context("syncing the export"))
-        .and_then(|()| abort.check());
-    abort.set_temp(None);
-    written?;
-    let persisted = if noclobber {
-        temp.persist_noclobber(dest)
-    } else {
-        temp.persist(dest)
-    };
-    persisted
-        .map_err(|e| e.error)
-        .with_context(|| format!("writing {}", dest.display()))?;
-    Ok(())
+        .and_then(|()| temp.as_file().sync_all().context("syncing the export"));
+    if let Err(e) = written {
+        drop(temp);
+        abort.release(&[path]);
+        return Err(e);
+    }
+    // Renamed into place under the abort's lock: an abort either comes
+    // first (nothing is written) or finds the destination written.
+    abort.guarded(|temps| {
+        let persisted = if noclobber {
+            temp.persist_noclobber(dest)
+        } else {
+            temp.persist(dest)
+        };
+        temps.files.retain(|f| *f != path);
+        persisted
+            .map_err(|e| e.error)
+            .with_context(|| format!("writing {}", dest.display()))?;
+        temps.written = true;
+        Ok(())
+    })
 }
 
 /// The seal-time export (D7): the ended session in `dir`, under the sessions
@@ -440,8 +499,19 @@ pub fn to_dir(
     let rec = Recording::open_local(root, dir)
         .map_err(|e| anyhow::anyhow!("{e}"))
         .with_context(|| format!("opening session {id}"))?;
+    // A copy the open made (an unsealed recording) is the abort's to remove
+    // too; aborted already, it is removed as `rec` drops.
+    let copies = match &rec {
+        Recording::Local(l) => l.opened.temp_files().to_vec(),
+        Recording::Foreign(_) => Vec::new(),
+    };
+    abort.guarded(|temps| {
+        temps.files.extend(copies.iter().cloned());
+        Ok(())
+    })?;
     let db = snapshot(&rec, Some(read), &store::tmp_dir(root), abort)?;
     drop(rec);
+    abort.release(&copies);
     std::fs::create_dir_all(export_dir)
         .with_context(|| format!("creating {}", export_dir.display()))?;
     let dest = export_dir.join(file_name(id));

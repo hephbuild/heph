@@ -245,8 +245,11 @@ impl SealExport {
                 error = %format!("{e:#}"),
                 "cannot export the session"
             ),
+            // Not stopped: it wrote its file just as the bound passed.
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) if !abort.abort() => {
+                tracing::debug!("the session export finished at its bound");
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                abort.abort();
                 tracing::warn!(
                     dir = %self.dir.display(),
                     bound_s = self.bound.as_secs(),

@@ -117,8 +117,10 @@ fn export_is_silent_and_bounded() {
         );
         slow.finish(Some(3), false);
         // Held past its bound, with its temp file already made beside the
-        // destination: stopped, and the temp file gone.
+        // destination: stopped, and every temp file gone while the export
+        // is still held (the process may exit now), its snapshot included.
         assert_eq!(entries(&out), [file_name(fast.id())]);
+        assert_eq!(entries(&store::tmp_dir(root.path())), Vec::<String>::new());
         (fast.id(), slow.id())
     });
     // Let the stopped export go on: it sees the abort and writes nothing.

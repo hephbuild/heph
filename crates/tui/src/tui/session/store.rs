@@ -422,6 +422,11 @@ impl Opened {
         self.copy.is_some()
     }
 
+    /// The temp files this reads from, removed when this drops.
+    pub(crate) fn temp_files(&self) -> &[PathBuf] {
+        self.copy.as_ref().map_or(&[], |c| &c.files)
+    }
+
     /// A recording opened by path or URL (spec I7): never live, and `files`
     /// (a decompressed copy, a download) are removed when this drops.
     pub(crate) fn foreign(conn: Connection, files: Vec<PathBuf>) -> Self {
