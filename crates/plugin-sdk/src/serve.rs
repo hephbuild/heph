@@ -43,6 +43,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The cdylib's own tokio runtime. A loaded cdylib's statically-linked tokio is a
 /// separate instance from the host's, so async work that touches the reactor (a
@@ -375,8 +376,9 @@ pub fn named_managed_driver<D: ManagedDriver + 'static>(
 ///
 /// A request id names an engine *request* (`req-{n}`), not a single call — the
 /// whole request subtree shares it — so multiple calls can be in flight under
-/// one id concurrently. Each keeps its own token in the `Vec`; `cancel` trips
-/// them all (a request cancel means the whole subtree stops).
+/// one id concurrently. Each keeps its own token, in its own slot under the id;
+/// `cancel` trips them all (a request cancel means the whole subtree stops),
+/// and a call's guard removes only its own slot.
 ///
 /// A run from a host at 0.19.1 or later is keyed by its own `cancel_key`
 /// instead (in `calls`, through [`enter_call`](Self::enter_call)), so the host
@@ -386,11 +388,15 @@ pub fn named_managed_driver<D: ManagedDriver + 'static>(
 /// request. A key is never parked (see [`cancel`](Self::cancel)).
 #[derive(Default)]
 struct CancelRegistry {
-    inflight: Mutex<HashMap<String, Vec<StdCancellationToken>>>,
+    /// Calls in flight by request id, each in its own slot.
+    inflight: Mutex<HashMap<Arc<str>, HashMap<u64, StdCancellationToken>>>,
+    /// The next slot [`enter`](Self::enter) hands out. Only unique, so it
+    /// orders nothing.
+    next_slot: AtomicU64,
     precancelled: Mutex<HashSet<String>>,
     /// Runs in flight by their cancel key. One token per key: a key names one
     /// call, and a second call under the same key is refused.
-    calls: Mutex<HashMap<String, StdCancellationToken>>,
+    calls: Mutex<HashMap<Arc<str>, StdCancellationToken>>,
 }
 
 impl CancelRegistry {
@@ -401,24 +407,17 @@ impl CancelRegistry {
     /// each key once, and two calls sharing one would cancel each other.
     fn enter_call(self: &Arc<Self>, key: &str) -> Result<CancelGuard> {
         let token = StdCancellationToken::new();
-        match self
-            .calls
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(key.to_string())
-        {
-            std::collections::hash_map::Entry::Occupied(_) => {
-                anyhow::bail!("run: cancel key {key:?} is already in flight")
-            }
-            std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert(token.clone());
-            }
+        let mut calls = self.calls.lock().unwrap_or_else(|e| e.into_inner());
+        if calls.contains_key(key) {
+            anyhow::bail!("run: cancel key {key:?} is already in flight")
         }
+        let key: Arc<str> = key.into();
+        calls.insert(Arc::clone(&key), token.clone());
+        drop(calls);
         Ok(CancelGuard {
             reg: Arc::clone(self),
-            id: key.to_string(),
+            entry: Registered::Call(key),
             token,
-            call: true,
         })
     }
 
@@ -435,27 +434,39 @@ impl CancelRegistry {
     /// the cancel — the eager seam spawn makes that window hittable.
     fn enter(self: &Arc<Self>, id: &str) -> CancelGuard {
         let token = StdCancellationToken::new();
-        if !id.is_empty() {
-            self.inflight
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .entry(id.to_string())
+        if id.is_empty() {
+            return CancelGuard {
+                reg: Arc::clone(self),
+                entry: Registered::Nothing,
+                token,
+            };
+        }
+        let slot = self.next_slot.fetch_add(1, Ordering::Relaxed);
+        let id = {
+            let mut map = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
+            // A sibling call under the same request shares its key; only the
+            // first call under an id allocates one.
+            let id = match map.get_key_value(id) {
+                Some((k, _)) => Arc::clone(k),
+                None => Arc::from(id),
+            };
+            map.entry(Arc::clone(&id))
                 .or_default()
-                .push(token.clone());
-            if self
-                .precancelled
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(id)
-            {
-                token.cancel();
-            }
+                .insert(slot, token.clone());
+            id
+        };
+        if self
+            .precancelled
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&*id)
+        {
+            token.cancel();
         }
         CancelGuard {
             reg: Arc::clone(self),
-            id: id.to_string(),
+            entry: Registered::Request { id, slot },
             token,
-            call: false,
         }
     }
 
@@ -485,7 +496,7 @@ impl CancelRegistry {
         let map = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(tokens) = map.get(id) {
             // Every call in flight under this request id, not just the latest.
-            for t in tokens {
+            for t in tokens.values() {
                 t.cancel();
             }
         }
@@ -514,60 +525,71 @@ impl CancelRegistry {
 /// Holds a call's cancellation token registered; deregisters on drop.
 struct CancelGuard {
     reg: Arc<CancelRegistry>,
-    id: String,
+    entry: Registered,
     token: StdCancellationToken,
-    /// `id` is a run's cancel key (in `calls`), not a request id.
-    call: bool,
+}
+
+/// Where a [`CancelGuard`]'s token is registered.
+enum Registered {
+    /// An empty request id: no cancellation wired for this call.
+    Nothing,
+    /// In `inflight`, in its own slot under a request id.
+    Request { id: Arc<str>, slot: u64 },
+    /// In `calls`, under a run's cancel key.
+    Call(Arc<str>),
+}
+
+impl Drop for CancelGuard {
+    fn drop(&mut self) {
+        match &self.entry {
+            Registered::Nothing => {}
+            Registered::Call(key) => {
+                // The key is this guard's alone (`enter_call` refuses a
+                // second), so nothing else can be under it; nothing was parked
+                // for it either.
+                self.reg
+                    .calls
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(key);
+            }
+            Registered::Request { id, slot } => self.leave_request(id, *slot),
+        }
+    }
 }
 
 impl CancelGuard {
     fn token(&self) -> &StdCancellationToken {
         &self.token
     }
-}
 
-impl Drop for CancelGuard {
-    fn drop(&mut self) {
-        if self.call {
-            // The key is this guard's alone (`enter_call` refuses a second), so
-            // nothing else can be under it; nothing was parked for it either.
-            self.reg
-                .calls
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&self.id);
-            return;
-        }
-        if !self.id.is_empty() {
-            {
-                let mut map = self.reg.inflight.lock().unwrap_or_else(|e| e.into_inner());
-                // Identity-checked: a request id names an engine request, not a
-                // single call, so sibling calls' tokens share this entry — a
-                // guard removes only its OWN token, never a sibling's.
-                if let Some(tokens) = map.get_mut(&self.id) {
-                    if let Some(i) = tokens.iter().position(|t| t.ptr_eq(&self.token)) {
-                        tokens.swap_remove(i);
-                    }
-                    if tokens.is_empty() {
-                        map.remove(&self.id);
-                    }
+    fn leave_request(&self, id: &str, slot: u64) {
+        {
+            let mut map = self.reg.inflight.lock().unwrap_or_else(|e| e.into_inner());
+            // By slot: a request id names an engine request, not a single
+            // call, so sibling calls' tokens share this entry — a guard removes
+            // only its OWN token, never a sibling's.
+            if let Some(tokens) = map.get_mut(id) {
+                tokens.remove(&slot);
+                if tokens.is_empty() {
+                    map.remove(id);
                 }
             }
-            // A cancelled call consumes its request's parked pre-cancel marker,
-            // so a cancelled request with no later `enter` doesn't park its id
-            // forever (unbounded in a long-lived LSP/watch process). Safe to
-            // consume: every token in flight under this id was already tripped
-            // by `cancel`, and any *later* call under this (cancelled) request
-            // gets re-cancelled by its own host-side `await_with_cancel`, which
-            // observes the already-tripped request token on first poll and
-            // fires `provider_cancel` again.
-            if self.token.is_cancelled() {
-                self.reg
-                    .precancelled
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&self.id);
-            }
+        }
+        // A cancelled call consumes its request's parked pre-cancel marker, so
+        // a cancelled request with no later `enter` doesn't park its id forever
+        // (unbounded in a long-lived LSP/watch process). Safe to consume: every
+        // token in flight under this id was already tripped by `cancel`, and
+        // any *later* call under this (cancelled) request gets re-cancelled by
+        // its own host-side `await_with_cancel`, which observes the
+        // already-tripped request token on first poll and fires
+        // `provider_cancel` again.
+        if self.token.is_cancelled() {
+            self.reg
+                .precancelled
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(id);
         }
     }
 }
@@ -3934,6 +3956,37 @@ mod tests {
         assert!(
             g2.token().is_cancelled(),
             "g1's late drop must not have deregistered g2's token"
+        );
+    }
+
+    // Sibling calls under one id leave in any order, each taking only its own
+    // slot, and the id goes with the last of them.
+    #[test]
+    fn registry_sibling_guards_leave_in_any_order() {
+        let reg = Arc::new(CancelRegistry::default());
+        let slots = |reg: &CancelRegistry| {
+            reg.inflight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get("x")
+                .map_or(0, HashMap::len)
+        };
+        let g1 = reg.enter("x");
+        let g2 = reg.enter("x");
+        let g3 = reg.enter("x");
+        assert_eq!(slots(&reg), 3);
+        drop(g2);
+        assert_eq!(slots(&reg), 2);
+        drop(g1);
+        assert_eq!(slots(&reg), 1);
+        reg.cancel("x");
+        assert!(g3.token().is_cancelled(), "the last sibling still trips");
+        drop(g3);
+        assert!(
+            reg.inflight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
         );
     }
 
