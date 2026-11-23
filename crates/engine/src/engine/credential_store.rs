@@ -377,7 +377,8 @@ impl CredentialStore {
     }
 }
 
-fn unix_secs(t: SystemTime) -> u64 {
+/// `t` in whole seconds since the epoch; `0` for a time before it.
+pub(crate) fn unix_secs(t: SystemTime) -> u64 {
     t.duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)
         .as_secs()

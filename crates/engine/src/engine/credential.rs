@@ -36,6 +36,7 @@
 //! useful, not the token.
 
 use crate::engine::Engine;
+use crate::engine::credential_store::unix_secs;
 use crate::engine::driver::targetdef::Input;
 use crate::engine::request_state::RequestState;
 use anyhow::Context as _;
@@ -562,8 +563,7 @@ impl Engine {
             material.expires_at = Some(
                 acquired_at
                     .checked_add(ttl)
-                    .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
+                    .map(unix_secs)
                     .unwrap_or_default(),
             );
         }
@@ -1313,11 +1313,7 @@ impl Engine {
                 addr: addr.format(),
                 root: self.cfg.root.clone(),
                 source_index: acquired.source_index,
-                acquired_at: acquired
-                    .acquired_at
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
+                acquired_at: unix_secs(acquired.acquired_at),
                 material: material.clone(),
             };
             crate::engine::credential_store::write_private_file(
@@ -1893,10 +1889,7 @@ fn json_path<'a>(doc: &'a serde_json::Value, key: &str) -> Option<&'a serde_json
 /// Told apart by type, because vendors do both and a declaration should not have
 /// to say which.
 fn parse_expiry(v: &serde_json::Value) -> anyhow::Result<u64> {
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let now = unix_secs(SystemTime::now());
     match v {
         serde_json::Value::Number(n) => {
             let secs = n

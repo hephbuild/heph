@@ -346,7 +346,7 @@ impl RunLogs {
             StartedRun {
                 log: Arc::downgrade(&log),
                 hashin: hashin.to_owned(),
-                at_unix_ms: unix_ms_now(),
+                at_unix_ms: crate::engine::event::now_unix_ms(),
                 not_streamed: !streams_log,
             },
         );
@@ -452,13 +452,6 @@ fn sweep_one(runs: &Path, dir: &Path, name: &[u8]) -> io::Result<bool> {
     std::fs::remove_dir_all(&tomb)?;
     drop(lock);
     Ok(true)
-}
-
-/// Now, in milliseconds since the epoch.
-fn unix_ms_now() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// Whether `dir` was last changed at least [`STALE_AFTER`] before `now`.
@@ -576,7 +569,7 @@ impl RunLog {
         let Some(reg) = &self.registration else {
             return;
         };
-        let at_unix_ms = unix_ms_now();
+        let at_unix_ms = crate::engine::event::now_unix_ms();
         reg.live.map().insert(
             reg.addr.clone(),
             LiveRun {

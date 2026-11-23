@@ -346,10 +346,7 @@ impl FailureSlots {
             version: MANIFEST_VERSION,
             addr: fill.addr.format(),
             hashin: fill.hashin.to_owned(),
-            failed_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-                .unwrap_or(0),
+            failed_at: crate::engine::event::now_unix_ms(),
         };
         let (root, lines, material, roots) =
             (self.root.clone(), fill.lines, fill.material, fill.roots);
