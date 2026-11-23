@@ -399,6 +399,56 @@ pub fn go_host_pass_env_config(go_version: &str) -> Option<(String, Value)> {
     ))
 }
 
+/// Dep groups for a link: each lib in `libs` under its
+/// [`import_path_to_dep_group`] group, plus the Go SDK ([`go_sdk_dep`]).
+pub fn lib_dep_groups(libs: &[(String, Addr)], go_version: &str) -> BTreeMap<String, Value> {
+    let mut deps: BTreeMap<String, Value> = libs
+        .iter()
+        .map(|(import_path, lib_addr)| {
+            (
+                import_path_to_dep_group(import_path),
+                Value::List(vec![Value::String(lib_addr.format())]),
+            )
+        })
+        .collect();
+    if let Some((sdk_group, sdk_val)) = go_sdk_dep(go_version) {
+        deps.insert(sdk_group, sdk_val);
+    }
+    deps
+}
+
+/// Put the toolchain's sandbox config on a `sh`/exec target that runs `go`:
+/// the SDK staged read-only ([`go_sdk_read_only_config`]) and the host env a
+/// non-hermetic toolchain needs ([`go_host_pass_env_config`]).
+pub fn insert_toolchain_config(config: &mut HashMap<String, Value>, go_version: &str) {
+    if let Some((ro_k, ro_v)) = go_sdk_read_only_config(go_version) {
+        config.insert(ro_k, ro_v);
+    }
+    if let Some((pe_k, pe_v)) = go_host_pass_env_config(go_version) {
+        config.insert(pe_k, pe_v);
+    }
+}
+
+/// Put a link's environment on its target: `GOOS`/`GOARCH`/`GOEXPERIMENT` in
+/// `runtime_env`, and the CGO/toolchain pins in `env`.
+///
+/// The pins live in `env` (hashed) so stale archives don't survive cache
+/// lookups: pluginexec excludes `runtime_env` from the def hash.
+pub fn insert_go_link_config(
+    config: &mut HashMap<String, Value>,
+    factors: &crate::plugingo::factors::Factors,
+) {
+    let mut runtime_env = HashMap::from([
+        ("GOOS".to_string(), Value::String(factors.goos.clone())),
+        ("GOARCH".to_string(), Value::String(factors.goarch.clone())),
+    ]);
+    if let Some(exp) = factors.goexperiment_env() {
+        runtime_env.insert("GOEXPERIMENT".to_string(), Value::String(exp));
+    }
+    config.insert("runtime_env".to_string(), Value::Map(runtime_env));
+    config.insert("env".to_string(), go_build_env_for(factors));
+}
+
 /// Prelude pointing `GOROOT` at the Go toolchain for `go_version` and exposing
 /// its `go` binary on `PATH` and as `$GO`.
 ///
