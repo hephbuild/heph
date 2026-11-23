@@ -630,6 +630,73 @@ mod tests {
         assert!(format!("{err:#}").contains("unknown entries"), "{err:#}");
     }
 
+    /// The whole message: every unknown key, sorted, known keys (a renamed one
+    /// included) left out, near-miss names and non-ASCII reported verbatim.
+    #[test]
+    fn unknown_keys_message_lists_every_unknown_key_sorted() {
+        let err = DemoSpec::from(&HashMap::from([
+            ("run".to_string(), Value::String("x".to_string())),
+            ("out".to_string(), Value::Null()),
+            ("outputs".to_string(), Value::Null()),
+            ("runs".to_string(), Value::Null()),
+            ("é".to_string(), Value::Null()),
+            ("".to_string(), Value::Null()),
+            ("Run".to_string(), Value::Null()),
+        ]))
+        .unwrap_err();
+        assert_eq!(
+            format!("{err:#}"),
+            r#"unknown entries found: ["", "Run", "outputs", "runs", "é"]"#
+        );
+    }
+
+    /// A bad field is reported before an unknown key: the fields are parsed
+    /// first, the leftovers checked last.
+    #[test]
+    fn a_field_error_is_reported_before_unknown_keys() {
+        let err = DemoSpec::from(&HashMap::from([
+            ("count".to_string(), Value::Bool(true)),
+            ("bogus".to_string(), Value::Null()),
+        ]))
+        .unwrap_err();
+        assert_eq!(format!("{err:#}"), "parse `count`: count must be an int");
+
+        let err =
+            ReqSpec::from(&HashMap::from([("bogus".to_string(), Value::Null())])).unwrap_err();
+        assert_eq!(format!("{err:#}"), "missing required `name`");
+    }
+
+    #[derive(SpecStruct, Debug, PartialEq)]
+    struct Nested {
+        a: String,
+        #[spec(rename = "bee")]
+        b: Vec<String>,
+    }
+
+    #[test]
+    fn spec_struct_parses_and_rejects_unknown_keys() {
+        let v = Value::Map(HashMap::from([
+            ("a".to_string(), Value::String("x".to_string())),
+            ("bee".to_string(), Value::String("y".to_string())),
+        ]));
+        assert_eq!(
+            Nested::from_spec_value(&v).unwrap(),
+            Nested {
+                a: "x".to_string(),
+                b: vec!["y".to_string()],
+            }
+        );
+        let v = Value::Map(HashMap::from([
+            ("a".to_string(), Value::String("x".to_string())),
+            ("b".to_string(), Value::Null()),
+            ("z".to_string(), Value::Null()),
+        ]));
+        assert_eq!(
+            format!("{:#}", Nested::from_spec_value(&v).unwrap_err()),
+            r#"unknown entries found: ["b", "z"]"#
+        );
+    }
+
     #[test]
     fn parse_error_carries_field_context() {
         let err = DemoSpec::from(&HashMap::from([
