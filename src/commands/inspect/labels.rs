@@ -5,9 +5,9 @@ use async_trait::async_trait;
 
 use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
+use crate::commands::utils::package_matcher_or_all;
 use crate::engine::Engine;
 use crate::htmatcher::Matcher;
-use crate::htpkg::{self, PkgBuf};
 use crate::tui::{self, App, AppContext, BufferedStdout, LogSink};
 
 #[derive(clap::Args, Clone)]
@@ -111,10 +111,7 @@ async fn execute_async(
     session: &Arc<SessionSlot>,
     global: GlobalOptions,
 ) -> anyhow::Result<()> {
-    let matcher = match &args.matcher {
-        Some(s) => htpkg::parse(s.as_str(), &crate::engine::get_cwp()?)?,
-        None => Matcher::PackagePrefix(PkgBuf::from("")),
-    };
+    let matcher = package_matcher_or_all(args.matcher.as_deref())?;
     let (engine, shutdown) = bootstrap::new_engine(&global, session)?;
     let app = LabelsApp {
         engine,

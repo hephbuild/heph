@@ -6,9 +6,10 @@ use async_trait::async_trait;
 
 use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
+use crate::commands::utils::package_matcher_or_all;
 use crate::engine::{Engine, PackageStates, StatesOptions};
 use crate::htmatcher::Matcher;
-use crate::htpkg::{self, PkgBuf};
+use crate::htpkg::PkgBuf;
 use crate::htvalue::Value;
 use crate::tui::{self, App, AppContext, BufferedStdout, LogSink};
 
@@ -218,10 +219,7 @@ async fn execute_async(
     session: &Arc<SessionSlot>,
     global: GlobalOptions,
 ) -> anyhow::Result<()> {
-    let matcher = match &args.matcher {
-        Some(s) => htpkg::parse(s.as_str(), &crate::engine::get_cwp()?)?,
-        None => Matcher::PackagePrefix(PkgBuf::from("")),
-    };
+    let matcher = package_matcher_or_all(args.matcher.as_deref())?;
     let (engine, shutdown) = bootstrap::new_engine(&global, session)?;
     let app = StatesApp {
         engine,

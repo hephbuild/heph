@@ -11,9 +11,9 @@ use hxstarlark_fmt::{Config, Reformat};
 
 use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
-use crate::engine::{Engine, get_cwp, get_root};
+use crate::commands::utils::package_matcher_or_all;
+use crate::engine::{Engine, get_root};
 use crate::htmatcher::Matcher;
-use crate::htpkg::{self, PkgBuf};
 use crate::pluginbuildfile::{FormatSettings, build_files_in_dir};
 use crate::tui::{self, App, AppContext, LogSink};
 
@@ -200,10 +200,7 @@ async fn execute_async(
     global: GlobalOptions,
 ) -> anyhow::Result<()> {
     let root = get_root()?;
-    let matcher = match args.matcher {
-        Some(s) => htpkg::parse(&s, &get_cwp()?)?,
-        None => Matcher::PackagePrefix(PkgBuf::from("")),
-    };
+    let matcher = package_matcher_or_all(args.matcher.as_deref())?;
     let (engine, shutdown) = bootstrap::new_engine(&global, session)?;
     let app = BuildFmtApp {
         engine,

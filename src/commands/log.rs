@@ -24,6 +24,7 @@ use hcore::hasync::StdCancellationToken;
 use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
 use crate::commands::completion::complete_target_addr;
+use crate::commands::utils::parse_addr_arg;
 use crate::engine::log_api::TAIL_MAX;
 use crate::engine::request_state::RequestState;
 use crate::engine::{
@@ -106,9 +107,7 @@ async fn execute_async(
     session: &Arc<SessionSlot>,
     global: GlobalOptions,
 ) -> anyhow::Result<Shown> {
-    let base = crate::engine::get_cwp()?;
-    let addr = htaddr::parse_addr_with_base(args.addr.as_ref(), &base)
-        .with_context(|| format!("parse {}", args.addr))?;
+    let addr = parse_addr_arg(&args.addr)?;
     let (engine, _shutdown) = bootstrap::new_engine(&global, session)?;
     // Runs going on in other hephs: found through the sessions under HOME.
     // `HEPH_NO_SESSION` turns recording off, not looking.

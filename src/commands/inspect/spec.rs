@@ -8,8 +8,9 @@ use clap_complete::engine::ArgValueCompleter;
 use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
 use crate::commands::completion::complete_target_addr;
+use crate::commands::utils::parse_addr_arg;
 use crate::engine::Engine;
-use crate::htaddr::{self, Addr};
+use crate::htaddr::Addr;
 use crate::tui::{self, App, AppContext, LogSink};
 
 #[derive(clap::Args, Clone)]
@@ -71,9 +72,7 @@ async fn execute_async(
     session: &Arc<SessionSlot>,
     global: GlobalOptions,
 ) -> anyhow::Result<()> {
-    let base = crate::engine::get_cwp()?;
-    let addr = htaddr::parse_addr_with_base(args.addr.as_ref(), &base)
-        .with_context(|| format!("parse {}", args.addr))?;
+    let addr = parse_addr_arg(&args.addr)?;
     let (engine, shutdown) = bootstrap::new_engine(&global, session)?;
     let app = SpecApp {
         engine,
