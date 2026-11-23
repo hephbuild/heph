@@ -53,3 +53,5 @@ src/lib.rs
 Cargo.toml
   - No `serde_json` dependency: none of the vendored code uses it once the
     server loop is gone.
+  - `derive_more` enables only `display` and `from`, the two derives the
+    vendored code uses, instead of `full`.

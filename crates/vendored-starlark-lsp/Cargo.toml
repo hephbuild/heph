@@ -15,7 +15,7 @@ all = "allow"
 [dependencies]
 anyhow = "1.0.104"
 derivative = "2.2"
-derive_more = { version = "2.1.1", features = ["full"] }
+derive_more = { version = "2.1.1", features = ["display", "from"] }
 dupe = "0.9.1"
 itertools = "0.15.0"
 lsp-types = "0.97.0"
