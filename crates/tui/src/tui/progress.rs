@@ -63,24 +63,6 @@ fn human_elapsed_ms(ms: u64) -> String {
     human_elapsed(ms)
 }
 
-/// Case-insensitive substring test for the `/` filter on the `Done`/`Failed`
-/// bodies. An empty filter matches everything (the unfiltered list).
-///
-/// Compares in place. Lower-casing both sides allocated two `String`s per row,
-/// and the filter has to be tried against *every* row to know how many matched —
-/// so at 100k targets that was 200k allocations on every frame.
-pub(crate) fn addr_matches(addr: &str, filter: &str) -> bool {
-    if filter.is_empty() {
-        return true;
-    }
-    // ASCII-only folding, matching what the two `to_ascii_lowercase` calls did.
-    // `windows` yields nothing when the filter is longer than the addr, and the
-    // empty filter is handled above, so the width is always non-zero.
-    addr.as_bytes()
-        .windows(filter.len())
-        .any(|w| w.eq_ignore_ascii_case(filter.as_bytes()))
-}
-
 /// Which target set the header counters are scoped to. `Matched` (the default)
 /// counts only the matched top-level targets; `All` counts every target the view
 /// has observed, including transitive deps. The `a` key toggles between them.
@@ -5408,21 +5390,6 @@ mod tests {
             cached.contains("//a:hit") && cached.contains("//dep:hit"),
             "{cached}"
         );
-    }
-
-    #[test]
-    fn addr_filter_folds_ascii_case_without_allocating() {
-        assert!(addr_matches("//WEB:Server", "web"));
-        assert!(addr_matches("//web:server", "WEB:SERVER"));
-        assert!(addr_matches("//web:server", "//web:server"));
-        assert!(!addr_matches("//web:server", "api"));
-        // A filter longer than the addr can never match.
-        assert!(!addr_matches("//a:b", "//a:b:c"));
-        // The empty filter is the unfiltered list.
-        assert!(addr_matches("//a:b", ""));
-        // Non-ASCII bytes compare as-is — exactly what ASCII lower-casing did.
-        assert!(addr_matches("//pkg/ünï:t", "ünï"));
-        assert!(!addr_matches("//pkg/ünï:t", "ÜNÏ"));
     }
 
     #[test]

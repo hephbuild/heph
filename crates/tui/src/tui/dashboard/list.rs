@@ -18,7 +18,9 @@ use ratatui::text::{Line, Span};
 use super::intern::Id;
 use super::model::{Model, Record, RowState, Tab};
 use crate::tui::progress::CountScope;
-use crate::tui::text::{clean_inline, cut_left, cut_right, expand_tabs, sanitize_log, width};
+use crate::tui::text::{
+    clean_inline, contains_ignore_ascii_case, cut_left, cut_right, expand_tabs, sanitize_log, width,
+};
 
 /// What a blocked row's PHASE and LAST LINE say, in the words of
 /// `hcore::events::admission_wait_text` for a pool and of the line's
@@ -223,7 +225,7 @@ impl FilterCache {
         self.bits.resize(n.div_ceil(64), 0);
         for i in self.scanned..n {
             let id = Id::try_from(i).unwrap_or(Id::MAX);
-            if crate::tui::progress::addr_matches(model.addr(id), &self.query)
+            if contains_ignore_ascii_case(model.addr(id), &self.query)
                 && let Some(word) = self.bits.get_mut(i / 64)
             {
                 *word |= 1 << (i % 64);

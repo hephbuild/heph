@@ -9,7 +9,9 @@ use std::collections::VecDeque;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::tui::text::{Redact, cut_right, expand_tabs, sanitize_log, take_width, width};
+use crate::tui::text::{
+    Redact, contains_ignore_ascii_case, cut_right, expand_tabs, sanitize_log, take_width, width,
+};
 
 /// The most of a log a pane holds: what search covers.
 pub const HELD_MAX: usize = 256 * 1024;
@@ -215,8 +217,9 @@ impl LogPane {
     /// heph's home redacted.
     fn line_text(&self, k: usize, redact: &Redact) -> String {
         let text = sanitize_log(&self.line_bytes(k));
-        let text = redact.apply(&text);
-        expand_tabs(&text).into_owned()
+        // The sanitized line itself when neither step changes it.
+        let text = owned(redact.apply(&text)).unwrap_or(text);
+        owned(expand_tabs(&text)).unwrap_or(text)
     }
 
     /// The last `n` non-blank lines, for the Overview.
@@ -373,9 +376,8 @@ impl LogPane {
 
     /// The lines holding the query, literal and ASCII case-insensitive.
     fn hits(&self, redact: &Redact) -> Vec<u64> {
-        let q = self.query.to_ascii_lowercase();
         (0..self.line_count())
-            .filter(|&k| self.line_text(k, redact).to_ascii_lowercase().contains(&q))
+            .filter(|&k| contains_ignore_ascii_case(&self.line_text(k, redact), &self.query))
             .map(|k| self.first_line + k as u64)
             .collect()
     }
@@ -521,6 +523,14 @@ impl LogPane {
         }
         debug_assert!(out.iter().all(|r| width(r) <= cols.max(2)));
         out
+    }
+}
+
+/// The new text when a step changed it; `None` when it lent its input back.
+fn owned(text: std::borrow::Cow<'_, str>) -> Option<String> {
+    match text {
+        std::borrow::Cow::Owned(s) => Some(s),
+        std::borrow::Cow::Borrowed(_) => None,
     }
 }
 
@@ -701,6 +711,35 @@ mod tests {
             p.last_lines(3, &Redact::default()),
             ["⚠\u{fe0f}⚠\u{fe0f}⚠\u{fe0f} disk low"]
         );
+    }
+
+    /// The search reads the text the pane draws: heph's home redacted and
+    /// tabs laid out, ASCII case folded; a line neither step changes is
+    /// drawn as it was written.
+    #[test]
+    fn log_search_reads_the_drawn_text() {
+        let r = Redact::of(["/hh/home".into()]);
+        let mut p = LogPane::default();
+        p.start_live("live".into());
+        p.append(b"Plain line\nopen /hh/home/x\na\tb\n");
+        let mut search = |q: &str| {
+            p.search_start();
+            q.chars().for_each(|c| p.search_input(c));
+            p.search_confirm(&r);
+            p.search_hint().expect("hint")
+        };
+        for (q, found) in [
+            ("PLAIN LINE", true),
+            ("<HEPH HOME>/x", true),
+            ("/hh/home", false),
+            ("a       b", true),
+        ] {
+            let hint = search(q);
+            assert_eq!(hint.contains("match 1 of 1 ·"), found, "{q:?}: {hint}");
+        }
+        assert_eq!(p.line_text(0, &r), "Plain line");
+        assert_eq!(p.line_text(1, &r), "open <heph home>/x");
+        assert_eq!(p.line_text(2, &r), "a       b");
     }
 
     /// I13: the log-text table, drawn in the Log tab.

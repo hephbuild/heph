@@ -460,9 +460,59 @@ fn replace_path(s: &str, root: &str) -> String {
     out
 }
 
+/// Whether `haystack` holds `needle`, ASCII letters compared without case
+/// and every other byte as-is: what lower-casing both with
+/// `to_ascii_lowercase` and calling `contains` decides, without the two
+/// `String`s. An empty needle is in everything.
+///
+/// The `/` filter tries it on every address to count its matches, and the
+/// log search on every held line.
+pub fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    // `windows` yields nothing when the needle is longer than the haystack,
+    // and the empty needle is handled above, so the width is never zero.
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contains_folds_ascii_case_only() {
+        let contains = contains_ignore_ascii_case;
+        assert!(contains("//WEB:Server", "web"));
+        assert!(contains("//web:server", "WEB:SERVER"));
+        assert!(contains("//web:server", "//web:server"));
+        assert!(!contains("//web:server", "api"));
+        // At either end, and overlapping a near miss.
+        assert!(contains("abc", "AB") && contains("abc", "bC"));
+        assert!(contains("aab", "ab"));
+        // A needle longer than the haystack can never match.
+        assert!(!contains("//a:b", "//a:b:c"));
+        // The empty needle matches everything, the empty haystack included.
+        assert!(contains("//a:b", "") && contains("", ""));
+        assert!(!contains("", "a"));
+        // Non-ASCII bytes compare as-is: exactly what ASCII lower-casing did.
+        assert!(contains("//pkg/ünï:t", "ünï"));
+        assert!(!contains("//pkg/ünï:t", "ÜNÏ"));
+        for (h, n) in [
+            ("Größe X", "SSE"),
+            ("ÀB", "àb"),
+            ("x\u{1F600}Y", "\u{1F600}y"),
+        ] {
+            assert_eq!(
+                contains(h, n),
+                h.to_ascii_lowercase().contains(&n.to_ascii_lowercase()),
+                "{h:?} {n:?}"
+            );
+        }
+    }
 
     /// Whether any character a terminal would act on survived.
     fn has_control(s: &str) -> bool {
