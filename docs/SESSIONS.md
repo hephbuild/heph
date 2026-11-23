@@ -588,6 +588,12 @@ the first lock chain, `null` when no chain leads to a session. `next` is
 
 The text `Next:` line prints `command` alone, its reason on the line below.
 
+A recording covers the whole run when `incomplete` is `false` and `state` is
+not `"lost"`, in `list --json` and `show --json` alike. `incomplete` speaks
+only of the size caps: a `lost` session's process went away without
+recording its end, so its last events may be missing whatever `incomplete`
+says (see "Why is my session `lost`?" under [Recipes](#recipes)).
+
 `inflight --json` is `{id, report}`.
 
 A shipped field is never renamed or removed and never changes type; a change
@@ -851,6 +857,9 @@ touched, and one still starting is left alone as above.
 
 The questions asked most, and what answers each. The SQL runs with `sqlite3`
 on a sealed recording, or on a copy of a live one (see [Reading](#reading)).
+It needs `sqlite3` 3.25 or newer: the `targets` view uses a window function,
+and an older `sqlite3` cannot parse the recording's schema, so every query
+fails with "malformed database schema".
 [Exit codes](#commands-and-exit-codes) say which failures are `heph
 session`'s own (125).
 
