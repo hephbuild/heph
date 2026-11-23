@@ -112,7 +112,18 @@ type BoxedResultFuture<'a> =
 /// does not need to store it separately.
 pub(crate) struct EngineProviderExecutor {
     engine: Weak<Engine>,
+    /// The request state every callback runs under — or, for an executor built
+    /// by [`Self::for_get`], the base it is derived from. Read through
+    /// [`Self::rs`], never directly.
     rs: Arc<RequestState>,
+    /// Set by [`Self::for_get`]: the provider whose `get` this executor serves,
+    /// which every callback must skip (see [`RequestState::with_skip_provider`]).
+    skip: Option<Arc<crate::engine::engine::Provider>>,
+    /// `rs` with `skip` added to its skip set, built on the first callback.
+    /// Most `get`s — every built-in answering `NotFound` — never call back, so
+    /// building it up front cost each of them a set clone and two `Arc`s for
+    /// nothing.
+    skipping_rs: std::sync::OnceLock<Arc<RequestState>>,
     /// True for an executor constructed via [`Self::for_list`] — i.e. one handed
     /// to `Provider::list` by a discovery walk's per-package fan-out. Only
     /// `query()` checks it; `result`/`note_dep`/`states_under` work regardless.
@@ -126,11 +137,44 @@ pub(crate) struct EngineProviderExecutor {
 }
 
 impl EngineProviderExecutor {
+    /// An executor whose callbacks run under `rs` as it is. Every engine
+    /// caller hands out [`Self::for_get`] or [`Self::for_list`]; this one is
+    /// for tests driving the callbacks directly.
+    #[cfg(test)]
     pub(crate) fn new(engine: Weak<Engine>, rs: Arc<RequestState>) -> Self {
         Self {
             engine,
             rs,
+            skip: None,
+            skipping_rs: std::sync::OnceLock::new(),
             for_provider_list: false,
+        }
+    }
+
+    /// The executor to hand to `provider`'s `Provider::get`: its callbacks run
+    /// under `rs` with `provider` skipped, so a `query` it makes cannot
+    /// re-enter its own `list` (and nested resolutions inherit the skip).
+    pub(crate) fn for_get(
+        engine: Weak<Engine>,
+        rs: Arc<RequestState>,
+        provider: Arc<crate::engine::engine::Provider>,
+    ) -> Self {
+        Self {
+            engine,
+            rs,
+            skip: Some(provider),
+            skipping_rs: std::sync::OnceLock::new(),
+            for_provider_list: false,
+        }
+    }
+
+    /// The request state callbacks run under.
+    fn rs(&self) -> &Arc<RequestState> {
+        match &self.skip {
+            None => &self.rs,
+            Some(provider) => self
+                .skipping_rs
+                .get_or_init(|| self.rs.with_skip_provider(&provider.name)),
         }
     }
 
@@ -152,6 +196,8 @@ impl EngineProviderExecutor {
         Self {
             engine,
             rs,
+            skip: None,
+            skipping_rs: std::sync::OnceLock::new(),
             for_provider_list: true,
         }
     }
@@ -169,7 +215,7 @@ impl ProviderExecutor for EngineProviderExecutor {
                 .ok_or_else(|| anyhow::anyhow!("engine dropped"))?;
             engine
                 .result_addr(
-                    self.rs.clone(),
+                    self.rs().clone(),
                     addr,
                     OutputMatcher::All,
                     &ResultOptions::default(),
@@ -184,7 +230,7 @@ impl ProviderExecutor for EngineProviderExecutor {
     ) -> futures::future::BoxFuture<'a, anyhow::Result<()>> {
         // Edge-only: register parent → addr (the synchronous cycle check) without
         // executing. parent is already set on `rs` by the enclosing result_addr.
-        Box::pin(async move { self.rs.track_dep(addr).map_err(anyhow::Error::new) })
+        Box::pin(async move { self.rs().track_dep(addr).map_err(anyhow::Error::new) })
     }
 
     fn states_under<'a>(
@@ -196,7 +242,7 @@ impl ProviderExecutor for EngineProviderExecutor {
                 .engine
                 .upgrade()
                 .ok_or_else(|| anyhow::anyhow!("engine dropped"))?;
-            let rs = self.rs.clone();
+            let rs = self.rs().clone();
 
             // Memoize the whole subtree gather per prefix: a `list` that calls
             // `states_under` for many packages (e.g. the go go_src query) then pays
@@ -330,7 +376,7 @@ impl ProviderExecutor for EngineProviderExecutor {
                 .engine
                 .upgrade()
                 .ok_or_else(|| anyhow::anyhow!("engine dropped"))?;
-            let rs = self.rs.clone();
+            let rs = self.rs().clone();
 
             // Collect packages eagerly (non-Send iterator dropped before first await)
             let pkg_iter = engine.packages(m, &rs).await?;
@@ -6330,10 +6376,10 @@ impl Engine {
         // — never deadlock, never silently drop a resolvable target.
         let mut pending_cycle: Option<anyhow::Error> = None;
         for provider in self.providers.iter() {
-            let provider_rs = rs.with_skip_provider(&provider.name);
-            let executor: Arc<dyn ProviderExecutor> = Arc::new(EngineProviderExecutor::new(
+            let executor: Arc<dyn ProviderExecutor> = Arc::new(EngineProviderExecutor::for_get(
                 Arc::downgrade(&self),
-                provider_rs,
+                Arc::clone(rs),
+                Arc::clone(provider),
             ));
 
             let spec = match provider
@@ -6864,8 +6910,13 @@ mod tests {
             'a,
             anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>>,
         > {
+            // One package, so a query that reaches this provider calls `list`:
+            // a zero `list_calls` then means it was skipped, not that there
+            // was nothing to list.
             Box::pin(async {
-                Ok(Box::new(std::iter::empty()) as Box<dyn Iterator<Item = _> + Send>)
+                Ok(Box::new(std::iter::once(Ok(ListPackageResponse {
+                    pkg: PkgBuf::from("any"),
+                }))) as Box<dyn Iterator<Item = _> + Send>)
             })
         }
         fn get<'a>(
@@ -7691,6 +7742,79 @@ mod tests {
             list_calls.load(Ordering::SeqCst),
             0,
             "skipped provider must not be called during query"
+        );
+        Ok(())
+    }
+
+    /// The `get` executor builds its skipping state only on the first callback,
+    /// and that state still skips its own provider and inherits every skip from
+    /// the state it was derived from — here, an outer `get`'s.
+    #[tokio::test]
+    async fn for_get_executor_skips_lazily_and_inherits_skips() -> anyhow::Result<()> {
+        let root = tempdir()?;
+        let a_calls = SArc::new(AtomicUsize::new(0));
+        let b_calls = SArc::new(AtomicUsize::new(0));
+        let mut engine = Engine::new(Config {
+            parallelism: None,
+            ..Config::for_tests(root.path())
+        })?;
+        for (name, calls) in [("provider_a", &a_calls), ("provider_b", &b_calls)] {
+            let calls = SArc::clone(calls);
+            engine.register_provider(move |_| {
+                Box::new(CountingProvider {
+                    name: name.to_string(),
+                    list_calls: SArc::clone(&calls),
+                })
+            })?;
+        }
+        let engine = SArc::new(engine);
+        let provider = |name: &str| {
+            engine
+                .providers
+                .iter()
+                .find(|p| p.name == name)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("provider {name} not registered"))
+        };
+        let rs = engine.new_state();
+
+        let outer =
+            EngineProviderExecutor::for_get(SArc::downgrade(&engine), rs, provider("provider_a")?);
+        assert!(
+            outer.skipping_rs.get().is_none(),
+            "no callback yet, so no skipping state either"
+        );
+        let inner = EngineProviderExecutor::for_get(
+            SArc::downgrade(&engine),
+            SArc::clone(outer.rs()),
+            provider("provider_b")?,
+        );
+
+        inner
+            .query(&Matcher::Package(PkgBuf::from("any")), &[])
+            .await?;
+
+        assert_eq!(
+            (
+                a_calls.load(Ordering::SeqCst),
+                b_calls.load(Ordering::SeqCst)
+            ),
+            (0, 0),
+            "the nested query must skip both the outer and the inner provider"
+        );
+
+        // Control: without a skip, the same query lists through both, so the
+        // zeros above are the skip's doing.
+        EngineProviderExecutor::new(SArc::downgrade(&engine), engine.new_state())
+            .query(&Matcher::Package(PkgBuf::from("any")), &[])
+            .await?;
+        assert_eq!(
+            (
+                a_calls.load(Ordering::SeqCst),
+                b_calls.load(Ordering::SeqCst)
+            ),
+            (1, 1),
+            "an unskipped query lists through every provider"
         );
         Ok(())
     }
