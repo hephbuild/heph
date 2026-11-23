@@ -342,24 +342,16 @@ impl LayeredFs {
         }
     }
 
-    /// Find the longest registered slot prefix that is an ancestor of `rel`
-    /// (or equal to it). Returns `(prefix_len_components, prefix, sub_rel)`
-    /// where `sub_rel = rel.strip_prefix(prefix)`.
+    /// Call `f(prefix, slot, sub_rel)` with the slot whose prefix is the
+    /// longest registered ancestor of `rel` (or `rel` itself), where
+    /// `sub_rel = rel.strip_prefix(prefix)`. `None` when no slot covers `rel`.
     fn find_slot<R>(&self, rel: &Path, f: impl FnOnce(&Path, &Slot, &Path) -> R) -> Option<R> {
         let slots = self.slots.read();
-        let mut best: Option<(usize, &Path, &Slot)> = None;
-        for (prefix, slot) in slots.iter() {
-            if rel.starts_with(prefix) || rel == prefix.as_path() {
-                let depth = prefix.components().count();
-                if best.map(|(d, _, _)| depth >= d).unwrap_or(true) {
-                    best = Some((depth, prefix, slot));
-                }
-            }
-        }
-        best.map(|(_, prefix, slot)| {
-            let sub_rel = rel.strip_prefix(prefix).unwrap_or(rel);
-            f(prefix, slot, sub_rel)
-        })
+        // `ancestors` runs from `rel` itself up to the empty path, so the
+        // first registered one is the longest.
+        let (prefix, slot) = rel.ancestors().find_map(|a| slots.get_key_value(a))?;
+        let sub_rel = rel.strip_prefix(prefix).unwrap_or(rel);
+        Some(f(prefix, slot, sub_rel))
     }
 
     fn assign_inode(&self, path: PathBuf) -> u64 {
@@ -2043,6 +2035,36 @@ mod tests {
         fs.copy_up(Path::new("f.bin")).expect("copy_up");
         let bytes = std::fs::read(upper.path().join("f.bin")).expect("read upper");
         assert_eq!(bytes, content);
+    }
+
+    /// `find_slot` picks the deepest slot whose prefix is a whole-component
+    /// ancestor of the path (or the path itself), and hands the rest over.
+    #[test]
+    fn find_slot_picks_the_deepest_covering_slot() {
+        let upper = tempfile::tempdir().expect("upper");
+        let fs = std::sync::Arc::new(LayeredFs::new_empty(upper.path().to_path_buf()));
+        let lookup = |rel: &str| {
+            fs.find_slot(Path::new(rel), |prefix, _, sub_rel| {
+                (
+                    prefix.to_string_lossy().into_owned(),
+                    sub_rel.to_string_lossy().into_owned(),
+                )
+            })
+        };
+        let pair = |prefix: &str, sub: &str| Some((prefix.to_string(), sub.to_string()));
+
+        let _p = fs.register_slot(PathBuf::from("p"), vec![]);
+        let _pq = fs.register_slot(PathBuf::from("p/q"), vec![]);
+        assert_eq!(lookup("x"), None, "no slot covers it");
+        assert_eq!(lookup("pp"), None, "a name prefix is not a path prefix");
+
+        let _root = fs.register_slot(PathBuf::new(), vec![]);
+        assert_eq!(lookup("x/y"), pair("", "x/y"));
+        assert_eq!(lookup("p"), pair("p", ""));
+        assert_eq!(lookup("p/a"), pair("p", "a"));
+        assert_eq!(lookup("p/qq"), pair("p", "qq"));
+        assert_eq!(lookup("p/q"), pair("p/q", ""));
+        assert_eq!(lookup("p/q/r/s"), pair("p/q", "r/s"));
     }
 
     /// Regression test for a lock-scope bug: `copy_up` used to run the
