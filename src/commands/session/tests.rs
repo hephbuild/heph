@@ -2605,7 +2605,10 @@ async fn export_is_self_contained() {
         );
     }
     // A foreign recording exports again: as it is, or `--no-logs`.
-    for (name, logs) in [("again.hephsession", true), ("again-bare.hephsession", false)] {
+    for (name, logs) in [
+        ("again.hephsession", true),
+        ("again-bare.hephsession", false),
+    ] {
         let rec = Opened::open_foreign(&full, ftmp.path()).expect("open the export");
         let again = out.path().join(name);
         let mut stdout = Vec::new();

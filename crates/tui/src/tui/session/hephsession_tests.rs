@@ -348,7 +348,11 @@ fn a_non_regular_file_is_not_a_session() {
     for path in [fifo, dir, link, PathBuf::from("."), PathBuf::from("..")] {
         let opened = open_bounded(path.clone(), case.tmp()).expect("opening it hung");
         let why = not_a_session_why(opened);
-        assert!(why.contains("not a regular file"), "{}: {why}", path.display());
+        assert!(
+            why.contains("not a regular file"),
+            "{}: {why}",
+            path.display()
+        );
     }
 }
 

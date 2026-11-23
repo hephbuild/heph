@@ -206,10 +206,12 @@ impl Foreign {
     /// log's kept tail and how many bytes were cut before it, cut as a
     /// viewer cuts them.
     pub fn failure_logs(&self, addr: &str) -> rusqlite::Result<Vec<(Vec<u8>, u64)>> {
-        Ok(read_failure_logs(&self.file.conn, Some(addr), FAILURE_LOGS_CAP)?
-            .into_iter()
-            .map(|l| (l.log, l.cut_bytes))
-            .collect())
+        Ok(
+            read_failure_logs(&self.file.conn, Some(addr), FAILURE_LOGS_CAP)?
+                .into_iter()
+                .map(|l| (l.log, l.cut_bytes))
+                .collect(),
+        )
     }
 
     /// What the user named: the path, or the URL without its credentials.
@@ -453,9 +455,14 @@ fn read_notices(
         let seq = r.get::<_, Option<i64>>(1)?;
         let name = r.get::<_, Option<String>>(2)?;
         let text = r.get::<_, Option<Vec<u8>>>(3)?.unwrap_or_default();
-        let cost = [addr.as_ref().map_or(0, String::len), name.as_ref().map_or(0, String::len)]
-            .iter()
-            .fold(text.len().saturating_add(ROW_COST), |a, b| a.saturating_add(*b));
+        let cost = [
+            addr.as_ref().map_or(0, String::len),
+            name.as_ref().map_or(0, String::len),
+        ]
+        .iter()
+        .fold(text.len().saturating_add(ROW_COST), |a, b| {
+            a.saturating_add(*b)
+        });
         let Some(rest) = left.checked_sub(cost) else {
             break;
         };

@@ -189,7 +189,10 @@ fn foreign_notices_and_logs_are_cut() {
     let cut = u64::try_from(5 << 20).expect("small") - FAILURE_LOG_CAP + 7;
     let logs = f.failure_logs("//p:a").expect("logs");
     assert_eq!(logs.len(), 1);
-    assert_eq!(logs.first().map(|(l, c)| (l.len() as u64, *c)), Some((FAILURE_LOG_CAP, cut)));
+    assert_eq!(
+        logs.first().map(|(l, c)| (l.len() as u64, *c)),
+        Some((FAILURE_LOG_CAP, cut))
+    );
 
     let source = rec.into_source().expect("source");
     let notices = source.notices();
@@ -200,7 +203,10 @@ fn foreign_notices_and_logs_are_cut() {
     let [log] = source.failure_logs() else {
         panic!("one log")
     };
-    assert_eq!((log.log.len() as u64, log.cut_bytes), (FAILURE_LOG_CAP, cut));
+    assert_eq!(
+        (log.log.len() as u64, log.cut_bytes),
+        (FAILURE_LOG_CAP, cut)
+    );
 }
 
 /// Every row costs the budget its addr and name too, and a constant: rows
@@ -224,10 +230,21 @@ fn foreign_rows_are_charged_in_full() {
         .iter()
         .map(|((addr, _, name), text)| addr.len() + name.len() + text.len() + ROW_COST)
         .sum();
-    assert!(!notices.is_empty() && charged <= budget, "{} rows, {charged} bytes", notices.len());
+    assert!(
+        !notices.is_empty() && charged <= budget,
+        "{} rows, {charged} bytes",
+        notices.len()
+    );
     let logs = read_failure_logs(rec.conn(), None, budget as u64).expect("logs");
-    let charged: usize = logs.iter().map(|l| l.addr.len() + l.log.len() + ROW_COST).sum();
-    assert!(!logs.is_empty() && charged <= budget, "{} rows, {charged} bytes", logs.len());
+    let charged: usize = logs
+        .iter()
+        .map(|l| l.addr.len() + l.log.len() + ROW_COST)
+        .sum();
+    assert!(
+        !logs.is_empty() && charged <= budget,
+        "{} rows, {charged} bytes",
+        logs.len()
+    );
 }
 
 /// A value past the foreign length limit is refused with an error, not read

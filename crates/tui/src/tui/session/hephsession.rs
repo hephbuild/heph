@@ -210,7 +210,9 @@ fn open_regular(path: &Path) -> io::Result<Result<File, ForeignError>> {
     } else {
         "something else"
     };
-    Ok(Err(not_a_session(format!("it is not a regular file but {what}"))))
+    Ok(Err(not_a_session(format!(
+        "it is not a regular file but {what}"
+    ))))
 }
 
 /// Up to the first 16 bytes of `r`: fewer only at end of file.
@@ -388,7 +390,9 @@ impl Read for Budgeted {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let left = self.left.load(Ordering::Relaxed);
         if left == 0 && !buf.is_empty() {
-            return Err(io::Error::other("the zip's central directory is past its cap"));
+            return Err(io::Error::other(
+                "the zip's central directory is past its cap",
+            ));
         }
         let want = buf.len().min(usize::try_from(left).unwrap_or(usize::MAX));
         let n = self.inner.read(buf.get_mut(..want).unwrap_or_default())?;
@@ -476,7 +480,10 @@ fn open_db(db: &Path) -> Result<Connection, ForeignError> {
     let conn = store::open_sealed(db)
         .map_err(|e| not_a_session(format!("cannot open it as SQLite: {e}")))?;
     conn.execute_batch("PRAGMA trusted_schema=OFF; PRAGMA query_only=1;")
-        .and_then(|()| conn.set_limit(Limit::SQLITE_LIMIT_LENGTH, VALUE_CAP).map(drop))
+        .and_then(|()| {
+            conn.set_limit(Limit::SQLITE_LIMIT_LENGTH, VALUE_CAP)
+                .map(drop)
+        })
         .map_err(|e| not_a_session(format!("cannot open it as SQLite: {e}")))?;
     let has_session: bool = conn
         .query_row(
