@@ -6,6 +6,11 @@ edition = "2024"
 [lints]
 workspace = true
 
+[features]
+# `pluginfs::holds_request`, for the in-process e2e suite. Never enabled by a
+# binary.
+test-support = []
+
 [dependencies]
 hcore = { package = "core", path = "../core" }
 hmodel = { package = "model", path = "../model" }

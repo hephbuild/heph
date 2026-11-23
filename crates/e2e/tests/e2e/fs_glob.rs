@@ -16,6 +16,7 @@
 use crate::common;
 
 use common::Workspace;
+use hbuiltins::pluginfs::holds_request;
 use heph::engine::{OutputMatcher, ResultOptions};
 use heph::htaddr::parse_addr;
 
@@ -127,6 +128,95 @@ target(
         common::artifact_string(&res),
         "a.txt\ninner/e.txt\nsub/deep/b.txt\n",
         "a package-rooted glob must source exactly its own tree, minus its excludes"
+    );
+    Ok(())
+}
+
+/// Waits up to 10s for `cond`: a request's data drops once the last task
+/// riding it lets go, which can trail the `drop` of its root handles.
+async fn eventually(cond: impl Fn() -> bool) -> bool {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !cond() {
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    true
+}
+
+/// The fs plugin memoizes a request's glob walks and compiled excludes under
+/// the request's id, in process-wide caches. Ending a request must drop its
+/// buckets — the engine reaches `pluginfs::forget_request` with the id the
+/// driver keyed them by — and only its own: a request still alive on the same
+/// engine keeps its memoized walk.
+#[tokio::test]
+async fn an_ended_request_drops_its_glob_memos_and_a_live_one_keeps_them() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_file("pkg/src/a.txt", "one");
+    ws.write_file("pkg/src/b.tmp", "skipped");
+    ws.write_build_file(
+        "pkg",
+        r#"
+target(
+    name = "t",
+    driver = "bash",
+    deps = {"src": [glob("src/*", exclude = ["src/*.tmp"])]},
+    out = "out.txt",
+    run = 'for f in $SRC_SRC; do basename $f; done | sort > $OUT',
+)
+"#,
+    );
+    let engine = ws.reopen()?;
+    let addr = parse_addr("//pkg:t")?;
+
+    let ended = engine.new_state();
+    let ended_id = ended.request_id().clone();
+    let res = engine
+        .clone()
+        .result_addr(
+            ended.clone(),
+            &addr,
+            OutputMatcher::All,
+            &ResultOptions::default(),
+        )
+        .await?;
+    assert_eq!(common::artifact_string(&res), "a.txt\n");
+    assert!(
+        holds_request(&ended_id),
+        "the glob run memoized its walk under the request's id"
+    );
+
+    let live = engine.new_state();
+    let live_id = live.request_id().clone();
+    let live_res = engine
+        .clone()
+        .result_addr(
+            live.clone(),
+            &addr,
+            OutputMatcher::All,
+            &ResultOptions::default(),
+        )
+        .await?;
+    assert_eq!(common::artifact_string(&live_res), "a.txt\n");
+    assert!(holds_request(&live_id));
+
+    drop(res);
+    drop(ended);
+    assert!(
+        eventually(|| !holds_request(&ended_id)).await,
+        "an ended request's glob memos must be dropped"
+    );
+    assert!(
+        holds_request(&live_id),
+        "a live request keeps its memoized walk when another request ends"
+    );
+
+    drop(live_res);
+    drop(live);
+    assert!(
+        eventually(|| !holds_request(&live_id)).await,
+        "the second request's memos go when it ends too"
     );
     Ok(())
 }

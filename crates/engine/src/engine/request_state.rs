@@ -1490,6 +1490,9 @@ impl Drop for RequestStateData {
                 tokens.remove(&self.request_id);
             }
         }
+        // The fs plugin's per-request memos are process-wide: drop this
+        // request's buckets whether or not the engine is still alive.
+        hbuiltins::pluginfs::forget_request(&self.request_id);
     }
 }
 

@@ -1786,6 +1786,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "buffa",
+ "builtins",
  "core",
  "engine",
  "futures",
