@@ -69,6 +69,45 @@ fn report_unpack_root(i: usize) -> String {
     format!("lint_report_{i}")
 }
 
+/// The inputs of a report consumer (the gate and the fixer), from its `deps`.
+///
+/// - Each `report` dep gets its own [`report_unpack_root`].
+/// - The golangci `config` is a hash-only input: it re-keys the target on any
+///   `.golangci.yml` change without staging the file (neither consumer reads it;
+///   they only consume the analyze report).
+/// - Every other dep is staged as usual.
+fn report_consumer_inputs(
+    deps: &HashMap<String, Vec<String>>,
+    pkg: &hmodel::htpkg::PkgBuf,
+) -> anyhow::Result<Vec<hplugin::driver::targetdef::Input>> {
+    dep_inputs(deps, pkg, |group, i| DepShape {
+        annotations: if group == "report" {
+            BTreeMap::from([("unpack_root".to_string(), report_unpack_root(i))])
+        } else {
+            BTreeMap::new()
+        },
+        runtime: group != "config",
+    })
+}
+
+/// Read every staged `report` of a report consumer, one per variant (origin
+/// `dep|report|*`), in staging order. `driver` names the consumer in the error
+/// when none is staged.
+fn read_reports(
+    deps: &DepGroups,
+    req: &ManagedRunRequest<'_, '_>,
+    driver: &str,
+) -> anyhow::Result<Vec<Vec<u8>>> {
+    let report_paths = deps.staged_paths(req, "report")?;
+    if report_paths.is_empty() {
+        anyhow::bail!("{driver}: no lint report staged");
+    }
+    report_paths
+        .iter()
+        .map(|p| std::fs::read(p).with_context(|| format!("read lint report {p}")))
+        .collect()
+}
+
 /// Dep group carrying the `heph-govet` unitchecker binary.
 const GOVET_TOOL_GROUP: &str = "govet_tool";
 
@@ -706,21 +745,7 @@ impl ManagedDriver for GoLintGateDriver {
         let pkg = req.target_spec.addr.package.clone();
         let spec = GoLintGateSpec::from(&req.target_spec.config).context("parse go_lint_gate")?;
 
-        let inputs = dep_inputs(&spec.deps, &pkg, |group, i| DepShape {
-            // One unpack root per report: every variant's analyze target is in
-            // this same package and emits `lint-report.json`, so they would
-            // otherwise all claim one sandbox path (see `report_unpack_root`).
-            annotations: if group == "report" {
-                BTreeMap::from([("unpack_root".to_string(), report_unpack_root(i))])
-            } else {
-                BTreeMap::new()
-            },
-            // The golangci config is a hash-only input: it re-keys the target on
-            // any `.golangci.yml` change without staging the file (this target
-            // never reads it — it only consumes the analyze report). Every other
-            // dep is staged as usual.
-            runtime: group != "config",
-        })?;
+        let inputs = report_consumer_inputs(&spec.deps, &pkg)?;
 
         let hash = def_hash(
             "go_lint_gate",
@@ -764,14 +789,7 @@ impl ManagedDriver for GoLintGateDriver {
         // yields the same finding in each, so dedupe — and sort, so the message
         // doesn't depend on staging order.
         let def = req.request.target.def_de::<GoLintGateDef>();
-        let report_paths = def.deps.staged_paths(&req, "report")?;
-        if report_paths.is_empty() {
-            anyhow::bail!("go_lint_gate: no lint report staged");
-        }
-        let reports = report_paths
-            .iter()
-            .map(|p| std::fs::read(p).with_context(|| format!("read lint report {p}")))
-            .collect::<anyhow::Result<Vec<_>>>()?;
+        let reports = read_reports(&def.deps, &req, "go_lint_gate")?;
         let findings = merge_report_findings(&reports)?;
         if !findings.is_empty() {
             anyhow::bail!(
@@ -1026,21 +1044,7 @@ impl ManagedDriver for GoLintFixDriver {
         let pkg = req.target_spec.addr.package.clone();
         let spec = GoLintFixSpec::from(&req.target_spec.config).context("parse go_lint_fix")?;
 
-        let inputs = dep_inputs(&spec.deps, &pkg, |group, i| DepShape {
-            // One unpack root per report: every variant's analyze target is in
-            // this same package and emits `lint-report.json`, so they would
-            // otherwise all claim one sandbox path (see `report_unpack_root`).
-            annotations: if group == "report" {
-                BTreeMap::from([("unpack_root".to_string(), report_unpack_root(i))])
-            } else {
-                BTreeMap::new()
-            },
-            // The golangci config is a hash-only input: it re-keys the target on
-            // any `.golangci.yml` change without staging the file (this target
-            // never reads it — it only consumes the analyze report). Every other
-            // dep is staged as usual.
-            runtime: group != "config",
-        })?;
+        let inputs = report_consumer_inputs(&spec.deps, &pkg)?;
 
         // The rewritten `.go` files are `codegen=in_place` outputs: the engine
         // writes them back over the tracked source files after a top-level run.
@@ -1093,14 +1097,7 @@ impl ManagedDriver for GoLintFixDriver {
         // One `-json` report per variant (dep|report|*), merged into a single
         // edit set per file — see `merge_report_edits`.
         let def = req.request.target.def_de::<GoLintFixDef>();
-        let report_paths = def.deps.staged_paths(&req, "report")?;
-        if report_paths.is_empty() {
-            anyhow::bail!("go_lint_fix: no lint report staged");
-        }
-        let reports = report_paths
-            .iter()
-            .map(|p| std::fs::read(p).with_context(|| format!("read lint report {p}")))
-            .collect::<anyhow::Result<Vec<_>>>()?;
+        let reports = read_reports(&def.deps, &req, "go_lint_fix")?;
         let mut edits_by_file = merge_report_edits(&reports)?;
 
         // Apply the edits to each staged source, rewriting it in place. The
@@ -1263,17 +1260,11 @@ pub fn build_lint_spec(p: LintParams) -> TargetSpec {
     }
 }
 
-/// Build the user-facing `lint` gate spec. Depends on the `report` output of the
-/// analyze target (`_lint-analyze`) and fails the build when it contains findings.
-///
-/// `config_addr` (the module's `.golangci.yml`) is attached as a hash-only dep
-/// so any config change re-keys the gate directly — not just transitively
-/// through `_lint-analyze`'s report.
-pub fn build_lint_gate_spec(
-    addr: Addr,
-    analyze_addrs: &[Addr],
-    config_addr: Option<&Addr>,
-) -> TargetSpec {
+/// The deps every report consumer (the gate and the fixer) declares: the
+/// `report` output of each per-variant analyze target, and the module's
+/// `.golangci.yml` as the hash-only `config` dep (see [`report_consumer_inputs`])
+/// so a config change re-keys the consumer directly.
+fn report_deps(analyze_addrs: &[Addr], config_addr: Option<&Addr>) -> BTreeMap<String, Value> {
     let mut deps = BTreeMap::from([(
         "report".to_string(),
         Value::List(
@@ -1289,6 +1280,21 @@ pub fn build_lint_gate_spec(
             Value::List(vec![Value::String(cfg.format())]),
         );
     }
+    deps
+}
+
+/// Build the user-facing `lint` gate spec. Depends on the `report` output of the
+/// analyze target (`_lint-analyze`) and fails the build when it contains findings.
+///
+/// `config_addr` (the module's `.golangci.yml`) is attached as a hash-only dep
+/// so any config change re-keys the gate directly — not just transitively
+/// through `_lint-analyze`'s report.
+pub fn build_lint_gate_spec(
+    addr: Addr,
+    analyze_addrs: &[Addr],
+    config_addr: Option<&Addr>,
+) -> TargetSpec {
+    let deps = report_deps(analyze_addrs, config_addr);
     let mut config: HashMap<String, Value> = HashMap::new();
     config.insert("deps".to_string(), Value::Map(deps.into_iter().collect()));
 
@@ -1322,28 +1328,11 @@ pub fn build_lint_fix_spec(
     go_files: &[String],
     config_addr: Option<&Addr>,
 ) -> TargetSpec {
-    let mut deps = BTreeMap::from([
-        (
-            "report".to_string(),
-            Value::List(
-                analyze_addrs
-                    .iter()
-                    .map(|a| Value::String(format!("{}|report", a.format())))
-                    .collect(),
-            ),
-        ),
-        (
-            String::new(),
-            Value::List(src_addrs.iter().cloned().map(Value::String).collect()),
-        ),
-    ]);
-    // Hash-only dep: a `.golangci.yml` change re-keys the fixer directly.
-    if let Some(cfg) = config_addr {
-        deps.insert(
-            "config".to_string(),
-            Value::List(vec![Value::String(cfg.format())]),
-        );
-    }
+    let mut deps = report_deps(analyze_addrs, config_addr);
+    deps.insert(
+        String::new(),
+        Value::List(src_addrs.iter().cloned().map(Value::String).collect()),
+    );
 
     let mut config: HashMap<String, Value> = HashMap::new();
     config.insert("deps".to_string(), Value::Map(deps.into_iter().collect()));
@@ -2242,5 +2231,76 @@ mod tests {
             Content::FilePath(p) => assert_eq!(p, "mylib/a.go", "output is pkg-relative"),
             other => panic!("expected FilePath, got {other}"),
         }
+    }
+
+    /// The gate and the fixer consume the same reports and the same config the
+    /// same way: each report under its own unpack root, the config hash-only.
+    /// The fixer only adds its sources (the `""` group).
+    #[tokio::test]
+    async fn gate_and_fix_declare_the_same_report_and_config_inputs() {
+        let analyze = [addr("_lint-analyze_a"), addr("_lint-analyze_b")];
+        let cfg = addr(".golangci.yml");
+        let token = hcore::hasync::StdCancellationToken::new();
+        let parse = |spec: TargetSpec| ParseRequest {
+            request_id: "t".to_string(),
+            target_spec: Arc::new(spec),
+        };
+        let gate = GoLintGateDriver::new()
+            .parse(
+                parse(build_lint_gate_spec(
+                    addr("lint-check"),
+                    &analyze,
+                    Some(&cfg),
+                )),
+                &token,
+            )
+            .await
+            .expect("parse gate")
+            .target_def
+            .inputs;
+        let fix = GoLintFixDriver::new()
+            .parse(
+                parse(build_lint_fix_spec(
+                    addr("lint"),
+                    &analyze,
+                    &["//mylib:a.go".to_string()],
+                    &["a.go".to_string()],
+                    Some(&cfg),
+                )),
+                &token,
+            )
+            .await
+            .expect("parse fix")
+            .target_def
+            .inputs;
+
+        // `Input` is neither `PartialEq` nor `Debug`: compare what the engine sees.
+        let json = |inputs: Vec<&hplugin::driver::targetdef::Input>| {
+            serde_json::to_value(inputs).expect("serialize inputs")
+        };
+        let fix_without_sources = fix
+            .iter()
+            .filter(|i| !i.origin_id.starts_with("dep||"))
+            .collect();
+        assert_eq!(json(gate.iter().collect()), json(fix_without_sources));
+
+        let shape: Vec<_> = gate
+            .iter()
+            .map(|i| {
+                (
+                    i.origin_id.as_str(),
+                    i.annotations.get("unpack_root").map(String::as_str),
+                    i.runtime,
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                ("dep|config|0", None, false),
+                ("dep|report|0", Some("lint_report_0"), true),
+                ("dep|report|1", Some("lint_report_1"), true),
+            ]
+        );
     }
 }
