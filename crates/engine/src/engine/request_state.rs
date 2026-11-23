@@ -149,6 +149,50 @@ pub struct DepDag {
     /// Keys are packed `(from, to)` rather than a tuple so the hash is one
     /// `FxHasher` round instead of two, at identical size.
     edges: FxHashSet<u64>,
+    /// Buffers for [`DepDag::reorder`], kept across back-edges so a reorder
+    /// under the request-wide `dep_dag` lock does not allocate once they have
+    /// grown.
+    pk: PkScratch,
+}
+
+/// Working buffers for one Pearce-Kelly reorder. Contents are meaningless
+/// between reorders; only the capacity carries over.
+#[derive(Debug, Default)]
+struct PkScratch {
+    delta_plus: Vec<u32>,
+    delta_minus: Vec<u32>,
+    stack: Vec<u32>,
+    positions: Vec<u32>,
+    /// Visited set of the current walk: `mark[n] == epoch` iff `n` was
+    /// visited. Bumping `epoch` empties it without touching `mark`.
+    mark: Vec<u32>,
+    epoch: u32,
+}
+
+impl PkScratch {
+    /// Start a walk over a graph of `nodes` nodes with nothing visited.
+    fn new_walk(&mut self, nodes: usize) {
+        self.mark.resize(nodes, 0);
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            // Wrapped: a stale mark could equal a reused epoch. 0 is never an
+            // epoch, so clearing to 0 empties every mark.
+            self.mark.fill(0);
+            self.epoch = 1;
+        }
+    }
+
+    /// Mark `n` visited; `true` iff it was not already.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "new_walk sized `mark` to the node count, and callers pass node indices"
+    )]
+    fn visit(&mut self, n: u32) -> bool {
+        let m = &mut self.mark[n as usize];
+        let fresh = *m != self.epoch;
+        *m = self.epoch;
+        fresh
+    }
 }
 
 impl DepDag {
@@ -183,64 +227,90 @@ impl DepDag {
             return Ok(());
         }
 
-        // Topological violation: ord[from] >= ord[to]. Run PK reorder over the
-        // affected region [to_ord, from_ord]. δ⁺ = forward reach from `to`; δ⁻ =
-        // backward reach from `from`. Cycle iff δ⁺ touches `from`.
-        let upper = from_ord;
-        let lower = to_ord;
-
-        let mut delta_plus: Vec<u32> = Vec::new();
-        let mut delta_minus: Vec<u32> = Vec::new();
-        let mut visited: FxHashSet<u32> = FxHashSet::default();
-
-        visited.insert(t);
-        delta_plus.push(t);
-        let mut stack = vec![t];
-        while let Some(n) = stack.pop() {
-            for &w in &self.succ[n as usize] {
-                if w == f {
-                    return Err(CycleError {
-                        from: from.clone(),
-                        to: to.clone(),
-                    });
-                }
-                if self.ord[w as usize] <= upper && visited.insert(w) {
-                    delta_plus.push(w);
-                    stack.push(w);
-                }
-            }
-        }
-
-        visited.clear();
-        visited.insert(f);
-        delta_minus.push(f);
-        stack.push(f);
-        while let Some(n) = stack.pop() {
-            for &w in &self.pred[n as usize] {
-                if self.ord[w as usize] >= lower && visited.insert(w) {
-                    delta_minus.push(w);
-                    stack.push(w);
-                }
-            }
-        }
-
-        delta_minus.sort_by_key(|&n| self.ord[n as usize]);
-        delta_plus.sort_by_key(|&n| self.ord[n as usize]);
-
-        let mut positions: Vec<u32> = Vec::with_capacity(delta_minus.len() + delta_plus.len());
-        positions.extend(delta_minus.iter().map(|&n| self.ord[n as usize]));
-        positions.extend(delta_plus.iter().map(|&n| self.ord[n as usize]));
-        positions.sort_unstable();
-
-        for (i, &n) in delta_minus.iter().enumerate() {
-            self.ord[n as usize] = positions[i];
-        }
-        for (i, &n) in delta_plus.iter().enumerate() {
-            self.ord[n as usize] = positions[delta_minus.len() + i];
+        // Taken out for the reorder and put back on every exit, the cycle
+        // rejection included, so the buffers' capacity is never lost.
+        let mut pk = std::mem::take(&mut self.pk);
+        let acyclic = self.reorder(f, t, &mut pk);
+        self.pk = pk;
+        if !acyclic {
+            return Err(CycleError {
+                from: from.clone(),
+                to: to.clone(),
+            });
         }
 
         self.commit_edge(f, t);
         Ok(())
+    }
+
+    /// Pearce-Kelly reorder for the back-edge `f → t` (`ord[f] >= ord[t]`)
+    /// over the affected region `[ord[t], ord[f]]`. δ⁺ = forward reach from
+    /// `t`; δ⁻ = backward reach from `f`. Cycle iff δ⁺ touches `f`: then
+    /// returns `false` without having rewritten any `ord`.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "all u32 indices are valid NodeIndex values produced by get_or_insert and bound to the vectors' lengths"
+    )]
+    fn reorder(&mut self, f: u32, t: u32, pk: &mut PkScratch) -> bool {
+        let upper = self.ord[f as usize];
+        let lower = self.ord[t as usize];
+        // A cycle bail leaves these partly filled; only the capacity is kept.
+        pk.delta_plus.clear();
+        pk.delta_minus.clear();
+        pk.stack.clear();
+        pk.positions.clear();
+
+        pk.new_walk(self.nodes.len());
+        pk.visit(t);
+        pk.delta_plus.push(t);
+        pk.stack.push(t);
+        while let Some(n) = pk.stack.pop() {
+            for &w in &self.succ[n as usize] {
+                if w == f {
+                    return false;
+                }
+                if self.ord[w as usize] <= upper && pk.visit(w) {
+                    pk.delta_plus.push(w);
+                    pk.stack.push(w);
+                }
+            }
+        }
+
+        pk.new_walk(self.nodes.len());
+        pk.visit(f);
+        pk.delta_minus.push(f);
+        pk.stack.push(f);
+        while let Some(n) = pk.stack.pop() {
+            for &w in &self.pred[n as usize] {
+                if self.ord[w as usize] >= lower && pk.visit(w) {
+                    pk.delta_minus.push(w);
+                    pk.stack.push(w);
+                }
+            }
+        }
+
+        // Unstable is exact here: `ord` is a permutation, so no two nodes share
+        // a key and every sort order is the same.
+        pk.delta_minus
+            .sort_unstable_by_key(|&n| self.ord[n as usize]);
+        pk.delta_plus
+            .sort_unstable_by_key(|&n| self.ord[n as usize]);
+
+        pk.positions
+            .extend(pk.delta_minus.iter().map(|&n| self.ord[n as usize]));
+        pk.positions
+            .extend(pk.delta_plus.iter().map(|&n| self.ord[n as usize]));
+        pk.positions.sort_unstable();
+
+        for (&n, &p) in pk
+            .delta_minus
+            .iter()
+            .chain(&pk.delta_plus)
+            .zip(&pk.positions)
+        {
+            self.ord[n as usize] = p;
+        }
+        true
     }
 
     /// Append `f → t` to the adjacency lists and record it in the membership
@@ -2159,6 +2229,81 @@ mod tests {
         dag.pred[ai].clear();
         assert!(dag.add_dep(&b, &a).is_ok());
         assert!(dag.succ[bi].is_empty() && dag.pred[ai].is_empty());
+    }
+
+    /// `ord` is a permutation of the node indices and orders every committed
+    /// edge forwards.
+    fn assert_topological(dag: &DepDag) {
+        let mut seen = vec![false; dag.ord.len()];
+        for &o in &dag.ord {
+            assert!(
+                !std::mem::replace(&mut seen[o as usize], true),
+                "ord repeats {o}"
+            );
+        }
+        for (u, succ) in dag.succ.iter().enumerate() {
+            for &v in succ {
+                assert!(
+                    dag.ord[u] < dag.ord[v as usize],
+                    "edge {u}→{v} runs backwards: ord {} ≥ {}",
+                    dag.ord[u],
+                    dag.ord[v as usize]
+                );
+            }
+        }
+    }
+
+    /// Whether `to` is reachable from `from` over committed edges.
+    fn reaches(dag: &DepDag, from: u32, to: u32) -> bool {
+        let mut seen = vec![false; dag.nodes.len()];
+        let mut stack = vec![from];
+        while let Some(n) = stack.pop() {
+            if n == to {
+                return true;
+            }
+            if !std::mem::replace(&mut seen[n as usize], true) {
+                stack.extend(&dag.succ[n as usize]);
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn test_dep_dag_interleaved_reorders_and_rejections_keep_a_topological_order() {
+        // Back-edges, rejected cycles and forward edges interleaved on one DAG,
+        // so each reorder starts from buffers a previous reorder — or a cycle
+        // bail that returned mid-walk — left behind. The epoch starts just
+        // short of wrapping, so the visited marks also go through the reset.
+        let names: Vec<Addr> = (0..40).map(|i| addr(&format!("n{i}"))).collect();
+        let mut dag = DepDag::new();
+        dag.pk.epoch = u32::MAX - 3;
+        let (mut reorders, mut rejections) = (0, 0);
+        let mut rng = 0x2545_f491_4f6c_dd1d_u64;
+        for _ in 0..3000 {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            let (a, b) = (
+                &names[(rng % 40) as usize],
+                &names[((rng >> 8) % 40) as usize],
+            );
+            let (ai, bi) = (dag.get_or_insert(a), dag.get_or_insert(b));
+            let cycle = ai == bi || reaches(&dag, bi, ai);
+            let back = dag.ord[ai as usize] >= dag.ord[bi as usize];
+            let res = dag.add_dep(a, b);
+            assert_eq!(res.is_err(), cycle, "{a} → {b}: wrong verdict");
+            if cycle {
+                rejections += 1;
+            } else if back {
+                reorders += 1;
+            }
+            assert_topological(&dag);
+        }
+        assert!(
+            reorders > 10 && rejections > 10,
+            "{reorders} reorders, {rejections} rejections"
+        );
+        assert!(dag.pk.epoch < u32::MAX - 3, "the epoch never wrapped");
     }
 
     #[test]
