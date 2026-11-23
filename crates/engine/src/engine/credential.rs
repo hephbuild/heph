@@ -1590,32 +1590,21 @@ impl Engine {
 
 /// The cross-process acquisition lock, keyed by resolution key.
 ///
-/// A [`KeyedRWLock`](hlock::hlock::KeyedRWLock) taken only for write: acquisition
-/// is never a shared operation, so the read half would buy nothing. Its whole job
-/// is to stop two concurrent `heph` invocations both driving an interactive vendor
-/// CLI for the same credential — which is two browser windows and two sessions
-/// where the user asked for one.
-pub enum CredentialLock {
-    /// `flock(2)` files under `<home>/lock/auth/`.
-    Fs(hlock::hlock::KeyedRWLock<String, hlock::hlock::FRWLock>),
-    /// In-process only. Tests, and anything that has opted out of file locking.
-    Mem(hlock::hlock::KeyedRWLock<String, hlock::hlock::MemRWLock>),
-}
+/// A [`KeyedFileLock`](crate::engine::keyed_file_lock::KeyedFileLock) taken only
+/// for write, over `<home>/lock/auth/<key>.auth.lock`: acquisition is never a
+/// shared operation, so the read half would buy nothing. Its whole job is to stop
+/// two concurrent `heph` invocations both driving an interactive vendor CLI for
+/// the same credential — which is two browser windows and two sessions where the
+/// user asked for one.
+pub struct CredentialLock(crate::engine::keyed_file_lock::KeyedFileLock);
 
 impl CredentialLock {
     pub fn new(backend: crate::engine::result_lock::LockBackend, dir: PathBuf) -> Self {
-        match backend {
-            crate::engine::result_lock::LockBackend::Fs => {
-                Self::Fs(hlock::hlock::KeyedRWLock::new(move |key: &String| {
-                    hlock::hlock::FRWLock::new(dir.join(format!("{key}.auth.lock")))
-                }))
-            }
-            crate::engine::result_lock::LockBackend::Mem => {
-                Self::Mem(hlock::hlock::KeyedRWLock::new(|_k| {
-                    hlock::hlock::MemRWLock::default()
-                }))
-            }
-        }
+        Self(crate::engine::keyed_file_lock::KeyedFileLock::new(
+            backend,
+            dir,
+            ".auth.lock",
+        ))
     }
 
     /// Take the exclusive guard for `key`. Type-erased: this code only ever holds
@@ -1625,14 +1614,7 @@ impl CredentialLock {
         // in another process is what this waits on, and abandoning the wait would
         // just start a second one.
         let ct = hcore::hasync::StdCancellationToken::new();
-        Ok(match self {
-            Self::Fs(l) => {
-                Box::new(l.write(key.to_string(), &ct).await?) as Box<dyn std::any::Any + Send>
-            }
-            Self::Mem(l) => {
-                Box::new(l.write(key.to_string(), &ct).await?) as Box<dyn std::any::Any + Send>
-            }
-        })
+        self.0.write(key.to_string(), &ct).await
     }
 }
 

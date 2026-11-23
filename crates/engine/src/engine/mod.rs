@@ -109,6 +109,7 @@ pub(crate) mod run_log;
 pub mod run_timeout;
 pub use invoke::{InvokeOutcome, InvokeRequest};
 pub(crate) mod invoke_sandbox;
+mod keyed_file_lock;
 mod managed_register;
 mod result_lock;
 pub use result_lock::{LockBackend, ResultLock};

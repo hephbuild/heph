@@ -22,13 +22,13 @@
 
 use crate::engine::Engine;
 use crate::engine::driver::targetdef::Input;
+use crate::engine::keyed_file_lock::{KeyedFileGuard, KeyedFileLock};
 use crate::engine::request_state::RequestState;
 use crate::engine::result_lock::LockBackend;
 use crate::engine::scratch_store::head_dir;
 use anyhow::Context as _;
 use hbuiltins::pluginscratch::{Access, DRIVER_NAME, ScratchDef, parse_declaration};
 use hcore::hasync::Cancellable;
-use hlock::hlock::{FRWLock, KeyedRWLock, MemRWLock};
 use hmodel::htaddr::Addr;
 use hplugin::driver::ScratchMount;
 use std::path::{Path, PathBuf};
@@ -80,71 +80,38 @@ impl ResolvedScratch {
 
 /// The per-slot cross-process lock guarding a scratch directory.
 ///
-/// A [`KeyedRWLock`] rather than the transformable lock `result_lock` uses: a
+/// A [`KeyedFileLock`] rather than the transformable lock `result_lock` uses: a
 /// scratch is only ever taken for read (`access = "shared"`) or write
 /// (`access = "exclusive"`) and never upgraded mid-run, so the extra machinery
 /// would buy nothing.
-pub enum ScratchLock {
-    /// `flock(2)` files under `<home>/lock/scratch/`. Mutually exclusive across
-    /// processes on the same machine — which is the point, since two `heph`
-    /// invocations share one slot directory.
-    Fs {
-        lock: KeyedRWLock<String, FRWLock>,
-        /// The directory the per-slot lock files live in. Kept so
-        /// [`holder_pid`](ScratchLock::holder_pid) can find a slot's file by
-        /// path, the same way `ResultLock::Fs` keeps its own.
-        dir: PathBuf,
-    },
-    /// In-process only. Tests, and anything that has opted out of file locking.
-    Mem(KeyedRWLock<String, MemRWLock>),
-}
-
-/// Path of a slot's lock file. One definition, so the file `new` locks and the
-/// file [`holder_pid`](ScratchLock::holder_pid) probes cannot drift apart.
-fn slot_lock_path(dir: &Path, slot: &str) -> PathBuf {
-    dir.join(format!("{slot}.scratch.lock"))
-}
+///
+/// Its files are `<home>/lock/scratch/<slot>.scratch.lock`: mutually exclusive
+/// across processes on the same machine — which is the point, since two `heph`
+/// invocations share one slot directory.
+pub struct ScratchLock(KeyedFileLock);
 
 /// An opaque RAII guard on a slot. Held for the target's execute and dropped
 /// after; the concrete guard type is erased because a target may hold a mix of
 /// read and write guards and this code only ever holds and drops them.
-pub type ScratchGuard = Box<dyn std::any::Any + Send>;
+pub type ScratchGuard = KeyedFileGuard;
 
 impl ScratchLock {
     pub fn new(backend: LockBackend, dir: PathBuf) -> Self {
-        match backend {
-            LockBackend::Fs => Self::Fs {
-                lock: KeyedRWLock::new({
-                    let dir = dir.clone();
-                    move |slot: &String| FRWLock::new(slot_lock_path(&dir, slot))
-                }),
-                dir,
-            },
-            LockBackend::Mem => Self::Mem(KeyedRWLock::new(|_| MemRWLock::default())),
-        }
+        Self(KeyedFileLock::new(backend, dir, ".scratch.lock"))
     }
 
-    /// Acquire the guard `access` calls for, waiting until available.
-    async fn acquire(
+    /// Acquire the guard `access` calls for, waiting until available. An
+    /// exclusive holder stamps its pid, for [`holder_pid`](Self::holder_pid).
+    pub(crate) async fn acquire(
         &self,
         slot: String,
         access: Access,
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ScratchGuard> {
-        Ok(match (self, access) {
-            (Self::Fs { lock, .. }, Access::Shared) => {
-                Box::new(lock.read(slot, ctoken).await?) as ScratchGuard
-            }
-            (Self::Fs { lock, .. }, Access::Exclusive) => {
-                let guard = lock.write(slot, ctoken).await?;
-                stamp_pid(guard.get());
-                Box::new(guard) as ScratchGuard
-            }
-            (Self::Mem(l), Access::Shared) => Box::new(l.read(slot, ctoken).await?) as ScratchGuard,
-            (Self::Mem(l), Access::Exclusive) => {
-                Box::new(l.write(slot, ctoken).await?) as ScratchGuard
-            }
-        })
+        match access {
+            Access::Shared => self.0.read(slot, ctoken).await,
+            Access::Exclusive => self.0.write_stamped(slot, ctoken).await,
+        }
     }
 
     /// A process holding `slot` exclusively right now, when one can be named.
@@ -158,48 +125,12 @@ impl ScratchLock {
     /// case worth naming — one `exclusive` consumer, very often in another
     /// `heph` process, blocking everyone else — which is the whole reason a
     /// waiter cannot answer this question by looking inward.
+    ///
+    /// Our own pid is never named: many targets sharing one `exclusive` cache is
+    /// the dominant shape, and the fix for that is the `access` on the
+    /// declaration, not a rogue process.
     fn holder_pid(&self, slot: &str) -> Option<u32> {
-        match self {
-            Self::Fs { dir, .. } => {
-                let path = slot_lock_path(dir, slot);
-                match hlock::hlock::FLock::is_path_held(&path) {
-                    // Our own pid means this build is serialized against itself
-                    // — many targets sharing one `exclusive` cache is the
-                    // dominant shape. Reporting "held by pid <us>" would send
-                    // the reader hunting a rogue process when the fix is the
-                    // `access` on the declaration, so say nothing and let the
-                    // renderer fall back to naming the access mode.
-                    Ok(true) => crate::engine::result_lock::read_pid(&path)
-                        .filter(|pid| *pid != std::process::id()),
-                    Ok(false) => None,
-                    Err(err) => {
-                        // Without this the diagnostic path is itself
-                        // undiagnosable — same reasoning as the result lock's.
-                        tracing::debug!(error = %err, slot, "probing scratch lock liveness");
-                        None
-                    }
-                }
-            }
-            // In-process only, so the holder is always this process and naming
-            // it would tell a reader nothing they did not already know.
-            Self::Mem(_) => None,
-        }
-    }
-}
-
-/// Stamp this process's pid into a slot's lock file, so a blocked waiter in
-/// another process can name the holder.
-///
-/// Written through the held guard's already-open file description, and
-/// newline-framed for the same reason the result lock frames its own: a shorter
-/// pid written over a longer stale one would otherwise leave `<new><stale tail>`
-/// — all digits, perfectly parseable, naming a process that is nobody. See
-/// `result_lock::read_pid`, which is the reader for both.
-///
-/// Best-effort: a failed stamp costs a waiter the holder's name and nothing else.
-fn stamp_pid(guard: &hlock::hlock::FWriteGuard) {
-    if let Err(err) = guard.write_contents(format!("{}\n", std::process::id()).as_bytes()) {
-        tracing::debug!(error = %err, "could not stamp pid into scratch lock");
+        self.0.holder_pid(slot)
     }
 }
 
