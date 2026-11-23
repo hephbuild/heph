@@ -14,7 +14,7 @@
 
 use super::driver_compile::GoCompileDriver;
 use super::driver_download::GoDownloadDriver;
-use super::driver_format::{GoFormatCheckDriver, GoFormatDriver};
+use super::driver_format::GoFormatDriver;
 use super::driver_golist::GoGolistDriver;
 use super::driver_lint::{GoLintDriver, GoLintFixDriver, GoLintGateDriver};
 use super::driver_testmain::GoTestmainDriver;
@@ -263,7 +263,7 @@ fn format_spec(driver: &str) -> TargetSpec {
 
 #[tokio::test]
 async fn format() {
-    let driver = GoFormatDriver::new().with_default_runner(Some(RUNNER.to_string()));
+    let driver = GoFormatDriver::fix().with_default_runner(Some(RUNNER.to_string()));
     assert_eq!(
         pin(&driver, format_spec("go_format")).await,
         golden(
@@ -277,7 +277,7 @@ async fn format() {
 
 #[tokio::test]
 async fn format_check() {
-    let driver = GoFormatCheckDriver::new().with_default_runner(Some(RUNNER.to_string()));
+    let driver = GoFormatDriver::check().with_default_runner(Some(RUNNER.to_string()));
     assert_eq!(
         pin(&driver, format_spec("go_format_check")).await,
         golden(

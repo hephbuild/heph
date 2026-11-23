@@ -265,10 +265,16 @@ fn parse_inputs(spec: &GoFormatSpec, pkg: &hmodel::htpkg::PkgBuf) -> anyhow::Res
 }
 
 // ---------------------------------------------------------------------------
-// Fix driver (`go_format`): reformat sources, codegen=in_place.
+// The driver, in one of two modes:
+//
+// - fix (`go_format`): reformat sources, codegen=in_place;
+// - check (`go_format_check`): fail when any file is not formatted.
 // ---------------------------------------------------------------------------
 
 pub struct GoFormatDriver {
+    /// `false`: the fixer (`go_format`); `true`: the check gate
+    /// (`go_format_check`). The def's hashed `check` field.
+    check: bool,
     /// Default exec runner for this driver's tool, from the plugin's `runner:`
     /// option in the config yaml. A target's own `runner` field overrides it,
     /// and `"local"` there opts back out. See [`crate::plugingo::runner`].
@@ -276,8 +282,20 @@ pub struct GoFormatDriver {
 }
 
 impl GoFormatDriver {
-    pub fn new() -> Self {
+    /// The fixer (`go_format`, registered as `format`): rewrites the sources in
+    /// place.
+    pub fn fix() -> Self {
         Self {
+            check: false,
+            default_runner: None,
+        }
+    }
+
+    /// The check gate (`go_format_check`, registered as `format_check`): fails
+    /// when any file is not formatted, writes nothing.
+    pub fn check() -> Self {
+        Self {
+            check: true,
             default_runner: None,
         }
     }
@@ -289,11 +307,14 @@ impl GoFormatDriver {
         self.default_runner = runner;
         self
     }
-}
 
-impl Default for GoFormatDriver {
-    fn default() -> Self {
-        Self::new()
+    /// The driver's name in its def hash and its parse error.
+    fn kind(&self) -> &'static str {
+        if self.check {
+            "go_format_check"
+        } else {
+            "go_format"
+        }
     }
 }
 
@@ -301,7 +322,7 @@ impl Default for GoFormatDriver {
 impl ManagedDriver for GoFormatDriver {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
         Ok(ConfigResponse {
-            name: "format".to_string(),
+            name: if self.check { "format_check" } else { "format" }.to_string(),
         })
     }
 
@@ -315,8 +336,8 @@ impl ManagedDriver for GoFormatDriver {
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ParseResponse> {
         let pkg = req.target_spec.addr.package.clone();
-        let pkg_str = pkg.as_str();
-        let spec = GoFormatSpec::from(&req.target_spec.config).context("parse go_format")?;
+        let spec = GoFormatSpec::from(&req.target_spec.config)
+            .with_context(|| format!("parse {}", self.kind()))?;
         let mut inputs = parse_inputs(&spec, &pkg)?;
         let (runner, runner_input) = super::runner::parse_runner_with_default(
             &spec.runner,
@@ -325,27 +346,32 @@ impl ManagedDriver for GoFormatDriver {
         )?;
         inputs.extend(runner_input);
 
-        // The rewritten sources, written back in place: the same glob the `""`
-        // group stages, so the output covers exactly what was staged (generated
-        // files are never staged, so never collected or written back) and the
-        // engine's in-place guard pairs it with that input by addr.
-        let outputs = vec![Output {
-            group: SRC_OUTPUT_GROUP.to_string(),
-            paths: vec![TPath {
-                content: Content::Glob(format_output_pattern(pkg_str)),
-                codegen_tree: CodegenMode::InPlace {
-                    write_on_failure: true,
-                },
-                collect: true,
-            }],
-        }];
+        // The fixer's rewritten sources, written back in place: the same glob
+        // the `""` group stages, so the output covers exactly what was staged
+        // (generated files are never staged, so never collected or written back)
+        // and the engine's in-place guard pairs it with that input by addr. The
+        // check gate writes nothing.
+        let outputs = if self.check {
+            vec![]
+        } else {
+            vec![Output {
+                group: SRC_OUTPUT_GROUP.to_string(),
+                paths: vec![TPath {
+                    content: Content::Glob(format_output_pattern(pkg.as_str())),
+                    codegen_tree: CodegenMode::InPlace {
+                        write_on_failure: true,
+                    },
+                    collect: true,
+                }],
+            }]
+        };
 
         let def = GoFormatDef {
-            check: false,
+            check: self.check,
             runner,
             deps: DepGroups::of(&spec.deps),
         };
-        let hash = def_hash("go_format", &req.target_spec.addr, &def);
+        let hash = def_hash(self.kind(), &req.target_spec.addr, &def);
 
         Ok(ParseResponse {
             target_def: TargetDef {
@@ -385,129 +411,21 @@ impl ManagedDriver for GoFormatDriver {
         if files.is_empty() {
             return Ok(ManagedRunResponse { artifacts: vec![] });
         }
-        let args = vec![OsString::from("-format"), arg_file(pkg_dir, &files)?];
+        let mut args = vec![OsString::from("-format")];
+        if def.check {
+            args.push(OsString::from("-check"));
+        }
+        args.push(arg_file(pkg_dir, &files)?);
 
         let output = exec_govet(&bin, args, &env, pkg_dir, runner, ctoken).await?;
         let mut log = ToolLog::new(&mut req.request);
-        let res = format_outcome(&mut log, &output).await;
-        // The rewritten sources are collected from the declared in_place outputs.
-        echo_failure(&mut req, res).await
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Check driver (`go_format_check`): fail when any file is not formatted.
-// ---------------------------------------------------------------------------
-
-pub struct GoFormatCheckDriver {
-    /// Default exec runner for this driver's tool, from the plugin's `runner:`
-    /// option in the config yaml. A target's own `runner` field overrides it,
-    /// and `"local"` there opts back out. See [`crate::plugingo::runner`].
-    default_runner: Option<String>,
-}
-
-impl GoFormatCheckDriver {
-    pub fn new() -> Self {
-        Self {
-            default_runner: None,
-        }
-    }
-
-    /// Set the driver-wide default runner (the plugin's `runner:` option).
-    /// `None` and `Some("local")` both mean "spawn on the host".
-    #[must_use]
-    pub fn with_default_runner(mut self, runner: Option<String>) -> Self {
-        self.default_runner = runner;
-        self
-    }
-}
-
-impl Default for GoFormatCheckDriver {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[async_trait]
-impl ManagedDriver for GoFormatCheckDriver {
-    fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
-        Ok(ConfigResponse {
-            name: "format_check".to_string(),
-        })
-    }
-
-    fn schema(&self) -> hplugin::driver::DriverSchema {
-        GoFormatSpec::schema()
-    }
-
-    async fn parse(
-        &self,
-        req: ParseRequest,
-        _ctoken: &(dyn Cancellable + Send + Sync),
-    ) -> anyhow::Result<ParseResponse> {
-        let pkg = req.target_spec.addr.package.clone();
-        let spec = GoFormatSpec::from(&req.target_spec.config).context("parse go_format_check")?;
-        let mut inputs = parse_inputs(&spec, &pkg)?;
-        let (runner, runner_input) = super::runner::parse_runner_with_default(
-            &spec.runner,
-            self.default_runner.as_deref(),
-            &pkg,
-        )?;
-        inputs.extend(runner_input);
-
-        let def = GoFormatDef {
-            check: true,
-            runner,
-            deps: DepGroups::of(&spec.deps),
+        let res = if def.check {
+            check_outcome(&mut log, &output).await
+        } else {
+            // The rewritten sources are collected from the declared in_place
+            // outputs.
+            format_outcome(&mut log, &output).await
         };
-        let hash = def_hash("go_format_check", &req.target_spec.addr, &def);
-
-        Ok(ParseResponse {
-            target_def: TargetDef {
-                addr: req.target_spec.addr.clone(),
-                labels: req.target_spec.labels.clone(),
-                raw_def: Arc::new(def),
-                inputs,
-                cache: CacheConfig::on(true),
-                hash,
-                resources: spec.resources,
-                ..Default::default()
-            },
-        })
-    }
-
-    async fn apply_transitive(
-        &self,
-        req: ApplyTransitiveRequest,
-        _ctoken: &(dyn Cancellable + Send + Sync),
-    ) -> anyhow::Result<ApplyTransitiveResponse> {
-        Ok(ApplyTransitiveResponse {
-            target_def: req.target_def,
-        })
-    }
-
-    async fn run<'a, 'io>(
-        &self,
-        mut req: ManagedRunRequest<'a, 'io>,
-        ctoken: &(dyn Cancellable + Send + Sync),
-    ) -> anyhow::Result<ManagedRunResponse> {
-        let pkg_dir = &req.sandbox_pkg_dir;
-        let def = req.request.target.def_de::<GoFormatDef>();
-        let runner = super::runner::runner_ref(req.request.request_id, def.runner.as_ref());
-        let (bin, env) = govet_bin_and_config(&req, &def.deps)?;
-        let files = def.deps.staged_paths(&req, "")?;
-        if files.is_empty() {
-            return Ok(ManagedRunResponse { artifacts: vec![] });
-        }
-        let args = vec![
-            OsString::from("-format"),
-            OsString::from("-check"),
-            arg_file(pkg_dir, &files)?,
-        ];
-
-        let output = exec_govet(&bin, args, &env, pkg_dir, runner, ctoken).await?;
-        let mut log = ToolLog::new(&mut req.request);
-        let res = check_outcome(&mut log, &output).await;
         echo_failure(&mut req, res).await
     }
 }
@@ -717,7 +635,7 @@ mod tests {
     #[tokio::test]
     async fn the_format_driver_default_runner_reaches_the_parsed_inputs() {
         let ct = hcore::hasync::StdCancellationToken::new();
-        let def = GoFormatDriver::new()
+        let def = GoFormatDriver::fix()
             .with_default_runner(Some("//tools/devenv:runner".to_string()))
             .parse(
                 ParseRequest {
@@ -752,7 +670,7 @@ mod tests {
     #[tokio::test]
     async fn the_format_check_driver_default_runner_reaches_the_parsed_inputs() {
         let ct = hcore::hasync::StdCancellationToken::new();
-        let def = GoFormatCheckDriver::new()
+        let def = GoFormatDriver::check()
             .with_default_runner(Some("//tools/devenv:runner".to_string()))
             .parse(
                 ParseRequest {
@@ -786,7 +704,7 @@ mod tests {
 
     async fn parse_fix(spec: TargetSpec) -> TargetDef {
         let ct = hcore::hasync::StdCancellationToken::new();
-        GoFormatDriver::new()
+        GoFormatDriver::fix()
             .parse(
                 ParseRequest {
                     request_id: "t".to_string(),
@@ -811,7 +729,7 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&fix.hash), "d1dd927ed529f768");
 
         let ct = hcore::hasync::StdCancellationToken::new();
-        let check = GoFormatCheckDriver::new()
+        let check = GoFormatDriver::check()
             .parse(
                 ParseRequest {
                     request_id: "t".to_string(),

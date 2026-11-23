@@ -11,8 +11,8 @@
 
 use hdriver_support::driver_managed::ManagedDriver;
 use hplugin_go::plugingo::{
-    GoCompileDriver, GoDownloadDriver, GoFormatCheckDriver, GoFormatDriver, GoGolistDriver,
-    GoLintDriver, GoLintFixDriver, GoLintGateDriver, GoTestmainDriver, GoToolchainDriver, Provider,
+    GoCompileDriver, GoDownloadDriver, GoFormatDriver, GoGolistDriver, GoLintDriver,
+    GoLintFixDriver, GoLintGateDriver, GoTestmainDriver, GoToolchainDriver, Provider,
 };
 use plugin_sdk::stabby::abi::{
     DynFunctionRegistry, DynLogSink, DynRunnerHost, DynSupervisor, NamedDriver, PluginComponents,
@@ -188,13 +188,13 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
     });
     // Formatters (gofmt/gofumpt/goimports) via heph-govet's -format mode.
     let format: Arc<dyn ManagedDriver> =
-        Arc::new(GoFormatDriver::new().with_default_runner(go_runner.clone()));
+        Arc::new(GoFormatDriver::fix().with_default_runner(go_runner.clone()));
     drivers.push(NamedDriver {
         name: "format".into(),
         driver: make_dyn_managed_driver(format),
     });
     let format_check: Arc<dyn ManagedDriver> =
-        Arc::new(GoFormatCheckDriver::new().with_default_runner(go_runner));
+        Arc::new(GoFormatDriver::check().with_default_runner(go_runner));
     drivers.push(NamedDriver {
         name: "format_check".into(),
         driver: make_dyn_managed_driver(format_check),

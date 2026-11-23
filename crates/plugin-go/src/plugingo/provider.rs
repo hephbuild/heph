@@ -5480,20 +5480,20 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn parse_format_spec(
         spec: hplugin::provider::TargetSpec,
     ) -> hplugin::driver::targetdef::TargetDef {
-        use crate::plugingo::driver_format::{GoFormatCheckDriver, GoFormatDriver};
+        use crate::plugingo::driver_format::GoFormatDriver;
         use hdriver_support::driver_managed::ManagedDriver as _;
         use hplugin::driver::ParseRequest;
-        let is_fix = spec.driver == "go.format";
+        let driver = if spec.driver == "go.format" {
+            GoFormatDriver::fix()
+        } else {
+            GoFormatDriver::check()
+        };
         let req = ParseRequest {
             request_id: "test".to_string(),
             target_spec: Arc::new(spec),
         };
         let ct = StdCancellationToken::new();
-        let resp = if is_fix {
-            GoFormatDriver::new().parse(req, &ct).await
-        } else {
-            GoFormatCheckDriver::new().parse(req, &ct).await
-        };
+        let resp = driver.parse(req, &ct).await;
         resp.expect("format spec parses").target_def
     }
 

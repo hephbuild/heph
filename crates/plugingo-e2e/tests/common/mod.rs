@@ -562,10 +562,10 @@ fn workspace_builder(
             .with_managed_driver(Box::new(plugingo::GoLintGateDriver::new()))
             .with_managed_driver(Box::new(plugingo::GoLintFixDriver::new()))
             .with_managed_driver(Box::new(
-                plugingo::GoFormatDriver::new().with_default_runner(r.clone()),
+                plugingo::GoFormatDriver::fix().with_default_runner(r.clone()),
             ))
             .with_managed_driver(Box::new(
-                plugingo::GoFormatCheckDriver::new().with_default_runner(r),
+                plugingo::GoFormatDriver::check().with_default_runner(r),
             )))
     };
     let mut go_plugin = Some(go_plugin);
