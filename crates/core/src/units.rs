@@ -101,9 +101,37 @@ pub fn human_bytes(bytes: u64) -> String {
     format!("{v:.1} {unit}")
 }
 
+/// `n` with `,` between each group of three digits: `1,204`. heph's one count
+/// format, so a failure report and a job summary write the same number the
+/// same way.
+pub fn thousands(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thousands_groups_digits_in_threes() {
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(7), "7");
+        assert_eq!(thousands(999), "999");
+        assert_eq!(thousands(1_000), "1,000");
+        assert_eq!(thousands(4_117), "4,117");
+        assert_eq!(thousands(20_140), "20,140");
+        assert_eq!(thousands(999_999), "999,999");
+        assert_eq!(thousands(1_000_000), "1,000,000");
+        assert_eq!(thousands(1_234_567_890), "1,234,567,890");
+    }
 
     #[test]
     fn human_bytes_reads_like_a_person_wrote_it() {

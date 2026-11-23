@@ -251,7 +251,7 @@ impl ReportContext {
                 value.push((
                     format!(
                         " ({} {})",
-                        thousands(lines),
+                        hcore::units::thousands(lines),
                         if lines == 1 { "line" } else { "lines" }
                     ),
                     Tone::Dim,
@@ -487,19 +487,6 @@ fn count_files(dir: &Path) -> usize {
         }
     }
     n
-}
-
-/// `n` with `,` between each group of three digits: `1,204`.
-fn thousands(n: usize) -> String {
-    let digits = n.to_string();
-    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
-    for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    out
 }
 
 #[cfg(test)]
