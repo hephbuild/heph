@@ -11038,6 +11038,7 @@ mod tests {
                 lines: rs.log_tail_lines(),
                 material: false,
                 fixes: None,
+                keep_log: true,
             })
             .await;
         e.context(slot)

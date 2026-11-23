@@ -374,6 +374,7 @@ impl Engine {
                                 lines: rs.log_tail_lines(),
                                 material: outputs_are_material,
                                 fixes: write_back.fixes,
+                                keep_log: true,
                             };
                             // A run with a live log keeps it, through the
                             // descriptor; its guard unlinks it once the slot
@@ -605,7 +606,7 @@ impl Engine {
     /// Where a run in `sandbox_dir` can have written its log: the directory
     /// itself and, when FUSE is mounted, the mount-side and backing-side
     /// directories the bridge redirects it to.
-    fn sandbox_roots(&self, sandbox_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    pub(crate) fn sandbox_roots(&self, sandbox_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
         let mut roots = vec![sandbox_dir.to_path_buf()];
         if let Some(rel) = self.fuse_rel(sandbox_dir) {
             roots.push(self.fuse.lower.join(rel));

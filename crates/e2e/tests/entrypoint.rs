@@ -378,6 +378,80 @@ target(name = "scr_sandbox", driver = "exec", entrypoint = True, workdir = "sand
     Ok(())
 }
 
+/// A `workdir = "sandbox"` entrypoint's `failure_out`: a failed exit keeps the
+/// matches, and nothing else, in the failure slot before the sandbox goes,
+/// with no `log.txt` (an invocation is never logged); a run that keeps
+/// nothing leaves no slot; the next invocation clears the slot.
+#[tokio::test]
+async fn sandbox_entrypoint_keeps_failure_out() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    // Passes once `$HEPH_TEST_OUT` exists, fails with 3 before that.
+    ws.write_build_file(
+        "app",
+        r#"
+target(name = "ep", driver = "bash", entrypoint = True, workdir = "sandbox",
+       failure_out = ["report/", "*.xml"],
+       run = "mkdir -p report && printf boom > report/r.txt && printf '<x/>' > junit.xml && echo other > other.txt && [ -e \"$HEPH_TEST_OUT\" ] || exit 3")
+target(name = "bare", driver = "bash", entrypoint = True, workdir = "sandbox",
+       failure_out = ["report/"],
+       run = "exit 4")
+"#,
+    );
+    let cwd = ws.dir.path().to_path_buf();
+    let out = ws.dir.path().join("pass");
+    let addr = parse_addr("//app:ep")?;
+
+    let exit = exited(invoke(&ws.engine, request("//app:ep", &cwd, &[], &out)?).await);
+    assert_eq!(exit, Exit::Code(3), "the tool's own exit, unchanged");
+    let kept = ws
+        .engine
+        .failure_outputs(&addr)?
+        .context("the failure is recorded")?;
+    assert_eq!(
+        kept.kept
+            .iter()
+            .map(|f| (f.path.clone(), f.size))
+            .collect::<Vec<_>>(),
+        [
+            (PathBuf::from("app/junit.xml"), 4),
+            (PathBuf::from("app/report/r.txt"), 4),
+        ],
+        "the matches and nothing else"
+    );
+    let slot = ws.engine.failure_slots().slot_dir(&addr);
+    assert_eq!(
+        read(&slot.join("out/app/report/r.txt"))?,
+        "boom",
+        "copied out of the sandbox"
+    );
+    assert!(
+        !slot.join(heph::engine::failure_slot::LOG).exists(),
+        "an invocation is never logged"
+    );
+    assert!(
+        !ws.dir.path().join("app/report").exists(),
+        "nothing reaches the tree"
+    );
+    assert!(
+        invoke_sandboxes(&ws.engine, "app", "ep").is_empty(),
+        "the sandbox still goes with the invocation"
+    );
+
+    // The next invocation clears it, and a passing one keeps nothing.
+    std::fs::write(&out, "")?;
+    let exit = exited(invoke(&ws.engine, request("//app:ep", &cwd, &[], &out)?).await);
+    assert_eq!(exit, Exit::Code(0));
+    assert_eq!(ws.engine.failure_outputs(&addr)?, None, "cleared");
+
+    // A failure whose `failure_out` matched nothing has no slot.
+    let bare = parse_addr("//app:bare")?;
+    let exit = exited(invoke(&ws.engine, request("//app:bare", &cwd, &[], &out)?).await);
+    assert_eq!(exit, Exit::Code(4));
+    assert_eq!(ws.engine.failure_outputs(&bare)?, None);
+    assert!(!ws.engine.failure_slots().slot_dir(&bare).exists());
+    Ok(())
+}
+
 /// Every path by which an entrypoint could be pulled in as an input, or built,
 /// refuses it, naming it (N2, R14). `inspect outputs` and `inspect hashout`
 /// are `result_addr` on the target — the direct-build row.

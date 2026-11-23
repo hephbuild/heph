@@ -523,6 +523,10 @@ impl Engine {
             options = options.with_args(args);
         }
 
+        // This target runs again: its last failure no longer describes it.
+        // Before the run, as a build's is cleared when its next run starts.
+        self.failure_slots.clear(addr).await;
+
         let ran = self
             .run_in_sandbox(
                 rs,
@@ -548,6 +552,12 @@ impl Engine {
         // The run's guards (stage holds, slots) go before the tree does; the
         // response carries nothing else an invocation keeps.
         let ran = ran.map(|r| r.map(drop));
+        // What a failed run left for `failure_out` is in the sandbox: into the
+        // failure slot before the teardown below removes it.
+        let ran = match ran {
+            Ok(Err(e)) => Ok(Err(self.keep_failure_out(addr, sandbox.dir(), e).await)),
+            other => other,
+        };
 
         // Every exit removes the sandbox, before this returns (E20).
         if let Err(e) = hcore::blocking::run(move || sandbox.teardown()).await {
@@ -558,5 +568,46 @@ impl Engine {
             );
         }
         ran
+    }
+
+    /// Keep a failed invocation's `failure_out` matches in `addr`'s failure
+    /// slot, as `out/` and nothing else: an invocation is never logged (R22),
+    /// so the slot has no `log.txt` whatever the driver attached.
+    ///
+    /// The managed layer packed the matches into a tar under `sandbox_dir`
+    /// only after a failed process exit, never under `--shell` or a cancel
+    /// (`hdriver_support::failure_out::keeps_failure_out`); parse accepted
+    /// `failure_out` only with `workdir = "sandbox"`, where the program wrote
+    /// into that sandbox. A run that kept nothing returns `err` untouched. A
+    /// failed keep never hides the run's own failure: it is one context line.
+    async fn keep_failure_out(
+        &self,
+        addr: &Addr,
+        sandbox_dir: &std::path::Path,
+        err: anyhow::Error,
+    ) -> anyhow::Error {
+        if hplugin::error::failure_out_tar(&err).is_none() {
+            return err;
+        }
+        let slot = self
+            .failure_slots
+            .fill(crate::engine::failure_slot::Fill {
+                addr,
+                // An invocation has no revision: it is never hashed.
+                hashin: "",
+                roots: self.sandbox_roots(sandbox_dir),
+                err: &err,
+                lines: 0,
+                material: false,
+                fixes: None,
+                keep_log: false,
+            })
+            .await;
+        let out_error = slot.out_error.clone();
+        let err = err.context(slot);
+        match out_error {
+            Some(e) => err.context(format!("failure_out not kept: {e}")),
+            None => err,
+        }
     }
 }
