@@ -1520,19 +1520,15 @@ fn opens_format_1_fixture() {
         assert!(!opened.is_copy() && !opened.live, "format {n}: sealed");
         assert!(sealed_column(&opened.conn));
         if n == store::FORMAT {
-            // The current format's schema is the fixture's: a table, view,
-            // index or trigger edited without a format bump fails here.
+            // Within a format the schema only grows (I5, I9): every object of
+            // the fixture is still there, with its columns in their order.
+            // The public explorer names' columns are the contract and do not
+            // move at all; growth there is a TEMP view of a later heph (D20).
             let fresh_root = tempfile::tempdir().expect("tempdir");
             let fresh_dir = session_dir(fresh_root.path(), SessionId::new(FIXTURE_STARTED_MS, 1));
             write_fixture(&fresh_dir);
             let fresh = store::open_sealed(&fresh_dir.join(store::FILE)).expect("open fresh");
-            assert_eq!(
-                dump(&opened.conn, SCHEMA_SQL),
-                dump(&fresh, SCHEMA_SQL),
-                "format {n}'s schema moved from its fixture: bump store::FORMAT and run \
-                 `cargo test -p tui generate_format_fixture -- --ignored` (or, if format {n} \
-                 was never released, delete its fixture and regenerate it)"
-            );
+            assert_schema_grew_only(n, &opened.conn, &fresh);
         }
         for sql in &recipes {
             let rows = count_rows(&opened.conn, sql);
@@ -1557,8 +1553,94 @@ fn opens_format_1_fixture() {
     }
 }
 
-/// Every schema object of a recording, as SQLite stores its definition.
-const SCHEMA_SQL: &str = "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name";
+/// The explorer's public names (I9): their columns are frozen within a
+/// format.
+const PUBLIC_NAMES: [&str; 6] = [
+    "sessions",
+    "spans",
+    "span_events",
+    "metrics",
+    "logs",
+    "targets",
+];
+
+/// Every schema object of a recording but SQLite's own, as `(type, name)`.
+fn schema_objects(conn: &rusqlite::Connection) -> Vec<(String, String)> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+        )
+        .expect("prepare");
+    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .expect("query")
+        .collect::<rusqlite::Result<_>>()
+        .expect("schema objects")
+}
+
+/// The columns of a table or view (`table_info`) or an index (`index_info`),
+/// in order.
+fn object_columns(conn: &rusqlite::Connection, kind: &str, name: &str) -> Vec<String> {
+    let sql = match kind {
+        "index" => "SELECT coalesce(name, '<expr>') FROM pragma_index_info(?1) ORDER BY seqno",
+        _ => "SELECT name FROM pragma_table_info(?1) ORDER BY cid",
+    };
+    let mut stmt = conn.prepare(sql).expect("prepare");
+    stmt.query_map([name], |r| r.get(0))
+        .expect("query")
+        .collect::<rusqlite::Result<_>>()
+        .expect("columns")
+}
+
+/// `part` appears in `whole` in the same order (not necessarily adjacent).
+fn in_order(part: &[String], whole: &[String]) -> bool {
+    let mut rest = whole.iter();
+    part.iter().all(|p| rest.any(|w| w == p))
+}
+
+/// Format `n`'s fixture schema against a fresh recording's: every fixture
+/// object still exists with the same type and its columns in their order,
+/// and the public names' columns are exactly the fixture's.
+fn assert_schema_grew_only(n: u32, fixture: &rusqlite::Connection, fresh: &rusqlite::Connection) {
+    let fresh_objects = schema_objects(fresh);
+    let objects = schema_objects(fixture);
+    for public in PUBLIC_NAMES {
+        assert!(
+            objects.iter().any(|(_, name)| name == public),
+            "format {n}: the fixture has no {public}"
+        );
+    }
+    for (kind, name) in objects {
+        assert!(
+            fresh_objects.iter().any(|(k, m)| *k == kind && *m == name),
+            "format {n}: {kind} {name} is in the format's fixture but no longer in its schema. \
+             Within a format the schema only grows (I5): keep it, or make the change a new format \
+             (bump store::FORMAT and run `cargo test -p tui generate_format_fixture -- --ignored`)"
+        );
+        if kind == "trigger" {
+            continue;
+        }
+        let was = object_columns(fixture, &kind, &name);
+        let now = object_columns(fresh, &kind, &name);
+        assert!(
+            !was.is_empty(),
+            "format {n}: no columns read for {kind} {name}"
+        );
+        if PUBLIC_NAMES.contains(&name.as_str()) {
+            assert_eq!(
+                was, now,
+                "format {n}: the columns of {name}, a public explorer name, moved. Stored views in \
+                 a released recording never change (I9): grow the contract with heph's TEMP views \
+                 (D20), or make it a new format"
+            );
+        } else {
+            assert!(
+                in_order(&was, &now),
+                "format {n}: {kind} {name} lost or reordered columns ({was:?} -> {now:?}). Within a \
+                 format the schema only grows (I5): add columns, or make it a new format"
+            );
+        }
+    }
+}
 
 /// How many rows `sql` returns.
 fn count_rows(conn: &rusqlite::Connection, sql: &str) -> usize {

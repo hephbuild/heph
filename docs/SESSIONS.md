@@ -436,6 +436,15 @@ incompatible change:
   format the six names only gain tables, columns, names and enum values; a
   derivation bump may add rows or attributes, and may correct a value that
   was wrong.
+- **Within a format the schema only grows** (I5). Every table, view and
+  index of the format's fixture stays, its columns in their order; new ones
+  may be added beside them. The stored definitions of the six public names
+  in a released recording never change: a recording carries its views, and
+  no heph rewrites a sealed file. A later contract that grows them (a new
+  column of `spans`, a new view) reaches older recordings through the TEMP
+  views a later heph puts in front of them, as `heph session query` does
+  (spec D20), not by editing what is stored. The fixture test checks exactly
+  this: a subset, in order, everywhere, and the six names' columns unchanged.
 
 New fields are `#[serde(default)]` and unknown ones are ignored. Two things
 are frozen for **every** format: the `lock` file name and its `flock`
