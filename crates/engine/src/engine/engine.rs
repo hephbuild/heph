@@ -833,7 +833,6 @@ impl Engine {
         #[cfg(any(test, feature = "test-support"))]
         let sqlite_writer_gate = sqlite.writer_gate();
         let sqlite_writes = Arc::new(sqlite);
-        let sqlite: Arc<dyn LocalCache> = sqlite_writes.clone();
         // Durable tier: manifests + small/medium blobs in sqlite, large blobs
         // spilled to plain files. The mem tier (below) fronts both.
         let blobs = Arc::new(crate::engine::local_cache_fs::LocalCacheFS::new(
@@ -841,7 +840,7 @@ impl Engine {
         )?);
         let durable: Arc<dyn LocalCache> =
             Arc::new(crate::engine::local_cache_spill::LocalCacheSpill::new(
-                sqlite,
+                sqlite_writes.clone(),
                 blobs,
                 usize::try_from(cfg.spill_threshold_bytes).unwrap_or(usize::MAX),
             ));
