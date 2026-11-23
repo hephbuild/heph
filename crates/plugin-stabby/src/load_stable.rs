@@ -616,6 +616,9 @@ fn drain_run(
 /// cancel this request) and keep awaiting — the call then returns its cancelled
 /// result. The plugin trips the token it gave the provider/driver, so a long `get`
 /// or a running subprocess stops, exactly as for an in-process target.
+///
+/// `on_cancel` borrows what it names (the request id, the run's key): it runs
+/// at most once, and a call that is never cancelled copies nothing for it.
 async fn await_with_cancel<T>(
     ct: &(dyn Cancellable + Send + Sync),
     on_cancel: impl FnOnce() + Send,
@@ -629,42 +632,6 @@ async fn await_with_cancel<T>(
             on_cancel();
             fut.await
         }
-    }
-}
-
-/// The cancel signal for a provider call: trip the plugin's in-flight `request_id`.
-fn provider_cancel(inner: &Arc<DynProvider>, request_id: &str) -> impl FnOnce() + Send {
-    let inner = Arc::clone(inner);
-    let id = request_id.to_string();
-    move || inner.cancel(id.into())
-}
-
-/// The cancel signal for a driver call other than a run (`parse`,
-/// `apply_transitive`): its `request_id`. A run's is [`run_cancel`].
-fn driver_cancel(inner: &Arc<DynManagedDriver>, id: &str) -> impl FnOnce() + Send {
-    let inner = Arc::clone(inner);
-    let id = id.to_string();
-    move || inner.cancel(id.into())
-}
-
-/// The cancel signal for a run: by its own `cancel_key` when it has one, and
-/// then saying why. Called once `ct` has fired, so `ct`'s reason is settled: a
-/// run the engine stopped at its `timeout` is cancelled as timed out
-/// (`cancel_timed_out`), so the plugin's token reads what `ct` does. A run
-/// with no key (a plugin before 0.19.1) is cancelled by `request_id`.
-fn run_cancel<'a>(
-    inner: &Arc<DynManagedDriver>,
-    ct: &'a (dyn Cancellable + Send + Sync),
-    cancel_key: Option<&str>,
-    request_id: &str,
-) -> impl FnOnce() + Send + 'a {
-    let inner = Arc::clone(inner);
-    let key = cancel_key.map(str::to_string);
-    let request_id = request_id.to_string();
-    move || match key {
-        Some(key) if ct.timed_out() => inner.cancel_timed_out(key.into()),
-        Some(key) => inner.cancel(key.into()),
-        None => inner.cancel(request_id.into()),
     }
 }
 
@@ -794,8 +761,8 @@ impl Provider for StableRemoteProvider {
             let fut =
                 self.inner
                     .invoke_exec(pb::ProviderMethod::Get as u32, encode_svec(&pb_req), exec);
-            let bytes =
-                await_with_cancel(ct, provider_cancel(&self.inner, &req.request_id), fut).await;
+            let cancel = || self.inner.cancel(req.request_id.as_str().into());
+            let bytes = await_with_cancel(ct, cancel, fut).await;
             let body = decode_unary(&bytes).map_err(GetError::Other)?;
             match body {
                 Body::GetResp(gr) => Ok(GetResponse {
@@ -846,7 +813,8 @@ impl Provider for StableRemoteProvider {
             let fut = self
                 .inner
                 .invoke(pb::ProviderMethod::Probe as u32, encode_svec(&pb_req));
-            let bytes = await_with_cancel(ct, provider_cancel(&self.inner, &request_id), fut).await;
+            let cancel = || self.inner.cancel(request_id.as_str().into());
+            let bytes = await_with_cancel(ct, cancel, fut).await;
             match decode_unary(&bytes)? {
                 Body::ProbeResp(pr) => Ok(ProbeResponse {
                     states: convert::states_from_pb(pr.states)?,
@@ -1036,7 +1004,8 @@ impl ManagedDriver for StableRemoteManagedDriver {
         let fut = self
             .inner
             .invoke(pb::DriverMethod::Parse as u32, encode_svec(&pb_req));
-        let bytes = await_with_cancel(ct, driver_cancel(&self.inner, &request_id), fut).await;
+        let cancel = || self.inner.cancel(request_id.as_str().into());
+        let bytes = await_with_cancel(ct, cancel, fut).await;
         match decode_unary(&bytes)? {
             Body::ParseResp(pr) => Ok(ParseResponse {
                 target_def: convert::target_def_from_pb(required_msg(
@@ -1066,7 +1035,8 @@ impl ManagedDriver for StableRemoteManagedDriver {
             pb::DriverMethod::ApplyTransitive as u32,
             encode_svec(&pb_req),
         );
-        let bytes = await_with_cancel(ct, driver_cancel(&self.inner, &request_id), fut).await;
+        let cancel = || self.inner.cancel(request_id.as_str().into());
+        let bytes = await_with_cancel(ct, cancel, fut).await;
         match decode_unary(&bytes)? {
             Body::ApplyTransitiveResp(r) => Ok(ApplyTransitiveResponse {
                 target_def: convert::target_def_from_pb(required_msg(
@@ -1321,11 +1291,16 @@ impl StableRemoteManagedDriver {
             // firing names this run, not every run of the request. The plugin
             // registered the key before `invoke_bidi` above resolved, and this
             // is the first point a cancel can be sent, so it is never early.
-            let run = await_with_cancel(
-                ct,
-                run_cancel(&self.inner, ct, cancel_key.as_deref(), &request_id),
-                rx,
-            );
+            // It runs once `ct` has fired, so `ct`'s reason is settled: a run
+            // the engine stopped at its `timeout` is cancelled as timed out, so
+            // the plugin's token reads what `ct` does. A run with no key (a
+            // plugin before 0.19.1) is cancelled by `request_id`.
+            let cancel = || match cancel_key.as_deref() {
+                Some(key) if ct.timed_out() => self.inner.cancel_timed_out(key.into()),
+                Some(key) => self.inner.cancel(key.into()),
+                None => self.inner.cancel(request_id.as_str().into()),
+            };
+            let run = await_with_cancel(ct, cancel, rx);
             // The run's result and the pump's end, together: the pump ends
             // only once the drain thread has sent the result and closed the
             // queue, so the run returns after every chunk queued before its

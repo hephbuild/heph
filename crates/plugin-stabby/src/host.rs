@@ -283,11 +283,12 @@ impl SeamSpawn {
     /// seam: spawned on the runtime this wrapper was constructed with, inline
     /// otherwise. A panicking body maps to `mk_err` (host-side bug, surfaced to
     /// the guest as an error) — never an unwind out of the wrapper's poll,
-    /// which runs inside the extern shim.
+    /// which runs inside the extern shim. `key` names the call in that error,
+    /// and is formatted only then.
     async fn run<T, F>(
         &self,
         method: &'static str,
-        key: String,
+        key: impl std::fmt::Display + Send,
         fut: F,
         mk_err: fn(String) -> T,
     ) -> T
@@ -487,7 +488,7 @@ impl StableRunnerHost for HostRunnerHost {
         };
         dynify(stabby::boxed::Box::new(self.seam.run(
             "prepare_runner",
-            String::new(),
+            "",
             fut,
             |m| SVec::from(hexecrunner::wire::PrepareReply::Err(m).encode().as_slice()),
         )))
@@ -572,7 +573,9 @@ impl StableExecutor for HostExecutor {
 
     extern "C" fn result<'a>(&'a self, addr: StableAddr) -> DynFuture<'a, ResultOutcome> {
         let parsed = addr_from_stable(&addr);
-        let key = parsed.to_string();
+        // An `Addr` clone is a refcount bump; its text is needed only if the
+        // callback panics.
+        let key = parsed.clone();
         let inner = Arc::clone(&self.inner);
         let fut = async move {
             match inner.result(&parsed).await {
@@ -656,7 +659,7 @@ impl StableExecutor for HostExecutor {
         };
         dynify(stabby::boxed::Box::new(self.seam.run(
             "query",
-            String::new(),
+            "",
             fut,
             |m| QueryOutcome {
                 ok: false,
@@ -667,11 +670,10 @@ impl StableExecutor for HostExecutor {
     }
 
     extern "C" fn states_under<'a>(&'a self, prefix: SString) -> DynFuture<'a, StatesOutcome> {
-        let prefix = PkgBuf::from(prefix.to_string());
-        let key = prefix.as_str().to_string();
+        let pkg = PkgBuf::from(prefix.to_string());
         let inner = Arc::clone(&self.inner);
         let fut = async move {
-            match inner.states_under(&prefix).await {
+            match inner.states_under(&pkg).await {
                 Ok(states) => StatesOutcome {
                     ok: true,
                     message: SString::new(),
@@ -689,7 +691,7 @@ impl StableExecutor for HostExecutor {
         };
         dynify(stabby::boxed::Box::new(self.seam.run(
             "states_under",
-            key,
+            prefix,
             fut,
             |m| StatesOutcome {
                 ok: false,
@@ -1078,5 +1080,33 @@ mod tests {
                 });
             }
         });
+    }
+
+    /// A host callback that panics reaches the guest as an error naming the
+    /// call by its key. The key is formatted only on that path, and reads
+    /// exactly as the eagerly built `addr.to_string()` key it replaced.
+    #[test]
+    fn a_panicking_host_callback_is_an_error_naming_its_call() {
+        use hmodel::htaddr::Addr;
+        use hmodel::htpkg::PkgBuf;
+
+        fn boom() -> String {
+            panic!("boom")
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let seam = super::SeamSpawn::on(rt.handle().clone(), tracing::Span::none());
+        let addr = Addr::new(
+            PkgBuf::from("some/pkg"),
+            "t".into(),
+            [("k".to_string(), "v".to_string())].into(),
+        );
+        let eager_key = addr.to_string();
+        let expected = format!("host callback result({eager_key}) panicked: boom");
+
+        let got = rt.block_on(seam.run("result", addr, async { boom() }, |m| m));
+        assert_eq!(got, expected);
     }
 }

@@ -543,8 +543,8 @@ impl CancelGuard {
         // token in flight under this id was already tripped by `cancel`, and
         // any *later* call under this (cancelled) request gets re-cancelled by
         // its own host-side `await_with_cancel`, which observes the
-        // already-tripped request token on first poll and fires
-        // `provider_cancel` again.
+        // already-tripped request token on first poll and sends the cancel
+        // again.
         if self.token.is_cancelled() {
             self.reg
                 .precancelled
