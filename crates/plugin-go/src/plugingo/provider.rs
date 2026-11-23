@@ -226,6 +226,64 @@ struct ImportClosure {
     libs: Vec<(Arc<str>, Addr)>,
 }
 
+/// Read `file` out of a `_golist` target's output artifact, decoded by `decode`
+/// and memoized in `cache` for the provider's lifetime.
+///
+/// `executor.result(golist_addr)` is called OUTSIDE the `once` closure so
+/// every caller (owner + cache-hit waiters) routes through
+/// `Engine::result_addr`, which registers the `parent → golist_addr` edge
+/// in the request's `DepDag`. Memoizing the executor call inside the
+/// closure would let waiters skip dep registration, hiding a real target-
+/// dep cycle as a memoizer deadlock. The cache only memoizes the artifact
+/// parse, which is the expensive part.
+///
+/// Fast path: once the file is parsed plugin-side, a caller only needs to
+/// register the `parent → golist_addr` dep edge (the host's cycle check). That
+/// is a cheap edge-only `note_dep` instead of a full `result()`, which would
+/// re-run the engine's whole result pipeline plus a lease round-trip for every
+/// edge — the dominant cost on the remote resolve path (every transitive import
+/// hits this).
+async fn read_golist_cached<T, D>(
+    cache: &Memoizer<Addr, Result<Arc<T>, Arc<anyhow::Error>>>,
+    executor: Arc<dyn ProviderExecutor>,
+    golist_addr: &Addr,
+    file: &'static str,
+    decode: D,
+) -> anyhow::Result<Arc<T>>
+where
+    T: Send + Sync + 'static,
+    D: FnOnce(Box<dyn std::io::Read>) -> anyhow::Result<T> + Send + 'static,
+{
+    if let Some(cached) = cache.peek(golist_addr) {
+        executor.note_dep(golist_addr).await?;
+        return cached.map_err(unwrap_arc_err);
+    }
+    let result = executor.result(golist_addr).await?;
+    cache
+        .once(golist_addr.clone(), move || async move {
+            let value = hcore::blocking::run(move || -> anyhow::Result<_> {
+                for artifact in &result.artifacts {
+                    for entry_result in artifact.walk()? {
+                        let entry = entry_result?;
+                        if entry.path.file_name().and_then(|n| n.to_str()) != Some(file) {
+                            continue;
+                        }
+                        let data = match entry.kind {
+                            hcore::hartifactcontent::WalkEntryKind::File { data, .. } => data,
+                            hcore::hartifactcontent::WalkEntryKind::Symlink { .. } => continue,
+                        };
+                        return decode(data);
+                    }
+                }
+                anyhow::bail!("_golist produced no {file}")
+            })
+            .await?;
+            Ok(Arc::new(value))
+        })
+        .await
+        .map_err(unwrap_arc_err)
+}
+
 /// Flatten already-deps-first-deduped `sub_closures` into one deps-first list,
 /// deduped by import_path, with `self_lib` (if any) appended last. Shared by
 /// `import_closure` (composing a node from its children's closures) and
@@ -3064,116 +3122,54 @@ impl ProviderInner {
     }
 
     /// Read and parse the single package from a `_golist` target's output artifact.
-    ///
-    /// `executor.result(golist_addr)` is called OUTSIDE the `once` closure so
-    /// every caller (owner + cache-hit waiters) routes through
-    /// `Engine::result_addr`, which registers the `parent → golist_addr` edge
-    /// in the request's `DepDag`. Memoizing the executor call inside the
-    /// closure would let waiters skip dep registration, hiding a real target-
-    /// dep cycle as a memoizer deadlock. The cache only memoizes the artifact
-    /// parse, which is the expensive part.
     async fn read_golist_package(
         &self,
         executor: Arc<dyn ProviderExecutor>,
         golist_addr: &Addr,
     ) -> anyhow::Result<Arc<GoPackage>> {
-        // Fast path: the package is already parsed plugin-side, so we only need
-        // to register the `parent → golist_addr` dep edge (the host's cycle
-        // check). That's a cheap edge-only `note_dep` instead of a full
-        // `result()`, which would re-run the engine's whole result pipeline plus
-        // a lease round-trip for every edge — the dominant cost on the remote
-        // resolve path (every transitive import hits this).
-        if let Some(cached) = self.pkg_cache.peek(golist_addr) {
-            executor.note_dep(golist_addr).await?;
-            return cached.map_err(unwrap_arc_err);
-        }
-        let result = executor.result(golist_addr).await?;
-        self.pkg_cache
-            .once(
-                golist_addr.clone(),
-                enclose!((result) move || async move {
-                    let pkg = hcore::blocking::run(move || -> anyhow::Result<_> {
-                        for artifact in &result.artifacts {
-                            for entry_result in artifact.walk()? {
-                                let entry = entry_result?;
-                                if entry.path.file_name().and_then(|n| n.to_str())
-                                    != Some("package.bin")
-                                {
-                                    continue;
-                                }
-                                let data = match entry.kind {
-                                    hcore::hartifactcontent::WalkEntryKind::File { data, .. } => data,
-                                    hcore::hartifactcontent::WalkEntryKind::Symlink { .. } => continue,
-                                };
-                                return decode_go_package(data);
-                            }
-                        }
-                        anyhow::bail!("_golist produced no package.bin")
-                    })
-                    .await?;
-                    // `go list -e` reports no-buildable-files cases as a JSON
-                    // entry with the Error field populated and empty GoFiles.
-                    // Surface that as a typed sentinel so consumers can map it
-                    // to NotFound uniformly (mirrors errNoGoFiles in the Go
-                    // reference impl: heph/plugin/plugingo/pkg_analysis.go:34).
-                    //
-                    // Test-only packages (only `package pkg_test` xtest files)
-                    // are NOT NOGO — go list -test reports a synthetic primary
-                    // entry without an Error in that case, so xtest variants
-                    // remain reachable.
-                    if pkg.go_files.is_empty() && pkg.error.is_some() {
-                        return Err(anyhow::Error::new(NoGoFilesError {
-                            import_path: pkg.import_path.clone(),
-                        }));
-                    }
-                    Ok(Arc::new(pkg))
-                }),
-            )
-            .await
-            .map_err(unwrap_arc_err)
+        read_golist_cached(
+            &self.pkg_cache,
+            executor,
+            golist_addr,
+            "package.bin",
+            |data| {
+                let pkg = decode_go_package(data)?;
+                // `go list -e` reports no-buildable-files cases as a JSON
+                // entry with the Error field populated and empty GoFiles.
+                // Surface that as a typed sentinel so consumers can map it
+                // to NotFound uniformly (mirrors errNoGoFiles in the Go
+                // reference impl: heph/plugin/plugingo/pkg_analysis.go:34).
+                //
+                // Test-only packages (only `package pkg_test` xtest files)
+                // are NOT NOGO — go list -test reports a synthetic primary
+                // entry without an Error in that case, so xtest variants
+                // remain reachable.
+                if pkg.go_files.is_empty() && pkg.error.is_some() {
+                    return Err(anyhow::Error::new(NoGoFilesError {
+                        import_path: pkg.import_path.clone(),
+                    }));
+                }
+                Ok(pkg)
+            },
+        )
+        .await
     }
 
+    /// Read and parse the driver-resolved per-file addresses from a `_golist`
+    /// target's output artifact.
     async fn read_golist_package_addrs(
         &self,
         executor: Arc<dyn ProviderExecutor>,
         golist_addr: &Addr,
     ) -> anyhow::Result<Arc<PackageAddrs>> {
-        // executor.result is called outside the once closure so waiters register
-        // the dep edge, not just the cache owner. Cache hit: cheap edge-only
-        // note_dep (see read_golist_package).
-        if let Some(cached) = self.pkg_addrs_cache.peek(golist_addr) {
-            executor.note_dep(golist_addr).await?;
-            return cached.map_err(unwrap_arc_err);
-        }
-        let result = executor.result(golist_addr).await?;
-        self.pkg_addrs_cache
-            .once(
-                golist_addr.clone(),
-                enclose!((result) move || async move {
-                    let addrs = hcore::blocking::run(move || -> anyhow::Result<_> {
-                        for artifact in &result.artifacts {
-                            for entry_result in artifact.walk()? {
-                                let entry = entry_result?;
-                                if entry.path.file_name().and_then(|n| n.to_str())
-                                    != Some("package_addrs.bin")
-                                {
-                                    continue;
-                                }
-                                let data = match entry.kind {
-                                    hcore::hartifactcontent::WalkEntryKind::File { data, .. } => data,
-                                    hcore::hartifactcontent::WalkEntryKind::Symlink { .. } => continue,
-                                };
-                                return decode_package_addrs(data);
-                            }
-                        }
-                        anyhow::bail!("_golist produced no package_addrs.bin")
-                    })
-                    .await?;
-                    Ok(Arc::new(addrs))
-                }),
-            )
-            .await
-            .map_err(unwrap_arc_err)
+        read_golist_cached(
+            &self.pkg_addrs_cache,
+            executor,
+            golist_addr,
+            "package_addrs.bin",
+            decode_package_addrs,
+        )
+        .await
     }
 
     fn build_lib_addr(&self, addr: &Addr, vref: &VariantRef) -> Addr {
