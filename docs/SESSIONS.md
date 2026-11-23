@@ -535,8 +535,9 @@ times in absolute unix ms; `[]` when there is no session:
   or `{kind: "admission", addr, pool}`. From the `status` row, so at most the
   first 100 of each kind.
 - `incomplete` is true when the recording passed its size cap and so is
-  short of the run (the table adds `incomplete` to PROGRESS); `null` on a
-  newer-format row. `show --json`'s `incomplete_reason` says why.
+  short of the run (the table adds `incomplete` to PROGRESS); `null` when
+  this heph cannot tell: a newer-format row, or a status row it cannot read
+  (`state` is then `unknown`). `show --json`'s `incomplete_reason` says why.
 - `format` appears only on the row of a session in a newer recording format,
   which this heph reads no further: that row has `owner_pid: null`, empty
   `argv`, `null` progress and `state: "unknown"`. `owner_pid` is never `null`

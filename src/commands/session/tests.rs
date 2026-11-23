@@ -2029,6 +2029,28 @@ async fn list_json_says_panicked() {
     assert_eq!(s["state"], "failed");
 }
 
+/// A status row this heph cannot read: `incomplete` is unknown (`null`), not
+/// "complete" (`false`).
+#[tokio::test]
+async fn list_json_incomplete_is_null_when_the_status_is_unreadable() {
+    let id = SessionId::new(T0, 1);
+    let source = FakeSource {
+        sessions: vec![(
+            SessionEntry {
+                status_unreadable: true,
+                ..entry(meta(id, 1, &["heph", "run"]), false, None)
+            },
+            Vec::new(),
+        )],
+    };
+    let sources: [&dyn SessionSource; 1] = [&source];
+    let json: serde_json::Value =
+        serde_json::from_str(&run_list(&sources, Workspace::All, true).await).expect("json");
+    let s = &json["sessions"][0];
+    assert_eq!(s["state"], "unknown", "{s}");
+    assert_eq!(s["incomplete"], serde_json::Value::Null, "{s}");
+}
+
 #[tokio::test]
 async fn list_shows_newer_format_placeholder() {
     let tmp = tempfile::tempdir().expect("tempdir");

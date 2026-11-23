@@ -54,8 +54,8 @@ pub struct ListRow {
     /// Every wait of a live session, each lock holder mapped to its session.
     blocked_on: Vec<BlockedOn>,
     /// The recording is short of the run (it passed its size cap; `show
-    /// --json`'s `incomplete_reason` says more). `null` for a session in a
-    /// newer format, which this heph does not read.
+    /// --json`'s `incomplete_reason` says more). `null` when this heph cannot
+    /// tell: a session in a newer format, or a status row it cannot read.
     incomplete: Option<bool>,
     /// Set only for a session in a newer directory format, which this heph
     /// does not read further.
@@ -166,7 +166,9 @@ fn json_row(e: &SessionEntry, every: &[&SessionEntry], opts: ViewOpts) -> ListRo
             progress: status.map(Progress::of),
             now,
             blocked_on,
-            incomplete: Some(status.is_some_and(|s| s.truncated)),
+            // Unknown, not "complete", when the status row is there but this
+            // heph cannot read it.
+            incomplete: (!e.status_unreadable).then(|| status.is_some_and(|s| s.truncated)),
             format: None,
         },
         EntryMeta::TooNew { found, .. } => ListRow {
