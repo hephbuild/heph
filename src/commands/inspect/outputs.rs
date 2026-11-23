@@ -72,7 +72,7 @@ async fn execute_async(
                 )
                 .await;
             let addr = addr.format();
-            crate::commands::errors::finalize!(ctx, rs, res, result => {
+            crate::commands::errors::finalize(&ctx, &rs, res, None, |result| {
                 // `entry_paths` is header-only for tar-backed cache artifacts, so
                 // listing a target's outputs does not read their bytes.
                 let collect = |arts: &[Arc<dyn hcore::hartifactcontent::Content>]| -> anyhow::Result<Vec<String>> {
@@ -102,6 +102,7 @@ async fn execute_async(
                 }
                 Ok(())
             })
+            .await
         },
     )
     .await

@@ -200,7 +200,7 @@ async fn execute_async(
             .await;
             out.close().await;
 
-            crate::commands::errors::finalize!(ctx, rs, res)
+            crate::commands::errors::finalize(&ctx, &rs, res, None, |_| Ok(())).await
         },
     )
     .await

@@ -83,7 +83,7 @@ impl App for ValidateApp {
             .await;
         out.close().await;
 
-        crate::commands::errors::finalize!(ctx, rs, res, gaps = &gaps)
+        crate::commands::errors::finalize(&ctx, &rs, res, Some(&gaps), |_| Ok(())).await
     }
 }
 

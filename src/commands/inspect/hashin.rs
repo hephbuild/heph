@@ -45,10 +45,11 @@ async fn execute_async(
             // `meta` may run provider targets, recording rich failures in `rs`;
             // `finalize` prefers those over the returned error and prints on success.
             let res = Arc::clone(&engine).meta(rs.clone(), &addr).await;
-            crate::commands::errors::finalize!(ctx, rs, res, meta => {
+            crate::commands::errors::finalize(&ctx, &rs, res, None, |meta| {
                 println!("{}", meta.hashin);
                 Ok(())
             })
+            .await
         },
     )
     .await

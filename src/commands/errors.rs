@@ -256,7 +256,7 @@ fn render_incomplete(
 /// What a keep-going walk skipped, read once at the end of a command. `None`
 /// when nothing was skipped, or when the command was cancelled: a Ctrl-C cuts
 /// the selection short on purpose, and exits as cancelled rather than as
-/// incomplete. [`finalize!`] announces it on the event stream.
+/// incomplete. [`finalize`] announces it on the event stream.
 pub fn incomplete_selection(
     gaps: &crate::engine::Gaps,
     cancelled: bool,
@@ -340,7 +340,7 @@ impl std::error::Error for IncompleteSelection {
     }
 }
 
-/// For a command that does not end in [`finalize!`]: `Err` with the
+/// For a command that does not end in [`finalize`]: `Err` with the
 /// "incomplete selection" block when the walk skipped anything, rendered by
 /// [`render_anyhow`] on the way out.
 pub fn require_complete_selection(gaps: &crate::engine::Gaps) -> anyhow::Result<()> {
@@ -362,34 +362,11 @@ pub fn is_cancelled(e: &anyhow::Error) -> bool {
     downcast_chain_ref::<CancelledError>(e).is_some()
 }
 
-/// Paved-road command finalizer. The single construct every command ends with.
-///
-/// One place owns the awkward truth that a command's *outcome* lives in two
-/// channels: the per-request failure registry (rich, deduped `TargetFailure`s,
-/// recorded when a provider/driver runs a target) and the returned `res`. Given
-/// `ctx`, the request state `rs`, an engine `res`, and `$val => $body` (the
-/// success output), it resolves them (pausing the TUI only for the success/error
-/// output that prints inline):
-///
-/// - registry non-empty → exit with [`FailedTargets`]; interactive mode defers the
-///   render to `render_anyhow` (after the viewport is torn down), non-interactive
-///   mode renders here. The returned `res` is a collateral marker, dropped;
-/// - registry empty, `res` Ok → bind the value as `$val` and run `$body` (may use
-///   `?`), then exit `Ok`;
-/// - registry empty, `res` Err → a cancellation exits `cancelled`; any other error
-///   is a genuine non-registry failure propagated to `render_anyhow`.
-///
-/// `$body` must evaluate to `anyhow::Result<()>`. Commands whose outcome isn't a
-/// single `Result` (e.g. `run`'s fail-fast batch) fold it into one `res` before
-/// calling — a cancellation among batch errors becomes `Err(CancelledError)`.
-///
-/// The `$val => $body` clause is optional: omit it for commands that print
-/// incrementally and need no end-of-run output (the success value is discarded).
-/// Fold a keep-going batch into the single `res` that [`finalize!`] expects.
+/// Fold a keep-going batch into the single `res` that [`finalize`] expects.
 ///
 /// `Engine::result` reports keep-going failures INSIDE its `Ok`
 /// (`BatchResult::errors`); they are normally duplicated into the failure
-/// registry, which `finalize!` renders. This fold must still exist: an error
+/// registry, which `finalize` renders. This fold must still exist: an error
 /// class the registry declines to record (a request-property marker leaking
 /// out of a conversion boundary) would otherwise be dropped on the floor —
 /// the run prints its "err N" summary, then exits 0 in silence, which a
@@ -446,7 +423,7 @@ pub fn require_non_empty(
 
 /// [`require_non_empty`], unless the selector walk skipped something. Then an
 /// empty match is answered by what was skipped — the "incomplete selection"
-/// block `finalize!` prints — not by "check your selector", which would send
+/// block `finalize` prints — not by "check your selector", which would send
 /// the user after a typo that is not there.
 pub fn require_non_empty_unless_incomplete(
     results: Vec<Arc<crate::engine::EResult>>,
@@ -459,130 +436,193 @@ pub fn require_non_empty_unless_incomplete(
     }
 }
 
-/// Paved-road command finalizer; the outcomes are described above
-/// [`fold_batch`]. One more applies to a command whose walk ran
-/// [`Discovery::KeepGoing`](crate::engine::Discovery) and passes its sink as
-/// `gaps = &sink`: anything skipped — and the command not cancelled — emits one
-/// `SelectionIncomplete` event, renders the "incomplete selection" block after
-/// any failure boxes (and after a genuine error), and exits non-zero even when
-/// the success body ran.
-macro_rules! finalize {
-    (@inner $ctx:expr, $rs:expr, $res:expr, $gaps:expr, $announce:expr, $val:pat => $body:block) => {{
-        let res = $res;
-        let cancelled = res
-            .as_ref()
-            .err()
-            .is_some_and($crate::commands::errors::is_cancelled);
-        let gaps: ::std::option::Option<&::std::sync::Arc<$crate::engine::Gaps>> = $gaps;
-        let incomplete =
-            gaps.and_then(|g| $crate::commands::errors::incomplete_selection(g, cancelled));
-        if let Some(report) = &incomplete {
-            ($announce)(report);
-        }
-        // The failures the line backend printed as they failed, box rows
-        // included: their boxes are left out below. Asked before the
-        // failures are taken, so the answer covers every one of them; empty
-        // on the interactive backend, whose report is unchanged.
-        let printed_live = $ctx.failures_printed().await;
-        // Each saying whether `heph log <addr>` would find its log: the
-        // report and the CI box point at it on the same answer. One printed
-        // live carried that answer then and is not asked again — but it is
-        // still taken, so the exit code and telemetry count it.
-        let failures = $rs
-            .take_failures_with_logs_where(|f| !printed_live.contains(&f.addr.format()))
-            .await;
-        if !failures.is_empty() {
-            // `res` is a collateral marker here — dropped either way.
-            if $ctx.interactive() {
-                // Do NOT render here: mid-run the TUI is only *paused*, so the
-                // resume re-anchor and the final viewport collapse would wipe the
-                // boxes off screen. Carry the failures out; `render_anyhow` in
-                // `main` prints them once the viewport is fully torn down.
-                // As the report: everything it reads from disk is read
-                // here, never at the render (two-mode TUI I7).
-                let home = $rs.heph_home();
-                let report = $crate::commands::errors::ReportContext::gather(
-                    &failures,
-                    |addr| $rs.took_down(addr),
-                    |addr| $rs.was_cancelled(addr),
-                    home.as_deref(),
-                );
-                ::anyhow::Result::<()>::Err(
-                    $crate::commands::errors::FailedTargets::deferred(failures)
-                        .with_incomplete(incomplete)
-                        .with_report(report)
-                        .into_error(),
-                )
-            } else {
-                // No viewport, so nothing ever repaints stderr and there is no
-                // reason to defer. Print at the failure site: deferring to `main`
-                // would push the diagnostics behind the backend's end-of-run
-                // summary *and* its unbounded background-upload drain, invert the
-                // errors-then-verdict order every other build tool prints, and lose
-                // them entirely if a second ctrl-c aborts during that drain.
-                // (Interactive has no such choice — teardown must come first, so it
-                // necessarily prints verdict-then-errors.)
-                ::anyhow::Result::<()>::Err(
-                    $crate::commands::errors::FailedTargets::reported_to_stderr(
-                        failures,
-                        incomplete,
-                        &printed_live,
-                        $ctx.session(),
-                    )
-                    .into_error(),
-                )
-            }
-        } else {
-            let printed: ::anyhow::Result<()> = $crate::tui::paused!($ctx, {
-                match res {
-                    Ok($val) => $body,
-                    // A cancellation is surfaced by `finish_exit`; any other error
-                    // is a genuine non-registry failure → `render_anyhow`.
-                    Err(e) if !cancelled => Err(e),
-                    Err(_) => Ok(()),
-                }
-            });
-            match incomplete {
-                None => {
-                    printed?;
-                    $crate::commands::errors::finish_exit(cancelled)
-                }
-                // What matched was processed; the run still fails for what was not.
-                Some(report) => ::anyhow::Result::<()>::Err(
-                    $crate::commands::errors::IncompleteSelection::new(
-                        report,
-                        printed.err(),
-                        $ctx.interactive(),
-                    )
-                    .into_error(),
-                ),
-            }
-        }
-    }};
-    ($ctx:expr, $rs:expr, $res:expr, gaps = $gaps:expr $(,)?) => {
-        $crate::commands::errors::finalize!($ctx, $rs, $res, gaps = $gaps, _ => { Ok(()) })
-    };
-    ($ctx:expr, $rs:expr, $res:expr, gaps = $gaps:expr, $val:pat => $body:block) => {
-        $crate::commands::errors::finalize!(
-            @inner $ctx, $rs, $res, Some($gaps),
-            // Once per command, so a hook learns the run was incomplete even
-            // when it never sees the terminal.
-            |report: &$crate::engine::discovery::GapReport| $rs.emit(report.to_event()),
-            $val => $body
-        )
-    };
-    ($ctx:expr, $rs:expr, $res:expr $(,)?) => {
-        $crate::commands::errors::finalize!($ctx, $rs, $res, _ => { Ok(()) })
-    };
-    ($ctx:expr, $rs:expr, $res:expr, $val:pat => $body:block) => {
-        $crate::commands::errors::finalize!(
-            @inner $ctx, $rs, $res, None,
-            |_: &$crate::engine::discovery::GapReport| {},
-            $val => $body
-        )
-    };
+/// What [`finalize`] asks of the app context: [`AppContext`](crate::tui::AppContext)
+/// in a command, a fake in the tests, so the branch it takes can be driven
+/// without a terminal.
+pub(crate) trait FinalizeCtx {
+    fn interactive(&self) -> bool;
+    fn session(&self) -> &SessionSlot;
+    /// The failures the line backend printed as they failed.
+    async fn failures_printed(&self) -> HashSet<String>;
+    /// Pause the TUI until the returned guard drops ([`crate::tui::paused!`]).
+    async fn pause(&self) -> impl Sized;
 }
-pub(crate) use finalize;
+
+impl FinalizeCtx for crate::tui::AppContext {
+    fn interactive(&self) -> bool {
+        crate::tui::AppContext::interactive(self)
+    }
+    fn session(&self) -> &SessionSlot {
+        crate::tui::AppContext::session(self)
+    }
+    async fn failures_printed(&self) -> HashSet<String> {
+        crate::tui::AppContext::failures_printed(self).await
+    }
+    async fn pause(&self) -> impl Sized {
+        crate::tui::AppContext::pause(self).await
+    }
+}
+
+/// What [`finalize`] asks of the request: its failure registry and events.
+/// [`RequestState`](crate::engine::request_state::RequestState) in a command,
+/// a fake in the tests, so the branch it takes can be driven without an engine.
+pub(crate) trait FinalizeRequest {
+    async fn take_failures_with_logs_where(
+        &self,
+        wanted: impl Fn(&TargetFailure) -> bool,
+    ) -> Vec<Arc<TargetFailure>>;
+    fn emit(&self, kind: crate::engine::event::BuildEventKind);
+    fn took_down(&self, root: &str) -> crate::engine::request_state::TookDown;
+    fn was_cancelled(&self, addr: &str) -> bool;
+    fn heph_home(&self) -> Option<std::path::PathBuf>;
+}
+
+impl FinalizeRequest for Arc<crate::engine::request_state::RequestState> {
+    async fn take_failures_with_logs_where(
+        &self,
+        wanted: impl Fn(&TargetFailure) -> bool,
+    ) -> Vec<Arc<TargetFailure>> {
+        crate::engine::request_state::RequestState::take_failures_with_logs_where(self, wanted)
+            .await
+    }
+    fn emit(&self, kind: crate::engine::event::BuildEventKind) {
+        crate::engine::request_state::RequestState::emit(self, kind)
+    }
+    fn took_down(&self, root: &str) -> crate::engine::request_state::TookDown {
+        crate::engine::request_state::RequestState::took_down(self, root)
+    }
+    fn was_cancelled(&self, addr: &str) -> bool {
+        crate::engine::request_state::RequestState::was_cancelled(self, addr)
+    }
+    fn heph_home(&self) -> Option<std::path::PathBuf> {
+        crate::engine::request_state::RequestState::heph_home(self)
+    }
+}
+
+/// Paved-road command finalizer. The single construct every command ends with.
+///
+/// One place owns the awkward truth that a command's *outcome* lives in two
+/// channels: the per-request failure registry (rich, deduped `TargetFailure`s,
+/// recorded when a provider/driver runs a target) and the returned `res`. Given
+/// `ctx`, the request state `rs`, an engine `res`, and `body` (the success
+/// output), it resolves them (pausing the TUI only for the success/error output
+/// that prints inline):
+///
+/// - registry non-empty → exit with [`FailedTargets`]; interactive mode defers the
+///   render to `render_anyhow` (after the viewport is torn down), non-interactive
+///   mode renders here. The returned `res` is a collateral marker, dropped;
+/// - registry empty, `res` Ok → run `body` on the value, then exit `Ok` (or with
+///   the body's error);
+/// - registry empty, `res` Err → a cancellation exits `cancelled`; any other error
+///   is a genuine non-registry failure propagated to `render_anyhow`.
+///
+/// Commands whose outcome isn't a single `Result` (e.g. `run`'s fail-fast
+/// batch) fold it into one `res` before calling — a cancellation among batch
+/// errors becomes `Err(CancelledError)`. A command that prints incrementally
+/// and needs no end-of-run output passes `|_| Ok(())`.
+///
+/// One more outcome applies to a command whose walk ran
+/// [`Discovery::KeepGoing`](crate::engine::Discovery) and passes its sink as
+/// `gaps`: anything skipped — and the command not cancelled — emits one
+/// `SelectionIncomplete` event, renders the "incomplete selection" block after
+/// any failure boxes (and after a genuine error, the body's included), and
+/// exits non-zero even when the success body ran.
+pub(crate) async fn finalize<T>(
+    ctx: &impl FinalizeCtx,
+    rs: &impl FinalizeRequest,
+    res: anyhow::Result<T>,
+    gaps: Option<&Arc<crate::engine::Gaps>>,
+    body: impl FnOnce(T) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let cancelled = res.as_ref().err().is_some_and(is_cancelled);
+    let incomplete = take_failure_outcome(ctx, rs, gaps, cancelled).await?;
+    let printed: anyhow::Result<()> = crate::tui::paused!(ctx, {
+        match res {
+            Ok(val) => body(val),
+            // A cancellation is surfaced by `finish_exit`; any other error
+            // is a genuine non-registry failure → `render_anyhow`.
+            Err(e) if !cancelled => Err(e),
+            Err(_) => Ok(()),
+        }
+    });
+    match incomplete {
+        None => {
+            printed?;
+            finish_exit(cancelled)
+        }
+        // What matched was processed; the run still fails for what was not.
+        Some(report) => {
+            Err(IncompleteSelection::new(report, printed.err(), ctx.interactive()).into_error())
+        }
+    }
+}
+
+/// The part of [`finalize`] that does not depend on the command's success
+/// value: announce what `gaps` skipped, then take the request's failures.
+/// `Err` is the command's error when the registry holds any failure
+/// ([`FailedTargets`]); `Ok` carries the incomplete selection, if any, for the
+/// success path.
+async fn take_failure_outcome(
+    ctx: &impl FinalizeCtx,
+    rs: &impl FinalizeRequest,
+    gaps: Option<&Arc<crate::engine::Gaps>>,
+    cancelled: bool,
+) -> anyhow::Result<Option<crate::engine::discovery::GapReport>> {
+    let incomplete = gaps.and_then(|g| incomplete_selection(g, cancelled));
+    if let Some(report) = &incomplete {
+        // Once per command, so a hook learns the run was incomplete even
+        // when it never sees the terminal.
+        rs.emit(report.to_event());
+    }
+    // The failures the line backend printed as they failed, box rows
+    // included: their boxes are left out below. Asked before the
+    // failures are taken, so the answer covers every one of them; empty
+    // on the interactive backend, whose report is unchanged.
+    let printed_live = ctx.failures_printed().await;
+    // Each saying whether `heph log <addr>` would find its log: the
+    // report and the CI box point at it on the same answer. One printed
+    // live carried that answer then and is not asked again — but it is
+    // still taken, so the exit code and telemetry count it.
+    let failures = rs
+        .take_failures_with_logs_where(|f| !printed_live.contains(&f.addr.format()))
+        .await;
+    if failures.is_empty() {
+        return Ok(incomplete);
+    }
+    // The caller's `res` is a collateral marker here — dropped either way.
+    if ctx.interactive() {
+        // Do NOT render here: mid-run the TUI is only *paused*, so the
+        // resume re-anchor and the final viewport collapse would wipe the
+        // boxes off screen. Carry the failures out; `render_anyhow` in
+        // `main` prints them once the viewport is fully torn down.
+        // As the report: everything it reads from disk is read
+        // here, never at the render (two-mode TUI I7).
+        let home = rs.heph_home();
+        let report = ReportContext::gather(
+            &failures,
+            |addr| rs.took_down(addr),
+            |addr| rs.was_cancelled(addr),
+            home.as_deref(),
+        );
+        Err(FailedTargets::deferred(failures)
+            .with_incomplete(incomplete)
+            .with_report(report)
+            .into_error())
+    } else {
+        // No viewport, so nothing ever repaints stderr and there is no
+        // reason to defer. Print at the failure site: deferring to `main`
+        // would push the diagnostics behind the backend's end-of-run
+        // summary *and* its unbounded background-upload drain, invert the
+        // errors-then-verdict order every other build tool prints, and lose
+        // them entirely if a second ctrl-c aborts during that drain.
+        // (Interactive has no such choice — teardown must come first, so it
+        // necessarily prints verdict-then-errors.)
+        Err(
+            FailedTargets::reported_to_stderr(failures, incomplete, &printed_live, ctx.session())
+                .into_error(),
+        )
+    }
+}
 
 /// Map the cancelled flag to an exit result for the no-failures path. Registry
 /// failures never reach here — they exit as [`FailedTargets`].
@@ -710,7 +750,7 @@ impl FailedTargets {
         this
     }
 
-    /// [`FailedTargets::reported`] against the real stderr — what `finalize!` uses.
+    /// [`FailedTargets::reported`] against the real stderr — what `finalize` uses.
     /// What it printed is recorded in `session`, so an attached viewer prints
     /// the report too.
     pub fn reported_to_stderr(
@@ -741,7 +781,7 @@ impl FailedTargets {
         &self.failures
     }
 
-    /// Build the `anyhow::Error` that carries these failures out of `finalize!`.
+    /// Build the `anyhow::Error` that carries these failures out of `finalize`.
     ///
     /// A representative [`TargetFailure`] is the chain's root, with `FailedTargets`
     /// layered on top as context.
@@ -794,7 +834,7 @@ pub fn render_anyhow(e: &anyhow::Error, session: &SessionSlot) -> bool {
 /// `Some("")` is a deliberate case: [`FailedTargets::reported`] already
 /// printed at the failure site, so the error is handled but adds no output.
 fn render_anyhow_to_string(e: &anyhow::Error, color: bool) -> Option<String> {
-    // Registry failures from `finalize!`. Interactive runs deferred their render
+    // Registry failures from `finalize`. Interactive runs deferred their render
     // to here — the viewport is torn down and nothing repaints over stderr now.
     if let Some(ft) = downcast_chain_ref::<FailedTargets>(e) {
         // An empty set is not a failure anyone can act on: claim nothing so the
@@ -908,7 +948,7 @@ mod tests {
         assert!(finish_exit(false).is_ok());
     }
 
-    /// Two registry failures, wrapped in a context frame the way `finalize!`'s
+    /// Two registry failures, wrapped in a context frame the way `finalize`'s
     /// caller chain wraps them.
     fn two_failures() -> Vec<Arc<TargetFailure>> {
         let a = crate::htaddr::parse_addr("//simple_fail:d1").unwrap();
@@ -923,7 +963,7 @@ mod tests {
     fn render_anyhow_reproduces_every_deferred_failure_box() {
         // Regression: in interactive TUI mode the registry failures used to be
         // printed mid-run inside a `paused!` block, where the resume re-anchor +
-        // final viewport collapse wiped them. `finalize!` now carries them out and
+        // final viewport collapse wiped them. `finalize` now carries them out and
         // `render_anyhow` (called post-teardown in `main`) reproduces the boxes.
         //
         // Asserting the exact bytes is the point: a `render_anyhow(&e) == true`
@@ -969,7 +1009,7 @@ mod tests {
 
     #[test]
     fn empty_failed_targets_is_not_claimed_as_handled() {
-        // `finalize!` guards on a non-empty registry, so this is latent — but an
+        // `finalize` guards on a non-empty registry, so this is latent — but an
         // empty set used to render nothing *and* report itself handled, which is a
         // non-zero exit with no output at all. Fall through to `main`'s log instead.
         let e = FailedTargets::deferred(vec![]).into_error();
@@ -998,10 +1038,9 @@ mod tests {
         );
     }
 
-    /// `finalize!` is duck-typed over the app context and the request state — it
-    /// only ever calls `interactive()`, `session()`, `pause()` and
-    /// `take_failures()` — so the
-    /// branch it takes can be driven without an engine or a terminal.
+    /// `finalize` takes the app context and the request state through
+    /// [`FinalizeCtx`] and [`FinalizeRequest`], so the branch it takes can be
+    /// driven without an engine or a terminal.
     struct FakeCtx {
         interactive: bool,
         pauses: std::cell::Cell<usize>,
@@ -1025,6 +1064,9 @@ mod tests {
             self.printed_live = addrs.iter().map(|a| (*a).to_owned()).collect();
             self
         }
+    }
+
+    impl FinalizeCtx for FakeCtx {
         fn interactive(&self) -> bool {
             self.interactive
         }
@@ -1034,7 +1076,7 @@ mod tests {
         fn session(&self) -> &crate::tui::session::SessionSlot {
             &self.session
         }
-        async fn pause(&self) -> FakeGuard {
+        async fn pause(&self) -> impl Sized {
             self.pauses.set(self.pauses.get() + 1);
             FakeGuard
         }
@@ -1101,7 +1143,7 @@ mod tests {
         assert!(fold_batch(batch).is_ok());
     }
 
-    /// All-cancelled collapses to the cancellation `finalize!` recognises…
+    /// All-cancelled collapses to the cancellation `finalize` recognises…
     #[test]
     fn fold_batch_collapses_pure_cancellation() {
         let batch = crate::engine::BatchResult {
@@ -1142,6 +1184,9 @@ mod tests {
                 Vec::new(),
             )
         }
+    }
+
+    impl FinalizeRequest for FakeRs {
         /// No engine to ask: every failure as recorded, wanted or not, as
         /// the real one returns them once the engine is gone.
         async fn take_failures_with_logs_where(
@@ -1215,7 +1260,9 @@ mod tests {
             let rs = FakeRs::new(vec![]);
             let gaps = some_gaps();
             let res: anyhow::Result<u8> = Ok(1);
-            let e = finalize!(ctx, rs, res, gaps = &gaps).unwrap_err();
+            let e = finalize(&ctx, &rs, res, Some(&gaps), |_| Ok(()))
+                .await
+                .unwrap_err();
             let inc = downcast_chain_ref::<IncompleteSelection>(&e).expect("incomplete");
             assert_eq!(inc.rendered, !interactive);
             assert_eq!(inc.report.skipped, 8);
@@ -1232,6 +1279,36 @@ mod tests {
         Ok(())
     }
 
+    /// A body that fails on an incomplete selection does not end the command
+    /// on its own error: the skips still fail it, as [`IncompleteSelection`],
+    /// with the body's error as the cause rendered above the block.
+    #[tokio::test]
+    async fn incomplete_selection_wraps_a_body_error() -> anyhow::Result<()> {
+        let ctx = FakeCtx::new(true);
+        let rs = FakeRs::new(vec![]);
+        let gaps = some_gaps();
+        let res: anyhow::Result<u8> = Ok(1);
+        let e = finalize(&ctx, &rs, res, Some(&gaps), |_| {
+            anyhow::bail!("writing --copy-out")
+        })
+        .await
+        .unwrap_err();
+        let inc = downcast_chain_ref::<IncompleteSelection>(&e).expect("incomplete");
+        assert_eq!(inc.report.skipped, 8);
+        let cause = inc.cause.as_ref().expect("the body's error is the cause");
+        assert_eq!(cause.to_string(), "writing --copy-out");
+        assert_eq!(ctx.pauses.get(), 1, "the body ran with the TUI paused");
+        assert_eq!(rs.1.borrow().len(), 1, "one SelectionIncomplete event");
+        let out = render_anyhow_to_string(&e, false).expect("claimed");
+        let cause_at = out.find("writing --copy-out").expect("cause rendered");
+        let block_at = out.find("! selection incomplete").expect("block rendered");
+        assert!(
+            cause_at < block_at,
+            "the cause renders above the block: {out}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn empty_match_with_skips_reports_the_skips() {
         let empty = crate::engine::Gaps::new("//...");
@@ -1241,7 +1318,7 @@ mod tests {
         assert!(err.to_string().contains("no targets matched"), "{err}");
         assert!(
             require_non_empty_unless_incomplete(vec![], &some_gaps()).is_ok(),
-            "the skips are the answer; `finalize!` reports them"
+            "the skips are the answer; `finalize` reports them"
         );
     }
 
@@ -1260,7 +1337,9 @@ mod tests {
         let mut rs = FakeRs::new(failures);
         rs.2.push("//simple_fail:stopped");
         let res: anyhow::Result<()> = Err(anyhow::Error::new(CancelledError));
-        let e = finalize!(ctx, rs, res).unwrap_err();
+        let e = finalize(&ctx, &rs, res, None, |_| Ok(()))
+            .await
+            .unwrap_err();
         let out = render_anyhow_to_string(&e, false).expect("claimed");
         assert!(out.contains("\n✗ //simple_fail:d1\n  │ boom a\n"), "{out}");
         assert!(out.contains("\n✗ //simple_fail:d2\n  │ boom b\n"), "{out}");
@@ -1281,7 +1360,9 @@ mod tests {
         let mut rs = FakeRs::new(failures);
         rs.2.push("//simple_fail:stopped");
         let res: anyhow::Result<()> = Err(anyhow::Error::new(CancelledError));
-        let e = finalize!(ctx, rs, res).unwrap_err();
+        let e = finalize(&ctx, &rs, res, None, |_| Ok(()))
+            .await
+            .unwrap_err();
         let out = render_anyhow_to_string(&e, false).unwrap_or_default();
         assert!(!out.contains("✗"), "{out}");
         assert!(!out.contains("stopped"), "{out}");
@@ -1294,7 +1375,9 @@ mod tests {
         let rs = FakeRs::new(two_failures());
         let gaps = some_gaps();
         let res: anyhow::Result<u8> = Ok(1);
-        let e = finalize!(ctx, rs, res, gaps = &gaps).unwrap_err();
+        let e = finalize(&ctx, &rs, res, Some(&gaps), |_| Ok(()))
+            .await
+            .unwrap_err();
         let out = render_anyhow_to_string(&e, false).expect("claimed");
         // Interactive: the report's blocks, not the boxes.
         let boxes = out.find("\n✗ ").expect("report blocks first");
@@ -1309,7 +1392,9 @@ mod tests {
         let ctx = FakeCtx::new(true);
         let rs = FakeRs::new(vec![]);
         let res: anyhow::Result<u8> = Ok(1);
-        let e = finalize!(ctx, rs, res, gaps = &gaps).unwrap_err();
+        let e = finalize(&ctx, &rs, res, Some(&gaps), |_| Ok(()))
+            .await
+            .unwrap_err();
         let out = render_anyhow_to_string(&e, false).expect("claimed");
         assert!(!out.contains("Target failures above"), "{out}");
         Ok(())
@@ -1323,7 +1408,9 @@ mod tests {
         let rs = FakeRs::new(vec![]);
         let gaps = some_gaps();
         let res: anyhow::Result<u8> = Err(anyhow::anyhow!("boom"));
-        let e = finalize!(ctx, rs, res, gaps = &gaps).unwrap_err();
+        let e = finalize(&ctx, &rs, res, Some(&gaps), |_| Ok(()))
+            .await
+            .unwrap_err();
         let out = render_anyhow_to_string(&e, false).expect("claimed");
         let boom = out.find("boom").expect("the error");
         let block = out.find("! selection incomplete").expect("the block");
@@ -1387,7 +1474,9 @@ mod tests {
         let rs = FakeRs::new(vec![]);
         let gaps = some_gaps();
         let res: anyhow::Result<u8> = Err(anyhow::Error::new(CancelledError));
-        let e = finalize!(ctx, rs, res, gaps = &gaps).unwrap_err();
+        let e = finalize(&ctx, &rs, res, Some(&gaps), |_| Ok(()))
+            .await
+            .unwrap_err();
         assert_eq!(e.to_string(), "cancelled");
         assert!(rs.1.borrow().is_empty());
         Ok(())
@@ -1402,7 +1491,9 @@ mod tests {
         let ctx = FakeCtx::new(true);
         let rs = FakeRs::new(two_failures());
         let res: anyhow::Result<u8> = Ok(1);
-        let e = finalize!(ctx, rs, res, _v => { Ok(()) }).unwrap_err();
+        let e = finalize(&ctx, &rs, res, None, |_| Ok(()))
+            .await
+            .unwrap_err();
         let ft = downcast_chain_ref::<FailedTargets>(&e).expect("carried out");
         assert!(!ft.rendered, "interactive defers to render_anyhow");
         assert_eq!(ft.failures().len(), 2);
@@ -1413,7 +1504,9 @@ mod tests {
         let ctx = FakeCtx::new(false);
         let rs = FakeRs::new(two_failures());
         let res: anyhow::Result<u8> = Ok(1);
-        let e = finalize!(ctx, rs, res, _v => { Ok(()) }).unwrap_err();
+        let e = finalize(&ctx, &rs, res, None, |_| Ok(()))
+            .await
+            .unwrap_err();
         let ft = downcast_chain_ref::<FailedTargets>(&e).expect("carried out");
         assert!(
             ft.rendered,
@@ -1433,7 +1526,9 @@ mod tests {
             let ctx = FakeCtx::new(interactive);
             let rs = FakeRs::new(two_failures());
             let res: anyhow::Result<u8> = Err(anyhow::Error::new(CancelledError));
-            let e = finalize!(ctx, rs, res, _v => { Ok(()) }).unwrap_err();
+            let e = finalize(&ctx, &rs, res, None, |_| Ok(()))
+                .await
+                .unwrap_err();
             assert!(
                 downcast_chain_ref::<FailedTargets>(&e).is_some(),
                 "interactive={interactive}: failures outrank the cancellation"
@@ -1449,7 +1544,12 @@ mod tests {
         let rs = FakeRs::new(vec![]);
         let res: anyhow::Result<u8> = Ok(7);
         let mut got = 0;
-        finalize!(ctx, rs, res, v => { got = v; Ok(()) }).unwrap();
+        finalize(&ctx, &rs, res, None, |v| {
+            got = v;
+            Ok(())
+        })
+        .await
+        .unwrap();
         assert_eq!(got, 7, "the success value reaches the body");
         assert_eq!(
             ctx.pauses.get(),
@@ -1466,7 +1566,12 @@ mod tests {
         let rs = FakeRs::new(vec![]);
         let res: anyhow::Result<u8> = Err(anyhow::Error::new(CancelledError));
         let mut ran = false;
-        let e = finalize!(ctx, rs, res, _v => { ran = true; Ok(()) }).unwrap_err();
+        let e = finalize(&ctx, &rs, res, None, |_| {
+            ran = true;
+            Ok(())
+        })
+        .await
+        .unwrap_err();
         assert_eq!(e.to_string(), "cancelled");
         assert!(!ran);
         Ok(())
@@ -1605,7 +1710,7 @@ mod tests {
         assert!(boxed.contains("  log: heph log //web:lint\n"), "{boxed}");
     }
 
-    /// `finalize!` on the line backend asks which failures were printed live
+    /// `finalize` on the line backend asks which failures were printed live
     /// before taking them: a failure printed live is taken all the same, so
     /// the run still exits non-zero for it.
     #[tokio::test]
@@ -1613,7 +1718,9 @@ mod tests {
         let ctx = FakeCtx::new(false).printed_live(&["//simple_fail:d1", "//simple_fail:d2"]);
         let rs = FakeRs::new(two_failures());
         let res: anyhow::Result<u8> = Ok(1);
-        let e = finalize!(ctx, rs, res, _v => { Ok(()) }).unwrap_err();
+        let e = finalize(&ctx, &rs, res, None, |_| Ok(()))
+            .await
+            .unwrap_err();
         let ft = downcast_chain_ref::<FailedTargets>(&e).expect("carried out");
         assert!(ft.rendered);
         assert_eq!(ft.failures().len(), 2);

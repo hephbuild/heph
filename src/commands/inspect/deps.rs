@@ -57,12 +57,13 @@ async fn execute_async(
             // `get_def` may run provider targets, recording rich failures in `rs`;
             // `finalize` prefers those over the returned error and prints on success.
             let res = Arc::clone(&engine).get_def(rs.clone(), &addr).await;
-            crate::commands::errors::finalize!(ctx, rs, res, def => {
+            crate::commands::errors::finalize(&ctx, &rs, res, None, |def| {
                 for input in &def.target_def.inputs {
                     println!("{}", input.r#ref);
                 }
                 Ok(())
             })
+            .await
         },
     )
     .await

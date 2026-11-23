@@ -46,11 +46,12 @@ async fn execute_async(
             // `get_spec` may run provider targets, recording rich failures in `rs`;
             // `finalize` prefers those over the returned error and prints on success.
             let res = Arc::clone(&engine).get_spec(rs.clone(), &addr).await;
-            crate::commands::errors::finalize!(ctx, rs, res, spec => {
+            crate::commands::errors::finalize(&ctx, &rs, res, None, |spec| {
                 let json = serde_json::to_string_pretty(&*spec).context("serialize spec")?;
                 println!("{json}");
                 Ok(())
             })
+            .await
         },
     )
     .await

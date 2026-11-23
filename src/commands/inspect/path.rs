@@ -57,7 +57,7 @@ async fn execute_async(
             let res = Arc::clone(&engine)
                 .dep_path_between(rs.clone(), a, b, no_transitive)
                 .await;
-            crate::commands::errors::finalize!(ctx, rs, res, chain => {
+            crate::commands::errors::finalize(&ctx, &rs, res, None, |chain| {
                 match chain {
                     // The chain reads dependent → dependency whichever way the
                     // arguments were given, so the direction is visible in the output.
@@ -72,6 +72,7 @@ async fn execute_async(
                 }
                 Ok(())
             })
+            .await
         },
     )
     .await

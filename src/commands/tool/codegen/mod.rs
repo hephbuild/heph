@@ -252,13 +252,14 @@ where
             };
             out.close().await;
             let res = res.and(code);
-            crate::commands::errors::finalize!(ctx, rs, res, code => {
+            crate::commands::errors::finalize(&ctx, &rs, res, None, |code| {
                 if code == 0 {
                     Ok(())
                 } else {
                     Err(CodegenExit { code, error: None }.into())
                 }
             })
+            .await
         },
     ))
     .and_then(|r| r);

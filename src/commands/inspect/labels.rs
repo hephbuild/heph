@@ -85,7 +85,7 @@ async fn execute_async(
             .await;
             out.close().await;
 
-            crate::commands::errors::finalize!(ctx, rs, res, gaps = &gaps)
+            crate::commands::errors::finalize(&ctx, &rs, res, Some(&gaps), |_| Ok(())).await
         },
     )
     .await

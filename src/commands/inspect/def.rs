@@ -76,7 +76,7 @@ async fn execute_async(
             } else {
                 Arc::clone(&engine).get_def(rs.clone(), &addr).await
             };
-            crate::commands::errors::finalize!(ctx, rs, res, def => {
+            crate::commands::errors::finalize(&ctx, &rs, res, None, |def| {
                 let view = DefView {
                     runs_as: runs_as(&def.driver, &def.target_def),
                     target_def: &def.target_def,
@@ -86,6 +86,7 @@ async fn execute_async(
                 println!("{json}");
                 Ok(())
             })
+            .await
         },
     )
     .await

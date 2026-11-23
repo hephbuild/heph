@@ -58,12 +58,13 @@ async fn execute_async(
                     },
                 )
                 .await;
-            crate::commands::errors::finalize!(ctx, rs, res, result => {
+            crate::commands::errors::finalize(&ctx, &rs, res, None, |result| {
                 for art in &result.artifacts_meta {
                     println!("{}", art.hashout);
                 }
                 Ok(())
             })
+            .await
         },
     )
     .await

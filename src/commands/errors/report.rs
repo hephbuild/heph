@@ -13,7 +13,7 @@
 //!
 //! Everything that touches the filesystem — the log tail, the walk of the
 //! kept `failure_out` files, resolving the home — happens in
-//! [`ReportContext::gather`], called where `finalize!` builds the error, so
+//! [`ReportContext::gather`], called where `finalize` builds the error, so
 //! rendering is pure and never waits on a disk.
 
 use std::collections::HashMap;
