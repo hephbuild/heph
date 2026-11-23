@@ -20,6 +20,7 @@ posthog-rs = "1.3.0"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
 tracing = "0.1"
 clap = { version = "4.6.9", features = ["derive"] }
+# Held at the release r2d2_sqlite is built against (see crates/walk/Cargo.toml).
 rusqlite = { version = "0.42", features = ["bundled", "blob"] }
 tokio = { version = "1.54.1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "fs"] }
 libc = "0.2"

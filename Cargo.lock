@@ -423,7 +423,6 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "tempfile",
- "testkit",
  "tokio",
 ]
 
@@ -699,14 +698,12 @@ dependencies = [
  "enclose",
  "futures",
  "glob",
- "itertools 0.15.0",
  "model",
  "parking_lot 0.13.0",
  "plugin",
  "rustc-hash",
  "serde",
  "serde_json",
- "serde_yaml",
  "tempfile",
  "template",
  "tokio",
@@ -714,7 +711,6 @@ dependencies = [
  "walk",
  "wax",
  "which",
- "xattr",
  "xxhash-rust",
 ]
 
@@ -1737,7 +1733,6 @@ dependencies = [
  "model",
  "plugin",
  "proc",
- "serde",
  "serde_json",
  "tar",
  "tempfile",
@@ -1902,7 +1897,6 @@ dependencies = [
  "glob",
  "google-cloud-auth",
  "hex",
- "humantime",
  "indexmap 2.14.2",
  "libc",
  "lock",
@@ -1927,12 +1921,10 @@ dependencies = [
  "rustls",
  "sandboxfuse",
  "serde",
- "serde-jsonlines",
  "serde_json",
  "serde_yaml",
  "sha2 0.11.1",
  "similar",
- "smart-default",
  "sqlite",
  "stacker",
  "strsim 0.11.1",
@@ -2143,7 +2135,6 @@ dependencies = [
  "hex",
  "reqwest",
  "sha2 0.11.1",
- "tempfile",
  "tokio",
 ]
 
@@ -2810,85 +2801,54 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 name = "heph"
 version = "0.1.0"
 dependencies = [
- "ansi-to-tui",
  "anyhow",
- "async-recursion",
- "async-stream",
  "async-trait",
- "borsh",
  "builtins",
  "chrono",
  "clap",
  "clap_complete",
  "core",
  "coreutils",
- "crossbeam-channel",
  "crossterm",
- "driver-support",
  "enclose",
  "engine",
- "erased-serde 0.4.11",
  "execrunner",
- "flate2",
  "futures",
  "glob",
- "htspec-derive",
  "humantime",
- "indexmap 2.14.2",
- "itertools 0.15.0",
  "libc",
  "lock",
  "mach2",
  "mimalloc",
- "minijinja",
  "model",
- "nom 8.0.0",
  "object_store",
- "parking_lot 0.13.0",
  "plugin",
  "plugin-buildfile",
- "plugin-devenv",
  "plugin-exec",
  "plugin-http",
  "plugin-nix",
  "plugin-query",
  "plugin-stabby",
- "posthog-rs",
  "pprof",
  "proc",
- "proto-gen",
- "quick_cache",
- "r2d2",
- "r2d2_sqlite",
  "ratatui",
- "rusqlite",
- "rustc-hash",
  "sandboxfuse",
  "selfupdate",
  "serde",
- "serde-jsonlines",
  "serde_json",
  "serde_yaml",
  "shlex",
- "similar",
- "smart-default",
- "stacker",
  "tar",
  "telemetry",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
- "tokio-util",
  "tracing",
  "tracing-log",
  "tracing-subscriber",
  "tui",
- "unicode-width 0.2.3",
  "url",
- "uuid",
  "walk",
- "walkdir",
- "wax",
  "which",
  "xattr",
  "xstarlark-fmt",
@@ -5251,7 +5211,6 @@ dependencies = [
  "model",
  "serde",
  "serde_json",
- "serde_yaml",
  "smart-default",
  "tempfile",
  "tokio",
@@ -5328,7 +5287,6 @@ dependencies = [
  "serde_yaml",
  "tempfile",
  "tokio",
- "tracing",
  "xxhash-rust",
 ]
 
@@ -5337,7 +5295,6 @@ name = "plugin-devenv-cdylib"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "plugin",
  "plugin-devenv",
  "plugin-sdk",
  "stabby",
@@ -5551,7 +5508,6 @@ name = "plugin-query"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-trait",
  "builtins",
  "core",
  "futures",
@@ -6737,16 +6693,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "serde-jsonlines"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "013e069239d98648ea43a9c01845b381445e88de08b5a895ef9302e3bffde03d"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "serde_core"
 version = "1.0.229"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7626,7 +7572,6 @@ dependencies = [
  "execrunner",
  "heph",
  "tempfile",
- "tokio",
 ]
 
 [[package]]
@@ -9057,7 +9002,6 @@ dependencies = [
  "lsp-types",
  "regex",
  "serde",
- "serde_json",
  "starlark",
  "starlark_syntax",
  "textwrap",
@@ -9113,7 +9057,6 @@ dependencies = [
  "anyhow",
  "borsh",
  "config",
- "glob",
  "ignore",
  "model",
  "parking_lot 0.13.0",

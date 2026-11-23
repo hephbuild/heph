@@ -49,3 +49,7 @@ src/definition.rs
 src/lib.rs
   - `definition` is a public module; `uri` is new (see above); `test` is not
     vendored.
+
+Cargo.toml
+  - No `serde_json` dependency: none of the vendored code uses it once the
+    server loop is gone.

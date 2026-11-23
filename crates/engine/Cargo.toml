@@ -72,7 +72,7 @@ rayon = "1.12.0"
 # gzip/brotli features → responses are not auto-decompressed (cache blobs stay
 # raw).
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls", "http2", "stream"] }
-# Held at the release r2d2_sqlite is built against (see the root Cargo.toml).
+# Held at the release r2d2_sqlite is built against (see crates/walk/Cargo.toml).
 rusqlite = { version = "0.42", features = ["bundled", "blob"] }
 rustc-hash = "2"
 # `statvfs` and `access` for `heph tool gc`'s cache.db conversion space check;
@@ -91,7 +91,6 @@ sha2 = "0.11"
 hex = "0.4"
 serde_yaml = "0.9"
 similar = "3"
-smart-default = "0.7.1"
 stacker = "0.1"
 strsim = "0.11.1"
 tar = "0.4"
@@ -107,11 +106,9 @@ thiserror = "2.0.21"
 libc = "0.2"
 xattr = "1"
 tempfile = "3.27"
-humantime = "2.4.0"
 
 [dev-dependencies]
 hplugin-buildfile = { package = "plugin-buildfile", path = "../plugin-buildfile" }
-serde-jsonlines = "0.7.0"
 tempfile = "3"
 # The paused clock (`start_paused`, `time::advance`), for tests only.
 tokio = { version = "1.54.1", features = ["test-util"] }
