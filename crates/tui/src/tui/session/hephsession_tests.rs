@@ -160,7 +160,6 @@ fn a_foreign_file_is_never_written() {
         .execute("DELETE FROM records", [])
         .expect_err("a foreign recording is read-only");
     assert!(err.to_string().contains("readonly") || err.to_string().contains("read-only"));
-    assert_eq!(session_id(&opened), session_id(&opened));
     assert_eq!(case.files(), ["ro.hephsession"]);
 }
 
@@ -322,6 +321,34 @@ fn a_sqlite_file_must_be_a_known_recording() {
             );
         }
         other => panic!("expected too new, got {other:?}"),
+    }
+}
+
+/// `open` on another thread, failing the test if it does not return within
+/// five seconds (a FIFO with no writer blocks a plain open forever).
+fn open_bounded(path: PathBuf, tmp: PathBuf) -> Option<Result<ForeignFile, ForeignError>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || drop(tx.send(open(&path, &tmp))));
+    rx.recv_timeout(std::time::Duration::from_secs(5)).ok()
+}
+
+/// Anything but a regular file (after symlinks) is not a session, refused
+/// without blocking: a FIFO, a directory, `.` and `..`.
+#[test]
+fn a_non_regular_file_is_not_a_session() {
+    let case = Case::new();
+    let fifo = case.dir.path().join("fifo.hephsession");
+    let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).expect("cstr");
+    // SAFETY: `c` is a valid NUL-terminated path for the call.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo");
+    let dir = case.dir.path().join("dir.hephsession");
+    std::fs::create_dir(&dir).expect("mkdir");
+    let link = case.dir.path().join("link.hephsession");
+    std::os::unix::fs::symlink(&fifo, &link).expect("symlink");
+    for path in [fifo, dir, link, PathBuf::from("."), PathBuf::from("..")] {
+        let opened = open_bounded(path.clone(), case.tmp()).expect("opening it hung");
+        let why = not_a_session_why(opened);
+        assert!(why.contains("not a regular file"), "{}: {why}", path.display());
     }
 }
 

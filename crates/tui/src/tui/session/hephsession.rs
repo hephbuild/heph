@@ -141,7 +141,7 @@ pub(crate) fn open_capped(
     let io_err = |what: &str, e: io::Error| {
         ForeignError::Io(anyhow::Error::new(e).context(format!("{what} {}", path.display())))
     };
-    let mut file = File::open(path).map_err(|e| io_err("open", e))?;
+    let mut file = open_regular(path).map_err(|e| io_err("open", e))??;
     let lead = read_lead(&mut file).map_err(|e| io_err("read", e))?;
     let decompressed = match sniff(&lead) {
         Sniffed::Sqlite => None,
@@ -165,6 +165,35 @@ pub(crate) fn open_capped(
         source: path.to_path_buf(),
         _decompressed: decompressed,
     })
+}
+
+/// `path` opened for reading if it is a regular file (after symlinks), and
+/// not a session otherwise. Opened non-blocking and checked on the open
+/// descriptor: a FIFO with no writer would block a plain open forever, and a
+/// check before the open could be raced. On a regular file `O_NONBLOCK`
+/// changes nothing.
+fn open_regular(path: &Path) -> io::Result<Result<File, ForeignError>> {
+    use std::os::unix::fs::{FileTypeExt as _, OpenOptionsExt as _};
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)?;
+    let kind = file.metadata()?.file_type();
+    if kind.is_file() {
+        return Ok(Ok(file));
+    }
+    let what = if kind.is_dir() {
+        "a directory"
+    } else if kind.is_fifo() {
+        "a FIFO"
+    } else if kind.is_socket() {
+        "a socket"
+    } else if kind.is_char_device() || kind.is_block_device() {
+        "a device"
+    } else {
+        "something else"
+    };
+    Ok(Err(not_a_session(format!("it is not a regular file but {what}"))))
 }
 
 /// Up to the first 16 bytes of `r`: fewer only at end of file.
