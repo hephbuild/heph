@@ -17,6 +17,11 @@ impl PkgBuf {
         &self.0
     }
 
+    /// The package path, without copying it.
+    pub fn into_string(self) -> String {
+        self.0
+    }
+
     pub fn components(&self) -> impl Iterator<Item = &str> {
         self.0.split('/').filter(|s| !s.is_empty())
     }

@@ -117,7 +117,7 @@ pub(crate) fn merge_packages(
     // reorder this merge: the fold runs over `per_provider` in
     // provider-registration order, exactly as the serial loop did,
     // regardless of which walk finished first.
-    let mut seen: FxHashSet<String> = FxHashSet::default();
+    let mut seen: FxHashSet<&str> = FxHashSet::default();
 
     // A whole-graph selector rejects nothing, so skip the check rather than
     // build a `PkgBuf` per package to be told so — `//...` is the single
@@ -129,7 +129,7 @@ pub(crate) fn merge_packages(
 
     for pkgs in per_provider {
         for p in pkgs.iter() {
-            if !seen.insert(p.clone()) {
+            if !seen.insert(p.as_str()) {
                 continue;
             }
             if scoped && m.matches_pkg(&PkgBuf::from(p.as_str())) == htmatcher::MatchResult::MatchNo
@@ -195,7 +195,7 @@ impl Engine {
                                 .await?;
                             let mut pkgs = Vec::new();
                             for res in it {
-                                pkgs.push(res?.pkg.to_string());
+                                pkgs.push(res?.pkg.into_string());
                             }
                             // Canonicalize the provider's block rather than
                             // trusting it to be ordered — see `packages`'
