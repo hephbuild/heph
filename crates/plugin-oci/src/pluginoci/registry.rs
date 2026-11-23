@@ -342,7 +342,7 @@ fn select_entries(
         let hit = index.manifests.iter().find(|e| {
             e.platform
                 .as_ref()
-                .is_some_and(|p| p.os.to_string() == os && p.architecture.to_string() == arch)
+                .is_some_and(|p| super::is_os_arch(p, os, arch))
         });
         match hit {
             Some(entry) => out.push(entry.clone()),

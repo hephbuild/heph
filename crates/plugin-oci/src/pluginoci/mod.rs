@@ -132,7 +132,8 @@ pub(crate) fn select_platform(
     for (manifest, p, digest) in manifests {
         let Some(p) = p else { continue };
         available.push(format!("{}/{}", p.os, p.architecture));
-        if p.os.to_string() == os && p.architecture.to_string() == arch {
+        // The first match wins.
+        if is_os_arch(&p, os, arch) {
             return Ok((manifest, digest));
         }
     }
@@ -229,6 +230,14 @@ pub(crate) fn split_platform(platform: &str) -> anyhow::Result<(&str, &str)> {
         _ => anyhow::bail!("`platform` must look like `os/arch`, got {platform:?}"),
     }
 }
+
+/// Whether an index entry's `platform` is the `os`/`arch` pair
+/// [`split_platform`] returned. The variant is not compared, for the reason
+/// given there. Which match wins when several do is the caller's policy.
+pub(crate) fn is_os_arch(platform: &oci_client::manifest::Platform, os: &str, arch: &str) -> bool {
+    platform.os.to_string() == os && platform.architecture.to_string() == arch
+}
+
 /// All paths a Dep input materialized into the sandbox, read from its `.list`
 /// file (one absolute path per line — see `driver_managed.rs::list_path_for`).
 ///

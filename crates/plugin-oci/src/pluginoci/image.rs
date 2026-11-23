@@ -59,7 +59,9 @@ use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3Default;
 
 use super::archive::{self, Blob, Blobs};
-use super::{ImageFormat, dep_files, layout_path, normalize_platform, split_platform, ws_path};
+use super::{
+    ImageFormat, dep_files, is_os_arch, layout_path, normalize_platform, split_platform, ws_path,
+};
 
 /// Media type of an uncompressed layer. See [`super::layer`] for why layers are
 /// not gzipped.
@@ -351,12 +353,21 @@ fn build_config(
     serde_json::to_vec(&Value::Object(config)).context("encode the image config")
 }
 
+/// The `base` image, its manifests listed once for every platform built on it.
+struct BaseImage {
+    layout: archive::Layout,
+    manifests: Vec<(
+        oci_client::manifest::OciImageManifest,
+        Option<oci_client::manifest::Platform>,
+        String,
+    )>,
+}
+
 /// The base's per-platform pieces, or an empty contribution when there is none.
-fn base_for(layout: Option<&archive::Layout>, platform: &str) -> anyhow::Result<BaseFor> {
-    let Some(layout) = layout else {
+fn base_for(base: Option<&BaseImage>, platform: &str) -> anyhow::Result<BaseFor> {
+    let Some(BaseImage { layout, manifests }) = base else {
         return Ok(BaseFor::default());
     };
-    let manifests = layout.manifests()?;
     anyhow::ensure!(
         !manifests.is_empty(),
         "`base` holds no manifests; it is not an image"
@@ -365,11 +376,13 @@ fn base_for(layout: Option<&archive::Layout>, platform: &str) -> anyhow::Result<
 
     let mut available = Vec::new();
     let mut chosen = None;
-    for (manifest, p, _) in &manifests {
+    for (manifest, p, _) in manifests {
         match p {
             Some(p) => {
                 available.push(format!("{}/{}", p.os, p.architecture));
-                if p.os.to_string() == os && p.architecture.to_string() == arch {
+                // The last match wins (`select_platform` keeps the first);
+                // kept as it was when the matcher was shared.
+                if is_os_arch(p, os, arch) {
                     chosen = Some(manifest);
                 }
             }
@@ -644,13 +657,14 @@ impl ManagedDriver for Driver {
         let def = req.request.target.def_de::<OciImageDef>().clone();
         let out_path = req.sandbox_pkg_dir.join(super::basename(&def.out)?);
 
-        let base_layout = match &def.base {
+        let base_image = match &def.base {
             Some(_) => {
                 let path = layout_path(&req, BASE_ORIGIN, "`base`")?;
-                Some(
-                    archive::Layout::read(&path)
-                        .with_context(|| format!("read the base image at {path:?}"))?,
-                )
+                let layout = archive::Layout::read(&path)
+                    .with_context(|| format!("read the base image at {path:?}"))?;
+                // Once, not once per platform: listing reads every manifest.
+                let manifests = layout.manifests()?;
+                Some(BaseImage { layout, manifests })
             }
             None => None,
         };
@@ -659,7 +673,7 @@ impl ManagedDriver for Driver {
         let mut entries: Vec<ImageIndexEntry> = Vec::new();
 
         for platform in &def.platforms {
-            let base = base_for(base_layout.as_ref(), platform)?;
+            let base = base_for(base_image.as_ref(), platform)?;
             for (digest, blob) in &base.blobs {
                 blobs.insert(digest.clone(), blob.clone());
             }
@@ -1057,6 +1071,77 @@ mod tests {
                 && text.find(r#""M=3""#) < text.find(r#""Z=1""#),
             "env must be sorted: {text}"
         );
+    }
+
+    /// Two instances filed under the same os/arch (`linux/arm`, variants v6
+    /// and v7), told apart by their configs' diff_ids. Returns the layout and
+    /// the two manifest digests, in index order.
+    fn same_platform_twice() -> (archive::Layout, [String; 2]) {
+        let mut blobs = Blobs::new();
+        let mut entries = Vec::new();
+        let mut digests = Vec::new();
+        for (variant, diff_id) in [("v6", "sha256:first"), ("v7", "sha256:second")] {
+            let config = serde_json::to_vec(&json!({
+                "architecture": "arm",
+                "os": "linux",
+                "rootfs": {"type": "layers", "diff_ids": [diff_id]},
+            }))
+            .expect("encode config");
+            let config_digest = archive::sha256_digest(&config);
+            let manifest = serde_json::to_vec(&json!({
+                "schemaVersion": 2,
+                "mediaType": oci_client::manifest::OCI_IMAGE_MEDIA_TYPE,
+                "config": {
+                    "mediaType": CONFIG_MEDIA_TYPE,
+                    "digest": config_digest,
+                    "size": config.len(),
+                },
+                "layers": [],
+            }))
+            .expect("encode manifest");
+            let digest = archive::sha256_digest(&manifest);
+            entries.push(archive::image_manifest_entry(
+                digest.clone(),
+                manifest.len() as i64,
+                Some(oci_client::manifest::Platform {
+                    os: "linux".into(),
+                    architecture: "arm".into(),
+                    os_version: None,
+                    os_features: None,
+                    variant: Some(variant.to_string()),
+                    features: None,
+                }),
+            ));
+            blobs.insert(config_digest, Blob::Bytes(config));
+            blobs.insert(digest.clone(), Blob::Bytes(manifest));
+            digests.push(digest);
+        }
+        let layout = archive::Layout {
+            index: archive::oci_index(entries),
+            blobs,
+        };
+        let [first, second] = <[String; 2]>::try_from(digests).expect("two digests");
+        (layout, [first, second])
+    }
+
+    /// Two instances under one os/arch: `base_for` takes the last, as it
+    /// always has, and `select_platform` the first. Sharing the matcher kept
+    /// each caller's policy; this pins both.
+    #[test]
+    fn same_platform_twice_keeps_each_pickers_policy() {
+        let (layout, [first, _second]) = same_platform_twice();
+        let manifests = layout.manifests().expect("manifests");
+        let base = BaseImage { layout, manifests };
+
+        let got = base_for(Some(&base), "linux/arm").expect("base_for");
+        assert_eq!(
+            got.diff_ids,
+            vec![json!("sha256:second")],
+            "base_for: last wins"
+        );
+
+        let (_, digest) = super::super::select_platform(&base.layout, "linux/arm").expect("select");
+        assert_eq!(digest, first, "select_platform: first wins");
     }
 
     /// A one-platform image: a layer on disk, a layer in memory, a config and
