@@ -23,6 +23,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 use hcore::approval_notice::{NoticeRoots, ReadNotice};
 use hcore::events::BuildEventKind;
+use rusqlite::config::DbConfig;
 use rusqlite::{Connection, OpenFlags, params};
 
 use super::format::{SessionRecord, SessionRecordKind};
@@ -154,16 +155,10 @@ pub fn snapshot(
         .to_str()
         .with_context(|| format!("{} is not UTF-8", temp.display()))?;
     abort.watch(rec.conn())?;
-    rec.conn()
-        .execute("VACUUM INTO ?1", params![target])
-        .context("copying the recording")?;
+    vacuum_into(rec, target).context("copying the recording")?;
     let live = matches!(rec, Recording::Local(l) if l.opened.live);
 
-    let copy = Connection::open_with_flags(
-        &temp,
-        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .with_context(|| format!("opening the copy {}", temp.display()))?;
+    let copy = open_copy(&temp).with_context(|| format!("opening the copy {}", temp.display()))?;
     abort.watch(&copy)?;
     if live {
         copy.execute("UPDATE session SET snapshot = 1", [])
@@ -189,6 +184,35 @@ pub fn snapshot(
         .map_err(|(_, e)| e)
         .context("closing the copy")?;
     Ok(temp)
+}
+
+/// `VACUUM INTO target` from `rec`. It writes only `target`, but a foreign
+/// connection's `query_only` refuses it as a write: lifted for this one
+/// statement. The connection stays read-only and `immutable=1`, so its file
+/// is still never written.
+fn vacuum_into(rec: &Recording, target: &str) -> rusqlite::Result<()> {
+    let conn = rec.conn();
+    if !rec.is_foreign() {
+        return conn.execute("VACUUM INTO ?1", params![target]).map(drop);
+    }
+    conn.execute_batch("PRAGMA query_only = 0")?;
+    let copied = conn.execute("VACUUM INTO ?1", params![target]).map(drop);
+    let restored = conn.execute_batch("PRAGMA query_only = 1");
+    copied.and(restored)
+}
+
+/// The copy, read-write. Its schema came from the recording, a foreign
+/// file's included, so nothing in it runs: triggers are off and
+/// `trusted_schema=OFF` keeps its views and defaults to harmless functions.
+fn open_copy(path: &Path) -> rusqlite::Result<Connection> {
+    let copy = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    copy.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, false)?;
+    copy.set_db_config(DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA, false)?;
+    copy.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
+    Ok(copy)
 }
 
 /// Fill `notices` and `failure_logs` of `copy` from the store and the failure

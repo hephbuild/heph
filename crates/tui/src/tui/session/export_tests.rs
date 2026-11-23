@@ -210,3 +210,40 @@ fn export_of_a_live_session_is_a_snapshot() {
     assert_eq!(state, RecordingState::Snapshot);
     assert_eq!(state.caveat(), Some("snapshot of a running session"));
 }
+
+/// A foreign recording exports again, kept as it is or with its logs left
+/// out, and its schema runs nothing while it does: the copy's `--no-logs`
+/// `DELETE`s run with triggers off, so a trigger planted in the file (one
+/// that would refuse the delete) never fires.
+#[test]
+fn a_foreign_recording_exports_again_without_running_its_triggers() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("crafted.db");
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src/tui/session/testdata/format-1")
+        .join(store::FILE);
+    std::fs::copy(fixture, &path).expect("copy the fixture");
+    let conn = Connection::open(&path).expect("open the copy");
+    conn.execute_batch(
+        "INSERT INTO notices VALUES ('//p:a', 1, 'plan', 'text');
+         CREATE TRIGGER planted BEFORE DELETE ON notices
+           BEGIN SELECT RAISE(ABORT, 'a planted trigger ran'); END;",
+    )
+    .expect("plant a trigger");
+    drop(conn);
+
+    let rec = Recording::open_foreign(&path, &tmp.path().join("ftmp")).expect("open foreign");
+    for (logs, want) in [(Some(no_read as ReadNotice), 1), (None, 0)] {
+        let db = snapshot(&rec, logs, &tmp.path().join("tmp"), &Abort::default())
+            .expect("export a foreign recording again");
+        let out = tmp.path().join("again.hephsession");
+        write_file(&db, &out, false, &Abort::default()).expect("write");
+        drop(db);
+        let again = Recording::open_foreign(&out, &tmp.path().join("ftmp")).expect("reopen");
+        let notices: i64 = again
+            .conn()
+            .query_row("SELECT count(*) FROM notices", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(notices, want, "logs kept: {}", logs.is_some());
+    }
+}

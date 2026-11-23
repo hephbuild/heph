@@ -2588,6 +2588,39 @@ async fn export_is_self_contained() {
         assert!(f.failure_logs("//a:collateral").expect("logs").is_empty());
         assert!(f.failure_logs("//a:outside").expect("logs").is_empty());
     }
+    // A foreign recording exports again: as it is, or `--no-logs`.
+    for (name, logs) in [("again.hephsession", true), ("again-bare.hephsession", false)] {
+        let rec = Opened::open_foreign(&full, ftmp.path()).expect("open the export");
+        let again = out.path().join(name);
+        let mut stdout = Vec::new();
+        export::export(
+            &rec,
+            export::Dest::File(again.clone()),
+            logs.then_some(
+                crate::engine::approval::read_notice_from_store
+                    as hcore::approval_notice::ReadNotice,
+            ),
+            ftmp.path(),
+            &mut stdout,
+        )
+        .expect("re-export a foreign recording");
+        drop(rec);
+        let rec = Opened::open_foreign(&again, ftmp.path()).expect("open the re-export");
+        let Opened::Foreign(f) = &rec else {
+            panic!("foreign")
+        };
+        assert_eq!(rec.meta().expect("meta").id, id, "{name}");
+        assert_eq!(
+            f.recorded_notice("//a:gate", 1, "plan").expect("notice"),
+            logs.then(|| NOTICE.to_owned()),
+            "{name}"
+        );
+        assert_eq!(
+            f.failure_logs("//a:root").expect("logs").len(),
+            usize::from(logs),
+            "{name}"
+        );
+    }
     let rec = Opened::open_foreign(&bare, ftmp.path()).expect("open the export");
     let Opened::Foreign(f) = &rec else {
         panic!("foreign")
