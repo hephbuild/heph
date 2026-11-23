@@ -121,6 +121,41 @@ pub fn cleanup(
     now: SystemTime,
     retention: Retention,
 ) -> std::io::Result<CleanupReport> {
+    cleanup_with(root, now, retention, &mut Removal::log)
+}
+
+/// One recording retention removed: which, how old, and which setting
+/// removed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Removal {
+    pub(crate) id: SessionId,
+    /// `human_duration` of its age.
+    pub(crate) age: String,
+    /// `keep`, `keep_bytes`, or `private`.
+    pub(crate) reason: &'static str,
+}
+
+impl Removal {
+    /// "Where did my session go?", answered at `debug`: cleanup runs during a
+    /// build, whose output it must not change (I1), and the default filter
+    /// shows (and records) `info`. `HEPH_LOG=debug` shows these lines.
+    fn log(&self) {
+        tracing::debug!(
+            id = %self.id,
+            age = self.age,
+            reason = self.reason,
+            "removed an ended session recording"
+        );
+    }
+}
+
+/// [`cleanup`], telling `removed` of each recording it removes.
+pub(crate) fn cleanup_with(
+    root: &Path,
+    now: SystemTime,
+    retention: Retention,
+    removed: &mut dyn FnMut(&Removal),
+) -> std::io::Result<CleanupReport> {
     let mut sessions: Vec<(SessionId, PathBuf)> = Vec::new();
     let mut tombs: Vec<PathBuf> = Vec::new();
     for entry in std::fs::read_dir(root)?.filter_map(Result::ok) {
@@ -237,14 +272,11 @@ pub fn cleanup(
             } else {
                 "keep"
             };
-            let age = hcore::units::human_duration(e.age);
-            // A private session is gone by design; a listed one is a
-            // recording someone may come looking for (`no session <id>`).
-            if private {
-                tracing::debug!(id = %e.id, age, reason, "removed an ended session recording");
-            } else {
-                tracing::info!(id = %e.id, age, reason, "removed an ended session recording");
-            }
+            removed(&Removal {
+                id: e.id,
+                age: hcore::units::human_duration(e.age),
+                reason,
+            });
         }
     }
     Ok(report)
@@ -564,44 +596,51 @@ mod tests {
         drop(lock);
     }
 
-    /// "Where did my session go?": each removal is one `info` line naming
-    /// the id, its age and which setting removed it.
+    /// "Where did my session go?": each removal names the id, its age and
+    /// which setting removed it (logged at `debug`, `Removal::log`). Asserted
+    /// on the values handed to the logger, not on captured log text: a
+    /// scoped subscriber races tracing's process-wide callsite cache when
+    /// other tests log on other threads.
     #[test]
     fn removals_are_logged_with_their_reason() {
-        use super::super::tests::Captured;
         let root = tempfile::tempdir().expect("tempdir");
         let now = SystemTime::now();
         let old = ended(root.path(), now, 2 * MIN, 1, 100);
         let new = ended(root.path(), now, MIN, 2, 100);
-        let captured = Captured::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(captured.clone())
-            .with_ansi(false)
-            .finish();
-        tracing::subscriber::with_default(subscriber, || {
-            let retention = Retention {
-                max_bytes: 150,
-                ..Retention::default()
-            };
-            let report = cleanup(root.path(), now + 2 * MIN, retention).expect("cleanup");
-            assert_eq!(report.removed, vec![old]);
-            let report = cleanup(root.path(), now + 8 * DAY, retention).expect("cleanup");
-            assert_eq!(report.removed, vec![new]);
-        });
-        let log = captured.settled_log();
-        let lines: Vec<&str> = log.lines().filter(|l| l.contains(" INFO ")).collect();
-        assert_eq!(lines.len(), 2, "{log}");
-        assert!(
-            lines[0].contains(&format!("id={old}")) && lines[0].contains("reason=\"keep_bytes\""),
-            "{log}"
-        );
-        assert!(
-            lines[1].contains(&format!("id={new}"))
-                && lines[1].contains("reason=\"keep\"")
-                // Written just after `now`, so a hair under 8 days.
-                && lines[1].contains("age=\"7d23h\""),
-            "{log}"
-        );
+        let retention = Retention {
+            max_bytes: 150,
+            ..Retention::default()
+        };
+        let mut removals = Vec::new();
+        let report = cleanup_with(root.path(), now + 2 * MIN, retention, &mut |r| {
+            removals.push(r.clone());
+        })
+        .expect("cleanup");
+        assert_eq!(report.removed, vec![old]);
+        let report = cleanup_with(root.path(), now + 8 * DAY, retention, &mut |r| {
+            removals.push(r.clone());
+        })
+        .expect("cleanup");
+        assert_eq!(report.removed, vec![new]);
+        let named: Vec<_> = removals.iter().map(|r| (r.id, r.reason)).collect();
+        assert_eq!(named, vec![(old, "keep_bytes"), (new, "keep")]);
+        // Written just after `now`, so a hair under 8 days.
+        assert_eq!(removals[1].age, "7d23h");
+
+        // A private root's removals say so.
+        let private = tempfile::tempdir().expect("tempdir");
+        let gone = ended(private.path(), now, MIN, 3, 100);
+        let mut removals = Vec::new();
+        cleanup_with(
+            private.path(),
+            now + 2 * MIN,
+            Retention::PRIVATE,
+            &mut |r| {
+                removals.push(r.reason);
+            },
+        )
+        .expect("cleanup");
+        assert_eq!(removals, vec!["private"], "{gone}");
     }
 
     /// Cleanup never writes or budgets what it cannot seal: garbage, a

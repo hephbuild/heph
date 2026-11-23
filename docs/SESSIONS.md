@@ -344,7 +344,7 @@ One row of `records` has a `body` like
 (`crates/core/src/events.rs`), with the same skew rules: an unknown variant
 decodes as `Unknown`. `session` is a `SessionRecordKind`: `Log {level, msg,
 seq}` (every line the terminal shows, at the terminal's own filter, so
-`debug!` lines under `-v` too, and diagnostics with an empty `level`; lossy
+`debug!` lines under `HEPH_LOG=debug` too, and diagnostics with an empty `level`; lossy
 UTF-8, stored verbatim and escaped by the viewer on output; `seq` numbers the
 sink's lines from 1), `End {exit_code,
 panicked}`, `Truncated`, `InflightWritten`, `LockHolder {pid, session}` (the
@@ -808,11 +808,14 @@ contents.
   removed (ids are never reused). A removal renames the directory to a tomb
   (`.removing-<id>-<pid>`) and then deletes it. Two cleanups can race on a
   stale tomb or reader copy, both deleting it, which is harmless.
-- Each removal of an ended recording logs one `info` line, `removed an
+- Each removal of an ended recording logs one `debug` line, `removed an
   ended session recording`, with its `id`, its `age` and the `reason`:
-  `keep` (older than `session.keep`) or `keep_bytes` (past
-  `session.keepBytes`). A private session's removal logs at `debug`, reason
-  `private`.
+  `keep` (older than `session.keep`), `keep_bytes` (past
+  `session.keepBytes`) or `private` (a private session). Cleanup runs while
+  a build starts, so it must not change that build's output (I1): the
+  default filter (`info`) neither shows nor records these lines. To see
+  them, run any session-recording command with `HEPH_LOG=debug`, or only
+  cleanup's with `HEPH_LOG=info,tui::tui::session::cleanup=debug`.
 - A session command given an id that matches nothing says that an ended
   recording is removed past `session.keep`, or sooner past
   `session.keepBytes`, with the values in force for the viewing heph, and
@@ -896,8 +899,9 @@ a pass.
 **My session id is gone.** An ended recording is removed once it is older
 than `session.keep` (7 days), or sooner when all of them together pass
 `session.keepBytes` (2 GiB), oldest first; `heph session show` on a missing id
-says which values were in force, and each removal logs an `info` line with
-its reason (see [Retention](#retention)). Raise either key in
+says which values were in force, and each removal logs a `debug` line with
+its reason, shown with `HEPH_LOG=info,tui::tui::session::cleanup=debug`
+(see [Retention](#retention)). Raise either key in
 `.hephconfig` to keep more.
 
 **Are my `resources` declarations the limit, or the machine?** The pool rows
