@@ -981,6 +981,25 @@ pub(crate) enum Imported {
     Abandoned,
 }
 
+/// `path` with every symlink and `..` resolved, if that lies inside one of
+/// `roots`; `None` if it lies outside. The error is `path`'s own
+/// canonicalization failing (`NotFound` for a missing file).
+///
+/// The check canonicalizes `path` itself rather than trusting the caller to
+/// have: a lexical `root/../elsewhere` starts with `root` component-wise.
+/// Each root is canonicalized too, so a root reached through a symlink (`/tmp`
+/// on macOS) still contains its files. A root that cannot be canonicalized
+/// contains nothing.
+pub(crate) fn inside_roots(path: &Path, roots: &[PathBuf]) -> io::Result<Option<PathBuf>> {
+    let real = std::fs::canonicalize(path)?;
+    let inside = roots.iter().any(|root| {
+        std::fs::canonicalize(root)
+            .map(|r| real.starts_with(r))
+            .unwrap_or(false)
+    });
+    Ok(inside.then_some(real))
+}
+
 /// `path`, opened, if it is a regular file (not a symlink) inside one of
 /// `roots`. `None` for anything else.
 fn open_contained(path: &Path, roots: &[PathBuf]) -> io::Result<Option<File>> {
@@ -989,16 +1008,10 @@ fn open_contained(path: &Path, roots: &[PathBuf]) -> io::Result<Option<File>> {
     if !meta.file_type().is_file() {
         return Ok(None);
     }
-    let real = std::fs::canonicalize(path)?;
-    let inside = roots.iter().any(|root| {
-        std::fs::canonicalize(root)
-            .map(|r| real.starts_with(r))
-            .unwrap_or(false)
-    });
-    if !inside {
+    let Some(real) = inside_roots(path, roots)? else {
         tracing::debug!(path = %path.display(), "a returned log outside the sandbox; not read");
         return Ok(None);
-    }
+    };
     // No-follow, so a file swapped for a link after the check is refused;
     // non-blocking, so one swapped for a FIFO is opened without waiting for a
     // writer, then refused below (the flag changes nothing for a regular
@@ -1240,6 +1253,58 @@ mod tests {
 
     fn enospc(_: &mut File, _: &[u8]) -> io::Result<()> {
         Err(io::Error::from_raw_os_error(libc::ENOSPC))
+    }
+
+    /// The containment check both sandbox readers share: on the canonical
+    /// path, by path component, through a symlinked root, and never through a
+    /// root that is not there.
+    #[test]
+    fn inside_roots_compares_canonical_components() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+        let root = base.join("sb");
+        std::fs::create_dir_all(root.join("d")).expect("mkdir");
+        std::fs::create_dir_all(base.join("sbx")).expect("mkdir");
+        std::fs::write(root.join("d/f"), b"").expect("write");
+        std::fs::write(base.join("sbx/f"), b"").expect("write");
+        std::os::unix::fs::symlink(&root, base.join("link")).expect("symlink");
+        let inside =
+            |path: &Path, roots: &[PathBuf]| inside_roots(path, roots).expect("inside_roots");
+        let only_root = std::slice::from_ref(&root);
+
+        assert_eq!(inside(&root.join("d/f"), only_root), Some(root.join("d/f")));
+        assert_eq!(
+            inside(&root.join("d/f"), &[base.join("link")]),
+            Some(root.join("d/f")),
+            "a root reached through a symlink still contains its files",
+        );
+        assert_eq!(
+            inside(&base.join("link/d/f"), only_root),
+            Some(root.join("d/f")),
+            "a path reached through a symlink is judged, and returned, resolved",
+        );
+        assert_eq!(
+            inside(&base.join("sbx/f"), only_root),
+            None,
+            "a sibling sharing the root's name as a prefix is outside",
+        );
+        assert_eq!(
+            inside(&root.join("../sbx/f"), only_root),
+            None,
+            "a `..` out of the root is resolved before the comparison",
+        );
+        assert_eq!(
+            inside(&root.join("d/f"), &[base.join("gone")]),
+            None,
+            "a root that cannot be canonicalized contains nothing",
+        );
+        assert_eq!(inside(&root.join("d/f"), &[]), None);
+        assert_eq!(
+            inside_roots(&root.join("d/missing"), only_root)
+                .expect_err("a missing path")
+                .kind(),
+            io::ErrorKind::NotFound,
+        );
     }
 
     /// A sink that never takes a byte: the stalled reader.

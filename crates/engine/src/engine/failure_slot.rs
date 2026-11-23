@@ -561,23 +561,18 @@ fn select_log(addr: &Addr, err: &anyhow::Error) -> Option<LogSource> {
 /// `path` with every symlink resolved, if it is a regular file inside one of
 /// `roots`. `None` for a missing file — not a second error — or one outside.
 fn resolve_in_roots(path: &Path, roots: &[PathBuf]) -> io::Result<Option<PathBuf>> {
-    let real = match std::fs::canonicalize(path) {
-        Ok(p) => p,
+    let real = match crate::engine::run_log::inside_roots(path, roots) {
+        Ok(Some(real)) => real,
+        Ok(None) => {
+            tracing::debug!(path = %path.display(), "the failure file is outside the sandbox; not read");
+            return Ok(None);
+        }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             tracing::debug!(path = %path.display(), "the failure file is gone");
             return Ok(None);
         }
         Err(e) => return Err(e),
     };
-    let inside = roots.iter().any(|root| {
-        std::fs::canonicalize(root)
-            .map(|r| real.starts_with(r))
-            .unwrap_or(false)
-    });
-    if !inside {
-        tracing::debug!(path = %path.display(), real = %real.display(), "the failure file is outside the sandbox; not read");
-        return Ok(None);
-    }
     if !std::fs::metadata(&real)?.is_file() {
         return Ok(None);
     }
