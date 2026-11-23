@@ -28,7 +28,7 @@
 
 use crate::plugingo::deps::{DepGroups, DepShape, dep_inputs};
 use crate::plugingo::parse_util::{def_hash, pkg_outputs};
-use crate::plugingo::tool_log::{ToolLog, run_captured};
+use crate::plugingo::tool_log::{ProcessGroup, ToolLog, echo_failure, run_captured};
 use anyhow::Context;
 use async_trait::async_trait;
 use hcore::hasync::Cancellable;
@@ -351,14 +351,27 @@ impl ManagedDriver for GoLintDriver {
         mut req: ManagedRunRequest<'a, 'io>,
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ManagedRunResponse> {
-        let res: anyhow::Result<ManagedRunResponse> = async {
+        let res = self.run_inner(&mut req, ctoken).await;
+        // heph-govet's output is captured, not streamed: see `echo_failure`.
+        echo_failure(&mut req, res).await
+    }
+}
+
+impl GoLintDriver {
+    /// Write the unitchecker config, run `heph-govet -json` over it, and keep
+    /// its report and facts.
+    async fn run_inner(
+        &self,
+        req: &mut ManagedRunRequest<'_, '_>,
+        ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> anyhow::Result<()> {
         let def = req.request.target.def_de::<GoLintDef>();
         let mut log = ToolLog::new(&mut req.request);
         let pkg_dir = &req.sandbox_pkg_dir;
 
         // The govet binary (single staged file in its group).
         let govet_bin = self
-            .single_staged_path(&req, &def.deps, GOVET_TOOL_GROUP)
+            .single_staged_path(req, &def.deps, GOVET_TOOL_GROUP)
             .context("locate staged heph-govet binary (govet_tool dep not staged?)")?;
 
         // Map each transitive import to its staged archive (type info) and, when
@@ -369,7 +382,7 @@ impl ManagedDriver for GoLintDriver {
         for ip in &def.import_paths {
             let lib_group = crate::plugingo::addr_util::import_path_to_dep_group(ip);
             let archive = self
-                .single_staged_path(&req, &def.deps, &lib_group)
+                .single_staged_path(req, &def.deps, &lib_group)
                 .with_context(|| format!("locate staged archive for lib {ip}"))?;
             package_file.insert(ip.clone(), archive);
             import_map.insert(ip.clone(), ip.clone());
@@ -381,7 +394,7 @@ impl ManagedDriver for GoLintDriver {
             // tools/heph-govet/vetx.go). Analyzers degrade to intra-package for that
             // one dependency only.
             let facts_group = import_path_to_facts_group(ip);
-            if let Ok(facts) = self.single_staged_path(&req, &def.deps, &facts_group) {
+            if let Ok(facts) = self.single_staged_path(req, &def.deps, &facts_group) {
                 // unitchecker gob-decodes whatever this points at, so a wrong file
                 // surfaces as a cryptic "decoding facts: unexpected EOF". The dep
                 // selects `|facts`, so the only staged file is the facts one — assert
@@ -402,7 +415,7 @@ impl ManagedDriver for GoLintDriver {
         // fails with `can't resolve import ""` unless the map carries it.
         import_map.insert("unsafe".to_string(), "unsafe".to_string());
 
-        let go_files = def.deps.staged_paths(&req, "")?;
+        let go_files = def.deps.staged_paths(req, "")?;
         let vetx_output = pkg_dir.join(LINT_FACTS);
 
         let cfg = UnitcheckerConfig {
@@ -436,7 +449,7 @@ impl ManagedDriver for GoLintDriver {
         // It is a hashed input, so a config change re-keys this target and
         // re-lints. Passed by env because unitchecker rejects unknown flags.
         let mut env: HashMap<String, String> = HashMap::new();
-        if let Ok(config_path) = self.single_staged_path(&req, &def.deps, "config") {
+        if let Ok(config_path) = self.single_staged_path(req, &def.deps, "config") {
             env.insert("HEPH_GOVET_GOLANGCI_CONFIG".to_string(), config_path);
         }
 
@@ -473,18 +486,9 @@ impl ManagedDriver for GoLintDriver {
             );
         }
 
-        Ok(ManagedRunResponse { artifacts: vec![] })
-        }
-        .await;
-        // heph-govet's output is captured, not streamed: see `echo_failure_log`.
-        if let Err(e) = &res {
-            hdriver_support::driver_managed::echo_failure_log(&mut req.request, e).await;
-        }
-        res
+        Ok(())
     }
-}
 
-impl GoLintDriver {
     /// [`DepGroups::single_staged_path`] for a one-output group (lib archive,
     /// facts, tool), rejecting a directory: read-only staging lists only a subtree *root* unless the
     /// input opts into per-file staging, and handing that directory to `exec` fails
@@ -527,7 +531,7 @@ impl GoLintDriver {
             args,
             env,
             cwd,
-            crate::plugingo::tool_log::ProcessGroup::Inherit,
+            ProcessGroup::Inherit,
             runner,
             ctoken,
         )

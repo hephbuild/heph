@@ -24,6 +24,7 @@
 //! both streams.
 
 use hcore::hasync::Cancellable;
+use hdriver_support::driver_managed::{ManagedRunRequest, ManagedRunResponse};
 use hdriver_support::run_log::{RunLog, Streams};
 use hplugin::driver::RunRequest;
 use hplugin::error::ProcessFailed;
@@ -75,6 +76,21 @@ pub(crate) async fn run_captured(
         ctty: false,
     };
     hexecrunner::output(runner, spec, ctoken).await
+}
+
+/// A failed run's output goes to the target's log, whose tail the failure box
+/// renders, rather than into the message — and, on a host without
+/// `log_capture`, to the live stderr of an interactive run, since it was
+/// captured rather than streamed (under `log_capture` the writers already have
+/// it, and an error with no `Log` artifact echoes nothing).
+pub(crate) async fn echo_failure(
+    req: &mut ManagedRunRequest<'_, '_>,
+    res: anyhow::Result<()>,
+) -> anyhow::Result<ManagedRunResponse> {
+    if let Err(e) = &res {
+        hdriver_support::driver_managed::echo_failure_log(&mut req.request, e).await;
+    }
+    res.map(|()| ManagedRunResponse { artifacts: vec![] })
 }
 
 /// A Go run's log, for the processes it spawns. Built once per run: under

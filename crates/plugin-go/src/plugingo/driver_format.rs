@@ -13,7 +13,7 @@
 //! (`formatters:` block), passed via `HEPH_GOVET_GOLANGCI_CONFIG` exactly like
 //! the lint config. Absent → gofmt.
 
-use crate::plugingo::tool_log::{ToolLog, run_captured};
+use crate::plugingo::tool_log::{ProcessGroup, ToolLog, echo_failure, run_captured};
 use anyhow::Context;
 use async_trait::async_trait;
 use hcore::hasync::Cancellable;
@@ -159,21 +159,6 @@ async fn check_outcome(log: &mut ToolLog<'_>, output: &std::process::Output) -> 
             .await
             .context("heph-govet -format -check failed")),
     }
-}
-
-/// A failed run's output goes to the target's log, whose tail the failure box
-/// renders, rather than into the message — and, on a host without
-/// `log_capture`, to the live stderr of an interactive run, since it was
-/// captured rather than streamed (under `log_capture` the writers already have
-/// it, and an error with no `Log` artifact echoes nothing).
-async fn echo_failure(
-    req: &mut ManagedRunRequest<'_, '_>,
-    res: anyhow::Result<()>,
-) -> anyhow::Result<ManagedRunResponse> {
-    if let Err(e) = &res {
-        hdriver_support::driver_managed::echo_failure_log(&mut req.request, e).await;
-    }
-    res.map(|()| ManagedRunResponse { artifacts: vec![] })
 }
 
 /// Shared config for both format drivers.
@@ -392,7 +377,7 @@ impl ManagedDriver for GoFormatDriver {
             args,
             &env,
             pkg_dir,
-            crate::plugingo::tool_log::ProcessGroup::Inherit,
+            ProcessGroup::Inherit,
             runner,
             ctoken,
         )

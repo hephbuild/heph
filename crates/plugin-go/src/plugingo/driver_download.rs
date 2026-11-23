@@ -17,7 +17,7 @@
 
 use crate::plugingo::deps::DepShape;
 use crate::plugingo::module_fetch::{FETCH_ACCESS_ENV, add_fetch_env};
-use crate::plugingo::tool_log::{ToolLog, run_captured};
+use crate::plugingo::tool_log::{ProcessGroup, ToolLog, echo_failure, run_captured};
 use anyhow::Context;
 use async_trait::async_trait;
 use enclose::enclose;
@@ -266,17 +266,9 @@ async fn fetch_module(
     // Its own group: in direct mode `go` forks `git` and friends; the
     // supervisor's killpg needs the whole group, or a cancel orphans them in the
     // module cache.
-    let output = run_captured(
-        go_bin,
-        args,
-        env,
-        cwd,
-        crate::plugingo::tool_log::ProcessGroup::Own,
-        runner,
-        ctoken,
-    )
-    .await
-    .with_context(|| format!("wait for go mod download {mod_at_ver}"))?;
+    let output = run_captured(go_bin, args, env, cwd, ProcessGroup::Own, runner, ctoken)
+        .await
+        .with_context(|| format!("wait for go mod download {mod_at_ver}"))?;
     if !output.status.success() {
         // What go said (the `-json` record's `Error` on stdout, `git`'s and the
         // network's complaints on stderr) goes to the target's log, whose tail
@@ -456,7 +448,21 @@ impl ManagedDriver for GoDownloadDriver {
         mut req: ManagedRunRequest<'a, 'io>,
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ManagedRunResponse> {
-        let res: anyhow::Result<ManagedRunResponse> = async {
+        let res = self.run_inner(&mut req, ctoken).await;
+        // `go mod download`'s output is captured, not streamed: see
+        // `echo_failure`.
+        echo_failure(&mut req, res).await
+    }
+}
+
+impl GoDownloadDriver {
+    /// Fetch the module into the scratch GOMODCACHE, then copy it into the
+    /// package's sandbox dir.
+    async fn run_inner(
+        &self,
+        req: &mut ManagedRunRequest<'_, '_>,
+        ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> anyhow::Result<()> {
         let def = req.request.target.def_de::<GoDownloadDef>();
         let mut log = ToolLog::new(&mut req.request);
         let runner =
@@ -472,7 +478,7 @@ impl ManagedDriver for GoDownloadDriver {
         )
         .await?;
 
-        let gomodcache = crate::plugingo::toolchain::scratch_dir(&req, "GOMODCACHE")?;
+        let gomodcache = crate::plugingo::toolchain::scratch_dir(req, "GOMODCACHE")?;
 
         let env = download_env(def.runner.is_some(), &goroot, &gomodcache, |n| {
             std::env::var(n).ok()
@@ -508,15 +514,7 @@ impl ManagedDriver for GoDownloadDriver {
             )
         })?;
 
-        Ok(ManagedRunResponse { artifacts: vec![] })
-        }
-        .await;
-        // `go mod download`'s output is captured, not streamed: see
-        // `echo_failure_log`.
-        if let Err(e) = &res {
-            hdriver_support::driver_managed::echo_failure_log(&mut req.request, e).await;
-        }
-        res
+        Ok(())
     }
 }
 
