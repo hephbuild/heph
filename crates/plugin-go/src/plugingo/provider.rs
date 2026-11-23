@@ -2171,9 +2171,11 @@ impl ProviderInner {
         // module universe. Returns the concrete `factors` this target builds with,
         // plus the `vref` to thread onto every sub-target and dependency address.
         //
-        // `module_root` bounds ancestry resolution at the go.mod dir (not repo
-        // root); it is unused for the `vp` (library) branch.
-        let module_root = module_root_rel(&kind, &self.workspace_root);
+        // `module_rel` (the workspace-relative go.mod dir) bounds ancestry
+        // resolution at the go.mod dir (not repo root); it is unused for the
+        // `vp` (library) branch. It also selects the module's shared `GOCACHE`
+        // (`module_of_pkg` of this package, since `kind` is its decode).
+        let module_rel = module_root_rel(&kind, &self.workspace_root);
 
         // format / format-check — variant-free (see `VARIANT_FREE_TARGET_NAMES`),
         // so handle them before variant resolution and source the file list from
@@ -2198,7 +2200,7 @@ impl ProviderInner {
                 return Err(GetError::NotFound);
             }
             return Arc::clone(&self)
-                .get_lint_aggregate(&req, &kind, &module_root)
+                .get_lint_aggregate(&req, &kind, &module_rel)
                 .await;
         }
 
@@ -2221,7 +2223,7 @@ impl ProviderInner {
             && matches!(&*kind, GoPackageKind::FirstParty { .. })
         {
             let (host_goos, host_goarch) = (current_goos(), current_goarch());
-            let chosen = variant::ancestry_variants_with_factors(&req.states, &module_root)
+            let chosen = variant::ancestry_variants_with_factors(&req.states, &module_rel)
                 .into_iter()
                 .find(|(_, f)| f.goos == host_goos && f.goarch == host_goarch);
             let Some((vref, _)) = chosen else {
@@ -2297,12 +2299,12 @@ impl ProviderInner {
             GoPackageKind::FirstParty { .. } => addr
                 .args
                 .get("vp")
-                .is_some_and(|vp| pkg_in_module(vp, &module_root, &self.pkgs)),
+                .is_some_and(|vp| pkg_in_module(vp, &module_rel, &self.pkgs)),
         };
         let (factors, vref) = variant::resolve(
             addr,
             &req.states,
-            &module_root,
+            &module_rel,
             req.executor.as_ref(),
             vp_same_module,
         )
@@ -2434,7 +2436,7 @@ impl ProviderInner {
                         embed_golist,
                         &pkg_addrs.embed_files,
                         &self.go_version,
-                        &module_of_pkg(&addr.package, &self.pkgs),
+                        &module_rel,
                     ),
                     _ => {
                         // `go_embed_src` assets (kept out of `_golist`) are staged
@@ -2460,7 +2462,7 @@ impl ProviderInner {
                             &transitive.libs,
                             &pkg_addrs.go_files,
                             &self.go_version,
-                            &module_of_pkg(&addr.package, &self.pkgs),
+                            &module_rel,
                             embed_golist,
                             &pkg_addrs.embed_files,
                             &embed_src_addrs,
@@ -2689,7 +2691,7 @@ impl ProviderInner {
                     &test_embed_files,
                     &embed_src_addrs,
                     &self.go_version,
-                    &module_of_pkg(&addr.package, &self.pkgs),
+                    &module_rel,
                 );
                 Ok(GetResponse { target_spec: spec })
             }
@@ -2769,7 +2771,7 @@ impl ProviderInner {
                     &pkg_addrs.xtest_embed_files,
                     &embed_src_addrs,
                     &self.go_version,
-                    &module_of_pkg(&addr.package, &self.pkgs),
+                    &module_rel,
                 );
                 Ok(GetResponse { target_spec: spec })
             }
@@ -2803,7 +2805,7 @@ impl ProviderInner {
                     &testmain_src_addr,
                     &libs,
                     &self.go_version,
-                    &module_of_pkg(&addr.package, &self.pkgs),
+                    &module_rel,
                 );
                 Ok(GetResponse { target_spec: spec })
             }
@@ -2840,7 +2842,7 @@ impl ProviderInner {
                     &testmain_src_addr,
                     &libs,
                     &self.go_version,
-                    &module_of_pkg(&addr.package, &self.pkgs),
+                    &module_rel,
                 );
                 Ok(GetResponse { target_spec: spec })
             }
