@@ -399,6 +399,33 @@ impl ManagedDriver for GoCompileDriver {
     }
 }
 
+/// The `go tool asm` argv both asm steps start with: `-gensymabis` and the
+/// per-`.s` assemble. cmd/go requires the two to agree, so they share it.
+fn asm_base_args(
+    def: &GoCompileDef,
+    trimpath: &str,
+    goinc: &str,
+    shared: Option<&str>,
+) -> Vec<String> {
+    let mut args = vec![
+        "tool".to_string(),
+        "asm".to_string(),
+        "-p".to_string(),
+        def.p_flag.clone(),
+        trimpath.to_string(),
+        "-I".to_string(),
+        ".".to_string(),
+        "-I".to_string(),
+        goinc.to_string(),
+        "-D".to_string(),
+        format!("GOOS_{}", def.goos),
+        "-D".to_string(),
+        format!("GOARCH_{}", def.goarch),
+    ];
+    args.extend(shared.map(str::to_string));
+    args
+}
+
 impl GoCompileDriver {
     /// The compile: importcfg, sources, embedcfg, then the `go tool` steps
     /// (asm, compile, pack) in order.
@@ -502,22 +529,7 @@ impl GoCompileDriver {
         // 4. asm step 0+1: seed go_asm.h, then -gensymabis → symabis.
         if has_asm {
             std::fs::write(pkg_dir.join("go_asm.h"), b"").context("seed go_asm.h")?;
-            let mut args = vec![
-                "tool".to_string(),
-                "asm".to_string(),
-                "-p".to_string(),
-                def.p_flag.clone(),
-                trimpath.clone(),
-                "-I".to_string(),
-                ".".to_string(),
-                "-I".to_string(),
-                goinc.clone(),
-                "-D".to_string(),
-                format!("GOOS_{}", def.goos),
-                "-D".to_string(),
-                format!("GOARCH_{}", def.goarch),
-            ];
-            args.extend(shared.map(str::to_string));
+            let mut args = asm_base_args(def, &trimpath, &goinc, shared);
             args.extend([
                 "-gensymabis".to_string(),
                 "-o".to_string(),
@@ -589,22 +601,7 @@ impl GoCompileDriver {
         if has_asm {
             for s in &def.s_files {
                 let obj = format!("{}.o", s.trim_end_matches(".s"));
-                let mut args = vec![
-                    "tool".to_string(),
-                    "asm".to_string(),
-                    "-p".to_string(),
-                    def.p_flag.clone(),
-                    trimpath.clone(),
-                    "-I".to_string(),
-                    ".".to_string(),
-                    "-I".to_string(),
-                    goinc.clone(),
-                    "-D".to_string(),
-                    format!("GOOS_{}", def.goos),
-                    "-D".to_string(),
-                    format!("GOARCH_{}", def.goarch),
-                ];
-                args.extend(shared.map(str::to_string));
+                let mut args = asm_base_args(def, &trimpath, &goinc, shared);
                 args.extend(["-o".to_string(), obj, format!("./{s}")]);
                 self.exec_go(
                     &go_bin,
@@ -1541,6 +1538,43 @@ mod driver_tests {
             def_hash(&a),
             def_hash(&c),
             "different import set must differ"
+        );
+    }
+
+    /// The asm prefix, in cmd/go's order, with `-shared` last when the link
+    /// is PIE.
+    #[test]
+    fn asm_base_args_order() {
+        let def = compile_def(false);
+        let base = [
+            "tool",
+            "asm",
+            "-p",
+            "example.com/mylib",
+            "-trimpath=/ws",
+            "-I",
+            ".",
+            "-I",
+            "/goroot/pkg/include",
+            "-D",
+            "GOOS_linux",
+            "-D",
+            "GOARCH_amd64",
+        ];
+        assert_eq!(
+            super::asm_base_args(&def, "-trimpath=/ws", "/goroot/pkg/include", None),
+            base
+        );
+        let mut shared = base.to_vec();
+        shared.push("-shared");
+        assert_eq!(
+            super::asm_base_args(
+                &def,
+                "-trimpath=/ws",
+                "/goroot/pkg/include",
+                Some("-shared")
+            ),
+            shared
         );
     }
 }
