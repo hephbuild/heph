@@ -138,7 +138,6 @@ struct GoGolistDef {
     /// See [`GoGolistSpec::race`].
     race: bool,
     with_test: bool,
-    dep_inputs: Vec<Input>,
     /// For thirdparty packages: the `download` target whose filtered outputs
     /// will be staged into consumers' sandboxes. Threaded through so
     /// `resolve_package_addrs` emits download-filter refs instead of pluginfs
@@ -253,28 +252,39 @@ fn golist_env(
 /// list unless it only answers "where do the bytes come from".
 const GOLIST_ONLY_PASS_ENV: &[&str] = &["GOMODCACHE"];
 
-impl Hash for GoGolistDef {
+/// What a `_golist` def hash covers: the def, plus the dep inputs `parse`
+/// declared. The inputs are hashed here rather than kept on the def, which
+/// `run` reads and never needs them.
+struct GolistDefHash<'a> {
+    def: &'a GoGolistDef,
+    dep_inputs: &'a [Input],
+}
+
+impl Hash for GolistDefHash<'_> {
     fn hash<H: Hasher>(&self, state: &mut H) {
+        let Self { def, dep_inputs } = self;
         GO_GOLIST_FORMAT_VERSION.hash(state);
-        self.import_path.hash(state);
-        self.goos.hash(state);
-        self.goarch.hash(state);
-        self.go_version.hash(state);
-        self.build_tags.hash(state);
-        self.goexperiment.hash(state);
+        def.import_path.hash(state);
+        def.goos.hash(state);
+        def.goarch.hash(state);
+        def.go_version.hash(state);
+        def.build_tags.hash(state);
+        def.goexperiment.hash(state);
         // Hashed only when set, so introducing race mode left every ordinary
         // `_golist` def hash — and therefore every cached listing — untouched.
         // The marker is a distinct string, so it cannot alias a neighbouring
         // field's contribution.
-        if self.race {
+        if def.race {
             "race".hash(state);
         }
         // Flips the `go list` command line, and with it which fields come back
         // populated — so it must key the cache.
-        self.with_test.hash(state);
-        self.dep_inputs.hash(state);
-        self.thirdparty_download_addr.hash(state);
-        self.firstparty.hash(state);
+        def.with_test.hash(state);
+        // A slice hashes exactly as the `Vec` the def used to hold did (length
+        // prefix, then each element), so the def hash did not move.
+        dep_inputs.hash(state);
+        def.thirdparty_download_addr.hash(state);
+        def.firstparty.hash(state);
         // The hermetic SDK arrives via dep_inputs (group `gosdk`); the engine
         // hashes its content, so no separate goroot/go_bin field is hashed here.
     }
@@ -358,12 +368,18 @@ impl ManagedDriver for GoGolistDriver {
             goexperiment: spec.goexperiment,
             race: spec.race,
             with_test: spec.with_test,
-            dep_inputs: dep_inputs.clone(),
             thirdparty_download_addr: spec.thirdparty_download_addr,
             firstparty: spec.firstparty,
         };
 
-        let hash = def_hash("go_golist", &req.target_spec.addr, &def);
+        let hash = def_hash(
+            "go_golist",
+            &req.target_spec.addr,
+            &GolistDefHash {
+                def: &def,
+                dep_inputs: &dep_inputs,
+            },
+        );
         let outputs = pkg_outputs(pkg.as_str(), &spec.out, &CodegenMode::None);
 
         Ok(ParseResponse {
@@ -1447,7 +1463,6 @@ mod tests {
             goexperiment: vec![],
             race: false,
             with_test,
-            dep_inputs: vec![],
             thirdparty_download_addr: None,
             firstparty: true,
         }
@@ -1690,10 +1705,15 @@ mod tests {
     /// here means every cached listing is being thrown away.
     const NON_RACE_GOLIST_HASH: u64 = 12427067391495276547;
 
+    /// `def`'s def hash with no dep inputs.
     fn def_hash(def: &GoGolistDef) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = xxhash_rust::xxh3::Xxh3Default::new();
-        def.hash(&mut h);
+        GolistDefHash {
+            def,
+            dep_inputs: &[],
+        }
+        .hash(&mut h);
         h.finish()
     }
 
@@ -1709,14 +1729,9 @@ mod tests {
     /// identical defs must not share a cache entry.
     #[test]
     fn test_with_test_keys_the_def_hash() {
-        let h = |d: &GoGolistDef| {
-            let mut hasher = Xxh3Default::new();
-            d.hash(&mut hasher);
-            hasher.finish()
-        };
         assert_ne!(
-            h(&def_with(true, vec![])),
-            h(&def_with(false, vec![])),
+            def_hash(&def_with(true, vec![])),
+            def_hash(&def_with(false, vec![])),
             "-test must key the golist cache"
         );
     }
