@@ -484,6 +484,39 @@ impl<'io> RunLog<'io> {
     }
 }
 
+/// Run a tool on the local runner and return its output whole, its stderr
+/// written to `log` as it arrives.
+///
+/// For a tool whose stdout is its answer (a store path, an environment) and
+/// whose stderr is progress. Under `log_capture` (`log` is `Some`) the stderr
+/// reaches the run's log live; the stdout is data, never the log, on either
+/// host. An older host keeps no log: the output is captured whole. Pair it
+/// with [`exit_failure`].
+pub async fn output_logging_stderr(
+    log: Option<&mut RunLog<'_>>,
+    spec: proc_exec::Spec,
+    ctoken: &(dyn Cancellable + Send + Sync),
+) -> anyhow::Result<std::process::Output> {
+    let runner = hexecrunner::RunnerRef::local();
+    match log {
+        Some(log) => log.output(runner, spec, Streams::STDERR, ctoken).await,
+        None => hexecrunner::output(runner, spec, ctoken).await,
+    }
+}
+
+/// The error for a tool run by [`output_logging_stderr`] that exited
+/// non-zero. `captured` is whether a log was passed: its stderr is then
+/// already in the run's log, so the error is the exit status under `what`; an
+/// older host gets the stderr in the message instead.
+pub fn exit_failure(output: &std::process::Output, captured: bool, what: String) -> anyhow::Error {
+    if captured {
+        return anyhow::Error::new(hplugin::error::ProcessFailed::from_status(output.status))
+            .context(what);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    anyhow::anyhow!("{what}: {stderr}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1307,5 +1340,32 @@ mod tests {
             .await;
         drop(log);
         assert_eq!(sink.text(), "compile error\n");
+    }
+
+    /// Under `log_capture` a failed tool is its exit status under `what`, as
+    /// a typed `ProcessFailed`, the stderr left to the log; an older host gets
+    /// the stderr in the message.
+    #[test]
+    fn exit_failure_shapes_both_hosts() {
+        let output = std::process::Output {
+            status: std::os::unix::process::ExitStatusExt::from_raw(1 << 8),
+            stdout: b"answer".to_vec(),
+            stderr: b"it broke".to_vec(),
+        };
+
+        let captured = exit_failure(&output, true, "tool failed".to_string());
+        assert_eq!(
+            format!("{captured:#}"),
+            "tool failed: process exited with status: exit status: 1"
+        );
+        assert!(
+            captured
+                .chain()
+                .any(|c| c.downcast_ref::<hplugin::error::ProcessFailed>().is_some()),
+            "a captured failure is a typed ProcessFailed"
+        );
+
+        let inline = exit_failure(&output, false, "tool failed".to_string());
+        assert_eq!(format!("{inline:#}"), "tool failed: it broke");
     }
 }
