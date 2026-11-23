@@ -692,7 +692,7 @@ fn has_go_file(dir: &std::path::Path) -> anyhow::Result<bool> {
 /// It is not free: it makes `go list` load the package a second time in its test
 /// configuration, pulling the test imports' own closure. Measured over 60 std
 /// packages listed one at a time against a *fresh shared* `GOCACHE` — i.e. what
-/// [`crate::plugingo::golist_gocache`] gives a cold run today — dropping `-test`
+/// [`crate::plugingo::gocache`] gives a cold run today — dropping `-test`
 /// took CPU from 3.72s to 2.58s (-31%) and wall from 1.89s to 1.69s (-11%).
 ///
 /// The gap used to be far wider: before the shared `GOCACHE`, every sandbox
