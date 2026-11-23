@@ -36,7 +36,6 @@
 use crate::plugingo::factors::{current_goarch, current_goos};
 use anyhow::Context;
 use async_trait::async_trait;
-use hcore::debug_hash::DebugHasher;
 use hcore::hasync::Cancellable;
 use hcore::htvalue::Value;
 use hdriver_support::driver_managed::{
@@ -55,7 +54,6 @@ use hplugin::provider::TargetSpec;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use xxhash_rust::xxh3::Xxh3Default;
 
 /// A convenient pinned Go release for tests and as a documented example. The
 /// provider requires the toolchain to be chosen explicitly (`gotool` option),
@@ -582,13 +580,8 @@ impl ManagedDriver for GoToolchainDriver {
             sha256: spec.sha256,
         };
 
-        let hash = {
-            let mut h = DebugHasher::new(Xxh3Default::new(), || {
-                format!("go_toolchain_{}", req.target_spec.addr.format())
-            });
-            def.hash(&mut h);
-            format!("{:x}", h.finish()).into_bytes()
-        };
+        let hash =
+            crate::plugingo::parse_util::def_hash("go_toolchain", &req.target_spec.addr, &def);
 
         // Output paths are workspace-relative: prepend the owning package, and
         // classify a trailing-slash entry as a directory tree (the SDK root).
@@ -600,11 +593,7 @@ impl ManagedDriver for GoToolchainDriver {
                 paths: paths
                     .iter()
                     .map(|p| {
-                        let full = if pkg_str.is_empty() {
-                            p.clone()
-                        } else {
-                            format!("{pkg_str}/{p}")
-                        };
+                        let full = crate::plugingo::parse_util::pkg_path(pkg_str, p);
                         let content = if let Some(dir) = full.strip_suffix('/') {
                             Content::DirPath(dir.to_string())
                         } else {

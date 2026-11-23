@@ -16,15 +16,14 @@
 use crate::plugingo::tool_log::ToolLog;
 use anyhow::Context;
 use async_trait::async_trait;
-use hcore::debug_hash::DebugHasher;
 use hcore::hasync::Cancellable;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
 use hdriver_support::run_log::Streams;
 use hplugin::driver::targetdef::path::{CodegenMode, Content, Path as TPath};
-use hplugin::driver::targetdef::{CacheConfig, Input, InputMode, Output, TargetDef};
+use hplugin::driver::targetdef::{CacheConfig, Input, Output, TargetDef};
 use hplugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
-    ParseResponse, TargetAddr,
+    ParseResponse,
 };
 use hplugin::htspec::Spec;
 use hproc::proc_exec;
@@ -33,10 +32,10 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use xxhash_rust::xxh3::Xxh3Default;
 
-use crate::plugingo::deps::{DepGroups, dep_origin};
+use crate::plugingo::deps::{DepGroups, DepShape, dep_inputs};
 use crate::plugingo::listed;
+use crate::plugingo::parse_util::def_hash;
 
 /// Dep group carrying the `heph-govet` binary (shared with lint; staged read-only).
 const GOVET_TOOL_GROUP: &str = "govet_tool";
@@ -249,42 +248,20 @@ impl Hash for GoFormatDef {
 /// `config` group is unhashed-annotation-free (it is hashed like the rest so a
 /// config edit re-formats), the tool is staged read-only.
 fn parse_inputs(spec: &GoFormatSpec, pkg: &hmodel::htpkg::PkgBuf) -> anyhow::Result<Vec<Input>> {
-    let mut inputs: Vec<Input> = Vec::new();
-    let mut groups: Vec<&String> = spec.deps.keys().collect();
-    groups.sort();
-    for group in groups {
-        // Read-only (one shared tool) *and* per-file: whole-tree read-only staging
-        // symlinks the subtree in and lists only its root directory, which
-        // `single_staged_path` would then hand to exec (a directory → EACCES).
-        // Per-file staging hardlinks each file and lists it, so we exec the binary.
-        let read_only = group.as_str() == GOVET_TOOL_GROUP;
-        let annotations = if read_only {
-            BTreeMap::from([
-                (
-                    hdriver_support::stage::READ_ONLY_ANNOTATION.to_string(),
-                    "true".to_string(),
-                ),
-                (
-                    hdriver_support::stage::STAGE_PER_FILE_ANNOTATION.to_string(),
-                    "true".to_string(),
-                ),
+    // Read-only (one shared tool) *and* per-file: whole-tree read-only staging
+    // symlinks the subtree in and lists only its root directory, which
+    // `single_staged_path` would then hand to exec (a directory → EACCES).
+    // Per-file staging hardlinks each file and lists it, so we exec the binary.
+    dep_inputs(&spec.deps, pkg, |group, _| {
+        if group == GOVET_TOOL_GROUP {
+            DepShape::staged(&[
+                hdriver_support::stage::READ_ONLY_ANNOTATION,
+                hdriver_support::stage::STAGE_PER_FILE_ANNOTATION,
             ])
         } else {
-            BTreeMap::new()
-        };
-        for (i, addr_str) in spec.deps.get(group).expect("group key").iter().enumerate() {
-            inputs.push(Input {
-                r#ref: TargetAddr::parse(addr_str, pkg)
-                    .with_context(|| format!("parse dep addr {addr_str}"))?,
-                mode: InputMode::Standard,
-                origin_id: dep_origin(group, i),
-                annotations: annotations.clone(),
-                hashed: true,
-                runtime: true,
-            });
+            DepShape::staged(&[])
         }
-    }
-    Ok(inputs)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -368,13 +345,7 @@ impl ManagedDriver for GoFormatDriver {
             runner,
             deps: DepGroups::of(&spec.deps),
         };
-        let hash = {
-            let mut h = DebugHasher::new(Xxh3Default::new(), || {
-                format!("go_format_{}", req.target_spec.addr.format())
-            });
-            def.hash(&mut h);
-            format!("{:x}", h.finish()).into_bytes()
-        };
+        let hash = def_hash("go_format", &req.target_spec.addr, &def);
 
         Ok(ParseResponse {
             target_def: TargetDef {
@@ -489,13 +460,7 @@ impl ManagedDriver for GoFormatCheckDriver {
             runner,
             deps: DepGroups::of(&spec.deps),
         };
-        let hash = {
-            let mut h = DebugHasher::new(Xxh3Default::new(), || {
-                format!("go_format_check_{}", req.target_spec.addr.format())
-            });
-            def.hash(&mut h);
-            format!("{:x}", h.finish()).into_bytes()
-        };
+        let hash = def_hash("go_format_check", &req.target_spec.addr, &def);
 
         Ok(ParseResponse {
             target_def: TargetDef {

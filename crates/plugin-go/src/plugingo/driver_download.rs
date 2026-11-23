@@ -15,29 +15,28 @@
 //! share heph's home at the same path, or no scratch would work under it
 //! (`docs/EXEC_RUNNERS.md`, "Containers").
 
+use crate::plugingo::deps::DepShape;
 use crate::plugingo::module_fetch::{FETCH_ACCESS_ENV, add_fetch_env};
 use crate::plugingo::tool_log::ToolLog;
 use anyhow::Context;
 use async_trait::async_trait;
 use enclose::enclose;
-use hcore::debug_hash::DebugHasher;
 use hcore::hasync::Cancellable;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
 use hplugin::driver::targetdef::path::{CodegenMode, Content, Path as OutputPath};
-use hplugin::driver::targetdef::{CacheConfig, Input, InputMode, Output, TargetDef};
+use hplugin::driver::targetdef::{CacheConfig, Output, TargetDef};
 use hplugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
     ParseResponse, TargetAddr,
 };
 use hplugin::htspec::Spec;
 use hproc::proc_exec;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::hash::{Hash, Hasher};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use xxhash_rust::xxh3::Xxh3Default;
 
 pub struct GoDownloadDriver {
     /// Default exec runner for `go`, from the plugin's `runner:` option. A
@@ -377,31 +376,13 @@ impl ManagedDriver for GoDownloadDriver {
             "go.download: `version` is required"
         );
 
-        let mut inputs: Vec<Input> = Vec::new();
-        // Sorted so `HashMap` iteration order cannot reach the input list.
-        let mut groups: Vec<&String> = spec.deps.keys().collect();
-        groups.sort();
-        for group in groups {
-            let annotations = if group == crate::plugingo::addr_util::GO_SDK_DEP_GROUP {
-                BTreeMap::from([(
-                    hdriver_support::stage::READ_ONLY_ANNOTATION.to_string(),
-                    "true".to_string(),
-                )])
+        let mut inputs = crate::plugingo::deps::dep_inputs(&spec.deps, &pkg, |group, _| {
+            if group == crate::plugingo::addr_util::GO_SDK_DEP_GROUP {
+                DepShape::staged(&[hdriver_support::stage::READ_ONLY_ANNOTATION])
             } else {
-                BTreeMap::new()
-            };
-            for (i, addr) in spec.deps.get(group).into_iter().flatten().enumerate() {
-                inputs.push(Input {
-                    r#ref: TargetAddr::parse(addr, &pkg)
-                        .with_context(|| format!("parse dep addr {addr}"))?,
-                    mode: InputMode::Standard,
-                    origin_id: crate::plugingo::deps::dep_origin(group, i),
-                    annotations: annotations.clone(),
-                    hashed: true,
-                    runtime: true,
-                });
+                DepShape::staged(&[])
             }
-        }
+        })?;
 
         let (runner, runner_input) = crate::plugingo::runner::parse_runner_with_default(
             &spec.runner,
@@ -427,13 +408,8 @@ impl ManagedDriver for GoDownloadDriver {
             go_version: spec.go_version,
             runner,
         };
-        let hash = {
-            let mut h = DebugHasher::new(Xxh3Default::new(), || {
-                format!("go_download_{}", req.target_spec.addr.format())
-            });
-            def.hash(&mut h);
-            format!("{:x}", h.finish()).into_bytes()
-        };
+        let hash =
+            crate::plugingo::parse_util::def_hash("go_download", &req.target_spec.addr, &def);
 
         // The package is a literal directory in front of the pattern.
         let glob = hmodel::htpkg::join_rel_checked(

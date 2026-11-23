@@ -26,16 +26,16 @@
 //! wrappers, lostcancel, …) keep full fidelity because facts cross the boundary —
 //! which export-data-only linting cannot do.
 
-use crate::plugingo::deps::{DepGroups, dep_origin};
+use crate::plugingo::deps::{DepGroups, DepShape, dep_inputs};
+use crate::plugingo::parse_util::{def_hash, pkg_outputs};
 use crate::plugingo::tool_log::ToolLog;
 use anyhow::Context;
 use async_trait::async_trait;
-use hcore::debug_hash::DebugHasher;
 use hcore::hasync::Cancellable;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
 use hdriver_support::run_log::Streams;
-use hplugin::driver::targetdef::path::{CodegenMode, Content, Path as TPath};
-use hplugin::driver::targetdef::{CacheConfig, Input, InputMode, Output, TargetDef};
+use hplugin::driver::targetdef::path::CodegenMode;
+use hplugin::driver::targetdef::{CacheConfig, TargetDef};
 use hplugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
     ParseResponse, TargetAddr,
@@ -47,7 +47,6 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use xxhash_rust::xxh3::Xxh3Default;
 
 /// Output filenames (package-relative). Kept in sync between [`build_lint_spec`]
 /// (the declared outputs) and [`GoLintDriver::run`] (where they are written).
@@ -243,47 +242,24 @@ impl ManagedDriver for GoLintDriver {
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ParseResponse> {
         let pkg = req.target_spec.addr.package.clone();
-        let pkg_str = pkg.as_str();
         let spec = GoLintSpec::from(&req.target_spec.config).context("parse go_lint config")?;
 
-        let mut inputs: Vec<Input> = Vec::new();
-        let mut groups: Vec<&String> = spec.deps.keys().collect();
-        groups.sort();
-        for group in groups {
-            let addrs = spec.deps.get(group).expect("group key from same map");
-            // The govet binary is staged read-only (one tool, shared, hardlinked)
-            // and **per-file**: without that, staging symlinks the whole subtree in
-            // and records only its root *directory* in the list file, so
-            // `single_staged_path` would hand a directory to exec (EACCES). Per-file
-            // staging hardlinks each file and lists it, so the path we exec is the
-            // binary itself.
-            let read_only = group.as_str() == GOVET_TOOL_GROUP;
-            let annotations = if read_only {
-                BTreeMap::from([
-                    (
-                        hdriver_support::stage::READ_ONLY_ANNOTATION.to_string(),
-                        "true".to_string(),
-                    ),
-                    (
-                        hdriver_support::stage::STAGE_PER_FILE_ANNOTATION.to_string(),
-                        "true".to_string(),
-                    ),
+        // The govet binary is staged read-only (one tool, shared, hardlinked) and
+        // **per-file**: without that, staging symlinks the whole subtree in and
+        // records only its root *directory* in the list file, so
+        // `single_staged_path` would hand a directory to exec (EACCES). Per-file
+        // staging hardlinks each file and lists it, so the path we exec is the
+        // binary itself.
+        let mut inputs = dep_inputs(&spec.deps, &pkg, |group, _| {
+            if group == GOVET_TOOL_GROUP {
+                DepShape::staged(&[
+                    hdriver_support::stage::READ_ONLY_ANNOTATION,
+                    hdriver_support::stage::STAGE_PER_FILE_ANNOTATION,
                 ])
             } else {
-                BTreeMap::new()
-            };
-            for (i, addr_str) in addrs.iter().enumerate() {
-                inputs.push(Input {
-                    r#ref: TargetAddr::parse(addr_str, &pkg)
-                        .with_context(|| format!("parse dep addr {addr_str}"))?,
-                    mode: InputMode::Standard,
-                    origin_id: dep_origin(group, i),
-                    annotations: annotations.clone(),
-                    hashed: true,
-                    runtime: true,
-                });
+                DepShape::staged(&[])
             }
-        }
+        })?;
 
         let (runner, runner_input) = super::runner::parse_runner_with_default(
             &spec.runner,
@@ -304,36 +280,8 @@ impl ManagedDriver for GoLintDriver {
             deps: DepGroups::of(&spec.deps),
         };
 
-        let outputs: Vec<Output> = spec
-            .out
-            .iter()
-            .map(|(group, paths)| Output {
-                group: group.clone(),
-                paths: paths
-                    .iter()
-                    .map(|p| {
-                        let full_path = if pkg_str.is_empty() {
-                            p.clone()
-                        } else {
-                            format!("{pkg_str}/{p}")
-                        };
-                        TPath {
-                            content: Content::FilePath(full_path),
-                            codegen_tree: CodegenMode::None,
-                            collect: true,
-                        }
-                    })
-                    .collect(),
-            })
-            .collect();
-
-        let hash = {
-            let mut h = DebugHasher::new(Xxh3Default::new(), || {
-                format!("go_lint_{}", req.target_spec.addr.format())
-            });
-            def.hash(&mut h);
-            format!("{:x}", h.finish()).into_bytes()
-        };
+        let outputs = pkg_outputs(pkg.as_str(), &spec.out, &CodegenMode::None);
+        let hash = def_hash("go_lint", &req.target_spec.addr, &def);
 
         Ok(ParseResponse {
             target_def: TargetDef {
@@ -758,42 +706,27 @@ impl ManagedDriver for GoLintGateDriver {
         let pkg = req.target_spec.addr.package.clone();
         let spec = GoLintGateSpec::from(&req.target_spec.config).context("parse go_lint_gate")?;
 
-        let mut inputs: Vec<Input> = Vec::new();
-        let mut groups: Vec<&String> = spec.deps.keys().collect();
-        groups.sort();
-        for group in groups {
-            for (i, addr_str) in spec.deps.get(group).expect("group key").iter().enumerate() {
-                inputs.push(Input {
-                    r#ref: TargetAddr::parse(addr_str, &pkg)
-                        .with_context(|| format!("parse dep addr {addr_str}"))?,
-                    mode: InputMode::Standard,
-                    origin_id: dep_origin(group, i),
-                    // One unpack root per report: every variant's analyze target
-                    // is in this same package and emits `lint-report.json`, so
-                    // they would otherwise all claim one sandbox path (see
-                    // `report_unpack_root`).
-                    annotations: if group.as_str() == "report" {
-                        BTreeMap::from([("unpack_root".to_string(), report_unpack_root(i))])
-                    } else {
-                        BTreeMap::new()
-                    },
-                    hashed: true,
-                    // The golangci config is a hash-only input: it re-keys the
-                    // target on any `.golangci.yml` change without staging the
-                    // file (this target never reads it — it only consumes the
-                    // analyze report). Every other dep is staged as usual.
-                    runtime: group.as_str() != "config",
-                });
-            }
-        }
+        let inputs = dep_inputs(&spec.deps, &pkg, |group, i| DepShape {
+            // One unpack root per report: every variant's analyze target is in
+            // this same package and emits `lint-report.json`, so they would
+            // otherwise all claim one sandbox path (see `report_unpack_root`).
+            annotations: if group == "report" {
+                BTreeMap::from([("unpack_root".to_string(), report_unpack_root(i))])
+            } else {
+                BTreeMap::new()
+            },
+            // The golangci config is a hash-only input: it re-keys the target on
+            // any `.golangci.yml` change without staging the file (this target
+            // never reads it — it only consumes the analyze report). Every other
+            // dep is staged as usual.
+            runtime: group != "config",
+        })?;
 
-        let hash = {
-            let mut h = DebugHasher::new(Xxh3Default::new(), || {
-                format!("go_lint_gate_{}", req.target_spec.addr.format())
-            });
-            GO_LINT_GATE_FORMAT_VERSION.hash(&mut h);
-            format!("{:x}", h.finish()).into_bytes()
-        };
+        let hash = def_hash(
+            "go_lint_gate",
+            &req.target_spec.addr,
+            &GO_LINT_GATE_FORMAT_VERSION,
+        );
 
         Ok(ParseResponse {
             target_def: TargetDef {
@@ -1091,72 +1024,39 @@ impl ManagedDriver for GoLintFixDriver {
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ParseResponse> {
         let pkg = req.target_spec.addr.package.clone();
-        let pkg_str = pkg.as_str();
         let spec = GoLintFixSpec::from(&req.target_spec.config).context("parse go_lint_fix")?;
 
-        let mut inputs: Vec<Input> = Vec::new();
-        let mut groups: Vec<&String> = spec.deps.keys().collect();
-        groups.sort();
-        for group in groups {
-            for (i, addr_str) in spec.deps.get(group).expect("group key").iter().enumerate() {
-                inputs.push(Input {
-                    r#ref: TargetAddr::parse(addr_str, &pkg)
-                        .with_context(|| format!("parse dep addr {addr_str}"))?,
-                    mode: InputMode::Standard,
-                    origin_id: dep_origin(group, i),
-                    // One unpack root per report: every variant's analyze target
-                    // is in this same package and emits `lint-report.json`, so
-                    // they would otherwise all claim one sandbox path (see
-                    // `report_unpack_root`).
-                    annotations: if group.as_str() == "report" {
-                        BTreeMap::from([("unpack_root".to_string(), report_unpack_root(i))])
-                    } else {
-                        BTreeMap::new()
-                    },
-                    hashed: true,
-                    // The golangci config is a hash-only input: it re-keys the
-                    // target on any `.golangci.yml` change without staging the
-                    // file (this target never reads it — it only consumes the
-                    // analyze report). Every other dep is staged as usual.
-                    runtime: group.as_str() != "config",
-                });
-            }
-        }
+        let inputs = dep_inputs(&spec.deps, &pkg, |group, i| DepShape {
+            // One unpack root per report: every variant's analyze target is in
+            // this same package and emits `lint-report.json`, so they would
+            // otherwise all claim one sandbox path (see `report_unpack_root`).
+            annotations: if group == "report" {
+                BTreeMap::from([("unpack_root".to_string(), report_unpack_root(i))])
+            } else {
+                BTreeMap::new()
+            },
+            // The golangci config is a hash-only input: it re-keys the target on
+            // any `.golangci.yml` change without staging the file (this target
+            // never reads it — it only consumes the analyze report). Every other
+            // dep is staged as usual.
+            runtime: group != "config",
+        })?;
 
         // The rewritten `.go` files are `codegen=in_place` outputs: the engine
         // writes them back over the tracked source files after a top-level run.
-        let outputs: Vec<Output> = spec
-            .out
-            .iter()
-            .map(|(group, paths)| Output {
-                group: group.clone(),
-                paths: paths
-                    .iter()
-                    .map(|p| {
-                        let full_path = if pkg_str.is_empty() {
-                            p.clone()
-                        } else {
-                            format!("{pkg_str}/{p}")
-                        };
-                        TPath {
-                            content: Content::FilePath(full_path),
-                            codegen_tree: CodegenMode::InPlace {
-                                write_on_failure: true,
-                            },
-                            collect: true,
-                        }
-                    })
-                    .collect(),
-            })
-            .collect();
+        let outputs = pkg_outputs(
+            pkg.as_str(),
+            &spec.out,
+            &CodegenMode::InPlace {
+                write_on_failure: true,
+            },
+        );
 
-        let hash = {
-            let mut h = DebugHasher::new(Xxh3Default::new(), || {
-                format!("go_lint_fix_{}", req.target_spec.addr.format())
-            });
-            GO_LINT_FIX_FORMAT_VERSION.hash(&mut h);
-            format!("{:x}", h.finish()).into_bytes()
-        };
+        let hash = def_hash(
+            "go_lint_fix",
+            &req.target_spec.addr,
+            &GO_LINT_FIX_FORMAT_VERSION,
+        );
 
         Ok(ParseResponse {
             target_def: TargetDef {
@@ -1472,6 +1372,7 @@ pub fn build_lint_fix_spec(
 mod tests {
     use super::*;
     use hmodel::htpkg::PkgBuf;
+    use hplugin::driver::targetdef::path::Content;
 
     const V: &str = crate::plugingo::toolchain::DEFAULT_GO_VERSION;
 

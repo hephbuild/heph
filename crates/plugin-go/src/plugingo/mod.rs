@@ -15,6 +15,9 @@ pub mod gocache;
 mod govet;
 mod listed;
 mod module_fetch;
+#[cfg(test)]
+mod parse_pins;
+mod parse_util;
 mod pkg_analysis;
 mod provider;
 mod target_bin;

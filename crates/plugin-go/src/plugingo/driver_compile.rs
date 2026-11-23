@@ -12,20 +12,20 @@
 //! `-shared`, `-symabis`, `-asmhdr`, `-embedcfg`) so archives stay
 //! byte-compatible.
 
-use crate::plugingo::deps::{DepGroups, dep_origin};
+use crate::plugingo::deps::{DepGroups, DepShape, dep_inputs};
 use crate::plugingo::embed;
 use crate::plugingo::factors::BuildMode;
 use crate::plugingo::listed;
+use crate::plugingo::parse_util::{def_hash, pkg_outputs};
 use crate::plugingo::pkg_analysis::decode_go_package;
 use crate::plugingo::tool_log::ToolLog;
 use anyhow::Context;
 use async_trait::async_trait;
-use hcore::debug_hash::DebugHasher;
 use hcore::hasync::Cancellable;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
 use hdriver_support::run_log::Streams;
-use hplugin::driver::targetdef::path::{CodegenMode, Content, Path};
-use hplugin::driver::targetdef::{CacheConfig, Input, InputMode, Output, TargetDef};
+use hplugin::driver::targetdef::path::CodegenMode;
+use hplugin::driver::targetdef::{CacheConfig, TargetDef};
 use hplugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
     ParseResponse, TargetAddr,
@@ -38,7 +38,6 @@ use std::ffi::OsString;
 use std::hash::{Hash, Hasher};
 use std::io::BufRead;
 use std::sync::Arc;
-use xxhash_rust::xxh3::Xxh3Default;
 
 pub struct GoCompileDriver {
     /// Default exec runner for this driver's tool, from the plugin's `runner:`
@@ -269,61 +268,25 @@ impl ManagedDriver for GoCompileDriver {
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ParseResponse> {
         let pkg = req.target_spec.addr.package.clone();
-        let pkg_str = pkg.as_str();
         let spec =
             GoCompileSpec::from(&req.target_spec.config).context("parse go_compile config")?;
 
-        let mut inputs: Vec<Input> = Vec::new();
-        let mut golist_origin_id: Option<String> = None;
-        let mut embed_src_origin_ids: Vec<String> = Vec::new();
-
-        let mut groups: Vec<&String> = spec.deps.keys().collect();
-        groups.sort();
-        for group in groups {
-            let addrs = spec.deps.get(group).expect("group key from same map");
-            let is_sdk = group.as_str() == crate::plugingo::addr_util::GO_SDK_DEP_GROUP;
-            let is_embed_src = group.as_str() == "embed_src";
-            // SDK and embed assets are read-only: staged once into the shared
-            // stage and hardlinked in. embed_src also goes per-file so the run
-            // step can enumerate it from the list.
-            let annotations = if is_sdk {
-                BTreeMap::from([(
-                    hdriver_support::stage::READ_ONLY_ANNOTATION.to_string(),
-                    "true".to_string(),
-                )])
-            } else if is_embed_src {
-                BTreeMap::from([
-                    (
-                        hdriver_support::stage::READ_ONLY_ANNOTATION.to_string(),
-                        "true".to_string(),
-                    ),
-                    (
-                        hdriver_support::stage::STAGE_PER_FILE_ANNOTATION.to_string(),
-                        "true".to_string(),
-                    ),
-                ])
-            } else {
-                BTreeMap::new()
-            };
-            for (i, addr_str) in addrs.iter().enumerate() {
-                let origin_id = dep_origin(group, i);
-                if group == "golist" && golist_origin_id.is_none() {
-                    golist_origin_id = Some(origin_id.clone());
-                }
-                if is_embed_src {
-                    embed_src_origin_ids.push(origin_id.clone());
-                }
-                inputs.push(Input {
-                    r#ref: TargetAddr::parse(addr_str, &pkg)
-                        .with_context(|| format!("parse dep addr {addr_str}"))?,
-                    mode: InputMode::Standard,
-                    origin_id,
-                    annotations: annotations.clone(),
-                    hashed: true,
-                    runtime: true,
-                });
+        // SDK and embed assets are read-only: staged once into the shared stage
+        // and hardlinked in. embed_src also goes per-file so the run step can
+        // enumerate it from the list.
+        let mut inputs = dep_inputs(&spec.deps, &pkg, |group, _| match group {
+            crate::plugingo::addr_util::GO_SDK_DEP_GROUP => {
+                DepShape::staged(&[hdriver_support::stage::READ_ONLY_ANNOTATION])
             }
-        }
+            "embed_src" => DepShape::staged(&[
+                hdriver_support::stage::READ_ONLY_ANNOTATION,
+                hdriver_support::stage::STAGE_PER_FILE_ANNOTATION,
+            ]),
+            _ => DepShape::staged(&[]),
+        })?;
+        let deps = DepGroups::of(&spec.deps);
+        let golist_origin_id = deps.origins("golist").next();
+        let embed_src_origin_ids: Vec<String> = deps.origins("embed_src").collect();
 
         let embed_variant = spec
             .embed_variant
@@ -363,39 +326,11 @@ impl ManagedDriver for GoCompileDriver {
                 None
             },
             embed_src_origin_ids,
-            deps: DepGroups::of(&spec.deps),
+            deps,
         };
 
-        let outputs: Vec<Output> = spec
-            .out
-            .iter()
-            .map(|(group, paths)| Output {
-                group: group.clone(),
-                paths: paths
-                    .iter()
-                    .map(|p| {
-                        let full_path = if pkg_str.is_empty() {
-                            p.clone()
-                        } else {
-                            format!("{pkg_str}/{p}")
-                        };
-                        Path {
-                            content: Content::FilePath(full_path),
-                            codegen_tree: CodegenMode::None,
-                            collect: true,
-                        }
-                    })
-                    .collect(),
-            })
-            .collect();
-
-        let hash = {
-            let mut h = DebugHasher::new(Xxh3Default::new(), || {
-                format!("go_compile_{}", req.target_spec.addr.format())
-            });
-            def.hash(&mut h);
-            format!("{:x}", h.finish()).into_bytes()
-        };
+        let outputs = pkg_outputs(pkg.as_str(), &spec.out, &CodegenMode::None);
+        let hash = def_hash("go_compile", &req.target_spec.addr, &def);
 
         // The shared `GOCACHE`, as a scratch reference — one cache per Go module
         // per variant, the same slot the golist targets of that module and

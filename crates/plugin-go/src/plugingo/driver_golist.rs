@@ -1,17 +1,18 @@
+use crate::plugingo::deps::DepShape;
 use crate::plugingo::module_fetch::{add_fetch_env, is_settled_package_error};
+use crate::plugingo::parse_util::{def_hash, pkg_outputs};
 use crate::plugingo::pkg_analysis::{
     GoPackage, encode_go_package, encode_package_addrs, resolve_package_addrs,
 };
 use crate::plugingo::tool_log::ToolLog;
 use anyhow::Context;
 use async_trait::async_trait;
-use hcore::debug_hash::DebugHasher;
 use hcore::hasync::Cancellable;
 use hcore::htvalue::signature::ParamType;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
 use hdriver_support::run_log::Streams;
-use hplugin::driver::targetdef::path::{CodegenMode, Content, Path};
-use hplugin::driver::targetdef::{CacheConfig, Input, InputMode, Output, TargetDef};
+use hplugin::driver::targetdef::path::CodegenMode;
+use hplugin::driver::targetdef::{CacheConfig, Input, TargetDef};
 use hplugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
     ParseResponse, TargetAddr,
@@ -22,7 +23,6 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use xxhash_rust::xxh3::Xxh3Default;
 
 /// The `-json=` field selection every `go list` in this plugin asks for. Named
 /// rather than inlined so the shape stays in one place: the field set is part of
@@ -298,47 +298,23 @@ impl ManagedDriver for GoGolistDriver {
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ParseResponse> {
         let pkg = req.target_spec.addr.package.clone();
-        let pkg_str = pkg.as_str();
 
         let spec = GoGolistSpec::from(&req.target_spec.config).context("parse go_golist config")?;
 
-        // Parse deps (srcfiles, modfiles) — no go_bin here
-        let dep_strings = spec.deps;
-
-        let mut dep_groups: Vec<&String> = dep_strings.keys().collect();
-        dep_groups.sort();
-        let mut dep_inputs: Vec<Input> = Vec::new();
-        for group in dep_groups {
-            let addrs = dep_strings.get(group).expect("group key from same map");
-            // The hermetic SDK (group `gosdk`) is read-only and identical across
-            // every golist target — stage it once and hardlink it into each
-            // sandbox instead of byte-copying the whole tree (incl. ~150 MB of
-            // std `src/`) per package. Source deps keep the source-map
-            // annotation so golist can map codegen output back to its target.
-            let is_sdk = group.as_str() == crate::plugingo::addr_util::GO_SDK_DEP_GROUP;
-            let annotations = if is_sdk {
-                std::collections::BTreeMap::from([(
-                    hdriver_support::stage::READ_ONLY_ANNOTATION.to_string(),
-                    "true".to_string(),
-                )])
+        // Parse deps (srcfiles, modfiles) — no go_bin here.
+        //
+        // The hermetic SDK (group `gosdk`) is read-only and identical across
+        // every golist target — stage it once and hardlink it into each sandbox
+        // instead of byte-copying the whole tree (incl. ~150 MB of std `src/`)
+        // per package. Source deps keep the source-map annotation so golist can
+        // map codegen output back to its target.
+        let mut dep_inputs = crate::plugingo::deps::dep_inputs(&spec.deps, &pkg, |group, _| {
+            DepShape::staged(&[if group == crate::plugingo::addr_util::GO_SDK_DEP_GROUP {
+                hdriver_support::stage::READ_ONLY_ANNOTATION
             } else {
-                std::collections::BTreeMap::from([(
-                    hdriver_support::driver_managed::SOURCE_MAP_ANNOTATION.to_string(),
-                    "true".to_string(),
-                )])
-            };
-            for (i, addr_str) in addrs.iter().enumerate() {
-                dep_inputs.push(Input {
-                    r#ref: TargetAddr::parse(addr_str, &pkg)
-                        .with_context(|| format!("parse dep addr {addr_str}"))?,
-                    mode: InputMode::Standard,
-                    origin_id: crate::plugingo::deps::dep_origin(group, i),
-                    annotations: annotations.clone(),
-                    hashed: true,
-                    runtime: true,
-                });
-            }
-        }
+                hdriver_support::driver_managed::SOURCE_MAP_ANNOTATION
+            }])
+        })?;
 
         let (runner, runner_input) = super::runner::parse_runner_with_default(
             &spec.runner,
@@ -387,37 +363,8 @@ impl ManagedDriver for GoGolistDriver {
             firstparty: spec.firstparty,
         };
 
-        let hash = {
-            let mut h = DebugHasher::new(Xxh3Default::new(), || {
-                format!("go_golist_{}", req.target_spec.addr.format())
-            });
-            def.hash(&mut h);
-            format!("{:x}", h.finish()).into_bytes()
-        };
-
-        // Parse outputs from spec, prepend package path
-        let outputs = spec
-            .out
-            .iter()
-            .map(|(group, paths)| Output {
-                group: group.clone(),
-                paths: paths
-                    .iter()
-                    .map(|p| {
-                        let full_path = if pkg_str.is_empty() {
-                            p.clone()
-                        } else {
-                            format!("{pkg_str}/{p}")
-                        };
-                        Path {
-                            content: Content::FilePath(full_path),
-                            codegen_tree: CodegenMode::None,
-                            collect: true,
-                        }
-                    })
-                    .collect(),
-            })
-            .collect();
+        let hash = def_hash("go_golist", &req.target_spec.addr, &def);
+        let outputs = pkg_outputs(pkg.as_str(), &spec.out, &CodegenMode::None);
 
         Ok(ParseResponse {
             target_def: TargetDef {
@@ -797,6 +744,9 @@ mod tests {
     use super::*;
     use crate::plugingo::pkg_analysis::GoModule;
     use hmodel::htpkg::PkgBuf;
+    use hplugin::driver::targetdef::InputMode;
+    use hplugin::driver::targetdef::path::Content;
+    use xxhash_rust::xxh3::Xxh3Default;
 
     fn driver() -> GoGolistDriver {
         GoGolistDriver::new()

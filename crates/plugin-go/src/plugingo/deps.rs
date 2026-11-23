@@ -16,6 +16,67 @@ pub(crate) fn dep_origin(group: &str, i: usize) -> String {
     format!("dep|{group}|{i}")
 }
 
+/// How `parse` declares one dep: the annotations it carries and whether it is
+/// staged. Every dep is hashed.
+pub(crate) struct DepShape {
+    pub(crate) annotations: BTreeMap<String, String>,
+    /// `false` for a hash-only dep: it keys the target but is never staged.
+    pub(crate) runtime: bool,
+}
+
+impl DepShape {
+    /// A staged dep with each of `flags` (a `stage` annotation) set to `"true"`.
+    pub(crate) fn staged(flags: &[&str]) -> Self {
+        Self {
+            annotations: flags
+                .iter()
+                .map(|f| (f.to_string(), "true".to_string()))
+                .collect(),
+            runtime: true,
+        }
+    }
+}
+
+/// The input for the `i`-th dep of `group`, origin [`dep_origin`]`(group, i)`.
+pub(crate) fn dep_input(
+    r#ref: hplugin::driver::TargetAddr,
+    group: &str,
+    i: usize,
+    shape: DepShape,
+) -> hplugin::driver::targetdef::Input {
+    hplugin::driver::targetdef::Input {
+        r#ref,
+        mode: hplugin::driver::targetdef::InputMode::Standard,
+        origin_id: dep_origin(group, i),
+        annotations: shape.annotations,
+        hashed: true,
+        runtime: shape.runtime,
+    }
+}
+
+/// The inputs for a target's `deps`, resolved against `pkg`: groups in sorted
+/// order, so `HashMap` iteration order cannot reach the input list (or a def
+/// hash that folds it in), and each group's deps in declared order. `shape`
+/// gives the `i`-th dep of a group its [`DepShape`].
+pub(crate) fn dep_inputs(
+    deps: &HashMap<String, Vec<String>>,
+    pkg: &hmodel::htpkg::PkgBuf,
+    shape: impl Fn(&str, usize) -> DepShape,
+) -> anyhow::Result<Vec<hplugin::driver::targetdef::Input>> {
+    use anyhow::Context as _;
+    let mut groups: Vec<(&String, &Vec<String>)> = deps.iter().collect();
+    groups.sort_unstable_by_key(|(group, _)| *group);
+    let mut out = Vec::with_capacity(groups.iter().map(|(_, addrs)| addrs.len()).sum());
+    for (group, addrs) in groups {
+        for (i, addr) in addrs.iter().enumerate() {
+            let r#ref = hplugin::driver::TargetAddr::parse(addr, pkg)
+                .with_context(|| format!("parse dep addr {addr}"))?;
+            out.push(dep_input(r#ref, group, i, shape(group, i)));
+        }
+    }
+    Ok(out)
+}
+
 /// How many deps each group of a target's `deps` declared, kept on the def so
 /// `run` can rebuild every origin `parse` handed out.
 ///
@@ -32,7 +93,7 @@ impl DepGroups {
     }
 
     /// The origins of `group`'s deps, in declaration order.
-    fn origins<'s>(&'s self, group: &'s str) -> impl Iterator<Item = String> + 's {
+    pub(crate) fn origins<'s>(&'s self, group: &'s str) -> impl Iterator<Item = String> + 's {
         let n = self.0.get(group).copied().unwrap_or(0);
         (0..n).map(move |i| dep_origin(group, i))
     }
