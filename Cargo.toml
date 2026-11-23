@@ -157,7 +157,7 @@ hxstarlark-fmt = { package = "xstarlark-fmt", path = "crates/xstarlark-fmt" }
 htspec-derive = { path = "crates/htspec-derive" }
 nom = { version = "8", default-features = false, features = ["std"] }
 anyhow = "1.0.104"
-tokio = { version = "1.54.1", features = ["rt", "rt-multi-thread", "io-util", "io-std", "process", "macros", "sync", "signal", "fs", "test-util", "tracing", "net"] }
+tokio = { version = "1.54.1", features = ["rt", "rt-multi-thread", "io-util", "io-std", "process", "macros", "sync", "signal", "fs", "time", "tracing", "net"] }
 # `frame-pointer` swaps pprof's stack walk from `_Unwind_Backtrace` (not
 # async-signal-safe — it faulted the process it was profiling) to a frame-pointer
 # chain walk that probes every address before dereferencing it. It needs the

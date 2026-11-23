@@ -95,7 +95,7 @@ smart-default = "0.7.1"
 stacker = "0.1"
 strsim = "0.11.1"
 tar = "0.4"
-tokio = { version = "1.54.1", features = ["rt", "rt-multi-thread", "io-util", "io-std", "process", "macros", "sync", "signal", "fs", "test-util", "tracing", "net"] }
+tokio = { version = "1.54.1", features = ["rt", "rt-multi-thread", "io-util", "io-std", "process", "macros", "sync", "signal", "fs", "time", "tracing", "net"] }
 tokio-util = { version = "0.7.20", features = ["io", "io-util"] }
 tracing = "0.1"
 url = "2.5.8"
@@ -113,3 +113,5 @@ humantime = "2.4.0"
 hplugin-buildfile = { package = "plugin-buildfile", path = "../plugin-buildfile" }
 serde-jsonlines = "0.7.0"
 tempfile = "3"
+# The paused clock (`start_paused`, `time::advance`), for tests only.
+tokio = { version = "1.54.1", features = ["test-util"] }
