@@ -48,6 +48,7 @@ const LAYOUTS: &[Layout] = &[
             "deferred.rs",
             "entrypoint.rs",
             "run_terminal.rs",
+            "session_export_env.rs",
         ],
         support: &["common"],
     },
