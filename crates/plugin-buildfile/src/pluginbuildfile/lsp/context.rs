@@ -95,13 +95,8 @@ impl HephLspContext {
         let patterns = buildfile_patterns(&*engine);
         let runtime = tokio::runtime::Handle::current();
         let drivers = Drivers::new(DriverSource::default());
-        let provider = build_listing_provider(
-            &root,
-            &patterns,
-            &registry,
-            &drivers.source,
-            runtime.clone(),
-        );
+        let provider =
+            build_listing_provider(&root, &patterns, &registry, &drivers, runtime.clone());
         let shared = SharedState::new(
             engine,
             root.clone(),
@@ -139,12 +134,12 @@ impl HephLspContext {
     }
 
     fn fresh_provider(&self) -> Arc<Provider> {
-        let source = self.drivers.lock().expect("drivers lock").source.clone();
+        let drivers = self.drivers.lock().expect("drivers lock");
         build_listing_provider(
             &self.root,
             &self.patterns,
             &self.registry,
-            &source,
+            &drivers,
             self.runtime.clone(),
         )
     }
@@ -311,21 +306,24 @@ fn first_build_file(dir: &Path, patterns: &[glob::Pattern]) -> Option<PathBuf> {
 
 /// Build a fresh buildfile provider for package/target listing, configured with
 /// the same patterns the engine's provider uses and the aggregated function
-/// registry and drivers (so `list(pkg)` can evaluate BUILD files).
+/// registry and drivers (so `list(pkg)` can evaluate BUILD files). It shares
+/// `drivers`' globals, built from the same registry and kwargs, so a rebuild
+/// after [`LISTING_TTL`] drops the provider's caches but not the globals.
 fn build_listing_provider(
     root: &Path,
     patterns: &[glob::Pattern],
     registry: &Arc<FunctionRegistry>,
-    drivers: &DriverSource,
+    drivers: &Drivers,
     runtime: tokio::runtime::Handle,
 ) -> Arc<Provider> {
     let provider = Provider {
         root: root.to_path_buf(),
         build_file_patterns: patterns.to_vec(),
+        globals: Arc::clone(&drivers.globals),
         ..Provider::base(Memoizer::with_tag_task("buildfile_pkg", runtime))
     }
     .with_function_registry(Arc::clone(registry))
-    .with_drivers(drivers.clone());
+    .with_drivers(drivers.source.clone());
     Arc::new(provider)
 }
 
@@ -691,6 +689,39 @@ mod tests {
             Some(&("//lib".to_string(), "make_name".to_string())),
             "the loaded symbol must still resolve for goto-definition"
         );
+    }
+
+    /// The listing provider evaluates with the globals the buffer evaluation
+    /// builds, so a rebuild after the TTL does not build them again; new
+    /// drivers replace both, since globals built without them lack the
+    /// `Kwargs`.
+    #[test]
+    fn listing_provider_shares_the_evaluation_globals() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let ctx = rt.block_on(async {
+            HephLspContext::new(Arc::new(FakeEngine {
+                root: dir.path().to_path_buf(),
+            }))
+        });
+        let globals =
+            |ctx: &HephLspContext| Arc::clone(&ctx.drivers.lock().expect("drivers lock").globals);
+
+        let before = globals(&ctx);
+        assert!(Arc::ptr_eq(&ctx.provider().globals, &before));
+        assert!(
+            Arc::ptr_eq(&ctx.fresh_provider().globals, &before),
+            "a rebuilt listing provider keeps the globals"
+        );
+
+        ctx.set_drivers(crate::pluginbuildfile::provider::DriverSource::default());
+        let after = globals(&ctx);
+        assert!(!Arc::ptr_eq(&before, &after), "new drivers, new globals");
+        assert!(Arc::ptr_eq(&ctx.provider().globals, &after));
     }
 
     #[test]
