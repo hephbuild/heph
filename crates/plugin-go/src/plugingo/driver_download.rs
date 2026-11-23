@@ -412,21 +412,14 @@ impl ManagedDriver for GoDownloadDriver {
 
         // The shared module cache: unhashed, because a warm and a cold cache hand
         // back the same bytes. See the exemption on `DOWNLOAD_ONLY_PASS_ENV`.
-        inputs.push(Input {
-            r#ref: TargetAddr {
+        inputs.push(hdriver_support::scratch::input(
+            TargetAddr {
                 r#ref: crate::plugingo::gocache::modcache_addr(),
                 output: None,
                 filters: vec![],
             },
-            mode: InputMode::Standard,
-            origin_id: format!("{}|0", hdriver_support::scratch::SCRATCH_ORIGIN_PREFIX),
-            annotations: BTreeMap::from([(
-                hdriver_support::scratch::SCRATCH_ANNOTATION.to_string(),
-                "true".to_string(),
-            )]),
-            hashed: false,
-            runtime: false,
-        });
+            0,
+        ));
 
         let def = GoDownloadDef {
             module: spec.module,

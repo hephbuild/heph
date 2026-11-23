@@ -363,21 +363,14 @@ impl ManagedDriver for GoGolistDriver {
             goarch: spec.goarch.clone(),
             variant: spec.go_variant.clone(),
         };
-        let gocache_input = Input {
-            r#ref: TargetAddr {
+        let gocache_input = hdriver_support::scratch::input(
+            TargetAddr {
                 r#ref: gocache_key.addr(),
                 output: None,
                 filters: vec![],
             },
-            mode: InputMode::Standard,
-            origin_id: format!("{}|0", hdriver_support::scratch::SCRATCH_ORIGIN_PREFIX),
-            annotations: std::collections::BTreeMap::from([(
-                hdriver_support::scratch::SCRATCH_ANNOTATION.to_string(),
-                "true".to_string(),
-            )]),
-            hashed: false,
-            runtime: false,
-        };
+            0,
+        );
 
         let def = GoGolistDef {
             runner,

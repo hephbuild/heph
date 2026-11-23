@@ -1683,42 +1683,9 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
         let dep_group_inputs = grouped(&dep_inputs);
         let runtime_dep_group_inputs = grouped(&runtime_dep_inputs);
 
-        // Scratch references. `hashed: false, runtime: false` is the one
-        // combination nothing else uses, and it is exactly right: a scratch
-        // materializes no artifacts (its declaration has none) and must not touch
-        // this target's cache key, because a target's outputs are required to be
-        // identical whether its scratch is warm, cold, or absent. The edge exists
-        // so the graph knows about it — which is what makes `heph query revdeps`
-        // answer "who shares this cache?" and what turns a bad addr into an
-        // ordinary `TargetNotFoundError`.
-        //
-        // Order is the declared order, deduped: a repeated reference would mount
-        // one directory twice and set one env var twice, which is a BUILD-file
-        // mistake worth naming rather than quietly collapsing.
-        let mut seen_scratch: BTreeMap<String, usize> = BTreeMap::new();
-        let mut scratch_inputs: Vec<Input> = Vec::with_capacity(spec.scratch.len());
-        for (i, raw) in spec.scratch.iter().enumerate() {
-            let r#ref = TargetAddr::parse(raw, &pkg)?;
-            let key = r#ref.to_string();
-            if let Some(first) = seen_scratch.insert(key.clone(), i) {
-                anyhow::bail!(
-                    "scratch {key} is referenced twice (positions {first} and {i}) — a scratch \
-                     mounts at one path and sets one environment variable, so referencing it \
-                     again does nothing; drop the duplicate"
-                );
-            }
-            scratch_inputs.push(Input {
-                r#ref,
-                mode: InputMode::Standard,
-                origin_id: format!("{}|{}", hdriver_support::scratch::SCRATCH_ORIGIN_PREFIX, i),
-                annotations: BTreeMap::from([(
-                    hdriver_support::scratch::SCRATCH_ANNOTATION.to_string(),
-                    "true".to_string(),
-                )]),
-                hashed: false,
-                runtime: false,
-            });
-        }
+        // Scratch references: unhashed graph edges, in declared order, a
+        // repeated one refused; see `scratch::inputs`.
+        let scratch_inputs = hdriver_support::scratch::inputs(&spec.scratch, &pkg)?;
 
         // Credential references. The same `hashed: false, runtime: false` edge a
         // scratch uses, told apart by its annotation — and for a sharper reason

@@ -90,18 +90,11 @@ pub(crate) fn blobs_addr() -> String {
 /// reach the target's cache key: a pull returns the same image whether the store
 /// was warm or empty.
 pub(crate) fn blobs_input() -> hplugin::driver::targetdef::Input {
-    hplugin::driver::targetdef::Input {
-        r#ref: hplugin::driver::TargetAddr::parse(&blobs_addr(), &PkgBuf::from(""))
+    hdriver_support::scratch::input(
+        hplugin::driver::TargetAddr::parse(&blobs_addr(), &PkgBuf::from(""))
             .expect("the blob store addr is a constant and always parses"),
-        mode: hplugin::driver::targetdef::InputMode::Standard,
-        origin_id: format!("{}|0", hdriver_support::scratch::SCRATCH_ORIGIN_PREFIX),
-        annotations: std::collections::BTreeMap::from([(
-            hdriver_support::scratch::SCRATCH_ANNOTATION.to_string(),
-            "true".to_string(),
-        )]),
-        hashed: false,
-        runtime: false,
-    }
+        0,
+    )
 }
 
 /// The file the probe writes, relative to the workspace root.
