@@ -28,7 +28,7 @@
 
 use crate::plugingo::deps::{DepGroups, DepShape, dep_inputs};
 use crate::plugingo::parse_util::{def_hash, pkg_outputs};
-use crate::plugingo::tool_log::ToolLog;
+use crate::plugingo::tool_log::{ToolLog, run_captured};
 use anyhow::Context;
 use async_trait::async_trait;
 use hcore::hasync::Cancellable;
@@ -41,7 +41,6 @@ use hplugin::driver::{
     ParseResponse, TargetAddr,
 };
 use hplugin::htspec::Spec;
-use hproc::proc_exec;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -528,24 +527,17 @@ impl GoLintDriver {
         runner: hexecrunner::RunnerRef<'_>,
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<Vec<u8>> {
-        let env_pairs: Vec<(OsString, OsString)> = env
-            .iter()
-            .map(|(k, v)| (OsString::from(k), OsString::from(v)))
-            .collect();
-        let spec = proc_exec::Spec {
-            program: govet_bin.to_path_buf(),
+        let output = run_captured(
+            govet_bin,
             args,
-            env: env_pairs,
-            cwd: cwd.to_path_buf(),
-            stdin: proc_exec::StdioSpec::Null,
-            stdout: proc_exec::StdioSpec::Piped,
-            stderr: proc_exec::StdioSpec::Piped,
-            setsid: false,
-            ctty: false,
-        };
-        let output = hexecrunner::output(runner, spec, ctoken)
-            .await
-            .context("wait for heph-govet")?;
+            env,
+            cwd,
+            crate::plugingo::tool_log::ProcessGroup::Inherit,
+            runner,
+            ctoken,
+        )
+        .await
+        .context("wait for heph-govet")?;
         if !output.status.success() {
             // The tool's output goes to the target's log, whose tail the
             // failure box renders, rather than into the message.

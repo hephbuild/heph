@@ -17,7 +17,7 @@
 
 use crate::plugingo::deps::DepShape;
 use crate::plugingo::module_fetch::{FETCH_ACCESS_ENV, add_fetch_env};
-use crate::plugingo::tool_log::ToolLog;
+use crate::plugingo::tool_log::{ToolLog, run_captured};
 use anyhow::Context;
 use async_trait::async_trait;
 use enclose::enclose;
@@ -30,7 +30,6 @@ use hplugin::driver::{
     ParseResponse, TargetAddr,
 };
 use hplugin::htspec::Spec;
-use hproc::proc_exec;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::hash::{Hash, Hasher};
@@ -260,28 +259,24 @@ async fn fetch_module(
     std::fs::write(&stub, "module heph_ignore\n")
         .with_context(|| format!("write stub {}", stub.display()))?;
 
-    let spec = proc_exec::Spec {
-        program: go_bin.to_path_buf(),
-        args: ["mod", "download", "-modcacherw", "-json", &mod_at_ver]
-            .iter()
-            .map(OsString::from)
-            .collect(),
-        env: env
-            .iter()
-            .map(|(k, v)| (OsString::from(k), OsString::from(v)))
-            .collect(),
-        cwd: cwd.to_path_buf(),
-        stdin: proc_exec::StdioSpec::Null,
-        stdout: proc_exec::StdioSpec::Piped,
-        stderr: proc_exec::StdioSpec::Piped,
-        // setsid: in direct mode `go` forks `git` and friends; the supervisor's
-        // killpg needs the whole group, or a cancel orphans them in the module cache.
-        setsid: true,
-        ctty: false,
-    };
-    let output = hexecrunner::output(runner, spec, ctoken)
-        .await
-        .with_context(|| format!("wait for go mod download {mod_at_ver}"))?;
+    let args = ["mod", "download", "-modcacherw", "-json", &mod_at_ver]
+        .iter()
+        .map(OsString::from)
+        .collect();
+    // Its own group: in direct mode `go` forks `git` and friends; the
+    // supervisor's killpg needs the whole group, or a cancel orphans them in the
+    // module cache.
+    let output = run_captured(
+        go_bin,
+        args,
+        env,
+        cwd,
+        crate::plugingo::tool_log::ProcessGroup::Own,
+        runner,
+        ctoken,
+    )
+    .await
+    .with_context(|| format!("wait for go mod download {mod_at_ver}"))?;
     if !output.status.success() {
         // What go said (the `-json` record's `Error` on stdout, `git`'s and the
         // network's complaints on stderr) goes to the target's log, whose tail

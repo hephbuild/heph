@@ -281,19 +281,7 @@ async fn probe_host_go(
         return Ok((goroot, go_bin));
     }
 
-    let spec = hproc::proc_exec::Spec {
-        // Bare name on purpose: the runner's `PATH` is what must resolve it, and
-        // it is the same `PATH` that the `go` answering below is found on.
-        program: std::path::PathBuf::from("go"),
-        args: vec!["env".into(), "GOROOT".into()],
-        env: vec![],
-        cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/")),
-        stdin: hproc::proc_exec::StdioSpec::Null,
-        stdout: hproc::proc_exec::StdioSpec::Piped,
-        stderr: hproc::proc_exec::StdioSpec::Piped,
-        setsid: false,
-        ctty: false,
-    };
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
     // Name the runner in the failure. Under a runner the program that failed to
     // exec is the runner's, not `go` — a bare `No such file or directory` here
     // reads as "no Go toolchain" when it can equally mean the runner's own
@@ -302,9 +290,19 @@ async fn probe_host_go(
         .addr
         .map(|a| format!(" (via exec runner {})", a.format()))
         .unwrap_or_default();
-    let out = hexecrunner::output(runner, spec, ctoken)
-        .await
-        .with_context(|| format!("{driver}: run `go env GOROOT`{via}"))?;
+    let out = crate::plugingo::tool_log::run_captured(
+        // Bare name on purpose: the runner's `PATH` is what must resolve it, and
+        // it is the same `PATH` that the `go` answering below is found on.
+        std::path::Path::new("go"),
+        vec!["env".into(), "GOROOT".into()],
+        &HashMap::new(),
+        &cwd,
+        crate::plugingo::tool_log::ProcessGroup::Inherit,
+        runner,
+        ctoken,
+    )
+    .await
+    .with_context(|| format!("{driver}: run `go env GOROOT`{via}"))?;
     if !out.status.success() {
         anyhow::bail!(
             "{driver}: `go env GOROOT` failed in the runner's environment: {}\n  \

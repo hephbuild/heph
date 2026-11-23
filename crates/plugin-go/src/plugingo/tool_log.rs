@@ -23,15 +23,59 @@
 //! success's log is cached and uploaded. A failure is not cached, so it keeps
 //! both streams.
 
+use hcore::hasync::Cancellable;
 use hdriver_support::run_log::{RunLog, Streams};
 use hplugin::driver::RunRequest;
 use hplugin::error::ProcessFailed;
-use hproc::proc_exec::StreamId;
-use std::path::PathBuf;
+use hproc::proc_exec::{self, StreamId};
+use std::collections::HashMap;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::process::Output;
 
 /// The log name an older host's failure appends to.
 const LOG_NAME: &str = "log.txt";
+
+/// Which process group a Go tool runs in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProcessGroup {
+    /// Its own (`setsid`), so a cancel's `killpg` reaches whatever it forks
+    /// (`go mod download` forks `git`).
+    Own,
+    /// The supervisor's. Right for a single-process tool: the supervisor's
+    /// direct-pid kill is enough.
+    Inherit,
+}
+
+/// Run a Go tool through the target's exec `runner`: stdin closed, both
+/// streams captured, the whole output returned once it exits. Never fails on a
+/// non-zero exit; the caller reads the status, and adds its own context to an
+/// error.
+pub(crate) async fn run_captured(
+    program: &Path,
+    args: Vec<OsString>,
+    env: &HashMap<String, String>,
+    cwd: &Path,
+    group: ProcessGroup,
+    runner: hexecrunner::RunnerRef<'_>,
+    ctoken: &(dyn Cancellable + Send + Sync),
+) -> anyhow::Result<Output> {
+    let spec = proc_exec::Spec {
+        program: program.to_path_buf(),
+        args,
+        env: env
+            .iter()
+            .map(|(k, v)| (OsString::from(k), OsString::from(v)))
+            .collect(),
+        cwd: cwd.to_path_buf(),
+        stdin: proc_exec::StdioSpec::Null,
+        stdout: proc_exec::StdioSpec::Piped,
+        stderr: proc_exec::StdioSpec::Piped,
+        setsid: group == ProcessGroup::Own,
+        ctty: false,
+    };
+    hexecrunner::output(runner, spec, ctoken).await
+}
 
 /// A Go run's log, for the processes it spawns. Built once per run: under
 /// `log_capture` it takes the request's writers.

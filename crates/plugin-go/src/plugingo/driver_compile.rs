@@ -18,7 +18,7 @@ use crate::plugingo::factors::BuildMode;
 use crate::plugingo::listed;
 use crate::plugingo::parse_util::{def_hash, pkg_outputs};
 use crate::plugingo::pkg_analysis::decode_go_package;
-use crate::plugingo::tool_log::ToolLog;
+use crate::plugingo::tool_log::{ToolLog, run_captured};
 use anyhow::Context;
 use async_trait::async_trait;
 use hcore::hasync::Cancellable;
@@ -31,7 +31,6 @@ use hplugin::driver::{
     ParseResponse, TargetAddr,
 };
 use hplugin::htspec::Spec;
-use hproc::proc_exec;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -784,24 +783,17 @@ impl GoCompileDriver {
         ctoken: &(dyn Cancellable + Send + Sync),
         step: &str,
     ) -> anyhow::Result<()> {
-        let env_pairs: Vec<(OsString, OsString)> = env
-            .iter()
-            .map(|(k, v)| (OsString::from(k), OsString::from(v)))
-            .collect();
-        let spec = proc_exec::Spec {
-            program: go_bin.to_path_buf(),
+        let output = run_captured(
+            go_bin,
             args,
-            env: env_pairs,
-            cwd: cwd.to_path_buf(),
-            stdin: proc_exec::StdioSpec::Null,
-            stdout: proc_exec::StdioSpec::Piped,
-            stderr: proc_exec::StdioSpec::Piped,
-            setsid: false,
-            ctty: false,
-        };
-        let output = hexecrunner::output(runner, spec, ctoken)
-            .await
-            .with_context(|| format!("wait for go {step}"))?;
+            env,
+            cwd,
+            crate::plugingo::tool_log::ProcessGroup::Inherit,
+            runner,
+            ctoken,
+        )
+        .await
+        .with_context(|| format!("wait for go {step}"))?;
         if !output.status.success() {
             // Both streams go to the target's log, which the failure box renders
             // the tail of — `go tool` writes diagnostics to stderr, but some

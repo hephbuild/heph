@@ -4,7 +4,7 @@ use crate::plugingo::parse_util::{def_hash, pkg_outputs};
 use crate::plugingo::pkg_analysis::{
     GoPackage, encode_go_package, encode_package_addrs, resolve_package_addrs,
 };
-use crate::plugingo::tool_log::ToolLog;
+use crate::plugingo::tool_log::{ProcessGroup, ToolLog, run_captured};
 use anyhow::Context;
 use async_trait::async_trait;
 use hcore::hasync::Cancellable;
@@ -18,7 +18,6 @@ use hplugin::driver::{
     ParseResponse, TargetAddr,
 };
 use hplugin::htspec::Spec;
-use hproc::proc_exec;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::hash::{Hash, Hasher};
@@ -490,28 +489,16 @@ impl ManagedDriver for GoGolistDriver {
         }
 
         let args: Vec<OsString> = golist_args(def).iter().map(OsString::from).collect();
-        let env_pairs: Vec<(OsString, OsString)> = env
-            .iter()
-            .map(|(k, v)| (OsString::from(k), OsString::from(v)))
-            .collect();
 
-        // setsid=false: `go list` is single-process; the supervisor's
-        // direct-pid kill is sufficient on hard-shutdown.
-        let spec = proc_exec::Spec {
-            program: go_bin.clone(),
+        // `go list` is single-process; the supervisor's direct-pid kill is
+        // sufficient on hard-shutdown.
+        let output = run_captured(
+            &go_bin,
             args,
-            env: env_pairs,
-            cwd: req.sandbox_pkg_dir.clone(),
-            stdin: proc_exec::StdioSpec::Null,
-            stdout: proc_exec::StdioSpec::Piped,
-            stderr: proc_exec::StdioSpec::Piped,
-            setsid: false,
-            ctty: false,
-        };
-
-        let output = hexecrunner::output(
-            super::runner::runner_ref(req.request.request_id, def.runner.as_ref()),
-            spec,
+            &env,
+            &req.sandbox_pkg_dir,
+            ProcessGroup::Inherit,
+            runner,
             ctoken,
         )
         .await

@@ -13,7 +13,7 @@
 //! (`formatters:` block), passed via `HEPH_GOVET_GOLANGCI_CONFIG` exactly like
 //! the lint config. Absent → gofmt.
 
-use crate::plugingo::tool_log::ToolLog;
+use crate::plugingo::tool_log::{ToolLog, run_captured};
 use anyhow::Context;
 use async_trait::async_trait;
 use hcore::hasync::Cancellable;
@@ -26,7 +26,6 @@ use hplugin::driver::{
     ParseResponse,
 };
 use hplugin::htspec::Spec;
-use hproc::proc_exec;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -113,36 +112,6 @@ fn arg_file(pkg_dir: &std::path::Path, files: &[String]) -> anyhow::Result<OsStr
     let mut arg = OsString::from("@");
     arg.push(path.as_os_str());
     Ok(arg)
-}
-
-/// Run `heph-govet` with `args`, returning its whole output. Never fails on a
-/// non-zero exit — the caller interprets the code.
-async fn exec_govet(
-    bin: &str,
-    args: Vec<OsString>,
-    env: &HashMap<String, String>,
-    cwd: &std::path::Path,
-    runner: hexecrunner::RunnerRef<'_>,
-    ctoken: &(dyn Cancellable + Send + Sync),
-) -> anyhow::Result<std::process::Output> {
-    let env_pairs: Vec<(OsString, OsString)> = env
-        .iter()
-        .map(|(k, v)| (OsString::from(k), OsString::from(v)))
-        .collect();
-    let spec = proc_exec::Spec {
-        program: std::path::PathBuf::from(bin),
-        args,
-        env: env_pairs,
-        cwd: cwd.to_path_buf(),
-        stdin: proc_exec::StdioSpec::Null,
-        stdout: proc_exec::StdioSpec::Piped,
-        stderr: proc_exec::StdioSpec::Piped,
-        setsid: false,
-        ctty: false,
-    };
-    hexecrunner::output(runner, spec, ctoken)
-        .await
-        .context("wait for heph-govet -format")
 }
 
 /// What a run makes of `heph-govet -format`'s exit. Rewriting prints only
@@ -417,7 +386,18 @@ impl ManagedDriver for GoFormatDriver {
         }
         args.push(arg_file(pkg_dir, &files)?);
 
-        let output = exec_govet(&bin, args, &env, pkg_dir, runner, ctoken).await?;
+        // A non-zero exit is not an error here: the outcome reads the code.
+        let output = run_captured(
+            std::path::Path::new(&bin),
+            args,
+            &env,
+            pkg_dir,
+            crate::plugingo::tool_log::ProcessGroup::Inherit,
+            runner,
+            ctoken,
+        )
+        .await
+        .context("wait for heph-govet -format")?;
         let mut log = ToolLog::new(&mut req.request);
         let res = if def.check {
             check_outcome(&mut log, &output).await
