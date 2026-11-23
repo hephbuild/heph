@@ -156,8 +156,9 @@ tokio = { version = "1.54.1", features = ["rt", "rt-multi-thread", "io-util", "i
 # async-signal-safe — it faulted the process it was profiling) to a frame-pointer
 # chain walk that probes every address before dereferencing it. It needs the
 # frame pointers `-Cforce-frame-pointers=yes` in `.cargo/config.toml` emits; see
-# `src/pprof_dump.rs`.
-pprof = { version = "0.15", features = ["prost-codec", "frame-pointer"] }
+# `src/pprof_dump.rs`. Default features off: the default `cpp` only builds a C++
+# demangler, and heph has no C++ frames of its own (Rust symbols still demangle).
+pprof = { version = "0.15", default-features = false, features = ["prost-codec", "frame-pointer"] }
 futures = "0.3.34"
 async-trait = "0.1.92"
 humantime = "2.4.0"
