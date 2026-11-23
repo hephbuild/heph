@@ -258,8 +258,7 @@ impl ProviderExecutor for EngineProviderExecutor {
                         // Enumerate every package at or under `prefix`, then union
                         // each package's own `provider_state`s (all providers).
                         let matcher = Matcher::PackagePrefix(prefix);
-                        let pkg_iter = engine.packages(&matcher, &rs).await?;
-                        let pkgs: Vec<String> = pkg_iter.collect::<anyhow::Result<_>>()?;
+                        let pkgs = engine.packages(&matcher, &rs).await?;
 
                         // One probe per `(package, provider)` pair, overlapped.
                         //
@@ -378,9 +377,7 @@ impl ProviderExecutor for EngineProviderExecutor {
                 .ok_or_else(|| anyhow::anyhow!("engine dropped"))?;
             let rs = self.rs().clone();
 
-            // Collect packages eagerly (non-Send iterator dropped before first await)
-            let pkg_iter = engine.packages(m, &rs).await?;
-            let pkgs: Vec<String> = pkg_iter.collect::<anyhow::Result<_>>()?;
+            let pkgs = engine.packages(m, &rs).await?;
 
             // One `list` callback surface for the whole walk, not one per
             // (package, provider) pair — it is stateless apart from the engine

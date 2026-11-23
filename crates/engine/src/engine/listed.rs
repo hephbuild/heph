@@ -217,10 +217,7 @@ impl Engine {
         discovery: Discovery,
     ) -> anyhow::Result<Vec<ListedFactMismatch>> {
         let gaps = discovery.gaps().cloned();
-        let pkgs: Vec<String> = self
-            .packages(m, &rs)
-            .await?
-            .collect::<anyhow::Result<_>>()?;
+        let pkgs = self.packages(m, &rs).await?;
         let per_pkg = futures::stream::iter(pkgs)
             .map(|pkg| {
                 let engine = Arc::clone(&self);

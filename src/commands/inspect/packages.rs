@@ -48,7 +48,7 @@ impl App for PackagesApp {
         let out = BufferedStdout::new(&ctx);
         let res: anyhow::Result<()> = async {
             for p in self.engine.packages(&self.matcher, &rs).await? {
-                out.println(p?);
+                out.println(p);
             }
             Ok(())
         }

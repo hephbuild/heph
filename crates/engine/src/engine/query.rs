@@ -425,10 +425,7 @@ impl Engine {
         gaps: Option<&Gaps>,
     ) -> anyhow::Result<(Vec<String>, bool)> {
         match gaps {
-            None => Ok((
-                self.packages(m, rs).await?.collect::<anyhow::Result<_>>()?,
-                false,
-            )),
+            None => Ok((self.packages(m, rs).await?, false)),
             Some(gaps) => self.packages_keep_going(m, rs, gaps).await,
         }
     }
