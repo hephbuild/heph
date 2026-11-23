@@ -46,6 +46,7 @@ use crate::engine::Engine;
 use crate::engine::remote_cache::{RemoteCacheBackend, SNAPSHOT_STREAM_BUF, ScratchSource};
 use anyhow::Context as _;
 use borsh::{BorshDeserialize, BorshSerialize};
+use futures::StreamExt as _;
 use std::io::Seek as _;
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _};
@@ -503,6 +504,12 @@ async fn write_all(
     Ok(())
 }
 
+/// `.meta` reads in flight at once while walking one lineage.
+///
+/// A lineage is never pruned, so its entry count grows with every publish; one
+/// read at a time made a cold resolve cost a round trip per generation.
+const META_READ_CONCURRENCY: usize = 8;
+
 /// Every readable head in one lineage of one cache.
 ///
 /// A meta that will not decode, or one from a format this build does not know, is
@@ -513,34 +520,38 @@ async fn heads_in(source: &ScratchSource<'_>, slot: &str, scope: &str) -> Vec<Re
     let Ok(names) = source.list_names(&prefix).await else {
         return Vec::new();
     };
-    let mut out = Vec::new();
-    for name in names {
-        let Some(stem) = name.strip_suffix(".meta") else {
-            continue;
-        };
+    let stems = names.iter().filter_map(|name| {
+        let stem = name.strip_suffix(".meta")?;
         // `list_names` may return a bare name or a full key depending on backend;
         // normalize to a full key so `open_read` finds it either way.
-        let stem = if stem.starts_with(KEY_PREFIX) {
+        Some(if stem.starts_with(KEY_PREFIX) {
             stem.to_string()
         } else {
             format!("{prefix}{stem}")
-        };
-        let Ok(Some(buf)) = source.read_small(&format!("{stem}.meta")).await else {
-            continue;
-        };
-        let Ok(meta) = SnapshotMeta::try_from_slice(&buf) else {
-            continue;
-        };
-        if meta.format != SNAPSHOT_FORMAT {
-            continue;
-        }
-        out.push(RemoteHead {
-            cache: source.name().to_string(),
-            stem,
-            meta,
-        });
-    }
-    out
+        })
+    });
+    // Collected before streaming: a closure in the stream's type makes the
+    // future not `Send` to the engine's `async_recursion` callers.
+    let reads: Vec<_> = stems.map(|stem| read_head(source, stem)).collect();
+    // `buffered`, so the heads come out in listing order, as they did when the
+    // metas were read one at a time.
+    let heads: Vec<Option<RemoteHead>> = futures::stream::iter(reads)
+        .buffered(META_READ_CONCURRENCY)
+        .collect()
+        .await;
+    heads.into_iter().flatten().collect()
+}
+
+/// The head whose meta is `<stem>.meta`, or `None` when it is absent, will not
+/// decode, or is from a format this build does not know.
+async fn read_head(source: &ScratchSource<'_>, stem: String) -> Option<RemoteHead> {
+    let buf = source.read_small(&format!("{stem}.meta")).await.ok()??;
+    let meta = SnapshotMeta::try_from_slice(&buf).ok()?;
+    (meta.format == SNAPSHOT_FORMAT).then(|| RemoteHead {
+        cache: source.name().to_string(),
+        stem,
+        meta,
+    })
 }
 
 /// The directory a lineage's contents live in. Re-exported here so the CLI has
@@ -765,6 +776,88 @@ mod tests {
         async fn list_names(&self, _prefix: &str) -> anyhow::Result<Vec<String>> {
             Ok(Vec::new())
         }
+    }
+
+    /// Backend holding a flat set of objects under one lineage, recording how
+    /// many reads were in flight at once.
+    #[derive(Default)]
+    struct Lineage {
+        objects: std::collections::BTreeMap<String, Vec<u8>>,
+        in_flight: std::sync::atomic::AtomicUsize,
+        peak: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl RemoteCacheBackend for Lineage {
+        async fn open_read(
+            &self,
+            key: &str,
+        ) -> anyhow::Result<Option<std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>>> {
+            use std::sync::atomic::Ordering::SeqCst;
+            let now = self.in_flight.fetch_add(1, SeqCst) + 1;
+            self.peak.fetch_max(now, SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            self.in_flight.fetch_sub(1, SeqCst);
+            let name = key.rsplit('/').next().unwrap_or(key);
+            Ok(self.objects.get(name).map(|b| {
+                Box::pin(std::io::Cursor::new(b.clone()))
+                    as std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>
+            }))
+        }
+        async fn open_write(
+            &self,
+            _key: &str,
+        ) -> anyhow::Result<std::pin::Pin<Box<dyn tokio::io::AsyncWrite + Send>>> {
+            anyhow::bail!("read-only")
+        }
+        async fn exists(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        async fn list_names(&self, _prefix: &str) -> anyhow::Result<Vec<String>> {
+            Ok(self.objects.keys().cloned().collect())
+        }
+    }
+
+    /// The metas are read concurrently, the heads still come out in listing
+    /// order, and an entry that will not decode or is from another format is
+    /// skipped without hiding the rest.
+    #[tokio::test]
+    async fn heads_in_reads_metas_concurrently_and_skips_bad_ones() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut objects = std::collections::BTreeMap::new();
+        let enc = |m: &SnapshotMeta| borsh::to_vec(m).expect("encode");
+        for g in 0..16u64 {
+            objects.insert(format!("{g:016x}.h.meta"), enc(&meta("master", g, 1)));
+            objects.insert(format!("{g:016x}.h.tar.gz"), b"payload".to_vec());
+        }
+        objects.insert("garbage.meta".to_string(), b"not borsh".to_vec());
+        let mut foreign = meta("master", 99, 1);
+        foreign.format = SNAPSHOT_FORMAT + 1;
+        objects.insert(format!("{:016x}.h.meta", 99), enc(&foreign));
+
+        let backend = std::sync::Arc::new(Lineage {
+            objects,
+            ..Lineage::default()
+        });
+        let set = crate::engine::remote_cache::RemoteCacheSet::with_backend(
+            backend.clone(),
+            tmp.path().to_path_buf(),
+        );
+        let sources = set.scratch_sources().await;
+
+        let heads = heads_in(&sources[0], "slot", "master").await;
+        let generations: Vec<_> = heads.iter().map(|h| h.meta.generation).collect();
+        assert_eq!(generations, (0..16).collect::<Vec<_>>());
+        assert_eq!(
+            heads[3].stem,
+            format!("{}{:016x}.h", scope_prefix("slot", "master"), 3),
+            "a bare listed name is normalized to a full key",
+        );
+        let peak = backend.peak.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            (2..=META_READ_CONCURRENCY).contains(&peak),
+            "metas are read concurrently, within the bound: peak {peak}",
+        );
     }
 
     fn packed_tree(root: &Path) -> Vec<u8> {
