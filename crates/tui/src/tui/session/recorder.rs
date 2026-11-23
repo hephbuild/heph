@@ -660,6 +660,9 @@ pub(crate) struct RecorderStart {
     pub(crate) lock: File,
     /// The write connection on the session's freshly created `session.db`.
     pub(crate) conn: Connection,
+    /// `conn`'s registration as open read-write ([`store::rw_open`]), held
+    /// until the connection is closed.
+    pub(crate) rw: store::RwOpen,
     pub(crate) session_id: SessionId,
     pub(crate) retention: Retention,
     /// A private-sessions root to sweep of every ended session too.
@@ -721,6 +724,7 @@ impl Recorder {
         let RecorderStart {
             root,
             conn,
+            rw,
             session_id,
             retention,
             private_root,
@@ -744,12 +748,17 @@ impl Recorder {
         if let Err(e) = spawned {
             tracing::debug!(error = %e, "cannot start the session cleanup");
         }
+        // One value, so the connection drops before its registration even if
+        // the thread never starts (a tuple drops in order).
+        let write = (conn, rw);
         std::thread::Builder::new()
             .name("heph-session-recorder".to_owned())
             .spawn(move || {
                 let _dispatch = tracing::dispatcher::set_default(&dispatch);
+                let (conn, rw) = write;
                 let mut thread = RecorderThread {
                     writer: Some(store::Writer::new(conn, session_id)),
+                    _rw: rw,
                     record_bytes: 0,
                     full_cap: faults.full_cap.unwrap_or(FULL_CAP),
                     ceiling: faults.ceiling.unwrap_or(CEILING),
@@ -844,6 +853,9 @@ enum Phase {
 struct RecorderThread {
     /// `None` once `End` is written and the recording sealed.
     writer: Option<store::Writer>,
+    /// The write connection's registration: declared after `writer`, so it
+    /// drops after the connection however the thread ends.
+    _rw: store::RwOpen,
     /// Bytes of record bodies inserted, toward the caps.
     record_bytes: u64,
     full_cap: u64,

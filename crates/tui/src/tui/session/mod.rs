@@ -281,12 +281,14 @@ impl Session {
             interactive: start.interactive,
             capabilities: vec![CAPABILITY_INFLIGHT.to_owned()],
         };
-        let conn = store::create(&dir, &meta, &store::Provenance::detect(), faults.refuse_wal)
-            .context("creating the session's recording")?;
+        let (conn, rw) =
+            store::create(&dir, &meta, &store::Provenance::detect(), faults.refuse_wal)
+                .context("creating the session's recording")?;
         let recorder = Recorder::spawn(RecorderStart {
             root: root.path().to_path_buf(),
             lock,
             conn,
+            rw,
             session_id: id,
             retention: cleanups.retention,
             private_root: cleanups.private_root,

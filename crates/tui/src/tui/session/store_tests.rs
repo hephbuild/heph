@@ -28,9 +28,10 @@ fn session_dir(root: &Path, id: SessionId) -> PathBuf {
 }
 
 /// A fresh recording in `dir` and its writer: WAL mode, the session row
-/// written, nothing else.
+/// written, nothing else. (Its read-write registration ends here: these
+/// tests have no other process to protect the writer's locks from.)
 fn writer_in(dir: &Path, id: SessionId) -> store::Writer {
-    let conn =
+    let (conn, _rw) =
         store::create(dir, &meta_for(id), &store::Provenance::default(), false).expect("create");
     store::Writer::new(conn, id)
 }
@@ -1012,6 +1013,87 @@ fn seal_lost_races_open_local() {
     eprintln!("seal_lost_races_open_local: {outcomes:?}");
 }
 
+/// A header read of a recording this process has open read-write goes
+/// through the registry's fd, never a plain fd of its own, whose close would
+/// drop every `fcntl` lock the writer holds (`store::rw_open`): the
+/// recorder's own recording is registered from before its write connection
+/// opens until after it closes, and is read (header, `open_local`, the
+/// holder scan's `read_meta_in`) without one. Once the recorder is gone, a
+/// read opens its own fd again.
+#[test]
+fn header_reads_never_close_an_fd_on_a_recording_open_read_write() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let rec = recorder_with(root.path(), Faults::default());
+    let path = rec.dir().join(store::FILE);
+    assert!(store::rw_open::is_open(&path).expect("stat"));
+    store::rw_open::plain_reads::take(&path);
+
+    let h = store::read_header(&path).expect("read").expect("sqlite");
+    assert!(h.is_known() && h.wal, "{h:?}");
+    let meta = store::read_meta_in(root.path(), rec.dir()).expect("meta");
+    assert_eq!(meta.id, rec.id());
+    assert_eq!(store::rw_open::plain_reads::take(&path), 0);
+
+    rec.finish(Some(0), false);
+    // The thread drops its registration as it exits, just after the seal.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while store::rw_open::is_open(&path).expect("stat") {
+        assert!(std::time::Instant::now() < deadline, "still registered");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        !store::read_header(&path)
+            .expect("read")
+            .expect("sqlite")
+            .wal
+    );
+    assert_eq!(store::rw_open::plain_reads::take(&path), 1);
+}
+
+/// Registrations count: the kept fd stays until the last one drops.
+#[test]
+fn rw_registrations_nest() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let id = now_id(41);
+    let dir = session_dir(root.path(), id);
+    tests::unsealed_recording(&dir, id, &[start_record(1, "//p:a")]);
+    let path = dir.join(store::FILE);
+    let outer = store::rw_open::register(&path).expect("register");
+    let inner = store::rw_open::register(&path).expect("register");
+    drop(inner);
+    assert!(store::rw_open::is_open(&path).expect("stat"));
+    drop(outer);
+    assert!(!store::rw_open::is_open(&path).expect("stat"));
+}
+
+/// A viewer never copies a recording this process still has open read-write
+/// with its lock free (a recorder that stopped before its thread closed the
+/// connection): the copy's plain fds would drop the writer's locks. It
+/// waits, as for a seal, and copies once the registration is gone.
+#[test]
+fn open_local_waits_out_a_write_connection_of_this_process() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let root = tempfile::tempdir().expect("tempdir");
+    let id = now_id(42);
+    let dir = session_dir(root.path(), id);
+    tests::unsealed_recording(&dir, id, &[start_record(1, "//p:a")]);
+    let path = dir.join(store::FILE);
+    let rw = store::rw_open::register(&path).expect("register");
+    let released = Arc::new(AtomicBool::new(false));
+    let releaser = std::thread::spawn({
+        let released = Arc::clone(&released);
+        move || {
+            std::thread::sleep(Duration::from_millis(200));
+            released.store(true, Ordering::SeqCst);
+            drop(rw);
+        }
+    });
+    let opened = store::open_local(root.path(), &dir).expect("open");
+    assert!(released.load(Ordering::SeqCst), "copied while registered");
+    assert!(opened.is_copy());
+    releaser.join().expect("releaser");
+}
+
 /// A cursor reads past more undecodable bodies than one page holds: a page
 /// that decodes to nothing is not the end of the recording. (1100 bodies:
 /// the first page also holds the first record, so the second is all
@@ -1221,7 +1303,7 @@ fn write_fixture(dir: &Path) {
             ci_run_url: None,
         },
     };
-    let conn = store::create(dir, &meta, &provenance, false).expect("create");
+    let (conn, _rw) = store::create(dir, &meta, &provenance, false).expect("create");
     let mut writer = store::Writer::new(conn, id);
     let s = FIXTURE_STARTED_MS;
     let ev = |at: u64, kind| {

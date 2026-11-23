@@ -28,6 +28,8 @@ pub fn alter(dir: &Path, sql: &str) -> anyhow::Result<()> {
 pub struct Recording {
     dir: PathBuf,
     writer: store::Writer,
+    /// Declared after the writer, so it drops after the connection.
+    rw: store::RwOpen,
 }
 
 impl Recording {
@@ -43,10 +45,11 @@ impl Recording {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         let lock = dir.join(files::LOCK);
         std::fs::write(&lock, b"").with_context(|| format!("creating {}", lock.display()))?;
-        let conn = store::create(dir, meta, &store::Provenance::default(), false)?;
+        let (conn, rw) = store::create(dir, meta, &store::Provenance::default(), false)?;
         let mut rec = Self {
             dir: dir.to_path_buf(),
             writer: store::Writer::new(conn, meta.id),
+            rw,
         };
         rec.append(records)?;
         if let Some(s) = status {
@@ -87,12 +90,14 @@ impl Recording {
         exit_code: Option<i32>,
         panicked: bool,
     ) -> anyhow::Result<PathBuf> {
-        let conn = self
-            .writer
+        let Self { dir, writer, rw } = self;
+        let conn = writer
             .finish(ended_unix_ms, exit_code, panicked)
             .context("finishing the recording")?;
-        match store::seal(conn, store::SEAL_TIMEOUT).context("sealing the recording")? {
-            store::Sealed::Done => Ok(self.dir),
+        let sealed = store::seal(conn, store::SEAL_TIMEOUT).context("sealing the recording");
+        drop(rw);
+        match sealed? {
+            store::Sealed::Done => Ok(dir),
             store::Sealed::CutShort => anyhow::bail!("the seal was cut short"),
         }
     }

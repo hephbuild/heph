@@ -14,7 +14,7 @@
 //! `immutable=1`). See `docs/SESSIONS.md`.
 
 use std::collections::VecDeque;
-use std::io::{self, Read as _};
+use std::io;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -128,18 +128,13 @@ impl Header {
 /// The header of the SQLite file at `path`, or `None` when it is shorter than
 /// a header (zero bytes: a recording killed while being created) or not a
 /// SQLite file at all.
+///
+/// Never opens (and so never closes) an fd of its own on a recording this
+/// process has open read-write: see [`rw_open`].
 pub fn read_header(path: &Path) -> io::Result<Option<Header>> {
     let mut buf = [0u8; 100];
-    let mut file = std::fs::File::open(path)?;
-    let mut filled = 0;
-    while filled < buf.len() {
-        let Some(rest) = buf.get_mut(filled..) else {
-            break;
-        };
-        match file.read(rest)? {
-            0 => return Ok(None),
-            n => filled += n,
-        }
+    if rw_open::read_start(path, &mut buf)? < buf.len() {
+        return Ok(None);
     }
     let be = |at: usize| {
         buf.get(at..at + 4)
@@ -155,6 +150,168 @@ pub fn read_header(path: &Path) -> io::Result<Option<Header>> {
         wal: buf.get(18) == Some(&2) || buf.get(19) == Some(&2),
     }))
 }
+
+/// The recordings this process has open read-write (the recorder's own, a
+/// cleanup's seal), each with one plain fd opened when it was registered.
+///
+/// Why it exists: SQLite's locks are POSIX `fcntl` locks, which belong to the
+/// (process, file) pair, not to an fd. Closing **any** fd on the file drops
+/// every lock this process holds on it, whichever fd took them. SQLite
+/// guards its own connections against that (it defers their closes while
+/// the file is locked), but a plain `File` opened and closed beside a write
+/// connection — a header read by the holder scan, by a viewer polling a
+/// seal — would silently drop the writer's locks, and another process could
+/// then checkpoint, switch the journal mode or read a half-sealed file.
+///
+/// So: a write connection on a recording is opened only under a
+/// registration ([`register`]), and dropped before it; a header read of a
+/// registered recording goes through the fd kept here (`pread`); and a
+/// header read of any other file holds the registry for its whole open, read
+/// and close, so no registration (hence no write connection) starts in
+/// between. The kept fd closes when the last registration drops, after the
+/// write connection closed. A viewer's copy copies under the session's lock
+/// taken shared, which every writer holds exclusively until its write is
+/// done, and checks [`is_open`] once it holds it.
+pub(crate) mod rw_open {
+    use std::fs::File;
+    use std::io;
+    use std::os::unix::fs::{FileExt as _, MetadataExt as _};
+    use std::path::Path;
+    use std::sync::{Mutex, MutexGuard};
+
+    struct Entry {
+        dev: u64,
+        ino: u64,
+        file: File,
+        holders: usize,
+    }
+
+    static OPEN: Mutex<Vec<Entry>> = Mutex::new(Vec::new());
+
+    fn entries() -> MutexGuard<'static, Vec<Entry>> {
+        OPEN.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// One registration of a recording open read-write; dropped after the
+    /// write connection.
+    #[derive(Debug)]
+    #[must_use = "a write connection is opened only while its registration is held"]
+    pub(crate) struct RwOpen {
+        dev: u64,
+        ino: u64,
+    }
+
+    /// Register `path` as open read-write by this process, before opening a
+    /// write connection on it.
+    pub(crate) fn register(path: &Path) -> io::Result<RwOpen> {
+        let mut entries = entries();
+        let meta = std::fs::metadata(path)?;
+        let (dev, ino) = (meta.dev(), meta.ino());
+        match entries.iter_mut().find(|e| e.dev == dev && e.ino == ino) {
+            Some(e) => e.holders += 1,
+            None => {
+                let file = File::open(path)?;
+                let meta = file.metadata()?;
+                // Replaced between the stat and the open: register what the
+                // fd holds, which is what a connection opened next reaches.
+                let (dev, ino) = (meta.dev(), meta.ino());
+                entries.push(Entry {
+                    dev,
+                    ino,
+                    file,
+                    holders: 1,
+                });
+                return Ok(RwOpen { dev, ino });
+            }
+        }
+        Ok(RwOpen { dev, ino })
+    }
+
+    impl Drop for RwOpen {
+        fn drop(&mut self) {
+            let mut entries = entries();
+            if let Some(at) = entries
+                .iter()
+                .position(|e| e.dev == self.dev && e.ino == self.ino)
+                && let Some(e) = entries.get_mut(at)
+            {
+                e.holders = e.holders.saturating_sub(1);
+                if e.holders == 0 {
+                    drop(entries.swap_remove(at));
+                }
+            }
+        }
+    }
+
+    /// Whether `path` is open read-write by this process.
+    pub(crate) fn is_open(path: &Path) -> io::Result<bool> {
+        let entries = entries();
+        let meta = std::fs::metadata(path)?;
+        Ok(entries
+            .iter()
+            .any(|e| e.dev == meta.dev() && e.ino == meta.ino()))
+    }
+
+    /// Read the start of `path` into `buf`; how many bytes (short at the
+    /// end of the file).
+    pub(super) fn read_start(path: &Path, buf: &mut [u8]) -> io::Result<usize> {
+        let entries = entries();
+        let meta = std::fs::metadata(path)?;
+        if let Some(e) = entries
+            .iter()
+            .find(|e| e.dev == meta.dev() && e.ino == meta.ino())
+        {
+            return fill(&e.file, buf);
+        }
+        #[cfg(test)]
+        plain_reads::record(meta.dev(), meta.ino());
+        // Opened and closed with the registry held: no write connection on
+        // this file starts meanwhile.
+        let file = File::open(path)?;
+        fill(&file, buf)
+    }
+
+    fn fill(file: &File, buf: &mut [u8]) -> io::Result<usize> {
+        let mut filled = 0;
+        while let Some(rest) = buf.get_mut(filled..)
+            && !rest.is_empty()
+        {
+            match file.read_at(rest, filled as u64)? {
+                0 => break,
+                n => filled += n,
+            }
+        }
+        Ok(filled)
+    }
+
+    /// The files [`read_start`] opened a plain fd on, by `(dev, ino)`, so a
+    /// test can tell a registered recording never got one.
+    #[cfg(test)]
+    pub(crate) mod plain_reads {
+        use std::sync::Mutex;
+
+        static SEEN: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+
+        pub(super) fn record(dev: u64, ino: u64) {
+            SEEN.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((dev, ino));
+        }
+
+        /// How many plain reads of `path`'s file there were, and forget them.
+        pub(crate) fn take(path: &std::path::Path) -> usize {
+            use std::os::unix::fs::MetadataExt as _;
+            let meta = std::fs::metadata(path).expect("stat");
+            let key = (meta.dev(), meta.ino());
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            let n = seen.iter().filter(|k| **k == key).count();
+            seen.retain(|k| *k != key);
+            n
+        }
+    }
+}
+
+pub(crate) use rw_open::RwOpen;
 
 /// Why a file cannot be read as a recording.
 #[derive(Debug)]
@@ -424,6 +581,13 @@ fn open_copy(root: &Path, dir: &Path, lock: &Path) -> Result<Option<Opened>, Ope
         return Ok(None);
     };
     let path = dir.join(FILE);
+    // A write connection of this process still open on it (a recorder that
+    // stopped and released its lock before its thread closed the
+    // connection): copying would close plain fds on it ([`rw_open`]). Wait
+    // for it as for a seal. No registration starts while the lock is held.
+    if rw_open::is_open(&path).with_context(|| format!("reading {}", path.display()))? {
+        return Ok(None);
+    }
     #[cfg(test)]
     copy_gate::hit(lock);
     let base = tmp.join(format!(
@@ -614,13 +778,14 @@ fn host_name() -> Option<String> {
 
 /// Create `dir/session.db` with its schema and session row: under a temp
 /// name, WAL checked, closed, renamed, and reopened by its final name (SQLite
-/// names `-wal` after the path a connection opened).
+/// names `-wal` after the path a connection opened). The write connection
+/// comes with its [`RwOpen`] registration, to drop after it.
 pub(crate) fn create(
     dir: &Path,
     meta: &SessionMeta,
     provenance: &Provenance,
     refuse_wal: bool,
-) -> anyhow::Result<Connection> {
+) -> anyhow::Result<(Connection, RwOpen)> {
     let tmp = dir.join(CREATING);
     {
         let conn = Connection::open_with_flags(
@@ -651,10 +816,11 @@ pub(crate) fn create(
     let path = dir.join(FILE);
     std::fs::rename(&tmp, &path)
         .with_context(|| format!("renaming {} to {}", tmp.display(), path.display()))?;
+    let rw = rw_open::register(&path).with_context(|| format!("opening {}", path.display()))?;
     let conn = open_existing_rw(&path).with_context(|| format!("opening {}", path.display()))?;
     conn.execute_batch("PRAGMA synchronous=OFF;")
         .context("configuring the recording")?;
-    Ok(conn)
+    Ok((conn, rw))
 }
 
 /// The schema, the format stamp and the session row, in one transaction: a
@@ -1296,6 +1462,8 @@ pub(crate) fn seal_lost(path: &Path) -> anyhow::Result<Sealed> {
     if !header.wal {
         return Ok(Sealed::Done);
     }
+    // Declared before the connection, so it drops after it.
+    let _rw = rw_open::register(path).with_context(|| format!("opening {}", path.display()))?;
     let conn = open_existing_rw(path).with_context(|| format!("opening {}", path.display()))?;
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let sealed: bool = conn.query_row("SELECT sealed FROM session", [], |r| r.get(0))?;

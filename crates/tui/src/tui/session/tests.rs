@@ -172,7 +172,7 @@ pub(super) fn event_record(ev: BuildEvent) -> SessionRecord {
 /// A recording in `dir` holding `records`, left as a `kill -9` leaves one:
 /// committed, unsealed (WAL mode), no `End`. The caller owns the lock.
 pub(super) fn unsealed_recording(dir: &Path, id: SessionId, records: &[SessionRecord]) {
-    let conn =
+    let (conn, _rw) =
         store::create(dir, &meta_for(id), &store::Provenance::default(), false).expect("create");
     let mut writer = store::Writer::new(conn, id);
     for r in records {
