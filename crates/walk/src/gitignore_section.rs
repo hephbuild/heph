@@ -63,6 +63,15 @@ impl GitignoreEntry {
             self.addr.as_ref().map(Addr::format).unwrap_or_default(),
         )
     }
+
+    /// The order of [`sort_key`](Self::sort_key), for sorts and merges: the
+    /// pattern decides, and the targets are formatted only when two patterns
+    /// tie, rather than on every comparison.
+    pub fn cmp_sorted(&self, other: &Self) -> std::cmp::Ordering {
+        self.pattern
+            .cmp(&other.pattern)
+            .then_with(|| self.sort_key().cmp(&other.sort_key()))
+    }
 }
 
 /// One line of a parsed section, with where it sits in the `.gitignore`.
