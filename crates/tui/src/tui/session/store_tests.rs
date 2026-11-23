@@ -1066,6 +1066,47 @@ fn rw_registrations_nest() {
     assert!(!store::rw_open::is_open(&path).expect("stat"));
 }
 
+/// A recording a cleanup removed after the viewer's probe is missing, not a
+/// read error: the registry reads a file that is gone as not open, and the
+/// copy reports it missing. Parked inside `open_copy`, after its lock and
+/// before the registry check, the hook removes it.
+#[test]
+fn a_recording_removed_under_the_copy_reads_as_missing() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let id = now_id(43);
+    let dir = session_dir(root.path(), id);
+    tests::unsealed_recording(&dir, id, &[start_record(1, "//p:a")]);
+    let path = dir.join(store::FILE);
+    assert!(
+        store::read_header(&path)
+            .expect("read")
+            .expect("sqlite")
+            .wal
+    );
+    store::copy_gate::set(&dir.join(files::LOCK), {
+        let path = path.clone();
+        move || {
+            for file in [
+                path.clone(),
+                store::sibling(&path, "-wal"),
+                store::sibling(&path, "-shm"),
+            ] {
+                match std::fs::remove_file(&file) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => panic!("removing {}: {e}", file.display()),
+                }
+            }
+        }
+    });
+    let opened = store::open_local(root.path(), &dir);
+    assert!(
+        matches!(opened, Err(store::OpenError::Missing)),
+        "{opened:?}"
+    );
+    assert!(!store::rw_open::is_open(&path).expect("gone is not open"));
+}
+
 /// A viewer never copies a recording this process still has open read-write
 /// with its lock free (a recorder that stopped before its thread closed the
 /// connection): the copy's plain fds would drop the writer's locks. It

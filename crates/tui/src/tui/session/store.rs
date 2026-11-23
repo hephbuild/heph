@@ -243,10 +243,15 @@ pub(crate) mod rw_open {
         }
     }
 
-    /// Whether `path` is open read-write by this process.
+    /// Whether `path` is open read-write by this process. A file that is gone
+    /// (a cleanup removed it) is not: the caller's missing path applies.
     pub(crate) fn is_open(path: &Path) -> io::Result<bool> {
         let entries = entries();
-        let meta = std::fs::metadata(path)?;
+        let meta = match std::fs::metadata(path) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e),
+        };
         Ok(entries
             .iter()
             .any(|e| e.dev == meta.dev() && e.ino == meta.ino()))
@@ -581,6 +586,8 @@ fn open_copy(root: &Path, dir: &Path, lock: &Path) -> Result<Option<Opened>, Ope
         return Ok(None);
     };
     let path = dir.join(FILE);
+    #[cfg(test)]
+    copy_gate::hit(lock);
     // A write connection of this process still open on it (a recorder that
     // stopped and released its lock before its thread closed the
     // connection): copying would close plain fds on it ([`rw_open`]). Wait
@@ -588,8 +595,6 @@ fn open_copy(root: &Path, dir: &Path, lock: &Path) -> Result<Option<Opened>, Ope
     if rw_open::is_open(&path).with_context(|| format!("reading {}", path.display()))? {
         return Ok(None);
     }
-    #[cfg(test)]
-    copy_gate::hit(lock);
     let base = tmp.join(format!(
         "copy-{}-{}.db",
         std::process::id(),
@@ -597,7 +602,16 @@ fn open_copy(root: &Path, dir: &Path, lock: &Path) -> Result<Option<Opened>, Ope
     ));
     let mut copy = TempCopy { files: Vec::new() };
     copy.files.push(base.clone());
-    std::fs::copy(&path, &base).with_context(|| format!("copying {}", path.display()))?;
+    match std::fs::copy(&path, &base) {
+        Ok(_) => {}
+        // A cleanup removed it since the probe.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(OpenError::Missing),
+        Err(e) => {
+            return Err(OpenError::Other(
+                anyhow::Error::new(e).context(format!("copying {}", path.display())),
+            ));
+        }
+    }
     let wal = sibling(&path, "-wal");
     let wal_copy = sibling(&base, "-wal");
     copy.files.push(wal_copy.clone());
