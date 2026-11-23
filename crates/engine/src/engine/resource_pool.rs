@@ -106,7 +106,7 @@
 //! - A grant is a [`Reservation`] built on the release side and sent through
 //!   a `oneshot`, so a waiter dropped after its grant was sent drops the
 //!   unobserved grant, which returns itself.
-//! - **Every** mutation of a lane's free amounts or queue ends with whatever
+//! - **Every** mutation of the pool's free amounts or queue ends with whatever
 //!   it made grantable granted: a release, an arrival, and a waiter's drop (a
 //!   cancelled head admits whoever its protection held back, without waiting
 //!   for the next release).
@@ -204,41 +204,81 @@ impl Limit {
     }
 }
 
-/// Admits targets against per-pool capacities. See the module docs.
+/// Admits targets against per-pool capacities: one queue over every named
+/// pool. See the module docs.
 #[derive(Debug)]
 pub struct ResourcePool {
-    main: Arc<Lane>,
+    /// Sorted, so a pool is found by binary search; indices are stable.
+    names: Box<[PoolName]>,
+    capacity: Box<[Limit]>,
+    /// Index of the `cpu` pool in `names`; `None` if there is none.
+    cpu_idx: Option<usize>,
+    state: Mutex<State>,
+    /// Live [`PendingRemoval`]s: grants a finished run still holds until its
+    /// sandbox is removed. Diagnostic only; nothing is admitted by it.
+    removals: AtomicU64,
+    /// [`ResourcePool::generation`]. Bumped (`Release`) while the state lock
+    /// is held, before the change it announces (`ResourcePool::change`), or
+    /// after `removals` moves. A reader that loads it (`Acquire`) and then
+    /// takes the lock is ordered after the changer's lock acquisition, so it
+    /// waits for that change to finish and sees it: no change is ever
+    /// announced before it can be observed, on a weakly ordered CPU (aarch64)
+    /// as on x86_64. A change landing between the load and the lock is seen
+    /// early and announced again on the next read: at worst one redundant
+    /// sample. Never read by admission.
+    generation: AtomicU64,
 }
 
 impl ResourcePool {
     /// A pool with these capacities (`cpu` in micro-CPUs, `memory` in bytes, a
     /// custom pool a count). A pool given twice keeps the last capacity.
     pub fn new(capacities: impl IntoIterator<Item = (PoolName, Limit)>) -> Arc<Self> {
+        let capacities: BTreeMap<PoolName, Limit> = capacities.into_iter().collect();
+        let (names, capacity): (Vec<PoolName>, Vec<Limit>) = capacities.into_iter().unzip();
+        let cpu_idx = names
+            .binary_search_by(|p| p.as_str().cmp(PoolName::CPU))
+            .ok();
         Arc::new(Self {
-            main: Lane::new(capacities.into_iter().collect()),
+            state: Mutex::new(State {
+                held: vec![0; capacity.len()].into_boxed_slice(),
+                waiting: vec![0; capacity.len()].into_boxed_slice(),
+                waiters: BTreeMap::new(),
+                next_seq: 0,
+                shapes: FxHashMap::default(),
+                classes: BTreeMap::new(),
+                next_class: 0,
+                head: Head::default(),
+                cursor: 0,
+                untested: Untested::Nothing,
+                batch: Vec::new(),
+                #[cfg(test)]
+                visited: 0,
+            }),
+            names: names.into_boxed_slice(),
+            capacity: capacity.into_boxed_slice(),
+            cpu_idx,
+            removals: AtomicU64::new(0),
+            generation: AtomicU64::new(0),
         })
     }
 
     /// The capacity of a named pool, `None` when it is not one.
     pub fn capacity(&self, pool: &str) -> Option<Limit> {
-        let idx = self.main.index(pool)?;
-        self.main.capacity.get(idx).copied()
+        let idx = self.index(pool)?;
+        self.capacity.get(idx).copied()
     }
 
     /// Every named pool and its capacity, in name order.
     pub fn capacities(&self) -> impl Iterator<Item = (&PoolName, Limit)> {
-        self.main
-            .names
-            .iter()
-            .zip(self.main.capacity.iter().copied())
+        self.names.iter().zip(self.capacity.iter().copied())
     }
 
     /// What nobody holds in a named pool right now, `None` when it is not one
     /// or is unbounded.
     pub fn available(&self, pool: &str) -> Option<u64> {
-        let idx = self.main.index(pool)?;
-        let cap = self.main.capacity.get(idx)?.bounded()?;
-        let held = self.main.state.lock().held.get(idx).copied()?;
+        let idx = self.index(pool)?;
+        let cap = self.capacity.get(idx)?.bounded()?;
+        let held = self.state.lock().held.get(idx).copied()?;
         Some(cap.saturating_sub(held))
     }
 
@@ -263,13 +303,13 @@ impl ResourcePool {
         implicit: &[(PoolName, u64)],
     ) -> Result<Acquire, AcquireError> {
         let (need, clamped) = self.resolve(request, implicit)?;
-        if self.main.frees_bounded(&need) {
-            return Ok(self.main.enqueue(need, clamped));
+        if self.frees_bounded(&need) {
+            return Ok(self.enqueue(need, clamped));
         }
         // Nothing on a bounded pool: it always fits, so it is granted now,
         // past any queue, and nothing caps how many such grants are live.
         Ok(Acquire {
-            state: AcquireState::Ready(Some(self.main.grant_now(need.into(), clamped))),
+            state: AcquireState::Ready(Some(self.grant_now(need.into(), clamped))),
         })
     }
 
@@ -277,35 +317,34 @@ impl ResourcePool {
     /// waiting for.
     pub fn snapshot(&self) -> ResourceSnapshot {
         ResourceSnapshot {
-            main: self.main.snapshot(),
+            main: self.snapshot_main(),
         }
     }
 
     /// How many finished runs' sandbox removals have not returned yet
     /// ([`Reservation::into_removal`]), each holding its `sandbox` slot.
     pub fn removals_pending(&self) -> u64 {
-        self.main.removals.load(Ordering::Acquire)
+        self.removals.load(Ordering::Acquire)
     }
 
     /// A counter that moves on every change to what the pool holds, who
     /// waits, or how many removals are pending; nothing else about it means
     /// anything. A [`snapshot`](Self::snapshot) taken after reading a value
-    /// shows every change that moved the counter up to that value (see
-    /// `Lane::generation`), so a sampler that remembers the last value it
+    /// shows every change that moved the counter up to that value (see the
+    /// `generation` field), so a sampler that remembers the last value it
     /// sent knows whether there is anything new without taking the lock.
     pub fn generation(&self) -> u64 {
-        self.main.generation.load(Ordering::Acquire)
+        self.generation.load(Ordering::Acquire)
     }
 
-    /// The request plus `implicit` as `(pool index, granted amount)` in the
-    /// main lane, sorted by pool index (one spelling per shape), empty when
-    /// it reserves nothing anywhere; and whether any amount was clamped.
+    /// The request plus `implicit` as `(pool index, granted amount)`, sorted
+    /// by pool index (one spelling per shape), empty when it reserves
+    /// nothing anywhere; and whether any amount was clamped.
     fn resolve(
         &self,
         request: &Demand,
         implicit: &[(PoolName, u64)],
     ) -> Result<(Vec<(usize, u64)>, bool), AcquireError> {
-        let lane = &self.main;
         let mut need = Vec::with_capacity(
             request
                 .len()
@@ -316,20 +355,20 @@ impl ResourcePool {
         // first pool that fails: the declaration, the undeclared `cpu`'s
         // default one CPU, then `implicit`.
         for (pool, amount) in request.iter() {
-            let idx = lane
-                .check(lane.index(pool.as_str()))
+            let idx = self
+                .check(self.index(pool.as_str()))
                 .map_err(|e| e.naming(pool.clone()))?;
             need.push((idx, amount));
         }
         if request.declared(PoolName::CPU).is_none() {
-            let idx = lane
-                .check(lane.cpu_idx)
+            let idx = self
+                .check(self.cpu_idx)
                 .map_err(|e| e.naming(PoolName::cpu()))?;
             need.push((idx, Resources::DEFAULT_CPU_MICROS));
         }
         for (pool, amount) in implicit {
-            let idx = lane
-                .check(lane.index(pool.as_str()))
+            let idx = self
+                .check(self.index(pool.as_str()))
                 .map_err(|e| e.naming(pool.clone()))?;
             need.push((idx, *amount));
         }
@@ -347,7 +386,7 @@ impl ResourcePool {
         });
         let mut clamped = false;
         need.retain_mut(|(idx, amount)| {
-            let granted = lane.clamp(*idx, *amount);
+            let granted = self.clamp(*idx, *amount);
             clamped |= granted < *amount;
             *amount = granted;
             granted != 0
@@ -607,33 +646,10 @@ pub enum Admitted {
     Pass,
 }
 
-/// One queue over every named pool.
-#[derive(Debug)]
-struct Lane {
-    /// Sorted, so a pool is found by binary search; indices are stable.
-    names: Box<[PoolName]>,
-    capacity: Box<[Limit]>,
-    /// Index of the `cpu` pool in `names`; `None` if there is none.
-    cpu_idx: Option<usize>,
-    state: Mutex<State>,
-    /// Live [`PendingRemoval`]s: grants a finished run still holds until its
-    /// sandbox is removed. Diagnostic only; nothing is admitted by it.
-    removals: AtomicU64,
-    /// [`ResourcePool::generation`]. Bumped (`Release`) while the state lock
-    /// is held, before the change it announces ([`Lane::change`]), or after
-    /// `removals` moves. A reader that loads it (`Acquire`) and then takes
-    /// the lock is ordered after the changer's lock acquisition, so it waits
-    /// for that change to finish and sees it: no change is ever announced
-    /// before it can be observed, on a weakly ordered CPU (aarch64) as on
-    /// x86_64. A change landing between the load and the lock is seen early
-    /// and announced again on the next read: at worst one redundant sample.
-    /// Never read by admission.
-    generation: AtomicU64,
-}
-
 #[derive(Debug)]
 struct State {
-    /// What is granted and not yet released, indexed like `Lane::names`.
+    /// What is granted and not yet released, indexed like
+    /// `ResourcePool::names`.
     /// Counted for an unbounded pool too, which only the snapshot reads.
     held: Box<[u64]>,
     /// Per pool, indexed like `held`: the queued waiters whose need takes
@@ -658,7 +674,7 @@ struct State {
     untested: Untested,
     /// The walk's batch, kept for its allocation.
     batch: Vec<(u64, u64)>,
-    /// How many classes the walk has tested, over the lane's life.
+    /// How many classes the walk has tested, over the pool's life.
     #[cfg(test)]
     visited: u64,
 }
@@ -918,36 +934,8 @@ impl State {
     }
 }
 
-impl Lane {
-    fn new(capacities: BTreeMap<PoolName, Limit>) -> Arc<Self> {
-        let (names, capacity): (Vec<PoolName>, Vec<Limit>) = capacities.into_iter().unzip();
-        let cpu_idx = names
-            .binary_search_by(|p| p.as_str().cmp(PoolName::CPU))
-            .ok();
-        Arc::new(Self {
-            state: Mutex::new(State {
-                held: vec![0; capacity.len()].into_boxed_slice(),
-                waiting: vec![0; capacity.len()].into_boxed_slice(),
-                waiters: BTreeMap::new(),
-                next_seq: 0,
-                shapes: FxHashMap::default(),
-                classes: BTreeMap::new(),
-                next_class: 0,
-                head: Head::default(),
-                cursor: 0,
-                untested: Untested::Nothing,
-                batch: Vec::new(),
-                #[cfg(test)]
-                visited: 0,
-            }),
-            names: names.into_boxed_slice(),
-            capacity: capacity.into_boxed_slice(),
-            cpu_idx,
-            removals: AtomicU64::new(0),
-            generation: AtomicU64::new(0),
-        })
-    }
-
+/// Admission: the queue, the grant chain and what they report.
+impl ResourcePool {
     /// The state lock, for a call that may change what is held or who
     /// waits: announces the change on `generation` while the lock is held.
     /// Reads take `state.lock()` directly.
@@ -988,7 +976,7 @@ impl Lane {
         admitted: Admitted,
     ) -> Reservation {
         Reservation {
-            lane: Arc::clone(self),
+            pool: Arc::clone(self),
             granted,
             origin: None,
             clamped,
@@ -1055,7 +1043,7 @@ impl Lane {
         Acquire {
             state: AcquireState::Waiting {
                 guard: WaitGuard {
-                    lane: Arc::clone(self),
+                    pool: Arc::clone(self),
                     seq,
                     armed: true,
                 },
@@ -1234,7 +1222,7 @@ impl Lane {
         })
     }
 
-    fn snapshot(&self) -> LaneSnapshot {
+    fn snapshot_main(&self) -> LaneSnapshot {
         let mut guard = self.state.lock();
         let st = &mut *guard;
         st.sync_head();
@@ -1403,7 +1391,7 @@ fn give(capacity: &[Limit], held: &mut [u64], granted: &[(usize, u64)]) {
 /// What a target holds while it runs; returns itself to the pool on drop.
 #[derive(Debug)]
 pub struct Reservation {
-    lane: Arc<Lane>,
+    pool: Arc<ResourcePool>,
     /// Shared with the class it was granted from.
     granted: Shape,
     /// The shape this was admitted as, once `granted` is only a part of it
@@ -1439,7 +1427,7 @@ impl Reservation {
     pub fn iter(&self) -> impl Iterator<Item = (&PoolName, u64)> {
         self.granted
             .iter()
-            .filter_map(|&(idx, n)| Some((self.lane.names.get(idx)?, n)))
+            .filter_map(|&(idx, n)| Some((self.pool.names.get(idx)?, n)))
     }
 
     /// Move what this grant holds of `pool` into a reservation of its own,
@@ -1451,7 +1439,7 @@ impl Reservation {
     /// The split-off half is never `clamped`: whether the grant was clamped
     /// stays a fact about the original request.
     pub fn split_off(&mut self, pool: &str) -> Option<Reservation> {
-        let idx = self.lane.index(pool)?;
+        let idx = self.pool.index(pool)?;
         let part = self.granted.iter().copied().find(|&(i, _)| i == idx)?;
         let origin = Arc::clone(self.origin.get_or_insert_with(|| Arc::clone(&self.granted)));
         self.granted = self
@@ -1461,7 +1449,7 @@ impl Reservation {
             .filter(|&(i, _)| i != idx)
             .collect();
         Some(Reservation {
-            lane: Arc::clone(&self.lane),
+            pool: Arc::clone(&self.pool),
             granted: Arc::from([part]),
             origin: Some(origin),
             clamped: false,
@@ -1475,8 +1463,8 @@ impl Reservation {
     /// drops, which uncounts it and then releases the grant, so a waiter the
     /// release admits never sees its own wait's cause still counted.
     pub fn into_removal(self) -> PendingRemoval {
-        self.lane.removals.fetch_add(1, Ordering::AcqRel);
-        self.lane.generation.fetch_add(1, Ordering::Release);
+        self.pool.removals.fetch_add(1, Ordering::AcqRel);
+        self.pool.generation.fetch_add(1, Ordering::Release);
         PendingRemoval { reservation: self }
     }
 }
@@ -1493,9 +1481,9 @@ impl Drop for PendingRemoval {
     fn drop(&mut self) {
         // Before the field drops, which is the release (and moves the
         // generation again, under the lock).
-        let lane = &self.reservation.lane;
-        lane.removals.fetch_sub(1, Ordering::AcqRel);
-        lane.generation.fetch_add(1, Ordering::Release);
+        let pool = &self.reservation.pool;
+        pool.removals.fetch_sub(1, Ordering::AcqRel);
+        pool.generation.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -1503,7 +1491,7 @@ impl Drop for Reservation {
     fn drop(&mut self) {
         if self.armed {
             let shape = self.origin.as_deref().unwrap_or(&self.granted);
-            self.lane.release(&self.granted, shape);
+            self.pool.release(&self.granted, shape);
         }
     }
 }
@@ -1526,12 +1514,12 @@ enum AcquireState {
 }
 
 impl Acquire {
-    /// Where this request stands in its lane, `None` once granted (or when it
-    /// was granted on arrival).
+    /// Where this request stands in the queue, `None` once granted (or when
+    /// it was granted on arrival).
     pub fn wait_info(&self) -> Option<WaitInfo> {
         match &self.state {
             AcquireState::Ready(_) => None,
-            AcquireState::Waiting { guard, .. } => guard.lane.wait_info(guard.seq),
+            AcquireState::Waiting { guard, .. } => guard.pool.wait_info(guard.seq),
         }
     }
 }
@@ -1563,7 +1551,7 @@ impl Future for Acquire {
 /// grant inside the receiver returns itself when the receiver drops.
 #[derive(Debug)]
 struct WaitGuard {
-    lane: Arc<Lane>,
+    pool: Arc<ResourcePool>,
     seq: u64,
     armed: bool,
 }
@@ -1571,7 +1559,7 @@ struct WaitGuard {
 impl Drop for WaitGuard {
     fn drop(&mut self) {
         if self.armed {
-            self.lane.cancel(self.seq);
+            self.pool.cancel(self.seq);
         }
     }
 }
@@ -1728,18 +1716,18 @@ mod tests {
 
     /// How many classes the walk has tested so far.
     fn visited(p: &ResourcePool) -> u64 {
-        p.main.state.lock().visited
+        p.state.lock().visited
     }
 
     /// Whether no pass is unfinished.
     fn pass_done(p: &ResourcePool) -> bool {
-        matches!(p.main.state.lock().untested, Untested::Nothing)
+        matches!(p.state.lock().untested, Untested::Nothing)
     }
 
     /// How many classes wait. Each is findable by its shape, and no other
     /// shape is.
     fn classes(p: &ResourcePool) -> usize {
-        let st = p.main.state.lock();
+        let st = p.state.lock();
         assert_eq!(st.classes.len(), st.shapes.len());
         st.classes.len()
     }
@@ -1778,8 +1766,7 @@ mod tests {
     /// head does not fit, and every other class's oldest waiter either does
     /// not fit or would take what a protected head needs.
     fn settled(p: &ResourcePool) -> bool {
-        let lane = &p.main;
-        let mut guard = lane.state.lock();
+        let mut guard = p.state.lock();
         let st = &mut *guard;
         st.sync_head();
         matches!(st.untested, Untested::Nothing)
@@ -1787,15 +1774,15 @@ mod tests {
                 let Some(&oldest) = c.waiters.first() else {
                     return false;
                 };
-                if !fits(&lane.capacity, &st.held, &c.need) {
+                if !fits(&p.capacity, &st.held, &c.need) {
                     return true;
                 }
                 let Some(head) = st.head.need() else {
                     return false;
                 };
                 st.head.seq() != Some(oldest)
-                    && !leaves_room(&lane.capacity, &st.held, &c.need, head)
-                    && st.head.protected(&lane.capacity)
+                    && !leaves_room(&p.capacity, &st.held, &c.need, head)
+                    && st.head.protected(&p.capacity)
             })
     }
 
@@ -2184,7 +2171,7 @@ mod tests {
     #[test]
     fn waiting_count_matches_a_recount() {
         fn recount(p: &ResourcePool) -> Vec<u64> {
-            let st = p.main.state.lock();
+            let st = p.state.lock();
             let mut waiting = vec![0u64; st.held.len()];
             for class in st.classes.values() {
                 for &(idx, _) in class.need.iter() {
@@ -3843,9 +3830,9 @@ mod tests {
         let _stays = now(&p, &cpus(1));
         let _head = queued(&p, &cpus(1));
 
-        // Nothing at all: granted and returned without the lane's lock,
+        // Nothing at all: granted and returned without the pool's lock,
         // which this thread holds.
-        let lock = p.main.state.lock();
+        let lock = p.state.lock();
         let nothing = p
             .acquire(&req(&[("cpu", 0)]))
             .unwrap()
@@ -4268,7 +4255,7 @@ mod tests {
             if let Some((head, snap)) = head.zip(snap.head) {
                 for o in &snap.overtaken {
                     // I1: its limit plus one grant, the widest there is.
-                    let idx = self.pool.main.index(o.pool.as_str()).unwrap();
+                    let idx = self.pool.index(o.pool.as_str()).unwrap();
                     let widest = self
                         .resolved
                         .iter()
@@ -4284,9 +4271,7 @@ mod tests {
                     self.drained = Some((head, snap.overtaken));
                 }
             }
-            self.peak_classes = self
-                .peak_classes
-                .max(self.pool.main.state.lock().classes.len());
+            self.peak_classes = self.peak_classes.max(self.pool.state.lock().classes.len());
             if !pass_done(&self.pool) {
                 self.unfinished += 1;
             }

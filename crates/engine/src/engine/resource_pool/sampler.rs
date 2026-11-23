@@ -64,7 +64,8 @@ impl PoolSampler {
         let mut sent = self.sent.lock();
         // Read before the snapshot: a change after this load is either in the
         // snapshot or moves the generation past what is recorded, and is sent
-        // (again) on the next call. See `Lane::generation` for the ordering.
+        // (again) on the next call. The `generation` field of `ResourcePool`
+        // documents the ordering.
         let generation = self.pool.generation();
         if generation == *sent {
             return Vec::new();
@@ -215,7 +216,7 @@ mod tests {
         sampler.spawn(move |s| {
             let events = s.sample();
             // What `sample` returned is sent with the pool's lock free.
-            assert!(!watched.main.state.is_locked(), "sent under the pool lock");
+            assert!(!watched.state.is_locked(), "sent under the pool lock");
             if !events.is_empty() && tx.send(events).is_err() {
                 return ControlFlow::Break(());
             }
