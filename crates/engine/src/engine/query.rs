@@ -13,6 +13,7 @@ use hmodel::htmatcher;
 use hmodel::htmatcher::{ListedFacts, MatchResult};
 use hmodel::htpkg::PkgBuf;
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::pin::Pin;
 use std::sync::Arc;
 
 /// What one package's discovery task found: its candidates, in provider order,
@@ -24,6 +25,21 @@ pub(super) struct PackageScan {
     /// A provider's `list` of this package failed and was skipped: its
     /// listings are missing, so no merged fact here can be trusted.
     listing_gap: bool,
+}
+
+/// End a package walk that is failing: flag it as abandoning, which ends the
+/// [`Engine::package_scans`] source so nothing further is spawned, then join
+/// the scans already running. Called before the error propagates.
+///
+/// Not optional, and not replaceable by `?`: inside `try_stream!` that yields
+/// the error and *returns*, leaving up to K-1 package tasks running with an
+/// `Arc<RequestState>` each. They would finish and release it — spawning means
+/// they are no longer strandable — but not before `Engine::result` has
+/// returned, so the request would deregister late and `drain_bg`, which waits
+/// on `bg_pending` rather than on detached tasks, would race it.
+async fn abandon<S: Stream>(stop: &std::sync::atomic::AtomicBool, mut per_pkg: Pin<&mut S>) {
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    while per_pkg.next().await.is_some() {}
 }
 
 /// One listed target, with what its provider said about it.
@@ -208,7 +224,7 @@ impl Engine {
         // incomplete stream never saw the full graph. Centralized here so every
         // whole-graph caller (query, unscoped validate) is covered without
         // per-command code.
-        let whole_graph = matches!(m, htmatcher::Matcher::PackagePrefix(p) if p.is_empty());
+        let whole_graph = m.is_whole_graph();
         async_stream::try_stream! {
             let gaps = discovery.gaps().cloned();
             let keep_going = gaps.is_some();
@@ -297,15 +313,7 @@ impl Engine {
             futures::pin_mut!(per_pkg);
 
             // Every way out of the walk on an error goes through this one value,
-            // never through `?` straight out: inside `try_stream!` that yields
-            // the error and *returns*, leaving up to K-1 package tasks running
-            // with an `Arc<RequestState>` each. They would finish and release it
-            // — spawning means they are no longer strandable — but not before
-            // `Engine::result` has returned, so the request would deregister
-            // late and `drain_bg`, which waits on `bg_pending` rather than on
-            // detached tasks, would race it. So the walk is flagged as
-            // abandoning (which ends the source, so nothing further is spawned)
-            // and what is already running is joined before propagating.
+            // never through `?` straight out, so it can be `abandon`ed first.
             let fatal: Option<anyhow::Error> = 'walk: loop {
                 let scan = match per_pkg.next().await {
                     None => break 'walk None,
@@ -403,8 +411,7 @@ impl Engine {
             };
 
             if let Some(e) = fatal {
-                stop.store(true, std::sync::atomic::Ordering::Relaxed);
-                while per_pkg.next().await.is_some() {}
+                abandon(&stop, per_pkg).await;
                 Err(e)?;
             }
 
@@ -652,7 +659,7 @@ impl Engine {
         discovery: Discovery,
     ) -> impl Stream<Item = anyhow::Result<Candidate>> + 'a {
         let trusted = rs.listed_facts_trust().trusts();
-        let whole_graph = matches!(m, htmatcher::Matcher::PackagePrefix(p) if p.is_empty());
+        let whole_graph = m.is_whole_graph();
         async_stream::try_stream! {
             if !m.is_addr_only() {
                 Err(anyhow::anyhow!(
@@ -703,8 +710,7 @@ impl Engine {
             };
 
             if let Some(e) = fatal {
-                stop.store(true, std::sync::atomic::Ordering::Relaxed);
-                while per_pkg.next().await.is_some() {}
+                abandon(&stop, per_pkg).await;
                 Err(e)?;
             }
 

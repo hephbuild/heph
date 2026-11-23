@@ -133,6 +133,13 @@ impl Matcher {
         }
     }
 
+    /// Whether `self` is the whole-graph selector `//...` — a `PackagePrefix`
+    /// rooted at the empty package. Syntactic: a composite that happens to
+    /// select everything (`//... || //a/...`) is not it.
+    pub fn is_whole_graph(&self) -> bool {
+        matches!(self, Matcher::PackagePrefix(p) if p.is_empty())
+    }
+
     pub fn matches_addr(&self, addr: &Addr) -> MatchResult {
         self.matches_listed(addr, &ListedFacts::UNKNOWN)
     }
@@ -287,6 +294,18 @@ mod tests {
         let mut evaluated = 0;
         let got = MatchResult::any([Shrug, No, Shrug].into_iter().inspect(|_| evaluated += 1));
         assert_eq!((got, evaluated), (Shrug, 3));
+    }
+
+    /// Only the literal `//...` is the whole graph; a narrower prefix, an
+    /// exact root package, or a composite holding `//...` is not.
+    #[test]
+    fn is_whole_graph_is_only_the_root_prefix() {
+        let root = Matcher::PackagePrefix(PkgBuf::from(""));
+        assert!(root.is_whole_graph());
+        assert!(!Matcher::PackagePrefix(PkgBuf::from("a")).is_whole_graph());
+        assert!(!Matcher::Package(PkgBuf::from("")).is_whole_graph());
+        assert!(!Matcher::Or(vec![root.clone()]).is_whole_graph());
+        assert!(!Matcher::Not(Box::new(root)).is_whole_graph());
     }
 
     #[test]

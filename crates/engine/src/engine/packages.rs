@@ -125,7 +125,7 @@ pub(crate) fn merge_packages(
     // about. Every other matcher pays one `PkgBuf` per *unique* package
     // (after the dedup below), and saves a probe plus a `list` for each one
     // it rejects.
-    let scoped = !matches!(m, htmatcher::Matcher::PackagePrefix(p) if p.is_empty());
+    let scoped = !m.is_whole_graph();
 
     for pkgs in per_provider {
         for p in pkgs.iter() {
