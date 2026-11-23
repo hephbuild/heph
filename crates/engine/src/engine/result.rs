@@ -3943,6 +3943,35 @@ impl Engine {
         Ok((resolution, handed))
     }
 
+    /// A local hit under `read`, from either the optimistic probe (branch A) or
+    /// a contended write that found the revision built while it waited: the
+    /// resolution sharing `read`, and the strong guard for the cell's creator.
+    async fn local_hit(
+        &self,
+        rs: &RequestState,
+        addr: &Addr,
+        hashin: &str,
+        manifest: Arc<Manifest>,
+        read: ResultReadGuard,
+    ) -> (Arc<LockedResolution>, Option<Arc<ResultReadGuard>>) {
+        // The target resolved: its last failure is stale. Under the read.
+        self.failure_slots.clear(addr).await;
+        let (slot, read) = GuardSlot::new(addr, hashin, Resolved::Hit(Arc::clone(&manifest)), read);
+        (
+            Arc::new(LockedResolution {
+                guard: Some(slot),
+                executed: None,
+                manifest: Some(manifest),
+                remote: RemoteCell::new(),
+                // Announced only outside a hash-only request (see
+                // `probe_cache_manifest`), so only then is it a hit to take back.
+                hit: (!rs.hash_only()).then_some(hcore::events::CacheHitKind::Local),
+                rebuilt: Default::default(),
+            }),
+            Some(read),
+        )
+    }
+
     /// Body of the per-addr lock dance: the optimistic read → miss → drop →
     /// write → re-check → execute → downgrade → riding-read sequence (and the
     /// non-cacheable force/shell branch). Runs once per addr per request via
@@ -4099,24 +4128,7 @@ impl Engine {
             // Where its blobs live is left unresolved: a caller that needs bytes
             // and hasn't got them forces the cell, and one that only needs
             // hashouts never does.
-            //
-            // The target resolved: its last failure is stale. Under the read.
-            self.failure_slots.clear(addr).await;
-            let (slot, read) =
-                GuardSlot::new(addr, hashin, Resolved::Hit(Arc::clone(&manifest)), read);
-            return Ok((
-                Arc::new(LockedResolution {
-                    guard: Some(slot),
-                    executed: None,
-                    manifest: Some(manifest),
-                    remote: RemoteCell::new(),
-                    // Announced only outside a hash-only request (see
-                    // `probe_cache_manifest`), so only then is it a hit to take back.
-                    hit: (!rs.hash_only()).then_some(hcore::events::CacheHitKind::Local),
-                    rebuilt: Default::default(),
-                }),
-                Some(read),
-            ));
+            return Ok(self.local_hit(&rs, addr, hashin, manifest, read).await);
         }
 
         // B. Miss: a plain read cannot upgrade. Drop it and take the exclusive
@@ -4185,25 +4197,7 @@ impl Engine {
                     Contended::Hit(Err(e)) => return Err(e),
                     Contended::Hit(Ok((manifest, read))) => {
                         // Branch A, reached late.
-                        self.failure_slots.clear(addr).await;
-                        let (slot, read) = GuardSlot::new(
-                            addr,
-                            hashin,
-                            Resolved::Hit(Arc::clone(&manifest)),
-                            read,
-                        );
-                        return Ok((
-                            Arc::new(LockedResolution {
-                                guard: Some(slot),
-                                executed: None,
-                                manifest: Some(manifest),
-                                remote: RemoteCell::new(),
-                                hit: (!rs.hash_only())
-                                    .then_some(hcore::events::CacheHitKind::Local),
-                                rebuilt: Default::default(),
-                            }),
-                            Some(read),
-                        ));
+                        return Ok(self.local_hit(&rs, addr, hashin, manifest, read).await);
                     }
                 }
             }
