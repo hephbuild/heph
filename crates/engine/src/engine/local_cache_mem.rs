@@ -177,7 +177,7 @@ impl LocalCache for LocalCacheMem {
 
     fn delete_all(&self, addr: &Addr, hashin: &str, names: &[&str]) -> Result<()> {
         for name in names {
-            self.cache.remove(&Self::key(addr, hashin, name));
+            self.cache.remove(&KeyRef(addr, hashin, name));
         }
         self.inner.delete_all(addr, hashin, names)
     }
