@@ -185,8 +185,34 @@ async fn run_list(sources: &[&dyn SessionSource], ws: Workspace<'_>, json: bool)
 
 async fn run_show(sources: &[&dyn SessionSource], id: &str, json: bool) -> anyhow::Result<String> {
     let mut out = Vec::new();
-    show::show(sources, opts(), id, &json_args(json), piped(&mut out)).await?;
+    show::show(
+        sources,
+        opts(),
+        id,
+        &json_args(json),
+        piped(&mut out),
+        &no_opener(),
+    )
+    .await?;
     Ok(String::from_utf8(out).expect("utf-8"))
+}
+
+/// A download that never happens: a test that reaches it named a URL.
+struct NoDownload;
+
+impl reference::Download for NoDownload {
+    fn get_to_temp(&self, url: &str, _dir: &Path) -> anyhow::Result<tempfile::NamedTempFile> {
+        anyhow::bail!("no download in this test: {url}")
+    }
+}
+
+/// An opener for tests that name sessions by id: nothing is downloaded, and
+/// a path `<ref>` puts its temp files in a directory that does not exist.
+fn no_opener() -> reference::Opener<'static> {
+    reference::Opener {
+        tmp_dir: Path::new("/nonexistent/heph-session-tmp"),
+        download: &NoDownload,
+    }
 }
 
 #[test]
@@ -1475,6 +1501,7 @@ async fn attach_mirrors_the_session_exit() {
                     no_tui: true,
                     ..Default::default()
                 },
+                &no_opener(),
             )
             .await
         }
@@ -1576,7 +1603,7 @@ async fn attach_reads_a_pending_notice_from_the_run_home() {
         let app = attach::AttachApp::new(
             &global,
             m,
-            true,
+            attach::Origin::Local { live: true },
             source.holder_names(id),
             futures::stream::empty().boxed(),
             detach_rx,
@@ -2486,7 +2513,7 @@ async fn export_is_self_contained() {
     let file = FileSource::new(sessions.path());
     let export = |output: PathBuf, no_logs: bool| {
         let args = ExportArgs {
-            id: id.encode(),
+            reference: id.encode(),
             output: Some(output),
             no_logs,
         };
@@ -2499,6 +2526,7 @@ async fn export_is_self_contained() {
                 &args,
                 crate::engine::approval::read_notice_from_store,
                 &mut stdout,
+                &no_opener(),
             )
             .await
             .expect("export");
@@ -2735,6 +2763,7 @@ async fn a_lost_session_sealed_by_cleanup_still_reads() {
         &id.encode(),
         &json_args(false),
         piped(&mut out),
+        &no_opener(),
     )
     .await
     .expect("show");
@@ -2755,6 +2784,7 @@ async fn a_lost_session_sealed_by_cleanup_still_reads() {
         &id.encode(),
         &json_args(true),
         piped(&mut out),
+        &no_opener(),
     )
     .await
     .expect("show --json");

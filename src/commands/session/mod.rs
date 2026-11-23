@@ -18,6 +18,7 @@
 mod attach;
 mod export;
 pub(crate) mod list;
+mod reference;
 pub(crate) mod show;
 #[cfg(test)]
 mod tests;
@@ -80,28 +81,36 @@ pub enum SessionCommands {
     List(ListArgs),
     /// Print a session's progress once, and what it is stuck on
     ///
-    /// `<id>` is a full session id, the pid of a live session, or a unique
+    /// `<ref>` is a full session id, the pid of a live session, or a unique
     /// prefix or suffix of an id. Give the suffix (the last 4–5 characters)
     /// or the pid: the leading characters are the start time, so sessions
-    /// started minutes apart share them.
+    /// started minutes apart share them. Anything with a `/` or a `.` is a
+    /// `.hephsession` file (`./02kf5` forces a path), and an `https://` URL
+    /// is downloaded and read; either is read only from itself.
     ///
     /// Examples:
     ///
     /// `heph session show 02kf5`
     ///
     /// `heph session show 48213 --json`
+    ///
+    /// `heph session show ./heph-02kf5.hephsession`
     Show(ShowArgs),
     /// Follow a session live, until it ends or you detach
     ///
     /// `q` (or Ctrl-C) detaches and leaves the session running. Exits with the
     /// session's exit code once it ends, 0 on detach, and 125 when heph cannot
-    /// follow it. A 125 that is the session's own is named on stderr.
+    /// follow it. A 125 that is the session's own is named on stderr. A
+    /// `.hephsession` file or URL is replayed to its end, and exits with the
+    /// code it recorded.
     ///
     /// Examples:
     ///
     /// `heph session attach 02kf5`
     ///
     /// `heph session attach 48213`
+    ///
+    /// `heph session attach ci/heph-02kf5.hephsession`
     Attach(AttachArgs),
     /// Ask a running session for its in-flight report
     ///
@@ -143,8 +152,10 @@ pub struct ListArgs {
 #[derive(Args, Clone, Debug)]
 pub struct ShowArgs {
     /// Session id, its last 4–5 characters, or a live session's pid (any
-    /// unique prefix or suffix of an id works).
-    pub id: String,
+    /// unique prefix or suffix of an id works); or a `.hephsession` path or
+    /// `https://` URL.
+    #[arg(value_name = "REF")]
+    pub reference: String,
     /// `--json` is the session's snapshot, with the viewer-computed `state`.
     #[command(flatten)]
     pub out: output::JsonArgs<show::ShowView<'static>>,
@@ -153,8 +164,10 @@ pub struct ShowArgs {
 #[derive(Args, Clone, Debug)]
 pub struct AttachArgs {
     /// Session id, its last 4–5 characters, or a live session's pid (any
-    /// unique prefix or suffix of an id works).
-    pub id: String,
+    /// unique prefix or suffix of an id works); or a `.hephsession` path or
+    /// `https://` URL.
+    #[arg(value_name = "REF")]
+    pub reference: String,
     /// Accepted only to be refused with a reason: `-D` belongs to `run`, and
     /// a viewer has no build of its own to open the dashboard on or hold.
     #[arg(short = 'D', long = "dashboard", hide = true)]
@@ -193,8 +206,10 @@ pub(crate) struct Out<'a> {
 #[derive(Args, Clone, Debug)]
 pub struct ExportArgs {
     /// Session id, its last 4–5 characters, or a live session's pid (any
-    /// unique prefix or suffix of an id works).
-    pub id: String,
+    /// unique prefix or suffix of an id works); or a `.hephsession` path or
+    /// `https://` URL, written again.
+    #[arg(value_name = "REF")]
+    pub reference: String,
     /// The file to write, replaced if it exists; `-` writes to stdout.
     /// Default: `./heph-<id>.hephsession`.
     #[arg(short = 'o', long = "output", value_name = "PATH")]
@@ -211,8 +226,94 @@ impl SessionArgs {
         session: &Arc<SessionSlot>,
         global: &GlobalOptions,
     ) -> anyhow::Result<()> {
-        wrap_exit(execute(&self.command, sink, session, global))
+        let res = execute(&self.command, sink, session, global);
+        if let Err(e) = &res
+            && self.command.json()
+        {
+            // The human line still goes to stderr, rendered by main.
+            let mut stdout = std::io::stdout().lock();
+            if let Err(w) = write_json_error(e, &mut stdout) {
+                tracing::debug!(error = %w, "cannot write the error as JSON");
+            }
+        }
+        wrap_exit(res)
     }
+}
+
+impl SessionCommands {
+    /// Whether the command was asked for `--json`.
+    fn json(&self) -> bool {
+        match self {
+            Self::List(a) => a.json,
+            Self::Show(a) => a.json,
+            Self::Inflight(a) => a.json,
+            Self::Attach(_) | Self::Export(_) => false,
+        }
+    }
+}
+
+/// What kind of failure a `heph session` error is, under `--json`'s
+/// `error.kind`. An open enum: a consumer reads a value it does not know as
+/// a failure, with `error.message` saying what. Every one exits 125.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ErrorKind {
+    /// No session matches the `<ref>`.
+    NotFound,
+    /// More than one session matches the `<ref>`; the message lists them.
+    Ambiguous,
+    /// The file or download is not a heph session.
+    NotASession,
+    /// A heph recording in a format newer than this heph reads. The message
+    /// names both formats.
+    FormatTooNew,
+    /// The URL was refused or its download failed.
+    Fetch,
+    /// A file could not be read or written.
+    Io,
+    /// Anything else; the message says what.
+    Other,
+}
+
+/// An error with its [`ErrorKind`].
+#[derive(Debug)]
+pub(crate) struct Kinded {
+    pub kind: ErrorKind,
+    pub error: anyhow::Error,
+}
+
+impl std::fmt::Display for Kinded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#}", self.error)
+    }
+}
+
+impl std::error::Error for Kinded {}
+
+pub(crate) fn kinded(kind: ErrorKind, error: anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(Kinded { kind, error })
+}
+
+/// The kind of `e`: the first [`Kinded`] in its chain, else `Other`.
+pub(crate) fn error_kind(e: &anyhow::Error) -> ErrorKind {
+    e.chain()
+        .find_map(|c| c.downcast_ref::<Kinded>())
+        .map_or(ErrorKind::Other, |k| k.kind)
+}
+
+/// `{"error": {"kind", "message"}}` on one line, for `--json`.
+pub(crate) fn write_json_error(e: &anyhow::Error, out: &mut dyn Write) -> anyhow::Result<()> {
+    serde_json::to_writer(
+        &mut *out,
+        &serde_json::json!({
+            "error": {
+                "kind": error_kind(e),
+                "message": format!("{e:#}"),
+            }
+        }),
+    )
+    .context("writing the error")?;
+    writeln!(out).context("writing the error")
 }
 
 /// Every error that is not already a [`SessionExit`] is this command's own:
@@ -240,8 +341,14 @@ fn execute(
     let root = hcore::userdir::heph_user_dir_from(std::env::var_os("HOME").as_deref())
         .context("locating ~/.heph/sessions")?
         .join(crate::tui::session::SESSIONS_DIR);
+    let tmp_dir = crate::tui::session::store::tmp_dir(&root);
     let file = FileSource::new(root);
     let sources: [&dyn SessionSource; 1] = [&file];
+    let download = hfetch::Fetcher::https_capped(crate::tui::session::hephsession::URL_CAP);
+    let opener = reference::Opener {
+        tmp_dir: &tmp_dir,
+        download: &download,
+    };
     let opts = ViewOpts {
         now_ms: hcore::events::now_unix_ms(),
         stall: stall_threshold(global.stall_notice),
@@ -272,16 +379,29 @@ fn execute(
             }
             bootstrap::block_on(list::list(&sources, opts, filter, &a.out, out))?
         }
-        SessionCommands::Show(a) => {
-            bootstrap::block_on(show::show(&sources, opts, &a.id, &a.out, out))?
-        }
+        SessionCommands::Show(a) => bootstrap::block_on(show::show(
+            &sources,
+            opts,
+            &a.reference,
+            &a.out,
+            out,
+            &opener,
+        ))?,
         SessionCommands::Inflight(a) => {
             bootstrap::block_on(inflight(&sources, opts, &a.id, &a.out, out))?
         }
         SessionCommands::Attach(a) => {
             a.refuse_dashboard()?;
             drop(stdout);
-            bootstrap::block_on(attach::attach(&sources, opts, &a.id, sink, session, global))?
+            bootstrap::block_on(attach::attach(
+                &sources,
+                opts,
+                &a.reference,
+                sink,
+                session,
+                global,
+                &opener,
+            ))?
         }
         SessionCommands::Export(a) => {
             let exported = bootstrap::block_on(export::export_ref(
@@ -290,6 +410,7 @@ fn execute(
                 a,
                 crate::engine::approval::read_notice_from_store,
                 &mut stdout,
+                &opener,
             ))??;
             if exported.snapshot {
                 sink.write_diagnostic(
@@ -539,7 +660,10 @@ pub(crate) async fn resolve(
 ) -> anyhow::Result<(usize, SessionEntry)> {
     let arg = arg.trim();
     if arg.is_empty() {
-        anyhow::bail!("no session id given");
+        return Err(kinded(
+            ErrorKind::NotFound,
+            anyhow::anyhow!("no session id given"),
+        ));
     }
     if let Ok(id) = SessionId::parse(arg) {
         for (i, source) in sources.iter().enumerate() {
@@ -553,9 +677,8 @@ pub(crate) async fn resolve(
         }
     }
     let all = list_all(sources).await?;
-    if arg.bytes().all(|b| b.is_ascii_digit())
-        && let Ok(pid) = arg.parse::<u32>()
-    {
+    let digits = arg.bytes().all(|b| b.is_ascii_digit());
+    if digits && let Ok(pid) = arg.parse::<u32>() {
         let mut by_pid: Vec<&(usize, SessionEntry)> = all
             .iter()
             .filter(|(_, e)| e.live && e.known_meta().is_some_and(|m| m.owner_pid == pid))
@@ -569,8 +692,11 @@ pub(crate) async fn resolve(
             return Err(ambiguous(arg, &by_pid, opts));
         }
     }
+    let not_found = |msg: String| kinded(ErrorKind::NotFound, anyhow::anyhow!(msg));
     let Some(needle) = crate::tui::session::id::normalize(arg) else {
-        anyhow::bail!("no session {arg}: not a session id, a live session's pid, or part of an id");
+        return Err(not_found(format!(
+            "no session {arg}: not a session id, a live session's pid, or part of an id"
+        )));
     };
     let matches: Vec<&(usize, SessionEntry)> = all
         .iter()
@@ -581,10 +707,16 @@ pub(crate) async fn resolve(
         .collect();
     match matches.as_slice() {
         [one] => Ok((*one).clone()),
-        [] => anyhow::bail!(
+        // Digits read two ways (spec: `12345`): say that neither matched.
+        [] if digits => Err(not_found(format!(
+            "no session {arg}: no live session has pid {arg}, and no session id starts or ends \
+             with {needle} (`heph session list --all` lists them): {}",
+            gone_hint(opts.retention)
+        ))),
+        [] => Err(not_found(format!(
             "no session {arg} (`heph session list --all` lists them): {}",
             gone_hint(opts.retention)
-        ),
+        ))),
         _ => Err(ambiguous(arg, &matches, opts)),
     }
 }
@@ -599,7 +731,7 @@ fn ambiguous(arg: &str, candidates: &[&(usize, SessionEntry)], opts: ViewOpts) -
         msg.push_str(&format!("\n  {}  {:<8} {command}", e.id, state.label()));
     }
     msg.push_str("\nGive more of the id (or its last characters).");
-    anyhow::anyhow!(msg)
+    kinded(ErrorKind::Ambiguous, anyhow::anyhow!(msg))
 }
 
 /// Refuse a session whose directory format this heph does not read (A6).
@@ -608,11 +740,14 @@ pub(crate) fn require_known(
 ) -> anyhow::Result<&crate::tui::session::SessionMeta> {
     match &entry.meta {
         EntryMeta::Known(m) => Ok(m),
-        EntryMeta::TooNew { found, supported } => anyhow::bail!(
-            "session {} was recorded in session format {found}; this heph reads format {supported} \
-             and older — use a newer heph to view it",
-            entry.id
-        ),
+        EntryMeta::TooNew { found, supported } => Err(kinded(
+            ErrorKind::FormatTooNew,
+            anyhow::anyhow!(
+                "session {} was recorded in session format {found}; this heph reads format \
+                 {supported} and older — use a newer heph to view it",
+                entry.id
+            ),
+        )),
     }
 }
 

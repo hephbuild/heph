@@ -108,6 +108,24 @@ pub struct ForeignFile {
     _decompressed: Option<tempfile::NamedTempFile>,
 }
 
+impl ForeignFile {
+    /// The connection, and the temp file it reads from (if any) as a path
+    /// the caller now removes.
+    pub(crate) fn into_parts(self) -> (Connection, Option<PathBuf>) {
+        let temp = self
+            ._decompressed
+            .and_then(|t| match t.into_temp_path().keep() {
+                Ok(path) => Some(path),
+                Err(e) => {
+                    // Removed now; the open connection keeps reading it.
+                    tracing::debug!(error = %e, "cannot keep a decompressed session");
+                    None
+                }
+            });
+        (self.conn, temp)
+    }
+}
+
 /// Open `path` as a `.hephsession` (any of the sniffed shapes),
 /// decompressing into `tmp_dir` when it must.
 pub fn open(path: &Path, tmp_dir: &Path) -> Result<ForeignFile, ForeignError> {

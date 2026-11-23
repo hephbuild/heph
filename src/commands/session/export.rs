@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 use hcore::approval_notice::ReadNotice;
 
-use super::{ExportArgs, ViewOpts, require_known, resolve};
+use super::reference::{Opener, Resolved, open_ref};
+use super::{ExportArgs, ViewOpts};
 use crate::tui::session::export::{self as core, Abort};
 use crate::tui::session::hephsession::EXTENSION;
 use crate::tui::session::recording::{Recording, RecordingState};
@@ -48,28 +49,34 @@ pub(crate) struct Exported {
 }
 
 /// `heph session export <ref>` over the sessions `file` holds: resolve `ref`
-/// as the other commands do, then [`export`] the local recording. `read` fills
-/// the export's notices (the engine's `read_notice_from_store`).
+/// as the other commands do, then [`export`] the recording, local or
+/// foreign. `read` fills a local export's notices (the engine's
+/// `read_notice_from_store`); a foreign one keeps its own.
 pub(crate) async fn export_ref(
     file: &FileSource,
     opts: ViewOpts,
     args: &ExportArgs,
     read: ReadNotice,
     stdout: &mut dyn Write,
+    opener: &Opener<'_>,
 ) -> anyhow::Result<Exported> {
     let sources: [&dyn SessionSource; 1] = [file];
-    let (_, entry) = resolve(&sources, &args.id, opts).await?;
-    require_known(&entry)?;
-    let id = entry.id;
+    let rec = match open_ref(&sources, &args.reference, opts, opener).await? {
+        Resolved::Local { entry, .. } => {
+            let id = entry.id;
+            Recording::open_local(file.root(), &file.root().join(id.encode()))
+                .map_err(|e| anyhow::anyhow!("{e}"))
+                .with_context(|| format!("opening session {id}"))?
+        }
+        Resolved::Foreign(rec) => rec,
+    };
+    let id = rec.meta().context("reading the session row")?.id;
     let dest = Dest::from_arg(args.output.as_deref(), id);
     if dest == Dest::Stdout && std::io::stdout().is_terminal() {
         anyhow::bail!(
             "a .{EXTENSION} file is binary: not writing it to a terminal (`-o PATH`, or redirect stdout)"
         );
     }
-    let rec = Recording::open_local(file.root(), &file.root().join(id.encode()))
-        .map_err(|e| anyhow::anyhow!("{e}"))
-        .with_context(|| format!("opening session {id}"))?;
     let logs = (!args.no_logs).then_some(read);
     export(&rec, dest, logs, &store::tmp_dir(file.root()), stdout)
         .with_context(|| format!("exporting session {id}"))

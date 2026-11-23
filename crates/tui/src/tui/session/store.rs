@@ -421,6 +421,16 @@ impl Opened {
     pub fn is_copy(&self) -> bool {
         self.copy.is_some()
     }
+
+    /// A recording opened by path or URL (spec I7): never live, and `files`
+    /// (a decompressed copy, a download) are removed when this drops.
+    pub(crate) fn foreign(conn: Connection, files: Vec<PathBuf>) -> Self {
+        Self {
+            conn,
+            live: false,
+            copy: (!files.is_empty()).then_some(TempCopy { files }),
+        }
+    }
 }
 
 #[derive(Debug)]

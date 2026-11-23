@@ -2757,6 +2757,7 @@ dependencies = [
  "enclose",
  "engine",
  "execrunner",
+ "fetch",
  "futures",
  "glob",
  "humantime",

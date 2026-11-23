@@ -145,6 +145,7 @@ hplugin-archive = { package = "plugin-archive", path = "crates/plugin-archive" }
 hplugin-query = { package = "plugin-query", path = "crates/plugin-query" }
 htelemetry = { package = "telemetry", path = "crates/telemetry" }
 htui = { package = "tui", path = "crates/tui" }
+hfetch = { package = "fetch", path = "crates/fetch" }
 hlock = { package = "lock", path = "crates/lock" }
 hselfupdate = { package = "selfupdate", path = "crates/selfupdate" }
 hengine = { package = "engine", path = "crates/engine" }

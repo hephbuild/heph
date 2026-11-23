@@ -30,7 +30,7 @@ pub const FOLLOW_TICK: Duration = Duration::from_millis(100);
 
 /// Records a follower reads before handing them on, so a slow consumer holds
 /// the follower back rather than a whole recording buffering in memory.
-const FOLLOW_BATCH: usize = 256;
+pub(crate) const FOLLOW_BATCH: usize = 256;
 
 /// What a viewer can say about a session's recording.
 #[derive(Debug, Clone)]

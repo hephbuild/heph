@@ -23,8 +23,10 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use super::reference::{Opener, Resolved, open_ref};
 use super::show::new_view;
-use super::{SessionExit, ViewOpts, escape_replayed, require_known, resolve};
+use super::{SessionExit, ViewOpts, escape, escape_replayed, require_known};
+use crate::tui::session::recording::{FailureLog, ForeignSource, RecordedNotices};
 use crate::tui::session::{
     FeedRunLogLocator, HeaderKind, HolderNames, Routed, SessionFeed, SessionId, SessionItem,
     SessionMeta, SessionSource,
@@ -49,13 +51,43 @@ pub(crate) async fn attach(
     sink: LogSink,
     session: &Arc<SessionSlot>,
     global: &crate::commands::GlobalOptions,
+    opener: &Opener<'_>,
+) -> anyhow::Result<()> {
+    match open_ref(sources, arg, opts, opener).await? {
+        Resolved::Local { index, entry } => {
+            let source = *sources
+                .get(index)
+                .ok_or_else(|| anyhow::anyhow!("the session's source went missing"))?;
+            follow(source, entry, None, sink, session, global).await
+        }
+        Resolved::Foreign(rec) => {
+            let foreign = rec.into_source()?;
+            let entry = foreign.entry().clone();
+            follow(&foreign, entry, Some(&foreign), sink, session, global).await
+        }
+    }
+}
+
+/// Follow `entry` from `source`: live for a local session, replayed to its
+/// end for a `foreign` recording (I7: nothing read but the recording).
+async fn follow(
+    source: &dyn SessionSource,
+    entry: crate::tui::session::SessionEntry,
+    foreign: Option<&ForeignSource>,
+    sink: LogSink,
+    session: &Arc<SessionSlot>,
+    global: &crate::commands::GlobalOptions,
 ) -> anyhow::Result<()> {
     let no_tui = global.no_tui;
-    let (i, entry) = resolve(sources, arg, opts).await?;
     let meta = require_known(&entry)?.clone();
-    let source = *sources
-        .get(i)
-        .ok_or_else(|| anyhow::anyhow!("the session's source went missing"))?;
+    if let Some(f) = foreign {
+        let caveat = f
+            .state()
+            .caveat()
+            .map(|c| format!(": {c}"))
+            .unwrap_or_default();
+        sink.write_diagnostic(&format!("heph: replaying {}{caveat}\n", escape(f.origin())));
+    }
     let stream = source.subscribe(entry.id).await?;
 
     // Ctrl-C, from the TUI's key handler or a SIGINT, detaches.
@@ -71,7 +103,7 @@ pub(crate) async fn attach(
     let app = AttachApp::new(
         global,
         meta,
-        entry.live,
+        foreign.map_or(Origin::Local { live: entry.live }, Origin::Foreign),
         source.holder_names(entry.id),
         stream,
         detach_rx,
@@ -88,6 +120,16 @@ pub(crate) async fn attach(
     let outcome = outcome?;
     if let Some(note) = exit_note(entry.id, outcome) {
         sink.write_diagnostic(&note);
+    }
+    // A recording with no end records no exit code: say why, not "lost".
+    if let (Some(f), Outcome::Lost) = (foreign, outcome) {
+        return Err(SessionExit::own(anyhow::anyhow!(
+            "{} has no recorded end ({}): nothing says how session {} exited",
+            f.origin(),
+            f.state().caveat().unwrap_or("incomplete"),
+            entry.id
+        ))
+        .into());
     }
     outcome_result(entry.id, outcome)
 }
@@ -185,6 +227,42 @@ enum Readers {
     },
     /// No engine reads that home from here: why, in the tabs' words.
     Unavailable(String),
+    /// A recording opened by path or URL (I7): notices and root failure logs
+    /// from what its export carried, nothing from this machine.
+    Recorded {
+        notices: RecordedNotices,
+        logs: Arc<RecordedLogs>,
+    },
+}
+
+/// The target screen's reader for a foreign recording: the root failure
+/// logs its export carried.
+struct RecordedLogs {
+    origin: String,
+    logs: Vec<FailureLog>,
+}
+
+impl tui::dashboard::TargetReader for RecordedLogs {
+    fn open_log(&self, addr: &str) -> tui::dashboard::LogOpened {
+        match self.logs.iter().find(|l| l.addr == addr) {
+            Some(l) => tui::dashboard::LogOpened::Tail {
+                bytes: l.log.clone(),
+                len: (l.log.len() as u64).saturating_add(l.cut_bytes),
+                about: format!("recorded in {}", self.origin),
+            },
+            None => tui::dashboard::LogOpened::Unavailable(format!(
+                "log not in {}: an export keeps only root failures' logs",
+                self.origin
+            )),
+        }
+    }
+
+    fn outputs(&self, _addr: &str, _failed: bool) -> tui::dashboard::OutputsFound {
+        tui::dashboard::OutputsFound::Unavailable(format!(
+            "outputs are not in a recording: {} holds none",
+            self.origin
+        ))
+    }
 }
 
 impl Readers {
@@ -270,6 +348,15 @@ pub(super) struct AttachApp {
     quit_rx: mpsc::UnboundedReceiver<()>,
 }
 
+/// Where an attached session comes from.
+#[derive(Clone, Copy)]
+pub(super) enum Origin<'a> {
+    /// This user's sessions directory; `live` when its owner held the lock.
+    Local { live: bool },
+    /// A path or URL (I7).
+    Foreign(&'a ForeignSource),
+}
+
 impl AttachApp {
     /// The viewer of `meta`'s session, following `stream`. Only the
     /// dashboard (`interactive`) reads logs, outputs and notices; the line
@@ -277,7 +364,7 @@ impl AttachApp {
     pub(super) fn new(
         global: &crate::commands::GlobalOptions,
         meta: SessionMeta,
-        live: bool,
+        origin: Origin<'_>,
         holders: HolderNames,
         stream: BoxStream<'static, anyhow::Result<SessionItem>>,
         detach_rx: mpsc::UnboundedReceiver<()>,
@@ -285,8 +372,17 @@ impl AttachApp {
     ) -> Self {
         let (quit_tx, quit_rx) = mpsc::unbounded_channel();
         let feed = SessionFeed::with_holders(holders.clone());
-        let readers =
-            interactive.then(|| Readers::for_session(global, &meta, meta.id, live, &feed));
+        // A foreign recording never gets an engine over a home (I7).
+        let readers = interactive.then(|| match origin {
+            Origin::Foreign(f) => Readers::Recorded {
+                notices: f.notices(),
+                logs: Arc::new(RecordedLogs {
+                    origin: f.origin().to_owned(),
+                    logs: f.failure_logs().to_vec(),
+                }),
+            },
+            Origin::Local { live } => Readers::for_session(global, &meta, meta.id, live, &feed),
+        });
         Self {
             id: meta.id,
             meta,
@@ -392,6 +488,9 @@ impl App for AttachApp {
             Some(Readers::Unavailable(why)) => {
                 view.with_target_reader(Arc::new(NotAttached(why.clone())))
             }
+            Some(Readers::Recorded { notices, logs }) => view
+                .with_target_reader(Arc::clone(logs) as _)
+                .with_recorded_notices(Arc::clone(notices)),
             None => view,
         }
     }
