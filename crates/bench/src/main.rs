@@ -443,10 +443,13 @@ fn run_dist_both(args: RunDistArgs) -> Result<()> {
         .with_context(|| format!("canonicalize {}", args.corpus.display()))?;
     let manifest = bench_corpus::load_manifest(&corpus)
         .context("load corpus manifest (run `corpus` first)")?;
+    let candidate = dist::Dist::locate(&args.candidate_dist).context("locate candidate dist")?;
+    let baseline = dist::Dist::locate(&args.baseline_dist).context("locate baseline dist")?;
 
     for _ in 0..args.warmup {
-        dist::prepare(&args.candidate_dist, &corpus, args.scenario).context("prepare candidate")?;
-        dist::prepare(&args.baseline_dist, &corpus, args.scenario).context("prepare baseline")?;
+        dist::prepare(&candidate, &corpus, &manifest, args.scenario)
+            .context("prepare candidate")?;
+        dist::prepare(&baseline, &corpus, &manifest, args.scenario).context("prepare baseline")?;
     }
 
     let mut candidate_ms = Vec::with_capacity(args.reps);
@@ -454,21 +457,15 @@ fn run_dist_both(args: RunDistArgs) -> Result<()> {
     for i in 0..args.reps {
         let seed = i as u64;
         if args.scenario.times_index_lookups() {
-            dist::check_populated_index(&args.candidate_dist, &corpus, &manifest)
+            dist::check_populated_index(&candidate, &corpus, &manifest)
                 .context("the candidate's codegen index before its rep")?;
         }
         candidate_ms.push(
-            dist::measure_once(
-                &args.candidate_dist,
-                &corpus,
-                &manifest,
-                args.scenario,
-                seed,
-            )
-            .context("measure candidate")?,
+            dist::measure_once(&candidate, &corpus, &manifest, args.scenario, seed)
+                .context("measure candidate")?,
         );
         baseline_ms.push(
-            dist::measure_once(&args.baseline_dist, &corpus, &manifest, args.scenario, seed)
+            dist::measure_once(&baseline, &corpus, &manifest, args.scenario, seed)
                 .context("measure baseline")?,
         );
     }
