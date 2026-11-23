@@ -11,6 +11,7 @@ use hcore::events::{AdmittedKind, display_amount, unit_of};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
+use super::chrome::{CHROME_ROWS, TABS_ROW, end_sub_frame, hint_line, on_back, sub_tab_rows};
 use super::detail::{Detail, Phase};
 use super::feed::{
     FeedMsg, FileKind, LogOpened, OutputFile, OutputsFound, TargetFeed, TargetReader,
@@ -31,10 +32,6 @@ pub const OUTPUTS_HINTS: &str =
 
 /// Files a group lists before folding the rest into "… N more".
 const FOLD_AT: usize = 3;
-
-/// Rows besides the body: two of header, the tab row, its rule, a blank
-/// and the hint row.
-const CHROME_ROWS: u16 = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetTab {
@@ -102,10 +99,7 @@ pub struct TargetScreen {
     drawn: Drawn,
 }
 
-/// The breadcrumb that starts the tab row; a click on it goes back.
-const BACK: &str = " ◂ esc  ";
-/// The tab row's place in the frame, and the first body row's.
-const TABS_ROW: u16 = 2;
+/// The first body row's place in the frame, under the tab row and its rule.
 const BODY_TOP: u16 = 4;
 /// Rows one wheel step moves.
 pub const WHEEL_ROWS: isize = 3;
@@ -174,7 +168,7 @@ impl TargetScreen {
         let d = &self.drawn;
         // The tab row is there while the hint row still fits under it.
         if row == TABS_ROW && d.rows > TABS_ROW + 1 {
-            if usize::from(col) < width(BACK.trim_end()) {
+            if on_back(col) {
                 return TargetClick::Back;
             }
             let Some(&(_, tab)) = d.tabs.iter().find(|(cols, _)| cols.contains(&col)) else {
@@ -469,18 +463,7 @@ impl TargetScreen {
         self.drawn.rows = rows;
         self.drawn.body_shown = body.len().min(body_rows);
         out.extend(body.into_iter().take(body_rows));
-        while out.len() < usize::from(rows.saturating_sub(2)) {
-            out.push(Line::default());
-        }
-        out.push(Line::default());
-        let hint = cut_right(&clean_inline(&hints), c.saturating_sub(2)).into_owned();
-        out.push(Line::styled(format!("  {hint}"), dim()));
-        let rows = usize::from(rows);
-        if out.len() > rows {
-            let hint = out.pop();
-            out.truncate(rows.saturating_sub(1));
-            out.extend(hint.filter(|_| rows > 0));
-        }
+        end_sub_frame(&mut out, hint_line(&hints, c, dim()), rows);
         out
     }
 
@@ -505,56 +488,23 @@ fn tab_rows(
     hits: &mut [(Range<u16>, TargetTab); 3],
 ) -> (Line<'static>, Line<'static>) {
     let addr = cut_left(&clean_inline(addr), cols / 2).into_owned();
-    let mut spans = vec![
-        Span::styled(BACK, dim()),
-        Span::styled(addr, Style::default().add_modifier(Modifier::BOLD)),
-        Span::styled("  │  ", dim()),
-    ];
-    let mut at: usize = spans.iter().map(|s| width(&s.content)).sum();
-    let mut mark = (0, 0);
-    for (i, t) in TargetTab::ALL.into_iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::raw("    "));
-            at += 4;
-        }
-        let name = t.name();
-        if let Some(h) = hits.get_mut(i) {
-            let col = |c: usize| u16::try_from(c.min(cols)).unwrap_or(u16::MAX);
-            *h = (col(at)..col(at + width(name)), t);
-        }
-        if t == active {
-            mark = (at, width(name));
-            spans.push(Span::styled(
-                name,
-                Style::default().add_modifier(Modifier::BOLD),
-            ));
-        } else {
-            spans.push(Span::styled(name, dim()));
-        }
-        at += width(name);
-    }
-    let room = cols.saturating_sub(at + 2);
-    if !status.is_empty() && room > 4 {
-        let status = cut_right(status, room).into_owned();
-        let gap = cols.saturating_sub(at + width(&status) + 1);
-        spans.push(Span::raw(" ".repeat(gap)));
-        spans.push(Span::styled(status, dim()));
-    }
-    let mut line = Line::from(spans);
-    if line.width() > cols {
-        line = Line::raw(cut_right(&line.to_string(), cols).into_owned());
-    }
-    let (start, w) = mark;
-    let rule: String = (0..cols)
-        .map(|i| {
-            if i >= start && i < start + w {
-                '━'
-            } else {
-                '─'
+    let crumb = Span::styled(addr, Style::default().add_modifier(Modifier::BOLD));
+    let active = TargetTab::ALL
+        .iter()
+        .position(|&t| t == active)
+        .unwrap_or_default();
+    sub_tab_rows(
+        [crumb],
+        TargetTab::ALL.map(TargetTab::name),
+        active,
+        (status, dim()),
+        cols,
+        |i, at| {
+            if let Some(h) = hits.get_mut(i) {
+                h.0 = at;
             }
-        })
-        .collect();
-    (line, Line::styled(rule, dim()))
+        },
+    )
 }
 
 /// The state's words and colour: the Overview's title and a failed Log's

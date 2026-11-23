@@ -695,6 +695,62 @@ fn timeline_from_events() {
     );
 }
 
+/// On a narrow or short terminal the target screen is still exactly `rows`
+/// lines, none wider than `cols`, its hint row last; the breadcrumb and the
+/// tabs stay clickable while the tab row is drawn.
+#[test]
+fn target_screen_narrow_and_short() {
+    let s = fold(&[at(0, start("//t:run")), at(0, exec("//t:run"))]);
+    let redact = Redact::default();
+    let inp = TargetInputs {
+        model: s.dashboard(),
+        waits: &s,
+        redact: &redact,
+        now_ms: T0 + 1_000,
+        scope: CountScope::Matched,
+        detach: false,
+    };
+    for tab in [TargetTab::Overview, TargetTab::Log, TargetTab::Outputs] {
+        let mut t = open_on(&s, "//t:run", tab, None);
+        for (cols, rows) in [
+            (120, 30),
+            (40, 8),
+            (20, 6),
+            (12, 4),
+            (8, 3),
+            (20, 2),
+            (20, 1),
+            (20, 0),
+        ] {
+            let f: Vec<String> = t
+                .frame(&title(), &inp, cols, rows)
+                .iter()
+                .map(text)
+                .collect();
+            assert_eq!(f.len(), usize::from(rows), "{tab:?} {cols}x{rows}: {f:#?}");
+            for l in &f {
+                assert!(
+                    crate::tui::text::width(l) <= usize::from(cols),
+                    "{cols}x{rows}: {l:?}"
+                );
+            }
+            if rows > 0 {
+                let hint = f.last().map(String::as_str).unwrap_or_default();
+                assert!(
+                    hint.starts_with("  ") && !hint.trim().is_empty(),
+                    "{cols}x{rows}: {f:#?}"
+                );
+            }
+            if rows >= 4 {
+                assert!(f[2].starts_with(" ◂"), "{cols}x{rows}: {f:#?}");
+                assert_eq!(t.click(1, 2), TargetClick::Back, "{cols}x{rows}");
+            } else {
+                assert_eq!(t.click(1, 2), TargetClick::Nothing, "{cols}x{rows}");
+            }
+        }
+    }
+}
+
 fn file(path: &str, size: u64) -> OutputFile {
     OutputFile {
         path: path.into(),

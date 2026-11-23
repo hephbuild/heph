@@ -2105,9 +2105,9 @@ impl TUIAppView for TuiProgressView {
         if let Some(prompt) = self.stop_arm.prompt(now_ms)
             && let Some(last) = lines.last_mut()
         {
-            let prompt = crate::tui::text::cut_right(&prompt, usize::from(cols).saturating_sub(2));
-            *last = Line::styled(
-                format!("  {prompt}"),
+            *last = crate::tui::dashboard::chrome::hint_line(
+                &prompt,
+                usize::from(cols),
                 ratatui::style::Style::default().fg(ratatui::style::Color::Yellow),
             );
         }
