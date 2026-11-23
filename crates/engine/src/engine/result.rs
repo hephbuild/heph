@@ -3265,9 +3265,8 @@ impl Engine {
                     OutputMatcher::None => anyhow::Ok(Vec::<String>::new()),
                     OutputMatcher::All => Ok(def.target.output_names()),
                     OutputMatcher::Exact(names) => {
-                        let all_output_names = def.target.output_names();
                         for name in &names {
-                            if !all_output_names.contains(name) {
+                            if !def.target.outputs.iter().any(|o| o.group == *name) {
                                 anyhow::bail!("output not found: {}", name);
                             }
                         }
