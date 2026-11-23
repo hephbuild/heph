@@ -453,8 +453,8 @@ fn install_id(dir: &std::path::Path) -> anyhow::Result<String> {
 
 /// The event `distinct_id`: `"ci"` on CI runners, the persistent install UUID
 /// otherwise.
-fn distinct_id(dir: &std::path::Path) -> anyhow::Result<String> {
-    if is_ci() {
+fn distinct_id(dir: &std::path::Path, ci: bool) -> anyhow::Result<String> {
+    if ci {
         return Ok("ci".to_string());
     }
     install_id(dir)
@@ -553,6 +553,7 @@ pub fn record_invocation(
     };
 
     let failure = error.map(classify_failure);
+    let ci = is_ci();
 
     let spool = match try_enqueue(ReportContext {
         command: &command,
@@ -561,6 +562,7 @@ pub fn record_invocation(
         success: failure.is_none(),
         failure,
         duration_ms: took.as_millis() as u64,
+        ci,
     }) {
         Ok(spool) => Some(spool),
         Err(e) => {
@@ -571,7 +573,7 @@ pub fn record_invocation(
 
     // CI: send now, blocking (see the module docs). Elsewhere: hand off to a
     // detached flusher when one is due, and never wait.
-    if is_ci() {
+    if ci {
         drop(spool);
         flush_blocking();
     } else if let Some(spool) = spool {
@@ -1245,6 +1247,9 @@ struct ReportContext<'a> {
     failure: Option<&'a str>,
     /// Command wall time, parse-to-exit.
     duration_ms: u64,
+    /// Whether this runs on CI ([`is_ci`]), decided once per invocation: it
+    /// sets the `ci` prop, the `distinct_id` and the flush mode.
+    ci: bool,
 }
 
 /// Spool this invocation's event; returns the open spool for the flush check.
@@ -1260,7 +1265,7 @@ fn try_enqueue(ctx: ReportContext<'_>) -> anyhow::Result<Spool> {
 
     let event = SpooledEvent {
         uuid: uuid::Uuid::new_v4().to_string(),
-        distinct_id: distinct_id(&dir)?,
+        distinct_id: distinct_id(&dir, ctx.ci)?,
         event: "cli_command".to_string(),
         props,
         created_ms: hcore::events::now_unix_ms() as i64,
@@ -1303,7 +1308,7 @@ fn build_props(
             put("version_build", build.into());
         }
     }
-    put("ci", is_ci().into());
+    put("ci", ctx.ci.into());
     // Stable per-repo id (one-way hash of the git root commit) grouping events by
     // project without identifying it. Absent when not in a git repo / git is
     // unavailable / a shallow clone can't reach the root and the GitHub API
@@ -1696,8 +1701,11 @@ mod tests {
             success: true,
             failure: None,
             duration_ms: 1,
+            ci: true,
         };
         let props = build_props(&ctx, &snapshot, Plugins::default(), Some("deadbeef"));
+        // The `ci` prop is the invocation's one CI decision, not a fresh env read.
+        assert_eq!(props.get("ci").and_then(|v| v.as_bool()), Some(true));
 
         // posthog-rs stamps `$os` / `$os_version` itself, so build_props must
         // not carry an `os` of its own (nor the `$`-prefixed keys).
@@ -1795,8 +1803,10 @@ mod tests {
             success: true,
             failure: None,
             duration_ms: 1,
+            ci: false,
         };
         let props = build_props(&ctx, &snapshot, Plugins::default(), None);
+        assert_eq!(props.get("ci").and_then(|v| v.as_bool()), Some(false));
         let n = |k: &str| props.get(k).and_then(|v| v.as_u64());
         assert_eq!(n("query_expr_addr"), Some(1));
         assert_eq!(n("query_expr_label"), Some(2));
