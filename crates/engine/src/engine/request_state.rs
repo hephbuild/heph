@@ -330,8 +330,8 @@ pub struct RequestStateData {
     pub mem_meta: Memoizer<AddrKey, Result<ResultMeta, ArcErr>>,
     pub mem_spec: Memoizer<AddrKey, Result<Arc<EngineTargetSpec>, ArcErr>>,
     pub mem_def: Memoizer<AddrKey, Result<Arc<ExtendedTargetDef>, ArcErr>>,
-    pub mem_expanded_inputs:
-        Memoizer<AddrKey, Result<Arc<Vec<crate::engine::driver::targetdef::Input>>, ArcErr>>,
+    pub(crate) mem_expanded_inputs:
+        Memoizer<AddrKey, Result<Arc<crate::engine::expand::ExpandedInputs>, ArcErr>>,
     pub mem_packages: Memoizer<String, Result<Arc<Vec<String>>, ArcErr>>,
     /// Outer memoizer for `Engine::probe_segments`. Keyed by the target package;
     /// the cached value is the flat accumulation of every provider's probe across

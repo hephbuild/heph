@@ -1,6 +1,6 @@
 use crate::engine::Engine;
 use crate::engine::driver::TargetAddr;
-use crate::engine::driver::targetdef::{Input, InputMode};
+use crate::engine::driver::targetdef::{Input, InputMode, TargetDef};
 use crate::engine::invoke::EntrypointAsInput;
 use crate::engine::request_state::{AddrKey, RequestState};
 use crate::engine::result::ExtendedTargetDef;
@@ -102,9 +102,8 @@ fn synthesized_fs_inputs(
 /// replaced by the `@heph/fs` inputs synthesized from `def.outputs`. Non-magic
 /// inputs pass through unchanged and in order.
 ///
-/// Allocate-on-write: if no magic input is present the original `inputs` Vec is
-/// cloned only once (the common case still pays a clone because the caller needs
-/// an owned `Vec` for `expand_inputs`).
+/// Allocate-on-write: if no magic input is present `def.inputs` is left as it
+/// is.
 pub(crate) fn expand_introspect_inputs(
     def: &mut crate::engine::driver::targetdef::TargetDef,
 ) -> anyhow::Result<()> {
@@ -132,13 +131,83 @@ pub(crate) fn expand_introspect_inputs(
 /// origin_id/mode/annotations plus the parent's `hashed`/`runtime` flags so
 /// children of a `hash_deps` (or `runtime_deps`) group expansion inherit
 /// the parent's intent.
-#[derive(Clone)]
 pub(crate) struct ParentOverride {
     pub origin_id: String,
     pub mode: InputMode,
     pub annotations: BTreeMap<String, String>,
     pub hashed: bool,
     pub runtime: bool,
+}
+
+impl ParentOverride {
+    /// The routing a group named in a target's own input list hands its
+    /// members: that input's.
+    fn of(group: &Input) -> Self {
+        Self {
+            origin_id: group.origin_id.clone(),
+            mode: group.mode.clone(),
+            annotations: group.annotations.clone(),
+            hashed: group.hashed,
+            runtime: group.runtime,
+        }
+    }
+
+    /// The parent's annotations as the base, with `child`'s own overriding
+    /// them on a key both set.
+    fn child_annotations(&self, child: &Input) -> BTreeMap<String, String> {
+        let mut merged = self.annotations.clone();
+        merged.extend(
+            child
+                .annotations
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone())),
+        );
+        merged
+    }
+
+    /// The routing a nested group's members inherit: this one, with the
+    /// nested group's annotations merged in as a child's are.
+    fn nested(&self, group: &Input) -> Self {
+        Self {
+            origin_id: self.origin_id.clone(),
+            mode: self.mode.clone(),
+            annotations: self.child_annotations(group),
+            hashed: self.hashed,
+            runtime: self.runtime,
+        }
+    }
+
+    /// A group member as this routing places it in the parent's inputs.
+    fn apply(&self, member: &Input) -> Input {
+        Input {
+            r#ref: member.r#ref.clone(),
+            origin_id: self.origin_id.clone(),
+            mode: self.mode.clone(),
+            annotations: self.child_annotations(member),
+            hashed: self.hashed,
+            runtime: self.runtime,
+        }
+    }
+}
+
+/// A target's inputs with its groups expanded, as
+/// [`Engine::expanded_inputs_for`] memoizes them. Reads as the input slice.
+pub(crate) enum ExpandedInputs {
+    /// No input is a group: the def's own list, shared rather than copied.
+    Declared(Arc<TargetDef>),
+    /// At least one input was a group, replaced in place by its members.
+    Expanded(Vec<Input>),
+}
+
+impl std::ops::Deref for ExpandedInputs {
+    type Target = [Input];
+
+    fn deref(&self) -> &[Input] {
+        match self {
+            Self::Declared(def) => &def.inputs,
+            Self::Expanded(inputs) => inputs,
+        }
+    }
 }
 
 impl Engine {
@@ -149,7 +218,7 @@ impl Engine {
         self: Arc<Self>,
         rs: Arc<RequestState>,
         addr: &Addr,
-    ) -> anyhow::Result<Arc<Vec<Input>>> {
+    ) -> anyhow::Result<Arc<ExpandedInputs>> {
         rs.data
             .mem_expanded_inputs
             .once(
@@ -168,141 +237,112 @@ impl Engine {
                         .await?;
                     let mut visited = FxHashSet::default();
                     let expanded = Arc::clone(&engine)
-                        .expand_inputs(
-                            rs,
-                            def.target_def.inputs.clone(),
-                            None,
-                            &mut visited,
-                        )
+                        .expand_inputs(rs, &def.target_def.inputs, &mut visited)
                         .await
                         .map_err(|e| EntrypointAsInput::name_consumer(e, &addr))?;
-                    Ok(Arc::new(expanded))
+                    Ok(Arc::new(match expanded {
+                        Some(inputs) => ExpandedInputs::Expanded(inputs),
+                        None => ExpandedInputs::Declared(Arc::clone(&def.target_def)),
+                    }))
                 }),
             )
             .await
             .map_err(unwrap_arc_err)
     }
 
-    /// Recursively expands transparent (group) inputs, replacing each group with
-    /// its constituent deps. Non-transparent inputs pass through unchanged.
+    /// Expands the transparent (group) inputs among `inputs`, replacing each
+    /// group with its constituent deps in place. Non-transparent inputs pass
+    /// through unchanged and in order.
     ///
-    /// `parent_override` propagates the origin_id, mode, and annotations from
-    /// the group's reference in the parent's input list so that exec driver
-    /// grouping (SRC_*) and routing (e.g. `unpack_root=tools`) reflect the
-    /// parent's intent, not the group's internal ids. Parent annotations form
-    /// the base; the child's own annotations override on key conflict.
+    /// `None` when no input is a group: `inputs` stand as they are and nothing
+    /// is copied, which is the common case. Otherwise the result is allocated
+    /// the first time a group is met, with the inputs before it copied in.
     ///
-    /// Top-level callers (`parent_override = None`) use an allocate-on-write
-    /// `result`: the original `inputs` Vec is returned untouched when no input
-    /// is transparent, and we only allocate (and copy the prior pass-throughs)
-    /// the first time we actually need to splice expanded deps in. Recursive
-    /// callers (`parent_override = Some(...)`) always rewrite every input, so
-    /// the result Vec is allocated up front.
-    ///
-    /// `visited` is borrowed mutably across recursion — expansion is purely
-    /// sequential within a single task, so no shared-state synchronisation is
-    /// needed (previously held behind `Arc<Mutex<…>>` for no benefit).
-    #[async_recursion]
+    /// `visited` holds the groups on the path being expanded, to refuse a
+    /// group that contains itself. Expansion is sequential within one task, so
+    /// it is borrowed mutably across the recursion.
     pub(crate) async fn expand_inputs(
         self: Arc<Self>,
         rs: Arc<RequestState>,
-        inputs: Vec<Input>,
-        parent_override: Option<ParentOverride>,
-        visited: &mut FxHashSet<String>,
-    ) -> anyhow::Result<Vec<Input>> {
-        let mut result: Option<Vec<Input>> = parent_override
-            .as_ref()
-            .map(|_| Vec::with_capacity(inputs.len()));
+        inputs: &[Input],
+        visited: &mut FxHashSet<Addr>,
+    ) -> anyhow::Result<Option<Vec<Input>>> {
+        let mut expanded: Option<Vec<Input>> = None;
 
-        let mut defs = self.input_defs(&rs, &inputs).enumerate();
+        let mut defs = self.input_defs(&rs, inputs).enumerate();
         while let Some((idx, next)) = defs.next().await {
             let (input, def) = next?;
 
             if def.target_def.transparent {
-                let out = result.get_or_insert_with(|| {
+                let out = expanded.get_or_insert_with(|| {
                     let mut v = Vec::with_capacity(inputs.len());
-                    if let Some(prefix) = inputs.get(..idx) {
-                        v.extend_from_slice(prefix);
-                    }
+                    v.extend_from_slice(inputs.get(..idx).unwrap_or_default());
                     v
                 });
-
-                let addr_str = input.r#ref.r#ref.format();
-                if !visited.insert(addr_str.clone()) {
-                    anyhow::bail!("circular group dependency at '{}'", addr_str);
-                }
-
-                // Effective routing context for the group's children: take the
-                // parent override if recursing, otherwise the input's own
-                // origin_id/mode/annotations/flags. Either way, the parent
-                // context wins over the group's interior child annotations
-                // only on keys the child does not set (merge happens below
-                // per child).
-                let eff = match parent_override.as_ref() {
-                    Some(p) => {
-                        let mut merged = p.annotations.clone();
-                        for (k, v) in &input.annotations {
-                            merged.insert(k.clone(), v.clone());
-                        }
-                        ParentOverride {
-                            origin_id: p.origin_id.clone(),
-                            mode: p.mode.clone(),
-                            annotations: merged,
-                            hashed: p.hashed,
-                            runtime: p.runtime,
-                        }
-                    }
-                    None => ParentOverride {
-                        origin_id: input.origin_id.clone(),
-                        mode: input.mode.clone(),
-                        annotations: input.annotations.clone(),
-                        hashed: input.hashed,
-                        runtime: input.runtime,
-                    },
-                };
-
-                let nested = Arc::clone(&self)
-                    .expand_inputs(
+                Arc::clone(&self)
+                    .expand_group_into(
                         rs.clone(),
-                        def.target_def.inputs.clone(),
-                        Some(eff),
+                        input,
+                        &def.target_def.inputs,
+                        &ParentOverride::of(input),
+                        out,
                         visited,
                     )
                     .await?;
-
-                visited.remove(&addr_str);
-
-                out.extend(nested);
-            } else if let Some(p) = parent_override.as_ref() {
-                // Recursive call: result Vec was allocated up front.
-                // Parent annotations form the base; child overrides on conflict.
-                let mut merged = p.annotations.clone();
-                for (k, v) in &input.annotations {
-                    merged.insert(k.clone(), v.clone());
-                }
-                result
-                    .as_mut()
-                    .expect("recursive call allocated result up front")
-                    .push(Input {
-                        r#ref: input.r#ref.clone(),
-                        origin_id: p.origin_id.clone(),
-                        mode: p.mode.clone(),
-                        annotations: merged,
-                        hashed: p.hashed,
-                        runtime: p.runtime,
-                    });
-            } else if let Some(out) = result.as_mut() {
-                // Top-level, but an earlier transparent input already triggered
-                // allocation — copy this passthrough into the new Vec.
+            } else if let Some(out) = expanded.as_mut() {
+                // A group earlier in the list allocated the result: copy this
+                // pass-through into it.
                 out.push(input.clone());
             }
-            // else: top-level, no transparent seen yet, original `inputs` still
-            // valid — skip.
         }
-        // The stream borrows `inputs`, which the no-group case hands back.
-        drop(defs);
 
-        Ok(result.unwrap_or(inputs))
+        Ok(expanded)
+    }
+
+    /// Appends the `members` of `group` to `out`, each routed by `routing`,
+    /// expanding a nested group in place.
+    ///
+    /// `routing` carries the origin_id, mode and annotations of the group's
+    /// reference in the target's own input list, so that exec driver grouping
+    /// (SRC_*) and routing (e.g. `unpack_root=tools`) reflect the target's
+    /// intent, not the group's internal ids. Its annotations form the base; a
+    /// member's own annotations override them on key conflict.
+    #[async_recursion]
+    async fn expand_group_into(
+        self: Arc<Self>,
+        rs: Arc<RequestState>,
+        group: &Input,
+        members: &[Input],
+        routing: &ParentOverride,
+        out: &mut Vec<Input>,
+        visited: &mut FxHashSet<Addr>,
+    ) -> anyhow::Result<()> {
+        let addr = &group.r#ref.r#ref;
+        if !visited.insert(addr.clone()) {
+            anyhow::bail!("circular group dependency at '{}'", addr.format());
+        }
+
+        let mut defs = self.input_defs(&rs, members);
+        while let Some(next) = defs.next().await {
+            let (member, def) = next?;
+            if def.target_def.transparent {
+                Arc::clone(&self)
+                    .expand_group_into(
+                        rs.clone(),
+                        member,
+                        &def.target_def.inputs,
+                        &routing.nested(member),
+                        out,
+                        visited,
+                    )
+                    .await?;
+            } else {
+                out.push(routing.apply(member));
+            }
+        }
+
+        visited.remove(addr);
+        Ok(())
     }
 
     /// Each of `inputs` with its def, in declaration order, refusing an
@@ -360,6 +400,7 @@ mod tests {
         ListPackagesRequest, ListRequest, ListResponse, ProbeRequest, ProbeResponse,
         Provider as EProvider, TargetSpec,
     };
+    use anyhow::Context as _;
     use futures::future::BoxFuture;
     use hcore::hasync::Cancellable;
     use hcore::htvalue::Value;
@@ -506,8 +547,9 @@ mod tests {
         let inputs = vec![input("//pkg:grp", "tool|cc|0", &[("unpack_root", "tools")])];
 
         let expanded = Arc::clone(&engine)
-            .expand_inputs(rs, inputs, None, &mut visited)
-            .await?;
+            .expand_inputs(rs, &inputs, &mut visited)
+            .await?
+            .context("a group input is expanded")?;
 
         assert_eq!(expanded.len(), 1, "group → one child");
         let child = &expanded[0];
@@ -518,6 +560,114 @@ mod tests {
             Some("tools"),
             "parent annotation must survive group expansion; got: {:?}",
             child.annotations,
+        );
+        Ok(())
+    }
+
+    /// A list with no group is the def's own, shared: nothing is copied.
+    #[tokio::test]
+    async fn inputs_without_a_group_are_the_defs_own() -> anyhow::Result<()> {
+        let (engine, _root) = engine_with(vec![
+            introspect_exec_spec("//pkg:app", &[], &["//pkg:a", "//pkg:b"]),
+            exec_spec("//pkg:a"),
+            exec_spec("//pkg:b"),
+        ])?;
+        let rs = engine.new_state();
+        let addr = hmodel::htaddr::parse_addr("//pkg:app")?;
+        let expanded = Arc::clone(&engine)
+            .expanded_inputs_for(rs.clone(), &addr)
+            .await?;
+        let def = Arc::clone(&engine).get_def_no_track(rs, &addr).await?;
+
+        let ExpandedInputs::Declared(shared) = &*expanded else {
+            panic!("no group, yet the inputs were copied");
+        };
+        assert!(Arc::ptr_eq(shared, &def.target_def));
+        let addrs: Vec<String> = expanded.iter().map(|i| i.r#ref.r#ref.format()).collect();
+        assert_eq!(addrs, ["//pkg:a", "//pkg:b"]);
+        Ok(())
+    }
+
+    /// Groups, nested ones included, are replaced in place: the target's own
+    /// inputs keep their position and the members appear in declaration order,
+    /// each routed as the group's reference in the target's list.
+    #[tokio::test]
+    async fn nested_groups_expand_in_place_and_in_order() -> anyhow::Result<()> {
+        let (engine, _root) = engine_with(vec![
+            group_spec("//pkg:outer", &["//pkg:m1", "//pkg:inner", "//pkg:m3"]),
+            group_spec("//pkg:inner", &["//pkg:m2"]),
+            exec_spec("//pkg:x"),
+            exec_spec("//pkg:y"),
+            exec_spec("//pkg:m1"),
+            exec_spec("//pkg:m2"),
+            exec_spec("//pkg:m3"),
+        ])?;
+        let rs = engine.new_state();
+        let mut visited = FxHashSet::default();
+        let inputs = vec![
+            input("//pkg:x", "x|0", &[]),
+            input("//pkg:outer", "outer|1", &[("unpack_root", "tools")]),
+            input("//pkg:y", "y|2", &[]),
+        ];
+        let expanded = Arc::clone(&engine)
+            .expand_inputs(rs, &inputs, &mut visited)
+            .await?
+            .context("a group input is expanded")?;
+
+        let got: Vec<(String, &str)> = expanded
+            .iter()
+            .map(|i| (i.r#ref.r#ref.format(), i.origin_id.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("//pkg:x".to_string(), "x|0"),
+                ("//pkg:m1".to_string(), "outer|1"),
+                ("//pkg:m2".to_string(), "outer|1"),
+                ("//pkg:m3".to_string(), "outer|1"),
+                ("//pkg:y".to_string(), "y|2"),
+            ]
+        );
+        assert!(
+            expanded[1..4]
+                .iter()
+                .all(|i| i.annotations.get("unpack_root").map(String::as_str) == Some("tools")),
+            "every member, nested or not, carries the reference's annotations"
+        );
+        assert!(
+            visited.is_empty(),
+            "a finished walk leaves no group on its path"
+        );
+        Ok(())
+    }
+
+    /// A group that contains itself is refused, not expanded forever, and the
+    /// message names the cycle. The group's def collects its members'
+    /// transitives, so the dependency tracker refuses it while resolving that
+    /// def — before the walk's own `visited` backstop is reached.
+    #[tokio::test]
+    async fn a_circular_group_is_refused() -> anyhow::Result<()> {
+        let (engine, _root) = engine_with(vec![
+            group_spec("//pkg:a", &["//pkg:b"]),
+            group_spec("//pkg:b", &["//pkg:a"]),
+        ])?;
+        let rs = engine.new_state();
+        let mut visited = FxHashSet::default();
+        let inputs = vec![input("//pkg:a", "dep|0", &[])];
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            Arc::clone(&engine).expand_inputs(rs, &inputs, &mut visited),
+        )
+        .await
+        .context("a circular group hangs the expansion")?;
+
+        let Err(err) = res else {
+            panic!("a circular group expanded");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("cyclic dependency detected: //pkg:b → //pkg:a"),
+            "got: {msg}"
         );
         Ok(())
     }
@@ -546,8 +696,9 @@ mod tests {
             &[("unpack_root", "tools"), ("custom", "p")],
         )];
         let expanded = Arc::clone(&engine)
-            .expand_inputs(rs, inputs, None, &mut visited)
-            .await?;
+            .expand_inputs(rs, &inputs, &mut visited)
+            .await?
+            .context("a group input is expanded")?;
         assert_eq!(
             expanded[0].annotations.get("custom").map(String::as_str),
             Some("p"),
@@ -612,7 +763,7 @@ mod tests {
         ];
         let res = tokio::time::timeout(
             std::time::Duration::from_secs(60),
-            Arc::clone(&engine).expand_inputs(rs, inputs, None, &mut visited),
+            Arc::clone(&engine).expand_inputs(rs, &inputs, &mut visited),
         )
         .await
         .map_err(|_elapsed| {
