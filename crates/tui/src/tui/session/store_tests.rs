@@ -958,9 +958,10 @@ fn copy_holds_the_lock_shared() {
 
 /// I3, raced for real: a cleanup sealing a lost session and a viewer opening
 /// it start together, many times over. Whichever wins, the viewer reads every
-/// committed record or is told to try again (never a short or failed read),
-/// the cleanup seals it or leaves it for the next one, and the next cleanup
-/// always ends with it sealed and whole.
+/// committed record (never a short or failed read, and never "try again": a
+/// viewer that meets the seal waits for it), the cleanup seals it or leaves
+/// it for the next one, and the next cleanup always ends with it sealed and
+/// whole.
 #[test]
 fn seal_lost_races_open_local() {
     let records: Vec<SessionRecord> = events().into_iter().map(event_record).collect();
@@ -989,9 +990,6 @@ fn seal_lost_races_open_local() {
                         let n = std::iter::from_fn(|| cursor.next_record().expect("read")).count();
                         (how, n)
                     }
-                    Err(store::OpenError::Other(e)) if format!("{e:#}").contains("try again") => {
-                        ("try again", 0)
-                    }
                     Err(e) => panic!("round {round}: {e:?}"),
                 }
             }
@@ -999,9 +997,7 @@ fn seal_lost_races_open_local() {
         start.wait();
         let first = cleanup::cleanup(root.path(), later, Retention::default()).expect("cleanup");
         let (how, n) = viewer.join().expect("viewer");
-        if how != "try again" {
-            assert_eq!(n, records.len(), "round {round}: read {how}");
-        }
+        assert_eq!(n, records.len(), "round {round}: read {how}");
         *outcomes.entry(how).or_default() += 1;
         assert!(first.removed.is_empty(), "round {round}: {first:?}");
         if first.sealed.is_empty() {

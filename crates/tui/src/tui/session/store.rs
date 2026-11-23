@@ -298,7 +298,8 @@ pub const TMP_DIR: &str = ".tmp";
 /// - lock free, rollback-mode header: sealed; `immutable=1`.
 /// - lock free, WAL-mode header (lost, or a seal cut short): take the lock
 ///   shared while copying the file and its `-wal` into [`tmp_dir`], and open
-///   the copy. The original is never written.
+///   the copy. The original is never written. A lock taken exclusively
+///   since the probe is a cleanup sealing it: wait for the seal, as above.
 pub fn open_local(root: &Path, dir: &Path) -> Result<Opened, OpenError> {
     let path = dir.join(FILE);
     let lock = dir.join(super::format::files::LOCK);
@@ -335,7 +336,11 @@ pub fn open_local(root: &Path, dir: &Path) -> Result<Opened, OpenError> {
         drop(conn);
         return open_after_seal(root, dir, &lock, &path);
     }
-    open_copy(root, dir, &lock)
+    match open_copy(root, dir, &lock)? {
+        Some(opened) => Ok(opened),
+        // A cleanup took the lock exclusively since the probe: it is sealing.
+        None => open_after_seal(root, dir, &lock, &path),
+    }
 }
 
 /// The session row's `sealed` column: `End` (or a cleanup's end) is
@@ -347,7 +352,9 @@ fn session_sealed(conn: &Connection) -> rusqlite::Result<bool> {
 /// A recording whose lock holder is sealing it: wait, holding nothing open,
 /// for the header to turn rollback (read it sealed) or the lock to free (a
 /// seal cut short or abandoned: read a copy), as long as a seal may retry.
-/// Past that, read it in place, as ended.
+/// Past that, read it in place, as ended. A copy that finds the lock taken
+/// exclusively again (another cleanup sealing it) goes back to waiting, under
+/// the same deadline.
 fn open_after_seal(root: &Path, dir: &Path, lock: &Path, path: &Path) -> Result<Opened, OpenError> {
     let deadline = Instant::now() + SEAL_TIMEOUT;
     loop {
@@ -366,8 +373,10 @@ fn open_after_seal(root: &Path, dir: &Path, lock: &Path, path: &Path) -> Result<
                 ));
             }
         }
-        if !lockfile::is_held(lock).with_context(|| format!("probing {}", lock.display()))? {
-            return open_copy(root, dir, lock);
+        if !lockfile::is_held(lock).with_context(|| format!("probing {}", lock.display()))?
+            && let Some(opened) = open_copy(root, dir, lock)?
+        {
+            return Ok(opened);
         }
         if Instant::now() >= deadline {
             return Ok(Opened {
@@ -395,7 +404,10 @@ fn check_header(header: Header) -> Result<(), OpenError> {
     Ok(())
 }
 
-fn open_copy(root: &Path, dir: &Path, lock: &Path) -> Result<Opened, OpenError> {
+/// Copy a recording whose lock is free and open the copy; `None` when a
+/// cleanup holds the lock exclusively (it is sealing: the caller waits for
+/// it with [`open_after_seal`]).
+fn open_copy(root: &Path, dir: &Path, lock: &Path) -> Result<Option<Opened>, OpenError> {
     let tmp = tmp_dir(root);
     std::fs::DirBuilder::new()
         .recursive(true)
@@ -405,24 +417,13 @@ fn open_copy(root: &Path, dir: &Path, lock: &Path) -> Result<Opened, OpenError> 
         .with_context(|| format!("making {} user-only", tmp.display()))?;
     // Shared: a cleanup's exclusive seal waits, and every other probe still
     // reads the session as not live. A lock held since the probe (the owner
-    // came back? no: a cleanup sealing it) means read it again, sealed.
-    let guard =
-        lockfile::try_lock_shared(lock).with_context(|| format!("locking {}", lock.display()))?;
+    // came back? no: a cleanup sealing it) means wait for the seal.
+    let Some(guard) =
+        lockfile::try_lock_shared(lock).with_context(|| format!("locking {}", lock.display()))?
+    else {
+        return Ok(None);
+    };
     let path = dir.join(FILE);
-    if guard.is_none() {
-        // A cleanup holds it exclusively: it is sealing. Read what it left.
-        return match read_header(&path) {
-            Ok(Some(h)) if !h.wal => Ok(Opened {
-                conn: open_sealed(&path)?,
-                live: false,
-                copy: None,
-            }),
-            _ => Err(OpenError::Other(anyhow::anyhow!(
-                "{} is being sealed; try again",
-                path.display()
-            ))),
-        };
-    }
     #[cfg(test)]
     copy_gate::hit(lock);
     let base = tmp.join(format!(
@@ -448,11 +449,11 @@ fn open_copy(root: &Path, dir: &Path, lock: &Path) -> Result<Opened, OpenError> 
     }
     drop(guard);
     let conn = open_existing_rw(&base)?;
-    Ok(Opened {
+    Ok(Some(Opened {
         conn,
         live: false,
         copy: Some(copy),
-    })
+    }))
 }
 
 /// A test's hold on [`open_copy`], between taking a session's lock and
