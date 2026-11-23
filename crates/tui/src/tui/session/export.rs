@@ -278,8 +278,17 @@ fn fill(copy: &Connection, read: ReadNotice, abort: &Abort) -> anyhow::Result<()
         }
         _ => tracing::debug!("the session recorded no workspace: no notice to export"),
     }
+    let ended_ms = store::read_row_end(copy)
+        .context("reading the session row")?
+        .ended_ms;
     match meta.home_dir.as_deref() {
-        Some(home) => fill_failure_logs(&tx, &records, &Path::new(home).join(FAILURES_DIR), abort)?,
+        Some(home) => fill_failure_logs(
+            &tx,
+            &records,
+            &Path::new(home).join(FAILURES_DIR),
+            ended_ms,
+            abort,
+        )?,
         None => tracing::debug!("the session recorded no home: no failure log to export"),
     }
     tx.commit().context("committing the fill")
@@ -349,11 +358,15 @@ fn fill_notices(
 
 /// One row per root failure (never a collateral one, nor a stop) whose log
 /// is in its failure slot: its last [`FAILURE_LOG_CAP`] bytes, within
-/// [`FAILURE_LOGS_CAP`] in all, `cut_bytes` saying what was left out.
+/// [`FAILURE_LOGS_CAP`] in all, `cut_bytes` saying what was left out. A
+/// slot keeps only a target's last failure: a log modified after the
+/// session's `ended_ms` (past [`LATER_SLACK_MS`]) is a later session's, and
+/// is left out.
 fn fill_failure_logs(
     conn: &Connection,
     records: &[SessionRecord],
     failures: &Path,
+    ended_ms: Option<i64>,
     abort: &Abort,
 ) -> anyhow::Result<()> {
     let mut insert = conn
@@ -381,6 +394,12 @@ fn fill_failure_logs(
             continue;
         }
         abort.check()?;
+        if let Some(ended) = ended_ms
+            && modified_ms(path).is_some_and(|m| m > ended.saturating_add(LATER_SLACK_MS))
+        {
+            tracing::debug!(file = %path.display(), "a failure log newer than the session: skipped");
+            continue;
+        }
         let (log, cut) = match tail(path, FAILURE_LOG_CAP.min(left)) {
             Ok(t) => t,
             Err(e) => {
@@ -394,6 +413,18 @@ fn fill_failure_logs(
             .context("writing a failure log")?;
     }
     Ok(())
+}
+
+/// How far past a session's end a failure log's mtime may be and still be
+/// its own: room for a filesystem's coarse or skewed clock (NFS), far less
+/// than the gap before another session rewrites the slot.
+const LATER_SLACK_MS: i64 = 1_000;
+
+/// `path`'s mtime in Unix milliseconds; `None` when it cannot be read.
+fn modified_ms(path: &Path) -> Option<i64> {
+    let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
+    let since = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+    i64::try_from(since.as_millis()).ok()
 }
 
 /// Whether `path` is an absolute path under `dir`, with no `..`.

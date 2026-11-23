@@ -2449,15 +2449,26 @@ async fn export_is_self_contained() {
     let root_log = home.join("failures").join("k1").join("log.txt");
     let mut log = vec![b'a'; usize::try_from(CUT).expect("small")];
     log.extend((0..FAILURE_LOG_CAP).map(|i| b'0' + u8::try_from(i % 10).expect("digit")));
-    for (path, bytes) in [
-        (&root_log, log.as_slice()),
+    // The slot of `//a:later` was rewritten by a later session: its log is
+    // newer than this session's end, so it is not this session's.
+    let later_log = home.join("failures").join("k3").join("log.txt");
+    let at = |ms: u64| std::time::UNIX_EPOCH + Duration::from_millis(ms);
+    for (path, bytes, mtime) in [
+        (&root_log, log.as_slice(), at(T0 + 5)),
         (
             &home.join("failures").join("k2").join("log.txt"),
-            b"collateral",
+            b"collateral".as_slice(),
+            at(T0 + 5),
         ),
+        (&later_log, b"a later session's".as_slice(), at(T0 + 60_000)),
     ] {
         std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
         std::fs::write(path, bytes).expect("write a log");
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .and_then(|f| f.set_modified(mtime))
+            .expect("set the log's mtime");
     }
     let outside = ws.path().join("outside.log");
     std::fs::write(&outside, b"not a failure slot").expect("write");
@@ -2506,6 +2517,7 @@ async fn export_is_self_contained() {
             &home.join("failures").join("k2").join("log.txt"),
         ),
         failed("//a:outside", None, &outside),
+        failed("//a:later", None, &later_log),
         SessionRecord::session(
             T0 + 10,
             SessionRecordKind::End {
@@ -2587,6 +2599,10 @@ async fn export_is_self_contained() {
         );
         assert!(f.failure_logs("//a:collateral").expect("logs").is_empty());
         assert!(f.failure_logs("//a:outside").expect("logs").is_empty());
+        assert!(
+            f.failure_logs("//a:later").expect("logs").is_empty(),
+            "a log newer than the session's end is a later session's"
+        );
     }
     // A foreign recording exports again: as it is, or `--no-logs`.
     for (name, logs) in [("again.hephsession", true), ("again-bare.hephsession", false)] {
