@@ -149,14 +149,7 @@ impl Engine {
         if slots.is_empty() {
             return (dead, kept, errored);
         }
-        let resolve_rs = self.new_state_full(
-            false,
-            rs.events_sender(),
-            rs.bg_pending(),
-            Self::DEFAULT_LOG_TAIL_LINES,
-            None,
-        );
-        resolve_rs.suppress_deferred_trims();
+        let resolve_rs = self.sweep_resolve_state(rs);
 
         let limit = self.max_workers.max(1);
         let mut set: JoinSet<(Slot, Verdict)> = JoinSet::new();

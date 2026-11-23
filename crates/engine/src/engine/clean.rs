@@ -42,10 +42,11 @@
 
 use crate::engine::Engine;
 use crate::engine::discovery::Discovery;
+use crate::engine::gc::emit_target_swept;
 use crate::engine::request_state::RequestState;
 use anyhow::{Context, Result};
 use futures::TryStreamExt;
-use hmodel::htaddr::{Addr, parse_addr};
+use hmodel::htaddr::Addr;
 use hmodel::htmatcher::{MatchResult, Matcher};
 use std::sync::Arc;
 use tokio::task::JoinSet;
@@ -137,28 +138,13 @@ impl Engine {
             // Drive off the cache's own enumeration: the only targets that can
             // possibly be cleaned are the ones it names, and the matcher decides
             // each from its addr.
-            let targets = self
-                .local_cache
-                .list_targets()
+            // A listing that fails mid-way still cleans what was already seen
+            // rather than throwing it away — a partial clean is still a clean,
+            // and the error is surfaced.
+            let addrs = self
+                .cached_addrs("clean", "cleaning")
                 .context("clean: listing cache targets")?;
-            for target in targets {
-                let addr_key = match target {
-                    Ok(k) => k,
-                    Err(e) => {
-                        // The stream failed mid-way. Clean what was already seen
-                        // rather than throwing it away — a partial clean is still
-                        // a clean, and the error is surfaced.
-                        tracing::warn!(error = %format!("{e:#}"), "clean: listing targets failed mid-stream, cleaning what was seen");
-                        break;
-                    }
-                };
-                let addr = match parse_addr(&addr_key) {
-                    Ok(a) => a,
-                    Err(e) => {
-                        tracing::warn!(addr = %addr_key, error = %format!("{e:#}"), "clean: skip unparseable cache addr");
-                        continue;
-                    }
-                };
+            for addr in addrs {
                 if matcher.matches_addr(&addr) != MatchResult::MatchYes {
                     continue;
                 }
@@ -220,14 +206,7 @@ impl Engine {
         matcher: &Matcher,
         discovery: Discovery,
     ) -> Result<Vec<Addr>> {
-        let resolve_rs = self.new_state_full(
-            false,
-            rs.events_sender(),
-            rs.bg_pending(),
-            Self::DEFAULT_LOG_TAIL_LINES,
-            None,
-        );
-        resolve_rs.suppress_deferred_trims();
+        let resolve_rs = self.sweep_resolve_state(rs);
 
         let mut addrs = Vec::new();
         {
@@ -359,12 +338,12 @@ impl Engine {
                 }
                 stats.revisions_removed += o.removed;
                 stats.bytes_removed = stats.bytes_removed.saturating_add(o.bytes);
-                emit_clean_target_swept(rs, o.removed, o.bytes);
+                emit_target_swept(rs, o.removed, o.bytes);
             }
             Ok((addr, Err(e))) => {
                 tracing::warn!(%addr, error = %format!("{e:#}"), "clean: target failed, continuing");
                 stats.errored += 1;
-                emit_clean_target_swept(rs, 0, 0);
+                emit_target_swept(rs, 0, 0);
             }
             Err(join_err) => {
                 tracing::warn!(error = %join_err, "clean: target task panicked, continuing");
@@ -372,14 +351,6 @@ impl Engine {
             }
         }
     }
-}
-
-/// Emit one `GcTargetSwept` so the TUI's "targets explored" count advances.
-fn emit_clean_target_swept(rs: &RequestState, revisions_removed: usize, bytes_removed: u64) {
-    rs.emit(crate::engine::event::BuildEventKind::GcTargetSwept {
-        revisions_removed,
-        bytes_removed,
-    });
 }
 
 #[cfg(test)]
