@@ -1980,7 +1980,6 @@ impl TuiProgressView {
             waits: &self.state,
             redact: &self.state.redact,
             now_ms: self.clock_at(now_ms),
-            scope,
             detach: matches!(self.role, Role::Attached { .. }),
         };
         let target = self.target.as_mut()?;
@@ -2014,9 +2013,7 @@ impl TuiProgressView {
         self.sync_approvals_with(&queue, Some(glyph));
         let (command, session, clock) = self.dashboard_title_parts(now_ms);
         let scope = self.list.scope;
-        let mut counts = self.state.dash.counts(scope);
-        counts.approvals = queue.len();
-        counts.approval_glyph = glyph;
+        let counts = self.state.dash.counts(scope);
         let title = crate::tui::dashboard::Title {
             command: &command,
             session: session.as_deref(),
@@ -2032,7 +2029,6 @@ impl TuiProgressView {
         let inputs = crate::tui::dashboard::approval::ApprovalInputs {
             title: &title,
             gauges: &gauges,
-            counts: &counts,
             queue: &queue,
             glyph,
             now_ms,

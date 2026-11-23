@@ -16,13 +16,12 @@ use super::detail::{Detail, Phase};
 use super::feed::{
     FeedMsg, FileKind, LogOpened, OutputFile, OutputsFound, TargetFeed, TargetReader,
 };
-use super::header::{Title, header_lines};
+use super::header::{Title, header_top};
 use super::intern::Id;
 use super::list::{Waits, secs_tenths};
 use super::logpane::{LogPane, PaneState};
-use super::model::{Model, Record, RowState, Tab};
+use super::model::{Model, Record, RowState};
 use crate::tui::app::ScreenKey;
-use crate::tui::progress::CountScope;
 use crate::tui::text::{Redact, clean_inline, cut_left, cut_right, width};
 
 pub const OVERVIEW_HINTS: &str = "tab/⇧tab switch tab · esc back to the list";
@@ -66,8 +65,6 @@ pub struct TargetInputs<'a> {
     pub waits: &'a dyn Waits,
     pub redact: &'a Redact,
     pub now_ms: u64,
-    /// The dashboard list's count scope, for the header's counts.
-    pub scope: CountScope,
     /// Drawn for `heph session attach`: the hints end in `q detach`, as the
     /// list's do there (I11).
     pub detach: bool,
@@ -368,10 +365,8 @@ impl TargetScreen {
     ) -> Vec<Line<'static>> {
         self.pump(inp.model);
         let m = inp.model;
-        let gauges = m.gauges();
-        let counts = m.counts(inp.scope);
-        let (header, _) = header_lines(title, &gauges, &counts, Tab::All, cols);
-        let mut out: Vec<Line<'static>> = header.into_iter().take(2).collect();
+        let (header, _) = header_top(title, &m.gauges(), cols);
+        let mut out: Vec<Line<'static>> = header.into_iter().collect();
         let c = usize::from(cols);
         let body_rows = usize::from(rows.saturating_sub(CHROME_ROWS));
         let addr = m.addr(self.id);

@@ -161,7 +161,6 @@ fn target_frame(s: &BuildState, t: &mut TargetScreen, now: u64, redact: &Redact)
         waits: s,
         redact,
         now_ms: T0 + now,
-        scope: CountScope::Matched,
         detach: false,
     };
     t.frame(&title(), &inp, 120, 30).iter().map(text).collect()
@@ -707,7 +706,6 @@ fn target_screen_narrow_and_short() {
         waits: &s,
         redact: &redact,
         now_ms: T0 + 1_000,
-        scope: CountScope::Matched,
         detach: false,
     };
     for tab in [TargetTab::Overview, TargetTab::Log, TargetTab::Outputs] {

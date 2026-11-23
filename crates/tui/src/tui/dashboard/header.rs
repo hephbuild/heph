@@ -360,6 +360,27 @@ pub fn header_lines_hits(
     active: Tab,
     cols: u16,
 ) -> ([Line<'static>; 4], Levels, TabHits) {
+    let ([title_row, gauge_row], mut lv) = header_top(title, gauges, cols);
+    let cols = usize::from(cols);
+
+    // Tab row.
+    let mut tabs = (Vec::new(), 0..0, TabHits::new());
+    for level in 0..=3u8 {
+        tabs = tabs_row(counts, active, level);
+        lv.tabs = level;
+        if spans_width(&tabs.0) <= cols {
+            break;
+        }
+    }
+
+    let rule = rule(cols, (tabs.1.start)..(tabs.1.end));
+    ([title_row, gauge_row, fit(tabs.0, cols), rule], lv, tabs.2)
+}
+
+/// The header's first two rows at `cols` columns: the title row and the
+/// row the gauges move down to. What the target and approval screens draw
+/// above their own tab row.
+pub fn header_top(title: &Title<'_>, gauges: &[&Gauge], cols: u16) -> ([Line<'static>; 2], Levels) {
     let cols = usize::from(cols);
     // The title and gauge rows start one column in.
     let inner = cols.saturating_sub(1);
@@ -428,31 +449,11 @@ pub fn header_lines_hits(
         Vec::new()
     };
 
-    // Tab row.
-    let mut tabs = (Vec::new(), 0..0, TabHits::new());
-    for level in 0..=3u8 {
-        tabs = tabs_row(counts, active, level);
-        lv.tabs = level;
-        if spans_width(&tabs.0) <= cols {
-            break;
-        }
-    }
-
     let lead = |mut spans: Vec<Span<'static>>| {
         spans.insert(0, Span::raw(" "));
         spans
     };
-    let rule = rule(cols, (tabs.1.start)..(tabs.1.end));
-    (
-        [
-            fit(lead(title_row), cols),
-            fit(lead(gauge_row), cols),
-            fit(tabs.0, cols),
-            rule,
-        ],
-        lv,
-        tabs.2,
-    )
+    ([fit(lead(title_row), cols), fit(lead(gauge_row), cols)], lv)
 }
 
 #[cfg(test)]
@@ -651,6 +652,34 @@ mod tests {
                     assert!(
                         row.contains(&format!("{verdict} · 1m05s")),
                         "{cols} cols, {command:.30}: {row:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// What the sub-screens draw is the header's first two rows, narrowed
+    /// the same way at every width, whatever the tab row would have needed.
+    #[test]
+    fn header_top_is_the_headers_first_two_rows() {
+        let wide = format!("heph r build //{}", "x".repeat(150));
+        let all = pools();
+        for n in [0, 3, all.len()] {
+            let gauges: Vec<&Gauge> = all.iter().take(n).collect();
+            for command in ["heph r build //...", wide.as_str()] {
+                let t = title(command);
+                for cols in 0..=160u16 {
+                    let (rows, lv) = header_lines(&t, &gauges, &COUNTS, Tab::Pending, cols);
+                    let (top, top_lv) = header_top(&t, &gauges, cols);
+                    assert_eq!(
+                        top,
+                        [rows[0].clone(), rows[1].clone()],
+                        "{n} pools, {cols} cols"
+                    );
+                    assert_eq!(
+                        (top_lv.title, top_lv.gauges_down, top_lv.gauges),
+                        (lv.title, lv.gauges_down, lv.gauges),
+                        "{n} pools, {cols} cols"
                     );
                 }
             }

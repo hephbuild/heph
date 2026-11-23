@@ -21,8 +21,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use super::chrome::{CHROME_ROWS, TABS_ROW, end_sub_frame, on_back, sub_tab_rows};
-use super::header::{Title, header_lines};
-use super::model::{Gauge, Tab, TabCounts};
+use super::header::{Title, header_top};
+use super::model::Gauge;
 use crate::tui::approval::QueuedApproval;
 use crate::tui::text::{
     Redact, clean_inline, cut_left, cut_right, expand_tabs, sanitize_log, take_width, width,
@@ -175,7 +175,6 @@ pub enum ApprovalClick {
 pub struct ApprovalInputs<'a> {
     pub title: &'a Title<'a>,
     pub gauges: &'a [&'a Gauge],
-    pub counts: &'a TabCounts,
     /// Every pending request, oldest first.
     pub queue: &'a [QueuedApproval],
     /// The approval glyph this frame (`✦`/`❖`).
@@ -458,8 +457,8 @@ impl ApprovalScreen {
             self.shown_since = Some(inp.now_ms);
         }
         self.pump();
-        let (header, _) = header_lines(inp.title, inp.gauges, inp.counts, Tab::All, cols);
-        let mut out: Vec<Line<'static>> = header.into_iter().take(2).collect();
+        let (header, _) = header_top(inp.title, inp.gauges, cols);
+        let mut out: Vec<Line<'static>> = header.into_iter().collect();
         let c = usize::from(cols);
         let body_rows = usize::from(rows.saturating_sub(CHROME_ROWS));
         let body = self.body(c);
