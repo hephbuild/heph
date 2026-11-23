@@ -413,6 +413,12 @@ impl TappedReceiver {
         Ok(())
     }
 
+    /// [`Self::try_recv`] until nothing is queued: every event already sent
+    /// is folded, none is waited for.
+    pub fn drain(&mut self, mut apply: impl FnMut(&BuildEvent)) {
+        while self.try_recv(&mut apply).is_ok() {}
+    }
+
     /// Await the next event and only record it — for a backend that has stopped
     /// folding (the line backend, after its summary) but whose process still
     /// emits.
