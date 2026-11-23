@@ -513,7 +513,7 @@ fn run_dist_both(args: RunDistArgs) -> Result<()> {
 }
 
 fn write_results(out: &Path, tier: &str, scenario: &str, wall_ms: Vec<f64>) -> Result<()> {
-    let mean = wall_ms.iter().sum::<f64>() / wall_ms.len().max(1) as f64;
+    let mean = compare::mean(&wall_ms);
     println!("{scenario}: {} reps, {mean:.1}ms mean", wall_ms.len());
     let results = RunResults {
         tier: tier.to_string(),

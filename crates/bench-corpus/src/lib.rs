@@ -203,8 +203,10 @@ fn add_codegen_targets(files: usize, pkg_src: &mut [String]) -> Result<(Vec<Stri
 
 /// The root `.gitignore` codegen mode writes: only the managed section, one
 /// `# //pkg:target` attribution line above each root-anchored pattern, in the
-/// shape `heph tool codegen gitignore` renders.
-fn codegen_gitignore(outputs: &[String]) -> Result<String> {
+/// shape `heph tool codegen gitignore` renders. Each of `outputs` is a
+/// root-relative path whose first component is its package (`pkg3/gen0.txt`),
+/// listed in the order given.
+pub fn codegen_gitignore(outputs: &[String]) -> Result<String> {
     let mut s = String::with_capacity(outputs.len() * 48 + 128);
     writeln!(s, "{CODEGEN_BEGIN_MARKER}").context("format section")?;
     for path in outputs {

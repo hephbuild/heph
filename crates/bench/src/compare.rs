@@ -135,7 +135,7 @@ pub struct ScenarioVerdict {
     pub regression: bool,
 }
 
-fn mean(v: &[f64]) -> f64 {
+pub(crate) fn mean(v: &[f64]) -> f64 {
     if v.is_empty() {
         0.0
     } else {
@@ -151,7 +151,7 @@ fn stdev(v: &[f64], m: f64) -> f64 {
     var.sqrt()
 }
 
-fn median(v: &[f64]) -> f64 {
+pub(crate) fn median(v: &[f64]) -> f64 {
     let mut v = v.to_vec();
     v.sort_by(f64::total_cmp);
     let n = v.len();

@@ -23,15 +23,14 @@
 //! Their timed counterparts (glob, warm build, import) are Tier B scenarios
 //! in `dist.rs`, compared against N-1 by `compare`.
 
-use crate::inprocess;
+use crate::{compare, inprocess};
 use anyhow::{Context, Result, bail, ensure};
-use bench_corpus::{CODEGEN_BEGIN_MARKER, CODEGEN_END_MARKER, CODEGEN_LABEL, CorpusManifest};
+use bench_corpus::{CODEGEN_LABEL, CorpusManifest};
 use heph::engine::{Config, Engine, OutputMatcher, ResultOptions};
 use heph::htaddr::parse_addr;
 use heph::htmatcher::Matcher;
 use heph::htpkg::PkgBuf;
 use heph::htwalk::codegen_index::{CodegenLockPaths, LookupMeta};
-use std::fmt::Write as _;
 use std::hint::black_box;
 use std::path::Path;
 use std::sync::Arc;
@@ -240,28 +239,12 @@ fn restore(corpus: &Path, pkg: &str, src: &str) -> Result<()> {
 }
 
 /// A root `.gitignore` holding only a managed section of `lines` patterns,
-/// shaped like the corpus's (an attribution line above each).
+/// five outputs per package, rendered by the corpus's own generator.
 fn section_of(lines: usize) -> Result<String> {
-    let mut s = String::with_capacity(lines * 48 + 128);
-    writeln!(s, "{CODEGEN_BEGIN_MARKER}").context("format section")?;
-    for i in 0..lines {
-        let pkg = i / 5;
-        writeln!(s, "# //pkg{pkg}:codegen\n/pkg{pkg}/gen{}.txt", i % 5)
-            .context("format section")?;
-    }
-    writeln!(s, "{CODEGEN_END_MARKER}").context("format section")?;
-    Ok(s)
-}
-
-fn median(v: &mut [f64]) -> f64 {
-    v.sort_by(f64::total_cmp);
-    match v.len() {
-        0 => 0.0,
-        n if n % 2 == 1 => v.get(n / 2).copied().unwrap_or(0.0),
-        n => {
-            (v.get(n / 2 - 1).copied().unwrap_or(0.0) + v.get(n / 2).copied().unwrap_or(0.0)) / 2.0
-        }
-    }
+    let outputs: Vec<String> = (0..lines)
+        .map(|i| format!("pkg{}/gen{}.txt", i / 5, i % 5))
+        .collect();
+    bench_corpus::codegen_gitignore(&outputs)
 }
 
 /// `Snapshot::status` of paths no row records and no section line matches
@@ -311,7 +294,7 @@ async fn status_miss(iters: usize, rounds: usize) -> Result<Check> {
             samples.push(start.elapsed().as_secs_f64() * 1e9 / iters as f64);
         }
     }
-    let medians: Vec<f64> = per_ns.iter_mut().map(|v| median(v)).collect();
+    let medians: Vec<f64> = per_ns.iter().map(|v| compare::median(v)).collect();
     let at = |lines: usize| {
         STATUS_LINES
             .iter()
@@ -355,21 +338,33 @@ mod tests {
     /// walk; a drift here would make every codegen bench read a stale section.
     #[test]
     fn corpus_markers_are_walks() {
+        use bench_corpus::{CODEGEN_BEGIN_MARKER, CODEGEN_END_MARKER};
         use heph::htwalk::gitignore_section::{BEGIN_MARKER, END_MARKER};
         assert_eq!(CODEGEN_BEGIN_MARKER, BEGIN_MARKER);
         assert_eq!(CODEGEN_END_MARKER, END_MARKER);
+    }
+
+    /// The microbench's section keeps the shape it was hand-formatted in: five
+    /// outputs per package, each under its attribution line.
+    #[test]
+    fn section_of_lists_five_outputs_per_package() {
+        use bench_corpus::{CODEGEN_BEGIN_MARKER, CODEGEN_END_MARKER};
+        let mut want = format!("{CODEGEN_BEGIN_MARKER}\n");
+        for (pkg, n) in [(0, 0), (0, 1), (0, 2), (0, 3), (0, 4), (1, 0), (1, 1)] {
+            want.push_str(&format!("# //pkg{pkg}:codegen\n/pkg{pkg}/gen{n}.txt\n"));
+        }
+        want.push_str(&format!("{CODEGEN_END_MARKER}\n"));
+        assert_eq!(section_of(7).expect("section"), want);
+        assert_eq!(
+            section_of(0).expect("section"),
+            format!("{CODEGEN_BEGIN_MARKER}\n{CODEGEN_END_MARKER}\n")
+        );
     }
 
     #[test]
     fn package_of_reads_the_package() {
         assert_eq!(package_of("//pkg12:codegen").ok(), Some("pkg12"));
         package_of("pkg12:codegen").expect_err("no leading //");
-    }
-
-    #[test]
-    fn median_of_even_and_odd() {
-        assert!((median(&mut [3.0, 1.0, 2.0]) - 2.0).abs() < f64::EPSILON);
-        assert!((median(&mut [4.0, 1.0, 3.0, 2.0]) - 2.5).abs() < f64::EPSILON);
     }
 
     /// The microbench measures every size, gates on 5,000 over 1, and reports
