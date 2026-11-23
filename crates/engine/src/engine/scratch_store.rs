@@ -107,7 +107,7 @@ pub struct SlotEntry {
 //                          /slot.meta     meta_path
 //                          /<scope>/      lineage_dir   (scope sanitized here)
 //                                  /head  head_dir      (the directory mounted)
-//                                  /head.meta           (lineage bookkeeping)
+//                                  /head.meta  head_meta_path (lineage bookkeeping)
 
 /// Root of the scratch store.
 pub fn store_root(home: &Path) -> PathBuf {
@@ -126,13 +126,24 @@ pub fn lineage_dir(home: &Path, slot: &str, scope: &str) -> PathBuf {
     slot_dir(home, slot).join(crate::engine::config::sanitize_scope(scope))
 }
 
-/// The directory actually mounted into a sandbox.
+/// The directory actually mounted into a sandbox: a slot's contents, for one
+/// lineage.
+///
+/// Scope-structured, so a branch's work stays on that branch: two scopes of one
+/// slot are two directories, and nothing a feature branch does can reach the one
+/// `master` builds from.
 ///
 /// A level below the lineage so bookkeeping can sit beside it without ever
 /// appearing inside the cache — anything written next to `head` is heph's, and
 /// anything inside it is the tool's.
 pub fn head_dir(home: &Path, slot: &str, scope: &str) -> PathBuf {
     lineage_dir(home, slot, scope).join("head")
+}
+
+/// The lineage's bookkeeping: the snapshot it was last seeded from or
+/// published as.
+pub fn head_meta_path(home: &Path, slot: &str, scope: &str) -> PathBuf {
+    lineage_dir(home, slot, scope).join("head.meta")
 }
 
 /// Root of the **audit** store: where `--no-scratch` puts its throwaway

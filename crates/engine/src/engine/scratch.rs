@@ -24,6 +24,7 @@ use crate::engine::Engine;
 use crate::engine::driver::targetdef::Input;
 use crate::engine::request_state::RequestState;
 use crate::engine::result_lock::LockBackend;
+use crate::engine::scratch_store::head_dir;
 use anyhow::Context as _;
 use hbuiltins::pluginscratch::{Access, DRIVER_NAME, ScratchDef, parse_declaration};
 use hcore::hasync::Cancellable;
@@ -202,16 +203,6 @@ fn stamp_pid(guard: &hlock::hlock::FWriteGuard) {
     }
 }
 
-/// The directory a slot's contents live in, for one lineage.
-///
-/// Scope-structured, so a branch's work stays on that branch: two scopes of one
-/// slot are two directories, and nothing a feature branch does can reach the one
-/// `master` builds from. `sanitize_scope` is what keeps a branch name like
-/// `feature/x` from silently nesting an extra level.
-pub fn scope_dir(home: &Path, slot: &str, scope: &str) -> PathBuf {
-    crate::engine::scratch_store::head_dir(home, slot, scope)
-}
-
 /// What preparing a scratch directory actually did, as it rides to
 /// `ScratchPrepareEnd`.
 ///
@@ -325,7 +316,7 @@ async fn resolve_scope_dir(
     opts: &crate::engine::config::ScratchOptions,
     addr: &Addr,
 ) -> anyhow::Result<(PathBuf, Prepared)> {
-    let own = scope_dir(home, slot, &opts.scope);
+    let own = head_dir(home, slot, &opts.scope);
     let exists = |p: PathBuf| async move {
         hcore::blocking::run(move || Ok::<bool, std::io::Error>(p.is_dir()))
             .await
@@ -343,7 +334,7 @@ async fn resolve_scope_dir(
             if *fallback == opts.scope {
                 continue;
             }
-            let from = scope_dir(home, slot, fallback);
+            let from = head_dir(home, slot, fallback);
             if !exists(from.clone()).await {
                 continue;
             }
@@ -929,12 +920,12 @@ mod scope_tests {
     fn scopes_are_separate_directories() {
         let home = Path::new("/h");
         assert_ne!(
-            scope_dir(home, "abc", "master"),
-            scope_dir(home, "abc", "feat")
+            head_dir(home, "abc", "master"),
+            head_dir(home, "abc", "feat")
         );
         assert_eq!(
-            scope_dir(home, "abc", "master"),
-            scope_dir(home, "abc", "master")
+            head_dir(home, "abc", "master"),
+            head_dir(home, "abc", "master")
         );
     }
 
@@ -942,7 +933,7 @@ mod scope_tests {
     /// collide the moment one is a path prefix of another.
     #[test]
     fn a_slash_in_a_branch_name_stays_one_component() {
-        let d = scope_dir(Path::new("/h"), "abc", "feature/x");
+        let d = head_dir(Path::new("/h"), "abc", "feature/x");
         let comps: Vec<_> = d.components().collect();
         assert_eq!(
             comps.len(),
@@ -956,7 +947,7 @@ mod scope_tests {
     /// lineage), so it cannot resolve to the slot dir itself.
     #[test]
     fn the_empty_scope_has_a_directory_of_its_own() {
-        let d = scope_dir(Path::new("/h"), "abc", "");
+        let d = head_dir(Path::new("/h"), "abc", "");
         assert!(d.ends_with("head"));
         assert!(d.to_string_lossy().contains("/abc/_/"), "{d:?}");
     }
@@ -967,7 +958,7 @@ mod scope_tests {
         let (got, prepared) = resolve_scope_dir(tmp.path(), "s", &opts("feat", &[], true), &addr())
             .await
             .expect("resolve");
-        assert_eq!(got, scope_dir(tmp.path(), "s", "feat"));
+        assert_eq!(got, head_dir(tmp.path(), "s", "feat"));
         assert_eq!(prepared, Prepared::Cold);
     }
 
@@ -976,7 +967,7 @@ mod scope_tests {
     #[tokio::test]
     async fn a_new_scope_seeds_from_its_fallback() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let master = scope_dir(tmp.path(), "s", "master");
+        let master = head_dir(tmp.path(), "s", "master");
         std::fs::create_dir_all(master.join("sub")).expect("mkdir");
         std::fs::write(master.join("sub").join("f"), b"warm").expect("write");
 
@@ -985,7 +976,7 @@ mod scope_tests {
                 .await
                 .expect("resolve");
 
-        assert_eq!(got, scope_dir(tmp.path(), "s", "feat"));
+        assert_eq!(got, head_dir(tmp.path(), "s", "feat"));
         assert_eq!(
             std::fs::read(got.join("sub").join("f")).expect("read seeded"),
             b"warm"
@@ -1000,7 +991,7 @@ mod scope_tests {
     #[tokio::test]
     async fn seeding_leaves_the_fallback_untouched() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let master = scope_dir(tmp.path(), "s", "master");
+        let master = head_dir(tmp.path(), "s", "master");
         std::fs::create_dir_all(&master).expect("mkdir");
         std::fs::write(master.join("f"), b"base").expect("write");
 
@@ -1016,7 +1007,7 @@ mod scope_tests {
     #[tokio::test]
     async fn seed_on_fork_off_starts_cold() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let master = scope_dir(tmp.path(), "s", "master");
+        let master = head_dir(tmp.path(), "s", "master");
         std::fs::create_dir_all(&master).expect("mkdir");
         std::fs::write(master.join("f"), b"warm").expect("write");
 
@@ -1033,7 +1024,7 @@ mod scope_tests {
     async fn a_warm_scope_is_never_reseeded() {
         let tmp = tempfile::tempdir().expect("tempdir");
         for (scope, body) in [("master", b"base".as_slice()), ("feat", b"mine".as_slice())] {
-            let d = scope_dir(tmp.path(), "s", scope);
+            let d = head_dir(tmp.path(), "s", scope);
             std::fs::create_dir_all(&d).expect("mkdir");
             std::fs::write(d.join("f"), body).expect("write");
         }
@@ -1051,7 +1042,7 @@ mod scope_tests {
     #[tokio::test]
     async fn fallbacks_are_tried_in_order_and_missing_ones_are_skipped() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let develop = scope_dir(tmp.path(), "s", "develop");
+        let develop = head_dir(tmp.path(), "s", "develop");
         std::fs::create_dir_all(&develop).expect("mkdir");
         std::fs::write(develop.join("f"), b"develop").expect("write");
 
@@ -1076,7 +1067,7 @@ mod scope_tests {
             resolve_scope_dir(tmp.path(), "s", &opts("feat", &["feat"], true), &addr())
                 .await
                 .expect("resolve");
-        assert_eq!(got, scope_dir(tmp.path(), "s", "feat"));
+        assert_eq!(got, head_dir(tmp.path(), "s", "feat"));
         assert_eq!(prepared, Prepared::Cold, "a self-seed is not a seed");
     }
 

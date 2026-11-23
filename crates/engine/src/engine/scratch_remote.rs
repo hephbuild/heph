@@ -44,11 +44,12 @@
 
 use crate::engine::Engine;
 use crate::engine::remote_cache::{RemoteCacheBackend, SNAPSHOT_STREAM_BUF, ScratchSource};
+use crate::engine::scratch_store::head_meta_path;
 use anyhow::Context as _;
 use borsh::{BorshDeserialize, BorshSerialize};
 use futures::StreamExt as _;
 use std::io::Seek as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _};
 
 /// Key-layout version. Bumping it makes every older entry invisible rather than
@@ -553,37 +554,34 @@ async fn read_head(source: &ScratchSource<'_>, stem: String) -> Option<RemoteHea
     })
 }
 
-/// The directory a lineage's contents live in. Re-exported here so the CLI has
-/// one place to ask for scratch paths.
-pub fn scope_head_dir(home: &Path, slot: &str, scope: &str) -> PathBuf {
-    crate::engine::scratch::scope_dir(home, slot, scope)
-}
-
-/// Where a slot's local lineage state is recorded.
-pub fn local_meta_path(home: &Path, slot: &str, scope: &str) -> PathBuf {
-    crate::engine::scratch_store::lineage_dir(home, slot, scope).join("head.meta")
-}
-
 /// Read the snapshot a local lineage was last seeded from or published as.
 pub fn read_local_meta(home: &Path, slot: &str, scope: &str) -> Option<SnapshotMeta> {
-    let bytes = std::fs::read(local_meta_path(home, slot, scope)).ok()?;
+    let bytes = std::fs::read(head_meta_path(home, slot, scope)).ok()?;
     let meta = SnapshotMeta::try_from_slice(&bytes).ok()?;
     (meta.format == SNAPSHOT_FORMAT).then_some(meta)
 }
 
 /// Record what a local lineage descends from. Best-effort: losing it costs a
 /// generation reset, never a wrong build.
+///
+/// Write-then-rename through a uniquely named temp file, so a concurrent reader
+/// never sees half a meta and two writers never share a temp file.
 pub fn write_local_meta(home: &Path, slot: &str, scope: &str, meta: &SnapshotMeta) {
-    let path = local_meta_path(home, slot, scope);
+    let path = head_meta_path(home, slot, scope);
     let write = || -> anyhow::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&path, borsh::to_vec(meta)?)?;
+        let parent = path.parent().context("scratch head meta has no parent")?;
+        std::fs::create_dir_all(parent).with_context(|| format!("create {parent:?}"))?;
+        let mut tmp = tempfile::NamedTempFile::new_in(parent)
+            .with_context(|| format!("create a temp file in {parent:?}"))?;
+        let bytes = borsh::to_vec(meta).context("encode the meta")?;
+        std::io::Write::write_all(&mut tmp, &bytes)
+            .with_context(|| format!("write {:?}", tmp.path()))?;
+        tmp.persist(&path)
+            .with_context(|| format!("rename into {path:?}"))?;
         Ok(())
     };
     if let Err(err) = write() {
-        tracing::debug!(slot, scope, error = %err, "recording scratch lineage meta");
+        tracing::debug!(slot, scope, error = %format!("{err:#}"), "recording scratch lineage meta");
     }
 }
 
@@ -974,10 +972,22 @@ mod tests {
             read_local_meta(tmp.path(), "s", "master"),
             Some(meta("master", 3, 10))
         );
+        // Overwritten in place, through a temp file that does not outlive it.
+        write_local_meta(tmp.path(), "s", "master", &meta("master", 5, 10));
+        assert_eq!(
+            read_local_meta(tmp.path(), "s", "master").map(|m| m.generation),
+            Some(5)
+        );
+        let lineage = crate::engine::scratch_store::lineage_dir(tmp.path(), "s", "master");
+        let names: Vec<_> = std::fs::read_dir(&lineage)
+            .expect("ls lineage")
+            .map(|e| e.expect("entry").file_name())
+            .collect();
+        assert_eq!(names, ["head.meta"]);
 
         let mut future = meta("master", 4, 10);
         future.format = SNAPSHOT_FORMAT + 1;
-        let p = local_meta_path(tmp.path(), "s", "master");
+        let p = head_meta_path(tmp.path(), "s", "master");
         std::fs::write(&p, borsh::to_vec(&future).expect("ser")).expect("write");
         assert_eq!(read_local_meta(tmp.path(), "s", "master"), None);
     }
