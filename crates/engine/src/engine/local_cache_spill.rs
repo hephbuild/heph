@@ -27,8 +27,9 @@
 //! ## GC integration
 //!
 //! `Engine::gc_entry` reads the manifest (primary), then calls
-//! [`LocalCache::delete`] for each named artifact plus the manifest itself.
-//! Because [`delete`](LocalCacheSpill::delete) removes from both backends and
+//! [`LocalCache::delete_all`] for the named artifacts, then for the manifest
+//! itself. Because [`delete`](LocalCacheSpill::delete) and
+//! [`delete_all`](LocalCacheSpill::delete_all) remove from both backends and
 //! the FS backend prunes now-empty revision/target dirs, a trimmed or orphaned
 //! revision's large blobs are reclaimed from the filesystem exactly as its
 //! sqlite blobs are. Enumeration ([`list_targets`](LocalCacheSpill::list_targets)
@@ -213,6 +214,13 @@ impl LocalCache for LocalCacheSpill {
         // prunes now-empty revision/target dirs.
         self.primary.delete(addr, hashin, name)?;
         self.blobs.delete(addr, hashin, name)?;
+        Ok(())
+    }
+
+    fn delete_all(&self, addr: &Addr, hashin: &str, names: &[&str]) -> Result<()> {
+        // Both backends, as `delete` does; the primary in one batch.
+        self.primary.delete_all(addr, hashin, names)?;
+        self.blobs.delete_all(addr, hashin, names)?;
         Ok(())
     }
 
@@ -767,5 +775,25 @@ mod tests {
         assert!(!cache.exists(&a, "h", "large").expect("ex"));
         // FS revision dir pruned once its last blob is gone.
         assert!(!fs.exists(&a, "h", "large").expect("ex"));
+    }
+
+    /// `delete_all` reaches both backends the same way, in one call each.
+    #[test]
+    fn delete_all_reclaims_from_both_backends() {
+        let dir = tempdir().expect("tempdir");
+        let (cache, sqlite, fs) = spill(dir.path(), 64);
+        let a = addr();
+
+        write(&cache, &a, "small", &[1u8; 16]);
+        write(&cache, &a, "large", &[2u8; 256]);
+        write(&cache, &a, "kept", &[3u8; 16]);
+
+        cache
+            .delete_all(&a, "h", &["small", "large"])
+            .expect("delete_all");
+
+        assert!(!sqlite.exists(&a, "h", "small").expect("ex"));
+        assert!(!fs.exists(&a, "h", "large").expect("ex"));
+        assert!(cache.exists(&a, "h", "kept").expect("ex"));
     }
 }

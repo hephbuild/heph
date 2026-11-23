@@ -255,6 +255,19 @@ pub trait LocalCache: Send + Sync {
         }
     }
     fn delete(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<()>;
+    /// [`delete`](Self::delete) every one of `names` in `(addr, hashin)`, in
+    /// order; every delete has landed when this returns `Ok`.
+    ///
+    /// The default deletes one at a time. A backend whose delete waits on a
+    /// commit (the sqlite one) overrides it to queue them all and then wait on
+    /// all, so a revision's artifacts cost one commit rather than one each, and
+    /// a decorator forwards it.
+    fn delete_all(&self, addr: &Addr, hashin: &str, names: &[&str]) -> anyhow::Result<()> {
+        for name in names {
+            self.delete(addr, hashin, name)?;
+        }
+        Ok(())
+    }
     /// Stream the distinct target address keys (`Addr::format()`, parseable via
     /// `htaddr::parse_addr`) present in the cache. Streamed rather than collected
     /// because the target count can be very large; GC processes one at a time so

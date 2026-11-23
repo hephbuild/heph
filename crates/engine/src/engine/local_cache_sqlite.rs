@@ -10,7 +10,7 @@ use hmodel::htaddr::Addr;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{Connection, OpenFlags};
 use std::cell::Cell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::{Future, poll_fn};
 use std::io::{self, Seek};
 use std::path::PathBuf;
@@ -1564,6 +1564,48 @@ impl LocalCache for LocalCacheSQLite {
         Ok(())
     }
 
+    /// Queue every delete, then wait on them all: the writer thread drains
+    /// them into one batch, so a revision costs one commit instead of one per
+    /// artifact. Parks the thread, like [`delete`](Self::delete).
+    fn delete_all(&self, addr: &Addr, hashin: &str, names: &[&str]) -> Result<()> {
+        // Nothing to delete opens no writer, as a loop of zero deletes would not.
+        if names.is_empty() {
+            return Ok(());
+        }
+        let addr_key = Self::key(addr);
+        let tx = self.writer_tx()?;
+        // A name repeated in one call is queued once: a second registration
+        // would supersede the first slot in the tracker, and only the slot the
+        // tracker holds is released if the writer thread dies.
+        let mut seen = HashSet::with_capacity(names.len());
+        let mut slots = Vec::with_capacity(names.len());
+        let mut queued = Ok(());
+        for &name in names {
+            if !seen.insert(name) {
+                continue;
+            }
+            let key = (addr_key.clone(), hashin.to_string(), name.to_string());
+            match self.pending.register_and_send(tx, key, |key, slot| {
+                WriterCmd::Delete(DeleteJob { key, slot })
+            }) {
+                Some(slot) => slots.push(slot),
+                None => {
+                    queued = Err(anyhow::anyhow!(
+                        "queueing a cache delete: sqlite writer thread is gone"
+                    ));
+                    break;
+                }
+            }
+        }
+        // Waited on even when a later send failed, so whatever was queued has
+        // settled before the caller sees the error — as with one delete at a
+        // time, where the deletes before the failing one had landed.
+        for slot in slots {
+            slot.wait();
+        }
+        queued
+    }
+
     fn seekable_reader(
         &self,
         addr: &Addr,
@@ -2267,6 +2309,48 @@ mod tests {
             name.to_string(),
             Default::default(),
         )
+    }
+
+    /// `delete_all` queues every delete before it waits on any, so the writer
+    /// drains them as one batch — with the writer held, all of them are in
+    /// flight at once, where one `delete` at a time would show only the first.
+    /// A name given twice is queued once, and everything named is gone after.
+    #[test]
+    fn delete_all_queues_every_delete_before_waiting() -> Result<()> {
+        let dir = tempdir()?;
+        let cache = Arc::new(open(&dir.path().join("cache.db"))?);
+        let addr = make_addr("pkg", "delete_all");
+        for name in ["a", "b", "c", "keep"] {
+            put(&cache, &addr, name, b"bytes")?;
+        }
+        assert!(cache.exists(&addr, "h", "c")?, "barrier");
+
+        cache.gate.close();
+        let deleting = std::thread::spawn({
+            let (cache, addr) = (Arc::clone(&cache), addr.clone());
+            move || cache.delete_all(&addr, "h", &["a", "b", "a", "c"])
+        });
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while cache.pending.map.lock().expect("pending").len() < 3 {
+            assert!(
+                Instant::now() < deadline,
+                "the deletes were not all queued before the first wait"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            cache.pending.map.lock().expect("pending").len(),
+            3,
+            "a repeated name is queued once"
+        );
+        cache.gate.open();
+        deleting.join().expect("delete_all thread")?;
+
+        for name in ["a", "b", "c"] {
+            assert!(!cache.exists(&addr, "h", name)?, "{name} survived");
+        }
+        assert!(cache.exists(&addr, "h", "keep")?, "an unnamed blob is kept");
+        Ok(())
     }
 
     /// Blobs whose streaming reads will park with a pooled connection held.

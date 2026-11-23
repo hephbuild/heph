@@ -45,6 +45,7 @@ use crate::engine::result_lock::TargetGuard;
 use anyhow::{Context, Result};
 use hcore::hmemoizer::downcast_chain_ref;
 use hmodel::htaddr::{Addr, parse_addr};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinSet;
@@ -215,21 +216,30 @@ impl Engine {
         // Both manifests, not just the one reads prefer: a revision written by
         // an older heph and by this one has two, and each names its own blobs.
         let manifests = Self::read_all_manifests(&self.local_cache, addr, hashin)?;
-        for (_, manifest) in &manifests {
-            for a in &manifest.artifacts {
-                // A manifest can name blobs that were never downloaded (a
-                // revision mirrored from a remote materializes lazily), so only
-                // count bytes actually reclaimed.
-                let stored = self
-                    .local_cache
-                    .stored_size(addr, hashin, &a.name)
-                    .with_context(|| format!("probe cached artifact {} for {addr}", a.name))?;
-                self.local_cache
-                    .delete(addr, hashin, &a.name)
-                    .with_context(|| format!("delete cached artifact {} for {addr}", a.name))?;
-                bytes = bytes.saturating_add(stored.unwrap_or(0));
-            }
+        // Each blob once, even when both manifests name it, so its bytes are
+        // counted once.
+        let mut seen = HashSet::new();
+        let blobs: Vec<&str> = manifests
+            .iter()
+            .flat_map(|(_, manifest)| &manifest.artifacts)
+            .map(|a| a.name.as_str())
+            .filter(|name| seen.insert(*name))
+            .collect();
+        for name in &blobs {
+            // A manifest can name blobs that were never downloaded (a revision
+            // mirrored from a remote materializes lazily), so only count bytes
+            // actually reclaimed.
+            let stored = self
+                .local_cache
+                .stored_size(addr, hashin, name)
+                .with_context(|| format!("probe cached artifact {name} for {addr}"))?;
+            bytes = bytes.saturating_add(stored.unwrap_or(0));
         }
+        // Blobs before manifests, each as one batch: a manifest's presence
+        // still implies its blobs until the manifest itself is gone.
+        self.local_cache
+            .delete_all(addr, hashin, &blobs)
+            .with_context(|| format!("delete cached artifacts for {addr} {hashin}"))?;
         // The manifests found, plus `MANIFEST_V2` always: the one this version
         // writes, so the one a partial write of this version can have left
         // behind unread. A v1 manifest is only ever written whole by an older
@@ -237,11 +247,10 @@ impl Engine {
         let found = manifests.iter().map(|(name, _)| *name);
         let hedge =
             (!manifests.iter().any(|(name, _)| *name == MANIFEST_V2)).then_some(MANIFEST_V2);
-        for name in found.chain(hedge) {
-            self.local_cache
-                .delete(addr, hashin, name)
-                .with_context(|| format!("delete {name} for {addr} {hashin}"))?;
-        }
+        let manifest_names: Vec<&str> = found.chain(hedge).collect();
+        self.local_cache
+            .delete_all(addr, hashin, &manifest_names)
+            .with_context(|| format!("delete manifests for {addr} {hashin}"))?;
         Ok(bytes)
     }
 
@@ -2521,6 +2530,76 @@ mod tests {
         engine.gc_entry(&a, "h1").expect("gc_entry");
 
         for name in [MANIFEST_V1, MANIFEST_V2, v1_name, v2_name] {
+            assert!(
+                !engine.local_cache.exists(&a, "h1", name).expect("exists"),
+                "{name} must be deleted"
+            );
+        }
+    }
+
+    /// The bytes GC reports are the sum of what each blob stored, each blob
+    /// counted once: one named by both manifests is not freed twice.
+    #[test]
+    fn gc_entry_sums_each_freed_blob_once() {
+        let (engine, _dir) = test_engine();
+        let a = addr("t");
+        let (shared, own) = ("shared.tar", "own.tar.zst");
+        write_encoded(
+            &engine,
+            &a,
+            "h1",
+            shared,
+            &ManifestArtifactEncoding::None,
+            b"in both manifests",
+        );
+        write_encoded(
+            &engine,
+            &a,
+            "h1",
+            own,
+            &ManifestArtifactEncoding::Zstd,
+            &[b'y'; 4096],
+        );
+        write_manifest(
+            &engine,
+            &a,
+            "h1",
+            MANIFEST_V1,
+            "1.0.0",
+            tar_artifact(shared, 17, ManifestArtifactEncoding::None),
+        );
+        // Two artifacts, which `write_manifest` does not write.
+        let manifest = Manifest {
+            version: crate::engine::local_cache::MANIFEST_V2_VERSION.to_string(),
+            target: a.format(),
+            created_at_nanos: 100,
+            hashin: "h1".to_string(),
+            artifacts: vec![
+                tar_artifact(shared, 17, ManifestArtifactEncoding::None),
+                tar_artifact(own, 4096, ManifestArtifactEncoding::Zstd),
+            ],
+        };
+        let mut w = engine
+            .local_cache
+            .writer(&a, "h1", MANIFEST_V2)
+            .expect("manifest writer");
+        borsh::to_writer(&mut w, &manifest).expect("write manifest");
+        w.commit().expect("commit manifest");
+        let stored: u64 = [shared, own]
+            .iter()
+            .map(|name| {
+                engine
+                    .local_cache
+                    .stored_size(&a, "h1", name)
+                    .expect("stored size")
+                    .expect("blob present")
+            })
+            .sum();
+
+        let bytes = engine.gc_entry(&a, "h1").expect("gc_entry");
+
+        assert_eq!(bytes, stored, "each blob's stored bytes, once");
+        for name in [MANIFEST_V1, MANIFEST_V2, shared, own] {
             assert!(
                 !engine.local_cache.exists(&a, "h1", name).expect("exists"),
                 "{name} must be deleted"
