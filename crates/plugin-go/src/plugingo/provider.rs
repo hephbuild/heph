@@ -1795,33 +1795,21 @@ fn pick_link(states: &[State], addr_pkg: &str) -> anyhow::Result<target_bin::Lin
     Ok(out)
 }
 
-/// Pick the closest (deepest) ancestor state carrying `go_codegen_deps`.
-/// Independent of `go_codegen_root` — a BUILD file declaring only
+/// The closest (deepest) ancestor state carrying `key`, with that entry's value.
+///
+/// Used for the `go_codegen_deps` / `go_embed_deps` lookups, which are
+/// independent of `go_codegen_root` — a BUILD file declaring only
 /// `go_codegen_deps` must still inject those deps into descendant `_golist`
 /// targets so generated `.go` files reach the sandbox. Mirrors `getCodegenDeps`
 /// in the Go reference impl (`heph/plugin/plugingo/plugin.go:184-200`), which
 /// scans for deps independently of the root marker.
-fn pick_codegen_deps(states: &[State]) -> Option<&State> {
+fn deepest_state_with<'a>(states: &'a [State], key: &str) -> Option<(&'a State, &'a Value)> {
     states
         .iter()
-        .filter(|s| s.state.contains_key("go_codegen_deps"))
-        .max_by_key(|s| s.package.as_str().len())
+        .filter_map(|s| s.state.get(key).map(|v| (s, v)))
+        .max_by_key(|(s, _)| s.package.as_str().len())
 }
 
-/// Source addrs the package sandbox needs beyond the canonical `*.go` filesystem
-/// glob. Includes:
-/// 1. `**/*` filesystem glob (excluding `.go` files) — picks up checked-in
-///    non-Go sources (e.g. embed targets).
-/// 2. `query("… && label(go_src) && tree_output(pkg)")` — unpacks the full output tree
-///    of any codegen target labelled `go_src` into the pkg dir, so both
-///    generated `.go` files and any sibling non-go outputs (e.g. `.wasm.br`)
-///    land in the sandbox.
-/// 3. `go_codegen_deps` from the closest ancestor BUILD state — explicit
-///    codegen targets that don't carry the `go_src` label.
-///
-/// Shared between `_golist` (so `go list` can resolve `//go:embed` patterns
-/// into `EmbedFiles`) and `embed` (so the driver's runtime re-glob of
-/// `embed_patterns` against `sandbox_pkg_dir` matches Go's resolution).
 /// Query-language pattern selecting exactly the package `pkg` (`//` for root).
 fn pkg_pattern(pkg: &str) -> String {
     format!("//{pkg}")
@@ -1868,23 +1856,61 @@ fn go_test_data_query_addr(pkg: &str) -> Addr {
     hplugin_query::pluginquery::query_addr(&expr, "", &["go"])
 }
 
-fn compute_pkg_src_addrs(pkg_str: &str, states: &[State]) -> anyhow::Result<Vec<String>> {
-    let non_go_glob = if pkg_str.is_empty() {
+/// The fs-glob pattern for every file in package `pkg`'s tree (`**/*` for root).
+fn pkg_tree_glob(pkg: &str) -> String {
+    if pkg.is_empty() {
         "**/*".to_string()
     } else {
-        format!("{}/**/*", pluginfs::escape_fs_literal(pkg_str))
-    };
+        format!("{}/**/*", pluginfs::escape_fs_literal(pkg))
+    }
+}
+
+/// Source addrs the package sandbox needs beyond the canonical `*.go` filesystem
+/// glob. Includes:
+/// 1. `**/*` filesystem glob (excluding `.go` files) — picks up checked-in
+///    non-Go sources (e.g. embed targets).
+/// 2. `query("… && label(go_src) && tree_output(pkg)")` — unpacks the full output tree
+///    of any codegen target labelled `go_src` into the pkg dir, so both
+///    generated `.go` files and any sibling non-go outputs (e.g. `.wasm.br`)
+///    land in the sandbox.
+/// 3. `go_codegen_deps` from the closest ancestor BUILD state — explicit
+///    codegen targets that don't carry the `go_src` label.
+///
+/// Shared between `_golist` (so `go list` can resolve `//go:embed` patterns
+/// into `EmbedFiles`) and `embed` (so the driver's runtime re-glob of
+/// `embed_patterns` against `sandbox_pkg_dir` matches Go's resolution).
+fn compute_pkg_src_addrs(pkg_str: &str, states: &[State]) -> anyhow::Result<Vec<String>> {
     // Exclude `.go` (their own lane) and the module files `go.mod`/`go.sum`:
     // the latter are delivered into `_golist` by the modfiles (`_go_mod`) lane
     // as `fs:file` deps. Without excluding them here the non-go glob and the
     // modfiles dep both produce `go.mod`/`go.sum` in the sandbox — two
     // different targets writing the same file, which the sandbox runner now
     // rejects as an output collision.
-    let non_go_glob_addr =
-        pluginfs::glob_addr(&non_go_glob, &["**/*.go", "**/go.mod", "**/go.sum"]);
+    let non_go_glob_addr = pluginfs::glob_addr(
+        &pkg_tree_glob(pkg_str),
+        &["**/*.go", "**/go.mod", "**/go.sum"],
+    );
     let mut addrs = vec![non_go_glob_addr.format()];
+    addrs.extend(labelled_src_lane(
+        pkg_str,
+        states,
+        "go_src",
+        "go_codegen_deps",
+    )?);
+    Ok(addrs)
+}
 
-    let codegen_root = pick_codegen_root(states);
+/// One labelled source lane of package `pkg_str`: the query for targets
+/// labelled `label` whose output lands in the package's tree, then the explicit
+/// deps under `deps_key` from the closest ancestor BUILD state (targets that
+/// don't carry the label). The `go_src` lane (`_golist`) and the
+/// `go_embed_src` lane (embeds only) share it, and so share one scope floor.
+fn labelled_src_lane(
+    pkg_str: &str,
+    states: &[State],
+    label: &str,
+    deps_key: &str,
+) -> anyhow::Result<Vec<String>> {
     // Scope: every package under the codegen root if one is declared, else the
     // target's own package *and everything under it*.
     //
@@ -1900,7 +1926,7 @@ fn compute_pkg_src_addrs(pkg_str: &str, states: &[State]) -> anyhow::Result<Vec<
     //
     // Widening the floor cannot pull in a foreign target: `tree_output(pkg)` still
     // requires the output to land in *this* package's tree.
-    let scope = match codegen_root {
+    let scope = match pick_codegen_root(states) {
         Some(root) => pkg_prefix_pattern(root.package.as_str()),
         None => default_scope(pkg_str),
     };
@@ -1908,30 +1934,19 @@ fn compute_pkg_src_addrs(pkg_str: &str, states: &[State]) -> anyhow::Result<Vec<
     // tier, `label` at the spec tier (`get_spec`), and `tree_output` only at the
     // def tier (`get_def`, the most expensive). Order terms by that cost so the
     // engine's left-to-right `&&` bails at the cheapest possible tier.
-    // Exclude the `go` provider: `go_src` labels only its buildfile codegen
-    // targets, never go targets — skipping go avoids resolving (and cascade-
-    // building) the go provider's per-variant targets.
-    let go_src_expr = format!("{scope} && label(go_src) && tree_output({pkg_str})");
-    let go_src_query_addr = hplugin_query::pluginquery::query_addr(&go_src_expr, "", &["go"]);
-    addrs.push(go_src_query_addr.format());
+    // Exclude the `go` provider: the `go_src`/`go_embed_src` labels mark only
+    // buildfile codegen targets, never go targets — skipping go avoids resolving
+    // (and cascade-building) the go provider's per-variant targets.
+    let expr = format!("{scope} && label({label}) && tree_output({pkg_str})");
+    let query_addr = hplugin_query::pluginquery::query_addr(&expr, "", &["go"]);
+    let mut addrs = vec![query_addr.format()];
 
-    if let Some(deps_state) = pick_codegen_deps(states)
-        && let Some(deps_val) = deps_state.state.get("go_codegen_deps")
-    {
-        let deps =
-            parse_strings(deps_val).context("parsing go_codegen_deps from go provider_state")?;
+    if let Some((_, deps_val)) = deepest_state_with(states, deps_key) {
+        let deps = parse_strings(deps_val)
+            .with_context(|| format!("parsing {deps_key} from go provider_state"))?;
         addrs.extend(deps);
     }
     Ok(addrs)
-}
-
-/// Pick the closest (deepest) ancestor state carrying `go_embed_deps`. Mirrors
-/// [`pick_codegen_deps`] for the embed-only lane.
-fn pick_embed_deps(states: &[State]) -> Option<&State> {
-    states
-        .iter()
-        .filter(|s| s.state.contains_key("go_embed_deps"))
-        .max_by_key(|s| s.package.as_str().len())
 }
 
 /// Address set for the `go_embed_src` lane: targets whose outputs are consumed
@@ -1948,29 +1963,7 @@ fn pick_embed_deps(states: &[State]) -> Option<&State> {
 /// 2. `go_embed_deps` from the closest ancestor BUILD state — explicit embed
 ///    targets that don't carry the label.
 fn compute_embed_src_addrs(pkg_str: &str, states: &[State]) -> anyhow::Result<Vec<String>> {
-    let codegen_root = pick_codegen_root(states);
-    // Same floor as the go_src lane (see `compute_pkg_src_addrs`): the subtree, so a
-    // generator in a sub-package of the embedding package is in scope.
-    let scope = match codegen_root {
-        Some(root) => pkg_prefix_pattern(root.package.as_str()),
-        None => default_scope(pkg_str),
-    };
-    // Cheapest-first by resolution tier (see `compute_pkg_src_addrs`): `scope`
-    // (addr) < `label` (spec/`get_spec`) < `tree_output` (def/`get_def`).
-    // Exclude the `go` provider (see `compute_pkg_src_addrs`): `go_embed_src`
-    // only labels buildfile codegen targets.
-    let expr = format!("{scope} && label(go_embed_src) && tree_output({pkg_str})");
-    let query_addr = hplugin_query::pluginquery::query_addr(&expr, "", &["go"]);
-    let mut addrs = vec![query_addr.format()];
-
-    if let Some(deps_state) = pick_embed_deps(states)
-        && let Some(deps_val) = deps_state.state.get("go_embed_deps")
-    {
-        let deps =
-            parse_strings(deps_val).context("parsing go_embed_deps from go provider_state")?;
-        addrs.extend(deps);
-    }
-    Ok(addrs)
+    labelled_src_lane(pkg_str, states, "go_embed_src", "go_embed_deps")
 }
 
 /// The package's static (checked-in) non-Go source tree as a single fs-glob addr,
@@ -1983,12 +1976,7 @@ fn compute_embed_src_addrs(pkg_str: &str, states: &[State]) -> anyhow::Result<Ve
 /// codegen xattr and are skipped by the glob, so the decoupling (and any
 /// `go_embed_src` lane staging) is preserved with no double-staging.
 fn pkg_static_embed_glob_addr(pkg_str: &str) -> String {
-    let glob = if pkg_str.is_empty() {
-        "**/*".to_string()
-    } else {
-        format!("{}/**/*", pluginfs::escape_fs_literal(pkg_str))
-    };
-    pluginfs::glob_addr(&glob, &["**/*.go"]).format()
+    pluginfs::glob_addr(&pkg_tree_glob(pkg_str), &["**/*.go"]).format()
 }
 
 impl ProviderInner {
@@ -8697,6 +8685,91 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             "//mgmt/go/cmd/exporter/rest/..."
         );
         assert_eq!(default_scope(""), "//");
+    }
+
+    /// Pins the exact addr strings of both source lanes and the static embed
+    /// glob. They reach `_golist`'s and `build_lib`'s def hashes, so a change to
+    /// any byte of them invalidates every Go target.
+    #[test]
+    fn source_lane_addrs_are_byte_stable() {
+        fn state(pkg: &str, entries: &[(&str, Value)]) -> State {
+            State {
+                package: PkgBuf::from(pkg),
+                provider: "go".to_string(),
+                state: entries
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.clone()))
+                    .collect(),
+            }
+        }
+        let list = |s: &str| Value::List(vec![Value::String(s.to_string())]);
+        let states = vec![
+            state(
+                "",
+                &[
+                    ("go_codegen_deps", list("//shallow:gen")),
+                    ("go_embed_deps", list("//shallow:dist")),
+                ],
+            ),
+            state(
+                "app",
+                &[
+                    ("go_codegen_root", Value::Bool(true)),
+                    ("go_codegen_deps", list("//app:gen")),
+                ],
+            ),
+            state("app/sub", &[("go_codegen_root", Value::Bool(false))]),
+        ];
+
+        // Scope from the deepest codegen root (`app`, not the `false` one at
+        // `app/sub`); deps from the deepest state carrying each key.
+        assert_eq!(
+            compute_pkg_src_addrs("app/sub", &states).unwrap(),
+            [
+                r#"//@heph/fs:glob@e="**/*.go,**/go.mod,**/go.sum",p=app/sub/**/*"#,
+                r#"//@heph/query:query@exclude_provider=go,expr="//app/... && label(go_src) && tree_output(app/sub)""#,
+                "//app:gen",
+            ]
+        );
+        assert_eq!(
+            compute_embed_src_addrs("app/sub", &states).unwrap(),
+            [
+                r#"//@heph/query:query@exclude_provider=go,expr="//app/... && label(go_embed_src) && tree_output(app/sub)""#,
+                "//shallow:dist",
+            ]
+        );
+        assert_eq!(
+            compute_pkg_src_addrs("", &[]).unwrap(),
+            [
+                r#"//@heph/fs:glob@e="**/*.go,**/go.mod,**/go.sum",p=**/*"#,
+                r#"//@heph/query:query@exclude_provider=go,expr="// && label(go_src) && tree_output()""#,
+            ]
+        );
+        assert_eq!(
+            compute_embed_src_addrs("", &[]).unwrap(),
+            [
+                r#"//@heph/query:query@exclude_provider=go,expr="// && label(go_embed_src) && tree_output()""#
+            ]
+        );
+        assert_eq!(
+            compute_pkg_src_addrs("lib[x]", &[]).unwrap(),
+            [
+                r#"//@heph/fs:glob@e="**/*.go,**/go.mod,**/go.sum",p=lib\[x\]/**/*"#,
+                r#"//@heph/query:query@exclude_provider=go,expr="//lib[x]/... && label(go_src) && tree_output(lib[x])""#,
+            ]
+        );
+        assert_eq!(
+            pkg_static_embed_glob_addr("app/sub"),
+            "//@heph/fs:glob@e=**/*.go,p=app/sub/**/*"
+        );
+        assert_eq!(
+            pkg_static_embed_glob_addr(""),
+            "//@heph/fs:glob@e=**/*.go,p=**/*"
+        );
+        assert_eq!(
+            pkg_static_embed_glob_addr("lib[x]"),
+            r"//@heph/fs:glob@e=**/*.go,p=lib\[x\]/**/*"
+        );
     }
 
     #[test]
