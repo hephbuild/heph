@@ -11,6 +11,7 @@ use crate::plugingo::listed;
 use crate::plugingo::pkg_analysis::{
     GoPackage, PackageAddrs, decode_go_package, decode_package_addrs, find_module_for_import,
     is_stdlib_import_path, parse_go_mod_module_path, parse_go_mod_requires, parse_go_sum_modules,
+    path_in_prefix,
 };
 use crate::plugingo::target_bin;
 use crate::plugingo::target_golist;
@@ -3928,9 +3929,8 @@ impl ProviderInner {
         module_root: &Path,
         need_sub_imports: bool,
     ) -> anyhow::Result<(String, Option<Addr>, Vec<String>)> {
-        let is_workspace_module = !workspace_module_path.is_empty()
-            && (import_path == workspace_module_path
-                || import_path.starts_with(&format!("{}/", workspace_module_path)));
+        let is_workspace_module =
+            !workspace_module_path.is_empty() && path_in_prefix(import_path, workspace_module_path);
         if !is_workspace_module && is_stdlib_import_path(import_path) {
             let addr = encode_stdlib(import_path, vref);
             if !need_sub_imports {
@@ -3957,7 +3957,7 @@ impl ProviderInner {
             import_path,
             vref,
             module_root,
-            workspace_module_path,
+            is_workspace_module.then_some(workspace_module_path),
             go_mod_requires,
         ) {
             Some(a) => a,
@@ -3990,22 +3990,23 @@ impl ProviderInner {
     }
 
     /// Resolve an import path to a heph `build_lib` Addr.
+    ///
+    /// `workspace_module` is the workspace module's path (from go.mod) when
+    /// `import_path` lies in it, `None` otherwise — the caller has already
+    /// made that check.
     fn resolve_import_to_addr(
         &self,
         import_path: &str,
         vref: &VariantRef,
         module_root: &Path,
-        workspace_module_path: &str,
+        workspace_module: Option<&str>,
         go_mod_requires: &[(String, String)],
     ) -> Option<Addr> {
         // Check if it's a first-party import (in the workspace module).
         // We use workspace_module_path (from go.mod) rather than root_pkg.module.path
         // because root_pkg may itself be a third-party package — its sub-packages must
         // still be resolved as third-party, not mapped into the workspace.
-        if !workspace_module_path.is_empty()
-            && (import_path == workspace_module_path
-                || import_path.starts_with(&format!("{}/", workspace_module_path)))
-        {
+        if let Some(workspace_module_path) = workspace_module {
             let rel_suffix = import_path
                 .strip_prefix(workspace_module_path)
                 .and_then(|s| s.strip_prefix('/'))
@@ -4024,17 +4025,15 @@ impl ProviderInner {
         // Third-party: look up in go.mod requires
         if let Some((mod_path, version)) = find_module_for_import(import_path, go_mod_requires) {
             let subpath = import_path
-                .strip_prefix(&mod_path)
+                .strip_prefix(mod_path)
                 .and_then(|s| s.strip_prefix('/'))
-                .unwrap_or("")
-                .to_string();
+                .unwrap_or("");
             let base_pkg = module_root
                 .strip_prefix(&self.workspace_root)
                 .unwrap_or_else(|_| Path::new(""))
-                .to_string_lossy()
-                .to_string();
+                .to_string_lossy();
             return Some(encode_thirdparty(
-                &mod_path, &version, &subpath, &base_pkg, vref,
+                mod_path, version, subpath, &base_pkg, vref,
             ));
         }
 
