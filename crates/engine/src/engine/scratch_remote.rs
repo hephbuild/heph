@@ -342,20 +342,9 @@ impl Engine {
         if sources.is_empty() {
             return None;
         }
-        let mut scopes = vec![scope.to_string()];
-        scopes.extend(fallbacks.iter().cloned());
-
-        for scope in scopes {
-            let mut best: Option<RemoteHead> = None;
-            for source in &sources {
-                for head in heads_in(source, slot, &scope).await {
-                    if best.as_ref().is_none_or(|b| better(&head, b).is_lt()) {
-                        best = Some(head);
-                    }
-                }
-            }
-            if best.is_some() {
-                return best;
+        for scope in std::iter::once(scope).chain(fallbacks.iter().map(String::as_str)) {
+            if let Some(best) = best_in_scope(&sources, slot, scope).await {
+                return Some(best);
             }
         }
         None
@@ -380,14 +369,7 @@ impl Engine {
 
         let mut out = Vec::with_capacity(scopes.len());
         for scope in scopes {
-            let mut best: Option<RemoteHead> = None;
-            for source in &sources {
-                for head in heads_in(source, slot, &scope).await {
-                    if best.as_ref().is_none_or(|b| better(&head, b).is_lt()) {
-                        best = Some(head);
-                    }
-                }
-            }
+            let best = best_in_scope(&sources, slot, &scope).await;
             out.push((scope, best));
         }
         out
@@ -502,6 +484,23 @@ async fn write_all(
     tokio::io::copy_buf(src, &mut w).await?;
     tokio::io::AsyncWriteExt::shutdown(&mut w).await?;
     Ok(())
+}
+
+/// The best head in one lineage across every source, by [`better`].
+///
+/// Shared by resolution and its explanation, so the trace can never name a
+/// different head than the one a build would restore. Of equally good heads the
+/// first found wins: the earlier source, then the earlier listing entry.
+async fn best_in_scope(
+    sources: &[ScratchSource<'_>],
+    slot: &str,
+    scope: &str,
+) -> Option<RemoteHead> {
+    let mut heads = Vec::new();
+    for source in sources {
+        heads.extend(heads_in(source, slot, scope).await);
+    }
+    heads.into_iter().min_by(better)
 }
 
 /// `.meta` reads in flight at once while walking one lineage.
@@ -858,6 +857,36 @@ mod tests {
             (2..=META_READ_CONCURRENCY).contains(&peak),
             "metas are read concurrently, within the bound: peak {peak}",
         );
+    }
+
+    /// The newest generation wins, a same-generation fork goes to the fuller
+    /// cache, and an empty lineage has no head.
+    #[tokio::test]
+    async fn best_in_scope_picks_what_better_ranks_first() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let enc = |m: &SnapshotMeta| borsh::to_vec(m).expect("encode");
+        let objects = [
+            ("0000000000000004.a.meta", enc(&meta("master", 4, 900))),
+            ("0000000000000005.b.meta", enc(&meta("master", 5, 100))),
+            ("0000000000000005.c.meta", enc(&meta("master", 5, 300))),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        let set = crate::engine::remote_cache::RemoteCacheSet::with_backend(
+            std::sync::Arc::new(Lineage {
+                objects,
+                ..Lineage::default()
+            }),
+            tmp.path().to_path_buf(),
+        );
+        let sources = set.scratch_sources().await;
+
+        let best = best_in_scope(&sources, "slot", "master")
+            .await
+            .expect("a head");
+        assert!(best.stem.ends_with("0000000000000005.c"), "{}", best.stem);
+        assert!(best_in_scope(&[], "slot", "master").await.is_none());
     }
 
     fn packed_tree(root: &Path) -> Vec<u8> {
