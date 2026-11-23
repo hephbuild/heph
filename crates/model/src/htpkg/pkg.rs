@@ -75,6 +75,9 @@ impl PkgBuf {
 /// a configuration mistake.
 pub fn join_rel_checked(pkg: &str, rel: &str) -> anyhow::Result<String> {
     let joined = join_raw(pkg, rel);
+    if is_normal(&joined) {
+        return Ok(joined);
+    }
     let mut out: Vec<&str> = Vec::new();
     for c in joined.split('/') {
         match c {
@@ -95,9 +98,20 @@ pub fn join_rel_checked(pkg: &str, rel: &str) -> anyhow::Result<String> {
 /// directory-vs-file distinction to preserve), so it is trimmed after the
 /// same `..`-bounded join.
 pub fn join_rel_checked_pkg(pkg: &str, rel: &str) -> anyhow::Result<String> {
-    Ok(join_rel_checked(pkg, rel)?
-        .trim_end_matches('/')
-        .to_string())
+    let mut joined = join_rel_checked(pkg, rel)?;
+    let len = joined.trim_end_matches('/').len();
+    joined.truncate(len);
+    Ok(joined)
+}
+
+/// Whether the normalization in [`join_rel_checked`] would return `joined`
+/// unchanged: no leading slash, no empty segment but a single trailing one,
+/// and no `.` or `..` segment. The common case — an ordinary package or path —
+/// then costs no more than the join itself.
+fn is_normal(joined: &str) -> bool {
+    !joined.starts_with('/')
+        && !joined.contains("//")
+        && joined.split('/').all(|c| c != "." && c != "..")
 }
 
 /// Concatenate `pkg` and `rel` with a single separator, skipping the separator
@@ -275,6 +289,117 @@ mod tests {
     fn join_rel_checked_errors_on_escape() {
         let err = join_rel_checked("a", "../../x").unwrap_err();
         assert!(err.to_string().contains("escapes workspace root"), "{err}");
+    }
+
+    /// Pins every outcome of both joins, error text included, on inputs that
+    /// sit next to the already-normal case: an empty segment, a leading or
+    /// trailing slash, `.`/`..` as a whole segment versus inside a name.
+    #[test]
+    fn join_rel_adversarial() {
+        // (pkg, rel, join_rel_checked, join_rel_checked_pkg)
+        let cases: &[(&str, &str, &str, &str)] = &[
+            ("", "", "", ""),
+            ("", "a", "a", "a"),
+            ("a", "b", "a/b", "a/b"),
+            ("", "a//b", "a/b", "a/b"),
+            ("a", "b//c", "a/b/c", "a/b/c"),
+            ("a/", "b", "a/b", "a/b"),
+            ("", "/a", "a", "a"),
+            ("", "//a", "a", "a"),
+            ("", "a/", "a/", "a"),
+            ("", "a//", "a/", "a"),
+            ("a", "/", "a/", "a"),
+            ("", "/", "", ""),
+            ("", "./", "", ""),
+            ("", "a/./b", "a/b", "a/b"),
+            ("", "a/.", "a", "a"),
+            ("", ".", "", ""),
+            ("", "a/..", "", ""),
+            ("a", "..", "", ""),
+            ("a", "../", "", ""),
+            ("a/b", "../c/", "a/c/", "a/c"),
+            ("", "*.go/", "*.go/", "*.go"),
+            ("", "a/.b", "a/.b", "a/.b"),
+            ("", "a/..b", "a/..b", "a/..b"),
+            ("", "a/b..", "a/b..", "a/b.."),
+            ("", "a/...", "a/...", "a/..."),
+            ("", ".a/b", ".a/b", ".a/b"),
+            ("é", "ü/", "é/ü/", "é/ü"),
+            ("a", "b\u{0}c", "a/b\u{0}c", "a/b\u{0}c"),
+        ];
+        for (pkg, rel, want, want_pkg) in cases {
+            assert_eq!(
+                join_rel_checked(pkg, rel).unwrap(),
+                *want,
+                "join_rel_checked({pkg:?}, {rel:?})"
+            );
+            assert_eq!(
+                join_rel_checked_pkg(pkg, rel).unwrap(),
+                *want_pkg,
+                "join_rel_checked_pkg({pkg:?}, {rel:?})"
+            );
+        }
+
+        let escapes: &[(&str, &str, &str)] = &[
+            ("", "..", "path '..' escapes workspace root"),
+            ("", "../", "path '../' escapes workspace root"),
+            ("a", "../..", "path 'a/../..' escapes workspace root"),
+            ("", "/..", "path '/..' escapes workspace root"),
+            ("", "./..", "path './..' escapes workspace root"),
+        ];
+        for (pkg, rel, want) in escapes {
+            for got in [
+                join_rel_checked(pkg, rel).unwrap_err(),
+                join_rel_checked_pkg(pkg, rel).unwrap_err(),
+            ] {
+                assert_eq!(got.to_string(), *want, "({pkg:?}, {rel:?})");
+            }
+        }
+    }
+
+    /// The fast path must agree with the full normalization on every input:
+    /// exhaustively, every string of up to seven `a`, `.` and `/`, joined
+    /// under an empty and a non-empty package.
+    #[test]
+    fn join_rel_fast_path_agrees_with_collapse() {
+        fn reference(joined: &str) -> Option<String> {
+            let mut out: Vec<&str> = Vec::new();
+            for c in joined.split('/') {
+                match c {
+                    "" | "." => {}
+                    ".." => {
+                        out.pop()?;
+                    }
+                    other => out.push(other),
+                }
+            }
+            Some(finish(&out, joined))
+        }
+
+        let mut inputs = vec![String::new()];
+        let mut frontier = vec![String::new()];
+        for _ in 0..7 {
+            let mut next = Vec::new();
+            for s in &frontier {
+                for c in ['a', '.', '/'] {
+                    let mut t = s.clone();
+                    t.push(c);
+                    next.push(t);
+                }
+            }
+            inputs.extend(next.iter().cloned());
+            frontier = next;
+        }
+        for rel in &inputs {
+            for pkg in ["", "p"] {
+                let joined = join_raw(pkg, rel);
+                assert_eq!(
+                    join_rel_checked(pkg, rel).ok(),
+                    reference(&joined),
+                    "({pkg:?}, {rel:?})"
+                );
+            }
+        }
     }
 
     #[test]

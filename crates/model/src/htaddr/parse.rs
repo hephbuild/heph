@@ -316,4 +316,152 @@ mod tests {
             assert!(res.is_err(), "Expected error for case: {}", case);
         }
     }
+
+    fn outcome(r: anyhow::Result<Addr>) -> String {
+        match r {
+            Ok(a) => format!("ok {a} pkg={:?}", a.package.as_str()),
+            Err(e) => format!("err {e:#}"),
+        }
+    }
+
+    /// Every outcome, error text included, pinned: what `parse_addr` accepts,
+    /// what it normalizes the package to, and the exact message it rejects
+    /// with. Near-miss names, empty input, non-ASCII and control bytes, and
+    /// `.`/`..` segments in every position.
+    #[test]
+    fn parse_addr_golden() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "",
+                r#"err invalid address "": Parsing Error: Error { input: "", code: Tag }"#,
+            ),
+            (
+                "/",
+                r#"err invalid address "/": Parsing Error: Error { input: "/", code: Tag }"#,
+            ),
+            (
+                "//",
+                r#"err invalid address "//": Parsing Error: Error { input: "", code: Char }"#,
+            ),
+            (
+                "//:",
+                r#"err invalid address "//:": Parsing Error: Error { input: "", code: TakeTill1 }"#,
+            ),
+            ("//:a", r#"ok //:a pkg="""#),
+            ("//a:b", r#"ok //a:b pkg="a""#),
+            ("//a/:b", r#"ok //a:b pkg="a""#),
+            ("//a//b:c", r#"ok //a/b:c pkg="a/b""#),
+            ("///a:b", r#"ok //a:b pkg="a""#),
+            ("//a/./b:c", r#"ok //a/b:c pkg="a/b""#),
+            ("//./a:b", r#"ok //a:b pkg="a""#),
+            ("//.:a", r#"ok //:a pkg="""#),
+            (
+                "//..:a",
+                r#"err invalid address "//..:a": path '..' escapes workspace root"#,
+            ),
+            ("//a/..:b", r#"ok //:b pkg="""#),
+            (
+                "//a/../..:b",
+                r#"err invalid address "//a/../..:b": path 'a/../..' escapes workspace root"#,
+            ),
+            ("//a/b/..:c", r#"ok //a:c pkg="a""#),
+            ("//a/.b:c", r#"ok //a/.b:c pkg="a/.b""#),
+            ("//a/..b:c", r#"ok //a/..b:c pkg="a/..b""#),
+            ("//a/b.:c", r#"ok //a/b.:c pkg="a/b.""#),
+            ("//a/...:b", r#"ok //a/...:b pkg="a/...""#),
+            ("//*.go/:x", r#"ok //*.go:x pkg="*.go""#),
+            ("//a/:b@k=v", r#"ok //a:b@k=v pkg="a""#),
+            ("//é/ü:ñ", r#"ok //é/ü:ñ pkg="é/ü""#),
+            (
+                "//a:b ",
+                r#"err invalid address "//a:b ": Parsing Error: Error { input: " ", code: Eof }"#,
+            ),
+            (
+                " //a:b",
+                r#"err invalid address " //a:b": Parsing Error: Error { input: " //a:b", code: Tag }"#,
+            ),
+            (
+                "//a b:c",
+                r#"err invalid address "//a b:c": Parsing Error: Error { input: " b:c", code: Char }"#,
+            ),
+            (
+                "//a:b|c",
+                r#"err invalid address "//a:b|c": Parsing Error: Error { input: "|c", code: Eof }"#,
+            ),
+            (
+                "//a:b@",
+                r#"err invalid address "//a:b@": Parsing Error: Error { input: "@", code: Eof }"#,
+            ),
+            (
+                "//a:b@=v",
+                r#"err invalid address "//a:b@=v": Parsing Error: Error { input: "@=v", code: Eof }"#,
+            ),
+            (
+                "//a:b:c",
+                r#"err invalid address "//a:b:c": Parsing Error: Error { input: ":c", code: Eof }"#,
+            ),
+            (
+                "//a::b",
+                r#"err invalid address "//a::b": Parsing Error: Error { input: ":b", code: TakeTill1 }"#,
+            ),
+            ("//pkg:name", r#"ok //pkg:name pkg="pkg""#),
+            ("//pkg:nam", r#"ok //pkg:nam pkg="pkg""#),
+            ("//pkg:name2", r#"ok //pkg:name2 pkg="pkg""#),
+            ("//pkg/:name", r#"ok //pkg:name pkg="pkg""#),
+            ("//pkg/sub:name", r#"ok //pkg/sub:name pkg="pkg/sub""#),
+            ("//a\u{0}b:c", "ok //a\u{0}b:c pkg=\"a\\0b\""),
+            ("//a/\u{7f}:c", "ok //a/\u{7f}:c pkg=\"a/\\u{7f}\""),
+        ];
+        for (input, want) in cases {
+            assert_eq!(&outcome(parse_addr(input)), want, "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn parse_addr_with_base_golden() {
+        let base = PkgBuf::from("x/y");
+        let bare = "relative references must start with ':', './', '../', or '//'";
+        let cases: &[(&str, String)] = &[
+            ("", format!("err invalid address '': {bare}")),
+            (
+                ":",
+                r#"err invalid address "//x/y:": Parsing Error: Error { input: "", code: TakeTill1 }"#
+                    .to_string(),
+            ),
+            (":a", r#"ok //x/y:a pkg="x/y""#.to_string()),
+            ("a", format!("err invalid address 'a': {bare}")),
+            (
+                "./a",
+                "err invalid address './a': a relative path reference must name a target, e.g. './a:name'"
+                    .to_string(),
+            ),
+            ("./a:b", r#"ok //x/y/a:b pkg="x/y/a""#.to_string()),
+            ("../a:b", r#"ok //x/a:b pkg="x/a""#.to_string()),
+            ("../../a:b", r#"ok //a:b pkg="a""#.to_string()),
+            (
+                "../../../a:b",
+                "err path 'x/y/../../../a' escapes workspace root".to_string(),
+            ),
+            (".:a", format!("err invalid address '.:a': {bare}")),
+            ("..:a", format!("err invalid address '..:a': {bare}")),
+            ("./:a", r#"ok //x/y:a pkg="x/y""#.to_string()),
+            (".//a:b", r#"ok //x/y/a:b pkg="x/y/a""#.to_string()),
+            ("./a/:b", r#"ok //x/y/a:b pkg="x/y/a""#.to_string()),
+            ("./a//b:c", r#"ok //x/y/a/b:c pkg="x/y/a/b""#.to_string()),
+            ("./a/./b:c", r#"ok //x/y/a/b:c pkg="x/y/a/b""#.to_string()),
+            ("./é:ü", r#"ok //x/y/é:ü pkg="x/y/é""#.to_string()),
+            ("./*.go/:x", r#"ok //x/y/*.go:x pkg="x/y/*.go""#.to_string()),
+            (":a@k=v", r#"ok //x/y:a@k=v pkg="x/y""#.to_string()),
+            ("./a:b@k=v", r#"ok //x/y/a:b@k=v pkg="x/y/a""#.to_string()),
+            ("../..:a", r#"ok //:a pkg="""#.to_string()),
+            ("./..:a", r#"ok //x:a pkg="x""#.to_string()),
+        ];
+        for (input, want) in cases {
+            assert_eq!(
+                &outcome(parse_addr_with_base(input, &base)),
+                want,
+                "input {input:?}"
+            );
+        }
+    }
 }
