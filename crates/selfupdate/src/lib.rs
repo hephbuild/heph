@@ -325,8 +325,7 @@ mod imp {
         }
 
         let url = download_url(tag, flavour, os, arch);
-        let bytes = download_with_ui(&url, tag)?;
-        install_atomic(&dir, &dest, &bytes)?;
+        install_atomic(&dir, &dest, |w| download_with_ui(&url, tag, w))?;
         Ok(dest)
     }
 
@@ -337,14 +336,14 @@ mod imp {
     ///   upgrade is left behind.
     /// - **Non-interactive** (piped/CI logs): a single `tracing::info!` line, as
     ///   before — no cursor tricks that would garble a log file.
-    fn download_with_ui(url: &str, tag: &str) -> anyhow::Result<Vec<u8>> {
+    fn download_with_ui(url: &str, tag: &str, out: &mut (dyn Write + Send)) -> anyhow::Result<()> {
         if !std::io::stderr().is_terminal() {
             tracing::info!("downloading heph {tag}");
-            return download(url, None);
+            return download(url, out, None);
         }
         let progress = Arc::new(Progress::default());
         let spinner = spawn_spinner(tag.to_string(), Arc::clone(&progress));
-        let result = download(url, Some(Arc::clone(&progress)));
+        let result = download(url, out, Some(Arc::clone(&progress)));
         // Stop the spinner and let it wipe its line before we hand control back.
         progress.done.store(true, Ordering::SeqCst);
         drop(spinner.join());
@@ -419,11 +418,15 @@ mod imp {
         }
     }
 
-    /// Fetch `url` fully into memory, streaming so `progress` (when present) tracks
-    /// bytes as they arrive.
-    fn download(url: &str, progress: Option<Arc<Progress>>) -> anyhow::Result<Vec<u8>> {
+    /// Stream `url` into `out`, so `progress` (when present) tracks bytes as
+    /// they arrive.
+    fn download(
+        url: &str,
+        out: &mut (dyn Write + Send),
+        progress: Option<Arc<Progress>>,
+    ) -> anyhow::Result<()> {
         let mut sink = ProgressSink {
-            buf: Vec::new(),
+            out,
             progress: progress.as_deref(),
         };
         hfetch::Fetcher::default().get(url, &mut sink, |len| {
@@ -431,38 +434,46 @@ mod imp {
                 p.total.store(len, Ordering::Relaxed);
             }
         })?;
-        Ok(sink.buf)
+        Ok(())
     }
 
-    /// Collects the body, counting bytes into `progress` as they land.
+    /// Passes the body on to `out`, counting bytes into `progress` as they land.
     struct ProgressSink<'a> {
-        buf: Vec<u8>,
+        out: &'a mut (dyn Write + Send),
         progress: Option<&'a Progress>,
     }
 
     impl Write for ProgressSink<'_> {
         fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-            self.buf.extend_from_slice(data);
+            let n = self.out.write(data)?;
             if let Some(p) = self.progress {
-                p.downloaded.fetch_add(data.len() as u64, Ordering::Relaxed);
+                p.downloaded.fetch_add(n as u64, Ordering::Relaxed);
             }
-            Ok(data.len())
+            Ok(n)
         }
 
         fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
+            self.out.flush()
         }
     }
 
-    /// Write `bytes` to a temp file, mark it executable, then rename into place so
-    /// a partial download is never seen as a usable binary by a concurrent run.
-    fn install_atomic(dir: &Path, dest: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    /// Stream the binary through `write` into a temp file, mark it executable,
+    /// then rename into place so a partial download is never seen as a usable
+    /// binary by a concurrent run.
+    fn install_atomic(
+        dir: &Path,
+        dest: &Path,
+        write: impl FnOnce(&mut (dyn Write + Send)) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
         let tmp = dir.join(".heph.download");
         // `exec_into` execve's this binary moments later, so it must be written
         // with the writable-fd barrier: a thread forking during the write leaves
         // an inherited writable fd in the child until it reaches its own execve,
         // and an exec of a binary with a live writable fd fails with ETXTBSY.
-        hcore::fsutil::write_executable(&tmp, bytes)?;
+        //
+        // A failed download leaves a partial, non-executable temp file; the
+        // next attempt, under the same lock, truncates it.
+        hcore::fsutil::write_executable_with(&tmp, write)?;
         std::fs::rename(&tmp, dest)
             .with_context(|| format!("install heph to {}", dest.display()))?;
         Ok(())
@@ -527,6 +538,12 @@ mod imp {
     #[cfg(test)]
     mod tests {
         use super::{fmt_bytes, install_atomic, progress_line};
+        use std::io::Write;
+
+        fn write_script(w: &mut (dyn Write + Send)) -> anyhow::Result<()> {
+            w.write_all(b"#!/bin/sh\necho ok\n")?;
+            Ok(())
+        }
 
         /// `install_atomic` is the last step before `exec_into` replaces the
         /// process image, and its errors are fatal (`main` turns them into
@@ -539,7 +556,7 @@ mod imp {
             let dir = tempfile::tempdir().expect("tempdir");
             let dest = dir.path().join("heph");
 
-            install_atomic(dir.path(), &dest, b"#!/bin/sh\necho ok\n").expect("install");
+            install_atomic(dir.path(), &dest, write_script).expect("install");
 
             use std::os::unix::fs::PermissionsExt as _;
             let mode = std::fs::metadata(&dest).expect("stat").permissions().mode();
@@ -565,7 +582,7 @@ mod imp {
             std::fs::create_dir(&dest).expect("mkdir dest");
             std::fs::write(dest.join("child"), b"x").expect("occupy");
 
-            let err = install_atomic(dir.path(), &dest, b"#!/bin/sh\necho ok\n")
+            let err = install_atomic(dir.path(), &dest, write_script)
                 .expect_err("rename over a non-empty dir must fail");
             let msg = format!("{err:#}");
             assert!(
@@ -576,6 +593,26 @@ mod imp {
                 dest.is_dir(),
                 "a failed install must not replace what was there"
             );
+        }
+
+        /// A download that fails midway reports its own error and installs
+        /// nothing at `dest`; a retry then installs over the partial temp file.
+        #[test]
+        fn install_atomic_installs_nothing_when_the_download_fails() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let dest = dir.path().join("heph");
+
+            let err = install_atomic(dir.path(), &dest, |w| {
+                w.write_all(b"#!/bin/sh\necho trunc")?;
+                anyhow::bail!("connection reset")
+            })
+            .expect_err("the download failed");
+            assert_eq!(format!("{err:#}"), "connection reset");
+            assert!(!dest.exists(), "a failed download must install nothing");
+
+            install_atomic(dir.path(), &dest, write_script).expect("retry");
+            let out = std::process::Command::new(&dest).output().expect("exec");
+            assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
         }
 
         #[test]
