@@ -550,24 +550,28 @@ pub mod targetdef {
     /// This is how a `TargetDef` round-trips across the plugin boundary (proto /
     /// shm / wasm): the host wraps the wire blob in a `RawDefBytes`, and the
     /// driver reads it with `def_de::<ConcreteDef>()`.
+    ///
+    /// The blob is kept as the validated JSON text it arrived as: the host
+    /// never looks inside a driver's def, only carries it, so building a value
+    /// tree for it would be work nobody reads.
     pub struct RawDefBytes {
-        value: serde_json::Value,
+        json: Box<serde_json::value::RawValue>,
         cell: std::sync::OnceLock<Box<dyn Any + Send + Sync>>,
     }
 
     impl RawDefBytes {
-        /// Wrap an already-parsed JSON value.
-        pub fn from_value(value: serde_json::Value) -> Self {
-            Self {
-                value,
+        /// Wrap a JSON-encoded raw-def blob (as produced by serializing a
+        /// `RawDef`). The blob must be one well-formed JSON value.
+        pub fn from_json_slice(bytes: &[u8]) -> anyhow::Result<Self> {
+            Ok(Self {
+                json: serde_json::from_slice(bytes)?,
                 cell: std::sync::OnceLock::new(),
-            }
+            })
         }
 
-        /// Wrap a JSON-encoded raw-def blob (as produced by serializing a
-        /// `RawDef`).
-        pub fn from_json_slice(bytes: &[u8]) -> anyhow::Result<Self> {
-            Ok(Self::from_value(serde_json::from_slice(bytes)?))
+        /// The blob exactly as it arrived, for forwarding it unchanged.
+        pub fn json(&self) -> &str {
+            self.json.get()
         }
 
         fn materialize<T>(&self) -> &T
@@ -575,7 +579,12 @@ pub mod targetdef {
             T: serde::de::DeserializeOwned + Send + Sync + 'static,
         {
             let boxed = self.cell.get_or_init(|| {
-                let v: T = serde_json::from_value(self.value.clone())
+                // Through a `Value`, as the carrier deserialized before it held
+                // text: serde_json's `arbitrary_precision`, which the starlark
+                // fork enables workspace-wide, hands numbers to a type from a
+                // `Value` and from text by different paths.
+                let v: T = serde_json::from_str::<serde_json::Value>(self.json.get())
+                    .and_then(serde_json::from_value)
                     .expect("RawDefBytes: deserialize into requested raw_def type");
                 Box::new(v) as Box<dyn Any + Send + Sync>
             });
@@ -585,11 +594,16 @@ pub mod targetdef {
         }
     }
 
-    // Serialize transparently as the wrapped value, so re-serializing a
-    // round-tripped `TargetDef` yields the original blob.
+    // Serialize as the wrapped value, so re-serializing a round-tripped
+    // `TargetDef` yields the original value. It goes through a `Value` so
+    // object keys come out sorted, as they always have for a round-tripped def
+    // (`inspect def`): this is the display path. Forwarding the blob across the
+    // seam copies [`RawDefBytes::json`] instead.
     impl serde::Serialize for RawDefBytes {
         fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-            self.value.serialize(s)
+            serde_json::from_str::<serde_json::Value>(self.json.get())
+                .map_err(serde::ser::Error::custom)?
+                .serialize(s)
         }
     }
 
@@ -905,6 +919,33 @@ pub mod targetdef {
             // Re-serializing the (round-tripped) raw_def yields the original.
             let reser = serde_json::to_value(&*t.raw_def).expect("reserialize");
             assert_eq!(reser, serde_json::json!({"name": "a", "n": 7}));
+        }
+
+        #[test]
+        fn raw_def_bytes_carries_the_blob_verbatim() {
+            // Key order, whitespace and number text are the producer's own.
+            let blob = br#"{"z": 1, "a": [1.50, {"y": 2, "b": 3}]}"#;
+            let raw = RawDefBytes::from_json_slice(blob).expect("wrap");
+            assert_eq!(raw.json().as_bytes(), blob);
+        }
+
+        #[test]
+        fn raw_def_bytes_serializes_with_sorted_keys() {
+            // `inspect def` prints a round-tripped def with sorted keys, as it
+            // did when the carrier held a `Value`.
+            let raw =
+                RawDefBytes::from_json_slice(br#"{"z": 1, "a": {"y": 2, "b": 3}}"#).expect("wrap");
+            assert_eq!(
+                serde_json::to_string(&raw).expect("serialize"),
+                r#"{"a":{"b":3,"y":2},"z":1}"#
+            );
+        }
+
+        #[test]
+        fn raw_def_bytes_rejects_malformed_json() {
+            assert!(RawDefBytes::from_json_slice(b"").is_err());
+            assert!(RawDefBytes::from_json_slice(b"{\"a\":").is_err());
+            assert!(RawDefBytes::from_json_slice(b"{} {}").is_err());
         }
     }
 

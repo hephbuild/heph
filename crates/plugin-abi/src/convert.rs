@@ -2053,8 +2053,14 @@ pub fn output_artifact_from_pb(oa: pb::OutputArtifactRef) -> anyhow::Result<Outp
 /// whether a concrete value (in-process) or a round-tripped [`RawDefBytes`].
 /// `driver` is left absent: the blob is only ever read by the driver that made
 /// it, which the request already names.
+///
+/// A round-tripped def is forwarded as the bytes it arrived as: only the
+/// driver that made it reads it, so it gets back exactly what it sent.
 pub fn raw_def_to_blob(raw: &Arc<dyn RawDef>) -> anyhow::Result<pb::RawDefBlob> {
-    let data = serde_json::to_vec(&**raw).context("serializing raw_def")?;
+    let data = match RawDef::as_any(raw.as_ref()).downcast_ref::<RawDefBytes>() {
+        Some(bytes) => bytes.json().as_bytes().to_vec(),
+        None => serde_json::to_vec(&**raw).context("serializing raw_def")?,
+    };
     Ok(pb::RawDefBlob {
         format: Some(pb::raw_def_blob::Format::Json.into()),
         data: Some(data),
@@ -3340,6 +3346,21 @@ mod tests {
             raw_def_from_blob(&unformatted).is_err(),
             "format is required"
         );
+    }
+
+    /// A def that crossed the seam goes back out as the very bytes it came in
+    /// as, not a re-encoding of them.
+    #[test]
+    fn raw_def_blob_forwards_round_tripped_bytes() {
+        let data = br#"{"z": 1, "a": {"y": 2.50, "b": 3}}"#.to_vec();
+        let blob = pb::RawDefBlob {
+            format: Some(pb::raw_def_blob::Format::Json.into()),
+            data: Some(data.clone()),
+            ..Default::default()
+        };
+        let raw = raw_def_from_blob(&blob).expect("from blob");
+        let again = raw_def_to_blob(&raw).expect("to blob");
+        assert_eq!(again.data, Some(data));
     }
 
     #[test]
