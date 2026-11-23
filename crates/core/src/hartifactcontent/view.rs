@@ -235,8 +235,7 @@ impl PathTransform {
     /// An empty set is vacuously fine — there is nothing to have typo'd
     /// against, and a target with no outputs yet is not an error.
     pub fn plan(&self, sources: &[SourcePaths]) -> anyhow::Result<RenamePlan> {
-        let all: Vec<PathBuf> = sources.iter().flat_map(|s| s.paths.clone()).collect();
-        if all.is_empty() {
+        if sources.iter().all(|s| s.paths.is_empty()) {
             return Ok(RenamePlan::default());
         }
 
@@ -263,7 +262,7 @@ impl PathTransform {
                     [] => anyhow::bail!(
                         "`rename` has nothing to rename — no output survived \
                          `include`/`exclude`{}",
-                        nearest_hint(&all),
+                        nearest_hint(sources),
                     ),
                     [only] => {
                         plan.insert(only.clone(), dst.clone());
@@ -279,8 +278,11 @@ impl PathTransform {
                 }
             }
             Rename::Exact(map) => {
-                let present: std::collections::BTreeSet<String> =
-                    all.iter().map(|p| path_to_slash(p)).collect();
+                let present: std::collections::BTreeSet<String> = sources
+                    .iter()
+                    .flat_map(|s| &s.paths)
+                    .map(|p| path_to_slash(p))
+                    .collect();
                 for (key, dst) in map {
                     if !present.contains(key) {
                         anyhow::bail!(
@@ -288,7 +290,7 @@ impl PathTransform {
                              matched exactly against the paths a target emits. Use the \
                              string form (`rename = \"{dst}\"`) to place the selected \
                              output without naming its source{}",
-                            nearest_hint(&all),
+                            nearest_hint(sources),
                         );
                     }
                     plan.insert(key.clone(), dst.clone());
@@ -309,7 +311,7 @@ impl PathTransform {
             if !matched {
                 anyhow::bail!(
                     "`strip_prefix` '{sp}' matched no output path{}",
-                    nearest_hint(&all),
+                    nearest_hint(sources),
                 );
             }
         }
@@ -442,12 +444,18 @@ fn path_to_slash(p: &Path) -> String {
 /// "did you mean" tail for a miss, listing a few real paths. Cheap and only
 /// built on the error path, where the user has already lost more time than this
 /// costs.
-fn nearest_hint(paths: &[PathBuf]) -> String {
-    if paths.is_empty() {
+fn nearest_hint(sources: &[SourcePaths]) -> String {
+    let total: usize = sources.iter().map(|s| s.paths.len()).sum();
+    if total == 0 {
         return String::new();
     }
-    let sample: Vec<String> = paths.iter().take(8).map(|p| path_to_slash(p)).collect();
-    let more = paths.len().saturating_sub(sample.len());
+    let sample: Vec<String> = sources
+        .iter()
+        .flat_map(|s| &s.paths)
+        .take(8)
+        .map(|p| path_to_slash(p))
+        .collect();
+    let more = total.saturating_sub(sample.len());
     let tail = if more > 0 {
         format!(" (and {more} more)")
     } else {
@@ -585,6 +593,30 @@ impl ViewContent {
             plan,
             mapping: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Like [`new`](Self::new), with the source's paths already in hand: the
+    /// mapping is resolved from `src` now rather than from a fresh listing of
+    /// `source` later. A caller that listed every source to build the
+    /// [`RenamePlan`] passes each listing back here, so a tar-backed source is
+    /// scanned once per build rather than twice.
+    ///
+    /// `src` must be `source`'s own listing, and it fixes the view's package.
+    /// Fails exactly where [`mapping`](Self::mapping) would: on a collision.
+    pub fn with_source_paths(
+        source: std::sync::Arc<dyn Content>,
+        transform: PathTransform,
+        plan: RenamePlan,
+        src: SourcePaths,
+    ) -> anyhow::Result<Self> {
+        let mapping = transform.resolve(&src, &plan)?;
+        Ok(Self {
+            source,
+            transform,
+            package: src.package,
+            plan,
+            mapping: std::sync::OnceLock::from(mapping),
+        })
     }
 
     pub fn transform(&self) -> &PathTransform {
@@ -1609,6 +1641,99 @@ mod tests {
             scans.load(Ordering::Relaxed),
             1,
             "the source path list must be scanned once and memoized"
+        );
+    }
+
+    /// A view seeded with its source's listing answers exactly what one that
+    /// lists the source itself does: same paths, same walk, same hashout.
+    #[test]
+    fn seeded_view_matches_a_lazily_resolved_one() {
+        let entries = [("app/build/out/server", "elf"), ("app/build/out/x", "hi")];
+        let t = PathTransform {
+            strip_prefix: Some("build/out".into()),
+            prefix: Some("lib".into()),
+            ..transform()
+        };
+        let lazy = ViewContent::new(
+            source(&entries),
+            t.clone(),
+            Some("app".into()),
+            RenamePlan::default(),
+        );
+        let s = source(&entries);
+        let listing = SourcePaths::new(Some("app".into()), s.entry_paths().expect("paths"));
+        let seeded = ViewContent::with_source_paths(s, t, RenamePlan::default(), listing)
+            .expect("seeded view");
+
+        assert_eq!(seeded.mapping().unwrap(), lazy.mapping().unwrap());
+        assert_eq!(seeded.entry_paths().unwrap(), lazy.entry_paths().unwrap());
+        assert_eq!(seeded.hashout().unwrap(), lazy.hashout().unwrap());
+        let walked = |v: &ViewContent| -> Vec<PathBuf> {
+            v.walk().unwrap().map(|e| e.unwrap().path).collect()
+        };
+        assert_eq!(walked(&seeded), walked(&lazy));
+    }
+
+    /// Seeding fails where resolving lazily would, with the same message.
+    #[test]
+    fn seeded_view_reports_a_collision_like_a_lazy_one() {
+        let entries = [("a/x", ""), ("b/x", "")];
+        let t = PathTransform {
+            rename: Rename::Exact(BTreeMap::from([
+                ("a/x".to_string(), "same".to_string()),
+                ("b/x".to_string(), "same".to_string()),
+            ])),
+            ..transform()
+        };
+        let s = source(&entries);
+        let listing = SourcePaths::new(None, s.entry_paths().unwrap());
+        let plan = t.plan(std::slice::from_ref(&listing)).unwrap();
+        let lazy = ViewContent::new(source(&entries), t.clone(), None, plan.clone());
+        let lazy = format!("{:#}", lazy.mapping().expect_err("lazy collides"));
+        let Err(seeded) = ViewContent::with_source_paths(s, t, plan, listing) else {
+            panic!("seeded view must collide too");
+        };
+        assert!(lazy.contains("path collision"), "{lazy}");
+        assert_eq!(format!("{seeded:#}"), lazy);
+    }
+
+    /// The "did you mean" tail samples the first eight paths across every
+    /// source, in source order, and counts the rest across all of them.
+    #[test]
+    fn nearest_hint_samples_across_sources() {
+        let t = PathTransform {
+            strip_prefix: Some("nope".into()),
+            ..transform()
+        };
+        let sources = [
+            src(None, &["a1", "a2", "a3", "a4", "a5"]),
+            src(None, &[]),
+            src(None, &["b1", "b2", "b3", "b4", "b5"]),
+        ];
+        let err = t.plan(&sources).expect_err("strip_prefix matches nothing");
+        assert_eq!(
+            format!("{err:#}"),
+            "`strip_prefix` 'nope' matched no output path. Available paths: \
+             a1, a2, a3, a4, a5, b1, b2, b3 (and 2 more)"
+        );
+
+        let t = PathTransform {
+            rename: Rename::Sole("x".into()),
+            include: vec!["zzz".into()],
+            ..transform()
+        };
+        let err = t
+            .plan(&[src(None, &["a"]), src(None, &["b"])])
+            .expect_err("nothing survives");
+        assert_eq!(
+            format!("{err:#}"),
+            "`rename` has nothing to rename — no output survived `include`/`exclude`. \
+             Available paths: a, b"
+        );
+        assert_eq!(
+            t.plan(&[src(None, &[]), src(None, &[])]).unwrap(),
+            RenamePlan::default(),
+            "no paths at all is vacuously fine"
         );
     }
 
