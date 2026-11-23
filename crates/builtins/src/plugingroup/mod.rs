@@ -177,18 +177,9 @@ impl hplugin::driver::Driver for Driver {
         let relocating = !transform.is_identity();
         if relocating {
             use std::hash::Hash as _;
-            struct Fold<'a>(&'a mut Xxh3);
-            impl std::hash::Hasher for Fold<'_> {
-                fn write(&mut self, bytes: &[u8]) {
-                    self.0.update(bytes);
-                }
-                fn finish(&self) -> u64 {
-                    self.0.digest()
-                }
-            }
             h.update(b"\0group-transform-v1\0");
-            let mut fold = Fold(&mut h);
-            transform.hash(&mut fold);
+            // `Xxh3` is a `Hasher` whose `write` is `update`.
+            transform.hash(&mut h);
         }
         let hash = format!("{:016x}", h.digest()).into_bytes();
 
@@ -667,6 +658,30 @@ mod tests {
         assert_ne!(base, lib, "adding a transform must change the def hash");
         assert_ne!(lib, bin, "changing a transform must change the def hash");
         assert_eq!(lib, lib_again, "the same transform must hash stably");
+    }
+
+    /// A relocating group's def hash as a literal: it reaches every consumer's
+    /// `hashin`, so how the transform is fed to the hasher must never move it.
+    #[tokio::test]
+    async fn relocating_group_hash_is_pinned() {
+        let def = parse_group(&[
+            (
+                "include",
+                Value::List(vec![Value::String("**/*.so".into())]),
+            ),
+            ("exclude", Value::List(vec![Value::String("**/x".into())])),
+            ("strip_prefix", Value::String("build/out".into())),
+            ("prefix", Value::String("lib".into())),
+            (
+                "rename",
+                Value::Map(HashMap::from([(
+                    "a".to_string(),
+                    Value::String("b".into()),
+                )])),
+            ),
+        ])
+        .await;
+        assert_eq!(String::from_utf8(def.hash).unwrap(), "d02b4a33dfa1a4f0");
     }
 
     /// `rename` is a dict, so its iteration order is not stable; the def hash
