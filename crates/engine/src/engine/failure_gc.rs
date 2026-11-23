@@ -28,6 +28,7 @@
 use crate::engine::Engine;
 use crate::engine::error::TargetNotFoundError;
 use crate::engine::failure_slot::{TEMP_PREFIX, addr_key, read_any_manifest};
+use crate::engine::gc::bounded_join;
 use crate::engine::request_state::RequestState;
 use hcore::hmemoizer::downcast_chain_ref;
 use hmodel::htaddr::{Addr, parse_addr};
@@ -35,7 +36,6 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::task::JoinSet;
 
 /// How old litter (a `.tmp-` directory, a slot without a valid manifest) must
 /// be before the sweep removes it. A fill builds its slot in a `.tmp-`
@@ -151,50 +151,44 @@ impl Engine {
         }
         let resolve_rs = self.sweep_resolve_state(rs);
 
-        let limit = self.max_workers.max(1);
-        let mut set: JoinSet<(Slot, Verdict)> = JoinSet::new();
-        let mut fold = |joined: Option<Result<(Slot, Verdict), tokio::task::JoinError>>| {
-            match joined {
-                Some(Ok((slot, Verdict::Dead))) => dead.push(slot),
-                Some(Ok((_, Verdict::Live))) => kept += 1,
-                Some(Ok((_, Verdict::Unknown))) => {
+        bounded_join(
+            slots,
+            self.max_workers,
+            |slot| {
+                let engine = Arc::clone(&self);
+                let rrs = Arc::clone(&resolve_rs);
+                async move {
+                    let verdict = match engine.get_spec(rrs, &slot.addr).await {
+                        Ok(_) => Verdict::Live,
+                        Err(e) if downcast_chain_ref::<TargetNotFoundError>(&e).is_some() => {
+                            Verdict::Dead
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                addr = %slot.addr,
+                                error = %format!("{e:#}"),
+                                "gc: resolving a failure slot's target failed, keeping it",
+                            );
+                            Verdict::Unknown
+                        }
+                    };
+                    (slot, verdict)
+                }
+            },
+            |joined| match joined {
+                Ok((slot, Verdict::Dead)) => dead.push(slot),
+                Ok((_, Verdict::Live)) => kept += 1,
+                Ok((_, Verdict::Unknown)) => {
                     kept += 1;
                     errored += 1;
                 }
-                Some(Err(e)) => {
+                Err(e) => {
                     tracing::warn!(error = %e, "gc: failure slot resolve task panicked, keeping it");
                     errored += 1;
                 }
-                None => {}
-            }
-        };
-        for slot in slots {
-            while set.len() >= limit {
-                fold(set.join_next().await);
-            }
-            let engine = Arc::clone(&self);
-            let rrs = Arc::clone(&resolve_rs);
-            set.spawn(async move {
-                let verdict = match engine.get_spec(rrs, &slot.addr).await {
-                    Ok(_) => Verdict::Live,
-                    Err(e) if downcast_chain_ref::<TargetNotFoundError>(&e).is_some() => {
-                        Verdict::Dead
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            addr = %slot.addr,
-                            error = %format!("{e:#}"),
-                            "gc: resolving a failure slot's target failed, keeping it",
-                        );
-                        Verdict::Unknown
-                    }
-                };
-                (slot, verdict)
-            });
-        }
-        while !set.is_empty() {
-            fold(set.join_next().await);
-        }
+            },
+        )
+        .await;
         (dead, kept, errored)
     }
 
