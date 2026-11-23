@@ -1341,11 +1341,13 @@ fn process_batch(conn: &mut Connection, batch: &mut [WriterCmd]) -> Result<()> {
     for cmd in batch.iter_mut() {
         match cmd {
             WriterCmd::Write(job) => {
-                tx.execute(
+                tx.prepare_cached(
                     "INSERT OR REPLACE INTO artifacts (addr, hashin, name, data) \
                      VALUES (?1, ?2, ?3, zeroblob(?4))",
-                    rusqlite::params![job.key.0, job.key.1, job.key.2, job.size],
                 )
+                .and_then(|mut stmt| {
+                    stmt.execute(rusqlite::params![job.key.0, job.key.1, job.key.2, job.size])
+                })
                 .with_context(|| {
                     format!(
                         "inserting artifact {addr}/{hashin}/{name}",
@@ -1365,18 +1367,18 @@ fn process_batch(conn: &mut Connection, batch: &mut [WriterCmd]) -> Result<()> {
                     .with_context(|| format!("writing blob for {}", job.key.2))?;
             }
             WriterCmd::Delete(job) => {
-                tx.execute(
-                    "DELETE FROM artifacts WHERE addr=?1 AND hashin=?2 AND name=?3",
-                    rusqlite::params![job.key.0, job.key.1, job.key.2],
-                )
-                .with_context(|| {
-                    format!(
-                        "deleting artifact {addr}/{hashin}/{name}",
-                        addr = job.key.0,
-                        hashin = job.key.1,
-                        name = job.key.2
-                    )
-                })?;
+                tx.prepare_cached("DELETE FROM artifacts WHERE addr=?1 AND hashin=?2 AND name=?3")
+                    .and_then(|mut stmt| {
+                        stmt.execute(rusqlite::params![job.key.0, job.key.1, job.key.2])
+                    })
+                    .with_context(|| {
+                        format!(
+                            "deleting artifact {addr}/{hashin}/{name}",
+                            addr = job.key.0,
+                            hashin = job.key.1,
+                            name = job.key.2
+                        )
+                    })?;
             }
             // `collect_batch` never puts one in a batch.
             WriterCmd::Maintain(_) => {}
