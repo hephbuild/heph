@@ -817,6 +817,16 @@ pub struct RequestState {
     tracked: Mutex<FxHashSet<AddrKey>>,
 }
 
+/// Sets `flag`, returning `true` to exactly one caller: the one that set it.
+///
+/// Loads before it swaps, so once the flag is up every later call — one per
+/// edge, from every worker — is a shared read rather than an exclusive write
+/// bouncing the cache line between cores.
+fn once(flag: &std::sync::atomic::AtomicBool) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    !flag.load(Relaxed) && !flag.swap(true, Relaxed)
+}
+
 impl RequestState {
     pub fn request_id(&self) -> &String {
         &self.data.request_id
@@ -1169,11 +1179,7 @@ impl RequestState {
         scratch_disabled: bool,
         pools: impl FnOnce() -> PoolAnnouncement,
     ) {
-        if !self
-            .data
-            .workers_announced
-            .swap(true, std::sync::atomic::Ordering::Relaxed)
-        {
+        if once(&self.data.workers_announced) {
             let pools = pools();
             self.emit(crate::engine::event::BuildEventKind::RequestConfig {
                 max_workers: count,
@@ -1190,10 +1196,7 @@ impl RequestState {
     /// top-level call); every later call — including inner `result`s sharing
     /// this request's data — gets `false` and must not emit `Matched`.
     pub fn claim_matched_stream(&self) -> bool {
-        !self
-            .data
-            .matched_announced
-            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        once(&self.data.matched_announced)
     }
 
     /// Hands a cloned sender to `emit_scope`'s drop-guard.
@@ -1685,6 +1688,22 @@ mod tests {
 
     fn addr(name: &str) -> Addr {
         Addr::new(PkgBuf::from("pkg"), name.to_string(), Default::default())
+    }
+
+    /// However many workers race on a once-flag, exactly one claims it.
+    #[test]
+    fn once_flag_is_claimed_exactly_once() {
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        let claims = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..16).map(|_| s.spawn(|| once(&flag))).collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("worker panicked"))
+                .filter(|claimed| *claimed)
+                .count()
+        });
+        assert_eq!(claims, 1);
+        assert!(!once(&flag), "a set flag is never claimed again");
     }
 
     /// A node's index in the DAG's parallel vectors, for white-box assertions.
