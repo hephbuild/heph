@@ -472,7 +472,7 @@ pub struct CachedWalker {
     /// durable store at all (disabled, bypassing).
     store_path: Option<PathBuf>,
     /// The durable store, once opened. Holds `None` when the open failed: the
-    /// walker then degrades to re-reading from disk for the rest of its life,
+    /// walker then degrades to its in-process front for the rest of its life,
     /// exactly as an eager open failure did.
     store: std::sync::OnceLock<Option<FsWalkStore>>,
     /// In-process front for directory listings, validated against the live
@@ -509,8 +509,8 @@ impl CachedWalker {
 
     /// The walker backed by the sqlite db at `db_path`, opened (or created) on
     /// first use — a command that never walks a tree never opens it. On any
-    /// db-open failure the walker still works — it just degrades to always
-    /// re-reading from disk (no cross-run cache).
+    /// db-open failure the walker still works — it just degrades to its
+    /// in-process front, as [`Self::disabled`] (no cross-run cache).
     pub fn open(db_path: &Path) -> Self {
         if cache_bypassed() {
             tracing::warn!(
@@ -635,8 +635,10 @@ impl CachedWalker {
         let listing = Arc::new(read_dir_uncached(dir)?);
         if !settled(&key, clock) {
             log_racy_skip(dir, "dir", &key, clock);
-        } else if let Some(store) = self.store() {
-            if let Ok(blob) = borsh::to_vec(&*listing) {
+        } else {
+            if let Some(store) = self.store()
+                && let Ok(blob) = borsh::to_vec(&*listing)
+            {
                 store.put_dir(dir, &key, &blob, now_ns());
             }
             self.dirs
@@ -693,8 +695,10 @@ impl CachedWalker {
         let fh = Arc::new(FileHash::new(&st, file_hashout(file, st.exec)?));
         if !settled(&key, clock) {
             log_racy_skip(file, "file", &key, clock);
-        } else if let Some(store) = self.store() {
-            store.put_file(file, &fh, now_ns());
+        } else {
+            if let Some(store) = self.store() {
+                store.put_file(file, &fh, now_ns());
+            }
             self.files.lock().insert(file.to_path_buf(), fh.clone());
         }
         Ok(fh)
@@ -1998,6 +2002,102 @@ mod tests {
         let w = CachedWalker::disabled();
         let l = w.read_dir(&tmp.path().join("d")).unwrap();
         assert_eq!(l.entries.len(), 1);
+    }
+
+    /// A disabled walker whose stat is the real one except for the ctime,
+    /// which reads `ctime` (see [`pinned_ctime_walker`]), and whose clock
+    /// reads `clock()`.
+    fn disabled_pinned_walker(
+        ctime: &Arc<AtomicI64>,
+        clock: impl Fn() -> i64 + Send + Sync + 'static,
+    ) -> CachedWalker {
+        let ctime = Arc::clone(ctime);
+        CachedWalker::disabled()
+            .with_clock(clock)
+            .with_stat(move |p| {
+                let mut st = stat_path(p)?;
+                if let Some(key) = &mut st.key {
+                    key.ctime_ns = ctime.load(Ordering::Relaxed);
+                }
+                Ok(st)
+            })
+    }
+
+    /// Rewrite `f` with `body`, and add `extra` to `pkg`, leaving every
+    /// stat key the walker sees as it was: the mtimes are set back to
+    /// [`old_mtime`] and the ctime is pinned by the caller.
+    fn rewrite_behind_the_key(pkg: &Path, f: &Path, body: &[u8], extra: &str) {
+        std::fs::write(f, body).unwrap();
+        std::fs::write(pkg.join(extra), b"").unwrap();
+        set_mtime(f, old_mtime());
+        set_mtime(pkg, old_mtime());
+    }
+
+    /// A walker with no durable store still keeps a settled read in its
+    /// in-process front: with every key unchanged, the second read is the
+    /// first one's result, not a fresh read of the disk.
+    #[test]
+    fn disabled_walker_serves_a_settled_read_from_its_front() {
+        let tmp = tempdir().unwrap();
+        let pkg = tmp.path().join("pkg");
+        std::fs::create_dir(&pkg).unwrap();
+        let f = pkg.join("f");
+        std::fs::write(&f, b"aaaa").unwrap();
+        set_mtime(&f, old_mtime());
+        set_mtime(&pkg, old_mtime());
+        let ctime = Arc::new(AtomicI64::new(1));
+        let w = disabled_pinned_walker(&ctime, || now_ns() + 3_600_000_000_000);
+        assert_eq!(names(&w.read_dir(&pkg).unwrap()), ["f"]);
+        assert_eq!(
+            w.file_hash(&f).unwrap().hashout,
+            bytes_hashout(b"aaaa", false)
+        );
+
+        rewrite_behind_the_key(&pkg, &f, b"bbbb", "g");
+        assert_eq!(names(&w.read_dir(&pkg).unwrap()), ["f"], "from the front");
+        assert_eq!(
+            w.file_hash(&f).unwrap().hashout,
+            bytes_hashout(b"aaaa", false),
+            "from the front"
+        );
+
+        // A moved key is still a miss.
+        ctime.store(2, Ordering::Relaxed);
+        assert_eq!(names(&w.read_dir(&pkg).unwrap()), ["f", "g"]);
+        assert_eq!(
+            w.file_hash(&f).unwrap().hashout,
+            bytes_hashout(b"bbbb", false)
+        );
+    }
+
+    /// A read that is not settled is not kept in a disabled walker's front
+    /// either: with every key unchanged, the next read goes to the disk.
+    #[test]
+    fn disabled_walker_does_not_keep_a_racy_read() {
+        let tmp = tempdir().unwrap();
+        let pkg = tmp.path().join("pkg");
+        std::fs::create_dir(&pkg).unwrap();
+        let f = pkg.join("f");
+        std::fs::write(&f, b"aaaa").unwrap();
+        set_mtime(&f, old_mtime());
+        set_mtime(&pkg, old_mtime());
+        let ctime = Arc::new(AtomicI64::new(1));
+        // The clock sits at the mtime: every read is inside the racy window.
+        let mtime_ns =
+            i64::try_from(old_mtime().duration_since(UNIX_EPOCH).unwrap().as_nanos()).unwrap();
+        let w = disabled_pinned_walker(&ctime, move || mtime_ns);
+        assert_eq!(names(&w.read_dir(&pkg).unwrap()), ["f"]);
+        assert_eq!(
+            w.file_hash(&f).unwrap().hashout,
+            bytes_hashout(b"aaaa", false)
+        );
+
+        rewrite_behind_the_key(&pkg, &f, b"bbbb", "g");
+        assert_eq!(names(&w.read_dir(&pkg).unwrap()), ["f", "g"]);
+        assert_eq!(
+            w.file_hash(&f).unwrap().hashout,
+            bytes_hashout(b"bbbb", false)
+        );
     }
 
     #[test]
