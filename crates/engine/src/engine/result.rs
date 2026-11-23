@@ -6461,10 +6461,12 @@ fn rewrite_query_inputs(
     dest: &Addr,
     dest_provider: &str,
 ) -> crate::engine::driver::targetdef::TargetDef {
-    let origin = dest.hash_str();
+    // Hashed on the first query input: almost no target has one.
+    let mut origin: Option<String> = None;
     for input in &mut def.inputs {
         let r = &input.r#ref.r#ref;
         if r.package.as_str() == hplugin_query::pluginquery::PACKAGE {
+            let origin = origin.get_or_insert_with(|| dest.hash_str());
             let mut args = r.args.clone();
             args.insert("_origin".to_string(), origin.clone());
             if !dest_provider.is_empty() && !args.contains_key("exclude_provider") {
