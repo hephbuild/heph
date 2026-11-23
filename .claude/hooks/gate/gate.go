@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"maps"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -37,19 +39,84 @@ const sleepReason = "Blocked: foreground `sleep %s`. Don't poll.\n" +
 	"Waiting on CI: `gh run watch <run-id> --exit-status` with run_in_background — the session is woken when it exits.\n" +
 	"Waiting on a local process: run it with run_in_background, or use Monitor with an until-loop."
 
+const unknownDirReason = "Blocked: this push runs in a directory the gate cannot work out, so it cannot check that `lint` passed there — " +
+	"a `cd` or `-C` it cannot read (an expansion, `~`, `cd -`, a flag, a bare `cd`); `pushd`, `eval`, `source` or `env -C`; " +
+	"`GIT_DIR`, `GIT_WORK_TREE`, `source` or `eval` anywhere before the push, which no later `cd` or `-C` undoes; a function named after a command the gate reads (`git`, `cd`, `env`, …); a `cd` inside a loop or a function, or as the last command of a pipe; a push inside a function body; " +
+	"or a step whose failure, or success, reaches the push from another directory (`git fetch && cd <abs>; git push`).\n" +
+	"Name the checkout as a literal absolute path: `git -C <abs> push ...`, or `cd <abs> && gh stack submit ...`. " +
+	"If an earlier `GIT_DIR`, `GIT_WORK_TREE`, `source`, `eval` or redefined command is the cause, that is not enough: run the push as its own command.\n" +
+	"If this push should go out unlinted, re-run as `HEPH_PUSH_UNLINTED=1 git push ...`."
+
+const deadPushReason = "Blocked: this push comes after an `exit` or `return` on every path, so it never runs, and the gate cannot say which checkout it would push from.\n" +
+	"Drop it, or move it before the `exit`.\n" +
+	"If this push should go out unlinted, re-run as `HEPH_PUSH_UNLINTED=1 git push ...`."
+
+const unreadablePushReason = "Blocked: the gate cannot read %s, and it mentions a push, so it cannot check that `lint` passed in the checkout that push runs in.\n" +
+	"Write the push as a plain command with the checkout as a literal absolute path: `git -C <abs> push ...`, or `cd <abs> && gh stack submit ...`.\n" +
+	"If this push should go out unlinted, re-run as `HEPH_PUSH_UNLINTED=1 git push ...`."
+
 // Wrappers that run their arguments as a command. The value is how many
 // arguments of their own they take before the command starts.
 var wrappers = map[string]int{
 	"command": 0, "exec": 0, "nohup": 0, "nice": 0, "env": 0, "timeout": 1,
 }
 
+// wrapperValueFlags are the wrappers' options whose value is the next
+// argument. env's short options are read as a cluster (envCluster).
+var wrapperValueFlags = map[string]map[string]bool{
+	"env":     {"--chdir": true, "--unset": true, "--split-string": true, "--argv0": true},
+	"nice":    {"-n": true, "--adjustment": true},
+	"timeout": {"-s": true, "--signal": true, "-k": true, "--kill-after": true},
+}
+
 // gate is what a check needs besides the command itself.
 type gate struct {
 	background bool
-	// unlinted says why HEAD should not be pushed yet, or "" when `lint`
-	// passed on exactly HEAD's tree. Called only for a command that pushes;
-	// nil allows every push.
-	unlinted func() string
+	// cwd is the directory the command starts in: the session's.
+	cwd string
+	// unlinted says why HEAD of the checkout at dir should not be pushed yet,
+	// or "" when `lint` passed there on exactly HEAD's tree. Called only for a
+	// command that pushes, with the checkout it pushes from (workdir.go), and
+	// elsewhere set when that is not cwd; nil allows every push.
+	unlinted func(dir string, elsewhere bool) string
+	// checkoutUnknown is set once the command line may have pointed git at a
+	// repository the gate cannot name, or redefined a command the gate reads
+	// (a function named `git` or `cd`; workdir.go). Unlike a directory, no
+	// later `cd` or `-C` clears it: a push after it is refused wherever it
+	// runs.
+	checkoutUnknown bool
+	// env is the environment a nested command line inherits from the command
+	// that runs it (`bash -c`, `eval`): its opt-ins hold inside. nil at the
+	// top.
+	env map[string]string
+}
+
+// commandEnv is the environment a command runs with, as far as the gate reads
+// it: what its command line inherited, then its prefix assignments.
+func commandEnv(g gate, assigns []*syntax.Assign) map[string]string {
+	env := make(map[string]string, len(g.env)+len(assigns))
+	maps.Copy(env, g.env)
+	for _, a := range assigns {
+		if a.Name != nil {
+			env[a.Name.Value] = literal(a.Value)
+		}
+	}
+	return env
+}
+
+// nested is the gate, and the directory it starts in, for a command line run
+// from dir by a command whose environment is env: it sees env's opt-ins, a
+// repository variable in env holds for all of it, and it starts in an
+// unknown directory when that variable is set or the command was moved
+// (chdir: `env -C`).
+func (g gate) nested(env map[string]string, chdir bool, dir wd) (gate, wd) {
+	g.env = env
+	repo := namesRepo(env)
+	g.checkoutUnknown = g.checkoutUnknown || repo
+	if (chdir || repo) && dir.state != dead {
+		dir = unknownWD
+	}
+	return g, dir
 }
 
 func parse(cmd string) (*syntax.File, error) {
@@ -67,53 +134,51 @@ func literals(call *syntax.CallExpr) []string {
 
 // check returns why cmd is refused, or "" to allow it.
 func check(cmd string, g gate) string {
-	file, err := parse(cmd)
-	if err != nil {
-		return ""
-	}
-	reason := ""
-	syntax.Walk(file, func(node syntax.Node) bool {
-		if reason != "" {
-			return false
-		}
-		// Every command sits in a Stmt, which also holds its redirections —
-		// where a `python3 - <<'PY'` script lives.
-		if stmt, ok := node.(*syntax.Stmt); ok {
-			if call, ok := stmt.Cmd.(*syntax.CallExpr); ok {
-				reason = checkCall(call, stmt.Redirs, g)
-			}
-		}
-		return true
-	})
-	return reason
+	return checkIn(cmd, at(g.cwd), g)
 }
 
-func checkCall(call *syntax.CallExpr, redirs []*syntax.Redirect, g gate) string {
-	optIns := map[string]bool{}
-	for _, a := range call.Assigns {
-		if a.Name != nil && literal(a.Value) == "1" {
-			optIns[a.Name.Value] = true
+// checkIn checks cmd started in dir: every command it runs, each in the
+// directory it runs in (workdir.go).
+func checkIn(cmd string, dir wd, g gate) string {
+	file, err := parse(cmd)
+	if err != nil {
+		// Nothing in it can be followed. A push in it would go unchecked, so
+		// text that mentions one is refused; the rest is let through, as the
+		// gate cannot say what it runs.
+		if g.unlinted != nil && mentionsPush(cmd) && !strings.Contains(cmd, unlintedOptIn+"=1") && g.env[unlintedOptIn] != "1" {
+			return fmt.Sprintf(unreadablePushReason, fmt.Sprintf("this command — the bash parser cannot parse it (%v)", err))
 		}
+		return ""
 	}
+	w := walker{g: g}
+	w.list(file.Stmts, dir)
+	return w.reason
+}
 
-	args := unwrap(literals(call), optIns)
+// checkCall checks one command. Its Stmt's redirections come with it: that is
+// where a `python3 - <<'PY'` script lives.
+func checkCall(call *syntax.CallExpr, redirs []*syntax.Redirect, dir wd, g gate) string {
+	// The command's environment: what it inherited, its prefix assignments,
+	// then env's.
+	env := commandEnv(g, call.Assigns)
+	args, chdir := unwrap(literals(call), env)
 	if len(args) == 0 {
 		return ""
 	}
 
 	switch args[0] {
 	case "tst":
-		if !optIns[optIn] {
+		if env[optIn] != "1" {
 			return tstReason
 		}
 	case "cargo":
 		// `tst` spelled out: its body run by hand is the same full suite, and
 		// must not be the way around the opt-in.
-		if wholeWorkspaceTest(args) && !optIns[optIn] {
+		if wholeWorkspaceTest(args) && env[optIn] != "1" {
 			return cargoTestReason
 		}
 	case "e2e":
-		if !optIns[optIn] {
+		if env[optIn] != "1" {
 			return e2eReason
 		}
 	case "sleep":
@@ -123,18 +188,30 @@ func checkCall(call *syntax.CallExpr, redirs []*syntax.Redirect, g gate) string 
 			}
 		}
 	case "git", "gh":
-		if pushes(args) && !optIns[unlintedOptIn] && g.unlinted != nil {
-			return g.unlinted()
+		if pushes(args) && env[unlintedOptIn] != "1" && g.unlinted != nil {
+			from := pushDir(args, dir)
+			switch {
+			case from.state == dead:
+				return deadPushReason
+			case chdir, g.checkoutUnknown, namesRepo(env):
+				from = unknownWD
+			}
+			if from.state != known {
+				return unknownDirReason
+			}
+			return g.unlinted(from.dir, filepath.Clean(from.dir) != filepath.Clean(g.cwd))
 		}
 	case "sed", "perl", "python", "python3":
-		if scriptedEdit(args, redirs) && !optIns[editOptIn] {
+		if scriptedEdit(args, redirs) && env[editOptIn] != "1" {
 			return editReason
 		}
 	case "bash", "sh", "zsh":
-		// `bash -c '<script>'` runs the script: check it as a command line.
+		// `bash -c '<script>'` runs the script: check it as a command line,
+		// run with this command's environment and from where it runs.
 		for i, a := range args[:len(args)-1] {
 			if a == "-c" || (strings.HasPrefix(a, "-") && strings.HasSuffix(a, "c") && !strings.HasPrefix(a, "--")) {
-				return check(args[i+1], g)
+				ng, start := g.nested(env, chdir, dir)
+				return checkIn(args[i+1], start, ng)
 			}
 		}
 	}
@@ -148,14 +225,7 @@ func checkCall(call *syntax.CallExpr, redirs []*syntax.Redirect, g gate) string 
 func pushes(args []string) bool {
 	switch args[0] {
 	case "git":
-		// Skip git's global options; -C and -c take a value.
-		i := 1
-		for i < len(args) && strings.HasPrefix(args[i], "-") {
-			if args[i] == "-C" || args[i] == "-c" {
-				i++
-			}
-			i++
-		}
+		i := parseGit(args).sub
 		if i >= len(args) || args[i] != "push" {
 			return false
 		}
@@ -217,26 +287,46 @@ func wholeWorkspaceTest(args []string) bool {
 }
 
 // unwrap strips wrappers that still run the command after them — `timeout
-// 600 tst`, `env X=1 tst`, `devenv shell -- e2e` — collecting opt-in
-// assignments given to env on the way.
-func unwrap(args []string, optIns map[string]bool) []string {
+// 600 tst`, `env X=1 tst`, `devenv shell -- e2e` — collecting the assignments
+// given to env into env (when it is not nil) on the way. chdir is set when
+// env may run the command elsewhere: `env -C <dir>`, or `env -S <string>`,
+// whose string can hold a -C of its own.
+func unwrap(args []string, env map[string]string) (rest []string, chdir bool) {
 	for len(args) > 0 {
 		// `command -v tst` / `command -V tst` only look the name up.
 		if args[0] == "command" && len(args) > 1 && (args[1] == "-v" || args[1] == "-V") {
-			return nil
+			return nil, chdir
 		}
 		if n, ok := wrappers[args[0]]; ok {
+			valueFlags := wrapperValueFlags[args[0]]
+			isEnv := args[0] == "env"
 			args = args[1:]
 			for len(args) > 0 && strings.HasPrefix(args[0], "-") {
+				opt := args[0]
 				args = args[1:]
+				if isEnv && !strings.HasPrefix(opt, "--") {
+					next, elsewhere := envCluster(opt)
+					chdir = chdir || elsewhere
+					if next && len(args) > 0 {
+						args = args[1:]
+					}
+					continue
+				}
+				flag, _, inline := strings.Cut(opt, "=")
+				if isEnv && (flag == "--chdir" || flag == "--split-string") {
+					chdir = true
+				}
+				if valueFlags[flag] && !inline && len(args) > 0 {
+					args = args[1:]
+				}
 			}
 			if len(args) < n {
-				return nil
+				return nil, chdir
 			}
 			args = args[n:]
 			for len(args) > 0 && strings.Contains(args[0], "=") {
-				if name, value, _ := strings.Cut(args[0], "="); value == "1" {
-					optIns[name] = true
+				if name, value, _ := strings.Cut(args[0], "="); env != nil {
+					env[name] = value
 				}
 				args = args[1:]
 			}
@@ -251,7 +341,23 @@ func unwrap(args []string, optIns map[string]bool) []string {
 		}
 		break
 	}
-	return args
+	return args, chdir
+}
+
+// envCluster reads a cluster of env's short options: `-i`, `-iC <dir>`,
+// `-iC<dir>`, `-u X`. The first option that takes a value takes the rest of
+// the cluster, or the next argument when nothing is left (next). elsewhere is
+// set when the cluster holds a C or an S anywhere — `-C`, or `-S`, whose
+// string can hold a -C — as the gate does not tell an option from a value
+// inside one (`-uC` unsets C, and is still read as a move).
+func envCluster(opt string) (next, elsewhere bool) {
+	elsewhere = strings.ContainsAny(opt[1:], "CS")
+	for i := 1; i < len(opt); i++ {
+		if strings.IndexByte("CSua", opt[i]) >= 0 {
+			return i == len(opt)-1, elsewhere
+		}
+	}
+	return false, elsewhere
 }
 
 // literal returns a word's value when it is fixed text — bare, 'single' or

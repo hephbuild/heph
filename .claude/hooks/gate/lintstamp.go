@@ -31,8 +31,14 @@ const unlintedReason = "Blocked: %s.\n" +
 	"rustfmt prints `Diff in`, not `error`), commit, then push. A `lint` run through the Bash tool records the tree it passed on.\n" +
 	"If this push should go out unlinted (a WIP branch nobody reviews yet), re-run as `HEPH_PUSH_UNLINTED=1 git push ...`."
 
+const unreadableReason = "Blocked: git cannot read the checkout at %s, which this push runs in (%v), so the gate cannot check that `lint` passed there.\n" +
+	"Check the path: `git -C <abs> push ...` with <abs> the checkout's absolute path.\n" +
+	"If this push should go out unlinted, re-run as `HEPH_PUSH_UNLINTED=1 git push ...`."
+
 // lintWrapper is the command that replaces a `lint` word: this program, in
-// lint mode, told the directory the shell is in when it gets there.
+// lint mode, told the directory the shell is in when it gets there. "$PWD" is
+// expanded by the shell at that point, so `cd <worktree> && lint` stamps the
+// worktree, not the session's checkout.
 func lintWrapper(gateDir string) string {
 	return "env GOTOOLCHAIN=local GOWORK=off go run -C " + shQuote(gateDir) + ` . lint "$PWD"`
 }
@@ -54,7 +60,7 @@ func stampLint(cmd, wrapper string) string {
 	syntax.Walk(file, func(node syntax.Node) bool {
 		if call, ok := node.(*syntax.CallExpr); ok {
 			args := literals(call)
-			rest := unwrap(args, map[string]bool{})
+			rest, _ := unwrap(args, nil)
 			if len(rest) > 0 && rest[0] == "lint" {
 				words = append(words, call.Args[len(args)-len(rest)])
 			}
@@ -143,30 +149,39 @@ func writeStamp(gitDir, tree string) error {
 }
 
 // lintStamp says why HEAD in dir should not be pushed yet, or "" when the last
-// passing `lint` there checked exactly HEAD's tree. Anything git cannot answer
-// — not a repository, no commits — allows.
-func lintStamp(dir string) string {
+// passing `lint` there checked exactly HEAD's tree. Anything it cannot answer
+// — not a repository, no commits, an unreadable stamp — allows in the session's
+// own cwd, and refuses in a directory the command moved to (elsewhere): that
+// one the agent chose, and `cd /typo; git push` must not pass because /typo is
+// not a repository.
+func lintStamp(dir string, elsewhere bool) string {
 	if dir == "" {
 		dir = "."
 	}
+	cannot := func(err error) string {
+		if !elsewhere {
+			return ""
+		}
+		return fmt.Sprintf(unreadableReason, dir, err)
+	}
 	gitDir, err := git(dir, nil, "rev-parse", "--absolute-git-dir")
 	if err != nil {
-		return ""
+		return cannot(err)
 	}
 	head, err := git(dir, nil, "rev-parse", "HEAD^{tree}")
 	if err != nil {
-		return ""
+		return cannot(err)
 	}
 	stamp, err := os.ReadFile(filepath.Join(gitDir, lintStampFile))
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
-		return fmt.Sprintf(unlintedReason, "`lint` has not passed in this checkout")
+		return fmt.Sprintf(unlintedReason, "`lint` has not passed in the checkout at "+dir)
 	case err != nil:
-		return ""
+		return cannot(err)
 	case strings.TrimSpace(string(stamp)) == head:
 		return ""
 	}
-	return fmt.Sprintf(unlintedReason, "HEAD is not the tree `lint` last passed on — something was committed or edited after it ran")
+	return fmt.Sprintf(unlintedReason, "HEAD of the checkout at "+dir+" is not the tree `lint` last passed on — something was committed or edited after it ran")
 }
 
 // git runs git in dir with env (nil: inherit) and returns its trimmed stdout.
