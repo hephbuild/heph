@@ -6,16 +6,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
-use async_trait::async_trait;
 use hxstarlark_fmt::{Config, Reformat};
 
 use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
+use crate::commands::progress_app::run_engine_command;
 use crate::commands::utils::package_matcher_or_all;
-use crate::engine::{Engine, get_root};
-use crate::htmatcher::Matcher;
+use crate::engine::get_root;
 use crate::pluginbuildfile::{FormatSettings, build_files_in_dir};
-use crate::tui::{self, App, AppContext, LogSink};
+use crate::tui::LogSink;
 
 /// Points at the cached targets that apply the same rule (docs/BUILDFILE_CHECKS.md).
 const AFTER_HELP: &str = "\
@@ -84,95 +83,6 @@ fn format_stdin() -> anyhow::Result<()> {
     Ok(())
 }
 
-struct BuildFmtApp {
-    engine: Arc<Engine>,
-    matcher: Matcher,
-    root: PathBuf,
-    check: bool,
-    fail_fast: bool,
-}
-
-#[async_trait]
-impl App for BuildFmtApp {
-    type Output = ();
-    type TuiView = crate::tui::TuiProgressView;
-    type CiView = crate::tui::CiProgressView;
-
-    fn tui_view(&self) -> Self::TuiView {
-        crate::tui::TuiProgressView::new("Formatting BUILD files".to_string())
-    }
-
-    fn ci_view(&self) -> Self::CiView {
-        crate::tui::CiProgressView::new("Formatting BUILD files".to_string())
-    }
-
-    async fn run(self, ctx: AppContext) -> anyhow::Result<()> {
-        let rs = self
-            .engine
-            .new_state_with_events(self.fail_fast, ctx.event_sender());
-
-        let res: anyhow::Result<()> = async {
-            let packages: Vec<String> = Arc::clone(&self.engine)
-                .packages(&self.matcher, &rs)
-                .await?;
-
-            // The workspace's configured BUILD-file patterns (literal names like
-            // `BUILD` and globs like `*.BUILD`) and indent width, so every file
-            // the buildfile provider treats as a BUILD file is covered and
-            // formatted as the workspace configures.
-            let settings = FormatSettings::resolve(Some(&self.root));
-            let cfg = Config {
-                indent_size: settings.indent,
-            };
-
-            // A package may have several matching files; dedup across packages.
-            let mut build_files: BTreeSet<PathBuf> = BTreeSet::new();
-            for pkg in &packages {
-                let dir = self.root.join(pkg);
-                build_files.extend(build_files_in_dir(&dir, &settings.patterns));
-            }
-
-            let mut changed = 0usize;
-            let mut formatted = 0usize;
-
-            for path in &build_files {
-                let label = file_label(&self.root, path);
-                let src = std::fs::read_to_string(path)
-                    .with_context(|| format!("reading {}", path.display()))?;
-
-                let Some(out_text) = decide(&path.to_string_lossy(), &src, cfg)? else {
-                    continue;
-                };
-
-                if self.check {
-                    tracing::warn!("{label} is not formatted");
-                    changed += 1;
-                } else {
-                    std::fs::write(path, &out_text)
-                        .with_context(|| format!("writing {}", path.display()))?;
-                    tracing::info!("formatted {label}");
-                    formatted += 1;
-                }
-            }
-
-            if self.check {
-                if changed > 0 {
-                    return Err(anyhow::anyhow!("{changed} BUILD file(s) need formatting"));
-                }
-                tracing::info!("all BUILD files are formatted");
-            } else if formatted == 0 {
-                tracing::info!("all BUILD files already formatted");
-            } else {
-                tracing::info!("formatted {formatted} BUILD file(s)");
-            }
-            Ok(())
-        }
-        .await;
-
-        crate::commands::errors::finalize!(ctx, rs, res)
-    }
-}
-
 /// What `build-fmt` does with one file whose source is `src`: the formatted
 /// bytes to write (and, under `--check`, the file to report), or `None` to
 /// leave it. The rule the `build-format-check` target applies too: a
@@ -201,22 +111,72 @@ async fn execute_async(
 ) -> anyhow::Result<()> {
     let root = get_root()?;
     let matcher = package_matcher_or_all(args.matcher.as_deref())?;
-    let (engine, shutdown) = bootstrap::new_engine(&global, session)?;
-    let app = BuildFmtApp {
-        engine,
-        matcher,
-        root,
-        check: args.check,
-        fail_fast: global.fail_fast,
-    };
-    let interactive = tui::should_use_tui(global.no_tui);
-    tui::run_app_with(
-        app,
+    let check = args.check;
+    run_engine_command(
+        "Formatting BUILD files",
         sink,
         session,
-        interactive,
+        &global,
         args.dashboard.dashboard,
-        shutdown,
+        move |engine, rs, ctx| async move {
+            let res: anyhow::Result<()> = async {
+                let packages: Vec<String> = Arc::clone(&engine).packages(&matcher, &rs).await?;
+
+                // The workspace's configured BUILD-file patterns (literal names like
+                // `BUILD` and globs like `*.BUILD`) and indent width, so every file
+                // the buildfile provider treats as a BUILD file is covered and
+                // formatted as the workspace configures.
+                let settings = FormatSettings::resolve(Some(&root));
+                let cfg = Config {
+                    indent_size: settings.indent,
+                };
+
+                // A package may have several matching files; dedup across packages.
+                let mut build_files: BTreeSet<PathBuf> = BTreeSet::new();
+                for pkg in &packages {
+                    let dir = root.join(pkg);
+                    build_files.extend(build_files_in_dir(&dir, &settings.patterns));
+                }
+
+                let mut changed = 0usize;
+                let mut formatted = 0usize;
+
+                for path in &build_files {
+                    let label = file_label(&root, path);
+                    let src = std::fs::read_to_string(path)
+                        .with_context(|| format!("reading {}", path.display()))?;
+
+                    let Some(out_text) = decide(&path.to_string_lossy(), &src, cfg)? else {
+                        continue;
+                    };
+
+                    if check {
+                        tracing::warn!("{label} is not formatted");
+                        changed += 1;
+                    } else {
+                        std::fs::write(path, &out_text)
+                            .with_context(|| format!("writing {}", path.display()))?;
+                        tracing::info!("formatted {label}");
+                        formatted += 1;
+                    }
+                }
+
+                if check {
+                    if changed > 0 {
+                        return Err(anyhow::anyhow!("{changed} BUILD file(s) need formatting"));
+                    }
+                    tracing::info!("all BUILD files are formatted");
+                } else if formatted == 0 {
+                    tracing::info!("all BUILD files already formatted");
+                } else {
+                    tracing::info!("formatted {formatted} BUILD file(s)");
+                }
+                Ok(())
+            }
+            .await;
+
+            crate::commands::errors::finalize!(ctx, rs, res)
+        },
     )
     .await
 }

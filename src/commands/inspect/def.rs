@@ -67,7 +67,6 @@ async fn execute_async(
         sink,
         session,
         &global,
-        global.no_tui,
         args.dashboard.dashboard,
         move |engine, rs, ctx| async move {
             // `get_def` may run provider targets, recording rich failures in `rs`;

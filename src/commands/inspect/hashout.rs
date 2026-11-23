@@ -43,7 +43,6 @@ async fn execute_async(
         sink,
         session,
         &global,
-        global.no_tui,
         args.dashboard.dashboard,
         move |engine, rs, ctx| async move {
             // `result_addr` runs the target; rich failures land in `rs`. `finalize`

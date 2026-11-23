@@ -174,7 +174,6 @@ async fn execute_async(
         sink,
         session,
         &global,
-        global.no_tui,
         args.dashboard.dashboard,
         move |engine, rs, ctx| async move {
             // Probing runs BUILD evaluation, which records rich failures in `rs`;

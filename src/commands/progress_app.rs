@@ -85,11 +85,28 @@ where
     F: FnOnce(AppContext) -> Fut + Send + 'static,
     Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
 {
+    let interactive = tui::should_use_tui(no_tui);
+    run_progress_app(label, sink, session, interactive, dashboard, shutdown, body).await
+}
+
+/// [`run_with_progress`] with the TUI decision already made: `interactive`.
+async fn run_progress_app<F, Fut>(
+    label: impl Into<String>,
+    sink: LogSink,
+    session: &Arc<SessionSlot>,
+    interactive: bool,
+    dashboard: bool,
+    shutdown: hcore::shutdown::ShutdownTrigger,
+    body: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce(AppContext) -> Fut + Send + 'static,
+    Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
+{
     let app = ProgressApp {
         label: label.into(),
         body,
     };
-    let interactive = tui::should_use_tui(no_tui);
     tui::run_app_with(app, sink, session, interactive, dashboard, shutdown).await
 }
 
@@ -97,14 +114,13 @@ where
 /// [`run_with_progress`]. `body` gets the engine and a request on it from
 /// [`engine_request`]; the exit code is the body's.
 ///
-/// `no_tui` is the command's, which is `global.no_tui` unless the command
-/// turns the TUI off itself (`--json`). `dashboard` is its `-D`.
+/// The terminal and `--no-tui` (`global.no_tui`) decide the TUI. `dashboard`
+/// is the command's `-D`.
 pub(crate) async fn run_engine_command<F, Fut>(
     label: impl Into<String>,
     sink: LogSink,
     session: &Arc<SessionSlot>,
     global: &GlobalOptions,
-    no_tui: bool,
     dashboard: bool,
     body: F,
 ) -> anyhow::Result<()>
@@ -112,13 +128,111 @@ where
     F: FnOnce(Arc<Engine>, Arc<RequestState>, AppContext) -> Fut + Send + 'static,
     Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
 {
-    let (engine, shutdown) = bootstrap::new_engine(global, session)?;
-    let fail_fast = global.fail_fast;
-    run_with_progress(
+    let no_tui = global.no_tui;
+    engine_command(
         label,
         sink,
         session,
-        no_tui,
+        global,
+        dashboard,
+        move || tui::should_use_tui(no_tui),
+        body,
+    )
+    .await
+}
+
+/// [`run_engine_command`] for a command whose `--json` (`json`) keeps the TUI
+/// off. The terminal and `--no-tui` decide first, as for every other command,
+/// and that decision is the `interactive` telemetry records; `json` overrides
+/// it after.
+pub(crate) async fn run_engine_command_json<F, Fut>(
+    label: impl Into<String>,
+    sink: LogSink,
+    session: &Arc<SessionSlot>,
+    global: &GlobalOptions,
+    json: bool,
+    dashboard: bool,
+    body: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce(Arc<Engine>, Arc<RequestState>, AppContext) -> Fut + Send + 'static,
+    Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    let no_tui = global.no_tui;
+    engine_command(
+        label,
+        sink,
+        session,
+        global,
+        dashboard,
+        unless_json(move || tui::should_use_tui(no_tui), json),
+        body,
+    )
+    .await
+}
+
+/// The TUI decision of a command with `--json`: `decide` runs first, always,
+/// so what it records is the terminal's answer; `json` turns the TUI off after.
+fn unless_json(decide: impl FnOnce() -> bool, json: bool) -> impl FnOnce() -> bool {
+    move || decide() && !json
+}
+
+/// The engine, then the TUI decision (`interactive`, made once the engine is
+/// up), then `body` under [`run_progress_app`].
+async fn engine_command<F, Fut>(
+    label: impl Into<String>,
+    sink: LogSink,
+    session: &Arc<SessionSlot>,
+    global: &GlobalOptions,
+    dashboard: bool,
+    interactive: impl FnOnce() -> bool,
+    body: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce(Arc<Engine>, Arc<RequestState>, AppContext) -> Fut + Send + 'static,
+    Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    let engine = bootstrap::new_engine(global, session)?;
+    engine_command_on(
+        engine,
+        label,
+        sink,
+        session,
+        global,
+        dashboard,
+        interactive,
+        body,
+    )
+    .await
+}
+
+/// [`engine_command`] past building the engine: the seam a test drives with an
+/// engine of its own, since `bootstrap::new_engine` reads the workspace the
+/// process's cwd is in.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "engine_command's arguments plus the engine it built"
+)]
+async fn engine_command_on<F, Fut>(
+    (engine, shutdown): (Arc<Engine>, hcore::shutdown::ShutdownTrigger),
+    label: impl Into<String>,
+    sink: LogSink,
+    session: &Arc<SessionSlot>,
+    global: &GlobalOptions,
+    dashboard: bool,
+    interactive: impl FnOnce() -> bool,
+    body: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce(Arc<Engine>, Arc<RequestState>, AppContext) -> Fut + Send + 'static,
+    Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    let fail_fast = global.fail_fast;
+    run_progress_app(
+        label,
+        sink,
+        session,
+        interactive(),
         dashboard,
         shutdown,
         move |ctx| {
@@ -191,29 +305,60 @@ mod tests {
     /// An engine command's request is fail-fast exactly when the command line
     /// says so — not always, as [`request_state`]'s is — so `--fail-fast`
     /// (and its absence) reaches `inspect`, `query` and the rest unchanged.
+    ///
+    /// And `--json` turns the TUI off without hiding the terminal's answer:
+    /// the decision runs, and records, before `json` overrides it. A terminal
+    /// that says yes is only simulated with `json` set, since without it the
+    /// test would start the real TUI.
     #[tokio::test]
-    async fn engine_request_takes_fail_fast_from_the_command_line() -> anyhow::Result<()> {
+    async fn engine_command_takes_fail_fast_and_json_from_the_command_line() -> anyhow::Result<()> {
+        use std::sync::OnceLock;
+
         let root = tempfile::tempdir()?;
         let engine = Arc::new(Engine::new(crate::engine::Config::for_tests(root.path()))?);
-        for fail_fast in [false, true] {
+        for (fail_fast, json) in [(false, false), (true, false), (false, true), (true, true)] {
             let session = Arc::new(SessionSlot::new());
             let sink = LogSink::new_direct_with(Arc::clone(&session));
             let (shutdown, _rx) = hcore::shutdown::ShutdownTrigger::new();
-            let engine = Arc::clone(&engine);
-            run_with_progress(
+            let global = GlobalOptions {
+                fail_fast,
+                ..GlobalOptions::default()
+            };
+            let terminal = json;
+            let recorded = OnceLock::new();
+            let decide = || {
+                recorded.set(terminal).expect("the TUI is decided once");
+                terminal
+            };
+            let seen = Arc::new(OnceLock::new());
+            let body_seen = Arc::clone(&seen);
+            engine_command_on(
+                (Arc::clone(&engine), shutdown),
                 "t",
                 sink,
                 &session,
-                true,
+                &global,
                 false,
-                shutdown,
-                move |ctx| async move {
-                    let rs = engine_request(&engine, fail_fast, &ctx);
-                    assert_eq!(rs.fail_fast(), fail_fast);
+                unless_json(decide, json),
+                move |_engine, rs, ctx| async move {
+                    body_seen
+                        .set((rs.fail_fast(), ctx.interactive()))
+                        .expect("the body runs once");
                     Ok(())
                 },
             )
             .await?;
+            let case = format!("fail_fast={fail_fast} json={json}");
+            assert_eq!(
+                seen.get(),
+                Some(&(fail_fast, false)),
+                "{case}: (request fail_fast, interactive app)"
+            );
+            assert_eq!(
+                recorded.get(),
+                Some(&terminal),
+                "{case}: the decision before --json"
+            );
         }
         Ok(())
     }
