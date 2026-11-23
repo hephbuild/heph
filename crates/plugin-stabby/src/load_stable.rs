@@ -13,9 +13,9 @@ use crate::abi::{
     StablePluginFunctionsDyn, StableProviderDyn,
 };
 use crate::host::HostExecutor;
+use crate::seam::encode_svec;
 use crate::vtable::dynify;
 use async_trait::async_trait;
-use buffa::Message;
 use futures::future::BoxFuture;
 use hcore::hasync::Cancellable;
 use hdriver_support::driver_managed::{
@@ -39,10 +39,6 @@ use plugin_abi::pb::frame::Body;
 use plugin_abi::{convert, pb};
 use stabby::vec::Vec as SVec;
 use std::sync::Arc;
-
-fn sv(bytes: &[u8]) -> SVec<u8> {
-    SVec::from(bytes)
-}
 
 /// Wrap the engine executor for the seam, choosing the spawn mode explicitly.
 ///
@@ -311,7 +307,7 @@ pub fn load(
     let name = cfg.name.as_str();
     // The create config crosses as protobuf bytes so its fields are additive;
     // the options ride it as structured values (no nested encode).
-    let cfg = convert::create_config_to_pb(cfg).encode_to_vec();
+    let cfg = encode_svec(&convert::create_config_to_pb(cfg));
 
     // SAFETY: loading a plugin dylib runs its initializers; the path is operator-
     // controlled config. The ABI of what we call is checked below via get_stabbied.
@@ -374,7 +370,7 @@ pub fn load(
         // This instance's registry handle: resolved through this engine's slot,
         // on this engine's runtime.
         create(
-            sv(&cfg),
+            cfg,
             crate::host::HostFunctionRegistry::wrap(functions, runtime),
         )
     };
@@ -728,15 +724,18 @@ impl Provider for StableRemoteProvider {
                 package: Some(req.package.as_str().to_string()),
                 states: req.states.iter().map(convert::state_to_pb).collect(),
                 ..Default::default()
-            }
-            .encode_to_vec();
+            };
             // Server-streaming **with** the executor, so the plugin's `list` can
             // call back (e.g. the go module variant universe via `states_under`).
             // Items still stream lazily across the seam.
             let exec: DynExecutor = wrap_executor(&req.executor);
             let stream = self
                 .inner
-                .invoke_exec_server_stream(pb::ProviderMethod::List as u32, sv(&pb_req), exec)
+                .invoke_exec_server_stream(
+                    pb::ProviderMethod::List as u32,
+                    encode_svec(&pb_req),
+                    exec,
+                )
                 .await;
             Ok(Box::new(ItemStreamIter {
                 stream,
@@ -761,11 +760,13 @@ impl Provider for StableRemoteProvider {
             let pb_req = pb::ListPackagesRequest {
                 prefix: Some(req.prefix.as_str().to_string()),
                 ..Default::default()
-            }
-            .encode_to_vec();
+            };
             let stream = self
                 .inner
-                .invoke_server_stream(pb::ProviderMethod::ListPackages as u32, sv(&pb_req))
+                .invoke_server_stream(
+                    pb::ProviderMethod::ListPackages as u32,
+                    encode_svec(&pb_req),
+                )
                 .await;
             Ok(Box::new(ItemStreamIter {
                 stream,
@@ -789,12 +790,11 @@ impl Provider for StableRemoteProvider {
                 addr: convert::addr_to_pb(&req.addr).into(),
                 states: req.states.iter().map(convert::state_to_pb).collect(),
                 ..Default::default()
-            }
-            .encode_to_vec();
+            };
             let exec: DynExecutor = wrap_executor(&req.executor);
-            let fut = self
-                .inner
-                .invoke_exec(pb::ProviderMethod::Get as u32, sv(&pb_req), exec);
+            let fut =
+                self.inner
+                    .invoke_exec(pb::ProviderMethod::Get as u32, encode_svec(&pb_req), exec);
             let bytes =
                 await_with_cancel(ct, provider_cancel(&self.inner, &req.request_id), fut).await;
             let body = decode_unary(&bytes).map_err(GetError::Other)?;
@@ -843,11 +843,10 @@ impl Provider for StableRemoteProvider {
                 request_id: Some(req.request_id),
                 package: Some(req.package.as_str().to_string()),
                 ..Default::default()
-            }
-            .encode_to_vec();
+            };
             let fut = self
                 .inner
-                .invoke(pb::ProviderMethod::Probe as u32, sv(&pb_req));
+                .invoke(pb::ProviderMethod::Probe as u32, encode_svec(&pb_req));
             let bytes = await_with_cancel(ct, provider_cancel(&self.inner, &request_id), fut).await;
             match decode_unary(&bytes)? {
                 Body::ProbeResp(pr) => Ok(ProbeResponse {
@@ -888,14 +887,13 @@ impl PluginFn for StableRemoteFn {
             // The host merges declarations into the package being evaluated.
             accepts_declarations: Some(true),
             ..Default::default()
-        }
-        .encode_to_vec();
+        };
         let bytes = self
             .handle
             .invoke(
                 pb::FunctionMethod::Call as u32,
                 self.name.as_str().into(),
-                sv(&pb_req),
+                encode_svec(&pb_req),
             )
             .await;
         match decode_unary(&bytes)? {
@@ -1035,11 +1033,10 @@ impl ManagedDriver for StableRemoteManagedDriver {
             target_spec: convert::target_spec_to_pb(req.target_spec.as_ref()).into(),
             driver: Some(self.name.clone()),
             ..Default::default()
-        }
-        .encode_to_vec();
+        };
         let fut = self
             .inner
-            .invoke(pb::DriverMethod::Parse as u32, sv(&pb_req));
+            .invoke(pb::DriverMethod::Parse as u32, encode_svec(&pb_req));
         let bytes = await_with_cancel(ct, driver_cancel(&self.inner, &request_id), fut).await;
         match decode_unary(&bytes)? {
             Body::ParseResp(pr) => Ok(ParseResponse {
@@ -1065,11 +1062,11 @@ impl ManagedDriver for StableRemoteManagedDriver {
             sandbox: convert::sandbox_to_pb(&req.sandbox).into(),
             driver: Some(self.name.clone()),
             ..Default::default()
-        }
-        .encode_to_vec();
-        let fut = self
-            .inner
-            .invoke(pb::DriverMethod::ApplyTransitive as u32, sv(&pb_req));
+        };
+        let fut = self.inner.invoke(
+            pb::DriverMethod::ApplyTransitive as u32,
+            encode_svec(&pb_req),
+        );
         let bytes = await_with_cancel(ct, driver_cancel(&self.inner, &request_id), fut).await;
         match decode_unary(&bytes)? {
             Body::ApplyTransitiveResp(r) => Ok(ApplyTransitiveResponse {
@@ -1189,16 +1186,15 @@ impl StableRemoteManagedDriver {
         };
         // `run` is bidi: the request stream carries the run request (RunInFrame),
         // the response stream carries the result (RunOutFrame). `shell` rides pmrr.
-        let in_frame = pb::RunInFrame {
+        let in_frame = encode_svec(&pb::RunInFrame {
             msg: Some(pb::run_in_frame::Msg::from(pmrr)),
             ..Default::default()
-        }
-        .encode_to_vec();
+        });
         // The request stream is live (N11): `in_tx` is held until the run's
         // terminal frame has been read — by the relay below, or by this frame
         // for a run that has none — and only its drop ends the stream. A plugin
         // never waits for that end before answering.
-        let (in_tx, in_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (in_tx, in_rx) = std::sync::mpsc::channel::<SVec<u8>>();
         {
             use anyhow::Context as _;
             in_tx
@@ -1308,11 +1304,10 @@ impl StableRemoteManagedDriver {
                     }
                     else => break,
                 };
-                let frame = pb::RunInFrame {
+                let frame = encode_svec(&pb::RunInFrame {
                     msg: Some(msg),
                     ..Default::default()
-                }
-                .encode_to_vec();
+                });
                 // The plugin dropped its end: nothing more is read.
                 if in_tx.send(frame).is_err() {
                     break;
@@ -1360,21 +1355,18 @@ impl StableRemoteManagedDriver {
 /// pulls it on a blocking thread, so the blocking `recv` is sound (mirrors how the
 /// guest drains run output on a blocking task).
 struct HostChannelItemStream {
-    rx: std::sync::Mutex<std::sync::mpsc::Receiver<Vec<u8>>>,
+    rx: std::sync::Mutex<std::sync::mpsc::Receiver<SVec<u8>>>,
 }
 
 impl StableItemStream for HostChannelItemStream {
     extern "C" fn next(&self) -> SVec<u8> {
         let rx = self.rx.lock().unwrap_or_else(|e| e.into_inner());
         // `Err` == every sender dropped (stream closed cleanly) => empty SVec.
-        match rx.recv() {
-            Ok(b) => SVec::from(b.as_slice()),
-            Err(_) => SVec::new(),
-        }
+        rx.recv().unwrap_or_default()
     }
 }
 
-fn host_channel_item_stream(rx: std::sync::mpsc::Receiver<Vec<u8>>) -> DynItemStream {
+fn host_channel_item_stream(rx: std::sync::mpsc::Receiver<SVec<u8>>) -> DynItemStream {
     dynify(stabby::boxed::Box::new(HostChannelItemStream {
         rx: std::sync::Mutex::new(rx),
     }))
@@ -1382,17 +1374,16 @@ fn host_channel_item_stream(rx: std::sync::mpsc::Receiver<Vec<u8>>) -> DynItemSt
 
 /// One build event, framed as the envelope `StreamItem` carrying its serde-JSON
 /// bytes (the wire form a hook plugin pulls and deserializes).
-fn event_frame(ev: &hcore::events::BuildEvent) -> Vec<u8> {
+fn event_frame(ev: &hcore::events::BuildEvent) -> SVec<u8> {
     let item = serde_json::to_vec(ev).unwrap_or_default();
-    pb::Frame {
+    encode_svec(&pb::Frame {
         id: Some(0),
         body: Some(Body::from(pb::StreamItem {
             item: Some(item),
             ..Default::default()
         })),
         ..Default::default()
-    }
-    .encode_to_vec()
+    })
 }
 
 /// Lazily-opened state for a remote hook's event stream.
@@ -1400,7 +1391,7 @@ fn event_frame(ev: &hcore::events::BuildEvent) -> Vec<u8> {
 struct HookStreamState {
     started: bool,
     /// Pushes event frames to the in-flight client-stream; `None` once closed.
-    tx: Option<std::sync::mpsc::Sender<Vec<u8>>>,
+    tx: Option<std::sync::mpsc::Sender<SVec<u8>>>,
     /// The task driving the plugin's `invoke_client_stream` to its ack.
     join: Option<tokio::task::JoinHandle<()>>,
 }
@@ -1459,7 +1450,7 @@ impl Hook for StableRemoteHook {
             // Open the client-stream once: the host pushes frames into `tx`, the
             // plugin pulls them and acks when the stream closes. Spawned because
             // the call runs for the whole request, concurrent with event flow.
-            let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+            let (tx, rx) = std::sync::mpsc::channel::<SVec<u8>>();
             let stream = host_channel_item_stream(rx);
             let inner = Arc::clone(&self.inner);
             let join = tokio::spawn(async move {
@@ -1542,6 +1533,7 @@ fn managed_input_to_pb(mi: &ManagedRunInput) -> pb::ManagedRunInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use buffa::Message;
 
     fn refusal(reported: Option<&str>) -> String {
         let path = std::path::Path::new("/p/libdrift.so");

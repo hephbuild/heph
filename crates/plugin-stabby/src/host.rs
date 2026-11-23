@@ -7,10 +7,9 @@ use crate::abi::{
     StableExecutor, StableFunctionRegistry, StableLogSink, StableRead, StableRunnerHost,
     StableSupervisor, StatesOutcome,
 };
-use crate::seam::panic_text;
+use crate::seam::{encode_svec, panic_text};
 use crate::vtable::dynify;
 use anyhow::Context;
-use buffa::Message;
 use hcore::hartifactcontent::Content;
 use hmodel::htaddr::Addr;
 use hmodel::htpkg::PkgBuf;
@@ -172,15 +171,11 @@ impl StableSupervisor for HostSupervisor {
 
 /// Encode a unary `pb::Frame` reply carrying `body`.
 fn unary(body: Body) -> SVec<u8> {
-    SVec::from(
-        pb::Frame {
-            id: Some(0),
-            body: Some(body),
-            ..Default::default()
-        }
-        .encode_to_vec()
-        .as_slice(),
-    )
+    encode_svec(&pb::Frame {
+        id: Some(0),
+        body: Some(body),
+        ..Default::default()
+    })
 }
 
 fn err_body(message: String) -> Body {
@@ -698,7 +693,7 @@ impl StableExecutor for HostExecutor {
                     message: SString::new(),
                     states: states
                         .iter()
-                        .map(|s| SVec::from(convert::state_to_pb(s).encode_to_vec().as_slice()))
+                        .map(|s| encode_svec(&convert::state_to_pb(s)))
                         .collect(),
                 },
                 Err(e) => StatesOutcome {

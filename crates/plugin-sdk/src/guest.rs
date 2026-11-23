@@ -3,7 +3,6 @@
 //! are direct stabby vtable dispatch into the host, no serialization.
 
 use anyhow::{Context, Result};
-use buffa::Message;
 use futures::future::BoxFuture;
 use hcore::hartifactcontent::{Content, WalkEntry};
 use hmodel::htaddr::Addr;
@@ -15,6 +14,7 @@ use hplugin_stabby::abi::{
     DynArtifact, DynExecutor, DynRead, StableAddr, StableArtifactContentDyn, StableExecutorDyn,
     StableReadDyn,
 };
+use hplugin_stabby::seam::encode_svec;
 use std::io::Read;
 use std::sync::Arc;
 
@@ -98,13 +98,10 @@ impl ProviderExecutor for GuestExecutor {
         extra_skip: &'a [String],
     ) -> BoxFuture<'a, Result<Vec<Addr>>> {
         Box::pin(async move {
-            let matcher_pb = plugin_abi::convert::matcher_to_pb(m).encode_to_vec();
+            let matcher_pb = encode_svec(&plugin_abi::convert::matcher_to_pb(m));
             let skip: stabby::vec::Vec<stabby::string::String> =
                 extra_skip.iter().map(|s| s.clone().into()).collect();
-            let r = self
-                .exec
-                .query(stabby::vec::Vec::from(matcher_pb.as_slice()), skip)
-                .await;
+            let r = self.exec.query(matcher_pb, skip).await;
             if r.ok {
                 let mut out = Vec::with_capacity(r.addrs.len());
                 for a in r.addrs.iter() {

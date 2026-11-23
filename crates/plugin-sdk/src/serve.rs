@@ -29,7 +29,7 @@ use hplugin_stabby::abi::{
     StableCancel, StableFunctionRegistryDyn, StableHook, StableItemStream, StableItemStreamDyn,
     StableManagedDriver, StableMeta, StablePluginFunctions, StableProvider,
 };
-use hplugin_stabby::seam::panic_text;
+use hplugin_stabby::seam::{encode_svec, panic_text};
 use hplugin_stabby::vtable::dynify;
 use plugin_abi::convert;
 use plugin_abi::convert::{absent_not_empty, required, required_msg};
@@ -197,17 +197,16 @@ fn decode_req<M: buffa::Message>(bytes: &[u8], what: &str) -> Result<M> {
 }
 
 fn unary(body: Body) -> SVec<u8> {
-    SVec::from(frame_bytes(body).as_slice())
+    frame_bytes(body)
 }
 
 /// Encode one `pb::Frame` carrying `body` (one frame per stream `next`).
-fn frame_bytes(body: Body) -> Vec<u8> {
-    pb::Frame {
+fn frame_bytes(body: Body) -> SVec<u8> {
+    encode_svec(&pb::Frame {
         id: Some(0),
         body: Some(body),
         ..Default::default()
-    }
-    .encode_to_vec()
+    })
 }
 
 fn wire_error(kind: pb::error::Kind, message: String) -> pb::Error {
@@ -223,21 +222,18 @@ fn wire_error(kind: pb::error::Kind, message: String) -> pb::Error {
 /// like [`HostRead`]) so the handle is `Send + Sync`, since list results flow into
 /// the host engine, which requires `Send`.
 struct GuestItemStream {
-    frames: std::sync::Mutex<Box<dyn Iterator<Item = Vec<u8>> + Send>>,
+    frames: std::sync::Mutex<Box<dyn Iterator<Item = SVec<u8>> + Send>>,
 }
 
 impl StableItemStream for GuestItemStream {
     extern "C" fn next(&self) -> SVec<u8> {
         let mut frames = self.frames.lock().unwrap_or_else(|e| e.into_inner());
         // Empty == stream exhausted; otherwise one encoded `pb::Frame`.
-        match frames.next() {
-            Some(bytes) => SVec::from(bytes.as_slice()),
-            None => SVec::new(),
-        }
+        frames.next().unwrap_or_default()
     }
 }
 
-fn make_item_stream(frames: Box<dyn Iterator<Item = Vec<u8>> + Send>) -> DynItemStream {
+fn make_item_stream(frames: Box<dyn Iterator<Item = SVec<u8>> + Send>) -> DynItemStream {
     dynify(stabby::boxed::Box::new(GuestItemStream {
         frames: std::sync::Mutex::new(frames),
     }))
@@ -249,7 +245,7 @@ fn make_item_stream(frames: Box<dyn Iterator<Item = Vec<u8>> + Send>) -> DynItem
 fn frame_iter<T: 'static>(
     mut iter: Box<dyn Iterator<Item = Result<T>> + Send>,
     encode_item: fn(T) -> Vec<u8>,
-) -> Box<dyn Iterator<Item = Vec<u8>> + Send> {
+) -> Box<dyn Iterator<Item = SVec<u8>> + Send> {
     let mut done = false;
     Box::new(std::iter::from_fn(move || {
         if done {
@@ -827,14 +823,10 @@ impl FunctionCall {
 /// A `ConfigResponse` whose `name` is absent when `config()` failed, rather
 /// than an empty name that reads as one.
 fn config_response(name: Result<String>) -> SVec<u8> {
-    SVec::from(
-        pb::ConfigResponse {
-            name: name.ok(),
-            ..Default::default()
-        }
-        .encode_to_vec()
-        .as_slice(),
-    )
+    encode_svec(&pb::ConfigResponse {
+        name: name.ok(),
+        ..Default::default()
+    })
 }
 
 fn provider_config(provider: &Arc<dyn Provider>) -> SVec<u8> {
@@ -844,7 +836,7 @@ fn provider_config(provider: &Arc<dyn Provider>) -> SVec<u8> {
 fn provider_state_schema(provider: &Arc<dyn Provider>) -> SVec<u8> {
     // Empty SVec == `None`; an encoded Schema == `Some` (see the ABI doc).
     match provider.state_schema() {
-        Some(s) => SVec::from(convert::state_schema_to_pb(&s).encode_to_vec().as_slice()),
+        Some(s) => encode_svec(&convert::state_schema_to_pb(&s)),
         None => SVec::new(),
     }
 }
@@ -867,16 +859,15 @@ pub fn make_plugin_functions(
     let mut named = SVec::new();
     let mut fns: HashMap<String, Arc<dyn PluginFn>> = HashMap::with_capacity(defs.len());
     for def in defs {
-        let meta = pb::FunctionDef {
+        let meta = encode_svec(&pb::FunctionDef {
             name: Some(def.name.clone()),
             signature: convert::fn_signature_to_pb(&def.signature).into(),
             doc: Some(def.doc),
             ..Default::default()
-        }
-        .encode_to_vec();
+        });
         named.push(NamedFunction {
             name: def.name.as_str().into(),
-            meta: SVec::from(meta.as_slice()),
+            meta,
         });
         if fns.insert(def.name.clone(), def.func).is_some() {
             anyhow::bail!(
@@ -1146,12 +1137,8 @@ impl FunctionCaller for GuestFunctions {
             // own outcome, not read `.value` and drop the rest.
             accepts_declarations: Some(true),
             ..Default::default()
-        }
-        .encode_to_vec();
-        let bytes = self
-            .reg
-            .call_registered(SVec::from(pb_req.as_slice()))
-            .await;
+        };
+        let bytes = self.reg.call_registered(encode_svec(&pb_req)).await;
         match decode_req::<pb::Frame>(&bytes[..], "the call_registered reply")?.body {
             Some(Body::CallFunctionResp(r)) => convert::fn_outcome_from_pb(*r),
             Some(Body::Error(e)) => anyhow::bail!("{}", e.message.unwrap_or_default()),
@@ -1189,11 +1176,7 @@ fn driver_config(driver: &Arc<dyn ManagedDriver>) -> SVec<u8> {
 }
 
 fn driver_schema(driver: &Arc<dyn ManagedDriver>) -> SVec<u8> {
-    SVec::from(
-        convert::driver_schema_to_pb(&driver.schema())
-            .encode_to_vec()
-            .as_slice(),
-    )
+    encode_svec(&convert::driver_schema_to_pb(&driver.schema()))
 }
 
 /// A def a guest driver returned, encoded for the host — refused if it declares
@@ -1385,20 +1368,17 @@ impl StableManagedDriver for StableManagedDriverImpl {
 /// is sound because the host drains run output on a blocking task (it cannot ride
 /// the host's async workers), matching how `run` already parks threads per chunk.
 struct ChannelItemStream {
-    rx: Mutex<tokio::sync::mpsc::Receiver<Vec<u8>>>,
+    rx: Mutex<tokio::sync::mpsc::Receiver<SVec<u8>>>,
 }
 
 impl StableItemStream for ChannelItemStream {
     extern "C" fn next(&self) -> SVec<u8> {
         let mut rx = self.rx.lock().unwrap_or_else(|e| e.into_inner());
-        match rx.blocking_recv() {
-            Some(bytes) => SVec::from(bytes.as_slice()),
-            None => SVec::new(),
-        }
+        rx.blocking_recv().unwrap_or_default()
     }
 }
 
-fn make_channel_item_stream(rx: tokio::sync::mpsc::Receiver<Vec<u8>>) -> DynItemStream {
+fn make_channel_item_stream(rx: tokio::sync::mpsc::Receiver<SVec<u8>>) -> DynItemStream {
     dynify(stabby::boxed::Box::new(ChannelItemStream {
         rx: Mutex::new(rx),
     }))
@@ -1420,7 +1400,7 @@ fn run_out_failure_frame(failure: pb::RunFailure) -> pb::RunOutFrame {
 
 /// A run response stream that fails immediately (one `RunOutFrame{failure}`).
 fn run_error_stream(msg: String) -> DynItemStream {
-    make_item_stream(Box::new(std::iter::once(run_out_err(msg).encode_to_vec())))
+    make_item_stream(Box::new(std::iter::once(encode_svec(&run_out_err(msg)))))
 }
 
 /// The run request a run's start frame carries, with what names it.
@@ -1519,7 +1499,7 @@ async fn run_bidi(
     // ride `req` / the channel later; today only the terminal result is sent.)
     // `spawn_on_with_cycle_ctx` (not a bare `spawn`) so the run task inherits the
     // caller's memoizer frame chain for cycle detection.
-    let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+    let (tx, rx) = tokio::sync::mpsc::channel::<SVec<u8>>(16);
     hcore::hmemoizer::spawn_on_with_cycle_ctx(cdylib_runtime().handle(), async move {
         let guard = call_guard.unwrap_or_else(|| cancels.enter(&request_id));
         // The tool's stops ride the response stream too, on a run with a PTY.
@@ -1532,7 +1512,7 @@ async fn run_bidi(
                         msg: Some(pb::run_out_frame::Msg::Stopped(true)),
                         ..Default::default()
                     };
-                    drop(tx.send(frame.encode_to_vec()).await);
+                    drop(tx.send(encode_svec(&frame)).await);
                 }
             })
         });
@@ -1543,7 +1523,7 @@ async fn run_bidi(
             stop_forward.abort();
         }
         // Host gone => receiver dropped; ignore send failure.
-        drop(tx.send(out.encode_to_vec()).await);
+        drop(tx.send(encode_svec(&out)).await);
     });
     make_channel_item_stream(rx)
 }
@@ -1633,12 +1613,12 @@ fn run_out_failure(e: &anyhow::Error) -> pb::RunOutFrame {
 /// side. Without it a `docker buildx build` prints its whole progress log into a
 /// channel nobody reads, and the user watches an idle spinner for minutes.
 struct FrameSink {
-    tx: tokio_util::sync::PollSender<Vec<u8>>,
+    tx: tokio_util::sync::PollSender<SVec<u8>>,
     stderr: bool,
 }
 
 impl FrameSink {
-    fn new(tx: &tokio::sync::mpsc::Sender<Vec<u8>>, stderr: bool) -> Self {
+    fn new(tx: &tokio::sync::mpsc::Sender<SVec<u8>>, stderr: bool) -> Self {
         FrameSink {
             tx: tokio_util::sync::PollSender::new(tx.clone()),
             stderr,
@@ -1666,11 +1646,10 @@ impl tokio::io::AsyncWrite for FrameSink {
                 } else {
                     pb::run_out_frame::Msg::StdoutChunk(buf.to_vec())
                 };
-                let frame = pb::RunOutFrame {
+                let frame = encode_svec(&pb::RunOutFrame {
                     msg: Some(msg),
                     ..Default::default()
-                }
-                .encode_to_vec();
+                });
                 drop(self.tx.send_item(frame));
                 std::task::Poll::Ready(Ok(buf.len()))
             }
@@ -1780,7 +1759,7 @@ async fn run_once(
     driver: Arc<dyn ManagedDriver>,
     request_id: String,
     start: RunStart,
-    out: &tokio::sync::mpsc::Sender<Vec<u8>>,
+    out: &tokio::sync::mpsc::Sender<SVec<u8>>,
     ct: &StdCancellationToken,
 ) -> pb::RunOutFrame {
     // `shell` selects run_shell over run; it rides the request.
@@ -2123,7 +2102,7 @@ mod tests {
             msg: Some(pb::run_in_frame::Msg::StdinChunk(b"s3cr3t".to_vec())),
             ..Default::default()
         };
-        let stream = make_item_stream(Box::new(std::iter::once(frame.encode_to_vec())));
+        let stream = make_item_stream(Box::new(std::iter::once(encode_svec(&frame))));
         let err = pull_run_start(&stream).expect_err("not a start frame");
         let msg = format!("{err:#}");
         assert!(msg.contains("stdin chunk (6 bytes)"), "{msg}");
@@ -2177,7 +2156,7 @@ mod tests {
         driver: Arc<dyn ManagedDriver>,
         request_id: String,
         req: pb::ManagedRunRequest,
-        out: &tokio::sync::mpsc::Sender<Vec<u8>>,
+        out: &tokio::sync::mpsc::Sender<SVec<u8>>,
         ct: &StdCancellationToken,
     ) -> pb::RunOutFrame {
         match RunStart::from_pb(req) {
@@ -2186,12 +2165,11 @@ mod tests {
         }
     }
 
-    fn start_frame(req: pb::ManagedRunRequest) -> Vec<u8> {
-        pb::RunInFrame {
+    fn start_frame(req: pb::ManagedRunRequest) -> SVec<u8> {
+        encode_svec(&pb::RunInFrame {
             msg: Some(pb::run_in_frame::Msg::from(req)),
             ..Default::default()
-        }
-        .encode_to_vec()
+        })
     }
 
     /// A run request missing a required field fails the run naming it — it
@@ -2202,7 +2180,7 @@ mod tests {
         use hcore::hasync::Cancellable;
         use hdriver_support::driver_managed::{ManagedRunRequest, ManagedRunResponse};
 
-        let (out_tx, _out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        let (out_tx, _out_rx) = tokio::sync::mpsc::channel::<SVec<u8>>(1);
         struct Unreached;
         #[async_trait::async_trait]
         impl ManagedDriver for Unreached {
@@ -2772,7 +2750,7 @@ mod tests {
         // A valid request so run_once gets past decoding and actually invokes
         // the driver. The output channel goes nowhere here: this test is about
         // the terminal error frame, not about live output.
-        let (out_tx, _out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        let (out_tx, _out_rx) = tokio::sync::mpsc::channel::<SVec<u8>>(1);
         let frame = futures::executor::block_on(run_once_wire(
             Arc::new(FailDriver) as Arc<dyn ManagedDriver>,
             "r".into(),
