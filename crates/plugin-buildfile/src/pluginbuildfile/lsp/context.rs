@@ -184,7 +184,7 @@ impl HephLspContext {
         // runtime context (see `list_packages`).
         let _rt = self.runtime.enter();
         let result = eval_source(&filename, text, pkg, &self.loader()).ok()?;
-        let target = result.targets.iter().find(|t| t.name == name)?;
+        let target = result.targets().iter().find(|t| t.name == name)?;
         // The call stack is outermost first, so the first frame in this file
         // is the call the package itself made.
         target

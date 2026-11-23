@@ -1044,7 +1044,7 @@ pub(crate) mod tests {
                    return target(name = name, driver = \"bash\", **kwargs)\n\n";
         let ok = format!("{lib}lib(name = \"a\", run = \"echo\", labels = [\"l\"])\n");
         let result = eval_source("BUILD", ok, "pkg", &loader).expect("evaluates");
-        assert_eq!(result.targets.len(), 1);
+        assert_eq!(result.targets().len(), 1);
         for (call, key) in [("rnu = \"echo\"", "`rnu`"), ("run = 1", "`run`")] {
             let src = format!("{lib}lib(name = \"a\", {call})\n");
             let Err(err) = eval_source("BUILD", src, "pkg", &loader) else {
@@ -1290,7 +1290,7 @@ lib(\"a\")
 lib(\"b\", deps = [\"//x:y\"], labels = \"l\")
 ";
         let result = eval_source("BUILD", src.to_string(), "pkg", &loader).expect("evaluates");
-        assert_eq!(result.targets.len(), 2);
+        assert_eq!(result.targets().len(), 2);
         // A wrong value fails at runtime, naming the parameter.
         let Err(err) = eval_source(
             "BUILD",
@@ -1318,9 +1318,9 @@ lib(\"b\", deps = [\"//x:y\"], labels = \"l\")
             format!("{example}\nlib(\"a\")\nlib(\"b\", deps = [\"//x:y\"], labels = \"l\")\n");
         let result = eval_source("BUILD", src, "pkg", &loader)
             .unwrap_or_else(|e| panic!("the doc's example: {e:#}\n{example}"));
-        let names: Vec<&str> = result.targets.iter().map(|t| t.name.as_str()).collect();
+        let names: Vec<&str> = result.targets().iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, ["a", "b"]);
-        let b = &result.targets[1];
+        let b = &result.targets()[1];
         assert_eq!(b.labels, ["l"], "{b:#?}");
         let transitive = format!("{:?}", b.transitive);
         assert!(transitive.contains("//x:y"), "deps passed through: {b:#?}");

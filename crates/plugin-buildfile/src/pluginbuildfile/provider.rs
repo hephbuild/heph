@@ -680,13 +680,13 @@ impl EProvider for Provider {
             // once, as the user's, and recorded for `heph validate`.
             let mut checks = Vec::new();
             if self.checks.is_some() && self.has_build_file(req.package.as_str()).await? {
-                let shadowed = targets::shadowed(res.targets.iter().map(|t| t.name.as_str()));
+                let shadowed = targets::shadowed(res.targets().iter().map(|t| t.name.as_str()));
                 self.shadowed.record(
                     req.package.as_str(),
                     targets::shadowed_checks(
                         &self.root,
                         &req.package,
-                        res.targets
+                        res.targets()
                             .iter()
                             .map(|t| (t.name.as_str(), t.provenance.as_slice())),
                     ),
@@ -709,7 +709,7 @@ impl EProvider for Provider {
             }
 
             let items: Vec<anyhow::Result<ListResponse>> = res
-                .targets
+                .targets()
                 .iter()
                 // The package is already evaluated, so the labels and driver
                 // `get` will return cost nothing to report here — the driver
@@ -804,29 +804,27 @@ impl EProvider for Provider {
                 .await
                 .map_err(|e: anyhow::Error| GetError::Other(e))?;
 
-            for p in res.targets.iter() {
-                if p.name == req.addr.name {
-                    let driver = if p.driver.is_empty() {
-                        self.default_driver.clone().ok_or_else(|| {
-                            GetError::Other(anyhow::anyhow!(
-                                "target {} has no driver and no defaultDriver is configured for the buildfile provider",
-                                req.addr.format()
-                            ))
-                        })?
-                    } else {
-                        p.driver.clone()
-                    };
-                    return Ok(GetResponse {
-                        target_spec: TargetSpec {
-                            addr: req.addr.clone(),
-                            driver,
-                            config: p.config.clone(),
-                            labels: p.labels.clone(),
-                            transitive: p.transitive.clone(),
-                            approval: p.approval.clone(),
-                        },
-                    });
-                }
+            if let Some(p) = res.target(&req.addr.name) {
+                let driver = if p.driver.is_empty() {
+                    self.default_driver.clone().ok_or_else(|| {
+                        GetError::Other(anyhow::anyhow!(
+                            "target {} has no driver and no defaultDriver is configured for the buildfile provider",
+                            req.addr.format()
+                        ))
+                    })?
+                } else {
+                    p.driver.clone()
+                };
+                return Ok(GetResponse {
+                    target_spec: TargetSpec {
+                        addr: req.addr.clone(),
+                        driver,
+                        config: p.config.clone(),
+                        labels: p.labels.clone(),
+                        transitive: p.transitive.clone(),
+                        approval: p.approval.clone(),
+                    },
+                });
             }
 
             // No target of the package has the name, so a check's name is
@@ -1054,7 +1052,7 @@ mod tests {
         assert_eq!(listed, expected);
 
         let result = provider.run_pkg("").await.expect("eval root package");
-        let from_builtin: Vec<String> = match result.targets[0].config.get("pkgs").unwrap() {
+        let from_builtin: Vec<String> = match result.targets()[0].config.get("pkgs").unwrap() {
             hcore::htvalue::Value::List(v) => v
                 .iter()
                 .map(|e| match e {
@@ -1175,7 +1173,7 @@ mod tests {
         // Consistent with the listing: actually loading the package (as
         // `find_build_files` would for evaluation) finds no build files either.
         let result = provider.run_pkg("linked").await.expect("eval package");
-        assert!(result.targets.is_empty(), "{:?}", result.targets);
+        assert!(result.targets().is_empty(), "{:?}", result.targets());
     }
 
     #[test]
@@ -1958,8 +1956,8 @@ target(
         };
 
         let result = provider.run_pkg(&pkg_name).await.unwrap();
-        assert_eq!(result.targets.len(), 1);
-        assert_eq!(result.targets[0].name, "globtarget");
+        assert_eq!(result.targets().len(), 1);
+        assert_eq!(result.targets()[0].name, "globtarget");
     }
 
     #[tokio::test]

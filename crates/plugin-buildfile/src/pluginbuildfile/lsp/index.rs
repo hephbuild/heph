@@ -84,7 +84,7 @@ impl DocIndex {
         // several targets).
         let mut by_span: BTreeMap<Span, Vec<String>> = BTreeMap::new();
 
-        for target in &result.targets {
+        for target in result.targets() {
             let addr = format!("//{pkg}:{}", target.name);
             for frame in &target.provenance {
                 by_span

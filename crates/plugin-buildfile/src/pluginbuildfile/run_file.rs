@@ -819,21 +819,61 @@ pub(crate) struct OnStatePayload {
 
 #[derive(Debug)]
 pub(crate) struct RunResult {
-    pub targets: Vec<OnTargetPayload>,
+    /// Private so nothing can change it after `name_index` was built from it:
+    /// read through [`Self::targets`] or [`Self::target`].
+    targets: Vec<OnTargetPayload>,
     pub states: Vec<OnStatePayload>,
     /// Frozen Starlark module for this BUILD file. Exposes top-level symbols so that
     /// other BUILD files can import them via `load("//pkg", "sym")`. Empty when the
     /// package has no BUILD file matching the configured patterns.
     pub module: FrozenModule,
+    /// Indices into `targets`, sorted by name and, for equal names, by
+    /// index. Built on the first [`Self::target`] call, so a result that is
+    /// only listed (or is one file's part of a package) never pays for it.
+    name_index: OnceLock<Box<[usize]>>,
+}
+
+impl RunResult {
+    fn new(
+        targets: Vec<OnTargetPayload>,
+        states: Vec<OnStatePayload>,
+        module: FrozenModule,
+    ) -> Self {
+        Self {
+            targets,
+            states,
+            module,
+            name_index: OnceLock::new(),
+        }
+    }
+
+    /// Every target the evaluation declared, in declaration order.
+    pub(crate) fn targets(&self) -> &[OnTargetPayload] {
+        &self.targets
+    }
+
+    /// The first target in `targets` named `name`: the one a linear scan
+    /// would find, in `O(log T)` once the index is built.
+    pub(crate) fn target(&self, name: &str) -> Option<&OnTargetPayload> {
+        let index = self.name_index.get_or_init(|| {
+            let mut index: Box<[usize]> = (0..self.targets.len()).collect();
+            // Stable, so equal names keep their index order and the lowest
+            // index comes first.
+            index.sort_by_key(|&i| self.targets.get(i).map(|t| t.name.as_str()));
+            index
+        });
+        let at =
+            index.partition_point(|&i| self.targets.get(i).is_some_and(|t| t.name.as_str() < name));
+        index
+            .get(at)
+            .and_then(|&i| self.targets.get(i))
+            .filter(|t| t.name == name)
+    }
 }
 
 fn empty_run_result() -> anyhow::Result<RunResult> {
     let module = Module::with_temp_heap(|m| m.freeze()).map_err(anyhow::Error::from)?;
-    Ok(RunResult {
-        targets: vec![],
-        states: vec![],
-        module,
-    })
+    Ok(RunResult::new(vec![], vec![], module))
 }
 
 fn merge_pkg_results(parts: &[Arc<RunResult>]) -> anyhow::Result<RunResult> {
@@ -871,11 +911,7 @@ fn merge_pkg_results(parts: &[Arc<RunResult>]) -> anyhow::Result<RunResult> {
         }
         module.freeze().map_err(anyhow::Error::from)
     })?;
-    Ok(RunResult {
-        targets,
-        states,
-        module: frozen,
-    })
+    Ok(RunResult::new(targets, states, frozen))
 }
 
 #[derive(ProvidesStaticType)]
@@ -2430,11 +2466,7 @@ fn eval_ast(
         .map_err(|_rc| anyhow::anyhow!("states Rc still has outstanding references after eval"))?
         .into_inner();
 
-    Ok(RunResult {
-        targets,
-        states,
-        module: frozen,
-    })
+    Ok(RunResult::new(targets, states, frozen))
 }
 
 #[cfg(test)]
@@ -2445,6 +2477,65 @@ pub(crate) mod tests {
     use hplugin::function::{DeclaredState, DeclaredTarget, FnOutcome};
     use std::fs;
     use tempfile::tempdir;
+
+    fn named(name: &str, driver: &str) -> OnTargetPayload {
+        OnTargetPayload {
+            name: name.to_string(),
+            driver: driver.to_string(),
+            labels: vec![],
+            transitive: Sandbox::default(),
+            approval: Approval::default(),
+            config: HashMap::new(),
+            provenance: vec![],
+        }
+    }
+
+    fn result_of(targets: Vec<OnTargetPayload>) -> RunResult {
+        let mut result = empty_run_result().expect("empty result");
+        result.targets = targets;
+        result
+    }
+
+    #[test]
+    fn target_lookup_matches_the_first_exact_name() {
+        let result = result_of(vec![
+            named("ab", "d1"),
+            named("b", "d2"),
+            named("a", "d3"),
+            named("a", "d4"),
+            named("", "d5"),
+            named("é", "d6"),
+        ]);
+        // A near-miss prefix is not a match, either way round.
+        assert_eq!(result.target("ab").map(|t| t.driver.as_str()), Some("d1"));
+        // A duplicate name answers with the first declared, as a scan would.
+        assert_eq!(result.target("a").map(|t| t.driver.as_str()), Some("d3"));
+        assert_eq!(result.target("b").map(|t| t.driver.as_str()), Some("d2"));
+        assert_eq!(result.target("").map(|t| t.driver.as_str()), Some("d5"));
+        assert_eq!(result.target("é").map(|t| t.driver.as_str()), Some("d6"));
+        for missing in ["abc", "A", "c", "aa", " a", "e"] {
+            assert!(result.target(missing).is_none(), "{missing:?} matched");
+        }
+        // Listing order is untouched by the index.
+        let order: Vec<&str> = result.targets.iter().map(|t| t.driver.as_str()).collect();
+        assert_eq!(order, ["d1", "d2", "d3", "d4", "d5", "d6"]);
+    }
+
+    #[test]
+    fn target_lookup_on_empty_and_merged_results() {
+        assert!(result_of(vec![]).target("a").is_none());
+
+        // Across a package's files, the earlier file's target wins.
+        let parts = [
+            Arc::new(result_of(vec![named("x", "first"), named("y", "y")])),
+            Arc::new(result_of(vec![named("x", "second"), named("w", "w")])),
+        ];
+        let merged = merge_pkg_results(&parts).expect("merge");
+        assert_eq!(merged.target("x").map(|t| t.driver.as_str()), Some("first"));
+        assert_eq!(merged.target("w").map(|t| t.driver.as_str()), Some("w"));
+        assert_eq!(merged.target("y").map(|t| t.driver.as_str()), Some("y"));
+        assert!(merged.target("z").is_none());
+    }
 
     fn hovers() -> BuiltinHovers {
         BuiltinHovers::new(
