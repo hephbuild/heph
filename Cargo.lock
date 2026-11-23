@@ -2121,6 +2121,7 @@ name = "fetch"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "hex",
  "reqwest",
  "sha2 0.11.1",
