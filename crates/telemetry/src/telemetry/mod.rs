@@ -129,7 +129,7 @@ pub fn observe_event(kind: &BuildEventKind) {
 }
 
 /// Record one resolved target's artifact count + known per-artifact sizes.
-pub fn record_artifacts(count: u64, sizes: &[u64]) {
+pub fn record_artifacts(count: u64, sizes: impl IntoIterator<Item = u64>) {
     COLLECTOR.record_artifacts(count, sizes);
 }
 

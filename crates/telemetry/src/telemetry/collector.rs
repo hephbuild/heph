@@ -285,25 +285,25 @@ impl TelemetryCollector {
     /// per-artifact `byte_size()`s. Artifact size lives on the result, not the
     /// event stream, so this is recorded explicitly where `result_addr` produces
     /// the `EResult`. Sizes fold into the fixed histogram — constant memory.
-    pub fn record_artifacts(&self, count: u64, sizes: &[u64]) {
+    pub fn record_artifacts(&self, count: u64, sizes: impl IntoIterator<Item = u64>) {
         // Most calls record nothing (a meta edge reads no outputs); skip the
         // shared RMW for those.
         if count != 0 {
             self.artifacts.fetch_add(count, Ordering::Relaxed);
         }
-        if sizes.is_empty() {
+        let (mut n, mut sum, mut max) = (0u64, 0u64, 0u64);
+        for size in sizes {
+            self.size_histogram.record(size);
+            n += 1;
+            sum += size;
+            max = max.max(size);
+        }
+        if n == 0 {
             return;
         }
-        self.sized_artifacts
-            .fetch_add(sizes.len() as u64, Ordering::Relaxed);
-        let sum: u64 = sizes.iter().sum();
+        self.sized_artifacts.fetch_add(n, Ordering::Relaxed);
         self.artifact_bytes.fetch_add(sum, Ordering::Relaxed);
-        if let Some(&max) = sizes.iter().max() {
-            self.max_artifact_bytes.fetch_max(max, Ordering::Relaxed);
-        }
-        for &size in sizes {
-            self.size_histogram.record(size);
-        }
+        self.max_artifact_bytes.fetch_max(max, Ordering::Relaxed);
     }
 
     /// Record one target's execute wall time (ms). Called only on a real
@@ -656,8 +656,8 @@ mod tests {
     fn record_artifacts_accumulates_counts_and_sizes() {
         let c = TelemetryCollector::new();
         // 2 artifacts, one size unknown (only one size reported).
-        c.record_artifacts(2, &[100]);
-        c.record_artifacts(3, &[50, 200, 10]);
+        c.record_artifacts(2, [100]);
+        c.record_artifacts(3, [50, 200, 10]);
         let s = c.snapshot();
         assert_eq!(
             s.artifacts, 5,
@@ -686,8 +686,8 @@ mod tests {
         // 99 small artifacts (size 1 → bucket 1, upper edge 1) and one big one
         // (size 1<<20 → bucket 21). The 99th-rank value is small.
         let small = vec![1u64; 99];
-        c.record_artifacts(99, &small);
-        c.record_artifacts(1, &[1 << 20]);
+        c.record_artifacts(99, small);
+        c.record_artifacts(1, [1 << 20]);
         let s = c.snapshot();
         // p99 lands in the small bucket (upper edge 1), not the big one.
         assert_eq!(s.p99_artifact_bytes, 1);
@@ -702,7 +702,7 @@ mod tests {
         let c = TelemetryCollector::new();
         // All sizes 1000 → bucket 10 ([512,1023], upper edge 1023). True p99 is
         // 1000; the estimate (1023) is within a factor of 2.
-        c.record_artifacts(100, &vec![1000u64; 100]);
+        c.record_artifacts(100, vec![1000u64; 100]);
         let p99 = c.snapshot().p99_artifact_bytes;
         assert!(
             (1000..=2000).contains(&p99),

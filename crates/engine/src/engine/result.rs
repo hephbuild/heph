@@ -3292,16 +3292,10 @@ impl Engine {
                 // event stream, so record them here once the result is in hand.
                 // Counts every resolved target across the process; the opt-out
                 // only gates whether the snapshot is sent.
-                let sizes: Vec<u64> = result
-                    .0
-                    .eresult
-                    .artifacts
-                    .iter()
-                    .filter_map(|a| a.byte_size())
-                    .collect();
+                let artifacts = &result.0.eresult.artifacts;
                 htelemetry::telemetry::record_artifacts(
-                    result.0.eresult.artifacts.len() as u64,
-                    &sizes,
+                    artifacts.len() as u64,
+                    artifacts.iter().filter_map(|a| a.byte_size()),
                 );
 
                 Ok(result)
