@@ -991,28 +991,23 @@ impl RecorderThread {
 
 /// Write `value` as JSON to `dir/name` through a `0600` temp file renamed over
 /// it, so a reader sees the old file or the new one, never half of one.
+///
+/// Encoded into memory first: serde_json writes token by token, and straight
+/// into the file that is one `write(2)` per token.
 pub(crate) fn write_atomically(
     dir: &Path,
     name: &str,
     value: &impl serde::Serialize,
 ) -> io::Result<()> {
-    write_atomically_with(dir, name, |f| {
-        serde_json::to_writer(f, value).map_err(io::Error::other)
-    })
+    let bytes = serde_json::to_vec(value).map_err(io::Error::other)?;
+    write_bytes_atomically(dir, name, &bytes)
 }
 
-/// [`write_atomically`] for bytes that are not JSON (`inflight.txt`).
+/// [`write_atomically`] for bytes already encoded, or not JSON
+/// (`inflight.txt`).
 pub fn write_bytes_atomically(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
-    write_atomically_with(dir, name, |f| io::Write::write_all(f, bytes))
-}
-
-fn write_atomically_with(
-    dir: &Path,
-    name: &str,
-    write: impl FnOnce(&mut std::fs::File) -> io::Result<()>,
-) -> io::Result<()> {
     let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
-    write(tmp.as_file_mut())?;
+    io::Write::write_all(tmp.as_file_mut(), bytes)?;
     tmp.persist(dir.join(name)).map_err(|e| e.error)?;
     Ok(())
 }
