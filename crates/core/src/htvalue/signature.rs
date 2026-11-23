@@ -440,8 +440,8 @@ impl FnSignature {
 
         let mut out_named = HashMap::with_capacity(self.named.len());
         for param in &self.named {
-            match named.remove(param.name) {
-                Some(v) => {
+            match named.remove_entry(param.name) {
+                Some((key, v)) => {
                     if !param.ty.matches(&v) {
                         anyhow::bail!(
                             "{fn_display}: argument `{}` expected {}, got {}",
@@ -450,7 +450,7 @@ impl FnSignature {
                             param.ty.describe_mismatch(&v)
                         );
                     }
-                    out_named.insert(param.name.to_string(), v);
+                    out_named.insert(key, v);
                 }
                 None => match &param.default {
                     Some(d) => {
