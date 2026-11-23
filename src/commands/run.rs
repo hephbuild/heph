@@ -491,10 +491,6 @@ struct RunHeader {
 }
 
 impl tui::ProgressHeader for RunHeader {
-    fn header(&self, core: &tui::BuildState, scope: tui::CountScope) -> Vec<tui::HeaderItem> {
-        self.counts.header(core, scope)
-    }
-
     fn label(&self) -> String {
         self.label.get()
     }

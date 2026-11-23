@@ -41,49 +41,6 @@ pub const LONG_RUNNING_THRESHOLD_MS: u64 = 5_000;
 /// (e.g. `59m59s` → `1h00m` would otherwise lose a column and jitter the counts).
 const ELAPSED_MIN_WIDTH: usize = 6;
 
-/// One braille cell holds up to this many worker dots (8-dot braille).
-const WORKERS_PER_CELL: usize = 8;
-
-/// Glyph for a cell with N busy workers, indexed by N (0..=8). Index 0 is the
-/// empty/idle cell (the caller paints it grey); the lit progression follows the
-/// pinned UI rule `⠁ ⠃ ⠇ ⠧ ⠷ ⠿ … ⣿` with the 7-dot step filled in.
-const BRAILLE_FILL: [char; WORKERS_PER_CELL + 1] = ['⣿', '⠁', '⠃', '⠇', '⡇', '⣇', '⣧', '⣷', '⣿'];
-
-/// One braille cell per group of [`WORKERS_PER_CELL`] worker slots. Busy slots
-/// fill left-to-right across cells; an all-idle cell is dim grey, any-busy cell
-/// is blue at the glyph matching its busy count.
-fn worker_spans(max_workers: usize, busy: usize) -> Vec<Span<'static>> {
-    if max_workers == 0 {
-        return Vec::new();
-    }
-    let cells = max_workers.div_ceil(WORKERS_PER_CELL);
-    let mut spans = Vec::with_capacity(cells);
-    for c in 0..cells {
-        let cell_start = c * WORKERS_PER_CELL;
-        let cap = (max_workers - cell_start).min(WORKERS_PER_CELL);
-        let busy_here = busy.saturating_sub(cell_start).min(cap);
-        let (glyph, style) = if busy_here == 0 {
-            // Idle cell: grey outline of the *available* slots in this cell, so a
-            // partial trailing cell (e.g. 2 of 8) shows only its real worker count
-            // (⠃) instead of a full ⣿ that overstates capacity. A full cell uses
-            // cap == 8 ⇒ ⣿, unchanged.
-            (
-                BRAILLE_FILL.get(cap).copied().unwrap_or('⣿'),
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::DIM),
-            )
-        } else {
-            (
-                BRAILLE_FILL.get(busy_here).copied().unwrap_or('⣿'),
-                Style::default().fg(Color::Blue),
-            )
-        };
-        spans.push(Span::styled(glyph.to_string(), style));
-    }
-    spans
-}
-
 /// Compact, human-friendly elapsed time. Precision is indicative only — the
 /// coarsest two units are shown: `12s`, `1m05s`, `1h05m`, `2d03h`. The seconds
 /// band is natural width (compact start); everything past a minute is padded to
@@ -104,33 +61,6 @@ fn human_elapsed_ms(ms: u64) -> String {
         return format!("{}.{:03}s", ms / 1000, ms % 1000);
     }
     human_elapsed(ms)
-}
-
-/// Which body the TUI viewport is showing. The default view is the live
-/// slow-target / lock-wait breakdown; the list views each mirror one header
-/// counter — [`ViewMode::Done`] the completed count, [`ViewMode::Matched`] the
-/// matched total, [`ViewMode::Cached`] the cached count, [`ViewMode::Waiting`]
-/// the admission-wait count, [`ViewMode::Failed`] the failed count. `Tab`
-/// cycles through `[Default]` plus one entry per
-/// tab-bound header segment the header model exposes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ViewMode {
-    /// The live breakdown: slow targets + lock waits (or idle art when empty).
-    Default,
-    /// The list of completed (successfully finished) targets, scoped by the
-    /// active [`CountScope`] (matched set vs every observed target). Mirrors the
-    /// `X` of the header's `X / Y done`.
-    Done,
-    /// The list of matched top-level targets. Mirrors the `Y` of the header's
-    /// `X / Y done`.
-    Matched,
-    /// The list of targets that hit cache. Mirrors the header's cached count.
-    Cached,
-    /// The targets held at admission past the notice threshold, each as its
-    /// `⧗` row. They are shown here and nowhere else until the wait ends.
-    Waiting,
-    /// The list of failed targets.
-    Failed,
 }
 
 /// Case-insensitive substring test for the `/` filter on the `Done`/`Failed`
@@ -161,69 +91,6 @@ pub enum CountScope {
     Matched,
     /// Counters across every target the view has seen (incl. transitive deps).
     All,
-}
-
-/// One freestanding segment of the header status line. The view joins items with
-/// ` · ` itself — items must NOT bake in separators. A [`HeaderItem::Tab`] binds a
-/// segment to a body [`ViewMode`]; the view highlights it (background colour)
-/// while that mode is the active view.
-pub enum HeaderItem {
-    /// A plain segment that is always rendered as-is.
-    Text(Vec<Span<'static>>),
-    /// A segment bound to a body view. Selectable via `Tab`; highlighted while
-    /// its `mode` is active.
-    Tab {
-        mode: ViewMode,
-        spans: Vec<Span<'static>>,
-    },
-    /// A single header segment composed of several parts rendered with NO
-    /// internal ` · ` separator (the parts bake in their own connective text,
-    /// e.g. ` / ` and ` done`). Each part may bind to its own body view and is
-    /// highlighted independently while that view is active — this is how the
-    /// `X / Y done` segment highlights `X` (Done) and `Y` (Matched) separately.
-    Split(Vec<HeaderPart>),
-}
-
-/// One part of a [`HeaderItem::Split`] segment: its spans plus an optional body
-/// view. `Some(mode)` makes the part a tab — selectable via `Tab` and
-/// highlighted while `mode` is the active view; `None` is inert connective text.
-pub struct HeaderPart {
-    spans: Vec<Span<'static>>,
-}
-
-impl HeaderPart {
-    /// A text part.
-    fn text(s: impl Into<String>) -> Self {
-        HeaderPart {
-            spans: vec![Span::raw(s.into())],
-        }
-    }
-}
-
-impl HeaderItem {
-    /// A plain-text segment.
-    pub fn text(s: impl Into<String>) -> Self {
-        HeaderItem::Text(vec![Span::raw(s.into())])
-    }
-
-    /// A plain-text segment bound to a body view.
-    pub fn tab(mode: ViewMode, s: impl Into<String>) -> Self {
-        HeaderItem::Tab {
-            mode,
-            spans: vec![Span::raw(s.into())],
-        }
-    }
-
-    /// The item's spans, regardless of variant (used by tests).
-    #[cfg(test)]
-    fn spans(&self) -> Vec<Span<'static>> {
-        match self {
-            HeaderItem::Text(spans) | HeaderItem::Tab { spans, .. } => spans.clone(),
-            HeaderItem::Split(parts) => {
-                parts.iter().flat_map(|p| p.spans.iter().cloned()).collect()
-            }
-        }
-    }
 }
 
 /// A target-scoped operation, as the client groups it for display. This is a
@@ -304,11 +171,6 @@ impl Op {
     }
 }
 
-/// A slow target as surfaced by [`BuildState::long_running`]: its address, the
-/// elapsed of its currently-active op, and the per-op breakdown `(op, elapsed_ms)`
-/// ordered by [`Op::order`].
-type SlowTarget = (String, u64, Vec<(Op, u64)>);
-
 /// Which edge of an [`Op`] span an event represents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Boundary {
@@ -375,9 +237,6 @@ pub struct BuildState {
     /// `CacheHitRebuilt` — the same fold the GHA report and telemetry use, so
     /// the summary line agrees with them. The tier events are not counted.
     cache: CacheCounts,
-    /// Worker capacity announced by the engine via `RequestConfig`. `None` until
-    /// the event lands (no worker indicator rendered before then).
-    max_workers: Option<usize>,
     /// Server timestamp of the first event seen — the run's start anchor for the
     /// header's elapsed clock. `None` until any event lands.
     started_at_ms: Option<u64>,
@@ -417,10 +276,6 @@ pub struct BuildState {
     /// Targets whose admission has waited past the notice threshold, by
     /// addr. Added on `AdmissionWaitStart`, removed on `AdmissionWaitEnd`.
     admission_waits: HashMap<String, AdmissionWait>,
-    /// Running targets granted less than they declared, by addr, as the
-    /// `cpu 16→4` their row shows. Set at `ExecuteStart`, cleared at
-    /// `ExecuteEnd`; a target that got what it asked for is not here.
-    clamped: HashMap<String, String>,
     /// The line's spotlight: the waits and runs ordered by start, the root
     /// failure on show, and the hold. See [`spotlight`].
     spot: spotlight::SpotIndex,
@@ -492,25 +347,12 @@ struct AdmissionWait {
     since_ms: u64,
 }
 
-/// Every blocked wait on one cache, collapsed for a single row.
-#[derive(Debug, Clone, Copy)]
-struct ScratchWaitGroup<'a> {
-    waiters: usize,
-    /// The *oldest* wait on this cache — how long the contention has run, not
-    /// how long the most recent arrival has been queued.
-    since_ms: u64,
-    holder_pid: Option<u32>,
-    access: &'a str,
-}
-
 /// One consumer's blocked wait on a scratch slot.
 #[derive(Debug, Clone)]
 struct ScratchWait {
     /// The scratch declaration's addr — the subject of the rendered row, since
     /// the cache is what the user would change, not the target that wanted it.
     scratch: String,
-    /// `"exclusive"` or `"shared"`, echoed from the declaration.
-    access: String,
     /// A process holding the slot, when one could be named.
     holder_pid: Option<u32>,
     /// When this consumer started waiting, for the row's elapsed clock.
@@ -633,12 +475,8 @@ impl BuildState {
         }
         match &ev.kind {
             BuildEventKind::RequestConfig {
-                max_workers: count,
-                resources,
-                units,
-                ..
+                resources, units, ..
             } => {
-                self.max_workers = Some(*count);
                 for pool in resources.keys() {
                     self.units
                         .insert(pool.clone(), hcore::events::unit_of(units, pool));
@@ -696,32 +534,16 @@ impl BuildState {
             // The op timeline (folded above) tracks Execute's duration; here we
             // keep only the `executed` counter side effect on a successful end.
             // A hit that rebuilds is retracted by its `CacheHitRebuilt`.
-            BuildEventKind::ExecuteStart {
-                addr,
-                declared,
-                reserved,
-                ..
-            } => {
+            BuildEventKind::ExecuteStart { addr, .. } => {
                 // A target that runs is no longer waiting. The engine sends
                 // `AdmissionWaitEnd` first; this keeps a lost End from leaving
                 // the row in the Waiting tab for the rest of the run.
                 self.end_admission_wait(addr);
-                match hcore::events::clamp_text(declared.as_ref(), reserved.as_ref(), |p| {
-                    self.unit_of(p)
-                }) {
-                    Some(clamp) => {
-                        self.clamped.insert(addr.clone(), clamp);
-                    }
-                    None => {
-                        self.clamped.remove(addr);
-                    }
-                }
             }
-            BuildEventKind::ExecuteEnd { addr, error } => {
+            BuildEventKind::ExecuteEnd { error, .. } => {
                 if error.is_none() {
                     self.executed += 1;
                 }
-                self.clamped.remove(addr);
             }
             BuildEventKind::AdmissionWaitStart {
                 addr,
@@ -791,14 +613,13 @@ impl BuildState {
             BuildEventKind::ScratchLockWaitStart {
                 addr,
                 scratch,
-                access,
                 holder_pid,
+                ..
             } => {
                 if let Some(prev) = self.scratch_waits.insert(
                     addr.clone(),
                     ScratchWait {
                         scratch: scratch.clone(),
-                        access: access.clone(),
                         holder_pid: *holder_pid,
                         since_ms: ev.at_unix_ms,
                     },
@@ -855,41 +676,6 @@ impl BuildState {
             BuildEventKind::Unknown => {}
         }
         self.fold_spotlight(ev.at_unix_ms);
-    }
-
-    /// Targets whose *currently-active* op has run longer than `threshold_ms`,
-    /// with the per-op breakdown for that target. Returns
-    /// `(addr, active_elapsed_ms, breakdown)` sorted by active elapsed descending
-    /// (then addr). The breakdown is the target's completed ops plus the live
-    /// active op, each at least one second, ordered by [`Op::order`]. A target
-    /// with no active op is never slow (it dropped off when its last op ended).
-    fn long_running(&self, now_ms: u64, threshold_ms: u64) -> Vec<SlowTarget> {
-        // Walks only the targets with an op open, not every target the run has
-        // touched. This runs on every frame of the live view.
-        let mut out: Vec<SlowTarget> = self
-            .dash
-            .open_ops()
-            .filter_map(|(id, r)| {
-                let active_op = r.op()?;
-                let active_elapsed = now_ms.saturating_sub(r.op_since_ms);
-                if active_elapsed <= threshold_ms {
-                    return None;
-                }
-                // The finished runs plus the live one, sub-second ops dropped,
-                // in pipeline order.
-                let breakdown: Vec<(Op, u64)> = Op::BY_ORDER
-                    .iter()
-                    .map(|&op| {
-                        let live = if op == active_op { active_elapsed } else { 0 };
-                        (op, r.op_ms(op) + live)
-                    })
-                    .filter(|&(_, ms)| ms >= 1000)
-                    .collect();
-                Some((self.dash.addr(id).to_owned(), active_elapsed, breakdown))
-            })
-            .collect();
-        out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        out
     }
 
     /// Number of matched top-level targets seen so far (provisional until the
@@ -969,24 +755,6 @@ impl BuildState {
         format!("{done} · {cached} · {failed}{split}")
     }
 
-    /// Workers currently holding an execute slot (targets whose active op is
-    /// `Execute`). This is the semaphore-bound busy count, not `running` (which
-    /// includes targets blocked on deps without a permit).
-    ///
-    /// Bounded by what is in flight, not by the run: it walks the model's
-    /// open ops, not every target that has ever run an op.
-    pub fn busy_workers(&self) -> usize {
-        self.dash
-            .open_ops()
-            .filter(|(_, r)| r.op() == Some(Op::Execute))
-            .count()
-    }
-
-    /// Announced worker capacity, or `None` before the `RequestConfig` event.
-    pub fn max_workers(&self) -> Option<usize> {
-        self.max_workers
-    }
-
     /// Drop `addr`'s announced admission wait, if any.
     fn end_admission_wait(&mut self, addr: &str) {
         self.admission_waits.remove(addr);
@@ -1016,85 +784,6 @@ impl BuildState {
     /// The dashboard's fold: records, buckets and gauges.
     pub fn dashboard(&self) -> &crate::tui::dashboard::Model {
         &self.dash
-    }
-
-    /// The cpu pool holds, in CPUs (rounded up), as its latest `PoolUsage`
-    /// reported it. Reading it walks nothing.
-    pub fn busy_cpus(&self) -> usize {
-        let held = self.dash.pool(hcore::capacity::CPU).map_or(0, |g| g.held);
-        usize::try_from(held.div_ceil(hcore::capacity::MICROS_PER_CPU)).unwrap_or(usize::MAX)
-    }
-
-    /// One `<pool> <held>/<capacity>` segment per bounded pool other than
-    /// `cpu` (which the worker cells show) that holds some of itself or has
-    /// waiters, from the pool's own `PoolUsage`, in the gauges' fixed order
-    /// (memory, sandbox, then declared pools by name) and the pool's unit:
-    /// `memory 2.0 GiB/16.0 GiB`, `gpu 2/2, 3 waiting`, `sandbox: 3 waiting
-    /// (2 removals pending)`. Walks the pools, never the targets.
-    pub fn pool_segments(&self) -> impl Iterator<Item = String> + '_ {
-        self.dash
-            .gauges()
-            .into_iter()
-            .filter(|g| g.pool != hcore::capacity::CPU && (g.held > 0 || g.waiting > 0))
-            .map(|g| {
-                let pool = &g.pool;
-                let base = match g.held {
-                    0 => format!("{pool}:"),
-                    held => format!(
-                        "{pool} {}/{}",
-                        hcore::events::display_amount(g.unit, held),
-                        hcore::events::display_amount(g.unit, g.capacity)
-                    ),
-                };
-                let waiting = match g.waiting {
-                    0 => return base,
-                    n if g.held == 0 => format!("{base} {n} waiting"),
-                    n => format!("{base}, {n} waiting"),
-                };
-                match g.removals_pending {
-                    0 => waiting,
-                    1 => format!("{waiting} (1 removal pending)"),
-                    n => format!("{waiting} ({n} removals pending)"),
-                }
-            })
-    }
-
-    /// Rows for targets whose admission has waited past the notice
-    /// threshold: `⧗ //a:b waits for cpu 4 (2 free, 41s)`. What was free is
-    /// as of the notice. Sorted by addr so the order is
-    /// stable across frames. The body of the [`ViewMode::Waiting`] tab, thinned
-    /// by the `/` filter like the other list tabs.
-    pub fn admission_wait_lines(&self, now_ms: u64, filter: &str) -> Vec<Line<'static>> {
-        let mut waits: Vec<(&String, &AdmissionWait)> = self
-            .admission_waits
-            .iter()
-            .filter(|(addr, _)| addr_matches(addr, filter))
-            .collect();
-        waits.sort_by(|a, b| a.0.cmp(b.0));
-        waits
-            .into_iter()
-            .map(|(addr, w)| {
-                let waited = human_elapsed(now_ms.saturating_sub(w.since_ms));
-                Line::from(Span::styled(
-                    format!(
-                        "  ⧗ {}",
-                        hcore::events::admission_wait_text(
-                            addr,
-                            &w.pool,
-                            self.unit_of(&w.pool),
-                            w.need,
-                            w.free,
-                            w.yielding_to
-                                .as_ref()
-                                .map(|to| (to, self.unit_of(&to.pool))),
-                            w.removals_pending,
-                            &waited
-                        )
-                    ),
-                    Style::default().fg(Color::Yellow),
-                ))
-            })
-            .collect()
     }
 
     /// Milliseconds since the first observed event, given the caller's wall
@@ -1141,36 +830,6 @@ impl BuildState {
         )
     }
 
-    /// The long-running ("slow") target rows, one per slow target and uncollapsed:
-    /// `addr (icon Ns)…` — one `(icon Ns)` group per op the target passed through
-    /// or is in — then `[cpu 16→4]` when the target was granted less than it
-    /// declared, so a clamp is visible without `-v`.
-    fn slow_rows(&self, now_ms: u64) -> Vec<Line<'static>> {
-        self.long_running(now_ms, LONG_RUNNING_THRESHOLD_MS)
-            .into_iter()
-            .map(|(addr, _active_elapsed, breakdown)| {
-                let groups: String = breakdown
-                    .iter()
-                    .map(|(op, ms)| format!(" ({} {}s)", op.icon(), ms / 1000))
-                    .collect();
-                match self.clamped.get(&addr) {
-                    Some(clamp) => Line::from(format!("  {addr}{groups} [{clamp}]")),
-                    None => Line::from(format!("  {addr}{groups}")),
-                }
-            })
-            .collect()
-    }
-
-    /// The full body: wait notices first (they take priority), then every
-    /// slow-target row. Uncollapsed — the caller windows it to the available rows.
-    /// Admission waits are not here: they live in the [`ViewMode::Waiting`] tab.
-    pub fn body_lines(&self, now_ms: u64) -> Vec<Line<'static>> {
-        let mut body = self.lock_wait_lines();
-        body.extend(self.scratch_wait_lines(now_ms));
-        body.extend(self.slow_rows(now_ms));
-        body
-    }
-
     /// Every cache that serialized somebody this run, as
     /// `(scratch, waiters, total wait ms)`, ordered by total wait descending so
     /// the worst offender is first. Empty when nothing ever blocked.
@@ -1182,88 +841,6 @@ impl BuildState {
             .collect();
         v.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(b.0)));
         v
-    }
-
-    /// Rows for scratch slots that are currently blocking somebody, one row per
-    /// *cache* rather than per waiting target:
-    /// `⧗ //build:gocache — 47 waiting (exclusive, 1m12s)`.
-    ///
-    /// Deliberately not shaped like the result-lock rows above, because the two
-    /// name different problems. A blocked result lock means another process is
-    /// building this exact target: wait, or kill it. A blocked scratch slot
-    /// means the build is serialized on a shared cache — a declaration-level
-    /// choice (`access = "exclusive"`) with a declaration-level fix. Rendering
-    /// them identically would send a user looking for a rogue process when what
-    /// they need to change is a line in a BUILD file.
-    ///
-    /// The subject is the scratch addr, and the count is the point: "47 waiting"
-    /// is what tells someone their cache is the bottleneck. Sorted by addr so
-    /// the order is stable across frames.
-    pub fn scratch_wait_lines(&self, now_ms: u64) -> Vec<Line<'static>> {
-        if self.scratch_waits.is_empty() {
-            return Vec::new();
-        }
-        // Collapse by cache: waiters, the oldest wait, and any named holder.
-        let mut by_scratch: HashMap<&str, ScratchWaitGroup<'_>> = HashMap::new();
-        for w in self.scratch_waits.values() {
-            let e = by_scratch
-                .entry(w.scratch.as_str())
-                .or_insert(ScratchWaitGroup {
-                    waiters: 0,
-                    since_ms: w.since_ms,
-                    holder_pid: w.holder_pid,
-                    access: w.access.as_str(),
-                });
-            e.waiters += 1;
-            e.since_ms = e.since_ms.min(w.since_ms);
-            // Any waiter that managed to name a holder speaks for the rest.
-            e.holder_pid = e.holder_pid.or(w.holder_pid);
-        }
-
-        let mut rows: Vec<(&str, ScratchWaitGroup<'_>)> = by_scratch.into_iter().collect();
-        rows.sort_by(|a, b| a.0.cmp(b.0));
-        rows.into_iter()
-            .map(|(scratch, g)| {
-                let waited = human_elapsed(now_ms.saturating_sub(g.since_ms));
-                // A named holder outranks the access mode: "another process has
-                // it" and "you declared this exclusive" are different fixes, and
-                // only the first can be pinned on a pid.
-                let detail = match g.holder_pid {
-                    Some(pid) => format!("held by {}, {waited}", self.holder(pid)),
-                    None => format!("{}, {waited}", g.access),
-                };
-                Line::from(Span::styled(
-                    format!("  ⧗ {scratch} — {} waiting ({detail})", g.waiters),
-                    Style::default().fg(Color::Yellow),
-                ))
-            })
-            .collect()
-    }
-
-    /// Rows for addrs currently blocked on the result lock past the notice
-    /// threshold, rendered like the slow-target rows but flagged locked:
-    /// `🔒 <addr> (locked by pid N)` — `locked by session <id> (pid N)` when a
-    /// live session is recorded for the pid — `(locked, in use)` when readers
-    /// are holding the revision, or `(locked, holder unknown)`.
-    /// Sorted by addr so the order is stable across frames. Empty when nothing
-    /// is blocked.
-    pub fn lock_wait_lines(&self) -> Vec<Line<'static>> {
-        let mut waits: Vec<(&String, &(LockHolder, u64))> = self.lock_waits.iter().collect();
-        waits.sort_by(|a, b| a.0.cmp(b.0));
-        waits
-            .into_iter()
-            .map(|(addr, (holder, _))| {
-                let holder = match holder {
-                    LockHolder::Pid(pid) => format!("locked by {}", self.holder(*pid)),
-                    LockHolder::Readers => "locked, in use".to_string(),
-                    LockHolder::Unknown => "locked, holder unknown".to_string(),
-                };
-                Line::from(Span::styled(
-                    format!("  🔒 {addr} ({holder})"),
-                    Style::default().fg(Color::Yellow),
-                ))
-            })
-            .collect()
     }
 
     /// What this state says a session is doing, as `show --json` carries it:
@@ -1441,23 +1018,21 @@ impl ProgressCore {
 
 pub use hcore::units::human_bytes;
 
-/// Per-command header content for [`TuiProgressView`]. The view owns the box
-/// chrome, the elapsed clock, and the body (slow rows / lock waits / idle art);
-/// the header supplies only the status segment after the clock (and the bottom
-/// label + final summary). `run`/`query`/`inspect` use [`BuildHeader`]; `gc`
-/// uses [`GcHeader`].
+/// Per-command header content for [`TuiProgressView`]. The view owns the
+/// line, the elapsed clock and the dashboard; the header supplies the label
+/// and the final summary, and a command with no dashboard its line's status
+/// segment. `run`/`query`/`inspect` use [`BuildHeader`]; `gc` uses
+/// [`GcHeader`].
 pub trait ProgressHeader: Send {
     /// Fold an event into header-private state. The build header reads the
     /// view's shared [`BuildState`] instead, so its impl is a no-op.
     fn apply(&mut self, _ev: &BuildEvent) {}
-    /// Status items shown after the elapsed clock. Each item is freestanding —
-    /// the view joins them with ` · ` and highlights any [`HeaderItem::Tab`]
-    /// whose mode is the active view — so a model must NOT bake in separators.
-    /// `core` is the view's shared build state; headers that track their own
-    /// state ignore it. `scope` selects whether the counts cover the matched set
-    /// or every observed target (toggled by the `a` key); state-private headers
-    /// ignore it.
-    fn header(&self, core: &BuildState, scope: CountScope) -> Vec<HeaderItem>;
+    /// The line's status segment, after the clock, for a header with no
+    /// dashboard ([`has_dashboard`](Self::has_dashboard) `false`). A header
+    /// with one never has it read: the line draws the build counts itself.
+    fn segment(&self) -> String {
+        String::new()
+    }
     /// The bottom-border label.
     fn label(&self) -> String;
     /// Whether the line keeps [`label`](Self::label) up once the matcher has
@@ -1499,54 +1074,6 @@ impl BuildHeader {
 }
 
 impl ProgressHeader for BuildHeader {
-    fn header(&self, core: &BuildState, scope: CountScope) -> Vec<HeaderItem> {
-        // One `counts` call per frame, and it is `O(1)` — the matched
-        // intersections behind `done` and `cached` are counters folded in
-        // `BuildState::apply`, not scans. Keep the whole header on this one call
-        // so the fields cannot disagree about the frame they describe.
-        let Counts {
-            done,
-            total,
-            cached,
-            waiting,
-            failed,
-        } = core.counts(scope);
-        // The done segment `X / Y done` splits into two independent tabs: `X`
-        // (the finished count → Done view) and `Y` (the matched total → Matched
-        // view). The connective ` / ` and trailing ` done` are inert text. Before
-        // any `Matched` event there is no denominator, so it reads `{executed} done`
-        // with only the Done tab.
-        let mut done_parts = vec![HeaderPart::text(done)];
-        match total {
-            Some(total) => {
-                done_parts.push(HeaderPart::text(" / "));
-                done_parts.push(HeaderPart::text(total));
-                done_parts.push(HeaderPart::text(" done"));
-            }
-            None => done_parts.push(HeaderPart::text(" done")),
-        }
-        let mut items = vec![
-            HeaderItem::Split(done_parts),
-            // The cached count is a tab into the cached-targets view.
-            HeaderItem::tab(ViewMode::Cached, cached),
-            // The waiting count is a tab into the admission-wait view.
-            HeaderItem::tab(ViewMode::Waiting, waiting),
-            // The failed count is a tab into the failed-targets view.
-            HeaderItem::tab(ViewMode::Failed, failed),
-        ];
-        // The cells are CPUs of the cpu pool, filled by what the running
-        // targets reserved (a running sum, not a walk over the targets).
-        let workers = worker_spans(core.max_workers().unwrap_or(0), core.busy_cpus());
-        if !workers.is_empty() {
-            items.push(HeaderItem::Text(workers));
-        }
-        items.extend(
-            core.pool_segments()
-                .map(|seg| HeaderItem::Text(vec![Span::raw(seg)])),
-        );
-        items
-    }
-
     fn label(&self) -> String {
         self.label.clone()
     }
@@ -1594,25 +1121,6 @@ impl GcHeader {
             failure_logs: None,
             cache_db: None,
         }
-    }
-
-    fn segment(&self) -> String {
-        let mut s = format!(
-            "{} targets · {} freed",
-            self.targets,
-            human_bytes(self.bytes_removed),
-        );
-        if let Some((n, bytes)) = self.failure_logs {
-            s.push_str(&format!(
-                " · {n} failure logs, {} freed",
-                human_bytes(bytes)
-            ));
-        }
-        if let Some(db) = &self.cache_db {
-            s.push_str(" · ");
-            s.push_str(db);
-        }
-        s
     }
 }
 
@@ -1708,8 +1216,23 @@ impl ProgressHeader for GcHeader {
         }
     }
 
-    fn header(&self, _core: &BuildState, _scope: CountScope) -> Vec<HeaderItem> {
-        vec![HeaderItem::text(self.segment())]
+    fn segment(&self) -> String {
+        let mut s = format!(
+            "{} targets · {} freed",
+            self.targets,
+            human_bytes(self.bytes_removed),
+        );
+        if let Some((n, bytes)) = self.failure_logs {
+            s.push_str(&format!(
+                " · {n} failure logs, {} freed",
+                human_bytes(bytes)
+            ));
+        }
+        if let Some(db) = &self.cache_db {
+            s.push_str(" · ");
+            s.push_str(db);
+        }
+        s
     }
 
     fn label(&self) -> String {
@@ -1889,24 +1412,6 @@ const APPROVAL_OPEN_HINT: &str = "v review approval";
 
 /// What an attached viewer's prompt row says in place of the key (I11).
 const APPROVAL_ELSEWHERE: &str = " · decide in the terminal that runs it";
-
-/// A header's items as plain text, joined as the box joins them.
-fn header_text(items: Vec<HeaderItem>) -> String {
-    let mut out = String::new();
-    for (i, item) in items.into_iter().enumerate() {
-        if i > 0 {
-            out.push_str(" · ");
-        }
-        let spans = match item {
-            HeaderItem::Text(spans) | HeaderItem::Tab { spans, .. } => spans,
-            HeaderItem::Split(parts) => parts.into_iter().flat_map(|p| p.spans).collect(),
-        };
-        for span in spans {
-            out.push_str(&span.content);
-        }
-    }
-    out
-}
 
 impl TuiProgressView {
     /// Build-counts header (run/query/inspect). The label rides the bottom border.
@@ -2220,18 +1725,6 @@ impl TuiProgressView {
         self.tab(true);
     }
 
-    /// The clock and the header model's items, as the box's top border
-    /// carried them: what the header tests read since the box went.
-    #[cfg(test)]
-    fn header_line(&self, now_ms: u64, _width: u16) -> String {
-        let clock = self.finished_at_ms.unwrap_or(now_ms);
-        format!(
-            "{} · {}",
-            human_elapsed(self.state.elapsed_ms(clock)),
-            header_text(self.model.header(&self.state, self.list.scope))
-        )
-    }
-
     /// The instant the run's times are measured to: `now_ms` while it runs,
     /// the finish once it has ended, so every clock on screen stops there
     /// (a target still open when the run ended included).
@@ -2405,9 +1898,7 @@ impl TuiProgressView {
                 cpu: self.cpu_segment(),
             })
         } else {
-            line::Body::Text(Cow::Owned(header_text(
-                self.model.header(&self.state, scope),
-            )))
+            line::Body::Text(Cow::Owned(self.model.segment()))
         };
         // Until the run ends, a label the header keeps up ("Invoking …": what
         // is about to take the terminal, on the line while its dependencies
@@ -3374,13 +2865,16 @@ mod tests {
         BuildEvent { at_unix_ms, kind }
     }
 
-    /// Flatten a header model's items into their concatenated text.
-    fn header_text(items: &[HeaderItem]) -> String {
-        items
-            .iter()
-            .flat_map(|i| i.spans())
-            .map(|s| s.content.to_string())
-            .collect()
+    /// What the dashboard's blocked row and details say about `addr`'s wait.
+    fn wait_detail(s: &BuildState, addr: &str) -> Option<String> {
+        use crate::tui::dashboard::Waits as _;
+        s.wait_words(addr, 0).map(|w| w.detail)
+    }
+
+    /// `addr`'s wait as `(PHASE, details)`, waited up to `now_ms`.
+    fn wait_words_at(s: &BuildState, addr: &str, now_ms: u64) -> Option<(String, String)> {
+        use crate::tui::dashboard::Waits as _;
+        s.wait_words(addr, now_ms).map(|w| (w.phase, w.detail))
     }
 
     #[test]
@@ -3394,15 +2888,10 @@ mod tests {
                 in_use_by_readers: false,
             },
         ));
-        let lines = s.lock_wait_lines();
-        assert_eq!(lines.len(), 1);
-        let text = lines[0]
-            .spans
-            .iter()
-            .map(|s| s.content.as_ref())
-            .collect::<String>();
-        assert!(text.contains("//pkg:a"), "{text}");
-        assert!(text.contains("pid 4242"), "{text}");
+        assert_eq!(
+            wait_detail(&s, "//pkg:a").as_deref(),
+            Some("held by pid 4242")
+        );
 
         // The notice disappears when the wait ends.
         s.apply(&ev(
@@ -3411,7 +2900,7 @@ mod tests {
                 addr: "//pkg:a".into(),
             },
         ));
-        assert!(s.lock_wait_lines().is_empty());
+        assert_eq!(wait_detail(&s, "//pkg:a"), None);
     }
 
     /// A live session recorded under `root`, owned by this test process.
@@ -3460,15 +2949,12 @@ mod tests {
         );
         let id = holder.id();
         assert_eq!(
-            line_text(&s.lock_wait_lines()[0]),
-            format!("  🔒 //pkg:a (locked by session {id} (pid {pid}))"),
+            wait_detail(&s, "//pkg:a"),
+            Some(format!("held by session {id} (pid {pid})")),
         );
         assert_eq!(
-            line_text(&s.scratch_wait_lines(61_000)[0]),
-            format!(
-                "  ⧗ //build:c — 1 waiting (held by session {id} (pid {pid}), {})",
-                human_elapsed(61_000)
-            ),
+            wait_detail(&s, "//pkg:b"),
+            Some(format!("held by session {id} (pid {pid})")),
         );
         holder.finish(Some(0), false);
     }
@@ -3478,12 +2964,12 @@ mod tests {
     #[test]
     fn lock_waits_name_only_the_pid_without_a_live_other_session() {
         let pid = std::process::id();
-        let pid_only = format!("  🔒 //pkg:a (locked by pid {pid})");
+        let pid_only = Some(format!("held by pid {pid}"));
         let render = |names: HolderNames| {
             let mut s = BuildState::new();
             s.name_lock_holders(names);
             resolve_then_apply(&mut s, ev(0, lock_wait_start("//pkg:a", pid)));
-            line_text(&s.lock_wait_lines()[0])
+            wait_detail(&s, "//pkg:a")
         };
 
         let empty = tempfile::tempdir().expect("tempdir");
@@ -3518,14 +3004,13 @@ mod tests {
         let late = live_session(root.path());
         assert!(!s.holders.needs(pid), "resolved, so never scanned again");
         resolve_then_apply(&mut s, ev(1, lock_wait_start("//pkg:b", pid)));
-        let lines: Vec<String> = s.lock_wait_lines().iter().map(line_text).collect();
-        assert_eq!(
-            lines,
-            [
-                format!("  🔒 //pkg:a (locked by pid {pid})"),
-                format!("  🔒 //pkg:b (locked by pid {pid})"),
-            ],
-        );
+        for addr in ["//pkg:a", "//pkg:b"] {
+            assert_eq!(
+                wait_detail(&s, addr),
+                Some(format!("held by pid {pid}")),
+                "{addr}"
+            );
+        }
         late.finish(Some(0), false);
     }
 
@@ -3540,12 +3025,10 @@ mod tests {
                 in_use_by_readers: false,
             },
         ));
-        let text = s.lock_wait_lines()[0]
-            .spans
-            .iter()
-            .map(|s| s.content.as_ref())
-            .collect::<String>();
-        assert!(text.contains("holder unknown"), "{text}");
+        assert_eq!(
+            wait_detail(&s, "//pkg:a").as_deref(),
+            Some("holder unknown")
+        );
     }
 
     /// The wait the old message could not explain: a rebuild or delete parked
@@ -3562,13 +3045,10 @@ mod tests {
                 in_use_by_readers: true,
             },
         ));
-        let text = s.lock_wait_lines()[0]
-            .spans
-            .iter()
-            .map(|s| s.content.as_ref())
-            .collect::<String>();
-        assert!(text.contains("(locked, in use)"), "{text}");
-        assert!(!text.contains("unknown"), "{text}");
+        assert_eq!(
+            wait_detail(&s, "//pkg:a").as_deref(),
+            Some("in use by readers")
+        );
     }
 
     fn result_start(addr: &str) -> BuildEventKind {
@@ -3615,84 +3095,6 @@ mod tests {
     }
 
     const CPU: u64 = hcore::capacity::MICROS_PER_CPU;
-
-    /// A target granted less than it declared shows `[cpu 16→4]` on its row
-    /// without `-v`; one granted in full shows nothing, and the note goes
-    /// with the run.
-    #[test]
-    fn a_clamped_target_row_shows_declared_to_reserved() {
-        let start = |addr: &str, declared: u64, reserved: u64| BuildEventKind::ExecuteStart {
-            output_groups: Vec::new(),
-            log_not_streamed: false,
-            addr: addr.into(),
-            driver: "exec".into(),
-            cache: true,
-            declared: Some([("cpu".into(), declared)].into()),
-            reserved: Some([("cpu".into(), reserved)].into()),
-            queued_ms: Some(0),
-            admitted: None,
-        };
-        let mut s = BuildState::new();
-        s.apply(&ev(0, start("//p:big", 16 * CPU, 4 * CPU)));
-        s.apply(&ev(0, start("//p:fits", 2 * CPU, 2 * CPU)));
-        let rows: Vec<String> = s.slow_rows(9_000).iter().map(|l| format!("{l}")).collect();
-        let big = rows
-            .iter()
-            .find(|r| r.contains("//p:big"))
-            .expect("big row");
-        assert!(big.ends_with("[cpu 16→4]"), "{big}");
-        let fits = rows
-            .iter()
-            .find(|r| r.contains("//p:fits"))
-            .expect("fits row");
-        assert!(!fits.contains('→'), "{fits}");
-        s.apply(&ev(9_000, execute_end("//p:big")));
-        assert!(s.clamped.is_empty());
-        assert_eq!(
-            hcore::events::clamp_text(
-                Some(&[("cpu".into(), CPU / 2), ("memory".into(), 1 << 30)].into()),
-                Some(&[("cpu".into(), CPU / 4), ("memory".into(), 1 << 30)].into()),
-                Unit::default_for,
-            )
-            .as_deref(),
-            Some("cpu 0.5→0.25")
-        );
-    }
-
-    /// A clamp on a custom pool reads in the unit `RequestConfig` announced
-    /// for it, not as a bare count.
-    #[test]
-    fn a_clamp_on_a_custom_pool_reads_in_its_unit() {
-        let mut s = BuildState::new();
-        s.apply(&ev(
-            0,
-            BuildEventKind::RequestConfig {
-                max_workers: 4,
-                fail_fast: false,
-                scratch_disabled: false,
-                resources: [("scratch_disk".into(), Some(4 << 30))].into(),
-                units: [("scratch_disk".into(), "bytes".into())].into(),
-            },
-        ));
-        s.apply(&ev(
-            1,
-            BuildEventKind::ExecuteStart {
-                output_groups: Vec::new(),
-                log_not_streamed: false,
-                addr: "//p:big".into(),
-                driver: "exec".into(),
-                cache: true,
-                declared: Some([("scratch_disk".into(), 8 << 30)].into()),
-                reserved: Some([("cpu".into(), CPU), ("scratch_disk".into(), 4 << 30)].into()),
-                queued_ms: None,
-                admitted: None,
-            },
-        ));
-        assert_eq!(
-            s.clamped.get("//p:big").map(String::as_str),
-            Some("scratch_disk 8.0 GiB→4.0 GiB")
-        );
-    }
 
     /// A pool's report, as the engine sends it on every change.
     fn pool_usage(pool: &str, held: u64, capacity: u64, waiting: u64) -> BuildEventKind {
@@ -3746,7 +3148,8 @@ mod tests {
             1,
             execute_start_reserving("//a:x", &[("cpu", 3 * CPU), ("docker", 1)]),
         ));
-        assert_eq!(s.busy_cpus(), 0, "nothing derived from reserved");
+        let cpu_held = |s: &BuildState| s.dashboard().pool("cpu").map_or(0, |g| g.held);
+        assert_eq!(cpu_held(&s), 0, "nothing derived from reserved");
         let pools = |s: &BuildState| {
             s.dashboard()
                 .gauges()
@@ -3755,22 +3158,13 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(pools(&s), ["cpu"]);
-        assert!(s.pool_segments().next().is_none());
 
         s.apply(&ev(2, pool_usage("cpu", 11 * CPU + CPU / 2, 12 * CPU, 0)));
         s.apply(&ev(2, pool_usage("memory", 9 << 30, 16 << 30, 0)));
         s.apply(&ev(2, pool_usage("sandbox", 9, 48, 0)));
         s.apply(&ev(2, pool_usage("docker", 2, 2, 1)));
         s.apply(&ev(2, pool_usage("gpu", 0, 4, 0)));
-        assert_eq!(s.busy_cpus(), 12, "11.5 rounds up");
-        assert_eq!(
-            s.pool_segments().collect::<Vec<_>>(),
-            [
-                "memory 9.0 GiB/16.0 GiB",
-                "sandbox 9/48",
-                "docker 2/2, 1 waiting"
-            ]
-        );
+        assert_eq!(cpu_held(&s), 11 * CPU + CPU / 2);
         let gauges = s.dashboard().gauges();
         assert_eq!(
             gauges.iter().map(|g| g.pool.as_str()).collect::<Vec<_>>(),
@@ -3813,14 +3207,10 @@ mod tests {
 
         // The next report replaces the last; a run's end moves nothing.
         s.apply(&ev(3, execute_end("//a:x")));
-        assert_eq!(s.busy_cpus(), 12);
+        assert_eq!(cpu_held(&s), 11 * CPU + CPU / 2);
         s.apply(&ev(4, pool_usage("cpu", 0, 12 * CPU, 0)));
         s.apply(&ev(4, pool_usage("docker", 1, 2, 0)));
-        assert_eq!(s.busy_cpus(), 0);
-        assert_eq!(
-            s.pool_segments().collect::<Vec<_>>(),
-            ["memory 9.0 GiB/16.0 GiB", "sandbox 9/48", "docker 1/2"]
-        );
+        assert_eq!(cpu_held(&s), 0);
 
         // A pool in play stays, idle or not; one never touched stays out.
         s.apply(&ev(5, pool_usage("memory", 0, 16 << 30, 0)));
@@ -3844,7 +3234,11 @@ mod tests {
     #[test]
     fn pool_segments_show_removals_pending_on_a_sandbox_wait() {
         let mut s = BuildState::new();
-        let segments = |s: &BuildState| s.pool_segments().collect::<Vec<_>>();
+        let segments = |s: &BuildState| {
+            s.dashboard()
+                .pool("sandbox")
+                .map(|g| (g.waiting, g.removals_pending))
+        };
         let wait = |addr: &str, pending| BuildEventKind::AdmissionWaitStart {
             addr: addr.into(),
             pool: "sandbox".into(),
@@ -3863,18 +3257,14 @@ mod tests {
         };
         s.apply(&ev(1, wait("//a:x", 0)));
         s.apply(&ev(1, usage(1, 0)));
-        assert_eq!(segments(&s), ["sandbox: 1 waiting"], "none pending");
+        assert_eq!(segments(&s), Some((1, 0)), "none pending");
         s.apply(&ev(1, wait("//a:y", 1)));
         s.apply(&ev(1, usage(2, 1)));
-        assert_eq!(segments(&s), ["sandbox: 2 waiting (1 removal pending)"]);
+        assert_eq!(segments(&s), Some((2, 1)));
         s.apply(&ev(2, wait("//a:z", 3)));
         s.apply(&ev(2, usage(3, 3)));
-        assert_eq!(segments(&s), ["sandbox: 3 waiting (3 removals pending)"]);
-        let row: String = s.admission_wait_lines(2, "")[2]
-            .spans
-            .iter()
-            .map(|sp| sp.content.as_ref())
-            .collect();
+        assert_eq!(segments(&s), Some((3, 3)));
+        let row = wait_detail(&s, "//a:z").expect("a's wait");
         assert!(
             row.ends_with("— cleanup is behind: 3 removals pending"),
             "{row}"
@@ -3886,7 +3276,7 @@ mod tests {
             ));
         }
         s.apply(&ev(3, usage(0, 0)));
-        assert!(segments(&s).is_empty(), "{:?}", segments(&s));
+        assert_eq!(segments(&s), Some((0, 0)));
     }
 
     #[test]
@@ -3904,19 +3294,17 @@ mod tests {
                 yielding_to: None,
             },
         ));
-        let text: String = s.admission_wait_lines(42_000, "")[0]
-            .spans
-            .iter()
-            .map(|sp| sp.content.as_ref())
-            .collect();
-        assert_eq!(text, "  ⧗ //a:b waits for cpu 4 (2 free, 41s)");
+        assert_eq!(
+            wait_words_at(&s, "//a:b", 42_000),
+            Some(("waits cpu 4".into(), "(2 free, 41s)".into()))
+        );
         s.apply(&ev(
             43_000,
             BuildEventKind::AdmissionWaitEnd {
                 addr: "//a:b".into(),
             },
         ));
-        assert!(s.admission_wait_lines(43_000, "").is_empty());
+        assert_eq!(wait_words_at(&s, "//a:b", 43_000), None);
     }
 
     /// A waiter that fits and is held back for the oldest one says so in its
@@ -3939,17 +3327,13 @@ mod tests {
         };
         s.apply(&ev(1_000, wait("//a:b", "cpu", 8 * CPU)));
         s.apply(&ev(1_000, wait("//a:c", "memory", 2 << 30)));
-        let rows: Vec<String> = s
-            .admission_wait_lines(42_000, "")
-            .iter()
-            .map(|l| format!("{l}"))
-            .collect();
         assert_eq!(
-            rows,
-            [
-                "  ⧗ //a:b waits for cpu 1 (3 free, yielding to a cpu 8 run, 41s)",
-                "  ⧗ //a:c waits for cpu 1 (3 free, yielding to a memory 2.0 GiB run, 41s)",
-            ]
+            wait_words_at(&s, "//a:b", 42_000).map(|w| w.1).as_deref(),
+            Some("(3 free, yielding to a cpu 8 run, 41s)")
+        );
+        assert_eq!(
+            wait_words_at(&s, "//a:c", 42_000).map(|w| w.1).as_deref(),
+            Some("(3 free, yielding to a memory 2.0 GiB run, 41s)")
         );
     }
 
@@ -4027,23 +3411,20 @@ mod tests {
         assert_eq!(s.counts(CountScope::Matched).waiting, "2 waiting");
         s.apply(&ev(2_000, execute_start("//a:b")));
         assert_eq!(s.counts(CountScope::Matched).waiting, "1 waiting");
-        let rows: Vec<String> = s
-            .admission_wait_lines(3_000, "")
-            .iter()
-            .map(|l| format!("{l}"))
-            .collect();
-        assert_eq!(rows.len(), 1, "{rows:?}");
-        assert!(rows[0].contains("//a:c"), "{rows:?}");
+        assert_eq!(wait_detail(&s, "//a:b"), None, "the started one");
+        assert!(wait_detail(&s, "//a:c").is_some(), "the one still waiting");
+    }
+
+    /// The line as drawn at `now_ms`, 200 columns wide.
+    fn line_at(v: &TuiProgressView, now_ms: u64) -> String {
+        line_text(&v.line("⠋", now_ms, 200, true))
     }
 
     #[test]
     fn the_session_header_counts_waiting_between_cached_and_failed() {
         let v = TuiProgressView::new("L");
-        let header = v.header_line(0, 100);
-        assert!(
-            header.contains("0 cached · 0 waiting · 0 failed"),
-            "{header}"
-        );
+        let line = line_at(&v, 0);
+        assert!(line.contains("0 cached · 0 waiting · 0 failed"), "{line}");
     }
     fn execute_end(addr: &str) -> BuildEventKind {
         BuildEventKind::ExecuteEnd {
@@ -4073,34 +3454,19 @@ mod tests {
     #[test]
     fn op_timeline_records_execute_then_local_cache_write_breakdown() {
         // Execute runs 0→3s (completed), then LocalCacheWrite opens at 3s and is
-        // still live at now=9s (6s active, over the 5s trigger). The breakdown
-        // carries both, ordered by pipeline.
+        // still live: the finished op is folded into the record, the live one
+        // is the open op.
         let mut s = BuildState::new();
         s.apply(&ev(0, execute_start("//a:b")));
         s.apply(&ev(3_000, execute_end("//a:b")));
         s.apply(&ev(3_000, local_write_start("//a:b")));
 
-        let long = s.long_running(9_000, 5_000);
-        assert_eq!(long.len(), 1);
-        assert_eq!(long[0].0, "//a:b");
-        assert_eq!(long[0].1, 6_000); // active LocalCacheWrite elapsed
-        assert_eq!(
-            long[0].2,
-            vec![(Op::Execute, 3_000), (Op::LocalCacheWrite, 6_000)]
-        );
-    }
-
-    #[test]
-    fn op_timeline_omits_sub_second_ops() {
-        // A 500ms Execute is below the 1s breakdown floor and is dropped; only the
-        // live 6s LocalCacheWrite shows.
-        let mut s = BuildState::new();
-        s.apply(&ev(0, execute_start("//a:b")));
-        s.apply(&ev(500, execute_end("//a:b")));
-        s.apply(&ev(500, local_write_start("//a:b")));
-
-        let long = s.long_running(6_500, 5_000);
-        assert_eq!(long[0].2, vec![(Op::LocalCacheWrite, 6_000)]);
+        assert_eq!(open_addrs(&s), ["//a:b"]);
+        let r = rec(&s, "//a:b");
+        assert_eq!(r.op_ms(Op::Execute), 3_000);
+        assert_eq!(r.op_ms(Op::LocalCacheWrite), 0, "still open");
+        assert_eq!((r.op(), r.op_open()), (Some(Op::LocalCacheWrite), true));
+        assert_eq!(r.op_since_ms, 3_000);
     }
 
     #[test]
@@ -4157,7 +3523,7 @@ mod tests {
             assert_eq!(open_addrs(&s), ["//a:b"]);
             s.apply(&ev(2_000, result_end("//a:b", error)));
             assert!(open_addrs(&s).is_empty());
-            assert!(s.long_running(99_000, 0).is_empty());
+            assert!(!rec(&s, "//a:b").op_open());
         }
     }
 
@@ -4187,18 +3553,26 @@ mod tests {
         let mut s = BuildState::new();
         s.apply(&ev(0, execute_start("//a:exec")));
         s.apply(&ev(0, local_write_start("//a:write")));
-        assert_eq!(s.busy_workers(), 1);
+        assert_eq!(executing(&s), 1);
+    }
+
+    /// Targets whose open op is `Execute`: the ones holding a worker slot.
+    fn executing(s: &BuildState) -> usize {
+        s.dash
+            .open_ops()
+            .filter(|(_, r)| r.op() == Some(Op::Execute))
+            .count()
     }
 
     #[test]
     fn op_timeline_non_execute_op_alone_surfaces_target() {
-        // A non-Execute op (cache write) with no Execute event still surfaces the
-        // target as slow, proving the timeline is not Execute-specific.
+        // A non-Execute op (cache write) with no Execute event still opens an
+        // op on the target, proving the timeline is not Execute-specific.
         let mut s = BuildState::new();
         s.apply(&ev(0, local_write_start("//a:b")));
-        let long = s.long_running(6_000, 5_000);
-        assert_eq!(long.len(), 1);
-        assert_eq!(long[0].2, vec![(Op::LocalCacheWrite, 6_000)]);
+        assert_eq!(open_addrs(&s), ["//a:b"]);
+        let r = rec(&s, "//a:b");
+        assert_eq!((r.op(), r.op_open()), (Some(Op::LocalCacheWrite), true));
     }
 
     #[test]
@@ -4387,26 +3761,28 @@ mod tests {
     }
 
     #[test]
-    fn long_running_filters_by_threshold_and_sorts_desc() {
+    fn long_running_ops_keep_their_start() {
+        // Each open op carries the instant it opened, which is what a live
+        // elapsed is measured from.
         let mut s = BuildState::new();
-        // Started at 0, 1000, 4000.
         s.apply(&ev(0, execute_start("//slow:a")));
         s.apply(&ev(1_000, execute_start("//mid:b")));
         s.apply(&ev(4_000, execute_start("//fresh:c")));
 
-        // now = 7000, threshold = 5000:
-        //   //slow:a   elapsed 7000 > 5000  ✓
-        //   //mid:b    elapsed 6000 > 5000  ✓
-        //   //fresh:c  elapsed 3000         ✗
-        let long = s.long_running(7_000, 5_000);
-        assert_eq!(long.len(), 2);
-        // Sorted descending by active elapsed: slow (7000) before mid (6000).
-        assert_eq!(long[0].0, "//slow:a");
-        assert_eq!(long[0].1, 7_000);
-        assert_eq!(long[0].2, vec![(Op::Execute, 7_000)]);
-        assert_eq!(long[1].0, "//mid:b");
-        assert_eq!(long[1].1, 6_000);
-        assert_eq!(long[1].2, vec![(Op::Execute, 6_000)]);
+        let mut open: Vec<(&str, Option<Op>, u64)> = s
+            .dash
+            .open_ops()
+            .map(|(id, r)| (s.dash.addr(id), r.op(), r.op_since_ms))
+            .collect();
+        open.sort_unstable_by_key(|&(addr, ..)| addr);
+        assert_eq!(
+            open,
+            [
+                ("//fresh:c", Some(Op::Execute), 4_000),
+                ("//mid:b", Some(Op::Execute), 1_000),
+                ("//slow:a", Some(Op::Execute), 0),
+            ]
+        );
     }
 
     #[test]
@@ -4414,28 +3790,8 @@ mod tests {
         let mut s = BuildState::new();
         s.apply(&ev(0, execute_start("//slow:a")));
         s.apply(&ev(100, execute_end("//slow:a")));
-        assert!(s.long_running(10_000, 5_000).is_empty());
-    }
-
-    #[test]
-    fn long_running_lines_render_icons_per_op() {
-        // A slow target with a finished Execute and a live LocalCacheWrite renders
-        // one `(icon Ns)` group per op.
-        let mut s = BuildState::new();
-        s.apply(&ev(0, execute_start("//slow:x")));
-        s.apply(&ev(3_000, execute_end("//slow:x")));
-        s.apply(&ev(3_000, local_write_start("//slow:x")));
-
-        let line = format!("{}", s.slow_rows(9_000)[0]);
-        assert!(line.contains("//slow:x"), "{line}");
-        assert!(
-            line.contains(&format!("({} ", Op::Execute.icon())),
-            "{line}"
-        );
-        assert!(
-            line.contains(&format!("({} ", Op::LocalCacheWrite.icon())),
-            "{line}"
-        );
+        assert!(open_addrs(&s).is_empty());
+        assert_eq!(rec(&s, "//slow:a").op_ms(Op::Execute), 100);
     }
 
     fn scratch_wait(addr: &str, scratch: &str, access: &str, pid: Option<u32>) -> BuildEventKind {
@@ -4454,9 +3810,10 @@ mod tests {
         }
     }
 
-    /// The row is about the *cache*, and many blocked targets collapse into one
-    /// line. A shared `exclusive` cache with hundreds of consumers produces that
-    /// many simultaneous waits; a row each would bury every other diagnostic.
+    /// Waits are grouped by *cache*: many blocked targets collapse into one
+    /// group. A shared `exclusive` cache with hundreds of consumers produces
+    /// that many simultaneous waits; a spotlight each would bury every other
+    /// diagnostic.
     #[test]
     fn scratch_waits_collapse_to_one_row_per_cache() {
         let mut st = BuildState::new();
@@ -4476,27 +3833,28 @@ mod tests {
             scratch_wait("//other:x", "//build:gomodcache", "shared", Some(88214)),
         ));
 
-        let lines = st.scratch_wait_lines(61_000);
-        assert_eq!(lines.len(), 2, "one row per cache, not per waiter");
+        assert_eq!(
+            st.spot.by_cache.len(),
+            2,
+            "one group per cache, not per waiter"
+        );
+        assert_eq!(
+            st.spot
+                .by_cache
+                .get("//build:gocache")
+                .map(std::collections::BTreeSet::len),
+            Some(40),
+        );
 
-        let text: Vec<String> = lines
-            .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
-            .collect();
-        assert!(
-            text[0].contains("//build:gocache") && text[0].contains("40 waiting"),
-            "the cache and the count are the diagnostic: {:?}",
-            text[0],
+        assert_eq!(
+            wait_words_at(&st, "//go/pkg0:build", 61_000),
+            Some(("waits //build:gocache".to_owned(), "queued".to_owned())),
+            "each waiter names the cache it waits on",
         );
-        assert!(
-            text[0].contains("exclusive"),
-            "an unheld slot names the access mode that caused it: {:?}",
-            text[0],
-        );
-        assert!(
-            text[1].contains("held by pid 88214"),
-            "a named holder outranks the access mode: {:?}",
-            text[1],
+        assert_eq!(
+            wait_detail(&st, "//other:x").as_deref(),
+            Some("held by pid 88214"),
+            "a named holder is the diagnostic",
         );
     }
 
@@ -4511,10 +3869,11 @@ mod tests {
             scratch_wait("//a:x", "//build:gocache", "exclusive", None),
         ));
         assert!(
-            st.lock_wait_lines().is_empty(),
-            "a scratch wait must not appear among the result-lock rows",
+            st.lock_waits.is_empty(),
+            "a scratch wait must not be folded as a result-lock wait",
         );
-        assert_eq!(st.scratch_wait_lines(1_000).len(), 1);
+        let (phase, _) = wait_words_at(&st, "//a:x", 1_000).expect("a wait");
+        assert_eq!(phase, "waits //build:gocache", "not `locked`");
     }
 
     /// The row disappears the moment the slot is acquired — it reflects only
@@ -4527,9 +3886,10 @@ mod tests {
             1_000,
             scratch_wait("//a:x", "//build:gocache", "exclusive", None),
         ));
-        assert_eq!(st.scratch_wait_lines(5_000).len(), 1);
+        assert!(wait_words_at(&st, "//a:x", 5_000).is_some());
         st.apply(&ev(9_000, scratch_wait_end("//a:x", "//build:gocache")));
-        assert!(st.scratch_wait_lines(9_000).is_empty());
+        assert_eq!(wait_words_at(&st, "//a:x", 9_000), None);
+        assert!(st.spot.by_cache.is_empty(), "the cache's group leaves too");
 
         // …and is remembered as a total, which is what the summary reports.
         assert_eq!(
@@ -4666,17 +4026,22 @@ mod tests {
                 scratch: "//build:gocache".into(),
             },
         ));
-        let rows = st.slow_rows(42_000);
-        let text: String = rows[0]
-            .spans
-            .iter()
-            .map(|s| s.content.to_string())
-            .collect();
-        assert!(
-            text.contains("//a:x")
-                && text.contains(&format!("({} 42s)", Op::ScratchPrepare.icon())),
-            "{text}",
-        );
+        assert_eq!(open_addrs(&st), ["//a:x"]);
+        let r = rec(&st, "//a:x");
+        assert_eq!((r.op(), r.op_open()), (Some(Op::ScratchPrepare), true));
+
+        st.apply(&ev(
+            42_000,
+            BuildEventKind::ScratchPrepareEnd {
+                addr: "//a:x".into(),
+                scratch: "//build:gocache".into(),
+                outcome: "pulled".into(),
+                bytes: 0,
+                path_mismatch: false,
+                error: None,
+            },
+        ));
+        assert_eq!(rec(&st, "//a:x").op_ms(Op::ScratchPrepare), 42_000);
     }
 
     /// Ordering is the pipeline order, so a row reads left-to-right as the
@@ -4701,16 +4066,6 @@ mod tests {
         );
     }
 
-    fn max_workers(count: usize) -> BuildEventKind {
-        BuildEventKind::RequestConfig {
-            max_workers: count,
-            fail_fast: false,
-            scratch_disabled: false,
-            resources: Default::default(),
-            units: Default::default(),
-        }
-    }
-
     #[test]
     fn header_shows_built_cached_failed_counts_no_running() {
         let mut v = TuiProgressView::new("L");
@@ -4724,13 +4079,13 @@ mod tests {
         v.apply(&ev(4, result_start("//a:failed")));
         v.apply(&ev(5, result_end("//a:failed", Some("boom".into()))));
 
-        let header = v.header_line(100, 120).to_string();
+        let line = line_at(&v, 100);
         // Done is Done + Cached, as the line and the tabs count it.
-        assert!(header.contains("2 done"), "{header}");
-        assert!(header.contains("1 cached"), "{header}");
-        assert!(header.contains("1 failed"), "{header}");
-        // The "running" count was dropped in favour of the worker braille.
-        assert!(!header.contains("running"), "{header}");
+        assert!(line.contains("2 done"), "{line}");
+        assert!(line.contains("1 cached"), "{line}");
+        assert!(line.contains("1 failed"), "{line}");
+        // There is no "running" count.
+        assert!(!line.contains("running"), "{line}");
     }
 
     #[test]
@@ -4740,54 +4095,14 @@ mod tests {
         v.apply(&ev(0, matched(&["//a:x", "//a:y", "//a:z"], false)));
         v.apply(&ev(1, result_start("//a:x")));
         v.apply(&ev(2, result_end("//a:x", None)));
-        let header = v.header_line(100, 120).to_string();
-        assert!(header.contains("1 / ~3 done"), "{header}");
+        let line = line_at(&v, 100);
+        assert!(line.contains("1 / ~3 done"), "{line}");
 
         // Matcher resolves: the `~` drops.
         v.apply(&ev(3, matched(&[], true)));
-        let header = v.header_line(100, 120).to_string();
-        assert!(header.contains("1 / 3 done"), "{header}");
-        assert!(!header.contains('~'), "{header}");
-    }
-
-    #[test]
-    fn header_braille_sits_after_failed_count() {
-        let mut v = TuiProgressView::new("L");
-        v.apply(&ev(0, max_workers(8)));
-        v.apply(&ev(1, execute_start("//a:b")));
-        v.apply(&ev(1, pool_usage("cpu", CPU, 8 * CPU, 0)));
-        let header = v.header_line(100, 120).to_string();
-        // " · ⠁" appears after "failed".
-        let failed_at = header.find("failed").expect("failed in header");
-        let braille_at = header.find('⠁').expect("braille in header");
-        assert!(
-            braille_at > failed_at,
-            "braille must follow failed: {header}"
-        );
-        assert!(
-            header.contains("failed · "),
-            "separator before braille: {header}"
-        );
-    }
-
-    #[test]
-    fn max_workers_event_drives_worker_braille() {
-        let mut v = TuiProgressView::new("L");
-        v.apply(&ev(0, max_workers(8)));
-        // One busy worker → first cell shows the 1-dot glyph, in the header.
-        v.apply(&ev(1, execute_start("//a:b")));
-        v.apply(&ev(1, pool_usage("cpu", CPU, 8 * CPU, 0)));
-        let header = v.header_line(120, 120).to_string();
-        assert!(header.contains('⠁'), "expected 1-busy braille: {header}");
-    }
-
-    #[test]
-    fn no_worker_braille_before_max_workers_event() {
-        let v = TuiProgressView::new("L");
-        let header = v.header_line(0, 120).to_string();
-        for g in ['⠁', '⠃', '⠇', '⠧', '⠷', '⠿', '⡿', '⣿'] {
-            assert!(!header.contains(g), "no braille expected: {header}");
-        }
+        let line = line_at(&v, 100);
+        assert!(line.contains("1 / 3 done"), "{line}");
+        assert!(!line.contains('~'), "{line}");
     }
 
     #[test]
@@ -5140,7 +4455,7 @@ mod tests {
         h.apply(&ev(0, gc_swept(2, 1024)));
         h.apply(&ev(1, gc_swept(0, 0))); // zero-removal target still counts as explored
 
-        let seg = header_text(&h.header(&core, CountScope::Matched));
+        let seg = ProgressHeader::segment(&h);
         assert!(seg.contains("2 targets"), "{seg}");
         assert!(seg.contains("1.0 KiB"), "{seg}");
         assert_eq!(h.label(), "GC");
@@ -5154,7 +4469,7 @@ mod tests {
         let core = BuildState::new();
         let mut h = GcHeader::new("GC");
         h.apply(&ev(0, gc_swept(2, 1024)));
-        let before = header_text(&h.header(&core, CountScope::Matched));
+        let before = ProgressHeader::segment(&h);
         assert_eq!(before, "1 targets · 1.0 KiB freed");
 
         h.apply(&ev(
@@ -5164,7 +4479,7 @@ mod tests {
                 bytes_removed: 2048,
             },
         ));
-        let after = header_text(&h.header(&core, CountScope::Matched));
+        let after = ProgressHeader::segment(&h);
         assert_eq!(after, format!("{before} · 3 failure logs, 2.0 KiB freed"));
 
         // Only failure logs removed: still worth a final line.
@@ -5215,7 +4530,7 @@ mod tests {
             let mut h = GcHeader::new("GC");
             h.apply(&ev(0, gc_swept(1, 1024)));
             h.apply(&ev(1, kind));
-            header_text(&h.header(&core, CountScope::Matched))
+            ProgressHeader::segment(&h)
         };
 
         assert_eq!(
@@ -5307,18 +4622,16 @@ mod tests {
     }
 
     #[test]
-    fn build_header_segment_has_counts_and_braille_and_ignores_gc() {
+    fn build_header_segment_has_counts_and_ignores_gc() {
         let mut core = BuildState::new();
-        core.apply(&ev(0, max_workers(8)));
         core.apply(&ev(1, execute_start("//a:b")));
-        core.apply(&ev(1, pool_usage("cpu", CPU, 8 * CPU, 0)));
+        core.apply(&ev(1, execute_end("//a:b")));
+        core.apply(&ev(1, result_end("//a:b", None)));
+        let before = core.counts_segment(CountScope::Matched);
+        assert_eq!(before, "1 done · 0 cached · 0 failed");
         // A gc event must not perturb the build counters.
         core.apply(&ev(2, gc_swept(9, 9)));
-
-        let h = BuildHeader::new("L");
-        let text = header_text(&h.header(&core, CountScope::Matched));
-        assert!(text.contains("done"), "{text}");
-        assert!(text.contains('⠁'), "expected worker braille: {text}");
+        assert_eq!(core.counts_segment(CountScope::Matched), before);
     }
 
     #[test]
@@ -5350,9 +4663,6 @@ mod tests {
     fn a_standing_label_outlives_the_matcher() {
         struct Invoking(bool);
         impl ProgressHeader for Invoking {
-            fn header(&self, core: &BuildState, scope: CountScope) -> Vec<HeaderItem> {
-                BuildHeader::new(String::new()).header(core, scope)
-            }
             fn label(&self) -> String {
                 "Invoking //app:tty".to_owned()
             }
@@ -5601,12 +4911,18 @@ mod tests {
         assert_eq!(cached, "2 cached", "all cached");
     }
 
-    /// The three count fields as the split header renders them, in header order
-    /// (item 2, the live-only waiting count, is not in the summary).
-    fn header_count_fields(s: &BuildState, scope: CountScope) -> (String, String, String) {
-        let items = BuildHeader::new("L").header(s, scope);
-        let text = |i: usize| header_text(&items[i..=i]);
-        (text(0), text(1), text(3))
+    /// The three count fields `(done, cached, failed)` as the line draws them
+    /// in `scope` (the live-only waiting count is not in the summary).
+    fn header_count_fields(v: &mut TuiProgressView, scope: CountScope) -> (String, String, String) {
+        v.list.scope = scope;
+        let line = line_at(v, 100);
+        let field = |suffix: &str| {
+            line.split(" · ")
+                .find(|seg| seg.ends_with(suffix))
+                .unwrap_or_default()
+                .to_owned()
+        };
+        (field(" done"), field(" cached"), field(" failed"))
     }
 
     /// Shorthand for a `(done, cached, failed)` golden.
@@ -5616,64 +4932,72 @@ mod tests {
 
     #[test]
     fn split_header_count_fields_match_the_plain_count_fields() {
-        // The header destructures `Counts` and splits the done segment into
-        // tabs; `count_fields` renders the same `Counts` as flat strings for the
-        // final summary. The two must stay character-identical in every scope and
-        // in every branch of the done segment — the counts are computed once per
-        // frame precisely so the header does not re-derive them.
-        let mut s = BuildState::new();
+        // The line draws its counts from the dashboard's tab counts;
+        // `count_fields` renders `Counts` as flat strings for the final
+        // summary. The two must stay character-identical in every scope and in
+        // every branch of the done segment.
+        let mut v = TuiProgressView::new("L");
 
         // Before any Matched event: the done segment has no denominator, and
         // done is Done + Cached of every target.
-        s.apply(&ev(0, execute_start("//a:built")));
-        s.apply(&ev(1, execute_end("//a:built")));
-        s.apply(&ev(1, result_end("//a:built", None)));
-        s.apply(&ev(2, local_cache_hit("//a:cached")));
-        s.apply(&ev(2, result_end("//a:cached", None)));
-        s.apply(&ev(3, result_start("//a:failed")));
-        s.apply(&ev(4, result_end("//a:failed", Some("boom".into()))));
+        v.apply(&ev(0, execute_start("//a:built")));
+        v.apply(&ev(1, execute_end("//a:built")));
+        v.apply(&ev(1, result_end("//a:built", None)));
+        v.apply(&ev(2, local_cache_hit("//a:cached")));
+        v.apply(&ev(2, result_end("//a:cached", None)));
+        v.apply(&ev(3, result_start("//a:failed")));
+        v.apply(&ev(4, result_end("//a:failed", Some("boom".into()))));
         for scope in [CountScope::Matched, CountScope::All] {
-            assert_eq!(header_count_fields(&s, scope), s.count_fields(scope));
+            assert_eq!(
+                header_count_fields(&mut v, scope),
+                v.state.count_fields(scope)
+            );
         }
         // The no-denominator branch is the one the done segment re-sources, so
         // pin it to a literal rather than only cross-checking it.
         assert_eq!(
-            header_count_fields(&s, CountScope::Matched),
+            header_count_fields(&mut v, CountScope::Matched),
             fields("2 done", "1 cached", "1 failed"),
         );
         assert_eq!(
-            header_count_fields(&s, CountScope::All),
+            header_count_fields(&mut v, CountScope::All),
             fields("2 / 3 done", "1 cached", "1 failed"),
         );
 
         // Provisional matched total (`~`): three matched, one finished from
         // cache, one with a hit still running. A hit counts once its target
         // ends; the unmatched failure is out of the matched scope.
-        s.apply(&ev(5, matched(&["//m:x", "//m:y", "//m:z"], false)));
-        s.apply(&ev(6, result_start("//m:x")));
-        s.apply(&ev(7, local_cache_hit("//m:x")));
-        s.apply(&ev(8, local_cache_hit("//m:y")));
-        s.apply(&ev(9, result_end("//m:x", None)));
-        s.apply(&ev(10, result_start("//m:y")));
+        v.apply(&ev(5, matched(&["//m:x", "//m:y", "//m:z"], false)));
+        v.apply(&ev(6, result_start("//m:x")));
+        v.apply(&ev(7, local_cache_hit("//m:x")));
+        v.apply(&ev(8, local_cache_hit("//m:y")));
+        v.apply(&ev(9, result_end("//m:x", None)));
+        v.apply(&ev(10, result_start("//m:y")));
         for scope in [CountScope::Matched, CountScope::All] {
-            assert_eq!(header_count_fields(&s, scope), s.count_fields(scope));
+            assert_eq!(
+                header_count_fields(&mut v, scope),
+                v.state.count_fields(scope)
+            );
         }
         assert_eq!(
-            header_count_fields(&s, CountScope::Matched),
+            header_count_fields(&mut v, CountScope::Matched),
             fields("1 / ~3 done", "1 cached", "0 failed"),
         );
         assert_eq!(
-            header_count_fields(&s, CountScope::All),
+            header_count_fields(&mut v, CountScope::All),
             fields("3 / 6 done", "2 cached", "1 failed"),
         );
 
         // Matcher resolves: the `~` drops on both paths.
-        s.apply(&ev(11, matched(&[], true)));
+        v.apply(&ev(11, matched(&[], true)));
         for scope in [CountScope::Matched, CountScope::All] {
-            assert_eq!(header_count_fields(&s, scope), s.count_fields(scope));
+            assert_eq!(
+                header_count_fields(&mut v, scope),
+                v.state.count_fields(scope)
+            );
         }
         assert_eq!(
-            header_count_fields(&s, CountScope::Matched),
+            header_count_fields(&mut v, CountScope::Matched),
             fields("1 / 3 done", "1 cached", "0 failed"),
         );
     }
@@ -5759,57 +5083,6 @@ mod tests {
         assert_eq!(s.elapsed_ms(9_000), 7_000);
     }
 
-    #[test]
-    fn worker_spans_map_busy_count_to_braille() {
-        // 8 workers = one cell; busy count selects the glyph.
-        let glyph = |busy: usize| -> String {
-            worker_spans(8, busy)
-                .iter()
-                .map(|s| s.content.to_string())
-                .collect()
-        };
-        assert_eq!(glyph(0), "⣿"); // idle (painted grey by caller)
-        assert_eq!(glyph(1), "⠁");
-        assert_eq!(glyph(6), "⣧");
-        assert_eq!(glyph(8), "⣿");
-
-        // Idle cell is dim dark grey, busy cell is blue.
-        assert_eq!(worker_spans(8, 0)[0].style.fg, Some(Color::DarkGray));
-        assert_eq!(worker_spans(8, 3)[0].style.fg, Some(Color::Blue));
-
-        // 10 workers spread over two cells; busy fills left-to-right, so 10 busy
-        // fills the first cell (8) and the second (2 → ⠃).
-        let cells = worker_spans(10, 10);
-        assert_eq!(cells.len(), 2);
-        assert_eq!(cells[0].content, "⣿");
-        assert_eq!(cells[1].content, "⠃");
-        // With only 8 busy, the first cell is full (blue) and the second is idle.
-        // The idle trailing cell shows only its real capacity (2 → ⠃ grey), not a
-        // full ⣿ that would misread as 8 more workers.
-        let partial = worker_spans(10, 8);
-        assert_eq!(partial[0].content, "⣿");
-        assert_eq!(partial[1].content, "⠃");
-        assert_eq!(partial[1].style.fg, Some(Color::DarkGray));
-    }
-
-    #[test]
-    fn worker_spans_render_full_capacity_when_all_idle() {
-        // 10 workers, none busy: two grey cells totalling 10 slots (8 + 2), not
-        // two full ⣿ cells (which would read as 16).
-        let idle = worker_spans(10, 0);
-        assert_eq!(idle.len(), 2);
-        assert_eq!(idle[0].content, "⣿"); // full cell: 8 slots
-        assert_eq!(idle[1].content, "⠃"); // partial cell: 2 slots
-        assert!(idle.iter().all(|c| c.style.fg == Some(Color::DarkGray)));
-
-        // 3 busy: first cell shows 3 blue dots, trailing cell stays 2 grey.
-        let active = worker_spans(10, 3);
-        assert_eq!(active[0].content, "⠇");
-        assert_eq!(active[0].style.fg, Some(Color::Blue));
-        assert_eq!(active[1].content, "⠃");
-        assert_eq!(active[1].style.fg, Some(Color::DarkGray));
-    }
-
     /// `heph session show`'s frame: the line, then the dashboard's All list
     /// with its titles, capped at 15 rows, no key hints, measured against
     /// the clock it is given.
@@ -5879,15 +5152,21 @@ mod tests {
 
     #[test]
     fn header_items_are_freestanding_without_separators() {
-        // Each header item must carry no ` · ` — the view owns the joins.
+        // Each count field must carry no ` · ` — `counts_segment` owns the
+        // joins.
         let mut core = BuildState::new();
-        core.apply(&ev(0, max_workers(8)));
+        core.apply(&ev(0, matched(&["//a:b"], false)));
         core.apply(&ev(1, execute_start("//a:b")));
-        let h = BuildHeader::new("L");
-        for item in h.header(&core, CountScope::Matched) {
-            let text: String = item.spans().iter().map(|s| s.content.to_string()).collect();
-            assert!(!text.contains('·'), "item baked in a separator: {text}");
+        for scope in [CountScope::Matched, CountScope::All] {
+            let (done, cached, failed) = core.count_fields(scope);
+            for text in [done, cached, failed] {
+                assert!(!text.contains('·'), "field baked in a separator: {text}");
+            }
         }
+        assert_eq!(
+            core.counts_segment(CountScope::Matched),
+            "0 / ~1 done · 0 cached · 0 failed"
+        );
     }
 
     #[test]
@@ -5980,9 +5259,9 @@ mod tests {
         v.open_dashboard();
 
         // Live: two frames at different wall clocks show different elapsed —
-        // on the dashboard's title and on `heph session show`'s header.
+        // on the dashboard's title and on the line.
         let title = |v: &mut TuiProgressView, now: u64| dash_frame(v, now)[0].clone();
-        let header = |v: &TuiProgressView, now: u64| v.header_line(now, 80).to_string();
+        let header = |v: &TuiProgressView, now: u64| line_at(v, now);
         assert_ne!(title(&mut v, 5_000), title(&mut v, 9_000));
         assert_ne!(header(&v, 5_000), header(&v, 9_000));
 
@@ -6270,9 +5549,7 @@ mod tests {
             ["//live:a", "//live:b", "//live:c"],
             "the frame path only walks the live ops"
         );
-        assert_eq!(s.busy_workers(), 2, "only Execute holds a worker slot");
-        // The slow-row scan reads the same index, so it sees all three.
-        assert_eq!(s.body_lines(LONG_RUNNING_THRESHOLD_MS + 3).len(), 3);
+        assert_eq!(executing(&s), 2, "only Execute holds a worker slot");
     }
 
     #[test]
@@ -6315,7 +5592,7 @@ mod tests {
         ];
         for (i, kind) in steps.into_iter().enumerate() {
             s.apply(&ev(i as u64, kind));
-            assert_eq!(s.busy_workers(), rescan(&s), "after step {i}");
+            assert_eq!(executing(&s), rescan(&s), "after step {i}");
             let mut index: Vec<(u32, Option<Op>)> =
                 s.dash.open_ops().map(|(id, r)| (id, r.op())).collect();
             index.sort_unstable_by_key(|&(id, _)| id);
@@ -6325,7 +5602,7 @@ mod tests {
                 "index drifted from the records after step {i}"
             );
         }
-        assert_eq!(s.busy_workers(), 0);
+        assert_eq!(executing(&s), 0);
         assert!(open_addrs(&s).is_empty(), "nothing left open");
         assert_eq!(s.dash.id_count(), 2, "both targets stay in the history");
     }

@@ -26,8 +26,8 @@ pub use approval::{
 pub use log_sink::LogSink;
 pub use paused::paused;
 pub use progress::{
-    BuildHeader, BuildState, CiProgressView, CountScope, GcCiView, GcHeader, HeaderItem,
-    ProgressHeader, TuiProgressView, ViewMode, human_bytes,
+    BuildHeader, BuildState, CiProgressView, CountScope, GcCiView, GcHeader, ProgressHeader,
+    TuiProgressView, human_bytes,
 };
 pub use pty_session::{PtyEnds, PtySession};
 pub use stdout_buffer::BufferedStdout;
