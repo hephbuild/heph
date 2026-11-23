@@ -257,6 +257,11 @@ fn session_lookup(dir: &Path, home: &Path, addr: &str) -> anyhow::Result<Session
         Err(e) => return Err(e).context("opening events.ndjson"),
     };
     let mut reader = RecordReader::new(events);
+    // Every record below is about `addr`, and the recorder writes compact
+    // JSON: a line that does not hold the addr as a JSON string is not
+    // decoded. The closing quote keeps `//p:a` from finding `//p:ab`.
+    let quoted = serde_json::to_vec(addr).context("encoding the addr")?;
+    let needle = memchr::memmem::Finder::new(&quoted);
     let mut newest: Option<(u64, RunLogRecord)> = None;
     let mut ended = false;
     // The `ExecuteStart` of a run of the addr not followed by its end: it
@@ -267,7 +272,10 @@ fn session_lookup(dir: &Path, home: &Path, addr: &str) -> anyhow::Result<Session
     // stamped at or after the start clears it whichever is written first:
     // the two come from different writers, so file order is not run order.
     let mut not_streamed: Option<u64> = None;
-    while let Some(rec) = reader.next_record().context("reading events.ndjson")? {
+    while let Some(rec) = reader
+        .next_containing(&needle)
+        .context("reading events.ndjson")?
+    {
         match (rec.kind, rec.session) {
             (_, Some(SessionRecordKind::RunLog(run)))
                 if run.addr == addr && run.relative_file().is_some() =>
@@ -724,6 +732,49 @@ mod tests {
         assert_eq!(
             hashin_of(session_run_log(&dir, &home, ADDR).expect("read")),
             Some((true, "h2".into()))
+        );
+    }
+
+    /// The lookup passes over lines that do not hold the addr as a JSON
+    /// string. A longer addr it is a prefix of (`//p:a` in `//p:ab`) never
+    /// ends or answers for it, and an addr JSON has to escape (a quote, a
+    /// backslash, non-ASCII) is still found.
+    #[test]
+    fn run_log_lookup_prefilter_near_misses_and_escapes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let root = tmp.path().join("sessions");
+        live_file(&home, "runs/e/1.log", b"a\n");
+        live_file(&home, "runs/e/2.log", b"odd\n");
+        let odd = "//p\u{e9}:q\"u\\o\tte";
+        let (dir, _lock) = session(
+            &root,
+            1,
+            &home,
+            &[
+                run_log(10, "//p:a", "ha", "runs/e/1.log"),
+                run_log(11, "//p:ab", "hab", "runs/e/9.log"),
+                execute_end(12, "//p:ab"),
+                execute_start(13, "//p:abc", true),
+                run_log(14, odd, "hodd", "runs/e/2.log"),
+            ],
+        );
+        assert_eq!(
+            hashin_of(session_run_log(&dir, &home, "//p:a").expect("read")),
+            Some((true, "ha".into())),
+            "//p:ab's end and //p:abc's start are not //p:a's"
+        );
+        assert_eq!(
+            hashin_of(session_run_log(&dir, &home, "//p:ab").expect("read")),
+            Some((false, "hab".into()))
+        );
+        assert_eq!(
+            hashin_of(session_run_log(&dir, &home, odd).expect("read")),
+            Some((true, "hodd".into()))
+        );
+        assert_eq!(
+            hashin_of(session_run_log(&dir, &home, "//p").expect("read")),
+            None
         );
     }
 
@@ -1265,5 +1316,55 @@ mod tests {
                 .is_none(),
             "an ended session's records are not trusted"
         );
+    }
+
+    /// The lookup's prefilter searches for the addr as `serde_json` quotes it,
+    /// which holds only while the recorder writes compact JSON through
+    /// `serde_json` too. Pinned here against the real recorder, not the test
+    /// fixture's own encoding: an addr JSON has to escape is found.
+    #[test]
+    fn recorded_run_log_of_an_escaped_addr_is_found() {
+        let user = tempfile::tempdir().expect("tempdir");
+        let ws = tempfile::tempdir().expect("tempdir");
+        let home = ws.path().join(".heph");
+        let slot = Arc::new(SessionSlot::new());
+        let root = SessionRoot::from_env(None, Some(user.path().as_os_str()));
+        let sessions = root.clone().expect("root").expect("recording on");
+        slot.configure(root, vec!["heph".into()]);
+        slot.set_workspace(ws.path(), ws.path(), &home);
+        let opened = slot
+            .open(
+                SessionHeader {
+                    kind: super::super::HeaderKind::Build,
+                    label: "run".into(),
+                },
+                false,
+            )
+            .expect("a session opened");
+        let odd = "//p\u{e9}:q\"u\\o\tte/\u{1}";
+        live_file(&home, "runs/e/0.log", b"out\n");
+        slot.run_log_created(RunLogRecord {
+            addr: odd.into(),
+            hashin: "h0".into(),
+            file: "runs/e/0.log".into(),
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let found = loop {
+            if let Some(found) = find_run_log(&sessions, &home, odd).expect("find") {
+                break found;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the RunLog record was never found"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(found.session, opened.id);
+        assert!(
+            matches!(&found.log, SessionRunLog::Live { record, .. } if record.hashin == "h0"),
+            "{found:?}"
+        );
+        slot.finish(Some(0));
     }
 }
