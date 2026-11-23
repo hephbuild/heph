@@ -36,7 +36,7 @@ use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 use hcore::events::{BuildEvent, BuildEventKind, EventReceiver, now_unix_ms};
@@ -126,7 +126,24 @@ struct Shared {
     /// The owner's `flock`, held until `End` is on disk. Here rather than on the
     /// thread so a recorder that stopped early still holds the session alive
     /// until the process finishes it.
-    lock: Mutex<Option<File>>,
+    lock: Mutex<LockState>,
+    /// Signalled when the thread exits.
+    exited: Condvar,
+}
+
+/// The lock, and who has had their say about it. Short of a committed `End`
+/// (the thread then frees it itself), the lock goes only once both the owner
+/// has finished the session and the thread has exited: a thread still alive
+/// may hold its write connection, whose close checkpoints and deletes the
+/// `-wal` — a viewer that saw the lock free before that could copy a
+/// half-checkpointed `session.db` with its `-wal` gone.
+#[derive(Debug)]
+struct LockState {
+    file: Option<File>,
+    /// `finish` ran (whatever came of its `End`).
+    finished: bool,
+    /// The thread exited, its write connection and registration closed.
+    exited: bool,
 }
 
 impl Shared {
@@ -149,22 +166,43 @@ impl Shared {
         self.stopped.load(Ordering::Acquire)
     }
 
+    fn lock_state(&self) -> MutexGuard<'_, LockState> {
+        self.lock.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Free the lock now: `End` is committed, so no viewer copies the file.
     fn release_lock(&self) {
-        drop(
-            self.lock
-                .lock()
+        drop(self.lock_state().file.take());
+    }
+
+    /// The owner's say: the session is finished. The lock goes now if the
+    /// thread has exited, after waiting for that until `deadline`; otherwise
+    /// the thread's exit frees it ([`ReleaseOnExit`]).
+    fn finish_lock(&self, deadline: Instant) {
+        let mut state = self.lock_state();
+        state.finished = true;
+        while !state.exited {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return;
+            }
+            state = self
+                .exited
+                .wait_timeout(state, left)
                 .unwrap_or_else(PoisonError::into_inner)
-                .take(),
-        );
+                .0;
+        }
+        drop(state.file.take());
     }
 }
 
-/// Releases the lock when the record loop exits, however it exits (a stop, a
-/// panic), if the owner has already finished the session. A finisher that
-/// timed out left the lock to the thread; a thread that then stops before it
-/// reaches `End` would otherwise keep a long-lived process's session looking
-/// live until that process exits. The session is over either way, and with no
-/// `End` on disk a viewer reads it as lost, which is the truth.
+/// The thread's say, when the record loop exits however it exits (a stop, a
+/// panic), after its write connection and registration are closed: the lock
+/// goes now if the owner has already finished the session. A finisher that
+/// timed out, or found the recording stopped, left the lock to the thread; a
+/// long-lived process's session would otherwise keep looking live until that
+/// process exits. The session is over either way, and with no `End` on disk a
+/// viewer reads it as lost, which is the truth.
 ///
 /// If the owner has not finished yet, the lock stays: `finish` releases it.
 #[derive(Debug)]
@@ -172,9 +210,13 @@ struct ReleaseOnExit(Arc<Shared>);
 
 impl Drop for ReleaseOnExit {
     fn drop(&mut self) {
-        if self.0.finished.load(Ordering::Acquire) {
-            self.0.release_lock();
+        let mut state = self.0.lock_state();
+        state.exited = true;
+        if state.finished {
+            drop(state.file.take());
         }
+        drop(state);
+        self.0.exited.notify_all();
     }
 }
 
@@ -315,6 +357,12 @@ impl SessionTap {
     /// Whether the recording stopped on a failure.
     pub fn is_stopped(&self) -> bool {
         self.shared.is_stopped()
+    }
+
+    /// Messages sent and not yet received by the thread.
+    #[cfg(test)]
+    pub(crate) fn pending(&self) -> usize {
+        self.shared.pending.load(Ordering::Relaxed)
     }
 }
 
@@ -734,7 +782,12 @@ impl Recorder {
             pending: AtomicUsize::new(0),
             max_pending: start.faults.max_pending.unwrap_or(MAX_PENDING),
             finished: AtomicBool::new(false),
-            lock: Mutex::new(Some(start.lock)),
+            lock: Mutex::new(LockState {
+                file: Some(start.lock),
+                finished: false,
+                exited: false,
+            }),
+            exited: Condvar::new(),
         });
         // The thread logs through whatever subscriber the spawner had — the
         // global one in the binary, a test's own in a test.
@@ -810,17 +863,19 @@ impl Recorder {
     /// `timeout` for the recorder to say it did; the seal is bounded under
     /// it. Idempotent: only the first call does anything.
     ///
-    /// If the recorder stopped, or its thread is gone, the lock is released
-    /// here with no `End` on disk — a viewer reads that as a lost session, which
-    /// is the truth about its records. If it does not answer in time, the lock
-    /// stays held: the thread releases it once its `End` and seal are done (or
-    /// failed), or when it exits without reaching `End`.
+    /// If the recorder stopped, or its `End` failed, the lock is released with
+    /// no `End` on disk — a viewer reads that as a lost session, which is the
+    /// truth about its records — but only once the thread has exited, its
+    /// write connection closed: this waits for that within `timeout`. If the
+    /// thread does not answer or exit in time, the lock stays held: the thread
+    /// releases it once its `End` and seal are done, or as it exits.
     pub fn finish(&self, exit_code: Option<i32>, panicked: bool, timeout: Duration) {
         let shared = &self.tap.shared;
         // From here every tap drops its sends: nothing may follow `End`.
         if shared.finished.swap(true, Ordering::AcqRel) {
             return;
         }
+        let deadline = Instant::now() + timeout;
         if !shared.is_stopped() {
             let (ack, acked) = mpsc::sync_channel(1);
             // Counted like every other message: the thread uncounts each one
@@ -833,7 +888,7 @@ impl Recorder {
                     at_unix_ms: now_unix_ms(),
                     exit_code,
                     panicked,
-                    deadline: Instant::now() + timeout,
+                    deadline,
                     ack,
                 })
                 .is_ok();
@@ -845,19 +900,17 @@ impl Recorder {
                     Ok(()) | Err(RecvTimeoutError::Disconnected) => {}
                     // The thread still holds the write connection and may yet
                     // commit `End` and seal: the lock stays with it (I2, I3).
-                    // Its own release after the seal, or this process's exit,
-                    // frees it.
+                    // Its own release after the seal, or its exit, frees it.
                     Err(RecvTimeoutError::Timeout) => {
                         tracing::debug!(
                             timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
                             "session recorder did not finish in time"
                         );
-                        return;
                     }
                 }
             }
         }
-        shared.release_lock();
+        shared.finish_lock(deadline);
     }
 }
 
@@ -1020,10 +1073,10 @@ impl RecorderThread {
                 deadline,
                 ack,
             } => {
+                // `End` landed: the lock is already free. It failed: the
+                // write connection is still open, so the lock goes as this
+                // thread exits, once `finish` has had its say.
                 self.end_session(rx, at_unix_ms, exit_code, panicked, deadline);
-                // Whether `End` landed or failed, the session is over: a
-                // finisher that timed out left the lock to this thread.
-                self.shared.release_lock();
                 // The finisher may have timed out and gone; nothing to tell it.
                 ack.send(()).unwrap_or_default();
                 return Flow::Stop;

@@ -747,6 +747,76 @@ fn a_stop_after_a_timed_out_finish_releases_the_lock() {
     drop(rec);
 }
 
+/// A recorder that stopped (here: it fell behind its pending cap while a
+/// write hangs) still has its thread, and the thread its write connection,
+/// until that write returns. `finish` must not free the lock under it: the
+/// connection's close checkpoints and deletes the `-wal`, so a viewer of
+/// another process that saw the lock free could copy a half-checkpointed
+/// `session.db` with its `-wal` gone. The lock goes once the thread has
+/// exited, its connection and registration closed first.
+#[test]
+fn finish_after_a_stop_keeps_the_lock_until_the_thread_exits() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let gate: Gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let rec = recorder_with(
+        dir.path(),
+        Faults {
+            gate: Some(Arc::clone(&gate)),
+            max_pending: Some(8),
+            ..Faults::default()
+        },
+    );
+    let tap = rec.tap();
+    let mut evs = events().into_iter().cycle();
+    // The thread takes the first event into its write, which the gate holds,
+    // before the stop is latched: a stop latched first would end the thread
+    // before it wrote anything.
+    tap.event(evs.next().expect("an event"));
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while tap.pending() > 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the thread never took the first event"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    for ev in evs.by_ref().take(100) {
+        tap.event(ev);
+        if tap.is_stopped() {
+            break;
+        }
+    }
+    assert!(tap.is_stopped(), "a full queue latched the stop");
+    rec.recorder
+        .finish(Some(0), false, Duration::from_millis(200));
+    let lock_path = rec.dir().join(files::LOCK);
+    let db = rec.dir().join(store::FILE);
+    assert!(
+        store::rw_open::is_open(&db).expect("stat"),
+        "the stopped thread's write is still held at the gate"
+    );
+    assert!(
+        lockfile::is_held(&lock_path).expect("probe"),
+        "finish freed the lock under the stopped thread's open write connection"
+    );
+    let (open, cv) = &*gate;
+    *open.lock().expect("gate") = true;
+    cv.notify_all();
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while lockfile::is_held(&lock_path).expect("probe") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the stopped thread's exit never released the lock"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !store::rw_open::is_open(&db).expect("stat"),
+        "the lock was freed before the thread closed its write connection"
+    );
+    drop(rec);
+}
+
 /// I1: a lost recording left beside a new session is cleanup's to seal, on
 /// its own thread. With that cleanup held up, the new session's records still
 /// commit at once and its `finish` seals it without waiting.
