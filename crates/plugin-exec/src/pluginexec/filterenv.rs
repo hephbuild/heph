@@ -7,7 +7,6 @@
 // See https://www.in-ulm.de/~mascheck/various/argmax/
 
 use std::collections::BTreeSet;
-use std::ffi::OsString;
 use std::sync::OnceLock;
 
 const MAX_ARG_STRLEN: usize = 131072;
@@ -106,9 +105,11 @@ fn filter_impl(
 /// limits can run the same target with different environments under the same
 /// key. This predates reading the limit from `sysconf` and is documented here,
 /// not fixed.
+///
+/// `args_len` is the argv's total length in bytes, program included.
 pub fn filter_long_env(
     mut env: Vec<(String, String)>,
-    args: &[OsString],
+    args_len: usize,
     protected: &BTreeSet<String>,
 ) -> anyhow::Result<Vec<(String, String)>> {
     let Some(maxl) = max_args() else {
@@ -117,8 +118,7 @@ pub fn filter_long_env(
     if maxl <= 0 {
         return Ok(env);
     }
-    let args_len: i64 = args.iter().map(|a| a.len() as i64).sum();
-    filter_impl(&mut env, args_len, maxl, protected)?;
+    filter_impl(&mut env, args_len as i64, maxl, protected)?;
     Ok(env)
 }
 

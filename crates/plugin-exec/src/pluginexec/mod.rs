@@ -2628,15 +2628,13 @@ impl Driver {
         // execve caps total argv+envp at ARG_MAX and each entry at MAX_ARG_STRLEN.
         // Drop overlong entries and evict longest until under the limit.
         let env_vec: Vec<(String, String)> = env.into_iter().collect();
-        let mut argv_for_filter: Vec<OsString> = Vec::with_capacity(1 + args_os.len());
-        argv_for_filter.push(OsString::from(&program));
-        argv_for_filter.extend(args_os.iter().cloned());
+        let argv_len = program.len() + args_os.iter().map(|a| a.len()).sum::<usize>();
         // Credential names are protected from the size limiter: its eviction
         // order is longest-first, which is precisely a session token, and
         // `ARG_MAX` differs by operating system — so without this the same BUILD
         // file would keep the credential on Linux and drop it on macOS, then run
         // unauthenticated or against whatever ambient identity the host had.
-        let env_vec = filterenv::filter_long_env(env_vec, &argv_for_filter, &credential_env_names)?;
+        let env_vec = filterenv::filter_long_env(env_vec, argv_len, &credential_env_names)?;
         // The run's own layers sit on the caller's base env, which is neither
         // filtered nor converted: it reaches the process byte for byte (E6),
         // except a `TOOL_<G>_ROOT` (or `HEPH_TOOLS_DIR`) heph leaves unset for
