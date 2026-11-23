@@ -746,59 +746,92 @@ pub fn detect_output_collisions_with_stop(
     groups: &BTreeMap<PathBuf, Vec<RunInput>>,
     stop: &dyn Fn() -> bool,
 ) -> anyhow::Result<()> {
-    // Absolute sandbox path -> the target that claimed it.
-    let mut owners: HashMap<PathBuf, Addr> = HashMap::new();
+    let mut claims = OutputClaims::default();
     for (unpack_root, inputs) in groups {
         for input in inputs {
             if stop() {
                 return Err(crate::stop::cancelled());
             }
-            let producer = &input.source_addr;
-            let paths = input.artifact.content.entry_paths().with_context(|| {
-                format!(
-                    "enumerate paths for output-collision check \
-                     (origin_id={}, source_addr={})",
-                    input.origin_id,
-                    producer.format(),
-                )
-            })?;
-            let filters = hartifactcontent::PathFilter::new(&input.filters);
-            for rel in paths {
-                if !filters.matches(&rel) {
-                    continue;
-                }
-                let abs = unpack_root.join(&rel);
-                match owners.get(&abs) {
-                    Some(existing) if existing != producer => {
-                        // Two fs-provider inputs (e.g. a `glob` and a specific
-                        // `file`) claiming the same path expose the *same*
-                        // workspace source bytes — the fs provider only surfaces
-                        // existing files, it never materializes — so this overlap
-                        // is benign (last-writer-wins is safe when the bytes
-                        // match). Allow it, keeping the first owner. Mirrors the
-                        // `validate` codegen-overlap exemption. Any collision
-                        // involving a non-fs producer is still a hard error.
-                        if is_fs_source(existing) && is_fs_source(producer) {
-                            continue;
-                        }
-                        anyhow::bail!(
-                            "output collision: {} is produced by two different targets \
-                             ({} and {}); a sandbox file may be provided by only one target",
-                            abs.display(),
-                            existing.format(),
-                            producer.format(),
-                        )
-                    }
-                    // Same producer (diamond / depended twice) — one owner, allowed.
-                    Some(_) => {}
-                    None => {
-                        owners.insert(abs, producer.clone());
-                    }
-                }
-            }
+            claims.claim_input(unpack_root, input)?;
         }
     }
     Ok(())
+}
+
+/// The core of [`detect_output_collisions`]: every absolute sandbox path
+/// claimed so far, and the target that owns it. A runner that already holds an
+/// input's paths (the FUSE runner's layer indexes) claims them with
+/// [`OutputClaims::claim`] rather than enumerating the content again.
+#[derive(Debug, Default)]
+pub struct OutputClaims {
+    owners: HashMap<PathBuf, Addr>,
+}
+
+impl OutputClaims {
+    /// Claim the paths `input` exposes under `unpack_root`, enumerated through
+    /// [`Content::entry_paths`](hartifactcontent::Content::entry_paths) and
+    /// narrowed by its `filters`.
+    pub fn claim_input(&mut self, unpack_root: &Path, input: &RunInput) -> anyhow::Result<()> {
+        let paths = input.artifact.content.entry_paths().with_context(|| {
+            format!(
+                "enumerate paths for output-collision check \
+                 (origin_id={}, source_addr={})",
+                input.origin_id,
+                input.source_addr.format(),
+            )
+        })?;
+        let filters = hartifactcontent::PathFilter::new(&input.filters);
+        self.claim(
+            unpack_root,
+            &input.source_addr,
+            paths
+                .iter()
+                .map(PathBuf::as_path)
+                .filter(|rel| filters.matches(rel)),
+        )
+    }
+
+    /// Claim `rel_paths` under `unpack_root` for `producer`: the file and
+    /// symlink paths it exposes, already narrowed by its filters. Errors on the
+    /// first path another target already owns.
+    pub fn claim<'p>(
+        &mut self,
+        unpack_root: &Path,
+        producer: &Addr,
+        rel_paths: impl IntoIterator<Item = &'p Path>,
+    ) -> anyhow::Result<()> {
+        for rel in rel_paths {
+            let abs = unpack_root.join(rel);
+            match self.owners.get(&abs) {
+                Some(existing) if existing != producer => {
+                    // Two fs-provider inputs (e.g. a `glob` and a specific
+                    // `file`) claiming the same path expose the *same*
+                    // workspace source bytes — the fs provider only surfaces
+                    // existing files, it never materializes — so this overlap
+                    // is benign (last-writer-wins is safe when the bytes
+                    // match). Allow it, keeping the first owner. Mirrors the
+                    // `validate` codegen-overlap exemption. Any collision
+                    // involving a non-fs producer is still a hard error.
+                    if is_fs_source(existing) && is_fs_source(producer) {
+                        continue;
+                    }
+                    anyhow::bail!(
+                        "output collision: {} is produced by two different targets \
+                         ({} and {}); a sandbox file may be provided by only one target",
+                        abs.display(),
+                        existing.format(),
+                        producer.format(),
+                    )
+                }
+                // Same producer (diamond / depended twice) — one owner, allowed.
+                Some(_) => {}
+                None => {
+                    self.owners.insert(abs, producer.clone());
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// [`hartifactcontent::unpack::unpack`] through `hcore::blocking::run`.
