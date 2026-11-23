@@ -993,11 +993,39 @@ fn codegen_groups(def: &LinkedTargetDef) -> Vec<String> {
 fn codegen_modes(target: &crate::engine::driver::targetdef::TargetDef) -> (bool, bool) {
     use crate::engine::driver::targetdef::path::CodegenMode;
 
-    let modes = || target.outputs.iter().flat_map(|o| o.paths.iter());
     (
-        modes().any(|p| matches!(p.codegen_tree, CodegenMode::Copy)),
-        modes().any(|p| matches!(p.codegen_tree, CodegenMode::InPlace { .. })),
+        target
+            .outputs
+            .iter()
+            .flat_map(|o| o.paths.iter())
+            .any(|p| matches!(p.codegen_tree, CodegenMode::Copy)),
+        has_in_place_output(&target.outputs),
     )
+}
+
+/// Whether any output path is `in_place` codegen.
+///
+/// The one test for "this target rewrites its own inputs": it doubles the GC
+/// history, arms the write-back guard and registers the fixpoint, and those
+/// three must agree.
+fn has_in_place_output(outputs: &[crate::engine::driver::targetdef::Output]) -> bool {
+    use crate::engine::driver::targetdef::path::CodegenMode;
+
+    outputs
+        .iter()
+        .flat_map(|o| o.paths.iter())
+        .any(|p| matches!(p.codegen_tree, CodegenMode::InPlace { .. }))
+}
+
+/// Whether any output path is codegen, in either mode: whether
+/// [`codegen_groups`] is non-empty, without building it.
+fn has_codegen_output(outputs: &[crate::engine::driver::targetdef::Output]) -> bool {
+    use crate::engine::driver::targetdef::path::CodegenMode;
+
+    outputs
+        .iter()
+        .flat_map(|o| o.paths.iter())
+        .any(|p| !matches!(p.codegen_tree, CodegenMode::None))
 }
 
 /// Each codegen output group's declared mode (first non-`None` path wins).
@@ -4396,7 +4424,7 @@ impl Engine {
         if rs.hash_only() || rs.ctoken().is_cancelled() {
             return Ok(());
         }
-        if codegen_groups(opts.def).is_empty() {
+        if !has_codegen_output(&opts.def.target.outputs) {
             return Ok(());
         }
 
@@ -5432,18 +5460,7 @@ impl Engine {
         def: &LinkedTargetDef,
     ) -> anyhow::Result<()> {
         // No in_place output: nothing is about to be overwritten.
-        if !def
-            .target
-            .outputs
-            .iter()
-            .flat_map(|o| o.paths.iter())
-            .any(|p| {
-                matches!(
-                    p.codegen_tree,
-                    crate::engine::driver::targetdef::path::CodegenMode::InPlace { .. }
-                )
-            })
-        {
+        if !has_in_place_output(&def.target.outputs) {
             return Ok(());
         }
 
@@ -5735,8 +5752,6 @@ impl Engine {
         hashin: &str,
         written: &WrittenPaths,
     ) -> anyhow::Result<()> {
-        use crate::engine::driver::targetdef::path::CodegenMode;
-
         // The fresh request below runs on its own cancellation token (unlinked
         // from this build), so refuse to start once the original build is
         // cancelled — the fixpoint is a pure optimization and must never delay a
@@ -5746,12 +5761,7 @@ impl Engine {
         }
         // Only in_place targets mutate their own inputs, so only they can reach a
         // fixpoint. (Frozen runs never write, hence never get here.)
-        let is_in_place = def.target.outputs.iter().any(|o| {
-            o.paths
-                .iter()
-                .any(|p| matches!(p.codegen_tree, CodegenMode::InPlace { .. }))
-        });
-        if !is_in_place {
+        if !has_in_place_output(&def.target.outputs) {
             return Ok(());
         }
 
@@ -6068,16 +6078,7 @@ impl Engine {
         // on the final def, so BOTH GC paths that read `def.cache.history` — the
         // post-write trim and the `heph gc` sweep — inherit it. The exec hash does
         // not include `cache`, so this never invalidates existing cache entries.
-        if def.cache.history > 0
-            && def.outputs.iter().any(|o| {
-                o.paths.iter().any(|p| {
-                    matches!(
-                        p.codegen_tree,
-                        crate::engine::driver::targetdef::path::CodegenMode::InPlace { .. }
-                    )
-                })
-            })
-        {
+        if def.cache.history > 0 && has_in_place_output(&def.outputs) {
             def.cache.history = def.cache.history.saturating_mul(2);
         }
 
@@ -14701,6 +14702,60 @@ mod tests {
             "second run over the transformed multi-file tree must be a cache hit, got {ev2:?}"
         );
         Ok(())
+    }
+
+    /// `has_codegen_output` is any non-`None` path; `has_in_place_output` only
+    /// an `in_place` one, wherever it sits among the outputs.
+    #[test]
+    fn codegen_output_predicates_over_each_mode() {
+        use crate::engine::driver::targetdef::Output;
+        use crate::engine::driver::targetdef::path::{CodegenMode, Content, Path};
+
+        let output = |modes: Vec<CodegenMode>| Output {
+            group: "g".to_string(),
+            paths: modes
+                .into_iter()
+                .map(|codegen_tree| Path {
+                    content: Content::FilePath("pkg/f".into()),
+                    codegen_tree,
+                    collect: false,
+                })
+                .collect(),
+        };
+        let in_place = || CodegenMode::InPlace {
+            write_on_failure: false,
+        };
+        let cases = [
+            ("no outputs", vec![], (false, false)),
+            (
+                "none",
+                vec![output(vec![CodegenMode::None])],
+                (false, false),
+            ),
+            ("copy", vec![output(vec![CodegenMode::Copy])], (true, false)),
+            ("in_place", vec![output(vec![in_place()])], (true, true)),
+            (
+                "in_place after a plain path",
+                vec![output(vec![CodegenMode::None, in_place()])],
+                (true, true),
+            ),
+            (
+                "in_place in a later group",
+                vec![
+                    output(vec![CodegenMode::Copy]),
+                    output(vec![CodegenMode::None]),
+                    output(vec![in_place()]),
+                ],
+                (true, true),
+            ),
+        ];
+        for (name, outputs, want) in cases {
+            assert_eq!(
+                (has_codegen_output(&outputs), has_in_place_output(&outputs)),
+                want,
+                "{name}"
+            );
+        }
     }
 
     /// The in-place guard watches the hashed inputs that read an `in_place`
