@@ -170,8 +170,8 @@ fn main() -> ExitCode {
     // hard-exits on an "unrecognized subcommand" — so if the upgrade ran after
     // matching, `heph <newcmd>` would die before the upgrade that adds <newcmd>
     // ever fired. Do a *soft* parse first (tolerates an unknown command), upgrade
-    // (a successful upgrade re-execs into the pin and never returns), then do the
-    // real parse below in whichever binary ends up running. The upgrade also runs
+    // (a successful upgrade re-execs into the pin and never returns), then act
+    // on the parse below in whichever binary ends up running. The upgrade also runs
     // *before* the supervisor fork so a re-exec can't orphan a sidecar.
     //
     // A missing-workspace (`NoConfig`) result is fatal only when this binary
@@ -188,11 +188,13 @@ fn main() -> ExitCode {
     }
 
     // Real parse — by here we've either re-exec'd into the pinned version (never
-    // returns) or stayed on this binary. Hard-exits with clap's canonical
-    // diagnostic on a genuinely unknown command or bad flags. Keeping the matches
-    // also lets the telemetry reporter enumerate the exact args/flags set —
-    // generically, for every command, with no per-command list.
-    let matches = Cli::command().get_matches();
+    // returns) or stayed on this binary, so the soft parse above is this
+    // binary's parse of the same argv: its error is the one a fresh parse would
+    // raise. Hard-exits with clap's canonical diagnostic on a genuinely unknown
+    // command or bad flags. Keeping the matches also lets the telemetry
+    // reporter enumerate the exact args/flags set — generically, for every
+    // command, with no per-command list.
+    let matches = soft_match.unwrap_or_else(|e| e.exit());
     let cli = match Cli::from_arg_matches(&matches) {
         Ok(cli) => cli,
         Err(e) => e.exit(),
