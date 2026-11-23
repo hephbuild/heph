@@ -827,6 +827,10 @@ pub(crate) struct RunResult {
     /// other BUILD files can import them via `load("//pkg", "sym")`. Empty when the
     /// package has no BUILD file matching the configured patterns.
     pub module: FrozenModule,
+    /// Whether a BUILD file was evaluated: false only for a package whose
+    /// directory is missing, escapes the workspace or holds no matching file.
+    /// What decides that the package gets the check targets.
+    pub has_build_file: bool,
     /// Indices into `targets`, sorted by name and, for equal names, by
     /// index. Built on the first [`Self::target`] call, so a result that is
     /// only listed (or is one file's part of a package) never pays for it.
@@ -834,6 +838,7 @@ pub(crate) struct RunResult {
 }
 
 impl RunResult {
+    /// The result of evaluating one or more BUILD files.
     fn new(
         targets: Vec<OnTargetPayload>,
         states: Vec<OnStatePayload>,
@@ -843,6 +848,7 @@ impl RunResult {
             targets,
             states,
             module,
+            has_build_file: true,
             name_index: OnceLock::new(),
         }
     }
@@ -873,7 +879,10 @@ impl RunResult {
 
 fn empty_run_result() -> anyhow::Result<RunResult> {
     let module = Module::with_temp_heap(|m| m.freeze()).map_err(anyhow::Error::from)?;
-    Ok(RunResult::new(vec![], vec![], module))
+    Ok(RunResult {
+        has_build_file: false,
+        ..RunResult::new(vec![], vec![], module)
+    })
 }
 
 fn merge_pkg_results(parts: &[Arc<RunResult>]) -> anyhow::Result<RunResult> {
