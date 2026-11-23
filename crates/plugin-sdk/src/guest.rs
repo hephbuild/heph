@@ -187,16 +187,17 @@ impl Content for StableContent {
 
 /// Adapts a stable [`DynRead`] (chunk-pull) to `std::io::Read`: serves the current
 /// chunk via a `Cursor`, pulling the next chunk when it drains; an empty chunk is EOF.
+/// The cursor reads the chunk the host handed over in place, never a copy of it.
 struct GuestRead {
     inner: DynRead,
-    cur: std::io::Cursor<Vec<u8>>,
+    cur: std::io::Cursor<stabby::vec::Vec<u8>>,
 }
 
 impl GuestRead {
     fn new(inner: DynRead) -> Self {
         Self {
             inner,
-            cur: std::io::Cursor::new(Vec::new()),
+            cur: std::io::Cursor::new(stabby::vec::Vec::new()),
         }
     }
 }
@@ -213,7 +214,7 @@ impl Read for GuestRead {
             if chunk.is_empty() {
                 return Ok(0);
             }
-            self.cur = std::io::Cursor::new(chunk.to_vec());
+            self.cur = std::io::Cursor::new(chunk);
         }
     }
 }
