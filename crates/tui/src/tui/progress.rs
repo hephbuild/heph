@@ -384,6 +384,37 @@ pub struct Counts {
     pub failed: String,
 }
 
+/// What a full screen's title row says, owned: [`Self::title`] lends it to
+/// the header.
+#[derive(Debug)]
+struct TitleParts {
+    command: String,
+    session: Option<String>,
+    clock: String,
+    done: usize,
+    /// The total and whether it is provisional; see [`BuildState::total_of`].
+    total: Option<(usize, bool)>,
+    standing: Option<&'static str>,
+    verdict: Option<crate::tui::dashboard::Verdict>,
+}
+
+impl TitleParts {
+    /// The title, borrowing every part, the verdict included, so it is never
+    /// copied and a second call says the same.
+    fn title(&self) -> crate::tui::dashboard::Title<'_> {
+        crate::tui::dashboard::Title {
+            command: &self.command,
+            session: self.session.as_deref(),
+            clock: &self.clock,
+            done: self.done,
+            total: self.total.map(|(n, _)| n),
+            provisional: self.total.is_some_and(|(_, p)| p),
+            standing: self.standing,
+            verdict: self.verdict.as_ref(),
+        }
+    }
+}
+
 impl Counts {
     /// The done segment as one string: `"{done} / {total} done"`, or
     /// `"{done} done"` when there is no denominator.
@@ -710,26 +741,38 @@ impl BuildState {
     /// the matcher streams. Before any `Matched` event the matched scope has
     /// no total: `{done} done`.
     fn counts_of(&self, tabs: &crate::tui::dashboard::TabCounts, scope: CountScope) -> Counts {
-        let total = match scope {
-            // Every observed target: it grows as deps stream rather than
-            // resolving to a fixed set, so it is never provisional.
-            CountScope::All => Some(tabs.all().to_string()),
-            CountScope::Matched if self.dash.matched_seen() => {
-                let tilde = if self.dash.matched_complete() {
-                    ""
-                } else {
-                    "~"
-                };
-                Some(format!("{tilde}{}", tabs.all()))
+        let total = self.total_of(tabs, scope).map(|(n, provisional)| {
+            if provisional {
+                format!("~{n}")
+            } else {
+                n.to_string()
             }
-            CountScope::Matched => None,
-        };
+        });
         Counts {
             done: tabs.finished_ok().to_string(),
             total,
             cached: format!("{} cached", tabs.cached),
             waiting: format!("{} waiting", tabs.blocked),
             failed: format!("{} failed", tabs.failed_total()),
+        }
+    }
+
+    /// The total in `scope` from the tabs' counts, and whether it is
+    /// provisional (`~`, the matcher still streams): every target in scope.
+    /// All is every observed target, which grows as deps stream rather than
+    /// resolving to a fixed set, so it is never provisional. Before any
+    /// `Matched` event the matched scope has no total.
+    pub fn total_of(
+        &self,
+        tabs: &crate::tui::dashboard::TabCounts,
+        scope: CountScope,
+    ) -> Option<(usize, bool)> {
+        match scope {
+            CountScope::All => Some((tabs.all(), false)),
+            CountScope::Matched if self.dash.matched_seen() => {
+                Some((tabs.all(), !self.dash.matched_complete()))
+            }
+            CountScope::Matched => None,
         }
     }
 
@@ -1732,9 +1775,10 @@ impl TuiProgressView {
         self.finished_at_ms.unwrap_or(now_ms)
     }
 
-    /// The dashboard's title row: the command, the clock and how far along
-    /// the run is, in the line's own figures.
-    fn dashboard_title_parts(&self, now_ms: u64) -> (String, Option<String>, String) {
+    /// The dashboard's title row, as every full screen draws it: the
+    /// command, the clock and how far along the run is, in the line's own
+    /// figures ([`BuildState::total_of`]).
+    fn title_parts(&self, now_ms: u64) -> TitleParts {
         let clock_at = self.clock_at(now_ms);
         let clock = hcore::units::human_duration(std::time::Duration::from_millis(
             self.state.elapsed_ms(clock_at),
@@ -1743,28 +1787,27 @@ impl TuiProgressView {
             Role::Attached { id, .. } => Some(id.to_string()),
             Role::Live { .. } => None,
         };
-        (self.label(), session, clock)
+        let scope = self.list.scope;
+        let tabs = self.state.dash.counts(scope);
+        TitleParts {
+            command: self.label(),
+            session,
+            clock,
+            done: tabs.finished_ok(),
+            total: self.state.total_of(&tabs, scope),
+            standing: self.approval_standing().map(|s| s.indicator()),
+            verdict: self.verdict(),
+        }
     }
 
     /// One dashboard frame, `cols` × `rows`:
     /// [`crate::tui::dashboard::dashboard_frame`], its pending requests
     /// leading All and on the Approvals tab.
     fn dashboard_lines(&mut self, now_ms: u64, cols: u16, rows: u16) -> Vec<Line<'static>> {
-        use crate::tui::dashboard::{DASHBOARD_HINTS, ListInputs, Title, dashboard_frame};
+        use crate::tui::dashboard::{DASHBOARD_HINTS, ListInputs, dashboard_frame};
         self.sync_approvals(Some(self.glyph(now_ms)));
-        let (command, session, clock) = self.dashboard_title_parts(now_ms);
-        let scope = self.list.scope;
-        let tabs = self.state.dash.counts(scope);
-        let title = Title {
-            command: &command,
-            session: session.as_deref(),
-            clock: &clock,
-            done: tabs.finished_ok(),
-            total: (scope == CountScope::All || self.state.dash.matched_seen()).then(|| tabs.all()),
-            provisional: scope == CountScope::Matched && !self.state.dash.matched_complete(),
-            standing: self.approval_standing().map(|s| s.indicator()),
-            verdict: self.verdict(),
-        };
+        let parts = self.title_parts(now_ms);
+        let title = parts.title();
         // The filter, while one is typed or kept, replaces the key hints.
         let filter = self.list.filter();
         let hints: std::borrow::Cow<'_, str> = if self.list.is_editing() {
@@ -1962,19 +2005,8 @@ impl TuiProgressView {
 
     /// The open target screen's frame, under the dashboard's header.
     fn target_lines(&mut self, now_ms: u64, cols: u16, rows: u16) -> Option<Vec<Line<'static>>> {
-        let (command, session, clock) = self.dashboard_title_parts(now_ms);
-        let scope = self.list.scope;
-        let tabs = self.state.dash.counts(scope);
-        let title = crate::tui::dashboard::Title {
-            command: &command,
-            session: session.as_deref(),
-            clock: &clock,
-            done: tabs.finished_ok(),
-            total: (scope == CountScope::All || self.state.dash.matched_seen()).then(|| tabs.all()),
-            provisional: scope == CountScope::Matched && !self.state.dash.matched_complete(),
-            standing: self.approval_standing().map(|s| s.indicator()),
-            verdict: self.verdict(),
-        };
+        let parts = self.title_parts(now_ms);
+        let title = parts.title();
         let inputs = crate::tui::dashboard::TargetInputs {
             model: &self.state.dash,
             waits: &self.state,
@@ -2011,20 +2043,8 @@ impl TuiProgressView {
         let glyph = self.glyph(now_ms);
         let queue = self.approval_queue();
         self.sync_approvals_with(&queue, Some(glyph));
-        let (command, session, clock) = self.dashboard_title_parts(now_ms);
-        let scope = self.list.scope;
-        let counts = self.state.dash.counts(scope);
-        let title = crate::tui::dashboard::Title {
-            command: &command,
-            session: session.as_deref(),
-            clock: &clock,
-            done: counts.finished_ok(),
-            total: (scope == CountScope::All || self.state.dash.matched_seen())
-                .then(|| counts.all()),
-            provisional: scope == CountScope::Matched && !self.state.dash.matched_complete(),
-            standing: self.approval_standing().map(|s| s.indicator()),
-            verdict: self.verdict(),
-        };
+        let parts = self.title_parts(now_ms);
+        let title = parts.title();
         let gauges = self.state.dash.gauges();
         let inputs = crate::tui::dashboard::approval::ApprovalInputs {
             title: &title,
@@ -5869,6 +5889,47 @@ mod tests {
                      scales with the list length",
                 );
             }
+        }
+    }
+
+    /// The full screens' title and the line count the same done figure and
+    /// total, `~` included, in either scope and before, during and after
+    /// the matcher streams.
+    #[test]
+    fn title_and_line_agree() {
+        let mut v = TuiProgressView::new("heph r build //p:...");
+        let t0 = 1_700_000_000_000;
+        let ev = |ms: u64, kind| BuildEvent {
+            at_unix_ms: t0 + ms,
+            kind,
+        };
+        let mut steps = vec![
+            ev(
+                0,
+                BuildEventKind::ResultStart {
+                    addr: "//p:a".into(),
+                },
+            ),
+            ev(1, matched(&["//p:a", "//p:b"], false)),
+            ev(2, matched(&["//p:a", "//p:b", "//p:c"], true)),
+        ];
+        steps.reverse();
+        loop {
+            for scope in [CountScope::Matched, CountScope::All] {
+                v.list.scope = scope;
+                let parts = v.title_parts(t0 + 5_000);
+                let title = parts.title();
+                let tilde = if title.provisional { "~" } else { "" };
+                let Counts { done, total, .. } = v.state.counts(scope);
+                assert_eq!(title.done.to_string(), done, "{scope:?}");
+                assert_eq!(
+                    title.total.map(|n| format!("{tilde}{n}")),
+                    total,
+                    "{scope:?}"
+                );
+            }
+            let Some(e) = steps.pop() else { break };
+            v.apply(&e);
         }
     }
 }

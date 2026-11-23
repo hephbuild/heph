@@ -24,7 +24,7 @@ pub struct Title<'a> {
     /// `auto-approving (Y)` / `auto-rejecting (N)`; never dropped.
     pub standing: Option<&'a str>,
     /// How the run ended, once it has; `None` while it runs.
-    pub verdict: Option<Verdict>,
+    pub verdict: Option<&'a Verdict>,
 }
 
 /// A finished run's verdict, as the line's final line words it: `✓ done`
@@ -230,7 +230,7 @@ fn title_spans(t: &Title<'_>, level: u8, command_cols: Option<usize>) -> Vec<Spa
         (None, _) => format!("{} done", t.done),
     };
     let lead = if out.is_empty() { "" } else { "   " };
-    match &t.verdict {
+    match t.verdict {
         Some(v) => {
             let color = if v.ok { Color::Green } else { Color::Red };
             out.push(Span::styled(
@@ -640,12 +640,13 @@ mod tests {
             ("✗ 12 failed", false),
             ("✗ stopped", false),
         ] {
+            let v = Verdict {
+                text: verdict.to_owned(),
+                ok,
+            };
             for command in ["heph r build //...", wide.as_str()] {
                 let mut t = title(command);
-                t.verdict = Some(Verdict {
-                    text: verdict.to_owned(),
-                    ok,
-                });
+                t.verdict = Some(&v);
                 for cols in 30..=120u16 {
                     let (rows, _) = header_lines(&t, &gauges, &COUNTS, Tab::All, cols);
                     let row = text(&rows[0]);
