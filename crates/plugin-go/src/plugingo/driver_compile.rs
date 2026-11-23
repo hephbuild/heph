@@ -444,8 +444,9 @@ impl ManagedDriver for GoCompileDriver {
             let mut importcfg = String::new();
             for ip in &import_paths {
                 let group = crate::plugingo::addr_util::import_path_to_dep_group(ip);
-                let archive = self
-                    .single_staged_path(&req, &def.deps, &group)
+                let archive = def
+                    .deps
+                    .single_staged_path(&req, &group)
                     .with_context(|| format!("locate staged archive for lib {ip}"))?;
                 importcfg.push_str(&format!("packagefile {ip}={archive}\n"));
             }
@@ -642,19 +643,6 @@ impl ManagedDriver for GoCompileDriver {
 }
 
 impl GoCompileDriver {
-    /// The single staged path for a one-output group (e.g. a lib archive).
-    fn single_staged_path(
-        &self,
-        req: &ManagedRunRequest<'_, '_>,
-        deps: &DepGroups,
-        group: &str,
-    ) -> anyhow::Result<String> {
-        deps.staged_paths(req, group)?
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("no staged file for dep group {group}"))
-    }
-
     /// Resolve the embedcfg JSON for `variant`: union Go's authoritative
     /// EmbedFiles (from the `golist` package.bin) with the selector's resolution
     /// of the staged `go_embed_src` assets, then group under each pattern.

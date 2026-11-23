@@ -485,9 +485,8 @@ impl ManagedDriver for GoLintDriver {
 }
 
 impl GoLintDriver {
-    /// The single staged path for a one-output group (lib archive, facts, tool).
-    ///
-    /// Rejects a directory: read-only staging lists only a subtree *root* unless the
+    /// [`DepGroups::single_staged_path`] for a one-output group (lib archive,
+    /// facts, tool), rejecting a directory: read-only staging lists only a subtree *root* unless the
     /// input opts into per-file staging, and handing that directory to `exec` fails
     /// as a bare `Permission denied` far from the cause. Fail with the reason here.
     fn single_staged_path(
@@ -496,11 +495,7 @@ impl GoLintDriver {
         deps: &DepGroups,
         group: &str,
     ) -> anyhow::Result<String> {
-        let path = deps
-            .staged_paths(req, group)?
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("no staged file for dep group {group}"))?;
+        let path = deps.single_staged_path(req, group)?;
         anyhow::ensure!(
             !std::path::Path::new(&path).is_dir(),
             "staged path for dep group {group} is a directory ({path}), not a file — the input \

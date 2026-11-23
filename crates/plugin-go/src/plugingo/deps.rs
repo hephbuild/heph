@@ -136,4 +136,121 @@ impl DepGroups {
         }
         Ok(out)
     }
+
+    /// The first file `group`'s deps staged: the one path of a one-output
+    /// group (a lib archive, its facts, a tool binary). Errors when the group
+    /// staged nothing.
+    pub(crate) fn single_staged_path(
+        &self,
+        req: &ManagedRunRequest<'_, '_>,
+        group: &str,
+    ) -> anyhow::Result<String> {
+        self.staged_paths(req, group)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("no staged file for dep group {group}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hdriver_support::driver_managed::ManagedRunInput;
+    use hplugin::driver::inputartifact::{InputArtifact, Type};
+    use hplugin::driver::targetdef::TargetDef;
+
+    /// A staged input of origin `origin`, its list file at `list` (`None` for a
+    /// support input, which has none).
+    fn input(origin: &str, list: Option<std::path::PathBuf>) -> ManagedRunInput {
+        ManagedRunInput {
+            input: hplugin::driver::RunInput {
+                artifact: InputArtifact {
+                    r#type: Type::Dep,
+                    origin_id: origin.to_string(),
+                    // Never read: the lookup goes through the list file.
+                    content: std::sync::Arc::new(hcore::hartifactcontent::FileContent::new(
+                        "unused",
+                    )),
+                },
+                origin_id: origin.to_string(),
+                source_addr: hmodel::htaddr::parse_addr("//dep:x").expect("addr"),
+                filters: vec![],
+                annotations: Default::default(),
+            },
+            list_path: list,
+            unpack_root: std::path::PathBuf::new(),
+        }
+    }
+
+    fn list_file(dir: &std::path::Path, name: &str, lines: &[&str]) -> std::path::PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, lines.join("\n")).expect("write list");
+        p
+    }
+
+    /// `single_staged_path` over `inputs`, for a def whose `lib` group
+    /// declared `n` deps.
+    fn single(inputs: Vec<ManagedRunInput>, n: usize) -> anyhow::Result<String> {
+        let def = TargetDef::default();
+        let id = "t".to_string();
+        let req = ManagedRunRequest {
+            request: hplugin::driver::RunRequest::new(&id, &def, std::path::PathBuf::new()),
+            sandbox_dir: std::path::PathBuf::new(),
+            sandbox_ws_dir: std::path::PathBuf::new(),
+            sandbox_pkg_dir: std::path::PathBuf::new(),
+            inputs,
+        };
+        DepGroups(BTreeMap::from([("lib".to_string(), n)])).single_staged_path(&req, "lib")
+    }
+
+    /// Several inputs sharing one origin (a dep that produced several
+    /// artifacts, or a support input beside it): the first list file found is
+    /// the origin's, and a support input without one is passed over.
+    #[test]
+    fn shared_origin_reads_the_list_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let list = list_file(dir.path(), "a.list", &["lib/a.a", "lib/b.a"]);
+        let origin = dep_origin("lib", 0);
+        let got = single(
+            vec![
+                input(&origin, None),
+                input(&origin, Some(list.clone())),
+                input(&origin, Some(list)),
+            ],
+            1,
+        )
+        .expect("staged");
+        assert_eq!(got, "lib/a.a");
+    }
+
+    /// The group's first dep staged nothing (elided by the engine, or its list
+    /// is empty): the path comes from the next one.
+    #[test]
+    fn empty_first_origin_falls_through() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let empty = list_file(dir.path(), "empty.list", &[]);
+        let second = list_file(dir.path(), "second.list", &["lib/second.a"]);
+        let got = single(
+            vec![
+                input(&dep_origin("lib", 0), Some(empty)),
+                input(&dep_origin("lib", 2), Some(second)),
+            ],
+            3,
+        )
+        .expect("staged");
+        assert_eq!(got, "lib/second.a");
+    }
+
+    /// No input carries the group's origin (or the group declared no deps):
+    /// the error names the group.
+    #[test]
+    fn absent_origin_is_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let other = list_file(dir.path(), "other.list", &["other/x.a"]);
+        for n in [0, 1] {
+            let err = single(vec![input(&dep_origin("other", 0), Some(other.clone()))], n)
+                .expect_err("nothing staged for lib");
+            assert_eq!(err.to_string(), "no staged file for dep group lib");
+        }
+    }
 }
