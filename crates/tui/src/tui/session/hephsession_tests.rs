@@ -390,3 +390,140 @@ fn a_zip_directory_is_capped() {
     let why = not_a_session_why(case.open(&zip_of(&refs, zip::CompressionMethod::Stored)));
     assert!(why.contains("central directory is past"), "{why}");
 }
+
+/// The offsets of every `sig` in `bytes`.
+fn offsets_of(bytes: &[u8], sig: &[u8; 4]) -> Vec<usize> {
+    bytes
+        .windows(4)
+        .enumerate()
+        .filter(|(_, w)| *w == sig)
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Little-endian `value` over `bytes[at..at + 4]`.
+fn put_u32(bytes: &mut [u8], at: usize, value: u32) {
+    bytes
+        .get_mut(at..at + 4)
+        .expect("in the zip")
+        .copy_from_slice(&value.to_le_bytes());
+}
+
+const LOCAL_HEADER: &[u8; 4] = b"PK\x03\x04";
+const CENTRAL_HEADER: &[u8; 4] = b"PK\x01\x02";
+
+/// An encrypted entry cannot be read without a password heph never asks
+/// for: refused, naming the entry, and nothing left behind. The flag is set
+/// by hand (general purpose bit 0, in the local and the central header),
+/// as an encrypting archiver would set it.
+#[test]
+fn an_encrypted_zip_entry_is_refused_by_name() {
+    let case = Case::new();
+    let mut zip = zip_of(
+        &[("run-7.hephsession", &zstd_of(&fixture()))],
+        zip::CompressionMethod::Stored,
+    );
+    for at in offsets_of(&zip, LOCAL_HEADER) {
+        *zip.get_mut(at + 6).expect("flags") |= 1;
+    }
+    for at in offsets_of(&zip, CENTRAL_HEADER) {
+        *zip.get_mut(at + 8).expect("flags") |= 1;
+    }
+    let path = case.write("artifact.zip", &zip);
+    let why = not_a_session_why(open(&path, &case.tmp()));
+    assert!(
+        why.contains("\"run-7.hephsession\"") && why.contains("Password required"),
+        "{why}"
+    );
+    assert_eq!(case.files(), ["artifact.zip"]);
+}
+
+/// A zip64 archive (what an archiver writes for a large entry, and some
+/// write for every entry) opens like any other.
+#[test]
+fn a_zip64_archive_opens() {
+    let case = Case::new();
+    let mut w = zip::ZipWriter::new(io::Cursor::new(Vec::new()));
+    let opts = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated)
+        .large_file(true);
+    w.start_file("x.hephsession", opts).expect("start entry");
+    w.write_all(&zstd_of(&fixture())).expect("write entry");
+    let zip = w.finish().expect("finish zip").into_inner();
+    // The zip64 extra field (header id 0x0001) is there.
+    assert!(
+        offsets_of(&zip, LOCAL_HEADER).iter().any(|at| {
+            let name_len = zip.get(at + 26..at + 28).expect("name length");
+            let name_len = usize::from(u16::from_le_bytes([name_len[0], name_len[1]]));
+            zip.get(at + 30 + name_len..at + 32 + name_len) == Some(&[1, 0][..])
+        }),
+        "not a zip64 entry"
+    );
+    let path = case.write("artifact.zip", &zip);
+    let opened = open(&path, &case.tmp()).expect("open a zip64 archive");
+    assert!(!session_id(&opened).is_empty());
+}
+
+/// A zstd frame whose header declares a 2 GiB window is refused before
+/// anything is decoded: the decoder would allocate the window. The frame is
+/// written by hand: no content size, window descriptor exponent 21
+/// (2^(10+21) bytes), then one raw last block.
+#[test]
+fn a_zstd_frame_wanting_a_2_gib_window_is_refused() {
+    let case = Case::new();
+    let data = b"SQLite format 3\0";
+    let mut frame = vec![0x28, 0xB5, 0x2F, 0xFD, 0x00, 21 << 3];
+    let block = u32::try_from(data.len() << 3).expect("small") | 1;
+    frame.extend_from_slice(block.to_le_bytes().get(..3).expect("3 bytes"));
+    frame.extend_from_slice(data);
+    let why = not_a_session_why(case.open(&frame));
+    assert!(why.contains("zstd") && why.contains("memory"), "{why}");
+    assert_eq!(case.files(), ["in.hephsession"]);
+}
+
+/// A zip entry whose headers understate its size, stored or deflated, is
+/// still stopped at the cap: the declared size is never trusted.
+#[test]
+fn an_understated_zip_entry_stops_at_the_cap() {
+    let mut big = fixture();
+    big.resize(3 << 20, 0);
+    for method in [
+        zip::CompressionMethod::Stored,
+        zip::CompressionMethod::Deflated,
+    ] {
+        let case = Case::new();
+        let mut zip = zip_of(&[("x.hephsession", &big)], method);
+        // Uncompressed size: local header +22, central header +24.
+        for at in offsets_of(&zip, LOCAL_HEADER) {
+            put_u32(&mut zip, at + 22, 100);
+        }
+        for at in offsets_of(&zip, CENTRAL_HEADER) {
+            put_u32(&mut zip, at + 24, 100);
+        }
+        let path = case.write("bomb.zip", &zip);
+        let why = not_a_session_why(open_capped(&path, &case.tmp(), 1 << 20));
+        // Stopped by the zip reader at the declared size, or by the cap;
+        // either way refused, and nothing kept.
+        assert!(
+            why.contains("larger than its declared") || why.contains("decompresses past"),
+            "{method:?}: {why}"
+        );
+        assert_eq!(case.files(), ["bomb.zip"], "{method:?}");
+    }
+}
+
+/// A zip cut short (a download that stopped) is refused, naming the zip,
+/// and never panics.
+#[test]
+fn a_truncated_zip_is_refused() {
+    let zip = zip_of(
+        &[("x.hephsession", &zstd_of(&fixture()))],
+        zip::CompressionMethod::Deflated,
+    );
+    for cut in [zip.len() / 2, zip.len() - 10, 30] {
+        let case = Case::new();
+        let why = not_a_session_why(case.open(zip.get(..cut).expect("cut")));
+        assert!(why.contains("cannot read the zip"), "cut at {cut}: {why}");
+        assert_eq!(case.files(), ["in.hephsession"], "cut at {cut}");
+    }
+}
