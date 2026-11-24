@@ -12,7 +12,9 @@
 //! ruleset — where the required status checks live — has condition
 //! `~DEFAULT_BRANCH`, so it applies to exactly the PRs whose base is master,
 //! and the gate builds every one of those unconditionally. Nothing reaches
-//! master without first being a PR that targets master.
+//! master without first being a PR that targets master. (An atomic `gh stack
+//! merge` holds every layer to the ruleset; a middle layer then carries the
+//! top's results, posted by `stack-status.yml` — see `stack_status.rs`.)
 //!
 //! Every assertion below protects a way that reasoning can be broken silently,
 //! in the direction where nothing goes red:
