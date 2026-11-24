@@ -2781,6 +2781,58 @@ fn export_destination() {
     );
 }
 
+/// `export -o PATH` replaces a file already at `PATH` with an export that
+/// opens (unlike the seal-time export, which never does); `-o` into a
+/// directory that does not exist fails naming it, and creates nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn export_o_replaces_a_file_and_wants_its_parent() {
+    let sessions = tempfile::tempdir().expect("tempdir");
+    let id = SessionId::new(T0, 12);
+    write_ended(
+        sessions.path(),
+        &meta(id, 1, &["heph", "run", "//a:b"]),
+        &build_records("//a:b", T0, Some(0)),
+        &ended(Some(0), T0 + 10),
+    );
+    let file = crate::tui::session::FileSource::new(sessions.path());
+    let out = tempfile::tempdir().expect("tempdir");
+    let export_to = |output: PathBuf| {
+        let file = &file;
+        async move {
+            export::export_ref(
+                file,
+                opts(),
+                &ExportArgs {
+                    reference: id.encode(),
+                    output: Some(output),
+                    no_logs: false,
+                },
+                crate::engine::approval::read_notice_from_store,
+                &mut Vec::new(),
+                &no_opener(),
+            )
+            .await
+        }
+    };
+
+    let path = out.path().join("run.hephsession");
+    std::fs::write(&path, "an older export").expect("write");
+    let exported = export_to(path.clone()).await.expect("export over a file");
+    assert_eq!(exported.path.as_deref(), Some(path.as_path()));
+    let rec = crate::tui::session::recording::Recording::open_foreign(&path, out.path())
+        .expect("the replacement opens");
+    assert_eq!(rec.meta().expect("meta").id, id);
+    drop(rec);
+
+    let missing = out.path().join("missing");
+    let e = export_to(missing.join("run.hephsession"))
+        .await
+        .expect_err("no parent");
+    let msg = format!("{e:#}");
+    assert!(msg.contains(&missing.display().to_string()), "{msg}");
+    assert!(!missing.exists());
+}
+
 /// The `.hephconfig` defaults a bad value's warning names are the ones the
 /// cleanup applies.
 /// A lost session sealed by cleanup carries `derivation` 0: no

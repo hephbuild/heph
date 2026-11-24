@@ -1,3 +1,6 @@
+use std::fs::Permissions;
+use std::os::unix::fs::PermissionsExt as _;
+
 use super::*;
 use crate::tui::session::format::files;
 use crate::tui::session::recorder::Gate;
@@ -7,6 +10,7 @@ use crate::tui::session::{
     HeaderKind, META_FORMAT, SealExport, Session, SessionHeader, SessionMeta, SessionRoot,
     SessionStart, lockfile, testing,
 };
+use crate::tui::session::{cleanup, recorder};
 
 fn no_read(_: &NoticeRoots, _: &[hcore::approval_notice::NoticeSource]) -> Option<String> {
     None
@@ -147,6 +151,135 @@ fn export_is_silent_and_bounded() {
             exit_code: Some(3),
             panicked: false
         }
+    );
+}
+
+/// `f` under a fresh subscriber, and what it logged once settled.
+fn logged<T>(f: impl FnOnce() -> T) -> (T, String) {
+    let captured = Captured::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(captured.clone())
+        .with_ansi(false)
+        .finish();
+    let out = tracing::subscriber::with_default(subscriber, f);
+    (out, captured.settled_log())
+}
+
+/// The local recording `id` under `root` ended with `exit_code`.
+fn assert_ended(root: &SessionRoot, id: SessionId, exit_code: i32) {
+    let rec =
+        Recording::open_local(root.path(), &root.path().join(id.encode())).expect("open local");
+    assert_eq!(
+        rec.state().expect("state"),
+        RecordingState::Finished {
+            exit_code: Some(exit_code),
+            panicked: false
+        }
+    );
+}
+
+/// A recorder that does not let go in time (`Finished::Late`: a hung disk
+/// holds its `End`) is not exported: the export would read a recording
+/// still being written. One warning naming the directory and why; nothing
+/// in it, even once the disk comes back.
+#[test]
+fn a_late_recorder_is_not_exported() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = SessionRoot::new(tmp.path().join("sessions"));
+    let out = tmp.path().join("exports");
+    let gate: Gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let ((), log) = logged(|| {
+        let session = Session::open_with(
+            &root,
+            SessionStart {
+                export: Some(seal_export(&out, EXPORT_DIR_BOUND, None)),
+                ..start()
+            },
+            cleanup::Retention::default(),
+            recorder::Faults {
+                gate: Some(Arc::clone(&gate)),
+                ..recorder::Faults::default()
+            },
+        )
+        .expect("open");
+        session.finish(Some(0), false);
+        assert_eq!(entries(&out), Vec::<String>::new());
+        let (open, opened) = &*gate;
+        *open.lock().expect("gate") = true;
+        opened.notify_all();
+    });
+    assert_eq!(entries(&out), Vec::<String>::new());
+    assert_eq!(log.matches("WARN").count(), 1, "{log}");
+    assert!(log.contains("it is not exported"), "{log}");
+    assert!(
+        log.contains(&format!("dir={}", out.display())) && log.contains("reason="),
+        "{log}"
+    );
+}
+
+/// An export that fails at seal (the directory is a file, or cannot be
+/// written) costs one warning naming the directory and the error, and
+/// nothing else: the session's end is recorded as it was.
+#[test]
+fn a_seal_time_export_failure_is_one_warning() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = SessionRoot::new(tmp.path().join("sessions"));
+    let a_file = tmp.path().join("a-file");
+    std::fs::write(&a_file, "not a directory").expect("write");
+    let read_only = tmp.path().join("read-only");
+    std::fs::create_dir(&read_only).expect("mkdir");
+    std::fs::set_permissions(&read_only, Permissions::from_mode(0o555)).expect("chmod");
+    // Root writes anywhere: that case says nothing there.
+    let probe = read_only.join("probe");
+    let writable = std::fs::write(&probe, "").is_ok();
+    let mut cases = vec![(a_file.clone(), "creating")];
+    if writable {
+        eprintln!("skipping the unwritable-directory case: it is writable here");
+    } else {
+        cases.push((read_only.clone(), "temp file"));
+    }
+    for (out, why) in cases {
+        let (id, log) = logged(|| {
+            let session = exporting(&root, seal_export(&out, EXPORT_DIR_BOUND, None));
+            session.finish(Some(4), false);
+            session.id()
+        });
+        assert_eq!(log.matches("WARN").count(), 1, "{}: {log}", out.display());
+        assert!(log.contains("cannot export the session"), "{log}");
+        assert!(
+            log.contains(&format!("dir={}", out.display()))
+                && log.contains("error=")
+                && log.contains(why),
+            "{log}"
+        );
+        assert_ended(&root, id, 4);
+    }
+    assert_eq!(std::fs::read(&a_file).expect("read"), b"not a directory");
+    assert!(entries(&read_only).iter().all(|n| n == "probe"));
+    std::fs::set_permissions(&read_only, Permissions::from_mode(0o755)).expect("chmod");
+}
+
+/// The seal-time export never replaces a file: one already at
+/// `<dir>/<id>.hephsession` is kept, with one warning.
+#[test]
+fn a_seal_time_export_never_overwrites() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = SessionRoot::new(tmp.path().join("sessions"));
+    let out = tmp.path().join("exports");
+    std::fs::create_dir(&out).expect("mkdir");
+    let (dest, log) = logged(|| {
+        let session = exporting(&root, seal_export(&out, EXPORT_DIR_BOUND, None));
+        let dest = out.join(file_name(session.id()));
+        std::fs::write(&dest, "keep").expect("write");
+        session.finish(Some(0), false);
+        dest
+    });
+    assert_eq!(std::fs::read(&dest).expect("read"), b"keep");
+    assert_eq!(entries(&out).len(), 1, "{:?}", entries(&out));
+    assert_eq!(log.matches("WARN").count(), 1, "{log}");
+    assert!(
+        log.contains("cannot export the session") && log.contains(&dest.display().to_string()),
+        "{log}"
     );
 }
 

@@ -12,7 +12,7 @@
 //! A path or URL opens a *foreign* recording (spec I7), read only from
 //! itself, even when it came from this machine.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context as _;
@@ -68,12 +68,29 @@ pub(crate) fn redact_url(url: &str) -> String {
 pub(crate) trait Download: Send + Sync {
     /// GET `url` into a new temp file in `dir`.
     fn get_to_temp(&self, url: &str, dir: &Path) -> anyhow::Result<tempfile::NamedTempFile>;
+
+    /// The fetcher behind it, for a test of the production wiring.
+    #[cfg(test)]
+    fn fetcher(&self) -> Option<hfetch::Fetcher> {
+        None
+    }
 }
 
 impl Download for hfetch::Fetcher {
     fn get_to_temp(&self, url: &str, dir: &Path) -> anyhow::Result<tempfile::NamedTempFile> {
         hfetch::Fetcher::get_to_temp(self, url, dir)
     }
+
+    #[cfg(test)]
+    fn fetcher(&self) -> Option<hfetch::Fetcher> {
+        Some(*self)
+    }
+}
+
+/// The download a `<ref>` URL goes through: `https://` only, redirects
+/// included, and at most [`URL_CAP`](crate::tui::session::hephsession::URL_CAP).
+pub(crate) fn url_fetcher() -> hfetch::Fetcher {
+    hfetch::Fetcher::https_capped(crate::tui::session::hephsession::URL_CAP)
 }
 
 /// How a foreign `<ref>` is opened: where temp files go, and the download.
@@ -82,6 +99,16 @@ pub(crate) struct Opener {
     /// Downloads and decompressed copies: the sessions root's `.tmp/`.
     pub tmp_dir: Arc<Path>,
     pub download: Arc<dyn Download>,
+}
+
+impl Opener {
+    /// Production's: temp files in `tmp_dir`, downloads by [`url_fetcher`].
+    pub(crate) fn new(tmp_dir: PathBuf) -> Self {
+        Self {
+            tmp_dir: tmp_dir.into(),
+            download: Arc::new(url_fetcher()),
+        }
+    }
 }
 
 /// A resolved `<ref>`.

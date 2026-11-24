@@ -130,6 +130,28 @@ fn ref_classification() {
     }
 }
 
+/// The opener `execute` builds downloads `https://` only, capped at
+/// `URL_CAP`: a `<ref>` URL is untrusted. An `http://` URL is refused by the
+/// download itself, before any connection, as well as by `classify`.
+#[test]
+fn the_production_opener_is_https_only_and_capped() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let opener = reference::Opener::new(tmp.path().to_path_buf());
+    assert_eq!(&*opener.tmp_dir, tmp.path());
+    let fetcher = opener.download.fetcher().expect("an hfetch::Fetcher");
+    assert!(fetcher.https_only, "{fetcher:?}");
+    assert_eq!(
+        fetcher.max_bytes,
+        Some(crate::tui::session::hephsession::URL_CAP),
+        "{fetcher:?}"
+    );
+    let e = opener
+        .download
+        .get_to_temp("http://127.0.0.1:1/x.hephsession", tmp.path())
+        .expect_err("http is refused");
+    assert!(e.downcast_ref::<hfetch::NotHttps>().is_some(), "{e:#}");
+}
+
 /// O4: a URL with credentials is refused before anything is fetched, and the
 /// credentials never reach the error text.
 #[tokio::test]
