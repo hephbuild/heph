@@ -47,7 +47,7 @@
 //! non-UTF-8 argument or environment value is legal on every supported target,
 //! and a text encoding would either corrupt it or bloat it several-fold.
 
-use hcore::session_record::SESSION_EXPORT_DIR_ENV;
+use hcore::session_record::is_heph_owned_env;
 use hproc::proc_exec;
 use rustix::fd::{AsFd, BorrowedFd, OwnedFd};
 use rustix::net::{
@@ -944,13 +944,16 @@ fn agent_environment(request: Vec<(OsString, OsString)>) -> Vec<(OsString, OsStr
 
 /// The runner's half of [`agent_environment`]: the agent's `environ` minus
 /// the keys that are the agent's own (`PATH` is joined separately) and
-/// [`SESSION_EXPORT_DIR_ENV`], which the launch is started without
-/// ([`crate::session`]) and which an environment that exports it anyway must
-/// not hand every target (spec E4). A target that names it in
-/// `runtime_pass_env` still gets it, through `request`.
+/// heph's own names ([`hcore::session_record::HEPH_OWNED_ENV`]), which the launch is started
+/// without ([`crate::session`]) and which an environment that exports them
+/// anyway must not hand every target (spec E4): `HEPH_SESSION_EXPORT_DIR`
+/// would send a nested heph's export there unasked, `HEPH_TOOLS_DIR` would
+/// hand a target without tools another sandbox's tool tree. A target that
+/// sets one itself, or names it in `runtime_pass_env`, still gets it,
+/// through `request`.
 fn runner_base(env: impl Iterator<Item = (OsString, OsString)>) -> Vec<(OsString, OsString)> {
     env.filter(|(k, _)| {
-        k != SOCK_ENV && k != PATH_SUFFIX_ENV && k != "PATH" && k != SESSION_EXPORT_DIR_ENV
+        k != SOCK_ENV && k != PATH_SUFFIX_ENV && k != "PATH" && !is_heph_owned_env(k)
     })
     .collect()
 }
@@ -1239,12 +1242,17 @@ mod tests {
     }
 
     /// Spec E4: an environment that exports the session export directory
-    /// does not hand it to every target; a near-miss name is kept.
+    /// (or another sandbox's tools directory) does not hand it to every
+    /// target; a near-miss name is kept.
     #[test]
     fn the_runner_base_never_carries_the_session_export_dir() {
         let base = runner_base(
             [
-                (SESSION_EXPORT_DIR_ENV, "/ci/sessions"),
+                (
+                    hcore::session_record::SESSION_EXPORT_DIR_ENV,
+                    "/ci/sessions",
+                ),
+                (hcore::session_record::TOOLS_DIR_ENV, "/outer/tools"),
                 ("HEPH_SESSION_EXPORT_DIRS", "near miss"),
                 (SOCK_ENV, "/s.sock"),
                 ("PATH", "/env/bin"),

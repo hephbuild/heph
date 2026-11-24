@@ -686,6 +686,15 @@ impl SessionSlot {
                 return None;
             }
         };
+        // An export directory inside the workspace: every heph writes there
+        // when it exits, so a target that reads or writes it misses the cache
+        // every run. Said once, as the session opens, never refused.
+        let in_workspace = start
+            .export
+            .as_ref()
+            .zip(start.workspace_root.as_deref())
+            .filter(|(e, ws)| export::dir_in_workspace(&e.dir, Path::new(ws)))
+            .map(|(e, ws)| (e.dir.clone(), ws.to_owned()));
         // Opened outside the slot's lock: it does IO.
         let session = match Session::open_with(&root, start, retention, faults) {
             Ok(s) => std::sync::Arc::new(s),
@@ -704,6 +713,18 @@ impl SessionSlot {
             && !session.is_private()
         {
             tracing::warn!(reason = %why, "this run's session is not exported");
+        }
+        if let Some((dir, workspace)) = in_workspace
+            && !session.is_private()
+        {
+            tracing::warn!(
+                dir = %dir.display(),
+                workspace = %workspace,
+                "{} is inside the workspace: every heph writes its session there when it exits, \
+                 so a target whose inputs or outputs cover it misses the cache every run; \
+                 point it outside the workspace (CI: under the runner's temp directory)",
+                hcore::session_record::SESSION_EXPORT_DIR_ENV
+            );
         }
         let opened = OpenedSession {
             id: session.id(),

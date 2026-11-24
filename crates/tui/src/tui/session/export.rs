@@ -568,6 +568,47 @@ pub fn export_dir_from_env(value: Option<&OsStr>) -> Result<Option<PathBuf>, Str
     }
 }
 
+/// Whether the export directory `dir` is `root` or under it, symlinks
+/// resolved as far as the path exists (it may not yet: it is created at
+/// seal). A heuristic for one warning, never a refusal: every heph writes
+/// `<id>.hephsession` there when it exits, so a target whose inputs or
+/// outputs cover it would miss the cache on every run.
+pub fn dir_in_workspace(dir: &Path, root: &Path) -> bool {
+    resolved(dir).starts_with(resolved(root))
+}
+
+/// `path` with `.` and `..` folded away, then its longest existing prefix
+/// canonicalized and the rest appended.
+fn resolved(path: &Path) -> PathBuf {
+    let mut normal = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::ParentDir => {
+                normal.pop();
+            }
+            Component::CurDir => {}
+            c => normal.push(c),
+        }
+    }
+    let mut existing = normal.as_path();
+    let mut rest = Vec::new();
+    loop {
+        if let Ok(canonical) = std::fs::canonicalize(existing) {
+            return rest
+                .iter()
+                .rev()
+                .fold(canonical, |p: PathBuf, c: &&OsStr| p.join(c));
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name);
+                existing = parent;
+            }
+            _ => return normal,
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "export_tests.rs"]
 mod tests;

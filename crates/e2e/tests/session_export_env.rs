@@ -56,6 +56,13 @@ target(
     run = "true",
     pass_env = ["HEPH_SESSION_EXPORT_DIR"],
 )
+target(
+    name = "runtime_named",
+    driver = "bash",
+    run = "echo probe=${E2E_EXPORT_DIR_PROBE:-absent} export=${HEPH_SESSION_EXPORT_DIR:-absent} > $OUT",
+    out = "env.txt",
+    runtime_pass_env = ["HEPH_SESSION_EXPORT_DIR"],
+)
 "#;
 
 /// Sets a host variable until dropped.
@@ -117,7 +124,8 @@ async fn seen(engine: &Arc<Engine>, addr: &str) -> anyhow::Result<Seen> {
 /// A target under `runtime_pass_env = ["*"]`, and one under the hashed
 /// `pass_env = ["*"]`, write what they see: neither sees the export directory,
 /// and the def hash, `hashin` and hashout are the same with and without it.
-/// Naming it in `pass_env` fails at parse.
+/// Naming it in `pass_env` fails at parse; naming it in `runtime_pass_env`
+/// passes it, with no hash moving between two values.
 #[tokio::test]
 async fn export_dir_never_reaches_a_target() -> anyhow::Result<()> {
     let _probe = EnvVar::set(PROBE, "1");
@@ -165,5 +173,24 @@ async fn export_dir_never_reaches_a_target() -> anyhow::Result<()> {
             "{addr}: {EXPORT_DIR} must change neither the output nor a hash"
         );
     }
+    drop(engine);
+
+    // The exemption (E4): a target that names it in `runtime_pass_env`,
+    // which is not hashed, sees the value, and the directory a job picked
+    // moves neither its def hash nor its `hashin`. A fresh engine per value,
+    // as above. The probe is not named, so it does not reach this one.
+    let mut keys = Vec::new();
+    for value in ["/a", "/b"] {
+        let _var = EnvVar::set(EXPORT_DIR, value);
+        let engine = ws.reopen()?;
+        let s = seen(&engine, "//p:runtime_named").await?;
+        assert_eq!(s.output, format!("probe=absent export={value}"));
+        keys.push((s.def_hash, s.hashin));
+    }
+    assert_eq!(
+        keys.first(),
+        keys.get(1),
+        "{EXPORT_DIR} in runtime_pass_env must move neither the def hash nor hashin"
+    );
     Ok(())
 }

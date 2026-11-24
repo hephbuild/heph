@@ -981,16 +981,25 @@ heph session attach sessions/<id>.hephsession
 - It includes the notices and root failure logs, as `export` does without
   `--no-logs`. A private session (`HEPH_NO_SESSION=1`) and `--raw` export
   nothing.
-- It **never reaches a target**. heph strips it from `pass_env = ["*"]`,
-  `runtime_pass_env = ["*"]` and a session runner's launch, and refuses it by
-  name in `pass_env` (and in a dependency's `transitive` env passed with
-  `hash: true`), where it would move the def hash with the directory a job
-  picked. A target that wants it names it in `runtime_pass_env`, which is not
-  hashed. An `entrypoint` target runs on the caller's whole environment, so a
-  heph it starts writes its own file there, as intended.
-- **Don't point it inside a target's outputs** (or anywhere a target reads):
-  a heph run by that target would add a new file with a new id on every run,
-  and the outputs would differ every time.
+- It **never reaches a target** unless something names it. heph strips it,
+  with its other own name `HEPH_TOOLS_DIR`, from `pass_env = ["*"]`,
+  `runtime_pass_env = ["*"]`, a session runner's launch (even when its
+  `launch_env` names it) and the environment that runner's agent hands every
+  target; and refuses it by name in `pass_env` (and in a dependency's
+  `transitive` env passed with `hash: true`), where it would move the def
+  hash with the directory a job picked. Three routes pass it on, each by
+  name and none hashed, so the directory moves no def hash and no `hashin`:
+  a target's own `runtime_pass_env`; a dependency's `transitive` env with
+  `hash: false`, which lands in the consumer's `runtime_pass_env`; and a wrap
+  runner's `runtime_pass_env`, which pulls it from the host into every
+  target that runner wraps. An `entrypoint` target runs on the caller's whole
+  environment, so a heph it starts writes its own file there, as intended.
+- **Point it outside the workspace.** Every heph that sees it writes
+  `<id>.hephsession` there when it exits, a new name each run, plus hidden
+  `.<name>.*.tmp` files while it writes. A target whose inputs or outputs
+  cover the directory (a glob over the workspace, say) therefore misses the cache on every run. heph warns once, when the
+  session opens, if the directory is inside the workspace root; it still
+  exports.
 
 ## Retention
 

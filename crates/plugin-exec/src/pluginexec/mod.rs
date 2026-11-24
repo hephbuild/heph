@@ -474,7 +474,7 @@ fn describe_tool_group(group: &str) -> String {
 /// tool target's outputs sit at `<its package>/<its path>` below it whatever
 /// group a consumer lists it in, so a launcher script can name the files
 /// shipped beside it.
-pub(crate) const TOOLS_DIR_KEY: &str = "HEPH_TOOLS_DIR";
+pub(crate) const TOOLS_DIR_KEY: &str = hcore::session_record::TOOLS_DIR_ENV;
 
 /// The `unpack_root` of every tool input, own or transitive: one tree per
 /// sandbox, which is what lets [`TOOLS_DIR_KEY`] have a single value.
@@ -487,7 +487,8 @@ fn host_env_for_wildcard() -> impl Iterator<Item = (String, String)> {
 }
 
 /// What a `"*"` passthrough keeps of `env`: all of it except the names that
-/// are heph's own and never a target's input.
+/// are heph's own and never a target's input
+/// ([`hcore::session_record::HEPH_OWNED_ENV`]).
 ///
 /// - [`TOOLS_DIR_KEY`] only ever names the tools of the heph target this
 ///   process runs inside, never anything of this target's. Left in, a nested
@@ -501,7 +502,7 @@ fn host_env_for_wildcard() -> impl Iterator<Item = (String, String)> {
 fn wildcard_env(
     env: impl Iterator<Item = (String, String)>,
 ) -> impl Iterator<Item = (String, String)> {
-    env.filter(|(k, _)| k != TOOLS_DIR_KEY && k != SESSION_EXPORT_DIR_ENV)
+    env.filter(|(k, _)| !hcore::session_record::is_heph_owned_env(k))
 }
 
 /// Refuse [`SESSION_EXPORT_DIR_ENV`] among the names a target hashes: a named

@@ -25,9 +25,31 @@ pub const RUNS_DIR: &str = "runs";
 /// it from the `pass_env = ["*"]` and `runtime_pass_env = ["*"]` wildcards
 /// and refuses it in a named `pass_env` (directly or through a dependency's
 /// hashed `transitive` env), where it would reach the def hash; the session
-/// runner removes it from its launch and its targets' base environment. Only
-/// a named `runtime_pass_env`, which is not hashed, passes it to a target.
+/// runner removes it from its launch and its targets' base environment (all
+/// three through [`HEPH_OWNED_ENV`]). Only a name in a `runtime_pass_env`,
+/// which is not hashed, passes it to a target: the target's own, a
+/// dependency's unhashed `transitive` env, or a wrap runner's.
 pub const SESSION_EXPORT_DIR_ENV: &str = "HEPH_SESSION_EXPORT_DIR";
+
+/// `HEPH_TOOLS_DIR`: the directory the exec driver stages a target's tools
+/// under. It names the tools of the heph target a process runs inside, never
+/// anything of another target's.
+pub const TOOLS_DIR_ENV: &str = "HEPH_TOOLS_DIR";
+
+/// The environment variables that are heph's own and never come to a target
+/// from an environment it inherits wholesale: the exec driver's `"*"`
+/// passthroughs, a session runner's launch (even when its `launch_env` names
+/// one), and the base environment a session runner's agent gives every
+/// target. A target still sets or passes one by name where the driver allows
+/// it; that goes through its own, explicit environment.
+pub const HEPH_OWNED_ENV: [&str; 2] = [TOOLS_DIR_ENV, SESSION_EXPORT_DIR_ENV];
+
+/// Whether `name` is one of [`HEPH_OWNED_ENV`]: an exact, case-sensitive
+/// match.
+pub fn is_heph_owned_env(name: impl AsRef<std::ffi::OsStr>) -> bool {
+    let name = name.as_ref();
+    HEPH_OWNED_ENV.iter().any(|owned| name == *owned)
+}
 
 /// A run's live log came into being: `addr` is running at `hashin`, and its
 /// output is being appended to `file`.
@@ -172,6 +194,29 @@ mod tests {
             "runs/x/1\0.log",
         ] {
             assert_eq!(rec(bad).relative_file(), None, "{bad:?}");
+        }
+    }
+
+    /// Exactly heph's names: a near miss, another case or a prefix is a
+    /// target's own variable.
+    #[test]
+    fn heph_owned_env_is_an_exact_match() {
+        for owned in [SESSION_EXPORT_DIR_ENV, TOOLS_DIR_ENV] {
+            assert!(is_heph_owned_env(owned), "{owned}");
+            assert!(
+                is_heph_owned_env(std::ffi::OsString::from(owned)),
+                "{owned}"
+            );
+        }
+        for other in [
+            "HEPH_SESSION_EXPORT_DIRS",
+            "heph_tools_dir",
+            "HEPH_TOOLS",
+            "HEPH_TOOLS_DIR ",
+            "",
+            "PATH",
+        ] {
+            assert!(!is_heph_owned_env(other), "{other:?}");
         }
     }
 }

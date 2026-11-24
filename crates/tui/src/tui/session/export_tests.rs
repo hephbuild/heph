@@ -4,8 +4,8 @@ use crate::tui::session::recorder::Gate;
 use crate::tui::session::recording::RecordingState;
 use crate::tui::session::tests::{Captured, start};
 use crate::tui::session::{
-    HeaderKind, META_FORMAT, SealExport, Session, SessionMeta, SessionRoot, SessionStart, lockfile,
-    testing,
+    HeaderKind, META_FORMAT, SealExport, Session, SessionHeader, SessionMeta, SessionRoot,
+    SessionStart, lockfile, testing,
 };
 
 fn no_read(_: &NoticeRoots, _: &[hcore::approval_notice::NoticeSource]) -> Option<String> {
@@ -148,6 +148,70 @@ fn export_is_silent_and_bounded() {
             panicked: false
         }
     );
+}
+
+/// An export directory inside the workspace is warned about once, when the
+/// session opens, naming both and what it costs; one beside the workspace
+/// (a near-miss name included) is not, and neither is a private session.
+/// The export still happens: the warning refuses nothing.
+#[test]
+fn an_export_dir_in_the_workspace_is_warned_about_once() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ws = tmp.path().join("ws");
+    std::fs::create_dir_all(&ws).expect("mkdir");
+    let warnings = |export: &Path, root: SessionRoot| {
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .finish();
+        let slot = crate::tui::session::SessionSlot::new();
+        slot.configure(Ok(Some(root)), vec!["heph".to_owned()]);
+        slot.set_workspace(&ws, &ws, &ws.join(".heph"));
+        slot.configure_export(Some(export.as_os_str()), no_read);
+        tracing::subscriber::with_default(subscriber, || {
+            for _ in 0..2 {
+                assert!(slot.open(SessionHeader::default(), false).is_some());
+            }
+            slot.finish(Some(0));
+        });
+        captured.settled_log()
+    };
+    let sessions = || SessionRoot::new(tmp.path().join("sessions"));
+    for inside in [
+        ws.join("out/sessions"),
+        ws.clone(),
+        // Not there yet, through `..`: still inside.
+        ws.join("a/../b"),
+    ] {
+        let log = warnings(&inside, sessions());
+        assert_eq!(
+            log.matches("WARN").count(),
+            1,
+            "{}: {log}",
+            inside.display()
+        );
+        assert!(
+            log.contains("inside the workspace")
+                && log.contains("misses the cache")
+                && log.contains(&format!("workspace={}", ws.display())),
+            "{log}"
+        );
+    }
+    assert_eq!(
+        entries(&ws.join("b")).len(),
+        1,
+        "warned, and exported all the same"
+    );
+    for outside in [tmp.path().join("ws2"), tmp.path().join("exports")] {
+        let log = warnings(&outside, sessions());
+        assert!(!log.contains("WARN"), "{}: {log}", outside.display());
+    }
+    let private = warnings(
+        &ws.join("out"),
+        SessionRoot::private(tmp.path().join("private")),
+    );
+    assert!(!private.contains("WARN"), "{private}");
 }
 
 /// `HEPH_SESSION_EXPORT_DIR`: unset or empty is off; only an absolute path
