@@ -114,6 +114,7 @@ workspace rooted at `$HOME`, whose home is `~/.heph`.
 
 ```
 ~/.heph/sessions/
+  .cleanup                   its mtime: when the last cleanup was claimed (at most hourly)
   .tmp/                      readers' copies of lost recordings (swept after 10 minutes)
   .removing-<id>-<pid>/      a removal in progress (a tomb)
   <id>/
@@ -468,7 +469,7 @@ header (`store::open_local`):
 | --- | --- | --- |
 | held | WAL | **live**: a read-only connection with a 1s `busy_timeout`. A follower re-reads `records WHERE seq > last` whenever `PRAGMA data_version` moves, and drops its connection as soon as a batch holds `End`, so the owner can seal. If the session row already says `sealed=1`, the holder (the owner after `End`, or a cleanup) is sealing: the viewer closes the connection, which would cut the seal short, and waits up to 3s for the header to turn rollback (read **sealed**) or the lock to free (read a **copy**); past that it reads in place, as ended. Never **live**. |
 | any | rollback | **sealed**: `immutable=1` (no `-shm`, no locks, works on a read-only copy). A held lock over a rollback-mode header is a cleanup that just sealed it: read as ended. `sealed=1` alone never chooses `immutable=1`. |
-| free | WAL | **copy**: a lost session, or a seal cut short. The viewer takes the session's `lock` **shared** while it copies `session.db` and its `-wal` into `<sessions root>/.tmp/`, releases it, and opens the copy (WAL recovery runs on the copy). A cleanup that finds the lock held shared does not wait for it: it leaves the session unsealed and uncounted, and the next cleanup (the next session start) seals it. Every other probe still reads the session as not live. A viewer that finds the lock held exclusively (a cleanup sealing it) waits for that seal exactly as in the first row: up to 3s for the header to turn rollback or the lock to free, then in place, as ended. The copy is removed when the viewer is done; an orphan is swept by cleanup after 10 minutes. |
+| free | WAL | **copy**: a lost session, or a seal cut short. The viewer takes the session's `lock` **shared** while it copies `session.db` and its `-wal` into `<sessions root>/.tmp/`, releases it, and opens the copy (WAL recovery runs on the copy). A cleanup that finds the lock held shared does not wait for it: it leaves the session unsealed and uncounted, and the next cleanup (a session start, at most hourly) seals it. Every other probe still reads the session as not live. A viewer that finds the lock held exclusively (a cleanup sealing it) waits for that seal exactly as in the first row: up to 3s for the header to turn rollback or the lock to free, then in place, as ended. The copy is removed when the viewer is done; an orphan is swept by cleanup after 10 minutes. |
 
 None of the three writes the original: a live WAL reader's only file write
 is SQLite's `-shm` index (I3). No reader opens with `SQLITE_OPEN_CREATE`, so
@@ -499,7 +500,8 @@ a file only finishes the checkpoint and mode switch, and keeps the owner's
 
 A session killed before its seal (`SIGKILL`, a second Ctrl-C) leaves a
 WAL-mode recording with no `End` and a free lock: `lost`. The next cleanup
-past [`STARTING`](#retention) **seals** it under its lock taken exclusively:
+past [`STARTING`](#retention) (cleanup runs at most hourly, so up to an
+hour later) **seals** it under its lock taken exclusively:
 `ended_ms` is its last record's `at_ms`, `exit_code` stays NULL, and the
 file is switched to rollback mode. Cleanup runs during a build, so it
 repairs nothing (I1): the explorer rows stay what the crash left, without
@@ -800,6 +802,33 @@ every other viewer stay read-only. It decides on lock state,
 modification times and a recording's 100-byte header, **never** on its
 contents.
 
+It runs **at most once an hour per sessions root**, asynchronously (a user
+decision, 2026-11-24: nothing about it needs to be inline). The root's
+`.cleanup` stamp holds, in its modification time, when its last cleanup was
+claimed:
+
+- A start whose stamp is younger than an hour (`INTERVAL`) does one `stat`
+  and nothing else: no thread, no scan. Its cost does not grow with history.
+- Otherwise the cleanup thread claims the run and then cleans. The claim is
+  atomic across hephs starting together: the first stamp is created with
+  `O_EXCL`, so exactly one creator wins; an existing stamp is checked and
+  touched under `flock(LOCK_EX | LOCK_NB)` on it, so a heph that finds it
+  locked, or finds it freshly touched, goes. The lock covers the check and
+  the touch, never the cleanup.
+- The claim stamps the root *before* any work. A heph that exits or crashes
+  mid-cleanup leaves the rest to the first start an hour later; every step
+  is idempotent (a seal under the session's lock, a removal by rename), and
+  a crashed claim leaves only the stamp, which expires like any other. A
+  stamp more than an hour in the future (the clock went back) counts as
+  expired.
+- A public start that claims its root also claims, under that root's own
+  stamp, the private root beside it (below).
+
+So a removal past `session.keep` or `session.keepBytes`, and the sealing of
+a lost session, can lag by up to an hour. Readers already handle that: a
+lost recording not yet sealed is read through a copy (see
+[Reading](#reading)), and a removed one was past retention either way.
+
 | What | Kept | Then |
 | --- | --- | --- |
 | An ended recording (lock free) | while last written under **7 days** ago, and among the newest that total at most **2 GiB** | the session directory is removed |
@@ -846,7 +875,7 @@ session:
 
 `keep` takes a duration (`7d`, `36h`, `90m`), `keepBytes` a size (`2G`,
 `500MiB`, `1048576`). `0` is zero, never "unset" or "no limit": `keep: 0`
-keeps no ended recording, so the next session start removes every ended one
+keeps no ended recording, so the next cleanup removes every ended one
 past the 60s start grace however young, and `keepBytes: 0` removes every
 sealed one it can count (one it cannot count still goes by age). Live and
 starting sessions are untouched either way. A value that does not
@@ -857,10 +886,11 @@ field keeps its default: retention is never a reason to fail a build.
 `keep_bytes` is refused as unknown.
 Profiles override each field separately.
 
-Every start also cleans `~/.heph/private-sessions/` with nothing kept
-(`Retention::PRIVATE`): an ended private session (lock free, so a killed
-run's) goes whatever its age and is never sealed, a live one is never
-touched, and one still starting is left alone as above.
+Every cleanup also cleans `~/.heph/private-sessions/` with nothing kept
+(`Retention::PRIVATE`), at most hourly under that root's own `.cleanup`
+stamp: an ended private session (lock free, so a killed run's) goes
+whatever its age and is never sealed, a live one is never touched, and one
+still starting is left alone as above.
 
 ## Recipes
 
@@ -909,7 +939,7 @@ not affected; a target's whole log is still in its
 **Why is my session `lost`?** Its lock is free and it has no `End`: the
 process was killed (`SIGKILL`, a second Ctrl-C, the OOM killer, the machine
 going down) or crashed before it could finish. Everything it committed until
-then is readable. The next session start seals it (see
+then is readable. The next cleanup, at most an hour later, seals it (see
 [Liveness and sealing](#liveness-and-sealing)): `ended_ms` becomes its last
 record's time and `exit_code` stays `null`, so a lost session never reads as
 a pass. What it was doing when it went, from `records` alone (a lost

@@ -734,6 +734,9 @@ pub(crate) struct Faults {
     pub(crate) ticks: Option<Duration>,
     /// [`COMMIT_BYTES`] in its place.
     pub(crate) commit_bytes: Option<u64>,
+    /// [`cleanup::INTERVAL`] in its place: `Duration::ZERO` cleans at every
+    /// start, for a test that needs a second start's cleanup.
+    pub(crate) cleanup_interval: Option<Duration>,
     /// Refuse WAL mode when creating the recording, as some filesystems do.
     pub(crate) refuse_wal: bool,
 }
@@ -755,12 +758,32 @@ pub(crate) struct RecorderStart {
     pub(crate) faults: Faults,
 }
 
-/// The start-of-session cleanup of `root`, then of `private_root`.
+/// Whether this process claimed `root`'s cleanup ([`cleanup::claim`]).
+fn claimed(root: &std::path::Path, interval: Duration) -> bool {
+    match cleanup::claim(root, interval) {
+        Ok(claimed) => claimed,
+        // A private root nobody has used yet: nothing to clean.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+        Err(e) => {
+            tracing::debug!(root = %root.display(), error = %e, "cannot claim the session cleanup");
+            false
+        }
+    }
+}
+
+/// The start-of-session cleanup of `root`, then of `private_root`, each when
+/// this process claims it: at most once an `interval` per root.
 fn clean_ended(
     root: &std::path::Path,
     retention: Retention,
     private_root: Option<&std::path::Path>,
+    interval: Duration,
 ) {
+    // Another process claimed this root within the interval, and so the
+    // private one beside it.
+    if !claimed(root, interval) {
+        return;
+    }
     match cleanup::cleanup(root, SystemTime::now(), retention) {
         Ok(report) if report != cleanup::CleanupReport::default() => {
             tracing::debug!(
@@ -777,6 +800,7 @@ fn clean_ended(
     // A killed `HEPH_NO_SESSION` run's directory: nobody else reads it, so it
     // goes whatever its age. Missing is normal.
     if let Some(private) = private_root
+        && claimed(private, interval)
         && let Err(e) = cleanup::cleanup(private, SystemTime::now(), Retention::PRIVATE)
         && e.kind() != io::ErrorKind::NotFound
     {
@@ -824,19 +848,24 @@ impl Recorder {
         // Cleanup on its own thread: sealing another session's recording can
         // wait on that file's viewers, and the record loop must not (I1). It
         // is detached; an exit mid-cleanup leaves what the next one finishes.
-        let cleanup_gate = faults.cleanup_gate.clone();
-        let cleanup_dispatch = dispatch.clone();
-        let spawned = std::thread::Builder::new()
-            .name("heph-session-cleanup".to_owned())
-            .spawn(move || {
-                let _dispatch = tracing::dispatcher::set_default(&cleanup_dispatch);
-                if let Some(gate) = &cleanup_gate {
-                    wait_for(gate);
-                }
-                clean_ended(&root, retention, private_root.as_deref());
-            });
-        if let Err(e) = spawned {
-            tracing::debug!(error = %e, "cannot start the session cleanup");
+        // Started only when the root's stamp says it is due: within the
+        // interval, a start costs this one `stat` and no thread.
+        let interval = faults.cleanup_interval.unwrap_or(cleanup::INTERVAL);
+        if cleanup::due(&root, interval) {
+            let cleanup_gate = faults.cleanup_gate.clone();
+            let cleanup_dispatch = dispatch.clone();
+            let spawned = std::thread::Builder::new()
+                .name("heph-session-cleanup".to_owned())
+                .spawn(move || {
+                    let _dispatch = tracing::dispatcher::set_default(&cleanup_dispatch);
+                    if let Some(gate) = &cleanup_gate {
+                        wait_for(gate);
+                    }
+                    clean_ended(&root, retention, private_root.as_deref(), interval);
+                });
+            if let Err(e) = spawned {
+                tracing::debug!(error = %e, "cannot start the session cleanup");
+            }
         }
         // One value, so the connection drops before its registration even if
         // the thread never starts (a tuple drops in order).

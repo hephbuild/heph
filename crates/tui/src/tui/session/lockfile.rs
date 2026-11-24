@@ -38,6 +38,13 @@ fn flock_nb(file: &File, op: libc::c_int) -> io::Result<bool> {
     }
 }
 
+/// Take `LOCK_EX` on an open `file` without waiting: `Ok(false)` when another
+/// open file description holds it. Released when `file` drops (or the
+/// process dies).
+pub(crate) fn try_lock_exclusive(file: &File) -> io::Result<bool> {
+    flock_nb(file, libc::LOCK_EX)
+}
+
 /// Create the owner's lock file (`0600`) and take `LOCK_EX` on it, retrying
 /// while a viewer's probe is in the way. The returned file *is* the lock:
 /// dropping it releases the session.

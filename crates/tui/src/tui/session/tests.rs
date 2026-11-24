@@ -1453,12 +1453,19 @@ async fn no_session_private_dir() {
     slot.finish(Some(0));
     assert!(!dir.exists(), "removed at exit");
 
+    // Each start below cleans: the hourly gate is `cleanup_runs_at_most_hourly`'s.
+    let every_start = Faults {
+        cleanup_interval: Some(Duration::ZERO),
+        ..Faults::default()
+    };
     for next in [public, SessionRoot::private(&private)] {
         let killed = killed_private_session(&private);
-        let session = Session::open(&next, start()).expect("open");
+        let session = Session::open_with(&next, start(), Retention::default(), every_start.clone())
+            .expect("open");
         session.finish(Some(0), false);
+        // The sweep is on the detached cleanup thread.
         assert!(
-            !killed.exists(),
+            eventually(|| !killed.exists()),
             "a {} start sweeps a killed private session",
             if next.is_private() {
                 "private"
@@ -1467,6 +1474,72 @@ async fn no_session_private_dir() {
             }
         );
     }
+}
+
+/// Poll `cond` for up to 20 s; `false` if it never held.
+fn eventually(mut cond: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !cond() {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    true
+}
+
+/// Backdate `root`'s cleanup stamp past the interval, as an hour going by
+/// would.
+fn expire_stamp(root: &Path) {
+    let then = std::time::SystemTime::now()
+        .checked_sub(cleanup::INTERVAL + Duration::from_secs(60))
+        .expect("time");
+    std::fs::File::options()
+        .write(true)
+        .open(root.join(cleanup::STAMP))
+        .and_then(|f| f.set_modified(then))
+        .expect("backdate the stamp");
+}
+
+/// Cleanup runs at most once an hour per root, off the build's path (user
+/// decision 2026-11-24). The first start in a root cleans it; a start within
+/// the hour leaves an ended session it would remove alone; once the stamp is
+/// an hour old, the next start removes it. The private root beside a public
+/// one is cleaned in the same pass, under its own stamp.
+#[test]
+fn cleanup_runs_at_most_hourly() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let public = SessionRoot::for_reading(Some(home.path().as_os_str())).expect("home");
+    let private = home.path().join(".heph").join(PRIVATE_SESSIONS_DIR);
+
+    let first = killed_private_session(&private);
+    Session::open(&public, start())
+        .expect("open")
+        .finish(Some(0), false);
+    assert!(
+        eventually(|| !first.exists()),
+        "the first start in a root cleans it"
+    );
+
+    let second = killed_private_session(&private);
+    Session::open(&public, start())
+        .expect("open")
+        .finish(Some(0), false);
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(
+        second.exists(),
+        "a start within the hour of the last cleanup leaves the root alone"
+    );
+
+    expire_stamp(public.path());
+    expire_stamp(&private);
+    Session::open(&public, start())
+        .expect("open")
+        .finish(Some(0), false);
+    assert!(
+        eventually(|| !second.exists()),
+        "a start an hour after the last cleanup cleans again"
+    );
 }
 
 /// A4: no `HOME` means no session, and the build still runs.

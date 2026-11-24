@@ -5,6 +5,15 @@
 //! loop, I1): the owner of a new session is the only writer of the sessions
 //! directory, and a viewer stays strictly read-only.
 //!
+//! At most once an hour per sessions root (user decision 2026-11-24: it need
+//! not run inline). The root's [`STAMP`] file's modification time is when its
+//! last cleanup was claimed: a start whose stamp is younger than [`INTERVAL`]
+//! does one `stat` ([`due`]) and nothing else. Otherwise the cleanup thread
+//! [`claim`]s the run, which stamps it before any work, then cleans. An exit
+//! mid-cleanup leaves the rest to the first start an hour later; every step
+//! is idempotent. So a removal, and the sealing of a lost session, can lag by
+//! up to an hour.
+//!
 //! The decision reads the lock, modification times and a recording's 100-byte
 //! header, never its contents. The `lock` file name and its `flock` meaning are
 //! frozen for every format, so a session of a format this heph cannot read is
@@ -112,6 +121,77 @@ pub const SCRATCH_GRACE: Duration = Duration::from_secs(10 * 60);
 /// two at once, which costs a `debug!` and nothing else.
 const TOMB_PREFIX: &str = ".removing-";
 
+/// How often a sessions root is cleaned, at most.
+pub const INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// The file in a sessions root whose modification time is when its last
+/// cleanup was claimed. Not a session id, so nothing reads it as a session.
+pub const STAMP: &str = ".cleanup";
+
+/// Whether `root`'s cleanup is due: its stamp is missing, unreadable, or
+/// older than `interval`. One `stat`; the session start calls it, and starts
+/// the cleanup thread only when it says yes. [`claim`] decides for real.
+pub(crate) fn due(root: &Path, interval: Duration) -> bool {
+    match std::fs::metadata(root.join(STAMP)).and_then(|m| m.modified()) {
+        Ok(claimed) => expired(claimed, SystemTime::now(), interval),
+        Err(_) => true,
+    }
+}
+
+/// Claim `root`'s cleanup for this process: `Ok(true)` when it is due and
+/// this call stamped it, so this process runs it and nobody else does for
+/// `interval`.
+///
+/// Sound with any number of hephs starting at once, on Linux and macOS alike:
+/// - No stamp yet: `O_CREAT | O_EXCL` lets exactly one creator through, and
+///   the new file's mtime is the claim. Every other caller finds it fresh.
+/// - A stamp: the check and the touch happen under `flock(LOCK_EX |
+///   LOCK_NB)` on it, the discipline session locks already use. A caller that
+///   finds it locked is beside a claim in progress and goes; one that gets
+///   the lock after a claim sees the new mtime and goes too. `now` is read
+///   under the lock, so it is never older than a claim the lock ordered first.
+/// - The lock is held for the check and the touch only, never for the
+///   cleanup, and the kernel drops it with a crashed process: a claim cannot
+///   outlive its process. What a crash leaves is the stamp, which expires
+///   after `interval` like any other.
+///
+/// A stamp from more than `interval` in the future (the clock went back) is
+/// expired, so cleanup is not held off until the clock catches up. A missing
+/// `root` is `Err(NotFound)`: nothing to clean, and no root is created.
+pub(crate) fn claim(root: &Path, interval: Duration) -> std::io::Result<bool> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = root.join(STAMP);
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+    {
+        Ok(_) => return Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    let stamp = std::fs::OpenOptions::new().write(true).open(&path)?;
+    if !lockfile::try_lock_exclusive(&stamp)? {
+        return Ok(false);
+    }
+    let now = SystemTime::now();
+    if !expired(stamp.metadata()?.modified()?, now, interval) {
+        return Ok(false);
+    }
+    stamp.set_modified(now)?;
+    Ok(true)
+}
+
+/// Whether a cleanup claimed at `claimed` is `interval` or more before `now`
+/// (or more than `interval` after it: the clock went back).
+fn expired(claimed: SystemTime, now: SystemTime, interval: Duration) -> bool {
+    match now.duration_since(claimed) {
+        Ok(since) => since >= interval,
+        Err(ahead) => ahead.duration() > interval,
+    }
+}
+
 /// Remove the ended sessions `retention` does not keep, under `root`, as of
 /// `now`, sealing lost ones first. Per-directory failures are skipped (a
 /// vanished directory is another cleanup's work); only an unreadable `root` is
@@ -172,7 +252,7 @@ pub(crate) fn cleanup_with(
 
     let mut report = CleanupReport::default();
     for tomb in tombs {
-        if age(now, last_write_and_size(&tomb).0) < SCRATCH_GRACE {
+        if age(now, scan_dir(&tomb).map_or(UNIX_EPOCH, |s| s.latest)) < SCRATCH_GRACE {
             continue;
         }
         match std::fs::remove_dir_all(&tomb) {
@@ -188,17 +268,19 @@ pub(crate) fn cleanup_with(
     // directory is probed: only the probe tells an ended one from a live one.
     let mut ended: Vec<Ended> = Vec::new();
     for (id, dir) in sessions {
-        let lock_path = dir.join(files::LOCK);
-        let lock_written = match std::fs::metadata(&lock_path) {
-            Ok(meta) => Some(meta.modified().unwrap_or(UNIX_EPOCH)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        // One pass over the directory: its last write, its size and its lock.
+        let scan = match scan_dir(&dir) {
+            Ok(scan) => scan,
+            // Removed since the listing: another cleanup's work.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
                 tracing::debug!(dir = %dir.display(), error = %e, "skipping session in cleanup");
                 continue;
             }
         };
+        let lock_written = scan.lock;
         if lock_written.is_some() {
-            match lockfile::is_held(&lock_path) {
+            match lockfile::is_held(&dir.join(files::LOCK)) {
                 Ok(false) => {}
                 Ok(true) => {
                     report.live += 1;
@@ -210,28 +292,30 @@ pub(crate) fn cleanup_with(
                 }
             }
         }
-        let (last_write, _) = last_write_and_size(&dir);
         // Possibly still starting: its owner may not hold the lock yet.
         let starting = match lock_written {
             Some(written) => age(now, written) < STARTING,
-            None => age(now, last_write) < STARTING,
+            None => age(now, scan.latest) < STARTING,
         };
         if starting {
             continue;
         }
-        let since = age(now, last_write);
+        let since = age(now, scan.latest);
         let keep = since < retention.max_age;
         // Sealing one that age removes anyway would be wasted work.
+        let sealed_before = report.sealed.len();
         let budgeted = if keep && lock_written.is_some() {
             seal_if_lost(&dir, id, &mut report)
         } else {
             false
         };
-        // Measured after the seal: the WAL is folded into the file.
-        let bytes = if budgeted {
-            last_write_and_size(&dir).1
-        } else {
+        let bytes = if !budgeted {
             0
+        } else if report.sealed.len() > sealed_before {
+            // Sealed just now: measured again, with the WAL folded in.
+            scan_dir(&dir).map_or(0, |s| s.bytes)
+        } else {
+            scan.bytes
         };
         ended.push(Ended {
             id,
@@ -433,25 +517,44 @@ fn age(now: SystemTime, written: SystemTime) -> Duration {
     now.duration_since(written).unwrap_or(Duration::ZERO)
 }
 
-/// The latest modification time of `dir` and its files, and their total size.
-/// Reads metadata only — never a file's contents.
-fn last_write_and_size(dir: &Path) -> (SystemTime, u64) {
-    let mut latest = std::fs::metadata(dir)
-        .and_then(|m| m.modified())
-        .unwrap_or(UNIX_EPOCH);
+/// What one pass over a session directory reads: metadata only, never a
+/// file's contents.
+#[derive(Debug)]
+struct DirScan {
+    /// The latest modification time of the directory and its files.
+    latest: SystemTime,
+    /// Their total size.
+    bytes: u64,
+    /// The `lock` file's modification time, if it has one.
+    lock: Option<SystemTime>,
+}
+
+/// Scan `dir` once. An error reading the directory, or the metadata of its
+/// `lock` file, is the caller's to skip it on; any other file's unreadable
+/// metadata is left out.
+fn scan_dir(dir: &Path) -> std::io::Result<DirScan> {
+    let mut latest = std::fs::metadata(dir)?.modified().unwrap_or(UNIX_EPOCH);
     let mut bytes = 0u64;
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for meta in entries
-            .filter_map(Result::ok)
-            .filter_map(|e| e.metadata().ok())
-        {
-            bytes = bytes.saturating_add(meta.len());
-            if let Ok(m) = meta.modified() {
-                latest = latest.max(m);
-            }
+    let mut lock = None;
+    for entry in std::fs::read_dir(dir)?.filter_map(Result::ok) {
+        let is_lock = entry.file_name() == files::LOCK;
+        let meta = match entry.metadata() {
+            Ok(meta) => meta,
+            Err(e) if is_lock => return Err(e),
+            Err(_) => continue,
+        };
+        let written = meta.modified().unwrap_or(UNIX_EPOCH);
+        if is_lock {
+            lock = Some(written);
         }
+        bytes = bytes.saturating_add(meta.len());
+        latest = latest.max(written);
     }
-    (latest, bytes)
+    Ok(DirScan {
+        latest,
+        bytes,
+        lock,
+    })
 }
 
 #[cfg(test)]
@@ -623,7 +726,9 @@ mod tests {
         // granularity), which can read behind `SystemTime::now()`, so `now +
         // 8 days` was sometimes exactly 8 days after the write ("8d00h") and
         // sometimes a hair under ("7d23h").
-        let (written, _) = last_write_and_size(&root.path().join(new.encode()));
+        let written = scan_dir(&root.path().join(new.encode()))
+            .expect("scan")
+            .latest;
         let at = written + 8 * DAY - 30 * MIN;
         let report = cleanup_with(root.path(), at, retention, &mut |r| {
             removals.push(r.clone());
@@ -890,6 +995,120 @@ mod tests {
         assert_eq!(report.tmp, 2);
         assert_eq!(std::fs::read_dir(&tmp).expect("read").count(), 0);
         assert_eq!(remaining(root.path()), vec![store::TMP_DIR.to_owned()]);
+    }
+
+    fn set_stamp(root: &Path, at: SystemTime) {
+        std::fs::File::options()
+            .write(true)
+            .open(root.join(STAMP))
+            .and_then(|f| f.set_modified(at))
+            .expect("set the stamp");
+    }
+
+    fn stamped(root: &Path) -> SystemTime {
+        std::fs::metadata(root.join(STAMP))
+            .and_then(|m| m.modified())
+            .expect("stamp")
+    }
+
+    /// The hourly gate: no stamp is due and the claim creates it; a fresh
+    /// stamp is neither due nor claimable and stays as it was; an expired one
+    /// (an hour old, or more than an hour in the future after the clock went
+    /// back) is due, and the claim moves it to now.
+    #[test]
+    fn the_stamp_gates_cleanup_hourly() {
+        let root = tempfile::tempdir().expect("tempdir");
+        assert!(due(root.path(), INTERVAL), "no stamp: due");
+        assert!(claim(root.path(), INTERVAL).expect("claim"), "first claim");
+        assert!(!due(root.path(), INTERVAL), "just claimed: fresh");
+        assert!(
+            !claim(root.path(), INTERVAL).expect("claim"),
+            "a fresh stamp is not claimed again"
+        );
+
+        let now = SystemTime::now();
+        let fresh = now - INTERVAL + MIN;
+        set_stamp(root.path(), fresh);
+        assert!(!due(root.path(), INTERVAL));
+        assert!(!claim(root.path(), INTERVAL).expect("claim"));
+        assert!(
+            stamped(root.path()) < now - MIN,
+            "a refused claim stamps nothing"
+        );
+
+        for expired_at in [now - (INTERVAL + MIN), now + INTERVAL + MIN] {
+            set_stamp(root.path(), expired_at);
+            assert!(due(root.path(), INTERVAL), "{expired_at:?}");
+            assert!(
+                claim(root.path(), INTERVAL).expect("claim"),
+                "{expired_at:?}"
+            );
+            let at = stamped(root.path());
+            assert!(
+                at > now - MIN && at < now + MIN,
+                "the claim stamps now: {at:?}"
+            );
+        }
+        // A little in the future (another clock's write) is fresh.
+        set_stamp(root.path(), now + MIN);
+        assert!(!claim(root.path(), INTERVAL).expect("claim"));
+
+        let missing = root.path().join("nobody");
+        assert_eq!(
+            claim(&missing, INTERVAL).expect_err("no root").kind(),
+            std::io::ErrorKind::NotFound,
+            "a missing root is never created"
+        );
+        assert!(!missing.exists());
+    }
+
+    /// Concurrent starts, with no stamp and with an expired one: exactly one
+    /// claims the run.
+    #[test]
+    fn concurrent_claims_run_one_cleanup() {
+        let root = tempfile::tempdir().expect("tempdir");
+        for round in 0..2 {
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+            let threads: Vec<_> = (0..8)
+                .map(|_| {
+                    let root = root.path().to_path_buf();
+                    let barrier = std::sync::Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        claim(&root, INTERVAL).expect("claim")
+                    })
+                })
+                .collect();
+            let won = threads
+                .into_iter()
+                .map(|t| t.join().expect("join"))
+                .filter(|claimed| *claimed)
+                .count();
+            assert_eq!(won, 1, "round {round}: one claim of {won}");
+            set_stamp(root.path(), SystemTime::now() - (INTERVAL + MIN));
+        }
+    }
+
+    /// A claim in progress (its lock held) turns other claims away; a process
+    /// that died after claiming leaves only the stamp, whose lock the kernel
+    /// released, and the first start after the interval claims again.
+    #[test]
+    fn a_stale_claim_expires() {
+        let root = tempfile::tempdir().expect("tempdir");
+        assert!(claim(root.path(), INTERVAL).expect("claim"));
+        set_stamp(root.path(), SystemTime::now() - (INTERVAL + MIN));
+        let in_progress = std::fs::File::open(root.path().join(STAMP)).expect("open");
+        assert!(lockfile::try_lock_exclusive(&in_progress).expect("lock"));
+        assert!(
+            !claim(root.path(), INTERVAL).expect("claim"),
+            "a claim in progress turns this one away"
+        );
+        // The claimer died: its lock goes with it, its stamp stays.
+        drop(in_progress);
+        assert!(
+            claim(root.path(), INTERVAL).expect("claim"),
+            "the expired stamp of a dead claimer is claimed"
+        );
     }
 
     /// Two sessions starting at once both clean: neither errors, each dead

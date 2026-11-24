@@ -12,7 +12,8 @@
 //! - [`id`]: [`SessionId`], 10 Crockford base32 characters sorting by start.
 //! - [`recorder`]: the recorder thread, its [`SessionTap`], and the
 //!   [`TappedReceiver`] both backends consume.
-//! - [`cleanup`]: removing ended sessions, at session start only.
+//! - [`cleanup`]: removing ended sessions, at session start only, at most
+//!   hourly per root.
 //! - [`run_logs`]: finding a running target's live log through the sessions
 //!   that recorded it ([`find_run_log`]).
 //! - [`SessionSlot`]: the process's one session. `main` builds it and hands it
@@ -200,7 +201,7 @@ struct Cleanups {
     /// For the session's own root.
     retention: Retention,
     /// The private root beside a public one, swept of every ended session: a
-    /// killed `HEPH_NO_SESSION` run's directory goes at the next start.
+    /// killed `HEPH_NO_SESSION` run's directory goes at the next cleanup.
     private_root: Option<PathBuf>,
 }
 
