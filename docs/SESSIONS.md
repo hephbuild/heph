@@ -633,9 +633,12 @@ says (see "Why is my session `lost`?" under [Recipes](#recipes)).
 
 A shipped field is never renamed or removed and never changes type; a change
 that would is a new field (`docs/JSON_OUTPUT.md`, "Stability"). No output
-carries a version to bump. `state` is computed by the viewer and may
-gain values; a consumer treats one it does not know as unknown, not as an
-error. `state` also depends on the viewer's `--stall-notice` (the `quiet`
+carries a version to bump. `state` is computed by the viewer and is an open
+enum, like `incomplete_reason` and `next.kind`: today `running`, `waiting`,
+`quiet`, `ok`, `failed`, `lost`, `unknown`, and, for a recording opened by
+path or URL, `snapshot` and `incomplete`. A consumer treats a value it does
+not know as unknown, not as an error. `state` also depends on the viewer's
+`--stall-notice` (the `quiet`
 threshold), so two viewers can disagree on it; `last_event_unix_ms` is the
 stable signal for "has it gone silent".
 
@@ -895,9 +898,12 @@ snapshot, or a recording copied out of a run that never finished).
   since every other next step reads local state. `show --json` adds
   `foreign: {origin, partial, notices: [{addr, seq, name, text}],
   failure_logs: [{addr, log, cut_bytes}]}`, where `partial` is `snapshot`,
-  `incomplete` or `null`; the field is absent for a local session. `state`
-  is derived as for a local one, so a snapshot reads `lost`, and `partial`
-  says why.
+  `incomplete` or `null`; the field is absent for a local session. A whole
+  recording's `state` is `ok` or `failed`, as a local one's would be. One
+  that is not whole has a `state` of its own, the same value as `partial`:
+  `snapshot` (exported while it ran) or `incomplete` (no recorded end).
+  Neither is `lost` or `running`, which describe a process this viewer
+  cannot see. `state` is an open enum, as for a local session.
 - `attach <file>` says `heph: replaying <origin>` on stderr, replays the
   recording once, and exits with its recorded code. A recording with no
   `End` exits 125 ("has no recorded end"), never `lost`.

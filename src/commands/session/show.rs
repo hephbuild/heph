@@ -152,8 +152,10 @@ async fn fold(
 pub struct ShowView<'a> {
     /// The session id.
     id: String,
-    /// Viewer-computed: running, waiting, quiet, ok, failed, lost or unknown.
-    state: SessionState,
+    /// Viewer-computed: running, waiting, quiet, ok, failed, lost or unknown;
+    /// for a recording opened by path or URL that is not whole, snapshot or
+    /// incomplete. An open enum.
+    state: StateJson,
     /// Every wait, each holder mapped to its session: `list --json`'s shape.
     blocked_on: Vec<BlockedOn>,
     /// The session at the root of the first lock chain, the one the run is
@@ -211,7 +213,7 @@ impl<'a> ShowView<'a> {
     )]
     fn new(
         id: String,
-        state: SessionState,
+        state: StateJson,
         blocked_on: Vec<BlockedOn>,
         chain_root: Option<String>,
         next: Next,
@@ -338,6 +340,42 @@ struct ForeignJson<'a> {
 enum Partial {
     Snapshot,
     Incomplete,
+}
+
+/// `show --json`'s `state`: a [`SessionState`], or, for a recording opened by
+/// path or URL that is not whole, its [`Partial`] (`snapshot`,
+/// `incomplete`). Derived from a local session's liveness, those would read
+/// `lost`, which says something about a process this viewer cannot see. An
+/// open enum. Flat rather than `untagged` over the two, which the output
+/// layer's field table cannot list; the values are the same strings.
+#[derive(Debug, Clone, Copy, Serialize, output::Shape)]
+#[serde(rename_all = "snake_case")]
+enum StateJson {
+    Running,
+    Waiting,
+    Quiet,
+    Ok,
+    Failed,
+    Lost,
+    Unknown,
+    Snapshot,
+    Incomplete,
+}
+
+impl StateJson {
+    fn new(state: SessionState, partial: Option<Partial>) -> Self {
+        match (partial, state) {
+            (Some(Partial::Snapshot), _) => Self::Snapshot,
+            (Some(Partial::Incomplete), _) => Self::Incomplete,
+            (None, SessionState::Running) => Self::Running,
+            (None, SessionState::Waiting) => Self::Waiting,
+            (None, SessionState::Quiet) => Self::Quiet,
+            (None, SessionState::Ok) => Self::Ok,
+            (None, SessionState::Failed) => Self::Failed,
+            (None, SessionState::Lost) => Self::Lost,
+            (None, SessionState::Unknown) => Self::Unknown,
+        }
+    }
 }
 
 #[derive(Serialize, output::Shape)]
@@ -473,7 +511,7 @@ async fn render(
     if json.enabled() {
         let view = ShowView::new(
             entry.id.encode(),
-            state,
+            StateJson::new(state, partial),
             blocked_on(&snapshot, &entry, &every),
             chain_root.map(|r| r.id.encode()),
             next,
@@ -980,7 +1018,7 @@ mod tests {
         }];
         let view = ShowView::new(
             "id".to_owned(),
-            SessionState::Running,
+            StateJson::Running,
             Vec::new(),
             None,
             Next {
@@ -994,6 +1032,12 @@ mod tests {
             1,
             true,
             &pools,
+            Some(ForeignJson {
+                origin: "origin",
+                partial: Some(Partial::Snapshot),
+                notices: Vec::new(),
+                failure_logs: Vec::new(),
+            }),
             &snapshot,
         );
         output::check_keys(&view)?;

@@ -2683,6 +2683,8 @@ async fn export_is_self_contained() {
             .expect("show --json"),
     )
     .expect("json");
+    // A whole recording keeps the state a local one would have.
+    assert_eq!(v["state"], "failed", "{v}");
     let foreign = &v["foreign"];
     assert_eq!(foreign["origin"], full_arg.as_str(), "{v}");
     assert!(foreign["partial"].is_null(), "{v}");

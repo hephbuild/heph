@@ -413,7 +413,7 @@ async fn a_path_never_reads_the_local_session() {
             .await
             .expect("show by path"),
     );
-    assert_ne!(v["state"], "running", "{v}");
+    assert_eq!(v["state"], "incomplete", "{v}");
     assert_eq!(v["foreign"]["partial"], "incomplete", "{v}");
     assert_eq!(v["foreign"]["origin"], arg.as_str(), "{v}");
 
@@ -587,6 +587,9 @@ async fn a_snapshot_export_reads_only_itself() {
         "{text}"
     );
     let v = json(&show_with(&sources, &arg, true, &op).await.expect("show"));
+    // Its own state: neither `lost` nor `running`, which say something about
+    // a process this viewer cannot see.
+    assert_eq!(v["state"], "snapshot", "{v}");
     assert_eq!(v["foreign"]["partial"], "snapshot", "{v}");
     assert_eq!(v["foreign"]["notices"][0]["text"], NOTICE, "{v}");
 
