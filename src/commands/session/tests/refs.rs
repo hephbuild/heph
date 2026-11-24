@@ -114,6 +114,11 @@ fn ref_classification() {
         let msg = format!("{e:#}");
         assert!(msg.contains("https://"), "{msg}");
         assert!(!msg.contains("hunter2"), "{msg}");
+        // The next step, by name.
+        assert!(
+            msg.contains("use https://, or download the file and open it by path"),
+            "{msg}"
+        );
     }
 }
 
@@ -287,7 +292,8 @@ async fn digits_are_a_live_pid_then_part_of_an_id() {
     let msg = format!("{e:#}");
     assert!(
         msg.contains("no live session has pid 12345")
-            && msg.contains("no session id starts or ends with 12345"),
+            && msg.contains("no session id starts or ends with 12345")
+            && msg.contains("`heph session list --all` lists them"),
         "{msg}"
     );
 }
@@ -353,7 +359,14 @@ async fn an_empty_or_too_new_ref() {
         .expect_err("too new");
     assert_eq!(error_kind(&e), ErrorKind::FormatTooNew);
     let msg = format!("{e:#}");
-    assert!(msg.contains(&arg) && msg.contains("99"), "{msg}");
+    // Both formats, and what to do.
+    assert!(
+        msg.contains(&arg)
+            && msg.contains("format 99")
+            && msg.contains(&format!("({})", store::FORMAT))
+            && msg.contains("upgrade heph"),
+        "{msg}"
+    );
     let mut out = Vec::new();
     write_json_error(&e, &mut out).expect("json");
     assert_eq!(

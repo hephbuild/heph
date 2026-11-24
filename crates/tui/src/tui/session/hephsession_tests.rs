@@ -177,6 +177,8 @@ fn a_zip_needs_exactly_one_session_entry() {
             && why.contains(r#""a.hephsession", "b.hephsession""#),
         "{why}"
     );
+    // The next step, by name.
+    assert!(why.contains("unzip it and open one by path"), "{why}");
 
     let none = zip_of(
         &[("notes.txt", b"x"), ("dir.hephsession/", b"")],

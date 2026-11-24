@@ -2706,6 +2706,24 @@ async fn export_is_self_contained() {
         .await
         .expect("show the bare export");
     assert!(!text.contains(NOTICE) && !text.contains("log of"), "{text}");
+    // A failed build's Next: says where its failure logs are: above, or,
+    // exported without them, on the machine that ran it.
+    assert!(
+        text.contains(
+            "\nNext: nothing\n  a recording read from a file, with no failure logs in it: \
+             `heph inspect failure <addr>` prints them on the machine that ran it\n"
+        ),
+        "{text}"
+    );
+    let full_text = refs::show_with(&sources, &full_arg, false, &by_path)
+        .await
+        .expect("show the export");
+    assert!(
+        full_text.contains(
+            "\nNext: nothing\n  a recording read from a file: the logs of its root failures are above\n"
+        ),
+        "{full_text}"
+    );
     // The same bytes served over https.
     const URL: &str = "https://example.invalid/full.hephsession";
     let by_url = refs::opener_in(
@@ -2726,6 +2744,21 @@ async fn export_is_self_contained() {
     assert!(
         printed.starts_with(&format!("heph: replaying {full_arg}\n")),
         "{printed}"
+    );
+}
+
+/// `export`'s stderr note on a running session and every viewer's caveat on
+/// the file it wrote say the same words, so one grep finds both.
+#[test]
+fn the_snapshot_note_is_the_viewers_caveat() {
+    let caveat = crate::tui::session::recording::RecordingState::Snapshot
+        .caveat()
+        .expect("a snapshot has a caveat");
+    assert_eq!(caveat, "snapshot of a running session");
+    assert!(
+        export::SNAPSHOT_NOTE.starts_with(&format!("heph: {caveat}: ")),
+        "{}",
+        export::SNAPSHOT_NOTE
     );
 }
 

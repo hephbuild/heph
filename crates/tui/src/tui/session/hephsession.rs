@@ -355,7 +355,7 @@ fn from_zip(file: File, tmp_dir: &Path, cap: u64) -> Result<tempfile::NamedTempF
         several => {
             let found: Vec<&String> = several.iter().map(|(_, n)| *n).collect();
             return Err(not_a_session(format!(
-                "the zip holds {} *{suffix} entries, not one: {}; extract the one to open",
+                "the zip holds {} *{suffix} entries, not one: {}; unzip it and open one by path",
                 found.len(),
                 list(&found)
             )));

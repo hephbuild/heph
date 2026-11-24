@@ -234,8 +234,14 @@ impl SealExport {
                     tracing::debug!("the session export finished past its bound");
                 }
             });
+        // Every warning names the directory and why: the one line a CI log
+        // keeps of an export that did not happen.
         if let Err(e) = spawned {
-            tracing::warn!(error = %e, "cannot export the session");
+            tracing::warn!(
+                dir = %self.dir.display(),
+                error = %e,
+                "cannot export the session"
+            );
             return;
         }
         match rx.recv_timeout(self.bound) {
@@ -253,11 +259,16 @@ impl SealExport {
                 tracing::warn!(
                     dir = %self.dir.display(),
                     bound_s = self.bound.as_secs(),
+                    reason = "it ran past its bound and was stopped",
                     "the session export did not finish in time: nothing written"
                 );
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                tracing::warn!(dir = %self.dir.display(), "the session export stopped");
+                tracing::warn!(
+                    dir = %self.dir.display(),
+                    reason = "the export thread panicked",
+                    "the session export stopped: nothing written"
+                );
             }
         }
     }
@@ -413,6 +424,7 @@ impl Session {
                 recorder::Finished::Ended => export.run(&self.root, &self.dir, self.id),
                 recorder::Finished::Late => tracing::warn!(
                     dir = %export.dir.display(),
+                    reason = "the recorder did not let go of the recording within its bound",
                     "the session's recording did not end in time: it is not exported"
                 ),
                 recorder::Finished::Again => {}

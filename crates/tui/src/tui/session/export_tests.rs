@@ -134,6 +134,11 @@ fn export_is_silent_and_bounded() {
     assert!(entries(&store::tmp_dir(root.path())).is_empty());
     assert_eq!(log.matches("WARN").count(), 1, "{log}");
     assert!(log.contains("did not finish in time"), "{log}");
+    // Where, and why: the one line a CI log keeps.
+    assert!(
+        log.contains(&format!("dir={}", out.display())) && log.contains("reason="),
+        "{log}"
+    );
     let rec =
         Recording::open_local(root.path(), &root.path().join(slow.encode())).expect("open local");
     assert_eq!(

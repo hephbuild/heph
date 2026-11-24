@@ -426,9 +426,7 @@ fn execute(
                 &opener,
             ))??;
             if exported.snapshot {
-                sink.write_diagnostic(
-                    "the session is still running: the export is a snapshot of it so far",
-                );
+                sink.write_diagnostic(export::SNAPSHOT_NOTE);
             }
             if let Some(path) = exported.path {
                 writeln!(stdout, "{}", path.display()).context("writing the path")?;

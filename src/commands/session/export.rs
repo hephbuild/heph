@@ -39,6 +39,12 @@ pub(crate) fn default_path(id: SessionId) -> PathBuf {
     PathBuf::from(format!("heph-{}.{EXTENSION}", id.encode()))
 }
 
+/// What `export` says on stderr when the session is still running. It holds
+/// the words every viewer of the file prints (`RecordingState`'s caveat), so
+/// one grep finds both.
+pub(crate) const SNAPSHOT_NOTE: &str =
+    "heph: snapshot of a running session: the export holds the session so far\n";
+
 /// What an export wrote.
 #[derive(Debug)]
 pub(crate) struct Exported {

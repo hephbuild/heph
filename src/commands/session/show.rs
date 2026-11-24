@@ -461,10 +461,15 @@ async fn render(
             command: None,
             argv: None,
             cwd: None,
-            reason: if f.failure_logs().is_empty() {
-                "a recording read from a file: nothing to do from here".to_owned()
+            reason: if !f.failure_logs().is_empty() {
+                "a recording read from a file: the logs of its root failures are above".to_owned()
+            } else if state == SessionState::Failed {
+                // `--no-logs`, or a failure that left no log.
+                "a recording read from a file, with no failure logs in it: `heph inspect failure \
+                 <addr>` prints them on the machine that ran it"
+                    .to_owned()
             } else {
-                "a recording read from a file: its root failures' logs are above".to_owned()
+                "a recording read from a file: nothing to do from here".to_owned()
             },
         },
         None => next_action(&entry, meta, state, &snapshot, chain_root),

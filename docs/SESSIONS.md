@@ -841,8 +841,11 @@ empty, compresses it, and renames it into place:
   refused when stdout is a terminal (`-o ./-` is a file named `-`). On
   success it prints the path written on stdout.
 - A **running** session exports too: the copy is a snapshot of it so far,
-  its session row says `snapshot = 1`, `export` says so on stderr, and every
-  viewer of the file says "snapshot of a running session".
+  its session row says `snapshot = 1`, and `export` and every viewer of the
+  file say `snapshot of a running session` (on stderr for `export`, on the
+  first line of `show`). To check what a file holds, read it back:
+  `heph session show --json <path>` gives its `state` (`snapshot`,
+  `incomplete`, or how a whole run ended) and `foreign.partial`.
 - `notices` holds the text of each approval notice the session showed, read
   as the live banner would, at most 4 MiB per notice.
 - `failure_logs` holds the failure log of each **root** failure (never the
@@ -872,7 +875,8 @@ and its text reaches the terminal escaped, as a live recording's does.
 `show`, `attach` and `export` take a `<ref>`, resolved once, in this order:
 
 1. **`https://…`** is a URL: downloaded into the sessions root's `.tmp/`
-   (at most 1 GiB), then sniffed. `http://` is refused, and so is a URL
+   (at most 1 GiB), then sniffed. `http://` is refused (the error says to
+   use `https://`, or download the file and open it by path), and so is a URL
    carrying credentials (`https://user:token@…`), so a token never reaches
    an error message. There is no URL authentication: for a private CI
    artifact, download it first and open the file (see [In CI](#in-ci)).
@@ -935,16 +939,20 @@ workflow sets it on the step that runs heph and uploads the directory with
   if: always()
   uses: actions/upload-artifact@v7
   with:
-    name: heph-sessions
+    name: sessions-${{ github.job }}
     path: ${{ runner.temp }}/heph-sessions
     if-no-files-found: ignore
 ```
 
-To read one, download it and open the file (the artifact URL needs
-authentication, which `<ref>` does not do):
+heph's own workflow names the artifact the same way,
+`sessions-<job>-<os>-<arch>-<attempt>`. To read one, download it, list the
+recordings (one per heph the step ran, named by session id), and open one
+by path (the artifact URL needs authentication, which `<ref>` does not do):
 
 ```
-gh run download <run-id> -n heph-sessions -D sessions
+gh run download <run-id> -n sessions-build -D sessions
+ls sessions/
+heph session show sessions/<id>.hephsession
 heph session attach sessions/<id>.hephsession
 ```
 
@@ -952,7 +960,8 @@ heph session attach sessions/<id>.hephsession
   the session opens and exports nothing; an empty one is off. The directory
   is created if missing.
 - A browser download of an artifact is a zip; a zip holding one
-  `.hephsession` opens as it is, one holding several must be extracted first.
+  `.hephsession` opens as it is. One holding several is refused with the
+  entries it holds: `unzip` it and open one by path.
 - The export runs after the recording's write connection closes, with its
   own 30s bound outside the recorder's 3s join. Past it the temp file is
   removed and one `warn!` says so. It prints nothing on success, and a

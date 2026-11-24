@@ -44,7 +44,8 @@ pub(crate) fn classify(arg: &str) -> anyhow::Result<RefKind<'_>> {
         return Err(kinded(
             ErrorKind::Fetch,
             anyhow::anyhow!(
-                "refusing {}: a recording is only downloaded over https://",
+                "refusing {}: a recording is only downloaded over https://; use https://, or \
+                 download the file and open it by path",
                 redact_url(arg)
             ),
         ));
