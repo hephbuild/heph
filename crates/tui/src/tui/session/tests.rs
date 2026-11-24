@@ -481,6 +481,50 @@ fn enospc_warns_once() {
     assert!(!lockfile::is_held(&lock).expect("probe"));
 }
 
+/// I1: a transaction past [`recorder::COMMIT_BYTES`] commits without waiting
+/// for the flush tick, so what the exiting process waits on is bounded. The
+/// flush and status ticks are an hour here (the first status upsert, which
+/// commits before any event, holds no record), so records a reader sees were
+/// committed by size; with the transaction left to the ticks, it sees none.
+#[test]
+fn a_full_transaction_commits_before_the_tick() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let session = recorder_with(
+        dir.path(),
+        Faults {
+            ticks: Some(Duration::from_secs(3600)),
+            commit_bytes: Some(1),
+            ..Faults::default()
+        },
+    );
+    let db = session.dir().join(store::FILE);
+    let tap = session.tap();
+    let sent = events();
+    let want = i64::try_from(sent.len()).expect("count");
+    for ev in sent {
+        tap.event(ev);
+    }
+    let reader = rusqlite::Connection::open_with_flags(
+        &db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .expect("a read-only connection");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut seen = 0;
+    while seen < want && std::time::Instant::now() < deadline {
+        seen = reader
+            .query_row("SELECT count(*) FROM records", [], |r| r.get(0))
+            .expect("count records");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        seen, want,
+        "every record committed by size, before the tick"
+    );
+    drop(reader);
+    session.finish(Some(0), false);
+}
+
 /// I1: a write that fails half way through a batch (the record went in, the
 /// explorer row it completes did not) lands none of that batch. A trigger
 /// refuses the `spans` row of `//boom`'s `ResultEnd`, after its record was

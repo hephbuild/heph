@@ -69,6 +69,13 @@ pub const MAX_PENDING: usize = 500_000;
 
 /// Delay from the first uncommitted record to its commit.
 const FLUSH_EVERY: Duration = Duration::from_millis(250);
+/// Bytes of records and explorer rows past which the open transaction is
+/// committed without waiting for [`FLUSH_EVERY`]. The exiting process waits
+/// for the last commit, so this bounds what it writes then: a fast build's
+/// whole run fits in one flush tick, and its single transaction (26k records,
+/// 5 MiB) took 8 ms to commit at exit. It also keeps a transaction inside
+/// SQLite's page cache, which a larger one spills mid-transaction.
+pub(crate) const COMMIT_BYTES: u64 = 512 * 1024;
 /// Minimum gap between two `status` upserts.
 const STATUS_EVERY: Duration = Duration::from_secs(1);
 /// How long the exiting process waits for `End` to be written and the
@@ -722,6 +729,11 @@ pub(crate) struct Faults {
     pub(crate) ceiling: Option<u64>,
     /// [`MAX_PENDING`] in its place, so a test falls behind with a few sends.
     pub(crate) max_pending: Option<usize>,
+    /// [`FLUSH_EVERY`] and [`STATUS_EVERY`] in their place, so a test tells
+    /// a commit by size from one by time.
+    pub(crate) ticks: Option<Duration>,
+    /// [`COMMIT_BYTES`] in its place.
+    pub(crate) commit_bytes: Option<u64>,
     /// Refuse WAL mode when creating the recording, as some filesystems do.
     pub(crate) refuse_wal: bool,
 }
@@ -845,6 +857,10 @@ impl Recorder {
                     ceiling: faults.ceiling.unwrap_or(CEILING),
                     phase: Phase::Full,
                     uncommitted_since: None,
+                    uncommitted_bytes: 0,
+                    flush_every: faults.ticks.unwrap_or(FLUSH_EVERY),
+                    status_every: faults.ticks.unwrap_or(STATUS_EVERY),
+                    commit_bytes: faults.commit_bytes.unwrap_or(COMMIT_BYTES),
                     state: BuildState::new(),
                     end: None,
                     dirty: true,
@@ -944,6 +960,11 @@ struct RecorderThread {
     phase: Phase,
     /// When the oldest uncommitted record was inserted.
     uncommitted_since: Option<Instant>,
+    /// Bytes of records and explorer rows in the open transaction.
+    uncommitted_bytes: u64,
+    flush_every: Duration,
+    status_every: Duration,
+    commit_bytes: u64,
     state: BuildState,
     end: Option<SessionEnd>,
     /// The state changed since the `status` row was last upserted.
@@ -1001,10 +1022,10 @@ impl RecorderThread {
 
     /// The next instant something is due: a commit or a status upsert.
     fn next_deadline(&self) -> Option<Instant> {
-        let flush = self.uncommitted_since.map(|t| t + FLUSH_EVERY);
+        let flush = self.uncommitted_since.map(|t| t + self.flush_every);
         let status = self.dirty.then(|| {
             self.last_status
-                .map_or_else(Instant::now, |t| t + STATUS_EVERY)
+                .map_or_else(Instant::now, |t| t + self.status_every)
         });
         match (flush, status) {
             (Some(a), Some(b)) => Some(a.min(b)),
@@ -1017,8 +1038,11 @@ impl RecorderThread {
         let now = Instant::now();
         let commit_due = self
             .uncommitted_since
-            .is_some_and(|t| now >= t + FLUSH_EVERY);
-        let status_due = self.dirty && self.last_status.is_none_or(|t| now >= t + STATUS_EVERY);
+            .is_some_and(|t| now >= t + self.flush_every);
+        let status_due = self.dirty
+            && self
+                .last_status
+                .is_none_or(|t| now >= t + self.status_every);
         if status_due && let Err(e) = self.upsert_status() {
             return self.fail("cannot write the session's status", &e);
         }
@@ -1088,7 +1112,7 @@ impl RecorderThread {
                 return Flow::Stop;
             }
         };
-        match written {
+        match written.and_then(|()| self.commit_if_full()) {
             Ok(()) => Flow::Continue,
             Err(e) => self.fail("cannot write the session's events", &e),
         }
@@ -1251,9 +1275,15 @@ impl RecorderThread {
         let Some(writer) = self.writer.as_mut() else {
             return Ok(());
         };
+        let explorer = writer.explorer_bytes;
         writer
             .insert(record, &self.line)
             .map_err(io::Error::other)?;
+        let explorer_added = writer.explorer_bytes.saturating_sub(explorer);
+        self.uncommitted_bytes = self
+            .uncommitted_bytes
+            .saturating_add(self.line_len())
+            .saturating_add(explorer_added);
         self.record_bytes = self.record_bytes.saturating_add(self.line_len());
         if self.uncommitted_since.is_none() {
             self.uncommitted_since = Some(Instant::now());
@@ -1278,10 +1308,19 @@ impl RecorderThread {
     /// Commit the open transaction: records and status reach readers.
     fn commit(&mut self) -> io::Result<()> {
         self.uncommitted_since = None;
+        self.uncommitted_bytes = 0;
         match self.writer.as_mut() {
             Some(writer) => writer.commit().map_err(io::Error::other),
             None => Ok(()),
         }
+    }
+
+    /// Commit now if the open transaction holds [`COMMIT_BYTES`] or more.
+    fn commit_if_full(&mut self) -> io::Result<()> {
+        if self.uncommitted_bytes < self.commit_bytes {
+            return Ok(());
+        }
+        self.commit()
     }
 
     /// Upsert the `status` row inside the open transaction.

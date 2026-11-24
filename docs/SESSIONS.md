@@ -640,9 +640,12 @@ after the view folds it, so what is recorded is what was shown, paused TUI
 included. The recorder is its own OS thread behind an unbounded channel:
 
 - Records go into one transaction per flush tick, committed 250ms after the
-  first uncommitted record and at exit, with the explorer rows they complete
+  first uncommitted record, as soon as it holds 512 KiB of records and
+  explorer rows, and at exit, with the explorer rows they complete
   (`journal_mode=WAL`, `synchronous=OFF`: a process crash loses nothing
-  committed). The `status` row is upserted in the same transaction, at most
+  committed). The size bound keeps the commit the exiting process waits on
+  small: a fast build fits its whole run in one tick, and committing that at
+  exit cost 8 ms on a 12.5k-target no-op. The `status` row is upserted in the same transaction, at most
   once a second and only when something changed.
 - At exit it writes `End`, the final `status` and the session row's end, and
   seals the file (see [Liveness and sealing](#liveness-and-sealing)),
