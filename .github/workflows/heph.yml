@@ -111,10 +111,12 @@ jobs:
   # This does not let untested code reach master. Required status checks live
   # in the `master` repository ruleset, whose condition is `~DEFAULT_BRANCH` —
   # it applies to exactly the PRs whose base is master, and the gate builds
-  # every one of those, unconditionally. A stacked PR merges with skipped checks
-  # because GitHub asks nothing of a PR that does not target a protected
-  # branch. The stack stays mergeable bottom-up with no manual override and no
-  # ruleset change.
+  # every one of those, unconditionally. Merged one layer at a time, bottom-up,
+  # a stacked PR merges with skipped checks because GitHub asks nothing of a PR
+  # that does not target a protected branch. Merged atomically (`gh stack
+  # merge`), every layer is held to the ruleset, and a middle layer has no
+  # result of its own: `stack-status.yml` posts the top's required checks onto
+  # each middle layer whose head is in the tree the top's run built.
   #
   # That argument has one seam, and it is the reason `edited` is in the
   # trigger list above. A skipped job's check run concludes `skipped`, which
@@ -284,6 +286,17 @@ jobs:
       # published binaries are still built CGO_ENABLED=0.
       - name: Test
         working-directory: tools/heph-govet
+        env:
+          CGO_ENABLED: "1"
+          GOFLAGS: "-buildvcs=false"
+        run: go test -race ./...
+        background: true
+
+      # `tools/stack-status` runs from `stack-status.yml`, after this workflow,
+      # where a broken one only shows as a stack that will not merge. Its tests
+      # run here instead: same toolchain, no build of its own.
+      - name: Test stack-status
+        working-directory: tools/stack-status
         env:
           CGO_ENABLED: "1"
           GOFLAGS: "-buildvcs=false"

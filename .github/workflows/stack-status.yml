@@ -1,0 +1,84 @@
+name: Stack status
+
+# Lets a stack merge on its top's run.
+#
+# `gh stack merge` merges a stack atomically, and GitHub holds every layer in it
+# to the `master` ruleset's required status checks, not only the bottom. The
+# middle layers have none: `heph.yml`'s gate skips them, because the top's tree
+# holds every layer and one run there tests the whole stack. A skipped matrix
+# job does not even report its expanded name — `Test ${{ matrix.os }}/...`, not
+# `Test darwin/arm64` — so a middle layer's required checks are not "skipped",
+# they are missing, and the stack stays blocked until each layer is built on
+# its own: one full run per layer, queued behind each other, for results the
+# top's run already gave.
+#
+# So when a top-of-stack run completes, `tools/stack-status` posts each required
+# check's result from that run as a commit status, under the same name, on
+# every middle layer whose head commit is in the top's tree. The ruleset is
+# unchanged; what satisfies it on a middle layer is the result of a run that
+# built that layer's code, with everything above it. What it vouches for and
+# what it does not is in the program's doc comment; the one thing to know here:
+# a layer's code is tested together with the layers above it, never alone. That
+# is the premise of building only the top, and merging a prefix of a stack
+# (`gh stack merge <middle-pr>`) relies on it too.
+#
+# `workflow_run` runs this file from the default branch with a token that can
+# write statuses, even for a run on a PR. The checkout is the default branch's
+# `tools/stack-status` — never PR code — and the run's branch names reach the
+# program only through the API. A fork's run is ignored: no layer of this
+# repository can be under it.
+#
+# `workflow_dispatch` re-mirrors a finished run by id, for a run that completed
+# before this workflow existed or whose mirror failed.
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Id of a completed CI run on the top of a stack"
+        required: true
+
+permissions:
+  statuses: write
+  pull-requests: read
+  actions: read
+  contents: read
+
+jobs:
+  mirror:
+    name: Mirror
+    # A push to the default branch has no stack; a PR that targets it carries
+    # its own checks. Both are filtered here so they never take a runner.
+    # Same-repo PRs only list `pull_requests`; a fork's is empty and the
+    # program turns it away.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.event == 'pull_request' &&
+       github.event.workflow_run.pull_requests[0].base.ref != github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          sparse-checkout: tools/stack-status
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: tools/stack-status/go.mod
+          # Standard library only: no go.sum, nothing to cache.
+          cache: false
+
+      - name: Mirror the top's required checks onto the layers below it
+        id: mirror
+        working-directory: tools/stack-status
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id || inputs.run_id }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: go run .
