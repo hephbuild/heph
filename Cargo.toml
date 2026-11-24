@@ -225,6 +225,9 @@ crossterm = { git = "https://github.com/hephbuild/crossterm.git", branch = "fix-
 # types as a dict (`in`, `|`, index, `.get`). heph builds one per
 # driver as `heph.types.<driver>.Kwargs`. The branch keeps starlark's
 # own dependencies on crates.io, so heph links one starlark_syntax.
+# It also puts the Debug Adapter Protocol types (debugserver-types, built by
+# schemafy) and the rustyline REPL behind `dap` and `repl` features, off by
+# default; heph enables neither, so neither is compiled.
 # To be proposed to meta/starlark-rust; drop this once a release carries it.
 # `crates/plugin-buildfile/src/pluginbuildfile/starlark_patch.rs` fails without it.
 starlark = { git = "https://github.com/hephbuild/starlark-rust.git", branch = "heph/v0.14.2" }

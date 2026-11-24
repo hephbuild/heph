@@ -69,6 +69,8 @@ func TestAllows(t *testing.T) {
 		"HEPH_FULL_SUITE=1 tst",
 		"HEPH_FULL_SUITE=1 e2e --test tui_pty",
 		"env HEPH_FULL_SUITE=1 tst",
+		"HEPH_FULL_SUITE=1 bash -c tst",
+		"HEPH_FULL_SUITE=1 eval tst",
 		"cd x && HEPH_FULL_SUITE=1 timeout 900 e2e",
 		"cargo test -p e2e some_test",
 		"cargo test --test tst",
@@ -111,7 +113,7 @@ func TestBackgroundSleepIsNotPolling(t *testing.T) {
 }
 
 func TestPushNeedsLint(t *testing.T) {
-	stale := gate{unlinted: func() string { return "stale" }}
+	stale := gate{unlinted: func(string, bool) string { return "stale" }}
 	for _, cmd := range []string{
 		"git push",
 		"git push -u origin HEAD",
@@ -128,6 +130,12 @@ func TestPushNeedsLint(t *testing.T) {
 	for _, cmd := range []string{
 		"HEPH_PUSH_UNLINTED=1 git push",
 		"env HEPH_PUSH_UNLINTED=1 git push -u origin HEAD",
+		// The opt-in reaches a command line its command runs.
+		"HEPH_PUSH_UNLINTED=1 eval 'git push'",
+		"HEPH_PUSH_UNLINTED=1 eval \"$X push\"",
+		"HEPH_PUSH_UNLINTED=1 bash -c 'git push'",
+		"env HEPH_PUSH_UNLINTED=1 sh -c 'cd /wt && git push'",
+		"HEPH_PUSH_UNLINTED=1 bash -c 'git push &!'",
 		"git push origin --delete old-branch",
 		"git push --tags",
 		"git commit -m 'git push later'",
@@ -139,7 +147,7 @@ func TestPushNeedsLint(t *testing.T) {
 			t.Errorf("should allow %q, got: %s", cmd, r)
 		}
 	}
-	linted := gate{unlinted: func() string { return "" }}
+	linted := gate{unlinted: func(string, bool) string { return "" }}
 	if r := check("git push", linted); r != "" {
 		t.Errorf("push of a linted tree blocked: %s", r)
 	}
@@ -155,8 +163,11 @@ func TestLintStamp(t *testing.T) {
 		}
 		return out
 	}
-	if r := lintStamp(dir); r != "" {
+	if r := lintStamp(dir, false); r != "" {
 		t.Errorf("not a repository yet, should allow: %s", r)
+	}
+	if lintStamp(dir, true) == "" {
+		t.Error("not a repository, and not the session's cwd: should refuse")
 	}
 	commit := func(args ...string) {
 		t.Helper()
@@ -164,7 +175,7 @@ func TestLintStamp(t *testing.T) {
 	}
 	run("init", "-q")
 	commit("--allow-empty", "-m", "a")
-	if lintStamp(dir) == "" {
+	if lintStamp(dir, false) == "" {
 		t.Error("no stamp should block")
 	}
 	gitDir := run("rev-parse", "--absolute-git-dir")
@@ -172,7 +183,7 @@ func TestLintStamp(t *testing.T) {
 	if err := os.WriteFile(stamp, []byte(run("rev-parse", "HEAD^{tree}")+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if r := lintStamp(dir); r != "" {
+	if r := lintStamp(dir, false); r != "" {
 		t.Errorf("stamp matches HEAD, should allow: %s", r)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "f"), []byte("x"), 0o644); err != nil {
@@ -180,7 +191,7 @@ func TestLintStamp(t *testing.T) {
 	}
 	run("add", "f")
 	commit("-m", "b")
-	if lintStamp(dir) == "" {
+	if lintStamp(dir, false) == "" {
 		t.Error("a commit after lint should block")
 	}
 }
@@ -245,7 +256,7 @@ func TestRunLintStampsOnlyAPass(t *testing.T) {
 	if code := runLint(dir, nil); code != 3 {
 		t.Errorf("exit code %d, want lint's 3", code)
 	}
-	if lintStamp(dir) == "" {
+	if lintStamp(dir, false) == "" {
 		t.Error("a failing lint must not stamp")
 	}
 
@@ -265,7 +276,7 @@ func TestRunLintStampsOnlyAPass(t *testing.T) {
 		t.Errorf("lint touched the real index: %q", status)
 	}
 	commit("b")
-	if r := lintStamp(dir); r != "" {
+	if r := lintStamp(dir, false); r != "" {
 		t.Errorf("committing the linted tree should allow the push: %s", r)
 	}
 }

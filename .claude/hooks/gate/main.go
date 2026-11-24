@@ -61,7 +61,8 @@ func main() {
 
 	if reason := check(command, gate{
 		background: background,
-		unlinted:   func() string { return lintStamp(in.Cwd) },
+		cwd:        in.Cwd,
+		unlinted:   lintStamp,
 	}); reason != "" {
 		respond(map[string]any{
 			"permissionDecision":       "deny",
