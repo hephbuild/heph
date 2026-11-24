@@ -19,17 +19,16 @@ pub mod why;
 
 use crate::tui::session::SessionSlot;
 use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use clap::Subcommand;
 
 use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
+use crate::commands::progress_app::run_engine_command_json;
 use crate::engine::Engine;
 use crate::engine::request_state::RequestState;
-use crate::tui::{self, App, AppContext, BufferedStdout, LogSink};
+use crate::tui::{BufferedStdout, LogSink};
 
 pub use paths::{ResolvedPath, resolve_path, root_hint, with_hint};
 
@@ -212,67 +211,6 @@ pub fn removed_gen_gitignore(args: &RemovedGenGitignoreArgs) -> anyhow::Result<(
     Err(CodegenExit::failed(anyhow::anyhow!(GEN_GITIGNORE_REMOVED)).into())
 }
 
-type Job<R> = Box<
-    dyn FnOnce(
-            Arc<Engine>,
-            Arc<RequestState>,
-        ) -> Pin<Box<dyn Future<Output = anyhow::Result<R>> + Send>>
-        + Send,
->;
-
-struct CodegenApp<R> {
-    engine: Arc<Engine>,
-    title: &'static str,
-    json: bool,
-    fail_fast: bool,
-    job: Job<R>,
-}
-
-#[async_trait]
-impl<R: Report> App for CodegenApp<R> {
-    type Output = ();
-    type TuiView = crate::tui::TuiProgressView;
-    type CiView = crate::tui::CiProgressView;
-
-    fn tui_view(&self) -> Self::TuiView {
-        crate::tui::TuiProgressView::new(self.title.to_string())
-    }
-
-    fn ci_view(&self) -> Self::CiView {
-        crate::tui::CiProgressView::new(self.title.to_string())
-    }
-
-    async fn run(self, ctx: AppContext) -> anyhow::Result<()> {
-        let rs = self
-            .engine
-            .new_state_with_events(self.fail_fast, ctx.event_sender());
-        let out = BufferedStdout::new(&ctx);
-        let res = (self.job)(Arc::clone(&self.engine), rs.clone()).await;
-        let code = match &res {
-            Ok(report) => {
-                if self.json {
-                    out.println(report.json().to_string());
-                } else {
-                    for line in report.text() {
-                        out.println(line);
-                    }
-                }
-                Ok(report.exit_code())
-            }
-            Err(_) => Ok(0),
-        };
-        out.close().await;
-        let res = res.and(code);
-        crate::commands::errors::finalize!(ctx, rs, res, code => {
-            if code == 0 {
-                Ok(())
-            } else {
-                Err(CodegenExit { code, error: None }.into())
-            }
-        })
-    }
-}
-
 /// Run `job` as a codegen command: bootstrap the engine, run it inside the
 /// TUI app, print its report, and end with its exit code.
 fn run_cli<R, F, Fut>(
@@ -289,19 +227,41 @@ where
     F: FnOnce(Arc<Engine>, Arc<RequestState>) -> Fut + Send + 'static,
     Fut: Future<Output = anyhow::Result<R>> + Send + 'static,
 {
-    let global = global.clone();
-    let res = bootstrap::block_on(async move {
-        let (engine, shutdown) = bootstrap::new_engine(&global, session)?;
-        let app = CodegenApp {
-            engine,
-            title,
-            json,
-            fail_fast: global.fail_fast,
-            job: Box::new(move |e, rs| Box::pin(job(e, rs))),
-        };
-        let interactive = tui::should_use_tui(global.no_tui) && !json;
-        tui::run_app_with(app, sink, session, interactive, dashboard, shutdown).await
-    })
+    let res = bootstrap::block_on(run_engine_command_json(
+        title,
+        sink,
+        session,
+        global,
+        json,
+        dashboard,
+        move |engine, rs, ctx| async move {
+            let out = BufferedStdout::new(&ctx);
+            let res = job(Arc::clone(&engine), rs.clone()).await;
+            let code = match &res {
+                Ok(report) => {
+                    if json {
+                        out.println(report.json().to_string());
+                    } else {
+                        for line in report.text() {
+                            out.println(line);
+                        }
+                    }
+                    Ok(report.exit_code())
+                }
+                Err(_) => Ok(0),
+            };
+            out.close().await;
+            let res = res.and(code);
+            crate::commands::errors::finalize(&ctx, &rs, res, None, |code| {
+                if code == 0 {
+                    Ok(())
+                } else {
+                    Err(CodegenExit { code, error: None }.into())
+                }
+            })
+            .await
+        },
+    ))
     .and_then(|r| r);
     // The app has ended (and `--json` never takes the TUI), so stdout is
     // ours. The error is still rendered on stderr by `main`.

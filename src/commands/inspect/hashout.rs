@@ -1,16 +1,15 @@
 use crate::tui::session::SessionSlot;
 use std::sync::Arc;
 
-use anyhow::Context;
-use async_trait::async_trait;
 use clap_complete::engine::ArgValueCompleter;
 
 use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
 use crate::commands::completion::complete_target_addr;
-use crate::engine::{Engine, OutputMatcher, ResultOptions};
-use crate::htaddr::{self, Addr};
-use crate::tui::{self, App, AppContext, LogSink};
+use crate::commands::progress_app::run_engine_command;
+use crate::commands::utils::parse_addr_arg;
+use crate::engine::{OutputMatcher, ResultOptions};
+use crate::tui::LogSink;
 
 #[derive(clap::Args, Clone)]
 pub struct Args {
@@ -19,56 +18,6 @@ pub struct Args {
     pub addr: String,
     #[command(flatten)]
     pub dashboard: crate::commands::progress_app::DashboardArgs,
-}
-
-struct HashoutApp {
-    engine: Arc<Engine>,
-    addr: Addr,
-    fail_fast: bool,
-    /// `--no-scratch`: run against empty scratch caches. Implies a rebuild.
-    no_scratch: bool,
-}
-
-#[async_trait]
-impl App for HashoutApp {
-    type Output = ();
-    type TuiView = crate::tui::TuiProgressView;
-    type CiView = crate::tui::CiProgressView;
-
-    fn tui_view(&self) -> Self::TuiView {
-        crate::tui::TuiProgressView::new(format!("Hashout {}", self.addr.format()))
-    }
-
-    fn ci_view(&self) -> Self::CiView {
-        crate::tui::CiProgressView::new(format!("Hashout {}", self.addr.format()))
-    }
-
-    async fn run(self, ctx: AppContext) -> anyhow::Result<()> {
-        let rs = self
-            .engine
-            .new_state_with_events(self.fail_fast, ctx.event_sender());
-        // `result_addr` runs the target; rich failures land in `rs`. `finalize`
-        // prefers those over the returned marker and prints the hashes on success.
-        let res = self
-            .engine
-            .clone()
-            .result_addr(
-                rs.clone(),
-                &self.addr,
-                OutputMatcher::None,
-                &ResultOptions {
-                    no_scratch: self.no_scratch,
-                    ..Default::default()
-                },
-            )
-            .await;
-        crate::commands::errors::finalize!(ctx, rs, res, result => {
-            for art in &result.artifacts_meta {
-                println!("{}", art.hashout);
-            }
-            Ok(())
-        })
-    }
 }
 
 pub fn execute(
@@ -86,24 +35,37 @@ async fn execute_async(
     session: &Arc<SessionSlot>,
     global: GlobalOptions,
 ) -> anyhow::Result<()> {
-    let base = crate::engine::get_cwp()?;
-    let addr = htaddr::parse_addr_with_base(args.addr.as_ref(), &base)
-        .with_context(|| format!("parse {}", args.addr))?;
-    let (engine, shutdown) = bootstrap::new_engine(&global, session)?;
-    let app = HashoutApp {
-        engine,
-        addr,
-        fail_fast: global.fail_fast,
-        no_scratch: global.no_scratch,
-    };
-    let interactive = tui::should_use_tui(global.no_tui);
-    tui::run_app_with(
-        app,
+    let addr = parse_addr_arg(&args.addr)?;
+    // `--no-scratch`: run against empty scratch caches. Implies a rebuild.
+    let no_scratch = global.no_scratch;
+    run_engine_command(
+        format!("Hashout {}", addr.format()),
         sink,
         session,
-        interactive,
+        &global,
         args.dashboard.dashboard,
-        shutdown,
+        move |engine, rs, ctx| async move {
+            // `result_addr` runs the target; rich failures land in `rs`. `finalize`
+            // prefers those over the returned marker and prints the hashes on success.
+            let res = Arc::clone(&engine)
+                .result_addr(
+                    rs.clone(),
+                    &addr,
+                    OutputMatcher::None,
+                    &ResultOptions {
+                        no_scratch,
+                        ..Default::default()
+                    },
+                )
+                .await;
+            crate::commands::errors::finalize(&ctx, &rs, res, None, |result| {
+                for art in &result.artifacts_meta {
+                    println!("{}", art.hashout);
+                }
+                Ok(())
+            })
+            .await
+        },
     )
     .await
 }

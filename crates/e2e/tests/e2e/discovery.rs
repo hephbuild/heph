@@ -246,7 +246,7 @@ async fn ctrl_c_with_skips_exits_as_cancelled() -> anyhow::Result<()> {
         .await??
         .expect_err("a cancelled run is not a successful one");
     // The engine half of the contract: the run comes back as a cancellation
-    // even though the walk had recorded a skip. (`finalize!` turning that into
+    // even though the walk had recorded a skip. (`finalize` turning that into
     // a cancelled exit with no report is covered in `src/commands/errors.rs`.)
     assert!(heph::commands::errors::is_cancelled(&err), "{err:#}");
     assert!(!gaps.is_empty(), "the skip was recorded before the cancel");

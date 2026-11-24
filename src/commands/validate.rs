@@ -11,13 +11,14 @@ use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
 use crate::commands::tool::codegen::gitignore::stale_messages;
 use crate::commands::tool::codegen::status::{self as codegen_status, ItemKind, StatusReport};
+use crate::commands::utils::package_matcher_or_all;
 use crate::engine::error::MultiError;
 use crate::engine::query::skip_unresolvable;
 use crate::engine::request_state::RequestState;
-use crate::engine::{Discovery, Engine, Gaps, get_cwp, get_root, gitignore};
+use crate::engine::{Discovery, Engine, Gaps, get_root, gitignore};
 use crate::htaddr::Addr;
 use crate::htmatcher::{MatchResult, Matcher};
-use crate::htpkg::{self, PkgBuf};
+use crate::htpkg::PkgBuf;
 use crate::pluginbuildfile::ShadowedChecks;
 use crate::tui::{self, App, AppContext, BufferedStdout, LogSink};
 
@@ -82,7 +83,7 @@ impl App for ValidateApp {
             .await;
         out.close().await;
 
-        crate::commands::errors::finalize!(ctx, rs, res, gaps = &gaps)
+        crate::commands::errors::finalize(&ctx, &rs, res, Some(&gaps), |_| Ok(())).await
     }
 }
 
@@ -373,10 +374,8 @@ async fn execute_async(
     global: GlobalOptions,
 ) -> anyhow::Result<()> {
     let root = get_root()?;
-    let (matcher, scoped) = match args.matcher {
-        Some(s) => (htpkg::parse(&s, &get_cwp()?)?, true),
-        None => (Matcher::PackagePrefix(PkgBuf::from("")), false),
-    };
+    let scoped = args.matcher.is_some();
+    let matcher = package_matcher_or_all(args.matcher.as_deref())?;
     let (engine, shutdown, shadowed) = bootstrap::new_validate_engine(&global, session)?;
     let app = ValidateApp {
         validate: Validate {

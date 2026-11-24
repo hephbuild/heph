@@ -104,7 +104,7 @@ impl App for GcApp {
         }
         // The progress view renders the sweep summary (TUI final line / CI finish);
         // no extra print here, which would duplicate it.
-        crate::commands::errors::finalize!(ctx, rs, res, _stats => { Ok(()) })
+        crate::commands::errors::finalize(&ctx, &rs, res, None, |_stats| Ok(())).await
     }
 }
 

@@ -668,20 +668,18 @@ impl RunApp {
                     EXIT_HEPH_FAILED
                 };
                 let res: anyhow::Result<()> = Err(e);
-                // In a block of its own: `finalize!` returns early with `?`,
-                // which would skip the wrapping below.
-                let finalized: anyhow::Result<()> =
-                    async { crate::commands::errors::finalize!(ctx, rs, res) }.await;
+                let finalized =
+                    crate::commands::errors::finalize(&ctx, &rs, res, None, |_| Ok(())).await;
                 let error = match finalized {
                     Err(error) => error,
-                    // `finalize!` swallows only a `CancelledError`.
+                    // `finalize` swallows only a `CancelledError`.
                     Ok(()) => anyhow::anyhow!("cancelled"),
                 };
                 Err(InvokeFailed { code, error }.into())
             }
             Err(e) => {
                 let res: anyhow::Result<()> = Err(e);
-                crate::commands::errors::finalize!(ctx, rs, res)?;
+                crate::commands::errors::finalize(&ctx, &rs, res, None, |_| Ok(())).await?;
                 Ok(None)
             }
             Ok(other) => Err(anyhow::anyhow!("unknown invocation outcome {other:?}")),
@@ -850,7 +848,7 @@ impl App for RunApp {
                 }
                 Err(e) if !self.args.args.is_empty() => {
                     let res: anyhow::Result<()> = Err(e);
-                    crate::commands::errors::finalize!(ctx, rs, res)?;
+                    crate::commands::errors::finalize(&ctx, &rs, res, None, |_| Ok(())).await?;
                     return Ok(None);
                 }
                 Ok(false) | Err(_) => {}
@@ -865,7 +863,7 @@ impl App for RunApp {
         }
 
         // Fold both matcher paths into a single `res: Result<Vec<_>>` so the
-        // `finalize!` paved road handles rendering and exit uniformly. The engine
+        // `finalize` paved road handles rendering and exit uniformly. The engine
         // already returns `Err` for cancellation and genuine top-level failures;
         // per-addr failures (default, fail-fast off) live in the request's failure registry.
         let outputs = if self.args.output.is_empty() {
@@ -900,22 +898,22 @@ impl App for RunApp {
         };
 
         // On success print `--cat-out` / `--list-out`; failures/cancellation are
-        // rendered and turned into the right exit by the macro.
-        let finalized: anyhow::Result<()> = crate::commands::errors::finalize!(ctx, rs, res, gaps = &gaps, result => {
+        // rendered and turned into the right exit by `finalize`.
+        let finalized = crate::commands::errors::finalize(&ctx, &rs, res, Some(&gaps), |result| {
             // Outputs are handed over only for a complete selection, exactly
             // as for one where a target failed: `--copy-out` into a directory
             // holding an earlier complete run would otherwise leave the
-            // skipped targets' old outputs next to the new ones. (Not a
-            // `return`: this block runs inside `finalize!`, which still has
-            // to turn the skips into the exit.)
+            // skipped targets' old outputs next to the new ones. `finalize`
+            // still turns the skips into the exit.
             let result = if gaps.is_empty() { result } else { Vec::new() };
             if self.args.cat_out {
                 for r in &result {
                     for a in &r.artifacts {
                         for e in a.walk()? {
                             let e = e?;
-                            if let crate::hartifactcontent::WalkEntryKind::File { mut data, .. } =
-                                e.kind
+                            if let crate::hartifactcontent::WalkEntryKind::File {
+                                mut data, ..
+                            } = e.kind
                             {
                                 io::copy(&mut data, &mut io::stdout())?;
                             }
@@ -950,7 +948,8 @@ impl App for RunApp {
                 }
             }
             Ok(())
-        });
+        })
+        .await;
         finalized.map(|()| None)
     }
 }

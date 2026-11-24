@@ -114,10 +114,11 @@ impl App for CleanApp {
             )
             .await;
 
-        crate::commands::errors::finalize!(ctx, rs, res, gaps = &gaps, stats => {
+        crate::commands::errors::finalize(&ctx, &rs, res, Some(&gaps), |stats| {
             print_summary(&stats, &selection);
             Ok(())
         })
+        .await
     }
 }
 

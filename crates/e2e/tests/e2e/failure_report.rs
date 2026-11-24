@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 /// Resolve `addr`, which must fail, and render the report its request
 /// would print: `took_down`, `was_cancelled` and the home all from the
-/// request, as `finalize!` gathers them.
+/// request, as `finalize` gathers them.
 async fn run_report(engine: &Arc<Engine>, addr: &str) -> anyhow::Result<String> {
     let rs = engine.new_state();
     let res = Arc::clone(engine)

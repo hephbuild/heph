@@ -9,8 +9,9 @@ use serde::Serialize;
 use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
 use crate::commands::completion::complete_target_addr;
+use crate::commands::utils::parse_addr_arg;
 use crate::engine::failure_slot::{FIXES, FailureSlots, LOG, OUT};
-use crate::htaddr::{self, Addr};
+use crate::htaddr::Addr;
 use crate::tui::LogSink;
 
 #[derive(clap::Args, Clone)]
@@ -95,9 +96,7 @@ async fn execute_async(
     session: &Arc<SessionSlot>,
     global: GlobalOptions,
 ) -> anyhow::Result<()> {
-    let base = crate::engine::get_cwp()?;
-    let addr = htaddr::parse_addr_with_base(args.addr.as_ref(), &base)
-        .with_context(|| format!("parse {}", args.addr))?;
+    let addr = parse_addr_arg(&args.addr)?;
     let (engine, _shutdown) = bootstrap::new_engine(&global, session)?;
     let view = failure_view(engine.failure_slots(), &addr)?;
     print!("{}", render(&addr, view.as_ref(), args.json)?);
@@ -124,6 +123,7 @@ fn render(addr: &Addr, view: Option<&FailureView>, json: bool) -> anyhow::Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::htaddr;
 
     /// A slot for `addr` under a fresh home, holding a log, an `out/` and,
     /// when `fixes`, a `fixes.txt`.

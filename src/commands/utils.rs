@@ -36,6 +36,27 @@ pub fn resolve_addr(input: &str) -> anyhow::Result<Addr> {
     resolve_addr_in(input, &engine::get_cwp()?, &engine::get_root()?)
 }
 
+/// Parse a CLI address argument relative to the current working package.
+///
+/// Strict: unlike [`resolve_addr`] there is no file-path sugar, so a path is
+/// a parse error.
+pub fn parse_addr_arg(input: &str) -> anyhow::Result<Addr> {
+    parse_addr_arg_in(input, &engine::get_cwp()?)
+}
+
+fn parse_addr_arg_in(input: &str, cwp: &PkgBuf) -> anyhow::Result<Addr> {
+    htaddr::parse_addr_with_base(input, cwp).with_context(|| format!("parse {input}"))
+}
+
+/// The package matcher an optional CLI argument selects, relative to the
+/// current working package; every package when the argument is absent.
+pub fn package_matcher_or_all(input: Option<&str>) -> anyhow::Result<Matcher> {
+    match input {
+        Some(s) => htpkg::parse(s, &engine::get_cwp()?),
+        None => Ok(Matcher::PackagePrefix(PkgBuf::from(""))),
+    }
+}
+
 /// Resolve the target selection for the `run`/`query` commands. Exactly one of
 /// the query form (`-e '<expr>'`) or the positional form (`<addr>` /
 /// `<label> <package>`) must be supplied. Exclusion is expressed inside the
@@ -243,6 +264,32 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let addr = resolve_addr_in(":mytarget", &PkgBuf::from("cmd/server"), dir.path()).unwrap();
         assert_eq!(addr, parse_addr("//cmd/server:mytarget").unwrap());
+    }
+
+    #[test]
+    fn addr_arg_resolves_against_package() {
+        let addr = parse_addr_arg_in(":mytarget", &PkgBuf::from("cmd/server")).unwrap();
+        assert_eq!(addr, parse_addr("//cmd/server:mytarget").unwrap());
+    }
+
+    #[test]
+    fn addr_arg_has_no_file_sugar() {
+        // Strict where `resolve_addr` is lenient: a path is a parse error, with
+        // the argument named.
+        let err = parse_addr_arg_in("data.txt", &PkgBuf::from("cmd/server")).unwrap_err();
+        assert!(
+            format!("{err:#}").starts_with("parse data.txt: "),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn absent_package_matcher_selects_every_package() {
+        let m = package_matcher_or_all(None).unwrap();
+        assert!(
+            matches!(&m, Matcher::PackagePrefix(p) if p.as_str().is_empty()),
+            "{m:?}"
+        );
     }
 
     #[test]

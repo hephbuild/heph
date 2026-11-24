@@ -2,15 +2,15 @@ use crate::tui::session::SessionSlot;
 use std::sync::Arc;
 
 use anyhow::Context;
-use async_trait::async_trait;
 
 use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
-use crate::engine::{Engine, PackageStates, StatesOptions};
-use crate::htmatcher::Matcher;
-use crate::htpkg::{self, PkgBuf};
+use crate::commands::progress_app::run_engine_command;
+use crate::commands::utils::package_matcher_or_all;
+use crate::engine::{PackageStates, StatesOptions};
+use crate::htpkg::PkgBuf;
 use crate::htvalue::Value;
-use crate::tui::{self, App, AppContext, BufferedStdout, LogSink};
+use crate::tui::{BufferedStdout, LogSink};
 
 #[derive(clap::Args, Clone)]
 pub struct Args {
@@ -30,61 +30,6 @@ pub struct Args {
     pub json: bool,
     #[command(flatten)]
     pub dashboard: crate::commands::progress_app::DashboardArgs,
-}
-
-struct StatesApp {
-    engine: Arc<Engine>,
-    matcher: Matcher,
-    opts: StatesOptions,
-    json: bool,
-    fail_fast: bool,
-}
-
-#[async_trait]
-impl App for StatesApp {
-    type Output = ();
-    type TuiView = crate::tui::TuiProgressView;
-    type CiView = crate::tui::CiProgressView;
-
-    fn tui_view(&self) -> Self::TuiView {
-        crate::tui::TuiProgressView::new(format!("States {:?}", self.matcher))
-    }
-
-    fn ci_view(&self) -> Self::CiView {
-        crate::tui::CiProgressView::new(format!("States {:?}", self.matcher))
-    }
-
-    async fn run(self, ctx: AppContext) -> anyhow::Result<()> {
-        let rs = self
-            .engine
-            .new_state_with_events(self.fail_fast, ctx.event_sender());
-
-        // Probing runs BUILD evaluation, which records rich failures in `rs`;
-        // `finalize` prefers those over the returned error.
-        let out = BufferedStdout::new(&ctx);
-        let res: anyhow::Result<()> = async {
-            let found = Arc::clone(&self.engine)
-                .states(rs.clone(), &self.matcher, &self.opts)
-                .await?;
-            // A package with nothing to say is noise in a workspace-wide scan,
-            // and "absent" already reads as "no state here" for a single one.
-            let found: Vec<&PackageStates> =
-                found.iter().filter(|p| !p.states.is_empty()).collect();
-
-            if self.json {
-                out.println(render_json(&found)?);
-            } else {
-                for line in render_text(&found, self.opts.inherited) {
-                    out.println(line);
-                }
-            }
-            Ok(())
-        }
-        .await;
-        out.close().await;
-
-        crate::commands::errors::finalize!(ctx, rs, res)
-    }
 }
 
 /// Render a state value as JSON. BUILD files spell booleans `True`, but every
@@ -218,29 +163,45 @@ async fn execute_async(
     session: &Arc<SessionSlot>,
     global: GlobalOptions,
 ) -> anyhow::Result<()> {
-    let matcher = match &args.matcher {
-        Some(s) => htpkg::parse(s.as_str(), &crate::engine::get_cwp()?)?,
-        None => Matcher::PackagePrefix(PkgBuf::from("")),
+    let matcher = package_matcher_or_all(args.matcher.as_deref())?;
+    let opts = StatesOptions {
+        inherited: args.inherited,
+        provider: args.provider.clone(),
     };
-    let (engine, shutdown) = bootstrap::new_engine(&global, session)?;
-    let app = StatesApp {
-        engine,
-        matcher,
-        opts: StatesOptions {
-            inherited: args.inherited,
-            provider: args.provider.clone(),
-        },
-        json: args.json,
-        fail_fast: global.fail_fast,
-    };
-    let interactive = tui::should_use_tui(global.no_tui);
-    tui::run_app_with(
-        app,
+    let json = args.json;
+    run_engine_command(
+        format!("States {matcher:?}"),
         sink,
         session,
-        interactive,
+        &global,
         args.dashboard.dashboard,
-        shutdown,
+        move |engine, rs, ctx| async move {
+            // Probing runs BUILD evaluation, which records rich failures in `rs`;
+            // `finalize` prefers those over the returned error.
+            let out = BufferedStdout::new(&ctx);
+            let res: anyhow::Result<()> = async {
+                let found = Arc::clone(&engine)
+                    .states(rs.clone(), &matcher, &opts)
+                    .await?;
+                // A package with nothing to say is noise in a workspace-wide scan,
+                // and "absent" already reads as "no state here" for a single one.
+                let found: Vec<&PackageStates> =
+                    found.iter().filter(|p| !p.states.is_empty()).collect();
+
+                if json {
+                    out.println(render_json(&found)?);
+                } else {
+                    for line in render_text(&found, opts.inherited) {
+                        out.println(line);
+                    }
+                }
+                Ok(())
+            }
+            .await;
+            out.close().await;
+
+            crate::commands::errors::finalize(&ctx, &rs, res, None, |_| Ok(())).await
+        },
     )
     .await
 }

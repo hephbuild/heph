@@ -2,18 +2,17 @@ use crate::tui::session::SessionSlot;
 use std::sync::Arc;
 
 use anyhow::Context;
-use async_trait::async_trait;
 use clap_complete::engine::ArgValueCompleter;
 use serde::Serialize;
 
 use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
 use crate::commands::completion::complete_target_addr;
-use crate::engine::Engine;
+use crate::commands::progress_app::run_engine_command;
+use crate::commands::utils::parse_addr_arg;
 use crate::engine::driver::sandbox::Sandbox;
 use crate::engine::driver::targetdef::TargetDef;
-use crate::htaddr::{self, Addr};
-use crate::tui::{self, App, AppContext, LogSink};
+use crate::tui::LogSink;
 
 #[derive(clap::Args, Clone)]
 pub struct Args {
@@ -46,54 +45,6 @@ fn runs_as(driver: &str, def: &TargetDef) -> Option<String> {
         .map(|_| format!("{driver}, entrypoint (uncached)"))
 }
 
-struct DefApp {
-    engine: Arc<Engine>,
-    addr: Addr,
-    no_transitive: bool,
-    fail_fast: bool,
-}
-
-#[async_trait]
-impl App for DefApp {
-    type Output = ();
-    type TuiView = crate::tui::TuiProgressView;
-    type CiView = crate::tui::CiProgressView;
-
-    fn tui_view(&self) -> Self::TuiView {
-        crate::tui::TuiProgressView::new(format!("Def {}", self.addr.format()))
-    }
-
-    fn ci_view(&self) -> Self::CiView {
-        crate::tui::CiProgressView::new(format!("Def {}", self.addr.format()))
-    }
-
-    async fn run(self, ctx: AppContext) -> anyhow::Result<()> {
-        let rs = self
-            .engine
-            .new_state_with_events(self.fail_fast, ctx.event_sender());
-        // `get_def` may run provider targets, recording rich failures in `rs`;
-        // `finalize` prefers those over the returned error and prints on success.
-        let res = if self.no_transitive {
-            self.engine
-                .clone()
-                .get_direct_def(rs.clone(), &self.addr)
-                .await
-        } else {
-            self.engine.clone().get_def(rs.clone(), &self.addr).await
-        };
-        crate::commands::errors::finalize!(ctx, rs, res, def => {
-            let view = DefView {
-                runs_as: runs_as(&def.driver, &def.target_def),
-                target_def: &def.target_def,
-                applied_transitive: def.applied_transitive.as_ref(),
-            };
-            let json = serde_json::to_string_pretty(&view).context("serialize def")?;
-            println!("{json}");
-            Ok(())
-        })
-    }
-}
-
 pub fn execute(
     args: &Args,
     sink: LogSink,
@@ -109,24 +60,34 @@ async fn execute_async(
     session: &Arc<SessionSlot>,
     global: GlobalOptions,
 ) -> anyhow::Result<()> {
-    let base = crate::engine::get_cwp()?;
-    let addr = htaddr::parse_addr_with_base(args.addr.as_ref(), &base)
-        .with_context(|| format!("parse {}", args.addr))?;
-    let (engine, shutdown) = bootstrap::new_engine(&global, session)?;
-    let app = DefApp {
-        engine,
-        addr,
-        no_transitive: args.no_transitive,
-        fail_fast: global.fail_fast,
-    };
-    let interactive = tui::should_use_tui(global.no_tui);
-    tui::run_app_with(
-        app,
+    let addr = parse_addr_arg(&args.addr)?;
+    let no_transitive = args.no_transitive;
+    run_engine_command(
+        format!("Def {}", addr.format()),
         sink,
         session,
-        interactive,
+        &global,
         args.dashboard.dashboard,
-        shutdown,
+        move |engine, rs, ctx| async move {
+            // `get_def` may run provider targets, recording rich failures in `rs`;
+            // `finalize` prefers those over the returned error and prints on success.
+            let res = if no_transitive {
+                Arc::clone(&engine).get_direct_def(rs.clone(), &addr).await
+            } else {
+                Arc::clone(&engine).get_def(rs.clone(), &addr).await
+            };
+            crate::commands::errors::finalize(&ctx, &rs, res, None, |def| {
+                let view = DefView {
+                    runs_as: runs_as(&def.driver, &def.target_def),
+                    target_def: &def.target_def,
+                    applied_transitive: def.applied_transitive.as_ref(),
+                };
+                let json = serde_json::to_string_pretty(&view).context("serialize def")?;
+                println!("{json}");
+                Ok(())
+            })
+            .await
+        },
     )
     .await
 }
