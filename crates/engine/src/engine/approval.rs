@@ -447,7 +447,7 @@ impl Store<'_> {
         if !db.exists() {
             return Ok(None);
         }
-        let sqlite: Arc<dyn LocalCache> = Arc::new(
+        let sqlite = Arc::new(
             crate::engine::local_cache_sqlite::LocalCacheSQLite::open_read_only(db)
                 .context("opening the local cache read-only")?,
         );

@@ -891,7 +891,7 @@ def lib(name: str, **kwargs: heph.types.bash.Kwargs) -> None:
         };
         let ok = call("run = \"echo\"");
         let result = eval_pkg(ok.path(), "pkg").unwrap_or_else(|e| panic!("{}", chain(&e)));
-        assert_eq!(result.targets.len(), 1);
+        assert_eq!(result.targets().len(), 1);
         let bad = call("rnu = \"echo\"");
         let err = chain(&eval_pkg(bad.path(), "pkg").expect_err("an unknown key"));
         assert!(err.contains("`rnu`"), "names the key: {err}");
@@ -979,7 +979,7 @@ def f(k: heph.types.bash.Kwargs):
                 &loader,
             )
             .expect("evaluates");
-            format!("{:?}", r.targets)
+            format!("{:?}", r.targets())
         };
         assert_eq!(
             eval(none()),

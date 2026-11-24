@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 /// Group `embed_files` (Go's resolved EmbedFiles list) by the pattern that
 /// matches them. Pure path-based matching: no filesystem access.
@@ -40,6 +40,34 @@ fn files_matching_pattern(pattern: &str, files: &[String]) -> Vec<String> {
     matched
 }
 
+/// One `/`-separated element of an embed pattern, compiled once per pattern.
+enum PatternSeg<'a> {
+    /// No glob meta: exact compare.
+    Lit(&'a str),
+    /// A single path element, so no separators to worry about; Go's `*`
+    /// matches a leading dot, which is glob's default.
+    Glob(glob::Pattern),
+    /// Glob meta that does not compile: matches nothing.
+    Never,
+}
+
+impl<'a> PatternSeg<'a> {
+    fn new(seg: &'a str) -> Self {
+        if !seg.contains(['*', '?', '[']) {
+            return Self::Lit(seg);
+        }
+        glob::Pattern::new(seg).map_or(Self::Never, Self::Glob)
+    }
+
+    fn matches(&self, name: &str) -> bool {
+        match self {
+            Self::Lit(lit) => *lit == name,
+            Self::Glob(g) => g.matches(name),
+            Self::Never => false,
+        }
+    }
+}
+
 /// Resolve a single `//go:embed` pattern against a flat list of candidate files
 /// (package-relative, `/`-separated paths), mirroring Go's `cmd/go` embed
 /// resolution. Returns the files Go would embed for `pattern`.
@@ -62,35 +90,15 @@ fn files_matching_pattern(pattern: &str, files: &[String]) -> Vec<String> {
 pub fn select_pattern_files(pattern: &str, files: &[String]) -> Vec<String> {
     let all = pattern.starts_with("all:");
     let p = pattern.strip_prefix("all:").unwrap_or(pattern);
-    let pat_segs: Vec<&str> = p.split('/').collect();
+    let pat_segs: Vec<PatternSeg<'_>> = p.split('/').map(PatternSeg::new).collect();
 
-    // Per-segment matcher: exact compare unless the segment carries glob meta.
-    let seg_matches = |pat_seg: &str, name: &str| -> bool {
-        if pat_seg.contains(['*', '?', '[']) {
-            match glob::Pattern::new(pat_seg) {
-                // Single path element → no separators to worry about; Go's `*`
-                // matches a leading dot, which is glob's default.
-                Ok(g) => g.matches(name),
-                Err(_) => false,
-            }
-        } else {
-            pat_seg == name
-        }
-    };
     // Does path `entry` (split into segments) match the pattern exactly?
     let entry_matches = |entry: &str| -> bool {
-        let segs: Vec<&str> = entry.split('/').collect();
-        segs.len() == pat_segs.len()
-            && pat_segs
-                .iter()
-                .zip(segs.iter())
-                .all(|(ps, s)| seg_matches(ps, s))
-    };
-    // Is `entry` a directory in the candidate set (a strict path-prefix of some
-    // file)? Derived purely from the flat file list — no filesystem access.
-    let is_dir = |entry: &str| -> bool {
-        let prefix = format!("{entry}/");
-        files.iter().any(|f| f.starts_with(&prefix))
+        let mut segs = entry.split('/');
+        pat_segs
+            .iter()
+            .all(|ps| segs.next().is_some_and(|s| ps.matches(s)))
+            && segs.next().is_none()
     };
     // Walk a matched directory, applying Go's leading-`.`/`_` exclusion to every
     // element *below* the matched root.
@@ -114,12 +122,15 @@ pub fn select_pattern_files(pattern: &str, files: &[String]) -> Vec<String> {
             matched.push(f.clone());
         }
     }
-    // Directory roots: every ancestor path of a file. Track which we've expanded
-    // so a dir shared by many files is walked once.
-    let mut seen_dirs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    // Directory roots: every ancestor path of a file, each a directory of the
+    // candidate set by construction. Track which we've checked so a dir shared
+    // by many files is matched (and walked) once. An ancestor deeper than the
+    // pattern has more segments than it and cannot match, so the walk stops at
+    // the pattern's depth.
+    let mut checked_dirs: HashSet<String> = HashSet::new();
     for f in files {
         let mut acc = String::new();
-        for seg in f.split('/') {
+        for seg in f.split('/').take(pat_segs.len()) {
             if !acc.is_empty() {
                 acc.push('/');
             }
@@ -127,13 +138,13 @@ pub fn select_pattern_files(pattern: &str, files: &[String]) -> Vec<String> {
             if acc.as_str() == f.as_str() {
                 break; // the file itself, not a dir
             }
-            if seen_dirs.contains(&acc) {
+            if checked_dirs.contains(acc.as_str()) {
                 continue;
             }
-            if is_dir(&acc) && entry_matches(&acc) {
-                seen_dirs.insert(acc.clone());
+            if entry_matches(&acc) {
                 push_dir_files(&acc, &mut matched);
             }
+            checked_dirs.insert(acc.clone());
         }
     }
 
@@ -452,6 +463,43 @@ mod tests {
     #[test]
     fn test_select_no_match_is_empty() {
         assert!(select_pattern_files("missing/*", &selector_fixture()).is_empty());
+    }
+
+    #[test]
+    fn test_select_nested_glob_segments() {
+        // A glob in a middle segment matches dirs at that level only; the
+        // matched dirs recurse with the skip rule.
+        assert_eq!(select_sorted("*/sub"), vec!["assets/sub/c.txt"]);
+        assert_eq!(
+            select_sorted("assets/*/*.txt"),
+            vec![
+                "assets/.hid/h.txt",
+                "assets/_und/u.txt",
+                "assets/sub/.d.txt",
+                "assets/sub/c.txt"
+            ]
+        );
+        assert_eq!(
+            select_sorted("a?sets/[s_]*"),
+            vec!["assets/_u.txt", "assets/_und/u.txt", "assets/sub/c.txt"]
+        );
+    }
+
+    #[test]
+    fn test_select_invalid_glob_matches_nothing() {
+        // A segment whose glob does not compile matches nothing, at any depth.
+        assert!(select_pattern_files("assets/[", &selector_fixture()).is_empty());
+        assert!(select_pattern_files("[/a.txt", &selector_fixture()).is_empty());
+        assert!(select_pattern_files("assets/[/c.txt", &selector_fixture()).is_empty());
+    }
+
+    #[test]
+    fn test_select_dir_shared_by_many_files_is_listed_once_each() {
+        let files: Vec<String> = (0..50).map(|i| format!("d/{i:02}/f.txt")).collect();
+        let got = select_pattern_files("d", &files);
+        let mut want = files.clone();
+        want.sort();
+        assert_eq!(got, want);
     }
 
     /// Parity guard: when a host `go` is available, diff our selector against

@@ -26,7 +26,7 @@ use super::auth::RegistryCredentials;
 /// mapping is backed by the page cache — pages are faulted in as the request
 /// body is written and can be dropped again under pressure — so a layer's size
 /// does not become the driver's resident heap.
-fn blob_body(blob: &Blob) -> anyhow::Result<bytes::Bytes> {
+pub(super) fn blob_body(blob: &Blob) -> anyhow::Result<bytes::Bytes> {
     let (path, offset, len) = match blob {
         // Manifests and configs: kilobytes, already in memory.
         Blob::Bytes(b) => return Ok(bytes::Bytes::from(b.clone())),
@@ -41,8 +41,9 @@ fn blob_body(blob: &Blob) -> anyhow::Result<bytes::Bytes> {
     // SAFETY: a mapping is only sound while nothing truncates or rewrites the
     // file under it. This file is a content-addressed blob in the sandbox this
     // driver owns — a layer staged by `oci_image`, a pulled blob renamed into
-    // place once complete, or an `oci-archive` input — and nothing writes to it
-    // for the length of the push.
+    // place once complete, an `oci-archive` input, or the docker-format archive
+    // `oci_load` wrote and closed before handing it to the daemon — and nothing
+    // writes to it for the length of the push or the load.
     let map = unsafe {
         memmap2::MmapOptions::new()
             .offset(offset)

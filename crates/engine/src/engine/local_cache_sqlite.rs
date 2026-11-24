@@ -830,6 +830,29 @@ impl LocalCacheSQLite {
         Ok(())
     }
 
+    /// [`LocalCache::writer`], as its concrete type, so the spill cache can take
+    /// the staged bytes back with [`SqliteCacheWriter::into_staged`].
+    pub(crate) fn entry_writer(
+        &self,
+        addr: &Addr,
+        hashin: &str,
+        name: &str,
+    ) -> Result<Box<SqliteCacheWriter>> {
+        // No pending registration here: the key becomes pending when the finished
+        // spool is *queued*, in `SqliteCacheWriter::commit`. Registering at open
+        // would make every reader of the key wait out the caller's whole
+        // streaming write — see `PendingTracker::register_and_send`. A writer
+        // dropped without commit therefore strands no waiter: nothing was ever
+        // registered for it.
+        Ok(Box::new(SqliteCacheWriter {
+            writer_tx: self.writer_tx()?.clone(),
+            pending: self.pending.clone(),
+            key: Some((Self::key(addr), hashin.to_string(), name.to_string())),
+            buf: Some(SpooledTempFile::new(SPOOL_MEM_THRESHOLD)),
+            size: 0,
+        }))
+    }
+
     /// The writer channel, spawning the writer thread (and opening the
     /// read-write connection) on first use.
     fn writer_tx(&self) -> Result<&mpsc::Sender<WriterCmd>> {
@@ -1417,19 +1440,7 @@ impl LocalCache for LocalCacheSQLite {
     }
 
     fn writer(&self, addr: &Addr, hashin: &str, name: &str) -> Result<Box<dyn EntryWriter>> {
-        // No pending registration here: the key becomes pending when the finished
-        // spool is *queued*, in `SqliteCacheWriter::commit`. Registering at open
-        // would make every reader of the key wait out the caller's whole
-        // streaming write — see `PendingTracker::register_and_send`. A writer
-        // dropped without commit therefore strands no waiter: nothing was ever
-        // registered for it.
-        Ok(Box::new(SqliteCacheWriter {
-            writer_tx: self.writer_tx()?.clone(),
-            pending: self.pending.clone(),
-            key: Some((Self::key(addr), hashin.to_string(), name.to_string())),
-            buf: Some(SpooledTempFile::new(SPOOL_MEM_THRESHOLD)),
-            size: 0,
-        }))
+        Ok(self.entry_writer(addr, hashin, name)?)
     }
 
     fn exists(&self, addr: &Addr, hashin: &str, name: &str) -> Result<bool> {
@@ -1709,7 +1720,7 @@ impl io::Seek for OwnedBlob {
     }
 }
 
-struct SqliteCacheWriter {
+pub(crate) struct SqliteCacheWriter {
     writer_tx: mpsc::Sender<WriterCmd>,
     pending: Arc<PendingTracker>,
     key: Option<Key>,
@@ -1765,6 +1776,23 @@ impl EntryWriter for SqliteCacheWriter {
             // waiting for a commit that will never come.
             .context("queueing a cache write: sqlite writer thread is gone")?;
         Ok(())
+    }
+}
+
+impl SqliteCacheWriter {
+    /// Abandon the entry, as a drop would, but hand back the bytes written so
+    /// far, rewound to the first one. Nothing reaches the cache.
+    ///
+    /// So the spill cache can move a staged prefix to its FS store without a
+    /// round trip through sqlite. Nothing is queued and nothing was registered
+    /// (that happens in `commit`), so no reader of the key waits on it.
+    pub(crate) fn into_staged(mut self) -> Result<SpooledTempFile> {
+        let (Some(key), Some(mut buf)) = (self.key.take(), self.buf.take()) else {
+            anyhow::bail!("sqlite cache writer already committed");
+        };
+        buf.seek(io::SeekFrom::Start(0))
+            .with_context(|| format!("rewinding spool for {}", key.2))?;
+        Ok(buf)
     }
 }
 
@@ -2447,6 +2475,36 @@ mod tests {
         // And once committed (queued), the wait is back on: the value is visible.
         writer.commit()?;
         assert!(cache.exists(&addr, "h", "blob")?);
+        Ok(())
+    }
+
+    /// `into_staged` hands back every byte written, from the first, and leaves
+    /// nothing behind: no row, and no pending write a reader would wait on. The
+    /// blob is over the spool's memory threshold so the file-backed spool's
+    /// rewind is covered too.
+    #[test]
+    fn into_staged_returns_the_bytes_and_leaves_no_row() -> Result<()> {
+        let dir = tempdir()?;
+        let cache = open(&dir.path().join("cache.db"))?;
+        let addr = make_addr("pkg", "staged");
+        let data: Vec<u8> = (0..SPOOL_MEM_THRESHOLD * 2)
+            .map(|i| (i % 251) as u8)
+            .collect();
+
+        let mut writer = cache.entry_writer(&addr, "h", "blob")?;
+        writer.write_all(&data)?;
+        let mut staged = Vec::new();
+        writer.into_staged()?.read_to_end(&mut staged)?;
+        assert!(staged == data, "staged bytes differ from what was written");
+
+        assert!(
+            matches!(
+                cache.existence(&addr, "h", "blob")?,
+                Existence::Committed(false)
+            ),
+            "a writer taken back with into_staged must queue nothing"
+        );
+        assert!(!cache.exists(&addr, "h", "blob")?);
         Ok(())
     }
 

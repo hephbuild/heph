@@ -10,8 +10,10 @@
 //!   size — GC enumerates revisions by manifest presence in the primary, so the
 //!   primary must remain the authoritative index.
 //! - Any other blob streams straight to the primary by default. The moment its
-//!   running size crosses `spill_threshold`, the prefix written so far is
-//!   migrated into the FS blob store and all further bytes stream there. Below
+//!   running size crosses `spill_threshold`, the prefix the primary writer has
+//!   staged so far is taken back uncommitted
+//!   ([`SqliteCacheWriter::into_staged`]) and copied into the FS blob store, and all
+//!   further bytes stream there; the prefix never lands in sqlite. Below
 //!   the threshold most artifacts stay in sqlite (fast indexed access, atomic,
 //!   mem-cacheable, and written with zero copies); genuinely large artifacts end
 //!   up on the filesystem where throughput wins and they don't bloat the DB / WAL.
@@ -46,15 +48,17 @@ use crate::engine::local_cache::{
     EntryWriter, Existence, LocalCache, NotFoundError, SizedReader, TargetStream, is_manifest_name,
 };
 use crate::engine::local_cache_fs::LocalCacheFS;
+use crate::engine::local_cache_sqlite::{LocalCacheSQLite, SqliteCacheWriter};
 use anyhow::{Context, Result};
 use hcore::hartifactcontent;
 use hmodel::htaddr::Addr;
-use std::io;
+use std::io::{self, Write as _};
 use std::sync::Arc;
 
 pub struct LocalCacheSpill {
-    /// Manifests + small/medium blobs.
-    primary: Arc<dyn LocalCache>,
+    /// Manifests + small/medium blobs. Sqlite by type, not any `LocalCache`:
+    /// a spill takes back what its writer staged, which only sqlite's does.
+    primary: Arc<LocalCacheSQLite>,
     /// Large blobs, as plain files.
     blobs: Arc<LocalCacheFS>,
     /// Blobs strictly larger than this spill to `blobs`; at-or-below stay in
@@ -64,7 +68,7 @@ pub struct LocalCacheSpill {
 
 impl LocalCacheSpill {
     pub fn new(
-        primary: Arc<dyn LocalCache>,
+        primary: Arc<LocalCacheSQLite>,
         blobs: Arc<LocalCacheFS>,
         spill_threshold: usize,
     ) -> Self {
@@ -96,8 +100,8 @@ impl LocalCache for LocalCacheSpill {
         }
         // Drop any stale FS copy before writing, so this key ends up in exactly
         // one backend — the invariant the module doc asserts and every read path
-        // relies on. It is not self-maintaining: `spill` deletes the primary's
-        // staged prefix when a blob is promoted, but nothing deleted the FS copy
+        // relies on. It is not self-maintaining: `spill` drops any primary copy
+        // when a blob is promoted, but nothing deleted the FS copy
         // when a rewrite of the same key stays *under* the threshold, which
         // `cache.spillThresholdBytes` being user-tunable makes reachable. Dual
         // residency would make `reader` (primary first) and `file_path` (FS only)
@@ -113,7 +117,7 @@ impl LocalCache for LocalCacheSpill {
         // (the common case) hit their final home with no buffering and no copy.
         let primary_writer = self
             .primary
-            .writer(addr, hashin, name)
+            .entry_writer(addr, hashin, name)
             .with_context(|| format!("open primary cache writer for {addr} {name}"))?;
         Ok(Box::new(SpillWriter {
             primary: self.primary.clone(),
@@ -282,10 +286,11 @@ impl LocalCache for LocalCacheSpill {
 /// running size crosses `threshold`. Holds no buffer of its own: the in-flight
 /// bytes live in whichever backend writer is currently open. Small blobs (never
 /// cross the threshold) reach their final home in sqlite with zero copies; a
-/// blob that does cross has its primary-staged prefix migrated to a fresh FS
-/// writer once — and only large blobs pay that.
+/// blob that does cross has the prefix its primary writer staged (and never
+/// committed) copied into a fresh FS writer once — and only large blobs pay
+/// that.
 struct SpillWriter {
-    primary: Arc<dyn LocalCache>,
+    primary: Arc<LocalCacheSQLite>,
     blobs: Arc<LocalCacheFS>,
     addr: Addr,
     hashin: String,
@@ -294,44 +299,47 @@ struct SpillWriter {
     /// Bytes written so far, used only to detect the threshold crossing.
     size: usize,
     /// Open until the blob spills; `None` afterwards.
-    primary_writer: Option<Box<dyn EntryWriter>>,
+    primary_writer: Option<Box<SqliteCacheWriter>>,
     /// `Some` once spilled; further writes stream directly into it.
     blob_writer: Option<Box<dyn EntryWriter>>,
 }
 
 impl SpillWriter {
-    /// Promote the blob from the primary to the FS store: commit the staged
-    /// prefix, copy it into a fresh FS writer, drop it from the primary, and
-    /// retain the FS writer for the remaining bytes.
+    /// Promote the blob from the primary to the FS store: take the prefix the
+    /// primary writer staged, copy it into a fresh FS writer, and retain the FS
+    /// writer for the remaining bytes.
     fn spill(&mut self) -> io::Result<()> {
-        // Commit the staged prefix to the primary so it can be read back — the
-        // one mid-stream commit in the protocol, and it is deleted again below
-        // once copied. The sqlite writer's PendingTracker makes the following
-        // reader/delete wait for that write to land.
+        // The prefix never reaches the primary: its writer hands its staging
+        // back uncommitted, so there is no write, read-back or delete of it, and
+        // no moment where a reader could take the prefix for the whole blob.
         let mut pw = self
             .primary_writer
             .take()
             .expect("spill called without an open primary writer");
         pw.flush()?;
-        pw.commit().map_err(io::Error::other)?;
+        let mut prefix = pw.into_staged().map_err(io::Error::other)?;
 
         let mut blob_writer = self
             .blobs
             .writer(&self.addr, &self.hashin, &self.name)
             .map_err(io::Error::other)?;
-        let mut prefix = self
-            .primary
-            .reader(&self.addr, &self.hashin, &self.name)
-            .map_err(io::Error::other)?
-            .reader;
         io::copy(&mut prefix, &mut blob_writer)?;
         drop(prefix);
 
-        // The blob now lives in the FS store; drop the primary's staged copy so
-        // a reader resolves to exactly one backend.
-        self.primary
-            .delete(&self.addr, &self.hashin, &self.name)
-            .map_err(io::Error::other)?;
+        // The blob is headed for the FS store, so drop any copy an earlier write
+        // of this key left in the primary, so a reader resolves to exactly one
+        // backend. `exists`, not `exists_committed`: it waits out a write to the
+        // key still queued, which would otherwise land after this check. A fresh
+        // revision, the normal case, has nothing there and queues no delete.
+        if self
+            .primary
+            .exists(&self.addr, &self.hashin, &self.name)
+            .map_err(io::Error::other)?
+        {
+            self.primary
+                .delete(&self.addr, &self.hashin, &self.name)
+                .map_err(io::Error::other)?;
+        }
 
         self.blob_writer = Some(blob_writer);
         htelemetry::telemetry::record_cache_spill();
@@ -375,17 +383,18 @@ impl EntryWriter for SpillWriter {
         // the blob durable in its final home. Nothing is staged in `self`.
         // Dropped without commit, that same writer discards its staging — an
         // abandoned blob lands in neither backend.
-        let (w, backend) = match (self.blob_writer.take(), self.primary_writer.take()) {
-            (Some(w), _) => (w, "spilled"),
-            (None, Some(w)) => (w, "primary"),
-            // `spill` always leaves exactly one backend writer open, and commit
-            // consumes `self` — so this is unreachable short of a logic bug.
-            (None, None) => anyhow::bail!(
-                "spill writer for {} {} has no open backend writer to commit",
-                self.addr,
-                self.name
-            ),
-        };
+        let (w, backend): (Box<dyn EntryWriter>, _) =
+            match (self.blob_writer.take(), self.primary_writer.take()) {
+                (Some(w), _) => (w, "spilled"),
+                (None, Some(w)) => (w, "primary"),
+                // `spill` always leaves exactly one backend writer open, and commit
+                // consumes `self` — so this is unreachable short of a logic bug.
+                (None, None) => anyhow::bail!(
+                    "spill writer for {} {} has no open backend writer to commit",
+                    self.addr,
+                    self.name
+                ),
+            };
         w.commit()
             .with_context(|| format!("commit {backend} blob {} for {}", self.name, self.addr))
     }
@@ -660,6 +669,41 @@ mod tests {
         assert!(
             high.file_path(&a, "h", "out").is_none(),
             "file_path must not hand out the superseded blob"
+        );
+    }
+
+    /// The mirror of the test above: a key that lives in the primary and is
+    /// rewritten above a lowered threshold spills, and the primary's copy must
+    /// go, or `reader` (primary first) would serve the stale bytes.
+    #[test]
+    fn a_rewrite_above_the_threshold_drops_the_stale_primary_copy() {
+        let dir = tempdir().expect("tempdir");
+        let a = addr();
+
+        // Threshold 4096: the 256-byte blob stays in sqlite.
+        let (high, sqlite, _fs) = spill(dir.path(), 4096);
+        write(&high, &a, "out", &[1u8; 256]);
+        assert!(
+            sqlite.exists(&a, "h", "out").expect("ex"),
+            "precondition: in the primary"
+        );
+
+        // Threshold lowered; the same key is rewritten and now spills.
+        let (low, sqlite2, fs2) = spill(dir.path(), 64);
+        write(&low, &a, "out", &[2u8; 256]);
+
+        assert!(
+            fs2.exists(&a, "h", "out").expect("ex"),
+            "the rewrite belongs in the FS store now"
+        );
+        assert!(
+            !sqlite2.exists(&a, "h", "out").expect("ex"),
+            "the stale primary copy must be gone, not shadowing the spilled one"
+        );
+        assert_eq!(read(&low, &a, "out"), vec![2u8; 256]);
+        assert!(
+            low.file_path(&a, "h", "out").is_some(),
+            "the spilled blob is the key's only copy"
         );
     }
 

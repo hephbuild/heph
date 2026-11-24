@@ -729,18 +729,24 @@ impl ManagedDriver for Driver {
             blobs.insert(manifest_digest, Blob::Bytes(manifest_bytes));
         }
 
-        let index = OciImageIndex {
-            schema_version: 2,
-            media_type: Some(oci_client::manifest::OCI_IMAGE_INDEX_MEDIA_TYPE.to_string()),
-            artifact_type: None,
-            manifests: entries.clone(),
-            annotations: None,
+        let layout = archive::Layout {
+            index: OciImageIndex {
+                schema_version: 2,
+                media_type: Some(oci_client::manifest::OCI_IMAGE_INDEX_MEDIA_TYPE.to_string()),
+                artifact_type: None,
+                manifests: entries.clone(),
+                annotations: None,
+            },
+            blobs,
         };
+        let index = &layout.index;
 
         match (def.layout, def.format) {
-            (true, _) => archive::write_layout_dir_blobs(&out_path, &index, &blobs),
-            (false, ImageFormat::Oci) => archive::write_layout_tar_blobs(&out_path, &index, &blobs),
-            (false, ImageFormat::Docker) => write_docker(&out_path, &index, &blobs),
+            (true, _) => archive::write_layout_dir_blobs(&out_path, index, &layout.blobs),
+            (false, ImageFormat::Oci) => {
+                archive::write_layout_tar_blobs(&out_path, index, &layout.blobs)
+            }
+            (false, ImageFormat::Docker) => write_docker(&out_path, &layout),
         }
         .with_context(|| format!("write the image to {out_path:?}"))?;
 
@@ -749,7 +755,7 @@ impl ManagedDriver for Driver {
         let digest = match entries.as_slice() {
             [only] => only.digest.clone(),
             _ => {
-                let raw = serde_json::to_vec(&index).context("encode the manifest list")?;
+                let raw = serde_json::to_vec(index).context("encode the manifest list")?;
                 archive::sha256_digest(&raw)
             }
         };
@@ -781,21 +787,19 @@ fn layer_tar(req: &ManagedRunRequest<'_, '_>, origin: &str) -> anyhow::Result<Pa
 }
 
 /// Write the docker-format archive a daemon's `docker load` accepts.
-fn write_docker(out: &std::path::Path, index: &OciImageIndex, blobs: &Blobs) -> anyhow::Result<()> {
-    // `write_docker_archive` reads through an in-memory `Layout`, so route the
-    // one-platform case through the layout the rest of the plugin already
-    // understands rather than growing a second docker-archive writer.
-    let tmp = out.with_extension("oci-tmp");
-    archive::write_layout_dir_blobs(&tmp, index, blobs)?;
-    let layout = archive::Layout::read(&tmp)?;
-    let manifests = layout.manifests()?;
-    let (manifest, _, digest) = manifests
+///
+/// The image is already an in-memory [`archive::Layout`] — the index plus the
+/// blobs, layers still on disk — which is what the docker writer reads, so it
+/// takes the layout as it is: no layout directory written and read back.
+/// `parse` refuses `format = "docker"` with more than one platform, so the
+/// first manifest is the image.
+fn write_docker(out: &std::path::Path, layout: &archive::Layout) -> anyhow::Result<()> {
+    let (manifest, _, digest) = layout
+        .manifests()?
         .into_iter()
         .next()
         .context("the assembled image has no manifest")?;
-    archive::write_docker_archive(out, &layout, &manifest, &digest, "heph:latest")?;
-    std::fs::remove_dir_all(&tmp).with_context(|| format!("clean up {tmp:?}"))?;
-    Ok(())
+    archive::write_docker_archive(out, layout, &manifest, &digest, "heph:latest")
 }
 
 #[cfg(test)]
@@ -1061,6 +1065,101 @@ mod tests {
             text.find(r#""A=2""#) < text.find(r#""M=3""#)
                 && text.find(r#""M=3""#) < text.find(r#""Z=1""#),
             "env must be sorted: {text}"
+        );
+    }
+
+    /// A one-platform image: a layer on disk, a layer in memory, a config and
+    /// the manifest, filed under an index the way `run` files them.
+    fn docker_fixture(dir: &std::path::Path) -> archive::Layout {
+        let mut blobs = Blobs::new();
+        let disk_layer = dir.join("layer-on-disk.tar");
+        std::fs::write(&disk_layer, vec![7u8; 70_000]).expect("write layer");
+        let (disk_digest, disk_size) = archive::sha256_file(&disk_layer).expect("hash layer");
+        blobs.insert(disk_digest.clone(), Blob::File(disk_layer));
+        let mem_layer = b"in-memory layer".to_vec();
+        let mem_digest = archive::sha256_digest(&mem_layer);
+        let mem_size = mem_layer.len();
+        blobs.insert(mem_digest.clone(), Blob::Bytes(mem_layer));
+        let config = br#"{"architecture":"amd64","os":"linux"}"#.to_vec();
+        let config_digest = archive::sha256_digest(&config);
+        let config_size = config.len();
+        blobs.insert(config_digest.clone(), Blob::Bytes(config));
+        let manifest = serde_json::to_vec(&json!({
+            "schemaVersion": 2,
+            "mediaType": oci_client::manifest::OCI_IMAGE_MEDIA_TYPE,
+            "config": {"mediaType": CONFIG_MEDIA_TYPE, "digest": config_digest, "size": config_size},
+            "layers": [
+                {"mediaType": LAYER_MEDIA_TYPE, "digest": disk_digest, "size": disk_size},
+                {"mediaType": LAYER_MEDIA_TYPE, "digest": mem_digest, "size": mem_size},
+            ],
+        }))
+        .expect("encode manifest");
+        let manifest_digest = archive::sha256_digest(&manifest);
+        let entry = ImageIndexEntry {
+            media_type: oci_client::manifest::OCI_IMAGE_MEDIA_TYPE.to_string(),
+            artifact_type: None,
+            digest: manifest_digest.clone(),
+            size: manifest.len() as i64,
+            platform: Some(oci_client::manifest::Platform {
+                os: "linux".into(),
+                architecture: "amd64".into(),
+                os_version: None,
+                os_features: None,
+                variant: None,
+                features: None,
+            }),
+            annotations: None,
+        };
+        blobs.insert(manifest_digest, Blob::Bytes(manifest));
+        archive::Layout {
+            index: OciImageIndex {
+                schema_version: 2,
+                media_type: Some(oci_client::manifest::OCI_IMAGE_INDEX_MEDIA_TYPE.to_string()),
+                artifact_type: None,
+                manifests: vec![entry],
+                annotations: None,
+            },
+            blobs,
+        }
+    }
+
+    /// The docker archive written straight from the in-memory layout is the
+    /// one the old route wrote — a layout directory on disk, read back — byte
+    /// for byte, and two writes of one image agree.
+    #[test]
+    fn the_docker_archive_matches_the_round_trip_through_a_layout_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let layout = docker_fixture(dir.path());
+
+        let direct = dir.path().join("direct.tar");
+        write_docker(&direct, &layout).expect("write direct");
+
+        let tmp = dir.path().join("round-trip.oci-tmp");
+        archive::write_layout_dir_blobs(&tmp, &layout.index, &layout.blobs).expect("write dir");
+        let reread = archive::Layout::read(&tmp).expect("read dir");
+        let (manifest, _, digest) = reread
+            .manifests()
+            .expect("manifests")
+            .into_iter()
+            .next()
+            .expect("one manifest");
+        let round_trip = dir.path().join("round-trip.tar");
+        archive::write_docker_archive(&round_trip, &reread, &manifest, &digest, "heph:latest")
+            .expect("write round trip");
+
+        let direct_bytes = std::fs::read(&direct).expect("read direct");
+        assert_eq!(
+            direct_bytes,
+            std::fs::read(&round_trip).expect("read round trip"),
+            "the archive must not depend on the route"
+        );
+
+        let again = dir.path().join("again.tar");
+        write_docker(&again, &layout).expect("write again");
+        assert_eq!(
+            direct_bytes,
+            std::fs::read(&again).expect("read again"),
+            "the same image must write the same archive"
         );
     }
 }

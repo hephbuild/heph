@@ -3,8 +3,11 @@ use crate::engine::driver::TargetAddr;
 use crate::engine::driver::targetdef::{Input, InputMode};
 use crate::engine::invoke::EntrypointAsInput;
 use crate::engine::request_state::{AddrKey, RequestState};
+use crate::engine::result::ExtendedTargetDef;
 use async_recursion::async_recursion;
 use enclose::enclose;
+use futures::FutureExt as _;
+use futures::stream::{FuturesOrdered, Stream, StreamExt as _};
 use hcore::hmemoizer::unwrap_arc_err;
 use hmodel::htaddr::Addr;
 use rustc_hash::FxHashSet;
@@ -211,24 +214,9 @@ impl Engine {
             .as_ref()
             .map(|_| Vec::with_capacity(inputs.len()));
 
-        for (idx, input) in inputs.iter().enumerate() {
-            let def = Arc::clone(&self)
-                .get_def(rs.clone(), &input.r#ref.r#ref)
-                .await?;
-
-            // Every input path converges here — deps, runtime_deps, tools,
-            // hash_deps, a runner, a `${read://…}`, a dep's transitive closure,
-            // a credential edge, and the members of a group — so this is the one
-            // place an entrypoint is refused as one (I8). Otherwise a build step
-            // could run something in a developer's cwd.
-            if def.target_def.entrypoint.is_some() {
-                return Err(EntrypointAsInput {
-                    entrypoint: input.r#ref.r#ref.clone(),
-                    origin_id: input.origin_id.clone(),
-                    consumer: None,
-                }
-                .into());
-            }
+        let mut defs = self.input_defs(&rs, &inputs).enumerate();
+        while let Some((idx, next)) = defs.next().await {
+            let (input, def) = next?;
 
             if def.target_def.transparent {
                 let out = result.get_or_insert_with(|| {
@@ -311,8 +299,53 @@ impl Engine {
             // else: top-level, no transparent seen yet, original `inputs` still
             // valid — skip.
         }
+        // The stream borrows `inputs`, which the no-group case hands back.
+        drop(defs);
 
         Ok(result.unwrap_or(inputs))
+    }
+
+    /// Each of `inputs` with its def, in declaration order, refusing an
+    /// entrypoint among them.
+    ///
+    /// The defs resolve concurrently — a child's parse, and its spec's BUILD
+    /// evaluation, cost the slowest sibling rather than the sum of them — but
+    /// the stream yields them in input order, so a walk that stops at the
+    /// first `Err` stops at the same input, with the same error, as resolving
+    /// them one after another did. The defs after it may have started; dropping
+    /// the stream abandons them, and a memoized def nobody else awaits is
+    /// aborted.
+    ///
+    /// Every input path converges here — deps, runtime_deps, tools,
+    /// hash_deps, a runner, a `${read://…}`, a dep's transitive closure,
+    /// a credential edge, and the members of a group — so this is the one
+    /// place an entrypoint is refused as one (I8). Otherwise a build step
+    /// could run something in a developer's cwd.
+    fn input_defs<'a>(
+        self: &Arc<Self>,
+        rs: &Arc<RequestState>,
+        inputs: &'a [Input],
+    ) -> impl Stream<Item = anyhow::Result<(&'a Input, Arc<ExtendedTargetDef>)>> + Send + use<'a>
+    {
+        inputs
+            .iter()
+            .map(|input| {
+                Arc::clone(self)
+                    .get_def(rs.clone(), &input.r#ref.r#ref)
+                    .map(move |def| {
+                        let def = def?;
+                        if def.target_def.entrypoint.is_some() {
+                            return Err(EntrypointAsInput {
+                                entrypoint: input.r#ref.r#ref.clone(),
+                                origin_id: input.origin_id.clone(),
+                                consumer: None,
+                            }
+                            .into());
+                        }
+                        Ok((input, def))
+                    })
+            })
+            .collect::<FuturesOrdered<_>>()
     }
 }
 
@@ -519,6 +552,82 @@ mod tests {
             expanded[0].annotations.get("custom").map(String::as_str),
             Some("p"),
         );
+        Ok(())
+    }
+
+    /// A target's input defs resolve concurrently, and the walk still reports
+    /// the first failing input in declaration order. Both `get`s meet at a
+    /// barrier, so neither returns until the other is in flight: resolving one
+    /// after another hangs. Past the barrier input 1 fails at once while input
+    /// 0 still parses, and the error is input 0's.
+    #[tokio::test]
+    async fn input_defs_resolve_concurrently_and_fail_in_input_order() -> anyhow::Result<()> {
+        use crate::engine::fault_provider::{FaultProvider, Faults};
+        use hbuiltins::pluginstatictarget::Target;
+
+        let ep = hmodel::htaddr::parse_addr("//pkg:ep")?;
+        let bad = hmodel::htaddr::parse_addr("//pkg:bad")?;
+        let target = |addr: &str, raw: &[(&str, Value)]| Target {
+            addr: addr.to_string(),
+            driver: "exec".to_string(),
+            run: Some("true".to_string()),
+            raw_config: raw
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), v.clone()))
+                .collect(),
+            ..Default::default()
+        };
+        let provider = FaultProvider::new(
+            vec![
+                target("//pkg:ep", &[("entrypoint", Value::Bool(true))]),
+                target("//pkg:bad", &[]),
+            ],
+            Faults {
+                fail_get: vec![bad.clone()],
+                rendezvous: Some((
+                    vec![ep.clone(), bad],
+                    Arc::new(tokio::sync::Barrier::new(2)),
+                )),
+                ..Default::default()
+            },
+        )?;
+        let gets = provider.gets();
+
+        let root = tempfile::tempdir()?;
+        let mut engine = Engine::new(Config {
+            parallelism: None,
+            ..Config::for_tests(root.path())
+        })?;
+        engine.register_managed_driver(|_| {
+            Box::new(hplugin_exec::pluginexec::Driver::new_exec().with_host_path())
+        })?;
+        engine.register_provider(move |_| Box::new(provider))?;
+        let engine = Arc::new(engine);
+
+        let rs = engine.new_state();
+        let mut visited = FxHashSet::default();
+        let inputs = vec![
+            input("//pkg:ep", "dep|0", &[]),
+            input("//pkg:bad", "dep|1", &[]),
+        ];
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            Arc::clone(&engine).expand_inputs(rs, inputs, None, &mut visited),
+        )
+        .await
+        .map_err(|_elapsed| {
+            anyhow::anyhow!("the sibling gets never met: input defs resolve one at a time")
+        })?;
+
+        assert_eq!(gets.max_in_flight(), 2, "both input gets in flight at once");
+        let Err(err) = res else {
+            panic!("an entrypoint input is refused");
+        };
+        let refused = err
+            .downcast_ref::<EntrypointAsInput>()
+            .unwrap_or_else(|| panic!("want input 0's EntrypointAsInput, got: {err:#}"));
+        assert_eq!(refused.entrypoint, ep);
+        assert_eq!(refused.origin_id, "dep|0");
         Ok(())
     }
 

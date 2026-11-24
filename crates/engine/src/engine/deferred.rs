@@ -381,14 +381,15 @@ impl Engine {
 
         let refs =
             collect(&spec.config, &spec.addr.package).with_context(|| format!("{}", spec.addr))?;
+        // `${OUT}` and `${SRC_*}` pass the pre-scan above, so the schema is
+        // still asked only once a reference has actually been found.
+        if refs.is_empty() {
+            return Ok(refs);
+        }
         let accepts = self
             .drivers_by_name
             .get(driver)
             .is_some_and(|d| d.driver.schema().accepts_deferred);
-
-        if refs.is_empty() {
-            return Ok(refs);
-        }
         if !accepts {
             let r = refs.first().map(|r| r.raw.as_str()).unwrap_or_default();
             anyhow::bail!(

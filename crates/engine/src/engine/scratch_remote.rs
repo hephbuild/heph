@@ -43,10 +43,12 @@
 //! parent it was last seeded from, and `heph tool scratch push` is the commit.
 
 use crate::engine::Engine;
-use crate::engine::remote_cache::{RemoteCacheBackend, ScratchSource};
+use crate::engine::remote_cache::{RemoteCacheBackend, SNAPSHOT_STREAM_BUF, ScratchSource};
 use anyhow::Context as _;
 use borsh::{BorshDeserialize, BorshSerialize};
+use std::io::Seek as _;
 use std::path::{Path, PathBuf};
+use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _};
 
 /// Key-layout version. Bumping it makes every older entry invisible rather than
 /// misread, which is the right failure for a cache.
@@ -124,21 +126,144 @@ fn better(a: &RemoteHead, b: &RemoteHead) -> std::cmp::Ordering {
         .then(a.stem.cmp(&b.stem))
 }
 
-/// Pack a directory tree into a gzipped tar.
+/// A writer that hashes and counts everything written through it.
+///
+/// What lets [`pack`] stream the archive out while still knowing its content
+/// hash: the digest of the streamed bytes is the digest of the whole archive.
+struct Digesting<W> {
+    inner: W,
+    hasher: xxhash_rust::xxh3::Xxh3,
+    len: u64,
+}
+
+impl<W> Digesting<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            hasher: xxhash_rust::xxh3::Xxh3::new(),
+            len: 0,
+        }
+    }
+
+    /// The content hash, as the snapshot key and meta spell it.
+    fn hash(&self) -> String {
+        format!("{:016x}", self.hasher.digest())
+    }
+}
+
+impl<W: std::io::Write> std::io::Write for Digesting<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        let written = buf
+            .get(..n)
+            .ok_or_else(|| std::io::Error::other("writer reported more bytes than it was given"))?;
+        self.hasher.update(written);
+        self.len += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Pack a directory tree into a gzipped tar written to `out`: the digesting
+/// writer it was written through, and the uncompressed size.
 ///
 /// Symlinks are archived as symlinks rather than followed, so a slot that has
 /// acquired a link out of the tree does not publish whatever it points at to
 /// every machine that picks the snapshot up.
-fn pack(dir: &Path) -> anyhow::Result<(Vec<u8>, u64)> {
+fn pack<W: std::io::Write>(dir: &Path, out: W) -> anyhow::Result<(Digesting<W>, u64)> {
     let mut bytes = 0u64;
-    let buf = Vec::new();
-    let enc = flate2::write::GzEncoder::new(buf, flate2::Compression::default());
+    let enc = flate2::write::GzEncoder::new(Digesting::new(out), flate2::Compression::default());
     let mut tar = tar::Builder::new(enc);
     tar.follow_symlinks(false);
 
     append_dir(&mut tar, dir, Path::new(""), &mut bytes)?;
     let enc = tar.into_inner().context("finish scratch tar")?;
     Ok((enc.finish().context("finish scratch gzip")?, bytes))
+}
+
+/// A snapshot packed into an anonymous temp file, rewound to its start.
+struct Packed {
+    file: std::fs::File,
+    /// Content hash of the archive, as the key and meta spell it.
+    hash: String,
+    /// Compressed size: what the upload moves.
+    len: u64,
+    /// Uncompressed size, for the meta.
+    bytes: u64,
+}
+
+/// Pack `dir` into a temp file beside it, hashing the archive on the way out.
+fn pack_to_temp(dir: &Path) -> anyhow::Result<Packed> {
+    let out = std::io::BufWriter::with_capacity(SNAPSHOT_STREAM_BUF, temp_file_beside(dir)?);
+    let (digest, bytes) = pack(dir, out)?;
+    let hash = digest.hash();
+    let mut file = digest
+        .inner
+        .into_inner()
+        .map_err(std::io::IntoInnerError::into_error)
+        .context("flush scratch snapshot temp file")?;
+    file.seek(std::io::SeekFrom::Start(0))
+        .context("rewind scratch snapshot temp file")?;
+    Ok(Packed {
+        file,
+        hash,
+        len: digest.len,
+        bytes,
+    })
+}
+
+/// Download `key` from `source` and unpack it into `dir`: the bytes
+/// downloaded.
+///
+/// The archive goes to a temp file beside `dir` first and is unpacked only once
+/// the download completed, so a transfer that dies part way leaves `dir`
+/// exactly as it was.
+async fn pull_snapshot(source: &ScratchSource<'_>, key: &str, dir: &Path) -> anyhow::Result<u64> {
+    let mut dest = tokio::io::BufWriter::with_capacity(
+        SNAPSHOT_STREAM_BUF,
+        tokio::fs::File::from_std(temp_file_beside(dir)?),
+    );
+    let n = source
+        .read_snapshot_into(key, &mut dest)
+        .await
+        .with_context(|| format!("read scratch snapshot {key}"))?
+        .ok_or_else(|| anyhow::anyhow!("scratch snapshot {key} vanished"))?;
+    dest.flush()
+        .await
+        .with_context(|| format!("write scratch snapshot {key} locally"))?;
+    let mut file = dest.into_inner().into_std().await;
+
+    let dir = dir.to_path_buf();
+    hcore::blocking::run(move || {
+        file.seek(std::io::SeekFrom::Start(0))
+            .context("rewind scratch snapshot temp file")
+            .and_then(|_| unpack(file, &dir))
+            .map_err(std::io::Error::other)
+    })
+    .await
+    .context("unpack scratch snapshot")?;
+    Ok(n)
+}
+
+/// An anonymous temp file next to `dir`, never inside it.
+///
+/// Beside the directory rather than in memory, because a snapshot is a whole
+/// compressed cache; and beside it rather than in it, so neither a pack nor a
+/// failed download ever touches the tree itself. Anonymous, so a process that
+/// dies mid-transfer leaves nothing behind.
+fn temp_file_beside(dir: &Path) -> anyhow::Result<std::fs::File> {
+    match dir.parent() {
+        Some(parent) => {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create scratch lineage dir {parent:?}"))?;
+            tempfile::tempfile_in(parent)
+                .with_context(|| format!("create scratch snapshot temp file in {parent:?}"))
+        }
+        None => tempfile::tempfile().context("create scratch snapshot temp file"),
+    }
 }
 
 /// Recursively append `dir`'s contents to `tar` under `rel`.
@@ -188,9 +313,9 @@ fn append_dir<W: std::io::Write>(
 }
 
 /// Unpack a gzipped tar into `dir`, which is created if absent.
-fn unpack(bytes: &[u8], dir: &Path) -> anyhow::Result<()> {
+fn unpack(archive: impl std::io::Read, dir: &Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(dir)?;
-    let dec = flate2::read::GzDecoder::new(bytes);
+    let dec = flate2::read::GzDecoder::new(archive);
     let mut archive = tar::Archive::new(dec);
     archive.set_overwrite(true);
     archive
@@ -275,19 +400,7 @@ impl Engine {
             .find(|s| s.name() == head.cache)
             .ok_or_else(|| anyhow::anyhow!("remote cache `{}` is gone or paused", head.cache))?;
 
-        let key = format!("{}.tar.gz", head.stem);
-        let bytes = source
-            .read_snapshot(&key)
-            .await
-            .with_context(|| format!("read scratch snapshot {key}"))?
-            .ok_or_else(|| anyhow::anyhow!("scratch snapshot {key} vanished"))?;
-
-        let dir = dir.to_path_buf();
-        let n = bytes.len() as u64;
-        hcore::blocking::run(move || unpack(&bytes, &dir).map_err(std::io::Error::other))
-            .await
-            .context("unpack scratch snapshot")?;
-        Ok(n)
+        pull_snapshot(source, &format!("{}.tar.gz", head.stem), dir).await
     }
 
     /// Publish `dir` as the next generation of `scope`'s lineage.
@@ -309,8 +422,12 @@ impl Engine {
         }
 
         let d = dir.to_path_buf();
-        let (blob, bytes) =
-            hcore::blocking::run(move || pack(&d).map_err(std::io::Error::other)).await?;
+        let Packed {
+            file,
+            hash,
+            len: blob_len,
+            bytes,
+        } = hcore::blocking::run(move || pack_to_temp(&d).map_err(std::io::Error::other)).await?;
 
         // `parent + 1` within this scope. A first publish — or one whose parent
         // came from another lineage — starts this scope at 0, because a
@@ -332,7 +449,6 @@ impl Engine {
             produced_at: dir.to_string_lossy().into_owned(),
         };
 
-        let hash = format!("{:016x}", xxhash_rust::xxh3::xxh3_64(&blob));
         // Nothing to publish: this lineage already holds exactly these bytes.
         // Skipping keeps a no-op CI run from adding a generation that says
         // nothing, which would otherwise make the chain grow with every build.
@@ -346,31 +462,43 @@ impl Engine {
         };
         let meta_bytes = borsh::to_vec(&meta).context("encode scratch snapshot meta")?;
 
+        let mut blob = tokio::io::BufReader::with_capacity(
+            SNAPSHOT_STREAM_BUF,
+            tokio::fs::File::from_std(file),
+        );
         for (name, backend) in &backends {
             // Payload first, meta last. A reader only ever discovers an entry via
             // its meta, so a half-finished publish is invisible rather than a
             // head pointing at bytes that are not there yet.
-            write_all(backend.as_ref(), &format!("{stem}.tar.gz"), &blob)
+            blob.seek(std::io::SeekFrom::Start(0))
+                .await
+                .context("rewind scratch snapshot temp file")?;
+            write_all(backend.as_ref(), &format!("{stem}.tar.gz"), &mut blob)
                 .await
                 .with_context(|| format!("upload scratch snapshot to `{name}`"))?;
-            write_all(backend.as_ref(), &format!("{stem}.meta"), &meta_bytes)
-                .await
-                .with_context(|| format!("upload scratch meta to `{name}`"))?;
+            write_all(
+                backend.as_ref(),
+                &format!("{stem}.meta"),
+                &mut meta_bytes.as_slice(),
+            )
+            .await
+            .with_context(|| format!("upload scratch meta to `{name}`"))?;
         }
         // Recorded locally so the next publish knows its parent, and so an
         // unchanged re-publish is recognized above.
         write_local_meta(&self.home, slot, scope, &meta);
-        Ok((generation, blob.len() as u64))
+        Ok((generation, blob_len))
     }
 }
 
+/// Stream `src` to `key` on `backend`, whole.
 async fn write_all(
     backend: &dyn RemoteCacheBackend,
     key: &str,
-    bytes: &[u8],
+    src: &mut (impl tokio::io::AsyncBufRead + Unpin + ?Sized),
 ) -> anyhow::Result<()> {
     let mut w = backend.open_write(key).await?;
-    tokio::io::AsyncWriteExt::write_all(&mut w, bytes).await?;
+    tokio::io::copy_buf(src, &mut w).await?;
     tokio::io::AsyncWriteExt::shutdown(&mut w).await?;
     Ok(())
 }
@@ -537,9 +665,9 @@ mod tests {
         std::fs::write(src.join("sub").join("f"), b"contents").expect("write");
         std::os::unix::fs::symlink("elsewhere", src.join("link")).expect("symlink");
 
-        let (blob, bytes) = pack(&src).expect("pack");
+        let (blob, bytes) = pack(&src, Vec::new()).expect("pack");
         assert_eq!(bytes, 8);
-        unpack(&blob, &dst).expect("unpack");
+        unpack(blob.inner.as_slice(), &dst).expect("unpack");
 
         assert_eq!(
             std::fs::read(dst.join("sub").join("f")).expect("read"),
@@ -552,6 +680,167 @@ mod tests {
         assert_eq!(
             std::fs::read_link(dst.join("link")).expect("readlink"),
             Path::new("elsewhere")
+        );
+    }
+
+    /// The hash of the streamed archive is the hash of the whole archive, so a
+    /// snapshot's key and meta are what hashing it in memory gave.
+    #[test]
+    fn the_streamed_digest_is_the_digest_of_the_whole_archive() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("lineage").join("head");
+        std::fs::create_dir_all(src.join("sub")).expect("mkdir");
+        for i in 0..64 {
+            // Enough incompressible-ish content to span many writes.
+            let body: Vec<u8> = (0..4096u32).map(|b| (b * 31 + i) as u8).collect();
+            std::fs::write(src.join("sub").join(format!("f{i}")), body).expect("write");
+        }
+
+        let (digest, _) = pack(&src, Vec::new()).expect("pack");
+        assert_eq!(
+            digest.hash(),
+            format!("{:016x}", xxhash_rust::xxh3::xxh3_64(&digest.inner))
+        );
+        assert_eq!(digest.len, digest.inner.len() as u64);
+
+        let mut packed = pack_to_temp(&src).expect("pack to temp");
+        assert_eq!(packed.hash, digest.hash(), "same tree, same archive");
+        assert_eq!(packed.len, digest.len);
+        let mut on_disk = Vec::new();
+        std::io::Read::read_to_end(&mut packed.file, &mut on_disk).expect("read temp");
+        assert_eq!(on_disk, digest.inner, "the temp file holds the archive");
+        assert_eq!(
+            std::fs::read_dir(tmp.path().join("lineage"))
+                .expect("ls lineage")
+                .count(),
+            1,
+            "the temp file is anonymous: nothing but `head` in the lineage",
+        );
+    }
+
+    /// Backend serving one object, optionally dying after `fail_after` bytes of
+    /// its body.
+    struct OneObject {
+        body: Vec<u8>,
+        fail_after: Option<usize>,
+    }
+
+    /// A body that errors on its first read.
+    struct Broken;
+
+    impl tokio::io::AsyncRead for Broken {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::Error::other("connection reset")))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RemoteCacheBackend for OneObject {
+        async fn open_read(
+            &self,
+            _key: &str,
+        ) -> anyhow::Result<Option<std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>>> {
+            let r: std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>> = match self.fail_after {
+                None => Box::pin(std::io::Cursor::new(self.body.clone())),
+                Some(n) => Box::pin(tokio::io::AsyncReadExt::chain(
+                    std::io::Cursor::new(self.body.get(..n).expect("prefix").to_vec()),
+                    Broken,
+                )),
+            };
+            Ok(Some(r))
+        }
+        async fn open_write(
+            &self,
+            _key: &str,
+        ) -> anyhow::Result<std::pin::Pin<Box<dyn tokio::io::AsyncWrite + Send>>> {
+            anyhow::bail!("read-only")
+        }
+        async fn exists(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        async fn list_names(&self, _prefix: &str) -> anyhow::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn packed_tree(root: &Path) -> Vec<u8> {
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).expect("mkdir");
+        std::fs::write(src.join("new"), b"from the snapshot").expect("write");
+        pack(&src, Vec::new()).expect("pack").0.inner
+    }
+
+    #[tokio::test]
+    async fn a_pull_unpacks_what_it_downloaded() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let body = packed_tree(tmp.path());
+        let len = body.len() as u64;
+        let set = crate::engine::remote_cache::RemoteCacheSet::with_backend(
+            std::sync::Arc::new(OneObject {
+                body,
+                fail_after: None,
+            }),
+            tmp.path().to_path_buf(),
+        );
+        let sources = set.scratch_sources().await;
+        let dir = tmp.path().join("lineage").join("head");
+
+        let n = pull_snapshot(&sources[0], "k.tar.gz", &dir)
+            .await
+            .expect("pull");
+        assert_eq!(n, len, "reports the bytes downloaded");
+        assert_eq!(
+            std::fs::read(dir.join("new")).expect("read"),
+            b"from the snapshot"
+        );
+        assert_eq!(
+            std::fs::read_dir(tmp.path().join("lineage"))
+                .expect("ls lineage")
+                .count(),
+            1,
+            "no temp file is left beside `head`",
+        );
+    }
+
+    /// A transfer that dies part way must leave the directory exactly as it was:
+    /// the archive is unpacked only once it is whole.
+    #[tokio::test]
+    async fn a_download_that_dies_midway_leaves_the_dir_untouched() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let body = packed_tree(tmp.path());
+        let half = body.len() / 2;
+        let set = crate::engine::remote_cache::RemoteCacheSet::with_backend(
+            std::sync::Arc::new(OneObject {
+                body,
+                fail_after: Some(half),
+            }),
+            tmp.path().to_path_buf(),
+        );
+        let sources = set.scratch_sources().await;
+        let lineage = tmp.path().join("lineage");
+        let dir = lineage.join("head");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join("old"), b"was here").expect("write");
+
+        let err = pull_snapshot(&sources[0], "k.tar.gz", &dir)
+            .await
+            .expect_err("the body fails half way");
+        assert!(format!("{err:#}").contains("connection reset"), "{err:#}");
+
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .expect("ls head")
+            .map(|e| e.expect("entry").file_name())
+            .collect();
+        assert_eq!(names, ["old"], "nothing was unpacked");
+        assert_eq!(std::fs::read(dir.join("old")).expect("read"), b"was here");
+        assert_eq!(
+            std::fs::read_dir(&lineage).expect("ls lineage").count(),
+            1,
+            "no temp file is left beside `head`",
         );
     }
 

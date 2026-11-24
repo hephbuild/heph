@@ -202,6 +202,25 @@ where
 /// tell its own residue from anything else that ends up in the directory.
 const TEMP_BLOB_EXT: &str = "blob";
 
+/// Write buffer in front of a downloading blob's temp file. Bounded memory: one
+/// per in-flight download, and downloads are capped by the bulk slots.
+const BLOB_TEMP_WRITE_BUFFER: usize = 1 << 20;
+
+/// The smallest such buffer: `tokio::io::copy`'s own chunk, below which a
+/// buffer saves no write.
+const BLOB_TEMP_WRITE_BUFFER_MIN: usize = 8 * 1024;
+
+/// The write buffer for a blob the manifest says is `size` bytes: no larger
+/// than the blob, so a small blob does not allocate a whole
+/// [`BLOB_TEMP_WRITE_BUFFER`], and never under [`BLOB_TEMP_WRITE_BUFFER_MIN`].
+/// `size` is the decoded size; the stored bytes of a zstd blob are usually
+/// fewer, and a buffer that ends up a little short costs one more write.
+fn blob_temp_write_buffer(size: u64) -> usize {
+    usize::try_from(size)
+        .unwrap_or(usize::MAX)
+        .clamp(BLOB_TEMP_WRITE_BUFFER_MIN, BLOB_TEMP_WRITE_BUFFER)
+}
+
 /// A transient file under `remote-tmp`, unlinked when dropped.
 ///
 /// Every temp here is consumed and discarded within the operation that made it —
@@ -1004,6 +1023,10 @@ impl RemoteRevision {
     }
 }
 
+/// Buffer a scratch snapshot is streamed through, both ways: what a pull or a
+/// push holds in memory instead of the whole archive.
+pub(crate) const SNAPSHOT_STREAM_BUF: usize = 128 * 1024;
+
 /// One readable cache as the scratch lineage reads it, handed out by
 /// [`RemoteCacheSet::scratch_sources`].
 ///
@@ -1061,13 +1084,28 @@ impl ScratchSource<'_> {
             .await
     }
 
-    /// A snapshot, whole. `None` when it is absent.
+    /// A snapshot, streamed into `dest`: the number of bytes written, or `None`
+    /// when it is absent.
+    ///
+    /// Streamed rather than returned whole because a snapshot is a whole
+    /// compressed cache, and holding one in memory makes the peak RSS of a pull
+    /// the size of the cache.
     ///
     /// Read as a blob is: a bulk slot held for the stream, the open under
     /// [`METADATA_TIMEOUT`] (it is a round trip with no body yet), and the body
     /// under the backend's inactivity bound, which a large snapshot on a slow
     /// link can outlast legitimately and a stalled one cannot.
-    pub async fn read_snapshot(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+    ///
+    /// A failure to write `dest` is reported but not held against the cache:
+    /// only the remote side's failures feed its breaker.
+    pub async fn read_snapshot_into<W>(
+        &self,
+        key: &str,
+        dest: &mut W,
+    ) -> anyhow::Result<Option<u64>>
+    where
+        W: AsyncWrite + Unpin + ?Sized,
+    {
         let read = async {
             observe_transfer_slots(self.cache);
             let _slot = self
@@ -1086,13 +1124,33 @@ impl ScratchSource<'_> {
             let Some(mut r) = opened else {
                 return Ok(None);
             };
-            let mut buf = Vec::new();
-            tokio::io::AsyncReadExt::read_to_end(&mut r, &mut buf)
-                .await
-                .with_context(|| format!("download remote scratch snapshot {key}"))?;
-            Ok(Some(buf))
+            // Copied by hand rather than with `tokio::io::copy` so a local write
+            // failure is told apart from a remote one: it ends the copy as an
+            // `Ok` the breaker does not count.
+            let mut buf = vec![0u8; SNAPSHOT_STREAM_BUF];
+            let mut written = 0u64;
+            loop {
+                let n = tokio::io::AsyncReadExt::read(&mut r, &mut buf)
+                    .await
+                    .with_context(|| format!("download remote scratch snapshot {key}"))?;
+                if n == 0 {
+                    break;
+                }
+                let chunk = buf.get(..n).context("short read from scratch snapshot")?;
+                if let Err(e) = dest.write_all(chunk).await {
+                    return Ok(Some(Err(e)));
+                }
+                written += n as u64;
+            }
+            Ok(Some(Ok(written)))
         };
-        self.checked("scratch pull", read).await
+        match self.checked("scratch pull", read).await? {
+            None => Ok(None),
+            Some(Ok(written)) => Ok(Some(written)),
+            Some(Err(e)) => {
+                Err(e).with_context(|| format!("write remote scratch snapshot {key} locally"))
+            }
+        }
     }
 
     /// Run `fut` unless the breaker opened since this source was handed out,
@@ -1683,9 +1741,24 @@ impl RemoteCacheSet {
         // future — unlinks the partial temp through `TempBlob`'s drop.
         let temp = TempBlob::new(dest_dir);
         // Temp-file I/O is local and genuinely fatal — propagate.
-        let mut file = tokio::fs::File::create(temp.path())
+        //
+        // Buffered because `tokio::io::copy` writes in 8 KiB chunks and every
+        // `poll_write` on a bare `tokio::fs::File` is a `spawn_blocking` round
+        // trip: ~131k blocking-pool dispatches per GiB pulled. The buffer turns
+        // that into one per MiB, or one per reader stall (`copy` flushes when
+        // the reader is pending). `shutdown` below flushes the tail.
+        let file = tokio::fs::File::create(temp.path())
             .await
             .with_context(|| format!("create temp for remote blob {name}"))?;
+        // Sized to the blob when the manifest says it is smaller than the
+        // buffer; a name it does not list (callers check first) gets the whole.
+        let buffer = rev
+            .manifest
+            .artifacts
+            .iter()
+            .find(|a| a.name == name)
+            .map_or(BLOB_TEMP_WRITE_BUFFER, |a| blob_temp_write_buffer(a.size));
+        let mut file = tokio::io::BufWriter::with_capacity(buffer, file);
         let mut reader = reader;
         // Race the transfer against cancellation. Without this a Ctrl-C during a
         // large pull is ignored until the copy ends — and the copy is exactly
@@ -2718,6 +2791,105 @@ mod tests {
             backend.lists.load(Ordering::SeqCst),
             FAILURE_THRESHOLD,
             "no request reaches a paused cache",
+        );
+    }
+
+    /// Backend serving one healthy object for every key.
+    struct OneBodyBackend(Vec<u8>);
+
+    #[async_trait]
+    impl RemoteCacheBackend for OneBodyBackend {
+        async fn open_read(
+            &self,
+            _key: &str,
+        ) -> anyhow::Result<Option<Pin<Box<dyn AsyncRead + Send>>>> {
+            Ok(Some(Box::pin(std::io::Cursor::new(self.0.clone()))))
+        }
+        async fn open_write(&self, _key: &str) -> anyhow::Result<Pin<Box<dyn AsyncWrite + Send>>> {
+            anyhow::bail!("read-only")
+        }
+        async fn exists(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        async fn list_names(&self, _prefix: &str) -> anyhow::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// A local sink that accepts `room` bytes, then fails every write.
+    struct FullDisk {
+        room: usize,
+    }
+
+    impl AsyncWrite for FullDisk {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            if self.room == 0 {
+                return std::task::Poll::Ready(Err(std::io::Error::other("no space left")));
+            }
+            let n = buf.len().min(self.room);
+            self.room -= n;
+            std::task::Poll::Ready(Ok(n))
+        }
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A snapshot pull that fails on the local side — the disk filled up part
+    /// way — names the local write, and is not held against the cache: the
+    /// remote served every byte asked of it, so the breaker must not count it.
+    ///
+    /// Counted, `FAILURE_THRESHOLD` full disks in a row would pause a healthy
+    /// cache for every artifact and scratch read in the run.
+    #[tokio::test]
+    async fn a_local_write_failure_on_a_snapshot_pull_spares_the_breaker() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let body = vec![7u8; 3 * SNAPSHOT_STREAM_BUF];
+        let set =
+            RemoteCacheSet::with_backend(Arc::new(OneBodyBackend(body)), dir.path().to_path_buf());
+        let sources = set.scratch_sources().await;
+        assert_eq!(sources.len(), 1);
+
+        for _ in 0..FAILURE_THRESHOLD {
+            let mut dest = FullDisk {
+                room: SNAPSHOT_STREAM_BUF + 17,
+            };
+            let err = sources[0]
+                .read_snapshot_into("k.tar.gz", &mut dest)
+                .await
+                .expect_err("the local sink fills up part way");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("write remote scratch snapshot k.tar.gz locally")
+                    && msg.contains("no space left"),
+                "the error names the local write and its cause: {msg}",
+            );
+        }
+
+        let cache = set.caches.first().expect("one cache");
+        assert_eq!(
+            cache.health.consecutive_failures.load(Ordering::Relaxed),
+            0,
+            "a local write failure is not a remote failure",
+        );
+        assert!(!cache.broken(), "the breaker stays closed");
+        assert_eq!(
+            set.scratch_sources().await.len(),
+            1,
+            "the cache is still handed to the scratch lineage",
         );
     }
 
@@ -4140,6 +4312,67 @@ mod tests {
                 .expect("blob present");
             assert_eq!(&std::fs::read(temp.path()).expect("read"), want, "{name}");
         }
+    }
+
+    /// A small blob gets a buffer its own size, not a whole MiB; a tiny one
+    /// gets the floor, and a large one the cap.
+    #[test]
+    fn a_blob_temp_buffer_is_sized_to_the_blob_within_bounds() {
+        assert_eq!(blob_temp_write_buffer(0), BLOB_TEMP_WRITE_BUFFER_MIN);
+        assert_eq!(blob_temp_write_buffer(100), BLOB_TEMP_WRITE_BUFFER_MIN);
+        assert_eq!(blob_temp_write_buffer(100_000), 100_000);
+        assert_eq!(
+            blob_temp_write_buffer(BLOB_TEMP_WRITE_BUFFER as u64),
+            BLOB_TEMP_WRITE_BUFFER
+        );
+        assert_eq!(blob_temp_write_buffer(u64::MAX), BLOB_TEMP_WRITE_BUFFER);
+    }
+
+    /// A blob larger than the temp file's write buffer, whose size is not a
+    /// multiple of it, lands whole: the buffered tail is flushed before the
+    /// temp is handed back.
+    #[tokio::test]
+    async fn a_blob_larger_than_the_write_buffer_lands_whole() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let addr = addr();
+        let len = 3 * BLOB_TEMP_WRITE_BUFFER + 12_345;
+        let blob: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let manifest = RemoteManifest {
+            version: REMOTE_MANIFEST_VERSION.to_string(),
+            target: addr.format(),
+            hashin: "h".to_string(),
+            artifacts: vec![remote_artifact(
+                "big.tar",
+                len as u64,
+                ManifestArtifactEncoding::None,
+            )],
+        };
+        let mut objects = std::collections::HashMap::new();
+        objects.insert(
+            RemoteCacheSet::key(&addr, "h", MANIFEST_V2),
+            borsh::to_vec(&manifest).expect("serialize manifest"),
+        );
+        objects.insert(RemoteCacheSet::key(&addr, "h", "big.tar"), blob.clone());
+        let backend = Arc::new(ReadProbeBackend {
+            objects,
+            in_flight: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+        });
+        let set = set_with(backend, dir.path().to_path_buf());
+
+        let rev = set
+            .fetch_manifest(&never(), &addr, "h")
+            .await
+            .expect("fetch manifest")
+            .expect("hit");
+        let temp = set
+            .fetch_blob(&never(), &rev, &addr, "h", "big.tar", dir.path())
+            .await
+            .expect("fetch blob")
+            .expect("blob present");
+        let got = std::fs::read(temp.path()).expect("read temp");
+        assert_eq!(got.len(), len, "every byte, the buffered tail included");
+        assert!(got == blob, "blob bytes must round-trip unchanged");
     }
 
     /// A v2 manifest naming a gzip blob is a miss: downloads store bytes

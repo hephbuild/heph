@@ -1329,9 +1329,10 @@ impl Engine {
     /// from `exists`. `exists` waits out the queue, so using it here re-parked
     /// the worker in precisely the case the cap exists to prevent, while the
     /// `warn!` claimed the opposite. The case is reachable rather than
-    /// hypothetical: `SpillWriter::spill` re-arms the pending map twice for one
-    /// key (a write, then a `delete`) every time a blob crosses the spill
-    /// threshold.
+    /// hypothetical: every write or delete queued for the key re-arms its
+    /// pending slot, so writers of one key that keep queueing (a rewrite that
+    /// spills and drops a stale primary copy queues a delete after the earlier
+    /// write) can outlast any fixed number of waits.
     pub(crate) async fn exists_local(
         &self,
         addr: &Addr,

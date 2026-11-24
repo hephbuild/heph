@@ -1611,8 +1611,10 @@ pub enum OutputMatcher {
 
 struct ExecuteOptions<'a> {
     hashin: &'a String,
-    spec: &'a TargetSpec,
-    def: &'a LinkedTargetDef,
+    /// Shared, not borrowed plainly: the memoizer closures below need owned,
+    /// `'static` copies, and an `Arc::clone` is all that costs.
+    spec: &'a Arc<TargetSpec>,
+    def: &'a Arc<LinkedTargetDef>,
     force: bool,
     interactive: Option<InteractiveWrapper>,
     shell: bool,
@@ -3182,7 +3184,7 @@ impl Engine {
                 let link_fut = Arc::clone(&self).link(rs.clone(), def.target_def.clone());
                 let meta_fut = Arc::clone(&self).meta(rs.clone(), addr);
                 let (link_res, meta_res) = tokio::join!(link_fut, meta_fut);
-                let def = link_res.with_context(|| "link")?;
+                let def = Arc::new(link_res.with_context(|| "link")?);
                 let meta = meta_res.with_context(|| "meta")?;
 
                 let output_names = match outputs {
@@ -3207,7 +3209,7 @@ impl Engine {
                         output_names,
                         &ExecuteOptions {
                             hashin: &meta.hashin,
-                            spec: &spec,
+                            spec: &spec.spec,
                             def: &def,
                             force,
                             interactive: opts.interactive.clone(),
@@ -3849,9 +3851,9 @@ impl Engine {
         // Filled only if this call creates the cell. See `GuardSlot`.
         let handoff = Handoff::default();
         // Owned copies so the memoizer closure is `'static`.
-        let def_owned = opts.def.clone();
+        let def_owned = Arc::clone(opts.def);
         let hashin = opts.hashin.clone();
-        let spec = opts.spec.clone();
+        let spec = Arc::clone(opts.spec);
         // Whichever caller creates the cell decides `force` and `no_scratch` for
         // every later one. On a selector run neither is per-caller for a
         // selected target: both come from the request's `Selection` (see
@@ -4364,7 +4366,7 @@ impl Engine {
         let can_cache =
             !opts.force && !opts.no_scratch && opts.def.target.cache.enabled && !opts.shell;
         let engine = Arc::clone(self);
-        let def = opts.def.clone();
+        let def = Arc::clone(opts.def);
         let hashin = opts.hashin.clone();
         let cached = cached.to_vec();
         rs.data
@@ -5130,8 +5132,8 @@ impl Engine {
     ) -> anyhow::Result<(Vec<ResultArtifact>, Vec<ArtifactMeta>)> {
         let addr = opts.def.target.addr.clone();
         let hashin = opts.hashin.clone();
-        let spec = opts.spec.clone();
-        let def = opts.def.clone();
+        let spec = Arc::clone(opts.spec);
+        let def = Arc::clone(opts.def);
         let use_tmp_cache = !opts.def.target.cache.enabled || opts.shell;
         let interactive = opts.interactive.clone();
         let shell = opts.shell;

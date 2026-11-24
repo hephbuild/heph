@@ -1104,17 +1104,36 @@ fn remote_engine(
     scope: &str,
     fallbacks: &[&str],
 ) -> Arc<heph::engine::Engine> {
+    remote_engine_with(root, &[remote_uri], scope, fallbacks)
+}
+
+/// [`remote_engine`] with one read+write remote cache per URI, named
+/// `shared`, `shared1`, `shared2`, … in order.
+fn remote_engine_with(
+    root: &std::path::Path,
+    remote_uris: &[&str],
+    scope: &str,
+    fallbacks: &[&str],
+) -> Arc<heph::engine::Engine> {
     use heph::engine::{Config, Engine, RemoteCacheDef, ScratchOptions};
     let mut e = Engine::new(Config {
-        remote_caches: vec![RemoteCacheDef {
-            name: "shared".to_string(),
-            uri: remote_uri.to_string(),
-            read: true,
-            write: true,
-            concurrency: 10,
-            endpoint: None,
-            region: None,
-        }],
+        remote_caches: remote_uris
+            .iter()
+            .enumerate()
+            .map(|(i, uri)| RemoteCacheDef {
+                name: if i == 0 {
+                    "shared".to_string()
+                } else {
+                    format!("shared{i}")
+                },
+                uri: (*uri).to_string(),
+                read: true,
+                write: true,
+                concurrency: 10,
+                endpoint: None,
+                region: None,
+            })
+            .collect(),
         scratch: ScratchOptions {
             scope: scope.to_string(),
             restore_scopes: fallbacks.iter().map(|s| s.to_string()).collect(),
@@ -1320,6 +1339,83 @@ async fn publishing_advances_the_lineage_and_skips_unchanged_contents() -> anyho
         .await
         .expect("a head");
     assert_eq!(head.meta.generation, 1, "the newest generation wins");
+    Ok(())
+}
+
+/// Every file under `dir` whose name ends in `suffix`, recursively.
+fn files_ending(dir: &std::path::Path, suffix: &str) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d).expect("read remote dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.to_string_lossy().ends_with(suffix) {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
+/// A publish to several writable caches uploads the same archive to each.
+///
+/// The archive is packed once, into a temp file, and streamed to every backend
+/// in turn: each upload has to start from the beginning of that file. One that
+/// did not would hand the second cache an empty (or truncated) blob under a key
+/// and meta that promise the whole archive.
+#[tokio::test]
+async fn a_publish_uploads_the_whole_archive_to_every_writable_cache() -> anyhow::Result<()> {
+    let first = tempfile::tempdir()?;
+    let second = tempfile::tempdir()?;
+    let uris = [
+        format!("file://{}", first.path().display()),
+        format!("file://{}", second.path().display()),
+    ];
+    let ws = tempfile::tempdir()?;
+    std::fs::create_dir_all(ws.path().join("build"))?;
+    std::fs::create_dir_all(ws.path().join("app"))?;
+    std::fs::write(ws.path().join("build").join("BUILD"), REMOTE_DECL)?;
+    std::fs::write(ws.path().join("app").join("BUILD"), remote_target("both"))?;
+
+    let e = remote_engine_with(ws.path(), &[&uris[0], &uris[1]], "master", &[]);
+    build(&e).await?;
+    let slot = e.scratch_slots()?[0].slot.clone();
+    let dir = heph::engine::scratch_store::head_dir(&e.home, &slot, "master");
+    // Incompressible, so the archive spans several stream buffers and an upload
+    // that started anywhere but the beginning cannot match.
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let bulk: Vec<u8> = (0..512 * 1024)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 56) as u8
+        })
+        .collect();
+    std::fs::write(dir.join("bulk"), bulk)?;
+    let (_, uploaded) = e.scratch_push(&slot, "master", &dir, None, "r1").await?;
+    assert!(
+        uploaded > 256 * 1024,
+        "the archive spans several buffers: {uploaded}"
+    );
+
+    let (in_first, in_second) = (
+        files_ending(first.path(), ".tar.gz"),
+        files_ending(second.path(), ".tar.gz"),
+    );
+    let ([a], [b]) = (&in_first[..], &in_second[..]) else {
+        panic!("one snapshot in each cache: {in_first:?}, {in_second:?}");
+    };
+    let (a, b) = (std::fs::read(a)?, std::fs::read(b)?);
+    assert_eq!(a.len() as u64, uploaded, "the first cache got the archive");
+    assert!(
+        a == b,
+        "both caches hold the same archive: {} vs {} bytes",
+        a.len(),
+        b.len()
+    );
     Ok(())
 }
 
