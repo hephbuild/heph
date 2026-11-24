@@ -144,8 +144,9 @@ fn snake_case(ident: &str) -> String {
 }
 
 /// Codegen shared by `Spec` and `SpecStruct`: for each named field, a statement
-/// pulling its key out of `__m: HashMap<&str, &Value>` (parse or default), the
-/// struct-init fragment, the schema `DriverField`, and the field's `ParamType`.
+/// that reads its key in place from `__m: &HashMap<String, Value>` (parse or
+/// default) and counts a hit, the struct-init fragment, the schema
+/// `DriverField`, and the field's `ParamType`.
 struct FieldCodegen {
     parse_stmts: Vec<proc_macro2::TokenStream>,
     field_inits: Vec<proc_macro2::TokenStream>,
@@ -161,6 +162,9 @@ struct FieldCodegen {
     /// refuses the reference and the author is told their driver does not take
     /// one, when it plainly does.
     any_deferred: bool,
+    /// The config key of every field, in declared order. Distinct: a struct
+    /// that maps two fields to one key fails to compile.
+    keys: Vec<String>,
 }
 
 /// Whether `ty` is a `Deferred<…>`, or a container of one.
@@ -204,6 +208,7 @@ fn field_codegen(
         schema_fields: Vec::new(),
         param_tys: Vec::new(),
         any_deferred: false,
+        keys: Vec::new(),
     };
 
     for field in fields {
@@ -212,6 +217,15 @@ fn field_codegen(
         let opts = parse_field_opts(&field.attrs)?;
         out.any_deferred |= mentions_deferred(fty);
         let key = opts.rename.clone().unwrap_or_else(|| ident.to_string());
+        // Each field reads its key in place, so a second field on the same key
+        // would read the same value and the unknown-key count would be off.
+        if out.keys.contains(&key) {
+            return Err(syn::Error::new_spanned(
+                field,
+                format!("duplicate spec key `{key}`: another field already reads it"),
+            ));
+        }
+        out.keys.push(key.clone());
         let doc = doc_string(&field.attrs);
         let required = opts.required;
 
@@ -249,8 +263,9 @@ fn field_codegen(
 
         let var = quote::format_ident!("__field_{}", ident);
         out.parse_stmts.push(quote! {
-            let #var: #fty = match __m.remove(#key) {
+            let #var: #fty = match __m.get(#key) {
                 ::core::option::Option::Some(__v) => {
+                    __hits += 1;
                     (#parse_call).with_context(|| ::std::format!("parse `{}`", #key))?
                 }
                 #absent_arm
@@ -271,11 +286,30 @@ fn field_codegen(
     Ok(out)
 }
 
-/// The unknown-leftover-key guard shared by `Spec` / `SpecStruct`.
-fn unknown_keys_check() -> proc_macro2::TokenStream {
+/// The field parse statements of `Spec` / `SpecStruct`, then the unknown-key
+/// guard: each field reads its key in place from `__m` and counts a hit, so
+/// the config has an unknown key exactly when it holds more keys than were
+/// hit. Only then are the keys checked against the known ones, so a valid
+/// config costs one lookup per field and no map of its own.
+fn parse_body(cg: &FieldCodegen) -> proc_macro2::TokenStream {
+    let parse_stmts = &cg.parse_stmts;
+    let keys = &cg.keys;
+    // A struct with no fields never counts a hit.
+    let hits = if keys.is_empty() {
+        quote! { let __hits: usize = 0; }
+    } else {
+        quote! { let mut __hits: usize = 0; }
+    };
     quote! {
-        if !__m.is_empty() {
-            let mut __unknown: ::std::vec::Vec<&str> = __m.into_keys().collect();
+        #hits
+        #(#parse_stmts)*
+        if __hits != __m.len() {
+            const __KNOWN: &[&str] = &[ #(#keys),* ];
+            let mut __unknown: ::std::vec::Vec<&str> = __m
+                .keys()
+                .map(::std::string::String::as_str)
+                .filter(|__k| !__KNOWN.contains(__k))
+                .collect();
             __unknown.sort_unstable();
             ::anyhow::bail!("unknown entries found: {:?}", __unknown);
         }
@@ -315,14 +349,13 @@ fn expand_spec(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     let name = &input.ident;
     let fields = named_fields(&input, "Spec")?;
     let cg = field_codegen(fields)?;
+    let body = parse_body(&cg);
     let FieldCodegen {
-        parse_stmts,
         field_inits,
         schema_fields,
         any_deferred,
         ..
     } = cg;
-    let unknown = unknown_keys_check();
 
     Ok(quote! {
         impl #name {
@@ -340,11 +373,9 @@ fn expand_spec(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                 __config: &::std::collections::HashMap<::std::string::String, crate::htvalue::Value>,
             ) -> ::anyhow::Result<Self> {
                 use ::anyhow::Context as _;
-                let mut __m: ::std::collections::HashMap<&str, &crate::htvalue::Value> =
-                    __config.iter().map(|(__k, __v)| (__k.as_str(), __v)).collect();
+                let __m = __config;
 
-                #(#parse_stmts)*
-                #unknown
+                #body
 
                 ::core::result::Result::Ok(Self { #(#field_inits),* })
             }
@@ -376,29 +407,25 @@ fn expand_spec_struct(input: DeriveInput) -> syn::Result<proc_macro2::TokenStrea
     let name = &input.ident;
     let fields = named_fields(&input, "SpecStruct")?;
     let cg = field_codegen(fields)?;
+    let body = parse_body(&cg);
     let FieldCodegen {
-        parse_stmts,
         field_inits,
         param_tys,
         ..
     } = cg;
-    let unknown = unknown_keys_check();
 
     Ok(quote! {
         impl crate::htspec::FromSpecValue for #name {
             fn from_spec_value(__value: &crate::htvalue::Value) -> ::anyhow::Result<Self> {
                 use ::anyhow::Context as _;
-                let __map = match __value {
+                let __m = match __value {
                     crate::htvalue::Value::Map(__m) => __m,
                     __other => ::anyhow::bail!(
                         "invalid: expected a map, got: {:?}", __other
                     ),
                 };
-                let mut __m: ::std::collections::HashMap<&str, &crate::htvalue::Value> =
-                    __map.iter().map(|(__k, __v)| (__k.as_str(), __v)).collect();
 
-                #(#parse_stmts)*
-                #unknown
+                #body
 
                 ::core::result::Result::Ok(Self { #(#field_inits),* })
             }
@@ -572,4 +599,63 @@ fn expand_spec_union(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    type Expand = fn(DeriveInput) -> syn::Result<proc_macro2::TokenStream>;
+
+    fn expand_err(input: DeriveInput, expand: Expand) -> String {
+        match expand(input) {
+            Ok(_) => panic!("expected the derive to refuse the struct"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    /// Two fields on one key would read the same value: a compile error, for
+    /// a rename onto another field's name and for two equal renames alike.
+    #[test]
+    fn a_duplicate_key_fails_to_compile() {
+        let onto_a_name: DeriveInput = syn::parse_quote! {
+            struct S {
+                out: String,
+                #[spec(rename = "out")]
+                outputs: String,
+            }
+        };
+        let two_renames: DeriveInput = syn::parse_quote! {
+            struct S {
+                #[spec(rename = "k")]
+                a: String,
+                #[spec(rename = "k")]
+                b: String,
+            }
+        };
+        let expanders: [Expand; 2] = [expand_spec, expand_spec_struct];
+        for expand in expanders {
+            assert_eq!(
+                expand_err(onto_a_name.clone(), expand),
+                "duplicate spec key `out`: another field already reads it"
+            );
+            assert_eq!(
+                expand_err(two_renames.clone(), expand),
+                "duplicate spec key `k`: another field already reads it"
+            );
+        }
+    }
+
+    #[test]
+    fn distinct_keys_expand() {
+        let input: DeriveInput = syn::parse_quote! {
+            struct S {
+                out: String,
+                #[spec(rename = "outputs")]
+                o: String,
+            }
+        };
+        expand_spec(input.clone()).expect("Spec expands");
+        expand_spec_struct(input).expect("SpecStruct expands");
+    }
 }

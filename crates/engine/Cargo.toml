@@ -50,7 +50,6 @@ glob = "0.3"
 # ring rustls provider ourselves (see `ensure_rustls_provider_installed`).
 google-cloud-auth = { version = "1.19", default-features = false }
 indexmap = "2"
-memoize = "0.6.0"
 object_store = { version = "0.14.2", features = ["aws", "gcp", "azure", "http", "tokio"] }
 parking_lot = "0.13"
 quick_cache = "0.7"
@@ -96,7 +95,7 @@ smart-default = "0.7.1"
 stacker = "0.1"
 strsim = "0.11.1"
 tar = "0.4"
-tokio = { version = "1.54.1", features = ["rt", "rt-multi-thread", "io-util", "io-std", "process", "macros", "sync", "signal", "fs", "test-util", "tracing", "net"] }
+tokio = { version = "1.54.1", features = ["rt", "rt-multi-thread", "io-util", "io-std", "process", "macros", "sync", "signal", "fs", "time", "tracing", "net"] }
 tokio-util = { version = "0.7.20", features = ["io", "io-util"] }
 tracing = "0.1"
 url = "2.5.8"
@@ -108,10 +107,11 @@ thiserror = "2.0.21"
 libc = "0.2"
 xattr = "1"
 tempfile = "3.27"
-derivative = "2.2.0"
 humantime = "2.4.0"
 
 [dev-dependencies]
 hplugin-buildfile = { package = "plugin-buildfile", path = "../plugin-buildfile" }
 serde-jsonlines = "0.7.0"
 tempfile = "3"
+# The paused clock (`start_paused`, `time::advance`), for tests only.
+tokio = { version = "1.54.1", features = ["test-util"] }

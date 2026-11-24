@@ -43,6 +43,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The cdylib's own tokio runtime. A loaded cdylib's statically-linked tokio is a
 /// separate instance from the host's, so async work that touches the reactor (a
@@ -375,8 +376,9 @@ pub fn named_managed_driver<D: ManagedDriver + 'static>(
 ///
 /// A request id names an engine *request* (`req-{n}`), not a single call — the
 /// whole request subtree shares it — so multiple calls can be in flight under
-/// one id concurrently. Each keeps its own token in the `Vec`; `cancel` trips
-/// them all (a request cancel means the whole subtree stops).
+/// one id concurrently. Each keeps its own token, in its own slot under the id;
+/// `cancel` trips them all (a request cancel means the whole subtree stops),
+/// and a call's guard removes only its own slot.
 ///
 /// A run from a host at 0.19.1 or later is keyed by its own `cancel_key`
 /// instead (in `calls`, through [`enter_call`](Self::enter_call)), so the host
@@ -386,11 +388,15 @@ pub fn named_managed_driver<D: ManagedDriver + 'static>(
 /// request. A key is never parked (see [`cancel`](Self::cancel)).
 #[derive(Default)]
 struct CancelRegistry {
-    inflight: Mutex<HashMap<String, Vec<StdCancellationToken>>>,
+    /// Calls in flight by request id, each in its own slot.
+    inflight: Mutex<HashMap<Arc<str>, HashMap<u64, StdCancellationToken>>>,
+    /// The next slot [`enter`](Self::enter) hands out. Only unique, so it
+    /// orders nothing.
+    next_slot: AtomicU64,
     precancelled: Mutex<HashSet<String>>,
     /// Runs in flight by their cancel key. One token per key: a key names one
     /// call, and a second call under the same key is refused.
-    calls: Mutex<HashMap<String, StdCancellationToken>>,
+    calls: Mutex<HashMap<Arc<str>, StdCancellationToken>>,
 }
 
 impl CancelRegistry {
@@ -401,24 +407,17 @@ impl CancelRegistry {
     /// each key once, and two calls sharing one would cancel each other.
     fn enter_call(self: &Arc<Self>, key: &str) -> Result<CancelGuard> {
         let token = StdCancellationToken::new();
-        match self
-            .calls
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(key.to_string())
-        {
-            std::collections::hash_map::Entry::Occupied(_) => {
-                anyhow::bail!("run: cancel key {key:?} is already in flight")
-            }
-            std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert(token.clone());
-            }
+        let mut calls = self.calls.lock().unwrap_or_else(|e| e.into_inner());
+        if calls.contains_key(key) {
+            anyhow::bail!("run: cancel key {key:?} is already in flight")
         }
+        let key: Arc<str> = key.into();
+        calls.insert(Arc::clone(&key), token.clone());
+        drop(calls);
         Ok(CancelGuard {
             reg: Arc::clone(self),
-            id: key.to_string(),
+            entry: Registered::Call(key),
             token,
-            call: true,
         })
     }
 
@@ -435,27 +434,39 @@ impl CancelRegistry {
     /// the cancel — the eager seam spawn makes that window hittable.
     fn enter(self: &Arc<Self>, id: &str) -> CancelGuard {
         let token = StdCancellationToken::new();
-        if !id.is_empty() {
-            self.inflight
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .entry(id.to_string())
+        if id.is_empty() {
+            return CancelGuard {
+                reg: Arc::clone(self),
+                entry: Registered::Nothing,
+                token,
+            };
+        }
+        let slot = self.next_slot.fetch_add(1, Ordering::Relaxed);
+        let id = {
+            let mut map = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
+            // A sibling call under the same request shares its key; only the
+            // first call under an id allocates one.
+            let id = match map.get_key_value(id) {
+                Some((k, _)) => Arc::clone(k),
+                None => Arc::from(id),
+            };
+            map.entry(Arc::clone(&id))
                 .or_default()
-                .push(token.clone());
-            if self
-                .precancelled
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(id)
-            {
-                token.cancel();
-            }
+                .insert(slot, token.clone());
+            id
+        };
+        if self
+            .precancelled
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&*id)
+        {
+            token.cancel();
         }
         CancelGuard {
             reg: Arc::clone(self),
-            id: id.to_string(),
+            entry: Registered::Request { id, slot },
             token,
-            call: false,
         }
     }
 
@@ -485,7 +496,7 @@ impl CancelRegistry {
         let map = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(tokens) = map.get(id) {
             // Every call in flight under this request id, not just the latest.
-            for t in tokens {
+            for t in tokens.values() {
                 t.cancel();
             }
         }
@@ -514,60 +525,71 @@ impl CancelRegistry {
 /// Holds a call's cancellation token registered; deregisters on drop.
 struct CancelGuard {
     reg: Arc<CancelRegistry>,
-    id: String,
+    entry: Registered,
     token: StdCancellationToken,
-    /// `id` is a run's cancel key (in `calls`), not a request id.
-    call: bool,
+}
+
+/// Where a [`CancelGuard`]'s token is registered.
+enum Registered {
+    /// An empty request id: no cancellation wired for this call.
+    Nothing,
+    /// In `inflight`, in its own slot under a request id.
+    Request { id: Arc<str>, slot: u64 },
+    /// In `calls`, under a run's cancel key.
+    Call(Arc<str>),
+}
+
+impl Drop for CancelGuard {
+    fn drop(&mut self) {
+        match &self.entry {
+            Registered::Nothing => {}
+            Registered::Call(key) => {
+                // The key is this guard's alone (`enter_call` refuses a
+                // second), so nothing else can be under it; nothing was parked
+                // for it either.
+                self.reg
+                    .calls
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(key);
+            }
+            Registered::Request { id, slot } => self.leave_request(id, *slot),
+        }
+    }
 }
 
 impl CancelGuard {
     fn token(&self) -> &StdCancellationToken {
         &self.token
     }
-}
 
-impl Drop for CancelGuard {
-    fn drop(&mut self) {
-        if self.call {
-            // The key is this guard's alone (`enter_call` refuses a second), so
-            // nothing else can be under it; nothing was parked for it either.
-            self.reg
-                .calls
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&self.id);
-            return;
-        }
-        if !self.id.is_empty() {
-            {
-                let mut map = self.reg.inflight.lock().unwrap_or_else(|e| e.into_inner());
-                // Identity-checked: a request id names an engine request, not a
-                // single call, so sibling calls' tokens share this entry — a
-                // guard removes only its OWN token, never a sibling's.
-                if let Some(tokens) = map.get_mut(&self.id) {
-                    if let Some(i) = tokens.iter().position(|t| t.ptr_eq(&self.token)) {
-                        tokens.swap_remove(i);
-                    }
-                    if tokens.is_empty() {
-                        map.remove(&self.id);
-                    }
+    fn leave_request(&self, id: &str, slot: u64) {
+        {
+            let mut map = self.reg.inflight.lock().unwrap_or_else(|e| e.into_inner());
+            // By slot: a request id names an engine request, not a single
+            // call, so sibling calls' tokens share this entry — a guard removes
+            // only its OWN token, never a sibling's.
+            if let Some(tokens) = map.get_mut(id) {
+                tokens.remove(&slot);
+                if tokens.is_empty() {
+                    map.remove(id);
                 }
             }
-            // A cancelled call consumes its request's parked pre-cancel marker,
-            // so a cancelled request with no later `enter` doesn't park its id
-            // forever (unbounded in a long-lived LSP/watch process). Safe to
-            // consume: every token in flight under this id was already tripped
-            // by `cancel`, and any *later* call under this (cancelled) request
-            // gets re-cancelled by its own host-side `await_with_cancel`, which
-            // observes the already-tripped request token on first poll and
-            // fires `provider_cancel` again.
-            if self.token.is_cancelled() {
-                self.reg
-                    .precancelled
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&self.id);
-            }
+        }
+        // A cancelled call consumes its request's parked pre-cancel marker, so
+        // a cancelled request with no later `enter` doesn't park its id forever
+        // (unbounded in a long-lived LSP/watch process). Safe to consume: every
+        // token in flight under this id was already tripped by `cancel`, and
+        // any *later* call under this (cancelled) request gets re-cancelled by
+        // its own host-side `await_with_cancel`, which observes the
+        // already-tripped request token on first poll and fires
+        // `provider_cancel` again.
+        if self.token.is_cancelled() {
+            self.reg
+                .precancelled
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(id);
         }
     }
 }
@@ -1174,38 +1196,6 @@ fn driver_schema(driver: &Arc<dyn ManagedDriver>) -> SVec<u8> {
     )
 }
 
-/// Run a driver call on the cdylib's own runtime and await its answer.
-///
-/// The future this returns is polled by a *host* worker thread, whose tokio
-/// thread-locals belong to the host's separately-linked tokio instance — this
-/// cdylib's copy sees no runtime there at all. Any reactor touch (a `proc_exec`
-/// spawn, a timer) then panics, and a panic across the ABI seam is a
-/// non-unwinding abort, not an error: the whole `heph` process dies.
-///
-/// `run` has always hopped for this reason. `parse` and `apply_transitive` must
-/// too: a driver that probes its toolchain to build the cache key shells out
-/// from `parse` (`docker_build` asks buildx for its default platform), which is the
-/// same reactor touch one call earlier.
-///
-/// The `CancelGuard` moves into the task so the registry entry outlives the
-/// call, and the borrowed token it hands the driver stays valid for it.
-async fn on_plugin_runtime<F, Fut>(guard: CancelGuard, f: F) -> SVec<u8>
-where
-    F: FnOnce(CancelGuard) -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = Body> + Send,
-{
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    // The guard moves into the task: it must outlive the call it cancels, and
-    // the token the driver borrows comes from it there.
-    cdylib_runtime().spawn(async move {
-        drop(tx.send(f(guard).await));
-    });
-    match rx.await {
-        Ok(body) => unary(body),
-        Err(_) => unary(err_body("plugin task dropped before completing".into())),
-    }
-}
-
 /// A def a guest driver returned, encoded for the host — refused if it declares
 /// an entrypoint the host cannot honour (R3), so an old host never builds and
 /// caches one.
@@ -1234,19 +1224,17 @@ async fn driver_parse(
         Err(e) => return unary(err_body(err_message(&e))),
     };
     let guard = cancels.enter(&preq.request_id);
-    on_plugin_runtime(guard, move |guard| async move {
-        match driver.parse(preq, guard.token()).await {
-            Ok(resp) => match def_to_wire(&resp.target_def) {
-                Ok(td) => Body::from(pb::ParseResponse {
-                    target_def: td.into(),
-                    ..Default::default()
-                }),
-                Err(e) => err_body(err_message(&e)),
-            },
+    let body = match driver.parse(preq, guard.token()).await {
+        Ok(resp) => match def_to_wire(&resp.target_def) {
+            Ok(td) => Body::from(pb::ParseResponse {
+                target_def: td.into(),
+                ..Default::default()
+            }),
             Err(e) => err_body(err_message(&e)),
-        }
-    })
-    .await
+        },
+        Err(e) => err_body(err_message(&e)),
+    };
+    unary(body)
 }
 
 async fn driver_apply_transitive(
@@ -1274,19 +1262,17 @@ async fn driver_apply_transitive(
         Err(e) => return unary(err_body(err_message(&e))),
     };
     let guard = cancels.enter(&areq.request_id);
-    on_plugin_runtime(guard, move |guard| async move {
-        match driver.apply_transitive(areq, guard.token()).await {
-            Ok(resp) => match def_to_wire(&resp.target_def) {
-                Ok(td) => Body::from(pb::ApplyTransitiveResponse {
-                    target_def: td.into(),
-                    ..Default::default()
-                }),
-                Err(e) => err_body(err_message(&e)),
-            },
+    let body = match driver.apply_transitive(areq, guard.token()).await {
+        Ok(resp) => match def_to_wire(&resp.target_def) {
+            Ok(td) => Body::from(pb::ApplyTransitiveResponse {
+                target_def: td.into(),
+                ..Default::default()
+            }),
             Err(e) => err_body(err_message(&e)),
-        }
-    })
-    .await
+        },
+        Err(e) => err_body(err_message(&e)),
+    };
+    unary(body)
 }
 
 impl StableMeta for StableManagedDriverImpl {
@@ -1302,6 +1288,13 @@ impl StableMeta for StableManagedDriverImpl {
 // Same seam shape as [`StableProvider`]: bodies spawn onto the plugin runtime,
 // the host polls only a `JoinHandle` await, panics become errors (never an
 // unwind through the extern shim), and bodies start eagerly at call time.
+//
+// Running on the plugin runtime is what makes `parse` and `apply_transitive`
+// safe to touch the reactor: the host polls the wrapper from its own worker,
+// whose tokio thread-locals belong to the host's tokio, not this cdylib's, so a
+// timer or a `proc_exec` spawn there would panic — an abort across the seam. A
+// driver that probes its toolchain to build the cache key shells out from
+// `parse` (`docker_build` asks buildx for its default platform).
 impl StableManagedDriver for StableManagedDriverImpl {
     extern "C" fn invoke<'a>(&'a self, method: u32, req: SVec<u8>) -> DynFuture<'a, SVec<u8>> {
         let driver = Arc::clone(&self.driver);
@@ -3966,6 +3959,37 @@ mod tests {
         );
     }
 
+    // Sibling calls under one id leave in any order, each taking only its own
+    // slot, and the id goes with the last of them.
+    #[test]
+    fn registry_sibling_guards_leave_in_any_order() {
+        let reg = Arc::new(CancelRegistry::default());
+        let slots = |reg: &CancelRegistry| {
+            reg.inflight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get("x")
+                .map_or(0, HashMap::len)
+        };
+        let g1 = reg.enter("x");
+        let g2 = reg.enter("x");
+        let g3 = reg.enter("x");
+        assert_eq!(slots(&reg), 3);
+        drop(g2);
+        assert_eq!(slots(&reg), 2);
+        drop(g1);
+        assert_eq!(slots(&reg), 1);
+        reg.cancel("x");
+        assert!(g3.token().is_cancelled(), "the last sibling still trips");
+        drop(g3);
+        assert!(
+            reg.inflight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+        );
+    }
+
     // Concurrent calls under ONE request id each keep their own token, and a
     // request cancel trips them ALL. With the old single-slot map this goes
     // red: the second enter replaced the first's token, so the cancel tripped
@@ -4826,6 +4850,221 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    // Abort-on-drop holds for a driver's `parse` too: the body runs in the one
+    // task `spawn_seam` started, so dropping the wrapper stops the driver's
+    // future (and releases its cancel-registry entry), rather than leaving it
+    // running in a second task nobody holds.
+    #[test]
+    fn dropped_parse_future_aborts_the_driver() {
+        use hcore::hasync::Cancellable;
+        use hdriver_support::driver_managed::{ManagedRunRequest, ManagedRunResponse};
+        use hplugin_stabby::abi::StableManagedDriverDyn;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        struct SetOnDrop(Arc<AtomicBool>);
+        impl Drop for SetOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        struct HangingParse {
+            started: Arc<AtomicBool>,
+            stopped: Arc<AtomicBool>,
+        }
+        #[async_trait::async_trait]
+        impl ManagedDriver for HangingParse {
+            fn config(
+                &self,
+                _r: hplugin::driver::ConfigRequest,
+            ) -> Result<hplugin::driver::ConfigResponse> {
+                Ok(hplugin::driver::ConfigResponse {
+                    name: "hang".into(),
+                })
+            }
+            fn schema(&self) -> hplugin::driver::DriverSchema {
+                hplugin::driver::DriverSchema::default()
+            }
+            async fn parse(
+                &self,
+                _r: hplugin::driver::ParseRequest,
+                _c: &(dyn Cancellable + Send + Sync),
+            ) -> Result<hplugin::driver::ParseResponse> {
+                // Dropped only when this future is dropped: it never completes.
+                let _guard = SetOnDrop(Arc::clone(&self.stopped));
+                self.started.store(true, Ordering::SeqCst);
+                futures::future::pending::<()>().await;
+                anyhow::bail!("unreachable")
+            }
+            async fn apply_transitive(
+                &self,
+                _r: hplugin::driver::ApplyTransitiveRequest,
+                _c: &(dyn Cancellable + Send + Sync),
+            ) -> Result<hplugin::driver::ApplyTransitiveResponse> {
+                anyhow::bail!("unused")
+            }
+            async fn run<'a, 'io>(
+                &self,
+                _r: ManagedRunRequest<'a, 'io>,
+                _c: &(dyn Cancellable + Send + Sync),
+            ) -> Result<ManagedRunResponse> {
+                anyhow::bail!("unused")
+            }
+        }
+
+        let started = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let dynd = make_dyn_managed_driver(Arc::new(HangingParse {
+            started: Arc::clone(&started),
+            stopped: Arc::clone(&stopped),
+        }) as Arc<dyn ManagedDriver>);
+
+        let req = pb::ParseRequest {
+            request_id: Some("r".into()),
+            target_spec: pb::TargetSpec {
+                addr: wire_target().addr,
+                driver: Some("hang".into()),
+                ..Default::default()
+            }
+            .into(),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let fut = dynd.invoke(pb::DriverMethod::Parse as u32, SVec::from(req.as_slice()));
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !started.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "parse never started");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        drop(fut);
+
+        while !stopped.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < deadline,
+                "the driver's parse still running after the wrapper was dropped"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// A managed driver whose `parse` and `apply_transitive` touch tokio (a
+    /// timer) before answering — or panic, when `.0` is set. `run` is unused.
+    struct TokioTouchingDriver(bool);
+
+    #[async_trait::async_trait]
+    impl ManagedDriver for TokioTouchingDriver {
+        fn config(
+            &self,
+            _r: hplugin::driver::ConfigRequest,
+        ) -> Result<hplugin::driver::ConfigResponse> {
+            Ok(hplugin::driver::ConfigResponse {
+                name: "tokiodrv".into(),
+            })
+        }
+        fn schema(&self) -> hplugin::driver::DriverSchema {
+            hplugin::driver::DriverSchema::default()
+        }
+        async fn parse(
+            &self,
+            _r: hplugin::driver::ParseRequest,
+            _c: &(dyn Cancellable + Send + Sync),
+        ) -> Result<hplugin::driver::ParseResponse> {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            assert!(!self.0, "parse exploded");
+            Ok(hplugin::driver::ParseResponse {
+                target_def: convert::target_def_from_pb(wire_target())?,
+            })
+        }
+        async fn apply_transitive(
+            &self,
+            r: hplugin::driver::ApplyTransitiveRequest,
+            _c: &(dyn Cancellable + Send + Sync),
+        ) -> Result<hplugin::driver::ApplyTransitiveResponse> {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            Ok(hplugin::driver::ApplyTransitiveResponse {
+                target_def: r.target_def,
+            })
+        }
+        async fn run<'a, 'io>(
+            &self,
+            _r: ManagedRunRequest<'a, 'io>,
+            _c: &(dyn Cancellable + Send + Sync),
+        ) -> Result<hdriver_support::driver_managed::ManagedRunResponse> {
+            anyhow::bail!("unused")
+        }
+    }
+
+    /// The host side of a [`TokioTouchingDriver`], reached through the real seam.
+    fn tokio_touching_host(panics: bool) -> hplugin_stabby::load_stable::StableRemoteManagedDriver {
+        let dynd = make_dyn_managed_driver(
+            Arc::new(TokioTouchingDriver(panics)) as Arc<dyn ManagedDriver>
+        );
+        hplugin_stabby::load_stable::StableRemoteManagedDriver::new(dynd, "tokiodrv").expect("load")
+    }
+
+    fn parse_request() -> hplugin::driver::ParseRequest {
+        hplugin::driver::ParseRequest {
+            request_id: "r".into(),
+            target_spec: Arc::new(hplugin::provider::TargetSpec {
+                addr: hmodel::htaddr::Addr::new(PkgBuf::from("p"), "t".into(), Default::default()),
+                driver: "tokiodrv".into(),
+                ..Default::default()
+            }),
+        }
+    }
+
+    // A driver's `parse` that touches tokio works when the host polls it from a
+    // plain `block_on`, with no plugin reactor current on the calling thread:
+    // the body runs in the seam task on the plugin's own runtime. Off it, the
+    // timer panics ("there is no reactor running") — in a real cdylib, inside
+    // the extern shim, aborting the process. A driver that probes its toolchain
+    // to build the cache key shells out from `parse`.
+    #[test]
+    fn a_driver_parse_touching_tokio_runs_on_the_seam() {
+        let host = tokio_touching_host(false);
+        let ct = StdCancellationToken::new();
+        let resp = futures::executor::block_on(host.parse(parse_request(), &ct))
+            .expect("a tokio-touching parse answers");
+        assert_eq!(resp.target_def.addr.name, "t");
+    }
+
+    // The same for `apply_transitive`, the other driver call made before `run`.
+    #[test]
+    fn a_driver_apply_transitive_touching_tokio_runs_on_the_seam() {
+        let host = tokio_touching_host(false);
+        let ct = StdCancellationToken::new();
+        let req = hplugin::driver::ApplyTransitiveRequest {
+            request_id: "r".into(),
+            target_def: convert::target_def_from_pb(wire_target()).expect("def"),
+            sandbox: Default::default(),
+        };
+        let resp = futures::executor::block_on(host.apply_transitive(req, &ct))
+            .expect("a tokio-touching apply_transitive answers");
+        assert_eq!(resp.target_def.addr.name, "t");
+    }
+
+    // A panicking `parse` surfaces as the seam's usual error — plugin name,
+    // method, the target's addr and the payload — never an unwind through the
+    // extern shim, and never the opaque "plugin task dropped before completing"
+    // the second spawn used to report.
+    #[test]
+    fn a_panicking_driver_parse_is_contained_as_error() {
+        let host = tokio_touching_host(true);
+        let ct = StdCancellationToken::new();
+        let msg = match futures::executor::block_on(host.parse(parse_request(), &ct)) {
+            Ok(_) => panic!("a panic must surface as an error, not success"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            msg.contains("plugin tokiodrv: parse(//p:t) panicked"),
+            "names the plugin, method and addr: {msg}"
+        );
+        assert!(msg.contains("parse exploded"), "carries the payload: {msg}");
     }
 
     // Pre-cancel race loop: a cancel issued through the extern cancel path may

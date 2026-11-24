@@ -229,26 +229,66 @@ pub fn defined_variant_names(states: &[State]) -> Vec<String> {
 /// package's ancestry. Callers map away the `Factors` when they only need the
 /// refs; those that must inspect factors (e.g. filter `test` targets to the host
 /// `goos`/`goarch`) keep them.
+///
+/// A variant whose resolution fails is left out, as [`resolve_ancestry`] would
+/// fail it; an in-module state whose `variants` do not parse fails every name,
+/// so the result is then empty.
 pub fn ancestry_variants_with_factors(
     states: &[State],
     module_root: &str,
 ) -> Vec<(VariantRef, Factors)> {
-    let mut names = std::collections::BTreeSet::new();
-    for s in states {
-        if under_module_root(s.package.as_str(), module_root)
-            && let Ok(raw) = raw_variants(s)
-        {
-            names.extend(raw.into_keys());
-        }
-    }
+    // Parse each in-module state once, rather than once per variant name.
+    let Ok(parsed) = in_module(states, module_root)
+        .map(|s| raw_variants(s).map(|raw| (s, raw)))
+        .collect::<anyhow::Result<Vec<_>>>()
+    else {
+        return Vec::new();
+    };
+    let names: std::collections::BTreeSet<&String> =
+        parsed.iter().flat_map(|(_, raw)| raw.keys()).collect();
     names
         .into_iter()
         .filter_map(|name| {
-            resolve_ancestry(&name, states, module_root)
-                .ok()
-                .map(|(f, v)| (v, f))
+            let declared = parsed.iter().map(|(s, raw)| Ok((*s, raw)));
+            let (s, f) = deepest_declaring(name, declared).ok().flatten()?;
+            Some((VariantRef::new(name.as_str(), s.package.as_str()), f))
         })
         .collect()
+}
+
+/// The states of `states` that lie within the module rooted at `module_root`.
+fn in_module<'s>(states: &'s [State], module_root: &str) -> impl Iterator<Item = &'s State> {
+    states
+        .iter()
+        .filter(move |s| under_module_root(s.package.as_str(), module_root))
+}
+
+/// The closest (deepest) state declaring `name`, with its resolved factors.
+/// `declared` yields each candidate state with its parsed `variants`, in
+/// ancestry order. At equal depth the first declaration wins. The first error,
+/// in that order, is returned: a parse error, or a declaration of `name` that
+/// does not resolve, even one a deeper declaration would have overridden.
+fn deepest_declaring<'s, R: std::borrow::Borrow<BTreeMap<String, RawVariant>>>(
+    name: &str,
+    declared: impl IntoIterator<Item = anyhow::Result<(&'s State, R)>>,
+) -> anyhow::Result<Option<(&'s State, Factors)>> {
+    let mut best: Option<(&State, Factors)> = None;
+    for entry in declared {
+        let (s, raw) = entry?;
+        let raw = raw.borrow();
+        if !raw.contains_key(name) {
+            continue;
+        }
+        let f = resolve_in_map(name, raw, &mut Vec::new())?;
+        let deeper = match &best {
+            Some((bs, _)) => s.package.as_str().len() > bs.package.as_str().len(),
+            None => true,
+        };
+        if deeper {
+            best = Some((s, f));
+        }
+    }
+    Ok(best)
 }
 
 /// The full module **universe** as `(VariantRef, Factors)` pairs — every variant
@@ -290,22 +330,8 @@ pub fn resolve_ancestry(
     states: &[State],
     module_root: &str,
 ) -> anyhow::Result<(Factors, VariantRef)> {
-    let mut best: Option<(&State, Factors)> = None;
-    for s in states {
-        if !under_module_root(s.package.as_str(), module_root) {
-            continue;
-        }
-        if let Some(f) = variant_in_state(s, name)? {
-            let deeper = match &best {
-                Some((bs, _)) => s.package.as_str().len() > bs.package.as_str().len(),
-                None => true,
-            };
-            if deeper {
-                best = Some((s, f));
-            }
-        }
-    }
-    match best {
+    let declared = in_module(states, module_root).map(|s| raw_variants(s).map(|raw| (s, raw)));
+    match deepest_declaring(name, declared)? {
         Some((s, f)) => Ok((f, VariantRef::new(name, s.package.as_str()))),
         None => bail!(
             "no go variant `{name}` is declared for this package or any ancestor \
@@ -652,6 +678,124 @@ mod tests {
         let states = vec![go_state("", &[("release", linux_amd64())])];
         let err = resolve_ancestry("release", &states, "app").unwrap_err();
         assert!(err.to_string().contains("no go variant `release`"), "{err}");
+    }
+
+    fn darwin_arm64() -> Value {
+        variant_val(&[("goos", s("darwin")), ("goarch", s("arm64"))])
+    }
+
+    fn unparseable_state(pkg: &str) -> State {
+        State {
+            package: PkgBuf::from(pkg),
+            provider: GO_PROVIDER.to_string(),
+            state: HashMap::from([("variants".to_string(), s("not a map"))]),
+        }
+    }
+
+    /// `(name, declaring pkg, goos)` of each ancestry variant.
+    fn ancestry_summary(states: &[State], module_root: &str) -> Vec<(String, String, String)> {
+        ancestry_variants_with_factors(states, module_root)
+            .into_iter()
+            .map(|(v, f)| (v.name, v.pkg, f.goos))
+            .collect()
+    }
+
+    #[test]
+    fn ancestry_variants_pin_each_name_to_its_deepest_declaration() {
+        // `release` overlaps (module root and below); `dev` only at the root;
+        // the repo root (above the module) is ignored entirely.
+        let states = vec![
+            go_state("", &[("above", linux_amd64())]),
+            go_state("app", &[("release", linux_amd64()), ("dev", linux_amd64())]),
+            go_state("app/cmd", &[("release", darwin_arm64())]),
+        ];
+        assert_eq!(
+            ancestry_summary(&states, "app"),
+            vec![
+                ("dev".into(), "app".into(), "linux".into()),
+                ("release".into(), "app/cmd".into(), "darwin".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn ancestry_tie_at_equal_depth_keeps_the_first_declaration() {
+        let states = vec![
+            go_state("app", &[("release", linux_amd64())]),
+            go_state("app", &[("release", darwin_arm64())]),
+        ];
+        assert_eq!(
+            ancestry_summary(&states, "app"),
+            vec![("release".into(), "app".into(), "linux".into())]
+        );
+        let (f, _) = resolve_ancestry("release", &states, "app").unwrap();
+        assert_eq!(f.goos, "linux");
+    }
+
+    #[test]
+    fn ancestry_drops_only_the_broken_variant() {
+        // A shallow `release` missing goarch fails `release` even though a
+        // deeper declaration would override it; `dev` still resolves.
+        let states = vec![
+            go_state(
+                "app",
+                &[
+                    ("release", variant_val(&[("goos", s("linux"))])),
+                    ("dev", linux_amd64()),
+                ],
+            ),
+            go_state("app/cmd", &[("release", darwin_arm64())]),
+        ];
+        assert_eq!(
+            ancestry_summary(&states, "app"),
+            vec![("dev".into(), "app".into(), "linux".into())]
+        );
+        let err = resolve_ancestry("release", &states, "app").unwrap_err();
+        assert!(err.to_string().contains("required"), "{err}");
+    }
+
+    #[test]
+    fn ancestry_unparseable_in_module_state_fails_every_name() {
+        let states = vec![
+            go_state("app", &[("release", linux_amd64())]),
+            unparseable_state("app/cmd"),
+        ];
+        assert!(ancestry_variants_with_factors(&states, "app").is_empty());
+        let err = resolve_ancestry("release", &states, "app").unwrap_err();
+        assert!(err.to_string().contains("must be a map"), "{err}");
+
+        // Above the module root, the same state is never parsed.
+        let states = vec![
+            unparseable_state(""),
+            go_state("app", &[("release", linux_amd64())]),
+        ];
+        assert_eq!(
+            ancestry_summary(&states, "app"),
+            vec![("release".into(), "app".into(), "linux".into())]
+        );
+    }
+
+    #[test]
+    fn resolve_ancestry_reports_the_first_failure_in_ancestry_order() {
+        // A broken `release` at `app` comes before the unparseable `app/cmd`:
+        // the error is the declaration's, not the parse failure's.
+        let states = vec![
+            go_state("app", &[("release", variant_val(&[("goos", s("linux"))]))]),
+            unparseable_state("app/cmd"),
+        ];
+        let err = resolve_ancestry("release", &states, "app").unwrap_err();
+        assert!(err.to_string().contains("required"), "{err}");
+
+        // Reversed order: the parse failure comes first.
+        let states = vec![
+            unparseable_state("app"),
+            go_state(
+                "app/cmd",
+                &[("release", variant_val(&[("goos", s("linux"))]))],
+            ),
+        ];
+        let err = resolve_ancestry("release", &states, "app").unwrap_err();
+        assert!(err.to_string().contains("must be a map"), "{err}");
     }
 
     #[test]

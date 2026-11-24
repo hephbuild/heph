@@ -1,17 +1,18 @@
 use anyhow::anyhow;
 use hconfig::{get_cwd, get_root};
 use hmodel::htpkg::PkgBuf;
-use memoize::memoize;
 use std::path::Path;
+use std::sync::LazyLock;
 
 /// Current working *package*: the cwd expressed relative to the workspace root.
-/// Empty when cwd is the root itself or lies outside it.
+/// Empty when cwd is the root itself or lies outside it. Resolved once per
+/// process.
 pub fn get_cwp() -> anyhow::Result<PkgBuf> {
-    get_cwp_inner().map_err(|e| anyhow!(e))
+    static CWP: LazyLock<Result<PkgBuf, String>> = LazyLock::new(find_cwp);
+    CWP.clone().map_err(|e| anyhow!(e))
 }
 
-#[memoize]
-fn get_cwp_inner() -> Result<PkgBuf, String> {
+fn find_cwp() -> Result<PkgBuf, String> {
     let cwd = get_cwd().map_err(|e| e.to_string())?;
     let root = get_root().map_err(|e| e.to_string())?;
 

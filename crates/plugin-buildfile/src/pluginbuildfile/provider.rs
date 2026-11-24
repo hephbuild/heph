@@ -329,28 +329,6 @@ impl Provider {
         self
     }
 
-    /// Whether `pkg`'s directory holds a BUILD file: what decides that it
-    /// gets the check targets. The same rule [`walk_package`] and evaluation
-    /// apply.
-    async fn has_build_file(&self, pkg: &str) -> anyhow::Result<bool> {
-        if hmodel::htpkg::join_rel_checked("", pkg).is_err() {
-            return Ok(false);
-        }
-        let dir = self.root.join(pkg);
-        let walker = Arc::clone(&self.walker);
-        let patterns = self.build_file_patterns.clone();
-        hcore::blocking::run(move || {
-            if !dir.is_dir() {
-                return Ok(false);
-            }
-            Ok(
-                !crate::pluginbuildfile::run_file::find_build_files(&walker, &dir, &patterns)?
-                    .is_empty(),
-            )
-        })
-        .await
-    }
-
     /// The spec of check `kind` in `pkg`: the package's load walk, run off
     /// the async workers, then the kind's spec. The walk is not cached, so
     /// it runs once per check target `get`: three times per package when all
@@ -679,7 +657,7 @@ impl EProvider for Provider {
             // one a target of the package shadows (I2): that name is listed
             // once, as the user's, and recorded for `heph validate`.
             let mut checks = Vec::new();
-            if self.checks.is_some() && self.has_build_file(req.package.as_str()).await? {
+            if self.checks.is_some() && res.has_build_file {
                 let shadowed = targets::shadowed(res.targets().iter().map(|t| t.name.as_str()));
                 self.shadowed.record(
                     req.package.as_str(),
@@ -833,10 +811,7 @@ impl EProvider for Provider {
             // evaluate fails `get` of a check with its error.
             if let (Some(opts), Some(kind)) = (self.checks, CheckKind::from_name(&req.addr.name))
                 && req.addr.args.is_empty()
-                && self
-                    .has_build_file(req.addr.package.as_str())
-                    .await
-                    .map_err(GetError::Other)?
+                && res.has_build_file
             {
                 let target_spec = self
                     .check_spec(&req.addr, kind, opts)
@@ -2230,6 +2205,43 @@ provider_state(provider = "go", root = "src", strict = True)
             provider.get(req, &StdCancellationToken::new()).await,
             Err(NotFound)
         ));
+    }
+
+    /// A directory without a BUILD file of its own gets no checks, though a
+    /// child holds one and the walk lists it as a package; nor does a
+    /// package that escapes the workspace, though the dir it names has one.
+    #[tokio::test]
+    async fn no_build_file_dir_gets_no_checks() {
+        let tmp = tempdir().expect("tempdir");
+        let root = tmp.path().join("ws");
+        for (path, content) in [
+            ("ws/parent/child/BUILD", "X = 1\n"),
+            ("outside/BUILD", "X = 1\n"),
+        ] {
+            let abs = tmp.path().join(path);
+            fs::create_dir_all(abs.parent().expect("parent")).expect("mkdir");
+            fs::write(&abs, content).expect("write");
+        }
+        let provider = checks_provider(&root, true);
+        for pkg in ["parent", "../outside"] {
+            let res = provider.run_pkg(pkg).await.expect("evaluates");
+            assert!(!res.has_build_file, "{pkg}");
+            assert!(listed(&provider, pkg).await.is_empty(), "{pkg}");
+            for name in CHECKS {
+                assert!(
+                    matches!(get_check(&provider, pkg, name).await, Err(NotFound)),
+                    "//{pkg}:{name}"
+                );
+            }
+        }
+        assert!(
+            provider
+                .run_pkg("parent/child")
+                .await
+                .expect("evaluates")
+                .has_build_file
+        );
+        assert_eq!(names(&listed(&provider, "parent/child").await), CHECKS);
     }
 
     #[tokio::test]

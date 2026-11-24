@@ -255,6 +255,19 @@ pub trait LocalCache: Send + Sync {
         }
     }
     fn delete(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<()>;
+    /// [`delete`](Self::delete) every one of `names` in `(addr, hashin)`, in
+    /// order; every delete has landed when this returns `Ok`.
+    ///
+    /// The default deletes one at a time. A backend whose delete waits on a
+    /// commit (the sqlite one) overrides it to queue them all and then wait on
+    /// all, so a revision's artifacts cost one commit rather than one each, and
+    /// a decorator forwards it.
+    fn delete_all(&self, addr: &Addr, hashin: &str, names: &[&str]) -> anyhow::Result<()> {
+        for name in names {
+            self.delete(addr, hashin, name)?;
+        }
+        Ok(())
+    }
     /// Stream the distinct target address keys (`Addr::format()`, parseable via
     /// `htaddr::parse_addr`) present in the cache. Streamed rather than collected
     /// because the target count can be very large; GC processes one at a time so
@@ -652,7 +665,7 @@ impl Engine {
         cache: &Arc<dyn LocalCache>,
         addr: &Addr,
         hashin: &str,
-        artifact: &outputartifact::OutputArtifact,
+        artifact: outputartifact::OutputArtifact,
         compress: bool,
     ) -> anyhow::Result<(CacheArtifact, ManifestArtifact)> {
         let hashin = hashin.to_string();
@@ -669,7 +682,9 @@ impl Engine {
         // `hcore::blocking::run`, never inline: inline parks a runtime worker
         // with the runtime unaware, and enough concurrent writes stop the
         // reactor entirely.
-        hcore::blocking::run(enclose!((cache => local_cache, addr, artifact) move || {
+        // The artifact moves into the job: a Raw artifact's bytes go to the
+        // packer as they are, never copied.
+        hcore::blocking::run(enclose!((cache => local_cache, addr) move || {
             let _slot = slot;
             let base_name = cache_entry_name(&artifact);
             // What heph packs itself is always compressed in a durable
@@ -690,11 +705,11 @@ impl Engine {
 
             // `size` is always the decoded size: the counter sits above the
             // encoder.
-            let (size, content_type, encoding, name) = match &artifact.content {
+            let (size, content_type, encoding, name) = match artifact.content {
                 outputartifact::Content::Raw(raw) => {
                     let mut cw = CountingWriter::new(open_writer(name)?);
                     let mut p = hartifactcontent::tar::TarPacker::new();
-                    p.create_raw(raw.data.clone(), raw.path.clone(), raw.x);
+                    p.create_raw(raw.data, raw.path, raw.x);
                     p.pack(&mut cw)
                         .with_context(|| format!("pack raw artifact into {addr} {name}"))?;
                     let size = cw.bytes_written();
@@ -706,7 +721,7 @@ impl Engine {
                 outputartifact::Content::File(file) => {
                     let mut cw = CountingWriter::new(open_writer(name)?);
                     let mut p = hartifactcontent::tar::TarPacker::new();
-                    p.create_file(file.source_path.clone(), file.out_path.clone());
+                    p.create_file(file.source_path.clone(), file.out_path);
                     p.pack(&mut cw).with_context(|| {
                         format!(
                             "pack file artifact {} into {addr} {name}",
@@ -747,7 +762,7 @@ impl Engine {
                         &addr,
                         &hashin,
                         &base_name,
-                        content,
+                        &content,
                         &ManifestArtifactContentType::Tar,
                         compress,
                     )?;
@@ -759,7 +774,7 @@ impl Engine {
                         &addr,
                         &hashin,
                         &base_name,
-                        content,
+                        &content,
                         &ManifestArtifactContentType::Cpio,
                         compress,
                     )?;
@@ -787,8 +802,8 @@ impl Engine {
                     size,
                 },
                 ManifestArtifact {
-                    hashout: artifact.hashout.clone(),
-                    group: artifact.group.clone(),
+                    hashout: artifact.hashout,
+                    group: artifact.group,
                     name,
                     size,
                     r#type: artifact_type,
@@ -886,10 +901,11 @@ impl Engine {
         // retry's good one.
         let key_ref = &key;
         let written = crate::engine::fanout::join_all_failable(
-            artifacts.iter().map(|artifact| async move {
+            artifacts.into_iter().map(|artifact| async move {
+                let name = artifact.name.clone();
                 self.cache_artifact_locally(ctoken, cache, addr, key_ref, artifact, !tmp)
                     .await
-                    .with_context(|| format!("cache artifact {} for {addr}", artifact.name))
+                    .with_context(|| format!("cache artifact {name} for {addr}"))
             }),
             false,
         )

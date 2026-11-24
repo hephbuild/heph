@@ -161,6 +161,13 @@ impl LocalCache for LocalCacheMem {
         self.inner.delete(addr, hashin, name)
     }
 
+    fn delete_all(&self, addr: &Addr, hashin: &str, names: &[&str]) -> Result<()> {
+        for name in names {
+            self.cache.remove(&Self::key(addr, hashin, name));
+        }
+        self.inner.delete_all(addr, hashin, names)
+    }
+
     fn list_targets(&self) -> Result<TargetStream> {
         // Enumeration is authoritative at the durable backend; the mem layer
         // only fronts reads, so delegate.
@@ -233,6 +240,7 @@ mod tests {
         reader_calls: Arc<AtomicUsize>,
         writer_calls: Arc<AtomicUsize>,
         delete_calls: Arc<AtomicUsize>,
+        delete_all_calls: Arc<AtomicUsize>,
         exists_calls: Arc<AtomicUsize>,
     }
 
@@ -316,6 +324,16 @@ mod tests {
             self.delete_calls.fetch_add(1, Ordering::Relaxed);
             let key = CountingCache::key(addr, hashin, name);
             self.store.lock().remove(&key);
+            Ok(())
+        }
+
+        fn delete_all(&self, addr: &Addr, hashin: &str, names: &[&str]) -> Result<()> {
+            self.delete_all_calls.fetch_add(1, Ordering::Relaxed);
+            for name in names {
+                self.store
+                    .lock()
+                    .remove(&CountingCache::key(addr, hashin, name));
+            }
             Ok(())
         }
 
@@ -630,6 +648,31 @@ mod tests {
         match dec.reader(&addr, "h1", "k") {
             Ok(_) => panic!("expected NotFoundError after delete"),
             Err(e) => assert!(e.is::<NotFoundError>(), "{e:#}"),
+        }
+    }
+
+    /// `delete_all` evicts every named entry from this tier and hands the
+    /// batch to the backend as one call, not as one `delete` per name.
+    #[test]
+    fn delete_all_invalidates_and_forwards_the_batch() {
+        let inner = Arc::new(CountingCache::default());
+        let dec = LocalCacheMem::new(inner.clone(), 1024, 64 * 1024);
+        let addr = make_addr();
+
+        for name in ["a", "b"] {
+            write_blob(&dec, &addr, name, b"x");
+            let _ = drain(dec.reader(&addr, "h1", name).expect("r").reader); // populate
+        }
+        dec.delete_all(&addr, "h1", &["a", "b"])
+            .expect("delete_all");
+
+        assert_eq!(inner.delete_all_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(inner.delete_calls.load(Ordering::Relaxed), 0);
+        for name in ["a", "b"] {
+            match dec.reader(&addr, "h1", name) {
+                Ok(_) => panic!("{name}: expected NotFoundError after delete_all"),
+                Err(e) => assert!(e.is::<NotFoundError>(), "{e:#}"),
+            }
         }
     }
 }

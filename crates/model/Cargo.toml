@@ -8,6 +8,7 @@ workspace = true
 
 [dependencies]
 anyhow = "1.0.104"
+hashbrown = { version = "0.17", default-features = false }
 nom = { version = "8", default-features = false, features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 xxhash-rust = { version = "0.8.21", features = ["xxh3", "std"] }

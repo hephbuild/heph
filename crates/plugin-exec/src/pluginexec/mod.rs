@@ -1925,7 +1925,7 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
         req: ApplyTransitiveRequest,
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ApplyTransitiveResponse> {
-        let mut def = req.target_def.clone();
+        let mut def = req.target_def;
         let mut xdef = def.def::<TargetDef>().clone();
         let is_entrypoint = xdef.entrypoint.is_some();
         fold_transitive_inputs(
@@ -2223,6 +2223,31 @@ impl Driver {
         let merged_dep_groups =
             merged_dep_groups(&def.dep_group_inputs, &def.runtime_dep_group_inputs);
 
+        // The Dep-type ManagedRunInputs by origin_id, in `req.inputs` order. A
+        // target may have both Dep outputs and Support files sharing the same
+        // origin_id; the support input has no list file and must not leak
+        // into SRC_/LIST_ env routing or be symlinked into bin/.
+        let mut dep_members: HashMap<&str, Vec<&hdriver_support::driver_managed::ManagedRunInput>> =
+            HashMap::new();
+        for m in req.inputs.iter().filter(|m| {
+            matches!(
+                m.input.artifact.r#type,
+                hplugin::driver::inputartifact::Type::Dep
+            )
+        }) {
+            dep_members
+                .entry(m.input.origin_id.as_str())
+                .or_default()
+                .push(m);
+        }
+        let dep_members_of = |origin_id: &str| {
+            dep_members
+                .get(origin_id)
+                .map_or(&[][..], Vec::as_slice)
+                .iter()
+                .copied()
+        };
+
         for (group, inputs) in &merged_dep_groups {
             let src_key = src_key(group);
 
@@ -2236,23 +2261,14 @@ impl Driver {
                         .to_str()
                         .expect("sandbox dir path must be valid UTF-8"),
                 );
-                std::fs::File::create(&path)
-                    .with_context(|| format!("create dep list file {:?}", path))?
+                let f = std::fs::File::create(&path)
+                    .with_context(|| format!("create dep list file {:?}", path))?;
+                std::io::BufWriter::new(f)
             };
             let entry = env.entry(src_key).or_default();
 
             for input in inputs {
-                // Filter to Dep-type ManagedRunInputs only. A target may have
-                // both Dep outputs and Support files sharing the same
-                // origin_id; the support input has no list file and must not
-                // leak into SRC_/LIST_ env routing.
-                if let Some(m) = req.inputs.iter().find(|m| {
-                    m.input.origin_id == input.origin_id
-                        && matches!(
-                            m.input.artifact.r#type,
-                            hplugin::driver::inputartifact::Type::Dep
-                        )
-                }) {
+                if let Some(m) = dep_members_of(&input.origin_id).next() {
                     let list_path = m.require_list_path()?;
                     let managed_list_f = std::fs::File::open(list_path).with_context(|| {
                         format!(
@@ -2281,6 +2297,11 @@ impl Driver {
                     }
                 }
             }
+            // Explicit, so a failed write is an error rather than lost in
+            // `BufWriter`'s drop.
+            list_f
+                .flush()
+                .with_context(|| format!("flush dep list (group={group})"))?;
         }
 
         // `$TOOL_<G>_ROOT` per group, set into `env` once passthrough is applied.
@@ -2332,13 +2353,7 @@ impl Driver {
                     // Every member, not the first: a `group` used as a tool
                     // expands into members sharing its origin_id, each with its
                     // own `source_addr`, all appending to the one list file.
-                    let mut members = req.inputs.iter().filter(|m| {
-                        m.input.origin_id == input.origin_id
-                            && matches!(
-                                m.input.artifact.r#type,
-                                hplugin::driver::inputartifact::Type::Dep
-                            )
-                    });
+                    let mut members = dep_members_of(&input.origin_id);
                     let Some(m) = members.next() else {
                         continue;
                     };
@@ -6460,6 +6475,84 @@ bash apply_transitive: 96d371e95980d767
             .await?;
 
         assert_eq!(std::fs::read_to_string(&out)?, "unset");
+        Ok(())
+    }
+
+    /// A Support input sharing its origin_id with a Dep input stays out of
+    /// `SRC`/`LIST`: the Dep's list (listed after the Support) is what the
+    /// group's env and list file carry, line for line.
+    #[tokio::test]
+    async fn dep_list_routes_the_dep_not_a_support_sharing_its_origin() -> anyhow::Result<()> {
+        let driver = Driver::new_exec().with_host_path();
+        let ctoken = StdCancellationToken::new();
+        let tmp = tempfile::tempdir()?;
+        std::fs::create_dir_all(tmp.path().join("list"))?;
+        let origin_id = "dep|lib|0";
+        let src = || {
+            Addr::new(
+                hmodel::htpkg::PkgBuf::from("pkg"),
+                "lib".to_string(),
+                BTreeMap::new(),
+            )
+        };
+
+        let mut support =
+            make_tool_managed_input_full(origin_id, tmp.path(), tmp.path(), src(), "")?;
+        support.input.artifact.r#type = hplugin::driver::inputartifact::Type::Support;
+        support.list_path = None;
+        let dep = make_tool_managed_input_full(origin_id, tmp.path(), tmp.path(), src(), "")?;
+        let dep_list = dep.list_path.clone().expect("dep list");
+        std::fs::write(&dep_list, "pkg/a.txt\n\npkg/b.txt\n")?;
+
+        let out = tmp.path().join("seen.txt");
+        let script = format!(
+            "{{ printf '%s|' \"$SRC\"; cat \"$LIST_SRC\"; }} > {}",
+            out.display()
+        );
+        let target_def = EngineTargetDef {
+            raw_def: Arc::new(TargetDef {
+                run: vec![
+                    D::new("sh".to_string()),
+                    D::new("-c".to_string()),
+                    D::new(script),
+                ],
+                dep_group_inputs: BTreeMap::from([(
+                    String::new(),
+                    vec![Input {
+                        r#ref: hplugin::driver::TargetAddr::default(),
+                        mode: InputMode::Standard,
+                        origin_id: origin_id.to_string(),
+                        annotations: BTreeMap::new(),
+                        hashed: true,
+                        runtime: true,
+                    }],
+                )]),
+                ..Default::default()
+            }),
+            cache: CacheConfig::on(true),
+            pty: true,
+            ..Default::default()
+        };
+
+        let request_id = "test".to_string();
+        let req = RunRequest::new(&request_id, &target_def, tmp.path());
+        driver
+            .run(
+                ManagedRunRequest {
+                    sandbox_dir: tmp.path().to_path_buf(),
+                    sandbox_ws_dir: tmp.path().to_path_buf(),
+                    sandbox_pkg_dir: tmp.path().to_path_buf(),
+                    request: req,
+                    inputs: vec![support, dep],
+                },
+                &ctoken,
+            )
+            .await?;
+
+        assert_eq!(
+            std::fs::read_to_string(&out)?,
+            "pkg/a.txt pkg/b.txt|pkg/a.txt\npkg/b.txt\n"
+        );
         Ok(())
     }
 

@@ -980,7 +980,8 @@ fn exclude_any_cache() -> &'static RwLock<ExcludeCache> {
 /// tree is immutable, so the artifact set for a given `(root, pattern, excludes)`
 /// is stable — memoize it and skip the walk on repeat calls. Keyed by
 /// `request_id` (outer) and `(root, pattern, excludes)` (inner) so it never
-/// reuses a stale tree across requests.
+/// reuses a stale tree across requests. A request's bucket goes when the
+/// request ends ([`forget_request`]), as the exclude cache's does.
 type GlobResultBucket = FxHashMap<String, Arc<Vec<OutputArtifact>>>;
 /// request_id → its [`GlobResultBucket`].
 type GlobResultCache = FxHashMap<String, GlobResultBucket>;
@@ -988,6 +989,27 @@ type GlobResultCache = FxHashMap<String, GlobResultBucket>;
 fn glob_result_cache() -> &'static RwLock<GlobResultCache> {
     static CACHE: OnceLock<RwLock<GlobResultCache>> = OnceLock::new();
     CACHE.get_or_init(|| RwLock::new(GlobResultCache::default()))
+}
+
+/// Drops `request_id`'s buckets from the per-request caches. The engine calls
+/// it when the request ends, so the caches hold only live requests rather than
+/// growing for the life of the process.
+///
+/// Request ids are unique per process, not per engine, so this touches no
+/// other request's bucket — even one of another engine sharing these
+/// process-wide caches.
+pub fn forget_request(request_id: &str) {
+    exclude_any_cache().write().remove(request_id);
+    glob_result_cache().write().remove(request_id);
+}
+
+/// Whether either per-request cache holds a bucket for `request_id`: what an
+/// engine-level test observes to prove a request's end reaches
+/// [`forget_request`] with the id the driver keyed its memos by.
+#[cfg(any(test, feature = "test-support"))]
+pub fn holds_request(request_id: &str) -> bool {
+    exclude_any_cache().read().contains_key(request_id)
+        || glob_result_cache().read().contains_key(request_id)
 }
 
 /// Returns the compiled exclude `Any` (engine ignore globs + user `exclude`) for
@@ -3757,6 +3779,34 @@ mod tests {
             res2.artifacts.len(),
             1,
             "second run in same request must reuse memoized walk"
+        );
+    }
+
+    /// `forget_request` drops that request's buckets from both per-request
+    /// caches, and only its own: a live request keeps its memoized walk and
+    /// its compiled excludes.
+    #[test]
+    fn forget_request_drops_only_that_requests_buckets() {
+        let skip = Ignore::new(&[], &[]).unwrap();
+        let exclude = vec!["*.tmp".to_string()];
+        let (ended, live) = ("test-forget-ended", "test-forget-live");
+        for id in [ended, live] {
+            memoize_glob_walk(id, "k".to_string(), vec![]);
+            cached_exclude_any(&skip, id, &exclude).unwrap();
+        }
+        let live_any = cached_exclude_any(&skip, live, &exclude).unwrap();
+
+        forget_request(ended);
+
+        assert!(memoized_glob_walk(ended, "k").is_none());
+        assert!(!exclude_any_cache().read().contains_key(ended));
+        assert!(memoized_glob_walk(live, "k").is_some());
+        assert!(
+            Arc::ptr_eq(
+                &live_any,
+                &cached_exclude_any(&skip, live, &exclude).unwrap()
+            ),
+            "the live request still reuses its compiled excludes"
         );
     }
 

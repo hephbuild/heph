@@ -306,6 +306,9 @@ impl hplugin::driver::Driver for Driver {
         let plan = transform
             .plan(&sources)
             .with_context(|| format!("group {}", req.target.addr.format()))?;
+        // Each dep's listing seeds its view below, in the same order, so no
+        // source is listed (for a tar, header-scanned) a second time.
+        let mut sources = sources.into_iter();
 
         let mut artifacts = Vec::with_capacity(req.inputs.len());
         for (i, input) in req.inputs.iter().enumerate() {
@@ -345,23 +348,28 @@ impl hplugin::driver::Driver for Driver {
                     });
                 }
                 hplugin::driver::inputartifact::Type::Dep => {
-                    let view = Arc::new(ViewContent::new(
-                        Arc::clone(&input.artifact.content),
-                        transform.clone(),
-                        dep_package(input),
-                        plan.clone(),
-                    ));
+                    let src = sources
+                        .next()
+                        .context("fewer dep listings than dep inputs")?;
                     // Resolving here surfaces a collision as a failure of *this*
                     // target, naming the group, rather than as a confusing
                     // staging error inside whichever consumer happened to
                     // materialize it first.
-                    view.mapping().with_context(|| {
-                        format!(
-                            "applying group {} transform to outputs of '{}'",
-                            req.target.addr.format(),
-                            input.source_addr
+                    let view = Arc::new(
+                        ViewContent::with_source_paths(
+                            Arc::clone(&input.artifact.content),
+                            transform.clone(),
+                            plan.clone(),
+                            src,
                         )
-                    })?;
+                        .with_context(|| {
+                            format!(
+                                "applying group {} transform to outputs of '{}'",
+                                req.target.addr.format(),
+                                input.source_addr
+                            )
+                        })?,
+                    );
                     let hashout = view
                         .hashout()
                         .with_context(|| format!("hashout of view over '{}'", input.source_addr))?;
@@ -709,6 +717,18 @@ mod tests {
     // A minimal in-memory `Content` standing in for a dep's cached artifact.
     struct FakeArtifact {
         paths: Vec<String>,
+        /// How many times `entry_paths` was asked — for a tar-backed artifact,
+        /// each one is a header scan of the whole archive.
+        listed: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FakeArtifact {
+        fn new(paths: &[&str]) -> Self {
+            Self {
+                paths: paths.iter().map(|s| (*s).to_string()).collect(),
+                listed: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
     }
 
     impl hcore::hartifactcontent::Content for FakeArtifact {
@@ -735,21 +755,32 @@ mod tests {
             Ok("dephash".to_string())
         }
         fn entry_paths(&self) -> anyhow::Result<Vec<std::path::PathBuf>> {
+            self.listed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(self.paths.iter().map(std::path::PathBuf::from).collect())
         }
     }
 
     async fn run_group(def: &TargetDef, dep_paths: &[&[&str]]) -> anyhow::Result<RunResponse> {
-        let inputs: Vec<hplugin::driver::RunInput> = dep_paths
+        let deps: Vec<Arc<FakeArtifact>> = dep_paths
+            .iter()
+            .map(|paths| Arc::new(FakeArtifact::new(paths)))
+            .collect();
+        run_group_over(def, &deps).await
+    }
+
+    async fn run_group_over(
+        def: &TargetDef,
+        deps: &[Arc<FakeArtifact>],
+    ) -> anyhow::Result<RunResponse> {
+        let inputs: Vec<hplugin::driver::RunInput> = deps
             .iter()
             .enumerate()
-            .map(|(i, paths)| hplugin::driver::RunInput {
+            .map(|(i, dep)| hplugin::driver::RunInput {
                 artifact: hplugin::driver::inputartifact::InputArtifact {
                     r#type: hplugin::driver::inputartifact::Type::Dep,
                     origin_id: format!("dep{i}"),
-                    content: Arc::new(FakeArtifact {
-                        paths: paths.iter().map(|s| (*s).to_string()).collect(),
-                    }),
+                    content: Arc::clone(dep) as Arc<dyn hcore::hartifactcontent::Content>,
                 },
                 origin_id: format!("dep{i}"),
                 source_addr: parse_addr("//pkg:a").expect("addr"),
@@ -797,6 +828,35 @@ mod tests {
             .collect();
         paths.sort();
         assert_eq!(paths, vec!["lib/a/b.so", "lib/server"]);
+    }
+
+    /// A group lists each dep once per run: the listing that builds the plan
+    /// also seeds that dep's view, so neither the run nor a consumer asking the
+    /// view for its paths or entries lists the dep again.
+    #[tokio::test]
+    async fn run_lists_each_dep_once() {
+        let def = parse_group(&[("prefix", Value::String("lib".into()))]).await;
+        let deps = [
+            Arc::new(FakeArtifact::new(&["a", "b/c"])),
+            Arc::new(FakeArtifact::new(&["d"])),
+        ];
+        let resp = run_group_over(&def, &deps).await.expect("run");
+
+        let mut paths: Vec<String> = Vec::new();
+        for art in &resp.artifacts {
+            let content = hcore::hartifactcontent::Content::entry_paths(art).expect("paths");
+            paths.extend(content.iter().map(|p| p.to_string_lossy().into_owned()));
+        }
+        paths.sort();
+        assert_eq!(paths, vec!["lib/a", "lib/b/c", "lib/d"]);
+
+        for (i, dep) in deps.iter().enumerate() {
+            assert_eq!(
+                dep.listed.load(std::sync::atomic::Ordering::Relaxed),
+                1,
+                "dep {i} listed more than once"
+            );
+        }
     }
 
     /// The artifact hashout must reflect the transform, since that is what

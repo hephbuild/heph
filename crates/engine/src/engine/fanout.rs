@@ -56,8 +56,21 @@ where
     if fail_fast {
         return futures::future::try_join_all(futs).await;
     }
-    let results = futures::future::join_all(futs).await;
-    let mut ok = Vec::with_capacity(results.len());
+    collect_failable(futures::future::join_all(futs).await, false)
+}
+
+/// [`join_all_failable`] over results already in hand: the first `Err` in
+/// order under `fail_fast`, otherwise every error, a sole one bare and
+/// several as a [`MultiError`].
+pub fn collect_failable<T>(
+    results: impl IntoIterator<Item = anyhow::Result<T>>,
+    fail_fast: bool,
+) -> anyhow::Result<Vec<T>> {
+    if fail_fast {
+        return results.into_iter().collect();
+    }
+    let results = results.into_iter();
+    let mut ok = Vec::with_capacity(results.size_hint().0);
     let mut errs = Vec::new();
     for r in results {
         match r {

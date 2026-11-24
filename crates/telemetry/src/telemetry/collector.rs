@@ -286,7 +286,11 @@ impl TelemetryCollector {
     /// event stream, so this is recorded explicitly where `result_addr` produces
     /// the `EResult`. Sizes fold into the fixed histogram — constant memory.
     pub fn record_artifacts(&self, count: u64, sizes: &[u64]) {
-        self.artifacts.fetch_add(count, Ordering::Relaxed);
+        // Most calls record nothing (a meta edge reads no outputs); skip the
+        // shared RMW for those.
+        if count != 0 {
+            self.artifacts.fetch_add(count, Ordering::Relaxed);
+        }
         if sizes.is_empty() {
             return;
         }

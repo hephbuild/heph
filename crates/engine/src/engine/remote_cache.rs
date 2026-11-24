@@ -1517,17 +1517,17 @@ impl RemoteCacheSet {
                 .collect();
             // Bounded fan-out: each in-flight put holds a multipart buffer, so a
             // revision with thousands of artifacts must not open them all at
-            // once. Returning on the first error drops the stream, abandoning the
-            // rest — a cache that just failed isn't worth finishing.
-            let results = stream::iter(blob_puts)
-                .buffered(REVISION_BLOB_CONCURRENCY)
-                .collect::<Vec<_>>()
+            // once. Unordered, so a slow blob does not hold the next one back
+            // from a free slot. Returning on the first error drops the stream,
+            // abandoning the rest — a cache that just failed isn't worth
+            // finishing.
+            let uploaded: anyhow::Result<()> = stream::iter(blob_puts)
+                .buffer_unordered(REVISION_BLOB_CONCURRENCY)
+                .try_collect()
                 .await;
-            for res in results {
-                if let Err(e) = res {
-                    cache.note_err("blob upload", &e);
-                    return;
-                }
+            if let Err(e) = uploaded {
+                cache.note_err("blob upload", &e);
+                return;
             }
             // Manifest last: its presence implies every blob is already stored.
             let manifest_key = Self::key(addr, hashin, MANIFEST_V2);
@@ -2195,7 +2195,7 @@ impl Engine {
                     hashin.to_string(),
                     tmp_dir.to_path_buf(),
                 );
-                let (name, encoding) = (a.name.clone(), a.encoding.clone());
+                let name = a.name.clone();
                 async move {
                     run_codec("upload copy", move || {
                         use std::io::Read;
@@ -2210,7 +2210,7 @@ impl Engine {
                         let reader = sized.reader.take(sized.size);
                         copy_to_file(reader, temp.path())
                             .with_context(|| format!("copy local blob {name}"))?;
-                        Ok((name, temp, encoding))
+                        Ok((name, temp))
                     })
                     .await
                 }
@@ -2218,13 +2218,14 @@ impl Engine {
             .collect();
         // Bounded so a revision with thousands of artifacts doesn't open a temp
         // file per artifact at once; `CODEC_SLOTS` bounds the CPU underneath.
-        let prepared: Vec<(String, TempBlob, ManifestArtifactEncoding)> = stream::iter(copies)
-            .buffered(REVISION_BLOB_CONCURRENCY)
+        // Unordered: each copy is named, so nothing needs them in manifest order.
+        let prepared: Vec<(String, TempBlob)> = stream::iter(copies)
+            .buffer_unordered(REVISION_BLOB_CONCURRENCY)
             .try_collect()
             .await?;
 
-        // Build the remote manifest from the local one, each artifact keeping
-        // the encoding its blob is stored in.
+        // Build the remote manifest from the local one, in its order, each
+        // artifact keeping the encoding its blob is stored in.
         let remote_manifest = RemoteManifest {
             version: REMOTE_MANIFEST_VERSION.to_string(),
             target: manifest.target.clone(),
@@ -2232,15 +2233,14 @@ impl Engine {
             artifacts: manifest
                 .artifacts
                 .iter()
-                .zip(prepared.iter())
-                .map(|(a, (_, _, encoding))| RemoteManifestArtifact {
+                .map(|a| RemoteManifestArtifact {
                     hashout: a.hashout.clone(),
                     group: a.group.clone(),
                     name: a.name.clone(),
                     size: a.size,
                     r#type: a.r#type.clone(),
                     content_type: a.content_type.clone(),
-                    encoding: encoding.clone(),
+                    encoding: a.encoding.clone(),
                 })
                 .collect(),
         };
@@ -2249,7 +2249,7 @@ impl Engine {
 
         let temps: Vec<(String, PathBuf)> = prepared
             .iter()
-            .map(|(name, temp, _)| (name.clone(), temp.path().to_path_buf()))
+            .map(|(name, temp)| (name.clone(), temp.path().to_path_buf()))
             .collect();
         self.remote_caches
             .put_revision(addr, hashin, &manifest_bytes, &temps)
@@ -2362,13 +2362,14 @@ impl Engine {
 
         // Bounded fan-out — see `REVISION_BLOB_CONCURRENCY`. A target whose caller
         // asks for many output groups must not open every stream at once.
+        // Unordered, so one slow blob does not keep the next from a free slot.
         // Collected eagerly — see the note in `put_revision`.
         let pulls: Vec<_> = names
             .iter()
             .map(|name| self.pull_remote_blob(ctoken, addr, hashin, rev, name, tmp_dir))
             .collect();
         let served: Vec<bool> = stream::iter(pulls)
-            .buffered(REVISION_BLOB_CONCURRENCY)
+            .buffer_unordered(REVISION_BLOB_CONCURRENCY)
             .try_collect()
             .await?;
         Ok(served.into_iter().all(|ok| ok))
@@ -3904,6 +3905,251 @@ mod tests {
         assert!(
             peak <= REVISION_BLOB_CONCURRENCY,
             "blob fan-out must stay bounded, saw peak concurrency {peak}"
+        );
+    }
+
+    /// Fails the first blob's write at once and holds every other blob's open
+    /// forever, recording each key it is asked to open.
+    #[derive(Default)]
+    struct FirstBlobFailsBackend {
+        opened: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl RemoteCacheBackend for FirstBlobFailsBackend {
+        async fn open_read(
+            &self,
+            _key: &str,
+        ) -> anyhow::Result<Option<Pin<Box<dyn AsyncRead + Send>>>> {
+            Ok(None)
+        }
+        async fn open_write(&self, key: &str) -> anyhow::Result<Pin<Box<dyn AsyncWrite + Send>>> {
+            self.opened.lock().expect("opened").push(key.to_string());
+            if key.ends_with("/blob-0") {
+                anyhow::bail!("injected blob write failure");
+            }
+            std::future::pending().await
+        }
+        async fn exists(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        async fn list_names(&self, _prefix: &str) -> anyhow::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// A failed blob ends the cache's push: the puts still in flight are
+    /// dropped, no blob past the fan-out bound is started, and the manifest is
+    /// never written. Driving every put to completion first would hang here,
+    /// since the other blobs never finish.
+    #[tokio::test]
+    async fn a_failed_blob_stops_the_revision_upload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let addr = addr();
+        let blob_src = dir.path().join("src.blob");
+        std::fs::write(&blob_src, b"data").expect("write blob");
+        let blobs: Vec<(String, PathBuf)> = (0..FANOUT_ARTIFACTS)
+            .map(|i| (format!("blob-{i}"), blob_src.clone()))
+            .collect();
+        let backend = Arc::new(FirstBlobFailsBackend::default());
+        let set = set_with(backend.clone(), dir.path().to_path_buf());
+
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            set.put_revision(&addr, "h", b"manifest", &blobs),
+        )
+        .await
+        .expect("a failed blob must end the upload, not wait for the others");
+
+        let opened = backend.opened.lock().expect("opened").clone();
+        assert!(
+            opened.len() <= REVISION_BLOB_CONCURRENCY,
+            "no blob past the fan-out bound may start after a failure: {} opened",
+            opened.len()
+        );
+        assert!(
+            !opened.iter().any(|k| k.ends_with(MANIFEST_V2)),
+            "the manifest must not be written after a failed blob"
+        );
+    }
+
+    /// Serves a manifest and its blobs, but holds the first blob's open until
+    /// every other blob has been opened.
+    struct SlowHeadBackend {
+        objects: std::collections::HashMap<String, Vec<u8>>,
+        head: String,
+        others_opened: tokio::sync::watch::Sender<usize>,
+        others: usize,
+    }
+
+    #[async_trait]
+    impl RemoteCacheBackend for SlowHeadBackend {
+        async fn open_read(
+            &self,
+            key: &str,
+        ) -> anyhow::Result<Option<Pin<Box<dyn AsyncRead + Send>>>> {
+            if key == self.head {
+                let mut opened = self.others_opened.subscribe();
+                opened
+                    .wait_for(|n| *n >= self.others)
+                    .await
+                    .context("others_opened closed")?;
+            } else if !key.ends_with(MANIFEST_V2) {
+                self.others_opened.send_modify(|n| *n += 1);
+            }
+            Ok(self.objects.get(key).map(|b| {
+                Box::pin(std::io::Cursor::new(b.clone())) as Pin<Box<dyn AsyncRead + Send>>
+            }))
+        }
+        async fn open_write(&self, _key: &str) -> anyhow::Result<Pin<Box<dyn AsyncWrite + Send>>> {
+            anyhow::bail!("read-only backend")
+        }
+        async fn exists(&self, key: &str) -> anyhow::Result<bool> {
+            Ok(self.objects.contains_key(key))
+        }
+        async fn list_names(&self, _prefix: &str) -> anyhow::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// An engine over `dir` whose remote set is `remote`.
+    fn engine_with_set(dir: &Path, remote: Arc<RemoteCacheSet>) -> Arc<crate::engine::Engine> {
+        let mut engine = Arc::new(
+            crate::engine::Engine::new(crate::engine::Config::for_tests(dir)).expect("engine"),
+        );
+        Arc::get_mut(&mut engine)
+            .expect("engine must not be shared yet")
+            .remote_caches = remote;
+        engine
+    }
+
+    /// A pull of more blobs than the fan-out bound completes while its first
+    /// blob is slow: the blobs behind it take the slots the others free. The
+    /// first blob is released only once every other one has been opened, so
+    /// an ordered fan-out, which starts nothing past the bound until the first
+    /// blob is done, never gets there.
+    #[tokio::test]
+    async fn a_slow_first_blob_does_not_hold_the_pull_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let addr = addr();
+        let count = REVISION_BLOB_CONCURRENCY + 1;
+        let artifacts: Vec<RemoteManifestArtifact> = (0..count).map(probe_artifact).collect();
+        let manifest = RemoteManifest {
+            version: REMOTE_MANIFEST_VERSION.to_string(),
+            target: addr.format(),
+            hashin: "h".to_string(),
+            artifacts: artifacts.clone(),
+        };
+        let mut objects = std::collections::HashMap::new();
+        objects.insert(
+            RemoteCacheSet::key(&addr, "h", MANIFEST_V2),
+            borsh::to_vec(&manifest).expect("serialize manifest"),
+        );
+        for a in &artifacts {
+            objects.insert(RemoteCacheSet::key(&addr, "h", &a.name), b"data".to_vec());
+        }
+        let backend = Arc::new(SlowHeadBackend {
+            objects,
+            head: RemoteCacheSet::key(&addr, "h", "blob-0"),
+            others_opened: tokio::sync::watch::Sender::new(0),
+            others: count - 1,
+        });
+        let engine = engine_with_set(dir.path(), set_with(backend, dir.path().to_path_buf()));
+
+        let rev = engine
+            .remote_caches
+            .fetch_manifest(&never(), &addr, "h")
+            .await
+            .expect("fetch manifest")
+            .expect("hit");
+        let names: Vec<String> = artifacts.iter().map(|a| a.name.clone()).collect();
+        let served = tokio::time::timeout(
+            Duration::from_secs(30),
+            engine.pull_remote_blobs(&never(), &addr, "h", &rev, &names),
+        )
+        .await
+        .expect("the pull must not wait on its first blob to start the rest")
+        .expect("pull");
+        assert!(served, "every blob must be served");
+    }
+
+    /// The remote manifest an upload writes lists the local manifest's
+    /// artifacts in the local order, each with its local encoding — whatever
+    /// order the blob copies finish in.
+    #[tokio::test]
+    async fn the_uploaded_manifest_mirrors_the_local_one() {
+        use crate::engine::driver::outputartifact;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let remote = RemoteCacheSet::new(
+            &[def("m", "memory:///m", true, true)],
+            dir.path().to_path_buf(),
+        )
+        .expect("remote set");
+        let engine = engine_with_set(dir.path(), remote);
+        let addr = addr();
+        // Sizes far apart, so the copies need not finish in manifest order and
+        // the large one is stored compressed while the small ones are not.
+        let artifacts: Vec<outputartifact::OutputArtifact> = [
+            ("big", vec![b'x'; 512 * 1024]),
+            ("tiny", b"t".to_vec()),
+            ("mid", vec![b'm'; 4096]),
+        ]
+        .into_iter()
+        .map(|(name, data)| outputartifact::OutputArtifact {
+            group: format!("g-{name}"),
+            name: name.to_string(),
+            r#type: outputartifact::Type::Output,
+            content: outputartifact::Content::Raw(outputartifact::ContentRaw {
+                data,
+                path: format!("{name}.txt"),
+                x: false,
+            }),
+            hashout: format!("hashout-{name}"),
+        })
+        .collect();
+        engine
+            .cache_locally(&never(), &addr, "h", artifacts, false)
+            .await
+            .expect("cache_locally");
+        engine.upload_to_remote(&addr, "h").await;
+
+        let local = engine
+            .read_manifest_blocking(&never(), &addr, "h")
+            .await
+            .expect("read local manifest")
+            .expect("local manifest");
+        let rev = engine
+            .remote_caches
+            .fetch_manifest(&never(), &addr, "h")
+            .await
+            .expect("fetch manifest")
+            .expect("uploaded");
+        let want = RemoteManifest {
+            version: REMOTE_MANIFEST_VERSION.to_string(),
+            target: local.target.clone(),
+            hashin: "h".to_string(),
+            artifacts: local
+                .artifacts
+                .iter()
+                .map(|a| RemoteManifestArtifact {
+                    hashout: a.hashout.clone(),
+                    group: a.group.clone(),
+                    name: a.name.clone(),
+                    size: a.size,
+                    r#type: a.r#type.clone(),
+                    content_type: a.content_type.clone(),
+                    encoding: a.encoding.clone(),
+                })
+                .collect(),
+        };
+        assert_eq!(local.artifacts.len(), 3);
+        assert_eq!(
+            borsh::to_vec(&rev.manifest).expect("borsh"),
+            borsh::to_vec(&want).expect("borsh"),
+            "remote manifest {:?} != local {:?}",
+            rev.manifest,
+            local
         );
     }
 

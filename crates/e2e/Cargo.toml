@@ -31,6 +31,10 @@ hplugin-devenv = { package = "plugin-devenv", path = "../plugin-devenv" }
 # `heph.go.build_addr` in-process, for the def-hash pin in `plugin_functions`.
 hplugin-go = { package = "plugin-go", path = "../plugin-go" }
 hcore = { package = "core", path = "../core" }
+# `pluginfs::holds_request`: `fs_glob` checks a request's end drops its memos.
+hbuiltins = { package = "builtins", path = "../builtins", features = [
+    "test-support",
+] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] }
 futures = "0.3"
 # `resources::clamp_is_logged_once_per_addr_per_request` captures the engine's

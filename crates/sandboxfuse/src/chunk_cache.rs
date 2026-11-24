@@ -45,7 +45,9 @@ struct ChunkKey {
 }
 
 /// One chunk: `None` until its first successful load.
-type ChunkSlot = Mutex<Option<Arc<[u8]>>>;
+/// The bytes are an `Arc<Vec<u8>>` rather than an `Arc<[u8]>`, which a
+/// `Vec` can only become by copying every byte.
+type ChunkSlot = Mutex<Option<Arc<Vec<u8>>>>;
 
 #[derive(Debug)]
 struct Entry {
@@ -131,13 +133,17 @@ impl ChunkCache {
         layer: u64,
         index: u64,
         load: impl FnOnce() -> std::io::Result<Vec<u8>>,
-    ) -> std::io::Result<Arc<[u8]>> {
+    ) -> std::io::Result<Arc<Vec<u8>>> {
         let slot = self.slot(ChunkKey { layer, index });
         let mut chunk = slot.lock();
         if let Some(bytes) = &*chunk {
             return Ok(Arc::clone(bytes));
         }
-        let bytes: Arc<[u8]> = load()?.into();
+        let mut bytes = load()?;
+        // A short (final) chunk would otherwise hold a whole chunk's
+        // capacity for as long as it is cached. A full one is left as is.
+        bytes.shrink_to_fit();
+        let bytes = Arc::new(bytes);
         *chunk = Some(Arc::clone(&bytes));
         Ok(bytes)
     }

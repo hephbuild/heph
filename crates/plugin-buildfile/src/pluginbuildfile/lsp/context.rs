@@ -8,7 +8,7 @@ use super::index::{DocIndex, SharedState};
 use crate::pluginbuildfile::Provider;
 use crate::pluginbuildfile::provider::{DriverSource, PackageList};
 use crate::pluginbuildfile::run_file::{
-    BuildFileLoader, build_globals, eval_source, resolve_load_target,
+    BuildFileLoader, build_globals, eval_parsed, eval_source, resolve_load_target,
 };
 use crate::pluginbuildfile::types::DriverKwargs;
 use hcore::hasync::StdCancellationToken;
@@ -406,13 +406,12 @@ impl LspContext for HephLspContext {
         // and goto-definition keep working. We do not surface eval errors as
         // diagnostics (they would be noisy while typing).
         let pkg = self.path_to_pkg(&path);
-        let source = content.clone();
-        if let Ok(result) = eval_source(&filename, content, &pkg, &self.loader()) {
+        if let Ok(result) = eval_parsed(ast.clone(), &pkg, &self.loader()) {
             self.shared
-                .set_index(uri.clone(), DocIndex::build(&result, &pkg, source));
+                .set_index(uri.clone(), DocIndex::build(&result, &pkg, content));
         } else {
             self.shared
-                .set_index(uri.clone(), DocIndex::unevaluated(source));
+                .set_index(uri.clone(), DocIndex::unevaluated(content));
         }
 
         LspEvalResult {
