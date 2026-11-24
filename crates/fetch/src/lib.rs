@@ -36,8 +36,8 @@ pub struct Fetcher {
     /// any byte is written, and a body that grows past it fails as it does
     /// ([`TooLarge`]). `None` is no cap.
     pub max_bytes: Option<u64>,
-    /// Refuse a URL, or a redirect, whose scheme is not `https` ([`NotHttps`]
-    /// for the URL itself; reqwest refuses the redirect).
+    /// Refuse a URL, or a redirect, whose scheme is not `https`: [`NotHttps`]
+    /// for the URL itself, and for a redirect, in the error's source chain.
     pub https_only: bool,
 }
 
@@ -214,11 +214,8 @@ impl Fetcher {
                 .into());
             }
         }
-        let client = reqwest::Client::builder()
-            .connect_timeout(self.connect_timeout)
-            .read_timeout(self.read_timeout)
-            .user_agent(user_agent())
-            .https_only(self.https_only)
+        let client = self
+            .client_builder()
             .build()
             .context("build download client")?;
         let mut req = client.get(url);
@@ -234,6 +231,13 @@ impl Fetcher {
             .and_then(|r| r.error_for_status())
             .map_err(reqwest::Error::without_url)
             .with_context(|| format!("GET {}", redact_url(url)))?;
+        if self.https_only && resp.status().is_redirection() {
+            // A redirect the client handed back unfollowed: one whose
+            // `Location` is not an http(s) URI (`file:`), or none at all.
+            // Its body is not the download.
+            return Err(unfollowed_redirect(&resp))
+                .with_context(|| format!("GET {}", redact_url(url)));
+        }
         let body = Body {
             url,
             resp,
@@ -247,6 +251,57 @@ impl Fetcher {
         }
         Ok(body)
     }
+
+    /// The client [`open`](Self::open) sends with. With
+    /// [`https_only`](Self::https_only), every redirect is checked by heph's
+    /// own policy as well as by reqwest's `https_only`: a `Location` that is
+    /// not `https` is refused with [`NotHttps`], whatever reqwest does.
+    fn client_builder(&self) -> reqwest::ClientBuilder {
+        reqwest::Client::builder()
+            .connect_timeout(self.connect_timeout)
+            .read_timeout(self.read_timeout)
+            .user_agent(user_agent())
+            .https_only(self.https_only)
+            .redirect(redirect_policy(self.https_only))
+    }
+}
+
+/// A 3xx `resp` the client did not follow: [`NotHttps`] when its `Location`
+/// resolves to anything but `https`, else a plain error naming the status.
+fn unfollowed_redirect(resp: &reqwest::Response) -> anyhow::Error {
+    let target = resp
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|loc| loc.to_str().ok())
+        .and_then(|loc| resp.url().join(loc).ok());
+    match target {
+        Some(target) if target.scheme() != "https" => NotHttps {
+            url: redact_url(target.as_str()),
+        }
+        .into(),
+        _ => anyhow::anyhow!("a {} redirect that was not followed", resp.status()),
+    }
+}
+
+/// reqwest's default redirect limit, kept by [`redirect_policy`].
+const MAX_REDIRECTS: usize = 10;
+
+/// reqwest's default policy, or with `https_only` one that also refuses a
+/// redirect to anything but `https`, naming it redacted.
+fn redirect_policy(https_only: bool) -> reqwest::redirect::Policy {
+    if !https_only {
+        return reqwest::redirect::Policy::default();
+    }
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.url().scheme() != "https" {
+            let url = redact_url(attempt.url().as_str());
+            attempt.error(NotHttps { url })
+        } else if attempt.previous().len() > MAX_REDIRECTS {
+            attempt.error(format!("more than {MAX_REDIRECTS} redirects"))
+        } else {
+            attempt.follow()
+        }
+    })
 }
 
 /// What a GET sends beyond its URL. See [`Fetcher::open_with`].
@@ -793,6 +848,46 @@ mod tests {
             .get("not a url", &mut Vec::new(), |_| {})
             .expect_err("garbage must fail");
         assert!(format!("{err:#}").contains("parse URL"), "{err:#}");
+    }
+
+    /// An `https_only` fetcher's redirect to `http://` or `file:` is refused,
+    /// naming the target without its query: `http://` by heph's redirect
+    /// policy, `file:` (which the client hands back unfollowed, as a 302
+    /// with an empty body) by `open`'s status check. reqwest's `https_only`
+    /// would refuse the first, plain-http, request this local server can
+    /// answer, so the test lifts only that, keeping the client and the path
+    /// `open` uses; the `http://` target has no listener, so following it
+    /// would fail differently.
+    #[test]
+    fn https_only_refuses_a_redirect_off_https() {
+        let nobody = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let nobody_addr = nobody.local_addr().unwrap();
+        drop(nobody);
+        for location in [
+            format!("http://{nobody_addr}/y.hephsession?sig=hunter2"),
+            "file:///etc/passwd".to_owned(),
+        ] {
+            let addr = serve_raw(
+                format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\n\
+                     Connection: close\r\n\r\n"
+                )
+                .into_bytes(),
+            );
+            let fetcher = Fetcher::https_capped(1 << 20);
+            let client = fetcher.client_builder().https_only(false).build().unwrap();
+            let url = format!("http://{addr}/x.hephsession");
+            let err = block_on_own_runtime(&url, async {
+                fetcher.open_with(&client, &url).await.map(|_body| ())
+            })
+            .expect_err(&location);
+            let refused = err
+                .chain()
+                .find_map(|e| e.downcast_ref::<NotHttps>())
+                .unwrap_or_else(|| panic!("{location}: not NotHttps: {err:#}"));
+            assert_eq!(refused.url, redact_url(&location), "{err:#}");
+            assert!(!format!("{err:#}").contains("hunter2"), "{err:#}");
+        }
     }
 
     /// An announced length over the cap fails before any byte is written.

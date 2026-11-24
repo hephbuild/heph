@@ -97,6 +97,14 @@ fn ref_classification() {
             RefKind::Path(Path::new("02kf5.hephsession")),
         ),
         ("a/b", RefKind::Path(Path::new("a/b"))),
+        (
+            "./run#2.hephsession",
+            RefKind::Path(Path::new("./run#2.hephsession")),
+        ),
+        (
+            "run?x.hephsession",
+            RefKind::Path(Path::new("run?x.hephsession")),
+        ),
         ("/abs/run", RefKind::Path(Path::new("/abs/run"))),
         ("https://h/x", RefKind::Url("https://h/x")),
         ("HTTPS://h/x", RefKind::Url("HTTPS://h/x")),
@@ -452,6 +460,43 @@ async fn a_path_never_reads_the_local_session() {
         printed.starts_with(&format!("heph: replaying {arg}: incomplete\n")),
         "{printed}"
     );
+}
+
+/// A file whose name holds `#` or `?` (a URI's fragment and query markers)
+/// opens by that name: SQLite is handed a `file:` URI, and an unescaped `#`
+/// would open `run` instead, or nothing.
+#[tokio::test]
+async fn a_path_with_uri_characters_opens() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().join("sessions");
+    let id = SessionId::new(T0, 11);
+    let dir = write_ended(
+        &root,
+        &meta(id, 1, &["heph", "run", "//a:b"]),
+        &build_records("//a:b", T0, Some(0)),
+        &ended(Some(0), T0 + 10),
+    );
+    let empty = FakeSource::default();
+    let sources: [&dyn SessionSource; 1] = [&empty];
+    for name in [
+        "run#2.hephsession",
+        "run?x.hephsession",
+        "run%23.hephsession",
+    ] {
+        let out = tempfile::tempdir().expect("tempdir");
+        let path = out.path().join(name);
+        std::fs::copy(dir.join(store::FILE), &path).expect("copy the recording");
+        let arg = path.display().to_string();
+        let ftmp = tempfile::tempdir().expect("tempdir");
+        let op = opener_in(ftmp.path(), NoDownload);
+        let v = json(
+            &show_with(&sources, &arg, true, &op)
+                .await
+                .unwrap_or_else(|e| panic!("{name}: {e:#}")),
+        );
+        assert_eq!(v["id"], id.encode().as_str(), "{name}: {v}");
+        assert_eq!(v["foreign"]["origin"], arg.as_str(), "{name}: {v}");
+    }
 }
 
 /// Recorded text from a file, in a Log record, a notice and a failure log,
