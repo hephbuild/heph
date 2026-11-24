@@ -338,10 +338,7 @@ pub(crate) fn build_tool_inputs(
                     r#ref: TargetAddr::parse(&v, pkg)?,
                     mode: InputMode::Tool,
                     origin_id: format!("tool|{}|{}", k, i),
-                    annotations: BTreeMap::from([(
-                        "unpack_root".to_string(),
-                        TOOLS_UNPACK_ROOT.to_string(),
-                    )]),
+                    annotations: tool_annotations(),
                     hashed: true,
                     runtime: true,
                 },
@@ -349,6 +346,33 @@ pub(crate) fn build_tool_inputs(
         }
     }
     Ok(out)
+}
+
+/// The annotations of every tool input, declared by the target or reached
+/// through a dependency's transitive closure alike.
+///
+/// Tools are consumed read-only (executables on PATH, never mutated by the
+/// target), so the OS sandbox runner stages each one once into the shared
+/// stage dir and links it in, rather than copying every tool into every
+/// sandbox. `stage_per_file` forces the per-file link path: the tool consumer
+/// reads each input's file list and flattens every tool file into a `bin/` dir
+/// by basename, so it needs individual files listed — not the single
+/// subtree-root symlink the default staging emits.
+///
+/// Hashed with the rest of `tool_group_inputs`, deliberately: a staged file has
+/// its write bits stripped, which a run can observe (and copy into an output).
+fn tool_annotations() -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("unpack_root".to_string(), TOOLS_UNPACK_ROOT.to_string()),
+        (
+            hdriver_support::stage::READ_ONLY_ANNOTATION.to_string(),
+            "true".to_string(),
+        ),
+        (
+            hdriver_support::stage::STAGE_PER_FILE_ANNOTATION.to_string(),
+            "true".to_string(),
+        ),
+    ])
 }
 
 /// `(group, input)` pairs, grouped in order.
@@ -371,30 +395,11 @@ pub(crate) fn fold_transitive_inputs(
     runtime_dep_groups: &mut BTreeMap<String, Vec<Input>>,
 ) {
     for tool in &sandbox.tools {
-        // Tools are consumed read-only (executables on PATH, never mutated by
-        // the target), so let the OS sandbox runner stage them once into the
-        // shared stage dir and link them in rather than copying every tool
-        // into every sandbox. `stage_per_file` forces the per-file link path:
-        // the tool consumer reads each input's file list and flattens every
-        // tool file into a `bin/` dir by basename, so it needs individual
-        // files listed — not the single subtree-root symlink the default
-        // staging emits.
-        let annotations = BTreeMap::from([
-            ("unpack_root".to_string(), TOOLS_UNPACK_ROOT.to_string()),
-            (
-                hdriver_support::stage::READ_ONLY_ANNOTATION.to_string(),
-                "true".to_string(),
-            ),
-            (
-                hdriver_support::stage::STAGE_PER_FILE_ANNOTATION.to_string(),
-                "true".to_string(),
-            ),
-        ]);
         let input = Input {
             r#ref: tool.r#ref.clone(),
             mode: InputMode::Tool,
             origin_id: tool.id.clone(),
-            annotations,
+            annotations: tool_annotations(),
             hashed: tool.hash,
             runtime: true,
         };
@@ -5388,34 +5393,34 @@ mod tests {
         Ok(())
     }
 
-    const EXEC_DEF_GOLDEN_POPULATED: &str = r#"exec parse: 61dea7f3aa15aa34
+    const EXEC_DEF_GOLDEN_POPULATED: &str = r#"exec parse: 2db0f453468bbcdb
   dep|sdk|0 //tools/go:sdk hashed=true runtime=true {}
   dep|srcs|0 //app:a hashed=true runtime=true {}
   dep|srcs|1 //app:b hashed=true runtime=true {}
   hash_dep||0 //app:hashed hashed=true runtime=false {}
   runtime_dep||0 //app:rt hashed=false runtime=true {}
-  tool||0 //tools:jq hashed=true runtime=true {"unpack_root": "tools"}
-  tool||1 //tools:yq hashed=true runtime=true {"unpack_root": "tools"}
-  tool|cc|0 //toolchain:gcc hashed=true runtime=true {"unpack_root": "tools"}
+  tool||0 //tools:jq hashed=true runtime=true {"read_only": "true", "stage_per_file": "true", "unpack_root": "tools"}
+  tool||1 //tools:yq hashed=true runtime=true {"read_only": "true", "stage_per_file": "true", "unpack_root": "tools"}
+  tool|cc|0 //toolchain:gcc hashed=true runtime=true {"read_only": "true", "stage_per_file": "true", "unpack_root": "tools"}
   runner //tools/devenv:runner hashed=true runtime=false {}
-exec apply_transitive: 96d371e95980d767
+exec apply_transitive: fe449c83c9d9db5e
   dep|sdk|0 //tools/go:sdk hashed=true runtime=true {}
   dep|srcs|0 //app:a hashed=true runtime=true {}
   dep|srcs|1 //app:b hashed=true runtime=true {}
   hash_dep||0 //app:hashed hashed=true runtime=false {}
   runtime_dep||0 //app:rt hashed=false runtime=true {}
-  tool||0 //tools:jq hashed=true runtime=true {"unpack_root": "tools"}
-  tool||1 //tools:yq hashed=true runtime=true {"unpack_root": "tools"}
-  tool|cc|0 //toolchain:gcc hashed=true runtime=true {"unpack_root": "tools"}
+  tool||0 //tools:jq hashed=true runtime=true {"read_only": "true", "stage_per_file": "true", "unpack_root": "tools"}
+  tool||1 //tools:yq hashed=true runtime=true {"read_only": "true", "stage_per_file": "true", "unpack_root": "tools"}
+  tool|cc|0 //toolchain:gcc hashed=true runtime=true {"read_only": "true", "stage_per_file": "true", "unpack_root": "tools"}
   runner //tools/devenv:runner hashed=true runtime=false {}
   _transitive_x_0_tool_t0 //tools/node:node hashed=true runtime=true {"read_only": "true", "stage_per_file": "true", "unpack_root": "tools"}
   _transitive_x_0_dep_d0 //lib:mods hashed=true runtime=true {}
   _transitive_x_0_dep_d1 //lib:rt_only hashed=false runtime=true {}
   _transitive_x_0_dep_d2 //lib:hash_only hashed=true runtime=false {}
-exec+coreutils parse: cfde72931f33cb07
-exec+coreutils apply_transitive: b3d46d6cf3e2cfbf
-bash parse: 61dea7f3aa15aa34
-bash apply_transitive: 96d371e95980d767
+exec+coreutils parse: d4f9869fc82e648b
+exec+coreutils apply_transitive: a6a30f5238850bcb
+bash parse: 2db0f453468bbcdb
+bash apply_transitive: fe449c83c9d9db5e
 "#;
 
     /// `entrypoint = False` is no flag at all: the golden's exec and bash def
@@ -5451,7 +5456,7 @@ bash apply_transitive: 96d371e95980d767
             let mut config = golden_populated_config();
             config.insert("entrypoint".to_string(), Value::Bool(false));
             let def = parse(driver(), config).await?;
-            assert_eq!(String::from_utf8_lossy(&def.hash), "61dea7f3aa15aa34");
+            assert_eq!(String::from_utf8_lossy(&def.hash), "2db0f453468bbcdb");
             assert!(def.entrypoint.is_none());
             let json = serde_json::to_string(&def)?;
             assert!(!json.contains("entrypoint"), "{json}");

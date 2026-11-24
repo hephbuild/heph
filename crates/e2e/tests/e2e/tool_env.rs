@@ -152,6 +152,75 @@ target(
     Ok(())
 }
 
+/// A tool the target declares itself (`tools = …`) is staged once into the
+/// shared stage and linked into each consumer's sandbox, exactly like a tool
+/// reached through a dependency's transitive closure — not copied into every
+/// sandbox. Shaped like an SDK: an entry binary plus a `support_files` tree,
+/// and the tree reaches each sandbox as a subtree symlink, not one link per
+/// file — a gcloud SDK is ~57k files, and linking each costs what copying did.
+#[tokio::test]
+async fn a_declared_tool_is_staged_once_for_every_consumer() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "sdktool",
+        r#"
+target(
+    name = "tool",
+    driver = "bash",
+    run = [
+        "mkdir -p sdk/bin sdk/lib",
+        "echo declared-tool-marker > sdk/lib/data.txt",
+        "printf '#!/bin/sh\\ncat \"$(dirname \"$(readlink -f \"$0\")\")/../lib/data.txt\"\\n' > sdk/bin/hello",
+        "chmod +x sdk/bin/hello",
+    ],
+    out = {"hello": "sdk/bin/hello"},
+    support_files = ["sdk/"],
+)
+"#,
+    );
+    ws.write_build_file(
+        "sdkuse",
+        r#"
+target(name = "a", driver = "bash", tools = ["//sdktool:tool"], run = "hello > $OUT", out = "a.txt")
+target(name = "b", driver = "bash", tools = {"h": "//sdktool:tool"}, run = "$TOOL_H > $OUT", out = "b.txt")
+target(
+    name = "shape",
+    driver = "bash",
+    tools = ["//sdktool:tool"],
+    run = 'if [ -L "$HEPH_TOOLS_DIR/sdktool/sdk/lib" ]; then echo subtree; else echo per-file; fi > $OUT',
+    out = "shape.txt",
+)
+"#,
+    );
+    let shape = ws.run("//sdkuse:shape").await?;
+    assert_eq!(
+        common::artifact_string(&shape).trim(),
+        "subtree",
+        "the support tree is linked as a subtree, not file by file"
+    );
+
+    for addr in ["//sdkuse:a", "//sdkuse:b"] {
+        let result = ws.run(addr).await?;
+        let content = common::artifact_string(&result);
+        assert_eq!(
+            content.trim(),
+            "declared-tool-marker",
+            "{addr}: {content:?}"
+        );
+    }
+
+    let staged = crate::failure_slot::files_containing(
+        &ws.engine.home.join("stage"),
+        "declared-tool-marker",
+    );
+    assert_eq!(
+        staged.len(),
+        1,
+        "the tool's support file is staged once, for both consumers: {staged:?}"
+    );
+    Ok(())
+}
+
 /// Shaped like `protoc`: a binary plus a data directory the consumer passes on
 /// its command line. `greet` prints `$1/greeting.txt`.
 const GREET_SDK_BUILD: &str = r#"
