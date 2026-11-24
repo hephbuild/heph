@@ -791,9 +791,9 @@ fn host_name() -> Option<String> {
 }
 
 /// Create `dir/session.db` with its schema and session row: under a temp
-/// name, WAL checked, closed, renamed, and reopened by its final name (SQLite
-/// names `-wal` after the path a connection opened). The write connection
-/// comes with its [`RwOpen`] registration, to drop after it.
+/// name, then switched to WAL (checked), closed, renamed, and reopened by its
+/// final name (SQLite names `-wal` after the path a connection opened). The
+/// write connection comes with its [`RwOpen`] registration, to drop after it.
 pub(crate) fn create(
     dir: &Path,
     meta: &SessionMeta,
@@ -815,15 +815,23 @@ pub(crate) fn create(
         // one synced commit per statement, and set before the switch to WAL
         // so the switch does not sync either. A crash before the rename
         // leaves only the temp name, which nothing reads.
-        conn.execute_batch("PRAGMA synchronous=OFF;")
+        //
+        // The schema goes in under a rollback journal kept in memory (no
+        // journal file, and still one transaction that rolls back whole),
+        // and only then is the file switched to WAL: the switch only stamps
+        // the header, no `-wal` is ever opened on the temp name, and the
+        // close has nothing to checkpoint. The header is WAL before the
+        // rename, as a reader of a held lock requires (a rollback header
+        // reads as sealed).
+        conn.execute_batch("PRAGMA synchronous=OFF; PRAGMA journal_mode=MEMORY;")
             .context("configuring the new recording")?;
+        init(&conn, meta, provenance)?;
         let mode: String = conn
             .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
             .context("switching the recording to WAL")?;
         if refuse_wal || !mode.eq_ignore_ascii_case("wal") {
             anyhow::bail!("the filesystem refused WAL mode (journal_mode is {mode})");
         }
-        init(&conn, meta, provenance)?;
         conn.close()
             .map_err(|(_, e)| e)
             .with_context(|| format!("closing {}", tmp.display()))?;

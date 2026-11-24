@@ -131,9 +131,12 @@ workspace rooted at `$HOME`, whose home is `~/.heph`.
 | `inflight.txt` | by the owner | the last in-flight report |
 
 `session.db` is created under a temporary name (`.session.db.creating`) with
-its schema, format stamp and session row in place, closed, renamed, and
-reopened by its final name, so no viewer ever opens a half-made file and no
-`-wal` is ever left named after the temporary name. A filesystem that
+its schema, format stamp and session row in place (under a rollback journal
+kept in memory, then switched to WAL, so the temporary name never has a
+`-wal` and its close has nothing to checkpoint), closed, renamed, and
+reopened by its final name, so no viewer ever opens a half-made file, the
+file is in WAL mode from the moment it has its final name, and no `-wal` is
+ever left named after the temporary name. A filesystem that
 refuses WAL mode (some network filesystems) stops the recorder before the
 rename, with its one `warn!` (see [Recording](#recording)).
 
