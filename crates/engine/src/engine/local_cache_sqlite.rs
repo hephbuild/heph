@@ -38,21 +38,16 @@ const READ_POOL_TIMEOUT: Duration = Duration::from_secs(30);
 /// [`LocalCacheSQLite::check_schema`].
 const SCHEMA_CHECK_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// Read connections to keep beyond the pipe budget, for the callers that take one
-/// with **no** pipe permit.
+/// Read connections to keep beyond the streaming-read (pipe permit) budget, for
+/// the callers that take one with **no** permit.
 ///
-/// Sizing the pool at exactly the pipe budget leaves zero headroom, and the pipe
-/// path holds its connection for the *consumer's* whole drain — so a burst of
-/// streaming reads can own every connection for an unbounded time while `exists`,
-/// `list_targets`, `list_target_entries`, `seekable_reader` and the SELECT phase
-/// of `reader` are still trying to acquire one. Those then block for
-/// [`READ_POOL_TIMEOUT`] on paths that are supposed to be a single indexed
-/// lookup.
-///
-/// It also breaks a scheduling cycle: a queued `rayon::spawn` pipe-copy owns a
-/// connection it cannot release until rayon runs it, while a rayon worker sits in
-/// `read_pool.get()`. With headroom the unpermitted caller is served from spare
-/// capacity and the copy gets to run.
+/// Sizing the pool at exactly the permit budget leaves zero headroom, and a
+/// streaming read holds its connection until the *consumer* drops the reader —
+/// so a burst of streaming reads can own every connection for an unbounded time
+/// while `exists`, `list_targets`, `list_target_entries`, `seekable_reader` and
+/// the SELECT phase of `reader` are still trying to acquire one. Those then
+/// block for [`READ_POOL_TIMEOUT`] on paths that are supposed to be a single
+/// indexed lookup.
 ///
 /// **A budget, not a proof.** The demand it covers is real threads — tokio
 /// workers, `hcore::blocking` jobs, rayon, and on Linux one FUSE session
@@ -87,6 +82,9 @@ const WRITE_BATCH_MAX_BYTES: i64 = 32 * 1024 * 1024;
 
 type Key = (String, String, String);
 
+/// Bounds the streaming reads open at once, each of which holds a pooled
+/// connection until its reader drops. The "pipe" names (this, the permit,
+/// `with_pipe_limit`) are from when the streaming path copied through a pipe.
 struct PipeSemaphore {
     count: Mutex<usize>,
     condvar: Condvar,
@@ -138,6 +136,9 @@ impl Drop for PipePermit {
     }
 }
 
+/// A streaming read and the permit it was opened under. Field order matters:
+/// `inner` (and the pooled connection it holds) drops first, so a thread the
+/// released permit wakes finds that connection back in the pool.
 struct GuardedReader<R: io::Read> {
     inner: R,
     _permit: PipePermit,
@@ -744,9 +745,8 @@ impl LocalCacheSQLite {
     /// It never creates, migrates or writes the database: one that is missing
     /// or below [`SCHEMA_VERSION`] is unavailable, and every write errors.
     ///
-    /// Every blob is read inline, on the caller's thread: such a reader reads
-    /// a few small blobs whole, and has no business starting the pipe copy's
-    /// thread pool.
+    /// Every blob is read whole, inline: such a reader reads a few small blobs,
+    /// and has no use for the streaming path's permits.
     pub(crate) fn open_read_only(db_path: PathBuf) -> Result<Self> {
         let mut cache = Self::with_pool_config(
             db_path,
@@ -1417,24 +1417,19 @@ impl LocalCache for LocalCacheSQLite {
         drop(blob);
         drop(conn);
 
-        // Semaphore acquired before pool to bound concurrent open pipes (= open FDs).
+        // Semaphore acquired before pool, to bound the streaming reads (each
+        // holding a pooled connection) to the permit budget.
         let permit = self.pipe_sem.acquire();
-        let mut blob = OwnedBlob::new(self.read_conn()?, &addr_key, hashin, name)?;
+        let blob = OwnedBlob::new(self.read_conn()?, &addr_key, hashin, name)?;
         let size = blob.len() as u64;
 
-        let (pipe_reader, mut pipe_writer) =
-            io::pipe().with_context(|| format!("creating pipe for sqlite blob read of {name}"))?;
-
-        // Move the blob, and the pooled connection it owns, into the rayon pool;
-        // the connection returns to the pool on drop.
-        rayon::spawn(move || {
-            drop(io::copy(&mut blob, &mut pipe_writer));
-        });
-
+        // The consumer reads the blob directly; the blob and its connection go
+        // back to the pool when the reader drops, then the permit is released.
+        // A read error reaches the consumer as one.
         Ok(SizedReader {
             size,
             reader: Box::new(GuardedReader {
-                inner: pipe_reader,
+                inner: blob,
                 _permit: permit,
             }),
             bytes: None,
@@ -1476,7 +1471,8 @@ impl LocalCache for LocalCacheSQLite {
     }
 
     /// One point lookup of `length(data)`, rather than the default's `reader`,
-    /// which spawns a copy of a large blob into a pipe only to drop it.
+    /// which takes a streaming permit and a second connection for a large blob
+    /// only to drop them.
     fn stored_size(&self, addr: &Addr, hashin: &str, name: &str) -> Result<Option<u64>> {
         let addr_key = Self::key(addr);
         self.pending.wait_if_pending(&addr_key, hashin, name);
@@ -2353,19 +2349,16 @@ mod tests {
         Ok(())
     }
 
-    /// Blobs whose streaming reads will park with a pooled connection held.
+    /// Blobs whose streaming reads are held open, each with a pooled connection.
     ///
-    /// Deliberately small: each held reader leaves a `rayon::spawn`'d `io::copy`
-    /// blocked writing into a full pipe, and rayon's pool is global to the test
-    /// binary. Taking more than a couple would stall unrelated tests that read a
-    /// blob, and the flake would be reported against them.
+    /// Small, so a saturated cache is cheap to build: the tests below need the
+    /// permit budget full, not large.
     const HELD_PIPES: usize = 2;
 
-    /// Writes `HELD_PIPES` oversized blobs and returns readers for all of them,
-    /// undrained — so every pipe permit and its pooled connection stays taken.
+    /// Writes `HELD_PIPES` blobs above the inline threshold and returns readers
+    /// for all of them, undrained — so every pipe permit and its pooled
+    /// connection stays taken until the readers drop.
     fn saturate_pipes(cache: &LocalCacheSQLite, addr: &Addr) -> Result<Vec<SizedReader>> {
-        // Over the pipe buffer, so the copy blocks with the connection held
-        // rather than finishing and handing it straight back.
         let payload = vec![7u8; 4 * 1024 * 1024];
         for i in 0..HELD_PIPES {
             let mut w = cache.writer(addr, "h", &format!("blob{i}"))?;
@@ -3329,6 +3322,42 @@ mod tests {
             outcome(read, &my_bytes, &their_bytes, "seekable");
         }
         assert!(wrong.is_empty(), "{wrong:#?}");
+        Ok(())
+    }
+
+    /// A streaming read whose key is deleted part way through either errors or
+    /// delivers the whole blob. A short `Ok` is the one wrong answer: the
+    /// consumer would take a truncated blob for the artifact. The pipe copy this
+    /// path once went through swallowed a read error as an early EOF.
+    #[test]
+    fn a_delete_mid_stream_never_reads_short() -> Result<()> {
+        let dir = tempdir()?;
+        let cache = LocalCacheSQLite::with_pipe_limit(
+            dir.path().join("cache.db"),
+            0,
+            DEFAULT_MAX_CONCURRENT_PIPES,
+        )?;
+        let addr = make_addr("pkg", "t");
+        let data: Vec<u8> = (0..512 * 1024usize).map(|i| (i % 251) as u8).collect();
+        put(&cache, &addr, "blob", &data)?;
+
+        let mut r = cache.reader(&addr, "h", "blob")?.reader;
+        let mut head = vec![0u8; 4096];
+        r.read_exact(&mut head)?;
+        // `delete` waits for its batch to commit.
+        cache.delete(&addr, "h", "blob")?;
+        assert!(!cache.exists(&addr, "h", "blob")?, "precondition: deleted");
+
+        let mut rest = Vec::new();
+        if r.read_to_end(&mut rest).is_ok() {
+            head.extend_from_slice(&rest);
+            assert!(
+                head == data,
+                "a read that succeeds must deliver every byte: got {} of {}",
+                head.len(),
+                data.len()
+            );
+        }
         Ok(())
     }
 
