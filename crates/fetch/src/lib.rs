@@ -83,6 +83,25 @@ impl std::fmt::Display for NotHttps {
 
 impl std::error::Error for NotHttps {}
 
+/// `url` as it may appear in a message: no userinfo, no query, no fragment.
+/// A signed URL (`?X-Amz-Signature=…`) carries its credential in the query,
+/// so every error this crate builds names the URL this way, and reqwest's own
+/// errors lose theirs ([`reqwest::Error::without_url`]). Text that does not
+/// parse as a URL is not echoed at all.
+pub fn redact_url(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(mut u) => {
+            // Only fails for a URL that cannot have credentials.
+            let _ok = u.set_username("");
+            let _ok = u.set_password(None);
+            u.set_query(None);
+            u.set_fragment(None);
+            u.to_string()
+        }
+        Err(_) => "the URL".to_owned(),
+    }
+}
+
 impl Fetcher {
     /// The default timeouts, `https://` only, at most `max_bytes` of body.
     pub fn https_capped(max_bytes: u64) -> Self {
@@ -98,8 +117,13 @@ impl Fetcher {
     ///
     /// Blocks the calling thread, as [`get`](Self::get) does.
     pub fn get_to_temp(&self, url: &str, dir: &Path) -> anyhow::Result<tempfile::NamedTempFile> {
-        let mut file = tempfile::NamedTempFile::new_in(dir)
-            .with_context(|| format!("create a temp file in {} for {url}", dir.display()))?;
+        let mut file = tempfile::NamedTempFile::new_in(dir).with_context(|| {
+            format!(
+                "create a temp file in {} for {}",
+                dir.display(),
+                redact_url(url)
+            )
+        })?;
         self.get(
             url,
             &mut std::io::BufWriter::new(file.as_file_mut()),
@@ -144,10 +168,11 @@ impl Fetcher {
         let mut written = 0u64;
         while let Some(chunk) = body.chunk().await? {
             w.write_all(&chunk)
-                .with_context(|| format!("write body of {url}"))?;
+                .with_context(|| format!("write body of {}", redact_url(url)))?;
             written += chunk.len() as u64;
         }
-        w.flush().with_context(|| format!("write body of {url}"))?;
+        w.flush()
+            .with_context(|| format!("write body of {}", redact_url(url)))?;
         Ok(written)
     }
 
@@ -178,11 +203,13 @@ impl Fetcher {
         url: &'u str,
         opts: RequestOptions<'_>,
     ) -> anyhow::Result<Body<'u>> {
+        // Every message names the URL without what may be a credential.
         if self.https_only {
-            let parsed = reqwest::Url::parse(url).with_context(|| format!("parse URL {url}"))?;
+            let parsed = reqwest::Url::parse(url)
+                .with_context(|| format!("parse URL {}", redact_url(url)))?;
             if parsed.scheme() != "https" {
                 return Err(NotHttps {
-                    url: url.to_string(),
+                    url: redact_url(url),
                 }
                 .into());
             }
@@ -205,7 +232,8 @@ impl Fetcher {
             .send()
             .await
             .and_then(|r| r.error_for_status())
-            .with_context(|| format!("GET {url}"))?;
+            .map_err(reqwest::Error::without_url)
+            .with_context(|| format!("GET {}", redact_url(url)))?;
         let body = Body {
             url,
             resp,
@@ -334,7 +362,8 @@ impl Body<'_> {
             .resp
             .chunk()
             .await
-            .with_context(|| format!("download {url}"))?;
+            .map_err(reqwest::Error::without_url)
+            .with_context(|| format!("download {}", redact_url(url)))?;
         if let Some(chunk) = &chunk {
             let read = self.read.saturating_add(chunk.len() as u64);
             if let Some(max) = self.max_bytes.filter(|max| read > *max) {
@@ -346,7 +375,8 @@ impl Body<'_> {
     }
 
     fn too_large(&self, max_bytes: u64) -> anyhow::Error {
-        anyhow::Error::new(TooLarge { max_bytes }).context(format!("download {}", self.url))
+        anyhow::Error::new(TooLarge { max_bytes })
+            .context(format!("download {}", redact_url(self.url)))
     }
 }
 
@@ -368,7 +398,7 @@ fn block_on_own_runtime<T: Send>(
                 .block_on(fut)
         })
         .join()
-        .map_err(|_e| anyhow::anyhow!("download thread for {url} panicked"))?
+        .map_err(|_e| anyhow::anyhow!("download thread for {} panicked", redact_url(url)))?
     })
 }
 
@@ -465,18 +495,18 @@ impl<W: Write> Sha256Writer<W> {
         for chunk in chunks {
             self.hw
                 .write_all(chunk.as_ref())
-                .with_context(|| format!("write body of {url}"))?;
+                .with_context(|| format!("write body of {}", redact_url(url)))?;
         }
         self.hw
             .flush()
-            .with_context(|| format!("write body of {url}"))
+            .with_context(|| format!("write body of {}", redact_url(url)))
     }
 
     /// Flush what was written and return its lowercase hex SHA-256.
     pub fn finish(mut self, url: &str) -> anyhow::Result<String> {
         self.hw
             .flush()
-            .with_context(|| format!("write body of {url}"))?;
+            .with_context(|| format!("write body of {}", redact_url(url)))?;
         Ok(hex::encode(self.hw.hasher.finalize()))
     }
 }
@@ -642,6 +672,64 @@ mod tests {
         assert!(!shown.contains("material"), "{shown}");
     }
 
+    /// A signed URL's query and fragment, and any userinfo, never reach an
+    /// error's text: not this crate's contexts, not reqwest's own message,
+    /// not [`NotHttps`].
+    #[test]
+    fn errors_never_carry_a_query_fragment_or_userinfo() {
+        const SECRETS: [&str; 3] = ["sekrit", "frag", "hunter2"];
+        let check = |err: &anyhow::Error, base: &str| {
+            for text in [format!("{err:#}"), format!("{err:?}")] {
+                for s in SECRETS {
+                    assert!(!text.contains(s), "{s} in: {text}");
+                }
+                assert!(text.contains(base), "{base} not in: {text}");
+            }
+        };
+        let signed = |base: &str| format!("{base}?X-Amz-Signature=sekrit#frag");
+
+        // An error status: reqwest names the URL in its own message.
+        let addr = serve_raw(
+            b"HTTP/1.1 404 Not Found\r\ncontent-length: 4\r\nconnection: close\r\n\r\nnope"
+                .to_vec(),
+        );
+        let base = format!("http://{addr}/x");
+        let err = get(&signed(&base), &mut Vec::new()).expect_err("404");
+        check(&err, &base);
+
+        // A connect failure.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let base = format!("http://{addr}/x");
+        let err = get(&signed(&base), &mut Vec::new()).expect_err("refused");
+        check(&err, &base);
+
+        // A body over the cap.
+        let addr = serve_raw(
+            b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\nconnection: close\r\n\r\ntests".to_vec(),
+        );
+        let base = format!("http://{addr}/x");
+        let err = capped(4)
+            .get(&signed(&base), &mut Vec::new(), |_| {})
+            .expect_err("over the cap");
+        check(&err, &base);
+
+        // Refused by scheme, userinfo included.
+        let err = Fetcher::https_capped(1)
+            .get(
+                "http://u:hunter2@h.invalid/x?X-Amz-Signature=sekrit#frag",
+                &mut Vec::new(),
+                |_| {},
+            )
+            .expect_err("http");
+        check(&err, "http://h.invalid/x");
+        assert_eq!(
+            err.downcast_ref::<NotHttps>().map(|e| e.url.as_str()),
+            Some("http://h.invalid/x")
+        );
+    }
+
     /// Serve `response` verbatim to one request, then close. Returns the
     /// address.
     fn serve_raw(response: Vec<u8>) -> std::net::SocketAddr {
@@ -693,7 +781,9 @@ mod tests {
                 .expect_err("http must be refused");
             assert_eq!(
                 err.downcast_ref::<NotHttps>(),
-                Some(&NotHttps { url: url.clone() }),
+                Some(&NotHttps {
+                    url: redact_url(&url)
+                }),
                 "{err:#}"
             );
             assert!(format!("{err:#}").contains("only https://"), "{err:#}");

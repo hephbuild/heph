@@ -144,6 +144,82 @@ async fn credentials_in_a_url_are_refused_and_never_echoed() {
     }
 }
 
+/// A signed URL's query and fragment are a credential: they never reach
+/// `foreign.origin`, the "read from" or "replaying" lines, or an error's
+/// `--json` message. What the download itself reports is `hfetch`'s to
+/// redact (its own test).
+#[tokio::test]
+async fn a_signed_url_query_never_reaches_the_output() {
+    const BASE: &str = "https://bucket.invalid/run.hephsession";
+    const SIGNED: &str =
+        "https://bucket.invalid/run.hephsession?X-Amz-Signature=sekrit&X-Amz-Credential=AKIA#frag";
+    let clean = |text: &str| {
+        for s in ["sekrit", "AKIA", "frag", "X-Amz"] {
+            assert!(!text.contains(s), "{s} in: {text}");
+        }
+    };
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let id = SessionId::new(T0, 12);
+    let dir = write_ended(
+        &tmp.path().join("sessions"),
+        &meta(id, 1, &["heph", "run", "//a:b"]),
+        &build_records("//a:b", T0, None),
+        &ended(Some(0), T0 + 10),
+    );
+    let body = std::fs::read(dir.join(store::FILE)).expect("read the recording");
+    let empty = FakeSource::default();
+    let sources: [&dyn SessionSource; 1] = [&empty];
+    let ftmp = tempfile::tempdir().expect("tempdir");
+    let op = opener_in(ftmp.path(), Serve(body));
+
+    let text = show_with(&sources, SIGNED, false, &op)
+        .await
+        .expect("show the download");
+    clean(&text);
+    assert_eq!(
+        text.lines().next(),
+        Some(format!("read from {BASE}").as_str()),
+        "{text}"
+    );
+    let v = json(
+        &show_with(&sources, SIGNED, true, &op)
+            .await
+            .expect("show --json"),
+    );
+    clean(&v.to_string());
+    assert_eq!(v["foreign"]["origin"], BASE, "{v}");
+    // No End record among these events: attach replays, then says so.
+    let (res, printed) = attach_captured(&sources, SIGNED, &op).await;
+    clean(&format!("{:#}", res.expect_err("no recorded end")));
+    clean(&printed);
+    assert!(
+        printed.starts_with(&format!("heph: replaying {BASE}\n")),
+        "{printed}"
+    );
+
+    // An error names the URL the same way.
+    let html = opener_in(ftmp.path(), Serve(b"<!doctype html>".to_vec()));
+    for url in [
+        SIGNED,
+        "http://bucket.invalid/run?X-Amz-Signature=sekrit#frag",
+    ] {
+        let e = show_with(&sources, url, true, &html)
+            .await
+            .expect_err("not a session");
+        let mut out = Vec::new();
+        write_json_error(&e, &mut out).expect("json");
+        let out = String::from_utf8(out).expect("utf-8");
+        clean(&out);
+        clean(&format!("{e:#}"));
+        assert!(
+            json(&out)["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("bucket.invalid/run")),
+            "{out}"
+        );
+    }
+}
+
 /// The spec's `12345`: a live session's pid first, then an id that starts or
 /// ends with it, then an error naming both readings.
 #[tokio::test]

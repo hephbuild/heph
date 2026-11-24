@@ -55,20 +55,11 @@ pub(crate) fn classify(arg: &str) -> anyhow::Result<RefKind<'_>> {
     Ok(RefKind::Id(arg))
 }
 
-/// `url` without the credentials it may carry, for messages: they never
-/// reach error text.
+/// `url` without the credentials it may carry (userinfo, and the query and
+/// fragment a signed URL holds its signature in), for `foreign.origin` and
+/// every message: they never reach the output.
 pub(crate) fn redact_url(url: &str) -> String {
-    match url::Url::parse(url) {
-        Ok(mut u) => {
-            if !u.username().is_empty() || u.password().is_some() {
-                // Only fails for a URL that cannot have credentials.
-                let _ok = u.set_username("");
-                let _ok = u.set_password(None);
-            }
-            u.to_string()
-        }
-        Err(_) => "the URL".to_owned(),
-    }
+    hfetch::redact_url(url)
 }
 
 /// Downloads a `.hephsession` given by URL: `hfetch::Fetcher` in production,
