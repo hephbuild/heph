@@ -84,11 +84,12 @@ pub const FINISH_TIMEOUT: Duration = Duration::from_secs(3);
 /// What the seal leaves of [`FINISH_TIMEOUT`] for the answer to reach the
 /// finisher, so it is not cut short while the seal still runs.
 const FINISH_MARGIN: Duration = Duration::from_millis(250);
-/// The most the owner's seal waits on another connection to the file: the
-/// PR 2 gate bounds a seal with a viewer attached at 500 ms. A follower closes
-/// within a [`super::source::FOLLOW_TICK`] of `End`, well inside it; a
-/// connection that stays open (a `sqlite3` shell) cuts the seal short, and the
-/// next cleanup seals the recording.
+/// The most any owner's seal takes, whatever blocks its switch out of WAL:
+/// the PR 2 gate bounds a seal with a viewer attached at 500 ms. A follower
+/// closes within a [`super::source::FOLLOW_TICK`] of `End`, well inside it.
+/// A seal still blocked at 400 ms (a connection that stays open, such as a
+/// `sqlite3` shell) is cut short: the recording stays in WAL mode, the lock is
+/// released, and the next cleanup seals it.
 pub(crate) const SEAL_BUDGET: Duration = Duration::from_millis(400);
 
 /// What the recorder thread is sent.

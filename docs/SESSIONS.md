@@ -61,8 +61,9 @@ another terminal can see. It is still recorded, into
 `~/.heph/private-sessions/<id>/` instead of `sessions/`, because a closed full
 screen replays its log lines from there (see [Recording](#recording)); `list`
 never reads that directory, so `show` and `attach` cannot name it. The run
-removes it when it finishes, and every session start, public or private,
-sweeps the private sessions a killed run left (see [Retention](#retention)).
+removes it when it finishes. A killed run's directory stays until the next
+cleanup sweeps it, which runs at most once an hour (see
+[Retention](#retention)), so it can linger for up to an hour.
 It is read once, by the front end, beside `HOME`; with no `HOME` it records
 nothing. This is a change of contract: before run logs, `HEPH_NO_SESSION=1`
 wrote nothing under `~/.heph` at all. It now writes there while the run
@@ -824,8 +825,10 @@ claimed:
 - A public start that claims its root also claims, under that root's own
   stamp, the private root beside it (below).
 
-So a removal past `session.keep` or `session.keepBytes`, and the sealing of
-a lost session, can lag by up to an hour. Readers already handle that: a
+So retention is enforced at the next hourly cleanup, not at once: a removal
+past `session.keep` or `session.keepBytes`, a change to either key
+(`keep: 0` included), and the sealing of a lost session all take effect up
+to an hour later. Readers already handle that: a
 lost recording not yet sealed is read through a copy (see
 [Reading](#reading)), and a removed one was past retention either way.
 
@@ -875,8 +878,8 @@ session:
 
 `keep` takes a duration (`7d`, `36h`, `90m`), `keepBytes` a size (`2G`,
 `500MiB`, `1048576`). `0` is zero, never "unset" or "no limit": `keep: 0`
-keeps no ended recording, so the next cleanup removes every ended one
-past the 60s start grace however young, and `keepBytes: 0` removes every
+keeps no ended recording, so the next cleanup (at most an hour later)
+removes every ended one past the 60s start grace however young, and `keepBytes: 0` removes every
 sealed one it can count (one it cannot count still goes by age). Live and
 starting sessions are untouched either way. A value that does not
 parse (`-1`, `5x`, a number past 2^64) is a warning naming its key, and that
@@ -890,7 +893,10 @@ Every cleanup also cleans `~/.heph/private-sessions/` with nothing kept
 (`Retention::PRIVATE`), at most hourly under that root's own `.cleanup`
 stamp: an ended private session (lock free, so a killed run's) goes
 whatever its age and is never sealed, a live one is never touched, and one
-still starting is left alone as above.
+still starting is left alone as above. A public start sweeps it only when it
+has claimed its own root's cleanup; a private start claims the private root
+directly. So a killed run's private directory can linger up to an hour,
+while a run that ends normally removes its own at once.
 
 ## Recipes
 
