@@ -35,6 +35,7 @@ use hplugin::htspec::{Spec, TargetSpecCache};
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use xxhash_rust::xxh3::Xxh3Default;
 
 pub const DRIVER_NAME: &str = "http_fetch";
@@ -203,28 +204,45 @@ impl ManagedDriver for Driver {
             .ok_or_else(|| anyhow::anyhow!("http_fetch: out {:?} has no file name", def.out))?;
         let dest = req.sandbox_pkg_dir.join(name);
 
-        let url = def.url.clone();
-        let sha256 = def.sha256.clone();
-        let executable = def.executable;
-
-        // Download + verify + write is blocking IO; keep it off the async runtime.
-        // Cancellation is honored by racing the join handle against the token (the
-        // blocking work can't be interrupted mid-syscall, but we stop awaiting it).
-        let work =
-            tokio::task::spawn_blocking(move || fetch(&url, &sha256, executable, &dest.clone()));
-
-        let fetch = async {
-            work.await
-                .context("http_fetch download task panicked")?
-                .with_context(|| format!("fetch {}", def.url))
-        };
-
-        tokio::select! {
-            r = fetch => r?,
-            () = ctoken.cancelled() => anyhow::bail!("http_fetch: {} cancelled", def.url),
-        }
+        fetch_until_cancelled(&def.url, &def.sha256, def.executable, &dest, ctoken).await?;
 
         Ok(ManagedRunResponse { artifacts: vec![] })
+    }
+}
+
+/// [`fetch`], abandoned the moment `ctoken` fires.
+///
+/// The transfer runs on the host's runtime (this driver is built into the
+/// binary, never a cdylib), so cancelling drops it: the transfer stops, the
+/// connection closes, and the partial file is removed before this returns.
+async fn fetch_until_cancelled(
+    url: &str,
+    expected_sha256: &str,
+    executable: bool,
+    dest: &std::path::Path,
+    ctoken: &(dyn Cancellable + Send + Sync),
+) -> anyhow::Result<()> {
+    match fetch(url, expected_sha256, executable, dest, ctoken.cancelled()).await {
+        Ok(Fetched::Done) => Ok(()),
+        Ok(Fetched::Cancelled) => anyhow::bail!("http_fetch: {url} cancelled"),
+        Err(err) => Err(err).with_context(|| format!("fetch {url}")),
+    }
+}
+
+/// How [`fetch`] ended, when it did not fail.
+#[derive(Debug, PartialEq, Eq)]
+enum Fetched {
+    Done,
+    /// The cancel signal fired first. Nothing is left at `dest`.
+    Cancelled,
+}
+
+/// Remove what an abandoned or failed download left at `dest`, if anything.
+fn remove_partial(dest: &std::path::Path) {
+    if let Err(rm_err) = std::fs::remove_file(dest)
+        && rm_err.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::debug!(path = ?dest, error = %rm_err, "remove failed download");
     }
 }
 
@@ -289,32 +307,194 @@ fn render(template: &str, args: &BTreeMap<String, String>) -> anyhow::Result<Str
 }
 
 /// Download `url`, verify it against `expected_sha256` (when non-empty), and
-/// write it to `dest`. Pure blocking work. The body is streamed to `dest` and
-/// hashed on the way; a failed download or a mismatch removes it again.
-fn fetch(
+/// write it to `dest`. The body is streamed to `dest` and hashed on the way; a
+/// failed download, a mismatch or `cancelled` firing removes it again.
+async fn fetch(
     url: &str,
     expected_sha256: &str,
     executable: bool,
     dest: &std::path::Path,
-) -> anyhow::Result<()> {
-    let verified = std::fs::File::create(dest)
-        .with_context(|| format!("create {dest:?}"))
-        .and_then(|f| {
-            hfetch::get_sha256(url, &mut std::io::BufWriter::new(f))
-                .with_context(|| format!("download to {dest:?}"))
-        })
-        .and_then(|got| verify_checksum(expected_sha256, &got, url));
-    if let Err(err) = verified {
-        if let Err(rm_err) = std::fs::remove_file(dest) {
-            tracing::debug!(path = ?dest, error = %rm_err, "remove failed download");
+    cancelled: impl Future<Output = ()>,
+) -> anyhow::Result<Fetched> {
+    let verified = match download(url, dest, cancelled).await {
+        Ok(Some(got)) => verify_checksum(expected_sha256, &got, url),
+        Ok(None) => {
+            remove_partial(dest);
+            return Ok(Fetched::Cancelled);
         }
+        Err(err) => Err(err),
+    };
+    if let Err(err) = verified {
+        remove_partial(dest);
         return Err(err);
     }
 
     if executable {
         set_executable(dest).with_context(|| format!("chmod +x {dest:?}"))?;
     }
-    Ok(())
+    Ok(Fetched::Done)
+}
+
+/// How many batches of the body may wait for the file writer, on top of the
+/// one it is writing.
+const WRITE_QUEUE: usize = 1;
+
+/// Received bytes the transfer gathers, while the writer is busy, before it
+/// waits for the writer.
+const WRITE_BATCH: usize = 1024 * 1024;
+
+/// The file a body is written into, and the hash of what has landed in it.
+type BodyFile = hfetch::Sha256Writer<std::io::BufWriter<std::fs::File>>;
+
+/// The transfer's end of the channel to the writer. Unless the transfer marked
+/// the body `whole`, dropping it sets `abandoned` before the sender goes, so a
+/// writer woken by the channel closing already sees the flag.
+struct Feed<'a, T> {
+    tx: tokio::sync::mpsc::Sender<T>,
+    abandoned: &'a AtomicBool,
+    whole: bool,
+}
+
+impl<T> Feed<'_, T> {
+    /// The whole body has been handed to the writer: dropping this no longer
+    /// abandons the download.
+    fn received_whole(&mut self) {
+        self.whole = true;
+    }
+}
+
+impl<T> Drop for Feed<'_, T> {
+    fn drop(&mut self) {
+        // `drop` runs before the fields are dropped, so this happens before
+        // the sender closes the channel.
+        if !self.whole {
+            self.abandoned.store(true, Ordering::Release);
+        }
+    }
+}
+
+/// Stream `url` into a new file at `dest` and return the body's SHA-256, or
+/// `None` when `cancelled` fired first.
+///
+/// The transfer runs on the caller's runtime, so `cancelled` drops it and
+/// closes the connection. It hands the body to the writer in batches over a
+/// bounded channel: whatever has arrived as soon as the writer can take it, at
+/// most [`WRITE_BATCH`] bytes gathered while it cannot, so a slow disk holds
+/// the transfer back rather than queuing the body in memory.
+///
+/// Creating the file, writing a batch and finishing the hash are each one short
+/// job on the blocking pool, so a runtime worker never waits on the disk. The
+/// file and its hasher wait in the writer between jobs: a download waiting on
+/// the network holds no blocking slot, which cache IO, sqlite reads and
+/// Starlark evaluation need too.
+///
+/// Every way out (end of body, failure, cancel) drops the sender, which ends
+/// the writer once its last job has finished, and this returns only once the
+/// writer has ended — so the caller can remove what it wrote without racing it.
+/// A transfer that did not receive the whole body marks itself abandoned
+/// first, and the writer starts no further job: the file is about to be
+/// removed, so writing the queued batch or hashing it would only take a
+/// blocking slot.
+async fn download(
+    url: &str,
+    dest: &std::path::Path,
+    cancelled: impl Future<Output = ()>,
+) -> anyhow::Result<Option<String>> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(WRITE_QUEUE);
+    let abandoned = AtomicBool::new(false);
+    let abandoned = &abandoned;
+    let writer = async move {
+        let gone = || anyhow::anyhow!("download to {dest:?} abandoned");
+        if abandoned.load(Ordering::Acquire) {
+            return Err(gone());
+        }
+        let mut file = hcore::blocking::run({
+            let dest = dest.to_owned();
+            move || -> anyhow::Result<BodyFile> {
+                let f = std::fs::File::create(&dest).with_context(|| format!("create {dest:?}"))?;
+                Ok(hfetch::Sha256Writer::new(std::io::BufWriter::new(f)))
+            }
+        })
+        .await?;
+        let job_url: std::sync::Arc<str> = url.into();
+        while let Some(batch) = rx.recv().await {
+            if abandoned.load(Ordering::Acquire) {
+                return Err(gone());
+            }
+            let url = job_url.clone();
+            file = hcore::blocking::run(move || {
+                file.write_chunks(&url, batch)?;
+                anyhow::Ok(file)
+            })
+            .await
+            .with_context(|| format!("download to {dest:?}"))?;
+        }
+        // The channel closed: the sender was dropped, after any abandon.
+        if abandoned.load(Ordering::Acquire) {
+            return Err(gone());
+        }
+        hcore::blocking::run(move || file.finish(&job_url))
+            .await
+            .with_context(|| format!("download to {dest:?}"))
+    };
+    // Built here, not inside `send_body`, so a transfer dropped before its
+    // first poll still marks itself abandoned.
+    let mut feed = Feed {
+        tx,
+        abandoned,
+        whole: false,
+    };
+    // Owns `feed`, so the sender is dropped the moment the transfer ends or
+    // is dropped.
+    let send_body = async move {
+        let tx = &feed.tx;
+        let mut body = hfetch::Fetcher::default().open(url).await?;
+        let mut batch = Vec::new();
+        let mut batched = 0;
+        loop {
+            // Hand the batch over the moment the writer can take it, and
+            // keep receiving meanwhile up to `WRITE_BATCH`. `Body::chunk` is
+            // cancel-safe, so losing the race to `reserve` drops no bytes.
+            tokio::select! {
+                biased;
+                permit = tx.reserve(), if !batch.is_empty() => {
+                    // The writer has gone: it failed, and its error is the
+                    // one to report.
+                    let Ok(permit) = permit else {
+                        return anyhow::Ok(());
+                    };
+                    permit.send(std::mem::take(&mut batch));
+                    batched = 0;
+                }
+                // Never both disabled: a full batch is not empty.
+                chunk = body.chunk(), if batched < WRITE_BATCH => {
+                    let Some(chunk) = chunk? else { break };
+                    batched += chunk.len();
+                    batch.push(chunk);
+                }
+            }
+        }
+        // As above, a writer that has gone has its own error to report.
+        if !batch.is_empty() && tx.send(batch).await.is_err() {
+            return anyhow::Ok(());
+        }
+        feed.received_whole();
+        anyhow::Ok(())
+    };
+    let transfer = async {
+        tokio::select! {
+            r = send_body => Some(r.with_context(|| format!("download to {dest:?}"))),
+            () = cancelled => None,
+        }
+    };
+    let (sent, written) = tokio::join!(transfer, writer);
+    match sent {
+        None => Ok(None),
+        // A transfer that failed fails the download, whatever the writer did
+        // with the part it got.
+        Some(Err(err)) => Err(err),
+        Some(Ok(())) => written.map(Some),
+    }
 }
 
 #[cfg(unix)]
@@ -430,14 +610,17 @@ mod tests {
     /// sha256 of `BODY`.
     const BODY_SHA: &str = "a2e1a3b0f1b0d0e08b6ad0aad9f0f7cbb90b9f19e5e0ff5a1a5d0ba9e4a9e0f7";
 
-    #[test]
-    fn fetch_writes_executable_file() {
+    #[tokio::test]
+    async fn fetch_writes_executable_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         let dest = dir.path().join("tool");
         let url = serve("200 OK", BODY, 1);
 
         // Checksum unset → fetched unverified (warns); the bytes still land.
-        fetch(&url, "", true, &dest).expect("fetch");
+        let fetched = fetch(&url, "", true, &dest, std::future::pending())
+            .await
+            .expect("fetch");
+        assert_eq!(fetched, Fetched::Done);
 
         assert_eq!(std::fs::read(&dest).expect("read"), BODY);
         #[cfg(unix)]
@@ -448,13 +631,35 @@ mod tests {
         }
     }
 
-    #[test]
-    fn fetch_rejects_checksum_mismatch_without_writing() {
+    /// A body several write batches long lands whole, in order, and verifies
+    /// against its checksum.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fetch_writes_a_body_larger_than_a_batch() {
+        let body: &'static [u8] = (0..3 * WRITE_BATCH + 17)
+            .map(|i| (i % 251) as u8)
+            .collect::<Vec<_>>()
+            .leak();
+        let (sha, _len) = hfetch::sha256_hex_of(body).expect("hash");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("tool");
+        let url = serve("200 OK", body, 1);
+
+        let fetched = fetch(&url, &sha, false, &dest, std::future::pending())
+            .await
+            .expect("fetch");
+        assert_eq!(fetched, Fetched::Done);
+        assert!(std::fs::read(&dest).expect("read") == body, "body differs");
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_checksum_mismatch_without_writing() {
         let dir = tempfile::tempdir().expect("tempdir");
         let dest = dir.path().join("tool");
         let url = serve("200 OK", b"tampered", 1);
 
-        let err = fetch(&url, BODY_SHA, false, &dest).expect_err("mismatch must fail");
+        let err = fetch(&url, BODY_SHA, false, &dest, std::future::pending())
+            .await
+            .expect_err("mismatch must fail");
         assert!(
             format!("{err:#}").contains("checksum mismatch"),
             "got: {err:#}"
@@ -462,14 +667,285 @@ mod tests {
         assert!(!dest.exists(), "a mismatched download must not be written");
     }
 
-    #[test]
-    fn fetch_fails_on_http_error_status() {
+    #[tokio::test]
+    async fn fetch_fails_on_http_error_status() {
         let dir = tempfile::tempdir().expect("tempdir");
         let dest = dir.path().join("tool");
         let url = serve("404 Not Found", b"", 1);
 
-        let err = fetch(&url, "", false, &dest).expect_err("404 must fail");
+        let err = fetch(&url, "", false, &dest, std::future::pending())
+            .await
+            .expect_err("404 must fail");
         assert!(format!("{err:#}").contains("GET"), "got: {err:#}");
+    }
+
+    /// Cancelling mid-transfer stops the download: the run returns at once,
+    /// the server sees its connection closed, and no partial file is left.
+    /// The download used to run on a blocking thread the token could not
+    /// reach, so it held the connection until the body ended or timed out.
+    #[tokio::test]
+    async fn cancel_mid_transfer_closes_the_connection_and_removes_the_file() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}/tool", listener.local_addr().expect("addr"));
+        let (sent_tx, sent_rx) = tokio::sync::oneshot::channel();
+        let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let Ok((mut sock, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            let _ = std::io::Read::read(&mut sock, &mut buf);
+            // Announce far more than is ever sent, so the body never ends.
+            let head = "HTTP/1.1 200 OK\r\nContent-Length: 100000000\r\n\r\n";
+            let _ = std::io::Write::write_all(&mut sock, head.as_bytes());
+            let _ = std::io::Write::write_all(&mut sock, &[0u8; 64 * 1024]);
+            let _ = sent_tx.send(());
+            // Blocks until the client closes its end (EOF) — or never.
+            let closed = matches!(std::io::Read::read(&mut sock, &mut buf), Ok(0) | Err(_));
+            let _ = closed_tx.send(closed);
+        });
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("tool");
+        let ctoken = hcore::hasync::StdCancellationToken::new();
+        let cancel = ctoken.clone();
+        tokio::spawn(async move {
+            let _ = sent_rx.await;
+            cancel.cancel();
+        });
+
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            fetch_until_cancelled(&url, "", false, &dest, &ctoken),
+        )
+        .await
+        .expect("a cancelled fetch returns at once")
+        .expect_err("a cancelled fetch fails");
+        assert!(format!("{err:#}").contains("cancelled"), "got: {err:#}");
+        assert!(!dest.exists(), "a cancelled download must not leave a file");
+        let closed = tokio::task::spawn_blocking(move || {
+            closed_rx.recv_timeout(std::time::Duration::from_secs(10))
+        })
+        .await
+        .expect("join");
+        assert_eq!(closed, Ok(true), "cancel must close the connection");
+    }
+
+    /// Serve a body that never ends: `sent` bytes, then hold the connection
+    /// until the client closes it. Returns the URL.
+    fn serve_endless(sent: usize) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}/tool", listener.local_addr().expect("addr"));
+        std::thread::spawn(move || {
+            let Ok((mut sock, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            let _ = std::io::Read::read(&mut sock, &mut buf);
+            let head = "HTTP/1.1 200 OK\r\nContent-Length: 100000000\r\n\r\n";
+            let _ = std::io::Write::write_all(&mut sock, head.as_bytes());
+            let _ = std::io::Write::write_all(&mut sock, &vec![0u8; sent]);
+            let _ = std::io::Read::read(&mut sock, &mut buf);
+        });
+        url
+    }
+
+    /// Cancelling once the writer has put bytes on disk: the run returns, and
+    /// the partial file is gone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_mid_write_removes_the_partial_file() {
+        let url = serve_endless(256 * 1024);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("tool");
+        let ctoken = hcore::hasync::StdCancellationToken::new();
+        let cancel = ctoken.clone();
+        let watched = dest.clone();
+        tokio::spawn(async move {
+            while std::fs::metadata(&watched).map_or(0, |m| m.len()) == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            cancel.cancel();
+        });
+
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            fetch_until_cancelled(&url, "", false, &dest, &ctoken),
+        )
+        .await
+        .expect("a cancelled fetch returns at once")
+        .expect_err("a cancelled fetch fails");
+        assert!(format!("{err:#}").contains("cancelled"), "got: {err:#}");
+        assert!(!dest.exists(), "a cancelled download must not leave a file");
+    }
+
+    /// Every byte received reaches the disk while the network stalls. Bytes
+    /// that arrived while the writer was busy used to wait in the transfer for
+    /// the next chunk, which a stalled network never sends.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stalled_body_reaches_the_disk_in_full() {
+        const SENT: usize = 256 * 1024;
+        let url = serve_endless(SENT);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("tool");
+        let ctoken = StdCancellationToken::new();
+        let download = tokio::spawn({
+            let (dest, ctoken) = (dest.clone(), ctoken.clone());
+            async move { fetch_until_cancelled(&url, "", false, &dest, &ctoken).await }
+        });
+        let on_disk = || std::fs::metadata(&dest).map_or(0, |m| m.len());
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while on_disk() < SENT as u64 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let landed = on_disk();
+
+        ctoken.cancel();
+        let err = download
+            .await
+            .expect("join")
+            .expect_err("a cancelled fetch fails");
+        assert!(format!("{err:#}").contains("cancelled"), "got: {err:#}");
+        assert_eq!(
+            landed, SENT as u64,
+            "every byte received must reach the disk while the network stalls"
+        );
+        assert!(!dest.exists(), "a cancelled download must not leave a file");
+    }
+
+    /// A cancelled download starts no further blocking job: its file is about
+    /// to be removed, so flushing and hashing it would only take a slot. With
+    /// every slot held, the cancel still returns at once. The writer used to
+    /// queue `finish` for a slot, and the fetch waited for it before removing
+    /// the file.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_download_starts_no_blocking_job() {
+        let url = serve_endless(0);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("tool");
+        let ctoken = StdCancellationToken::new();
+        let download = tokio::spawn({
+            let (dest, ctoken) = (dest.clone(), ctoken.clone());
+            async move { fetch_until_cancelled(&url, "", false, &dest, &ctoken).await }
+        });
+        // The writer has created the file and waits on a body that never
+        // starts.
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !dest.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the download creates its file");
+
+        // Hold every blocking slot until `releases` is dropped.
+        let n = hcore::blocking::concurrency_limit();
+        let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut releases = Vec::with_capacity(n);
+        let mut holders = tokio::task::JoinSet::new();
+        for _ in 0..n {
+            let (release, held) = std::sync::mpsc::channel::<()>();
+            releases.push(release);
+            let started = started.clone();
+            holders.spawn(hcore::blocking::run(move || {
+                started.fetch_add(1, Ordering::SeqCst);
+                while held.recv().is_ok() {}
+            }));
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while started.load(Ordering::SeqCst) < n {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("every blocking slot is held");
+
+        ctoken.cancel();
+        let returned = tokio::time::timeout(std::time::Duration::from_secs(5), download).await;
+        drop(releases);
+        while let Some(joined) = holders.join_next().await {
+            joined.expect("join");
+        }
+        let err = returned
+            .expect("a cancelled download needs no blocking slot to return")
+            .expect("join")
+            .expect_err("a cancelled fetch fails");
+        assert!(format!("{err:#}").contains("cancelled"), "got: {err:#}");
+        assert!(!dest.exists(), "a cancelled download must not leave a file");
+    }
+
+    /// Cancelled before the writer job has run: the file the job then creates
+    /// is still removed, because the fetch waits for the job before removing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_before_the_writer_runs_leaves_no_file_behind() {
+        let url = serve_endless(0);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("tool");
+        let ctoken = hcore::hasync::StdCancellationToken::new();
+        ctoken.cancel();
+
+        let err = fetch_until_cancelled(&url, "", false, &dest, &ctoken)
+            .await
+            .expect_err("a cancelled fetch fails");
+        assert!(format!("{err:#}").contains("cancelled"), "got: {err:#}");
+        // A job still running after the fetch returned would create the file
+        // now; give it the time to.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!dest.exists(), "a cancelled download must not leave a file");
+    }
+
+    /// A download waiting on the network holds no blocking slot. With as many
+    /// stalled downloads in flight as there are slots, another blocking job
+    /// still runs at once. The writer used to park in its slot for the whole
+    /// transfer, so a few slow downloads starved cache IO, sqlite reads and
+    /// Starlark evaluation of every slot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stalled_downloads_hold_no_blocking_slot() {
+        let n = hcore::blocking::concurrency_limit();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ctoken = StdCancellationToken::new();
+        let mut downloads = tokio::task::JoinSet::new();
+        let mut dests = Vec::with_capacity(n);
+        for i in 0..n {
+            let url = serve_endless(64 * 1024);
+            let dest = dir.path().join(format!("tool-{i}"));
+            dests.push(dest.clone());
+            let ctoken = ctoken.clone();
+            downloads
+                .spawn(async move { fetch_until_cancelled(&url, "", false, &dest, &ctoken).await });
+        }
+        // Every download has created its file and now waits on a body that
+        // never ends. Waiting for the file, not for bytes in it: a writer that
+        // kept its slot for the whole transfer created the file inside that
+        // slot too, so it fails the assertion below rather than this wait.
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            for dest in &dests {
+                while !dest.exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            }
+        })
+        .await
+        .expect("every download creates its file");
+
+        let other = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            hcore::blocking::run(|| 42),
+        )
+        .await;
+
+        ctoken.cancel();
+        while let Some(joined) = downloads.join_next().await {
+            let err = joined.expect("join").expect_err("a cancelled fetch fails");
+            assert!(format!("{err:#}").contains("cancelled"), "got: {err:#}");
+        }
+        assert_eq!(
+            other,
+            Ok(42),
+            "a blocking job must not wait for {n} stalled downloads"
+        );
+        for dest in &dests {
+            assert!(!dest.exists(), "a cancelled download must not leave a file");
+        }
     }
 
     fn parse_req(addr: &str, config: HashMap<String, Value>) -> ParseRequest {

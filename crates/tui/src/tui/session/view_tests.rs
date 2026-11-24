@@ -18,9 +18,7 @@ use super::*;
 use crate::tui::app::{Decide, TUIAppView};
 use crate::tui::approval::{ApprovalCenter, ApprovalNoticeView};
 use crate::tui::dashboard::approval::test_store;
-use crate::tui::progress::{
-    BuildHeader, BuildState, CountScope, HeaderItem, ProgressHeader, TuiProgressView,
-};
+use crate::tui::progress::{BuildHeader, BuildState, CountScope, ProgressHeader, TuiProgressView};
 
 const WIDTH: u16 = 140;
 const HEIGHT: u16 = 16;
@@ -37,10 +35,6 @@ struct SharedLabel {
 }
 
 impl ProgressHeader for SharedLabel {
-    fn header(&self, core: &BuildState, scope: CountScope) -> Vec<HeaderItem> {
-        self.inner.header(core, scope)
-    }
-
     fn label(&self) -> String {
         self.label
             .lock()

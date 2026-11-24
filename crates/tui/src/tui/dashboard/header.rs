@@ -24,7 +24,7 @@ pub struct Title<'a> {
     /// `auto-approving (Y)` / `auto-rejecting (N)`; never dropped.
     pub standing: Option<&'a str>,
     /// How the run ended, once it has; `None` while it runs.
-    pub verdict: Option<Verdict>,
+    pub verdict: Option<&'a Verdict>,
 }
 
 /// A finished run's verdict, as the line's final line words it: `✓ done`
@@ -230,7 +230,7 @@ fn title_spans(t: &Title<'_>, level: u8, command_cols: Option<usize>) -> Vec<Spa
         (None, _) => format!("{} done", t.done),
     };
     let lead = if out.is_empty() { "" } else { "   " };
-    match &t.verdict {
+    match t.verdict {
         Some(v) => {
             let color = if v.ok { Color::Green } else { Color::Red };
             out.push(Span::styled(
@@ -360,73 +360,8 @@ pub fn header_lines_hits(
     active: Tab,
     cols: u16,
 ) -> ([Line<'static>; 4], Levels, TabHits) {
+    let ([title_row, gauge_row], mut lv) = header_top(title, gauges, cols);
     let cols = usize::from(cols);
-    // The title and gauge rows start one column in.
-    let inner = cols.saturating_sub(1);
-    let mut lv = Levels::default();
-
-    // Title row: full with the gauges beside it while both fit.
-    let full = title_spans(title, 0, None);
-    let cells_row = gauges_row(gauges, true, &[]);
-    let side = !gauges.is_empty()
-        && spans_width(&full) + GAUGE_GAP.len() + spans_width(&cells_row) <= inner;
-    let mut title_row = if side {
-        let mut row = full;
-        // Right-align the gauges.
-        let gap = inner - spans_width(&row) - spans_width(&cells_row);
-        row.push(Span::raw(" ".repeat(gap)));
-        row.extend(cells_row);
-        row
-    } else {
-        lv.gauges_down = !gauges.is_empty();
-        let mut chosen = None;
-        for level in 0..3u8 {
-            let row = title_spans(title, level, None);
-            if spans_width(&row) <= inner {
-                lv.title = level;
-                chosen = Some(row);
-                break;
-            }
-        }
-        chosen.unwrap_or_else(|| {
-            lv.title = 3;
-            // What the command may keep: the rest, with the clock whole.
-            let rest = spans_width(&title_spans(title, 2, Some(0)));
-            let room = inner.saturating_sub(rest + 3);
-            title_spans(title, 2, Some(room))
-        })
-    };
-    if title_row.is_empty() {
-        title_row.push(Span::raw(""));
-    }
-
-    // Gauge row.
-    let gauge_row = if lv.gauges_down {
-        let numbers = gauges_row(gauges, false, &[]);
-        let cells_row = gauges_row(gauges, true, &[]);
-        if spans_width(&cells_row) <= inner {
-            cells_row
-        } else if spans_width(&numbers) <= inner {
-            lv.gauges = 1;
-            numbers
-        } else {
-            lv.gauges = 2;
-            let mut folded = vec![false; gauges.len()];
-            let mut row = numbers;
-            for i in fold_order(gauges) {
-                if spans_width(&row) <= inner {
-                    break;
-                }
-                if let Some(f) = folded.get_mut(i) {
-                    *f = true;
-                }
-                row = gauges_row(gauges, false, &folded);
-            }
-            row
-        }
-    } else {
-        Vec::new()
-    };
 
     // Tab row.
     let mut tabs = (Vec::new(), 0..0, TabHits::new());
@@ -438,21 +373,85 @@ pub fn header_lines_hits(
         }
     }
 
+    let rule = rule(cols, (tabs.1.start)..(tabs.1.end));
+    ([title_row, gauge_row, fit(tabs.0, cols), rule], lv, tabs.2)
+}
+
+/// The header's first two rows at `cols` columns: the title row and the
+/// row the gauges move down to. What the target and approval screens draw
+/// above their own tab row.
+pub fn header_top(title: &Title<'_>, gauges: &[&Gauge], cols: u16) -> ([Line<'static>; 2], Levels) {
+    let cols = usize::from(cols);
+    // The title and gauge rows start one column in.
+    let inner = cols.saturating_sub(1);
+    let mut lv = Levels::default();
+
+    // Title row: full with the gauges beside it while both fit. Each row
+    // is built once: the full title is level 0, and the cells row not
+    // drawn beside it is the gauge row's first try.
+    let full = title_spans(title, 0, None);
+    let cells_row = gauges_row(gauges, true, &[]);
+    let side = !gauges.is_empty()
+        && spans_width(&full) + GAUGE_GAP.len() + spans_width(&cells_row) <= inner;
+    let (mut title_row, cells_down) = if side {
+        let mut row = full;
+        // Right-align the gauges.
+        let gap = inner - spans_width(&row) - spans_width(&cells_row);
+        row.push(Span::raw(" ".repeat(gap)));
+        row.extend(cells_row);
+        (row, None)
+    } else {
+        lv.gauges_down = !gauges.is_empty();
+        let mut row = full;
+        while spans_width(&row) > inner && lv.title < 2 {
+            lv.title += 1;
+            row = title_spans(title, lv.title, None);
+        }
+        if spans_width(&row) > inner {
+            lv.title = 3;
+            // What the command may keep: the rest, with the clock whole.
+            let rest = spans_width(&title_spans(title, 2, Some(0)));
+            let room = inner.saturating_sub(rest + 3);
+            row = title_spans(title, 2, Some(room));
+        }
+        (row, Some(cells_row))
+    };
+    if title_row.is_empty() {
+        title_row.push(Span::raw(""));
+    }
+
+    // Gauge row.
+    let gauge_row = match cells_down {
+        _ if !lv.gauges_down => Vec::new(),
+        Some(cells_row) if spans_width(&cells_row) <= inner => cells_row,
+        _ => {
+            let numbers = gauges_row(gauges, false, &[]);
+            if spans_width(&numbers) <= inner {
+                lv.gauges = 1;
+                numbers
+            } else {
+                lv.gauges = 2;
+                let mut folded = vec![false; gauges.len()];
+                let mut row = numbers;
+                for i in fold_order(gauges) {
+                    if spans_width(&row) <= inner {
+                        break;
+                    }
+                    if let Some(f) = folded.get_mut(i) {
+                        *f = true;
+                    }
+                    row = gauges_row(gauges, false, &folded);
+                }
+                row
+            }
+        }
+    };
+
     let lead = |mut spans: Vec<Span<'static>>| {
         spans.insert(0, Span::raw(" "));
         spans
     };
-    let rule = rule(cols, (tabs.1.start)..(tabs.1.end));
-    (
-        [
-            fit(lead(title_row), cols),
-            fit(lead(gauge_row), cols),
-            fit(tabs.0, cols),
-            rule,
-        ],
-        lv,
-        tabs.2,
-    )
+    ([fit(lead(title_row), cols), fit(lead(gauge_row), cols)], lv)
 }
 
 #[cfg(test)]
@@ -639,18 +638,47 @@ mod tests {
             ("✗ 12 failed", false),
             ("✗ stopped", false),
         ] {
+            let v = Verdict {
+                text: verdict.to_owned(),
+                ok,
+            };
             for command in ["heph r build //...", wide.as_str()] {
                 let mut t = title(command);
-                t.verdict = Some(Verdict {
-                    text: verdict.to_owned(),
-                    ok,
-                });
+                t.verdict = Some(&v);
                 for cols in 30..=120u16 {
                     let (rows, _) = header_lines(&t, &gauges, &COUNTS, Tab::All, cols);
                     let row = text(&rows[0]);
                     assert!(
                         row.contains(&format!("{verdict} · 1m05s")),
                         "{cols} cols, {command:.30}: {row:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// What the sub-screens draw is the header's first two rows, narrowed
+    /// the same way at every width, whatever the tab row would have needed.
+    #[test]
+    fn header_top_is_the_headers_first_two_rows() {
+        let wide = format!("heph r build //{}", "x".repeat(150));
+        let all = pools();
+        for n in [0, 3, all.len()] {
+            let gauges: Vec<&Gauge> = all.iter().take(n).collect();
+            for command in ["heph r build //...", wide.as_str()] {
+                let t = title(command);
+                for cols in 0..=160u16 {
+                    let (rows, lv) = header_lines(&t, &gauges, &COUNTS, Tab::Pending, cols);
+                    let (top, top_lv) = header_top(&t, &gauges, cols);
+                    assert_eq!(
+                        top,
+                        [rows[0].clone(), rows[1].clone()],
+                        "{n} pools, {cols} cols"
+                    );
+                    assert_eq!(
+                        (top_lv.title, top_lv.gauges_down, top_lv.gauges),
+                        (lv.title, lv.gauges_down, lv.gauges),
+                        "{n} pools, {cols} cols"
                     );
                 }
             }

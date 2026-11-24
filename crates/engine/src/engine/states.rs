@@ -57,10 +57,12 @@ impl Engine {
         let pkgs = match m {
             Matcher::Package(p) => vec![p.clone()],
             _ => {
-                let mut pkgs: Vec<PkgBuf> = Vec::new();
-                for p in self.packages(m, &rs).await? {
-                    pkgs.push(PkgBuf::from(p?.as_str()));
-                }
+                let mut pkgs: Vec<PkgBuf> = self
+                    .packages(m, &rs)
+                    .await?
+                    .into_iter()
+                    .map(PkgBuf::from)
+                    .collect();
                 pkgs.sort_by(|a, b| a.as_str().cmp(b.as_str()));
                 pkgs
             }

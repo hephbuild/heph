@@ -170,8 +170,8 @@ fn main() -> ExitCode {
     // hard-exits on an "unrecognized subcommand" — so if the upgrade ran after
     // matching, `heph <newcmd>` would die before the upgrade that adds <newcmd>
     // ever fired. Do a *soft* parse first (tolerates an unknown command), upgrade
-    // (a successful upgrade re-execs into the pin and never returns), then do the
-    // real parse below in whichever binary ends up running. The upgrade also runs
+    // (a successful upgrade re-execs into the pin and never returns), then act
+    // on the parse below in whichever binary ends up running. The upgrade also runs
     // *before* the supervisor fork so a re-exec can't orphan a sidecar.
     //
     // A missing-workspace (`NoConfig`) result is fatal only when this binary
@@ -188,11 +188,13 @@ fn main() -> ExitCode {
     }
 
     // Real parse — by here we've either re-exec'd into the pinned version (never
-    // returns) or stayed on this binary. Hard-exits with clap's canonical
-    // diagnostic on a genuinely unknown command or bad flags. Keeping the matches
-    // also lets the telemetry reporter enumerate the exact args/flags set —
-    // generically, for every command, with no per-command list.
-    let matches = Cli::command().get_matches();
+    // returns) or stayed on this binary, so the soft parse above is this
+    // binary's parse of the same argv: its error is the one a fresh parse would
+    // raise. Hard-exits with clap's canonical diagnostic on a genuinely unknown
+    // command or bad flags. Keeping the matches also lets the telemetry
+    // reporter enumerate the exact args/flags set — generically, for every
+    // command, with no per-command list.
+    let matches = soft_match.unwrap_or_else(|e| e.exit());
     let cli = match Cli::from_arg_matches(&matches) {
         Ok(cli) => cli,
         Err(e) => e.exit(),
@@ -208,12 +210,13 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // Telemetry decision is taken up front (config read), but the event is
+    // Telemetry decision is taken up front (the env kill switch, then the
+    // config read only when the switch is unset), but the event is
     // recorded at exit: spooled, and handed to a detached flusher when the
     // spool is due — never waited on. On CI the runner — and its spool — is
     // ephemeral and kills detached processes, so CI sends synchronously.
     let telemetry_on =
-        heph::telemetry::is_enabled(commands::bootstrap::telemetry_enabled_from_config());
+        heph::telemetry::is_enabled(commands::bootstrap::telemetry_enabled_from_config);
     // Warm the repo fingerprint off the hot path: the git root walk runs on a
     // detached thread now so the exit-time flush only reads the cached result.
     if telemetry_on {
@@ -283,60 +286,7 @@ fn main() -> ExitCode {
     // records the number.
     let code: u8 = match &exec_result {
         Ok(_) => 0,
-        Err(_) if tool_exit.is_some() => match tool_exit {
-            // A wait status carries 0–255, so the conversion never falls back.
-            Some(hcore::process::Exit::Code(code)) => u8::try_from(code).unwrap_or(1),
-            // Re-raised below, once everything else on the way out has run.
-            _ => 1,
-        },
-        // heph's own failure after the target resolved to an entrypoint (or
-        // a Ctrl-C before its tool started): its box, and 125 (or 130), so it
-        // is never read as the tool's status (R4).
-        // `heph tool codegen`: 1 for findings, 2 for a failure (Decision 20).
-        Err(e)
-            if e.downcast_ref::<commands::tool::codegen::CodegenExit>()
-                .is_some() =>
-        {
-            let exit = e.downcast_ref::<commands::tool::codegen::CodegenExit>();
-            if let Some(err) = exit.and_then(|x| x.error.as_ref())
-                && !heph::commands::errors::render_anyhow(err, &session)
-            {
-                error!(error = %format!("{err:#}"), "Failed");
-            }
-            exit.map_or(2, |x| x.code)
-        }
-        // `heph session`: 125 for its own failures, else the code `attach`
-        // mirrors from the session it followed.
-        Err(e) if commands::session::exit_code(e).is_some() => {
-            let exit = e.downcast_ref::<commands::session::SessionExit>();
-            if let Some(err) = exit.and_then(|x| x.error.as_ref())
-                && !heph::commands::errors::render_anyhow(err, &session)
-            {
-                error!(error = %format!("{err:#}"), "Failed");
-            }
-            commands::session::exit_code(e).unwrap_or(commands::session::SessionExit::OWN_FAILURE)
-        }
-        // `heph log` found no log: its status line already said so.
-        Err(e) if e.downcast_ref::<commands::log::NoLog>().is_some() => 1,
-        Err(e) if e.downcast_ref::<commands::run::InvokeFailed>().is_some() => {
-            let failed = e.downcast_ref::<commands::run::InvokeFailed>();
-            if let Some(f) = failed
-                && !heph::commands::errors::render_anyhow(&f.error, &session)
-            {
-                error!(error = %format!("{:#}", f.error), "Failed");
-            }
-            failed.map_or(1, |f| f.code)
-        }
-        Err(e) => {
-            // Render a graphical diagnostic if the error chain carries one
-            // (Starlark/Go diagnostics from single-error commands). The TUI is
-            // already torn down here, so plain stderr output is safe. Fall back
-            // to the one-line log when nothing renderable is found.
-            if !heph::commands::errors::render_anyhow(e, &session) {
-                error!(error = %format!("{:#}", e), "Failed");
-            }
-            1
-        }
+        Err(e) => exit_code_for(e, tool_exit, &session),
     };
     let result = ExitCode::from(code);
     // `End` and the lock release, before anything slow on the way out
@@ -376,6 +326,66 @@ fn main() -> ExitCode {
     }
 
     result
+}
+
+/// The exit code for a failed command, rendering the error on the way. The
+/// first type in the chain that claims the failure decides, in this order.
+fn exit_code_for(
+    e: &anyhow::Error,
+    tool_exit: Option<hcore::process::Exit>,
+    session: &SessionSlot,
+) -> u8 {
+    // An entrypoint's program ended without success: heph exits as it did.
+    if let Some(exit) = tool_exit {
+        return match exit {
+            // A wait status carries 0–255, so the conversion never falls back.
+            hcore::process::Exit::Code(code) => u8::try_from(code).unwrap_or(1),
+            // Re-raised by the caller, once everything else on the way out has run.
+            _ => 1,
+        };
+    }
+    // `heph tool codegen`: 1 for findings, 2 for a failure (Decision 20).
+    if let Some(exit) = e.downcast_ref::<commands::tool::codegen::CodegenExit>() {
+        if let Some(err) = &exit.error {
+            report(err, session);
+        }
+        return exit.code;
+    }
+    // `heph session`: 125 for its own failures, else the code `attach`
+    // mirrors from the session it followed. The code comes from
+    // `session::exit_code`, the mapping its tests pin.
+    if let Some(code) = commands::session::exit_code(e) {
+        if let Some(err) = e
+            .downcast_ref::<commands::session::SessionExit>()
+            .and_then(|exit| exit.error.as_ref())
+        {
+            report(err, session);
+        }
+        return code;
+    }
+    // `heph log` found no log: its status line already said so.
+    if e.downcast_ref::<commands::log::NoLog>().is_some() {
+        return 1;
+    }
+    // heph's own failure after the target resolved to an entrypoint (or a
+    // Ctrl-C before its tool started): its box, and 125 (or 130), so it is
+    // never read as the tool's status (R4).
+    if let Some(failed) = e.downcast_ref::<commands::run::InvokeFailed>() {
+        report(&failed.error, session);
+        return failed.code;
+    }
+    report(e, session);
+    1
+}
+
+/// Render a graphical diagnostic if the error chain carries one
+/// (Starlark/Go diagnostics from single-error commands). The TUI is already
+/// torn down here, so plain stderr output is safe. Falls back to the one-line
+/// log when nothing renderable is found.
+fn report(err: &anyhow::Error, session: &SessionSlot) {
+    if !heph::commands::errors::render_anyhow(err, session) {
+        error!(error = %format!("{err:#}"), "Failed");
+    }
 }
 
 /// The hidden exec-runner invocations.

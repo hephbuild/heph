@@ -651,7 +651,7 @@ impl Engine {
     /// (distinct addrs → distinct locks) and processed with bounded concurrency.
     ///
     /// A per-target failure is logged and counted (`GcStats::errored`), never
-    /// aborts the sweep, and the JoinSet is always fully drained.
+    /// aborts the sweep, and every task is joined before the next step.
     pub async fn gc_all(self: Arc<Self>, rs: Arc<RequestState>) -> Result<GcStats> {
         let decisions = Arc::clone(&self).gc_resolve_decisions(&rs).await;
 
@@ -664,28 +664,30 @@ impl Engine {
             ..GcStats::default()
         };
 
-        let limit = self.fan_out.max(1);
-        let mut set: JoinSet<(Addr, Result<TargetOutcome>)> = JoinSet::new();
-        for (addr, decision) in decisions {
-            let (Decision::Orphan | Decision::Trim(_)) = decision else {
+        let applied = decisions.into_iter().filter(|(_, decision)| {
+            let skip = matches!(decision, Decision::Skip);
+            if skip {
                 // Skipped target: count already recorded; advance the explored
-                // count without taking its lock.
-                emit_gc_target_swept(&rs, 0, 0);
-                continue;
-            };
-            while set.len() >= limit {
-                Self::drain_one(&mut set, &rs, &mut stats).await;
+                // count without taking its lock. Emitted as the sweep reaches
+                // it, so the events keep the decisions' order.
+                emit_target_swept(&rs, 0, 0);
             }
-            let engine = Arc::clone(&self);
-            let crs = rs.clone();
-            set.spawn(async move {
-                let out = engine.gc_apply(crs, &addr, decision).await;
-                (addr, out)
-            });
-        }
-        while !set.is_empty() {
-            Self::drain_one(&mut set, &rs, &mut stats).await;
-        }
+            !skip
+        });
+        bounded_join(
+            applied,
+            self.fan_out,
+            |(addr, decision)| {
+                let engine = Arc::clone(&self);
+                let crs = rs.clone();
+                async move {
+                    let out = engine.gc_apply(crs, &addr, decision).await;
+                    (addr, out)
+                }
+            },
+            |joined| fold_gc_outcome(joined, &rs, &mut stats),
+        )
+        .await;
 
         // Prune the shared filesystem-walk cache: drop rows untouched past the
         // TTL and rows whose path no longer exists. Best-effort — a prune failure
@@ -784,6 +786,60 @@ impl Engine {
         self: Arc<Self>,
         rs: &Arc<RequestState>,
     ) -> Vec<(Addr, Decision)> {
+        let resolve_rs = self.sweep_resolve_state(rs);
+        let addrs = match self.cached_addrs("gc", "resolving") {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "gc: listing cache targets failed");
+                return Vec::new();
+            }
+        };
+
+        let mut decisions: Vec<(Addr, Decision)> = Vec::new();
+        bounded_join(
+            addrs,
+            self.fan_out,
+            |addr| {
+                let engine = Arc::clone(&self);
+                let rrs = resolve_rs.clone();
+                async move {
+                    let d = engine.gc_decide(rrs, &addr).await;
+                    (addr, d)
+                }
+            },
+            |joined| match joined {
+                Ok(entry) => decisions.push(entry),
+                // Logged and dropped — the target is simply left untouched in
+                // phase 2.
+                Err(join_err) => {
+                    tracing::warn!(error = %join_err, "gc: resolve task panicked, skipping target")
+                }
+            },
+        )
+        .await;
+
+        decisions
+        // `resolve_rs` drops here → releases every read lock resolution took.
+    }
+
+    /// The request state a sweep resolves targets under before it takes any
+    /// write lock — gc's phase 1, `clean`'s graph selection, the failure-slot
+    /// sweep. Private to the sweep (no fail-fast, no approval), sharing the
+    /// caller's event sink and background-work counter.
+    ///
+    /// **It exists to avoid a deadlock, and only works if the caller drops it
+    /// before deleting.** Resolving executes shared deps, and each execution
+    /// leaves a riding *read* lock in the state that performed it, released
+    /// only when that state drops. A delete takes the addr's *write* lock. Do
+    /// both on one state and a target whose read the resolution still holds
+    /// deadlocks against its own write. So: resolve under this state, drop it,
+    /// then delete.
+    ///
+    /// It also suppresses deferred trims. The executions resolution performs
+    /// would otherwise record post-write trims that fire when this state drops
+    /// — concurrently with the write locks the sweep then takes. The sweep is
+    /// the authoritative trim; it does not need a second one racing it.
+    pub(super) fn sweep_resolve_state(self: &Arc<Self>, rs: &RequestState) -> Arc<RequestState> {
         let resolve_rs = self.new_state_full(
             false,
             rs.events_sender(),
@@ -791,54 +847,48 @@ impl Engine {
             Self::DEFAULT_LOG_TAIL_LINES,
             None,
         );
-        // Phase 1 resolves, and resolving executes shared cacheable deps — each
-        // of which would otherwise record a post-write trim that fires when this
-        // state drops, i.e. concurrently with phase 2's write locks. This sweep
-        // is the authoritative trim; it does not need a second one racing it.
         resolve_rs.suppress_deferred_trims();
-        let targets = match self.local_cache.list_targets() {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!(error = %format!("{e:#}"), "gc: listing cache targets failed");
-                return Vec::new();
-            }
-        };
+        resolve_rs
+    }
 
-        let limit = self.fan_out.max(1);
-        let mut set: JoinSet<(Addr, Decision)> = JoinSet::new();
-        let mut decisions: Vec<(Addr, Decision)> = Vec::new();
-
-        for target in targets {
-            let addr_key = match target {
-                Ok(k) => k,
+    /// Every addr the local cache holds an entry for, streamed from its own
+    /// enumeration. `who` prefixes the warnings; `then` says what the caller
+    /// does with a listing that fails mid-stream (`"resolving"`, `"cleaning"`):
+    /// the addrs seen so far are still yielded, and the stream ends. A key that
+    /// does not parse as an addr is logged and skipped.
+    ///
+    /// An error opening the enumeration is returned for the caller to handle.
+    pub(super) fn cached_addrs(
+        &self,
+        who: &'static str,
+        then: &'static str,
+    ) -> Result<impl Iterator<Item = Addr> + use<>> {
+        let targets = self.local_cache.list_targets()?;
+        Ok(targets
+            .map_while(move |target| match target {
+                Ok(k) => Some(k),
                 Err(e) => {
-                    tracing::warn!(error = %format!("{e:#}"), "gc: listing targets failed mid-stream, resolving what was seen");
-                    break;
+                    tracing::warn!(
+                        who,
+                        then,
+                        error = %format!("{e:#}"),
+                        "listing targets failed mid-stream; going on with what was seen"
+                    );
+                    None
                 }
-            };
-            let addr = match parse_addr(&addr_key) {
-                Ok(a) => a,
+            })
+            .filter_map(move |addr_key| match parse_addr(&addr_key) {
+                Ok(a) => Some(a),
                 Err(e) => {
-                    tracing::warn!(addr = %addr_key, error = %format!("{e:#}"), "gc: skip unparseable cache addr");
-                    continue;
+                    tracing::warn!(
+                        who,
+                        addr = %addr_key,
+                        error = %format!("{e:#}"),
+                        "skip unparseable cache addr"
+                    );
+                    None
                 }
-            };
-            while set.len() >= limit {
-                push_decision(&mut decisions, set.join_next().await);
-            }
-            let engine = Arc::clone(&self);
-            let rrs = resolve_rs.clone();
-            set.spawn(async move {
-                let d = engine.gc_decide(rrs, &addr).await;
-                (addr, d)
-            });
-        }
-        while !set.is_empty() {
-            push_decision(&mut decisions, set.join_next().await);
-        }
-
-        decisions
-        // `resolve_rs` drops here → releases every read lock resolution took.
+            }))
     }
 
     /// Resolve one target's [`Decision`]. Never errors: a resolution failure maps
@@ -962,40 +1012,80 @@ impl Engine {
             Decision::Skip => Ok(TargetOutcome::default()),
         }
     }
+}
 
-    /// Await one finished phase-2 task and fold it into `stats`. Per-target errors
-    /// (and task panics) are logged and counted, never propagated, so the sweep
-    /// continues. Emits one `GcTargetSwept` per target so the TUI's "targets
-    /// explored" count advances even for failures.
-    async fn drain_one(
-        set: &mut JoinSet<(Addr, Result<TargetOutcome>)>,
-        rs: &Arc<RequestState>,
-        stats: &mut GcStats,
-    ) {
-        let Some(joined) = set.join_next().await else {
-            return;
-        };
-        match joined {
-            Ok((_, Ok(o))) => {
-                stats.revisions_removed += o.removed;
-                stats.revisions_kept += o.kept;
-                stats.bytes_removed = stats.bytes_removed.saturating_add(o.bytes);
-                if o.orphan {
-                    stats.orphan_targets_removed += 1;
-                }
-                emit_gc_target_swept(rs, o.removed, o.bytes);
+/// Fold one finished phase-2 task into `stats`. Per-target errors (and task
+/// panics) are logged and counted, never propagated, so the sweep continues.
+/// Emits one `GcTargetSwept` per target so the TUI's "targets explored" count
+/// advances even for failures.
+fn fold_gc_outcome(
+    joined: std::result::Result<(Addr, Result<TargetOutcome>), tokio::task::JoinError>,
+    rs: &RequestState,
+    stats: &mut GcStats,
+) {
+    match joined {
+        Ok((_, Ok(o))) => {
+            stats.revisions_removed += o.removed;
+            stats.revisions_kept += o.kept;
+            stats.bytes_removed = stats.bytes_removed.saturating_add(o.bytes);
+            if o.orphan {
+                stats.orphan_targets_removed += 1;
             }
-            Ok((addr, Err(e))) => {
-                tracing::warn!(%addr, error = %format!("{e:#}"), "gc: target failed, continuing");
-                stats.errored += 1;
-                emit_gc_target_swept(rs, 0, 0);
-            }
-            Err(join_err) => {
-                // A panicked task must not take down the sweep.
-                tracing::warn!(error = %join_err, "gc: target task panicked, continuing");
-                stats.errored += 1;
+            emit_target_swept(rs, o.removed, o.bytes);
+        }
+        Ok((addr, Err(e))) => {
+            tracing::warn!(%addr, error = %format!("{e:#}"), "gc: target failed, continuing");
+            stats.errored += 1;
+            emit_target_swept(rs, 0, 0);
+        }
+        Err(join_err) => {
+            // A panicked task must not take down the sweep.
+            tracing::warn!(error = %join_err, "gc: target task panicked, continuing");
+            stats.errored += 1;
+        }
+    }
+}
+
+/// Spawn `spawn(item)` for each of `items`, at most `limit` (at least 1) in
+/// flight, and hand each finished task's join result to `fold` as it
+/// completes. Returns once every task has been joined.
+///
+/// Every sweep (gc's two phases, `clean`, the failure-slot sweep) fans out
+/// through this. Two properties they rely on:
+///
+/// - **Backpressure.** Before each spawn it waits for a slot, so a source that
+///   yields far faster than the tasks finish — a big cache's enumeration, a
+///   big graph — never queues the whole selection. `items` is pulled one at a
+///   time: an item is pulled, then held until a slot is free for it, so at
+///   most one item waits outside the set. A `limit` of 0 runs one at a time.
+/// - **Abort on drop.** The tasks live in a [`JoinSet`], so dropping this
+///   future (a cancelled command) aborts every task still waiting at an
+///   await. Detaching them instead — `buffer_unordered` over spawned handles —
+///   would let a dropped sweep go on deleting.
+///
+/// A task that panics reaches `fold` as an `Err`; the others keep going.
+pub(super) async fn bounded_join<I, T, Fut>(
+    items: I,
+    limit: usize,
+    mut spawn: impl FnMut(I::Item) -> Fut,
+    mut fold: impl FnMut(std::result::Result<T, tokio::task::JoinError>),
+) where
+    I: IntoIterator,
+    Fut: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let limit = limit.max(1);
+    let mut set = JoinSet::new();
+    for item in items {
+        while set.len() >= limit {
+            if let Some(joined) = set.join_next().await {
+                fold(joined);
             }
         }
+        set.spawn(spawn(item));
+    }
+    while let Some(joined) = set.join_next().await {
+        fold(joined);
     }
 }
 
@@ -1071,23 +1161,8 @@ fn cache_db_event(report: &CompactReport) -> BuildEventKind {
     }
 }
 
-/// Fold one resolved decision into the list, tolerating a panicked resolve task
-/// (logged, dropped — the target is simply left untouched in phase 2).
-fn push_decision(
-    decisions: &mut Vec<(Addr, Decision)>,
-    joined: Option<std::result::Result<(Addr, Decision), tokio::task::JoinError>>,
-) {
-    match joined {
-        Some(Ok(entry)) => decisions.push(entry),
-        Some(Err(join_err)) => {
-            tracing::warn!(error = %join_err, "gc: resolve task panicked, skipping target")
-        }
-        None => {}
-    }
-}
-
 /// Emit one `GcTargetSwept` so the TUI's "targets explored" count advances.
-fn emit_gc_target_swept(rs: &RequestState, revisions_removed: usize, bytes_removed: u64) {
+pub(super) fn emit_target_swept(rs: &RequestState, revisions_removed: usize, bytes_removed: u64) {
     rs.emit(crate::engine::event::BuildEventKind::GcTargetSwept {
         revisions_removed,
         bytes_removed,
@@ -1108,6 +1183,43 @@ mod tests {
     use hcore::hasync::StdCancellationToken;
     use std::io::Write as _;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The most tasks `bounded_join` had running at once, over 20 items that
+    /// each hold their slot across a sleep, and how many results it folded.
+    async fn bounded_join_peak(limit: usize) -> (usize, usize) {
+        let running = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut folded = 0;
+        bounded_join(
+            0..20,
+            limit,
+            |_| {
+                let (running, peak) = (Arc::clone(&running), Arc::clone(&peak));
+                async move {
+                    let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    running.fetch_sub(1, Ordering::SeqCst);
+                }
+            },
+            |joined| {
+                joined.expect("task");
+                folded += 1;
+            },
+        )
+        .await;
+        (peak.load(Ordering::SeqCst), folded)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bounded_join_runs_exactly_limit_at_once() {
+        assert_eq!(bounded_join_peak(3).await, (3, 20));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bounded_join_with_a_zero_limit_runs_one_at_a_time() {
+        assert_eq!(bounded_join_peak(0).await, (1, 20));
+    }
 
     /// Engine whose durable cache spills any blob over `spill` bytes to the FS
     /// store, so GC tests can exercise reclaiming filesystem-spilled blobs

@@ -88,14 +88,12 @@ impl Engine {
         &self,
         m: &htmatcher::Matcher,
         rs: &Arc<RequestState>,
-    ) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<String>> + Send>> {
+    ) -> anyhow::Result<Vec<String>> {
         let mut per_provider: Vec<Arc<Vec<String>>> = Vec::with_capacity(self.providers.len());
         for res in self.provider_packages(m, rs).await {
             per_provider.push(res?);
         }
-        Ok(Box::new(
-            merge_packages(m, &per_provider).into_iter().map(Ok),
-        ))
+        Ok(merge_packages(m, &per_provider))
     }
 }
 
@@ -119,7 +117,7 @@ pub(crate) fn merge_packages(
     // reorder this merge: the fold runs over `per_provider` in
     // provider-registration order, exactly as the serial loop did,
     // regardless of which walk finished first.
-    let mut seen: FxHashSet<String> = FxHashSet::default();
+    let mut seen: FxHashSet<&str> = FxHashSet::default();
 
     // A whole-graph selector rejects nothing, so skip the check rather than
     // build a `PkgBuf` per package to be told so — `//...` is the single
@@ -127,11 +125,11 @@ pub(crate) fn merge_packages(
     // about. Every other matcher pays one `PkgBuf` per *unique* package
     // (after the dedup below), and saves a probe plus a `list` for each one
     // it rejects.
-    let scoped = !matches!(m, htmatcher::Matcher::PackagePrefix(p) if p.is_empty());
+    let scoped = !m.is_whole_graph();
 
     for pkgs in per_provider {
         for p in pkgs.iter() {
-            if !seen.insert(p.clone()) {
+            if !seen.insert(p.as_str()) {
                 continue;
             }
             if scoped && m.matches_pkg(&PkgBuf::from(p.as_str())) == htmatcher::MatchResult::MatchNo
@@ -197,7 +195,7 @@ impl Engine {
                                 .await?;
                             let mut pkgs = Vec::new();
                             for res in it {
-                                pkgs.push(res?.pkg.to_string());
+                                pkgs.push(res?.pkg.into_string());
                             }
                             // Canonicalize the provider's block rather than
                             // trusting it to be ordered — see `packages`'
@@ -390,8 +388,7 @@ mod tests {
 
         let pkgs: Vec<String> = engine
             .packages(&Matcher::PackagePrefix(pkg("")), &rs)
-            .await?
-            .collect::<anyhow::Result<Vec<_>>>()?;
+            .await?;
 
         // The always-on built-in `fs` provider also advertises its `@heph/fs`
         // package; it sorts first because it is registered before `p1`/`p2`.
@@ -432,8 +429,7 @@ mod tests {
 
         let pkgs: Vec<String> = engine
             .packages(&Matcher::PackagePrefix(pkg("")), &rs)
-            .await?
-            .collect::<anyhow::Result<Vec<_>>>()?;
+            .await?;
 
         // `@heph/fs` from the always-on built-in provider, registered first;
         // then p1's block sorted; then p2's only new package. Note `beta` lands
@@ -461,10 +457,7 @@ mod tests {
             engine.register_provider(move |_| Box::new(ListsPkgs::new("p2", p2)))?;
             let engine = Arc::new(engine);
             let rs = engine.new_state();
-            engine
-                .packages(&Matcher::PackagePrefix(pkg("")), &rs)
-                .await?
-                .collect::<anyhow::Result<Vec<_>>>()
+            engine.packages(&Matcher::PackagePrefix(pkg("")), &rs).await
         }
 
         let expected = vec!["@heph/fs", "alpha", "delta", "mid", "zeta", "beta"];
@@ -509,8 +502,7 @@ mod tests {
             let rs = engine.new_state();
             let pkgs: Vec<String> = engine
                 .packages(&Matcher::PackagePrefix(pkg("")), &rs)
-                .await?
-                .collect::<anyhow::Result<Vec<_>>>()?;
+                .await?;
             assert_eq!(pkgs, vec!["@heph/fs", "alpha", "delta", "mid", "zeta"]);
         }
         assert_eq!(
@@ -657,8 +649,7 @@ mod tests {
         let start = std::time::Instant::now();
         let pkgs: Vec<String> = engine
             .packages(&Matcher::PackagePrefix(pkg("")), &rs)
-            .await?
-            .collect::<anyhow::Result<Vec<_>>>()?;
+            .await?;
         let elapsed = start.elapsed();
 
         assert_eq!(
@@ -702,8 +693,7 @@ mod tests {
 
         let pkgs: Vec<String> = engine
             .packages(&Matcher::PackagePrefix(pkg("foo")), &rs)
-            .await?
-            .collect::<anyhow::Result<Vec<_>>>()?;
+            .await?;
 
         // `foobar` is not under `foo`: the prefix is a package prefix, not a
         // string one. The built-in `fs` provider's `@heph/fs` is dropped too —
@@ -732,10 +722,7 @@ mod tests {
             Matcher::Label("lint".to_string()),
             Matcher::PackagePrefix(pkg("foo")),
         ]);
-        let pkgs: Vec<String> = engine
-            .packages(&m, &rs)
-            .await?
-            .collect::<anyhow::Result<Vec<_>>>()?;
+        let pkgs: Vec<String> = engine.packages(&m, &rs).await?;
 
         assert_eq!(pkgs, vec!["foo".to_string(), "foo/deep".to_string()]);
         Ok(())
@@ -754,8 +741,7 @@ mod tests {
 
         let pkgs: Vec<String> = engine
             .packages(&Matcher::Label("lint".to_string()), &rs)
-            .await?
-            .collect::<anyhow::Result<Vec<_>>>()?;
+            .await?;
 
         assert_eq!(pkgs, vec!["@heph/fs", "bar", "foo"]);
         Ok(())

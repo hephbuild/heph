@@ -1,6 +1,6 @@
 use crate::plugingo::addr_util::{
-    go_build_env_for, go_host_pass_env_config, go_run_prelude, go_sdk_dep, go_sdk_read_only_config,
-    import_path_to_dep_group, to_run_value, write_importcfg_script,
+    go_run_prelude, insert_go_link_config, insert_toolchain_config, lib_dep_groups, to_run_value,
+    write_importcfg_script,
 };
 use crate::plugingo::driver_compile::{CompileParams, build_compile_spec};
 use crate::plugingo::factors::Factors;
@@ -226,28 +226,17 @@ pub fn build_test_spec(
         "\"$GO\" tool link -importcfg \"$importcfg\" -buildmode={mode}{race}{ldflags} -X testing.testBinary=1 -o test_binary \"$SRC_TESTMAIN\""
     ));
 
-    let mut deps: BTreeMap<String, Value> = BTreeMap::new();
+    // `lib_*` groups never collide with `testmain`.
+    let mut deps = lib_dep_groups(all_libs, go_version);
     deps.insert(
         "testmain".to_string(),
         Value::List(vec![Value::String(testmain_lib_addr.format())]),
     );
-    for (import_path, lib_addr) in all_libs {
-        let group = import_path_to_dep_group(import_path);
-        deps.insert(group, Value::List(vec![Value::String(lib_addr.format())]));
-    }
-    if let Some((sdk_group, sdk_val)) = go_sdk_dep(go_version) {
-        deps.insert(sdk_group, sdk_val);
-    }
 
     let mut config: HashMap<String, Value> = HashMap::new();
     config.insert("run".to_string(), to_run_value(script));
     config.insert("deps".to_string(), Value::Map(deps.into_iter().collect()));
-    if let Some((ro_k, ro_v)) = go_sdk_read_only_config(go_version) {
-        config.insert(ro_k, ro_v);
-    }
-    if let Some((pe_k, pe_v)) = go_host_pass_env_config(go_version) {
-        config.insert(pe_k, pe_v);
-    }
+    insert_toolchain_config(&mut config, go_version);
     config.insert(
         "out".to_string(),
         Value::Map(HashMap::from([(
@@ -255,17 +244,7 @@ pub fn build_test_spec(
             Value::List(vec![Value::String("test_binary".to_string())]),
         )])),
     );
-    let mut runtime_env = HashMap::from([
-        ("GOOS".to_string(), Value::String(factors.goos.clone())),
-        ("GOARCH".to_string(), Value::String(factors.goarch.clone())),
-    ]);
-    if let Some(exp) = factors.goexperiment_env() {
-        runtime_env.insert("GOEXPERIMENT".to_string(), Value::String(exp));
-    }
-    config.insert("runtime_env".to_string(), Value::Map(runtime_env));
-    // CGO/toolchain pins live in `env` (hashed) so stale archives don't survive
-    // cache lookups (pluginexec/mod.rs:70 excludes runtime_env from the def hash).
-    config.insert("env".to_string(), go_build_env_for(factors));
+    insert_go_link_config(&mut config, factors);
 
     TargetSpec {
         addr,

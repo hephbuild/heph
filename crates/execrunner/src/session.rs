@@ -199,7 +199,7 @@ impl SessionRunner {
         cfg: &SessionConfig,
     ) -> anyhow::Result<Arc<Session>> {
         let key = (ctx.addr.to_string(), ctx.fingerprint.to_string());
-        let slot = self.slot(key.clone())?;
+        let slot = self.slot(key)?;
         let mut guard = slot.lock().await;
         if let Some(live) = guard.as_ref() {
             return Ok(Arc::clone(live));
@@ -440,7 +440,7 @@ fn launch_output(tail: &Arc<Mutex<String>>) -> String {
 /// The launch argv, for a diagnostic — re-read from the config rather than
 /// threaded through, since this is a cold error path.
 fn cfg_launch_hint(ctx: &RunnerCtx<'_>) -> Vec<String> {
-    serde_json::from_value::<SessionConfig>(ctx.config.clone())
+    SessionConfig::deserialize(ctx.config)
         .map(|c| c.launch)
         .unwrap_or_default()
 }
@@ -619,7 +619,7 @@ impl ExecRunner for SessionRunner {
         ctx: &RunnerCtx<'_>,
         mut rewrite: SpecRewrite,
     ) -> anyhow::Result<SpecRewrite> {
-        let cfg: SessionConfig = serde_json::from_value(ctx.config.clone())
+        let cfg = SessionConfig::deserialize(ctx.config)
             .map_err(|e| anyhow::anyhow!("runner {}: parse session config: {e}", ctx.addr))?;
         let session = self.session(ctx, &cfg).await?;
 

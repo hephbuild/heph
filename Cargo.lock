@@ -423,7 +423,6 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "tempfile",
- "testkit",
  "tokio",
 ]
 
@@ -699,14 +698,12 @@ dependencies = [
  "enclose",
  "futures",
  "glob",
- "itertools 0.15.0",
  "model",
  "parking_lot 0.13.0",
  "plugin",
  "rustc-hash",
  "serde",
  "serde_json",
- "serde_yaml",
  "tempfile",
  "template",
  "tokio",
@@ -714,7 +711,6 @@ dependencies = [
  "walk",
  "wax",
  "which",
- "xattr",
  "xxhash-rust",
 ]
 
@@ -1126,9 +1122,7 @@ dependencies = [
  "anyhow",
  "findutils",
  "flate2",
- "grep-cli",
  "grep-matcher",
- "grep-printer",
  "grep-regex",
  "grep-searcher",
  "regex",
@@ -1195,15 +1189,6 @@ dependencies = [
  "which",
  "xxhash-rust",
  "zstd",
-]
-
-[[package]]
-name = "cpp_demangle"
-version = "0.4.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2bb79cb74d735044c972aae58ed0aaa9a837e85b01106a54c39e42e97f62253"
-dependencies = [
- "cfg-if",
 ]
 
 [[package]]
@@ -1737,7 +1722,6 @@ dependencies = [
  "model",
  "plugin",
  "proc",
- "serde",
  "serde_json",
  "tar",
  "tempfile",
@@ -1902,7 +1886,6 @@ dependencies = [
  "glob",
  "google-cloud-auth",
  "hex",
- "humantime",
  "indexmap 2.14.2",
  "libc",
  "lock",
@@ -1927,12 +1910,10 @@ dependencies = [
  "rustls",
  "sandboxfuse",
  "serde",
- "serde-jsonlines",
  "serde_json",
  "serde_yaml",
  "sha2 0.11.1",
  "similar",
- "smart-default",
  "sqlite",
  "stacker",
  "strsim 0.11.1",
@@ -2140,10 +2121,10 @@ name = "fetch"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "hex",
  "reqwest",
  "sha2 0.11.1",
- "tempfile",
  "tokio",
 ]
 
@@ -2630,41 +2611,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "grep-cli"
-version = "0.1.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf32d263c5d5cc2a23ce587097f5ddafdb188492ba2e6fb638eaccdc22453631"
-dependencies = [
- "bstr",
- "globset",
- "libc",
- "log",
- "termcolor",
- "winapi-util",
-]
-
-[[package]]
 name = "grep-matcher"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9417543f4870fc8f1c8e1af870afae2431007626d9e703fce6471c468d33847"
 dependencies = [
  "memchr",
-]
-
-[[package]]
-name = "grep-printer"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fd76035e87871f51c1ee5b793e32122b3ccf9c692662d9622ef1686ff5321acb"
-dependencies = [
- "bstr",
- "grep-matcher",
- "grep-searcher",
- "log",
- "serde",
- "serde_json",
- "termcolor",
 ]
 
 [[package]]
@@ -2810,85 +2762,54 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 name = "heph"
 version = "0.1.0"
 dependencies = [
- "ansi-to-tui",
  "anyhow",
- "async-recursion",
- "async-stream",
  "async-trait",
- "borsh",
  "builtins",
  "chrono",
  "clap",
  "clap_complete",
  "core",
  "coreutils",
- "crossbeam-channel",
  "crossterm",
- "driver-support",
  "enclose",
  "engine",
- "erased-serde 0.4.11",
  "execrunner",
- "flate2",
  "futures",
  "glob",
- "htspec-derive",
  "humantime",
- "indexmap 2.14.2",
- "itertools 0.15.0",
  "libc",
  "lock",
  "mach2",
  "mimalloc",
- "minijinja",
  "model",
- "nom 8.0.0",
  "object_store",
- "parking_lot 0.13.0",
  "plugin",
  "plugin-buildfile",
- "plugin-devenv",
  "plugin-exec",
  "plugin-http",
  "plugin-nix",
  "plugin-query",
  "plugin-stabby",
- "posthog-rs",
  "pprof",
  "proc",
- "proto-gen",
- "quick_cache",
- "r2d2",
- "r2d2_sqlite",
  "ratatui",
- "rusqlite",
- "rustc-hash",
  "sandboxfuse",
  "selfupdate",
  "serde",
- "serde-jsonlines",
  "serde_json",
  "serde_yaml",
  "shlex",
- "similar",
- "smart-default",
- "stacker",
  "tar",
  "telemetry",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
- "tokio-util",
  "tracing",
  "tracing-log",
  "tracing-subscriber",
  "tui",
- "unicode-width 0.2.3",
  "url",
- "uuid",
  "walk",
- "walkdir",
- "wax",
  "which",
  "xattr",
  "xstarlark-fmt",
@@ -5251,7 +5172,6 @@ dependencies = [
  "model",
  "serde",
  "serde_json",
- "serde_yaml",
  "smart-default",
  "tempfile",
  "tokio",
@@ -5319,7 +5239,6 @@ dependencies = [
  "async-trait",
  "core",
  "driver-support",
- "execrunner",
  "model",
  "plugin",
  "proc",
@@ -5328,7 +5247,6 @@ dependencies = [
  "serde_yaml",
  "tempfile",
  "tokio",
- "tracing",
  "xxhash-rust",
 ]
 
@@ -5337,7 +5255,6 @@ name = "plugin-devenv-cdylib"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "plugin",
  "plugin-devenv",
  "plugin-sdk",
  "stabby",
@@ -5492,7 +5409,6 @@ dependencies = [
  "async-trait",
  "core",
  "driver-support",
- "execrunner",
  "model",
  "plugin",
  "proc",
@@ -5517,6 +5433,7 @@ dependencies = [
  "docker_credential",
  "driver-support",
  "execrunner",
+ "fetch",
  "futures",
  "hex",
  "memmap2",
@@ -5551,7 +5468,6 @@ name = "plugin-query"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-trait",
  "builtins",
  "core",
  "futures",
@@ -6708,7 +6624,6 @@ dependencies = [
  "config",
  "core",
  "fetch",
- "libc",
  "tempfile",
  "thiserror 2.0.21",
  "tracing",
@@ -6734,16 +6649,6 @@ checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
 dependencies = [
  "serde_core",
  "serde_derive",
-]
-
-[[package]]
-name = "serde-jsonlines"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "013e069239d98648ea43a9c01845b381445e88de08b5a895ef9302e3bffde03d"
-dependencies = [
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -7394,7 +7299,6 @@ version = "12.18.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "912017718eb4d21930546245af9a3475c9dccf15675a5c215664e76621afc471"
 dependencies = [
- "cpp_demangle",
  "rustc-demangle",
  "symbolic-common",
 ]
@@ -7514,15 +7418,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "termcolor"
-version = "1.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "06794f8f6c5c898b3275aebefa6b8a1cb24cd2c6c79397ab15774837a0bc5755"
-dependencies = [
- "winapi-util",
-]
-
-[[package]]
 name = "termina"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7626,7 +7521,6 @@ dependencies = [
  "execrunner",
  "heph",
  "tempfile",
- "tokio",
 ]
 
 [[package]]
@@ -9057,7 +8951,6 @@ dependencies = [
  "lsp-types",
  "regex",
  "serde",
- "serde_json",
  "starlark",
  "starlark_syntax",
  "textwrap",
@@ -9113,7 +9006,6 @@ dependencies = [
  "anyhow",
  "borsh",
  "config",
- "glob",
  "ignore",
  "model",
  "parking_lot 0.13.0",

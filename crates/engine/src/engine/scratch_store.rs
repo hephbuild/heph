@@ -107,7 +107,7 @@ pub struct SlotEntry {
 //                          /slot.meta     meta_path
 //                          /<scope>/      lineage_dir   (scope sanitized here)
 //                                  /head  head_dir      (the directory mounted)
-//                                  /head.meta           (lineage bookkeeping)
+//                                  /head.meta  head_meta_path (lineage bookkeeping)
 
 /// Root of the scratch store.
 pub fn store_root(home: &Path) -> PathBuf {
@@ -126,13 +126,24 @@ pub fn lineage_dir(home: &Path, slot: &str, scope: &str) -> PathBuf {
     slot_dir(home, slot).join(crate::engine::config::sanitize_scope(scope))
 }
 
-/// The directory actually mounted into a sandbox.
+/// The directory actually mounted into a sandbox: a slot's contents, for one
+/// lineage.
+///
+/// Scope-structured, so a branch's work stays on that branch: two scopes of one
+/// slot are two directories, and nothing a feature branch does can reach the one
+/// `master` builds from.
 ///
 /// A level below the lineage so bookkeeping can sit beside it without ever
 /// appearing inside the cache — anything written next to `head` is heph's, and
 /// anything inside it is the tool's.
 pub fn head_dir(home: &Path, slot: &str, scope: &str) -> PathBuf {
     lineage_dir(home, slot, scope).join("head")
+}
+
+/// The lineage's bookkeeping: the snapshot it was last seeded from or
+/// published as.
+pub fn head_meta_path(home: &Path, slot: &str, scope: &str) -> PathBuf {
+    lineage_dir(home, slot, scope).join("head.meta")
 }
 
 /// Root of the **audit** store: where `--no-scratch` puts its throwaway
@@ -184,15 +195,7 @@ pub(crate) fn sweep_dead_audit_dirs(root: &Path) -> (usize, u64) {
         let Ok(pid) = name.split('-').next().unwrap_or_default().parse::<i32>() else {
             continue;
         };
-        // SAFETY: `kill` with signal 0 performs the permission check and
-        // returns, sending nothing. It takes a plain `pid_t` and touches no
-        // memory we own, so there is no pointer or lifetime obligation.
-        //
-        // ESRCH means no such process; EPERM means it exists and belongs to
-        // someone else, which still counts as alive.
-        let alive = unsafe { libc::kill(pid, 0) } == 0
-            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
-        if alive {
+        if hproc::pid_alive(pid) {
             continue;
         }
         let (bytes, _) = measure(&entry.path());

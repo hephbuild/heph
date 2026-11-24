@@ -114,8 +114,7 @@ impl App for BuildFmtApp {
         let res: anyhow::Result<()> = async {
             let packages: Vec<String> = Arc::clone(&self.engine)
                 .packages(&self.matcher, &rs)
-                .await?
-                .collect::<anyhow::Result<Vec<_>>>()?;
+                .await?;
 
             // The workspace's configured BUILD-file patterns (literal names like
             // `BUILD` and globs like `*.BUILD`) and indent width, so every file

@@ -1,10 +1,11 @@
+use crate::raw_file::{pkg_out, raw_file_response};
 use anyhow::Context as _;
 use async_trait::async_trait;
 use hcore::hasync::Cancellable;
 use hcore::htvalue::signature::ParamType;
 use hplugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
-    ParseResponse, RunRequest, RunResponse, outputartifact,
+    ParseResponse, RunRequest, RunResponse,
     targetdef::{
         Output, TargetDef,
         path::{CodegenMode, Content, Path},
@@ -66,12 +67,7 @@ impl hplugin::driver::Driver for Driver {
             .unwrap_or_else(|| req.target_spec.addr.name.clone());
         let executable = spec.executable;
 
-        let pkg = req.target_spec.addr.package.as_str();
-        let out = if pkg.is_empty() {
-            out_rel
-        } else {
-            format!("{pkg}/{out_rel}")
-        };
+        let out = pkg_out(req.target_spec.addr.package.as_str(), out_rel);
 
         let mut h = Xxh3::new();
         h.update(req.target_spec.addr.format().as_bytes());
@@ -120,33 +116,11 @@ impl hplugin::driver::Driver for Driver {
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<RunResponse> {
         let def = req.target.def::<TextFileDef>();
-        let data = def.text.as_bytes().to_vec();
-
-        let mut h = Xxh3::new();
-        h.update(&data);
-        h.update(def.out.as_bytes());
-        h.update(&[def.executable as u8]);
-        let hashout = format!("{:x}", h.digest());
-
-        let name = std::path::Path::new(&def.out)
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| def.out.clone());
-
-        Ok(RunResponse {
-            artifacts: vec![outputartifact::OutputArtifact {
-                group: "".to_string(),
-                name,
-                r#type: outputartifact::Type::Output,
-                content: outputartifact::Content::Raw(outputartifact::ContentRaw {
-                    data,
-                    path: def.out.clone(),
-                    x: def.executable,
-                }),
-                hashout,
-            }],
-            ..Default::default()
-        })
+        Ok(raw_file_response(
+            def.text.as_bytes().to_vec(),
+            &def.out,
+            def.executable,
+        ))
     }
 
     async fn run_shell<'a, 'io>(
@@ -165,6 +139,7 @@ mod tests {
     use hcore::htvalue::Value;
     use hmodel::htaddr::parse_addr;
     use hplugin::driver::Driver as EDriver;
+    use hplugin::driver::outputartifact;
     use hplugin::provider::TargetSpec;
     use std::collections::HashMap;
 
@@ -374,5 +349,32 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r1.artifacts[0].hashout, r2.artifacts[0].hashout);
+    }
+
+    /// The def hash and the artifact's hashout, as literals: both reach cache
+    /// keys, so a change to how either is fed (the package join, the byte
+    /// order of the hashout's stream) must show up here.
+    #[tokio::test]
+    async fn test_hashes_are_pinned() {
+        let driver = Driver;
+        let mut cfg = basic_config("hello", "bin/f");
+        cfg.insert("executable".to_string(), Value::Bool(true));
+        let parsed = driver
+            .parse(make_parse_req("//pkg:t", cfg), &ctoken())
+            .await
+            .unwrap();
+        assert_eq!(parsed.target_def.hash, b"49e7360c376e0eed");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let request_id = "test".to_string();
+        let hashin = String::new();
+        let res = driver
+            .run(
+                make_run_request(&parsed.target_def, &request_id, tmp.path(), &hashin),
+                &ctoken(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.artifacts[0].hashout, "f468b8f530a4b89e");
     }
 }

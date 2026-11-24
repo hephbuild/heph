@@ -336,7 +336,7 @@ async fn drop_covering_lines(
             .map(|r| display(&r.path))
             .collect();
         let mut lines: Vec<GitignoreEntry> = dropped.into_iter().map(|(e, _)| e).collect();
-        lines.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
+        lines.sort_by(GitignoreEntry::cmp_sorted);
         Ok((lines, also.into_iter().collect()))
     })
     .await

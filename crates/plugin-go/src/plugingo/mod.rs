@@ -15,6 +15,9 @@ pub mod gocache;
 mod govet;
 mod listed;
 mod module_fetch;
+#[cfg(test)]
+mod parse_pins;
+mod parse_util;
 mod pkg_analysis;
 mod provider;
 mod target_bin;
@@ -30,7 +33,7 @@ mod variant;
 
 pub use driver_compile::GoCompileDriver;
 pub use driver_download::GoDownloadDriver;
-pub use driver_format::{GoFormatCheckDriver, GoFormatDriver, format_sources_pattern};
+pub use driver_format::{GoFormatDriver, format_sources_pattern};
 pub use driver_golist::GoGolistDriver;
 pub use driver_lint::{GoLintDriver, GoLintFixDriver, GoLintGateDriver};
 pub use driver_testmain::GoTestmainDriver;

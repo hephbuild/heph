@@ -3,19 +3,15 @@
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
 
+use super::chrome::{CHROME_ROWS, TABS_ROW, end_frame, hint_line};
 use super::header::{Title, header_lines_hits};
 use super::list::{ListInputs, ListState, list_lines};
-use crate::tui::text::{clean_inline, cut_right};
 
 /// The dashboard's key hints, as the spec draws them.
 pub const DASHBOARD_HINTS: &str = "↑/↓ select · enter details · l log · tab/⇧tab list · / filter · a all targets · esc close dashboard · ctrl-c stop";
 
-/// Rows the frame keeps besides the list: four of header, a blank and the
-/// hint row.
-const CHROME_ROWS: u16 = 6;
-/// The header's rows, and the tab row's place among them.
+/// The header's rows.
 const HEADER_ROWS: u16 = 4;
-const TABS_ROW: u16 = 2;
 
 /// The dashboard at `cols` × `rows`: the header's four rows, the list of
 /// `st`'s tab, a blank and `hints` cut to fit. Exactly `rows` lines, none
@@ -44,19 +40,12 @@ pub fn dashboard_frame(
     st.drawn.tabs_row = (rows >= 4).then_some(TABS_ROW);
     st.drawn.tabs = tabs;
     st.drawn.rows_top = HEADER_ROWS + u16::from(list_rows > 1);
-    out.push(Line::default());
-    let hint = cut_right(&clean_inline(hints), usize::from(cols).saturating_sub(2)).into_owned();
-    out.push(Line::styled(
-        format!("  {hint}"),
+    let hint = hint_line(
+        hints,
+        usize::from(cols),
         Style::default().fg(Color::DarkGray),
-    ));
-    let rows = usize::from(rows);
-    // Too short for the chrome: keep the top, and the hint row last.
-    if out.len() > rows {
-        let hint = out.pop();
-        out.truncate(rows.saturating_sub(1));
-        out.extend(hint.filter(|_| rows > 0));
-    }
+    );
+    end_frame(&mut out, hint, rows);
     out
 }
 
@@ -136,7 +125,6 @@ mod tests {
             waits: &NoWaits,
             lines: &lines,
             now_ms: 2_000,
-            redact: &Redact::default(),
         };
         let title = Title {
             command: "heph r build //...",

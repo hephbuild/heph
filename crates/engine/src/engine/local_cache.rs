@@ -593,6 +593,26 @@ fn cache_entry_name(artifact: &outputartifact::OutputArtifact) -> String {
     }
 }
 
+/// Write one blob heph packs itself (a raw, file or view artifact) and commit
+/// it, returning its decoded size: `fill` writes the packed bytes through a
+/// counter that sits above the encoder. `what` names the artifact kind in the
+/// commit's error; `fill` carries its own.
+fn write_packed(
+    writer: Box<dyn EntryWriter>,
+    what: &str,
+    addr: &Addr,
+    name: &str,
+    fill: impl FnOnce(&mut CountingWriter<Box<dyn EntryWriter>>) -> anyhow::Result<()>,
+) -> anyhow::Result<u64> {
+    let mut cw = CountingWriter::new(writer);
+    fill(&mut cw)?;
+    let size = cw.bytes_written();
+    cw.into_inner()
+        .commit()
+        .with_context(|| format!("commit {what} artifact {addr} {name}"))?;
+    Ok(size)
+}
+
 /// Store a container (tar/cpio) the driver already wrote to disk, returning its
 /// size.
 ///
@@ -707,32 +727,26 @@ impl Engine {
             // encoder.
             let (size, content_type, encoding, name) = match artifact.content {
                 outputartifact::Content::Raw(raw) => {
-                    let mut cw = CountingWriter::new(open_writer(name)?);
-                    let mut p = hartifactcontent::tar::TarPacker::new();
-                    p.create_raw(raw.data, raw.path, raw.x);
-                    p.pack(&mut cw)
-                        .with_context(|| format!("pack raw artifact into {addr} {name}"))?;
-                    let size = cw.bytes_written();
-                    cw.into_inner().commit().with_context(|| {
-                        format!("commit raw artifact {addr} {name}")
+                    let size = write_packed(open_writer(name)?, "raw", &addr, name, |w| {
+                        let mut p = hartifactcontent::tar::TarPacker::new();
+                        p.create_raw(raw.data, raw.path, raw.x);
+                        p.pack(w)
+                            .with_context(|| format!("pack raw artifact into {addr} {name}"))
                     })?;
-                    (size, hartifactcontent::Type::Tar, packed_encoding.clone(), packed_name.clone())
+                    (size, ManifestArtifactContentType::Tar, packed_encoding.clone(), packed_name.clone())
                 }
                 outputartifact::Content::File(file) => {
-                    let mut cw = CountingWriter::new(open_writer(name)?);
-                    let mut p = hartifactcontent::tar::TarPacker::new();
-                    p.create_file(file.source_path.clone(), file.out_path);
-                    p.pack(&mut cw).with_context(|| {
-                        format!(
-                            "pack file artifact {} into {addr} {name}",
-                            file.source_path
-                        )
+                    let size = write_packed(open_writer(name)?, "file", &addr, name, |w| {
+                        let mut p = hartifactcontent::tar::TarPacker::new();
+                        p.create_file(file.source_path.clone(), file.out_path);
+                        p.pack(w).with_context(|| {
+                            format!(
+                                "pack file artifact {} into {addr} {name}",
+                                file.source_path
+                            )
+                        })
                     })?;
-                    let size = cw.bytes_written();
-                    cw.into_inner().commit().with_context(|| {
-                        format!("commit file artifact {addr} {name}")
-                    })?;
-                    (size, hartifactcontent::Type::Tar, packed_encoding.clone(), packed_name.clone())
+                    (size, ManifestArtifactContentType::Tar, packed_encoding.clone(), packed_name.clone())
                 }
                 // A view normally never arrives here: `is_passthrough` diverts it
                 // before the cache write, because its whole point is to own no
@@ -742,19 +756,17 @@ impl Engine {
                 // is free to change or be reclaimed underneath it. That costs a
                 // full copy, which is the cost of having asked to cache it.
                 outputartifact::Content::View(v) => {
-                    let mut cw = CountingWriter::new(open_writer(name)?);
-                    let mut r = hartifactcontent::Content::reader(v.view.as_ref())
-                        .with_context(|| {
-                            format!("open view artifact reader for {addr} {name}")
+                    let size = write_packed(open_writer(name)?, "view", &addr, name, |w| {
+                        let mut r = hartifactcontent::Content::reader(v.view.as_ref())
+                            .with_context(|| {
+                                format!("open view artifact reader for {addr} {name}")
+                            })?;
+                        io::copy(&mut r, w).with_context(|| {
+                            format!("pack view artifact into {addr} {name}")
                         })?;
-                    io::copy(&mut r, &mut cw).with_context(|| {
-                        format!("pack view artifact into {addr} {name}")
+                        Ok(())
                     })?;
-                    let size = cw.bytes_written();
-                    cw.into_inner().commit().with_context(|| {
-                        format!("commit view artifact {addr} {name}")
-                    })?;
-                    (size, hartifactcontent::Type::Tar, packed_encoding.clone(), packed_name.clone())
+                    (size, ManifestArtifactContentType::Tar, packed_encoding.clone(), packed_name.clone())
                 }
                 outputartifact::Content::TarPath(content) => {
                     let (size, encoding, name) = store_container(
@@ -766,7 +778,7 @@ impl Engine {
                         &ManifestArtifactContentType::Tar,
                         compress,
                     )?;
-                    (size, hartifactcontent::Type::Tar, encoding, name)
+                    (size, ManifestArtifactContentType::Tar, encoding, name)
                 }
                 outputartifact::Content::CpioPath(content) => {
                     let (size, encoding, name) = store_container(
@@ -778,42 +790,28 @@ impl Engine {
                         &ManifestArtifactContentType::Cpio,
                         compress,
                     )?;
-                    (size, hartifactcontent::Type::Cpio, encoding, name)
+                    (size, ManifestArtifactContentType::Cpio, encoding, name)
                 }
             };
 
-            let artifact_type = match artifact.r#type {
-                outputartifact::Type::Output => ManifestArtifactType::Output,
-                outputartifact::Type::Log => ManifestArtifactType::Log,
-                outputartifact::Type::SupportFile => ManifestArtifactType::SupportFile,
+            let manifest_artifact = ManifestArtifact {
+                hashout: artifact.hashout,
+                group: artifact.group,
+                name,
+                size,
+                r#type: match artifact.r#type {
+                    outputartifact::Type::Output => ManifestArtifactType::Output,
+                    outputartifact::Type::Log => ManifestArtifactType::Log,
+                    outputartifact::Type::SupportFile => ManifestArtifactType::SupportFile,
+                },
+                content_type,
+                encoding,
             };
-
-            anyhow::Ok((
-                CacheArtifact {
-                    addr: addr.clone(),
-                    hashin: hashin.clone(),
-                    name: name.clone(),
-                    cache: local_cache.clone(),
-                    encoding: encoding.clone(),
-                    hashout: artifact.hashout.clone(),
-                    content_type,
-                    group: artifact.group.clone(),
-                    r#type: artifact_type.clone(),
-                    size,
-                },
-                ManifestArtifact {
-                    hashout: artifact.hashout,
-                    group: artifact.group,
-                    name,
-                    size,
-                    r#type: artifact_type,
-                    content_type: match content_type {
-                        hartifactcontent::Type::Tar => ManifestArtifactContentType::Tar,
-                        hartifactcontent::Type::Cpio => ManifestArtifactContentType::Cpio,
-                    },
-                    encoding,
-                },
-            ))
+            // The artifact a later hit reads back from this manifest entry, built
+            // the same way, so the write and hit paths cannot disagree.
+            let cache_artifact =
+                CacheArtifact::from_manifest(&addr, &hashin, &manifest_artifact, local_cache);
+            anyhow::Ok((cache_artifact, manifest_artifact))
         }))
         .await
     }
@@ -999,24 +997,15 @@ impl Engine {
         };
         Ok(manifest
             .artifacts
-            .into_iter()
+            .iter()
             .find(|a| matches!(a.r#type, ManifestArtifactType::Log))
             .map(|a| -> Arc<dyn hartifactcontent::Content> {
-                Arc::new(CacheArtifact {
-                    addr: addr.clone(),
-                    hashin: hashin.to_owned(),
-                    name: a.name,
-                    cache: Arc::clone(&self.local_cache),
-                    encoding: a.encoding,
-                    content_type: match a.content_type {
-                        ManifestArtifactContentType::Tar => hartifactcontent::Type::Tar,
-                        ManifestArtifactContentType::Cpio => hartifactcontent::Type::Cpio,
-                    },
-                    r#type: a.r#type,
-                    hashout: a.hashout,
-                    group: a.group,
-                    size: a.size,
-                })
+                Arc::new(CacheArtifact::from_manifest(
+                    addr,
+                    hashin,
+                    a,
+                    Arc::clone(&self.local_cache),
+                ))
             }))
     }
 
@@ -1086,14 +1075,21 @@ impl Engine {
                 return Err(e).with_context(|| format!("read {name} for {addr} {hashin}"));
             }
         };
-        let mut buf = Vec::with_capacity(sized.size as usize);
-        sized
-            .reader
-            .take(sized.size)
-            .read_to_end(&mut buf)
-            .with_context(|| format!("read manifest bytes for {addr} {hashin}"))?;
-        let manifest = borsh::from_slice::<Manifest>(&buf)
-            .with_context(|| format!("deserialize manifest for {addr} {hashin}"))?;
+        let manifest = match &sized.bytes {
+            // Already in memory (an inline sqlite blob, a mem-tier hit): decode
+            // it where it is rather than draining a copy.
+            Some(bytes) => borsh::from_slice::<Manifest>(bytes),
+            None => {
+                let mut buf = Vec::with_capacity(sized.size as usize);
+                sized
+                    .reader
+                    .take(sized.size)
+                    .read_to_end(&mut buf)
+                    .with_context(|| format!("read manifest bytes for {addr} {hashin}"))?;
+                borsh::from_slice::<Manifest>(&buf)
+            }
+        }
+        .with_context(|| format!("deserialize manifest for {addr} {hashin}"))?;
         Ok(Some(manifest))
     }
 
@@ -2391,6 +2387,115 @@ mod tests {
             manifest.artifacts[0].name, "out_out.tar.raw",
             "a verbatim blob is adopted under its v2-only name"
         );
+    }
+
+    /// What a write returns is what a later hit builds from the manifest it
+    /// committed: every packed kind and a container, one of each artifact type.
+    #[tokio::test]
+    async fn written_artifacts_equal_their_manifest_entries() {
+        let (engine, dir) = test_engine();
+        let ctoken = StdCancellationToken::new();
+        let addr = test_addr();
+
+        let file = dir.path().join("f.txt");
+        std::fs::write(&file, b"file body").expect("write file");
+        let tar = dir.path().join("c.tar");
+        std::fs::write(&tar, vec![7u8; 4096]).expect("write tar");
+        let artifacts = vec![
+            raw_artifact("a", b"raw body"),
+            sandbox_file("g", "f", outputartifact::Type::SupportFile, &file),
+            tar_artifact("c.tar", &tar, false),
+            outputartifact::OutputArtifact {
+                r#type: outputartifact::Type::Log,
+                ..raw_artifact("log", b"log body")
+            },
+        ];
+        let written = engine
+            .cache_locally(&ctoken, &addr, "HASHIN_FROM_MANIFEST", artifacts, false)
+            .await
+            .expect("cache_locally");
+        let manifest = engine
+            .read_manifest(&addr, "HASHIN_FROM_MANIFEST")
+            .expect("read manifest")
+            .expect("manifest committed");
+
+        let fields = |a: &CacheArtifact| {
+            let content_type = match a.content_type {
+                hartifactcontent::Type::Tar => "tar",
+                hartifactcontent::Type::Cpio => "cpio",
+            };
+            format!(
+                "{} {} {} {:?} {content_type} {} {} {:?} {}",
+                a.addr, a.hashin, a.name, a.encoding, a.hashout, a.group, a.r#type, a.size
+            )
+        };
+        assert_eq!(written.len(), manifest.artifacts.len());
+        for (w, m) in written.iter().zip(&manifest.artifacts) {
+            let hit = CacheArtifact::from_manifest(
+                &addr,
+                "HASHIN_FROM_MANIFEST",
+                m,
+                Arc::clone(&engine.local_cache),
+            );
+            assert_eq!(fields(w), fields(&hit));
+        }
+    }
+
+    /// A manifest decodes the same whether the backend hands back its bytes in
+    /// memory (an inline sqlite blob) or only a stream (above the inline
+    /// threshold).
+    #[test]
+    fn a_manifest_decodes_from_bytes_and_from_a_stream() {
+        use crate::engine::local_cache_sqlite::{DEFAULT_MAX_CONCURRENT_PIPES, LocalCacheSQLite};
+
+        let addr = test_addr();
+        let manifest = Manifest {
+            version: MANIFEST_V2_VERSION.to_string(),
+            target: addr.format(),
+            created_at_nanos: 42,
+            hashin: "H".to_string(),
+            artifacts: vec![ManifestArtifact {
+                hashout: "ho".to_string(),
+                group: "g".to_string(),
+                name: "out_a.tar.zst".to_string(),
+                size: 7,
+                r#type: ManifestArtifactType::Output,
+                content_type: ManifestArtifactContentType::Tar,
+                encoding: ManifestArtifactEncoding::Zstd,
+            }],
+        };
+        let encoded = borsh::to_vec(&manifest).expect("encode");
+
+        for (path, inline_threshold, in_memory) in
+            [("bytes", 1024 * 1024, true), ("stream", 0, false)]
+        {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let cache: Arc<dyn LocalCache> = Arc::new(
+                LocalCacheSQLite::with_pipe_limit(
+                    dir.path().join("cache.db"),
+                    inline_threshold,
+                    DEFAULT_MAX_CONCURRENT_PIPES,
+                )
+                .expect("sqlite"),
+            );
+            let mut w = cache.writer(&addr, "H", MANIFEST_V2).expect("writer");
+            w.write_all(&encoded).expect("write");
+            w.commit().expect("commit");
+            assert_eq!(
+                cache
+                    .reader(&addr, "H", MANIFEST_V2)
+                    .expect("reader")
+                    .bytes
+                    .is_some(),
+                in_memory,
+                "{path}: the fixture must take the intended path"
+            );
+
+            let read = Engine::read_named_manifest(&cache, &addr, "H", MANIFEST_V2)
+                .expect("read")
+                .expect("present");
+            assert_eq!(borsh::to_vec(&read).expect("encode"), encoded, "{path}");
+        }
     }
 
     /// A `tmp` revision (uncacheable, `--shell`) is read back once, in this

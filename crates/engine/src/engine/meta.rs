@@ -121,7 +121,7 @@ impl Engine {
         // hashin. `runtime_deps` (hashed=false) are still materialized via
         // the link/execute path, but must not alter the cache key.
         let futures = inputs.iter().filter(|input| input.hashed).map(|input| {
-            enclose!((self => engine, rc, input) async move {
+            enclose!((self => engine, rc) async move {
                 engine
                     .clone()
                     .result_addr(

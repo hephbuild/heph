@@ -11,13 +11,14 @@
 //! `crates/template` — shared with the `tmpl` applet, because configuration that
 //! exists in two places drifts.
 
+use crate::raw_file::{pkg_out, raw_file_response};
 use anyhow::Context as _;
 use async_trait::async_trait;
 use hcore::hasync::Cancellable;
 use hcore::htvalue::signature::ParamType;
 use hplugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, Deferred,
-    ParseRequest, ParseResponse, RunRequest, RunResponse, TargetAddr, outputartifact,
+    ParseRequest, ParseResponse, RunRequest, RunResponse, TargetAddr,
     targetdef::{
         Input, InputMode, Output, TargetDef,
         path::{CodegenMode, Content, Path},
@@ -114,11 +115,7 @@ impl hplugin::driver::Driver for Driver {
         let src = TargetAddr::parse(&spec.src, &pkg)
             .with_context(|| format!("parsing template src '{}'", spec.src))?;
 
-        let out = if pkg.as_str().is_empty() {
-            out_rel
-        } else {
-            format!("{}/{out_rel}", pkg.as_str())
-        };
+        let out = pkg_out(pkg.as_str(), out_rel);
 
         let mut h = Xxh3::new();
         h.update(&TEMPLATE_FORMAT_VERSION.to_le_bytes());
@@ -198,33 +195,11 @@ impl hplugin::driver::Driver for Driver {
             .with_context(|| format!("template {}: resolving `vars`", req.target.addr.format()))?;
         let rendered = render(&template, &vars)
             .with_context(|| format!("template {}", req.target.addr.format()))?;
-        let data = rendered.into_bytes();
-
-        let mut h = Xxh3::new();
-        h.update(&data);
-        h.update(def.out.as_bytes());
-        h.update(&[def.executable as u8]);
-        let hashout = format!("{:x}", h.digest());
-
-        let name = std::path::Path::new(&def.out)
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| def.out.clone());
-
-        Ok(RunResponse {
-            artifacts: vec![outputartifact::OutputArtifact {
-                group: String::new(),
-                name,
-                r#type: outputartifact::Type::Output,
-                content: outputartifact::Content::Raw(outputartifact::ContentRaw {
-                    data,
-                    path: def.out.clone(),
-                    x: def.executable,
-                }),
-                hashout,
-            }],
-            ..Default::default()
-        })
+        Ok(raw_file_response(
+            rendered.into_bytes(),
+            &def.out,
+            def.executable,
+        ))
     }
 
     async fn run_shell<'a, 'io>(

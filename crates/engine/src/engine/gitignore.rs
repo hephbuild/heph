@@ -33,7 +33,7 @@ pub use hwalk::gitignore_section::{
 /// deterministic. Two *different* targets emitting the same path stay as two
 /// distinct lines (that collision is a `validate` error, not a gitignore one).
 fn normalize(mut entries: Vec<GitignoreEntry>) -> Vec<GitignoreEntry> {
-    entries.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
+    entries.sort_by(GitignoreEntry::cmp_sorted);
     entries.dedup();
     entries
 }
@@ -230,7 +230,7 @@ pub fn diff_section(existing: &[u8], entries: &[GitignoreEntry]) -> SectionDiff 
     let rendered = render(existing, entries);
     let parsed = hwalk::gitignore_section::parse_section_bytes(existing);
     let mut old: Vec<GitignoreEntry> = parsed.lines.iter().map(|l| l.entry.clone()).collect();
-    old.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
+    old.sort_by(GitignoreEntry::cmp_sorted);
     let new = normalize(entries.to_vec());
     let (added, removed) = sorted_difference(&new, &old);
 
@@ -267,7 +267,7 @@ fn sorted_difference(
     let (mut only_a, mut only_b) = (Vec::new(), Vec::new());
     let (mut i, mut j) = (0, 0);
     while let (Some(x), Some(y)) = (a.get(i), b.get(j)) {
-        match x.sort_key().cmp(&y.sort_key()) {
+        match x.cmp_sorted(y) {
             Ordering::Less => {
                 only_a.push(x.clone());
                 i += 1;
@@ -520,6 +520,44 @@ mod tests {
             pattern: pattern.to_string(),
             addr: Some(parse_addr(addr).expect("valid addr")),
         }
+    }
+
+    /// `cmp_sorted` is the order of `sort_key`, ties on the pattern included:
+    /// the target decides those, and an unattributed line sorts first.
+    #[test]
+    fn cmp_sorted_orders_as_sort_key_does_including_pattern_ties() {
+        let entries = [
+            attributed("/b", "//p:z"),
+            attributed("/a", "//p:b"),
+            bare("/a"),
+            attributed("/a", "//p:a"),
+            attributed("/a", "//p:ab"),
+            bare("/b"),
+            attributed("/a", "//q:a"),
+        ];
+        for x in &entries {
+            for y in &entries {
+                assert_eq!(
+                    x.cmp_sorted(y),
+                    x.sort_key().cmp(&y.sort_key()),
+                    "{x:?} vs {y:?}"
+                );
+            }
+        }
+        let normalized = normalize(entries.to_vec());
+        let lines: Vec<_> = normalized.iter().map(GitignoreEntry::to_line).collect();
+        assert_eq!(
+            lines,
+            [
+                "/a",
+                "# //p:a\n/a",
+                "# //p:ab\n/a",
+                "# //p:b\n/a",
+                "# //q:a\n/a",
+                "/b",
+                "# //p:z\n/b",
+            ]
+        );
     }
 
     #[test]

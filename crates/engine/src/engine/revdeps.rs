@@ -32,10 +32,7 @@ impl Engine {
     ) -> impl Stream<Item = anyhow::Result<Addr>> + 'a {
         // Cap in-flight def resolutions; the engine's own semaphores gate the
         // real work, this just bounds the orchestration set held off the stream.
-        let concurrency = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .saturating_mul(2);
+        let concurrency = crate::engine::fanout::discovery_concurrency();
         // The walk itself rarely resolves anything for a package scope; the
         // candidate's def is resolved here, so this is where most of a revdeps
         // run's skips happen.

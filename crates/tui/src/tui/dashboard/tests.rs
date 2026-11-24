@@ -119,7 +119,7 @@ fn text(l: &Line<'_>) -> String {
 
 /// One frame of `tab`'s list at `T0 + now`, 120 columns by 20 rows.
 fn frame(s: &BuildState, st: &mut ListState, tab: Tab, now: u64) -> Vec<String> {
-    frame_with(s, st, tab, now, &LastLines::default(), &Redact::default())
+    frame_with(s, st, tab, now, &LastLines::default())
 }
 
 fn frame_with(
@@ -128,7 +128,6 @@ fn frame_with(
     tab: Tab,
     now: u64,
     lines: &LastLines,
-    redact: &Redact,
 ) -> Vec<String> {
     st.set_tab(tab);
     let inp = ListInputs {
@@ -136,7 +135,6 @@ fn frame_with(
         waits: s,
         lines,
         now_ms: T0 + now,
-        redact,
     };
     list_lines(&inp, st, 120, 20).iter().map(text).collect()
 }
@@ -161,7 +159,6 @@ fn target_frame(s: &BuildState, t: &mut TargetScreen, now: u64, redact: &Redact)
         waits: s,
         redact,
         now_ms: T0 + now,
-        scope: CountScope::Matched,
         detach: false,
     };
     t.frame(&title(), &inp, 120, 30).iter().map(text).collect()
@@ -443,8 +440,9 @@ fn wait_text_is_the_shared_formatter_pending_row() {
     };
     for (pool, removals, yields) in [
         ("cpu", None, None),
-        ("cpu", None, Some(yielding)),
+        ("cpu", None, Some(yielding.clone())),
         ("sandbox", Some(2), None),
+        ("sandbox", Some(2), Some(yielding)),
     ] {
         let s = fold(&[
             at(0, start("//w:a")),
@@ -479,19 +477,28 @@ fn wait_text_is_the_shared_formatter_pending_row() {
             "{words:?}"
         );
         assert!(!words.row_detail.contains("41s"), "{words:?}");
-        match (pool, &yields) {
-            ("cpu", None) => assert_eq!(words.row_detail, "(2 free)"),
-            (_, Some(_)) => assert!(
+        match (removals, &yields) {
+            (None, None) => assert_eq!(words.row_detail, "(2 free)"),
+            (None, Some(_)) => assert!(
                 words
                     .row_detail
                     .starts_with("(2 free, yielding to a memory ")
                     && words.row_detail.ends_with(" run)"),
                 "{words:?}"
             ),
-            _ => assert!(
+            (Some(_), None) => assert!(
                 words
                     .row_detail
-                    .ends_with(") — cleanup is behind: 2 removals pending"),
+                    .ends_with(" free) — cleanup is behind: 2 removals pending"),
+                "{words:?}"
+            ),
+            // Both: the time goes from inside the brackets, the cleanup
+            // cause stays after them.
+            (Some(_), Some(_)) => assert!(
+                words.row_detail.ends_with(
+                    " free, yielding to a memory 1.0 GiB run) — cleanup is behind: 2 removals \
+                     pending"
+                ),
                 "{words:?}"
             ),
         }
@@ -693,6 +700,61 @@ fn timeline_from_events() {
         f.iter().any(|r| r.contains("execute") && r.ends_with('▶')),
         "{f:#?}"
     );
+}
+
+/// On a narrow or short terminal the target screen is still exactly `rows`
+/// lines, none wider than `cols`, its hint row last; the breadcrumb and the
+/// tabs stay clickable while the tab row is drawn.
+#[test]
+fn target_screen_narrow_and_short() {
+    let s = fold(&[at(0, start("//t:run")), at(0, exec("//t:run"))]);
+    let redact = Redact::default();
+    let inp = TargetInputs {
+        model: s.dashboard(),
+        waits: &s,
+        redact: &redact,
+        now_ms: T0 + 1_000,
+        detach: false,
+    };
+    for tab in [TargetTab::Overview, TargetTab::Log, TargetTab::Outputs] {
+        let mut t = open_on(&s, "//t:run", tab, None);
+        for (cols, rows) in [
+            (120, 30),
+            (40, 8),
+            (20, 6),
+            (12, 4),
+            (8, 3),
+            (20, 2),
+            (20, 1),
+            (20, 0),
+        ] {
+            let f: Vec<String> = t
+                .frame(&title(), &inp, cols, rows)
+                .iter()
+                .map(text)
+                .collect();
+            assert_eq!(f.len(), usize::from(rows), "{tab:?} {cols}x{rows}: {f:#?}");
+            for l in &f {
+                assert!(
+                    crate::tui::text::width(l) <= usize::from(cols),
+                    "{cols}x{rows}: {l:?}"
+                );
+            }
+            if rows > 0 {
+                let hint = f.last().map(String::as_str).unwrap_or_default();
+                assert!(
+                    hint.starts_with("  ") && !hint.trim().is_empty(),
+                    "{cols}x{rows}: {f:#?}"
+                );
+            }
+            if rows >= 4 {
+                assert!(f[2].starts_with(" ◂"), "{cols}x{rows}: {f:#?}");
+                assert_eq!(t.click(1, 2), TargetClick::Back, "{cols}x{rows}");
+            } else {
+                assert_eq!(t.click(1, 2), TargetClick::Nothing, "{cols}x{rows}");
+            }
+        }
+    }
 }
 
 fn file(path: &str, size: u64) -> OutputFile {
@@ -1042,7 +1104,7 @@ fn no_home_path_on_any_screen_dashboard_and_target() {
     let mut lines = LastLines::default();
     let mut st = ListState::default();
     for tab in [Tab::All, Tab::Failed, Tab::Pending] {
-        frame_with(&s, &mut st, tab, 1_000, &lines, &redact);
+        frame_with(&s, &mut st, tab, 1_000, &lines);
         let ids: Vec<Id> = st.visible().to_vec();
         lines.apply(
             ids.iter()
@@ -1054,8 +1116,9 @@ fn no_home_path_on_any_screen_dashboard_and_target() {
                 })
                 .collect(),
             &ids,
+            &redact,
         );
-        let f = frame_with(&s, &mut st, tab, 1_000, &lines, &redact);
+        let f = frame_with(&s, &mut st, tab, 1_000, &lines);
         if tab != Tab::Pending {
             assert!(f.iter().any(|r| r.contains("main.rs:3")), "{tab:?}: {f:#?}");
         }

@@ -12,5 +12,4 @@ hmodel = { package = "model", path = "../model" }
 hplugin = { package = "plugin", path = "../plugin" }
 hbuiltins = { package = "builtins", path = "../builtins" }
 anyhow = "1.0.104"
-async-trait = "0.1.92"
 futures = "0.3.34"

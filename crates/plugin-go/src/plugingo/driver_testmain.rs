@@ -1,13 +1,13 @@
-use crate::plugingo::deps::dep_origin;
+use crate::plugingo::deps::{DepShape, dep_input, dep_origin};
 use crate::plugingo::gen_testmain::{analyze_test_main, generate_testmain};
+use crate::plugingo::parse_util::{def_hash, pkg_outputs};
 use crate::plugingo::pkg_analysis::decode_go_package;
 use anyhow::Context;
 use async_trait::async_trait;
-use hcore::debug_hash::DebugHasher;
 use hcore::hasync::Cancellable;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
-use hplugin::driver::targetdef::path::{CodegenMode, Content, Path};
-use hplugin::driver::targetdef::{CacheConfig, Input, InputMode, Output, TargetDef};
+use hplugin::driver::targetdef::path::CodegenMode;
+use hplugin::driver::targetdef::{CacheConfig, Input, TargetDef};
 use hplugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
     ParseResponse, TargetAddr,
@@ -17,7 +17,6 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::io::BufRead;
 use std::sync::Arc;
-use xxhash_rust::xxh3::Xxh3Default;
 
 pub struct GoTestmainDriver;
 
@@ -91,7 +90,6 @@ impl ManagedDriver for GoTestmainDriver {
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ParseResponse> {
         let pkg = req.target_spec.addr.package.clone();
-        let pkg_str = pkg.as_str();
 
         let spec =
             GoTestmainSpec::from(&req.target_spec.config).context("parse go_testmain config")?;
@@ -109,15 +107,13 @@ impl ManagedDriver for GoTestmainDriver {
 
         let mut inputs: Vec<Input> = Vec::new();
         for (i, addr_str) in golist_addrs.iter().enumerate() {
-            inputs.push(Input {
-                r#ref: TargetAddr::parse(addr_str, &pkg)
+            inputs.push(dep_input(
+                TargetAddr::parse(addr_str, &pkg)
                     .with_context(|| format!("parse golist dep addr {addr_str}"))?,
-                mode: InputMode::Standard,
-                origin_id: dep_origin("golist", i),
-                annotations: std::collections::BTreeMap::new(),
-                hashed: true,
-                runtime: true,
-            });
+                "golist",
+                i,
+                DepShape::staged(&[]),
+            ));
         }
 
         // Test source files: sandboxed inputs so the driver never reaches outside
@@ -126,15 +122,13 @@ impl ManagedDriver for GoTestmainDriver {
         for group in ["test", "xtest"] {
             if let Some(file_addrs) = deps.get(group) {
                 for (i, addr_str) in file_addrs.iter().enumerate() {
-                    inputs.push(Input {
-                        r#ref: TargetAddr::parse(addr_str, &pkg)
+                    inputs.push(dep_input(
+                        TargetAddr::parse(addr_str, &pkg)
                             .with_context(|| format!("parse {group} src dep addr {addr_str}"))?,
-                        mode: InputMode::Standard,
-                        origin_id: dep_origin(group, i),
-                        annotations: std::collections::BTreeMap::new(),
-                        hashed: true,
-                        runtime: true,
-                    });
+                        group,
+                        i,
+                        DepShape::staged(&[]),
+                    ));
                 }
             }
         }
@@ -144,36 +138,8 @@ impl ManagedDriver for GoTestmainDriver {
             mode: spec.mode,
         };
 
-        let outputs = spec
-            .out
-            .iter()
-            .map(|(group, paths)| Output {
-                group: group.clone(),
-                paths: paths
-                    .iter()
-                    .map(|p| {
-                        let full_path = if pkg_str.is_empty() {
-                            p.clone()
-                        } else {
-                            format!("{pkg_str}/{p}")
-                        };
-                        Path {
-                            content: Content::FilePath(full_path),
-                            codegen_tree: CodegenMode::None,
-                            collect: true,
-                        }
-                    })
-                    .collect(),
-            })
-            .collect();
-
-        let hash = {
-            let mut h = DebugHasher::new(Xxh3Default::new(), || {
-                format!("go_testmain_{}", req.target_spec.addr.format())
-            });
-            def.hash(&mut h);
-            format!("{:x}", h.finish()).into_bytes()
-        };
+        let outputs = pkg_outputs(pkg.as_str(), &spec.out, &CodegenMode::None);
+        let hash = def_hash("go_testmain", &req.target_spec.addr, &def);
 
         Ok(ParseResponse {
             target_def: TargetDef {
@@ -274,6 +240,7 @@ mod tests {
     use hcore::htvalue::Value;
     use hmodel::htaddr::Addr;
     use hmodel::htpkg::PkgBuf;
+    use hplugin::driver::targetdef::path::Content;
     use hplugin::provider::TargetSpec;
     use std::collections::HashMap;
 

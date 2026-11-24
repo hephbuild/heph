@@ -54,7 +54,7 @@ pub(crate) struct CallTargets {
 /// What the evaluation contributes for one document. It enriches answers (the
 /// "Targets" hover, an undocumented `def`'s signature) and never gates them:
 /// the site, the shadowing and the loaded names come from the resolver.
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub(crate) struct DocIndex {
     pub call_targets: Vec<CallTargets>,
     /// Rendered hover doc for each top-level function binding (`def` in this file
@@ -195,7 +195,9 @@ pub(crate) struct SharedState {
     /// per hover so the prototype can narrow to the driver/provider the call
     /// site names.
     pub builtin_hovers: crate::pluginbuildfile::run_file::BuiltinHovers,
-    docs: Mutex<HashMap<LspUri, DocIndex>>,
+    /// Shared, so a reader takes a handle rather than copying the buffer and
+    /// its index out from under the lock.
+    docs: Mutex<HashMap<LspUri, Arc<DocIndex>>>,
     /// The name sets of each document's last good parse (D3).
     overlays: Mutex<HashMap<LspUri, Arc<super::site::Overlay>>>,
     /// The token array the loop just built for a document, handed to the
@@ -225,10 +227,13 @@ impl SharedState {
     }
 
     pub(crate) fn set_index(&self, uri: LspUri, index: DocIndex) {
-        self.docs.lock().expect("docs lock").insert(uri, index);
+        self.docs
+            .lock()
+            .expect("docs lock")
+            .insert(uri, Arc::new(index));
     }
 
-    pub(crate) fn index(&self, uri: &LspUri) -> Option<DocIndex> {
+    pub(crate) fn index(&self, uri: &LspUri) -> Option<Arc<DocIndex>> {
         self.docs.lock().expect("docs lock").get(uri).cloned()
     }
 

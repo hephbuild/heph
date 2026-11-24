@@ -1293,6 +1293,30 @@ async fn honest_listings_report_no_mismatch() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A provider listing one addr twice with the same lying facts makes one
+/// claim, so `heph validate` reports it once.
+#[tokio::test]
+async fn duplicate_listing_reports_one_mismatch() -> anyhow::Result<()> {
+    let (ws, _) = workspace(
+        vec![bash("//a:t", &["y"]), bash("//a:t", &["y"])],
+        Faults {
+            name: Some("liar"),
+            listed_facts: facts_fn(|_| Some(ListedFacts::default().with_labels(["x"]))),
+            ..Default::default()
+        },
+    )?;
+    assert_eq!(
+        mismatches(&ws).await?,
+        vec![
+            "provider `liar` lists //a:t with labels [x], but it resolves to labels [y]. \
+             Provider `liar` must list exactly what its `get` returns, or leave the field \
+             unknown; set HEPH_NO_LISTED_FACTS=1 to resolve every target instead of trusting \
+             listed facts"
+        ]
+    );
+    Ok(())
+}
+
 /// Invariant 2: a listed driver match whose `get` fails keeps the walk's rules
 /// (a recorded skip under keep-going, a failed run without), and a listed
 /// `has_codegen=false` never reaches the failing `get` at all.

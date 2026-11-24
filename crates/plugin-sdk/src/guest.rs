@@ -3,7 +3,6 @@
 //! are direct stabby vtable dispatch into the host, no serialization.
 
 use anyhow::{Context, Result};
-use buffa::Message;
 use futures::future::BoxFuture;
 use hcore::hartifactcontent::{Content, WalkEntry};
 use hmodel::htaddr::Addr;
@@ -15,6 +14,7 @@ use hplugin_stabby::abi::{
     DynArtifact, DynExecutor, DynRead, StableAddr, StableArtifactContentDyn, StableExecutorDyn,
     StableReadDyn,
 };
+use hplugin_stabby::seam::encode_svec;
 use std::io::Read;
 use std::sync::Arc;
 
@@ -98,13 +98,10 @@ impl ProviderExecutor for GuestExecutor {
         extra_skip: &'a [String],
     ) -> BoxFuture<'a, Result<Vec<Addr>>> {
         Box::pin(async move {
-            let matcher_pb = plugin_abi::convert::matcher_to_pb(m).encode_to_vec();
+            let matcher_pb = encode_svec(&plugin_abi::convert::matcher_to_pb(m));
             let skip: stabby::vec::Vec<stabby::string::String> =
                 extra_skip.iter().map(|s| s.clone().into()).collect();
-            let r = self
-                .exec
-                .query(stabby::vec::Vec::from(matcher_pb.as_slice()), skip)
-                .await;
+            let r = self.exec.query(matcher_pb, skip).await;
             if r.ok {
                 let mut out = Vec::with_capacity(r.addrs.len());
                 for a in r.addrs.iter() {
@@ -187,16 +184,17 @@ impl Content for StableContent {
 
 /// Adapts a stable [`DynRead`] (chunk-pull) to `std::io::Read`: serves the current
 /// chunk via a `Cursor`, pulling the next chunk when it drains; an empty chunk is EOF.
+/// The cursor reads the chunk the host handed over in place, never a copy of it.
 struct GuestRead {
     inner: DynRead,
-    cur: std::io::Cursor<Vec<u8>>,
+    cur: std::io::Cursor<stabby::vec::Vec<u8>>,
 }
 
 impl GuestRead {
     fn new(inner: DynRead) -> Self {
         Self {
             inner,
-            cur: std::io::Cursor::new(Vec::new()),
+            cur: std::io::Cursor::new(stabby::vec::Vec::new()),
         }
     }
 }
@@ -213,7 +211,7 @@ impl Read for GuestRead {
             if chunk.is_empty() {
                 return Ok(0);
             }
-            self.cur = std::io::Cursor::new(chunk.to_vec());
+            self.cur = std::io::Cursor::new(chunk);
         }
     }
 }

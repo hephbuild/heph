@@ -162,7 +162,7 @@ impl Budgeted {
 /// addr or an error message can contain multi-byte UTF-8, and a byte-index slice
 /// through one is a panic. The workspace also denies raw string slicing for
 /// exactly this reason.
-fn truncate_chars(s: &str, max: usize) -> String {
+pub(crate) fn truncate_chars(s: &str, max: usize) -> String {
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {
         if i >= max {
@@ -191,19 +191,11 @@ pub(crate) fn fmt_duration(ms: u64) -> String {
     hcore::units::human_duration(std::time::Duration::from_millis(ms))
 }
 
-/// `1,412` — thousands separators, because the difference between 4117 and 41171
-/// is not scannable at a glance and these numbers are read at a glance.
+/// `1,412` — thousands separators ([`hcore::units::thousands`]), because the
+/// difference between 4117 and 41171 is not scannable at a glance and these
+/// numbers are read at a glance.
 fn fmt_count(n: usize) -> String {
-    let s = n.to_string();
-    let mut out = String::new();
-    let len = s.chars().count();
-    for (i, c) in s.chars().enumerate() {
-        if i > 0 && (len - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    out
+    hcore::units::thousands(n)
 }
 
 /// A 20-cell progress bar. Unicode blocks rather than an image: a badge would be

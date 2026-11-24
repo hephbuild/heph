@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use enclose::enclose;
@@ -84,15 +84,12 @@ impl Engine {
 
         // Cap in-flight def resolutions; the engine's own semaphores gate the
         // real work, this just bounds the level's orchestration set.
-        let concurrency = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .saturating_mul(2);
+        let concurrency = crate::engine::fanout::discovery_concurrency();
 
         // `parents[dep] = node` — the node that first reached `dep`, i.e. the
-        // predecessor on a shortest chain from `from`.
+        // predecessor on a shortest chain from `from`. Its keys, plus `from`,
+        // are every node the walk has reached.
         let mut parents: HashMap<Addr, Addr> = HashMap::new();
-        let mut seen: HashSet<Addr> = HashSet::from([from.clone()]);
         let mut frontier = vec![from.clone()];
 
         while !frontier.is_empty() {
@@ -113,7 +110,9 @@ impl Engine {
             let mut next = Vec::new();
             for (node, deps) in level {
                 for dep in deps {
-                    if !seen.insert(dep.clone()) {
+                    // A dep listed twice, or reached before, keeps its first
+                    // parent: that one is on a shortest chain.
+                    if dep == from || parents.contains_key(&dep) {
                         continue;
                     }
                     parents.insert(dep.clone(), node.clone());
@@ -130,9 +129,9 @@ impl Engine {
     }
 }
 
-/// A target's dependency addrs, deduplicated, in declared order. Several inputs
-/// may reference the same target through different outputs; as a graph edge that
-/// is one dep. `no_transitive` drops the inputs contributed by the deps'
+/// A target's dependency addrs, in declared order. Several inputs may reference
+/// the same target through different outputs, so an addr can repeat; the walk
+/// keeps the first. `no_transitive` drops the inputs contributed by the deps'
 /// transitive sandboxes, leaving only what the target declares itself.
 async fn deps_of(
     engine: Arc<Engine>,
@@ -145,14 +144,11 @@ async fn deps_of(
     } else {
         engine.get_def(rs, addr).await?
     };
-    let inputs = &def.target_def.inputs;
-
-    let mut seen = HashSet::with_capacity(inputs.len());
-    Ok(inputs
+    Ok(def
+        .target_def
+        .inputs
         .iter()
-        .map(|input| &input.r#ref.r#ref)
-        .filter(|dep| seen.insert((*dep).clone()))
-        .cloned()
+        .map(|input| input.r#ref.r#ref.clone())
         .collect())
 }
 
@@ -451,6 +447,33 @@ mod tests {
             Some(vec![
                 "//app:bin".to_string(),
                 "//lib:l".to_string(),
+                "//lib:leaf".to_string(),
+            ])
+        );
+        Ok(())
+    }
+
+    /// Two equal chains to `leaf` from a level of three, the first of them
+    /// reached only through a dep that is listed twice: the tie still goes to
+    /// the chain through the earliest frontier entry, and the repeat changes
+    /// nothing.
+    #[tokio::test]
+    async fn equal_chains_tie_break_on_frontier_order() -> anyhow::Result<()> {
+        let (engine, _root) = make_engine(vec![
+            target("//app:bin", &["//lib:z", "//lib:a"]),
+            target("//lib:z", &["//lib:y", "//lib:y"]),
+            target("//lib:a", &["//lib:b"]),
+            target("//lib:y", &["//lib:leaf"]),
+            target("//lib:b", &["//lib:leaf"]),
+            target("//lib:leaf", &[]),
+        ])?;
+
+        assert_eq!(
+            path(engine, "//app:bin", "//lib:leaf").await?,
+            Some(vec![
+                "//app:bin".to_string(),
+                "//lib:z".to_string(),
+                "//lib:y".to_string(),
                 "//lib:leaf".to_string(),
             ])
         );

@@ -11,13 +11,8 @@
 //! is.
 
 use hplugin_devenv::plugindevenv;
-use plugin_sdk::stabby::abi::{
-    DynFunctionRegistry, DynLogSink, DynRunnerHost, DynSupervisor, PluginComponents,
-};
-use plugin_sdk::stabby::{
-    create_config_from_bytes, install_log_sink, install_runner_host, install_supervisor,
-    named_managed_driver,
-};
+use plugin_sdk::stabby::abi::{DynFunctionRegistry, PluginComponents};
+use plugin_sdk::stabby::{create_config_from_bytes, named_managed_driver};
 
 /// Stable ABI create entry. `cfg` is the encoded create config; the `bin:`
 /// option is read out of it so a workspace can pin which `devenv` it
@@ -37,59 +32,15 @@ pub extern "C" fn heph_plugin_create(
             // "unknown driver", which names the problem at a place the user can
             // act on.
             tracing::error!(error = %format!("{e:#}"), "devenv plugin: bad configuration");
-            PluginComponents {
-                provider: stabby::option::Option::None(),
-                drivers: stabby::vec::Vec::new(),
-                functions: stabby::vec::Vec::new(),
-                function_handle: stabby::option::Option::None(),
-                hooks: stabby::vec::Vec::new(),
-                runners: stabby::vec::Vec::new(),
-                meta: stabby::vec::Vec::new(),
-            }
+            PluginComponents::empty()
         }
     }
 }
 
-/// Stable ABI log-sink entry. Without it this cdylib's statically-linked
-/// `tracing` has no subscriber and every diagnostic it emits vanishes.
-#[stabby::export]
-pub extern "C" fn heph_plugin_set_log_sink(sink: DynLogSink) {
-    install_log_sink(sink);
-}
-
-/// ABI version entry: the host reads it before anything else and refuses this
-/// plugin if it was built for an ABI the host does not load. A plain C symbol,
-/// so it reads the same whatever stabby layout either side has.
-#[unsafe(no_mangle)]
-pub extern "C" fn heph_plugin_abi_semver() -> *const std::ffi::c_char {
-    plugin_sdk::stabby::abi_semver()
-}
-
-/// Stable ABI log-filter entry: the host's filter as protobuf `LogFilter` bytes,
-/// so events it would discard are dropped here instead of forwarded.
-#[stabby::export]
-pub extern "C" fn heph_plugin_set_log_filter(filter: stabby::vec::Vec<u8>) {
-    plugin_sdk::stabby::install_log_filter(&filter);
-}
-
-/// Stable ABI supervisor entry. This cdylib links its own `proc`, so without it
-/// the `devenv shell` it spawns to capture an environment is unregistered with
-/// the sidecar and orphaned on a hard kill of the host — and a stray nix
-/// evaluation is exactly the child that must not survive.
-#[stabby::export]
-pub extern "C" fn heph_plugin_set_supervisor(sup: DynSupervisor) {
-    install_supervisor(sup);
-}
-
-/// Stable ABI exec-runner entry: the host hands the plugin a handle to its
-/// runner registry. This cdylib links its own `execrunner`, whose registry the
-/// engine's `install_exec_runner_host` never reached — without this, a target
-/// here that names a `runner` fails with "no runner host is installed in this
-/// component" rather than running in the environment it asked for.
-#[stabby::export]
-pub extern "C" fn heph_plugin_set_runner_host(host: DynRunnerHost) {
-    install_runner_host(host);
-}
+// The supervisor entry matters here: the `devenv shell` this plugin spawns to
+// capture an environment would otherwise be orphaned on a hard kill of the
+// host, and a stray nix evaluation is exactly the child that must not survive.
+plugin_sdk::export_host_entries!();
 
 fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
     let opts = create_config_from_bytes(cfg)?.options;
@@ -99,12 +50,7 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
     )?)?);
 
     Ok(PluginComponents {
-        provider: stabby::option::Option::None(),
         drivers,
-        functions: stabby::vec::Vec::new(),
-        function_handle: stabby::option::Option::None(),
-        hooks: stabby::vec::Vec::new(),
-        runners: stabby::vec::Vec::new(),
-        meta: stabby::vec::Vec::new(),
+        ..PluginComponents::empty()
     })
 }

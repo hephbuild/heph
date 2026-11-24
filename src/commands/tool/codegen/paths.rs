@@ -26,7 +26,7 @@ pub fn resolve_path(root: &Path, cwd: &Path, arg: &str) -> ResolvedPath {
     };
     // `normalize_rel` strips `root` before resolving `..`, so normalise the
     // whole path first: `<root>/a/../../x` must not read as inside.
-    let abs = lexical(&abs);
+    let abs = hcore::paths::lexical(&abs);
     match hwalk::codegen_index::normalize_rel(root, &abs) {
         Some(rel) => ResolvedPath::Inside(rel.into_owned()),
         None => ResolvedPath::Outside,
@@ -58,23 +58,6 @@ pub fn with_hint(reason: &str, hint: Option<&str>) -> String {
         Some(h) => format!("{reason}; {h}"),
         None => reason.to_owned(),
     }
-}
-
-/// `p` with `.` and `..` resolved as text (as git does).
-fn lexical(p: &Path) -> PathBuf {
-    use std::path::Component;
-
-    let mut out = PathBuf::new();
-    for c in p.components() {
-        match c {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                out.pop();
-            }
-            other => out.push(other),
-        }
-    }
-    out
 }
 
 #[cfg(test)]

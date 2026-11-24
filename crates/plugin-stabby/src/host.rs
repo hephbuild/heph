@@ -7,17 +7,16 @@ use crate::abi::{
     StableExecutor, StableFunctionRegistry, StableLogSink, StableRead, StableRunnerHost,
     StableSupervisor, StatesOutcome,
 };
-use crate::seam::panic_text;
+use crate::seam::{encode_svec, panic_text};
 use crate::vtable::dynify;
 use anyhow::Context;
-use buffa::Message;
 use hcore::hartifactcontent::Content;
 use hmodel::htaddr::Addr;
 use hmodel::htpkg::PkgBuf;
 use hplugin::function::{FnArgs, FnCallContext, FunctionSlot};
 use hplugin::provider::ProviderExecutor;
 use plugin_abi::pb::frame::Body;
-use plugin_abi::{convert, pb};
+use plugin_abi::{convert, error_body, pb};
 use stabby::future::DynFutureUnsync as DynFuture;
 use stabby::string::String as SString;
 use stabby::vec::Vec as SVec;
@@ -171,24 +170,8 @@ impl StableSupervisor for HostSupervisor {
 }
 
 /// Encode a unary `pb::Frame` reply carrying `body`.
-fn unary(body: Body) -> SVec<u8> {
-    SVec::from(
-        pb::Frame {
-            id: Some(0),
-            body: Some(body),
-            ..Default::default()
-        }
-        .encode_to_vec()
-        .as_slice(),
-    )
-}
-
-fn err_body(message: String) -> Body {
-    Body::from(pb::Error {
-        kind: Some(pb::error::Kind::Other.into()),
-        message: Some(message),
-        ..Default::default()
-    })
+fn frame_bytes(body: Body) -> SVec<u8> {
+    encode_svec(&plugin_abi::frame(body))
 }
 
 /// A `CallRegisteredRequest`, decoded. Every addressing field is required —
@@ -300,11 +283,12 @@ impl SeamSpawn {
     /// seam: spawned on the runtime this wrapper was constructed with, inline
     /// otherwise. A panicking body maps to `mk_err` (host-side bug, surfaced to
     /// the guest as an error) — never an unwind out of the wrapper's poll,
-    /// which runs inside the extern shim.
+    /// which runs inside the extern shim. `key` names the call in that error,
+    /// and is formatted only then.
     async fn run<T, F>(
         &self,
         method: &'static str,
-        key: String,
+        key: impl std::fmt::Display + Send,
         fut: F,
         mk_err: fn(String) -> T,
     ) -> T
@@ -385,7 +369,7 @@ impl StableFunctionRegistry for HostFunctionRegistry {
         let req = match RegisteredCall::decode(&req[..]) {
             Ok(r) => r,
             Err(e) => {
-                let body = unary(err_body(format!("call_registered decode: {e:#}")));
+                let body = frame_bytes(error_body(format!("call_registered decode: {e:#}")));
                 return dynify(stabby::boxed::Box::new(async move { body }));
             }
         };
@@ -395,7 +379,7 @@ impl StableFunctionRegistry for HostFunctionRegistry {
             let registry = match slot.get() {
                 Ok(r) => r,
                 Err(e) => {
-                    return unary(err_body(format!(
+                    return frame_bytes(error_body(format!(
                         "calling `heph.{}.{}` from a plugin: {e:#}",
                         req.plugin, req.name
                     )));
@@ -404,7 +388,7 @@ impl StableFunctionRegistry for HostFunctionRegistry {
             let rf = match registry.resolve(&req.plugin, &req.name) {
                 Ok(rf) => rf.clone(),
                 Err(e) => {
-                    return unary(err_body(format!(
+                    return frame_bytes(error_body(format!(
                         "calling `heph.{}.{}` from a plugin: {e:#}",
                         req.plugin, req.name
                     )));
@@ -449,15 +433,15 @@ impl StableFunctionRegistry for HostFunctionRegistry {
                 }),
             };
             match res {
-                Ok(resp) => unary(Body::from(resp)),
-                Err(e) => unary(err_body(format!("{e:#}"))),
+                Ok(resp) => frame_bytes(Body::from(resp)),
+                Err(e) => frame_bytes(error_body(format!("{e:#}"))),
             }
         };
         dynify(stabby::boxed::Box::new(self.seam.run(
             "call_registered",
             key,
             fut,
-            |m| unary(err_body(m)),
+            |m| frame_bytes(error_body(m)),
         )))
     }
 }
@@ -504,7 +488,7 @@ impl StableRunnerHost for HostRunnerHost {
         };
         dynify(stabby::boxed::Box::new(self.seam.run(
             "prepare_runner",
-            String::new(),
+            "",
             fut,
             |m| SVec::from(hexecrunner::wire::PrepareReply::Err(m).encode().as_slice()),
         )))
@@ -554,10 +538,6 @@ impl HostExecutor {
     }
 }
 
-fn is_cycle(e: &anyhow::Error) -> bool {
-    hcore::hmemoizer::downcast_chain_ref::<hplugin::error::CycleError>(e).is_some()
-}
-
 /// Reconstruct an `Addr` from the seam's parts — no `//pkg:name` parse.
 fn addr_from_stable(a: &StableAddr) -> Addr {
     let args = a
@@ -585,7 +565,7 @@ impl StableExecutor for HostExecutor {
             },
             Err(e) => NoteDepOutcome {
                 ok: false,
-                cycle: is_cycle(&e),
+                cycle: convert::is_cycle(&e),
                 message: e.to_string().into(),
             },
         }
@@ -593,7 +573,9 @@ impl StableExecutor for HostExecutor {
 
     extern "C" fn result<'a>(&'a self, addr: StableAddr) -> DynFuture<'a, ResultOutcome> {
         let parsed = addr_from_stable(&addr);
-        let key = parsed.to_string();
+        // An `Addr` clone is a refcount bump; its text is needed only if the
+        // callback panics.
+        let key = parsed.clone();
         let inner = Arc::clone(&self.inner);
         let fut = async move {
             match inner.result(&parsed).await {
@@ -620,7 +602,7 @@ impl StableExecutor for HostExecutor {
                 }
                 Err(e) => ResultOutcome {
                     ok: false,
-                    cycle: is_cycle(&e),
+                    cycle: convert::is_cycle(&e),
                     cancelled: hplugin::error::is_cancelled(&e),
                     message: e.to_string().into(),
                     artifacts: SVec::new(),
@@ -677,7 +659,7 @@ impl StableExecutor for HostExecutor {
         };
         dynify(stabby::boxed::Box::new(self.seam.run(
             "query",
-            String::new(),
+            "",
             fut,
             |m| QueryOutcome {
                 ok: false,
@@ -688,17 +670,16 @@ impl StableExecutor for HostExecutor {
     }
 
     extern "C" fn states_under<'a>(&'a self, prefix: SString) -> DynFuture<'a, StatesOutcome> {
-        let prefix = PkgBuf::from(prefix.to_string());
-        let key = prefix.as_str().to_string();
+        let pkg = PkgBuf::from(prefix.to_string());
         let inner = Arc::clone(&self.inner);
         let fut = async move {
-            match inner.states_under(&prefix).await {
+            match inner.states_under(&pkg).await {
                 Ok(states) => StatesOutcome {
                     ok: true,
                     message: SString::new(),
                     states: states
                         .iter()
-                        .map(|s| SVec::from(convert::state_to_pb(s).encode_to_vec().as_slice()))
+                        .map(|s| encode_svec(&convert::state_to_pb(s)))
                         .collect(),
                 },
                 Err(e) => StatesOutcome {
@@ -710,7 +691,7 @@ impl StableExecutor for HostExecutor {
         };
         dynify(stabby::boxed::Box::new(self.seam.run(
             "states_under",
-            key,
+            prefix,
             fut,
             |m| StatesOutcome {
                 ok: false,
@@ -1099,5 +1080,33 @@ mod tests {
                 });
             }
         });
+    }
+
+    /// A host callback that panics reaches the guest as an error naming the
+    /// call by its key. The key is formatted only on that path, and reads
+    /// exactly as the eagerly built `addr.to_string()` key it replaced.
+    #[test]
+    fn a_panicking_host_callback_is_an_error_naming_its_call() {
+        use hmodel::htaddr::Addr;
+        use hmodel::htpkg::PkgBuf;
+
+        fn boom() -> String {
+            panic!("boom")
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let seam = super::SeamSpawn::on(rt.handle().clone(), tracing::Span::none());
+        let addr = Addr::new(
+            PkgBuf::from("some/pkg"),
+            "t".into(),
+            [("k".to_string(), "v".to_string())].into(),
+        );
+        let eager_key = addr.to_string();
+        let expected = format!("host callback result({eager_key}) panicked: boom");
+
+        let got = rt.block_on(seam.run("result", addr, async { boom() }, |m| m));
+        assert_eq!(got, expected);
     }
 }

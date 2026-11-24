@@ -20,8 +20,9 @@ use hcore::approval_notice::{NoticeRoots, NoticeSource, ReadNotice};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use super::header::{Title, header_lines};
-use super::model::{Gauge, Tab, TabCounts};
+use super::chrome::{CHROME_ROWS, TABS_ROW, end_sub_frame, on_back, sub_tab_rows};
+use super::header::{Title, header_top};
+use super::model::Gauge;
 use crate::tui::approval::QueuedApproval;
 use crate::tui::text::{
     Redact, clean_inline, cut_left, cut_right, expand_tabs, sanitize_log, take_width, width,
@@ -43,11 +44,6 @@ pub const READ_ONLY_HINT: &str = "read only · decisions happen in the terminal 
 /// The view's other keys.
 pub const VIEW_HINTS: &str = "←/→ notice · ↑/↓ scroll · esc back";
 
-/// The breadcrumb that starts the tab row; a click on it goes back.
-const BACK: &str = " ◂ esc  ";
-/// Header (2), tab row, rule, a blank and the hint row.
-const CHROME_ROWS: u16 = 6;
-const TABS_ROW: u16 = 2;
 /// Rows one wheel step moves.
 const WHEEL_ROWS: isize = 3;
 
@@ -179,7 +175,6 @@ pub enum ApprovalClick {
 pub struct ApprovalInputs<'a> {
     pub title: &'a Title<'a>,
     pub gauges: &'a [&'a Gauge],
-    pub counts: &'a TabCounts,
     /// Every pending request, oldest first.
     pub queue: &'a [QueuedApproval],
     /// The approval glyph this frame (`✦`/`❖`).
@@ -358,7 +353,7 @@ impl ApprovalScreen {
         if row != TABS_ROW || self.rows <= TABS_ROW + 1 {
             return ApprovalClick::Nothing;
         }
-        if usize::from(col) < width(BACK.trim_end()) {
+        if on_back(col) {
             return ApprovalClick::Back;
         }
         match self.tabs.iter().find(|(cols, _)| cols.contains(&col)) {
@@ -462,60 +457,51 @@ impl ApprovalScreen {
             self.shown_since = Some(inp.now_ms);
         }
         self.pump();
-        let (header, _) = header_lines(inp.title, inp.gauges, inp.counts, Tab::All, cols);
-        let mut out: Vec<Line<'static>> = header.into_iter().take(2).collect();
+        let (header, _) = header_top(inp.title, inp.gauges, cols);
+        let mut out: Vec<Line<'static>> = header.into_iter().collect();
         let c = usize::from(cols);
         let body_rows = usize::from(rows.saturating_sub(CHROME_ROWS));
         let body = self.body(c);
         self.scroll = self.scroll.min(body.len().saturating_sub(body_rows));
         self.body_rows = body_rows;
+        let (tabs, rule) = self.tab_rows(inp.glyph, inp.queue, c);
+        out.push(tabs);
+        out.push(rule);
+        self.rows = rows;
+        out.extend(body.into_iter().skip(self.scroll).take(body_rows));
+        end_sub_frame(&mut out, self.hints(inp.now_ms, c), rows);
+        out
+    }
+
+    /// ` ◂ esc  ✦ //addr  │  plan    changelog      1 of 2 pending` and the
+    /// rule under it, heavy under the notice on screen. The status is the
+    /// decision just taken while it shows, else where the request is in
+    /// `queue`.
+    fn tab_rows(
+        &mut self,
+        glyph: &'static str,
+        queue: &[QueuedApproval],
+        cols: usize,
+    ) -> (Line<'static>, Line<'static>) {
+        let pending;
         let status = match &self.flash {
             Some(f) => (
-                f.text.clone(),
+                f.text.as_str(),
                 Style::default()
                     .fg(if f.approved { Color::Green } else { Color::Red })
                     .add_modifier(Modifier::BOLD),
             ),
             None => {
-                let at = inp.queue.iter().position(|q| q.seq == self.req.seq);
-                let text = match at {
-                    Some(k) => format!("{} of {} pending", k + 1, inp.queue.len()),
-                    None => format!("{} pending", inp.queue.len()),
+                let at = queue.iter().position(|q| q.seq == self.req.seq);
+                pending = match at {
+                    Some(k) => format!("{} of {} pending", k + 1, queue.len()),
+                    None => format!("{} pending", queue.len()),
                 };
-                (text, Style::default().fg(Color::DarkGray))
+                (pending.as_str(), Style::default().fg(Color::DarkGray))
             }
         };
-        let (tabs, rule) = self.tab_rows(inp.glyph, status, c);
-        out.push(tabs);
-        out.push(rule);
-        self.rows = rows;
-        out.extend(body.into_iter().skip(self.scroll).take(body_rows));
-        while out.len() < usize::from(rows.saturating_sub(2)) {
-            out.push(Line::default());
-        }
-        out.push(Line::default());
-        out.push(self.hints(inp.now_ms, c));
-        let rows = usize::from(rows);
-        if out.len() > rows {
-            let hint = out.pop();
-            out.truncate(rows.saturating_sub(1));
-            out.extend(hint.filter(|_| rows > 0));
-        }
-        out
-    }
-
-    /// ` ◂ esc  ✦ //addr  │  plan    changelog      1 of 2 pending` and the
-    /// rule under it, heavy under the notice on screen.
-    fn tab_rows(
-        &mut self,
-        glyph: &'static str,
-        (status, status_style): (String, Style),
-        cols: usize,
-    ) -> (Line<'static>, Line<'static>) {
-        let dim = Style::default().fg(Color::DarkGray);
         let addr = cut_left(&clean_inline(&self.req.addr), cols / 3).into_owned();
-        let mut spans = vec![
-            Span::styled(BACK, dim),
+        let crumb = [
             Span::styled(
                 glyph,
                 Style::default()
@@ -524,53 +510,17 @@ impl ApprovalScreen {
             ),
             Span::raw(" "),
             Span::styled(addr, Style::default().add_modifier(Modifier::BOLD)),
-            Span::styled("  │  ", dim),
         ];
-        let mut at: usize = spans.iter().map(|s| width(&s.content)).sum();
-        let mut mark = (0, 0);
-        self.tabs.clear();
-        for (i, n) in self.req.notices.iter().enumerate() {
-            if i > 0 {
-                spans.push(Span::raw("    "));
-                at += 4;
-            }
-            let name = clean_inline(&n.name).into_owned();
-            let w = width(&name);
-            let col = |c: usize| u16::try_from(c.min(cols)).unwrap_or(u16::MAX);
-            self.tabs.push((col(at)..col(at + w), i));
-            if i == self.notice {
-                mark = (at, w);
-                spans.push(Span::styled(
-                    name,
-                    Style::default().add_modifier(Modifier::BOLD),
-                ));
-            } else {
-                spans.push(Span::styled(name, dim));
-            }
-            at += w;
-        }
-        let room = cols.saturating_sub(at + 2);
-        if room > 4 {
-            let status = cut_right(&status, room).into_owned();
-            let gap = cols.saturating_sub(at + width(&status) + 1);
-            spans.push(Span::raw(" ".repeat(gap)));
-            spans.push(Span::styled(status, status_style));
-        }
-        let mut line = Line::from(spans);
-        if line.width() > cols {
-            line = Line::raw(cut_right(&line.to_string(), cols).into_owned());
-        }
-        let (start, w) = mark;
-        let rule: String = (0..cols)
-            .map(|i| {
-                if i >= start && i < start + w {
-                    '━'
-                } else {
-                    '─'
-                }
-            })
-            .collect();
-        (line, Line::styled(rule, dim))
+        let names = self
+            .req
+            .notices
+            .iter()
+            .map(|n| clean_inline(&n.name).into_owned());
+        let hits = &mut self.tabs;
+        hits.clear();
+        sub_tab_rows(crumb, names, self.notice, status, cols, |i, at| {
+            hits.push((at, i));
+        })
     }
 
     /// The hint row: the decision keys, greyed out while they are locked

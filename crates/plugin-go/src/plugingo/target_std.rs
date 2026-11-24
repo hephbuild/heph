@@ -1,5 +1,5 @@
 use crate::plugingo::addr_util::{
-    go_host_pass_env_config, go_run_prelude, go_sdk_dep, go_sdk_read_only_config, to_run_value,
+    go_run_prelude, go_sdk_dep, insert_toolchain_config, to_run_value,
 };
 use crate::plugingo::cc_toolchain;
 use crate::plugingo::factors::{Factors, VariantRef};
@@ -119,12 +119,7 @@ pub fn install_spec(
     let mut config: HashMap<String, Value> = HashMap::new();
     config.insert("run".to_string(), to_run_value(run));
     config.insert("deps".to_string(), Value::Map(deps));
-    if let Some((ro_k, ro_v)) = go_sdk_read_only_config(go_version) {
-        config.insert(ro_k, ro_v);
-    }
-    if let Some((pe_k, pe_v)) = go_host_pass_env_config(go_version) {
-        config.insert(pe_k, pe_v);
-    }
+    insert_toolchain_config(&mut config, go_version);
     // A staged C compiler still needs `PATH` to reach its own subprograms (`as`,
     // `ld`); without it cgo fails with `cannot execute 'as'`. Merged rather than
     // set so a non-hermetic toolchain's passthrough above survives. No-op unless

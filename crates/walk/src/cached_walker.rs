@@ -258,14 +258,14 @@ pub fn fs_entry_hashout(out_path: &str, content_hashout: &str) -> String {
 /// used only as a *cache validation* fast-path, never as the identity.)
 pub fn file_hashout(path: &Path, x: bool) -> Result<String> {
     use std::io::Read as _;
-    let file = std::fs::File::open(path)
+    let mut file = std::fs::File::open(path)
         .with_context(|| format!("open file for hashing '{}'", path.display()))?;
-    let mut reader = std::io::BufReader::new(file);
     let mut h = ContentHasher::new();
-    // Stream in chunks so large inputs never load wholesale into memory.
+    // Stream in chunks so large inputs never load wholesale into memory. The
+    // chunks are large enough that a BufReader would add nothing.
     let mut buf = [0u8; 64 * 1024];
     loop {
-        let n = reader
+        let n = file
             .read(&mut buf)
             .with_context(|| format!("read file for hashing '{}'", path.display()))?;
         if n == 0 {
@@ -288,21 +288,37 @@ pub fn bytes_hashout(bytes: &[u8], x: bool) -> String {
     h.finish(x)
 }
 
-/// The one content hash [`file_hashout`], [`bytes_hashout`] and
-/// [`CachedWalker::file_hash`] share, so they cannot drift: the content
-/// streamed in, then the exec marker folded in after it.
-struct ContentHasher(Xxh3);
+/// The one content hash [`file_hashout`], [`bytes_hashout`],
+/// [`CachedWalker::file_hash`] and the engine's passthrough verification
+/// share, so they cannot drift: the content streamed in, then the exec marker
+/// folded in after it. It feeds cache keys, so its bytes never change.
+pub struct ContentHasher(Xxh3);
+
+impl std::fmt::Debug for ContentHasher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ContentHasher").finish_non_exhaustive()
+    }
+}
+
+impl Default for ContentHasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl ContentHasher {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self(Xxh3::new())
     }
 
-    fn update(&mut self, bytes: &[u8]) {
+    /// Stream the next `bytes` of the content in.
+    pub fn update(&mut self, bytes: &[u8]) {
         self.0.update(bytes);
     }
 
-    fn finish(mut self, x: bool) -> String {
+    /// The hashout of the content streamed in, for a file whose exec bit is
+    /// `x`.
+    pub fn finish(mut self, x: bool) -> String {
         self.0.update(&[x as u8]);
         format!("{:x}", self.0.digest())
     }
@@ -472,7 +488,7 @@ pub struct CachedWalker {
     /// durable store at all (disabled, bypassing).
     store_path: Option<PathBuf>,
     /// The durable store, once opened. Holds `None` when the open failed: the
-    /// walker then degrades to re-reading from disk for the rest of its life,
+    /// walker then degrades to its in-process front for the rest of its life,
     /// exactly as an eager open failure did.
     store: std::sync::OnceLock<Option<FsWalkStore>>,
     /// In-process front for directory listings, validated against the live
@@ -509,8 +525,8 @@ impl CachedWalker {
 
     /// The walker backed by the sqlite db at `db_path`, opened (or created) on
     /// first use — a command that never walks a tree never opens it. On any
-    /// db-open failure the walker still works — it just degrades to always
-    /// re-reading from disk (no cross-run cache).
+    /// db-open failure the walker still works — it just degrades to its
+    /// in-process front, as [`Self::disabled`] (no cross-run cache).
     pub fn open(db_path: &Path) -> Self {
         if cache_bypassed() {
             tracing::warn!(
@@ -635,8 +651,10 @@ impl CachedWalker {
         let listing = Arc::new(read_dir_uncached(dir)?);
         if !settled(&key, clock) {
             log_racy_skip(dir, "dir", &key, clock);
-        } else if let Some(store) = self.store() {
-            if let Ok(blob) = borsh::to_vec(&*listing) {
+        } else {
+            if let Some(store) = self.store()
+                && let Ok(blob) = borsh::to_vec(&*listing)
+            {
                 store.put_dir(dir, &key, &blob, now_ns());
             }
             self.dirs
@@ -693,8 +711,10 @@ impl CachedWalker {
         let fh = Arc::new(FileHash::new(&st, file_hashout(file, st.exec)?));
         if !settled(&key, clock) {
             log_racy_skip(file, "file", &key, clock);
-        } else if let Some(store) = self.store() {
-            store.put_file(file, &fh, now_ns());
+        } else {
+            if let Some(store) = self.store() {
+                store.put_file(file, &fh, now_ns());
+            }
             self.files.lock().insert(file.to_path_buf(), fh.clone());
         }
         Ok(fh)
@@ -1334,6 +1354,37 @@ mod tests {
             }
         }
         assert_ne!(bytes_hashout(b"a", false), bytes_hashout(b"a", true));
+    }
+
+    /// The hashout of a file over several read chunks is pinned: it reaches
+    /// every input's hashin, so a change to how the file is read must not
+    /// move it.
+    #[test]
+    fn file_hashout_over_several_chunks_is_pinned() {
+        let tmp = tempdir().unwrap();
+        let f = tmp.path().join("big");
+        let body: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&f, &body).unwrap();
+        assert_eq!(file_hashout(&f, false).unwrap(), "c25fbb19f343cf66");
+        assert_eq!(file_hashout(&f, true).unwrap(), "82a2c1fe43996d65");
+    }
+
+    /// The content hash feeds cache keys and every recorded hashout, so its
+    /// bytes are pinned: xxh3-64 over the content then one exec-bit byte, in
+    /// lowercase hex without padding, however the content is chunked.
+    #[test]
+    fn content_hasher_bytes_are_pinned() {
+        for (x, want) in [(false, "3a944c9bd3adc9bc"), (true, "755faaf580db378f")] {
+            let mut h = ContentHasher::new();
+            h.update(b"hel");
+            h.update(b"");
+            h.update(b"lo\n");
+            let got = h.finish(x);
+            let mut oneshot = b"hello\n".to_vec();
+            oneshot.push(u8::from(x));
+            assert_eq!(got, format!("{:x}", xxhash_rust::xxh3::xxh3_64(&oneshot)));
+            assert_eq!(got, want, "x={x}");
+        }
     }
 
     /// Opening a walker opens no database, and a walker that never walked
@@ -1998,6 +2049,102 @@ mod tests {
         let w = CachedWalker::disabled();
         let l = w.read_dir(&tmp.path().join("d")).unwrap();
         assert_eq!(l.entries.len(), 1);
+    }
+
+    /// A disabled walker whose stat is the real one except for the ctime,
+    /// which reads `ctime` (see [`pinned_ctime_walker`]), and whose clock
+    /// reads `clock()`.
+    fn disabled_pinned_walker(
+        ctime: &Arc<AtomicI64>,
+        clock: impl Fn() -> i64 + Send + Sync + 'static,
+    ) -> CachedWalker {
+        let ctime = Arc::clone(ctime);
+        CachedWalker::disabled()
+            .with_clock(clock)
+            .with_stat(move |p| {
+                let mut st = stat_path(p)?;
+                if let Some(key) = &mut st.key {
+                    key.ctime_ns = ctime.load(Ordering::Relaxed);
+                }
+                Ok(st)
+            })
+    }
+
+    /// Rewrite `f` with `body`, and add `extra` to `pkg`, leaving every
+    /// stat key the walker sees as it was: the mtimes are set back to
+    /// [`old_mtime`] and the ctime is pinned by the caller.
+    fn rewrite_behind_the_key(pkg: &Path, f: &Path, body: &[u8], extra: &str) {
+        std::fs::write(f, body).unwrap();
+        std::fs::write(pkg.join(extra), b"").unwrap();
+        set_mtime(f, old_mtime());
+        set_mtime(pkg, old_mtime());
+    }
+
+    /// A walker with no durable store still keeps a settled read in its
+    /// in-process front: with every key unchanged, the second read is the
+    /// first one's result, not a fresh read of the disk.
+    #[test]
+    fn disabled_walker_serves_a_settled_read_from_its_front() {
+        let tmp = tempdir().unwrap();
+        let pkg = tmp.path().join("pkg");
+        std::fs::create_dir(&pkg).unwrap();
+        let f = pkg.join("f");
+        std::fs::write(&f, b"aaaa").unwrap();
+        set_mtime(&f, old_mtime());
+        set_mtime(&pkg, old_mtime());
+        let ctime = Arc::new(AtomicI64::new(1));
+        let w = disabled_pinned_walker(&ctime, || now_ns() + 3_600_000_000_000);
+        assert_eq!(names(&w.read_dir(&pkg).unwrap()), ["f"]);
+        assert_eq!(
+            w.file_hash(&f).unwrap().hashout,
+            bytes_hashout(b"aaaa", false)
+        );
+
+        rewrite_behind_the_key(&pkg, &f, b"bbbb", "g");
+        assert_eq!(names(&w.read_dir(&pkg).unwrap()), ["f"], "from the front");
+        assert_eq!(
+            w.file_hash(&f).unwrap().hashout,
+            bytes_hashout(b"aaaa", false),
+            "from the front"
+        );
+
+        // A moved key is still a miss.
+        ctime.store(2, Ordering::Relaxed);
+        assert_eq!(names(&w.read_dir(&pkg).unwrap()), ["f", "g"]);
+        assert_eq!(
+            w.file_hash(&f).unwrap().hashout,
+            bytes_hashout(b"bbbb", false)
+        );
+    }
+
+    /// A read that is not settled is not kept in a disabled walker's front
+    /// either: with every key unchanged, the next read goes to the disk.
+    #[test]
+    fn disabled_walker_does_not_keep_a_racy_read() {
+        let tmp = tempdir().unwrap();
+        let pkg = tmp.path().join("pkg");
+        std::fs::create_dir(&pkg).unwrap();
+        let f = pkg.join("f");
+        std::fs::write(&f, b"aaaa").unwrap();
+        set_mtime(&f, old_mtime());
+        set_mtime(&pkg, old_mtime());
+        let ctime = Arc::new(AtomicI64::new(1));
+        // The clock sits at the mtime: every read is inside the racy window.
+        let mtime_ns =
+            i64::try_from(old_mtime().duration_since(UNIX_EPOCH).unwrap().as_nanos()).unwrap();
+        let w = disabled_pinned_walker(&ctime, move || mtime_ns);
+        assert_eq!(names(&w.read_dir(&pkg).unwrap()), ["f"]);
+        assert_eq!(
+            w.file_hash(&f).unwrap().hashout,
+            bytes_hashout(b"aaaa", false)
+        );
+
+        rewrite_behind_the_key(&pkg, &f, b"bbbb", "g");
+        assert_eq!(names(&w.read_dir(&pkg).unwrap()), ["f", "g"]);
+        assert_eq!(
+            w.file_hash(&f).unwrap().hashout,
+            bytes_hashout(b"bbbb", false)
+        );
     }
 
     #[test]

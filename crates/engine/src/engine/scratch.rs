@@ -22,12 +22,13 @@
 
 use crate::engine::Engine;
 use crate::engine::driver::targetdef::Input;
+use crate::engine::keyed_file_lock::{KeyedFileGuard, KeyedFileLock};
 use crate::engine::request_state::RequestState;
 use crate::engine::result_lock::LockBackend;
+use crate::engine::scratch_store::head_dir;
 use anyhow::Context as _;
 use hbuiltins::pluginscratch::{Access, DRIVER_NAME, ScratchDef, parse_declaration};
 use hcore::hasync::Cancellable;
-use hlock::hlock::{FRWLock, KeyedRWLock, MemRWLock};
 use hmodel::htaddr::Addr;
 use hplugin::driver::ScratchMount;
 use std::path::{Path, PathBuf};
@@ -79,71 +80,38 @@ impl ResolvedScratch {
 
 /// The per-slot cross-process lock guarding a scratch directory.
 ///
-/// A [`KeyedRWLock`] rather than the transformable lock `result_lock` uses: a
+/// A [`KeyedFileLock`] rather than the transformable lock `result_lock` uses: a
 /// scratch is only ever taken for read (`access = "shared"`) or write
 /// (`access = "exclusive"`) and never upgraded mid-run, so the extra machinery
 /// would buy nothing.
-pub enum ScratchLock {
-    /// `flock(2)` files under `<home>/lock/scratch/`. Mutually exclusive across
-    /// processes on the same machine — which is the point, since two `heph`
-    /// invocations share one slot directory.
-    Fs {
-        lock: KeyedRWLock<String, FRWLock>,
-        /// The directory the per-slot lock files live in. Kept so
-        /// [`holder_pid`](ScratchLock::holder_pid) can find a slot's file by
-        /// path, the same way `ResultLock::Fs` keeps its own.
-        dir: PathBuf,
-    },
-    /// In-process only. Tests, and anything that has opted out of file locking.
-    Mem(KeyedRWLock<String, MemRWLock>),
-}
-
-/// Path of a slot's lock file. One definition, so the file `new` locks and the
-/// file [`holder_pid`](ScratchLock::holder_pid) probes cannot drift apart.
-fn slot_lock_path(dir: &Path, slot: &str) -> PathBuf {
-    dir.join(format!("{slot}.scratch.lock"))
-}
+///
+/// Its files are `<home>/lock/scratch/<slot>.scratch.lock`: mutually exclusive
+/// across processes on the same machine — which is the point, since two `heph`
+/// invocations share one slot directory.
+pub struct ScratchLock(KeyedFileLock);
 
 /// An opaque RAII guard on a slot. Held for the target's execute and dropped
 /// after; the concrete guard type is erased because a target may hold a mix of
 /// read and write guards and this code only ever holds and drops them.
-pub type ScratchGuard = Box<dyn std::any::Any + Send>;
+pub type ScratchGuard = KeyedFileGuard;
 
 impl ScratchLock {
     pub fn new(backend: LockBackend, dir: PathBuf) -> Self {
-        match backend {
-            LockBackend::Fs => Self::Fs {
-                lock: KeyedRWLock::new({
-                    let dir = dir.clone();
-                    move |slot: &String| FRWLock::new(slot_lock_path(&dir, slot))
-                }),
-                dir,
-            },
-            LockBackend::Mem => Self::Mem(KeyedRWLock::new(|_| MemRWLock::default())),
-        }
+        Self(KeyedFileLock::new(backend, dir, ".scratch.lock"))
     }
 
-    /// Acquire the guard `access` calls for, waiting until available.
-    async fn acquire(
+    /// Acquire the guard `access` calls for, waiting until available. An
+    /// exclusive holder stamps its pid, for [`holder_pid`](Self::holder_pid).
+    pub(crate) async fn acquire(
         &self,
         slot: String,
         access: Access,
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ScratchGuard> {
-        Ok(match (self, access) {
-            (Self::Fs { lock, .. }, Access::Shared) => {
-                Box::new(lock.read(slot, ctoken).await?) as ScratchGuard
-            }
-            (Self::Fs { lock, .. }, Access::Exclusive) => {
-                let guard = lock.write(slot, ctoken).await?;
-                stamp_pid(guard.get());
-                Box::new(guard) as ScratchGuard
-            }
-            (Self::Mem(l), Access::Shared) => Box::new(l.read(slot, ctoken).await?) as ScratchGuard,
-            (Self::Mem(l), Access::Exclusive) => {
-                Box::new(l.write(slot, ctoken).await?) as ScratchGuard
-            }
-        })
+        match access {
+            Access::Shared => self.0.read(slot, ctoken).await,
+            Access::Exclusive => self.0.write_stamped(slot, ctoken).await,
+        }
     }
 
     /// A process holding `slot` exclusively right now, when one can be named.
@@ -157,59 +125,13 @@ impl ScratchLock {
     /// case worth naming — one `exclusive` consumer, very often in another
     /// `heph` process, blocking everyone else — which is the whole reason a
     /// waiter cannot answer this question by looking inward.
+    ///
+    /// Our own pid is never named: many targets sharing one `exclusive` cache is
+    /// the dominant shape, and the fix for that is the `access` on the
+    /// declaration, not a rogue process.
     fn holder_pid(&self, slot: &str) -> Option<u32> {
-        match self {
-            Self::Fs { dir, .. } => {
-                let path = slot_lock_path(dir, slot);
-                match hlock::hlock::FLock::is_path_held(&path) {
-                    // Our own pid means this build is serialized against itself
-                    // — many targets sharing one `exclusive` cache is the
-                    // dominant shape. Reporting "held by pid <us>" would send
-                    // the reader hunting a rogue process when the fix is the
-                    // `access` on the declaration, so say nothing and let the
-                    // renderer fall back to naming the access mode.
-                    Ok(true) => crate::engine::result_lock::read_pid(&path)
-                        .filter(|pid| *pid != std::process::id()),
-                    Ok(false) => None,
-                    Err(err) => {
-                        // Without this the diagnostic path is itself
-                        // undiagnosable — same reasoning as the result lock's.
-                        tracing::debug!(error = %err, slot, "probing scratch lock liveness");
-                        None
-                    }
-                }
-            }
-            // In-process only, so the holder is always this process and naming
-            // it would tell a reader nothing they did not already know.
-            Self::Mem(_) => None,
-        }
+        self.0.holder_pid(slot)
     }
-}
-
-/// Stamp this process's pid into a slot's lock file, so a blocked waiter in
-/// another process can name the holder.
-///
-/// Written through the held guard's already-open file description, and
-/// newline-framed for the same reason the result lock frames its own: a shorter
-/// pid written over a longer stale one would otherwise leave `<new><stale tail>`
-/// — all digits, perfectly parseable, naming a process that is nobody. See
-/// `result_lock::read_pid`, which is the reader for both.
-///
-/// Best-effort: a failed stamp costs a waiter the holder's name and nothing else.
-fn stamp_pid(guard: &hlock::hlock::FWriteGuard) {
-    if let Err(err) = guard.write_contents(format!("{}\n", std::process::id()).as_bytes()) {
-        tracing::debug!(error = %err, "could not stamp pid into scratch lock");
-    }
-}
-
-/// The directory a slot's contents live in, for one lineage.
-///
-/// Scope-structured, so a branch's work stays on that branch: two scopes of one
-/// slot are two directories, and nothing a feature branch does can reach the one
-/// `master` builds from. `sanitize_scope` is what keeps a branch name like
-/// `feature/x` from silently nesting an extra level.
-pub fn scope_dir(home: &Path, slot: &str, scope: &str) -> PathBuf {
-    crate::engine::scratch_store::head_dir(home, slot, scope)
 }
 
 /// What preparing a scratch directory actually did, as it rides to
@@ -325,7 +247,7 @@ async fn resolve_scope_dir(
     opts: &crate::engine::config::ScratchOptions,
     addr: &Addr,
 ) -> anyhow::Result<(PathBuf, Prepared)> {
-    let own = scope_dir(home, slot, &opts.scope);
+    let own = head_dir(home, slot, &opts.scope);
     let exists = |p: PathBuf| async move {
         hcore::blocking::run(move || Ok::<bool, std::io::Error>(p.is_dir()))
             .await
@@ -343,7 +265,7 @@ async fn resolve_scope_dir(
             if *fallback == opts.scope {
                 continue;
             }
-            let from = scope_dir(home, slot, fallback);
+            let from = head_dir(home, slot, fallback);
             if !exists(from.clone()).await {
                 continue;
             }
@@ -929,12 +851,12 @@ mod scope_tests {
     fn scopes_are_separate_directories() {
         let home = Path::new("/h");
         assert_ne!(
-            scope_dir(home, "abc", "master"),
-            scope_dir(home, "abc", "feat")
+            head_dir(home, "abc", "master"),
+            head_dir(home, "abc", "feat")
         );
         assert_eq!(
-            scope_dir(home, "abc", "master"),
-            scope_dir(home, "abc", "master")
+            head_dir(home, "abc", "master"),
+            head_dir(home, "abc", "master")
         );
     }
 
@@ -942,7 +864,7 @@ mod scope_tests {
     /// collide the moment one is a path prefix of another.
     #[test]
     fn a_slash_in_a_branch_name_stays_one_component() {
-        let d = scope_dir(Path::new("/h"), "abc", "feature/x");
+        let d = head_dir(Path::new("/h"), "abc", "feature/x");
         let comps: Vec<_> = d.components().collect();
         assert_eq!(
             comps.len(),
@@ -956,7 +878,7 @@ mod scope_tests {
     /// lineage), so it cannot resolve to the slot dir itself.
     #[test]
     fn the_empty_scope_has_a_directory_of_its_own() {
-        let d = scope_dir(Path::new("/h"), "abc", "");
+        let d = head_dir(Path::new("/h"), "abc", "");
         assert!(d.ends_with("head"));
         assert!(d.to_string_lossy().contains("/abc/_/"), "{d:?}");
     }
@@ -967,7 +889,7 @@ mod scope_tests {
         let (got, prepared) = resolve_scope_dir(tmp.path(), "s", &opts("feat", &[], true), &addr())
             .await
             .expect("resolve");
-        assert_eq!(got, scope_dir(tmp.path(), "s", "feat"));
+        assert_eq!(got, head_dir(tmp.path(), "s", "feat"));
         assert_eq!(prepared, Prepared::Cold);
     }
 
@@ -976,7 +898,7 @@ mod scope_tests {
     #[tokio::test]
     async fn a_new_scope_seeds_from_its_fallback() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let master = scope_dir(tmp.path(), "s", "master");
+        let master = head_dir(tmp.path(), "s", "master");
         std::fs::create_dir_all(master.join("sub")).expect("mkdir");
         std::fs::write(master.join("sub").join("f"), b"warm").expect("write");
 
@@ -985,7 +907,7 @@ mod scope_tests {
                 .await
                 .expect("resolve");
 
-        assert_eq!(got, scope_dir(tmp.path(), "s", "feat"));
+        assert_eq!(got, head_dir(tmp.path(), "s", "feat"));
         assert_eq!(
             std::fs::read(got.join("sub").join("f")).expect("read seeded"),
             b"warm"
@@ -1000,7 +922,7 @@ mod scope_tests {
     #[tokio::test]
     async fn seeding_leaves_the_fallback_untouched() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let master = scope_dir(tmp.path(), "s", "master");
+        let master = head_dir(tmp.path(), "s", "master");
         std::fs::create_dir_all(&master).expect("mkdir");
         std::fs::write(master.join("f"), b"base").expect("write");
 
@@ -1016,7 +938,7 @@ mod scope_tests {
     #[tokio::test]
     async fn seed_on_fork_off_starts_cold() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let master = scope_dir(tmp.path(), "s", "master");
+        let master = head_dir(tmp.path(), "s", "master");
         std::fs::create_dir_all(&master).expect("mkdir");
         std::fs::write(master.join("f"), b"warm").expect("write");
 
@@ -1033,7 +955,7 @@ mod scope_tests {
     async fn a_warm_scope_is_never_reseeded() {
         let tmp = tempfile::tempdir().expect("tempdir");
         for (scope, body) in [("master", b"base".as_slice()), ("feat", b"mine".as_slice())] {
-            let d = scope_dir(tmp.path(), "s", scope);
+            let d = head_dir(tmp.path(), "s", scope);
             std::fs::create_dir_all(&d).expect("mkdir");
             std::fs::write(d.join("f"), body).expect("write");
         }
@@ -1051,7 +973,7 @@ mod scope_tests {
     #[tokio::test]
     async fn fallbacks_are_tried_in_order_and_missing_ones_are_skipped() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let develop = scope_dir(tmp.path(), "s", "develop");
+        let develop = head_dir(tmp.path(), "s", "develop");
         std::fs::create_dir_all(&develop).expect("mkdir");
         std::fs::write(develop.join("f"), b"develop").expect("write");
 
@@ -1076,7 +998,7 @@ mod scope_tests {
             resolve_scope_dir(tmp.path(), "s", &opts("feat", &["feat"], true), &addr())
                 .await
                 .expect("resolve");
-        assert_eq!(got, scope_dir(tmp.path(), "s", "feat"));
+        assert_eq!(got, head_dir(tmp.path(), "s", "feat"));
         assert_eq!(prepared, Prepared::Cold, "a self-seed is not a seed");
     }
 

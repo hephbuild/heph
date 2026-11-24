@@ -246,51 +246,9 @@ impl Drop for Handle {
 }
 
 pub(super) fn spawn(spec: Spec) -> io::Result<Handle> {
-    let Spec {
-        program,
-        args,
-        env,
-        cwd,
-        stdin,
-        stdout,
-        stderr,
-        setsid,
-        ctty,
-    } = spec;
-    let mut cmd = Command::new(&program);
-    cmd.args(&args)
-        .env_clear()
-        .envs(env.iter().map(|(k, v)| (k, v)))
-        .current_dir(&cwd)
-        .kill_on_drop(true)
-        .stdin(stdin.into_stdio())
-        .stdout(stdout.into_stdio())
-        .stderr(stderr.into_stdio());
-
-    if setsid || ctty {
-        #[expect(
-            clippy::multiple_unsafe_ops_per_block,
-            reason = "pre_exec + setsid + ioctl must share one unsafe context"
-        )]
-        // SAFETY: pre_exec runs between fork and exec; only async-signal-safe
-        // syscalls (setsid, ioctl) are invoked.
-        unsafe {
-            cmd.pre_exec(move || {
-                if setsid && libc::setsid() < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                if ctty && libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-    }
-
-    // The supervisor must be up before the child exists, or a hard kill of heph
-    // in between would leave it unreaped (it starts lazily; see
-    // `process_supervisor::init`).
-    super::ensure_supervisor_for(&program)?;
+    let (cmd, own_group) = super::build_command(spec)?;
+    let mut cmd = Command::from(cmd);
+    cmd.kill_on_drop(true);
     let mut child = cmd.spawn()?;
     let pid = child
         .id()
@@ -304,7 +262,7 @@ pub(super) fn spawn(spec: Spec) -> io::Result<Handle> {
 
     Ok(Handle {
         pid,
-        own_group: setsid,
+        own_group,
         child,
         stdin: stdin_pump,
         stdout: stdout_reader,

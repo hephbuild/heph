@@ -19,7 +19,7 @@ use starlark::starlark_module;
 use starlark::syntax::{AstModule, Dialect};
 use starlark::values::dict::DictRef;
 use starlark::values::float::UnpackFloat;
-use starlark::values::list::{AllocList, UnpackList};
+use starlark::values::list::{AllocList, ListRef, UnpackList};
 use starlark::values::{UnpackValue, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -969,9 +969,9 @@ pub(crate) fn starlark_to_rust(v: &Value) -> anyhow::Result<htvalue::Value> {
         return Ok(htvalue::Value::Float(f));
     }
 
-    if let Ok(Some(l)) = UnpackList::<Value>::unpack_value(*v) {
+    if let Some(l) = ListRef::from_value(*v) {
         return Ok(htvalue::Value::List(
-            l.items
+            l.content()
                 .iter()
                 .map(starlark_to_rust)
                 .collect::<anyhow::Result<_>>()?,
@@ -1169,53 +1169,45 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
         let mut labels: Vec<String> = vec![];
         let mut transitive: Sandbox = Default::default();
         let mut approval: Approval = Default::default();
-        let config = m
-            .iter()
-            .map(|e| -> anyhow::Result<Option<(String, htvalue::Value)>> {
-                match e.0.as_str() {
-                    "name" => {
-                        if let Some(s) = e.1.unpack_str() {
-                            name = s.to_string();
-                        }
-                        Ok(None)
+        let mut config: HashMap<String, htvalue::Value> = HashMap::with_capacity(m.len());
+        for (key, value) in m.iter() {
+            match key.as_str() {
+                "name" => {
+                    if let Some(s) = value.unpack_str() {
+                        name = s.to_string();
                     }
-                    "driver" => {
-                        if let Some(s) = e.1.unpack_str() {
-                            driver = s.to_string();
-                        }
-                        Ok(None)
-                    }
-                    "labels" => {
-                        // `None` is the field left out, as `heph.types.Labels`
-                        // promises: a wrapper passes its `labels = None` through.
-                        if e.1.is_none() {
-                            labels = vec![];
-                        } else if let Some(s) = e.1.unpack_str() {
-                            labels = vec![s.to_string()];
-                        } else {
-                            labels = UnpackList::<String>::unpack_value_err(*e.1)
-                                .map_err(|e| anyhow::anyhow!("{e}"))?
-                                .items;
-                        }
-                        Ok(None)
-                    }
-                    "transitive" => {
-                        transitive = sandbox_from(starlark_to_rust(e.1)?, &PkgBuf::from(extra.pkg))
-                            .with_context(|| "transitive")?;
-                        Ok(None)
-                    }
-                    "approval" => {
-                        approval =
-                            approval_from(starlark_to_rust(e.1)?).with_context(|| "approval")?;
-                        Ok(None)
-                    }
-                    _ => Ok(Some((e.0.as_str().to_string(), starlark_to_rust(e.1)?))),
                 }
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?
-            .into_iter()
-            .flatten()
-            .collect::<HashMap<String, htvalue::Value>>();
+                "driver" => {
+                    if let Some(s) = value.unpack_str() {
+                        driver = s.to_string();
+                    }
+                }
+                "labels" => {
+                    // `None` is the field left out, as `heph.types.Labels`
+                    // promises: a wrapper passes its `labels = None` through.
+                    if value.is_none() {
+                        labels = vec![];
+                    } else if let Some(s) = value.unpack_str() {
+                        labels = vec![s.to_string()];
+                    } else {
+                        labels = UnpackList::<String>::unpack_value_err(*value)
+                            .map_err(|e| anyhow::anyhow!("{e}"))?
+                            .items;
+                    }
+                }
+                "transitive" => {
+                    transitive = sandbox_from(starlark_to_rust(value)?, &PkgBuf::from(extra.pkg))
+                        .with_context(|| "transitive")?;
+                }
+                "approval" => {
+                    approval =
+                        approval_from(starlark_to_rust(value)?).with_context(|| "approval")?;
+                }
+                key => {
+                    config.insert(key.to_string(), starlark_to_rust(value)?);
+                }
+            }
+        }
 
         validate_target_decl(&name, &labels).map_err(starlark::Error::new_other)?;
         // An empty driver is allowed here: the provider resolves it against the
@@ -1338,23 +1330,19 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
         let m = args.names_map()?;
 
         let mut provider = String::new();
-        let kwargs = m
-            .iter()
-            .map(|e| -> anyhow::Result<Option<(String, htvalue::Value)>> {
-                match e.0.as_str() {
-                    "provider" => {
-                        if let Some(s) = e.1.unpack_str() {
-                            provider = s.to_string();
-                        }
-                        Ok(None)
+        let mut kwargs: HashMap<String, htvalue::Value> = HashMap::with_capacity(m.len());
+        for (key, value) in m.iter() {
+            match key.as_str() {
+                "provider" => {
+                    if let Some(s) = value.unpack_str() {
+                        provider = s.to_string();
                     }
-                    _ => Ok(Some((e.0.as_str().to_string(), starlark_to_rust(e.1)?))),
                 }
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?
-            .into_iter()
-            .flatten()
-            .collect::<HashMap<String, htvalue::Value>>();
+                key => {
+                    kwargs.insert(key.to_string(), starlark_to_rust(value)?);
+                }
+            }
+        }
 
         validate_state_decl(&provider).map_err(starlark::Error::new_other)?;
 

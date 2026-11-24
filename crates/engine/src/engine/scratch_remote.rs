@@ -44,11 +44,12 @@
 
 use crate::engine::Engine;
 use crate::engine::remote_cache::{RemoteCacheBackend, SNAPSHOT_STREAM_BUF, ScratchSource};
+use crate::engine::scratch_store::head_meta_path;
 use anyhow::Context as _;
 use borsh::{BorshDeserialize, BorshSerialize};
 use futures::StreamExt as _;
 use std::io::Seek as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _};
 
 /// Key-layout version. Bumping it makes every older entry invisible rather than
@@ -342,20 +343,9 @@ impl Engine {
         if sources.is_empty() {
             return None;
         }
-        let mut scopes = vec![scope.to_string()];
-        scopes.extend(fallbacks.iter().cloned());
-
-        for scope in scopes {
-            let mut best: Option<RemoteHead> = None;
-            for source in &sources {
-                for head in heads_in(source, slot, &scope).await {
-                    if best.as_ref().is_none_or(|b| better(&head, b).is_lt()) {
-                        best = Some(head);
-                    }
-                }
-            }
-            if best.is_some() {
-                return best;
+        for scope in std::iter::once(scope).chain(fallbacks.iter().map(String::as_str)) {
+            if let Some(best) = best_in_scope(&sources, slot, scope).await {
+                return Some(best);
             }
         }
         None
@@ -380,14 +370,7 @@ impl Engine {
 
         let mut out = Vec::with_capacity(scopes.len());
         for scope in scopes {
-            let mut best: Option<RemoteHead> = None;
-            for source in &sources {
-                for head in heads_in(source, slot, &scope).await {
-                    if best.as_ref().is_none_or(|b| better(&head, b).is_lt()) {
-                        best = Some(head);
-                    }
-                }
-            }
+            let best = best_in_scope(&sources, slot, &scope).await;
             out.push((scope, best));
         }
         out
@@ -504,6 +487,23 @@ async fn write_all(
     Ok(())
 }
 
+/// The best head in one lineage across every source, by [`better`].
+///
+/// Shared by resolution and its explanation, so the trace can never name a
+/// different head than the one a build would restore. Of equally good heads the
+/// first found wins: the earlier source, then the earlier listing entry.
+async fn best_in_scope(
+    sources: &[ScratchSource<'_>],
+    slot: &str,
+    scope: &str,
+) -> Option<RemoteHead> {
+    let mut heads = Vec::new();
+    for source in sources {
+        heads.extend(heads_in(source, slot, scope).await);
+    }
+    heads.into_iter().min_by(better)
+}
+
 /// `.meta` reads in flight at once while walking one lineage.
 ///
 /// A lineage is never pruned, so its entry count grows with every publish; one
@@ -554,37 +554,34 @@ async fn read_head(source: &ScratchSource<'_>, stem: String) -> Option<RemoteHea
     })
 }
 
-/// The directory a lineage's contents live in. Re-exported here so the CLI has
-/// one place to ask for scratch paths.
-pub fn scope_head_dir(home: &Path, slot: &str, scope: &str) -> PathBuf {
-    crate::engine::scratch::scope_dir(home, slot, scope)
-}
-
-/// Where a slot's local lineage state is recorded.
-pub fn local_meta_path(home: &Path, slot: &str, scope: &str) -> PathBuf {
-    crate::engine::scratch_store::lineage_dir(home, slot, scope).join("head.meta")
-}
-
 /// Read the snapshot a local lineage was last seeded from or published as.
 pub fn read_local_meta(home: &Path, slot: &str, scope: &str) -> Option<SnapshotMeta> {
-    let bytes = std::fs::read(local_meta_path(home, slot, scope)).ok()?;
+    let bytes = std::fs::read(head_meta_path(home, slot, scope)).ok()?;
     let meta = SnapshotMeta::try_from_slice(&bytes).ok()?;
     (meta.format == SNAPSHOT_FORMAT).then_some(meta)
 }
 
 /// Record what a local lineage descends from. Best-effort: losing it costs a
 /// generation reset, never a wrong build.
+///
+/// Write-then-rename through a uniquely named temp file, so a concurrent reader
+/// never sees half a meta and two writers never share a temp file.
 pub fn write_local_meta(home: &Path, slot: &str, scope: &str, meta: &SnapshotMeta) {
-    let path = local_meta_path(home, slot, scope);
+    let path = head_meta_path(home, slot, scope);
     let write = || -> anyhow::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&path, borsh::to_vec(meta)?)?;
+        let parent = path.parent().context("scratch head meta has no parent")?;
+        std::fs::create_dir_all(parent).with_context(|| format!("create {parent:?}"))?;
+        let mut tmp = tempfile::NamedTempFile::new_in(parent)
+            .with_context(|| format!("create a temp file in {parent:?}"))?;
+        let bytes = borsh::to_vec(meta).context("encode the meta")?;
+        std::io::Write::write_all(&mut tmp, &bytes)
+            .with_context(|| format!("write {:?}", tmp.path()))?;
+        tmp.persist(&path)
+            .with_context(|| format!("rename into {path:?}"))?;
         Ok(())
     };
     if let Err(err) = write() {
-        tracing::debug!(slot, scope, error = %err, "recording scratch lineage meta");
+        tracing::debug!(slot, scope, error = %format!("{err:#}"), "recording scratch lineage meta");
     }
 }
 
@@ -860,6 +857,36 @@ mod tests {
         );
     }
 
+    /// The newest generation wins, a same-generation fork goes to the fuller
+    /// cache, and an empty lineage has no head.
+    #[tokio::test]
+    async fn best_in_scope_picks_what_better_ranks_first() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let enc = |m: &SnapshotMeta| borsh::to_vec(m).expect("encode");
+        let objects = [
+            ("0000000000000004.a.meta", enc(&meta("master", 4, 900))),
+            ("0000000000000005.b.meta", enc(&meta("master", 5, 100))),
+            ("0000000000000005.c.meta", enc(&meta("master", 5, 300))),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        let set = crate::engine::remote_cache::RemoteCacheSet::with_backend(
+            std::sync::Arc::new(Lineage {
+                objects,
+                ..Lineage::default()
+            }),
+            tmp.path().to_path_buf(),
+        );
+        let sources = set.scratch_sources().await;
+
+        let best = best_in_scope(&sources, "slot", "master")
+            .await
+            .expect("a head");
+        assert!(best.stem.ends_with("0000000000000005.c"), "{}", best.stem);
+        assert!(best_in_scope(&[], "slot", "master").await.is_none());
+    }
+
     fn packed_tree(root: &Path) -> Vec<u8> {
         let src = root.join("src");
         std::fs::create_dir_all(&src).expect("mkdir");
@@ -945,10 +972,22 @@ mod tests {
             read_local_meta(tmp.path(), "s", "master"),
             Some(meta("master", 3, 10))
         );
+        // Overwritten in place, through a temp file that does not outlive it.
+        write_local_meta(tmp.path(), "s", "master", &meta("master", 5, 10));
+        assert_eq!(
+            read_local_meta(tmp.path(), "s", "master").map(|m| m.generation),
+            Some(5)
+        );
+        let lineage = crate::engine::scratch_store::lineage_dir(tmp.path(), "s", "master");
+        let names: Vec<_> = std::fs::read_dir(&lineage)
+            .expect("ls lineage")
+            .map(|e| e.expect("entry").file_name())
+            .collect();
+        assert_eq!(names, ["head.meta"]);
 
         let mut future = meta("master", 4, 10);
         future.format = SNAPSHOT_FORMAT + 1;
-        let p = local_meta_path(tmp.path(), "s", "master");
+        let p = head_meta_path(tmp.path(), "s", "master");
         std::fs::write(&p, borsh::to_vec(&future).expect("ser")).expect("write");
         assert_eq!(read_local_meta(tmp.path(), "s", "master"), None);
     }

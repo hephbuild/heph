@@ -151,13 +151,15 @@ pub fn lookup_run_log(root: &SessionRoot, home: &Path, addr: &str) -> anyhow::Re
         let log = match session_lookup(&entry.path(), home, addr) {
             Ok(SessionLookup::Log(log)) => log,
             Ok(SessionLookup::Started(at)) => {
-                if started.is_none_or(|(t, s)| (at, id.encode()) > (t, s.encode())) {
+                // Ties on the time go to the later session: an id's order is
+                // its text's order (see `id.rs`), without encoding either.
+                if started.is_none_or(|prev| (at, id) > prev) {
                     started = Some((at, id));
                 }
                 continue;
             }
             Ok(SessionLookup::NotStreamed(at)) => {
-                if not_streamed.is_none_or(|(n_at, n)| (at, id.encode()) > (n_at, n.encode())) {
+                if not_streamed.is_none_or(|prev| (at, id) > prev) {
                     not_streamed = Some((at, id));
                 }
                 continue;
@@ -168,9 +170,9 @@ pub fn lookup_run_log(root: &SessionRoot, home: &Path, addr: &str) -> anyhow::Re
                 continue;
             }
         };
-        let newer = newest.as_ref().is_none_or(|n| {
-            (log.at_unix_ms(), id.encode()) > (n.log.at_unix_ms(), n.session.encode())
-        });
+        let newer = newest
+            .as_ref()
+            .is_none_or(|n| (log.at_unix_ms(), id) > (n.log.at_unix_ms(), n.session));
         if newer {
             newest = Some(FoundRunLog { session: id, log });
         }

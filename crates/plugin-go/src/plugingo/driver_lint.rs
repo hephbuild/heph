@@ -26,28 +26,26 @@
 //! wrappers, lostcancel, …) keep full fidelity because facts cross the boundary —
 //! which export-data-only linting cannot do.
 
-use crate::plugingo::deps::{DepGroups, dep_origin};
-use crate::plugingo::tool_log::ToolLog;
+use crate::plugingo::deps::{DepGroups, DepShape, dep_inputs};
+use crate::plugingo::parse_util::{def_hash, pkg_outputs};
+use crate::plugingo::tool_log::{ProcessGroup, ToolLog, echo_failure, run_captured};
 use anyhow::Context;
 use async_trait::async_trait;
-use hcore::debug_hash::DebugHasher;
 use hcore::hasync::Cancellable;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
 use hdriver_support::run_log::Streams;
-use hplugin::driver::targetdef::path::{CodegenMode, Content, Path as TPath};
-use hplugin::driver::targetdef::{CacheConfig, Input, InputMode, Output, TargetDef};
+use hplugin::driver::targetdef::path::CodegenMode;
+use hplugin::driver::targetdef::{CacheConfig, TargetDef};
 use hplugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
     ParseResponse, TargetAddr,
 };
 use hplugin::htspec::Spec;
-use hproc::proc_exec;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use xxhash_rust::xxh3::Xxh3Default;
 
 /// Output filenames (package-relative). Kept in sync between [`build_lint_spec`]
 /// (the declared outputs) and [`GoLintDriver::run`] (where they are written).
@@ -68,6 +66,45 @@ const LINT_REPORT: &str = "lint-report.json";
 /// packages, so their paths already differ.)
 fn report_unpack_root(i: usize) -> String {
     format!("lint_report_{i}")
+}
+
+/// The inputs of a report consumer (the gate and the fixer), from its `deps`.
+///
+/// - Each `report` dep gets its own [`report_unpack_root`].
+/// - The golangci `config` is a hash-only input: it re-keys the target on any
+///   `.golangci.yml` change without staging the file (neither consumer reads it;
+///   they only consume the analyze report).
+/// - Every other dep is staged as usual.
+fn report_consumer_inputs(
+    deps: &HashMap<String, Vec<String>>,
+    pkg: &hmodel::htpkg::PkgBuf,
+) -> anyhow::Result<Vec<hplugin::driver::targetdef::Input>> {
+    dep_inputs(deps, pkg, |group, i| DepShape {
+        annotations: if group == "report" {
+            BTreeMap::from([("unpack_root".to_string(), report_unpack_root(i))])
+        } else {
+            BTreeMap::new()
+        },
+        runtime: group != "config",
+    })
+}
+
+/// Read every staged `report` of a report consumer, one per variant (origin
+/// `dep|report|*`), in staging order. `driver` names the consumer in the error
+/// when none is staged.
+fn read_reports(
+    deps: &DepGroups,
+    req: &ManagedRunRequest<'_, '_>,
+    driver: &str,
+) -> anyhow::Result<Vec<Vec<u8>>> {
+    let report_paths = deps.staged_paths(req, "report")?;
+    if report_paths.is_empty() {
+        anyhow::bail!("{driver}: no lint report staged");
+    }
+    report_paths
+        .iter()
+        .map(|p| std::fs::read(p).with_context(|| format!("read lint report {p}")))
+        .collect()
 }
 
 /// Dep group carrying the `heph-govet` unitchecker binary.
@@ -243,47 +280,24 @@ impl ManagedDriver for GoLintDriver {
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ParseResponse> {
         let pkg = req.target_spec.addr.package.clone();
-        let pkg_str = pkg.as_str();
         let spec = GoLintSpec::from(&req.target_spec.config).context("parse go_lint config")?;
 
-        let mut inputs: Vec<Input> = Vec::new();
-        let mut groups: Vec<&String> = spec.deps.keys().collect();
-        groups.sort();
-        for group in groups {
-            let addrs = spec.deps.get(group).expect("group key from same map");
-            // The govet binary is staged read-only (one tool, shared, hardlinked)
-            // and **per-file**: without that, staging symlinks the whole subtree in
-            // and records only its root *directory* in the list file, so
-            // `single_staged_path` would hand a directory to exec (EACCES). Per-file
-            // staging hardlinks each file and lists it, so the path we exec is the
-            // binary itself.
-            let read_only = group.as_str() == GOVET_TOOL_GROUP;
-            let annotations = if read_only {
-                BTreeMap::from([
-                    (
-                        hdriver_support::stage::READ_ONLY_ANNOTATION.to_string(),
-                        "true".to_string(),
-                    ),
-                    (
-                        hdriver_support::stage::STAGE_PER_FILE_ANNOTATION.to_string(),
-                        "true".to_string(),
-                    ),
+        // The govet binary is staged read-only (one tool, shared, hardlinked) and
+        // **per-file**: without that, staging symlinks the whole subtree in and
+        // records only its root *directory* in the list file, so
+        // `single_staged_path` would hand a directory to exec (EACCES). Per-file
+        // staging hardlinks each file and lists it, so the path we exec is the
+        // binary itself.
+        let mut inputs = dep_inputs(&spec.deps, &pkg, |group, _| {
+            if group == GOVET_TOOL_GROUP {
+                DepShape::staged(&[
+                    hdriver_support::stage::READ_ONLY_ANNOTATION,
+                    hdriver_support::stage::STAGE_PER_FILE_ANNOTATION,
                 ])
             } else {
-                BTreeMap::new()
-            };
-            for (i, addr_str) in addrs.iter().enumerate() {
-                inputs.push(Input {
-                    r#ref: TargetAddr::parse(addr_str, &pkg)
-                        .with_context(|| format!("parse dep addr {addr_str}"))?,
-                    mode: InputMode::Standard,
-                    origin_id: dep_origin(group, i),
-                    annotations: annotations.clone(),
-                    hashed: true,
-                    runtime: true,
-                });
+                DepShape::staged(&[])
             }
-        }
+        })?;
 
         let (runner, runner_input) = super::runner::parse_runner_with_default(
             &spec.runner,
@@ -304,36 +318,8 @@ impl ManagedDriver for GoLintDriver {
             deps: DepGroups::of(&spec.deps),
         };
 
-        let outputs: Vec<Output> = spec
-            .out
-            .iter()
-            .map(|(group, paths)| Output {
-                group: group.clone(),
-                paths: paths
-                    .iter()
-                    .map(|p| {
-                        let full_path = if pkg_str.is_empty() {
-                            p.clone()
-                        } else {
-                            format!("{pkg_str}/{p}")
-                        };
-                        TPath {
-                            content: Content::FilePath(full_path),
-                            codegen_tree: CodegenMode::None,
-                            collect: true,
-                        }
-                    })
-                    .collect(),
-            })
-            .collect();
-
-        let hash = {
-            let mut h = DebugHasher::new(Xxh3Default::new(), || {
-                format!("go_lint_{}", req.target_spec.addr.format())
-            });
-            def.hash(&mut h);
-            format!("{:x}", h.finish()).into_bytes()
-        };
+        let outputs = pkg_outputs(pkg.as_str(), &spec.out, &CodegenMode::None);
+        let hash = def_hash("go_lint", &req.target_spec.addr, &def);
 
         Ok(ParseResponse {
             target_def: TargetDef {
@@ -365,14 +351,27 @@ impl ManagedDriver for GoLintDriver {
         mut req: ManagedRunRequest<'a, 'io>,
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ManagedRunResponse> {
-        let res: anyhow::Result<ManagedRunResponse> = async {
+        let res = self.run_inner(&mut req, ctoken).await;
+        // heph-govet's output is captured, not streamed: see `echo_failure`.
+        echo_failure(&mut req, res).await
+    }
+}
+
+impl GoLintDriver {
+    /// Write the unitchecker config, run `heph-govet -json` over it, and keep
+    /// its report and facts.
+    async fn run_inner(
+        &self,
+        req: &mut ManagedRunRequest<'_, '_>,
+        ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> anyhow::Result<()> {
         let def = req.request.target.def_de::<GoLintDef>();
         let mut log = ToolLog::new(&mut req.request);
         let pkg_dir = &req.sandbox_pkg_dir;
 
         // The govet binary (single staged file in its group).
         let govet_bin = self
-            .single_staged_path(&req, &def.deps, GOVET_TOOL_GROUP)
+            .single_staged_path(req, &def.deps, GOVET_TOOL_GROUP)
             .context("locate staged heph-govet binary (govet_tool dep not staged?)")?;
 
         // Map each transitive import to its staged archive (type info) and, when
@@ -383,7 +382,7 @@ impl ManagedDriver for GoLintDriver {
         for ip in &def.import_paths {
             let lib_group = crate::plugingo::addr_util::import_path_to_dep_group(ip);
             let archive = self
-                .single_staged_path(&req, &def.deps, &lib_group)
+                .single_staged_path(req, &def.deps, &lib_group)
                 .with_context(|| format!("locate staged archive for lib {ip}"))?;
             package_file.insert(ip.clone(), archive);
             import_map.insert(ip.clone(), ip.clone());
@@ -395,7 +394,7 @@ impl ManagedDriver for GoLintDriver {
             // tools/heph-govet/vetx.go). Analyzers degrade to intra-package for that
             // one dependency only.
             let facts_group = import_path_to_facts_group(ip);
-            if let Ok(facts) = self.single_staged_path(&req, &def.deps, &facts_group) {
+            if let Ok(facts) = self.single_staged_path(req, &def.deps, &facts_group) {
                 // unitchecker gob-decodes whatever this points at, so a wrong file
                 // surfaces as a cryptic "decoding facts: unexpected EOF". The dep
                 // selects `|facts`, so the only staged file is the facts one — assert
@@ -416,7 +415,7 @@ impl ManagedDriver for GoLintDriver {
         // fails with `can't resolve import ""` unless the map carries it.
         import_map.insert("unsafe".to_string(), "unsafe".to_string());
 
-        let go_files = def.deps.staged_paths(&req, "")?;
+        let go_files = def.deps.staged_paths(req, "")?;
         let vetx_output = pkg_dir.join(LINT_FACTS);
 
         let cfg = UnitcheckerConfig {
@@ -450,7 +449,7 @@ impl ManagedDriver for GoLintDriver {
         // It is a hashed input, so a config change re-keys this target and
         // re-lints. Passed by env because unitchecker rejects unknown flags.
         let mut env: HashMap<String, String> = HashMap::new();
-        if let Ok(config_path) = self.single_staged_path(&req, &def.deps, "config") {
+        if let Ok(config_path) = self.single_staged_path(req, &def.deps, "config") {
             env.insert("HEPH_GOVET_GOLANGCI_CONFIG".to_string(), config_path);
         }
 
@@ -487,21 +486,11 @@ impl ManagedDriver for GoLintDriver {
             );
         }
 
-        Ok(ManagedRunResponse { artifacts: vec![] })
-        }
-        .await;
-        // heph-govet's output is captured, not streamed: see `echo_failure_log`.
-        if let Err(e) = &res {
-            hdriver_support::driver_managed::echo_failure_log(&mut req.request, e).await;
-        }
-        res
+        Ok(())
     }
-}
 
-impl GoLintDriver {
-    /// The single staged path for a one-output group (lib archive, facts, tool).
-    ///
-    /// Rejects a directory: read-only staging lists only a subtree *root* unless the
+    /// [`DepGroups::single_staged_path`] for a one-output group (lib archive,
+    /// facts, tool), rejecting a directory: read-only staging lists only a subtree *root* unless the
     /// input opts into per-file staging, and handing that directory to `exec` fails
     /// as a bare `Permission denied` far from the cause. Fail with the reason here.
     fn single_staged_path(
@@ -510,11 +499,7 @@ impl GoLintDriver {
         deps: &DepGroups,
         group: &str,
     ) -> anyhow::Result<String> {
-        let path = deps
-            .staged_paths(req, group)?
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("no staged file for dep group {group}"))?;
+        let path = deps.single_staged_path(req, group)?;
         anyhow::ensure!(
             !std::path::Path::new(&path).is_dir(),
             "staged path for dep group {group} is a directory ({path}), not a file — the input \
@@ -541,24 +526,17 @@ impl GoLintDriver {
         runner: hexecrunner::RunnerRef<'_>,
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<Vec<u8>> {
-        let env_pairs: Vec<(OsString, OsString)> = env
-            .iter()
-            .map(|(k, v)| (OsString::from(k), OsString::from(v)))
-            .collect();
-        let spec = proc_exec::Spec {
-            program: govet_bin.to_path_buf(),
+        let output = run_captured(
+            govet_bin,
             args,
-            env: env_pairs,
-            cwd: cwd.to_path_buf(),
-            stdin: proc_exec::StdioSpec::Null,
-            stdout: proc_exec::StdioSpec::Piped,
-            stderr: proc_exec::StdioSpec::Piped,
-            setsid: false,
-            ctty: false,
-        };
-        let output = hexecrunner::output(runner, spec, ctoken)
-            .await
-            .context("wait for heph-govet")?;
+            env,
+            cwd,
+            ProcessGroup::Inherit,
+            runner,
+            ctoken,
+        )
+        .await
+        .context("wait for heph-govet")?;
         if !output.status.success() {
             // The tool's output goes to the target's log, whose tail the
             // failure box renders, rather than into the message.
@@ -758,42 +736,13 @@ impl ManagedDriver for GoLintGateDriver {
         let pkg = req.target_spec.addr.package.clone();
         let spec = GoLintGateSpec::from(&req.target_spec.config).context("parse go_lint_gate")?;
 
-        let mut inputs: Vec<Input> = Vec::new();
-        let mut groups: Vec<&String> = spec.deps.keys().collect();
-        groups.sort();
-        for group in groups {
-            for (i, addr_str) in spec.deps.get(group).expect("group key").iter().enumerate() {
-                inputs.push(Input {
-                    r#ref: TargetAddr::parse(addr_str, &pkg)
-                        .with_context(|| format!("parse dep addr {addr_str}"))?,
-                    mode: InputMode::Standard,
-                    origin_id: dep_origin(group, i),
-                    // One unpack root per report: every variant's analyze target
-                    // is in this same package and emits `lint-report.json`, so
-                    // they would otherwise all claim one sandbox path (see
-                    // `report_unpack_root`).
-                    annotations: if group.as_str() == "report" {
-                        BTreeMap::from([("unpack_root".to_string(), report_unpack_root(i))])
-                    } else {
-                        BTreeMap::new()
-                    },
-                    hashed: true,
-                    // The golangci config is a hash-only input: it re-keys the
-                    // target on any `.golangci.yml` change without staging the
-                    // file (this target never reads it — it only consumes the
-                    // analyze report). Every other dep is staged as usual.
-                    runtime: group.as_str() != "config",
-                });
-            }
-        }
+        let inputs = report_consumer_inputs(&spec.deps, &pkg)?;
 
-        let hash = {
-            let mut h = DebugHasher::new(Xxh3Default::new(), || {
-                format!("go_lint_gate_{}", req.target_spec.addr.format())
-            });
-            GO_LINT_GATE_FORMAT_VERSION.hash(&mut h);
-            format!("{:x}", h.finish()).into_bytes()
-        };
+        let hash = def_hash(
+            "go_lint_gate",
+            &req.target_spec.addr,
+            &GO_LINT_GATE_FORMAT_VERSION,
+        );
 
         Ok(ParseResponse {
             target_def: TargetDef {
@@ -831,14 +780,7 @@ impl ManagedDriver for GoLintGateDriver {
         // yields the same finding in each, so dedupe — and sort, so the message
         // doesn't depend on staging order.
         let def = req.request.target.def_de::<GoLintGateDef>();
-        let report_paths = def.deps.staged_paths(&req, "report")?;
-        if report_paths.is_empty() {
-            anyhow::bail!("go_lint_gate: no lint report staged");
-        }
-        let reports = report_paths
-            .iter()
-            .map(|p| std::fs::read(p).with_context(|| format!("read lint report {p}")))
-            .collect::<anyhow::Result<Vec<_>>>()?;
+        let reports = read_reports(&def.deps, &req, "go_lint_gate")?;
         let findings = merge_report_findings(&reports)?;
         if !findings.is_empty() {
             anyhow::bail!(
@@ -1091,72 +1033,25 @@ impl ManagedDriver for GoLintFixDriver {
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ParseResponse> {
         let pkg = req.target_spec.addr.package.clone();
-        let pkg_str = pkg.as_str();
         let spec = GoLintFixSpec::from(&req.target_spec.config).context("parse go_lint_fix")?;
 
-        let mut inputs: Vec<Input> = Vec::new();
-        let mut groups: Vec<&String> = spec.deps.keys().collect();
-        groups.sort();
-        for group in groups {
-            for (i, addr_str) in spec.deps.get(group).expect("group key").iter().enumerate() {
-                inputs.push(Input {
-                    r#ref: TargetAddr::parse(addr_str, &pkg)
-                        .with_context(|| format!("parse dep addr {addr_str}"))?,
-                    mode: InputMode::Standard,
-                    origin_id: dep_origin(group, i),
-                    // One unpack root per report: every variant's analyze target
-                    // is in this same package and emits `lint-report.json`, so
-                    // they would otherwise all claim one sandbox path (see
-                    // `report_unpack_root`).
-                    annotations: if group.as_str() == "report" {
-                        BTreeMap::from([("unpack_root".to_string(), report_unpack_root(i))])
-                    } else {
-                        BTreeMap::new()
-                    },
-                    hashed: true,
-                    // The golangci config is a hash-only input: it re-keys the
-                    // target on any `.golangci.yml` change without staging the
-                    // file (this target never reads it — it only consumes the
-                    // analyze report). Every other dep is staged as usual.
-                    runtime: group.as_str() != "config",
-                });
-            }
-        }
+        let inputs = report_consumer_inputs(&spec.deps, &pkg)?;
 
         // The rewritten `.go` files are `codegen=in_place` outputs: the engine
         // writes them back over the tracked source files after a top-level run.
-        let outputs: Vec<Output> = spec
-            .out
-            .iter()
-            .map(|(group, paths)| Output {
-                group: group.clone(),
-                paths: paths
-                    .iter()
-                    .map(|p| {
-                        let full_path = if pkg_str.is_empty() {
-                            p.clone()
-                        } else {
-                            format!("{pkg_str}/{p}")
-                        };
-                        TPath {
-                            content: Content::FilePath(full_path),
-                            codegen_tree: CodegenMode::InPlace {
-                                write_on_failure: true,
-                            },
-                            collect: true,
-                        }
-                    })
-                    .collect(),
-            })
-            .collect();
+        let outputs = pkg_outputs(
+            pkg.as_str(),
+            &spec.out,
+            &CodegenMode::InPlace {
+                write_on_failure: true,
+            },
+        );
 
-        let hash = {
-            let mut h = DebugHasher::new(Xxh3Default::new(), || {
-                format!("go_lint_fix_{}", req.target_spec.addr.format())
-            });
-            GO_LINT_FIX_FORMAT_VERSION.hash(&mut h);
-            format!("{:x}", h.finish()).into_bytes()
-        };
+        let hash = def_hash(
+            "go_lint_fix",
+            &req.target_spec.addr,
+            &GO_LINT_FIX_FORMAT_VERSION,
+        );
 
         Ok(ParseResponse {
             target_def: TargetDef {
@@ -1193,14 +1088,7 @@ impl ManagedDriver for GoLintFixDriver {
         // One `-json` report per variant (dep|report|*), merged into a single
         // edit set per file — see `merge_report_edits`.
         let def = req.request.target.def_de::<GoLintFixDef>();
-        let report_paths = def.deps.staged_paths(&req, "report")?;
-        if report_paths.is_empty() {
-            anyhow::bail!("go_lint_fix: no lint report staged");
-        }
-        let reports = report_paths
-            .iter()
-            .map(|p| std::fs::read(p).with_context(|| format!("read lint report {p}")))
-            .collect::<anyhow::Result<Vec<_>>>()?;
+        let reports = read_reports(&def.deps, &req, "go_lint_fix")?;
         let mut edits_by_file = merge_report_edits(&reports)?;
 
         // Apply the edits to each staged source, rewriting it in place. The
@@ -1363,17 +1251,11 @@ pub fn build_lint_spec(p: LintParams) -> TargetSpec {
     }
 }
 
-/// Build the user-facing `lint` gate spec. Depends on the `report` output of the
-/// analyze target (`_lint-analyze`) and fails the build when it contains findings.
-///
-/// `config_addr` (the module's `.golangci.yml`) is attached as a hash-only dep
-/// so any config change re-keys the gate directly — not just transitively
-/// through `_lint-analyze`'s report.
-pub fn build_lint_gate_spec(
-    addr: Addr,
-    analyze_addrs: &[Addr],
-    config_addr: Option<&Addr>,
-) -> TargetSpec {
+/// The deps every report consumer (the gate and the fixer) declares: the
+/// `report` output of each per-variant analyze target, and the module's
+/// `.golangci.yml` as the hash-only `config` dep (see [`report_consumer_inputs`])
+/// so a config change re-keys the consumer directly.
+fn report_deps(analyze_addrs: &[Addr], config_addr: Option<&Addr>) -> BTreeMap<String, Value> {
     let mut deps = BTreeMap::from([(
         "report".to_string(),
         Value::List(
@@ -1389,6 +1271,21 @@ pub fn build_lint_gate_spec(
             Value::List(vec![Value::String(cfg.format())]),
         );
     }
+    deps
+}
+
+/// Build the user-facing `lint` gate spec. Depends on the `report` output of the
+/// analyze target (`_lint-analyze`) and fails the build when it contains findings.
+///
+/// `config_addr` (the module's `.golangci.yml`) is attached as a hash-only dep
+/// so any config change re-keys the gate directly — not just transitively
+/// through `_lint-analyze`'s report.
+pub fn build_lint_gate_spec(
+    addr: Addr,
+    analyze_addrs: &[Addr],
+    config_addr: Option<&Addr>,
+) -> TargetSpec {
+    let deps = report_deps(analyze_addrs, config_addr);
     let mut config: HashMap<String, Value> = HashMap::new();
     config.insert("deps".to_string(), Value::Map(deps.into_iter().collect()));
 
@@ -1422,28 +1319,11 @@ pub fn build_lint_fix_spec(
     go_files: &[String],
     config_addr: Option<&Addr>,
 ) -> TargetSpec {
-    let mut deps = BTreeMap::from([
-        (
-            "report".to_string(),
-            Value::List(
-                analyze_addrs
-                    .iter()
-                    .map(|a| Value::String(format!("{}|report", a.format())))
-                    .collect(),
-            ),
-        ),
-        (
-            String::new(),
-            Value::List(src_addrs.iter().cloned().map(Value::String).collect()),
-        ),
-    ]);
-    // Hash-only dep: a `.golangci.yml` change re-keys the fixer directly.
-    if let Some(cfg) = config_addr {
-        deps.insert(
-            "config".to_string(),
-            Value::List(vec![Value::String(cfg.format())]),
-        );
-    }
+    let mut deps = report_deps(analyze_addrs, config_addr);
+    deps.insert(
+        String::new(),
+        Value::List(src_addrs.iter().cloned().map(Value::String).collect()),
+    );
 
     let mut config: HashMap<String, Value> = HashMap::new();
     config.insert("deps".to_string(), Value::Map(deps.into_iter().collect()));
@@ -1472,6 +1352,7 @@ pub fn build_lint_fix_spec(
 mod tests {
     use super::*;
     use hmodel::htpkg::PkgBuf;
+    use hplugin::driver::targetdef::path::Content;
 
     const V: &str = crate::plugingo::toolchain::DEFAULT_GO_VERSION;
 
@@ -2341,5 +2222,76 @@ mod tests {
             Content::FilePath(p) => assert_eq!(p, "mylib/a.go", "output is pkg-relative"),
             other => panic!("expected FilePath, got {other}"),
         }
+    }
+
+    /// The gate and the fixer consume the same reports and the same config the
+    /// same way: each report under its own unpack root, the config hash-only.
+    /// The fixer only adds its sources (the `""` group).
+    #[tokio::test]
+    async fn gate_and_fix_declare_the_same_report_and_config_inputs() {
+        let analyze = [addr("_lint-analyze_a"), addr("_lint-analyze_b")];
+        let cfg = addr(".golangci.yml");
+        let token = hcore::hasync::StdCancellationToken::new();
+        let parse = |spec: TargetSpec| ParseRequest {
+            request_id: "t".to_string(),
+            target_spec: Arc::new(spec),
+        };
+        let gate = GoLintGateDriver::new()
+            .parse(
+                parse(build_lint_gate_spec(
+                    addr("lint-check"),
+                    &analyze,
+                    Some(&cfg),
+                )),
+                &token,
+            )
+            .await
+            .expect("parse gate")
+            .target_def
+            .inputs;
+        let fix = GoLintFixDriver::new()
+            .parse(
+                parse(build_lint_fix_spec(
+                    addr("lint"),
+                    &analyze,
+                    &["//mylib:a.go".to_string()],
+                    &["a.go".to_string()],
+                    Some(&cfg),
+                )),
+                &token,
+            )
+            .await
+            .expect("parse fix")
+            .target_def
+            .inputs;
+
+        // `Input` is neither `PartialEq` nor `Debug`: compare what the engine sees.
+        let json = |inputs: Vec<&hplugin::driver::targetdef::Input>| {
+            serde_json::to_value(inputs).expect("serialize inputs")
+        };
+        let fix_without_sources = fix
+            .iter()
+            .filter(|i| !i.origin_id.starts_with("dep||"))
+            .collect();
+        assert_eq!(json(gate.iter().collect()), json(fix_without_sources));
+
+        let shape: Vec<_> = gate
+            .iter()
+            .map(|i| {
+                (
+                    i.origin_id.as_str(),
+                    i.annotations.get("unpack_root").map(String::as_str),
+                    i.runtime,
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                ("dep|config|0", None, false),
+                ("dep|report|0", Some("lint_report_0"), true),
+                ("dep|report|1", Some("lint_report_1"), true),
+            ]
+        );
     }
 }

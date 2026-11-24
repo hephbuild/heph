@@ -1683,42 +1683,9 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
         let dep_group_inputs = grouped(&dep_inputs);
         let runtime_dep_group_inputs = grouped(&runtime_dep_inputs);
 
-        // Scratch references. `hashed: false, runtime: false` is the one
-        // combination nothing else uses, and it is exactly right: a scratch
-        // materializes no artifacts (its declaration has none) and must not touch
-        // this target's cache key, because a target's outputs are required to be
-        // identical whether its scratch is warm, cold, or absent. The edge exists
-        // so the graph knows about it — which is what makes `heph query revdeps`
-        // answer "who shares this cache?" and what turns a bad addr into an
-        // ordinary `TargetNotFoundError`.
-        //
-        // Order is the declared order, deduped: a repeated reference would mount
-        // one directory twice and set one env var twice, which is a BUILD-file
-        // mistake worth naming rather than quietly collapsing.
-        let mut seen_scratch: BTreeMap<String, usize> = BTreeMap::new();
-        let mut scratch_inputs: Vec<Input> = Vec::with_capacity(spec.scratch.len());
-        for (i, raw) in spec.scratch.iter().enumerate() {
-            let r#ref = TargetAddr::parse(raw, &pkg)?;
-            let key = r#ref.to_string();
-            if let Some(first) = seen_scratch.insert(key.clone(), i) {
-                anyhow::bail!(
-                    "scratch {key} is referenced twice (positions {first} and {i}) — a scratch \
-                     mounts at one path and sets one environment variable, so referencing it \
-                     again does nothing; drop the duplicate"
-                );
-            }
-            scratch_inputs.push(Input {
-                r#ref,
-                mode: InputMode::Standard,
-                origin_id: format!("{}|{}", hdriver_support::scratch::SCRATCH_ORIGIN_PREFIX, i),
-                annotations: BTreeMap::from([(
-                    hdriver_support::scratch::SCRATCH_ANNOTATION.to_string(),
-                    "true".to_string(),
-                )]),
-                hashed: false,
-                runtime: false,
-            });
-        }
+        // Scratch references: unhashed graph edges, in declared order, a
+        // repeated one refused; see `scratch::inputs`.
+        let scratch_inputs = hdriver_support::scratch::inputs(&spec.scratch, &pkg)?;
 
         // Credential references. The same `hashed: false, runtime: false` edge a
         // scratch uses, told apart by its annotation — and for a sharper reason
@@ -2661,15 +2628,13 @@ impl Driver {
         // execve caps total argv+envp at ARG_MAX and each entry at MAX_ARG_STRLEN.
         // Drop overlong entries and evict longest until under the limit.
         let env_vec: Vec<(String, String)> = env.into_iter().collect();
-        let mut argv_for_filter: Vec<OsString> = Vec::with_capacity(1 + args_os.len());
-        argv_for_filter.push(OsString::from(&program));
-        argv_for_filter.extend(args_os.iter().cloned());
+        let argv_len = program.len() + args_os.iter().map(|a| a.len()).sum::<usize>();
         // Credential names are protected from the size limiter: its eviction
         // order is longest-first, which is precisely a session token, and
         // `ARG_MAX` differs by operating system — so without this the same BUILD
         // file would keep the credential on Linux and drop it on macOS, then run
         // unauthenticated or against whatever ambient identity the host had.
-        let env_vec = filterenv::filter_long_env(env_vec, &argv_for_filter, &credential_env_names)?;
+        let env_vec = filterenv::filter_long_env(env_vec, argv_len, &credential_env_names)?;
         // The run's own layers sit on the caller's base env, which is neither
         // filtered nor converted: it reaches the process byte for byte (E6),
         // except a `TOOL_<G>_ROOT` (or `HEPH_TOOLS_DIR`) heph leaves unset for

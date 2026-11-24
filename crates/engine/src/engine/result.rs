@@ -258,8 +258,7 @@ impl ProviderExecutor for EngineProviderExecutor {
                         // Enumerate every package at or under `prefix`, then union
                         // each package's own `provider_state`s (all providers).
                         let matcher = Matcher::PackagePrefix(prefix);
-                        let pkg_iter = engine.packages(&matcher, &rs).await?;
-                        let pkgs: Vec<String> = pkg_iter.collect::<anyhow::Result<_>>()?;
+                        let pkgs = engine.packages(&matcher, &rs).await?;
 
                         // One probe per `(package, provider)` pair, overlapped.
                         //
@@ -378,9 +377,7 @@ impl ProviderExecutor for EngineProviderExecutor {
                 .ok_or_else(|| anyhow::anyhow!("engine dropped"))?;
             let rs = self.rs().clone();
 
-            // Collect packages eagerly (non-Send iterator dropped before first await)
-            let pkg_iter = engine.packages(m, &rs).await?;
-            let pkgs: Vec<String> = pkg_iter.collect::<anyhow::Result<_>>()?;
+            let pkgs = engine.packages(m, &rs).await?;
 
             // One `list` callback surface for the whole walk, not one per
             // (package, provider) pair — it is stateless apart from the engine
@@ -830,12 +827,11 @@ impl PassthroughContent {
         Ok((
             VerifyingReader {
                 inner: Box::new(file),
-                hasher: xxhash_rust::xxh3::Xxh3::new(),
+                hasher: Some(hwalk::ContentHasher::new()),
                 x: self.x,
                 expected: self.expected.clone(),
                 source_path: self.source_path.clone(),
                 out_path: self.out_path.clone(),
-                verified: false,
             },
             size,
         ))
@@ -882,10 +878,8 @@ impl Content for PassthroughContent {
 
 /// A `Read` adapter that hashes the bytes it passes through and, at EOF, verifies
 /// the digest matches the expected hashout — failing the read (and so the
-/// consuming target) otherwise. The content digest is identical to
-/// [`hwalk::file_hashout`]: xxh3 over the content followed by a single exec-bit
-/// marker byte. `passthrough_reader_matches_file_hashout` pins the two together
-/// so they cannot silently drift.
+/// consuming target) otherwise. The content digest is [`hwalk::file_hashout`]'s
+/// by construction: both are an [`hwalk::ContentHasher`].
 ///
 /// The recorded hashout takes one of two forms, and both are accepted: the
 /// content hash bound to the artifact's `out_path` by [`hwalk::fs_entry_hashout`]
@@ -899,13 +893,13 @@ impl Content for PassthroughContent {
 /// that needs none.
 struct VerifyingReader {
     inner: Box<dyn std::io::Read>,
-    hasher: xxhash_rust::xxh3::Xxh3,
+    /// The content hashed so far; taken at EOF, so the check runs once.
+    hasher: Option<hwalk::ContentHasher>,
     x: bool,
     expected: String,
     source_path: String,
     /// The artifact's `out_path`, for the path-bound (`fs` source file) form.
     out_path: String,
-    verified: bool,
 }
 
 impl std::io::Read for VerifyingReader {
@@ -915,10 +909,8 @@ impl std::io::Read for VerifyingReader {
             // EOF: finalize and verify exactly once. A reader read to completion
             // (the materialization copy always is) triggers this; a partial read
             // that is dropped early simply does not verify.
-            if !self.verified {
-                self.verified = true;
-                self.hasher.update(&[self.x as u8]);
-                let got = format!("{:x}", self.hasher.digest());
+            if let Some(hasher) = self.hasher.take() {
+                let got = hasher.finish(self.x);
                 if got != self.expected
                     && hwalk::fs_entry_hashout(&self.out_path, &got) != self.expected
                 {
@@ -935,8 +927,8 @@ impl std::io::Read for VerifyingReader {
             }
             return Ok(0);
         }
-        if let Some(chunk) = buf.get(..n) {
-            self.hasher.update(chunk);
+        if let (Some(hasher), Some(chunk)) = (&mut self.hasher, buf.get(..n)) {
+            hasher.update(chunk);
         }
         Ok(n)
     }
@@ -993,11 +985,39 @@ fn codegen_groups(def: &LinkedTargetDef) -> Vec<String> {
 fn codegen_modes(target: &crate::engine::driver::targetdef::TargetDef) -> (bool, bool) {
     use crate::engine::driver::targetdef::path::CodegenMode;
 
-    let modes = || target.outputs.iter().flat_map(|o| o.paths.iter());
     (
-        modes().any(|p| matches!(p.codegen_tree, CodegenMode::Copy)),
-        modes().any(|p| matches!(p.codegen_tree, CodegenMode::InPlace { .. })),
+        target
+            .outputs
+            .iter()
+            .flat_map(|o| o.paths.iter())
+            .any(|p| matches!(p.codegen_tree, CodegenMode::Copy)),
+        has_in_place_output(&target.outputs),
     )
+}
+
+/// Whether any output path is `in_place` codegen.
+///
+/// The one test for "this target rewrites its own inputs": it doubles the GC
+/// history, arms the write-back guard and registers the fixpoint, and those
+/// three must agree.
+fn has_in_place_output(outputs: &[crate::engine::driver::targetdef::Output]) -> bool {
+    use crate::engine::driver::targetdef::path::CodegenMode;
+
+    outputs
+        .iter()
+        .flat_map(|o| o.paths.iter())
+        .any(|p| matches!(p.codegen_tree, CodegenMode::InPlace { .. }))
+}
+
+/// Whether any output path is codegen, in either mode: whether
+/// [`codegen_groups`] is non-empty, without building it.
+fn has_codegen_output(outputs: &[crate::engine::driver::targetdef::Output]) -> bool {
+    use crate::engine::driver::targetdef::path::CodegenMode;
+
+    outputs
+        .iter()
+        .flat_map(|o| o.paths.iter())
+        .any(|p| !matches!(p.codegen_tree, CodegenMode::None))
 }
 
 /// Each codegen output group's declared mode (first non-`None` path wins).
@@ -2467,7 +2487,7 @@ impl Engine {
         // Directly-requested target (no parent) — the outermost frame. Used below
         // to surface the rich recorded failure to the caller instead of the
         // internal `UpstreamFailed` marker.
-        let is_top = rs.parent.is_none();
+        let is_top = rs.parent().is_none();
         // `--frozen` is a property of the run, not of one frame: the `copy`
         // write-back fires on dependency frames too, and those resolve with
         // `ResultOptions::default()`. Record it from the only frame that carries
@@ -3237,9 +3257,8 @@ impl Engine {
                     OutputMatcher::None => anyhow::Ok(Vec::<String>::new()),
                     OutputMatcher::All => Ok(def.target.output_names()),
                     OutputMatcher::Exact(names) => {
-                        let all_output_names = def.target.output_names();
                         for name in &names {
-                            if !all_output_names.contains(name) {
+                            if !def.target.outputs.iter().any(|o| o.group == *name) {
                                 anyhow::bail!("output not found: {}", name);
                             }
                         }
@@ -3251,7 +3270,6 @@ impl Engine {
                 let result = self
                     .execute_and_cache(
                         rs.clone(),
-                        &def,
                         output_names,
                         &ExecuteOptions {
                             hashin: &meta.hashin,
@@ -3269,16 +3287,10 @@ impl Engine {
                 // event stream, so record them here once the result is in hand.
                 // Counts every resolved target across the process; the opt-out
                 // only gates whether the snapshot is sent.
-                let sizes: Vec<u64> = result
-                    .0
-                    .eresult
-                    .artifacts
-                    .iter()
-                    .filter_map(|a| a.byte_size())
-                    .collect();
+                let artifacts = &result.0.eresult.artifacts;
                 htelemetry::telemetry::record_artifacts(
-                    result.0.eresult.artifacts.len() as u64,
-                    &sizes,
+                    artifacts.len() as u64,
+                    artifacts.iter().filter_map(|a| a.byte_size()),
                 );
 
                 Ok(result)
@@ -3466,11 +3478,11 @@ impl Engine {
     async fn execute_and_cache(
         self: Arc<Self>,
         rs: Arc<RequestState>,
-        def: &LinkedTargetDef,
         outputs: Vec<String>,
         opts: &ExecuteOptions<'_>,
     ) -> anyhow::Result<(MemoResult, Option<Arc<ResultReadGuard>>)> {
-        let (locked, handed) = self.clone().resolve_locked(rs.clone(), def, opts).await?;
+        let def = opts.def;
+        let (locked, handed) = self.clone().resolve_locked(rs.clone(), opts).await?;
         // This caller's riding read, held across everything below (output
         // reads, codegen write-back) and handed on beside the result to the
         // caller that created this cell — never kept by the memoized value.
@@ -3890,10 +3902,9 @@ impl Engine {
     async fn resolve_locked(
         self: Arc<Self>,
         rs: Arc<RequestState>,
-        def: &LinkedTargetDef,
         opts: &ExecuteOptions<'_>,
     ) -> anyhow::Result<(Arc<LockedResolution>, Option<Arc<ResultReadGuard>>)> {
-        let addr = def.target.addr.clone();
+        let addr = opts.def.target.addr.clone();
         // Filled only if this call creates the cell. See `GuardSlot`.
         let handoff = Handoff::default();
         // Owned copies so the memoizer closure is `'static`.
@@ -3943,6 +3954,35 @@ impl Engine {
             .map_err(unwrap_arc_err)?;
         let handed = handoff.lock().take();
         Ok((resolution, handed))
+    }
+
+    /// A local hit under `read`, from either the optimistic probe (branch A) or
+    /// a contended write that found the revision built while it waited: the
+    /// resolution sharing `read`, and the strong guard for the cell's creator.
+    async fn local_hit(
+        &self,
+        rs: &RequestState,
+        addr: &Addr,
+        hashin: &str,
+        manifest: Arc<Manifest>,
+        read: ResultReadGuard,
+    ) -> (Arc<LockedResolution>, Option<Arc<ResultReadGuard>>) {
+        // The target resolved: its last failure is stale. Under the read.
+        self.failure_slots.clear(addr).await;
+        let (slot, read) = GuardSlot::new(addr, hashin, Resolved::Hit(Arc::clone(&manifest)), read);
+        (
+            Arc::new(LockedResolution {
+                guard: Some(slot),
+                executed: None,
+                manifest: Some(manifest),
+                remote: RemoteCell::new(),
+                // Announced only outside a hash-only request (see
+                // `probe_cache_manifest`), so only then is it a hit to take back.
+                hit: (!rs.hash_only()).then_some(hcore::events::CacheHitKind::Local),
+                rebuilt: Default::default(),
+            }),
+            Some(read),
+        )
     }
 
     /// Body of the per-addr lock dance: the optimistic read → miss → drop →
@@ -4093,7 +4133,7 @@ impl Engine {
                 self.result_lock().read(addr, hashin, ctoken),
             )
             .await?;
-        if let Some(manifest) = self.probe_cache_manifest(&rs, def, opts).await? {
+        if let Some(manifest) = self.probe_cache_manifest(&rs, addr, hashin).await? {
             // A. Hit — share this read; each caller reads its own outputs under
             // it and offers the codegen write-back / fixpoint in
             // `execute_and_cache` (once per addr, under this riding read). The
@@ -4101,24 +4141,7 @@ impl Engine {
             // Where its blobs live is left unresolved: a caller that needs bytes
             // and hasn't got them forces the cell, and one that only needs
             // hashouts never does.
-            //
-            // The target resolved: its last failure is stale. Under the read.
-            self.failure_slots.clear(addr).await;
-            let (slot, read) =
-                GuardSlot::new(addr, hashin, Resolved::Hit(Arc::clone(&manifest)), read);
-            return Ok((
-                Arc::new(LockedResolution {
-                    guard: Some(slot),
-                    executed: None,
-                    manifest: Some(manifest),
-                    remote: RemoteCell::new(),
-                    // Announced only outside a hash-only request (see
-                    // `probe_cache_manifest`), so only then is it a hit to take back.
-                    hit: (!rs.hash_only()).then_some(hcore::events::CacheHitKind::Local),
-                    rebuilt: Default::default(),
-                }),
-                Some(read),
-            ));
+            return Ok(self.local_hit(&rs, addr, hashin, manifest, read).await);
         }
 
         // B. Miss: a plain read cannot upgrade. Drop it and take the exclusive
@@ -4167,7 +4190,7 @@ impl Engine {
                         let read = engine.result_lock().read(addr, hashin, ctoken).await?;
                         Ok(
                             match engine
-                                .probe_cache_manifest(rs_ref, def, opts)
+                                .probe_cache_manifest(rs_ref, addr, hashin)
                                 .await
                                 .with_context(|| format!("probing the local cache for {addr}"))
                             {
@@ -4187,25 +4210,7 @@ impl Engine {
                     Contended::Hit(Err(e)) => return Err(e),
                     Contended::Hit(Ok((manifest, read))) => {
                         // Branch A, reached late.
-                        self.failure_slots.clear(addr).await;
-                        let (slot, read) = GuardSlot::new(
-                            addr,
-                            hashin,
-                            Resolved::Hit(Arc::clone(&manifest)),
-                            read,
-                        );
-                        return Ok((
-                            Arc::new(LockedResolution {
-                                guard: Some(slot),
-                                executed: None,
-                                manifest: Some(manifest),
-                                remote: RemoteCell::new(),
-                                hit: (!rs.hash_only())
-                                    .then_some(hcore::events::CacheHitKind::Local),
-                                rebuilt: Default::default(),
-                            }),
-                            Some(read),
-                        ));
+                        return Ok(self.local_hit(&rs, addr, hashin, manifest, read).await);
                     }
                 }
             }
@@ -4217,7 +4222,7 @@ impl Engine {
         // race-win we share without executing; otherwise we execute + cache the
         // full set, which `build_eresult` filters per caller.
         let (executed, manifest, remote, hit) =
-            match self.probe_cache_manifest(&rs, def, opts).await? {
+            match self.probe_cache_manifest(&rs, addr, hashin).await? {
                 // Same as branch A: where the blobs live stays unresolved until a
                 // caller needs them.
                 Some(manifest) => (
@@ -4404,7 +4409,7 @@ impl Engine {
         if rs.hash_only() || rs.ctoken().is_cancelled() {
             return Ok(());
         }
-        if codegen_groups(opts.def).is_empty() {
+        if !has_codegen_output(&opts.def.target.outputs) {
             return Ok(());
         }
 
@@ -5440,18 +5445,7 @@ impl Engine {
         def: &LinkedTargetDef,
     ) -> anyhow::Result<()> {
         // No in_place output: nothing is about to be overwritten.
-        if !def
-            .target
-            .outputs
-            .iter()
-            .flat_map(|o| o.paths.iter())
-            .any(|p| {
-                matches!(
-                    p.codegen_tree,
-                    crate::engine::driver::targetdef::path::CodegenMode::InPlace { .. }
-                )
-            })
-        {
+        if !has_in_place_output(&def.target.outputs) {
             return Ok(());
         }
 
@@ -5743,8 +5737,6 @@ impl Engine {
         hashin: &str,
         written: &WrittenPaths,
     ) -> anyhow::Result<()> {
-        use crate::engine::driver::targetdef::path::CodegenMode;
-
         // The fresh request below runs on its own cancellation token (unlinked
         // from this build), so refuse to start once the original build is
         // cancelled — the fixpoint is a pure optimization and must never delay a
@@ -5754,12 +5746,7 @@ impl Engine {
         }
         // Only in_place targets mutate their own inputs, so only they can reach a
         // fixpoint. (Frozen runs never write, hence never get here.)
-        let is_in_place = def.target.outputs.iter().any(|o| {
-            o.paths
-                .iter()
-                .any(|p| matches!(p.codegen_tree, CodegenMode::InPlace { .. }))
-        });
-        if !is_in_place {
+        if !has_in_place_output(&def.target.outputs) {
             return Ok(());
         }
 
@@ -5888,11 +5875,9 @@ impl Engine {
     async fn probe_cache_manifest(
         &self,
         rs: &Arc<RequestState>,
-        def: &LinkedTargetDef,
-        opts: &ExecuteOptions<'_>,
+        addr: &Addr,
+        hashin: &str,
     ) -> anyhow::Result<Option<Arc<Manifest>>> {
-        let addr = &def.target.addr;
-        let hashin = opts.hashin.as_str();
         let hit = self
             .read_manifest_blocking(rs.ctoken(), addr, hashin)
             .await?
@@ -6078,16 +6063,7 @@ impl Engine {
         // on the final def, so BOTH GC paths that read `def.cache.history` — the
         // post-write trim and the `heph gc` sweep — inherit it. The exec hash does
         // not include `cache`, so this never invalidates existing cache entries.
-        if def.cache.history > 0
-            && def.outputs.iter().any(|o| {
-                o.paths.iter().any(|p| {
-                    matches!(
-                        p.codegen_tree,
-                        crate::engine::driver::targetdef::path::CodegenMode::InPlace { .. }
-                    )
-                })
-            })
-        {
+        if def.cache.history > 0 && has_in_place_output(&def.outputs) {
             def.cache.history = def.cache.history.saturating_mul(2);
         }
 
@@ -6187,7 +6163,7 @@ impl Engine {
             })
             .enumerate()
             .map(|(i, input)| {
-                let input_ref = input.r#ref.clone();
+                let input_ref = &input.r#ref;
                 enclose!((self => engine, rs) async move {
                     let spec = Arc::clone(&engine)
                         .get_spec(rs.clone(), &input_ref.r#ref)
@@ -6461,10 +6437,12 @@ fn rewrite_query_inputs(
     dest: &Addr,
     dest_provider: &str,
 ) -> crate::engine::driver::targetdef::TargetDef {
-    let origin = dest.hash_str();
+    // Hashed on the first query input: almost no target has one.
+    let mut origin: Option<String> = None;
     for input in &mut def.inputs {
         let r = &input.r#ref.r#ref;
         if r.package.as_str() == hplugin_query::pluginquery::PACKAGE {
+            let origin = origin.get_or_insert_with(|| dest.hash_str());
             let mut args = r.args.clone();
             args.insert("_origin".to_string(), origin.clone());
             if !dest_provider.is_empty() && !args.contains_key("exclude_provider") {
@@ -6704,11 +6682,10 @@ mod tests {
         assert!(err.to_string().contains("modified after it was hashed"));
     }
 
-    /// The verifying reader must compute byte-for-byte the same digest as
-    /// [`hwalk::file_hashout`] — they are two implementations of one hash and
-    /// would silently break passthrough verification if they drifted. Reading an
-    /// unmodified file through the reader (with the canonical hash as `expected`)
-    /// succeeds; with any other `expected` it fails.
+    /// The verifying reader computes byte-for-byte the same digest as
+    /// [`hwalk::file_hashout`], streamed over the reader's own chunks. Reading
+    /// an unmodified file through the reader (with the canonical hash as
+    /// `expected`) succeeds; with any other `expected` it fails.
     #[tokio::test]
     async fn passthrough_reader_matches_file_hashout() {
         let dir = tempdir().expect("tempdir");
@@ -11357,7 +11334,7 @@ mod tests {
         // Pre-populate dag with addr→addr already there is overkill; just call result_addr
         // twice with the same parent set, but result_addr sets parent via with_parent so the
         // second invocation inside the same parent chain triggers cycle. Simulate by manually
-        // setting rs.parent = addr before calling result_addr(addr).
+        // making addr the parent before calling result_addr(addr).
         let rs = engine.new_state().with_parent(addr.clone());
         let result = engine
             .clone()
@@ -14709,6 +14686,60 @@ mod tests {
             "second run over the transformed multi-file tree must be a cache hit, got {ev2:?}"
         );
         Ok(())
+    }
+
+    /// `has_codegen_output` is any non-`None` path; `has_in_place_output` only
+    /// an `in_place` one, wherever it sits among the outputs.
+    #[test]
+    fn codegen_output_predicates_over_each_mode() {
+        use crate::engine::driver::targetdef::Output;
+        use crate::engine::driver::targetdef::path::{CodegenMode, Content, Path};
+
+        let output = |modes: Vec<CodegenMode>| Output {
+            group: "g".to_string(),
+            paths: modes
+                .into_iter()
+                .map(|codegen_tree| Path {
+                    content: Content::FilePath("pkg/f".into()),
+                    codegen_tree,
+                    collect: false,
+                })
+                .collect(),
+        };
+        let in_place = || CodegenMode::InPlace {
+            write_on_failure: false,
+        };
+        let cases = [
+            ("no outputs", vec![], (false, false)),
+            (
+                "none",
+                vec![output(vec![CodegenMode::None])],
+                (false, false),
+            ),
+            ("copy", vec![output(vec![CodegenMode::Copy])], (true, false)),
+            ("in_place", vec![output(vec![in_place()])], (true, true)),
+            (
+                "in_place after a plain path",
+                vec![output(vec![CodegenMode::None, in_place()])],
+                (true, true),
+            ),
+            (
+                "in_place in a later group",
+                vec![
+                    output(vec![CodegenMode::Copy]),
+                    output(vec![CodegenMode::None]),
+                    output(vec![in_place()]),
+                ],
+                (true, true),
+            ),
+        ];
+        for (name, outputs, want) in cases {
+            assert_eq!(
+                (has_codegen_output(&outputs), has_in_place_output(&outputs)),
+                want,
+                "{name}"
+            );
+        }
     }
 
     /// The in-place guard watches the hashed inputs that read an `in_place`

@@ -642,7 +642,9 @@ impl Tally {
             && let Some(exec_started_ms) = rec.exec_started_ms
         {
             let duration_ms = at.saturating_sub(exec_started_ms);
-            self.push_slowest(Completed {
+            // Gate before building the row: most targets finish in under a
+            // second, and their addr and driver need not be copied at all.
+            self.admit_slowest(duration_ms, || Completed {
                 duration_ms,
                 addr: addr.to_string(),
                 driver: rec.driver.as_deref().map(str::to_string),
@@ -658,22 +660,27 @@ impl Tally {
         self.record_root(addr, failure, rec.as_ref(), at);
     }
 
-    fn push_slowest(&mut self, c: Completed) {
-        if c.duration_ms < SLOWEST_MIN_MS {
+    /// Add the row `row` builds to the "slowest" table if a completed target
+    /// of `duration_ms` earns one: at least [`SLOWEST_MIN_MS`], and either the
+    /// table has room or it is strictly longer than the shortest row kept,
+    /// which it then replaces. `row` runs only for a target that gets in.
+    fn admit_slowest(&mut self, duration_ms: u64, row: impl FnOnce() -> Completed) {
+        if duration_ms < SLOWEST_MIN_MS {
             return;
         }
-        if self.slowest.len() < SLOWEST_KEPT {
-            self.slowest.push(Reverse(c));
-            return;
-        }
-        // Replace the smallest if this one is longer. `peek` on a min-heap of
-        // `Reverse` yields the shortest retained duration.
-        if let Some(Reverse(min)) = self.slowest.peek()
-            && c.duration_ms > min.duration_ms
-        {
+        if self.slowest.len() >= SLOWEST_KEPT {
+            // `peek` on a min-heap of `Reverse` yields the shortest retained
+            // duration.
+            if self
+                .slowest
+                .peek()
+                .is_none_or(|Reverse(min)| duration_ms <= min.duration_ms)
+            {
+                return;
+            }
             self.slowest.pop();
-            self.slowest.push(Reverse(c));
         }
+        self.slowest.push(Reverse(row()));
     }
 
     fn record_root(&mut self, addr: &str, failure: Failure<'_>, rec: Option<&TargetRec>, at: u64) {
@@ -1308,6 +1315,40 @@ mod tests {
         exec(&mut t, "//a:second", 0, SLOWEST_MIN_MS);
         let addrs: Vec<String> = t.slowest().into_iter().map(|c| c.addr).collect();
         assert_eq!(addrs, vec!["//a:second".to_string()]);
+    }
+
+    /// Once the table is full, a target as long as the shortest row does not
+    /// displace it (the first seen stays); a longer one replaces it.
+    #[test]
+    fn slowest_full_table_keeps_ties_and_replaces_on_longer() {
+        let mut t = Tally::default();
+        for i in 0..SLOWEST_KEPT {
+            exec(&mut t, &format!("//a:kept{i:02}"), 0, SLOWEST_MIN_MS);
+        }
+        exec(&mut t, "//a:equal", 0, SLOWEST_MIN_MS);
+        let addrs: Vec<String> = t.slowest().into_iter().map(|c| c.addr).collect();
+        assert_eq!(addrs.len(), SLOWEST_KEPT);
+        assert!(
+            !addrs.iter().any(|a| a == "//a:equal"),
+            "a tie must not displace a kept row: {addrs:?}"
+        );
+
+        exec(&mut t, "//a:longer", 0, SLOWEST_MIN_MS + 1);
+        let slowest = t.slowest();
+        assert_eq!(slowest.len(), SLOWEST_KEPT, "still bounded");
+        assert_eq!(
+            slowest.first().map(|c| c.addr.as_str()),
+            Some("//a:longer"),
+            "the longer target is admitted, longest first"
+        );
+        assert_eq!(
+            slowest
+                .iter()
+                .filter(|c| c.addr.starts_with("//a:kept"))
+                .count(),
+            SLOWEST_KEPT - 1,
+            "exactly one shortest row made room"
+        );
     }
 
     #[test]

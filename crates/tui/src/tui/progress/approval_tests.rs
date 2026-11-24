@@ -430,3 +430,57 @@ fn no_home_path_on_any_screen_approval_view() {
     assert!(changelog.contains("notice unavailable"), "{changelog}");
     assert!(!changelog.contains(&home_str), "{changelog}");
 }
+
+/// On a narrow or short terminal the approval view is still exactly `rows`
+/// lines, none wider than `cols`, its hint row last; the breadcrumb and the
+/// notice tabs stay clickable while the tab row is drawn.
+#[test]
+fn approval_view_narrow_and_short() {
+    use crate::tui::dashboard::approval::ApprovalClick;
+    let home = tempfile::tempdir().expect("tempdir");
+    let center = ApprovalCenter::new();
+    let build = center.build();
+    let _t = center.request(
+        &build,
+        "//p:gate".into(),
+        vec![
+            notice(home.path(), "plan", "the plan"),
+            notice(home.path(), "changelog", "the changes"),
+        ],
+    );
+    let mut v = with_store(view(&center), home.path());
+    assert!(v.approval_open());
+    for (cols, rows) in [
+        (120, 30),
+        (40, 8),
+        (20, 6),
+        (12, 4),
+        (8, 3),
+        (20, 2),
+        (20, 1),
+        (20, 0),
+    ] {
+        let f = texts(&settled(&mut v, T0, cols, rows));
+        assert_eq!(f.len(), usize::from(rows), "{cols}x{rows}: {f:#?}");
+        for l in &f {
+            assert!(
+                crate::tui::text::width(l) <= usize::from(cols),
+                "{cols}x{rows}: {l:?}"
+            );
+        }
+        if rows > 0 {
+            let hint = f.last().map(String::as_str).unwrap_or_default();
+            assert!(
+                hint.starts_with("  ") && !hint.trim().is_empty(),
+                "{cols}x{rows}: {f:#?}"
+            );
+        }
+        let screen = v.approval.as_mut().expect("open");
+        if rows >= 4 {
+            assert!(f[2].starts_with(" ◂"), "{cols}x{rows}: {f:#?}");
+            assert_eq!(screen.click(1, 2), ApprovalClick::Back, "{cols}x{rows}");
+        } else {
+            assert_eq!(screen.click(1, 2), ApprovalClick::Nothing, "{cols}x{rows}");
+        }
+    }
+}

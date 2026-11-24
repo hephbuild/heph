@@ -7,12 +7,8 @@ use hmodel::htmatcher::{MatchResult, Matcher};
 /// (see [`crate::engine::matcher_target::match_target`]).
 pub fn match_spec(m: &Matcher, spec: &TargetSpec) -> MatchResult {
     match m {
-        Matcher::Addr(addr) => {
-            if spec.addr == *addr {
-                MatchResult::MatchYes
-            } else {
-                MatchResult::MatchNo
-            }
+        Matcher::Addr(_) | Matcher::Package(_) | Matcher::PackagePrefix(_) => {
+            m.matches_addr(&spec.addr)
         }
         Matcher::Label(label) => {
             if spec.labels.contains(label) {
@@ -30,56 +26,10 @@ pub fn match_spec(m: &Matcher, spec: &TargetSpec) -> MatchResult {
                 MatchResult::MatchNo
             }
         }
-        Matcher::Package(pkg) => {
-            if spec.addr.package == *pkg {
-                MatchResult::MatchYes
-            } else {
-                MatchResult::MatchNo
-            }
-        }
-        Matcher::PackagePrefix(pkg) => {
-            if spec.addr.package.has_prefix(pkg) {
-                MatchResult::MatchYes
-            } else {
-                MatchResult::MatchNo
-            }
-        }
-        Matcher::Or(matchers) => {
-            let mut has_shrug = false;
-            for m in matchers {
-                match match_spec(m, spec) {
-                    MatchResult::MatchYes => return MatchResult::MatchYes,
-                    MatchResult::MatchShrug => has_shrug = true,
-                    MatchResult::MatchNo => {}
-                }
-            }
-            if has_shrug {
-                MatchResult::MatchShrug
-            } else {
-                MatchResult::MatchNo
-            }
-        }
-        Matcher::And(matchers) => {
-            let mut has_shrug = false;
-            for m in matchers {
-                match match_spec(m, spec) {
-                    MatchResult::MatchNo => return MatchResult::MatchNo,
-                    MatchResult::MatchShrug => has_shrug = true,
-                    MatchResult::MatchYes => {}
-                }
-            }
-            if has_shrug {
-                MatchResult::MatchShrug
-            } else {
-                MatchResult::MatchYes
-            }
-        }
+        Matcher::Or(matchers) => MatchResult::any(matchers.iter().map(|m| match_spec(m, spec))),
+        Matcher::And(matchers) => MatchResult::all(matchers.iter().map(|m| match_spec(m, spec))),
         Matcher::TreeOutputTo(_) => MatchResult::MatchShrug,
-        Matcher::Not(m) => match match_spec(m, spec) {
-            MatchResult::MatchYes => MatchResult::MatchNo,
-            MatchResult::MatchNo => MatchResult::MatchYes,
-            MatchResult::MatchShrug => MatchResult::MatchShrug,
-        },
+        Matcher::Not(m) => match_spec(m, spec).negate(),
     }
 }
 

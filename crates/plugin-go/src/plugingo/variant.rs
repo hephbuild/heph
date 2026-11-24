@@ -27,6 +27,7 @@
 //! append). `goos`/`goarch` may be omitted when inherited. Cycles are rejected.
 
 use crate::plugingo::factors::{BuildMode, Factors, VariantRef, race_from_args};
+use crate::plugingo::pkg_analysis::path_in_prefix;
 use anyhow::{Context, bail};
 use hcore::htvalue::{Value, parse_strings};
 use hmodel::htaddr::Addr;
@@ -69,7 +70,7 @@ struct RawVariant {
 /// itself or a descendant). `module_root == ""` (a root `go.mod`) contains
 /// everything.
 fn under_module_root(pkg: &str, module_root: &str) -> bool {
-    module_root.is_empty() || pkg == module_root || pkg.starts_with(&format!("{module_root}/"))
+    module_root.is_empty() || path_in_prefix(pkg, module_root)
 }
 
 /// Parse one raw variant definition (`Value::Map`). Rejects unknown keys; wrong

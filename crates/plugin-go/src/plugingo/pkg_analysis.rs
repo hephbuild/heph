@@ -434,15 +434,19 @@ pub fn parse_go_mod_requires(content: &str) -> Vec<(String, String)> {
 /// modules pulled in transitively by a dependency (e.g. `golang.org/x/net`
 /// behind `golang.org/x/oauth2`) appear *only* in `go.sum`. Without them their
 /// import paths fail to resolve to a thirdparty addr and get silently dropped.
+///
+/// A module with several source-hash lines is listed once, at its first line:
+/// [`find_module_for_import`] would pick that one among the duplicates anyway.
 pub fn parse_go_sum_modules(content: &str) -> Vec<(String, String)> {
     let mut result = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
     for line in content.lines() {
         let mut parts = line.split_whitespace();
         let (Some(module), Some(version)) = (parts.next(), parts.next()) else {
             continue;
         };
         // Skip the go.mod-only graph entries; keep only source-hash lines.
-        if version.ends_with("/go.mod") {
+        if version.ends_with("/go.mod") || !seen.insert(module) {
             continue;
         }
         result.push((module.to_string(), version.to_string()));
@@ -450,23 +454,28 @@ pub fn parse_go_sum_modules(content: &str) -> Vec<(String, String)> {
     result
 }
 
+/// Whether `path` is `prefix` itself or lies below it (`prefix/...`), compared
+/// by `/`-separated element: `foo/bar` is under `foo` but not under `fo`.
+pub fn path_in_prefix(path: &str, prefix: &str) -> bool {
+    path.strip_prefix(prefix)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
 /// Find which module in `requires` best matches `import_path`.
-/// Returns `Some((module_path, version))` for the longest matching prefix.
-pub fn find_module_for_import(
+/// Returns `Some((module_path, version))` for the longest matching prefix; at
+/// equal length the first listed wins.
+pub fn find_module_for_import<'r>(
     import_path: &str,
-    requires: &[(String, String)],
-) -> Option<(String, String)> {
+    requires: &'r [(String, String)],
+) -> Option<(&'r str, &'r str)> {
     let mut best: Option<&(String, String)> = None;
     for req in requires {
         let module = &req.0;
-        // exact match or import_path starts with module + "/"
-        if (import_path == module.as_str() || import_path.starts_with(&format!("{}/", module)))
-            && best.is_none_or(|(b, _)| module.len() > b.len())
-        {
+        if path_in_prefix(import_path, module) && best.is_none_or(|(b, _)| module.len() > b.len()) {
             best = Some(req);
         }
     }
-    best.cloned()
+    best.map(|(module, version)| (module.as_str(), version.as_str()))
 }
 
 /// Run `go list -json -e` (no -deps) directly as a subprocess.
@@ -566,6 +575,32 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d/go.mod h1:gOpvHmFTYa4Iltr
                 ),
             ],
             "must keep exactly one source-version entry per module, dropping /go.mod graph lines"
+        );
+    }
+
+    #[test]
+    fn test_parse_go_sum_modules_lists_a_module_once_at_its_first_line() {
+        // Several source-hash lines for one module (an untidied go.sum keeps
+        // old versions): the module is listed once, with its first version,
+        // the one `find_module_for_import` picked among the duplicates.
+        let go_sum = "\
+example.com/a v1.0.0 h1:aaa=
+example.com/a v1.0.0/go.mod h1:aaa=
+example.com/a v1.2.0 h1:bbb=
+example.com/ab v0.1.0 h1:ccc=
+example.com/a v1.3.0 h1:ddd=
+";
+        let mods = parse_go_sum_modules(go_sum);
+        assert_eq!(
+            mods,
+            vec![
+                ("example.com/a".to_string(), "v1.0.0".to_string()),
+                ("example.com/ab".to_string(), "v0.1.0".to_string()),
+            ]
+        );
+        assert_eq!(
+            find_module_for_import("example.com/a/pkg", &mods),
+            Some(("example.com/a", "v1.0.0"))
         );
     }
 
@@ -705,20 +740,69 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d/go.mod h1:gOpvHmFTYa4Iltr
     fn test_find_module_for_import_exact() {
         let requires = vec![("github.com/foo/bar".to_string(), "v1.2.3".to_string())];
         let result = find_module_for_import("github.com/foo/bar", &requires);
-        assert_eq!(
-            result,
-            Some(("github.com/foo/bar".to_string(), "v1.2.3".to_string()))
-        );
+        assert_eq!(result, Some(("github.com/foo/bar", "v1.2.3")));
     }
 
     #[test]
     fn test_find_module_for_import_subpath() {
         let requires = vec![("github.com/foo/bar".to_string(), "v1.2.3".to_string())];
         let result = find_module_for_import("github.com/foo/bar/pkg", &requires);
+        assert_eq!(result, Some(("github.com/foo/bar", "v1.2.3")));
+    }
+
+    #[test]
+    fn test_find_module_for_import_matches_whole_path_elements() {
+        // `foo/bar` is not a prefix of `foo/barbaz` as a path, only as a string.
+        let requires = vec![("github.com/foo/bar".to_string(), "v1.2.3".to_string())];
         assert_eq!(
-            result,
-            Some(("github.com/foo/bar".to_string(), "v1.2.3".to_string()))
+            find_module_for_import("github.com/foo/barbaz", &requires),
+            None
         );
+        assert_eq!(
+            find_module_for_import("github.com/foo/barbaz/pkg", &requires),
+            None
+        );
+        assert_eq!(find_module_for_import("github.com/foo/ba", &requires), None);
+        assert_eq!(find_module_for_import("github.com/foo", &requires), None);
+        assert_eq!(find_module_for_import("", &requires), None);
+
+        // `foo/barbaz` is preferred over `foo/bar` only for its own subtree.
+        let requires = vec![
+            ("github.com/foo/bar".to_string(), "v1.0.0".to_string()),
+            ("github.com/foo/barbaz".to_string(), "v2.0.0".to_string()),
+        ];
+        assert_eq!(
+            find_module_for_import("github.com/foo/bar/x", &requires),
+            Some(("github.com/foo/bar", "v1.0.0"))
+        );
+        assert_eq!(
+            find_module_for_import("github.com/foo/barbaz/x", &requires),
+            Some(("github.com/foo/barbaz", "v2.0.0"))
+        );
+    }
+
+    #[test]
+    fn test_find_module_for_import_first_wins_at_equal_length() {
+        let requires = vec![
+            ("github.com/foo/bar".to_string(), "v1.0.0".to_string()),
+            ("github.com/foo/bar".to_string(), "v2.0.0".to_string()),
+        ];
+        assert_eq!(
+            find_module_for_import("github.com/foo/bar/pkg", &requires),
+            Some(("github.com/foo/bar", "v1.0.0"))
+        );
+    }
+
+    #[test]
+    fn test_path_in_prefix() {
+        assert!(path_in_prefix("a/b", "a/b"));
+        assert!(path_in_prefix("a/b/c", "a/b"));
+        assert!(!path_in_prefix("a/bc", "a/b"));
+        assert!(!path_in_prefix("a", "a/b"));
+        assert!(!path_in_prefix("a/b", "a/b/"));
+        assert!(path_in_prefix("", ""));
+        assert!(!path_in_prefix("a", ""));
+        assert!(path_in_prefix("/a", ""));
     }
 
     #[test]
@@ -728,10 +812,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d/go.mod h1:gOpvHmFTYa4Iltr
             ("github.com/foo/bar".to_string(), "v1.2.3".to_string()),
         ];
         let result = find_module_for_import("github.com/foo/bar/pkg", &requires);
-        assert_eq!(
-            result,
-            Some(("github.com/foo/bar".to_string(), "v1.2.3".to_string()))
-        );
+        assert_eq!(result, Some(("github.com/foo/bar", "v1.2.3")));
     }
 
     #[test]

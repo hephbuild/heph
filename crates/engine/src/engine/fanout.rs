@@ -25,13 +25,11 @@ use std::future::Future;
 /// scheduler pressure, not CPU oversubscription. Bounding the product would
 /// need this to become a process-wide semaphore rather than a per-stream cap.
 ///
-/// Deliberately the same expression the engine's other stream-consuming walks
-/// use (`labels.rs`, `revdeps.rs`, `deppath.rs`).
+/// The engine's other stream-consuming walks (`labels.rs`, `revdeps.rs`,
+/// `deppath.rs`) use it too. The core count is [`hcore::sysres::host_cpus`],
+/// read once per process.
 pub fn discovery_concurrency() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .saturating_mul(2)
+    hcore::sysres::host_cpus().saturating_mul(2)
 }
 
 /// `try_join_all` equivalent that honors `fail_fast`.

@@ -19,7 +19,6 @@ bench-corpus = { path = "../bench-corpus" }
 heph = { path = "../.." }
 # `fsutil::remove_dir_all`: wiping a corpus home that holds read-only dirs.
 hcore = { package = "core", path = "../core" }
-htestkit = { package = "testkit", path = "../testkit" }
 anyhow = "1"
 clap = { version = "4.6.9", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

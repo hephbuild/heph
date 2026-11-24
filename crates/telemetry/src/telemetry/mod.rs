@@ -129,7 +129,7 @@ pub fn observe_event(kind: &BuildEventKind) {
 }
 
 /// Record one resolved target's artifact count + known per-artifact sizes.
-pub fn record_artifacts(count: u64, sizes: &[u64]) {
+pub fn record_artifacts(count: u64, sizes: impl IntoIterator<Item = u64>) {
     COLLECTOR.record_artifacts(count, sizes);
 }
 
@@ -274,9 +274,17 @@ fn ci_from(lookup: impl Fn(&str) -> Option<String>) -> bool {
 
 /// Whether telemetry should run, combining the config flag with the env kill
 /// switch. The env var wins so CI and the project's own e2e binaries can opt out
-/// without touching a config file.
-pub fn is_enabled(config_enabled: bool) -> bool {
-    config_enabled && std::env::var_os(DISABLE_ENV).is_none()
+/// without touching a config file. The env is checked first, so the config —
+/// a `.hephconfig` parse at startup — is only read when the kill switch is
+/// unset.
+pub fn is_enabled(config_enabled: impl FnOnce() -> bool) -> bool {
+    enabled_with(std::env::var_os(DISABLE_ENV).is_some(), config_enabled)
+}
+
+/// [`is_enabled`] over an injected kill-switch state, testable without
+/// mutating the process environment.
+fn enabled_with(env_disabled: bool, config_enabled: impl FnOnce() -> bool) -> bool {
+    !env_disabled && config_enabled()
 }
 
 /// Machine-level config dir holding the install id and the spool:
@@ -381,10 +389,9 @@ fn hand_off_opt_out(
     // flusher, or an opt-out one still within its deadline) holds this off,
     // and of two opted-out commands only the one that claims the spawn starts
     // a flusher.
-    let spawned_recently = state.last_spawn_ms.is_some_and(|last| {
-        (0..millis(FLUSH_RETRY_INTERVAL)).contains(&now_ms.saturating_sub(last))
-    });
-    if spawned_recently || !spool.claim_spawn(state.last_spawn_ms, now_ms)? {
+    if spawned_recently(state.last_spawn_ms, now_ms)
+        || !spool.claim_spawn(state.last_spawn_ms, now_ms)?
+    {
         return Ok(OptOutHandOff::Pending);
     }
     drop(spool);
@@ -446,8 +453,8 @@ fn install_id(dir: &std::path::Path) -> anyhow::Result<String> {
 
 /// The event `distinct_id`: `"ci"` on CI runners, the persistent install UUID
 /// otherwise.
-fn distinct_id(dir: &std::path::Path) -> anyhow::Result<String> {
-    if is_ci() {
+fn distinct_id(dir: &std::path::Path, ci: bool) -> anyhow::Result<String> {
+    if ci {
         return Ok("ci".to_string());
     }
     install_id(dir)
@@ -546,6 +553,7 @@ pub fn record_invocation(
     };
 
     let failure = error.map(classify_failure);
+    let ci = is_ci();
 
     let spool = match try_enqueue(ReportContext {
         command: &command,
@@ -554,6 +562,7 @@ pub fn record_invocation(
         success: failure.is_none(),
         failure,
         duration_ms: took.as_millis() as u64,
+        ci,
     }) {
         Ok(spool) => Some(spool),
         Err(e) => {
@@ -564,7 +573,7 @@ pub fn record_invocation(
 
     // CI: send now, blocking (see the module docs). Elsewhere: hand off to a
     // detached flusher when one is due, and never wait.
-    if is_ci() {
+    if ci {
         drop(spool);
         flush_blocking();
     } else if let Some(spool) = spool {
@@ -595,10 +604,7 @@ fn flush_due(s: SpoolState, now_ms: i64) -> bool {
     if s.count == 0 {
         return false;
     }
-    let spawned_recently = s.last_spawn_ms.is_some_and(|last| {
-        (0..millis(FLUSH_RETRY_INTERVAL)).contains(&now_ms.saturating_sub(last))
-    });
-    if spawned_recently {
+    if spawned_recently(s.last_spawn_ms, now_ms) {
         return false;
     }
     s.count >= FLUSH_AT_EVENTS
@@ -626,6 +632,16 @@ fn next_flush_due(s: SpoolState, now_ms: i64) -> Option<i64> {
         .filter(|&last| last <= now_ms)
         .map(|last| last.saturating_add(millis(FLUSH_RETRY_INTERVAL)));
     Some(retry.map_or(ready, |r| ready.max(r)))
+}
+
+/// Whether a flusher was spawned within the last [`FLUSH_RETRY_INTERVAL`] of
+/// `now_ms`, which holds the next spawn off. A spawn stamp from the *future*
+/// (the clock stepped back) does not count: it would otherwise suppress spawns
+/// until the clock caught up.
+fn spawned_recently(last_spawn_ms: Option<i64>, now_ms: i64) -> bool {
+    last_spawn_ms.is_some_and(|last| {
+        (0..millis(FLUSH_RETRY_INTERVAL)).contains(&now_ms.saturating_sub(last))
+    })
 }
 
 /// `d` in whole milliseconds, saturating.
@@ -1231,6 +1247,9 @@ struct ReportContext<'a> {
     failure: Option<&'a str>,
     /// Command wall time, parse-to-exit.
     duration_ms: u64,
+    /// Whether this runs on CI ([`is_ci`]), decided once per invocation: it
+    /// sets the `ci` prop, the `distinct_id` and the flush mode.
+    ci: bool,
 }
 
 /// Spool this invocation's event; returns the open spool for the flush check.
@@ -1246,7 +1265,7 @@ fn try_enqueue(ctx: ReportContext<'_>) -> anyhow::Result<Spool> {
 
     let event = SpooledEvent {
         uuid: uuid::Uuid::new_v4().to_string(),
-        distinct_id: distinct_id(&dir)?,
+        distinct_id: distinct_id(&dir, ctx.ci)?,
         event: "cli_command".to_string(),
         props,
         created_ms: hcore::events::now_unix_ms() as i64,
@@ -1289,7 +1308,7 @@ fn build_props(
             put("version_build", build.into());
         }
     }
-    put("ci", is_ci().into());
+    put("ci", ctx.ci.into());
     // Stable per-repo id (one-way hash of the git root commit) grouping events by
     // project without identifying it. Absent when not in a git repo / git is
     // unavailable / a shallow clone can't reach the root and the GitHub API
@@ -1606,12 +1625,27 @@ mod tests {
     fn env_kill_switch_overrides_enabled() {
         // SAFETY: single-threaded test; no other thread reads the env here.
         unsafe { std::env::set_var(DISABLE_ENV, "1") };
-        assert!(!is_enabled(true));
+        assert!(!is_enabled(|| true));
         // SAFETY: as above.
         unsafe { std::env::remove_var(DISABLE_ENV) };
-        assert!(is_enabled(true));
+        assert!(is_enabled(|| true));
         // Config opt-out alone also disables.
-        assert!(!is_enabled(false));
+        assert!(!is_enabled(|| false));
+    }
+
+    #[test]
+    fn env_kill_switch_skips_the_config_read() {
+        // Set, the switch decides alone: the config (a `.hephconfig` parse in
+        // the binary) is never read.
+        assert!(!enabled_with(true, || panic!(
+            "config read under the kill switch"
+        )));
+        let mut read = false;
+        assert!(enabled_with(false, || {
+            read = true;
+            true
+        }));
+        assert!(read, "config read when the switch is unset");
     }
 
     #[test]
@@ -1667,8 +1701,11 @@ mod tests {
             success: true,
             failure: None,
             duration_ms: 1,
+            ci: true,
         };
         let props = build_props(&ctx, &snapshot, Plugins::default(), Some("deadbeef"));
+        // The `ci` prop is the invocation's one CI decision, not a fresh env read.
+        assert_eq!(props.get("ci").and_then(|v| v.as_bool()), Some(true));
 
         // posthog-rs stamps `$os` / `$os_version` itself, so build_props must
         // not carry an `os` of its own (nor the `$`-prefixed keys).
@@ -1766,8 +1803,10 @@ mod tests {
             success: true,
             failure: None,
             duration_ms: 1,
+            ci: false,
         };
         let props = build_props(&ctx, &snapshot, Plugins::default(), None);
+        assert_eq!(props.get("ci").and_then(|v| v.as_bool()), Some(false));
         let n = |k: &str| props.get(k).and_then(|v| v.as_u64());
         assert_eq!(n("query_expr_addr"), Some(1));
         assert_eq!(n("query_expr_label"), Some(2));
@@ -1985,6 +2024,18 @@ mod flush_tests {
             state(FLUSH_AT_EVENTS, 10 * MIN, Some(-10 * MIN)),
             NOW
         ));
+    }
+
+    /// The window both spawn gates (a due flush, an opt-out hand-off) share:
+    /// half-open `[last, last + retry)`, and a future stamp never holds off.
+    #[test]
+    fn spawned_recently_window_boundaries() {
+        let retry = i64::try_from(FLUSH_RETRY_INTERVAL.as_millis()).expect("ms");
+        assert!(!spawned_recently(None, NOW));
+        assert!(spawned_recently(Some(NOW), NOW));
+        assert!(spawned_recently(Some(NOW - (retry - 1)), NOW));
+        assert!(!spawned_recently(Some(NOW - retry), NOW));
+        assert!(!spawned_recently(Some(NOW + 1), NOW));
     }
 
     /// Of several commands that find a flush due at once, exactly one claims

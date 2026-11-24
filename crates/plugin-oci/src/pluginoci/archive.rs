@@ -10,7 +10,7 @@
 //! except where a digest is *verified*, which is called out where it happens.
 
 use anyhow::Context as _;
-use oci_client::manifest::{OciImageIndex, OciImageManifest};
+use oci_client::manifest::{ImageIndexEntry, OciImageIndex, OciImageManifest, Platform};
 use std::io::Read as _;
 use std::path::Path;
 
@@ -228,6 +228,35 @@ impl Blob {
 /// because the write order is the archive's bytes.
 pub(crate) type Blobs = std::collections::BTreeMap<String, Blob>;
 
+/// The image index heph writes: schema 2, the OCI index media type, the
+/// given entries, no annotations.
+pub(crate) fn oci_index(manifests: Vec<ImageIndexEntry>) -> OciImageIndex {
+    OciImageIndex {
+        schema_version: 2,
+        media_type: Some(oci_client::manifest::OCI_IMAGE_INDEX_MEDIA_TYPE.to_string()),
+        artifact_type: None,
+        manifests,
+        annotations: None,
+    }
+}
+
+/// An index entry pointing at an OCI image manifest, filed under `platform`
+/// (`None` for an image that does not say).
+pub(crate) fn image_manifest_entry(
+    digest: String,
+    size: i64,
+    platform: Option<Platform>,
+) -> ImageIndexEntry {
+    ImageIndexEntry {
+        media_type: oci_client::manifest::OCI_IMAGE_MEDIA_TYPE.to_string(),
+        artifact_type: None,
+        digest,
+        size,
+        platform,
+        annotations: None,
+    }
+}
+
 /// `blobs/sha256/<hex>` → `sha256:<hex>`. Anything else is not a blob.
 fn blob_digest_of(name: &str) -> Option<String> {
     let rest = name.strip_prefix("blobs/")?;
@@ -263,32 +292,22 @@ fn tagged_index(index: &OciImageIndex, blobs: &mut Blobs) -> anyhow::Result<OciI
         });
     }
 
-    let inner = OciImageIndex {
-        schema_version: 2,
-        media_type: Some(oci_client::manifest::OCI_IMAGE_INDEX_MEDIA_TYPE.to_string()),
-        artifact_type: None,
-        manifests: index.manifests.clone(),
-        annotations: None,
-    };
+    let inner = oci_index(index.manifests.clone());
     let raw = serde_json::to_vec(&inner).context("encode the nested index")?;
     let digest = sha256_digest(&raw);
     let size = raw.len() as i64;
     blobs.insert(digest.clone(), Blob::Bytes(raw));
 
-    Ok(OciImageIndex {
-        schema_version: 2,
-        media_type: Some(oci_client::manifest::OCI_IMAGE_INDEX_MEDIA_TYPE.to_string()),
+    // Not `image_manifest_entry`: this entry points at an index, and carries
+    // the tag.
+    Ok(oci_index(vec![ImageIndexEntry {
+        media_type: oci_client::manifest::OCI_IMAGE_INDEX_MEDIA_TYPE.to_string(),
         artifact_type: None,
-        manifests: vec![oci_client::manifest::ImageIndexEntry {
-            media_type: oci_client::manifest::OCI_IMAGE_INDEX_MEDIA_TYPE.to_string(),
-            artifact_type: None,
-            digest,
-            size,
-            platform: None,
-            annotations: Some(annotations),
-        }],
-        annotations: None,
-    })
+        digest,
+        size,
+        platform: None,
+        annotations: Some(annotations),
+    }]))
 }
 
 /// Write a layout to `dir` in the on-disk OCI layout shape (`oci-layout`,
@@ -403,26 +422,9 @@ fn append_blob<W: std::io::Write>(
 
 /// The sha256 of a file, without reading it into memory.
 pub(crate) fn sha256_file(path: &Path) -> anyhow::Result<(String, u64)> {
-    use sha2::{Digest as _, Sha256};
-    let mut f = std::fs::File::open(path).with_context(|| format!("open {path:?}"))?;
-    let mut h = HashWriter(Sha256::new());
-    let n = std::io::copy(&mut f, &mut h).with_context(|| format!("hash {path:?}"))?;
-    Ok((format!("sha256:{}", hex::encode(h.0.finalize())), n))
-}
-
-/// `io::Write` over a hasher, so `io::copy` can stream a file into it: digest
-/// 0.11 dropped the `Write` impl the hashers used to carry.
-struct HashWriter(sha2::Sha256);
-
-impl std::io::Write for HashWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        sha2::Digest::update(&mut self.0, buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
+    let f = std::fs::File::open(path).with_context(|| format!("open {path:?}"))?;
+    let (hex, n) = hfetch::sha256_hex_of(f).with_context(|| format!("hash {path:?}"))?;
+    Ok((format!("sha256:{hex}"), n))
 }
 
 fn blob_path(digest: &str) -> anyhow::Result<String> {
@@ -472,20 +474,11 @@ pub(crate) fn write_docker_archive(
         blobs.insert(layer.digest.clone(), layout.blob(&layer.digest)?.clone());
     }
 
-    let index = OciImageIndex {
-        schema_version: 2,
-        media_type: Some(oci_client::manifest::OCI_IMAGE_INDEX_MEDIA_TYPE.to_string()),
-        artifact_type: None,
-        manifests: vec![oci_client::manifest::ImageIndexEntry {
-            media_type: oci_client::manifest::OCI_IMAGE_MEDIA_TYPE.to_string(),
-            artifact_type: None,
-            digest: manifest_digest.to_string(),
-            size: manifest_bytes.len() as i64,
-            platform: None,
-            annotations: None,
-        }],
-        annotations: None,
-    };
+    let index = oci_index(vec![image_manifest_entry(
+        manifest_digest.to_string(),
+        manifest_bytes.len() as i64,
+        None,
+    )]);
 
     let docker_manifest = serde_json::json!([{
         "Config": blob_path(&manifest.config.digest)?,
@@ -693,5 +686,33 @@ mod tests {
         let err = format!("{:#}", Layout::read(&path).expect_err("not a layout"));
         assert!(err.contains("not an OCI layout"), "got: {err}");
         assert!(err.contains("format = \"docker\""), "got: {err}");
+    }
+
+    /// The index heph writes, pinned byte for byte: its digest is what a
+    /// multi-platform image reports and what a registry files the tag under.
+    #[test]
+    fn the_written_index_json_is_pinned() {
+        let platform = Platform {
+            os: "linux".into(),
+            architecture: "arm64".into(),
+            os_version: None,
+            os_features: None,
+            variant: None,
+            features: None,
+        };
+        let index = oci_index(vec![
+            image_manifest_entry("sha256:aa".to_string(), 12, Some(platform)),
+            image_manifest_entry("sha256:bb".to_string(), 34, None),
+        ]);
+        assert_eq!(
+            String::from_utf8(serde_json::to_vec(&index).expect("encode")).expect("utf8"),
+            concat!(
+                r#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","#,
+                r#""manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","#,
+                r#""digest":"sha256:aa","size":12,"platform":{"architecture":"arm64","os":"linux"}},"#,
+                r#"{"mediaType":"application/vnd.oci.image.manifest.v1+json","#,
+                r#""digest":"sha256:bb","size":34}]}"#,
+            )
+        );
     }
 }

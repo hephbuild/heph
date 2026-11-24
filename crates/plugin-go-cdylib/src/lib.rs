@@ -11,15 +11,12 @@
 
 use hdriver_support::driver_managed::ManagedDriver;
 use hplugin_go::plugingo::{
-    GoCompileDriver, GoDownloadDriver, GoFormatCheckDriver, GoFormatDriver, GoGolistDriver,
-    GoLintDriver, GoLintFixDriver, GoLintGateDriver, GoTestmainDriver, GoToolchainDriver, Provider,
+    GoCompileDriver, GoDownloadDriver, GoFormatDriver, GoGolistDriver, GoLintDriver,
+    GoLintFixDriver, GoLintGateDriver, GoTestmainDriver, GoToolchainDriver, Provider,
 };
-use plugin_sdk::stabby::abi::{
-    DynFunctionRegistry, DynLogSink, DynRunnerHost, DynSupervisor, NamedDriver, PluginComponents,
-};
+use plugin_sdk::stabby::abi::{DynFunctionRegistry, NamedDriver, PluginComponents};
 use plugin_sdk::stabby::{
-    create_config_from_bytes, install_log_sink, install_runner_host, install_supervisor,
-    make_dyn_managed_driver, make_dyn_provider, make_plugin_functions,
+    create_config_from_bytes, make_dyn_managed_driver, make_dyn_provider, make_plugin_functions,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -47,47 +44,9 @@ pub extern "C" fn heph_plugin_create(
     }
 }
 
-/// Stable ABI log-sink entry: the host calls this right after `create` to hand the
-/// plugin a sink for its `tracing` events. Without it, this cdylib's
-/// statically-linked `tracing` has no subscriber and the plugin's logs vanish.
-#[stabby::export]
-pub extern "C" fn heph_plugin_set_log_sink(sink: DynLogSink) {
-    install_log_sink(sink);
-}
-
-/// ABI version entry: the host reads it before anything else and refuses this
-/// plugin if it was built for an ABI the host does not load. A plain C symbol,
-/// so it reads the same whatever stabby layout either side has.
-#[unsafe(no_mangle)]
-pub extern "C" fn heph_plugin_abi_semver() -> *const std::ffi::c_char {
-    plugin_sdk::stabby::abi_semver()
-}
-
-/// Stable ABI log-filter entry: the host's filter as protobuf `LogFilter` bytes,
-/// so events it would discard are dropped here instead of forwarded.
-#[stabby::export]
-pub extern "C" fn heph_plugin_set_log_filter(filter: stabby::vec::Vec<u8>) {
-    plugin_sdk::stabby::install_log_filter(&filter);
-}
-
-/// Stable ABI supervisor entry: the host hands the plugin its process-supervisor
-/// client. This cdylib links its own `proc`, whose tracker the host's startup
-/// `init` never reached — without this, every `go` compile this plugin spawns goes
-/// unregistered with the sidecar (orphaned on a hard kill of the host).
-#[stabby::export]
-pub extern "C" fn heph_plugin_set_supervisor(sup: DynSupervisor) {
-    install_supervisor(sup);
-}
-
-/// Stable ABI exec-runner entry: the host hands the plugin a handle to its
-/// runner registry. This cdylib links its own `execrunner`, whose registry the
-/// engine's `install_exec_runner_host` never reached — without this, a target
-/// here that names a `runner` fails with "no runner host is installed in this
-/// component" rather than running in the environment it asked for.
-#[stabby::export]
-pub extern "C" fn heph_plugin_set_runner_host(host: DynRunnerHost) {
-    install_runner_host(host);
-}
+// The supervisor entry tracks every `go` compile this plugin spawns, which would
+// otherwise be orphaned on a hard kill of the host.
+plugin_sdk::export_host_entries!();
 
 fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
     let cfg = create_config_from_bytes(cfg)?;
@@ -188,13 +147,13 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
     });
     // Formatters (gofmt/gofumpt/goimports) via heph-govet's -format mode.
     let format: Arc<dyn ManagedDriver> =
-        Arc::new(GoFormatDriver::new().with_default_runner(go_runner.clone()));
+        Arc::new(GoFormatDriver::fix().with_default_runner(go_runner.clone()));
     drivers.push(NamedDriver {
         name: "format".into(),
         driver: make_dyn_managed_driver(format),
     });
     let format_check: Arc<dyn ManagedDriver> =
-        Arc::new(GoFormatCheckDriver::new().with_default_runner(go_runner));
+        Arc::new(GoFormatDriver::check().with_default_runner(go_runner));
     drivers.push(NamedDriver {
         name: "format_check".into(),
         driver: make_dyn_managed_driver(format_check),
@@ -205,10 +164,7 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
         drivers,
         functions,
         function_handle: function_handle.into(),
-        // The go plugin exports no hooks.
-        hooks: stabby::vec::Vec::new(),
-        // No return-side metadata to report yet.
-        runners: stabby::vec::Vec::new(),
-        meta: stabby::vec::Vec::new(),
+        // No hooks, no runners, no return-side metadata.
+        ..PluginComponents::empty()
     })
 }

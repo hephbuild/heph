@@ -15,29 +15,27 @@
 //! share heph's home at the same path, or no scratch would work under it
 //! (`docs/EXEC_RUNNERS.md`, "Containers").
 
+use crate::plugingo::deps::DepShape;
 use crate::plugingo::module_fetch::{FETCH_ACCESS_ENV, add_fetch_env};
-use crate::plugingo::tool_log::ToolLog;
+use crate::plugingo::tool_log::{ProcessGroup, ToolLog, echo_failure, run_captured};
 use anyhow::Context;
 use async_trait::async_trait;
 use enclose::enclose;
-use hcore::debug_hash::DebugHasher;
 use hcore::hasync::Cancellable;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
 use hplugin::driver::targetdef::path::{CodegenMode, Content, Path as OutputPath};
-use hplugin::driver::targetdef::{CacheConfig, Input, InputMode, Output, TargetDef};
+use hplugin::driver::targetdef::{CacheConfig, Output, TargetDef};
 use hplugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
     ParseResponse, TargetAddr,
 };
 use hplugin::htspec::Spec;
-use hproc::proc_exec;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::hash::{Hash, Hasher};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use xxhash_rust::xxh3::Xxh3Default;
 
 pub struct GoDownloadDriver {
     /// Default exec runner for `go`, from the plugin's `runner:` option. A
@@ -261,26 +259,14 @@ async fn fetch_module(
     std::fs::write(&stub, "module heph_ignore\n")
         .with_context(|| format!("write stub {}", stub.display()))?;
 
-    let spec = proc_exec::Spec {
-        program: go_bin.to_path_buf(),
-        args: ["mod", "download", "-modcacherw", "-json", &mod_at_ver]
-            .iter()
-            .map(OsString::from)
-            .collect(),
-        env: env
-            .iter()
-            .map(|(k, v)| (OsString::from(k), OsString::from(v)))
-            .collect(),
-        cwd: cwd.to_path_buf(),
-        stdin: proc_exec::StdioSpec::Null,
-        stdout: proc_exec::StdioSpec::Piped,
-        stderr: proc_exec::StdioSpec::Piped,
-        // setsid: in direct mode `go` forks `git` and friends; the supervisor's
-        // killpg needs the whole group, or a cancel orphans them in the module cache.
-        setsid: true,
-        ctty: false,
-    };
-    let output = hexecrunner::output(runner, spec, ctoken)
+    let args = ["mod", "download", "-modcacherw", "-json", &mod_at_ver]
+        .iter()
+        .map(OsString::from)
+        .collect();
+    // Its own group: in direct mode `go` forks `git` and friends; the
+    // supervisor's killpg needs the whole group, or a cancel orphans them in the
+    // module cache.
+    let output = run_captured(go_bin, args, env, cwd, ProcessGroup::Own, runner, ctoken)
         .await
         .with_context(|| format!("wait for go mod download {mod_at_ver}"))?;
     if !output.status.success() {
@@ -377,31 +363,13 @@ impl ManagedDriver for GoDownloadDriver {
             "go.download: `version` is required"
         );
 
-        let mut inputs: Vec<Input> = Vec::new();
-        // Sorted so `HashMap` iteration order cannot reach the input list.
-        let mut groups: Vec<&String> = spec.deps.keys().collect();
-        groups.sort();
-        for group in groups {
-            let annotations = if group == crate::plugingo::addr_util::GO_SDK_DEP_GROUP {
-                BTreeMap::from([(
-                    hdriver_support::stage::READ_ONLY_ANNOTATION.to_string(),
-                    "true".to_string(),
-                )])
+        let mut inputs = crate::plugingo::deps::dep_inputs(&spec.deps, &pkg, |group, _| {
+            if group == crate::plugingo::addr_util::GO_SDK_DEP_GROUP {
+                DepShape::staged(&[hdriver_support::stage::READ_ONLY_ANNOTATION])
             } else {
-                BTreeMap::new()
-            };
-            for (i, addr) in spec.deps.get(group).into_iter().flatten().enumerate() {
-                inputs.push(Input {
-                    r#ref: TargetAddr::parse(addr, &pkg)
-                        .with_context(|| format!("parse dep addr {addr}"))?,
-                    mode: InputMode::Standard,
-                    origin_id: crate::plugingo::deps::dep_origin(group, i),
-                    annotations: annotations.clone(),
-                    hashed: true,
-                    runtime: true,
-                });
+                DepShape::staged(&[])
             }
-        }
+        })?;
 
         let (runner, runner_input) = crate::plugingo::runner::parse_runner_with_default(
             &spec.runner,
@@ -412,21 +380,14 @@ impl ManagedDriver for GoDownloadDriver {
 
         // The shared module cache: unhashed, because a warm and a cold cache hand
         // back the same bytes. See the exemption on `DOWNLOAD_ONLY_PASS_ENV`.
-        inputs.push(Input {
-            r#ref: TargetAddr {
+        inputs.push(hdriver_support::scratch::input(
+            TargetAddr {
                 r#ref: crate::plugingo::gocache::modcache_addr(),
                 output: None,
                 filters: vec![],
             },
-            mode: InputMode::Standard,
-            origin_id: format!("{}|0", hdriver_support::scratch::SCRATCH_ORIGIN_PREFIX),
-            annotations: BTreeMap::from([(
-                hdriver_support::scratch::SCRATCH_ANNOTATION.to_string(),
-                "true".to_string(),
-            )]),
-            hashed: false,
-            runtime: false,
-        });
+            0,
+        ));
 
         let def = GoDownloadDef {
             module: spec.module,
@@ -434,13 +395,8 @@ impl ManagedDriver for GoDownloadDriver {
             go_version: spec.go_version,
             runner,
         };
-        let hash = {
-            let mut h = DebugHasher::new(Xxh3Default::new(), || {
-                format!("go_download_{}", req.target_spec.addr.format())
-            });
-            def.hash(&mut h);
-            format!("{:x}", h.finish()).into_bytes()
-        };
+        let hash =
+            crate::plugingo::parse_util::def_hash("go_download", &req.target_spec.addr, &def);
 
         // The package is a literal directory in front of the pattern.
         let glob = hmodel::htpkg::join_rel_checked(
@@ -492,7 +448,21 @@ impl ManagedDriver for GoDownloadDriver {
         mut req: ManagedRunRequest<'a, 'io>,
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ManagedRunResponse> {
-        let res: anyhow::Result<ManagedRunResponse> = async {
+        let res = self.run_inner(&mut req, ctoken).await;
+        // `go mod download`'s output is captured, not streamed: see
+        // `echo_failure`.
+        echo_failure(&mut req, res).await
+    }
+}
+
+impl GoDownloadDriver {
+    /// Fetch the module into the scratch GOMODCACHE, then copy it into the
+    /// package's sandbox dir.
+    async fn run_inner(
+        &self,
+        req: &mut ManagedRunRequest<'_, '_>,
+        ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> anyhow::Result<()> {
         let def = req.request.target.def_de::<GoDownloadDef>();
         let mut log = ToolLog::new(&mut req.request);
         let runner =
@@ -508,17 +478,7 @@ impl ManagedDriver for GoDownloadDriver {
         )
         .await?;
 
-        let gomodcache = req
-            .request
-            .scratch
-            .iter()
-            .find(|m| m.env == "GOMODCACHE")
-            .map(|m| m.dir.clone())
-            .context(
-                "no GOMODCACHE scratch mount: the host resolves and locks one for every \
-                 target that references the shared cache, and `--no-scratch` supplies an \
-                 empty one rather than none",
-            )?;
+        let gomodcache = crate::plugingo::toolchain::scratch_dir(req, "GOMODCACHE")?;
 
         let env = download_env(def.runner.is_some(), &goroot, &gomodcache, |n| {
             std::env::var(n).ok()
@@ -554,15 +514,7 @@ impl ManagedDriver for GoDownloadDriver {
             )
         })?;
 
-        Ok(ManagedRunResponse { artifacts: vec![] })
-        }
-        .await;
-        // `go mod download`'s output is captured, not streamed: see
-        // `echo_failure_log`.
-        if let Err(e) = &res {
-            hdriver_support::driver_managed::echo_failure_log(&mut req.request, e).await;
-        }
-        res
+        Ok(())
     }
 }
 

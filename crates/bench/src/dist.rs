@@ -333,13 +333,8 @@ fn write_dist_codegen_config(dist: &Dist, corpus: &Path) -> Result<()> {
 /// (recorded, not pending) for every corpus output: the state every
 /// candidate `codegen-glob-cold`/`-warm` rep must time its lookups against.
 /// Run before each such rep, outside the timed region.
-pub fn check_populated_index(
-    dist_dir: &Path,
-    corpus: &Path,
-    manifest: &CorpusManifest,
-) -> Result<()> {
-    let dist = Dist::locate(dist_dir)?;
-    write_dist_codegen_config(&dist, corpus)?;
+pub fn check_populated_index(dist: &Dist, corpus: &Path, manifest: &CorpusManifest) -> Result<()> {
+    write_dist_codegen_config(dist, corpus)?;
     let home = cache_dir(corpus)?;
     check_index_rows(corpus, &home, manifest.codegen_outputs.len())
 }
@@ -373,9 +368,8 @@ fn check_index_rows(corpus: &Path, home: &Path, expected: usize) -> Result<()> {
 
 /// Codegen scenarios' prepare: a wiped home and one full build of every
 /// `copy` target, which writes the files back and records (N-1: stamps) them.
-fn prepare_codegen(dist: &Dist, corpus: &Path) -> Result<()> {
+fn prepare_codegen(dist: &Dist, corpus: &Path, manifest: &CorpusManifest) -> Result<()> {
     write_dist_codegen_config(dist, corpus)?;
-    let manifest = bench_corpus::load_manifest(corpus).context("load corpus manifest")?;
     if manifest.codegen_addrs.is_empty() {
         bail!("corpus has no copy targets (generate with --codegen-files > 0)");
     }
@@ -410,14 +404,18 @@ fn measure_codegen(
 /// `corpus` must already be absolute (canonicalize before calling — see
 /// `write_go_config`'s comment on why a relative path breaks once `heph`
 /// runs with `current_dir(corpus)`).
-pub fn prepare(dist_dir: &Path, corpus: &Path, scenario: Scenario) -> Result<()> {
-    let dist = Dist::locate(dist_dir)?;
+pub fn prepare(
+    dist: &Dist,
+    corpus: &Path,
+    manifest: &CorpusManifest,
+    scenario: Scenario,
+) -> Result<()> {
     if scenario.is_codegen() {
-        return prepare_codegen(&dist, corpus);
+        return prepare_codegen(dist, corpus, manifest);
     }
-    write_go_config(corpus, &dist)?;
+    write_go_config(corpus, dist)?;
     wipe_cache(corpus)?;
-    build_go_tree(&dist, corpus)?;
+    build_go_tree(dist, corpus)?;
     Ok(())
 }
 
@@ -426,22 +424,21 @@ pub fn prepare(dist_dir: &Path, corpus: &Path, scenario: Scenario) -> Result<()>
 /// same corpus, or every call mutates the same files again. `corpus` must
 /// already be absolute, same as `prepare`.
 pub fn measure_once(
-    dist_dir: &Path,
+    dist: &Dist,
     corpus: &Path,
     manifest: &CorpusManifest,
     scenario: Scenario,
     mutate_seed: u64,
 ) -> Result<f64> {
     if scenario.is_codegen() {
-        return measure_codegen(&Dist::locate(dist_dir)?, corpus, manifest, scenario);
+        return measure_codegen(dist, corpus, manifest, scenario);
     }
     if manifest.go_package_count == 0 {
         bail!(
             "corpus has no go/ subtree (generate with --go-packages > 0) — nothing for Tier B to build"
         );
     }
-    let dist = Dist::locate(dist_dir)?;
-    write_go_config(corpus, &dist)?;
+    write_go_config(corpus, dist)?;
 
     if let Scenario::Cold = scenario {
         wipe_cache(corpus)?;
@@ -453,7 +450,7 @@ pub fn measure_once(
         bench_corpus::incrementalize_go(&corpus.join("go"), 0.01, 0xDEC1 ^ mutate_seed)
             .context("mutate go corpus for incremental scenario")?;
     }
-    build_go_tree(&dist, corpus)
+    build_go_tree(dist, corpus)
 }
 
 #[cfg(test)]

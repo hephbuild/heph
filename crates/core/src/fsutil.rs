@@ -82,13 +82,40 @@ pub fn close_ensure_ro_fd(file: fs::File, path: &Path) -> anyhow::Result<()> {
 /// chmod, then drain writable descriptors via [`close_ensure_ro_fd`] — and the
 /// last step is the one that gets forgotten, which is exactly how the `ETXTBSY`
 /// flake this guards against was introduced. Callers that stream rather than
-/// buffer (`unpack`) call the barrier directly; everyone else should use this.
+/// buffer (`unpack`) call the barrier directly; everyone else should use this
+/// or [`write_executable_with`].
 pub fn write_executable(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     use std::io::Write as _;
 
     let mut file = fs::File::create(path).with_context(|| format!("create {:?}", path))?;
     file.write_all(bytes)
         .with_context(|| format!("write {} bytes to {:?}", bytes.len(), path))?;
+    finish_executable(file, path)
+}
+
+/// [`write_executable`] for content that is streamed rather than held in
+/// memory: `write` fills the file through a buffered writer, then the file is
+/// flushed, made executable and closed through the same barrier.
+///
+/// When `write` fails, the partly written file is left at `path`, not
+/// executable; the caller decides whether to remove it.
+pub fn write_executable_with(
+    path: &Path,
+    write: impl FnOnce(&mut (dyn io::Write + Send)) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let file = fs::File::create(path).with_context(|| format!("create {:?}", path))?;
+    let mut buf = io::BufWriter::with_capacity(256 * 1024, file);
+    write(&mut buf)?;
+    let file = buf
+        .into_inner()
+        .map_err(io::IntoInnerError::into_error)
+        .with_context(|| format!("flush {:?}", path))?;
+    finish_executable(file, path)
+}
+
+/// The tail both writers share: chmod the written `file`, then drain its
+/// writable descriptors.
+fn finish_executable(file: fs::File, path: &Path) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -98,6 +125,40 @@ pub fn write_executable(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
             .with_context(|| format!("chmod +x {:?}", path))?;
     }
     close_ensure_ro_fd(file, path)
+}
+
+/// An exclusive, advisory, cross-process lock (`flock(2)`) on a file, taken by
+/// [`lock_file_exclusive`] and released on drop.
+#[derive(Debug)]
+pub struct FileLock {
+    file: fs::File,
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        // Unlock explicitly rather than leave it to the close: a forked child
+        // still holding an inherited copy of the fd would otherwise keep the
+        // lock until it reaches `execve`.
+        drop(self.file.unlock());
+    }
+}
+
+/// Open (creating it if needed) the lock file at `path` and take an exclusive
+/// lock on it, blocking until any other holder releases it. Advisory, and tied
+/// to the open file description.
+///
+/// No timeout: callers hold it for a download, and a waiter should wait for
+/// that download rather than start its own.
+pub fn lock_file_exclusive(path: &Path) -> anyhow::Result<FileLock> {
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("open lock file {}", path.display()))?;
+    file.lock()
+        .with_context(|| format!("flock LOCK_EX on {}", path.display()))?;
+    Ok(FileLock { file })
 }
 
 /// `remove_dir_all` that recovers from `PermissionDenied`. Read-only dirs
@@ -429,6 +490,92 @@ mod tests {
 
         let out = Command::new(&script).output().expect("exec");
         assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+    }
+
+    /// Content streamed in many small writes, larger than the writer's
+    /// buffer, lands whole and the file runs.
+    #[test]
+    fn write_executable_with_streams_a_runnable_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("tool");
+        // A comment line longer than the 256 KiB buffer, so the flush and
+        // the writes that bypass the buffer are both exercised.
+        let filler = vec![b'#'; 300 * 1024];
+
+        write_executable_with(&script, |w| {
+            w.write_all(b"#!/bin/sh\n")?;
+            for chunk in filler.chunks(1000) {
+                w.write_all(chunk)?;
+            }
+            w.write_all(b"\necho ok\n")?;
+            Ok(())
+        })
+        .expect("write_executable_with");
+
+        let mode = fs::metadata(&script).expect("stat").permissions().mode();
+        assert_eq!(mode & 0o111, 0o111, "must be executable, mode={mode:o}");
+        assert_eq!(
+            fs::metadata(&script).expect("stat").len(),
+            (10 + filler.len() + 9) as u64
+        );
+        let out = Command::new(&script).output().expect("exec");
+        assert!(out.status.success(), "exec failed: {out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+    }
+
+    /// A failing writer's error is returned as is, and the partial file is
+    /// left behind without the exec bit.
+    #[test]
+    fn write_executable_with_returns_the_writers_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("tool");
+
+        let err = write_executable_with(&script, |w| {
+            w.write_all(b"#!/bin/sh\n")?;
+            anyhow::bail!("download interrupted")
+        })
+        .expect_err("the writer failed");
+
+        assert_eq!(format!("{err:#}"), "download interrupted");
+        let mode = fs::metadata(&script).expect("stat").permissions().mode();
+        assert_eq!(mode & 0o111, 0, "a failed write must not be executable");
+    }
+
+    /// A second `lock_file_exclusive` on the same path blocks while the first
+    /// guard lives, and takes the lock once it is dropped.
+    #[test]
+    fn lock_file_exclusive_blocks_until_the_holder_drops() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("download.lock");
+
+        let held = lock_file_exclusive(&path).expect("first lock");
+        let (tx, rx) = mpsc::channel();
+        let waiter = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let lock = lock_file_exclusive(&path).expect("second lock");
+                tx.send(()).expect("send");
+                lock
+            }
+        });
+
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "the second lock must wait for the first"
+        );
+        drop(held);
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("the second lock is taken once the first is dropped");
+        let second = waiter.join().expect("waiter");
+
+        // While the second guard lives, an independent fd cannot lock it.
+        let probe = fs::File::open(&path).expect("open probe");
+        assert!(
+            matches!(probe.try_lock(), Err(fs::TryLockError::WouldBlock)),
+            "the second guard holds the lock"
+        );
+        drop(second);
+        probe.try_lock().expect("released on drop");
     }
 
     /// The barrier must fail loudly, naming the step, if the file it is asked to

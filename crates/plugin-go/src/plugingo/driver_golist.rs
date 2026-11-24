@@ -1,28 +1,27 @@
+use crate::plugingo::deps::DepShape;
 use crate::plugingo::module_fetch::{add_fetch_env, is_settled_package_error};
+use crate::plugingo::parse_util::{def_hash, pkg_outputs};
 use crate::plugingo::pkg_analysis::{
     GoPackage, encode_go_package, encode_package_addrs, resolve_package_addrs,
 };
-use crate::plugingo::tool_log::ToolLog;
+use crate::plugingo::tool_log::{ProcessGroup, ToolLog, run_captured};
 use anyhow::Context;
 use async_trait::async_trait;
-use hcore::debug_hash::DebugHasher;
 use hcore::hasync::Cancellable;
 use hcore::htvalue::signature::ParamType;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
 use hdriver_support::run_log::Streams;
-use hplugin::driver::targetdef::path::{CodegenMode, Content, Path};
-use hplugin::driver::targetdef::{CacheConfig, Input, InputMode, Output, TargetDef};
+use hplugin::driver::targetdef::path::CodegenMode;
+use hplugin::driver::targetdef::{CacheConfig, Input, TargetDef};
 use hplugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
     ParseResponse, TargetAddr,
 };
 use hplugin::htspec::Spec;
-use hproc::proc_exec;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use xxhash_rust::xxh3::Xxh3Default;
 
 /// The `-json=` field selection every `go list` in this plugin asks for. Named
 /// rather than inlined so the shape stays in one place: the field set is part of
@@ -138,7 +137,6 @@ struct GoGolistDef {
     /// See [`GoGolistSpec::race`].
     race: bool,
     with_test: bool,
-    dep_inputs: Vec<Input>,
     /// For thirdparty packages: the `download` target whose filtered outputs
     /// will be staged into consumers' sandboxes. Threaded through so
     /// `resolve_package_addrs` emits download-filter refs instead of pluginfs
@@ -181,31 +179,14 @@ fn golist_env(
     gocache: &std::path::Path,
     host: impl Fn(&str) -> Option<String>,
 ) -> HashMap<String, String> {
-    let mut env: HashMap<String, String> = HashMap::new();
-    env.insert("GOOS".to_string(), def.goos.clone());
-    env.insert("GOARCH".to_string(), def.goarch.clone());
-    env.insert("GOROOT".to_string(), goroot.to_string_lossy().into_owned());
-    env.insert(
-        "GOCACHE".to_string(),
-        gocache.to_string_lossy().into_owned(),
+    let mut env = crate::plugingo::toolchain::go_tool_env(
+        &def.goos,
+        &def.goarch,
+        def.race,
+        &def.goexperiment,
+        goroot,
+        gocache,
     );
-    // Pin the toolchain to the staged SDK and ignore any workspace go.work so
-    // resolution is reproducible regardless of host config.
-    env.insert("GOTOOLCHAIN".to_string(), "local".to_string());
-    env.insert("GOWORK".to_string(), "off".to_string());
-    // Pin CGO_ENABLED rather than letting Go autodetect it: autodetection is
-    // PATH-dependent and drifts across hosts — e.g. an Ubuntu host with gcc on
-    // PATH pulls runtime/cgo in here but later link steps run without it,
-    // breaking importcfg. The value must match what the compile/link sandboxes
-    // use, which is `0` for every ordinary build and `1` only for a race build
-    // off darwin (see `factors::cgo_required`).
-    env.insert(
-        "CGO_ENABLED".to_string(),
-        crate::plugingo::factors::cgo_enabled_value(&def.goos, def.race).to_string(),
-    );
-    if !def.goexperiment.is_empty() {
-        env.insert("GOEXPERIMENT".to_string(), def.goexperiment.join(","));
-    }
     add_fetch_env(&mut env, &host);
     for name in GOLIST_ONLY_PASS_ENV {
         if let Some(v) = host(name) {
@@ -253,28 +234,39 @@ fn golist_env(
 /// list unless it only answers "where do the bytes come from".
 const GOLIST_ONLY_PASS_ENV: &[&str] = &["GOMODCACHE"];
 
-impl Hash for GoGolistDef {
+/// What a `_golist` def hash covers: the def, plus the dep inputs `parse`
+/// declared. The inputs are hashed here rather than kept on the def, which
+/// `run` reads and never needs them.
+struct GolistDefHash<'a> {
+    def: &'a GoGolistDef,
+    dep_inputs: &'a [Input],
+}
+
+impl Hash for GolistDefHash<'_> {
     fn hash<H: Hasher>(&self, state: &mut H) {
+        let Self { def, dep_inputs } = self;
         GO_GOLIST_FORMAT_VERSION.hash(state);
-        self.import_path.hash(state);
-        self.goos.hash(state);
-        self.goarch.hash(state);
-        self.go_version.hash(state);
-        self.build_tags.hash(state);
-        self.goexperiment.hash(state);
+        def.import_path.hash(state);
+        def.goos.hash(state);
+        def.goarch.hash(state);
+        def.go_version.hash(state);
+        def.build_tags.hash(state);
+        def.goexperiment.hash(state);
         // Hashed only when set, so introducing race mode left every ordinary
         // `_golist` def hash — and therefore every cached listing — untouched.
         // The marker is a distinct string, so it cannot alias a neighbouring
         // field's contribution.
-        if self.race {
+        if def.race {
             "race".hash(state);
         }
         // Flips the `go list` command line, and with it which fields come back
         // populated — so it must key the cache.
-        self.with_test.hash(state);
-        self.dep_inputs.hash(state);
-        self.thirdparty_download_addr.hash(state);
-        self.firstparty.hash(state);
+        def.with_test.hash(state);
+        // A slice hashes exactly as the `Vec` the def used to hold did (length
+        // prefix, then each element), so the def hash did not move.
+        dep_inputs.hash(state);
+        def.thirdparty_download_addr.hash(state);
+        def.firstparty.hash(state);
         // The hermetic SDK arrives via dep_inputs (group `gosdk`); the engine
         // hashes its content, so no separate goroot/go_bin field is hashed here.
     }
@@ -298,47 +290,23 @@ impl ManagedDriver for GoGolistDriver {
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ParseResponse> {
         let pkg = req.target_spec.addr.package.clone();
-        let pkg_str = pkg.as_str();
 
         let spec = GoGolistSpec::from(&req.target_spec.config).context("parse go_golist config")?;
 
-        // Parse deps (srcfiles, modfiles) — no go_bin here
-        let dep_strings = spec.deps;
-
-        let mut dep_groups: Vec<&String> = dep_strings.keys().collect();
-        dep_groups.sort();
-        let mut dep_inputs: Vec<Input> = Vec::new();
-        for group in dep_groups {
-            let addrs = dep_strings.get(group).expect("group key from same map");
-            // The hermetic SDK (group `gosdk`) is read-only and identical across
-            // every golist target — stage it once and hardlink it into each
-            // sandbox instead of byte-copying the whole tree (incl. ~150 MB of
-            // std `src/`) per package. Source deps keep the source-map
-            // annotation so golist can map codegen output back to its target.
-            let is_sdk = group.as_str() == crate::plugingo::addr_util::GO_SDK_DEP_GROUP;
-            let annotations = if is_sdk {
-                std::collections::BTreeMap::from([(
-                    hdriver_support::stage::READ_ONLY_ANNOTATION.to_string(),
-                    "true".to_string(),
-                )])
+        // Parse deps (srcfiles, modfiles) — no go_bin here.
+        //
+        // The hermetic SDK (group `gosdk`) is read-only and identical across
+        // every golist target — stage it once and hardlink it into each sandbox
+        // instead of byte-copying the whole tree (incl. ~150 MB of std `src/`)
+        // per package. Source deps keep the source-map annotation so golist can
+        // map codegen output back to its target.
+        let mut dep_inputs = crate::plugingo::deps::dep_inputs(&spec.deps, &pkg, |group, _| {
+            DepShape::staged(&[if group == crate::plugingo::addr_util::GO_SDK_DEP_GROUP {
+                hdriver_support::stage::READ_ONLY_ANNOTATION
             } else {
-                std::collections::BTreeMap::from([(
-                    hdriver_support::driver_managed::SOURCE_MAP_ANNOTATION.to_string(),
-                    "true".to_string(),
-                )])
-            };
-            for (i, addr_str) in addrs.iter().enumerate() {
-                dep_inputs.push(Input {
-                    r#ref: TargetAddr::parse(addr_str, &pkg)
-                        .with_context(|| format!("parse dep addr {addr_str}"))?,
-                    mode: InputMode::Standard,
-                    origin_id: crate::plugingo::deps::dep_origin(group, i),
-                    annotations: annotations.clone(),
-                    hashed: true,
-                    runtime: true,
-                });
-            }
-        }
+                hdriver_support::driver_managed::SOURCE_MAP_ANNOTATION
+            }])
+        })?;
 
         let (runner, runner_input) = super::runner::parse_runner_with_default(
             &spec.runner,
@@ -363,21 +331,14 @@ impl ManagedDriver for GoGolistDriver {
             goarch: spec.goarch.clone(),
             variant: spec.go_variant.clone(),
         };
-        let gocache_input = Input {
-            r#ref: TargetAddr {
+        let gocache_input = hdriver_support::scratch::input(
+            TargetAddr {
                 r#ref: gocache_key.addr(),
                 output: None,
                 filters: vec![],
             },
-            mode: InputMode::Standard,
-            origin_id: format!("{}|0", hdriver_support::scratch::SCRATCH_ORIGIN_PREFIX),
-            annotations: std::collections::BTreeMap::from([(
-                hdriver_support::scratch::SCRATCH_ANNOTATION.to_string(),
-                "true".to_string(),
-            )]),
-            hashed: false,
-            runtime: false,
-        };
+            0,
+        );
 
         let def = GoGolistDef {
             runner,
@@ -389,42 +350,19 @@ impl ManagedDriver for GoGolistDriver {
             goexperiment: spec.goexperiment,
             race: spec.race,
             with_test: spec.with_test,
-            dep_inputs: dep_inputs.clone(),
             thirdparty_download_addr: spec.thirdparty_download_addr,
             firstparty: spec.firstparty,
         };
 
-        let hash = {
-            let mut h = DebugHasher::new(Xxh3Default::new(), || {
-                format!("go_golist_{}", req.target_spec.addr.format())
-            });
-            def.hash(&mut h);
-            format!("{:x}", h.finish()).into_bytes()
-        };
-
-        // Parse outputs from spec, prepend package path
-        let outputs = spec
-            .out
-            .iter()
-            .map(|(group, paths)| Output {
-                group: group.clone(),
-                paths: paths
-                    .iter()
-                    .map(|p| {
-                        let full_path = if pkg_str.is_empty() {
-                            p.clone()
-                        } else {
-                            format!("{pkg_str}/{p}")
-                        };
-                        Path {
-                            content: Content::FilePath(full_path),
-                            codegen_tree: CodegenMode::None,
-                            collect: true,
-                        }
-                    })
-                    .collect(),
-            })
-            .collect();
+        let hash = def_hash(
+            "go_golist",
+            &req.target_spec.addr,
+            &GolistDefHash {
+                def: &def,
+                dep_inputs: &dep_inputs,
+            },
+        );
+        let outputs = pkg_outputs(pkg.as_str(), &spec.out, &CodegenMode::None);
 
         Ok(ParseResponse {
             target_def: TargetDef {
@@ -484,17 +422,7 @@ impl ManagedDriver for GoGolistDriver {
         // to write anyway — Go reads `~/.cache/go-build` when `GOCACHE` is unset,
         // so inventing a sandbox-local directory would be guessing at what the
         // host already decided.
-        let gocache = req
-            .request
-            .scratch
-            .iter()
-            .find(|m| m.env == "GOCACHE")
-            .map(|m| m.dir.clone())
-            .context(
-                "no GOCACHE scratch mount: the host resolves and locks one for every \
-                 target that references the shared cache, and `--no-scratch` supplies an \
-                 empty one rather than none",
-            )?;
+        let gocache = crate::plugingo::toolchain::scratch_dir(&req, "GOCACHE")?;
 
         let env = golist_env(def, &goroot, &gocache, |n| std::env::var(n).ok());
 
@@ -534,28 +462,16 @@ impl ManagedDriver for GoGolistDriver {
         }
 
         let args: Vec<OsString> = golist_args(def).iter().map(OsString::from).collect();
-        let env_pairs: Vec<(OsString, OsString)> = env
-            .iter()
-            .map(|(k, v)| (OsString::from(k), OsString::from(v)))
-            .collect();
 
-        // setsid=false: `go list` is single-process; the supervisor's
-        // direct-pid kill is sufficient on hard-shutdown.
-        let spec = proc_exec::Spec {
-            program: go_bin.clone(),
+        // `go list` is single-process; the supervisor's direct-pid kill is
+        // sufficient on hard-shutdown.
+        let output = run_captured(
+            &go_bin,
             args,
-            env: env_pairs,
-            cwd: req.sandbox_pkg_dir.clone(),
-            stdin: proc_exec::StdioSpec::Null,
-            stdout: proc_exec::StdioSpec::Piped,
-            stderr: proc_exec::StdioSpec::Piped,
-            setsid: false,
-            ctty: false,
-        };
-
-        let output = hexecrunner::output(
-            super::runner::runner_ref(req.request.request_id, def.runner.as_ref()),
-            spec,
+            &env,
+            &req.sandbox_pkg_dir,
+            ProcessGroup::Inherit,
+            runner,
             ctoken,
         )
         .await
@@ -736,7 +652,7 @@ fn has_go_file(dir: &std::path::Path) -> anyhow::Result<bool> {
 /// It is not free: it makes `go list` load the package a second time in its test
 /// configuration, pulling the test imports' own closure. Measured over 60 std
 /// packages listed one at a time against a *fresh shared* `GOCACHE` — i.e. what
-/// [`crate::plugingo::golist_gocache`] gives a cold run today — dropping `-test`
+/// [`crate::plugingo::gocache`] gives a cold run today — dropping `-test`
 /// took CPU from 3.72s to 2.58s (-31%) and wall from 1.89s to 1.69s (-11%).
 ///
 /// The gap used to be far wider: before the shared `GOCACHE`, every sandbox
@@ -804,6 +720,9 @@ mod tests {
     use super::*;
     use crate::plugingo::pkg_analysis::GoModule;
     use hmodel::htpkg::PkgBuf;
+    use hplugin::driver::targetdef::InputMode;
+    use hplugin::driver::targetdef::path::Content;
+    use xxhash_rust::xxh3::Xxh3Default;
 
     fn driver() -> GoGolistDriver {
         GoGolistDriver::new()
@@ -1504,7 +1423,6 @@ mod tests {
             goexperiment: vec![],
             race: false,
             with_test,
-            dep_inputs: vec![],
             thirdparty_download_addr: None,
             firstparty: true,
         }
@@ -1747,10 +1665,15 @@ mod tests {
     /// here means every cached listing is being thrown away.
     const NON_RACE_GOLIST_HASH: u64 = 12427067391495276547;
 
+    /// `def`'s def hash with no dep inputs.
     fn def_hash(def: &GoGolistDef) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = xxhash_rust::xxh3::Xxh3Default::new();
-        def.hash(&mut h);
+        GolistDefHash {
+            def,
+            dep_inputs: &[],
+        }
+        .hash(&mut h);
         h.finish()
     }
 
@@ -1766,14 +1689,9 @@ mod tests {
     /// identical defs must not share a cache entry.
     #[test]
     fn test_with_test_keys_the_def_hash() {
-        let h = |d: &GoGolistDef| {
-            let mut hasher = Xxh3Default::new();
-            d.hash(&mut hasher);
-            hasher.finish()
-        };
         assert_ne!(
-            h(&def_with(true, vec![])),
-            h(&def_with(false, vec![])),
+            def_hash(&def_with(true, vec![])),
+            def_hash(&def_with(false, vec![])),
             "-test must key the golist cache"
         );
     }

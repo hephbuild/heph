@@ -28,10 +28,7 @@ pub async fn run<A: App + 'static>(
         ));
     }
     // After `open`, so the process's own session is never named as a holder.
-    let holders = app
-        .lock_holders()
-        .or_else(|| slot.map(SessionSlot::holder_names))
-        .unwrap_or_default();
+    let holders = super::lock_holders(&app, slot);
     view.name_lock_holders(holders.clone());
     view.begin();
 
@@ -121,7 +118,7 @@ pub async fn run<A: App + 'static>(
             // `None` (the app's context gone) disables the arm.
             Some(reply) = printed_rx.recv() => {
                 if let Some(r) = events.as_mut() {
-                    while r.try_recv(|ev| view.apply(ev)).is_ok() {}
+                    r.drain(|ev| view.apply(ev));
                 }
                 // The app stopped waiting: nothing to tell.
                 drop(reply.send(view.failures_printed()));
@@ -132,7 +129,7 @@ pub async fn run<A: App + 'static>(
     // Drain any events buffered before the sender dropped so the final
     // summary is accurate even if the app future completed first.
     if let Some(r) = events.as_mut() {
-        while r.try_recv(|ev| view.apply(ev)).is_ok() {}
+        r.drain(|ev| view.apply(ev));
     }
 
     // A signal (INT, TERM, HUP) that reached the run before it ended stopped

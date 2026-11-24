@@ -1,10 +1,42 @@
-//! Path relationships, for deciding whether two declared paths collide.
+//! Path relationships, for deciding whether two declared paths collide, and
+//! [`lexical`] normalization.
 //!
 //! Pure string arithmetic over already-normalized, same-frame paths — it touches
 //! no filesystem and resolves no symlinks. Callers are responsible for putting
 //! both paths in the same frame first (both workspace-relative, or both
 //! absolute); comparing paths from different frames is a caller bug this cannot
 //! detect.
+
+use std::path::{Component, Path, PathBuf};
+
+/// `p` with `.` and `..` resolved as text, as git does: no filesystem access, so
+/// a path that does not exist yet works, and a symlink before a `..` is not
+/// followed.
+///
+/// A `..` pops the previous component. At the root it is dropped, so `/..` is
+/// `/`. A relative path keeps a `..` it has nothing to pop, so `../a` stays
+/// `../a` and `a/../../b` is `../b`: dropping it would name another path.
+pub fn lexical(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => match out.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                // `/..` is `/`.
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                // Empty, or already a leading `..`: nothing to pop.
+                Some(Component::ParentDir | Component::CurDir) | None => {
+                    out.push(Component::ParentDir);
+                }
+            },
+            other => out.push(other),
+        }
+    }
+    out
+}
 
 /// Components of a path, with the noise removed: empty segments (a leading `/`,
 /// a doubled `//`, a trailing `/`) and `.` segments, which name the same
@@ -99,5 +131,38 @@ mod tests {
         assert!(!paths_overlap("", "anything"));
         assert!(!paths_overlap("anything", ""));
         assert!(!paths_overlap("", ""));
+    }
+
+    #[test]
+    fn lexical_resolves_dot_and_dotdot_as_text() {
+        let l = |s: &str| lexical(Path::new(s));
+        assert_eq!(l("/w/a/./b"), Path::new("/w/a/b"));
+        assert_eq!(l("/w/a/../b"), Path::new("/w/b"));
+        assert_eq!(l("/w/a/b/../../c"), Path::new("/w/c"));
+        assert_eq!(l("a//b/"), Path::new("a/b"));
+        assert_eq!(l("a/b/.."), Path::new("a"));
+    }
+
+    /// `..` at the root is the root: `/..` is `/`, and a path cannot climb
+    /// above it however many `..` it has.
+    #[test]
+    fn lexical_cannot_climb_above_the_root() {
+        let l = |s: &str| lexical(Path::new(s));
+        assert_eq!(l("/.."), Path::new("/"));
+        assert_eq!(l("/w/../../../x"), Path::new("/x"));
+        assert_eq!(l("."), Path::new(""));
+    }
+
+    /// A relative path has no root to stop at: a `..` with nothing to pop is
+    /// kept, or the result would name a different path.
+    #[test]
+    fn lexical_keeps_a_relative_paths_leading_dotdot() {
+        let l = |s: &str| lexical(Path::new(s));
+        assert_eq!(l("../a"), Path::new("../a"));
+        assert_eq!(l(".."), Path::new(".."));
+        assert_eq!(l("../../a"), Path::new("../../a"));
+        assert_eq!(l("a/../../b"), Path::new("../b"));
+        assert_eq!(l("./../a/./b/.."), Path::new("../a"));
+        assert_eq!(l("../a/.."), Path::new(".."));
     }
 }

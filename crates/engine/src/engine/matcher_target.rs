@@ -83,12 +83,8 @@ pub fn match_target(m: &Matcher, spec: &TargetSpec, def: &TargetDef) -> MatchRes
                 MatchResult::MatchNo
             }
         }
-        Matcher::Addr(addr) => {
-            if def.addr == *addr {
-                MatchResult::MatchYes
-            } else {
-                MatchResult::MatchNo
-            }
+        Matcher::Addr(_) | Matcher::Package(_) | Matcher::PackagePrefix(_) => {
+            m.matches_addr(&def.addr)
         }
         Matcher::Label(label) => {
             if def.labels.contains(label) {
@@ -144,55 +140,13 @@ pub fn match_target(m: &Matcher, spec: &TargetSpec, def: &TargetDef) -> MatchRes
             }
             MatchResult::MatchNo
         }
-        Matcher::Package(pkg) => {
-            if def.addr.package == *pkg {
-                MatchResult::MatchYes
-            } else {
-                MatchResult::MatchNo
-            }
-        }
-        Matcher::PackagePrefix(prefix) => {
-            if def.addr.package.has_prefix(prefix) {
-                MatchResult::MatchYes
-            } else {
-                MatchResult::MatchNo
-            }
-        }
         Matcher::Or(matchers) => {
-            let mut has_shrug = false;
-            for m in matchers {
-                match match_target(m, spec, def) {
-                    MatchResult::MatchYes => return MatchResult::MatchYes,
-                    MatchResult::MatchShrug => has_shrug = true,
-                    MatchResult::MatchNo => {}
-                }
-            }
-            if has_shrug {
-                MatchResult::MatchShrug
-            } else {
-                MatchResult::MatchNo
-            }
+            MatchResult::any(matchers.iter().map(|m| match_target(m, spec, def)))
         }
         Matcher::And(matchers) => {
-            let mut has_shrug = false;
-            for m in matchers {
-                match match_target(m, spec, def) {
-                    MatchResult::MatchNo => return MatchResult::MatchNo,
-                    MatchResult::MatchShrug => has_shrug = true,
-                    MatchResult::MatchYes => {}
-                }
-            }
-            if has_shrug {
-                MatchResult::MatchShrug
-            } else {
-                MatchResult::MatchYes
-            }
+            MatchResult::all(matchers.iter().map(|m| match_target(m, spec, def)))
         }
-        Matcher::Not(m) => match match_target(m, spec, def) {
-            MatchResult::MatchYes => MatchResult::MatchNo,
-            MatchResult::MatchNo => MatchResult::MatchYes,
-            MatchResult::MatchShrug => MatchResult::MatchShrug,
-        },
+        Matcher::Not(m) => match_target(m, spec, def).negate(),
     }
 }
 

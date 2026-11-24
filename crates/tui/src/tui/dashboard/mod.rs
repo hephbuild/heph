@@ -13,6 +13,7 @@
 
 pub mod approval;
 mod bucket;
+pub(crate) mod chrome;
 pub mod detail;
 pub mod feed;
 pub mod frame;

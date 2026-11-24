@@ -9,10 +9,11 @@ workspace = true
 [dependencies]
 anyhow = "1.0.104"
 hconfig = { package = "config", path = "../config" }
-glob = "0.3"
 wax = "0.7"
 borsh = { version = "1.8.1", features = ["derive"] }
-# Held at the release r2d2_sqlite is built against (see the root Cargo.toml).
+# Held at the release r2d2_sqlite is built against: a newer rusqlite is a
+# second copy whose `Connection`/`Params` don't unify with the pool's. Every
+# other manifest that declares rusqlite points here.
 rusqlite = { version = "0.42", features = ["bundled", "blob"] }
 r2d2 = "0.8"
 r2d2_sqlite = "0.37"

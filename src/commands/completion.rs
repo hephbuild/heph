@@ -131,12 +131,7 @@ async fn addr_candidates(
 /// List every package the providers know about (single cached filesystem walk).
 async fn all_packages(engine: &Arc<Engine>, rs: &Arc<RequestState>) -> anyhow::Result<Vec<String>> {
     let m = Matcher::PackagePrefix(PkgBuf::from(""));
-    let it = engine.packages(&m, rs).await?;
-    let mut v = Vec::new();
-    for p in it {
-        v.push(p?);
-    }
-    Ok(v)
+    engine.packages(&m, rs).await
 }
 
 /// Render absolute package `p` as the relative path string that resolves back

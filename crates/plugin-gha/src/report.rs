@@ -13,7 +13,7 @@
 //! - **The embedded JSON** is a *different, hard-capped* document for an agent
 //!   that can only fetch the comment through the API. See [`EMBED_MAX`].
 
-use crate::render::fmt_duration;
+use crate::render::{fmt_duration, truncate_chars};
 use crate::tally::{Counters, RootFailure, Tally};
 
 /// Schema identifier. Field names never change within a version.
@@ -40,18 +40,6 @@ const EMBED_ADDR_MAX: usize = 128;
 /// The marker wrapping the embedded document.
 pub(crate) const EMBED_OPEN: &str = "<!-- heph:json ";
 pub(crate) const EMBED_CLOSE: &str = " -->";
-
-fn truncate_chars(s: &str, max: usize) -> String {
-    let mut out = String::new();
-    for (i, c) in s.chars().enumerate() {
-        if i >= max {
-            out.push('…');
-            return out;
-        }
-        out.push(c);
-    }
-    out
-}
 
 fn status_str(t: &Tally, c: &Counters) -> &'static str {
     if c.roots_total > 0 {

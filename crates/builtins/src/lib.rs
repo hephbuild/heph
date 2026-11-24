@@ -20,6 +20,7 @@ pub mod pluginscratch;
 pub mod pluginstatictarget;
 pub mod plugintemplate;
 pub mod plugintextfile;
+mod raw_file;
 
 // The `htspec` derive macros expand to code referencing `crate::htvalue` and
 // `crate::htspec`; alias them here so those expansions resolve in this crate,

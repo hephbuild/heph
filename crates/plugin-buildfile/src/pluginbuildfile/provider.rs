@@ -132,8 +132,6 @@ pub fn build_files_in_dir(dir: &Path, patterns: &[glob::Pattern]) -> Vec<PathBuf
     paths
 }
 
-pub struct RequestState {}
-
 pub struct Provider {
     pub root: std::path::PathBuf,
     pub build_file_patterns: Vec<glob::Pattern>,
@@ -144,7 +142,6 @@ pub struct Provider {
     /// Set via the `defaultDriver` provider option. `None` means a target with no
     /// driver is an error.
     pub default_driver: Option<String>,
-    pub requests: Mutex<HashMap<String, RequestState>>,
     /// Cache: pkg name → parsed BUILD file result. Avoids re-parsing the Starlark
     /// AST on every `list`/`get`/`probe` call for the same package (3+ calls per
     /// pkg in a typical run), and dedupes concurrent in-flight parses on the same
@@ -224,7 +221,6 @@ impl Provider {
             build_file_patterns: default_build_file_patterns(),
             skip: Arc::new(Ignore::default()),
             default_driver: None,
-            requests: Mutex::new(HashMap::new()),
             pkg_cache,
             packages: OnceLock::new(),
             file_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -625,8 +621,6 @@ fn find_packages_sync(
 
     Ok(())
 }
-
-impl Provider {}
 
 impl EProvider for Provider {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {

@@ -36,7 +36,6 @@
 use crate::plugingo::factors::{current_goarch, current_goos};
 use anyhow::Context;
 use async_trait::async_trait;
-use hcore::debug_hash::DebugHasher;
 use hcore::hasync::Cancellable;
 use hcore::htvalue::Value;
 use hdriver_support::driver_managed::{
@@ -55,7 +54,6 @@ use hplugin::provider::TargetSpec;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use xxhash_rust::xxh3::Xxh3Default;
 
 /// A convenient pinned Go release for tests and as a documented example. The
 /// provider requires the toolchain to be chosen explicitly (`gotool` option),
@@ -268,6 +266,70 @@ impl HostGoCache {
     }
 }
 
+/// The directory of the scratch mount the host resolved and locked for `env`
+/// (`GOCACHE`, `GOMODCACHE`). Always present for a target that references the
+/// scratch: `--no-scratch` supplies an empty mount rather than none, so there is
+/// nothing to fall back to and nothing to guess.
+pub(crate) fn scratch_dir(
+    req: &ManagedRunRequest<'_, '_>,
+    env: &str,
+) -> anyhow::Result<std::path::PathBuf> {
+    req.request
+        .scratch
+        .iter()
+        .find(|m| m.env == env)
+        .map(|m| m.dir.clone())
+        .with_context(|| {
+            format!(
+                "no {env} scratch mount: the host resolves and locks one for every \
+                 target that references the shared cache, and `--no-scratch` supplies an \
+                 empty one rather than none"
+            )
+        })
+}
+
+/// The base environment `go list` and `go tool compile` run under: the target
+/// platform, the staged `GOROOT`, the shared `GOCACHE`, and the build config
+/// pinned so it is the same in every sandbox. Each caller adds its own `PATH`
+/// rule (and `go list` its fetch environment).
+///
+/// - `GOTOOLCHAIN=local` and `GOWORK=off` pin the toolchain to the staged SDK
+///   and ignore any workspace `go.work`, whatever the host config.
+/// - `CGO_ENABLED` is pinned rather than autodetected: autodetection is
+///   `PATH`-dependent and drifts across hosts (an Ubuntu host with gcc on `PATH`
+///   pulls `runtime/cgo` into the listing, but later link steps run without it,
+///   breaking importcfg). It is `0` for every ordinary build and `1` only for a
+///   race build off darwin ([`crate::plugingo::factors::cgo_required`]), the
+///   same in the golist, compile and link sandboxes.
+/// - `GOEXPERIMENT` only when the variant sets one.
+pub(crate) fn go_tool_env(
+    goos: &str,
+    goarch: &str,
+    race: bool,
+    goexperiment: &[String],
+    goroot: &std::path::Path,
+    gocache: &std::path::Path,
+) -> HashMap<String, String> {
+    let mut env: HashMap<String, String> = HashMap::new();
+    env.insert("GOOS".to_string(), goos.to_string());
+    env.insert("GOARCH".to_string(), goarch.to_string());
+    env.insert("GOROOT".to_string(), goroot.to_string_lossy().into_owned());
+    env.insert(
+        "GOCACHE".to_string(),
+        gocache.to_string_lossy().into_owned(),
+    );
+    env.insert("GOTOOLCHAIN".to_string(), "local".to_string());
+    env.insert("GOWORK".to_string(), "off".to_string());
+    env.insert(
+        "CGO_ENABLED".to_string(),
+        crate::plugingo::factors::cgo_enabled_value(goos, race).to_string(),
+    );
+    if !goexperiment.is_empty() {
+        env.insert("GOEXPERIMENT".to_string(), goexperiment.join(","));
+    }
+    env
+}
+
 /// Ask the environment where its Go lives. See [`HostGoCache`].
 async fn probe_host_go(
     runner: hexecrunner::RunnerRef<'_>,
@@ -283,19 +345,7 @@ async fn probe_host_go(
         return Ok((goroot, go_bin));
     }
 
-    let spec = hproc::proc_exec::Spec {
-        // Bare name on purpose: the runner's `PATH` is what must resolve it, and
-        // it is the same `PATH` that the `go` answering below is found on.
-        program: std::path::PathBuf::from("go"),
-        args: vec!["env".into(), "GOROOT".into()],
-        env: vec![],
-        cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/")),
-        stdin: hproc::proc_exec::StdioSpec::Null,
-        stdout: hproc::proc_exec::StdioSpec::Piped,
-        stderr: hproc::proc_exec::StdioSpec::Piped,
-        setsid: false,
-        ctty: false,
-    };
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
     // Name the runner in the failure. Under a runner the program that failed to
     // exec is the runner's, not `go` — a bare `No such file or directory` here
     // reads as "no Go toolchain" when it can equally mean the runner's own
@@ -304,9 +354,19 @@ async fn probe_host_go(
         .addr
         .map(|a| format!(" (via exec runner {})", a.format()))
         .unwrap_or_default();
-    let out = hexecrunner::output(runner, spec, ctoken)
-        .await
-        .with_context(|| format!("{driver}: run `go env GOROOT`{via}"))?;
+    let out = crate::plugingo::tool_log::run_captured(
+        // Bare name on purpose: the runner's `PATH` is what must resolve it, and
+        // it is the same `PATH` that the `go` answering below is found on.
+        std::path::Path::new("go"),
+        vec!["env".into(), "GOROOT".into()],
+        &HashMap::new(),
+        &cwd,
+        crate::plugingo::tool_log::ProcessGroup::Inherit,
+        runner,
+        ctoken,
+    )
+    .await
+    .with_context(|| format!("{driver}: run `go env GOROOT`{via}"))?;
     if !out.status.success() {
         anyhow::bail!(
             "{driver}: `go env GOROOT` failed in the runner's environment: {}\n  \
@@ -582,13 +642,8 @@ impl ManagedDriver for GoToolchainDriver {
             sha256: spec.sha256,
         };
 
-        let hash = {
-            let mut h = DebugHasher::new(Xxh3Default::new(), || {
-                format!("go_toolchain_{}", req.target_spec.addr.format())
-            });
-            def.hash(&mut h);
-            format!("{:x}", h.finish()).into_bytes()
-        };
+        let hash =
+            crate::plugingo::parse_util::def_hash("go_toolchain", &req.target_spec.addr, &def);
 
         // Output paths are workspace-relative: prepend the owning package, and
         // classify a trailing-slash entry as a directory tree (the SDK root).
@@ -600,11 +655,7 @@ impl ManagedDriver for GoToolchainDriver {
                 paths: paths
                     .iter()
                     .map(|p| {
-                        let full = if pkg_str.is_empty() {
-                            p.clone()
-                        } else {
-                            format!("{pkg_str}/{p}")
-                        };
+                        let full = crate::plugingo::parse_util::pkg_path(pkg_str, p);
                         let content = if let Some(dir) = full.strip_suffix('/') {
                             Content::DirPath(dir.to_string())
                         } else {
@@ -1290,5 +1341,53 @@ mod tests {
             "nothing may be unpacked from an unverified tarball"
         );
         assert!(!tarball.exists(), "the tarball must be removed");
+    }
+
+    /// The base env `go list` and `go tool compile` share: exactly these keys,
+    /// with `CGO_ENABLED` pinned per platform and race, and no host `PATH`.
+    #[test]
+    fn go_tool_env_is_the_pinned_base() {
+        let env = |goos: &str, race: bool, goexperiment: &[String]| {
+            let mut kv: Vec<(String, String)> = go_tool_env(
+                goos,
+                "amd64",
+                race,
+                goexperiment,
+                std::path::Path::new("/goroot"),
+                std::path::Path::new("/gocache"),
+            )
+            .into_iter()
+            .collect();
+            kv.sort();
+            kv
+        };
+        let pairs = |kv: &[(&str, &str)]| -> Vec<(String, String)> {
+            kv.iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        assert_eq!(
+            env("linux", false, &[]),
+            pairs(&[
+                ("CGO_ENABLED", "0"),
+                ("GOARCH", "amd64"),
+                ("GOCACHE", "/gocache"),
+                ("GOOS", "linux"),
+                ("GOROOT", "/goroot"),
+                ("GOTOOLCHAIN", "local"),
+                ("GOWORK", "off"),
+            ])
+        );
+        let racy = env(
+            "linux",
+            true,
+            &["loopvar".to_string(), "rangefunc".to_string()],
+        );
+        assert!(racy.contains(&("CGO_ENABLED".to_string(), "1".to_string())));
+        assert!(racy.contains(&("GOEXPERIMENT".to_string(), "loopvar,rangefunc".to_string())));
+        assert!(
+            env("darwin", true, &[]).contains(&("CGO_ENABLED".to_string(), "0".to_string())),
+            "a darwin race build does not need cgo"
+        );
     }
 }

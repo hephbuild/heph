@@ -8,13 +8,10 @@ use std::sync::Arc;
 
 use hplugin::hook::Hook;
 use hplugin_gha::GhaHook;
-use plugin_sdk::stabby::abi::{
-    DynFunctionRegistry, DynLogSink, DynRunnerHost, DynSupervisor, NamedHook, PluginComponents,
-};
-use plugin_sdk::stabby::{
-    create_config_from_bytes, install_log_sink, install_runner_host, install_supervisor,
-    make_dyn_hook,
-};
+use plugin_sdk::stabby::abi::{DynFunctionRegistry, NamedHook, PluginComponents};
+use plugin_sdk::stabby::{create_config_from_bytes, make_dyn_hook};
+
+plugin_sdk::export_host_entries!();
 
 /// Stable ABI create entry. `#[stabby::export]` emits the type-report symbols the
 /// host's `get_stabbied` checks for ABI compatibility. `cfg` is the encoded
@@ -34,47 +31,6 @@ pub extern "C" fn heph_plugin_create(
     }
 }
 
-/// Stable ABI log-sink entry: the host calls this right after `create` to hand the
-/// plugin a sink for its `tracing` events. Without it, this cdylib's
-/// statically-linked `tracing` has no subscriber and the hook's logs vanish.
-#[stabby::export]
-pub extern "C" fn heph_plugin_set_log_sink(sink: DynLogSink) {
-    install_log_sink(sink);
-}
-
-/// ABI version entry: the host reads it before anything else and refuses this
-/// plugin if it was built for an ABI the host does not load. A plain C symbol,
-/// so it reads the same whatever stabby layout either side has.
-#[unsafe(no_mangle)]
-pub extern "C" fn heph_plugin_abi_semver() -> *const std::ffi::c_char {
-    plugin_sdk::stabby::abi_semver()
-}
-
-/// Stable ABI log-filter entry: the host's filter as protobuf `LogFilter` bytes,
-/// so events it would discard are dropped here instead of forwarded.
-#[stabby::export]
-pub extern "C" fn heph_plugin_set_log_filter(filter: stabby::vec::Vec<u8>) {
-    plugin_sdk::stabby::install_log_filter(&filter);
-}
-
-/// Stable ABI supervisor entry: the host hands the plugin its process-supervisor
-/// client, so any child this plugin spawns is tracked by the host's sidecar rather
-/// than by this cdylib's own (uninitialised) copy of the `proc` tracker.
-#[stabby::export]
-pub extern "C" fn heph_plugin_set_supervisor(sup: DynSupervisor) {
-    install_supervisor(sup);
-}
-
-/// Stable ABI exec-runner entry: the host hands the plugin a handle to its
-/// runner registry. This cdylib links its own `execrunner`, whose registry the
-/// engine's `install_exec_runner_host` never reached — without this, a target
-/// here that names a `runner` fails with "no runner host is installed in this
-/// component" rather than running in the environment it asked for.
-#[stabby::export]
-pub extern "C" fn heph_plugin_set_runner_host(host: DynRunnerHost) {
-    install_runner_host(host);
-}
-
 fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
     let options = create_config_from_bytes(cfg)?.options;
     let hook: Arc<dyn Hook> = Arc::new(GhaHook::from_options(&options)?);
@@ -85,14 +41,9 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
         hook: make_dyn_hook(hook),
     });
 
+    // Hook-only: no provider, no drivers, no functions.
     Ok(PluginComponents {
-        // Hook-only: no provider, no drivers, no functions.
-        provider: stabby::option::Option::None(),
-        drivers: stabby::vec::Vec::new(),
-        functions: stabby::vec::Vec::new(),
-        function_handle: stabby::option::Option::None(),
         hooks,
-        runners: stabby::vec::Vec::new(),
-        meta: stabby::vec::Vec::new(),
+        ..PluginComponents::empty()
     })
 }

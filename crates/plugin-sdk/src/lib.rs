@@ -89,16 +89,72 @@ pub mod stabby {
     /// The body of a cdylib's required `heph_plugin_abi_semver` entry: a
     /// pointer to [`ABI_SEMVER`], NUL-terminated and `'static`. The host reads
     /// it before calling anything else and refuses a plugin from an ABI it does
-    /// not load — or one that does not export the entry at all. Export it as a
-    /// plain C function, not a `#[stabby::export]`:
-    ///
-    /// ```ignore
-    /// #[unsafe(no_mangle)]
-    /// pub extern "C" fn heph_plugin_abi_semver() -> *const std::ffi::c_char {
-    ///     plugin_sdk::stabby::abi_semver()
-    /// }
-    /// ```
+    /// not load — or one that does not export the entry at all.
+    /// [`export_host_entries!`](crate::export_host_entries) exports it.
     pub fn abi_semver() -> *const std::ffi::c_char {
         plugin_abi::ABI_SEMVER_C.as_ptr()
     }
+}
+
+/// Export every host entry a cdylib plugin needs besides its own
+/// `heph_plugin_create`: the ABI version, the log sink and filter, the process
+/// supervisor and the exec-runner host. Invoke it once at the root of the
+/// cdylib crate, which must depend on `stabby` itself:
+///
+/// ```ignore
+/// plugin_sdk::export_host_entries!();
+/// ```
+///
+/// Each entry is optional to the host except the ABI version, so one a plugin
+/// forgot to export would only degrade: its logs vanish, its children go
+/// unsupervised, its targets cannot name a runner. Exporting them all from
+/// here means a new entry reaches every plugin built against this SDK.
+///
+/// - `heph_plugin_abi_semver`: the [`ABI_SEMVER`](crate::stabby::ABI_SEMVER) the
+///   plugin was built for. The host reads it before anything else and refuses
+///   a plugin from an ABI it does not load. A plain C symbol, not a stabby
+///   export, so it reads the same whatever stabby layout either side has.
+/// - `heph_plugin_set_log_sink`: the host's sink for this cdylib's `tracing`
+///   events. The cdylib links its own `tracing`, whose global subscriber is
+///   never set, so without it every log the plugin emits vanishes.
+/// - `heph_plugin_set_log_filter`: the host's filter as protobuf `LogFilter`
+///   bytes, so events it would discard are dropped here instead of forwarded.
+/// - `heph_plugin_set_supervisor`: the host's process-supervisor client. The
+///   cdylib links its own `proc`, whose tracker the host's startup never
+///   reached, so without it every child the plugin spawns goes unregistered
+///   with the sidecar and is orphaned on a hard kill of the host.
+/// - `heph_plugin_set_runner_host`: the host's runner registry. The cdylib
+///   links its own `execrunner`, whose registry the engine's
+///   `install_exec_runner_host` never reached, so without it a target that
+///   names a `runner` fails with "no runner host is installed in this
+///   component" rather than running in the environment it asked for.
+#[cfg(feature = "stabby")]
+#[macro_export]
+macro_rules! export_host_entries {
+    () => {
+        #[unsafe(no_mangle)]
+        pub extern "C" fn heph_plugin_abi_semver() -> *const ::std::ffi::c_char {
+            $crate::stabby::abi_semver()
+        }
+
+        #[stabby::export]
+        pub extern "C" fn heph_plugin_set_log_sink(sink: $crate::stabby::abi::DynLogSink) {
+            $crate::stabby::install_log_sink(sink);
+        }
+
+        #[stabby::export]
+        pub extern "C" fn heph_plugin_set_log_filter(filter: stabby::vec::Vec<u8>) {
+            $crate::stabby::install_log_filter(&filter);
+        }
+
+        #[stabby::export]
+        pub extern "C" fn heph_plugin_set_supervisor(sup: $crate::stabby::abi::DynSupervisor) {
+            $crate::stabby::install_supervisor(sup);
+        }
+
+        #[stabby::export]
+        pub extern "C" fn heph_plugin_set_runner_host(host: $crate::stabby::abi::DynRunnerHost) {
+            $crate::stabby::install_runner_host(host);
+        }
+    };
 }

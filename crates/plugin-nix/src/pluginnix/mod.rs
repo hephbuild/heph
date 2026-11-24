@@ -3,8 +3,7 @@ use async_trait::async_trait;
 use hcore::hasync::Cancellable;
 use hcore::htvalue::signature::ParamType;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
-use hdriver_support::run_log::{RunLog, Streams};
-use hexecrunner::RunnerRef;
+use hdriver_support::run_log::{RunLog, exit_failure, output_logging_stderr};
 use hmodel::htpkg::PkgBuf;
 use hplugin::driver::targetdef::path::{CodegenMode, Content, Path as TPath};
 use hplugin::driver::targetdef::{CacheConfig, Input, InputMode, Output, TargetDef};
@@ -12,7 +11,6 @@ use hplugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
     ParseResponse, TargetAddr,
 };
-use hplugin::error::ProcessFailed;
 use hplugin::htspec::Spec;
 use hproc::proc_exec;
 use std::ffi::OsString;
@@ -141,37 +139,6 @@ fn passthrough_nix_env() -> Vec<(OsString, OsString)> {
     out
 }
 
-/// Run one `nix` invocation and return its output whole.
-///
-/// Under `log_capture` (`log` is `Some`) nix's stderr — fetching, evaluation
-/// and build progress — reaches the run's log as nix writes it. Its stdout is
-/// nix's answer (flake metadata, a store path): data, never the log, on either
-/// host. An older host keeps no log, as before: the output is captured whole.
-async fn run_nix(
-    spec: proc_exec::Spec,
-    log: Option<&mut RunLog<'_>>,
-    ctoken: &(dyn Cancellable + Send + Sync),
-) -> anyhow::Result<std::process::Output> {
-    match log {
-        Some(log) => {
-            log.output(RunnerRef::local(), spec, Streams::STDERR, ctoken)
-                .await
-        }
-        None => hexecrunner::output(RunnerRef::local(), spec, ctoken).await,
-    }
-}
-
-/// A nix invocation that exited non-zero. Under `log_capture` its stderr is
-/// already in the run's log, so the error is the exit status with no path; an
-/// older host gets nix's stderr in the message, as before.
-fn nix_failed(output: &std::process::Output, captured: bool, what: String) -> anyhow::Error {
-    if captured {
-        return anyhow::Error::new(ProcessFailed::from_status(output.status)).context(what);
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    anyhow::anyhow!("{what}: {stderr}")
-}
-
 /// Resolve a (possibly mutable) flake URL to its locked form via
 /// `nix flake metadata --json`. Output `.url` is the immutable URL containing
 /// the resolved rev / narHash, suitable for `getFlake` in pure-eval mode.
@@ -210,11 +177,12 @@ async fn lock_flake_url(
     };
 
     let captured = log.is_some();
-    let output = run_nix(spec, log, ctoken)
+    // nix's stderr (fetching, evaluation) is the log; its stdout is the answer.
+    let output = output_logging_stderr(log, spec, ctoken)
         .await
         .context("wait for nix flake metadata")?;
     if !output.status.success() {
-        return Err(nix_failed(
+        return Err(exit_failure(
             &output,
             captured,
             format!("nix flake metadata failed for {url}"),
@@ -467,12 +435,13 @@ impl ManagedDriver for Driver {
             ctty: false,
         };
 
-        let output = run_nix(spec, log.as_mut(), ctoken)
+        // nix's stderr (build progress) is the log; its stdout is the store path.
+        let output = output_logging_stderr(log.as_mut(), spec, ctoken)
             .await
             .with_context(|| format!("wait for nix build for {addr_str}"))?;
 
         if !output.status.success() {
-            return Err(nix_failed(
+            return Err(exit_failure(
                 &output,
                 log.is_some(),
                 format!("nix build failed for {addr_str}"),
@@ -866,6 +835,7 @@ mod log_tests {
     use hdriver_support::driver_managed::ManagedRunInput;
     use hmodel::htaddr::parse_addr;
     use hplugin::driver::{RunInput, RunRequest, inputartifact, outputartifact};
+    use hplugin::error::ProcessFailed;
     use hplugin::provider::TargetSpec;
     use std::collections::HashMap;
 

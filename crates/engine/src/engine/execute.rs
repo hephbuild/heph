@@ -835,8 +835,8 @@ impl Engine {
     ) -> anyhow::Result<Vec<RunInput>> {
         let fail_fast = rc.fail_fast();
         let futs = inputs.iter().map(|input| {
-            enclose!((self => engine, rc, input) async move {
-                let res = engine.result_addr(rc, &input.target.addr, OutputMatcher::Exact(input.output_names), &ResultOptions::default()).await?;
+            enclose!((self => engine, rc) async move {
+                let res = engine.result_addr(rc, &input.target.addr, OutputMatcher::Exact(input.output_names.clone()), &ResultOptions::default()).await?;
                 let dep_inputs = res.artifacts.iter().map(|art| RunInput {
                     artifact: InputArtifact {
                         r#type: Type::Dep,
@@ -1278,46 +1278,48 @@ fn admitted_kind(admitted: crate::engine::resource_pool::Admitted) -> hcore::eve
     }
 }
 
-/// What a run is told of its reservation: `cpu` always, in whole CPUs
-/// (rounded up, at least 1, so a zero-cost grant is told 1), and every other
-/// pool it was granted more than 0 of, each rendered by its pool's unit
-/// (`unit_of`, the engine's pools).
+/// What a run is told of its reservation: `cpu` is what it was granted, and
+/// every other pool what it was granted ([`render_allotment`]).
 pub(crate) fn allotment_of(
     reservation: &crate::engine::resource_pool::Reservation,
     unit_of: impl Fn(&str) -> Option<hcore::capacity::Unit>,
 ) -> hplugin::driver::Allotment {
-    use hcore::capacity::Unit;
     use hplugin::provider::PoolName;
-    let cpu = (
-        PoolName::CPU.to_owned(),
-        Unit::Cpu.render(reservation.amount(PoolName::CPU).max(1)),
-    );
-    let rest = reservation
-        .iter()
-        .filter(|(p, n)| p.as_str() != PoolName::CPU && *n > 0)
-        .map(|(p, n)| {
-            let unit = unit_of(p.as_str()).unwrap_or_else(|| Unit::default_for(p.as_str()));
-            (p.as_str().to_owned(), unit.render(n))
-        });
-    hplugin::driver::Allotment::new(std::iter::once(cpu).chain(rest))
+    render_allotment(
+        reservation.amount(PoolName::CPU),
+        reservation.iter(),
+        unit_of,
+    )
 }
 
 /// What an entrypoint run is told, having reserved nothing: `cpu` is the
-/// whole `cpu_capacity` (in whole CPUs, at least 1), and every other pool its
-/// declared amount when above 0, rendered by the pool's unit.
+/// whole `cpu_capacity`, and every other pool its declared amount
+/// ([`render_allotment`]).
 pub(crate) fn entrypoint_allotment(
     cpu_capacity: u64,
     demand: &hplugin::driver::Demand,
     unit_of: impl Fn(&str) -> Option<hcore::capacity::Unit>,
 ) -> hplugin::driver::Allotment {
+    render_allotment(cpu_capacity, demand.iter(), unit_of)
+}
+
+/// The `${resource:<pool>}` values: `cpu` always, `cpu_micros` in whole CPUs
+/// (rounded up, at least 1, so a zero-cost grant is told 1), and every other
+/// pool of `amounts` above 0, each rendered by its pool's unit (`unit_of`,
+/// the engine's pools; else the name's default). A `cpu` in `amounts` is
+/// ignored: `cpu_micros` is the cpu.
+fn render_allotment<'a>(
+    cpu_micros: u64,
+    amounts: impl Iterator<Item = (&'a hplugin::provider::PoolName, u64)>,
+    unit_of: impl Fn(&str) -> Option<hcore::capacity::Unit>,
+) -> hplugin::driver::Allotment {
     use hcore::capacity::Unit;
     use hplugin::provider::PoolName;
     let cpu = (
         PoolName::CPU.to_owned(),
-        Unit::Cpu.render(cpu_capacity.max(1)),
+        Unit::Cpu.render(cpu_micros.max(1)),
     );
-    let rest = demand
-        .iter()
+    let rest = amounts
         .filter(|(p, n)| p.as_str() != PoolName::CPU && *n > 0)
         .map(|(p, n)| {
             let unit = unit_of(p.as_str()).unwrap_or_else(|| Unit::default_for(p.as_str()));
@@ -1648,5 +1650,29 @@ mod tests {
             let a = allotment_of(&grant(&caps, &undeclared), units);
             assert_eq!(a.iter().collect::<Vec<_>>(), [("cpu", "1")]);
         }
+    }
+
+    /// An entrypoint reserves nothing: it is told the whole cpu capacity in
+    /// whole CPUs (at least 1), whatever cpu it declared, and every other pool
+    /// it declared above 0, unclamped, each rendered by its unit.
+    #[test]
+    fn entrypoint_allotment_is_the_cpu_capacity_and_every_declared_pool() {
+        let declared = req(&[
+            ("cpu", CPU),
+            ("gpu", 1),
+            ("memory", 8 << 30),
+            ("scratch", 0),
+        ]);
+        let a = entrypoint_allotment(4 * CPU, &declared, units);
+        assert_eq!(
+            a.iter().collect::<Vec<_>>(),
+            [("cpu", "4"), ("gpu", "1"), ("memory", "8589934592")],
+            "the capacity, not the declared cpu; a pool declared at 0 is left out"
+        );
+
+        let a = entrypoint_allotment(2_500_000, &req(&[]), units);
+        assert_eq!(a.iter().collect::<Vec<_>>(), [("cpu", "3")], "rounded up");
+        let a = entrypoint_allotment(0, &req(&[]), units);
+        assert_eq!(a.iter().collect::<Vec<_>>(), [("cpu", "1")], "at least 1");
     }
 }

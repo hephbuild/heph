@@ -105,9 +105,10 @@ fn unpack_inner(
 
     // Many entries share a parent dir; `create_dir_all` per entry re-walks those
     // ancestors every time (a measurable chunk of unpack — see ai-docs/PERFORMANCE.md).
-    // Skip dirs already created this unpack.
-    let mut created_dirs: std::collections::HashSet<std::path::PathBuf> =
-        std::collections::HashSet::new();
+    // Skip dirs already created this unpack; only the first entry under a
+    // directory pays for its owned path.
+    let mut created_dirs: rustc_hash::FxHashSet<std::path::PathBuf> =
+        rustc_hash::FxHashSet::default();
 
     for entry in content
         .walk()
@@ -133,7 +134,7 @@ fn unpack_inner(
         }
         let dest = dst.join(&entry.path);
         if let Some(parent) = dest.parent()
-            && created_dirs.insert(parent.to_path_buf())
+            && !created_dirs.contains(parent)
         {
             fs::create_dir_all(parent).with_context(|| {
                 format!(
@@ -143,13 +144,12 @@ fn unpack_inner(
                     describe_existing(parent),
                 )
             })?;
+            created_dirs.insert(parent.to_path_buf());
         }
         if let Some(ref mut list_f) = list_dst_f {
-            list_f
-                .write_all(format!("{}\n", dest.display()).as_bytes())
-                .with_context(|| {
-                    format!("append to list file {:?}", list_dst.expect("Some checked"))
-                })?;
+            writeln!(list_f, "{}", dest.display()).with_context(|| {
+                format!("append to list file {:?}", list_dst.expect("Some checked"))
+            })?;
         }
         match &mut entry.kind {
             WalkEntryKind::Symlink { target } => {
@@ -312,6 +312,38 @@ mod tests {
         // Symlink resolves to file with the expected content.
         let resolved = std::fs::read(&link_path).unwrap();
         assert_eq!(resolved, b"hello");
+    }
+
+    /// Files in nested and shared directories all land, and the list file
+    /// holds one `<dest>\n` line per unpacked entry, in walk order, appended
+    /// after whatever it already held.
+    #[test]
+    fn unpack_nested_dirs_and_list_file_bytes() {
+        let mut buf = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut buf);
+            for path in ["a/b/c/one", "a/b/two", "a/b/c/three", "top", "d/é/four"] {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(path.len() as u64);
+                header.set_mode(0o644);
+                builder
+                    .append_data(&mut header, path, path.as_bytes())
+                    .unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        let out = tempfile::tempdir().expect("out tempdir");
+        let list = out.path().join("list.txt");
+        std::fs::write(&list, b"prior\n").unwrap();
+        let dst = out.path().join("ws");
+        unpack(&TarBytes(buf), &dst, Some(&list), None).expect("unpack");
+
+        let mut want = String::from("prior\n");
+        for path in ["a/b/c/one", "a/b/two", "a/b/c/three", "top", "d/é/four"] {
+            assert_eq!(std::fs::read(dst.join(path)).unwrap(), path.as_bytes());
+            want.push_str(&format!("{}\n", dst.join(path).display()));
+        }
+        assert_eq!(std::fs::read_to_string(&list).unwrap(), want);
     }
 
     /// `unpack_files_only` writes the files and skips the link member.

@@ -11,6 +11,7 @@ use crate::plugingo::listed;
 use crate::plugingo::pkg_analysis::{
     GoPackage, PackageAddrs, decode_go_package, decode_package_addrs, find_module_for_import,
     is_stdlib_import_path, parse_go_mod_module_path, parse_go_mod_requires, parse_go_sum_modules,
+    path_in_prefix,
 };
 use crate::plugingo::target_bin;
 use crate::plugingo::target_golist;
@@ -223,6 +224,64 @@ struct ImportClosureKey {
 #[derive(Debug, Clone, Default)]
 struct ImportClosure {
     libs: Vec<(Arc<str>, Addr)>,
+}
+
+/// Read `file` out of a `_golist` target's output artifact, decoded by `decode`
+/// and memoized in `cache` for the provider's lifetime.
+///
+/// `executor.result(golist_addr)` is called OUTSIDE the `once` closure so
+/// every caller (owner + cache-hit waiters) routes through
+/// `Engine::result_addr`, which registers the `parent → golist_addr` edge
+/// in the request's `DepDag`. Memoizing the executor call inside the
+/// closure would let waiters skip dep registration, hiding a real target-
+/// dep cycle as a memoizer deadlock. The cache only memoizes the artifact
+/// parse, which is the expensive part.
+///
+/// Fast path: once the file is parsed plugin-side, a caller only needs to
+/// register the `parent → golist_addr` dep edge (the host's cycle check). That
+/// is a cheap edge-only `note_dep` instead of a full `result()`, which would
+/// re-run the engine's whole result pipeline plus a lease round-trip for every
+/// edge — the dominant cost on the remote resolve path (every transitive import
+/// hits this).
+async fn read_golist_cached<T, D>(
+    cache: &Memoizer<Addr, Result<Arc<T>, Arc<anyhow::Error>>>,
+    executor: Arc<dyn ProviderExecutor>,
+    golist_addr: &Addr,
+    file: &'static str,
+    decode: D,
+) -> anyhow::Result<Arc<T>>
+where
+    T: Send + Sync + 'static,
+    D: FnOnce(Box<dyn std::io::Read>) -> anyhow::Result<T> + Send + 'static,
+{
+    if let Some(cached) = cache.peek(golist_addr) {
+        executor.note_dep(golist_addr).await?;
+        return cached.map_err(unwrap_arc_err);
+    }
+    let result = executor.result(golist_addr).await?;
+    cache
+        .once(golist_addr.clone(), move || async move {
+            let value = hcore::blocking::run(move || -> anyhow::Result<_> {
+                for artifact in &result.artifacts {
+                    for entry_result in artifact.walk()? {
+                        let entry = entry_result?;
+                        if entry.path.file_name().and_then(|n| n.to_str()) != Some(file) {
+                            continue;
+                        }
+                        let data = match entry.kind {
+                            hcore::hartifactcontent::WalkEntryKind::File { data, .. } => data,
+                            hcore::hartifactcontent::WalkEntryKind::Symlink { .. } => continue,
+                        };
+                        return decode(data);
+                    }
+                }
+                anyhow::bail!("_golist produced no {file}")
+            })
+            .await?;
+            Ok(Arc::new(value))
+        })
+        .await
+        .map_err(unwrap_arc_err)
 }
 
 /// Flatten already-deps-first-deduped `sub_closures` into one deps-first list,
@@ -1167,7 +1226,8 @@ impl ProviderInner {
     }
 }
 
-#[derive(Clone)]
+/// Shared through `libs_cache`: a caller that needs to add to `libs` copies it.
+#[derive(Debug)]
 struct TransitiveDeps {
     /// `(import_path, build_lib_addr)` for every reachable dep (for importcfg).
     libs: Vec<(String, Addr)>,
@@ -1735,33 +1795,21 @@ fn pick_link(states: &[State], addr_pkg: &str) -> anyhow::Result<target_bin::Lin
     Ok(out)
 }
 
-/// Pick the closest (deepest) ancestor state carrying `go_codegen_deps`.
-/// Independent of `go_codegen_root` — a BUILD file declaring only
+/// The closest (deepest) ancestor state carrying `key`, with that entry's value.
+///
+/// Used for the `go_codegen_deps` / `go_embed_deps` lookups, which are
+/// independent of `go_codegen_root` — a BUILD file declaring only
 /// `go_codegen_deps` must still inject those deps into descendant `_golist`
 /// targets so generated `.go` files reach the sandbox. Mirrors `getCodegenDeps`
 /// in the Go reference impl (`heph/plugin/plugingo/plugin.go:184-200`), which
 /// scans for deps independently of the root marker.
-fn pick_codegen_deps(states: &[State]) -> Option<&State> {
+fn deepest_state_with<'a>(states: &'a [State], key: &str) -> Option<(&'a State, &'a Value)> {
     states
         .iter()
-        .filter(|s| s.state.contains_key("go_codegen_deps"))
-        .max_by_key(|s| s.package.as_str().len())
+        .filter_map(|s| s.state.get(key).map(|v| (s, v)))
+        .max_by_key(|(s, _)| s.package.as_str().len())
 }
 
-/// Source addrs the package sandbox needs beyond the canonical `*.go` filesystem
-/// glob. Includes:
-/// 1. `**/*` filesystem glob (excluding `.go` files) — picks up checked-in
-///    non-Go sources (e.g. embed targets).
-/// 2. `query("… && label(go_src) && tree_output(pkg)")` — unpacks the full output tree
-///    of any codegen target labelled `go_src` into the pkg dir, so both
-///    generated `.go` files and any sibling non-go outputs (e.g. `.wasm.br`)
-///    land in the sandbox.
-/// 3. `go_codegen_deps` from the closest ancestor BUILD state — explicit
-///    codegen targets that don't carry the `go_src` label.
-///
-/// Shared between `_golist` (so `go list` can resolve `//go:embed` patterns
-/// into `EmbedFiles`) and `embed` (so the driver's runtime re-glob of
-/// `embed_patterns` against `sandbox_pkg_dir` matches Go's resolution).
 /// Query-language pattern selecting exactly the package `pkg` (`//` for root).
 fn pkg_pattern(pkg: &str) -> String {
     format!("//{pkg}")
@@ -1808,23 +1856,61 @@ fn go_test_data_query_addr(pkg: &str) -> Addr {
     hplugin_query::pluginquery::query_addr(&expr, "", &["go"])
 }
 
-fn compute_pkg_src_addrs(pkg_str: &str, states: &[State]) -> anyhow::Result<Vec<String>> {
-    let non_go_glob = if pkg_str.is_empty() {
+/// The fs-glob pattern for every file in package `pkg`'s tree (`**/*` for root).
+fn pkg_tree_glob(pkg: &str) -> String {
+    if pkg.is_empty() {
         "**/*".to_string()
     } else {
-        format!("{}/**/*", pluginfs::escape_fs_literal(pkg_str))
-    };
+        format!("{}/**/*", pluginfs::escape_fs_literal(pkg))
+    }
+}
+
+/// Source addrs the package sandbox needs beyond the canonical `*.go` filesystem
+/// glob. Includes:
+/// 1. `**/*` filesystem glob (excluding `.go` files) — picks up checked-in
+///    non-Go sources (e.g. embed targets).
+/// 2. `query("… && label(go_src) && tree_output(pkg)")` — unpacks the full output tree
+///    of any codegen target labelled `go_src` into the pkg dir, so both
+///    generated `.go` files and any sibling non-go outputs (e.g. `.wasm.br`)
+///    land in the sandbox.
+/// 3. `go_codegen_deps` from the closest ancestor BUILD state — explicit
+///    codegen targets that don't carry the `go_src` label.
+///
+/// Shared between `_golist` (so `go list` can resolve `//go:embed` patterns
+/// into `EmbedFiles`) and `embed` (so the driver's runtime re-glob of
+/// `embed_patterns` against `sandbox_pkg_dir` matches Go's resolution).
+fn compute_pkg_src_addrs(pkg_str: &str, states: &[State]) -> anyhow::Result<Vec<String>> {
     // Exclude `.go` (their own lane) and the module files `go.mod`/`go.sum`:
     // the latter are delivered into `_golist` by the modfiles (`_go_mod`) lane
     // as `fs:file` deps. Without excluding them here the non-go glob and the
     // modfiles dep both produce `go.mod`/`go.sum` in the sandbox — two
     // different targets writing the same file, which the sandbox runner now
     // rejects as an output collision.
-    let non_go_glob_addr =
-        pluginfs::glob_addr(&non_go_glob, &["**/*.go", "**/go.mod", "**/go.sum"]);
+    let non_go_glob_addr = pluginfs::glob_addr(
+        &pkg_tree_glob(pkg_str),
+        &["**/*.go", "**/go.mod", "**/go.sum"],
+    );
     let mut addrs = vec![non_go_glob_addr.format()];
+    addrs.extend(labelled_src_lane(
+        pkg_str,
+        states,
+        "go_src",
+        "go_codegen_deps",
+    )?);
+    Ok(addrs)
+}
 
-    let codegen_root = pick_codegen_root(states);
+/// One labelled source lane of package `pkg_str`: the query for targets
+/// labelled `label` whose output lands in the package's tree, then the explicit
+/// deps under `deps_key` from the closest ancestor BUILD state (targets that
+/// don't carry the label). The `go_src` lane (`_golist`) and the
+/// `go_embed_src` lane (embeds only) share it, and so share one scope floor.
+fn labelled_src_lane(
+    pkg_str: &str,
+    states: &[State],
+    label: &str,
+    deps_key: &str,
+) -> anyhow::Result<Vec<String>> {
     // Scope: every package under the codegen root if one is declared, else the
     // target's own package *and everything under it*.
     //
@@ -1840,7 +1926,7 @@ fn compute_pkg_src_addrs(pkg_str: &str, states: &[State]) -> anyhow::Result<Vec<
     //
     // Widening the floor cannot pull in a foreign target: `tree_output(pkg)` still
     // requires the output to land in *this* package's tree.
-    let scope = match codegen_root {
+    let scope = match pick_codegen_root(states) {
         Some(root) => pkg_prefix_pattern(root.package.as_str()),
         None => default_scope(pkg_str),
     };
@@ -1848,30 +1934,19 @@ fn compute_pkg_src_addrs(pkg_str: &str, states: &[State]) -> anyhow::Result<Vec<
     // tier, `label` at the spec tier (`get_spec`), and `tree_output` only at the
     // def tier (`get_def`, the most expensive). Order terms by that cost so the
     // engine's left-to-right `&&` bails at the cheapest possible tier.
-    // Exclude the `go` provider: `go_src` labels only its buildfile codegen
-    // targets, never go targets — skipping go avoids resolving (and cascade-
-    // building) the go provider's per-variant targets.
-    let go_src_expr = format!("{scope} && label(go_src) && tree_output({pkg_str})");
-    let go_src_query_addr = hplugin_query::pluginquery::query_addr(&go_src_expr, "", &["go"]);
-    addrs.push(go_src_query_addr.format());
+    // Exclude the `go` provider: the `go_src`/`go_embed_src` labels mark only
+    // buildfile codegen targets, never go targets — skipping go avoids resolving
+    // (and cascade-building) the go provider's per-variant targets.
+    let expr = format!("{scope} && label({label}) && tree_output({pkg_str})");
+    let query_addr = hplugin_query::pluginquery::query_addr(&expr, "", &["go"]);
+    let mut addrs = vec![query_addr.format()];
 
-    if let Some(deps_state) = pick_codegen_deps(states)
-        && let Some(deps_val) = deps_state.state.get("go_codegen_deps")
-    {
-        let deps =
-            parse_strings(deps_val).context("parsing go_codegen_deps from go provider_state")?;
+    if let Some((_, deps_val)) = deepest_state_with(states, deps_key) {
+        let deps = parse_strings(deps_val)
+            .with_context(|| format!("parsing {deps_key} from go provider_state"))?;
         addrs.extend(deps);
     }
     Ok(addrs)
-}
-
-/// Pick the closest (deepest) ancestor state carrying `go_embed_deps`. Mirrors
-/// [`pick_codegen_deps`] for the embed-only lane.
-fn pick_embed_deps(states: &[State]) -> Option<&State> {
-    states
-        .iter()
-        .filter(|s| s.state.contains_key("go_embed_deps"))
-        .max_by_key(|s| s.package.as_str().len())
 }
 
 /// Address set for the `go_embed_src` lane: targets whose outputs are consumed
@@ -1888,29 +1963,7 @@ fn pick_embed_deps(states: &[State]) -> Option<&State> {
 /// 2. `go_embed_deps` from the closest ancestor BUILD state — explicit embed
 ///    targets that don't carry the label.
 fn compute_embed_src_addrs(pkg_str: &str, states: &[State]) -> anyhow::Result<Vec<String>> {
-    let codegen_root = pick_codegen_root(states);
-    // Same floor as the go_src lane (see `compute_pkg_src_addrs`): the subtree, so a
-    // generator in a sub-package of the embedding package is in scope.
-    let scope = match codegen_root {
-        Some(root) => pkg_prefix_pattern(root.package.as_str()),
-        None => default_scope(pkg_str),
-    };
-    // Cheapest-first by resolution tier (see `compute_pkg_src_addrs`): `scope`
-    // (addr) < `label` (spec/`get_spec`) < `tree_output` (def/`get_def`).
-    // Exclude the `go` provider (see `compute_pkg_src_addrs`): `go_embed_src`
-    // only labels buildfile codegen targets.
-    let expr = format!("{scope} && label(go_embed_src) && tree_output({pkg_str})");
-    let query_addr = hplugin_query::pluginquery::query_addr(&expr, "", &["go"]);
-    let mut addrs = vec![query_addr.format()];
-
-    if let Some(deps_state) = pick_embed_deps(states)
-        && let Some(deps_val) = deps_state.state.get("go_embed_deps")
-    {
-        let deps =
-            parse_strings(deps_val).context("parsing go_embed_deps from go provider_state")?;
-        addrs.extend(deps);
-    }
-    Ok(addrs)
+    labelled_src_lane(pkg_str, states, "go_embed_src", "go_embed_deps")
 }
 
 /// The package's static (checked-in) non-Go source tree as a single fs-glob addr,
@@ -1923,12 +1976,7 @@ fn compute_embed_src_addrs(pkg_str: &str, states: &[State]) -> anyhow::Result<Ve
 /// codegen xattr and are skipped by the glob, so the decoupling (and any
 /// `go_embed_src` lane staging) is preserved with no double-staging.
 fn pkg_static_embed_glob_addr(pkg_str: &str) -> String {
-    let glob = if pkg_str.is_empty() {
-        "**/*".to_string()
-    } else {
-        format!("{}/**/*", pluginfs::escape_fs_literal(pkg_str))
-    };
-    pluginfs::glob_addr(&glob, &["**/*.go"]).format()
+    pluginfs::glob_addr(&pkg_tree_glob(pkg_str), &["**/*.go"]).format()
 }
 
 impl ProviderInner {
@@ -2111,9 +2159,11 @@ impl ProviderInner {
         // module universe. Returns the concrete `factors` this target builds with,
         // plus the `vref` to thread onto every sub-target and dependency address.
         //
-        // `module_root` bounds ancestry resolution at the go.mod dir (not repo
-        // root); it is unused for the `vp` (library) branch.
-        let module_root = module_root_rel(&kind, &self.workspace_root);
+        // `module_rel` (the workspace-relative go.mod dir) bounds ancestry
+        // resolution at the go.mod dir (not repo root); it is unused for the
+        // `vp` (library) branch. It also selects the module's shared `GOCACHE`
+        // (`module_of_pkg` of this package, since `kind` is its decode).
+        let module_rel = module_root_rel(&kind, &self.workspace_root);
 
         // format / format-check — variant-free (see `VARIANT_FREE_TARGET_NAMES`),
         // so handle them before variant resolution and source the file list from
@@ -2138,7 +2188,7 @@ impl ProviderInner {
                 return Err(GetError::NotFound);
             }
             return Arc::clone(&self)
-                .get_lint_aggregate(&req, &kind, &module_root)
+                .get_lint_aggregate(&req, &kind, &module_rel)
                 .await;
         }
 
@@ -2161,7 +2211,7 @@ impl ProviderInner {
             && matches!(&*kind, GoPackageKind::FirstParty { .. })
         {
             let (host_goos, host_goarch) = (current_goos(), current_goarch());
-            let chosen = variant::ancestry_variants_with_factors(&req.states, &module_root)
+            let chosen = variant::ancestry_variants_with_factors(&req.states, &module_rel)
                 .into_iter()
                 .find(|(_, f)| f.goos == host_goos && f.goarch == host_goarch);
             let Some((vref, _)) = chosen else {
@@ -2237,12 +2287,12 @@ impl ProviderInner {
             GoPackageKind::FirstParty { .. } => addr
                 .args
                 .get("vp")
-                .is_some_and(|vp| pkg_in_module(vp, &module_root, &self.pkgs)),
+                .is_some_and(|vp| pkg_in_module(vp, &module_rel, &self.pkgs)),
         };
         let (factors, vref) = variant::resolve(
             addr,
             &req.states,
-            &module_root,
+            &module_rel,
             req.executor.as_ref(),
             vp_same_module,
         )
@@ -2340,7 +2390,13 @@ impl ProviderInner {
                     return Err(GetError::NotFound);
                 }
                 let transitive = Arc::clone(&self)
-                    .collect_direct_libs(Arc::clone(&req.executor), &pkg, &[], &vref, &module_root)
+                    .collect_direct_libs(
+                        Arc::clone(&req.executor),
+                        &pkg.imports,
+                        &[],
+                        &vref,
+                        &module_root,
+                    )
                     .await
                     .map_err(GetError::Other)?;
 
@@ -2368,7 +2424,7 @@ impl ProviderInner {
                         embed_golist,
                         &pkg_addrs.embed_files,
                         &self.go_version,
-                        &module_of_pkg(&addr.package, &self.pkgs),
+                        &module_rel,
                     ),
                     _ => {
                         // `go_embed_src` assets (kept out of `_golist`) are staged
@@ -2394,7 +2450,7 @@ impl ProviderInner {
                             &transitive.libs,
                             &pkg_addrs.go_files,
                             &self.go_version,
-                            &module_of_pkg(&addr.package, &self.pkgs),
+                            &module_rel,
                             embed_golist,
                             &pkg_addrs.embed_files,
                             &embed_src_addrs,
@@ -2413,7 +2469,13 @@ impl ProviderInner {
                     return Err(GetError::NotFound);
                 }
                 let transitive = Arc::clone(&self)
-                    .collect_direct_libs(Arc::clone(&req.executor), &pkg, &[], &vref, &module_root)
+                    .collect_direct_libs(
+                        Arc::clone(&req.executor),
+                        &pkg.imports,
+                        &[],
+                        &vref,
+                        &module_root,
+                    )
                     .await
                     .map_err(GetError::Other)?;
 
@@ -2489,19 +2551,20 @@ impl ProviderInner {
                 }
 
                 let own_lib_addr = self.build_lib_addr(addr, &vref);
-                let mut transitive = Arc::clone(&self)
+                let transitive = Arc::clone(&self)
                     .collect_transitive_libs(
                         Arc::clone(&req.executor),
-                        &pkg,
+                        &pkg.imports,
                         &race_link_imports(&factors),
                         &vref,
                         &module_root,
                     )
                     .await
                     .map_err(GetError::Other)?;
-                transitive
-                    .libs
-                    .insert(0, (import_path.clone(), own_lib_addr));
+                let libs: Vec<(String, Addr)> =
+                    std::iter::once((import_path.clone(), own_lib_addr))
+                        .chain(transitive.libs.iter().cloned())
+                        .collect();
 
                 let link =
                     pick_link(&req.states, addr.package.as_str()).map_err(GetError::Other)?;
@@ -2509,7 +2572,7 @@ impl ProviderInner {
                     addr.clone(),
                     &import_path,
                     &factors,
-                    &transitive.libs,
+                    &libs,
                     &link,
                     &self.go_version,
                 );
@@ -2563,12 +2626,11 @@ impl ProviderInner {
                 if !has_tests && !has_go {
                     return Err(GetError::NotFound);
                 }
-                let test_extra: Vec<String> = pkg.test_imports.clone();
                 let transitive = Arc::clone(&self)
                     .collect_direct_libs(
                         Arc::clone(&req.executor),
-                        &pkg,
-                        &test_extra,
+                        &pkg.imports,
+                        &pkg.test_imports,
                         &vref,
                         &module_root,
                     )
@@ -2617,7 +2679,7 @@ impl ProviderInner {
                     &test_embed_files,
                     &embed_src_addrs,
                     &self.go_version,
-                    &module_of_pkg(&addr.package, &self.pkgs),
+                    &module_rel,
                 );
                 Ok(GetResponse { target_spec: spec })
             }
@@ -2626,30 +2688,6 @@ impl ProviderInner {
                 if pkg.xtest_go_files.is_empty() {
                     return Err(GetError::NotFound);
                 }
-                let xtest_imports_pkg = GoPackage {
-                    import_path: format!("{}_test", import_path),
-                    dir: pkg.dir.clone(),
-                    name: pkg.name.clone(),
-                    go_files: vec![],
-                    s_files: vec![],
-                    h_files: vec![],
-                    test_go_files: vec![],
-                    xtest_go_files: vec![],
-                    embed_patterns: vec![],
-                    embed_files: vec![],
-                    test_embed_patterns: vec![],
-                    test_embed_files: vec![],
-                    xtest_embed_patterns: vec![],
-                    xtest_embed_files: vec![],
-                    imports: pkg.xtest_imports.clone(),
-                    test_imports: vec![],
-                    xtest_imports: vec![],
-                    standard: false,
-                    module: pkg.module.clone(),
-                    match_: vec![],
-                    incomplete: false,
-                    error: None,
-                };
                 // xtest (`package P_test`) imports P as a normal external import.
                 // Normally xtest_lib's compile uses P=normal build_lib so its
                 // embedded fingerprint matches the xtest bin's link-time view
@@ -2666,7 +2704,7 @@ impl ProviderInner {
                 let transitive = Arc::clone(&self)
                     .collect_direct_libs(
                         Arc::clone(&req.executor),
-                        &xtest_imports_pkg,
+                        &pkg.xtest_imports,
                         &[],
                         &vref,
                         &module_root,
@@ -2677,13 +2715,17 @@ impl ProviderInner {
                 let p_lib_name = pick_xtest_p_lib_name(&pkg);
                 let rewritten_libs: Vec<(String, Addr)> = transitive
                     .libs
-                    .into_iter()
+                    .iter()
                     .filter_map(|(ip, a)| {
-                        if ip != import_path {
-                            return Some((ip, a));
+                        if *ip != import_path {
+                            return Some((ip.clone(), a.clone()));
                         }
-                        p_lib_name
-                            .map(|name| (ip, self.make_addr_with_name(&addr.package, name, &vref)))
+                        p_lib_name.map(|name| {
+                            (
+                                ip.clone(),
+                                self.make_addr_with_name(&addr.package, name, &vref),
+                            )
+                        })
                     })
                     .collect();
 
@@ -2717,7 +2759,7 @@ impl ProviderInner {
                     &pkg_addrs.xtest_embed_files,
                     &embed_src_addrs,
                     &self.go_version,
-                    &module_of_pkg(&addr.package, &self.pkgs),
+                    &module_rel,
                 );
                 Ok(GetResponse { target_spec: spec })
             }
@@ -2727,12 +2769,10 @@ impl ProviderInner {
                 if pkg.test_go_files.is_empty() {
                     return Err(GetError::NotFound);
                 }
-                let testmain_imports = ["os", "reflect", "testing", "testing/internal/testdeps"];
-                let testmain_pkg = make_testmain_pkg(&pkg, &testmain_imports);
-                let mut transitive = Arc::clone(&self)
+                let transitive = Arc::clone(&self)
                     .collect_direct_libs(
                         Arc::clone(&req.executor),
-                        &testmain_pkg,
+                        &TESTMAIN_IMPORTS.map(String::from),
                         &[],
                         &vref,
                         &module_root,
@@ -2742,7 +2782,8 @@ impl ProviderInner {
                 // testmain imports `_test "P"` → importcfg needs P→test_lib.
                 let test_lib_addr =
                     self.make_addr_with_name(&addr.package, "build_test_lib", &vref);
-                transitive.libs.push((import_path.clone(), test_lib_addr));
+                let mut libs = transitive.libs.clone();
+                libs.push((import_path.clone(), test_lib_addr));
 
                 let testmain_src_addr =
                     Addr::new(addr.package.clone(), "testmain".to_string(), vref.to_args());
@@ -2750,9 +2791,9 @@ impl ProviderInner {
                     addr.clone(),
                     &factors,
                     &testmain_src_addr,
-                    &transitive.libs,
+                    &libs,
                     &self.go_version,
-                    &module_of_pkg(&addr.package, &self.pkgs),
+                    &module_rel,
                 );
                 Ok(GetResponse { target_spec: spec })
             }
@@ -2762,12 +2803,10 @@ impl ProviderInner {
                 if pkg.xtest_go_files.is_empty() {
                     return Err(GetError::NotFound);
                 }
-                let testmain_imports = ["os", "reflect", "testing", "testing/internal/testdeps"];
-                let testmain_pkg = make_testmain_pkg(&pkg, &testmain_imports);
-                let mut transitive = Arc::clone(&self)
+                let transitive = Arc::clone(&self)
                     .collect_direct_libs(
                         Arc::clone(&req.executor),
-                        &testmain_pkg,
+                        &TESTMAIN_IMPORTS.map(String::from),
                         &[],
                         &vref,
                         &module_root,
@@ -2777,9 +2816,8 @@ impl ProviderInner {
                 // testmain imports `_xtest "P_test"` → importcfg needs P_test→xtest_lib.
                 let xtest_lib_addr =
                     self.make_addr_with_name(&addr.package, "build_xtest_lib", &vref);
-                transitive
-                    .libs
-                    .push((format!("{}_test", import_path), xtest_lib_addr));
+                let mut libs = transitive.libs.clone();
+                libs.push((format!("{}_test", import_path), xtest_lib_addr));
 
                 let testmain_src_addr = Addr::new(
                     addr.package.clone(),
@@ -2790,9 +2828,9 @@ impl ProviderInner {
                     addr.clone(),
                     &factors,
                     &testmain_src_addr,
-                    &transitive.libs,
+                    &libs,
                     &self.go_version,
-                    &module_of_pkg(&addr.package, &self.pkgs),
+                    &module_rel,
                 );
                 Ok(GetResponse { target_spec: spec })
             }
@@ -2806,20 +2844,14 @@ impl ProviderInner {
                 let test_extra: Vec<String> = pkg
                     .test_imports
                     .iter()
-                    .chain(
-                        ["os", "reflect", "testing", "testing/internal/testdeps"]
-                            .iter()
-                            .map(|s| (*s).to_string())
-                            .collect::<Vec<_>>()
-                            .iter(),
-                    )
-                    .chain(race_link_imports(&factors).iter())
                     .cloned()
+                    .chain(TESTMAIN_IMPORTS.map(String::from))
+                    .chain(race_link_imports(&factors))
                     .collect();
                 let transitive = Arc::clone(&self)
                     .collect_transitive_libs(
                         Arc::clone(&req.executor),
-                        &pkg,
+                        &pkg.imports,
                         &test_extra,
                         &vref,
                         &module_root,
@@ -2829,13 +2861,13 @@ impl ProviderInner {
 
                 // Assemble flat importcfg list: dedup by importpath, then add P→test_lib.
                 let mut all_libs: Vec<(String, Addr)> = Vec::new();
-                let mut seen: HashSet<String> = HashSet::new();
-                for (ip, a) in transitive.libs {
-                    if ip == import_path {
+                let mut seen: HashSet<&str> = HashSet::new();
+                for (ip, a) in &transitive.libs {
+                    if *ip == import_path {
                         continue; // P slot reserved for test_lib below
                     }
-                    if seen.insert(ip.clone()) {
-                        all_libs.push((ip, a));
+                    if seen.insert(ip) {
+                        all_libs.push((ip.clone(), a.clone()));
                     }
                 }
                 let test_lib_addr =
@@ -2863,51 +2895,21 @@ impl ProviderInner {
                 if pkg.xtest_go_files.is_empty() {
                     return Err(GetError::NotFound);
                 }
-                let xtest_extra: Vec<String> = pkg
+                let xtest_root_imports: Vec<String> = pkg
                     .xtest_imports
                     .iter()
                     .chain(&pkg.imports)
-                    .chain(
-                        ["os", "reflect", "testing", "testing/internal/testdeps"]
-                            .iter()
-                            .map(|s| (*s).to_string())
-                            .collect::<Vec<_>>()
-                            .iter(),
-                    )
-                    .chain(race_link_imports(&factors).iter())
                     .cloned()
+                    .chain(TESTMAIN_IMPORTS.map(String::from))
+                    .chain(race_link_imports(&factors))
                     .collect();
-                // Walk from a synthetic pkg whose imports are xtest_extra; pkg.imports
-                // are already in there, so the transitive closure covers everything
-                // both P (normal) and P_test (xtest_lib) need.
-                let xtest_root = GoPackage {
-                    import_path: format!("{}_test", import_path),
-                    dir: pkg.dir.clone(),
-                    name: pkg.name.clone(),
-                    go_files: vec![],
-                    s_files: vec![],
-                    h_files: vec![],
-                    test_go_files: vec![],
-                    xtest_go_files: vec![],
-                    embed_patterns: vec![],
-                    embed_files: vec![],
-                    test_embed_patterns: vec![],
-                    test_embed_files: vec![],
-                    xtest_embed_patterns: vec![],
-                    xtest_embed_files: vec![],
-                    imports: xtest_extra.clone(),
-                    test_imports: vec![],
-                    xtest_imports: vec![],
-                    standard: false,
-                    module: pkg.module.clone(),
-                    match_: vec![],
-                    incomplete: false,
-                    error: None,
-                };
+                // Walk from the xtest root's imports; pkg.imports are already in
+                // there, so the transitive closure covers everything both P
+                // (normal) and P_test (xtest_lib) need.
                 let transitive = Arc::clone(&self)
                     .collect_transitive_libs(
                         Arc::clone(&req.executor),
-                        &xtest_root,
+                        &xtest_root_imports,
                         &[],
                         &vref,
                         &module_root,
@@ -2916,7 +2918,7 @@ impl ProviderInner {
                     .map_err(GetError::Other)?;
 
                 let mut all_libs: Vec<(String, Addr)> = Vec::new();
-                let mut seen: HashSet<String> = HashSet::new();
+                let mut seen: HashSet<&str> = HashSet::new();
                 // P's flavor in xtest bin must match xtest_lib's compile-time
                 // view (see `pick_xtest_p_lib_name`). For pure xtest-only
                 // packages P has no lib at all — skip the slot entirely so we
@@ -2924,18 +2926,18 @@ impl ProviderInner {
                 if let Some(p_lib_name) = pick_xtest_p_lib_name(&pkg) {
                     let p_addr = self.make_addr_with_name(&addr.package, p_lib_name, &vref);
                     all_libs.push((import_path.clone(), p_addr));
-                    seen.insert(import_path.clone());
+                    seen.insert(&import_path);
                 } else {
                     // Still reserve the slot so a transitive resolution of P
                     // (resolves to build_lib addr that doesn't exist) doesn't
                     // sneak into the importcfg.
-                    seen.insert(import_path.clone());
+                    seen.insert(&import_path);
                 }
                 let p_test = format!("{}_test", import_path);
-                seen.insert(p_test.clone()); // reserve for xtest_lib below
-                for (ip, a) in transitive.libs {
-                    if seen.insert(ip.clone()) {
-                        all_libs.push((ip, a));
+                seen.insert(&p_test); // reserve for xtest_lib below
+                for (ip, a) in &transitive.libs {
+                    if seen.insert(ip) {
+                        all_libs.push((ip.clone(), a.clone()));
                     }
                 }
                 let xtest_lib_addr =
@@ -3050,7 +3052,6 @@ impl ProviderInner {
                     &module_root_rel.to_string_lossy(),
                     &go_mod_addr,
                     &go_src_glob_addr,
-                    None,
                     &extra_src_addrs,
                     has_test_files,
                 )?
@@ -3110,116 +3111,54 @@ impl ProviderInner {
     }
 
     /// Read and parse the single package from a `_golist` target's output artifact.
-    ///
-    /// `executor.result(golist_addr)` is called OUTSIDE the `once` closure so
-    /// every caller (owner + cache-hit waiters) routes through
-    /// `Engine::result_addr`, which registers the `parent → golist_addr` edge
-    /// in the request's `DepDag`. Memoizing the executor call inside the
-    /// closure would let waiters skip dep registration, hiding a real target-
-    /// dep cycle as a memoizer deadlock. The cache only memoizes the artifact
-    /// parse, which is the expensive part.
     async fn read_golist_package(
         &self,
         executor: Arc<dyn ProviderExecutor>,
         golist_addr: &Addr,
     ) -> anyhow::Result<Arc<GoPackage>> {
-        // Fast path: the package is already parsed plugin-side, so we only need
-        // to register the `parent → golist_addr` dep edge (the host's cycle
-        // check). That's a cheap edge-only `note_dep` instead of a full
-        // `result()`, which would re-run the engine's whole result pipeline plus
-        // a lease round-trip for every edge — the dominant cost on the remote
-        // resolve path (every transitive import hits this).
-        if let Some(cached) = self.pkg_cache.peek(golist_addr) {
-            executor.note_dep(golist_addr).await?;
-            return cached.map_err(unwrap_arc_err);
-        }
-        let result = executor.result(golist_addr).await?;
-        self.pkg_cache
-            .once(
-                golist_addr.clone(),
-                enclose!((result) move || async move {
-                    let pkg = hcore::blocking::run(move || -> anyhow::Result<_> {
-                        for artifact in &result.artifacts {
-                            for entry_result in artifact.walk()? {
-                                let entry = entry_result?;
-                                if entry.path.file_name().and_then(|n| n.to_str())
-                                    != Some("package.bin")
-                                {
-                                    continue;
-                                }
-                                let data = match entry.kind {
-                                    hcore::hartifactcontent::WalkEntryKind::File { data, .. } => data,
-                                    hcore::hartifactcontent::WalkEntryKind::Symlink { .. } => continue,
-                                };
-                                return decode_go_package(data);
-                            }
-                        }
-                        anyhow::bail!("_golist produced no package.bin")
-                    })
-                    .await?;
-                    // `go list -e` reports no-buildable-files cases as a JSON
-                    // entry with the Error field populated and empty GoFiles.
-                    // Surface that as a typed sentinel so consumers can map it
-                    // to NotFound uniformly (mirrors errNoGoFiles in the Go
-                    // reference impl: heph/plugin/plugingo/pkg_analysis.go:34).
-                    //
-                    // Test-only packages (only `package pkg_test` xtest files)
-                    // are NOT NOGO — go list -test reports a synthetic primary
-                    // entry without an Error in that case, so xtest variants
-                    // remain reachable.
-                    if pkg.go_files.is_empty() && pkg.error.is_some() {
-                        return Err(anyhow::Error::new(NoGoFilesError {
-                            import_path: pkg.import_path.clone(),
-                        }));
-                    }
-                    Ok(Arc::new(pkg))
-                }),
-            )
-            .await
-            .map_err(unwrap_arc_err)
+        read_golist_cached(
+            &self.pkg_cache,
+            executor,
+            golist_addr,
+            "package.bin",
+            |data| {
+                let pkg = decode_go_package(data)?;
+                // `go list -e` reports no-buildable-files cases as a JSON
+                // entry with the Error field populated and empty GoFiles.
+                // Surface that as a typed sentinel so consumers can map it
+                // to NotFound uniformly (mirrors errNoGoFiles in the Go
+                // reference impl: heph/plugin/plugingo/pkg_analysis.go:34).
+                //
+                // Test-only packages (only `package pkg_test` xtest files)
+                // are NOT NOGO — go list -test reports a synthetic primary
+                // entry without an Error in that case, so xtest variants
+                // remain reachable.
+                if pkg.go_files.is_empty() && pkg.error.is_some() {
+                    return Err(anyhow::Error::new(NoGoFilesError {
+                        import_path: pkg.import_path.clone(),
+                    }));
+                }
+                Ok(pkg)
+            },
+        )
+        .await
     }
 
+    /// Read and parse the driver-resolved per-file addresses from a `_golist`
+    /// target's output artifact.
     async fn read_golist_package_addrs(
         &self,
         executor: Arc<dyn ProviderExecutor>,
         golist_addr: &Addr,
     ) -> anyhow::Result<Arc<PackageAddrs>> {
-        // executor.result is called outside the once closure so waiters register
-        // the dep edge, not just the cache owner. Cache hit: cheap edge-only
-        // note_dep (see read_golist_package).
-        if let Some(cached) = self.pkg_addrs_cache.peek(golist_addr) {
-            executor.note_dep(golist_addr).await?;
-            return cached.map_err(unwrap_arc_err);
-        }
-        let result = executor.result(golist_addr).await?;
-        self.pkg_addrs_cache
-            .once(
-                golist_addr.clone(),
-                enclose!((result) move || async move {
-                    let addrs = hcore::blocking::run(move || -> anyhow::Result<_> {
-                        for artifact in &result.artifacts {
-                            for entry_result in artifact.walk()? {
-                                let entry = entry_result?;
-                                if entry.path.file_name().and_then(|n| n.to_str())
-                                    != Some("package_addrs.bin")
-                                {
-                                    continue;
-                                }
-                                let data = match entry.kind {
-                                    hcore::hartifactcontent::WalkEntryKind::File { data, .. } => data,
-                                    hcore::hartifactcontent::WalkEntryKind::Symlink { .. } => continue,
-                                };
-                                return decode_package_addrs(data);
-                            }
-                        }
-                        anyhow::bail!("_golist produced no package_addrs.bin")
-                    })
-                    .await?;
-                    Ok(Arc::new(addrs))
-                }),
-            )
-            .await
-            .map_err(unwrap_arc_err)
+        read_golist_cached(
+            &self.pkg_addrs_cache,
+            executor,
+            golist_addr,
+            "package_addrs.bin",
+            decode_package_addrs,
+        )
+        .await
     }
 
     fn build_lib_addr(&self, addr: &Addr, vref: &VariantRef) -> Addr {
@@ -3598,13 +3537,13 @@ impl ProviderInner {
     /// Build the cache key for `collect_*_libs`. Imports are sorted+deduped so
     /// distinct caller-side orderings of the same logical input set hash to one entry.
     fn libs_key(
-        root_pkg: &GoPackage,
+        root_imports: &[String],
         extra_imports: &[String],
         vref: &VariantRef,
         module_root: &Path,
         transitive: bool,
     ) -> LibsKey {
-        let mut imports: Vec<String> = root_pkg.imports.clone();
+        let mut imports: Vec<String> = root_imports.to_vec();
         imports.sort();
         imports.dedup();
         let mut extra: Vec<String> = extra_imports.to_vec();
@@ -3619,7 +3558,8 @@ impl ProviderInner {
         }
     }
 
-    /// Collect all transitive lib addresses for a package's imports, recursively.
+    /// Collect all transitive lib addresses for a package's imports
+    /// (`root_imports`, plus `extra_imports`), recursively.
     ///
     /// Each BFS frontier is processed concurrently via `try_join_all`. Each dep's
     /// `_golist` target is fetched via `executor.result` (engine pipeline with disk
@@ -3632,45 +3572,59 @@ impl ProviderInner {
     async fn collect_transitive_libs(
         self: Arc<Self>,
         executor: Arc<dyn ProviderExecutor>,
-        root_pkg: &GoPackage,
+        root_imports: &[String],
         extra_imports: &[String],
         vref: &VariantRef,
         module_root: &Path,
-    ) -> anyhow::Result<TransitiveDeps> {
-        self.collect_libs(executor, root_pkg, extra_imports, vref, module_root, true)
-            .await
+    ) -> anyhow::Result<Arc<TransitiveDeps>> {
+        self.collect_libs(
+            executor,
+            root_imports,
+            extra_imports,
+            vref,
+            module_root,
+            true,
+        )
+        .await
     }
 
     /// Resolve direct imports only (no recursion) — correct for compile steps.
     async fn collect_direct_libs(
         self: Arc<Self>,
         executor: Arc<dyn ProviderExecutor>,
-        root_pkg: &GoPackage,
+        root_imports: &[String],
         extra_imports: &[String],
         vref: &VariantRef,
         module_root: &Path,
-    ) -> anyhow::Result<TransitiveDeps> {
-        self.collect_libs(executor, root_pkg, extra_imports, vref, module_root, false)
-            .await
+    ) -> anyhow::Result<Arc<TransitiveDeps>> {
+        self.collect_libs(
+            executor,
+            root_imports,
+            extra_imports,
+            vref,
+            module_root,
+            false,
+        )
+        .await
     }
 
     async fn collect_libs(
         self: Arc<Self>,
         executor: Arc<dyn ProviderExecutor>,
-        root_pkg: &GoPackage,
+        root_imports: &[String],
         extra_imports: &[String],
         vref: &VariantRef,
         module_root: &Path,
         transitive: bool,
-    ) -> anyhow::Result<TransitiveDeps> {
-        let key = Self::libs_key(root_pkg, extra_imports, vref, module_root, transitive);
+    ) -> anyhow::Result<Arc<TransitiveDeps>> {
+        let key = Self::libs_key(root_imports, extra_imports, vref, module_root, transitive);
         let extra = extra_imports.to_vec();
+        let root_imports = root_imports.to_vec();
         let module_root = module_root.to_path_buf();
-        let arc = self
-            .libs_cache
+        self.libs_cache
             .once(
                 key,
-                enclose!((self => me, executor, vref, root_pkg.imports => root_imports) move || async move {
+                enclose!((self => me, executor, vref) move || async move {
                     me.collect_libs_inner(
                         executor,
                         &root_imports,
@@ -3684,8 +3638,7 @@ impl ProviderInner {
                 }),
             )
             .await
-            .map_err(unwrap_arc_err)?;
-        Ok((*arc).clone())
+            .map_err(unwrap_arc_err)
     }
 
     fn load_go_mod(&self, module_root: &Path) -> anyhow::Result<Arc<GoModData>> {
@@ -3822,27 +3775,27 @@ impl ProviderInner {
     ) -> anyhow::Result<TransitiveDeps> {
         let go_mod = self.load_go_mod(module_root)?;
 
-        if transitive {
-            // Pre-dedupe the top-level set so we don't fan out the same
-            // import_path twice (also halves cache lookups for repeated entries
-            // between `root_imports` and `extra_imports`).
-            let mut unique_imports: Vec<String> = root_imports
-                .iter()
-                .chain(extra_imports.iter())
-                .filter(|i| *i != "unsafe" && *i != "C")
-                .cloned()
-                .collect::<HashSet<_>>()
-                .into_iter()
-                .collect();
-            // HashSet iteration order is randomized per process; sort so the
-            // resulting transitive lib order is deterministic run-to-run.
-            unique_imports.sort();
+        // Dedupe the top-level set so we don't fan out the same import_path
+        // twice (also halves cache lookups for repeated entries between
+        // `root_imports` and `extra_imports`), and sort it so the resulting lib
+        // order is deterministic. The go_compile cache key sorts at the hash
+        // boundary too, but keeping both lanes deterministic avoids surprising
+        // any other consumer of `TransitiveDeps.libs`.
+        let mut imports: Vec<&str> = root_imports
+            .iter()
+            .chain(extra_imports)
+            .map(String::as_str)
+            .filter(|i| *i != "unsafe" && *i != "C")
+            .collect();
+        imports.sort_unstable();
+        imports.dedup();
 
+        if transitive {
             let module_root_buf = module_root.to_path_buf();
-            let sub_closures = try_join_all(unique_imports.into_iter().map(|ip| {
+            let sub_closures = try_join_all(imports.into_iter().map(|ip| {
                 Arc::clone(&self).import_closure(
                     Arc::clone(&executor),
-                    ip,
+                    ip.to_string(),
                     vref.clone(),
                     Arc::clone(&go_mod),
                     module_root_buf.clone(),
@@ -3863,22 +3816,7 @@ impl ProviderInner {
         let go_mod_requires = &go_mod.requires;
         let workspace_module_path = go_mod.module_path.as_str();
 
-        let mut imports: Vec<String> = root_imports
-            .iter()
-            .chain(extra_imports.iter())
-            .filter(|i| *i != "unsafe" && *i != "C")
-            .cloned()
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-        // HashSet iteration order is randomized per process; sort so the
-        // resulting `libs` order is deterministic run-to-run (mirrors the
-        // transitive branch above). The go_compile cache key sorts at the hash
-        // boundary too, but keeping this lane deterministic avoids surprising any
-        // other consumer of `TransitiveDeps.libs`.
-        imports.sort();
-
-        let results = try_join_all(imports.iter().map(|ip| {
+        let results = try_join_all(imports.into_iter().map(|ip| {
             self.resolve_import(
                 Arc::clone(&executor),
                 ip,
@@ -3928,9 +3866,8 @@ impl ProviderInner {
         module_root: &Path,
         need_sub_imports: bool,
     ) -> anyhow::Result<(String, Option<Addr>, Vec<String>)> {
-        let is_workspace_module = !workspace_module_path.is_empty()
-            && (import_path == workspace_module_path
-                || import_path.starts_with(&format!("{}/", workspace_module_path)));
+        let is_workspace_module =
+            !workspace_module_path.is_empty() && path_in_prefix(import_path, workspace_module_path);
         if !is_workspace_module && is_stdlib_import_path(import_path) {
             let addr = encode_stdlib(import_path, vref);
             if !need_sub_imports {
@@ -3957,7 +3894,7 @@ impl ProviderInner {
             import_path,
             vref,
             module_root,
-            workspace_module_path,
+            is_workspace_module.then_some(workspace_module_path),
             go_mod_requires,
         ) {
             Some(a) => a,
@@ -3990,22 +3927,23 @@ impl ProviderInner {
     }
 
     /// Resolve an import path to a heph `build_lib` Addr.
+    ///
+    /// `workspace_module` is the workspace module's path (from go.mod) when
+    /// `import_path` lies in it, `None` otherwise — the caller has already
+    /// made that check.
     fn resolve_import_to_addr(
         &self,
         import_path: &str,
         vref: &VariantRef,
         module_root: &Path,
-        workspace_module_path: &str,
+        workspace_module: Option<&str>,
         go_mod_requires: &[(String, String)],
     ) -> Option<Addr> {
         // Check if it's a first-party import (in the workspace module).
         // We use workspace_module_path (from go.mod) rather than root_pkg.module.path
         // because root_pkg may itself be a third-party package — its sub-packages must
         // still be resolved as third-party, not mapped into the workspace.
-        if !workspace_module_path.is_empty()
-            && (import_path == workspace_module_path
-                || import_path.starts_with(&format!("{}/", workspace_module_path)))
-        {
+        if let Some(workspace_module_path) = workspace_module {
             let rel_suffix = import_path
                 .strip_prefix(workspace_module_path)
                 .and_then(|s| s.strip_prefix('/'))
@@ -4024,17 +3962,15 @@ impl ProviderInner {
         // Third-party: look up in go.mod requires
         if let Some((mod_path, version)) = find_module_for_import(import_path, go_mod_requires) {
             let subpath = import_path
-                .strip_prefix(&mod_path)
+                .strip_prefix(mod_path)
                 .and_then(|s| s.strip_prefix('/'))
-                .unwrap_or("")
-                .to_string();
+                .unwrap_or("");
             let base_pkg = module_root
                 .strip_prefix(&self.workspace_root)
                 .unwrap_or_else(|_| Path::new(""))
-                .to_string_lossy()
-                .to_string();
+                .to_string_lossy();
             return Some(encode_thirdparty(
-                &mod_path, &version, &subpath, &base_pkg, vref,
+                mod_path, version, subpath, &base_pkg, vref,
             ));
         }
 
@@ -4042,35 +3978,9 @@ impl ProviderInner {
     }
 }
 
-/// Build a synthetic `GoPackage` representing the `main` package of a
-/// testmain.go file. Only `imports` is set — used to drive
-/// `collect_direct_libs` resolution.
-fn make_testmain_pkg(pkg: &GoPackage, imports: &[&str]) -> GoPackage {
-    GoPackage {
-        import_path: "main".to_string(),
-        dir: pkg.dir.clone(),
-        name: Some("main".to_string()),
-        go_files: vec![],
-        s_files: vec![],
-        h_files: vec![],
-        test_go_files: vec![],
-        xtest_go_files: vec![],
-        embed_patterns: vec![],
-        embed_files: vec![],
-        test_embed_patterns: vec![],
-        test_embed_files: vec![],
-        xtest_embed_patterns: vec![],
-        xtest_embed_files: vec![],
-        imports: imports.iter().map(|s| (*s).to_string()).collect(),
-        test_imports: vec![],
-        xtest_imports: vec![],
-        standard: false,
-        module: pkg.module.clone(),
-        match_: vec![],
-        incomplete: false,
-        error: None,
-    }
-}
+/// The packages a generated testmain.go imports, besides the package under
+/// test: the roots of a testmain lib's direct libs, and part of a test link's.
+const TESTMAIN_IMPORTS: [&str; 4] = ["os", "reflect", "testing", "testing/internal/testdeps"];
 
 fn build_testmain_spec(
     addr: Addr,
@@ -5570,20 +5480,20 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn parse_format_spec(
         spec: hplugin::provider::TargetSpec,
     ) -> hplugin::driver::targetdef::TargetDef {
-        use crate::plugingo::driver_format::{GoFormatCheckDriver, GoFormatDriver};
+        use crate::plugingo::driver_format::GoFormatDriver;
         use hdriver_support::driver_managed::ManagedDriver as _;
         use hplugin::driver::ParseRequest;
-        let is_fix = spec.driver == "go.format";
+        let driver = if spec.driver == "go.format" {
+            GoFormatDriver::fix()
+        } else {
+            GoFormatDriver::check()
+        };
         let req = ParseRequest {
             request_id: "test".to_string(),
             target_spec: Arc::new(spec),
         };
         let ct = StdCancellationToken::new();
-        let resp = if is_fix {
-            GoFormatDriver::new().parse(req, &ct).await
-        } else {
-            GoFormatCheckDriver::new().parse(req, &ct).await
-        };
+        let resp = driver.parse(req, &ct).await;
         resp.expect("format spec parses").target_def
     }
 
@@ -8775,6 +8685,91 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             "//mgmt/go/cmd/exporter/rest/..."
         );
         assert_eq!(default_scope(""), "//");
+    }
+
+    /// Pins the exact addr strings of both source lanes and the static embed
+    /// glob. They reach `_golist`'s and `build_lib`'s def hashes, so a change to
+    /// any byte of them invalidates every Go target.
+    #[test]
+    fn source_lane_addrs_are_byte_stable() {
+        fn state(pkg: &str, entries: &[(&str, Value)]) -> State {
+            State {
+                package: PkgBuf::from(pkg),
+                provider: "go".to_string(),
+                state: entries
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.clone()))
+                    .collect(),
+            }
+        }
+        let list = |s: &str| Value::List(vec![Value::String(s.to_string())]);
+        let states = vec![
+            state(
+                "",
+                &[
+                    ("go_codegen_deps", list("//shallow:gen")),
+                    ("go_embed_deps", list("//shallow:dist")),
+                ],
+            ),
+            state(
+                "app",
+                &[
+                    ("go_codegen_root", Value::Bool(true)),
+                    ("go_codegen_deps", list("//app:gen")),
+                ],
+            ),
+            state("app/sub", &[("go_codegen_root", Value::Bool(false))]),
+        ];
+
+        // Scope from the deepest codegen root (`app`, not the `false` one at
+        // `app/sub`); deps from the deepest state carrying each key.
+        assert_eq!(
+            compute_pkg_src_addrs("app/sub", &states).unwrap(),
+            [
+                r#"//@heph/fs:glob@e="**/*.go,**/go.mod,**/go.sum",p=app/sub/**/*"#,
+                r#"//@heph/query:query@exclude_provider=go,expr="//app/... && label(go_src) && tree_output(app/sub)""#,
+                "//app:gen",
+            ]
+        );
+        assert_eq!(
+            compute_embed_src_addrs("app/sub", &states).unwrap(),
+            [
+                r#"//@heph/query:query@exclude_provider=go,expr="//app/... && label(go_embed_src) && tree_output(app/sub)""#,
+                "//shallow:dist",
+            ]
+        );
+        assert_eq!(
+            compute_pkg_src_addrs("", &[]).unwrap(),
+            [
+                r#"//@heph/fs:glob@e="**/*.go,**/go.mod,**/go.sum",p=**/*"#,
+                r#"//@heph/query:query@exclude_provider=go,expr="// && label(go_src) && tree_output()""#,
+            ]
+        );
+        assert_eq!(
+            compute_embed_src_addrs("", &[]).unwrap(),
+            [
+                r#"//@heph/query:query@exclude_provider=go,expr="// && label(go_embed_src) && tree_output()""#
+            ]
+        );
+        assert_eq!(
+            compute_pkg_src_addrs("lib[x]", &[]).unwrap(),
+            [
+                r#"//@heph/fs:glob@e="**/*.go,**/go.mod,**/go.sum",p=lib\[x\]/**/*"#,
+                r#"//@heph/query:query@exclude_provider=go,expr="//lib[x]/... && label(go_src) && tree_output(lib[x])""#,
+            ]
+        );
+        assert_eq!(
+            pkg_static_embed_glob_addr("app/sub"),
+            "//@heph/fs:glob@e=**/*.go,p=app/sub/**/*"
+        );
+        assert_eq!(
+            pkg_static_embed_glob_addr(""),
+            "//@heph/fs:glob@e=**/*.go,p=**/*"
+        );
+        assert_eq!(
+            pkg_static_embed_glob_addr("lib[x]"),
+            r"//@heph/fs:glob@e=**/*.go,p=lib\[x\]/**/*"
+        );
     }
 
     #[test]

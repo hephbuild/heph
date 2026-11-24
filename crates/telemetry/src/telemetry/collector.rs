@@ -14,6 +14,7 @@
 //!
 //! [`RequestState::emit`]: RequestState::emit
 
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use hcore::events::{BuildEventKind, CacheCounts};
@@ -182,17 +183,9 @@ pub struct TelemetryCollector {
     /// Local-cache blobs that crossed the spill threshold and moved from the
     /// primary store onto the FS blob store.
     cache_spills: AtomicU64,
-    /// Whether a `--expr` query was parsed this run, and the per-node counts of
-    /// its matcher tree (recorded by the command that parses it).
-    query_expr_present: AtomicU8,
-    qe_addr: AtomicU64,
-    qe_label: AtomicU64,
-    qe_package: AtomicU64,
-    qe_package_prefix: AtomicU64,
-    qe_tree_output: AtomicU64,
-    qe_and: AtomicU64,
-    qe_or: AtomicU64,
-    qe_not: AtomicU64,
+    /// The per-node counts of the `--expr` query parsed this run, if one was
+    /// (recorded by the command that parses it).
+    query_expr: OnceLock<QueryExprCounts>,
     /// Interactive-TUI decision, recorded where `should_use_tui` makes it (tri-
     /// state — see the `INTERACTIVE_*` constants).
     interactive: AtomicU8,
@@ -233,15 +226,7 @@ impl TelemetryCollector {
             sandbox_fuse: AtomicU64::new(0),
             sandbox_os: AtomicU64::new(0),
             cache_spills: AtomicU64::new(0),
-            query_expr_present: AtomicU8::new(0),
-            qe_addr: AtomicU64::new(0),
-            qe_label: AtomicU64::new(0),
-            qe_package: AtomicU64::new(0),
-            qe_package_prefix: AtomicU64::new(0),
-            qe_tree_output: AtomicU64::new(0),
-            qe_and: AtomicU64::new(0),
-            qe_or: AtomicU64::new(0),
-            qe_not: AtomicU64::new(0),
+            query_expr: OnceLock::new(),
             interactive: AtomicU8::new(INTERACTIVE_UNSET),
         }
     }
@@ -285,25 +270,25 @@ impl TelemetryCollector {
     /// per-artifact `byte_size()`s. Artifact size lives on the result, not the
     /// event stream, so this is recorded explicitly where `result_addr` produces
     /// the `EResult`. Sizes fold into the fixed histogram — constant memory.
-    pub fn record_artifacts(&self, count: u64, sizes: &[u64]) {
+    pub fn record_artifacts(&self, count: u64, sizes: impl IntoIterator<Item = u64>) {
         // Most calls record nothing (a meta edge reads no outputs); skip the
         // shared RMW for those.
         if count != 0 {
             self.artifacts.fetch_add(count, Ordering::Relaxed);
         }
-        if sizes.is_empty() {
+        let (mut n, mut sum, mut max) = (0u64, 0u64, 0u64);
+        for size in sizes {
+            self.size_histogram.record(size);
+            n += 1;
+            sum += size;
+            max = max.max(size);
+        }
+        if n == 0 {
             return;
         }
-        self.sized_artifacts
-            .fetch_add(sizes.len() as u64, Ordering::Relaxed);
-        let sum: u64 = sizes.iter().sum();
+        self.sized_artifacts.fetch_add(n, Ordering::Relaxed);
         self.artifact_bytes.fetch_add(sum, Ordering::Relaxed);
-        if let Some(&max) = sizes.iter().max() {
-            self.max_artifact_bytes.fetch_max(max, Ordering::Relaxed);
-        }
-        for &size in sizes {
-            self.size_histogram.record(size);
-        }
+        self.max_artifact_bytes.fetch_max(max, Ordering::Relaxed);
     }
 
     /// Record one target's execute wall time (ms). Called only on a real
@@ -361,20 +346,10 @@ impl TelemetryCollector {
 
     /// Record the per-node shape of a parsed `--expr` query matcher. Called by
     /// the command that runs the real query parser, so the syntax is never
-    /// re-interpreted here. Counts accumulate (a run parses at most one expr).
+    /// re-interpreted here. A run parses at most one expr; should a second
+    /// arrive, the first record wins.
     pub fn record_query_expr(&self, c: &QueryExprCounts) {
-        self.query_expr_present.store(1, Ordering::Relaxed);
-        self.qe_addr.fetch_add(c.addr.into(), Ordering::Relaxed);
-        self.qe_label.fetch_add(c.label.into(), Ordering::Relaxed);
-        self.qe_package
-            .fetch_add(c.package.into(), Ordering::Relaxed);
-        self.qe_package_prefix
-            .fetch_add(c.package_prefix.into(), Ordering::Relaxed);
-        self.qe_tree_output
-            .fetch_add(c.tree_output.into(), Ordering::Relaxed);
-        self.qe_and.fetch_add(c.and.into(), Ordering::Relaxed);
-        self.qe_or.fetch_add(c.or.into(), Ordering::Relaxed);
-        self.qe_not.fetch_add(c.not.into(), Ordering::Relaxed);
+        self.query_expr.get_or_init(|| *c);
     }
 
     /// Record the interactive-TUI decision exactly as `should_use_tui` made it.
@@ -415,18 +390,7 @@ impl TelemetryCollector {
             sandbox_fuse: self.sandbox_fuse.load(Ordering::Relaxed),
             sandbox_os: self.sandbox_os.load(Ordering::Relaxed),
             cache_spills: self.cache_spills.load(Ordering::Relaxed),
-            query_expr: (self.query_expr_present.load(Ordering::Relaxed) != 0).then(|| {
-                QueryExprCounts {
-                    addr: self.qe_addr.load(Ordering::Relaxed) as u32,
-                    label: self.qe_label.load(Ordering::Relaxed) as u32,
-                    package: self.qe_package.load(Ordering::Relaxed) as u32,
-                    package_prefix: self.qe_package_prefix.load(Ordering::Relaxed) as u32,
-                    tree_output: self.qe_tree_output.load(Ordering::Relaxed) as u32,
-                    and: self.qe_and.load(Ordering::Relaxed) as u32,
-                    or: self.qe_or.load(Ordering::Relaxed) as u32,
-                    not: self.qe_not.load(Ordering::Relaxed) as u32,
-                }
-            }),
+            query_expr: self.query_expr.get().copied(),
             interactive: match self.interactive.load(Ordering::Relaxed) {
                 INTERACTIVE_YES => Some(true),
                 INTERACTIVE_NO => Some(false),
@@ -643,6 +607,12 @@ mod tests {
             ..QueryExprCounts::default()
         });
         c.record_interactive(false);
+        // A second record does not overwrite or add to the first.
+        c.record_query_expr(&QueryExprCounts {
+            addr: 5,
+            label: 7,
+            ..QueryExprCounts::default()
+        });
         let s = c.snapshot();
         let q = s.query_expr.expect("present after record");
         assert_eq!(q.label, 2);
@@ -656,8 +626,8 @@ mod tests {
     fn record_artifacts_accumulates_counts_and_sizes() {
         let c = TelemetryCollector::new();
         // 2 artifacts, one size unknown (only one size reported).
-        c.record_artifacts(2, &[100]);
-        c.record_artifacts(3, &[50, 200, 10]);
+        c.record_artifacts(2, [100]);
+        c.record_artifacts(3, [50, 200, 10]);
         let s = c.snapshot();
         assert_eq!(
             s.artifacts, 5,
@@ -686,8 +656,8 @@ mod tests {
         // 99 small artifacts (size 1 → bucket 1, upper edge 1) and one big one
         // (size 1<<20 → bucket 21). The 99th-rank value is small.
         let small = vec![1u64; 99];
-        c.record_artifacts(99, &small);
-        c.record_artifacts(1, &[1 << 20]);
+        c.record_artifacts(99, small);
+        c.record_artifacts(1, [1 << 20]);
         let s = c.snapshot();
         // p99 lands in the small bucket (upper edge 1), not the big one.
         assert_eq!(s.p99_artifact_bytes, 1);
@@ -702,7 +672,7 @@ mod tests {
         let c = TelemetryCollector::new();
         // All sizes 1000 → bucket 10 ([512,1023], upper edge 1023). True p99 is
         // 1000; the estimate (1023) is within a factor of 2.
-        c.record_artifacts(100, &vec![1000u64; 100]);
+        c.record_artifacts(100, vec![1000u64; 100]);
         let p99 = c.snapshot().p99_artifact_bytes;
         assert!(
             (1000..=2000).contains(&p99),

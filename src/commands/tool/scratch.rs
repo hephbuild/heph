@@ -276,7 +276,7 @@ fn local_trace(
     seed_on_fork: bool,
 ) -> Vec<(String, bool)> {
     let has = |sc: &str| {
-        let p = crate::engine::scratch_remote::scope_head_dir(home, slot, sc);
+        let p = crate::engine::scratch_store::head_dir(home, slot, sc);
         std::fs::read_dir(&p).is_ok_and(|mut d| d.next().is_some())
     };
 
@@ -364,8 +364,8 @@ async fn head_trace(
     // skipped straight to the network would name the wrong winner in exactly the
     // case this command exists for: a fresh branch on a machine that has built
     // its base.
-    let local = crate::engine::scratch_remote::scope_head_dir(&engine.home, &slot, &scope);
-    let head_of = |sc: &str| crate::engine::scratch_remote::scope_head_dir(&engine.home, &slot, sc);
+    let local = crate::engine::scratch_store::head_dir(&engine.home, &slot, &scope);
+    let head_of = |sc: &str| crate::engine::scratch_store::head_dir(&engine.home, &slot, sc);
 
     let trace = local_trace(
         &engine.home,
@@ -584,7 +584,7 @@ async fn push(
             .as_ref()
             .map(|m| m.addr.clone())
             .unwrap_or_else(|| slot.slot.clone());
-        let dir = crate::engine::scratch_remote::scope_head_dir(&engine.home, &slot.slot, &scope);
+        let dir = crate::engine::scratch_store::head_dir(&engine.home, &slot.slot, &scope);
         if !dir.is_dir() {
             println!("{name}: nothing built in this lineage, skipped");
             continue;
@@ -738,7 +738,7 @@ async fn pull_selected(
             outln!(out, "{addr}: nothing published for this branch");
             continue;
         };
-        let dir = crate::engine::scratch_remote::scope_head_dir(&engine.home, &slot, &scope);
+        let dir = crate::engine::scratch_store::head_dir(&engine.home, &slot, &scope);
         match engine.scratch_pull(&head, &dir).await {
             Ok(bytes) => {
                 crate::engine::scratch_remote::write_local_meta(
@@ -856,7 +856,7 @@ mod tests {
     fn the_local_walk_stops_at_the_first_warm_lineage() {
         let home = tempfile::tempdir().expect("tempdir");
         let warm = |sc: &str| {
-            let d = crate::engine::scratch_remote::scope_head_dir(home.path(), "s1", sc);
+            let d = crate::engine::scratch_store::head_dir(home.path(), "s1", sc);
             std::fs::create_dir_all(&d).expect("mkdir");
             std::fs::write(d.join("f"), b"x").expect("write");
         };
@@ -897,7 +897,7 @@ mod tests {
     #[test]
     fn seeding_off_means_the_walk_never_leaves_its_own_lineage() {
         let home = tempfile::tempdir().expect("tempdir");
-        let d = crate::engine::scratch_remote::scope_head_dir(home.path(), "s1", "master");
+        let d = crate::engine::scratch_store::head_dir(home.path(), "s1", "master");
         std::fs::create_dir_all(&d).expect("mkdir");
         std::fs::write(d.join("f"), b"x").expect("write");
 

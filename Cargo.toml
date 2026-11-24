@@ -122,14 +122,12 @@ workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
-borsh = { version = "1.8.1", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.6.9", features = ["derive"] }
 clap_complete = { version = "4.6", features = ["unstable-dynamic"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-log = "0.2"
-hproto-gen = { package = "proto-gen", path = "gen/proto" }
 hcore = { package = "core", path = "crates/core" }
 hwalk = { package = "walk", path = "crates/walk" }
 hproc = { package = "proc", path = "crates/proc" }
@@ -140,10 +138,8 @@ hplugin = { package = "plugin", path = "crates/plugin" }
 hbuiltins = { package = "builtins", path = "crates/builtins" }
 hcoreutils = { package = "coreutils", path = "crates/coreutils" }
 hplugin-buildfile = { package = "plugin-buildfile", path = "crates/plugin-buildfile" }
-hdriver-support = { package = "driver-support", path = "crates/driver-support" }
 hplugin-exec = { package = "plugin-exec", path = "crates/plugin-exec" }
 hplugin-nix = { package = "plugin-nix", path = "crates/plugin-nix" }
-hplugin-devenv = { package = "plugin-devenv", path = "crates/plugin-devenv" }
 hplugin-http = { package = "plugin-http", path = "crates/plugin-http" }
 hplugin-query = { package = "plugin-query", path = "crates/plugin-query" }
 htelemetry = { package = "telemetry", path = "crates/telemetry" }
@@ -154,60 +150,33 @@ hengine = { package = "engine", path = "crates/engine" }
 # Hands the host's log filter to the plugin loader (`log::init`).
 hplugin-stabby = { package = "plugin-stabby", path = "crates/plugin-stabby", features = ["host"] }
 hxstarlark-fmt = { package = "xstarlark-fmt", path = "crates/xstarlark-fmt" }
-htspec-derive = { path = "crates/htspec-derive" }
-nom = { version = "8", default-features = false, features = ["std"] }
 anyhow = "1.0.104"
 tokio = { version = "1.54.1", features = ["rt", "rt-multi-thread", "io-util", "io-std", "process", "macros", "sync", "signal", "fs", "time", "tracing", "net"] }
 # `frame-pointer` swaps pprof's stack walk from `_Unwind_Backtrace` (not
 # async-signal-safe — it faulted the process it was profiling) to a frame-pointer
 # chain walk that probes every address before dereferencing it. It needs the
 # frame pointers `-Cforce-frame-pointers=yes` in `.cargo/config.toml` emits; see
-# `src/pprof_dump.rs`.
-pprof = { version = "0.15", features = ["prost-codec", "frame-pointer"] }
+# `src/pprof_dump.rs`. Default features off: the default `cpp` only builds a C++
+# demangler, and heph has no C++ frames of its own (Rust symbols still demangle).
+pprof = { version = "0.15", default-features = false, features = ["prost-codec", "frame-pointer"] }
 futures = "0.3.34"
 async-trait = "0.1.92"
-async-recursion = "1"
-stacker = "0.1"
-async-stream = "0.3"
-smart-default = "0.7.1"
 humantime = "2.4.0"
-tokio-util = { version = "0.7.20", features = ["io", "io-util"] }
 xxhash-rust = { version = "0.8.21" , features = ["xxh3", "std"]}
-itertools = "0.15.0"
 tar = "0.4"
 glob = "0.3"
-wax = "0.7"
-walkdir = "2"
 xattr = "1"
-similar = "3"
 shlex = "2"
 tempfile = "3.27"
 thiserror = "2.0.21"
 enclose = "1"
 which = "8.0.6"
-# Held at the release r2d2_sqlite is built against: a newer rusqlite is a
-# second copy whose `Connection`/`Params` don't unify with the pool's.
-rusqlite = { version = "0.42", features = ["bundled", "blob"] }
-r2d2 = "0.8"
-r2d2_sqlite = "0.37"
-parking_lot = "0.13"
-rustc-hash = "2"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm", "macros", "scrolling-regions"] }
-ansi-to-tui = "8"
-unicode-width = "0.2"
 crossterm = { version = "0.29", features = ["event-stream"] }
 libc = "0.2"
-minijinja = "3"
-erased-serde = "0.4"
-crossbeam-channel = "0.5"
-quick_cache = "0.7"
-indexmap = "2"
-posthog-rs = "1.3.0"
 mimalloc = { version = "0.1", default-features = false }
-uuid = { version = "1.29.3", features = ["v4"] }
 object_store = { version = "0.14.2", features = ["aws", "gcp", "azure", "http", "tokio"] }
 url = "2.5.8"
-flate2 = "1.1.11"
 
 [features]
 # FUSE sandbox is on by default. The FUSE machinery (and its `fuser`/libfuse
@@ -226,7 +195,6 @@ fuse-sandbox = ["hsandboxfuse/fuse-sandbox"]
 mach2 = "0.7"
 
 [dev-dependencies]
-serde-jsonlines = "0.7.0"
 tempfile = "3"
 # `engine::fault_provider` for the command tests.
 hengine = { package = "engine", path = "crates/engine", features = ["test-support"] }

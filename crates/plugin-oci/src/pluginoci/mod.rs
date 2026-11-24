@@ -132,7 +132,8 @@ pub(crate) fn select_platform(
     for (manifest, p, digest) in manifests {
         let Some(p) = p else { continue };
         available.push(format!("{}/{}", p.os, p.architecture));
-        if p.os.to_string() == os && p.architecture.to_string() == arch {
+        // The first match wins.
+        if is_os_arch(&p, os, arch) {
             return Ok((manifest, digest));
         }
     }
@@ -229,6 +230,14 @@ pub(crate) fn split_platform(platform: &str) -> anyhow::Result<(&str, &str)> {
         _ => anyhow::bail!("`platform` must look like `os/arch`, got {platform:?}"),
     }
 }
+
+/// Whether an index entry's `platform` is the `os`/`arch` pair
+/// [`split_platform`] returned. The variant is not compared, for the reason
+/// given there. Which match wins when several do is the caller's policy.
+pub(crate) fn is_os_arch(platform: &oci_client::manifest::Platform, os: &str, arch: &str) -> bool {
+    platform.os.to_string() == os && platform.architecture.to_string() == arch
+}
+
 /// All paths a Dep input materialized into the sandbox, read from its `.list`
 /// file (one absolute path per line — see `driver_managed.rs::list_path_for`).
 ///
@@ -238,15 +247,15 @@ pub(crate) fn split_platform(platform: &str) -> anyhow::Result<(&str, &str)> {
 /// `parse`, never once per input: per input, every file comes back once per
 /// artifact.
 fn dep_files(req: &ManagedRunRequest<'_, '_>, origin_id: &str) -> anyhow::Result<Vec<PathBuf>> {
-    let Some(m) = req.inputs.iter().find(|m| {
-        m.input.origin_id == origin_id
-            && matches!(
-                m.input.artifact.r#type,
-                hplugin::driver::inputartifact::Type::Dep
-            )
-    }) else {
-        return Ok(Vec::new());
-    };
+    match find_dep_input(req, origin_id) {
+        Some(m) => read_dep_list(m),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// The paths a Dep input's `.list` file names: one absolute materialized path
+/// per line (see `driver_managed.rs::list_path_for`), blank lines skipped.
+fn read_dep_list(m: &ManagedRunInput) -> anyhow::Result<Vec<PathBuf>> {
     let list_path = m.require_list_path()?;
     let content = std::fs::read_to_string(list_path)
         .with_context(|| format!("read dep list {list_path:?}"))?;
@@ -299,32 +308,31 @@ pub(crate) fn dep_input<'r>(
     req: &'r ManagedRunRequest<'_, '_>,
     origin_id: &str,
 ) -> anyhow::Result<&'r ManagedRunInput> {
-    req.inputs
-        .iter()
-        .find(|m| {
-            m.input.origin_id == origin_id
-                && matches!(
-                    m.input.artifact.r#type,
-                    hplugin::driver::inputartifact::Type::Dep
-                )
-        })
-        .with_context(|| format!("no dep input {origin_id:?} in sandbox"))
+    find_dep_input(req, origin_id).with_context(|| format!("no dep input {origin_id:?} in sandbox"))
+}
+
+/// [`dep_input`], `None` when the request has no such input.
+fn find_dep_input<'r>(
+    req: &'r ManagedRunRequest<'_, '_>,
+    origin_id: &str,
+) -> Option<&'r ManagedRunInput> {
+    req.inputs.iter().find(|m| {
+        m.input.origin_id == origin_id
+            && matches!(
+                m.input.artifact.r#type,
+                hplugin::driver::inputartifact::Type::Dep
+            )
+    })
 }
 
 /// Absolute path to the single file a Dep input materialized into the sandbox.
-/// Reads the input's `.list` file (one absolute path per line — see
-/// `driver_managed.rs::list_path_for`). Errors unless exactly one file was
-/// produced, so a caller expecting one archive fails loudly on a mis-declared
-/// dep.
+/// Errors unless exactly one file was produced, so a caller expecting one
+/// archive fails loudly on a mis-declared dep.
 pub(crate) fn dep_single_file(
     req: &ManagedRunRequest<'_, '_>,
     origin_id: &str,
 ) -> anyhow::Result<PathBuf> {
-    let list_path = dep_input(req, origin_id)?.require_list_path()?;
-    // The `.list` file holds one absolute materialized path per line.
-    let content = std::fs::read_to_string(list_path)
-        .with_context(|| format!("read dep list {list_path:?}"))?;
-    let mut paths = content.lines().filter(|l| !l.is_empty());
+    let mut paths = read_dep_list(dep_input(req, origin_id)?)?.into_iter();
     let first = paths
         .next()
         .with_context(|| format!("dep {origin_id:?} produced no files"))?;
@@ -332,7 +340,7 @@ pub(crate) fn dep_single_file(
         paths.next().is_none(),
         "dep {origin_id:?} produced more than one file; expected exactly one archive"
     );
-    Ok(PathBuf::from(first))
+    Ok(first)
 }
 
 fn basename(path: &str) -> anyhow::Result<&std::ffi::OsStr> {
@@ -600,5 +608,47 @@ mod tests {
             assert_eq!(heavy.resources.declared("cpu"), Some("2"), "{driver}");
             assert_eq!(heavy.hash, plain.hash, "{driver}: resources are unhashed");
         }
+    }
+
+    /// The two readers of a dep's `.list` over one request: an origin with no
+    /// input, an empty list, one line and two lines. "No dep input" stays an
+    /// empty set for `dep_files` and an error of its own for
+    /// `dep_single_file`.
+    #[test]
+    fn dep_list_readers_on_missing_empty_one_and_two_lines() {
+        use super::testfake::{Sandbox, run_request};
+        let sbx = Sandbox::new("app");
+        let (a, b) = (sbx.ws.join("a.tar"), sbx.ws.join("b.tar"));
+        let def = hplugin::driver::targetdef::TargetDef::default();
+        let rid = "req".to_string();
+        let req = run_request(
+            &rid,
+            "hashin",
+            &def,
+            &sbx,
+            &[
+                ("empty", vec![]),
+                ("one", vec![a.clone()]),
+                ("two", vec![a.clone(), b.clone()]),
+            ],
+        );
+
+        assert!(dep_files(&req, "missing").expect("missing").is_empty());
+        let err = format!(
+            "{:#}",
+            dep_single_file(&req, "missing").expect_err("missing")
+        );
+        assert!(err.contains("no dep input \"missing\""), "got: {err}");
+
+        assert!(dep_files(&req, "empty").expect("empty").is_empty());
+        let err = format!("{:#}", dep_single_file(&req, "empty").expect_err("empty"));
+        assert!(err.contains("produced no files"), "got: {err}");
+
+        assert_eq!(dep_files(&req, "one").expect("one"), vec![a.clone()]);
+        assert_eq!(dep_single_file(&req, "one").expect("one"), a);
+
+        assert_eq!(dep_files(&req, "two").expect("two"), vec![a, b]);
+        let err = format!("{:#}", dep_single_file(&req, "two").expect_err("two"));
+        assert!(err.contains("more than one file"), "got: {err}");
     }
 }

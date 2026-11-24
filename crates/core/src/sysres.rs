@@ -27,10 +27,17 @@ pub const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 ///
 /// The host's number, never a run's: `-j` and `--resource cpu=` set the pool's
 /// capacity over it and leave this alone.
+///
+/// Read once per process and cached, as [`crate::blocking`]'s limit is: on
+/// Linux the read is a `sched_getaffinity` plus cgroup files, and every
+/// discovery walk asks. A cgroup resized mid-process is not seen.
 pub fn host_cpus() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
+    static CACHED: OnceLock<usize> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    })
 }
 
 /// The memory this process may use, in bytes: the `memory` pool's default

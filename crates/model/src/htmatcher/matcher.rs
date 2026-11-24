@@ -9,6 +9,55 @@ pub enum MatchResult {
     MatchShrug,
 }
 
+impl MatchResult {
+    /// The tri-state `Or`: Yes if any term is Yes, else Shrug if any shrugs,
+    /// else No — so no terms at all is No. Stops at the first Yes, so terms
+    /// after it are never evaluated.
+    pub fn any(terms: impl IntoIterator<Item = MatchResult>) -> MatchResult {
+        let mut shrug = false;
+        for term in terms {
+            match term {
+                MatchResult::MatchYes => return MatchResult::MatchYes,
+                MatchResult::MatchShrug => shrug = true,
+                MatchResult::MatchNo => {}
+            }
+        }
+        if shrug {
+            MatchResult::MatchShrug
+        } else {
+            MatchResult::MatchNo
+        }
+    }
+
+    /// The tri-state `And`: No if any term is No, else Shrug if any shrugs,
+    /// else Yes — so no terms at all is Yes. Stops at the first No, so terms
+    /// after it are never evaluated.
+    pub fn all(terms: impl IntoIterator<Item = MatchResult>) -> MatchResult {
+        let mut shrug = false;
+        for term in terms {
+            match term {
+                MatchResult::MatchNo => return MatchResult::MatchNo,
+                MatchResult::MatchShrug => shrug = true,
+                MatchResult::MatchYes => {}
+            }
+        }
+        if shrug {
+            MatchResult::MatchShrug
+        } else {
+            MatchResult::MatchYes
+        }
+    }
+
+    /// The tri-state `Not`: Yes and No swap, a shrug stays a shrug.
+    pub fn negate(self) -> MatchResult {
+        match self {
+            MatchResult::MatchYes => MatchResult::MatchNo,
+            MatchResult::MatchNo => MatchResult::MatchYes,
+            MatchResult::MatchShrug => MatchResult::MatchShrug,
+        }
+    }
+}
+
 /// Matcher predicates over a target. `TreeOutputTo(pkg)` selects targets whose
 /// codegen-tree outputs land inside (or contain) the package `pkg` — mirrors
 /// heph's `CodegenPackage` (see `internal/tmatch/match.go::MatchDef`). The
@@ -76,44 +125,19 @@ impl Matcher {
                     MatchResult::MatchNo
                 }
             }
-            Matcher::Or(matchers) => {
-                let mut shrug = false;
-                for m in matchers {
-                    match m.matches_pkg(pkg) {
-                        MatchResult::MatchYes => return MatchResult::MatchYes,
-                        MatchResult::MatchShrug => shrug = true,
-                        MatchResult::MatchNo => {}
-                    }
-                }
-                if shrug {
-                    MatchResult::MatchShrug
-                } else {
-                    MatchResult::MatchNo
-                }
-            }
-            Matcher::And(matchers) => {
-                let mut shrug = false;
-                for m in matchers {
-                    match m.matches_pkg(pkg) {
-                        MatchResult::MatchNo => return MatchResult::MatchNo,
-                        MatchResult::MatchShrug => shrug = true,
-                        MatchResult::MatchYes => {}
-                    }
-                }
-                if shrug {
-                    MatchResult::MatchShrug
-                } else {
-                    MatchResult::MatchYes
-                }
-            }
+            Matcher::Or(matchers) => MatchResult::any(matchers.iter().map(|m| m.matches_pkg(pkg))),
+            Matcher::And(matchers) => MatchResult::all(matchers.iter().map(|m| m.matches_pkg(pkg))),
             // Sound under the all/none reading: "no addr matches" negates to
             // "every addr matches", and vice versa.
-            Matcher::Not(m) => match m.matches_pkg(pkg) {
-                MatchResult::MatchYes => MatchResult::MatchNo,
-                MatchResult::MatchNo => MatchResult::MatchYes,
-                MatchResult::MatchShrug => MatchResult::MatchShrug,
-            },
+            Matcher::Not(m) => m.matches_pkg(pkg).negate(),
         }
+    }
+
+    /// Whether `self` is the whole-graph selector `//...` — a `PackagePrefix`
+    /// rooted at the empty package. Syntactic: a composite that happens to
+    /// select everything (`//... || //a/...`) is not it.
+    pub fn is_whole_graph(&self) -> bool {
+        matches!(self, Matcher::PackagePrefix(p) if p.is_empty())
     }
 
     pub fn matches_addr(&self, addr: &Addr) -> MatchResult {
@@ -211,40 +235,12 @@ impl Matcher {
                 }
             }
             Matcher::Or(matchers) => {
-                let mut shrug = false;
-                for m in matchers {
-                    match m.matches_listed(addr, facts) {
-                        MatchResult::MatchYes => return MatchResult::MatchYes,
-                        MatchResult::MatchShrug => shrug = true,
-                        MatchResult::MatchNo => {}
-                    }
-                }
-                if shrug {
-                    MatchResult::MatchShrug
-                } else {
-                    MatchResult::MatchNo
-                }
+                MatchResult::any(matchers.iter().map(|m| m.matches_listed(addr, facts)))
             }
             Matcher::And(matchers) => {
-                let mut shrug = false;
-                for m in matchers {
-                    match m.matches_listed(addr, facts) {
-                        MatchResult::MatchNo => return MatchResult::MatchNo,
-                        MatchResult::MatchShrug => shrug = true,
-                        MatchResult::MatchYes => {}
-                    }
-                }
-                if shrug {
-                    MatchResult::MatchShrug
-                } else {
-                    MatchResult::MatchYes
-                }
+                MatchResult::all(matchers.iter().map(|m| m.matches_listed(addr, facts)))
             }
-            Matcher::Not(m) => match m.matches_listed(addr, facts) {
-                MatchResult::MatchYes => MatchResult::MatchNo,
-                MatchResult::MatchNo => MatchResult::MatchYes,
-                MatchResult::MatchShrug => MatchResult::MatchShrug,
-            },
+            Matcher::Not(m) => m.matches_listed(addr, facts).negate(),
         }
     }
 }
@@ -256,6 +252,67 @@ mod tests {
 
     fn addr(pkg: &str, name: &str) -> Addr {
         Addr::new(PkgBuf::from(pkg), name.to_string(), BTreeMap::new())
+    }
+
+    use MatchResult::{MatchNo as No, MatchShrug as Shrug, MatchYes as Yes};
+
+    #[test]
+    fn any_is_the_tri_state_or() {
+        assert_eq!(MatchResult::any([]), No, "empty Or");
+        assert_eq!(MatchResult::any([No, No]), No);
+        assert_eq!(MatchResult::any([No, Shrug, No]), Shrug);
+        assert_eq!(MatchResult::any([Shrug, Yes]), Yes);
+        assert_eq!(MatchResult::any([No, Yes, Shrug]), Yes);
+    }
+
+    #[test]
+    fn all_is_the_tri_state_and() {
+        assert_eq!(MatchResult::all([]), Yes, "empty And");
+        assert_eq!(MatchResult::all([Yes, Yes]), Yes);
+        assert_eq!(MatchResult::all([Yes, Shrug, Yes]), Shrug);
+        assert_eq!(MatchResult::all([Shrug, No]), No);
+        assert_eq!(MatchResult::all([Yes, No, Shrug]), No);
+    }
+
+    /// `any` stops at the first Yes and `all` at the first No: a term after
+    /// it is never evaluated, which is what makes a cheap leading term pay.
+    #[test]
+    fn any_and_all_short_circuit() {
+        let mut evaluated = 0;
+        let got = MatchResult::any([Shrug, Yes, No, No].into_iter().inspect(|_| evaluated += 1));
+        assert_eq!((got, evaluated), (Yes, 2));
+
+        let mut evaluated = 0;
+        let got = MatchResult::all(
+            [Shrug, No, Yes, Yes]
+                .into_iter()
+                .inspect(|_| evaluated += 1),
+        );
+        assert_eq!((got, evaluated), (No, 2));
+
+        // A shrug never stops the fold: a later term can still decide.
+        let mut evaluated = 0;
+        let got = MatchResult::any([Shrug, No, Shrug].into_iter().inspect(|_| evaluated += 1));
+        assert_eq!((got, evaluated), (Shrug, 3));
+    }
+
+    /// Only the literal `//...` is the whole graph; a narrower prefix, an
+    /// exact root package, or a composite holding `//...` is not.
+    #[test]
+    fn is_whole_graph_is_only_the_root_prefix() {
+        let root = Matcher::PackagePrefix(PkgBuf::from(""));
+        assert!(root.is_whole_graph());
+        assert!(!Matcher::PackagePrefix(PkgBuf::from("a")).is_whole_graph());
+        assert!(!Matcher::Package(PkgBuf::from("")).is_whole_graph());
+        assert!(!Matcher::Or(vec![root.clone()]).is_whole_graph());
+        assert!(!Matcher::Not(Box::new(root)).is_whole_graph());
+    }
+
+    #[test]
+    fn negate_swaps_yes_and_no_and_keeps_a_shrug() {
+        assert_eq!(Yes.negate(), No);
+        assert_eq!(No.negate(), Yes);
+        assert_eq!(Shrug.negate(), Shrug);
     }
 
     #[test]

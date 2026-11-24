@@ -210,30 +210,36 @@ fn front(set: &BTreeSet<(u64, String)>) -> Option<&(u64, String)> {
 }
 
 /// The dashboard's blocked rows read the same wait maps, in the same words:
-/// an admission wait's are `admission_wait_text`'s, a lock's name the
+/// an admission wait's are `admission_wait_text`'s pieces
+/// (`AdmissionWaitWords`), a lock's name the
 /// holder's session as the spotlight does.
 impl crate::tui::dashboard::Waits for BuildState {
     fn wait_words(&self, addr: &str, now_ms: u64) -> Option<crate::tui::dashboard::WaitWords> {
         use crate::tui::dashboard::WaitWords;
         if let Some(w) = self.admission_waits.get(addr) {
-            let text = self.admission_text(addr, now_ms)?;
-            // `<addr> waits for <pool> <need> (<free>, [yielding to …, ]
-            // <waited>)[ — cleanup …]`: PHASE is `waits <pool> <need>`
-            // (`waits sandbox`, whose need is always one slot), LAST LINE the
-            // rest.
-            let rest = text.strip_prefix(addr).unwrap_or(&text).trim_start();
-            let rest = rest.strip_prefix("waits for ").unwrap_or(rest);
-            let (head, detail) = rest.split_once(" (").unwrap_or((rest, ""));
+            let words = hcore::events::AdmissionWaitWords {
+                pool: &w.pool,
+                unit: self.unit_of(&w.pool),
+                need: w.need,
+                free: w.free,
+                yielding_to: w
+                    .yielding_to
+                    .as_ref()
+                    .map(|to| (to, self.unit_of(&to.pool))),
+                removals_pending: w.removals_pending,
+            };
+            // PHASE is `waits <pool> <need>` (`waits sandbox`, whose need is
+            // always one slot), LAST LINE the rest.
             let phase = if w.pool == hcore::capacity::SANDBOX {
                 format!("waits {}", w.pool)
             } else {
-                format!("waits {head}")
+                format!("waits {}", words.wants())
             };
             let waited_ms = now_ms.saturating_sub(w.since_ms);
-            let detail = format!("({detail}");
+            let detail = words.detail(Some(&elapsed(waited_ms))).to_string();
             // The row's TIME column already says how long: its LAST LINE
-            // drops the formatter's trailing `, <waited>`.
-            let row_detail = detail.replacen(&format!(", {})", elapsed(waited_ms)), ")", 1);
+            // leaves the waited time out.
+            let row_detail = words.detail(None).to_string();
             return Some(WaitWords {
                 phase,
                 detail,
@@ -275,25 +281,6 @@ impl crate::tui::dashboard::Waits for BuildState {
 }
 
 impl BuildState {
-    /// `addr`'s admission wait in the shared formatter's words, waited up
-    /// to `now_ms`.
-    fn admission_text(&self, addr: &str, now_ms: u64) -> Option<String> {
-        let w = self.admission_waits.get(addr)?;
-        let waited = elapsed(now_ms.saturating_sub(w.since_ms));
-        Some(hcore::events::admission_wait_text(
-            addr,
-            &w.pool,
-            self.unit_of(&w.pool),
-            w.need,
-            w.free,
-            w.yielding_to
-                .as_ref()
-                .map(|to| (to, self.unit_of(&to.pool))),
-            w.removals_pending,
-            &waited,
-        ))
-    }
-
     /// Rule 2: the root failure on show, if any.
     pub(super) fn spot_failure(&self) -> Option<Spot> {
         let f = self.spot.root_failure.as_ref()?;

@@ -160,13 +160,15 @@ impl ErrorDetail {
     }
 }
 
-struct EndGuard {
+/// Emits the scope's end event when it drops, built by `make_end`: held
+/// in the scope's future, so the closure lives inline rather than boxed.
+struct EndGuard<M: FnOnce(Option<ErrorDetail>) -> BuildEventKind> {
     data: Option<Arc<RequestStateData>>,
-    make_end: Option<Box<dyn FnOnce(Option<ErrorDetail>) -> BuildEventKind + Send>>,
+    make_end: Option<M>,
     error: Option<ErrorDetail>,
 }
 
-impl Drop for EndGuard {
+impl<M: FnOnce(Option<ErrorDetail>) -> BuildEventKind> Drop for EndGuard<M> {
     fn drop(&mut self) {
         if let (Some(data), Some(make_end)) = (self.data.take(), self.make_end.take()) {
             let kind = make_end(self.error.take());
@@ -208,7 +210,7 @@ pub async fn emit_scope_with<T, F: Future<Output = ()>>(
     rs.emit(start);
     let mut guard = EndGuard {
         data: Some(rs.data()),
-        make_end: Some(Box::new(make_end)),
+        make_end: Some(make_end),
         error: None,
     };
     let out = fut.await; // guard still armed if this is cancelled mid-await

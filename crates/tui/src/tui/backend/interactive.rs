@@ -325,10 +325,7 @@ pub async fn run<A: App + 'static>(
         .and_then(|s| s.open(view.session_header(), true))
         .map(|s| s.tap);
     // After `open`, so the process's own session is never named as a holder.
-    let holders = app
-        .lock_holders()
-        .or_else(|| slot.map(SessionSlot::holder_names))
-        .unwrap_or_default();
+    let holders = super::lock_holders(&app, slot);
     view.name_lock_holders(holders.clone());
     // Size the inline viewport to ~1/3 of the terminal height. Queried before the
     // viewport is built (so the first frame is already sized); the column count is
@@ -942,7 +939,7 @@ pub async fn run<A: App + 'static>(
     // request state drops). Drain them so the final summary reflects the full
     // stream rather than the snapshot at the last tick.
     if let Some(r) = build_events.as_mut() {
-        while r.try_recv(|e| view.apply(e)).is_ok() {}
+        r.drain(|e| view.apply(e));
     }
 
     // Persistent final summary, printed straight to stderr below the

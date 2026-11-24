@@ -42,13 +42,13 @@
 
 use crate::engine::Engine;
 use crate::engine::discovery::Discovery;
+use crate::engine::gc::{bounded_join, emit_target_swept};
 use crate::engine::request_state::RequestState;
 use anyhow::{Context, Result};
 use futures::TryStreamExt;
-use hmodel::htaddr::{Addr, parse_addr};
+use hmodel::htaddr::Addr;
 use hmodel::htmatcher::{MatchResult, Matcher};
 use std::sync::Arc;
-use tokio::task::JoinSet;
 
 /// Outcome of an [`Engine::clean`] run.
 ///
@@ -74,17 +74,6 @@ pub struct CleanStats {
     /// removing them (their `lock` was free). Swept whatever the selection:
     /// they belong to no target.
     pub run_log_dirs_removed: usize,
-}
-
-/// The in-flight state of one [`Engine::clean`] run: the bounded set of delete
-/// tasks and the stats they fold into. Bundled so a single `submit` can serve
-/// both selection paths without either one re-implementing the backpressure.
-struct CleanRun {
-    set: JoinSet<(Addr, Result<TargetOutcome>)>,
-    /// Maximum delete tasks in flight — and, on the addr-only path, the run's
-    /// whole memory footprint.
-    limit: usize,
-    stats: CleanStats,
 }
 
 /// What cleaning one target did.
@@ -127,62 +116,57 @@ impl Engine {
         matcher: &Matcher,
         discovery: Discovery,
     ) -> Result<CleanStats> {
-        let mut run = CleanRun {
-            set: JoinSet::new(),
-            limit: self.fan_out.max(1),
-            stats: CleanStats::default(),
-        };
-
-        if matcher.is_addr_only() {
+        let mut stats = if matcher.is_addr_only() {
             // Drive off the cache's own enumeration: the only targets that can
             // possibly be cleaned are the ones it names, and the matcher decides
-            // each from its addr.
-            let targets = self
-                .local_cache
-                .list_targets()
-                .context("clean: listing cache targets")?;
-            for target in targets {
-                let addr_key = match target {
-                    Ok(k) => k,
-                    Err(e) => {
-                        // The stream failed mid-way. Clean what was already seen
-                        // rather than throwing it away — a partial clean is still
-                        // a clean, and the error is surfaced.
-                        tracing::warn!(error = %format!("{e:#}"), "clean: listing targets failed mid-stream, cleaning what was seen");
-                        break;
-                    }
-                };
-                let addr = match parse_addr(&addr_key) {
-                    Ok(a) => a,
-                    Err(e) => {
-                        tracing::warn!(addr = %addr_key, error = %format!("{e:#}"), "clean: skip unparseable cache addr");
-                        continue;
-                    }
-                };
-                if matcher.matches_addr(&addr) != MatchResult::MatchYes {
-                    continue;
-                }
-                Arc::clone(&self).submit(&mut run, &rs, addr).await;
-            }
+            // each from its addr. A listing that fails mid-way still cleans
+            // what was already seen rather than throwing it away — a partial
+            // clean is still a clean, and the error is surfaced.
+            let addrs = self
+                .cached_addrs("clean", "cleaning")
+                .context("clean: listing cache targets")?
+                .filter(|addr| matcher.matches_addr(addr) == MatchResult::MatchYes);
+            Arc::clone(&self).clean_addrs(&rs, addrs).await
         } else {
             // The cache cannot answer `label(...)`, so the graph does — and that
             // has to finish before a single delete starts. See
             // `resolve_selection`: the walk holds read locks that the deletes
             // would deadlock against.
-            for addr in Arc::clone(&self)
+            let addrs = Arc::clone(&self)
                 .resolve_selection(&rs, matcher, discovery)
-                .await?
-            {
-                Arc::clone(&self).submit(&mut run, &rs, addr).await;
-            }
-        }
+                .await?;
+            Arc::clone(&self).clean_addrs(&rs, addrs.into_iter()).await
+        };
 
-        while !run.set.is_empty() {
-            Self::drain_one_clean(&mut run.set, &rs, &mut run.stats).await;
-        }
         // Ended hephs' run logs; a live heph holds its directory's lock.
-        run.stats.run_log_dirs_removed = hcore::blocking::run(self.run_logs.sweeper()).await;
-        Ok(run.stats)
+        stats.run_log_dirs_removed = hcore::blocking::run(self.run_logs.sweeper()).await;
+        Ok(stats)
+    }
+
+    /// Clean every one of `addrs`, at most `fan_out` at a time — on the
+    /// addr-only path, the run's whole memory footprint, since `addrs` is
+    /// pulled only as a slot frees up.
+    async fn clean_addrs(
+        self: Arc<Self>,
+        rs: &Arc<RequestState>,
+        addrs: impl Iterator<Item = Addr>,
+    ) -> CleanStats {
+        let mut stats = CleanStats::default();
+        bounded_join(
+            addrs,
+            self.fan_out,
+            |addr| {
+                let engine = Arc::clone(&self);
+                let crs = rs.clone();
+                async move {
+                    let out = engine.clean_addr(crs, &addr).await;
+                    (addr, out)
+                }
+            },
+            |joined| fold_clean_outcome(joined, rs, &mut stats),
+        )
+        .await;
+        stats
     }
 
     /// Walk the graph for a selection the cache keys cannot decide, returning
@@ -220,14 +204,7 @@ impl Engine {
         matcher: &Matcher,
         discovery: Discovery,
     ) -> Result<Vec<Addr>> {
-        let resolve_rs = self.new_state_full(
-            false,
-            rs.events_sender(),
-            rs.bg_pending(),
-            Self::DEFAULT_LOG_TAIL_LINES,
-            None,
-        );
-        resolve_rs.suppress_deferred_trims();
+        let resolve_rs = self.sweep_resolve_state(rs);
 
         let mut addrs = Vec::new();
         {
@@ -250,22 +227,6 @@ impl Engine {
         // kind of thing a later edit reorders without noticing.
         drop(resolve_rs);
         Ok(addrs)
-    }
-
-    /// Queue one target for cleaning, first draining down to `limit` in flight.
-    ///
-    /// The await is the backpressure: it is what keeps a source that can yield
-    /// far faster than the deletes complete — either enumeration, on a big cache
-    /// or a big graph — from queueing the whole selection.
-    async fn submit(self: Arc<Self>, run: &mut CleanRun, rs: &Arc<RequestState>, addr: Addr) {
-        while run.set.len() >= run.limit {
-            Self::drain_one_clean(&mut run.set, rs, &mut run.stats).await;
-        }
-        let crs = rs.clone();
-        run.set.spawn(async move {
-            let out = self.clean_addr(crs, &addr).await;
-            (addr, out)
-        });
     }
 
     /// Delete every revision of one target, under its write lock.
@@ -339,47 +300,36 @@ impl Engine {
 
         Ok(TargetOutcome { removed, bytes })
     }
-
-    /// Await one finished clean task and fold it into `stats`. Per-target errors
-    /// and task panics are logged and counted, never propagated. Emits one
-    /// `GcTargetSwept` per target — including failures — so the TUI's explored
-    /// count advances in step with the work.
-    async fn drain_one_clean(
-        set: &mut JoinSet<(Addr, Result<TargetOutcome>)>,
-        rs: &Arc<RequestState>,
-        stats: &mut CleanStats,
-    ) {
-        let Some(joined) = set.join_next().await else {
-            return;
-        };
-        match joined {
-            Ok((_, Ok(o))) => {
-                if o.removed > 0 {
-                    stats.targets_cleaned += 1;
-                }
-                stats.revisions_removed += o.removed;
-                stats.bytes_removed = stats.bytes_removed.saturating_add(o.bytes);
-                emit_clean_target_swept(rs, o.removed, o.bytes);
-            }
-            Ok((addr, Err(e))) => {
-                tracing::warn!(%addr, error = %format!("{e:#}"), "clean: target failed, continuing");
-                stats.errored += 1;
-                emit_clean_target_swept(rs, 0, 0);
-            }
-            Err(join_err) => {
-                tracing::warn!(error = %join_err, "clean: target task panicked, continuing");
-                stats.errored += 1;
-            }
-        }
-    }
 }
 
-/// Emit one `GcTargetSwept` so the TUI's "targets explored" count advances.
-fn emit_clean_target_swept(rs: &RequestState, revisions_removed: usize, bytes_removed: u64) {
-    rs.emit(crate::engine::event::BuildEventKind::GcTargetSwept {
-        revisions_removed,
-        bytes_removed,
-    });
+/// Fold one finished clean task into `stats`. Per-target errors and task
+/// panics are logged and counted, never propagated. Emits one `GcTargetSwept`
+/// per target — including failures — so the TUI's explored count advances in
+/// step with the work.
+fn fold_clean_outcome(
+    joined: std::result::Result<(Addr, Result<TargetOutcome>), tokio::task::JoinError>,
+    rs: &RequestState,
+    stats: &mut CleanStats,
+) {
+    match joined {
+        Ok((_, Ok(o))) => {
+            if o.removed > 0 {
+                stats.targets_cleaned += 1;
+            }
+            stats.revisions_removed += o.removed;
+            stats.bytes_removed = stats.bytes_removed.saturating_add(o.bytes);
+            emit_target_swept(rs, o.removed, o.bytes);
+        }
+        Ok((addr, Err(e))) => {
+            tracing::warn!(%addr, error = %format!("{e:#}"), "clean: target failed, continuing");
+            stats.errored += 1;
+            emit_target_swept(rs, 0, 0);
+        }
+        Err(join_err) => {
+            tracing::warn!(error = %join_err, "clean: target task panicked, continuing");
+            stats.errored += 1;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -813,6 +763,57 @@ mod tests {
         let stats = cleaner.await.expect("join").expect("clean");
         assert_eq!(stats.revisions_removed, 1);
         assert!(!present(&engine, &a, "h1"));
+    }
+
+    /// A clean that is dropped mid-run — a cancelled command — aborts its delete
+    /// tasks rather than detaching them: one parked on the write lock (the
+    /// gate) never deletes, even once the lock is free.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_clean_never_deletes_what_it_was_waiting_on() {
+        let (engine, _dir) = test_engine();
+        let a = addr("t");
+        write_revision(&engine, &a, "h1", 100, &["out.tar"]);
+
+        let gate = crate::engine::cache_test_support::wlock(&engine, &a).await;
+        let rs = engine.new_state();
+        // Every delete task holds a clone of the request state, so the count
+        // says when one has been spawned, and when every one is gone.
+        let probe = Arc::clone(&rs);
+        let cleaner = tokio::spawn({
+            let engine = Arc::clone(&engine);
+            let m = Matcher::Addr(a.clone());
+            async move { engine.clean(rs, &m, Discovery::Complete).await }
+        });
+
+        // The probe, `clean`'s own handle and the delete task's.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while Arc::strong_count(&probe) < 3 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the delete task never started"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Drop the sweep, then open the gate.
+        cleaner.abort();
+        assert!(cleaner.await.expect_err("aborted").is_cancelled());
+        drop(gate);
+
+        // A detached task would now take the lock, delete, and only then let
+        // go of its handle; an aborted one is already gone.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while Arc::strong_count(&probe) > 1 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a delete task outlived its clean"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            present(&engine, &a, "h1"),
+            "a dropped clean deleted after the gate opened"
+        );
     }
 
     /// A revision another command is reading — a long `heph run` riding it —

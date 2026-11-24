@@ -51,15 +51,13 @@ use async_trait::async_trait;
 use hcore::hasync::Cancellable;
 use hcore::htvalue::signature::ParamType;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
-use hdriver_support::run_log::{RunLog, Streams};
-use hexecrunner::RunnerRef;
+use hdriver_support::run_log::{RunLog, exit_failure, output_logging_stderr};
 use hplugin::driver::targetdef::path::{CodegenMode, Content, Path as OutPath};
 use hplugin::driver::targetdef::{CacheConfig, Input, InputMode, Output, TargetDef};
 use hplugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
     ParseResponse, TargetAddr,
 };
-use hplugin::error::ProcessFailed;
 use hplugin::htspec::{FromSpecValue, Spec};
 use hproc::proc_exec;
 use std::collections::BTreeMap;
@@ -563,23 +561,15 @@ impl Driver {
         };
 
         let captured = log.is_some();
-        let out = match log {
-            Some(log) => {
-                log.output(RunnerRef::local(), spec, Streams::STDERR, ctoken)
-                    .await
-            }
-            None => hexecrunner::output(RunnerRef::local(), spec, ctoken).await,
-        }
-        .with_context(|| format!("run `{} shell -- env -0`", self.devenv_bin))?;
+        let out = output_logging_stderr(log, spec, ctoken)
+            .await
+            .with_context(|| format!("run `{} shell -- env -0`", self.devenv_bin))?;
         if !out.status.success() {
-            let what = format!("`{} shell` failed in {root:?}", self.devenv_bin);
-            if captured {
-                return Err(
-                    anyhow::Error::new(ProcessFailed::from_status(out.status)).context(what)
-                );
-            }
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            anyhow::bail!("{what}: {stderr}");
+            return Err(exit_failure(
+                &out,
+                captured,
+                format!("`{} shell` failed in {root:?}", self.devenv_bin),
+            ));
         }
         Ok(parse_env0(&out.stdout))
     }
@@ -903,6 +893,7 @@ mod log_tests {
     use super::*;
     use hcore::hasync::StdCancellationToken;
     use hplugin::driver::RunRequest;
+    use hplugin::error::ProcessFailed;
     use std::sync::Arc;
 
     /// A stand-in `devenv` running `body` under `/bin/sh`.

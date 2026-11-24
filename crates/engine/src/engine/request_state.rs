@@ -845,13 +845,12 @@ impl Selection {
 /// Per-invocation state. Cheap to clone via with_parent — shares the same RequestStateData.
 pub struct RequestState {
     pub data: Arc<RequestStateData>,
-    /// The target that triggered this invocation, used for cycle detection in result_addr.
-    pub parent: Option<Addr>,
     /// Provider names excluded from query iteration for this request subtree.
     pub skip_providers: Arc<HashSet<String>>,
     /// The ancestor chain of this invocation (parent first), mirroring the
     /// `with_parent` stack. Always maintained so a [`speculative`] fork can seed
-    /// its cycle check from the real ancestors at the fork point.
+    /// its cycle check from the real ancestors at the fork point. Its head is
+    /// [`parent`](RequestState::parent).
     ///
     /// [`speculative`]: RequestState::speculative
     crumbs: Option<Arc<Crumb>>,
@@ -1274,15 +1273,20 @@ impl RequestState {
         self.data.events.clone()
     }
 
+    /// The target that triggered this invocation, used for cycle detection in
+    /// `result_addr`: the head of the breadcrumb chain.
+    pub fn parent(&self) -> Option<&Addr> {
+        self.crumbs.as_deref().map(|c| &c.addr)
+    }
+
     /// Returns a child RequestState sharing the same data but with a new parent.
     pub fn with_parent(&self, parent: Addr) -> Arc<RequestState> {
         let crumbs = Some(Arc::new(Crumb {
-            addr: parent.clone(),
+            addr: parent,
             parent: self.crumbs.clone(),
         }));
         Arc::new(RequestState {
             data: Arc::clone(&self.data),
-            parent: Some(parent),
             skip_providers: Arc::clone(&self.skip_providers),
             crumbs,
             speculative: self.speculative,
@@ -1296,7 +1300,6 @@ impl RequestState {
         set.insert(name.to_string());
         Arc::new(RequestState {
             data: Arc::clone(&self.data),
-            parent: self.parent.clone(),
             skip_providers: Arc::new(set),
             crumbs: self.crumbs.clone(),
             speculative: self.speculative,
@@ -1316,7 +1319,6 @@ impl RequestState {
         self.data.speculative_live.fetch_add(1, Ordering::AcqRel);
         Arc::new(RequestState {
             data: Arc::clone(&self.data),
-            parent: self.parent.clone(),
             skip_providers: Arc::clone(&self.skip_providers),
             crumbs: self.crumbs.clone(),
             speculative: true,
@@ -1358,7 +1360,7 @@ impl RequestState {
                 cur = crumb.parent.as_deref();
             }
             Ok(())
-        } else if let Some(parent) = &self.parent {
+        } else if let Some(parent) = self.parent() {
             // Already committed from this state: `add_dep` would find the edge
             // in `DepDag::edges` and return `Ok(())` unchanged, so answer it
             // here instead of queueing for the shared lock. See `tracked`.
@@ -1735,7 +1737,6 @@ impl Engine {
 
         let state = Arc::new(RequestState {
             data: Arc::clone(&data),
-            parent: None,
             skip_providers: Arc::new(HashSet::new()),
             crumbs: None,
             speculative: false,

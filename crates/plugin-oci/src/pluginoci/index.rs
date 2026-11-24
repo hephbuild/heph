@@ -62,7 +62,7 @@ use hplugin::driver::{
     ParseResponse, TargetAddr,
 };
 use hplugin::htspec::{Spec, TargetSpecCache};
-use oci_client::manifest::{ImageIndexEntry, OciImageIndex, OciImageManifest, Platform};
+use oci_client::manifest::{ImageIndexEntry, OciImageManifest, Platform};
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -424,13 +424,7 @@ impl ManagedDriver for Driver {
             }
         }
 
-        let index = OciImageIndex {
-            schema_version: 2,
-            media_type: Some(oci_client::manifest::OCI_IMAGE_INDEX_MEDIA_TYPE.to_string()),
-            artifact_type: None,
-            manifests: entries.clone(),
-            annotations: None,
-        };
+        let index = archive::oci_index(entries);
 
         if def.layout {
             archive::write_layout_dir_blobs(&out_path, &index, &blobs)
@@ -460,6 +454,7 @@ mod tests {
     use hcore::htvalue::Value;
     use hmodel::htaddr::parse_addr;
     use hplugin::provider::TargetSpec;
+    use oci_client::manifest::OciImageIndex;
     use std::collections::HashMap;
 
     fn cfg(pairs: &[(&str, Value)]) -> HashMap<String, Value> {

@@ -26,8 +26,8 @@ use super::index::SharedState;
 use super::lex::{self, Bracket, Kind, NO_LINK, Tok, Tokens};
 use super::position::{self, Encoding};
 use super::site::{ArgCall, Builtin, Call, Quote, Site, Str};
-use crate::pluginbuildfile::provider::DriverSource;
-use crate::pluginbuildfile::run_file::{resolve_load_target, target_base_fields};
+use crate::pluginbuildfile::provider::{DriverSource, build_files_in_dir};
+use crate::pluginbuildfile::run_file::{parse_build_file, resolve_load_target, target_base_fields};
 use crate::pluginbuildfile::types::{self, DriverKwargs};
 use crate::pluginbuildfile::{DEFAULT_INDENT, build_file_indent_from_options};
 use hplugin::driver::{DriverSchema, DriverSchemas};
@@ -38,7 +38,7 @@ use lsp_types::{
     CompletionItem, CompletionItemKind, CompletionTextEdit, Documentation, Hover, HoverContents,
     LocationLink, MarkupContent, MarkupKind, Position, Range, TextEdit,
 };
-use starlark::syntax::{AstModule, Dialect};
+use starlark::syntax::AstModule;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range as Bytes;
 use std::path::{Path, PathBuf};
@@ -919,7 +919,7 @@ fn load_files(path: &str, ctx: &Ctx<'_>) -> Vec<PathBuf> {
         return Vec::new();
     };
     if resolved.is_dir() {
-        package_build_files(&resolved, &ctx.shared.patterns)
+        build_files_in_dir(&resolved, &ctx.shared.patterns)
     } else {
         vec![resolved]
     }
@@ -942,17 +942,12 @@ fn defs_in(ast: &AstModule) -> Vec<(String, u32)> {
     out
 }
 
-fn parse_file(path: &Path) -> Option<AstModule> {
-    let content = std::fs::read_to_string(path).ok()?;
-    AstModule::parse(&path.to_string_lossy(), content, &Dialect::Extended).ok()
-}
-
 /// `load("…", "…` → the loaded file's exported `def`s. Read from that file's
 /// own AST; the current file's is not consulted.
 fn load_symbols(path: &str, ctx: &Ctx<'_>) -> Vec<Candidate> {
     load_files(path, ctx)
         .iter()
-        .filter_map(|f| parse_file(f))
+        .filter_map(|f| parse_build_file(f).ok())
         .flat_map(|ast| defs_in(&ast))
         .filter(|(name, _)| !name.starts_with('_'))
         .map(|(name, _)| Candidate {
@@ -1201,7 +1196,7 @@ fn address_definition(value: &Str, ctx: &Ctx<'_>) -> Option<LocationLink> {
         (ctx.package(), Some(literal.strip_prefix(':')?))
     };
     let dir = ctx.shared.root.join(&pkg);
-    let files = package_build_files(&dir, &ctx.shared.patterns);
+    let files = build_files_in_dir(&dir, &ctx.shared.patterns);
     if let Some(name) = name {
         // The open document's text wins over the file on disk.
         let texts: Vec<(&PathBuf, String)> = files
@@ -1256,7 +1251,7 @@ fn target_line(text: &str, name: &str) -> Option<u32> {
 /// load path names.
 fn symbol_definition(path: &str, name: &str, origin: Range, ctx: &Ctx<'_>) -> Option<LocationLink> {
     load_files(path, ctx).iter().find_map(|f| {
-        let ast = parse_file(f)?;
+        let ast = parse_build_file(f).ok()?;
         let line = defs_in(&ast).into_iter().find(|(n, _)| n == name)?.1;
         link(origin, f, line)
     })
@@ -1317,24 +1312,6 @@ pub(crate) fn format(
 // ---------------------------------------------------------------------------
 // Paths.
 // ---------------------------------------------------------------------------
-
-/// Files in `dir` matching a BUILD pattern, sorted by name (heph's merge order).
-pub(crate) fn package_build_files(dir: &Path, patterns: &[glob::Pattern]) -> Vec<PathBuf> {
-    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
-        .filter(|e| {
-            patterns
-                .iter()
-                .any(|p| p.matches(&e.file_name().to_string_lossy()))
-        })
-        .map(|e| e.path())
-        .collect();
-    files.sort();
-    files
-}
 
 /// Package name for a BUILD-file path: its parent dir, workspace-relative,
 /// forward-slashed (empty at the root).

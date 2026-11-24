@@ -126,10 +126,11 @@ fn parse_tar(argv: &[OsString]) -> Result<TarOptions, String> {
     Ok(o)
 }
 
-/// Every file and symlink under `root`, relative to it, sorted.
+/// Every file and symlink under `root`, in path order.
 ///
-/// Sorted because directory order is filesystem- and machine-dependent, and it
-/// would otherwise end up baked into the archive's bytes.
+/// The walk visits each directory's entries by name, so it does not depend on
+/// the filesystem's directory order — nor does which error it stops at — and
+/// a depth-first walk in name order already yields the paths sorted.
 fn walk_sorted(root: &Path) -> io::Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     for entry in walkdir::WalkDir::new(root)
@@ -142,7 +143,6 @@ fn walk_sorted(root: &Path) -> io::Result<Vec<PathBuf>> {
         }
         out.push(entry.into_path());
     }
-    out.sort();
     Ok(out)
 }
 
@@ -229,6 +229,9 @@ fn tar_create(o: &TarOptions) -> io::Result<()> {
                 members.push((full, p.clone()));
             }
         }
+        // The archive's member order: by name, so it depends neither on the
+        // filesystem's directory order nor on the order the paths were given
+        // in, either of which would otherwise end up in the archive's bytes.
         members.sort_by(|a, b| a.1.cmp(&b.1));
         for (full, rel) in &members {
             append_reproducible(&mut builder, full, rel, mtime)?;
@@ -540,6 +543,42 @@ mod tests {
         let a = build(one.path(), &outs.path().join("a.tar"));
         let b = build(two.path(), &outs.path().join("b.tar"));
         assert_eq!(a, b, "the same tree must produce byte-identical archives");
+    }
+
+    /// Members are ordered by path, whatever order the paths were given in:
+    /// component by component, so `a/c/e` comes before `a/c.d` and `a/b`
+    /// before `a-c`, where a byte-wise sort of the names would not.
+    #[test]
+    fn members_are_in_path_order_whatever_the_argument_order() {
+        let dir = tempfile::tempdir().unwrap();
+        for rel in ["a/b", "a/c.d", "a/c/e", "a-c", "a.txt", "z"] {
+            write(dir.path(), rel, rel);
+        }
+        let outs = tempfile::tempdir().unwrap();
+        let build = |name: &str, paths: &[&str]| {
+            let out = outs.path().join(name);
+            let mut args = vec![
+                "tar".to_string(),
+                "-cf".to_string(),
+                out.to_string_lossy().into_owned(),
+                "-C".to_string(),
+                dir.path().to_string_lossy().into_owned(),
+            ];
+            args.extend(paths.iter().map(|p| p.to_string()));
+            assert_eq!(tar(args.into_iter().map(OsString::from).collect()), OK);
+            std::fs::read(out).unwrap()
+        };
+        let forward = build("forward.tar", &["a", "a-c", "a.txt", "z"]);
+        let backward = build("backward.tar", &["z", "a.txt", "a-c", "a"]);
+        assert_eq!(forward, backward, "argument order must not reach the bytes");
+
+        let mut archive = tar::Archive::new(&forward[..]);
+        let names: Vec<String> = archive
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["a/b", "a/c/e", "a/c.d", "a-c", "a.txt", "z"]);
     }
 
     #[test]
