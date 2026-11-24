@@ -254,3 +254,298 @@ fn a_foreign_recording_exports_again_without_running_its_triggers() {
         assert_eq!(notices, want, "logs kept: {}", logs.is_some());
     }
 }
+
+/// What the committed export fixture's approval notice says.
+const FIXTURE_NOTICE: &str =
+    "Migrates the production database: drops the column `users.legacy_id`.";
+/// The root failure's log in the committed export fixture.
+const FIXTURE_LOG: &str = "applying 0042_drop_legacy_id\nerror: column \"legacy_id\" is still read by view \"active_users\"\n";
+/// When the committed export fixture's session started.
+const FIXTURE_EXPORT_STARTED_MS: u64 = 1_763_000_000_000;
+
+/// The notice reader the export fixture was written with: it stands in for
+/// the engine's `read_notice_from_store`, which this crate cannot reach.
+fn fixture_notice(_: &NoticeRoots, _: &[hcore::approval_notice::NoticeSource]) -> Option<String> {
+    Some(FIXTURE_NOTICE.to_owned())
+}
+
+/// Format `n`'s committed export: what `HEPH_SESSION_EXPORT_DIR` leaves.
+fn export_fixture(n: u32) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(format!("src/tui/session/testdata/format-{n}"))
+        .join(format!("example.{EXTENSION}"))
+}
+
+/// A finished `heph run` under `tmp` that asked for one approval (with a
+/// notice) and failed at a root whose log is in its failure slot, exported
+/// at seal as `HEPH_SESSION_EXPORT_DIR` exports it. Returns the export.
+fn write_export_fixture(tmp: &Path) -> PathBuf {
+    use crate::tui::session::{ApprovalPrompt, ApprovalPromptNotice, ApprovalQueued};
+    use hcore::approval_notice::{NoticeOrigin, NoticeSource};
+    use hcore::events::LeftBehindData;
+
+    let t0 = FIXTURE_EXPORT_STARTED_MS;
+    let root = tmp.join("sessions");
+    let ws = tmp.join("ws");
+    let home = ws.join(".heph");
+    let log = home.join("failures").join("k1").join("log.txt");
+    std::fs::create_dir_all(log.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&log, FIXTURE_LOG).expect("write the log");
+    // Written during the session: an export keeps no log newer than its end.
+    std::fs::File::options()
+        .write(true)
+        .open(&log)
+        .and_then(|f| f.set_modified(std::time::UNIX_EPOCH + Duration::from_millis(t0 + 40)))
+        .expect("set the log's mtime");
+
+    let id = SessionId::new(t0, 1);
+    let dir = root.join(id.encode());
+    let mut m = meta(id);
+    m.argv = ["heph", "run", "//app:deploy"].map(str::to_owned).into();
+    m.cwd = Some(ws.display().to_string());
+    m.workspace_root = Some(ws.display().to_string());
+    m.home_dir = Some(home.display().to_string());
+    let ev = |ms: u64, kind: BuildEventKind| SessionRecord {
+        at_unix_ms: t0 + ms,
+        kind: Some(kind),
+        session: None,
+    };
+    let records = [
+        ev(
+            1,
+            BuildEventKind::Matched {
+                addrs: vec!["//app:deploy".to_owned()],
+                complete: true,
+            },
+        ),
+        ev(
+            2,
+            BuildEventKind::ResultStart {
+                addr: "//app:deploy".to_owned(),
+            },
+        ),
+        ev(
+            3,
+            BuildEventKind::ResultStart {
+                addr: "//app:migrate".to_owned(),
+            },
+        ),
+        SessionRecord::session(
+            t0 + 10,
+            SessionRecordKind::Approval {
+                prompt: Some(Box::new(ApprovalPrompt {
+                    queue: vec![ApprovalQueued {
+                        seq: 1,
+                        addr: "//app:migrate".to_owned(),
+                        queued_at_unix_ms: t0 + 10,
+                        notices: vec![ApprovalPromptNotice {
+                            name: "plan".to_owned(),
+                            sources: vec![NoticeSource {
+                                addr: "//app:plan".to_owned(),
+                                origin: NoticeOrigin::File {
+                                    path: "PLAN".to_owned(),
+                                    out_path: "PLAN".to_owned(),
+                                    x: false,
+                                    hashout: "0".to_owned(),
+                                },
+                            }],
+                        }],
+                    }],
+                })),
+                standing: None,
+            },
+        ),
+        SessionRecord::session(
+            t0 + 20,
+            SessionRecordKind::Approval {
+                prompt: None,
+                standing: None,
+            },
+        ),
+        ev(
+            40,
+            BuildEventKind::ResultEnd {
+                addr: "//app:migrate".to_owned(),
+                error: Some("exit status: 1".to_owned()),
+                upstream_of: None,
+                exit_status: Some("exit status: 1".to_owned()),
+                log_tail: None,
+                timed_out: None,
+                cancelled: false,
+                left_behind: Some(Box::new(LeftBehindData {
+                    log_path: Some(log.display().to_string()),
+                    ..LeftBehindData::default()
+                })),
+            },
+        ),
+        ev(
+            41,
+            BuildEventKind::ResultEnd {
+                addr: "//app:deploy".to_owned(),
+                error: Some("//app:migrate failed".to_owned()),
+                upstream_of: Some("//app:migrate".to_owned()),
+                exit_status: None,
+                log_tail: None,
+                timed_out: None,
+                cancelled: false,
+                left_behind: None,
+            },
+        ),
+        SessionRecord::session(
+            t0 + 50,
+            SessionRecordKind::End {
+                exit_code: Some(1),
+                panicked: false,
+            },
+        ),
+    ];
+    testing::Recording::create(&dir, &m, &records, None)
+        .expect("recording")
+        .seal(t0 + 50, Some(1), false)
+        .expect("seal");
+    let out = tmp.join("exports");
+    to_dir(&root, &dir, id, &out, fixture_notice, &Abort::default()).expect("export")
+}
+
+/// Writes the current format's export fixture. Run it only for a format
+/// that has none yet: a released format's fixture is frozen. See
+/// `testdata/README.md`.
+#[test]
+#[ignore = "writes the committed fixture; run by hand on a format bump"]
+fn generate_export_fixture() {
+    let target = export_fixture(store::FORMAT);
+    assert!(
+        !target.exists(),
+        "{} exists: a released format's fixture is frozen; delete it first only if format {} was never released",
+        target.display(),
+        store::FORMAT
+    );
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let written = write_export_fixture(tmp.path());
+    std::fs::create_dir_all(target.parent().expect("a parent")).expect("mkdir");
+    std::fs::copy(written, &target).expect("copy the fixture");
+}
+
+/// Every released format's committed export (what a CI run's
+/// `HEPH_SESSION_EXPORT_DIR` leaves) opens through the path `heph session
+/// show`/`attach` take, and reads back the run it holds from itself alone:
+/// its state, the approval's notice text, the root failure's log, and the
+/// tables a reader queries, `notices` and `failure_logs` by their columns.
+#[test]
+fn opens_export_fixtures() {
+    for n in 1..=store::FORMAT {
+        let path = export_fixture(n);
+        assert!(
+            path.exists(),
+            "format {n} has no committed export at {}: run `cargo test -p tui generate_export_fixture -- --ignored`",
+            path.display()
+        );
+        let bytes = std::fs::read(&path).expect("read the export");
+        assert_eq!(
+            bytes.get(..4),
+            Some(&[0x28, 0xB5, 0x2F, 0xFD][..]),
+            "a zstd frame"
+        );
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let rec = Recording::open_foreign(&path, tmp.path()).expect("open the export");
+        let meta = rec.meta().expect("meta");
+        assert_eq!(
+            meta.id,
+            SessionId::new(FIXTURE_EXPORT_STARTED_MS, 1),
+            "format {n}"
+        );
+        assert_eq!(meta.argv, ["heph", "run", "//app:deploy"]);
+        assert_eq!(
+            rec.state().expect("state"),
+            RecordingState::Finished {
+                exit_code: Some(1),
+                panicked: false
+            },
+            "format {n}"
+        );
+        let conn = rec.conn();
+        let row: (bool, bool, Option<i64>) = conn
+            .query_row("SELECT sealed, snapshot, exit_code FROM session", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .expect("session row");
+        assert_eq!(
+            row,
+            (true, false, Some(1)),
+            "format {n}: sealed, not a snapshot"
+        );
+        let notices: Vec<(String, i64, String, String)> = conn
+            .prepare("SELECT addr, seq, name, text FROM notices")
+            .and_then(|mut s| {
+                s.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+                    .collect()
+            })
+            .expect("notices");
+        assert_eq!(
+            notices,
+            [(
+                "//app:migrate".to_owned(),
+                1,
+                "plan".to_owned(),
+                FIXTURE_NOTICE.to_owned()
+            )],
+            "format {n}"
+        );
+        let logs: Vec<(String, i64, Vec<u8>, i64)> = conn
+            .prepare("SELECT addr, nth, log, cut_bytes FROM failure_logs")
+            .and_then(|mut s| {
+                s.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+                    .collect()
+            })
+            .expect("failure logs");
+        assert_eq!(
+            logs,
+            [(
+                "//app:migrate".to_owned(),
+                0,
+                FIXTURE_LOG.as_bytes().to_vec(),
+                0
+            )],
+            "format {n}: the root failure's log, not the collateral one's"
+        );
+        let kinds: Vec<String> = conn
+            .prepare("SELECT kind FROM records ORDER BY seq")
+            .and_then(|mut s| s.query_map([], |r| r.get(0))?.collect())
+            .expect("records");
+        assert_eq!(kinds.last().map(String::as_str), Some("End"), "format {n}");
+        assert_eq!(kinds.iter().filter(|k| *k == "Approval").count(), 2);
+
+        let Recording::Foreign(f) = &rec else {
+            panic!("foreign")
+        };
+        assert_eq!(
+            f.recorded_notice("//app:migrate", 1, "plan")
+                .expect("notice"),
+            Some(FIXTURE_NOTICE.to_owned())
+        );
+        assert_eq!(
+            f.failure_logs("//app:migrate").expect("logs"),
+            [(FIXTURE_LOG.as_bytes().to_vec(), 0)]
+        );
+        assert!(f.failure_logs("//app:deploy").expect("logs").is_empty());
+
+        // The viewers' source: everything above, read once at open.
+        let source = rec.into_source().expect("a viewer's source");
+        assert_eq!(
+            source.entry().id,
+            SessionId::new(FIXTURE_EXPORT_STARTED_MS, 1)
+        );
+        assert_eq!(
+            source
+                .notices()
+                .get(&("//app:migrate".to_owned(), 1, "plan".to_owned())),
+            Some(&FIXTURE_NOTICE.to_owned())
+        );
+        let logs: Vec<(&str, &[u8])> = source
+            .failure_logs()
+            .iter()
+            .map(|l| (l.addr.as_str(), l.log.as_slice()))
+            .collect();
+        assert_eq!(logs, [("//app:migrate", FIXTURE_LOG.as_bytes())]);
+    }
+}

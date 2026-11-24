@@ -195,7 +195,7 @@ still in WAL mode (live, or a seal cut short) or sealed (rollback mode).
 | `session` | exactly one row: id, `format`, heph version, owner pid, `host`, `user`, `actor_kind` (`human`, `agent`, `ci`), `actor_name` (`claude-code`, `github-actions`, `unknown`), `ci_run_url`, `command`, `argv` (a JSON array), `cwd` (`HEPH_CWD` when set), workspace root and home, `git_head` (always NULL for now), label, interactive, `capabilities`, `lossy` (argv or cwd lost bytes: a NUL or invalid UTF-8 stored as U+FFFD), `started_ms`, `ended_ms`, `exit_code`, `panicked`, `truncated` and `truncated_seq` (set once the recording reached its 1 GiB ceiling; passing only the 256 MiB full cap shows as the first `heph.truncated` span event and in `status`), `derivation`, `sealed`, `snapshot` (0 in a local recording; 1 in an export taken of a session still running) |
 | `records` | the source of truth, in stream order: `seq`, `at_ms`, `kind` (the record's variant name), `addr`, and `body`, the record as JSON (see [Records](#records)) |
 | `status` | one row: the latest `SessionSnapshot`, upserted at most once a second and only when changed, and the final one at exit |
-| `notices`, `failure_logs` | empty in a local recording; filled only by an export (see [Export](#export-hephsession)) |
+| `notices`, `failure_logs` | empty in a local recording; filled only by an export (see [Export](#export-hephsession)): `notices (addr, seq, name, text)`, one row per approval notice; `failure_logs (addr, nth, log, cut_bytes)`, one row per root failure |
 | `spans`, `span_events`, `metrics` | the explorer tables, derived from `records` (see [The explorer](#the-explorer)) |
 | `logs`, `sessions`, `targets` | explorer views over `records`, `session` and `spans` |
 
@@ -212,8 +212,11 @@ of the session row's fields reaches a hash, or a target's argv, env or files
 
 The six explorer names (`sessions`, `spans`, `span_events`, `metrics`,
 `logs`, `targets`) are the public contract (I9, below). The tables behind
-them (`session`, `records`, `status`, `notices`, `failure_logs`) are
-internal and may change within a format.
+them (`session`, `records`, `status`) are internal and may change within a
+format. `notices` and `failure_logs` are what another machine reads an
+export's notices and logs from, so they are held to the same rule as the
+six names: within a format they only gain columns, and the four of each
+listed above keep their names and meaning.
 
 ### The explorer
 
@@ -445,10 +448,11 @@ incompatible change:
   `application_id` is not heph's is "not a heph session"; a newer format is
   refused by name, by `show`/`attach`/`inflight` naming both versions,
   while `list` shows a placeholder row ("format N, needs newer heph") and
-  exits 0; every older format is read, back to 1. Each released format has a
-  committed fixture that a test opens
-  (`crates/tui/src/tui/session/testdata/format-N/session.db`), and a format
-  bump adds one. `show` run by a heph older than the session row's
+  exits 0; every older format is read, back to 1. Each released format has
+  committed fixtures that a test opens, a recording
+  (`crates/tui/src/tui/session/testdata/format-N/session.db`) and an export
+  (`format-N/example.hephsession`, read back through the viewers' path), and
+  a format bump adds both. `show` run by a heph older than the session row's
   `heph_version` warns that the session may be shown incomplete; `list`,
   `attach` and `inflight` do not warn.
 - **`SessionSnapshot.version`** versions the `status` row on disk, and
@@ -477,11 +481,14 @@ incompatible change:
   (spec D20), not by editing what is stored. The fixture test checks exactly
   this: a subset, in order, everywhere, and the six names' columns unchanged.
 
-New fields are `#[serde(default)]` and unknown ones are ignored. Two things
-are frozen for **every** format: the `lock` file name and its `flock`
-meaning. That is what lets cleanup, which reads at most a recording's
-100-byte header, work on a session of a format it cannot read: a held lock
-over an unreadable recording is a live session of unknown format.
+New fields are `#[serde(default)]` and unknown ones are ignored. Three
+things are frozen for **every** format: the `lock` file name and its `flock`
+meaning, and where the 100-byte SQLite header keeps what a reader decides
+from: `user_version` (the format) at offset 60 and `application_id`
+(`0x48455048`) at offset 68, each 4 bytes big-endian, and the WAL-or-rollback
+bytes 18–19. That is what lets cleanup, which reads at most that header, work
+on a session of a format it cannot read: a held lock over an unreadable
+recording is a live session of unknown format.
 
 There is no reader for the `meta.json` / `events.ndjson` / `status.json`
 directories an earlier heph wrote (spec D9): it has no `session.db`, so
@@ -869,6 +876,11 @@ A reader sniffs the leading bytes, never the name:
 
 Every file is opened read-only and `immutable=1`, with `trusted_schema` off,
 and its text reaches the terminal escaped, as a live recording's does.
+`immutable=1` reads the file and nothing beside it, so a bare `session.db`
+copied out of a sessions directory while still in WAL mode (a live session,
+or a lost one) and opened by path misses whatever is still in its `-wal`:
+it shows as `incomplete`, ending where the last checkpoint did. Export it
+(`heph session export <id>`) to read it whole on another machine.
 
 ## Opening a recording: `<ref>`
 
