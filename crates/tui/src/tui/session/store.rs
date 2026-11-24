@@ -1042,8 +1042,18 @@ pub struct PoolSummary {
     pub waiting_us: u64,
 }
 
-/// Every pool with session-wide rows, by name. Empty for a session still
-/// running (the rows come at its end), and for one that admitted nothing.
+/// The most pools [`read_pools`] holds. A foreign file is untrusted: without
+/// this, its metrics could name a pool per row.
+pub const POOLS_CAP: usize = 256;
+
+/// The longest unit [`read_pools`] keeps (heph writes `{cpu}`, `By`, `1`).
+const POOL_UNIT_CAP: usize = 64;
+
+/// Every pool with session-wide rows, by name, at most [`POOLS_CAP`] of
+/// them. Empty for a session still running (the rows come at its end), and
+/// for one that admitted nothing. A row naming a pool no heph could
+/// (longer than a pool name may be), or with a unit no heph writes, is
+/// skipped.
 pub fn read_pools(conn: &Connection) -> rusqlite::Result<Vec<PoolSummary>> {
     let mut stmt = conn.prepare(
         "SELECT json_extract(attributes, '$.\"heph.pool\"'), name, unit, value FROM metrics \
@@ -1061,9 +1071,17 @@ pub fn read_pools(conn: &Connection) -> rusqlite::Result<Vec<PoolSummary>> {
         let name: String = r.get(1)?;
         let unit: String = r.get(2)?;
         let value: f64 = r.get(3)?;
+        if pool.len() > hcore::capacity::MAX_POOL_NAME_LEN || unit.len() > POOL_UNIT_CAP {
+            continue;
+        }
         if name == "heph.pool.capacity" {
             // Ordered by time: the last row wins.
-            capacity.insert(pool, value);
+            if capacity.len() < POOLS_CAP || capacity.contains_key(&pool) {
+                capacity.insert(pool, value);
+            }
+            continue;
+        }
+        if pools.len() >= POOLS_CAP && !pools.contains_key(&pool) {
             continue;
         }
         let summary = pools.entry(pool.clone()).or_insert_with(|| PoolSummary {
