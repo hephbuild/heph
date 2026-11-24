@@ -64,8 +64,11 @@ pub(crate) async fn export_ref(
     let rec = match open_ref(&sources, &args.reference, opts, opener).await? {
         Resolved::Local { entry, .. } => {
             let id = entry.id;
-            Recording::open_local(file.root(), &file.root().join(id.encode()))
-                .map_err(|e| anyhow::anyhow!("{e}"))
+            // Opening an unsealed recording copies it: blocking work.
+            let (root, dir) = (file.root().to_path_buf(), file.root().join(id.encode()));
+            hcore::blocking::run(move || Recording::open_local(&root, &dir))
+                .await
+                .map_err(anyhow::Error::new)
                 .with_context(|| format!("opening session {id}"))?
         }
         Resolved::Foreign(rec) => rec,
@@ -78,8 +81,18 @@ pub(crate) async fn export_ref(
         );
     }
     let logs = (!args.no_logs).then_some(read);
-    export(&rec, dest, logs, &store::tmp_dir(file.root()), stdout)
-        .with_context(|| format!("exporting session {id}"))
+    let tmp = store::tmp_dir(file.root());
+    match dest {
+        // The VACUUM, the log reads and the compression: on the blocking
+        // pool, never on a runtime worker.
+        Dest::File(_) => {
+            hcore::blocking::run(move || export(&rec, dest, logs, &tmp, &mut std::io::sink())).await
+        }
+        // The caller's writer is borrowed, so this one runs where it is
+        // called: `bootstrap::block_on`'s own thread, not a worker.
+        Dest::Stdout => export(&rec, dest, logs, &tmp, stdout),
+    }
+    .with_context(|| format!("exporting session {id}"))
 }
 
 /// Write `rec` to `dest`: a snapshot made self-contained through `logs`

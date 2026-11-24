@@ -109,11 +109,9 @@ impl Recording {
         tmp_dir: &Path,
     ) -> Result<Self, ForeignError> {
         let download = download.into_temp_path();
-        let file = hephsession::open(&download, tmp_dir).map_err(|e| match e {
-            // The temp path means nothing to the user: name the URL.
-            ForeignError::Io(e) => ForeignError::Io(e.context(format!("reading {origin}"))),
-            other => other,
-        })?;
+        // An IO error names no path (the temp one would mean nothing to the
+        // user): the caller names `origin`.
+        let file = hephsession::open(&download, tmp_dir)?;
         Ok(Self::Foreign(Foreign {
             file,
             download: Some(download),

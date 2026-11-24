@@ -356,13 +356,14 @@ fn a_non_regular_file_is_not_a_session() {
     }
 }
 
-/// A missing file is an IO error naming it, not "not a session".
+/// A missing file is an IO error, not "not a session". Its message leaves
+/// the path to the caller, which names it once.
 #[test]
 fn a_missing_file_is_an_io_error() {
     let case = Case::new();
     let path = case.dir.path().join("nope.hephsession");
     match open(&path, &case.tmp()) {
-        Err(ForeignError::Io(e)) => assert!(format!("{e:#}").contains("nope.hephsession")),
+        Err(ForeignError::Io(e)) => assert!(!format!("{e:#}").contains("nope.hephsession")),
         other => panic!("expected an IO error, got {other:?}"),
     }
 }

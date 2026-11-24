@@ -528,7 +528,7 @@ pub fn to_dir(
     abort: &Abort,
 ) -> anyhow::Result<PathBuf> {
     let rec = Recording::open_local(root, dir)
-        .map_err(|e| anyhow::anyhow!("{e}"))
+        .map_err(anyhow::Error::new)
         .with_context(|| format!("opening session {id}"))?;
     // A copy the open made (an unsealed recording) is the abort's to remove
     // too; aborted already, it is removed as `rec` drops.

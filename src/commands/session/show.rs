@@ -376,7 +376,8 @@ pub(crate) async fn show(
             render(source, sources, entry, None, opts, json, out).await
         }
         Resolved::Foreign(rec) => {
-            let foreign = rec.into_source()?;
+            // Reads the whole recording's session-wide rows: blocking work.
+            let foreign = hcore::blocking::run(move || rec.into_source()).await?;
             let sources: [&dyn SessionSource; 1] = [&foreign];
             let entry = foreign.entry().clone();
             render(&foreign, &sources, entry, Some(&foreign), opts, json, out).await

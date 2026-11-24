@@ -294,11 +294,23 @@ pub(crate) fn kinded(kind: ErrorKind, error: anyhow::Error) -> anyhow::Error {
     anyhow::Error::new(Kinded { kind, error })
 }
 
-/// The kind of `e`: the first [`Kinded`] in its chain, else `Other`.
+/// The kind of `e`: the first [`Kinded`] or local-recording `OpenError` in
+/// its chain, else `Other`.
 pub(crate) fn error_kind(e: &anyhow::Error) -> ErrorKind {
+    use crate::tui::session::store::OpenError;
     e.chain()
-        .find_map(|c| c.downcast_ref::<Kinded>())
-        .map_or(ErrorKind::Other, |k| k.kind)
+        .find_map(|c| {
+            if let Some(k) = c.downcast_ref::<Kinded>() {
+                return Some(k.kind);
+            }
+            c.downcast_ref::<OpenError>().map(|o| match o {
+                OpenError::Missing => ErrorKind::NotFound,
+                OpenError::NotASession => ErrorKind::NotASession,
+                OpenError::TooNew { .. } => ErrorKind::FormatTooNew,
+                OpenError::Other(_) => ErrorKind::Other,
+            })
+        })
+        .unwrap_or(ErrorKind::Other)
 }
 
 /// `{"error": {"kind", "message"}}` on one line, for `--json`.

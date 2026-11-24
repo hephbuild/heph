@@ -61,7 +61,8 @@ pub(crate) async fn attach(
             follow(source, entry, None, sink, session, global).await
         }
         Resolved::Foreign(rec) => {
-            let foreign = rec.into_source()?;
+            // Reads the whole recording's session-wide rows: blocking work.
+            let foreign = hcore::blocking::run(move || rec.into_source()).await?;
             let entry = foreign.entry().clone();
             follow(&foreign, entry, Some(&foreign), sink, session, global).await
         }

@@ -220,6 +220,38 @@ async fn a_signed_url_query_never_reaches_the_output() {
     }
 }
 
+/// A path that cannot be read is `io`, and its message names it once.
+#[tokio::test]
+async fn an_unreadable_path_is_io_and_named_once() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let empty = FakeSource::default();
+    let sources: [&dyn SessionSource; 1] = [&empty];
+    let op = opener_in(tmp.path(), NoDownload);
+    let arg = tmp.path().join("nope.hephsession").display().to_string();
+    let e = show_with(&sources, &arg, false, &op)
+        .await
+        .expect_err("missing");
+    assert_eq!(error_kind(&e), ErrorKind::Io);
+    let msg = format!("{e:#}");
+    assert_eq!(msg.matches("nope.hephsession").count(), 1, "{msg}");
+}
+
+/// A local recording's `OpenError` keeps its kind through the context the
+/// command adds: `error.kind` reads it, not `other`.
+#[test]
+fn an_open_error_keeps_its_kind() {
+    use crate::tui::session::store::OpenError;
+    for (e, kind) in [
+        (OpenError::Missing, ErrorKind::NotFound),
+        (OpenError::NotASession, ErrorKind::NotASession),
+        (OpenError::TooNew { found: 99 }, ErrorKind::FormatTooNew),
+        (OpenError::Other(anyhow::anyhow!("disk")), ErrorKind::Other),
+    ] {
+        let e = anyhow::Error::new(e).context("opening session x");
+        assert_eq!(error_kind(&e), kind, "{e:#}");
+    }
+}
+
 /// The spec's `12345`: a live session's pid first, then an id that starts or
 /// ends with it, then an error naming both readings.
 #[tokio::test]

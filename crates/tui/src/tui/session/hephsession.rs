@@ -90,7 +90,8 @@ pub enum ForeignError {
     /// A heph recording in a format newer than this heph reads.
     TooNew { found: u32 },
     /// The file could not be read at all (missing, unreadable, disk full
-    /// while decompressing).
+    /// while decompressing). The message does not name the file: the
+    /// caller, which knows what the user called it, does.
     Io(anyhow::Error),
 }
 
@@ -155,9 +156,10 @@ pub(crate) fn open_capped(
     tmp_dir: &Path,
     cap: u64,
 ) -> Result<ForeignFile, ForeignError> {
-    let io_err = |what: &str, e: io::Error| {
-        ForeignError::Io(anyhow::Error::new(e).context(format!("{what} {}", path.display())))
-    };
+    // The caller names what it opened (a path, or a URL rather than the
+    // download's temp path), so the message does not.
+    let io_err =
+        |what: &'static str, e: io::Error| ForeignError::Io(anyhow::Error::new(e).context(what));
     let mut file = open_regular(path).map_err(|e| io_err("open", e))??;
     let lead = read_lead(&mut file).map_err(|e| io_err("read", e))?;
     let decompressed = match sniff(&lead) {
