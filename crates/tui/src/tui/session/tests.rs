@@ -885,6 +885,74 @@ fn cleanup_does_not_hold_up_the_recording() {
     }
 }
 
+/// I1 and the PR 2 gate: a foreign connection on the live file (a `sqlite3`
+/// shell, an editor's SQLite browser) keeps the seal from switching the
+/// journal mode. `finish` gives the seal [`recorder::SEAL_BUDGET`] and goes,
+/// with `End` committed; the next cleanup seals the recording.
+#[test]
+fn a_foreign_connection_does_not_hold_up_finish() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let session = Session::open(&SessionRoot::new(root.path()), start()).expect("open");
+    let id = session.id();
+    let dir = session.dir().to_path_buf();
+    let db = dir.join(store::FILE);
+    let tap = session.tap();
+    for ev in events() {
+        tap.event(ev);
+    }
+    tap.flush(Duration::from_secs(5))
+        .expect("records committed");
+    drop(tap);
+    let foreign = rusqlite::Connection::open_with_flags(
+        &db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .expect("a foreign read-only connection");
+    foreign
+        .execute_batch("BEGIN; SELECT count(*) FROM records;")
+        .expect("a read held open");
+
+    let finishing = std::time::Instant::now();
+    session.finish(Some(0), false);
+    let took = finishing.elapsed();
+    assert!(
+        took < Duration::from_millis(600),
+        "finish waited {took:?} on a foreign connection"
+    );
+    assert!(
+        !lockfile::is_held(&dir.join(files::LOCK)).expect("probe"),
+        "the lock is free once finish returns"
+    );
+    foreign.execute_batch("COMMIT").expect("end the read");
+    let end = store::read_row_end(&foreign).expect("row end");
+    assert!(end.sealed, "End is committed: {end:?}");
+    let last: String = foreign
+        .query_row(
+            "SELECT kind FROM records ORDER BY seq DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .expect("the last record");
+    assert_eq!(last, "End");
+    drop(foreign);
+    assert!(
+        store::read_header(&db).expect("header").expect("heph").wal,
+        "the cut-short seal left the file in WAL mode"
+    );
+
+    let report = cleanup::cleanup(
+        root.path(),
+        std::time::SystemTime::now() + cleanup::STARTING * 2,
+        Retention::default(),
+    )
+    .expect("cleanup");
+    assert_eq!(report.sealed, vec![id], "{report:?}");
+    assert!(
+        !store::read_header(&db).expect("header").expect("heph").wal,
+        "cleanup sealed it"
+    );
+}
+
 /// I1: a recorder that panics costs the recording, not the run.
 #[test]
 fn recorder_panic_does_not_fail_app() {

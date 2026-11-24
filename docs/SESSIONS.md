@@ -482,8 +482,11 @@ At exit the owner writes `End`, the final `status`, and the session row's
 transaction; then it **seals** the file: `wal_checkpoint(TRUNCATE)`,
 checking its busy column (a viewer mid-read makes it busy with rc OK), then
 `journal_mode=DELETE`, checking the mode it returns. It retries while a
-viewer is in the way, within the exit's 3s bound less a 250ms margin, then
-releases the lock. Nothing writes the file after the mode switch, so the
+viewer is in the way for at most 400ms (less if the exit's 3s bound has
+less than that left after a 250ms margin), then releases the lock. A
+follower closes on `End` well inside that; a connection that stays open (a
+`sqlite3` shell on the live file) cuts the seal short, so the process exits
+on time and the next cleanup seals the recording. Nothing writes the file after the mode switch, so the
 rollback-mode header is the only seal test: `sealed=1` in a WAL-mode file
 means the seal was cut short, and readers take the copy path for it.
 `sealed=1` therefore means `End` and the session row's end fields are

@@ -77,6 +77,12 @@ pub const FINISH_TIMEOUT: Duration = Duration::from_secs(3);
 /// What the seal leaves of [`FINISH_TIMEOUT`] for the answer to reach the
 /// finisher, so it is not cut short while the seal still runs.
 const FINISH_MARGIN: Duration = Duration::from_millis(250);
+/// The most the owner's seal waits on another connection to the file: the
+/// PR 2 gate bounds a seal with a viewer attached at 500 ms. A follower closes
+/// within a [`super::source::FOLLOW_TICK`] of `End`, well inside it; a
+/// connection that stays open (a `sqlite3` shell) cuts the seal short, and the
+/// next cleanup seals the recording.
+pub(crate) const SEAL_BUDGET: Duration = Duration::from_millis(400);
 
 /// What the recorder thread is sent.
 #[derive(Debug)]
@@ -1141,7 +1147,8 @@ impl RecorderThread {
         // cut short leaves the file in WAL mode for the next cleanup.
         let budget = deadline
             .saturating_duration_since(Instant::now())
-            .saturating_sub(FINISH_MARGIN);
+            .saturating_sub(FINISH_MARGIN)
+            .min(SEAL_BUDGET);
         match store::seal(conn, budget) {
             Ok(store::Sealed::Done) => {}
             Ok(store::Sealed::CutShort) => {
