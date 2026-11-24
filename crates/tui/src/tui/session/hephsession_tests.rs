@@ -483,6 +483,12 @@ fn a_zstd_frame_wanting_a_2_gib_window_is_refused() {
 
 /// A zip entry whose headers understate its size, stored or deflated, is
 /// still stopped at the cap: the declared size is never trusted.
+///
+/// Two lies. One declares 100 bytes: the zip crate itself stops reading at
+/// the declared size, before heph's cap is reached, so that half is the
+/// dependency's guard. The other declares 2 MiB, over the 1 MiB cap but
+/// under the 3 MiB it really holds: only heph's cap stops it before the zip
+/// reader would, so that half fails if heph's cap goes.
 #[test]
 fn an_understated_zip_entry_stops_at_the_cap() {
     let mut big = fixture();
@@ -491,24 +497,28 @@ fn an_understated_zip_entry_stops_at_the_cap() {
         zip::CompressionMethod::Stored,
         zip::CompressionMethod::Deflated,
     ] {
-        let case = Case::new();
-        let mut zip = zip_of(&[("x.hephsession", &big)], method);
-        // Uncompressed size: local header +22, central header +24.
-        for at in offsets_of(&zip, LOCAL_HEADER) {
-            put_u32(&mut zip, at + 22, 100);
+        for declared in [100, 2 << 20] {
+            let case = Case::new();
+            let mut zip = zip_of(&[("x.hephsession", &big)], method);
+            // Uncompressed size: local header +22, central header +24.
+            for at in offsets_of(&zip, LOCAL_HEADER) {
+                put_u32(&mut zip, at + 22, declared);
+            }
+            for at in offsets_of(&zip, CENTRAL_HEADER) {
+                put_u32(&mut zip, at + 24, declared);
+            }
+            let path = case.write("bomb.zip", &zip);
+            let why = not_a_session_why(open_capped(&path, &case.tmp(), 1 << 20));
+            if declared > 1 << 20 {
+                assert!(why.contains("decompresses past"), "{method:?}: {why}");
+            } else {
+                assert!(
+                    why.contains("larger than its declared") || why.contains("decompresses past"),
+                    "{method:?}: {why}"
+                );
+            }
+            assert_eq!(case.files(), ["bomb.zip"], "{method:?} {declared}");
         }
-        for at in offsets_of(&zip, CENTRAL_HEADER) {
-            put_u32(&mut zip, at + 24, 100);
-        }
-        let path = case.write("bomb.zip", &zip);
-        let why = not_a_session_why(open_capped(&path, &case.tmp(), 1 << 20));
-        // Stopped by the zip reader at the declared size, or by the cap;
-        // either way refused, and nothing kept.
-        assert!(
-            why.contains("larger than its declared") || why.contains("decompresses past"),
-            "{method:?}: {why}"
-        );
-        assert_eq!(case.files(), ["bomb.zip"], "{method:?}");
     }
 }
 
