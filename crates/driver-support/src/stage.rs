@@ -39,6 +39,10 @@ pub const READ_ONLY_ANNOTATION: &str = "read_only";
 /// Without it an
 /// unfiltered read-only input is exposed as one directory symlink and the list
 /// records only that subtree root — which a per-file consumer cannot use.
+///
+/// It applies to the artifacts that have a list: an input's `Support`
+/// artifacts (its `support_files`) have none, and the OS runner links them as
+/// a subtree whatever this annotation says.
 pub const STAGE_PER_FILE_ANNOTATION: &str = "stage_per_file";
 
 /// Map an arbitrary key (a source addr like `//pkg/sub:name`) to a single
@@ -897,8 +901,7 @@ fn link_tree(
     for (kind, rel) in &nodes {
         let dst = link_root.join(rel);
         if *kind == NodeKind::Dir {
-            std::fs::create_dir_all(&dst)
-                .with_context(|| format!("create linked dir {:?}", dst))?;
+            real_dir(&dst)?;
             continue;
         }
         if !filters.matches(rel) {
@@ -917,6 +920,51 @@ fn link_tree(
         list.append(&listed)?;
     }
     Ok(())
+}
+
+/// Make `dst` a real directory of the sandbox, for [`link_tree`] to link files
+/// into.
+///
+/// An earlier input may have symlinked `dst` whole into its own stage entry
+/// (a tool's `support_files` tree is linked as one subtree, see
+/// [`place_entry`]). Linking a file through that symlink would create — or,
+/// replacing an existing one, unlink — an entry inside the read-only stage
+/// that every other sandbox shares. So the symlink is split instead, the way
+/// `place_entry` splits one: replaced by a real directory holding a link to
+/// each of its entries. `link_tree` visits parents first, so the outermost
+/// symlink is the one split, and a nested one is split when its own turn
+/// comes.
+#[cfg(unix)]
+fn real_dir(dst: &Path) -> anyhow::Result<()> {
+    match std::fs::symlink_metadata(dst) {
+        Ok(md) if md.file_type().is_symlink() => {
+            let existing = std::fs::read_link(dst)
+                .with_context(|| format!("readlink existing symlink {:?}", dst))?;
+            if !std::fs::metadata(&existing).is_ok_and(|m| m.is_dir()) {
+                anyhow::bail!(
+                    "staged input needs a directory at {:?}, where an earlier input placed \
+                     a symlink to {:?}, which is not one",
+                    dst,
+                    existing,
+                );
+            }
+            std::fs::remove_file(dst)
+                .with_context(|| format!("remove symlink before splitting {:?}", dst))?;
+            std::fs::create_dir(dst)
+                .with_context(|| format!("create real dir over split symlink {:?}", dst))?;
+            merge_dir(&existing, dst, &mut None)
+        }
+        Ok(md) if md.is_dir() => Ok(()),
+        Ok(md) => anyhow::bail!(
+            "staged input needs a directory at {:?}, where an earlier input placed a {:?}",
+            dst,
+            md.file_type(),
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(dst).with_context(|| format!("create linked dir {:?}", dst))
+        }
+        Err(e) => Err(e).with_context(|| format!("stat linked dir {:?}", dst)),
+    }
 }
 
 /// Materialize one staged entry at `dst`: a regular file through
@@ -1910,6 +1958,83 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&link).expect("teardown");
         assert!(stage.join("nodejs24/toolA/tools/heph/bin/node").exists());
         assert!(stage.join("nodejs24/toolB/tools/heph/bin/npm").exists());
+    }
+
+    /// A per-file input placed under a directory an earlier input symlinked
+    /// whole (a tool's `support_files` tree, linked as one subtree) splits that
+    /// symlink into real directories and links its own files there. It never
+    /// links or unlinks *through* the symlink, which would write into the
+    /// read-only stage entry the symlink points at.
+    #[tokio::test]
+    async fn per_file_input_under_a_symlinked_tree_never_writes_through_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let stage = tmp.path().join("stage");
+        let link = tmp.path().join("ws");
+        let support = content(
+            "support",
+            &[
+                ("t/sdk/bin/hello", "HELLO", true),
+                ("t/sdk/lib/data.txt", "DATA", false),
+            ],
+        );
+        let output = content("output", &[("t/sdk/bin/hello", "HELLO", true)]);
+
+        stage_and_link(&support, &stage, "k", &link, None, &[], false, &ct())
+            .await
+            .expect("support tree");
+        assert!(
+            std::fs::symlink_metadata(link.join("t/sdk"))
+                .expect("lstat")
+                .file_type()
+                .is_symlink(),
+            "precondition: the support tree is one subtree symlink"
+        );
+
+        let list_path = tmp.path().join("hello.list");
+        let mut list = ListFile::new(list_path.clone());
+        stage_and_link(
+            &output,
+            &stage,
+            "k",
+            &link,
+            Some(&mut list),
+            &[],
+            true,
+            &ct(),
+        )
+        .await
+        .expect("a per-file output under the symlinked tree");
+        drop(list);
+
+        for dir in ["t/sdk", "t/sdk/bin"] {
+            assert!(
+                std::fs::symlink_metadata(link.join(dir))
+                    .expect("lstat")
+                    .file_type()
+                    .is_dir(),
+                "{dir} is a real directory now"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(link.join("t/sdk/bin/hello")).expect("read"),
+            "HELLO"
+        );
+        assert_eq!(
+            std::fs::read_to_string(link.join("t/sdk/lib/data.txt")).expect("read"),
+            "DATA",
+            "the support tree's other entries stay reachable"
+        );
+        assert_eq!(
+            listed(&list_path),
+            vec![link.join("t/sdk/bin/hello").display().to_string()]
+        );
+        assert_eq!(
+            std::fs::read_to_string(stage.join("k/support/t/sdk/bin/hello"))
+                .expect("the support entry's file is intact"),
+            "HELLO"
+        );
+        std::fs::remove_dir_all(&link).expect("teardown");
+        assert!(stage.join("k/support/t/sdk/lib/data.txt").exists());
     }
 
     #[tokio::test]

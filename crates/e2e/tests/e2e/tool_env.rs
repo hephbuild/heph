@@ -155,7 +155,9 @@ target(
 /// A tool the target declares itself (`tools = …`) is staged once into the
 /// shared stage and linked into each consumer's sandbox, exactly like a tool
 /// reached through a dependency's transitive closure — not copied into every
-/// sandbox. Shaped like an SDK: an entry binary plus a `support_files` tree.
+/// sandbox. Shaped like an SDK: an entry binary plus a `support_files` tree,
+/// and the tree reaches each sandbox as a subtree symlink, not one link per
+/// file — a gcloud SDK is ~57k files, and linking each costs what copying did.
 #[tokio::test]
 async fn a_declared_tool_is_staged_once_for_every_consumer() -> anyhow::Result<()> {
     let ws = Workspace::new();
@@ -181,7 +183,20 @@ target(
         r#"
 target(name = "a", driver = "bash", tools = ["//sdktool:tool"], run = "hello > $OUT", out = "a.txt")
 target(name = "b", driver = "bash", tools = {"h": "//sdktool:tool"}, run = "$TOOL_H > $OUT", out = "b.txt")
+target(
+    name = "shape",
+    driver = "bash",
+    tools = ["//sdktool:tool"],
+    run = 'if [ -L "$HEPH_TOOLS_DIR/sdktool/sdk/lib" ]; then echo subtree; else echo per-file; fi > $OUT',
+    out = "shape.txt",
+)
 "#,
+    );
+    let shape = ws.run("//sdkuse:shape").await?;
+    assert_eq!(
+        common::artifact_string(&shape).trim(),
+        "subtree",
+        "the support tree is linked as a subtree, not file by file"
     );
 
     for addr in ["//sdkuse:a", "//sdkuse:b"] {

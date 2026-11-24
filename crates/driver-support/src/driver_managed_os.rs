@@ -77,6 +77,14 @@ impl ManagedDriverOs {
                 let list_path = list_path_for(&input, &list_dir);
                 match self.stage_dir.as_deref() {
                     Some(stage_dir) if crate::stage::is_read_only(&input.annotations) => {
+                        // Per-file linking serves a consumer that reads the
+                        // input's list, so it applies only where there is
+                        // one. A `Support` artifact has none: an exec tool's
+                        // `support_files` tree (an SDK, tens of thousands of
+                        // files) is linked as one subtree symlink, like any
+                        // other read-only input, not file by file.
+                        let per_file =
+                            list_path.is_some() && crate::stage::is_per_file(&input.annotations);
                         let hold = crate::stage::stage_and_link(
                             &input.artifact.content,
                             stage_dir,
@@ -86,7 +94,7 @@ impl ManagedDriverOs {
                                 .as_deref()
                                 .map(|p| crate::stage::ListFile::reuse(&mut open_list, p)),
                             &input.filters,
-                            crate::stage::is_per_file(&input.annotations),
+                            per_file,
                             ctoken,
                         )
                         .await
