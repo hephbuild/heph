@@ -384,3 +384,46 @@ fn raw_records_no_session() {
         sessions.display()
     );
 }
+
+/// Spec row (MAJOR #5): `HEPH_SESSION_EXPORT_DIR` set on a run writes its
+/// session to `<dir>/<id>.hephsession` as it exits, a file `session show`
+/// opens by path, and a run whose export succeeds says nothing about it.
+#[test]
+fn the_export_dir_variable_exports_each_run() {
+    let dist = Dist::locate();
+    let ws = workspace();
+    let exports = tempfile::tempdir().expect("tempdir");
+    // `cmd` strips the variable from the ambient environment: set it after.
+    let out = ws
+        .cmd(&dist, &["run", "//pkg:ok"])
+        .env(common::SESSION_EXPORT_DIR_ENV, exports.path())
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run");
+    assert!(out.status.success(), "{}", describe(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let id = id_in(&stderr).unwrap_or_else(|| panic!("no session announced\n{}", describe(&out)));
+    assert!(
+        !stderr.contains("WARN") && !stderr.contains("export"),
+        "{}",
+        describe(&out)
+    );
+    let names: Vec<String> = std::fs::read_dir(exports.path())
+        .expect("the export dir")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    let file = format!("{id}.hephsession");
+    assert_eq!(names, std::slice::from_ref(&file));
+
+    let path = exports.path().join(&file);
+    let shown = ws
+        .run(
+            &dist,
+            &["session", "show", "--json", path.to_str().expect("UTF-8")],
+        )
+        .expect("session show");
+    assert!(shown.status.success(), "{}", describe(&shown));
+    let v: serde_json::Value = serde_json::from_slice(&shown.stdout).expect("show --json");
+    assert_eq!(v["id"], id.as_str(), "{v}");
+    assert_eq!(v["state"], "ok", "{v}");
+}
