@@ -916,6 +916,22 @@ in
   # an `xcrun` and an `ld -v`, about 40ms — a tenth of a debug link — so it is
   # done once per shell, not once per link.
   #
+  # A local mac shell packs debug builds' debug info into a `.dSYM` per binary
+  # (`split-debuginfo = "packed"`). Cargo's macOS default, `unpacked`, leaves
+  # the binary's object files beside it in `build/<pkg>/<hash>/out/` for its
+  # debug map, and nothing ever deletes them: every incremental session names
+  # its codegen units afresh, so each edit of a crate adds a new set. One
+  # worktree held 4.7 GB of them, a third of it referenced by no binary, and
+  # `core`'s test binary alone had 784 beside it. Packed, rustc runs `dsymutil`
+  # after the link and deletes the objects. Backtraces keep file:line; kache
+  # stores the `.dSYM` rustc wrote instead of running `dsymutil` again.
+  #
+  # The cost is the `dsymutil` run on every debug link: +0.7s on `core`'s
+  # test binary, 2-4s and ~1.5 GB of memory on a 250-300 MB one (`e2e`,
+  # `heph`). Linux embeds the DWARF in the binary and has no loose objects, so
+  # this is macOS only. CI is left alone: its runners are thrown away, and its
+  # cache keys must not move.
+  #
   # Local shells resolve features once for the whole workspace, whatever `-p` a
   # command selects. Stable cargo unifies a dependency's features only across
   # the selected packages, so `cargo test -p engine`, `cargo test -p e2e` and
@@ -938,6 +954,9 @@ in
       export CARGO_RESOLVER_FEATURE_UNIFICATION=workspace
     fi
   '' + lib.optionalString pkgs.stdenv.isDarwin ''
+    if [ -z "''${CI:-}" ]; then
+      export CARGO_PROFILE_DEV_SPLIT_DEBUGINFO=packed
+    fi
     export HEPH_DARWIN_LD=ld64.lld
     _heph_ld=$(env -u DEVELOPER_DIR /usr/bin/xcrun --find ld 2>/dev/null) || _heph_ld=
     # `PROJECT:ld-1230.1` is ld-prime; ld64 prints `PROJECT:ld64-954.16`.
