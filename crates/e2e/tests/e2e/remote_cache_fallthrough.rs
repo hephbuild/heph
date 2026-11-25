@@ -7,6 +7,9 @@
 //! output. An output identical to the cold run's therefore proves the second
 //! remote served it: the first could not, and a rebuild would not match. The
 //! run must also succeed — a damaged entry on one remote is never a failure.
+//!
+//! The `*_on_the_only_remote_rebuilds` tests read one remote instead: with no
+//! tier left to fall through to, the damaged revision is rebuilt.
 
 use crate::common::{build_engine_with_remotes, drain};
 use heph::engine::HomeDir;
@@ -285,6 +288,183 @@ async fn a_missing_blob_falls_through_on_the_hit() {
         out,
         "the second remote must serve the revision, not a rebuild"
     );
+}
+
+// One remote only: when it cannot serve the revision there is no tier left,
+// so the target rebuilds. A rebuild produces a different output, so an output
+// unlike the cold run's proves the damaged entry was not served.
+
+/// A fresh engine over `root` reading the one remote at `remote`.
+fn sole_engine(root: &Path, remote: &Path) -> Arc<heph::engine::Engine> {
+    let uri = format!("file://{}", remote.display());
+    build_engine_with_remotes(root, &[("only", &uri)])
+}
+
+/// Run `//pkg:t` against the damaged sole `remote` and assert it rebuilt:
+/// it succeeds with an output unlike the `cold` one, and the local cache then
+/// serves exactly that output to an engine with no remote, so nothing the
+/// remote held reached it. Returns the rebuilt output.
+async fn rebuilds(root: &Path, remote: &Path, cold: &[u8]) -> Vec<u8> {
+    let rebuilt = run(&sole_engine(root, remote), "//pkg:t").await;
+    assert_ne!(
+        rebuilt, cold,
+        "the sole remote cannot serve the revision: the target must rebuild"
+    );
+    assert_eq!(
+        run(
+            &crate::common::build_engine_with_remote(root, None),
+            "//pkg:t"
+        )
+        .await,
+        rebuilt,
+        "the local cache must hold the rebuilt output, whole"
+    );
+    rebuilt
+}
+
+/// A blob cut short on the only remote, for a reproducible target. The hit
+/// decision lists names only, so the revision is taken as a hit and the cut is
+/// found when the blob is pulled; with no tier left the target rebuilds, and a
+/// reproducible rebuild matches the hit's hashouts, so the run succeeds with
+/// the whole output.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_truncated_blob_of_a_reproducible_target_on_the_only_remote_rebuilds() {
+    let root = tempfile::tempdir().expect("root");
+    let remote = tempfile::tempdir().expect("remote");
+    write_build(
+        root.path(),
+        r#"target(name = "t", driver = "bash", run = "echo the same bytes every time > $OUT", out = "out.txt")"#,
+    );
+    let out = run(&sole_engine(root.path(), remote.path()), "//pkg:t").await;
+    rm_local_cache(root.path());
+    truncate_half(&out_blob(&revision(remote.path(), "t")));
+
+    assert_eq!(
+        run(&sole_engine(root.path(), remote.path()), "//pkg:t").await,
+        out,
+        "the target must rebuild its whole output, not serve the cut blob"
+    );
+}
+
+/// The same cut for a target whose output is not reproducible (accepted
+/// exemption, spec I3): the hit's hashouts were already committed, the rebuild
+/// differs from them, so the run stops loudly on the existing diverged-rebuild
+/// guard. Nothing truncated reaches the local cache, which holds the whole
+/// rebuilt output, and a re-run succeeds from it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_truncated_raw_blob_of_a_non_reproducible_target_on_the_only_remote_stops_loudly() {
+    let root = tempfile::tempdir().expect("root");
+    let remote = tempfile::tempdir().expect("remote");
+    write_build(
+        root.path(),
+        r#"target(name = "t", driver = "bash", run = "head -c 2000000 /dev/urandom | gzip > $OUT", out = "out.gz")"#,
+    );
+    let out = run(&sole_engine(root.path(), remote.path()), "//pkg:t").await;
+    assert!(
+        out.len() > 1_500_000,
+        "the output must clear the sniff floor"
+    );
+    rm_local_cache(root.path());
+
+    let blob = out_blob(&revision(remote.path(), "t"));
+    assert!(
+        !blob.to_string_lossy().ends_with(".zst"),
+        "a gzip payload must be stored raw: {}",
+        blob.display()
+    );
+    truncate_half(&blob);
+
+    let engine = sole_engine(root.path(), remote.path());
+    let rs = engine.new_state();
+    let Err(err) = Arc::clone(&engine)
+        .result_addr(
+            rs.clone(),
+            &heph::htaddr::parse_addr("//pkg:t").expect("parse addr"),
+            heph::engine::OutputMatcher::All,
+            &heph::engine::ResultOptions::default(),
+        )
+        .await
+    else {
+        panic!("a diverged rebuild after a hit must stop the run");
+    };
+    drain(rs).await;
+    assert!(
+        format!("{err:#}").contains("the rebuild differs from cached revision"),
+        "the run must stop on the diverged-rebuild guard: {err:#}"
+    );
+
+    let rebuilt = run(
+        &crate::common::build_engine_with_remote(root.path(), None),
+        "//pkg:t",
+    )
+    .await;
+    assert_ne!(rebuilt, out, "the local cache must hold the rebuild");
+    assert!(
+        rebuilt.len() > 1_500_000,
+        "the rebuilt output must be whole, not the truncated blob: {} bytes",
+        rebuilt.len()
+    );
+    assert_eq!(
+        run(&sole_engine(root.path(), remote.path()), "//pkg:t").await,
+        rebuilt,
+        "a re-run succeeds from the local cache"
+    );
+}
+
+/// A manifest that does not deserialize on the only remote.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_garbage_manifest_on_the_only_remote_rebuilds() {
+    let root = tempfile::tempdir().expect("root");
+    let remote = tempfile::tempdir().expect("remote");
+    write_build(root.path(), RANDOM_TARGET);
+    let out = run(&sole_engine(root.path(), remote.path()), "//pkg:t").await;
+    rm_local_cache(root.path());
+
+    let rev = revision(remote.path(), "t");
+    std::fs::write(rev.join("manifest-v2.borsh"), b"not a manifest").expect("garble manifest");
+
+    rebuilds(root.path(), remote.path(), &out).await;
+}
+
+/// Another target's revision restored under this one's key on the only
+/// remote: its manifest names `//pkg:u`, and its blobs are `u`'s output.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn another_targets_revision_on_the_only_remote_rebuilds() {
+    let root = tempfile::tempdir().expect("root");
+    let remote = tempfile::tempdir().expect("remote");
+    write_build(
+        root.path(),
+        &format!(
+            "{RANDOM_TARGET}\n{}",
+            r#"target(name = "u", driver = "bash", run = "echo $RANDOM$RANDOM$RANDOM > $OUT", out = "out.txt")"#
+        ),
+    );
+    let cold_engine = sole_engine(root.path(), remote.path());
+    let out = run(&cold_engine, "//pkg:t").await;
+    let other = run(&cold_engine, "//pkg:u").await;
+    drop(cold_engine);
+    assert_ne!(out, other, "the two targets must be told apart by output");
+    rm_local_cache(root.path());
+
+    copy_revision_over(&revision(remote.path(), "u"), &revision(remote.path(), "t"));
+
+    let rebuilt = rebuilds(root.path(), remote.path(), &out).await;
+    assert_ne!(rebuilt, other, "u's bytes must not be served as t's");
+}
+
+/// The hit decision: the only remote's manifest is whole, but its output
+/// blob is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_missing_blob_on_the_only_remote_rebuilds() {
+    let root = tempfile::tempdir().expect("root");
+    let remote = tempfile::tempdir().expect("remote");
+    write_build(root.path(), RANDOM_TARGET);
+    let out = run(&sole_engine(root.path(), remote.path()), "//pkg:t").await;
+    rm_local_cache(root.path());
+
+    std::fs::remove_file(out_blob(&revision(remote.path(), "t"))).expect("evict blob");
+
+    rebuilds(root.path(), remote.path(), &out).await;
 }
 
 /// Total bytes of every file under `dir`.
