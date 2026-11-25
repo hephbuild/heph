@@ -31,6 +31,10 @@ What a consumer may rely on:
   inlined, titles and descriptions, and how alternatives are structured
   (`anyOf`, `oneOf`, `if`/`then`). Treat the document as opaque: hand it to a
   validator whole, and do not `$ref` into it from another schema.
+- **Whitespace.** Pretty-printed on a terminal, one line when piped, like
+  every JSON heph prints (`docs/JSON_OUTPUT.md`). `--json` prints the same
+  document and `--jq` filters it; neither is needed to get the schema, and
+  `--fields` does not apply.
 
 ## Getting the schema from a tool
 

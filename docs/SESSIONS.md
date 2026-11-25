@@ -219,7 +219,8 @@ incompatible change:
   needs newer heph") and exits 0. `show` run by a heph older than
   `meta.heph_version` warns that the session may be shown incomplete;
   `list`, `attach` and `inflight` do not warn.
-- **`SessionSnapshot.version`** versions `status.json` and `show --json`.
+- **`SessionSnapshot.version`** versions `status.json` on disk, and nothing
+  else: `show --json` leaves it out (its stability is the CLI's, below).
   It is still 1 with the list cap and `totals`, because no heph has shipped a
   snapshot yet: version 1 is what the first release carries, cap included.
   The cap is not an additive change, since it changes what the existing lists
@@ -236,12 +237,16 @@ meaning. That is what lets cleanup, which never parses `meta.json`, work on a
 session of a format it cannot read: a held lock with an unreadable `meta.json`
 is a live session of unknown format.
 
-### `--json` stability
+### `--json`
 
-`list --json` is `{version, sessions: [{id, owner_pid, argv, workspace_root,
-cwd, state, started_unix_ms, last_event_unix_ms, exit_code, panicked,
-progress, now, blocked_on, format}]}`, sorted by id, times in absolute unix
-ms:
+`list`, `show` and `inflight` take `--json`, `--fields` and `--jq`, with the
+rules every heph command follows (`docs/JSON_OUTPUT.md`): `--fields help`
+lists each command's fields.
+
+`list --json` is an array, one element per session, `[{id, owner_pid, argv,
+workspace_root, cwd, state, started_unix_ms, last_event_unix_ms, exit_code,
+panicked, progress, now, blocked_on, format}]`, sorted by id, times in
+absolute unix ms; `[]` when there is no session:
 
 - `progress` is PROGRESS as numbers, `{done, total, total_complete,
   running_ops, failed}`, `null` before the session wrote its first
@@ -268,8 +273,13 @@ ms:
   `argv`, `null` progress and `state: "unknown"`. `owner_pid` is never `null`
   otherwise.
 
-`show --json` is the `SessionSnapshot` plus `id`, `state`, `blocked_on`,
-`chain_root`, and `next`. The snapshot is folded from the event log, every
+`show --json` is one object: the viewer's `id`, `state`, `blocked_on`,
+`chain_root` and `next`, then the snapshot field by field
+(`approval_standing`, present only while a standing approval decision acts on
+the build, `first_event_unix_ms`, `last_event_unix_ms`, `counts`, `running`,
+`waiting`, `failed`, `lock_waits`, `admission_waits`, `totals`, `truncated`,
+`end`). The snapshot's own `version` is not printed: it versions `status.json`
+on disk, not this output. The snapshot is folded from the event log, every
 list in full, unless the log reached its 64 MiB cap: then it is `status.json`,
 each list capped at 100 entries, and `totals` says which were cut.
 `blocked_on` has `list --json`'s shape, but from that same snapshot, so it is
@@ -294,8 +304,9 @@ The text `Next:` line prints `command` alone, its reason on the line below.
 
 `inflight --json` is `{id, report}`.
 
-Field names are permanent once released: a field may be added, never renamed
-or removed without a version bump. `state` is computed by the viewer and may
+A shipped field is never renamed or removed and never changes type; a change
+that would is a new field (`docs/JSON_OUTPUT.md`, "Stability"). No output
+carries a version to bump. `state` is computed by the viewer and may
 gain values; a consumer treats one it does not know as unknown, not as an
 error. `state` also depends on the viewer's `--stall-notice` (the `quiet`
 threshold), so two viewers can disagree on it; `last_event_unix_ms` is the

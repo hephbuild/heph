@@ -133,7 +133,7 @@ the bytes decide between `Generated` and `Source`.
 ### Globs
 
 The fs `glob()` target and the BUILD-time `heph.fs.glob()` skip `Generated`
-and `Modified` files, silently by default. `-v` and `--json` list each
+and `Modified` files, silently by default. `-v` lists each
 path, once per run however many globs skipped it, and `-v` adds each glob's
 own count ("excluded 3 generated files (…)"); `heph tool codegen why <path>`
 explains one. Reading the index needs no target definition, no engine call
@@ -295,7 +295,8 @@ discard it").
 
 ## Commands
 
-Every command lives under `heph tool codegen` and takes `--json`. Path
+Every command lives under `heph tool codegen` and takes `--json`, `--fields`
+and `--jq` (see JSON below, and `docs/JSON_OUTPUT.md`). Path
 arguments may be relative to the current directory, relative to the
 workspace root (`//p/foo.go`), or absolute; a path outside the workspace is
 refused. A bare `p/foo.go` typed in a subdirectory that names nothing there,
@@ -321,7 +322,7 @@ message: "section marker predates heph vX; run heph tool codegen gitignore
 once and commit".
 
 ```json
-{"schema": 1, "stale": true, "reasons": ["lines"], "written": true,
+{"stale": true, "reasons": ["lines"], "written": true,
  "lines": [{"op": "add", "pattern": "/p/foo.pb.go", "addr": "//p:gen"}],
  "released": [{"path": "p/old.pb.go", "addr": "//p:gen"}]}
 ```
@@ -349,11 +350,12 @@ A broken BUILD file never fails `status`. `--check` exits 1 when anything is
 listed.
 
 ```
-{"schema": 1, "items": [{"path", "kind", "addr", "output", "fix"}, ...]}
+{"items": [{"path", "kind", "addr", "output", "fix"}, ...], "hint"}
 ```
 
 An `unresolved` item has `package` and `error` instead of `path`: branch on
-`kind` first.
+`kind` first. `hint` is present only when the index is empty but section
+lines match files on disk.
 
 ### `heph tool codegen keep <path>...`
 
@@ -377,7 +379,7 @@ do and changes nothing.
 or unknown:
 
 ```
-{"schema": 1, "results": [{"path", "result", "reason"}, ...],
+{"results": [{"path", "result", "reason"}, ...],
  "lines": [{"op": "remove", "pattern", "addr"}, ...], "released": ["p/other.pb.go", ...]}
 ```
 
@@ -394,11 +396,13 @@ matched with its line number and whether heph wrote it, or "no section line
 matches". Exits 1 when a path is unknown.
 
 ```
-{"schema": 1, "hint": "...",
- "results": [{"path", "result", "reason", "status", "status_reason",
+{"results": [{"path", "result", "reason", "status", "status_reason",
               "row": {"path", "addr", "output", "state", "written_at", "pending", "verified"},
-              "section_line": {"line", "pattern", "heph_wrote", "negated"}}, ...]}
+              "section_line": {"line", "pattern", "heph_wrote", "negated"}}, ...],
+ "hint": "..."}
 ```
+
+`results` has one entry per path, in argument order, a repeated path once.
 
 `result` is `explained`, `unknown` or `refused` (outside the workspace).
 `status` is `generated`, `modified`, `released` or `source`; `status_reason`
@@ -420,7 +424,7 @@ recorded 412 generated files from the previous heph's xattrs; 3 skipped, 0 uncha
 ```
 
 ```json
-{"schema": 1, "recorded": 412, "skipped": 3, "unchanged": 0}
+{"recorded": 412, "skipped": 3, "unchanged": 0}
 ```
 
 A file whose xattr value is empty or not a target address is `skipped` with a
@@ -429,21 +433,28 @@ warning; a section line still covers it as `unrecorded`. Removed in v1.1.0.
 ### `heph tool gen-gitignore` (removed)
 
 Fails with exit 2: "heph tool gen-gitignore was removed; use heph tool codegen
-gitignore (and --check for the up-to-date test)". With `--json`:
-`{"schema": 1, "error": "command_removed", "use": "heph tool codegen gitignore"}`.
+gitignore (and --check for the up-to-date test)", on stderr, whatever it is
+given: it has no JSON form, and an old `--json` changes nothing. Nothing is
+printed on stdout.
 
 ### JSON
 
-Every `--json` output is `{"schema": 1, ...}` with sorted arrays and a `kind`
-or `result` enum. A new field is additive; a renamed or removed field bumps
-`schema`. Consumers must ignore fields they do not know, and treat a `kind`,
-`result`, `reason`, `status`, `status_reason` or `state` value they do not
-know as opaque: a new value is additive too.
+Each command's `--json` is the one object shown under it, keys in the order
+shown, with sorted arrays and a `kind` or `result` enum. The output follows
+heph's rules for every command (`docs/JSON_OUTPUT.md`): pretty on a terminal,
+one line when piped; `--fields` picks keys (`--fields help` lists them) and
+`--jq` filters the object. A shipped key is never renamed or removed and
+never changes type; a change that would is a new key. Consumers must ignore
+keys they do not know, and treat a `kind`, `result`, `reason`, `status`,
+`status_reason` or `state` value they do not know as opaque: a new value is
+additive too.
 
-A failure (exit 2) prints `{"schema": 1, "error": "<message>"}` on stdout and
-the message on stderr. A usage error is clap's, before any command runs: it
-prints nothing on stdout. The removed `gen-gitignore` prints its own document
-(above).
+The exit code is the same with or without `--json`. Findings (`--check`) and
+refused or unknown paths print the object and exit 1. A failure (exit 2)
+prints nothing on stdout and the message on stderr, so `… --json | jq .error`
+prints nothing; branch on the exit code. A usage error is clap's, before any
+command runs, and prints nothing on stdout either. A `--jq` filter that fails
+while it runs also exits 2, never 1, so it cannot read as findings.
 
 ## Upgrading from the xattr
 

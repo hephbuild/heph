@@ -179,6 +179,13 @@ $ heph tool build-lsp --explain BUILD:12:20 --json
 
 Line and column are 1-based, the column counted in characters.
 
+`--json` prints one object, `{col, degraded, file, line, reason, site}`:
+`site` is the classification (its `kind`, and what the resolver read there),
+`reason` why heph's answer would be empty (`null` when heph answers), and
+`degraded` the list above. `--fields` and `--jq` work as on every command
+(`docs/JSON_OUTPUT.md`). They apply to `--explain` only: the server itself
+speaks JSON-RPC on stdio, so `--json` without `--explain` exits 2.
+
 ## Adding a site kind
 
 1. Add a `Site` variant in `site.rs` and detect it in `classify`. Read only
