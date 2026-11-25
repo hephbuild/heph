@@ -18,6 +18,7 @@
 mod attach;
 mod export;
 pub(crate) mod list;
+mod query;
 mod reference;
 pub(crate) mod show;
 #[cfg(test)]
@@ -137,6 +138,89 @@ pub enum SessionCommands {
     ///
     /// `heph session export 02kf5 -o -`
     Export(ExportArgs),
+    /// Read-only SQL over the sessions recorded
+    ///
+    /// Every source is presented as the same six tables (`sessions`,
+    /// `targets`, `spans`, `span_events`, `metrics`, `logs`; `--schema`
+    /// lists their columns), so one query works on any of them:
+    ///
+    /// - by default, the catalog: this workspace's sessions started in the
+    ///   window (`--since 7d`), `--all-workspaces` for every workspace's. The
+    ///   catalog holds the spans of the targets that ran, not of cache hits,
+    ///   and no logs.
+    /// - `--full`: every recording kept that started in the window instead,
+    ///   cache hits included, at the cost of opening each file.
+    /// - `--from <ref>`: the recordings named, a session id, a `.hephsession`
+    ///   path or an `https://` URL; repeatable.
+    ///
+    /// The query is read-only by construction: one statement, reads and
+    /// side-effect-free functions only. It stops after `--timeout`, and more
+    /// rows than `--limit` (100000 by default, 0 for none) is an error. A
+    /// refused or failing statement exits 125.
+    ///
+    /// Examples:
+    ///
+    /// `heph session query 'SELECT addr, duration_us FROM targets ORDER BY duration_us DESC LIMIT 10'`
+    ///
+    /// `heph session query --since 30d --format json -f slowest.sql`
+    ///
+    /// `heph session query --from ci/heph-02kf5.hephsession 'SELECT count(*) FROM spans'`
+    ///
+    /// `heph session query --schema`
+    Query(QueryArgs),
+}
+
+#[derive(Args, Clone, Debug)]
+#[command(group(
+    clap::ArgGroup::new("statement").required(true).args(["sql", "file", "schema"])
+))]
+pub struct QueryArgs {
+    /// The SQL; `-` reads it from stdin.
+    #[arg(value_name = "SQL")]
+    pub sql: Option<String>,
+    /// Read the SQL from FILE.
+    #[arg(short = 'f', long = "file", value_name = "FILE")]
+    pub file: Option<std::path::PathBuf>,
+    /// Query this recording instead of the window: a session id (or its last
+    /// 4–5 characters, or a live session's pid), a `.hephsession` path or an
+    /// `https://` URL. Repeatable.
+    #[arg(long = "from", value_name = "REF")]
+    pub from: Vec<String>,
+    /// Sessions started since: a duration back from now (`7d`, `12h`) or an
+    /// RFC 3339 time. The catalog keeps 90 days, recordings 7.
+    #[arg(long, value_name = "T", default_value = "7d", conflicts_with = "from")]
+    pub since: String,
+    /// Sessions started before: a duration back from now or an RFC 3339 time.
+    #[arg(long, value_name = "T", conflicts_with = "from")]
+    pub until: Option<String>,
+    /// Every workspace's sessions, not only this one's.
+    #[arg(long, conflicts_with = "from")]
+    pub all_workspaces: bool,
+    /// Every recording kept in the window instead of the catalog: the spans
+    /// of cache hits too.
+    #[arg(long, conflicts_with = "from")]
+    pub full: bool,
+    /// `table` (aligned, for a terminal), `csv`, or `json`:
+    /// `{version, columns, types, rows, coverage}`.
+    #[arg(long, value_enum, default_value = "table")]
+    pub format: QueryFormat,
+    /// Rows returned at most; more is an error. 0: no cap.
+    #[arg(long, value_name = "N")]
+    pub limit: Option<usize>,
+    /// Stop the query after this long (`30s`, `2m`).
+    #[arg(long, value_name = "DURATION", default_value = "30s", value_parser = query::parse_timeout)]
+    pub timeout: Duration,
+    /// Print the six tables with their columns and the schema version.
+    #[arg(long, conflicts_with_all = ["from", "full", "format"])]
+    pub schema: bool,
+}
+
+/// How `heph session query` prints its rows.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueryFormat {
+    Table,
+    Csv,
+    Json,
 }
 
 #[derive(Args, Clone, Debug)]
@@ -422,6 +506,36 @@ fn execute(
                 writeln!(stdout, "{}", path.display()).context("writing the path")?;
             }
             Ok(())
+        }
+        SessionCommands::Query(a) => {
+            let workspace = if a.all_workspaces {
+                None
+            } else {
+                crate::engine::get_root()
+                    .ok()
+                    .map(|p| p.to_string_lossy().into_owned())
+            };
+            let windowed = a.from.is_empty() && !a.schema;
+            if windowed && !a.all_workspaces && workspace.is_none() {
+                sink.write_diagnostic(
+                    "heph: not in a workspace; querying the sessions of every workspace\n",
+                );
+            }
+            let note_sink = sink.clone();
+            let env = query::QueryEnv {
+                root: &root,
+                sources: &sources,
+                opts,
+                opener: &opener,
+                workspace,
+                note: Arc::new(move |line: &str| note_sink.write_diagnostic(line)),
+            };
+            bootstrap::block_on(query::query(
+                a,
+                env,
+                &mut std::io::stdin().lock(),
+                &mut stdout,
+            ))?
         }
     }
 }
