@@ -1065,13 +1065,16 @@ fn header_reads_never_close_an_fd_on_a_recording_open_read_write() {
         assert!(std::time::Instant::now() < deadline, "still registered");
         std::thread::sleep(Duration::from_millis(5));
     }
+    // The catalog writes read the header too (attached immutable only when
+    // sealed), on their own fd once the recorder is gone.
+    store::rw_open::plain_reads::take(&path);
     assert!(
         !store::read_header(&path)
             .expect("read")
             .expect("sqlite")
             .wal
     );
-    assert_eq!(store::rw_open::plain_reads::take(&path), 1);
+    assert!(store::rw_open::plain_reads::take(&path) >= 1);
 }
 
 /// Registrations count: the kept fd stays until the last one drops.

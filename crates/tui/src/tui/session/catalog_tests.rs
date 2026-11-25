@@ -190,6 +190,58 @@ fn catalog_owner_writes_start_then_seal() {
     );
 }
 
+/// A seal a reader cut short leaves the recording in WAL mode, `End` and
+/// `sealed=1` in the WAL. The owner's seal-time write reads through the WAL:
+/// its `complete=1` row has the end and every target, not the last
+/// checkpoint's empty session.
+#[test]
+fn a_cut_short_seal_still_writes_the_whole_session() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let id = recent_id(1, 0);
+    let dir = tmp.path().join(id.encode());
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(dir.join(files::LOCK), b"").expect("lock file");
+    let (conn, _rw) =
+        store::create(&dir, &meta_for(id), &store::Provenance::default(), false).expect("create");
+    // A viewer's read from before the build: the checkpoint cannot copy
+    // anything written after it into the file.
+    let reader = Connection::open_with_flags(
+        dir.join(store::FILE),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("a reader");
+    reader
+        .execute_batch("BEGIN; SELECT count(*) FROM records;")
+        .expect("a read held open");
+    let mut writer = store::Writer::new(conn, id);
+    for ev in build_events() {
+        let r = event_record(ev);
+        let body = serde_json::to_string(&r).expect("encode");
+        writer.insert(&r, &body).expect("insert");
+    }
+    writer.commit().expect("commit");
+    let conn = writer
+        .finish(id.started_unix_ms() + 1_000, Some(0), false)
+        .expect("finish");
+    assert_eq!(
+        store::seal(conn, Duration::from_millis(50)).expect("seal"),
+        store::Sealed::CutShort
+    );
+    catalog::record_seal(tmp.path(), &dir, true);
+    drop(reader);
+
+    let conn = read(tmp.path());
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM sessions WHERE complete = 1 AND ended_ms IS NOT NULL"
+        ),
+        1,
+        "the seal-time row is complete and ended"
+    );
+    assert_eq!(count(&conn, "SELECT count(*) FROM targets"), 3);
+}
+
 /// `dropped_write_heals_without_watermark` (I8): A's write is dropped, a
 /// later B's succeeds; the next command heals A. A heal racing an owner's
 /// write doubles no row.

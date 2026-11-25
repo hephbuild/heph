@@ -164,11 +164,17 @@ enum Rows {
 
 /// Copy the recording at `rec` into the catalog on `conn`: one transaction,
 /// so a heal racing the owner's own write never doubles a row.
-fn copy_session(conn: &Connection, rec: &Path, live: bool, copy: Rows) -> rusqlite::Result<()> {
-    let query = if live {
-        "mode=ro"
-    } else {
+///
+/// Attached `immutable` only when its header says rollback mode: a live
+/// recording, or one whose seal a reader cut short, has its last
+/// transactions (`End`, `sealed=1`, the derived rows) in the WAL, which an
+/// immutable attach never reads.
+fn copy_session(conn: &Connection, rec: &Path, copy: Rows) -> rusqlite::Result<()> {
+    let sealed = matches!(store::read_header(rec), Ok(Some(h)) if !h.wal);
+    let query = if sealed {
         "mode=ro&immutable=1"
+    } else {
+        "mode=ro"
     };
     conn.execute("ATTACH DATABASE ?1 AS rec", [store::file_uri(rec, query)])?;
     let res = copy_attached(conn, copy);
@@ -450,7 +456,7 @@ fn try_owner_write(root: &Path, dir: &Path, copy: Rows) -> anyhow::Result<bool> 
         .map_err(|e| anyhow::anyhow!("{e}"))
         .context("checking the session catalog")?;
     let rec = dir.join(store::FILE);
-    copy_session(&conn, &rec, copy == Rows::Start, copy)
+    copy_session(&conn, &rec, copy)
         .with_context(|| format!("copying {} into the catalog", rec.display()))?;
     drop(conn);
     drop(lock);
@@ -725,7 +731,7 @@ fn heal(conn: &Connection, root: &Path, now_ms: u64) -> rusqlite::Result<HealRep
             report.unknown += 1;
             continue;
         }
-        match copy_session(conn, &rec, false, Rows::Full { recorded: true }) {
+        match copy_session(conn, &rec, Rows::Full { recorded: true }) {
             Ok(()) => report.healed += 1,
             Err(e) if catalog_failed(conn, &e) => return Err(e),
             Err(e) => {
@@ -812,7 +818,7 @@ pub fn replace(root: &Path, dir: &Path) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("{e}"))
         .context("checking the session catalog")?;
     let rec = dir.join(store::FILE);
-    copy_session(&conn, &rec, false, Rows::Full { recorded: true })
+    copy_session(&conn, &rec, Rows::Full { recorded: true })
         .with_context(|| format!("copying {} into the catalog", rec.display()))
 }
 
@@ -1174,7 +1180,6 @@ mod tests {
         copy_session(
             &stale,
             &dir.join(store::FILE),
-            false,
             Rows::Full { recorded: true },
         )
         .expect("the seal write lands");
