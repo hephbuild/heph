@@ -479,16 +479,90 @@ pub(crate) async fn list(
     catalog: Option<&CatalogRows>,
     json: bool,
     out: &mut dyn Write,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Shown> {
     let all = list_all(sources).await?;
     let every: Vec<&SessionEntry> = all.iter().map(|(_, e)| e).collect();
     let shown = rows(&every, catalog, workspace, filter, opts);
-    if json {
-        write_json(&shown, &every, catalog, opts, out)
+    // `--addr` reads the catalog's target rows, which a session writes when
+    // it ends: the live ones in the window are not searched.
+    let live_unsearched = if filter.addr.is_some() {
+        let window = ListFilter {
+            since_ms: filter.since_ms,
+            until_ms: filter.until_ms,
+            ..ListFilter::default()
+        };
+        every
+            .iter()
+            .copied()
+            .filter(|e| e.live)
+            .filter(|e| {
+                let r = Row {
+                    entry: Some(*e),
+                    cat: None,
+                };
+                keep(&r, workspace, &window, opts)
+            })
+            .count()
     } else {
-        write_table(&shown, &every, workspace, filter, opts, out)
+        0
+    };
+    if json {
+        write_json(&shown, &every, catalog, opts, out)?;
+    } else {
+        write_table(&shown, &every, workspace, filter, opts, out)?;
     }
+    Ok(Shown {
+        rows: shown.len(),
+        live_unsearched,
+    })
 }
+
+/// What `list` printed, for [`hints`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Shown {
+    pub rows: usize,
+    /// Live sessions in the window `--addr` did not search.
+    pub live_unsearched: usize,
+}
+
+/// The stderr lines that say what `list` did not look at: under `--addr`,
+/// the live sessions (their targets reach the catalog when they end); and,
+/// when nothing matched, how much further back the catalog reaches than the
+/// window `since` (the `--since` text) asked for.
+pub(crate) fn hints(
+    shown: Shown,
+    filter: &ListFilter,
+    catalog: Option<&CatalogRows>,
+    since: &str,
+    now_ms: u64,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if shown.live_unsearched > 0 {
+        let n = shown.live_unsearched;
+        out.push(format!(
+            "heph: --addr searches ended sessions only; {n} live session{} not searched \
+             until {} ends\n",
+            if n == 1 { " is" } else { "s are" },
+            if n == 1 { "it" } else { "each" },
+        ));
+    }
+    if shown.rows == 0
+        && let Some(since_ms) = filter.since_ms
+        && let Some(oldest) = catalog.and_then(|c| c.oldest_started_ms)
+        && oldest < since_ms
+    {
+        let days = now_ms.saturating_sub(oldest).div_ceil(DAY_MS).max(1);
+        let keep = catalog::KEEP.as_secs() / (24 * 60 * 60);
+        out.push(format!(
+            "heph: no session matched since {since}; the catalog holds sessions from up to \
+             {days} day{} ago (it keeps {keep} days): --since {days}d reads them\n",
+            if days == 1 { "" } else { "s" },
+        ));
+    }
+    out
+}
+
+const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 
 /// The stderr line saying `list` widened to every workspace on its own: it
 /// was not given `--all`, but there is no workspace here to narrow to.

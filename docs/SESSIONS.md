@@ -147,6 +147,18 @@ writes the rows of any ended recording the catalog lacks, and rebuilds a
 missing or corrupt catalog. What it did goes to stderr, never stdout (see
 [The catalog](#the-catalog-catalogdb)).
 
+After it lists, `list` says on stderr what it did not search, in the table
+and with `--json` alike:
+
+```
+heph: --addr searches ended sessions only; 2 live sessions are not searched until each ends
+heph: no session matched since 7d; the catalog holds sessions from up to 23 days ago (it keeps 90 days): --since 23d reads them
+```
+
+The first line comes with `--addr` when a live session started in the
+window. The second comes when nothing matched and the catalog holds sessions
+older than the window; its `--since` reaches the oldest.
+
 ### `query`
 
 ```

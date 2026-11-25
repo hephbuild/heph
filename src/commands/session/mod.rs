@@ -467,7 +467,7 @@ fn execute(
             let catalog = list::read_catalog(&root, opts.now_ms, &filter, &mut |note| {
                 sink.write_diagnostic(note);
             });
-            bootstrap::block_on(list::list(
+            let shown = bootstrap::block_on(list::list(
                 &sources,
                 opts,
                 scope,
@@ -475,7 +475,11 @@ fn execute(
                 catalog.as_ref(),
                 a.json,
                 &mut stdout,
-            ))?
+            ))??;
+            for hint in list::hints(shown, &filter, catalog.as_ref(), &a.since, opts.now_ms) {
+                sink.write_diagnostic(&hint);
+            }
+            Ok(())
         }
         SessionCommands::Show(a) => {
             // `show` reads explorer rows, so it repairs what it reads (D14);

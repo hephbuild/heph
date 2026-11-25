@@ -665,3 +665,80 @@ async fn list_over_a_truncated_and_an_unknown_format_recording() {
     assert_eq!(cat.heal.unknown, 1, "skipped again, never failed");
     assert_eq!(cat.heal.failed + cat.heal.deferred, 0, "{:?}", cat.heal);
 }
+
+/// `list` over the real catalog, as `execute` runs it: the ids it printed
+/// (`--json`) and the hints it says on stderr after them.
+async fn list_hints(
+    root: &Path,
+    now: u64,
+    filter: &list::ListFilter,
+    since: &str,
+) -> (Vec<String>, Vec<String>) {
+    let file = FileSource::new(root);
+    let sources: [&dyn SessionSource; 1] = [&file];
+    let catalog = list::read_catalog(root, now, filter, &mut |_| {});
+    let mut out = Vec::new();
+    let shown = list::list(
+        &sources,
+        ViewOpts {
+            now_ms: now,
+            ..opts()
+        },
+        Workspace::All,
+        filter,
+        catalog.as_ref(),
+        true,
+        &mut out,
+    )
+    .await
+    .expect("list");
+    let json: serde_json::Value = serde_json::from_slice(&out).expect("json");
+    (
+        json_ids(&json),
+        list::hints(shown, filter, catalog.as_ref(), since, now),
+    )
+}
+
+/// What `list` did not search is said on stderr: under `--addr`, the live
+/// sessions (their targets reach the catalog when they end); and, when the
+/// window matched nothing, how much further back the catalog reaches, as the
+/// `--since` that reads it.
+#[tokio::test]
+async fn list_says_what_it_did_not_search() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    let now = hcore::events::now_unix_ms();
+    let old = session(root, now, 20 * DAY_MS, "run", ADDR, Did::Ran, &HUMAN);
+    let reach = "heph: no session matched since 7d; the catalog holds sessions from up to 20 \
+                 days ago (it keeps 90 days): --since 20d reads them\n";
+
+    let (ids, hints) = list_hints(root, now, &since(7, now), "7d").await;
+    assert!(ids.is_empty(), "{ids:?}");
+    assert_eq!(hints, [reach]);
+    let (ids, hints) = list_hints(root, now, &since(20, now), "20d").await;
+    assert_eq!(ids, [old.encode()], "the hinted --since reads it");
+    assert!(hints.is_empty(), "{hints:?}");
+
+    let live_id = SessionId::new(now - 60_000, 9);
+    let _live = write_live(
+        root,
+        &meta(live_id, 4242, &["heph", "run", ADDR]),
+        &resolved(ADDR, now - 60_000, true, None),
+        None,
+    );
+    let unsearched =
+        "heph: --addr searches ended sessions only; 1 live session is not searched until it ends\n";
+    let by_addr = |days| list::ListFilter {
+        addr: Some(ADDR.to_owned()),
+        ..since(days, now)
+    };
+    let (ids, hints) = list_hints(root, now, &by_addr(7), "7d").await;
+    assert!(ids.is_empty(), "the live session is not searched: {ids:?}");
+    assert_eq!(hints, [unsearched, reach]);
+    let (ids, hints) = list_hints(root, now, &by_addr(30), "30d").await;
+    assert_eq!(ids, [old.encode()]);
+    assert_eq!(hints, [unsearched]);
+    let (ids, hints) = list_hints(root, now, &since(7, now), "7d").await;
+    assert_eq!(ids, [live_id.encode()], "without --addr it is listed");
+    assert!(hints.is_empty(), "{hints:?}");
+}
