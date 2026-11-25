@@ -138,36 +138,10 @@ where
 
 /// Build the engine `global` describes, then run `body` on it under
 /// [`run_progress_app`]. `body` gets the engine and a request on it from
-/// [`engine_request`]; the exit code is the body's.
+/// [`engine_request`]; the exit code is the body's. `dashboard` is the
+/// command's `-D`.
 ///
-/// The terminal and `--no-tui` (`global.no_tui`) decide the TUI. `dashboard`
-/// is the command's `-D`.
-pub(crate) async fn run_engine_command<F, Fut>(
-    label: impl Into<String>,
-    sink: LogSink,
-    session: &Arc<SessionSlot>,
-    global: &GlobalOptions,
-    dashboard: bool,
-    body: F,
-) -> anyhow::Result<()>
-where
-    F: FnOnce(Arc<Engine>, Arc<RequestState>, AppContext) -> Fut + Send + 'static,
-    Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
-{
-    let no_tui = global.no_tui;
-    engine_command(
-        label,
-        sink,
-        session,
-        global,
-        dashboard,
-        move || tui::should_use_tui(no_tui),
-        body,
-    )
-    .await
-}
-
-/// [`run_engine_command`] for a command that has opted into the output
+/// For a command that has opted into the output
 /// flags: the runner reads them, so under any of `--json`, `--fields`, `--jq`
 /// the TUI is off without the command having to remember (I1). The terminal
 /// and `--no-tui` decide first, as for every other command, and that decision
@@ -270,7 +244,7 @@ where
     .await
 }
 
-/// The request a [`run_engine_command`] body runs on: its build events reach
+/// The request a [`run_engine_command_out`] body runs on: its build events reach
 /// `ctx`'s view, and it is fail-fast as the command line says (`fail_fast`),
 /// unlike [`request_state`].
 fn engine_request(engine: &Arc<Engine>, fail_fast: bool, ctx: &AppContext) -> Arc<RequestState> {

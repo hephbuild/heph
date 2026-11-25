@@ -361,7 +361,9 @@ fn exit_code_for(
         };
     }
     // `--jq`: a filter that failed while it ran is 2 on every command, so it
-    // never reads as a command's own code; a cancelled one is 130.
+    // never reads as a command's own code; a cancelled one is 130. An output
+    // flag a command refused after parsing (`tool build-fmt -`) is 2, as
+    // clap's refusals are.
     if let Some(code) = output::exit_code(e) {
         report(e, session);
         return code;

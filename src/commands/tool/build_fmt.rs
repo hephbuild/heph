@@ -10,7 +10,7 @@ use hxstarlark_fmt::{Config, Reformat};
 
 use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
-use crate::commands::progress_app::run_engine_command;
+use crate::commands::progress_app::run_engine_command_out;
 use crate::commands::utils::package_matcher_or_all;
 use crate::engine::get_root;
 use crate::pluginbuildfile::{FormatSettings, build_files_in_dir};
@@ -41,6 +41,23 @@ pub struct Args {
     pub check: bool,
     #[command(flatten)]
     pub dashboard: crate::commands::progress_app::DashboardArgs,
+    // Refused with `-`, whose stdout is the formatted source.
+    #[command(flatten)]
+    pub out: output::JsonArgs<FmtView<'static>>,
+}
+
+/// `heph tool build-fmt --json`: the BUILD files the run looked at, and the
+/// ones that were not formatted. Under `--check` the record is printed and the
+/// command still exits non-zero when any file needs formatting.
+#[derive(Debug, serde::Serialize, output::Record)]
+pub struct FmtView<'a> {
+    /// BUILD files examined.
+    checked: usize,
+    /// Workspace-relative paths of the files that were not formatted, in path
+    /// order: rewritten, or under `--check` only reported.
+    unformatted: &'a [String],
+    /// Whether `unformatted` were rewritten; `false` under `--check`.
+    written: bool,
 }
 
 pub fn execute(
@@ -50,6 +67,15 @@ pub fn execute(
     global: &GlobalOptions,
 ) -> anyhow::Result<()> {
     if args.matcher.as_deref() == Some(STDIN_MARKER) {
+        if args.out.enabled() {
+            // A usage error (exit 2), as clap's refusals of the flags are.
+            return Err(output::OutputError::Refused(
+                "`heph tool build-fmt -` writes the formatted source to stdout, which has no \
+                 JSON form; drop --json/--fields/--jq, or name a package matcher"
+                    .to_owned(),
+            )
+            .into());
+        }
         return format_stdin();
     }
     bootstrap::block_on(execute_async(args.clone(), sink, session, global.clone()))?
@@ -112,14 +138,16 @@ async fn execute_async(
     let root = get_root()?;
     let matcher = package_matcher_or_all(args.matcher.as_deref())?;
     let check = args.check;
-    run_engine_command(
+    let out = args.out;
+    run_engine_command_out(
         "Formatting BUILD files",
         sink,
         session,
         &global,
+        &out.clone(),
         args.dashboard.dashboard,
         move |engine, rs, ctx| async move {
-            let res: anyhow::Result<()> = async {
+            let res: anyhow::Result<(usize, Vec<String>)> = async {
                 let packages: Vec<String> = Arc::clone(&engine).packages(&matcher, &rs).await?;
 
                 // The workspace's configured BUILD-file patterns (literal names like
@@ -138,8 +166,8 @@ async fn execute_async(
                     build_files.extend(build_files_in_dir(&dir, &settings.patterns));
                 }
 
-                let mut changed = 0usize;
-                let mut formatted = 0usize;
+                // Files not formatted: rewritten, or under `--check` reported.
+                let mut unformatted = Vec::new();
 
                 for path in &build_files {
                     let label = file_label(&root, path);
@@ -152,39 +180,76 @@ async fn execute_async(
 
                     if check {
                         tracing::warn!("{label} is not formatted");
-                        changed += 1;
                     } else {
                         std::fs::write(path, &out_text)
                             .with_context(|| format!("writing {}", path.display()))?;
                         tracing::info!("formatted {label}");
-                        formatted += 1;
                     }
+                    unformatted.push(label);
                 }
 
                 if check {
-                    if changed > 0 {
-                        return Err(anyhow::anyhow!("{changed} BUILD file(s) need formatting"));
+                    if unformatted.is_empty() {
+                        tracing::info!("all BUILD files are formatted");
                     }
-                    tracing::info!("all BUILD files are formatted");
-                } else if formatted == 0 {
+                } else if unformatted.is_empty() {
                     tracing::info!("all BUILD files already formatted");
                 } else {
-                    tracing::info!("formatted {formatted} BUILD file(s)");
+                    tracing::info!("formatted {} BUILD file(s)", unformatted.len());
                 }
-                Ok(())
+                Ok((build_files.len(), unformatted))
             }
             .await;
 
-            crate::commands::errors::finalize(&ctx, &rs, res, None, |_| Ok(())).await
+            let cancelled = || rs.ctoken().is_cancelled();
+            crate::commands::errors::finalize(&ctx, &rs, res, None, |(checked, unformatted)| {
+                if out.enabled() {
+                    let view = FmtView {
+                        checked,
+                        unformatted: &unformatted,
+                        written: !check,
+                    };
+                    out.record(&view, &cancelled)?;
+                }
+                // Printed first: the record is the findings `--check` fails on.
+                check_verdict(check, unformatted.len())
+            })
+            .await
         },
     )
     .await
 }
 
+/// `--check` fails when any file needs formatting.
+fn check_verdict(check: bool, unformatted: usize) -> anyhow::Result<()> {
+    if check && unformatted > 0 {
+        anyhow::bail!("{unformatted} BUILD file(s) need formatting");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Config, decide};
+    use super::{Config, FmtView, check_verdict, decide};
     use std::path::PathBuf;
+
+    #[test]
+    fn record_keys_subset_of_fields() -> anyhow::Result<()> {
+        output::check_keys(&FmtView {
+            checked: 2,
+            unformatted: &["pkg/BUILD".to_string()],
+            written: false,
+        })
+    }
+
+    /// `--check` fails on findings, and only `--check` does: a rewrite that
+    /// changed files succeeded.
+    #[test]
+    fn only_check_fails_on_unformatted_files() {
+        assert!(check_verdict(true, 1).is_err());
+        assert!(check_verdict(true, 0).is_ok());
+        assert!(check_verdict(false, 3).is_ok());
+    }
 
     /// Every formatter fixture's input and expected output.
     fn fixtures() -> Vec<(String, String)> {
