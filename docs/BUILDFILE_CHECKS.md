@@ -27,6 +27,26 @@ runtime type checks, so `heph run`, `query` and `validate` already fail on it.
 A passing `build-lint-check` means that every def body typechecks. It does not
 mean the whole file does.
 
+The checker still reads the top level for the types a def sees there, and two
+things follow from that:
+
+- **A module-level call's result type is taken; its arguments are still
+  unchecked.** `cfg = Lib(name = "x")` makes `cfg` a `Lib`, and
+  `srcs = glob("*.c")` makes `srcs` the `str` that `glob` returns, so a def
+  that reads `cfg.nme` or `srcs.foo` gets a finding. The call itself is never
+  run and its arguments are not checked: a top-level `x = Lib(name = 1)` is no
+  finding, and evaluation reports it. Only an unconditional top-level
+  assignment is typed this way; inside `if` or `for` the name is `Any`. The
+  result type is the callee's: a record's instance, an enum's value, a
+  builtin's declared return type, a def's return annotation. A def in the same
+  file with no return annotation gives `Any`, a loaded one its inferred return
+  type, and a plugin function (`heph.<plugin>.<fn>`) gives `Any`.
+- **An unconditional top-level statement on a declared type's own value is
+  checked.** After `Mode = enum("debug")`, a top-level `X = Mode.nope` is a
+  finding. Evaluation raises the same error, since that statement always
+  runs. Inside `if` or `for` nothing is evaluated, so
+  `if hasattr(Mode, "nope"): X = Mode.nope` is no finding.
+
 A `def` with no return type gets one inferred from its `return` statements,
 and calls to it are checked against that type. Lambdas cannot be annotated, so
 they are exempt.
@@ -49,27 +69,48 @@ Names = list[str]
 
 def lib(l: Lib) -> Names:
     n: Names = 1          # reported: an alias is a type expression
+    l.nme                 # reported: `Lib` has no field `nme`
     return [l.name]
 
 def app():
-    lib("a")              # currently not reported: `Lib` is `Any` to the checker
+    lib("a")              # reported: Expected type `Lib` but got `str`
+    Lib(name = 1)         # reported: Expected type `str` but got `int`
+    m: Mode = "debug"     # reported: Expected type `Mode` but got `str`
 ```
 
-Lint checks an alias declared in the same file, since it is a type
-expression. Lint does not check a loaded alias, nor any `record` or `enum`. A
-record or enum is the result of a call, and the checker runs nothing, so it
-treats the annotation as `Any`.
+Where declared types are checked:
 
-A passing `build-lint-check` therefore does not prove that a record or enum
-annotation is respected. Evaluation enforces all of them: `lib("a")` fails at
-`heph run` with an error containing ``does not match the type annotation
-`Lib` ``. The same applies to a record field of the wrong type and to an enum
-value that is not a variant. That text is starlark's and may change with it,
-so match on a substring, not on the whole line.
+| Where | Lint | Evaluation |
+|---|---|---|
+| An alias, declared here or loaded | yes | yes |
+| A record's fields and attributes, an enum's values, in a def | yes | when the def runs |
+| A loaded record or enum, in a def | yes | when the def runs |
+| A module-level call's result, used in a def (`cfg = Lib(...)`) | yes | when the def runs |
+| The arguments of `record(...)`, `enum(...)` and `field(...)` | no | yes |
+| The arguments of a module-level call (`x = Lib(name = 1)`) | no | yes |
 
-The lint gap is a limit of the current checker, not a promise. A starlark
-upgrade that types records statically would start reporting such calls, and
-would be listed under [What changes on upgrade](#what-changes-on-upgrade).
+Lint builds a record or enum from its declaration without running anything,
+so the two agree on its fields and variants. Where lint cannot tell what a
+declaration says (a field type it cannot read, a declaration under `if`, a
+name bound twice, `**kwargs`), it uses `Any` for that part: lint never
+requires what evaluation does not. Evaluation's error text for a mismatch
+contains ``does not match the type annotation `Lib` ``. That text is
+starlark's and may change with it, so match on a substring, not on the whole
+line.
+
+A `type-error:` about a record or enum ends with where it was declared, by
+the type's identity rather than its name, so two records named `Lib` are told
+apart:
+
+```
+app/BUILD:4:14: type-error: The attribute `nme` is not available on the type `Lib` (Lib declared at lib/defs.BUILD:1)
+```
+
+A message about several declared types lists them in the order it mentions
+them, separated by `; `, and past three ends with `and N more`. An alias
+never gets a site, since it names no new type, and neither does a builtin
+type. The site is only in the line's text: findings are log lines, so there
+is no `declared_at` field to read it from.
 
 A record or enum value cannot be passed whole to `target()` or
 `provider_state()`, whose arguments hold only None, str, bool, int, float,
@@ -404,6 +445,18 @@ reading only: the key stays optional in the type.
   or tuple display (`srcs = []`, `creds = {}`, `t = ()`) now needs an
   annotation with no `Any` in it, although its default types it. The finding
   says what the default types it as and suggests a fix.
+- `build-lint-check` now types record and enum declarations and module-level
+  call results, so packages that passed may fail. The new findings are a
+  record field that does not exist or has the wrong type, an enum value of the
+  wrong type, an attribute a declared type does not have, a mismatch against
+  a loaded alias, and an attribute of a module-level call's result:
+  `srcs = glob("*.c")`, then `srcs.foo` in a def, is now an error, since
+  `glob` returns a `str`. See [Declared types](#declared-types).
+- A field renamed in a library now fails every package that loads it and
+  uses the old name, at lint time rather than when the def runs.
+- Builtins' declared return types, and the starlark fork's revision, now move
+  lint verdicts: a module-level call's result takes its callee's return type.
+  Both change only with a heph version, which the lint key carries.
 - A plugin named `types` no longer loads. The name is reserved for
   `heph.types`, like `core`.
 - `target(labels = None)` is now accepted and means labels left out, so a
