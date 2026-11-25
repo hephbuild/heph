@@ -260,19 +260,26 @@ fn copy_attached(conn: &Connection, copy: Rows) -> rusqlite::Result<()> {
                 params![sid, i64::from(recorded && !explorer)],
             )?;
             conn.execute("DELETE FROM main.target_rows WHERE sid = ?1", [sid])?;
+            // The recording's targets and kept results are each read once,
+            // into the connection's temp schema, for the two statements
+            // that use them; dropped before the commit, so a command's own
+            // SQL over this connection never sees them.
             conn.execute_batch(&format!(
-                "INSERT OR IGNORE INTO main.addrs (addr) SELECT addr FROM ({REC_TARGETS})"
+                "DROP TABLE IF EXISTS temp.rec_targets;
+                 CREATE TEMP TABLE rec_targets
+                   (addr TEXT PRIMARY KEY, outcome TEXT, duration_us INTEGER);
+                 INSERT INTO temp.rec_targets {REC_TARGETS};
+                 INSERT OR IGNORE INTO main.addrs (addr) SELECT addr FROM temp.rec_targets;"
             ))?;
             conn.execute(
-                &format!(
-                    "INSERT INTO main.target_rows (sid, addr_id, outcome, duration_us)
-                     SELECT ?1, a.id, CASE t.outcome WHEN 'hit' THEN 0 WHEN 'ran' THEN 1
-                       WHEN 'failed' THEN 2 WHEN 'cancelled' THEN 3 ELSE t.outcome END,
-                       t.duration_us
-                     FROM ({REC_TARGETS}) t JOIN main.addrs a ON a.addr = t.addr"
-                ),
+                "INSERT INTO main.target_rows (sid, addr_id, outcome, duration_us)
+                 SELECT ?1, a.id, CASE t.outcome WHEN 'hit' THEN 0 WHEN 'ran' THEN 1
+                   WHEN 'failed' THEN 2 WHEN 'cancelled' THEN 3 ELSE t.outcome END,
+                   t.duration_us
+                 FROM temp.rec_targets t JOIN main.addrs a ON a.addr = t.addr",
                 [sid],
             )?;
+            conn.execute_batch("DROP TABLE temp.rec_targets")?;
             for table in ["spans", "span_events", "metrics"] {
                 conn.execute(
                     &format!("DELETE FROM main.{table} WHERE session_id = ?1"),
@@ -281,10 +288,14 @@ fn copy_attached(conn: &Connection, copy: Rows) -> rusqlite::Result<()> {
             }
             if recorded && explorer {
                 conn.execute_batch(&format!(
-                    "INSERT INTO main.spans SELECT session_id, span_id, parent_span_id, name, class,
+                    "DROP TABLE IF EXISTS temp.ran_results;
+                     CREATE TEMP TABLE ran_results (span_id INTEGER PRIMARY KEY);
+                     INSERT OR IGNORE INTO temp.ran_results {RAN_RESULTS};
+                     INSERT INTO main.spans SELECT session_id, span_id, parent_span_id, name, class,
                        addr, driver, outcome, start_us, end_us, duration_us, status, attributes
-                     FROM rec.spans WHERE addr IS NULL OR span_id IN ({RAN_RESULTS})
-                       OR parent_span_id IN ({RAN_RESULTS})"
+                     FROM rec.spans WHERE addr IS NULL OR span_id IN temp.ran_results
+                       OR parent_span_id IN temp.ran_results;
+                     DROP TABLE temp.ran_results;"
                 ))?;
                 conn.execute(
                     "INSERT INTO main.span_events SELECT session_id, span_id, name, time_us, attributes

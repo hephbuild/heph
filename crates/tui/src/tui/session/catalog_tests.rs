@@ -442,6 +442,11 @@ fn a_lost_catalog_is_rebuilt_on_open() {
     let opened = catalog::open(root, now_ms()).expect("open");
     assert!(!opened.in_memory);
     assert_eq!(snapshot(&opened.conn), original);
+    assert_eq!(
+        count(&opened.conn, "SELECT count(*) FROM temp.sqlite_master"),
+        0,
+        "the copies' scratch tables are gone before a query runs"
+    );
     assert_eq!(opened.notes.len(), 1, "{:?}", opened.notes);
     assert!(opened.notes[0].contains("missing"), "{:?}", opened.notes);
     // Rounded down: 3 days and a second is "3 days", never a day it does
