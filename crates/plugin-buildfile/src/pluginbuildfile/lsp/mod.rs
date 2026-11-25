@@ -93,23 +93,59 @@ pub fn explain(target: &str, json: bool) -> anyhow::Result<String> {
     .ok();
     let overlay = parsed.as_ref().map(site::overlay_of);
     let pos = lsp_types::Position::new(line.saturating_sub(1), col.saturating_sub(1));
-    let resolution = match position::to_offset(&text, pos, position::Encoding::Utf32) {
-        Some(offset) => site::resolve(
-            &site::Doc {
-                text: &text,
-                tokens: &tokens,
-                overlay: overlay.as_ref(),
-                ast: if overlay.is_some() {
-                    site::AstState::Current
-                } else {
-                    site::AstState::Absent
-                },
-            },
-            offset,
-        ),
+    let doc = site::Doc {
+        text: &text,
+        tokens: &tokens,
+        overlay: overlay.as_ref(),
+        ast: if overlay.is_some() {
+            site::AstState::Current
+        } else {
+            site::AstState::Absent
+        },
+    };
+    let offset = position::to_offset(&text, pos, position::Encoding::Utf32);
+    let resolution = match offset {
+        Some(offset) => site::resolve(&doc, offset),
         None => site::Resolution::none(site::Reason::NotASite),
     };
-    let value = resolution.to_json();
+    let mut value = resolution.to_json();
+    // Typed with `heph_globals` alone and no loads: there is no registry and
+    // no workspace here, so a loaded name is untyped.
+    let typed = match (&resolution.site, offset) {
+        (
+            site::Site::Member {
+                receiver, scope, ..
+            },
+            Some(offset),
+        ) => match receiver {
+            site::Receiver::Literal { kind } => Some((typed::Answer::literal(*kind, false), true)),
+            site::Receiver::Rebound { name, rest } => {
+                let globals = crate::pluginbuildfile::run_file::heph_globals(
+                    &crate::pluginbuildfile::types::DriverKwargs::default(),
+                    |_| {},
+                );
+                let types = parsed
+                    .is_some()
+                    .then(|| typed::DocTypes::check(file, &text, &globals, |_| Default::default()));
+                let lookup = typed::Lookup {
+                    root: name,
+                    rest,
+                    scope,
+                    shadowed: site::bound_in_group(&doc, offset, name),
+                    stale: false,
+                    registry_ready: false,
+                };
+                Some((typed::Answer::of(types.flatten().as_ref(), &lookup), false))
+            }
+            site::Receiver::Names | site::Receiver::Expression => None,
+        },
+        _ => None,
+    };
+    if let Some((answer, literal)) = typed
+        && let Some(site) = value.get_mut("site").and_then(|s| s.as_object_mut())
+    {
+        answer.explain_into(site, literal);
+    }
     if json {
         let mut out = serde_json::json!({ "file": file, "line": line, "col": col });
         if let (Some(map), serde_json::Value::Object(r)) = (out.as_object_mut(), value) {
@@ -122,7 +158,21 @@ pub fn explain(target: &str, json: bool) -> anyhow::Result<String> {
     let kind = site.get("kind").and_then(|k| k.as_str()).unwrap_or("none");
     let mut out = format!("{file}:{line}:{col}\n  site: {kind}");
     for key in [
-        "call", "keyword", "prefix", "quote", "plugin", "selected", "receiver", "type", "scope",
+        "call",
+        "keyword",
+        "prefix",
+        "quote",
+        "plugin",
+        "selected",
+        "receiver",
+        "type",
+        "scope",
+        "binding",
+        "source",
+        "approximation",
+        "stale",
+        "registry",
+        "empty_because",
     ] {
         if let Some(v) = site.get(key).filter(|v| !v.is_null()) {
             out.push_str(&format!("\n  {key}: {v}"));

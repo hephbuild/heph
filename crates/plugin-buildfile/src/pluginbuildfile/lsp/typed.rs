@@ -103,9 +103,9 @@ impl DocTypes {
         let module = types
             .module_bindings()
             .map(|b| {
-                let declaration = b.declaration.map(|(_, span)| {
-                    format!("{path}:{}", span.resolve_span().begin.line + 1)
-                });
+                let declaration = b
+                    .declaration
+                    .map(|(_, span)| format!("{path}:{}", span.resolve_span().begin.line + 1));
                 (
                     b.name.to_owned(),
                     ModuleType {
@@ -289,7 +289,11 @@ impl Answer {
         }
         site.insert(
             "registry".to_string(),
-            json!(if self.registry_ready { "ready" } else { "pending" }),
+            json!(if self.registry_ready {
+                "ready"
+            } else {
+                "pending"
+            }),
         );
         site.insert("empty_because".to_string(), json!(self.empty_because));
     }
@@ -326,7 +330,10 @@ fn find<'t>(types: &'t DocTypes, name: &str, scope: &[String]) -> Found<'t> {
 /// The type of the def binding [`find`] found for `lookup`.
 fn def_ty(types: &DocTypes, lookup: &Lookup<'_>) -> Option<Ty> {
     (1..=lookup.scope.len()).rev().find_map(|depth| {
-        let entries = types.defs.get(lookup.scope.get(..depth)?)?.get(lookup.root)?;
+        let entries = types
+            .defs
+            .get(lookup.scope.get(..depth)?)?
+            .get(lookup.root)?;
         entries.first().map(|(_, ty)| ty.clone())
     })
 }

@@ -166,8 +166,10 @@ pub(crate) enum Receiver {
     /// A chain of names whose root the file does not bind: a global's path.
     Names,
     /// A chain of names whose root `name` the file binds itself (assigned,
-    /// loaded, a parameter), so it is not the global of that name.
-    Rebound { name: String },
+    /// loaded, a parameter), so it is not the global of that name. `rest`
+    /// is the chain after the root (`l.mode.│`: `["mode"]`), which typed
+    /// completion folds over.
+    Rebound { name: String, rest: Vec<String> },
     /// A string, list or dict literal (D9): `"-".│`, `[1].│`, `{}.│`. Read
     /// from the token before the `.`, so it needs no parse.
     Literal { kind: Literal },
@@ -453,7 +455,7 @@ impl Site {
             map.insert("receiver".to_string(), json!(receiver.name()));
             map.insert("scope".to_string(), json!(scope));
             match receiver {
-                Receiver::Rebound { name } => {
+                Receiver::Rebound { name, .. } => {
                     map.insert("rebound".to_string(), json!(name));
                 }
                 Receiver::Literal { kind } => {
@@ -1428,13 +1430,14 @@ fn dotted_site(
     // global of that name, whatever it holds; that holds for `heph` too.
     let rebound = chain
         .as_deref()
-        .and_then(|segs| segs.first())
-        .filter(|root| is_rebound(doc.overlay, root));
-    if let Some(root) = rebound {
+        .and_then(|segs| segs.split_first())
+        .filter(|(root, _)| is_rebound(doc.overlay, root));
+    if let Some((root, rest)) = rebound {
         return Some(Site::Member {
             path: None,
             receiver: Receiver::Rebound {
                 name: (*root).to_string(),
+                rest: rest.iter().map(|s| (*s).to_string()).collect(),
             },
             scope,
             edit,
@@ -1468,6 +1471,44 @@ fn dotted_site(
             prefix,
         },
     })
+}
+
+/// Whether a comprehension's `for NAME … in` or a `lambda NAME … :` binds
+/// `name` in the bracket groups enclosing `o`, or on `o`'s line (I8). The
+/// fork reports such a binding under the enclosing def, and not at module
+/// level at all, so a typed answer for `name` there could be another
+/// binding's: `[x.│ for x in xs]` must not take a module-level `x`.
+///
+/// Read from the tokens over the outermost enclosing group's extent and the
+/// cursor's line, so it over-approximates (a `lambda` elsewhere in the group
+/// counts): erring toward an empty answer, never toward a wrong one.
+pub(crate) fn bound_in_group(doc: &Doc<'_>, o: usize, name: &str) -> bool {
+    let mut lo = line_start(doc.text, o);
+    let mut hi = line_end(doc.text, o);
+    if let Some(&outer) = doc.open_stack(o).first()
+        && let Some(t) = doc.tok(outer)
+    {
+        lo = lo.min(t.start as usize);
+        hi = hi.max(doc.extent(outer).0);
+    }
+    let toks = doc.toks();
+    let mut i = doc.first_at_or_after(lo);
+    // Inside a binder: the token that ends its names (`in` for `for`, `:`
+    // for `lambda`).
+    let mut binder: Option<&str> = None;
+    while let Some(t) = toks.get(i).filter(|t| (t.start as usize) < hi) {
+        let text = doc.text_of(t);
+        match (binder, t.kind) {
+            (None, Kind::Keyword) if text == "for" => binder = Some("in"),
+            (None, Kind::Keyword) if text == "lambda" => binder = Some(":"),
+            (Some("in"), Kind::Keyword) if text == "in" => binder = None,
+            (Some(":"), Kind::Colon) => binder = None,
+            (Some(_), Kind::Ident) if text == name => return true,
+            _ => {}
+        }
+        i += 1;
+    }
+    false
 }
 
 /// The literal the `.` token `dot` follows (D9), or `None` when its receiver
@@ -1825,15 +1866,17 @@ mod tests {
                 "{fixture}"
             );
         }
-        let rebound = |name: &str| {
+        let rebound_chain = |name: &str, rest: &[&str]| {
             Some((
                 None,
                 Receiver::Rebound {
                     name: name.to_string(),
+                    rest: rest.iter().map(|x| (*x).to_string()).collect(),
                 },
                 String::new(),
             ))
         };
+        let rebound = |name: &str| rebound_chain(name, &[]);
         assert_eq!(
             path(with_overlay("x = typing.│\n", &["typing"])),
             rebound("typing"),
@@ -1861,10 +1904,14 @@ mod tests {
         );
         // A rebound `heph` is not the global either: no plugin sites, and no
         // callee shadowing that would hand `heph.` to the stock global list.
-        for fixture in ["x = heph.│\n", "x = heph.core.│\n", "x = heph.core.os.│\n"] {
+        for (fixture, rest) in [
+            ("x = heph.│\n", &[][..]),
+            ("x = heph.core.│\n", &["core"][..]),
+            ("x = heph.core.os.│\n", &["core", "os"][..]),
+        ] {
             let r = with_overlay(fixture, &["heph"]);
             assert_eq!(r.reason, None, "{fixture}");
-            assert_eq!(path(r), rebound("heph"), "{fixture}");
+            assert_eq!(path(r), rebound_chain("heph", rest), "{fixture}");
         }
         for not_member in [
             "# typing.│\n",
@@ -2006,6 +2053,36 @@ mod tests {
     fn scope(fixture: &str) -> Vec<String> {
         let (text, o) = split(fixture);
         scope_of(&text, o)
+    }
+
+    #[test]
+    fn site_comprehension_and_lambda_binders() {
+        let bound = |fixture: &str, name: &str| {
+            let (text, o) = split(fixture);
+            let tokens = lex(&text);
+            let doc = Doc {
+                text: &text,
+                tokens: &tokens,
+                overlay: None,
+                ast: AstState::Current,
+            };
+            bound_in_group(&doc, o, name)
+        };
+        for (fixture, name, want) in [
+            ("y = [x.│ for x in xs]\n", "x", true),
+            ("y = [x.│ for x in xs]\n", "xs", false),
+            ("y = [x.│ for (a, x) in xs]\n", "x", true),
+            ("y = {k: v.│ for k, v in d.items()}\n", "v", true),
+            ("y = f(\n    [x.│\n     for x in xs],\n)\n", "x", true),
+            ("f = lambda x: x.│\n", "x", true),
+            ("f = lambda a, b = 1: b.│\n", "b", true),
+            ("f = lambda a: x.│\n", "x", false),
+            ("y = [z for x in xs]\nx.│\n", "x", false),
+            ("def f(x):\n    return x.│\n", "x", false),
+            ("for x in xs:\n    x.│\n", "x", false),
+        ] {
+            assert_eq!(bound(fixture, name), want, "{fixture} {name}");
+        }
     }
 
     /// D6's adversarial inputs.
