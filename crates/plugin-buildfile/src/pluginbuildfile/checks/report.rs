@@ -56,6 +56,63 @@ impl fmt::Display for Finding {
     }
 }
 
+/// Where a record or enum a `type-error` finding mentions was declared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeclarationSite {
+    /// The type's name, as the message prints it (`Lib2 = Lib` prints `Lib`).
+    pub name: String,
+    /// The declaring file's workspace-relative path.
+    pub file: String,
+    /// 1-based line of the binding that declared it.
+    pub line: usize,
+}
+
+/// How many declaration sites a finding names before `and N more`.
+const MAX_SITES: usize = 3;
+
+impl Finding {
+    /// Append where the types this finding mentions were declared, in the
+    /// order given (the message's): ` (Lib declared at lib/defs.star:3)`, or
+    /// ` (A declared at a.star:3; B declared at b.star:7)`. A site already
+    /// named (same file and line) is skipped; past [`MAX_SITES`], the rest are
+    /// counted as `; and N more`. No site leaves the message unchanged.
+    ///
+    /// The suffix goes at the end of the message, which is the finding's only
+    /// line, so its prefix and starlark's message stem stay as they were.
+    pub(crate) fn name_declarations<'a>(
+        &mut self,
+        sites: impl IntoIterator<Item = &'a DeclarationSite>,
+    ) {
+        let mut distinct: Vec<&DeclarationSite> = Vec::new();
+        for site in sites {
+            if !distinct
+                .iter()
+                .any(|seen| seen.file == site.file && seen.line == site.line)
+            {
+                distinct.push(site);
+            }
+        }
+        if distinct.is_empty() {
+            return;
+        }
+        let named = distinct.len().min(MAX_SITES);
+        self.message.push_str(" (");
+        for (i, site) in distinct.iter().take(named).enumerate() {
+            if i > 0 {
+                self.message.push_str("; ");
+            }
+            let DeclarationSite { name, file, line } = site;
+            self.message
+                .push_str(&format!("{name} declared at {file}:{line}"));
+        }
+        let more = distinct.len() - named;
+        if more > 0 {
+            self.message.push_str(&format!("; and {more} more"));
+        }
+        self.message.push(')');
+    }
+}
+
 /// The last line of a failure that has an `annotation:` finding: where the
 /// rule it breaks is switched on.
 pub(crate) const ANNOTATIONS_FOOTER: &str = "annotations are required by requireTypeAnnotations in .hephconfig (plugins: buildfile, options)";

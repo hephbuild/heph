@@ -11,10 +11,15 @@
 //!
 //! Findings in a file the package does not own are discarded (I1); its
 //! interface is still used by the files that load it.
+//!
+//! A `type-error` finding about a record or enum a walked file declares ends
+//! with where it was declared (`(Lib declared at lib/defs.star:3)`), matched
+//! by the type's identity in the error, never by its text. Only the finding's
+//! text changes; nothing about it reaches a hash.
 
 use super::annotations;
 use super::loads::{LoadEdge, LoadWalk, owns};
-use super::report::{Finding, Kind};
+use super::report::{DeclarationSite, Finding, Kind};
 use crate::pluginbuildfile::ast::bound_names;
 use crate::pluginbuildfile::run_file::{heph_globals, is_exported, parse_build_source};
 use crate::pluginbuildfile::types::DriverKwargs;
@@ -22,8 +27,10 @@ use allocative::Allocative;
 use anyhow::Context;
 use starlark::any::ProvidesStaticType;
 use starlark::environment::Globals;
-use starlark::typing::{AstModuleTypecheck, Interface, Ty};
-use starlark::values::typing::{StarlarkCallableParamAny, StarlarkCallableParamSpec};
+use starlark::typing::{AstModuleTypecheck, Interface, Ty, TypeMap, error_types};
+use starlark::values::typing::{
+    StarlarkCallableParamAny, StarlarkCallableParamSpec, TypeInstanceId,
+};
 use starlark::values::{NoSerialize, StarlarkValue, starlark_value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
@@ -54,6 +61,11 @@ pub(crate) fn lint(
     let globals = check_globals(plugin_fns, kwargs);
     let mut checked: HashMap<&str, Checked> = HashMap::with_capacity(walk.files.len());
     let mut findings = Vec::new();
+    // Every record and enum the walked files declare, by identity, and the
+    // owned findings whose errors mention one (index into `findings`): a
+    // finding names the declarations once every file is checked (D10).
+    let mut declarations: HashMap<TypeInstanceId, DeclarationSite> = HashMap::new();
+    let mut mentions: Vec<(usize, Vec<TypeInstanceId>)> = Vec::new();
 
     for path in walk.dependency_order()? {
         let file = walk
@@ -90,7 +102,7 @@ pub(crate) fn lint(
             .collect();
 
         // Approximations mark where the checker gave up, not wrong code.
-        let (errors, _types, iface, _approximations) = ast.typecheck(&globals, &loads);
+        let (errors, types, iface, _approximations) = ast.typecheck(&globals, &loads);
         // An internal error is the checker failing, not the code: the check
         // could not run, whichever file it is in.
         if let Some(e) = errors
@@ -102,14 +114,57 @@ pub(crate) fn lint(
                 e.without_diagnostic()
             );
         }
+        record_declarations(path, &types, &mut declarations);
         if owned {
-            findings.extend(errors.iter().map(|e| type_error(path, e)));
+            for e in &errors {
+                let ids = mentioned_user_types(e);
+                if !ids.is_empty() {
+                    mentions.push((findings.len(), ids));
+                }
+                findings.push(type_error(path, e));
+            }
         }
         checked.insert(path, Checked { iface, exported });
     }
 
+    for (at, ids) in mentions {
+        if let Some(finding) = findings.get_mut(at) {
+            finding.name_declarations(ids.iter().filter_map(|id| declarations.get(id)));
+        }
+    }
     findings.sort();
     Ok(findings)
+}
+
+/// Record where each record and enum type `path` declares was declared, by
+/// the type's identity: the path is the walk's key, never the name the
+/// codemap carries, and the line is the declaring binding's. An alias in the
+/// same file (`Lib2 = Lib`) reports the same declaration, kept once.
+fn record_declarations(
+    path: &str,
+    types: &TypeMap,
+    declarations: &mut HashMap<TypeInstanceId, DeclarationSite>,
+) {
+    for binding in types.module_bindings() {
+        let Some((id, span)) = binding.declaration else {
+            continue;
+        };
+        declarations.entry(id).or_insert_with(|| DeclarationSite {
+            name: binding
+                .as_type
+                .map_or_else(|| binding.name.to_owned(), ToString::to_string),
+            file: path.to_owned(),
+            line: span.resolve_span().begin.line + 1,
+        });
+    }
+}
+
+/// The user types (records, enums) a typechecker error mentions, by
+/// identity, in the order its message mentions them. Read from the error's
+/// typed payload, never its text: an error built from a plain message
+/// mentions none.
+fn mentioned_user_types(e: &starlark::Error) -> Vec<TypeInstanceId> {
+    error_types(e).iter().flat_map(Ty::user_type_ids).collect()
 }
 
 /// Read workspace-relative paths under `root` (the driver's sandbox). An
