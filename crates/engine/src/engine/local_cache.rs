@@ -1210,7 +1210,8 @@ impl Engine {
     fn v3_blob_name(manifest_name: &str, artifact: &ManifestArtifact) -> String {
         match manifest_name {
             MANIFEST_V1 => cache_codec::v3_entry_name(&artifact.name, &artifact.encoding),
-            MANIFEST_V2 => format!("{}{}", cache_codec::V3_PREFIX, artifact.name),
+            // A v2 name is the remote's name, so v3's is the same mapping.
+            MANIFEST_V2 => cache_codec::local_entry_name_of_remote(&artifact.name),
             _ => artifact.name.clone(),
         }
     }

@@ -13158,6 +13158,16 @@ mod tests {
                 ),
             ),
             (
+                // ENAMETOOLONG on Linux and macOS (NAME_MAX 255): not "does not exist".
+                "unstattable at write",
+                vec![dir.path().join("n".repeat(300))],
+                false,
+                format!(
+                    "declares host path {}, which cannot be checked",
+                    path_str(&dir.path().join("n".repeat(300)))
+                ),
+            ),
+            (
                 "65 paths",
                 many(65)?,
                 false,

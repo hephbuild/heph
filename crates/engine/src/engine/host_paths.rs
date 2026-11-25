@@ -54,9 +54,16 @@ pub(crate) async fn checked_for_entry(
     let addr = addr.clone();
     hcore::blocking::run(move || {
         for path in &paths {
-            std::fs::metadata(path.as_path()).with_context(|| {
-                format!("{addr} declares host path {path}, which does not exist when its entry is written")
-            })?;
+            if let Err(e) = std::fs::metadata(path.as_path()) {
+                let what = if is_gone(&e) {
+                    "which does not exist"
+                } else {
+                    "which cannot be checked"
+                };
+                return Err(e).with_context(|| {
+                    format!("{addr} declares host path {path}, {what} when its entry is written")
+                });
+            }
         }
         Ok(paths)
     })
@@ -74,12 +81,7 @@ pub(crate) fn liveness(addr: &Addr, paths: &[String]) -> anyhow::Result<Liveness
     for path in paths {
         match std::fs::metadata(path) {
             Ok(_) => {}
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                ) =>
-            {
+            Err(e) if is_gone(&e) => {
                 return Ok(Liveness::Stale { path: path.clone() });
             }
             Err(e) => {
@@ -97,15 +99,20 @@ pub(crate) fn stale_reason(path: &str) -> String {
     format!("stale: host path {path} is gone")
 }
 
+/// `ENOENT` or `ENOTDIR`: the path is gone, as opposed to unreadable.
+fn is_gone(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
+}
+
 fn join(paths: &[HostPath]) -> String {
-    let mut out = String::new();
-    for (i, p) in paths.iter().enumerate() {
-        if i > 0 {
-            out.push_str(", ");
-        }
-        out.push_str(p.as_str());
-    }
-    out
+    paths
+        .iter()
+        .map(HostPath::as_str)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[cfg(test)]
