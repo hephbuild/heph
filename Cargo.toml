@@ -228,6 +228,26 @@ crossterm = { git = "https://github.com/hephbuild/crossterm.git", branch = "fix-
 # It also puts the Debug Adapter Protocol types (debugserver-types, built by
 # schemafy) and the rustyline REPL behind `dap` and `repl` features, off by
 # default; heph enables neither, so neither is compiled.
+# And declared types in the lint pre-pass, one commit each (so each can be
+# dropped or rebased alone), where the checker used `Any`:
+# - `record`, `field` and `enum` are marked as special builtins;
+# - `RecordType::init_ty` / `EnumType::init_ty` name a record or enum type
+#   without an Evaluator, by the same code `export_as` runs;
+# - the pre-pass builds a top-level record or enum, so a def is checked
+#   against its fields and values, and types a module-level call's result
+#   (`cfg = Lib(...)`, `srcs = glob(...)`) with its callee's return type,
+#   never running the call nor checking its arguments;
+# - `Interface::{get_type, new_with_types}`: a loaded record, enum or alias
+#   types an annotation in the loading file;
+# - `TypeMap::{bindings, module_bindings}` and `typing::members`, for the
+#   BUILD-file LSP;
+# - `typing::error_types` and `Ty::user_type_ids`: the types an error is
+#   about, by identity, so a finding names where a record or enum was
+#   declared.
+# So native return types, and this rev, now move `build-lint-check` verdicts:
+# changing a native's declared return type or bumping the fork can fail a
+# package that passed. Both reach users only with a heph version, which the
+# lint key carries (docs/BUILDFILE_CHECKS.md, "What changes on upgrade").
 # To be proposed to meta/starlark-rust; drop this once a release carries it.
 # `crates/plugin-buildfile/src/pluginbuildfile/starlark_patch.rs` fails without it.
 starlark = { git = "https://github.com/hephbuild/starlark-rust.git", branch = "heph/v0.14.2" }
