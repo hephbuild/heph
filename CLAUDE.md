@@ -248,12 +248,17 @@ hashing it in iteration order would move the def hash on every run.
 `heph.gh.release_asset(...)` (`crates/plugin-gh/src/release.rs`) declares an
 `http_fetch` of a release asset's download URL and, with `extract = True`, a
 `gh.extract` that unpacks it in-process (`crates/archive`).
+With `credentials` (a private repository) it goes through the API instead: an
+uncached `http_fetch` of the release JSON, a `gh.asset_url` picking the asset's
+API URL out of it, and an `http_fetch` whose `url` reads it (`${read://…}`).
 
 Read `docs/GH_RELEASES.md` before touching it. The one thing to know going in:
 the function only *declares* targets and must stay pure (no network, no
 environment), and the archive is untrusted input, so every unpacking rule
 (no `..`/absolute paths, links resolved inside the output, normalized modes,
 duplicates refused) is a security property with a unit test, not a nicety.
+So is `asset_url` refusing a URL outside `api_url`: the credentials are sent to
+whatever URL it writes.
 
 ### Failure outputs
 
