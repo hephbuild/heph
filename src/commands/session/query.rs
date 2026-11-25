@@ -195,10 +195,14 @@ async fn sources(
         // No session was ever recorded here: the empty schema answers.
         return Ok((Vec::new(), 0));
     }
-    let (root, now_ms) = (env.root.to_owned(), env.opts.now_ms);
-    let catalog = hcore::blocking::run(move || catalog::open(&root, now_ms))
+    let (root, now_ms, open_stop) = (env.root.to_owned(), env.opts.now_ms, Arc::clone(stop));
+    // Healing or rebuilding it reads recordings, seconds each over many: a
+    // Ctrl-C stops it between two, and its notes would describe a heal
+    // that did not finish.
+    let catalog = hcore::blocking::run(move || catalog::open_until(&root, now_ms, &open_stop))
         .await
         .context("opening the session catalog")?;
+    interrupted(stop)?;
     for n in &catalog.notes {
         note(n);
     }

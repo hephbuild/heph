@@ -2,6 +2,7 @@
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -470,6 +471,34 @@ fn a_lost_catalog_is_rebuilt_on_open() {
         "a sound catalog is quiet: {:?}",
         opened.notes
     );
+}
+
+/// A command stopped (Ctrl-C) while its open heals or rebuilds the catalog
+/// stops between two recordings, not after the last; the next command's
+/// heal writes what it left, equal to a catalog never interrupted.
+#[test]
+fn a_stopped_rebuild_leaves_the_rest_to_the_next_command() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    for id in [recent_id(1, 2_000), recent_id(2, 1_000)] {
+        let dir = sealed(root, id);
+        catalog::record_seal(root, &dir, true);
+    }
+    let original = snapshot(&read(root));
+
+    remove_catalog(root);
+    let stopped = catalog::open_until(root, now_ms(), &AtomicBool::new(true)).expect("open");
+    assert_eq!(stopped.heal.healed, 0, "{:?}", stopped.heal);
+    assert_eq!(
+        count(&stopped.conn, "SELECT count(*) FROM sessions"),
+        0,
+        "stopped before the first recording"
+    );
+    drop(stopped);
+
+    let opened = catalog::open(root, now_ms()).expect("open");
+    assert_eq!(opened.heal.healed, 2, "{:?}", opened.heal);
+    assert_eq!(snapshot(&opened.conn), original);
 }
 
 /// A heph catalog in an older format (`user_version` below [`catalog::FORMAT`],

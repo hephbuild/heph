@@ -22,6 +22,7 @@ use std::fs::{DirBuilder, File};
 use std::io;
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -731,11 +732,19 @@ pub struct HealReport {
 /// Open `root`'s catalog for one command, as of `now_ms`. Fails only when
 /// not even an in-memory catalog can be made.
 pub fn open(root: &Path, now_ms: u64) -> anyhow::Result<Catalog> {
-    match open_on_disk(root, now_ms) {
+    open_until(root, now_ms, &AtomicBool::new(false))
+}
+
+/// [`open`], whose heal or rebuild stops between two recordings once `stop`
+/// is set (a command's Ctrl-C): the caller sees `stop` and gives up on the
+/// catalog. What it wrote by then stays; the next command's heal writes the
+/// rest, as it would after a dropped owner write.
+pub fn open_until(root: &Path, now_ms: u64, stop: &AtomicBool) -> anyhow::Result<Catalog> {
+    match open_on_disk(root, now_ms, stop) {
         Ok(catalog) => Ok(catalog),
         Err(reason) => {
             tracing::debug!(root = %root.display(), reason, "answering without the session catalog");
-            in_memory(root, now_ms, &reason)
+            in_memory(root, now_ms, &reason, stop)
         }
     }
 }
@@ -770,7 +779,7 @@ fn covers(conn: &Connection, now_ms: u64) -> rusqlite::Result<String> {
 }
 
 /// An in-memory catalog of every kept recording.
-fn in_memory(root: &Path, now_ms: u64, reason: &str) -> anyhow::Result<Catalog> {
+fn in_memory(root: &Path, now_ms: u64, reason: &str, stop: &AtomicBool) -> anyhow::Result<Catalog> {
     let conn = Connection::open_in_memory_with_flags(
         OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_CREATE
@@ -782,7 +791,7 @@ fn in_memory(root: &Path, now_ms: u64, reason: &str) -> anyhow::Result<Catalog> 
     ensure_schema(&conn, true)
         .map_err(|e| anyhow::anyhow!("{e}"))
         .context("creating an in-memory session catalog")?;
-    let heal = heal(&conn, root, now_ms).context("reading the recordings")?;
+    let heal = heal(&conn, root, now_ms, stop).context("reading the recordings")?;
     let covers = covers(&conn, now_ms).context("reading the recordings")?;
     Ok(Catalog {
         conn,
@@ -797,7 +806,7 @@ fn in_memory(root: &Path, now_ms: u64, reason: &str) -> anyhow::Result<Catalog> 
 }
 
 /// `Err`: why the command answers from the recordings instead.
-fn open_on_disk(root: &Path, now_ms: u64) -> Result<Catalog, String> {
+fn open_on_disk(root: &Path, now_ms: u64, stop: &AtomicBool) -> Result<Catalog, String> {
     let lock_path = root.join(LOCK);
     let lock = lockfile::open_shared_file(&lock_path).map_err(|e| e.to_string())?;
     if !lockfile::lock_within(&lock, false, LOCK_WAIT).map_err(|e| e.to_string())? {
@@ -814,18 +823,18 @@ fn open_on_disk(root: &Path, now_ms: u64) -> Result<Catalog, String> {
         match opened {
             Ok(conn) => conn,
             Err(e) if e.rebuilt_because().is_some() => {
-                repair(root, &lock, now_ms, &mut notes, &mut rebuilt)?
+                repair(root, &lock, now_ms, stop, &mut notes, &mut rebuilt)?
             }
             Err(e) => return Err(e.to_string()),
         }
     } else {
-        repair(root, &lock, now_ms, &mut notes, &mut rebuilt)?
+        repair(root, &lock, now_ms, stop, &mut notes, &mut rebuilt)?
     };
-    let (conn, heal) = match rebuilt.map_or_else(|| heal(&conn, root, now_ms), Ok) {
+    let (conn, heal) = match rebuilt.map_or_else(|| heal(&conn, root, now_ms, stop), Ok) {
         Ok(h) => (conn, h),
         Err(e) if is_corrupt(&e) => {
             drop(conn);
-            let conn = repair(root, &lock, now_ms, &mut notes, &mut rebuilt)?;
+            let conn = repair(root, &lock, now_ms, stop, &mut notes, &mut rebuilt)?;
             (conn, rebuilt.unwrap_or_default())
         }
         Err(e) => return Err(e.to_string()),
@@ -849,6 +858,7 @@ fn repair(
     root: &Path,
     lock: &File,
     now_ms: u64,
+    stop: &AtomicBool,
     notes: &mut Vec<String>,
     rebuilt: &mut Option<HealReport>,
 ) -> Result<Connection, String> {
@@ -888,7 +898,7 @@ fn repair(
     }
     let conn = open_rw(root, true).map_err(|e| e.to_string())?;
     ensure_schema(&conn, false).map_err(|e| e.to_string())?;
-    let heal = heal(&conn, root, now_ms).map_err(|e| e.to_string())?;
+    let heal = heal(&conn, root, now_ms, stop).map_err(|e| e.to_string())?;
     let covers = covers(&conn, now_ms).map_err(|e| e.to_string())?;
     let what = match &moved {
         Some((why, to)) => format!("the session catalog {why}, moved to {}", to.display()),
@@ -935,9 +945,14 @@ fn move_aside(root: &Path, now_ms: u64) -> anyhow::Result<PathBuf> {
 /// recording's (the recording was re-derived and the `replace` after it was
 /// dropped). No watermark: a write dropped before a later session's
 /// succeeded is still found. A recording whose heal fails is noted and tried
-/// again at most once a [`HEAL_RETRY`]. `Err` only for a failure of the
-/// catalog itself.
-fn heal(conn: &Connection, root: &Path, now_ms: u64) -> rusqlite::Result<HealReport> {
+/// again at most once a [`HEAL_RETRY`]. Stops between two recordings once
+/// `stop` is set. `Err` only for a failure of the catalog itself.
+fn heal(
+    conn: &Connection,
+    root: &Path,
+    now_ms: u64,
+    stop: &AtomicBool,
+) -> rusqlite::Result<HealReport> {
     let mut report = HealReport::default();
     // Complete rows, by the derivation they were written with.
     let complete: HashMap<String, i64> = {
@@ -960,6 +975,9 @@ fn heal(conn: &Connection, root: &Path, now_ms: u64) -> rusqlite::Result<HealRep
         }
     };
     for entry in entries.filter_map(Result::ok) {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
         let name = entry.file_name();
         let Some(id) = name.to_str().filter(|s| SessionId::parse(s).is_ok()) else {
             continue;
