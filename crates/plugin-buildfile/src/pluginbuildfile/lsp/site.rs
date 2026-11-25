@@ -168,7 +168,10 @@ pub(crate) enum Receiver {
     /// A chain of names whose root `name` the file binds itself (assigned,
     /// loaded, a parameter), so it is not the global of that name.
     Rebound { name: String },
-    /// Anything else: a call, an index, a literal.
+    /// A string, list or dict literal (D9): `"-".│`, `[1].│`, `{}.│`. Read
+    /// from the token before the `.`, so it needs no parse.
+    Literal { kind: Literal },
+    /// Anything else: a call, an index, a parenthesized group.
     Expression,
 }
 
@@ -177,7 +180,33 @@ impl Receiver {
         match self {
             Receiver::Names => "names",
             Receiver::Rebound { .. } => "rebound",
+            Receiver::Literal { .. } => "literal",
             Receiver::Expression => "expression",
+        }
+    }
+}
+
+/// The kind of a [`Receiver::Literal`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Literal {
+    /// A string token, or an implicitly concatenated run of them (bytes are
+    /// not: there is no bytes type to list).
+    Str,
+    /// A `[…]` display: its `[` does not follow a token that ends an
+    /// expression, so it is not an index.
+    List,
+    /// A `{…}` display.
+    Dict,
+}
+
+impl Literal {
+    /// The type `--explain` reports. The element types are unknown, and the
+    /// display says so.
+    pub(crate) fn type_name(self) -> &'static str {
+        match self {
+            Literal::Str => "str",
+            Literal::List => "list[Any]",
+            Literal::Dict => "dict[Any, Any]",
         }
     }
 }
@@ -268,6 +297,9 @@ pub(crate) enum Site {
     Member {
         path: Option<Vec<String>>,
         receiver: Receiver,
+        /// The names of the `def`s the cursor is inside, outermost first
+        /// ([`def_path`]); empty at module level.
+        scope: Vec<String>,
         edit: Range<usize>,
         prefix: String,
     },
@@ -407,11 +439,27 @@ impl Site {
                 map.insert("path".to_string(), json!(path));
             }
         }
-        if let (Site::Member { path, receiver, .. }, Some(map)) = (self, out.as_object_mut()) {
+        if let (
+            Site::Member {
+                path,
+                receiver,
+                scope,
+                ..
+            },
+            Some(map),
+        ) = (self, out.as_object_mut())
+        {
             map.insert("path".to_string(), json!(path));
             map.insert("receiver".to_string(), json!(receiver.name()));
-            if let Receiver::Rebound { name } = receiver {
-                map.insert("rebound".to_string(), json!(name));
+            map.insert("scope".to_string(), json!(scope));
+            match receiver {
+                Receiver::Rebound { name } => {
+                    map.insert("rebound".to_string(), json!(name));
+                }
+                Receiver::Literal { kind } => {
+                    map.insert("type".to_string(), json!(kind.type_name()));
+                }
+                Receiver::Names | Receiver::Expression => {}
             }
         }
         out
@@ -904,6 +952,245 @@ impl Doc<'_> {
             .find(|t| matches!(t.kind, Kind::Error(_)) && !t.contains(o) && (t.end as usize) <= o)
             .map(Tok::range)
     }
+
+    /// Whether byte `pos` lies inside a token (a comment, a string).
+    fn covered(&self, pos: usize) -> bool {
+        let i = self.toks().partition_point(|t| (t.start as usize) <= pos);
+        i > 0 && self.tok(i - 1).is_some_and(|t| (t.end as usize) > pos)
+    }
+
+    /// Whether the `\n` at byte `n` is escaped by a `\` outside any token
+    /// (CRLF included): the lexer skips it, so it is not a line break.
+    fn escaped_newline(&self, n: usize) -> bool {
+        let before = self.text.get(..n).unwrap_or("");
+        let before = before.strip_suffix('\r').unwrap_or(before);
+        before.ends_with('\\') && !self.covered(before.len() - 1)
+    }
+
+    /// Whether a line break the lexer reads as one lies between token `a`
+    /// and token `b`: a `\n` not escaped by a `\`. Only comments lie between
+    /// two adjacent significant tokens, and a comment runs to its line end,
+    /// so a `\` inside one escapes nothing.
+    fn newline_between(&self, a: usize, b: usize) -> bool {
+        let (Some(a), Some(b)) = (self.tok(a), self.tok(b)) else {
+            return false;
+        };
+        let from = a.end as usize;
+        self.text
+            .get(from..b.start as usize)
+            .unwrap_or("")
+            .match_indices('\n')
+            .any(|(n, _)| !self.escaped_newline(from + n))
+    }
+
+    /// Where opener `t` stops enclosing: a position is inside it while it
+    /// is below this. Through the byte of its (possibly mismatched) closer,
+    /// so a line that begins with the closer begins inside. `None` for an
+    /// unclosed one, which [`def_path`] ends itself.
+    fn open_until(&self, t: &Tok) -> Option<usize> {
+        if t.link == NO_LINK {
+            return None;
+        }
+        self.tok(t.link as usize).map(|c| c.start as usize + 1)
+    }
+
+    /// Whether token `t` is a keyword that only ever starts a statement, so
+    /// a line it starts cannot continue an expression.
+    fn starts_statement(&self, t: &Tok) -> bool {
+        t.kind == Kind::Load
+            || t.kind == Kind::Keyword
+                && matches!(
+                    self.text_of(t),
+                    "def" | "return" | "pass" | "break" | "continue" | "elif"
+                )
+    }
+
+    /// An error token made of nothing but blanks and line breaks (a BOM, a
+    /// form feed, a bad dedent's `\n   `): it is whitespace to the line
+    /// structure.
+    fn is_blank_token(&self, t: &Tok) -> bool {
+        matches!(t.kind, Kind::Error(_))
+            && self.text_of(t).chars().all(|c| c == '\n' || is_blank(c))
+    }
+
+    /// Whether the `def` at token `def` has its header's `:` (the first one
+    /// outside its brackets) ending at or before `o`: the cursor is in a
+    /// one-line body, `def g(): return l.│`.
+    fn header_closed_before(&self, def: usize, o: usize) -> bool {
+        let mut depth = 0usize;
+        for t in self.toks().get(def + 1..).unwrap_or(&[]) {
+            if t.start as usize >= o {
+                break;
+            }
+            match t.kind {
+                Kind::Open(_) => depth += 1,
+                Kind::Close(_) => depth = depth.saturating_sub(1),
+                Kind::Colon if depth == 0 => return t.end as usize <= o,
+                _ => {}
+            }
+        }
+        false
+    }
+}
+
+/// A blank character for the line structure: indentation (`' '`, `'\t'`),
+/// and the bytes the lexer ignores there (`'\r'`, a form feed, a BOM).
+fn is_blank(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\r' | '\x0c' | '\u{feff}')
+}
+
+/// The first token of a logical line, before the cursor.
+struct Head<'d> {
+    tok: usize,
+    /// Its indent in bytes: the spaces and tabs before it on its line.
+    indent: usize,
+    /// The name, when the line is `def NAME`.
+    def: Option<&'d str>,
+}
+
+/// The names of the `def`s whose body holds byte `o`, outermost first (D6).
+/// From the tokens only, so it answers on a document that does not parse.
+///
+/// The cursor is inside `def NAME` when a `def` token starts a logical line
+/// at indent *k*, the cursor's logical line is deeper than *k*, and no
+/// logical line between them is at indent ≤ *k*. A logical line starts at a
+/// token that is the first on its line, outside every bracket, and not after
+/// a `\` continuation; so blank and comment-only lines, and lines that begin
+/// inside a string, a bracket or a continuation, are not lines here.
+///
+/// An unclosed bracket encloses what follows it, as it does for the lexer,
+/// until a line starts with a keyword no expression continues with (`def`,
+/// `return`, `pass`, `break`, `continue`, `elif`, `load`). It does not end
+/// at the call's guessed extent, as [`Doc::open_stack`] has it: a call whose
+/// arguments sit at column 0 would end at the first of them as soon as its
+/// `)` is deleted.
+///
+/// The cursor's own logical line is the one its line continues, if it
+/// continues one; otherwise its indent is the blanks before the cursor, so a
+/// cursor at column 0 of a blank line in a body is at module level. On a
+/// `def` line the cursor is in the outer scope, until the header's `:`: after
+/// it, `def g(): return l.│` is in `g`.
+///
+/// Indents are byte counts of spaces and tabs (the lexer rejects a tab
+/// indent, so a mix only arises in a broken document); `\r`, a form feed and
+/// a BOM count as nothing. `o` is a byte offset: a client's UTF-16 position
+/// is converted before.
+pub(crate) fn def_path(doc: &Doc<'_>, o: usize) -> Vec<String> {
+    let text = doc.text;
+    let o = o.min(text.len());
+    let cl = line_start(text, o);
+    let mut heads: Vec<Head<'_>> = Vec::new();
+    // Where each enclosing opener stops enclosing; `None` while unclosed.
+    let mut stack: Vec<Option<usize>> = Vec::new();
+    let open_at =
+        |stack: &[Option<usize>], at: usize| stack.iter().any(|until| until.is_none_or(|u| u > at));
+    // Whether the cursor's line begins inside a bracket, taken when the walk
+    // reaches that line.
+    let mut cursor_line_bracketed: Option<bool> = None;
+    // The end of the last token that is not blank.
+    let mut prev_end: Option<usize> = None;
+    for (i, t) in doc.toks().iter().enumerate() {
+        let s = t.start as usize;
+        if s >= o {
+            break;
+        }
+        if doc.is_blank_token(t) {
+            continue;
+        }
+        let gap = text.get(prev_end.unwrap_or(0)..s).unwrap_or("");
+        // The first token on its line: a line break since the last token (or
+        // no token before it at all), then only blanks.
+        let lead = match gap.rfind('\n') {
+            Some(n) => gap.get(n + 1..),
+            None => prev_end.is_none().then_some(gap),
+        };
+        prev_end = Some(t.end as usize);
+        if t.kind == Kind::Comment {
+            continue;
+        }
+        let lead = lead.filter(|l| {
+            l.chars().all(is_blank)
+                && !(s - l.len())
+                    .checked_sub(1)
+                    .is_some_and(|n| doc.escaped_newline(n))
+        });
+        // An unclosed bracket runs on, as the lexer has it (no newline
+        // inside), until a line starts with a statement keyword, which no
+        // expression continues with: `def g():` after a broken call.
+        if lead.is_some() && doc.starts_statement(t) {
+            stack.retain(Option::is_some);
+        }
+        if cursor_line_bracketed.is_none() && s >= cl {
+            cursor_line_bracketed = Some(open_at(&stack, cl));
+        }
+        stack.retain(|until| until.is_none_or(|u| u > s));
+        if stack.is_empty()
+            && let Some(lead) = lead
+        {
+            let def = (t.kind == Kind::Keyword && doc.text_of(t) == "def")
+                .then(|| doc.tok(i + 1))
+                .flatten()
+                .filter(|n| n.kind == Kind::Ident)
+                .map(|n| doc.text_of(n));
+            heads.push(Head {
+                tok: i,
+                indent: lead.bytes().filter(|b| matches!(b, b' ' | b'\t')).count(),
+                def,
+            });
+        }
+        if matches!(t.kind, Kind::Open(_)) {
+            stack.push(doc.open_until(t));
+        }
+    }
+    let bracketed = cursor_line_bracketed.unwrap_or_else(|| open_at(&stack, cl));
+    let continued = bracketed
+        || doc.inside_string(cl)
+        || cl.checked_sub(1).is_some_and(|n| doc.escaped_newline(n));
+    let start_of = |h: &Head<'_>| doc.tok(h.tok).map_or(0, |t| t.start as usize);
+    // The cursor's own logical line: the head it continues, or its own head
+    // when one starts on its line before it.
+    let own = if continued {
+        heads.len().checked_sub(1)
+    } else {
+        heads
+            .last()
+            .filter(|h| start_of(h) >= cl)
+            .map(|_| heads.len() - 1)
+    };
+    let indent = match own.and_then(|p| heads.get(p)) {
+        Some(h) if continued => h.indent,
+        _ => text
+            .get(cl..o)
+            .unwrap_or("")
+            .chars()
+            .take_while(|&c| is_blank(c))
+            .filter(|c| matches!(c, ' ' | '\t'))
+            .count(),
+    };
+    let one_line = own
+        .and_then(|p| heads.get(p))
+        .and_then(|h| h.def.filter(|_| doc.header_closed_before(h.tok, o)));
+    let mut path: Vec<String> = Vec::new();
+    let mut m = indent;
+    for h in heads
+        .get(..own.unwrap_or(heads.len()))
+        .unwrap_or(&[])
+        .iter()
+        .rev()
+    {
+        if m == 0 {
+            break;
+        }
+        if h.indent < m {
+            if let Some(name) = h.def {
+                path.push(name.to_string());
+            }
+            m = h.indent;
+        }
+    }
+    path.reverse();
+    path.extend(one_line.map(str::to_string));
+    path
 }
 
 /// Classify byte offset `o` of `doc`. `None` positions (past the end) are
@@ -1020,7 +1307,7 @@ fn classify(doc: &Doc<'_>, o: usize) -> Result<Site, Reason> {
 
     // Any member position, right after a `.`: `heph.`, `heph.<plugin>.`,
     // `typing.`, `f().`.
-    if let Some(site) = dotted_site(doc, word, o, &edit, &prefix) {
+    if let Some(site) = dotted_site(doc, word, o, stack.is_empty(), &edit, &prefix) {
         return Ok(site);
     }
 
@@ -1115,10 +1402,14 @@ fn key_site(call: Call, edit: Range<usize>, prefix: String) -> Site {
 /// token only ever means attribute access (a float is one `Number` token), so
 /// `typing. A│`, `typing.\n    A│` and `typing\n  .│` all have the receiver
 /// `typing`.
+///
+/// `top_level` is whether the cursor is outside every bracket, which decides
+/// whether a line break before a `[` is a `Newline` token (D9).
 fn dotted_site(
     doc: &Doc<'_>,
     word: Option<usize>,
     o: usize,
+    top_level: bool,
     edit: &Range<usize>,
     prefix: &str,
 ) -> Option<Site> {
@@ -1132,6 +1423,7 @@ fn dotted_site(
     let chain = ident_chain(doc, dot);
     let edit = edit.clone();
     let prefix = prefix.to_string();
+    let scope = def_path(doc, o);
     // A root the file binds itself (assigned, loaded, a parameter) is not the
     // global of that name, whatever it holds; that holds for `heph` too.
     let rebound = chain
@@ -1144,6 +1436,7 @@ fn dotted_site(
             receiver: Receiver::Rebound {
                 name: (*root).to_string(),
             },
+            scope,
             edit,
             prefix,
         });
@@ -1162,16 +1455,68 @@ fn dotted_site(
         Some(segs) => Site::Member {
             path: Some(segs.iter().map(|s| (*s).to_string()).collect()),
             receiver: Receiver::Names,
+            scope,
             edit,
             prefix,
         },
         None => Site::Member {
             path: None,
-            receiver: Receiver::Expression,
+            receiver: literal_receiver(doc, dot, top_level)
+                .map_or(Receiver::Expression, |kind| Receiver::Literal { kind }),
+            scope,
             edit,
             prefix,
         },
     })
+}
+
+/// The literal the `.` token `dot` follows (D9), or `None` when its receiver
+/// is anything else.
+///
+/// - A string token is `str`; in an implicitly concatenated run it is the
+///   last one, so the run is `str` too. A bytes literal is nothing.
+/// - A `}` is a dict.
+/// - A `]` is a list when its `[` opens a display: the token before the `[`
+///   does not end an expression. At top level a line break before the `[`
+///   is a `Newline` token, which ends nothing; inside brackets the lexer
+///   emits none, so the `[` indexes what precedes it.
+///
+/// The closer's opener is one hop over the lexer's bracket link, so the cost
+/// does not grow with the literal; a link that is missing, or that pairs
+/// two kinds, answers nothing.
+fn literal_receiver(doc: &Doc<'_>, dot: usize, top_level: bool) -> Option<Literal> {
+    let dot_start = doc.tok(dot)?.start as usize;
+    let r = doc.prev_significant(dot_start, None)?;
+    let rt = *doc.tok(r)?;
+    let bracket = match rt.kind {
+        Kind::Str => {
+            let text = doc.text_of(&rt);
+            let prefix = text.get(..text.find(['"', '\''])?)?;
+            return (!prefix.contains(['b', 'B'])).then_some(Literal::Str);
+        }
+        Kind::Close(b @ (Bracket::Square | Bracket::Curly)) => b,
+        _ => return None,
+    };
+    let open = rt.link as usize;
+    let ot = doc.tok(open).filter(|t| {
+        rt.link != NO_LINK && t.kind == Kind::Open(bracket) && !t.popped && t.link as usize == r
+    })?;
+    if bracket == Bracket::Curly {
+        return Some(Literal::Dict);
+    }
+    let Some(p) = doc.prev_significant(ot.start as usize, None) else {
+        return Some(Literal::List);
+    };
+    let pt = doc.tok(p)?;
+    let ends_expression = matches!(
+        pt.kind,
+        Kind::Ident | Kind::Str | Kind::Number | Kind::Close(_)
+    );
+    if !ends_expression || (top_level && doc.newline_between(p, open)) {
+        Some(Literal::List)
+    } else {
+        None
+    }
 }
 
 /// The `a.b.c` chain of identifiers ending at the `.` token `dot`, or `None`
@@ -1450,7 +1795,12 @@ mod tests {
             ("x = typing.Any.│\n", s(&["typing", "Any"]), &names, ""),
             ("x = f().│\n", None, &expr, ""),
             ("x = l[0].│\n", None, &expr, ""),
-            ("x = \"s\".jo│\n", None, &expr, "jo"),
+            (
+                "x = \"s\".jo│\n",
+                None,
+                &Receiver::Literal { kind: Literal::Str },
+                "jo",
+            ),
             // Whitespace, newlines and comments between the tokens do not
             // matter: a `.` only ever means attribute access.
             ("x = typing. A│\n", s(&["typing"]), &names, "A"),
@@ -1542,6 +1892,389 @@ mod tests {
         assert_eq!(expr["path"], Value::Null);
         assert_eq!(expr["receiver"], json!("expression"));
         assert!(expr.get("rebound").is_none(), "{expr}");
+        assert!(expr.get("type").is_none(), "{expr}");
+        assert_eq!(expr["scope"], json!([]));
+        for (fixture, ty) in [
+            ("x = \"-\".│\n", "str"),
+            ("x = [1].│\n", "list[Any]"),
+            ("x = {}.│\n", "dict[Any, Any]"),
+        ] {
+            let literal = json(at(fixture));
+            assert_eq!(literal["receiver"], json!("literal"), "{fixture}");
+            assert_eq!(literal["type"], json!(ty), "{fixture}");
+            assert_eq!(literal["path"], Value::Null, "{fixture}");
+        }
+        let scoped = json(at("def f(l):\n    def g(m):\n        m.│\n"));
+        assert_eq!(scoped["scope"], json!(["f", "g"]));
+    }
+
+    /// The receiver of the member site at the `│`, or `None` when it is not
+    /// a member site.
+    fn receiver(fixture: &str) -> Option<Receiver> {
+        match at(fixture).site {
+            Site::Member { receiver, .. } => Some(receiver),
+            _ => None,
+        }
+    }
+
+    /// D9's adversarial inputs: the literal before the `.`, from the token
+    /// before it and one bracket-link hop.
+    #[test]
+    fn site_literal_receiver() {
+        let lit = |kind| Some(Receiver::Literal { kind });
+        let (str_, list, dict) = (lit(Literal::Str), lit(Literal::List), lit(Literal::Dict));
+        let expr = Some(Receiver::Expression);
+        for (fixture, want) in [
+            ("x = \"a\".│\n", &str_),
+            ("x = 'a'.│\n", &str_),
+            ("x = \"\"\"a\"\"\".│\n", &str_),
+            ("x = r\"a\".│\n", &str_),
+            ("x = \"a\" \"b\".│\n", &str_),
+            ("x = \"a\"\n  \"b\".│\n", &str_),
+            ("x = f\"x{y}\".│\n", &str_),
+            ("x = \"]\".│\n", &str_),
+            ("x = \"a\".up│\n", &str_),
+            ("x = \"a\".join(xs).│\n", &expr),
+            ("x = [].│\n", &list),
+            ("x = [x for x in y].│\n", &list),
+            ("x = [\n  1,\n].│\n", &list),
+            ("x = [1, # ]\n].│\n", &list),
+            ("def f():\n    return [1].│\n", &list),
+            ("x = ([1]).│\n", &expr),
+            ("x = [[1]][0].│\n", &expr),
+            ("x = xs[0].│\n", &expr),
+            ("x = f()[0].│\n", &expr),
+            ("x = d[\"k\"].│\n", &expr),
+            ("x = \"ab\"[0].│\n", &expr),
+            ("x = {}.│\n", &dict),
+            ("x = {\"a\": 1}.│\n", &dict),
+            ("x = {k: v for k, v in x}.│\n", &dict),
+            ("x = {\"a\": 1}[\"a\"].│\n", &expr),
+            ("x = (\"a\").│\n", &expr),
+            // At top level the line break is a `Newline` token, which ends
+            // nothing: a new statement's display.
+            ("x = xs[0]\n[1, 2].│\n", &list),
+            ("x = xs[0] # c\n[1, 2].│\n", &list),
+            // A `\` makes the next line part of this one: an index.
+            ("x = xs[0] \\\n[1, 2].│\n", &expr),
+            // Inside brackets the lexer emits no newline: an index.
+            ("f(xs[0]\n  [1].│\n", &expr),
+            ("x = [1].│", &list),
+            ("foo([1].│\n", &list),
+            ("x = y in [1].│\n", &list),
+            ("x = not [1].│\n", &list),
+            ("x = a if b else [1].│\n", &list),
+            ("f = lambda: [1].│\n", &list),
+            ("x = None[0].│\n", &expr),
+            ("x = True[0].│\n", &expr),
+            ("x = False[0].│\n", &expr),
+            // A closer whose link pairs it with nothing, or with another kind.
+            ("x = (1].│\n", &expr),
+            ("x = {1].│\n", &expr),
+            ("x = [1}.│\n", &expr),
+            ("x = (1}.│\n", &expr),
+            // Not a member site at all.
+            ("x = 1.│\n", &None),
+            ("x = \"ab.│\n", &None),
+            ("x = \"a.│\"\n", &None),
+            ("# [1].│\n", &None),
+            ("x = 1 # \"a\".│\n", &None),
+        ] {
+            assert_eq!(&receiver(fixture), want, "{fixture:?}");
+        }
+        // Bytes have no type to list: whatever the dialect makes of them, not
+        // a `str`.
+        assert_ne!(receiver("x = b\"a\".│\n"), str_);
+        assert_ne!(receiver("x = rb\"a\".│\n"), str_);
+        // The prefix is the member being typed.
+        assert_eq!(at("x = \"a\".up│\n").site.prefix(), Some("up"));
+    }
+
+    fn scope_of(text: &str, o: usize) -> Vec<String> {
+        let tokens = lex(text);
+        def_path(
+            &Doc {
+                text,
+                tokens: &tokens,
+                overlay: None,
+                ast: AstState::Current,
+            },
+            o,
+        )
+    }
+
+    fn scope(fixture: &str) -> Vec<String> {
+        let (text, o) = split(fixture);
+        scope_of(&text, o)
+    }
+
+    /// D6's adversarial inputs.
+    #[test]
+    fn site_def_path() {
+        let f: &[&str] = &["f"];
+        let fg: &[&str] = &["f", "g"];
+        let top: &[&str] = &[];
+        for (fixture, want) in [
+            ("def f(l):\n    l.│\n", f),
+            // Blank, whitespace-only and comment-only lines are skipped.
+            ("def f(l):\n    x = 1\n\n    l.│\n", f),
+            ("def f(l):\n    x = 1\n        \n    l.│\n", f),
+            ("def f(l):\n    x = 1\n  \n    l.│\n", f),
+            ("def f(l):\n    x = 1\n# c\n    l.│\n", f),
+            ("def f(l):\n# c\n    l.│\n", f),
+            // Lines that begin inside a bracket or after a `\`.
+            ("def f(l):\n    x = foo(\n1,\n)\n    l.│\n", f),
+            ("def f(l):\n    x = foo(\n1, l.│\n", f),
+            ("def f(l):\n    x = foo(\n1,\n)\nl.│\n", top),
+            // An unclosed bracket runs on until a statement keyword.
+            ("def f(l):\n    x = foo(\n1,\n    │\n", f),
+            ("def f(l):\n    x = foo(\ndef g(m):\n    m.│\n", &["g"]),
+            ("def f(l):\n    x = foo(\n    return l\nl.│\n", top),
+            ("x = foo(\ndef g(m):\n    m.│\n", &["g"]),
+            ("def f(l):\n    x = 1 + \\\n2\n    l.│\n", f),
+            ("def f(l):\n    x = 1 + \\\nl.│\n", f),
+            // A `\` inside a comment continues nothing.
+            ("def f(l):\n    x = 1 # \\\nl.│\n", top),
+            // Lines that begin inside a string.
+            ("def f(l):\n    \"\"\"\ndef g():\n\"\"\"\n    l.│\n", f),
+            ("def f(l):\n    \"\"\"\ndef g():\n    l.│\n", f),
+            ("\"def x(:\"\n    l.│\n", top),
+            ("x = \"\"\"\ndef x(:\n\"\"\"\nl.│\n", top),
+            // On the `def` line, before the header's `:`: the outer scope.
+            ("def f(l: Lib = │\n", top),
+            ("def f(l: Lib = l.│):\n    pass\n", top),
+            ("def f(l = [\n    1,\n    l.│\n]):\n    pass\n", top),
+            ("def f(l = [\n1,\nl.│\n]):\n    pass\n", top),
+            ("│def f(l):\n    pass\n", top),
+            ("def f│(l):\n    pass\n", top),
+            ("def f(\n    l,\n    m):\n    l.│\n", f),
+            ("def f(\nl,\n):\n    l.│\n", f),
+            ("def f(l) -> str:\n    l.│\n", f),
+            // After it, on the same line: the body.
+            ("def f(l):│\n", f),
+            ("def f(l): return l.│\n", f),
+            // Nesting, and back out.
+            ("def f(l):\n    def g(m):\n        m.│\n", fg),
+            ("def f(l):\n    def g(m):\n        pass\n    l.│\n", f),
+            ("def f(l):\n    def g(m):\n        pass\n\n    l.│\n", f),
+            ("def f(l):\n    def g(m):\n        pass\nl.│\n", top),
+            ("def f(l):\n    def g(): return l.│\n", fg),
+            ("def f(l):\n    def g(m):│\n", fg),
+            ("def f(l):\n    def g(m│):\n", f),
+            (
+                "def f(l):\n    if l:\n        def g(m):\n            m.│\n",
+                fg,
+            ),
+            ("def f(l):\n    if l:\n        x = 1\n    l.│\n", f),
+            // Under an `if`, in both branches, twice.
+            ("if x:\n    def f(l):\n        l.│\n", f),
+            (
+                "if x:\n    def f(l):\n        pass\nelse:\n    def f(l):\n        l.│\n",
+                f,
+            ),
+            ("if x:\n    def f(l):\n        pass\nelse:\n    l.│\n", top),
+            ("def f(l):\n    pass\ndef f(l):\n    l.│\n", f),
+            // The cursor's own indent decides on a blank line.
+            ("def f(l):\n    x = 1\n│\n    y = 2\n", top),
+            ("def f(l):\n    x = 1\n  │\n", f),
+            ("def f(l):\n    x = 1\n    │\n", f),
+            ("def f(l):\n    def g(m):\n        x = 1\n    │\n", f),
+            ("def f(l):\n    x = 1\n    │y = 2\n", f),
+            // EOF after a dedent.
+            ("def f(l):\n    pass\n│", top),
+            ("def f(l):\n    pass\n\n│", top),
+            ("def f(l):\n    pass│", f),
+            // A lambda is not a def.
+            ("x = lambda l: l.│\n", top),
+            ("def f(m):\n    g = lambda l: l.│\n", f),
+            // A `def` with no name is not a def line.
+            ("def (l):\n    l.│\n", top),
+            ("│", top),
+        ] {
+            assert_eq!(scope(fixture), want, "{fixture:?}");
+        }
+    }
+
+    #[test]
+    fn site_def_path_byte_columns() {
+        // A tab is one byte, as the lexer counts it: `g` is at 2, the
+        // cursor's line at 1.
+        assert_eq!(scope("def f(l):\n\tl.│\n"), ["f"]);
+        assert_eq!(scope("def f(l):\n  def g(m):\n\tm.│\n"), ["f"]);
+        assert_eq!(scope("def f(l):\n  def g(m):\n\t\t\tm.│\n"), ["f", "g"]);
+        // CRLF is LF.
+        assert_eq!(scope("def f(l):\r\n    x = 1\r\n\r\n    l.│\r\n"), ["f"]);
+        assert_eq!(scope("def f(l):\r\n    pass\r\nl.│\r\n"), [] as [&str; 0]);
+        assert_eq!(scope("def f(l):\r\n    x = 1 + \\\r\nl.│\r\n"), ["f"]);
+        assert_eq!(scope("def f(l):\r\n    x = 1\r\n│\r\n"), [] as [&str; 0]);
+        // A BOM is no indent.
+        assert_eq!(scope("\u{feff}def f(l):\n    l.│\n"), ["f"]);
+        assert_eq!(scope("\u{feff}def f(l):\n    pass\nl.│\n"), [] as [&str; 0]);
+        // A form feed is no indent, and a line of one is blank.
+        assert_eq!(scope("def f(l):\n\x0c    l.│\n"), ["f"]);
+        assert_eq!(scope("def f(l):\n    x = 1\n\x0c\n    l.│\n"), ["f"]);
+        assert_eq!(scope("\x0cdef f(l):\n    l.│\n"), ["f"]);
+        // Multibyte text before the cursor: the client's UTF-16 column is
+        // converted first, and the indent is counted in bytes.
+        let text = "def f(l):\n    s = \"日本語 😀\"; l.up\nl.x\n";
+        let before = "    s = \"日本語 😀\"; l.";
+        let col = before.encode_utf16().count() as u32;
+        let o =
+            position::to_offset(text, Position::new(1, col), Encoding::Utf16).expect("in range");
+        assert_eq!(text.get(o..o + 2), Some("up"));
+        assert_eq!(scope_of(text, o), ["f"]);
+        let o = position::to_offset(text, Position::new(2, 2), Encoding::Utf16).expect("in range");
+        assert_eq!(scope_of(text, o), [] as [&str; 0]);
+    }
+
+    /// The defs of a parsed module, each with its path and the bytes its
+    /// body covers: from the end of its header's `:` to the end of its last
+    /// line.
+    fn ast_defs(text: &str) -> Vec<(Vec<String>, usize, usize)> {
+        use starlark::syntax::ast::{AstStmt, Stmt};
+        fn walk(
+            s: &AstStmt,
+            text: &str,
+            path: &mut Vec<String>,
+            out: &mut Vec<(Vec<String>, usize, usize)>,
+        ) {
+            if let Stmt::Def(def) = &s.node {
+                path.push(def.name.node.ident.clone());
+                let header = def.signature_span().end().get() as usize;
+                let colon = header
+                    + cut(text, header..text.len())
+                        .find(':')
+                        .expect("header colon")
+                    + 1;
+                let last = (s.span.end().get() as usize).saturating_sub(1);
+                out.push((path.clone(), colon, line_end(text, last)));
+                walk(&def.body, text, path, out);
+                path.pop();
+                return;
+            }
+            s.visit_stmt(|c| walk(c, text, path, out));
+        }
+        let ast = starlark::syntax::AstModule::parse(
+            "oracle.star",
+            text.to_string(),
+            &starlark::syntax::Dialect::Extended,
+        )
+        .expect("oracle fixture parses");
+        let mut out = Vec::new();
+        walk(ast.statement(), text, &mut Vec::new(), &mut out);
+        out
+    }
+
+    fn cut(text: &str, r: Range<usize>) -> &str {
+        text.get(r).expect("a char boundary")
+    }
+
+    /// The AST's answer at `pos`: the innermost def whose body covers it.
+    fn ast_scope(defs: &[(Vec<String>, usize, usize)], pos: usize) -> Vec<String> {
+        defs.iter()
+            .filter(|(_, from, to)| *from <= pos && pos <= *to)
+            .map(|(path, ..)| path.clone())
+            .max_by_key(Vec::len)
+            .unwrap_or_default()
+    }
+
+    const ORACLE_FIXTURE: &str = r#"load("//x:y.star", "Lib")
+
+X = 1
+
+def f(l, m = [
+    1,
+    2,
+]):
+    """Doc.
+def g():
+"""
+    x = l.name
+    if x:
+        y = foo(
+1,
+            2,
+        )
+    z = 1 + \
+2
+# comment at col 0
+    def g(a):
+        return a.b
+
+    def h(): return l.c
+    for i in m:
+        def n(b: Lib = Lib(
+            name = "n",
+        )) -> str:
+            return b.name  # trailing
+    return m
+
+def k(
+    a,
+    b) -> str:
+    return a
+
+if X:
+    def f2(l):
+        pass
+else:
+    def f2(l):
+        return l.x
+
+lam = lambda l: l.y
+d = {"a": [1, 2], "b": (3,)}
+"#;
+
+    /// D6's oracle: at every token boundary and every line end, the token
+    /// rule agrees with the AST's def nesting; and again with the character
+    /// before the cursor deleted (a document that no longer parses), except
+    /// where that character is the one the answer turns on (a line break,
+    /// a header's `:`).
+    #[test]
+    fn site_def_path_matches_ast() {
+        let crlf = ORACLE_FIXTURE.replace('\n', "\r\n");
+        let mut checked = 0usize;
+        for text in [ORACLE_FIXTURE, crlf.as_str()] {
+            let defs = ast_defs(text);
+            assert_eq!(defs.len(), 7, "{defs:?}");
+            let colons: HashSet<usize> = defs.iter().map(|(_, from, _)| *from).collect();
+            let tokens = lex(text);
+            let mut samples = std::collections::BTreeSet::new();
+            samples.insert(text.len());
+            for t in tokens.toks.iter().filter(|t| t.kind != Kind::Comment) {
+                samples.insert(t.start as usize);
+                samples.insert(t.end as usize);
+                // The line end of every line with code on it.
+                samples.insert(line_end(text, t.start as usize));
+            }
+            for &pos in &samples {
+                let want = ast_scope(&defs, pos);
+                assert_eq!(
+                    scope_of(text, pos),
+                    want,
+                    "at {pos}: {:?}│{:?}",
+                    cut(text, line_start(text, pos)..pos),
+                    cut(text, pos..line_end(text, pos))
+                );
+                checked += 1;
+                let Some(c) = cut(text, 0..pos).chars().next_back() else {
+                    continue;
+                };
+                if matches!(c, '\n' | '\r') || colons.contains(&pos) {
+                    continue;
+                }
+                let at = pos - c.len_utf8();
+                let broken = format!("{}{}", cut(text, 0..at), cut(text, pos..text.len()));
+                assert_eq!(
+                    scope_of(&broken, at),
+                    want,
+                    "{c:?} deleted at {pos}: {:?}│{:?}",
+                    cut(&broken, line_start(&broken, at)..at),
+                    cut(&broken, at..line_end(&broken, at))
+                );
+            }
+        }
+        assert!(checked > 300, "sampled only {checked} positions");
     }
 
     #[test]
@@ -1889,6 +2622,34 @@ mod cost {
                 "{name}: resolving took {took:?}"
             );
         }
+    }
+
+    /// A 100,000-element list before the `.`: the display is found by one
+    /// bracket-link hop, not a walk over its elements. The cursor sits in a
+    /// def, so the def path is walked too.
+    #[test]
+    fn literal_receiver_on_a_100k_element_list_under_50ms() {
+        let mut text = String::from("def f():\n    return [");
+        for i in 0..100_000 {
+            text.push_str(&format!("{i}, "));
+        }
+        text.push_str("].");
+        let (took, r) = time_resolve(&text);
+        match r.site {
+            Site::Member {
+                receiver, scope, ..
+            } => {
+                assert_eq!(
+                    receiver,
+                    Receiver::Literal {
+                        kind: Literal::List
+                    }
+                );
+                assert_eq!(scope, ["f"]);
+            }
+            other => panic!("not a member site: {other:?}"),
+        }
+        assert!(took < Duration::from_millis(50), "resolving took {took:?}");
     }
 
     /// The real figures: lexing (once per edit) and resolving (once per

@@ -120,7 +120,9 @@ pub fn explain(target: &str, json: bool) -> anyhow::Result<String> {
     let site = value.get("site").unwrap_or(&none);
     let kind = site.get("kind").and_then(|k| k.as_str()).unwrap_or("none");
     let mut out = format!("{file}:{line}:{col}\n  site: {kind}");
-    for key in ["call", "keyword", "prefix", "quote", "plugin", "selected"] {
+    for key in [
+        "call", "keyword", "prefix", "quote", "plugin", "selected", "receiver", "type", "scope",
+    ] {
         if let Some(v) = site.get(key).filter(|v| !v.is_null()) {
             out.push_str(&format!("\n  {key}: {v}"));
         }
