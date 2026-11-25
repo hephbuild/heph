@@ -199,9 +199,14 @@ struct ListJsonEntry {
     user: Option<String>,
     /// The heph subcommand (`run`, `query`, ...).
     command: Option<String>,
-    /// False for a private session (`HEPH_NO_SESSION`): only its catalog row
-    /// is kept, no recording.
+    /// The session wrote a recording. False only for a private session
+    /// (`HEPH_NO_SESSION`), which leaves just its catalog row. Stays true
+    /// once cleanup removed the recording: see `recording_kept`.
     recorded: bool,
+    /// The recording's directory is still kept, so `show`, `attach`,
+    /// `export` and `query --from` can open it. False for a private session,
+    /// and for one the catalog still lists after cleanup removed it.
+    recording_kept: bool,
     /// With `--addr`: that target in this session.
     #[serde(skip_serializing_if = "Option::is_none")]
     target: Option<TargetJson>,
@@ -568,6 +573,7 @@ fn json_entry(r: &Row<'_>, every: &[&SessionEntry], opts: ViewOpts) -> ListJsonE
         user: cat.and_then(|c| c.user.clone()),
         command: r.command().map(str::to_owned),
         recorded: r.entry.is_some() || cat.is_none_or(|c| c.recorded),
+        recording_kept: r.entry.is_some(),
         target,
         progress: None,
         now: None,

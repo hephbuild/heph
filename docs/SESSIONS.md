@@ -858,8 +858,8 @@ there leaves the file for the next cleanup.
 
 `list --json` is `{version, sessions: [{id, owner_pid, argv, workspace_root,
 cwd, state, started_unix_ms, ended_unix_ms, last_event_unix_ms, exit_code,
-panicked, actor, user, command, recorded, target, progress, now, blocked_on,
-incomplete, format}], retention}`, times in absolute unix ms. `sessions` is
+panicked, actor, user, command, recorded, recording_kept, target, progress,
+now, blocked_on, incomplete, format}], retention}`, times in absolute unix ms. `sessions` is
 in the table's order: live sessions first, then ended ones, each newest
 first. (Before the catalog it was sorted by id.)
 
@@ -869,8 +869,13 @@ first. (Before the catalog it was sorted by id.)
 - `command` is the heph subcommand (`run`, `query`, ...).
 - `ended_unix_ms` is `null` while the session runs, and when it never
   recorded its end.
-- `recorded` is `false` for a private session: only its catalog row is kept,
-  there is no recording.
+- `recorded` says the session wrote a recording. It is `false` only for a
+  private session: only its catalog row is kept, there is no recording. It
+  stays `true` after cleanup removed the recording.
+- `recording_kept` says the recording is still on disk, so `show`, `attach`,
+  `export` and `query --from` can open it. It is `false` for a private
+  session, and for a session the catalog still lists after cleanup removed
+  its recording (`recorded` `true`).
 - `target` appears only with `--addr`: `{addr, outcome, duration_ms}`, that
   target in this session. `outcome` is `ran`, `hit`, `failed` or `cancelled`,
   an open set.

@@ -220,6 +220,7 @@ async fn list_who_ran() {
     assert_eq!(f["user"], "bob");
     assert_eq!(f["command"], "run");
     assert_eq!(f["recorded"], true);
+    assert_eq!(f["recording_kept"], true);
     assert_eq!(f["ended_unix_ms"], failed.started_unix_ms() + 1_000);
     assert_eq!(json["sessions"][1]["target"]["outcome"], "ran");
     assert_eq!(
@@ -317,6 +318,19 @@ async fn list_who_ran() {
         .find(|l| l.starts_with(&ran.encode()))
         .unwrap_or_else(|| panic!("the catalog row is listed:\n{table}"));
     assert!(row.contains(" ran ") && row.contains(" ok "), "{row}");
+    let (json, _) = list_at(root, now, &who_ran, true).await;
+    let json: serde_json::Value = serde_json::from_str(&json).expect("json");
+    let gone = json["sessions"]
+        .as_array()
+        .expect("sessions")
+        .iter()
+        .find(|s| s["id"] == ran.encode())
+        .unwrap_or_else(|| panic!("the catalog row is listed: {json}"));
+    assert_eq!(gone["recorded"], true, "it did record: {gone}");
+    assert_eq!(
+        gone["recording_kept"], false,
+        "but there is no recording left to show: {gone}"
+    );
     let (plain, _) = list_at(root, now, &since(7, now), false).await;
     assert!(plain.contains(&ran.encode()), "{plain}");
 }
