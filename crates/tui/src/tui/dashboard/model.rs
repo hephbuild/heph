@@ -1216,6 +1216,7 @@ mod tests {
                 addr: addr(rng),
                 outcome: CacheOutcomeKind::LocalHit,
                 reason: None,
+                stale_host_path: None,
             },
             8 => BuildEventKind::CacheHitRebuilt {
                 addr: addr(rng),

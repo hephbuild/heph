@@ -59,6 +59,7 @@ fn hit(addr: &str) -> BuildEventKind {
         addr: addr.into(),
         outcome: CacheOutcomeKind::LocalHit,
         reason: None,
+        stale_host_path: None,
     }
 }
 

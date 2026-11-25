@@ -946,6 +946,7 @@ mod tests {
             addr: addr.into(),
             outcome,
             reason: None,
+            stale_host_path: None,
         }
     }
 

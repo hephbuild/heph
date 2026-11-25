@@ -4482,6 +4482,7 @@ impl Engine {
                                 addr: addr_s,
                                 outcome: hcore::events::CacheOutcomeKind::RemoteHit,
                                 reason: None,
+                                stale_host_path: None,
                             });
                             // The one place the answer is already in hand: this cell
                             // just located the revision, so the lazy cell starts
@@ -4510,6 +4511,7 @@ impl Engine {
                                 reason: stale
                                     .as_ref()
                                     .map(|(path, _)| crate::engine::host_paths::stale_reason(path)),
+                                stale_host_path: stale.as_ref().map(|(path, _)| path.clone()),
                             });
                             let (cached, meta) = self
                                 .clone()
@@ -6132,6 +6134,7 @@ impl Engine {
                 addr: addr_s,
                 outcome: hcore::events::CacheOutcomeKind::LocalHit,
                 reason: None,
+                stale_host_path: None,
             });
         }
         Ok(probe)
@@ -6144,11 +6147,9 @@ impl Engine {
     /// writer is replacing it. Its blobs are left to GC.
     async fn delete_stale_manifest(&self, addr: &Addr, hashin: &str) -> anyhow::Result<()> {
         let (cache, a, h) = (self.local_cache.clone(), addr.clone(), hashin.to_owned());
-        hcore::blocking::run(move || {
-            cache.delete(&a, &h, crate::engine::local_cache::MANIFEST_V3)
-        })
-        .await
-        .with_context(|| format!("deleting the stale cache entry of {addr}"))
+        hcore::blocking::run(move || cache.delete(&a, &h, crate::engine::local_cache::MANIFEST_V3))
+            .await
+            .with_context(|| format!("deleting the stale cache entry of {addr}"))
     }
 
     /// Public, tracked. Records `parent → addr` in `dep_dag` and updates `parent`
@@ -13360,8 +13361,11 @@ mod tests {
                 .iter()
                 .filter_map(|e| match e {
                     BuildEventKind::CacheOutcome {
-                        outcome, reason, ..
-                    } => Some((*outcome, reason.clone())),
+                        outcome,
+                        reason,
+                        stale_host_path,
+                        ..
+                    } => Some((*outcome, reason.clone(), stale_host_path.clone())),
                     _ => None,
                 })
                 .collect();
@@ -13369,7 +13373,8 @@ mod tests {
                 outcomes,
                 vec![(
                     hcore::events::CacheOutcomeKind::Miss,
-                    Some(crate::engine::host_paths::stale_reason(&path_str(&path)))
+                    Some(crate::engine::host_paths::stale_reason(&path_str(&path))),
+                    Some(path_str(&path)),
                 )],
                 "{events:?}"
             );
@@ -13410,7 +13415,11 @@ mod tests {
         let (engine, _home, addr) = host_path_engine(driver)?;
 
         run_host_path_target(&engine, engine.new_state(), &addr).await?;
-        assert_eq!(manifests_of(&engine, &addr)?.len(), 1, "the first run wrote");
+        assert_eq!(
+            manifests_of(&engine, &addr)?.len(),
+            1,
+            "the first run wrote"
+        );
         std::fs::remove_file(&path)?;
 
         let err = run_host_path_target(&engine, engine.new_state(), &addr)

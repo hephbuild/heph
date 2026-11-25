@@ -465,6 +465,7 @@ mod tests {
             addr: addr.into(),
             outcome,
             reason: None,
+            stale_host_path: None,
         };
         t.apply(&BuildEvent {
             at_unix_ms: 1,

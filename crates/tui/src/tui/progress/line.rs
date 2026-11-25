@@ -959,6 +959,7 @@ mod tests {
             addr: addr.into(),
             outcome: CacheOutcomeKind::LocalHit,
             reason: None,
+            stale_host_path: None,
         };
         let matched = [
             "//p:ok",

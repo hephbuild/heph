@@ -3683,6 +3683,7 @@ mod tests {
             addr: addr.into(),
             outcome: CacheOutcomeKind::Miss,
             reason: Some("stale: host path /nix/store/x is gone".into()),
+            stale_host_path: Some("/nix/store/x".into()),
         };
         s.apply(&ev(1, stale("//a:same")));
         s.apply(&ev(2, stale("//a:changed")));
@@ -3699,6 +3700,7 @@ mod tests {
                 addr: "//a:cold".into(),
                 outcome: CacheOutcomeKind::Miss,
                 reason: None,
+                stale_host_path: None,
             },
         ));
         assert!(
@@ -3763,6 +3765,7 @@ mod tests {
                 addr: "//c:d".into(),
                 outcome: CacheOutcomeKind::Miss,
                 reason: None,
+                stale_host_path: None,
             },
         ));
         let summary = s.summary();
@@ -4865,6 +4868,7 @@ mod tests {
             addr: addr.into(),
             outcome: CacheOutcomeKind::LocalHit,
             reason: None,
+            stale_host_path: None,
         }
     }
 
@@ -4873,6 +4877,7 @@ mod tests {
             addr: addr.into(),
             outcome: CacheOutcomeKind::RemoteHit,
             reason: None,
+            stale_host_path: None,
         }
     }
 
@@ -5840,6 +5845,7 @@ mod tests {
                     addr: a.clone(),
                     outcome: hcore::events::CacheOutcomeKind::LocalHit,
                     reason: None,
+                    stale_host_path: None,
                 });
             } else {
                 ev(BuildEventKind::ExecuteStart {

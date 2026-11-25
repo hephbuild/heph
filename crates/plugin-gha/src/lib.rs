@@ -2139,6 +2139,7 @@ mod tests {
                 addr: "//a:x".into(),
                 outcome: hcore::events::CacheOutcomeKind::LocalHit,
                 reason: None,
+                stale_host_path: None,
             },
         ));
         hook.on_event(&ev(

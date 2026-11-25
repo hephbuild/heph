@@ -228,7 +228,10 @@ impl Ran {
             .expect("the request fails")
     }
 
-    /// Every `CacheOutcome` for `addr`, with its reason.
+    /// Every `CacheOutcome` for `addr`, with its reason. Each one's typed
+    /// `stale_host_path` is checked against its reason here, so every
+    /// assertion on a stale miss's reason also pins the machine signal: the
+    /// path is set exactly when the reason names it.
     fn outcomes(&self, addr: &str) -> Vec<(CacheOutcomeKind, Option<String>)> {
         self.events
             .iter()
@@ -237,7 +240,20 @@ impl Ran {
                     addr: a,
                     outcome,
                     reason,
-                } if a == addr => Some((*outcome, reason.clone())),
+                    stale_host_path,
+                } if a == addr => {
+                    assert_eq!(
+                        *reason,
+                        stale_host_path
+                            .as_deref()
+                            .and_then(|p| stale_reason(Path::new(p))),
+                        "{addr}: `stale_host_path` {stale_host_path:?} disagrees with the reason"
+                    );
+                    if stale_host_path.is_some() {
+                        assert_eq!(*outcome, CacheOutcomeKind::Miss, "{addr}");
+                    }
+                    Some((*outcome, reason.clone()))
+                }
                 _ => None,
             })
             .collect()
@@ -366,6 +382,17 @@ async fn host_path_gone_reruns() -> anyhow::Result<()> {
     assert_eq!(
         second.outcomes("//pkg:hp"),
         vec![(CacheOutcomeKind::Miss, stale_reason(&path))],
+        "{:?}",
+        second.events
+    );
+    // The typed field is the machine signal: the path as the entry stored it.
+    let gone = path.to_str().expect("utf-8 tempdir");
+    assert_eq!(
+        second.count(|e| matches!(
+            e,
+            BuildEventKind::CacheOutcome { stale_host_path: Some(p), .. } if p == gone
+        )),
+        1,
         "{:?}",
         second.events
     );

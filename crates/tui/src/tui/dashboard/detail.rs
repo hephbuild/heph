@@ -450,6 +450,7 @@ mod tests {
             addr: a(),
             outcome,
             reason: None,
+            stale_host_path: None,
         };
         let cases = [
             (
