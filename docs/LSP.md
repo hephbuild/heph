@@ -32,6 +32,8 @@ request ──> position.rs (UTF-16/8/32 → byte, once)
 | `context.rs` | The vendored analysis's `LspContext`: load resolution, listing, evaluation for the index |
 | `diagnostics.rs` | AST checks of `target(` / `provider_state(` keyword arguments; with `requireTypeAnnotations` on, each `def` parameter missing a type, from the checker `build-lint-check` runs (type errors are not shown; see `docs/BUILDFILE_CHECKS.md`) |
 | `index.rs` | The evaluation side channel (provenance "Targets" hover, undocumented `def` signatures) and the per-document shared state |
+| `typed.rs` | Typed members: a document's bindings typed by lint's checker, looked up by def path and name |
+| `memo.rs` | The loaded files' interfaces, memoized under a chained key and evicted when no open document reaches them |
 | `crates/vendored-starlark-lsp` | `starlark_lsp` 0.14.2's analysis modules, owned by heph; its `NOTICE` lists every divergence |
 
 ## One workspace
@@ -60,7 +62,7 @@ evaluated again and its diagnostics are republished, with no edit needed.
 | `arg_key` | a keyword-name position inside a call to any other plain-named function (`my_rule(`, `glob(`; not `x.f(`, not a `def`'s parameters) | the callee's unwritten parameters, each inserting `name = `, ranked first; then stock (see below) | stock | stock |
 | `plugin_namespace` | after `heph.` | plugins, `core` and `types` | — | — |
 | `plugin_member` | after `heph.<plugin>.`, or on the function name | the plugin's functions; under `heph.types.`, every type alias, then the driver namespaces; under `heph.types.<driver…>.`, `Kwargs` where the path names a driver, then the namespaces under it | the function's signature and doc; for an alias, its expansion; for `Kwargs`, its keys and their types, each key the driver requires marked `(required by the driver)` | — |
-| `member` | any other position after a `.` (`typing.│`, `l.na│`, `f().│`), whitespace and newlines between the tokens included | where the receiver is a chain of names whose root is a global the file does not bind (`typing`, `heph.core`), that namespace's members; otherwise nothing | a namespace's member: its doc, or nothing for a name it does not have; any other receiver: stock | stock |
+| `member` | any other position after a `.` (`typing.│`, `l.na│`, `f().│`), whitespace and newlines between the tokens included | where the receiver is a chain of names whose root is a global the file does not bind (`typing`, `heph.core`), that namespace's members; where it is a name the file binds, or a literal, the members the checker accepts on its type (see [Typed members](#typed-members)); otherwise nothing | a namespace's member: its doc, or nothing for a name it does not have; any other receiver: stock | stock |
 | `address` | a string starting `//` or `:`, inside a call or not | packages, then targets, both forms | — | the call that declared the target (see below), or the package's BUILD file |
 | `load_path` | the first argument of `load(` | package paths | — | the loaded file |
 | `load_symbol` | a later string argument of `load(` | the loaded file's exported `def`s | — | the `def` line, from the loaded file's AST |
@@ -100,18 +102,20 @@ A member position is any position whose previous significant token is a `.`:
 a `.` only ever means attribute access (a float is one number token), so
 `typing. A│`, `typing.\n    A│` and `typing\n  .│` all have the receiver
 `typing`, and the chain walks left over name-dot pairs whatever lies between
-them (`a.\n typing.│` is `a.typing`). The receiver has one of three shapes,
+them (`a.\n typing.│` is `a.typing`). The receiver has one of these shapes,
 which `--explain` reports as `receiver`:
 
 - `names`: a chain of names whose root the file does not bind. `path` is the
   chain. A path that names no namespace (`typing.Any.│`, a function's member)
   completes nothing, and `path` shows which.
 - `rebound`: a chain of names whose root the file binds; `rebound` names it.
-- `expression`: a call, an index, a literal (`f().│`, `l[0].│`, `"s".│`).
+  It lists its type's members ([Typed members](#typed-members)).
+- `literal`: a string, list or dict literal (`"-".│`, `[].│`, `{}.│`); `type`
+  names which. It lists that type's members.
+- `expression`: anything else, such as a call or an index (`f().│`,
+  `l[0].│`). It completes nothing.
 
-A name bound by the file (`l = record(…)`, then `l.│`) completes nothing even
-where its value has fields: values have no static types here, so a declared
-`record`'s fields are not offered. That is a known gap.
+`receiver` is an open set: a consumer tolerates a value it does not know.
 
 A type position (`def f(x: │`) completes as an expression does. The stock
 analysis offered only `str`, `int`, `bool`, `None` and `float` there, and a
@@ -163,6 +167,124 @@ address-shaped string (`:…`, `//pkg:`, or a package path with a `/` followed
 by `:`), so a dict-literal colon or `"a:b"` prose stays quiet. `/` completes
 only inside a string.
 
+## Typed members
+
+A `member` site whose receiver is a name the file binds (`l.│`) or a literal
+(`"-".│`) lists the members lint's checker accepts on the receiver's type:
+exactly the names `n` for which `build-lint-check` accepts `receiver.n`, each
+with the type the checker gives it as the item's `detail`. There is no second
+method list to drift from the checker.
+
+- A declared `record` lists its fields; a declared `enum`, and a value of
+  one, what the checker accepts on each. `str`, `list` and `dict` list their
+  methods. A chain folds over its segments:
+  `l.mode.│` lists the members of the type of `l`'s `mode` field.
+- A union lists every alternative's members, because the checker accepts an
+  attribute that any alternative has. So for `T | None`, a listed `.x` passes
+  lint and can still fail at run time when the value is `None`.
+- An open type lists nothing: `Any`, a callable, an iterator, a type, a
+  record whose fields are unknown. A driver's `Kwargs` lists the dict methods
+  the checker accepts on it.
+- A struct or a namespace lists nothing either, but it is closed: the checker
+  rejects a name it does not have, and completion does not list the ones it
+  has (`members_not_listed`). One built with `**kwargs`, which accepts any
+  name, reports `members_not_listed` too.
+- A module-level binding to a literal other than a string (`{}`, `1`) types
+  as `Any` in the checker's pre-pass, so `typing = {}` then `typing.│` lists
+  nothing, with `empty_because: any`.
+- A def under a top-level `if` or `for` has its parameters typed `Any`: the
+  checker solves only top-level defs. They list nothing.
+- A name that a comprehension or a `lambda` binds in the cursor's bracket
+  group, or on its line, lists nothing. The checker reports such a binding
+  under the enclosing def, so the answer could be another binding's.
+
+A receiver is looked up by the cursor's def path and its name, never by
+position, so a type found is never a different binding's. A name bound twice
+in one def, or one the checker cannot resolve, lists nothing, and
+`empty_because` says why.
+
+The def path is read from the tokens, so it holds in a broken document. An
+unclosed bracket encloses what follows it, as it does for the lexer, until a
+line starts with `def`, `return`, `pass`, `break`, `continue`, `elif` or
+`load`, keywords no expression continues with. It does not stop at the call's
+guessed extent: a call whose arguments sit at column 0 would end at the first
+of them as soon as its `)` is deleted. The cost is a line the bracket swallows
+by mistake:
+
+```python
+def f(l):
+    x = foo(
+    y = 1
+l.│
+```
+
+Here the cursor's def path is `[f]`, not `[]`.
+
+### Literal receivers
+
+The receiver is a literal when the token before the `.` is a string (or an
+implicitly concatenated run of them), a `]` closing a list display, or a `}`.
+It types as `str`, `list[Any]` or `dict[Any, Any]`: the element types are
+unknown. A `]` closing an index (`xs[0].│`, `"ab"[0].│`) or a parenthesized
+group (`([1]).│`) is not a literal, nor is a call on one (`"a".join(xs).│`).
+Which `[` a `]` closes is found by a balanced backward walk over the lexer's
+bracket links; the `[` opens a display when the token before it does not end
+an expression (a name, a literal, `)`, `]` or `}`). At bracket depth 0, a line
+break does not end an expression, so `[1, 2].│` at the start of a line is a
+display. A literal needs no parse and no registry, so it answers in a broken
+document and at startup.
+
+### Where the types come from
+
+The types are lint's, so completion and `build-lint-check` agree:
+
+- The same checker and the same globals: lint's (`check_globals`), not the
+  globals the server evaluates with. A plugin function is opaque to the
+  checker (`Any`), so its return type never reaches completion.
+- The same loads: each `load()` string resolves through evaluation's
+  resolver, and a loaded file's interface is lint's. A directory load is
+  every BUILD file in it. The `//pkg:file.star` fallback that evaluation
+  rejects is not typed.
+- Loaded files are read from disk, as lint reads them. An unsaved edit in
+  another buffer is not seen until it is saved.
+- Before the registry lands, the checker runs with the evaluation surface
+  alone (`heph_globals`): a record still types, but a parameter annotated
+  with a driver's `Kwargs` is `Any` and lists nothing until the registry
+  lands. A registry that fails to load leaves it that way. `registry` says
+  which globals answered.
+
+### Lifetimes
+
+- The typecheck is lazy. It runs only at a member site whose receiver the
+  file binds, on the document's last good parse, and its result is kept for
+  that text and the registry generation. Other keystrokes pay nothing. Only
+  the source and the bindings' types are kept, never the syntax tree.
+- Typing `l.` breaks the parse, so the answer comes from the last good parse
+  and says `stale: true`. A name renamed in the same document is seen at the
+  next good parse.
+- Each loaded file's interface is kept across requests and documents, under a
+  chained key: the digest of its content plus the keys of the files its loads
+  read. The digest is checked with a stat, and the file is read again only
+  when the stat changes; it is typechecked again only when its key changes.
+  Every member lookup walks the document's loads again and compares their
+  keys with the ones its types were checked against. So an edit on disk to a
+  file loaded two hops away is seen at the next member completion, with no
+  edit to the document.
+- The load walk is kept too, one per document, under its package, load
+  strings and BUILD patterns. It is reused while the stat of every path it
+  read holds: each file it parsed, each path a load probed (so a file created
+  where a load found nothing is seen), and each directory a load listed (so a
+  BUILD file added to a loaded directory is seen). It runs again, through
+  evaluation's resolver, only when one of those moved.
+- A stat is racily clean when the file changed within 2 s of the moment it
+  was read: a same-length rewrite inside one timestamp tick would keep the
+  stat, and so the old answer. Such a stat validates nothing, and the file is
+  read again on the next lookup, until it is safely old.
+- An interface is evicted once no open document's loads reach it. That check
+  runs on `didClose` and after every typecheck, since a document that changes
+  its loads leaves the old ones behind. A document's types are dropped on
+  `didClose`, so reopening it starts clean.
+
 ## Broken documents
 
 The site kind, the enclosing call, its keyword and the string prefix are
@@ -202,10 +324,37 @@ reason, degradations, item count and time:
 - `degraded` says what a present answer could not do in full:
   `call_extent_guessed` (with the line the extent stopped at),
   `edit_to_word_end`, `ast_stale` (with the versions behind), `ast_absent`,
-  `lex_error_before` (with its span).
-- A `member` site carries `path` (the receiver's chain of names, or `null`)
-  and `receiver` (`names`, `rebound` with the bound name in `rebound`, or
-  `expression`), which together say why its list is empty.
+  `lex_error_before` (with its span), `explain_without_registry` (the CLI's
+  answer at a typed member site; see below).
+- A `member` site carries `path` (the receiver's chain of names, or `null`),
+  `receiver` (`names`, `rebound` with the bound name in `rebound`, `literal`,
+  or `expression`) and `scope` (the cursor's def path, outermost first),
+  which together say why its list is empty.
+- A typed member site ([Typed members](#typed-members)) adds:
+  - `binding`: how the receiver's root is bound: `param`, `local`,
+    `comprehension`, `lambda`, `module`, `loaded` or `none`;
+  - `type`: the receiver's type as the checker prints it, or `null`;
+  - `source`: where the root came from: the declaration as `path:line`, or
+    the `load()` string;
+  - `approximation`: the reason the found binding carries, when the checker
+    typed its declaration `Any` (`conditional_binding`, `rebound`,
+    `non_literal_variant`, `star_args`, `in_def`, `invalid_declaration`), or
+    `null`. `rebound` and `in_def` can come with a non-empty list: the
+    binding still lists its `type`'s members;
+  - `stale`: the types are from an earlier text than the current one;
+  - `registry`: `ready`, or `pending` when the types were checked without the
+    registry;
+  - `empty_because`: why the list is empty, or `null`: `any`, `open_type`,
+    `members_not_listed` (a struct or a namespace: closed, since the checker
+    rejects a name it lacks, but its members are not listed),
+    `unknown_binding`, `ambiguous_binding`, `no_members`, `no_types_yet`
+    (the document has never parsed), `approximation` (the binding carries
+    an `approximation` and the list is empty).
+
+  Beyond the member-site keys, a literal receiver carries `type`, `registry`
+  and `empty_because` only.
+  `receiver`, `binding` and `empty_because` are open sets: a consumer
+  tolerates a value it does not know.
 
 To see it for one position without an editor:
 
@@ -215,6 +364,15 @@ $ heph tool build-lsp --explain BUILD:12:20 --json
 ```
 
 Line and column are 1-based, the column counted in characters.
+
+The CLI has no engine, so the registry never lands: a typed member answer
+says `registry: pending` and its resolution adds a `degraded` entry
+`explain_without_registry`. Its answer can differ from the editor's at the
+same position: a parameter annotated with a driver's `Kwargs` lists its
+members in the editor and nothing here, where it types as `Any`. Loads are typed under the
+workspace root found from the current directory (`explain_in` with
+`hconfig::get_root()`, in `lsp/mod.rs`); outside a workspace, loaded names
+are untyped.
 
 ## Adding a site kind
 

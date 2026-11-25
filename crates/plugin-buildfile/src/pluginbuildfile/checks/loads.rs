@@ -16,7 +16,7 @@
 //! deterministically.
 
 use crate::pluginbuildfile::run_file::{
-    Resolved, find_build_files, load_cycle, parse_build_file, resolve_load,
+    Resolved, find_build_files, load_cycle, parse_build_file, resolve_load, resolve_load_target,
 };
 use anyhow::Context;
 use hmodel::htaddr::Addr;
@@ -203,11 +203,84 @@ pub(crate) fn walk_package(
         files: &mut walk.files,
         done_dirs: HashSet::new(),
         in_flight: HashSet::new(),
+        reads: None,
     };
     // Seeded as evaluation seeds it: the package directory itself is on the
     // chain, so a load back into it is the same cycle evaluation reports.
     walker_state.visit_dir(&dir, pkg, &files)?;
     Ok(walk)
+}
+
+/// Walk the loads of one file that is not read from disk (the LSP's open
+/// buffer, at workspace path `file`, evaluated in `pkg`): resolve each of
+/// `modules` (its `load()` strings) as [`walk_package`] does, through
+/// [`resolve_load`], and walk what they load, transitively.
+///
+/// Best effort: a load that fails to resolve, parse or walk (a cycle back
+/// into `file` or its directory included) is left out of the edges, so its
+/// names are untyped; the others still walk. Returns each walked load
+/// string's edge, the walk of every file they reach, `file` never among
+/// them, and what the walk read ([`WalkReads`]), failed loads included.
+pub(crate) fn walk_loads<'m>(
+    root: &Path,
+    walker: &CachedWalker,
+    pkg: &str,
+    file: &Path,
+    modules: impl IntoIterator<Item = &'m str>,
+    patterns: &[glob::Pattern],
+) -> (BTreeMap<String, LoadEdge>, LoadWalk, WalkReads) {
+    let mut walk = LoadWalk {
+        pkg: pkg.to_string(),
+        files: BTreeMap::new(),
+    };
+    let mut edges = BTreeMap::new();
+    // Seeded as evaluation seeds it: the file and its directory are on the
+    // chain, so a load back into either is a cycle, not a second copy.
+    let seed: HashSet<PathBuf> = [file.to_path_buf()]
+        .into_iter()
+        .chain(file.parent().map(Path::to_path_buf))
+        .collect();
+    let mut state = Walker {
+        root,
+        walker,
+        patterns,
+        files: &mut walk.files,
+        done_dirs: HashSet::new(),
+        in_flight: seed.clone(),
+        reads: Some(WalkReads::default()),
+    };
+    for module in modules {
+        if edges.contains_key(module) {
+            continue;
+        }
+        match state.visit_load(pkg, module) {
+            Ok(edge) => {
+                edges.insert(module.to_string(), edge);
+            }
+            Err(e) => {
+                tracing::debug!(module, error = %e, "lsp: load left untyped");
+                // A failed visit leaves its chain behind.
+                state.in_flight.clone_from(&seed);
+            }
+        }
+    }
+    let reads = state.reads.take().unwrap_or_default();
+    (edges, walk, reads)
+}
+
+/// What a [`walk_loads`] read from disk: what a caller memoizing the walk
+/// watches, since the walk's answer moves only when one of these does.
+#[derive(Debug, Default)]
+pub(crate) struct WalkReads {
+    /// Every path a load probed (as [`resolve_load`] stats it: a file, a
+    /// directory whose listing was read, or nothing, for a load that did not
+    /// resolve) and every file parsed, whether the load succeeded or not, in
+    /// the order reached. A path may repeat. Each with whether the walk saw
+    /// something there: a path it saw that is gone by the time its caller
+    /// stats it vanished mid-walk, so that stat vouches for nothing.
+    pub paths: Vec<(PathBuf, bool)>,
+    /// Files parsed.
+    pub parsed: u64,
 }
 
 /// One walk's state. It mirrors [`BuildFileLoader`](super::super::run_file::BuildFileLoader):
@@ -220,6 +293,8 @@ struct Walker<'a> {
     files: &'a mut BTreeMap<String, WalkedFile>,
     done_dirs: HashSet<PathBuf>,
     in_flight: HashSet<PathBuf>,
+    /// `Some` when the caller wants to know what was read ([`walk_loads`]).
+    reads: Option<WalkReads>,
 }
 
 impl Walker<'_> {
@@ -246,7 +321,12 @@ impl Walker<'_> {
         if !self.in_flight.insert(path.to_path_buf()) {
             return Err(load_cycle(self.root, path));
         }
-        let symlink = std::fs::symlink_metadata(path)
+        let meta = std::fs::symlink_metadata(path);
+        if let Some(reads) = &mut self.reads {
+            reads.paths.push((path.to_path_buf(), meta.is_ok()));
+            reads.parsed += 1;
+        }
+        let symlink = meta
             .with_context(|| format!("stat {rel}"))?
             .file_type()
             .is_symlink();
@@ -275,7 +355,21 @@ impl Walker<'_> {
     }
 
     fn visit_load(&mut self, current_pkg: &str, module: &str) -> anyhow::Result<LoadEdge> {
-        match resolve_load(self.root, self.walker, current_pkg, module, self.patterns)? {
+        // The path `resolve_load` is about to stat, recorded before it can
+        // fail: a load that does not resolve now may once the path exists.
+        // Seen there once it resolves.
+        let probed = self.reads.as_mut().and_then(|reads| {
+            let candidate = resolve_load_target(self.root, current_pkg, module).ok()?;
+            reads.paths.push((candidate, false));
+            Some(reads.paths.len() - 1)
+        });
+        let resolved = resolve_load(self.root, self.walker, current_pkg, module, self.patterns)?;
+        if let Some(i) = probed
+            && let Some((_, seen)) = self.reads.as_mut().and_then(|r| r.paths.get_mut(i))
+        {
+            *seen = true;
+        }
+        match resolved {
             Resolved::File { path, pkg } => {
                 self.visit_file(&path, &pkg)?;
                 Ok(LoadEdge::File {

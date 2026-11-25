@@ -18,9 +18,11 @@ pub(crate) mod diagnostics;
 mod handlers;
 mod index;
 mod lex;
+mod memo;
 mod position;
 mod server;
 pub(crate) mod site;
+mod typed;
 
 #[cfg(feature = "test-support")]
 pub use server::{RunOptions, run_with};
@@ -69,7 +71,88 @@ pub fn run(connection: Connection, engine: Arc<dyn LspEngine>) -> anyhow::Result
 /// empty, and what a present one could not do in full. The same
 /// classification every editor request goes through, for "why did it do
 /// that?". `json` renders it as one JSON object.
+///
+/// Loads are typed against the workspace the cwd resolves to, as the server
+/// binds its engine to; there is no registry ([`explain_in`]).
 pub fn explain(target: &str, json: bool) -> anyhow::Result<String> {
+    explain_in(target, json, hconfig::get_root().ok().as_deref())
+}
+
+/// The CLI as a [`typed::MemberHost`]: one document read from disk, typed
+/// with lint's globals before the registry (`heph_globals`) and the loads
+/// `root` resolves, if any.
+struct CliHost<'a> {
+    doc: &'a site::Doc<'a>,
+    offset: usize,
+    /// The file as given on the command line.
+    file: &'a str,
+    parses: bool,
+    root: Option<&'a std::path::Path>,
+    globals: starlark::environment::Globals,
+}
+
+impl typed::MemberHost for CliHost<'_> {
+    fn registry_ready(&mut self) -> bool {
+        false
+    }
+
+    fn is_global(&mut self, name: &str) -> bool {
+        self.globals.names().any(|g| g.as_str() == name)
+    }
+
+    fn shadowed(&mut self, name: &str) -> Option<bool> {
+        Some(site::bound_in_group(self.doc, self.offset, name))
+    }
+
+    fn types(&mut self) -> (Option<Arc<typed::DocTypes>>, bool, bool) {
+        if !self.parses {
+            return (None, false, false);
+        }
+        // The workspace path, placed as the server places an open document
+        // under the engine's root; the file as given outside one.
+        let placed = self.root.and_then(|root| {
+            let (rel, abs) = server::Root::new(root).place(std::path::Path::new(self.file))?;
+            Some((root, abs, rel))
+        });
+        let path = placed
+            .as_ref()
+            .map_or(self.file, |(_, _, rel)| rel.as_str());
+        let globals = &self.globals;
+        let types = typed::DocTypes::check(path, self.doc.text, globals, |modules| {
+            let Some((root, abs, _)) = &placed else {
+                return Default::default();
+            };
+            let patterns =
+                crate::pluginbuildfile::provider::FormatSettings::resolve(Some(root)).patterns;
+            memo::InterfaceMemo::default()
+                .loaded_interfaces(
+                    root,
+                    &handlers::pkg_of(root, abs),
+                    abs,
+                    modules.iter().copied(),
+                    &patterns,
+                    globals,
+                    0,
+                )
+                .interfaces
+        });
+        (types.map(Arc::new), false, false)
+    }
+}
+
+/// [`explain`] with loads resolved under `root` (`None`: loaded names are
+/// untyped).
+///
+/// It runs without an engine, so the registry never lands: a member answer
+/// says `registry: pending`, and the resolution carries a
+/// `explain_without_registry` degradation, because the editor's answer at the
+/// same position can differ (a driver's `Kwargs` parameter lists the dict
+/// members the checker accepts there, and nothing here).
+pub fn explain_in(
+    target: &str,
+    json: bool,
+    root: Option<&std::path::Path>,
+) -> anyhow::Result<String> {
     use anyhow::Context as _;
     let mut parts = target.rsplitn(3, ':');
     let (col, line, file) = match (parts.next(), parts.next(), parts.next()) {
@@ -92,23 +175,47 @@ pub fn explain(target: &str, json: bool) -> anyhow::Result<String> {
     .ok();
     let overlay = parsed.as_ref().map(site::overlay_of);
     let pos = lsp_types::Position::new(line.saturating_sub(1), col.saturating_sub(1));
-    let resolution = match position::to_offset(&text, pos, position::Encoding::Utf32) {
-        Some(offset) => site::resolve(
-            &site::Doc {
-                text: &text,
-                tokens: &tokens,
-                overlay: overlay.as_ref(),
-                ast: if overlay.is_some() {
-                    site::AstState::Current
-                } else {
-                    site::AstState::Absent
-                },
-            },
-            offset,
-        ),
+    let doc = site::Doc {
+        text: &text,
+        tokens: &tokens,
+        overlay: overlay.as_ref(),
+        ast: if overlay.is_some() {
+            site::AstState::Current
+        } else {
+            site::AstState::Absent
+        },
+    };
+    let offset = position::to_offset(&text, pos, position::Encoding::Utf32);
+    let resolution = match offset {
+        Some(offset) => site::resolve(&doc, offset),
         None => site::Resolution::none(site::Reason::NotASite),
     };
-    let value = resolution.to_json();
+    let mut value = resolution.to_json();
+    // The server's member dispatch, over this host.
+    let typed = offset.and_then(|offset| {
+        typed::member_answer(
+            &resolution.site,
+            &mut CliHost {
+                doc: &doc,
+                offset,
+                file,
+                parses: parsed.is_some(),
+                root,
+                globals: crate::pluginbuildfile::run_file::heph_globals(
+                    &crate::pluginbuildfile::types::DriverKwargs::default(),
+                    |_| {},
+                ),
+            },
+        )
+    });
+    if let Some((answer, literal)) = typed {
+        if let Some(site) = value.get_mut("site").and_then(|s| s.as_object_mut()) {
+            answer.explain_into(site, literal);
+        }
+        if let Some(degraded) = value.get_mut("degraded").and_then(|d| d.as_array_mut()) {
+            degraded.push(serde_json::json!({"degraded": "explain_without_registry"}));
+        }
+    }
     if json {
         let mut out = serde_json::json!({ "file": file, "line": line, "col": col });
         if let (Some(map), serde_json::Value::Object(r)) = (out.as_object_mut(), value) {
@@ -120,7 +227,23 @@ pub fn explain(target: &str, json: bool) -> anyhow::Result<String> {
     let site = value.get("site").unwrap_or(&none);
     let kind = site.get("kind").and_then(|k| k.as_str()).unwrap_or("none");
     let mut out = format!("{file}:{line}:{col}\n  site: {kind}");
-    for key in ["call", "keyword", "prefix", "quote", "plugin", "selected"] {
+    for key in [
+        "call",
+        "keyword",
+        "prefix",
+        "quote",
+        "plugin",
+        "selected",
+        "receiver",
+        "type",
+        "scope",
+        "binding",
+        "source",
+        "approximation",
+        "stale",
+        "registry",
+        "empty_because",
+    ] {
         if let Some(v) = site.get(key).filter(|v| !v.is_null()) {
             out.push_str(&format!("\n  {key}: {v}"));
         }

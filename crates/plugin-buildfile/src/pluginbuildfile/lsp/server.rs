@@ -15,8 +15,13 @@ use super::context::HephLspContext;
 use super::handlers::{self, Ctx, Merge, Registry};
 use super::index::SharedState;
 use super::lex::{self, Tokens};
+use super::memo::{InterfaceMemo, Loaded};
 use super::position::{self, Encoding};
 use super::site::{self, AstState, Resolution, Site};
+use super::typed::{self, Answer, DocTypes};
+use crate::pluginbuildfile::checks::lint::check_globals;
+use crate::pluginbuildfile::run_file::heph_globals;
+use crate::pluginbuildfile::types::DriverKwargs;
 use hplugin::lsp::LspEngine;
 use lsp_server::{Connection, ErrorCode, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
@@ -28,8 +33,10 @@ use lsp_types::{
 };
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use starlark::environment::Globals;
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
@@ -67,8 +74,35 @@ struct Document {
     tokens: Arc<Tokens>,
     /// The version of the last text that parsed, if any did.
     ast_version: Option<i32>,
+    /// The text at `ast_version`: what typed completion checks (I8).
+    good_text: Option<Arc<str>>,
+    /// The types of `good_text`, checked on the first member request that
+    /// needs them.
+    types: Option<TypesMemo>,
+    /// Every loaded file the last typecheck's loads reached: the
+    /// [`InterfaceMemo`] entries this document keeps alive. It outlives an
+    /// edit, so the next typecheck finds them; `didClose` releases them.
+    reach: Vec<String>,
+    /// The key its load walk is memoized under, once typechecked: `didClose`
+    /// forgets the walk by it, since a file deleted before then can no
+    /// longer be placed.
+    walked: Option<PathBuf>,
     /// Outside the bound repo: stock answers only, `reason: outside_root`.
     outside_root: bool,
+}
+
+/// One typecheck of a document's last good text: valid while the text's
+/// version, the registry generation and its loads' chained key are the ones
+/// it was checked at.
+struct TypesMemo {
+    version: i32,
+    generation: u64,
+    /// The text's load strings, to look its loads up again without a parse.
+    modules: Arc<[String]>,
+    /// [`Loaded::key`] at the typecheck: a loaded file that changed on disk,
+    /// however deep, moves it.
+    loads: u128,
+    types: Arc<DocTypes>,
 }
 
 impl Document {
@@ -102,22 +136,52 @@ struct Server<'a> {
     root: Root,
     documents: HashMap<LspUri, Document>,
     registry: RegistryState,
+    /// Bumped when the registry lands: the typing globals change with it
+    /// (I9), so every [`TypesMemo`] from before is stale.
+    registry_generation: u64,
+    /// lint's globals for the current generation.
+    globals: Option<(u64, Arc<Globals>)>,
+    /// Typechecks run, for `heph/documents` (test support).
+    typechecks: u64,
+    /// The loaded files' interfaces, shared by every open document (I10).
+    interfaces: InterfaceMemo,
     shutting_down: bool,
 }
 
 /// The engine's root, as given and canonical (an editor may spell a path
 /// either way, `/var` against `/private/var` on macOS).
-struct Root {
+pub(super) struct Root {
     path: std::path::PathBuf,
     canonical: Option<std::path::PathBuf>,
 }
 
 impl Root {
-    fn new(path: &std::path::Path) -> Root {
+    pub(super) fn new(path: &std::path::Path) -> Root {
         Root {
             path: path.to_path_buf(),
             canonical: path.canonicalize().ok(),
         }
+    }
+
+    /// `path`'s workspace-relative path, and its absolute path under the
+    /// root as given, as the load walk spells it. `None` outside the root.
+    /// The path is canonicalized only when neither spelling of the root
+    /// prefixes it, so a symlinked package directory under the root keeps
+    /// its own spelling.
+    pub(super) fn place(&self, path: &Path) -> Option<(String, PathBuf)> {
+        let canonical = self.canonical.as_deref();
+        let rel = path
+            .strip_prefix(&self.path)
+            .ok()
+            .or_else(|| path.strip_prefix(canonical?).ok())
+            .map(Path::to_path_buf)
+            .or_else(|| {
+                let pc = path.canonicalize().ok()?;
+                pc.strip_prefix(canonical?).ok().map(Path::to_path_buf)
+            })?;
+        let rel = rel.to_str()?.replace('\\', "/");
+        let abs = self.path.join(&rel);
+        Some((rel, abs))
     }
 
     fn contains(&self, p: &std::path::Path) -> bool {
@@ -235,6 +299,7 @@ pub fn run_with(
             )));
     }
 
+    let registry_generation = u64::from(matches!(registry, RegistryState::Ready(_)));
     let mut server = Server {
         connection: &connection,
         backend: Backend::new(ctx),
@@ -244,6 +309,10 @@ pub fn run_with(
         root,
         documents: HashMap::new(),
         registry,
+        registry_generation,
+        globals: None,
+        typechecks: 0,
+        interfaces: InterfaceMemo::default(),
         shutting_down: false,
     };
     server.main_loop();
@@ -351,6 +420,46 @@ struct Located {
     resolution: Resolution,
 }
 
+/// The server as a [`typed::MemberHost`], for one located request.
+struct ServerHost<'s, 'a> {
+    server: &'s mut Server<'a>,
+    located: &'s Located,
+}
+
+impl typed::MemberHost for ServerHost<'_, '_> {
+    fn registry_ready(&mut self) -> bool {
+        self.server.registry().is_some()
+    }
+
+    fn is_global(&mut self, name: &str) -> bool {
+        let registry = self.server.registry();
+        self.server.shared.namespaces.contains_key(name)
+            || self
+                .server
+                .globals(registry.as_deref())
+                .names()
+                .any(|g| g.as_str() == name)
+    }
+
+    fn shadowed(&mut self, name: &str) -> Option<bool> {
+        let doc = self.server.documents.get(&self.located.key)?;
+        Some(site::bound_in_group(
+            &site::Doc {
+                text: &doc.text,
+                tokens: &doc.tokens,
+                overlay: None,
+                ast: AstState::Current,
+            },
+            self.located.offset,
+            name,
+        ))
+    }
+
+    fn types(&mut self) -> (Option<Arc<DocTypes>>, bool, bool) {
+        self.server.doc_types(&self.located.key)
+    }
+}
+
 impl Server<'_> {
     fn main_loop(&mut self) {
         while let Ok(msg) = self.connection.receiver.recv() {
@@ -389,15 +498,38 @@ impl Server<'_> {
             "textDocument/definition" => parse(&req).map(|p| self.definition(p)),
             "textDocument/formatting" => Ok(self.formatting(&req.params)),
             #[cfg(feature = "test-support")]
-            "heph/documents" => Ok(serde_json::json!({
-                "documents": self.documents.len(),
-                "parses": self.backend.parsed_documents(),
-                "indexes": self.shared.len(),
-            })),
+            "heph/documents" => Ok({
+                // Polled, so `registry` is what the next request would see.
+                let _ready = self.registry();
+                serde_json::json!({
+                    "documents": self.documents.len(),
+                    "parses": self.backend.parsed_documents(),
+                    "indexes": self.shared.len(),
+                    "typechecks": self.typechecks,
+                    "interfaces": self.interfaces.len(),
+                    "interface_checks": self.interfaces.checks(),
+                    "load_walks": self.interfaces.walks_run(),
+                    "load_walks_held": self.interfaces.walks_held(),
+                    "loaded_file_reads": self.interfaces.reads(),
+                    "registry": match self.registry {
+                        RegistryState::Loading(_) => "loading",
+                        RegistryState::Ready(_) => "ready",
+                        RegistryState::Failed => "failed",
+                    },
+                })
+            }),
             #[cfg(feature = "test-support")]
             "heph/explain" => parse::<lsp_types::TextDocumentPositionParams>(&req).map(|p| {
-                self.locate(&p.text_document.uri, p.position)
-                    .map_or(Value::Null, |l| l.resolution.to_json())
+                let Some(located) = self.locate(&p.text_document.uri, p.position) else {
+                    return Value::Null;
+                };
+                let mut value = located.resolution.to_json();
+                if let Some((answer, literal)) = self.member_answer(&located)
+                    && let Some(site) = value.get_mut("site").and_then(Value::as_object_mut)
+                {
+                    answer.explain_into(site, literal);
+                }
+                value
             }),
             other => Err(Response::new_err(
                 req.id,
@@ -450,14 +582,17 @@ impl Server<'_> {
         // evaluation below (and re-evaluates the other open documents).
         let _ready = self.registry();
         let parsed = self.diagnose(&key, &client_uri, &text, &tokens, version);
-        let ast_version = if parsed {
-            Some(version)
-        } else {
-            self.documents.get(&key).and_then(|d| d.ast_version)
-        };
-        let outside_root = match self.documents.get(&key) {
+        let mut prev = self.documents.remove(&key);
+        let outside_root = match &prev {
             Some(prev) => prev.outside_root,
             None => matches!(&key, LspUri::File(p) if !self.root.contains(p)),
+        };
+        let reach = prev.as_mut().map(|p| std::mem::take(&mut p.reach));
+        let walked = prev.as_mut().and_then(|p| p.walked.take());
+        let (ast_version, good_text, types) = match prev {
+            _ if parsed => (Some(version), Some(Arc::from(text.as_str())), None),
+            Some(prev) => (prev.ast_version, prev.good_text, prev.types),
+            None => (None, None, None),
         };
         self.documents.insert(
             key,
@@ -467,6 +602,10 @@ impl Server<'_> {
                 version,
                 tokens,
                 ast_version,
+                good_text,
+                types,
+                reach: reach.unwrap_or_default(),
+                walked,
                 outside_root,
             },
         );
@@ -530,6 +669,9 @@ impl Server<'_> {
             .collect();
         for (key, parsed) in parsed {
             if parsed && let Some(doc) = self.documents.get_mut(&key) {
+                if doc.ast_version != Some(doc.version) {
+                    doc.good_text = Some(Arc::from(doc.text.as_str()));
+                }
                 doc.ast_version = Some(doc.version);
             }
         }
@@ -539,10 +681,25 @@ impl Server<'_> {
         let Some(key) = uri_key(&client_uri) else {
             return;
         };
-        self.documents.remove(&key);
+        if let Some(walked) = self.documents.remove(&key).and_then(|d| d.walked) {
+            self.interfaces.forget(&walked);
+        }
+        self.evict_unreached();
         self.backend.close(&key);
         self.shared.remove(&key);
         self.publish(client_uri, Vec::new(), None);
+    }
+
+    /// Drop every memoized interface no open document's loads reach (I10):
+    /// run as a document closes, and after every typecheck, since a document
+    /// that changed its loads leaves the old ones behind.
+    fn evict_unreached(&mut self) {
+        let reached: HashSet<&str> = self
+            .documents
+            .values()
+            .flat_map(|d| d.reach.iter().map(String::as_str))
+            .collect();
+        self.interfaces.retain(&reached);
     }
 
     fn publish(&self, uri: Uri, diagnostics: Vec<Diagnostic>, version: Option<i32>) {
@@ -565,6 +722,7 @@ impl Server<'_> {
                 Ok(r) => {
                     self.backend.context.set_drivers(r.driver_source.clone());
                     self.registry = RegistryState::Ready(Arc::new(r));
+                    self.registry_generation += 1;
                     self.rediagnose_open_documents();
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => return None,
@@ -730,6 +888,7 @@ impl Server<'_> {
             }
             Merge::Replace => {
                 let site = &located.resolution.site;
+                let typed = self.member_answer(&located);
                 let registry = match self.registry() {
                     Some(registry) => Some(registry),
                     // A namespace's members are the globals', not the
@@ -742,13 +901,166 @@ impl Server<'_> {
                 };
                 registry
                     .and_then(|registry| {
-                        self.with_ctx(&located.key, &registry, |ctx| handlers::items(site, ctx))
+                        self.with_ctx(&located.key, &registry, |ctx| match &typed {
+                            Some((answer, _)) => handlers::typed_items(site, &answer.items, ctx),
+                            None => handlers::items(site, ctx),
+                        })
                     })
                     .unwrap_or_default()
             }
         };
         self.log("completion", &located, items.len(), started);
         serde_json::to_value(items).unwrap_or_else(|_| serde_json::json!([]))
+    }
+
+    /// The typed answer at a member site whose receiver is a name the file
+    /// binds, a name that is no global, or a literal, and whether it is a
+    /// literal's. `None` at any other site: a global namespace's members are
+    /// not typed.
+    fn member_answer(&mut self, located: &Located) -> Option<(Answer, bool)> {
+        typed::member_answer(
+            &located.resolution.site,
+            &mut ServerHost {
+                server: self,
+                located,
+            },
+        )
+    }
+
+    /// The types of `key`'s last good text, checked now unless the memo is
+    /// for that text, the current registry generation and what its loads see
+    /// now; whether that text is behind the current one; whether the registry
+    /// has landed.
+    ///
+    /// Every call looks the loads up again ([`InterfaceMemo`]), a stat of
+    /// each path the document's memoized load walk read: a loaded file
+    /// edited on disk, however deep, moves their key and so misses the
+    /// document's memo. The interfaces no open document reaches are evicted
+    /// after.
+    fn doc_types(&mut self, key: &LspUri) -> (Option<Arc<DocTypes>>, bool, bool) {
+        let registry = self.registry();
+        let ready = registry.is_some();
+        let generation = self.registry_generation;
+        let Some(doc) = self.documents.get(key) else {
+            return (None, false, ready);
+        };
+        let (Some(version), Some(good)) = (doc.ast_version, doc.good_text.clone()) else {
+            return (None, false, ready);
+        };
+        let stale = version != doc.version;
+        let memo = doc
+            .types
+            .as_ref()
+            .filter(|m| m.version == version && m.generation == generation)
+            .map(|m| (Arc::clone(&m.types), Arc::clone(&m.modules), m.loads));
+        let Some((rel, abs)) = self.workspace_path(key) else {
+            return (None, stale, ready);
+        };
+        let globals = self.globals(registry.as_deref());
+        let root = &self.shared.root;
+        let pkg = handlers::pkg_of(root, &abs);
+        let patterns = &self.shared.patterns;
+        let interfaces = &mut self.interfaces;
+        let mut lookup = |modules: &[&str]| {
+            interfaces.loaded_interfaces(
+                root,
+                &pkg,
+                &abs,
+                modules.iter().copied(),
+                patterns,
+                &globals,
+                generation,
+            )
+        };
+
+        // The text's own types still hold if its loads see what they saw.
+        let mut fresh = None;
+        if let Some((types, modules, loads)) = memo {
+            let names: Vec<&str> = modules.iter().map(String::as_str).collect();
+            let loaded = lookup(&names);
+            if loaded.key == loads {
+                let reach = loaded.closure;
+                self.settle(key, abs, reach, None);
+                return (Some(types), stale, ready);
+            }
+            fresh = Some(loaded);
+        }
+        let mut seen: Option<(Arc<[String]>, u128, Vec<String>)> = None;
+        let checked = DocTypes::check(&rel, &good, &globals, |modules| {
+            let Loaded {
+                interfaces,
+                key,
+                closure,
+            } = fresh.unwrap_or_else(|| lookup(modules));
+            seen = Some((
+                modules.iter().map(|&m| m.to_owned()).collect(),
+                key,
+                closure,
+            ));
+            interfaces
+        });
+        self.typechecks += 1;
+        let (modules, loads, reach) = seen.unwrap_or_default();
+        let types = checked.map(Arc::new);
+        let memo = types.as_ref().map(|types| TypesMemo {
+            version,
+            generation,
+            modules,
+            loads,
+            types: Arc::clone(types),
+        });
+        self.settle(key, abs, reach, memo);
+        (types, stale, ready)
+    }
+
+    /// Record what `key`'s typecheck (or its memo's validation) reached, the
+    /// key its load walk is memoized under and, when it checked, its memo;
+    /// then evict what no document reaches.
+    fn settle(
+        &mut self,
+        key: &LspUri,
+        walked: PathBuf,
+        reach: Vec<String>,
+        memo: Option<TypesMemo>,
+    ) {
+        if let Some(doc) = self.documents.get_mut(key) {
+            doc.reach = reach;
+            doc.walked = Some(walked);
+            if memo.is_some() {
+                doc.types = memo;
+            }
+        }
+        self.evict_unreached();
+    }
+
+    /// lint's globals (I9): with the plugin functions and the drivers'
+    /// `Kwargs` once the registry has landed, `heph_globals` alone before.
+    fn globals(&mut self, registry: Option<&Registry>) -> Arc<Globals> {
+        if let Some((generation, globals)) = &self.globals
+            && *generation == self.registry_generation
+        {
+            return Arc::clone(globals);
+        }
+        let globals = Arc::new(match registry {
+            Some(registry) => {
+                let functions = self.shared.engine.function_registry();
+                let names: Vec<(&str, &str)> = functions.iter().map(|(p, f, _)| (p, f)).collect();
+                check_globals(&names, &registry.kwargs())
+            }
+            None => heph_globals(&DriverKwargs::default(), |_| {}),
+        });
+        self.globals = Some((self.registry_generation, Arc::clone(&globals)));
+        globals
+    }
+
+    /// `key`'s workspace-relative path, and its absolute path under the
+    /// engine's root as the load walk spells it ([`Root::place`]). `None`
+    /// outside the root.
+    fn workspace_path(&self, key: &LspUri) -> Option<(String, PathBuf)> {
+        let LspUri::File(path) = key else {
+            return None;
+        };
+        self.root.place(path)
     }
 
     fn stock_completion(

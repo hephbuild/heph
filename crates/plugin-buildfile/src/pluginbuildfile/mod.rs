@@ -12,7 +12,32 @@ pub use checks::targets::{ChecksOptions, ShadowedCheck, ShadowedChecks};
 /// The transport-free LSP loop, for the editor-shaped harness in `tests/lsp.rs`.
 #[cfg(feature = "test-support")]
 pub use lsp::{RunOptions as LspRunOptions, run as lsp_run, run_with as lsp_run_with};
-pub use lsp::{explain as lsp_explain, serve_stdio};
+pub use lsp::{explain as lsp_explain, explain_in as lsp_explain_in, serve_stdio};
+
+/// `build-lint-check`'s findings for `pkg` under `root`, one line each, with
+/// the `(plugin, fn)` names `plugin_fns` callable and no driver's `Kwargs`:
+/// the checker `tests/lsp.rs` holds typed member completion to (I7).
+#[cfg(feature = "test-support")]
+pub fn lint_findings(
+    root: &std::path::Path,
+    pkg: &str,
+    plugin_fns: &[(&str, &str)],
+) -> anyhow::Result<Vec<String>> {
+    let walk = checks::loads::walk_package(
+        root,
+        &hwalk::CachedWalker::disabled(),
+        pkg,
+        &default_build_file_patterns(),
+    )?;
+    let findings = checks::lint::lint(
+        &walk,
+        &mut checks::lint::read_under(root),
+        plugin_fns,
+        &types::DriverKwargs::default(),
+        false,
+    )?;
+    Ok(findings.iter().map(ToString::to_string).collect())
+}
 pub use provider::{
     DEFAULT_INDENT, FormatSettings, Provider, build_file_indent_from_options,
     build_file_patterns_from_options, build_files_in_dir, default_build_file_patterns,

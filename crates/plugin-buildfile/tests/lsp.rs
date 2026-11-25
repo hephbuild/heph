@@ -49,12 +49,20 @@ const CURSOR: char = '│';
 struct Gate {
     open: Mutex<bool>,
     cv: Condvar,
+    /// Opening the gate kills the snapshot's thread instead.
+    fails: std::sync::atomic::AtomicBool,
 }
 
 impl Gate {
     fn release(&self) {
         *self.open.lock().expect("gate lock") = true;
         self.cv.notify_all();
+    }
+
+    /// Open the gate on a snapshot that dies: the registry never lands.
+    fn fail(&self) {
+        self.fails.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.release();
     }
 }
 
@@ -73,6 +81,12 @@ impl FakeEngine {
             while !*open {
                 open = gate.cv.wait(open).expect("gate wait");
             }
+            // Released first, so the panic below poisons nothing.
+            drop(open);
+            assert!(
+                !gate.fails.load(std::sync::atomic::Ordering::SeqCst),
+                "the registry snapshot fails (by the test's design)"
+            );
         }
     }
 }
@@ -1256,12 +1270,27 @@ fn member_completion_lists_a_namespace_and_nothing_else() {
     let doc = lsp.open("e/BUILD", "typing = {}\nx = typ│ing\n");
     let doc = lsp.change(&doc, "typing = {}\nx = typing.│\n");
     let result = lsp.completion(&doc);
+    let explained = lsp.explain(&doc);
+    assert_eq!(explained["site"]["binding"], json!("module"), "{explained}");
+    // The pre-pass types a module-level display `Any`, as lint does, so the
+    // rebound global lists nothing (I7): never the global's members.
+    assert_eq!(
+        explained["site"]["empty_because"],
+        json!("any"),
+        "{explained}"
+    );
     assert!(items(&result).is_empty(), "a rebound global: {result}");
 
+    // A literal receiver lists its type's members (D9).
+    let doc = lsp.open("g/BUILD", "x = \"s\".│\n");
+    let got = labels(&lsp.completion(&doc));
+    for want in ["join", "upper", "split"] {
+        assert!(got.iter().any(|l| l == want), "{want}: {got:?}");
+    }
+
     for (path, fixture, why) in [
-        ("d/BUILD", "l = {}\nx = l.│\n", "a local"),
+        ("d/BUILD", "l = {}\nx = l.│\n", "a local never parsed"),
         ("f/BUILD", "x = f().│\n", "a call"),
-        ("g/BUILD", "x = \"s\".│\n", "a literal"),
         (
             "h/BUILD",
             "x = typing.Any.│\n",
@@ -1345,6 +1374,530 @@ fn member_completion_lists_a_namespace_and_nothing_else() {
         "{explained}"
     );
     assert_eq!(explained["site"]["path"], Value::Null, "{explained}");
+}
+
+// ---------------------------------------------------------------------------
+// Typed members: lifetimes (I10) and the registry (I9).
+// ---------------------------------------------------------------------------
+
+/// Open `rel` with `parses`, then edit it to `dotted`, as an editor has it
+/// once the `.` is typed: `dotted` need not parse, its types are `parses`'.
+fn open_dotted(lsp: &mut Lsp, rel: &str, parses: &str, dotted: &str) -> Doc {
+    let doc = lsp.open(rel, parses);
+    lsp.change(&doc, dotted)
+}
+
+fn sorted_labels(result: &Value) -> Vec<String> {
+    let mut got = labels(result);
+    got.sort();
+    got
+}
+
+/// The server's test-support counters.
+fn counters(lsp: &mut Lsp) -> Value {
+    lsp.request("heph/documents", Value::Null)
+}
+
+fn counter(counters: &Value, name: &str) -> u64 {
+    counters[name]
+        .as_u64()
+        .unwrap_or_else(|| panic!("no counter {name}: {counters}"))
+}
+
+/// The counters of typing work, without the disk reads: a file written
+/// within the racy window is read again on the next lookup, however little
+/// it changed.
+fn typing_counters(lsp: &mut Lsp) -> Value {
+    let mut all = counters(lsp);
+    if let Some(map) = all.as_object_mut() {
+        map.remove("load_walks");
+        map.remove("loaded_file_reads");
+    }
+    all
+}
+
+#[test]
+fn edit_to_transitive_load_refreshes() {
+    let mut lsp = Lsp::start();
+    lsp.write("lib/mode.star", "Mode = record(level = str)\n");
+    lsp.write(
+        "lib/defs.star",
+        "load(\"//lib/mode.star\", \"Mode\")\n\nLib = record(name = str, mode = Mode)\n",
+    );
+    let head = "load(\"//lib/defs.star\", \"Lib\")\n\ndef f(l: Lib):\n";
+    let doc = open_dotted(
+        &mut lsp,
+        "pkg/BUILD",
+        &format!("{head}    x = l.mode\n"),
+        &format!("{head}    x = l.mode.│\n"),
+    );
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), ["level"]);
+    let first = typing_counters(&mut lsp);
+    assert_eq!(counter(&first, "typechecks"), 1, "{first}");
+    assert_eq!(counter(&first, "interfaces"), 2, "{first}");
+    assert_eq!(counter(&first, "interface_checks"), 2, "{first}");
+
+    // Nothing moved: the document's memo answers and no file is checked.
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), ["level"]);
+    assert_eq!(typing_counters(&mut lsp), first);
+
+    // An edit on disk two loads away, with the document unchanged: the
+    // file it loads directly is checked again under its moved key, and so is
+    // the document.
+    lsp.write(
+        "lib/mode.star",
+        "Mode = record(level = str, verbose = bool)\n",
+    );
+    assert_eq!(
+        sorted_labels(&lsp.completion(&doc)),
+        ["level", "verbose"],
+        "the transitive edit is seen"
+    );
+    let second = typing_counters(&mut lsp);
+    assert_eq!(counter(&second, "typechecks"), 2, "{second}");
+    assert_eq!(counter(&second, "interfaces"), 2, "{second}");
+    assert_eq!(counter(&second, "interface_checks"), 4, "{second}");
+
+    // An edit on disk that leaves the content as it was: rehashed, not
+    // checked.
+    lsp.write(
+        "lib/mode.star",
+        "Mode = record(level = str, verbose = bool)\n",
+    );
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), ["level", "verbose"]);
+    assert_eq!(typing_counters(&mut lsp), second);
+}
+
+#[test]
+fn close_evicts_unreached_interfaces() {
+    let mut lsp = Lsp::start();
+    lsp.write("shared/lib.star", "S = record(s = str)\n");
+    lsp.write("b/lib.star", "B = record(y = str)\n");
+    lsp.write("b/other.star", "C = record(z = str)\n");
+    let a_head = "load(\"//shared/lib.star\", \"S\")\n\ndef f(v: S):\n";
+    let a = open_dotted(
+        &mut lsp,
+        "a/BUILD",
+        &format!("{a_head}    x = v\n"),
+        &format!("{a_head}    x = v.│\n"),
+    );
+    assert_eq!(sorted_labels(&lsp.completion(&a)), ["s"]);
+    let b_head = |lib: &str, ty: &str| {
+        format!(
+            "load(\"//shared/lib.star\", \"S\")\nload(\"//b/{lib}.star\", \"{ty}\")\n\n\
+             def f(v: {ty}):\n"
+        )
+    };
+    let b = open_dotted(
+        &mut lsp,
+        "b/BUILD",
+        &format!("{}    x = v\n", b_head("lib", "B")),
+        &format!("{}    x = v.│\n", b_head("lib", "B")),
+    );
+    assert_eq!(sorted_labels(&lsp.completion(&b)), ["y"]);
+    assert_eq!(counter(&counters(&mut lsp), "interfaces"), 2);
+    assert_eq!(
+        counter(&counters(&mut lsp), "interface_checks"),
+        2,
+        "shared is checked once"
+    );
+
+    // `b` trades one load for another: what it no longer reaches goes after
+    // its next typecheck.
+    let b = lsp.change(&b, &format!("{}    x = v\n", b_head("other", "C")));
+    let b = lsp.change(&b, &format!("{}    x = v.│\n", b_head("other", "C")));
+    assert_eq!(sorted_labels(&lsp.completion(&b)), ["z"]);
+    assert_eq!(counter(&counters(&mut lsp), "interfaces"), 2);
+
+    // Closing `a` keeps what `b` still reaches.
+    lsp.close(&a);
+    assert_eq!(counter(&counters(&mut lsp), "interfaces"), 2);
+    lsp.close(&b);
+    assert_eq!(counter(&counters(&mut lsp), "interfaces"), 0);
+}
+
+#[test]
+fn reopen_starts_clean() {
+    let mut lsp = Lsp::start();
+    lsp.write("lib/defs.star", "Lib = record(name = str)\n");
+    // Settled, so a walk kept past the close would still hold.
+    past_racy_window();
+    let head = "load(\"//lib/defs.star\", \"Lib\")\n\ndef f(l: Lib):\n";
+    let parses = format!("{head}    x = l\n");
+    let dotted = format!("{head}    x = l.│\n");
+    let doc = open_dotted(&mut lsp, "pkg/BUILD", &parses, &dotted);
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), ["name"]);
+    lsp.close(&doc);
+    let closed = counters(&mut lsp);
+    assert_eq!(counter(&closed, "interfaces"), 0, "{closed}");
+    assert_eq!(counter(&closed, "load_walks"), 1, "{closed}");
+    assert_eq!(counter(&closed, "load_walks_held"), 0, "{closed}");
+
+    // Reopened with a text that has never parsed: nothing of the closed
+    // document's types is carried over.
+    let doc = lsp.open("pkg/BUILD", &dotted);
+    assert!(items(&lsp.completion(&doc)).is_empty());
+    let explained = lsp.explain(&doc);
+    assert_eq!(explained["site"]["binding"], "none", "{explained}");
+    assert_eq!(
+        explained["site"]["empty_because"], "no_types_yet",
+        "{explained}"
+    );
+    assert_eq!(explained["site"]["type"], Value::Null, "{explained}");
+
+    // Once it parses, it is typechecked afresh, the loaded file with it.
+    let doc = lsp.change(&doc, &parses);
+    let doc = lsp.change(&doc, &dotted);
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), ["name"]);
+    let reopened = counters(&mut lsp);
+    assert_eq!(counter(&reopened, "typechecks"), 2, "{reopened}");
+    assert_eq!(counter(&reopened, "interfaces"), 1, "{reopened}");
+    assert_eq!(counter(&reopened, "interface_checks"), 2, "{reopened}");
+    // The closed document's walk was forgotten: its loads are walked again.
+    assert_eq!(counter(&reopened, "load_walks"), 2, "{reopened}");
+}
+
+/// Wait out the memo's racy window (2s): a file written within it is read
+/// again on every lookup, so a test that proves a stat alone catches a change
+/// starts from stats that are safely old.
+fn past_racy_window() {
+    std::thread::sleep(Duration::from_millis(2100));
+}
+
+#[test]
+fn memo_hit_reads_no_loaded_file() {
+    let mut lsp = Lsp::start();
+    lsp.write("lib/mode.star", "Mode = record(level = str)\n");
+    lsp.write(
+        "lib/defs.star",
+        "load(\"//lib/mode.star\", \"Mode\")\n\nLib = record(name = str, mode = Mode)\n",
+    );
+    lsp.write("dir/BUILD", "D = record(d = str)\n");
+    past_racy_window();
+    let head = "load(\"//lib/defs.star\", \"Lib\")\nload(\"//dir\", \"D\")\n\
+                load(\"//lib/absent.star\", \"A\")\n\ndef f(l: Lib, d: D):\n";
+    let doc = open_dotted(
+        &mut lsp,
+        "pkg/BUILD",
+        &format!("{head}    x = l.mode\n"),
+        &format!("{head}    x = l.mode.│\n"),
+    );
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), ["level"]);
+    let first = counters(&mut lsp);
+    assert_eq!(counter(&first, "load_walks"), 1, "{first}");
+    // The walk parses each of the three files, the memo reads each for its
+    // digest.
+    assert_eq!(counter(&first, "loaded_file_reads"), 6, "{first}");
+
+    // Nothing moved: the walk is validated by stats, and no loaded file is
+    // read, parsed or checked.
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), ["level"]);
+    assert_eq!(counters(&mut lsp), first);
+}
+
+#[test]
+fn build_file_added_to_loaded_dir_is_seen() {
+    let mut lsp = Lsp::start();
+    lsp.write("lib/BUILD", "X = \"x\"\n");
+    past_racy_window();
+    let head = "load(\"//lib\", \"Lib\")\n\ndef f(l: Lib):\n";
+    let doc = open_dotted(
+        &mut lsp,
+        "pkg/BUILD",
+        &format!("{head}    x = l\n"),
+        &format!("{head}    x = l.│\n"),
+    );
+    assert!(sorted_labels(&lsp.completion(&doc)).is_empty());
+    // The walk is settled: the next one is the directory's stat moving.
+    assert!(sorted_labels(&lsp.completion(&doc)).is_empty());
+    assert_eq!(counter(&counters(&mut lsp), "load_walks"), 1);
+
+    lsp.write("lib/more.BUILD", DECLS);
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), LIB_FIELDS);
+    assert_eq!(counter(&counters(&mut lsp), "load_walks"), 2);
+}
+
+#[test]
+fn unresolved_load_resolves_once_created() {
+    let mut lsp = Lsp::start();
+    let head = "load(\"//lib/later.star\", \"Lib\")\n\ndef f(l: Lib):\n";
+    let doc = open_dotted(
+        &mut lsp,
+        "pkg/BUILD",
+        &format!("{head}    x = l\n"),
+        &format!("{head}    x = l.│\n"),
+    );
+    assert!(sorted_labels(&lsp.completion(&doc)).is_empty());
+    // A path that is not there is no racy stat: the walk is settled.
+    assert!(sorted_labels(&lsp.completion(&doc)).is_empty());
+    assert_eq!(counter(&counters(&mut lsp), "load_walks"), 1);
+
+    lsp.write("lib/later.star", DECLS);
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), LIB_FIELDS);
+    assert_eq!(counter(&counters(&mut lsp), "interfaces"), 1);
+}
+
+#[test]
+fn bad_load_leaves_the_others_typed() {
+    let fixed = "B = record(b = str)\n";
+    let cases: [(&str, &[u8]); 5] = [
+        ("does not parse", b"B = record(b = str\n"),
+        ("missing", b""),
+        (
+            "cycle back into the document",
+            b"load(\"//pkg/BUILD\", \"f\")\nB = record(b = str)\n",
+        ),
+        (
+            "cycle back into the document's directory",
+            b"load(\"//pkg\", \"f\")\nB = record(b = str)\n",
+        ),
+        ("not UTF-8", b"B = record(b = str)\n# \xff\xfe\n"),
+    ];
+    let head = "load(\"//good/defs.star\", \"G\")\nload(\"//bad/defs.star\", \"B\")\n\n\
+                def f(g: G, b: B):\n";
+    for (case, bad) in cases {
+        let mut lsp = Lsp::start();
+        lsp.write("good/defs.star", "G = record(g = str)\n");
+        let bad_path = lsp.root().join("bad/defs.star");
+        if !bad.is_empty() {
+            std::fs::create_dir_all(lsp.root().join("bad")).expect("mkdir");
+            std::fs::write(&bad_path, bad).expect("write bad");
+        }
+        let doc = lsp.open("pkg/BUILD", &format!("{head}    x = g\n"));
+        let members = |lsp: &mut Lsp, var: &str| {
+            let doc = lsp.change(&doc, &format!("{head}    x = {var}.│\n"));
+            sorted_labels(&lsp.completion(&doc))
+        };
+        assert_eq!(members(&mut lsp, "g"), ["g"], "{case}: the good load");
+        assert!(members(&mut lsp, "b").is_empty(), "{case}: the bad load");
+        let broken = counters(&mut lsp);
+        assert_eq!(counter(&broken, "interfaces"), 1, "{case}: {broken}");
+
+        lsp.write("bad/defs.star", fixed);
+        assert_eq!(members(&mut lsp, "b"), ["b"], "{case}: fixed");
+        assert_eq!(members(&mut lsp, "g"), ["g"], "{case}: fixed");
+        let fixed_counters = counters(&mut lsp);
+        assert_eq!(
+            counter(&fixed_counters, "interfaces"),
+            2,
+            "{case}: {fixed_counters}"
+        );
+
+        std::fs::remove_file(&bad_path).expect("remove bad");
+        assert!(members(&mut lsp, "b").is_empty(), "{case}: removed");
+        assert_eq!(members(&mut lsp, "g"), ["g"], "{case}: removed");
+        let removed = counters(&mut lsp);
+        assert_eq!(counter(&removed, "interfaces"), 1, "{case}: {removed}");
+    }
+}
+
+#[test]
+fn symlinked_load_follows_its_target() {
+    let mut lsp = Lsp::start();
+    lsp.write("real/one.star", "L = record(one = str)\n");
+    lsp.write("real/two.star", "L = record(two = str)\n");
+    std::fs::create_dir_all(lsp.root().join("link")).expect("mkdir");
+    let link = lsp.root().join("link/defs.star");
+    std::os::unix::fs::symlink(lsp.root().join("real/one.star"), &link).expect("symlink");
+    past_racy_window();
+    let head = "load(\"//link/defs.star\", \"L\")\n\ndef f(l: L):\n";
+    let doc = open_dotted(
+        &mut lsp,
+        "pkg/BUILD",
+        &format!("{head}    x = l\n"),
+        &format!("{head}    x = l.│\n"),
+    );
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), ["one"]);
+
+    // The target changes under the link, whose own stat does not move.
+    lsp.write("real/one.star", "L = record(one = str, more = str)\n");
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), ["more", "one"]);
+
+    // The link is pointed elsewhere.
+    std::fs::remove_file(&link).expect("unlink");
+    std::os::unix::fs::symlink(lsp.root().join("real/two.star"), &link).expect("symlink");
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), ["two"]);
+
+    // The link is removed: nothing of it is held.
+    std::fs::remove_file(&link).expect("unlink");
+    assert!(sorted_labels(&lsp.completion(&doc)).is_empty());
+    assert_eq!(counter(&counters(&mut lsp), "interfaces"), 0);
+}
+
+#[test]
+fn racy_same_length_rewrite_is_seen() {
+    // A rewrite within one timestamp tick can keep the whole stat; the memo
+    // reads a file again until its stat is older than the racy window. (On a
+    // filesystem with fine timestamps the ctime moves anyway; the racy rule
+    // itself is unit-tested in `lsp::memo`.)
+    let mut lsp = Lsp::start();
+    lsp.write("lib/defs.star", "Lib = record(aaa = str)\n");
+    let head = "load(\"//lib/defs.star\", \"Lib\")\n\ndef f(l: Lib):\n";
+    let doc = open_dotted(
+        &mut lsp,
+        "pkg/BUILD",
+        &format!("{head}    x = l\n"),
+        &format!("{head}    x = l.│\n"),
+    );
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), ["aaa"]);
+    lsp.write("lib/defs.star", "Lib = record(bbb = str)\n");
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), ["bbb"]);
+}
+
+#[test]
+fn racy_stats_are_read_again_until_settled() {
+    // What proves the racy rule is consulted at all: with nothing changed, a
+    // file written within the window is walked and read again on every
+    // lookup, and no longer once the window has passed.
+    let mut lsp = Lsp::start();
+    lsp.write("lib/defs.star", "Lib = record(aaa = str)\n");
+    let head = "load(\"//lib/defs.star\", \"Lib\")\n\ndef f(l: Lib):\n";
+    let doc = open_dotted(
+        &mut lsp,
+        "pkg/BUILD",
+        &format!("{head}    x = l\n"),
+        &format!("{head}    x = l.│\n"),
+    );
+    let walks_reads = |lsp: &mut Lsp| {
+        let c = counters(lsp);
+        (counter(&c, "load_walks"), counter(&c, "loaded_file_reads"))
+    };
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), ["aaa"]);
+    let (walks, reads) = walks_reads(&mut lsp);
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), ["aaa"]);
+    // The racy walk runs again (parsing the file), and the racy entry reads
+    // the file again for its digest.
+    assert_eq!(walks_reads(&mut lsp), (walks + 1, reads + 2));
+
+    past_racy_window();
+    // One more of each, whose stats are now safely old...
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), ["aaa"]);
+    let settled = walks_reads(&mut lsp);
+    assert_eq!(settled, (walks + 2, reads + 4));
+    // ...and then nothing.
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), ["aaa"]);
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), ["aaa"]);
+    assert_eq!(walks_reads(&mut lsp), settled);
+}
+
+#[test]
+fn close_forgets_the_walk_of_a_deleted_document() {
+    // The document is opened through a link to the root, so placing it needs
+    // a canonicalize, which fails once it is deleted: close must still find
+    // its walk.
+    let mut lsp = Lsp::start();
+    lsp.write("lib/defs.star", "Lib = record(name = str)\n");
+    let links = tempfile::tempdir().expect("tempdir");
+    let alias = links.path().join("alias");
+    std::os::unix::fs::symlink(lsp.root(), &alias).expect("symlink");
+    let head = "load(\"//lib/defs.star\", \"Lib\")\n\ndef f(l: Lib):\n";
+    let real = lsp.write("pkg/BUILD", &format!("{head}    x = l\n"));
+    let uri = file_uri(&alias.join("pkg/BUILD"));
+    lsp.notify(
+        "textDocument/didOpen",
+        json!({"textDocument": {
+            "uri": uri, "languageId": "starlark", "version": 1,
+            "text": format!("{head}    x = l\n"),
+        }}),
+    );
+    let doc = Doc {
+        uri,
+        text: format!("{head}    x = l\n"),
+        line: 0,
+        character: 0,
+        version: 1,
+    };
+    let doc = lsp.change(&doc, &format!("{head}    x = l.│\n"));
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), ["name"]);
+    assert_eq!(counter(&counters(&mut lsp), "load_walks_held"), 1);
+
+    std::fs::remove_file(&real).expect("delete the document");
+    lsp.close(&doc);
+    let closed = counters(&mut lsp);
+    assert_eq!(counter(&closed, "load_walks_held"), 0, "{closed}");
+    assert_eq!(counter(&closed, "interfaces"), 0, "{closed}");
+}
+
+#[test]
+fn types_before_and_after_registry() {
+    const RECORD: &str = "Lib = record(name = str)\n\ndef f(l: Lib):\n";
+    const KWARGS: &str = "def f(kw: heph.types.exec.Kwargs):\n";
+    let open = |lsp: &mut Lsp| {
+        let record = open_dotted(
+            lsp,
+            "rec/BUILD",
+            &format!("{RECORD}    x = l\n"),
+            &format!("{RECORD}    x = l.│\n"),
+        );
+        let kwargs = open_dotted(
+            lsp,
+            "kw/BUILD",
+            &format!("{KWARGS}    x = kw\n"),
+            &format!("{KWARGS}    x = kw.│\n"),
+        );
+        (record, kwargs)
+    };
+    // What typing with `heph_globals` alone gives: a record's fields, and no
+    // Kwargs, so a Kwargs parameter lists nothing.
+    let assert_pending = |lsp: &mut Lsp, record: &Doc, kwargs: &Doc| {
+        assert_eq!(sorted_labels(&lsp.completion(record)), ["name"]);
+        let result = lsp.completion(kwargs);
+        assert!(items(&result).is_empty(), "{result}");
+        let explained = lsp.explain(kwargs);
+        assert_eq!(
+            explained["site"]["empty_because"],
+            json!("any"),
+            "{explained}"
+        );
+        for doc in [record, kwargs] {
+            let explained = lsp.explain(doc);
+            assert_eq!(
+                explained["site"]["registry"],
+                json!("pending"),
+                "{explained}"
+            );
+        }
+    };
+
+    // Before the registry lands (`initialize` timed out waiting for it).
+    let (mut lsp, gate) = Lsp::new_gated();
+    lsp.initialize();
+    let (record, kwargs) = open(&mut lsp);
+    assert_pending(&mut lsp, &record, &kwargs);
+    assert_eq!(counters(&mut lsp)["registry"], json!("loading"));
+
+    // Once it lands, the Kwargs parameter is the dict the checker types it as.
+    gate.release();
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    while counters(&mut lsp)["registry"] != json!("ready") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the registry never landed"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let got = sorted_labels(&lsp.completion(&kwargs));
+    for want in ["get", "items", "keys", "values"] {
+        assert!(got.iter().any(|l| l == want), "{want}: {got:?}");
+    }
+    let explained = lsp.explain(&kwargs);
+    assert_eq!(explained["site"]["registry"], json!("ready"), "{explained}");
+    assert_eq!(sorted_labels(&lsp.completion(&record)), ["name"]);
+
+    // A registry that fails to load: `heph_globals` for good.
+    let (mut lsp, gate) = Lsp::new_gated();
+    lsp.initialize();
+    gate.fail();
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    while counters(&mut lsp)["registry"] != json!("failed") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the registry never failed"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let (record, kwargs) = open(&mut lsp);
+    assert_pending(&mut lsp, &record, &kwargs);
 }
 
 /// A member's edit lands on the member in every position encoding, with a
@@ -3135,7 +3688,10 @@ fn did_close_frees_the_document_model() {
     let mut lsp = Lsp::start();
     let a = lsp.open("a/BUILD", "target(name = \"a\")\n");
     let b = lsp.open("b/BUILD", "target(name = \"b\")\n");
-    let counts = |lsp: &mut Lsp| lsp.request("heph/documents", Value::Null);
+    let counts = |lsp: &mut Lsp| {
+        let all = lsp.request("heph/documents", Value::Null);
+        json!({"documents": all["documents"], "parses": all["parses"], "indexes": all["indexes"]})
+    };
     assert_eq!(
         counts(&mut lsp),
         json!({"documents": 2, "parses": 2, "indexes": 2})
@@ -3461,4 +4017,818 @@ fn document_outside_the_root_gets_stock_with_a_reason() {
     };
     assert_eq!(reason(&lsp.explain(&doc)).as_deref(), Some("outside_root"));
     assert!(heph_items(&lsp.completion(&doc)).is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Typed member completion (docs/LSP.md, "Typed members").
+// ---------------------------------------------------------------------------
+
+/// An enum, and a record with a field of it and an optional list field.
+const DECLS: &str = "Mode = enum(\"debug\", \"release\")\n\
+                     Lib = record(name = str, mode = Mode, srcs = field(list[str], []))\n";
+
+/// The record's fields, as completion lists them.
+const LIB_FIELDS: [&str; 3] = ["mode", "name", "srcs"];
+
+/// Open `rel` as `parses` (a text that parses), then type `typed` over it
+/// (cursor marked), as an editor does: the `.` just typed breaks the parse,
+/// and the types come from the last good one.
+fn type_after(lsp: &mut Lsp, rel: &str, parses: &str, typed: &str) -> Doc {
+    let doc = lsp.open(rel, parses);
+    lsp.change(&doc, typed)
+}
+
+fn detail(result: &Value, label: &str) -> String {
+    item(result, label)["detail"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// One D5 key of a member site's `--explain`.
+fn site_key(explained: &Value, key: &str) -> Value {
+    explained["site"][key].clone()
+}
+
+fn typechecks(lsp: &mut Lsp) -> u64 {
+    lsp.request("heph/documents", Value::Null)["typechecks"]
+        .as_u64()
+        .expect("typechecks counted")
+}
+
+#[test]
+fn typed_member_completion() {
+    let mut lsp = Lsp::start();
+    let head = format!(
+        "{DECLS}\n\
+         def f(l: Lib, m: Mode, s: str, xs: list[str], d: dict[str, int], \
+         **kw: heph.types.exec.Kwargs):\n    \
+         c = Lib(name = \"a\", mode = Mode(\"debug\"))\n"
+    );
+    let mut doc = lsp.open("pkg/BUILD", &format!("{head}    pass\n"));
+    let mut at = |lsp: &mut Lsp, receiver: &str| {
+        doc = lsp.change(&doc, &format!("{head}    x = {receiver}.│\n"));
+        (lsp.completion(&doc), lsp.explain(&doc))
+    };
+
+    let (result, explained) = at(&mut lsp, "l");
+    assert_eq!(sorted_labels(&result), LIB_FIELDS, "{result}");
+    // D7: the member's type as the checker prints it.
+    assert_eq!(detail(&result, "name"), "str");
+    assert_eq!(detail(&result, "mode"), "Mode");
+    assert_eq!(detail(&result, "srcs"), "list[str]");
+    assert_eq!(
+        site_key(&explained, "binding"),
+        json!("param"),
+        "{explained}"
+    );
+    assert_eq!(site_key(&explained, "type"), json!("Lib"), "{explained}");
+    assert_eq!(site_key(&explained, "scope"), json!(["f"]), "{explained}");
+    assert_eq!(
+        site_key(&explained, "registry"),
+        json!("ready"),
+        "{explained}"
+    );
+    assert_eq!(site_key(&explained, "empty_because"), Value::Null);
+
+    for receiver in ["m", "l.mode"] {
+        let (result, _) = at(&mut lsp, receiver);
+        assert_eq!(sorted_labels(&result), ["index", "value"], "{receiver}");
+        // The checker types an enum value's `value` as `Any`.
+        assert_eq!(detail(&result, "value"), "typing.Any", "{receiver}");
+        assert_eq!(detail(&result, "index"), "int", "{receiver}");
+    }
+
+    let (result, explained) = at(&mut lsp, "Mode");
+    assert_eq!(
+        sorted_labels(&result),
+        ["debug", "release", "type", "values"],
+        "{result}"
+    );
+    assert_eq!(detail(&result, "debug"), "Mode");
+    assert_eq!(
+        site_key(&explained, "binding"),
+        json!("module"),
+        "{explained}"
+    );
+    assert_eq!(
+        site_key(&explained, "source"),
+        json!("pkg/BUILD:1"),
+        "{explained}"
+    );
+
+    let (result, _) = at(&mut lsp, "s");
+    assert!(has(&result, "upper") && has(&result, "split"), "{result}");
+    assert_eq!(detail(&result, "upper"), "def() -> str");
+
+    let (result, _) = at(&mut lsp, "xs");
+    for want in ["append", "extend", "index", "pop"] {
+        assert!(has(&result, want), "xs.{want}: {result}");
+    }
+    assert!(!has(&result, "upper"), "{result}");
+
+    let (result, _) = at(&mut lsp, "d");
+    for want in ["get", "items", "keys", "values"] {
+        assert!(has(&result, want), "d.{want}: {result}");
+    }
+
+    // A local bound by a record constructor call inside the def.
+    let (result, explained) = at(&mut lsp, "c");
+    assert_eq!(sorted_labels(&result), LIB_FIELDS, "{result}");
+    assert_eq!(
+        site_key(&explained, "binding"),
+        json!("local"),
+        "{explained}"
+    );
+
+    // A `Kwargs` parameter lists the dict attributes the checker accepts.
+    let (result, explained) = at(&mut lsp, "kw");
+    for want in ["get", "items", "keys"] {
+        assert!(has(&result, want), "kw.{want}: {result}");
+    }
+    assert_eq!(
+        site_key(&explained, "binding"),
+        json!("param"),
+        "{explained}"
+    );
+}
+
+#[test]
+fn literal_receiver_completion() {
+    let mut lsp = Lsp::start();
+    // No parse and no types needed: each document is broken from its first
+    // version.
+    for (i, (fixture, ty, want)) in [
+        ("x = \"-\".│\n", "str", "join"),
+        ("x = 'x'.│\n", "str", "upper"),
+        ("x = \"\"\"a\"\"\".│\n", "str", "split"),
+        ("x = \"a\" \"b\".│\n", "str", "strip"),
+        ("x = [].│\n", "list[Any]", "append"),
+        ("x = [1, 2].│\n", "list[Any]", "extend"),
+        ("x = [\n  1,\n].│\n", "list[Any]", "pop"),
+        ("xs = [1]\nx = xs[0]\n[1, 2].│\n", "list[Any]", "insert"),
+        ("x = {}.│\n", "dict[Any, Any]", "items"),
+        ("x = {\"a\": 1}.│\n", "dict[Any, Any]", "keys"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let doc = lsp.open(&format!("lit{i}/BUILD"), fixture);
+        let result = lsp.completion(&doc);
+        assert!(has(&result, want), "{fixture}: {result}");
+        let explained = lsp.explain(&doc);
+        assert_eq!(
+            site_key(&explained, "receiver"),
+            json!("literal"),
+            "{fixture}"
+        );
+        assert_eq!(site_key(&explained, "type"), json!(ty), "{fixture}");
+        assert_eq!(site_key(&explained, "empty_because"), Value::Null);
+    }
+
+    // A prefix filters, and the edit lands on the member.
+    let doc = lsp.open("prefix/BUILD", "x = \"a\".up│\n");
+    let result = lsp.completion(&doc);
+    assert_eq!(labels(&result), ["upper"]);
+    assert_eq!(
+        apply("x = \"a\".up\n", &item(&result, "upper")),
+        "x = \"a\".upper\n"
+    );
+
+    for (i, fixture) in [
+        "xs = [1]\nx = xs[0].│\n",
+        "xs = [\"a\"]\nx = \"a\".join(xs).│\n",
+        "x = 1.│\n",
+        "x = (\"a\").│\n",
+        "x = {\"a\": 1}[\"a\"].│\n",
+        "x = \"ab\"[0].│\n",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let doc = lsp.open(&format!("nolit{i}/BUILD"), fixture);
+        let result = lsp.completion(&doc);
+        // `1.` is a float, not a member site, so the stock names pass
+        // through there; no receiver here has a literal's members.
+        for method in ["upper", "append", "items"] {
+            assert!(!has(&result, method), "{fixture}: {result}");
+        }
+        if !fixture.starts_with("x = 1.") {
+            assert!(items(&result).is_empty(), "{fixture}: {result}");
+        }
+        let explained = lsp.explain(&doc);
+        assert_ne!(
+            site_key(&explained, "receiver"),
+            json!("literal"),
+            "{fixture}"
+        );
+    }
+}
+
+#[test]
+fn module_call_receiver_completes() {
+    let mut lsp = Lsp::start();
+    let cfg = "cfg = Lib(name = \"x\", mode = Mode(\"debug\"))\n";
+    lsp.write("lib/defs.star", &format!("{DECLS}{cfg}"));
+
+    // Declared and called in the document.
+    let head = format!("{DECLS}{cfg}\ndef g():\n");
+    let doc = type_after(
+        &mut lsp,
+        "local/BUILD",
+        &format!("{head}    pass\n"),
+        &format!("{head}    x = cfg.│\n"),
+    );
+    let result = lsp.completion(&doc);
+    assert_eq!(sorted_labels(&result), LIB_FIELDS, "{result}");
+    let explained = lsp.explain(&doc);
+    assert_eq!(
+        site_key(&explained, "binding"),
+        json!("module"),
+        "{explained}"
+    );
+    assert_eq!(site_key(&explained, "type"), json!("Lib"), "{explained}");
+    // At module level too.
+    let doc = type_after(
+        &mut lsp,
+        "top/BUILD",
+        &format!("{DECLS}{cfg}y = cfg\n"),
+        &format!("{DECLS}{cfg}y = cfg.│\n"),
+    );
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), LIB_FIELDS);
+
+    // Loaded: the call's result type crosses the interface.
+    let head = "load(\"//lib/defs.star\", \"cfg\")\n\ndef g():\n";
+    let doc = type_after(
+        &mut lsp,
+        "loaded/BUILD",
+        &format!("{head}    pass\n"),
+        &format!("{head}    x = cfg.│\n"),
+    );
+    let result = lsp.completion(&doc);
+    assert_eq!(sorted_labels(&result), LIB_FIELDS, "{result}");
+    let explained = lsp.explain(&doc);
+    assert_eq!(
+        site_key(&explained, "binding"),
+        json!("loaded"),
+        "{explained}"
+    );
+    assert_eq!(
+        site_key(&explained, "source"),
+        json!("//lib/defs.star"),
+        "{explained}"
+    );
+}
+
+#[test]
+fn typecheck_is_lazy() {
+    let mut lsp = Lsp::start();
+    let head = format!("{DECLS}\ndef f(l: Lib):\n");
+    let doc = lsp.open("pkg/BUILD", &format!("{head}    pass\n"));
+    let doc = lsp.change(&doc, &format!("{head}    x = l\n"));
+    let doc = lsp.change(&doc, &format!("{head}    x = l.\n"));
+    let doc = lsp.change(&doc, &format!("{head}    x = l│\n"));
+    // Edits, a hover and a completion at another site check nothing.
+    lsp.hover(&doc);
+    lsp.completion(&doc);
+    lsp.barrier();
+    assert_eq!(
+        typechecks(&mut lsp),
+        0,
+        "no member completion, no typecheck"
+    );
+
+    let doc = lsp.change(&doc, &format!("{head}    x = l.│\n"));
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), LIB_FIELDS);
+    assert_eq!(typechecks(&mut lsp), 1);
+    // The same last good text: the memo answers.
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), LIB_FIELDS);
+    assert_eq!(typechecks(&mut lsp), 1, "memoized by the last good version");
+    // A literal needs no types.
+    let doc = lsp.change(&doc, &format!("{head}    x = \"a\".│\n"));
+    assert!(has(&lsp.completion(&doc), "upper"));
+    assert_eq!(typechecks(&mut lsp), 1, "a literal is not typechecked");
+}
+
+#[test]
+fn typed_member_completion_agrees_with_lint() {
+    let mut lsp = Lsp::start();
+    let head = format!(
+        "{DECLS}\n\
+         def f(l: Lib, m: Mode, s: str, xs: list[str], d: dict[str, int], o: Lib | None):\n"
+    );
+    let receivers = ["l", "m", "Mode", "s", "xs", "d", "o", "l.mode", "l.srcs"];
+    let mut doc = lsp.open("pkg/BUILD", &format!("{head}    pass\n"));
+    let mut listed = Vec::new();
+    for receiver in receivers {
+        doc = lsp.change(&doc, &format!("{head}    x = {receiver}.│\n"));
+        let got: std::collections::BTreeSet<String> =
+            labels(&lsp.completion(&doc)).into_iter().collect();
+        assert!(!got.is_empty(), "{receiver} lists something");
+        listed.push((receiver, got));
+    }
+    // Every member any receiver lists, and a name none has: the probe.
+    let mut vocabulary: std::collections::BTreeSet<String> = listed
+        .iter()
+        .flat_map(|(_, got)| got.iter().cloned())
+        .collect();
+    vocabulary.insert("nosuch".to_string());
+
+    // One access per line, so a finding's line names the access it rejects.
+    let mut source = head.clone();
+    let mut accesses = Vec::new();
+    for (receiver, got) in &listed {
+        for name in &vocabulary {
+            source.push_str(&format!("    _ = {receiver}.{name}\n"));
+            accesses.push((source.lines().count(), *receiver, name, got.contains(name)));
+        }
+    }
+    lsp.write("pkg/BUILD", &source);
+    let findings =
+        plugin_buildfile::pluginbuildfile::lint_findings(&lsp.root(), "pkg", &[("fs", "join")])
+            .expect("lint runs");
+    let rejected: std::collections::BTreeSet<usize> = findings
+        .iter()
+        .filter_map(|f| {
+            f.strip_prefix("pkg/BUILD:")?
+                .split(':')
+                .next()?
+                .parse()
+                .ok()
+        })
+        .collect();
+    assert_eq!(
+        rejected.len(),
+        findings.len(),
+        "one finding per rejected access: {findings:#?}"
+    );
+    for (line, receiver, name, listed) in accesses {
+        assert_eq!(
+            !rejected.contains(&line),
+            listed,
+            "line {line}: completion lists `{receiver}.{name}` iff lint accepts it"
+        );
+    }
+}
+
+#[test]
+fn typed_members_of_a_loaded_record() {
+    let mut lsp = Lsp::start();
+    lsp.write("lib/defs.star", DECLS);
+    let head = "load(\"//lib/defs.star\", \"Lib\", \"Mode\")\n\ndef f(l: Lib):\n";
+    let doc = type_after(
+        &mut lsp,
+        "pkg/BUILD",
+        &format!("{head}    pass\n"),
+        &format!("{head}    x = l.│\n"),
+    );
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), LIB_FIELDS);
+    let doc = lsp.change(&doc, &format!("{head}    x = l.mode.│\n"));
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), ["index", "value"]);
+    let doc = lsp.change(&doc, &format!("{head}    x = Mode.│\n"));
+    let result = lsp.completion(&doc);
+    assert!(has(&result, "debug") && has(&result, "release"), "{result}");
+    let explained = lsp.explain(&doc);
+    assert_eq!(
+        site_key(&explained, "binding"),
+        json!("loaded"),
+        "{explained}"
+    );
+    assert_eq!(
+        site_key(&explained, "source"),
+        json!("//lib/defs.star"),
+        "{explained}"
+    );
+}
+
+#[test]
+fn record_in_dir_load_second_file() {
+    let mut lsp = Lsp::start();
+    lsp.write("lib/BUILD", "X = \"x\"\n");
+    lsp.write("lib/more.BUILD", DECLS);
+    let head = "load(\"//lib\", \"Lib\")\n\ndef f(l: Lib):\n";
+    let doc = type_after(
+        &mut lsp,
+        "pkg/BUILD",
+        &format!("{head}    pass\n"),
+        &format!("{head}    x = l.│\n"),
+    );
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), LIB_FIELDS);
+}
+
+#[test]
+fn pkg_file_fallback_not_typed() {
+    let mut lsp = Lsp::start();
+    lsp.write("lib/defs.star", DECLS);
+    for (rel, load, want) in [
+        ("file/BUILD", "//lib/defs.star", LIB_FIELDS.to_vec()),
+        // Evaluation rejects `//pkg:file`, so lint and the LSP do not type it.
+        ("fallback/BUILD", "//lib:defs.star", Vec::new()),
+    ] {
+        let head = format!("load(\"{load}\", \"Lib\")\n\ndef f(l: Lib):\n");
+        let doc = type_after(
+            &mut lsp,
+            rel,
+            &format!("{head}    pass\n"),
+            &format!("{head}    x = l.│\n"),
+        );
+        assert_eq!(sorted_labels(&lsp.completion(&doc)), want, "{load}");
+    }
+}
+
+#[test]
+fn loaded_file_unsaved_edit_not_seen() {
+    let mut lsp = Lsp::start();
+    let saved = "Lib = record(name = str)\n";
+    let edited = "Lib = record(name = str, extra = str)\n";
+    let lib = lsp.open("lib/defs.star", saved);
+    let _unsaved = lsp.change(&lib, edited);
+
+    let head = "load(\"//lib/defs.star\", \"Lib\")\n\ndef f(l: Lib):\n";
+    let parses = format!("{head}    pass\n");
+    let typed = format!("{head}    x = l.│\n");
+    let doc = type_after(&mut lsp, "pkg/BUILD", &parses, &typed);
+    assert_eq!(
+        sorted_labels(&lsp.completion(&doc)),
+        ["name"],
+        "the loaded file as on disk, as lint reads it"
+    );
+
+    // Saved: the next good parse types against it.
+    lsp.write("lib/defs.star", edited);
+    let doc = lsp.change(&doc, &parses);
+    let doc = lsp.change(&doc, &typed);
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), ["extra", "name"]);
+}
+
+#[test]
+fn typed_members_survive_a_broken_edit() {
+    let mut lsp = Lsp::start();
+    let doc = lsp.open(
+        "pkg/BUILD",
+        &format!("{DECLS}\ndef f(l: Lib):\n    x = l.│name\n"),
+    );
+    let explained = lsp.explain(&doc);
+    assert_eq!(site_key(&explained, "stale"), json!(false), "{explained}");
+
+    let doc = lsp.change(&doc, &format!("{DECLS}\ndef f(l: Lib):\n    x = l.│\n"));
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), LIB_FIELDS);
+    let explained = lsp.explain(&doc);
+    assert_eq!(site_key(&explained, "stale"), json!(true), "{explained}");
+    assert_eq!(site_key(&explained, "type"), json!("Lib"), "{explained}");
+
+    // E5: retyped in a broken document, the parameter keeps its old type
+    // until the next good parse; a renamed one is not found.
+    let doc = lsp.change(&doc, &format!("{DECLS}\ndef f(l: Mode):\n    x = l.│\n"));
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), LIB_FIELDS);
+    let doc = lsp.change(&doc, &format!("{DECLS}\ndef f(k: Lib):\n    x = k.│\n"));
+    assert!(items(&lsp.completion(&doc)).is_empty());
+    assert_eq!(
+        site_key(&lsp.explain(&doc), "empty_because"),
+        json!("unknown_binding")
+    );
+    let doc = lsp.change(&doc, &format!("{DECLS}\ndef f(l: Mode):\n    x = l\n"));
+    let doc = lsp.change(&doc, &format!("{DECLS}\ndef f(l: Mode):\n    x = l.│\n"));
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), ["index", "value"]);
+}
+
+#[test]
+fn same_param_name_in_two_defs() {
+    let mut lsp = Lsp::start();
+    let f = "def f(l: Lib):\n";
+    let g = "def g(l: Mode):\n";
+    let h = "def h(l: Lib):\n    def k(l: Mode):\n";
+    let parses = format!("{DECLS}\n{f}    pass\n\n{g}    pass\n\n{h}        pass\n");
+    for (rel, typed, scope, want) in [
+        (
+            "f/BUILD",
+            format!("{DECLS}\n{f}    x = l.│\n\n{g}    pass\n\n{h}        pass\n"),
+            json!(["f"]),
+            LIB_FIELDS.to_vec(),
+        ),
+        (
+            "g/BUILD",
+            format!("{DECLS}\n{f}    pass\n\n{g}    x = l.│\n\n{h}        pass\n"),
+            json!(["g"]),
+            vec!["index", "value"],
+        ),
+        (
+            "k/BUILD",
+            format!("{DECLS}\n{f}    pass\n\n{g}    pass\n\n{h}        x = l.│\n"),
+            json!(["h", "k"]),
+            vec!["index", "value"],
+        ),
+    ] {
+        let doc = type_after(&mut lsp, rel, &parses, &typed);
+        assert_eq!(sorted_labels(&lsp.completion(&doc)), want, "{rel}");
+        let explained = lsp.explain(&doc);
+        assert_eq!(site_key(&explained, "scope"), scope, "{explained}");
+    }
+}
+
+#[test]
+fn comprehension_shadowing_lists_nothing() {
+    let mut lsp = Lsp::start();
+    let cfg = "cfg = Lib(name = \"x\", mode = Mode(\"debug\"))\n";
+    for (rel, parses, typed) in [
+        (
+            "group/BUILD",
+            format!("{DECLS}\ndef f(l: Lib):\n    x = [l for l in [1]]\n"),
+            format!("{DECLS}\ndef f(l: Lib):\n    x = [l.│ for l in [1]]\n"),
+        ),
+        (
+            "after/BUILD",
+            format!("{DECLS}\ndef f(l: Lib):\n    x = [l for l in [1]]\n    y = l\n"),
+            format!("{DECLS}\ndef f(l: Lib):\n    x = [l for l in [1]]\n    y = l.│\n"),
+        ),
+        (
+            "module/BUILD",
+            format!("{DECLS}{cfg}x = [cfg for cfg in [1]]\n"),
+            format!("{DECLS}{cfg}x = [cfg.│ for cfg in [1]]\n"),
+        ),
+    ] {
+        let doc = type_after(&mut lsp, rel, &parses, &typed);
+        let result = lsp.completion(&doc);
+        assert!(items(&result).is_empty(), "{rel}: {result}");
+        assert_eq!(
+            site_key(&lsp.explain(&doc), "empty_because"),
+            json!("ambiguous_binding"),
+            "{rel}"
+        );
+    }
+}
+
+#[test]
+fn lambda_param_lists_nothing() {
+    let mut lsp = Lsp::start();
+    let doc = type_after(
+        &mut lsp,
+        "pkg/BUILD",
+        &format!("{DECLS}\ndef f(l: Lib):\n    g = lambda l: l\n"),
+        &format!("{DECLS}\ndef f(l: Lib):\n    g = lambda l: l.│\n"),
+    );
+    let result = lsp.completion(&doc);
+    assert!(items(&result).is_empty(), "{result}");
+    let because = site_key(&lsp.explain(&doc), "empty_because");
+    assert!(
+        because == json!("ambiguous_binding") || because == json!("unknown_binding"),
+        "{because}"
+    );
+}
+
+#[test]
+fn untyped_receivers_list_nothing() {
+    let mut lsp = Lsp::start();
+    for (rel, parses, typed, binding) in [
+        (
+            "any/BUILD",
+            "def f(a: typing.Any):\n    pass\n",
+            "def f(a: typing.Any):\n    x = a.│\n",
+            "param",
+        ),
+        (
+            "unannotated/BUILD",
+            "def f(a):\n    pass\n",
+            "def f(a):\n    x = a.│\n",
+            "param",
+        ),
+        // A plugin function is opaque to lint, so its result is `Any`.
+        (
+            "plugin/BUILD",
+            "v = heph.fs.join(\"a\", \"b\")\n\ndef f():\n    pass\n",
+            "v = heph.fs.join(\"a\", \"b\")\n\ndef f():\n    x = v.│\n",
+            "module",
+        ),
+    ] {
+        let doc = type_after(&mut lsp, rel, parses, typed);
+        let result = lsp.completion(&doc);
+        assert!(items(&result).is_empty(), "{rel}: {result}");
+        let explained = lsp.explain(&doc);
+        assert_eq!(
+            site_key(&explained, "binding"),
+            json!(binding),
+            "{explained}"
+        );
+        assert_eq!(
+            site_key(&explained, "empty_because"),
+            json!("any"),
+            "{explained}"
+        );
+    }
+
+    // E4: a document that never parsed has no types yet.
+    let doc = lsp.open("never/BUILD", "def f(a: str):\n    x = a.│\n");
+    let result = lsp.completion(&doc);
+    assert!(items(&result).is_empty(), "{result}");
+    assert_eq!(
+        site_key(&lsp.explain(&doc), "empty_because"),
+        json!("no_types_yet")
+    );
+}
+
+#[test]
+fn approximated_declarations_say_why() {
+    let mut lsp = Lsp::start();
+    let def = "def g():\n";
+    // (reason, the module-level declaration of `R`, what `R.│` lists)
+    for (reason, decl, listed) in [
+        (
+            "conditional_binding",
+            "c = True\nif c:\n    R = record(a = str)\n",
+            &[][..],
+        ),
+        // Bound twice, the name is the union of its two bindings' values, and
+        // the checker accepts what both record types have.
+        (
+            "rebound",
+            "R = record(a = str)\nR = record(b = str)\n",
+            &["type"][..],
+        ),
+        (
+            "non_literal_variant",
+            "V = \"a\"\nR = enum(V, \"b\")\n",
+            &[][..],
+        ),
+        ("star_args", "F = {\"a\": str}\nR = record(**F)\n", &[][..]),
+        ("invalid_declaration", "R = enum(\"a\", \"a\")\n", &[][..]),
+    ] {
+        let doc = type_after(
+            &mut lsp,
+            &format!("{reason}/BUILD"),
+            &format!("{decl}\n{def}    pass\n"),
+            &format!("{decl}\n{def}    x = R.│\n"),
+        );
+        let result = lsp.completion(&doc);
+        let explained = lsp.explain(&doc);
+        assert_eq!(sorted_labels(&result), listed, "{reason}: {explained}");
+        assert_eq!(
+            site_key(&explained, "binding"),
+            json!("module"),
+            "{reason}: {explained}"
+        );
+        assert_eq!(
+            site_key(&explained, "approximation"),
+            json!(reason),
+            "{explained}"
+        );
+        // Why the list is empty, when it is.
+        let because = listed.is_empty().then_some("approximation");
+        assert_eq!(
+            site_key(&explained, "empty_because"),
+            json!(because),
+            "{explained}"
+        );
+    }
+
+    // Declared in a def: the local's own reason.
+    let body = "    R = record(a = str)\n";
+    let doc = type_after(
+        &mut lsp,
+        "in_def/BUILD",
+        &format!("{def}{body}    pass\n"),
+        &format!("{def}{body}    x = R.│\n"),
+    );
+    let result = lsp.completion(&doc);
+    let explained = lsp.explain(&doc);
+    assert_eq!(
+        site_key(&explained, "binding"),
+        json!("local"),
+        "{explained}"
+    );
+    assert_eq!(
+        site_key(&explained, "approximation"),
+        json!("in_def"),
+        "{explained}"
+    );
+    // In a def, the call is typed by `record`'s declared return type, whose
+    // `type` the checker accepts: the reason is given, and the list holds.
+    assert_eq!(sorted_labels(&result), ["type"], "{explained}");
+    assert_eq!(
+        site_key(&explained, "empty_because"),
+        Value::Null,
+        "{result} {explained}"
+    );
+
+    // A parameter `R` shadows the conditional module `R`: the reason is the
+    // module binding's, never the parameter's.
+    let decl = "c = True\nif c:\n    R = record(a = str)\n\ndef h(R):\n";
+    let doc = type_after(
+        &mut lsp,
+        "shadowed/BUILD",
+        &format!("{decl}    pass\n"),
+        &format!("{decl}    x = R.│\n"),
+    );
+    let explained = lsp.explain(&doc);
+    assert_eq!(
+        site_key(&explained, "binding"),
+        json!("param"),
+        "{explained}"
+    );
+    assert_eq!(site_key(&explained, "approximation"), Value::Null);
+    assert_eq!(
+        site_key(&explained, "empty_because"),
+        json!("any"),
+        "{explained}"
+    );
+}
+
+#[test]
+fn large_enum_completes() {
+    const VARIANTS: usize = 10_000;
+    let mut lsp = Lsp::start();
+    let variants: Vec<String> = (0..VARIANTS).map(|i| format!("\"v{i}\"")).collect();
+    let decl = format!("Many = enum({})\n\ndef f():\n", variants.join(", "));
+    let doc = type_after(
+        &mut lsp,
+        "pkg/BUILD",
+        &format!("{decl}    pass\n"),
+        &format!("{decl}    x = Many.│\n"),
+    );
+    let started = std::time::Instant::now();
+    let result = lsp.completion(&doc);
+    let took = started.elapsed();
+    let got = labels(&result);
+    // Every variant, plus the enum type's own `type` and `values`.
+    assert_eq!(got.len(), VARIANTS + 2, "{:?}", got.get(..5));
+    assert!(has(&result, "v0") && has(&result, "v9999"));
+    // A gross-regression guard, generous for a loaded debug build: the
+    // first member completion typechecks the document too.
+    assert!(
+        took < Duration::from_secs(2),
+        "10,000-variant completion took {took:?}"
+    );
+}
+
+/// `--explain FILE:LINE:COL` as the CLI runs it, for a fixture written at
+/// `rel` under `root` with its cursor marked.
+fn cli_explain(root: &Path, rel: &str, fixture: &str) -> Value {
+    let at = fixture.find(CURSOR).expect("fixture has a cursor");
+    let text = fixture.replace(CURSOR, "");
+    let before = fixture.get(..at).expect("cursor on a char boundary");
+    let line = before.matches('\n').count() + 1;
+    let col = before.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+    let path = root.join(rel);
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&path, text).expect("write fixture");
+    let target = format!("{}:{line}:{col}", path.display());
+    let out = plugin_buildfile::pluginbuildfile::lsp_explain_in(&target, true, Some(root))
+        .expect("explain runs");
+    serde_json::from_str(&out).expect("explain prints JSON")
+}
+
+#[test]
+fn cli_explain_shares_the_member_dispatch() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().canonicalize().expect("canonical root");
+    std::fs::create_dir_all(root.join("lib")).expect("mkdir");
+    std::fs::write(root.join("lib/defs.star"), DECLS).expect("write lib");
+    let degraded_here =
+        |explained: &Value| degraded(explained).contains(&"explain_without_registry".to_string());
+
+    // A loaded receiver is typed: the CLI walks the loads as the editor does.
+    let explained = cli_explain(
+        &root,
+        "pkg/BUILD",
+        "load(\"//lib/defs.star\", \"Lib\")\n\ndef f(l: Lib):\n    x = l.│name\n",
+    );
+    assert_eq!(site_key(&explained, "type"), json!("Lib"), "{explained}");
+    assert_eq!(
+        site_key(&explained, "binding"),
+        json!("param"),
+        "{explained}"
+    );
+    assert_eq!(site_key(&explained, "empty_because"), Value::Null);
+    assert_eq!(
+        site_key(&explained, "registry"),
+        json!("pending"),
+        "{explained}"
+    );
+    assert!(degraded_here(&explained), "{explained}");
+
+    // A document that does not parse has no types yet, as in the editor: the
+    // receiver is a name no parse binds.
+    let explained = cli_explain(&root, "never/BUILD", "def f(a: str):\n    x = a.│\n");
+    assert_eq!(
+        site_key(&explained, "receiver"),
+        json!("names"),
+        "{explained}"
+    );
+    assert_eq!(
+        site_key(&explained, "empty_because"),
+        json!("no_types_yet"),
+        "{explained}"
+    );
+
+    // Bound by nothing in a document that parses.
+    let explained = cli_explain(&root, "nothing/BUILD", "def f():\n    x = nope.│name\n");
+    assert_eq!(
+        site_key(&explained, "empty_because"),
+        json!("unknown_binding"),
+        "{explained}"
+    );
+
+    // A global namespace is not typed: no typed keys, no degradation.
+    let explained = cli_explain(&root, "global/BUILD", "x = typing.│Any\n");
+    assert_eq!(site_key(&explained, "empty_because"), Value::Null);
+    assert!(!degraded_here(&explained), "{explained}");
 }

@@ -84,7 +84,7 @@ impl Registry {
     }
 
     /// The drivers' `Kwargs`: none before the snapshot lands.
-    fn kwargs(&self) -> Arc<DriverKwargs> {
+    pub(crate) fn kwargs(&self) -> Arc<DriverKwargs> {
         // A fixed source never fails; an empty set stands in if it did.
         self.driver_source
             .kwargs()
@@ -286,6 +286,39 @@ pub(crate) fn items(site: &Site, ctx: &Ctx<'_>) -> Vec<CompletionItem> {
         }
     };
     render(site, candidates, edit, value, ctx)
+}
+
+/// The items of a member site from its typed answer ([`super::typed`]): each
+/// member the checker accepts on the receiver, its `detail` the member's type
+/// as the checker prints it (D7). A member that is not an identifier (an enum
+/// variant `"my-mode"`) cannot be written after a `.` and is left out.
+pub(crate) fn typed_items(
+    site: &Site,
+    members: &[(String, starlark::typing::Ty)],
+    ctx: &Ctx<'_>,
+) -> Vec<CompletionItem> {
+    let Site::Member { edit, .. } = site else {
+        return Vec::new();
+    };
+    let candidates = members
+        .iter()
+        .filter(|(name, _)| is_identifier(name))
+        .map(|(name, ty)| Candidate {
+            label: name.clone(),
+            detail: Some(ty.to_string()),
+            doc: String::new(),
+            insert: name.clone(),
+        })
+        .collect();
+    render(site, candidates, edit.clone(), None, ctx)
+}
+
+fn is_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// The keyword-argument completion of a call to a function whose parameters
