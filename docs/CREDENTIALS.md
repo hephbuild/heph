@@ -571,6 +571,9 @@ share one entry. The rules are the registry drivers' rules:
   (`localhost`, `127.0.0.0/8`, `::1`) is exempt. Go's module fetch makes the
   same choice with the same file.
 - **A URL with `user:pass@` and `credentials` together is refused at parse.**
+  A `url` computed by another target (`${read://…}`, see
+  [DEFERRED_VALUES.md](DEFERRED_VALUES.md)) gets both checks at run, on the
+  resolved value, before any request.
 - **The header goes to the URL's origin only.** A redirect to another host,
   port or scheme drops it, so a release asset that redirects to a CDN's signed
   URL does not hand that CDN the credential.
