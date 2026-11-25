@@ -166,10 +166,11 @@ async fn golist() {
     let driver = GoGolistDriver::new().with_default_runner(Some(RUNNER.to_string()));
     // `raw_def` moved when the def stopped carrying a copy of its dep inputs
     // (they are hashed, never read by `run`); `hash` and `inputs` did not.
+    // `hash` moved with `GO_GOLIST_FORMAT_VERSION` 19 (portable `Dir`).
     assert_eq!(
         pin(&driver, spec).await,
         golden(
-            "cbd4cbd43b71a9f0",
+            "1333ebc226df4d91",
             18258194127413756051,
             14850982951679174278,
             6272041238485915835
