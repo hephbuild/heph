@@ -1968,4 +1968,64 @@ mod tests {
             out.status
         );
     }
+
+    /// A run response's `host_paths` is validated again on the host side of
+    /// the seam: a plugin that skips the SDK's check, or one built against
+    /// another version of it, cannot hand the engine a list of the wrong
+    /// shape. Each refused list fails the run with what is wrong with it; an
+    /// accepted one arrives deduplicated and sorted.
+    #[test]
+    fn drain_run_refuses_a_bad_host_path_list() {
+        fn drain(host_paths: Vec<String>) -> anyhow::Result<ManagedRunResponse> {
+            let frame = pb::RunOutFrame {
+                msg: Some(
+                    pb::ManagedRunResponse {
+                        host_paths,
+                        ..Default::default()
+                    }
+                    .into(),
+                ),
+                ..Default::default()
+            };
+            let (tx, _rx) = tokio::sync::mpsc::channel(RELAY_QUEUE);
+            drain_run(item_stream(std::iter::once(encode_svec(&frame))), &tx)
+        }
+
+        let many = |k: usize| (0..k).map(|i| format!("/nix/store/p{i}")).collect();
+        // (case, list, what the error says)
+        let refused: Vec<(&str, Vec<String>, &str)> = vec![
+            ("relative", vec!["nix/store/x".into()], "is not absolute"),
+            (
+                "dot-dot",
+                vec!["/nix/store/x/../y".into()],
+                "is not normalized",
+            ),
+            ("empty", vec![String::new()], "is empty"),
+            ("NUL byte", vec!["/nix/store/x\0y".into()], "NUL byte"),
+            (
+                "65 paths",
+                many(hplugin::driver::MAX_HOST_PATHS + 1),
+                "65 host paths declared, at most 64",
+            ),
+        ];
+        for (case, list, says) in refused {
+            let Err(err) = drain(list) else {
+                panic!("{case}: accepted");
+            };
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("decoding the run's host_paths") && msg.contains(says),
+                "{case}: expected {says:?} in {msg}"
+            );
+        }
+
+        let ok = drain(vec![
+            "/nix/store/b".into(),
+            "/nix/store/a/".into(),
+            "/nix/store/b".into(),
+        ])
+        .expect("a good list decodes");
+        let got: Vec<&str> = ok.host_paths.iter().map(|p| p.as_str()).collect();
+        assert_eq!(got, ["/nix/store/a", "/nix/store/b"]);
+    }
 }
