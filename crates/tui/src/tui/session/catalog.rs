@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
+use rusqlite::config::DbConfig;
 use rusqlite::{Connection, ErrorCode, OpenFlags, params};
 
 use super::id::SessionId;
@@ -480,6 +481,30 @@ fn owner_write(root: &Path, dir: &Path, copy: Rows, bound: Duration) {
     }
 }
 
+/// Keep an owner's catalog write inside `deadline`, the run's exit path
+/// waiting on it:
+/// - its VM steps, by a progress handler that interrupts the statement;
+/// - its waits on a locked catalog, by a busy handler that gives up at the
+///   deadline rather than after a fixed timeout;
+/// - its commit, by `synchronous=NORMAL` (no fsync on a WAL commit; the
+///   catalog is rebuildable, I8), no auto-checkpoint, and no checkpoint when
+///   it closes: a command's connection or the next cleanup checkpoints.
+fn bound_owner(conn: &mut Connection, deadline: Instant) -> rusqlite::Result<()> {
+    conn.progress_handler(1000, Some(move || Instant::now() >= deadline))?;
+    conn.busy_handler(Some(move |_tries: i32| {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        std::thread::sleep(left.min(Duration::from_millis(5)));
+        true
+    }))?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    conn.pragma_update(None, "wal_autocheckpoint", 0)?;
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;
+    Ok(())
+}
+
 /// `Ok(false)`: `catalog.lock` was not free at once (a repair). Past
 /// `bound`, the write is interrupted and its transaction rolled back.
 fn try_owner_write(root: &Path, dir: &Path, copy: Rows, bound: Duration) -> anyhow::Result<bool> {
@@ -493,8 +518,7 @@ fn try_owner_write(root: &Path, dir: &Path, copy: Rows, bound: Duration) -> anyh
     }
     let deadline = Instant::now() + bound;
     let mut conn = open_rw(root, true).context("opening the session catalog")?;
-    conn.progress_handler(1000, Some(move || Instant::now() >= deadline))
-        .context("bounding the catalog write")?;
+    bound_owner(&mut conn, deadline).context("bounding the catalog write")?;
     ensure_schema(&conn, false)
         .map_err(|e| anyhow::anyhow!("{e}"))
         .context("checking the session catalog")?;

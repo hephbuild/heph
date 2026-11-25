@@ -756,6 +756,41 @@ fn an_owner_write_past_its_bound_leaves_no_half_rows() {
     assert_eq!(count(&opened.conn, "SELECT count(*) FROM targets"), 500);
 }
 
+/// An owner waits on a locked catalog until its write's deadline, not for
+/// a fixed busy timeout past it; and it leaves no checkpoint for its exit
+/// path: its rows stay in the WAL for a command to fold in.
+#[test]
+fn an_owner_waits_on_a_locked_catalog_only_until_its_bound() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    let earlier = sealed(root, recent_id(1, 2_000));
+    catalog::record_seal(root, &earlier, true);
+    let holder = Connection::open(root.join(catalog::FILE)).expect("open");
+    holder.execute_batch("BEGIN IMMEDIATE").expect("hold");
+    let dir = sealed(root, recent_id(2, 1_000));
+    let started = Instant::now();
+    catalog::record_seal_within(root, &dir, true, Duration::from_millis(100));
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_millis(350),
+        "waited past its bound: {took:?}"
+    );
+    holder.execute_batch("ROLLBACK").expect("release");
+    drop(holder);
+
+    // Alone on the catalog, its write is left in the WAL when it closes.
+    catalog::record_seal(root, &dir, true);
+    let wal = std::fs::metadata(root.join("catalog.db-wal")).map_or(0, |m| m.len());
+    assert!(wal > 0, "the owner's close did not checkpoint");
+    assert_eq!(
+        count(
+            &read(root),
+            "SELECT count(*) FROM sessions WHERE complete = 1"
+        ),
+        2
+    );
+}
+
 /// `a_build_never_repairs` (I1): a run with a missing catalog and a
 /// recording of an older derivation writes only its own rows and
 /// re-derives nothing.
