@@ -1840,6 +1840,36 @@ def f(k: heph.types.bash.Kwargs):
                 "    Dep(name = \"a\").nme",
             ],
         ]);
+
+        // The right operand of a short-circuiting `and`/`or` the left decides
+        // never runs at evaluation, so the pre-pass must not evaluate it
+        // either: an attribute error there is no evaluation error.
+        let short_circuited: &[&[&str]] = &[
+            &["x = False and \"s\".nope()"],
+            &["x = False and \"s\".nope"],
+            &["x = True or \"s\".nope()"],
+            &["Mode = enum(\"a\")", "x = False and Mode.nope()"],
+            &["Mode = enum(\"a\")", "x = True or Mode.nope"],
+        ];
+        for &row in short_circuited {
+            let pkg = src(row);
+            let files = [("pkg/BUILD", pkg.as_str())];
+            assert_eq!(lint_ws(&files), Vec::<String>::new(), "{row:#?}");
+            assert_eq!(eval_err(&files), None, "{row:#?}: evaluation fails");
+        }
+        // The same operand on its own is a finding and an evaluation error,
+        // so the rows above are not clean for want of a check.
+        for row in [
+            &["x = \"s\".nope()"][..],
+            &["x = \"s\".nope"],
+            &["Mode = enum(\"a\")", "x = Mode.nope()"],
+            &["Mode = enum(\"a\")", "x = Mode.nope"],
+        ] {
+            let pkg = src(row);
+            let files = [("pkg/BUILD", pkg.as_str())];
+            assert_ne!(lint_ws(&files), Vec::<String>::new(), "{row:#?}");
+            assert!(eval_err(&files).is_some(), "{row:#?}: evaluation succeeds");
+        }
     }
 
     #[test]
@@ -2086,6 +2116,7 @@ def f(k: heph.types.bash.Kwargs):
             ),
             ("dir/BUILD", "A = \"a\"\n"),
             ("dir/more.BUILD", "\nViaDir = record(a = str)\n"),
+            ("lib/é/defs.star", "Accent = record(a = str)\n"),
         ]);
         lint_pkg(tmp.path(), "pkg", false)
             .into_iter()
@@ -2098,7 +2129,7 @@ def f(k: heph.types.bash.Kwargs):
         "load(\"//lib/other.star\", OLib = \"Lib\")",
         "load(\"//lib/multi.star\", \"Multi\")",
         "load(\"//dir\", \"ViaDir\")",
-        "",
+        "load(\"//lib/é/defs.star\", \"Accent\")",
     ];
 
     /// D10: a finding about a declared type names where it was declared,
@@ -2292,6 +2323,16 @@ def f(k: heph.types.bash.Kwargs):
                     "    f(1)",
                 ],
                 &["Expected type `Multi` but got `int` (Multi declared at lib/multi.star:3)"],
+            ),
+            (
+                "declared under a non-ASCII directory",
+                &[
+                    "def f(a: Accent) -> None:",
+                    "    pass",
+                    "def g() -> None:",
+                    "    f(1)",
+                ],
+                &["Expected type `Accent` but got `int` (Accent declared at lib/é/defs.star:1)"],
             ),
             (
                 "a private record",
@@ -2505,15 +2546,28 @@ def f(k: heph.types.bash.Kwargs):
     /// type of `x = <call>` at module level matches the value evaluation
     /// binds `x` to. A call that fails at evaluation must be typed `Never`.
     /// A callable global with no row and no exemption fails, so a new native
-    /// cannot skip the sweep; a wrong declared return type fails here.
+    /// cannot skip the sweep; a wrong declared return type fails here. Method
+    /// calls are typed through `dot` (D11), so every member of the
+    /// [`METHOD_RECEIVERS`] is held to the same rule, by [`METHOD_ROWS`].
     #[test]
     fn module_call_results_sound_against_runtime() {
         use starlark::environment::Module;
         use starlark::values::FrozenHeap;
         use starlark::values::typing::TypeCompiled;
 
-        let callables = callable_globals();
-        let rowed: BTreeSet<String> = SOUND_ROWS.iter().map(|(g, _)| (*g).to_owned()).collect();
+        let mut callables = callable_globals();
+        let members = receiver_members();
+        assert!(
+            callables.is_disjoint(&members),
+            "a global and a member share a key: {:?}",
+            callables.intersection(&members).collect::<Vec<_>>()
+        );
+        callables.extend(members);
+        let rowed: BTreeSet<String> = SOUND_ROWS
+            .iter()
+            .chain(METHOD_ROWS)
+            .map(|(g, _)| (*g).to_owned())
+            .collect();
         let exempt: BTreeSet<String> = SOUND_EXEMPT.iter().map(|(g, _)| (*g).to_owned()).collect();
         let missing: Vec<&String> = callables
             .iter()
@@ -2521,7 +2575,7 @@ def f(k: heph.types.bash.Kwargs):
             .collect();
         assert!(
             missing.is_empty(),
-            "callable globals with no row: {missing:?}"
+            "callable globals or receiver members with no row: {missing:?}"
         );
         let stale: Vec<&String> = rowed
             .iter()
@@ -2530,13 +2584,17 @@ def f(k: heph.types.bash.Kwargs):
             .collect();
         assert!(
             stale.is_empty(),
-            "rows or exemptions for no callable global: {stale:?}"
+            "rows or exemptions for no callable global or receiver member: {stale:?}"
         );
         let both: Vec<&String> = exempt.intersection(&rowed).collect();
         assert!(both.is_empty(), "exempt and rowed: {both:?}");
 
         let mut failures = Vec::new();
-        for (global, lines) in SOUND_ROWS {
+        let rows = SOUND_ROWS
+            .iter()
+            .map(|row| (row, None))
+            .chain(METHOD_ROWS.iter().map(|row| (row, row.0.split_once('.'))));
+        for ((global, lines), method) in rows {
             let (inferred, verdict) = sound_against_runtime(lines, |inferred, value| {
                 let frozen = FrozenHeap::new();
                 Module::with_temp_heap(|module| {
@@ -2549,6 +2607,23 @@ def f(k: heph.types.bash.Kwargs):
             });
             if let Err(why) = verdict {
                 failures.push(format!("{global} {lines:?}: typed `{inferred}`, {why}"));
+            }
+            // A method row typed `Any` checks nothing: it must be on a
+            // receiver the pre-pass never types, and a row on such a
+            // receiver that becomes typed means the list is stale.
+            if let Some((receiver, _)) = method {
+                let untyped = UNTYPED_METHOD_RECEIVERS.contains(&receiver);
+                let any = inferred == Ty::any();
+                if any && !untyped {
+                    failures.push(format!(
+                        "{global} {lines:?}: typed `Any`, so the row checks nothing"
+                    ));
+                } else if !any && untyped {
+                    failures.push(format!(
+                        "{global} {lines:?}: typed `{inferred}` on a receiver \
+                         UNTYPED_METHOD_RECEIVERS says is never typed"
+                    ));
+                }
             }
         }
         // A record or enum the module declares has one identity in the
@@ -2570,6 +2645,160 @@ def f(k: heph.types.bash.Kwargs):
             "unsound call result types:\n{}",
             failures.join("\n")
         );
+    }
+
+    /// The receivers whose members [`module_call_results_sound_against_runtime`]
+    /// sweeps, each with a BUILD expression evaluating to one. A method call
+    /// is typed through `dot` (D11), so a member's declared type moves
+    /// verdicts exactly as a global's return type does. The dialect has no
+    /// `set` value (no `set` global, no literal), so there is none to sweep.
+    const METHOD_RECEIVERS: &[(&str, &str)] = &[
+        ("str", "\"\""),
+        ("list", "[]"),
+        ("dict", "{}"),
+        ("bytes", "bytes(\"\")"),
+    ];
+
+    /// Receivers on which the pre-pass never types a method call: `dot` takes
+    /// a member's declared type only when the receiver has a value (D11), and
+    /// the pre-pass has no list, dict or bytes value (a display or a call
+    /// result is typed at most), so `x = l.pop()` at module level is `Any`.
+    /// Their rows still run and pin that; a `str` row typed `Any` fails, as
+    /// it would check nothing, and a row here that becomes typed fails too.
+    const UNTYPED_METHOD_RECEIVERS: &[&str] = &["list", "dict", "bytes"];
+
+    /// One row of the method half of
+    /// [`module_call_results_sound_against_runtime`]: `<receiver>.<member>`
+    /// and the module's lines, the last of which binds `x` to the call. A
+    /// member can have several rows.
+    const METHOD_ROWS: &[(&str, &[&str])] = &[
+        ("str.capitalize", &["x = \"ab\".capitalize()"]),
+        ("str.codepoints", &["x = \"ab\".codepoints()"]),
+        ("str.count", &["x = \"aba\".count(\"a\")"]),
+        ("str.count", &["x = \"aba\".count(\"a\", 1, 3)"]),
+        ("str.elems", &["x = \"ab\".elems()"]),
+        ("str.endswith", &["x = \"ab\".endswith(\"b\")"]),
+        ("str.endswith", &["x = \"ab\".endswith((\"a\", \"b\"))"]),
+        ("str.find", &["x = \"ab\".find(\"z\")"]),
+        ("str.format", &["x = \"{}-{a}\".format(1, a = 2)"]),
+        ("str.index", &["x = \"ab\".index(\"b\")"]),
+        ("str.isalnum", &["x = \"a1\".isalnum()"]),
+        ("str.isalpha", &["x = \"a1\".isalpha()"]),
+        ("str.isdigit", &["x = \"1\".isdigit()"]),
+        ("str.islower", &["x = \"a\".islower()"]),
+        ("str.isspace", &["x = \" \".isspace()"]),
+        ("str.istitle", &["x = \"Ab\".istitle()"]),
+        ("str.isupper", &["x = \"A\".isupper()"]),
+        ("str.join", &["x = \",\".join([\"a\", \"b\"])"]),
+        ("str.lower", &["x = \"A\".lower()"]),
+        ("str.lstrip", &["x = \" a\".lstrip()"]),
+        ("str.lstrip", &["x = \"xa\".lstrip(\"x\")"]),
+        ("str.partition", &["x = \"a=b\".partition(\"=\")"]),
+        ("str.partition", &["x = \"ab\".partition(\"=\")"]),
+        ("str.removeprefix", &["x = \"ab\".removeprefix(\"a\")"]),
+        ("str.removesuffix", &["x = \"ab\".removesuffix(\"b\")"]),
+        ("str.replace", &["x = \"aa\".replace(\"a\", \"b\", 1)"]),
+        ("str.rfind", &["x = \"aba\".rfind(\"a\")"]),
+        ("str.rindex", &["x = \"aba\".rindex(\"a\")"]),
+        ("str.rpartition", &["x = \"a=b=c\".rpartition(\"=\")"]),
+        ("str.rsplit", &["x = \"a,b,c\".rsplit(\",\", 1)"]),
+        ("str.rsplit", &["x = \"a b\".rsplit()"]),
+        ("str.rstrip", &["x = \"a \".rstrip()"]),
+        ("str.split", &["x = \"a,b\".split(\",\")"]),
+        ("str.split", &["x = \"a b\".split()"]),
+        ("str.splitlines", &["x = \"a\\nb\".splitlines()"]),
+        ("str.splitlines", &["x = \"a\\nb\".splitlines(True)"]),
+        ("str.startswith", &["x = \"ab\".startswith(\"a\")"]),
+        ("str.strip", &["x = \" a \".strip()"]),
+        ("str.title", &["x = \"ab cd\".title()"]),
+        ("str.upper", &["x = \"a\".upper()"]),
+        ("str.split", &["S = \"a,b\"", "x = S.split(\",\")"]),
+        ("bytes.elems", &["b = bytes(\"ab\")", "x = b.elems()"]),
+        ("list.append", &["l = list([1])", "x = l.append(2)"]),
+        ("list.clear", &["l = list([1])", "x = l.clear()"]),
+        ("list.extend", &["l = list([1])", "x = l.extend([2])"]),
+        (
+            "list.index",
+            &["l = list([\"a\", \"b\"])", "x = l.index(\"b\")"],
+        ),
+        ("list.insert", &["l = list([1])", "x = l.insert(0, 2)"]),
+        ("list.pop", &["l = list([\"a\", \"b\"])", "x = l.pop()"]),
+        ("list.pop", &["l = list([1, \"a\"])", "x = l.pop(0)"]),
+        ("list.pop", &["l = \"a,b\".split(\",\")", "x = l.pop()"]),
+        ("list.remove", &["l = list([1])", "x = l.remove(1)"]),
+        ("dict.clear", &["d = dict(a = 1)", "x = d.clear()"]),
+        ("dict.get", &["d = dict(a = 1)", "x = d.get(\"a\")"]),
+        ("dict.get", &["d = dict(a = 1)", "x = d.get(\"b\")"]),
+        ("dict.get", &["d = dict(a = 1)", "x = d.get(\"b\", \"z\")"]),
+        ("dict.items", &["d = dict(a = 1)", "x = d.items()"]),
+        ("dict.keys", &["d = dict(a = 1)", "x = d.keys()"]),
+        ("dict.pop", &["d = dict(a = 1)", "x = d.pop(\"a\")"]),
+        ("dict.pop", &["d = dict(a = 1)", "x = d.pop(\"b\", \"z\")"]),
+        ("dict.popitem", &["d = dict(a = 1)", "x = d.popitem()"]),
+        (
+            "dict.setdefault",
+            &["d = dict(a = 1)", "x = d.setdefault(\"b\")"],
+        ),
+        (
+            "dict.setdefault",
+            &["d = dict(a = 1)", "x = d.setdefault(\"a\", 2)"],
+        ),
+        ("dict.update", &["d = dict(a = 1)", "x = d.update(b = 2)"]),
+        (
+            "dict.update",
+            &["d = dict(a = 1)", "x = d.update([(\"b\", 2)])"],
+        ),
+        ("dict.values", &["d = dict(a = 1)", "x = d.values()"]),
+    ];
+
+    /// Every member the checker types on a [`METHOD_RECEIVERS`] receiver, as
+    /// `<receiver>.<member>`, with each receiver's typed members held equal
+    /// to the attributes evaluation gives the value: a member evaluation has
+    /// and lint lacks makes lint stricter than evaluation (I2), and one lint
+    /// has and evaluation lacks is a declared type no call can be checked
+    /// against.
+    ///
+    /// Every member is kept, callable or not: today every member of these
+    /// receivers is a method, and a non-method attribute's type is the same
+    /// declared surface, held to the same rule (its row reads it).
+    fn receiver_members() -> BTreeSet<String> {
+        let lines: Vec<String> = METHOD_RECEIVERS
+            .iter()
+            .map(|(name, expr)| format!("r_{name} = {expr}"))
+            .collect();
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let tmp = ws(&[("pkg/BUILD", &src(&lines))]);
+        let result = crate::pluginbuildfile::checks::test_ws::eval_pkg(tmp.path(), "pkg")
+            .unwrap_or_else(|e| panic!("the receivers evaluate: {}", chain(&e)));
+
+        let mut out = BTreeSet::new();
+        let mut drift = Vec::new();
+        for (name, _) in METHOD_RECEIVERS {
+            let value = result
+                .module
+                .get(&format!("r_{name}"))
+                .unwrap_or_else(|e| panic!("r_{name} is bound: {e}"));
+            let value = value.value();
+            let typed: BTreeSet<String> = starlark::typing::members(&Ty::of_value(value))
+                .into_iter()
+                .map(|(member, _)| member)
+                .collect();
+            let runtime: BTreeSet<String> = value.dir_attr().into_iter().collect();
+            if typed != runtime {
+                drift.push(format!(
+                    "{name}: typed only {:?}, runtime only {:?}",
+                    typed.difference(&runtime).collect::<Vec<_>>(),
+                    runtime.difference(&typed).collect::<Vec<_>>(),
+                ));
+            }
+            out.extend(typed.into_iter().map(|member| format!("{name}.{member}")));
+        }
+        assert!(
+            drift.is_empty(),
+            "typed members differ from evaluation's attributes:\n{}",
+            drift.join("\n")
+        );
+        out
     }
 
     /// Constructor calls of a record and an enum the module declares, for
