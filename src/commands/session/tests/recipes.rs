@@ -144,7 +144,7 @@ fn recipes_run() {
 
     // The built-in ones through the engine, as `heph session query --from`
     // runs them: the columns the docs list, and the fixture's rows.
-    let expected: [(&str, &[&[&str]]); 5] = [
+    let expected: [(&str, &[&[&str]]); 6] = [
         (
             "time_by_phase",
             &[
@@ -169,6 +169,12 @@ fn recipes_run() {
         (
             "waiting_by_load",
             &[&["cbszjpg001", "admission", "0", "0", "1000"]],
+        ),
+        // Its cpu pool has no sample to be set against: the whole session
+        // reads unknown.
+        (
+            "resources_vs_machine",
+            &[&["cbszjpg001", "cpu", "0", "0", "0", "12000"]],
         ),
     ];
     assert_eq!(expected.len(), RECIPES.len());
@@ -536,6 +542,233 @@ fn waiting_split_by_load() {
     }
     assert_eq!(
         recipe_rows("waiting_by_load", &all),
+        want_all,
+        "all at once"
+    );
+}
+
+/// One row of the spec's "Resources vs machine" table.
+struct VersusCase {
+    row: &'static str,
+    /// The session's end, ms after its start at 0; `None` while it runs.
+    end_ms: Option<i64>,
+    /// `(pool, ms, held, capacity)`: `heph.pool.held` and
+    /// `heph.pool.capacity` rows.
+    pools: Vec<(&'static str, i64, f64, f64)>,
+    /// `(metric, ms, value)`.
+    metrics: Vec<(&'static str, i64, f64)>,
+    /// `(pool, declared above use ms, use above declared ms, matched ms,
+    /// unknown ms)`, by pool.
+    want: Vec<(&'static str, i64, i64, i64, i64)>,
+}
+
+/// CPU busy `cpu` at each of `ms`.
+fn busy_at(ms: impl IntoIterator<Item = i64>, cpu: f64) -> Vec<(&'static str, i64, f64)> {
+    ms.into_iter().map(|t| (BUSY, t, cpu)).collect()
+}
+
+/// A pool row: `held` of `capacity`.
+fn held(pool: &'static str, ms: i64, held: f64, capacity: f64) -> (&'static str, i64, f64, f64) {
+    (pool, ms, held, capacity)
+}
+
+fn versus_db() -> rusqlite::Connection {
+    let db = rusqlite::Connection::open_in_memory().expect("in-memory db");
+    db.execute_batch(
+        "CREATE TABLE metrics (session_id, name, time_us, value, attributes);
+         CREATE TABLE sessions (session_id, started_ms, ended_ms);",
+    )
+    .expect("schema");
+    db
+}
+
+fn write_versus_case(db: &rusqlite::Connection, session: &str, case: &VersusCase) {
+    db.execute(
+        "INSERT INTO sessions VALUES (?1, 0, ?2)",
+        rusqlite::params![session, case.end_ms],
+    )
+    .expect("the session");
+    for &(pool, ms, held, capacity) in &case.pools {
+        for (name, value) in [("heph.pool.held", held), ("heph.pool.capacity", capacity)] {
+            db.execute(
+                "INSERT INTO metrics VALUES (?1, ?2, ?3, ?4, json_object('heph.pool', ?5))",
+                rusqlite::params![session, name, ms * 1_000, value, pool],
+            )
+            .expect("a pool row");
+        }
+    }
+    for &(name, ms, value) in &case.metrics {
+        db.execute(
+            "INSERT INTO metrics VALUES (?1, ?2, ?3, ?4, NULL)",
+            rusqlite::params![session, name, ms * 1_000, value],
+        )
+        .expect("a metric");
+    }
+}
+
+fn versus_want(session: &str, case: &VersusCase) -> Vec<Vec<String>> {
+    case.want
+        .iter()
+        .map(|&(pool, declared, used, matched, unknown)| {
+            let mut row = vec![session.to_owned(), pool.to_owned()];
+            row.extend([declared, used, matched, unknown].map(|ms| (ms * 1_000).to_string()));
+            row
+        })
+        .collect()
+}
+
+/// Spec row `resources_vs_machine`: every row of the spec's "Resources vs
+/// machine" table, each as its own session, then all of them in one
+/// database. Sessions start at 0; a sample covers the interval since the
+/// one before it, so the first sample of each case only opens the timeline.
+#[test]
+fn resources_vs_machine() {
+    const LIMIT: &str = "heph.machine.cpu.limit";
+    const MEM_LIMIT: &str = "heph.machine.memory.limit";
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let cases = [
+        VersusCase {
+            row: "cpu pool 8/8 held, machine 30% busy, for 10 s: 10 s declared above use",
+            end_ms: Some(10_000),
+            pools: vec![held("cpu", 0, 8.0, 8.0)],
+            metrics: busy_at((0..=10).map(|s| s * 1000), 0.3),
+            want: vec![("cpu", 10_000, 0, 0, 0)],
+        },
+        VersusCase {
+            row: "cpu pool 2/8 held, machine 95% busy: use above declared",
+            end_ms: Some(2000),
+            pools: vec![held("cpu", 0, 2.0, 8.0)],
+            metrics: busy_at([0, 1000, 2000], 0.95),
+            want: vec![("cpu", 0, 2000, 0, 0)],
+        },
+        VersusCase {
+            row: "cpu pool 8/8 held, machine 95% busy: matched",
+            end_ms: Some(2000),
+            pools: vec![held("cpu", 0, 8.0, 8.0)],
+            metrics: busy_at([0, 1000, 2000], 0.95),
+            want: vec![("cpu", 0, 0, 2000, 0)],
+        },
+        VersusCase {
+            row: "held exactly 90% and busy exactly 50%: matched (and held at 90% \
+                  against busy 30% is declared above use)",
+            end_ms: Some(2000),
+            pools: vec![held("cpu", 0, 9.0, 10.0)],
+            metrics: vec![(BUSY, 0, 0.5), (BUSY, 1000, 0.5), (BUSY, 2000, 0.3)],
+            want: vec![("cpu", 1000, 0, 1000, 0)],
+        },
+        VersusCase {
+            row: "a pool capacity of 16 on a quota of 4 CPUs: 8/16 held against busy \
+                  over the quota (8 held is more than the 4 CPUs, yet half the pool)",
+            end_ms: Some(2000),
+            pools: vec![held("cpu", 0, 8.0, 16.0)],
+            metrics: [vec![(LIMIT, 0, 4.0)], busy_at([0, 1000, 2000], 0.3)].concat(),
+            want: vec![("cpu", 0, 0, 2000, 0)],
+        },
+        VersusCase {
+            row: "memory pool 30/32 GiB held, machine memory 20% used: declared above use, \
+                  for the memory pool",
+            end_ms: Some(2000),
+            pools: vec![held("memory", 0, 30.0 * GIB, 32.0 * GIB)],
+            metrics: vec![
+                (MEM_LIMIT, 0, 64.0 * GIB),
+                (USED, 0, 12.8 * GIB),
+                (USED, 1000, 12.8 * GIB),
+                (USED, 2000, 12.8 * GIB),
+                (BUSY, 0, 0.95),
+                (BUSY, 1000, 0.95),
+                (BUSY, 2000, 0.95),
+            ],
+            want: vec![("memory", 2000, 0, 0, 0)],
+        },
+        VersusCase {
+            row: "no pool rows (an all-hit build): no rows",
+            end_ms: Some(2000),
+            pools: vec![],
+            metrics: busy_at([0, 1000, 2000], 0.3),
+            want: vec![],
+        },
+        VersusCase {
+            row: "pool rows but the CPU source stopped: unknown from the stop on \
+                  (memory samples go on, and are not CPU)",
+            end_ms: Some(10_000),
+            pools: vec![held("cpu", 0, 8.0, 8.0)],
+            metrics: [
+                vec![(MEM_LIMIT, 0, 100.0)],
+                busy_at([0, 1000, 2000, 3000], 0.3),
+                (0..=10).map(|s| (USED, s * 1000, 10.0)).collect(),
+            ]
+            .concat(),
+            want: vec![("cpu", 3000, 0, 0, 7000)],
+        },
+        VersusCase {
+            row: "a pool row every 250 ms and a sample every 1 s: each interval uses the \
+                  pool value holding over it, time-weighted (neither its first nor last value)",
+            end_ms: Some(2000),
+            pools: vec![
+                held("cpu", 0, 8.0, 8.0),
+                held("cpu", 250, 8.0, 8.0),
+                held("cpu", 500, 0.0, 8.0),
+                held("cpu", 750, 0.0, 8.0),
+                held("cpu", 1000, 8.0, 8.0),
+                held("cpu", 1250, 8.0, 8.0),
+                held("cpu", 1500, 8.0, 8.0),
+                held("cpu", 1750, 6.0, 8.0),
+            ],
+            metrics: busy_at([0, 1000, 2000], 0.3),
+            // (0, 1 s]: a mean of 0.5 held (matched); (1 s, 2 s]: 0.9375.
+            want: vec![("cpu", 1000, 0, 1000, 0)],
+        },
+        VersusCase {
+            row: "a pool whose last row came before the last sample: the last value holds \
+                  until End",
+            end_ms: Some(4000),
+            pools: vec![held("cpu", 0, 2.0, 8.0), held("cpu", 1500, 8.0, 8.0)],
+            metrics: busy_at([0, 1000, 2000, 3000, 4000], 0.3),
+            // (1 s, 2 s] holds 0.625 on average: matched, like (0, 1 s].
+            want: vec![("cpu", 2000, 0, 2000, 0)],
+        },
+        VersusCase {
+            row: "a pool the machine has no counterpart for (docker, sandbox): no row",
+            end_ms: Some(2000),
+            pools: vec![held("docker", 0, 2.0, 2.0), held("sandbox", 0, 4.0, 4.0)],
+            metrics: busy_at([0, 1000, 2000], 0.3),
+            want: vec![],
+        },
+        VersusCase {
+            row: "time before the pool's first row and before the first sample, and a \
+                  gap over 2 s: unknown",
+            end_ms: Some(10_000),
+            pools: vec![held("cpu", 1000, 8.0, 8.0)],
+            metrics: busy_at([2000, 3000, 6000, 7000], 0.3),
+            // Classified: (2, 3] and (6, 7]; (3, 6] is a 3 s gap.
+            want: vec![("cpu", 2000, 0, 0, 8000)],
+        },
+        VersusCase {
+            row: "a live session: up to its last row",
+            end_ms: None,
+            pools: vec![held("cpu", 0, 8.0, 8.0)],
+            metrics: busy_at([0, 1000, 2000], 0.3),
+            want: vec![("cpu", 2000, 0, 0, 0)],
+        },
+    ];
+
+    let all = versus_db();
+    let mut want_all = Vec::new();
+    for (i, case) in cases.iter().enumerate() {
+        let db = versus_db();
+        write_versus_case(&db, "s", case);
+        assert_eq!(
+            recipe_rows("resources_vs_machine", &db),
+            versus_want("s", case),
+            "{}",
+            case.row
+        );
+        let session = format!("s{i:02}");
+        write_versus_case(&all, &session, case);
+        want_all.extend(versus_want(&session, case));
+    }
+    assert_eq!(
+        recipe_rows("resources_vs_machine", &all),
         want_all,
         "all at once"
     );

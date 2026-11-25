@@ -517,6 +517,7 @@ recordings are kept, 7 days by default.
 | `phase_percentiles` | `class`, `name`, `n`, `p50_ms`, `p90_ms`, `p99_ms` (nearest rank), `max_ms` |
 | `hit_rate_by_package` | `package`, `targets` (resolved: ran, hit or failed; cancelled ones are left out), `hits`, `hit_pct`; lowest rate first |
 | `waiting_by_load` | `session_id`, `phase` (the waiting phase, its span name without heph.), `busy_us`, `spare_us`, `unknown_us` (span-microseconds summed across targets, split by the machine sample covering them; `show` prints the same split on its machine line) |
+| `resources_vs_machine` | `session_id`, `pool` (`cpu` or `memory`: the pools with a machine counterpart), `declared_above_use_us`, `use_above_declared_us`, `matched_us`, `unknown_us` (the session's time, split by the pool's held fraction against the machine's over each sample interval; `show` prints the same totals on the pool's line) |
 
 ```sql
 -- time_by_phase: Where did time go, by class and phase (busy time, not wall time)?
@@ -657,15 +658,99 @@ JOIN marks b ON b.session_id = w.session_id AND b.x = w.e
 WHERE w.e > w.s
 GROUP BY w.session_id, w.phase
 ORDER BY w.session_id, w.phase;
+
+-- resources_vs_machine: Do the declared resources match what the machine used, by pool?
+-- Declared above use: the pool at 90% held or more while the machine is under 50%.
+-- Use above declared: the machine at 90% or more while the pool is under 50% held.
+-- Matched: the rest. Unknown: no sample or no pool row covers the time.
+-- cpu against CPU busy, memory against memory used over RAM. Other pools have no row.
+-- The catalog keeps no machine samples: over it everything reads unknown.
+-- Use --full or --from.
+WITH pool AS (
+  SELECT session_id, pool, time_us AS x, held FROM (
+    SELECT session_id, json_extract(attributes, '$."heph.pool"') AS pool, time_us,
+           1.0 * max(CASE name WHEN 'heph.pool.held' THEN value END)
+             / max(CASE name WHEN 'heph.pool.capacity' THEN value END) AS held
+    FROM metrics WHERE name IN ('heph.pool.held', 'heph.pool.capacity')
+    GROUP BY session_id, pool, time_us)
+  WHERE pool IN ('cpu', 'memory') AND held >= 0
+), area AS (
+  SELECT session_id, pool, x, held,
+         coalesce(sum(held * (nx - x)) OVER (PARTITION BY session_id, pool ORDER BY x
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0) AS area
+  FROM (SELECT *, lead(x) OVER (PARTITION BY session_id, pool ORDER BY x) AS nx FROM pool)
+), machine AS (
+  SELECT session_id, 'cpu' AS pool, time_us AS x,
+         CASE WHEN max(value) BETWEEN 0 AND 1 THEN max(value) END AS m
+  FROM metrics WHERE name = 'heph.machine.cpu.busy'
+  GROUP BY session_id, time_us
+  UNION ALL
+  SELECT u.session_id, 'memory', u.x,
+         CASE WHEN u.used >= 0 AND l.mem_limit > 0 THEN 1.0 * u.used / l.mem_limit END
+  FROM (SELECT session_id, time_us AS x, max(value) AS used
+        FROM metrics WHERE name = 'heph.machine.memory.used'
+        GROUP BY session_id, time_us) u
+  LEFT JOIN (SELECT session_id, max(value) AS mem_limit
+             FROM metrics WHERE name = 'heph.machine.memory.limit'
+             GROUP BY session_id) l ON l.session_id = u.session_id
+), timeline AS (
+  SELECT session_id, pool, x, 0 AS kind, held, area, NULL AS m FROM area
+  UNION ALL
+  SELECT session_id, pool, x, 1, NULL, NULL, m FROM machine
+), grouped AS (
+  SELECT *, sum(1 - kind) OVER (PARTITION BY session_id, pool ORDER BY x, kind
+                                ROWS UNBOUNDED PRECEDING) AS grp
+  FROM timeline
+), samples AS (
+  SELECT session_id, pool, x AS t, kind, m,
+         first_value(area) OVER g
+           + first_value(held) OVER g * (x - first_value(x) OVER g) AS f
+  FROM grouped
+  WINDOW g AS (PARTITION BY session_id, pool, grp ORDER BY x, kind)
+), intervals AS (
+  SELECT session_id, pool, t, m, f,
+         lag(t) OVER w AS prev, lag(f) OVER w AS fprev
+  FROM samples WHERE kind = 1
+  WINDOW w AS (PARTITION BY session_id, pool ORDER BY t)
+), bounds AS (
+  SELECT p.session_id, p.pool, p.fx, s.started_ms * 1000 AS a,
+         coalesce(s.ended_ms * 1000, p.last) AS b
+  FROM (SELECT session_id, pool, min(CASE kind WHEN 0 THEN x END) AS fx, max(x) AS last
+        FROM timeline GROUP BY session_id, pool) p
+  JOIN sessions s ON s.session_id = p.session_id
+  WHERE p.fx IS NOT NULL
+), pieces AS (
+  SELECT i.session_id, i.pool, i.m,
+         max(0, min(i.t, b.b) - max(i.prev, b.fx, b.a)) AS len,
+         round((i.f - CASE WHEN i.prev >= b.fx THEN i.fprev ELSE 0 END)
+               / (i.t - max(i.prev, b.fx)), 6) AS held
+  FROM intervals i
+  JOIN bounds b ON b.session_id = i.session_id AND b.pool = i.pool
+  WHERE i.t - i.prev <= 2000000 AND i.m IS NOT NULL AND i.t > b.fx
+)
+SELECT b.session_id, b.pool,
+       coalesce(sum(CASE WHEN c.held >= 0.9 AND c.m < 0.5 THEN c.len END), 0)
+         AS declared_above_use_us,
+       coalesce(sum(CASE WHEN c.m >= 0.9 AND c.held < 0.5 THEN c.len END), 0)
+         AS use_above_declared_us,
+       coalesce(sum(CASE WHEN c.held >= 0.9 AND c.m < 0.5 THEN 0
+                         WHEN c.m >= 0.9 AND c.held < 0.5 THEN 0
+                         ELSE c.len END), 0) AS matched_us,
+       max(b.b - b.a, 0) - coalesce(sum(c.len), 0) AS unknown_us
+FROM bounds b
+LEFT JOIN pieces c ON c.session_id = b.session_id AND c.pool = b.pool
+GROUP BY b.session_id, b.pool
+ORDER BY b.session_id, b.pool;
 ```
 
 Over the catalog, `hit_rate_by_package` counts hits from `targets`, which
 keeps them; the other four read `spans`, which the catalog keeps only for
 targets that ran (`--full` reads every recording instead).
-`waiting_by_load` reads the machine samples in `metrics` too, which the
-catalog does not keep at all, so over it every wait reads unknown. Their
-comment says so, and `query --format json` names `spans` (and, for
-`waiting_by_load`, `metrics`) in `coverage.partial`.
+`waiting_by_load` and `resources_vs_machine` read the machine samples in
+`metrics`, which the catalog does not keep at all, so over it every wait,
+and every pool's whole session, reads unknown. Their comment says so, and
+`query --format json` names `spans` (and, for those two, `metrics`) in
+`coverage.partial`.
 
 The recipes are not part of the explorer contract (I9). A release may
 change a recipe's SQL, its columns or its name. A script that runs one
