@@ -621,7 +621,11 @@ impl BuildState {
             BuildEventKind::LocalCacheHit { .. }
             | BuildEventKind::LocalCacheMiss { .. }
             | BuildEventKind::RemoteCacheHit { .. }
-            | BuildEventKind::RemoteCacheMiss { .. } => {}
+            | BuildEventKind::RemoteCacheMiss { .. }
+            | BuildEventKind::RemoteTierMiss { .. } => {}
+            // Run-level snapshot diagnostics: the CI view prints them.
+            BuildEventKind::CacheSnapshotState { .. }
+            | BuildEventKind::SnapshotJournalPending { .. } => {}
             // The per-target hit bit is the model's; a retracted hit clears it.
             BuildEventKind::CacheOutcome {
                 addr,

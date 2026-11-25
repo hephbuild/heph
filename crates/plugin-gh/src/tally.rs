@@ -470,7 +470,12 @@ impl Tally {
             | BuildEventKind::RemoteCacheHit { addr, .. } => {
                 self.ensure(addr, ev.at_unix_ms);
             }
-            BuildEventKind::RemoteCacheMiss { .. } | BuildEventKind::LocalCacheMiss { .. } => {}
+            BuildEventKind::RemoteCacheMiss { .. }
+            | BuildEventKind::LocalCacheMiss { .. }
+            | BuildEventKind::RemoteTierMiss { .. } => {}
+            // Run-level snapshot diagnostics: the CI log prints them.
+            BuildEventKind::CacheSnapshotState { .. }
+            | BuildEventKind::SnapshotJournalPending { .. } => {}
 
             BuildEventKind::CacheOutcome { addr, outcome, .. } => {
                 self.cache.apply(&ev.kind);
