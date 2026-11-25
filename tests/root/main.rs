@@ -33,6 +33,7 @@ mod coreutils_cli;
 mod darwin_linker;
 mod execrunner_gate;
 mod gc_cli;
+mod json_cli;
 mod json_print_gate;
 mod lint_gate;
 mod log_cmd;
