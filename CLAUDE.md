@@ -78,7 +78,14 @@ Where the space goes, measured on 2026-11-25 with 8 worktrees building at once:
   The 5–17 GB of incremental state per worktree is the largest part. The rest
   is the same crate built many times over: `cargo test -p A -p B` resolves
   features differently from another `-p` set, so each set builds its own copy
-  of every shared workspace crate (21 of `engine` in one tree).
+  of every shared workspace crate (21 of `engine` in one tree). A local devenv
+  shell now resolves features for the whole workspace whatever `-p` selects
+  (`enterShell` in `devenv.nix`), so test builds share one copy per crate. CI
+  does not, and keeps building the release artifacts as plain cargo does.
+  The trade-off: locally, a crate that uses a dependency feature it never
+  declared still compiles, because another member turns it on. CI's `-p`
+  shards are where that shows up. Fix it by declaring the feature, not by
+  scoping the shard.
 - **kache's store: about 10 GB, under 1 GB of it its own.** The rest is shared
   with `target/` dirs as reflinks.
 - **Leaked test tempdirs in `$TMPDIR`**, if a test used `tempfile::tempdir()` where
