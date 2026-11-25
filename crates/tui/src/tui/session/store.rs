@@ -436,6 +436,16 @@ impl Opened {
             copy: (!files.is_empty()).then_some(TempCopy { files }),
         }
     }
+
+    /// The connection, and the temp files it reads from, which the caller now
+    /// removes.
+    pub(crate) fn into_parts(self) -> (Connection, Vec<PathBuf>) {
+        let files = self
+            .copy
+            .map(|mut c| std::mem::take(&mut c.files))
+            .unwrap_or_default();
+        (self.conn, files)
+    }
 }
 
 #[derive(Debug)]
@@ -1639,10 +1649,15 @@ fn derive_into(path: &Path, pending: Pending, durable: bool) -> anyhow::Result<(
 /// what a foreign or live one always gets. The copy is removed when the
 /// result drops.
 pub fn derived_copy(root: &Path, source: &Path, need: Need) -> anyhow::Result<Opened> {
-    let tmp = tmp_dir(root);
+    derived_copy_in(&tmp_dir(root), source, need)
+}
+
+/// [`derived_copy`], with the copy in `tmp`: a foreign recording's, which
+/// knows its temp directory and not the sessions root.
+pub fn derived_copy_in(tmp: &Path, source: &Path, need: Need) -> anyhow::Result<Opened> {
     std::fs::DirBuilder::new()
         .recursive(true)
-        .create(&tmp)
+        .create(tmp)
         .with_context(|| format!("creating {}", tmp.display()))?;
     let base = tmp.join(format!(
         "derived-{}-{}.db",

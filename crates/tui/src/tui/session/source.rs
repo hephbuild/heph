@@ -243,11 +243,26 @@ pub(crate) fn open_repaired(
     dir: &Path,
     note: &(dyn Fn(&str) + Send + Sync),
 ) -> anyhow::Result<store::Opened> {
-    let need = store::Need::default();
+    open_repaired_with(root, dir, store::Need::default(), note)
+}
+
+/// [`open_repaired`], also giving the recording what `need` asks (a query's
+/// indexes, built under the same lock on its first need). Only a
+/// re-derivation is said on stderr and falls back to a temp copy: a
+/// recording that cannot be indexed is read without its indexes.
+pub(crate) fn open_repaired_with(
+    root: &Path,
+    dir: &Path,
+    need: store::Need,
+    note: &(dyn Fn(&str) + Send + Sync),
+) -> anyhow::Result<store::Opened> {
     match store::pending_local(dir, need) {
         Ok(Some(p)) if p.any() => {
-            note("heph: re-deriving 1 recording\n");
+            if p.rederive {
+                note("heph: re-deriving 1 recording\n");
+            }
             match store::upgrade_local(dir, need) {
+                Ok(store::Upgraded::Done) if !p.rederive => {}
                 Ok(store::Upgraded::Done) => {
                     if let Err(e) = super::catalog::replace(root, dir) {
                         tracing::debug!(
@@ -258,7 +273,7 @@ pub(crate) fn open_repaired(
                     }
                 }
                 Ok(store::Upgraded::Current) => {}
-                failed => {
+                failed if p.rederive => {
                     tracing::debug!(
                         dir = %dir.display(),
                         outcome = ?failed.map_err(|e| format!("{e:#}")),
@@ -266,6 +281,11 @@ pub(crate) fn open_repaired(
                     );
                     return store::derived_copy(root, &dir.join(store::FILE), need);
                 }
+                failed => tracing::debug!(
+                    dir = %dir.display(),
+                    outcome = ?failed.map_err(|e| format!("{e:#}")),
+                    "reading a recording without its indexes"
+                ),
             }
         }
         Ok(_) => {}

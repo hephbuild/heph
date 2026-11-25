@@ -45,6 +45,10 @@ pub struct Local {
 #[derive(Debug)]
 pub struct Foreign {
     file: ForeignFile,
+    /// The file's explorer rows re-derived into a temp copy, read in its
+    /// place, when an older heph derived them (D14). The file itself is
+    /// never written.
+    derived: Option<Opened>,
     /// The download a URL was fetched into, removed with this.
     download: Option<tempfile::TempPath>,
     /// What the user named, for messages: the path, or the URL without its
@@ -94,8 +98,10 @@ impl Recording {
     /// The `.hephsession` (or bare `session.db`) at `path`, decompressing
     /// into `tmp_dir` when it must.
     pub fn open_foreign(path: &Path, tmp_dir: &Path) -> Result<Self, ForeignError> {
+        let file = hephsession::open(path, tmp_dir)?;
         Ok(Self::Foreign(Foreign {
-            file: hephsession::open(path, tmp_dir)?,
+            derived: derive_foreign(&file, tmp_dir)?,
+            file,
             download: None,
             origin: path.display().to_string(),
         }))
@@ -113,6 +119,7 @@ impl Recording {
         // user): the caller names `origin`.
         let file = hephsession::open(&download, tmp_dir)?;
         Ok(Self::Foreign(Foreign {
+            derived: derive_foreign(&file, tmp_dir)?,
             file,
             download: Some(download),
             origin,
@@ -126,7 +133,7 @@ impl Recording {
     pub fn conn(&self) -> &Connection {
         match self {
             Self::Local(l) => &l.opened.conn,
-            Self::Foreign(f) => &f.file.conn,
+            Self::Foreign(f) => f.conn(),
         }
     }
 
@@ -170,7 +177,31 @@ impl Recording {
     }
 }
 
+/// A copy of `file` with its explorer rows re-derived, when an older heph
+/// derived them; `None` when they are current (or newer, never downgraded).
+fn derive_foreign(file: &ForeignFile, tmp_dir: &Path) -> Result<Option<Opened>, ForeignError> {
+    let io = |e: anyhow::Error| ForeignError::Io(e.context("re-derive the recording"));
+    let pending = store::pending(&file.conn, store::Need::default())
+        .map_err(|e| io(anyhow::Error::new(e)))?;
+    if !pending.rederive {
+        return Ok(None);
+    }
+    let path = file
+        .conn
+        .path()
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| io(anyhow::anyhow!("the recording has no file to copy")))?;
+    store::derived_copy_in(tmp_dir, Path::new(path), store::Need::default())
+        .map(Some)
+        .map_err(io)
+}
+
 impl Foreign {
+    /// The connection a viewer reads: the re-derived copy, when there is one.
+    pub fn conn(&self) -> &Connection {
+        self.derived.as_ref().map_or(&self.file.conn, |d| &d.conn)
+    }
+
     /// What was opened: the path the user named.
     pub fn source(&self) -> &Path {
         &self.file.source
@@ -187,8 +218,7 @@ impl Foreign {
         let seq = i64::try_from(seq).unwrap_or(i64::MAX);
         let cap = i64::try_from(NOTICE_READ_CAP).unwrap_or(i64::MAX);
         let text = self
-            .file
-            .conn
+            .conn()
             .query_row(
                 "SELECT CAST(substr(CAST(text AS BLOB), 1, ?4) AS BLOB) FROM notices
                  WHERE addr = ?1 AND seq = ?2 AND name = ?3 ORDER BY rowid LIMIT 1",
@@ -205,7 +235,7 @@ impl Foreign {
     /// viewer cuts them.
     pub fn failure_logs(&self, addr: &str) -> rusqlite::Result<Vec<(Vec<u8>, u64)>> {
         Ok(
-            read_failure_logs(&self.file.conn, Some(addr), FAILURE_LOGS_CAP)?
+            read_failure_logs(self.conn(), Some(addr), FAILURE_LOGS_CAP)?
                 .into_iter()
                 .map(|l| (l.log, l.cut_bytes))
                 .collect(),
@@ -268,7 +298,7 @@ pub struct ForeignSource {
 
 impl ForeignSource {
     fn new(f: Foreign) -> anyhow::Result<Self> {
-        let conn = &f.file.conn;
+        let conn = f.conn();
         let what = || format!("reading {}", f.origin);
         let meta = store::read_meta(conn).with_context(what)?;
         let state = row_state(conn).with_context(what)?;
@@ -287,10 +317,23 @@ impl ForeignSource {
         let failure_logs = read_failure_logs(conn, None, FAILURE_LOGS_CAP).with_context(what)?;
         let Foreign {
             file,
+            derived,
             download,
             origin,
         } = f;
-        let (conn, decompressed) = file.into_parts();
+        // The re-derived copy is read in place of the file, which then has
+        // nothing more to give: it closes now.
+        let (conn, decompressed) = match derived {
+            Some(d) => {
+                let (_, decompressed) = file.into_parts();
+                let (conn, copies) = d.into_parts();
+                (conn, copies.into_iter().chain(decompressed).collect())
+            }
+            None => {
+                let (conn, decompressed) = file.into_parts();
+                (conn, decompressed.into_iter().collect::<Vec<_>>())
+            }
+        };
         let download = download.and_then(|d| match d.keep() {
             Ok(path) => Some(path),
             Err(e) => {
