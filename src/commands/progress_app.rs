@@ -69,9 +69,8 @@ where
     }
 }
 
-/// Run `body` under the TUI (on a terminal, unless `no_tui`) or the line
-/// backend, and return what it returns — the exit code is the body's.
-/// `dashboard` is the command's `-D` ([`DashboardArgs`]).
+/// [`run_with_progress_out`] for a command without output flags: `auth login`,
+/// which runs sign-in commands that talk to the user.
 pub(crate) async fn run_with_progress<F, Fut>(
     label: impl Into<String>,
     sink: LogSink,
@@ -89,8 +88,11 @@ where
     run_progress_app(label, sink, session, interactive, dashboard, shutdown, body).await
 }
 
-/// [`run_with_progress`] for a command with output flags: under any of them
-/// the TUI stays off, so stdout carries the document and nothing else (I1).
+/// Run `body` under the TUI (on a terminal, unless `no_tui`) or the line
+/// backend, and return what it returns — the exit code is the body's.
+/// `dashboard` is the command's `-D` ([`DashboardArgs`]). Under any of the
+/// output flags the TUI stays off, so stdout carries the document and nothing
+/// else (I1).
 #[expect(
     clippy::too_many_arguments,
     reason = "run_with_progress's arguments plus the output flags"
@@ -113,7 +115,7 @@ where
     run_progress_app(label, sink, session, interactive, dashboard, shutdown, body).await
 }
 
-/// [`run_with_progress`] with the TUI decision already made: `interactive`.
+/// [`run_with_progress_out`] with the TUI decision already made: `interactive`.
 async fn run_progress_app<F, Fut>(
     label: impl Into<String>,
     sink: LogSink,
@@ -135,7 +137,7 @@ where
 }
 
 /// Build the engine `global` describes, then run `body` on it under
-/// [`run_with_progress`]. `body` gets the engine and a request on it from
+/// [`run_progress_app`]. `body` gets the engine and a request on it from
 /// [`engine_request`]; the exit code is the body's.
 ///
 /// The terminal and `--no-tui` (`global.no_tui`) decide the TUI. `dashboard`
