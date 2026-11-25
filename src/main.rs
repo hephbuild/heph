@@ -194,7 +194,11 @@ fn main() -> ExitCode {
     // command or bad flags. Keeping the matches also lets the telemetry
     // reporter enumerate the exact args/flags set — generically, for every
     // command, with no per-command list.
-    let matches = soft_match.unwrap_or_else(|e| e.exit());
+    // An output flag on a command without a JSON form gets a tip naming what
+    // to use instead; the exit code stays clap's 2.
+    let matches = soft_match.unwrap_or_else(|e| {
+        commands::json_contract::with_no_json_hint(e, &Cli::command(), std::env::args_os()).exit()
+    });
     let cli = match Cli::from_arg_matches(&matches) {
         Ok(cli) => cli,
         Err(e) => e.exit(),

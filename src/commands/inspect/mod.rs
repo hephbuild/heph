@@ -11,7 +11,7 @@ mod packages;
 mod path;
 mod revdeps;
 mod spec;
-mod states;
+pub(crate) mod states;
 
 use crate::tui::session::SessionSlot;
 use clap::{Args, Subcommand};

@@ -60,8 +60,8 @@ pub struct ListRow {
 }
 
 /// How far a session got, as PROGRESS shows it.
-#[derive(Debug, Serialize)]
-struct Progress {
+#[derive(Debug, Serialize, output::Shape)]
+pub(crate) struct Progress {
     /// Matched targets that finished once `total` is known; before that,
     /// every target that finished.
     done: u64,

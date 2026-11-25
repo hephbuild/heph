@@ -66,7 +66,7 @@ impl serde::Serialize for LineChange {
 }
 
 /// A recorded file the rewrite releases: no line covers it any more.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, output::Shape)]
 pub struct Released {
     pub path: String,
     pub addr: String,

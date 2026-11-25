@@ -62,7 +62,7 @@ pub struct DiscardArgs {
 }
 
 /// One path's result.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, output::Shape)]
 #[serde(rename_all = "snake_case")]
 pub enum PathResultKind {
     Kept,
@@ -91,7 +91,7 @@ impl PathResultKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, output::Shape)]
 pub struct PathResult {
     /// As given when refused for being outside the workspace; root-relative
     /// otherwise.

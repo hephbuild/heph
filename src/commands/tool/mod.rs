@@ -9,7 +9,7 @@ mod coreutils;
 pub mod gc;
 mod plugins;
 mod resolve_plugins;
-mod scratch;
+pub(crate) mod scratch;
 mod telemetry;
 
 use crate::tui::session::SessionSlot;

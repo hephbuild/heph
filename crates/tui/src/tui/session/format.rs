@@ -349,7 +349,7 @@ impl std::fmt::Display for NoticeUnavailable {
 
 /// A standing approval decision: after Y (or N), every request of the build
 /// is approved (or rejected) without a prompt, until the build ends.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, output_derive::Shape)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalStanding {
     /// Y: shown as `auto-approving (Y)`.
@@ -436,7 +436,9 @@ pub struct SessionSnapshot {
 }
 
 /// One list's full length, and whether the snapshot's copy was cut.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, output_derive::Shape,
+)]
 pub struct ListTotal {
     #[serde(default)]
     pub total: u64,
@@ -456,7 +458,9 @@ impl ListTotal {
 }
 
 /// [`SessionSnapshot::totals`]: one [`ListTotal`] per list.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, output_derive::Shape,
+)]
 pub struct ListTotals {
     #[serde(default)]
     pub running: ListTotal,
@@ -544,7 +548,7 @@ impl SessionSnapshot {
 }
 
 /// The header's numbers.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, output_derive::Shape)]
 pub struct SnapshotCounts {
     /// Matched top-level targets so far; `None` before the matcher reported.
     #[serde(default)]
@@ -584,7 +588,7 @@ pub struct SnapshotCounts {
 }
 
 /// A target with an operation open.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, output_derive::Shape)]
 pub struct RunningTarget {
     pub addr: String,
     /// `execute`, `local_cache_write`, `remote_cache_read`, …; a viewer shows an
@@ -595,7 +599,7 @@ pub struct RunningTarget {
 }
 
 /// A target blocked on its result lock.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, output_derive::Shape)]
 pub struct LockWaitEntry {
     pub addr: String,
     /// The process holding the lock, when it could be named. A viewer maps it to
@@ -609,7 +613,7 @@ pub struct LockWaitEntry {
 }
 
 /// A target held at admission past the notice threshold.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, output_derive::Shape)]
 pub struct AdmissionWaitEntry {
     pub addr: String,
     pub pool: String,
@@ -620,7 +624,7 @@ pub struct AdmissionWaitEntry {
 }
 
 /// How the session ended.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, output_derive::Shape)]
 pub struct SessionEnd {
     pub at_unix_ms: u64,
     #[serde(default)]

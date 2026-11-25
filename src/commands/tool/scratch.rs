@@ -622,16 +622,16 @@ pub struct HeadView<'a> {
     restores_lineage: Option<&'a str>,
 }
 
-#[derive(Debug, serde::Serialize)]
-struct LocalView<'a> {
+#[derive(Debug, serde::Serialize, output::Shape)]
+pub(crate) struct LocalView<'a> {
     lineage: &'a str,
     warm: bool,
     #[serde(serialize_with = "output::ser::path")]
     path: &'a Path,
 }
 
-#[derive(Debug, serde::Serialize)]
-struct RemoteView<'a> {
+#[derive(Debug, serde::Serialize, output::Shape)]
+pub(crate) struct RemoteView<'a> {
     lineage: &'a str,
     /// How far along its lineage the published head is.
     generation: Option<u64>,
@@ -660,16 +660,16 @@ impl<'a> RemoteView<'a> {
     }
 }
 
-#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[derive(Debug, Clone, Copy, serde::Serialize, output::Shape)]
 #[serde(rename_all = "snake_case")]
-enum RemoteSkipped {
+pub(crate) enum RemoteSkipped {
     DeclaredLocal,
     NoRemoteCache,
 }
 
-#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[derive(Debug, Clone, Copy, serde::Serialize, output::Shape)]
 #[serde(rename_all = "snake_case")]
-enum RestoresFrom {
+pub(crate) enum RestoresFrom {
     Local,
     Remote,
 }
@@ -900,9 +900,9 @@ pub struct PushRow<'a> {
     error: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[derive(Debug, Clone, Copy, serde::Serialize, output::Shape)]
 #[serde(rename_all = "snake_case")]
-enum PushOutcome {
+pub(crate) enum PushOutcome {
     Published,
     Unchanged,
     Skipped,
@@ -1143,9 +1143,9 @@ pub struct PullRow<'a> {
     error: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[derive(Debug, Clone, Copy, serde::Serialize, output::Shape)]
 #[serde(rename_all = "snake_case")]
-enum PullOutcome {
+pub(crate) enum PullOutcome {
     Fetched,
     NothingPublished,
     Failed,

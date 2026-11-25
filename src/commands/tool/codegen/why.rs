@@ -32,7 +32,7 @@ pub struct Args {
 }
 
 /// The row that decided, as `why` shows it.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, output::Shape)]
 pub struct WhyRow {
     /// The row's own path: another casing of the argument after a fold hit.
     pub path: String,
@@ -49,7 +49,7 @@ pub struct WhyRow {
 }
 
 /// The section line that matched.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, output::Shape)]
 pub struct WhyLine {
     pub line: usize,
     pub pattern: String,
@@ -59,7 +59,7 @@ pub struct WhyLine {
     pub negated: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, output::Shape)]
 pub struct WhyItem {
     pub path: String,
     pub result: PathResultKind,

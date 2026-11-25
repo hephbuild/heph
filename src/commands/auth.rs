@@ -170,7 +170,7 @@ impl AuthArgs {
 /// Three states, and the distinction between the last two is the whole value of
 /// the command: "you need to run something" is actionable, "nothing here can
 /// work" is a configuration bug.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, output::Shape)]
 #[serde(rename_all = "snake_case")]
 pub enum State {
     /// A source applies here.
@@ -420,7 +420,7 @@ pub struct ExplainView {
 }
 
 /// One source in [`ExplainView::sources`].
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, output::Shape)]
 pub struct ExplainStep {
     /// Its position in the chain, from 0.
     index: usize,

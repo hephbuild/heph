@@ -16,8 +16,8 @@
 //! `attach` names a mirrored 125 on stderr. See [`SessionExit`].
 
 mod attach;
-mod list;
-mod show;
+pub(crate) mod list;
+pub(crate) mod show;
 #[cfg(test)]
 mod tests;
 
@@ -327,7 +327,7 @@ pub(crate) enum Workspace<'a> {
 /// What a session is doing, as a viewer derives it — never stored.
 /// `Unknown` is a session in a format this heph cannot read, and whatever a
 /// newer heph adds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, output::Shape)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionState {
     Running,
@@ -419,7 +419,7 @@ pub(crate) fn every_running_waits(status: &crate::tui::session::SessionSnapshot)
 }
 
 /// What one waiting target waits for, in `list --json` and `show --json`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, output::Shape)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum BlockedOn {
     /// A result lock another process holds.

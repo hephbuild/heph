@@ -224,8 +224,8 @@ impl<'a> ShowView<'a> {
 }
 
 /// What to do next, for a person (`Next:`) and an agent (`next`).
-#[derive(Debug, Serialize)]
-struct Next {
+#[derive(Debug, Serialize, output::Shape)]
+pub(crate) struct Next {
     kind: NextKind,
     /// Display text for a person: each word shell-quoted when it needs it, so
     /// the line pastes back into a shell, then escaped for the terminal; the
@@ -247,9 +247,9 @@ struct Next {
 
 /// [`Next`]'s kind. A consumer treats one it does not know as "read the
 /// reason".
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, output::Shape)]
 #[serde(rename_all = "snake_case")]
-enum NextKind {
+pub(crate) enum NextKind {
     /// Follow the session: `heph session attach`.
     Attach,
     /// Look at another session, the root of the lock chain: `heph session show`.

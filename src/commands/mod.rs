@@ -7,6 +7,7 @@ pub mod errors;
 pub mod gendocs;
 mod global;
 pub mod inspect;
+pub mod json_contract;
 pub mod log;
 pub mod progress_app;
 pub mod query;

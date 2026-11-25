@@ -137,7 +137,7 @@ pub struct PackageStatesRow<'a> {
 }
 
 /// One `provider_state(...)` in [`PackageStatesRow::states`].
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, output::Shape)]
 pub struct StateRow<'a> {
     /// The package whose BUILD file declared it, as `//pkg`.
     declared_in: String,
