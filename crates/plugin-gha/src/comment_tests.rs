@@ -142,11 +142,47 @@ fn config(url: &str, section: &str, run_id: &str) -> CommentConfig {
         repo: "o/r".to_string(),
         token: "t".to_string(),
         pr: 7,
+        kind: RunKind::PullRequest,
+        repo_url: None,
         job_key: "test".to_string(),
         run_id: run_id.to_string(),
         section_key: section.to_string(),
         timeout: Duration::from_secs(5),
     }
+}
+
+/// [`config`] for a merge-queue run.
+fn queue_config(url: &str, section: &str, run_id: &str) -> CommentConfig {
+    CommentConfig {
+        kind: RunKind::MergeQueue,
+        ..config(url, section, run_id)
+    }
+}
+
+/// A comment as GitHub lists it.
+fn listed(id: u64, body: &str) -> (&'static str, String) {
+    (
+        "200 OK",
+        serde_json::json!([{"id": id, "body": body}]).to_string(),
+    )
+}
+
+/// A comment holding both blocks, one section each.
+fn both_blocks(pr_run: &str, pr_text: &str, mq_run: &str, mq_text: &str) -> String {
+    assemble_body(
+        "<!-- heph-gha:test -->",
+        None,
+        &Groups {
+            pull_request: Some(Group {
+                run_id: pr_run.into(),
+                sections: vec![("sec".into(), pr_text.into())],
+            }),
+            merge_queue: Some(Group {
+                run_id: mq_run.into(),
+                sections: vec![("sec".into(), mq_text.into())],
+            }),
+        },
+    )
 }
 
 /// An empty comment list, then a created comment carrying an id.
@@ -195,11 +231,14 @@ fn adopting_a_same_run_comment_preserves_other_steps() {
     // replace — that is the whole point of the per-step sections.
     let other = assemble_body(
         "<!-- heph-gha:test -->",
-        "1-1",
-        &[(
-            "othersection".to_string(),
-            "## step one\nits results".into(),
-        )],
+        None,
+        &crate::tests::pr_only(
+            "1-1",
+            vec![(
+                "othersection".to_string(),
+                "## step one\nits results".into(),
+            )],
+        ),
     );
     let gh = FakeGitHub::start(vec![
         (
@@ -224,11 +263,14 @@ fn a_new_run_resets_the_previous_builds_sections() {
     // previous build's sections pile up forever.
     let stale = assemble_body(
         "<!-- heph-gha:test -->",
-        "1-1",
-        &[
-            ("a".to_string(), "old step a".into()),
-            ("b".to_string(), "old step b".into()),
-        ],
+        None,
+        &crate::tests::pr_only(
+            "1-1",
+            vec![
+                ("a".to_string(), "old step a".into()),
+                ("b".to_string(), "old step b".into()),
+            ],
+        ),
     );
     let gh = FakeGitHub::start(vec![
         (
@@ -248,6 +290,140 @@ fn a_new_run_resets_the_previous_builds_sections() {
     assert!(body.contains("new build"), "{body}");
     assert_eq!(parse_sections(&body).len(), 1, "only ours: {body}");
     assert_eq!(parse_run_id(&body).as_deref(), Some("2-1"));
+}
+
+#[test]
+fn a_merge_queue_run_adds_its_block_after_the_pr_s_ci() {
+    // The PR's CI wrote the comment, under an earlier run. The merge-queue run
+    // is a different run, but the PR block is not its to reset.
+    let pr_ci = assemble_body(
+        "<!-- heph-gha:test -->",
+        None,
+        &crate::tests::pr_only("1-1", vec![("sec".into(), "pr ci results".into())]),
+    );
+    let gh = FakeGitHub::start(vec![listed(99, &pr_ci), ("200 OK", "{}".to_string())]);
+
+    let c = CommentClient::new(queue_config(&gh.url, "sec", "2-1"));
+    c.sync(|| "queue results".to_string(), None);
+
+    let body = gh.last_written_body().expect("a write happened");
+    let groups = parse_groups(&body);
+    assert_eq!(
+        groups.pull_request.as_ref().map(|g| g.run_id.as_str()),
+        Some("1-1"),
+        "PR block kept under its own run: {body}"
+    );
+    assert!(body.contains("pr ci results"), "{body}");
+    assert_eq!(
+        groups.merge_queue.as_ref().map(|g| g.run_id.as_str()),
+        Some("2-1"),
+        "{body}"
+    );
+    let pr = body.find("pr ci results").expect("pr");
+    let mq = body.find("queue results").expect("queue");
+    assert!(pr < mq, "the PR's CI comes first: {body}");
+    assert!(body.contains("# Merge queue"), "{body}");
+}
+
+#[test]
+fn a_merge_queue_re_run_resets_only_its_own_block() {
+    let both = both_blocks("1-1", "pr ci results", "2-1", "old queue attempt");
+    let gh = FakeGitHub::start(vec![listed(99, &both), ("200 OK", "{}".to_string())]);
+
+    // Same merge-queue run, next attempt.
+    let c = CommentClient::new(queue_config(&gh.url, "other", "2-2"));
+    c.sync(|| "new queue attempt".to_string(), None);
+
+    let body = gh.last_written_body().expect("a write happened");
+    assert!(body.contains("pr ci results"), "PR block kept: {body}");
+    assert!(
+        !body.contains("old queue attempt"),
+        "stale queue cleared: {body}"
+    );
+    let mq = parse_groups(&body).merge_queue.expect("queue block");
+    assert_eq!(mq.run_id, "2-2");
+    assert_eq!(
+        mq.sections.len(),
+        1,
+        "only the new attempt's section: {body}"
+    );
+}
+
+#[test]
+fn a_pr_re_run_resets_only_its_own_block() {
+    let both = both_blocks("1-1", "old pr ci", "2-1", "queue results");
+    let gh = FakeGitHub::start(vec![listed(99, &both), ("200 OK", "{}".to_string())]);
+
+    let c = CommentClient::new(config(&gh.url, "other", "1-2"));
+    c.sync(|| "new pr ci".to_string(), None);
+
+    let body = gh.last_written_body().expect("a write happened");
+    assert!(body.contains("queue results"), "queue block kept: {body}");
+    assert!(!body.contains("old pr ci"), "stale PR CI cleared: {body}");
+    let pr = parse_groups(&body).pull_request.expect("PR block");
+    assert_eq!(pr.run_id, "1-2");
+    assert_eq!(pr.sections.len(), 1, "{body}");
+}
+
+#[test]
+fn the_final_write_carries_the_other_block_as_it_is_now() {
+    // The PR's CI and its merge-queue run overlap. Each read the other's block
+    // once, at adopt; without a re-read the one finishing last would write that
+    // stale copy back over the other's final report.
+    let at_adopt = both_blocks("1-1", "pr ci running", "2-1", "queue running");
+    let now = both_blocks("1-1", "pr ci running", "2-1", "queue finished");
+    let gh = FakeGitHub::start(vec![
+        listed(99, &at_adopt),
+        ("200 OK", "{}".to_string()),
+        (
+            "200 OK",
+            serde_json::json!({"id": 99, "body": now}).to_string(),
+        ),
+        ("200 OK", "{}".to_string()),
+    ]);
+
+    let c = CommentClient::new(config(&gh.url, "sec", "1-1"));
+    c.sync(|| "pr ci running".to_string(), None);
+    c.sync_final(|| "pr ci finished".to_string(), None);
+
+    let reqs = gh.requests();
+    assert!(
+        reqs.iter()
+            .any(|r| r.method == "GET" && r.path.ends_with("/issues/comments/99")),
+        "the comment is re-read by id: {reqs:#?}"
+    );
+    let body = gh.last_written_body().expect("a write happened");
+    assert!(
+        body.contains("queue finished"),
+        "other block is current: {body}"
+    );
+    assert!(body.contains("pr ci finished"), "own block is ours: {body}");
+    assert!(
+        !body.contains("pr ci running"),
+        "own block not re-read: {body}"
+    );
+}
+
+#[test]
+fn a_failed_re_read_still_writes_the_final_report() {
+    let both = both_blocks("1-1", "pr ci running", "2-1", "queue running");
+    let gh = FakeGitHub::start(vec![
+        listed(99, &both),
+        ("200 OK", "{}".to_string()),
+        ("500 Internal Server Error", "{}".to_string()),
+        ("200 OK", "{}".to_string()),
+    ]);
+
+    let c = CommentClient::new(config(&gh.url, "sec", "1-1"));
+    c.sync(|| "pr ci running".to_string(), None);
+    c.sync_final(|| "pr ci finished".to_string(), None);
+
+    let body = gh.last_written_body().expect("a write happened");
+    assert!(body.contains("pr ci finished"), "{body}");
+    assert!(
+        body.contains("queue running"),
+        "last known queue block kept: {body}"
+    );
 }
 
 #[test]
