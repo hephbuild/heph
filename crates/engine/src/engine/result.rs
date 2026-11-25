@@ -4389,12 +4389,20 @@ impl Engine {
                     (!rs.hash_only()).then_some(hcore::events::CacheHitKind::Local),
                 ),
                 probe @ (Probe::Absent | Probe::Stale { .. }) => {
-                    // A stale entry (I5) is a miss with a reason. It is not
-                    // deleted: the re-run below overwrites it under this write
-                    // lock, and a failed re-run leaves it to be found stale
-                    // again.
+                    // A stale entry (I5) is a miss with a reason. Its manifest
+                    // is deleted here, under this write lock and before the
+                    // re-run: a re-run cut short (cancelled, or a write error)
+                    // after committing some of its blobs would otherwise
+                    // leave the old manifest naming the new bytes under the
+                    // old `hashout`s, and live again once the path is back.
+                    // Deleted, the entry is absent until a re-run commits a
+                    // whole one. The manifest stays in memory for
+                    // `report_stale_rebuild`.
                     let stale = match probe {
-                        Probe::Stale { path, manifest } => Some((path, manifest)),
+                        Probe::Stale { path, manifest } => {
+                            self.delete_stale_manifest(addr, hashin).await?;
+                            Some((path, manifest))
+                        }
                         _ => None,
                     };
                     // The settled local miss: both probes came back empty under the
@@ -6127,6 +6135,20 @@ impl Engine {
             });
         }
         Ok(probe)
+    }
+
+    /// Delete the manifest of a [`Probe::Stale`] entry. Only a
+    /// [`MANIFEST_V3`](crate::engine::local_cache::MANIFEST_V3) declares host
+    /// paths, so it is the only manifest an entry can be stale by. The caller
+    /// holds the entry's write lock (I5): no reader is riding it and no other
+    /// writer is replacing it. Its blobs are left to GC.
+    async fn delete_stale_manifest(&self, addr: &Addr, hashin: &str) -> anyhow::Result<()> {
+        let (cache, a, h) = (self.local_cache.clone(), addr.clone(), hashin.to_owned());
+        hcore::blocking::run(move || {
+            cache.delete(&a, &h, crate::engine::local_cache::MANIFEST_V3)
+        })
+        .await
+        .with_context(|| format!("deleting the stale cache entry of {addr}"))
     }
 
     /// Public, tracked. Records `parent → addr` in `dep_dag` and updates `parent`
@@ -12909,6 +12931,10 @@ mod tests {
         /// `run` creates every declared path before declaring it, the way a
         /// rebuild brings a collected store path back.
         create: bool,
+        /// Every run after the first also returns a second artifact whose
+        /// container does not exist: the cache write commits `out`'s blob,
+        /// then fails before the manifest.
+        broken_rerun: bool,
     }
 
     impl HostPathDriver {
@@ -12919,6 +12945,7 @@ mod tests {
                 cache: CacheConfig::on(false),
                 vary_hashout: false,
                 create: false,
+                broken_rerun: false,
             }
         }
     }
@@ -12981,19 +13008,31 @@ mod tests {
             } else {
                 "feedface".to_string()
             };
+            let mut artifacts = vec![outputartifact::OutputArtifact {
+                group: "main".to_string(),
+                name: "out".to_string(),
+                r#type: outputartifact::Type::Output,
+                content: outputartifact::Content::Raw(outputartifact::ContentRaw {
+                    data: hashout.as_bytes().to_vec(),
+                    path: "out".to_string(),
+                    x: false,
+                }),
+                hashout,
+            }];
+            if self.broken_rerun && n > 0 {
+                artifacts.push(outputartifact::OutputArtifact {
+                    group: "main".to_string(),
+                    name: "broken".to_string(),
+                    r#type: outputartifact::Type::Output,
+                    content: outputartifact::Content::TarPath(
+                        outputartifact::ContentPath::borrowed("/nonexistent/heph-test/broken.tar"),
+                    ),
+                    hashout: "broken".to_string(),
+                });
+            }
             Ok(RunResponse {
                 host_paths,
-                artifacts: vec![outputartifact::OutputArtifact {
-                    group: "main".to_string(),
-                    name: "out".to_string(),
-                    r#type: outputartifact::Type::Output,
-                    content: outputartifact::Content::Raw(outputartifact::ContentRaw {
-                        data: hashout.as_bytes().to_vec(),
-                        path: "out".to_string(),
-                        x: false,
-                    }),
-                    hashout,
-                }],
+                artifacts,
                 ..Default::default()
             })
         }
@@ -13352,6 +13391,42 @@ mod tests {
             run_host_path_target(&engine, engine.new_state(), &addr).await?;
             assert_eq!(count.load(Ordering::SeqCst), 2, "the rewritten entry hits");
         }
+        Ok(())
+    }
+
+    /// I5: a stale entry's manifest is deleted under the write lock before its
+    /// re-run. A re-run that commits a blob and then fails leaves the entry
+    /// absent, so the next run misses — not the old manifest naming the new
+    /// bytes, live again once the path is back.
+    #[tokio::test]
+    async fn stale_rerun_failing_after_a_blob_leaves_no_entry() -> anyhow::Result<()> {
+        let store = tempdir()?;
+        let path = store.path().join("x");
+        let count = SArc::new(AtomicUsize::new(0));
+        let mut driver = HostPathDriver::new(count.clone(), vec![path.clone()]);
+        driver.vary_hashout = true;
+        driver.create = true;
+        driver.broken_rerun = true;
+        let (engine, _home, addr) = host_path_engine(driver)?;
+
+        run_host_path_target(&engine, engine.new_state(), &addr).await?;
+        assert_eq!(manifests_of(&engine, &addr)?.len(), 1, "the first run wrote");
+        std::fs::remove_file(&path)?;
+
+        let err = run_host_path_target(&engine, engine.new_state(), &addr)
+            .await
+            .expect_err("the re-run's second artifact cannot be written");
+        assert!(format!("{err:#}").contains("broken"), "{err:#}");
+        assert_eq!(count.load(Ordering::SeqCst), 2, "the stale entry re-ran");
+        assert!(path.exists(), "the re-run brought the path back");
+        assert!(
+            manifests_of(&engine, &addr)?.is_empty(),
+            "the stale manifest is gone and the failed re-run committed none"
+        );
+
+        // Absent, not live: the next run misses and runs again.
+        drop(run_host_path_target(&engine, engine.new_state(), &addr).await);
+        assert_eq!(count.load(Ordering::SeqCst), 3, "the next run missed");
         Ok(())
     }
 

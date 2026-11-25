@@ -613,8 +613,8 @@ target(name = "hp", driver = "hostpaths", run = "sleep 0.5; echo $RANDOM$RANDOM$
     Ok(())
 }
 
-/// The re-run fails: the error surfaces, the stale entry is never served, and
-/// the next run retries it.
+/// The re-run fails: the error surfaces, the stale entry is never served (its
+/// manifest is gone after the first failed re-run), and the next run retries.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn host_path_gone_rerun_fails() -> anyhow::Result<()> {
     let root = tempfile::tempdir()?;
@@ -656,9 +656,11 @@ async fn host_path_gone_rerun_fails() -> anyhow::Result<()> {
     let fixed = run(&engine, "//pkg:dep").await;
     assert_eq!(artifact_string(fixed.ok()), "fixed\n");
     assert_eq!(knobs.runs("hp"), 4, "the next run retried and rebuilt it");
+    // The first failed re-run removed the stale manifest under the write lock
+    // (I5), so later runs find no entry: a plain miss, not a stale one.
     assert_eq!(
         fixed.outcomes("//pkg:hp"),
-        vec![(CacheOutcomeKind::Miss, stale_reason(&path))]
+        vec![(CacheOutcomeKind::Miss, None)]
     );
     Ok(())
 }
