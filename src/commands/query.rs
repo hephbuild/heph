@@ -157,6 +157,26 @@ async fn query_row(
     })
 }
 
+/// Push `query --json`'s row for each of `addrs` into `list` as it is found,
+/// computing only the fields `out` selects (I4). Rows are filled in a
+/// bounded window and yielded in the walk's order, the text output's (D9). A
+/// closed stdout stops the walk: `addrs` is dropped unpolled. The list is
+/// left open; the caller closes it when the walk was whole (D10).
+pub async fn push_json_rows<W: std::io::Write>(
+    engine: &Arc<Engine>,
+    rs: &Arc<RequestState>,
+    out: &output::JsonArgs<QueryRow>,
+    candidates: bool,
+    addrs: impl Stream<Item = anyhow::Result<Addr>>,
+    list: &mut output::ListWriter<'_, QueryRow, W>,
+) -> anyhow::Result<output::Flow> {
+    let wants = Wants::new(out, candidates);
+    let rows = addrs
+        .map_ok(|addr| query_row(Arc::clone(engine), rs.clone(), wants, addr))
+        .try_buffered(crate::engine::fanout::discovery_concurrency());
+    list.push_stream(rows).await
+}
+
 /// The addrs `query` prints for `m`, in the walk's order: by default only
 /// targets that exist, each match resolved to confirm it; with `candidates`,
 /// the listing-level candidates unconfirmed. A candidate the walk rules out is
@@ -194,7 +214,6 @@ async fn execute_async(
     let m = resolve_matcher(&args.expr, &args.arg1, &args.arg2, &cwp, true)?;
     let candidates = args.candidates;
     let json = args.out.clone();
-    let wants = Wants::new(&json, candidates);
     run_engine_command_out(
         format!("Querying {}", crate::htquery::format(&m)),
         sink,
@@ -216,13 +235,7 @@ async fn execute_async(
             if json.enabled() {
                 let cancelled = || rs.ctoken().is_cancelled();
                 let mut list = json.printer().start_list()?;
-                // Rows are filled in a bounded window, yielded in the walk's
-                // order: the text output's order (D9).
-                let rows = stream
-                    .map_ok(|addr| query_row(Arc::clone(&engine), rs.clone(), wants, addr))
-                    .try_buffered(crate::engine::fanout::discovery_concurrency());
-                // A closed stdout stops the walk: the stream is dropped unpolled.
-                let res = list.push_stream(rows).await;
+                let res = push_json_rows(&engine, &rs, &json, candidates, stream, &mut list).await;
                 return crate::commands::errors::finalize(&ctx, &rs, res, Some(&gaps), |flow| {
                     // Closed only when the walk is whole (D10).
                     if flow == output::Flow::Continue && gaps.is_empty() {

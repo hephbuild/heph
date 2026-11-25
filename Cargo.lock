@@ -1774,6 +1774,7 @@ dependencies = [
  "heph",
  "hex",
  "libc",
+ "output",
  "plugin",
  "plugin-abi",
  "plugin-devenv",

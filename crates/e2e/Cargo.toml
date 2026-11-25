@@ -53,5 +53,7 @@ tar = "0.4"
 # `oci_image`: inflates a gzipped layer blob to check its `diff_id`.
 flate2 = "1.1.11"
 serde_json = "1"
+# `json_field_costs` parses `--fields` and writes `heph query --json` rows.
+output = { path = "../output" }
 sha2 = "0.11"
 hex = "0.4"
