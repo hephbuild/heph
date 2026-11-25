@@ -594,6 +594,46 @@ fn otlp_counts_span_events_toward_a_line() {
     }
 }
 
+/// A line is cut only when the next span would take it past the bound: a
+/// line that reaches the bound exactly is kept whole, and no two lines in a
+/// row would have fit in one.
+#[test]
+fn otlp_fills_a_line_up_to_its_bound() {
+    let work = tempfile::tempdir().expect("tempdir");
+    let ex = explorer(&fixture(), work.path());
+    for per_line in [2, 3] {
+        let mut out = Vec::new();
+        otlp::write_lines(&ex, &mut out, per_line).expect("export");
+        let d = decode(&String::from_utf8(out).expect("utf-8"));
+        let lines: Vec<Vec<usize>> = d
+            .traces
+            .iter()
+            .map(|t| {
+                t.resource_spans
+                    .iter()
+                    .flat_map(|r| &r.scope_spans)
+                    .flat_map(|s| &s.spans)
+                    .map(|s| 1 + s.events.len())
+                    .collect()
+            })
+            .collect();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.len() > 1 && l.iter().sum::<usize>() == per_line),
+            "no line of several spans reaches the bound of {per_line} exactly: {lines:?}"
+        );
+        for pair in lines.windows(2) {
+            let (line, next) = (&pair[0], &pair[1]);
+            let first = next.first().copied().unwrap_or_default();
+            assert!(
+                line.iter().sum::<usize>() + first > per_line,
+                "a line was cut before its bound of {per_line}: {line:?} then {next:?}"
+            );
+        }
+    }
+}
+
 /// Every `(key, value)` whose key is one of `keys`.
 fn values_of<'a>(v: &'a Json, keys: &[&str], out: &mut Vec<(&'a str, &'a Json)>) {
     match v {
