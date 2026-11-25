@@ -183,6 +183,11 @@ const GCROOTS_SUBDIR: &str = "gcroots";
 /// The name of the store path a run roots.
 const ROOT_NAME: &str = "heph-devenv-env";
 
+/// Why a run that names store paths must root them, for the errors rooting
+/// returns after their cause.
+const ROOT_WHY: &str = "The root keeps `nix-collect-garbage` from deleting the store paths \
+                        runner.json names while the runner stays cached.";
+
 /// The expression file the root is built from, in the runner's sandbox.
 const ROOT_EXPR_FILE: &str = "heph-devenv-env.nix";
 
@@ -617,14 +622,7 @@ impl ManagedDriver for Driver {
                 ctoken,
             )
             .await
-            .with_context(|| {
-                format!(
-                    "rooting the nix store paths {OUT_FILE} names, so `nix-collect-garbage` \
-                     cannot delete them while the runner stays cached. `{}` is looked up on \
-                     the runner's `pass_env` PATH, as `{}` is.",
-                    self.nix_bin, self.devenv_bin
-                )
-            })?;
+            .context("rooting the runner's store paths failed")?;
 
         let out = req.sandbox_pkg_dir.join(OUT_FILE);
         tokio::fs::write(&out, &bytes)
@@ -884,24 +882,37 @@ impl Driver {
                 });
                 if missing {
                     e.context(format!(
-                        "`{}` was not found. A devenv runner whose output names nix store paths \
-                         needs `nix` on its `pass_env` PATH to root them",
-                        self.nix_bin
+                        "`{}` was not found on the runner's `pass_env` PATH. A runner whose \
+                         output names nix store paths needs it to root them: add the directory \
+                         holding `nix` to the PATH its `pass_env` passes, as `{}` is found \
+                         there. {ROOT_WHY}",
+                        self.nix_bin, self.devenv_bin
                     ))
                 } else {
                     e
                 }
             })?;
         if !out.status.success() {
-            return Err(exit_failure(
-                &out,
-                captured,
-                format!(
-                    "`{} build` failed rooting {} store paths",
-                    self.nix_bin,
-                    paths.len()
-                ),
-            ));
+            return Err(if captured {
+                exit_failure(
+                    &out,
+                    true,
+                    format!(
+                        "`{} build` failed rooting {} store paths; its output is in the log. \
+                         {ROOT_WHY}",
+                        self.nix_bin,
+                        paths.len()
+                    ),
+                )
+            } else {
+                // The cause first, then why the run needed it.
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let cause = match stderr.trim_end() {
+                    "" => format!("`{} build` exited with {}", self.nix_bin, out.status),
+                    stderr => stderr.to_owned(),
+                };
+                anyhow::anyhow!("{cause}\n{ROOT_WHY}")
+            });
         }
 
         let printed = std::str::from_utf8(&out.stdout).context("nix build stdout is not UTF-8")?;
@@ -1712,9 +1723,16 @@ echo '{root}'"#,
         let Err(e) = res else {
             panic!("the root fails")
         };
+        // What failed and its cause first, then why the run needed it.
         let msg = format!("{e:#}");
-        assert!(msg.contains("nix-collect-garbage"), "{msg}");
-        assert!(msg.contains("cannot connect to socket"), "{msg}");
+        assert!(
+            msg.starts_with(
+                "rooting the runner's store paths failed: error: cannot connect to socket\n"
+            ),
+            "{msg}"
+        );
+        assert!(msg.ends_with(ROOT_WHY), "{msg}");
+        assert!(ROOT_WHY.contains("nix-collect-garbage"));
         assert!(
             !dir.path().join("sandbox/ws/pkg").join(OUT_FILE).exists(),
             "no runner.json"
@@ -1753,8 +1771,8 @@ echo '{root}'"#,
     }
 
     /// An output naming store paths with no `nix` to root them fails the run,
-    /// saying what was missing and what it was for, and leaves no `runner.json`
-    /// to be cached unrooted.
+    /// saying what was missing, what to do about it and what it was for, and
+    /// leaves no `runner.json` to be cached unrooted.
     #[tokio::test]
     async fn missing_nix_fails_with_a_clear_message() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1767,9 +1785,17 @@ echo '{root}'"#,
             panic!("the run fails without nix")
         };
         let msg = format!("{e:#}");
-        assert!(msg.contains("not found"), "{msg}");
-        assert!(msg.contains("pass_env"), "{msg}");
-        assert!(msg.contains("nix-collect-garbage"), "{msg}");
+        let want = format!(
+            "rooting the runner's store paths failed: `{}` was not found on the runner's \
+             `pass_env` PATH",
+            driver.nix_bin
+        );
+        assert!(msg.starts_with(&want), "{msg}");
+        assert!(
+            msg.contains("add the directory holding `nix` to the PATH"),
+            "{msg}"
+        );
+        assert!(msg.contains(ROOT_WHY), "{msg}");
         assert!(
             !dir.path().join("sandbox/ws/pkg").join(OUT_FILE).exists(),
             "no runner.json"
