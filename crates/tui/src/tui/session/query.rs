@@ -178,7 +178,12 @@ pub const RECIPES: &[Recipe] = &[
     Recipe {
         name: "time_by_phase",
         purpose: "Where did time go, by class and phase (busy time, not wall time)?",
-        notes: SPANS_NOTE,
+        notes: &[
+            "The catalog keeps the spans of targets that ran, not of cache hits:",
+            "for a warm run, use --full or --from.",
+            "It sums every session in scope. For one, query it with --from <id>,",
+            "or add AND session_id = '<id>' to its WHERE.",
+        ],
         sql: "\
 SELECT class, name, count(*) AS n, sum(duration_us) / 1e6 AS busy_s
 FROM spans WHERE class IS NOT NULL

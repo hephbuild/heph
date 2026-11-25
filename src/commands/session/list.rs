@@ -217,7 +217,8 @@ struct ListJsonEntry {
     recorded: bool,
     /// The recording's directory is still kept, so `show`, `attach`,
     /// `export` and `query --from` can open it. False for a private session,
-    /// and for one the catalog still lists after cleanup removed it.
+    /// and for one the catalog still lists after cleanup removed it. True
+    /// for a recording in a newer heph's format, which this one cannot open.
     recording_kept: bool,
     /// With `--addr`: that target in this session.
     #[serde(skip_serializing_if = "Option::is_none")]

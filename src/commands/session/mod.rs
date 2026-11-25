@@ -147,7 +147,9 @@ pub enum SessionCommands {
     /// `--format otlp` writes the session's spans, logs and metrics as
     /// OTLP/JSON lines instead (at most 1000 items a line), for an OpenTelemetry
     /// collector's `otlp_json_file` receiver or any OTLP tool. Each line is
-    /// also the body of one OTLP/HTTP export request.
+    /// also the body of one OTLP/HTTP export request. What maps to what, a
+    /// collector config and a push loop are in the OTLP section of
+    /// docs/SESSIONS.md.
     ///
     /// Examples:
     ///
@@ -183,7 +185,11 @@ pub enum SessionCommands {
     /// `--schema` also prints the built-in recipes, SQL for the questions
     /// asked most: `time_by_phase`, `uncovered_wall`, `phase_percentiles`
     /// and `hit_rate_by_package`. Copy one into a query, or into a file for
-    /// `-f`.
+    /// `-f`. A recipe sums every session in scope: for one session, run it
+    /// with `--from <id>`, or add `session_id = '<id>'` to its `WHERE`.
+    /// Past 7 days (`--since 30d`), the catalog answers, up to 90 days back,
+    /// with the spans of what ran only; `--full` reaches only the recordings
+    /// still kept (7 days by default).
     ///
     /// Examples:
     ///

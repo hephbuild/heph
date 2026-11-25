@@ -1,6 +1,7 @@
 //! `heph session export --format otlp` (spec "OTLP out", D11, D13): a
 //! recording's spans, logs and metrics as OTLP/JSON, the file format the
-//! collector's `otlpjsonfile` receiver reads. Each line is a `TracesData` /
+//! collector's `otlp_json_file` receiver reads (`otlpjsonfile`, its older
+//! name, is a deprecated alias). Each line is a `TracesData` /
 //! `LogsData` / `MetricsData` (the shape of the matching export request) of
 //! one session and at most [`LINE_ITEMS`] spans and their events, log
 //! records or data points (a span with more events is a line alone);

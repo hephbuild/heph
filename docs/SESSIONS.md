@@ -500,6 +500,13 @@ every recording kept, or the recordings named (see [`query`](#query));
 They key on `class`, never on a span's name: the same target shows
 `heph.process` or `heph.driver.run` depending on its driver.
 
+A recipe answers over every session in its source. For one session, query
+it with `--from <id>` (the recording itself, cache hits included), or add
+`session_id = '<id>'` to the recipe's `WHERE` over the catalog. Past the
+default 7 days, `--since 30d` reads the catalog, which keeps 90 days of rows
+but only the spans of what ran; `--full` reaches only as far back as
+recordings are kept, 7 days by default.
+
 | Recipe | Columns |
 | --- | --- |
 | `time_by_phase` | `class`, `name`, `n` (spans), `busy_s` (their summed time: busy, not wall, since phases of different targets overlap) |
@@ -511,6 +518,8 @@ They key on `class`, never on a span's name: the same target shows
 -- time_by_phase: Where did time go, by class and phase (busy time, not wall time)?
 -- The catalog keeps the spans of targets that ran, not of cache hits:
 -- for a warm run, use --full or --from.
+-- It sums every session in scope. For one, query it with --from <id>,
+-- or add AND session_id = '<id>' to its WHERE.
 SELECT class, name, count(*) AS n, sum(duration_us) / 1e6 AS busy_s
 FROM spans WHERE class IS NOT NULL
 GROUP BY class, name ORDER BY busy_s DESC, class, name;
@@ -772,7 +781,10 @@ The run that owns the session writes twice:
 
 - At start, its `sessions` row with `complete=0`, from a thread of its own,
   then it folds the catalog's WAL in. A private session skips the row and
-  only folds the public catalog's WAL in.
+  only folds the public catalog's WAL in. The fold is a `TRUNCATE`
+  checkpoint: it waits for a reader or writer on the catalog, but only up to
+  the 1s write bound and only on that thread, never the build's; past it,
+  the fold is left for the next one.
 - At seal, after `End`, every catalog row of its session in one transaction,
   with `complete=1` and the recording's `derivation`. A private session
   writes these rows with `recorded=0` into the public catalog, then removes
@@ -940,7 +952,9 @@ greatest first. A change to this order bumps `version`.
 - `recording_kept` says the recording is still on disk, so `show`, `attach`,
   `export` and `query --from` can open it. It is `false` for a private
   session, and for a session the catalog still lists after cleanup removed
-  its recording (`recorded` `true`).
+  its recording (`recorded` `true`). It says the directory is there, not
+  that this heph can read it: a recording a newer heph wrote is `true`, and
+  opening it fails (`error.kind` `format_too_new`), naming its format.
 - `target` appears only with `--addr`: `{addr, outcome, duration_ms}`, that
   target in this session. `outcome` is `ran`, `hit`, `failed` or `cancelled`,
   an open set.
@@ -1305,12 +1319,16 @@ nothing runs in the build to produce it.
 - `<ref>` is any `<ref>`: a local session, or a `.hephsession` file by path
   or URL. A session and its `.hephsession` export write the same lines.
 - Each line is a `TracesData`, a `LogsData` or a `MetricsData` (the JSON
-  of the matching collector export request) holding at most 1000 spans,
-  log records or metric data points. The span lines come first, then the
-  log lines, then the metric lines. A signal with nothing in it writes no
-  line. A metric with more points than fit goes on in the next line, as a
-  metric of the same name, kind and unit. The export holds one line in
-  memory, not the whole session.
+  of the matching collector export request) holding at most 1000 spans and
+  span events, log records or metric data points. A span is never split
+  from its events, so a span with more than 1000 is a line on its own. The
+  span lines come first, then the log lines, then the metric lines. A
+  signal with nothing in it writes no line. A metric with more points than
+  fit goes on in the next line, as a metric of the same name, kind and
+  unit, under the same resource and scope, and for a counter from the same
+  start time: one series, which a backend that keys series on those joins
+  back together. The export holds one line in memory, not the whole
+  session.
 - `-o PATH` writes `PATH` through a temp file beside it, renamed into place,
   replacing a file already there; the default is `./heph-<id>.otlp.jsonl`.
   `-o -` writes the lines to stdout, a terminal included (it is text). On
@@ -1346,9 +1364,10 @@ What maps to what:
 | `metrics` rows of one name, kind and unit | one metric: `counter` a monotonic cumulative sum from the session's start, `gauge` (and a kind this heph does not know) a gauge; one data point per row |
 
 **Into a collector.** The `otlp_json_file` receiver of
-`opentelemetry-collector-contrib` (`otlpjsonfile` before it was renamed)
-reads the file as it is. One file holds all three signals; give the receiver
-to each pipeline:
+`opentelemetry-collector-contrib` (alpha for traces, metrics and logs) reads
+the file as it is. Its older name, `otlpjsonfile`, is a deprecated alias: it
+still works, and logs a deprecation warning. One file holds all three
+signals; give the receiver to each pipeline:
 
 ```yaml
 receivers:
