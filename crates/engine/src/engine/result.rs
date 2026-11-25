@@ -2048,21 +2048,23 @@ fn reconcile_rebuilt_hashouts(
     if promised == rebuilt {
         return Ok(());
     }
-    // The first line is what a one-line renderer (the TUI) shows: what happened
-    // and what to do. The rest is the account.
+    // The first line is what a one-line renderer (the TUI) shows, cut from the
+    // right after the addr it already prints — and the target-failure context
+    // names the addr again — so it leads with the action and repeats no addr.
+    // The rest is the account.
     anyhow::bail!(
-        "{addr} is not reproducible; run the command again to continue.\n\
-         Its cached revision {hashin} was used as a hit, then its blobs turned out to be \
-         unavailable (reclaimed by a local GC, or by an object-store lifecycle rule on a shared \
-         cache), and rebuilding it produced different outputs:\n  \
+        "re-run to continue: the rebuild differs from cached revision {hashin}\n\
+         The revision was used as a cache hit, then its blobs turned out to be unavailable \
+         (reclaimed by a local GC or an object-store lifecycle rule, or a failed transfer), and \
+         rebuilding it produced different outputs:\n  \
          cached:   {promised:?}\n  rebuilt:  {rebuilt:?}\n\
          This run stops because targets in it may already have keyed their cache entries on the \
-         cached outputs, which no longer exist. The rebuilt outputs have replaced them in the \
-         cache, so the next run keys everything on the rebuilt ones and succeeds.\n\
-         To stop it recurring, fix the target: the same inputs must always produce the same \
-         outputs, so something it writes depends on what it does not declare (an absolute path, \
-         a timestamp, host state). Two runs on two machines that diverge are this bug; one only \
-         surfaces when a cached blob is gone and the revision is rebuilt."
+         cached outputs, which no longer exist. The rebuilt outputs have replaced them in this \
+         machine's cache, so re-running gets past this target.\n\
+         To prevent this: the same inputs must always produce the same outputs. Something this \
+         target writes depends on what it does not declare (an absolute path, a timestamp, host \
+         state), or a heph or plugin upgrade changed what it writes without changing its cache \
+         key. It goes unnoticed until a cached blob is gone and the revision is rebuilt."
     )
 }
 
@@ -8866,10 +8868,15 @@ mod tests {
         for h in &real {
             assert!(msg.contains(h), "must name the rebuilt hashout: {msg}");
         }
-        let first_line = msg.lines().next().unwrap_or_default();
+        // The target-failure context already names the addr; the reconcile's
+        // own first line — all a one-line renderer shows after it — must lead
+        // with what to do.
+        let own = err.root_cause().to_string();
         assert!(
-            first_line.contains("//pkg:t") && first_line.contains("run the command again"),
-            "the first line — all a one-line renderer shows — must say what to do: {msg}"
+            own.lines()
+                .next()
+                .is_some_and(|l| l.starts_with("re-run to continue")),
+            "the first line must lead with what to do: {msg}"
         );
         drop(err);
         drain_bg(rs2).await;
