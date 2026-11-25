@@ -476,7 +476,14 @@ fn execute(
                 a.json,
                 &mut stdout,
             ))??;
-            for hint in list::hints(shown, &filter, catalog.as_ref(), &a.since, opts.now_ms) {
+            for hint in list::hints(
+                shown,
+                &filter,
+                scope,
+                catalog.as_ref(),
+                &a.since,
+                opts.now_ms,
+            ) {
                 sink.write_diagnostic(&hint);
             }
             Ok(())

@@ -675,6 +675,17 @@ async fn list_hints(
     filter: &list::ListFilter,
     since: &str,
 ) -> (Vec<String>, Vec<String>) {
+    list_hints_in(root, now, filter, Workspace::All, since).await
+}
+
+/// [`list_hints`] scoped to `workspace`.
+async fn list_hints_in(
+    root: &Path,
+    now: u64,
+    filter: &list::ListFilter,
+    workspace: Workspace<'_>,
+    since: &str,
+) -> (Vec<String>, Vec<String>) {
     let file = FileSource::new(root);
     let sources: [&dyn SessionSource; 1] = [&file];
     let catalog = list::read_catalog(root, now, filter, &mut |_| {});
@@ -685,7 +696,7 @@ async fn list_hints(
             now_ms: now,
             ..opts()
         },
-        Workspace::All,
+        workspace,
         filter,
         catalog.as_ref(),
         true,
@@ -696,8 +707,69 @@ async fn list_hints(
     let json: serde_json::Value = serde_json::from_slice(&out).expect("json");
     (
         json_ids(&json),
-        list::hints(shown, filter, catalog.as_ref(), since, now),
+        list::hints(shown, filter, workspace, catalog.as_ref(), since, now),
     )
+}
+
+/// The catalog's reach is said only when the window is all that narrowed
+/// the list: its oldest session may be of another actor, user, command or
+/// workspace, so under any of those the hinted `--since` could match
+/// nothing again. `--addr` does not count (`list_says_what_it_did_not_search`).
+#[tokio::test]
+async fn the_reach_hint_is_for_the_window_alone() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    let now = hcore::events::now_unix_ms();
+    session(root, now, 20 * DAY_MS, "run", ADDR, Did::Ran, &HUMAN);
+    let narrowed: [(&str, list::ListFilter); 4] = [
+        (
+            "--failed",
+            list::ListFilter {
+                failed: true,
+                ..since(7, now)
+            },
+        ),
+        (
+            "--actor",
+            list::ListFilter {
+                actor: Some(ActorKind::Agent),
+                ..since(7, now)
+            },
+        ),
+        (
+            "--command",
+            list::ListFilter {
+                command: Some("query".to_owned()),
+                ..since(7, now)
+            },
+        ),
+        (
+            "--user",
+            list::ListFilter {
+                user: Some("someone-else".to_owned()),
+                ..since(7, now)
+            },
+        ),
+    ];
+    for (flag, filter) in &narrowed {
+        let (ids, hints) = list_hints(root, now, filter, "7d").await;
+        assert!(ids.is_empty(), "{flag}: {ids:?}");
+        assert!(hints.is_empty(), "{flag}: {hints:?}");
+    }
+    let (ids, hints) = list_hints_in(
+        root,
+        now,
+        &since(7, now),
+        Workspace::Only("/another/workspace"),
+        "7d",
+    )
+    .await;
+    assert!(ids.is_empty(), "{ids:?}");
+    assert!(hints.is_empty(), "a workspace narrows it too: {hints:?}");
+
+    // The window alone: said.
+    let (_, hints) = list_hints(root, now, &since(7, now), "7d").await;
+    assert_eq!(hints.len(), 1, "{hints:?}");
 }
 
 /// What `list` did not search is said on stderr: under `--addr`, the live

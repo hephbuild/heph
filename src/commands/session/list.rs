@@ -528,10 +528,15 @@ pub(crate) struct Shown {
 /// The stderr lines that say what `list` did not look at: under `--addr`,
 /// the live sessions (their targets reach the catalog when they end); and,
 /// when nothing matched, how much further back the catalog reaches than the
-/// window `since` (the `--since` text) asked for.
+/// window `since` (the `--since` text) asked for. That one only when the
+/// window is all that narrowed the list (`--addr` aside, whose row the
+/// catalog reaches back as far): the catalog's oldest session is of any
+/// actor, user, command and workspace, so under another filter the
+/// suggested `--since` may still match nothing.
 pub(crate) fn hints(
     shown: Shown,
     filter: &ListFilter,
+    workspace: Workspace<'_>,
     catalog: Option<&CatalogRows>,
     since: &str,
     now_ms: u64,
@@ -546,7 +551,13 @@ pub(crate) fn hints(
             if n == 1 { "it" } else { "each" },
         ));
     }
+    let window_only = matches!(workspace, Workspace::All)
+        && !filter.failed
+        && filter.actor.is_none()
+        && filter.command.is_none()
+        && filter.user.is_none();
     if shown.rows == 0
+        && window_only
         && let Some(since_ms) = filter.since_ms
         && let Some(oldest) = catalog.and_then(|c| c.oldest_started_ms)
         && oldest < since_ms
