@@ -199,6 +199,22 @@ fn main() -> ExitCode {
         Ok(cli) => cli,
         Err(e) => e.exit(),
     };
+    // `--fields help`: the command's field table on stdout, exit 0, before
+    // anything starts. clap cannot print it from the value parser (its help
+    // errors are rendered with an `error:` prefix).
+    if let Some(table) = output::fields_help(&matches) {
+        use std::io::Write as _;
+        return match std::io::stdout().write_all(table.as_bytes()) {
+            // A reader that closed the pipe (`| head -1`) took what it
+            // wanted: exit 0, as every other output path does.
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+            Err(e) => {
+                error!(error = %e, "printing the field table");
+                ExitCode::FAILURE
+            }
+        };
+    }
 
     // Set up the supervisor sidecar that will SIGKILL every tracked child
     // process group when this binary exits — including hard-kill scenarios.
@@ -343,6 +359,12 @@ fn exit_code_for(
             // Re-raised by the caller, once everything else on the way out has run.
             _ => 1,
         };
+    }
+    // `--jq`: a filter that failed while it ran is 2 on every command, so it
+    // never reads as a command's own code; a cancelled one is 130.
+    if let Some(code) = output::exit_code(e) {
+        report(e, session);
+        return code;
     }
     // `heph tool codegen`: 1 for findings, 2 for a failure (Decision 20).
     if let Some(exit) = e.downcast_ref::<commands::tool::codegen::CodegenExit>() {

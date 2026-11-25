@@ -41,3 +41,4 @@ mod stack_status;
 mod target_dir_script;
 mod test_layout;
 mod tst_script;
+mod version_json;
