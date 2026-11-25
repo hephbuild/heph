@@ -49,12 +49,20 @@ const CURSOR: char = '│';
 struct Gate {
     open: Mutex<bool>,
     cv: Condvar,
+    /// Opening the gate kills the snapshot's thread instead.
+    fails: std::sync::atomic::AtomicBool,
 }
 
 impl Gate {
     fn release(&self) {
         *self.open.lock().expect("gate lock") = true;
         self.cv.notify_all();
+    }
+
+    /// Open the gate on a snapshot that dies: the registry never lands.
+    fn fail(&self) {
+        self.fails.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.release();
     }
 }
 
@@ -73,6 +81,12 @@ impl FakeEngine {
             while !*open {
                 open = gate.cv.wait(open).expect("gate wait");
             }
+            // Released first, so the panic below poisons nothing.
+            drop(open);
+            assert!(
+                !gate.fails.load(std::sync::atomic::Ordering::SeqCst),
+                "the registry snapshot fails (by the test's design)"
+            );
         }
     }
 }
@@ -1360,6 +1374,247 @@ fn member_completion_lists_a_namespace_and_nothing_else() {
         "{explained}"
     );
     assert_eq!(explained["site"]["path"], Value::Null, "{explained}");
+}
+
+// ---------------------------------------------------------------------------
+// Typed members: lifetimes (I10) and the registry (I9).
+// ---------------------------------------------------------------------------
+
+/// Open `rel` with `parses`, then edit it to `dotted`, as an editor has it
+/// once the `.` is typed: `dotted` need not parse, its types are `parses`'.
+fn open_dotted(lsp: &mut Lsp, rel: &str, parses: &str, dotted: &str) -> Doc {
+    let doc = lsp.open(rel, parses);
+    lsp.change(&doc, dotted)
+}
+
+fn sorted_labels(result: &Value) -> Vec<String> {
+    let mut got = labels(result);
+    got.sort();
+    got
+}
+
+/// The server's test-support counters.
+fn counters(lsp: &mut Lsp) -> Value {
+    lsp.request("heph/documents", Value::Null)
+}
+
+fn counter(counters: &Value, name: &str) -> u64 {
+    counters[name]
+        .as_u64()
+        .unwrap_or_else(|| panic!("no counter {name}: {counters}"))
+}
+
+#[test]
+fn edit_to_transitive_load_refreshes() {
+    let mut lsp = Lsp::start();
+    lsp.write("lib/mode.star", "Mode = record(level = str)\n");
+    lsp.write(
+        "lib/defs.star",
+        "load(\"//lib/mode.star\", \"Mode\")\n\nLib = record(name = str, mode = Mode)\n",
+    );
+    let head = "load(\"//lib/defs.star\", \"Lib\")\n\ndef f(l: Lib):\n";
+    let doc = open_dotted(
+        &mut lsp,
+        "pkg/BUILD",
+        &format!("{head}    x = l.mode\n"),
+        &format!("{head}    x = l.mode.│\n"),
+    );
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), ["level"]);
+    let first = counters(&mut lsp);
+    assert_eq!(counter(&first, "typechecks"), 1, "{first}");
+    assert_eq!(counter(&first, "interfaces"), 2, "{first}");
+    assert_eq!(counter(&first, "interface_checks"), 2, "{first}");
+
+    // Nothing moved: the document's memo answers and no file is checked.
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), ["level"]);
+    assert_eq!(counters(&mut lsp), first);
+
+    // An edit on disk two loads away, with the document unchanged: the
+    // file it loads directly is checked again under its moved key, and so is
+    // the document.
+    lsp.write(
+        "lib/mode.star",
+        "Mode = record(level = str, verbose = bool)\n",
+    );
+    assert_eq!(
+        sorted_labels(&lsp.completion(&doc)),
+        ["level", "verbose"],
+        "the transitive edit is seen"
+    );
+    let second = counters(&mut lsp);
+    assert_eq!(counter(&second, "typechecks"), 2, "{second}");
+    assert_eq!(counter(&second, "interfaces"), 2, "{second}");
+    assert_eq!(counter(&second, "interface_checks"), 4, "{second}");
+
+    // An edit on disk that leaves the content as it was: rehashed, not
+    // checked.
+    lsp.write(
+        "lib/mode.star",
+        "Mode = record(level = str, verbose = bool)\n",
+    );
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), ["level", "verbose"]);
+    assert_eq!(counters(&mut lsp), second);
+}
+
+#[test]
+fn close_evicts_unreached_interfaces() {
+    let mut lsp = Lsp::start();
+    lsp.write("shared/lib.star", "S = record(s = str)\n");
+    lsp.write("b/lib.star", "B = record(y = str)\n");
+    lsp.write("b/other.star", "C = record(z = str)\n");
+    let a_head = "load(\"//shared/lib.star\", \"S\")\n\ndef f(v: S):\n";
+    let a = open_dotted(
+        &mut lsp,
+        "a/BUILD",
+        &format!("{a_head}    x = v\n"),
+        &format!("{a_head}    x = v.│\n"),
+    );
+    assert_eq!(sorted_labels(&lsp.completion(&a)), ["s"]);
+    let b_head = |lib: &str, ty: &str| {
+        format!(
+            "load(\"//shared/lib.star\", \"S\")\nload(\"//b/{lib}.star\", \"{ty}\")\n\n\
+             def f(v: {ty}):\n"
+        )
+    };
+    let b = open_dotted(
+        &mut lsp,
+        "b/BUILD",
+        &format!("{}    x = v\n", b_head("lib", "B")),
+        &format!("{}    x = v.│\n", b_head("lib", "B")),
+    );
+    assert_eq!(sorted_labels(&lsp.completion(&b)), ["y"]);
+    assert_eq!(counter(&counters(&mut lsp), "interfaces"), 2);
+    assert_eq!(
+        counter(&counters(&mut lsp), "interface_checks"),
+        2,
+        "shared is checked once"
+    );
+
+    // `b` trades one load for another: what it no longer reaches goes after
+    // its next typecheck.
+    let b = lsp.change(&b, &format!("{}    x = v\n", b_head("other", "C")));
+    let b = lsp.change(&b, &format!("{}    x = v.│\n", b_head("other", "C")));
+    assert_eq!(sorted_labels(&lsp.completion(&b)), ["z"]);
+    assert_eq!(counter(&counters(&mut lsp), "interfaces"), 2);
+
+    // Closing `a` keeps what `b` still reaches.
+    lsp.close(&a);
+    assert_eq!(counter(&counters(&mut lsp), "interfaces"), 2);
+    lsp.close(&b);
+    assert_eq!(counter(&counters(&mut lsp), "interfaces"), 0);
+}
+
+#[test]
+fn reopen_starts_clean() {
+    let mut lsp = Lsp::start();
+    lsp.write("lib/defs.star", "Lib = record(name = str)\n");
+    let head = "load(\"//lib/defs.star\", \"Lib\")\n\ndef f(l: Lib):\n";
+    let parses = format!("{head}    x = l\n");
+    let dotted = format!("{head}    x = l.│\n");
+    let doc = open_dotted(&mut lsp, "pkg/BUILD", &parses, &dotted);
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), ["name"]);
+    lsp.close(&doc);
+    let closed = counters(&mut lsp);
+    assert_eq!(counter(&closed, "interfaces"), 0, "{closed}");
+
+    // Reopened with a text that has never parsed: nothing of the closed
+    // document's types is carried over.
+    let doc = lsp.open("pkg/BUILD", &dotted);
+    assert!(items(&lsp.completion(&doc)).is_empty());
+    let explained = lsp.explain(&doc);
+    assert_eq!(explained["site"]["binding"], Value::Null, "{explained}");
+    assert_eq!(explained["site"]["type"], Value::Null, "{explained}");
+
+    // Once it parses, it is typechecked afresh, the loaded file with it.
+    let doc = lsp.change(&doc, &parses);
+    let doc = lsp.change(&doc, &dotted);
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), ["name"]);
+    let reopened = counters(&mut lsp);
+    assert_eq!(counter(&reopened, "typechecks"), 2, "{reopened}");
+    assert_eq!(counter(&reopened, "interfaces"), 1, "{reopened}");
+    assert_eq!(counter(&reopened, "interface_checks"), 2, "{reopened}");
+}
+
+#[test]
+fn types_before_and_after_registry() {
+    const RECORD: &str = "Lib = record(name = str)\n\ndef f(l: Lib):\n";
+    const KWARGS: &str = "def f(kw: heph.types.exec.Kwargs):\n";
+    let open = |lsp: &mut Lsp| {
+        let record = open_dotted(
+            lsp,
+            "rec/BUILD",
+            &format!("{RECORD}    x = l\n"),
+            &format!("{RECORD}    x = l.│\n"),
+        );
+        let kwargs = open_dotted(
+            lsp,
+            "kw/BUILD",
+            &format!("{KWARGS}    x = kw\n"),
+            &format!("{KWARGS}    x = kw.│\n"),
+        );
+        (record, kwargs)
+    };
+    // What typing with `heph_globals` alone gives: a record's fields, and no
+    // Kwargs, so a Kwargs parameter lists nothing.
+    let assert_pending = |lsp: &mut Lsp, record: &Doc, kwargs: &Doc| {
+        assert_eq!(sorted_labels(&lsp.completion(record)), ["name"]);
+        let result = lsp.completion(kwargs);
+        assert!(items(&result).is_empty(), "{result}");
+        let explained = lsp.explain(kwargs);
+        assert_eq!(
+            explained["site"]["empty_because"],
+            json!("any"),
+            "{explained}"
+        );
+        for doc in [record, kwargs] {
+            let explained = lsp.explain(doc);
+            assert_eq!(
+                explained["site"]["registry"],
+                json!("pending"),
+                "{explained}"
+            );
+        }
+    };
+
+    // Before the registry lands (`initialize` timed out waiting for it).
+    let (mut lsp, gate) = Lsp::new_gated();
+    lsp.initialize();
+    let (record, kwargs) = open(&mut lsp);
+    assert_pending(&mut lsp, &record, &kwargs);
+    assert_eq!(counters(&mut lsp)["registry"], json!("loading"));
+
+    // Once it lands, the Kwargs parameter is the dict the checker types it as.
+    gate.release();
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    while counters(&mut lsp)["registry"] != json!("ready") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the registry never landed"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let got = sorted_labels(&lsp.completion(&kwargs));
+    for want in ["get", "items", "keys", "values"] {
+        assert!(got.iter().any(|l| l == want), "{want}: {got:?}");
+    }
+    let explained = lsp.explain(&kwargs);
+    assert_eq!(explained["site"]["registry"], json!("ready"), "{explained}");
+    assert_eq!(sorted_labels(&lsp.completion(&record)), ["name"]);
+
+    // A registry that fails to load: `heph_globals` for good.
+    let (mut lsp, gate) = Lsp::new_gated();
+    lsp.initialize();
+    gate.fail();
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    while counters(&mut lsp)["registry"] != json!("failed") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the registry never failed"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let (record, kwargs) = open(&mut lsp);
+    assert_pending(&mut lsp, &record, &kwargs);
 }
 
 /// A member's edit lands on the member in every position encoding, with a
@@ -3150,7 +3405,10 @@ fn did_close_frees_the_document_model() {
     let mut lsp = Lsp::start();
     let a = lsp.open("a/BUILD", "target(name = \"a\")\n");
     let b = lsp.open("b/BUILD", "target(name = \"b\")\n");
-    let counts = |lsp: &mut Lsp| lsp.request("heph/documents", Value::Null);
+    let counts = |lsp: &mut Lsp| {
+        let all = lsp.request("heph/documents", Value::Null);
+        json!({"documents": all["documents"], "parses": all["parses"], "indexes": all["indexes"]})
+    };
     assert_eq!(
         counts(&mut lsp),
         json!({"documents": 2, "parses": 2, "indexes": 2, "typechecks": 0})
