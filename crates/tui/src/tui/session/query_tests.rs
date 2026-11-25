@@ -650,10 +650,11 @@ fn a_query_over_a_capped_session_says_it_is_partial() {
     };
     let capped = "none for 1 session(s) over the catalog's cap";
 
+    let samples = "machine samples not kept; summaries only";
     let metrics = partial("SELECT count(*) FROM metrics", Scope::default());
     assert_eq!(
         metrics.get("metrics").map(String::as_str),
-        Some(capped),
+        Some(&*format!("{samples}; {capped}")),
         "{metrics:?}"
     );
     let spans = partial("SELECT count(*) FROM spans", Scope::default());
@@ -669,5 +670,10 @@ fn a_query_over_a_capped_session_says_it_is_partial() {
         until_ms: Some(now_ms() - 1_500),
         ..Scope::default()
     };
-    assert!(partial("SELECT count(*) FROM metrics", before_over).is_empty());
+    let metrics = partial("SELECT count(*) FROM metrics", before_over);
+    assert_eq!(
+        metrics.get("metrics").map(String::as_str),
+        Some(samples),
+        "{metrics:?}"
+    );
 }

@@ -355,10 +355,12 @@ ORDER BY w.session_id, w.phase",
 /// The explorer names the catalog holds: it keeps no logs.
 const CATALOG_HOLDS: &[&str] = &["sessions", "spans", "span_events", "metrics", "targets"];
 /// What the catalog holds of a table only in part (`coverage.partial`):
-/// the spans of what ran, not of cache hits, and no logs.
+/// the spans of what ran, not of cache hits; the session summaries of the
+/// machine, not its samples (D25); and no logs.
 const CATALOG_PARTIAL: &[(&str, &str)] = &[
     ("spans", "ran targets only"),
     ("span_events", "ran targets only"),
+    ("metrics", "machine samples not kept; summaries only"),
     ("logs", "not kept"),
 ];
 /// The tables whose rows the catalog leaves out for a session over its cap.

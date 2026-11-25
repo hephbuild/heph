@@ -241,7 +241,10 @@ line:
   `sessions` and `targets` rows are whole. `partial` names each table read
   from the catalog that it holds only in part, with what is missing:
   `"spans"` and `"span_events"` are `"ran targets only"` (a cache hit's
-  spans are not kept), `"logs"` is `"not kept"`, and with `capped` above 0,
+  spans are not kept), `"metrics"` is `"machine samples not kept; summaries
+  only"` (the catalog copies the `heph.session.*` summaries and the
+  start-time figures, never the per-sample rows), `"logs"` is `"not kept"`,
+  and with `capped` above 0,
   `"spans"`, `"span_events"` and `"metrics"` also say `"none for N
   session(s) over the catalog's cap"`; `{}` when nothing read is partial,
   and always for `--full` and `--from`. A non-empty `partial` is also one
@@ -661,8 +664,8 @@ keeps them; the other four read `spans`, which the catalog keeps only for
 targets that ran (`--full` reads every recording instead).
 `waiting_by_load` reads the machine samples in `metrics` too, which the
 catalog does not keep at all, so over it every wait reads unknown. Their
-comment says so, and `query --format json` names `spans` in
-`coverage.partial`.
+comment says so, and `query --format json` names `spans` (and, for
+`waiting_by_load`, `metrics`) in `coverage.partial`.
 
 The recipes are not part of the explorer contract (I9). A release may
 change a recipe's SQL, its columns or its name. A script that runs one

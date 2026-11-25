@@ -474,6 +474,12 @@ async fn query_over_the_catalog_says_what_it_holds_in_part() {
             "SELECT count(*) FROM logs",
             serde_json::json!({"logs": "not kept"}),
         ),
+        // The machine's summaries, not its samples (D25).
+        (
+            &[],
+            "SELECT count(*) FROM metrics",
+            serde_json::json!({"metrics": "machine samples not kept; summaries only"}),
+        ),
         (&[], "SELECT count(*) FROM targets", serde_json::json!({})),
         (
             &["--from", &id],
