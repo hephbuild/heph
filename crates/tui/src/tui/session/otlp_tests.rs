@@ -353,9 +353,10 @@ fn round_trips(path: &Path, d: &Decoded, written: Written) {
 }
 
 /// A session of thousands of spans, logs and metric points is cut into
-/// lines of at most `LINE_ITEMS` each (a metric runs on into the next
-/// line), each line a valid message of its signal, spans first, then logs,
-/// then metrics; and together the lines still hold every row exactly.
+/// lines of at most `LINE_ITEMS` each (a span counted with its events; a
+/// metric runs on into the next line), each line a valid message of its
+/// signal, spans first, then logs, then metrics; and together the lines
+/// still hold every row exactly.
 #[test]
 fn otlp_cuts_a_large_session_into_bounded_lines() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -390,14 +391,13 @@ fn otlp_cuts_a_large_session_into_bounded_lines() {
     let d = decode(&text);
     let lines = |items: usize| items.div_ceil(otlp::LINE_ITEMS);
     assert_eq!(
-        (d.traces.len(), d.logs.len(), d.metrics.len()),
-        (
-            lines(written.spans),
-            lines(written.logs),
-            lines(written.points)
-        ),
+        (d.logs.len(), d.metrics.len()),
+        (lines(written.logs), lines(written.points)),
         "{written:?}"
     );
+    // A span counts with its events, and is never split from them: a line
+    // of spans is cut when the next span would not fit.
+    let span_items = |s: &trace::Span| 1 + s.events.len();
     let spans: Vec<usize> = d
         .traces
         .iter()
@@ -405,10 +405,32 @@ fn otlp_cuts_a_large_session_into_bounded_lines() {
             t.resource_spans
                 .iter()
                 .flat_map(|r| &r.scope_spans)
-                .map(|s| s.spans.len())
+                .flat_map(|s| &s.spans)
+                .map(span_items)
                 .sum()
         })
         .collect();
+    assert_eq!(
+        spans.iter().sum::<usize>(),
+        written.spans + written.span_events,
+        "every span and event is on a line once"
+    );
+    let largest = d
+        .traces
+        .iter()
+        .flat_map(|t| &t.resource_spans)
+        .flat_map(|r| &r.scope_spans)
+        .flat_map(|s| &s.spans)
+        .map(span_items)
+        .max()
+        .expect("a span");
+    let (last, full) = spans.split_last().expect("a line");
+    assert!(
+        full.iter()
+            .all(|&n| n <= otlp::LINE_ITEMS && n + largest > otlp::LINE_ITEMS)
+            && (1..=otlp::LINE_ITEMS).contains(last),
+        "spans and events a line: {spans:?}"
+    );
     let logs: Vec<usize> = d
         .logs
         .iter()
@@ -436,7 +458,7 @@ fn otlp_cuts_a_large_session_into_bounded_lines() {
                 .sum()
         })
         .collect();
-    for (signal, per_line) in [("spans", &spans), ("logs", &logs), ("points", &points)] {
+    for (signal, per_line) in [("logs", &logs), ("points", &points)] {
         let (last, full) = per_line.split_last().expect("a line");
         assert!(
             full.iter().all(|&n| n == otlp::LINE_ITEMS) && (1..=otlp::LINE_ITEMS).contains(last),
@@ -506,6 +528,69 @@ fn ids(v: &Json, out: &mut Vec<(String, String)>) {
         }
         Json::Array(items) => items.iter().for_each(|i| ids(i, out)),
         _ => {}
+    }
+}
+
+/// A span's events count toward its line's bound, and a span is never split
+/// from them: one with more events than the bound is a line alone, and the
+/// lines around it stay within it.
+#[test]
+fn otlp_counts_span_events_toward_a_line() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join(store::FILE);
+    std::fs::copy(fixture(), &path).expect("copy the fixture");
+    rusqlite::Connection::open(&path)
+        .expect("open the copy")
+        .execute_batch(
+            "INSERT INTO spans (session_id, span_id, parent_span_id, name, class, start_us, \
+               end_us, duration_us, status) \
+               SELECT s.id, 2000000, NULL, 'heph.busy', 'phase', s.started_ms * 1000, \
+                 s.started_ms * 1000 + 10, 10, 'ok' FROM session s;
+             WITH RECURSIVE k(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM k WHERE i < 5) \
+             INSERT INTO span_events (session_id, span_id, name, time_us, attributes) \
+               SELECT s.id, 2000000, 'tick', s.started_ms * 1000 + i, NULL FROM k, session s;",
+        )
+        .expect("grow the recording");
+    let per_line = 3;
+    let work = tempfile::tempdir().expect("tempdir");
+    let ex = explorer(&path, work.path());
+    let mut out = Vec::new();
+    let written = otlp::write_lines(&ex, &mut out, per_line).expect("export");
+    let d = decode(&String::from_utf8(out).expect("utf-8"));
+    let lines: Vec<Vec<&trace::Span>> = d
+        .traces
+        .iter()
+        .map(|t| {
+            t.resource_spans
+                .iter()
+                .flat_map(|r| &r.scope_spans)
+                .flat_map(|s| &s.spans)
+                .collect()
+        })
+        .collect();
+    assert_eq!(
+        lines.iter().map(Vec::len).sum::<usize>(),
+        written.spans,
+        "every span is on a line"
+    );
+    let busy = lines
+        .iter()
+        .find(|l| l.iter().any(|s| s.name == "heph.busy"))
+        .expect("the busy span's line");
+    assert_eq!(
+        (busy.len(), busy.first().map(|s| s.events.len())),
+        (1, Some(5)),
+        "a span over the bound is a line alone, with all its events"
+    );
+    for line in lines
+        .iter()
+        .filter(|l| l.iter().all(|s| s.name != "heph.busy"))
+    {
+        let items: usize = line.iter().map(|s| 1 + s.events.len()).sum();
+        assert!(
+            (1..=per_line).contains(&items),
+            "a line of {items} spans and events"
+        );
     }
 }
 

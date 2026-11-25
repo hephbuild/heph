@@ -2,7 +2,8 @@
 //! recording's spans, logs and metrics as OTLP/JSON, the file format the
 //! collector's `otlpjsonfile` receiver reads. Each line is a `TracesData` /
 //! `LogsData` / `MetricsData` (the shape of the matching export request) of
-//! one session and at most [`LINE_ITEMS`] spans, log records or data points;
+//! one session and at most [`LINE_ITEMS`] spans and their events, log
+//! records or data points (a span with more events is a line alone);
 //! the spans' lines come first, then the logs', then the metrics'. A signal
 //! with nothing to say writes no line. Rows are streamed: an export holds
 //! one line in memory, not the session.
@@ -58,8 +59,10 @@ pub struct Written {
     pub points: usize,
 }
 
-/// Spans, log records or metric data points one line holds at most, so an
-/// export holds one line's worth in memory, whatever the session's size.
+/// Spans and span events, log records or metric data points one line holds
+/// at most, so an export holds one line's worth in memory, whatever the
+/// session's size. A span is never split from its events: one with more
+/// events than this is a line of its own.
 pub const LINE_ITEMS: usize = 1000;
 
 /// Write `explorer`'s sessions to `out` as OTLP/JSON lines.
@@ -380,6 +383,7 @@ fn write_spans(
         .context("reading the spans")?;
     let mut rows = stmt.query([&s.id]).context("reading the spans")?;
     let mut out = Vec::new();
+    let mut items = 0;
     while let Some(r) = rows.next().context("reading the spans")? {
         let span_id: i64 = r.get(0).context("reading a span")?;
         let parent: Option<i64> = r.get(1).context("reading a span")?;
@@ -415,6 +419,16 @@ fn write_spans(
         };
         let span_events = events.of(span_id)?;
         written.span_events += span_events.len();
+        // A span counts with its events: a line of spans that each carry
+        // many would otherwise be many times the bound. A span is never
+        // split, so one with more events than the bound is a line alone.
+        let span_items = 1 + span_events.len();
+        if !out.is_empty() && items + span_items > lines.per_line {
+            written.spans += out.len();
+            lines.spans(s, std::mem::take(&mut out))?;
+            items = 0;
+        }
+        items += span_items;
         out.push(trace::Span {
             trace_id: s.trace_id.clone(),
             span_id: span_id.to_be_bytes().to_vec(),
@@ -435,10 +449,6 @@ fn write_spans(
             .into(),
             ..Default::default()
         });
-        if out.len() == lines.per_line {
-            written.spans += out.len();
-            lines.spans(s, std::mem::take(&mut out))?;
-        }
     }
     if !out.is_empty() {
         written.spans += out.len();
