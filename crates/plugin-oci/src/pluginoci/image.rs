@@ -60,7 +60,7 @@ use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3Default;
 
 use super::archive::{self, Blob, Blobs};
-use super::layer::{DESCRIPTOR_SUFFIX, LayerDescriptor, LayerEncoding};
+use super::layer::{DESCRIPTOR_SUFFIX, GZIP_MAGIC, LayerDescriptor, LayerEncoding};
 use super::{
     ImageFormat, dep_files, is_os_arch, layout_path, normalize_platform, split_platform, ws_path,
 };
@@ -104,8 +104,10 @@ struct OciImageSpec {
     /// it is, and a runtime rejects that only at deploy.
     ///
     /// The check runs when the image target *runs*, not at query or
-    /// `heph validate`: it reads what the dep produced. The fix is to wrap the
-    /// dep in an `oci.layer` (`srcs = [...]`, `prefix = ...`).
+    /// `heph validate`: it reads what the dep produced. The fix is an
+    /// `oci.layer` over the dep: wrap its files (`srcs = [...]`,
+    /// `prefix = ...`), or, when it produces a prebuilt tar, adopt it as it is
+    /// (`tar = ...`).
     layers: Vec<String>,
     /// Layers that differ per platform, appended after `layers`, keyed by the
     /// platform they belong to. Each value is one `oci.layer` address or a
@@ -907,15 +909,49 @@ fn select_layer(
 }
 
 /// The error for a `layers` entry that is not an `oci.layer`: what it
-/// produced, and the target that would make it one.
+/// produced, and the target that would make it one: a tar is adopted with
+/// `tar =`, a gzipped file decompressed first, anything else wrapped with
+/// `srcs`.
 fn not_a_layer(paths: &[PathBuf], dep: &str, attr: &str) -> anyhow::Error {
     let produced = name_list(&paths.iter().map(PathBuf::as_path).collect::<Vec<_>>());
+    let head = match paths {
+        [only] => file_head(only),
+        _ => Vec::new(),
+    };
+    let fix = if head.starts_with(&GZIP_MAGIC) {
+        "It is gzip-compressed; `oci.layer` adopts an uncompressed tar. Decompress it in a \
+         target of its own (e.g. `gunzip`), then adopt that:\n  target(name = \"<name>\", \
+         driver = \"oci.layer\", tar = \"<the decompressed tar>\")"
+            .to_string()
+    } else if head.get(257..262) == Some(b"ustar".as_slice()) {
+        format!(
+            "It is a tar; adopt it as the layer, as it is:\n  target(name = \"<name>\", driver = \
+             \"oci.layer\", tar = \"{dep}\")"
+        )
+    } else {
+        format!(
+            "Wrap it, to put its files at a path inside the image:\n  target(name = \"<name>\", \
+             driver = \"oci.layer\", srcs = [\"{dep}\"], prefix = \"<dir in image>\")  # e.g. \
+             /usr/bin"
+        )
+    };
     anyhow::anyhow!(
         "{attr} entry {dep} is not an `oci.layer` target (it produced: {produced}). An image \
-         layer must be built by `oci.layer`, which puts the files at a path inside the image \
-         and records the layer's digests. Wrap it:\n  target(name = \"<name>\", driver = \
-         \"oci.layer\", srcs = [\"{dep}\"], prefix = \"<dir in image>\")  # e.g. /usr/bin"
+         layer must be built by `oci.layer`, which records the layer's digests. {fix}"
     )
+}
+
+/// The first bytes of `path`, enough to see a tar's `ustar` magic at offset
+/// 257. Empty when it cannot be read: it only picks the suggestion.
+fn file_head(path: &Path) -> Vec<u8> {
+    use std::io::Read as _;
+    let mut head = Vec::with_capacity(263);
+    if let Ok(file) = std::fs::File::open(path)
+        && file.take(263).read_to_end(&mut head).is_err()
+    {
+        head.clear();
+    }
+    head
 }
 
 /// Write the docker-format archive a daemon's `docker load` accepts.
@@ -1480,6 +1516,59 @@ mod tests {
             let err = refused(&produced(dir.path(), &files));
             assert!(err.contains(DEP), "{case}: names the dep: {err}");
             assert!(err.contains(want), "{case}: wanted {want:?} in: {err}");
+        }
+    }
+
+    /// The fix offered fits what the dep produced: a tar is adopted with
+    /// `tar =`, a gzip stream is decompressed first, anything else is wrapped
+    /// with `srcs`.
+    #[test]
+    fn the_refusal_suggests_the_fix_for_what_was_produced() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut b = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_gnu();
+        h.set_size(2);
+        h.set_cksum();
+        b.append_data(&mut h, "etc/motd", &b"hi"[..])
+            .expect("append");
+        let tar_path = dir.path().join("rootfs.tar");
+        std::fs::write(&tar_path, b.into_inner().expect("finish")).expect("write");
+        let gz_path = dir.path().join("rootfs.tar.gz");
+        std::fs::write(&gz_path, [0x1f, 0x8b, 0x08, 0, 0, 0, 0, 0]).expect("write");
+        let bin_path = dir.path().join("server");
+        std::fs::write(&bin_path, "elf").expect("write");
+
+        let cases = [
+            (
+                "a tar",
+                tar_path,
+                format!(
+                    "It is a tar; adopt it as the layer, as it is:\n  target(name = \"<name>\", driver = \"oci.layer\", tar = \"{DEP}\")"
+                ),
+                "srcs =",
+            ),
+            (
+                "a gzip stream",
+                gz_path,
+                "It is gzip-compressed; `oci.layer` adopts an uncompressed tar. Decompress it"
+                    .to_string(),
+                "srcs =",
+            ),
+            (
+                "anything else",
+                bin_path,
+                format!("srcs = [\"{DEP}\"], prefix = \"<dir in image>\""),
+                "tar =",
+            ),
+        ];
+        for (case, path, want, not) in cases {
+            let err = refused(&[path]);
+            assert!(
+                err.contains("is not an `oci.layer` target"),
+                "{case}: the stable phrase: {err}"
+            );
+            assert!(err.contains(&want), "{case}: wanted {want:?} in: {err}");
+            assert!(!err.contains(not), "{case}: no {not:?} in: {err}");
         }
     }
 

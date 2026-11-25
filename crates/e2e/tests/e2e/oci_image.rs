@@ -336,6 +336,110 @@ target(
     }
 }
 
+/// A tar some other tool built, with its own mtimes and owners, written into
+/// the workspace as `app/rootfs.tar`. Returns its bytes.
+fn write_rootfs_tar(ws: &htestkit::Workspace) -> Vec<u8> {
+    let mut b = tar::Builder::new(Vec::new());
+    let mut dir = tar::Header::new_ustar();
+    dir.set_entry_type(tar::EntryType::Directory);
+    dir.set_size(0);
+    dir.set_mode(0o755);
+    dir.set_mtime(1_700_000_000);
+    dir.set_cksum();
+    b.append_data(&mut dir, "etc/", std::io::empty())
+        .expect("dir");
+    let mut file = tar::Header::new_ustar();
+    file.set_size(4);
+    file.set_mode(0o640);
+    file.set_uid(1000);
+    file.set_mtime(1_700_000_000);
+    file.set_cksum();
+    b.append_data(&mut file, "etc/motd", &b"hi!\n"[..])
+        .expect("file");
+    let bytes = b.into_inner().expect("finish the tar");
+    std::fs::write(htestkit::root(ws).join("app/rootfs.tar"), &bytes).expect("write the tar");
+    bytes
+}
+
+/// `oci.layer(tar = ...)` adopts a prebuilt tar as the layer: the image's
+/// layer inflates to exactly the tar's bytes — names, modes, owners and times
+/// as its producer wrote them — and its diff_id is their digest.
+#[tokio::test]
+async fn test_a_prebuilt_tar_is_adopted_as_the_layer() -> anyhow::Result<()> {
+    let ws = workspace();
+    ws.write_build_file(
+        "app",
+        r#"
+target(name = "rootfs", driver = "oci.layer", tar = glob("rootfs.tar"))
+target(name = "img", driver = "oci.image", layers = [":rootfs"], platforms = ["linux/amd64"])
+"#,
+    );
+    let fixture = write_rootfs_tar(&ws);
+
+    let bytes = htestkit::artifact_bytes(&*ws.run("//app:img").await?);
+    let manifest = manifest_of(&bytes);
+    let layer = &manifest["layers"][0];
+    assert_eq!(
+        layer["mediaType"], "application/vnd.oci.image.layer.v1.tar+gzip",
+        "an adopted tar is gzipped by default"
+    );
+    let blob = layout_blobs(&bytes)
+        .remove(layer["digest"].as_str().expect("digest"))
+        .expect("layer blob");
+    let mut inflated = Vec::new();
+    std::io::Read::read_to_end(
+        &mut flate2::read::GzDecoder::new(blob.as_slice()),
+        &mut inflated,
+    )?;
+    assert!(
+        inflated == fixture,
+        "the layer inflates to the tar, byte for byte ({} bytes, want {})",
+        inflated.len(),
+        fixture.len()
+    );
+    assert_eq!(
+        config_of(&bytes)["rootfs"]["diff_ids"],
+        serde_json::json!([format!(
+            "sha256:{}",
+            hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&fixture))
+        )]),
+        "the diff_id is the adopted tar's digest"
+    );
+    Ok(())
+}
+
+/// A prebuilt tar listed straight in `layers` is refused like any other
+/// non-layer, and the fix offered is to adopt it with `tar =`, not to wrap
+/// its bytes as a file with `srcs`.
+#[tokio::test]
+async fn test_a_raw_tar_in_layers_is_refused_suggesting_tar() {
+    let ws = workspace();
+    ws.write_build_file(
+        "app",
+        r#"
+target(name = "img", driver = "oci.image", layers = [glob("rootfs.tar")], platforms = ["linux/amd64"])
+"#,
+    );
+    write_rootfs_tar(&ws);
+    let err = format!(
+        "{:#}",
+        ws.run("//app:img")
+            .await
+            .err()
+            .expect("a raw tar must fail the image")
+    );
+    assert!(
+        err.contains("is not an `oci.layer` target"),
+        "the stable phrase: {err}"
+    );
+    assert!(
+        err.contains("It is a tar; adopt it as the layer")
+            && err.contains("driver = \"oci.layer\", tar = \""),
+        "suggests `tar =`: {err}"
+    );
+    assert!(!err.contains("srcs = ["), "not the srcs wrap: {err}");
+}
+
 /// A `group` re-exporting one layer is that layer: the descriptor and the blob
 /// travel through it together. A group of two layers is refused rather than
 /// one of them picked, since `layers` order is the stacking order and a group
