@@ -335,12 +335,13 @@ async fn list_who_ran() {
     assert!(plain.contains(&ran.encode()), "{plain}");
 }
 
-/// Spec row `targets_answer_cache_hits` (D18), as a root-crate unit test
-/// with synthetic records rather than in crates/e2e, which records no
-/// session in-process: a run that executed //p:t and one that hit its cache
-/// are both listed by `--addr`, outcomes `ran` and `hit`.
+/// Spec row `targets_answer_cache_hits` (D18), the `list --json` half: a run
+/// that executed //p:t and one that hit its cache are both listed by
+/// `--addr`, with `target.outcome` `ran` and `hit`. Synthetic records; that
+/// a real build's events seal into those rows is
+/// `crates/e2e/tests/e2e/session_catalog.rs`.
 #[tokio::test]
-async fn targets_answer_cache_hits() {
+async fn list_json_shows_the_addr_outcome() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path();
     let now = hcore::events::now_unix_ms();
