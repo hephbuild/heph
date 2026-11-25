@@ -542,6 +542,29 @@ async fn query_stops_when_interrupted_opening_its_sources() {
     }
 }
 
+/// A Ctrl-C also stops the catalog's heal: the query hands the catalog its
+/// own stop flag, so a heal already interrupted copies no recording before
+/// the query gives up.
+#[tokio::test]
+async fn query_stops_the_catalog_heal_when_interrupted() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().join("sessions");
+    session(&root, 0, 1);
+    session(&root, 60_000, 2);
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let ran = run_query_until(&root, &["SELECT 1"], "", Arc::new(NoDownload), stop).await;
+    let (kind, _, _) = kind_and_code(ran.out.expect_err("answered"));
+    assert_eq!(kind, ErrorKind::Interrupted);
+    let healed: i64 = rusqlite::Connection::open_with_flags(
+        root.join(crate::tui::session::catalog::FILE),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("open the catalog")
+    .query_row("SELECT count(*) FROM sessions", [], |r| r.get(0))
+    .expect("count");
+    assert_eq!(healed, 0, "the heal copied recordings after the Ctrl-C");
+}
+
 /// Serves `body` like [`super::refs::Serve`], counting the downloads.
 struct CountedServe {
     body: Vec<u8>,
