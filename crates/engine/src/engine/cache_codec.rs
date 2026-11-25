@@ -1013,7 +1013,10 @@ pub(crate) mod tests {
                 Err(io::Error::other("disk gone"))
             }
         }
-        for encoding in [ManifestArtifactEncoding::None, ManifestArtifactEncoding::Zstd] {
+        for encoding in [
+            ManifestArtifactEncoding::None,
+            ManifestArtifactEncoding::Zstd,
+        ] {
             assert!(
                 check_pulled_length(&mut Broken, &encoding, 1).is_err(),
                 "{encoding:?}: a failed read is an error"

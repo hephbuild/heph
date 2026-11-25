@@ -1459,6 +1459,17 @@ impl RemoteCacheSet {
         home: PathBuf,
     ) -> Arc<Self> {
         let order: Vec<usize> = (0..backends.len()).collect();
+        Self::with_backends_in_order(backends, order, home)
+    }
+
+    /// Test-only: [`Self::with_backends`], read in `order` (indices into
+    /// `backends`) rather than in the order given.
+    #[cfg(test)]
+    pub(crate) fn with_backends_in_order(
+        backends: Vec<(&str, Arc<dyn RemoteCacheBackend>)>,
+        order: Vec<usize>,
+        home: PathBuf,
+    ) -> Arc<Self> {
         let caches = backends
             .into_iter()
             .map(|(name, backend)| {
@@ -3453,9 +3464,7 @@ mod tests {
                 !set.caches.first().expect("cache").broken(),
                 "should not break before the threshold"
             );
-            let res = set
-                .locate(&never(), &addr, "h", Need::Manifest)
-                .await;
+            let res = set.locate(&never(), &addr, "h", Need::Manifest).await;
             assert!(res.is_none(), "a failing remote read is a miss");
         }
         assert!(
@@ -3868,8 +3877,14 @@ mod tests {
         let mut missing = names.clone();
         missing.push("absent.tar".to_string());
         assert!(
-            !set.blobs_present(&ctoken, cache, &addr, "h", missing.iter().map(String::as_str))
-                .await
+            !set.blobs_present(
+                &ctoken,
+                cache,
+                &addr,
+                "h",
+                missing.iter().map(String::as_str)
+            )
+            .await
         );
     }
 
@@ -4120,7 +4135,10 @@ mod tests {
             .map(|i| {
                 let (set, addr) = (Arc::clone(&set), addr.clone());
                 tokio::spawn(async move {
-                    drop(set.locate(&never(), &addr, &format!("h{i}"), Need::Manifest).await);
+                    drop(
+                        set.locate(&never(), &addr, &format!("h{i}"), Need::Manifest)
+                            .await,
+                    );
                 })
             })
             .collect();
@@ -5349,6 +5367,18 @@ mod tests {
         data: &[u8],
         hashout: &str,
     ) -> (Arc<dyn RemoteCacheBackend>, Arc<crate::engine::Engine>) {
+        cache_built_at(dir, name, &addr(), hashin, data, hashout).await
+    }
+
+    /// [`cache_built_by`] for the target `target`.
+    async fn cache_built_at(
+        dir: &Path,
+        name: &str,
+        target: &Addr,
+        hashin: &str,
+        data: &[u8],
+        hashout: &str,
+    ) -> (Arc<dyn RemoteCacheBackend>, Arc<crate::engine::Engine>) {
         use crate::engine::driver::outputartifact;
 
         let set = RemoteCacheSet::new(
@@ -5374,10 +5404,10 @@ mod tests {
             hashout: hashout.to_string(),
         };
         engine
-            .cache_locally(&never(), &addr(), hashin, vec![artifact], false)
+            .cache_locally(&never(), target, hashin, vec![artifact], false)
             .await
             .expect("cache_locally");
-        engine.upload_to_remote(&addr(), hashin).await;
+        engine.upload_to_remote(target, hashin).await;
         (backend, engine)
     }
 
@@ -5550,5 +5580,456 @@ mod tests {
             0,
             "a presence miss is not a failure"
         );
+    }
+
+    /// Key→bytes backend that records every GET by key and counts listings.
+    /// A GET of `cancel_on_get`'s key cancels its token, then answers.
+    #[derive(Default)]
+    struct MapBackend {
+        objects: std::collections::HashMap<String, Vec<u8>>,
+        gets: std::sync::Mutex<Vec<String>>,
+        lists: AtomicUsize,
+        cancel_on_get: Option<(String, hcore::hasync::StdCancellationToken)>,
+    }
+
+    impl MapBackend {
+        fn gets_of(&self, key: &str) -> usize {
+            let gets = self.gets.lock().expect("gets");
+            gets.iter().filter(|k| *k == key).count()
+        }
+    }
+
+    #[async_trait]
+    impl RemoteCacheBackend for MapBackend {
+        async fn open_read(
+            &self,
+            key: &str,
+        ) -> anyhow::Result<Option<Pin<Box<dyn AsyncRead + Send>>>> {
+            self.gets.lock().expect("gets").push(key.to_string());
+            if let Some((at, ctoken)) = &self.cancel_on_get
+                && at == key
+            {
+                ctoken.cancel();
+            }
+            Ok(self.objects.get(key).map(|b| {
+                Box::pin(std::io::Cursor::new(b.clone())) as Pin<Box<dyn AsyncRead + Send>>
+            }))
+        }
+        async fn open_write(&self, _key: &str) -> anyhow::Result<Pin<Box<dyn AsyncWrite + Send>>> {
+            anyhow::bail!("read-only map backend")
+        }
+        async fn exists(&self, key: &str) -> anyhow::Result<bool> {
+            Ok(self.objects.contains_key(key))
+        }
+        async fn list_names(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+            self.lists.fetch_add(1, Ordering::SeqCst);
+            Ok(self
+                .objects
+                .keys()
+                .filter_map(|k| k.strip_prefix(prefix)?.strip_prefix('/'))
+                .map(str::to_string)
+                .collect())
+        }
+    }
+
+    const X: &[u8] = b"blob x, whole";
+    const Y: &[u8] = b"blob y, whole too";
+
+    /// The manifest of revision `(addr(), "h")`: raw blobs `x` and `y`, both
+    /// in group `out`.
+    fn xy_manifest() -> RemoteManifest {
+        RemoteManifest {
+            version: REMOTE_MANIFEST_VERSION.to_string(),
+            target: addr().format(),
+            hashin: "h".to_string(),
+            artifacts: vec![
+                remote_artifact("x", X.len() as u64, ManifestArtifactEncoding::None),
+                remote_artifact("y", Y.len() as u64, ManifestArtifactEncoding::None),
+            ],
+        }
+    }
+
+    /// A [`MapBackend`] holding `manifest` (already serialized, or `None`) and
+    /// each `(name, bytes)` as that blob of `(addr(), "h")`.
+    fn holding(manifest: Option<Vec<u8>>, blobs: &[(&str, &[u8])]) -> MapBackend {
+        let addr = addr();
+        let mut objects: std::collections::HashMap<String, Vec<u8>> = blobs
+            .iter()
+            .map(|(name, bytes)| (RemoteCacheSet::key(&addr, "h", name), bytes.to_vec()))
+            .collect();
+        if let Some(m) = manifest {
+            objects.insert(RemoteCacheSet::key(&addr, "h", REMOTE_MANIFEST), m);
+        }
+        MapBackend {
+            objects,
+            ..Default::default()
+        }
+    }
+
+    fn borsh_of(m: &RemoteManifest) -> Vec<u8> {
+        borsh::to_vec(m).expect("borsh")
+    }
+
+    /// The local manifest's entry for the remote blob `name`, as a hit mirrors
+    /// it (under its local v3 name).
+    fn want(manifest: &RemoteManifest, name: &str) -> ManifestArtifact {
+        local_manifest_from_remote(manifest, "h")
+            .artifacts
+            .into_iter()
+            .find(|a| remote_entry_name(&a.name) == name)
+            .expect("the manifest names it")
+    }
+
+    fn manifest_key() -> String {
+        RemoteCacheSet::key(&addr(), "h", REMOTE_MANIFEST)
+    }
+
+    fn cut(bytes: &[u8]) -> &[u8] {
+        bytes.get(..bytes.len() - 3).expect("long enough to cut")
+    }
+
+    /// The fall-through reads the whole read order, the tiers before the one
+    /// that located the revision included. Read `a` then `b`: `a` lacks `y`,
+    /// so the hit decision takes `b`; `b`'s `x` is cut short, and `a`, which
+    /// holds `x` whole, serves it. No rebuild, no listing on the way.
+    #[tokio::test]
+    async fn a_tier_before_the_locating_one_serves_the_blob() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let m = xy_manifest();
+        let a = Arc::new(holding(Some(borsh_of(&m)), &[("x", X)]));
+        let b = Arc::new(holding(Some(borsh_of(&m)), &[("x", cut(X)), ("y", Y)]));
+        let engine = engine_with_set(
+            dir.path(),
+            RemoteCacheSet::with_backends(
+                vec![("a", a.clone()), ("b", b.clone())],
+                dir.path().to_path_buf(),
+            ),
+        );
+        let groups = ["out".to_string()];
+        let first = engine
+            .remote_caches
+            .locate(&never(), &addr(), "h", Need::Groups(&groups))
+            .await
+            .expect("b holds every blob");
+        assert_eq!(engine.remote_caches.cache_name(&first), "b");
+
+        assert!(
+            engine
+                .pull_remote_blob_from_any(&never(), &addr(), "h", &first, &want(&m, "x"))
+                .await
+                .expect("pull"),
+            "a holds x whole and must serve it"
+        );
+        assert_eq!(local_blob(&engine, "h", &want(&m, "x").name), X);
+        assert_eq!(
+            a.gets_of(&manifest_key()),
+            2,
+            "a's manifest is read for the hit and once more for the fall-through"
+        );
+        assert_eq!(
+            a.lists.load(Ordering::SeqCst),
+            1,
+            "only the hit decision lists"
+        );
+        let b_cache = engine.remote_caches.caches.get(1).expect("b");
+        assert!(!b_cache.broken());
+        assert_eq!(
+            b_cache.health.consecutive_failures.load(Ordering::Relaxed),
+            0,
+            "a blob cut short is the cache answering, not failing"
+        );
+    }
+
+    /// The read order, not the config order, decides which tier locates the
+    /// revision and which the fall-through asks next: config `[a, b]`, read
+    /// `b` then `a`.
+    #[tokio::test]
+    async fn the_fall_through_follows_the_read_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let m = xy_manifest();
+        let a = Arc::new(holding(Some(borsh_of(&m)), &[("x", X), ("y", Y)]));
+        let b = Arc::new(holding(Some(borsh_of(&m)), &[("x", cut(X)), ("y", Y)]));
+        let engine = engine_with_set(
+            dir.path(),
+            RemoteCacheSet::with_backends_in_order(
+                vec![("a", a.clone()), ("b", b.clone())],
+                vec![1, 0],
+                dir.path().to_path_buf(),
+            ),
+        );
+        let first = engine
+            .remote_caches
+            .locate(&never(), &addr(), "h", Need::Manifest)
+            .await
+            .expect("located");
+        assert_eq!(engine.remote_caches.cache_name(&first), "b");
+        assert_eq!(a.gets_of(&manifest_key()), 0, "b is read first");
+
+        assert!(
+            engine
+                .pull_remote_blob_from_any(&never(), &addr(), "h", &first, &want(&m, "x"))
+                .await
+                .expect("pull")
+        );
+        assert_eq!(local_blob(&engine, "h", &want(&m, "x").name), X);
+        assert_eq!(a.gets_of(&RemoteCacheSet::key(&addr(), "h", "x")), 1);
+    }
+
+    /// Three tiers: the first has no manifest, the second cuts both blobs
+    /// short, the third holds them whole. Both blobs come from the third, and
+    /// the other tiers' manifests are read once for the revision, not once per
+    /// blob: the fall-through is O(revisions). Nothing lists.
+    #[tokio::test]
+    async fn the_fall_through_reads_each_tier_once_per_revision() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let m = xy_manifest();
+        let t1 = Arc::new(holding(None, &[]));
+        let t2 = Arc::new(holding(Some(borsh_of(&m)), &[("x", cut(X)), ("y", cut(Y))]));
+        let t3 = Arc::new(holding(Some(borsh_of(&m)), &[("x", X), ("y", Y)]));
+        let engine = engine_with_set(
+            dir.path(),
+            RemoteCacheSet::with_backends(
+                vec![("t1", t1.clone()), ("t2", t2.clone()), ("t3", t3.clone())],
+                dir.path().to_path_buf(),
+            ),
+        );
+        let first = engine
+            .remote_caches
+            .locate(&never(), &addr(), "h", Need::Manifest)
+            .await
+            .expect("located");
+        assert_eq!(engine.remote_caches.cache_name(&first), "t2");
+
+        for (name, bytes) in [("x", X), ("y", Y)] {
+            assert!(
+                engine
+                    .pull_remote_blob_from_any(&never(), &addr(), "h", &first, &want(&m, name))
+                    .await
+                    .expect("pull"),
+                "t3 serves {name}"
+            );
+            assert_eq!(local_blob(&engine, "h", &want(&m, name).name), bytes);
+        }
+        let key = manifest_key();
+        assert_eq!(t1.gets_of(&key), 2, "t1: the hit, then one fall-through");
+        assert_eq!(t2.gets_of(&key), 1, "t2: the hit only");
+        assert_eq!(t3.gets_of(&key), 1, "t3: one fall-through for both blobs");
+        for t in [&t1, &t2, &t3] {
+            assert_eq!(t.lists.load(Ordering::SeqCst), 0, "nothing lists");
+        }
+    }
+
+    /// A blob no tier serves whole is a miss: the caller rebuilds, nothing
+    /// reaches the local cache or stays in the temp dir, and the breaker stays
+    /// closed past the failure threshold — a length rejection is the cache
+    /// answering, not failing.
+    #[tokio::test]
+    async fn a_blob_no_tier_serves_whole_is_a_miss_that_leaves_the_breaker_closed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let m = xy_manifest();
+        let engine = engine_with_set(
+            dir.path(),
+            RemoteCacheSet::with_backend(
+                Arc::new(holding(Some(borsh_of(&m)), &[("x", cut(X)), ("y", Y)])),
+                dir.path().to_path_buf(),
+            ),
+        );
+        for _ in 0..=FAILURE_THRESHOLD {
+            let first = engine
+                .remote_caches
+                .locate(&never(), &addr(), "h", Need::Manifest)
+                .await
+                .expect("located");
+            assert!(
+                !engine
+                    .pull_remote_blob_from_any(&never(), &addr(), "h", &first, &want(&m, "x"))
+                    .await
+                    .expect("pull"),
+                "no tier serves x whole: the caller rebuilds"
+            );
+        }
+        let cache = engine.remote_caches.caches.first().expect("cache");
+        assert!(
+            !cache.broken(),
+            "a length rejection must not pause the cache"
+        );
+        assert_eq!(cache.health.consecutive_failures.load(Ordering::Relaxed), 0);
+        assert!(cache.damage_warned.load(Ordering::Relaxed));
+        assert!(
+            !engine
+                .local_cache
+                .exists(&addr(), "h", "x")
+                .expect("exists"),
+            "a blob cut short must not reach the local cache"
+        );
+        let tmp = engine.remote_tmp_dir().await.expect("tmp dir");
+        assert_eq!(temp_blobs(tmp), Vec::<PathBuf>::new());
+    }
+
+    /// A first tier whose manifest is damaged — garbage, a gzip blob, another
+    /// target or another hashin under the key — is passed over for the second,
+    /// which holds the revision whole; the first's breaker stays closed.
+    #[tokio::test]
+    async fn a_damaged_manifest_passes_the_tier_over() {
+        let good = xy_manifest();
+        let mut gzip = good.clone();
+        gzip.artifacts[0].encoding = ManifestArtifactEncoding::Gzip;
+        let mut other_target = good.clone();
+        other_target.target = mk_addr("p", "u", &[]).format();
+        let mut other_hashin = good.clone();
+        other_hashin.hashin = "h-other".to_string();
+        for (what, bytes) in [
+            ("garbage", b"not borsh".to_vec()),
+            ("a gzip blob", borsh_of(&gzip)),
+            ("another target", borsh_of(&other_target)),
+            ("another hashin", borsh_of(&other_hashin)),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let set = RemoteCacheSet::with_backends(
+                vec![
+                    ("damaged", Arc::new(holding(Some(bytes), &[("x", X)]))),
+                    (
+                        "whole",
+                        Arc::new(holding(Some(borsh_of(&good)), &[("x", X), ("y", Y)])),
+                    ),
+                ],
+                dir.path().to_path_buf(),
+            );
+            let groups = ["out".to_string()];
+            let rev = set
+                .locate(&never(), &addr(), "h", Need::Groups(&groups))
+                .await
+                .unwrap_or_else(|| panic!("{what}: the second tier serves"));
+            assert_eq!(set.cache_name(&rev), "whole", "{what}");
+            let damaged = set.caches.first().expect("damaged");
+            assert!(!damaged.broken(), "{what}: the breaker stays closed");
+            assert!(
+                damaged.damage_warned.load(Ordering::Relaxed),
+                "{what}: reported as damage"
+            );
+        }
+    }
+
+    /// A run cancelled while the fall-through looks for another tier ends in
+    /// `CancelledError`, not a miss, and leaves no blob, local or temporary.
+    #[tokio::test]
+    async fn a_cancelled_fall_through_is_cancelled_and_leaves_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let m = xy_manifest();
+        let ctoken = never();
+        let mut b = holding(Some(borsh_of(&m)), &[("x", X), ("y", Y)]);
+        b.cancel_on_get = Some((manifest_key(), ctoken.clone()));
+        let engine = engine_with_set(
+            dir.path(),
+            RemoteCacheSet::with_backends(
+                vec![
+                    (
+                        "a",
+                        Arc::new(holding(Some(borsh_of(&m)), &[("x", cut(X)), ("y", Y)])),
+                    ),
+                    ("b", Arc::new(b)),
+                ],
+                dir.path().to_path_buf(),
+            ),
+        );
+        let first = engine
+            .remote_caches
+            .locate(&ctoken, &addr(), "h", Need::Manifest)
+            .await
+            .expect("located");
+        assert_eq!(engine.remote_caches.cache_name(&first), "a");
+
+        let err = engine
+            .pull_remote_blob_from_any(&ctoken, &addr(), "h", &first, &want(&m, "x"))
+            .await
+            .expect_err("a cancelled fall-through is not a miss");
+        assert!(err.is::<crate::engine::error::CancelledError>(), "{err:#}");
+        assert!(
+            !engine
+                .local_cache
+                .exists(&addr(), "h", "x")
+                .expect("exists")
+        );
+        let tmp = engine.remote_tmp_dir().await.expect("tmp dir");
+        assert_eq!(temp_blobs(tmp), Vec::<PathBuf>::new());
+    }
+
+    /// The key check compares the manifest's target with the address it was
+    /// looked up under; a target with args must round-trip through upload
+    /// and hit, not be rejected as another revision.
+    #[tokio::test]
+    async fn a_target_with_args_round_trips_the_key_check() {
+        let writer_dir = tempfile::tempdir().expect("tempdir");
+        let target = mk_addr("p", "t", &[("os", "linux/amd64"), ("mode", "a b")]);
+        let (backend, writer) =
+            cache_built_at(writer_dir.path(), "c", &target, "h", b"data", "ho-data").await;
+        let local = writer
+            .read_manifest_blocking(&never(), &target, "h")
+            .await
+            .expect("read manifest")
+            .expect("manifest");
+        let want = local.artifacts.first().expect("one artifact").clone();
+
+        let reader_dir = tempfile::tempdir().expect("tempdir");
+        let reader = engine_with_set(
+            reader_dir.path(),
+            RemoteCacheSet::with_backends(vec![("c", backend)], reader_dir.path().to_path_buf()),
+        );
+        let (_, rev) = reader
+            .probe_remote_revision(&never(), &target, "h", &["out".to_string()])
+            .await
+            .expect("probe")
+            .expect("the revision passes the key check");
+        assert!(
+            reader
+                .pull_remote_blob_from_any(&never(), &target, "h", &rev, &want)
+                .await
+                .expect("pull")
+        );
+        assert!(
+            !reader
+                .remote_caches
+                .caches
+                .first()
+                .expect("c")
+                .damage_warned
+                .load(Ordering::Relaxed),
+            "nothing was reported damaged"
+        );
+    }
+
+    /// `entry_for` matches the whole entry, and never an empty hashout: a log
+    /// identifies nothing, so no tier's log is ever taken for another's.
+    #[test]
+    fn entry_for_matches_the_whole_entry_and_never_an_empty_hashout() {
+        let mut m = xy_manifest();
+        m.artifacts.push(RemoteManifestArtifact {
+            hashout: String::new(),
+            group: String::new(),
+            name: "log".to_string(),
+            size: 3,
+            r#type: ManifestArtifactType::Log,
+            content_type: ManifestArtifactContentType::Tar,
+            encoding: ManifestArtifactEncoding::None,
+        });
+        let rev = RemoteRevision::new(0, m.clone());
+        assert!(rev.entry_for(&want(&m, "x")).is_some(), "the same entry");
+        assert!(
+            rev.entry_for(&want(&m, "log")).is_none(),
+            "an empty hashout never matches, even itself"
+        );
+        type Change = fn(&mut ManifestArtifact);
+        let changes: [(&str, Change); 5] = [
+            ("hashout", |w| w.hashout.push('!')),
+            ("size", |w| w.size += 1),
+            ("encoding", |w| w.encoding = ManifestArtifactEncoding::Zstd),
+            ("group", |w| w.group.push('!')),
+            ("type", |w| w.r#type = ManifestArtifactType::SupportFile),
+        ];
+        for (what, change) in changes {
+            let mut w = want(&m, "x");
+            change(&mut w);
+            assert!(rev.entry_for(&w).is_none(), "another {what}");
+        }
     }
 }
