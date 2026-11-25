@@ -694,7 +694,13 @@ impl Engine {
         }
         let Some(rev) = self
             .remote_caches()
-            .fetch_manifest(&ctoken, addr, hashin)
+            .locate(
+                &ctoken,
+                addr,
+                hashin,
+                crate::engine::remote_cache::Need::Manifest,
+                None,
+            )
             .await
             .with_context(|| format!("fetching the remote manifest of {addr} {hashin}"))?
         else {

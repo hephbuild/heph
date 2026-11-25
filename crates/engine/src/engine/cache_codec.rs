@@ -423,73 +423,116 @@ pub(crate) struct SeekableDecoder {
     pos: u64,
 }
 
-impl SeekableDecoder {
-    pub(crate) fn open(mut src: Box<dyn ReadSeek + Send>) -> anyhow::Result<Self> {
-        let len = src.seek(SeekFrom::End(0)).context("size zstd blob")?;
-        anyhow::ensure!(
-            len >= (SKIPPABLE_HEADER_SIZE + FOOTER_SIZE) as u64,
-            "zstd blob of {len} bytes is too short to hold a seek table"
-        );
-        src.seek(SeekFrom::Start(len - FOOTER_SIZE as u64))
-            .context("seek to zstd seek table footer")?;
-        let mut footer = [0u8; FOOTER_SIZE];
-        src.read_exact(&mut footer)
-            .context("read zstd seek table footer")?;
-        let frames = u32_at(&footer, 0)?;
-        let descriptor = footer.get(4).copied().unwrap_or_default();
-        anyhow::ensure!(
-            u32_at(&footer, 5)? == SEEKABLE_MAGIC,
-            "zstd blob does not end with a seek table: truncated, or not in the seekable format"
-        );
-        anyhow::ensure!(
-            descriptor & DESCRIPTOR_RESERVED == 0,
-            "zstd seek table descriptor {descriptor:#x} sets reserved bits"
-        );
-        let entry: u64 = if descriptor & DESCRIPTOR_CHECKSUM != 0 {
-            ENTRY_SIZE as u64 + 4
-        } else {
-            ENTRY_SIZE as u64
-        };
-        let body = u64::from(frames) * entry + FOOTER_SIZE as u64;
-        let table_len = SKIPPABLE_HEADER_SIZE as u64 + body;
-        anyhow::ensure!(
-            table_len <= len,
-            "zstd seek table of {frames} frames is longer than the {len}-byte blob"
-        );
-        let table_start = len - table_len;
-        src.seek(SeekFrom::Start(table_start))
-            .context("seek to zstd seek table")?;
-        let mut table = vec![0u8; usize::try_from(table_len - FOOTER_SIZE as u64)?];
-        src.read_exact(&mut table).context("read zstd seek table")?;
-        anyhow::ensure!(
-            u32_at(&table, 0)? == SKIPPABLE_MAGIC && u64::from(u32_at(&table, 4)?) == body,
-            "zstd seek table has a malformed frame header"
-        );
+/// Check a blob pulled from a remote against the decoded size `size` its
+/// manifest entry records, before it reaches the local cache.
+///
+/// A raw blob's stored length is its decoded length. A zstd blob's decoded
+/// length is what its seek table sums to, and reading the table also checks
+/// that its frames account for every stored byte, so a blob cut anywhere —
+/// mid-frame, between frames, or through the table — fails here. Both cost a
+/// seek and, for zstd, two small reads at the end of a file just written:
+/// nothing on the hit path's critical bytes.
+///
+/// `Err` says why the blob cannot be served: the tier that sent it is
+/// rejected for this blob (a restore that died part-way, a corrupt object),
+/// never the target.
+pub(crate) fn check_pulled_length<R: Read + Seek + ?Sized>(
+    stored: &mut R,
+    encoding: &ManifestArtifactEncoding,
+    size: u64,
+) -> anyhow::Result<()> {
+    let decoded = match encoding {
+        ManifestArtifactEncoding::None => stored.seek(SeekFrom::End(0)).context("size raw blob")?,
+        ManifestArtifactEncoding::Zstd => read_seek_table(stored)?
+            .1
+            .last()
+            .copied()
+            .unwrap_or_default(),
+        ManifestArtifactEncoding::Gzip => anyhow::bail!("gzip cache blobs are not supported"),
+    };
+    anyhow::ensure!(
+        decoded == size,
+        "blob decodes to {decoded} bytes, but its manifest records {size}"
+    );
+    Ok(())
+}
 
-        let cap = usize::try_from(frames)? + 1;
-        let mut stored = Vec::with_capacity(cap);
-        let mut decoded = Vec::with_capacity(cap);
-        let (mut c_end, mut d_end) = (0u64, 0u64);
+/// Read and validate the seek table at the end of `src`: the frames' start
+/// offsets in the stored bytes and in the decoded bytes, each starting at 0
+/// and holding one more element than there are frames. Fails on a blob that
+/// is truncated or padded, since its frames must cover every stored byte.
+fn read_seek_table<R: Read + Seek + ?Sized>(src: &mut R) -> anyhow::Result<(Vec<u64>, Vec<u64>)> {
+    let len = src.seek(SeekFrom::End(0)).context("size zstd blob")?;
+    anyhow::ensure!(
+        len >= (SKIPPABLE_HEADER_SIZE + FOOTER_SIZE) as u64,
+        "zstd blob of {len} bytes is too short to hold a seek table"
+    );
+    src.seek(SeekFrom::Start(len - FOOTER_SIZE as u64))
+        .context("seek to zstd seek table footer")?;
+    let mut footer = [0u8; FOOTER_SIZE];
+    src.read_exact(&mut footer)
+        .context("read zstd seek table footer")?;
+    let frames = u32_at(&footer, 0)?;
+    let descriptor = footer.get(4).copied().unwrap_or_default();
+    anyhow::ensure!(
+        u32_at(&footer, 5)? == SEEKABLE_MAGIC,
+        "zstd blob does not end with a seek table: truncated, or not in the seekable format"
+    );
+    anyhow::ensure!(
+        descriptor & DESCRIPTOR_RESERVED == 0,
+        "zstd seek table descriptor {descriptor:#x} sets reserved bits"
+    );
+    let entry: u64 = if descriptor & DESCRIPTOR_CHECKSUM != 0 {
+        ENTRY_SIZE as u64 + 4
+    } else {
+        ENTRY_SIZE as u64
+    };
+    let body = u64::from(frames) * entry + FOOTER_SIZE as u64;
+    let table_len = SKIPPABLE_HEADER_SIZE as u64 + body;
+    anyhow::ensure!(
+        table_len <= len,
+        "zstd seek table of {frames} frames is longer than the {len}-byte blob"
+    );
+    let table_start = len - table_len;
+    src.seek(SeekFrom::Start(table_start))
+        .context("seek to zstd seek table")?;
+    let mut table = vec![0u8; usize::try_from(table_len - FOOTER_SIZE as u64)?];
+    src.read_exact(&mut table).context("read zstd seek table")?;
+    anyhow::ensure!(
+        u32_at(&table, 0)? == SKIPPABLE_MAGIC && u64::from(u32_at(&table, 4)?) == body,
+        "zstd seek table has a malformed frame header"
+    );
+
+    let cap = usize::try_from(frames)? + 1;
+    let mut stored = Vec::with_capacity(cap);
+    let mut decoded = Vec::with_capacity(cap);
+    let (mut c_end, mut d_end) = (0u64, 0u64);
+    stored.push(c_end);
+    decoded.push(d_end);
+    let entry = usize::try_from(entry)?;
+    for i in 0..usize::try_from(frames)? {
+        let at = SKIPPABLE_HEADER_SIZE + i * entry;
+        let c = u64::from(u32_at(&table, at)?);
+        let d = u64::from(u32_at(&table, at + 4)?);
+        anyhow::ensure!(
+            d <= MAX_FRAME_DECODED,
+            "zstd frame {i} claims {d} decoded bytes"
+        );
+        c_end += c;
+        d_end += d;
         stored.push(c_end);
         decoded.push(d_end);
-        let entry = usize::try_from(entry)?;
-        for i in 0..usize::try_from(frames)? {
-            let at = SKIPPABLE_HEADER_SIZE + i * entry;
-            let c = u64::from(u32_at(&table, at)?);
-            let d = u64::from(u32_at(&table, at + 4)?);
-            anyhow::ensure!(
-                d <= MAX_FRAME_DECODED,
-                "zstd frame {i} claims {d} decoded bytes"
-            );
-            c_end += c;
-            d_end += d;
-            stored.push(c_end);
-            decoded.push(d_end);
-        }
-        anyhow::ensure!(
-            c_end == table_start,
-            "zstd seek table frames cover {c_end} bytes, but {table_start} precede the table"
-        );
+    }
+    anyhow::ensure!(
+        c_end == table_start,
+        "zstd seek table frames cover {c_end} bytes, but {table_start} precede the table"
+    );
+    Ok((stored, decoded))
+}
+
+impl SeekableDecoder {
+    pub(crate) fn open(mut src: Box<dyn ReadSeek + Send>) -> anyhow::Result<Self> {
+        let (stored, decoded) = read_seek_table(&mut *src)?;
         Ok(Self {
             src,
             stored,
@@ -863,6 +906,47 @@ pub(crate) mod tests {
             assert!(seekable(short.clone()).is_err(), "seekable open, cut {cut}");
             assert!(stream(short).is_err(), "stream, cut {cut}");
         }
+    }
+
+    /// A pulled blob is checked against its manifest's decoded `size`: a raw
+    /// blob by its length, a zstd blob by its seek table. The whole blob
+    /// passes; one cut anywhere, or a manifest naming another size, does not.
+    #[test]
+    fn a_pulled_blob_is_checked_against_its_manifest_size() {
+        let check = |stored: &[u8], encoding: &ManifestArtifactEncoding, size: u64| {
+            check_pulled_length(&mut io::Cursor::new(stored), encoding, size)
+        };
+
+        let data = sample(2 * F + 99, 13);
+        let size = data.len() as u64;
+        let raw = ManifestArtifactEncoding::None;
+        assert!(check(&data, &raw, size).is_ok(), "whole raw blob");
+        assert!(
+            check(&data[..data.len() - 1], &raw, size).is_err(),
+            "raw, cut 1"
+        );
+        assert!(
+            check(&data[..F], &raw, size).is_err(),
+            "raw, cut to one frame"
+        );
+        assert!(check(&data, &raw, size + 1).is_err(), "raw, another size");
+
+        let zstd = ManifestArtifactEncoding::Zstd;
+        let stored = encode(&data);
+        assert!(check(&stored, &zstd, size).is_ok(), "whole zstd blob");
+        assert!(
+            check(&stored, &zstd, size - 1).is_err(),
+            "zstd, another size"
+        );
+        let table = SKIPPABLE_HEADER_SIZE + 3 * ENTRY_SIZE + FOOTER_SIZE;
+        for cut in [1, table, table + 1, stored.len() / 2] {
+            let short = stored.get(..stored.len() - cut).expect("cut");
+            assert!(check(short, &zstd, size).is_err(), "zstd, cut {cut}");
+        }
+        assert!(
+            check(&[], &zstd, 0).is_err(),
+            "an empty zstd blob has no table"
+        );
     }
 
     /// The case the seekable format exists for: a compressed artifact on the

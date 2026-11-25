@@ -1390,7 +1390,7 @@ impl Engine {
             .filter(move |a| artifact_is_needed(a, outputs, support_needed))
     }
 
-    /// Names of the blobs a caller asking for `outputs` needs that are not in the
+    /// The entries of the blobs a caller asking for `outputs` needs that are not in the
     /// local cache yet — exactly what has to be pulled from a remote before
     /// [`artifacts_from_manifest`](Self::artifacts_from_manifest) can serve the
     /// read.
@@ -1398,14 +1398,14 @@ impl Engine {
     /// A non-empty result is the normal state of a revision whose manifest came
     /// from a remote: the manifest records the revision's identity and hashouts,
     /// not which of its blobs happen to be resident.
-    pub(crate) async fn missing_local_blobs(
+    pub(crate) async fn missing_local_blobs<'m>(
         &self,
         _ctoken: &dyn Cancellable,
         addr: &Addr,
         hashin: &str,
-        manifest: &Manifest,
-        outputs: &[String],
-    ) -> anyhow::Result<Vec<String>> {
+        manifest: &'m Manifest,
+        outputs: &'m [String],
+    ) -> anyhow::Result<Vec<&'m ManifestArtifact>> {
         // Stays on the calling worker rather than going to `hcore::blocking`: this
         // is a walk of an already-parsed manifest plus one indexed point lookup per
         // needed artifact — no bytes read, no compression — and a `'static` job
@@ -1422,7 +1422,7 @@ impl Engine {
                     format!("probe local blob {} for {addr} {hashin}", artifact.name)
                 })?
             {
-                missing.push(artifact.name.clone());
+                missing.push(artifact);
             }
         }
         Ok(missing)

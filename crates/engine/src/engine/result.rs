@@ -23,7 +23,9 @@ use hmodel::htpkg::PkgBuf;
 
 use crate::engine::driver::sandbox::Sandbox;
 use crate::engine::link::LinkedTargetDef;
-use crate::engine::local_cache::{BlobResidency, CacheArtifact, Manifest, ManifestArtifactType};
+use crate::engine::local_cache::{
+    BlobResidency, CacheArtifact, Manifest, ManifestArtifact, ManifestArtifactType,
+};
 use crate::engine::remote_cache::RemoteRevision;
 use crate::engine::result_lock::ResultReadGuard;
 use anyhow::Context;
@@ -2132,11 +2134,11 @@ async fn pull_one_remote_blob(
     rev: Arc<RemoteRevision>,
     addr: Addr,
     hashin: String,
-    name: String,
+    want: ManifestArtifact,
 ) -> anyhow::Result<bool> {
     let ctoken = rs.ctoken().clone_arc();
     engine
-        .pull_remote_blobs(ctoken.as_ref(), &addr, &hashin, &rev, &[name])
+        .pull_remote_blob_from_any(ctoken.as_ref(), &addr, &hashin, &rev, &want)
         .await
 }
 
@@ -3910,19 +3912,10 @@ impl Engine {
         let Some(rev) = self.remote_revision(rs, remote, def, hashin).await? else {
             return Ok(None);
         };
-        // The local manifest and the remote one can disagree on blob names: a
-        // `manifest-v1.borsh` an older heph mirrored names bare blobs, and the
-        // remote now holds a v2 revision of the same hashin under suffixed
-        // names. Such a blob is unobtainable, not a bug: rebuild.
-        if let Some(name) = missing.iter().find(|name| !rev.names_blob(name)) {
-            tracing::debug!(
-                %addr,
-                hashin,
-                blob = %name,
-                "remote revision does not name a blob the local manifest needs; rebuilding"
-            );
-            return Ok(None);
-        }
+        // Each blob is pulled from the first cache whose manifest names it with
+        // the local manifest's type, group and hashout — not by name alone (see
+        // `RemoteRevision::entry_for`). One no cache serves is unobtainable, not
+        // a bug: rebuild.
         Ok(self
             .pull_missing_blobs(rs, addr, hashin, rev, missing)
             .await?
@@ -3967,9 +3960,17 @@ impl Engine {
         if !def.target.cache.remote_enabled || !self.remote_caches.has_readable() {
             return Ok(None);
         }
+        // The manifest alone: callers of this cell need different blobs, and
+        // each pull falls through past a cache that cannot serve its own.
         Ok(self
             .remote_caches
-            .fetch_manifest(rs.ctoken(), &def.target.addr, hashin)
+            .locate(
+                rs.ctoken(),
+                &def.target.addr,
+                hashin,
+                crate::engine::remote_cache::Need::Manifest,
+                None,
+            )
             .await
             .with_context(|| format!("locating remote revision for {} {hashin}", def.target.addr))?
             .map(Arc::new))
@@ -3990,7 +3991,7 @@ impl Engine {
         addr: &Addr,
         hashin: &str,
         rev: &Arc<RemoteRevision>,
-        missing: Vec<String>,
+        missing: Vec<&ManifestArtifact>,
     ) -> anyhow::Result<bool> {
         let addr_s = addr.format();
         let hashin = hashin.to_string();
@@ -4005,16 +4006,16 @@ impl Engine {
             },
             async {
                 let mut pulls = Vec::with_capacity(missing.len());
-                for name in &missing {
-                    let key = (AddrKey(addr.clone()), hashin.clone(), name.clone());
+                for want in &missing {
+                    let key = (AddrKey(addr.clone()), hashin.clone(), want.name.clone());
                     let engine = Arc::clone(self);
                     let rs_owned = Arc::clone(rs);
                     let rev = Arc::clone(rev);
                     let addr = addr.clone();
                     let hashin = hashin.clone();
-                    let name = name.clone();
+                    let want = (*want).clone();
                     pulls.push(rs.data.mem_remote_blob.once(key, move || {
-                        pull_one_remote_blob(engine, rs_owned, rev, addr, hashin, name)
+                        pull_one_remote_blob(engine, rs_owned, rev, addr, hashin, want)
                     }));
                 }
                 // Bounded: one in-flight pull holds a temp file plus a live
@@ -4479,7 +4480,7 @@ impl Engine {
                             // hits, not just local ones.
                             rs.emit(crate::engine::event::BuildEventKind::RemoteCacheHit {
                                 addr: addr_s.clone(),
-                                cache: self.remote_caches.cache_name(&rev).map(str::to_owned),
+                                cache: Some(self.remote_caches.cache_name(&rev).to_owned()),
                             });
                             rs.emit(crate::engine::event::BuildEventKind::CacheOutcome {
                                 addr: addr_s,
