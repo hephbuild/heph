@@ -729,13 +729,22 @@ impl Server<'_> {
                 }
             }
             Merge::Replace => {
-                // Only a site that needs no registry gets here without one
-                // (see `locate`): a namespace's members are the globals'.
-                let registry = self.registry().unwrap_or_default();
-                self.with_ctx(&located.key, &registry, |ctx| {
-                    handlers::items(&located.resolution.site, ctx)
-                })
-                .unwrap_or_default()
+                let site = &located.resolution.site;
+                let registry = match self.registry() {
+                    Some(registry) => Some(registry),
+                    // A namespace's members are the globals', not the
+                    // registry's. Any other site answers nothing until the
+                    // registry lands, whatever `locate` let through.
+                    None if matches!(site, Site::Member { .. }) => {
+                        Some(Arc::new(Registry::default()))
+                    }
+                    None => None,
+                };
+                registry
+                    .and_then(|registry| {
+                        self.with_ctx(&located.key, &registry, |ctx| handlers::items(site, ctx))
+                    })
+                    .unwrap_or_default()
             }
         };
         self.log("completion", &located, items.len(), started);
@@ -790,11 +799,17 @@ impl Server<'_> {
             // does not have included; any other receiver's member is whatever
             // the stock analysis knows.
             Site::Member { path, .. } => {
-                match self.with_ctx(&located.key, reg, |ctx| {
-                    handlers::is_namespace(path.as_deref(), ctx).then(|| handlers::hover(site, ctx))
-                }) {
-                    Some(Some(heph)) => heph,
-                    _ => self.stock_hover(params, &located, reg),
+                // `Some(answer)` for a known namespace, `answer` possibly
+                // empty; `None` hands the member to the stock analysis.
+                let heph = self
+                    .with_ctx(&located.key, reg, |ctx| {
+                        handlers::is_namespace(path.as_deref(), ctx)
+                            .then(|| handlers::hover(site, ctx))
+                    })
+                    .flatten();
+                match heph {
+                    Some(answer) => answer,
+                    None => self.stock_hover(params, &located, reg),
                 }
             }
             _ => self

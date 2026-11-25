@@ -25,14 +25,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-/// Build the Starlark globals: the static `starlark_module` builtins, the static
-/// `heph.core` host/platform namespace, plus a dynamic `heph.<provider>.<fn>`
-/// namespace for every function the providers expose. Built once per
-/// buildfile-provider lifetime (the registry is fixed after the engine injects it).
 /// One member of a namespace in the globals (`typing.Any`, `heph.core.os`),
 /// for LSP member completion/hover: bare name, a one-line signature for the
 /// completion detail, and the full rendered doc.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct NamespaceMember {
     pub name: String,
     pub detail: String,
@@ -2550,6 +2546,34 @@ pub(crate) mod tests {
         let mut result = empty_run_result().expect("empty result");
         result.targets = targets;
         result
+    }
+
+    /// The LSP's member completion looks namespaces up by these dotted keys.
+    #[test]
+    fn namespace_members_are_keyed_by_dotted_path() {
+        let doc = build_globals(
+            &FunctionRegistry::default(),
+            &crate::pluginbuildfile::types::DriverKwargs::default(),
+        )
+        .documentation();
+        let namespaces = namespace_members(&doc);
+        for key in ["typing", "heph", "heph.core"] {
+            assert!(
+                namespaces.contains_key(key),
+                "{key}: {:?}",
+                namespaces.keys()
+            );
+        }
+        let core: Vec<&str> = namespaces["heph.core"]
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect();
+        assert!(core.contains(&"os"), "{core:?}");
+        let typing: Vec<&str> = namespaces["typing"]
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect();
+        assert!(typing.contains(&"Callable"), "{typing:?}");
     }
 
     #[test]

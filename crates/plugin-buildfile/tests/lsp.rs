@@ -260,6 +260,12 @@ fn split_cursor_in(fixture: &str, encoding: &str) -> (String, u32, u32) {
 
 /// The byte offset of a UTF-16 LSP position in `text`.
 fn byte_of(text: &str, pos: &Value) -> usize {
+    byte_of_in(text, pos, "utf-16")
+}
+
+/// The byte offset of an LSP position in `text`, the column counted in the
+/// named position encoding.
+fn byte_of_in(text: &str, pos: &Value, encoding: &str) -> usize {
     let line = pos["line"].as_u64().expect("line") as usize;
     let character = pos["character"].as_u64().expect("character") as usize;
     let mut starts = vec![0usize];
@@ -282,16 +288,25 @@ fn byte_of(text: &str, pos: &Value) -> usize {
         if units >= character {
             return start + off;
         }
-        units += c.len_utf16();
+        units += match encoding {
+            "utf-8" => c.len_utf8(),
+            "utf-32" => 1,
+            _ => c.len_utf16(),
+        };
     }
     text.len()
 }
 
 /// `text` with a completion item's text edit applied.
 fn apply(text: &str, item: &Value) -> String {
+    apply_in(text, item, "utf-16")
+}
+
+/// [`apply`], the edit's columns counted in the named position encoding.
+fn apply_in(text: &str, item: &Value, encoding: &str) -> String {
     let edit = &item["textEdit"];
-    let start = byte_of(text, &edit["range"]["start"]);
-    let end = byte_of(text, &edit["range"]["end"]);
+    let start = byte_of_in(text, &edit["range"]["start"], encoding);
+    let end = byte_of_in(text, &edit["range"]["end"], encoding);
     format!(
         "{}{}{}",
         &text[..start],
@@ -1265,6 +1280,102 @@ fn member_completion_lists_a_namespace_and_nothing_else() {
     assert!(text.contains("typing.Callable"), "{text}");
     let doc = lsp.open("l/BUILD", "x = typing.Nosu│ch\n");
     assert!(lsp.hover(&doc).is_null(), "no member, no hover");
+
+    // `heph.core` is one namespace among the globals' (looked up by its
+    // dotted path).
+    let doc = lsp.open("m/BUILD", "x = heph.core.│\n");
+    let got = labels(&lsp.completion(&doc));
+    for want in ["os", "resource"] {
+        assert!(got.iter().any(|l| l == want), "{want}: {got:?}");
+    }
+    let doc = lsp.open("n/BUILD", "x = heph.core.o│s()\n");
+    let text = hover_text(&lsp.hover(&doc));
+    assert!(!text.is_empty(), "heph.core.os has a hover");
+
+    // A root bound by a `load` or a parameter is not the global, read from
+    // the last good parse.
+    for (path, parses, dotted) in [
+        (
+            "o/BUILD",
+            "load(\"//x:y.star\", typing = \"foo\")\nx = typ│ing\n",
+            "load(\"//x:y.star\", typing = \"foo\")\nx = typing.│\n",
+        ),
+        (
+            "p/BUILD",
+            "def f(typing):\n    x = typ│ing\n",
+            "def f(typing):\n    x = typing.│\n",
+        ),
+    ] {
+        let doc = lsp.open(path, parses);
+        let doc = lsp.change(&doc, dotted);
+        let result = lsp.completion(&doc);
+        assert!(items(&result).is_empty(), "{dotted}: {result}");
+        let explained = lsp.explain(&doc);
+        assert_eq!(
+            explained["site"]["receiver"],
+            json!("rebound"),
+            "{explained}"
+        );
+        assert_eq!(explained["site"]["rebound"], json!("typing"), "{explained}");
+        assert_eq!(explained["site"]["path"], Value::Null, "{explained}");
+    }
+
+    // A member inside a call, a keyword value or a default is a member, not
+    // a keyword-name site.
+    for (path, fixture) in [
+        ("q/BUILD", "foo(typing.│)\n"),
+        ("r/BUILD", "target(name = \"x\", deps = typing.│)\n"),
+        ("s/BUILD", "def f(x = typing.│):\n    pass\n"),
+    ] {
+        let doc = lsp.open(path, fixture);
+        let explained = lsp.explain(&doc);
+        assert_eq!(kind(&explained), "member", "{fixture}: {explained}");
+        assert_eq!(explained["site"]["receiver"], json!("names"), "{explained}");
+        assert_eq!(explained["site"]["path"], json!(["typing"]), "{explained}");
+        let mut got = labels(&lsp.completion(&doc));
+        got.sort();
+        assert_eq!(got, typing, "{fixture}");
+    }
+
+    let doc = lsp.open("t/BUILD", "x = f().│\n");
+    let explained = lsp.explain(&doc);
+    assert_eq!(
+        explained["site"]["receiver"],
+        json!("expression"),
+        "{explained}"
+    );
+    assert_eq!(explained["site"]["path"], Value::Null, "{explained}");
+}
+
+/// A member's edit lands on the member in every position encoding, with a
+/// character that is two UTF-16 units and four UTF-8 bytes before it.
+#[test]
+fn member_completion_edit_after_non_ascii() {
+    for encoding in ["utf-16", "utf-8"] {
+        let mut lsp = Lsp::new();
+        lsp.initialize_with(json!({"general": {"positionEncodings": [encoding]}}));
+        assert_eq!(lsp.encoding, encoding);
+        for (path, fixture, want) in [
+            (
+                "a/BUILD",
+                "x = \"😀\"\ny = typing.Ca│\n",
+                "x = \"😀\"\ny = typing.Callable\n",
+            ),
+            (
+                "b/BUILD",
+                "y = [\"😀\", typing.Ca│]\n",
+                "y = [\"😀\", typing.Callable]\n",
+            ),
+        ] {
+            let doc = lsp.open(path, fixture);
+            let result = lsp.completion(&doc);
+            assert_eq!(
+                apply_in(&doc.text, &item(&result, "Callable"), encoding),
+                want,
+                "{encoding}: {fixture}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -2132,6 +2243,18 @@ fn empty_results_carry_a_reason() {
         Some("providers_loading")
     );
     assert!(heph_items(&lsp.completion(&doc)).is_empty());
+    // A namespace's members are the globals', not the registry's: `member`
+    // answers before the registry lands.
+    let member = lsp.open("m/BUILD", "x = typing.│\n");
+    let explained = lsp.explain(&member);
+    assert_eq!(kind(&explained), "member", "{explained}");
+    assert_eq!(reason(&explained), None, "{explained}");
+    let mut got = labels(&lsp.completion(&member));
+    got.sort();
+    assert_eq!(got, ["Any", "Callable", "Iterable", "Never"]);
+    let member = lsp.open("n/BUILD", "x = typing.Calla│ble\n");
+    let text = hover_text(&lsp.hover(&member));
+    assert!(text.contains("typing.Callable"), "{text}");
     gate.release();
     let deadline = std::time::Instant::now() + TIMEOUT;
     while reason(&lsp.explain(&doc)).is_some() {

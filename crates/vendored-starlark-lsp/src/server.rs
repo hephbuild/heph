@@ -673,7 +673,10 @@ impl<T: LspContext> Backend<T> {
 
                 match &autocomplete_type {
                     None | Some(AutocompleteType::None) => None,
-                    Some(AutocompleteType::Default) => Some(
+                    // heph: a type is any expression (`list[str]`, `typing.Any`,
+                    // a declared `record`, a loaded alias), so a type position
+                    // offers every name, not upstream's five primitives.
+                    Some(AutocompleteType::Default | AutocompleteType::Type) => Some(
                         self.default_completion_options(
                             &uri,
                             &document,
@@ -731,19 +734,6 @@ impl<T: LspContext> Backend<T> {
                             character,
                             workspace_root.as_deref(),
                         ))
-                        .collect(),
-                    ),
-                    // heph: a type is any expression (`list[str]`, `typing.Any`,
-                    // a declared `record`, a loaded alias), so a type position
-                    // offers every name, not upstream's five primitives.
-                    Some(AutocompleteType::Type) => Some(
-                        self.default_completion_options(
-                            &uri,
-                            &document,
-                            line,
-                            character,
-                            workspace_root.as_deref(),
-                        )
                         .collect(),
                     ),
                 }
