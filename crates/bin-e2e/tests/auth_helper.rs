@@ -118,6 +118,63 @@ fn the_git_helper_answers_the_protocol_as_a_process() {
     );
 }
 
+/// The helper's stdout, byte for byte, for the dialects this pin can answer.
+/// `heph`'s own commands moved to the `--json` output rules; the helper
+/// protocols are somebody else's documents and must not move with them: no
+/// reformatting, no trailing document newline rules, no `--json` flag.
+#[test]
+fn auth_helper_bytes_unchanged() {
+    let dist = Dist::locate();
+    let ws = Workspace::new().expect("workspace");
+    let pin = staged_pin(&ws, &dist);
+    let pin = pin.to_string_lossy();
+
+    let answer = |dialect: &str, op: Option<&str>, stdin: &[u8]| {
+        let mut argv = vec!["__auth-helper", dialect, "--pin", &pin];
+        argv.extend(op);
+        let mut child = ws
+            .cmd(&dist, &argv)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn the helper");
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin")
+            .write_all(stdin)
+            .expect("write the request");
+        let out = child.wait_with_output().expect("wait");
+        assert!(out.status.success(), "{}", describe(&out));
+        String::from_utf8(out.stdout).expect("utf-8")
+    };
+
+    // git: `key=value` lines and a blank line; the expiry is a Unix timestamp
+    // that depends on when the pin was minted, so only its digits are free.
+    let git = answer("git", Some("get"), b"protocol=https\nhost=git.example\n\n");
+    let (head, tail) = git
+        .split_once("password_expiry_utc=")
+        .unwrap_or_else(|| panic!("no expiry line: {git:?}"));
+    assert_eq!(
+        head,
+        "protocol=https\nhost=git.example\nusername=u\npassword=bin-e2e-material\n"
+    );
+    let digits = tail
+        .strip_suffix("\n\n")
+        .unwrap_or_else(|| panic!("{git:?}"));
+    assert!(
+        !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()),
+        "{git:?}"
+    );
+
+    // docker: one compact JSON object and a newline, keys in this order.
+    assert_eq!(
+        answer("docker", Some("get"), b"git.example\n"),
+        "{\"Secret\":\"bin-e2e-material\",\"ServerURL\":\"git.example\",\"Username\":\"u\"}\n"
+    );
+}
+
 /// The write half of the protocol succeeds and does nothing. A tool must not be
 /// able to substitute an identity into heph's store.
 #[test]

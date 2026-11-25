@@ -89,6 +89,30 @@ where
     run_progress_app(label, sink, session, interactive, dashboard, shutdown, body).await
 }
 
+/// [`run_with_progress`] for a command with output flags: under any of them
+/// the TUI stays off, so stdout carries the document and nothing else (I1).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "run_with_progress's arguments plus the output flags"
+)]
+pub(crate) async fn run_with_progress_out<F, Fut>(
+    label: impl Into<String>,
+    sink: LogSink,
+    session: &Arc<SessionSlot>,
+    no_tui: bool,
+    out: &impl output::OutputFlags,
+    dashboard: bool,
+    shutdown: hcore::shutdown::ShutdownTrigger,
+    body: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce(AppContext) -> Fut + Send + 'static,
+    Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    let interactive = unless_json(|| tui::should_use_tui(no_tui), out.enabled())();
+    run_progress_app(label, sink, session, interactive, dashboard, shutdown, body).await
+}
+
 /// [`run_with_progress`] with the TUI decision already made: `interactive`.
 async fn run_progress_app<F, Fut>(
     label: impl Into<String>,
