@@ -668,6 +668,10 @@ fn try_owner_write(
 /// interrupted. Only the start thread runs it, off the build path: the
 /// seal's exit path never checkpoints.
 fn fold_wal(conn: &Connection, deadline: Instant) -> rusqlite::Result<()> {
+    // Prepared before the watchdog starts: preparing reads the schema, and
+    // on a fresh connection rebuilds the WAL index first; an interrupt
+    // landing then is cleared by the statement's first step, and lost.
+    let mut fold = conn.prepare("PRAGMA wal_checkpoint(TRUNCATE)")?;
     let Some(left) = deadline.checked_duration_since(Instant::now()) else {
         return Ok(());
     };
@@ -687,7 +691,7 @@ fn fold_wal(conn: &Connection, deadline: Instant) -> rusqlite::Result<()> {
             tracing::debug!(error = %e, "cannot bound the catalog's WAL fold: skipped");
             return Ok(());
         }
-        let folded = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+        let folded = fold.query_row([], |_| Ok(()));
         drop(done);
         folded
     })
@@ -1561,5 +1565,93 @@ mod tests {
                 "{case}, broken catalog"
             );
         }
+    }
+
+    /// A catalog file under `root` with `pages` 4 KiB pages of rows left in
+    /// its WAL, as an owner leaves its write.
+    fn unfolded(root: &Path, pages: u32) -> u64 {
+        let conn = open_rw(root, true).expect("open");
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .expect("wal");
+        conn.pragma_update(None, "wal_autocheckpoint", 0)
+            .expect("no autocheckpoint");
+        conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)
+            .expect("no checkpoint on close");
+        conn.execute_batch(&format!(
+            "CREATE TABLE t (b BLOB);
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {pages})
+             INSERT INTO t SELECT randomblob(3500) FROM n;"
+        ))
+        .expect("rows");
+        drop(conn);
+        wal_len(root)
+    }
+
+    fn wal_len(root: &Path) -> u64 {
+        std::fs::metadata(root.join(format!("{FILE}-wal"))).map_or(0, |m| m.len())
+    }
+
+    /// A fold whose deadline has passed (the start's write took the whole
+    /// bound) is skipped: the WAL is left as it is, for the next start.
+    #[test]
+    fn a_fold_past_its_deadline_is_skipped() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let before = unfolded(tmp.path(), 16);
+        assert!(before > 0);
+        let conn = open_rw(tmp.path(), false).expect("open");
+        let past = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("an instant in the past");
+        fold_wal(&conn, past).expect("skipped");
+        assert_eq!(wal_len(tmp.path()), before, "the WAL was touched");
+        // In time, the same fold truncates it.
+        fold_wal(&conn, Instant::now() + Duration::from_secs(10)).expect("fold");
+        assert_eq!(wal_len(tmp.path()), 0);
+    }
+
+    /// On a fresh connection, preparing the fold rebuilds the WAL index from
+    /// the whole WAL. When that outlasts the deadline, the fold is skipped:
+    /// an interrupt landing then would be cleared by the fold's first step,
+    /// which would then copy the whole WAL unbounded.
+    #[test]
+    fn a_fold_whose_wal_index_outlasts_its_deadline_is_skipped() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let before = unfolded(tmp.path(), 16_384);
+        let conn = open_rw(tmp.path(), false).expect("open");
+        fold_wal(&conn, Instant::now() + Duration::from_millis(1)).expect("skipped");
+        assert_eq!(wal_len(tmp.path()), before, "the WAL was folded in");
+    }
+
+    /// The watchdog interrupts a fold still copying at its deadline: a WAL
+    /// far larger than a millisecond's copy stops short, as an error, and
+    /// the catalog still reads whole.
+    #[test]
+    fn a_fold_still_copying_at_its_deadline_is_interrupted() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pages = 16_384;
+        unfolded(tmp.path(), pages);
+        let conn = open_rw(tmp.path(), false).expect("open");
+        // Read first, as the owner's write has before its fold: the WAL
+        // index is built, and the fold's millisecond is all copying.
+        let rows = |conn: &Connection| -> u32 {
+            conn.query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+                .expect("count")
+        };
+        assert_eq!(rows(&conn), pages);
+        let err = fold_wal(&conn, Instant::now() + Duration::from_millis(1))
+            .expect_err("a 64 MiB fold in a millisecond");
+        assert_eq!(
+            err.sqlite_error_code(),
+            Some(ErrorCode::OperationInterrupted),
+            "{err}"
+        );
+        assert!(wal_len(tmp.path()) > 0, "the WAL was not truncated");
+        assert_eq!(rows(&conn), pages, "read after the interrupt");
+        drop(conn);
+        assert_eq!(
+            rows(&open_rw(tmp.path(), false).expect("reopen")),
+            pages,
+            "read on a new connection"
+        );
     }
 }
