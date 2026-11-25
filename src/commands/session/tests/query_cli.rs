@@ -216,6 +216,56 @@ async fn query_formats() {
     );
 }
 
+/// `--format json`'s `columns` and `types` of each explorer name are the
+/// same whichever source answers it: the catalog (the default), every kept
+/// recording (`--full`), one recording (`--from <id>`) and a
+/// `.hephsession` (`--from <path>`). They are the declared schema, which
+/// `--schema` prints: a consumer reads them once, not per source.
+#[tokio::test(flavor = "multi_thread")]
+async fn query_json_types_are_the_same_from_every_source() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().join("sessions");
+    let id = session(&root, 0, 1).encode();
+    let out = tempfile::tempdir().expect("tempdir");
+    let hs = out.path().join("run.hephsession");
+    let file = FileSource::new(&root);
+    export::export_ref(
+        &file,
+        opts(),
+        &ExportArgs {
+            reference: id.clone(),
+            output: Some(hs.clone()),
+            no_logs: false,
+            format: ExportFormat::Hephsession,
+        },
+        crate::engine::approval::read_notice_from_store,
+        &mut Vec::new(),
+        &super::refs::opener_in(out.path(), NoDownload),
+        no_note(),
+    )
+    .await
+    .expect("export a .hephsession");
+    let hs = hs.display().to_string();
+    let sources: [&[&str]; 4] = [&[], &["--full"], &["--from", &id], &["--from", &hs]];
+
+    for t in crate::tui::session::query::TABLES {
+        let want_columns: Vec<&str> = t.columns.iter().map(|(c, _)| *c).collect();
+        let want_types: Vec<&str> = t.columns.iter().map(|(_, ty)| *ty).collect();
+        let sql = format!("SELECT * FROM {}", t.name);
+        for from in sources {
+            let argv: Vec<&str> = from
+                .iter()
+                .copied()
+                .chain(["--format", "json", &sql])
+                .collect();
+            let ran = run_query(&root, &argv, "").await;
+            let v = json(&ran.out.unwrap_or_else(|e| panic!("{argv:?}: {e:#}")));
+            assert_eq!(v["columns"], serde_json::json!(want_columns), "{argv:?}");
+            assert_eq!(v["types"], serde_json::json!(want_types), "{argv:?}");
+        }
+    }
+}
+
 /// A table cell is one line, its control bytes escaped: a foreign file's
 /// text never reaches the terminal raw.
 #[tokio::test]
