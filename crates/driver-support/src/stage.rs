@@ -2586,16 +2586,43 @@ pub(crate) mod tests {
                 .map(|(p, b, x)| (p.as_str(), b.as_str(), *x))
                 .collect();
             let c = content("hhh", &borrowed);
-            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            const RUNS: usize = 4;
+            const ROUNDS: usize = 25;
+            use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+            let stop = Arc::new(AtomicBool::new(false));
+            // Holds taken by each run so far; `ROUNDS` once it is done.
+            let held: Arc<[AtomicUsize; RUNS]> = Arc::new(Default::default());
             let sweeper = {
-                let (stage, stop) = (stage.clone(), Arc::clone(&stop));
+                let (stage, stop, held) = (stage.clone(), Arc::clone(&stop), Arc::clone(&held));
                 std::thread::spawn(move || {
                     let mut swept = 0usize;
-                    // A pause per sweep, as any real `gc` has: a sweeper
-                    // spinning flat out can win every hold window, which the
-                    // hold reports as an error after its bounded retries.
-                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                        swept += clear_stage(&stage).0;
+                    while !stop.load(Ordering::Relaxed) {
+                        let removed = clear_stage(&stage).0;
+                        swept += removed;
+                        // After a removal, sweep again only once every run
+                        // still going has taken a new hold. A real `gc` does
+                        // not remove the same entry again within milliseconds,
+                        // and a sweeper that did could win every attempt a
+                        // run makes: the window between materializing and
+                        // holding includes the read lock's poll backoff (up to
+                        // 100ms) whenever another run holds the entry's lock.
+                        // On a loaded runner that came out about once in 25
+                        // runs as "kept disappearing … (8 attempts)". That is
+                        // the stage-clearing loop the bounded retry exists to
+                        // report. Waiting this way, each removal costs a run
+                        // at most one attempt, whatever the scheduling.
+                        if removed > 0 {
+                            let seen: Vec<usize> =
+                                held.iter().map(|h| h.load(Ordering::Acquire)).collect();
+                            while !stop.load(Ordering::Relaxed)
+                                && held.iter().zip(&seen).any(|(h, &s)| {
+                                    let now = h.load(Ordering::Acquire);
+                                    now == s && now < ROUNDS
+                                })
+                            {
+                                std::thread::sleep(std::time::Duration::from_micros(500));
+                            }
+                        }
                         std::thread::sleep(std::time::Duration::from_micros(500));
                     }
                     swept
@@ -2606,11 +2633,15 @@ pub(crate) mod tests {
                 .enable_all()
                 .build()?;
             let res: anyhow::Result<()> = rt.block_on(async {
-                let runs = (0..4).map(|w| {
-                    let (c, stage, root) =
-                        (Arc::clone(&c), stage.clone(), tmp.path().to_path_buf());
+                let runs = (0..RUNS).map(|w| {
+                    let (c, stage, root, held) = (
+                        Arc::clone(&c),
+                        stage.clone(),
+                        tmp.path().to_path_buf(),
+                        Arc::clone(&held),
+                    );
                     tokio::spawn(async move {
-                        for round in 0..25 {
+                        for round in 0..ROUNDS {
                             let into = root.join(format!("run-{w}-{round}"));
                             let hold = stage_and_link(
                                 &c,
@@ -2624,6 +2655,7 @@ pub(crate) mod tests {
                             )
                             .await?
                             .context("held")?;
+                            held[w].fetch_add(1, Ordering::Release);
                             for i in 0..64 {
                                 let got =
                                     std::fs::read_to_string(into.join(format!("sdk/f{i:02}")))
