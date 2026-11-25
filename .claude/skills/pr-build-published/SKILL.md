@@ -18,14 +18,18 @@ Goal: report whether the current PR's build artifacts were published as a
 complete pre-release, or why not.
 
 How it works: publishing is spread over three jobs in `.github/workflows/heph.yml`.
-`prerelease_create` ("Create pre-release") creates the empty pre-release, each
-`build` leg ("Build <os>/<arch>") uploads its own files as soon as it is built,
-and `manifests` (display name **"Plugin manifests"**) uploads the plugin
-manifests and `heph-govet` once every build has succeeded, then marks the
-release body "complete". The script watches that last job, matching on its
+`prerelease_create` ("Create pre-release") creates the pre-release and uploads
+`heph-govet`. Each `build` leg ("Build <os>/<arch>") uploads its own files as
+soon as it is built, then republishes the plugin manifests to cover its
+platform (`.github/workflows/publish-plugin-manifests.sh`), so a platform is
+installable before the slowest one lands. `manifests` (display name **"Plugin
+manifests"**) runs the same script once every build has succeeded, then marks
+the release body "complete". The script watches that last job, matching on its
 display name (what the GitHub Actions jobs API returns). It is **skipped** when
-any build leg failed — the pre-release then stays partial — and **fails** when
-a step (artifact download, manifest generation, the upload) errors.
+any build leg failed — the platforms that built are then on the pre-release,
+manifests included, but it stays "partial" — and **fails** when a step (the
+manifest publish, the body edit) errors. A leg's own manifest step is
+`continue-on-error`: a warning there is repaired by this job.
 
 ## Run
 
@@ -48,8 +52,8 @@ bash .claude/skills/pr-build-published/watch-upload-artifacts.sh
   - Exit 2 (`no PR`) → there is no open PR for the current branch; tell the user to open one.
   - Exit 3 (`no CI run`) → the `CI` workflow has not started for the head commit yet.
   - Exit 4 (`skipped`) → the job was skipped because a build leg (or `gen`/`govet`) did not
-    succeed; the platforms that did build are already on the pre-release. Relay that and the
-    run URL.
+    succeed; the platforms that did build are already on the pre-release, with plugin
+    manifests listing them. Relay that and the run URL.
   - Exit 5 (`failed`) → the job ran but concluded `failure`/`cancelled`/`timed_out`; relay the
     failing step name(s) the script reported and the run URL.
   - Exit 6 (`timeout`) → the job did not reach a terminal state within the deadline; share the

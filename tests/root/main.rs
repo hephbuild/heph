@@ -35,6 +35,7 @@ mod gc_cli;
 mod lint_gate;
 mod log_cmd;
 mod lsp_lifecycle;
+mod publish_manifests;
 mod resources_gate;
 mod run_outputs_cli;
 mod stack_status;

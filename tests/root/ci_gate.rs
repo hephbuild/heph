@@ -1190,9 +1190,12 @@ fn only_release_promotes_to_mainline() {
 }
 
 /// Every asset family the old single `Pre-release` job published still has an
-/// upload step: the CLI in both flavours, heph-bench, the four plugin cdylibs,
-/// their manifests and checksums, and heph-govet — which the go plugin
-/// downloads from `releases/download/<version>/heph-govet_<os>_<arch>`.
+/// upload step: the CLI in both flavours, heph-bench, the four plugin cdylibs
+/// and heph-govet — which the go plugin downloads from
+/// `releases/download/<version>/heph-govet_<os>_<arch>`. The manifests and
+/// their checksums go up through `publish-plugin-manifests.sh`, which
+/// `every_build_publishes_the_manifests_after_its_cdylibs` and
+/// `tests/root/publish_manifests.rs` cover.
 #[test]
 fn every_release_asset_has_an_uploader() {
     let wf = parsed();
@@ -1214,8 +1217,6 @@ fn every_release_asset_has_an_uploader() {
         families.push(format!(
             "\"heph-{plugin}-plugin_${{OS}}_${{ARCH}}.${{EXT}}\""
         ));
-        families.push(format!("dist/heph-{plugin}-plugin.json "));
-        families.push(format!("dist/heph-{plugin}-plugin.json.sha256"));
     }
     let missing: Vec<&String> = families
         .iter()
@@ -1225,6 +1226,97 @@ fn every_release_asset_has_an_uploader() {
         missing.is_empty(),
         "no `gh release upload` publishes {missing:?}"
     );
+}
+
+const PUBLISH_MANIFESTS: &str = "bash .github/workflows/publish-plugin-manifests.sh";
+
+/// A platform's plugins are installable the moment that platform is built:
+/// each `build` leg republishes the manifests itself instead of leaving it to
+/// `manifests`, which waits for the slowest platform. The step comes after the
+/// leg's own upload, because the script builds the manifests from the
+/// release's asset listing — run before it, the leg's platform is missing from
+/// what it publishes, and the convergence argument in the script's header
+/// (every leg uploads before its first listing) no longer holds.
+///
+/// `manifests` runs it too, and must: it is the only run that no leg can
+/// overlap, and the one whose failure fails a check.
+#[test]
+fn every_build_publishes_the_manifests_after_its_cdylibs() {
+    let wf = parsed();
+    let build = job(&wf, "build").expect("a `build` job");
+    let leg_steps = steps(build);
+    let upload = leg_steps
+        .iter()
+        .position(|s| field(s, "name") == "Publish to the pre-release")
+        .expect("the build leg uploads its own files");
+    let at = leg_steps
+        .iter()
+        .position(|s| field(s, "run").trim() == PUBLISH_MANIFESTS)
+        .expect("the build leg publishes the plugin manifests");
+    assert!(
+        at > upload,
+        "the build leg publishes the manifests before its own cdylibs are on \
+         the release, so its platform is missing from them"
+    );
+    let step = leg_steps.get(at).expect("the step just found");
+    assert_eq!(
+        field(step, "if"),
+        "needs.prerelease_create.outputs.publish == 'true'"
+    );
+    // Without devenv the leg has no `go` to build the generator with; without
+    // `continue-on-error` an API outage fails a build that succeeded; without a
+    // timeout a hung request holds the leg until the job's 90 minutes.
+    assert!(field(step, "shell").starts_with("devenv shell"));
+    assert_eq!(
+        step.get("continue-on-error").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert!(step.get("timeout-minutes").is_some());
+    assert_eq!(
+        env_of(step, "EXPECT_PLATFORMS"),
+        Some("${{ matrix.os }}_${{ matrix.arch }}"),
+        "a leg must expect its own platform, or a lagging listing that lacks \
+         it reads as current"
+    );
+
+    let manifests = job(&wf, "manifests").expect("a `manifests` job");
+    let last = step_running_exactly(manifests, PUBLISH_MANIFESTS)
+        .expect("`manifests` republishes the plugin manifests after every build");
+    assert!(
+        last.get("continue-on-error").is_none(),
+        "`manifests` is the backstop; its publish must fail the job"
+    );
+    assert!(
+        needs_of(manifests).iter().any(|n| n == "build"),
+        "`manifests` must wait for every build leg, or a leg can overlap it"
+    );
+    let mut legs: Vec<String> = coords(build).iter().map(|c| c.replace('/', "_")).collect();
+    legs.sort();
+    let expected: Vec<&str> = env_of(last, "EXPECT_PLATFORMS")
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect();
+    assert_eq!(
+        expected, legs,
+        "`manifests` must expect exactly the build matrix's platforms, sorted, \
+         or it marks a release complete with one missing"
+    );
+}
+
+/// `heph-govet` goes up from the job that holds its artifact and that every
+/// build leg waits for, so it is on the release before any manifest names the
+/// go plugin.
+#[test]
+fn heph_govet_is_published_before_any_build() {
+    let wf = parsed();
+    let create = job(&wf, "prerelease_create").expect("a `prerelease_create` job");
+    assert!(needs_of(create).iter().any(|n| n == "govet"));
+    assert!(
+        step_running(create, "dist/heph-govet_*").is_some(),
+        "`prerelease_create` publishes heph-govet"
+    );
+    let build = job(&wf, "build").expect("a `build` job");
+    assert!(needs_of(build).iter().any(|n| n == "prerelease_create"));
 }
 
 /// Without the upload secret (a fork PR) publishing is skipped, not failed:

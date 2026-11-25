@@ -360,7 +360,7 @@ jobs:
             echo "sha256_${name#heph-govet_}=$sha" >> $GITHUB_OUTPUT
           done
 
-      # The `manifests` job downloads this artifact and publishes the binaries
+      # `prerelease_create` downloads this artifact and publishes the binaries
       # as `heph-govet_<os>_<arch>` release assets — the URL the go plugin
       # fetches them from (`crates/plugin-go/src/plugingo/govet.rs`). The
       # `.sha256` sidecars are internal to this job and are not published.
@@ -375,12 +375,15 @@ jobs:
             !dist/*.sha256
 
   # Artifacts publish as they land. This job creates the run's pre-release in
-  # `hephbuild/heph-artifacts-v1` up front; each `build` leg uploads its own
-  # files the moment its build and smoke test pass; `manifests` adds the
-  # plugin manifests and `heph-govet` once every build is done, and marks the
-  # release complete. No test, lint or bin-e2e result delays any of it — only
-  # `release` waits for those, and only `release` promotes to mainline.
-  # `tests/root/ci_gate.rs` checks both halves.
+  # `hephbuild/heph-artifacts-v1` up front, with `heph-govet` (built before any
+  # `build` leg starts, so waiting for it delays nothing); each `build` leg
+  # uploads its own files the moment its build and smoke test pass, then
+  # republishes the plugin manifests to cover its platform; `manifests`
+  # republishes them once more after every build and marks the release
+  # complete. A platform is therefore installable, plugins included, as soon as
+  # it is built, not when the slowest platform is. No test, lint or bin-e2e
+  # result delays any of it — only `release` waits for those, and only
+  # `release` promotes to mainline. `tests/root/ci_gate.rs` checks both halves.
   #
   # Until `manifests` runs, the pre-release is partial, and a failed build
   # leaves it partial for good (accepted exemption E5). It is still marked
@@ -400,7 +403,7 @@ jobs:
     name: Create pre-release
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    needs: gen
+    needs: [gen, govet]
     outputs:
       publish: ${{ steps.create.outputs.publish }}
       url: ${{ steps.create.outputs.url }}
@@ -427,6 +430,26 @@ jobs:
           fi
           echo "publish=true" >> "$GITHUB_OUTPUT"
           echo "url=https://github.com/$REPO/releases/tag/$VERSION" >> "$GITHUB_OUTPUT"
+
+      # The go plugin downloads `heph-govet_<os>_<arch>` from its own release
+      # (`crates/plugin-go/src/plugingo/govet.rs`), so it goes up before any
+      # platform's plugin manifest can point at the go plugin.
+      - name: Download heph-govet
+        if: steps.create.outputs.publish == 'true'
+        uses: actions/download-artifact@v8
+        with:
+          name: heph-govet
+          path: dist
+
+      - name: Publish heph-govet
+        if: steps.create.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.HEPH_ARTIFACTS_PAT }}
+          VERSION: ${{ needs.gen.outputs.version }}
+          REPO: hephbuild/heph-artifacts-v1
+        run: |
+          set -euo pipefail
+          gh release upload "$VERSION" -R "$REPO" --clobber dist/heph-govet_*
 
   build:
     name: Build ${{ matrix.os }}/${{ matrix.arch }}
@@ -795,6 +818,28 @@ jobs:
           if [ "$BUILD_BENCH" = "true" ]; then files+=("heph-bench_${OS}_${ARCH}"); fi
           gh release upload "$VERSION" -R "$REPO" --clobber "${files[@]}"
 
+      # The plugin manifests, rebuilt from every cdylib the pre-release holds
+      # now: this platform's, plus whichever legs landed before it. Legs may
+      # finish together; the script converges under any overlap and order (its
+      # header says why). `continue-on-error`: a leg that cannot get them
+      # current within the script's retries has hit the API, not a bug in its
+      # build, and `manifests` republishes them after every build regardless,
+      # without that allowance. A normal run takes seconds; the timeout is for
+      # a hung API call, which `continue-on-error` does not cut short.
+      - name: Publish plugin manifests
+        if: needs.prerelease_create.outputs.publish == 'true'
+        continue-on-error: true
+        timeout-minutes: 5
+        shell: devenv shell bash -- -e {0}
+        env:
+          GH_TOKEN: ${{ secrets.HEPH_ARTIFACTS_PAT }}
+          VERSION: ${{ needs.gen.outputs.version }}
+          REPO: hephbuild/heph-artifacts-v1
+          # This leg's own platform: a listing that does not show it yet is
+          # lagging, and is never written from.
+          EXPECT_PLATFORMS: ${{ matrix.os }}_${{ matrix.arch }}
+        run: bash .github/workflows/publish-plugin-manifests.sh
+
       # Last, deliberately. This is the only job with steps after its compile,
       # and the drain must not sit in front of them: it would still be correct
       # today (nothing after `Build` compiles) but only by accident, and a
@@ -856,88 +901,50 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-  # The rest of the pre-release: the plugin manifests (which need every
-  # platform's cdylib to checksum) and `heph-govet`, then the release body
-  # flips from "partial" to "complete". Runs only when every build succeeded —
-  # deliberately not `always()`, which would publish manifests with a platform
-  # missing from them.
+  # The end of the pre-release. Each `build` leg already published the plugin
+  # manifests for the platforms present when it finished. This job runs the
+  # same script once more, now that no leg can still be writing, then flips the
+  # release body from "partial" to "complete". It runs only when every build
+  # succeeded, deliberately not under `always()`: "complete" would then be
+  # written on a release with a platform missing. Unlike the legs' step, a
+  # failure here fails the job.
   manifests:
     name: Plugin manifests
-    needs: [gen, govet, prerelease_create, build]
+    needs: [gen, prerelease_create, build]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      # Checkout brings tools/pluginmanifest (the manifest generator); the built
-      # artifacts download into dist/ alongside it.
+      # Checkout brings the script and tools/pluginmanifest, the manifest
+      # generator it builds.
       - name: Checkout
+        if: needs.prerelease_create.outputs.publish == 'true'
         uses: actions/checkout@v7
       - uses: actions/setup-go@v7
+        if: needs.prerelease_create.outputs.publish == 'true'
         with:
           go-version-file: tools/pluginmanifest/go.mod
           # pluginmanifest has no external deps (no go.sum) — nothing to cache,
           # and the default cache lookup warns about a missing root go.mod.
           cache: false
 
-      # Every plugin cdylib (`heph-<name>-plugin_<os>_<arch>.{so,dylib}`), by
-      # pattern rather than a list, so a new platform cannot be silently
-      # absent from its manifest.
-      - name: Download plugin artifacts
-        uses: actions/download-artifact@v8
-        with:
-          pattern: "heph-*-plugin_*"
-          path: dist
-          merge-multiple: true
-
-      - name: Download heph-govet
-        uses: actions/download-artifact@v8
-        with:
-          name: heph-govet
-          path: dist
-
-      - name: List artifacts
-        run: ls -lahR dist
-
-      # Build the go plugin distribution manifest from the per-os/arch cdylibs in
-      # dist/ — one entry per artifact, its `url` the release-asset URL it's
-      # published alongside (so `plugins: - { identifier: { url: .../heph-go-plugin.json } }`
-      # resolves the right dylib for the host). Each entry carries the artifact's
-      # `sha256:` checksum; a `<manifest>.sha256` sidecar (published too) holds the
+      # One manifest per plugin, one entry per per-os/arch cdylib on the release:
+      # its `url` the release-asset URL (so `plugins: - { identifier: { url:
+      # .../heph-go-plugin.json } }` resolves the right cdylib for the host), its
+      # `checksum` that asset's digest. A `<manifest>.sha256` sidecar holds the
       # manifest's own checksum for consumers to pin as `plugins[].checksum`.
-      # JSON via tools/pluginmanifest.
-      - name: Generate plugin manifests
-        run: |
-          VERSION="${{needs.gen.outputs.version}}"
-          BASE="https://github.com/hephbuild/heph-artifacts-v1/releases/download/$VERSION"
-          ( cd tools/pluginmanifest && go run . -name go -version "$VERSION" \
-              -prefix heph-go-plugin -from-dir "$GITHUB_WORKSPACE/dist" -url-base "$BASE" \
-              -out "$GITHUB_WORKSPACE/dist/heph-go-plugin.json" )
-          cat dist/heph-go-plugin.json
-          echo "manifest checksum: $(cat dist/heph-go-plugin.json.sha256)"
-          # The gha hook plugin ships the same way: one manifest entry per
-          # per-os/arch cdylib in dist/, published as a release asset.
-          ( cd tools/pluginmanifest && go run . -name gha -version "$VERSION" \
-              -prefix heph-gha-plugin -from-dir "$GITHUB_WORKSPACE/dist" -url-base "$BASE" \
-              -out "$GITHUB_WORKSPACE/dist/heph-gha-plugin.json" )
-          cat dist/heph-gha-plugin.json
-          echo "manifest checksum: $(cat dist/heph-gha-plugin.json.sha256)"
-          # The oci plugin (`docker_build` / `oci_pull` / `oci_push` / `oci_load`)
-          # ships the same way — it is not compiled into the CLI.
-          ( cd tools/pluginmanifest && go run . -name oci -version "$VERSION" \
-              -prefix heph-oci-plugin -from-dir "$GITHUB_WORKSPACE/dist" -url-base "$BASE" \
-              -out "$GITHUB_WORKSPACE/dist/heph-oci-plugin.json" )
-          cat dist/heph-oci-plugin.json
-          echo "manifest checksum: $(cat dist/heph-oci-plugin.json.sha256)"
-          # The devenv exec-runner plugin (`devenv_runner`), same flow.
-          ( cd tools/pluginmanifest && go run . -name devenv -version "$VERSION" \
-              -prefix heph-devenv-plugin -from-dir "$GITHUB_WORKSPACE/dist" -url-base "$BASE" \
-              -out "$GITHUB_WORKSPACE/dist/heph-devenv-plugin.json" )
-          cat dist/heph-devenv-plugin.json
-          echo "manifest checksum: $(cat dist/heph-devenv-plugin.json.sha256)"
+      - name: Publish plugin manifests
+        if: needs.prerelease_create.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.HEPH_ARTIFACTS_PAT }}
+          VERSION: ${{ needs.gen.outputs.version }}
+          REPO: hephbuild/heph-artifacts-v1
+          # Every `build` matrix leg, as <os>_<arch>; `ci_gate.rs` holds the two
+          # lists equal. A platform missing from the release fails this step,
+          # so the release is never marked complete without it.
+          EXPECT_PLATFORMS: darwin_arm64 linux_amd64 linux_arm64
+        run: bash .github/workflows/publish-plugin-manifests.sh
 
-      # The manifests, their `.sha256` sidecars and `heph-govet`, then mark the
-      # pre-release complete. Every file is named, so a missing one fails the
-      # upload rather than leaving a gap.
-      - name: Publish manifests and heph-govet
+      - name: Mark the pre-release complete
         if: needs.prerelease_create.outputs.publish == 'true'
         env:
           GH_TOKEN: ${{ secrets.HEPH_ARTIFACTS_PAT }}
@@ -945,12 +952,6 @@ jobs:
           REPO: hephbuild/heph-artifacts-v1
         run: |
           set -euo pipefail
-          gh release upload "$VERSION" -R "$REPO" --clobber \
-            dist/heph-go-plugin.json dist/heph-go-plugin.json.sha256 \
-            dist/heph-gha-plugin.json dist/heph-gha-plugin.json.sha256 \
-            dist/heph-oci-plugin.json dist/heph-oci-plugin.json.sha256 \
-            dist/heph-devenv-plugin.json dist/heph-devenv-plugin.json.sha256 \
-            dist/heph-govet_*
           gh release edit "$VERSION" -R "$REPO" \
             --notes "$(printf 'Artifacts automatically published from source-repo (rust).\n\nStatus: complete.')"
 
