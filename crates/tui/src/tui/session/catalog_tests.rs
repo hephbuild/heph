@@ -1260,9 +1260,13 @@ fn show_rederives_an_older_derivation_once() {
     assert!(!opened.is_copy());
     assert!(count(&opened.conn, "SELECT count(*) FROM spans") > 0);
     drop(opened);
+    let id = dir.file_name().expect("id").to_string_lossy().into_owned();
     assert_eq!(
         *notes.lock().expect("notes"),
-        ["heph: re-deriving 1 recording\n"]
+        [format!(
+            "heph: re-deriving session {id}: its session was lost, and cleanup sealed it\n"
+        )],
+        "names the session and why, once"
     );
     assert_eq!(catalog_derivation(), i64::from(store::DERIVATION));
     assert!(count(&read(root), "SELECT count(*) FROM spans") > 0);
@@ -1303,11 +1307,28 @@ fn rederive_is_durable_and_safe_under_failure_and_race() {
     let before = std::fs::read(dir.join(store::FILE)).expect("read");
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).expect("chmod");
     let failed = store::upgrade_local(&dir, store::Need::default());
-    let opened = source::open_repaired(root, &dir, &|_: &str| {});
+    let notes = Mutex::new(Vec::<String>::new());
+    let opened = source::open_repaired(root, &dir, &|n: &str| {
+        notes.lock().expect("notes").push(n.to_owned());
+    });
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
     assert!(failed.is_err(), "{failed:?}");
     let opened = opened.expect("answered from a temp copy");
     assert!(opened.is_copy());
+    let id = dir.file_name().expect("id").to_string_lossy().into_owned();
+    let notes = notes.into_inner().expect("notes");
+    assert_eq!(notes.len(), 2, "{notes:?}");
+    assert!(
+        notes[0].starts_with(&format!("heph: re-deriving session {id}: ")),
+        "{notes:?}"
+    );
+    assert!(
+        notes[1].starts_with(&format!(
+            "heph: session {id} cannot be re-derived in place ("
+        )) && notes[1].ends_with("); reading a re-derived temp copy for this command\n")
+            && notes[1].contains("Permission denied"),
+        "the fallback is said, with its reason: {notes:?}"
+    );
     assert!(count(&opened.conn, "SELECT count(*) FROM spans") > 0);
     drop(opened);
     assert_eq!(std::fs::read(dir.join(store::FILE)).expect("read"), before);

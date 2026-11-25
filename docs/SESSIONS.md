@@ -780,10 +780,11 @@ it re-derives that session's recording (below).
 Each recording's `session.derivation` names the version of the code that
 derived its explorer rows. When `show` opens a local, sealed recording whose
 derivation is older than this heph's, it re-derives it once, in place, and
-says so on stderr:
+says so on stderr, one line per recording, naming the session and why:
 
 ```
-heph: re-deriving 1 recording
+heph: re-deriving session 02kf5…: an older heph derived it (derivation 1, this heph 2)
+heph: re-deriving session 02kf7…: its session was lost, and cleanup sealed it
 ```
 
 It takes the session's `lock` exclusively and writes a copy beside the
@@ -798,7 +799,13 @@ next `list` re-copies the row (see [Repair on open](#repair-on-open)).
 When the recording cannot be re-derived in place (its lock is held, a
 `-journal` or `-wal` sits beside it, a full disk, a read-only directory),
 `show` derives the rows into a temporary copy for this command only and
-leaves the original as it was. A recording with a newer derivation is read
+leaves the original as it was, and says so on stderr with the reason:
+
+```
+heph: session 02kf5… cannot be re-derived in place (…: Permission denied (os error 13)); reading a re-derived temp copy for this command
+```
+
+A recording with a newer derivation is read
 as it is, never re-derived or downgraded. A live or lost (not yet sealed)
 recording is never written. Two commands at once serialise on the lock; the
 second finds the recording current.

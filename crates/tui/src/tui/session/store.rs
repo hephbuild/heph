@@ -1492,11 +1492,26 @@ pub struct Pending {
     /// one is never re-derived, nor downgraded.
     pub rederive: bool,
     pub indexes: bool,
+    /// The derivation its explorer rows were derived by.
+    pub derivation: u32,
 }
 
 impl Pending {
     pub fn any(self) -> bool {
         self.rederive || self.indexes
+    }
+
+    /// Why its explorer rows are re-derived, for a note: a cleanup sealed
+    /// it after its session was lost, or an older heph derived them.
+    pub fn rederive_cause(self) -> String {
+        if self.derivation == STALE_DERIVATION {
+            "its session was lost, and cleanup sealed it".to_owned()
+        } else {
+            format!(
+                "an older heph derived it (derivation {}, this heph {DERIVATION})",
+                self.derivation
+            )
+        }
     }
 }
 
@@ -1515,6 +1530,7 @@ pub fn pending(conn: &Connection, need: Need) -> rusqlite::Result<Pending> {
     Ok(Pending {
         rederive: derivation < DERIVATION,
         indexes,
+        derivation,
     })
 }
 

@@ -248,8 +248,9 @@ pub(crate) fn open_repaired(
 
 /// [`open_repaired`], also giving the recording what `need` asks (a query's
 /// indexes, built under the same lock on its first need). Only a
-/// re-derivation is said on stderr and falls back to a temp copy: a
-/// recording that cannot be indexed is read without its indexes.
+/// re-derivation is said through `note` (the session's id and why) and
+/// falls back to a temp copy, said too with the reason: a recording that
+/// cannot be indexed is read without its indexes.
 pub(crate) fn open_repaired_with(
     root: &Path,
     dir: &Path,
@@ -258,8 +259,15 @@ pub(crate) fn open_repaired_with(
 ) -> anyhow::Result<store::Opened> {
     match store::pending_local(dir, need) {
         Ok(Some(p)) if p.any() => {
+            let id = dir
+                .file_name()
+                .map(|n| n.to_string_lossy())
+                .unwrap_or_default();
             if p.rederive {
-                note("heph: re-deriving 1 recording\n");
+                note(&format!(
+                    "heph: re-deriving session {id}: {}\n",
+                    p.rederive_cause()
+                ));
             }
             match store::upgrade_local(dir, need) {
                 Ok(store::Upgraded::Done) if !p.rederive => {}
@@ -274,11 +282,14 @@ pub(crate) fn open_repaired_with(
                 }
                 Ok(store::Upgraded::Current) => {}
                 failed if p.rederive => {
-                    tracing::debug!(
-                        dir = %dir.display(),
-                        outcome = ?failed.map_err(|e| format!("{e:#}")),
-                        "re-deriving into a temp copy instead"
-                    );
+                    let why = match failed {
+                        Err(e) => format!("{e:#}"),
+                        Ok(_) => "its lock stayed held".to_owned(),
+                    };
+                    note(&format!(
+                        "heph: session {id} cannot be re-derived in place ({why}); \
+                         reading a re-derived temp copy for this command\n"
+                    ));
                     return store::derived_copy(root, &dir.join(store::FILE), need);
                 }
                 failed => tracing::debug!(
