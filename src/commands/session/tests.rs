@@ -2409,6 +2409,7 @@ async fn a_lost_session_sealed_by_cleanup_still_reads() {
             exit_status: None,
             log_tail: None,
             timed_out: None,
+            spans: Vec::new(),
         },
     ));
     records.push(record(

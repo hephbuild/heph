@@ -560,6 +560,7 @@ fn failed_derived_insert_rolls_back_the_batch() {
                     timed_out: None,
                     cancelled: false,
                     left_behind: None,
+                    spans: Vec::new(),
                 },
             });
         };

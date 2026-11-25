@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime};
 
 use hcore::events::{
     AdmittedKind, BuildEvent, BuildEventKind, CacheHitKind, CacheOutcomeKind, FixesData,
-    LeftBehindData, LogTailData, OutputGroupSummary, SelectionGap, SelectionGapExample,
+    LeftBehindData, LogTailData, OutputGroupSummary, PhaseSpan, SelectionGap, SelectionGapExample,
     TimedOutData, YieldingToData,
 };
 
@@ -71,6 +71,7 @@ fn end_record(at: u64, addr: &str) -> SessionRecord {
             timed_out: None,
             cancelled: false,
             left_behind: None,
+            spans: Vec::new(),
         },
     })
 }
@@ -208,6 +209,20 @@ fn every_event_kind() -> Vec<BuildEventKind> {
                 }),
                 log_readable: Some(true),
             })),
+            // A name this build does not know as well as one it does: the
+            // store keeps both as recorded.
+            spans: vec![
+                PhaseSpan {
+                    name: "process".into(),
+                    start_unix_us: 10,
+                    end_unix_us: 25,
+                },
+                PhaseSpan {
+                    name: "newer_host_phase".into(),
+                    start_unix_us: 25,
+                    end_unix_us: 30,
+                },
+            ],
         },
         K::ExecuteStart {
             addr: a(),
@@ -1959,6 +1974,7 @@ fn explorer_golden_rows() {
                 }),
                 cancelled: false,
                 left_behind: None,
+                spans: Vec::new(),
             },
         ),
     ];
