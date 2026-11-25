@@ -152,6 +152,11 @@ const DEFAULT_PASS_ENV: &[&str] = &[
 /// This is a denylist, which is only sound because the *input* environment is a
 /// strict hashed allowlist: with the input pinned, what devenv adds is a
 /// function of the declared inputs plus these known-volatile few.
+///
+/// heph's own variables ([`hcore::session_record::HEPH_OWNED_ENV`]) are
+/// dropped beside these, by [`parse_env0`], from the one list `core` keeps
+/// (and refused in `pass_env` at parse), so the fingerprint, the capture and
+/// both modes' launch agree on leaving them out.
 const CAPTURE_DENY: &[&str] = &[
     "PWD",
     "OLDPWD",
@@ -475,6 +480,7 @@ impl ManagedDriver for Driver {
         let mode = spec.mode;
         check_root(&spec.root)?;
 
+        refuse_heph_owned(&req.target_spec.addr, &spec.pass_env)?;
         let names: Vec<String> = if spec.pass_env.is_empty() {
             DEFAULT_PASS_ENV.iter().map(|s| (*s).to_string()).collect()
         } else {
@@ -966,7 +972,29 @@ fn check_root(root: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Parse NUL-separated `KEY=VALUE` records, dropping per-process noise.
+/// Refuse a heph-owned name ([`hcore::session_record::HEPH_OWNED_ENV`]) in
+/// `pass_env`: it is hashed into the def and fingerprinted through the
+/// capture, so it would move both with the directory a CI job picked, and a
+/// `session` launch would carry it. The exec driver refuses the same in its
+/// hashed `pass_env`.
+fn refuse_heph_owned(addr: &hmodel::htaddr::Addr, pass_env: &[String]) -> anyhow::Result<()> {
+    if let Some(name) = pass_env
+        .iter()
+        .find(|n| hcore::session_record::is_heph_owned_env(n))
+    {
+        anyhow::bail!(
+            "{}: `{name}` is in `pass_env`, which is hashed, but it is heph's own variable, \
+             not an input of the environment: it would move the def hash and the fingerprint \
+             with the directory a CI job picked. A target that needs it names it in its own \
+             `runtime_pass_env`, which hands it to the process without hashing it",
+            addr.format(),
+        );
+    }
+    Ok(())
+}
+
+/// Parse NUL-separated `KEY=VALUE` records, dropping per-process noise and
+/// heph's own variables.
 fn parse_env0(bytes: &[u8]) -> BTreeMap<String, String> {
     bytes
         .split(|b| *b == 0)
@@ -974,7 +1002,7 @@ fn parse_env0(bytes: &[u8]) -> BTreeMap<String, String> {
         .filter_map(|rec| {
             let s = std::str::from_utf8(rec).ok()?;
             let (k, v) = s.split_once('=')?;
-            if CAPTURE_DENY.contains(&k) {
+            if CAPTURE_DENY.contains(&k) || hcore::session_record::is_heph_owned_env(k) {
                 return None;
             }
             Some((k.to_string(), normalize_value(v)))
@@ -1128,6 +1156,16 @@ mod tests {
     #[test]
     fn per_process_noise_is_dropped() {
         let raw = b"PWD=/a\0SHLVL=3\0_=/usr/bin/env\0OLDPWD=/b\0KEEP=yes\0";
+        let env = parse_env0(raw);
+        assert_eq!(env.keys().collect::<Vec<_>>(), vec!["KEEP"]);
+    }
+
+    /// heph's own variables never reach the capture, whatever devenv
+    /// exports: in it they would move the fingerprint with the directory a
+    /// CI job picked, and `wrap` would hand them to every target.
+    #[test]
+    fn heph_owned_names_never_reach_the_capture() {
+        let raw = b"HEPH_SESSION_EXPORT_DIR=/ci/sessions\0HEPH_TOOLS_DIR=/sbx/tools\0KEEP=yes\0";
         let env = parse_env0(raw);
         assert_eq!(env.keys().collect::<Vec<_>>(), vec!["KEEP"]);
     }
@@ -1350,6 +1388,44 @@ mod log_tests {
             String::from_utf8_lossy(&out).into_owned(),
             String::from_utf8_lossy(&err).into_owned(),
         )
+    }
+
+    /// A heph-owned name in `pass_env` is refused at parse, naming it and
+    /// where it goes instead: hashed there, it would move the runner's def
+    /// hash with the directory a CI job picked, and reach the capture and a
+    /// session's launch.
+    #[tokio::test]
+    async fn a_heph_owned_name_in_pass_env_is_refused() {
+        for name in hcore::session_record::HEPH_OWNED_ENV {
+            let parse = ParseRequest {
+                request_id: "test".to_string(),
+                target_spec: Arc::new(hplugin::provider::TargetSpec {
+                    addr: hmodel::htaddr::parse_addr("//pkg:env").expect("addr"),
+                    driver: "devenv_runner".to_string(),
+                    config: std::collections::HashMap::from([(
+                        "pass_env".to_string(),
+                        hcore::htvalue::Value::List(vec![
+                            hcore::htvalue::Value::String("PATH".to_string()),
+                            hcore::htvalue::Value::String(name.to_string()),
+                        ]),
+                    )]),
+                    ..Default::default()
+                }),
+            };
+            let err = match Driver::new()
+                .parse(parse, &StdCancellationToken::new())
+                .await
+            {
+                Ok(_) => panic!("{name} in pass_env must be refused"),
+                Err(e) => format!("{e:#}"),
+            };
+            assert!(
+                err.contains("//pkg:env")
+                    && err.contains(&format!("`{name}`"))
+                    && err.contains("runtime_pass_env"),
+                "{err}"
+            );
+        }
     }
 
     /// Under `log_capture` building the shell reaches the log; the environment

@@ -997,7 +997,9 @@ heph session attach sessions/<id>.hephsession
   `launch_env` names it) and the environment that runner's agent hands every
   target; and refuses it by name in `pass_env` (and in a dependency's
   `transitive` env passed with `hash: true`), where it would move the def
-  hash with the directory a job picked. Three routes pass it on, each by
+  hash with the directory a job picked. A `devenv_runner` refuses both of
+  heph's names in its `pass_env` and drops them from the environment it
+  captures, so neither its fingerprint nor either mode's launch carries them. Three routes pass it on, each by
   name and none hashed, so the directory moves no def hash and no `hashin`:
   a target's own `runtime_pass_env`; a dependency's `transitive` env with
   `hash: false`, which lands in the consumer's `runtime_pass_env`; and a wrap
