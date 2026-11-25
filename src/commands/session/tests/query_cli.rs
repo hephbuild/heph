@@ -309,6 +309,16 @@ async fn query_schema_lists_every_name() {
             );
         }
     }
+    // The built-in recipes follow, each under its `-- name: purpose` line
+    // (`recipes_run` runs them as printed).
+    let recipes = out.split_once("\nrecipes\n").expect("a recipes section").1;
+    for r in crate::tui::session::query::RECIPES {
+        assert!(
+            recipes.contains(&format!("\n-- {}: {}\n{};\n", r.name, r.purpose, r.sql)),
+            "{}: {recipes}",
+            r.name
+        );
+    }
 }
 
 /// The default source is the catalog scoped by the window; `--full` reads

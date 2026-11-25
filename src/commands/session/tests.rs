@@ -3041,4 +3041,5 @@ fn retention_defaults_agree() {
 
 mod list_catalog;
 mod query_cli;
+mod recipes;
 mod refs;

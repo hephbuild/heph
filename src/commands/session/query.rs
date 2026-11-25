@@ -308,7 +308,9 @@ impl Drop for StopOn {
     }
 }
 
-/// `--schema`: the six names, a line per column, and the contract version.
+/// `--schema`: the six names, a line per column, the contract version, and
+/// the built-in recipes as runnable SQL, each under a `-- name: purpose`
+/// line.
 fn write_schema(out: &mut dyn Write) -> anyhow::Result<()> {
     let mut text = format!("explorer schema version {}\n", store::SCHEMA_VERSION);
     for t in engine::TABLES {
@@ -319,6 +321,10 @@ fn write_schema(out: &mut dyn Write) -> anyhow::Result<()> {
         for (c, ty) in t.columns {
             text.push_str(&format!("  {c:width$}  {ty}\n"));
         }
+    }
+    text.push_str("\nrecipes\n");
+    for r in engine::RECIPES {
+        text.push_str(&format!("\n-- {}: {}\n{};\n", r.name, r.purpose, r.sql));
     }
     out.write_all(text.as_bytes()).context("writing the schema")
 }

@@ -169,8 +169,9 @@ The window holds whole sessions by their start: every row of a session
 started in it, none of one started before it.
 
 The SQL is the argument, `-` reads it from stdin, `-f FILE` from a file.
-`--schema` prints the six tables with a line per column and the schema
-version, and runs nothing.
+`--schema` prints the six tables with a line per column, the schema
+version and the [built-in recipes](#built-in-recipes) as runnable SQL, and
+runs nothing.
 
 **Read-only by construction.** The statement is prepared first against
 empty copies of the six tables: more than one statement, any write
@@ -453,23 +454,85 @@ value, never 0. Both are frozen, as are released span and metric names.
 Enumerations (`class`, `status`, `outcome`, `metrics.kind`) are open: a
 consumer handles a value it does not know.
 
-Two recipes:
+#### Built-in recipes
+
+heph ships recipes, not reports: SQL for the questions asked most, which
+`heph session query --schema` prints and this section carries word for
+word. Each reads only the six explorer names, so it runs over the catalog,
+every recording kept, or the recordings named (see [`query`](#query));
+`sqlite3` on a sealed recording (or a copy of a live one) answers them too.
+They key on `class`, never on a span's name: the same target shows
+`heph.process` or `heph.driver.run` depending on its driver.
+
+| Recipe | Columns |
+| --- | --- |
+| `time_by_phase` | `class`, `name`, `n` (spans), `busy_s` (their summed time: busy, not wall, since phases of different targets overlap) |
+| `uncovered_wall` | `session_id`, `wall_s`, `target_s` (wall time with at least one `target`-class span open, overlaps counted once), `uncovered_pct` (the rest, as a share of the wall); ended sessions only |
+| `phase_percentiles` | `class`, `name`, `n`, `p50_ms`, `p90_ms`, `p99_ms` (nearest rank), `max_ms` |
+| `hit_rate_by_package` | `package`, `targets` (resolved: ran, hit or failed; cancelled ones are left out), `hits`, `hit_pct`; lowest rate first |
 
 ```sql
--- Where did time go, by class and phase (busy time, not wall time)?
+-- time_by_phase: Where did time go, by class and phase (busy time, not wall time)?
 SELECT class, name, count(*) AS n, sum(duration_us) / 1e6 AS busy_s
 FROM spans WHERE class IS NOT NULL
-GROUP BY class, name ORDER BY busy_s DESC;
+GROUP BY class, name ORDER BY busy_s DESC, class, name;
 
--- How did //p:t end, and who ran it?
+-- uncovered_wall: How much of each session's wall time had no target running?
+WITH runs AS (
+  SELECT session_id, start_us, end_us,
+         max(end_us) OVER (PARTITION BY session_id ORDER BY start_us, end_us
+                           ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS before_end
+  FROM spans WHERE class = 'target' AND end_us IS NOT NULL
+), islands AS (
+  SELECT session_id, start_us, end_us,
+         sum(before_end IS NULL OR start_us > before_end)
+           OVER (PARTITION BY session_id ORDER BY start_us, end_us) AS island
+  FROM runs
+), covered AS (
+  SELECT session_id, sum(island_us) AS target_us
+  FROM (SELECT session_id, max(end_us) - min(start_us) AS island_us
+        FROM islands GROUP BY session_id, island)
+  GROUP BY session_id
+)
+SELECT s.session_id, (s.ended_ms - s.started_ms) / 1e3 AS wall_s,
+       coalesce(c.target_us, 0) / 1e6 AS target_s,
+       round(100 - coalesce(c.target_us, 0) / 10.0 / (s.ended_ms - s.started_ms), 1)
+         AS uncovered_pct
+FROM sessions s LEFT JOIN covered c USING (session_id)
+WHERE s.ended_ms > s.started_ms
+ORDER BY s.started_ms DESC;
+
+-- phase_percentiles: How long does each phase take: p50, p90, p99 and max, in ms?
+SELECT class, name, count(*) AS n,
+       min(CASE WHEN cd >= 0.5 THEN duration_us END) / 1e3 AS p50_ms,
+       min(CASE WHEN cd >= 0.9 THEN duration_us END) / 1e3 AS p90_ms,
+       min(CASE WHEN cd >= 0.99 THEN duration_us END) / 1e3 AS p99_ms,
+       max(duration_us) / 1e3 AS max_ms
+FROM (SELECT class, name, duration_us,
+             cume_dist() OVER (PARTITION BY class, name ORDER BY duration_us) AS cd
+      FROM spans WHERE class IS NOT NULL AND duration_us IS NOT NULL)
+GROUP BY class, name ORDER BY p90_ms DESC, class, name;
+
+-- hit_rate_by_package: Which packages miss the cache most?
+SELECT substr(addr, 1, instr(addr, ':') - 1) AS package,
+       count(*) AS targets, sum(outcome = 'hit') AS hits,
+       round(100.0 * sum(outcome = 'hit') / count(*), 1) AS hit_pct
+FROM targets WHERE outcome IN ('ran', 'hit', 'failed')
+GROUP BY package ORDER BY hit_pct, targets DESC, package;
+```
+
+Over the catalog, `hit_rate_by_package` counts hits from `targets`, which
+keeps them; the other three read `spans`, which the catalog keeps only for
+targets that ran (`--full` reads every recording instead).
+
+**Who ran `//p:t`, and how did it end?** `heph session list --addr //p:t`
+answers it; as SQL, for more columns:
+
+```sql
 SELECT s.started_ms, s.user, s.actor_name, s.argv, r.outcome, r.duration_us / 1e3 AS ms
 FROM spans r JOIN sessions s USING (session_id)
 WHERE r.name = 'heph.result' AND r.addr = '//p:t';
 ```
-
-`heph session query` runs them over the catalog, every recording kept, or
-the recordings named (see [`query`](#query)); `sqlite3` on a sealed
-recording (or a copy of a live one) answers them too.
 
 ### Pools
 

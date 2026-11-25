@@ -136,6 +136,83 @@ pub const TABLES: &[Table] = &[
     },
 ];
 
+/// A built-in recipe: a question asked often, and the SQL that answers it
+/// over any source. `--schema` prints them; `docs/SESSIONS.md` carries the
+/// same text, which `recipes_run` holds it to.
+#[derive(Debug)]
+pub struct Recipe {
+    pub name: &'static str,
+    /// One line: the question it answers.
+    pub purpose: &'static str,
+    /// One statement, no trailing `;`. Keys on `class`, never on a span's
+    /// name (E5).
+    pub sql: &'static str,
+}
+
+/// The built-in recipes, in the order `--schema` prints them.
+pub const RECIPES: &[Recipe] = &[
+    Recipe {
+        name: "time_by_phase",
+        purpose: "Where did time go, by class and phase (busy time, not wall time)?",
+        sql: "\
+SELECT class, name, count(*) AS n, sum(duration_us) / 1e6 AS busy_s
+FROM spans WHERE class IS NOT NULL
+GROUP BY class, name ORDER BY busy_s DESC, class, name",
+    },
+    Recipe {
+        name: "uncovered_wall",
+        purpose: "How much of each session's wall time had no target running?",
+        sql: "\
+WITH runs AS (
+  SELECT session_id, start_us, end_us,
+         max(end_us) OVER (PARTITION BY session_id ORDER BY start_us, end_us
+                           ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS before_end
+  FROM spans WHERE class = 'target' AND end_us IS NOT NULL
+), islands AS (
+  SELECT session_id, start_us, end_us,
+         sum(before_end IS NULL OR start_us > before_end)
+           OVER (PARTITION BY session_id ORDER BY start_us, end_us) AS island
+  FROM runs
+), covered AS (
+  SELECT session_id, sum(island_us) AS target_us
+  FROM (SELECT session_id, max(end_us) - min(start_us) AS island_us
+        FROM islands GROUP BY session_id, island)
+  GROUP BY session_id
+)
+SELECT s.session_id, (s.ended_ms - s.started_ms) / 1e3 AS wall_s,
+       coalesce(c.target_us, 0) / 1e6 AS target_s,
+       round(100 - coalesce(c.target_us, 0) / 10.0 / (s.ended_ms - s.started_ms), 1)
+         AS uncovered_pct
+FROM sessions s LEFT JOIN covered c USING (session_id)
+WHERE s.ended_ms > s.started_ms
+ORDER BY s.started_ms DESC",
+    },
+    Recipe {
+        name: "phase_percentiles",
+        purpose: "How long does each phase take: p50, p90, p99 and max, in ms?",
+        sql: "\
+SELECT class, name, count(*) AS n,
+       min(CASE WHEN cd >= 0.5 THEN duration_us END) / 1e3 AS p50_ms,
+       min(CASE WHEN cd >= 0.9 THEN duration_us END) / 1e3 AS p90_ms,
+       min(CASE WHEN cd >= 0.99 THEN duration_us END) / 1e3 AS p99_ms,
+       max(duration_us) / 1e3 AS max_ms
+FROM (SELECT class, name, duration_us,
+             cume_dist() OVER (PARTITION BY class, name ORDER BY duration_us) AS cd
+      FROM spans WHERE class IS NOT NULL AND duration_us IS NOT NULL)
+GROUP BY class, name ORDER BY p90_ms DESC, class, name",
+    },
+    Recipe {
+        name: "hit_rate_by_package",
+        purpose: "Which packages miss the cache most?",
+        sql: "\
+SELECT substr(addr, 1, instr(addr, ':') - 1) AS package,
+       count(*) AS targets, sum(outcome = 'hit') AS hits,
+       round(100.0 * sum(outcome = 'hit') / count(*), 1) AS hit_pct
+FROM targets WHERE outcome IN ('ran', 'hit', 'failed')
+GROUP BY package ORDER BY hit_pct, targets DESC, package",
+    },
+];
+
 /// The explorer names the catalog holds: it keeps no logs.
 const CATALOG_HOLDS: &[&str] = &["sessions", "spans", "span_events", "metrics", "targets"];
 

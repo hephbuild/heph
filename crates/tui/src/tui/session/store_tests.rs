@@ -1537,36 +1537,14 @@ fn generate_format_fixture() {
     std::fs::copy(dir.join(store::FILE), &target).expect("copy the fixture");
 }
 
-/// The recipes `docs/SESSIONS.md` gives, one statement each, from its first
-/// `sql` block.
-fn recipes() -> Vec<String> {
-    let doc = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/SESSIONS.md");
-    let text = std::fs::read_to_string(&doc).expect("read docs/SESSIONS.md");
-    let block = text
-        .split("```sql\n")
-        .nth(1)
-        .and_then(|rest| rest.split("```").next())
-        .expect("a sql block in docs/SESSIONS.md");
-    block
-        .split(';')
-        .map(|stmt| {
-            stmt.lines()
-                .filter(|l| !l.trim_start().starts_with("--"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .filter(|stmt| !stmt.trim().is_empty())
-        .collect()
-}
-
 /// I5: every released format's committed fixture opens in place as a sealed
 /// recording, reads back every record with none skipped, and answers the
-/// documented recipes and the pool summary. A format bump that adds no
-/// fixture fails here.
+/// built-in recipes (`query::RECIPES`, which `docs/SESSIONS.md` carries) and
+/// the pool summary. A format bump that adds no fixture fails here.
 #[test]
 fn opens_format_1_fixture() {
-    let recipes = recipes();
-    assert_eq!(recipes.len(), 2, "{recipes:?}");
+    let recipes: Vec<&str> = super::query::RECIPES.iter().map(|r| r.sql).collect();
+    assert!(!recipes.is_empty());
     for n in 1..=store::FORMAT {
         let path = fixture(n);
         assert!(
