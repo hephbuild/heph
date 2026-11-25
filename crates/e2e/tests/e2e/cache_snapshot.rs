@@ -6,17 +6,19 @@
 //! The journal tests drive it through `Config::record_working_set` and read
 //! it back with `cache_snapshot::{list_journals, read_journal}`. The tier
 //! tests build each snapshot by hand ([`Fixture`]): a cold run writes a
-//! `file://` bucket, which is copied into a generation behind a marker. Last,
-//! the export, through `Engine::export_snapshot` (the `snapshot` command is
-//! not here yet): job after job over one snapshot dir.
+//! `file://` bucket, which is copied into a generation behind a marker. Then
+//! the export, through `Engine::export_snapshot`: job after job over one
+//! snapshot dir. Last, the `snapshot` command's lock protocol (I5), through
+//! the `Consumption` it drives, with a short recorder wait.
 
 use crate::common::{artifact_string, drain};
 use futures::TryStreamExt as _;
 use hcore::events::CacheOutcomeKind;
 use hcore::hasync::StdCancellationToken;
 use heph::engine::cache_snapshot::{
-    ExportReport, Incomplete, JournalContents, LeftOut, WorkingSet, list_journals, lock_snapshot,
-    read_journal, read_marker, working_set_dir,
+    Consumption, ExportOutcome, ExportReport, Incomplete, JournalContents, LeftOut, RECORDER_WAIT,
+    RecorderAliveError, WorkingSet, list_journals, lock_snapshot, read_journal, read_marker,
+    working_set_dir,
 };
 use heph::engine::event::{BuildEvent, BuildEventKind};
 use heph::engine::{Config, Discovery, Engine, HomeDir, OutputMatcher, ResultOptions};
@@ -1227,4 +1229,291 @@ async fn export_skips_a_gc_trimmed_revision() {
         "{report:?}"
     );
     assert_eq!(report.new.count, 0, "{report:?}");
+}
+
+// ---------------------------------------------------------------------------
+// The snapshot command's lock protocol (I5)
+// ---------------------------------------------------------------------------
+
+/// A wait short enough that a test refused after it stays fast.
+const SHORT_WAIT: Duration = Duration::from_millis(200);
+
+/// Drop the trailer from the journal at `path`: what a recorder killed
+/// without running destructors leaves.
+fn strip_trailer(path: &Path) {
+    let text = std::fs::read_to_string(path).expect("read journal");
+    let kept: String = text
+        .lines()
+        .filter(|l| !l.contains(r#""t":"Trailer""#))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    assert_ne!(kept, text, "{} had a trailer", path.display());
+    std::fs::write(path, kept).expect("rewrite journal");
+}
+
+/// Take the journals with `wait`, export them to `dir` and consume them,
+/// through a fresh non-recording engine, as the command does.
+async fn snapshot(root: &Path, dir: &Path, wait: Duration) -> ExportReport {
+    let tok = StdCancellationToken::new();
+    let c = Consumption::acquire(&home(root), wait, &tok)
+        .await
+        .expect("acquire");
+    c.export(&engine(root, None, false), dir, &tok)
+        .await
+        .expect("export")
+}
+
+/// A recorder mid-request, before its first flush, holds its journal: the
+/// snapshot gives up after the wait, naming the pid, and consumes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refuses_while_a_recorder_is_alive() {
+    let root = tempfile::tempdir().expect("root");
+    let parent = tempfile::tempdir().expect("parent");
+    let dir = parent.path().join("snap");
+    write_build(root.path(), FOUR);
+    let e = job_engine(root.path(), &dir);
+    let rs = e.new_state();
+    let res = Arc::clone(&e)
+        .result_addr(
+            rs.clone(),
+            &addr("//pkg:a"),
+            OutputMatcher::All,
+            &ResultOptions::default(),
+        )
+        .await
+        .expect("build");
+    drop(res);
+    let journals = list_journals(&home(root.path())).expect("list");
+    assert_eq!(journals.len(), 1, "the first record created the journal");
+
+    let started = Instant::now();
+    let err = Consumption::acquire(&home(root.path()), SHORT_WAIT, &StdCancellationToken::new())
+        .await
+        .expect_err("a live recorder refuses the snapshot");
+    assert!(started.elapsed() >= SHORT_WAIT, "it waited first");
+    let alive = err
+        .downcast_ref::<RecorderAliveError>()
+        .unwrap_or_else(|| panic!("not a RecorderAliveError: {err:#}"));
+    assert_eq!(alive.recorders.len(), 1, "{alive:?}");
+    assert_eq!(alive.recorders[0].journal, journals[0]);
+    assert_eq!(alive.recorders[0].pid, Some(std::process::id()));
+    assert!(
+        format!("{err:#}").contains(&std::process::id().to_string()),
+        "the message names the pid: {err:#}"
+    );
+    assert!(!dir.exists(), "nothing was written");
+    assert_eq!(list_journals(&home(root.path())).expect("list"), journals);
+
+    drain(rs).await;
+    drop(e);
+}
+
+/// A recorder that exits inside the wait lets the snapshot through, with its
+/// journal complete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn waits_for_a_recorder_that_exits() {
+    let root = tempfile::tempdir().expect("root");
+    let parent = tempfile::tempdir().expect("parent");
+    let dir = parent.path().join("snap");
+    write_build(root.path(), FOUR);
+    let e = job_engine(root.path(), &dir);
+    run(&e, &["//pkg:a"]).await;
+    assert_eq!(list_journals(&home(root.path())).expect("list").len(), 1);
+
+    let exits = tokio::spawn(async move {
+        tokio::time::sleep(SHORT_WAIT).await;
+        drop(e);
+    });
+    let tok = StdCancellationToken::new();
+    let c = Consumption::acquire(&home(root.path()), Duration::from_secs(30), &tok)
+        .await
+        .expect("the recorder exits inside the wait");
+    exits.await.expect("recorder task");
+    assert!(c.working_set().is_complete(), "{:?}", c.working_set());
+    assert_eq!(c.working_set().revisions.len(), 1);
+
+    let report = c
+        .export(&engine(root.path(), None, false), &dir, &tok)
+        .await
+        .expect("export");
+    assert!(
+        matches!(report.outcome, ExportOutcome::Written { .. }),
+        "{report:?}"
+    );
+    assert_eq!(report.new.count, 1, "{report:?}");
+    assert!(list_journals(&home(root.path())).expect("list").is_empty());
+}
+
+/// A journal whose recorder died without its trailer has no lock holder: it
+/// is read at once, as incomplete, never waited on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dead_recorder_does_not_block() {
+    let root = tempfile::tempdir().expect("root");
+    let parent = tempfile::tempdir().expect("parent");
+    let dir = parent.path().join("snap");
+    write_build(root.path(), FOUR);
+    let (ws, _) = job(root.path(), &dir, &["//pkg:a", "//pkg:b"]).await;
+    strip_trailer(&ws.journals[0]);
+
+    let started = Instant::now();
+    let report = snapshot(root.path(), &dir, RECORDER_WAIT).await;
+    assert!(
+        started.elapsed() < RECORDER_WAIT / 2,
+        "a dead recorder was waited on: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(report.incomplete.len(), 1, "{report:?}");
+    assert_eq!(
+        report.incomplete[0].reason,
+        Incomplete::NoTrailer.to_string()
+    );
+    assert_eq!(report.new.count, 2, "{report:?}");
+    assert!(list_journals(&home(root.path())).expect("list").is_empty());
+}
+
+/// Only the journals read are consumed: a recorder that starts once the
+/// snapshot has listed them keeps its journal, and a `.tmp` one is never
+/// read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_recorder_started_mid_snapshot_keeps_its_journal() {
+    let root = tempfile::tempdir().expect("root");
+    let parent = tempfile::tempdir().expect("parent");
+    let dir = parent.path().join("snap");
+    write_build(root.path(), FOUR);
+    let (ws, _) = job(root.path(), &dir, &["//pkg:a"]).await;
+    let first = ws.journals.clone();
+    let tmp = working_set_dir(&home(root.path())).join(".1-unrenamed.tmp");
+    std::fs::write(&tmp, "not yet a journal\n").expect("write tmp");
+
+    let tok = StdCancellationToken::new();
+    let c = Consumption::acquire(&home(root.path()), SHORT_WAIT, &tok)
+        .await
+        .expect("acquire");
+    assert_eq!(c.working_set().journals, first);
+
+    // A recorder starts now, and is still alive while the export runs.
+    let late = job_engine(root.path(), &dir);
+    run(&late, &["//pkg:b"]).await;
+    let report = c
+        .export(&engine(root.path(), None, false), &dir, &tok)
+        .await
+        .expect("export");
+    assert_eq!(report.journals, first, "{report:?}");
+    assert_eq!(report.new.count, 1, "only //pkg:a: {report:?}");
+    assert!(tmp.exists(), "a .tmp journal is never consumed");
+
+    drop(late);
+    let left = read_settled(root.path(), 1).await;
+    assert_ne!(left[0].path, first[0]);
+    assert_eq!(
+        recorded(&left),
+        vec![("//pkg:b".to_string(), hashin(root.path(), "//pkg:b").await)]
+    );
+}
+
+/// E3: a journal left by an earlier job on a persistent runner, killed
+/// before its trailer, makes the run incomplete and the snapshot bigger than
+/// this job's working set. Every revision in it is still exported under its
+/// own `hashin`, so the next job is never served a wrong output.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stale_journal_makes_it_bigger_never_wrong() {
+    let root = tempfile::tempdir().expect("root");
+    let parent = tempfile::tempdir().expect("parent");
+    let dir = parent.path().join("snap");
+    write_build(root.path(), FOUR);
+    let (stale, _) = job(root.path(), &dir, &["//pkg:a", "//pkg:b"]).await;
+    strip_trailer(&stale.journals[0]);
+    let old_a = hashin(root.path(), "//pkg:a").await;
+
+    // This job: `//pkg:a` changed, and it builds that and `//pkg:c`.
+    write_build(root.path(), &FOUR.replace("echo a >", "echo a2 >"));
+    let e = job_engine(root.path(), &dir);
+    run(&e, &["//pkg:a", "//pkg:c"]).await;
+    drop(e);
+    let new_a = hashin(root.path(), "//pkg:a").await;
+    assert_ne!(old_a, new_a);
+
+    let tok = StdCancellationToken::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let c = loop {
+        let c = Consumption::acquire(&home(root.path()), RECORDER_WAIT, &tok)
+            .await
+            .expect("acquire");
+        // The job's own journal gets its trailer a moment after the engine
+        // drops; only the stale one may be incomplete.
+        if c.working_set().incomplete.len() == 1 || Instant::now() > deadline {
+            break c;
+        }
+        drop(c);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(c.working_set().journals.len(), 2);
+    let report = c
+        .export(&engine(root.path(), None, false), &dir, &tok)
+        .await
+        .expect("export");
+    assert_eq!(report.incomplete.len(), 1, "{report:?}");
+    assert_eq!(
+        report.incomplete[0].journal, stale.journals[0],
+        "{report:?}"
+    );
+    // Bigger: the stale //pkg:b goes in beside this job's //pkg:a and
+    // //pkg:c. The stale //pkg:a's revision is no longer in the local cache
+    // (the new one replaced it), so it is left out, counted.
+    assert_eq!(
+        report.new.count, 3,
+        "the new //pkg:a, //pkg:b and //pkg:c: {report:?}"
+    );
+    assert!(report.top.iter().any(|r| r.addr == "//pkg:b"), "{report:?}");
+    assert_eq!(
+        report.left_out.get(&LeftOut::Trimmed).map(|t| t.count),
+        Some(1),
+        "the old //pkg:a: {report:?}"
+    );
+
+    // A fresh machine: the changed target is served its own output, and the
+    // stale entry's target is served from the snapshot, which is correct.
+    rm_local_cache(root.path());
+    let e = job_engine(root.path(), &dir);
+    let (a, events) = run_one(&e, "//pkg:a").await;
+    assert_eq!(a, b"a2\n");
+    assert_eq!(served_by(&events, "//pkg:a").as_deref(), Some("snapshot"));
+    let (b, events) = run_one(&e, "//pkg:b").await;
+    assert_eq!(b, b"b\n");
+    assert_eq!(served_by(&events, "//pkg:b").as_deref(), Some("snapshot"));
+}
+
+/// D4: the build and the `snapshot` command resolve the same dir from the
+/// same config, and only the build records.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn build_and_command_resolve_the_same_dir() {
+    let root = tempfile::tempdir().expect("root");
+    std::fs::write(
+        root.path().join(".hephconfig"),
+        "cacheSnapshot:\n  dir: snap\n",
+    )
+    .expect("write .hephconfig");
+    let global = heph::commands::GlobalOptions::default();
+    let (build, _shutdown, _) =
+        heph::commands::bootstrap::new_validate_engine_at(root.path(), &global, None)
+            .expect("build engine");
+    let command = heph::commands::bootstrap::new_snapshot_engine_at(
+        root.path(),
+        &global,
+        std::env::vars_os(),
+    )
+    .expect("snapshot engine");
+
+    let dir = build
+        .cache_snapshot_dir()
+        .expect("the build has a snapshot dir");
+    if std::env::var_os("HEPH_CACHE_SNAPSHOT").is_none() {
+        assert!(dir.ends_with("snap"), "{}", dir.display());
+    }
+    assert_eq!(command.cache_snapshot_dir(), Some(dir));
+    assert!(build.working_set_journal().is_some(), "the build records");
+    assert!(
+        command.working_set_journal().is_none(),
+        "the snapshot command never records"
+    );
 }

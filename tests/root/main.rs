@@ -45,5 +45,6 @@ mod run_outputs_cli;
 mod stack_status;
 mod target_dir_script;
 mod test_layout;
+mod tool_cache_snapshot;
 mod tst_script;
 mod version_json;

@@ -58,6 +58,7 @@ use std::sync::{Arc, OnceLock};
 
 pub mod export;
 pub mod marker;
+pub mod take;
 pub use export::{
     ExportOutcome, ExportReport, IncompleteJournal, LeftOut, RevisionBytes, SNAPSHOT_LOCK_FILE,
     SnapshotLock, Tally, lock_snapshot, try_lock_snapshot,
@@ -66,6 +67,7 @@ pub use marker::{
     GENERATION_PREFIX, Generation, MARKER_FILE, MARKER_TMP_PREFIX, Marker, NoTier, SNAPSHOT_FORMAT,
     is_generation_name, open_tier, read_marker, write_marker,
 };
+pub use take::{Consumption, LiveRecorder, RECORDER_WAIT, RecorderAliveError, SnapshotCancelled};
 
 /// The first line's `magic`: what makes a file a working-set journal.
 pub const JOURNAL_MAGIC: &str = "heph-working-set";
@@ -704,6 +706,12 @@ impl crate::engine::Engine {
     /// ([`Config::record_working_set`](crate::engine::Config::record_working_set)).
     pub fn working_set_journal(&self) -> Option<&Arc<Journal>> {
         self.working_set.as_ref()
+    }
+
+    /// The cache snapshot dir this engine was configured with, resolved;
+    /// `None` when snapshots are off.
+    pub fn cache_snapshot_dir(&self) -> Option<&Path> {
+        self.cfg.cache_snapshot.as_deref()
     }
 }
 

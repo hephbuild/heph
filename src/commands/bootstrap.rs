@@ -396,6 +396,28 @@ pub fn new_reader_engine(
     Ok((Arc::new(engine), home))
 }
 
+/// The engine of `heph tool cache snapshot`, over the workspace at `root`:
+/// the config resolved as a build's (so both find the same snapshot dir,
+/// D4), the environment read from `vars`, no plugin loaded, no hook, no
+/// SIGINT handler (the command cancels itself), no session, and never a
+/// working set (I5).
+pub fn new_snapshot_engine_at(
+    root: &std::path::Path,
+    global: &super::GlobalOptions,
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> anyhow::Result<Arc<engine::Engine>> {
+    let (_file, config) = engine_config(root, global, EngineRole::Snapshot, vars)
+        .context("resolving the workspace's config")?;
+    let engine = engine::Engine::new(config).context("building the snapshot engine")?;
+    Ok(Arc::new(engine))
+}
+
+/// [`new_snapshot_engine_at`] over the workspace the cwd resolves to, and
+/// the process's environment.
+pub fn new_snapshot_engine(global: &super::GlobalOptions) -> anyhow::Result<Arc<engine::Engine>> {
+    new_snapshot_engine_at(&workspace_root()?, global, std::env::vars_os())
+}
+
 /// What an engine is built for, which decides what the environment may do
 /// to it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -408,13 +430,16 @@ enum EngineRole {
     /// a malformed `HEPH_RESOURCE_<NAME>` is ignored, and nothing they do is
     /// part of a build's working set.
     Helper,
+    /// `heph tool cache snapshot`: resolves the snapshot dir exactly as a
+    /// build does (D4), runs no target, and never records (I5).
+    Snapshot,
 }
 
 impl EngineRole {
     fn bad_env(self) -> BadEnv {
         match self {
             Self::Build => BadEnv::Refuse,
-            Self::Helper => BadEnv::Ignore,
+            Self::Helper | Self::Snapshot => BadEnv::Ignore,
         }
     }
 
@@ -929,9 +954,16 @@ mod tests {
         );
         assert!(!helper.record_working_set);
 
+        let snapshot = config(EngineRole::Snapshot, None);
+        assert_eq!(snapshot.cache_snapshot, build.cache_snapshot);
+        assert!(!snapshot.record_working_set);
+
         let env = config(EngineRole::Build, Some("from-env"));
         assert_eq!(env.cache_snapshot, Some(build.root.join("from-env")));
         assert!(env.record_working_set);
+        let env_snapshot = config(EngineRole::Snapshot, Some("from-env"));
+        assert_eq!(env_snapshot.cache_snapshot, env.cache_snapshot);
+        assert!(!env_snapshot.record_working_set);
 
         let off = config(EngineRole::Build, Some(""));
         assert_eq!(off.cache_snapshot, None);
