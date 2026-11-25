@@ -395,6 +395,33 @@ pub fn open_sealed(path: &Path) -> rusqlite::Result<Connection> {
     Connection::open_with_flags(file_uri(path, "mode=ro&immutable=1"), read_only_flags())
 }
 
+/// Where a recording a connection reads came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Trust {
+    /// This machine's session directory: heph wrote it.
+    Local,
+    /// Opened by path or downloaded: anyone may have written it.
+    Foreign,
+}
+
+/// What every connection on a foreign recording, or on a copy of one, gets:
+/// `trusted_schema=OFF` and the [`VALUE_CAP`](super::hephsession::VALUE_CAP)
+/// length limit, so a crafted schema runs nothing and an oversized value is
+/// an error rather than loaded; a reader is `query_only` as well. A copy's
+/// re-derivation reads the same bytes the file holds, so it is held to the
+/// same rules as the file.
+pub(crate) fn distrust(conn: &Connection, reader: bool) -> rusqlite::Result<()> {
+    conn.execute_batch("PRAGMA trusted_schema=OFF;")?;
+    conn.set_limit(
+        rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH,
+        super::hephsession::VALUE_CAP,
+    )?;
+    if reader {
+        conn.execute_batch("PRAGMA query_only=1;")?;
+    }
+    Ok(())
+}
+
 /// A connection that may write an existing recording (a seal, a
 /// re-derivation). Never creates the file.
 fn open_existing_rw(path: &Path) -> rusqlite::Result<Connection> {
@@ -1617,7 +1644,7 @@ pub fn upgrade_local(dir: &Path, need: Need) -> anyhow::Result<Upgraded> {
     let copy = Scratch::new(dir.join(REDERIVING));
     copy.clear()?;
     std::fs::copy(&path, copy.path()).with_context(|| format!("copying {}", path.display()))?;
-    derive_into(copy.path(), pending, true)?;
+    derive_into(copy.path(), pending, true, Trust::Local)?;
     std::fs::File::open(copy.path())
         .and_then(|f| f.sync_all())
         .with_context(|| format!("syncing {}", copy.path().display()))?;
@@ -1633,9 +1660,12 @@ pub fn upgrade_local(dir: &Path, need: Need) -> anyhow::Result<Upgraded> {
 /// Re-derive (and index) the recording copy at `path` in place, then seal
 /// it. `durable`: `synchronous=FULL`, as the copy that replaces a recording
 /// needs; a temp copy for one command does not.
-fn derive_into(path: &Path, pending: Pending, durable: bool) -> anyhow::Result<()> {
+fn derive_into(path: &Path, pending: Pending, durable: bool, trust: Trust) -> anyhow::Result<()> {
     let conn = open_existing_rw(path).with_context(|| format!("opening {}", path.display()))?;
     let work = || -> rusqlite::Result<()> {
+        if trust == Trust::Foreign {
+            distrust(&conn, false)?;
+        }
         if durable {
             conn.pragma_update(None, "synchronous", "FULL")?;
             #[cfg(target_os = "macos")]
@@ -1665,12 +1695,19 @@ fn derive_into(path: &Path, pending: Pending, durable: bool) -> anyhow::Result<(
 /// what a foreign or live one always gets. The copy is removed when the
 /// result drops.
 pub fn derived_copy(root: &Path, source: &Path, need: Need) -> anyhow::Result<Opened> {
-    derived_copy_in(&tmp_dir(root), source, need)
+    derived_copy_in(&tmp_dir(root), source, need, Trust::Local)
 }
 
 /// [`derived_copy`], with the copy in `tmp`: a foreign recording's, which
-/// knows its temp directory and not the sessions root.
-pub fn derived_copy_in(tmp: &Path, source: &Path, need: Need) -> anyhow::Result<Opened> {
+/// knows its temp directory and not the sessions root. A
+/// [`Trust::Foreign`] copy is derived and read under [`distrust`], as the
+/// file itself is.
+pub fn derived_copy_in(
+    tmp: &Path,
+    source: &Path,
+    need: Need,
+    trust: Trust,
+) -> anyhow::Result<Opened> {
     std::fs::DirBuilder::new()
         .recursive(true)
         .create(tmp)
@@ -1689,10 +1726,14 @@ pub fn derived_copy_in(tmp: &Path, source: &Path, need: Need) -> anyhow::Result<
         pending(&conn, need).with_context(|| format!("reading {}", base.display()))?
     };
     if pending.any() {
-        derive_into(&base, pending, false)?;
+        derive_into(&base, pending, false, trust)?;
+    }
+    let conn = open_sealed(&base).with_context(|| format!("opening {}", base.display()))?;
+    if trust == Trust::Foreign {
+        distrust(&conn, true).with_context(|| format!("opening {}", base.display()))?;
     }
     Ok(Opened {
-        conn: open_sealed(&base).with_context(|| format!("opening {}", base.display()))?,
+        conn,
         live: false,
         copy: Some(copy),
     })

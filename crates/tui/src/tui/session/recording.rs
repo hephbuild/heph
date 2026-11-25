@@ -191,9 +191,14 @@ fn derive_foreign(file: &ForeignFile, tmp_dir: &Path) -> Result<Option<Opened>, 
         .path()
         .filter(|p| !p.is_empty())
         .ok_or_else(|| io(anyhow::anyhow!("the recording has no file to copy")))?;
-    store::derived_copy_in(tmp_dir, Path::new(path), store::Need::default())
-        .map(Some)
-        .map_err(io)
+    store::derived_copy_in(
+        tmp_dir,
+        Path::new(path),
+        store::Need::default(),
+        store::Trust::Foreign,
+    )
+    .map(Some)
+    .map_err(io)
 }
 
 impl Foreign {

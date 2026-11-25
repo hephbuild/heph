@@ -248,19 +248,29 @@ fn foreign_rows_are_charged_in_full() {
 }
 
 /// A value past the foreign length limit is refused with an error, not read
-/// into memory.
+/// into memory: read from the file itself (its derivation current), and
+/// from the copy an older derivation is re-derived into, which is as
+/// untrusted as the file it was copied from.
 #[test]
 fn an_oversized_foreign_value_is_refused() {
-    let tmp = tempfile::tempdir().expect("tempdir");
     let over = hephsession::VALUE_CAP + 1;
-    let dir = session_dir(
-        tmp.path(),
-        &format!("INSERT INTO notices VALUES ('//p:a', 1, 'plan', zeroblob({over}));"),
-    );
-    let rec = Recording::open_foreign(&dir.join(store::FILE), &tmp.path().join(".tmp"))
-        .expect("open foreign");
-    let Err(err) = rec.into_source() else {
-        panic!("a value past the limit was read")
-    };
-    assert!(format!("{err:#}").contains("too big"), "{err:#}");
+    for derivation in [store::DERIVATION, store::STALE_DERIVATION] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = session_dir(
+            tmp.path(),
+            &format!(
+                "INSERT INTO notices VALUES ('//p:a', 1, 'plan', zeroblob({over}));
+                 UPDATE session SET derivation = {derivation};"
+            ),
+        );
+        let rec = Recording::open_foreign(&dir.join(store::FILE), &tmp.path().join(".tmp"))
+            .expect("open foreign");
+        let Err(err) = rec.into_source() else {
+            panic!("derivation {derivation}: a value past the limit was read")
+        };
+        assert!(
+            format!("{err:#}").contains("too big"),
+            "derivation {derivation}: {err:#}"
+        );
+    }
 }
