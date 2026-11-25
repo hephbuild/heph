@@ -257,6 +257,58 @@ fn heal_failure_is_bounded() {
     assert_eq!((tomorrow.failed, tomorrow.deferred), (1, 0));
 }
 
+/// A recording re-derived after its row was written, whose `replace` was
+/// dropped, is healed by the next command: a complete row older than its
+/// recording's derivation is copied again. A row as old as its recording is
+/// left alone.
+#[test]
+fn heal_recopies_a_row_older_than_its_recording() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    let dir = sealed(root, recent_id(1, 1_000));
+    let fresh = catalog::open(root, now_ms()).expect("open");
+    assert_eq!(fresh.heal.healed, 1);
+    let once = snapshot(&fresh.conn);
+    drop(fresh);
+
+    // The row as an older heph wrote it, with a target the re-derivation
+    // no longer has; the recording at this heph's derivation.
+    let older = |derivation: u32| {
+        let rw = Connection::open(root.join(catalog::FILE)).expect("open rw");
+        rw.execute_batch(&format!(
+            "UPDATE sessions SET derivation = {derivation};
+             DELETE FROM target_rows;"
+        ))
+        .expect("age the row");
+    };
+    older(store::DERIVATION - 1);
+    let healed = catalog::open(root, now_ms()).expect("open");
+    assert_eq!(healed.heal.healed, 1, "copied again");
+    assert_eq!(snapshot(&healed.conn), once);
+    drop(healed);
+    assert_eq!(
+        catalog::open(root, now_ms()).expect("open").heal.healed,
+        0,
+        "current now: not copied again"
+    );
+
+    // Recording and row both at the older derivation (not re-derived yet):
+    // nothing to copy.
+    testing::alter(
+        &dir,
+        &format!("UPDATE session SET derivation = {}", store::DERIVATION - 1),
+    )
+    .expect("age the recording");
+    older(store::DERIVATION - 1);
+    let left = catalog::open(root, now_ms()).expect("open");
+    assert_eq!(left.heal.healed, 0);
+    assert_eq!(
+        count(&left.conn, "SELECT count(*) FROM target_rows"),
+        0,
+        "left as it was"
+    );
+}
+
 fn remove_catalog(root: &Path) {
     for name in [catalog::FILE, "catalog.db-wal", "catalog.db-shm"] {
         match std::fs::remove_file(root.join(name)) {
@@ -611,10 +663,34 @@ fn catalog_retention_windows() {
             std::fs::remove_dir_all(dir.path()).expect("remove a recording");
         }
     }
+    // An address only the expired session resolved.
+    {
+        let rw = Connection::open(root.join(catalog::FILE)).expect("open rw");
+        rw.execute_batch(&format!(
+            "INSERT INTO addrs (addr) VALUES ('//only:old');
+             INSERT INTO target_rows (sid, addr_id, outcome, duration_us)
+               SELECT sid, last_insert_rowid(), 1, 0 FROM sessions WHERE session_id = '{}';",
+            ids[0]
+        ))
+        .expect("a target only the old session has");
+    }
     let report = catalog::clean(root, SystemTime::now()).expect("clean");
     assert_eq!((report.expired, report.corrupt), (1, 2));
     assert_eq!(corrupt_files(root), [fresh]);
     let conn = read(root);
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM addrs WHERE addr = '//only:old'"
+        ),
+        0,
+        "an address no target row uses is pruned"
+    );
+    assert_eq!(
+        count(&conn, "SELECT count(*) FROM addrs"),
+        count(&conn, "SELECT count(DISTINCT addr_id) FROM target_rows"),
+        "every address still used is kept"
+    );
     let kept: Vec<String> = conn
         .prepare("SELECT session_id FROM sessions ORDER BY started_ms")
         .expect("prepare")

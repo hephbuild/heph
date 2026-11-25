@@ -17,7 +17,7 @@
 //! [`WRITE_BOUND`] is dropped with a `debug!`: it never fails or slows the
 //! run past that bound (I1). A build never repairs anything.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{DirBuilder, File};
 use std::io;
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
@@ -656,15 +656,19 @@ fn move_aside(root: &Path, now_ms: u64) -> anyhow::Result<PathBuf> {
 }
 
 /// Write the rows of every kept, sealed recording whose `sessions` row is
-/// missing or has `complete=0`. No watermark: a write dropped before a later
-/// session's succeeded is still found. A recording whose heal fails is noted
-/// and tried again at most once a [`HEAL_RETRY`]. `Err` only for a failure
-/// of the catalog itself.
+/// missing or has `complete=0`, or whose `derivation` is older than its
+/// recording's (the recording was re-derived and the `replace` after it was
+/// dropped). No watermark: a write dropped before a later session's
+/// succeeded is still found. A recording whose heal fails is noted and tried
+/// again at most once a [`HEAL_RETRY`]. `Err` only for a failure of the
+/// catalog itself.
 fn heal(conn: &Connection, root: &Path, now_ms: u64) -> rusqlite::Result<HealReport> {
     let mut report = HealReport::default();
-    let complete: HashSet<String> = {
-        let mut stmt = conn.prepare("SELECT session_id FROM sessions WHERE complete = 1")?;
-        stmt.query_map([], |r| r.get(0))?
+    // Complete rows, by the derivation they were written with.
+    let complete: HashMap<String, i64> = {
+        let mut stmt =
+            conn.prepare("SELECT session_id, derivation FROM sessions WHERE complete = 1")?;
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?
     };
     let retry_after = i64::try_from(now_ms.saturating_sub(retry_ms())).unwrap_or(i64::MAX);
@@ -685,14 +689,19 @@ fn heal(conn: &Connection, root: &Path, now_ms: u64) -> rusqlite::Result<HealRep
         let Some(id) = name.to_str().filter(|s| SessionId::parse(s).is_ok()) else {
             continue;
         };
-        if complete.contains(id) {
+        let rec = entry.path().join(store::FILE);
+        // Only a row older than this heph's derivation can be behind its
+        // recording: one more small read for those, none for the rest.
+        if let Some(&derivation) = complete.get(id)
+            && (derivation >= i64::from(store::DERIVATION)
+                || !recording_is_newer(conn, &rec, derivation))
+        {
             continue;
         }
         if failed.contains(id) {
             report.deferred += 1;
             continue;
         }
-        let rec = entry.path().join(store::FILE);
         // Live, lost and not yet sealed, or gone: not ended, nothing to heal.
         let header = match store::read_header(&rec) {
             Ok(Some(h)) => h,
@@ -719,6 +728,32 @@ fn heal(conn: &Connection, root: &Path, now_ms: u64) -> rusqlite::Result<HealRep
         }
     }
     Ok(report)
+}
+
+/// Whether the sealed recording `rec` was derived by a newer derivation than
+/// `than`. A recording that cannot be read is not: the row stays as it is.
+fn recording_is_newer(conn: &Connection, rec: &Path, than: i64) -> bool {
+    match store::read_header(rec) {
+        Ok(Some(h)) if !h.wal && h.is_known() => {}
+        _ => return false,
+    }
+    let read = || -> rusqlite::Result<i64> {
+        conn.execute(
+            "ATTACH DATABASE ?1 AS rec",
+            [store::file_uri(rec, "mode=ro&immutable=1")],
+        )?;
+        let derivation = conn.query_row("SELECT derivation FROM rec.session", [], |r| r.get(0));
+        let detached = conn.execute_batch("DETACH DATABASE rec");
+        let derivation = derivation?;
+        detached.map(|()| derivation)
+    };
+    match read() {
+        Ok(d) => d > than,
+        Err(e) => {
+            tracing::debug!(recording = %rec.display(), error = %e, "cannot read a recording's derivation");
+            false
+        }
+    }
 }
 
 fn retry_ms() -> u64 {
@@ -966,8 +1001,8 @@ pub(crate) fn clean_with(root: &Path, now: SystemTime, cap: u64) -> anyhow::Resu
     Ok(report)
 }
 
-/// Delete the sessions `filter` selects, and every row of theirs, in one
-/// transaction.
+/// Delete the sessions `filter` selects, every row of theirs, and the
+/// addresses no target row uses any more, in one transaction.
 fn delete_sessions(
     conn: &Connection,
     filter: &str,
@@ -991,7 +1026,8 @@ fn delete_sessions(
                  DELETE FROM span_events WHERE session_id IN (SELECT session_id FROM temp.gone);
                  DELETE FROM metrics WHERE session_id IN (SELECT session_id FROM temp.gone);
                  DELETE FROM heal_failures WHERE session_id IN (SELECT session_id FROM temp.gone);
-                 DELETE FROM sessions WHERE sid IN (SELECT sid FROM temp.gone);",
+                 DELETE FROM sessions WHERE sid IN (SELECT sid FROM temp.gone);
+                 DELETE FROM addrs WHERE id NOT IN (SELECT addr_id FROM target_rows);",
             )?;
         }
         conn.execute_batch("DROP TABLE temp.gone")?;
