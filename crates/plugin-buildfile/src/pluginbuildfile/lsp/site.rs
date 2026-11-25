@@ -159,6 +159,29 @@ impl Quote {
     }
 }
 
+/// What a [`Site::Member`]'s receiver (the expression before the `.`) is, so
+/// `--explain` can say why its member list is empty.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Receiver {
+    /// A chain of names whose root the file does not bind: a global's path.
+    Names,
+    /// A chain of names whose root `name` the file binds itself (assigned,
+    /// loaded, a parameter), so it is not the global of that name.
+    Rebound { name: String },
+    /// Anything else: a call, an index, a literal.
+    Expression,
+}
+
+impl Receiver {
+    fn name(&self) -> &'static str {
+        match self {
+            Receiver::Names => "names",
+            Receiver::Rebound { .. } => "rebound",
+            Receiver::Expression => "expression",
+        }
+    }
+}
+
 /// A string (or not-yet-string) value at the cursor.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Str {
@@ -237,6 +260,17 @@ pub(crate) enum Site {
         edit: Range<usize>,
         prefix: String,
     },
+    /// Any other member position, right after a `.`: `typing.│`,
+    /// `heph.core.os.│`, `l.na│`, `f().│`. `path` is the receiver when it is
+    /// a chain of identifiers whose root is a global the file does not rebind
+    /// (`["typing"]`, [`Receiver::Names`]), and `None` otherwise: a local
+    /// value, a call, a literal, whose members nothing here knows.
+    Member {
+        path: Option<Vec<String>>,
+        receiver: Receiver,
+        edit: Range<usize>,
+        prefix: String,
+    },
     /// A `//pkg:name` or `:name` string.
     Address {
         value: Str,
@@ -265,6 +299,7 @@ impl Site {
             Site::ArgKey { .. } => "arg_key",
             Site::PluginNamespace { .. } => "plugin_namespace",
             Site::PluginMember { .. } => "plugin_member",
+            Site::Member { .. } => "member",
             Site::Address { .. } => "address",
             Site::LoadPath { .. } => "load_path",
             Site::LoadSymbol { .. } => "load_symbol",
@@ -307,7 +342,8 @@ impl Site {
             | Site::StateKey { prefix, .. }
             | Site::ArgKey { prefix, .. }
             | Site::PluginNamespace { prefix, .. }
-            | Site::PluginMember { prefix, .. } => Some(prefix),
+            | Site::PluginMember { prefix, .. }
+            | Site::Member { prefix, .. } => Some(prefix),
         }
     }
 
@@ -357,7 +393,8 @@ impl Site {
             | Site::StateKey { edit, .. }
             | Site::ArgKey { edit, .. }
             | Site::PluginNamespace { edit, .. }
-            | Site::PluginMember { edit, .. } => Some(edit),
+            | Site::PluginMember { edit, .. }
+            | Site::Member { edit, .. } => Some(edit),
             _ => None,
         };
         if let (Some(edit), Some(map)) = (word, out.as_object_mut()) {
@@ -368,6 +405,13 @@ impl Site {
             map.insert("plugin".to_string(), json!(plugin));
             if !path.is_empty() {
                 map.insert("path".to_string(), json!(path));
+            }
+        }
+        if let (Site::Member { path, receiver, .. }, Some(map)) = (self, out.as_object_mut()) {
+            map.insert("path".to_string(), json!(path));
+            map.insert("receiver".to_string(), json!(receiver.name()));
+            if let Receiver::Rebound { name } = receiver {
+                map.insert("rebound".to_string(), json!(name));
             }
         }
         out
@@ -876,11 +920,10 @@ pub(crate) fn resolve(doc: &Doc<'_>, o: usize) -> Resolution {
     };
     // Shadowing, decided here for every feature. Every site inside a
     // `target(` / `provider_state(` call is shadowed with its callee, so the
-    // list is `Site::call`'s, not a second copy that a new kind can miss.
-    let callee = match &resolution.site {
-        Site::PluginNamespace { .. } | Site::PluginMember { .. } => Some("heph"),
-        site => site.call().map(|call| call.callee.name()),
-    };
+    // list is `Site::call`'s, not a second copy that a new kind can miss. A
+    // rebound `heph` never gets here as a `heph.` site: `dotted_site` makes it
+    // a `member` whose receiver is rebound, like any other bound root.
+    let callee = resolution.site.call().map(|call| call.callee.name());
     let ast_degraded = match doc.ast {
         AstState::Current => None,
         AstState::Stale { behind } => Some(Degraded::AstStale { behind }),
@@ -975,7 +1018,8 @@ fn classify(doc: &Doc<'_>, o: usize) -> Result<Site, Reason> {
         return Ok(Site::Callee { call });
     }
 
-    // `heph.` and `heph.<plugin>.` member paths.
+    // Any member position, right after a `.`: `heph.`, `heph.<plugin>.`,
+    // `typing.`, `f().`.
     if let Some(site) = dotted_site(doc, word, o, &edit, &prefix) {
         return Ok(site);
     }
@@ -1062,6 +1106,15 @@ fn key_site(call: Call, edit: Range<usize>, prefix: String) -> Site {
     }
 }
 
+/// The site of a member position: the member being typed (or the cursor)
+/// follows a `.`. `heph.│` is [`Site::PluginNamespace`], `heph.<plugin>.│`
+/// (and deeper under `heph.types`) [`Site::PluginMember`], any other
+/// [`Site::Member`]. `None` when the previous significant token is not a `.`.
+///
+/// Whitespace, newlines and comments between the tokens do not matter: a `.`
+/// token only ever means attribute access (a float is one `Number` token), so
+/// `typing. A│`, `typing.\n    A│` and `typing\n  .│` all have the receiver
+/// `typing`.
 fn dotted_site(
     doc: &Doc<'_>,
     word: Option<usize>,
@@ -1069,47 +1122,85 @@ fn dotted_site(
     edit: &Range<usize>,
     prefix: &str,
 ) -> Option<Site> {
-    // The token before the member being typed (or the cursor) must be a `.`.
     let member_start = word
         .and_then(|i| doc.tok(i))
         .map_or(o, |t| t.start as usize);
     let dot = doc.prev_significant(member_start, None)?;
-    let dot_tok = doc.tok(dot)?;
-    if dot_tok.kind != Kind::Dot || dot_tok.end as usize != member_start {
+    if doc.tok(dot)?.kind != Kind::Dot {
         return None;
     }
-    // Walk left over `ident .` pairs.
+    let chain = ident_chain(doc, dot);
+    let edit = edit.clone();
+    let prefix = prefix.to_string();
+    // A root the file binds itself (assigned, loaded, a parameter) is not the
+    // global of that name, whatever it holds; that holds for `heph` too.
+    let rebound = chain
+        .as_deref()
+        .and_then(|segs| segs.first())
+        .filter(|root| is_rebound(doc.overlay, root));
+    if let Some(root) = rebound {
+        return Some(Site::Member {
+            path: None,
+            receiver: Receiver::Rebound {
+                name: (*root).to_string(),
+            },
+            edit,
+            prefix,
+        });
+    }
+    Some(match chain.as_deref() {
+        Some(["heph"]) => Site::PluginNamespace { edit, prefix },
+        // A driver's `Kwargs` nests one namespace per segment of its name.
+        Some(["heph", plugin, path @ ..]) if path.is_empty() || *plugin == "types" => {
+            Site::PluginMember {
+                plugin: (*plugin).to_string(),
+                path: path.iter().map(|s| (*s).to_string()).collect(),
+                edit,
+                prefix,
+            }
+        }
+        Some(segs) => Site::Member {
+            path: Some(segs.iter().map(|s| (*s).to_string()).collect()),
+            receiver: Receiver::Names,
+            edit,
+            prefix,
+        },
+        None => Site::Member {
+            path: None,
+            receiver: Receiver::Expression,
+            edit,
+            prefix,
+        },
+    })
+}
+
+/// The `a.b.c` chain of identifiers ending at the `.` token `dot`, or `None`
+/// when the receiver is anything else (a call, an index, a literal). It walks
+/// left over `Ident Dot` pairs by token order, skipping comments, whatever
+/// whitespace lies between them.
+fn ident_chain<'d>(doc: &'d Doc<'_>, dot: usize) -> Option<Vec<&'d str>> {
     let mut segments: Vec<&str> = Vec::new();
-    let mut i = dot;
+    let mut dot_tok = *doc.tok(dot)?;
     loop {
-        let name = i.checked_sub(1).and_then(|j| doc.tok(j))?;
+        // `x[0].a`, `f().a`, `"s".a`: a receiver that is not a name.
+        let name = doc
+            .prev_significant(dot_tok.start as usize, None)
+            .and_then(|j| doc.tok(j))
+            .copied()?;
         if name.kind != Kind::Ident {
             return None;
         }
-        segments.push(doc.text_of(name));
-        let before = i.checked_sub(2).and_then(|j| doc.tok(j));
-        match before {
-            Some(b) if b.kind == Kind::Dot && b.end == name.start => i -= 2,
+        segments.push(doc.text_of(&name));
+        match doc
+            .prev_significant(name.start as usize, None)
+            .and_then(|j| doc.tok(j))
+        {
+            Some(b) if b.kind == Kind::Dot => dot_tok = *b,
             _ => break,
         }
     }
     segments.reverse();
-    match segments.as_slice() {
-        ["heph"] => Some(Site::PluginNamespace {
-            edit: edit.clone(),
-            prefix: prefix.to_string(),
-        }),
-        // A driver's `Kwargs` nests one namespace per segment of its name.
-        ["heph", plugin, path @ ..] if path.is_empty() || *plugin == "types" => {
-            Some(Site::PluginMember {
-                plugin: (*plugin).to_string(),
-                path: path.iter().map(|s| (*s).to_string()).collect(),
-                edit: edit.clone(),
-                prefix: prefix.to_string(),
-            })
-        }
-        _ => None,
-    }
+    Some(segments)
 }
 
 fn string_site(
@@ -1328,6 +1419,129 @@ mod tests {
             None,
             "a plugin function has no members"
         );
+    }
+
+    /// Every other position after a `.` is a `member` site; its path is the
+    /// receiver when that is a chain of names rooted at a global.
+    #[test]
+    fn site_member_path_is_a_global_name_chain() {
+        let path = |r: Resolution| match r.site {
+            Site::Member {
+                path,
+                receiver,
+                prefix,
+                ..
+            } => Some((path, receiver, prefix)),
+            _ => None,
+        };
+        let s = |v: &[&str]| Some(v.iter().map(|x| (*x).to_string()).collect::<Vec<_>>());
+        let names = Receiver::Names;
+        let expr = Receiver::Expression;
+        for (fixture, want, receiver, prefix) in [
+            ("x = typing.│\n", s(&["typing"]), &names, ""),
+            ("def f(x: typing.Ca│ll):\n", s(&["typing"]), &names, "Ca"),
+            ("x = a.b.│\n", s(&["a", "b"]), &names, ""),
+            (
+                "x = heph.fs.join.│\n",
+                s(&["heph", "fs", "join"]),
+                &names,
+                "",
+            ),
+            ("x = typing.Any.│\n", s(&["typing", "Any"]), &names, ""),
+            ("x = f().│\n", None, &expr, ""),
+            ("x = l[0].│\n", None, &expr, ""),
+            ("x = \"s\".jo│\n", None, &expr, "jo"),
+            // Whitespace, newlines and comments between the tokens do not
+            // matter: a `.` only ever means attribute access.
+            ("x = typing. A│\n", s(&["typing"]), &names, "A"),
+            ("x = (typing.\n    A│)\n", s(&["typing"]), &names, "A"),
+            ("x = (typing\n  .│)\n", s(&["typing"]), &names, ""),
+            ("x = (a.\n typing.│)\n", s(&["a", "typing"]), &names, ""),
+            ("x = (typing # c\n  .│)\n", s(&["typing"]), &names, ""),
+            ("x = f() . │\n", None, &expr, ""),
+            // Inside a call, a value or a default: still a member.
+            ("foo(typing.│)\n", s(&["typing"]), &names, ""),
+            (
+                "target(name = \"x\", deps = typing.│)\n",
+                s(&["typing"]),
+                &names,
+                "",
+            ),
+            ("def f(x = typing.│):\n", s(&["typing"]), &names, ""),
+        ] {
+            assert_eq!(
+                path(at(fixture)),
+                Some((want, receiver.clone(), prefix.to_string())),
+                "{fixture}"
+            );
+        }
+        let rebound = |name: &str| {
+            Some((
+                None,
+                Receiver::Rebound {
+                    name: name.to_string(),
+                },
+                String::new(),
+            ))
+        };
+        assert_eq!(
+            path(with_overlay("x = typing.│\n", &["typing"])),
+            rebound("typing"),
+            "a root the file binds is not the global"
+        );
+        assert_eq!(
+            path(with_overlay(
+                "load(\"//x:y.star\", typing = \"foo\")\nx = typing.│\n",
+                &["typing"]
+            )),
+            rebound("typing"),
+            "a load binds its alias"
+        );
+        assert_eq!(
+            path(with_overlay(
+                "def f(typing):\n    x = typing.│\n",
+                &["f", "typing"]
+            )),
+            rebound("typing"),
+            "a parameter binds its name"
+        );
+        assert_eq!(
+            path(with_overlay("x = typing.│\n", &["other"])),
+            Some((s(&["typing"]), Receiver::Names, String::new()))
+        );
+        // A rebound `heph` is not the global either: no plugin sites, and no
+        // callee shadowing that would hand `heph.` to the stock global list.
+        for fixture in ["x = heph.│\n", "x = heph.core.│\n", "x = heph.core.os.│\n"] {
+            let r = with_overlay(fixture, &["heph"]);
+            assert_eq!(r.reason, None, "{fixture}");
+            assert_eq!(path(r), rebound("heph"), "{fixture}");
+        }
+        for not_member in [
+            "# typing.│\n",
+            "x = \"typing.│\"\n",
+            "x = 1.│\n",
+            "x = typ│\n",
+        ] {
+            assert_eq!(path(at(not_member)), None, "{not_member}");
+        }
+    }
+
+    #[test]
+    fn site_member_explain_json_names_the_receiver() {
+        let json = |r: Resolution| r.site.to_json();
+        let names = json(at("x = typing.│\n"));
+        assert_eq!(names["kind"], json!("member"));
+        assert_eq!(names["path"], json!(["typing"]));
+        assert_eq!(names["receiver"], json!("names"));
+        assert!(names.get("rebound").is_none(), "{names}");
+        let rebound = json(with_overlay("x = typing.│\n", &["typing"]));
+        assert_eq!(rebound["path"], Value::Null);
+        assert_eq!(rebound["receiver"], json!("rebound"));
+        assert_eq!(rebound["rebound"], json!("typing"));
+        let expr = json(at("x = f().│\n"));
+        assert_eq!(expr["path"], Value::Null);
+        assert_eq!(expr["receiver"], json!("expression"));
+        assert!(expr.get("rebound").is_none(), "{expr}");
     }
 
     #[test]

@@ -1004,4 +1004,84 @@ def f(k: heph.types.bash.Kwargs):
             )
         );
     }
+
+    /// Types a BUILD file declares (`record`, `field`, `enum`, an alias,
+    /// `typing`), here and across a load, check clean with annotations
+    /// required: the checker's globals are evaluation's.
+    #[test]
+    fn user_declared_types_check_clean() {
+        let tmp = ws(&[
+            (
+                "pkg/BUILD",
+                "load(\"//lib/defs.star\", \"Lib\", \"Mode\")\n\n\
+                 Names = list[str]\n\n\
+                 def names(l: Lib, extra: typing.Any = None) -> Names:\n    \
+                 return [l.name, l.mode.value]\n\n\
+                 def use(f: typing.Callable) -> Names:\n    \
+                 return names(Lib(name = \"a\", mode = Mode(\"debug\")))\n",
+            ),
+            (
+                "lib/defs.star",
+                "Mode = enum(\"debug\", \"release\")\n\
+                 Lib = record(name = str, mode = Mode, srcs = field(list[str], []))\n",
+            ),
+        ]);
+        assert_eq!(lint_pkg(tmp.path(), "pkg", true), []);
+    }
+
+    /// The limit of the static checker on declared types. A type alias is a
+    /// type expression the checker evaluates, so a mismatch is reported. A
+    /// `record` or `enum` is the result of a call, which it does not run: the
+    /// annotation is `Any` there, and evaluation's runtime check is what
+    /// catches the mismatch (`run_file`'s
+    /// `user_declared_types_checked_at_evaluation`).
+    #[test]
+    fn user_declared_record_and_enum_checked_at_evaluation_only() {
+        let tmp = ws(&[(
+            "pkg/BUILD",
+            "Names = list[str]\n\
+             R = record(a = str)\n\
+             E = enum(\"a\", \"b\")\n\n\
+             def f(n: Names, r: R, e: E) -> None:\n    pass\n\n\
+             def g() -> None:\n    f(1, \"r\", 1)\n",
+        )]);
+        assert_eq!(
+            lines(&lint_pkg(tmp.path(), "pkg", true)),
+            ["pkg/BUILD:9:7: type-error: Expected type `list[str]` but got `int`"]
+        );
+
+        // An alias is checked only in the file that declares it: a loaded
+        // name has no value for the checker to evaluate, so it is `Any`.
+        let tmp = ws(&[
+            (
+                "pkg/BUILD",
+                "load(\"//lib/defs.star\", \"Names\")\n\n\
+                 def f(n: Names) -> None:\n    pass\n\n\
+                 def g() -> None:\n    f(1)\n",
+            ),
+            ("lib/defs.star", "Names = list[str]\n"),
+        ]);
+        assert_eq!(lint_pkg(tmp.path(), "pkg", true), []);
+    }
+
+    /// A file that binds a name the type extensions add keeps its own binding
+    /// in the checker, as in evaluation (`run_file`'s
+    /// `user_bindings_shadow_type_globals`).
+    #[test]
+    fn user_bindings_shadow_type_globals() {
+        let tmp = ws(&[
+            (
+                "pkg/BUILD",
+                "load(\"//lib/defs.star\", \"field\")\n\
+                 enum = \"e\"\n\
+                 typing = {\"a\": \"t\"}\n\n\
+                 def eval_type(x: str) -> str:\n    return x\n\n\
+                 def name(record: str = \"r\") -> str:\n    \
+                 n: str = typing[\"a\"]\n    \
+                 return \"-\".join([record, enum, n, eval_type(field)])\n",
+            ),
+            ("lib/defs.star", "field = \"f\"\n"),
+        ]);
+        assert_eq!(lint_pkg(tmp.path(), "pkg", true), []);
+    }
 }

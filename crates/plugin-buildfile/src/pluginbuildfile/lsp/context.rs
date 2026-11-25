@@ -90,7 +90,7 @@ impl HephLspContext {
         // and the stock analysis never answers under `heph.types` (heph's
         // `plugin_member` site replaces it there).
         let doc_globals = build_globals(&registry, &DriverKwargs::default()).documentation();
-        let core_members = crate::pluginbuildfile::run_file::heph_core_members(&doc_globals);
+        let namespaces = crate::pluginbuildfile::run_file::namespace_members(&doc_globals);
         let builtin_hovers = crate::pluginbuildfile::run_file::BuiltinHovers::new(&doc_globals);
         let patterns = buildfile_patterns(&*engine);
         let runtime = tokio::runtime::Handle::current();
@@ -101,7 +101,7 @@ impl HephLspContext {
             engine,
             root.clone(),
             patterns.clone(),
-            core_members,
+            namespaces,
             builtin_hovers,
         );
         HephLspContext {
