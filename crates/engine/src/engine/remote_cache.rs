@@ -1304,23 +1304,60 @@ impl RemoteCacheSet {
     /// a test can drive the read path against a stub object store.
     #[cfg(test)]
     pub(crate) fn with_backend(backend: Arc<dyn RemoteCacheBackend>, home: PathBuf) -> Arc<Self> {
+        Self::with_backends(vec![("stub", backend)], home)
+    }
+
+    /// Test-only: a set of readable+writable caches over `backends`, read in
+    /// the order given — no latency probe — so a test can make one cache fail
+    /// in a way the next must cover.
+    #[cfg(test)]
+    pub(crate) fn with_backends(
+        backends: Vec<(&str, Arc<dyn RemoteCacheBackend>)>,
+        home: PathBuf,
+    ) -> Arc<Self> {
+        let order: Vec<usize> = (0..backends.len()).collect();
+        let caches = backends
+            .into_iter()
+            .map(|(name, backend)| {
+                ConfiguredCache::new(
+                    RemoteCacheDef {
+                        name: name.to_string(),
+                        uri: format!("memory:///{name}"),
+                        read: true,
+                        write: true,
+                        concurrency: 4,
+                        endpoint: None,
+                        region: None,
+                    },
+                    backend,
+                )
+            })
+            .collect();
         Arc::new(Self {
-            caches: vec![ConfiguredCache::new(
-                RemoteCacheDef {
-                    name: "stub".to_string(),
-                    uri: "memory:///stub".to_string(),
-                    read: true,
-                    write: true,
-                    concurrency: 4,
-                    endpoint: None,
-                    region: None,
-                },
-                backend,
-            )],
+            caches,
             home,
             config_hash: String::new(),
-            read_order: OnceCell::new(),
+            read_order: OnceCell::new_with(Some(order)),
         })
+    }
+
+    /// Test-only: fix the read order to `names`, fastest-first, instead of
+    /// measuring it, so a test can say which cache is read first. Must be
+    /// called before the first read; an order already settled is an error.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn pin_read_order_for_tests(&self, names: &[&str]) -> anyhow::Result<()> {
+        let order = names
+            .iter()
+            .map(|name| {
+                self.caches
+                    .iter()
+                    .position(|c| c.def.name == *name && c.def.read)
+                    .with_context(|| format!("no readable cache named `{name}`"))
+            })
+            .collect::<anyhow::Result<Vec<usize>>>()?;
+        self.read_order
+            .set(order)
+            .context("the read order is already settled")
     }
 
     /// An empty set with no home. Test-only: production builds every set through
@@ -5148,6 +5185,223 @@ mod tests {
                 .await
                 .expect("fetch")
                 .is_none()
+        );
+    }
+
+    /// One memory cache named `name`, written to by an engine of its own that
+    /// caches `data` as blob `a` with `hashout` and pushes it: the revision a
+    /// build of `(addr(), hashin)` left on that cache. Returns the cache's
+    /// backend, to be shared with a reader's set, and the writer's engine.
+    async fn cache_built_by(
+        dir: &Path,
+        name: &str,
+        hashin: &str,
+        data: &[u8],
+        hashout: &str,
+    ) -> (Arc<dyn RemoteCacheBackend>, Arc<crate::engine::Engine>) {
+        use crate::engine::driver::outputartifact;
+
+        let set = RemoteCacheSet::new(
+            &[def(name, &format!("memory:///{name}"), true, true)],
+            dir.to_path_buf(),
+        )
+        .expect("remote set");
+        let (_, backend) = set
+            .writable_backends()
+            .into_iter()
+            .next()
+            .expect("one writable cache");
+        let engine = engine_with_set(dir, set);
+        let artifact = outputartifact::OutputArtifact {
+            group: "out".to_string(),
+            name: "a".to_string(),
+            r#type: outputartifact::Type::Output,
+            content: outputartifact::Content::Raw(outputartifact::ContentRaw {
+                data: data.to_vec(),
+                path: "a.txt".to_string(),
+                x: false,
+            }),
+            hashout: hashout.to_string(),
+        };
+        engine
+            .cache_locally(&never(), &addr(), hashin, vec![artifact], false)
+            .await
+            .expect("cache_locally");
+        engine.upload_to_remote(&addr(), hashin).await;
+        (backend, engine)
+    }
+
+    /// The bytes of blob `name` in `engine`'s local cache.
+    fn local_blob(engine: &crate::engine::Engine, hashin: &str, name: &str) -> Vec<u8> {
+        use std::io::Read as _;
+        let mut r = engine
+            .local_cache
+            .reader(&addr(), hashin, name)
+            .expect("local blob");
+        let mut bytes = Vec::new();
+        r.reader.read_to_end(&mut bytes).expect("read local blob");
+        bytes
+    }
+
+    /// A target that is not reproducible, built twice for one `(addr, hashin)`,
+    /// leaves two revisions naming the same blob with different hashouts. A
+    /// reader whose local manifest records one hashout must never be handed
+    /// the other build's bytes: the first cache's entry does not match
+    /// (`entry_for` is `None`), the pull falls through to the cache that holds
+    /// the matching build, and with no such cache it is a miss — nothing is
+    /// written locally and the caller rebuilds.
+    #[tokio::test]
+    async fn a_pulled_blob_with_another_hashout_is_rejected() {
+        let orig_dir = tempfile::tempdir().expect("tempdir");
+        let rebuilt_dir = tempfile::tempdir().expect("tempdir");
+        let (orig, orig_engine) =
+            cache_built_by(orig_dir.path(), "orig", "h", b"first build", "ho-first").await;
+        let (rebuilt, _rebuilt_engine) = cache_built_by(
+            rebuilt_dir.path(),
+            "rebuilt",
+            "h",
+            b"second build, other bytes",
+            "ho-second",
+        )
+        .await;
+
+        // The reader's local manifest is the first build's.
+        let local = orig_engine
+            .read_manifest_blocking(&never(), &addr(), "h")
+            .await
+            .expect("read manifest")
+            .expect("manifest");
+        let want = local.artifacts.first().expect("one artifact").clone();
+        let want_bytes = local_blob(&orig_engine, "h", &want.name);
+
+        // Read first: the cache that holds the other build.
+        let reader_dir = tempfile::tempdir().expect("tempdir");
+        let reader = engine_with_set(
+            reader_dir.path(),
+            RemoteCacheSet::with_backends(
+                vec![("rebuilt", rebuilt.clone()), ("orig", orig)],
+                reader_dir.path().to_path_buf(),
+            ),
+        );
+        let first = reader
+            .remote_caches
+            .locate(&never(), &addr(), "h", Need::Manifest, None)
+            .await
+            .expect("locate")
+            .expect("a revision");
+        assert_eq!(reader.remote_caches.cache_name(&first), "rebuilt");
+        let other = first
+            .manifest
+            .artifacts
+            .iter()
+            .find(|a| a.name == want.name)
+            .expect("the other build names the same blob");
+        assert_eq!(other.hashout, "ho-second");
+        assert!(
+            first.entry_for(&want).is_none(),
+            "a blob with another hashout must not match the local manifest's"
+        );
+
+        assert!(
+            reader
+                .pull_remote_blob_from_any(&never(), &addr(), "h", &first, &want)
+                .await
+                .expect("pull"),
+            "the cache holding the matching build must serve the blob"
+        );
+        assert_eq!(
+            local_blob(&reader, "h", &want.name),
+            want_bytes,
+            "the pulled blob must be the matching build's, byte for byte"
+        );
+
+        // Only the other build on offer: a miss, and nothing lands locally.
+        let lone_dir = tempfile::tempdir().expect("tempdir");
+        let lone = engine_with_set(
+            lone_dir.path(),
+            RemoteCacheSet::with_backends(
+                vec![("rebuilt", rebuilt)],
+                lone_dir.path().to_path_buf(),
+            ),
+        );
+        let first = lone
+            .remote_caches
+            .locate(&never(), &addr(), "h", Need::Manifest, None)
+            .await
+            .expect("locate")
+            .expect("a revision");
+        assert!(
+            !lone
+                .pull_remote_blob_from_any(&never(), &addr(), "h", &first, &want)
+                .await
+                .expect("pull"),
+            "no cache holds the matching build: the caller must rebuild"
+        );
+        assert!(
+            !lone
+                .local_cache
+                .exists(&addr(), "h", &want.name)
+                .expect("exists"),
+            "the other build's bytes must not reach the local cache"
+        );
+    }
+
+    /// A cache that answers a listing without a blob the hit needs is passed
+    /// over for the next, and its breaker stays closed: the listing succeeded,
+    /// so the cache is healthy and merely lacks the entry. Run past the
+    /// failure threshold, so a miss counted as a failure would have tripped it.
+    #[tokio::test]
+    async fn a_presence_miss_leaves_the_breaker_closed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let addr = addr();
+        let manifest = RemoteManifest {
+            version: REMOTE_MANIFEST_VERSION.to_string(),
+            target: addr.format(),
+            hashin: "h".to_string(),
+            artifacts: vec![remote_artifact(
+                "out_a.tar",
+                4,
+                ManifestArtifactEncoding::None,
+            )],
+        };
+        let manifest_key = RemoteCacheSet::key(&addr, "h", MANIFEST_V2);
+        let blob_key = RemoteCacheSet::key(&addr, "h", "out_a.tar");
+        let manifest_bytes = borsh::to_vec(&manifest).expect("borsh");
+        let backend = |objects: Vec<(&String, &[u8])>| -> Arc<dyn RemoteCacheBackend> {
+            Arc::new(ReadProbeBackend {
+                objects: objects
+                    .into_iter()
+                    .map(|(k, v)| (k.clone(), v.to_vec()))
+                    .collect(),
+                in_flight: AtomicUsize::new(0),
+                peak: AtomicUsize::new(0),
+            })
+        };
+        let lacking = backend(vec![(&manifest_key, &manifest_bytes)]);
+        let whole = backend(vec![(&manifest_key, &manifest_bytes), (&blob_key, b"blob")]);
+        let set = RemoteCacheSet::with_backends(
+            vec![("lacking", lacking), ("whole", whole)],
+            dir.path().to_path_buf(),
+        );
+        let groups = ["out".to_string()];
+
+        for _ in 0..=FAILURE_THRESHOLD {
+            let rev = set
+                .locate(&never(), &addr, "h", Need::Groups(&groups), None)
+                .await
+                .expect("locate")
+                .expect("the second cache holds the whole revision");
+            assert_eq!(set.cache_name(&rev), "whole");
+        }
+        let lacking = set.caches.first().expect("first cache");
+        assert!(
+            !lacking.broken(),
+            "a cache that answered its listing must not be paused"
+        );
+        assert_eq!(
+            lacking.health.consecutive_failures.load(Ordering::Relaxed),
+            0,
+            "a presence miss is not a failure"
         );
     }
 }

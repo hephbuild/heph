@@ -65,6 +65,7 @@ mod plugin_fn_declarations;
 mod plugin_functions;
 mod query;
 mod remote_cache;
+mod remote_cache_fallthrough;
 mod resources;
 mod result_outputs;
 mod run_json;

@@ -29,22 +29,36 @@ pub fn build_engine(root: &std::path::Path, remote_uri: &str) -> Arc<Engine> {
 
 /// [`build_engine`] with the remote optional: `None` configures no remote.
 pub fn build_engine_with_remote(root: &std::path::Path, remote_uri: Option<&str>) -> Arc<Engine> {
+    let remotes: Vec<(&str, &str)> = remote_uri.map(|uri| ("shared", uri)).into_iter().collect();
+    build_engine_with_remotes(root, &remotes)
+}
+
+/// [`build_engine`] over several read+write remotes, `(name, uri)`, read in
+/// the order given rather than in measured-latency order, so a test decides
+/// which remote is asked first. Every remote is written on upload.
+pub fn build_engine_with_remotes(root: &std::path::Path, remotes: &[(&str, &str)]) -> Arc<Engine> {
     let mut e = Engine::new(Config {
-        remote_caches: remote_uri
-            .map(|uri| heph::engine::RemoteCacheDef {
-                name: "shared".to_string(),
-                uri: uri.to_string(),
+        remote_caches: remotes
+            .iter()
+            .map(|(name, uri)| heph::engine::RemoteCacheDef {
+                name: (*name).to_string(),
+                uri: (*uri).to_string(),
                 read: true,
                 write: true,
                 concurrency: 10,
                 endpoint: None,
                 region: None,
             })
-            .into_iter()
             .collect(),
         ..Config::for_tests(root)
     })
     .expect("engine");
+    if remotes.len() > 1 {
+        let names: Vec<&str> = remotes.iter().map(|(name, _)| *name).collect();
+        e.remote_caches()
+            .pin_read_order_for_tests(&names)
+            .expect("pin the remotes' read order");
+    }
     e.register_provider(|init| {
         Box::new(pluginbuildfile::Provider::new(
             init.root.to_path_buf(),
