@@ -14,7 +14,7 @@ use std::collections::BTreeSet;
 
 /// The race fixture, with a `pre_run` test state under `//racy` only: its test
 /// runners switch to `bash`, `//clean`'s stay `exec`.
-fn race_with_pre_run() -> anyhow::Result<tempfile::TempDir> {
+fn race_with_pre_run() -> anyhow::Result<hcore::fsutil::TempDir> {
     let dir = fixture("race")?;
     std::fs::write(
         dir.path().join("racy").join("BUILD"),

@@ -153,7 +153,7 @@ async fn private_modules_fetched_with_git_under_the_hermetic_sdk() -> anyhow::Re
     )?;
     tagged_repo(&repos.join("gone"), GONE_FILES)?;
 
-    let app = tempfile::tempdir()?;
+    let app = hcore::fsutil::tempdir()?;
     std::fs::write(
         app.path().join("go.mod"),
         "module example.test/app\n\ngo 1.21\n\n\

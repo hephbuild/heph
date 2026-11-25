@@ -9,7 +9,9 @@ use heph::engine::{
 use heph::htaddr::{Addr, parse_addr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tempfile::TempDir;
+// Not `tempfile::TempDir`: an engine run stages and caches read-only trees in
+// the workspace, which tempfile's drop cannot remove.
+use hcore::fsutil::TempDir;
 
 type SetupFn = Box<dyn FnOnce(&mut Engine) -> anyhow::Result<()>>;
 
@@ -24,13 +26,14 @@ pub struct WorkspaceBuilder {
 impl WorkspaceBuilder {
     pub fn new() -> anyhow::Result<Self> {
         Ok(Self::from_dir(
-            tempfile::tempdir().context("create workspace tempdir")?,
+            hcore::fsutil::tempdir().context("create workspace tempdir")?,
         ))
     }
 
-    pub fn from_dir(dir: TempDir) -> Self {
+    /// A `tempfile::TempDir` is taken over, so its read-only trees go too.
+    pub fn from_dir(dir: impl Into<TempDir>) -> Self {
         Self {
-            dir,
+            dir: dir.into(),
             parallelism: None,
             fs_skip: vec![],
             keep_failed_sandboxes: false,
@@ -287,7 +290,7 @@ pub fn root(ws: &Workspace) -> &Path {
 }
 
 pub fn copy_dir_to_tempdir(src: &Path) -> anyhow::Result<TempDir> {
-    let tmp = tempfile::tempdir().context("create tempdir")?;
+    let tmp = hcore::fsutil::tempdir().context("create tempdir")?;
     copy_dir_all(src, tmp.path())?;
     Ok(tmp)
 }

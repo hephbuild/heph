@@ -397,7 +397,7 @@ async fn test_embed_generated_in_subpackage_of_the_embedder() -> anyhow::Result<
 #[tokio::test]
 async fn go_test_sees_resource_cpu_and_host_gomaxprocs() -> anyhow::Result<()> {
     require_go!();
-    let dir = tempfile::tempdir()?;
+    let dir = hcore::fsutil::tempdir()?;
     let root = dir.path();
     std::fs::write(root.join("go.mod"), "module example.com/cpus\n\ngo 1.21\n")?;
     std::fs::create_dir_all(root.join("p"))?;

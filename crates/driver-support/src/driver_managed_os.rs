@@ -341,7 +341,7 @@ mod tests {
     #[tokio::test]
     async fn timeout_keeps_failure_out_and_writes_nothing_back() -> anyhow::Result<()> {
         use hplugin::driver::targetdef::path::{CodegenMode, Content, Path as DefPath};
-        let tmp = tempfile::tempdir()?;
+        let tmp = hcore::fsutil::tempdir()?;
         let stage = tmp.path().join("stage");
         let id = "t".to_string();
         let cancelled: fn() -> anyhow::Error = || anyhow::anyhow!("cancelled");
@@ -416,7 +416,7 @@ mod tests {
     #[tokio::test]
     async fn failure_without_exit_collects_nothing() -> anyhow::Result<()> {
         use hplugin::error::{Exit, ProcessFailed};
-        let tmp = tempfile::tempdir()?;
+        let tmp = hcore::fsutil::tempdir()?;
         let stage = tmp.path().join("stage");
         let target = keeps_report();
         let id = "t".to_string();
@@ -508,7 +508,7 @@ mod tests {
     /// its frame, so nothing stays held (R16).
     #[tokio::test]
     async fn stage_holds_ride_the_guards_and_drop_on_failure() -> anyhow::Result<()> {
-        let tmp = tempfile::tempdir()?;
+        let tmp = hcore::fsutil::tempdir()?;
         let stage = tmp.path().join("stage");
         let target = TargetDef::default();
         let id = "t".to_string();
@@ -538,7 +538,7 @@ mod tests {
     /// the stage as a build's is, and held for as long as the run's guards.
     #[tokio::test]
     async fn entrypoint_read_only_input_is_linked_like_a_build() -> anyhow::Result<()> {
-        let tmp = tempfile::tempdir()?;
+        let tmp = hcore::fsutil::tempdir()?;
         let stage = tmp.path().join("stage");
         let target = TargetDef {
             entrypoint: Some(hplugin::driver::targetdef::Entrypoint::new(

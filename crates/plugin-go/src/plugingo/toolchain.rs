@@ -901,7 +901,7 @@ mod host_go_tests {
     #[tokio::test]
     async fn host_mode_under_a_runner_asks_the_runners_go() {
         const REQ: &str = "req-host-go";
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = hcore::fsutil::tempdir().expect("tempdir");
         let probes = Arc::new(AtomicUsize::new(0));
         hexecrunner::install_host(Arc::new(FakeEnv {
             go: fake_go(dir.path(), "/env/goroot"),
@@ -932,7 +932,7 @@ mod host_go_tests {
     #[tokio::test]
     async fn the_probe_is_paid_once_per_environment() {
         const REQ: &str = "req-once";
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = hcore::fsutil::tempdir().expect("tempdir");
         let probes = Arc::new(AtomicUsize::new(0));
         hexecrunner::install_host(Arc::new(FakeEnv {
             go: fake_go(dir.path(), "/env/goroot"),
@@ -981,7 +981,7 @@ mod host_go_tests {
     #[tokio::test]
     async fn a_different_runner_re_probes() {
         const REQ: &str = "req-reprobe";
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = hcore::fsutil::tempdir().expect("tempdir");
         let probes = Arc::new(AtomicUsize::new(0));
         hexecrunner::install_host(Arc::new(FakeEnv {
             go: fake_go(dir.path(), "/env/goroot"),
@@ -1040,7 +1040,7 @@ mod host_go_tests {
     #[tokio::test]
     async fn target_mode_asks_the_staged_go_for_goroot() {
         use hplugin::driver::inputartifact::{InputArtifact, Type};
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = hcore::fsutil::tempdir().expect("tempdir");
         let go = fake_go(dir.path(), "/staged/goroot");
         std::fs::rename(&go, dir.path().join("go")).expect("rename fake go");
         let origin =
@@ -1313,7 +1313,7 @@ mod tests {
     fn test_download_verify_extract_streams_through_a_removed_tarball() {
         let (bytes, sha) = fake_sdk_tarball();
         let url = serve_once(bytes);
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = hcore::fsutil::tempdir().expect("tempdir");
         let tarball = dir.path().join("go-sdk.tar.gz");
         let dest = dir.path().join("pkg");
 
@@ -1328,7 +1328,7 @@ mod tests {
     fn test_download_verify_extract_mismatch_extracts_nothing() {
         let (bytes, _) = fake_sdk_tarball();
         let url = serve_once(bytes);
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = hcore::fsutil::tempdir().expect("tempdir");
         let tarball = dir.path().join("go-sdk.tar.gz");
         let dest = dir.path().join("pkg");
 

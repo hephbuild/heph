@@ -102,6 +102,8 @@ let path = dir.path();
 // dir is dropped (and deleted) at end of scope
 ```
 
+**A directory an engine, a stage or a cache writes into takes `hcore::fsutil::tempdir()`, not `tempfile::tempdir()`.** A run stages tools and dependencies read-only (`0555` dirs). `tempfile`'s drop cannot remove those and ignores the failure, so the test strands its whole directory in `$TMPDIR`. Before the fix this added up to 466 directories on one machine in one day, some of them holding a ~240 MB Go toolchain. `htestkit::Workspace` already uses the right type. `crates/e2e/tests/e2e/workspace_cleanup.rs` is the regression test.
+
 Rules:
 - Never hardcode `/tmp/something` — parallel tests collide.
 - Never reuse a path between tests — leftover state causes false passes.

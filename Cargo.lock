@@ -7447,9 +7447,9 @@ name = "testkit"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "core",
  "execrunner",
  "heph",
- "tempfile",
 ]
 
 [[package]]
