@@ -271,3 +271,272 @@ fn phase_percentiles_are_nearest_rank() {
         ]
     );
 }
+
+/// One `waiting_split_by_load` case: the machine rows, the waits, and the
+/// split it reads.
+struct SplitCase {
+    /// The spec's row, as the failure names it.
+    row: &'static str,
+    /// `(metric, ms, value)`; a `heph.machine.memory.limit` of 100 is added
+    /// when there is any.
+    metrics: Vec<(&'static str, i64, f64)>,
+    /// `(span name, start ms, end ms)`: waiting spans.
+    waits: Vec<(&'static str, i64, Option<i64>)>,
+    /// `(phase, busy ms, spare ms, unknown ms)`, by phase.
+    want: Vec<(&'static str, i64, i64, i64)>,
+}
+
+const BUSY: &str = "heph.machine.cpu.busy";
+const USED: &str = "heph.machine.memory.used";
+
+/// A sample at `ms`: CPU busy `cpu`, memory at 10% of the limit.
+fn load(ms: i64, cpu: f64) -> [(&'static str, i64, f64); 2] {
+    [(BUSY, ms, cpu), (USED, ms, 10.0)]
+}
+
+/// Samples at each of `points`, `(ms, cpu)`, memory at 10%.
+fn loads(points: &[(i64, f64)]) -> Vec<(&'static str, i64, f64)> {
+    points.iter().flat_map(|&(ms, cpu)| load(ms, cpu)).collect()
+}
+
+/// Write `case` into `db` as session `session`.
+fn write_split_case(db: &rusqlite::Connection, session: &str, case: &SplitCase) {
+    if !case.metrics.is_empty() {
+        db.execute(
+            "INSERT INTO metrics VALUES (?1, 'heph.machine.memory.limit', 0, 100.0)",
+            [session],
+        )
+        .expect("the limit");
+    }
+    for &(name, ms, value) in &case.metrics {
+        // A NaN binds as NULL, as SQLite stores it.
+        db.execute(
+            "INSERT INTO metrics VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![session, name, ms * 1_000, value],
+        )
+        .expect("a metric");
+    }
+    for (i, &(name, start, end)) in case.waits.iter().enumerate() {
+        db.execute(
+            "INSERT INTO spans VALUES (?1, ?2, ?3, 'waiting', ?4, ?5)",
+            rusqlite::params![
+                session,
+                i64::try_from(i).expect("few"),
+                name,
+                start * 1_000,
+                end.map(|e| e * 1_000)
+            ],
+        )
+        .expect("a wait");
+    }
+}
+
+fn split_db() -> rusqlite::Connection {
+    let db = rusqlite::Connection::open_in_memory().expect("in-memory db");
+    db.execute_batch(
+        "CREATE TABLE metrics (session_id, name, time_us, value);
+         CREATE TABLE spans (session_id, span_id, name, class, start_us, end_us);",
+    )
+    .expect("schema");
+    db
+}
+
+/// The expected rows of `case` as session `session`.
+fn split_want(session: &str, case: &SplitCase) -> Vec<Vec<String>> {
+    case.want
+        .iter()
+        .map(|&(phase, busy, spare, unknown)| {
+            vec![
+                session.to_owned(),
+                phase.to_owned(),
+                (busy * 1_000).to_string(),
+                (spare * 1_000).to_string(),
+                (unknown * 1_000).to_string(),
+            ]
+        })
+        .collect()
+}
+
+/// Spec row `waiting_split_by_load`: every row of the spec's "Waiting
+/// split" table, each as its own session, then all of them in one database
+/// (sessions never bleed into one another). The table's "two samples with
+/// the same time_us" row reads "the busier one wins" (a decision recorded
+/// in the PR: no insertion order is readable in SQL), and its clock-step
+/// row is not a recipe input: the recipe reads `time_us` only, which the
+/// recorder stamps from its monotonic anchor.
+#[test]
+fn waiting_split_by_load() {
+    let cases = [
+        SplitCase {
+            row: "a 200 ms admission wait inside one interval at CPU 0.95: busy 200 ms",
+            metrics: loads(&[(0, 0.5), (1000, 0.95)]),
+            waits: vec![("heph.admission", 300, Some(500))],
+            want: vec![("admission", 200, 0, 0)],
+        },
+        SplitCase {
+            row: "a wait half in a 0.95 interval, half in a 0.5 one: half busy, half spare",
+            metrics: loads(&[(0, 0.5), (1000, 0.95), (2000, 0.5)]),
+            waits: vec![("heph.admission", 500, Some(1500))],
+            want: vec![("admission", 500, 500, 0)],
+        },
+        SplitCase {
+            row: "an interval at exactly 0.9: busy (0.89 is spare)",
+            metrics: loads(&[(0, 0.5), (1000, 0.9), (2000, 0.89)]),
+            waits: vec![("heph.admission", 0, Some(2000))],
+            want: vec![("admission", 1000, 1000, 0)],
+        },
+        SplitCase {
+            row: "CPU 0.3 with memory at 96%, and at exactly 95%: busy (94% is spare)",
+            metrics: vec![
+                (BUSY, 0, 0.3),
+                (USED, 0, 96.0),
+                (BUSY, 1000, 0.3),
+                (USED, 1000, 96.0),
+                (BUSY, 2000, 0.3),
+                (USED, 2000, 95.0),
+                (BUSY, 3000, 0.3),
+                (USED, 3000, 94.0),
+            ],
+            waits: vec![("heph.admission", 0, Some(3000))],
+            want: vec![("admission", 2000, 1000, 0)],
+        },
+        SplitCase {
+            row: "a zero-length span: not counted",
+            metrics: loads(&[(0, 0.5), (1000, 0.95)]),
+            waits: vec![("heph.admission", 500, Some(500))],
+            want: vec![],
+        },
+        SplitCase {
+            row: "a span across the first sample: the part before it unknown",
+            metrics: loads(&[(1000, 0.95), (2000, 0.95)]),
+            waits: vec![("heph.admission", 500, Some(1500))],
+            want: vec![("admission", 500, 0, 500)],
+        },
+        SplitCase {
+            row: "a gap of exactly 2.0 s: classified",
+            metrics: loads(&[(0, 0.5), (2000, 0.95)]),
+            waits: vec![("heph.admission", 0, Some(2000))],
+            want: vec![("admission", 2000, 0, 0)],
+        },
+        SplitCase {
+            row: "gaps of 2.5 s and 30 s: unknown",
+            metrics: loads(&[(0, 0.95), (2500, 0.95), (3500, 0.95), (33_500, 0.95)]),
+            waits: vec![("heph.admission", 0, Some(33_500))],
+            want: vec![("admission", 1000, 0, 32_500)],
+        },
+        SplitCase {
+            row: "a span after the last sample (after End, past the cap): unknown, never spare",
+            metrics: loads(&[(0, 0.5), (1000, 0.5)]),
+            waits: vec![("heph.admission", 500, Some(2500))],
+            want: vec![("admission", 0, 500, 1500)],
+        },
+        SplitCase {
+            row: "a span after the CPU source stopped (memory still read): unknown, never spare",
+            metrics: [
+                load(0, 0.5).to_vec(),
+                load(1000, 0.5).to_vec(),
+                vec![(USED, 2000, 10.0), (USED, 3000, 10.0)],
+            ]
+            .concat(),
+            waits: vec![("heph.admission", 500, Some(3000))],
+            want: vec![("admission", 0, 500, 2000)],
+        },
+        SplitCase {
+            row: "the memory source stopped, CPU below 0.9: unknown, never spare (busy still busy)",
+            metrics: vec![
+                (BUSY, 0, 0.5),
+                (USED, 0, 10.0),
+                (BUSY, 1000, 0.5),
+                (BUSY, 2000, 0.95),
+            ],
+            waits: vec![("heph.admission", 0, Some(2000))],
+            want: vec![("admission", 1000, 0, 1000)],
+        },
+        SplitCase {
+            row: "a span with no end: cut at the last sample; one starting after it: not counted",
+            metrics: loads(&[(0, 0.95), (1000, 0.95), (2000, 0.5)]),
+            waits: vec![("heph.admission", 500, None), ("heph.deps", 2500, None)],
+            want: vec![("admission", 500, 1000, 0)],
+        },
+        SplitCase {
+            row: "two samples with the same time_us: the busier wins, no zero-length interval",
+            metrics: vec![
+                (BUSY, 0, 0.5),
+                (USED, 0, 10.0),
+                (BUSY, 1000, 0.95),
+                (BUSY, 1000, 0.5),
+                (USED, 1000, 10.0),
+                (USED, 1000, 10.0),
+                (BUSY, 2000, 0.5),
+                (USED, 2000, 10.0),
+            ],
+            waits: vec![("heph.admission", 0, Some(2000))],
+            want: vec![("admission", 1000, 1000, 0)],
+        },
+        SplitCase {
+            row: "busy 1.5, NaN, or -0.1 in a foreign recording: that interval unknown",
+            metrics: loads(&[
+                (0, 0.5),
+                (1000, 1.5),
+                (2000, f64::NAN),
+                (3000, -0.1),
+                (4000, 0.95),
+            ]),
+            waits: vec![("heph.admission", 0, Some(4000))],
+            want: vec![("admission", 1000, 0, 3000)],
+        },
+        SplitCase {
+            row: "a recording with no machine rows: all unknown, and the recipe runs",
+            metrics: vec![],
+            waits: vec![("heph.admission", 0, Some(1000))],
+            want: vec![("admission", 0, 0, 1000)],
+        },
+        SplitCase {
+            row: "another process saturating the machine (heph's CPU time flat): busy",
+            metrics: [
+                load(0, 1.0).to_vec(),
+                load(1000, 1.0).to_vec(),
+                vec![
+                    ("heph.process.cpu.time", 0, 0.25),
+                    ("heph.process.cpu.time", 1000, 0.25),
+                ],
+            ]
+            .concat(),
+            waits: vec![("heph.admission", 0, Some(1000))],
+            want: vec![("admission", 1000, 0, 0)],
+        },
+        SplitCase {
+            row: "two targets waiting on deps at once for 1 s each: 2 s of deps time",
+            metrics: loads(&[(0, 0.95), (1000, 0.95)]),
+            waits: vec![("heph.deps", 0, Some(1000)), ("heph.deps", 0, Some(1000))],
+            want: vec![("deps", 2000, 0, 0)],
+        },
+        SplitCase {
+            row: "a deps wait at CPU 0.2: spare",
+            metrics: loads(&[(0, 0.2), (1000, 0.2)]),
+            waits: vec![("heph.deps", 0, Some(1000))],
+            want: vec![("deps", 0, 1000, 0)],
+        },
+    ];
+
+    let all = split_db();
+    let mut want_all = Vec::new();
+    for (i, case) in cases.iter().enumerate() {
+        let db = split_db();
+        write_split_case(&db, "s", case);
+        assert_eq!(
+            recipe_rows("waiting_by_load", &db),
+            split_want("s", case),
+            "{}",
+            case.row
+        );
+        let session = format!("s{i:02}");
+        write_split_case(&all, &session, case);
+        want_all.extend(split_want(&session, case));
+    }
+    assert_eq!(
+        recipe_rows("waiting_by_load", &all),
+        want_all,
+        "all at once"
+    );
+}
