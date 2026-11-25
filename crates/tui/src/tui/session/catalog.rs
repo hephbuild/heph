@@ -449,18 +449,24 @@ fn ensure_schema(conn: &Connection, in_memory: bool) -> Result<(), Unusable> {
 /// The owner's start-of-session write: its `sessions` row with
 /// `complete=0`, from the live recording in `dir`. Never fails the run.
 pub fn record_start(root: &Path, dir: &Path) {
-    owner_write(root, dir, Rows::Start);
+    owner_write(root, dir, Rows::Start, WRITE_BOUND);
 }
 
 /// The owner's seal-time write: every row of its session, replaced, with
 /// `complete=1`. `recorded` false for a private session, whose recording is
 /// removed right after. Never fails the run.
 pub fn record_seal(root: &Path, dir: &Path, recorded: bool) {
-    owner_write(root, dir, Rows::Full { recorded });
+    record_seal_within(root, dir, recorded, WRITE_BOUND);
 }
 
-fn owner_write(root: &Path, dir: &Path, copy: Rows) {
-    match try_owner_write(root, dir, copy) {
+/// [`record_seal`] with `bound` in place of [`WRITE_BOUND`], so a test
+/// reaches it with a small recording.
+pub(crate) fn record_seal_within(root: &Path, dir: &Path, recorded: bool, bound: Duration) {
+    owner_write(root, dir, Rows::Full { recorded }, bound);
+}
+
+fn owner_write(root: &Path, dir: &Path, copy: Rows, bound: Duration) {
+    match try_owner_write(root, dir, copy, bound) {
         Ok(true) => {}
         Ok(false) => tracing::debug!(
             root = %root.display(),
@@ -474,8 +480,9 @@ fn owner_write(root: &Path, dir: &Path, copy: Rows) {
     }
 }
 
-/// `Ok(false)`: `catalog.lock` was not free at once (a repair).
-fn try_owner_write(root: &Path, dir: &Path, copy: Rows) -> anyhow::Result<bool> {
+/// `Ok(false)`: `catalog.lock` was not free at once (a repair). Past
+/// `bound`, the write is interrupted and its transaction rolled back.
+fn try_owner_write(root: &Path, dir: &Path, copy: Rows, bound: Duration) -> anyhow::Result<bool> {
     let lock_path = root.join(LOCK);
     let lock = lockfile::open_shared_file(&lock_path)
         .with_context(|| format!("opening {}", lock_path.display()))?;
@@ -484,7 +491,7 @@ fn try_owner_write(root: &Path, dir: &Path, copy: Rows) -> anyhow::Result<bool> 
     {
         return Ok(false);
     }
-    let deadline = Instant::now() + WRITE_BOUND;
+    let deadline = Instant::now() + bound;
     let mut conn = open_rw(root, true).context("opening the session catalog")?;
     conn.progress_handler(1000, Some(move || Instant::now() >= deadline))
         .context("bounding the catalog write")?;

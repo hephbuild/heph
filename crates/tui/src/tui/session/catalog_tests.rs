@@ -64,13 +64,45 @@ fn build_events() -> Vec<BuildEvent> {
 
 /// A sealed recording of [`build_events`] under `root`, ended `ended_ms`.
 pub(super) fn sealed(root: &Path, id: SessionId) -> PathBuf {
+    sealed_with(root, id, build_events())
+}
+
+/// `n` targets that each ran, with a phase span: a copy of many rows.
+fn many_targets(n: usize) -> Vec<BuildEvent> {
+    let mut evs = Vec::with_capacity(2 * n);
+    for i in 0..n {
+        let addr = format!("//many:t{i}");
+        evs.push(BuildEvent {
+            at_unix_ms: 2,
+            kind: BuildEventKind::ResultStart { addr: addr.clone() },
+        });
+        evs.push(BuildEvent {
+            at_unix_ms: 6,
+            kind: BuildEventKind::ResultEnd {
+                spans: vec![phase("heph.process")],
+                left_behind: None,
+                cancelled: false,
+                addr,
+                error: None,
+                upstream_of: None,
+                exit_status: None,
+                log_tail: None,
+                timed_out: None,
+            },
+        });
+    }
+    evs
+}
+
+/// A sealed recording of `evs` under `root`.
+fn sealed_with(root: &Path, id: SessionId, evs: Vec<BuildEvent>) -> PathBuf {
     let dir = root.join(id.encode());
     std::fs::create_dir_all(&dir).expect("mkdir");
     std::fs::write(dir.join(files::LOCK), b"").expect("lock file");
     let (conn, _rw) =
         store::create(&dir, &meta_for(id), &store::Provenance::default(), false).expect("create");
     let mut writer = store::Writer::new(conn, id);
-    for ev in build_events() {
+    for ev in evs {
         let r = event_record(ev);
         let body = serde_json::to_string(&r).expect("encode");
         writer.insert(&r, &body).expect("insert");
@@ -662,7 +694,7 @@ fn catalog_write_failure_never_fails_the_run() {
     let started = Instant::now();
     session.finish(Some(3), false);
     assert!(
-        started.elapsed() < Duration::from_secs(4),
+        started.elapsed() < catalog::WRITE_BOUND + Duration::from_millis(500),
         "bounded: {:?}",
         started.elapsed()
     );
@@ -681,6 +713,47 @@ fn catalog_write_failure_never_fails_the_run() {
         0,
         "the write was dropped"
     );
+}
+
+/// An owner write past its bound is interrupted and rolled back whole: the
+/// start row stays `complete=0` with none of the session's other rows, and
+/// the next command heals it.
+#[test]
+fn an_owner_write_past_its_bound_leaves_no_half_rows() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    let id = recent_id(1, 1_000);
+    // Big enough that copying its targets runs past the progress handler's
+    // first check; the `sessions` upsert before it does not.
+    let dir = sealed_with(root, id, many_targets(500));
+    catalog::record_start(root, &dir);
+    catalog::record_seal_within(root, &dir, true, Duration::ZERO);
+    {
+        let conn = read(root);
+        assert_eq!(
+            count(&conn, "SELECT count(*) FROM sessions WHERE complete = 0"),
+            1,
+            "the start row, as it was"
+        );
+        for table in ["targets", "spans", "span_events", "metrics"] {
+            assert_eq!(
+                count(&conn, &format!("SELECT count(*) FROM {table}")),
+                0,
+                "no half rows in {table}"
+            );
+        }
+    }
+    let opened = catalog::open(root, now_ms()).expect("open");
+    assert!(!opened.in_memory);
+    assert_eq!(opened.heal.healed, 1);
+    assert_eq!(
+        count(
+            &opened.conn,
+            "SELECT count(*) FROM sessions WHERE complete = 1"
+        ),
+        1
+    );
+    assert_eq!(count(&opened.conn, "SELECT count(*) FROM targets"), 500);
 }
 
 /// `a_build_never_repairs` (I1): a run with a missing catalog and a
