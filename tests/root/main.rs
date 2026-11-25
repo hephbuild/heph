@@ -36,6 +36,7 @@ mod lint_gate;
 mod log_cmd;
 mod lsp_lifecycle;
 mod resources_gate;
+mod run_outputs_cli;
 mod stack_status;
 mod target_dir_script;
 mod test_layout;

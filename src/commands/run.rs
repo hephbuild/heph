@@ -866,10 +866,26 @@ impl App for RunApp {
         // `finalize` paved road handles rendering and exit uniformly. The engine
         // already returns `Err` for cancellation and genuine top-level failures;
         // per-addr failures (default, fail-fast off) live in the request's failure registry.
-        let outputs = if self.args.output.is_empty() {
+        //
+        // Outputs are read only by `--cat-out`, `--list-out` and `--copy-out`.
+        // Without one, the selected targets are resolved for their hashouts
+        // alone, as dependencies are, so a remote hit transfers no blob. Asking
+        // for every output instead downloaded each selected target's bytes
+        // into the local cache for nobody: a fully cached CI run over 91 OCI
+        // images, each archive carrying its base's layers, spent minutes
+        // pulling them. Execution and the codegen write-back do not depend on
+        // this: a miss still runs and caches the full output set, and a
+        // codegen target still writes its tree.
+        //
+        // `--output` keeps naming groups even without a reader, so a group the
+        // target lacks stays an error.
+        let reads_outputs = self.args.cat_out || self.args.list_out || self.args.copy_out.is_some();
+        let outputs = if !self.args.output.is_empty() {
+            OutputMatcher::Exact(self.args.output.clone())
+        } else if reads_outputs {
             OutputMatcher::All
         } else {
-            OutputMatcher::Exact(self.args.output.clone())
+            OutputMatcher::None
         };
 
         let res = match self.matcher {
