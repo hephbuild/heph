@@ -222,8 +222,12 @@ pub struct BuildState {
     /// Targets whose local entry was stale and rebuilt, in arrival order:
     /// the `CacheOutcome` reason, and whether the rebuild changed the output
     /// (`StaleOutputChanged`). What the run summary names (see
-    /// [`Self::stale_lines`]).
+    /// [`Self::stale_lines`]). Only the first [`STALE_LINES_MAX`] are kept:
+    /// a run that collected a whole store would otherwise hold one per target.
     stale: Vec<StaleEntry>,
+    /// The stale entries past [`STALE_LINES_MAX`], counted, and what the
+    /// summary says of the first of them.
+    stale_omitted: StaleOmitted,
     /// Server timestamp of the first event seen — the run's start anchor for the
     /// header's elapsed clock. `None` until any event lands.
     started_at_ms: Option<u64>,
@@ -283,6 +287,14 @@ struct StaleEntry {
     addr: String,
     reason: String,
     output_changed: bool,
+}
+
+/// The stale entries past [`STALE_LINES_MAX`]: how many, and the first one,
+/// as the summary's tail line names it.
+#[derive(Debug, Clone, Default)]
+struct StaleOmitted {
+    count: usize,
+    first: Option<String>,
 }
 
 /// The most stale entries the run summary names one by one; the rest are
@@ -609,14 +621,34 @@ impl BuildState {
             | BuildEventKind::RemoteCacheHit { .. }
             | BuildEventKind::RemoteCacheMiss { .. } => {}
             // The per-target hit bit is the model's; a retracted hit clears it.
-            BuildEventKind::CacheOutcome { addr, reason, .. } => {
+            BuildEventKind::CacheOutcome {
+                addr,
+                reason,
+                stale_host_path,
+                ..
+            } => {
                 self.cache.apply(&ev.kind);
                 if let Some(reason) = reason {
-                    self.stale.push(StaleEntry {
-                        addr: addr.clone(),
-                        reason: self.redact.apply(reason).into_owned(),
-                        output_changed: false,
-                    });
+                    if self.stale.len() < STALE_LINES_MAX {
+                        self.stale.push(StaleEntry {
+                            addr: addr.clone(),
+                            reason: self.redact.apply(reason).into_owned(),
+                            output_changed: false,
+                        });
+                    } else {
+                        let omitted = &mut self.stale_omitted;
+                        omitted.count += 1;
+                        if omitted.first.is_none() {
+                            // The path when the host sent it; a host that
+                            // predates the field still names the target.
+                            omitted.first = Some(match stale_host_path {
+                                Some(path) => {
+                                    format!("{addr}, host path {}", self.redact.apply(path))
+                                }
+                                None => addr.clone(),
+                            });
+                        }
+                    }
                 }
             }
             BuildEventKind::CacheHitRebuilt { .. } => {
@@ -886,7 +918,6 @@ impl BuildState {
         let mut lines: Vec<String> = self
             .stale
             .iter()
-            .take(STALE_LINES_MAX)
             .map(|s| {
                 let changed = if s.output_changed {
                     "; its output changed, so its dependents rebuilt too"
@@ -896,10 +927,11 @@ impl BuildState {
                 format!("{}: cache miss, {}{changed}", s.addr, s.reason)
             })
             .collect();
-        if let Some(more) = self.stale.len().checked_sub(STALE_LINES_MAX)
-            && more > 0
-        {
-            lines.push(format!("… and {more} more stale cache entries rebuilt"));
+        let StaleOmitted { count, first } = &self.stale_omitted;
+        if let Some(first) = first {
+            lines.push(format!(
+                "… and {count} more stale cache entries rebuilt, the first {first}"
+            ));
         }
         lines
     }
@@ -3725,7 +3757,37 @@ mod tests {
         assert_eq!(lines.len(), STALE_LINES_MAX + 1);
         assert_eq!(
             lines.last().map(String::as_str),
-            Some("… and 2 more stale cache entries rebuilt")
+            Some(
+                "… and 2 more stale cache entries rebuilt, the first //b:8, host path /nix/store/x"
+            )
+        );
+        // Only the named entries are held, however many go stale.
+        assert_eq!(s.stale.len(), STALE_LINES_MAX);
+        // An omitted entry's changed output finds nothing to mark.
+        s.apply(&ev(
+            6,
+            BuildEventKind::StaleOutputChanged {
+                addr: "//b:9".into(),
+            },
+        ));
+        assert_eq!(s.stale_lines(), lines);
+        // A host predating `stale_host_path` still names the first omitted
+        // target.
+        let mut old = BuildState::new();
+        for i in 0..=STALE_LINES_MAX {
+            old.apply(&ev(
+                1,
+                BuildEventKind::CacheOutcome {
+                    addr: format!("//c:{i}"),
+                    outcome: CacheOutcomeKind::Miss,
+                    reason: Some("stale: host path /nix/store/y is gone".into()),
+                    stale_host_path: None,
+                },
+            ));
+        }
+        assert_eq!(
+            old.stale_lines().last().map(String::as_str),
+            Some("… and 1 more stale cache entries rebuilt, the first //c:10")
         );
         assert!(BuildState::new().stale_lines().is_empty());
     }
