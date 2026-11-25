@@ -443,6 +443,8 @@ impl Server<'_> {
                     "typechecks": self.typechecks,
                     "interfaces": self.interfaces.len(),
                     "interface_checks": self.interfaces.checks(),
+                    "load_walks": self.interfaces.walks_run(),
+                    "loaded_file_reads": self.interfaces.reads(),
                     "registry": match self.registry {
                         RegistryState::Loading(_) => "loading",
                         RegistryState::Ready(_) => "ready",
@@ -612,6 +614,9 @@ impl Server<'_> {
             return;
         };
         self.documents.remove(&key);
+        if let Some((_, abs)) = self.workspace_path(&key) {
+            self.interfaces.forget(&abs);
+        }
         self.evict_unreached();
         self.backend.close(&key);
         self.shared.remove(&key);
@@ -909,7 +914,8 @@ impl Server<'_> {
     /// now; whether that text is behind the current one; whether the registry
     /// has landed.
     ///
-    /// Every call looks the loads up again ([`InterfaceMemo`]): a loaded file
+    /// Every call looks the loads up again ([`InterfaceMemo`]), a stat of
+    /// each path the document's memoized load walk read: a loaded file
     /// edited on disk, however deep, moves their key and so misses the
     /// document's memo. The interfaces no open document reaches are evicted
     /// after.

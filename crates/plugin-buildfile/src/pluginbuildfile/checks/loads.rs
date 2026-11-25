@@ -16,7 +16,7 @@
 //! deterministically.
 
 use crate::pluginbuildfile::run_file::{
-    Resolved, find_build_files, load_cycle, parse_build_file, resolve_load,
+    Resolved, find_build_files, load_cycle, parse_build_file, resolve_load, resolve_load_target,
 };
 use anyhow::Context;
 use hmodel::htaddr::Addr;
@@ -203,6 +203,7 @@ pub(crate) fn walk_package(
         files: &mut walk.files,
         done_dirs: HashSet::new(),
         in_flight: HashSet::new(),
+        reads: None,
     };
     // Seeded as evaluation seeds it: the package directory itself is on the
     // chain, so a load back into it is the same cycle evaluation reports.
@@ -218,8 +219,8 @@ pub(crate) fn walk_package(
 /// Best effort: a load that fails to resolve, parse or walk (a cycle back
 /// into `file` or its directory included) is left out of the edges, so its
 /// names are untyped; the others still walk. Returns each walked load
-/// string's edge, and the walk of every file they reach, `file` never among
-/// them.
+/// string's edge, the walk of every file they reach, `file` never among
+/// them, and what the walk read ([`WalkReads`]), failed loads included.
 pub(crate) fn walk_loads<'m>(
     root: &Path,
     walker: &CachedWalker,
@@ -227,7 +228,7 @@ pub(crate) fn walk_loads<'m>(
     file: &Path,
     modules: impl IntoIterator<Item = &'m str>,
     patterns: &[glob::Pattern],
-) -> (BTreeMap<String, LoadEdge>, LoadWalk) {
+) -> (BTreeMap<String, LoadEdge>, LoadWalk, WalkReads) {
     let mut walk = LoadWalk {
         pkg: pkg.to_string(),
         files: BTreeMap::new(),
@@ -246,6 +247,7 @@ pub(crate) fn walk_loads<'m>(
         files: &mut walk.files,
         done_dirs: HashSet::new(),
         in_flight: seed.clone(),
+        reads: Some(WalkReads::default()),
     };
     for module in modules {
         if edges.contains_key(module) {
@@ -262,7 +264,21 @@ pub(crate) fn walk_loads<'m>(
             }
         }
     }
-    (edges, walk)
+    let reads = state.reads.take().unwrap_or_default();
+    (edges, walk, reads)
+}
+
+/// What a [`walk_loads`] read from disk: what a caller memoizing the walk
+/// watches, since the walk's answer moves only when one of these does.
+#[derive(Debug, Default)]
+pub(crate) struct WalkReads {
+    /// Every path a load probed (as [`resolve_load`] stats it: a file, a
+    /// directory whose listing was read, or nothing, for a load that did not
+    /// resolve) and every file parsed, whether the load succeeded or not, in
+    /// the order reached. A path may repeat.
+    pub paths: Vec<PathBuf>,
+    /// Files parsed.
+    pub parsed: u64,
 }
 
 /// One walk's state. It mirrors [`BuildFileLoader`](super::super::run_file::BuildFileLoader):
@@ -275,6 +291,8 @@ struct Walker<'a> {
     files: &'a mut BTreeMap<String, WalkedFile>,
     done_dirs: HashSet<PathBuf>,
     in_flight: HashSet<PathBuf>,
+    /// `Some` when the caller wants to know what was read ([`walk_loads`]).
+    reads: Option<WalkReads>,
 }
 
 impl Walker<'_> {
@@ -300,6 +318,10 @@ impl Walker<'_> {
         }
         if !self.in_flight.insert(path.to_path_buf()) {
             return Err(load_cycle(self.root, path));
+        }
+        if let Some(reads) = &mut self.reads {
+            reads.paths.push(path.to_path_buf());
+            reads.parsed += 1;
         }
         let symlink = std::fs::symlink_metadata(path)
             .with_context(|| format!("stat {rel}"))?
@@ -330,6 +352,13 @@ impl Walker<'_> {
     }
 
     fn visit_load(&mut self, current_pkg: &str, module: &str) -> anyhow::Result<LoadEdge> {
+        // The path `resolve_load` is about to stat, recorded before it can
+        // fail: a load that does not resolve now may once the path exists.
+        if let Some(reads) = &mut self.reads
+            && let Ok(candidate) = resolve_load_target(self.root, current_pkg, module)
+        {
+            reads.paths.push(candidate);
+        }
         match resolve_load(self.root, self.walker, current_pkg, module, self.patterns)? {
             Resolved::File { path, pkg } => {
                 self.visit_file(&path, &pkg)?;

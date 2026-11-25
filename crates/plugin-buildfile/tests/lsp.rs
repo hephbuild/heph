@@ -1404,6 +1404,18 @@ fn counter(counters: &Value, name: &str) -> u64 {
         .unwrap_or_else(|| panic!("no counter {name}: {counters}"))
 }
 
+/// The counters of typing work, without the disk reads: a file written
+/// within the racy window is read again on the next lookup, however little
+/// it changed.
+fn typing_counters(lsp: &mut Lsp) -> Value {
+    let mut all = counters(lsp);
+    if let Some(map) = all.as_object_mut() {
+        map.remove("load_walks");
+        map.remove("loaded_file_reads");
+    }
+    all
+}
+
 #[test]
 fn edit_to_transitive_load_refreshes() {
     let mut lsp = Lsp::start();
@@ -1420,14 +1432,14 @@ fn edit_to_transitive_load_refreshes() {
         &format!("{head}    x = l.mode.│\n"),
     );
     assert_eq!(sorted_labels(&lsp.completion(&doc)), ["level"]);
-    let first = counters(&mut lsp);
+    let first = typing_counters(&mut lsp);
     assert_eq!(counter(&first, "typechecks"), 1, "{first}");
     assert_eq!(counter(&first, "interfaces"), 2, "{first}");
     assert_eq!(counter(&first, "interface_checks"), 2, "{first}");
 
     // Nothing moved: the document's memo answers and no file is checked.
     assert_eq!(sorted_labels(&lsp.completion(&doc)), ["level"]);
-    assert_eq!(counters(&mut lsp), first);
+    assert_eq!(typing_counters(&mut lsp), first);
 
     // An edit on disk two loads away, with the document unchanged: the
     // file it loads directly is checked again under its moved key, and so is
@@ -1441,7 +1453,7 @@ fn edit_to_transitive_load_refreshes() {
         ["level", "verbose"],
         "the transitive edit is seen"
     );
-    let second = counters(&mut lsp);
+    let second = typing_counters(&mut lsp);
     assert_eq!(counter(&second, "typechecks"), 2, "{second}");
     assert_eq!(counter(&second, "interfaces"), 2, "{second}");
     assert_eq!(counter(&second, "interface_checks"), 4, "{second}");
@@ -1453,7 +1465,7 @@ fn edit_to_transitive_load_refreshes() {
         "Mode = record(level = str, verbose = bool)\n",
     );
     assert_eq!(sorted_labels(&lsp.completion(&doc)), ["level", "verbose"]);
-    assert_eq!(counters(&mut lsp), second);
+    assert_eq!(typing_counters(&mut lsp), second);
 }
 
 #[test]
