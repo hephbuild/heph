@@ -373,8 +373,31 @@ a cache miss and re-runs it rather than serving an environment that points at
 deleted paths. Rooting needs `nix` on the runner's `pass_env` PATH whenever its
 output names a store path; without one the run fails and writes no
 `runner.json`. Runners cached before this declared nothing, so the driver's
-format version moved with it: each devenv runner re-runs once after the
-upgrade. Its `runner.json` bytes are unchanged, so consumers keep their keys.
+format version moved from 3 to 4 with it: each devenv runner re-runs once after
+the upgrade. Its `runner.json` bytes are unchanged, so consumers keep their
+keys.
+
+The gcroot's lifecycle:
+
+- **One per runner address.** `<addr hash>` is the runner target's address, so
+  a workspace has as many gcroots as it has devenv runners that named a store
+  path, whatever their history.
+- **Replaced on each run**, in place: `nix build --out-link` repoints the link
+  at the new root, so the previous root holds until the new one is written,
+  and a run whose `nix build` fails leaves it as it was.
+- **Not removed by heph.** `heph tool clean` drops cache entries and heph's own
+  gc sweeps the cache, `stage/` and `sandbox/`; neither touches
+  `<home>/devenv-runner/`. A runner that is deleted or renamed leaves its
+  gcroot behind.
+- **It pins the environment's whole closure** against `nix-collect-garbage`
+  for as long as it exists: everything the captured environment names, which
+  for a typical devenv shell is the toolchain and its dependencies.
+
+To release them, delete the directory: `rm -rf <home>/devenv-runner/gcroots`
+(`<home>` is `.heph/` under the workspace root by default). The next
+`nix-collect-garbage` may then collect what they kept, and a cached runner
+whose root was collected turns into a miss and re-runs, re-creating its
+gcroot.
 
 ## Containers
 
