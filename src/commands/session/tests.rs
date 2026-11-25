@@ -177,9 +177,17 @@ fn piped(w: &mut Vec<u8>) -> Out<'_> {
 
 async fn run_list(sources: &[&dyn SessionSource], ws: Workspace<'_>, json: bool) -> String {
     let mut out = Vec::new();
-    list::list(sources, opts(), ws, &json_args(json), piped(&mut out))
-        .await
-        .expect("list");
+    list::list(
+        sources,
+        opts(),
+        ws,
+        &list::ListFilter::default(),
+        None,
+        json,
+        &mut out,
+    )
+    .await
+    .expect("list");
     String::from_utf8(out).expect("utf-8")
 }
 
@@ -593,7 +601,13 @@ async fn commands_run_against_any_source() {
         assert!(lines[0].contains(col), "{table}");
     }
     assert_eq!(lines.len(), 5, "header + 4 sessions:\n{table}");
-    // Live first; the ended one last.
+    for col in ["ACTOR", "STARTED", "TOOK"] {
+        assert!(lines[0].contains(col), "{table}");
+    }
+    assert!(!lines[0].contains("OUTCOME"), "only with --addr:\n{table}");
+    // Live first, newest first; the ended one last.
+    assert!(lines[1].starts_with(&root_holder.encode()), "{table}");
+    assert!(lines[3].starts_with(&a.encode()), "{table}");
     assert!(lines[4].starts_with(&b.encode()), "{table}");
     assert!(lines[4].contains("ok"), "{table}");
     assert!(lines[4].contains("1/1"), "{table}");
@@ -637,10 +651,23 @@ async fn commands_run_against_any_source() {
         .iter()
         .map(|s| s["id"].as_str().expect("id"))
         .collect();
-    let mut sorted = ids.clone();
-    sorted.sort_unstable();
-    assert_eq!(ids, sorted, "sorted by id");
-    let a_json = &json[0];
+    // Live first, then ended; newest first within each.
+    assert_eq!(
+        ids,
+        [
+            root_holder.encode(),
+            holder.encode(),
+            a.encode(),
+            b.encode()
+        ],
+        "live newest first, then ended"
+    );
+    assert_eq!(
+        json["retention"]["catalog"]["keep_ms"],
+        serde_json::Value::Null,
+        "no catalog read"
+    );
+    let a_json = &json["sessions"][2];
     assert_eq!(a_json["state"], "waiting");
     assert_eq!(a_json["owner_pid"], 100);
     assert_eq!(a_json["started_unix_ms"], T0);
@@ -656,7 +683,7 @@ async fn commands_run_against_any_source() {
     assert_eq!(a_json["progress"]["running_ops"], 0);
     assert_eq!(a_json["panicked"], false);
     assert!(a_json.get("format").is_none(), "only on too-new rows");
-    let b_json = &json[1];
+    let b_json = &json["sessions"][3];
     assert_eq!(b_json["exit_code"], 0);
     assert_eq!(b_json["state"], "ok");
     assert_eq!(b_json["now"], serde_json::Value::Null, "it ended");
@@ -2947,35 +2974,16 @@ async fn a_lost_session_sealed_by_cleanup_still_reads() {
     let file = crate::tui::session::FileSource::new(&root);
     let sources: [&dyn SessionSource; 1] = [&file];
 
-    let mut out = Vec::new();
-    list::list(
-        &sources,
-        opts(),
-        Workspace::All,
-        &json_args(false),
-        piped(&mut out),
-    )
-    .await
-    .expect("list");
-    let table = String::from_utf8(out).expect("utf-8");
+    let table = run_list(&sources, Workspace::All, false).await;
     let row = table
         .lines()
         .find(|l| l.contains(&id.encode()))
         .unwrap_or_else(|| panic!("no row: {table}"));
     assert!(row.contains("lost"), "{table}");
 
-    let mut out = Vec::new();
-    list::list(
-        &sources,
-        opts(),
-        Workspace::All,
-        &json_args(true),
-        piped(&mut out),
-    )
-    .await
-    .expect("list --json");
-    let json: serde_json::Value = serde_json::from_slice(&out).expect("json");
-    let s = &json[0];
+    let json: serde_json::Value =
+        serde_json::from_str(&run_list(&sources, Workspace::All, true).await).expect("json");
+    let s = &json["sessions"][0];
     assert_eq!(s["id"], id.encode(), "{json}");
     assert_eq!(s["state"], "lost", "{s}");
     assert_eq!(s["exit_code"], serde_json::Value::Null, "{s}");
@@ -3031,4 +3039,5 @@ fn retention_defaults_agree() {
     );
 }
 
+mod list_catalog;
 mod refs;

@@ -770,6 +770,143 @@ pub fn replace(root: &Path, dir: &Path) -> anyhow::Result<()> {
         .with_context(|| format!("copying {} into the catalog", rec.display()))
 }
 
+// ----------------------------------------------------------------- list
+
+/// The window and target `heph session list` asks the catalog for. The
+/// other filters apply to a recording without a catalog row too, so `list`
+/// applies them itself.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ListQuery<'a> {
+    /// Sessions started at or after this (unix ms).
+    pub since_ms: Option<u64>,
+    /// Sessions started at or before this (unix ms).
+    pub until_ms: Option<u64>,
+    /// Only sessions that resolved this target, each with its row.
+    pub addr: Option<&'a str>,
+}
+
+/// One catalog `sessions` row, as `list` reads it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Listed {
+    pub session_id: String,
+    pub owner_pid: Option<u32>,
+    pub user: Option<String>,
+    /// `human`, `agent` or `ci`; an open set.
+    pub actor_kind: Option<String>,
+    pub actor_name: Option<String>,
+    /// The heph subcommand (`run`, `query`, ...).
+    pub command: Option<String>,
+    pub argv: Vec<String>,
+    pub cwd: Option<String>,
+    pub workspace_root: Option<String>,
+    pub started_ms: u64,
+    pub ended_ms: Option<u64>,
+    pub exit_code: Option<i32>,
+    pub panicked: bool,
+    pub truncated: bool,
+    /// False for a private session (`HEPH_NO_SESSION`), which kept no
+    /// recording.
+    pub recorded: bool,
+    /// With [`ListQuery::addr`]: that target's row in this session.
+    pub target: Option<ListedTarget>,
+}
+
+/// A session's row for one target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedTarget {
+    pub addr: String,
+    /// `ran`, `hit`, `failed` or `cancelled`; an open set.
+    pub outcome: String,
+    pub duration_us: Option<u64>,
+}
+
+/// The catalog's sessions in `q`'s window, newest first.
+pub fn list_sessions(conn: &Connection, q: &ListQuery<'_>) -> anyhow::Result<Vec<Listed>> {
+    let ms = |v: Option<u64>| v.map(|v| i64::try_from(v).unwrap_or(i64::MAX));
+    let (target_cols, target_join) = if q.addr.is_some() {
+        // One seek per session in the window, as the `targets` view's
+        // outcome mapping spells it.
+        (
+            ", CASE t.outcome WHEN 0 THEN 'hit' WHEN 1 THEN 'ran' WHEN 2 THEN 'failed' \
+               WHEN 3 THEN 'cancelled' ELSE t.outcome END, t.duration_us",
+            " JOIN target_rows t ON t.sid = s.sid \
+               AND t.addr_id = (SELECT id FROM addrs WHERE addr = ?3)",
+        )
+    } else {
+        // `?3` is still bound (NULL), so it must appear.
+        (", NULL, NULL", " WHERE ?3 IS NULL")
+    };
+    let sql = format!(
+        "SELECT s.session_id, s.owner_pid, s.user, s.actor_kind, s.actor_name, s.command, \
+           s.argv, s.cwd, s.workspace_root, s.started_ms, s.ended_ms, s.exit_code, \
+           coalesce(s.panicked, 0), coalesce(s.truncated, 0), s.recorded{target_cols} \
+         FROM sessions s{target_join} \
+         AND (?1 IS NULL OR s.started_ms >= ?1) AND (?2 IS NULL OR s.started_ms <= ?2) \
+         ORDER BY s.started_ms DESC, s.session_id DESC"
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .context("preparing the session catalog's list")?;
+    let row = |r: &rusqlite::Row<'_>| -> rusqlite::Result<Listed> {
+        let argv: Option<String> = r.get(6)?;
+        let outcome: Option<rusqlite::types::Value> = r.get(15)?;
+        let target = match (q.addr, outcome) {
+            (Some(addr), Some(o)) => Some(ListedTarget {
+                addr: addr.to_owned(),
+                outcome: match o {
+                    rusqlite::types::Value::Text(t) => t,
+                    rusqlite::types::Value::Integer(i) => i.to_string(),
+                    _ => "unknown".to_owned(),
+                },
+                duration_us: r
+                    .get::<_, Option<i64>>(16)?
+                    .and_then(|d| u64::try_from(d).ok()),
+            }),
+            _ => None,
+        };
+        Ok(Listed {
+            session_id: r.get(0)?,
+            owner_pid: r
+                .get::<_, Option<i64>>(1)?
+                .and_then(|p| u32::try_from(p).ok()),
+            user: r.get(2)?,
+            actor_kind: r.get::<_, Option<String>>(3)?.filter(|k| !k.is_empty()),
+            actor_name: r.get(4)?,
+            command: r.get(5)?,
+            argv: argv
+                .and_then(|a| serde_json::from_str(&a).ok())
+                .unwrap_or_default(),
+            cwd: r.get(7)?,
+            workspace_root: r.get(8)?,
+            started_ms: u64::try_from(r.get::<_, i64>(9)?).unwrap_or(0),
+            ended_ms: r
+                .get::<_, Option<i64>>(10)?
+                .and_then(|e| u64::try_from(e).ok()),
+            exit_code: r
+                .get::<_, Option<i64>>(11)?
+                .and_then(|c| i32::try_from(c).ok()),
+            panicked: r.get::<_, i64>(12)? != 0,
+            truncated: r.get::<_, i64>(13)? != 0,
+            recorded: r.get::<_, i64>(14)? != 0,
+            target,
+        })
+    };
+    let rows = stmt
+        .query_map(params![ms(q.since_ms), ms(q.until_ms), q.addr], row)
+        .context("listing the session catalog")?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("reading the session catalog")
+}
+
+/// When the catalog's oldest session started (unix ms): how far back it
+/// answers. `None` when it holds no session.
+pub fn oldest_started_ms(conn: &Connection) -> anyhow::Result<Option<u64>> {
+    let oldest: Option<i64> = conn
+        .query_row("SELECT min(started_ms) FROM sessions", [], |r| r.get(0))
+        .context("reading the session catalog's oldest session")?;
+    Ok(oldest.and_then(|o| u64::try_from(o).ok()))
+}
+
 // -------------------------------------------------------------- cleanup
 
 /// What a catalog cleanup did.

@@ -142,11 +142,73 @@ pub enum SessionCommands {
 #[derive(Args, Clone, Debug)]
 pub struct ListArgs {
     /// Every workspace's sessions, not only this one's.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "workspace")]
     pub all: bool,
-    /// `--json` is an array of sessions, sorted by id.
-    #[command(flatten)]
-    pub out: output::JsonArgs<list::ListRow>,
+    /// Sessions started since: a duration back from now (`7d`, `12h`) or an
+    /// RFC 3339 time (`2026-11-20T10:00+02:00`). The catalog keeps 90 days.
+    #[arg(long, value_name = "T", default_value = "7d")]
+    pub since: String,
+    /// Sessions started before: a duration back from now or an RFC 3339 time.
+    #[arg(long, value_name = "T")]
+    pub until: Option<String>,
+    /// Only the sessions that resolved this target, with its OUTCOME (ran,
+    /// hit, failed, cancelled).
+    #[arg(long, value_name = "ADDR")]
+    pub addr: Option<String>,
+    /// Only the sessions that failed.
+    #[arg(long)]
+    pub failed: bool,
+    /// Only the sessions run by a human, an agent or CI.
+    #[arg(long, value_enum)]
+    pub actor: Option<ActorKind>,
+    /// Only the sessions of this heph command (`run`, `query`, ...).
+    #[arg(long, value_name = "COMMAND")]
+    pub command: Option<String>,
+    /// Only the sessions run by this user (`$USER`).
+    #[arg(long, value_name = "USER")]
+    pub user: Option<String>,
+    /// The sessions of the workspace at DIR, not this one's.
+    #[arg(long, value_name = "DIR")]
+    pub workspace: Option<std::path::PathBuf>,
+    /// Machine-readable output: `{version, sessions: [...], retention}`, live
+    /// sessions first, then ended ones newest first.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Who ran a session, as `list --actor` selects it.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActorKind {
+    Human,
+    Agent,
+    Ci,
+}
+
+impl ActorKind {
+    /// The catalog's `actor_kind`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Human => "human",
+            Self::Agent => "agent",
+            Self::Ci => "ci",
+        }
+    }
+}
+
+impl ListArgs {
+    /// The filter these flags select, as of `now_ms`.
+    fn filter(&self, now_ms: u64) -> anyhow::Result<list::ListFilter> {
+        let (since_ms, until_ms) = list::window(&self.since, self.until.as_deref(), now_ms)?;
+        Ok(list::ListFilter {
+            since_ms: Some(since_ms),
+            until_ms,
+            addr: self.addr.clone(),
+            failed: self.failed,
+            actor: self.actor,
+            command: self.command.clone(),
+            user: self.user.clone(),
+        })
+    }
 }
 
 #[derive(Args, Clone, Debug)]
@@ -256,7 +318,7 @@ fn execute(
         .context("locating ~/.heph/sessions")?
         .join(crate::tui::session::SESSIONS_DIR);
     let tmp_dir = crate::tui::session::store::tmp_dir(&root);
-    let file = FileSource::new(root);
+    let file = FileSource::new(root.clone());
     let sources: [&dyn SessionSource; 1] = [&file];
     let opener = reference::Opener::new(tmp_dir);
     let opts = ViewOpts {
@@ -273,21 +335,40 @@ fn execute(
     match cmd {
         SessionCommands::List(a) => {
             // Outside a workspace there is no "this one": list them all.
+            let filter = a.filter(opts.now_ms)?;
             let workspace = if a.all {
                 None
+            } else if let Some(dir) = &a.workspace {
+                // As a workspace root is recorded: absolute, links resolved.
+                let dir = std::fs::canonicalize(dir)
+                    .or_else(|_| std::path::absolute(dir))
+                    .with_context(|| format!("resolving --workspace {}", dir.display()))?;
+                Some(dir.to_string_lossy().into_owned())
             } else {
                 crate::engine::get_root()
                     .ok()
                     .map(|p| p.to_string_lossy().into_owned())
             };
-            let filter = match &workspace {
+            let scope = match &workspace {
                 Some(w) => Workspace::Only(w),
                 None => Workspace::All,
             };
             if let Some(note) = list::scope_note(a.all, workspace.as_deref()) {
                 sink.write_diagnostic(note);
             }
-            bootstrap::block_on(list::list(&sources, opts, filter, &a.out, out))?
+            // `list` heals and repairs the catalog it reads (D14).
+            let catalog = list::read_catalog(&root, opts.now_ms, &filter, &mut |note| {
+                sink.write_diagnostic(note);
+            });
+            bootstrap::block_on(list::list(
+                &sources,
+                opts,
+                scope,
+                &filter,
+                catalog.as_ref(),
+                a.json,
+                &mut stdout,
+            ))?
         }
         SessionCommands::Show(a) => {
             // `show` reads explorer rows, so it repairs what it reads (D14);

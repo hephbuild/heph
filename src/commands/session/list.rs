@@ -1,16 +1,20 @@
-//! `heph session list`: one row per session, from `meta.json` and
-//! `status.json` alone — never the event log (I3: listing costs a few small
-//! reads per session, however long each one ran).
+//! `heph session list`: one row per session, from the catalog (who ran
+//! what, when, for how long) and each session directory's `meta.json` and
+//! `status.json` (its state now) — never the event log (I3: listing costs a
+//! few small reads per session, however long each one ran).
 
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
+use std::path::Path;
 
 use anyhow::Context as _;
 use serde::Serialize;
 
 use super::{
-    BlockedOn, Out, SessionState, ViewOpts, Workspace, ago, blocked_on, command_line, derive_state,
-    escape, list_all, truncate,
+    ActorKind, BlockedOn, SessionState, ViewOpts, Workspace, ago, blocked_on, command_line,
+    derive_state, escape, list_all, truncate,
 };
+use crate::tui::session::catalog::{self, ListQuery, Listed};
 use crate::tui::session::{EntryMeta, SessionEntry, SessionSource, holder_session};
 
 /// The widest COMMAND cell.
@@ -18,11 +22,155 @@ const COMMAND_WIDTH: usize = 40;
 /// The widest NOW cell.
 const NOW_WIDTH: usize = 60;
 
-/// One session in `list --json`, which is an array of these sorted by id.
-/// Times are absolute unix milliseconds.
-#[derive(Debug, Serialize, output::Record)]
-pub struct ListRow {
-    /// The session id.
+/// What `list` selects, besides the workspace. The default selects every
+/// session.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct ListFilter {
+    /// Sessions started at or after this (unix ms).
+    pub since_ms: Option<u64>,
+    /// Sessions started at or before this (unix ms).
+    pub until_ms: Option<u64>,
+    /// Only the sessions that resolved this target, with its outcome.
+    pub addr: Option<String>,
+    /// Only the sessions that failed.
+    pub failed: bool,
+    pub actor: Option<ActorKind>,
+    /// The heph subcommand (`run`, `query`, ...).
+    pub command: Option<String>,
+    pub user: Option<String>,
+}
+
+/// Parse `--since`/`--until`: a duration back from `now_ms` (`7d`, `12h`,
+/// `0d`) or an RFC 3339 time, seconds optional (`2026-11-20T10:00+02:00`).
+pub(crate) fn parse_time(flag: &str, s: &str, now_ms: u64) -> anyhow::Result<u64> {
+    if let Ok(d) = hcore::units::parse_duration(s) {
+        return Ok(now_ms.saturating_sub(u64::try_from(d.as_millis()).unwrap_or(u64::MAX)));
+    }
+    let t = s.trim();
+    // `Z` as an offset, for the forms without seconds that `%:z` reads.
+    let zoned = match t.strip_suffix(['Z', 'z']) {
+        Some(rest) => format!("{rest}+00:00"),
+        None => t.to_owned(),
+    };
+    let parsed = chrono::DateTime::parse_from_rfc3339(t)
+        .or_else(|_| chrono::DateTime::parse_from_str(&zoned, "%Y-%m-%dT%H:%M%:z"))
+        .or_else(|_| chrono::DateTime::parse_from_str(&zoned, "%Y-%m-%dT%H:%M:%S%.f%:z"));
+    match parsed {
+        Ok(at) => Ok(u64::try_from(at.timestamp_millis()).unwrap_or(0)),
+        Err(_) => anyhow::bail!(
+            "{flag} {s:?} is neither a duration (7d, 12h, 30m) nor an RFC 3339 time \
+             (2026-11-20T10:00+02:00)"
+        ),
+    }
+}
+
+/// The window `--since` and `--until` select, refusing one that ends before
+/// it starts.
+pub(crate) fn window(
+    since: &str,
+    until: Option<&str>,
+    now_ms: u64,
+) -> anyhow::Result<(u64, Option<u64>)> {
+    let since_ms = parse_time("--since", since, now_ms)?;
+    let until_ms = until
+        .map(|u| parse_time("--until", u, now_ms))
+        .transpose()?;
+    if let Some(u) = until_ms
+        && u < since_ms
+    {
+        anyhow::bail!(
+            "--until {:?} is earlier than --since {since:?}",
+            until.unwrap_or_default()
+        );
+    }
+    Ok((since_ms, until_ms))
+}
+
+/// The catalog's answer, read before `list` runs.
+#[derive(Debug, Default)]
+pub(crate) struct CatalogRows {
+    /// The catalog's sessions in the window, with the target under `--addr`.
+    pub rows: Vec<Listed>,
+    /// When its oldest session started: how far back it answers.
+    pub oldest_started_ms: Option<u64>,
+    /// Answering from the recordings kept: there is no usable catalog.
+    pub in_memory: bool,
+}
+
+/// Open (and so repair, D14) the catalog in `root` and read what `filter`
+/// asks of it. Its notes go to `note`, each a full line. `None` when there is
+/// no sessions directory yet, or the catalog cannot be read at all: `list`
+/// then answers from the session directories alone.
+pub(crate) fn read_catalog(
+    root: &Path,
+    now_ms: u64,
+    filter: &ListFilter,
+    note: &mut dyn FnMut(&str),
+) -> Option<CatalogRows> {
+    if !root.is_dir() {
+        return None;
+    }
+    let mut read = || -> anyhow::Result<CatalogRows> {
+        let cat = catalog::open(root, now_ms)?;
+        for n in &cat.notes {
+            note(n);
+        }
+        let q = ListQuery {
+            since_ms: filter.since_ms,
+            until_ms: filter.until_ms,
+            addr: filter.addr.as_deref(),
+        };
+        Ok(CatalogRows {
+            rows: catalog::list_sessions(&cat.conn, &q)?,
+            oldest_started_ms: catalog::oldest_started_ms(&cat.conn)?,
+            in_memory: cat.in_memory,
+        })
+    };
+    match read() {
+        Ok(rows) => Some(rows),
+        Err(e) => {
+            tracing::debug!(error = %format!("{e:#}"), "listing without the session catalog");
+            None
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ListJson {
+    version: u32,
+    /// Live sessions first, then ended ones newest first.
+    sessions: Vec<ListJsonEntry>,
+    retention: RetentionJson,
+}
+
+/// How far back each half of `list` answers.
+#[derive(Debug, Serialize)]
+struct RetentionJson {
+    recordings: RecordingsRetention,
+    catalog: CatalogRetention,
+}
+
+#[derive(Debug, Serialize)]
+struct RecordingsRetention {
+    /// `session.keep`: an ended recording is removed this long after it ended.
+    keep_ms: u64,
+    /// `session.keepBytes`.
+    keep_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct CatalogRetention {
+    /// How long a catalog row is kept; `null` when there is no usable
+    /// catalog and `list` answered from the recordings kept.
+    keep_ms: Option<u64>,
+    /// When the catalog's oldest session started: a rebuilt catalog covers
+    /// only the recordings kept then. `null` when it holds none.
+    oldest_started_unix_ms: Option<u64>,
+}
+
+/// One session in `list --json`. Times are absolute unix milliseconds.
+#[derive(Debug, Serialize)]
+struct ListJsonEntry {
     id: String,
     /// The recording process's pid; `null` only for a session in a newer
     /// directory format.
@@ -37,12 +185,25 @@ pub struct ListRow {
     state: SessionState,
     /// When it started.
     started_unix_ms: u64,
-    /// Its latest build event; `null` before the first.
+    /// `null` while it runs, and for a session that never recorded its end.
+    ended_unix_ms: Option<u64>,
     last_event_unix_ms: Option<u64>,
     /// Its exit code once it ended; `null` while live, or killed by a signal.
     exit_code: Option<i32>,
     /// Set when the session ended in a panic (its `exit_code` may still be 0).
     panicked: bool,
+    /// Who ran it; `null` when the catalog has no row for it.
+    actor: Option<ActorJson>,
+    /// `$USER` of the run; `null` when unknown.
+    user: Option<String>,
+    /// The heph subcommand (`run`, `query`, ...).
+    command: Option<String>,
+    /// False for a private session (`HEPH_NO_SESSION`): only its catalog row
+    /// is kept, no recording.
+    recorded: bool,
+    /// With `--addr`: that target in this session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<TargetJson>,
     /// The PROGRESS column's numbers; `null` before the session wrote its
     /// first `status.json`.
     progress: Option<Progress>,
@@ -61,6 +222,22 @@ pub struct ListRow {
     /// does not read further.
     #[serde(skip_serializing_if = "Option::is_none")]
     format: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct ActorJson {
+    /// `human`, `agent` or `ci`; an open set.
+    kind: String,
+    /// The agent or CI system, when known.
+    name: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct TargetJson {
+    addr: String,
+    /// `ran`, `hit`, `failed` or `cancelled`; an open set.
+    outcome: String,
+    duration_ms: Option<u64>,
 }
 
 /// How far a session got, as PROGRESS shows it.
@@ -102,31 +279,197 @@ impl Progress {
     }
 }
 
+/// One listed session: its directory, its catalog row, or both.
+#[derive(Debug, Clone, Copy)]
+struct Row<'a> {
+    entry: Option<&'a SessionEntry>,
+    cat: Option<&'a Listed>,
+}
+
+impl Row<'_> {
+    fn id(&self) -> String {
+        match (self.entry, self.cat) {
+            (Some(e), _) => e.id.encode(),
+            (None, Some(c)) => c.session_id.clone(),
+            (None, None) => String::new(),
+        }
+    }
+
+    fn live(&self) -> bool {
+        self.entry.is_some_and(|e| e.live)
+    }
+
+    fn started_ms(&self) -> u64 {
+        match (self.entry, self.cat) {
+            (_, Some(c)) => c.started_ms,
+            (Some(e), None) => match &e.meta {
+                EntryMeta::Known(m) => m.started_unix_ms,
+                EntryMeta::TooNew { .. } => e.id.started_unix_ms(),
+            },
+            (None, None) => 0,
+        }
+    }
+
+    fn ended_ms(&self) -> Option<u64> {
+        self.entry
+            .and_then(|e| e.status.as_ref())
+            .and_then(|s| s.end.as_ref())
+            .map(|end| end.at_unix_ms)
+            .or_else(|| self.cat.and_then(|c| c.ended_ms))
+    }
+
+    fn workspace_root(&self) -> Option<&str> {
+        match (self.entry.map(|e| &e.meta), self.cat) {
+            (Some(EntryMeta::Known(m)), _) => m.workspace_root.as_deref(),
+            (_, Some(c)) => c.workspace_root.as_deref(),
+            _ => None,
+        }
+    }
+
+    fn too_new(&self) -> bool {
+        self.entry
+            .is_some_and(|e| matches!(e.meta, EntryMeta::TooNew { .. }))
+    }
+
+    fn command(&self) -> Option<&str> {
+        if let Some(c) = self.cat.and_then(|c| c.command.as_deref()) {
+            return Some(c);
+        }
+        match self.entry.map(|e| &e.meta) {
+            Some(EntryMeta::Known(m)) => m.argv.get(1).map(String::as_str),
+            _ => None,
+        }
+    }
+
+    fn state(&self, opts: ViewOpts) -> SessionState {
+        match (self.entry, self.cat) {
+            (Some(e), _) => derive_state(e, opts.now_ms, opts.stall),
+            // Its directory is gone (cleaned up, or a private session's).
+            (None, Some(c)) => match c.ended_ms {
+                Some(_) if c.exit_code == Some(0) && !c.panicked => SessionState::Ok,
+                Some(_) => SessionState::Failed,
+                None => SessionState::Lost,
+            },
+            (None, None) => SessionState::Unknown,
+        }
+    }
+
+    /// The ACTOR cell: `human`, `ci`, `agent (<name>)` or bare `agent`.
+    fn actor_cell(&self) -> String {
+        let Some(c) = self.cat else {
+            return "-".to_owned();
+        };
+        match (c.actor_kind.as_deref(), c.actor_name.as_deref()) {
+            (Some("agent"), Some(name)) => format!("agent ({})", escape(name)),
+            (Some(kind), _) => escape(kind).into_owned(),
+            (None, _) => "-".to_owned(),
+        }
+    }
+}
+
+/// Every session to list: the directories (live first, then ended newest
+/// first), joined with the catalog's rows, filtered. Under `--addr`, only the
+/// sessions whose catalog rows resolved that target.
+fn rows<'a>(
+    every: &[&'a SessionEntry],
+    catalog: Option<&'a CatalogRows>,
+    workspace: Workspace<'_>,
+    filter: &ListFilter,
+    opts: ViewOpts,
+) -> Vec<Row<'a>> {
+    let listed: &[Listed] = catalog.map_or(&[], |c| &c.rows);
+    let by_id: HashMap<&str, &Listed> = listed.iter().map(|l| (l.session_id.as_str(), l)).collect();
+    let mut rows: Vec<Row<'a>> = Vec::new();
+    if filter.addr.is_some() {
+        let entries: HashMap<String, &SessionEntry> =
+            every.iter().map(|e| (e.id.encode(), *e)).collect();
+        rows.extend(listed.iter().map(|l| Row {
+            entry: entries.get(&l.session_id).copied(),
+            cat: Some(l),
+        }));
+    } else {
+        let mut seen: HashSet<String> = HashSet::with_capacity(every.len());
+        for e in every {
+            let id = e.id.encode();
+            rows.push(Row {
+                entry: Some(e),
+                cat: by_id.get(id.as_str()).copied(),
+            });
+            seen.insert(id);
+        }
+        rows.extend(
+            listed
+                .iter()
+                .filter(|l| !seen.contains(&l.session_id))
+                .map(|l| Row {
+                    entry: None,
+                    cat: Some(l),
+                }),
+        );
+    }
+    rows.retain(|r| keep(r, workspace, filter, opts));
+    rows.sort_by_cached_key(|r| {
+        (
+            !r.live(),
+            std::cmp::Reverse(r.started_ms()),
+            std::cmp::Reverse(r.id()),
+        )
+    });
+    rows
+}
+
+fn keep(r: &Row<'_>, workspace: Workspace<'_>, filter: &ListFilter, opts: ViewOpts) -> bool {
+    let started = r.started_ms();
+    if filter.since_ms.is_some_and(|s| started < s) || filter.until_ms.is_some_and(|u| started > u)
+    {
+        return false;
+    }
+    let in_workspace = match workspace {
+        Workspace::All => true,
+        // Its workspace is unknown: shown everywhere, as the placeholder.
+        Workspace::Only(_) if r.too_new() => true,
+        Workspace::Only(w) => r.workspace_root() == Some(w),
+    };
+    if !in_workspace {
+        return false;
+    }
+    if filter.failed && r.state(opts) != SessionState::Failed {
+        return false;
+    }
+    if let Some(kind) = filter.actor
+        && r.cat.and_then(|c| c.actor_kind.as_deref()) != Some(kind.as_str())
+    {
+        return false;
+    }
+    if let Some(cmd) = &filter.command
+        && r.command() != Some(cmd.as_str())
+    {
+        return false;
+    }
+    if let Some(user) = &filter.user
+        && r.cat.and_then(|c| c.user.as_deref()) != Some(user.as_str())
+    {
+        return false;
+    }
+    true
+}
+
 pub(crate) async fn list(
     sources: &[&dyn SessionSource],
     opts: ViewOpts,
     workspace: Workspace<'_>,
-    json: &output::JsonArgs<ListRow>,
-    out: Out<'_>,
+    filter: &ListFilter,
+    catalog: Option<&CatalogRows>,
+    json: bool,
+    out: &mut dyn Write,
 ) -> anyhow::Result<()> {
     let all = list_all(sources).await?;
-    let shown: Vec<&SessionEntry> = all
-        .iter()
-        .map(|(_, e)| e)
-        .filter(|e| match (workspace, &e.meta) {
-            (Workspace::All, _) => true,
-            // Its workspace is unknown: shown everywhere, as the placeholder.
-            (Workspace::Only(_), EntryMeta::TooNew { .. }) => true,
-            (Workspace::Only(w), EntryMeta::Known(m)) => m.workspace_root.as_deref() == Some(w),
-        })
-        .collect();
     let every: Vec<&SessionEntry> = all.iter().map(|(_, e)| e).collect();
-    if json.enabled() {
-        let rows = shown.iter().map(|e| json_row(e, &every, opts));
-        json.printer_to(out.w, out.style)
-            .list_iter(rows, &output::never_cancelled)
+    let shown = rows(&every, catalog, workspace, filter, opts);
+    if json {
+        write_json(&shown, &every, catalog, opts, out)
     } else {
-        write_table(&shown, &every, workspace, opts, out.w)
+        write_table(&shown, &every, workspace, filter, opts, out)
     }
 }
 
@@ -137,39 +480,31 @@ pub(crate) fn scope_note(all: bool, workspace: Option<&str>) -> Option<&'static 
         .then_some("heph: not in a workspace; listing the sessions of every workspace\n")
 }
 
-/// `e`'s element of `list --json`.
-fn json_row(e: &SessionEntry, every: &[&SessionEntry], opts: ViewOpts) -> ListRow {
-    let state = derive_state(e, opts.now_ms, opts.stall);
-    let status = e.status.as_ref();
-    let blocked_on = status.map(|s| blocked_on(s, e, every)).unwrap_or_default();
-    let end = status.and_then(|s| s.end.as_ref());
-    let exit_code = end.and_then(|x| x.exit_code);
-    let last_event_unix_ms = status.and_then(|s| s.last_event_unix_ms);
-    let now = match state {
-        SessionState::Running | SessionState::Waiting | SessionState::Quiet => status
-            .map(|s| now_cell(s, e, every, opts))
-            .filter(|n| n != "-"),
-        _ => None,
+fn write_json(
+    shown: &[Row<'_>],
+    every: &[&SessionEntry],
+    catalog: Option<&CatalogRows>,
+    opts: ViewOpts,
+    out: &mut dyn Write,
+) -> anyhow::Result<()> {
+    let sessions = shown.iter().map(|r| json_entry(r, every, opts)).collect();
+    let on_disk = catalog.filter(|c| !c.in_memory);
+    let retention = RetentionJson {
+        recordings: RecordingsRetention {
+            keep_ms: u64::try_from(opts.retention.max_age.as_millis()).unwrap_or(u64::MAX),
+            keep_bytes: opts.retention.max_bytes,
+        },
+        catalog: CatalogRetention {
+            keep_ms: on_disk.map(|_| u64::try_from(catalog::KEEP.as_millis()).unwrap_or(u64::MAX)),
+            oldest_started_unix_ms: on_disk.and_then(|c| c.oldest_started_ms),
+        },
     };
-    match &e.meta {
-        EntryMeta::Known(m) => ListRow {
-            id: e.id.encode(),
-            owner_pid: Some(m.owner_pid),
-            argv: m.argv.clone(),
-            workspace_root: m.workspace_root.clone(),
-            cwd: m.cwd.clone(),
-            state,
-            started_unix_ms: m.started_unix_ms,
-            last_event_unix_ms,
-            exit_code,
-            panicked: end.is_some_and(|x| x.panicked),
-            progress: status.map(Progress::of),
-            now,
-            blocked_on,
-            // Unknown, not "complete", when the status row is there but this
-            // heph cannot read it.
-            incomplete: (!e.status_unreadable).then(|| status.is_some_and(|s| s.truncated)),
-            format: None,
+    serde_json::to_writer_pretty(
+        &mut *out,
+        &ListJson {
+            version: LIST_JSON_VERSION,
+            sessions,
+            retention,
         },
         EntryMeta::TooNew { found, .. } => ListRow {
             id: e.id.encode(),
@@ -191,43 +526,140 @@ fn json_row(e: &SessionEntry, every: &[&SessionEntry], opts: ViewOpts) -> ListRo
     }
 }
 
-const HEADERS: [&str; 7] = [
-    "ID", "WORKTREE", "COMMAND", "STATE", "EXIT", "PROGRESS", "NOW",
+fn json_entry(r: &Row<'_>, every: &[&SessionEntry], opts: ViewOpts) -> ListJsonEntry {
+    let state = r.state(opts);
+    let cat = r.cat;
+    let actor = cat.and_then(|c| {
+        c.actor_kind.as_ref().map(|kind| ActorJson {
+            kind: kind.clone(),
+            name: c.actor_name.clone(),
+        })
+    });
+    let target = cat.and_then(|c| c.target.as_ref()).map(|t| TargetJson {
+        addr: t.addr.clone(),
+        outcome: t.outcome.clone(),
+        duration_ms: t.duration_us.map(|d| d / 1000),
+    });
+    let mut j = ListJsonEntry {
+        id: r.id(),
+        owner_pid: cat.and_then(|c| c.owner_pid),
+        argv: cat.map(|c| c.argv.clone()).unwrap_or_default(),
+        workspace_root: cat.and_then(|c| c.workspace_root.clone()),
+        cwd: cat.and_then(|c| c.cwd.clone()),
+        state,
+        started_unix_ms: r.started_ms(),
+        ended_unix_ms: r.ended_ms(),
+        last_event_unix_ms: None,
+        exit_code: cat.and_then(|c| c.exit_code),
+        panicked: cat.is_some_and(|c| c.panicked),
+        actor,
+        user: cat.and_then(|c| c.user.clone()),
+        command: r.command().map(str::to_owned),
+        recorded: r.entry.is_some() || cat.is_none_or(|c| c.recorded),
+        target,
+        progress: None,
+        now: None,
+        blocked_on: Vec::new(),
+        incomplete: cat.map(|c| c.truncated),
+        format: None,
+    };
+    let Some(e) = r.entry else {
+        return j;
+    };
+    let status = e.status.as_ref();
+    let end = status.and_then(|s| s.end.as_ref());
+    j.blocked_on = status.map(|s| blocked_on(s, e, every)).unwrap_or_default();
+    j.last_event_unix_ms = status.and_then(|s| s.last_event_unix_ms);
+    j.progress = status.map(Progress::of);
+    j.now = match state {
+        SessionState::Running | SessionState::Waiting | SessionState::Quiet => status
+            .map(|s| now_cell(s, e, every, opts))
+            .filter(|n| n != "-"),
+        _ => None,
+    };
+    match &e.meta {
+        EntryMeta::Known(m) => {
+            j.owner_pid = Some(m.owner_pid);
+            j.argv.clone_from(&m.argv);
+            j.workspace_root.clone_from(&m.workspace_root);
+            j.cwd.clone_from(&m.cwd);
+            j.started_unix_ms = m.started_unix_ms;
+            j.exit_code = end.and_then(|x| x.exit_code);
+            j.panicked = end.is_some_and(|x| x.panicked);
+            // Unknown, not "complete", when the status row is there but this
+            // heph cannot read it.
+            j.incomplete = (!e.status_unreadable).then(|| status.is_some_and(|s| s.truncated));
+        }
+        EntryMeta::TooNew { found, .. } => {
+            j.owner_pid = None;
+            j.argv = Vec::new();
+            j.started_unix_ms = e.id.started_unix_ms();
+            j.blocked_on = Vec::new();
+            j.last_event_unix_ms = None;
+            j.progress = None;
+            j.now = None;
+            j.incomplete = None;
+            j.format = Some(*found);
+        }
+    }
+    j
+}
+
+const HEADERS: [&str; 10] = [
+    "ID", "ACTOR", "STARTED", "TOOK", "WORKTREE", "COMMAND", "STATE", "EXIT", "PROGRESS", "NOW",
 ];
+/// Where `--addr`'s OUTCOME column goes: before STATE.
+const OUTCOME_AT: usize = 6;
 
 fn write_table(
-    shown: &[&SessionEntry],
+    shown: &[Row<'_>],
     every: &[&SessionEntry],
     workspace: Workspace<'_>,
+    filter: &ListFilter,
     opts: ViewOpts,
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
     if shown.is_empty() {
-        let empty = match workspace {
-            Workspace::Only(_) => "no sessions in this workspace (--all for every workspace)",
-            Workspace::All => "no sessions",
+        let empty = match (&filter.addr, workspace) {
+            (Some(addr), _) => format!("no sessions resolved {}", escape(addr)),
+            (None, Workspace::Only(_)) => {
+                "no sessions in this workspace (--all for every workspace)".to_owned()
+            }
+            (None, Workspace::All) => "no sessions".to_owned(),
         };
         writeln!(out, "{empty}").context("writing the session list")?;
         return Ok(());
     }
-    // Live first, then ended; each by start.
-    let mut ordered: Vec<&SessionEntry> = shown.to_vec();
-    ordered.sort_by_key(|e| (!e.live, e.id));
-    let rows: Vec<[String; 7]> = ordered.iter().map(|e| row(e, every, opts)).collect();
-    let mut widths = HEADERS.map(|h| h.chars().count());
+    let with_outcome = filter.addr.is_some();
+    let mut header: Vec<String> = HEADERS.iter().map(|h| (*h).to_owned()).collect();
+    if with_outcome {
+        header.insert(OUTCOME_AT, "OUTCOME".to_owned());
+    }
+    let rows: Vec<Vec<String>> = shown
+        .iter()
+        .map(|r| {
+            let mut cells = row(r, every, opts);
+            if with_outcome {
+                let outcome = r
+                    .cat
+                    .and_then(|c| c.target.as_ref())
+                    .map_or_else(|| "-".to_owned(), |t| escape(&t.outcome).into_owned());
+                cells.insert(OUTCOME_AT, outcome);
+            }
+            cells
+        })
+        .collect();
+    let mut widths: Vec<usize> = header.iter().map(|h| h.chars().count()).collect();
     for r in &rows {
         for (w, cell) in widths.iter_mut().zip(r) {
             *w = (*w).max(cell.chars().count());
         }
     }
-    let header = HEADERS.map(str::to_owned);
     for r in std::iter::once(&header).chain(&rows) {
         let mut line = String::new();
-        for (i, (cell, w)) in r.iter().zip(widths).enumerate() {
-            if i + 1 == r.len() {
-                line.push_str(cell);
-            } else {
-                line.push_str(cell);
+        for (i, (cell, w)) in r.iter().zip(&widths).enumerate() {
+            line.push_str(cell);
+            if i + 1 < r.len() {
                 line.extend(std::iter::repeat_n(' ', w - cell.chars().count() + 2));
             }
         }
@@ -236,13 +668,39 @@ fn write_table(
     Ok(())
 }
 
-fn row(e: &SessionEntry, every: &[&SessionEntry], opts: ViewOpts) -> [String; 7] {
-    let id = e.id.encode();
+fn row(r: &Row<'_>, every: &[&SessionEntry], opts: ViewOpts) -> Vec<String> {
+    let id = r.id();
+    let actor = r.actor_cell();
+    let started_ms = r.started_ms();
+    let started = format!("{} ago", ago(opts.now_ms, started_ms));
+    let took = r
+        .ended_ms()
+        .map_or_else(|| "-".to_owned(), |end| ago(end, started_ms));
+    let state = r.state(opts);
+    let worktree = r
+        .workspace_root()
+        .and_then(|w| Path::new(w).file_name())
+        .map_or_else(
+            || "-".to_owned(),
+            |f| escape(&f.to_string_lossy()).into_owned(),
+        );
+    let e = match (r.entry, r.cat) {
+        (Some(e), _) => e,
+        // Only the catalog row is left: its directory was cleaned up, or it
+        // was a private session that kept none.
+        (None, Some(c)) => {
+            return catalog_row(c, [id, actor, started, took, worktree], state, opts);
+        }
+        (None, None) => return vec![id],
+    };
     let meta = match &e.meta {
         EntryMeta::Known(m) => m,
         EntryMeta::TooNew { found, .. } => {
-            return [
+            return vec![
                 id,
+                "-".to_owned(),
+                started,
+                "-".to_owned(),
                 "-".to_owned(),
                 format!("format {found}, needs newer heph"),
                 SessionState::Unknown.label().to_owned(),
@@ -252,15 +710,6 @@ fn row(e: &SessionEntry, every: &[&SessionEntry], opts: ViewOpts) -> [String; 7]
             ];
         }
     };
-    let state = derive_state(e, opts.now_ms, opts.stall);
-    let worktree = meta
-        .workspace_root
-        .as_deref()
-        .and_then(|w| std::path::Path::new(w).file_name())
-        .map_or_else(
-            || "-".to_owned(),
-            |f| escape(&f.to_string_lossy()).into_owned(),
-        );
     let status = e.status.as_ref();
     let end = status.and_then(|s| s.end.as_ref());
     let exit = match end {
@@ -303,8 +752,11 @@ fn row(e: &SessionEntry, every: &[&SessionEntry], opts: ViewOpts) -> [String; 7]
         ),
         _ => status.map_or_else(|| "-".to_owned(), |s| now_cell(s, e, every, opts)),
     };
-    [
+    vec![
         id,
+        actor,
+        started,
+        took,
         worktree,
         command_line(&meta.argv, COMMAND_WIDTH),
         state.label().to_owned(),
@@ -312,6 +764,31 @@ fn row(e: &SessionEntry, every: &[&SessionEntry], opts: ViewOpts) -> [String; 7]
         progress,
         truncate(&now, NOW_WIDTH),
     ]
+}
+
+/// The row of a session only the catalog still holds; `lead` is its ID,
+/// ACTOR, STARTED, TOOK and WORKTREE cells.
+fn catalog_row(c: &Listed, lead: [String; 5], state: SessionState, opts: ViewOpts) -> Vec<String> {
+    let exit = match (c.ended_ms, c.exit_code) {
+        (None, _) => "-".to_owned(),
+        (Some(_), _) if c.panicked => "panic".to_owned(),
+        (Some(_), Some(code)) => code.to_string(),
+        (Some(_), None) => "signal".to_owned(),
+    };
+    let progress = if c.recorded { "-" } else { "not recorded" };
+    let now = c.ended_ms.map_or_else(
+        || "-".to_owned(),
+        |end| format!("{} ago", ago(opts.now_ms, end)),
+    );
+    let mut cells = Vec::from(lead);
+    cells.extend([
+        command_line(&c.argv, COMMAND_WIDTH),
+        state.label().to_owned(),
+        exit,
+        progress.to_owned(),
+        now,
+    ]);
+    cells
 }
 
 /// What a live session is on: the lock it waits for and who holds it, else its
