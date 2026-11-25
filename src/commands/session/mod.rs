@@ -117,9 +117,9 @@ pub struct ListArgs {
     /// Every workspace's sessions, not only this one's.
     #[arg(long)]
     pub all: bool,
-    /// Machine-readable output: `{version, sessions: [...]}`, sorted by id.
-    #[arg(long)]
-    pub json: bool,
+    /// `--json` is an array of sessions, sorted by id.
+    #[command(flatten)]
+    pub out: output::JsonArgs<list::ListRow>,
 }
 
 #[derive(Args, Clone, Debug)]
@@ -127,9 +127,9 @@ pub struct ShowArgs {
     /// Session id, its last 4–5 characters, or a live session's pid (any
     /// unique prefix or suffix of an id works).
     pub id: String,
-    /// The session's snapshot as JSON, with the viewer-computed `state`.
-    #[arg(long)]
-    pub json: bool,
+    /// `--json` is the session's snapshot, with the viewer-computed `state`.
+    #[command(flatten)]
+    pub out: output::JsonArgs<show::ShowView<'static>>,
 }
 
 #[derive(Args, Clone, Debug)]
@@ -160,9 +160,16 @@ pub struct InflightArgs {
     /// Session id, its last 4–5 characters, or a live session's pid (any
     /// unique prefix or suffix of an id works).
     pub id: String,
-    /// `{id, report}`.
-    #[arg(long)]
-    pub json: bool,
+    /// `--json` is `{id, report}`.
+    #[command(flatten)]
+    pub out: output::JsonArgs<InflightView<'static>>,
+}
+
+/// Where a viewer prints, and how its JSON is laid out there (a test asks
+/// for [`output::Style::Compact`] on a buffer).
+pub(crate) struct Out<'a> {
+    pub w: &'a mut dyn Write,
+    pub style: output::Style,
 }
 
 impl SessionArgs {
@@ -177,10 +184,12 @@ impl SessionArgs {
 }
 
 /// Every error that is not already a [`SessionExit`] is this command's own:
-/// exit 125, so it is never read as an exit code `attach` mirrored.
+/// exit 125, so it is never read as an exit code `attach` mirrored. A `--jq`
+/// failure keeps the output layer's code (2, or 130 when cancelled), as on
+/// every command.
 pub(crate) fn wrap_exit(res: anyhow::Result<()>) -> anyhow::Result<()> {
     res.map_err(|e| {
-        if e.downcast_ref::<SessionExit>().is_some() {
+        if e.downcast_ref::<SessionExit>().is_some() || output::exit_code(&e).is_some() {
             e
         } else {
             SessionExit::own(e).into()
@@ -207,6 +216,10 @@ fn execute(
         version: hcore::version::current(),
     };
     let mut stdout = std::io::stdout().lock();
+    let out = Out {
+        w: &mut stdout,
+        style: output::Style::for_stdout(),
+    };
     match cmd {
         SessionCommands::List(a) => {
             // Outside a workspace there is no "this one": list them all.
@@ -224,13 +237,13 @@ fn execute(
             if let Some(note) = list::scope_note(a.all, workspace.as_deref()) {
                 sink.write_diagnostic(note);
             }
-            bootstrap::block_on(list::list(&sources, opts, filter, a.json, &mut stdout))?
+            bootstrap::block_on(list::list(&sources, opts, filter, &a.out, out))?
         }
         SessionCommands::Show(a) => {
-            bootstrap::block_on(show::show(&sources, opts, &a.id, a.json, &mut stdout))?
+            bootstrap::block_on(show::show(&sources, opts, &a.id, &a.out, out))?
         }
         SessionCommands::Inflight(a) => {
-            bootstrap::block_on(inflight(&sources, opts, &a.id, a.json, &mut stdout))?
+            bootstrap::block_on(inflight(&sources, opts, &a.id, &a.out, out))?
         }
         SessionCommands::Attach(a) => {
             a.refuse_dashboard()?;
@@ -551,8 +564,8 @@ async fn inflight(
     sources: &[&dyn SessionSource],
     opts: ViewOpts,
     arg: &str,
-    json: bool,
-    out: &mut dyn Write,
+    json: &output::JsonArgs<InflightView<'static>>,
+    out: Out<'_>,
 ) -> anyhow::Result<()> {
     let (i, entry) = resolve(sources, arg, opts).await?;
     require_known(&entry)?;
@@ -560,28 +573,29 @@ async fn inflight(
         .get(i)
         .context("the session's source went missing")?;
     let report = source.inflight(entry.id, INFLIGHT_TIMEOUT).await?;
-    if json {
-        #[derive(Serialize)]
-        struct InflightJson<'a> {
-            id: String,
-            report: &'a str,
-        }
-        serde_json::to_writer_pretty(
-            &mut *out,
-            &InflightJson {
-                id: entry.id.encode(),
-                report: &report,
-            },
-        )
-        .context("writing the report")?;
-        writeln!(out).context("writing the report")?;
-    } else {
-        write!(out, "{}", escape_text(&report)).context("writing the report")?;
-        if !report.ends_with('\n') {
-            writeln!(out).context("writing the report")?;
-        }
+    if json.enabled() {
+        let view = InflightView {
+            id: entry.id.encode(),
+            report: &report,
+        };
+        return json
+            .printer_to(out.w, out.style)
+            .record(&view, &output::never_cancelled);
+    }
+    write!(out.w, "{}", escape_text(&report)).context("writing the report")?;
+    if !report.ends_with('\n') {
+        writeln!(out.w).context("writing the report")?;
     }
     Ok(())
+}
+
+/// `heph session inflight --json`.
+#[derive(Debug, Serialize, output::Record)]
+pub struct InflightView<'a> {
+    /// The session id.
+    id: String,
+    /// The in-flight report, as the session wrote it (unescaped).
+    report: &'a str,
 }
 
 /// `argv` as one line: the program by its file name, the arguments as given,

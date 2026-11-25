@@ -8,19 +8,22 @@
 //! the run is stuck on and what to do next.
 
 use std::collections::HashSet;
-use std::io::Write;
 
 use anyhow::Context as _;
 use futures::StreamExt as _;
 use serde::Serialize;
 
 use super::{
-    BlockedOn, SessionState, ViewOpts, ago, blocked_on, command_line, derive_state, escape,
+    BlockedOn, Out, SessionState, ViewOpts, ago, blocked_on, command_line, derive_state, escape,
     list_all, recorded_by_newer, require_known, resolve,
 };
 use crate::tui::session::{
     ApprovalStanding, HeaderKind, SessionEntry, SessionItem, SessionMeta, SessionRecordKind,
-    SessionSnapshot, SessionSource, format::SessionEnd, holder_session,
+    SessionSnapshot, SessionSource,
+    format::{
+        AdmissionWaitEntry, ListTotals, LockWaitEntry, RunningTarget, SessionEnd, SnapshotCounts,
+    },
+    holder_session,
 };
 use crate::tui::{self, TUIAppView as _};
 
@@ -127,23 +130,97 @@ async fn fold(
     Ok(folded)
 }
 
-#[derive(Serialize)]
-struct ShowJson<'a> {
+/// `heph session show --json`: the viewer's verdict, then the session's
+/// snapshot field by field. The snapshot's own `version` is left out: it
+/// versions `status.json` on disk, not this output.
+#[derive(Serialize, output::Record)]
+pub struct ShowView<'a> {
+    /// The session id.
     id: String,
-    /// Viewer-computed; see [`SessionState`].
+    /// Viewer-computed: running, waiting, quiet, ok, failed, lost or unknown.
     state: SessionState,
     /// Every wait, each holder mapped to its session: `list --json`'s shape.
     blocked_on: Vec<BlockedOn>,
     /// The session at the root of the first lock chain, the one the run is
     /// really waiting for; `null` when no chain leads to a session.
     chain_root: Option<String>,
+    /// What to do next: `kind`, `command`, `argv`, `cwd`, `reason`.
     next: Next,
     /// The standing approval decision (`approve` after Y, `reject` after N)
     /// acting on the running build; absent when none is.
     #[serde(skip_serializing_if = "Option::is_none")]
     approval_standing: Option<ApprovalStanding>,
-    #[serde(flatten)]
-    snapshot: &'a SessionSnapshot,
+    /// The first build event's time.
+    first_event_unix_ms: Option<u64>,
+    /// The latest build event's time.
+    last_event_unix_ms: Option<u64>,
+    /// How many targets matched, finished, failed and are in flight.
+    counts: &'a SnapshotCounts,
+    /// Targets with an operation open, oldest first.
+    running: &'a [RunningTarget],
+    /// Targets blocked on a result lock or on admission, sorted.
+    waiting: &'a [String],
+    /// Failed targets, in failure order.
+    failed: &'a [String],
+    /// Result locks waited on, with their holders.
+    lock_waits: &'a [LockWaitEntry],
+    /// Resource-pool admissions waited on.
+    admission_waits: &'a [AdmissionWaitEntry],
+    /// Each list's full length, and whether it was cut.
+    totals: &'a ListTotals,
+    /// The event log hit its cap; the fold is short of the session.
+    truncated: bool,
+    /// How the session ended; `null` while it runs.
+    end: Option<&'a SessionEnd>,
+}
+
+impl<'a> ShowView<'a> {
+    /// Every field of `snapshot` but its `version`.
+    fn new(
+        id: String,
+        state: SessionState,
+        blocked_on: Vec<BlockedOn>,
+        chain_root: Option<String>,
+        next: Next,
+        approval_standing: Option<ApprovalStanding>,
+        snapshot: &'a SessionSnapshot,
+    ) -> Self {
+        // Destructured, so a field added to the snapshot is a compile error
+        // here rather than silently missing from `show --json`.
+        let SessionSnapshot {
+            version: _,
+            first_event_unix_ms,
+            last_event_unix_ms,
+            counts,
+            running,
+            waiting,
+            failed,
+            lock_waits,
+            admission_waits,
+            totals,
+            truncated,
+            end,
+        } = snapshot;
+        Self {
+            id,
+            state,
+            blocked_on,
+            chain_root,
+            next,
+            approval_standing,
+            first_event_unix_ms: *first_event_unix_ms,
+            last_event_unix_ms: *last_event_unix_ms,
+            counts,
+            running,
+            waiting,
+            failed,
+            lock_waits,
+            admission_waits,
+            totals,
+            truncated: *truncated,
+            end: end.as_ref(),
+        }
+    }
 }
 
 /// What to do next, for a person (`Next:`) and an agent (`next`).
@@ -193,8 +270,8 @@ pub(crate) async fn show(
     sources: &[&dyn SessionSource],
     opts: ViewOpts,
     arg: &str,
-    json: bool,
-    out: &mut dyn Write,
+    json: &output::JsonArgs<ShowView<'static>>,
+    out: Out<'_>,
 ) -> anyhow::Result<()> {
     let (i, entry) = resolve(sources, arg, opts).await?;
     let meta = require_known(&entry)?;
@@ -231,23 +308,21 @@ pub(crate) async fn show(
         )
     });
 
-    if json {
-        serde_json::to_writer_pretty(
-            &mut *out,
-            &ShowJson {
-                id: entry.id.encode(),
-                state,
-                blocked_on: blocked_on(&snapshot, &entry, &every),
-                chain_root: chain_root.map(|r| r.id.encode()),
-                next,
-                approval_standing: standing,
-                snapshot: &snapshot,
-            },
-        )
-        .context("writing the session")?;
-        writeln!(out).context("writing the session")?;
-        return Ok(());
+    if json.enabled() {
+        let view = ShowView::new(
+            entry.id.encode(),
+            state,
+            blocked_on(&snapshot, &entry, &every),
+            chain_root.map(|r| r.id.encode()),
+            next,
+            standing,
+            &snapshot,
+        );
+        return json
+            .printer_to(out.w, out.style)
+            .record(&view, &output::never_cancelled);
     }
+    let out = out.w;
 
     let mut text = String::new();
     header(&mut text, &entry, meta, opts.now_ms);
@@ -600,4 +675,42 @@ fn shell_line(argv: &[String]) -> String {
         line.push_str(&shlex::try_quote(w).unwrap_or(std::borrow::Cow::Borrowed(w)));
     }
     escape(&line).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn record_keys_subset_of_fields() -> anyhow::Result<()> {
+        let snapshot = SessionSnapshot::default();
+        let view = ShowView::new(
+            "id".to_owned(),
+            SessionState::Running,
+            Vec::new(),
+            None,
+            Next {
+                kind: NextKind::Attach,
+                command: None,
+                argv: None,
+                cwd: None,
+                reason: String::new(),
+            },
+            Some(ApprovalStanding::Approve),
+            &snapshot,
+        );
+        output::check_keys(&view)?;
+        // Every snapshot key but `version` is in the view: what `flatten`
+        // printed before, field for field.
+        let serde_json::Value::Object(keys) = serde_json::to_value(&snapshot)? else {
+            anyhow::bail!("a snapshot serializes as an object");
+        };
+        let fields = <ShowView<'_> as output::Record>::FIELDS;
+        let missing: Vec<&String> = keys
+            .keys()
+            .filter(|k| *k != "version" && !fields.iter().any(|f| f.name == k.as_str()))
+            .collect();
+        anyhow::ensure!(missing.is_empty(), "snapshot keys missing: {missing:?}");
+        Ok(())
+    }
 }
