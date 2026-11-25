@@ -47,6 +47,18 @@ pub(crate) async fn query(
     stdin: &mut dyn Read,
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
+    query_until(args, env, stdin, out, Arc::default()).await
+}
+
+/// [`query`], stopped (exit 130) once `stop` is set: by a SIGINT, or by
+/// the caller.
+pub(crate) async fn query_until(
+    args: &QueryArgs,
+    env: QueryEnv<'_>,
+    stdin: &mut dyn Read,
+    out: &mut dyn Write,
+    stop: Arc<AtomicBool>,
+) -> anyhow::Result<()> {
     if args.schema {
         return write_schema(out);
     }
@@ -58,13 +70,16 @@ pub(crate) async fn query(
             Some(n) => Some(n),
         },
         timeout: args.timeout,
-        stop: Arc::default(),
+        stop,
     };
     // Armed before any source is opened: a Ctrl-C stops the query and lets
     // its temp files go, rather than killing heph with them on disk.
     let _sigint = StopOn::interrupt(Arc::clone(&limits.stop));
 
-    let (sources, skipped) = sources(args, &env).await?;
+    let (sources, skipped) = sources(args, &env, &limits.stop).await?;
+    // The engine looks at the flag only every so many steps, which a short
+    // statement never takes.
+    interrupted(&limits.stop)?;
     let tmp = store::tmp_dir(env.root);
     if sources.len() > 1 {
         std::fs::create_dir_all(&tmp)
@@ -74,6 +89,7 @@ pub(crate) async fn query(
     let mut answer = hcore::blocking::run(move || engine::run(&sql, sources, &tmp, &run_limits))
         .await
         .map_err(query_error)?;
+    interrupted(&limits.stop)?;
     answer.coverage.skipped += skipped;
     notes(&answer.coverage, &*env.note);
     match args.format {
@@ -104,7 +120,11 @@ fn read_sql(args: &QueryArgs, stdin: &mut dyn Read) -> anyhow::Result<String> {
 
 /// The sources `args` select, and how many recordings were skipped picking
 /// them (`--full`: a format this heph does not know, or unreadable).
-async fn sources(args: &QueryArgs, env: &QueryEnv<'_>) -> anyhow::Result<(Vec<Source>, usize)> {
+async fn sources(
+    args: &QueryArgs,
+    env: &QueryEnv<'_>,
+    stop: &Arc<AtomicBool>,
+) -> anyhow::Result<(Vec<Source>, usize)> {
     let note = Arc::clone(&env.note);
     if !args.from.is_empty() {
         let mut out = Vec::with_capacity(args.from.len());
@@ -117,6 +137,7 @@ async fn sources(args: &QueryArgs, env: &QueryEnv<'_>) -> anyhow::Result<(Vec<So
             ));
         };
         for r in &args.from {
+            interrupted(stop)?;
             // A path or a URL is known by what it names before it is opened,
             // so a duplicate is never downloaded or decompressed twice.
             let (early, shown) = match reference::classify(r.trim())? {
@@ -168,7 +189,7 @@ async fn sources(args: &QueryArgs, env: &QueryEnv<'_>) -> anyhow::Result<(Vec<So
     let (since_ms, until_ms) =
         super::list::window(&args.since, args.until.as_deref(), env.opts.now_ms)?;
     if args.full {
-        return full(env, since_ms, until_ms).await;
+        return full(env, since_ms, until_ms, Arc::clone(stop)).await;
     }
     if !env.root.is_dir() {
         // No session was ever recorded here: the empty schema answers.
@@ -204,6 +225,7 @@ async fn full(
     env: &QueryEnv<'_>,
     since_ms: u64,
     until_ms: Option<u64>,
+    stop: Arc<AtomicBool>,
 ) -> anyhow::Result<(Vec<Source>, usize)> {
     let in_window = |t: u64| t >= since_ms && until_ms.is_none_or(|u| t <= u);
     let mut dirs = Vec::new();
@@ -229,6 +251,8 @@ async fn full(
     hcore::blocking::run(move || {
         let mut out = Vec::with_capacity(dirs.len());
         for dir in dirs {
+            // Opening one may re-derive it: seconds each, over many.
+            interrupted(&stop)?;
             match RecordingFile::local(&root, &dir, &*note) {
                 Ok(file) => out.push(Source::Recording(file)),
                 Err(e) => {
@@ -254,6 +278,14 @@ pub(crate) fn query_error(e: QueryError) -> anyhow::Error {
         .into(),
         QueryError::Io(e) | QueryError::Other(e) => e.context("running the query"),
     }
+}
+
+/// The `interrupted` error once `stop` is set.
+fn interrupted(stop: &AtomicBool) -> anyhow::Result<()> {
+    if stop.load(Ordering::Relaxed) {
+        return Err(query_error(QueryError::Interrupted));
+    }
+    Ok(())
 }
 
 /// The stderr lines saying the answer is incomplete.

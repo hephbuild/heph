@@ -38,6 +38,16 @@ async fn run_query_with(
     stdin: &str,
     download: Arc<dyn reference::Download>,
 ) -> Ran {
+    run_query_until(root, argv, stdin, download, Arc::default()).await
+}
+
+async fn run_query_until(
+    root: &Path,
+    argv: &[&str],
+    stdin: &str,
+    download: Arc<dyn reference::Download>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) -> Ran {
     let a = args(argv);
     let file = FileSource::new(root);
     let sources: [&dyn SessionSource; 1] = [&file];
@@ -57,7 +67,7 @@ async fn run_query_with(
         })),
     };
     let mut out = Vec::new();
-    let res = query::query(&a, env, &mut stdin.as_bytes(), &mut out).await;
+    let res = query::query_until(&a, env, &mut stdin.as_bytes(), &mut out, stop).await;
     let notes = notes.lock().expect("notes").clone();
     Ran {
         out: res.map(|()| String::from_utf8(out).expect("utf-8")),
@@ -381,6 +391,28 @@ async fn query_stop_listener_is_armed_before_its_task_runs() {
     })
     .await
     .expect("the signal raised before the task ran sets the stop flag");
+}
+
+/// A Ctrl-C while the sources open stops the query (`interrupted`, 130)
+/// over every kind of source, though the statement is too short for the
+/// engine's progress handler ever to look at the stop flag.
+#[tokio::test]
+async fn query_stops_when_interrupted_opening_its_sources() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().join("sessions");
+    let a = session(&root, 0, 1).encode();
+    session(&root, 60_000, 2);
+    let catalog: &[&str] = &[];
+    let one: &[&str] = &["--from", &a];
+    let full: &[&str] = &["--full"];
+    for from in [catalog, one, full] {
+        let argv: Vec<&str> = from.iter().copied().chain(["SELECT 1"]).collect();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let ran = run_query_until(&root, &argv, "", Arc::new(NoDownload), stop).await;
+        let e = ran.out.expect_err(&format!("{argv:?}: answered"));
+        let (kind, code, _) = kind_and_code(e);
+        assert_eq!((kind, code), (ErrorKind::Interrupted, Some(130)), "{argv:?}");
+    }
 }
 
 /// Serves `body` like [`super::refs::Serve`], counting the downloads.
