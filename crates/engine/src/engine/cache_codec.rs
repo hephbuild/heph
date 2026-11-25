@@ -1,12 +1,13 @@
 //! How cache blobs are encoded at rest, locally and on the remote.
 //!
 //! A revision written by this version stores its artifacts zstd-compressed
-//! (level [`ZSTD_LEVEL`]) under a [`MANIFEST_V2`](crate::engine::local_cache::MANIFEST_V2)
+//! (level [`ZSTD_LEVEL`]) under a [`MANIFEST_V3`](crate::engine::local_cache::MANIFEST_V3)
 //! manifest. Every blob a v2 manifest names carries a suffix saying how it is
 //! stored: [`ZSTD_SUFFIX`] when compressed, [`RAW_SUFFIX`] when verbatim (see
-//! [`entry_name`]). The remote stores the local bytes verbatim, under the same
-//! names and the same manifest name, so a transfer in either direction neither
-//! encodes nor decodes.
+//! [`entry_name`]); a v3 manifest names the same, behind [`V3_PREFIX`]. The
+//! remote stores the local bytes verbatim, under the v2 names and the v2
+//! manifest name ([`remote_entry_name`]), so a transfer in either direction
+//! neither encodes nor decodes.
 //!
 //! Why new names rather than a new value in the existing `encoding` field: a
 //! heph that predates compression reads `manifest-v1.borsh`, ignores
@@ -121,6 +122,32 @@ pub(crate) fn entry_name(base: &str, encoding: &ManifestArtifactEncoding) -> Str
         // so that nothing could ever confuse it with a blob that was.
         ManifestArtifactEncoding::Gzip => format!("{base}.gz"),
     }
+}
+
+/// What every blob name a [`MANIFEST_V3`](crate::engine::local_cache::MANIFEST_V3)
+/// holds starts with. A v1 or v2 name starts with its artifact type (`out_`,
+/// `log_`, `support_`), so no v3 name equals one of them: an older heph
+/// rewriting a revision's v2 blobs never touches the bytes a v3 manifest names.
+pub(crate) const V3_PREFIX: &str = "v3.";
+
+/// The local entry name a blob of `base` name is stored under with `encoding`
+/// in a v3 revision: the v2 [`entry_name`] behind [`V3_PREFIX`].
+pub(crate) fn v3_entry_name(base: &str, encoding: &ManifestArtifactEncoding) -> String {
+    format!("{V3_PREFIX}{}", entry_name(base, encoding))
+}
+
+/// The name the remote stores the local blob `local` under. V3's names are
+/// local only: the remote keeps v2's [`entry_name`] keys, so its object keys
+/// and manifests are the same whichever version uploaded them. A v1 or v2 name
+/// is returned as is.
+pub(crate) fn remote_entry_name(local: &str) -> &str {
+    local.strip_prefix(V3_PREFIX).unwrap_or(local)
+}
+
+/// The local v3 name of the remote blob `remote`, the inverse of
+/// [`remote_entry_name`]: what a revision mirrored from the remote names.
+pub(crate) fn local_entry_name_of_remote(remote: &str) -> String {
+    format!("{V3_PREFIX}{remote}")
 }
 
 /// A pair of bases among one target's artifacts that an older heph and this one

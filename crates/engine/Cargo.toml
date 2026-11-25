@@ -112,3 +112,4 @@ hplugin-buildfile = { package = "plugin-buildfile", path = "../plugin-buildfile"
 tempfile = "3"
 # The paused clock (`start_paused`, `time::advance`), for tests only.
 tokio = { version = "1.54.1", features = ["test-util"] }
+tracing-subscriber = "0.3"

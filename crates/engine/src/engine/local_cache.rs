@@ -111,6 +111,10 @@ pub struct ManifestArtifact {
     pub encoding: ManifestArtifactEncoding,
 }
 
+/// A revision's manifest, whichever name it was read from (see
+/// [`decode_manifest`]). Its borsh layout is the [`MANIFEST_V3`] one, which is
+/// the only one this version writes: [`ManifestV2`]'s fields, then
+/// `host_paths`.
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct Manifest {
     pub version: String,
@@ -118,6 +122,56 @@ pub struct Manifest {
     pub created_at_nanos: i64,
     pub hashin: String,
     pub artifacts: Vec<ManifestArtifact>,
+    /// The host paths the revision's outputs name, as its driver declared them
+    /// (`hplugin::driver::HostPath`): sorted, deduplicated, at most
+    /// `MAX_HOST_PATHS`. A local hit is served only while every one exists.
+    /// Empty for a [`MANIFEST_V1`]/[`MANIFEST_V2`] revision and for one mirrored
+    /// from a remote. Never part of any hash.
+    pub host_paths: Vec<String>,
+}
+
+/// The borsh layout of a [`MANIFEST_V1`] and a [`MANIFEST_V2`], byte for byte
+/// what an older heph writes. Read only through [`decode_manifest`]; this
+/// version never writes it (tests plant older revisions with it).
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
+pub(crate) struct ManifestV2 {
+    pub version: String,
+    pub target: String,
+    pub created_at_nanos: i64,
+    pub hashin: String,
+    pub artifacts: Vec<ManifestArtifact>,
+}
+
+impl From<ManifestV2> for Manifest {
+    fn from(m: ManifestV2) -> Self {
+        let ManifestV2 {
+            version,
+            target,
+            created_at_nanos,
+            hashin,
+            artifacts,
+        } = m;
+        Self {
+            version,
+            target,
+            created_at_nanos,
+            hashin,
+            artifacts,
+            host_paths: Vec::new(),
+        }
+    }
+}
+
+/// Decode the bytes of the manifest called `name`. The one place that knows
+/// which layout each name has: every reader goes through it.
+pub(crate) fn decode_manifest(name: &str, bytes: &[u8]) -> anyhow::Result<Manifest> {
+    match name {
+        MANIFEST_V3 => borsh::from_slice::<Manifest>(bytes).context("decode a manifest-v3"),
+        MANIFEST_V2 | MANIFEST_V1 => borsh::from_slice::<ManifestV2>(bytes)
+            .map(Manifest::from)
+            .with_context(|| format!("decode a {name}")),
+        _ => anyhow::bail!("{name} is not a manifest name"),
+    }
 }
 
 pub struct SizedReader {
@@ -340,8 +394,9 @@ pub struct NotFoundError;
 /// them, and materializes per caller. Read paths therefore check residency
 /// explicitly — see [`missing_local_blobs`](Engine::missing_local_blobs).
 ///
-/// Every revision this version writes uses [`MANIFEST_V2`]. A v1 manifest was
-/// written by a heph that stores every blob raw; it is still read (so an
+/// Every revision this version writes uses [`MANIFEST_CURRENT`]. A v1 manifest
+/// was written by a heph that stores every blob raw, and a v2 one by a heph
+/// that encodes blobs but records no host paths; both are still read (so an
 /// upgrade keeps the local cache warm) and still collected by GC, but never
 /// written.
 pub(crate) const MANIFEST_V1: &str = "manifest-v1.borsh";
@@ -354,10 +409,25 @@ pub(crate) const MANIFEST_V2: &str = "manifest-v2.borsh";
 
 /// `Manifest::version` of a [`MANIFEST_V2`] manifest. Informational: the name,
 /// not this string, is what readers branch on.
+#[cfg(test)]
 pub(crate) const MANIFEST_V2_VERSION: &str = "2.0.0";
 
+/// Name of the manifest of a revision that records the host paths its outputs
+/// name ([`Manifest::host_paths`]). Its blobs have their own names
+/// ([`cache_codec::v3_entry_name`]), never a v2 one, so an older heph
+/// rewriting the same key cannot change the bytes behind a v3 `hashout`.
+pub(crate) const MANIFEST_V3: &str = "manifest-v3.borsh";
+
+/// `Manifest::version` of a [`MANIFEST_V3`] manifest. Informational, like
+/// [`MANIFEST_V2_VERSION`].
+pub(crate) const MANIFEST_V3_VERSION: &str = "3.0.0";
+
+/// The manifest name every revision this version writes has: what a writer
+/// writes, and what a barrier waits for after a write.
+pub(crate) const MANIFEST_CURRENT: &str = MANIFEST_V3;
+
 /// Every manifest name a revision can have, newest first: the read order.
-pub(crate) const MANIFESTS: [&str; 2] = [MANIFEST_V2, MANIFEST_V1];
+pub(crate) const MANIFESTS: [&str; 3] = [MANIFEST_V3, MANIFEST_V2, MANIFEST_V1];
 
 /// The durable cache's sqlite database under a heph `home`.
 pub(crate) fn cache_db_path(home: &std::path::Path) -> std::path::PathBuf {
@@ -657,7 +727,7 @@ fn store_container(
     } else {
         ManifestArtifactEncoding::None
     };
-    let name = cache_codec::entry_name(base_name, &encoding);
+    let name = cache_codec::v3_entry_name(base_name, &encoding);
 
     if encoding == ManifestArtifactEncoding::None
         && content.owned
@@ -717,7 +787,7 @@ impl Engine {
             } else {
                 ManifestArtifactEncoding::None
             };
-            let packed_name = cache_codec::entry_name(&base_name, &packed_encoding);
+            let packed_name = cache_codec::v3_entry_name(&base_name, &packed_encoding);
             let open_writer = |name: &str| -> anyhow::Result<Box<dyn EntryWriter>> {
                 cache_codec::open_writer(&*local_cache, &addr, &hashin, name, &packed_encoding)
             };
@@ -816,13 +886,31 @@ impl Engine {
         .await
     }
 
-    /// Persist `artifacts` for `addr` under the input hash `hashin`.
+    /// [`cache_locally_with_host_paths`](Self::cache_locally_with_host_paths)
+    /// for a revision that declares no host paths.
+    #[cfg(test)]
     pub async fn cache_locally(
         &self,
         ctoken: &dyn Cancellable,
         addr: &Addr,
         hashin: &str,
         artifacts: Vec<outputartifact::OutputArtifact>,
+        tmp: bool,
+    ) -> anyhow::Result<Vec<CacheArtifact>> {
+        self.cache_locally_with_host_paths(ctoken, addr, hashin, artifacts, &[], tmp)
+            .await
+    }
+
+    /// Persist `artifacts` for `addr` under the input hash `hashin`, as a
+    /// [`MANIFEST_CURRENT`] revision recording `host_paths`, the host paths its
+    /// outputs name.
+    pub async fn cache_locally_with_host_paths(
+        &self,
+        ctoken: &dyn Cancellable,
+        addr: &Addr,
+        hashin: &str,
+        artifacts: Vec<outputartifact::OutputArtifact>,
+        host_paths: &[hplugin::driver::HostPath],
         tmp: bool,
     ) -> anyhow::Result<Vec<CacheArtifact>> {
         // Two artifacts mapping to one cache entry name used to resolve
@@ -911,11 +999,12 @@ impl Engine {
         let (res_artifacts, manifest_artifacts): (Vec<_>, Vec<_>) = written.into_iter().unzip();
 
         let manifest = Manifest {
-            version: MANIFEST_V2_VERSION.to_string(),
+            version: MANIFEST_V3_VERSION.to_string(),
             target: addr.format(),
             created_at_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(0),
             hashin: hashin.to_string(),
             artifacts: manifest_artifacts,
+            host_paths: host_paths.iter().map(|p| p.as_str().to_owned()).collect(),
         };
 
         // Manifest strictly last — it is the revision's commit record, so a
@@ -932,7 +1021,7 @@ impl Engine {
         // pool's tar jobs would only delay the moment dependents can read this
         // result.
         let mut manifest_writer = cache
-            .writer(addr, &key, MANIFEST_V2)
+            .writer(addr, &key, MANIFEST_CURRENT)
             .with_context(|| format!("open manifest writer for {addr}"))?;
         borsh::to_writer(&mut manifest_writer, &manifest)
             .with_context(|| format!("write manifest for {addr}"))?;
@@ -969,7 +1058,7 @@ impl Engine {
         // shutdown of a cancelled build.
         if !tmp
             && !self
-                .exists_local(addr, &key, MANIFEST_V2)
+                .exists_local(addr, &key, MANIFEST_CURRENT)
                 .await
                 .with_context(|| format!("waiting for the cache write of {addr} to commit"))?
         {
@@ -1078,7 +1167,7 @@ impl Engine {
         let manifest = match &sized.bytes {
             // Already in memory (an inline sqlite blob, a mem-tier hit): decode
             // it where it is rather than draining a copy.
-            Some(bytes) => borsh::from_slice::<Manifest>(bytes),
+            Some(bytes) => decode_manifest(name, bytes),
             None => {
                 let mut buf = Vec::with_capacity(sized.size as usize);
                 sized
@@ -1086,7 +1175,7 @@ impl Engine {
                     .take(sized.size)
                     .read_to_end(&mut buf)
                     .with_context(|| format!("read manifest bytes for {addr} {hashin}"))?;
-                borsh::from_slice::<Manifest>(&buf)
+                decode_manifest(name, &buf)
             }
         }
         .with_context(|| format!("deserialize manifest for {addr} {hashin}"))?;
@@ -1111,42 +1200,44 @@ impl Engine {
         else {
             return Ok(false);
         };
-        self.duplicate_cache_entry(
-            addr,
-            src_key,
-            dst_key,
-            manifest_name == MANIFEST_V1,
-            &manifest,
-        )?;
+        self.duplicate_cache_entry(addr, src_key, dst_key, manifest_name, &manifest)?;
         Ok(true)
+    }
+
+    /// The name a blob of a `manifest_name` revision has in a
+    /// [`MANIFEST_V3`] one. A v3 manifest names only v3 names: a v1 blob's bare
+    /// name gets its encoding's suffix, and a v2 name gets the v3 prefix.
+    fn v3_blob_name(manifest_name: &str, artifact: &ManifestArtifact) -> String {
+        match manifest_name {
+            MANIFEST_V1 => cache_codec::v3_entry_name(&artifact.name, &artifact.encoding),
+            // A v2 name is the remote's name, so v3's is the same mapping.
+            MANIFEST_V2 => cache_codec::local_entry_name_of_remote(&artifact.name),
+            _ => artifact.name.clone(),
+        }
     }
 
     /// Copy the blobs named in `manifest` from `src_key` to `dst_key`, then write
     /// `manifest` (rewritten with `hashin = dst_key`) under `dst_key` as a
-    /// [`MANIFEST_V2`]. Blob bytes are copied verbatim so the duplicate decodes
-    /// to the primary; only the manifest's `hashin` differs so a reader keyed by
-    /// `dst_key` sees a consistent revision.
+    /// [`MANIFEST_CURRENT`], with the source's host paths. Blob bytes are copied
+    /// verbatim so the duplicate decodes to the primary; only the manifest's
+    /// `hashin` differs so a reader keyed by `dst_key` sees a consistent
+    /// revision.
     ///
-    /// `from_v1`: `manifest` was read from a [`MANIFEST_V1`], whose blob names
-    /// are bare. A v2 manifest never names a bare blob (that name is an older
-    /// heph's), so each blob is copied to its v2
-    /// [`entry_name`](cache_codec::entry_name) for its encoding, and the
-    /// duplicate records that name.
+    /// `manifest_name` is the name `manifest` was read from. A v3 manifest names
+    /// only v3 blobs (an older heph's names are its own), so each blob of a v1
+    /// or v2 source is copied to its [`v3_blob_name`](Self::v3_blob_name), and
+    /// the duplicate records that name.
     fn duplicate_cache_entry(
         &self,
         addr: &Addr,
         src_key: &str,
         dst_key: &str,
-        from_v1: bool,
+        manifest_name: &str,
         manifest: &Manifest,
     ) -> anyhow::Result<()> {
         let mut dup_artifacts = Vec::with_capacity(manifest.artifacts.len());
         for artifact in &manifest.artifacts {
-            let dst_name = if from_v1 {
-                cache_codec::entry_name(&artifact.name, &artifact.encoding)
-            } else {
-                artifact.name.clone()
-            };
+            let dst_name = Self::v3_blob_name(manifest_name, artifact);
             let mut reader = match self.local_cache.reader(addr, src_key, &artifact.name) {
                 Ok(r) => r.reader,
                 // A remote hit's log is fetched only when someone reads it,
@@ -1195,15 +1286,16 @@ impl Engine {
             .unwrap_or(0)
             .max(manifest.created_at_nanos.saturating_add(1));
         let dup_manifest = Manifest {
-            version: MANIFEST_V2_VERSION.to_string(),
+            version: MANIFEST_V3_VERSION.to_string(),
             target: manifest.target.clone(),
             hashin: dst_key.to_string(),
             created_at_nanos: dup_created,
             artifacts: dup_artifacts,
+            host_paths: manifest.host_paths.clone(),
         };
         let mut manifest_writer = self
             .local_cache
-            .writer(addr, dst_key, MANIFEST_V2)
+            .writer(addr, dst_key, MANIFEST_CURRENT)
             .with_context(|| format!("open manifest writer for {addr} {dst_key}"))?;
         borsh::to_writer(&mut manifest_writer, &dup_manifest)
             .with_context(|| format!("write manifest for {addr} {dst_key}"))?;
@@ -1234,6 +1326,27 @@ impl Engine {
         let (local_cache, addr, hashin) =
             (self.local_cache.clone(), addr.clone(), hashin.to_string());
         hcore::blocking::run(move || Self::read_manifest_from(&local_cache, &addr, &hashin)).await
+    }
+
+    /// [`read_manifest_blocking`](Self::read_manifest_blocking), plus whether
+    /// every host path the manifest declares still exists, in the same
+    /// blocking job (I4): the read that decides a local hit. An empty list
+    /// costs nothing past the read.
+    pub(crate) async fn probe_manifest_blocking(
+        &self,
+        addr: &Addr,
+        hashin: &str,
+    ) -> anyhow::Result<Option<(Manifest, crate::engine::host_paths::Liveness)>> {
+        let (local_cache, addr, hashin) =
+            (self.local_cache.clone(), addr.clone(), hashin.to_string());
+        hcore::blocking::run(move || {
+            let Some(manifest) = Self::read_manifest_from(&local_cache, &addr, &hashin)? else {
+                return Ok(None);
+            };
+            let live = crate::engine::host_paths::liveness(&addr, &manifest.host_paths)?;
+            Ok(Some((manifest, live)))
+        })
+        .await
     }
 
     /// The blobs a caller asking for `outputs` will actually read: its Output
@@ -1640,6 +1753,7 @@ mod tests {
                 content_type: ManifestArtifactContentType::Tar,
                 encoding: ManifestArtifactEncoding::None,
             }],
+            host_paths: Vec::new(),
         };
         let outputs = vec!["out".to_string()];
 
@@ -1887,7 +2001,13 @@ mod tests {
             .await
             .expect("probe")
             .expect("remote hit while intact");
-        let blob_names: Vec<String> = manifest.artifacts.iter().map(|a| a.name.clone()).collect();
+        // The probe returns the mirrored local manifest, whose V3 names are
+        // local only: the remote keys its objects by V2's name.
+        let blob_names: Vec<String> = manifest
+            .artifacts
+            .iter()
+            .map(|a| crate::engine::cache_codec::remote_entry_name(&a.name).to_string())
+            .collect();
         let removed = evict_objects(remote.path(), &blob_names);
         assert!(removed > 0, "test must actually evict a blob");
 
@@ -1954,7 +2074,7 @@ mod tests {
             .expect("manifest present");
         let names: Vec<_> = manifest.artifacts.iter().map(|a| a.name.as_str()).collect();
         // Raw artifacts are packed by heph and always compressed.
-        let expected: Vec<_> = (0..16).map(|i| format!("out_a{i:02}.tar.zst")).collect();
+        let expected: Vec<_> = (0..16).map(|i| format!("v3.out_a{i:02}.tar.zst")).collect();
         assert_eq!(
             names,
             expected.iter().map(String::as_str).collect::<Vec<_>>()
@@ -1999,7 +2119,7 @@ mod tests {
         let events = log.events.lock().unwrap();
         let manifest_open = events
             .iter()
-            .position(|(name, ev)| name == MANIFEST_V2 && *ev == "open")
+            .position(|(name, ev)| name == MANIFEST_CURRENT && *ev == "open")
             .expect("manifest opened");
         let artifact_dones = events
             .iter()
@@ -2135,7 +2255,7 @@ mod tests {
         assert!(
             engine
                 .local_cache
-                .exists_committed(&addr, "HASHIN_DURABLE", MANIFEST_V2)
+                .exists_committed(&addr, "HASHIN_DURABLE", MANIFEST_CURRENT)
                 .expect("exists_committed"),
             "the manifest is committed by the time cache_locally returns",
         );
@@ -2384,8 +2504,8 @@ mod tests {
             ManifestArtifactEncoding::None
         );
         assert_eq!(
-            manifest.artifacts[0].name, "out_out.tar.raw",
-            "a verbatim blob is adopted under its v2-only name"
+            manifest.artifacts[0].name, "v3.out_out.tar.raw",
+            "a verbatim blob is adopted under its V3 name"
         );
     }
 
@@ -2450,7 +2570,7 @@ mod tests {
 
         let addr = test_addr();
         let manifest = Manifest {
-            version: MANIFEST_V2_VERSION.to_string(),
+            version: MANIFEST_V3_VERSION.to_string(),
             target: addr.format(),
             created_at_nanos: 42,
             hashin: "H".to_string(),
@@ -2463,6 +2583,7 @@ mod tests {
                 content_type: ManifestArtifactContentType::Tar,
                 encoding: ManifestArtifactEncoding::Zstd,
             }],
+            host_paths: vec!["/nix/store/x".to_string()],
         };
         let encoded = borsh::to_vec(&manifest).expect("encode");
 
@@ -2478,12 +2599,12 @@ mod tests {
                 )
                 .expect("sqlite"),
             );
-            let mut w = cache.writer(&addr, "H", MANIFEST_V2).expect("writer");
+            let mut w = cache.writer(&addr, "H", MANIFEST_V3).expect("writer");
             w.write_all(&encoded).expect("write");
             w.commit().expect("commit");
             assert_eq!(
                 cache
-                    .reader(&addr, "H", MANIFEST_V2)
+                    .reader(&addr, "H", MANIFEST_V3)
                     .expect("reader")
                     .bytes
                     .is_some(),
@@ -2491,7 +2612,7 @@ mod tests {
                 "{path}: the fixture must take the intended path"
             );
 
-            let read = Engine::read_named_manifest(&cache, &addr, "H", MANIFEST_V2)
+            let read = Engine::read_named_manifest(&cache, &addr, "H", MANIFEST_V3)
                 .expect("read")
                 .expect("present");
             assert_eq!(borsh::to_vec(&read).expect("encode"), encoded, "{path}");
@@ -2611,7 +2732,7 @@ mod tests {
             .expect("cache_locally");
 
         assert_eq!(arts[0].encoding, ManifestArtifactEncoding::Zstd);
-        assert_eq!(arts[0].name, "out_out.tar.zst");
+        assert_eq!(arts[0].name, "v3.out_out.tar.zst");
         assert_eq!(arts[0].size, bytes.len() as u64, "the decoded size");
         assert!(src.exists(), "a compressed container is copied, not moved");
         let stored = engine
@@ -2879,7 +3000,7 @@ mod tests {
         .expect("blob writer");
         io::Write::write_all(&mut w, data).expect("write blob");
         w.commit().expect("commit blob");
-        let manifest = Manifest {
+        let manifest = ManifestV2 {
             version: "1.0.0".to_string(),
             target: addr.format(),
             created_at_nanos: 100,
@@ -2942,10 +3063,10 @@ mod tests {
         assert_eq!(via_seek, tar);
     }
 
-    /// Duplicating a v2 revision keeps each blob's encoding and name, and the
-    /// copy decodes to the original.
+    /// Duplicating a revision this version wrote keeps each blob's encoding and
+    /// name, and the copy decodes to the original.
     #[tokio::test]
-    async fn duplicating_a_v2_revision_keeps_its_encoding() {
+    async fn duplicating_a_v3_revision_keeps_its_encoding() {
         let (engine, _dir) = test_engine();
         let ctoken = StdCancellationToken::new();
         let addr = test_addr();
@@ -2975,8 +3096,8 @@ mod tests {
         let [(dup_name, dup)] = dup.as_slice() else {
             panic!("expected exactly one manifest for the duplicate");
         };
-        assert_eq!(*dup_name, MANIFEST_V2);
-        assert_eq!(dup.version, MANIFEST_V2_VERSION);
+        assert_eq!(*dup_name, MANIFEST_V3);
+        assert_eq!(dup.version, MANIFEST_V3_VERSION);
         assert_eq!(dup.artifacts[0].name, src.artifacts[0].name);
         assert_eq!(dup.artifacts[0].encoding, ManifestArtifactEncoding::Zstd);
 
@@ -3001,11 +3122,11 @@ mod tests {
         drain_reader(hartifactcontent::Content::reader(&arts[0]).expect("reader"))
     }
 
-    /// Duplicating a v1 revision writes a v2 one: every blob is copied to its
-    /// suffixed v2 name, since a v2 manifest naming a bare blob would name an
+    /// Duplicating a v1 revision writes a v3 one: every blob is copied to its
+    /// v3 name, since a v3 manifest naming a bare or a v2 blob would name an
     /// older heph's key.
     #[tokio::test]
-    async fn duplicating_a_v1_revision_writes_v2_names() {
+    async fn duplicating_a_v1_revision_writes_v3_names() {
         let (engine, dir) = test_engine();
         let ctoken = StdCancellationToken::new();
         let addr = test_addr();
@@ -3024,12 +3145,13 @@ mod tests {
         let [(dup_name, dup)] = dup.as_slice() else {
             panic!("expected exactly one manifest for the duplicate");
         };
-        assert_eq!(*dup_name, MANIFEST_V2);
-        assert_eq!(dup.version, MANIFEST_V2_VERSION);
+        assert_eq!(*dup_name, MANIFEST_V3);
+        assert_eq!(dup.version, MANIFEST_V3_VERSION);
         for a in &dup.artifacts {
             assert!(
-                cache_codec::V2_SUFFIXES.iter().any(|s| a.name.ends_with(s)),
-                "a v2 manifest names only suffixed blobs: {}",
+                a.name.starts_with(cache_codec::V3_PREFIX)
+                    && cache_codec::V2_SUFFIXES.iter().any(|s| a.name.ends_with(s)),
+                "a v3 manifest names only v3 blobs: {}",
                 a.name
             );
         }
@@ -3039,11 +3161,344 @@ mod tests {
             .await
             .expect("read duplicate")
             .expect("duplicate present");
-        assert_eq!(arts[0].name, "out_a.tar.raw");
+        assert_eq!(arts[0].name, "v3.out_a.tar.raw");
         assert_eq!(
             drain_reader(hartifactcontent::Content::reader(&arts[0]).expect("reader")),
             tar
         );
+    }
+
+    /// The hashin a [`plant_v2_fixture`] revision is stored under.
+    const V2_FIXTURE_HASHIN: &str = "V2FIXTURE";
+
+    /// The bytes the v2 fixture's one raw artifact `a` (group `out`, path
+    /// `a.txt`) was written from.
+    const V2_FIXTURE_DATA: &[u8] = b"v2 fixture bytes";
+
+    /// Plant what the previous heph wrote for `test_addr()` under
+    /// [`V2_FIXTURE_HASHIN`]: its `manifest-v2.borsh` and its one zstd blob
+    /// `out_a.tar.zst`, byte for byte as captured from it. Not rebuilt from
+    /// today's types, so a change to the v2 layout fails the tests that read it.
+    fn plant_v2_fixture(engine: &Engine) {
+        let addr = test_addr();
+        for (name, bytes) in [
+            (
+                "out_a.tar.zst",
+                include_bytes!("testdata/v2_revision/out_a.tar.zst").as_slice(),
+            ),
+            (
+                MANIFEST_V2,
+                include_bytes!("testdata/v2_revision/manifest-v2.borsh").as_slice(),
+            ),
+        ] {
+            let mut w = engine
+                .local_cache
+                .writer(&addr, V2_FIXTURE_HASHIN, name)
+                .expect("fixture writer");
+            io::Write::write_all(&mut w, bytes).expect("write fixture");
+            w.commit().expect("commit fixture");
+        }
+    }
+
+    /// A host path inside the test's own directory.
+    fn host_path(dir: &std::path::Path, name: &str) -> hplugin::driver::HostPath {
+        hplugin::driver::HostPath::from_path(&dir.join(name)).expect("host path")
+    }
+
+    /// An upgrade keeps a v2 cache warm: the bytes the previous heph wrote
+    /// still decode, as a hit, to what its run produced.
+    #[tokio::test]
+    async fn v2_manifest_still_hits() {
+        let (engine, _dir) = test_engine();
+        let ctoken = StdCancellationToken::new();
+        let addr = test_addr();
+        let def = linked_def(&addr);
+        plant_v2_fixture(&engine);
+
+        let (name, manifest) =
+            Engine::read_newest_manifest(&engine.local_cache, &addr, V2_FIXTURE_HASHIN)
+                .expect("read")
+                .expect("v2 manifest present");
+        assert_eq!(name, MANIFEST_V2);
+        assert_eq!(manifest.version, MANIFEST_V2_VERSION);
+        assert!(manifest.host_paths.is_empty());
+
+        let (arts, _) = engine
+            .artifacts_from_local_cache(&ctoken, &def, V2_FIXTURE_HASHIN, vec!["out".into()])
+            .await
+            .expect("read v2 revision")
+            .expect("v2 revision is a hit");
+        let [art] = arts.as_slice() else {
+            panic!("expected one artifact, got {}", arts.len());
+        };
+        assert_eq!(art.name, "out_a.tar.zst");
+        assert_eq!(art.hashout, "hashout-a");
+
+        // The same artifact written today decodes to the same bytes.
+        engine
+            .cache_locally(
+                &ctoken,
+                &addr,
+                "TODAY",
+                vec![raw_artifact("a", V2_FIXTURE_DATA)],
+                false,
+            )
+            .await
+            .expect("cache_locally");
+        let v2 = decoded_output(&engine, &def, V2_FIXTURE_HASHIN).await;
+        assert_eq!(v2, decoded_output(&engine, &def, "TODAY").await);
+        assert!(
+            v2.windows(V2_FIXTURE_DATA.len())
+                .any(|w| w == V2_FIXTURE_DATA),
+            "the v2 blob decodes to the artifact's bytes"
+        );
+    }
+
+    /// A key both the previous heph and this one wrote is read through its v3
+    /// manifest, whose blobs are its own: the v2 blob stays the previous heph's
+    /// bytes (I7).
+    #[tokio::test]
+    async fn v3_and_v2_both_present_reads_v3() {
+        let (engine, dir) = test_engine();
+        let ctoken = StdCancellationToken::new();
+        let addr = test_addr();
+        let def = linked_def(&addr);
+        plant_v2_fixture(&engine);
+        engine
+            .cache_locally_with_host_paths(
+                &ctoken,
+                &addr,
+                V2_FIXTURE_HASHIN,
+                vec![raw_artifact("a", b"v3 bytes, not the fixture's")],
+                &[host_path(dir.path(), "store")],
+                false,
+            )
+            .await
+            .expect("cache_locally");
+
+        let all = Engine::read_all_manifests(&engine.local_cache, &addr, V2_FIXTURE_HASHIN)
+            .expect("read manifests");
+        let [(MANIFEST_V3, v3), (MANIFEST_V2, v2)] = all.as_slice() else {
+            panic!("expected a v3 and a v2 manifest, newest first");
+        };
+        assert_eq!(v3.host_paths.len(), 1);
+        for a in &v3.artifacts {
+            assert!(a.name.starts_with(cache_codec::V3_PREFIX), "{}", a.name);
+            assert!(
+                v2.artifacts.iter().all(|b| b.name != a.name),
+                "v3 blob {} is a v2 name",
+                a.name
+            );
+        }
+
+        let (name, newest) =
+            Engine::read_newest_manifest(&engine.local_cache, &addr, V2_FIXTURE_HASHIN)
+                .expect("read")
+                .expect("present");
+        assert_eq!(name, MANIFEST_V3);
+        assert_eq!(newest.host_paths, v3.host_paths);
+        let out = decoded_output(&engine, &def, V2_FIXTURE_HASHIN).await;
+        assert!(
+            out.windows(8).any(|w| w == b"v3 bytes"),
+            "served the v3 blob"
+        );
+
+        // The v2 blob is untouched: still exactly the fixture's bytes.
+        let v2_blob = drain_reader(
+            engine
+                .local_cache
+                .reader(&addr, V2_FIXTURE_HASHIN, "out_a.tar.zst")
+                .expect("v2 blob")
+                .reader,
+        );
+        assert_eq!(
+            v2_blob,
+            include_bytes!("testdata/v2_revision/out_a.tar.zst").as_slice()
+        );
+    }
+
+    /// The host path list survives a write and a read on both durable
+    /// backends: sqlite rows, and files past the spill threshold.
+    #[tokio::test]
+    async fn v3_roundtrip_both_backends() {
+        for (backend, (engine, dir)) in [
+            ("sqlite", test_engine()),
+            ("spill", test_engine_spilling_at(1)),
+        ] {
+            let ctoken = StdCancellationToken::new();
+            let addr = test_addr();
+            let paths = hplugin::driver::HostPath::list([
+                dir.path().join("b").to_str().expect("utf-8"),
+                dir.path().join("a").to_str().expect("utf-8"),
+            ])
+            .expect("paths");
+            engine
+                .cache_locally_with_host_paths(
+                    &ctoken,
+                    &addr,
+                    "ROUNDTRIP",
+                    vec![raw_artifact("a", &[5u8; 4096])],
+                    &paths,
+                    false,
+                )
+                .await
+                .expect("cache_locally");
+
+            let (name, manifest) =
+                Engine::read_newest_manifest(&engine.local_cache, &addr, "ROUNDTRIP")
+                    .expect("read")
+                    .expect("present");
+            assert_eq!(name, MANIFEST_V3, "{backend}");
+            assert_eq!(manifest.version, MANIFEST_V3_VERSION, "{backend}");
+            assert_eq!(
+                manifest.host_paths,
+                paths
+                    .iter()
+                    .map(|p| p.as_str().to_owned())
+                    .collect::<Vec<_>>(),
+                "{backend}"
+            );
+            let out = decoded_output(&engine, &linked_def(&addr), "ROUNDTRIP").await;
+            assert!(
+                out.windows(64).any(|w| w == [5u8; 64]),
+                "{backend}: the blob reads back"
+            );
+        }
+    }
+
+    /// A duplicate (an `in_place` fixpoint key) and a tmp revision persisted to
+    /// the durable cache both keep the source's host paths: the list lives and
+    /// dies with its entry (I7).
+    #[tokio::test]
+    async fn duplicate_and_persist_carry_host_paths() {
+        let (engine, dir) = test_engine();
+        let ctoken = StdCancellationToken::new();
+        let addr = test_addr();
+        let paths = [host_path(dir.path(), "store")];
+        let want = vec![paths[0].as_str().to_owned()];
+
+        engine
+            .cache_locally_with_host_paths(
+                &ctoken,
+                &addr,
+                "PRIMARYHASH",
+                vec![raw_artifact("a", b"dup me")],
+                &paths,
+                false,
+            )
+            .await
+            .expect("cache_locally");
+        assert!(
+            engine
+                .duplicate_cache_revision(&addr, "PRIMARYHASH", "FIXPOINTKEY")
+                .expect("duplicate")
+        );
+        let (name, dup) = Engine::read_newest_manifest(&engine.local_cache, &addr, "FIXPOINTKEY")
+            .expect("read")
+            .expect("duplicate present");
+        assert_eq!(name, MANIFEST_V3);
+        assert_eq!(dup.host_paths, want);
+
+        let arts = engine
+            .cache_locally_with_host_paths(
+                &ctoken,
+                &addr,
+                "TMPHASH",
+                vec![raw_artifact("a", b"persist me")],
+                &paths,
+                true,
+            )
+            .await
+            .expect("cache_locally tmp");
+        // A tmp revision is keyed `{hashin}_{nanos}`; its artifacts carry the
+        // key, which is what the approval gate hands `persist_revision`.
+        let key = arts[0].hashin.as_str();
+        assert_ne!(key, "TMPHASH", "a tmp revision gets a unique key");
+        assert!(
+            engine.read_manifest(&addr, key).expect("read").is_none(),
+            "a tmp revision is not durable yet"
+        );
+        engine
+            .local_cache_tmp
+            .persist_revision(&addr, key)
+            .expect("persist");
+        let (name, persisted) = Engine::read_newest_manifest(&engine.local_cache, &addr, key)
+            .expect("read")
+            .expect("persisted");
+        assert_eq!(name, MANIFEST_V3);
+        assert_eq!(persisted.host_paths, want);
+    }
+
+    /// Duplicating a v2 revision writes a v3 one under v3 names, leaving the v2
+    /// blobs as the previous heph wrote them.
+    #[tokio::test]
+    async fn duplicating_a_v2_revision_writes_v3_names() {
+        let (engine, _dir) = test_engine();
+        let addr = test_addr();
+        let def = linked_def(&addr);
+        plant_v2_fixture(&engine);
+        assert!(
+            engine
+                .duplicate_cache_revision(&addr, V2_FIXTURE_HASHIN, "FIXPOINTKEY")
+                .expect("duplicate")
+        );
+        let (name, dup) = Engine::read_newest_manifest(&engine.local_cache, &addr, "FIXPOINTKEY")
+            .expect("read")
+            .expect("duplicate present");
+        assert_eq!(name, MANIFEST_V3);
+        assert_eq!(dup.artifacts[0].name, "v3.out_a.tar.zst");
+        assert!(dup.host_paths.is_empty());
+        assert_eq!(
+            decoded_output(&engine, &def, "FIXPOINTKEY").await,
+            decoded_output(&engine, &def, V2_FIXTURE_HASHIN).await
+        );
+    }
+
+    /// The upload backstop (I6): an entry that declares host paths never
+    /// reaches the remote, whatever the target's `cache.remote` said.
+    #[tokio::test]
+    async fn an_entry_with_host_paths_is_never_uploaded() {
+        let remote = tempfile::tempdir().expect("remote dir");
+        let remote_uri = format!("file://{}", remote.path().display());
+        let ctoken = StdCancellationToken::new();
+        let addr = test_addr();
+        let (engine, dir) = engine_with_remote(&remote_uri);
+        engine
+            .cache_locally_with_host_paths(
+                &ctoken,
+                &addr,
+                "HOSTLOCAL",
+                vec![raw_artifact("a", b"host-local payload")],
+                &[host_path(dir.path(), "store")],
+                false,
+            )
+            .await
+            .expect("cache_locally");
+        engine.upload_to_remote(&addr, "HOSTLOCAL").await;
+
+        let (other, _o) = engine_with_remote(&remote_uri);
+        assert!(
+            other
+                .remote_caches
+                .fetch_manifest(&ctoken, &addr, "HOSTLOCAL")
+                .await
+                .expect("fetch")
+                .is_none(),
+            "the remote holds no manifest for a host-local entry"
+        );
+        let mut stored = Vec::new();
+        let mut stack = vec![remote.path().to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).expect("read remote dir") {
+                let p = e.expect("entry").path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else {
+                    stored.push(p);
+                }
+            }
+        }
+        assert!(stored.is_empty(), "the remote received {stored:?}");
     }
 
     fn drain_reader(mut r: Box<dyn io::Read>) -> Vec<u8> {
@@ -3278,8 +3733,7 @@ mod tests {
                 std::fs::write(&out, b"pass")?;
                 return Ok(crate::engine::driver::RunResponse {
                     artifacts: vec![sandbox_file("main", "out", Type::Output, &out)],
-                    sandbox_cleanup: None,
-                    sandbox_guards: vec![],
+                    ..Default::default()
                 });
             }
             let log = r.sandbox_dir.join("log.txt");
@@ -3382,7 +3836,7 @@ mod tests {
                 ManifestArtifactEncoding::None,
                 ManifestArtifactEncoding::Zstd,
             ] {
-                let entry = cache_codec::entry_name(&base, &encoding);
+                let entry = cache_codec::v3_entry_name(&base, &encoding);
                 assert!(
                     !engine.local_cache.exists(&addr, &hashin, &entry)?,
                     "a failed run stored blob {entry}"
@@ -3411,7 +3865,7 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            [("main", "out_out.tar.zst")],
+            [("main", "v3.out_out.tar.zst")],
             "only what the pass returned"
         );
         Ok(())

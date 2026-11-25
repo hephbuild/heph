@@ -464,6 +464,8 @@ mod tests {
         let o = |addr: &str, outcome| BuildEventKind::CacheOutcome {
             addr: addr.into(),
             outcome,
+            reason: None,
+            stale_host_path: None,
         };
         t.apply(&BuildEvent {
             at_unix_ms: 1,

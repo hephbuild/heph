@@ -210,3 +210,95 @@ async fn output_is_nondeterministic_without_cache() {
         "without a cache, a fresh run must re-execute and produce a different output"
     );
 }
+
+/// Every object file under a `file://` cache directory, as `(file name, bytes)`.
+fn remote_objects(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(remote_objects(&path));
+        } else {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            out.push((name, std::fs::read(&path).expect("read remote object")));
+        }
+    }
+    out
+}
+
+/// The local cache moved to v3 manifests and v3 blob names; the remote did
+/// not (Decision 11). A v3 entry uploads under the previous version's keys —
+/// a `manifest-v2.borsh` naming `<base>.zst` / `<base>.raw` blobs, nothing
+/// `v3.` anywhere — so an older heph reads what this one uploads, and an entry
+/// laid out as the older heph lays it out is pulled by this one and hits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_names_unchanged_for_v3() {
+    let root = tempfile::tempdir().expect("root tempdir");
+    let remote = tempfile::tempdir().expect("remote tempdir");
+    let remote_uri = format!("file://{}", remote.path().display());
+    std::fs::create_dir_all(root.path().join("pkg")).expect("mkdir pkg");
+    std::fs::write(
+        root.path().join("pkg").join("BUILD"),
+        r#"target(name = "t", driver = "bash", run = "echo $RANDOM$RANDOM$RANDOM > $OUT", out = "out.txt")"#,
+    )
+    .expect("write BUILD");
+
+    let cold = build_engine(root.path(), &remote_uri);
+    let out_cold = run_drain(&cold, "//pkg:t").await;
+    drop(cold);
+
+    let objects = remote_objects(remote.path());
+    let manifests: Vec<&[u8]> = objects
+        .iter()
+        .filter(|(name, _)| name == "manifest-v2.borsh")
+        .map(|(_, bytes)| bytes.as_slice())
+        .collect();
+    let [manifest] = manifests.as_slice() else {
+        panic!("expected one remote manifest-v2.borsh, got {objects:?}");
+    };
+    let blobs: Vec<&str> = objects
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .filter(|name| *name != "manifest-v2.borsh")
+        .collect();
+    assert!(!blobs.is_empty(), "the cold run uploads its blobs");
+    for name in &blobs {
+        assert!(
+            !name.starts_with("v3.") && (name.ends_with(".zst") || name.ends_with(".raw")),
+            "remote blob {name} is not a v2 entry name"
+        );
+        assert!(
+            manifest.windows(name.len()).any(|w| w == name.as_bytes()),
+            "the remote manifest names blob {name}"
+        );
+    }
+    assert!(
+        !manifest.windows(3).any(|w| w == b"v3."),
+        "the remote manifest names no v3 blob"
+    );
+    assert!(
+        objects
+            .iter()
+            .all(|(name, _)| !name.contains("manifest-v3")),
+        "no v3 manifest on the remote"
+    );
+
+    // The remote now holds exactly what the previous version uploads. A cold
+    // local cache pulls it, mirrors it as v3, and hits rather than re-running
+    // the (random) target.
+    std::fs::remove_dir_all(HomeDir::for_tests(root.path()).join("cache")).expect("rm local cache");
+    let warm = build_engine(root.path(), &remote_uri);
+    assert_eq!(
+        run_drain(&warm, "//pkg:t").await,
+        out_cold,
+        "an entry pulled from the remote hits"
+    );
+    assert_eq!(
+        run_drain(&warm, "//pkg:t").await,
+        out_cold,
+        "and its mirrored v3 entry hits locally"
+    );
+}

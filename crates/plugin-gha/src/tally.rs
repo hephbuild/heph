@@ -469,7 +469,7 @@ impl Tally {
             }
             BuildEventKind::RemoteCacheMiss { .. } | BuildEventKind::LocalCacheMiss { .. } => {}
 
-            BuildEventKind::CacheOutcome { addr, outcome } => {
+            BuildEventKind::CacheOutcome { addr, outcome, .. } => {
                 self.cache.apply(&ev.kind);
                 if *outcome == CacheOutcomeKind::Miss {
                     self.bump_pkg_miss(addr);
@@ -483,6 +483,8 @@ impl Tally {
                     self.bump_pkg_miss(addr);
                 }
             }
+            // The miss it follows was counted by its `CacheOutcome`.
+            BuildEventKind::StaleOutputChanged { .. } => {}
 
             BuildEventKind::ResultLockWaitStart {
                 addr, holder_pid, ..
@@ -943,6 +945,8 @@ mod tests {
         BuildEventKind::CacheOutcome {
             addr: addr.into(),
             outcome,
+            reason: None,
+            stale_host_path: None,
         }
     }
 

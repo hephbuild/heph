@@ -443,7 +443,7 @@ impl ManagedDriver for Driver {
         )
         .context("write the digest output")?;
 
-        Ok(ManagedRunResponse { artifacts: vec![] })
+        Ok(ManagedRunResponse::default())
     }
 }
 

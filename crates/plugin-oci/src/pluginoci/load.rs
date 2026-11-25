@@ -552,7 +552,7 @@ impl ManagedDriver for Driver {
             .await
             .with_context(|| format!("write the loaded image ref to {ref_path:?}"))?;
 
-        Ok(ManagedRunResponse { artifacts: vec![] })
+        Ok(ManagedRunResponse::default())
     }
 }
 

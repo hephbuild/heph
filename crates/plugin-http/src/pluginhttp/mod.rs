@@ -288,7 +288,7 @@ impl ManagedDriver for Driver {
             None => err,
         })?;
 
-        Ok(ManagedRunResponse { artifacts: vec![] })
+        Ok(ManagedRunResponse::default())
     }
 }
 

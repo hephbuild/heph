@@ -730,7 +730,7 @@ impl ManagedDriver for GoToolchainDriver {
             () = ctoken.cancelled() => anyhow::bail!("go toolchain download cancelled"),
         }
 
-        Ok(ManagedRunResponse { artifacts: vec![] })
+        Ok(ManagedRunResponse::default())
     }
 }
 

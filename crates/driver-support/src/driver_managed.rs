@@ -52,8 +52,11 @@ pub struct ManagedRunRequest<'a, 'io> {
     pub sandbox_pkg_dir: PathBuf,
     pub inputs: Vec<ManagedRunInput>,
 }
+#[derive(Default)]
 pub struct ManagedRunResponse {
     pub artifacts: Vec<outputartifact::OutputArtifact>,
+    /// As [`RunResponse::host_paths`](hplugin::driver::RunResponse::host_paths).
+    pub host_paths: Vec<hplugin::driver::HostPath>,
 }
 
 /// For a driver that captures its tool's output whole instead of streaming it:

@@ -51,7 +51,7 @@ async fn run_pkg(engine: &Arc<Engine>) -> Vec<BuildEvent> {
 fn outcomes(events: &[BuildEvent]) -> BTreeMap<String, Vec<CacheOutcomeKind>> {
     let mut m: BTreeMap<String, Vec<CacheOutcomeKind>> = BTreeMap::new();
     for e in events {
-        if let BuildEventKind::CacheOutcome { addr, outcome } = &e.kind {
+        if let BuildEventKind::CacheOutcome { addr, outcome, .. } = &e.kind {
             m.entry(addr.clone()).or_default().push(*outcome);
         }
     }

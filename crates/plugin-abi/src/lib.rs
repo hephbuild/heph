@@ -32,6 +32,15 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// the new `x.y.0`. The 0.14.0 and 0.15.0 entries below predate it — they were
 /// additive minors, and there was no version check to read them.
 ///
+/// 0.21.3 (additive, a patch): host paths.
+/// `RunResponse.host_paths` / `ManagedRunResponse.host_paths` (2, `repeated
+/// string`) list the host paths a run's outputs name; the host stores them with
+/// the cache entry and treats a local hit whose path is gone as a miss. The host
+/// validates them on decode (absolute, normalized, UTF-8, at most 64) and
+/// refuses the run otherwise. The skew, both ways: a 0.21.2 plugin sends no
+/// list, as before; a 0.21.3 plugin on a 0.21.2 host has its list dropped. No
+/// plugin must be rebuilt.
+///
 /// 0.21.2 (a patch): stabby 72.1.8 → 72.1.16. stabby's ABI is unchanged
 /// (`abi=2.0.0` before and after) and no `#[stabby]` type, type report or
 /// layout differs between the two releases' `stabby-abi` / `stabby-macros`
@@ -337,7 +346,7 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// 0.3.0: `PluginComponents` gained a `hooks` field (a layout change to the
 /// create-entry struct) for the Hook plugin kind — a hard break, so every plugin
 /// must be rebuilt against this ABI.
-pub const ABI_SEMVER: &str = "0.21.2";
+pub const ABI_SEMVER: &str = "0.21.3";
 
 /// The start of the ABI lane this host loads: a plugin is accepted iff its
 /// version matches the caret requirement `^MIN_PLUGIN_ABI` — pre-1.0, one
@@ -354,7 +363,7 @@ pub const MIN_PLUGIN_ABI: &str = "0.21.0";
 
 /// [`ABI_SEMVER`], NUL-terminated: what a plugin's `heph_plugin_abi_semver`
 /// entry returns a pointer to. Bumped with it; a test holds the two equal.
-pub const ABI_SEMVER_C: &std::ffi::CStr = c"0.21.2";
+pub const ABI_SEMVER_C: &std::ffi::CStr = c"0.21.3";
 
 /// The first plugin ABI that reads `ManagedRunRequest.log_capture`. The host
 /// sends it only to a plugin at this version or later; an older one returns

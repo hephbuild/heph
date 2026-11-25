@@ -18,7 +18,9 @@
 
 use crate::engine::Engine;
 use crate::engine::link::LinkedTargetDef;
-use crate::engine::local_cache::{CacheArtifact, LocalCache, MANIFEST_V2, ManifestArtifactType};
+use crate::engine::local_cache::{
+    CacheArtifact, LocalCache, MANIFEST_CURRENT, ManifestArtifactType,
+};
 use crate::engine::provider::TargetSpec;
 use crate::engine::request_state::RequestState;
 use crate::engine::result::{OutputMatcher, PassthroughContent, ResultOptions};
@@ -240,7 +242,7 @@ impl Engine {
                 hcore::blocking::run(move || tmp.persist_revision(&a, &r)).await?;
                 // The manifest is a revision's last write, so once it is
                 // committed so are its blobs.
-                if !self.exists_local(&addr, revision, MANIFEST_V2).await? {
+                if !self.exists_local(&addr, revision, MANIFEST_CURRENT).await? {
                     anyhow::bail!("revision {revision} of {addr} is not in the local cache");
                 }
                 Ok(())
@@ -577,6 +579,59 @@ mod tests {
         assert_eq!(
             render(0, &[("//p:a", b"0123")]),
             "… notice truncated: 0 of 4 bytes shown; full text: heph inspect outputs //p:a\n"
+        );
+    }
+
+    /// A notice input read from a tmp revision is persisted, then found by
+    /// the name this version writes: a v3 manifest, not a v2 one that is never
+    /// there.
+    #[tokio::test]
+    async fn approval_persist_origin_v3_revision() {
+        use crate::engine::cache_test_support::{addr, test_engine};
+        use crate::engine::driver::outputartifact;
+        use crate::engine::local_cache::MANIFEST_V3;
+        use hcore::hartifactcontent::{Content, Origin};
+        use hcore::hasync::StdCancellationToken;
+
+        let (engine, _dir) = test_engine();
+        let a = addr("notice");
+        let arts = engine
+            .cache_locally(
+                &StdCancellationToken::new(),
+                &a,
+                "TMPREV",
+                vec![outputartifact::OutputArtifact {
+                    group: "out".to_string(),
+                    name: "n".to_string(),
+                    r#type: outputartifact::Type::Output,
+                    content: outputartifact::Content::Raw(outputartifact::ContentRaw {
+                        data: b"read me before approving".to_vec(),
+                        path: "NOTICE".to_string(),
+                        x: false,
+                    }),
+                    hashout: "hashout-n".to_string(),
+                }],
+                true,
+            )
+            .await
+            .expect("cache_locally tmp");
+
+        // The origin a notice input records: the artifact's own, which names
+        // the tmp revision's `{hashin}_{nanos}` key.
+        let origin = arts[0].origin().expect("a cache artifact has an origin");
+        let Origin::Cache { revision, .. } = &origin else {
+            panic!("a cache artifact's origin is a cache revision: {origin:?}");
+        };
+        engine
+            .persist_origin(&origin)
+            .await
+            .expect("persist_origin finds the v3 revision");
+        assert!(
+            engine
+                .local_cache
+                .exists(&a, revision, MANIFEST_V3)
+                .expect("exists"),
+            "the revision is durable under its v3 manifest"
         );
     }
 

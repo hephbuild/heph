@@ -731,7 +731,20 @@ fn start_outranks(stored_ms: Option<u64>, start_ms: u64) -> bool {
 }
 
 fn same_revision(a: &Manifest, b: &Manifest) -> anyhow::Result<bool> {
-    let key = |m: &Manifest| borsh::to_vec(&(&m.target, &m.hashin, &m.artifacts));
+    // Blob names compared as the remote stores them: a v2 entry an older heph
+    // mirrored and this version's v3 view of the same remote revision differ
+    // only in the v3 prefix.
+    let key = |m: &Manifest| {
+        let artifacts: Vec<ManifestArtifact> = m
+            .artifacts
+            .iter()
+            .map(|x| ManifestArtifact {
+                name: cache_codec::remote_entry_name(&x.name).to_owned(),
+                ..x.clone()
+            })
+            .collect();
+        borsh::to_vec(&(&m.target, &m.hashin, &artifacts))
+    };
     Ok(key(a).context("encoding a manifest")? == key(b).context("encoding a manifest")?)
 }
 

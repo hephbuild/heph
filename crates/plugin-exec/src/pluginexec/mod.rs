@@ -2784,7 +2784,7 @@ impl Driver {
             return if writes_log {
                 log_response(&output_log_path)
             } else {
-                Ok(ManagedRunResponse { artifacts: vec![] })
+                Ok(ManagedRunResponse::default())
             };
         }
         // A build target's `--shell` has no log: `output_log` is `None` there,
@@ -3147,7 +3147,7 @@ impl Driver {
         if writes_log {
             log_response(&output_log_path)
         } else {
-            Ok(ManagedRunResponse { artifacts: vec![] })
+            Ok(ManagedRunResponse::default())
         }
     }
 }
@@ -3172,6 +3172,7 @@ fn log_response(output_log_path: &std::path::Path) -> anyhow::Result<ManagedRunR
             }),
             hashout: "".to_string(),
         }],
+        ..Default::default()
     })
 }
 

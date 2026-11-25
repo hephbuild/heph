@@ -1072,3 +1072,73 @@ fn allotment_crosses_the_plugin_seam() {
         );
     }
 }
+
+/// **A cdylib driver's host paths reach the manifest across a real `dlopen`;
+/// a plugin reporting ABI 0.21.1 declares none.**
+///
+/// The test cdylib's `hostpaths` driver declares the path its target names
+/// and writes `run=<nanoseconds>`, so equal bytes are a hit and new bytes a
+/// re-run. At this ABI: a second run hits, and with the path deleted the entry
+/// is stale and re-runs. With `HEPH_TEST_PLUGIN_ABI_0_21_1` the cdylib reports
+/// 0.21.1 and behaves as a plugin from before host paths: the entry outlives
+/// the path.
+#[test]
+fn cdylib_host_paths_cross_abi() {
+    let dist = Dist::locate();
+    let dylib = dist.test_plugin("entrypoint");
+    assert!(dylib.is_file(), "missing {}", dylib.display());
+    for old in [false, true] {
+        let ws = Workspace::new().expect("workspace");
+        let manifest = ws.root().join("test-entrypoint-plugin.json");
+        let sum = sha256_file(&dylib).expect("hash test cdylib");
+        write_manifest(&manifest, "entrypoint_test", &dylib, Some(&sum)).expect("write manifest");
+        ws.config(&format!("{BASE_CONFIG}  - path: {}\n", manifest.display()))
+            .expect("write config");
+        let store = ws.root().join("store");
+        std::fs::create_dir_all(&store).expect("mkdir store");
+        let path = store.join("env");
+        std::fs::write(&path, b"").expect("create host path");
+        ws.write(
+            "app/BUILD",
+            &format!(
+                "target(name = \"t\", driver = \"entrypoint_test.hostpaths\", path = {:?})\n",
+                path.display().to_string()
+            ),
+        )
+        .expect("write BUILD");
+
+        let run = || -> String {
+            let mut cmd = ws.cmd(&dist, &["run", "//app:t", "--cat-out"]);
+            if old {
+                cmd.env("HEPH_TEST_PLUGIN_ABI_0_21_1", "1");
+            }
+            let child = cmd
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn heph");
+            let out = common::wait_output(child, common::RUN_DEADLINE).expect("heph run");
+            assert!(out.status.success(), "old={old}: {}", describe(&out));
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        let first = run();
+        assert!(first.starts_with("run="), "old={old}: {first}");
+        assert_eq!(run(), first, "old={old}: the second run hits");
+
+        std::fs::remove_file(&path).expect("delete host path");
+        let after = run();
+        if old {
+            assert_eq!(
+                after, first,
+                "a 0.21.1 plugin declared nothing: still a hit"
+            );
+        } else {
+            assert_ne!(
+                after, first,
+                "the declared path is gone: the entry is stale"
+            );
+        }
+    }
+}

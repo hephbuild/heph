@@ -807,7 +807,7 @@ target(name = "d", driver = "bash", out = "d.txt", deps = [":t"],
     let outcome: Vec<CacheOutcomeKind> = events
         .iter()
         .filter_map(|e| match &e.kind {
-            BuildEventKind::CacheOutcome { addr, outcome } if addr == "//p:d" => Some(*outcome),
+            BuildEventKind::CacheOutcome { addr, outcome, .. } if addr == "//p:d" => Some(*outcome),
             _ => None,
         })
         .collect();

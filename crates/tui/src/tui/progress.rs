@@ -219,6 +219,15 @@ pub struct BuildState {
     /// `CacheHitRebuilt` — the same fold the GHA report and telemetry use, so
     /// the summary line agrees with them. The tier events are not counted.
     cache: CacheCounts,
+    /// Targets whose local entry was stale and rebuilt, in arrival order:
+    /// the `CacheOutcome` reason, and whether the rebuild changed the output
+    /// (`StaleOutputChanged`). What the run summary names (see
+    /// [`Self::stale_lines`]). Only the first [`STALE_LINES_MAX`] are kept:
+    /// a run that collected a whole store would otherwise hold one per target.
+    stale: Vec<StaleEntry>,
+    /// The stale entries past [`STALE_LINES_MAX`], counted, and what the
+    /// summary says of the first of them.
+    stale_omitted: StaleOmitted,
     /// Server timestamp of the first event seen — the run's start anchor for the
     /// header's elapsed clock. `None` until any event lands.
     started_at_ms: Option<u64>,
@@ -271,6 +280,26 @@ pub struct BuildState {
     /// line's and the box's counts and gauges.
     dash: crate::tui::dashboard::Model,
 }
+
+/// One target whose local entry was stale, for the run summary.
+#[derive(Debug, Clone)]
+struct StaleEntry {
+    addr: String,
+    reason: String,
+    output_changed: bool,
+}
+
+/// The stale entries past [`STALE_LINES_MAX`]: how many, and the first one,
+/// as the summary's tail line names it.
+#[derive(Debug, Clone, Default)]
+struct StaleOmitted {
+    count: usize,
+    first: Option<String>,
+}
+
+/// The most stale entries the run summary names one by one; the rest are
+/// counted.
+const STALE_LINES_MAX: usize = 10;
 
 /// A root failure's reason, as the line's spotlight and the dashboard's
 /// PHASE column show it: `exit 101`, `timed out 10m`, or the error's first
@@ -592,14 +621,46 @@ impl BuildState {
             | BuildEventKind::RemoteCacheHit { .. }
             | BuildEventKind::RemoteCacheMiss { .. } => {}
             // The per-target hit bit is the model's; a retracted hit clears it.
-            BuildEventKind::CacheOutcome { .. } => {
+            BuildEventKind::CacheOutcome {
+                addr,
+                reason,
+                stale_host_path,
+                ..
+            } => {
                 self.cache.apply(&ev.kind);
+                if let Some(reason) = reason {
+                    if self.stale.len() < STALE_LINES_MAX {
+                        self.stale.push(StaleEntry {
+                            addr: addr.clone(),
+                            reason: self.redact.apply(reason).into_owned(),
+                            output_changed: false,
+                        });
+                    } else {
+                        let omitted = &mut self.stale_omitted;
+                        omitted.count += 1;
+                        if omitted.first.is_none() {
+                            // The path when the host sent it; a host that
+                            // predates the field still names the target.
+                            omitted.first = Some(match stale_host_path {
+                                Some(path) => {
+                                    format!("{addr}, host path {}", self.redact.apply(path))
+                                }
+                                None => addr.clone(),
+                            });
+                        }
+                    }
+                }
             }
             BuildEventKind::CacheHitRebuilt { .. } => {
                 // A rebuild whose `was` this build does not know moves nothing
                 // in the fold.
                 if CacheCounts::delta(&ev.kind).is_some() {
                     self.cache.apply(&ev.kind);
+                }
+            }
+            BuildEventKind::StaleOutputChanged { addr } => {
+                if let Some(s) = self.stale.iter_mut().rev().find(|s| s.addr == *addr) {
+                    s.output_changed = true;
                 }
             }
             BuildEventKind::ResultLockWaitStart {
@@ -846,6 +907,33 @@ impl BuildState {
             hits,
             misses,
         )
+    }
+
+    /// The run summary's lines for stale entries: one per target whose local
+    /// entry was rebuilt because it was stale, with the reason the engine
+    /// gave, and whether the rebuild changed its output (its dependents then
+    /// rebuilt too). At most [`STALE_LINES_MAX`], then a count of the rest.
+    /// Empty on a run with none, which is nearly every run.
+    pub fn stale_lines(&self) -> Vec<String> {
+        let mut lines: Vec<String> = self
+            .stale
+            .iter()
+            .map(|s| {
+                let changed = if s.output_changed {
+                    "; its output changed, so its dependents rebuilt too"
+                } else {
+                    ""
+                };
+                format!("{}: cache miss, {}{changed}", s.addr, s.reason)
+            })
+            .collect();
+        let StaleOmitted { count, first } = &self.stale_omitted;
+        if let Some(first) = first {
+            lines.push(format!(
+                "… and {count} more stale cache entries rebuilt, the first {first}"
+            ));
+        }
+        lines
     }
 
     /// Every cache that serialized somebody this run, as
@@ -2483,7 +2571,12 @@ impl TUIAppView for TuiProgressView {
     fn last_render(&self) {
         if let Some(line) = self.final_line_in(crate::tui::color::stderr_color_enabled()) {
             use std::io::Write;
-            drop(writeln!(std::io::stderr().lock(), "{line}"));
+            let mut err = std::io::stderr().lock();
+            // Stale entries first, so the final line stays the last one.
+            for stale in self.state.stale_lines() {
+                drop(writeln!(err, "{stale}"));
+            }
+            drop(writeln!(err, "{line}"));
         }
     }
 }
@@ -2821,6 +2914,9 @@ impl CIAppView for CiProgressView {
         for (scratch, waiters, total_ms) in self.core.state.scratch_wait_totals() {
             let total = human_elapsed(total_ms);
             tracing::info!("scratch {scratch} serialized {waiters} targets, {total} of total wait");
+        }
+        for line in self.core.state.stale_lines() {
+            tracing::info!("{line}");
         }
         tracing::info!("{}", self.summary_line());
     }
@@ -3631,6 +3727,93 @@ mod tests {
         assert_eq!(s.dash.in_flight_count(), 0);
     }
 
+    /// A stale entry is a miss in the counts, and the summary names it with
+    /// the engine's reason, and says when its rebuild changed the output.
+    /// Past the cap, the rest are counted.
+    #[test]
+    fn stale_entries_are_named_in_the_summary() {
+        let mut s = BuildState::new();
+        let stale = |addr: &str| BuildEventKind::CacheOutcome {
+            addr: addr.into(),
+            outcome: CacheOutcomeKind::Miss,
+            reason: Some("stale: host path /nix/store/x is gone".into()),
+            stale_host_path: Some("/nix/store/x".into()),
+        };
+        s.apply(&ev(1, stale("//a:same")));
+        s.apply(&ev(2, stale("//a:changed")));
+        s.apply(&ev(
+            3,
+            BuildEventKind::StaleOutputChanged {
+                addr: "//a:changed".into(),
+            },
+        ));
+        // A plain miss is not stale.
+        s.apply(&ev(
+            4,
+            BuildEventKind::CacheOutcome {
+                addr: "//a:cold".into(),
+                outcome: CacheOutcomeKind::Miss,
+                reason: None,
+                stale_host_path: None,
+            },
+        ));
+        assert!(
+            s.summary().ends_with("cache 0 hit / 3 miss"),
+            "{}",
+            s.summary()
+        );
+        assert_eq!(
+            s.stale_lines(),
+            vec![
+                "//a:same: cache miss, stale: host path /nix/store/x is gone".to_owned(),
+                "//a:changed: cache miss, stale: host path /nix/store/x is gone; \
+                 its output changed, so its dependents rebuilt too"
+                    .to_owned(),
+            ]
+        );
+
+        for i in 0..STALE_LINES_MAX {
+            s.apply(&ev(5, stale(&format!("//b:{i}"))));
+        }
+        let lines = s.stale_lines();
+        assert_eq!(lines.len(), STALE_LINES_MAX + 1);
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some(
+                "… and 2 more stale cache entries rebuilt, the first //b:8, host path /nix/store/x"
+            )
+        );
+        // Only the named entries are held, however many go stale.
+        assert_eq!(s.stale.len(), STALE_LINES_MAX);
+        // An omitted entry's changed output finds nothing to mark.
+        s.apply(&ev(
+            6,
+            BuildEventKind::StaleOutputChanged {
+                addr: "//b:9".into(),
+            },
+        ));
+        assert_eq!(s.stale_lines(), lines);
+        // A host predating `stale_host_path` still names the first omitted
+        // target.
+        let mut old = BuildState::new();
+        for i in 0..=STALE_LINES_MAX {
+            old.apply(&ev(
+                1,
+                BuildEventKind::CacheOutcome {
+                    addr: format!("//c:{i}"),
+                    outcome: CacheOutcomeKind::Miss,
+                    reason: Some("stale: host path /nix/store/y is gone".into()),
+                    stale_host_path: None,
+                },
+            ));
+        }
+        assert_eq!(
+            old.stale_lines().last().map(String::as_str),
+            Some("… and 1 more stale cache entries rebuilt, the first //c:10")
+        );
+        assert!(BuildState::new().stale_lines().is_empty());
+    }
+
     #[test]
     fn summary_counts_targets_not_tiers() {
         let mut s = BuildState::new();
@@ -3665,6 +3848,8 @@ mod tests {
             BuildEventKind::CacheOutcome {
                 addr: "//c:d".into(),
                 outcome: CacheOutcomeKind::Miss,
+                reason: None,
+                stale_host_path: None,
             },
         ));
         let summary = s.summary();
@@ -4766,6 +4951,8 @@ mod tests {
         BuildEventKind::CacheOutcome {
             addr: addr.into(),
             outcome: CacheOutcomeKind::LocalHit,
+            reason: None,
+            stale_host_path: None,
         }
     }
 
@@ -4773,6 +4960,8 @@ mod tests {
         BuildEventKind::CacheOutcome {
             addr: addr.into(),
             outcome: CacheOutcomeKind::RemoteHit,
+            reason: None,
+            stale_host_path: None,
         }
     }
 
@@ -5739,6 +5928,8 @@ mod tests {
                 ev(BuildEventKind::CacheOutcome {
                     addr: a.clone(),
                     outcome: hcore::events::CacheOutcomeKind::LocalHit,
+                    reason: None,
+                    stale_host_path: None,
                 });
             } else {
                 ev(BuildEventKind::ExecuteStart {

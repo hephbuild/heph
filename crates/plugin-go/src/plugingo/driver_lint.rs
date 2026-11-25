@@ -789,7 +789,7 @@ impl ManagedDriver for GoLintGateDriver {
                 findings.join("\n")
             );
         }
-        Ok(ManagedRunResponse { artifacts: vec![] })
+        Ok(ManagedRunResponse::default())
     }
 }
 
@@ -1110,7 +1110,7 @@ impl ManagedDriver for GoLintFixDriver {
             }
         }
 
-        Ok(ManagedRunResponse { artifacts: vec![] })
+        Ok(ManagedRunResponse::default())
     }
 }
 

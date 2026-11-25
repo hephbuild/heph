@@ -958,6 +958,8 @@ mod tests {
         let hit = |addr: &str| BuildEventKind::CacheOutcome {
             addr: addr.into(),
             outcome: CacheOutcomeKind::LocalHit,
+            reason: None,
+            stale_host_path: None,
         };
         let matched = [
             "//p:ok",

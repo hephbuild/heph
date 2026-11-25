@@ -1,6 +1,6 @@
 use crate::engine::local_cache::{
-    EntryWriter, Existence, LocalCache, MANIFESTS, Manifest, NotFoundError, SizedReader,
-    TargetStream,
+    EntryWriter, Existence, LocalCache, MANIFESTS, NotFoundError, SizedReader, TargetStream,
+    decode_manifest,
 };
 use anyhow::{Context, Result};
 use hcore::hartifactcontent;
@@ -367,7 +367,7 @@ fn read_any_target_addr(target_dir: &Path) -> Result<Option<String>> {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(e).with_context(|| format!("read {manifest_path:?}")),
             };
-            if let Ok(manifest) = borsh::from_slice::<Manifest>(&buf) {
+            if let Ok(manifest) = decode_manifest(name, &buf) {
                 return Ok(Some(manifest.target));
             }
         }
@@ -556,18 +556,11 @@ mod tests {
             "t".to_string(),
             Default::default(),
         );
-        // One revision per manifest name: the addr is recovered from either.
-        for (h, manifest_name) in [("h1", MANIFESTS[0]), ("h2", MANIFESTS[1])] {
-            let manifest = Manifest {
-                version: "1.0.0".to_string(),
-                target: addr.format(),
-                created_at_nanos: 0,
-                hashin: h.to_string(),
-                artifacts: vec![],
-            };
-            let mut w = cache.writer(&addr, h, manifest_name)?;
-            borsh::to_writer(&mut w, &manifest)?;
-            w.commit()?;
+        // One revision per manifest name, each in its own layout: the addr is
+        // recovered from any of them.
+        let hashins = ["h1", "h2", "h3"];
+        for (h, manifest_name) in hashins.into_iter().zip(MANIFESTS) {
+            write_manifest(&cache, &addr, h, manifest_name)?;
         }
 
         // One distinct target, recovered from the manifest's `target` field.
@@ -576,7 +569,58 @@ mod tests {
 
         let mut entries = cache.list_target_entries(&addr)?;
         entries.sort();
-        assert_eq!(entries, vec!["h1".to_string(), "h2".to_string()]);
+        assert_eq!(entries, hashins.map(String::from));
+        Ok(())
+    }
+
+    /// Plant an empty revision of `addr` under `manifest_name`, in that name's
+    /// borsh layout.
+    fn write_manifest(
+        cache: &LocalCacheFS,
+        addr: &Addr,
+        hashin: &str,
+        manifest_name: &str,
+    ) -> Result<()> {
+        use crate::engine::local_cache::{MANIFEST_V3, Manifest, ManifestV2};
+        let v2 = ManifestV2 {
+            version: "1.0.0".to_string(),
+            target: addr.format(),
+            created_at_nanos: 0,
+            hashin: hashin.to_string(),
+            artifacts: vec![],
+        };
+        let mut w = cache.writer(addr, hashin, manifest_name)?;
+        if manifest_name == MANIFEST_V3 {
+            let v3 = Manifest {
+                host_paths: vec!["/nix/store/x".to_string()],
+                ..Manifest::from(v2)
+            };
+            borsh::to_writer(&mut w, &v3)?;
+        } else {
+            borsh::to_writer(&mut w, &v2)?;
+        }
+        w.commit()?;
+        Ok(())
+    }
+
+    /// A target whose only revisions are v3 is listed: GC reaches it. A v3
+    /// manifest does not decode in the v2 layout (it has a trailing list), so
+    /// a reader that tried only that layout would skip the target.
+    #[test]
+    fn read_any_target_addr_lists_v3() -> Result<()> {
+        use crate::engine::local_cache::MANIFEST_V3;
+        let dir = tempdir()?;
+        let cache = LocalCacheFS::new(PathBuf::from(dir.path()))?;
+        let addr = hmodel::htaddr::Addr::new(
+            hmodel::htpkg::PkgBuf::from("pkg"),
+            "v3only".to_string(),
+            Default::default(),
+        );
+        write_manifest(&cache, &addr, "h1", MANIFEST_V3)?;
+        write_manifest(&cache, &addr, "h2", MANIFEST_V3)?;
+
+        let targets = cache.list_targets()?.collect::<Result<Vec<_>>>()?;
+        assert_eq!(targets, vec![addr.format()]);
         Ok(())
     }
 

@@ -7,7 +7,7 @@
 //! the two suites cannot drift into disagreeing about what a cache revision is.
 
 use crate::engine::local_cache::{
-    MANIFEST_V2, MANIFEST_V2_VERSION, MANIFESTS, Manifest, ManifestArtifact,
+    MANIFEST_CURRENT, MANIFEST_V3_VERSION, MANIFESTS, Manifest, ManifestArtifact,
     ManifestArtifactContentType, ManifestArtifactEncoding, ManifestArtifactType,
 };
 use crate::engine::result_lock::TargetGuard;
@@ -62,7 +62,8 @@ pub(crate) fn write_revision(
         w.commit().expect("commit artifact");
     }
     let manifest = Manifest {
-        version: MANIFEST_V2_VERSION.to_string(),
+        version: MANIFEST_V3_VERSION.to_string(),
+        host_paths: Vec::new(),
         target: addr.format(),
         created_at_nanos: created,
         hashin: hashin.to_string(),
@@ -81,7 +82,7 @@ pub(crate) fn write_revision(
     };
     let mut w = engine
         .local_cache
-        .writer(addr, hashin, MANIFEST_V2)
+        .writer(addr, hashin, MANIFEST_CURRENT)
         .expect("manifest writer");
     borsh::to_writer(&mut w, &manifest).expect("write manifest");
     w.commit().expect("commit manifest");
@@ -89,7 +90,7 @@ pub(crate) fn write_revision(
     assert!(
         engine
             .local_cache
-            .exists(addr, hashin, MANIFEST_V2)
+            .exists(addr, hashin, MANIFEST_CURRENT)
             .expect("exists")
     );
 }

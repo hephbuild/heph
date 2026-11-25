@@ -363,7 +363,7 @@ impl ManagedDriver for GoFormatDriver {
         let (bin, env) = govet_bin_and_config(&req, &def.deps)?;
         let files = def.deps.staged_paths(&req, "")?;
         if files.is_empty() {
-            return Ok(ManagedRunResponse { artifacts: vec![] });
+            return Ok(ManagedRunResponse::default());
         }
         let mut args = vec![OsString::from("-format")];
         if def.check {

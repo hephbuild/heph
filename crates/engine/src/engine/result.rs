@@ -1690,6 +1690,60 @@ struct ExecuteOptions<'a> {
     no_scratch: bool,
 }
 
+/// What [`Engine::probe_cache_manifest`] found for `(addr, hashin)` locally.
+pub(crate) enum Probe {
+    /// No manifest.
+    Absent,
+    /// A manifest whose declared host paths all exist: a local hit.
+    Live(Arc<Manifest>),
+    /// A manifest with a declared host path gone (I3, I5): a miss with a
+    /// reason. The manifest rides along so a re-run can tell whether its
+    /// outputs differ from the entry it replaces.
+    Stale {
+        path: String,
+        manifest: Arc<Manifest>,
+    },
+}
+
+/// I5, Decision 12: a stale entry's re-run whose outputs differ from those of
+/// the entry it replaced is logged at `info` and named in the run summary
+/// (`StaleOutputChanged`). Its dependents rebuild; a nix re-run of a pinned
+/// ref is expected to come back unchanged, while one of an unlocked ref may
+/// resolve it again and differ.
+fn report_stale_rebuild(
+    rs: &RequestState,
+    addr: String,
+    path: &str,
+    old: &Manifest,
+    new: &[ArtifactMeta],
+) {
+    let mut was: Vec<&str> = old
+        .artifacts
+        .iter()
+        .filter(|a| {
+            matches!(
+                a.r#type,
+                ManifestArtifactType::Output | ManifestArtifactType::SupportFile
+            )
+        })
+        .map(|a| a.hashout.as_str())
+        .collect();
+    let mut now: Vec<&str> = new.iter().map(|m| m.hashout.as_str()).collect();
+    was.sort_unstable();
+    now.sort_unstable();
+    if was == now {
+        return;
+    }
+    tracing::info!(
+        addr = %addr,
+        path,
+        was = ?was,
+        now = ?now,
+        "rebuilt a stale cache entry and its output changed: its dependents rebuild too"
+    );
+    rs.emit(crate::engine::event::BuildEventKind::StaleOutputChanged { addr });
+}
+
 /// Output-independent result of the per-addr lock dance, single-flighted by
 /// `mem_locked_result` (keyed by `Addr` alone). Every `(outputs, is_top)`
 /// memoizer cell of one addr awaits the same cell and shares its single riding
@@ -4231,7 +4285,10 @@ impl Engine {
                 self.result_lock().read(addr, hashin, ctoken),
             )
             .await?;
-        if let Some(manifest) = self.probe_cache_manifest(&rs, addr, hashin).await? {
+        // A stale entry falls through as a miss: a hash-only request answers
+        // "unknown" below, running nothing and leaving the entry alone (I3),
+        // and anything else re-probes under the write lock and rebuilds.
+        if let Probe::Live(manifest) = self.probe_cache_manifest(&rs, addr, hashin).await? {
             // A. Hit — share this read; each caller reads its own outputs under
             // it and offers the codegen write-back / fixpoint in
             // `execute_and_cache` (once per addr, under this riding read). The
@@ -4292,8 +4349,10 @@ impl Engine {
                                 .await
                                 .with_context(|| format!("probing the local cache for {addr}"))
                             {
-                                Ok(Some(manifest)) => Some(Ok((manifest, read))),
-                                Ok(None) => None,
+                                Ok(Probe::Live(manifest)) => Some(Ok((manifest, read))),
+                                // Stale: still a miss, so keep contending; the
+                                // winner's re-check rebuilds it.
+                                Ok(Probe::Absent | Probe::Stale { .. }) => None,
                                 Err(e) => Some(Err(e)),
                             },
                         )
@@ -4323,13 +4382,29 @@ impl Engine {
             match self.probe_cache_manifest(&rs, addr, hashin).await? {
                 // Same as branch A: where the blobs live stays unresolved until a
                 // caller needs them.
-                Some(manifest) => (
+                Probe::Live(manifest) => (
                     None,
                     Some(manifest),
                     RemoteCell::new(),
                     (!rs.hash_only()).then_some(hcore::events::CacheHitKind::Local),
                 ),
-                None => {
+                probe @ (Probe::Absent | Probe::Stale { .. }) => {
+                    // A stale entry (I5) is a miss with a reason. Its manifest
+                    // is deleted here, under this write lock and before the
+                    // re-run: a re-run cut short (cancelled, or a write error)
+                    // after committing some of its blobs would otherwise
+                    // leave the old manifest naming the new bytes under the
+                    // old `hashout`s, and live again once the path is back.
+                    // Deleted, the entry is absent until a re-run commits a
+                    // whole one. The manifest stays in memory for
+                    // `report_stale_rebuild`.
+                    let stale = match probe {
+                        Probe::Stale { path, manifest } => {
+                            self.delete_stale_manifest(addr, hashin).await?;
+                            Some((path, manifest))
+                        }
+                        _ => None,
+                    };
                     // The settled local miss: both probes came back empty under the
                     // write lock, so this fires exactly once per cold target — the
                     // probe itself stays silent on a miss (see
@@ -4360,8 +4435,14 @@ impl Engine {
                     // `/nix/store/...` wrapper paths) set it false so a wrapper built
                     // on one machine is never pulled onto another that lacks that
                     // store path — which would `exec` a missing path (status 127).
-                    let remote_attempted =
-                        def.target.cache.remote_enabled && self.remote_caches.has_readable();
+                    //
+                    // After a stale miss the remote is skipped for this run
+                    // (I6): what it holds names no host path, so it is either
+                    // a revision built on another machine or the same stale
+                    // output, and neither is checked here.
+                    let remote_attempted = stale.is_none()
+                        && def.target.cache.remote_enabled
+                        && self.remote_caches.has_readable();
                     let located = if remote_attempted {
                         let span_addr = addr_s.clone();
                         // Every blob a caller of this addr could read must still be on
@@ -4400,6 +4481,8 @@ impl Engine {
                             rs.emit(crate::engine::event::BuildEventKind::CacheOutcome {
                                 addr: addr_s,
                                 outcome: hcore::events::CacheOutcomeKind::RemoteHit,
+                                reason: None,
+                                stale_host_path: None,
                             });
                             // The one place the answer is already in hand: this cell
                             // just located the revision, so the lazy cell starts
@@ -4423,13 +4506,20 @@ impl Engine {
                             // The target's outcome, remote or not, and before the
                             // build: a build that then fails still had to build.
                             rs.emit(crate::engine::event::BuildEventKind::CacheOutcome {
-                                addr: addr_s,
+                                addr: addr_s.clone(),
                                 outcome: hcore::events::CacheOutcomeKind::Miss,
+                                reason: stale
+                                    .as_ref()
+                                    .map(|(path, _)| crate::engine::host_paths::stale_reason(path)),
+                                stale_host_path: stale.as_ref().map(|(path, _)| path.clone()),
                             });
                             let (cached, meta) = self
                                 .clone()
                                 .execute_and_cache_inner(rs.clone(), opts)
                                 .await?;
+                            if let Some((path, old)) = &stale {
+                                report_stale_rebuild(&rs, addr_s, path, old, &meta);
+                            }
                             (
                                 Some(Arc::new(ExecutedArtifacts { cached, meta })),
                                 None,
@@ -5309,13 +5399,32 @@ impl Engine {
                     // `cache_locally`, which reads the outputs out of the sandbox
                     // — and `_live_log` too, since it reads the run's live log,
                     // which is unlinked once the entry holds it.
-                    let (artifacts, sandbox_teardown, sandbox_guards, _execute_guard, _live_log) = engine
+                    let crate::engine::execute::Executed {
+                        artifacts,
+                        host_paths,
+                        teardown: sandbox_teardown,
+                        sandbox_guards,
+                        execute_guard: _execute_guard,
+                        live_log: _live_log,
+                    } = engine
                         .clone()
-                        .execute(rs.clone(), &addr, &spec, &def, &hashin, interactive, shell, no_scratch, false)
+                        .execute(
+                            rs.clone(),
+                            &addr,
+                            &spec,
+                            &def,
+                            &hashin,
+                            interactive,
+                            crate::engine::execute::ExecuteFlags {
+                                shell,
+                                no_scratch,
+                                outputs_are_material: false,
+                            },
+                        )
                         .await
                         .with_context(|| format!("execute {addr}"))?;
 
-                    let artifacts_meta = match artifacts
+                    let checked = match artifacts
                         .iter()
                         .filter(|a| matches!(
                             a.r#type,
@@ -5325,7 +5434,22 @@ impl Engine {
                         .collect::<anyhow::Result<Vec<_>>>()
                         .with_context(|| format!("read artifact metas for {addr}"))
                     {
-                        Ok(metas) => metas,
+                        // A run that writes no durable entry (caching off, a
+                        // shell) has nowhere to keep its host paths: ignored.
+                        Ok(metas) if use_tmp_cache => Ok((metas, Vec::new())),
+                        // I6 and I8, before anything is written: a refused
+                        // list leaves no manifest behind.
+                        Ok(metas) => crate::engine::host_paths::checked_for_entry(
+                            &addr,
+                            def.target.cache.remote_enabled,
+                            host_paths,
+                        )
+                        .await
+                        .map(|host_paths| (metas, host_paths)),
+                        Err(err) => Err(err),
+                    };
+                    let (artifacts_meta, host_paths) = match checked {
+                        Ok(checked) => checked,
                         Err(err) => {
                             // A target failure, like any `Err` leaving the
                             // execute: nothing reads the sandbox past this
@@ -5333,9 +5457,10 @@ impl Engine {
                             // as on the completion path below; under
                             // `--keep-failed-sandboxes` it stays on disk for
                             // a post-mortem of the artifacts it failed to
-                            // hash. A bare `?` here would fall into the drop
-                            // path, which reclaims — that path must mean
-                            // cancellation only.
+                            // hash, or of the host paths it declared. A bare
+                            // `?` here would fall into the drop path, which
+                            // reclaims — that path must mean cancellation
+                            // only.
                             drop(sandbox_guards);
                             let fate = if engine.cfg.keep_failed_sandboxes {
                                 let kept = engine.sandbox_on_disk(sandbox_teardown.dir());
@@ -5402,11 +5527,12 @@ impl Engine {
                                     error: error.map(crate::engine::event::ErrorDetail::into_message),
                                 }
                             },
-                            engine.cache_locally(
+                            engine.cache_locally_with_host_paths(
                                 rs.ctoken(),
                                 &addr,
                                 &hashin,
                                 to_cache,
+                                &host_paths,
                                 use_tmp_cache,
                             ),
                         )
@@ -5970,18 +6096,33 @@ impl Engine {
     /// Only *absence* is fail-soft. A transfer that starts and then errors, or a
     /// temp-dir failure, propagates out of `pull_missing_blobs` and fails the run;
     /// it is not turned into a rebuild.
+    ///
+    /// **Liveness (I3, I4).** This is the one place a local hit is decided, so
+    /// it is where the host paths an entry declares are checked: one `stat`
+    /// each, in the manifest read's blocking job. An entry with a path gone is
+    /// [`Probe::Stale`], never a hit — before `LocalCacheHit` and before any
+    /// dependent folds its `hashout`. A stat error other than "gone" fails the
+    /// target.
     async fn probe_cache_manifest(
         &self,
         rs: &Arc<RequestState>,
         addr: &Addr,
         hashin: &str,
-    ) -> anyhow::Result<Option<Arc<Manifest>>> {
-        let hit = self
-            .read_manifest_blocking(rs.ctoken(), addr, hashin)
-            .await?
-            .map(Arc::new);
-        if hit.is_some() && !rs.hash_only() {
-            // Every `Some` returned here settles the cell as a local hit — the
+    ) -> anyhow::Result<Probe> {
+        use crate::engine::host_paths::Liveness;
+        let probe = match self.probe_manifest_blocking(addr, hashin).await? {
+            None => Probe::Absent,
+            Some((manifest, Liveness::Live)) => Probe::Live(Arc::new(manifest)),
+            Some((manifest, Liveness::Stale { path })) => {
+                tracing::debug!(%addr, hashin, path, "local cache entry is stale: a host path it declares is gone");
+                Probe::Stale {
+                    path,
+                    manifest: Arc::new(manifest),
+                }
+            }
+        };
+        if matches!(probe, Probe::Live(_)) && !rs.hash_only() {
+            // Every `Live` returned here settles the cell as a local hit — the
             // optimistic probe, the contended late hit and the write-lock
             // re-check all return it straight away — so the target's outcome
             // goes out with the tier event, once.
@@ -5992,9 +6133,23 @@ impl Engine {
             rs.emit(crate::engine::event::BuildEventKind::CacheOutcome {
                 addr: addr_s,
                 outcome: hcore::events::CacheOutcomeKind::LocalHit,
+                reason: None,
+                stale_host_path: None,
             });
         }
-        Ok(hit)
+        Ok(probe)
+    }
+
+    /// Delete the manifest of a [`Probe::Stale`] entry. Only a
+    /// [`MANIFEST_V3`](crate::engine::local_cache::MANIFEST_V3) declares host
+    /// paths, so it is the only manifest an entry can be stale by. The caller
+    /// holds the entry's write lock (I5): no reader is riding it and no other
+    /// writer is replacing it. Its blobs are left to GC.
+    async fn delete_stale_manifest(&self, addr: &Addr, hashin: &str) -> anyhow::Result<()> {
+        let (cache, a, h) = (self.local_cache.clone(), addr.clone(), hashin.to_owned());
+        hcore::blocking::run(move || cache.delete(&a, &h, crate::engine::local_cache::MANIFEST_V3))
+            .await
+            .with_context(|| format!("deleting the stale cache entry of {addr}"))
     }
 
     /// Public, tracked. Records `parent → addr` in `dep_dag` and updates `parent`
@@ -8281,7 +8436,7 @@ mod tests {
             &self,
             key: &str,
         ) -> anyhow::Result<Option<Pin<Box<dyn tokio::io::AsyncRead + Send>>>> {
-            if !key.ends_with(crate::engine::local_cache::MANIFEST_V2) {
+            if !key.ends_with(crate::engine::remote_cache::REMOTE_MANIFEST) {
                 // The blob is gone, even though `exists` still claims otherwise.
                 return Ok(None);
             }
@@ -8373,7 +8528,7 @@ mod tests {
         assert_eq!(
             count_kind(&events, |e| matches!(
                 e,
-                BuildEventKind::CacheOutcome { addr, outcome: hcore::events::CacheOutcomeKind::RemoteHit }
+                BuildEventKind::CacheOutcome { addr, outcome: hcore::events::CacheOutcomeKind::RemoteHit, .. }
                     if addr == "//pkg:t"
             )),
             1,
@@ -8417,7 +8572,7 @@ mod tests {
     /// the hit degrades to a rebuild like any other unobtainable blob.
     #[tokio::test]
     async fn local_v1_manifest_over_a_v2_remote_rebuilds() -> anyhow::Result<()> {
-        use crate::engine::local_cache::{MANIFEST_V1, Manifest};
+        use crate::engine::local_cache::{MANIFEST_V1, ManifestV2};
 
         let remote = tempdir()?;
         let remote_uri = format!("file://{}", remote.path().display());
@@ -8445,15 +8600,19 @@ mod tests {
 
         // What an older heph's lazy mirror left behind: a v1 manifest with the
         // same hashouts, bare names, raw encoding, and no blobs.
-        let v1 = Manifest {
+        let v1 = ManifestV2 {
             version: "1.0.0".to_string(),
+            target: seeded.target.clone(),
+            created_at_nanos: seeded.created_at_nanos,
+            hashin: seeded.hashin.clone(),
             artifacts: seeded
                 .artifacts
                 .iter()
                 .map(|a| {
+                    let v2_name = crate::engine::cache_codec::remote_entry_name(&a.name);
                     let bare = crate::engine::cache_codec::V2_SUFFIXES
                         .iter()
-                        .find_map(|s| a.name.strip_suffix(s))
+                        .find_map(|s| v2_name.strip_suffix(s))
                         .expect("every v2 name is suffixed");
                     crate::engine::local_cache::ManifestArtifact {
                         name: bare.to_string(),
@@ -8462,7 +8621,6 @@ mod tests {
                     }
                 })
                 .collect(),
-            ..seeded.clone()
         };
         let (engine, _home) = engine_with_remote_bash(vec![out_target("//pkg:t")], &remote_uri)?;
         let mut w = engine.local_cache.writer(&addr, hashin, MANIFEST_V1)?;
@@ -8520,7 +8678,7 @@ mod tests {
             &self,
             key: &str,
         ) -> anyhow::Result<Option<Pin<Box<dyn tokio::io::AsyncRead + Send>>>> {
-            if key.ends_with(crate::engine::local_cache::MANIFEST_V2) {
+            if key.ends_with(crate::engine::remote_cache::REMOTE_MANIFEST) {
                 self.metadata.fetch_add(1, Ordering::SeqCst);
             } else {
                 self.blobs.fetch_add(1, Ordering::SeqCst);
@@ -9011,7 +9169,7 @@ mod tests {
             if path.is_dir() {
                 removed += evict_remote_blobs(&path);
             } else if path.file_name().and_then(|n| n.to_str())
-                != Some(crate::engine::local_cache::MANIFEST_V2)
+                != Some(crate::engine::remote_cache::REMOTE_MANIFEST)
             {
                 std::fs::remove_file(&path).expect("evict blob");
                 removed += 1;
@@ -9035,7 +9193,7 @@ mod tests {
                 continue;
             }
             if path.file_name().and_then(|n| n.to_str())
-                != Some(crate::engine::local_cache::MANIFEST_V2)
+                != Some(crate::engine::remote_cache::REMOTE_MANIFEST)
             {
                 continue;
             }
@@ -11884,7 +12042,7 @@ mod tests {
     ) -> usize {
         count_kind(
             events,
-            |e| matches!(e, BuildEventKind::CacheOutcome { addr: a, outcome: o } if a == addr && *o == outcome),
+            |e| matches!(e, BuildEventKind::CacheOutcome { addr: a, outcome: o, .. } if a == addr && *o == outcome),
         )
     }
 
@@ -12614,7 +12772,7 @@ mod tests {
                         Ok(())
                     }) as crate::engine::driver::SandboxCleanupJob
                 }),
-                sandbox_guards: vec![],
+                ..Default::default()
             })
         }
         async fn run_shell<'a, 'io>(
@@ -12755,6 +12913,608 @@ mod tests {
         };
         engine.register_provider(move |_| Box::new(OneTargetProvider { spec }))?;
         Ok((Arc::new(engine), dir, addr))
+    }
+
+    // ----------------------------------------------------------------------
+    // Declared host paths: the write check (I6, I8) and the stale miss (I4, I5).
+    // ----------------------------------------------------------------------
+
+    /// Raw driver whose run declares `paths` as host paths. They are kept raw
+    /// and turned into `HostPath`s inside `run`, so a path of the wrong shape
+    /// fails the run the way it fails a real driver's.
+    struct HostPathDriver {
+        exec_count: SArc<AtomicUsize>,
+        paths: Vec<std::path::PathBuf>,
+        cache: CacheConfig,
+        /// Each run's output is `out-<n>`, `n` the run's index, instead of a
+        /// constant: a re-run's `hashout` differs from the entry it replaces.
+        vary_hashout: bool,
+        /// `run` creates every declared path before declaring it, the way a
+        /// rebuild brings a collected store path back.
+        create: bool,
+        /// Every run after the first also returns a second artifact whose
+        /// container does not exist: the cache write commits `out`'s blob,
+        /// then fails before the manifest.
+        broken_rerun: bool,
+    }
+
+    impl HostPathDriver {
+        fn new(exec_count: SArc<AtomicUsize>, paths: Vec<std::path::PathBuf>) -> Self {
+            Self {
+                exec_count,
+                paths,
+                cache: CacheConfig::on(false),
+                vary_hashout: false,
+                create: false,
+                broken_rerun: false,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl RawDriver for HostPathDriver {
+        fn config(&self, _req: DriverConfigRequest) -> anyhow::Result<DriverConfigResponse> {
+            Ok(DriverConfigResponse {
+                name: "hostpaths".to_string(),
+            })
+        }
+        fn schema(&self) -> crate::engine::driver::DriverSchema {
+            crate::engine::driver::DriverSchema::default()
+        }
+        async fn parse(
+            &self,
+            req: ParseRequest,
+            _ctoken: &(dyn Cancellable + Send + Sync),
+        ) -> anyhow::Result<ParseResponse> {
+            Ok(ParseResponse {
+                target_def: TargetDef {
+                    addr: req.target_spec.addr.clone(),
+                    outputs: vec![Output {
+                        group: "main".to_string(),
+                        paths: vec![],
+                    }],
+                    cache: self.cache,
+                    hash: vec![1, 2, 3, 4],
+                    ..Default::default()
+                },
+            })
+        }
+        async fn apply_transitive(
+            &self,
+            req: ApplyTransitiveRequest,
+            _ctoken: &(dyn Cancellable + Send + Sync),
+        ) -> anyhow::Result<ApplyTransitiveResponse> {
+            Ok(ApplyTransitiveResponse {
+                target_def: req.target_def,
+            })
+        }
+        async fn run<'a, 'io>(
+            &self,
+            _req: RunRequest<'a, 'io>,
+            _ctoken: &(dyn Cancellable + Send + Sync),
+        ) -> anyhow::Result<RunResponse> {
+            let n = self.exec_count.fetch_add(1, Ordering::SeqCst);
+            if self.create {
+                for p in &self.paths {
+                    std::fs::write(p, b"").with_context(|| format!("creating {}", p.display()))?;
+                }
+            }
+            let host_paths = self
+                .paths
+                .iter()
+                .map(|p| hplugin::driver::HostPath::from_path(p))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let hashout = if self.vary_hashout {
+                format!("out-{n}")
+            } else {
+                "feedface".to_string()
+            };
+            let mut artifacts = vec![outputartifact::OutputArtifact {
+                group: "main".to_string(),
+                name: "out".to_string(),
+                r#type: outputartifact::Type::Output,
+                content: outputartifact::Content::Raw(outputartifact::ContentRaw {
+                    data: hashout.as_bytes().to_vec(),
+                    path: "out".to_string(),
+                    x: false,
+                }),
+                hashout,
+            }];
+            if self.broken_rerun && n > 0 {
+                artifacts.push(outputartifact::OutputArtifact {
+                    group: "main".to_string(),
+                    name: "broken".to_string(),
+                    r#type: outputartifact::Type::Output,
+                    content: outputartifact::Content::TarPath(
+                        outputartifact::ContentPath::borrowed("/nonexistent/heph-test/broken.tar"),
+                    ),
+                    hashout: "broken".to_string(),
+                });
+            }
+            Ok(RunResponse {
+                host_paths,
+                artifacts,
+                ..Default::default()
+            })
+        }
+        async fn run_shell<'a, 'io>(
+            &self,
+            _req: RunRequest<'a, 'io>,
+            _ctoken: &(dyn Cancellable + Send + Sync),
+        ) -> anyhow::Result<RunResponse> {
+            anyhow::bail!("run_shell not supported by HostPathDriver")
+        }
+    }
+
+    /// Engine whose single target `//pkg:a` is driven by `driver`, over a
+    /// sqlite-direct cache so a test reads back exactly what was written.
+    fn host_path_engine(
+        driver: HostPathDriver,
+    ) -> anyhow::Result<(Arc<Engine>, tempfile::TempDir, Addr)> {
+        let dir = tempdir()?;
+        let mut engine = Engine::new(Config {
+            parallelism: None,
+            mem_cache: crate::engine::MemCacheOptions {
+                capacity_bytes: 0,
+                ..Default::default()
+            },
+            ..Config::for_tests(dir.path())
+        })?;
+        engine.register_driver(move |_| Box::new(driver))?;
+        let addr = Addr::new(PkgBuf::from("pkg"), "a".to_string(), Default::default());
+        let spec = TargetSpec {
+            addr: addr.clone(),
+            driver: "hostpaths".to_string(),
+            ..Default::default()
+        };
+        engine.register_provider(move |_| Box::new(OneTargetProvider { spec }))?;
+        Ok((Arc::new(engine), dir, addr))
+    }
+
+    /// One request for `addr`, its result dropped at once.
+    async fn run_host_path_target(
+        engine: &Arc<Engine>,
+        rs: Arc<RequestState>,
+        addr: &Addr,
+    ) -> anyhow::Result<()> {
+        engine
+            .clone()
+            .result_addr(rs, addr, OutputMatcher::All, &ResultOptions::default())
+            .await
+            .map(drop)
+    }
+
+    /// Every manifest the cache holds for `addr`.
+    fn manifests_of(engine: &Engine, addr: &Addr) -> anyhow::Result<Vec<Manifest>> {
+        let mut out = Vec::new();
+        for hashin in engine.local_cache.list_target_entries(addr)? {
+            if let Some(m) = Engine::read_manifest_from(&engine.local_cache, addr, &hashin)? {
+                out.push(m);
+            }
+        }
+        Ok(out)
+    }
+
+    fn path_str(p: &std::path::Path) -> String {
+        p.to_str().expect("utf-8 tempdir").to_owned()
+    }
+
+    /// I8's adversarial table, and I6: every refused list fails the run and
+    /// leaves no manifest; every accepted one is stored deduplicated, sorted
+    /// and normalized.
+    #[tokio::test]
+    async fn host_paths_refused() -> anyhow::Result<()> {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::path::PathBuf;
+
+        let dir = tempdir()?;
+        let existing = |name: &str| -> anyhow::Result<PathBuf> {
+            let p = dir.path().join(name);
+            std::fs::write(&p, b"")?;
+            Ok(p)
+        };
+        let many = |k: usize| -> anyhow::Result<Vec<PathBuf>> {
+            (0..k).map(|i| existing(&format!("p{i}"))).collect()
+        };
+        let f = existing("f")?;
+        let root = path_str(dir.path());
+
+        // (case, paths, remote on, what the error says)
+        let refused: Vec<(&str, Vec<PathBuf>, bool, String)> = vec![
+            (
+                "relative",
+                vec![PathBuf::from("nix/store/x")],
+                false,
+                "is not absolute".into(),
+            ),
+            (
+                "dot-dot",
+                vec![PathBuf::from(format!("{root}/x/../f"))],
+                false,
+                "is not normalized".into(),
+            ),
+            ("empty", vec![PathBuf::new()], false, "is empty".into()),
+            (
+                "NUL byte",
+                vec![PathBuf::from(format!("{root}/f\0g"))],
+                false,
+                "contains a NUL byte".into(),
+            ),
+            (
+                "non-UTF-8",
+                vec![PathBuf::from(std::ffi::OsStr::from_bytes(
+                    &[root.as_bytes(), b"/\xff"].concat(),
+                ))],
+                false,
+                "is not UTF-8".into(),
+            ),
+            (
+                "missing at write",
+                vec![f.clone(), dir.path().join("missing")],
+                false,
+                format!(
+                    "declares host path {}, which does not exist",
+                    path_str(&dir.path().join("missing"))
+                ),
+            ),
+            (
+                // ENAMETOOLONG on Linux and macOS (NAME_MAX 255): not "does not exist".
+                "unstattable at write",
+                vec![dir.path().join("n".repeat(300))],
+                false,
+                format!(
+                    "declares host path {}, which cannot be checked",
+                    path_str(&dir.path().join("n".repeat(300)))
+                ),
+            ),
+            (
+                "65 paths",
+                many(65)?,
+                false,
+                "65 host paths declared, at most 64".into(),
+            ),
+            (
+                "remote on",
+                vec![f.clone()],
+                true,
+                format!(
+                    "declares host paths ({}) with `cache.remote` on",
+                    path_str(&f)
+                ),
+            ),
+        ];
+        for (case, paths, remote, says) in refused {
+            let count = SArc::new(AtomicUsize::new(0));
+            let mut driver = HostPathDriver::new(count.clone(), paths);
+            driver.cache = CacheConfig::on(remote);
+            let (engine, _home, addr) = host_path_engine(driver)?;
+            let err = run_host_path_target(&engine, engine.new_state(), &addr)
+                .await
+                .expect_err(case);
+            let msg = format!("{err:#}");
+            assert!(msg.contains(&addr.format()), "{case}: {msg}");
+            assert!(msg.contains(&says), "{case}: expected {says:?} in {msg}");
+            assert_eq!(count.load(Ordering::SeqCst), 1, "{case}: ran once");
+            assert!(
+                engine.local_cache.list_target_entries(&addr)?.is_empty(),
+                "{case}: a refused list leaves no entry"
+            );
+        }
+
+        let sixty_four = many(64)?;
+        let mut sixty_four_strs: Vec<String> = sixty_four.iter().map(|p| path_str(p)).collect();
+        sixty_four_strs.sort();
+        let mut with_dup = sixty_four.clone();
+        with_dup.push(sixty_four[0].clone());
+
+        // (case, paths, the list the manifest stores)
+        let accepted: Vec<(&str, Vec<PathBuf>, Vec<String>)> = vec![
+            (
+                "trailing slash",
+                vec![PathBuf::from(format!("{}/", path_str(&f)))],
+                vec![path_str(&f)],
+            ),
+            ("exactly 64", sixty_four, sixty_four_strs.clone()),
+            ("65 with one duplicate", with_dup, sixty_four_strs),
+            (
+                "the same path twice",
+                vec![f.clone(), f.clone()],
+                vec![path_str(&f)],
+            ),
+        ];
+        for (case, paths, stored) in accepted {
+            let count = SArc::new(AtomicUsize::new(0));
+            let (engine, _home, addr) =
+                host_path_engine(HostPathDriver::new(count.clone(), paths))?;
+            run_host_path_target(&engine, engine.new_state(), &addr)
+                .await
+                .with_context(|| case.to_string())?;
+            let manifests = manifests_of(&engine, &addr)?;
+            assert_eq!(manifests.len(), 1, "{case}: one entry");
+            assert_eq!(manifests[0].host_paths, stored, "{case}");
+            // And the entry is live: a second request hits.
+            run_host_path_target(&engine, engine.new_state(), &addr).await?;
+            assert_eq!(
+                count.load(Ordering::SeqCst),
+                1,
+                "{case}: the second run hit"
+            );
+        }
+        Ok(())
+    }
+
+    /// I4: a declared path the engine cannot stat (`EACCES`, here a parent
+    /// directory with no permissions) fails the target on a warm run rather
+    /// than calling the entry stale and rebuilding it on every run.
+    #[tokio::test]
+    async fn host_path_stat_error_fails() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // SAFETY: `geteuid` takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping host_path_stat_error_fails: root ignores permissions");
+            return Ok(());
+        }
+
+        /// Gives the locked directory its permissions back before the
+        /// `TempDir` holding it is removed, even when an assertion fails.
+        struct Unlock(std::path::PathBuf);
+        impl Drop for Unlock {
+            fn drop(&mut self) {
+                drop(std::fs::set_permissions(
+                    &self.0,
+                    std::fs::Permissions::from_mode(0o755),
+                ));
+            }
+        }
+
+        let dir = tempdir()?;
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked)?;
+        let path = locked.join("x");
+        std::fs::write(&path, b"")?;
+
+        let count = SArc::new(AtomicUsize::new(0));
+        let (engine, _home, addr) =
+            host_path_engine(HostPathDriver::new(count.clone(), vec![path.clone()]))?;
+        run_host_path_target(&engine, engine.new_state(), &addr).await?;
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))?;
+        let _unlock = Unlock(locked.clone());
+        let err = run_host_path_target(&engine, engine.new_state(), &addr)
+            .await
+            .expect_err("a stat error fails the target");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&format!("checking host path {}", path_str(&path))),
+            "{msg}"
+        );
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "a stat error is not a stale miss: nothing re-runs"
+        );
+        Ok(())
+    }
+
+    /// Run `fut` with a thread-local subscriber at `info` capturing into the
+    /// returned string. A `#[tokio::test]` runtime is current-thread, so every
+    /// engine task is polled, and logs, on this thread.
+    async fn capture_info_logs<F: std::future::Future>(fut: F) -> (F::Output, String) {
+        use tracing_subscriber::util::SubscriberInitExt as _;
+
+        #[derive(Clone, Default)]
+        struct Captured(SArc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .map_err(|e| std::io::Error::other(e.to_string()))?
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let log = Captured::default();
+        let writer = log.clone();
+        let out = {
+            // A second live dispatcher keeps tracing from caching a callsite's
+            // interest from whichever dispatcher saw it first, as in
+            // `crates/e2e`'s `capture_logs`.
+            let _second = tracing_subscriber::registry().set_default();
+            let _guard = tracing_subscriber::fmt()
+                .with_writer(move || writer.clone())
+                .with_ansi(false)
+                .with_max_level(tracing_subscriber::filter::LevelFilter::INFO)
+                .set_default();
+            fut.await
+        };
+        let text = String::from_utf8_lossy(&log.0.lock().expect("log buffer")).into_owned();
+        (out, text)
+    }
+
+    /// I5, Decision 12: a stale entry is a miss with its reason, its re-run
+    /// overwrites it, and a re-run whose `hashout` differs from the entry it
+    /// replaced logs at `info` and emits `StaleOutputChanged`. One whose
+    /// `hashout` is unchanged does neither.
+    #[tokio::test]
+    async fn rerun_hashout_change_logs_info() -> anyhow::Result<()> {
+        const CHANGED: &str = "rebuilt a stale cache entry and its output changed";
+        for vary_hashout in [true, false] {
+            let store = tempdir()?;
+            let path = store.path().join("x");
+            let count = SArc::new(AtomicUsize::new(0));
+            let mut driver = HostPathDriver::new(count.clone(), vec![path.clone()]);
+            driver.vary_hashout = vary_hashout;
+            driver.create = true;
+            let (engine, _home, addr) = host_path_engine(driver)?;
+
+            run_host_path_target(&engine, engine.new_state(), &addr).await?;
+            std::fs::remove_file(&path)?;
+
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let rs = engine.new_state_with_events(true, Some(tx));
+            let (res, log) =
+                capture_info_logs(run_host_path_target(&engine, rs.clone(), &addr)).await;
+            res?;
+            drop(rs);
+            let mut events = Vec::new();
+            while let Ok(ev) = rx.try_recv() {
+                events.push(ev.kind);
+            }
+
+            assert_eq!(count.load(Ordering::SeqCst), 2, "the stale entry re-ran");
+            let outcomes: Vec<_> = events
+                .iter()
+                .filter_map(|e| match e {
+                    BuildEventKind::CacheOutcome {
+                        outcome,
+                        reason,
+                        stale_host_path,
+                        ..
+                    } => Some((*outcome, reason.clone(), stale_host_path.clone())),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                outcomes,
+                vec![(
+                    hcore::events::CacheOutcomeKind::Miss,
+                    Some(crate::engine::host_paths::stale_reason(&path_str(&path))),
+                    Some(path_str(&path)),
+                )],
+                "{events:?}"
+            );
+            let changed = events.iter().filter(|e| {
+                matches!(e, BuildEventKind::StaleOutputChanged { addr: a } if *a == addr.format())
+            });
+            assert_eq!(
+                changed.count(),
+                usize::from(vary_hashout),
+                "vary_hashout={vary_hashout}: {events:?}"
+            );
+            assert_eq!(
+                log.contains(CHANGED),
+                vary_hashout,
+                "vary_hashout={vary_hashout}: {log}"
+            );
+
+            // The re-run overwrote the entry, and its path exists again: a hit.
+            run_host_path_target(&engine, engine.new_state(), &addr).await?;
+            assert_eq!(count.load(Ordering::SeqCst), 2, "the rewritten entry hits");
+        }
+        Ok(())
+    }
+
+    /// A stale entry another request is still reading (its result held, so a
+    /// riding read on the entry) cannot be rebuilt until that read is
+    /// released: the second request waits on the write lock, re-probing the
+    /// entry as stale each time it looks. The wait is announced once it
+    /// outlasts `RESULT_LOCK_NOTICE` (in-use by readers), and cancelling the
+    /// waiter ends it at once, as a cancellation, without running anything.
+    #[tokio::test]
+    async fn a_stale_wait_on_a_held_entry_is_announced_and_cancellable() -> anyhow::Result<()> {
+        let store = tempdir()?;
+        let path = store.path().join("x");
+        let count = SArc::new(AtomicUsize::new(0));
+        let mut driver = HostPathDriver::new(count.clone(), vec![path.clone()]);
+        driver.create = true;
+        let (engine, _home, addr) = host_path_engine(driver)?;
+
+        let held = engine
+            .clone()
+            .result_addr(
+                engine.new_state(),
+                &addr,
+                OutputMatcher::All,
+                &ResultOptions::default(),
+            )
+            .await?;
+        std::fs::remove_file(&path)?;
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let rs = engine.new_state_with_events(true, Some(tx));
+        let waiter = tokio::spawn({
+            let (engine, rs, addr) = (engine.clone(), rs.clone(), addr.clone());
+            async move { run_host_path_target(&engine, rs, &addr).await }
+        });
+
+        let announced = tokio::time::timeout(Duration::from_secs(30), async {
+            while let Some(ev) = rx.recv().await {
+                if let BuildEventKind::ResultLockWaitStart {
+                    addr: a,
+                    in_use_by_readers,
+                    ..
+                } = ev.kind
+                    && a == addr.format()
+                {
+                    return Some(in_use_by_readers);
+                }
+            }
+            None
+        })
+        .await
+        .expect("the wait is announced");
+        assert_eq!(announced, Some(true), "the wait names the entry's readers");
+
+        rs.ctoken().cancel();
+        let res = tokio::time::timeout(Duration::from_secs(10), waiter)
+            .await
+            .expect("a cancelled wait returns promptly")
+            .expect("waiter task");
+        let err = res.expect_err("a cancelled wait fails");
+        // The lock wait reports a plain "cancelled" under its own context; the
+        // engine classifies it by the request's token (`is_cancellation`).
+        assert!(
+            format!("{err:#}").ends_with("cancelled"),
+            "expected a cancellation, got: {err:#}"
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 1, "the waiter ran nothing");
+        drop(held);
+        Ok(())
+    }
+
+    /// I5: a stale entry's manifest is deleted under the write lock before its
+    /// re-run. A re-run that commits a blob and then fails leaves the entry
+    /// absent, so the next run misses — not the old manifest naming the new
+    /// bytes, live again once the path is back.
+    #[tokio::test]
+    async fn stale_rerun_failing_after_a_blob_leaves_no_entry() -> anyhow::Result<()> {
+        let store = tempdir()?;
+        let path = store.path().join("x");
+        let count = SArc::new(AtomicUsize::new(0));
+        let mut driver = HostPathDriver::new(count.clone(), vec![path.clone()]);
+        driver.vary_hashout = true;
+        driver.create = true;
+        driver.broken_rerun = true;
+        let (engine, _home, addr) = host_path_engine(driver)?;
+
+        run_host_path_target(&engine, engine.new_state(), &addr).await?;
+        assert_eq!(
+            manifests_of(&engine, &addr)?.len(),
+            1,
+            "the first run wrote"
+        );
+        std::fs::remove_file(&path)?;
+
+        let err = run_host_path_target(&engine, engine.new_state(), &addr)
+            .await
+            .expect_err("the re-run's second artifact cannot be written");
+        assert!(format!("{err:#}").contains("broken"), "{err:#}");
+        assert_eq!(count.load(Ordering::SeqCst), 2, "the stale entry re-ran");
+        assert!(path.exists(), "the re-run brought the path back");
+        assert!(
+            manifests_of(&engine, &addr)?.is_empty(),
+            "the stale manifest is gone and the failed re-run committed none"
+        );
+
+        // Absent, not live: the next run misses and runs again.
+        drop(run_host_path_target(&engine, engine.new_state(), &addr).await);
+        assert_eq!(count.load(Ordering::SeqCst), 3, "the next run missed");
+        Ok(())
     }
 
     /// What the target of [`resolve_one_artifact_at_spill`] emits.
@@ -15668,8 +16428,7 @@ mod tests {
                     }),
                     hashout: "feedface".to_string(),
                 }],
-                sandbox_cleanup: None,
-                sandbox_guards: vec![],
+                ..Default::default()
             })
         }
         async fn run_shell<'a, 'io>(
@@ -15678,11 +16437,7 @@ mod tests {
             _ctoken: &(dyn Cancellable + Send + Sync),
         ) -> anyhow::Result<RunResponse> {
             self.shell_runs.fetch_add(1, Ordering::SeqCst);
-            Ok(RunResponse {
-                artifacts: vec![],
-                sandbox_cleanup: None,
-                sandbox_guards: vec![],
-            })
+            Ok(RunResponse::default())
         }
     }
 

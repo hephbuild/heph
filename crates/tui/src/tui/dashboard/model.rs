@@ -556,7 +556,7 @@ impl Model {
                 }
                 self.restate(id);
             }
-            BuildEventKind::CacheOutcome { addr, outcome } => {
+            BuildEventKind::CacheOutcome { addr, outcome, .. } => {
                 if matches!(
                     outcome,
                     CacheOutcomeKind::LocalHit | CacheOutcomeKind::RemoteHit
@@ -1215,6 +1215,8 @@ mod tests {
             7 => BuildEventKind::CacheOutcome {
                 addr: addr(rng),
                 outcome: CacheOutcomeKind::LocalHit,
+                reason: None,
+                stale_host_path: None,
             },
             8 => BuildEventKind::CacheHitRebuilt {
                 addr: addr(rng),

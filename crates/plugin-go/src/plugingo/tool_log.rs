@@ -90,7 +90,7 @@ pub(crate) async fn echo_failure(
     if let Err(e) = &res {
         hdriver_support::driver_managed::echo_failure_log(&mut req.request, e).await;
     }
-    res.map(|()| ManagedRunResponse { artifacts: vec![] })
+    res.map(|()| ManagedRunResponse::default())
 }
 
 /// A Go run's log, for the processes it spawns. Built once per run: under
