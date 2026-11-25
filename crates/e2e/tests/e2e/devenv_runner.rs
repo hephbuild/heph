@@ -28,9 +28,13 @@
 //! ```sh
 //! HEPH_E2E_DEVENV=1 cargo test -p e2e --test e2e devenv_runner::
 //! ```
+//!
+//! CI sets `HEPH_E2E_DEVENV` only for `plugingo-e2e`'s Go smoke tests, so these
+//! run locally, by hand, and nowhere else.
 
 use crate::common;
 
+use heph::engine::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
 use hplugin_devenv::plugindevenv;
 use htestkit::WorkspaceBuilder;
 
@@ -76,6 +80,12 @@ fn which_devenv() -> Option<std::path::PathBuf> {
 }
 
 fn workspace() -> htestkit::Workspace {
+    workspace_recording(None)
+}
+
+/// [`workspace`], recording into `declared` the `host_paths` every run of the
+/// runner driver returns, when one is given.
+fn workspace_recording(declared: Option<Declared>) -> htestkit::Workspace {
     WorkspaceBuilder::new()
         .expect("workspace tempdir")
         .with_provider(|init| {
@@ -88,12 +98,86 @@ fn workspace() -> htestkit::Workspace {
         .with_managed_driver(Box::new(
             heph::pluginexec::Driver::new_bash().with_host_path(),
         ))
-        .with_plugin("devenv", |init| {
-            Ok(heph::engine::PluginParts::default()
-                .with_managed_driver(Box::new(plugindevenv::Driver::new(&init.home))))
+        .with_plugin("devenv", move |init| {
+            let driver = plugindevenv::Driver::new(&init.home);
+            let parts = heph::engine::PluginParts::default();
+            Ok(match declared {
+                Some(declared) => parts.with_managed_driver(Box::new(RecordsHostPaths {
+                    inner: driver,
+                    declared,
+                })),
+                None => parts.with_managed_driver(Box::new(driver)),
+            })
         })
         .build()
         .expect("build workspace")
+}
+
+/// The host paths runs declared, in run order.
+type Declared = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+/// The runner driver, recording the `host_paths` each run returns: what the
+/// engine is handed to check on every later hit.
+struct RecordsHostPaths {
+    inner: plugindevenv::Driver,
+    declared: Declared,
+}
+
+#[async_trait::async_trait]
+impl ManagedDriver for RecordsHostPaths {
+    fn config(
+        &self,
+        req: hplugin::driver::ConfigRequest,
+    ) -> anyhow::Result<hplugin::driver::ConfigResponse> {
+        ManagedDriver::config(&self.inner, req)
+    }
+    fn schema(&self) -> hplugin::driver::DriverSchema {
+        ManagedDriver::schema(&self.inner)
+    }
+    async fn parse(
+        &self,
+        req: hplugin::driver::ParseRequest,
+        ctoken: &(dyn hcore::hasync::Cancellable + Send + Sync),
+    ) -> anyhow::Result<hplugin::driver::ParseResponse> {
+        ManagedDriver::parse(&self.inner, req, ctoken).await
+    }
+    async fn apply_transitive(
+        &self,
+        req: hplugin::driver::ApplyTransitiveRequest,
+        ctoken: &(dyn hcore::hasync::Cancellable + Send + Sync),
+    ) -> anyhow::Result<hplugin::driver::ApplyTransitiveResponse> {
+        ManagedDriver::apply_transitive(&self.inner, req, ctoken).await
+    }
+    async fn run<'a, 'io>(
+        &self,
+        req: ManagedRunRequest<'a, 'io>,
+        ctoken: &(dyn hcore::hasync::Cancellable + Send + Sync),
+    ) -> anyhow::Result<ManagedRunResponse> {
+        let res = ManagedDriver::run(&self.inner, req, ctoken).await?;
+        self.declared
+            .lock()
+            .expect("declared lock")
+            .extend(res.host_paths.iter().map(|p| p.as_str().to_owned()));
+        Ok(res)
+    }
+}
+
+/// The `/nix/store/<hash>-` prefix of every store path `text` names, read the
+/// way nix forms one: a nix32 hash part (no `e`, `o`, `t`, `u`, so a dev
+/// environment's `/nix/store/eeee…` output placeholders are skipped) and a `-`.
+/// By hash rather than whole path, so a path followed by a byte nix allows in a
+/// name (`<path>=<flag value>`) still matches the path itself.
+fn store_hash_prefixes(text: &str) -> std::collections::BTreeSet<&str> {
+    const STORE: &str = "/nix/store/";
+    const NIX32: &[u8] = b"0123456789abcdfghijklmnpqrsvwxyz";
+    text.match_indices(STORE)
+        .filter_map(|(start, _)| {
+            let end = start + STORE.len() + 33;
+            let prefix = text.get(start..end)?;
+            let hash = prefix.get(STORE.len()..end - start - 1)?;
+            (hash.bytes().all(|b| NIX32.contains(&b)) && prefix.ends_with('-')).then_some(prefix)
+        })
+        .collect()
 }
 
 /// Write the devenv files plus a `devenv.runner` target over them.
@@ -224,6 +308,61 @@ async fn session_mode_emits_a_launch_and_the_same_fingerprint() -> anyhow::Resul
     assert_ne!(
         wrap, session,
         "the two modes must not emit identical bytes, or they would share a cache entry"
+    );
+    Ok(())
+}
+
+/// Against the real `nix`: the run declares one host path, it exists, the
+/// gcroot under heph's home links it, and its closure holds every store path
+/// `runner.json` names — so a `nix-collect-garbage` cannot take anything a
+/// cached `runner.json` hands its consumers. The unit tests prove the same
+/// with a fake `nix`; only this one proves `builtins.toFile` over
+/// `builtins.storePath` really references what it was given.
+#[tokio::test]
+async fn the_declared_root_is_rooted_and_its_closure_covers_runner_json() -> anyhow::Result<()> {
+    skip_unless_opted_in!();
+
+    let declared = Declared::default();
+    let ws = workspace_recording(Some(std::sync::Arc::clone(&declared)));
+    write_env(&ws, "wrap", "");
+    let doc = common::artifact_string(&*ws.run("//env:runner").await?);
+
+    let declared = declared.lock().expect("declared lock").clone();
+    let [root] = declared.as_slice() else {
+        panic!("one run declares exactly one host path; got {declared:?}")
+    };
+    assert!(
+        std::path::Path::new(root).exists(),
+        "the declared path {root} exists"
+    );
+    let gcroot = ws
+        .engine
+        .home
+        .as_path()
+        .join("devenv-runner/gcroots")
+        .join(heph::htaddr::parse_addr("//env:runner")?.hash_str());
+    assert_eq!(
+        std::fs::read_link(&gcroot)?,
+        std::path::Path::new(root),
+        "the gcroot {gcroot:?} links the declared path"
+    );
+
+    let out = std::process::Command::new("nix-store")
+        .args(["--query", "--requisites", root])
+        .output()?;
+    assert!(
+        out.status.success(),
+        "nix-store --query --requisites {root}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let requisites = String::from_utf8(out.stdout)?;
+    let closure = store_hash_prefixes(&requisites);
+    let named = store_hash_prefixes(&doc);
+    assert!(!named.is_empty(), "runner.json names store paths: {doc}");
+    let outside: Vec<_> = named.difference(&closure).collect();
+    assert!(
+        outside.is_empty(),
+        "store paths runner.json names but the root's closure lacks: {outside:?}"
     );
     Ok(())
 }
