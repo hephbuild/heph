@@ -9,8 +9,8 @@
 
 use std::collections::BTreeMap;
 
-use rusqlite::Connection;
 use rusqlite::types::ValueRef;
+use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 
 use super::derive::{SESSION_SPAN, machine as names};
@@ -49,13 +49,16 @@ pub enum MachineStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NoneReason {
-    /// No machine row at all: recorded by a heph from before machine stats
-    /// (derivation 1), whose records have none to derive.
+    /// Its explorer rows were derived by a heph from before machine stats
+    /// (a derivation below [`MACHINE_DERIVATION`]), read as they are.
     OlderDerivation,
-    /// The start-time figures, but no sample: the run was shorter than one
-    /// tick.
+    /// Derived by a heph with machine stats, but nothing sampled: the run
+    /// was shorter than one tick, or the sampler never started.
     NoSamples,
 }
+
+/// The derivation that first wrote machine rows (`store::DERIVATION` 2).
+pub const MACHINE_DERIVATION: u32 = 2;
 
 /// Where a limit came from. An open enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -145,7 +148,8 @@ pub struct MachineSummary {
     /// Always `host` (O11).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_limit_source: Option<LimitSource>,
-    /// The session summaries, written at seal: absent while it runs.
+    /// The session summaries: the rows the seal writes, or while it runs
+    /// the same aggregates over the samples so far.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu_busy_mean: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -196,13 +200,16 @@ fn whole(v: f64) -> Option<u64> {
 /// The machine summary of the recording `conn` reads.
 pub fn read_machine(conn: &Connection) -> rusqlite::Result<MachineSummary> {
     // `status` and `reason` are decided at the end, from what was read.
-    let mut m = MachineSummary::none(NoneReason::OlderDerivation);
+    let mut m = MachineSummary::none(NoneReason::NoSamples);
 
     // The once-written rows; ordered by time, so the last one wins.
     let mut stmt = conn.prepare(
-        "SELECT name, value FROM metrics WHERE name IN (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+        "SELECT name, value, time_us FROM metrics WHERE name IN (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
          AND value IS NOT NULL ORDER BY time_us",
     )?;
+    // When the sampler read the start-time figures: what the first sample's
+    // interval runs from.
+    let mut started_us: Option<i64> = None;
     let mut rows = stmt.query([
         names::CPU_COUNT,
         names::CPU_LIMIT,
@@ -218,6 +225,9 @@ pub fn read_machine(conn: &Connection) -> rusqlite::Result<MachineSummary> {
         match name.as_str() {
             names::CPU_COUNT => {
                 m.cpus = whole(value).and_then(|n| u32::try_from(n).ok());
+                if let ValueRef::Integer(t) = r.get_ref(2)? {
+                    started_us = Some(t);
+                }
             }
             names::CPU_LIMIT => m.cpu_limit = (value.is_finite() && value > 0.0).then_some(value),
             names::MEMORY_LIMIT => m.memory_limit_bytes = whole(value),
@@ -242,6 +252,9 @@ pub fn read_machine(conn: &Connection) -> rusqlite::Result<MachineSummary> {
         names::PER_SAMPLE,
         |r| r.get(0),
     )?;
+    if sampled {
+        from_samples(conn, &mut m, started_us)?;
+    }
 
     let mut stmt = conn.prepare(
         "SELECT time_us, substr(json_extract(attributes, '$.\"heph.sampler.source\"'), 1, ?3), \
@@ -273,14 +286,60 @@ pub fn read_machine(conn: &Connection) -> rusqlite::Result<MachineSummary> {
         (false, false) => MachineStatus::Failed,
         (false, true) => MachineStatus::None,
     };
-    let has_info = m.cpus.is_some() || m.cpu_limit.is_some() || m.memory_limit_bytes.is_some();
-    m.reason = (m.status == MachineStatus::None).then_some(if has_info {
-        NoneReason::NoSamples
-    } else {
-        NoneReason::OlderDerivation
-    });
+    m.reason = None;
+    if m.status == MachineStatus::None {
+        // Only the derivation tells an older heph's recording from a run
+        // whose sampler never started: neither has a machine row.
+        let derivation: Option<i64> = conn
+            .query_row("SELECT derivation FROM session", [], |r| r.get(0))
+            .optional()?;
+        m.reason = Some(match derivation {
+            Some(d) if d < i64::from(MACHINE_DERIVATION) => NoneReason::OlderDerivation,
+            _ => NoneReason::NoSamples,
+        });
+    }
     m.waiting.by_phase = read_waiting(conn)?;
     Ok(m)
+}
+
+/// The session summaries the seal has not written yet (a live or lost
+/// recording), as the seal computes them, from the per-sample rows: busy
+/// mean weighted by each sample's interval (the time since the sample
+/// before it, or since the start-time figures for the first), and the
+/// peaks. A summary row already read is kept. Each read is one name, so
+/// the `(name, time_us)` index serves it when the recording has one.
+fn from_samples(
+    conn: &Connection,
+    m: &mut MachineSummary,
+    started_us: Option<i64>,
+) -> rusqlite::Result<()> {
+    if m.cpu_busy_mean.is_none() || m.cpu_busy_peak.is_none() {
+        let (mean, peak): (Option<f64>, Option<f64>) = conn.query_row(
+            "SELECT sum(value * w) / sum(w), max(value) FROM ( \
+               SELECT value, max(time_us - coalesce(lag(time_us) OVER (ORDER BY time_us), \
+                                                    ?2, time_us - 1), 1) AS w \
+               FROM metrics WHERE name = ?1 AND value BETWEEN 0 AND 1)",
+            rusqlite::params![names::CPU_BUSY, started_us],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        m.cpu_busy_mean = m.cpu_busy_mean.or(mean.and_then(fraction));
+        m.cpu_busy_peak = m.cpu_busy_peak.or(peak.and_then(fraction));
+    }
+    let peak = |name: &str| -> rusqlite::Result<Option<u64>> {
+        let v: Option<f64> = conn.query_row(
+            "SELECT max(value) FROM metrics WHERE name = ?1 AND value >= 0",
+            [name],
+            |r| r.get(0),
+        )?;
+        Ok(v.and_then(whole))
+    };
+    if m.memory_used_peak_bytes.is_none() {
+        m.memory_used_peak_bytes = peak(names::MEMORY_USED)?;
+    }
+    if m.heph_resident_peak_bytes.is_none() {
+        m.heph_resident_peak_bytes = peak(names::PROCESS_RESIDENT)?;
+    }
+    Ok(())
 }
 
 /// A text column, or `""` for anything else.
