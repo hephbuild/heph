@@ -41,11 +41,12 @@ pub(crate) const SUMMARY_BUDGET: usize = 900 * 1024;
 
 /// Budget for **one step's section** of the shared comment.
 ///
-/// A job's comment holds a section per heph step, all concatenated by
-/// `assemble_body`, plus the hidden markers. Budgeting a single section at the
-/// full comment limit would let one step consume the whole body and 422 the
-/// next; a quarter leaves room for several steps and the markers.
-pub(crate) const LIVE_SECTION_BUDGET: usize = COMMENT_LIMIT / 4;
+/// A job's comment holds two blocks — the PR's CI and its merge-queue run —
+/// each with a section per heph step, all concatenated by `assemble_body`,
+/// plus the headings and hidden markers. Budgeting a single section at the full
+/// comment limit would let one step consume the whole body and 422 the next; an
+/// eighth leaves room for three steps in each block and the markers.
+pub(crate) const LIVE_SECTION_BUDGET: usize = COMMENT_LIMIT / 8;
 
 /// Longest single failure message rendered. The full text is in the job log and
 /// the JSON document; the report is an index, not a transcript.
@@ -96,9 +97,9 @@ const LIVE_LOCK_ROWS: usize = 3;
 const LIVE_ROOT_ROWS: usize = 5;
 /// Log-tail bytes shown live, per listed root. No line cap: the engine already
 /// applied `--log-lines`, and a second, smaller cap here is what left the comment
-/// showing five lines that rarely reached the error. Five roots at this cap use
-/// 10 KiB of the 16 KiB [`LIVE_SECTION_BUDGET`]; a root whose tail does not fit
-/// is still listed, without it.
+/// showing five lines that rarely reached the error. Five roots at this cap
+/// would take 10 KiB, more than the 8 KiB [`LIVE_SECTION_BUDGET`]; a root whose
+/// tail does not fit is still listed, without it.
 const LIVE_LOG_BYTES: usize = 2 * 1024;
 
 /// Final view: table sizes.
