@@ -144,7 +144,7 @@ fn recipes_run() {
 
     // The built-in ones through the engine, as `heph session query --from`
     // runs them: the columns the docs list, and the fixture's rows.
-    let expected: [(&str, &[&[&str]]); 4] = [
+    let expected: [(&str, &[&[&str]]); 5] = [
         (
             "time_by_phase",
             &[
@@ -165,6 +165,11 @@ fn recipes_run() {
             ],
         ),
         ("hit_rate_by_package", &[&["//p", "2", "1", "50"]]),
+        // Recorded before machine stats: the wait reads unknown.
+        (
+            "waiting_by_load",
+            &[&["cbszjpg001", "admission", "0", "0", "1000"]],
+        ),
     ];
     assert_eq!(expected.len(), RECIPES.len());
     for (r, (name, rows)) in RECIPES.iter().zip(expected) {
@@ -190,13 +195,18 @@ fn recipes_run() {
 
 /// Run built-in recipe `name` over `setup`, rows as [`text`] spells them.
 fn run_recipe(name: &str, setup: &str) -> Vec<Vec<String>> {
+    let db = rusqlite::Connection::open_in_memory().expect("in-memory db");
+    db.execute_batch(setup).expect("setup");
+    recipe_rows(name, &db)
+}
+
+/// Run built-in recipe `name` over `db`, rows as [`text`] spells them.
+fn recipe_rows(name: &str, db: &rusqlite::Connection) -> Vec<Vec<String>> {
     let sql = RECIPES
         .iter()
         .find(|r| r.name == name)
         .expect("a built-in recipe")
         .sql;
-    let db = rusqlite::Connection::open_in_memory().expect("in-memory db");
-    db.execute_batch(setup).expect("setup");
     let mut stmt = db.prepare(sql).expect("compiles");
     let n = stmt.column_count();
     stmt.query_map([], |row| {

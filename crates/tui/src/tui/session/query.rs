@@ -247,6 +247,7 @@ SELECT substr(addr, 1, instr(addr, ':') - 1) AS package,
 FROM targets WHERE outcome IN ('ran', 'hit', 'failed')
 GROUP BY package ORDER BY hit_pct, targets DESC, package",
     },
+    WAITING_BY_LOAD,
 ];
 
 /// The waiting split (D29), which `heph session show` runs too: each

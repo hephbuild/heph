@@ -513,6 +513,7 @@ recordings are kept, 7 days by default.
 | `uncovered_wall` | `session_id`, `wall_s`, `target_s` (wall time with at least one `target`-class span open, overlaps counted once), `uncovered_pct` (the rest, as a share of the wall); ended sessions only |
 | `phase_percentiles` | `class`, `name`, `n`, `p50_ms`, `p90_ms`, `p99_ms` (nearest rank), `max_ms` |
 | `hit_rate_by_package` | `package`, `targets` (resolved: ran, hit or failed; cancelled ones are left out), `hits`, `hit_pct`; lowest rate first |
+| `waiting_by_load` | `session_id`, `phase` (the waiting phase, its span name without heph.), `busy_us`, `spare_us`, `unknown_us` (span-microseconds summed across targets, split by the machine sample covering them; `show` prints the same split on its machine line) |
 
 ```sql
 -- time_by_phase: Where did time go, by class and phase (busy time, not wall time)?
@@ -572,12 +573,95 @@ SELECT substr(addr, 1, instr(addr, ':') - 1) AS package,
        round(100.0 * sum(outcome = 'hit') / count(*), 1) AS hit_pct
 FROM targets WHERE outcome IN ('ran', 'hit', 'failed')
 GROUP BY package ORDER BY hit_pct, targets DESC, package;
+
+-- waiting_by_load: Was the machine the limit while work waited, by waiting phase?
+-- Busy: CPU busy at 0.9 or more, or memory used at 95% of the limit or more,
+-- in the sample covering the time. Spare: below both. Unknown: no sample
+-- covers it (before the first, after the last, across a gap over 2 s).
+-- Microseconds summed across targets, so concurrent waits add up.
+-- The catalog keeps no machine samples, and the spans of ran targets only:
+-- over it every wait reads unknown. Use --full or --from.
+WITH busy AS (
+  SELECT session_id, time_us AS t, max(value) AS cpu
+  FROM metrics WHERE name = 'heph.machine.cpu.busy'
+  GROUP BY session_id, time_us
+), used AS (
+  SELECT session_id, time_us AS t, max(value) AS used
+  FROM metrics WHERE name = 'heph.machine.memory.used'
+  GROUP BY session_id, time_us
+), mem AS (
+  SELECT session_id, max(value) AS mem_limit
+  FROM metrics WHERE name = 'heph.machine.memory.limit'
+  GROUP BY session_id
+), intervals AS (
+  SELECT b.session_id, b.t, b.cpu, u.used, m.mem_limit,
+         lag(b.t) OVER (PARTITION BY b.session_id ORDER BY b.t) AS prev
+  FROM busy b
+  LEFT JOIN used u ON u.session_id = b.session_id AND u.t = b.t
+  LEFT JOIN mem m ON m.session_id = b.session_id
+), loads AS (
+  SELECT session_id, t, t - prev AS len,
+         CASE
+           WHEN prev IS NULL OR t - prev > 2000000
+             OR cpu IS NULL OR cpu < 0 OR cpu > 1 THEN 0
+           WHEN cpu >= 0.9 THEN 1
+           WHEN used IS NULL OR mem_limit IS NULL OR used < 0 OR mem_limit <= 0 THEN 0
+           WHEN 100 * used >= 95 * mem_limit THEN 1
+           ELSE 2
+         END AS load
+  FROM intervals
+), cum AS (
+  SELECT session_id, t, load,
+         sum(CASE load WHEN 1 THEN len ELSE 0 END) OVER w AS busy_to,
+         sum(CASE load WHEN 2 THEN len ELSE 0 END) OVER w AS spare_to,
+         count(*) OVER (PARTITION BY session_id ORDER BY t DESC) AS nth
+  FROM loads WINDOW w AS (PARTITION BY session_id ORDER BY t)
+), waits AS (
+  SELECT w.session_id,
+         CASE WHEN substr(w.name, 1, 5) = 'heph.' THEN substr(w.name, 6) ELSE w.name END
+           AS phase,
+         w.start_us AS s, coalesce(w.end_us, max(w.start_us, l.t)) AS e
+  FROM spans w
+  LEFT JOIN (SELECT session_id, t FROM cum WHERE nth = 1) l ON l.session_id = w.session_id
+  WHERE w.class = 'waiting' AND w.start_us IS NOT NULL
+), points AS (
+  SELECT session_id, s AS x, 0 AS sample FROM waits WHERE e > s
+  UNION SELECT session_id, e, 0 FROM waits WHERE e > s
+  UNION SELECT session_id, t, 1 FROM cum
+), ranked AS (
+  SELECT session_id, x, sample,
+         sum(sample) OVER (PARTITION BY session_id ORDER BY x DESC, sample DESC
+                           ROWS UNBOUNDED PRECEDING) AS nth
+  FROM points
+), marks AS (
+  SELECT r.session_id, r.x,
+         coalesce(c.busy_to - CASE c.load WHEN 1 THEN c.t - r.x ELSE 0 END,
+                  f.busy_to, 0) AS busy_at,
+         coalesce(c.spare_to - CASE c.load WHEN 2 THEN c.t - r.x ELSE 0 END,
+                  f.spare_to, 0) AS spare_at
+  FROM ranked r
+  LEFT JOIN cum c ON c.session_id = r.session_id AND c.nth = r.nth
+  LEFT JOIN cum f ON f.session_id = r.session_id AND f.nth = 1
+  WHERE r.sample = 0
+)
+SELECT w.session_id, w.phase,
+       sum(b.busy_at - a.busy_at) AS busy_us,
+       sum(b.spare_at - a.spare_at) AS spare_us,
+       sum(w.e - w.s - (b.busy_at - a.busy_at) - (b.spare_at - a.spare_at)) AS unknown_us
+FROM waits w
+JOIN marks a ON a.session_id = w.session_id AND a.x = w.s
+JOIN marks b ON b.session_id = w.session_id AND b.x = w.e
+WHERE w.e > w.s
+GROUP BY w.session_id, w.phase
+ORDER BY w.session_id, w.phase;
 ```
 
 Over the catalog, `hit_rate_by_package` counts hits from `targets`, which
-keeps them; the other three read `spans`, which the catalog keeps only for
-targets that ran (`--full` reads every recording instead). Their comment
-says so, and `query --format json` names those tables in
+keeps them; the other four read `spans`, which the catalog keeps only for
+targets that ran (`--full` reads every recording instead).
+`waiting_by_load` reads the machine samples in `metrics` too, which the
+catalog does not keep at all, so over it every wait reads unknown. Their
+comment says so, and `query --format json` names `spans` in
 `coverage.partial`.
 
 The recipes are not part of the explorer contract (I9). A release may
