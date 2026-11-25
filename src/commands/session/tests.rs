@@ -2486,6 +2486,7 @@ async fn export_is_self_contained() {
                 log_path: Some(log.display().to_string()),
                 ..LeftBehindData::default()
             })),
+            spans: Vec::new(),
         }),
         session: None,
     };

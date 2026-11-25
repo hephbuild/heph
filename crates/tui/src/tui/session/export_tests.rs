@@ -638,6 +638,7 @@ fn write_export_fixture(tmp: &Path) -> PathBuf {
                     log_path: Some(log.display().to_string()),
                     ..LeftBehindData::default()
                 })),
+                spans: Vec::new(),
             },
         ),
         ev(
@@ -651,6 +652,7 @@ fn write_export_fixture(tmp: &Path) -> PathBuf {
                 timed_out: None,
                 cancelled: false,
                 left_behind: None,
+                spans: Vec::new(),
             },
         ),
         SessionRecord::session(
