@@ -5327,6 +5327,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "url",
  "xxhash-rust",
 ]
 

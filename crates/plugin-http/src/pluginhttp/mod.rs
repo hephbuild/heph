@@ -38,6 +38,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use xxhash_rust::xxh3::Xxh3Default;
 
+mod auth;
+
 pub const DRIVER_NAME: &str = "http_fetch";
 
 /// Config for an `http_fetch` target.
@@ -60,6 +62,17 @@ struct HttpFetchSpec {
     out: Option<String>,
     /// Mark the fetched file executable (a downloaded tool binary).
     executable: bool,
+    /// Credentials to fetch with, as `credential` target addresses presented
+    /// with `heph.auth.netrc([...])`. The URL's host is sent the basic auth of
+    /// the netrc entry naming it; a host none of them covers is an error, never
+    /// an anonymous request. When empty, the fetch is anonymous: the host's own
+    /// `~/.netrc` is not read.
+    ///
+    /// Not an input: nothing about a credential reaches the cache key. So a
+    /// credential-gated fetch is only as cacheable as it is pinned — without
+    /// `sha256`, two identities served different bytes would share one entry.
+    /// Set `sha256`, or `cache = False`.
+    credentials: Vec<String>,
     /// Caching for the fetched file. Defaults to on for both the local and
     /// remote cache — a fetch is content-addressed (pinned by `sha256`), so it
     /// is safe to share. `cache = False` disables both tiers; the dict form
@@ -136,9 +149,35 @@ impl ManagedDriver for Driver {
             format!("{pkg}/{out_rel}")
         };
 
+        let credential_inputs =
+            hdriver_support::credential::inputs(&spec.credentials, &addr.package)?;
+        let cache: hplugin::driver::targetdef::CacheConfig = spec.cache.into();
+        let sha256 = spec.sha256.unwrap_or_default();
+        if !credential_inputs.is_empty() {
+            // Two identities for one request: the one in the URL would be sent,
+            // or not, depending on what the client does with both.
+            anyhow::ensure!(
+                !has_userinfo(&url),
+                "{}: the url carries a username or password and the target names \
+                 `credentials`; drop the one from the url",
+                addr.format()
+            );
+            // The rendered URL is the whole key, and a server can answer it
+            // differently per identity: without a pin, a shared entry serves
+            // one identity's bytes to another.
+            if sha256.is_empty() && cache.enabled {
+                tracing::warn!(
+                    url,
+                    "http_fetch: {url} is fetched with credentials and no `sha256`, so what it \
+                     serves can depend on whichever identity ran it, and the cache entry (remote \
+                     included) is shared across identities; set `sha256`, or `cache = False`"
+                );
+            }
+        }
+
         let def = HttpFetchDef {
             url,
-            sha256: spec.sha256.unwrap_or_default(),
+            sha256,
             out: out.clone(),
             executable: spec.executable,
         };
@@ -156,8 +195,10 @@ impl ManagedDriver for Driver {
                 addr: addr.clone(),
                 labels: req.target_spec.labels.clone(),
                 raw_def: Arc::new(def),
-                // No inputs: the bytes come from the network, not from other
-                // targets or the host filesystem.
+                // The bytes come from the network, not from other targets or
+                // the host filesystem. The only edges are credentials, which
+                // materialize nothing and never reach the cache key.
+                inputs: credential_inputs,
                 outputs: vec![Output {
                     group: String::new(),
                     paths: vec![Path {
@@ -166,7 +207,7 @@ impl ManagedDriver for Driver {
                         collect: true,
                     }],
                 }],
-                cache: spec.cache.into(),
+                cache,
                 hash,
                 // Not in `hash` above: a declaration moves no key.
                 resources: spec
@@ -204,10 +245,44 @@ impl ManagedDriver for Driver {
             .ok_or_else(|| anyhow::anyhow!("http_fetch: out {:?} has no file name", def.out))?;
         let dest = req.sandbox_pkg_dir.join(name);
 
-        fetch_until_cancelled(&def.url, &def.sha256, def.executable, &dest, ctoken).await?;
+        // Off the async workers: it reads the presented netrc files.
+        let declared = auth::declared(req.request.target);
+        let selected = if declared == 0 && req.request.credentials.is_empty() {
+            None
+        } else {
+            let target = req.request.target.addr.format();
+            let mounts = req.request.credentials.clone();
+            let url = def.url.clone();
+            hcore::blocking::run(move || auth::resolve(&target, declared, &mounts, &url)).await?
+        };
+
+        let fetched = fetch_until_cancelled(
+            &def.url,
+            selected.as_ref().map(|s| &s.auth),
+            &def.sha256,
+            def.executable,
+            &dest,
+            ctoken,
+        )
+        .await;
+        match selected {
+            Some(s) => fetched.with_context(|| {
+                format!(
+                    "authenticated with the netrc entry credential {} presents",
+                    s.credential
+                )
+            })?,
+            None => fetched?,
+        }
 
         Ok(ManagedRunResponse { artifacts: vec![] })
     }
+}
+
+/// Whether `url` names a username or password in its authority
+/// (`https://user:pass@host/`).
+fn has_userinfo(url: &str) -> bool {
+    url::Url::parse(url).is_ok_and(|u| !u.username().is_empty() || u.password().is_some())
 }
 
 /// [`fetch`], abandoned the moment `ctoken` fires.
@@ -217,12 +292,22 @@ impl ManagedDriver for Driver {
 /// connection closes, and the partial file is removed before this returns.
 async fn fetch_until_cancelled(
     url: &str,
+    auth: Option<&hfetch::BasicAuth>,
     expected_sha256: &str,
     executable: bool,
     dest: &std::path::Path,
     ctoken: &(dyn Cancellable + Send + Sync),
 ) -> anyhow::Result<()> {
-    match fetch(url, expected_sha256, executable, dest, ctoken.cancelled()).await {
+    match fetch(
+        url,
+        auth,
+        expected_sha256,
+        executable,
+        dest,
+        ctoken.cancelled(),
+    )
+    .await
+    {
         Ok(Fetched::Done) => Ok(()),
         Ok(Fetched::Cancelled) => anyhow::bail!("http_fetch: {url} cancelled"),
         Err(err) => Err(err).with_context(|| format!("fetch {url}")),
@@ -311,12 +396,13 @@ fn render(template: &str, args: &BTreeMap<String, String>) -> anyhow::Result<Str
 /// failed download, a mismatch or `cancelled` firing removes it again.
 async fn fetch(
     url: &str,
+    auth: Option<&hfetch::BasicAuth>,
     expected_sha256: &str,
     executable: bool,
     dest: &std::path::Path,
     cancelled: impl Future<Output = ()>,
 ) -> anyhow::Result<Fetched> {
-    let verified = match download(url, dest, cancelled).await {
+    let verified = match download(url, auth, dest, cancelled).await {
         Ok(Some(got)) => verify_checksum(expected_sha256, &got, url),
         Ok(None) => {
             remove_partial(dest);
@@ -397,6 +483,7 @@ impl<T> Drop for Feed<'_, T> {
 /// blocking slot.
 async fn download(
     url: &str,
+    auth: Option<&hfetch::BasicAuth>,
     dest: &std::path::Path,
     cancelled: impl Future<Output = ()>,
 ) -> anyhow::Result<Option<String>> {
@@ -448,7 +535,7 @@ async fn download(
     // is dropped.
     let send_body = async move {
         let tx = &feed.tx;
-        let mut body = hfetch::Fetcher::default().open(url).await?;
+        let mut body = hfetch::Fetcher::default().open_with(url, auth).await?;
         let mut batch = Vec::new();
         let mut batched = 0;
         loop {
@@ -617,7 +704,7 @@ mod tests {
         let url = serve("200 OK", BODY, 1);
 
         // Checksum unset → fetched unverified (warns); the bytes still land.
-        let fetched = fetch(&url, "", true, &dest, std::future::pending())
+        let fetched = fetch(&url, None, "", true, &dest, std::future::pending())
             .await
             .expect("fetch");
         assert_eq!(fetched, Fetched::Done);
@@ -644,7 +731,7 @@ mod tests {
         let dest = dir.path().join("tool");
         let url = serve("200 OK", body, 1);
 
-        let fetched = fetch(&url, &sha, false, &dest, std::future::pending())
+        let fetched = fetch(&url, None, &sha, false, &dest, std::future::pending())
             .await
             .expect("fetch");
         assert_eq!(fetched, Fetched::Done);
@@ -657,7 +744,7 @@ mod tests {
         let dest = dir.path().join("tool");
         let url = serve("200 OK", b"tampered", 1);
 
-        let err = fetch(&url, BODY_SHA, false, &dest, std::future::pending())
+        let err = fetch(&url, None, BODY_SHA, false, &dest, std::future::pending())
             .await
             .expect_err("mismatch must fail");
         assert!(
@@ -673,7 +760,7 @@ mod tests {
         let dest = dir.path().join("tool");
         let url = serve("404 Not Found", b"", 1);
 
-        let err = fetch(&url, "", false, &dest, std::future::pending())
+        let err = fetch(&url, None, "", false, &dest, std::future::pending())
             .await
             .expect_err("404 must fail");
         assert!(format!("{err:#}").contains("GET"), "got: {err:#}");
@@ -716,7 +803,7 @@ mod tests {
 
         let err = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            fetch_until_cancelled(&url, "", false, &dest, &ctoken),
+            fetch_until_cancelled(&url, None, "", false, &dest, &ctoken),
         )
         .await
         .expect("a cancelled fetch returns at once")
@@ -769,7 +856,7 @@ mod tests {
 
         let err = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            fetch_until_cancelled(&url, "", false, &dest, &ctoken),
+            fetch_until_cancelled(&url, None, "", false, &dest, &ctoken),
         )
         .await
         .expect("a cancelled fetch returns at once")
@@ -790,7 +877,7 @@ mod tests {
         let ctoken = StdCancellationToken::new();
         let download = tokio::spawn({
             let (dest, ctoken) = (dest.clone(), ctoken.clone());
-            async move { fetch_until_cancelled(&url, "", false, &dest, &ctoken).await }
+            async move { fetch_until_cancelled(&url, None, "", false, &dest, &ctoken).await }
         });
         let on_disk = || std::fs::metadata(&dest).map_or(0, |m| m.len());
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -825,7 +912,7 @@ mod tests {
         let ctoken = StdCancellationToken::new();
         let download = tokio::spawn({
             let (dest, ctoken) = (dest.clone(), ctoken.clone());
-            async move { fetch_until_cancelled(&url, "", false, &dest, &ctoken).await }
+            async move { fetch_until_cancelled(&url, None, "", false, &dest, &ctoken).await }
         });
         // The writer has created the file and waits on a body that never
         // starts.
@@ -883,7 +970,7 @@ mod tests {
         let ctoken = hcore::hasync::StdCancellationToken::new();
         ctoken.cancel();
 
-        let err = fetch_until_cancelled(&url, "", false, &dest, &ctoken)
+        let err = fetch_until_cancelled(&url, None, "", false, &dest, &ctoken)
             .await
             .expect_err("a cancelled fetch fails");
         assert!(format!("{err:#}").contains("cancelled"), "got: {err:#}");
@@ -910,8 +997,9 @@ mod tests {
             let dest = dir.path().join(format!("tool-{i}"));
             dests.push(dest.clone());
             let ctoken = ctoken.clone();
-            downloads
-                .spawn(async move { fetch_until_cancelled(&url, "", false, &dest, &ctoken).await });
+            downloads.spawn(async move {
+                fetch_until_cancelled(&url, None, "", false, &dest, &ctoken).await
+            });
         }
         // Every download has created its file and now waits on a body that
         // never ends. Waiting for the file, not for bytes in it: a writer that
@@ -1181,5 +1269,123 @@ mod tests {
             format!("{err:#}").contains("references arg `goos`"),
             "got: {err:#}"
         );
+    }
+
+    async fn parse_with_credentials(url: &str, credentials: &[&str]) -> anyhow::Result<TargetDef> {
+        let mut config = HashMap::from([
+            ("url".to_string(), Value::String(url.to_string())),
+            ("sha256".to_string(), Value::String(BODY_SHA.to_string())),
+        ]);
+        if !credentials.is_empty() {
+            config.insert(
+                "credentials".to_string(),
+                Value::List(
+                    credentials
+                        .iter()
+                        .map(|c| Value::String((*c).to_string()))
+                        .collect(),
+                ),
+            );
+        }
+        Ok(Driver
+            .parse(parse_req("//dl:tool", config), &StdCancellationToken::new())
+            .await?
+            .target_def)
+    }
+
+    /// A credential is an edge the cache key cannot see: annotated, neither
+    /// hashed nor materialized at runtime, resolved against the package, and
+    /// adding one leaves the def hash where it was.
+    #[tokio::test]
+    async fn credentials_are_unhashed_edges() {
+        let plain = parse_with_credentials("https://x/tool", &[])
+            .await
+            .expect("parse");
+        assert!(plain.inputs.is_empty());
+        let gated = parse_with_credentials("https://x/tool", &[":netrc"])
+            .await
+            .expect("parse");
+        let [edge] = gated.inputs.as_slice() else {
+            panic!("one credential edge, got {}", gated.inputs.len());
+        };
+        assert!(hdriver_support::credential::is_credential(
+            &edge.annotations
+        ));
+        assert!(!edge.hashed && !edge.runtime);
+        assert_eq!(edge.r#ref.to_string(), "//dl:netrc");
+        assert_eq!(gated.hash, plain.hash, "a credential must not move the key");
+    }
+
+    /// A URL naming its own user and a declared credential are two identities
+    /// for one request; parse refuses the pair rather than let the client pick.
+    #[tokio::test]
+    async fn userinfo_in_the_url_and_credentials_are_exclusive() {
+        let Err(err) = parse_with_credentials("https://u:p@x/tool", &["//auth:netrc"]).await else {
+            panic!("two identities must fail parse");
+        };
+        assert!(
+            format!("{err:#}").contains("url carries a username or password"),
+            "{err:#}"
+        );
+        parse_with_credentials("https://u:p@x/tool", &[])
+            .await
+            .expect("userinfo alone is the author's own business");
+    }
+
+    /// Serve `body` to one request, recording the `Authorization` header it
+    /// arrived with (empty when none).
+    fn serve_recording_auth(body: &'static [u8]) -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let Ok((mut sock, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            let n = std::io::Read::read(&mut sock, &mut buf).unwrap_or(0);
+            let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let auth = head
+                .lines()
+                .find_map(|l| {
+                    l.split_once(':')
+                        .filter(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+                        .map(|(_, v)| v.trim().to_string())
+                })
+                .unwrap_or_default();
+            let _ = tx.send(auth);
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = std::io::Write::write_all(&mut sock, resp.as_bytes());
+            let _ = std::io::Write::write_all(&mut sock, body);
+        });
+        (url, rx)
+    }
+
+    /// The selected entry goes out as basic auth, and nothing goes out without
+    /// one.
+    #[tokio::test]
+    async fn fetch_sends_basic_auth_only_when_given() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("tool");
+
+        let (url, auth) = serve_recording_auth(BODY);
+        let creds = hfetch::BasicAuth {
+            username: "u".to_string(),
+            password: "p".to_string(),
+        };
+        fetch(&url, Some(&creds), "", false, &dest, std::future::pending())
+            .await
+            .expect("fetch");
+        // base64("u:p")
+        assert_eq!(auth.recv().expect("request"), "Basic dTpw");
+
+        let (url, auth) = serve_recording_auth(BODY);
+        fetch(&url, None, "", false, &dest, std::future::pending())
+            .await
+            .expect("fetch");
+        assert_eq!(auth.recv().expect("request"), "");
     }
 }

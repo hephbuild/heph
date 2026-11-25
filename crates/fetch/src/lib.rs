@@ -88,18 +88,50 @@ impl Fetcher {
     /// For a caller that writes the body somewhere other than the polling
     /// worker; [`get_async`](Self::get_async) writes each chunk inline.
     pub async fn open<'u>(&self, url: &'u str) -> anyhow::Result<Body<'u>> {
+        self.open_with(url, None).await
+    }
+
+    /// [`open`](Self::open), sending `auth` as HTTP basic auth when set.
+    ///
+    /// The header is sent to `url`'s origin only: a redirect to another host,
+    /// port or scheme drops it (reqwest strips `Authorization` on a
+    /// cross-origin hop), so a release asset that redirects to a CDN's signed
+    /// URL does not hand that CDN the credential.
+    pub async fn open_with<'u>(
+        &self,
+        url: &'u str,
+        auth: Option<&BasicAuth>,
+    ) -> anyhow::Result<Body<'u>> {
         let client = reqwest::Client::builder()
             .connect_timeout(self.connect_timeout)
             .read_timeout(self.read_timeout)
             .build()
             .context("build download client")?;
-        let resp = client
-            .get(url)
+        let mut req = client.get(url);
+        if let Some(auth) = auth {
+            req = req.basic_auth(&auth.username, Some(&auth.password));
+        }
+        let resp = req
             .send()
             .await
             .and_then(|r| r.error_for_status())
             .with_context(|| format!("GET {url}"))?;
         Ok(Body { url, resp })
+    }
+}
+
+/// A username and password sent as HTTP basic auth. See [`Fetcher::open_with`].
+pub struct BasicAuth {
+    pub username: String,
+    pub password: String,
+}
+
+/// Prints neither field: an auth value that reaches a log or an error chain
+/// through `{:?}` would put the secret there, and a username is material too
+/// (GitHub takes a token as one).
+impl std::fmt::Debug for BasicAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BasicAuth(<redacted>)")
     }
 }
 

@@ -525,6 +525,51 @@ a generated directory would break the build rather than authenticate it. A
 private base image goes through `oci.pull(layout = True, credentials = [...])`
 and `bases`, which is also the hermetic way to take one.
 
+## `http_fetch`
+
+`http_fetch` downloads in-process too, so like the registry drivers it reads one
+presentation an HTTP client already understands: a netrc file, which
+`heph.auth.netrc([...])` writes at `0600` and points `NETRC` at.
+
+```python
+files = target(
+    name    = "files",
+    driver  = "auth.credential",
+    # `heph.auth.netrc` writes `login ${username} password ${token}` by default;
+    # pass `login =` / `password =` templates for other field names.
+    sources = [heph.auth.env(["USERNAME", "TOKEN"])],
+    present = heph.auth.netrc(["files.acme.dev"]),
+)
+
+target(name = "sdk", driver = "http_fetch", url = "https://files.acme.dev/sdk-1.2.tar.gz",
+       sha256 = "…", credentials = [files])
+```
+
+The `machine` entry naming the URL's host goes out as basic auth. Host matching
+is exact and ignores case, port and path. The rules are the registry drivers'
+rules:
+
+- **No `credentials` means anonymous.** The developer's own `~/.netrc` is never
+  read. There is no `ambient_credentials` here.
+- **A host no credential covers is an error**, never an anonymous request, and
+  two credentials covering one host are refused. A netrc `default` entry covers
+  no host. Honoring it would let a declaration written for one server
+  authenticate a request to any other. The error says it was skipped.
+- **A credential that is not a netrc presentation is not consulted**, and the
+  error names it.
+- **A URL with `user:pass@` and `credentials` together is refused at parse.**
+- **The header goes to the URL's origin only.** A redirect to another host,
+  port or scheme drops it, so a release asset that redirects to a CDN's signed
+  URL does not hand that CDN the credential.
+
+netrc cannot hold an empty value or one containing whitespace. Material like
+that renders into a file the driver cannot read, and the error says why
+without quoting the file.
+
+The residual risk applies here too, and more directly: the rendered URL is the
+whole key, and a server can serve different bytes per identity. A gated fetch
+with no `sha256` and caching on warns at parse. Set `sha256`, or `cache = False`.
+
 ## The CLI
 
 | Command | Does |

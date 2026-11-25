@@ -150,6 +150,129 @@ target(
     Ok(())
 }
 
+/// Serve `body` to one request and hand back the `Authorization` header it
+/// carried (empty when none).
+fn serve_recording_auth(body: &'static [u8]) -> (String, std::sync::mpsc::Receiver<String>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let url = format!("http://{}", listener.local_addr().expect("addr"));
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let Ok((mut sock, _)) = listener.accept() else {
+            return;
+        };
+        let mut buf = [0u8; 4096];
+        let n = sock.read(&mut buf).unwrap_or(0);
+        let auth = String::from_utf8_lossy(buf.get(..n).unwrap_or_default())
+            .lines()
+            .find_map(|l| {
+                l.split_once(':')
+                    .filter(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+                    .map(|(_, v)| v.trim().to_string())
+            })
+            .unwrap_or_default();
+        let _ = tx.send(auth);
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = sock.write_all(head.as_bytes());
+        let _ = sock.write_all(body);
+    });
+    (url, rx)
+}
+
+/// `credentials` on `http_fetch`, through the real engine: the host acquires
+/// the credential, presents it as a netrc file, and the driver sends that
+/// entry's login and password to the URL's host as basic auth.
+#[tokio::test]
+async fn test_http_fetch_authenticates_with_a_netrc_credential() -> anyhow::Result<()> {
+    let (url, auth) = serve_recording_auth(SCRIPT);
+    let ws = Workspace::new();
+    ws.write_file(
+        "secrets/creds.json",
+        r#"{"user": "fetcher", "token": "netrc-e2e-token"}"#,
+    );
+    let root = ws.dir.path().display().to_string();
+    ws.write_build_file(
+        "auth",
+        &format!(
+            r#"
+target(
+    name    = "files",
+    driver  = "auth.credential",
+    sources = [heph.auth.file("{root}/secrets/creds.json",
+                              fields = {{"username": "user", "token": "token"}})],
+    present = heph.auth.netrc(["127.0.0.1"]),
+)
+"#
+        ),
+    );
+    ws.write_build_file(
+        "dl",
+        &format!(
+            r#"target(name = "f", driver = "http_fetch", url = "{url}/tool.sh",
+       credentials = ["//auth:files"], cache = False)"#
+        ),
+    );
+
+    ws.run("//dl:f").await?;
+    // base64("fetcher:netrc-e2e-token")
+    assert_eq!(
+        auth.recv()?,
+        "Basic ZmV0Y2hlcjpuZXRyYy1lMmUtdG9rZW4=",
+        "the netrc entry must reach the server as basic auth"
+    );
+    Ok(())
+}
+
+/// A credential whose netrc names another host fails the fetch before the
+/// network, naming the host: never an anonymous request instead.
+#[tokio::test]
+async fn test_http_fetch_with_credentials_for_another_host_fails() -> anyhow::Result<()> {
+    let (url, hits) = serve(SCRIPT, 1);
+    let ws = Workspace::new();
+    ws.write_file(
+        "secrets/creds.json",
+        r#"{"user": "fetcher", "token": "netrc-e2e-token"}"#,
+    );
+    let root = ws.dir.path().display().to_string();
+    ws.write_build_file(
+        "auth",
+        &format!(
+            r#"
+target(
+    name    = "files",
+    driver  = "auth.credential",
+    sources = [heph.auth.file("{root}/secrets/creds.json",
+                              fields = {{"username": "user", "token": "token"}})],
+    present = heph.auth.netrc(["files.example.com"]),
+)
+"#
+        ),
+    );
+    ws.write_build_file(
+        "dl",
+        &format!(
+            r#"target(name = "f", driver = "http_fetch", url = "{url}/tool.sh",
+       credentials = ["//auth:files"], cache = False)"#
+        ),
+    );
+
+    let err = ws
+        .run("//dl:f")
+        .await
+        .err()
+        .expect("an uncovered host must fail");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("no declared credential covers host \"127.0.0.1\""),
+        "{msg}"
+    );
+    assert!(!msg.contains("netrc-e2e-token"), "material leaked: {msg}");
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "nothing reached the server");
+    Ok(())
+}
+
 /// A fetched binary consumed as a **tool** — the read-only, shared-stage path (what
 /// the go plugin's lint/format drivers use for heph-govet) — must still be
 /// executable in the consumer's sandbox.
