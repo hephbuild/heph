@@ -1256,12 +1256,27 @@ fn member_completion_lists_a_namespace_and_nothing_else() {
     let doc = lsp.open("e/BUILD", "typing = {}\nx = typ│ing\n");
     let doc = lsp.change(&doc, "typing = {}\nx = typing.│\n");
     let result = lsp.completion(&doc);
+    let explained = lsp.explain(&doc);
+    assert_eq!(explained["site"]["binding"], json!("module"), "{explained}");
+    // The pre-pass types a module-level display `Any`, as lint does, so the
+    // rebound global lists nothing (I7): never the global's members.
+    assert_eq!(
+        explained["site"]["empty_because"],
+        json!("any"),
+        "{explained}"
+    );
     assert!(items(&result).is_empty(), "a rebound global: {result}");
 
+    // A literal receiver lists its type's members (D9).
+    let doc = lsp.open("g/BUILD", "x = \"s\".│\n");
+    let got = labels(&lsp.completion(&doc));
+    for want in ["join", "upper", "split"] {
+        assert!(got.iter().any(|l| l == want), "{want}: {got:?}");
+    }
+
     for (path, fixture, why) in [
-        ("d/BUILD", "l = {}\nx = l.│\n", "a local"),
+        ("d/BUILD", "l = {}\nx = l.│\n", "a local never parsed"),
         ("f/BUILD", "x = f().│\n", "a call"),
-        ("g/BUILD", "x = \"s\".│\n", "a literal"),
         (
             "h/BUILD",
             "x = typing.Any.│\n",
@@ -3138,17 +3153,17 @@ fn did_close_frees_the_document_model() {
     let counts = |lsp: &mut Lsp| lsp.request("heph/documents", Value::Null);
     assert_eq!(
         counts(&mut lsp),
-        json!({"documents": 2, "parses": 2, "indexes": 2})
+        json!({"documents": 2, "parses": 2, "indexes": 2, "typechecks": 0})
     );
     lsp.close(&a);
     assert_eq!(
         counts(&mut lsp),
-        json!({"documents": 1, "parses": 1, "indexes": 1})
+        json!({"documents": 1, "parses": 1, "indexes": 1, "typechecks": 0})
     );
     lsp.close(&b);
     assert_eq!(
         counts(&mut lsp),
-        json!({"documents": 0, "parses": 0, "indexes": 0})
+        json!({"documents": 0, "parses": 0, "indexes": 0, "typechecks": 0})
     );
 }
 
@@ -3461,4 +3476,617 @@ fn document_outside_the_root_gets_stock_with_a_reason() {
     };
     assert_eq!(reason(&lsp.explain(&doc)).as_deref(), Some("outside_root"));
     assert!(heph_items(&lsp.completion(&doc)).is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Typed member completion (docs/LSP.md, "Typed members").
+// ---------------------------------------------------------------------------
+
+/// An enum, and a record with a field of it and an optional list field.
+const DECLS: &str = "Mode = enum(\"debug\", \"release\")\n\
+                     Lib = record(name = str, mode = Mode, srcs = field(list[str], []))\n";
+
+/// The record's fields, as completion lists them.
+const LIB_FIELDS: [&str; 3] = ["mode", "name", "srcs"];
+
+/// Open `rel` as `parses` (a text that parses), then type `typed` over it
+/// (cursor marked), as an editor does: the `.` just typed breaks the parse,
+/// and the types come from the last good one.
+fn type_after(lsp: &mut Lsp, rel: &str, parses: &str, typed: &str) -> Doc {
+    let doc = lsp.open(rel, parses);
+    lsp.change(&doc, typed)
+}
+
+fn sorted_labels(result: &Value) -> Vec<String> {
+    let mut got = labels(result);
+    got.sort();
+    got
+}
+
+fn detail(result: &Value, label: &str) -> String {
+    item(result, label)["detail"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// One D5 key of a member site's `--explain`.
+fn site_key(explained: &Value, key: &str) -> Value {
+    explained["site"][key].clone()
+}
+
+fn typechecks(lsp: &mut Lsp) -> u64 {
+    lsp.request("heph/documents", Value::Null)["typechecks"]
+        .as_u64()
+        .expect("typechecks counted")
+}
+
+#[test]
+fn typed_member_completion() {
+    let mut lsp = Lsp::start();
+    let head = format!(
+        "{DECLS}\n\
+         def f(l: Lib, m: Mode, s: str, xs: list[str], d: dict[str, int], \
+         **kw: heph.types.exec.Kwargs):\n    \
+         c = Lib(name = \"a\", mode = Mode(\"debug\"))\n"
+    );
+    let mut doc = lsp.open("pkg/BUILD", &format!("{head}    pass\n"));
+    let mut at = |lsp: &mut Lsp, receiver: &str| {
+        doc = lsp.change(&doc, &format!("{head}    x = {receiver}.│\n"));
+        (lsp.completion(&doc), lsp.explain(&doc))
+    };
+
+    let (result, explained) = at(&mut lsp, "l");
+    assert_eq!(sorted_labels(&result), LIB_FIELDS, "{result}");
+    // D7: the member's type as the checker prints it.
+    assert_eq!(detail(&result, "name"), "str");
+    assert_eq!(detail(&result, "mode"), "Mode");
+    assert_eq!(detail(&result, "srcs"), "list[str]");
+    assert_eq!(
+        site_key(&explained, "binding"),
+        json!("param"),
+        "{explained}"
+    );
+    assert_eq!(site_key(&explained, "type"), json!("Lib"), "{explained}");
+    assert_eq!(site_key(&explained, "scope"), json!(["f"]), "{explained}");
+    assert_eq!(
+        site_key(&explained, "registry"),
+        json!("ready"),
+        "{explained}"
+    );
+    assert_eq!(site_key(&explained, "empty_because"), Value::Null);
+
+    for receiver in ["m", "l.mode"] {
+        let (result, _) = at(&mut lsp, receiver);
+        assert_eq!(sorted_labels(&result), ["index", "value"], "{receiver}");
+        // The checker types an enum value's `value` as `Any`.
+        assert_eq!(detail(&result, "value"), "typing.Any", "{receiver}");
+        assert_eq!(detail(&result, "index"), "int", "{receiver}");
+    }
+
+    let (result, explained) = at(&mut lsp, "Mode");
+    assert_eq!(
+        sorted_labels(&result),
+        ["debug", "release", "type", "values"],
+        "{result}"
+    );
+    assert_eq!(detail(&result, "debug"), "Mode");
+    assert_eq!(
+        site_key(&explained, "binding"),
+        json!("module"),
+        "{explained}"
+    );
+    assert_eq!(
+        site_key(&explained, "source"),
+        json!("pkg/BUILD:1"),
+        "{explained}"
+    );
+
+    let (result, _) = at(&mut lsp, "s");
+    assert!(has(&result, "upper") && has(&result, "split"), "{result}");
+    assert_eq!(detail(&result, "upper"), "def() -> str");
+
+    let (result, _) = at(&mut lsp, "xs");
+    for want in ["append", "extend", "index", "pop"] {
+        assert!(has(&result, want), "xs.{want}: {result}");
+    }
+    assert!(!has(&result, "upper"), "{result}");
+
+    let (result, _) = at(&mut lsp, "d");
+    for want in ["get", "items", "keys", "values"] {
+        assert!(has(&result, want), "d.{want}: {result}");
+    }
+
+    // A local bound by a record constructor call inside the def.
+    let (result, explained) = at(&mut lsp, "c");
+    assert_eq!(sorted_labels(&result), LIB_FIELDS, "{result}");
+    assert_eq!(
+        site_key(&explained, "binding"),
+        json!("local"),
+        "{explained}"
+    );
+
+    // A `Kwargs` parameter lists the dict attributes the checker accepts.
+    let (result, explained) = at(&mut lsp, "kw");
+    for want in ["get", "items", "keys"] {
+        assert!(has(&result, want), "kw.{want}: {result}");
+    }
+    assert_eq!(
+        site_key(&explained, "binding"),
+        json!("param"),
+        "{explained}"
+    );
+}
+
+#[test]
+fn literal_receiver_completion() {
+    let mut lsp = Lsp::start();
+    // No parse and no types needed: each document is broken from its first
+    // version.
+    for (i, (fixture, ty, want)) in [
+        ("x = \"-\".│\n", "str", "join"),
+        ("x = 'x'.│\n", "str", "upper"),
+        ("x = \"\"\"a\"\"\".│\n", "str", "split"),
+        ("x = \"a\" \"b\".│\n", "str", "strip"),
+        ("x = [].│\n", "list[Any]", "append"),
+        ("x = [1, 2].│\n", "list[Any]", "extend"),
+        ("x = [\n  1,\n].│\n", "list[Any]", "pop"),
+        ("xs = [1]\nx = xs[0]\n[1, 2].│\n", "list[Any]", "insert"),
+        ("x = {}.│\n", "dict[Any, Any]", "items"),
+        ("x = {\"a\": 1}.│\n", "dict[Any, Any]", "keys"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let doc = lsp.open(&format!("lit{i}/BUILD"), fixture);
+        let result = lsp.completion(&doc);
+        assert!(has(&result, want), "{fixture}: {result}");
+        let explained = lsp.explain(&doc);
+        assert_eq!(
+            site_key(&explained, "receiver"),
+            json!("literal"),
+            "{fixture}"
+        );
+        assert_eq!(site_key(&explained, "type"), json!(ty), "{fixture}");
+        assert_eq!(site_key(&explained, "empty_because"), Value::Null);
+    }
+
+    // A prefix filters, and the edit lands on the member.
+    let doc = lsp.open("prefix/BUILD", "x = \"a\".up│\n");
+    let result = lsp.completion(&doc);
+    assert_eq!(labels(&result), ["upper"]);
+    assert_eq!(
+        apply("x = \"a\".up\n", &item(&result, "upper")),
+        "x = \"a\".upper\n"
+    );
+
+    for (i, fixture) in [
+        "xs = [1]\nx = xs[0].│\n",
+        "xs = [\"a\"]\nx = \"a\".join(xs).│\n",
+        "x = 1.│\n",
+        "x = (\"a\").│\n",
+        "x = {\"a\": 1}[\"a\"].│\n",
+        "x = \"ab\"[0].│\n",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let doc = lsp.open(&format!("nolit{i}/BUILD"), fixture);
+        let result = lsp.completion(&doc);
+        // `1.` is a float, not a member site, so the stock names pass
+        // through there; no receiver here has a literal's members.
+        for method in ["upper", "append", "items"] {
+            assert!(!has(&result, method), "{fixture}: {result}");
+        }
+        if !fixture.starts_with("x = 1.") {
+            assert!(items(&result).is_empty(), "{fixture}: {result}");
+        }
+        let explained = lsp.explain(&doc);
+        assert_ne!(
+            site_key(&explained, "receiver"),
+            json!("literal"),
+            "{fixture}"
+        );
+    }
+}
+
+#[test]
+fn module_call_receiver_completes() {
+    let mut lsp = Lsp::start();
+    let cfg = "cfg = Lib(name = \"x\", mode = Mode(\"debug\"))\n";
+    lsp.write("lib/defs.star", &format!("{DECLS}{cfg}"));
+
+    // Declared and called in the document.
+    let head = format!("{DECLS}{cfg}\ndef g():\n");
+    let doc = type_after(
+        &mut lsp,
+        "local/BUILD",
+        &format!("{head}    pass\n"),
+        &format!("{head}    x = cfg.│\n"),
+    );
+    let result = lsp.completion(&doc);
+    assert_eq!(sorted_labels(&result), LIB_FIELDS, "{result}");
+    let explained = lsp.explain(&doc);
+    assert_eq!(
+        site_key(&explained, "binding"),
+        json!("module"),
+        "{explained}"
+    );
+    assert_eq!(site_key(&explained, "type"), json!("Lib"), "{explained}");
+    // At module level too.
+    let doc = type_after(
+        &mut lsp,
+        "top/BUILD",
+        &format!("{DECLS}{cfg}y = cfg\n"),
+        &format!("{DECLS}{cfg}y = cfg.│\n"),
+    );
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), LIB_FIELDS);
+
+    // Loaded: the call's result type crosses the interface.
+    let head = "load(\"//lib/defs.star\", \"cfg\")\n\ndef g():\n";
+    let doc = type_after(
+        &mut lsp,
+        "loaded/BUILD",
+        &format!("{head}    pass\n"),
+        &format!("{head}    x = cfg.│\n"),
+    );
+    let result = lsp.completion(&doc);
+    assert_eq!(sorted_labels(&result), LIB_FIELDS, "{result}");
+    let explained = lsp.explain(&doc);
+    assert_eq!(
+        site_key(&explained, "binding"),
+        json!("loaded"),
+        "{explained}"
+    );
+    assert_eq!(
+        site_key(&explained, "source"),
+        json!("//lib/defs.star"),
+        "{explained}"
+    );
+}
+
+#[test]
+fn typecheck_is_lazy() {
+    let mut lsp = Lsp::start();
+    let head = format!("{DECLS}\ndef f(l: Lib):\n");
+    let doc = lsp.open("pkg/BUILD", &format!("{head}    pass\n"));
+    let doc = lsp.change(&doc, &format!("{head}    x = l\n"));
+    let doc = lsp.change(&doc, &format!("{head}    x = l.\n"));
+    let doc = lsp.change(&doc, &format!("{head}    x = l│\n"));
+    // Edits, a hover and a completion at another site check nothing.
+    lsp.hover(&doc);
+    lsp.completion(&doc);
+    lsp.barrier();
+    assert_eq!(
+        typechecks(&mut lsp),
+        0,
+        "no member completion, no typecheck"
+    );
+
+    let doc = lsp.change(&doc, &format!("{head}    x = l.│\n"));
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), LIB_FIELDS);
+    assert_eq!(typechecks(&mut lsp), 1);
+    // The same last good text: the memo answers.
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), LIB_FIELDS);
+    assert_eq!(typechecks(&mut lsp), 1, "memoized by the last good version");
+    // A literal needs no types.
+    let doc = lsp.change(&doc, &format!("{head}    x = \"a\".│\n"));
+    assert!(has(&lsp.completion(&doc), "upper"));
+    assert_eq!(typechecks(&mut lsp), 1, "a literal is not typechecked");
+}
+
+#[test]
+fn typed_member_completion_agrees_with_lint() {
+    let mut lsp = Lsp::start();
+    let head = format!(
+        "{DECLS}\n\
+         def f(l: Lib, m: Mode, s: str, xs: list[str], d: dict[str, int], o: Lib | None):\n"
+    );
+    let receivers = ["l", "m", "Mode", "s", "xs", "d", "o", "l.mode", "l.srcs"];
+    let mut doc = lsp.open("pkg/BUILD", &format!("{head}    pass\n"));
+    let mut listed = Vec::new();
+    for receiver in receivers {
+        doc = lsp.change(&doc, &format!("{head}    x = {receiver}.│\n"));
+        let got: std::collections::BTreeSet<String> =
+            labels(&lsp.completion(&doc)).into_iter().collect();
+        assert!(!got.is_empty(), "{receiver} lists something");
+        listed.push((receiver, got));
+    }
+    // Every member any receiver lists, and a name none has: the probe.
+    let mut vocabulary: std::collections::BTreeSet<String> = listed
+        .iter()
+        .flat_map(|(_, got)| got.iter().cloned())
+        .collect();
+    vocabulary.insert("nosuch".to_string());
+
+    // One access per line, so a finding's line names the access it rejects.
+    let mut source = head.clone();
+    let mut accesses = Vec::new();
+    for (receiver, got) in &listed {
+        for name in &vocabulary {
+            source.push_str(&format!("    _ = {receiver}.{name}\n"));
+            accesses.push((source.lines().count(), *receiver, name, got.contains(name)));
+        }
+    }
+    lsp.write("pkg/BUILD", &source);
+    let findings =
+        plugin_buildfile::pluginbuildfile::lint_findings(&lsp.root(), "pkg", &[("fs", "join")])
+            .expect("lint runs");
+    let rejected: std::collections::BTreeSet<usize> = findings
+        .iter()
+        .filter_map(|f| {
+            f.strip_prefix("pkg/BUILD:")?
+                .split(':')
+                .next()?
+                .parse()
+                .ok()
+        })
+        .collect();
+    assert_eq!(
+        rejected.len(),
+        findings.len(),
+        "one finding per rejected access: {findings:#?}"
+    );
+    for (line, receiver, name, listed) in accesses {
+        assert_eq!(
+            !rejected.contains(&line),
+            listed,
+            "line {line}: completion lists `{receiver}.{name}` iff lint accepts it"
+        );
+    }
+}
+
+#[test]
+fn typed_members_of_a_loaded_record() {
+    let mut lsp = Lsp::start();
+    lsp.write("lib/defs.star", DECLS);
+    let head = "load(\"//lib/defs.star\", \"Lib\", \"Mode\")\n\ndef f(l: Lib):\n";
+    let doc = type_after(
+        &mut lsp,
+        "pkg/BUILD",
+        &format!("{head}    pass\n"),
+        &format!("{head}    x = l.│\n"),
+    );
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), LIB_FIELDS);
+    let doc = lsp.change(&doc, &format!("{head}    x = l.mode.│\n"));
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), ["index", "value"]);
+    let doc = lsp.change(&doc, &format!("{head}    x = Mode.│\n"));
+    let result = lsp.completion(&doc);
+    assert!(has(&result, "debug") && has(&result, "release"), "{result}");
+    let explained = lsp.explain(&doc);
+    assert_eq!(
+        site_key(&explained, "binding"),
+        json!("loaded"),
+        "{explained}"
+    );
+    assert_eq!(
+        site_key(&explained, "source"),
+        json!("//lib/defs.star"),
+        "{explained}"
+    );
+}
+
+#[test]
+fn record_in_dir_load_second_file() {
+    let mut lsp = Lsp::start();
+    lsp.write("lib/BUILD", "X = \"x\"\n");
+    lsp.write("lib/more.BUILD", DECLS);
+    let head = "load(\"//lib\", \"Lib\")\n\ndef f(l: Lib):\n";
+    let doc = type_after(
+        &mut lsp,
+        "pkg/BUILD",
+        &format!("{head}    pass\n"),
+        &format!("{head}    x = l.│\n"),
+    );
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), LIB_FIELDS);
+}
+
+#[test]
+fn pkg_file_fallback_not_typed() {
+    let mut lsp = Lsp::start();
+    lsp.write("lib/defs.star", DECLS);
+    for (rel, load, want) in [
+        ("file/BUILD", "//lib/defs.star", LIB_FIELDS.to_vec()),
+        // Evaluation rejects `//pkg:file`, so lint and the LSP do not type it.
+        ("fallback/BUILD", "//lib:defs.star", Vec::new()),
+    ] {
+        let head = format!("load(\"{load}\", \"Lib\")\n\ndef f(l: Lib):\n");
+        let doc = type_after(
+            &mut lsp,
+            rel,
+            &format!("{head}    pass\n"),
+            &format!("{head}    x = l.│\n"),
+        );
+        assert_eq!(sorted_labels(&lsp.completion(&doc)), want, "{load}");
+    }
+}
+
+#[test]
+fn loaded_file_unsaved_edit_not_seen() {
+    let mut lsp = Lsp::start();
+    let saved = "Lib = record(name = str)\n";
+    let edited = "Lib = record(name = str, extra = str)\n";
+    let lib = lsp.open("lib/defs.star", saved);
+    let _unsaved = lsp.change(&lib, edited);
+
+    let head = "load(\"//lib/defs.star\", \"Lib\")\n\ndef f(l: Lib):\n";
+    let parses = format!("{head}    pass\n");
+    let typed = format!("{head}    x = l.│\n");
+    let doc = type_after(&mut lsp, "pkg/BUILD", &parses, &typed);
+    assert_eq!(
+        sorted_labels(&lsp.completion(&doc)),
+        ["name"],
+        "the loaded file as on disk, as lint reads it"
+    );
+
+    // Saved: the next good parse types against it.
+    lsp.write("lib/defs.star", edited);
+    let doc = lsp.change(&doc, &parses);
+    let doc = lsp.change(&doc, &typed);
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), ["extra", "name"]);
+}
+
+#[test]
+fn typed_members_survive_a_broken_edit() {
+    let mut lsp = Lsp::start();
+    let doc = lsp.open(
+        "pkg/BUILD",
+        &format!("{DECLS}\ndef f(l: Lib):\n    x = l.│name\n"),
+    );
+    let explained = lsp.explain(&doc);
+    assert_eq!(site_key(&explained, "stale"), json!(false), "{explained}");
+
+    let doc = lsp.change(&doc, &format!("{DECLS}\ndef f(l: Lib):\n    x = l.│\n"));
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), LIB_FIELDS);
+    let explained = lsp.explain(&doc);
+    assert_eq!(site_key(&explained, "stale"), json!(true), "{explained}");
+    assert_eq!(site_key(&explained, "type"), json!("Lib"), "{explained}");
+
+    // E5: retyped in a broken document, the parameter keeps its old type
+    // until the next good parse; a renamed one is not found.
+    let doc = lsp.change(&doc, &format!("{DECLS}\ndef f(l: Mode):\n    x = l.│\n"));
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), LIB_FIELDS);
+    let doc = lsp.change(&doc, &format!("{DECLS}\ndef f(k: Lib):\n    x = k.│\n"));
+    assert!(items(&lsp.completion(&doc)).is_empty());
+    assert_eq!(
+        site_key(&lsp.explain(&doc), "empty_because"),
+        json!("unknown_binding")
+    );
+    let doc = lsp.change(&doc, &format!("{DECLS}\ndef f(l: Mode):\n    x = l\n"));
+    let doc = lsp.change(&doc, &format!("{DECLS}\ndef f(l: Mode):\n    x = l.│\n"));
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), ["index", "value"]);
+}
+
+#[test]
+fn same_param_name_in_two_defs() {
+    let mut lsp = Lsp::start();
+    let f = "def f(l: Lib):\n";
+    let g = "def g(l: Mode):\n";
+    let h = "def h(l: Lib):\n    def k(l: Mode):\n";
+    let parses = format!("{DECLS}\n{f}    pass\n\n{g}    pass\n\n{h}        pass\n");
+    for (rel, typed, scope, want) in [
+        (
+            "f/BUILD",
+            format!("{DECLS}\n{f}    x = l.│\n\n{g}    pass\n\n{h}        pass\n"),
+            json!(["f"]),
+            LIB_FIELDS.to_vec(),
+        ),
+        (
+            "g/BUILD",
+            format!("{DECLS}\n{f}    pass\n\n{g}    x = l.│\n\n{h}        pass\n"),
+            json!(["g"]),
+            vec!["index", "value"],
+        ),
+        (
+            "k/BUILD",
+            format!("{DECLS}\n{f}    pass\n\n{g}    pass\n\n{h}        x = l.│\n"),
+            json!(["h", "k"]),
+            vec!["index", "value"],
+        ),
+    ] {
+        let doc = type_after(&mut lsp, rel, &parses, &typed);
+        assert_eq!(sorted_labels(&lsp.completion(&doc)), want, "{rel}");
+        let explained = lsp.explain(&doc);
+        assert_eq!(site_key(&explained, "scope"), scope, "{explained}");
+    }
+}
+
+#[test]
+fn comprehension_shadowing_lists_nothing() {
+    let mut lsp = Lsp::start();
+    let cfg = "cfg = Lib(name = \"x\", mode = Mode(\"debug\"))\n";
+    for (rel, parses, typed) in [
+        (
+            "group/BUILD",
+            format!("{DECLS}\ndef f(l: Lib):\n    x = [l for l in [1]]\n"),
+            format!("{DECLS}\ndef f(l: Lib):\n    x = [l.│ for l in [1]]\n"),
+        ),
+        (
+            "after/BUILD",
+            format!("{DECLS}\ndef f(l: Lib):\n    x = [l for l in [1]]\n    y = l\n"),
+            format!("{DECLS}\ndef f(l: Lib):\n    x = [l for l in [1]]\n    y = l.│\n"),
+        ),
+        (
+            "module/BUILD",
+            format!("{DECLS}{cfg}x = [cfg for cfg in [1]]\n"),
+            format!("{DECLS}{cfg}x = [cfg.│ for cfg in [1]]\n"),
+        ),
+    ] {
+        let doc = type_after(&mut lsp, rel, &parses, &typed);
+        let result = lsp.completion(&doc);
+        assert!(items(&result).is_empty(), "{rel}: {result}");
+        assert_eq!(
+            site_key(&lsp.explain(&doc), "empty_because"),
+            json!("ambiguous_binding"),
+            "{rel}"
+        );
+    }
+}
+
+#[test]
+fn lambda_param_lists_nothing() {
+    let mut lsp = Lsp::start();
+    let doc = type_after(
+        &mut lsp,
+        "pkg/BUILD",
+        &format!("{DECLS}\ndef f(l: Lib):\n    g = lambda l: l\n"),
+        &format!("{DECLS}\ndef f(l: Lib):\n    g = lambda l: l.│\n"),
+    );
+    let result = lsp.completion(&doc);
+    assert!(items(&result).is_empty(), "{result}");
+    let because = site_key(&lsp.explain(&doc), "empty_because");
+    assert!(
+        because == json!("ambiguous_binding") || because == json!("unknown_binding"),
+        "{because}"
+    );
+}
+
+#[test]
+fn untyped_receivers_list_nothing() {
+    let mut lsp = Lsp::start();
+    for (rel, parses, typed, binding) in [
+        (
+            "any/BUILD",
+            "def f(a: typing.Any):\n    pass\n",
+            "def f(a: typing.Any):\n    x = a.│\n",
+            "param",
+        ),
+        (
+            "unannotated/BUILD",
+            "def f(a):\n    pass\n",
+            "def f(a):\n    x = a.│\n",
+            "param",
+        ),
+        // A plugin function is opaque to lint, so its result is `Any`.
+        (
+            "plugin/BUILD",
+            "v = heph.fs.join(\"a\", \"b\")\n\ndef f():\n    pass\n",
+            "v = heph.fs.join(\"a\", \"b\")\n\ndef f():\n    x = v.│\n",
+            "module",
+        ),
+    ] {
+        let doc = type_after(&mut lsp, rel, parses, typed);
+        let result = lsp.completion(&doc);
+        assert!(items(&result).is_empty(), "{rel}: {result}");
+        let explained = lsp.explain(&doc);
+        assert_eq!(
+            site_key(&explained, "binding"),
+            json!(binding),
+            "{explained}"
+        );
+        assert_eq!(
+            site_key(&explained, "empty_because"),
+            json!("any"),
+            "{explained}"
+        );
+    }
+
+    // E4: a document that never parsed has no types yet.
+    let doc = lsp.open("never/BUILD", "def f(a: str):\n    x = a.│\n");
+    let result = lsp.completion(&doc);
+    assert!(items(&result).is_empty(), "{result}");
+    assert_eq!(
+        site_key(&lsp.explain(&doc), "empty_because"),
+        json!("no_types_yet")
+    );
 }
