@@ -862,7 +862,11 @@ empty, compresses it, and renames it into place:
   as the live banner would, at most 4 MiB per notice.
 - `failure_logs` holds the failure log of each **root** failure (never the
   collateral ones failed by it), its last 1 MiB each and 32 MiB in all, with
-  `cut_bytes` saying how much of its start was left out.
+  `cut_bytes` saying how much of its start was left out. A target's failure
+  slot holds only its last failure, so a log modified more than a second
+  after the session ended is another run's and is left out. That check
+  cannot catch a concurrent session that failed the same target before this
+  one ended: its log is exported as this session's.
 - `--no-logs` leaves both tables empty, for a file that leaves the machine
   without the text of a notice or a log. The records themselves (addresses,
   argv, cwd, the log lines the run printed) are still in it.
