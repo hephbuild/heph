@@ -18,7 +18,7 @@
 //! text changes; nothing about it reaches a hash.
 
 use super::annotations;
-use super::loads::{LoadEdge, LoadWalk, owns};
+use super::loads::{LoadEdge, LoadWalk, WalkedFile, owns};
 use super::report::{DeclarationSite, Finding, Kind};
 use crate::pluginbuildfile::ast::bound_names;
 use crate::pluginbuildfile::run_file::{heph_globals, is_exported, parse_build_source};
@@ -180,48 +180,36 @@ pub(crate) struct Checked {
     pub(crate) exported: BTreeSet<String>,
 }
 
-/// Every file of `walk` typechecked against `globals`, in dependency order, as
-/// [`lint`] checks them: each file's loads see [`interface_of`] the files
-/// before it. Best effort, for the LSP (I9): a file that cannot be read,
-/// parsed or ordered is left out, and so is any load of it, whose names a
-/// loader then sees as `Any`. Errors and approximations are not kept.
-pub(crate) fn interfaces<'w>(
-    walk: &'w LoadWalk,
-    read: &mut dyn FnMut(&str) -> anyhow::Result<String>,
+/// One walked file (`path`, its source `src`, its walk entry `file`)
+/// typechecked against `globals` as [`lint`] checks it: each of its loads sees
+/// [`interface_with`] over what `checked` holds of the files it loads, which
+/// were checked before it. Best effort, for the LSP (I9): `None` when the file
+/// does not parse, and a load whose files are not in `checked` is left out, so
+/// a loader sees its names as `Any`. Errors and approximations are not kept.
+pub(crate) fn check_loaded<'c>(
+    path: &str,
+    src: String,
+    file: &WalkedFile,
+    checked: impl Fn(&str) -> Option<&'c Checked>,
     globals: &Globals,
-) -> HashMap<&'w str, Checked> {
-    let mut checked: HashMap<&str, Checked> = HashMap::with_capacity(walk.files.len());
-    let Ok(order) = walk.dependency_order() else {
-        return checked;
-    };
-    for path in order {
-        let Some(file) = walk.files.get(path) else {
-            continue;
-        };
-        let Some(ast) = read(path)
-            .ok()
-            .and_then(|src| parse_build_source(path, src).ok())
-        else {
-            continue;
-        };
-        let loads = ast
-            .loads()
-            .into_iter()
-            .filter_map(|load| {
-                let edge = file.loads.get(load.module_id)?;
-                let iface = interface_of(edge, &checked).ok()?;
-                Some((load.module_id.to_owned(), iface))
-            })
-            .collect();
-        let exported = bound_names(&ast)
-            .into_iter()
-            .filter(|n| is_exported(n))
-            .map(str::to_owned)
-            .collect();
-        let (_errors, _types, iface, _approximations) = ast.typecheck(globals, &loads);
-        checked.insert(path, Checked { iface, exported });
-    }
-    checked
+) -> Option<Checked> {
+    let ast = parse_build_source(path, src).ok()?;
+    let loads = ast
+        .loads()
+        .into_iter()
+        .filter_map(|load| {
+            let edge = file.loads.get(load.module_id)?;
+            let iface = interface_with(edge, &checked).ok()?;
+            Some((load.module_id.to_owned(), iface))
+        })
+        .collect();
+    let exported = bound_names(&ast)
+        .into_iter()
+        .filter(|n| is_exported(n))
+        .map(str::to_owned)
+        .collect();
+    let (_errors, _types, iface, _approximations) = ast.typecheck(globals, &loads);
+    Some(Checked { iface, exported })
 }
 
 /// The interface one `load()` sees. A file load is the file's own; a
@@ -237,10 +225,16 @@ pub(crate) fn interface_of(
     edge: &LoadEdge,
     checked: &HashMap<&str, Checked>,
 ) -> anyhow::Result<Interface> {
+    interface_with(edge, |path| checked.get(path))
+}
+
+/// [`interface_of`], each loaded file's [`Checked`] looked up by `checked`.
+pub(crate) fn interface_with<'c>(
+    edge: &LoadEdge,
+    checked: impl Fn(&str) -> Option<&'c Checked>,
+) -> anyhow::Result<Interface> {
     let get = |path: &str| {
-        checked
-            .get(path)
-            .with_context(|| format!("{path} is loaded before it was checked"))
+        checked(path).with_context(|| format!("{path} is loaded before it was checked"))
     };
     match edge {
         LoadEdge::File { path, .. } => Ok(get(path)?.iface.clone()),

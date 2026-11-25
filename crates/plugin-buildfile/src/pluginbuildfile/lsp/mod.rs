@@ -18,6 +18,7 @@ pub(crate) mod diagnostics;
 mod handlers;
 mod index;
 mod lex;
+mod memo;
 mod position;
 mod server;
 pub(crate) mod site;

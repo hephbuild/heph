@@ -7,40 +7,13 @@
 //! (I8). A member list is exactly what the checker accepts on the receiver's
 //! type ([`starlark::typing::members`], I7).
 
-use crate::pluginbuildfile::checks::lint::{self, interface_of};
-use crate::pluginbuildfile::checks::loads::walk_loads;
 use crate::pluginbuildfile::run_file::parse_build_source;
 use serde_json::{Map, Value, json};
 use starlark::environment::Globals;
 use starlark::typing::{AstModuleTypecheck, BindingKind, Interface, Ty, TyBasic, members};
 use std::collections::HashMap;
-use std::path::Path;
 
 use super::site::Literal;
-
-/// The interface each of a document's `load()` strings sees: lint's walk and
-/// lint's merge (I9), the loaded files read from disk under `root`.
-///
-/// `file` is the document's absolute path (`root` joined with its workspace
-/// path), `pkg` its package, `modules` its load strings. A load that does not
-/// resolve is missing from the map, so the names it binds are untyped.
-pub(crate) fn loaded_interfaces<'m>(
-    root: &Path,
-    pkg: &str,
-    file: &Path,
-    modules: impl IntoIterator<Item = &'m str>,
-    patterns: &[glob::Pattern],
-    globals: &Globals,
-) -> HashMap<String, Interface> {
-    let walker = hwalk::CachedWalker::disabled();
-    let (edges, walk) = walk_loads(root, &walker, pkg, file, modules, patterns);
-    let mut read = lint::read_under(root);
-    let checked = lint::interfaces(&walk, &mut read, globals);
-    edges
-        .into_iter()
-        .filter_map(|(module, edge)| Some((module, interface_of(&edge, &checked).ok()?)))
-        .collect()
-}
 
 /// One module-level binding's type and where it came from.
 #[derive(Debug)]

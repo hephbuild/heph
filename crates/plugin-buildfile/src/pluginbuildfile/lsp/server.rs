@@ -15,9 +15,10 @@ use super::context::HephLspContext;
 use super::handlers::{self, Ctx, Merge, Registry};
 use super::index::SharedState;
 use super::lex::{self, Tokens};
+use super::memo::{InterfaceMemo, Loaded};
 use super::position::{self, Encoding};
 use super::site::{self, AstState, Resolution, Site};
-use super::typed::{self, Answer, DocTypes, Lookup};
+use super::typed::{Answer, DocTypes, Lookup};
 use crate::pluginbuildfile::checks::lint::check_globals;
 use crate::pluginbuildfile::run_file::heph_globals;
 use crate::pluginbuildfile::types::DriverKwargs;
@@ -34,7 +35,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use starlark::environment::Globals;
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
@@ -78,15 +79,25 @@ struct Document {
     /// The types of `good_text`, checked on the first member request that
     /// needs them.
     types: Option<TypesMemo>,
+    /// Every loaded file the last typecheck's loads reached: the
+    /// [`InterfaceMemo`] entries this document keeps alive. It outlives an
+    /// edit, so the next typecheck finds them; `didClose` releases them.
+    reach: Vec<String>,
     /// Outside the bound repo: stock answers only, `reason: outside_root`.
     outside_root: bool,
 }
 
 /// One typecheck of a document's last good text: valid while the text's
-/// version and the registry generation are the ones it was checked at.
+/// version, the registry generation and its loads' chained key are the ones
+/// it was checked at.
 struct TypesMemo {
     version: i32,
     generation: u64,
+    /// The text's load strings, to look its loads up again without a parse.
+    modules: Arc<[String]>,
+    /// [`Loaded::key`] at the typecheck: a loaded file that changed on disk,
+    /// however deep, moves it.
+    loads: u128,
     types: Arc<DocTypes>,
 }
 
@@ -128,6 +139,8 @@ struct Server<'a> {
     globals: Option<(u64, Arc<Globals>)>,
     /// Typechecks run, for `heph/documents` (test support).
     typechecks: u64,
+    /// The loaded files' interfaces, shared by every open document (I10).
+    interfaces: InterfaceMemo,
     shutting_down: bool,
 }
 
@@ -274,6 +287,7 @@ pub fn run_with(
         registry_generation,
         globals: None,
         typechecks: 0,
+        interfaces: InterfaceMemo::default(),
         shutting_down: false,
     };
     server.main_loop();
@@ -419,12 +433,23 @@ impl Server<'_> {
             "textDocument/definition" => parse(&req).map(|p| self.definition(p)),
             "textDocument/formatting" => Ok(self.formatting(&req.params)),
             #[cfg(feature = "test-support")]
-            "heph/documents" => Ok(serde_json::json!({
-                "documents": self.documents.len(),
-                "parses": self.backend.parsed_documents(),
-                "indexes": self.shared.len(),
-                "typechecks": self.typechecks,
-            })),
+            "heph/documents" => Ok({
+                // Polled, so `registry` is what the next request would see.
+                let _ready = self.registry();
+                serde_json::json!({
+                    "documents": self.documents.len(),
+                    "parses": self.backend.parsed_documents(),
+                    "indexes": self.shared.len(),
+                    "typechecks": self.typechecks,
+                    "interfaces": self.interfaces.len(),
+                    "interface_checks": self.interfaces.checks(),
+                    "registry": match self.registry {
+                        RegistryState::Loading(_) => "loading",
+                        RegistryState::Ready(_) => "ready",
+                        RegistryState::Failed => "failed",
+                    },
+                })
+            }),
             #[cfg(feature = "test-support")]
             "heph/explain" => parse::<lsp_types::TextDocumentPositionParams>(&req).map(|p| {
                 let Some(located) = self.locate(&p.text_document.uri, p.position) else {
@@ -489,11 +514,12 @@ impl Server<'_> {
         // evaluation below (and re-evaluates the other open documents).
         let _ready = self.registry();
         let parsed = self.diagnose(&key, &client_uri, &text, &tokens, version);
-        let prev = self.documents.remove(&key);
+        let mut prev = self.documents.remove(&key);
         let outside_root = match &prev {
             Some(prev) => prev.outside_root,
             None => matches!(&key, LspUri::File(p) if !self.root.contains(p)),
         };
+        let reach = prev.as_mut().map(|p| std::mem::take(&mut p.reach));
         let (ast_version, good_text, types) = match prev {
             _ if parsed => (Some(version), Some(Arc::from(text.as_str())), None),
             Some(prev) => (prev.ast_version, prev.good_text, prev.types),
@@ -509,6 +535,7 @@ impl Server<'_> {
                 ast_version,
                 good_text,
                 types,
+                reach: reach.unwrap_or_default(),
                 outside_root,
             },
         );
@@ -585,9 +612,22 @@ impl Server<'_> {
             return;
         };
         self.documents.remove(&key);
+        self.evict_unreached();
         self.backend.close(&key);
         self.shared.remove(&key);
         self.publish(client_uri, Vec::new(), None);
+    }
+
+    /// Drop every memoized interface no open document's loads reach (I10):
+    /// run as a document closes, and after every typecheck, since a document
+    /// that changed its loads leaves the old ones behind.
+    fn evict_unreached(&mut self) {
+        let reached: HashSet<&str> = self
+            .documents
+            .values()
+            .flat_map(|d| d.reach.iter().map(String::as_str))
+            .collect();
+        self.interfaces.retain(&reached);
     }
 
     fn publish(&self, uri: Uri, diagnostics: Vec<Diagnostic>, version: Option<i32>) {
@@ -865,8 +905,14 @@ impl Server<'_> {
     }
 
     /// The types of `key`'s last good text, checked now unless the memo is
-    /// for that text and the current registry generation; whether that text
-    /// is behind the current one; whether the registry has landed.
+    /// for that text, the current registry generation and what its loads see
+    /// now; whether that text is behind the current one; whether the registry
+    /// has landed.
+    ///
+    /// Every call looks the loads up again ([`InterfaceMemo`]): a loaded file
+    /// edited on disk, however deep, moves their key and so misses the
+    /// document's memo. The interfaces no open document reaches are evicted
+    /// after.
     fn doc_types(&mut self, key: &LspUri) -> (Option<Arc<DocTypes>>, bool, bool) {
         let registry = self.registry();
         let ready = registry.is_some();
@@ -878,12 +924,11 @@ impl Server<'_> {
             return (None, false, ready);
         };
         let stale = version != doc.version;
-        if let Some(memo) = &doc.types
-            && memo.version == version
-            && memo.generation == generation
-        {
-            return (Some(Arc::clone(&memo.types)), stale, ready);
-        }
+        let memo = doc
+            .types
+            .as_ref()
+            .filter(|m| m.version == version && m.generation == generation)
+            .map(|m| (Arc::clone(&m.types), Arc::clone(&m.modules), m.loads));
         let Some((rel, abs)) = self.workspace_path(key) else {
             return (None, stale, ready);
         };
@@ -891,28 +936,69 @@ impl Server<'_> {
         let root = &self.shared.root;
         let pkg = handlers::pkg_of(root, &abs);
         let patterns = &self.shared.patterns;
-        let checked = DocTypes::check(&rel, &good, &globals, |modules| {
-            typed::loaded_interfaces(
+        let interfaces = &mut self.interfaces;
+        let mut lookup = |modules: &[&str]| {
+            interfaces.loaded_interfaces(
                 root,
                 &pkg,
                 &abs,
                 modules.iter().copied(),
                 patterns,
                 &globals,
+                generation,
             )
+        };
+
+        // The text's own types still hold if its loads see what they saw.
+        let mut fresh = None;
+        if let Some((types, modules, loads)) = memo {
+            let names: Vec<&str> = modules.iter().map(String::as_str).collect();
+            let loaded = lookup(&names);
+            if loaded.key == loads {
+                let reach = loaded.closure;
+                self.settle(key, reach, None);
+                return (Some(types), stale, ready);
+            }
+            fresh = Some(loaded);
+        }
+        let mut seen: Option<(Arc<[String]>, u128, Vec<String>)> = None;
+        let checked = DocTypes::check(&rel, &good, &globals, |modules| {
+            let Loaded {
+                interfaces,
+                key,
+                closure,
+            } = fresh.unwrap_or_else(|| lookup(modules));
+            seen = Some((
+                modules.iter().map(|&m| m.to_owned()).collect(),
+                key,
+                closure,
+            ));
+            interfaces
         });
         self.typechecks += 1;
-        let Some(types) = checked.map(Arc::new) else {
-            return (None, stale, ready);
-        };
+        let (modules, loads, reach) = seen.unwrap_or_default();
+        let types = checked.map(Arc::new);
+        let memo = types.as_ref().map(|types| TypesMemo {
+            version,
+            generation,
+            modules,
+            loads,
+            types: Arc::clone(types),
+        });
+        self.settle(key, reach, memo);
+        (types, stale, ready)
+    }
+
+    /// Record what `key`'s typecheck (or its memo's validation) reached and,
+    /// when it checked, its memo; then evict what no document reaches.
+    fn settle(&mut self, key: &LspUri, reach: Vec<String>, memo: Option<TypesMemo>) {
         if let Some(doc) = self.documents.get_mut(key) {
-            doc.types = Some(TypesMemo {
-                version,
-                generation,
-                types: Arc::clone(&types),
-            });
+            doc.reach = reach;
+            if memo.is_some() {
+                doc.types = memo;
+            }
         }
-        (Some(types), stale, ready)
+        self.evict_unreached();
     }
 
     /// lint's globals (I9): with the plugin functions and the drivers'
