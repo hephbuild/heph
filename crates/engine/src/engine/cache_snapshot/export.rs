@@ -27,8 +27,8 @@
 //! A revision goes in with every non-log blob, or not at all. Its manifest is
 //! the local one, re-encoded through [`RemoteManifest::from_local`], the
 //! upload's own builder. Each blob is hard-linked from the previous
-//! generation when that generation's entry for it is equal on type, group,
-//! hashout, size and encoding and is a regular file, else copied from the
+//! generation when that generation's entry for it is equal on type, content
+//! type, group, hashout, size and encoding and is a regular file, else copied from the
 //! local cache — never linked out of `<home>/cache/blobs/`. Every placed blob
 //! is checked: a raw one's length against `size`, a zstd one decoded through
 //! its frame checksums. Anything that fails leaves the whole revision out,
@@ -473,58 +473,69 @@ struct Reference {
 
 /// Pick the manifest `job` is exported under: the local one (a v1 converted
 /// to v2 names), or for a carry-over the local cache no longer holds, the
-/// previous generation's.
-fn reference(
-    cache: &Arc<dyn LocalCache>,
-    job: &Job,
-) -> anyhow::Result<Result<Reference, (LeftOut, u64)>> {
-    let local = Engine::read_newest_manifest(cache, &job.addr, &job.hashin)
-        .with_context(|| format!("reading the manifest of {} {}", job.addr, job.hashin))?;
+/// previous generation's. A local manifest that does not read or decode
+/// leaves the revision out as [`LeftOut::Corrupt`], like a corrupt blob.
+fn reference(cache: &Arc<dyn LocalCache>, job: &Job) -> Result<Reference, (LeftOut, u64)> {
+    let local = match Engine::read_newest_manifest(cache, &job.addr, &job.hashin) {
+        Ok(local) => local,
+        Err(e) => {
+            tracing::warn!(
+                addr = %job.addr, hashin = %job.hashin, error = %format!("{e:#}"),
+                "cache snapshot: the local manifest does not read; leaving the revision out",
+            );
+            return Err((LeftOut::Corrupt, 0));
+        }
+    };
     let Some((name, local)) = local else {
-        return Ok(match (&job.prev, job.kind) {
+        return match (&job.prev, job.kind) {
             (Some(prev), Kind::CarriedOver) => Ok(Reference {
                 manifest: (**prev).clone(),
                 local_names: vec![None; prev.artifacts.len()],
             }),
             _ => Err((LeftOut::Trimmed, 0)),
-        });
+        };
     };
     let decoded: u64 = local.artifacts.iter().map(|a| a.size).sum();
     if local.target != job.addr.format() || local.hashin != job.hashin {
-        return Ok(Err((LeftOut::KeyMismatch, decoded)));
+        return Err((LeftOut::KeyMismatch, decoded));
     }
-    if name == MANIFEST_V1 {
-        // A v1 manifest names bare blobs, every one raw: each goes under its
-        // v2 name for that encoding, as `duplicate_cache_entry` converts it.
-        let mut converted: Manifest = local.clone();
-        let mut local_names = Vec::with_capacity(local.artifacts.len());
-        for a in &mut converted.artifacts {
-            if a.encoding != ManifestArtifactEncoding::None {
-                return Ok(Err((LeftOut::Unsupported, decoded)));
+    match name {
+        MANIFEST_V1 => {
+            // A v1 manifest names bare blobs, every one raw: each goes under
+            // its v2 name for that encoding, as `duplicate_cache_entry`
+            // converts it.
+            let mut converted: Manifest = local.clone();
+            let mut local_names = Vec::with_capacity(local.artifacts.len());
+            for a in &mut converted.artifacts {
+                if a.encoding != ManifestArtifactEncoding::None {
+                    return Err((LeftOut::Unsupported, decoded));
+                }
+                let v2 = cache_codec::entry_name(&a.name, &ManifestArtifactEncoding::None);
+                local_names.push(Some(std::mem::replace(&mut a.name, v2)));
             }
-            let v2 = cache_codec::entry_name(&a.name, &ManifestArtifactEncoding::None);
-            local_names.push(Some(std::mem::replace(&mut a.name, v2)));
+            Ok(Reference {
+                manifest: RemoteManifest::from_local(&converted, &job.hashin),
+                local_names,
+            })
         }
-        return Ok(Ok(Reference {
-            manifest: RemoteManifest::from_local(&converted, &job.hashin),
-            local_names,
-        }));
+        MANIFEST_V2 => Ok(Reference {
+            manifest: RemoteManifest::from_local(&local, &job.hashin),
+            local_names: local
+                .artifacts
+                .iter()
+                .map(|a| Some(a.name.clone()))
+                .collect(),
+        }),
+        // A manifest name a later heph adds: not one this export converts.
+        _ => Err((LeftOut::Unsupported, decoded)),
     }
-    debug_assert_eq!(name, MANIFEST_V2);
-    Ok(Ok(Reference {
-        manifest: RemoteManifest::from_local(&local, &job.hashin),
-        local_names: local
-            .artifacts
-            .iter()
-            .map(|a| Some(a.name.clone()))
-            .collect(),
-    }))
 }
 
 /// Whether a previous-generation entry may stand in for `want`.
 fn same_entry(prev: &RemoteManifestArtifact, want: &RemoteManifestArtifact) -> bool {
     prev.name == want.name
         && prev.r#type == want.r#type
+        && prev.content_type == want.content_type
         && prev.group == want.group
         && prev.hashout == want.hashout
         && prev.size == want.size
@@ -618,7 +629,7 @@ fn export_revision(
     job: &Job,
     roots: &Roots,
 ) -> anyhow::Result<Placed> {
-    let reference = match reference(cache, job)? {
+    let reference = match reference(cache, job) {
         Ok(r) => r,
         Err((why, bytes)) => return Ok(Placed::LeftOut(why, bytes)),
     };

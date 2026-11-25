@@ -1589,11 +1589,18 @@ impl Engine {
     /// Absolute directories every plugin that walks the tree must prune by exact
     /// path: the engine-owned home (cache/sandboxes/locks — never packages), the
     /// CI cache snapshot dir when one is configured (I1: a root glob never reads
-    /// a snapshot, whatever its name), plus the literal (non-glob) `fs.skip`
-    /// entries, resolved relative to the root.
+    /// a snapshot, whatever its name, nor through another spelling of it:
+    /// [`snapshot_skip_dirs`](crate::engine::cache_snapshot::snapshot_skip_dirs)),
+    /// plus the literal (non-glob) `fs.skip` entries, resolved relative to the
+    /// root.
     pub fn skip_dirs(&self) -> Vec<PathBuf> {
         let mut dirs = vec![self.home.to_path_buf()];
-        dirs.extend(self.cfg.cache_snapshot.iter().cloned());
+        if let Some(dir) = &self.cfg.cache_snapshot {
+            dirs.extend(crate::engine::cache_snapshot::snapshot_skip_dirs(
+                &self.cfg.root,
+                dir,
+            ));
+        }
         dirs.extend(
             self.cfg
                 .fs_skip

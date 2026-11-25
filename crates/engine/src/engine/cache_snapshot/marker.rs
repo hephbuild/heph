@@ -205,6 +205,10 @@ pub fn read_marker(dir: &Path) -> Result<Generation, NoTier> {
 /// diagnostic saying so: a `warn!` carrying the format seen, except for a
 /// `dir` that does not exist, which is a lineage's first job and only logged
 /// at `info`.
+///
+/// Every engine opens the tier, helper engines included, so one process may
+/// open the same unusable dir many times: the warning is sent once per
+/// process for each dir and reason, and logged at `debug` after that.
 pub fn open_tier(dir: &Path) -> Result<Generation, NoTier> {
     match read_marker(dir) {
         Ok(generation) => {
@@ -222,15 +226,38 @@ pub fn open_tier(dir: &Path) -> Result<Generation, NoTier> {
             Err(NoTier::NoDir)
         }
         Err(reason) => {
-            tracing::warn!(
-                dir = %dir.display(),
-                format = ?reason.format(),
-                reason = %reason,
-                "cache snapshot: not used, building cold",
-            );
+            if first_warning(dir, &reason) {
+                tracing::warn!(
+                    dir = %dir.display(),
+                    format = ?reason.format(),
+                    reason = %reason,
+                    "cache snapshot: not used, building cold",
+                );
+            } else {
+                tracing::debug!(
+                    dir = %dir.display(),
+                    reason = %reason,
+                    "cache snapshot: not used, building cold (warned already)",
+                );
+            }
             Err(reason)
         }
     }
+}
+
+/// Whether this process has not yet warned about `dir` for `reason`; records
+/// that it now has.
+fn first_warning(dir: &Path, reason: &NoTier) -> bool {
+    static WARNED: std::sync::Mutex<Vec<(PathBuf, String)>> = std::sync::Mutex::new(Vec::new());
+    let key = (dir.to_path_buf(), reason.to_string());
+    let Ok(mut warned) = WARNED.lock() else {
+        return true;
+    };
+    if warned.contains(&key) {
+        return false;
+    }
+    warned.push(key);
+    true
 }
 
 /// [`write_marker_with`] recording no counts.

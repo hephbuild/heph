@@ -48,7 +48,7 @@ use anyhow::Context as _;
 use hmodel::htaddr::Addr;
 use hmodel::htpkg::PkgBuf;
 use parking_lot::Mutex;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::Write as _;
@@ -236,11 +236,30 @@ fn push_line(buf: &mut Vec<u8>, line: &Line) {
 struct JournalFile {
     path: PathBuf,
     file: Mutex<std::fs::File>,
+    /// Set by the first failed append. The file then lacks (part of) a
+    /// batch, so nothing more is written to it — the trailer included — and
+    /// it reads as incomplete ([`Incomplete::NoTrailer`]), never as a
+    /// smaller complete set.
+    poisoned: AtomicBool,
 }
 
 impl JournalFile {
+    fn new(path: PathBuf, file: std::fs::File) -> Self {
+        Self {
+            path,
+            file: Mutex::new(file),
+            poisoned: AtomicBool::new(false),
+        }
+    }
+
     fn append(&self, bytes: &[u8]) {
-        if let Err(e) = self.file.lock().write_all(bytes) {
+        let mut file = self.file.lock();
+        // Read and set under the file's mutex, which orders every append.
+        if self.poisoned.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Err(e) = file.write_all(bytes) {
+            self.poisoned.store(true, Ordering::Relaxed);
             tracing::warn!(
                 path = %self.path.display(), error = %e,
                 "writing the working-set journal failed; the next snapshot will read this run as incomplete",
@@ -256,8 +275,10 @@ pub struct Journal {
     /// Created at the first record. `None` inside means creation failed:
     /// warned once, and nothing more is recorded.
     file: OnceLock<Option<JournalFile>>,
-    /// Every revision this engine has batched, so each is written once.
-    seen: Mutex<FxHashSet<(Addr, Arc<str>)>>,
+    /// Every revision this engine has batched, so each is written once: the
+    /// `hashin`s of each target. Keyed by target so a lookup borrows, and a
+    /// revision already seen allocates nothing.
+    seen: Mutex<FxHashMap<Addr, FxHashSet<Arc<str>>>>,
     /// Every scratch entry this engine has batched.
     seen_scratch: Mutex<FxHashSet<RecordedScratch>>,
     /// Set once the run-end reminder of an unwritten journal was sent, so an
@@ -271,7 +292,7 @@ impl Journal {
         Self {
             dir: working_set_dir(home),
             file: OnceLock::new(),
-            seen: Mutex::new(FxHashSet::default()),
+            seen: Mutex::new(FxHashMap::default()),
             seen_scratch: Mutex::new(FxHashSet::default()),
             reminded: AtomicBool::new(false),
         }
@@ -284,7 +305,7 @@ impl Journal {
 
     /// How many distinct revisions this engine has recorded.
     pub fn revisions(&self) -> usize {
-        self.seen.lock().len()
+        self.seen.lock().values().map(FxHashSet::len).sum()
     }
 
     /// Record a scratch slot published outside any request (`heph tool
@@ -363,7 +384,6 @@ fn create_journal_file(dir: &Path) -> anyhow::Result<JournalFile> {
         };
         let published = (|| -> anyhow::Result<PathBuf> {
             file.try_lock()
-                .map_err(|e| anyhow::anyhow!("{e}"))
                 .with_context(|| format!("locking {}", tmp.display()))?;
             let mut buf = serde_json::to_vec(&Header {
                 magic: JOURNAL_MAGIC.to_owned(),
@@ -379,10 +399,7 @@ fn create_journal_file(dir: &Path) -> anyhow::Result<JournalFile> {
             Ok(path)
         })();
         return match published {
-            Ok(path) => Ok(JournalFile {
-                path,
-                file: Mutex::new(file),
-            }),
+            Ok(path) => Ok(JournalFile::new(path, file)),
             Err(e) => {
                 drop(file);
                 drop(std::fs::remove_file(&tmp));
@@ -421,15 +438,21 @@ impl RequestJournal {
     /// of an engine creates its journal file (I5: the lock is held from the
     /// first recording request on).
     pub(crate) fn record_revision(&self, addr: &Addr, hashin: &str) {
-        let key: Arc<str> = Arc::from(hashin);
-        if !self
-            .journal
-            .seen
-            .lock()
-            .insert((addr.clone(), Arc::clone(&key)))
-        {
-            return;
-        }
+        let key: Arc<str> = {
+            let mut seen = self.journal.seen.lock();
+            if let Some(hashins) = seen.get_mut(addr) {
+                if hashins.contains(hashin) {
+                    return;
+                }
+                let key: Arc<str> = Arc::from(hashin);
+                hashins.insert(Arc::clone(&key));
+                key
+            } else {
+                let key: Arc<str> = Arc::from(hashin);
+                seen.insert(addr.clone(), FxHashSet::from_iter([Arc::clone(&key)]));
+                key
+            }
+        };
         if self.journal.file().is_none() {
             return;
         }
@@ -730,6 +753,34 @@ impl WorkingSet {
     }
 }
 
+/// The paths a tree walk rooted at `root` must prune for the snapshot dir
+/// `dir` (I1), when the walker compares exact lexical paths.
+///
+/// `dir` as configured, always. When it exists, also its canonical form, and
+/// that form re-rooted under `root` as written when it lies under `root`'s
+/// canonical form: an absolute `dir` spelled through a symlink (macOS's
+/// `/var` for `/private/var`, a symlinked checkout) names the directory the
+/// walker reaches under another spelling, and a root glob would otherwise
+/// hash the snapshot.
+pub fn snapshot_skip_dirs(root: &Path, dir: &Path) -> Vec<PathBuf> {
+    let mut out = vec![dir.to_path_buf()];
+    let Ok(canonical) = std::fs::canonicalize(dir) else {
+        return out;
+    };
+    if let Ok(root_canonical) = std::fs::canonicalize(root)
+        && let Ok(rel) = canonical.strip_prefix(&root_canonical)
+    {
+        let rerooted = hcore::paths::lexical(&root.join(rel));
+        if !out.contains(&rerooted) {
+            out.push(rerooted);
+        }
+    }
+    if !out.contains(&canonical) {
+        out.push(canonical);
+    }
+    out
+}
+
 impl crate::engine::Engine {
     /// This engine's working-set journal, when it records one
     /// ([`Config::record_working_set`](crate::engine::Config::record_working_set)).
@@ -969,6 +1020,86 @@ mod tests {
         let j = record_and_read(|rj| rj.record_revision(&addr("p", "a", &[]), "ha"));
         assert_eq!(j.version, JOURNAL_VERSION);
         assert_eq!(j.incomplete, None);
+    }
+
+    /// Wait for every queued flush job.
+    fn drain(pending: &crate::engine::sandbox_cleaner::PendingCounter) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while pending.load(Ordering::Acquire) > 0 {
+            assert!(std::time::Instant::now() < deadline, "flush never drained");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// A batch that failed to append is never followed by a trailer, even
+    /// when the file is writable again by the time the journal drops: the
+    /// run reads as incomplete, not as a complete run missing that batch.
+    #[test]
+    fn a_failed_append_leaves_the_journal_incomplete() {
+        let home = tempfile::tempdir().expect("home");
+        let journal = Arc::new(Journal::new(home.path()));
+        let pending = crate::engine::sandbox_cleaner::PendingCounter::default();
+        let request = |name: &str, hashin: &str| {
+            let rj = RequestJournal::new(Arc::clone(&journal));
+            rj.record_revision(&addr("p", name, &[]), hashin);
+            rj.flush(false, &pending);
+            drain(&pending);
+        };
+        request("a", "ha");
+        let path = journal.path().expect("created").to_path_buf();
+        let jf = journal
+            .file
+            .get()
+            .and_then(Option::as_ref)
+            .expect("journal open");
+
+        // The next batch fails: its writes go to a read-only handle...
+        let read_only = std::fs::File::open(&path).expect("open read-only");
+        let writable = std::mem::replace(&mut *jf.file.lock(), read_only);
+        request("b", "hb");
+        // ...and the file is writable again for the trailer, as a disk that
+        // freed up would be.
+        *jf.file.lock() = writable;
+        request("c", "hc");
+        drop(journal);
+
+        let j = read_journal(&path).expect("read");
+        assert_eq!(j.incomplete, Some(Incomplete::NoTrailer));
+        assert_eq!(
+            j.revisions
+                .iter()
+                .map(|r| r.hashin.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ha"],
+            "nothing is written after the failed batch"
+        );
+    }
+
+    /// A snapshot dir named through a symlink is pruned under the spelling
+    /// the walker reaches it by, in both directions: the root through the
+    /// link and the dir by its real path, and the other way round.
+    #[test]
+    fn a_symlinked_snapshot_dir_is_pruned_under_the_walked_spelling() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let real = tmp.path().join("real");
+        let snap = real.join("snap");
+        std::fs::create_dir_all(&snap).expect("mkdir");
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let real_canonical = std::fs::canonicalize(&real).expect("canonical");
+
+        // Walked through the link; configured by the real path.
+        let dirs = snapshot_skip_dirs(&link, &real_canonical.join("snap"));
+        assert!(dirs.contains(&link.join("snap")), "{dirs:?}");
+
+        // Walked by the real path; configured through the link.
+        let dirs = snapshot_skip_dirs(&real_canonical, &link.join("snap"));
+        assert!(dirs.contains(&real_canonical.join("snap")), "{dirs:?}");
+        assert!(dirs.contains(&link.join("snap")), "{dirs:?}");
+
+        // A dir that does not exist yet keeps its lexical form only.
+        let absent = link.join("absent");
+        assert_eq!(snapshot_skip_dirs(&link, &absent), vec![absent]);
     }
 
     #[test]

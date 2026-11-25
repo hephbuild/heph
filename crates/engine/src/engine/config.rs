@@ -146,8 +146,10 @@ pub struct Config {
     /// `None` when snapshots are off: `HEPH_CACHE_SNAPSHOT` over
     /// `cacheSnapshot.dir`, resolved by
     /// [`resolve_cache_snapshot_dir`](crate::engine::config_yaml::resolve_cache_snapshot_dir).
-    /// Every tree walk prunes it ([`Engine::skip_dirs`]), so no glob ever
-    /// reads it as source.
+    /// It is in [`Engine::skip_dirs`], which every in-process tree walk
+    /// prunes, so no BUILD-file glob reads it as source. Not every walk: the
+    /// Go cdylib plugin builds its provider with no skip dirs at all, so its
+    /// package discovery does not prune this dir.
     ///
     /// [`Engine::skip_dirs`]: crate::engine::Engine::skip_dirs
     pub cache_snapshot: Option<PathBuf>,
