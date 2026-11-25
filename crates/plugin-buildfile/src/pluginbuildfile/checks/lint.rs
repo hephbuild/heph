@@ -2339,4 +2339,246 @@ def f(k: heph.types.bash.Kwargs):
               (A declared at pkg/BUILD:1; B declared at pkg/BUILD:2)"]
         );
     }
+
+    /// One row of [`module_call_results_sound_against_runtime`]: the global
+    /// the row calls (its dotted path) and the module's lines, the last of
+    /// which binds `x` to the call. A global can have several rows.
+    const SOUND_ROWS: &[(&str, &[&str])] = &[
+        ("abs", &["x = abs(-1)"]),
+        ("abs", &["x = abs(-1.5)"]),
+        ("all", &["x = all([1, 0])"]),
+        ("any", &["x = any([])"]),
+        ("bool", &["x = bool(1)"]),
+        ("bytes", &["x = bytes(\"a\")"]),
+        ("chr", &["x = chr(65)"]),
+        ("dict", &["x = dict(a = 1)"]),
+        ("dir", &["x = dir(\"\")"]),
+        ("enum", &["x = enum(\"a\", \"b\")"]),
+        ("enumerate", &["x = enumerate([\"a\"])"]),
+        ("eval_type", &["x = eval_type(int)"]),
+        ("fail", &["x = fail(\"no\")"]),
+        ("field", &["x = field(str)"]),
+        ("field", &["x = field(list[str], [])"]),
+        ("file", &["x = file(\"a.txt\")"]),
+        ("float", &["x = float(1)"]),
+        ("getattr", &["x = getattr(\"\", \"upper\")"]),
+        ("glob", &["x = glob(\"*.c\")"]),
+        ("hasattr", &["x = hasattr(\"\", \"upper\")"]),
+        ("hash", &["x = hash(\"a\")"]),
+        ("heph.core.arch", &["x = heph.core.arch()"]),
+        ("heph.core.arch_raw", &["x = heph.core.arch_raw()"]),
+        ("heph.core.num_cpu", &["x = heph.core.num_cpu()"]),
+        ("heph.core.os", &["x = heph.core.os()"]),
+        ("heph.core.os_raw", &["x = heph.core.os_raw()"]),
+        ("heph.core.packages", &["x = heph.core.packages(\"//...\")"]),
+        ("heph.core.pkg", &["x = heph.core.pkg()"]),
+        ("heph.core.resource", &["x = heph.core.resource(\"cpu\")"]),
+        (
+            "heph.core.resource",
+            &["x = heph.core.resource(\"memory\")"],
+        ),
+        ("int", &["x = int(\"1\")"]),
+        ("isinstance", &["x = isinstance(1, int)"]),
+        ("len", &["x = len([1])"]),
+        ("list", &["x = list((1, 2))"]),
+        ("max", &["x = max(1, 2)"]),
+        ("min", &["x = min([1, 2])"]),
+        ("ord", &["x = ord(\"a\")"]),
+        (
+            "provider_state",
+            &["x = provider_state(provider = \"p\", a = 1)"],
+        ),
+        ("query", &["x = query(\"//...\")"]),
+        ("range", &["x = range(3)"]),
+        ("record", &["x = record(name = str)"]),
+        ("repr", &["x = repr(1)"]),
+        ("reversed", &["x = reversed([1, 2])"]),
+        ("sorted", &["x = sorted([2, 1])"]),
+        ("str", &["x = str(1)"]),
+        ("struct", &["x = struct(a = 1)"]),
+        ("target", &["x = target(name = \"t\", driver = \"bash\")"]),
+        ("tuple", &["x = tuple([1])"]),
+        ("type", &["x = type(1)"]),
+        ("zip", &["x = zip([1], [\"a\"])"]),
+    ];
+
+    /// Callable globals [`module_call_results_sound_against_runtime`] cannot
+    /// call in a unit test, each with why. Checked: an entry that is not a
+    /// callable global, or that also has a row, fails the test.
+    const SOUND_EXEMPT: &[(&str, &str)] = &[];
+
+    /// Every callable global the checker sees ([`check_globals`] with no
+    /// plugin function: a plugin function is opaque and typed `Any`), by
+    /// dotted path, namespaces walked.
+    fn callable_globals() -> BTreeSet<String> {
+        use starlark::environment::Module;
+        use starlark::values::{Heap, Value};
+
+        fn walk<'v>(path: String, v: Value<'v>, heap: Heap<'v>, out: &mut BTreeSet<String>) {
+            match v.get_type() {
+                "namespace" => {
+                    for name in v.dir_attr() {
+                        let member =
+                            v.get_attr(&name, heap).ok().flatten().unwrap_or_else(|| {
+                                panic!("{path}.{name} is listed but not readable")
+                            });
+                        walk(format!("{path}.{name}"), member, heap, out);
+                    }
+                }
+                "function" => {
+                    out.insert(path);
+                }
+                _ => {}
+            }
+        }
+
+        let globals = check_globals(&[], &crate::pluginbuildfile::types::tests::test_kwargs());
+        Module::with_temp_heap(|module| {
+            let mut out = BTreeSet::new();
+            for (name, v) in globals.iter() {
+                walk(name.to_owned(), v.to_value(), module.heap(), &mut out);
+            }
+            out
+        })
+    }
+
+    /// A type as a value, so `TypeCompiled::new` compiles it exactly as the
+    /// evaluator compiles an annotation of that type
+    /// (`TypeCompiled::from_ty`, which is crate-private).
+    #[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]
+    struct TyValue(Ty);
+
+    impl std::fmt::Display for TyValue {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            std::fmt::Display::fmt(&self.0, f)
+        }
+    }
+
+    starlark::starlark_simple_value!(TyValue);
+
+    #[starlark_value(type = "ty_value")]
+    impl<'v> StarlarkValue<'v> for TyValue {
+        fn eval_type(&self) -> Option<Ty> {
+            Some(self.0.clone())
+        }
+    }
+
+    /// I11's gate, exhaustive over the globals: for each row, the pre-pass's
+    /// type of `x = <call>` at module level matches the value evaluation
+    /// binds `x` to. A call that fails at evaluation must be typed `Never`.
+    /// A callable global with no row and no exemption fails, so a new native
+    /// cannot skip the sweep; a wrong declared return type fails here.
+    #[test]
+    fn module_call_results_sound_against_runtime() {
+        use starlark::environment::Module;
+        use starlark::values::FrozenHeap;
+        use starlark::values::typing::TypeCompiled;
+
+        let callables = callable_globals();
+        let rowed: BTreeSet<String> = SOUND_ROWS.iter().map(|(g, _)| (*g).to_owned()).collect();
+        let exempt: BTreeSet<String> = SOUND_EXEMPT.iter().map(|(g, _)| (*g).to_owned()).collect();
+        let missing: Vec<&String> = callables
+            .iter()
+            .filter(|g| !rowed.contains(*g) && !exempt.contains(*g))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "callable globals with no row: {missing:?}"
+        );
+        let stale: Vec<&String> = rowed
+            .iter()
+            .chain(&exempt)
+            .filter(|g| !callables.contains(*g))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "rows or exemptions for no callable global: {stale:?}"
+        );
+        let both: Vec<&String> = exempt.intersection(&rowed).collect();
+        assert!(both.is_empty(), "exempt and rowed: {both:?}");
+
+        let mut failures = Vec::new();
+        for (global, lines) in SOUND_ROWS {
+            let (inferred, verdict) = sound_against_runtime(lines, |inferred, value| {
+                let frozen = FrozenHeap::new();
+                Module::with_temp_heap(|module| {
+                    let heap = module.heap();
+                    TypeCompiled::new(heap.alloc_simple(TyValue(inferred.clone())), heap)
+                        .expect("a type compiles")
+                        .to_frozen(&frozen)
+                })
+                .matches(value)
+            });
+            if let Err(why) = verdict {
+                failures.push(format!("{global} {lines:?}: typed `{inferred}`, {why}"));
+            }
+        }
+        // A record or enum the module declares has one identity in the
+        // pre-pass and another in each evaluation, so its constructor's result
+        // cannot match by identity: it is held to the type evaluation gives
+        // the value, by name (the fork's `export_as_unchanged` pins that the
+        // two name the same type).
+        for lines in DECLARED_ROWS {
+            let (inferred, verdict) = sound_against_runtime(lines, |inferred, value| {
+                !inferred.user_type_ids().is_empty()
+                    && Ty::of_value(value).to_string() == inferred.to_string()
+            });
+            if let Err(why) = verdict {
+                failures.push(format!("{lines:?}: typed `{inferred}`, {why}"));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "unsound call result types:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    /// Constructor calls of a record and an enum the module declares, for
+    /// [`module_call_results_sound_against_runtime`]: the last line binds `x`.
+    const DECLARED_ROWS: &[&[&str]] = &[
+        &["Lib = record(name = str)", "x = Lib(name = \"a\")"],
+        &[
+            "Lib = record(name = str, srcs = field(list[str], []))",
+            "x = Lib(name = \"a\")",
+        ],
+        &["Mode = enum(\"a\", \"b\")", "x = Mode(\"a\")"],
+    ];
+
+    /// The pre-pass's type of module-level `x` in `lines`, and whether it is
+    /// sound against evaluation of the same file as `//pkg`: `matches` holds
+    /// for the value evaluation binds, or the type is `Never` and evaluation
+    /// fails.
+    fn sound_against_runtime(
+        lines: &[&str],
+        matches: impl FnOnce(&Ty, starlark::values::Value<'_>) -> bool,
+    ) -> (Ty, Result<(), String>) {
+        let file = src(lines);
+        let ast = parse_build_source("pkg/BUILD", file.clone()).expect("parses");
+        let globals = check_globals(&[], &crate::pluginbuildfile::types::tests::test_kwargs());
+        let (_, types, _, _) = ast.typecheck(&globals, &HashMap::new());
+        let inferred = types
+            .module_bindings()
+            .find(|b| b.name == "x")
+            .unwrap_or_else(|| panic!("`x` is not bound in {lines:?}"))
+            .ty
+            .clone();
+
+        let tmp = ws(&[("pkg/BUILD", &file), ("pkg/a.txt", "")]);
+        let verdict = match crate::pluginbuildfile::checks::test_ws::eval_pkg(tmp.path(), "pkg") {
+            Err(_) if inferred == Ty::never() => Ok(()),
+            Err(e) => Err(format!("evaluation failed: {}", chain(&e))),
+            Ok(_) if inferred == Ty::never() => Err("evaluates, typed `Never`".to_owned()),
+            Ok(result) => {
+                let value = result.module.get("x").expect("x is bound");
+                let value = value.value();
+                if matches(&inferred, value) {
+                    Ok(())
+                } else {
+                    Err(format!("value `{value}` of type `{}`", value.get_type()))
+                }
+            }
+        };
+        (inferred, verdict)
+    }
 }
