@@ -37,7 +37,10 @@ memmap2 = "0.9"
 tar = "0.4"
 # Layer compression. Called directly rather than through `flate2`, whose
 # backend is chosen by feature unification: see `pluginoci/gzip.rs`.
-miniz_oxide = "0.9"
+# Pinned exactly: its output is every gzipped layer's digest, so bumping it is
+# an `OCI_LAYER_FORMAT_VERSION` bump, with `the_gzipped_blob_digest_is_pinned`
+# re-pinned in the same commit.
+miniz_oxide = "=0.9.1"
 crc32fast = "1.5"
 sha2 = "0.11"
 # sha2 0.11 (digest 0.11) returns an `Array` that no longer implements

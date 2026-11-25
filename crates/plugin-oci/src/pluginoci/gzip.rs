@@ -9,10 +9,14 @@
 //!   already carries both `miniz_oxide` and `zlib-rs` under `flate2`, so the
 //!   same source could produce different bytes depending on whether this
 //!   cdylib was built alone or alongside the host. `miniz_oxide` is called
-//!   directly here. Its output depends only on its version (its one optional
-//!   feature, `simd`, touches adler32, which a raw deflate stream never
-//!   computes), and `layer.rs`'s pinned-digest test fails if a version bump
-//!   moves it.
+//!   directly here, at a version pinned exactly in `Cargo.toml`. None of its
+//!   features reaches the deflate encoder: `simd` speeds up adler32, which a
+//!   raw deflate stream never computes; `block-boundary` is an inflate option;
+//!   `std`, `with-alloc`, `serde` and `rustc-dep-of-std` change what the crate
+//!   links or derives, not what it emits. So its output is a function of its
+//!   version, and `layer.rs`'s pinned-digest test fails if a version bump
+//!   moves the output on that test's corpus — a corpus built to exercise the
+//!   encoder broadly, though no finite corpus proves an untouched encoder.
 //! - **The gzip header.** It has room for an mtime, a file name and the
 //!   writing OS. The header here is fixed: mtime 0, no name, OS 255
 //!   ("unknown"), as `gzip -n` and every reproducible-build tool write it.
@@ -38,8 +42,9 @@ pub(crate) struct GzipWriter<W: Write> {
     inner: W,
     deflate: Box<CompressorOxide>,
     crc: crc32fast::Hasher,
-    /// Uncompressed length modulo 2^32, which is what the trailer records.
-    isize: u32,
+    /// Uncompressed length modulo 2^32, which is what the trailer records
+    /// (RFC 1952 calls it ISIZE).
+    input_len: u32,
     out: Box<[u8]>,
 }
 
@@ -53,7 +58,7 @@ impl<W: Write> GzipWriter<W> {
             inner,
             deflate: Box::new(CompressorOxide::new(flags)),
             crc: crc32fast::Hasher::new(),
-            isize: 0,
+            input_len: 0,
             out: vec![0; CHUNK].into_boxed_slice(),
         })
     }
@@ -86,9 +91,9 @@ impl<W: Write> GzipWriter<W> {
     /// Close the deflate stream, write the trailer, and hand back the writer.
     pub(crate) fn finish(mut self) -> io::Result<W> {
         self.pump(&[], TDEFLFlush::Finish)?;
-        let crc = std::mem::take(&mut self.crc).finalize();
+        let crc = self.crc.finalize();
         self.inner.write_all(&crc.to_le_bytes())?;
-        self.inner.write_all(&self.isize.to_le_bytes())?;
+        self.inner.write_all(&self.input_len.to_le_bytes())?;
         self.inner.flush()?;
         Ok(self.inner)
     }
@@ -97,7 +102,7 @@ impl<W: Write> GzipWriter<W> {
 impl<W: Write> Write for GzipWriter<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.crc.update(buf);
-        self.isize = self.isize.wrapping_add(buf.len() as u32);
+        self.input_len = self.input_len.wrapping_add(buf.len() as u32);
         self.pump(buf, TDEFLFlush::None)?;
         Ok(buf.len())
     }

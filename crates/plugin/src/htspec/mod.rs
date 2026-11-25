@@ -199,9 +199,11 @@ impl FromSpecValue for std::collections::BTreeMap<String, crate::driver::Deferre
 /// either shape, as every list field does, and the type names both.
 impl FromSpecValue for std::collections::BTreeMap<String, Vec<String>> {
     fn from_spec_value(v: &Value) -> anyhow::Result<Self> {
-        ordered_map(v, "{string: string | [string]}", |v| {
-            Vec::<String>::from_spec_value(v)
-        })
+        ordered_map(
+            v,
+            "{string: string | [string]}",
+            Vec::<String>::from_spec_value,
+        )
     }
 
     fn spec_param_type() -> ParamType {

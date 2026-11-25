@@ -1582,9 +1582,9 @@ impl Resources {
     /// that declares none: 0, so it reserves nothing and is admitted at once,
     /// never queueing behind a cpu request.
     pub const VIEW_CPU: &'static str = "0";
-    /// The `cpu` an IO-bound driver (`http`, OCI's pull, push, load, layer,
-    /// index and image, `go.download`) advertises for a target that declares
-    /// none: 0.1 CPU, so ten downloads share one CPU instead of each taking a
+    /// The `cpu` an IO-bound driver (`http`, OCI's pull, push, load, index,
+    /// image and `compress = False` layer, `go.download`) advertises for a
+    /// target that declares none: 0.1 CPU, so ten downloads share one CPU instead of each taking a
     /// whole one while it waits on the network.
     pub const IO_CPU: &'static str = "0.1";
 

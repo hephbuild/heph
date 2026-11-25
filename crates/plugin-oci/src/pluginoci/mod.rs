@@ -533,8 +533,9 @@ mod tests {
         assert!(parse_docker_load_ref("nothing here").is_err());
     }
 
-    /// The IO-bound drivers (pull, push, load, layer, index, image) cost 0.1
-    /// cpu when the target declares none; a declared `cpu` replaces it, and
+    /// The IO-bound drivers (pull, push, load, uncompressed layer, index,
+    /// image) cost 0.1 cpu when the target declares none; a declared `cpu`
+    /// replaces it, and
     /// neither moves the def hash.
     #[tokio::test]
     async fn io_drivers_default_to_a_tenth_of_a_cpu_unhashed() {
@@ -559,7 +560,13 @@ mod tests {
             ("oci.load", vec![("image", s(":img")), ("tag", s("a:dev"))]),
             (
                 "oci.layer",
-                vec![("srcs", list(&[":bin"])), ("prefix", s("/usr/bin"))],
+                // Uncompressed: a gzipped layer advertises a whole CPU (see
+                // `layer::a_compressed_layer_reserves_a_cpu`).
+                vec![
+                    ("srcs", list(&[":bin"])),
+                    ("prefix", s("/usr/bin")),
+                    ("compress", Value::Bool(false)),
+                ],
             ),
             ("oci.index", vec![("images", list(&[":amd64"]))]),
             (

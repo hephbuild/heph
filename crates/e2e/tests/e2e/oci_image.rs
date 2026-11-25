@@ -336,6 +336,105 @@ target(
     }
 }
 
+/// A `group` re-exporting one layer is that layer: the descriptor and the blob
+/// travel through it together. A group of two layers is refused rather than
+/// one of them picked, since `layers` order is the stacking order and a group
+/// has none to offer.
+#[tokio::test]
+async fn test_a_group_of_one_layer_is_a_layer_and_of_two_is_refused() -> anyhow::Result<()> {
+    let ws = workspace();
+    ws.write_build_file(
+        "app",
+        r#"
+target(name = "conf", driver = "bash", run = "echo k=v > $OUT", out = "app.conf")
+target(name = "bin", driver = "bash", run = "echo elf > $OUT", out = "server")
+target(name = "etc", driver = "oci.layer", srcs = [":conf"], prefix = "/etc")
+target(name = "app", driver = "oci.layer", srcs = [":bin"], prefix = "/usr/bin")
+target(name = "one", driver = "group", deps = [":etc"])
+target(name = "two", driver = "group", deps = [":etc", ":app"])
+target(name = "img_direct", driver = "oci.image", layers = [":etc"], platforms = ["linux/amd64"])
+target(name = "img_one", driver = "oci.image", layers = [":one"], platforms = ["linux/amd64"])
+target(name = "img_two", driver = "oci.image", layers = [":two"], platforms = ["linux/amd64"])
+"#,
+    );
+    let direct = manifest_of(&htestkit::artifact_bytes(
+        &*ws.run("//app:img_direct").await?,
+    ));
+    let via_group = manifest_of(&htestkit::artifact_bytes(&*ws.run("//app:img_one").await?));
+    assert_eq!(
+        via_group["layers"], direct["layers"],
+        "a group of one layer is that layer"
+    );
+
+    let err = format!(
+        "{:#}",
+        ws.run("//app:img_two")
+            .await
+            .err()
+            .expect("a group of two layers must be refused")
+    );
+    assert!(
+        err.contains("`layers` entry //app:two produced 2 layers"),
+        "names the entry and the count: {err}"
+    );
+    Ok(())
+}
+
+/// One image mixing a gzipped and an uncompressed layer: each keeps its own
+/// media type, and the diff_ids follow the layers in order — the inflated
+/// tar's digest for the gzipped one, the blob's own for the plain one.
+#[tokio::test]
+async fn test_one_image_mixes_compressed_and_plain_layers() -> anyhow::Result<()> {
+    use std::io::Read as _;
+    let ws = workspace();
+    ws.write_build_file(
+        "app",
+        r#"
+target(name = "conf", driver = "bash", run = "echo k=v > $OUT", out = "app.conf")
+target(name = "bin", driver = "bash", run = "echo elf > $OUT", out = "server")
+target(name = "gz", driver = "oci.layer", srcs = [":conf"], prefix = "/etc")
+target(name = "plain", driver = "oci.layer", srcs = [":bin"], prefix = "/usr/bin", compress = False)
+target(name = "img", driver = "oci.image", layers = [":gz", ":plain"], platforms = ["linux/amd64"])
+"#,
+    );
+    let bytes = htestkit::artifact_bytes(&*ws.run("//app:img").await?);
+    let manifest = manifest_of(&bytes);
+    let layers = manifest["layers"].as_array().expect("layers");
+    assert_eq!(
+        layers
+            .iter()
+            .map(|l| l["mediaType"].clone())
+            .collect::<Vec<_>>(),
+        vec![
+            serde_json::json!("application/vnd.oci.image.layer.v1.tar+gzip"),
+            serde_json::json!("application/vnd.oci.image.layer.v1.tar"),
+        ],
+        "each layer keeps its own encoding, in order"
+    );
+
+    let blobs = layout_blobs(&bytes);
+    let blob = |l: &serde_json::Value| {
+        blobs
+            .get(l["digest"].as_str().expect("digest"))
+            .expect("layer blob")
+            .clone()
+    };
+    let sha = |b: &[u8]| {
+        format!(
+            "sha256:{}",
+            hex::encode(<sha2::Sha256 as sha2::Digest>::digest(b))
+        )
+    };
+    let mut inflated = Vec::new();
+    flate2::read::GzDecoder::new(blob(&layers[0]).as_slice()).read_to_end(&mut inflated)?;
+    assert_eq!(
+        config_of(&bytes)["rootfs"]["diff_ids"],
+        serde_json::json!([sha(&inflated), sha(&blob(&layers[1]))]),
+        "diff_ids in layer order: the inflated tar's digest, then the plain blob's"
+    );
+    Ok(())
+}
+
 /// Same inputs, same bytes. This is the claim the rule is built on, and the one
 /// that a wall clock, a map iteration order or a `read_dir` order would break —
 /// none of which a single run can catch.

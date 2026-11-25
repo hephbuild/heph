@@ -53,13 +53,14 @@ use hplugin::htspec::{Spec, TargetSpecCache};
 use oci_client::manifest::ImageIndexEntry;
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, HashMap};
+use std::ffi::OsStr;
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3Default;
 
 use super::archive::{self, Blob, Blobs};
-use super::layer::{DESCRIPTOR_SUFFIX, LayerDescriptor, MEDIA_TYPE_TAR, MEDIA_TYPE_TAR_GZIP};
+use super::layer::{DESCRIPTOR_SUFFIX, LayerDescriptor, LayerEncoding};
 use super::{
     ImageFormat, dep_files, is_os_arch, layout_path, normalize_platform, split_platform, ws_path,
 };
@@ -97,10 +98,14 @@ struct OciImageSpec {
     /// **Order matters**: a later layer's file shadows the same path in an
     /// earlier one.
     ///
-    /// Only `oci.layer` targets: any other target (a binary, a `group`, a tar
-    /// written by a script) fails the image build, naming it. Its output would
-    /// otherwise be filed as a layer blob as it is, and a runtime rejects that
-    /// only at deploy.
+    /// Only `oci.layer` targets, or a `group` re-exporting exactly one: any
+    /// other target (a binary, a tar written by a script) fails the image
+    /// build, naming it. Its output would otherwise be filed as a layer blob as
+    /// it is, and a runtime rejects that only at deploy.
+    ///
+    /// The check runs when the image target *runs*, not at query or
+    /// `heph validate`: it reads what the dep produced. The fix is to wrap the
+    /// dep in an `oci.layer` (`srcs = [...]`, `prefix = ...`).
     layers: Vec<String>,
     /// Layers that differ per platform, appended after `layers`, keyed by the
     /// platform they belong to. Each value is one `oci.layer` address or a
@@ -489,12 +494,21 @@ impl ManagedDriver for Driver {
             .collect::<anyhow::Result<Vec<_>>>()
             .context("`platforms`")?;
 
-        let pbp: BTreeMap<String, Vec<String>> = spec
-            .layers_by_platform
-            .iter()
-            .map(|(k, v)| Ok((normalize_platform(k)?, v.clone())))
-            .collect::<anyhow::Result<_>>()
-            .context("`layers_by_platform`")?;
+        // Keyed by the normalized platform, each with the key as written: two
+        // spellings of one platform ("linux/amd64", "linux/x86_64") would
+        // otherwise collapse into whichever sorts last, and the other's layers
+        // vanish from the image.
+        let mut pbp: BTreeMap<String, (&str, &Vec<String>)> = BTreeMap::new();
+        for (key, list) in &spec.layers_by_platform {
+            let platform = normalize_platform(key)
+                .with_context(|| format!("`layers_by_platform` key {key:?}"))?;
+            if let Some((other, _)) = pbp.insert(platform.clone(), (key.as_str(), list)) {
+                anyhow::bail!(
+                    "`layers_by_platform` has two entries for {platform:?}: {other:?} and \
+                     {key:?} name the same platform. Merge them into one entry."
+                );
+            }
+        }
         if !pbp.is_empty() {
             for platform in &platforms {
                 anyhow::ensure!(
@@ -556,7 +570,7 @@ impl ManagedDriver for Driver {
             layers.push(push_dep(l, layer_origin(None, i))?);
         }
         let mut layers_by_platform = Vec::new();
-        for (platform, list) in &pbp {
+        for (platform, (_, list)) in &pbp {
             let mut normalized = Vec::new();
             for (i, l) in list.iter().enumerate() {
                 normalized.push(push_dep(l, layer_origin(Some(platform), i))?);
@@ -689,25 +703,39 @@ impl ManagedDriver for Driver {
 
             let mut layer_descs = base.layers.clone();
             let mut diff_ids = base.diff_ids.clone();
+            // (origin, attribute, the entry as written): errors name the entry,
+            // not the input behind it — through a `group`, that is the group's
+            // first dep, not what the BUILD file lists.
             let mut own = Vec::new();
-            for (i, _) in def.layers.iter().enumerate() {
-                own.push((layer_origin(None, i), "`layers`".to_string()));
+            for (i, dep) in def.layers.iter().enumerate() {
+                own.push((layer_origin(None, i), "`layers`".to_string(), dep));
             }
             if let Some((_, list)) = def.layers_by_platform.iter().find(|(p, _)| p == platform) {
-                for (i, _) in list.iter().enumerate() {
+                for (i, dep) in list.iter().enumerate() {
                     own.push((
                         layer_origin(Some(platform), i),
                         format!("`layers_by_platform[{platform:?}]`"),
+                        dep,
                     ));
                 }
             }
-            for (origin, attr) in &own {
-                let (path, descriptor) = layer_blob(&req, origin, attr)?;
+            for (origin, attr, dep) in &own {
+                let (path, descriptor) = select_layer(&dep_files(&req, origin)?, dep, attr)?;
                 // Streamed, not read: a layer can be most of an image, and this
                 // runs once per platform per image target.
                 let (digest, size) = archive::sha256_file(&path)?;
+                // Uncompressed, the blob is the tar: the two digests are one
+                // value, and both are in hand. A mismatch is a corrupted or
+                // hand-edited layer output, which a runtime would reject on
+                // unpack.
+                anyhow::ensure!(
+                    descriptor.media_type != LayerEncoding::Tar || descriptor.diff_id == digest,
+                    "{attr} entry {dep}: its uncompressed layer blob has digest {digest}, but its \
+                     descriptor records diff_id {}; the layer's output is inconsistent, rebuild it",
+                    descriptor.diff_id,
+                );
                 layer_descs.push(json!({
-                    "mediaType": descriptor.media_type,
+                    "mediaType": descriptor.media_type.media_type(),
                     "digest": digest,
                     "size": size,
                 }));
@@ -786,71 +814,108 @@ impl ManagedDriver for Driver {
     }
 }
 
-/// The blob an `oci.layer` dep produced, and its descriptor.
+/// How many file names an error lists before it says "and N more": a `group`
+/// or a `glob()` dep can produce thousands.
+const NAMES_SHOWN: usize = 10;
+
+/// The file names of `paths`, at most [`NAMES_SHOWN`] of them, for an error.
+fn name_list(paths: &[&Path]) -> String {
+    if paths.is_empty() {
+        return "nothing".to_string();
+    }
+    let mut out = paths
+        .iter()
+        .take(NAMES_SHOWN)
+        .map(|p| p.file_name().unwrap_or(p.as_os_str()).to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if let Some(more) = paths.len().checked_sub(NAMES_SHOWN).filter(|n| *n > 0) {
+        out.push_str(&format!(", and {more} more"));
+    }
+    out
+}
+
+/// The blob an `oci.layer` dep produced, and its descriptor, out of the files
+/// the dep produced. `dep` and `attr` name the entry in errors.
 ///
 /// The descriptor is what marks the dep as a layer. Anything else — a binary,
 /// a config file, a tar some other target wrote — is refused here: filed as a
 /// layer blob, it would build and push clean and fail only when a runtime
-/// tries to unpack it.
-fn layer_blob(
-    req: &ManagedRunRequest<'_, '_>,
-    origin: &str,
+/// tries to unpack it. So is a layer with anything beside it (a `group` of a
+/// layer and a binary): the image would ship without the binary, and nothing
+/// would say so.
+fn select_layer(
+    paths: &[PathBuf],
+    dep: &str,
     attr: &str,
 ) -> anyhow::Result<(PathBuf, LayerDescriptor)> {
-    let dep = super::find_dep_input(req, origin)
-        .map(|m| m.input.source_addr.format())
-        .unwrap_or_else(|| origin.to_string());
-    let paths = dep_files(req, origin)?;
-    let file_name = |p: &PathBuf| {
-        p.file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default()
-    };
-    let descriptors: Vec<&PathBuf> = paths
+    let descriptors: Vec<&Path> = paths
         .iter()
-        .filter(|p| file_name(p).ends_with(DESCRIPTOR_SUFFIX))
+        .map(PathBuf::as_path)
+        .filter(|p| {
+            p.file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|n| n.ends_with(DESCRIPTOR_SUFFIX))
+        })
         .collect();
     let descriptor_path = match descriptors.as_slice() {
         [only] => *only,
-        [] => {
-            let produced = if paths.is_empty() {
-                "nothing".to_string()
-            } else {
-                paths.iter().map(file_name).collect::<Vec<_>>().join(", ")
-            };
-            anyhow::bail!(
-                "{attr} entry {dep} is not an `oci.layer` target (it produced: {produced}). An \
-                 image layer must be built by `oci.layer`, which puts the files at a path inside \
-                 the image and records the layer's digests. Wrap it:\n  target(name = \
-                 \"<name>\", driver = \"oci.layer\", srcs = [\"{dep}\"], prefix = \"/usr/bin\")"
-            )
-        }
+        [] => return Err(not_a_layer(paths, dep, attr)),
         many => anyhow::bail!(
-            "{attr} entry {dep} produced {} layers; list each `oci.layer` target on its own, \
-             in the order they stack",
-            many.len()
+            "{attr} entry {dep} produced {} layers ({}); list each `oci.layer` target on its \
+             own, in the order they stack",
+            many.len(),
+            name_list(many)
         ),
     };
     let descriptor: LayerDescriptor = serde_json::from_slice(
         &std::fs::read(descriptor_path)
             .with_context(|| format!("read the layer descriptor {descriptor_path:?}"))?,
     )
-    .with_context(|| format!("parse the layer descriptor {descriptor_path:?} of {dep}"))?;
+    .with_context(|| {
+        format!("{attr} entry {dep}: parse its layer descriptor {descriptor_path:?}")
+    })?;
     anyhow::ensure!(
-        [MEDIA_TYPE_TAR, MEDIA_TYPE_TAR_GZIP].contains(&descriptor.media_type.as_str()),
-        "{dep}'s layer descriptor has media type {:?}, which this heph does not write",
-        descriptor.media_type
+        Path::new(&descriptor.blob).file_name() == Some(OsStr::new(&descriptor.blob)),
+        "{attr} entry {dep}: its layer descriptor names the blob {:?}, which is not a plain \
+         file name",
+        descriptor.blob
     );
-    let blob = paths
+    let blob_path = descriptor_path.with_file_name(&descriptor.blob);
+    anyhow::ensure!(
+        paths.contains(&blob_path),
+        "{attr} entry {dep}: its layer descriptor names the blob {:?}, which it did not \
+         produce (it produced: {})",
+        descriptor.blob,
+        name_list(&paths.iter().map(PathBuf::as_path).collect::<Vec<_>>())
+    );
+    let extra: Vec<&Path> = paths
         .iter()
-        .find(|p| file_name(p) == descriptor.blob)
-        .with_context(|| {
-            format!(
-                "{dep}'s layer descriptor names the blob {:?}, which it did not produce",
-                descriptor.blob
-            )
-        })?;
-    Ok((blob.clone(), descriptor))
+        .map(PathBuf::as_path)
+        .filter(|p| *p != descriptor_path && *p != blob_path)
+        .collect();
+    anyhow::ensure!(
+        extra.is_empty(),
+        "{attr} entry {dep} produced {} file(s) besides its layer: {}. An image takes a layer as \
+         one `oci.layer` target writes it, and those files would be left out of the image \
+         without a word. Put them in an `oci.layer` of their own and list that, or into this \
+         layer's `srcs`.",
+        extra.len(),
+        name_list(&extra)
+    );
+    Ok((blob_path, descriptor))
+}
+
+/// The error for a `layers` entry that is not an `oci.layer`: what it
+/// produced, and the target that would make it one.
+fn not_a_layer(paths: &[PathBuf], dep: &str, attr: &str) -> anyhow::Error {
+    let produced = name_list(&paths.iter().map(PathBuf::as_path).collect::<Vec<_>>());
+    anyhow::anyhow!(
+        "{attr} entry {dep} is not an `oci.layer` target (it produced: {produced}). An image \
+         layer must be built by `oci.layer`, which puts the files at a path inside the image \
+         and records the layer's digests. Wrap it:\n  target(name = \"<name>\", driver = \
+         \"oci.layer\", srcs = [\"{dep}\"], prefix = \"<dir in image>\")  # e.g. /usr/bin"
+    )
 }
 
 /// Write the docker-format archive a daemon's `docker load` accepts.
@@ -1227,8 +1292,8 @@ mod tests {
             "mediaType": oci_client::manifest::OCI_IMAGE_MEDIA_TYPE,
             "config": {"mediaType": CONFIG_MEDIA_TYPE, "digest": config_digest, "size": config_size},
             "layers": [
-                {"mediaType": MEDIA_TYPE_TAR, "digest": disk_digest, "size": disk_size},
-                {"mediaType": MEDIA_TYPE_TAR, "digest": mem_digest, "size": mem_size},
+                {"mediaType": LayerEncoding::Tar.media_type(), "digest": disk_digest, "size": disk_size},
+                {"mediaType": LayerEncoding::Tar.media_type(), "digest": mem_digest, "size": mem_size},
             ],
         }))
         .expect("encode manifest");
@@ -1289,6 +1354,189 @@ mod tests {
             direct_bytes,
             std::fs::read(&again).expect("read again"),
             "the same image must write the same archive"
+        );
+    }
+
+    const DEP: &str = "//app:dep";
+    const ATTR: &str = "`layers`";
+
+    /// Write `files` (name, body) into `dir` and return their paths, as a
+    /// dep's list names them.
+    fn produced(dir: &Path, files: &[(&str, &str)]) -> Vec<PathBuf> {
+        files
+            .iter()
+            .map(|(name, body)| {
+                let p = dir.join(name);
+                std::fs::write(&p, body).expect("write");
+                p
+            })
+            .collect()
+    }
+
+    fn descriptor_json(blob: &str, media_type: &str) -> String {
+        json!({"blob": blob, "mediaType": media_type, "diffId": "sha256:00"}).to_string()
+    }
+
+    fn refused(paths: &[PathBuf]) -> String {
+        format!(
+            "{:#}",
+            select_layer(paths, DEP, ATTR).expect_err("must be refused")
+        )
+    }
+
+    /// The one shape accepted: a descriptor and the blob it names, nothing
+    /// else.
+    #[test]
+    fn a_layer_is_its_descriptor_and_its_blob() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = produced(
+            dir.path(),
+            &[
+                ("l.tar.gz", "gz"),
+                (
+                    "l.oci-layer.json",
+                    &descriptor_json("l.tar.gz", LayerEncoding::TarGzip.media_type()),
+                ),
+            ],
+        );
+        let (blob, descriptor) = select_layer(&paths, DEP, ATTR).expect("a layer");
+        assert_eq!(blob, dir.path().join("l.tar.gz"));
+        assert_eq!(descriptor.media_type, LayerEncoding::TarGzip);
+    }
+
+    /// Every way a dep's output can fail to be one layer, each refused with
+    /// the entry named — never a layer blob filed by guesswork.
+    #[test]
+    fn everything_else_is_refused_naming_the_dep() {
+        /// A case: its name, the files the dep produced, and the error text.
+        type Case = (&'static str, Vec<(&'static str, String)>, &'static str);
+        let gz = LayerEncoding::TarGzip.media_type();
+        let cases: Vec<Case> = vec![
+            (
+                "no descriptor",
+                vec![("server", "elf".into())],
+                "is not an `oci.layer` target (it produced: server)",
+            ),
+            (
+                "two descriptors",
+                vec![
+                    ("a.tar.gz", "a".into()),
+                    ("a.oci-layer.json", descriptor_json("a.tar.gz", gz)),
+                    ("b.tar.gz", "b".into()),
+                    ("b.oci-layer.json", descriptor_json("b.tar.gz", gz)),
+                ],
+                "produced 2 layers (a.oci-layer.json, b.oci-layer.json)",
+            ),
+            (
+                "unparseable descriptor",
+                vec![("l.tar.gz", "gz".into()), ("l.oci-layer.json", "{".into())],
+                "parse its layer descriptor",
+            ),
+            (
+                "unknown media type",
+                vec![
+                    ("l.tar.gz", "gz".into()),
+                    (
+                        "l.oci-layer.json",
+                        descriptor_json("l.tar.gz", "application/vnd.oci.image.layer.v1.tar+zstd"),
+                    ),
+                ],
+                "unknown variant",
+            ),
+            (
+                "blob not produced",
+                vec![("l.oci-layer.json", descriptor_json("l.tar.gz", gz))],
+                "names the blob \"l.tar.gz\", which it did not produce",
+            ),
+            (
+                "blob with a separator",
+                vec![
+                    ("l.tar.gz", "gz".into()),
+                    ("l.oci-layer.json", descriptor_json("sub/l.tar.gz", gz)),
+                ],
+                "which is not a plain file name",
+            ),
+            (
+                "blob escaping the output",
+                vec![
+                    ("l.tar.gz", "gz".into()),
+                    ("l.oci-layer.json", descriptor_json("..", gz)),
+                ],
+                "which is not a plain file name",
+            ),
+            (
+                "a file beside the layer",
+                vec![
+                    ("l.tar.gz", "gz".into()),
+                    ("l.oci-layer.json", descriptor_json("l.tar.gz", gz)),
+                    ("server", "elf".into()),
+                ],
+                "produced 1 file(s) besides its layer: server",
+            ),
+        ];
+        for (case, files, want) in cases {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let files: Vec<(&str, &str)> = files.iter().map(|(n, b)| (*n, b.as_str())).collect();
+            let err = refused(&produced(dir.path(), &files));
+            assert!(err.contains(DEP), "{case}: names the dep: {err}");
+            assert!(err.contains(want), "{case}: wanted {want:?} in: {err}");
+        }
+    }
+
+    /// A big `group` or `glob()` dep would otherwise put thousands of names
+    /// into one error line.
+    #[test]
+    fn the_produced_list_is_capped() {
+        let paths: Vec<PathBuf> = (0..25)
+            .map(|i| PathBuf::from(format!("/s/f{i:02}")))
+            .collect();
+        let err = refused(&paths);
+        assert!(err.contains("f09, and 15 more"), "got: {err}");
+        assert!(!err.contains("f10"), "got: {err}");
+    }
+
+    fn parse_image(pairs: &[(&str, hcore::htvalue::Value)]) -> anyhow::Result<ParseResponse> {
+        let req = ParseRequest {
+            request_id: "test".to_string(),
+            target_spec: Arc::new(hplugin::provider::TargetSpec {
+                addr: hmodel::htaddr::parse_addr("//app:img").expect("addr"),
+                driver: "oci.image".to_string(),
+                config: pairs
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), v.clone()))
+                    .collect(),
+                ..Default::default()
+            }),
+        };
+        futures::executor::block_on(
+            Driver::new().parse(req, &hcore::hasync::StdCancellationToken::new()),
+        )
+    }
+
+    /// Two spellings of one platform must not collapse into whichever sorts
+    /// last: the other entry's layers would silently leave the image.
+    #[test]
+    fn two_spellings_of_one_platform_are_refused() {
+        use hcore::htvalue::Value;
+        let s = |v: &str| Value::String(v.to_string());
+        let err = format!(
+            "{:#}",
+            parse_image(&[
+                ("platforms", Value::List(vec![s("linux/amd64")])),
+                (
+                    "layers_by_platform",
+                    Value::Map(HashMap::from([
+                        ("linux/amd64".to_string(), s(":a")),
+                        ("linux/x86_64".to_string(), s(":b")),
+                    ])),
+                ),
+            ])
+            .err()
+            .expect("two keys for one platform")
+        );
+        assert!(
+            err.contains("\"linux/amd64\" and \"linux/x86_64\" name the same platform"),
+            "names both spellings: {err}"
         );
     }
 }
