@@ -443,10 +443,12 @@ pub struct Answer {
 /// Why a query failed.
 #[derive(Debug)]
 pub enum QueryError {
-    /// The statement: refused, invalid, or stopped (`error.kind` `sql`).
+    /// The statement: refused, invalid, or stopped.
     Sql(String),
     /// Stopped by a SIGINT.
     Interrupted,
+    /// The disk holding the temp copy is full, not the 2 GiB cap.
+    Io(anyhow::Error),
     /// Anything else: a source that cannot be read, the temp database.
     Other(anyhow::Error),
 }
@@ -456,7 +458,7 @@ impl fmt::Display for QueryError {
         match self {
             Self::Sql(m) => f.write_str(m),
             Self::Interrupted => f.write_str("interrupted"),
-            Self::Other(e) => write!(f, "{e:#}"),
+            Self::Io(e) | Self::Other(e) => write!(f, "{e:#}"),
         }
     }
 }
@@ -1151,7 +1153,7 @@ fn copy_recording(
                 ),
                 [],
             )
-            .map_err(|e| copy_error(&e, limits))?;
+            .map_err(|e| copy_error(&e, conn, limits))?;
         }
         Ok(())
     };
@@ -1168,12 +1170,108 @@ fn detach(conn: &Connection) -> Result<(), QueryError> {
     Ok(())
 }
 
-fn copy_error(e: &rusqlite::Error, limits: &Limits) -> QueryError {
-    if e.sqlite_error_code() == Some(ErrorCode::DiskFull) {
-        return QueryError::Sql(format!(
+/// An error copying into `conn`, the temp database. SQLite says "full"
+/// alike for its `max_page_count` (the 2 GiB cap) and for a full disk.
+fn copy_error(e: &rusqlite::Error, conn: &Connection, limits: &Limits) -> QueryError {
+    if e.sqlite_error_code() != Some(ErrorCode::DiskFull) {
+        return stopped(e, limits);
+    }
+    match at_cap(conn) {
+        Ok(true) => QueryError::Sql(format!(
             "the query's copy of its sources reached {} GiB: narrow the window or the sources",
             COPY_CAP >> 30
-        ));
+        )),
+        Ok(false) => QueryError::Io(anyhow::anyhow!(
+            "the disk holding the query's temp copy ({}) is full",
+            conn.path().unwrap_or("?")
+        )),
+        Err(e) => QueryError::Io(e.context("the query's temp copy is full")),
     }
-    stopped(e, limits)
+}
+
+/// Whether `conn`'s file is at its `max_page_count`. The failed statement
+/// leaves `page_count` where it began (the pager drops what it held), but
+/// with no journal what it wrote stays in the file: at the cap, that is
+/// all of it but what the page cache still held.
+fn at_cap(conn: &Connection) -> anyhow::Result<bool> {
+    let pragma = |name: &str| -> anyhow::Result<i64> {
+        conn.query_row(&format!("PRAGMA {name}"), [], |r| r.get(0))
+            .with_context(|| format!("reading the temp copy's {name}"))
+    };
+    let page = u64::try_from(pragma("page_size")?).unwrap_or(0);
+    let cap = u64::try_from(pragma("max_page_count")?)
+        .unwrap_or(0)
+        .saturating_mul(page);
+    // Negative: KiB; positive: pages.
+    let cache = match pragma("cache_size")? {
+        n if n < 0 => n.unsigned_abs().saturating_mul(1024),
+        n => n.unsigned_abs().saturating_mul(page),
+    };
+    let path = conn
+        .path()
+        .filter(|p| !p.is_empty())
+        .context("the temp copy has no file")?;
+    let len = std::fs::metadata(path)
+        .with_context(|| format!("reading the size of {path}"))?
+        .len();
+    // Twice the cache, and a page: the margin is SQLite's, not the disk's.
+    Ok(len
+        .saturating_add(cache.saturating_mul(2))
+        .saturating_add(page)
+        >= cap)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A temp database set up as `copied` sets up its copy, capped at
+    /// `max_pages`, with a 64 KiB page cache.
+    fn copy_db(path: &Path, max_pages: Option<i64>) -> Connection {
+        let conn = Connection::open(path).expect("open");
+        conn.execute_batch(
+            "PRAGMA journal_mode = OFF; PRAGMA synchronous = OFF; PRAGMA cache_size = -64;
+             CREATE TABLE t (b BLOB);",
+        )
+        .expect("set up");
+        if let Some(n) = max_pages {
+            conn.pragma_update(None, "max_page_count", n).expect("cap");
+        }
+        conn
+    }
+
+    /// SQLite says "full" alike for the copy's cap (`max_page_count`) and
+    /// for a full disk. Past the cap it is the statement's to narrow
+    /// (`sql`); short of it, the disk is full (`io`), and saying "reached
+    /// 2 GiB" would send the user after the wrong thing.
+    #[test]
+    fn copy_error_tells_the_cap_from_a_full_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let limits = Limits::default();
+
+        let capped = copy_db(&dir.path().join("capped.db"), Some(2_000));
+        let e = capped
+            .execute(
+                "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 100000)
+                 INSERT INTO t SELECT randomblob(1000) FROM r",
+                [],
+            )
+            .expect_err("past the cap");
+        assert_eq!(e.sqlite_error_code(), Some(ErrorCode::DiskFull), "{e}");
+        match copy_error(&e, &capped, &limits) {
+            QueryError::Sql(m) => assert!(m.contains("reached"), "{m}"),
+            other => panic!("the cap: {other:?}"),
+        }
+
+        // Far below its cap: what the disk says when it fills.
+        let roomy = copy_db(&dir.path().join("roomy.db"), None);
+        let full = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+            Some("database or disk is full".to_owned()),
+        );
+        match copy_error(&full, &roomy, &limits) {
+            QueryError::Io(e) => assert!(format!("{e:#}").contains("full"), "{e:#}"),
+            other => panic!("a full disk: {other:?}"),
+        }
+    }
 }

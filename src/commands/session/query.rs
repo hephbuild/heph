@@ -252,7 +252,7 @@ pub(crate) fn query_error(e: QueryError) -> anyhow::Error {
             error: Some(anyhow::anyhow!("query interrupted")),
         }
         .into(),
-        QueryError::Other(e) => e.context("running the query"),
+        QueryError::Io(e) | QueryError::Other(e) => e.context("running the query"),
     }
 }
 
