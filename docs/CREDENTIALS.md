@@ -549,7 +549,11 @@ target(name = "sdk", driver = "http_fetch", url = "https://files.acme.dev/sdk-1.
 The `machine` entry naming the URL's host goes out as **basic auth, and only
 basic auth**. A server that wants a bearer token or a custom header (GitLab's
 `PRIVATE-TOKEN`) has no presentation here yet; many such servers also take the
-token as the password of basic auth, under a username they document. Host
+token as the password of basic auth, under a username they document.
+Non-secret headers go on the target as `headers = {...}`: they are hashed, and
+`Authorization`, `Proxy-Authorization` and `Cookie` are refused there. A GitHub
+release asset through the API, for one, needs `headers = {"Accept":
+"application/octet-stream"}` next to its `credentials`. Host
 matching is exact and ignores case, path and port, so two services on one host
 share one entry. The rules are the registry drivers' rules:
 

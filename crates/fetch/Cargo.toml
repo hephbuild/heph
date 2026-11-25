@@ -8,6 +8,7 @@ workspace = true
 
 [dependencies]
 anyhow = "1.0.104"
+hcore = { package = "core", path = "../core" }
 # `Body::chunk`'s item: reqwest's own chunk type, already in reqwest's tree.
 bytes = "1.12"
 hex = "0.4"

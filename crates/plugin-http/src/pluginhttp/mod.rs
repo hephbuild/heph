@@ -62,6 +62,15 @@ struct HttpFetchSpec {
     out: Option<String>,
     /// Mark the fetched file executable (a downloaded tool binary).
     executable: bool,
+    /// Extra request headers, e.g. `{"Accept": "application/octet-stream"}`
+    /// for a GitHub release asset through the API. Hashed: a header can change
+    /// what the server answers, so it is part of the target's identity. Names
+    /// are case-insensitive (two spellings of one name are refused). Secrets
+    /// are refused here (`Authorization`, `Proxy-Authorization`, `Cookie`; use
+    /// `credentials`), and so are the headers the client owns (`Host`,
+    /// `Content-Length`, `Transfer-Encoding`, `Connection`). A `User-Agent`
+    /// replaces the default `heph/<version>`.
+    headers: BTreeMap<String, String>,
     /// Credentials to fetch with, as `credential` target addresses presented
     /// with `heph.auth.netrc([...])`. The URL's host is sent the basic auth of
     /// the netrc entry naming it; a host none of them covers is an error, never
@@ -94,6 +103,9 @@ struct HttpFetchDef {
     /// Package-relative output path.
     out: String,
     executable: bool,
+    /// Extra request headers, names lowercased, sorted by name.
+    #[serde(default)]
+    headers: Vec<(String, String)>,
 }
 
 /// Bump to invalidate cached fetches when the output layout changes.
@@ -106,6 +118,11 @@ impl Hash for HttpFetchDef {
         self.sha256.hash(state);
         self.out.hash(state);
         self.executable.hash(state);
+        // Only when set, so a target without headers keeps the key it had
+        // before they existed.
+        if !self.headers.is_empty() {
+            self.headers.hash(state);
+        }
     }
 }
 
@@ -166,11 +183,14 @@ impl ManagedDriver for Driver {
             );
         }
 
+        let headers = normalize_headers(&spec.headers).with_context(|| addr.format())?;
+
         let def = HttpFetchDef {
             url,
             sha256,
             out: out.clone(),
             executable: spec.executable,
+            headers,
         };
 
         let hash = {
@@ -253,7 +273,10 @@ impl ManagedDriver for Driver {
 
         let fetched = fetch_until_cancelled(
             &def.url,
-            selected.as_ref().map(|s| &s.auth),
+            hfetch::RequestOptions {
+                auth: selected.as_ref().map(|s| &s.auth),
+                headers: &def.headers,
+            },
             &def.sha256,
             def.executable,
             &dest,
@@ -267,6 +290,23 @@ impl ManagedDriver for Driver {
 
         Ok(ManagedRunResponse { artifacts: vec![] })
     }
+}
+
+/// The `headers` attribute as the def holds it: each accepted by
+/// [`hfetch::check_header`], names lowercased so `Accept` and `accept` are one
+/// header with one hash, sorted by name so the map's order never reaches it.
+fn normalize_headers(headers: &BTreeMap<String, String>) -> anyhow::Result<Vec<(String, String)>> {
+    let mut out: BTreeMap<String, (&str, String)> = BTreeMap::new();
+    for (name, value) in headers {
+        let lower = hfetch::check_header(name, value)?;
+        if let Some((first, _)) = out.insert(lower, (name.as_str(), value.clone())) {
+            anyhow::bail!(
+                "headers {first:?} and {name:?} are one header (names are case-insensitive); \
+                 keep one"
+            );
+        }
+    }
+    Ok(out.into_iter().map(|(n, (_, v))| (n, v)).collect())
 }
 
 /// Whether a target's parse warns: it fetches with credentials, nothing pins
@@ -307,7 +347,7 @@ fn refusal_hint(err: &anyhow::Error, selected: Option<&auth::Selected>) -> Optio
 /// connection closes, and the partial file is removed before this returns.
 async fn fetch_until_cancelled(
     url: &str,
-    auth: Option<&hfetch::BasicAuth>,
+    opts: hfetch::RequestOptions<'_>,
     expected_sha256: &str,
     executable: bool,
     dest: &std::path::Path,
@@ -315,7 +355,7 @@ async fn fetch_until_cancelled(
 ) -> anyhow::Result<()> {
     match fetch(
         url,
-        auth,
+        opts,
         expected_sha256,
         executable,
         dest,
@@ -411,13 +451,13 @@ fn render(template: &str, args: &BTreeMap<String, String>) -> anyhow::Result<Str
 /// failed download, a mismatch or `cancelled` firing removes it again.
 async fn fetch(
     url: &str,
-    auth: Option<&hfetch::BasicAuth>,
+    opts: hfetch::RequestOptions<'_>,
     expected_sha256: &str,
     executable: bool,
     dest: &std::path::Path,
     cancelled: impl Future<Output = ()>,
 ) -> anyhow::Result<Fetched> {
-    let verified = match download(url, auth, dest, cancelled).await {
+    let verified = match download(url, opts, dest, cancelled).await {
         Ok(Some(got)) => verify_checksum(expected_sha256, &got, url),
         Ok(None) => {
             remove_partial(dest);
@@ -498,7 +538,7 @@ impl<T> Drop for Feed<'_, T> {
 /// blocking slot.
 async fn download(
     url: &str,
-    auth: Option<&hfetch::BasicAuth>,
+    opts: hfetch::RequestOptions<'_>,
     dest: &std::path::Path,
     cancelled: impl Future<Output = ()>,
 ) -> anyhow::Result<Option<String>> {
@@ -550,7 +590,7 @@ async fn download(
     // is dropped.
     let send_body = async move {
         let tx = &feed.tx;
-        let mut body = hfetch::Fetcher::default().open_with(url, auth).await?;
+        let mut body = hfetch::Fetcher::default().open_with(url, opts).await?;
         let mut batch = Vec::new();
         let mut batched = 0;
         loop {
@@ -719,9 +759,16 @@ mod tests {
         let url = serve("200 OK", BODY, 1);
 
         // Checksum unset → fetched unverified (warns); the bytes still land.
-        let fetched = fetch(&url, None, "", true, &dest, std::future::pending())
-            .await
-            .expect("fetch");
+        let fetched = fetch(
+            &url,
+            Default::default(),
+            "",
+            true,
+            &dest,
+            std::future::pending(),
+        )
+        .await
+        .expect("fetch");
         assert_eq!(fetched, Fetched::Done);
 
         assert_eq!(std::fs::read(&dest).expect("read"), BODY);
@@ -746,9 +793,16 @@ mod tests {
         let dest = dir.path().join("tool");
         let url = serve("200 OK", body, 1);
 
-        let fetched = fetch(&url, None, &sha, false, &dest, std::future::pending())
-            .await
-            .expect("fetch");
+        let fetched = fetch(
+            &url,
+            Default::default(),
+            &sha,
+            false,
+            &dest,
+            std::future::pending(),
+        )
+        .await
+        .expect("fetch");
         assert_eq!(fetched, Fetched::Done);
         assert!(std::fs::read(&dest).expect("read") == body, "body differs");
     }
@@ -759,9 +813,16 @@ mod tests {
         let dest = dir.path().join("tool");
         let url = serve("200 OK", b"tampered", 1);
 
-        let err = fetch(&url, None, BODY_SHA, false, &dest, std::future::pending())
-            .await
-            .expect_err("mismatch must fail");
+        let err = fetch(
+            &url,
+            Default::default(),
+            BODY_SHA,
+            false,
+            &dest,
+            std::future::pending(),
+        )
+        .await
+        .expect_err("mismatch must fail");
         assert!(
             format!("{err:#}").contains("checksum mismatch"),
             "got: {err:#}"
@@ -775,9 +836,16 @@ mod tests {
         let dest = dir.path().join("tool");
         let url = serve("404 Not Found", b"", 1);
 
-        let err = fetch(&url, None, "", false, &dest, std::future::pending())
-            .await
-            .expect_err("404 must fail");
+        let err = fetch(
+            &url,
+            Default::default(),
+            "",
+            false,
+            &dest,
+            std::future::pending(),
+        )
+        .await
+        .expect_err("404 must fail");
         assert!(format!("{err:#}").contains("GET"), "got: {err:#}");
     }
 
@@ -818,7 +886,7 @@ mod tests {
 
         let err = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            fetch_until_cancelled(&url, None, "", false, &dest, &ctoken),
+            fetch_until_cancelled(&url, Default::default(), "", false, &dest, &ctoken),
         )
         .await
         .expect("a cancelled fetch returns at once")
@@ -871,7 +939,7 @@ mod tests {
 
         let err = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            fetch_until_cancelled(&url, None, "", false, &dest, &ctoken),
+            fetch_until_cancelled(&url, Default::default(), "", false, &dest, &ctoken),
         )
         .await
         .expect("a cancelled fetch returns at once")
@@ -892,7 +960,9 @@ mod tests {
         let ctoken = StdCancellationToken::new();
         let download = tokio::spawn({
             let (dest, ctoken) = (dest.clone(), ctoken.clone());
-            async move { fetch_until_cancelled(&url, None, "", false, &dest, &ctoken).await }
+            async move {
+                fetch_until_cancelled(&url, Default::default(), "", false, &dest, &ctoken).await
+            }
         });
         let on_disk = || std::fs::metadata(&dest).map_or(0, |m| m.len());
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -927,7 +997,9 @@ mod tests {
         let ctoken = StdCancellationToken::new();
         let download = tokio::spawn({
             let (dest, ctoken) = (dest.clone(), ctoken.clone());
-            async move { fetch_until_cancelled(&url, None, "", false, &dest, &ctoken).await }
+            async move {
+                fetch_until_cancelled(&url, Default::default(), "", false, &dest, &ctoken).await
+            }
         });
         // The writer has created the file and waits on a body that never
         // starts.
@@ -985,7 +1057,7 @@ mod tests {
         let ctoken = hcore::hasync::StdCancellationToken::new();
         ctoken.cancel();
 
-        let err = fetch_until_cancelled(&url, None, "", false, &dest, &ctoken)
+        let err = fetch_until_cancelled(&url, Default::default(), "", false, &dest, &ctoken)
             .await
             .expect_err("a cancelled fetch fails");
         assert!(format!("{err:#}").contains("cancelled"), "got: {err:#}");
@@ -1013,7 +1085,7 @@ mod tests {
             dests.push(dest.clone());
             let ctoken = ctoken.clone();
             downloads.spawn(async move {
-                fetch_until_cancelled(&url, None, "", false, &dest, &ctoken).await
+                fetch_until_cancelled(&url, Default::default(), "", false, &dest, &ctoken).await
             });
         }
         // Every download has created its file and now waits on a body that
@@ -1432,8 +1504,169 @@ mod tests {
         }
     }
 
+    fn authed(auth: &hfetch::BasicAuth) -> hfetch::RequestOptions<'_> {
+        hfetch::RequestOptions {
+            auth: Some(auth),
+            ..Default::default()
+        }
+    }
+
     /// base64("u:p")
     const BASIC_U_P: &str = "Basic dTpw";
+
+    /// Serve one request on `listener` and report its whole head, lowercased.
+    fn answer_head(listener: std::net::TcpListener) -> std::sync::mpsc::Receiver<String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let Ok((mut sock, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            let n = std::io::Read::read(&mut sock, &mut buf).unwrap_or(0);
+            let _ =
+                tx.send(String::from_utf8_lossy(buf.get(..n).unwrap_or_default()).to_lowercase());
+            let _ = std::io::Write::write_all(&mut sock, ok(b"x").as_bytes());
+        });
+        rx
+    }
+
+    /// Every request says who it is (`heph/<version>`; GitHub's API refuses one
+    /// that does not), and carries the target's headers.
+    #[tokio::test]
+    async fn fetch_sends_the_user_agent_and_the_targets_headers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("tool");
+        let ua = format!("user-agent: {}", hfetch::user_agent().to_lowercase());
+        assert!(ua.starts_with("user-agent: heph/"), "{ua}");
+
+        let (listener, url) = bind();
+        let head = answer_head(listener);
+        fetch(
+            &url,
+            Default::default(),
+            "",
+            false,
+            &dest,
+            std::future::pending(),
+        )
+        .await
+        .expect("fetch");
+        assert!(
+            head.recv().expect("request").contains(&ua),
+            "default user agent"
+        );
+
+        let (listener, url) = bind();
+        let head = answer_head(listener);
+        let headers = vec![
+            ("accept".to_string(), "application/octet-stream".to_string()),
+            ("user-agent".to_string(), "custom/1".to_string()),
+        ];
+        let opts = hfetch::RequestOptions {
+            auth: None,
+            headers: &headers,
+        };
+        fetch(&url, opts, "", false, &dest, std::future::pending())
+            .await
+            .expect("fetch");
+        let got = head.recv().expect("request");
+        assert!(got.contains("accept: application/octet-stream"), "{got}");
+        assert!(got.contains("user-agent: custom/1"), "{got}");
+        assert!(
+            !got.contains("heph/"),
+            "the target's user agent replaces the default: {got}"
+        );
+    }
+
+    async fn parse_with_headers(headers: &[(&str, &str)]) -> anyhow::Result<TargetDef> {
+        let mut config = HashMap::from([(
+            "url".to_string(),
+            Value::String("https://x/tool".to_string()),
+        )]);
+        if !headers.is_empty() {
+            config.insert(
+                "headers".to_string(),
+                Value::Map(
+                    headers
+                        .iter()
+                        .map(|(k, v)| ((*k).to_string(), Value::String((*v).to_string())))
+                        .collect(),
+                ),
+            );
+        }
+        Ok(Driver
+            .parse(parse_req("//dl:tool", config), &StdCancellationToken::new())
+            .await?
+            .target_def)
+    }
+
+    /// Headers are part of the target's identity, spelled any case; a target
+    /// without them keeps the key it had before they existed.
+    #[tokio::test]
+    async fn headers_are_hashed_case_insensitively() {
+        let plain = parse_with_headers(&[]).await.expect("parse");
+        let a = parse_with_headers(&[("Accept", "application/octet-stream")])
+            .await
+            .expect("parse");
+        let b = parse_with_headers(&[("accept", "application/octet-stream")])
+            .await
+            .expect("parse");
+        let c = parse_with_headers(&[("Accept", "application/json")])
+            .await
+            .expect("parse");
+        assert_ne!(a.hash, plain.hash, "a header moves the key");
+        assert_eq!(a.hash, b.hash, "header names are case-insensitive");
+        assert_ne!(a.hash, c.hash, "a header value moves the key");
+
+        // Pinned from before `headers` existed: the url/sha256/out/executable
+        // hash of this target must not move.
+        let mut h = DebugHasher::new(Xxh3Default::new(), || "pin".to_string());
+        HttpFetchDef {
+            url: "https://x/tool".to_string(),
+            sha256: String::new(),
+            out: "dl/tool".to_string(),
+            executable: false,
+            headers: vec![],
+        }
+        .hash(&mut h);
+        let mut old = DebugHasher::new(Xxh3Default::new(), || "pin".to_string());
+        HTTP_FETCH_FORMAT_VERSION.hash(&mut old);
+        "https://x/tool".hash(&mut old);
+        "".hash(&mut old);
+        "dl/tool".hash(&mut old);
+        false.hash(&mut old);
+        assert_eq!(h.finish(), old.finish(), "no headers hashes as before");
+    }
+
+    /// Secrets, client-owned headers, two spellings of one name, and bytes a
+    /// header cannot carry are refused at parse, without quoting the value.
+    #[tokio::test]
+    async fn headers_that_cannot_be_set_are_refused() {
+        for (headers, wants) in [
+            (
+                vec![("Authorization", "Bearer s3cr3t")],
+                "declare `credentials`",
+            ),
+            (vec![("cookie", "s=s3cr3t")], "declare `credentials`"),
+            (
+                vec![("Proxy-Authorization", "s3cr3t")],
+                "declare `credentials`",
+            ),
+            (vec![("Host", "evil.example")], "derives it from the url"),
+            (vec![("Content-Length", "1")], "the client sets it"),
+            (vec![("Accept", "a"), ("accept", "b")], "are one header"),
+            (vec![("bad name", "v")], "not a valid HTTP header name"),
+            (vec![("X-Token", "s3cr3t\nInjected: 1")], "cannot carry"),
+        ] {
+            let Err(err) = parse_with_headers(&headers).await else {
+                panic!("{headers:?} must fail parse");
+            };
+            let msg = format!("{err:#}");
+            assert!(msg.contains(wants), "{headers:?}: {msg}");
+            assert!(msg.contains("//dl:tool"), "names the target: {msg}");
+            assert!(!msg.contains("s3cr3t"), "quoted a value: {msg}");
+        }
+    }
 
     /// The selected entry goes out as basic auth, and nothing goes out without
     /// one.
@@ -1446,7 +1679,7 @@ mod tests {
         let auth = answer(listener, vec![ok(b"x")]);
         fetch(
             &url,
-            Some(&creds()),
+            authed(&creds()),
             "",
             false,
             &dest,
@@ -1458,9 +1691,16 @@ mod tests {
 
         let (listener, url) = bind();
         let auth = answer(listener, vec![ok(b"x")]);
-        fetch(&url, None, "", false, &dest, std::future::pending())
-            .await
-            .expect("fetch");
+        fetch(
+            &url,
+            Default::default(),
+            "",
+            false,
+            &dest,
+            std::future::pending(),
+        )
+        .await
+        .expect("fetch");
         assert_eq!(auth.recv().expect("request"), "");
     }
 
@@ -1479,7 +1719,7 @@ mod tests {
         let at_origin = answer(origin_listener, vec![redirect(&format!("{cdn}/signed"))]);
         fetch(
             &origin,
-            Some(&creds()),
+            authed(&creds()),
             "",
             false,
             &dest,
@@ -1494,7 +1734,7 @@ mod tests {
         let seen = answer(listener, vec![redirect(&format!("{url}/next")), ok(b"x")]);
         fetch(
             &url,
-            Some(&creds()),
+            authed(&creds()),
             "",
             false,
             &dest,
@@ -1517,9 +1757,16 @@ mod tests {
             async move {
                 let (listener, url) = bind();
                 let _seen = answer(listener, vec![status(line)]);
-                fetch(&url, None, "", false, &dest, std::future::pending())
-                    .await
-                    .expect_err(line)
+                fetch(
+                    &url,
+                    Default::default(),
+                    "",
+                    false,
+                    &dest,
+                    std::future::pending(),
+                )
+                .await
+                .expect_err(line)
             }
         };
         let selected = auth::Selected {

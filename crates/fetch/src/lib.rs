@@ -88,27 +88,32 @@ impl Fetcher {
     /// For a caller that writes the body somewhere other than the polling
     /// worker; [`get_async`](Self::get_async) writes each chunk inline.
     pub async fn open<'u>(&self, url: &'u str) -> anyhow::Result<Body<'u>> {
-        self.open_with(url, None).await
+        self.open_with(url, RequestOptions::default()).await
     }
 
-    /// [`open`](Self::open), sending `auth` as HTTP basic auth when set.
+    /// [`open`](Self::open), sending what `opts` adds to the request.
     ///
-    /// The header is sent to `url`'s origin only: a redirect to another host,
-    /// port or scheme drops it (reqwest strips `Authorization` on a
+    /// The auth header is sent to `url`'s origin only: a redirect to another
+    /// host, port or scheme drops it (reqwest strips `Authorization` on a
     /// cross-origin hop), so a release asset that redirects to a CDN's signed
-    /// URL does not hand that CDN the credential.
+    /// URL does not hand that CDN the credential. `opts.headers` hold no
+    /// secret ([`check_header`] refuses those) and follow every hop.
     pub async fn open_with<'u>(
         &self,
         url: &'u str,
-        auth: Option<&BasicAuth>,
+        opts: RequestOptions<'_>,
     ) -> anyhow::Result<Body<'u>> {
         let client = reqwest::Client::builder()
             .connect_timeout(self.connect_timeout)
             .read_timeout(self.read_timeout)
+            .user_agent(user_agent())
             .build()
             .context("build download client")?;
         let mut req = client.get(url);
-        if let Some(auth) = auth {
+        for (name, value) in opts.headers {
+            req = req.header(name.as_str(), value.as_str());
+        }
+        if let Some(auth) = opts.auth {
             req = req.basic_auth(&auth.username, Some(&auth.password));
         }
         let resp = req
@@ -118,6 +123,65 @@ impl Fetcher {
             .with_context(|| format!("GET {url}"))?;
         Ok(Body { url, resp })
     }
+}
+
+/// What a GET sends beyond its URL. See [`Fetcher::open_with`].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RequestOptions<'a> {
+    /// Sent as HTTP basic auth, to the URL's origin only.
+    pub auth: Option<&'a BasicAuth>,
+    /// Extra request headers, each already accepted by [`check_header`]. One
+    /// named `User-Agent` replaces [`user_agent`].
+    pub headers: &'a [(String, String)],
+}
+
+/// The `User-Agent` every download sends: `heph/<version>`. Some servers
+/// refuse a request with none (GitHub's API answers 403), and reqwest sets
+/// none of its own.
+pub fn user_agent() -> String {
+    format!("heph/{}", hcore::version::current())
+}
+
+/// Headers a caller may not set through [`RequestOptions::headers`], and why.
+/// Secrets first: a header there is ordinary configuration, written in a BUILD
+/// file and hashed into a key, so a credential in one would be both. The rest
+/// frame the request, which is the client's job.
+const REFUSED_HEADERS: &[(&str, &str)] = &[
+    (
+        "authorization",
+        "it carries a credential; declare `credentials` instead",
+    ),
+    (
+        "proxy-authorization",
+        "it carries a credential; declare `credentials` instead",
+    ),
+    (
+        "cookie",
+        "it carries a credential; declare `credentials` instead",
+    ),
+    ("host", "the client derives it from the url"),
+    ("content-length", "the client sets it"),
+    ("transfer-encoding", "the client sets it"),
+    ("connection", "the client manages the connection"),
+];
+
+/// Accept `name: value` as an extra request header, or say why not: a name or
+/// value HTTP cannot carry, or a header in the refused set. Returns the name
+/// lowercased, the one spelling two declarations of the same header share.
+///
+/// Never quotes `value`: an author who put a token in one anyway should not
+/// find it copied into an error.
+pub fn check_header(name: &str, value: &str) -> anyhow::Result<String> {
+    let parsed = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+        .map_err(|_e| anyhow::anyhow!("{name:?} is not a valid HTTP header name"))?;
+    let lower = parsed.as_str();
+    if let Some((_, why)) = REFUSED_HEADERS.iter().find(|(n, _)| *n == lower) {
+        anyhow::bail!("header {name:?} cannot be set here: {why}");
+    }
+    reqwest::header::HeaderValue::from_str(value).map_err(|_e| {
+        anyhow::anyhow!("the value of header {name:?} holds bytes an HTTP header cannot carry")
+    })?;
+    Ok(lower.to_string())
 }
 
 /// The HTTP status a failed download was answered with, if the failure was a
