@@ -16,7 +16,7 @@ use serde::Serialize;
 use tokio::signal::unix::{SignalKind, signal};
 
 use super::reference::{self, Opener, Resolved};
-use super::{QueryArgs, QueryFormat, ViewOpts, escape, escape_text, list_all};
+use super::{QueryArgs, QueryFormat, SessionExit, ViewOpts, escape, escape_text, list_all};
 use crate::tui::session::query::{
     self as engine, Answer, Coverage, Limits, QueryError, RecordingFile, Scope, Source,
 };
@@ -190,10 +190,16 @@ async fn full(
     .await
 }
 
-fn query_error(e: QueryError) -> anyhow::Error {
+/// `e` as the command reports it: a Ctrl-C exits 130, as an interrupted
+/// command does; everything else is 125 (`wrap_exit`).
+pub(crate) fn query_error(e: QueryError) -> anyhow::Error {
     match e {
         QueryError::Sql(m) => anyhow::anyhow!(m),
-        QueryError::Interrupted => anyhow::anyhow!("query interrupted"),
+        QueryError::Interrupted => SessionExit {
+            code: SessionExit::INTERRUPTED,
+            error: Some(anyhow::anyhow!("query interrupted")),
+        }
+        .into(),
         QueryError::Other(e) => e.context("running the query"),
     }
 }

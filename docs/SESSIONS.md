@@ -38,7 +38,7 @@ path or `https://` URL (see [Opening a recording: `<ref>`](#opening-a-recording-
 | `attach <ref>` | The interactive TUI on the session, following it until it ends; `q` or Ctrl-C detaches and never cancels it. Without a terminal it follows in line form. | the session's exit code; 0 on detach |
 | `inflight <id>` | The session's in-flight report (what the `SIGQUIT` dump carries), asked for through the session directory; waits 5s. Local sessions only. | 0 |
 | `export <ref>` | Writes the recording as one self-contained `.hephsession` file and prints its path (see [Export](#export-hephsession)). | 0 |
-| `query <sql>` | Read-only SQL over the [explorer](#the-explorer)'s six tables, from the catalog (this workspace's sessions of the last 7 days by default), every recording kept (`--full`), or the recordings named (`--from <ref>`). See [`query`](#query). | 0 |
+| `query <sql>` | Read-only SQL over the [explorer](#the-explorer)'s six tables, from the catalog (this workspace's sessions of the last 7 days by default), every recording kept (`--full`), or the recordings named (`--from <ref>`). See [`query`](#query). | 0; 130 on Ctrl-C |
 
 Every error of `heph session` itself exits **125**: no such session, an
 ambiguous id, a file that is not a heph session, a URL refused or not
@@ -54,10 +54,13 @@ session whose `End` carries no code (killed by a signal, or it panicked) is
 reported as an error with that reason. An agent tells "the run failed" from
 "the wait failed" by that line, or by `heph session show <id> --json`.
 
+The one exception is a `query` stopped by Ctrl-C: it exits **130**, as an
+interrupted command does.
+
 Under `--json` (`list`, `show`, `inflight`, and `query --format json`), an
 error is what it is on every heph command (`docs/JSON_OUTPUT.md`): the
-message on stderr and the exit code, 125 here, with nothing on stdout. No
-JSON error object is printed.
+message on stderr and the exit code (125, or 130 for an interrupted query),
+with nothing on stdout. No JSON error object is printed.
 
 STATE is computed by the viewer, never stored: `running`; `waiting` (every
 open target is in a lock or admission wait); `quiet` (no event for longer
@@ -210,10 +213,11 @@ line:
   and truncated sources are also named on stderr. `coverage` only gains
   fields.
 
-**Errors** exit 125, as every `heph session` error does. A refused, invalid
+**Errors** exit 125, as `heph session`'s own errors do. A refused, invalid
 or stopped statement says so on stderr with SQLite's message (an unknown
 table or column lists the real ones); under `--format json` stdout stays
-empty.
+empty. Ctrl-C stops the query, removes its temp files, and exits **130**,
+the one `heph session` error that is not 125.
 
 ### heph inside a target
 

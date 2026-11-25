@@ -363,3 +363,21 @@ async fn query_stop_listener_is_armed_before_its_task_runs() {
     .await
     .expect("the signal raised before the task ran sets the stop flag");
 }
+
+/// A query stopped by Ctrl-C exits 130, not 125 (the one `heph session`
+/// error that does), with its message for stderr. A `--timeout` stays 125.
+#[test]
+fn query_interrupted_exits_130() {
+    use crate::tui::session::query::QueryError;
+
+    let (code, msg) = code_and_msg(query::query_error(QueryError::Interrupted));
+    assert_eq!((code, msg.as_str()), (Some(130), "query interrupted"));
+
+    let (code, msg) = code_and_msg(query::query_error(QueryError::Sql(
+        "stopped after --timeout 1s".into(),
+    )));
+    assert_eq!(
+        (code, msg.as_str()),
+        (Some(125), "stopped after --timeout 1s")
+    );
+}

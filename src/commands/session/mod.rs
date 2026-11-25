@@ -13,7 +13,8 @@
 //! ambiguous id, a format this heph cannot read, a lost session on attach, an
 //! in-flight request that went unanswered); `attach` otherwise exits with the
 //! session's exit code, and 0 on detach. A session can exit 125 too, so
-//! `attach` names a mirrored 125 on stderr. See [`SessionExit`].
+//! `attach` names a mirrored 125 on stderr. A `query` stopped by Ctrl-C exits
+//! 130, the one exception. See [`SessionExit`].
 
 mod attach;
 mod export;
@@ -156,7 +157,8 @@ pub enum SessionCommands {
     /// The query is read-only by construction: one statement, reads and
     /// side-effect-free functions only. It stops after `--timeout`, and more
     /// rows than `--limit` (100000 by default, 0 for none) is an error. A
-    /// refused or failing statement exits 125.
+    /// refused or failing statement exits 125. Ctrl-C stops it and exits
+    /// 130.
     ///
     /// Examples:
     ///
@@ -380,7 +382,8 @@ impl SessionArgs {
 /// Every error that is not already a [`SessionExit`] is this command's own:
 /// exit 125, so it is never read as an exit code `attach` mirrored. A `--jq`
 /// failure keeps the output layer's code (2, or 130 when cancelled), as on
-/// every command.
+/// every command. A query stopped by Ctrl-C is already a [`SessionExit`]
+/// with code 130, as an interrupted command exits.
 pub(crate) fn wrap_exit(res: anyhow::Result<()>) -> anyhow::Result<()> {
     res.map_err(|e| {
         if e.downcast_ref::<SessionExit>().is_some() || output::exit_code(&e).is_some() {
@@ -552,6 +555,8 @@ impl SessionExit {
     /// The command's own failure (A14). A session can exit 125 as well;
     /// `attach` says so on stderr when it mirrors one (`attach::exit_note`).
     pub const OWN_FAILURE: u8 = 125;
+    /// `query` stopped by Ctrl-C: 128 + SIGINT, as a shell reports it.
+    pub const INTERRUPTED: u8 = 130;
 
     pub fn own(error: anyhow::Error) -> Self {
         Self {
