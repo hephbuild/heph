@@ -265,6 +265,12 @@ GROUP BY package ORDER BY hit_pct, targets DESC, package",
 /// first sample at or after it by a running count over one sorted timeline,
 /// and the split of `[s, e]` is the difference of two running totals. The
 /// `(name, time_us)` index serves the three metric reads when it exists.
+///
+/// The `+` in `+w.start_us AS s` is load-bearing: it strips the column's
+/// INTEGER affinity, so `a.x = w.s` compares like `b.x = w.e` and SQLite's
+/// automatic index on the marks can look the start up by `x`. Without it,
+/// each wait scanned every mark of its session: 50k waits took minutes
+/// (`waiting_split_uses_index` checks the plan).
 pub const WAITING_BY_LOAD: Recipe = Recipe {
     name: "waiting_by_load",
     purpose: "Was the machine the limit while work waited, by waiting phase?",
@@ -316,7 +322,7 @@ WITH busy AS (
   SELECT w.session_id,
          CASE WHEN substr(w.name, 1, 5) = 'heph.' THEN substr(w.name, 6) ELSE w.name END
            AS phase,
-         w.start_us AS s, coalesce(w.end_us, max(w.start_us, l.t)) AS e
+         +w.start_us AS s, coalesce(w.end_us, max(w.start_us, l.t)) AS e
   FROM spans w
   LEFT JOIN (SELECT session_id, t FROM cum WHERE nth = 1) l ON l.session_id = w.session_id
   WHERE w.class = 'waiting' AND w.start_us IS NOT NULL

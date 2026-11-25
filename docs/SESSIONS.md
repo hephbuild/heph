@@ -623,7 +623,7 @@ WITH busy AS (
   SELECT w.session_id,
          CASE WHEN substr(w.name, 1, 5) = 'heph.' THEN substr(w.name, 6) ELSE w.name END
            AS phase,
-         w.start_us AS s, coalesce(w.end_us, max(w.start_us, l.t)) AS e
+         +w.start_us AS s, coalesce(w.end_us, max(w.start_us, l.t)) AS e
   FROM spans w
   LEFT JOIN (SELECT session_id, t FROM cum WHERE nth = 1) l ON l.session_id = w.session_id
   WHERE w.class = 'waiting' AND w.start_us IS NOT NULL

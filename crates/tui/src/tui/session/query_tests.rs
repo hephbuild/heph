@@ -677,3 +677,108 @@ fn a_query_over_a_capped_session_says_it_is_partial() {
         "{metrics:?}"
     );
 }
+
+/// Spec row `waiting_split_uses_index`: on a recording with 50k targets'
+/// admission waits and 8 hours of samples, once the first query has built
+/// the indexes, every read of `metrics` in `waiting_by_load` goes through
+/// the `(name, time_us)` index (`show` runs it on the file itself); and the
+/// split it reads accounts for every microsecond waited.
+#[test]
+fn waiting_split_uses_index() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().join("sessions");
+    let qtmp = tmp.path().join("qtmp");
+    let dir = recording(&root, 1, 1_000);
+    // 50k waits of 100 ms, one every 576 ms, over 8 h of samples a second
+    // apart, alternately busy and spare, with memory at 10%.
+    testing::alter(
+        &dir,
+        "CREATE TEMP TABLE base AS
+           SELECT (SELECT session_id FROM spans LIMIT 1) AS sid,
+                  1700000000000000 AS b;
+         WITH RECURSIVE k(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM k WHERE i < 49999)
+         INSERT INTO spans (session_id, span_id, name, class, addr, start_us, end_us, duration_us)
+         SELECT sid, 10000000 + i, 'heph.admission', 'waiting', '//big:t' || i,
+                b + i * 576000, b + i * 576000 + 100000, 100000
+         FROM k, base;
+         INSERT INTO metrics (session_id, name, kind, unit, time_us, value)
+         SELECT sid, 'heph.machine.memory.limit', 'gauge', 'By', b, 100.0 FROM base;
+         WITH RECURSIVE k(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM k WHERE i < 28800)
+         INSERT INTO metrics (session_id, name, kind, unit, time_us, value)
+         SELECT sid, 'heph.machine.cpu.busy', 'gauge', '1', b + i * 1000000,
+                CASE i % 2 WHEN 0 THEN 0.95 ELSE 0.5 END
+         FROM k, base
+         UNION ALL
+         SELECT sid, 'heph.machine.memory.used', 'gauge', 'By', b + i * 1000000, 10.0
+         FROM k, base
+         UNION ALL
+         SELECT sid, 'heph.process.memory.resident', 'gauge', 'By', b + i * 1000000, 1e8
+         FROM k, base;",
+    )
+    .expect("the 8-hour fixture");
+    let file = dir.join(store::FILE);
+    assert!(!indexes(&file).contains(&"metrics_name".to_owned()));
+    rows(
+        "SELECT count(*) FROM metrics",
+        vec![local(&root, &dir)],
+        &qtmp,
+    );
+    assert!(
+        indexes(&file).contains(&"metrics_name".to_owned()),
+        "built on first need"
+    );
+
+    let conn = Connection::open_with_flags(&file, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("open");
+    let mut stmt = conn
+        .prepare(&format!(
+            "EXPLAIN QUERY PLAN {}",
+            query::WAITING_BY_LOAD.sql
+        ))
+        .expect("prepare the plan");
+    let plan: Vec<String> = stmt
+        .query_map([], |r| r.get(3))
+        .expect("plan")
+        .collect::<rusqlite::Result<_>>()
+        .expect("plan rows");
+    let reads: Vec<&String> = plan
+        .iter()
+        .filter(|d| d.contains(" metrics") && !d.contains("CTE"))
+        .collect();
+    assert_eq!(reads.len(), 3, "busy, used and the limit: {plan:#?}");
+    for d in &reads {
+        assert!(
+            d.contains("INDEX metrics_name (name=?"),
+            "{d} is not an index search: {plan:#?}"
+        );
+    }
+    // Each wait's two ends are looked up by time (`x`), not by scanning
+    // every mark of the session per wait: with the wait's start compared at
+    // the column's affinity, the start's lookup lost `x` and 50k waits took
+    // minutes.
+    let marks: Vec<&String> = plan.iter().filter(|d| d.starts_with("SEARCH r ")).collect();
+    assert_eq!(marks.len(), 2, "both ends: {plan:#?}");
+    for d in marks {
+        assert!(d.contains("x=?"), "{d}: {plan:#?}");
+    }
+
+    let waited: i64 = conn
+        .query_row(
+            "SELECT sum(end_us - start_us) FROM spans \
+             WHERE class = 'waiting' AND name = 'heph.admission'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("waited");
+    let split = super::machine::read_waiting(&conn).expect("the split");
+    let admission = &split["admission"];
+    assert_eq!(
+        i64::try_from(admission.total_us()).expect("fits"),
+        waited,
+        "{admission:?}"
+    );
+    assert!(
+        admission.busy_us > 0 && admission.spare_us > 0,
+        "{admission:?}"
+    );
+}
