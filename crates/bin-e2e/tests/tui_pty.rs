@@ -2458,3 +2458,140 @@ fn last_index(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 fn first_index(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
+
+/// How many rows [`long_notice_build`]'s notice has.
+const NOTICE_ROWS: u32 = 100;
+
+/// `//pkg:one`, approval-gated, its notice [`NOTICE_ROWS`] rows `row1`,
+/// `row2`, …: taller than the screen.
+fn long_notice_build(_gate: &std::path::Path) -> String {
+    format!(
+        concat!(
+            "target(name = \"plan\", driver = \"bash\", cache = False, out = \"plan.txt\",",
+            " run = \"for ((i = 1; i <= {n}; i++)); do echo row$i; done > $OUT\")\n",
+            "target(name = \"one\", driver = \"bash\", cache = False, run = \"true\",",
+            " deps = {{\"plan\": \":plan\"}},",
+            " approval = {{\"required\": True, \"notice\": [\"plan\"]}})\n",
+        ),
+        n = NOTICE_ROWS,
+    )
+}
+
+/// `bytes` in standard base64, padded: what an OSC 52 carries.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let byte = |i: usize| u32::from(chunk.get(i).copied().unwrap_or(0));
+        let n = (byte(0) << 16) | (byte(1) << 8) | byte(2);
+        for i in 0..4 {
+            let sextet = (n >> (18 - 6 * i)) & 63;
+            let c = if i <= chunk.len() {
+                ALPHABET.get(sextet as usize).copied().unwrap_or(b'=')
+            } else {
+                b'='
+            };
+            out.push(char::from(c));
+        }
+    }
+    out
+}
+
+/// A drag in the approval view's notice scrolls it and copies what scrolled
+/// off screen. Pressed on its first row, the wheel turned twice under the
+/// held button scrolls it six rows, the selection kept from `row1`; the
+/// pointer held on the hint row, past the notice's bottom, scrolls it on to
+/// its end. The release copies every row, `row1` to the last, though most
+/// were never on screen with the button down; the notice stays where the
+/// drag left it.
+#[test]
+fn a_drag_scrolls_the_approval_notice_and_copies_all_it_spans() {
+    let mut g = Gated::start_build(long_notice_build, "", &[], "//pkg:one");
+    g.pty.wait_screen("the request on the line", DEADLINE, |s| {
+        prompted_for(s, "//pkg:one", "")
+    });
+    g.pty.send(ENTER);
+    g.pty.wait_screen("the notice in the view", DEADLINE, |s| {
+        approval_tabs(s).is_some() && find_cell(s, "row1").is_some()
+    });
+    let (top, col) = g
+        .pty
+        .with_screen(|s| find_cell(s, "row1"))
+        .expect("waited for above");
+    let row_at = |s: &vt100::Screen, row: u16| rows_of(s).nth(usize::from(row)).unwrap_or_default();
+    let inverse_at =
+        |s: &vt100::Screen, row: u16| s.cell(row, col).is_some_and(vt100::Cell::inverse);
+    // SGR is 1-based: button 0 pressed (M) and released (m), 32 the left
+    // button moving, 65 a wheel step down.
+    let (x, y) = (col + 1, top + 1);
+    g.pty
+        .send(format!("\x1b[<0;{x};{y}M\x1b[<32;{};{y}M", x + 3).as_bytes());
+    g.pty
+        .send(format!("\x1b[<65;{x};{y}M\x1b[<65;{x};{y}M").as_bytes());
+    g.pty.wait_screen(
+        "the notice scrolled six rows under the held button, selected",
+        DEADLINE,
+        |s| row_at(s, top).trim() == "row7" && inverse_at(s, top),
+    );
+    let osc_start = b"\x1b]52;";
+    assert!(
+        !contains(&g.pty.output(), osc_start),
+        "copied before the release"
+    );
+    // The hint row: two rows past the notice's bottom.
+    let hint_y = common::pty::ROWS;
+    g.pty.send(format!("\x1b[<32;{x};{hint_y}M").as_bytes());
+    let last = format!("row{NOTICE_ROWS}");
+    g.pty.wait_screen(
+        "the notice scrolled to its end with the pointer held past it",
+        DEADLINE,
+        |s| {
+            find_cell(s, &last)
+                .is_some_and(|(row, c)| s.cell(row, c).is_some_and(vt100::Cell::inverse))
+        },
+    );
+    g.pty.send(format!("\x1b[<0;{x};{hint_y}m").as_bytes());
+    let text = (1..=NOTICE_ROWS)
+        .map(|i| format!("row{i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let osc = format!("\x1b]52;c;{}\x1b\\", base64(text.as_bytes()));
+    let deadline = Instant::now() + DEADLINE;
+    while !contains(&g.pty.output(), osc.as_bytes()) {
+        assert!(
+            Instant::now() < deadline,
+            "no OSC 52 carrying row1 to {last} after the release; copied: {:?}\n{}",
+            first_index(&g.pty.output(), osc_start).map(|i| {
+                String::from_utf8_lossy(g.pty.output().get(i..).unwrap_or_default())
+                    .chars()
+                    .take(80)
+                    .collect::<String>()
+            }),
+            g.pty.screen()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Left at its end: the last row on the notice's last line, nothing
+    // highlighted, the copy noted.
+    let shown = u32::from(common::pty::ROWS) - 6;
+    let first_shown = format!("row{}", NOTICE_ROWS - shown + 1);
+    g.pty.wait_screen(
+        "the notice left at its end, the copy noted",
+        DEADLINE,
+        |s| {
+            row_at(s, top).trim() == first_shown
+                && !inverse_at(s, top)
+                && s.contents()
+                    .contains(&format!("copied {} chars", text.chars().count()))
+        },
+    );
+    g.pty.send(b"y");
+    let ended = g.exit();
+    assert_eq!(
+        ended,
+        common::pty::Ended::Code(0),
+        "the build failed\n{}",
+        g.pty.seen()
+    );
+    assert_restored(&g.pty, "drag in the notice");
+}

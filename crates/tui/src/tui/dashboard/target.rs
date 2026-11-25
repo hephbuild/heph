@@ -22,7 +22,7 @@ use super::intern::Id;
 use super::list::{Waits, secs_tenths};
 use super::logpane::{LogPane, PaneState};
 use super::model::{Model, Record, RowState};
-use crate::tui::app::ScreenKey;
+use crate::tui::app::{DocRow, ScreenKey, SelectDoc};
 use crate::tui::text::{Redact, clean_inline, cut_left, cut_right, width};
 
 pub const OVERVIEW_HINTS: &str = "tab/⇧tab switch tab · esc back to the list";
@@ -109,9 +109,17 @@ struct Drawn {
     tabs: [(Range<u16>, TargetTab); 3],
     rows: u16,
     body_shown: usize,
-    /// The Log tab's log text: its rows, from past the line numbers to the
-    /// right edge. What a drag starting there selects within.
-    log_text: Option<Rect>,
+    /// The frame's width.
+    cols: u16,
+    /// The tab's body rows, the full width of them.
+    body_area: Rect,
+    /// Overview's or Outputs' whole body, scrolled to `scroll`: what a
+    /// drag there selects in. Empty on the Log tab.
+    body: Vec<Line<'static>>,
+    /// The Log tab's log pane: its rows, the full width of them, and the
+    /// column its text starts at, past the line numbers. What a drag there
+    /// selects in.
+    log: Option<(Rect, u16)>,
 }
 
 impl Default for Drawn {
@@ -120,7 +128,10 @@ impl Default for Drawn {
             tabs: TargetTab::ALL.map(|t| (0..0, t)),
             rows: 0,
             body_shown: 0,
-            log_text: None,
+            cols: 0,
+            body_area: Rect::default(),
+            body: Vec::new(),
+            log: None,
         }
     }
 }
@@ -164,10 +175,38 @@ impl TargetScreen {
         }
     }
 
-    /// The Log tab's text in the last frame, when `at` is in it: a drag
-    /// started there selects the log without its line numbers.
-    pub fn text_region(&self, at: Position) -> Option<Rect> {
-        self.drawn.log_text.filter(|r| r.contains(at))
+    /// The tab body's whole text when `at` is in it on the last frame, for
+    /// a drag to select and scroll in: the Log tab's held log, without its
+    /// line numbers, or Overview's or Outputs' rows. `None` off it.
+    pub fn selection_doc(&mut self, at: Position, redact: &Redact) -> Option<SelectDoc> {
+        if self.tab == TargetTab::Log {
+            let (area, text_left) = self.drawn.log.filter(|(r, _)| r.contains(at))?;
+            let (rows, top) = self.pane.doc(usize::from(self.drawn.cols), redact)?;
+            return Some(SelectDoc {
+                area,
+                text_left,
+                rows,
+                top,
+            });
+        }
+        if !self.drawn.body_area.contains(at) || self.drawn.body.is_empty() {
+            return None;
+        }
+        Some(SelectDoc {
+            area: self.drawn.body_area,
+            text_left: 0,
+            rows: self.drawn.body.iter().cloned().map(DocRow::plain).collect(),
+            top: self.scroll,
+        })
+    }
+
+    /// A drag left the tab body scrolled to row `top` of its
+    /// [`Self::selection_doc`].
+    pub fn scroll_to(&mut self, top: usize) {
+        match self.tab {
+            TargetTab::Log => self.pane.scroll_to_doc_row(top),
+            _ => self.scroll = top,
+        }
     }
 
     /// A click at `(col, row)` of the last frame: the breadcrumb, a tab, or
@@ -382,7 +421,15 @@ impl TargetScreen {
         let body_rows = usize::from(rows.saturating_sub(CHROME_ROWS));
         let addr = m.addr(self.id);
         let rec = m.record(self.id).copied();
-        self.drawn.log_text = None;
+        self.drawn.log = None;
+        self.drawn.body.clear();
+        self.drawn.cols = cols;
+        self.drawn.body_area = Rect::new(
+            0,
+            BODY_TOP,
+            cols,
+            u16::try_from(body_rows).unwrap_or(u16::MAX),
+        );
         let (status, body, hints) = match (self.tab, rec) {
             (_, None) => (String::new(), Vec::new(), OVERVIEW_HINTS.to_owned()),
             (TargetTab::Overview, Some(r)) => {
@@ -428,11 +475,10 @@ impl TargetScreen {
                     _ => {
                         let top = body.len();
                         body.extend(self.pane.body(c, left, inp.redact));
-                        let shown = body.len().min(body_rows).saturating_sub(top);
-                        self.drawn.log_text = self.pane.text_col().and_then(|x| {
+                        self.drawn.log = self.pane.text_col().and_then(|x| {
                             let y = BODY_TOP.checked_add(u16::try_from(top).ok()?)?;
-                            let height = u16::try_from(shown).ok()?;
-                            Some(Rect::new(x, y, cols.saturating_sub(x), height))
+                            let height = u16::try_from(left).ok()?;
+                            Some((Rect::new(0, y, cols, height), x))
                         });
                     }
                 }
@@ -483,10 +529,13 @@ impl TargetScreen {
         out
     }
 
-    /// `body` from the scroll offset, kept within it.
+    /// `body` from the scroll offset, kept within it. The whole of it is
+    /// kept until the next frame, for a drag to select in.
     fn window(&mut self, body: Vec<Line<'static>>, rows: usize) -> Vec<Line<'static>> {
         self.scroll = self.scroll.min(body.len().saturating_sub(rows));
-        body.into_iter().skip(self.scroll).take(rows).collect()
+        let shown = body.iter().skip(self.scroll).take(rows).cloned().collect();
+        self.drawn.body = body;
+        shown
     }
 }
 

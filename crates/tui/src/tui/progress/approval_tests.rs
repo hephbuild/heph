@@ -484,3 +484,49 @@ fn approval_view_narrow_and_short() {
         }
     }
 }
+
+/// A drag in the notice selects in all of it: the view hands over every
+/// wrapped row, from the one on top, with a wrapped line's rows joined; off
+/// the notice it hands over nothing. Left scrolled by the drag, the notice
+/// stays there.
+#[test]
+fn a_drag_in_the_notice_selects_all_of_it() {
+    use ratatui::layout::Position;
+    let home = tempfile::tempdir().expect("tempdir");
+    let center = ApprovalCenter::new();
+    let mut content: String = (1..=40).map(|i| format!("line{i}\n")).collect();
+    content.push_str(&"x".repeat(50));
+    content.push('\n');
+    let _t = center.request(
+        &center.build(),
+        "//p:gate".into(),
+        vec![notice(home.path(), "plan", &content)],
+    );
+    let mut v = with_store(view(&center), home.path());
+    assert!(v.approval_open());
+    let cols: u16 = 40;
+    let lines = settled(&mut v, T0, cols, ROWS);
+    let body_top = texts(&lines)
+        .iter()
+        .position(|r| r.trim() == "line1")
+        .expect("the notice on screen");
+    let row = u16::try_from(body_top).expect("a screen row");
+    let doc = v
+        .selection_doc(Position::new(5, row))
+        .expect("a doc in the notice");
+    assert_eq!(doc.area.y, row);
+    assert_eq!(doc.text_left, 2, "past the indent");
+    assert_eq!(doc.top, 0);
+    // Fifty x's at 38 columns: two rows, the first going on in the second.
+    assert_eq!(doc.rows.len(), 40 + 2);
+    let joined: Vec<bool> = doc.rows[39..].iter().map(|r| r.joined).collect();
+    assert_eq!(joined, [false, true, false]);
+    assert_eq!(doc.rows[0].line.to_string(), "  line1");
+    assert!(
+        v.selection_doc(Position::new(5, 0)).is_none(),
+        "the header is not the notice"
+    );
+    v.selection_scrolled(10);
+    let lines = v.render_full(T0, cols, ROWS);
+    assert_eq!(texts(&lines)[body_top].trim(), "line11");
+}

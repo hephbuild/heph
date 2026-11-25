@@ -2147,11 +2147,26 @@ impl TUIAppView for TuiProgressView {
         }
     }
 
-    fn selection_region(&self, at: ratatui::layout::Position) -> Option<ratatui::layout::Rect> {
-        if self.approval.is_some() || !self.dashboard_open {
+    fn selection_doc(
+        &mut self,
+        at: ratatui::layout::Position,
+    ) -> Option<crate::tui::app::SelectDoc> {
+        // The approval view overlays whichever screen opened it.
+        if let Some(a) = &self.approval {
+            return a.selection_doc(at);
+        }
+        if !self.dashboard_open {
             return None;
         }
-        self.target.as_ref()?.text_region(at)
+        self.target.as_mut()?.selection_doc(at, &self.state.redact)
+    }
+
+    fn selection_scrolled(&mut self, top: usize) {
+        if let Some(a) = self.approval.as_mut() {
+            a.scroll_to(top);
+        } else if let Some(t) = self.target.as_mut().filter(|_| self.dashboard_open) {
+            t.scroll_to(top);
+        }
     }
 
     fn mouse(&mut self, input: crate::tui::app::MouseInput) {

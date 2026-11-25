@@ -24,6 +24,7 @@ use tokio::sync::mpsc;
 
 use super::select::{Action, Selection};
 use crate::tui::app::{App, AppContext, Control, Decide, MouseInput, ScreenKey, TUIAppView};
+use crate::tui::dashboard::WHEEL_ROWS;
 use crate::tui::log_sink::{LogSink, REPLAY_FLUSH_TIMEOUT, ReplayMark, Replayed, SinkLine};
 use crate::tui::session::recorder::ViewTap;
 use crate::tui::session::{SessionSlot, TappedReceiver};
@@ -184,7 +185,8 @@ impl FullScreen {
     /// is not asked: the frozen frame is drawn instead, with the selection
     /// on it. A resize ends the drag, since the frame it froze no longer
     /// fits; so does [`select::IDLE`](super::select::IDLE) with no mouse
-    /// report.
+    /// report. A pointer held past a pane's edge scrolls it a step here,
+    /// since a still pointer sends no report.
     fn draw(
         &mut self,
         now: Instant,
@@ -196,6 +198,7 @@ impl FullScreen {
             self.terminal.resize(size.into())?;
         }
         self.select.expire(now);
+        self.select.tick(now);
         if self
             .notice
             .as_ref()
@@ -246,8 +249,15 @@ impl FullScreen {
     /// Draw the held selection now rather than on the next tick, at most
     /// every [`SELECT_REPAINT`]. Only the frozen frame is drawn, never the
     /// view's: a selection that no longer fits the screen ends, drawing
-    /// nothing, and the next tick draws the view.
-    fn repaint_selection(&mut self, now: Instant) -> io::Result<()> {
+    /// nothing, and the next tick draws the view. A failed draw is logged:
+    /// the next tick draws again.
+    fn repaint_selection(&mut self, now: Instant) {
+        if let Err(e) = self.try_repaint_selection(now) {
+            tracing::debug!(error = %e, "drawing the selection");
+        }
+    }
+
+    fn try_repaint_selection(&mut self, now: Instant) -> io::Result<()> {
         if now.saturating_duration_since(self.painted) < SELECT_REPAINT {
             return Ok(());
         }
@@ -260,7 +270,7 @@ impl FullScreen {
         self.draw(now, |_| Vec::new())
     }
 
-    /// The drag, if any, ends without copying: a key or a wheel step.
+    /// The drag, if any, ends without copying: a key.
     fn cancel_selection(&mut self) {
         self.select.cancel();
     }
@@ -1096,9 +1106,11 @@ pub async fn run<A: App + 'static>(
 }
 
 /// A captured mouse event on the full screen `f`. A left press freezes the
-/// frame; a drag selects on it; the release copies the selection and says
-/// so on the hint row, or is a click when there was no drag. A wheel step
-/// ends a drag and scrolls. Other buttons and modified presses mean nothing.
+/// frame; a drag selects on it, and scrolls the pane it started in when the
+/// wheel turns or the pointer is held past the pane's edge; the release
+/// copies the selection and says so on the hint row, or is a click when
+/// there was no drag. A wheel step that is not a drag's ends any drag and
+/// scrolls the view. Other buttons and modified presses mean nothing.
 fn on_mouse(f: &mut FullScreen, view: &mut impl TUIAppView, m: MouseEvent) {
     let (col, row) = (m.column, m.row);
     let at = Position::new(col, row);
@@ -1110,44 +1122,52 @@ fn on_mouse(f: &mut FullScreen, view: &mut impl TUIAppView, m: MouseEvent) {
             let ms = now_unix_ms();
             match f.freeze(|area| view.render_full(ms, area.width, area.height)) {
                 Ok(frozen) => {
-                    let region = view.selection_region(at);
-                    f.select.press(frozen, region, at, now);
+                    let doc = view.selection_doc(at);
+                    f.select.press(frozen, doc, at, now);
                     f.press_approval = view.in_approval_view();
                 }
                 Err(e) => tracing::debug!(error = %e, "freezing the frame for a selection"),
             }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
-            if f.select.motion(at, now) == Action::Repaint
-                && let Err(e) = f.repaint_selection(now)
-            {
-                tracing::debug!(error = %e, "drawing the selection");
+            if f.select.motion(at, now) == Action::Repaint {
+                f.repaint_selection(now);
             }
         }
-        MouseEventKind::Up(MouseButton::Left) => match f.select.release(at) {
-            Action::Click(p) if view.in_approval_view() == f.press_approval => {
-                view.mouse(MouseInput::Click { col: p.x, row: p.y });
+        MouseEventKind::Up(MouseButton::Left) => {
+            let released = f.select.release(at);
+            // Not on a screen that changed under the button: a click or a
+            // scroll is matched against what the user saw.
+            let same_screen = view.in_approval_view() == f.press_approval;
+            if let Some(top) = released.scrolled.filter(|_| same_screen) {
+                view.selection_scrolled(top);
             }
-            Action::Copy(text) => match copy_to_clipboard(&text) {
-                Ok(()) => {
-                    let n = text.chars().count();
-                    let note = format!(
-                        " copied {n} char{} (OSC 52) · not on your clipboard? HEPH_NO_MOUSE=1 gives the terminal its own selection",
-                        if n == 1 { "" } else { "s" }
-                    );
-                    f.notice = Some((note, now));
+            match released.action {
+                Action::Click(p) if same_screen => {
+                    view.mouse(MouseInput::Click { col: p.x, row: p.y });
                 }
-                Err(e) => tracing::debug!(error = %e, "copying the selection"),
-            },
-            Action::Click(_) | Action::Repaint | Action::Nothing => {}
-        },
+                Action::Copy(text) => match copy_to_clipboard(&text) {
+                    Ok(()) => {
+                        let n = text.chars().count();
+                        let note = format!(
+                            " copied {n} char{} (OSC 52) · not on your clipboard? HEPH_NO_MOUSE=1 gives the terminal its own selection",
+                            if n == 1 { "" } else { "s" }
+                        );
+                        f.notice = Some((note, now));
+                    }
+                    Err(e) => tracing::debug!(error = %e, "copying the selection"),
+                },
+                Action::Click(_) | Action::Repaint | Action::Nothing => {}
+            }
+        }
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-            f.cancel_selection();
-            view.mouse(MouseInput::Wheel {
-                col,
-                row,
-                down: m.kind == MouseEventKind::ScrollDown,
-            });
+            let down = m.kind == MouseEventKind::ScrollDown;
+            let rows = if down { WHEEL_ROWS } else { -WHEEL_ROWS };
+            match f.select.wheel(rows, now) {
+                Some(Action::Repaint) => f.repaint_selection(now),
+                Some(_) => {}
+                None => view.mouse(MouseInput::Wheel { col, row, down }),
+            }
         }
         _ => {}
     }
