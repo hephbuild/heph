@@ -1150,17 +1150,13 @@ fn on_mouse(f: &mut FullScreen, view: &mut impl TUIAppView, m: MouseEvent) {
                 Action::Click(p) if same_screen => {
                     view.mouse(MouseInput::Click { col: p.x, row: p.y });
                 }
-                Action::Copy(text) => match copy_to_clipboard(&text) {
-                    Ok(()) => {
-                        let n = text.chars().count();
-                        let note = format!(
-                            " copied {n} char{} (OSC 52) · not on your clipboard? HEPH_NO_MOUSE=1 gives the terminal its own selection",
-                            if n == 1 { "" } else { "s" }
-                        );
-                        f.notice = Some((note, now));
+                Action::Copy(text) => {
+                    let sent = capped(&text);
+                    match copy_to_clipboard(sent) {
+                        Ok(()) => f.notice = Some((copy_note(sent, &text), now)),
+                        Err(e) => tracing::debug!(error = %e, "copying the selection"),
                     }
-                    Err(e) => tracing::debug!(error = %e, "copying the selection"),
-                },
+                }
                 Action::Click(_) | Action::Repaint | Action::Nothing => {}
             }
         }
@@ -1175,6 +1171,31 @@ fn on_mouse(f: &mut FullScreen, view: &mut impl TUIAppView, m: MouseEvent) {
         }
         _ => {}
     }
+}
+
+/// The most text one copy sends, in bytes: about 87 KB once base64'd into
+/// the OSC 52. Some terminals silently drop a much larger one while the
+/// note would still say "copied"; past this, the copy is cut and the note
+/// says so.
+const COPY_CAP: usize = 64 * 1024;
+
+/// `text` cut to [`COPY_CAP`] bytes, on a character boundary.
+fn capped(text: &str) -> &str {
+    text.get(..text.floor_char_boundary(COPY_CAP))
+        .unwrap_or(text)
+}
+
+/// The hint-row note for a copy that sent `sent` of the selected `text`.
+fn copy_note(sent: &str, text: &str) -> String {
+    let n = sent.chars().count();
+    let what = if sent.len() < text.len() {
+        format!("the first {n} of {} chars", text.chars().count())
+    } else {
+        format!("{n} char{}", if n == 1 { "" } else { "s" })
+    };
+    format!(
+        " copied {what} (OSC 52) · not on your clipboard? HEPH_NO_MOUSE=1 gives the terminal its own selection"
+    )
 }
 
 /// Put `text` on the system clipboard through the terminal: an OSC 52
@@ -1647,10 +1668,40 @@ impl Replay {
 
 #[cfg(test)]
 mod tests {
-    use super::{IntoText, RunEnd, TICK, bg_drained, exit_drain_wake, rows_needed};
+    use super::{
+        COPY_CAP, IntoText, RunEnd, TICK, bg_drained, capped, copy_note, exit_drain_wake,
+        rows_needed,
+    };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    #[test]
+    fn a_copy_under_the_cap_is_sent_whole() {
+        let text = "a".repeat(COPY_CAP);
+        assert_eq!(capped(&text), text);
+        assert!(copy_note(capped(&text), &text).starts_with(" copied 65536 chars (OSC 52)"));
+        assert!(copy_note("x", "x").starts_with(" copied 1 char (OSC 52)"));
+        assert_eq!(capped(""), "");
+    }
+
+    #[test]
+    fn a_copy_over_the_cap_is_cut_on_a_char_and_says_so() {
+        // 3-byte chars: the cap falls inside one, so the cut lands before it.
+        let text = "漢".repeat(COPY_CAP / 3 + 10);
+        let sent = capped(&text);
+        assert_eq!(sent.len(), COPY_CAP / 3 * 3);
+        assert!(text.starts_with(sent));
+        let note = copy_note(sent, &text);
+        assert!(
+            note.starts_with(&format!(
+                " copied the first {} of {} chars (OSC 52)",
+                COPY_CAP / 3,
+                COPY_CAP / 3 + 10
+            )),
+            "{note}"
+        );
+    }
 
     /// Regression: while the app future does CPU-bound sync work between
     /// awaits (e.g. `block_in_place` for a filesystem walk or Starlark
