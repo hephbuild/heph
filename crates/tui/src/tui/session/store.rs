@@ -1551,6 +1551,16 @@ impl Pending {
 
 /// What `conn`'s recording lacks of `need`.
 pub fn pending(conn: &Connection, need: Need) -> rusqlite::Result<Pending> {
+    pending_against(conn, need, DERIVATION)
+}
+
+/// [`pending`], as a heph whose derivation is `ours` decides it: a test
+/// asks what an older heph makes of a newer recording.
+pub(crate) fn pending_against(
+    conn: &Connection,
+    need: Need,
+    ours: u32,
+) -> rusqlite::Result<Pending> {
     let derivation: u32 = conn.query_row("SELECT derivation FROM session", [], |r| r.get(0))?;
     let indexes = need.indexes && {
         let have: i64 = conn.query_row(
@@ -1562,7 +1572,7 @@ pub fn pending(conn: &Connection, need: Need) -> rusqlite::Result<Pending> {
         usize::try_from(have).unwrap_or(0) < INDEXES.len()
     };
     Ok(Pending {
-        rederive: derivation < DERIVATION,
+        rederive: derivation < ours,
         indexes,
         derivation,
     })

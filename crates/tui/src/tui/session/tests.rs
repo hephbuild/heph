@@ -114,6 +114,60 @@ pub(super) fn is_machine(record: &SessionRecord) -> bool {
     )
 }
 
+/// A sampler's records for a session started at `s` (unix ms): the start
+/// figures (a 2.5-CPU quota), then three samples covering 1 s, 3 s and 1 s,
+/// the last naming the memory source that stopped. Busy is 0.2, 0.8, 0.5
+/// (mean 0.62 over time, peak 0.8); memory peaks at 3 GiB, heph's resident
+/// set at 300 MiB.
+pub(super) fn machine_records(s: u64) -> Vec<SessionRecord> {
+    use format::{MachineInfoRecord, MachineSampleRecord, MachineSourceFailure};
+    let at = |ms: u64, kind| SessionRecord::session(s + ms, kind);
+    let sample = |ms: u64,
+                  interval_s: u64,
+                  busy_ppm: u32,
+                  memory: Option<u64>,
+                  cpu_ms: u64,
+                  rss_mib: u64| {
+        at(
+            ms,
+            SessionRecordKind::MachineSample(Box::new(MachineSampleRecord {
+                time_unix_us: (s + ms) * 1000,
+                interval_us: interval_s * 1_000_000,
+                cpu_busy_ppm: Some(busy_ppm),
+                memory_used_bytes: memory,
+                process_cpu_us: Some(cpu_ms * 1000),
+                process_resident_bytes: Some(rss_mib << 20),
+                failed: if memory.is_some() {
+                    Vec::new()
+                } else {
+                    vec![MachineSourceFailure {
+                        source: "heph.machine.memory.used".into(),
+                        error: "reading /proc/meminfo: field missing".into(),
+                    }]
+                },
+                dropped: 0,
+            })),
+        )
+    };
+    vec![
+        at(
+            0,
+            SessionRecordKind::MachineInfo(Box::new(MachineInfoRecord {
+                time_unix_us: s * 1000,
+                cpu_count: Some(8),
+                cpu_limit_ucpus: Some(2_500_000),
+                cpu_limit_source: Some("quota".into()),
+                memory_limit_bytes: Some(16 << 30),
+                memory_limit_source: Some("host".into()),
+                failed: Vec::new(),
+            })),
+        ),
+        sample(1_000, 1, 200_000, Some(2 << 30), 500, 100),
+        sample(4_000, 3, 800_000, Some(3 << 30), 1_500, 300),
+        sample(5_000, 1, 500_000, None, 1_800, 200),
+    ]
+}
+
 /// The local recording in `dir`, opened as a reader would (the sessions root
 /// is its parent).
 pub(super) fn open(dir: &Path) -> store::Opened {
@@ -1184,6 +1238,213 @@ fn full_cap_keeps_the_ending_view_records() {
     assert_eq!(kinds, want);
 }
 
+/// Wait until the fake sampler behind `exhausted` has sent its last sample.
+#[track_caller]
+fn sampled(exhausted: &std::sync::mpsc::Receiver<()>) {
+    exhausted
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the fake sampler sent every sample");
+}
+
+/// How many of `records` the machine sampler wrote.
+fn machine_count(records: &[SessionRecord]) -> usize {
+    records.iter().filter(|r| is_machine(r)).count()
+}
+
+/// D15: machine records are explorer inputs, not critical. A sampler whose
+/// readings reach the recorder only past the full cap has none of them
+/// kept, while a critical record sent after them still lands; the same
+/// sampler under no cap has every reading kept, so the capped run is not
+/// empty for want of readings.
+#[test]
+fn machine_rows_are_non_critical() {
+    use super::sampler::tests::{Fake, fake_sampler};
+    // Uncapped: the info and three samples are recorded.
+    let root = tempfile::tempdir().expect("tempdir");
+    let (spawn, exhausted) = fake_sampler(Fake::default(), 3, None);
+    let rec = recorder_with(
+        root.path(),
+        Faults {
+            sampler: Some(spawn),
+            ..Faults::default()
+        },
+    );
+    sampled(&exhausted);
+    rec.recorder.finish(Some(0), false, Duration::from_secs(10));
+    let (records, _) = read_records(rec.dir());
+    assert_eq!(machine_count(&records), 4, "the info and three samples");
+
+    // Capped: the sampler reads nothing until the recording is past the cap.
+    let root = tempfile::tempdir().expect("tempdir");
+    let gate: Gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let (spawn, exhausted) = fake_sampler(Fake::default(), 3, Some(Arc::clone(&gate)));
+    let rec = recorder_with(
+        root.path(),
+        Faults {
+            sampler: Some(spawn),
+            ..capped(4 * MIB, recorder::CEILING)
+        },
+    );
+    let tap = rec.tap();
+    for _ in 0..5 {
+        tap.event(big_event());
+    }
+    tap.flush(Duration::from_secs(60))
+        .expect("flushed past the cap");
+    let (open, cv) = &*gate;
+    *open.lock().expect("gate") = true;
+    cv.notify_all();
+    sampled(&exhausted);
+    let label = SessionRecordKind::Label {
+        label: "after the readings".into(),
+    };
+    tap.view(1, label.clone());
+    rec.recorder.finish(Some(0), false, Duration::from_secs(10));
+
+    let (records, _) = read_records(rec.dir());
+    let truncated = records
+        .iter()
+        .position(|r| r.session == Some(SessionRecordKind::Truncated))
+        .expect("past the full cap");
+    assert_eq!(machine_count(&records), 0, "no machine record kept");
+    let tail: Vec<_> = records[truncated..]
+        .iter()
+        .filter_map(|r| r.session.clone())
+        .collect();
+    assert_eq!(
+        tail,
+        [
+            SessionRecordKind::Truncated,
+            label,
+            SessionRecordKind::End {
+                exit_code: Some(0),
+                panicked: false
+            }
+        ],
+        "the critical records after the readings land"
+    );
+    let machine_rows: i64 = open_conn_count(
+        rec.dir(),
+        "SELECT count(*) FROM metrics WHERE name LIKE 'heph.machine.%' OR name LIKE 'heph.process.%'",
+    );
+    assert_eq!(machine_rows, 0);
+}
+
+/// `count(*)` of `sql` over the recording in `dir`.
+fn open_conn_count(dir: &Path, sql: &str) -> i64 {
+    open(dir).conn.query_row(sql, [], |r| r.get(0)).expect(sql)
+}
+
+/// A recording of [`events`] with the fake sampler `fake` beside it, three
+/// samples long; its directory (under the returned root) and its records.
+fn machine_run(
+    fake: super::sampler::tests::Fake,
+) -> (tempfile::TempDir, std::path::PathBuf, Vec<SessionRecord>) {
+    let root = tempfile::tempdir().expect("tempdir");
+    let (spawn, exhausted) = super::sampler::tests::fake_sampler(fake, 3, None);
+    let rec = recorder_with(
+        root.path(),
+        Faults {
+            sampler: Some(spawn),
+            ..Faults::default()
+        },
+    );
+    let tap = rec.tap();
+    for ev in events() {
+        tap.event(ev);
+    }
+    sampled(&exhausted);
+    rec.recorder.finish(Some(1), false, Duration::from_secs(10));
+    let (records, skipped) = read_records(rec.dir());
+    assert_eq!(skipped, 0);
+    (root, rec.dir().to_path_buf(), records)
+}
+
+/// The recorder's half: a source that fails mid-run is named in one
+/// `MachineSample` and becomes one `heph.sampler.stopped` event on the
+/// session span naming it and why; it writes no row after, the other
+/// sources keep writing, and every record the build sent is what a run with
+/// no failing source records, timestamps aside. (The sampler's half is
+/// `sampler::tests::sampler_source_failure_stops_only_that_source`.)
+#[test]
+fn sampler_source_failure_stops_only_that_source() {
+    use super::sampler::tests::Fake;
+    let (_root, dir, records) = machine_run(Fake::failing_memory_at(2));
+    let named: Vec<_> = records
+        .iter()
+        .filter_map(|r| match &r.session {
+            Some(SessionRecordKind::MachineSample(s)) => Some(s.failed.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(named.len(), 3, "three samples");
+    assert!(named[0].is_empty() && named[2].is_empty(), "{named:?}");
+    let error = format!("reading fake memory: {}", io::Error::from_raw_os_error(5));
+    assert_eq!(
+        named[1],
+        [format::MachineSourceFailure {
+            source: "heph.machine.memory.used".into(),
+            error: error.clone(),
+        }]
+    );
+
+    let conn = open(&dir).conn;
+    let mut stmt = conn
+        .prepare(
+            "SELECT span_id, json_extract(attributes, '$.\"heph.sampler.source\"'), \
+               json_extract(attributes, '$.\"heph.sampler.error\"') \
+             FROM span_events WHERE name = 'heph.sampler.stopped'",
+        )
+        .expect("prepare");
+    let events: Vec<(i64, String, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .expect("query")
+        .collect::<rusqlite::Result<_>>()
+        .expect("rows");
+    let session_span: i64 = conn
+        .query_row(
+            "SELECT span_id FROM spans WHERE name = 'heph.session'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("the session span");
+    assert_eq!(
+        events,
+        [(session_span, "heph.machine.memory.used".to_owned(), error)]
+    );
+    let rows = |name: &str| -> i64 {
+        conn.query_row(
+            "SELECT count(*) FROM metrics WHERE name = ?1",
+            [name],
+            |r| r.get(0),
+        )
+        .expect("count")
+    };
+    assert_eq!(rows("heph.machine.memory.used"), 1, "only before it failed");
+    for name in [
+        "heph.machine.cpu.busy",
+        "heph.process.cpu.time",
+        "heph.process.memory.resident",
+    ] {
+        assert_eq!(rows(name), 3, "{name} keeps writing");
+    }
+    drop(stmt);
+    drop(conn);
+
+    let (_root, _, clean) = machine_run(Fake::default());
+    // Each as its JSON, so two records compare whole.
+    let build = |records: Vec<SessionRecord>| -> Vec<String> {
+        records
+            .into_iter()
+            .filter(|r| !is_machine(r))
+            .map(|r| serde_json::to_string(&SessionRecord { at_unix_ms: 0, ..r }).expect("encode"))
+            .collect()
+    };
+    let (faulty, clean) = (build(records), build(clean));
+    assert!(!clean.is_empty());
+    assert_eq!(faulty, clean, "the build's records are untouched");
+}
+
 /// The `status` row stays bounded however many targets wait: 50k lock waits
 /// and 50k admission waits through a real recorder, read back from the row it
 /// wrote — while live and after `End` — have every list cut to
@@ -2073,7 +2334,7 @@ fn output_records_are_capped() {
 }
 
 /// Every row of the explorer tables, each as its columns' debug text, sorted.
-fn explorer_rows(conn: &rusqlite::Connection) -> Vec<String> {
+pub(super) fn explorer_rows(conn: &rusqlite::Connection) -> Vec<String> {
     let mut rows = Vec::new();
     for table in ["spans", "span_events", "metrics"] {
         let mut stmt = conn

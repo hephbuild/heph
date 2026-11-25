@@ -40,7 +40,7 @@ mod mach;
 #[cfg(any(target_os = "linux", test))]
 mod procfs;
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
 
 #[cfg(target_os = "macos")]
 use mach::host_sources;

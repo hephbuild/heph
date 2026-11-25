@@ -1633,6 +1633,152 @@ fn opens_format_1_fixture() {
     }
 }
 
+/// Where the committed recording derived by derivation `n` lives.
+fn derivation_fixture(n: u32) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src/tui/session/testdata")
+        .join(format!("derivation-{n}"))
+        .join(store::FILE)
+}
+
+/// The first derivation that writes machine rows (PR 5), and the last one
+/// before it (PR 4), which a heph still in use reads recordings with.
+const MACHINE_DERIVATION: u32 = 2;
+const PR4_DERIVATION: u32 = 1;
+
+/// Write a small sealed recording with machine records into `dir`, derived
+/// by this heph: one target that ran, the sampler's start figures and three
+/// samples (one naming a stopped source), and `End`.
+fn write_derivation_fixture(dir: &Path) {
+    let id = SessionId::new(FIXTURE_STARTED_MS, 2);
+    let meta = SessionMeta {
+        owner_pid: 4242,
+        heph_version: "0.0.0-fixture".into(),
+        label: "run //p:t".into(),
+        ..meta_for(id)
+    };
+    let (conn, _rw) =
+        store::create(dir, &meta, &store::Provenance::default(), false).expect("create");
+    let mut writer = store::Writer::new(conn, id);
+    let s = FIXTURE_STARTED_MS;
+    let mut records = vec![start_record(s + 1, "//p:t")];
+    records.extend(tests::machine_records(s));
+    records.push(end_record(s + 5_500, "//p:t"));
+    records.push(session_record(
+        s + 6_000,
+        SessionRecordKind::End {
+            exit_code: Some(0),
+            panicked: false,
+        },
+    ));
+    records.sort_by_key(|r| r.at_unix_ms);
+    for r in &records {
+        insert(&mut writer, r);
+    }
+    let conn = writer.finish(s + 6_000, Some(0), false).expect("finish");
+    assert_eq!(
+        store::seal(conn, store::SEAL_TIMEOUT).expect("seal"),
+        store::Sealed::Done
+    );
+    tests::alter(dir)
+        .execute_batch("PRAGMA page_size = 1024; VACUUM;")
+        .expect("compact");
+}
+
+/// Writes the committed recording of the current derivation. Like a
+/// format's fixture, a released derivation's is frozen: never regenerate it.
+#[test]
+#[ignore = "writes the committed fixture; run by hand on a derivation bump that needs one"]
+fn generate_derivation_fixture() {
+    let target = derivation_fixture(store::DERIVATION);
+    assert!(
+        !target.exists(),
+        "{} exists: a released derivation's fixture is frozen",
+        target.display()
+    );
+    let root = tempfile::tempdir().expect("tempdir");
+    let dir = session_dir(root.path(), SessionId::new(FIXTURE_STARTED_MS, 2));
+    write_derivation_fixture(&dir);
+    std::fs::create_dir_all(target.parent().expect("a parent")).expect("mkdir");
+    std::fs::copy(dir.join(store::FILE), &target).expect("copy the fixture");
+}
+
+/// PR 5 bumps the derivation so its machine rows survive an older reader: a
+/// heph at the PR 4 derivation reads the committed recording as it is (a
+/// newer derivation is never re-derived, so never derived away), and this
+/// heph reads it in place with every machine row. Re-deriving it here gives
+/// exactly the committed rows, so the derivation that wrote them has not
+/// moved without a bump.
+#[test]
+fn older_derivation_keeps_machine_rows() {
+    let path = derivation_fixture(MACHINE_DERIVATION);
+    let id = store::read_meta(&store::open_sealed(&path).expect("open the fixture"))
+        .expect("the fixture's session row")
+        .id;
+    let root = tempfile::tempdir().expect("tempdir");
+    let dir = session_dir(root.path(), id);
+    std::fs::copy(&path, dir.join(store::FILE)).expect("copy the fixture");
+    let need = store::Need { indexes: true };
+
+    let opened = tests::open(&dir);
+    assert!(!opened.is_copy(), "sealed and current: read in place");
+    let pr4 = store::pending_against(&opened.conn, need, PR4_DERIVATION).expect("pending");
+    assert_eq!(pr4.derivation, MACHINE_DERIVATION);
+    assert!(!pr4.rederive, "PR 4 re-derives it: {pr4:?}");
+    assert!(
+        !store::pending(&opened.conn, need)
+            .expect("pending")
+            .rederive
+    );
+    let committed = tests::explorer_rows(&opened.conn);
+    let machine = dump(
+        &opened.conn,
+        "SELECT name, count(*) FROM metrics \
+         WHERE name LIKE 'heph.machine.%' OR name LIKE 'heph.process.%' \
+           OR name LIKE 'heph.session.machine.%' OR name LIKE 'heph.session.process.%' \
+         GROUP BY name ORDER BY name",
+    );
+    assert_eq!(
+        machine,
+        [
+            "heph.machine.cpu.busy|3",
+            "heph.machine.cpu.count|1",
+            "heph.machine.cpu.limit|1",
+            "heph.machine.memory.limit|1",
+            "heph.machine.memory.used|2",
+            "heph.process.cpu.time|3",
+            "heph.process.memory.resident|3",
+            "heph.session.machine.cpu.busy.mean|1",
+            "heph.session.machine.cpu.busy.peak|1",
+            "heph.session.machine.memory.used.peak|1",
+            "heph.session.process.memory.resident.peak|1",
+        ]
+    );
+    drop(opened);
+
+    // Past a later bump this heph derives differently, as it may: that bump
+    // commits its own fixture.
+    if store::DERIVATION == MACHINE_DERIVATION {
+        testing::alter(
+            &dir,
+            &format!(
+                "DELETE FROM metrics; DELETE FROM span_events; UPDATE session SET derivation = {}",
+                store::STALE_DERIVATION
+            ),
+        )
+        .expect("stale");
+        assert_eq!(
+            store::upgrade_local(&dir, store::Need::default()).expect("upgrade"),
+            store::Upgraded::Done
+        );
+        assert_eq!(
+            tests::explorer_rows(&tests::open(&dir).conn),
+            committed,
+            "the derivation moved without a bump"
+        );
+    }
+}
+
 /// The explorer's public names (I9): their columns are frozen within a
 /// format.
 const PUBLIC_NAMES: [&str; 6] = [
@@ -2508,6 +2654,70 @@ fn overlapping_results_of_one_addr() {
     assert_eq!(
         dump(&conn, "SELECT addr, outcome, duration_us FROM targets"),
         ["//p:x|ran|6000"]
+    );
+}
+
+/// I9, D27: every machine metric written has the name, kind and unit of the
+/// Design table ("Machine stats"), and no attributes; a stopped source is a
+/// `heph.sampler.stopped` event on the session span carrying exactly
+/// `heph.sampler.source` (the metric it fed) and `heph.sampler.error`. The
+/// table is spelled out here, not taken from `derive::machine`, so renaming
+/// a constant fails this test instead of moving a frozen name.
+#[test]
+fn machine_names_pinned() {
+    let id = now_id(34);
+    let s = id.started_unix_ms();
+    let (_root, conn) = derived(id, &tests::machine_records(s), s + 6_000);
+    let written = dump(
+        &conn,
+        "SELECT DISTINCT name, kind, unit, attributes IS NULL FROM metrics ORDER BY name",
+    );
+    let design = [
+        ("heph.machine.cpu.busy", "gauge", "1"),
+        ("heph.machine.cpu.count", "gauge", "{cpu}"),
+        ("heph.machine.cpu.limit", "gauge", "{cpu}"),
+        ("heph.machine.memory.limit", "gauge", "By"),
+        ("heph.machine.memory.used", "gauge", "By"),
+        ("heph.process.cpu.time", "counter", "s"),
+        ("heph.process.memory.resident", "gauge", "By"),
+        ("heph.session.machine.cpu.busy.mean", "gauge", "1"),
+        ("heph.session.machine.cpu.busy.peak", "gauge", "1"),
+        ("heph.session.machine.memory.used.peak", "gauge", "By"),
+        ("heph.session.process.memory.resident.peak", "gauge", "By"),
+    ];
+    assert_eq!(
+        written,
+        design
+            .iter()
+            .map(|(name, kind, unit)| format!("{name}|{kind}|{unit}|1"))
+            .collect::<Vec<_>>()
+    );
+    // The per-sample names are the ones the catalog leaves out (D25), and the
+    // ones a stopped source names.
+    let per_sample = [
+        "heph.machine.cpu.busy",
+        "heph.machine.memory.used",
+        "heph.process.cpu.time",
+        "heph.process.memory.resident",
+    ];
+    assert_eq!(super::derive::machine::PER_SAMPLE, per_sample);
+    assert_eq!(
+        super::sampler::Source::ALL.map(super::sampler::Source::metric),
+        per_sample
+    );
+    assert_eq!(
+        dump(
+            &conn,
+            "SELECT span_id, name, \
+               (SELECT group_concat(key, ',') \
+                  FROM (SELECT key FROM json_each(attributes) ORDER BY key)), \
+               json_extract(attributes, '$.\"heph.sampler.source\"') \
+             FROM span_events WHERE name LIKE 'heph.sampler.%'"
+        ),
+        [format!(
+            "{}|heph.sampler.stopped|heph.sampler.error,heph.sampler.source|heph.machine.memory.used",
+            super::derive::SESSION_SPAN
+        )]
     );
 }
 

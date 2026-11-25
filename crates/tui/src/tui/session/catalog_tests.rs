@@ -99,14 +99,18 @@ fn many_targets(n: usize) -> Vec<BuildEvent> {
 
 /// A sealed recording of `evs` under `root`.
 fn sealed_with(root: &Path, id: SessionId, evs: Vec<BuildEvent>) -> PathBuf {
+    sealed_records(root, id, evs.into_iter().map(event_record).collect())
+}
+
+/// [`sealed_with`] for any records, the session's own among them.
+fn sealed_records(root: &Path, id: SessionId, records: Vec<SessionRecord>) -> PathBuf {
     let dir = root.join(id.encode());
     std::fs::create_dir_all(&dir).expect("mkdir");
     std::fs::write(dir.join(files::LOCK), b"").expect("lock file");
     let (conn, _rw) =
         store::create(&dir, &meta_for(id), &store::Provenance::default(), false).expect("create");
     let mut writer = store::Writer::new(conn, id);
-    for ev in evs {
-        let r = event_record(ev);
+    for r in records {
         let body = serde_json::to_string(&r).expect("encode");
         writer.insert(&r, &body).expect("insert");
     }
@@ -1500,4 +1504,142 @@ fn rederive_is_durable_and_safe_under_failure_and_race() {
         .collect();
     outcomes.sort_by_key(|o| format!("{o:?}"));
     assert_eq!(outcomes, [store::Upgraded::Current, store::Upgraded::Done]);
+}
+
+/// D25, D30, I9: the session summaries, machine and pool, are derived into
+/// the recording at seal and copied into the catalog as they are, so one
+/// query answers from either; the catalog keeps none of the per-tick
+/// samples; and a repair on open derives the same rows the seal did.
+#[test]
+fn summaries_same_in_every_source() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let id = recent_id(9, 60_000);
+    let s = id.started_unix_ms();
+    let pool = |at: u64, held: u64, waiting: u64| {
+        event_record(BuildEvent {
+            at_unix_ms: s + at,
+            kind: BuildEventKind::PoolUsage {
+                pool: "cpu".into(),
+                held,
+                capacity: 8_000_000,
+                waiting,
+                removals_pending: 0,
+            },
+        })
+    };
+    let mut records = vec![event_record(BuildEvent {
+        at_unix_ms: s,
+        kind: BuildEventKind::RequestConfig {
+            max_workers: 4,
+            fail_fast: false,
+            scratch_disabled: false,
+            resources: std::collections::BTreeMap::new(),
+            units: std::collections::BTreeMap::from([("cpu".into(), "cpu".into())]),
+        },
+    })];
+    records.extend(super::tests::machine_records(s));
+    records.extend([pool(10, 2_000_000, 1), pool(2_000, 4_000_000, 0)]);
+    records.sort_by_key(|r| r.at_unix_ms);
+    let dir = sealed_records(tmp.path(), id, records);
+
+    let sql = |table_filter: &str| {
+        format!(
+            "SELECT name, kind, unit, time_us, value, attributes FROM metrics \
+             WHERE {table_filter} ORDER BY name, attributes, time_us"
+        )
+    };
+    let summaries = sql("name LIKE 'heph.session.%'");
+    let per_sample = format!(
+        "SELECT count(*) FROM metrics WHERE name IN ('{}')",
+        super::derive::machine::PER_SAMPLE.join("', '")
+    );
+    let recording = store::open_local(tmp.path(), &dir).expect("open the recording");
+    let derived = dump_rows(&recording.conn, &summaries);
+    let names = dump_rows(
+        &recording.conn,
+        "SELECT DISTINCT name FROM metrics WHERE name LIKE 'heph.session.%'",
+    );
+    for name in [
+        "heph.session.machine.cpu.busy.mean",
+        "heph.session.machine.cpu.busy.peak",
+        "heph.session.machine.memory.used.peak",
+        "heph.session.process.memory.resident.peak",
+        "heph.session.pool.held.mean",
+    ] {
+        assert!(
+            names.contains(&format!("Text({name:?})")),
+            "{name} derived: {names:?}"
+        );
+    }
+    let value = |name: &str| -> f64 {
+        recording
+            .conn
+            .query_row("SELECT value FROM metrics WHERE name = ?1", [name], |r| {
+                r.get(0)
+            })
+            .expect(name)
+    };
+    assert!((value("heph.session.machine.cpu.busy.mean") - 0.62).abs() < 1e-9);
+    assert!((value("heph.session.machine.cpu.busy.peak") - 0.8).abs() < 1e-9);
+    assert!((value("heph.session.machine.memory.used.peak") - (3u64 << 30) as f64).abs() < 1.0);
+    assert!(
+        (value("heph.session.process.memory.resident.peak") - (300u64 << 20) as f64).abs() < 1.0
+    );
+    assert!(
+        count(&recording.conn, &per_sample) > 0,
+        "the recording keeps its samples"
+    );
+    let everything = dump_rows(&recording.conn, &sql("true"));
+    drop(recording);
+
+    catalog::record_seal(tmp.path(), &dir, true);
+    let catalog = read(tmp.path());
+    assert_eq!(
+        dump_rows(&catalog, &summaries),
+        derived,
+        "the catalog's copy"
+    );
+    assert_eq!(count(&catalog, &per_sample), 0, "no samples in the catalog");
+    let start_figures = sql(
+        "name IN ('heph.machine.cpu.count', 'heph.machine.cpu.limit', \
+         'heph.machine.memory.limit')",
+    );
+    assert_eq!(
+        dump_rows(&catalog, &start_figures).len(),
+        3,
+        "the start figures are copied"
+    );
+
+    testing::alter(
+        &dir,
+        &format!(
+            "DELETE FROM metrics; UPDATE session SET derivation = {}",
+            store::STALE_DERIVATION
+        ),
+    )
+    .expect("age the derivation");
+    assert_eq!(
+        store::upgrade_local(&dir, store::Need::default()).expect("repair"),
+        store::Upgraded::Done
+    );
+    let repaired = store::open_local(tmp.path(), &dir).expect("open the repaired recording");
+    assert_eq!(dump_rows(&repaired.conn, &sql("true")), everything);
+}
+
+/// Every row of `sql`, each as its columns' debug text joined by `|`.
+fn dump_rows(conn: &Connection, sql: &str) -> Vec<String> {
+    let mut stmt = conn.prepare(sql).expect(sql);
+    let n = stmt.column_count();
+    stmt.query_map([], |r| {
+        (0..n)
+            .map(|i| {
+                r.get::<_, rusqlite::types::Value>(i)
+                    .map(|v| format!("{v:?}"))
+            })
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map(|v| v.join("|"))
+    })
+    .expect(sql)
+    .collect::<rusqlite::Result<_>>()
+    .expect(sql)
 }
