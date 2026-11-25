@@ -205,7 +205,8 @@ fn is_store_name_byte(b: u8) -> bool {
 /// A store path ends where its name does, and the name runs as far as the bytes
 /// nix allows in one. A path followed by a byte nix also allows in a name is
 /// therefore read too long — `-fmacro-prefix-map=<path>=<other>` reads as
-/// `<path>=` — and [`resolve_store_paths`] trims it against the store.
+/// `<path>=`, and a path ending a sentence as `<path>.` — and
+/// [`resolve_store_paths`] trims it against the store.
 fn store_path_tokens<'a>(text: &'a str, store_dir: &str) -> BTreeSet<&'a str> {
     let prefix = format!("{store_dir}/");
     let bytes = text.as_bytes();
@@ -232,29 +233,28 @@ fn store_path_tokens<'a>(text: &'a str, store_dir: &str) -> BTreeSet<&'a str> {
 
 /// The store paths among `tokens` that exist, each trimmed to the path it names.
 ///
-/// A token that does not exist is retried without each `=`-suffix of its name,
-/// longest first, which undoes [`store_path_tokens`]'s over-long read. One that
-/// still does not exist is left out: a path that is not in the store now cannot
-/// go missing from it, and nix refuses to root it.
+/// A token that does not exist is retried one byte shorter at a time, down to a
+/// one-byte name, which undoes [`store_path_tokens`]'s over-long read whatever
+/// name byte followed the path (`=`, `.`, `-`, `+`, `_`, `?`). The longest
+/// prefix that exists is the path: its hash part covers its name, so no other
+/// store path shares that hash. A path that exists costs one `stat`; only a
+/// miss walks back through the name.
+///
+/// One that still does not exist is left out: a path that is not in the store
+/// now cannot go missing from it, and nix refuses to root it.
 fn resolve_store_paths(tokens: Vec<String>, store_dir_len: usize) -> BTreeSet<String> {
-    // `<store_dir>/<hash>-` and one byte of name: an `=` before it leaves no name.
+    // `<store_dir>/<hash>-` and one byte of name.
     let min_len = store_dir_len + 1 + STORE_HASH_LEN + 2;
     tokens
         .into_iter()
-        .filter_map(|token| {
-            let cuts = token
-                .bytes()
-                .enumerate()
-                .filter(|&(i, b)| b == b'=' && i >= min_len)
-                .map(|(i, _)| i)
-                .rev();
-            let found = std::iter::once(token.len()).chain(cuts).find_map(|end| {
-                let path = token.get(..end)?;
-                std::fs::symlink_metadata(path).is_ok().then_some(end)
+        .filter_map(|mut token| {
+            let found = (min_len..=token.len()).rev().find(|&end| {
+                token
+                    .get(..end)
+                    .is_some_and(|path| std::fs::symlink_metadata(path).is_ok())
             });
             match found {
                 Some(end) => {
-                    let mut token = token;
                     token.truncate(end);
                     Some(token)
                 }
@@ -1486,6 +1486,8 @@ echo '{root}'"#,
                 format!("-isystem {libc}/include -fmacro-prefix-map={python}={placeholder}"),
             ),
             ("DEVENV_PROFILE", profile.clone()),
+            // Prose: the path is followed by a `.`, a byte nix allows in a name.
+            ("MOTD", format!("profile at {profile}.")),
             ("out", json.clone()),
             ("STALE", format!("{gone}/lib")),
         ]);
@@ -1716,7 +1718,13 @@ echo '{root}'"#,
             (format!("x:{good}:y"), vec![good.clone()]),
             (format!("\"{good}\""), vec![good.clone()]),
             (format!("{good} {good}"), vec![good.clone()]),
+            // Followed by a name byte: read too long, for the resolver to trim.
             (format!("{good}=/x"), vec![format!("{good}=")]),
+            (format!("see {good}."), vec![format!("{good}.")]),
+            (format!("{good}-"), vec![format!("{good}-")]),
+            (format!("{good}+x"), vec![format!("{good}+x")]),
+            (format!("{good}_"), vec![format!("{good}_")]),
+            (format!("{good}?"), vec![format!("{good}?")]),
             (format!("{good}é"), vec![good.clone()]),
             (
                 format!("{s}/{h}-a+b?c=d_e.f"),
@@ -1740,26 +1748,44 @@ echo '{root}'"#,
         }
     }
 
-    /// An over-long read is trimmed back to the path the store has, a name that
-    /// really holds `=` is kept whole, and a path the store does not have is
-    /// left out.
+    /// An over-long read is trimmed back to the path the store has, whichever
+    /// name byte followed it; a name that really holds that byte (`=`, `-`,
+    /// `+`) is kept whole; and a path the store does not have is left out.
     #[test]
     fn resolving_trims_an_over_long_read_and_drops_what_the_store_lacks() {
         let dir = tempfile::tempdir().expect("tempdir");
         let plain = store_dir_path(dir.path(), 0, "python3-3.14.8");
         let with_eq = store_dir_path(dir.path(), 1, "a=b");
+        let with_dash = store_dir_path(dir.path(), 3, "foo-bar");
+        let with_plus = store_dir_path(dir.path(), 4, "libcxx-21.1.6+apple-sdk-26.5");
         let store_len = dir.path().join("store").to_string_lossy().len();
         let gone = format!("{}/{}-gone", dir.path().join("store").display(), hash(2));
-        let tokens = vec![
-            format!("{plain}="),
-            format!("{plain}=x=y"),
-            with_eq.clone(),
-            format!("{with_eq}="),
-            gone,
+        let cases: Vec<(String, Option<&String>)> = vec![
+            (plain.clone(), Some(&plain)),
+            (format!("{plain}="), Some(&plain)),
+            (format!("{plain}=x=y"), Some(&plain)),
+            (format!("{plain}."), Some(&plain)),
+            (format!("{plain}-"), Some(&plain)),
+            (format!("{plain}+"), Some(&plain)),
+            (format!("{plain}_"), Some(&plain)),
+            (format!("{plain}?"), Some(&plain)),
+            (format!("{plain}.-+_?=x"), Some(&plain)),
+            (with_eq.clone(), Some(&with_eq)),
+            (format!("{with_eq}="), Some(&with_eq)),
+            (with_dash.clone(), Some(&with_dash)),
+            (format!("{with_dash}-"), Some(&with_dash)),
+            (with_plus.clone(), Some(&with_plus)),
+            (format!("{with_plus}."), Some(&with_plus)),
+            (gone.clone(), None),
+            (format!("{gone}."), None),
         ];
-        assert_eq!(
-            resolve_store_paths(tokens, store_len),
-            BTreeSet::from([plain, with_eq])
-        );
+        for (token, want) in cases {
+            let got = resolve_store_paths(vec![token.clone()], store_len);
+            assert_eq!(
+                got,
+                want.into_iter().cloned().collect::<BTreeSet<_>>(),
+                "resolving {token:?}"
+            );
+        }
     }
 }
