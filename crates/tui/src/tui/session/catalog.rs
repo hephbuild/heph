@@ -696,26 +696,54 @@ fn fold_wal(conn: &Connection, deadline: Instant) -> rusqlite::Result<()> {
     };
     // The progress handler is not called inside the checkpoint's one VM
     // step; an interrupt is, between the pages it copies.
+    let folded = interrupted_after(conn, left, || {
+        copy.query_row([], |_| Ok(()))
+            .and_then(|()| conn.busy_timeout(Duration::ZERO))
+            .and_then(|()| restart.query_row([], |_| Ok(())))
+    });
+    folded.unwrap_or_else(|| {
+        tracing::debug!("cannot bound the catalog's WAL fold: skipped");
+        Ok(())
+    })
+}
+
+/// How often the watchdog repeats its interrupt past the deadline.
+const REINTERRUPT: Duration = Duration::from_millis(1);
+
+/// `run`, with what it runs on `conn` interrupted once `left` has passed,
+/// from a watchdog thread. `None`, without running it, when the watchdog
+/// cannot start.
+fn interrupted_after<R>(
+    conn: &Connection,
+    left: Duration,
+    run: impl FnOnce() -> rusqlite::Result<R>,
+) -> Option<rusqlite::Result<R>> {
     let interrupt = conn.get_interrupt_handle();
     let (done, wait) = mpsc::channel::<()>();
     std::thread::scope(|s| {
         let watchdog = std::thread::Builder::new()
             .name("heph-session-catalog-fold".to_owned())
             .spawn_scoped(s, move || {
-                if wait.recv_timeout(left) == Err(RecvTimeoutError::Timeout) {
+                if wait.recv_timeout(left) != Err(RecvTimeoutError::Timeout) {
+                    return;
+                }
+                // An interrupt landing while no statement runs on the
+                // connection is cleared by the next one's first step:
+                // repeated until `run` returns.
+                loop {
                     interrupt.interrupt();
+                    if wait.recv_timeout(REINTERRUPT) != Err(RecvTimeoutError::Timeout) {
+                        return;
+                    }
                 }
             });
         if let Err(e) = watchdog {
-            tracing::debug!(error = %e, "cannot bound the catalog's WAL fold: skipped");
-            return Ok(());
+            tracing::debug!(error = %e, "cannot start the catalog's watchdog");
+            return None;
         }
-        let folded = copy
-            .query_row([], |_| Ok(()))
-            .and_then(|()| conn.busy_timeout(Duration::ZERO))
-            .and_then(|()| restart.query_row([], |_| Ok(())));
+        let ran = run();
         drop(done);
-        folded
+        Some(ran)
     })
 }
 
@@ -1708,6 +1736,33 @@ mod tests {
         let folder = open_rw(root, false).expect("reopen");
         fold_wal(&folder, Instant::now() + BOUND).expect("fold");
         assert_eq!(wal_len(root), 0);
+    }
+
+    /// An interrupt landing while nothing runs on the connection is cleared
+    /// by the next statement's first step. The watchdog repeats it until
+    /// `run` returns, so a statement that starts after the deadline (the
+    /// fold's thread preempted before its first step, or its `TRUNCATE`
+    /// after its `PASSIVE`) is still stopped.
+    #[test]
+    fn an_interrupt_before_the_first_step_is_repeated() {
+        let conn = Connection::open_in_memory().expect("open");
+        let ran = interrupted_after(&conn, Duration::ZERO, || {
+            // The first interrupt lands now, with no statement running.
+            std::thread::sleep(Duration::from_millis(50));
+            conn.query_row(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 100000000)
+                 SELECT count(*) FROM n",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+        })
+        .expect("a watchdog");
+        let err = ran.expect_err("a statement started past the deadline");
+        assert_eq!(
+            err.sqlite_error_code(),
+            Some(ErrorCode::OperationInterrupted),
+            "{err}"
+        );
     }
 
     /// On a fresh connection, preparing the fold rebuilds the WAL index from
