@@ -1520,6 +1520,8 @@ fn close_evicts_unreached_interfaces() {
 fn reopen_starts_clean() {
     let mut lsp = Lsp::start();
     lsp.write("lib/defs.star", "Lib = record(name = str)\n");
+    // Settled, so a walk kept past the close would still hold.
+    past_racy_window();
     let head = "load(\"//lib/defs.star\", \"Lib\")\n\ndef f(l: Lib):\n";
     let parses = format!("{head}    x = l\n");
     let dotted = format!("{head}    x = l.│\n");
@@ -1528,6 +1530,8 @@ fn reopen_starts_clean() {
     lsp.close(&doc);
     let closed = counters(&mut lsp);
     assert_eq!(counter(&closed, "interfaces"), 0, "{closed}");
+    assert_eq!(counter(&closed, "load_walks"), 1, "{closed}");
+    assert_eq!(counter(&closed, "load_walks_held"), 0, "{closed}");
 
     // Reopened with a text that has never parsed: nothing of the closed
     // document's types is carried over.
@@ -1549,6 +1553,8 @@ fn reopen_starts_clean() {
     assert_eq!(counter(&reopened, "typechecks"), 2, "{reopened}");
     assert_eq!(counter(&reopened, "interfaces"), 1, "{reopened}");
     assert_eq!(counter(&reopened, "interface_checks"), 2, "{reopened}");
+    // The closed document's walk was forgotten: its loads are walked again.
+    assert_eq!(counter(&reopened, "load_walks"), 2, "{reopened}");
 }
 
 /// Wait out the memo's racy window (2s): a file written within it is read
@@ -1736,6 +1742,80 @@ fn racy_same_length_rewrite_is_seen() {
     assert_eq!(sorted_labels(&lsp.completion(&doc)), ["aaa"]);
     lsp.write("lib/defs.star", "Lib = record(bbb = str)\n");
     assert_eq!(sorted_labels(&lsp.completion(&doc)), ["bbb"]);
+}
+
+#[test]
+fn racy_stats_are_read_again_until_settled() {
+    // What proves the racy rule is consulted at all: with nothing changed, a
+    // file written within the window is walked and read again on every
+    // lookup, and no longer once the window has passed.
+    let mut lsp = Lsp::start();
+    lsp.write("lib/defs.star", "Lib = record(aaa = str)\n");
+    let head = "load(\"//lib/defs.star\", \"Lib\")\n\ndef f(l: Lib):\n";
+    let doc = open_dotted(
+        &mut lsp,
+        "pkg/BUILD",
+        &format!("{head}    x = l\n"),
+        &format!("{head}    x = l.│\n"),
+    );
+    let walks_reads = |lsp: &mut Lsp| {
+        let c = counters(lsp);
+        (counter(&c, "load_walks"), counter(&c, "loaded_file_reads"))
+    };
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), ["aaa"]);
+    let (walks, reads) = walks_reads(&mut lsp);
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), ["aaa"]);
+    // The racy walk runs again (parsing the file), and the racy entry reads
+    // the file again for its digest.
+    assert_eq!(walks_reads(&mut lsp), (walks + 1, reads + 2));
+
+    past_racy_window();
+    // One more of each, whose stats are now safely old...
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), ["aaa"]);
+    let settled = walks_reads(&mut lsp);
+    assert_eq!(settled, (walks + 2, reads + 4));
+    // ...and then nothing.
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), ["aaa"]);
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), ["aaa"]);
+    assert_eq!(walks_reads(&mut lsp), settled);
+}
+
+#[test]
+fn close_forgets_the_walk_of_a_deleted_document() {
+    // The document is opened through a link to the root, so placing it needs
+    // a canonicalize, which fails once it is deleted: close must still find
+    // its walk.
+    let mut lsp = Lsp::start();
+    lsp.write("lib/defs.star", "Lib = record(name = str)\n");
+    let links = tempfile::tempdir().expect("tempdir");
+    let alias = links.path().join("alias");
+    std::os::unix::fs::symlink(lsp.root(), &alias).expect("symlink");
+    let head = "load(\"//lib/defs.star\", \"Lib\")\n\ndef f(l: Lib):\n";
+    let real = lsp.write("pkg/BUILD", &format!("{head}    x = l\n"));
+    let uri = file_uri(&alias.join("pkg/BUILD"));
+    lsp.notify(
+        "textDocument/didOpen",
+        json!({"textDocument": {
+            "uri": uri, "languageId": "starlark", "version": 1,
+            "text": format!("{head}    x = l\n"),
+        }}),
+    );
+    let doc = Doc {
+        uri,
+        text: format!("{head}    x = l\n"),
+        line: 0,
+        character: 0,
+        version: 1,
+    };
+    let doc = lsp.change(&doc, &format!("{head}    x = l.│\n"));
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), ["name"]);
+    assert_eq!(counter(&counters(&mut lsp), "load_walks_held"), 1);
+
+    std::fs::remove_file(&real).expect("delete the document");
+    lsp.close(&doc);
+    let closed = counters(&mut lsp);
+    assert_eq!(counter(&closed, "load_walks_held"), 0, "{closed}");
+    assert_eq!(counter(&closed, "interfaces"), 0, "{closed}");
 }
 
 #[test]
