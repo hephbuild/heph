@@ -289,7 +289,9 @@ must stay **out of every hash and of the persisted read order** — not
 `config_hash`, not `store_order`, not `measure_latency` — and is **never
 written** during a build; every per-tier rejection passes the tier over to the
 next one rather than ending the lookup. Helper engines and the snapshot
-command's own engine never record.
+command's own engine never record. Bumping `SNAPSHOT_FORMAT` (the
+`HEPH_SNAPSHOT` marker) or `JOURNAL_VERSION` turns every CI snapshot cold for
+one job — release-gated, like `COREUTILS_VERSION`.
 
 ### Target timeouts
 
