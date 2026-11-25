@@ -31,7 +31,7 @@ use rusqlite::limits::Limit;
 use rusqlite::types::Value;
 use rusqlite::{Connection, ErrorCode, OpenFlags};
 
-use super::catalog::Catalog;
+use super::catalog::{self, Catalog};
 use super::store;
 
 /// One explorer name and its columns with their declared types, in order.
@@ -424,6 +424,9 @@ pub struct Coverage {
     /// Sessions read whose recording stopped at its size ceiling, so their
     /// rows are incomplete.
     pub truncated: usize,
+    /// When the catalog was read: the start (unix ms) of the oldest session
+    /// it holds. Nothing older is in the answer, whatever the window.
+    pub reaches_ms: Option<u64>,
 }
 
 /// A query's answer.
@@ -981,6 +984,8 @@ fn in_place(
                 .copied()
                 .filter(|t| CATALOG_HOLDS.contains(t))
                 .collect();
+            coverage.reaches_ms =
+                catalog::reaches_ms(conn).context("reading how far the catalog reaches")?;
             coverage.truncated = count(
                 conn,
                 &format!(

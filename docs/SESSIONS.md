@@ -200,7 +200,8 @@ line:
 ```json
 {"version":1,"columns":["addr","duration_us"],"types":["TEXT","INTEGER"],
  "rows":[["//p:t","81234"]],
- "coverage":{"catalog":["targets"],"recordings":0,"skipped":0,"truncated":0}}
+ "coverage":{"catalog":["targets"],"recordings":0,"skipped":0,"truncated":0,
+             "reaches_ms":1763400000000}}
 ```
 
 - `types` is each column's declared type, `null` for an expression.
@@ -211,8 +212,11 @@ line:
   the catalog, `recordings` how many recordings were read, `skipped` how
   many were not (`--full`), `truncated` how many sessions read stopped
   recording at their size ceiling, so their rows are incomplete. Skipped
-  and truncated sources are also named on stderr. `coverage` only gains
-  fields.
+  and truncated sources are also named on stderr. `reaches_ms`, when the
+  catalog was read, is the start (unix ms) of the oldest session it holds:
+  nothing older is in the answer, whatever `--since` asks for (the catalog
+  keeps 90 days, and less once rebuilt or answering from the recordings
+  kept); `null` for `--full` and `--from`. `coverage` only gains fields.
 
 **Errors** exit 125, as `heph session`'s own errors do. A refused, invalid
 or stopped statement says so on stderr with SQLite's message (an unknown
@@ -755,8 +759,11 @@ that bound, and a build never repairs anything (I1).
   and says why on stderr:
 
   ```
-  heph: the session catalog cannot be used (it was written by heph 0.9.0, newer than this one): answering from the recordings kept
+  heph: the session catalog cannot be used (it was written by heph 0.9.0, newer than this one): answering from the recordings kept; it covers the last 6 days
   ```
+
+  The reach is rounded down: a session 6 days and 20 hours old covers "the
+  last 6 days"; under a day, the hours.
 
   `list --json` then has `retention.catalog.keep_ms: null`.
 

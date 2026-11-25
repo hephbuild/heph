@@ -452,6 +452,7 @@ struct JsonCoverage<'a> {
     recordings: usize,
     skipped: usize,
     truncated: usize,
+    reaches_ms: Option<u64>,
 }
 
 /// A value under `--format json`: INTEGER a string, REAL a number (NaN and
@@ -486,6 +487,7 @@ fn write_json(answer: &Answer, out: &mut dyn Write) -> anyhow::Result<()> {
             recordings: answer.coverage.recordings,
             skipped: answer.coverage.skipped,
             truncated: answer.coverage.truncated,
+            reaches_ms: answer.coverage.reaches_ms,
         },
     };
     serde_json::to_writer(&mut *out, &doc).context("writing the query's rows")?;

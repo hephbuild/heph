@@ -192,7 +192,9 @@ async fn query_formats() {
     );
     assert_eq!(
         v["coverage"],
-        serde_json::json!({"catalog": [], "recordings": 1, "skipped": 0, "truncated": 0})
+        serde_json::json!({
+            "catalog": [], "recordings": 1, "skipped": 0, "truncated": 0, "reaches_ms": null
+        })
     );
 
     let ran = run_query(&root, &["--from", &id, "--format", "csv", sql], "").await;
@@ -340,7 +342,7 @@ async fn query_sources_follow_the_window() {
     let root = tmp.path().join("sessions");
     session(&root, 0, 1);
     session(&root, 60_000, 2);
-    session(&root, 10 * DAY_MS, 3);
+    let oldest = session(&root, 10 * DAY_MS, 3);
     let newer = session(&root, 120_000, 4);
     testing::alter(&root.join(newer.encode()), "PRAGMA user_version=999").expect("newer");
     let count = "SELECT count(*) AS n FROM sessions";
@@ -349,6 +351,12 @@ async fn query_sources_follow_the_window() {
     let v = json(&ran.out.expect("catalog"));
     assert_eq!(v["rows"], serde_json::json!([["2"]]), "{v}");
     assert_eq!(v["coverage"]["catalog"], serde_json::json!(["sessions"]));
+    // The catalog reaches its oldest session, outside the 7-day window.
+    assert_eq!(
+        v["coverage"]["reaches_ms"],
+        oldest.started_unix_ms(),
+        "{v}"
+    );
     let ran = run_query(&root, &["--format", "json", "--since", "30d", count], "").await;
     assert_eq!(
         json(&ran.out.expect("30d"))["rows"],
@@ -360,6 +368,7 @@ async fn query_sources_follow_the_window() {
     assert_eq!(v["rows"], serde_json::json!([["2"]]), "{v}");
     assert_eq!(v["coverage"]["recordings"], 2, "{v}");
     assert_eq!(v["coverage"]["skipped"], 1, "{v}");
+    assert_eq!(v["coverage"]["reaches_ms"], serde_json::Value::Null, "{v}");
     assert!(
         ran.notes.iter().any(|n| n.contains("skipped 1 recording")),
         "{:?}",

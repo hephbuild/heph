@@ -430,8 +430,9 @@ fn corrupt_files(root: &Path) -> Vec<String> {
 fn a_lost_catalog_is_rebuilt_on_open() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path();
-    for (i, ago) in [(1, 3 * DAY_MS), (2, 1_000)] {
-        let dir = sealed(root, recent_id(i, ago));
+    let oldest = recent_id(1, 3 * DAY_MS);
+    for id in [oldest, recent_id(2, 1_000)] {
+        let dir = sealed(root, id);
         catalog::record_seal(root, &dir, true);
     }
     let original = snapshot(&read(root));
@@ -442,10 +443,16 @@ fn a_lost_catalog_is_rebuilt_on_open() {
     assert_eq!(snapshot(&opened.conn), original);
     assert_eq!(opened.notes.len(), 1, "{:?}", opened.notes);
     assert!(opened.notes[0].contains("missing"), "{:?}", opened.notes);
+    // Rounded down: 3 days and a second is "3 days", never a day it does
+    // not hold.
     assert!(
-        opened.notes[0].contains("covers the last 4 days"),
+        opened.notes[0].contains("covers the last 3 days"),
         "{:?}",
         opened.notes
+    );
+    assert_eq!(
+        catalog::reaches_ms(&opened.conn).expect("reach"),
+        Some(oldest.started_unix_ms()),
     );
     drop(opened);
 
@@ -565,6 +572,12 @@ fn catalog_repair_is_guarded() {
     assert!(opened.in_memory);
     assert_eq!(opened.heal.healed, 2, "answered from both recordings");
     assert!(opened.notes[0].contains("answering from the recordings"));
+    // How far back that answer reaches: the oldest kept, 2 s ago.
+    assert!(
+        opened.notes[0].contains("it covers the last hour"),
+        "{:?}",
+        opened.notes
+    );
     holder.execute_batch("ROLLBACK").expect("release");
     drop(holder);
     assert!(corrupt_files(root).is_empty());

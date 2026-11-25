@@ -670,6 +670,35 @@ pub fn open(root: &Path, now_ms: u64) -> anyhow::Result<Catalog> {
     }
 }
 
+/// The start (unix ms) of the oldest session `conn`, a catalog, holds:
+/// nothing started before it can be answered from it.
+pub fn reaches_ms(conn: &Connection) -> rusqlite::Result<Option<u64>> {
+    let oldest: Option<i64> =
+        conn.query_row("SELECT min(started_ms) FROM main.sessions", [], |r| {
+            r.get(0)
+        })?;
+    Ok(oldest.and_then(|ms| u64::try_from(ms).ok()))
+}
+
+/// How far back `conn` reaches as of `now_ms`, for a note: "it covers the
+/// last 3 days". Rounded down, so it never claims a day it does not hold.
+fn covers(conn: &Connection, now_ms: u64) -> rusqlite::Result<String> {
+    const HOUR_MS: u64 = 60 * 60 * 1000;
+    let plural = |n: u64, unit: &str| format!("{n} {unit}{}", if n == 1 { "" } else { "s" });
+    Ok(match reaches_ms(conn)? {
+        Some(ms) => {
+            let age = now_ms.saturating_sub(ms);
+            let span = match (age / DAY_MS, age / HOUR_MS) {
+                (0, 0) => "hour".to_owned(),
+                (0, hours) => plural(hours, "hour"),
+                (days, _) => plural(days, "day"),
+            };
+            format!("it covers the last {span}")
+        }
+        None => "no recording is kept".to_owned(),
+    })
+}
+
 /// An in-memory catalog of every kept recording.
 fn in_memory(root: &Path, now_ms: u64, reason: &str) -> anyhow::Result<Catalog> {
     let conn = Connection::open_in_memory_with_flags(
@@ -684,11 +713,13 @@ fn in_memory(root: &Path, now_ms: u64, reason: &str) -> anyhow::Result<Catalog> 
         .map_err(|e| anyhow::anyhow!("{e}"))
         .context("creating an in-memory session catalog")?;
     let heal = heal(&conn, root, now_ms).context("reading the recordings")?;
+    let covers = covers(&conn, now_ms).context("reading the recordings")?;
     Ok(Catalog {
         conn,
         _lock: None,
         notes: vec![format!(
-            "heph: the session catalog cannot be used ({reason}): answering from the recordings kept\n"
+            "heph: the session catalog cannot be used ({reason}): answering from the recordings \
+             kept; {covers}\n"
         )],
         in_memory: true,
         heal,
@@ -788,19 +819,7 @@ fn repair(
     let conn = open_rw(root, true).map_err(|e| e.to_string())?;
     ensure_schema(&conn, false).map_err(|e| e.to_string())?;
     let heal = heal(&conn, root, now_ms).map_err(|e| e.to_string())?;
-    let oldest: Option<i64> = conn
-        .query_row("SELECT min(started_ms) FROM sessions", [], |r| r.get(0))
-        .map_err(|e| e.to_string())?;
-    let covers = match oldest.and_then(|ms| u64::try_from(ms).ok()) {
-        Some(ms) => {
-            let days = now_ms.saturating_sub(ms).div_ceil(DAY_MS).max(1);
-            format!(
-                "it covers the last {days} day{}",
-                if days == 1 { "" } else { "s" }
-            )
-        }
-        None => "no recording is kept".to_owned(),
-    };
+    let covers = covers(&conn, now_ms).map_err(|e| e.to_string())?;
     let what = match &moved {
         Some((why, to)) => format!("the session catalog {why}, moved to {}", to.display()),
         None => "the session catalog was missing".to_owned(),
