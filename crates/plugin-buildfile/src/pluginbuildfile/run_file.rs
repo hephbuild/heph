@@ -344,6 +344,11 @@ const USER_TYPE_EXTENSIONS: &[LibraryExtension] = &[
 /// namespace. Evaluation adds callable plugin functions ([`build_globals`]);
 /// the lint check adds opaque stand-ins by name, so both see the same static
 /// surface.
+///
+/// No global here may hold an unnamed `record` or `enum` type. The lint
+/// pre-pass names such a type (`init_ty`) on the first module that binds it,
+/// and the name sticks process-wide, so a finding's text would depend on which
+/// package was checked first.
 pub(crate) fn heph_globals(
     kwargs: &crate::pluginbuildfile::types::DriverKwargs,
     plugins: impl Fn(&mut GlobalsBuilder),
