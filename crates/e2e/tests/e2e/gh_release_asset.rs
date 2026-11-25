@@ -8,7 +8,7 @@
 //! plugin ABI (exported with `make_plugin_functions`, loaded with
 //! `decode_functions`, as a cdylib's is), declaring an `http_fetch` of the
 //! asset's download URL — `server_url` pointed at a loopback server — and a
-//! `gh.extract` that unpacks it. The declared targets are fetched, verified and
+//! builtin `archive.extract` that unpacks it. The declared targets are fetched, verified and
 //! unpacked by the real engine.
 //!
 //! With `credentials`, `api_url` points at a loopback server playing the
@@ -28,11 +28,11 @@ fn behind_the_abi(plugin: &str, defs: Vec<PluginFnDef>) -> anyhow::Result<Vec<Pl
     hplugin_stabby::load_stable::decode_functions(plugin, named.into_iter().collect(), handle)
 }
 
-/// A workspace with BUILD files, `http_fetch`, and the `gh` plugin's function
-/// and its `extract` and `asset_url` drivers. The BUILD files pass
+/// A workspace with BUILD files, `http_fetch`, the builtin `archive` plugin,
+/// and the `gh` plugin's function and `asset_url` driver. The BUILD files pass
 /// `server_url` (and `api_url`).
 fn workspace() -> anyhow::Result<htestkit::Workspace> {
-    htestkit::WorkspaceBuilder::new()?
+    crate::archive::archive_plugin(htestkit::WorkspaceBuilder::new()?)
         .with_provider(|init| {
             Box::new(heph::pluginbuildfile::Provider::new(
                 init.root.to_path_buf(),
@@ -44,7 +44,6 @@ fn workspace() -> anyhow::Result<htestkit::Workspace> {
         .with_plugin("gh", |_| {
             Ok(PluginParts::default()
                 .with_functions(behind_the_abi("gh", hplugin_gh::release::functions("gh"))?)
-                .with_managed_driver(Box::new(hplugin_gh::extract::Driver))
                 .with_managed_driver(Box::new(hplugin_gh::asset_url::Driver)))
         })
         .build()
@@ -117,7 +116,7 @@ tool = heph.gh.release_asset(
     );
 
     let spec = ws.get_spec("//third_party/tool:tool").await?;
-    assert_eq!(spec.driver, "gh.extract");
+    assert_eq!(spec.driver, "archive.extract");
     assert_eq!(
         ws.get_spec("//third_party/tool:tool_archive").await?.driver,
         "http_fetch"

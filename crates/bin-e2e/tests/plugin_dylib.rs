@@ -330,8 +330,10 @@ fn spec_driver(ws: &Workspace, dist: &Dist, addr: &str) -> String {
 ///
 /// `heph.gh.release_asset` is called across the seam and its declarations come
 /// back: `inspect spec` resolves the declared targets without building, so no
-/// network is needed. The `gh.extract` driver then runs across the seam on an
-/// archive built offline by the builtin coreutils' `tar`. Both with the hook
+/// network is needed. The extract it declares is the host's builtin
+/// `archive.extract`, not the cdylib's, and the release binary must have it:
+/// it unpacks an archive built offline by the builtin coreutils' `tar`, with
+/// the gh cdylib loaded. Both with the hook
 /// enabled (`hook: {enable: true}`, when it writes the step summary at the end
 /// of the run) and without (when it writes nothing, though `GITHUB_ACTIONS`
 /// is `true`).
@@ -371,7 +373,7 @@ target(
 
 target(
     name = "unpacked",
-    driver = "gh.extract",
+    driver = "archive.extract",
     src = ":archive",
     format = "tar.gz",
 )
@@ -406,7 +408,7 @@ target(
 
         assert_eq!(
             spec_driver(&ws, &dist, "//rel:tool"),
-            "gh.extract",
+            "archive.extract",
             "hook={hook}"
         );
         assert_eq!(
@@ -512,7 +514,7 @@ heph.gh.release_asset(
     for hook in [false, true] {
         configure_gh(&ws, &dist, &gh_options("", hook));
         for (addr, driver) in [
-            ("//priv:tool", "gh.extract"),
+            ("//priv:tool", "archive.extract"),
             ("//priv:tool_archive", "http_fetch"),
             ("//priv:tool_url", "gh.asset_url"),
             ("//priv:tool_release", "http_fetch"),

@@ -2,7 +2,8 @@
 //!
 //! The function does no HTTP of its own. It **declares** targets for the
 //! calling package: an `http_fetch` of the asset's download URL, and — with
-//! `extract = True` — a `<plugin>.extract` that unpacks it. Fetching, pinning
+//! `extract = True` — an `archive.extract` (the builtin `archive` plugin's
+//! driver, `docs/ARCHIVE.md`) that unpacks it. Fetching, pinning
 //! (`sha256`) and caching are `http_fetch`'s, exactly as if the BUILD file had
 //! written the `target(...)` calls. See `docs/GH_RELEASES.md`.
 //!
@@ -25,7 +26,6 @@
 //! arguments (`server_url`, `api_url`), not options: one workspace may pull
 //! from a GitHub Enterprise server and from github.com.
 
-use crate::extract::{Count, FormatArg};
 use anyhow::{Context as _, bail};
 use async_trait::async_trait;
 use harchive::Format;
@@ -38,6 +38,7 @@ use hplugin::function::{
 use hplugin::htspec::{FromSpecValue, Spec};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use std::collections::HashMap;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
 /// Where releases are downloaded from when `server_url` is not passed.
@@ -66,6 +67,11 @@ const GITHUB_API_VERSION: &str = "2022-11-28";
 /// The builtin driver the asset is fetched with. Named, not imported: the gh
 /// plugin is a cdylib and `http_fetch` lives in the host.
 const HTTP_FETCH: &str = "http_fetch";
+
+/// The builtin driver an archive is unpacked with (the `archive` plugin's, see
+/// `docs/ARCHIVE.md`). Named, not imported, for the same reason: linking it
+/// would put the unpacker and its codecs into the gh cdylib.
+const ARCHIVE_EXTRACT: &str = "archive.extract";
 
 /// Suffix of the fetch target's name when the asset is extracted: the
 /// extracted tree takes `name`, the archive `<name>_archive`.
@@ -343,11 +349,11 @@ struct ReleaseAssetArgs {
     /// With `extract` only: the most bytes the archive may unpack to (default
     /// 4 GiB).
     #[spec(ty = ParamType::Int)]
-    max_bytes: Option<Count>,
+    max_bytes: Option<NonZeroU64>,
     /// With `extract` only: the most entries the archive may hold (default
     /// 1,000,000).
     #[spec(ty = ParamType::Int)]
-    max_entries: Option<Count>,
+    max_entries: Option<NonZeroU64>,
     /// Without `extract` only: mark the fetched file executable (default
     /// `False`).
     executable: bool,
@@ -415,9 +421,26 @@ impl FromSpecValue for Addrs {
     }
 }
 
-/// A count as the extract driver reads it back: an `Int` unless it does not
-/// fit one.
-fn count_value(Count(n): Count) -> Value {
+/// The `format` argument: one of [`Format`]'s spellings, checked at the call
+/// so a typo fails in the BUILD file rather than at the declared extract. A
+/// newtype because both `Format` and [`FromSpecValue`] are other crates'.
+#[derive(Clone, Copy, Debug)]
+struct FormatArg(Format);
+
+impl FromSpecValue for FormatArg {
+    fn from_spec_value(v: &Value) -> anyhow::Result<Self> {
+        Format::parse(&String::from_spec_value(v)?).map(Self)
+    }
+
+    fn spec_param_type() -> ParamType {
+        ParamType::one_of(Format::ALL.iter().map(|f| f.as_str()))
+    }
+}
+
+/// A count argument (`max_bytes`, `max_entries`), forwarded to the extract as
+/// passed: an `Int` unless it does not fit one.
+fn count_value(n: NonZeroU64) -> Value {
+    let n = n.get();
     i64::try_from(n).map_or(Value::Uint(n), Value::Int)
 }
 
@@ -608,7 +631,7 @@ fn release_asset(plugin: &str, pkg: &str, args: &FnArgs) -> anyhow::Result<FnOut
     }
     outcome.declare_target(DeclaredTarget {
         name: name.to_string(),
-        driver: format!("{plugin}.{}", crate::extract::DRIVER_NAME),
+        driver: ARCHIVE_EXTRACT.to_string(),
         config,
         ..Default::default()
     });
@@ -924,7 +947,7 @@ mod tests {
         assert_eq!(fetch.config.get("sha256"), Some(&s("abc")));
 
         assert_eq!(extract.name, "tool");
-        assert_eq!(extract.driver, "gh.extract");
+        assert_eq!(extract.driver, "archive.extract");
         assert_eq!(extract.config.get("src"), Some(&s(":tool_archive")));
         assert_eq!(extract.config.get("format"), Some(&s("tar.gz")));
         assert_eq!(extract.config.get("strip_components"), Some(&Value::Int(1)));
@@ -972,18 +995,22 @@ mod tests {
         assert_eq!(extract.config.get("max_bytes"), None);
     }
 
+    /// The plugin's own driver (`asset_url`) is named after the plugin as the
+    /// manifest names it; the extract is the builtin `archive.extract` under
+    /// any name.
     #[test]
-    fn the_driver_is_named_after_the_plugin() {
+    fn only_the_plugins_own_driver_is_named_after_it() {
         let args = FnArgs {
             positional: vec![],
-            named: with(&[("extract", Value::Bool(true))])
+            named: with(&[("extract", Value::Bool(true)), creds(&["//auth:gh"])])
                 .into_iter()
                 .map(|(k, v)| (k.to_string(), v))
                 .collect(),
         };
         let out = release_asset("github", "", &args).unwrap();
         assert_eq!(out.value(), &s("//:tool"));
-        assert_eq!(out.targets()[1].driver, "github.extract");
+        assert_eq!(target(&out, "tool_url").driver, "github.asset_url");
+        assert_eq!(target(&out, "tool").driver, "archive.extract");
     }
 
     fn creds(addrs: &[&str]) -> (&'static str, Value) {
@@ -1085,7 +1112,7 @@ mod tests {
             "the pin is the asset's bytes"
         );
         let extract = target(&out, "tool");
-        assert_eq!(extract.driver, "gh.extract");
+        assert_eq!(extract.driver, "archive.extract");
         assert_eq!(extract.config.get("src"), Some(&s(":tool_archive")));
         assert_eq!(extract.config.get("credentials"), None);
         assert_eq!(extract.config.get("sha256"), None);
@@ -1196,18 +1223,18 @@ mod tests {
             ),
             (
                 &[("extract", Value::Bool(true)), ("max_bytes", Value::Int(0))],
-                "parse `max_bytes`: must be a positive integer, got Int(0)",
+                "parse `max_bytes`: invalid: expected a positive integer, got: 0",
             ),
             (
                 &[
                     ("extract", Value::Bool(true)),
                     ("max_entries", Value::Int(-3)),
                 ],
-                "parse `max_entries`: must be a positive integer, got Int(-3)",
+                "parse `max_entries`: invalid: expected a positive integer, got: -3",
             ),
             (
                 &[("extract", Value::Bool(true)), ("max_bytes", s("4G"))],
-                "parse `max_bytes`: must be a positive integer",
+                "parse `max_bytes`: invalid: expected int",
             ),
             (
                 &[

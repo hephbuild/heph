@@ -7,12 +7,12 @@
 //!   `hook:` key. They are always decoded, so a typo fails even while the hook
 //!   is off; the hook is constructed only when `hook.enable` is true.
 //! - **`heph.gh.release_asset(...)`** ([`release`]): a BUILD function declaring
-//!   an `http_fetch` of a release asset, and optionally an `extract` of it.
-//!   With `credentials` (a private repository) it fetches through the API: an
-//!   `http_fetch` of the release JSON, an `asset_url` picking the asset's URL
-//!   out of it, and an `http_fetch` of that URL.
-//! - **The `extract` driver** ([`extract`]): unpacks an archive in-process
-//!   ([`harchive::unpack`]). See `docs/GH_RELEASES.md`.
+//!   an `http_fetch` of a release asset, and optionally an `archive.extract`
+//!   of it (the builtin `archive` plugin's driver, named rather than linked:
+//!   see `docs/ARCHIVE.md`). With `credentials` (a private repository) it
+//!   fetches through the API: an `http_fetch` of the release JSON, an
+//!   `asset_url` picking the asset's URL out of it, and an `http_fetch` of
+//!   that URL. See `docs/GH_RELEASES.md`.
 //! - **The `asset_url` driver** ([`asset_url`]): one asset's API URL from a
 //!   release JSON.
 //!
@@ -64,7 +64,6 @@
 pub mod asset_url;
 #[cfg(test)]
 mod comment_tests;
-pub mod extract;
 pub mod release;
 mod render;
 mod report;

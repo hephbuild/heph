@@ -42,7 +42,12 @@ exactly as if the BUILD file had written them, and the engine builds them:
 
 - `extract = False`: one `http_fetch` target named `name`.
 - `extract = True`: an `http_fetch` named `<name>_archive` (its output is the
-  archive, named `asset`), and a `gh.extract` named `name` whose `src` is it.
+  archive, named `asset`), and an `archive.extract` named `name` whose `src`
+  is it. `archive.extract` is the builtin `archive` plugin's driver
+  ([ARCHIVE.md](ARCHIVE.md)), named by the function rather than shipped in the
+  gh cdylib. So the gh plugin needs a heph that ships the builtin `archive`
+  plugin; with an older one, an `extract = True` target fails with "unknown
+  driver `archive.extract`".
 
 `<name>_archive` (and, with `credentials`, `<name>_release` and `<name>_url`)
 are reserved in the calling package. Nothing refuses a hand-written target with
@@ -184,36 +189,13 @@ enabling the plugin for release assets needs no `options:` and loads no hook.
 
 ## Unpacking rules
 
-`gh.extract` unpacks in-process (no host `tar`/`unzip`, through the `archive`
-crate, `crates/archive`), with the same code on every supported platform. One
-difference is the filesystem's: two entries whose
-names differ only by case (or Unicode normalization) both extract on Linux,
-while on macOS's case-insensitive APFS they are one file, and the second entry
-fails with an error saying it collides with the first on a case-insensitive
-filesystem. The archive is untrusted, so:
-
-- An absolute path or a `..` component is refused, and so is an entry written
-  through a symlink the archive created.
-- A symlink must stay inside the output: an absolute target is refused, and
-  every link is resolved through the extracted tree, following the links it
-  meets, and refused if it climbs above it. A hard link becomes a copy of an
-  entry already extracted.
-- Device and fifo entries are refused. Paths must be UTF-8.
-- Modes are normalized: `0o755` when any execute bit is set, else `0o644`;
-  directories `0o755`. Owners and mtimes are not applied.
-- A path that appears twice is an error, except a directory listed again. A
-  zip whose central directory names a path twice is refused as a whole.
-- The output is bounded: at most 4 GiB written and 1,000,000 entries by
-  default, counted while unpacking; the call's `max_bytes` / `max_entries`
-  (forwarded to `gh.extract`) raise them. They are not hashed: exceeding one fails the run,
-  and a failure is never cached.
-- `strip_components` counts a leading `.` as GNU tar and bsdtar do
-  (`./tool-1.0/bin/tool` with 1 is `tool-1.0/bin/tool`); a hard link's target
-  is stripped too, a symlink's is not. An entry with no more components than
-  `strip_components` is skipped; an archive from which nothing remains is an
-  error listing its first five entries.
-- The extracted tree is cached (`cache = False` turns it off): it is a pure
-  function of the archive's bytes.
+With `extract = True` the archive is unpacked by `archive.extract`, in-process
+and with the same code on every supported platform. The archive is untrusted
+input; the rules it is held to (paths, links, modes, duplicates, bounds,
+`strip_components`) are [ARCHIVE.md's](ARCHIVE.md#unpacking-rules). The call's
+`format`, `strip_components`, `max_bytes`, `max_entries` and `out` are
+forwarded to it as passed; the bounds are not hashed, and the extracted tree
+is cached as a pure function of the archive's bytes.
 
 ## Private repositories
 

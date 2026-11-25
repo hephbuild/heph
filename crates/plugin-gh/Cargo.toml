@@ -26,15 +26,18 @@ serde_path_to_error = "0.1"
 # comparisons per insert, each walking a long shared `//deep/package/…` prefix
 # before diverging; FxHash hashes the bytes once.
 rustc-hash = "2"
-# `heph.gh.release_asset` and the `extract` driver it declares.
+# `heph.gh.release_asset` and the `asset_url` driver it declares.
 async-trait = "0.1.92"
 hdriver-support = { package = "driver-support", path = "../driver-support" }
 serde = { version = "1", features = ["derive"] }
 xxhash-rust = { version = "0.8.21", features = ["xxh3", "std"] }
 # Path segments of a release download URL (already in the tree through `url`).
 percent-encoding = "2.3"
-# The hardened unpacker `extract` runs.
-harchive = { package = "archive", path = "../archive" }
+# `Format` only: `release_asset` checks and infers `format` at the call. The
+# unpacker and its codecs are the host's `archive.extract`: plugin-gh does not
+# request the codec feature (cargo may still unify it on when built alongside
+# heph), and the linker drops the codecs from the cdylib since nothing calls them.
+harchive = { package = "archive", path = "../archive", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
