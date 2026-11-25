@@ -96,15 +96,8 @@ impl<'a, R: Record, W: Write> Printer<'a, R, W> {
     }
 
     /// A complete document in `buf`: print it, or run the filter over it.
-    fn document(mut self, mut buf: Vec<u8>, cancelled: Cancelled<'_>) -> anyhow::Result<()> {
-        if let Some(jq) = self.jq {
-            return jq.run(buf, &mut self.w, cancelled);
-        }
-        buf.push(b'\n');
-        if !closed(self.w.write_all(&buf))? {
-            closed(self.w.flush())?;
-        }
-        Ok(())
+    fn document(mut self, buf: Vec<u8>, cancelled: Cancelled<'_>) -> anyhow::Result<()> {
+        write_document(&mut self.w, buf, self.jq, cancelled)
     }
 
     /// Start a list: `[` is written now, each [`ListWriter::push`] adds an
@@ -131,25 +124,9 @@ impl<'a, R: Record, W: Write> Printer<'a, R, W> {
         T: Record<Static = R::Static> + Serialize,
         S: Stream<Item = anyhow::Result<T>>,
     {
-        let mut rows = std::pin::pin!(rows);
         let mut list = self.start_list()?;
-        loop {
-            // Flush only when the producer has nothing ready: a reader sees
-            // each element as soon as the walk pauses, without a write per row.
-            let next = match rows.next().now_or_never() {
-                Some(next) => next,
-                None => {
-                    if list.flush()? == Flow::Stop {
-                        return Ok(());
-                    }
-                    rows.next().await
-                }
-            };
-            let Some(row) = next else { break };
-            let row = row.context("the list stopped before its end; its `]` was not written")?;
-            if list.push(&row)? == Flow::Stop {
-                return Ok(());
-            }
+        if list.push_stream(rows).await? == Flow::Stop {
+            return Ok(());
         }
         list.finish(cancelled)
     }
@@ -161,10 +138,8 @@ impl<'a, R: Record, W: Write> Printer<'a, R, W> {
         I: IntoIterator<Item = T>,
     {
         let mut list = self.start_list()?;
-        for row in rows {
-            if list.push(&row)? == Flow::Stop {
-                return Ok(());
-            }
+        if list.push_iter(rows)? == Flow::Stop {
+            return Ok(());
         }
         list.finish(cancelled)
     }
@@ -233,6 +208,52 @@ impl<R: Record, W: Write> ListWriter<'_, R, W> {
         flow
     }
 
+    /// [`ListWriter::push`] each of `rows`, stopping at a closed stdout.
+    pub fn push_iter<T, I>(&mut self, rows: I) -> anyhow::Result<Flow>
+    where
+        T: Record<Static = R::Static> + Serialize,
+        I: IntoIterator<Item = T>,
+    {
+        for row in rows {
+            if self.push(&row)? == Flow::Stop {
+                return Ok(Flow::Stop);
+            }
+        }
+        Ok(Flow::Continue)
+    }
+
+    /// [`ListWriter::push`] each row of `rows` as it arrives, flushing
+    /// whenever the producer has nothing ready, so a reader sees each element
+    /// as soon as the walk pauses. An `Err` row is returned (the list stays
+    /// unclosed); a closed stdout stops polling `rows` and is [`Flow::Stop`].
+    pub async fn push_stream<T, S>(&mut self, rows: S) -> anyhow::Result<Flow>
+    where
+        T: Record<Static = R::Static> + Serialize,
+        S: Stream<Item = anyhow::Result<T>>,
+    {
+        let mut rows = std::pin::pin!(rows);
+        loop {
+            // Flush only when the producer has nothing ready: a reader sees
+            // each element as soon as the walk pauses, without a write per row.
+            let next = match rows.next().now_or_never() {
+                Some(next) => next,
+                None => {
+                    if self.flush()? == Flow::Stop {
+                        return Ok(Flow::Stop);
+                    }
+                    rows.next().await
+                }
+            };
+            let Some(row) = next else {
+                return Ok(Flow::Continue);
+            };
+            let row = row.context("the list stopped before its end; its `]` was not written")?;
+            if self.push(&row)? == Flow::Stop {
+                return Ok(Flow::Stop);
+            }
+        }
+    }
+
     /// Write `]` and end the document; under `--jq`, run the filter over it.
     pub fn finish(mut self, cancelled: Cancelled<'_>) -> anyhow::Result<()> {
         if self.stopped {
@@ -285,6 +306,42 @@ impl<R: Record, W: Write> ListWriter<'_, R, W> {
         }
         Ok(Flow::Continue)
     }
+}
+
+/// A complete document in `buf` on `w`: printed with its newline, or run
+/// through `jq`. A broken pipe is `Ok`.
+fn write_document(
+    w: &mut impl Write,
+    mut buf: Vec<u8>,
+    jq: Option<&Jq>,
+    cancelled: Cancelled<'_>,
+) -> anyhow::Result<()> {
+    if let Some(jq) = jq {
+        return jq.run(buf, w, cancelled);
+    }
+    buf.push(b'\n');
+    if !closed(w.write_all(&buf))? {
+        closed(w.flush())?;
+    }
+    Ok(())
+}
+
+/// Any serializable `value` as the whole document on `w`, with no field
+/// selection: the printer of [`crate::DocArgs`]. Compact under `--jq`.
+pub(crate) fn value_document<T: Serialize + ?Sized>(
+    w: &mut impl Write,
+    value: &T,
+    style: Style,
+    jq: Option<&Jq>,
+    cancelled: Cancelled<'_>,
+) -> anyhow::Result<()> {
+    let mut buf = Vec::new();
+    let result = match (style, jq) {
+        (Style::Pretty, None) => value.serialize(&mut serde_json::Serializer::pretty(&mut buf)),
+        _ => value.serialize(&mut serde_json::Serializer::new(&mut buf)),
+    };
+    result.context("serializing the JSON output")?;
+    write_document(w, buf, jq, cancelled)
 }
 
 /// `value` with only `selection`, appended to `buf` in `style`. Into a buffer

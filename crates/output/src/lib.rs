@@ -74,6 +74,14 @@
 //! [`ListWriter`] driver to cancel its request). Any other write error is an
 //! error with context.
 //!
+//! A command that prints JSON either way and has no stable shape (D11:
+//! `inspect spec`, `inspect def`, `tool config-schema`) flattens [`DocArgs`]
+//! instead: `--json` and `--jq`, no `--fields`, no `Record`; it prints any
+//! `Serialize` value with [`DocArgs::print`].
+//!
+//! An engine command hands its flags to the runner as [`OutputFlags`], so the
+//! runner keeps the TUI off under any of them; the command cannot forget.
+//!
 //! `cancelled` is polled while a `--jq` filter runs (on its own thread, which
 //! is abandoned, not joined, on cancellation): pass the request's
 //! `ctoken().is_cancelled()`, or [`never_cancelled`] in a command with no
@@ -94,6 +102,7 @@ extern crate self as output;
 mod args;
 #[cfg(doctest)]
 mod derive_refusals;
+mod doc;
 mod error;
 mod filter;
 mod jq;
@@ -103,6 +112,7 @@ mod write;
 use std::marker::PhantomData;
 
 pub use args::{FieldSel, JsonArgs, fields_help};
+pub use doc::{DocArgs, OutputFlags};
 pub use error::{OutputError, exit_code};
 pub use jq::Jq;
 pub use output_derive::{Record, Shape};
