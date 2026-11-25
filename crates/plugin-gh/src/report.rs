@@ -289,6 +289,7 @@ mod tests {
                     error: Some(msg.clone()),
                     upstream_of: None,
                     exit_status: Some("exit status: 1".into()),
+                    exit_code: None,
                     log_tail: Some(LogTailData {
                         text: "FAIL\nline two".into(),
                         start_line: 1,
@@ -307,6 +308,7 @@ mod tests {
                     error: Some("dependency failed".into()),
                     upstream_of: Some("//very/long/package/path/number0:some-broken-target".into()),
                     exit_status: None,
+                    exit_code: None,
                     log_tail: None,
                 },
             ));
@@ -414,6 +416,7 @@ mod tests {
                 error: Some("boom".into()),
                 upstream_of: None,
                 exit_status: None,
+                exit_code: None,
                 // The injection attempt is the LAST line, which is the one the
                 // annotation actually quotes.
                 log_tail: Some(LogTailData {

@@ -2778,7 +2778,7 @@ impl Driver {
                 // Nothing was captured: no log artifact, never a handle into
                 // a sandbox that is about to be removed (R22).
                 return Err(
-                    hplugin::error::ProcessFailed::new(exit_display(exit), Some(exit)).into(),
+                    hplugin::error::ProcessFailed::new(exit.to_string(), Some(exit)).into(),
                 );
             }
             return if writes_log {
@@ -3174,15 +3174,6 @@ fn log_response(output_log_path: &std::path::Path) -> anyhow::Result<ManagedRunR
         }],
         ..Default::default()
     })
-}
-
-/// `ProcessFailed.status` for an [`Exit`](hplugin::error::Exit): the same
-/// words std's `ExitStatus` display uses for the common cases.
-fn exit_display(exit: hplugin::error::Exit) -> String {
-    match exit {
-        hplugin::error::Exit::Code(code) => format!("exit status: {code}"),
-        hplugin::error::Exit::Signal(sig) => format!("signal: {sig}"),
-    }
 }
 
 /// The run's environment: the caller's `base` at the bottom, the run's own

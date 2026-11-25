@@ -73,6 +73,7 @@ fn end(addr: &str, error: Option<&str>, upstream_of: Option<&str>) -> BuildEvent
         error: error.map(Into::into),
         upstream_of: upstream_of.map(Into::into),
         exit_status: error.map(|_| "exit status: 101".into()),
+        exit_code: None,
         log_tail: None,
         timed_out: None,
     }
@@ -86,6 +87,7 @@ fn stopped(addr: &str) -> BuildEventKind {
         error: Some("cancelled".into()),
         upstream_of: None,
         exit_status: None,
+        exit_code: None,
         log_tail: None,
         timed_out: None,
     }
@@ -569,6 +571,7 @@ fn timed_out_root_reads_as_failure_failed_tab() {
                 error: Some("timed out after 10m".into()),
                 upstream_of: None,
                 exit_status: None,
+                exit_code: None,
                 log_tail: None,
                 timed_out: Some(TimedOutData {
                     timeout_ms: 600_000,
@@ -1080,6 +1083,7 @@ fn overview_took_down_and_timeout() {
                 error: Some("timed out after 10m".into()),
                 upstream_of: None,
                 exit_status: None,
+                exit_code: None,
                 log_tail: None,
                 timed_out: Some(TimedOutData {
                     timeout_ms: 600_000,
@@ -1160,6 +1164,7 @@ fn no_home_path_on_any_screen_dashboard_and_target() {
         error: Some(format!("{home}/sandbox/x/run.sh: not found")),
         upstream_of: None,
         exit_status: None,
+        exit_code: None,
         log_tail: None,
         timed_out: None,
     };
@@ -1292,6 +1297,7 @@ fn failed_without_status(addr: &str, error: &str) -> BuildEventKind {
         error: Some(error.into()),
         upstream_of: None,
         exit_status: None,
+        exit_code: None,
         log_tail: None,
         timed_out: None,
     }

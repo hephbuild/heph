@@ -842,6 +842,7 @@ fn a_failed_build_s_last_comment_is_final() {
             error: Some("target failed".into()),
             upstream_of: None,
             exit_status: Some("exit status: 1".into()),
+            exit_code: None,
             log_tail: None,
         },
     ));

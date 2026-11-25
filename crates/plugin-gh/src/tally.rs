@@ -381,6 +381,8 @@ impl Tally {
                 error,
                 upstream_of,
                 exit_status,
+                // `exit_status` already names it.
+                exit_code: _,
                 log_tail,
                 // The message already says it timed out; the report has no
                 // separate place for it.
@@ -464,7 +466,8 @@ impl Tally {
 
             // Tier events are per tier, not per target — a remote hit is a
             // local miss first — so they count nothing.
-            BuildEventKind::LocalCacheHit { addr } | BuildEventKind::RemoteCacheHit { addr } => {
+            BuildEventKind::LocalCacheHit { addr }
+            | BuildEventKind::RemoteCacheHit { addr, .. } => {
                 self.ensure(addr, ev.at_unix_ms);
             }
             BuildEventKind::RemoteCacheMiss { .. } | BuildEventKind::LocalCacheMiss { .. } => {}
@@ -1006,6 +1009,7 @@ mod tests {
                 error: None,
                 upstream_of: None,
                 exit_status: None,
+                exit_code: None,
                 log_tail: None,
             },
         ));
@@ -1026,6 +1030,7 @@ mod tests {
                 error: Some("execute //base:proto: process exited with status 1".into()),
                 upstream_of: None,
                 exit_status: None,
+                exit_code: None,
                 log_tail: None,
             },
         ));
@@ -1040,6 +1045,7 @@ mod tests {
                     error: Some("dependency failed".into()),
                     upstream_of: Some("//base:proto".into()),
                     exit_status: None,
+                    exit_code: None,
                     log_tail: None,
                 },
             ));
@@ -1076,6 +1082,7 @@ mod tests {
                     error: Some("boom".into()),
                     upstream_of: None,
                     exit_status: None,
+                    exit_code: None,
                     log_tail: None,
                 },
             ));
@@ -1182,7 +1189,10 @@ mod tests {
             ));
             t.apply(&ev(
                 2,
-                BuildEventKind::RemoteCacheHit { addr: addr.clone() },
+                BuildEventKind::RemoteCacheHit {
+                    addr: addr.clone(),
+                    cache: None,
+                },
             ));
             t.apply(&ev(2, outcome(&addr, CacheOutcomeKind::RemoteHit)));
         }
@@ -1739,6 +1749,7 @@ mod tests {
                 error: Some("boom".into()),
                 upstream_of: None,
                 exit_status: None,
+                exit_code: None,
                 log_tail: None,
             },
         ));
@@ -1759,6 +1770,7 @@ mod tests {
                     error: Some("boom".into()),
                     upstream_of: None,
                     exit_status: None,
+                    exit_code: None,
                     log_tail: None,
                 },
             ));
@@ -1783,6 +1795,7 @@ mod tests {
                     error: Some("boom".into()),
                     upstream_of: None,
                     exit_status: None,
+                    exit_code: None,
                     log_tail: None,
                 },
             ));
@@ -1806,6 +1819,7 @@ mod tests {
                 error: Some("target failed: //services/api:test".into()),
                 upstream_of: None,
                 exit_status: Some("exit status: 1".into()),
+                exit_code: None,
                 log_tail: Some(LogTailData {
                     text: "--- FAIL: TestCreateUser (0.03s)\n    want 201, got 500".into(),
                     start_line: 88,
@@ -1853,6 +1867,7 @@ mod tests {
                 error: None,
                 upstream_of: None,
                 exit_status: None,
+                exit_code: None,
                 log_tail: None,
             },
         ));

@@ -2725,6 +2725,7 @@ mod tests {
                 error: error.map(crate::engine::event::ErrorDetail::into_message),
                 upstream_of: None,
                 exit_status: None,
+                exit_code: None,
                 log_tail: None,
                 timed_out: None,
             },

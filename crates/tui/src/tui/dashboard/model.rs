@@ -1235,6 +1235,7 @@ mod tests {
                     error,
                     upstream_of,
                     exit_status: None,
+                    exit_code: None,
                     log_tail: None,
                     timed_out: None,
                 }

@@ -937,6 +937,7 @@ mod tests {
                     error: Some("target failed".into()),
                     upstream_of: None,
                     exit_status: Some("exit status: 1".into()),
+                    exit_code: None,
                     log_tail: None,
                 },
             ));
@@ -952,6 +953,7 @@ mod tests {
                     error: Some("dependency failed".into()),
                     upstream_of: Some("//root0:broken".into()),
                     exit_status: None,
+                    exit_code: None,
                     log_tail: None,
                 },
             ));
@@ -1053,6 +1055,7 @@ mod tests {
                     error: Some(format!("execute failed: {huge}")),
                     upstream_of: None,
                     exit_status: None,
+                    exit_code: None,
                     log_tail: None,
                 },
             ));
@@ -1090,6 +1093,7 @@ mod tests {
                 error: Some("y".repeat(10_000)),
                 upstream_of: None,
                 exit_status: None,
+                exit_code: None,
                 log_tail: None,
             },
         ));
@@ -1111,6 +1115,7 @@ mod tests {
                 error: Some("エラー".repeat(500)),
                 upstream_of: None,
                 exit_status: None,
+                exit_code: None,
                 log_tail: None,
             },
         ));
@@ -1154,6 +1159,7 @@ mod tests {
                     error: None,
                     upstream_of: None,
                     exit_status: None,
+                    exit_code: None,
                     log_tail: None,
                 },
             ));
@@ -1212,6 +1218,7 @@ mod tests {
                 error: None,
                 upstream_of: None,
                 exit_status: None,
+                exit_code: None,
                 log_tail: None,
             },
         ));
@@ -1272,6 +1279,7 @@ mod tests {
                 error: None,
                 upstream_of: None,
                 exit_status: None,
+                exit_code: None,
                 log_tail: None,
             },
         ));
@@ -1451,6 +1459,7 @@ mod tests {
                     error: Some("target failed".into()),
                     upstream_of: None,
                     exit_status: Some("exit status: 1".into()),
+                    exit_code: None,
                     log_tail: Some(hcore::events::LogTailData {
                         text: tail(i),
                         start_line: 1,
@@ -1646,6 +1655,7 @@ mod tests {
                     error: None,
                     upstream_of: None,
                     exit_status: None,
+                    exit_code: None,
                     log_tail: None,
                 },
             ));
@@ -1809,7 +1819,10 @@ mod tests {
             ));
             t.apply(&ev(
                 2,
-                BuildEventKind::RemoteCacheHit { addr: addr.clone() },
+                BuildEventKind::RemoteCacheHit {
+                    addr: addr.clone(),
+                    cache: None,
+                },
             ));
             t.apply(&ev(2, outcome(addr, CacheOutcomeKind::RemoteHit)));
         }

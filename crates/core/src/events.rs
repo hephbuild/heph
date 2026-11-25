@@ -369,6 +369,13 @@ pub enum BuildEventKind {
         /// exists to remove.
         #[serde(default)]
         exit_status: Option<String>,
+        /// The code the process exited with, when the driver reported its
+        /// status structured: what `heph run --json` reports as `exit_code`,
+        /// read here rather than parsed out of `exit_status`. `None` for a
+        /// signal, for a status only known as text, and from a host that
+        /// predates it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
         /// The last lines of the target's process log. Only ever attached to a
         /// failing result, so a green build pays nothing for it.
         #[serde(default)]
@@ -667,6 +674,11 @@ pub enum BuildEventKind {
     /// count targets with [`CacheOutcome`](Self::CacheOutcome).
     RemoteCacheHit {
         addr: String,
+        /// The configured name of the remote cache that had it (`caches:` in
+        /// `.hephconfig`): `heph run --json` reports it. `None` from a host
+        /// that predates it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache: Option<String>,
     },
     /// A remote tier was consulted and did not have the revision. A **tier
     /// event, not a target outcome**: it follows a [`LocalCacheMiss`]
@@ -1156,6 +1168,7 @@ pub mod test_support {
             error: None,
             upstream_of: None,
             exit_status: None,
+            exit_code: None,
             log_tail: None,
             timed_out: None,
             cancelled: false,
@@ -1183,6 +1196,7 @@ pub mod test_support {
                 6,
                 BuildEventKind::RemoteCacheHit {
                     addr: a("//q:remote"),
+                    cache: None,
                 },
             ),
             ev(6, outcome("//q:remote", CacheOutcomeKind::RemoteHit)),
@@ -1245,6 +1259,7 @@ pub mod test_support {
                 23,
                 BuildEventKind::RemoteCacheHit {
                     addr: a("//s:gone"),
+                    cache: None,
                 },
             ),
             ev(23, outcome("//s:gone", CacheOutcomeKind::RemoteHit)),
@@ -1308,6 +1323,7 @@ mod tests {
                 error,
                 upstream_of,
                 exit_status,
+                exit_code,
                 log_tail,
                 timed_out,
                 cancelled,
@@ -1318,6 +1334,7 @@ mod tests {
                 assert_eq!(error.as_deref(), Some("boom"));
                 assert_eq!(upstream_of, None);
                 assert_eq!(exit_status, None);
+                assert_eq!(exit_code, None);
                 assert_eq!(log_tail, None);
                 assert_eq!(timed_out, None);
                 assert_eq!(left_behind, None);
@@ -1942,6 +1959,7 @@ mod tests {
                 error: Some("target failed".into()),
                 upstream_of: Some("//base:proto".into()),
                 exit_status: Some("exit status: 1".into()),
+                exit_code: Some(1),
                 log_tail: Some(LogTailData {
                     text: "FAIL".into(),
                     start_line: 88,
@@ -1961,12 +1979,14 @@ mod tests {
             BuildEventKind::ResultEnd {
                 upstream_of,
                 exit_status,
+                exit_code,
                 log_tail,
                 timed_out,
                 ..
             } => {
                 assert_eq!(upstream_of.as_deref(), Some("//base:proto"));
                 assert_eq!(exit_status.as_deref(), Some("exit status: 1"));
+                assert_eq!(exit_code, Some(1));
                 assert_eq!(log_tail.map(|l| l.start_line), Some(88));
                 assert_eq!(
                     timed_out,
@@ -2340,6 +2360,7 @@ mod tests {
             },
             BuildEventKind::RemoteCacheHit {
                 addr: "//a:z".into(),
+                cache: None,
             },
         ]);
         assert_eq!(c, CacheCounts::default());
@@ -2452,5 +2473,27 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// A `RemoteCacheHit` from a host that predates the cache's name decodes
+    /// with none, and a named one is written only when there is a name.
+    #[test]
+    fn remote_cache_hit_without_a_cache_name_decodes() {
+        let old = r#"{"at_unix_ms":1,"kind":{"type":"RemoteCacheHit","addr":"//a:x"}}"#;
+        let ev: BuildEvent = serde_json::from_str(old).expect("an older frame decodes");
+        let BuildEventKind::RemoteCacheHit { addr, cache } = ev.kind else {
+            panic!("not a RemoteCacheHit: {:?}", ev.kind);
+        };
+        assert_eq!(addr, "//a:x");
+        assert_eq!(cache, None);
+        let json = serde_json::to_string(&BuildEvent {
+            at_unix_ms: 1,
+            kind: BuildEventKind::RemoteCacheHit {
+                addr: "//a:x".into(),
+                cache: None,
+            },
+        })
+        .expect("encode");
+        assert!(!json.contains("cache"), "{json}");
     }
 }

@@ -456,7 +456,10 @@ mod tests {
             (
                 vec![
                     BuildEventKind::LocalCacheMiss { addr: a() },
-                    BuildEventKind::RemoteCacheHit { addr: a() },
+                    BuildEventKind::RemoteCacheHit {
+                        addr: a(),
+                        cache: None,
+                    },
                     outcome(CacheOutcomeKind::RemoteHit),
                 ],
                 Some("hit: remote"),

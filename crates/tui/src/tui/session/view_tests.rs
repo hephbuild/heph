@@ -62,6 +62,7 @@ fn result_end(addr: &str, error: Option<&str>) -> BuildEventKind {
         error: error.map(Into::into),
         upstream_of: None,
         exit_status: None,
+        exit_code: None,
         log_tail: None,
         timed_out: None,
     }
