@@ -223,6 +223,11 @@ fn no_opener() -> reference::Opener {
     }
 }
 
+/// Where a command's stderr notes go in a test that does not read them.
+fn no_note() -> Arc<dyn Fn(&str) + Send + Sync> {
+    Arc::new(|_: &str| {})
+}
+
 #[test]
 fn state_is_derived() {
     let id = SessionId::new(T0, 1);
@@ -2565,6 +2570,7 @@ async fn export_is_self_contained() {
             reference: id.encode(),
             output: Some(output),
             no_logs,
+            format: ExportFormat::Hephsession,
         };
         let file = &file;
         async move {
@@ -2576,6 +2582,7 @@ async fn export_is_self_contained() {
                 crate::engine::approval::read_notice_from_store,
                 &mut stdout,
                 &no_opener(),
+                no_note(),
             )
             .await
             .expect("export");
@@ -2792,23 +2799,31 @@ fn the_snapshot_note_is_the_viewers_caveat() {
     );
 }
 
-/// `-o` as given, `-` for stdout, else `./heph-<id>.hephsession`.
+/// `-o` as given, `-` for stdout, else `./heph-<id>.hephsession` (or
+/// `./heph-<id>.otlp.jsonl` with `--format otlp`).
 #[test]
 fn export_destination() {
     let id = SessionId::new(T0, 7);
+    let (heph, otlp) = (ExportFormat::Hephsession, ExportFormat::Otlp);
     assert_eq!(
-        export::Dest::from_arg(None, id),
+        export::Dest::from_arg(None, id, heph),
         export::Dest::File(PathBuf::from(format!("heph-{}.hephsession", id.encode())))
     );
     assert_eq!(
-        export::Dest::from_arg(Some(Path::new("-")), id),
-        export::Dest::Stdout
+        export::Dest::from_arg(None, id, otlp),
+        export::Dest::File(PathBuf::from(format!("heph-{}.otlp.jsonl", id.encode())))
     );
-    // A file named `-` is spelled `./-`.
-    assert_eq!(
-        export::Dest::from_arg(Some(Path::new("./-")), id),
-        export::Dest::File(PathBuf::from("./-"))
-    );
+    for format in [heph, otlp] {
+        assert_eq!(
+            export::Dest::from_arg(Some(Path::new("-")), id, format),
+            export::Dest::Stdout
+        );
+        // A file named `-` is spelled `./-`.
+        assert_eq!(
+            export::Dest::from_arg(Some(Path::new("./-")), id, format),
+            export::Dest::File(PathBuf::from("./-"))
+        );
+    }
 }
 
 /// `export -o PATH` replaces a file already at `PATH` with an export that
@@ -2836,10 +2851,12 @@ async fn export_o_replaces_a_file_and_wants_its_parent() {
                     reference: id.encode(),
                     output: Some(output),
                     no_logs: false,
+                    format: ExportFormat::Hephsession,
                 },
                 crate::engine::approval::read_notice_from_store,
                 &mut Vec::new(),
                 &no_opener(),
+                no_note(),
             )
             .await
         }
@@ -3039,6 +3056,7 @@ fn retention_defaults_agree() {
     );
 }
 
+mod export_otlp;
 mod list_catalog;
 mod query_cli;
 mod recipes;

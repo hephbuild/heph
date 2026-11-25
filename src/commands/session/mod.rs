@@ -131,6 +131,10 @@ pub enum SessionCommands {
     /// `--no-logs` leaves both out. A running session exports too: the file
     /// is a snapshot, and says so. Prints the path written.
     ///
+    /// `--format otlp` writes the session's spans, logs and metrics as
+    /// OTLP/JSON lines instead (one line per signal), for an OpenTelemetry
+    /// collector's `otlpjsonfile` receiver or any OTLP tool.
+    ///
     /// Examples:
     ///
     /// `heph session export 02kf5`
@@ -138,6 +142,8 @@ pub enum SessionCommands {
     /// `heph session export 48213 -o build.hephsession --no-logs`
     ///
     /// `heph session export 02kf5 -o -`
+    ///
+    /// `heph session export 02kf5 --format otlp -o -`
     Export(ExportArgs),
     /// Read-only SQL over the sessions recorded
     ///
@@ -360,12 +366,25 @@ pub struct ExportArgs {
     #[arg(value_name = "REF")]
     pub reference: String,
     /// The file to write, replaced if it exists; `-` writes to stdout.
-    /// Default: `./heph-<id>.hephsession`.
+    /// Default: `./heph-<id>.hephsession`, or `./heph-<id>.otlp.jsonl` with
+    /// `--format otlp`.
     #[arg(short = 'o', long = "output", value_name = "PATH")]
     pub output: Option<std::path::PathBuf>,
-    /// Leave out approval notice text and root-failure logs.
+    /// Leave out approval notice text and root-failure logs. Refused with
+    /// `--format otlp`, which holds neither.
     #[arg(long)]
     pub no_logs: bool,
+    /// `hephsession` (the recording, for `heph session show`/`attach`/`query`
+    /// elsewhere) or `otlp` (OTLP/JSON lines: spans, logs, metrics).
+    #[arg(long, value_enum, default_value = "hephsession")]
+    pub format: ExportFormat,
+}
+
+/// What `heph session export` writes.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExportFormat {
+    Hephsession,
+    Otlp,
 }
 
 impl SessionArgs {
@@ -494,6 +513,9 @@ fn execute(
             ))?
         }
         SessionCommands::Export(a) => {
+            let note_sink = sink.clone();
+            let note: Arc<dyn Fn(&str) + Send + Sync> =
+                Arc::new(move |line: &str| note_sink.write_diagnostic(line));
             let exported = bootstrap::block_on(export::export_ref(
                 &file,
                 opts,
@@ -501,6 +523,7 @@ fn execute(
                 crate::engine::approval::read_notice_from_store,
                 &mut stdout,
                 &opener,
+                note,
             ))??;
             if exported.snapshot {
                 sink.write_diagnostic(export::SNAPSHOT_NOTE);
