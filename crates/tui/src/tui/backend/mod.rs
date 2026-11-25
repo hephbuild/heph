@@ -1,5 +1,6 @@
 pub mod ci;
 pub mod interactive;
+mod select;
 
 use crate::tui::app::App;
 use crate::tui::session::{HolderNames, SessionSlot};

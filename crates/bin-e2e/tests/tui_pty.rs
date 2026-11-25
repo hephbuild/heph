@@ -547,10 +547,11 @@ fn paused_for_target(s: &vt100::Screen) -> bool {
     !s.alternate_screen() && count_rows(s, TARGET_OUT) > 0
 }
 
-/// The mouse is captured the way the full screens capture it: press and
-/// release reports (`?1000h`), SGR-encoded (`?1006h`).
+/// The mouse is captured the way the full screens capture it: presses,
+/// releases and motion with a button down (`?1002h`, for drag-to-copy),
+/// SGR-encoded (`?1006h`).
 fn mouse_captured(s: &vt100::Screen) -> bool {
-    s.mouse_protocol_mode() == vt100::MouseProtocolMode::PressRelease
+    s.mouse_protocol_mode() == vt100::MouseProtocolMode::ButtonMotion
         && s.mouse_protocol_encoding() == vt100::MouseProtocolEncoding::Sgr
 }
 
@@ -1523,6 +1524,52 @@ fn click_tab(pty: &common::pty::Pty, case: &str) {
     );
 }
 
+/// [`CLICKED_TAB`] as base64, the way an OSC 52 carries it.
+const CLICKED_TAB_BASE64: &str = "RG9uZQ==";
+
+/// Drag (SGR press, motion with the button down, release) across the
+/// [`CLICKED_TAB`] label: the label is highlighted while the button is down,
+/// the release puts exactly its text on the clipboard with an OSC 52, and the
+/// drag is no click (the tab is still not active; [`click_tab`] checks).
+fn drag_copy_tab(pty: &common::pty::Pty, case: &str) {
+    let found = pty.with_screen(|s| find_cell(s, CLICKED_TAB));
+    assert!(
+        found.is_some(),
+        "{case}: no {CLICKED_TAB:?} tab on the dashboard\n{}",
+        pty.screen()
+    );
+    let (row, col) = found.expect("asserted above");
+    let last = col + u16::try_from(CLICKED_TAB.len()).expect("a short label") - 1;
+    // SGR is 1-based; button 32 is the left button moving.
+    let (x0, x1, y) = (col + 1, last + 1, row + 1);
+    pty.send(format!("\x1b[<0;{x0};{y}M\x1b[<32;{x1};{y}M").as_bytes());
+    pty.wait_screen(
+        &format!("{case}: {CLICKED_TAB:?} highlighted while dragged over"),
+        DEADLINE,
+        |s| (col..=last).all(|c| s.cell(row, c).is_some_and(vt100::Cell::inverse)),
+    );
+    let osc = format!("\x1b]52;c;{CLICKED_TAB_BASE64}\x1b\\");
+    assert!(
+        !contains(&pty.output(), osc.as_bytes()),
+        "{case}: copied before the release"
+    );
+    pty.send(format!("\x1b[<0;{x1};{y}m").as_bytes());
+    let deadline = Instant::now() + DEADLINE;
+    while !contains(&pty.output(), osc.as_bytes()) {
+        assert!(
+            Instant::now() < deadline,
+            "{case}: no OSC 52 carrying {CLICKED_TAB:?} after the release\n{}",
+            pty.screen()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    pty.wait_screen(
+        &format!("{case}: the highlight gone after the release"),
+        DEADLINE,
+        |s| (col..=last).all(|c| s.cell(row, c).is_some_and(|cell| !cell.inverse())),
+    );
+}
+
 /// The line, with the mouse released.
 fn line_without_mouse(s: &vt100::Screen) -> bool {
     on_line_once(s) && no_mouse(s)
@@ -1548,11 +1595,13 @@ fn finished_dashboard_captured(s: &vt100::Screen) -> bool {
     on_finished_dashboard(s) && mouse_captured(s)
 }
 
-/// The mouse is captured only while a full screen is up: on after Tab (press
-/// and release, SGR), off on the line, after esc, while a target holds the
-/// terminal, after ctrl-c and once heph is gone. Motion tracking (`?1003h`,
-/// `?1002h`) is never asked for. `HEPH_NO_MOUSE=1` keeps it off throughout.
-/// A click on a tab label, as a terminal encodes it, makes that tab active.
+/// The mouse is captured only while a full screen is up: on after Tab
+/// (button events with motion while a button is down, SGR), off on the line,
+/// after esc, while a target holds the terminal, after ctrl-c and once heph
+/// is gone. Any-motion tracking (`?1003h`) is never asked for.
+/// `HEPH_NO_MOUSE=1` keeps it off throughout. A drag over a tab label copies
+/// its text and does not click it; a click on it, as a terminal encodes it,
+/// makes that tab active.
 #[test]
 fn mouse_capture_only_on_full_screens() {
     struct Case {
@@ -1635,22 +1684,20 @@ fn mouse_capture_only_on_full_screens() {
             )]);
             g.play(case.steps);
             if case.click {
+                drag_copy_tab(&g.pty, case.name);
                 click_tab(&g.pty, case.name);
             }
             g.play(case.rest);
             g.exit();
             assert_restored(&g.pty, case.name);
             let out = g.pty.output();
-            for motion in [&b"\x1b[?1003h"[..], b"\x1b[?1002h"] {
-                assert!(
-                    !contains(&out, motion),
-                    "{}: motion tracking {:?} was asked for",
-                    case.name,
-                    String::from_utf8_lossy(motion)
-                );
-            }
+            assert!(
+                !contains(&out, b"\x1b[?1003h"),
+                "{}: any-motion tracking was asked for",
+                case.name
+            );
             assert_eq!(
-                contains(&out, b"\x1b[?1000h"),
+                contains(&out, b"\x1b[?1002h"),
                 case.mouse,
                 "{}: whether the mouse was ever captured",
                 case.name

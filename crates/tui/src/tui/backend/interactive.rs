@@ -15,13 +15,14 @@ use crossterm::terminal::{
 use futures::StreamExt;
 use ratatui::backend::{Backend, ClearType};
 use ratatui::buffer::Buffer;
-use ratatui::layout::Position;
+use ratatui::layout::{Position, Rect};
 use ratatui::prelude::Widget;
-use ratatui::text::Text;
+use ratatui::text::{Line, Text};
 use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::{Terminal, TerminalOptions, Viewport};
 use tokio::sync::mpsc;
 
+use super::select::{At, Drag, Release};
 use crate::tui::app::{App, AppContext, Control, Decide, MouseInput, ScreenKey, TUIAppView};
 use crate::tui::log_sink::{LogSink, REPLAY_FLUSH_TIMEOUT, ReplayMark, Replayed, SinkLine};
 use crate::tui::session::recorder::ViewTap;
@@ -57,9 +58,11 @@ const LEAVE_ALT_SCREEN: &[u8] = b"\x1b[?1049l";
 /// at worst one extra "off", never a capture left on.
 static MOUSE_UP: AtomicBool = AtomicBool::new(false);
 
-/// Button presses (1000) reported in SGR encoding (1006). Not crossterm's
-/// `EnableMouseCapture`, which also turns on any-motion reporting (1003): an
-/// event for every cell the pointer crosses.
+/// Button presses, and motion while a button is down (1002), reported in SGR
+/// encoding (1006): the motion is what a drag selects with (see
+/// [`super::select`]). Not crossterm's `EnableMouseCapture`, which also turns
+/// on any-motion reporting (1003): an event for every cell the pointer
+/// crosses, button or not.
 ///
 /// Then alternate scroll (1007) off: a terminal with it on turns the wheel
 /// into ↑/↓ on the alternate screen, which would move the selection instead
@@ -70,9 +73,11 @@ static MOUSE_UP: AtomicBool = AtomicBool::new(false);
 /// screen, so leaving it off changes nothing on the main screen; the cost
 /// is a later full-screen program without mouse reporting (`less`) whose
 /// wheel no longer scrolls in a terminal that had 1007 on.
-const MOUSE_ON: &[u8] = b"\x1b[?1000h\x1b[?1006h\x1b[?1007l";
-/// Both capture modes off; also what the hard abort writes.
-const MOUSE_OFF: &[u8] = b"\x1b[?1000l\x1b[?1006l";
+const MOUSE_ON: &[u8] = b"\x1b[?1002h\x1b[?1006h\x1b[?1007l";
+/// Every capture mode off (1000 too, which heph no longer turns on: a
+/// terminal that keeps the two apart has nothing left on); also what the
+/// hard abort writes.
+const MOUSE_OFF: &[u8] = b"\x1b[?1002l\x1b[?1000l\x1b[?1006l";
 
 /// Whether the full screens capture the mouse: yes, unless `HEPH_NO_MOUSE`
 /// is set to anything but `0` or nothing. No config key (spec decision).
@@ -104,6 +109,9 @@ struct FullScreen {
     /// The terminal was resized since the last draw: the next one repaints
     /// every cell, not only the ones that changed. See [`FullScreen::draw`].
     resized: bool,
+    /// A left press held down: the frame it froze, drawn in place of the
+    /// view's until the release (see [`super::select`]).
+    drag: Option<Drag>,
 }
 
 impl FullScreen {
@@ -126,6 +134,7 @@ impl FullScreen {
         let screen = Self {
             terminal,
             resized: false,
+            drag: None,
         };
         crossterm::execute!(io::stderr(), EnterAlternateScreen)
             .context("entering the alternate screen")?;
@@ -148,12 +157,75 @@ impl FullScreen {
     /// size clears the screen and drops ratatui's idea of what is on it;
     /// unlike `clear`, it sends no cursor query, which must not race the
     /// input stream.
-    fn draw(&mut self, frame: impl FnOnce(&mut ratatui::Frame<'_>)) -> io::Result<()> {
+    ///
+    /// `lines` is the view's frame for the area. While a drag is under way
+    /// it is not asked: the frozen frame is drawn instead, with the
+    /// selection on it. A resize ends the drag, since the frame it froze no
+    /// longer fits.
+    fn draw(&mut self, lines: impl FnOnce(Rect) -> Vec<Line<'static>>) -> io::Result<()> {
+        if std::mem::take(&mut self.resized) {
+            self.drag = None;
+            let size = self.terminal.size()?;
+            self.terminal.resize(size.into())?;
+        }
+        let mut misfit = false;
+        let drag = self.drag.as_ref();
+        self.terminal.draw(|fr| {
+            let area = fr.area();
+            match drag {
+                Some(d) if d.fits(area) => d.paint(fr.buffer_mut()),
+                _ => {
+                    misfit = drag.is_some();
+                    fr.render_widget(Paragraph::new(Text::from(lines(area))), area);
+                }
+            }
+        })?;
+        if misfit {
+            self.drag = None;
+        }
+        Ok(())
+    }
+
+    /// A left press at `at`: draw the view's frame now and freeze it, so the
+    /// drag that may follow selects from what is on screen.
+    fn press(&mut self, at: At, lines: impl FnOnce(Rect) -> Vec<Line<'static>>) -> io::Result<()> {
+        self.drag = None;
         if std::mem::take(&mut self.resized) {
             let size = self.terminal.size()?;
             self.terminal.resize(size.into())?;
         }
-        self.terminal.draw(frame).map(drop)
+        let done = self.terminal.draw(|fr| {
+            let area = fr.area();
+            fr.render_widget(Paragraph::new(Text::from(lines(area))), area);
+        })?;
+        self.drag = Some(Drag::new(done.buffer.clone(), at));
+        Ok(())
+    }
+
+    /// The pointer moved to `at` with the button down: redraw the selection
+    /// at once rather than on the next tick. The view is not asked for a
+    /// frame: a drag that no longer fits the screen ends, drawing nothing,
+    /// and the next tick draws the view.
+    fn drag_to(&mut self, at: At) -> io::Result<()> {
+        let Some(d) = self.drag.as_mut() else {
+            return Ok(());
+        };
+        if !d.extend(at) {
+            return Ok(());
+        }
+        let area = Rect::from((Position::ORIGIN, self.terminal.size()?));
+        if self.resized || !d.fits(area) {
+            self.drag = None;
+            return Ok(());
+        }
+        self.draw(|_| Vec::new())
+    }
+
+    /// The button came up at `at`; `None` when no press was held (it went
+    /// down before the screen was up, or a key or the wheel ended the drag).
+    /// The next draw is the view's again.
+    fn release(&mut self, at: At) -> Option<Release> {
+        self.drag.take().map(|d| d.release(at))
     }
 }
 
@@ -530,6 +602,13 @@ pub async fn run<A: App + 'static>(
                 {
                     view.disarm_stop();
                 }
+                // A key ends a drag without copying: the key acts on the
+                // view, which the frozen frame would otherwise hide.
+                if let Some(Ok(Event::Key(_))) = &maybe_evt
+                    && let Some(f) = full.as_mut()
+                {
+                    f.drag = None;
+                }
                 match maybe_evt {
                     Some(Ok(ev)) if stop_arm::is_ctrl_c(&ev) => {
                         // On a full screen the first press only arms; the
@@ -690,9 +769,9 @@ pub async fn run<A: App + 'static>(
                     // The mouse, captured only while a full screen is up: a
                     // report still in flight as it closed lands here with
                     // the line up, and is dropped.
-                    Some(Ok(Event::Mouse(m))) if full.is_some() => {
-                        if let Some(input) = mouse_input(m) {
-                            view.mouse(input);
+                    Some(Ok(Event::Mouse(m))) => {
+                        if let Some(f) = full.as_mut() {
+                            on_mouse(f, &mut view, m);
                         }
                     }
                     Some(Ok(Event::Resize(w, h))) => {
@@ -831,11 +910,7 @@ pub async fn run<A: App + 'static>(
                     // the ioctl as it draws, and repaints every cell after
                     // a resize.
                     let now = now_unix_ms();
-                    drop(f.draw(|fr| {
-                        let area = fr.area();
-                        let lines = view.render_full(now, area.width, area.height);
-                        fr.render_widget(Paragraph::new(Text::from(lines)), area);
-                    }));
+                    drop(f.draw(|area| view.render_full(now, area.width, area.height)));
                     // Under the held dashboard, once it has been up a while
                     // (so a test sees it before the panic takes it down).
                     if debug_panic == Some(DebugPanic::Backend)
@@ -960,27 +1035,58 @@ pub async fn run<A: App + 'static>(
     result
 }
 
-/// What a captured mouse event means to a full screen: a left press or a
-/// wheel step. Releases (mode 1000 reports them), other buttons and
-/// modified presses mean nothing.
-fn mouse_input(m: MouseEvent) -> Option<MouseInput> {
+/// A captured mouse event on the full screen `f`. A left press freezes the
+/// frame; a drag selects on it; the release copies the selection, or is a
+/// click when there was no drag. A wheel step ends a drag and scrolls.
+/// Other buttons and modified presses mean nothing.
+fn on_mouse(f: &mut FullScreen, view: &mut impl TUIAppView, m: MouseEvent) {
     let (col, row) = (m.column, m.row);
     match m.kind {
         MouseEventKind::Down(MouseButton::Left) if m.modifiers.is_empty() => {
-            Some(MouseInput::Click { col, row })
+            let now = now_unix_ms();
+            if let Err(e) = f.press((col, row), |area| {
+                view.render_full(now, area.width, area.height)
+            }) {
+                tracing::debug!(error = %e, "freezing the frame for a selection");
+            }
         }
-        MouseEventKind::ScrollUp => Some(MouseInput::Wheel {
-            col,
-            row,
-            down: false,
-        }),
-        MouseEventKind::ScrollDown => Some(MouseInput::Wheel {
-            col,
-            row,
-            down: true,
-        }),
-        _ => None,
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if let Err(e) = f.drag_to((col, row)) {
+                tracing::debug!(error = %e, "drawing the selection");
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => match f.release((col, row)) {
+            Some(Release::Click { col, row }) => view.mouse(MouseInput::Click { col, row }),
+            Some(Release::Copy(text)) => {
+                if let Err(e) = copy_to_clipboard(&text) {
+                    tracing::debug!(error = %e, "copying the selection");
+                }
+            }
+            Some(Release::Nothing) | None => {}
+        },
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            f.drag = None;
+            view.mouse(MouseInput::Wheel {
+                col,
+                row,
+                down: m.kind == MouseEventKind::ScrollDown,
+            });
+        }
+        _ => {}
     }
+}
+
+/// Put `text` on the system clipboard through the terminal: an OSC 52
+/// ("set the clipboard selection to this base64"). The terminal decides
+/// whether to honour it; one that does not (or a multiplexer not set to
+/// pass it on, as tmux's `set-clipboard` default) drops it, and nothing
+/// says so — heph cannot learn the outcome without a query racing the
+/// input stream.
+fn copy_to_clipboard(text: &str) -> io::Result<()> {
+    crossterm::execute!(
+        io::stderr(),
+        crossterm::clipboard::CopyToClipboard::to_clipboard_from(text)
+    )
 }
 
 /// The decision `key` asks for: `y`/`n`/`Y`/`N` pressed (without ctrl)

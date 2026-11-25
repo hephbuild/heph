@@ -264,10 +264,12 @@ impl Decide {
 }
 
 /// A mouse event on a full screen, at a cell of the last frame drawn
-/// (column, row; 0-based). Only presses and the wheel are captured.
+/// (column, row; 0-based). A drag never reaches the view: the backend
+/// selects with it and copies the selection on release.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MouseInput {
-    /// The left button went down.
+    /// The left button went down and came back up there, with no drag in
+    /// between. Delivered at the release.
     Click { col: u16, row: u16 },
     /// One wheel step, `down` (towards the end) or up.
     Wheel { col: u16, row: u16, down: bool },
