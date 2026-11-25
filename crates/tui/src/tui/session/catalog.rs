@@ -56,6 +56,12 @@ pub const CAP: u64 = 1024 * 1024 * 1024;
 pub const HEAL_RETRY: Duration = Duration::from_secs(DAY_S);
 /// How long a command waits for `catalog.lock` (a repair elsewhere).
 const LOCK_WAIT: Duration = Duration::from_secs(5);
+/// Pages one cleanup `incremental_vacuum` gives back (4 MiB at 4 KiB
+/// pages): one short write transaction, not the whole freelist in one.
+const VACUUM_STEP: u32 = 1024;
+/// Cleanup's pause between two of its write transactions: longer than an
+/// owner's busy-handler poll, so an owner waiting on the catalog gets in.
+const CLEAN_YIELD: Duration = Duration::from_millis(10);
 const DAY_S: u64 = 24 * 60 * 60;
 const DAY_MS: u64 = DAY_S * 1000;
 
@@ -409,6 +415,10 @@ fn ensure_schema(conn: &Connection, in_memory: bool) -> Result<(), Unusable> {
         return Ok(());
     }
     if !in_memory {
+        // Before the first table, and before WAL mode, which writes the
+        // header and leaves `auto_vacuum` at NONE: a cap enforced by deleting
+        // rows must be able to give the pages back.
+        conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
         let mode: String =
             conn.pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get(0))?;
         if !mode.eq_ignore_ascii_case("wal") {
@@ -417,9 +427,6 @@ fn ensure_schema(conn: &Connection, in_memory: bool) -> Result<(), Unusable> {
                 Some(format!("the catalog's filesystem refused WAL ({mode})")),
             )));
         }
-        // Before the first table: a cap enforced by deleting rows must be
-        // able to give the pages back.
-        conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
     }
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let made = (|| -> Result<(), Unusable> {
@@ -1055,6 +1062,17 @@ pub fn clean(root: &Path, now: SystemTime) -> anyhow::Result<CleanReport> {
 }
 
 pub(crate) fn clean_with(root: &Path, now: SystemTime, cap: u64) -> anyhow::Result<CleanReport> {
+    clean_between(root, now, cap, &mut || std::thread::sleep(CLEAN_YIELD))
+}
+
+/// [`clean_with`], calling `between` after each of its write transactions,
+/// with none open: where an owner waiting on the catalog gets in.
+pub(crate) fn clean_between(
+    root: &Path,
+    now: SystemTime,
+    cap: u64,
+    between: &mut dyn FnMut(),
+) -> anyhow::Result<CleanReport> {
     let now_ms = u64::try_from(
         now.duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -1084,14 +1102,51 @@ pub(crate) fn clean_with(root: &Path, now: SystemTime, cap: u64) -> anyhow::Resu
     let cutoff = i64::try_from(now_ms.saturating_sub(keep_ms)).unwrap_or(i64::MAX);
     report.expired = delete_sessions(&conn, "started_ms < ?1", [cutoff])
         .context("deleting expired catalog rows")?;
-    let (rows, sessions) = enforce_cap(&conn, cap).context("capping the session catalog")?;
+    if report.expired > 0 {
+        between();
+    }
+    let (rows, sessions) =
+        enforce_cap(&conn, cap, between).context("capping the session catalog")?;
     report.capped_rows = rows;
     report.capped_sessions = sessions;
+    if report.expired + sessions > 0 {
+        // Once, not per session deleted: a scan of every target row.
+        conn.execute_batch("DELETE FROM addrs WHERE id NOT IN (SELECT addr_id FROM target_rows)")
+            .context("pruning the catalog's addresses")?;
+        between();
+    }
+    if report.expired + rows + sessions > 0 {
+        vacuum(&conn, between).context("giving the catalog's free pages back")?;
+    }
     Ok(report)
 }
 
-/// Delete the sessions `filter` selects, every row of theirs, and the
-/// addresses no target row uses any more, in one transaction.
+/// Give the free pages back [`VACUUM_STEP`] at a time, each step its own
+/// transaction, calling `between` after each.
+fn vacuum(conn: &Connection, between: &mut dyn FnMut()) -> rusqlite::Result<()> {
+    let free = || conn.pragma_query_value(None, "freelist_count", |r| r.get::<_, i64>(0));
+    let mut left = free()?;
+    let mut step = conn.prepare(&format!("PRAGMA incremental_vacuum({VACUUM_STEP})"))?;
+    while left > 0 {
+        // Each step of the statement gives one page back: run it to its
+        // end (`execute_batch` would step it once).
+        let mut pages = step.query([])?;
+        while pages.next()?.is_some() {}
+        drop(pages);
+        between();
+        let now = free()?;
+        if now >= left {
+            // Not an incremental catalog: nothing more to give back.
+            break;
+        }
+        left = now;
+    }
+    Ok(())
+}
+
+/// Delete the sessions `filter` selects and every row of theirs, in one
+/// transaction. The addresses they leave unused stay for the caller to
+/// prune once.
 fn delete_sessions(
     conn: &Connection,
     filter: &str,
@@ -1115,8 +1170,7 @@ fn delete_sessions(
                  DELETE FROM span_events WHERE session_id IN (SELECT session_id FROM temp.gone);
                  DELETE FROM metrics WHERE session_id IN (SELECT session_id FROM temp.gone);
                  DELETE FROM heal_failures WHERE session_id IN (SELECT session_id FROM temp.gone);
-                 DELETE FROM sessions WHERE sid IN (SELECT sid FROM temp.gone);
-                 DELETE FROM addrs WHERE id NOT IN (SELECT addr_id FROM target_rows);",
+                 DELETE FROM sessions WHERE sid IN (SELECT sid FROM temp.gone);",
             )?;
         }
         conn.execute_batch("DROP TABLE temp.gone")?;
@@ -1142,8 +1196,13 @@ fn used_bytes(conn: &Connection) -> rusqlite::Result<u64> {
 
 /// Past `cap`: drop the span and metric rows of the oldest sessions first,
 /// keeping `sessions` and `targets`, then whole sessions by age. Returns how
-/// many sessions lost their explorer rows, and how many went whole.
-fn enforce_cap(conn: &Connection, cap: u64) -> rusqlite::Result<(usize, usize)> {
+/// many sessions lost their explorer rows, and how many went whole. One
+/// transaction per session, `between` after each.
+fn enforce_cap(
+    conn: &Connection,
+    cap: u64,
+    between: &mut dyn FnMut(),
+) -> rusqlite::Result<(usize, usize)> {
     let (mut rows, mut whole) = (0, 0);
     while used_bytes(conn)? > cap {
         let oldest: Option<String> = conn
@@ -1172,6 +1231,7 @@ fn enforce_cap(conn: &Connection, cap: u64) -> rusqlite::Result<(usize, usize)> 
                 }
             }
             conn.execute_batch("COMMIT")?;
+            between();
             rows += 1;
             continue;
         }
@@ -1180,13 +1240,11 @@ fn enforce_cap(conn: &Connection, cap: u64) -> rusqlite::Result<(usize, usize)> 
             "sid = (SELECT sid FROM sessions ORDER BY started_ms LIMIT 1)",
             [],
         )?;
+        between();
         if gone == 0 {
             break;
         }
         whole += gone;
-    }
-    if rows + whole > 0 {
-        conn.execute_batch("PRAGMA incremental_vacuum")?;
     }
     Ok((rows, whole))
 }

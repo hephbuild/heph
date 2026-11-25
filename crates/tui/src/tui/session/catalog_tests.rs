@@ -1034,6 +1034,84 @@ fn catalog_targets_fit_the_cap() {
     assert_eq!(count(&read(root), "SELECT count(*) FROM sessions"), 0);
 }
 
+/// Cleanup holds no write transaction between its steps, and gives the
+/// free pages back a step at a time: an owner that comes in between two
+/// lands its write within its bound.
+#[test]
+fn cleanup_yields_to_a_waiting_owner() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    let first = sealed(root, recent_id(1, 2_000));
+    catalog::record_seal(root, &first, true);
+    {
+        let conn = Connection::open(root.join(catalog::FILE)).expect("open");
+        for s in 0..4 {
+            conn.execute(
+                "INSERT INTO sessions (session_id, started_ms, recorded, complete, derivation)
+                 VALUES (?1, ?2, 1, 1, 1)",
+                rusqlite::params![
+                    format!("synthetic-{s}"),
+                    i64::try_from(now_ms() - 10_000 + s).expect("ms")
+                ],
+            )
+            .expect("session");
+            // ~3 MiB of explorer rows each.
+            conn.execute(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 3000)
+                 INSERT INTO spans (session_id, span_id, name, attributes)
+                 SELECT ?1, i, 'heph.result', hex(randomblob(512)) FROM n",
+                [format!("synthetic-{s}")],
+            )
+            .expect("spans");
+        }
+    }
+    let owner = sealed(root, recent_id(2, 1_000));
+    let owner_id = owner
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("id")
+        .to_owned();
+    let watch = read(root);
+    let free = |c: &Connection| count(c, "PRAGMA freelist_count");
+    let (mut calls, mut landed, mut shrinking, mut last_free) = (0, None, 0, i64::MAX);
+    let report = catalog::clean_between(root, SystemTime::now(), 0, &mut || {
+        calls += 1;
+        if calls == 1 {
+            let started = Instant::now();
+            catalog::record_seal_within(root, &owner, true, Duration::from_millis(500));
+            landed = Some((
+                count(
+                    &watch,
+                    &format!(
+                        "SELECT count(*) FROM sessions WHERE session_id = '{owner_id}' AND complete = 1"
+                    ),
+                ),
+                started.elapsed(),
+            ));
+        }
+        let now = free(&watch);
+        if now > 0 && now < last_free {
+            shrinking += 1;
+        }
+        last_free = now;
+    })
+    .expect("clean");
+    let (rows, took) = landed.expect("cleanup paused at least once");
+    assert_eq!(rows, 1, "the owner's write landed between two steps");
+    assert!(took < Duration::from_millis(500), "{took:?}");
+    assert!(report.capped_rows >= 4, "{report:?}");
+    assert!(
+        shrinking >= 2,
+        "the free pages went back in steps, a pause between two: {shrinking}"
+    );
+    assert_eq!(free(&watch), 0, "every free page given back");
+    assert_eq!(
+        count(&watch, "PRAGMA auto_vacuum"),
+        2,
+        "the catalog is made incremental"
+    );
+}
+
 /// `an_older_derivation_is_rederived_on_open`, the command's half (I4,
 /// D14): the first read of explorer rows re-derives the recording, says so
 /// once on stderr, and replaces its catalog rows; a second read does no
