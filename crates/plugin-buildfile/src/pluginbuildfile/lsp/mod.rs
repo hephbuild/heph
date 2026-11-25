@@ -148,8 +148,8 @@ impl typed::MemberHost for CliHost<'_> {
 /// It runs without an engine, so the registry never lands: a member answer
 /// says `registry: pending`, and the resolution carries a
 /// `explain_without_registry` degradation, because the editor's answer at the
-/// same position can differ (a driver's `Kwargs` parameter lists its fields
-/// there, not here).
+/// same position can differ (a driver's `Kwargs` parameter lists the dict
+/// members the checker accepts there, and nothing here).
 pub fn explain_in(
     target: &str,
     json: bool,
