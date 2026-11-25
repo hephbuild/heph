@@ -187,6 +187,11 @@ fn rollback(conn: &Connection) {
     }
 }
 
+/// Every catalog table is named `main.`: the recording attached as `rec`
+/// has views of the same names, and a connection whose schema is stale (it
+/// read the catalog empty before another one made it) resolves a bare name
+/// into `rec`. A qualified name that is not found instead makes SQLite
+/// reload the schema and prepare again.
 fn copy_attached(conn: &Connection, copy: Rows) -> rusqlite::Result<()> {
     let columns = SESSION_COLUMNS.join(", ");
     conn.execute_batch("BEGIN IMMEDIATE")?;
@@ -194,7 +199,7 @@ fn copy_attached(conn: &Connection, copy: Rows) -> rusqlite::Result<()> {
         Rows::Start => {
             conn.execute(
                 &format!(
-                    "INSERT INTO sessions ({columns}) {SESSION_SELECT} ON CONFLICT(session_id) DO NOTHING"
+                    "INSERT INTO main.sessions ({columns}) {SESSION_SELECT} ON CONFLICT(session_id) DO NOTHING"
                 ),
                 params![1, 0],
             )?;
@@ -208,51 +213,57 @@ fn copy_attached(conn: &Connection, copy: Rows) -> rusqlite::Result<()> {
                 .join(", ");
             conn.execute(
                 &format!(
-                    "INSERT INTO sessions ({columns}) {SESSION_SELECT} ON CONFLICT(session_id) DO UPDATE SET {set}"
+                    "INSERT INTO main.sessions ({columns}) {SESSION_SELECT} ON CONFLICT(session_id) DO UPDATE SET {set}"
                 ),
                 params![i64::from(recorded), 1],
             )?;
             let (sid, id): (i64, String) = conn.query_row(
-                "SELECT sid, session_id FROM sessions WHERE session_id = (SELECT id FROM rec.session)",
+                "SELECT sid, session_id FROM main.sessions WHERE session_id = (SELECT id FROM rec.session)",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?;
-            conn.execute("DELETE FROM target_rows WHERE sid = ?1", [sid])?;
+            conn.execute("DELETE FROM main.target_rows WHERE sid = ?1", [sid])?;
             conn.execute_batch(&format!(
-                "INSERT OR IGNORE INTO addrs (addr) SELECT addr FROM ({REC_TARGETS})"
+                "INSERT OR IGNORE INTO main.addrs (addr) SELECT addr FROM ({REC_TARGETS})"
             ))?;
             conn.execute(
                 &format!(
-                    "INSERT INTO target_rows (sid, addr_id, outcome, duration_us)
+                    "INSERT INTO main.target_rows (sid, addr_id, outcome, duration_us)
                      SELECT ?1, a.id, CASE t.outcome WHEN 'hit' THEN 0 WHEN 'ran' THEN 1
                        WHEN 'failed' THEN 2 WHEN 'cancelled' THEN 3 ELSE t.outcome END,
                        t.duration_us
-                     FROM ({REC_TARGETS}) t JOIN addrs a ON a.addr = t.addr"
+                     FROM ({REC_TARGETS}) t JOIN main.addrs a ON a.addr = t.addr"
                 ),
                 [sid],
             )?;
             for table in ["spans", "span_events", "metrics"] {
-                conn.execute(&format!("DELETE FROM {table} WHERE session_id = ?1"), [&id])?;
+                conn.execute(
+                    &format!("DELETE FROM main.{table} WHERE session_id = ?1"),
+                    [&id],
+                )?;
             }
             if recorded {
                 conn.execute_batch(&format!(
-                    "INSERT INTO spans SELECT session_id, span_id, parent_span_id, name, class,
+                    "INSERT INTO main.spans SELECT session_id, span_id, parent_span_id, name, class,
                        addr, driver, outcome, start_us, end_us, duration_us, status, attributes
                      FROM rec.spans WHERE addr IS NULL OR span_id IN ({RAN_RESULTS})
                        OR parent_span_id IN ({RAN_RESULTS})"
                 ))?;
                 conn.execute(
-                    "INSERT INTO span_events SELECT session_id, span_id, name, time_us, attributes
+                    "INSERT INTO main.span_events SELECT session_id, span_id, name, time_us, attributes
                      FROM rec.span_events
                      WHERE span_id IN (SELECT span_id FROM main.spans WHERE session_id = ?1)",
                     [&id],
                 )?;
                 conn.execute_batch(
-                    "INSERT INTO metrics SELECT session_id, name, kind, unit, time_us, value,
+                    "INSERT INTO main.metrics SELECT session_id, name, kind, unit, time_us, value,
                        attributes FROM rec.metrics",
                 )?;
             }
-            conn.execute("DELETE FROM heal_failures WHERE session_id = ?1", [&id])?;
+            conn.execute(
+                "DELETE FROM main.heal_failures WHERE session_id = ?1",
+                [&id],
+            )?;
         }
     }
     conn.execute_batch("COMMIT")
@@ -1136,4 +1147,40 @@ fn sweep_corrupt(root: &Path, now_ms: u64) -> usize {
 /// directory beside it) when it is missing, user-only.
 pub(crate) fn ensure_root(root: &Path) -> io::Result<()> {
     DirBuilder::new().recursive(true).mode(0o700).create(root)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The owner's seal write lands on a catalog its start thread made while
+    /// the seal's connection still held it as empty: a short build's start
+    /// and seal race on a new catalog. Without `main.`, the stale schema
+    /// resolved `sessions` into the attached recording's `sessions` view and
+    /// the seal was dropped ("cannot modify sessions because it is a view").
+    #[test]
+    fn a_seal_on_a_catalog_made_meanwhile_lands() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let id = SessionId::new(1_700_000_000_000, 1);
+        let dir = super::super::catalog_tests::sealed(root, id);
+        let stale = open_rw(root, true).expect("open");
+        let tables: i64 = stale
+            .query_row("SELECT count(*) FROM sqlite_schema", [], |r| r.get(0))
+            .expect("schema");
+        assert_eq!(tables, 0, "the seal's connection caches an empty schema");
+        record_start(root, &dir);
+        ensure_schema(&stale, false).expect("made meanwhile");
+        copy_session(
+            &stale,
+            &dir.join(store::FILE),
+            false,
+            Rows::Full { recorded: true },
+        )
+        .expect("the seal write lands");
+        let complete: i64 = stale
+            .query_row("SELECT complete FROM main.sessions", [], |r| r.get(0))
+            .expect("the session's row");
+        assert_eq!(complete, 1);
+    }
 }

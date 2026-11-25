@@ -63,7 +63,7 @@ fn build_events() -> Vec<BuildEvent> {
 }
 
 /// A sealed recording of [`build_events`] under `root`, ended `ended_ms`.
-fn sealed(root: &Path, id: SessionId) -> PathBuf {
+pub(super) fn sealed(root: &Path, id: SessionId) -> PathBuf {
     let dir = root.join(id.encode());
     std::fs::create_dir_all(&dir).expect("mkdir");
     std::fs::write(dir.join(files::LOCK), b"").expect("lock file");
@@ -580,8 +580,10 @@ fn a_build_never_repairs() {
     .expect("open");
     session.finish(Some(0), false);
     let conn = read(root);
+    // `complete = 1`: the seal's own row, which a late start row never
+    // stands in for.
     let ids: Vec<String> = conn
-        .prepare("SELECT session_id FROM sessions")
+        .prepare("SELECT session_id FROM sessions WHERE complete = 1")
         .expect("prepare")
         .query_map([], |r| r.get(0))
         .expect("query")
