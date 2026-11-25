@@ -29,60 +29,70 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// `heph.core` host/platform namespace, plus a dynamic `heph.<provider>.<fn>`
 /// namespace for every function the providers expose. Built once per
 /// buildfile-provider lifetime (the registry is fixed after the engine injects it).
-/// One `heph.core.<fn>` builtin, for LSP member completion/hover: bare name, a
-/// one-line signature for the completion detail, and the full rendered doc.
-pub(crate) struct CoreMember {
+/// One member of a namespace in the globals (`typing.Any`, `heph.core.os`),
+/// for LSP member completion/hover: bare name, a one-line signature for the
+/// completion detail, and the full rendered doc.
+#[derive(Debug, Clone)]
+pub(crate) struct NamespaceMember {
     pub name: String,
     pub detail: String,
     pub doc: String,
 }
 
-/// Enumerate the `heph.core` namespace's functions from the globals doc. These
-/// are static `#[starlark_module]` builtins (not provider-registry functions),
-/// so the proxy can't get them from the registry — it reads this list instead.
-pub(crate) fn heph_core_members(globals_doc: &starlark::docs::DocModule) -> Vec<CoreMember> {
+/// Every namespace in the globals doc, keyed by its dotted path (`typing`,
+/// `heph`, `heph.core`), each with its members. A namespace's members are
+/// static (`heph.core`'s are `#[starlark_module]` builtins, not registry
+/// functions), so the LSP reads them here rather than from the registry.
+pub(crate) fn namespace_members(
+    globals_doc: &starlark::docs::DocModule,
+) -> HashMap<String, Vec<NamespaceMember>> {
+    use starlark::docs::DocModule;
     use starlark::docs::markdown::render_doc_item_no_link;
     use starlark::docs::{DocItem, DocMember};
 
-    // Navigate `heph` → `core`; both are namespaces (nested `DocModule`s).
-    let nested = |item: &DocItem, key: &str| -> Option<DocItem> {
-        match item {
-            DocItem::Module(m) => m.members.get(key).cloned(),
-            _ => None,
-        }
-    };
-    let Some(heph) = globals_doc.members.get("heph") else {
-        return vec![];
-    };
-    let core = match nested(heph, "core") {
-        Some(DocItem::Module(m)) => m.members,
-        _ => return vec![],
-    };
-
-    core.iter()
-        .map(|(name, item)| {
-            let detail = match item {
-                DocItem::Member(DocMember::Function(f)) => {
-                    let params = f
-                        .params
-                        .pos_only
-                        .iter()
-                        .chain(f.params.pos_or_named.iter())
-                        .chain(f.params.named_only.iter())
-                        .map(|p| format!("{}: {}", p.name, p.typ))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    format!("{name}({params}) -> {}", f.ret.typ)
+    fn walk(path: String, module: &DocModule, out: &mut HashMap<String, Vec<NamespaceMember>>) {
+        let members = module
+            .members
+            .iter()
+            .map(|(name, item)| {
+                let detail = match item {
+                    DocItem::Member(DocMember::Function(f)) => {
+                        let params = f
+                            .params
+                            .pos_only
+                            .iter()
+                            .chain(f.params.pos_or_named.iter())
+                            .chain(f.params.named_only.iter())
+                            .map(|p| format!("{}: {}", p.name, p.typ))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!("{name}({params}) -> {}", f.ret.typ)
+                    }
+                    DocItem::Module(_) => "namespace".to_string(),
+                    _ => String::new(),
+                };
+                NamespaceMember {
+                    name: name.clone(),
+                    detail,
+                    doc: render_doc_item_no_link(name, item),
                 }
-                _ => String::new(),
-            };
-            CoreMember {
-                name: name.clone(),
-                detail,
-                doc: render_doc_item_no_link(name, item),
+            })
+            .collect();
+        for (name, item) in &module.members {
+            if let DocItem::Module(m) = item {
+                walk(format!("{path}.{name}"), m, out);
             }
-        })
-        .collect()
+        }
+        out.insert(path, members);
+    }
+
+    let mut out = HashMap::new();
+    for (name, item) in &globals_doc.members {
+        if let DocItem::Module(m) = item {
+            walk(name.clone(), m, &mut out);
+        }
+    }
+    out
 }
 
 /// Hover markdown for the `target` and `provider_state` builtins, rendered on

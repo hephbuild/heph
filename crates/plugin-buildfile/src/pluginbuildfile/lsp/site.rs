@@ -237,6 +237,16 @@ pub(crate) enum Site {
         edit: Range<usize>,
         prefix: String,
     },
+    /// Any other member position, right after a `.`: `typing.│`,
+    /// `heph.core.os.│`, `l.na│`, `f().│`. `path` is the receiver when it is
+    /// a chain of identifiers whose root is a global the file does not rebind
+    /// (`["typing"]`), and `None` otherwise: a local value, a call, a literal,
+    /// whose members nothing here knows.
+    Member {
+        path: Option<Vec<String>>,
+        edit: Range<usize>,
+        prefix: String,
+    },
     /// A `//pkg:name` or `:name` string.
     Address {
         value: Str,
@@ -265,6 +275,7 @@ impl Site {
             Site::ArgKey { .. } => "arg_key",
             Site::PluginNamespace { .. } => "plugin_namespace",
             Site::PluginMember { .. } => "plugin_member",
+            Site::Member { .. } => "member",
             Site::Address { .. } => "address",
             Site::LoadPath { .. } => "load_path",
             Site::LoadSymbol { .. } => "load_symbol",
@@ -307,7 +318,8 @@ impl Site {
             | Site::StateKey { prefix, .. }
             | Site::ArgKey { prefix, .. }
             | Site::PluginNamespace { prefix, .. }
-            | Site::PluginMember { prefix, .. } => Some(prefix),
+            | Site::PluginMember { prefix, .. }
+            | Site::Member { prefix, .. } => Some(prefix),
         }
     }
 
@@ -357,7 +369,8 @@ impl Site {
             | Site::StateKey { edit, .. }
             | Site::ArgKey { edit, .. }
             | Site::PluginNamespace { edit, .. }
-            | Site::PluginMember { edit, .. } => Some(edit),
+            | Site::PluginMember { edit, .. }
+            | Site::Member { edit, .. } => Some(edit),
             _ => None,
         };
         if let (Some(edit), Some(map)) = (word, out.as_object_mut()) {
@@ -1078,10 +1091,40 @@ fn dotted_site(
     if dot_tok.kind != Kind::Dot || dot_tok.end as usize != member_start {
         return None;
     }
-    // Walk left over `ident .` pairs.
+    let receiver = ident_chain(doc, dot);
+    Some(match receiver.as_deref() {
+        Some(["heph"]) => Site::PluginNamespace {
+            edit: edit.clone(),
+            prefix: prefix.to_string(),
+        },
+        // A driver's `Kwargs` nests one namespace per segment of its name.
+        Some(["heph", plugin, path @ ..]) if path.is_empty() || *plugin == "types" => {
+            Site::PluginMember {
+                plugin: (*plugin).to_string(),
+                path: path.iter().map(|s| (*s).to_string()).collect(),
+                edit: edit.clone(),
+                prefix: prefix.to_string(),
+            }
+        }
+        // A root the file binds itself (assigned, loaded, a parameter) is not
+        // the global of that name, whatever it holds.
+        _ => Site::Member {
+            path: receiver
+                .filter(|segs| segs.first().is_some_and(|r| !is_rebound(doc.overlay, r)))
+                .map(|segs| segs.iter().map(|s| (*s).to_string()).collect()),
+            edit: edit.clone(),
+            prefix: prefix.to_string(),
+        },
+    })
+}
+
+/// The `a.b.c` chain of identifiers ending at the `.` token `dot`, or `None`
+/// when the receiver is anything else (a call, an index, a literal).
+fn ident_chain<'d>(doc: &'d Doc<'_>, dot: usize) -> Option<Vec<&'d str>> {
     let mut segments: Vec<&str> = Vec::new();
     let mut i = dot;
     loop {
+        // `x[0].a`, `f().a`, `"s".a`: a receiver that is not a name.
         let name = i.checked_sub(1).and_then(|j| doc.tok(j))?;
         if name.kind != Kind::Ident {
             return None;
@@ -1094,22 +1137,7 @@ fn dotted_site(
         }
     }
     segments.reverse();
-    match segments.as_slice() {
-        ["heph"] => Some(Site::PluginNamespace {
-            edit: edit.clone(),
-            prefix: prefix.to_string(),
-        }),
-        // A driver's `Kwargs` nests one namespace per segment of its name.
-        ["heph", plugin, path @ ..] if path.is_empty() || *plugin == "types" => {
-            Some(Site::PluginMember {
-                plugin: (*plugin).to_string(),
-                path: path.iter().map(|s| (*s).to_string()).collect(),
-                edit: edit.clone(),
-                prefix: prefix.to_string(),
-            })
-        }
-        _ => None,
-    }
+    Some(segments)
 }
 
 fn string_site(
@@ -1328,6 +1356,49 @@ mod tests {
             None,
             "a plugin function has no members"
         );
+    }
+
+    /// Every other position after a `.` is a `member` site; its path is the
+    /// receiver when that is a chain of names rooted at a global.
+    #[test]
+    fn site_member_path_is_a_global_name_chain() {
+        let path = |r: Resolution| match r.site {
+            Site::Member { path, prefix, .. } => Some((path, prefix)),
+            _ => None,
+        };
+        let s = |v: &[&str]| Some(v.iter().map(|x| (*x).to_string()).collect::<Vec<_>>());
+        for (fixture, want, prefix) in [
+            ("x = typing.│\n", s(&["typing"]), ""),
+            ("def f(x: typing.Ca│ll):\n", s(&["typing"]), "Ca"),
+            ("x = a.b.│\n", s(&["a", "b"]), ""),
+            ("x = heph.fs.join.│\n", s(&["heph", "fs", "join"]), ""),
+            ("x = f().│\n", None, ""),
+            ("x = l[0].│\n", None, ""),
+            ("x = \"s\".jo│\n", None, "jo"),
+        ] {
+            assert_eq!(
+                path(at(fixture)),
+                Some((want, prefix.to_string())),
+                "{fixture}"
+            );
+        }
+        assert_eq!(
+            path(with_overlay("x = typing.│\n", &["typing"])),
+            Some((None, String::new())),
+            "a root the file binds is not the global"
+        );
+        assert_eq!(
+            path(with_overlay("x = typing.│\n", &["other"])),
+            Some((s(&["typing"]), String::new()))
+        );
+        for not_member in [
+            "# typing.│\n",
+            "x = \"typing.│\"\n",
+            "x = 1.│\n",
+            "x = typ│\n",
+        ] {
+            assert_eq!(path(at(not_member)), None, "{not_member}");
+        }
     }
 
     #[test]

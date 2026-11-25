@@ -38,7 +38,8 @@ forms are `record` (with `field` for a default), `enum`, a type alias, and
 `typing` (`typing.Any`, `typing.Callable`, `typing.Iterable`,
 `typing.Never`). Starlark's `eval_type(x)`, which turns a value into a type,
 comes with `typing`. These are ordinary globals: a file that binds one of the
-names itself keeps its own binding. A declared type can be loaded like any
+names itself keeps its own binding. The editor completes them, `typing.`'s
+members, and declared types in an annotation (`docs/LSP.md`). A declared type can be loaded like any
 other name:
 
 ```python

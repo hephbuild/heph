@@ -618,7 +618,12 @@ impl Server<'_> {
         );
         let resolution = if doc.outside_root {
             Resolution::none(site::Reason::OutsideRoot)
-        } else if !ready && !matches!(resolution.site, Site::None | Site::ArgKey { .. }) {
+        } else if !ready
+            && !matches!(
+                resolution.site,
+                Site::None | Site::ArgKey { .. } | Site::Member { .. }
+            )
+        {
             Resolution::none(site::Reason::ProvidersLoading)
         } else {
             resolution
@@ -723,14 +728,15 @@ impl Server<'_> {
                     None => stock,
                 }
             }
-            Merge::Replace => match self.registry() {
-                Some(registry) => self
-                    .with_ctx(&located.key, &registry, |ctx| {
-                        handlers::items(&located.resolution.site, ctx)
-                    })
-                    .unwrap_or_default(),
-                None => Vec::new(),
-            },
+            Merge::Replace => {
+                // Only a site that needs no registry gets here without one
+                // (see `locate`): a namespace's members are the globals'.
+                let registry = self.registry().unwrap_or_default();
+                self.with_ctx(&located.key, &registry, |ctx| {
+                    handlers::items(&located.resolution.site, ctx)
+                })
+                .unwrap_or_default()
+            }
         };
         self.log("completion", &located, items.len(), started);
         serde_json::to_value(items).unwrap_or_else(|_| serde_json::json!([]))
@@ -779,6 +785,17 @@ impl Server<'_> {
         let hover = match site {
             Site::None | Site::ArgKey { .. } | Site::FieldValue { .. } => {
                 self.stock_hover(params, &located, reg)
+            }
+            // A global namespace's member is heph's to answer, a member it
+            // does not have included; any other receiver's member is whatever
+            // the stock analysis knows.
+            Site::Member { path, .. } => {
+                match self.with_ctx(&located.key, reg, |ctx| {
+                    handlers::is_namespace(path.as_deref(), ctx).then(|| handlers::hover(site, ctx))
+                }) {
+                    Some(Some(heph)) => heph,
+                    _ => self.stock_hover(params, &located, reg),
+                }
             }
             _ => self
                 .with_ctx(&located.key, reg, |ctx| {

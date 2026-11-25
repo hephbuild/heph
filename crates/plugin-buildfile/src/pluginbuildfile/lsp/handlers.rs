@@ -27,7 +27,9 @@ use super::lex::{self, Bracket, Kind, NO_LINK, Tok, Tokens};
 use super::position::{self, Encoding};
 use super::site::{ArgCall, Builtin, Call, Quote, Site, Str};
 use crate::pluginbuildfile::provider::{DriverSource, build_files_in_dir};
-use crate::pluginbuildfile::run_file::{parse_build_file, resolve_load_target, target_base_fields};
+use crate::pluginbuildfile::run_file::{
+    NamespaceMember, parse_build_file, resolve_load_target, target_base_fields,
+};
 use crate::pluginbuildfile::types::{self, DriverKwargs};
 use crate::pluginbuildfile::{DEFAULT_INDENT, build_file_indent_from_options};
 use hplugin::driver::{DriverSchema, DriverSchemas};
@@ -196,6 +198,7 @@ fn item_kind(site: &Site) -> CompletionItemKind {
         }
         Site::PluginNamespace { .. } => CompletionItemKind::MODULE,
         Site::PluginMember { .. } | Site::LoadSymbol { .. } => CompletionItemKind::FUNCTION,
+        Site::Member { .. } => CompletionItemKind::PROPERTY,
         Site::Address { .. } => CompletionItemKind::REFERENCE,
         Site::LoadPath { .. } => CompletionItemKind::FILE,
         Site::None | Site::Callee { .. } => CompletionItemKind::TEXT,
@@ -259,6 +262,15 @@ pub(crate) fn items(site: &Site, ctx: &Ctx<'_>) -> Vec<CompletionItem> {
         Site::PluginMember {
             plugin, path, edit, ..
         } => (members(plugin, path, ctx), edit.clone(), None),
+        // A receiver that is not a global namespace offers nothing: the stock
+        // answer after a `.` is the global list, never valid there.
+        Site::Member { path, edit, .. } => (
+            namespace(path.as_deref(), ctx)
+                .map(|ms| ms.iter().map(namespace_candidate).collect())
+                .unwrap_or_default(),
+            edit.clone(),
+            None,
+        ),
         Site::Address { value } => (
             addresses(&value.prefix, ctx),
             value.edit.clone(),
@@ -731,6 +743,31 @@ fn namespaces(ctx: &Ctx<'_>) -> Vec<Candidate> {
         .collect()
 }
 
+/// The members of the global namespace at `path` (`["typing"]`), when it is
+/// one.
+fn namespace<'c>(path: Option<&[String]>, ctx: &'c Ctx<'_>) -> Option<&'c [NamespaceMember]> {
+    let path = path?;
+    ctx.shared
+        .namespaces
+        .get(&path.join("."))
+        .map(Vec::as_slice)
+}
+
+/// Whether `path` names a global namespace, so heph's answer about its members
+/// is the whole answer.
+pub(crate) fn is_namespace(path: Option<&[String]>, ctx: &Ctx<'_>) -> bool {
+    namespace(path, ctx).is_some()
+}
+
+fn namespace_candidate(m: &NamespaceMember) -> Candidate {
+    Candidate {
+        label: m.name.clone(),
+        detail: (!m.detail.is_empty()).then(|| m.detail.clone()),
+        doc: m.doc.clone(),
+        insert: m.name.clone(),
+    }
+}
+
 /// `heph.<plugin>.` → that plugin's functions (`heph.core.` → the builtins,
 /// `heph.types.` → the type aliases and the driver namespaces,
 /// `heph.types.<path>.` → that driver's `Kwargs` and the namespaces under it).
@@ -742,15 +779,10 @@ fn members(plugin: &str, path: &[String], ctx: &Ctx<'_>) -> Vec<Candidate> {
     if plugin == "core" {
         return ctx
             .shared
-            .core_members
-            .iter()
-            .map(|m| Candidate {
-                label: m.name.clone(),
-                detail: (!m.detail.is_empty()).then(|| m.detail.clone()),
-                doc: m.doc.clone(),
-                insert: m.name.clone(),
-            })
-            .collect();
+            .namespaces
+            .get("heph.core")
+            .map(|ms| ms.iter().map(namespace_candidate).collect())
+            .unwrap_or_default();
     }
     let registry = ctx.shared.engine.function_registry();
     registry
@@ -1039,7 +1071,8 @@ pub(crate) fn hover(site: &Site, ctx: &Ctx<'_>) -> Option<Hover> {
                 types_member_doc(&ctx.registry.kwargs(), &path, name)?
             } else if plugin == "core" {
                 ctx.shared
-                    .core_members
+                    .namespaces
+                    .get("heph.core")?
                     .iter()
                     .find(|m| m.name == name)
                     .map(|m| m.doc.clone())?
@@ -1048,6 +1081,16 @@ pub(crate) fn hover(site: &Site, ctx: &Ctx<'_>) -> Option<Hover> {
                 let rf = registry.get(plugin, name)?;
                 function_doc(name, rf)
             };
+            (md, edit.clone())
+        }
+        // `None` where heph does not know the member: the server answers
+        // stock there.
+        Site::Member { path, edit, .. } => {
+            let name = ctx.text.get(edit.clone())?;
+            let md = namespace(path.as_deref(), ctx)?
+                .iter()
+                .find(|m| m.name == name)
+                .map(|m| m.doc.clone())?;
             (md, edit.clone())
         }
     };
@@ -1157,7 +1200,7 @@ fn link(origin: Range, path: &Path, line: u32) -> Option<LocationLink> {
 /// `Some(empty)` is heph saying there is nothing to jump to.
 pub(crate) fn definition(site: &Site, ctx: &Ctx<'_>) -> Option<Vec<LocationLink>> {
     match site {
-        Site::None | Site::ArgKey { .. } | Site::FieldValue { .. } => None,
+        Site::None | Site::ArgKey { .. } | Site::FieldValue { .. } | Site::Member { .. } => None,
         Site::Address { value } => Some(address_definition(value, ctx).into_iter().collect()),
         Site::LoadPath { value } => {
             let origin = ctx.range(&value.token);
@@ -1486,6 +1529,7 @@ mod tests {
             merge("target(name = \"x\", driver = \"ex│\")\n"),
             ("driver_value", Merge::Replace)
         );
+        assert_eq!(merge("x = typing.│\n"), ("member", Merge::Replace));
     }
 
     fn binding(src: &str, name: &str) -> Option<(String, String)> {

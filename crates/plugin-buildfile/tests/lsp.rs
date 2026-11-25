@@ -1173,8 +1173,8 @@ fn types_completion_and_hover() {
 
 /// A document declaring its own types: `record`, `field` and `typing`
 /// complete, `record` hovers, and the document evaluates with no diagnostic,
-/// since the server's globals are evaluation's. (`typing.` members do not
-/// complete: no non-`heph` namespace's members do yet.)
+/// since the server's globals are evaluation's. A type position offers every
+/// name a type can be, the declared ones included.
 #[test]
 fn declared_types_complete_hover_and_evaluate() {
     let mut lsp = Lsp::start();
@@ -1188,6 +1188,17 @@ fn declared_types_complete_hover_and_evaluate() {
     let text = hover_text(&lsp.hover(&doc));
     assert!(text.contains("record"), "{text}");
 
+    // A type position: the declared record, `typing` and `list`, where the
+    // stock analysis offered only `str`, `int`, `bool`, `None` and `float`.
+    for (prefix, want) in [("L", "Lib"), ("t", "typing"), ("l", "list"), ("s", "str")] {
+        let doc = lsp.open(
+            &format!("annot_{want}/BUILD"),
+            &format!("Lib = record(name = str)\n\ndef f(l: {prefix}│) -> None:\n    pass\n"),
+        );
+        let offered = lsp.completion(&doc);
+        assert!(has(&offered, want), "{want} in a type position: {offered}");
+    }
+
     let source = "Mode = enum(\"debug\", \"release\")\n\
                   Lib = record(name = str, mode = Mode, srcs = field(list[str], []))\n\n\
                   def lib(l: Lib, extra: typing.Any = None) -> None:\n    \
@@ -1197,6 +1208,63 @@ fn declared_types_complete_hover_and_evaluate() {
     lsp.barrier();
     let diagnostics = lsp.last_diagnostics(&doc).expect("diagnostics published");
     assert!(diagnostics.is_empty(), "{diagnostics:?}");
+}
+
+/// After a `.`: a global namespace's members, in an annotation and in a
+/// document that does not parse; nothing after any other receiver, where the
+/// stock analysis offered the whole global list.
+#[test]
+fn member_completion_lists_a_namespace_and_nothing_else() {
+    let mut lsp = Lsp::start();
+    let typing = ["Any", "Callable", "Iterable", "Never"];
+    for (path, fixture) in [
+        ("a/BUILD", "def f(x: typing.│) -> None:\n    pass\n"),
+        // Does not parse: the site comes from the tokens.
+        ("b/BUILD", "x = typing.│\n"),
+    ] {
+        let doc = lsp.open(path, fixture);
+        let mut got = labels(&lsp.completion(&doc));
+        got.sort();
+        assert_eq!(got, typing, "{fixture}");
+    }
+    let doc = lsp.open("c/BUILD", "x = typing.Ca│\n");
+    let result = lsp.completion(&doc);
+    assert_eq!(labels(&result), ["Callable"]);
+    assert_eq!(
+        apply("x = typing.Ca\n", &item(&result, "Callable")),
+        "x = typing.Callable\n",
+        "the edit replaces the member being typed, not the receiver"
+    );
+
+    // The file's own names come from its last good parse, as an editor has
+    // it before the `.` is typed.
+    let doc = lsp.open("e/BUILD", "typing = {}\nx = typ│ing\n");
+    let doc = lsp.change(&doc, "typing = {}\nx = typing.│\n");
+    let result = lsp.completion(&doc);
+    assert!(items(&result).is_empty(), "a rebound global: {result}");
+
+    for (path, fixture, why) in [
+        ("d/BUILD", "l = {}\nx = l.│\n", "a local"),
+        ("f/BUILD", "x = f().│\n", "a call"),
+        ("g/BUILD", "x = \"s\".│\n", "a literal"),
+        (
+            "h/BUILD",
+            "x = typing.Any.│\n",
+            "a member that is not a namespace",
+        ),
+        ("i/BUILD", "x = heph.core.os.│\n", "a heph function"),
+        ("j/BUILD", "x = nosuch.│\n", "an unknown name"),
+    ] {
+        let doc = lsp.open(path, fixture);
+        let result = lsp.completion(&doc);
+        assert!(items(&result).is_empty(), "{why}: {result}");
+    }
+
+    let doc = lsp.open("k/BUILD", "x = typing.Calla│ble\n");
+    let text = hover_text(&lsp.hover(&doc));
+    assert!(text.contains("typing.Callable"), "{text}");
+    let doc = lsp.open("l/BUILD", "x = typing.Nosu│ch\n");
+    assert!(lsp.hover(&doc).is_null(), "no member, no hover");
 }
 
 #[test]
@@ -1640,6 +1708,7 @@ fn matrix(site: &str, feature: Feature) {
         "state_key" => "provider_state(provider = \"go\", go_codegen_r│oot = True)\n",
         "plugin_namespace" => "x = heph.f│s\n",
         "plugin_member" => "x = heph.fs.jo│in(\"a\", \"b\")\n",
+        "member" => "def f(x: typing.An│y) -> None:\n    pass\n",
         "address" => "target(name = \"x\", deps = [\"//lib:ut│il\"])\n",
         "load_path" => "load(\"//l│ib\", \"make_name\")\n",
         "load_symbol" => "load(\"//x:y.star\", \"fo│o\")\n",
@@ -1680,6 +1749,7 @@ fn matrix(site: &str, feature: Feature) {
                 "state_key" => &["go_codegen_root"],
                 "plugin_namespace" => &["fs"],
                 "plugin_member" => &["join"],
+                "member" => &["Any"],
                 "address" => &["//lib:util"],
                 "load_path" => &["//lib"],
                 "load_symbol" => &["foo"],
@@ -1696,6 +1766,7 @@ fn matrix(site: &str, feature: Feature) {
                 "target_key" => Some("Command line to run."),
                 "state_key" => Some("Mark this package as a Go codegen root."),
                 "plugin_member" => Some("Join two path segments."),
+                "member" => Some("typing.Any"),
                 // Stock passes through; it has nothing on a keyword name.
                 "arg_key" => None,
                 "field_value" => {
@@ -1827,6 +1898,18 @@ fn matrix_plugin_member_hover() {
 #[test]
 fn matrix_plugin_member_definition() {
     matrix("plugin_member", Feature::Definition);
+}
+#[test]
+fn matrix_member_items() {
+    matrix("member", Feature::Items);
+}
+#[test]
+fn matrix_member_hover() {
+    matrix("member", Feature::Hover);
+}
+#[test]
+fn matrix_member_definition() {
+    matrix("member", Feature::Definition);
 }
 #[test]
 fn matrix_address_items() {
