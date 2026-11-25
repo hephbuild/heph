@@ -802,46 +802,66 @@ impl Server<'_> {
     }
 
     /// The typed answer at a member site whose receiver is a name the file
-    /// binds or a literal, and whether it is a literal's. `None` at any other
-    /// site: a global namespace's members are not typed.
+    /// binds, a name that is no global, or a literal, and whether it is a
+    /// literal's. `None` at any other site: a global namespace's members are
+    /// not typed.
     fn member_answer(&mut self, located: &Located) -> Option<(Answer, bool)> {
         let Site::Member {
-            receiver, scope, ..
+            receiver,
+            scope,
+            path,
+            ..
         } = &located.resolution.site
         else {
             return None;
         };
-        match receiver {
+        let (root, rest) = match receiver {
             site::Receiver::Literal { kind } => {
-                Some((Answer::literal(*kind, self.registry().is_some()), true))
+                return Some((Answer::literal(*kind, self.registry().is_some()), true));
             }
-            site::Receiver::Rebound { name, rest } => {
-                let shadowed = {
-                    let doc = self.documents.get(&located.key)?;
-                    site::bound_in_group(
-                        &site::Doc {
-                            text: &doc.text,
-                            tokens: &doc.tokens,
-                            overlay: None,
-                            ast: AstState::Current,
-                        },
-                        located.offset,
-                        name,
-                    )
-                };
-                let (types, stale, registry_ready) = self.doc_types(&located.key);
-                let lookup = Lookup {
-                    root: name,
-                    rest,
-                    scope,
-                    shadowed,
-                    stale,
-                    registry_ready,
-                };
-                Some((Answer::of(types.as_deref(), &lookup), false))
+            site::Receiver::Expression => return None,
+            site::Receiver::Rebound { name, rest } => (name.as_str(), rest.as_slice()),
+            // A root that is no global, and that the last good parse does not
+            // bind: bound in text that has not parsed yet (`no_types_yet`,
+            // E4), or by nothing (`unknown_binding`). The answer is empty
+            // either way; the lookup says which.
+            site::Receiver::Names => {
+                let (root, rest) = path.as_deref()?.split_first()?;
+                let registry = self.registry();
+                let global = self.shared.namespaces.contains_key(root)
+                    || self
+                        .globals(registry.as_deref())
+                        .names()
+                        .any(|g| g.as_str() == root);
+                if global {
+                    return None;
+                }
+                (root.as_str(), rest)
             }
-            site::Receiver::Names | site::Receiver::Expression => None,
-        }
+        };
+        let shadowed = {
+            let doc = self.documents.get(&located.key)?;
+            site::bound_in_group(
+                &site::Doc {
+                    text: &doc.text,
+                    tokens: &doc.tokens,
+                    overlay: None,
+                    ast: AstState::Current,
+                },
+                located.offset,
+                root,
+            )
+        };
+        let (types, stale, registry_ready) = self.doc_types(&located.key);
+        let lookup = Lookup {
+            root,
+            rest,
+            scope,
+            shadowed,
+            stale,
+            registry_ready,
+        };
+        Some((Answer::of(types.as_deref(), &lookup), false))
     }
 
     /// The types of `key`'s last good text, checked now unless the memo is
