@@ -210,6 +210,61 @@ pub(crate) fn walk_package(
     Ok(walk)
 }
 
+/// Walk the loads of one file that is not read from disk (the LSP's open
+/// buffer, at workspace path `file`, evaluated in `pkg`): resolve each of
+/// `modules` (its `load()` strings) as [`walk_package`] does, through
+/// [`resolve_load`], and walk what they load, transitively.
+///
+/// Best effort: a load that fails to resolve, parse or walk (a cycle back
+/// into `file` or its directory included) is left out of the edges, so its
+/// names are untyped; the others still walk. Returns each walked load
+/// string's edge, and the walk of every file they reach, `file` never among
+/// them.
+pub(crate) fn walk_loads<'m>(
+    root: &Path,
+    walker: &CachedWalker,
+    pkg: &str,
+    file: &Path,
+    modules: impl IntoIterator<Item = &'m str>,
+    patterns: &[glob::Pattern],
+) -> (BTreeMap<String, LoadEdge>, LoadWalk) {
+    let mut walk = LoadWalk {
+        pkg: pkg.to_string(),
+        files: BTreeMap::new(),
+    };
+    let mut edges = BTreeMap::new();
+    // Seeded as evaluation seeds it: the file and its directory are on the
+    // chain, so a load back into either is a cycle, not a second copy.
+    let seed: HashSet<PathBuf> = [file.to_path_buf()]
+        .into_iter()
+        .chain(file.parent().map(Path::to_path_buf))
+        .collect();
+    let mut state = Walker {
+        root,
+        walker,
+        patterns,
+        files: &mut walk.files,
+        done_dirs: HashSet::new(),
+        in_flight: seed.clone(),
+    };
+    for module in modules {
+        if edges.contains_key(module) {
+            continue;
+        }
+        match state.visit_load(pkg, module) {
+            Ok(edge) => {
+                edges.insert(module.to_string(), edge);
+            }
+            Err(e) => {
+                tracing::debug!(module, error = %e, "lsp: load left untyped");
+                // A failed visit leaves its chain behind.
+                state.in_flight.clone_from(&seed);
+            }
+        }
+    }
+    (edges, walk)
+}
+
 /// One walk's state. It mirrors [`BuildFileLoader`](super::super::run_file::BuildFileLoader):
 /// a directory and a file each go on the chain while their loads are being
 /// walked, and are skipped once done.

@@ -180,6 +180,50 @@ pub(crate) struct Checked {
     pub(crate) exported: BTreeSet<String>,
 }
 
+/// Every file of `walk` typechecked against `globals`, in dependency order, as
+/// [`lint`] checks them: each file's loads see [`interface_of`] the files
+/// before it. Best effort, for the LSP (I9): a file that cannot be read,
+/// parsed or ordered is left out, and so is any load of it, whose names a
+/// loader then sees as `Any`. Errors and approximations are not kept.
+pub(crate) fn interfaces<'w>(
+    walk: &'w LoadWalk,
+    read: &mut dyn FnMut(&str) -> anyhow::Result<String>,
+    globals: &Globals,
+) -> HashMap<&'w str, Checked> {
+    let mut checked: HashMap<&str, Checked> = HashMap::with_capacity(walk.files.len());
+    let Ok(order) = walk.dependency_order() else {
+        return checked;
+    };
+    for path in order {
+        let Some(file) = walk.files.get(path) else {
+            continue;
+        };
+        let Some(ast) = read(path)
+            .ok()
+            .and_then(|src| parse_build_source(path, src).ok())
+        else {
+            continue;
+        };
+        let loads = ast
+            .loads()
+            .into_iter()
+            .filter_map(|load| {
+                let edge = file.loads.get(load.module_id)?;
+                let iface = interface_of(edge, &checked).ok()?;
+                Some((load.module_id.to_owned(), iface))
+            })
+            .collect();
+        let exported = bound_names(&ast)
+            .into_iter()
+            .filter(|n| is_exported(n))
+            .map(str::to_owned)
+            .collect();
+        let (_errors, _types, iface, _approximations) = ast.typecheck(globals, &loads);
+        checked.insert(path, Checked { iface, exported });
+    }
+    checked
+}
+
 /// The interface one `load()` sees. A file load is the file's own; a
 /// directory load merges its files' interfaces as evaluation merges their
 /// modules (`merge_pkg_results`): in order, a later file's name wins, and only
@@ -241,7 +285,7 @@ fn type_error(path: &str, e: &starlark::Error) -> Finding {
 /// The globals the checker typechecks against: evaluation's static surface
 /// (`target()` and the other builtins, `heph.core`, `heph.types` with each
 /// driver's `Kwargs`) plus one [`OpaquePluginFn`] per plugin function name.
-fn check_globals(plugin_fns: &[(&str, &str)], kwargs: &DriverKwargs) -> Globals {
+pub(crate) fn check_globals(plugin_fns: &[(&str, &str)], kwargs: &DriverKwargs) -> Globals {
     let mut by_plugin: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
     for &(plugin, func) in plugin_fns {
         by_plugin.entry(plugin).or_default().insert(func);

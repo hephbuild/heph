@@ -21,6 +21,7 @@ mod lex;
 mod position;
 mod server;
 pub(crate) mod site;
+mod typed;
 
 #[cfg(feature = "test-support")]
 pub use server::{RunOptions, run_with};
