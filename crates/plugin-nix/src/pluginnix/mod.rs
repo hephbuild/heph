@@ -58,6 +58,13 @@ struct NixDef {
     system: String,
 }
 
+/// Hashes the `nixpkgs` ref as written, not the commit it resolves to. An
+/// unlocked ref (`nixos-unstable`) is therefore resolved again on every run:
+/// the first, one after cache eviction, `--force`, and every stale-miss
+/// re-run. That is sound — a nix target keeps `cache.remote` off, and its
+/// dependents fold its hashout, so a newer resolution rebuilds them rather
+/// than serving stale output — but not reproducible: pin the commit in the
+/// ref to keep nixpkgs fixed.
 impl Hash for NixDef {
     fn hash<H: Hasher>(&self, state: &mut H) {
         DRIVER_FORMAT_VERSION.hash(state);
@@ -261,7 +268,10 @@ fn sh_quote(s: &str) -> String {
 /// otherwise fail as a bare "not found", with nothing pointing at the fix.
 fn wrapper_script(target_bin: &str, addr: &str) -> String {
     let bin = sh_quote(target_bin);
-    let missing = sh_quote(&format!("{target_bin} missing; heph run --force {addr}"));
+    let missing = sh_quote(&format!(
+        "{target_bin} missing (its nix store path was collected); re-run to rebuild it, \
+         or: heph run --force {addr}"
+    ));
     format!(
         "#!/bin/sh\n\
          [ -e {bin} ] || {{ printf '%s\\n' {missing} >&2; exit 127; }}\n\
@@ -1216,7 +1226,10 @@ mod host_path_tests {
         assert_eq!(out.status.code(), Some(127), "{out:?}");
         assert_eq!(
             String::from_utf8_lossy(&out.stderr),
-            format!("{program} missing; heph run --force //pkg:t\n")
+            format!(
+                "{program} missing (its nix store path was collected); re-run to rebuild it, \
+                 or: heph run --force //pkg:t\n"
+            )
         );
     }
 }
