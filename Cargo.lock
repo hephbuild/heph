@@ -1269,6 +1269,7 @@ name = "crossterm"
 version = "0.29.0"
 source = "git+https://github.com/hephbuild/crossterm.git?branch=fix-eventstream-wake-loss#44134cb24de9457347393e5d9acf1aa422bd2fc3"
 dependencies = [
+ "base64 0.22.1",
  "bitflags 2.13.2",
  "crossterm_winapi",
  "derive_more 2.1.1",

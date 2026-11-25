@@ -264,13 +264,57 @@ impl Decide {
 }
 
 /// A mouse event on a full screen, at a cell of the last frame drawn
-/// (column, row; 0-based). Only presses and the wheel are captured.
+/// (column, row; 0-based). A drag never reaches the view: the backend
+/// selects with it and copies the selection on release.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MouseInput {
-    /// The left button went down.
+    /// The left button went down and came back up there, with no drag in
+    /// between. Delivered at the release.
     Click { col: u16, row: u16 },
     /// One wheel step, `down` (towards the end) or up.
     Wheel { col: u16, row: u16, down: bool },
+}
+
+/// A scrolling pane's whole text, handed to the backend as a drag starts in
+/// it ([`TUIAppView::selection_doc`]). While the button is down the backend
+/// draws the pane from these rows, scrolled as the drag scrolls it, and
+/// copies from them: what was selected, on screen or not, with no view
+/// call until the release.
+#[derive(Debug)]
+pub struct SelectDoc {
+    /// The screen rows the pane takes, the full width of them: its rows are
+    /// drawn here.
+    pub area: ratatui::layout::Rect,
+    /// The first column a selection takes: past line numbers or an indent.
+    pub text_left: u16,
+    /// Every row of the pane, top to bottom, as the pane draws them.
+    pub rows: Vec<DocRow>,
+    /// The row at the top of [`Self::area`].
+    pub top: usize,
+}
+
+/// One row of a [`SelectDoc`].
+#[derive(Debug)]
+pub struct DocRow {
+    /// The row as the pane draws it.
+    pub line: Line<'static>,
+    /// The row uncut, when the pane cut it to the screen's width: a
+    /// selection that runs to the right edge copies the rest of it.
+    pub whole: Option<Line<'static>>,
+    /// The row's text goes on in the next row (a wrapped line): copied
+    /// without a line break between them.
+    pub joined: bool,
+}
+
+impl DocRow {
+    /// A row drawn whole, not continued on the next.
+    pub fn plain(line: Line<'static>) -> Self {
+        Self {
+            line,
+            whole: None,
+            joined: false,
+        }
+    }
 }
 
 /// Aggregates the engine's build-event stream and renders progress in the
@@ -339,6 +383,20 @@ pub trait TUIAppView: Send {
     /// last [`Self::render_full`] drew. Everything a click does has a key;
     /// no click decides an approval. No-op by default.
     fn mouse(&mut self, _input: MouseInput) {}
+
+    /// The scrolling pane a drag that starts at `at` selects in, matched
+    /// against what the last [`Self::render_full`] drew: all of its rows,
+    /// so the drag can scroll it (by the wheel, or held past its edge) and
+    /// copy what is off screen. `None` for a press outside one: the drag
+    /// selects the screen as drawn. `None` by default.
+    fn selection_doc(&mut self, _at: ratatui::layout::Position) -> Option<SelectDoc> {
+        None
+    }
+
+    /// A drag in the pane [`Self::selection_doc`] gave ended with the pane
+    /// scrolled to row `top` of that doc: the pane stays there. Called only
+    /// when the drag scrolled it. No-op by default.
+    fn selection_scrolled(&mut self, _top: usize) {}
 
     /// Cycle the body view (the `Tab` / `Shift+Tab` keys). `forward` advances to
     /// the next view, otherwise the previous. Called from the backend's key

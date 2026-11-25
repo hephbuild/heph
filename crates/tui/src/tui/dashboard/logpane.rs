@@ -9,6 +9,7 @@ use std::collections::VecDeque;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
+use crate::tui::app::DocRow;
 use crate::tui::text::{
     Redact, contains_ignore_ascii_case, cut_right, expand_tabs, sanitize_log, take_width, width,
 };
@@ -60,6 +61,16 @@ pub struct LogPane {
     note: Option<String>,
     /// The body rows of the last frame, for paging and leaving follow.
     rows: usize,
+    /// The column the last frame's log text starts at, past the line
+    /// numbers; `None` when it drew a notice instead of lines.
+    text_col: Option<u16>,
+    /// The rows of its top line the last frame left above the pane (a
+    /// wrapped line, following the end).
+    skip: usize,
+    /// The log line on each row of the last [`Self::doc`].
+    doc_lines: Vec<u64>,
+    /// Whether the pane followed the end when [`Self::doc`] was taken.
+    doc_followed: bool,
 }
 
 impl Default for LogPane {
@@ -80,11 +91,21 @@ impl Default for LogPane {
             cur: None,
             note: None,
             rows: 0,
+            text_col: None,
+            skip: 0,
+            doc_lines: Vec::new(),
+            doc_followed: false,
         }
     }
 }
 
 impl LogPane {
+    /// The column the last [`Self::body`]'s log text starts at (past the
+    /// line numbers), or `None` when it drew no log lines.
+    pub fn text_col(&self) -> Option<u16> {
+        self.text_col
+    }
+
     fn reset(&mut self, state: PaneState) {
         let (follow, wrap) = (self.follow, self.wrap);
         *self = Self {
@@ -420,6 +441,10 @@ impl LogPane {
     /// The pane's body, `cols` × `rows`.
     pub fn body(&mut self, cols: usize, rows: usize, redact: &Redact) -> Vec<Line<'static>> {
         self.rows = rows;
+        self.text_col = None;
+        self.skip = 0;
+        // A frame is drawn only once no drag holds the last doc.
+        self.doc_lines = Vec::new();
         let count = self.line_count();
         let empty = match &self.state {
             PaneState::Closed | PaneState::Opening => Some("opening the log…".to_owned()),
@@ -442,6 +467,8 @@ impl LogPane {
             0
         };
         let text_cols = cols.saturating_sub(gutter + 1).max(1);
+        // Each row is the gutter, a space, then the text.
+        self.text_col = u16::try_from(gutter + 1).ok();
         // The held lines this frame shows, as (line index, row texts).
         let mut shown: Vec<(usize, Vec<String>)> = Vec::new();
         let mut used = 0;
@@ -459,6 +486,7 @@ impl LogPane {
             if let Some((_, first)) = shown.first_mut() {
                 let extra = used.saturating_sub(rows).min(first.len());
                 first.drain(..extra);
+                self.skip = extra;
             }
             self.top = self.first_line + shown.first().map_or(0, |s| s.0) as u64;
         } else {
@@ -477,26 +505,106 @@ impl LogPane {
         let mut out = Vec::with_capacity(rows);
         for (k, texts) in shown {
             let abs = self.first_line + k as u64;
-            let style = if self.cur == Some(abs) {
-                Style::default().add_modifier(Modifier::REVERSED)
-            } else {
-                Style::default()
-            };
-            for (i, text) in texts.into_iter().enumerate() {
-                let mut spans = Vec::with_capacity(2);
-                if gutter > 0 {
-                    let no = if i == 0 {
-                        format!("{:>gutter$}", abs + 1)
-                    } else {
-                        " ".repeat(gutter)
-                    };
-                    spans.push(Span::styled(no, Style::default().fg(Color::DarkGray)));
-                }
-                spans.push(Span::styled(format!(" {text}"), style));
-                out.push(Line::from(spans));
+            for (i, text) in texts.iter().enumerate() {
+                out.push(self.row_line(abs, i == 0, text, gutter));
             }
         }
         out
+    }
+
+    /// Row `text` of log line `abs` as drawn: the line number on its
+    /// `first` row (blank on the rows it wraps onto), then the text.
+    fn row_line(&self, abs: u64, first: bool, text: &str, gutter: usize) -> Line<'static> {
+        let style = if self.cur == Some(abs) {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        let mut spans = Vec::with_capacity(2);
+        if gutter > 0 {
+            let no = if first {
+                format!("{:>gutter$}", abs + 1)
+            } else {
+                " ".repeat(gutter)
+            };
+            spans.push(Span::styled(no, Style::default().fg(Color::DarkGray)));
+        }
+        spans.push(Span::styled(format!(" {text}"), style));
+        Line::from(spans)
+    }
+
+    /// Every held line as the last [`Self::body`] drew its rows, at `cols`,
+    /// for a drag to select and scroll in, and the row at its top. A row
+    /// cut to the width carries the line whole. `None` when that frame drew
+    /// a notice rather than lines.
+    ///
+    /// The one call that costs the whole held log rather than the visible
+    /// window (I7), once a press.
+    pub fn doc(&mut self, cols: usize, redact: &Redact) -> Option<(Vec<DocRow>, usize)> {
+        let count = self.line_count();
+        if self.text_col.is_none() || count == 0 {
+            return None;
+        }
+        let gutter = if self.numbered {
+            digits(self.first_line + count as u64)
+        } else {
+            0
+        };
+        let text_cols = cols.saturating_sub(gutter + 1).max(1);
+        let top_line = usize::try_from(self.top.saturating_sub(self.first_line)).unwrap_or(0);
+        let mut rows = Vec::with_capacity(count);
+        let mut lines = Vec::with_capacity(count);
+        let mut top = 0;
+        for k in 0..count {
+            let abs = self.first_line + k as u64;
+            if k == top_line {
+                top = rows.len() + self.skip;
+            }
+            if self.wrap {
+                let texts = self.rows_of(k, text_cols, redact);
+                let last = texts.len().saturating_sub(1);
+                for (i, text) in texts.iter().enumerate() {
+                    rows.push(DocRow {
+                        line: self.row_line(abs, i == 0, text, gutter),
+                        whole: None,
+                        joined: i < last,
+                    });
+                    lines.push(abs);
+                }
+            } else {
+                let text = self.line_text(k, redact);
+                let cut = cut_right(&text, text_cols);
+                let whole = matches!(cut, std::borrow::Cow::Owned(_))
+                    .then(|| self.row_line(abs, true, &text, gutter));
+                rows.push(DocRow {
+                    line: self.row_line(abs, true, &cut, gutter),
+                    whole,
+                    joined: false,
+                });
+                lines.push(abs);
+            }
+        }
+        self.doc_lines = lines;
+        self.doc_followed = self.follow;
+        Some((rows, top))
+    }
+
+    /// A drag left the last [`Self::doc`] scrolled to its row `top`: the
+    /// line on it goes to the top, the pane no longer following, unless
+    /// the drag ended at the end of a pane that was. The pane's top is a
+    /// line, so a row in the middle of a wrapped line lands on that line's
+    /// first row. A line the log has dropped since lands on the oldest
+    /// held.
+    pub fn scroll_to_doc_row(&mut self, top: usize) {
+        let lines = std::mem::take(&mut self.doc_lines);
+        if self.doc_followed && top + self.rows >= lines.len() {
+            self.follow = true;
+            return;
+        }
+        if let Some(&abs) = lines.get(top) {
+            self.follow = false;
+            self.top = abs.max(self.first_line);
+        }
     }
 
     /// Line `k`'s screen rows: one cut to `cols`, or all of it wrapped.
@@ -603,6 +711,151 @@ mod tests {
         assert_eq!(texts(&mut p, 40, 1), ["1 line1"]);
         p.follow_end();
         assert_eq!(texts(&mut p, 40, 1), ["24 partial"]);
+    }
+
+    fn line_text_of(l: &Line<'_>) -> String {
+        l.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    /// A drag's doc is every held line as the frame draws its rows, from
+    /// the row the frame drew at the top; scrolled to a row, the pane puts
+    /// its line at the top and stops following, unless the drag ended at
+    /// the end of a pane that followed.
+    #[test]
+    fn a_drags_doc_is_the_held_log_as_drawn() {
+        let r = Redact::default();
+        let mut p = LogPane::default();
+        p.start_live("live".into());
+        p.append(numbered(1, 20).as_bytes());
+        p.append(b"a line far too long for the pane\n");
+        // Following: lines 19 to 21 on screen.
+        let drawn = p.body(16, 3, &r);
+        let (rows, top) = p.doc(16, &r).expect("lines drawn");
+        assert_eq!(rows.len(), 21);
+        assert_eq!(top, 18);
+        for (k, line) in drawn.iter().enumerate() {
+            assert_eq!(
+                line_text_of(&rows[top + k].line),
+                line_text_of(line),
+                "row {k} as drawn"
+            );
+        }
+        // The cut row carries its line whole; the others need not.
+        let last = &rows[20];
+        assert_eq!(line_text_of(&last.line), "21 a line far t…");
+        assert_eq!(
+            last.whole.as_ref().map(line_text_of).as_deref(),
+            Some("21 a line far too long for the pane")
+        );
+        assert!(rows[0].whole.is_none() && !rows[0].joined);
+
+        // Back at the end of a followed pane: still following.
+        p.scroll_to_doc_row(18);
+        assert!(p.following());
+        // Scrolled up: that line on top, no longer following.
+        p.doc(16, &r);
+        p.scroll_to_doc_row(4);
+        assert!(!p.following());
+        assert_eq!(texts(&mut p, 40, 2), ["5 line5", "6 line6"]);
+
+        // Wrapped: a line's rows go on in the next, the top past the rows
+        // of its line the frame left above the pane.
+        p.toggle_wrap();
+        p.follow_end();
+        let drawn = p.body(16, 1, &r);
+        let (rows, top) = p.doc(16, &r).expect("lines drawn");
+        assert_eq!(rows.len(), 20 + 3, "the long line on three rows");
+        assert_eq!(top, 22, "the long line's last row on screen");
+        // Its text as drawn; the frame numbers the row it starts on screen
+        // with, the doc only the line's first.
+        let text = |l: &Line<'_>| line_text_of(l).get(3..).map(str::to_owned);
+        assert_eq!(text(&rows[top].line), text(&drawn[0]));
+        assert_eq!(text(&drawn[0]).as_deref(), Some("e pane"));
+        let joined: Vec<bool> = rows[20..].iter().map(|r| r.joined).collect();
+        assert_eq!(joined, [true, true, false]);
+        assert!(rows[20..].iter().all(|r| r.whole.is_none()));
+        // A row in the middle of a line scrolls to that line.
+        p.scroll_to_doc_row(21);
+        assert!(!p.following());
+        assert_eq!(p.body(16, 1, &r).len(), 1);
+        assert_eq!(p.top, 20);
+    }
+
+    /// What a drag copies is what the pane draws: heph's home redacted (I9),
+    /// control bytes gone (I13), tabs expanded, in the drawn row, the whole
+    /// one and the wrapped ones alike. The clipboard is the one place a
+    /// raw line would leave the terminal.
+    #[test]
+    fn a_drags_doc_is_redacted_and_sanitized() {
+        let r = Redact::of(["/hh/home".into()]);
+        let line = "a\tb open /hh/home/secret \x1b[31mred\x1b[0m\x07 and then some more";
+        let clean = "a       b open <heph home>/secret red and then some more";
+        let mut p = LogPane::default();
+        p.start_live("live".into());
+        p.append(format!("{line}\n").as_bytes());
+        for wrap in [false, true] {
+            if wrap {
+                p.toggle_wrap();
+            }
+            p.body(24, 5, &r);
+            let (rows, _) = p.doc(24, &r).expect("lines drawn");
+            let mut texts: Vec<String> = Vec::new();
+            for row in &rows {
+                texts.push(line_text_of(&row.line));
+                texts.extend(row.whole.as_ref().map(line_text_of));
+            }
+            for t in &texts {
+                assert!(!t.contains("/hh/home"), "wrap {wrap}: {t:?}");
+                assert!(!t.chars().any(char::is_control), "wrap {wrap}: {t:?}");
+            }
+            if wrap {
+                let joined: String = rows
+                    .iter()
+                    .map(|row| {
+                        line_text_of(&row.line)
+                            .get(2..)
+                            .unwrap_or_default()
+                            .to_owned()
+                    })
+                    .collect();
+                assert_eq!(joined, clean, "the wrapped rows, joined");
+            } else {
+                assert_eq!(
+                    texts.last().map(|t| t.get(2..).unwrap_or_default()),
+                    Some(clean)
+                );
+            }
+        }
+    }
+
+    /// A drag that scrolled to a line the log has since dropped (the pane
+    /// holds the last [`HELD_MAX`] bytes) lands on the oldest line held.
+    #[test]
+    fn a_drags_scroll_to_a_dropped_line_lands_on_the_oldest_held() {
+        let r = Redact::default();
+        let mut p = LogPane::default();
+        p.start_live("live".into());
+        p.append(numbered(1, 50).as_bytes());
+        p.body(40, 5, &r);
+        p.doc(40, &r).expect("lines drawn");
+        // Push every held line out.
+        let filler = format!("{}\n", "x".repeat(1023));
+        for _ in 0..=HELD_MAX / 1024 {
+            p.append(filler.as_bytes());
+        }
+        assert!(p.first_line > 50, "the doc's lines were dropped");
+        p.scroll_to_doc_row(2);
+        assert!(!p.following());
+        assert_eq!(p.top, p.first_line);
+    }
+
+    #[test]
+    fn a_drags_doc_is_none_on_a_notice() {
+        let r = Redact::default();
+        let mut p = LogPane::default();
+        p.start_live("live".into());
+        p.body(40, 3, &r);
+        assert!(p.doc(40, &r).is_none(), "no output yet");
     }
 
     #[test]

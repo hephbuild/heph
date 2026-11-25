@@ -8,6 +8,7 @@ use ratatui::text::Line;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use super::target::BODY_TOP;
 use super::*;
 use crate::tui::progress::{BuildState, CountScope};
 use crate::tui::text::Redact;
@@ -763,6 +764,111 @@ fn file(path: &str, size: u64) -> OutputFile {
         kind: FileKind::File,
         size,
     }
+}
+
+/// A drag in the Log tab selects in the whole held log, its pane under the
+/// failure's status rows and from past the line numbers: the doc's area is
+/// the rows the frame drew the log on, its top the row on top of them. A
+/// press on the line numbers, the header or the status rows gets none.
+/// Left scrolled by the drag, the pane stays there, no longer following.
+#[test]
+fn a_drag_in_the_log_tab_selects_in_the_whole_log() {
+    use ratatui::layout::Position;
+    let s = fold(&[
+        at(0, start("//e:ran")),
+        at(0, exec("//e:ran")),
+        at(
+            500,
+            end("//e:ran", Some("execute //e:ran: exit status: 101"), None),
+        ),
+    ]);
+    let reader = Arc::new(StubReader::default());
+    let log: String = (1..=60).map(|i| format!("line{i}\n")).collect();
+    reader.set_log("//e:ran", log.as_bytes());
+    let r = Redact::default();
+    let mut t = open_on(&s, "//e:ran", TargetTab::Log, Some(reader));
+    let f = target_frame_until(&s, &mut t, &r, |f| f.iter().any(|l| l.contains("line60")));
+    // `NN lineNN`: a log row, not the tab row's line count.
+    let log_row = |l: &String| {
+        l.split_once(' ')
+            .is_some_and(|(n, rest)| n.parse::<u32>().is_ok() && rest.starts_with("line"))
+    };
+    let first = f.iter().position(log_row).expect("the log on screen");
+    let last = f.iter().rposition(log_row).expect("the log on screen");
+    assert!(
+        first > usize::from(BODY_TOP),
+        "the status rows above: {f:#?}"
+    );
+    let y = u16::try_from(first).expect("a screen row");
+    for (at, what) in [
+        (Position::new(0, y), "the line numbers"),
+        (Position::new(10, 0), "the header"),
+        (Position::new(10, BODY_TOP), "the status row"),
+    ] {
+        assert!(t.selection_doc(at, &r).is_none(), "{what}");
+    }
+    let doc = t
+        .selection_doc(Position::new(10, y), &r)
+        .expect("a doc in the log");
+    assert_eq!(doc.area.y, y);
+    assert_eq!(usize::from(doc.area.height), last - first + 1, "{f:#?}");
+    assert_eq!(doc.text_left, 3, "past `NN `");
+    assert_eq!(doc.rows.len(), 60);
+    assert_eq!(doc.top, 60 - usize::from(doc.area.height), "following");
+    assert!(
+        f[first].ends_with(&format!("line{}", doc.top + 1)),
+        "{f:#?}"
+    );
+    // A following pane would draw its end again.
+    t.scroll_to(5);
+    let f = target_frame(&s, &mut t, 10_000, &r);
+    assert!(f[first].ends_with(" line6"), "{f:#?}");
+}
+
+/// A drag in Outputs (and Overview, the same path) selects in the whole
+/// body, scrolled where the frame drew it; a drag that scrolled it leaves
+/// it there.
+#[test]
+fn a_drag_in_outputs_selects_in_the_whole_body() {
+    use ratatui::layout::Position;
+    let s = fold(&[
+        at(0, start("//o:done")),
+        at(0, exec("//o:done")),
+        at(1_000, exec_end("//o:done")),
+        at(1_000, end("//o:done", None, None)),
+    ]);
+    let reader = Arc::new(StubReader::default());
+    let groups = (1..=40)
+        .map(|i| OutputGroup {
+            name: format!("group{i}"),
+            size: 1_000,
+            hash: None,
+            files: vec![file(&format!("gen/f{i}.rs"), 1_000)],
+            unavailable: None,
+        })
+        .collect();
+    reader.set_outputs("//o:done", OutputsFound::Listing(groups));
+    let r = Redact::default();
+    let mut t = open_on(&s, "//o:done", TargetTab::Outputs, Some(reader));
+    target_frame_until(&s, &mut t, &r, |f| f.iter().any(|l| l.contains("group1")));
+    t.scroll(4);
+    let f = target_frame(&s, &mut t, 10_000, &r);
+    let top = usize::from(BODY_TOP);
+    let doc = t
+        .selection_doc(Position::new(3, BODY_TOP), &r)
+        .expect("a doc in the body");
+    assert_eq!(doc.area.y, BODY_TOP);
+    assert_eq!(doc.top, 4);
+    assert!(doc.rows.len() > 40, "every group: {}", doc.rows.len());
+    let row = |k: usize| text(&doc.rows[k].line);
+    assert_eq!(row(4), f[top], "the doc's top row is the one drawn there");
+    assert!(
+        t.selection_doc(Position::new(3, 0), &r).is_none(),
+        "the header"
+    );
+    t.scroll_to(10);
+    let f = target_frame(&s, &mut t, 10_000, &r);
+    assert_eq!(f[top], row(10));
 }
 
 /// Outputs lists a finished target's groups with each file's path and size

@@ -17,12 +17,14 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 
 use hcore::approval_notice::{NoticeRoots, NoticeSource, ReadNotice};
 
+use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use super::chrome::{CHROME_ROWS, TABS_ROW, end_sub_frame, on_back, sub_tab_rows};
 use super::header::{Title, header_top};
 use super::model::Gauge;
+use crate::tui::app::{DocRow, SelectDoc};
 use crate::tui::approval::QueuedApproval;
 use crate::tui::text::{
     Redact, clean_inline, cut_left, cut_right, expand_tabs, sanitize_log, take_width, width,
@@ -133,6 +135,18 @@ fn drawable(text: &str, redact: &Redact) -> Vec<String> {
         .collect()
 }
 
+/// A notice row's text, and whether its line goes on in the next row.
+type WrappedRow = (String, bool);
+
+/// The columns a notice's rows are indented by.
+const NOTICE_INDENT: u16 = 2;
+
+/// A notice row as drawn: indented by [`NOTICE_INDENT`].
+fn notice_row(text: &str) -> Line<'static> {
+    let indent = usize::from(NOTICE_INDENT);
+    Line::raw(format!("{:indent$}{text}", ""))
+}
+
 /// `line` wrapped to `cols`, each piece no wider: a long line shows whole
 /// on several rows.
 fn wrap(line: &str, cols: usize, out: &mut Vec<String>) {
@@ -195,8 +209,13 @@ pub struct ApprovalScreen {
     flash: Option<Flash>,
     texts: HashMap<NoticeKey, NoticeText>,
     feed: Option<NoticeFeed>,
-    /// The current notice wrapped at a width: `(cols, notice, rows)`.
-    wrapped: Option<(usize, usize, Vec<String>)>,
+    /// The current notice wrapped at a width: `(cols, notice, rows)`, each
+    /// row with whether its line goes on in the next.
+    wrapped: Option<(usize, usize, Vec<WrappedRow>)>,
+    /// The notice's rows on the last frame, the full width of them.
+    body_area: Rect,
+    /// The notice the last [`Self::selection_doc`] came from.
+    doc_of: Option<NoticeKey>,
     /// The tab row's notice labels, by column, as the last frame drew them.
     tabs: Vec<(Range<u16>, usize)>,
     rows: u16,
@@ -221,6 +240,8 @@ impl ApprovalScreen {
             texts: HashMap::new(),
             feed,
             wrapped: None,
+            body_area: Rect::default(),
+            doc_of: None,
             tabs: Vec::new(),
             rows: 0,
             body_rows: 0,
@@ -347,6 +368,51 @@ impl ApprovalScreen {
         self.scroll(if down { WHEEL_ROWS } else { -WHEEL_ROWS });
     }
 
+    /// The notice's whole text when `at` is in its rows on the last frame,
+    /// for a drag to select and scroll in. `None` off it, or with no
+    /// notice text on screen (being read, unavailable, none declared).
+    pub fn selection_doc(&mut self, at: Position) -> Option<SelectDoc> {
+        if !self.body_area.contains(at) {
+            return None;
+        }
+        let Some(NoticeText::Lines(_)) = self.notice_key().and_then(|k| self.texts.get(&k)) else {
+            return None;
+        };
+        let (_, notice, rows) = self.wrapped.as_ref()?;
+        if *notice != self.notice {
+            return None;
+        }
+        self.doc_of = self.notice_key();
+        Some(SelectDoc {
+            area: self.body_area,
+            // Past the notice's indent.
+            text_left: NOTICE_INDENT,
+            rows: rows
+                .iter()
+                .map(|(r, joined)| DocRow {
+                    line: notice_row(r),
+                    whole: None,
+                    joined: *joined,
+                })
+                .collect(),
+            top: self.scroll,
+        })
+    }
+
+    /// A drag left the notice scrolled to row `top`. Only the notice the
+    /// drag's doc came from: the request on screen can move on under a
+    /// held button (decided elsewhere, cancelled), and the next one opens
+    /// at its top.
+    pub fn scroll_to(&mut self, top: usize) {
+        if self
+            .doc_of
+            .take()
+            .is_some_and(|k| Some(k) == self.notice_key())
+        {
+            self.scroll = top;
+        }
+    }
+
     /// A click at `(col, row)` of the last frame: the breadcrumb or a
     /// notice tab. Nothing on this screen decides.
     pub fn click(&mut self, col: u16, row: u16) -> ApprovalClick {
@@ -433,18 +499,25 @@ impl ApprovalScreen {
                     !matches!(&self.wrapped, Some((c, k, _)) if *c == room && *k == self.notice);
                 if fresh {
                     let mut rows = Vec::with_capacity(lines.len());
+                    let mut joined = Vec::with_capacity(lines.len());
                     for l in lines {
+                        let first = rows.len();
                         wrap(l, room, &mut rows);
+                        // Each of a line's rows but its last goes on in the next.
+                        let last = rows.len().saturating_sub(1);
+                        joined.extend((first..rows.len()).map(|k| k < last));
                     }
                     // A trailing newline is not a row of its own.
                     if rows.len() > 1 && rows.last().is_some_and(String::is_empty) {
                         rows.pop();
+                        joined.pop();
                     }
-                    self.wrapped = Some((room, self.notice, rows));
+                    self.wrapped =
+                        Some((room, self.notice, rows.into_iter().zip(joined).collect()));
                 }
                 self.wrapped
                     .as_ref()
-                    .map(|(_, _, rows)| rows.iter().map(|r| Line::raw(format!("  {r}"))).collect())
+                    .map(|(_, _, rows)| rows.iter().map(|(r, _)| notice_row(r)).collect())
                     .unwrap_or_default()
             }
         }
@@ -467,6 +540,12 @@ impl ApprovalScreen {
         let (tabs, rule) = self.tab_rows(inp.glyph, inp.queue, c);
         out.push(tabs);
         out.push(rule);
+        self.body_area = Rect::new(
+            0,
+            u16::try_from(out.len()).unwrap_or(u16::MAX),
+            cols,
+            u16::try_from(body_rows).unwrap_or(u16::MAX),
+        );
         self.rows = rows;
         out.extend(body.into_iter().skip(self.scroll).take(body_rows));
         end_sub_frame(&mut out, self.hints(inp.now_ms, c), rows);

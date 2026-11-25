@@ -15,14 +15,16 @@ use crossterm::terminal::{
 use futures::StreamExt;
 use ratatui::backend::{Backend, ClearType};
 use ratatui::buffer::Buffer;
-use ratatui::layout::Position;
+use ratatui::layout::{Position, Rect};
 use ratatui::prelude::Widget;
-use ratatui::text::Text;
+use ratatui::text::{Line, Text};
 use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::{Terminal, TerminalOptions, Viewport};
 use tokio::sync::mpsc;
 
+use super::select::{Action, Selection};
 use crate::tui::app::{App, AppContext, Control, Decide, MouseInput, ScreenKey, TUIAppView};
+use crate::tui::dashboard::WHEEL_ROWS;
 use crate::tui::log_sink::{LogSink, REPLAY_FLUSH_TIMEOUT, ReplayMark, Replayed, SinkLine};
 use crate::tui::session::recorder::ViewTap;
 use crate::tui::session::{SessionSlot, TappedReceiver};
@@ -57,9 +59,11 @@ const LEAVE_ALT_SCREEN: &[u8] = b"\x1b[?1049l";
 /// at worst one extra "off", never a capture left on.
 static MOUSE_UP: AtomicBool = AtomicBool::new(false);
 
-/// Button presses (1000) reported in SGR encoding (1006). Not crossterm's
-/// `EnableMouseCapture`, which also turns on any-motion reporting (1003): an
-/// event for every cell the pointer crosses.
+/// Button presses, and motion while a button is down (1002), reported in SGR
+/// encoding (1006): the motion is what a drag selects with (see
+/// [`super::select`]). Not crossterm's `EnableMouseCapture`, which also turns
+/// on any-motion reporting (1003): an event for every cell the pointer
+/// crosses, button or not.
 ///
 /// Then alternate scroll (1007) off: a terminal with it on turns the wheel
 /// into ↑/↓ on the alternate screen, which would move the selection instead
@@ -70,9 +74,12 @@ static MOUSE_UP: AtomicBool = AtomicBool::new(false);
 /// screen, so leaving it off changes nothing on the main screen; the cost
 /// is a later full-screen program without mouse reporting (`less`) whose
 /// wheel no longer scrolls in a terminal that had 1007 on.
-const MOUSE_ON: &[u8] = b"\x1b[?1000h\x1b[?1006h\x1b[?1007l";
-/// Both capture modes off; also what the hard abort writes.
-const MOUSE_OFF: &[u8] = b"\x1b[?1000l\x1b[?1006l";
+///
+/// 1000 goes first: a terminal that knows it but not 1002 still reports
+/// clicks and the wheel. One that knows both takes the last one set.
+const MOUSE_ON: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?1007l";
+/// Every capture mode off; also what the hard abort writes.
+const MOUSE_OFF: &[u8] = b"\x1b[?1002l\x1b[?1000l\x1b[?1006l";
 
 /// Whether the full screens capture the mouse: yes, unless `HEPH_NO_MOUSE`
 /// is set to anything but `0` or nothing. No config key (spec decision).
@@ -104,7 +111,28 @@ struct FullScreen {
     /// The terminal was resized since the last draw: the next one repaints
     /// every cell, not only the ones that changed. See [`FullScreen::draw`].
     resized: bool,
+    /// The mouse's selection: a left press held down freezes the frame,
+    /// drawn in place of the view's until the release (see
+    /// [`super::select`]).
+    select: Selection,
+    /// Whether the approval view was up at the press: a release-click on a
+    /// screen that changed under the button is dropped, not matched against
+    /// a hit map the user never saw.
+    press_approval: bool,
+    /// When the selection was last drawn from a motion report, to draw at
+    /// most every [`SELECT_REPAINT`] (the tick catches up).
+    painted: Instant,
+    /// The note a copy leaves on the hint row, and when it was made.
+    notice: Option<(String, Instant)>,
 }
+
+/// The least time between two draws of a selection from motion reports: a
+/// burst of them over a slow link draws once, not once per report.
+const SELECT_REPAINT: Duration = Duration::from_millis(16);
+/// How long a copy's note stays on the hint row.
+const NOTICE_FOR: Duration = Duration::from_millis(1500);
+/// The hint row while a press is held.
+const SELECTING_HINT: &str = " selecting · release to copy · any key cancels";
 
 impl FullScreen {
     /// Switch to the alternate screen, and capture the mouse on it when
@@ -126,6 +154,10 @@ impl FullScreen {
         let screen = Self {
             terminal,
             resized: false,
+            select: Selection::default(),
+            press_approval: false,
+            painted: Instant::now(),
+            notice: None,
         };
         crossterm::execute!(io::stderr(), EnterAlternateScreen)
             .context("entering the alternate screen")?;
@@ -148,13 +180,121 @@ impl FullScreen {
     /// size clears the screen and drops ratatui's idea of what is on it;
     /// unlike `clear`, it sends no cursor query, which must not race the
     /// input stream.
-    fn draw(&mut self, frame: impl FnOnce(&mut ratatui::Frame<'_>)) -> io::Result<()> {
+    ///
+    /// `lines` is the view's frame for the area. While a press is held it
+    /// is not asked: the frozen frame is drawn instead, with the selection
+    /// on it. A resize ends the drag, since the frame it froze no longer
+    /// fits; so does [`select::IDLE`](super::select::IDLE) with no mouse
+    /// report. A pointer held past a pane's edge scrolls it a step here,
+    /// since a still pointer sends no report.
+    fn draw(
+        &mut self,
+        now: Instant,
+        lines: impl FnOnce(Rect) -> Vec<Line<'static>>,
+    ) -> io::Result<()> {
+        if std::mem::take(&mut self.resized) {
+            self.select.cancel();
+            let size = self.terminal.size()?;
+            self.terminal.resize(size.into())?;
+        }
+        self.select.expire(now);
+        self.select.tick(now);
+        if self
+            .notice
+            .as_ref()
+            .is_some_and(|(_, at)| now.saturating_duration_since(*at) >= NOTICE_FOR)
+        {
+            self.notice = None;
+        }
+        let notice = self.notice.as_ref().map(|(text, _)| text.as_str());
+        let held = self.select.held();
+        let mut misfit = false;
+        self.terminal.draw(|fr| {
+            let area = fr.area();
+            match held {
+                Some(d) if d.fits(area) => {
+                    d.paint(fr.buffer_mut());
+                    hint_row(fr.buffer_mut(), SELECTING_HINT);
+                }
+                _ => {
+                    misfit = held.is_some();
+                    fr.render_widget(Paragraph::new(Text::from(lines(area))), area);
+                    if let Some(text) = notice {
+                        hint_row(fr.buffer_mut(), text);
+                    }
+                }
+            }
+        })?;
+        if misfit {
+            self.select.cancel();
+        }
+        Ok(())
+    }
+
+    /// A left press: draw the view's frame now and return it, to freeze, so
+    /// the drag that may follow selects from what is on screen.
+    fn freeze(&mut self, lines: impl FnOnce(Rect) -> Vec<Line<'static>>) -> io::Result<Buffer> {
+        self.select.cancel();
         if std::mem::take(&mut self.resized) {
             let size = self.terminal.size()?;
             self.terminal.resize(size.into())?;
         }
-        self.terminal.draw(frame).map(drop)
+        let done = self.terminal.draw(|fr| {
+            let area = fr.area();
+            fr.render_widget(Paragraph::new(Text::from(lines(area))), area);
+        })?;
+        Ok(done.buffer.clone())
     }
+
+    /// Draw the held selection now rather than on the next tick, at most
+    /// every [`SELECT_REPAINT`]. Only the frozen frame is drawn, never the
+    /// view's: a selection that no longer fits the screen ends, drawing
+    /// nothing, and the next tick draws the view. A failed draw is logged:
+    /// the next tick draws again.
+    fn repaint_selection(&mut self, now: Instant) {
+        if let Err(e) = self.try_repaint_selection(now) {
+            tracing::debug!(error = %e, "drawing the selection");
+        }
+    }
+
+    fn try_repaint_selection(&mut self, now: Instant) -> io::Result<()> {
+        if now.saturating_duration_since(self.painted) < SELECT_REPAINT {
+            return Ok(());
+        }
+        let area = Rect::from((Position::ORIGIN, self.terminal.size()?));
+        if self.resized || !self.select.held().is_some_and(|d| d.fits(area)) {
+            self.select.cancel();
+            return Ok(());
+        }
+        self.painted = now;
+        self.draw(now, |_| Vec::new())
+    }
+
+    /// The drag, if any, ends without copying: a key.
+    fn cancel_selection(&mut self) {
+        self.select.cancel();
+    }
+}
+
+/// Write `text` over the frame's last row, the hint row: a selection's own
+/// hints, or the note a copy leaves.
+fn hint_row(buf: &mut Buffer, text: &str) {
+    let area = buf.area;
+    let Some(y) = area.bottom().checked_sub(1).filter(|&y| y >= area.top()) else {
+        return;
+    };
+    for x in area.left()..area.right() {
+        if let Some(cell) = buf.cell_mut((x, y)) {
+            cell.reset();
+        }
+    }
+    buf.set_stringn(
+        area.left(),
+        y,
+        text,
+        usize::from(area.width),
+        ratatui::style::Style::default().fg(ratatui::style::Color::DarkGray),
+    );
 }
 
 impl Drop for FullScreen {
@@ -530,6 +670,13 @@ pub async fn run<A: App + 'static>(
                 {
                     view.disarm_stop();
                 }
+                // A key ends a drag without copying: the key acts on the
+                // view, which the frozen frame would otherwise hide.
+                if let Some(Ok(Event::Key(_))) = &maybe_evt
+                    && let Some(f) = full.as_mut()
+                {
+                    f.cancel_selection();
+                }
                 match maybe_evt {
                     Some(Ok(ev)) if stop_arm::is_ctrl_c(&ev) => {
                         // On a full screen the first press only arms; the
@@ -690,9 +837,9 @@ pub async fn run<A: App + 'static>(
                     // The mouse, captured only while a full screen is up: a
                     // report still in flight as it closed lands here with
                     // the line up, and is dropped.
-                    Some(Ok(Event::Mouse(m))) if full.is_some() => {
-                        if let Some(input) = mouse_input(m) {
-                            view.mouse(input);
+                    Some(Ok(Event::Mouse(m))) => {
+                        if let Some(f) = full.as_mut() {
+                            on_mouse(f, &mut view, m);
                         }
                     }
                     Some(Ok(Event::Resize(w, h))) => {
@@ -704,6 +851,10 @@ pub async fn run<A: App + 'static>(
                         needs_resize = true;
                         if let Some(f) = full.as_mut() {
                             f.resized = true;
+                            // Now, not at the next draw: a release before it
+                            // would copy, or scroll the view, from rows laid
+                            // out at the old size.
+                            f.cancel_selection();
                         }
                     }
                     _ => {}
@@ -831,10 +982,8 @@ pub async fn run<A: App + 'static>(
                     // the ioctl as it draws, and repaints every cell after
                     // a resize.
                     let now = now_unix_ms();
-                    drop(f.draw(|fr| {
-                        let area = fr.area();
-                        let lines = view.render_full(now, area.width, area.height);
-                        fr.render_widget(Paragraph::new(Text::from(lines)), area);
+                    drop(f.draw(Instant::now(), |area| {
+                        view.render_full(now, area.width, area.height)
                     }));
                     // Under the held dashboard, once it has been up a while
                     // (so a test sees it before the panic takes it down).
@@ -960,27 +1109,106 @@ pub async fn run<A: App + 'static>(
     result
 }
 
-/// What a captured mouse event means to a full screen: a left press or a
-/// wheel step. Releases (mode 1000 reports them), other buttons and
-/// modified presses mean nothing.
-fn mouse_input(m: MouseEvent) -> Option<MouseInput> {
+/// A captured mouse event on the full screen `f`. A left press freezes the
+/// frame; a drag selects on it, and scrolls the pane it started in when the
+/// wheel turns or the pointer is held past the pane's edge; the release
+/// copies the selection and says so on the hint row, or is a click when
+/// there was no drag. A wheel step that is not a drag's ends any drag and
+/// scrolls the view. Other buttons and modified presses mean nothing.
+fn on_mouse(f: &mut FullScreen, view: &mut impl TUIAppView, m: MouseEvent) {
     let (col, row) = (m.column, m.row);
+    let at = Position::new(col, row);
+    let now = Instant::now();
     match m.kind {
-        MouseEventKind::Down(MouseButton::Left) if m.modifiers.is_empty() => {
-            Some(MouseInput::Click { col, row })
+        // Not as the screen closes (esc or `q` went in before the tick
+        // takes it down): there is no frame of it to freeze.
+        MouseEventKind::Down(MouseButton::Left) if m.modifiers.is_empty() && view.full_screen() => {
+            let ms = now_unix_ms();
+            match f.freeze(|area| view.render_full(ms, area.width, area.height)) {
+                Ok(frozen) => {
+                    let doc = view.selection_doc(at);
+                    f.select.press(frozen, doc, at, now);
+                    f.press_approval = view.in_approval_view();
+                }
+                Err(e) => tracing::debug!(error = %e, "freezing the frame for a selection"),
+            }
         }
-        MouseEventKind::ScrollUp => Some(MouseInput::Wheel {
-            col,
-            row,
-            down: false,
-        }),
-        MouseEventKind::ScrollDown => Some(MouseInput::Wheel {
-            col,
-            row,
-            down: true,
-        }),
-        _ => None,
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if f.select.motion(at, now) == Action::Repaint {
+                f.repaint_selection(now);
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            let released = f.select.release(at);
+            // Not on a screen that changed under the button: a click or a
+            // scroll is matched against what the user saw.
+            let same_screen = view.in_approval_view() == f.press_approval;
+            if let Some(top) = released.scrolled.filter(|_| same_screen) {
+                view.selection_scrolled(top);
+            }
+            match released.action {
+                Action::Click(p) if same_screen => {
+                    view.mouse(MouseInput::Click { col: p.x, row: p.y });
+                }
+                Action::Copy(text) => {
+                    let sent = capped(&text);
+                    match copy_to_clipboard(sent) {
+                        Ok(()) => f.notice = Some((copy_note(sent, &text), now)),
+                        Err(e) => tracing::debug!(error = %e, "copying the selection"),
+                    }
+                }
+                Action::Click(_) | Action::Repaint | Action::Nothing => {}
+            }
+        }
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            let down = m.kind == MouseEventKind::ScrollDown;
+            let rows = if down { WHEEL_ROWS } else { -WHEEL_ROWS };
+            match f.select.wheel(rows, now) {
+                Some(Action::Repaint) => f.repaint_selection(now),
+                Some(_) => {}
+                None => view.mouse(MouseInput::Wheel { col, row, down }),
+            }
+        }
+        _ => {}
     }
+}
+
+/// The most text one copy sends, in bytes: about 87 KB once base64'd into
+/// the OSC 52. Some terminals silently drop a much larger one while the
+/// note would still say "copied"; past this, the copy is cut and the note
+/// says so.
+const COPY_CAP: usize = 64 * 1024;
+
+/// `text` cut to [`COPY_CAP`] bytes, on a character boundary.
+fn capped(text: &str) -> &str {
+    text.get(..text.floor_char_boundary(COPY_CAP))
+        .unwrap_or(text)
+}
+
+/// The hint-row note for a copy that sent `sent` of the selected `text`.
+fn copy_note(sent: &str, text: &str) -> String {
+    let n = sent.chars().count();
+    let what = if sent.len() < text.len() {
+        format!("the first {n} of {} chars", text.chars().count())
+    } else {
+        format!("{n} char{}", if n == 1 { "" } else { "s" })
+    };
+    format!(
+        " copied {what} (OSC 52) · not on your clipboard? HEPH_NO_MOUSE=1 gives the terminal its own selection"
+    )
+}
+
+/// Put `text` on the system clipboard through the terminal: an OSC 52
+/// ("set the clipboard selection to this base64"). The terminal decides
+/// whether to honour it; one that does not (or a multiplexer not set to
+/// pass it on, as tmux's `set-clipboard` default) drops it, and nothing
+/// says so — heph cannot learn the outcome without a query racing the
+/// input stream.
+fn copy_to_clipboard(text: &str) -> io::Result<()> {
+    crossterm::execute!(
+        io::stderr(),
+        crossterm::clipboard::CopyToClipboard::to_clipboard_from(text)
+    )
 }
 
 /// The decision `key` asks for: `y`/`n`/`Y`/`N` pressed (without ctrl)
@@ -1440,10 +1668,40 @@ impl Replay {
 
 #[cfg(test)]
 mod tests {
-    use super::{IntoText, RunEnd, TICK, bg_drained, exit_drain_wake, rows_needed};
+    use super::{
+        COPY_CAP, IntoText, RunEnd, TICK, bg_drained, capped, copy_note, exit_drain_wake,
+        rows_needed,
+    };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    #[test]
+    fn a_copy_under_the_cap_is_sent_whole() {
+        let text = "a".repeat(COPY_CAP);
+        assert_eq!(capped(&text), text);
+        assert!(copy_note(capped(&text), &text).starts_with(" copied 65536 chars (OSC 52)"));
+        assert!(copy_note("x", "x").starts_with(" copied 1 char (OSC 52)"));
+        assert_eq!(capped(""), "");
+    }
+
+    #[test]
+    fn a_copy_over_the_cap_is_cut_on_a_char_and_says_so() {
+        // 3-byte chars: the cap falls inside one, so the cut lands before it.
+        let text = "漢".repeat(COPY_CAP / 3 + 10);
+        let sent = capped(&text);
+        assert_eq!(sent.len(), COPY_CAP / 3 * 3);
+        assert!(text.starts_with(sent));
+        let note = copy_note(sent, &text);
+        assert!(
+            note.starts_with(&format!(
+                " copied the first {} of {} chars (OSC 52)",
+                COPY_CAP / 3,
+                COPY_CAP / 3 + 10
+            )),
+            "{note}"
+        );
+    }
 
     /// Regression: while the app future does CPU-bound sync work between
     /// awaits (e.g. `block_in_place` for a filesystem walk or Starlark
