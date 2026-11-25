@@ -166,8 +166,6 @@ fn validate_positional_label(label: &str) -> anyhow::Result<()> {
     Err(err)
 }
 
-/// Tally a parsed query matcher's nodes into telemetry counts. Walks the tree
-/// the real parser produced, so the syntax is never re-interpreted; counts only.
 /// Print `rows` as a keep-going command's JSON list: closed with its `]` only
 /// when the walk skipped nothing (`gaps` empty), so a list with gaps is never
 /// read as whole (D10). `finalize` then fails the command for the gaps.
@@ -189,6 +187,8 @@ where
     Ok(())
 }
 
+/// Tally a parsed query matcher's nodes into telemetry counts. Walks the tree
+/// the real parser produced, so the syntax is never re-interpreted; counts only.
 fn count_matcher(m: &Matcher, c: &mut htelemetry::telemetry::QueryExprCounts) {
     match m {
         Matcher::Addr(_) => c.addr += 1,

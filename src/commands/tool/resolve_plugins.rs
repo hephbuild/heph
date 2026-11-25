@@ -1,3 +1,6 @@
+use anyhow::Context;
+use std::io::Write;
+
 use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
 use crate::tui::LogSink;
@@ -10,6 +13,18 @@ pub struct Args {
     /// `~/.heph/plugins/<os>-<arch>/` first).
     #[arg(long)]
     pub force: bool,
+    #[command(flatten)]
+    pub out: output::JsonArgs<Resolved>,
+}
+
+/// `heph tool resolve-plugins --json`: what the configured plugins
+/// contributed, once every one of them loaded.
+#[derive(Debug, serde::Serialize, output::Record)]
+pub struct Resolved {
+    /// Every registered provider, by full name, sorted.
+    providers: Vec<String>,
+    /// Every registered driver, by full name, sorted.
+    drivers: Vec<String>,
 }
 
 pub fn execute(
@@ -42,12 +57,31 @@ async fn execute_async(
     providers.sort();
     drivers.sort();
 
-    println!(
-        "plugins resolved \u{2713} ({} providers, {} drivers)",
+    if args.out.enabled() {
+        let resolved = Resolved { providers, drivers };
+        return args.out.record(&resolved, &output::never_cancelled);
+    }
+    let mut out = std::io::stdout().lock();
+    writeln!(
+        out,
+        "plugins resolved \u{2713} ({} providers, {} drivers)\n  providers: {}\n  drivers:   {}",
         providers.len(),
-        drivers.len()
-    );
-    println!("  providers: {}", providers.join(", "));
-    println!("  drivers:   {}", drivers.join(", "));
-    Ok(())
+        drivers.len(),
+        providers.join(", "),
+        drivers.join(", "),
+    )
+    .context("writing the resolved plugins")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn record_keys_subset_of_fields() -> anyhow::Result<()> {
+        output::check_keys(&Resolved {
+            providers: vec!["fs".to_string()],
+            drivers: vec!["exec".to_string()],
+        })
+    }
 }

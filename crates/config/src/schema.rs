@@ -66,14 +66,6 @@ pub(crate) fn empty_is_null(schema: &mut Schema) {
     }
 }
 
-/// [`config_json_schema`] as `heph tool config-schema` prints it: pretty JSON
-/// and a trailing newline.
-pub fn config_json_schema_text() -> serde_json::Result<String> {
-    let mut text = serde_json::to_string_pretty(&config_json_schema())?;
-    text.push('\n');
-    Ok(text)
-}
-
 /// Mirrors `FuseEnabled`'s `Deserialize`: a boolean, or one of its words
 /// (`"true"` and `"false"` quoted are words too).
 impl JsonSchema for FuseEnabled {
@@ -584,8 +576,8 @@ mod tests {
     /// hashing or insertion reaches the output.
     #[test]
     fn schema_text_is_deterministic() {
-        let a = config_json_schema_text().expect("render");
-        let b = config_json_schema_text().expect("render");
+        let a = serde_json::to_vec(&config_json_schema()).expect("render");
+        let b = serde_json::to_vec(&config_json_schema()).expect("render");
         assert_eq!(a, b);
     }
 
