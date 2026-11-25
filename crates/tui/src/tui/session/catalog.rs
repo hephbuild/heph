@@ -303,9 +303,12 @@ fn copy_attached(conn: &Connection, copy: Rows) -> rusqlite::Result<()> {
                      WHERE span_id IN (SELECT span_id FROM main.spans WHERE session_id = ?1)",
                     [&id],
                 )?;
-                conn.execute_batch(
+                // The machine's per-tick samples stay in the recording; its
+                // start-time figures and session summaries are copied (D25).
+                conn.execute(
                     "INSERT INTO main.metrics SELECT session_id, name, kind, unit, time_us, value,
-                       attributes FROM rec.metrics",
+                       attributes FROM rec.metrics WHERE name NOT IN (?1, ?2, ?3, ?4)",
+                    super::derive::machine::PER_SAMPLE,
                 )?;
             }
             conn.execute(
