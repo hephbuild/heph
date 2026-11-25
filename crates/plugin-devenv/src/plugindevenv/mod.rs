@@ -242,6 +242,16 @@ fn store_path_tokens<'a>(text: &'a str, store_dir: &str) -> BTreeSet<&'a str> {
 ///
 /// One that still does not exist is left out: a path that is not in the store
 /// now cannot go missing from it, and nix refuses to root it.
+///
+/// Accepted exemption: a `nix-collect-garbage` between devenv's capture and
+/// this check can delete a path the capture named. It is then left out like a
+/// path that was never built, and the root does not cover it: the declared
+/// closure under-reports what `runner.json` names, which the engine trusts
+/// (I2), so the cached entry stays a hit and a consumer that runs the missing
+/// path fails. Nothing here can tell the two apart or bring the path back, and
+/// failing the run instead would fail every runner whose environment names an
+/// unbuilt path. It is logged at warn, naming the path, so the failure a
+/// consumer hits later can be traced to it; re-running the runner rebuilds it.
 fn resolve_store_paths(tokens: Vec<String>, store_dir_len: usize) -> BTreeSet<String> {
     // `<store_dir>/<hash>-` and one byte of name.
     let min_len = store_dir_len + 1 + STORE_HASH_LEN + 2;
@@ -259,10 +269,12 @@ fn resolve_store_paths(tokens: Vec<String>, store_dir_len: usize) -> BTreeSet<St
                     Some(token)
                 }
                 None => {
-                    tracing::debug!(
+                    tracing::warn!(
                         path = %token,
-                        "devenv_runner: runner.json names a store path that is not in the store; \
-                         nothing to root"
+                        "devenv_runner: runner.json names a store path that is not in the store, \
+                         so it is not rooted. It was never built, or a garbage collection took it \
+                         after devenv captured the environment; a target that uses it will fail \
+                         until the runner re-runs"
                     );
                     None
                 }
