@@ -31,6 +31,37 @@ A `def` with no return type gets one inferred from its `return` statements,
 and calls to it are checked against that type. Lambdas cannot be annotated, so
 they are exempt.
 
+### Declared types
+
+A BUILD file can declare its own types and annotate with them. The available
+forms are `record` (with `field` for a default), `enum`, a type alias, and
+`typing` (`typing.Any`, `typing.Callable`, `typing.Iterable`,
+`typing.Never`). A declared type can be loaded like any other name:
+
+```python
+Mode = enum("debug", "release")
+Lib = record(name = str, mode = Mode, srcs = field(list[str], []))
+Names = list[str]
+
+def lib(l: Lib) -> Names:
+    n: Names = 1          # reported: an alias is a type expression
+    return [l.name]
+
+def app():
+    lib("a")              # not reported: `Lib` is `Any` to the checker
+```
+
+Lint checks an alias, since it is a type expression. A `record` or `enum` is
+the result of a call, and the checker runs nothing, so it treats the
+annotation as `Any`. Evaluation enforces all three: `lib("a")` fails at
+`heph run` with ``Value `a` of type `string` does not match the type
+annotation `Lib` …``. The same applies to a record field of the wrong type
+and to an enum value that is not a variant.
+
+A record or enum value cannot be passed to `target()` itself, whose config
+holds only None, str, bool, int, float, list and dict. Pass its fields
+(`l.name`, `mode.value`) instead.
+
 ## The targets
 
 | Target | Does | Writes | Labels |

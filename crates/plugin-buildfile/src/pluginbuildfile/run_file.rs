@@ -13,7 +13,7 @@ use hplugin::function::{FnArgs, FnCallContext, FunctionRegistry, PluginFn};
 use hplugin::provider::{Approval, ProvenanceFrame};
 use hwalk::{CachedWalker, EntryKind};
 use starlark::any::ProvidesStaticType;
-use starlark::environment::{FrozenModule, Globals, GlobalsBuilder, Module};
+use starlark::environment::{FrozenModule, Globals, GlobalsBuilder, LibraryExtension, Module};
 use starlark::eval::{Arguments, Evaluator, FileLoader};
 use starlark::starlark_module;
 use starlark::syntax::{AstModule, Dialect};
@@ -320,6 +320,18 @@ pub(crate) fn build_globals(
     })
 }
 
+/// The starlark extensions a BUILD file declares its own types with, on top of
+/// the standard globals: `record`/`field`, `enum`, and `typing` (`typing.Any`,
+/// `typing.Callable`, `typing.Iterable`, `typing.Never`, and `eval_type`).
+///
+/// `StructType` is deliberately absent: `struct` is heph's own builtin, which
+/// returns a dict `target()` accepts.
+const USER_TYPE_EXTENSIONS: &[LibraryExtension] = &[
+    LibraryExtension::RecordType,
+    LibraryExtension::EnumType,
+    LibraryExtension::Typing,
+];
+
 /// The globals every BUILD file sees: the static `starlark_module` builtins
 /// (`target`, …), `heph.core` and `heph.types` (with `kwargs`, each driver's
 /// `heph.types.<driver>.Kwargs`), plus whatever `plugins` adds to the `heph`
@@ -330,7 +342,7 @@ pub(crate) fn heph_globals(
     kwargs: &crate::pluginbuildfile::types::DriverKwargs,
     plugins: impl Fn(&mut GlobalsBuilder),
 ) -> Globals {
-    GlobalsBuilder::standard()
+    GlobalsBuilder::extended_by(USER_TYPE_EXTENSIONS)
         .with(starlark_module)
         .with_namespace("heph", |hb| {
             // Static `heph.core` host/platform builtins.
@@ -5557,5 +5569,78 @@ target(name = "hand", driver = "exec", transitive = {"deps": {"g": [":sib", "//o
         let typo = Value::Map(HashMap::from([("requred".to_string(), Value::Bool(true))]));
         approval_from(typo.clone()).expect_err("unknown key");
         assert!(!ty.matches(&typo));
+    }
+
+    /// The types a BUILD file declares for itself: a `record` (with a `field`
+    /// default), an `enum`, a type alias, and `typing`, each usable as an
+    /// annotation.
+    const USER_TYPES: &str = r#"
+Mode = enum("debug", "release")
+Lib = record(name = str, mode = Mode, srcs = field(list[str], []))
+Names = list[str]
+
+def lib(l: Lib, extra: typing.Any = None) -> Names:
+    target(name = l.name, driver = "d", mode = l.mode.value, srcs = l.srcs)
+    return [l.name]
+"#;
+
+    #[test]
+    fn user_declared_types_evaluate() {
+        let config = run_target_config(&format!(
+            "{USER_TYPES}\nlib(Lib(name = \"a\", mode = Mode(\"release\")))\n"
+        ));
+        assert_eq!(
+            config.get("mode"),
+            Some(&htvalue::Value::String("release".to_string()))
+        );
+        assert_eq!(config.get("srcs"), Some(&htvalue::Value::List(vec![])));
+    }
+
+    /// Evaluation checks a declared type wherever it is used: an annotation, a
+    /// record field, an enum variant.
+    #[test]
+    fn user_declared_types_checked_at_evaluation() {
+        for (call, want) in [
+            ("lib(\"a\")", "type annotation `Lib`"),
+            ("lib(Lib(name = 1, mode = Mode(\"debug\")))", "`str`"),
+            ("lib(Lib(name = \"a\", mode = Mode(\"fast\")))", "fast"),
+        ] {
+            let err = run_target_config_err(&format!("{USER_TYPES}\n{call}\n"));
+            assert!(err.contains(want), "{call}: {err}");
+        }
+    }
+
+    /// A type declared in one file is the same type in the file that loads it,
+    /// through a file load and through a directory load (which re-exports each
+    /// file's frozen values, [`merge_pkg_results`]).
+    #[test]
+    fn user_declared_types_cross_loads() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("types.BUILD"), USER_TYPES).unwrap();
+        fs::create_dir_all(root.join("lib")).unwrap();
+        fs::write(root.join("lib/BUILD"), USER_TYPES).unwrap();
+        let write_pkg = |pkg: &str, load: &str, call: &str| {
+            fs::create_dir_all(root.join(pkg)).unwrap();
+            let src = format!(
+                "load(\"{load}\", \"Lib\", \"Mode\", \"lib\")\n\n\
+                 def wrap(l: Lib) -> None:\n    lib(l)\n\n{call}\n"
+            );
+            fs::write(root.join(pkg).join("BUILD"), src).unwrap();
+        };
+        let provider = make_provider(&dir);
+        for (pkg, load) in [("fromfile", "//types.BUILD"), ("fromdir", "//lib")] {
+            write_pkg(pkg, load, "wrap(Lib(name = \"a\", mode = Mode(\"debug\")))");
+            let result = run_pkg_blocking(&provider, pkg).expect(load);
+            assert_eq!(result.targets.len(), 1, "{load}");
+
+            let bad = format!("{pkg}_bad");
+            write_pkg(&bad, load, "wrap(\"a\")");
+            let err = run_pkg_blocking(&provider, &bad).expect_err(load);
+            assert!(
+                format!("{err:#}").contains("type annotation `Lib`"),
+                "{load}: {err:#}"
+            );
+        }
     }
 }
