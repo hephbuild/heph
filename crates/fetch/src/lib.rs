@@ -732,7 +732,10 @@ mod tests {
     /// not [`NotHttps`].
     #[test]
     fn errors_never_carry_a_query_fragment_or_userinfo() {
-        const SECRETS: [&str; 3] = ["sekrit", "frag", "hunter2"];
+        // Tokens no symbol name can contain: `{err:?}` carries a backtrace
+        // when RUST_BACKTRACE is set (as in CI), and this test's own name
+        // has "frag" in it.
+        const SECRETS: [&str; 3] = ["Q9sekritQ9", "Q9fragQ9", "Q9hunter2Q9"];
         let check = |err: &anyhow::Error, base: &str| {
             for text in [format!("{err:#}"), format!("{err:?}")] {
                 for s in SECRETS {
@@ -741,7 +744,7 @@ mod tests {
                 assert!(text.contains(base), "{base} not in: {text}");
             }
         };
-        let signed = |base: &str| format!("{base}?X-Amz-Signature=sekrit#frag");
+        let signed = |base: &str| format!("{base}?X-Amz-Signature=Q9sekritQ9#Q9fragQ9");
 
         // An error status: reqwest names the URL in its own message.
         let addr = serve_raw(
@@ -773,7 +776,7 @@ mod tests {
         // Refused by scheme, userinfo included.
         let err = Fetcher::https_capped(1)
             .get(
-                "http://u:hunter2@h.invalid/x?X-Amz-Signature=sekrit#frag",
+                "http://u:Q9hunter2Q9@h.invalid/x?X-Amz-Signature=Q9sekritQ9#Q9fragQ9",
                 &mut Vec::new(),
                 |_| {},
             )
