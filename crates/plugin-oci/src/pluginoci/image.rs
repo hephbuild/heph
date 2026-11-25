@@ -724,8 +724,11 @@ impl ManagedDriver for Driver {
             for (origin, attr, dep) in &own {
                 let (path, descriptor) = select_layer(&dep_files(&req, origin)?, dep, attr)?;
                 // Streamed, not read: a layer can be most of an image, and this
-                // runs once per platform per image target.
-                let (digest, size) = archive::sha256_file(&path)?;
+                // runs once per platform per image target. sha256 over every
+                // byte is CPU work, off the async worker.
+                let job_path = path.clone();
+                let (digest, size) =
+                    hcore::blocking::run(move || archive::sha256_file(&job_path)).await?;
                 // Uncompressed, the blob is the tar: the two digests are one
                 // value, and both are in hand. A mismatch is a corrupted or
                 // hand-edited layer output, which a runtime would reject on
@@ -825,16 +828,16 @@ fn name_list(paths: &[&Path]) -> String {
     if paths.is_empty() {
         return "nothing".to_string();
     }
-    let mut out = paths
+    let shown = paths
         .iter()
         .take(NAMES_SHOWN)
         .map(|p| p.file_name().unwrap_or(p.as_os_str()).to_string_lossy())
         .collect::<Vec<_>>()
         .join(", ");
-    if let Some(more) = paths.len().checked_sub(NAMES_SHOWN).filter(|n| *n > 0) {
-        out.push_str(&format!(", and {more} more"));
+    match paths.len().checked_sub(NAMES_SHOWN).filter(|n| *n > 0) {
+        Some(more) => format!("{shown}, and {more} more"),
+        None => shown,
     }
-    out
 }
 
 /// The blob an `oci.layer` dep produced, and its descriptor, out of the files
@@ -884,6 +887,13 @@ fn select_layer(
         descriptor.blob
     );
     let blob_path = descriptor_path.with_file_name(&descriptor.blob);
+    // Else the descriptor's own JSON would be filed as the layer blob.
+    anyhow::ensure!(
+        blob_path != descriptor_path,
+        "{attr} entry {dep}: its layer descriptor names itself, {:?}, as the blob; the layer's \
+         output is inconsistent, rebuild it",
+        descriptor.blob
+    );
     anyhow::ensure!(
         paths.contains(&blob_path),
         "{attr} entry {dep}: its layer descriptor names the blob {:?}, which it did not \
@@ -919,14 +929,18 @@ fn not_a_layer(paths: &[PathBuf], dep: &str, attr: &str) -> anyhow::Error {
         _ => Vec::new(),
     };
     let fix = if head.starts_with(&GZIP_MAGIC) {
-        "It is gzip-compressed; `oci.layer` adopts an uncompressed tar. Decompress it in a \
-         target of its own (e.g. `gunzip`), then adopt that:\n  target(name = \"<name>\", \
-         driver = \"oci.layer\", tar = \"<the decompressed tar>\")"
-            .to_string()
+        format!(
+            "It is gzip-compressed; `oci.layer` adopts an uncompressed tar. Decompress it in a \
+             target of its own, then adopt that:\n  target(name = \"<name>_tar\", driver = \
+             \"bash\", run = \"gunzip -c $SRC > $OUT\", deps = [\"{dep}\"], out = \
+             \"<name>.tar\")\n  target(name = \"<name>\", driver = \"oci.layer\", tar = \
+             \":<name>_tar\")"
+        )
     } else if head.get(257..262) == Some(b"ustar".as_slice()) {
         format!(
             "It is a tar; adopt it as the layer, as it is:\n  target(name = \"<name>\", driver = \
-             \"oci.layer\", tar = \"{dep}\")"
+             \"oci.layer\", tar = \"{dep}\")\n(the tar's entries are checked when that target \
+             runs)"
         )
     } else {
         format!(
@@ -1501,6 +1515,11 @@ mod tests {
                 "which is not a plain file name",
             ),
             (
+                "descriptor naming itself",
+                vec![("l.oci-layer.json", descriptor_json("l.oci-layer.json", gz))],
+                "its layer descriptor names itself, \"l.oci-layer.json\", as the blob",
+            ),
+            (
                 "a file beside the layer",
                 vec![
                     ("l.tar.gz", "gz".into()),
@@ -1543,15 +1562,19 @@ mod tests {
                 "a tar",
                 tar_path,
                 format!(
-                    "It is a tar; adopt it as the layer, as it is:\n  target(name = \"<name>\", driver = \"oci.layer\", tar = \"{DEP}\")"
+                    "It is a tar; adopt it as the layer, as it is:\n  target(name = \"<name>\", driver = \"oci.layer\", tar = \"{DEP}\")\n(the tar's entries are checked when that target runs)"
                 ),
                 "srcs =",
             ),
             (
                 "a gzip stream",
                 gz_path,
-                "It is gzip-compressed; `oci.layer` adopts an uncompressed tar. Decompress it"
-                    .to_string(),
+                format!(
+                    "It is gzip-compressed; `oci.layer` adopts an uncompressed tar. Decompress it \
+                     in a target of its own, then adopt that:\n  target(name = \"<name>_tar\", \
+                     driver = \"bash\", run = \"gunzip -c $SRC > $OUT\", deps = [\"{DEP}\"], out \
+                     = \"<name>.tar\")"
+                ),
                 "srcs =",
             ),
             (

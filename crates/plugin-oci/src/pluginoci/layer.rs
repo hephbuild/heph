@@ -162,27 +162,6 @@ struct OciLayerSpec {
     ///
     /// Exactly one of `srcs` and `tar`.
     srcs: Vec<String>,
-    /// A target producing one uncompressed tar, used as the layer as it is:
-    /// its entries keep their names, modes, owners and times. For a tar some
-    /// other tool already builds (a rootfs, a vendor's archive).
-    ///
-    /// The tar's bytes are adopted as they are, and compressed per `compress`
-    /// (gzipped unless `compress = False`); its `diff_id` is the tar's own
-    /// digest. Every entry header is read, and refused are: a file that is
-    /// not a tar, a gzipped tar (decompress it first), a tar with no entries,
-    /// an entry with an absolute path or a `..` component, a hardlink to one,
-    /// and a symlink to an absolute path. Whiteout entries are kept: an
-    /// adopted layer may express deletions. `prefix`, `strip` and `mode`
-    /// rewrite paths and modes, so they do not apply and are refused with
-    /// `tar`.
-    ///
-    /// Reproducibility is the producing target's: the layer's digest is a
-    /// function of the tar's bytes, so a tar carrying a build time or the
-    /// builder's uid makes a different layer on every build.
-    ///
-    /// Exactly one of `srcs` and `tar`.
-    #[spec(ty = hcore::htvalue::signature::ParamType::String)]
-    tar: Option<String>,
     /// Where the `srcs` files land inside the image, e.g. `"/usr/bin"`.
     ///
     /// Required with `srcs`, deliberately. A default of `/` (files at their
@@ -190,8 +169,43 @@ struct OciLayerSpec {
     /// wants, so it would be overridden every time — and the one caller who
     /// forgot would get an image that builds and pushes clean and fails at
     /// `docker run` with `stat /usr/bin/server: no such file or directory`.
+    ///
+    /// With `srcs` only: refused with `tar`, whose entries keep their own
+    /// paths.
     #[spec(ty = hcore::htvalue::signature::ParamType::String)]
     prefix: Option<String>,
+    /// Exactly one of `srcs` and `tar`. `srcs` is for files heph builds;
+    /// `tar` is for an archive something else builds (a rootfs, a vendor's
+    /// archive, a `docker export`).
+    ///
+    /// A target producing one uncompressed tar, used as the layer as it is:
+    /// its entries keep their names, modes, owners and times. The tar's bytes
+    /// are adopted unchanged and compressed per `compress` (gzipped unless
+    /// `compress = False`); its `diff_id` is the tar's own digest.
+    ///
+    /// Every entry header is read, and the layer target fails when it runs
+    /// (not at query time) on:
+    ///
+    /// - a file that is not a tar, or is truncated;
+    /// - a gzipped tar (decompress it first);
+    /// - a tar with no entries;
+    /// - an entry with an absolute path or a `..` component, or a hardlink
+    ///   to one, or a hardlink with no target;
+    /// - anything but zero padding after the end of the archive (two tars
+    ///   concatenated, say).
+    ///
+    /// Symlinks are kept whatever they point at: in a container an absolute
+    /// symlink resolves against the image's root, as rootfs tars expect
+    /// (`/usr/bin/awk -> /etc/alternatives/awk`). Whiteout entries are kept
+    /// too: an adopted layer may express deletions. `prefix`, `strip` and
+    /// `mode` rewrite paths and modes, so they do not apply and are refused
+    /// with `tar`.
+    ///
+    /// Reproducibility is the producing target's: the layer's digest is a
+    /// function of the tar's bytes, so a tar carrying a build time or the
+    /// builder's uid makes a different layer on every build.
+    #[spec(ty = hcore::htvalue::signature::ParamType::String)]
+    tar: Option<String>,
     /// A leading workspace-relative path to drop before applying `prefix`, e.g.
     /// `strip = "cmd/server"` puts `cmd/server/bin` at `<prefix>/bin`.
     ///
@@ -223,7 +237,8 @@ struct OciLayerSpec {
     /// saves nothing.
     ///
     /// Flipping it changes the layer's digest, and so the digest of every
-    /// image that lists the layer.
+    /// image that lists the layer. For an adopted `tar`, gzip changes the
+    /// blob's digest but not the `diff_id`, which is always the tar's own.
     #[spec(default = true)]
     compress: bool,
     /// Caching for the layer tar. Defaults to on for both tiers.
@@ -284,6 +299,10 @@ enum LayerSource {
 /// exec-bit mode rule, the gzip encoder and the descriptor. Changing any of
 /// them alters the bytes without altering a single field below, which is the
 /// same-key-different-artifact shape.
+///
+/// It covers what `tar` adoption refuses as well: tightening that rule is a
+/// bump too, or a layer adopted under the looser rule stays in the cache and
+/// keeps being served.
 ///
 /// 2: gzip by default, and the descriptor next to the blob.
 const OCI_LAYER_FORMAT_VERSION: u32 = 2;
@@ -447,8 +466,15 @@ fn write_blob(
     encoding: LayerEncoding,
     fill: impl FnOnce(&mut dyn std::io::Write) -> anyhow::Result<()>,
 ) -> anyhow::Result<String> {
+    // Written beside `out` and renamed over it: an input can sit at `out`
+    // itself (layer `rootfs` adopting `rootfs.tar` with `compress = False`),
+    // and creating `out` up front would truncate it before `fill` reads it.
+    let name = out
+        .file_name()
+        .with_context(|| format!("layer path {out:?} has no file name"))?;
+    let partial = out.with_file_name(format!(".{}.partial", name.to_string_lossy()));
     let file = std::io::BufWriter::new(
-        std::fs::File::create(out).with_context(|| format!("create layer {out:?}"))?,
+        std::fs::File::create(&partial).with_context(|| format!("create layer {partial:?}"))?,
     );
     let (file, hasher) = match encoding {
         LayerEncoding::TarGzip => {
@@ -466,7 +492,8 @@ fn write_blob(
     };
     file.into_inner()
         .map_err(std::io::IntoInnerError::into_error)
-        .with_context(|| format!("flush layer {out:?}"))?;
+        .with_context(|| format!("flush layer {partial:?}"))?;
+    std::fs::rename(&partial, out).with_context(|| format!("move {partial:?} to {out:?}"))?;
     Ok(format!(
         "sha256:{}",
         hex::encode(sha2::Digest::finalize(hasher))
@@ -615,16 +642,17 @@ fn srcs_entries(
     Ok(entries)
 }
 
-/// The one file the `tar` dep produced.
-fn tar_file(req: &ManagedRunRequest<'_, '_>, dep: &str) -> anyhow::Result<PathBuf> {
-    let files = match <[PathBuf; 1]>::try_from(dep_files(req, TAR_ORIGIN)?) {
+/// The one file of `files`, what the `tar` dep produced. `ws_dir` is
+/// stripped from the names an error lists.
+fn tar_file(files: Vec<PathBuf>, ws_dir: &Path, dep: &str) -> anyhow::Result<PathBuf> {
+    let files = match <[PathBuf; 1]>::try_from(files) {
         Ok([only]) => return Ok(only),
         Err(files) => files,
     };
     let names: Vec<String> = files
         .iter()
         .map(|p| {
-            p.strip_prefix(&req.sandbox_ws_dir)
+            p.strip_prefix(ws_dir)
                 .unwrap_or(p)
                 .to_string_lossy()
                 .into_owned()
@@ -672,14 +700,46 @@ impl<R: std::io::Read> std::io::Read for Tee<'_, R> {
     }
 }
 
+/// Forwards the bytes after a tar's end-of-archive block to the sink, and
+/// fails on the first one that is not zero: the padding belongs to the layer,
+/// anything else is data a runtime would drop or reject.
+struct ZeroTail<'s> {
+    sink: &'s mut dyn std::io::Write,
+    /// Set when a non-zero byte was seen, as against a failing sink.
+    trailing_data: bool,
+    /// The sink's error, kept apart as [`Tee`] keeps it.
+    failed: Option<std::io::Error>,
+}
+
+impl std::io::Write for ZeroTail<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.iter().any(|b| *b != 0) {
+            self.trailing_data = true;
+            return Err(std::io::Error::other("data after the end of the archive"));
+        }
+        if let Err(e) = self.sink.write_all(buf) {
+            let shown = std::io::Error::new(e.kind(), e.to_string());
+            self.failed = Some(e);
+            return Err(shown);
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.sink.flush()
+    }
+}
+
 /// Copy the tar at `src`, produced by `dep`, into `sink` byte for byte,
 /// reading every entry header on the way. Streams: the tar is never held in
 /// memory. See [`write_blob`]: blocking.
 ///
 /// What is refused is what would reach outside the layer when a runtime
-/// extracts it — an absolute or `..` entry name, a hardlink to one, an
-/// absolute symlink (the srcs path's rule) — plus a file that is not a tar at
-/// all, a gzipped one, and one with no entries.
+/// extracts it — an absolute or `..` entry name, a hardlink to one or with no
+/// target — plus a file that is not a tar at all, a truncated one, a gzipped
+/// one, one with no entries, and one with data after its end-of-archive
+/// block. Symlinks are not: in a container they resolve against the image's
+/// root, absolute ones included.
 fn adopt_tar(src: &Path, dep: &str, sink: &mut dyn std::io::Write) -> anyhow::Result<()> {
     use std::io::BufRead as _;
     let shown = src.file_name().map_or_else(
@@ -715,11 +775,27 @@ fn adopt_tar(src: &Path, dep: &str, sink: &mut dyn std::io::Write) -> anyhow::Re
     );
     // The archive stops at the first zero block. The rest — the second one
     // and the padding to the record size — is part of the tar the dep wrote,
-    // so it is part of the layer and of its diff_id.
-    let copied = std::io::copy(&mut tee, &mut std::io::sink());
-    if let Some(e) = tee.failed.take() {
+    // so it is part of the layer and of its diff_id. It must be zeros: a
+    // second tar concatenated, or headers after a lone zero block, would be
+    // dropped by one runtime and rejected by another.
+    let Tee {
+        mut inner, sink, ..
+    } = tee;
+    let mut tail = ZeroTail {
+        sink,
+        trailing_data: false,
+        failed: None,
+    };
+    let copied = std::io::copy(&mut inner, &mut tail);
+    if let Some(e) = tail.failed.take() {
         return Err(e).context("write the layer");
     }
+    anyhow::ensure!(
+        !tail.trailing_data,
+        "{dep} produced {shown}, which has data after the end of the archive (two tars \
+         concatenated, or entries after a zero block); a runtime would drop or reject it. \
+         Produce one tar."
+    );
     copied.with_context(|| format!("read {shown} from {dep}"))?;
     Ok(())
 }
@@ -731,7 +807,7 @@ fn check_entries<R: std::io::Read>(
     dep: &str,
     shown: &str,
 ) -> anyhow::Result<usize> {
-    let not_a_tar = || format!("{dep} produced {shown}, which is not a tar");
+    let not_a_tar = || format!("{dep} produced {shown}, which is not a tar, or is cut short");
     let mut count = 0;
     for entry in ar.entries().with_context(not_a_tar)? {
         let entry = entry.with_context(not_a_tar)?;
@@ -744,35 +820,31 @@ fn check_entries<R: std::io::Read>(
         // Whiteouts (`.wh.<name>`, `.wh..wh..opq`) are allowed, unlike in a
         // srcs layer: an adopted layer may be one that expresses deletions on
         // purpose, and what it deletes is its producer's decision.
-        match entry.header().entry_type() {
-            tar::EntryType::Link => {
-                let target = entry
-                    .link_name()
-                    .with_context(not_a_tar)?
-                    .unwrap_or_default();
-                anyhow::ensure!(
-                    !escapes(&target),
-                    "{dep} produced {shown}, whose hardlink {path:?} points at {target:?}, which \
-                     is absolute or has a `..` component; a hardlink names another entry of \
-                     the layer"
-                );
-            }
-            tar::EntryType::Symlink => {
-                // A relative target may climb with `..` and still resolve
-                // inside the image's root; an absolute one is refused as a
-                // srcs layer refuses it.
-                let target = entry
-                    .link_name()
-                    .with_context(not_a_tar)?
-                    .unwrap_or_default();
-                anyhow::ensure!(
-                    target.is_relative(),
-                    "{dep} produced {shown}, whose symlink {path:?} points at the absolute path \
-                     {target:?}; inside an image that would point at the host's filesystem, \
-                     not the layer's"
-                );
-            }
-            _ => {}
+        //
+        // Symlinks are not checked at all. A runtime resolves one against
+        // the image's root, absolute or climbing, and rootfs tars are full
+        // of absolute ones (`/usr/bin/awk -> /etc/alternatives/awk`). The
+        // srcs path refuses an absolute symlink because it is a host file,
+        // whose target was meant for the host; an adopted tar's was written
+        // for the image.
+        if entry.header().entry_type() == tar::EntryType::Link {
+            // An empty name (a PAX `linkpath=`) is no target either, and
+            // would pass the escape check below.
+            let target = entry
+                .link_name()
+                .with_context(not_a_tar)?
+                .filter(|t| !t.as_os_str().is_empty())
+                .with_context(|| {
+                    format!(
+                        "{dep} produced {shown}, whose hardlink {path:?} names no target; a \
+                         hardlink names another entry of the layer"
+                    )
+                })?;
+            anyhow::ensure!(
+                !escapes(&target),
+                "{dep} produced {shown}, whose hardlink {path:?} points at {target:?}, which is \
+                 absolute or has a `..` component; a hardlink names another entry of the layer"
+            );
         }
         count += 1;
     }
@@ -974,7 +1046,7 @@ impl ManagedDriver for Driver {
                 hcore::blocking::run(move || write_layer(&job_out, &entries, mode, encoding)).await
             }
             LayerSource::Tar { tar } => {
-                let src = tar_file(&req, &tar)?;
+                let src = tar_file(dep_files(&req, TAR_ORIGIN)?, &req.sandbox_ws_dir, &tar)?;
                 hcore::blocking::run(move || {
                     write_blob(&job_out, encoding, |sink| adopt_tar(&src, &tar, sink))
                 })
@@ -1532,22 +1604,237 @@ mod tests {
         hard.set_size(0);
         b.append_link(&mut hard, "usr/bin/alias", "usr/bin/tool")
             .expect("hardlink");
+        // A body several reads long, of bytes the reader cannot mistake for
+        // padding: bodies pass through the tee, not only headers.
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let big: Vec<u8> = (0..200_000)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x.to_le_bytes()[0] | 1
+            })
+            .collect();
+        let mut data = tar::Header::new_gnu();
+        data.set_size(big.len() as u64);
+        data.set_mode(0o644);
+        data.set_cksum();
+        b.append_data(&mut data, "usr/share/blob", big.as_slice())
+            .expect("big file");
         let mut bytes = b.into_inner().expect("finish");
         // GNU tar pads to a 10240-byte record; nothing past the first zero
         // block is read by the archive reader.
-        bytes.resize(10240, 0);
+        bytes.resize(bytes.len().div_ceil(10240) * 10240, 0);
 
         let sink = adopt(&bytes).expect("a valid tar is adopted");
-        assert!(sink == bytes, "the sink holds the tar exactly");
+        assert!(
+            sink == bytes,
+            "the sink holds the tar exactly ({} bytes, want {})",
+            sink.len(),
+            bytes.len()
+        );
+
+        // Through the gzip writer, whose output crosses its 64 KiB chunk on
+        // this incompressible body: the blob inflates to the tar, and the
+        // diff_id is the tar's digest.
+        use std::io::Read as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("rootfs.tar");
+        std::fs::write(&src, &bytes).expect("write");
+        let out = dir.path().join("l.tar.gz");
+        let diff_id = write_blob(&out, LayerEncoding::TarGzip, |sink| {
+            adopt_tar(&src, TAR_DEP, sink)
+        })
+        .expect("gzip adoption");
+        let blob = std::fs::read(&out).expect("read blob");
+        assert!(
+            blob.len() > 64 * 1024,
+            "the blob must cross a chunk, got {} bytes",
+            blob.len()
+        );
+        let mut inflated = Vec::new();
+        flate2::read::GzDecoder::new(blob.as_slice())
+            .read_to_end(&mut inflated)
+            .expect("the blob is gzip");
+        assert!(inflated == bytes, "the blob inflates to the tar");
+        assert_eq!(
+            diff_id,
+            format!(
+                "sha256:{}",
+                hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&bytes))
+            )
+        );
+    }
+
+    /// Layer `rootfs` adopting `rootfs.tar` with `compress = False` writes its
+    /// blob to the path its input sits at. The input is read whole before
+    /// the blob replaces it, not truncated by the blob's creation.
+    #[test]
+    fn a_tar_at_the_blob_path_is_read_before_it_is_replaced() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("rootfs.tar");
+        let bytes = raw_tar(tar::EntryType::Regular, b"etc/motd", b"");
+        std::fs::write(&path, &bytes).expect("write");
+        write_blob(&path, LayerEncoding::Tar, |sink| {
+            adopt_tar(&path, TAR_DEP, sink)
+        })
+        .expect("adopted in place");
+        assert!(std::fs::read(&path).expect("read") == bytes);
+    }
+
+    /// An absolute symlink is adopted: in a container it resolves against
+    /// the image's root, and rootfs tars are full of them.
+    #[test]
+    fn an_absolute_symlink_is_adopted() {
+        let bytes = raw_tar(
+            tar::EntryType::Symlink,
+            b"usr/bin/awk",
+            b"/etc/alternatives/awk",
+        );
+        assert!(adopt(&bytes).expect("adopted") == bytes);
+    }
+
+    /// A tar whose one entry has a long name or long link target, carried by
+    /// an extension entry `ext` written by hand ahead of it: `set_path` and
+    /// `set_link_name` refuse these names. The entry's own header fields
+    /// hold short placeholders, which the extension overrides.
+    fn long_tar(ext: LongExt, long: &[u8], kind: tar::EntryType) -> Vec<u8> {
+        let (ext_kind, body) = match ext {
+            LongExt::GnuName => (tar::EntryType::GNULongName, [long, b"\0"].concat()),
+            LongExt::GnuLink => (tar::EntryType::GNULongLink, [long, b"\0"].concat()),
+            LongExt::PaxPath => (tar::EntryType::XHeader, pax_record(b"path", long)),
+            LongExt::PaxLinkpath => (tar::EntryType::XHeader, pax_record(b"linkpath", long)),
+        };
+        let mut h = tar::Header::new_gnu();
+        raw(&mut h.as_old_mut().name, b"././@LongLink");
+        h.set_entry_type(ext_kind);
+        h.set_size(body.len() as u64);
+        h.set_mode(0o644);
+        h.set_cksum();
+        let mut b = tar::Builder::new(Vec::new());
+        b.append(&h, body.as_slice()).expect("extension");
+        let mut e = tar::Header::new_gnu();
+        raw(&mut e.as_old_mut().name, b"short");
+        if kind == tar::EntryType::Link {
+            raw(&mut e.as_old_mut().linkname, b"short");
+        }
+        e.set_entry_type(kind);
+        e.set_size(0);
+        e.set_mode(0o644);
+        e.set_cksum();
+        b.append(&e, std::io::empty()).expect("entry");
+        b.into_inner().expect("finish")
+    }
+
+    /// Which extension entry carries a long name.
+    #[derive(Clone, Copy)]
+    enum LongExt {
+        GnuName,
+        GnuLink,
+        PaxPath,
+        PaxLinkpath,
+    }
+
+    /// One PAX record, `<len> <key>=<value>\n`, whose length counts itself.
+    fn pax_record(key: &[u8], value: &[u8]) -> Vec<u8> {
+        let rest = key.len() + value.len() + 3; // ' ', '=', '\n'
+        let len = (1..=20)
+            .map(|digits| rest + digits)
+            .find(|n| n.to_string().len() + rest == *n)
+            .expect("a length that counts itself");
+        [len.to_string().as_bytes(), b" ", key, b"=", value, b"\n"].concat()
     }
 
     /// Everything an adopted tar is refused for, each naming the dep.
     #[test]
     fn adopted_tars_refuse_what_escapes_the_layer() {
         use tar::EntryType as T;
+        let one = raw_tar(T::Regular, b"etc/motd", b"");
+        let mut truncated = tar::Header::new_gnu();
+        raw(&mut truncated.as_old_mut().name, b"etc/motd");
+        truncated.set_size(1024);
+        truncated.set_mode(0o644);
+        truncated.set_cksum();
+        let truncated = [truncated.as_bytes().as_slice(), &[b'x'; 10]].concat();
+        let mut dirty_padding = one.clone();
+        dirty_padding.resize(10240, 0);
+        if let Some(last) = dirty_padding.last_mut() {
+            *last = 1;
+        }
+        let long_abs = [b"/".as_slice(), &b"a/".repeat(60), b"passwd"].concat();
+        let long_up = [b"usr/".as_slice(), &[b'x'; 120], b"/../../../etc/passwd"].concat();
         let cases: Vec<(&str, Vec<u8>, &str)> = vec![
-            ("not a tar", b"hello, world".to_vec(), "which is not a tar"),
+            (
+                "not a tar",
+                b"hello, world".to_vec(),
+                "which is not a tar, or is cut short",
+            ),
             ("garbage block", vec![0xAA; 1024], "which is not a tar"),
+            (
+                "truncated body",
+                truncated,
+                "which is not a tar, or is cut short",
+            ),
+            (
+                "truncated header",
+                one.get(..300).expect("a header's worth").to_vec(),
+                "which is not a tar, or is cut short",
+            ),
+            (
+                "two tars concatenated",
+                [one.as_slice(), &one].concat(),
+                "which has data after the end of the archive",
+            ),
+            (
+                "non-zero padding",
+                dirty_padding,
+                "which has data after the end of the archive",
+            ),
+            (
+                "hardlink with no target",
+                raw_tar(T::Link, b"usr/bin/x", b""),
+                "whose hardlink \"usr/bin/x\" names no target",
+            ),
+            (
+                "GNU long name, absolute",
+                long_tar(LongExt::GnuName, &long_abs, T::Regular),
+                "is absolute or has a `..` component",
+            ),
+            (
+                "GNU long name, climbing",
+                long_tar(LongExt::GnuName, &long_up, T::Regular),
+                "is absolute or has a `..` component",
+            ),
+            (
+                "PAX path, absolute",
+                long_tar(LongExt::PaxPath, &long_abs, T::Regular),
+                "is absolute or has a `..` component",
+            ),
+            (
+                "PAX path, climbing",
+                long_tar(LongExt::PaxPath, &long_up, T::Regular),
+                "is absolute or has a `..` component",
+            ),
+            (
+                "GNU long hardlink, absolute",
+                long_tar(LongExt::GnuLink, &long_abs, T::Link),
+                "whose hardlink \"short\" points at \"/a/a/",
+            ),
+            (
+                "GNU long hardlink, climbing",
+                long_tar(LongExt::GnuLink, &long_up, T::Link),
+                "whose hardlink \"short\" points at \"usr/xxx",
+            ),
+            (
+                "PAX linkpath, absolute",
+                long_tar(LongExt::PaxLinkpath, &long_abs, T::Link),
+                "whose hardlink \"short\" points at \"/a/a/",
+            ),
+            (
+                "PAX linkpath, climbing",
+                long_tar(LongExt::PaxLinkpath, &long_up, T::Link),
+                "whose hardlink \"short\" points at \"usr/xxx",
+            ),
             (
                 "gzip",
                 vec![0x1f, 0x8b, 0x08, 0, 0, 0, 0, 0],
@@ -1575,11 +1862,6 @@ mod tests {
                 raw_tar(T::Link, b"usr/bin/x", b"/etc/shadow"),
                 "whose hardlink \"usr/bin/x\" points at \"/etc/shadow\"",
             ),
-            (
-                "absolute symlink",
-                raw_tar(T::Symlink, b"usr/bin/x", b"/etc/shadow"),
-                "whose symlink \"usr/bin/x\" points at the absolute path \"/etc/shadow\"",
-            ),
         ];
         for (case, bytes, want) in cases {
             let err = format!("{:#}", adopt(&bytes).expect_err(case));
@@ -1594,5 +1876,39 @@ mod tests {
     fn a_relative_symlink_may_climb() {
         let bytes = raw_tar(tar::EntryType::Symlink, b"usr/bin/x", b"../../lib/x");
         assert!(adopt(&bytes).expect("adopted") == bytes);
+    }
+
+    /// A `tar` dep must produce one file: two (a `glob()` matching both) or
+    /// none are refused naming the dep and what it produced, workspace-relative.
+    #[test]
+    fn a_tar_dep_produces_exactly_one_file() {
+        let ws = Path::new("/sandbox/ws");
+        let only = ws.join("app/rootfs.tar");
+        assert_eq!(
+            tar_file(vec![only.clone()], ws, TAR_DEP).expect("one file"),
+            only
+        );
+
+        let two = format!(
+            "{:#}",
+            tar_file(vec![only, ws.join("app/extra.tar")], ws, TAR_DEP).expect_err("two files")
+        );
+        assert!(
+            two.contains(&format!(
+                "`tar` {TAR_DEP} must produce exactly one file, the tar to adopt; it produced 2: \
+                 app/rootfs.tar, app/extra.tar"
+            )),
+            "got: {two}"
+        );
+
+        let none = format!(
+            "{:#}",
+            tar_file(Vec::new(), ws, TAR_DEP).expect_err("no file")
+        );
+        assert!(
+            none.contains(&format!("`tar` {TAR_DEP} must produce exactly one file")),
+            "got: {none}"
+        );
+        assert!(none.contains("it produced 0: nothing"), "got: {none}");
     }
 }

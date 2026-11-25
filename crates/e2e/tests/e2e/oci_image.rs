@@ -408,6 +408,78 @@ target(name = "img", driver = "oci.image", layers = [":rootfs"], platforms = ["l
     Ok(())
 }
 
+/// `tar =` with `compress = False` files the tar's own bytes as the blob,
+/// under the uncompressed media type, and its diff_id is the blob's digest.
+#[tokio::test]
+async fn test_an_uncompressed_adopted_tar_is_the_blob() -> anyhow::Result<()> {
+    let ws = workspace();
+    ws.write_build_file(
+        "app",
+        r#"
+target(name = "rootfs", driver = "oci.layer", tar = glob("rootfs.tar"), compress = False)
+target(name = "img", driver = "oci.image", layers = [":rootfs"], platforms = ["linux/amd64"])
+"#,
+    );
+    let fixture = write_rootfs_tar(&ws);
+
+    let bytes = htestkit::artifact_bytes(&*ws.run("//app:img").await?);
+    let manifest = manifest_of(&bytes);
+    let layer = &manifest["layers"][0];
+    assert_eq!(layer["mediaType"], "application/vnd.oci.image.layer.v1.tar");
+    assert_eq!(
+        config_of(&bytes)["rootfs"]["diff_ids"],
+        serde_json::json!([layer["digest"]]),
+        "uncompressed, the diff_id and the blob digest are one value"
+    );
+    let blob = layout_blobs(&bytes)
+        .remove(layer["digest"].as_str().expect("digest"))
+        .expect("layer blob");
+    assert!(
+        blob == fixture,
+        "the blob is the tar, byte for byte ({} bytes, want {})",
+        blob.len(),
+        fixture.len()
+    );
+    Ok(())
+}
+
+/// A rootfs tar's absolute symlinks resolve against the image's root, so
+/// adopting one succeeds and keeps the link as written.
+#[tokio::test]
+async fn test_an_adopted_tar_keeps_its_absolute_symlinks() -> anyhow::Result<()> {
+    let ws = workspace();
+    ws.write_build_file(
+        "app",
+        r#"
+target(name = "rootfs", driver = "oci.layer", tar = glob("rootfs.tar"), compress = False)
+target(name = "img", driver = "oci.image", layers = [":rootfs"], platforms = ["linux/amd64"])
+"#,
+    );
+    let mut b = tar::Builder::new(Vec::new());
+    let mut link = tar::Header::new_ustar();
+    link.set_entry_type(tar::EntryType::Symlink);
+    link.set_size(0);
+    link.set_mode(0o777);
+    b.append_link(&mut link, "usr/bin/awk", "/etc/alternatives/awk")?;
+    let fixture = b.into_inner()?;
+    std::fs::write(htestkit::root(&ws).join("app/rootfs.tar"), &fixture)?;
+
+    let bytes = htestkit::artifact_bytes(&*ws.run("//app:img").await?);
+    let manifest = manifest_of(&bytes);
+    let blob = layout_blobs(&bytes)
+        .remove(manifest["layers"][0]["digest"].as_str().expect("digest"))
+        .expect("layer blob");
+    assert!(blob == fixture, "the tar is adopted as it is");
+    let mut ar = tar::Archive::new(blob.as_slice());
+    let mut entries = ar.entries()?;
+    let entry = entries.next().expect("one entry")?;
+    assert_eq!(
+        entry.link_name()?.as_deref(),
+        Some(std::path::Path::new("/etc/alternatives/awk"))
+    );
+    Ok(())
+}
+
 /// A prebuilt tar listed straight in `layers` is refused like any other
 /// non-layer, and the fix offered is to adopt it with `tar =`, not to wrap
 /// its bytes as a file with `srcs`.
