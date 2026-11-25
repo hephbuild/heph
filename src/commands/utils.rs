@@ -168,6 +168,27 @@ fn validate_positional_label(label: &str) -> anyhow::Result<()> {
 
 /// Tally a parsed query matcher's nodes into telemetry counts. Walks the tree
 /// the real parser produced, so the syntax is never re-interpreted; counts only.
+/// Print `rows` as a keep-going command's JSON list: closed with its `]` only
+/// when the walk skipped nothing (`gaps` empty), so a list with gaps is never
+/// read as whole (D10). `finalize` then fails the command for the gaps.
+pub(crate) fn json_list<R, T, I>(
+    out: &output::JsonArgs<R>,
+    rows: I,
+    gaps: &engine::Gaps,
+    cancelled: output::Cancelled<'_>,
+) -> anyhow::Result<()>
+where
+    R: output::Record + 'static,
+    T: output::Record<Static = R::Static> + serde::Serialize,
+    I: IntoIterator<Item = T>,
+{
+    let mut list = out.printer().start_list()?;
+    if list.push_iter(rows)? == output::Flow::Continue && gaps.is_empty() {
+        list.finish(cancelled)?;
+    }
+    Ok(())
+}
+
 fn count_matcher(m: &Matcher, c: &mut htelemetry::telemetry::QueryExprCounts) {
     match m {
         Matcher::Addr(_) => c.addr += 1,

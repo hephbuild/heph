@@ -1,4 +1,5 @@
 use crate::tui::session::SessionSlot;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -19,25 +20,34 @@ pub struct Args {
     /// Target address (e.g. //pkg:name)
     #[arg(add = ArgValueCompleter::new(complete_target_addr))]
     pub addr: String,
-    /// Emit JSON instead of one labelled path per line
-    #[arg(long)]
-    pub json: bool,
+    #[command(flatten)]
+    pub out: output::JsonArgs<FailureView>,
 }
 
 /// Where a target's last recorded failure is kept: its slot, and each part
 /// of it that the failed run left. Paths are absolute; an absent part is
 /// `None` (`null` in `--json`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, output::Record)]
 pub struct FailureView {
+    /// The target's address.
     pub addr: String,
+    /// The failure slot's directory.
+    #[serde(serialize_with = "output::ser::path")]
     pub slot: PathBuf,
     /// The input hash of the run that failed. It may no longer be the
     /// target's: nothing is resolved to compare.
     pub hashin: String,
     /// When it failed, in milliseconds since the Unix epoch.
     pub failed_at: u64,
+    /// The failed run's full process log; null when it kept none.
+    #[serde(serialize_with = "output::ser::opt_path")]
     pub log: Option<PathBuf>,
+    /// Its `failure_out` matches, laid out as in the workspace; null when
+    /// none matched.
+    #[serde(serialize_with = "output::ser::opt_path")]
     pub out: Option<PathBuf>,
+    /// The list of files an `in_place` write-back changed; null when none.
+    #[serde(serialize_with = "output::ser::opt_path")]
     pub fixes: Option<PathBuf>,
 }
 
@@ -99,23 +109,41 @@ async fn execute_async(
     let addr = parse_addr_arg(&args.addr)?;
     let (engine, _shutdown) = bootstrap::new_engine(&global, session)?;
     let view = failure_view(engine.failure_slots(), &addr)?;
-    print!("{}", render(&addr, view.as_ref(), args.json)?);
-    Ok(())
+    let mut stdout = std::io::BufWriter::new(std::io::stdout());
+    print_to(
+        &args.out,
+        &addr,
+        view.as_ref(),
+        &mut stdout,
+        output::Style::for_stdout(),
+    )?;
+    stdout.flush().context("printing the failure")
 }
 
-/// What the command prints on stdout for `view`, or the error it exits 1
-/// with. With no recorded failure, text mode is an error (`no recorded
-/// failure for <addr>` on stderr, exit 1), while `--json` prints `null` and
-/// succeeds: a script tells "no failure" from "the command broke" by the exit
-/// code alone.
-fn render(addr: &Addr, view: Option<&FailureView>, json: bool) -> anyhow::Result<String> {
-    if json {
-        let mut out = serde_json::to_string_pretty(&view).context("serialize failure")?;
-        out.push('\n');
-        return Ok(out);
+/// Print what the command prints on stdout for `view` on `w`, or return the
+/// error it exits 1 with. With no recorded failure, text mode is an error
+/// (`no recorded failure for <addr>` on stderr, exit 1), while `--json`
+/// prints `null` and succeeds: a script tells "no failure" from "the command
+/// broke" by the exit code alone.
+fn print_to(
+    out: &output::JsonArgs<FailureView>,
+    addr: &Addr,
+    view: Option<&FailureView>,
+    w: &mut impl Write,
+    style: output::Style,
+) -> anyhow::Result<()> {
+    if out.enabled() {
+        // No request: SIGINT ends the process as is.
+        let printer = out.printer_to(w, style);
+        return match view {
+            Some(view) => printer.record(view, &output::never_cancelled),
+            None => printer.null(&output::never_cancelled),
+        };
     }
     match view {
-        Some(view) => Ok(render_text(view)),
+        Some(view) => w
+            .write_all(render_text(view).as_bytes())
+            .context("printing the failure"),
         None => anyhow::bail!("no recorded failure for {}", addr.format()),
     }
 }
@@ -181,14 +209,22 @@ mod tests {
         for (argv, want) in [
             (&["failure", "//web:lint"][..], None),
             (&["failure", "//web:lint", "--json"][..], Some("null\n")),
+            (&["failure", "//web:lint", "--jq", "."][..], Some("null\n")),
+            (
+                &["failure", "//web:lint", "--fields", "log"][..],
+                Some("null\n"),
+            ),
         ] {
             let args = Cli::try_parse_from(argv).expect("parse").args;
             let addr = htaddr::parse_addr(&args.addr).expect("addr");
             let view = failure_view(&slots, &addr).expect("read");
             assert_eq!(view, None, "{argv:?}");
-            let got = render(&addr, view.as_ref(), args.json);
+            let (got, printed) = print(&args, &addr, view.as_ref());
             match want {
-                Some(want) => assert_eq!(got.expect("json succeeds"), want, "{argv:?}"),
+                Some(want) => {
+                    got.expect("json succeeds");
+                    assert_eq!(printed, want, "{argv:?}");
+                }
                 None => assert_eq!(
                     got.expect_err("text mode exits 1").to_string(),
                     "no recorded failure for //web:lint"
@@ -197,19 +233,73 @@ mod tests {
         }
     }
 
-    /// A recorded failure renders through the same step in both modes.
+    /// `print_to` on a buffer, piped: the result, and what it printed.
+    fn print(args: &Args, addr: &Addr, view: Option<&FailureView>) -> (anyhow::Result<()>, String) {
+        let mut out = Vec::new();
+        let got = print_to(&args.out, addr, view, &mut out, output::Style::Compact);
+        (got, String::from_utf8(out).expect("utf-8"))
+    }
+
+    fn args(flags: &[&str]) -> Args {
+        Args {
+            addr: "//web:lint".into(),
+            out: output::JsonArgs::try_parse_from(flags).expect("flags"),
+        }
+    }
+
+    /// A recorded failure prints the text form, or the view as one compact
+    /// JSON line when piped.
     #[test]
-    fn render_prints_the_view() {
+    fn print_prints_the_view() {
         let addr = htaddr::parse_addr("//web:lint").expect("addr");
         let (_home, slots) = slot(&addr, true);
         let view = failure_view(&slots, &addr).expect("read").expect("a slot");
-        assert_eq!(
-            render(&addr, Some(&view), false).expect("text"),
-            render_text(&view)
-        );
-        let json: serde_json::Value =
-            serde_json::from_str(&render(&addr, Some(&view), true).expect("json")).expect("parse");
+        let (got, text) = print(&args(&[]), &addr, Some(&view));
+        got.expect("text");
+        assert_eq!(text, render_text(&view));
+
+        let (got, json) = print(&args(&["--json"]), &addr, Some(&view));
+        got.expect("json");
+        assert_eq!(json.lines().count(), 1, "{json}");
+        let json: serde_json::Value = serde_json::from_str(&json).expect("parse");
         assert_eq!(json, serde_json::to_value(&view).expect("serialize"));
+
+        // `--jq` reads the log's path straight out, unquoted.
+        let (got, log) = print(&args(&["--jq", ".log"]), &addr, Some(&view));
+        got.expect("jq");
+        assert_eq!(
+            log,
+            format!("{}\n", view.log.as_ref().expect("log").display())
+        );
+    }
+
+    #[test]
+    fn record_keys_subset_of_fields() {
+        let addr = htaddr::parse_addr("//web:lint").expect("addr");
+        let (_home, slots) = slot(&addr, true);
+        let view = failure_view(&slots, &addr).expect("read").expect("a slot");
+        output::check_keys(&view).unwrap();
+    }
+
+    /// A slot under a non-UTF-8 directory fails naming the path, instead of
+    /// printing a lossy one a script would act on.
+    #[test]
+    fn non_utf8_path_is_an_error() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let addr = htaddr::parse_addr("//web:lint").expect("addr");
+        let view = FailureView {
+            addr: addr.format(),
+            slot: PathBuf::from(std::ffi::OsStr::from_bytes(b"/tmp/\xff")),
+            hashin: "h".into(),
+            failed_at: 1,
+            log: None,
+            out: None,
+            fixes: None,
+        };
+        let (got, printed) = print(&args(&["--json"]), &addr, Some(&view));
+        let err = format!("{:#}", got.expect_err("a lossy path is refused"));
+        assert!(err.contains("not valid UTF-8"), "{err}");
+        assert_eq!(printed, "");
     }
 
     #[test]

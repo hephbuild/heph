@@ -1,13 +1,16 @@
 use crate::tui::session::SessionSlot;
 use std::sync::Arc;
 
+use anyhow::Context as _;
 use clap_complete::engine::ArgValueCompleter;
+use std::io::Write as _;
 
 use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
 use crate::commands::completion::complete_target_addr;
-use crate::commands::progress_app::run_engine_command;
+use crate::commands::progress_app::run_engine_command_out;
 use crate::commands::utils::resolve_addr;
+use crate::htaddr::Addr;
 use crate::tui::LogSink;
 
 #[derive(clap::Args, Clone)]
@@ -23,6 +26,16 @@ pub struct Args {
     pub no_transitive: bool,
     #[command(flatten)]
     pub dashboard: crate::commands::progress_app::DashboardArgs,
+    #[command(flatten)]
+    pub out: output::JsonArgs<PathRow<'static>>,
+}
+
+/// `heph inspect path --json`: one element per hop, from the dependent to the
+/// dependency; `[]` when the two are unconnected.
+#[derive(Debug, serde::Serialize, output::Record)]
+pub struct PathRow<'a> {
+    /// A target on the chain.
+    addr: &'a Addr,
 }
 
 pub fn execute(
@@ -45,11 +58,13 @@ async fn execute_async(
     // Kept for the "no path" log line — the addrs themselves move into the walk.
     let (a_label, b_label) = (a.format(), b.format());
     let no_transitive = args.no_transitive;
-    run_engine_command(
+    let json = args.out.clone();
+    run_engine_command_out(
         format!("Path {a_label} ↔ {b_label}"),
         sink,
         session,
         &global,
+        &args.out,
         args.dashboard.dashboard,
         move |engine, rs, ctx| async move {
             // Resolving defs may run provider targets, recording rich failures in
@@ -57,18 +72,23 @@ async fn execute_async(
             let res = Arc::clone(&engine)
                 .dep_path_between(rs.clone(), a, b, no_transitive)
                 .await;
+            let cancelled = || rs.ctoken().is_cancelled();
             crate::commands::errors::finalize(&ctx, &rs, res, None, |chain| {
-                match chain {
-                    // The chain reads dependent → dependency whichever way the
-                    // arguments were given, so the direction is visible in the output.
-                    Some(chain) => {
-                        for addr in chain {
-                            println!("{}", addr.format());
-                        }
-                    }
-                    // Unconnected targets leave stdout empty, so callers can test the
-                    // output for emptiness; the reason goes to the log (stderr) instead.
-                    None => tracing::info!("no path between {a_label} and {b_label}"),
+                // Unconnected targets leave stdout empty (`[]` under --json), so
+                // callers can test the output for emptiness; the reason goes to
+                // the log (stderr) instead.
+                if chain.is_none() {
+                    tracing::info!("no path between {a_label} and {b_label}");
+                }
+                // The chain reads dependent → dependency whichever way the
+                // arguments were given, so the direction is visible in the output.
+                let rows = chain.iter().flatten().map(|addr| PathRow { addr });
+                if json.enabled() {
+                    return json.list_iter(rows, &cancelled);
+                }
+                let mut stdout = std::io::stdout().lock();
+                for row in rows {
+                    writeln!(stdout, "{}", row.addr.format()).context("printing the path")?;
                 }
                 Ok(())
             })
@@ -76,4 +96,15 @@ async fn execute_async(
         },
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn record_keys_subset_of_fields() {
+        let addr = crate::htaddr::parse_addr("//a:b").unwrap();
+        output::check_keys(&PathRow { addr: &addr }).unwrap();
+    }
 }

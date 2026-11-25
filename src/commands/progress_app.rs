@@ -171,6 +171,25 @@ where
     .await
 }
 
+/// [`run_engine_command_json`] for a command that has opted into the output
+/// flags: the runner reads them, so under any of `--json`, `--fields`, `--jq`
+/// the TUI is off without the command having to remember (I1).
+pub(crate) async fn run_engine_command_out<F, Fut>(
+    label: impl Into<String>,
+    sink: LogSink,
+    session: &Arc<SessionSlot>,
+    global: &GlobalOptions,
+    out: &impl output::OutputFlags,
+    dashboard: bool,
+    body: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce(Arc<Engine>, Arc<RequestState>, AppContext) -> Fut + Send + 'static,
+    Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    run_engine_command_json(label, sink, session, global, out.enabled(), dashboard, body).await
+}
+
 /// The TUI decision of a command with `--json`: `decide` runs first, always,
 /// so what it records is the terminal's answer; `json` turns the TUI off after.
 fn unless_json(decide: impl FnOnce() -> bool, json: bool) -> impl FnOnce() -> bool {
