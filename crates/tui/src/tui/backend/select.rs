@@ -20,8 +20,9 @@
 //! the view hands over at the press, rather than in the rows on screen. The
 //! ends of the selection are rows of the doc, so the drag scrolls the pane:
 //! a wheel step scrolls it under the held button, and the pointer held past
-//! its top or bottom edge scrolls it on every [`AUTOSCROLL`], faster the
-//! further past. Rows selected and scrolled away stay selected and are
+//! its top or bottom edge scrolls it, faster the further past: a step on
+//! each render tick while the pointer is still, and on each motion report
+//! at most every [`AUTOSCROLL`]. Rows selected and scrolled away stay selected and are
 //! copied. A selection's rows keep to the pane, from its text column (past
 //! line numbers or an indent) to its right edge; a selection that runs to
 //! the right edge takes the rest of a row the pane cut short, and a wrapped
@@ -440,19 +441,24 @@ impl Drag {
     }
 
     /// The selected text: each row's cells, rows joined by `\n` (a wrapped
-    /// row by nothing), each line without its trailing blanks.
+    /// row by nothing), each line without its trailing blanks (a wrapped
+    /// line's, across all its rows).
     fn text(&self) -> String {
         let mut out = String::new();
         let mut joined = false;
         let mut first = true;
         let right = self.bounds.right().saturating_sub(1);
         let end_row = self.ends().1.row;
+        // Where the line being copied starts: a wrapped line's rows are one.
+        let mut start = 0;
         for (row, from, to) in self.rows() {
-            if !first && !joined {
-                out.push('\n');
+            if !joined {
+                if !first {
+                    out.push('\n');
+                }
+                start = out.len();
             }
             first = false;
-            let start = out.len();
             match &self.pane {
                 None => {
                     if let Ok(y) = u16::try_from(row) {
@@ -1027,6 +1033,41 @@ mod tests {
             drag_in(pane_frame(&doc), Some(doc), p(3, 1), p(11, 2)),
             Action::Copy("hello world".into()),
             "the blank a wrap ends a row on is text"
+        );
+    }
+
+    #[test]
+    fn a_wrapped_lines_trailing_blanks_go_across_its_rows() {
+        let row = |text: &str, joined: bool| DocRow {
+            line: Line::raw(format!("   {text}")),
+            whole: None,
+            joined,
+        };
+        // `abc` and eleven blanks, wrapped at 9 columns.
+        let doc = SelectDoc {
+            area: PANE,
+            text_left: 3,
+            rows: vec![row("abc      ", true), row("     ", false), row("x", false)],
+            top: 0,
+        };
+        assert_eq!(
+            drag_in(pane_frame(&doc), Some(doc), p(3, 1), p(11, 3)),
+            Action::Copy("abc\nx".into())
+        );
+    }
+
+    #[test]
+    fn a_wide_character_in_a_doc_row_is_copied_whole() {
+        let doc = SelectDoc {
+            area: PANE,
+            text_left: 3,
+            rows: vec![DocRow::plain(Line::raw(" 1 a漢b"))],
+            top: 0,
+        };
+        // From the second half of `漢` to the end of the row.
+        assert_eq!(
+            drag_in(pane_frame(&doc), Some(doc), p(5, 1), p(11, 1)),
+            Action::Copy("漢b".into())
         );
     }
 

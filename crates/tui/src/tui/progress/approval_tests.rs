@@ -530,3 +530,48 @@ fn a_drag_in_the_notice_selects_all_of_it() {
     let lines = v.render_full(T0, cols, ROWS);
     assert_eq!(texts(&lines)[body_top].trim(), "line11");
 }
+
+/// A drag's scroll lands only on the notice it selected in: the request on
+/// screen moved on under the held button (decided here, or elsewhere), and
+/// the next one opens at its top, not where the drag left the last.
+#[test]
+fn a_drags_scroll_stays_with_the_notice_it_came_from() {
+    use ratatui::layout::Position;
+    let home = tempfile::tempdir().expect("tempdir");
+    let center = ApprovalCenter::new();
+    let content: String = (1..=40).map(|i| format!("line{i}\n")).collect();
+    let mut tickets: Vec<ApprovalTicket> = ["//p:a", "//p:b"]
+        .into_iter()
+        .map(|addr| {
+            center.request(
+                &center.build(),
+                addr.into(),
+                vec![notice(home.path(), "plan", &content)],
+            )
+        })
+        .collect();
+    let mut v = with_store(view(&center), home.path());
+    assert!(v.approval_open());
+    let lines = settled(&mut v, T0, COLS, ROWS);
+    let row = texts(&lines)
+        .iter()
+        .position(|r| r.trim() == "line1")
+        .expect("the notice on screen");
+    let row = u16::try_from(row).expect("a screen row");
+    assert!(v.selection_doc(Position::new(5, row)).is_some());
+    // The drag is held while //p:a is decided and //p:b comes up, read.
+    v.approval_decide(Decide::Approve, T0 + LOCKOUT_MS);
+    assert_eq!(tickets[0].rx.try_recv(), Ok(true));
+    let next = T0 + LOCKOUT_MS + FLASH_MS;
+    v.advance(next);
+    let lines = settled(&mut v, next, COLS, ROWS);
+    assert!(
+        texts(&lines).iter().any(|r| r.contains("//p:b")),
+        "{:#?}",
+        texts(&lines)
+    );
+    v.selection_scrolled(10);
+    let f = frame(&mut v, next);
+    assert_eq!(f[usize::from(row)].trim(), "line1", "{f:#?}");
+    assert!(pending(&mut tickets[1]));
+}

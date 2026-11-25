@@ -851,6 +851,10 @@ pub async fn run<A: App + 'static>(
                         needs_resize = true;
                         if let Some(f) = full.as_mut() {
                             f.resized = true;
+                            // Now, not at the next draw: a release before it
+                            // would copy, or scroll the view, from rows laid
+                            // out at the old size.
+                            f.cancel_selection();
                         }
                     }
                     _ => {}

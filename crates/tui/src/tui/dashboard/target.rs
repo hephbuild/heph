@@ -98,7 +98,7 @@ pub struct TargetScreen {
 }
 
 /// The first body row's place in the frame, under the tab row and its rule.
-const BODY_TOP: u16 = 4;
+pub(super) const BODY_TOP: u16 = 4;
 /// Rows one wheel step moves.
 pub const WHEEL_ROWS: isize = 3;
 
@@ -180,7 +180,12 @@ impl TargetScreen {
     /// line numbers, or Overview's or Outputs' rows. `None` off it.
     pub fn selection_doc(&mut self, at: Position, redact: &Redact) -> Option<SelectDoc> {
         if self.tab == TargetTab::Log {
-            let (area, text_left) = self.drawn.log.filter(|(r, _)| r.contains(at))?;
+            // Not on the line numbers: a drag there selects the frame as
+            // drawn, and the held log is not worth building for it.
+            let (area, text_left) = self
+                .drawn
+                .log
+                .filter(|(r, x)| r.contains(at) && at.x >= *x)?;
             let (rows, top) = self.pane.doc(usize::from(self.drawn.cols), redact)?;
             return Some(SelectDoc {
                 area,
@@ -192,10 +197,12 @@ impl TargetScreen {
         if !self.drawn.body_area.contains(at) || self.drawn.body.is_empty() {
             return None;
         }
+        // Taken, not cloned: the next frame builds it again.
+        let body = std::mem::take(&mut self.drawn.body);
         Some(SelectDoc {
             area: self.drawn.body_area,
             text_left: 0,
-            rows: self.drawn.body.iter().cloned().map(DocRow::plain).collect(),
+            rows: body.into_iter().map(DocRow::plain).collect(),
             top: self.scroll,
         })
     }

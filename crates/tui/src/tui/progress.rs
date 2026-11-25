@@ -2152,7 +2152,7 @@ impl TUIAppView for TuiProgressView {
         at: ratatui::layout::Position,
     ) -> Option<crate::tui::app::SelectDoc> {
         // The approval view overlays whichever screen opened it.
-        if let Some(a) = &self.approval {
+        if let Some(a) = self.approval.as_mut() {
             return a.selection_doc(at);
         }
         if !self.dashboard_open {

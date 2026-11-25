@@ -141,9 +141,10 @@ type WrappedRow = (String, bool);
 /// The columns a notice's rows are indented by.
 const NOTICE_INDENT: u16 = 2;
 
-/// A notice row as drawn: indented.
+/// A notice row as drawn: indented by [`NOTICE_INDENT`].
 fn notice_row(text: &str) -> Line<'static> {
-    Line::raw(format!("  {text}"))
+    let indent = usize::from(NOTICE_INDENT);
+    Line::raw(format!("{:indent$}{text}", ""))
 }
 
 /// `line` wrapped to `cols`, each piece no wider: a long line shows whole
@@ -213,6 +214,8 @@ pub struct ApprovalScreen {
     wrapped: Option<(usize, usize, Vec<WrappedRow>)>,
     /// The notice's rows on the last frame, the full width of them.
     body_area: Rect,
+    /// The notice the last [`Self::selection_doc`] came from.
+    doc_of: Option<NoticeKey>,
     /// The tab row's notice labels, by column, as the last frame drew them.
     tabs: Vec<(Range<u16>, usize)>,
     rows: u16,
@@ -238,6 +241,7 @@ impl ApprovalScreen {
             feed,
             wrapped: None,
             body_area: Rect::default(),
+            doc_of: None,
             tabs: Vec::new(),
             rows: 0,
             body_rows: 0,
@@ -367,7 +371,7 @@ impl ApprovalScreen {
     /// The notice's whole text when `at` is in its rows on the last frame,
     /// for a drag to select and scroll in. `None` off it, or with no
     /// notice text on screen (being read, unavailable, none declared).
-    pub fn selection_doc(&self, at: Position) -> Option<SelectDoc> {
+    pub fn selection_doc(&mut self, at: Position) -> Option<SelectDoc> {
         if !self.body_area.contains(at) {
             return None;
         }
@@ -378,6 +382,7 @@ impl ApprovalScreen {
         if *notice != self.notice {
             return None;
         }
+        self.doc_of = self.notice_key();
         Some(SelectDoc {
             area: self.body_area,
             // Past the notice's indent.
@@ -394,9 +399,18 @@ impl ApprovalScreen {
         })
     }
 
-    /// A drag left the notice scrolled to row `top`.
+    /// A drag left the notice scrolled to row `top`. Only the notice the
+    /// drag's doc came from: the request on screen can move on under a
+    /// held button (decided elsewhere, cancelled), and the next one opens
+    /// at its top.
     pub fn scroll_to(&mut self, top: usize) {
-        self.scroll = top;
+        if self
+            .doc_of
+            .take()
+            .is_some_and(|k| Some(k) == self.notice_key())
+        {
+            self.scroll = top;
+        }
     }
 
     /// A click at `(col, row)` of the last frame: the breadcrumb or a

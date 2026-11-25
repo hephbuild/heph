@@ -443,6 +443,8 @@ impl LogPane {
         self.rows = rows;
         self.text_col = None;
         self.skip = 0;
+        // A frame is drawn only once no drag holds the last doc.
+        self.doc_lines = Vec::new();
         let count = self.line_count();
         let empty = match &self.state {
             PaneState::Closed | PaneState::Opening => Some("opening the log…".to_owned()),
@@ -589,7 +591,10 @@ impl LogPane {
 
     /// A drag left the last [`Self::doc`] scrolled to its row `top`: the
     /// line on it goes to the top, the pane no longer following, unless
-    /// the drag ended at the end of a pane that was.
+    /// the drag ended at the end of a pane that was. The pane's top is a
+    /// line, so a row in the middle of a wrapped line lands on that line's
+    /// first row. A line the log has dropped since lands on the oldest
+    /// held.
     pub fn scroll_to_doc_row(&mut self, top: usize) {
         let lines = std::mem::take(&mut self.doc_lines);
         if self.doc_followed && top + self.rows >= lines.len() {
@@ -774,6 +779,74 @@ mod tests {
         assert!(!p.following());
         assert_eq!(p.body(16, 1, &r).len(), 1);
         assert_eq!(p.top, 20);
+    }
+
+    /// What a drag copies is what the pane draws: heph's home redacted (I9),
+    /// control bytes gone (I13), tabs expanded, in the drawn row, the whole
+    /// one and the wrapped ones alike. The clipboard is the one place a
+    /// raw line would leave the terminal.
+    #[test]
+    fn a_drags_doc_is_redacted_and_sanitized() {
+        let r = Redact::of(["/hh/home".into()]);
+        let line = "a\tb open /hh/home/secret \x1b[31mred\x1b[0m\x07 and then some more";
+        let clean = "a       b open <heph home>/secret red and then some more";
+        let mut p = LogPane::default();
+        p.start_live("live".into());
+        p.append(format!("{line}\n").as_bytes());
+        for wrap in [false, true] {
+            if wrap {
+                p.toggle_wrap();
+            }
+            p.body(24, 5, &r);
+            let (rows, _) = p.doc(24, &r).expect("lines drawn");
+            let mut texts: Vec<String> = Vec::new();
+            for row in &rows {
+                texts.push(line_text_of(&row.line));
+                texts.extend(row.whole.as_ref().map(line_text_of));
+            }
+            for t in &texts {
+                assert!(!t.contains("/hh/home"), "wrap {wrap}: {t:?}");
+                assert!(!t.chars().any(char::is_control), "wrap {wrap}: {t:?}");
+            }
+            if wrap {
+                let joined: String = rows
+                    .iter()
+                    .map(|row| {
+                        line_text_of(&row.line)
+                            .get(2..)
+                            .unwrap_or_default()
+                            .to_owned()
+                    })
+                    .collect();
+                assert_eq!(joined, clean, "the wrapped rows, joined");
+            } else {
+                assert_eq!(
+                    texts.last().map(|t| t.get(2..).unwrap_or_default()),
+                    Some(clean)
+                );
+            }
+        }
+    }
+
+    /// A drag that scrolled to a line the log has since dropped (the pane
+    /// holds the last [`HELD_MAX`] bytes) lands on the oldest line held.
+    #[test]
+    fn a_drags_scroll_to_a_dropped_line_lands_on_the_oldest_held() {
+        let r = Redact::default();
+        let mut p = LogPane::default();
+        p.start_live("live".into());
+        p.append(numbered(1, 50).as_bytes());
+        p.body(40, 5, &r);
+        p.doc(40, &r).expect("lines drawn");
+        // Push every held line out.
+        let filler = format!("{}\n", "x".repeat(1023));
+        for _ in 0..=HELD_MAX / 1024 {
+            p.append(filler.as_bytes());
+        }
+        assert!(p.first_line > 50, "the doc's lines were dropped");
+        p.scroll_to_doc_row(2);
+        assert!(!p.following());
+        assert_eq!(p.top, p.first_line);
     }
 
     #[test]

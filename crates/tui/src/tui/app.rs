@@ -280,7 +280,7 @@ pub enum MouseInput {
 /// draws the pane from these rows, scrolled as the drag scrolls it, and
 /// copies from them: what was selected, on screen or not, with no view
 /// call until the release.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug)]
 pub struct SelectDoc {
     /// The screen rows the pane takes, the full width of them: its rows are
     /// drawn here.
@@ -294,7 +294,7 @@ pub struct SelectDoc {
 }
 
 /// One row of a [`SelectDoc`].
-#[derive(Debug, Clone, Default)]
+#[derive(Debug)]
 pub struct DocRow {
     /// The row as the pane draws it.
     pub line: Line<'static>,
