@@ -822,11 +822,20 @@ impl Driver {
         // One root per address: a run replaces the root its last run made, and
         // an entry whose path a GC then takes re-runs on its next hit.
         let gcroot = self.gcroots_dir.join(addr_hash);
-        // `nix build --out-link` refuses to overwrite an existing path.
-        match tokio::fs::remove_file(&gcroot).await {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e).with_context(|| format!("remove stale gcroot {gcroot:?}")),
+        // `nix build --out-link` replaces a link into the store in place
+        // (`LocalFSStore::addPermRoot`), so the last run's root holds until
+        // this one lands, and a failed build leaves it rooted. Removing it
+        // first would open a window with nothing rooted. Nix refuses anything
+        // else at that path — a file, a link out of the store — which heph never
+        // writes there; only that is cleared.
+        let replaceable = match tokio::fs::read_link(&gcroot).await {
+            Ok(target) => target.starts_with(&self.store_dir),
+            Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+        };
+        if !replaceable {
+            tokio::fs::remove_file(&gcroot)
+                .await
+                .with_context(|| format!("remove {gcroot:?}, which is not a gcroot"))?;
         }
 
         // A file, not `--expr`: an environment can name hundreds of paths, and
@@ -1419,8 +1428,8 @@ mod root_tests {
 
     /// A fake `nix` at `dir/nix` that records its argv in `dir/nix.args`, writes
     /// the root with the expression's store paths as its references, and links
-    /// it at `--out-link`. `ln -s` fails on an existing link, as `nix build
-    /// --out-link` refuses one.
+    /// it at `--out-link`. Like `nix build --out-link` (checked against nix
+    /// 2.34), it replaces a link into the store and refuses anything else there.
     fn fake_nix(dir: &Path) {
         fake_nix_rooting_in(dir, dir);
     }
@@ -1442,11 +1451,36 @@ while [ $# -gt 0 ]; do
   shift
 done
 grep '^  "' "$file" | tr -d ' "' > '{root}' || exit 1
-ln -s '{root}' "$link" || exit 1
+if [ -e "$link" ] || [ -L "$link" ]; then
+  case "$(readlink "$link")" in
+    '{store}'/*) ;;
+    *) echo "error: cannot create symlink \"$link\"; already exists" >&2; exit 1;;
+  esac
+fi
+ln -sfn '{root}' "$link" || exit 1
 echo '{root}'"#,
                 args = args.display(),
+                store = store_owner.join("store").display(),
             ),
         );
+    }
+
+    /// `//pkg:env`'s gcroot under `dir/home`.
+    fn gcroot_of(dir: &Path) -> PathBuf {
+        let addr_hash = hmodel::htaddr::parse_addr("//pkg:env")
+            .expect("addr")
+            .hash_str();
+        dir.join("home/devenv-runner/gcroots").join(addr_hash)
+    }
+
+    /// A gcroot an earlier run left, linking a store path under `dir/store`;
+    /// returns the gcroot and that path.
+    fn an_earlier_root(dir: &Path) -> (PathBuf, String) {
+        let gcroot = gcroot_of(dir);
+        let earlier = store_dir_path(dir, 9, "heph-devenv-env");
+        std::fs::create_dir_all(gcroot.parent().expect("parent")).expect("mkdir gcroots");
+        std::os::unix::fs::symlink(&earlier, &gcroot).expect("earlier gcroot");
+        (gcroot, earlier)
     }
 
     /// The root's references, as the fake `nix` recorded them.
@@ -1553,15 +1587,7 @@ echo '{root}'"#,
         let (body, _) = env_naming_store_paths(dir.path());
         let driver = fake(dir.path(), &body);
         fake_nix(dir.path());
-        let addr_hash = hmodel::htaddr::parse_addr("//pkg:env")
-            .expect("addr")
-            .hash_str();
-        let gcroot = dir
-            .path()
-            .join("home/devenv-runner/gcroots")
-            .join(&addr_hash);
-        std::fs::create_dir_all(gcroot.parent().expect("parent")).expect("mkdir gcroots");
-        std::os::unix::fs::symlink("/nix/store/an-earlier-run", &gcroot).expect("stale gcroot");
+        let (gcroot, _) = an_earlier_root(dir.path());
 
         let (res, _, _) = run(&driver, dir.path(), false).await;
         let res = res.expect("run");
@@ -1669,7 +1695,8 @@ echo '{root}'"#,
     }
 
     /// A root that cannot be made fails the run with what it was for, and no
-    /// `runner.json` is left behind to be cached unrooted.
+    /// `runner.json` is left behind to be cached unrooted. The root an earlier
+    /// run made is still there: nothing removed it before the build.
     #[tokio::test]
     async fn a_failed_root_fails_the_run_and_writes_no_runner_json() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1679,6 +1706,7 @@ echo '{root}'"#,
             &dir.path().join("nix"),
             "echo 'error: cannot connect to socket' >&2; exit 1",
         );
+        let (gcroot, earlier) = an_earlier_root(dir.path());
 
         let (res, _, _) = run(&driver, dir.path(), false).await;
         let Err(e) = res else {
@@ -1691,6 +1719,37 @@ echo '{root}'"#,
             !dir.path().join("sandbox/ws/pkg").join(OUT_FILE).exists(),
             "no runner.json"
         );
+        assert_eq!(
+            std::fs::read_link(&gcroot).expect("the earlier gcroot survives"),
+            Path::new(&earlier)
+        );
+    }
+
+    /// Something at the gcroot that nix would refuse to replace — a file, a link
+    /// out of the store — is cleared, so the run roots rather than fails.
+    #[tokio::test]
+    async fn what_nix_would_refuse_at_the_gcroot_is_cleared() {
+        for plant in ["file", "link out of the store"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let (body, _) = env_naming_store_paths(dir.path());
+            let driver = fake(dir.path(), &body);
+            fake_nix(dir.path());
+            let gcroot = gcroot_of(dir.path());
+            std::fs::create_dir_all(gcroot.parent().expect("parent")).expect("mkdir gcroots");
+            if plant == "file" {
+                std::fs::write(&gcroot, "not a root").expect("plant a file");
+            } else {
+                std::os::unix::fs::symlink("/usr", &gcroot).expect("plant a link");
+            }
+
+            let (res, _, _) = run(&driver, dir.path(), false).await;
+            res.unwrap_or_else(|e| panic!("{plant}: {e:#}"));
+            assert_eq!(
+                std::fs::read_link(&gcroot).expect("gcroot"),
+                Path::new(&root_path(dir.path())),
+                "{plant}"
+            );
+        }
     }
 
     /// An output naming store paths with no `nix` to root them fails the run,
