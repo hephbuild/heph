@@ -18,6 +18,7 @@
 //!     hand-written impl for a bespoke shape (see [`TargetSpecCache`], the
 //!     shared `cache` attribute).
 
+use anyhow::Context as _;
 use hcore::htvalue::signature::ParamType;
 use hcore::htvalue::{
     Value, parse_bool, parse_map_string_map_string_strings, parse_map_string_string,
@@ -162,7 +163,7 @@ impl<T: FromSpecValue> FromSpecValue for Option<T> {
 /// there.
 impl FromSpecValue for std::collections::BTreeMap<String, String> {
     fn from_spec_value(v: &Value) -> anyhow::Result<Self> {
-        ordered_map(v, String::from_spec_value)
+        ordered_map(v, "{string: string}", String::from_spec_value)
     }
 
     fn spec_param_type() -> ParamType {
@@ -178,7 +179,11 @@ impl FromSpecValue for std::collections::BTreeMap<String, String> {
 /// than a rule someone follows.
 impl FromSpecValue for std::collections::BTreeMap<String, crate::driver::Deferred<String>> {
     fn from_spec_value(v: &Value) -> anyhow::Result<Self> {
-        ordered_map(v, crate::driver::Deferred::<String>::from_spec_value)
+        ordered_map(
+            v,
+            "{string: string}",
+            crate::driver::Deferred::<String>::from_spec_value,
+        )
     }
 
     fn spec_param_type() -> ParamType {
@@ -186,7 +191,28 @@ impl FromSpecValue for std::collections::BTreeMap<String, crate::driver::Deferre
     }
 }
 
-/// A `{string: T}` map, keys checked and order preserved.
+/// A `{name: [string]}` map, keys required and order kept.
+///
+/// Strict where [`HashMap<String, Vec<String>>`] is lenient about the *map*: a
+/// bare string or list does not become `{"": …}`, because here the key carries
+/// meaning (a platform, say) that cannot be defaulted. Each *value* takes
+/// either shape, as every list field does, and the type names both.
+impl FromSpecValue for std::collections::BTreeMap<String, Vec<String>> {
+    fn from_spec_value(v: &Value) -> anyhow::Result<Self> {
+        ordered_map(
+            v,
+            "{string: string | [string]}",
+            Vec::<String>::from_spec_value,
+        )
+    }
+
+    fn spec_param_type() -> ParamType {
+        ParamType::map(Vec::<String>::spec_param_type())
+    }
+}
+
+/// A `{string: T}` map, keys checked and order preserved. `expected` is the
+/// shape the error names when `v` is not a map.
 ///
 /// Keys are never templates in any driver — the host's walk does not recurse
 /// into them, so a reference there would never be substituted and would become a
@@ -194,6 +220,7 @@ impl FromSpecValue for std::collections::BTreeMap<String, crate::driver::Deferre
 /// driver.
 fn ordered_map<T>(
     v: &Value,
+    expected: &str,
     value: impl Fn(&Value) -> anyhow::Result<T>,
 ) -> anyhow::Result<std::collections::BTreeMap<String, T>> {
     match v {
@@ -201,10 +228,11 @@ fn ordered_map<T>(
             .iter()
             .map(|(k, v)| {
                 reject_deferred_reference(k)?;
-                Ok((k.clone(), value(v)?))
+                let parsed = value(v).with_context(|| format!("key {k:?}"))?;
+                Ok((k.clone(), parsed))
             })
             .collect(),
-        other => anyhow::bail!("invalid: expected {{string: string}}, got: {other:?}"),
+        other => anyhow::bail!("invalid: expected {expected}, got: {other:?}"),
     }
 }
 
@@ -537,6 +565,53 @@ mod tests {
             M::spec_param_type(),
             HashMap::<String, String>::spec_param_type()
         );
+    }
+
+    /// A keyed list map (`oci.image`'s `layers_by_platform`): each value takes
+    /// a string or a list, and the type, the LSP and the errors all say so;
+    /// the map itself has no shorthand, since a missing key is a missing
+    /// platform, not a default one.
+    #[test]
+    fn a_keyed_list_map_takes_both_value_shapes_and_names_them() {
+        type M = std::collections::BTreeMap<String, Vec<String>>;
+        let s = |v: &str| Value::String(v.to_string());
+
+        let m = M::from_spec_value(&Value::Map(HashMap::from([
+            ("linux/amd64".to_string(), s(":a")),
+            (
+                "linux/arm64".to_string(),
+                Value::List(vec![s(":b"), s(":c")]),
+            ),
+        ])))
+        .expect("both value shapes");
+        assert_eq!(m["linux/amd64"], vec![":a"]);
+        assert_eq!(m["linux/arm64"], vec![":b", ":c"]);
+
+        assert_eq!(M::spec_param_type().render(), "map[string | list[string]]");
+
+        let err = format!(
+            "{:#}",
+            M::from_spec_value(&Value::Map(HashMap::from([(
+                "linux/amd64".to_string(),
+                Value::Int(1),
+            )])))
+            .expect_err("an int value")
+        );
+        assert!(
+            err.contains("linux/amd64") && err.contains("string or [string]"),
+            "names the key and both shapes: {err}"
+        );
+
+        for bare in [s(":a"), Value::List(vec![s(":a")])] {
+            let err = format!(
+                "{:#}",
+                M::from_spec_value(&bare).expect_err("no map shorthand")
+            );
+            assert!(
+                err.contains("{string: string | [string]}"),
+                "names both value shapes: {err}"
+            );
+        }
     }
 
     /// The whole-driver gate is derived from the field types, so that "one field
