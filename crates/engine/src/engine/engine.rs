@@ -392,6 +392,11 @@ pub struct Engine {
     /// dead-process ones swept) on first use. Lazy, so an ordinary build never
     /// creates it.
     pub(crate) scratch_audit_ready: tokio::sync::OnceCell<PathBuf>,
+
+    /// This engine's working-set journal, when
+    /// [`Config::record_working_set`] is on. Every request but a hash-only
+    /// one holds it; no file exists until the first recording request.
+    pub(crate) working_set: Option<Arc<crate::engine::cache_snapshot::Journal>>,
 }
 
 /// Per-process FUSE sandbox state. Owns the `<home>/sandboxfuse<pid>/`
@@ -1003,6 +1008,9 @@ impl Engine {
             driver_schema_slot: hplugin::driver::DriverSchemaSlot::new(),
             remote_tmp_ready: tokio::sync::OnceCell::new(),
             scratch_audit_ready: tokio::sync::OnceCell::new(),
+            working_set: cfg
+                .record_working_set
+                .then(|| Arc::new(crate::engine::cache_snapshot::Journal::new(&home))),
         };
         // Ended hephs' run logs, off the hot path: never awaited by a build.
         engine.run_logs.start_sweep(&engine.runtime);

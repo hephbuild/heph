@@ -134,6 +134,14 @@ pub struct Config {
     /// outside the `sandbox` pool's bound; a credential target's sandbox is
     /// removed whatever this says.
     pub keep_failed_sandboxes: bool,
+    /// Record this engine's working set in a journal under
+    /// `<home>/cache/working-set/` for `heph tool cache snapshot`. See
+    /// [`cache_snapshot`](crate::engine::cache_snapshot).
+    ///
+    /// Set by the front end when a snapshot dir is configured, and never for
+    /// a helper engine (`new_helper_engine`, the reader engine) or the
+    /// `snapshot` command's own engine. Off by default.
+    pub record_working_set: bool,
     /// Resource pools as written, each with its unit and capacity: the config
     /// file's `resources:`, with the run's overrides (`--resource`, `-j`,
     /// `HEPH_RESOURCE_<NAME>`) laid over it by the front end. A builtin absent
@@ -193,6 +201,7 @@ impl Config {
             scratch: ScratchOptions::default(),
             listed_facts_trust: Default::default(),
             keep_failed_sandboxes: false,
+            record_working_set: false,
             resources: BTreeMap::new(),
         }
     }
@@ -301,6 +310,9 @@ impl ConfigYamlExt for ConfigYaml {
             listed_facts_trust: defaults.listed_facts_trust,
             // A run's choice, like `--fail-fast`: the CLI sets it.
             keep_failed_sandboxes: defaults.keep_failed_sandboxes,
+            // Per engine, not per workspace: the front end turns it on for a
+            // build engine when a snapshot dir is configured.
+            record_working_set: defaults.record_working_set,
             lock_backend: self
                 .lock
                 .and_then(|l| l.backend)

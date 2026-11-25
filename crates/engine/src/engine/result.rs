@@ -4098,7 +4098,17 @@ impl Engine {
                         shell,
                         no_scratch,
                     };
-                    let (resolution, read) = engine.resolve_locked_inner(rs, &opts).await?;
+                    let (resolution, read) =
+                        engine.resolve_locked_inner(Arc::clone(&rs), &opts).await?;
+                    // The working set: a durable revision this request hit on
+                    // any tier, or wrote — once per addr per request, here in
+                    // the cell. A shell run and a cache-off target write a tmp
+                    // revision, and a `remote_enabled = false` one never
+                    // leaves this machine, so none of them is carried.
+                    let cache = &def_owned.target.cache;
+                    if cache.enabled && cache.remote_enabled && !shell {
+                        rs.record_revision(&def_owned.target.addr, &hashin);
+                    }
                     *handoff.lock() = read;
                     anyhow::Ok(resolution)
                 }),
@@ -6039,11 +6049,17 @@ impl Engine {
             }
         ))
         .await;
-        if let Err(e) = dup {
-            // Best-effort: the primary cache entry is already written, so a
-            // failure here just means the next run re-executes instead of
-            // hitting the fixpoint. Never fail a successful build over it.
-            tracing::debug!(error = %format!("{e:#}"), %addr, "fixpoint: duplicate cache revision failed");
+        match dup {
+            // The next run computes this key, so the working set carries it.
+            // `false`: the primary was gone, nothing was filed.
+            Ok(true) if def.target.cache.remote_enabled => rs.record_revision(&addr, &fixpoint),
+            Ok(_) => {}
+            Err(e) => {
+                // Best-effort: the primary cache entry is already written, so a
+                // failure here just means the next run re-executes instead of
+                // hitting the fixpoint. Never fail a successful build over it.
+                tracing::debug!(error = %format!("{e:#}"), %addr, "fixpoint: duplicate cache revision failed");
+            }
         }
         Ok(())
     }

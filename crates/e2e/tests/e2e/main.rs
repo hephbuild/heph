@@ -22,6 +22,7 @@ mod archive;
 mod buildfile_checks;
 mod cache_load;
 mod cache_outcome;
+mod cache_snapshot;
 mod clean;
 mod codegen_commands;
 mod codegen_in_place;

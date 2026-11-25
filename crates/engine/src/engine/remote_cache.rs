@@ -1590,7 +1590,7 @@ impl RemoteCacheSet {
     /// Key prefix shared by every object of one revision — [`Self::key`] without
     /// the artifact segment. One `list_names` of this prefix enumerates the whole
     /// revision, which is how presence is checked without a request per artifact.
-    fn revision_prefix(addr: &Addr, hashin: &str) -> String {
+    pub(crate) fn revision_prefix(addr: &Addr, hashin: &str) -> String {
         let mut key = String::new();
         for c in addr.package.components() {
             key.push_str(&key_segment(c));

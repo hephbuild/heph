@@ -48,6 +48,7 @@ pub use hplugin::driver;
 pub use hplugin::error;
 pub use hplugin::hook;
 mod cache_codec;
+pub mod cache_snapshot;
 pub mod event;
 mod labels;
 pub use labels::LabelSource;

@@ -585,7 +585,13 @@ impl Engine {
     /// `None` when the lineage was already warm, there was nothing to pull, or
     /// the pull failed — all three of which mean "cold", which by the scratch
     /// contract is a slowdown and nothing more.
-    async fn pull_if_cold(&self, slot: &str, dir: &Path, addr: &Addr) -> Option<(u64, bool)> {
+    async fn pull_if_cold(
+        &self,
+        rs: &RequestState,
+        slot: &str,
+        dir: &Path,
+        addr: &Addr,
+    ) -> Option<(u64, bool)> {
         // Unreadable counts as cold: if the directory cannot be listed, nothing
         // useful is in it either way.
         let cold = std::fs::read_dir(dir).map_or(true, |mut d| d.next().is_none());
@@ -629,6 +635,14 @@ impl Engine {
                     &opts.scope,
                     &head.meta,
                 );
+                // The working set: the slot, and the generation it came from
+                // (the parent the snapshot export publishes on top of).
+                rs.record_scratch(crate::engine::cache_snapshot::RecordedScratch {
+                    slot: slot.to_owned(),
+                    scope: head.meta.scope.clone(),
+                    generation: head.meta.generation,
+                    content_hash: head.meta.content_hash.clone(),
+                });
                 Some((bytes, path_mismatch))
             }
             Err(err) => {
@@ -755,7 +769,7 @@ impl Engine {
                     && !no_scratch
                     && !dropped
                     && let Some((bytes, path_mismatch)) =
-                        self.pull_if_cold(slot, &dir, &r.addr).await
+                        self.pull_if_cold(rs, slot, &dir, &r.addr).await
                 {
                     *cell.lock() = PrepareOutcome {
                         prepared: Some(Prepared::Pulled),
