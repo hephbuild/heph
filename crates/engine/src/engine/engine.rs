@@ -894,9 +894,20 @@ impl Engine {
 
         // Remote caches: backends are constructed synchronously here (no
         // network); latency ordering is measured lazily on first use.
-        let remote_caches =
-            crate::engine::RemoteCacheSet::new(&cfg.remote_caches, home.to_path_buf())
-                .context("configure remote caches")?;
+        // The cache snapshot's tier is opened here, once per engine, read-only:
+        // an unusable snapshot dir is one diagnostic and no tier, never an
+        // error (I3). Helper engines read it too — reading is harmless; only
+        // recording is the build engine's.
+        let snapshot = cfg
+            .cache_snapshot
+            .as_deref()
+            .and_then(crate::engine::cache_snapshot::open_tier);
+        let remote_caches = crate::engine::RemoteCacheSet::with_snapshot(
+            &cfg.remote_caches,
+            snapshot.as_ref().map(|g| g.path.as_path()),
+            home.to_path_buf(),
+        )
+        .context("configure remote caches")?;
 
         // Shared cross-run filesystem-walk cache, handed to tree-walking plugins
         // via `PluginInit`. Its own sqlite db so it can be pruned independently.

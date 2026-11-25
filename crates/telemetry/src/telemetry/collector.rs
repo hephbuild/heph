@@ -558,7 +558,8 @@ mod tests {
         let addr = || "//pkg:a".to_string();
         c.observe_event(&BuildEventKind::RemoteCacheHit {
             addr: addr(),
-            cache: None,
+            cache: Some("bucket".into()),
+            snapshot: false,
         });
         c.observe_event(&BuildEventKind::RemoteCacheMiss { addr: addr() });
         c.observe_event(&BuildEventKind::RemoteCacheMiss { addr: addr() });

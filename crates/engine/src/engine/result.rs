@@ -4486,9 +4486,14 @@ impl Engine {
                             // "already built elsewhere", execution skipped. Emit it so
                             // the cached count (TUI, GHA, telemetry) reflects remote
                             // hits, not just local ones.
+                            // Which tier served it, for per-tier hit counts:
+                            // the snapshot by flag, a user cache by name.
+                            let snapshot = self.remote_caches.served_by_snapshot(&rev);
                             rs.emit(crate::engine::event::BuildEventKind::RemoteCacheHit {
                                 addr: addr_s.clone(),
-                                cache: Some(self.remote_caches.cache_name(&rev).to_owned()),
+                                cache: (!snapshot)
+                                    .then(|| self.remote_caches.cache_name(&rev).to_owned()),
+                                snapshot,
                             });
                             rs.emit(crate::engine::event::BuildEventKind::CacheOutcome {
                                 addr: addr_s,

@@ -458,7 +458,8 @@ mod tests {
                     BuildEventKind::LocalCacheMiss { addr: a() },
                     BuildEventKind::RemoteCacheHit {
                         addr: a(),
-                        cache: None,
+                        cache: Some("bucket".into()),
+                        snapshot: false,
                     },
                     outcome(CacheOutcomeKind::RemoteHit),
                 ],

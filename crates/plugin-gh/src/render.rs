@@ -1821,7 +1821,8 @@ mod tests {
                 2,
                 BuildEventKind::RemoteCacheHit {
                     addr: addr.clone(),
-                    cache: None,
+                    cache: Some("bucket".into()),
+                    snapshot: false,
                 },
             ));
             t.apply(&ev(2, outcome(addr, CacheOutcomeKind::RemoteHit)));

@@ -1,9 +1,13 @@
 //! The working-set journal end to end: which engines record, what they
 //! record from each cache tier, and that the trailer follows the last entry.
+//! Then the snapshot tier: a `cacheSnapshot` dir read first, read-only, and
+//! passed over for anything it can't serve.
 //!
-//! The snapshot tier, the export and the `snapshot` command are not here yet;
-//! these tests drive the journal through `Config::record_working_set` and
-//! read it back with `cache_snapshot::{list_journals, read_journal}`.
+//! The export and the `snapshot` command are not here yet: these tests drive
+//! the journal through `Config::record_working_set` and read it back with
+//! `cache_snapshot::{list_journals, read_journal}`, and build each snapshot
+//! by hand ([`Fixture`]): a cold run writes a `file://` bucket, which is
+//! copied into a generation behind a marker.
 
 use crate::common::{artifact_string, drain};
 use futures::TryStreamExt as _;
@@ -455,4 +459,628 @@ target(
         before,
         "the glob never reached the snapshot dir, so the test proves nothing"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The snapshot tier.
+
+/// The one generation every [`Fixture`] writes.
+const GEN: &str = "gen-fixture";
+
+/// Each target's output differs on every run, so an output equal to the cold
+/// run's proves a cache served it, and which tier did is in the events.
+const RANDOM: &str = r#"
+target(name = "t", driver = "bash", run = "echo $RANDOM$RANDOM$RANDOM > $OUT", out = "out.txt")
+target(name = "u", driver = "bash", run = "echo $RANDOM$RANDOM$RANDOM > $OUT", out = "out.txt")
+"#;
+
+/// Reproducible: a rebuild produces the bytes the snapshot holds.
+const FOUR: &str = r#"
+target(name = "a", driver = "bash", run = "echo a > $OUT", out = "a.txt")
+target(name = "b", driver = "bash", run = "echo b > $OUT", out = "b.txt")
+target(name = "c", driver = "bash", run = "echo c > $OUT", out = "c.txt")
+target(name = "d", driver = "bash", run = "echo d > $OUT", out = "d.txt")
+"#;
+
+/// What a fixture engine reads besides the snapshot.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Bucket {
+    Absent,
+    /// The cold run's bucket, read after the snapshot, never written.
+    ReadOnly,
+    /// The cold run's bucket, read after the snapshot, and uploaded to.
+    Writable,
+}
+
+/// A workspace, the `file://` bucket a cold run wrote, and a snapshot dir
+/// whose one generation is a copy of that bucket, behind a marker. The local
+/// cache is gone, so the next engine over `root` starts cold but for the
+/// tiers.
+struct Fixture {
+    root: tempfile::TempDir,
+    bucket: tempfile::TempDir,
+    parent: tempfile::TempDir,
+    /// Each built addr's output from the cold run.
+    cold: std::collections::BTreeMap<String, Vec<u8>>,
+}
+
+impl Fixture {
+    async fn new(body: &str, addrs: &[&str]) -> Self {
+        let root = tempfile::tempdir().expect("root");
+        let bucket = tempfile::tempdir().expect("bucket");
+        let parent = tempfile::tempdir().expect("snapshot parent");
+        write_build(root.path(), body);
+        let e = engine(root.path(), Some(bucket.path()), false);
+        let mut cold = std::collections::BTreeMap::new();
+        for a in addrs {
+            cold.insert((*a).to_string(), run_one(&e, a).await.0);
+        }
+        drop(e);
+        rm_local_cache(root.path());
+        let f = Self {
+            root,
+            bucket,
+            parent,
+            cold,
+        };
+        copy_tree(f.bucket.path(), &f.generation());
+        heph::engine::cache_snapshot::write_marker(&f.dir(), GEN).expect("write marker");
+        f
+    }
+
+    /// `<dir>`, the configured snapshot dir.
+    fn dir(&self) -> std::path::PathBuf {
+        self.parent.path().join("snap")
+    }
+
+    fn generation(&self) -> std::path::PathBuf {
+        self.dir().join(GEN)
+    }
+
+    fn cold(&self, a: &str) -> &[u8] {
+        self.cold.get(a).map(Vec::as_slice).unwrap_or_default()
+    }
+
+    fn engine(&self, bucket: Bucket, record: bool) -> Arc<Engine> {
+        self.engine_at(self.dir(), bucket, record)
+    }
+
+    /// A fresh engine over the workspace, with `dir` as its snapshot dir.
+    fn engine_at(&self, dir: std::path::PathBuf, bucket: Bucket, record: bool) -> Arc<Engine> {
+        let remote_caches = match bucket {
+            Bucket::Absent => Vec::new(),
+            Bucket::ReadOnly | Bucket::Writable => vec![heph::engine::RemoteCacheDef {
+                name: "bucket".to_string(),
+                uri: format!("file://{}", self.bucket.path().display()),
+                read: true,
+                write: bucket == Bucket::Writable,
+                concurrency: 10,
+                endpoint: None,
+                region: None,
+            }],
+        };
+        engine_with(Config {
+            remote_caches,
+            record_working_set: record,
+            cache_snapshot: Some(dir),
+            ..Config::for_tests(self.root.path())
+        })
+    }
+
+    /// The snapshot's one revision directory of `//pkg:<target>`.
+    fn revision(&self, target: &str) -> std::path::PathBuf {
+        let mut dirs: Vec<std::path::PathBuf> =
+            std::fs::read_dir(self.generation().join("pkg").join(target))
+                .expect("the snapshot holds the target")
+                .map(|e| e.expect("dir entry").path())
+                .filter(|p| p.join("manifest-v2.borsh").is_file())
+                .collect();
+        assert_eq!(dirs.len(), 1, "one revision of {target}: {dirs:?}");
+        dirs.remove(0)
+    }
+
+    /// The output blob of the snapshot's revision of `//pkg:<target>`.
+    fn out_blob(&self, target: &str) -> std::path::PathBuf {
+        let dir = self.revision(target);
+        let blobs: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .expect("read revision")
+            .map(|e| e.expect("dir entry").path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("out_"))
+            })
+            .collect();
+        assert_eq!(
+            blobs.len(),
+            1,
+            "one output blob in {}: {blobs:?}",
+            dir.display()
+        );
+        blobs.into_iter().next().expect("one blob")
+    }
+}
+
+fn rm_local_cache(root: &Path) {
+    std::fs::remove_dir_all(home(root).join("cache")).expect("rm local cache");
+}
+
+/// Copy the tree at `src` to `dst`, which must not exist.
+fn copy_tree(src: &Path, dst: &Path) {
+    std::fs::create_dir_all(dst).expect("mkdir copy");
+    for entry in std::fs::read_dir(src).expect("read tree") {
+        let entry = entry.expect("dir entry");
+        let to = dst.join(entry.file_name());
+        if entry.file_type().expect("file type").is_dir() {
+            copy_tree(&entry.path(), &to);
+        } else {
+            std::fs::copy(entry.path(), &to).expect("copy file");
+        }
+    }
+}
+
+/// Every file under `dir`, as `(relative path, bytes)`, sorted.
+fn tree_contents(dir: &Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+    fn walk(base: &Path, dir: &Path, out: &mut Vec<(std::path::PathBuf, Vec<u8>)>) {
+        for entry in std::fs::read_dir(dir).expect("read tree") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                walk(base, &path, out);
+            } else {
+                let rel = path.strip_prefix(base).expect("under base").to_path_buf();
+                out.push((rel, std::fs::read(&path).expect("read file")));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, &mut out);
+    out.sort();
+    out
+}
+
+/// Resolve `a` with all its outputs in one request, drain it, and return the
+/// output's bytes and every event the request emitted.
+async fn run_one(engine: &Arc<Engine>, a: &str) -> (Vec<u8>, Vec<BuildEvent>) {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let rs = engine.new_state_with_events(true, Some(tx));
+    let res = Arc::clone(engine)
+        .result_addr(
+            rs.clone(),
+            &addr(a),
+            OutputMatcher::All,
+            &ResultOptions::default(),
+        )
+        .await
+        .expect("a snapshot never fails a build");
+    let out = crate::common::artifact_bytes(&res);
+    drop(res);
+    drain(rs).await;
+    let mut events = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        events.push(ev);
+    }
+    (out, events)
+}
+
+/// The tier that served `a` in `events`: `"snapshot"`, a remote's name, or
+/// `None` when it was not a remote hit.
+fn served_by(events: &[BuildEvent], a: &str) -> Option<String> {
+    events.iter().find_map(|e| match &e.kind {
+        BuildEventKind::RemoteCacheHit {
+            addr,
+            cache,
+            snapshot,
+        } if addr == a => Some(if *snapshot {
+            "snapshot".to_string()
+        } else {
+            cache.clone()
+        }),
+        _ => None,
+    })
+}
+
+/// `a`'s cache outcome in `events`.
+fn outcome_of(events: &[BuildEvent], a: &str) -> Option<CacheOutcomeKind> {
+    outcomes(events)
+        .into_iter()
+        .find_map(|(addr, o)| (addr == a).then_some(o))
+}
+
+/// Run `f` (an engine's construction, which opens the tier) and return what
+/// it returned with every `WARN` line it logged.
+fn warnings_while<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
+    use tracing_subscriber::util::SubscriberInitExt as _;
+    #[derive(Clone, Default)]
+    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .map_err(|e| std::io::Error::other(e.to_string()))?
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let log = Captured::default();
+    let writer = log.clone();
+    let value = {
+        // A second live dispatcher: see `resources::clamp_is_logged_once_per_addr_per_request`.
+        let _second = tracing_subscriber::registry().set_default();
+        let _guard = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing_subscriber::filter::LevelFilter::WARN)
+            .set_default();
+        f()
+    };
+    let text = String::from_utf8(log.0.lock().expect("log buffer").clone()).expect("utf-8 log");
+    let warnings = text
+        .lines()
+        .filter(|l| l.contains("WARN"))
+        .map(str::to_owned)
+        .collect();
+    (value, warnings)
+}
+
+async fn def_hash(engine: &Arc<Engine>, a: &str) -> Vec<u8> {
+    Arc::clone(engine)
+        .get_def(engine.new_state(), &addr(a))
+        .await
+        .expect("def")
+        .target_def
+        .hash
+        .clone()
+}
+
+/// I1: the tier moves neither a def hash nor a `hashin`, and it serves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hashes_do_not_move_with_the_tier() {
+    let f = Fixture::new(FOUR, &["//pkg:a"]).await;
+    let without = engine(f.root.path(), None, false);
+    let with = f.engine(Bucket::Absent, false);
+    for a in ["//pkg:a", "//pkg:b"] {
+        assert_eq!(def_hash(&without, a).await, def_hash(&with, a).await, "{a}");
+        let h = |e: &Arc<Engine>| {
+            let e = Arc::clone(e);
+            async move {
+                Arc::clone(&e)
+                    .meta(e.new_state(), &addr(a))
+                    .await
+                    .expect("meta")
+                    .hashin
+            }
+        };
+        assert_eq!(h(&without).await, h(&with).await, "{a}");
+    }
+    drop(without);
+    let (out, events) = run_one(&with, "//pkg:a").await;
+    assert_eq!(
+        served_by(&events, "//pkg:a").as_deref(),
+        Some("snapshot"),
+        "{events:#?}"
+    );
+    assert_eq!(out, f.cold("//pkg:a"));
+}
+
+/// I4: a build that hits the tier, misses and uploads leaves `<dir>`
+/// byte-identical; the upload went to the bucket.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_build_never_writes_the_tier() {
+    let f = Fixture::new(FOUR, &["//pkg:a"]).await;
+    let before = tree_contents(&f.dir());
+    let e = f.engine(Bucket::Writable, true);
+    let (_, events) = run_one(&e, "//pkg:a").await;
+    assert_eq!(served_by(&events, "//pkg:a").as_deref(), Some("snapshot"));
+    let (_, events) = run_one(&e, "//pkg:b").await;
+    assert_eq!(outcome_of(&events, "//pkg:b"), Some(CacheOutcomeKind::Miss));
+    drop(e);
+    assert!(
+        f.bucket.path().join("pkg").join("b").is_dir(),
+        "the miss was uploaded to the bucket, so a write had somewhere to go"
+    );
+    assert!(
+        tree_contents(&f.dir()) == before,
+        "the build wrote into the snapshot dir"
+    );
+}
+
+/// Relocatable: the wire format holds no absolute path, so a renamed `<dir>`
+/// still serves every revision.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_moved_dir_still_hits() {
+    let f = Fixture::new(FOUR, &["//pkg:a", "//pkg:b"]).await;
+    let moved = f.parent.path().join("moved");
+    std::fs::rename(f.dir(), &moved).expect("move the snapshot dir");
+    let e = f.engine_at(moved, Bucket::Absent, false);
+    for a in ["//pkg:a", "//pkg:b"] {
+        let (out, events) = run_one(&e, a).await;
+        assert_eq!(
+            served_by(&events, a).as_deref(),
+            Some("snapshot"),
+            "{a}: {events:#?}"
+        );
+        assert_eq!(out, f.cold(a));
+    }
+}
+
+/// A snapshot revision missing its output blob is passed over at the hit
+/// decision, and the bucket serves it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_missing_blob_falls_through_to_the_bucket() {
+    let f = Fixture::new(RANDOM, &["//pkg:t"]).await;
+    std::fs::remove_file(f.out_blob("t")).expect("evict blob");
+    let (out, events) = run_one(&f.engine(Bucket::ReadOnly, false), "//pkg:t").await;
+    assert_eq!(
+        served_by(&events, "//pkg:t").as_deref(),
+        Some("bucket"),
+        "{events:#?}"
+    );
+    assert_eq!(
+        out,
+        f.cold("//pkg:t"),
+        "the bucket served it, not a rebuild"
+    );
+}
+
+/// With no bucket, only the target whose blob is gone runs; the rest hit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_missing_blob_without_a_bucket_rebuilds_that_target_only() {
+    let f = Fixture::new(FOUR, &["//pkg:a", "//pkg:b"]).await;
+    std::fs::remove_file(f.out_blob("a")).expect("evict blob");
+    let e = f.engine(Bucket::Absent, false);
+    let (out, events) = run_one(&e, "//pkg:a").await;
+    assert_eq!(outcome_of(&events, "//pkg:a"), Some(CacheOutcomeKind::Miss));
+    assert_eq!(out, f.cold("//pkg:a"), "reproducible: the rebuild matches");
+    let (out, events) = run_one(&e, "//pkg:b").await;
+    assert_eq!(served_by(&events, "//pkg:b").as_deref(), Some("snapshot"));
+    assert_eq!(out, f.cold("//pkg:b"));
+}
+
+/// The lazy pull: `top` hits the snapshot, so `dep`'s manifest is mirrored
+/// locally and its multi-MiB blob left on the tiers. The snapshot then loses
+/// `dep`'s blob, and a later process asking for `dep`'s output pulls it from
+/// the bucket rather than rebuild it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lazy_pull_falls_through_too() {
+    let f = Fixture::new(
+        r#"
+dep = target(
+    name = "dep",
+    driver = "bash",
+    run = "head -c 3000000 /dev/urandom | base64 > $OUT",
+    out = "dep.txt",
+)
+
+target(
+    name = "top",
+    driver = "bash",
+    run = "echo $RANDOM$RANDOM$RANDOM$(wc -c < $SRC_DEP) > $OUT",
+    deps = {"dep": dep},
+    out = "top.txt",
+)
+"#,
+        &["//pkg:top", "//pkg:dep"],
+    )
+    .await;
+    let (top, events) = run_one(&f.engine(Bucket::ReadOnly, false), "//pkg:top").await;
+    assert_eq!(top, f.cold("//pkg:top"));
+    assert_eq!(served_by(&events, "//pkg:top").as_deref(), Some("snapshot"));
+
+    std::fs::remove_file(f.out_blob("dep")).expect("evict blob");
+    let (dep, _) = run_one(&f.engine(Bucket::ReadOnly, false), "//pkg:dep").await;
+    assert!(
+        dep == f.cold("//pkg:dep"),
+        "the lazy pull must fall through to the bucket, not rebuild"
+    );
+}
+
+/// Diagnosability: each remote hit names its tier, so local, snapshot and
+/// bucket hits and misses fold into per-tier counts from the event stream
+/// (`--json` carries the same events), and the snapshot's hits are in the
+/// working set.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn per_tier_hit_counts_are_reported() {
+    let f = Fixture::new(FOUR, &["//pkg:a", "//pkg:b", "//pkg:c"]).await;
+    // `c` only in the bucket; `d` nowhere.
+    std::fs::remove_dir_all(f.generation().join("pkg").join("c")).expect("drop c from the tier");
+    let e = f.engine(Bucket::ReadOnly, true);
+    // `a` from the snapshot, into the local cache.
+    run_one(&e, "//pkg:a").await;
+
+    let mut events = Vec::new();
+    for a in ["//pkg:a", "//pkg:b", "//pkg:c", "//pkg:d"] {
+        events.extend(run_one(&e, a).await.1);
+    }
+    let mut tiers = hcore::events::TierCounts::default();
+    for ev in &events {
+        tiers.apply(&ev.kind);
+    }
+    assert_eq!(
+        (tiers.local, tiers.snapshot, tiers.misses),
+        (1, 1, 1),
+        "{tiers:?}"
+    );
+    assert_eq!(
+        tiers.remote,
+        std::collections::BTreeMap::from([("bucket".to_string(), 1)]),
+        "{tiers:?}"
+    );
+    let json: Vec<String> = events
+        .iter()
+        .filter(|ev| matches!(ev.kind, BuildEventKind::RemoteCacheHit { .. }))
+        .map(|ev| serde_json::to_string(&ev.kind).expect("json"))
+        .collect();
+    assert!(
+        json.iter().any(|j| j.contains(r#""snapshot":true"#)),
+        "{json:?}"
+    );
+    assert!(
+        json.iter().any(|j| j.contains(r#""cache":"bucket""#)),
+        "{json:?}"
+    );
+
+    drop(e);
+    let recorded = recorded(&read_settled(f.root.path(), 1).await);
+    for a in ["//pkg:a", "//pkg:b", "//pkg:c", "//pkg:d"] {
+        let h = hashin(f.root.path(), a).await;
+        assert!(
+            recorded.contains(&(a.to_string(), h)),
+            "{a} is in the working set whatever tier served it: {recorded:?}"
+        );
+    }
+}
+
+/// I3: the per-tier rejections each move the lookup on to the bucket, or,
+/// for an unusable dir or marker, leave the build cold with no tier.
+mod degrades {
+    use super::*;
+
+    /// `a` resolved by an engine over `f` with `bucket`; its outcome must be
+    /// a cold miss (no tier) for every case here.
+    async fn builds_cold(e: &Arc<Engine>, a: &str) {
+        let (_, events) = run_one(e, a).await;
+        assert_eq!(
+            outcome_of(&events, a),
+            Some(CacheOutcomeKind::Miss),
+            "{events:#?}"
+        );
+        assert_eq!(served_by(&events, a), None);
+    }
+
+    /// The first restore of a lineage: no dir, no warning, a cold build.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn missing_dir() {
+        let f = Fixture::new(FOUR, &["//pkg:a"]).await;
+        let (e, warnings) =
+            warnings_while(|| f.engine_at(f.parent.path().join("absent"), Bucket::Absent, false));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        builds_cold(&e, "//pkg:a").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn empty_dir() {
+        let f = Fixture::new(FOUR, &["//pkg:a"]).await;
+        let empty = f.parent.path().join("empty");
+        std::fs::create_dir(&empty).expect("mkdir");
+        let (e, warnings) = warnings_while(|| f.engine_at(empty, Bucket::Absent, false));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        builds_cold(&e, "//pkg:a").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn missing_or_unreadable_marker() {
+        let f = Fixture::new(FOUR, &["//pkg:a"]).await;
+        let marker = f.dir().join(heph::engine::cache_snapshot::MARKER_FILE);
+        for (case, contents) in [("missing", None), ("unparseable", Some("{not json"))] {
+            match contents {
+                None => std::fs::remove_file(&marker).expect("rm marker"),
+                Some(c) => std::fs::write(&marker, c).expect("write marker"),
+            }
+            let (e, warnings) = warnings_while(|| f.engine(Bucket::Absent, false));
+            assert_eq!(warnings.len(), 1, "{case}: {warnings:?}");
+            builds_cold(&e, "//pkg:a").await;
+            drop(e);
+            rm_local_cache(f.root.path());
+        }
+    }
+
+    /// A newer format is one warning naming it and no tier; an older one
+    /// is served.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn newer_marker_format() {
+        let f = Fixture::new(FOUR, &["//pkg:a"]).await;
+        let marker = f.dir().join(heph::engine::cache_snapshot::MARKER_FILE);
+        let newer = heph::engine::cache_snapshot::SNAPSHOT_FORMAT + 1;
+        std::fs::write(
+            &marker,
+            format!(r#"{{"format":{newer},"heph":"x","current":"{GEN}"}}"#),
+        )
+        .expect("write marker");
+        let (e, warnings) = warnings_while(|| f.engine(Bucket::Absent, false));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings.iter().all(|w| w.contains(&newer.to_string())),
+            "the warning names the format it saw: {warnings:?}"
+        );
+        builds_cold(&e, "//pkg:a").await;
+        drop(e);
+        rm_local_cache(f.root.path());
+
+        let older = heph::engine::cache_snapshot::SNAPSHOT_FORMAT - 1;
+        std::fs::write(
+            &marker,
+            format!(r#"{{"format":{older},"heph":"x","current":"{GEN}"}}"#),
+        )
+        .expect("write marker");
+        let (e, warnings) = warnings_while(|| f.engine(Bucket::Absent, false));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let (_, events) = run_one(&e, "//pkg:a").await;
+        assert_eq!(served_by(&events, "//pkg:a").as_deref(), Some("snapshot"));
+    }
+
+    /// A manifest under the key that names another target, and one that
+    /// does not deserialize: each falls through to the bucket.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn manifest_key_mismatch() {
+        let f = Fixture::new(RANDOM, &["//pkg:t", "//pkg:u"]).await;
+        // `u`'s revision restored under `t`'s key.
+        let t = f.revision("t");
+        std::fs::remove_dir_all(&t).expect("clear revision");
+        copy_tree(&f.revision("u"), &t);
+        // `u`'s manifest garbage.
+        std::fs::write(f.revision("u").join("manifest-v2.borsh"), b"not borsh")
+            .expect("garbage manifest");
+
+        let e = f.engine(Bucket::ReadOnly, false);
+        for a in ["//pkg:t", "//pkg:u"] {
+            let (out, events) = run_one(&e, a).await;
+            assert_eq!(
+                served_by(&events, a).as_deref(),
+                Some("bucket"),
+                "{a}: {events:#?}"
+            );
+            assert_eq!(out, f.cold(a), "{a}");
+        }
+    }
+
+    /// A zstd blob and a raw blob cut short after the restore: the hit stands
+    /// on the snapshot's manifest, and the pull falls through to the bucket.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn truncated_blob_on_read() {
+        let f = Fixture::new(
+            r#"
+target(name = "z", driver = "bash", run = "echo $RANDOM$RANDOM$RANDOM > $OUT", out = "out.txt")
+target(name = "r", driver = "bash", run = "head -c 2000000 /dev/urandom | gzip > $OUT", out = "out.gz")
+"#,
+            &["//pkg:z", "//pkg:r"],
+        )
+        .await;
+        for (target, zstd) in [("z", true), ("r", false)] {
+            let blob = f.out_blob(target);
+            assert_eq!(
+                blob.to_string_lossy().ends_with(".zst"),
+                zstd,
+                "{}",
+                blob.display()
+            );
+            let len = std::fs::metadata(&blob).expect("stat").len();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&blob)
+                .expect("open blob")
+                .set_len(len / 2)
+                .expect("truncate");
+        }
+        let e = f.engine(Bucket::ReadOnly, false);
+        for a in ["//pkg:z", "//pkg:r"] {
+            let (out, _) = run_one(&e, a).await;
+            assert!(
+                out == f.cold(a),
+                "{a}: the bucket must serve the whole blob"
+            );
+        }
+    }
 }

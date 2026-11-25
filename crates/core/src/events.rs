@@ -671,14 +671,20 @@ pub enum BuildEventKind {
         error: Option<String>,
     },
     /// A remote tier had the revision. A **tier event, not a target outcome**:
-    /// count targets with [`CacheOutcome`](Self::CacheOutcome).
+    /// count targets with [`CacheOutcome`](Self::CacheOutcome). [`TierCounts`]
+    /// folds it, with the outcomes, into hits per tier.
     RemoteCacheHit {
         addr: String,
         /// The configured name of the remote cache that had it (`caches:` in
-        /// `.hephconfig`): `heph run --json` reports it. `None` from a host
-        /// that predates it.
+        /// `.hephconfig`): `heph run --json` reports it. `None` when
+        /// `snapshot` is set, and from a host that predates it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cache: Option<String>,
+        /// The CI cache snapshot's tier served it (`cacheSnapshot:`), not a
+        /// cache the user configured. A flag rather than a name, since a
+        /// user cache may be named anything, `snapshot` included.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        snapshot: bool,
     },
     /// A remote tier was consulted and did not have the revision. A **tier
     /// event, not a target outcome**: it follows a [`LocalCacheMiss`]
@@ -1121,6 +1127,46 @@ impl CacheCounts {
     }
 }
 
+/// Hits per cache tier — local, the CI cache snapshot, each remote by name —
+/// and misses, so "how many hits came from the snapshot, how many from the
+/// bucket" has an answer. Folded from [`CacheOutcome`]
+/// (BuildEventKind::CacheOutcome) (local hits, misses) and from
+/// [`RemoteCacheHit`](BuildEventKind::RemoteCacheHit), which the engine emits
+/// once with each remote-hit outcome and which names the tier.
+///
+/// Attribution, not accounting: a hit later taken back
+/// ([`CacheHitRebuilt`](BuildEventKind::CacheHitRebuilt)) stays on its tier
+/// here. [`CacheCounts`] is the per-target count.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TierCounts {
+    pub local: u64,
+    pub snapshot: u64,
+    /// By `caches:` name; `""` for a hit from a host that predates the name.
+    pub remote: BTreeMap<String, u64>,
+    pub misses: u64,
+}
+
+impl TierCounts {
+    /// Fold one event; every other event is ignored.
+    pub fn apply(&mut self, kind: &BuildEventKind) {
+        match kind {
+            BuildEventKind::CacheOutcome { outcome, .. } => match outcome {
+                CacheOutcomeKind::LocalHit => self.local = self.local.saturating_add(1),
+                CacheOutcomeKind::Miss => self.misses = self.misses.saturating_add(1),
+                CacheOutcomeKind::RemoteHit | CacheOutcomeKind::Unknown => {}
+            },
+            BuildEventKind::RemoteCacheHit { snapshot: true, .. } => {
+                self.snapshot = self.snapshot.saturating_add(1);
+            }
+            BuildEventKind::RemoteCacheHit { cache, .. } => {
+                let n = self.remote.entry(cache.clone()).or_default();
+                *n = n.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Fixtures shared by every consumer's tests, so they are all checked against
 /// one event stream and one expected answer.
 #[cfg(any(test, feature = "test-support"))]
@@ -1196,7 +1242,8 @@ pub mod test_support {
                 6,
                 BuildEventKind::RemoteCacheHit {
                     addr: a("//q:remote"),
-                    cache: None,
+                    cache: Some("bucket".into()),
+                    snapshot: false,
                 },
             ),
             ev(6, outcome("//q:remote", CacheOutcomeKind::RemoteHit)),
@@ -1260,6 +1307,7 @@ pub mod test_support {
                 BuildEventKind::RemoteCacheHit {
                     addr: a("//s:gone"),
                     cache: None,
+                    snapshot: true,
                 },
             ),
             ev(23, outcome("//s:gone", CacheOutcomeKind::RemoteHit)),
@@ -2346,6 +2394,24 @@ mod tests {
         assert_eq!(c.consulted(), 7, "one count per cacheable target");
     }
 
+    /// The shared stream's remote hits are split by the tier that served them:
+    /// one from the snapshot, one from the cache named `bucket`.
+    #[test]
+    fn tier_counts_attribute_each_remote_hit_to_its_tier() {
+        let mut t = TierCounts::default();
+        for e in test_support::cache_stream() {
+            t.apply(&e.kind);
+        }
+        assert_eq!(t.local, 3, "{t:?}");
+        assert_eq!(t.snapshot, 1, "{t:?}");
+        assert_eq!(
+            t.remote,
+            BTreeMap::from([("bucket".to_string(), 1)]),
+            "{t:?}"
+        );
+        assert_eq!(t.misses, 2, "{t:?}");
+    }
+
     #[test]
     fn cache_counts_ignore_tier_events() {
         let c = fold(&[
@@ -2360,7 +2426,8 @@ mod tests {
             },
             BuildEventKind::RemoteCacheHit {
                 addr: "//a:z".into(),
-                cache: None,
+                cache: Some("bucket".into()),
+                snapshot: false,
             },
         ]);
         assert_eq!(c, CacheCounts::default());

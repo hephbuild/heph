@@ -688,9 +688,32 @@ struct CacheHealth {
     cooldown_ms: AtomicU64,
 }
 
+/// What a cache is to the set: one the user configured under `caches:`, or the
+/// CI cache snapshot's tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CacheRole {
+    User,
+    /// The read-only tier over the current generation of a cache snapshot
+    /// (`cacheSnapshot:`). It is identified by this role, never by its name, so
+    /// a user cache of any name can't be taken for it: it is outside
+    /// `config_hash`, the persisted read order and `measure_latency`, read
+    /// first, and never written.
+    Snapshot,
+}
+
+/// The snapshot tier's name in logs and events. Display only: a user cache may
+/// carry the same name, and nothing looks the tier up by it (see
+/// [`CacheRole::Snapshot`]).
+pub const SNAPSHOT_TIER_NAME: &str = "snapshot";
+
+/// The snapshot tier's request budget. It is local disk, so this only bounds
+/// open files, not a remote's connection pool.
+const SNAPSHOT_TIER_CONCURRENCY: usize = 64;
+
 /// A configured cache: its definition, the constructed backend, its health, and
 /// its request budget (see [`META_SLOT_RESERVE`]).
 struct ConfiguredCache {
+    role: CacheRole,
     def: RemoteCacheDef,
     backend: Arc<dyn RemoteCacheBackend>,
     health: CacheHealth,
@@ -710,8 +733,35 @@ struct ConfiguredCache {
 
 impl ConfiguredCache {
     fn new(def: RemoteCacheDef, backend: Arc<dyn RemoteCacheBackend>) -> Self {
+        Self::with_role(CacheRole::User, def, backend)
+    }
+
+    /// The snapshot tier over `backend`: readable, **never writable**, so no
+    /// upload, scratch push or manifest write can reach it (I4).
+    fn snapshot(uri: String, backend: Arc<dyn RemoteCacheBackend>) -> Self {
+        Self::with_role(
+            CacheRole::Snapshot,
+            RemoteCacheDef {
+                name: SNAPSHOT_TIER_NAME.to_string(),
+                uri,
+                read: true,
+                write: false,
+                concurrency: SNAPSHOT_TIER_CONCURRENCY,
+                endpoint: None,
+                region: None,
+            },
+            backend,
+        )
+    }
+
+    fn with_role(
+        role: CacheRole,
+        def: RemoteCacheDef,
+        backend: Arc<dyn RemoteCacheBackend>,
+    ) -> Self {
         let (reserve, shared) = split_request_budget(def.concurrency);
         Self {
+            role,
             def,
             backend,
             health: CacheHealth::default(),
@@ -720,6 +770,12 @@ impl ConfiguredCache {
             damage_warned: AtomicBool::new(false),
             skip_logged: AtomicBool::new(false),
         }
+    }
+
+    /// Whether anything may be written to this cache. Never the snapshot tier,
+    /// whatever its definition says: a build does not modify `<dir>` (I4).
+    fn writable(&self) -> bool {
+        self.role == CacheRole::User && self.def.write
     }
 
     /// Record that this cache answered with a damaged entry under `key` — a
@@ -1400,6 +1456,19 @@ impl RemoteCacheSet {
     /// Build the set from definitions. Backend construction is synchronous (no
     /// network), so a bad URI fails here, at engine startup, with context.
     pub fn new(defs: &[RemoteCacheDef], home: PathBuf) -> anyhow::Result<Arc<Self>> {
+        Self::with_snapshot(defs, None, home)
+    }
+
+    /// [`Self::new`], plus the snapshot tier over `snapshot` — the current
+    /// generation's directory, the `file://` root, as
+    /// [`open_tier`](crate::engine::cache_snapshot::open_tier) returns it —
+    /// when there is one. See [`CacheRole::Snapshot`] for what sets the tier
+    /// apart.
+    pub fn with_snapshot(
+        defs: &[RemoteCacheDef],
+        snapshot: Option<&Path>,
+        home: PathBuf,
+    ) -> anyhow::Result<Arc<Self>> {
         // Each cache reads credentials from a namespace derived from its name.
         // The derivation is not injective — `a-b` and `a_b` both flatten to
         // `HEPH_CACHE_A_B_` — so two caches can end up sharing one namespace.
@@ -1434,7 +1503,21 @@ impl RemoteCacheSet {
             .with_context(|| format!("configure remote cache `{}`", def.name))?;
             caches.push(ConfiguredCache::new(def.clone(), Arc::new(backend)));
         }
+        // Hashed before the snapshot joins: the tier must not move the
+        // persisted read order's key (I1).
         let config_hash = config_hash(defs);
+        if let Some(generation) = snapshot {
+            // A snapshot can leave a build cold, never fail it (I3): a tier
+            // that can't be set up is one warning and no tier.
+            match snapshot_tier(generation) {
+                Ok(tier) => caches.push(tier),
+                Err(e) => warn!(
+                    dir = %generation.display(),
+                    error = ?e,
+                    "cache snapshot: not used, building cold",
+                ),
+            }
+        }
         Ok(Arc::new(Self {
             caches,
             home,
@@ -1500,15 +1583,16 @@ impl RemoteCacheSet {
     /// called before the first read; an order already settled is an error.
     #[cfg(any(test, feature = "test-support"))]
     pub fn pin_read_order_for_tests(&self, names: &[&str]) -> anyhow::Result<()> {
-        let order = names
+        let pinned = names
             .iter()
             .map(|name| {
                 self.caches
                     .iter()
-                    .position(|c| c.def.name == *name && c.def.read)
+                    .position(|c| c.role == CacheRole::User && c.def.name == *name && c.def.read)
                     .with_context(|| format!("no readable cache named `{name}`"))
             })
             .collect::<anyhow::Result<Vec<usize>>>()?;
+        let order = self.snapshot_idx().into_iter().chain(pinned).collect();
         self.read_order
             .set(order)
             .context("the read order is already settled")
@@ -1554,7 +1638,7 @@ impl RemoteCacheSet {
     pub fn writable_backends(&self) -> Vec<(String, Arc<dyn RemoteCacheBackend>)> {
         self.caches
             .iter()
-            .filter(|c| c.def.write)
+            .filter(|c| c.writable())
             .map(|c| (c.def.name.clone(), Arc::clone(&c.backend)))
             .collect()
     }
@@ -1564,7 +1648,7 @@ impl RemoteCacheSet {
     }
 
     pub(crate) fn has_writable(&self) -> bool {
-        self.caches.iter().any(|c| c.def.write)
+        self.caches.iter().any(ConfiguredCache::writable)
     }
 
     /// Whether any cache is readable — the gate for the download/read path.
@@ -1605,8 +1689,11 @@ impl RemoteCacheSet {
     /// Probe every cache's round-trip latency once, concurrently, and report it.
     /// Drives `heph tool cache measure-latency`; also persists the resulting read
     /// order so subsequent runs skip the probe.
+    ///
+    /// The snapshot tier is neither probed nor reported: it is local disk,
+    /// always read first, and kept out of the persisted order (I1).
     pub async fn measure_latency(&self) -> Vec<CacheLatency> {
-        let probes = self.caches.iter().map(|c| async move {
+        let probes = self.user_caches().map(|c| async move {
             let latency = match c.probe_latency().await {
                 Ok(d) => Some(d),
                 Err(e) => {
@@ -1638,21 +1725,48 @@ impl RemoteCacheSet {
         results
     }
 
-    /// Readable cache indices in ascending-latency order. Loads the persisted
-    /// order when it matches the current config, otherwise probes every readable
-    /// cache once (in parallel) and persists the result.
+    /// Readable cache indices: the snapshot tier first when there is one, then
+    /// the user's caches in ascending-latency order. Loads the persisted order
+    /// when it matches the current config, otherwise probes every readable
+    /// user cache once (in parallel) and persists the result.
     async fn read_order(&self) -> &[usize] {
         self.read_order
-            .get_or_init(|| async { self.compute_read_order().await })
+            .get_or_init(|| async {
+                let mut order: Vec<usize> = self.snapshot_idx().into_iter().collect();
+                order.extend(self.compute_read_order().await);
+                order
+            })
             .await
     }
 
+    /// The snapshot tier's index, when the set has one.
+    fn snapshot_idx(&self) -> Option<usize> {
+        self.caches
+            .iter()
+            .position(|c| c.role == CacheRole::Snapshot)
+    }
+
+    /// The caches the user configured under `caches:`, the snapshot tier left
+    /// out.
+    fn user_caches(&self) -> impl Iterator<Item = &ConfiguredCache> {
+        self.caches.iter().filter(|c| c.role == CacheRole::User)
+    }
+
+    /// Whether `rev` was located on the snapshot tier.
+    pub(crate) fn served_by_snapshot(&self, rev: &RemoteRevision) -> bool {
+        self.caches
+            .get(rev.cache_idx)
+            .is_some_and(|c| c.role == CacheRole::Snapshot)
+    }
+
+    /// The user caches' read order — the snapshot tier is not in it, nor in
+    /// what is persisted.
     async fn compute_read_order(&self) -> Vec<usize> {
         let readable: Vec<usize> = self
             .caches
             .iter()
             .enumerate()
-            .filter(|(_, c)| c.def.read)
+            .filter(|(_, c)| c.role == CacheRole::User && c.def.read)
             .map(|(i, _)| i)
             .collect();
         if readable.len() <= 1 {
@@ -1663,12 +1777,9 @@ impl RemoteCacheSet {
         if let Some(names) = load_order(&self.home, &self.config_hash) {
             let mut ordered: Vec<usize> = Vec::with_capacity(readable.len());
             for name in &names {
-                if let Some((i, _)) = self
-                    .caches
-                    .iter()
-                    .enumerate()
-                    .find(|(i, c)| c.def.read && &c.def.name == name && !ordered.contains(i))
-                {
+                if let Some(i) = readable.iter().copied().find(|i| {
+                    self.caches.get(*i).is_some_and(|c| &c.def.name == name) && !ordered.contains(i)
+                }) {
                     ordered.push(i);
                 }
             }
@@ -1680,11 +1791,9 @@ impl RemoteCacheSet {
             return ordered;
         }
 
-        let probes = self
-            .caches
+        let probes = readable
             .iter()
-            .enumerate()
-            .filter(|(_, c)| c.def.read)
+            .filter_map(|&i| self.caches.get(i).map(|c| (i, c)))
             .map(|(i, c)| async move {
                 let lat = match c.probe_latency().await {
                     Ok(d) => d,
@@ -1745,7 +1854,7 @@ impl RemoteCacheSet {
     ) {
         // Skip caches the breaker has already tripped — no point hitting (or
         // re-logging) a cache that's down.
-        let writers = self.caches.iter().filter(|c| c.def.write && !c.broken());
+        let writers = self.caches.iter().filter(|c| c.writable() && !c.broken());
         let per_cache = writers.map(|cache| async move {
             // Collected eagerly rather than left as a lazy `Map`: feeding a
             // closure-returning-async-block straight into `stream::iter` makes
@@ -2256,6 +2365,18 @@ fn copy_to_file(mut reader: impl std::io::Read, dest: &Path) -> anyhow::Result<(
         std::fs::File::create(dest).with_context(|| format!("create temp {}", dest.display()))?;
     std::io::copy(&mut reader, &mut file).context("copy")?;
     Ok(())
+}
+
+/// The snapshot tier over `generation`, read through the `file://` backend
+/// every remote of that scheme uses (D1, D7).
+fn snapshot_tier(generation: &Path) -> anyhow::Result<ConfiguredCache> {
+    let uri = url::Url::from_directory_path(generation)
+        .map_err(|()| anyhow::anyhow!("{} is not an absolute path", generation.display()))?
+        .to_string();
+    let backend =
+        ObjStoreBackend::from_uri(&uri, SNAPSHOT_TIER_CONCURRENCY, &StoreOptions::default())
+            .with_context(|| format!("configure the cache snapshot tier at {uri}"))?;
+    Ok(ConfiguredCache::snapshot(uri, Arc::new(backend)))
 }
 
 /// Stable hash of the definition set (order-independent) used to invalidate the
@@ -3022,6 +3143,75 @@ mod tests {
             endpoint: None,
             region: None,
         }
+    }
+
+    /// I1: the snapshot tier moves neither `config_hash` nor the persisted
+    /// read order, and is never latency-probed; it is read first, never
+    /// written, and a user cache named `snapshot` is not taken for it.
+    #[tokio::test]
+    async fn store_order_and_config_hash_ignore_the_tier() {
+        let defs = vec![
+            def("a", "memory:///a", true, true),
+            def(SNAPSHOT_TIER_NAME, "memory:///s", true, true),
+        ];
+        let home_without = tempfile::tempdir().expect("tempdir");
+        let home_with = tempfile::tempdir().expect("tempdir");
+        let generation = tempfile::tempdir().expect("tempdir");
+        let without = RemoteCacheSet::new(&defs, home_without.path().to_path_buf()).expect("set");
+        let with = RemoteCacheSet::with_snapshot(
+            &defs,
+            Some(generation.path()),
+            home_with.path().to_path_buf(),
+        )
+        .expect("set");
+
+        assert_eq!(with.config_hash, without.config_hash);
+        assert_eq!(with.caches.len(), 3, "the tier joined the set");
+
+        // Read order: the tier first, then the user caches; what is persisted
+        // names the user caches only, under the same key.
+        let order_with: Vec<usize> = with.read_order().await.to_vec();
+        let order_without: Vec<usize> = without.read_order().await.to_vec();
+        let tier = with.snapshot_idx().expect("the tier");
+        assert_eq!(order_with.first(), Some(&tier), "{order_with:?}");
+        assert_eq!(order_with.len(), order_without.len() + 1);
+        let mut persisted = load_order(home_with.path(), &with.config_hash).expect("persisted");
+        persisted.sort();
+        let mut user_names: Vec<String> = defs.iter().map(|d| d.name.clone()).collect();
+        user_names.sort();
+        assert_eq!(persisted, user_names, "only the user caches are persisted");
+
+        // measure_latency probes and reports the user caches only.
+        let mut measured: Vec<String> = with
+            .measure_latency()
+            .await
+            .into_iter()
+            .map(|l| l.uri)
+            .collect();
+        measured.sort();
+        assert_eq!(measured, vec!["memory:///a", "memory:///s"]);
+
+        // Never written: the user's `snapshot` cache is writable, the tier is not.
+        let writable: Vec<String> = with
+            .writable_backends()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(
+            writable,
+            vec!["a".to_string(), SNAPSHOT_TIER_NAME.to_string()]
+        );
+        let blob = home_with.path().join("blob");
+        std::fs::write(&blob, b"x").expect("write");
+        with.put_revision(&addr(), "h1", b"manifest", &[("out".to_string(), blob)])
+            .await;
+        assert_eq!(
+            std::fs::read_dir(generation.path())
+                .expect("read_dir")
+                .count(),
+            0,
+            "put_revision wrote into the snapshot tier"
+        );
     }
 
     /// Each cache reads credentials from a namespace derived from its name, and
