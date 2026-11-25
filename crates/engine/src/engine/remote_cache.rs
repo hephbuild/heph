@@ -1121,6 +1121,39 @@ pub(crate) struct RemoteManifestArtifact {
     pub encoding: ManifestArtifactEncoding,
 }
 
+impl RemoteManifest {
+    /// The remote manifest of the local `manifest` stored under `hashin`, in
+    /// its order, each artifact keeping the encoding its blob is stored in
+    /// (blobs travel verbatim), under its [`remote_entry_name`]. The one
+    /// builder of a remote manifest, shared by the upload and the snapshot
+    /// export.
+    pub(crate) fn from_local(manifest: &Manifest, hashin: &str) -> Self {
+        RemoteManifest {
+            version: REMOTE_MANIFEST_VERSION.to_string(),
+            target: manifest.target.clone(),
+            hashin: hashin.to_string(),
+            artifacts: manifest
+                .artifacts
+                .iter()
+                .map(|a| RemoteManifestArtifact {
+                    hashout: a.hashout.clone(),
+                    group: a.group.clone(),
+                    name: remote_entry_name(&a.name).to_owned(),
+                    size: a.size,
+                    r#type: a.r#type.clone(),
+                    content_type: a.content_type.clone(),
+                    encoding: a.encoding.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    /// The bytes stored as [`REMOTE_MANIFEST`] on a remote: the one encoder.
+    pub(crate) fn encode(&self) -> anyhow::Result<Vec<u8>> {
+        borsh::to_vec(self).context("serialize remote manifest")
+    }
+}
+
 /// Remote manifest format version — independent of the local manifest's, so the
 /// two can evolve separately. Informational, like the local one: the object
 /// name ([`REMOTE_MANIFEST`]) is what keeps an older heph from reading it.
@@ -1664,7 +1697,7 @@ impl RemoteCacheSet {
     /// verbatim only when it is unambiguously safe, otherwise it appends a hash
     /// of the original (see there). Two distinct addresses therefore always
     /// produce distinct key prefixes, so targets sharing a `hashin` never alias.
-    fn key(addr: &Addr, hashin: &str, name: &str) -> String {
+    pub(crate) fn key(addr: &Addr, hashin: &str, name: &str) -> String {
         let mut key = Self::revision_prefix(addr, hashin);
         key.push('/');
         key.push_str(&key_segment(name));
@@ -2719,29 +2752,7 @@ impl Engine {
             .try_collect()
             .await?;
 
-        // Build the remote manifest from the local one, in its order, each
-        // artifact keeping the encoding its blob is stored in, under its remote
-        // name.
-        let remote_manifest = RemoteManifest {
-            version: REMOTE_MANIFEST_VERSION.to_string(),
-            target: manifest.target.clone(),
-            hashin: hashin.to_string(),
-            artifacts: manifest
-                .artifacts
-                .iter()
-                .map(|a| RemoteManifestArtifact {
-                    hashout: a.hashout.clone(),
-                    group: a.group.clone(),
-                    name: remote_entry_name(&a.name).to_owned(),
-                    size: a.size,
-                    r#type: a.r#type.clone(),
-                    content_type: a.content_type.clone(),
-                    encoding: a.encoding.clone(),
-                })
-                .collect(),
-        };
-        let manifest_bytes =
-            borsh::to_vec(&remote_manifest).context("serialize remote manifest")?;
+        let manifest_bytes = RemoteManifest::from_local(&manifest, hashin).encode()?;
 
         let temps: Vec<(String, PathBuf)> = prepared
             .iter()

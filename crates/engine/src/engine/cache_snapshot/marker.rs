@@ -50,6 +50,11 @@ pub struct Marker {
     pub heph: String,
     /// The current generation's directory name, `gen-<nonce>`.
     pub current: String,
+    /// Whether the run that wrote it was incomplete, so it also carried over
+    /// what it restored: a small snapshot then reads as "an earlier job
+    /// failed", not "the restore missed". For diagnosis only.
+    #[serde(default)]
+    pub incomplete: bool,
 }
 
 /// The generation a readable marker names.
@@ -214,8 +219,9 @@ pub fn open_tier(dir: &Path) -> Option<Generation> {
 
 /// Point `dir`'s marker at the generation `current`, by writing a temp file
 /// and renaming it over [`MARKER_FILE`]. The generation must already be
-/// complete: this is the last write of a snapshot.
-pub fn write_marker(dir: &Path, current: &str) -> anyhow::Result<()> {
+/// complete: this is the last write of a snapshot. `incomplete` records
+/// whether the run that wrote it was ([`Marker::incomplete`]).
+pub fn write_marker(dir: &Path, current: &str, incomplete: bool) -> anyhow::Result<()> {
     anyhow::ensure!(
         is_generation_name(current),
         "{current:?} is not a `{GENERATION_PREFIX}<nonce>` generation name"
@@ -224,6 +230,7 @@ pub fn write_marker(dir: &Path, current: &str) -> anyhow::Result<()> {
         format: SNAPSHOT_FORMAT,
         heph: hcore::version::current().to_owned(),
         current: current.to_owned(),
+        incomplete,
     };
     let bytes = serde_json::to_vec(&marker).context("encoding the snapshot marker")?;
     let nonce = uuid::Uuid::new_v4().simple().to_string();
@@ -340,7 +347,7 @@ mod tests {
     fn write_then_read_round_trips() {
         let tmp = snapshot_dir();
         mkgen(tmp.path(), "gen-0123abc_-Z");
-        write_marker(tmp.path(), "gen-0123abc_-Z").expect("write");
+        write_marker(tmp.path(), "gen-0123abc_-Z", false).expect("write");
         let generation = open_tier(tmp.path()).expect("served");
         assert_eq!(generation.path, tmp.path().join("gen-0123abc_-Z"));
         assert_eq!(
@@ -349,15 +356,15 @@ mod tests {
                 format: SNAPSHOT_FORMAT,
                 heph: hcore::version::current().to_owned(),
                 current: "gen-0123abc_-Z".to_owned(),
+                incomplete: false,
             }
         );
         // A second write replaces the first and leaves no temp file behind.
         mkgen(tmp.path(), "gen-b");
-        write_marker(tmp.path(), "gen-b").expect("rewrite");
-        assert_eq!(
-            read_marker(tmp.path()).expect("served").marker.current,
-            "gen-b"
-        );
+        write_marker(tmp.path(), "gen-b", true).expect("rewrite");
+        let marker = read_marker(tmp.path()).expect("served").marker;
+        assert_eq!(marker.current, "gen-b");
+        assert!(marker.incomplete, "the incomplete flag round-trips");
         let names: Vec<String> = std::fs::read_dir(tmp.path())
             .expect("read dir")
             .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
@@ -365,7 +372,7 @@ mod tests {
             .collect();
         assert!(names.is_empty(), "{names:?}");
         // A name that is not a generation is refused before anything is written.
-        write_marker(tmp.path(), "../x").expect_err("not a generation");
+        write_marker(tmp.path(), "../x", false).expect_err("not a generation");
         assert_eq!(
             read_marker(tmp.path()).expect("served").marker.current,
             "gen-b"

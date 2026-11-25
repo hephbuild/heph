@@ -3,17 +3,20 @@
 //! Then the snapshot tier: a `cacheSnapshot` dir read first, read-only, and
 //! passed over for anything it can't serve.
 //!
-//! The export and the `snapshot` command are not here yet: these tests drive
-//! the journal through `Config::record_working_set` and read it back with
-//! `cache_snapshot::{list_journals, read_journal}`, and build each snapshot
-//! by hand ([`Fixture`]): a cold run writes a `file://` bucket, which is
-//! copied into a generation behind a marker.
+//! The journal tests drive it through `Config::record_working_set` and read
+//! it back with `cache_snapshot::{list_journals, read_journal}`. The tier
+//! tests build each snapshot by hand ([`Fixture`]): a cold run writes a
+//! `file://` bucket, which is copied into a generation behind a marker. Last,
+//! the export, through `Engine::export_snapshot` (the `snapshot` command is
+//! not here yet): job after job over one snapshot dir.
 
 use crate::common::{artifact_string, drain};
 use futures::TryStreamExt as _;
 use hcore::events::CacheOutcomeKind;
+use hcore::hasync::StdCancellationToken;
 use heph::engine::cache_snapshot::{
-    JournalContents, WorkingSet, list_journals, read_journal, working_set_dir,
+    ExportReport, Incomplete, JournalContents, LeftOut, WorkingSet, list_journals, lock_snapshot,
+    read_journal, read_marker, working_set_dir,
 };
 use heph::engine::event::{BuildEvent, BuildEventKind};
 use heph::engine::{Config, Discovery, Engine, HomeDir, OutputMatcher, ResultOptions};
@@ -524,7 +527,7 @@ impl Fixture {
             cold,
         };
         copy_tree(f.bucket.path(), &f.generation());
-        heph::engine::cache_snapshot::write_marker(&f.dir(), GEN).expect("write marker");
+        heph::engine::cache_snapshot::write_marker(&f.dir(), GEN, false).expect("write marker");
         f
     }
 
@@ -1083,4 +1086,145 @@ target(name = "r", driver = "bash", run = "head -c 2000000 /dev/urandom | gzip >
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The export, driven through its API as the `snapshot` command will drive it:
+// lock, read the journals, export with an engine that records nothing, delete
+// the journals.
+
+const ALL_FOUR: [&str; 4] = ["//pkg:a", "//pkg:b", "//pkg:c", "//pkg:d"];
+
+/// A CI job's engine: the snapshot dir configured, recording its working set.
+fn job_engine(root: &Path, dir: &Path) -> Arc<Engine> {
+    engine_with(Config {
+        record_working_set: true,
+        cache_snapshot: Some(dir.to_path_buf()),
+        ..Config::for_tests(root)
+    })
+}
+
+/// Export `ws` into `dir`, then delete the journals it was read from.
+async fn export(root: &Path, dir: &Path, ws: &WorkingSet) -> ExportReport {
+    let lock = lock_snapshot(&home(root)).expect("snapshot lock");
+    let e = engine(root, None, false);
+    let report = e
+        .export_snapshot(&lock, dir, ws, &StdCancellationToken::new())
+        .await
+        .expect("export");
+    for j in &ws.journals {
+        let removed = std::fs::remove_file(j);
+        assert!(
+            removed
+                .as_ref()
+                .err()
+                .is_none_or(|err| err.kind() == std::io::ErrorKind::NotFound),
+            "deleting {}: {removed:?}",
+            j.display()
+        );
+    }
+    report
+}
+
+/// One job over `root`: build `addrs` with the snapshot at `dir`, and return
+/// its working set and every build's events.
+async fn job(root: &Path, dir: &Path, addrs: &[&str]) -> (WorkingSet, Vec<BuildEvent>) {
+    let e = job_engine(root, dir);
+    let events = run(&e, addrs).await;
+    drop(e);
+    let ws = WorkingSet::from_journals(read_settled(root, 1).await);
+    (ws, events)
+}
+
+/// A cold first job that builds every target of [`FOUR`] and snapshots it,
+/// then a fresh machine: the local cache gone.
+async fn first_job(root: &Path, dir: &Path) {
+    write_build(root, FOUR);
+    let (ws, _) = job(root, dir, &ALL_FOUR).await;
+    let report = export(root, dir, &ws).await;
+    assert_eq!(report.new.count, 4, "{report:?}");
+    rm_local_cache(root);
+}
+
+/// The headline: a second job on a fresh machine is served whole by the
+/// snapshot the first wrote, and writes it back unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_job_runs_nothing() {
+    let root = tempfile::tempdir().expect("root");
+    let parent = tempfile::tempdir().expect("parent");
+    let dir = parent.path().join("snap");
+    first_job(root.path(), &dir).await;
+
+    let (ws, events) = job(root.path(), &dir, &ALL_FOUR).await;
+    for a in ALL_FOUR {
+        assert_eq!(served_by(&events, a).as_deref(), Some("snapshot"), "{a}");
+    }
+    let report = export(root.path(), &dir, &ws).await;
+    assert_eq!(report.kept.count, 4, "{report:?}");
+    assert_eq!(report.new.count + report.dropped.count, 0, "{report:?}");
+    assert!(report.left_out.is_empty(), "{report:?}");
+    assert!(list_journals(&home(root.path())).expect("list").is_empty());
+}
+
+/// A complete job's snapshot is its working set: what it did not use goes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unused_revisions_are_dropped() {
+    let root = tempfile::tempdir().expect("root");
+    let parent = tempfile::tempdir().expect("parent");
+    let dir = parent.path().join("snap");
+    first_job(root.path(), &dir).await;
+
+    let (ws, _) = job(root.path(), &dir, &["//pkg:a", "//pkg:b"]).await;
+    let report = export(root.path(), &dir, &ws).await;
+    assert_eq!(report.kept.count, 2, "{report:?}");
+    assert_eq!(report.dropped.count, 2, "{report:?}");
+    assert_eq!(report.dropped_addrs, vec!["//pkg:c", "//pkg:d"]);
+
+    rm_local_cache(root.path());
+    let (_, events) = job(root.path(), &dir, &["//pkg:c"]).await;
+    assert_eq!(outcome_of(&events, "//pkg:c"), Some(CacheOutcomeKind::Miss));
+}
+
+/// An incomplete job also carries over what it restored and did not touch,
+/// though this machine's local cache never held it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_incomplete_run_keeps_restored_revisions() {
+    let root = tempfile::tempdir().expect("root");
+    let parent = tempfile::tempdir().expect("parent");
+    let dir = parent.path().join("snap");
+    first_job(root.path(), &dir).await;
+
+    let (mut ws, _) = job(root.path(), &dir, &["//pkg:a"]).await;
+    ws.incomplete
+        .push((ws.journals[0].clone(), Incomplete::Failed));
+    let report = export(root.path(), &dir, &ws).await;
+    assert_eq!(report.kept.count, 1, "{report:?}");
+    assert_eq!(report.carried_over.count, 3, "{report:?}");
+    assert_eq!(report.incomplete.len(), 1, "{report:?}");
+    assert!(read_marker(&dir).expect("marker").marker.incomplete);
+
+    rm_local_cache(root.path());
+    let (_, events) = job(root.path(), &dir, &ALL_FOUR).await;
+    for a in ALL_FOUR {
+        assert_eq!(served_by(&events, a).as_deref(), Some("snapshot"), "{a}");
+    }
+}
+
+/// A revision gc trimmed between the build and the export is left out and
+/// counted, not a failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn export_skips_a_gc_trimmed_revision() {
+    let root = tempfile::tempdir().expect("root");
+    let parent = tempfile::tempdir().expect("parent");
+    let dir = parent.path().join("snap");
+    write_build(root.path(), FOUR);
+    let (ws, _) = job(root.path(), &dir, &ALL_FOUR).await;
+    rm_local_cache(root.path());
+    let report = export(root.path(), &dir, &ws).await;
+    assert_eq!(
+        report.left_out.get(&LeftOut::Trimmed).map(|t| t.count),
+        Some(4),
+        "{report:?}"
+    );
+    assert_eq!(report.new.count, 0, "{report:?}");
 }

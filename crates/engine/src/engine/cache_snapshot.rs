@@ -56,7 +56,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
+pub mod export;
 pub mod marker;
+pub use export::{
+    ExportOutcome, ExportReport, IncompleteJournal, LeftOut, RevisionBytes, SNAPSHOT_LOCK_FILE,
+    SnapshotLock, Tally, lock_snapshot, try_lock_snapshot,
+};
 pub use marker::{
     GENERATION_PREFIX, Generation, MARKER_FILE, MARKER_TMP_PREFIX, Marker, NoTier, SNAPSHOT_FORMAT,
     is_generation_name, open_tier, read_marker, write_marker,
