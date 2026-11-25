@@ -41,6 +41,7 @@ pub mod hephsession;
 pub mod holder;
 pub mod id;
 pub mod lockfile;
+pub mod machine;
 pub mod otlp;
 pub mod query;
 pub mod recorder;
