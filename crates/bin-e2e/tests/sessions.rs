@@ -403,8 +403,17 @@ fn the_export_dir_variable_exports_each_run() {
     assert!(out.status.success(), "{}", describe(&out));
     let stderr = String::from_utf8_lossy(&out.stderr);
     let id = id_in(&stderr).unwrap_or_else(|| panic!("no session announced\n{}", describe(&out)));
+    // What the seal-time export warns with (tui's `session/mod.rs`), and no
+    // other warning either.
+    const EXPORT_WARNINGS: [&str; 5] = [
+        "cannot export the session",
+        "the session export did not finish in time",
+        "the session export stopped",
+        "is not exported",
+        "is inside the workspace",
+    ];
     assert!(
-        !stderr.contains("WARN") && !stderr.contains("export"),
+        !stderr.contains("WARN") && !EXPORT_WARNINGS.iter().any(|w| stderr.contains(w)),
         "{}",
         describe(&out)
     );
