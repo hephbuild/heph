@@ -342,6 +342,14 @@ pub trait TUIAppView: Send {
     /// no click decides an approval. No-op by default.
     fn mouse(&mut self, _input: MouseInput) {}
 
+    /// Where a drag that starts at `at` selects, matched against what the
+    /// last [`Self::render_full`] drew: a region whose rows the selection
+    /// keeps to (the Log tab's text, without its line numbers), or `None`
+    /// for the whole screen. `None` by default.
+    fn selection_region(&self, _at: ratatui::layout::Position) -> Option<ratatui::layout::Rect> {
+        None
+    }
+
     /// Cycle the body view (the `Tab` / `Shift+Tab` keys). `forward` advances to
     /// the next view, otherwise the previous. Called from the backend's key
     /// handler; the repaint happens on the next render tick. No-op by default for

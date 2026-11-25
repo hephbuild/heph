@@ -8,6 +8,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use hcore::events::{AdmittedKind, display_amount, unit_of};
+use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -25,7 +26,7 @@ use crate::tui::app::ScreenKey;
 use crate::tui::text::{Redact, clean_inline, cut_left, cut_right, width};
 
 pub const OVERVIEW_HINTS: &str = "tab/⇧tab switch tab · esc back to the list";
-pub const LOG_HINTS: &str = "↑/↓ scroll (stops following) · f follow · / search · n/N next/prev · g/G top/bottom · w wrap · esc back";
+pub const LOG_HINTS: &str = "↑/↓ scroll (stops following) · f follow · / search · n/N next/prev · g/G top/bottom · w wrap · drag to copy · esc back";
 pub const OUTPUTS_HINTS: &str =
     "↑/↓ scroll · enter expand a folded group · tab/⇧tab switch tab · esc back to the list";
 
@@ -108,6 +109,9 @@ struct Drawn {
     tabs: [(Range<u16>, TargetTab); 3],
     rows: u16,
     body_shown: usize,
+    /// The Log tab's log text: its rows, from past the line numbers to the
+    /// right edge. What a drag starting there selects within.
+    log_text: Option<Rect>,
 }
 
 impl Default for Drawn {
@@ -116,6 +120,7 @@ impl Default for Drawn {
             tabs: TargetTab::ALL.map(|t| (0..0, t)),
             rows: 0,
             body_shown: 0,
+            log_text: None,
         }
     }
 }
@@ -157,6 +162,12 @@ impl TargetScreen {
             body_rows: 0,
             drawn: Drawn::default(),
         }
+    }
+
+    /// The Log tab's text in the last frame, when `at` is in it: a drag
+    /// started there selects the log without its line numbers.
+    pub fn text_region(&self, at: Position) -> Option<Rect> {
+        self.drawn.log_text.filter(|r| r.contains(at))
     }
 
     /// A click at `(col, row)` of the last frame: the breadcrumb, a tab, or
@@ -371,6 +382,7 @@ impl TargetScreen {
         let body_rows = usize::from(rows.saturating_sub(CHROME_ROWS));
         let addr = m.addr(self.id);
         let rec = m.record(self.id).copied();
+        self.drawn.log_text = None;
         let (status, body, hints) = match (self.tab, rec) {
             (_, None) => (String::new(), Vec::new(), OVERVIEW_HINTS.to_owned()),
             (TargetTab::Overview, Some(r)) => {
@@ -413,7 +425,16 @@ impl TargetScreen {
                     PaneState::Nothing(_) if error.is_some() => {
                         body.push(Line::styled(" log: none kept", dim()));
                     }
-                    _ => body.extend(self.pane.body(c, left, inp.redact)),
+                    _ => {
+                        let top = body.len();
+                        body.extend(self.pane.body(c, left, inp.redact));
+                        let shown = body.len().min(body_rows).saturating_sub(top);
+                        self.drawn.log_text = self.pane.text_col().and_then(|x| {
+                            let y = BODY_TOP.checked_add(u16::try_from(top).ok()?)?;
+                            let height = u16::try_from(shown).ok()?;
+                            Some(Rect::new(x, y, cols.saturating_sub(x), height))
+                        });
+                    }
                 }
                 let hints = self
                     .pane

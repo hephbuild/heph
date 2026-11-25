@@ -1528,9 +1528,11 @@ fn click_tab(pty: &common::pty::Pty, case: &str) {
 const CLICKED_TAB_BASE64: &str = "RG9uZQ==";
 
 /// Drag (SGR press, motion with the button down, release) across the
-/// [`CLICKED_TAB`] label: the label is highlighted while the button is down,
-/// the release puts exactly its text on the clipboard with an OSC 52, and the
-/// drag is no click (the tab is still not active; [`click_tab`] checks).
+/// [`CLICKED_TAB`] label. First one a key ends: the highlight goes and the
+/// release copies nothing. Then one that copies: the label is highlighted
+/// while the button is down, the release puts exactly its text on the
+/// clipboard with an OSC 52 and says so on the hint row, and the drag is no
+/// click (the tab is still not active; [`click_tab`] checks).
 fn drag_copy_tab(pty: &common::pty::Pty, case: &str) {
     let found = pty.with_screen(|s| find_cell(s, CLICKED_TAB));
     assert!(
@@ -1542,11 +1544,36 @@ fn drag_copy_tab(pty: &common::pty::Pty, case: &str) {
     let last = col + u16::try_from(CLICKED_TAB.len()).expect("a short label") - 1;
     // SGR is 1-based; button 32 is the left button moving.
     let (x0, x1, y) = (col + 1, last + 1, row + 1);
-    pty.send(format!("\x1b[<0;{x0};{y}M\x1b[<32;{x1};{y}M").as_bytes());
+    let highlighted =
+        |s: &vt100::Screen| (col..=last).all(|c| s.cell(row, c).is_some_and(vt100::Cell::inverse));
+    let plain = |s: &vt100::Screen| {
+        (col..=last).all(|c| s.cell(row, c).is_some_and(|cell| !cell.inverse()))
+    };
+    let press_and_drag = format!("\x1b[<0;{x0};{y}M\x1b[<32;{x1};{y}M");
+    // A key (↑ moves the list's selection) ends the drag.
+    pty.send(press_and_drag.as_bytes());
+    pty.wait_screen(
+        &format!("{case}: highlighted, to cancel"),
+        DEADLINE,
+        highlighted,
+    );
+    pty.send(b"\x1b[A");
+    pty.wait_screen(
+        &format!("{case}: the highlight gone after a key"),
+        DEADLINE,
+        plain,
+    );
+    // Its release, with nothing held: no click, no copy.
+    pty.send(format!("\x1b[<0;{x1};{y}m").as_bytes());
+    pty.send(press_and_drag.as_bytes());
     pty.wait_screen(
         &format!("{case}: {CLICKED_TAB:?} highlighted while dragged over"),
         DEADLINE,
-        |s| (col..=last).all(|c| s.cell(row, c).is_some_and(vt100::Cell::inverse)),
+        highlighted,
+    );
+    assert!(
+        !contains(&pty.output(), b"\x1b]52;"),
+        "{case}: a drag a key ended was copied"
     );
     let osc = format!("\x1b]52;c;{CLICKED_TAB_BASE64}\x1b\\");
     assert!(
@@ -1564,9 +1591,9 @@ fn drag_copy_tab(pty: &common::pty::Pty, case: &str) {
         std::thread::sleep(Duration::from_millis(20));
     }
     pty.wait_screen(
-        &format!("{case}: the highlight gone after the release"),
+        &format!("{case}: the highlight gone and the copy noted after the release"),
         DEADLINE,
-        |s| (col..=last).all(|c| s.cell(row, c).is_some_and(|cell| !cell.inverse())),
+        |s| plain(s) && s.contents().contains("copied 4 chars (OSC 52)"),
     );
 }
 

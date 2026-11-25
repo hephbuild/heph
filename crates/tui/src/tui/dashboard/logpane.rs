@@ -60,6 +60,9 @@ pub struct LogPane {
     note: Option<String>,
     /// The body rows of the last frame, for paging and leaving follow.
     rows: usize,
+    /// The column the last frame's log text starts at, past the line
+    /// numbers; `None` when it drew a notice instead of lines.
+    text_col: Option<u16>,
 }
 
 impl Default for LogPane {
@@ -80,11 +83,18 @@ impl Default for LogPane {
             cur: None,
             note: None,
             rows: 0,
+            text_col: None,
         }
     }
 }
 
 impl LogPane {
+    /// The column the last [`Self::body`]'s log text starts at (past the
+    /// line numbers), or `None` when it drew no log lines.
+    pub fn text_col(&self) -> Option<u16> {
+        self.text_col
+    }
+
     fn reset(&mut self, state: PaneState) {
         let (follow, wrap) = (self.follow, self.wrap);
         *self = Self {
@@ -420,6 +430,7 @@ impl LogPane {
     /// The pane's body, `cols` × `rows`.
     pub fn body(&mut self, cols: usize, rows: usize, redact: &Redact) -> Vec<Line<'static>> {
         self.rows = rows;
+        self.text_col = None;
         let count = self.line_count();
         let empty = match &self.state {
             PaneState::Closed | PaneState::Opening => Some("opening the log…".to_owned()),
@@ -442,6 +453,8 @@ impl LogPane {
             0
         };
         let text_cols = cols.saturating_sub(gutter + 1).max(1);
+        // Each row is the gutter, a space, then the text.
+        self.text_col = u16::try_from(gutter + 1).ok();
         // The held lines this frame shows, as (line index, row texts).
         let mut shown: Vec<(usize, Vec<String>)> = Vec::new();
         let mut used = 0;

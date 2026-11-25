@@ -2147,6 +2147,13 @@ impl TUIAppView for TuiProgressView {
         }
     }
 
+    fn selection_region(&self, at: ratatui::layout::Position) -> Option<ratatui::layout::Rect> {
+        if self.approval.is_some() || !self.dashboard_open {
+            return None;
+        }
+        self.target.as_ref()?.text_region(at)
+    }
+
     fn mouse(&mut self, input: crate::tui::app::MouseInput) {
         use crate::tui::app::MouseInput;
         use crate::tui::dashboard::approval::ApprovalClick;
