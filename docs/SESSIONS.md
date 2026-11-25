@@ -38,6 +38,7 @@ path or `https://` URL (see [Opening a recording: `<ref>`](#opening-a-recording-
 | `attach <ref>` | The interactive TUI on the session, following it until it ends; `q` or Ctrl-C detaches and never cancels it. Without a terminal it follows in line form. | the session's exit code; 0 on detach |
 | `inflight <id>` | The session's in-flight report (what the `SIGQUIT` dump carries), asked for through the session directory; waits 5s. Local sessions only. | 0 |
 | `export <ref>` | Writes the recording as one self-contained `.hephsession` file and prints its path (see [Export](#export-hephsession)). | 0 |
+| `query <sql>` | Read-only SQL over the [explorer](#the-explorer)'s six tables, from the catalog (this workspace's sessions of the last 7 days by default), every recording kept (`--full`), or the recordings named (`--from <ref>`). See [`query`](#query). | 0 |
 
 Every error of `heph session` itself exits **125**: no such session, an
 ambiguous id, a file that is not a heph session, a URL refused or not
@@ -53,9 +54,10 @@ session whose `End` carries no code (killed by a signal, or it panicked) is
 reported as an error with that reason. An agent tells "the run failed" from
 "the wait failed" by that line, or by `heph session show <id> --json`.
 
-Under `--json` (`list`, `show`, `inflight`), an error is what it is on every
-heph command (`docs/JSON_OUTPUT.md`): the message on stderr and the exit code,
-125 here, with nothing on stdout. No JSON error object is printed.
+Under `--json` (`list`, `show`, `inflight`, and `query --format json`), an
+error is what it is on every heph command (`docs/JSON_OUTPUT.md`): the
+message on stderr and the exit code, 125 here, with nothing on stdout. No
+JSON error object is printed.
 
 STATE is computed by the viewer, never stored: `running`; `waiting` (every
 open target is in a lock or admission wait); `quiet` (no event for longer
@@ -141,6 +143,77 @@ Before it lists, `list` opens the catalog, and that open repairs it: it
 writes the rows of any ended recording the catalog lacks, and rebuilds a
 missing or corrupt catalog. What it did goes to stderr, never stdout (see
 [The catalog](#the-catalog-catalogdb)).
+
+### `query`
+
+```
+heph session query [--from <ref>]... [--since 7d] [--until T] [--all-workspaces] [--full]
+                   [--format table|csv|json] [--limit N] [--timeout 30s] [--schema]
+                   ('SELECT ...' | - | -f FILE)
+```
+
+One SQL statement over the [explorer](#the-explorer)'s six tables. Every
+source presents the same names, so a query written against one recording
+runs unchanged on the catalog or on a directory of CI downloads.
+
+| Source | Flags | Reads |
+| --- | --- | --- |
+| the catalog | (default) `--since`, `--until`, `--all-workspaces` | this workspace's sessions started in the window (7 days by default; the catalog keeps 90). Opening it repairs it, as `list` does. Spans of the targets that ran, not of cache hits; no `logs`. |
+| every recording kept | `--full` | each recording that started in the window, in this workspace: cache hits included, at the cost of opening each file. A recording in a format this heph does not read, or that cannot be read, is skipped and counted. |
+| the recordings named | `--from <ref>`, repeatable | a session id (as `show` takes it), a `.hephsession` path, an `https://` URL. The window does not apply: `--since`, `--until`, `--all-workspaces` and `--full` are refused beside it. |
+
+The window holds whole sessions by their start: every row of a session
+started in it, none of one started before it.
+
+The SQL is the argument, `-` reads it from stdin, `-f FILE` from a file.
+`--schema` prints the six tables with a line per column and the schema
+version, and runs nothing.
+
+**Read-only by construction.** The statement is prepared first against
+empty copies of the six tables: more than one statement, any write
+(`INSERT`, `DELETE`, `CREATE`, `VACUUM`), `ATTACH`, a pragma other than
+`table_info`, `table_list` and `index_list`, `load_extension` and the
+file functions, and a read of anything but the six tables are refused
+before a source is opened. A single source is queried in place, read-only,
+through heph's own views, never a file's stored ones; several are copied
+into a temp database (under `~/.heph/sessions/.tmp/`, at most 2 GiB) of only
+the tables the statement reads, removed when the query ends or on Ctrl-C.
+A recording heph keeps gets its indexes on its first query; a file named by
+path or URL is never written.
+
+**Limits.** `--timeout` (30s) stops the query, copies included. More rows
+than `--limit` (100000; `0` for no cap) is an error, not a truncated
+answer, so a partial result is never read as a whole one. Strings and
+blobs are capped at 64 MiB.
+
+**Output.** `--format table` (the default) aligns the columns, one line per
+row, every control character escaped; NULL is an empty cell and a BLOB is
+base64. `--format csv` is a header line then RFC 4180 rows, `\n`-ended,
+with the same NULL and BLOB rendering; on a terminal its control
+characters are escaped, newlines and tabs kept. `--format json` is one
+line:
+
+```json
+{"version":1,"columns":["addr","duration_us"],"types":["TEXT","INTEGER"],
+ "rows":[["//p:t","81234"]],
+ "coverage":{"catalog":["targets"],"recordings":0,"skipped":0,"truncated":0}}
+```
+
+- `types` is each column's declared type, `null` for an expression.
+- In `rows`, an INTEGER is a string (a 64-bit value survives a JSON
+  parser), a REAL a number (NaN and infinities `null`), a BLOB base64, NULL
+  `null`.
+- `coverage` says where the rows came from: `catalog` the tables read from
+  the catalog, `recordings` how many recordings were read, `skipped` how
+  many were not (`--full`), `truncated` how many sessions read stopped
+  recording at their size ceiling, so their rows are incomplete. Skipped
+  and truncated sources are also named on stderr. `coverage` only gains
+  fields.
+
+**Errors** exit 125, as every `heph session` error does. A refused, invalid
+or stopped statement says so on stderr with SQLite's message (an unknown
+table or column lists the real ones); under `--format json` stdout stays
+empty.
 
 ### heph inside a target
 
@@ -390,8 +463,9 @@ FROM spans r JOIN sessions s USING (session_id)
 WHERE r.name = 'heph.result' AND r.addr = '//p:t';
 ```
 
-There is no query command yet; `sqlite3` on a sealed recording (or a copy of
-a live one) answers them.
+`heph session query` runs them over the catalog, every recording kept, or
+the recordings named (see [`query`](#query)); `sqlite3` on a sealed
+recording (or a copy of a live one) answers them too.
 
 ### Pools
 
