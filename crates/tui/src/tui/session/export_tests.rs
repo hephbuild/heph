@@ -16,13 +16,19 @@ fn no_read(_: &NoticeRoots, _: &[hcore::approval_notice::NoticeSource]) -> Optio
     None
 }
 
-fn seal_export(dir: &Path, bound: Duration, gate: Option<Gate>) -> SealExport {
+fn seal_export(dir: &Path, bound: Duration, hold: Option<Hold>) -> SealExport {
     SealExport {
         dir: dir.to_path_buf(),
         read: no_read,
         bound,
-        gate,
+        hold: hold.unwrap_or_default(),
     }
+}
+
+fn open_gate(gate: &Gate) {
+    let (open, opened) = &**gate;
+    *open.lock().expect("gate") = true;
+    opened.notify_all();
 }
 
 /// A session under `root` exporting to `out` at seal.
@@ -117,7 +123,14 @@ fn export_is_silent_and_bounded() {
         fast.finish(Some(0), false);
         let slow = exporting(
             &root,
-            seal_export(&out, Duration::from_millis(200), Some(gate.clone())),
+            seal_export(
+                &out,
+                Duration::from_millis(200),
+                Some(Hold {
+                    compressing: Some(gate.clone()),
+                    ..Hold::default()
+                }),
+            ),
         );
         slow.finish(Some(3), false);
         // Held past its bound, with its temp file already made beside the
@@ -152,6 +165,58 @@ fn export_is_silent_and_bounded() {
             panicked: false
         }
     );
+}
+
+/// I1 over a stalled filesystem: an export stuck renaming its file into
+/// place, under the lock its temp files are kept by, never holds up the
+/// exit. The abort returns promptly without that lock; once the write
+/// returns, the export finds itself stopped and removes what it made, the
+/// destination included, so nothing is left in the export directory.
+#[test]
+fn an_abort_never_waits_on_a_stalled_write() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = SessionRoot::new(tmp.path().join("sessions"));
+    let out = tmp.path().join("exports");
+    let gate: Gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let captured = Captured::default();
+    let dispatch = tracing::Dispatch::new(
+        tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .finish(),
+    );
+    let session = tracing::dispatcher::with_default(&dispatch, || {
+        exporting(
+            &root,
+            seal_export(
+                &out,
+                Duration::from_millis(200),
+                Some(Hold {
+                    persisting: Some(gate.clone()),
+                    ..Hold::default()
+                }),
+            ),
+        )
+    });
+    // `finish` on a thread of its own: a hang is a failed test, not a hung one.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let finishing = dispatch.clone();
+    std::thread::spawn(move || {
+        let _dispatch = tracing::dispatcher::set_default(&finishing);
+        session.finish(Some(0), false);
+        tx.send(()).expect("the test waits for finish");
+    });
+    drop(dispatch);
+    // The bound (200 ms) plus the abort's brief wait for its cleanup.
+    let returned = rx.recv_timeout(Duration::from_secs(5));
+    // Let the stalled write return either way, so nothing is left hanging.
+    open_gate(&gate);
+    returned.expect("finish did not return while the export was stuck in its write");
+    let log = captured.settled_log();
+    assert_eq!(entries(&out), Vec::<String>::new(), "{log}");
+    assert!(entries(&store::tmp_dir(root.path())).is_empty());
+    assert_eq!(log.matches("WARN").count(), 1, "{log}");
+    assert!(log.contains("did not finish in time"), "{log}");
 }
 
 /// `f` under a fresh subscriber, and what it logged once settled.

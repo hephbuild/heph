@@ -989,9 +989,15 @@ heph session attach sessions/<id>.hephsession
   `.hephsession` opens as it is. One holding several is refused with the
   entries it holds: `unzip` it and open one by path.
 - The export runs after the recording's write connection closes, with its
-  own 30s bound outside the recorder's 3s join. Past it the temp file is
-  removed and one `warn!` says so. It prints nothing on success, and a
-  failure is one `warn!` that never changes the exit code.
+  own 30s bound outside the recorder's 3s join. Past it heph stops the
+  export, removes its temp files, and one `warn!` says so; heph waits at
+  most a second more for that, never for the export itself, so a stalled
+  filesystem does not hold up the exit. A write that was stuck there
+  removes what it made (the export file included) once it returns: once
+  the export stops itself it writes nothing more. If heph exits before
+  then, what that write made stays: a hidden temp file, or a whole
+  `<id>.hephsession`, never a partial one. It prints nothing on success,
+  and a failure is one `warn!` that never changes the exit code.
 - It includes the notices and root failure logs, as `export` does without
   `--no-logs`. A private session (`HEPH_NO_SESSION=1`) and `--raw` export
   nothing.

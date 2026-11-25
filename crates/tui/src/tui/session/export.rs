@@ -16,7 +16,7 @@ use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::io::{self, Read as _, Seek as _, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -53,60 +53,102 @@ pub fn file_name(id: SessionId) -> String {
 /// uses. The export checks it between steps and while compressing; an
 /// abort also interrupts a running SQLite statement and removes every temp
 /// file the export holds.
+///
+/// [`Abort::abort`] never waits on the export (I1: recording never holds up
+/// the exit). A step that makes a file (a temp, or the rename into place)
+/// may be stuck on a stalled filesystem when the abort comes; it finds
+/// itself stopped once it returns and removes what it made, the destination
+/// included. So the guarantee is that **once the export stops itself, it
+/// writes nothing more**, not that nothing appears after `abort` returns:
+/// a step that was stuck can still land a file, which it then removes, and
+/// if the process exits first that file stays (a hidden temp, or a whole
+/// export, never a partial one).
 #[derive(Debug, Clone, Default)]
 pub struct Abort(Arc<AbortInner>);
 
+/// [`AbortInner::state`]: the export runs.
+const RUNNING: u8 = 0;
+/// [`AbortInner::state`]: stopped by [`Abort::abort`]; it writes nothing more.
+const ABORTED: u8 = 1;
+/// [`AbortInner::state`]: the destination is written; an abort stops nothing.
+const WRITTEN: u8 = 2;
+
+/// How long [`Abort::abort`] waits for its cleanup to remove the temp
+/// files: briefly, since a stalled filesystem must not hold up the exit.
+pub(crate) const CLEANUP_WAIT: Duration = Duration::from_secs(1);
+
 #[derive(Default)]
 struct AbortInner {
-    /// Set by [`Abort::abort`] under `temps`' lock.
-    aborted: AtomicBool,
+    /// [`RUNNING`], then [`ABORTED`] or [`WRITTEN`] for good: the one
+    /// compare-and-swap that decides whether an abort stopped the export or
+    /// came after it wrote its destination.
+    state: AtomicU8,
     /// The statement to interrupt: the connection the export runs on now.
     sqlite: Mutex<Option<rusqlite::InterruptHandle>>,
-    /// Every temp file the export made and still holds. A temp is made, and
-    /// the destination written, under this lock after checking `aborted`,
-    /// so once [`Abort::abort`] returns nothing more appears.
-    temps: Mutex<Temps>,
-    /// A test's slow export: held before compressing until it opens.
-    gate: Option<super::recorder::Gate>,
+    /// Every temp file the export made and still holds. The export makes a
+    /// temp, or writes the destination, holding this lock, and checks
+    /// `state` before and after; the abort's cleanup takes it on a thread of
+    /// its own, so the abort never waits on it.
+    temps: Mutex<Vec<PathBuf>>,
+    /// A test's slow export.
+    hold: Hold,
 }
 
-#[derive(Debug, Default)]
-struct Temps {
-    files: Vec<PathBuf>,
-    /// The destination is written: an abort now stops nothing.
-    written: bool,
+/// Where a test's slow export holds until a gate opens. Always the default
+/// (no gate) outside tests.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Hold {
+    /// Before compressing, holding nothing.
+    pub(crate) compressing: Option<super::recorder::Gate>,
+    /// Under the temp files' lock, about to rename the export into place: a
+    /// write stalled on its filesystem.
+    pub(crate) persisting: Option<super::recorder::Gate>,
 }
 
 impl std::fmt::Debug for AbortInner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AbortInner")
-            .field("aborted", &self.aborted)
+            .field("state", &self.state)
             .finish_non_exhaustive()
     }
 }
 
+/// Remove every file in `files`, emptying it; one already gone is fine.
+fn remove_all(files: &mut Vec<PathBuf>) {
+    for file in files.drain(..) {
+        if let Err(e) = std::fs::remove_file(&file)
+            && e.kind() != io::ErrorKind::NotFound
+        {
+            tracing::debug!(file = %file.display(), error = %e, "cannot remove an export's temp file");
+        }
+    }
+}
+
 impl Abort {
-    /// An abort whose export holds before compressing until `gate` opens
-    /// (a test's slow export); `None` is [`Abort::default`].
-    pub(crate) fn with_gate(gate: Option<super::recorder::Gate>) -> Self {
+    /// An abort whose export holds where `hold` says until its gate opens (a
+    /// test's slow export); the default is [`Abort::default`].
+    pub(crate) fn with_hold(hold: Hold) -> Self {
         Self(Arc::new(AbortInner {
-            gate,
+            hold,
             ..AbortInner::default()
         }))
     }
 
-    /// Stop the export: interrupt its statement, remove every temp file it
-    /// holds. `false` when it had already written its destination (it
-    /// finished at the bound): nothing was stopped.
+    /// Stop the export: mark it stopped, interrupt its statement, and remove
+    /// every temp file it holds on a thread of its own, waited for at most
+    /// [`CLEANUP_WAIT`]. Never waits on the export itself (see [`Abort`]).
+    /// `false` when it had already written its destination (it finished at
+    /// the bound): nothing was stopped.
     pub fn abort(&self) -> bool {
-        let files = {
-            let mut temps = self.temps();
-            if temps.written {
-                return false;
-            }
-            self.0.aborted.store(true, Ordering::Release);
-            std::mem::take(&mut temps.files)
-        };
+        if self
+            .0
+            .state
+            .compare_exchange(RUNNING, ABORTED, Ordering::AcqRel, Ordering::Acquire)
+            == Err(WRITTEN)
+        {
+            return false;
+        }
+        // Held only to set or read the handle, never across a statement.
         if let Some(h) = self
             .0
             .sqlite
@@ -116,43 +158,90 @@ impl Abort {
         {
             h.interrupt();
         }
-        // Removed after the lock: the export, if it is waiting on it, finds
-        // itself aborted and makes nothing new.
-        for temp in files {
-            if let Err(e) = std::fs::remove_file(&temp)
-                && e.kind() != io::ErrorKind::NotFound
-            {
-                tracing::debug!(file = %temp.display(), error = %e, "cannot remove an export's temp file");
+        // The export may hold `temps` across a write stuck on its filesystem:
+        // the cleanup waits for it, the exit does not. Whatever that write
+        // makes, the export removes itself once it returns (`guarded`).
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let inner = Arc::clone(&self.0);
+        let spawned = std::thread::Builder::new()
+            .name("heph-session-export-abort".to_owned())
+            .spawn(move || {
+                remove_all(&mut inner.temps.lock().unwrap_or_else(PoisonError::into_inner));
+                if tx.try_send(()).is_err() {
+                    tracing::trace!("an export's cleanup finished past the abort's wait");
+                }
+            });
+        match spawned {
+            Ok(_) => {
+                if rx.recv_timeout(CLEANUP_WAIT).is_err() {
+                    tracing::debug!(
+                        "an export's temp files are still held by a stalled write: it removes them when the write returns"
+                    );
+                }
+            }
+            // No thread: remove what the export does not hold right now.
+            Err(e) => {
+                tracing::debug!(error = %e, "cannot start the export's cleanup");
+                match self.0.temps.try_lock() {
+                    Ok(mut files) => remove_all(&mut files),
+                    Err(std::sync::TryLockError::Poisoned(p)) => remove_all(&mut p.into_inner()),
+                    Err(std::sync::TryLockError::WouldBlock) => {}
+                }
             }
         }
         true
     }
 
-    fn temps(&self) -> std::sync::MutexGuard<'_, Temps> {
+    fn temps(&self) -> std::sync::MutexGuard<'_, Vec<PathBuf>> {
         self.0.temps.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn check(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
-            !self.0.aborted.load(Ordering::Acquire),
+            self.0.state.load(Ordering::Acquire) != ABORTED,
             "the export was stopped at its time bound"
         );
         Ok(())
     }
 
     /// Run `make` (which makes temp files, or writes the destination) unless
-    /// the export is aborted, holding the lock [`Abort::abort`] takes: what
-    /// `make` adds to the list is removed by an abort, and an abort that
-    /// comes after it waits for it.
-    fn guarded<T>(&self, make: impl FnOnce(&mut Temps) -> anyhow::Result<T>) -> anyhow::Result<T> {
+    /// the export is aborted, holding the temp files' lock. An abort does not
+    /// wait for that lock, so one that came while `make` ran is seen only
+    /// after it: then every file in the list, what `make` added included,
+    /// is removed here, and the export stops.
+    fn guarded<T>(
+        &self,
+        make: impl FnOnce(&mut Vec<PathBuf>) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
         let mut temps = self.temps();
         self.check()?;
-        make(&mut temps)
+        let made = make(&mut temps);
+        if let Err(stopped) = self.check() {
+            remove_all(&mut temps);
+            // A temp file `make` returned removes itself as it drops.
+            drop(made);
+            return Err(stopped);
+        }
+        made
+    }
+
+    /// The destination `dest` is written: from now on an abort stops nothing.
+    /// An abort that came first wins: `dest` joins the files to remove, and
+    /// the caller's [`Abort::guarded`] removes it.
+    fn written(&self, temps: &mut Vec<PathBuf>, dest: &Path) {
+        if self
+            .0
+            .state
+            .compare_exchange(RUNNING, WRITTEN, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            temps.push(dest.to_path_buf());
+        }
     }
 
     /// Stop tracking `files`: removed (or renamed into place) by their owner.
     fn release(&self, files: &[PathBuf]) {
-        self.temps().files.retain(|f| !files.contains(f));
+        self.temps().retain(|f| !files.contains(f));
     }
 
     /// Interrupt `conn` on an abort from now on.
@@ -195,7 +284,7 @@ pub fn snapshot(
             .tempfile_in(tmp_dir)
             .with_context(|| format!("creating a temp file in {}", tmp_dir.display()))?
             .into_temp_path();
-        temps.files.extend(with_journals(&temp));
+        temps.extend(with_journals(&temp));
         Ok(temp)
     })?;
     let target = temp
@@ -449,7 +538,7 @@ fn tail(path: &Path, max: u64) -> io::Result<(Vec<u8>, u64)> {
 pub fn compress(db: &Path, out: impl Write, abort: &Abort) -> anyhow::Result<()> {
     let mut src = std::fs::File::open(db).with_context(|| format!("opening {}", db.display()))?;
     let mut enc = zstd::stream::Encoder::new(out, LEVEL).context("starting the compression")?;
-    if let Some(gate) = &abort.0.gate {
+    if let Some(gate) = &abort.0.hold.compressing {
         super::recorder::wait_for(gate);
     }
     let mut buf = vec![0_u8; 1 << 20];
@@ -488,7 +577,7 @@ pub fn write_file(db: &Path, dest: &Path, noclobber: bool, abort: &Abort) -> any
             .suffix(".tmp")
             .tempfile_in(parent)
             .with_context(|| format!("creating a temp file in {}", parent.display()))?;
-        temps.files.push(temp.path().to_path_buf());
+        temps.push(temp.path().to_path_buf());
         Ok(temp)
     })?;
     let path = temp.path().to_path_buf();
@@ -499,19 +588,23 @@ pub fn write_file(db: &Path, dest: &Path, noclobber: bool, abort: &Abort) -> any
         abort.release(&[path]);
         return Err(e);
     }
-    // Renamed into place under the abort's lock: an abort either comes
-    // first (nothing is written) or finds the destination written.
+    // Renamed into place under the temp files' lock: an abort either comes
+    // first (nothing is written), finds the destination written, or came
+    // while the rename ran, and the destination is removed again.
     abort.guarded(|temps| {
+        if let Some(gate) = &abort.0.hold.persisting {
+            super::recorder::wait_for(gate);
+        }
         let persisted = if noclobber {
             temp.persist_noclobber(dest)
         } else {
             temp.persist(dest)
         };
-        temps.files.retain(|f| *f != path);
+        temps.retain(|f| *f != path);
         persisted
             .map_err(|e| e.error)
             .with_context(|| format!("writing {}", dest.display()))?;
-        temps.written = true;
+        abort.written(temps, dest);
         Ok(())
     })
 }
@@ -537,7 +630,7 @@ pub fn to_dir(
         Recording::Foreign(_) => Vec::new(),
     };
     abort.guarded(|temps| {
-        temps.files.extend(copies.iter().cloned());
+        temps.extend(copies.iter().cloned());
         Ok(())
     })?;
     let db = snapshot(&rec, Some(read), &store::tmp_dir(root), abort)?;

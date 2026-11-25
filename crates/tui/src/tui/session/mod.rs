@@ -203,18 +203,20 @@ pub struct SealExport {
     pub read: hcore::approval_notice::ReadNotice,
     /// [`export::EXPORT_DIR_BOUND`] outside a test.
     pub bound: std::time::Duration,
-    /// A test's slow export: it holds before compressing until this opens.
-    /// Always `None` outside tests.
-    pub(crate) gate: Option<recorder::Gate>,
+    /// A test's slow export: where it holds until a gate opens. Always the
+    /// default (no gate) outside tests.
+    pub(crate) hold: export::Hold,
 }
 
 impl SealExport {
     /// Export the ended session `id` in `dir` under the sessions `root`, on
     /// a thread this waits at most `bound` for. Silent on success; one
     /// `warn!` otherwise, and the exit code is never touched. Past the bound
-    /// the export is stopped and its temp file removed.
+    /// the export is stopped without waiting on it ([`export::Abort`]): its
+    /// temp files are removed, by the export itself when a write of its was
+    /// stuck, and once it stops itself it writes nothing more.
     fn run(&self, root: &Path, dir: &Path, id: SessionId) {
-        let abort = export::Abort::with_gate(self.gate.clone());
+        let abort = export::Abort::with_hold(self.hold.clone());
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
         let (root, dir, export_dir, read, thread_abort) = (
@@ -579,7 +581,7 @@ impl SessionSlot {
                 dir,
                 read,
                 bound: export::EXPORT_DIR_BOUND,
-                gate: None,
+                hold: export::Hold::default(),
             }),
             Err(why) => ExportSetup::Refused(why),
         };
