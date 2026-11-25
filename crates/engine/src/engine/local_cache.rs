@@ -609,13 +609,20 @@ pub(crate) fn support_files_needed_for(has_output_artifact: bool, outputs: &[Str
 /// Whether one manifest artifact is a blob a caller asking for `outputs` will
 /// actually read — the single predicate behind [`Engine::needed_artifacts`] and
 /// the per-artifact gate in [`Engine::artifacts_from_manifest`], so residency is
-/// never decided against a different set than the one that gets read.
+/// never decided against a different set than the one that gets read — and
+/// behind the remote hit decision's presence check, which asks it of a remote
+/// manifest's entries, so the remote is checked for exactly what will be read.
 ///
 /// `support_needed` comes from [`support_files_needed`]; it is passed in rather
 /// than recomputed so a per-artifact loop stays linear.
-fn artifact_is_needed(a: &ManifestArtifact, outputs: &[String], support_needed: bool) -> bool {
-    match a.r#type {
-        ManifestArtifactType::Output => outputs.contains(&a.group),
+pub(crate) fn artifact_is_needed(
+    r#type: &ManifestArtifactType,
+    group: &str,
+    outputs: &[String],
+    support_needed: bool,
+) -> bool {
+    match r#type {
+        ManifestArtifactType::Output => outputs.iter().any(|o| o == group),
         ManifestArtifactType::SupportFile => support_needed,
         ManifestArtifactType::Log => false,
     }
@@ -1387,7 +1394,7 @@ impl Engine {
         manifest
             .artifacts
             .iter()
-            .filter(move |a| artifact_is_needed(a, outputs, support_needed))
+            .filter(move |a| artifact_is_needed(&a.r#type, &a.group, outputs, support_needed))
     }
 
     /// The entries of the blobs a caller asking for `outputs` needs that are not in the
@@ -1534,7 +1541,7 @@ impl Engine {
             // Past the meta, only what this caller actually reads is probed and
             // handed back — Outputs gated on the requested groups, SupportFiles
             // gated on there being a requested group at all.
-            if !artifact_is_needed(artifact, outputs, support_needed) {
+            if !artifact_is_needed(&artifact.r#type, &artifact.group, outputs, support_needed) {
                 continue;
             }
 
@@ -3480,9 +3487,13 @@ mod tests {
         assert!(
             other
                 .remote_caches
-                .fetch_manifest(&ctoken, &addr, "HOSTLOCAL")
+                .locate(
+                    &ctoken,
+                    &addr,
+                    "HOSTLOCAL",
+                    crate::engine::remote_cache::Need::Manifest,
+                )
                 .await
-                .expect("fetch")
                 .is_none(),
             "the remote holds no manifest for a host-local entry"
         );

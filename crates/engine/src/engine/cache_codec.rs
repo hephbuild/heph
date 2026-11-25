@@ -433,15 +433,55 @@ pub(crate) struct SeekableDecoder {
 /// seek and, for zstd, two small reads at the end of a file just written:
 /// nothing on the hit path's critical bytes.
 ///
-/// `Err` says why the blob cannot be served: the tier that sent it is
-/// rejected for this blob (a restore that died part-way, a corrupt object),
-/// never the target.
+/// [`PulledLength::Mismatch`] says why the blob cannot be served: the tier
+/// that sent it is passed over for this blob (a restore that died part-way, a
+/// corrupt object), never the target. `Err` is a local failure to read the
+/// temp file the bytes were streamed into — an I/O error, not the tier's
+/// answer — and fails the pull like any other local I/O.
+///
+/// Two exemptions, both accepted by D10/I2 of the CI cache snapshots spec:
+///
+/// - **E-len: the check is on length, not content.** A raw blob of the full
+///   length whose tail is wrong passes; nothing hashes the bytes on the way
+///   in. A zstd blob fares better only by accident of format: its frames fail
+///   their own checks when decoded.
+/// - **E-hashout: a tier's `hashout` is trusted as the blob's identity.** The
+///   fall-through matches an entry by its `hashout` (and name, type, group,
+///   size, encoding), never by hashing the bytes, so a tier that names a
+///   blob's `hashout` but stores other bytes of the same length is believed.
 pub(crate) fn check_pulled_length<R: Read + Seek + ?Sized>(
     stored: &mut R,
     encoding: &ManifestArtifactEncoding,
     size: u64,
-) -> anyhow::Result<()> {
-    let decoded = match encoding {
+) -> anyhow::Result<PulledLength> {
+    match decoded_length(stored, encoding) {
+        Ok(decoded) if decoded == size => Ok(PulledLength::Matches),
+        Ok(decoded) => Ok(PulledLength::Mismatch(anyhow::anyhow!(
+            "blob decodes to {decoded} bytes, but its manifest records {size}"
+        ))),
+        // Every format check below is an `ensure!`/`bail!`; only the seeks and
+        // reads of the local temp file raise an `io::Error`.
+        Err(e) if e.chain().any(|c| c.is::<std::io::Error>()) => Err(e),
+        Err(e) => Ok(PulledLength::Mismatch(e)),
+    }
+}
+
+/// What [`check_pulled_length`] found of a pulled blob.
+#[derive(Debug)]
+pub(crate) enum PulledLength {
+    /// It decodes to the size the manifest records.
+    Matches,
+    /// It does not, or its format does not hold together: why.
+    Mismatch(anyhow::Error),
+}
+
+/// The decoded length of `stored`, per `encoding`; `Err` on a blob whose format
+/// does not hold together, or on a failed read of it.
+fn decoded_length<R: Read + Seek + ?Sized>(
+    stored: &mut R,
+    encoding: &ManifestArtifactEncoding,
+) -> anyhow::Result<u64> {
+    Ok(match encoding {
         ManifestArtifactEncoding::None => stored.seek(SeekFrom::End(0)).context("size raw blob")?,
         ManifestArtifactEncoding::Zstd => read_seek_table(stored)?
             .1
@@ -449,12 +489,7 @@ pub(crate) fn check_pulled_length<R: Read + Seek + ?Sized>(
             .copied()
             .unwrap_or_default(),
         ManifestArtifactEncoding::Gzip => anyhow::bail!("gzip cache blobs are not supported"),
-    };
-    anyhow::ensure!(
-        decoded == size,
-        "blob decodes to {decoded} bytes, but its manifest records {size}"
-    );
-    Ok(())
+    })
 }
 
 /// Read and validate the seek table at the end of `src`: the frames' start
@@ -910,43 +945,80 @@ pub(crate) mod tests {
 
     /// A pulled blob is checked against its manifest's decoded `size`: a raw
     /// blob by its length, a zstd blob by its seek table. The whole blob
-    /// passes; one cut anywhere, or a manifest naming another size, does not.
+    /// passes; one cut or padded anywhere, or a manifest naming another size,
+    /// does not — and none of those is an `Err`, which is kept for a failed
+    /// local read.
     #[test]
     fn a_pulled_blob_is_checked_against_its_manifest_size() {
-        let check = |stored: &[u8], encoding: &ManifestArtifactEncoding, size: u64| {
-            check_pulled_length(&mut io::Cursor::new(stored), encoding, size)
+        let matches = |stored: &[u8], encoding: &ManifestArtifactEncoding, size: u64| {
+            matches!(
+                check_pulled_length(&mut io::Cursor::new(stored), encoding, size)
+                    .expect("an in-memory blob reads"),
+                PulledLength::Matches
+            )
         };
 
         let data = sample(2 * F + 99, 13);
         let size = data.len() as u64;
         let raw = ManifestArtifactEncoding::None;
-        assert!(check(&data, &raw, size).is_ok(), "whole raw blob");
-        assert!(
-            check(&data[..data.len() - 1], &raw, size).is_err(),
-            "raw, cut 1"
-        );
-        assert!(
-            check(&data[..F], &raw, size).is_err(),
-            "raw, cut to one frame"
-        );
-        assert!(check(&data, &raw, size + 1).is_err(), "raw, another size");
+        assert!(matches(&data, &raw, size), "whole raw blob");
+        assert!(!matches(&data[..data.len() - 1], &raw, size), "raw, cut 1");
+        assert!(!matches(&data[..F], &raw, size), "raw, cut to one frame");
+        assert!(!matches(&data, &raw, size + 1), "raw, another size");
+        let mut long = data.clone();
+        long.push(0);
+        assert!(!matches(&long, &raw, size), "raw, one byte longer");
 
         let zstd = ManifestArtifactEncoding::Zstd;
         let stored = encode(&data);
-        assert!(check(&stored, &zstd, size).is_ok(), "whole zstd blob");
-        assert!(
-            check(&stored, &zstd, size - 1).is_err(),
-            "zstd, another size"
-        );
+        assert!(matches(&stored, &zstd, size), "whole zstd blob");
+        assert!(!matches(&stored, &zstd, size - 1), "zstd, another size");
         let table = SKIPPABLE_HEADER_SIZE + 3 * ENTRY_SIZE + FOOTER_SIZE;
         for cut in [1, table, table + 1, stored.len() / 2] {
             let short = stored.get(..stored.len() - cut).expect("cut");
-            assert!(check(short, &zstd, size).is_err(), "zstd, cut {cut}");
+            assert!(!matches(short, &zstd, size), "zstd, cut {cut}");
         }
+        // Padded: zeros after the table, and a second copy of the table, whose
+        // footer is valid but whose frames no longer cover what precedes it.
+        let tail = stored.get(stored.len() - table..).expect("table").to_vec();
+        for (what, pad) in [
+            ("1 byte", vec![0u8; 1]),
+            ("a footer's length", vec![0u8; FOOTER_SIZE]),
+            ("the table again", tail),
+        ] {
+            let mut padded = stored.clone();
+            padded.extend_from_slice(&pad);
+            assert!(!matches(&padded, &zstd, size), "zstd, padded by {what}");
+        }
+        assert!(!matches(&[], &zstd, 0), "an empty zstd blob has no table");
         assert!(
-            check(&[], &zstd, 0).is_err(),
-            "an empty zstd blob has no table"
+            !matches(&data, &ManifestArtifactEncoding::Gzip, size),
+            "gzip is never served"
         );
+    }
+
+    /// A read of the local temp file that fails is the puller's I/O error,
+    /// not the tier's answer: `Err`, so the pull fails instead of passing
+    /// the tier over as if it had sent damaged bytes.
+    #[test]
+    fn a_failed_read_of_a_pulled_blob_is_an_error_not_a_mismatch() {
+        struct Broken;
+        impl Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("disk gone"))
+            }
+        }
+        impl Seek for Broken {
+            fn seek(&mut self, _: SeekFrom) -> io::Result<u64> {
+                Err(io::Error::other("disk gone"))
+            }
+        }
+        for encoding in [ManifestArtifactEncoding::None, ManifestArtifactEncoding::Zstd] {
+            assert!(
+                check_pulled_length(&mut Broken, &encoding, 1).is_err(),
+                "{encoding:?}: a failed read is an error"
+            );
+        }
     }
 
     /// The case the seekable format exists for: a compressed artifact on the

@@ -3969,10 +3969,8 @@ impl Engine {
                 &def.target.addr,
                 hashin,
                 crate::engine::remote_cache::Need::Manifest,
-                None,
             )
             .await
-            .with_context(|| format!("locating remote revision for {} {hashin}", def.target.addr))?
             .map(Arc::new))
     }
 
@@ -4450,7 +4448,7 @@ impl Engine {
                         let span_addr = addr_s.clone();
                         // Every blob a caller of this addr could read must still be on
                         // the remote for the hit to stand — checked by presence, not by
-                        // transfer (see `RemoteCacheSet::blobs_exist`).
+                        // transfer (see `RemoteCacheSet::locate`'s `Need::Groups`).
                         let needed: Vec<String> = def.target.output_names();
                         // A backend read error is not an error here: the remote
                         // set reports it as absence (breaker), so the target is a
@@ -6091,7 +6089,7 @@ impl Engine {
     ///   just those blobs.
     /// - **missing, and the remote answers "absent"** (no readable remote, remote
     ///   opted out for this target, the revision is gone, or a transport error
-    ///   that `fetch_manifest`/`fetch_blob` reports as absence) → the read returns
+    ///   that `locate`/`fetch_blob` reports as absence) → the read returns
     ///   "unavailable" and the target is rebuilt, fail-soft, exactly as a plain
     ///   miss would have been — with the freshly-produced `hashout`s reconciled
     ///   against this manifest's, so a dependent that already folded the cached
@@ -12339,7 +12337,7 @@ mod tests {
     }
 
     /// A remote whose manifest lookup errors does not fail the resolution:
-    /// `fetch_manifest` records the error against the cache's breaker and
+    /// `locate` records the error against the cache's breaker and
     /// answers "absent", so the target is an ordinary miss — one `Miss`
     /// outcome, never a hit and never two outcomes.
     #[tokio::test]
