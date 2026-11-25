@@ -1299,6 +1299,34 @@ fn machine_rows_are_non_critical() {
         label: "after the readings".into(),
     };
     tap.view(1, label.clone());
+    // A target that waited a second for admission while the readings were
+    // dropped: its result is critical, so its wait lands.
+    let now_ms = hcore::events::now_unix_ms();
+    let now_us = now_ms * 1_000;
+    tap.event(BuildEvent {
+        at_unix_ms: now_ms,
+        kind: BuildEventKind::ResultStart {
+            addr: "//a:waited".into(),
+        },
+    });
+    tap.event(BuildEvent {
+        at_unix_ms: now_ms,
+        kind: BuildEventKind::ResultEnd {
+            spans: vec![hcore::events::PhaseSpan {
+                name: "heph.admission".into(),
+                start_unix_us: now_us - 1_000_000,
+                end_unix_us: now_us,
+            }],
+            left_behind: None,
+            cancelled: false,
+            addr: "//a:waited".into(),
+            error: None,
+            upstream_of: None,
+            exit_status: None,
+            log_tail: None,
+            timed_out: None,
+        },
+    });
     rec.recorder.finish(Some(0), false, Duration::from_secs(10));
 
     let (records, _) = read_records(rec.dir());
@@ -1328,6 +1356,17 @@ fn machine_rows_are_non_critical() {
         "SELECT count(*) FROM metrics WHERE name LIKE 'heph.machine.%' OR name LIKE 'heph.process.%'",
     );
     assert_eq!(machine_rows, 0);
+
+    // The split reads the dropped readings as unknown, never as spare.
+    // `self::`: `open` is the gate's flag here.
+    let waiting =
+        super::machine::read_waiting(&self::open(rec.dir()).conn).expect("the waiting split");
+    let admission = waiting.get("admission").expect("the admission wait landed");
+    assert_eq!(
+        (admission.busy_us, admission.spare_us, admission.unknown_us),
+        (0, 0, 1_000_000),
+        "{waiting:?}"
+    );
 }
 
 /// Decision (a): a sampler that fails to start is recorded as one failed
