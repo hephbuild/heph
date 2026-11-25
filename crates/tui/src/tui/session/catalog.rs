@@ -47,6 +47,10 @@ pub const FORMAT: u32 = 1;
 pub const BUSY_TIMEOUT: Duration = Duration::from_millis(500);
 /// The bound on one whole owner write.
 pub const WRITE_BOUND: Duration = Duration::from_secs(1);
+/// `journal_size_limit`: what a WAL another checkpoint folded in whole is
+/// cut back to by the next write, while some connection (a long `query`)
+/// keeps the catalog open. Between runs, [`fold_wal`] truncates it instead.
+pub const WAL_KEEP: i64 = 4 << 20;
 /// How long a catalog row is kept.
 pub const KEEP: Duration = Duration::from_secs(90 * DAY_S);
 /// How long a moved-aside corrupt catalog is kept.
@@ -379,6 +383,7 @@ fn open_rw(root: &Path, create: bool) -> rusqlite::Result<Connection> {
     }
     let conn = Connection::open_with_flags(&path, flags)?;
     conn.busy_timeout(BUSY_TIMEOUT)?;
+    conn.pragma_update(None, "journal_size_limit", WAL_KEEP)?;
     Ok(conn)
 }
 
@@ -652,7 +657,14 @@ fn try_owner_write(
 /// Fold the catalog's WAL in at a session's start (a private one's too,
 /// [`fold`]), so the WAL the owners leave unchecked ([`bound_owner`]) stays
 /// about one session's writes long.
-/// A passive checkpoint waits on no reader or writer; past `deadline`, it is
+///
+/// A `TRUNCATE` checkpoint, not a passive one: no connection keeps the
+/// catalog open between runs, so the next one to open it rebuilds the WAL
+/// index from the file and counts every frame as not yet folded in. A WAL
+/// only folded in is then never restarted, grows by every write, and each
+/// fold copies all of it again; truncated, it starts empty. Its waits on a
+/// writer or a reader go through the owner's busy handler, which gives up at
+/// `deadline`, having folded in what it could; past `deadline`, the copy is
 /// interrupted. Only the start thread runs it, off the build path: the
 /// seal's exit path never checkpoints.
 fn fold_wal(conn: &Connection, deadline: Instant) -> rusqlite::Result<()> {
@@ -675,7 +687,7 @@ fn fold_wal(conn: &Connection, deadline: Instant) -> rusqlite::Result<()> {
             tracing::debug!(error = %e, "cannot bound the catalog's WAL fold: skipped");
             return Ok(());
         }
-        let folded = conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()));
+        let folded = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
         drop(done);
         folded
     })

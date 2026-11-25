@@ -915,6 +915,49 @@ fn the_wal_folds_in_at_the_next_sessions_start() {
     );
 }
 
+/// Bytes of the catalog's `-wal`.
+fn wal_len(root: &Path) -> u64 {
+    std::fs::metadata(root.join("catalog.db-wal")).map_or(0, |m| m.len())
+}
+
+/// A WAL one large write grew is cut back once it is folded in, so one big
+/// session does not leave a WAL its size behind for good. A passive fold
+/// did not: each run's new connection counts every frame as unfolded, so
+/// the WAL was never restarted, and only grew.
+#[test]
+fn a_folded_wal_is_cut_back_to_its_limit() {
+    const LIMIT: u64 = catalog::WAL_KEEP.unsigned_abs();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    let first = sealed(root, recent_id(1, 3_000));
+    catalog::record_seal(root, &first, true);
+    {
+        // Left in the WAL, as an owner's write is.
+        let conn = Connection::open(root.join(catalog::FILE)).expect("open");
+        conn.pragma_update(None, "wal_autocheckpoint", 0)
+            .expect("no autocheckpoint");
+        conn.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            true,
+        )
+        .expect("no checkpoint on close");
+        conn.execute_batch(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 16000)
+             INSERT INTO metrics SELECT 'big', 'm', 'gauge', '1', i, i, randomblob(1000) FROM n;",
+        )
+        .expect("a large write");
+    }
+    assert!(wal_len(root) > 3 * LIMIT, "{} bytes", wal_len(root));
+    // The next start folds it in; the one after restarts the WAL.
+    catalog::record_start(root, &sealed(root, recent_id(2, 2_000)));
+    catalog::record_start(root, &sealed(root, recent_id(3, 1_000)));
+    assert!(
+        wal_len(root) <= LIMIT,
+        "the WAL kept {} bytes after a fold",
+        wal_len(root)
+    );
+}
+
 /// `a_build_never_repairs` (I1): a run with a missing catalog and a
 /// recording of an older derivation writes only its own rows and
 /// re-derives nothing.
