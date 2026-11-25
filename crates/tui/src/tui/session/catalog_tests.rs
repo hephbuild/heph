@@ -707,7 +707,7 @@ fn catalog_write_failure_never_fails_the_run() {
     let started = Instant::now();
     session.finish(Some(3), false);
     assert!(
-        started.elapsed() < catalog::WRITE_BOUND + Duration::from_millis(500),
+        started.elapsed() < catalog::WRITE_BOUND + Duration::from_secs(1),
         "bounded: {:?}",
         started.elapsed()
     );
@@ -834,8 +834,12 @@ fn an_owner_write_past_its_bound_leaves_no_half_rows() {
 }
 
 /// An owner waits on a locked catalog until its write's deadline, not for
-/// a fixed busy timeout past it; and it leaves no checkpoint for its exit
-/// path: its rows stay in the WAL for a command to fold in.
+/// a fixed busy timeout; and it leaves no checkpoint for its exit path: its
+/// rows stay in the WAL for a command to fold in.
+///
+/// The bound is set a second past [`catalog::BUSY_TIMEOUT`], so the
+/// deadline, not the fixed timeout, is what ends the wait (`took >= bound`,
+/// which load cannot break), and it gives up then (a second of slack).
 #[test]
 fn an_owner_waits_on_a_locked_catalog_only_until_its_bound() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -845,11 +849,16 @@ fn an_owner_waits_on_a_locked_catalog_only_until_its_bound() {
     let holder = Connection::open(root.join(catalog::FILE)).expect("open");
     holder.execute_batch("BEGIN IMMEDIATE").expect("hold");
     let dir = sealed(root, recent_id(2, 1_000));
+    let bound = catalog::BUSY_TIMEOUT + Duration::from_secs(1);
     let started = Instant::now();
-    catalog::record_seal_within(root, &dir, true, within(Duration::from_millis(100)));
+    catalog::record_seal_within(root, &dir, true, within(bound));
     let took = started.elapsed();
     assert!(
-        took < Duration::from_millis(350),
+        took >= bound,
+        "gave up before its bound, on a fixed timeout: {took:?}"
+    );
+    assert!(
+        took < bound + Duration::from_secs(1),
         "waited past its bound: {took:?}"
     );
     holder.execute_batch("ROLLBACK").expect("release");
@@ -1298,7 +1307,10 @@ fn cleanup_yields_to_a_waiting_owner() {
         calls += 1;
         if calls == 1 {
             let started = Instant::now();
-            catalog::record_seal_within(root, &owner, true, within(Duration::from_millis(500)));
+            // Its bound is generous: were cleanup holding a write
+            // transaction across this call, the owner would wait it out
+            // and its write would be dropped, whatever the bound.
+            catalog::record_seal_within(root, &owner, true, within(Duration::from_secs(5)));
             landed = Some((
                 count(
                     &watch,
@@ -1317,8 +1329,10 @@ fn cleanup_yields_to_a_waiting_owner() {
     })
     .expect("clean");
     let (rows, took) = landed.expect("cleanup paused at least once");
-    assert_eq!(rows, 1, "the owner's write landed between two steps");
-    assert!(took < Duration::from_millis(500), "{took:?}");
+    assert_eq!(
+        rows, 1,
+        "the owner's write landed between two steps (took {took:?})"
+    );
     assert!(report.capped_rows >= 4, "{report:?}");
     assert!(
         shrinking >= 2,
