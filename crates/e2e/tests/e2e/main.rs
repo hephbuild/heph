@@ -75,5 +75,6 @@ mod run_timeout;
 mod sandbox_pool;
 mod scratch;
 mod session_catalog;
+mod session_sampler;
 mod tool_env;
 mod workspace_cleanup;
