@@ -12,6 +12,7 @@ use clap_complete::engine::ArgValueCompleter;
 use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
 use crate::commands::completion::complete_target_addr;
+use crate::commands::run_json::{self, RunEntry};
 use crate::commands::utils::resolve_matcher;
 use crate::engine::{
     Discovery, Engine, Gaps, InteractiveWrapper, InvokeOutcome, InvokeRequest, OutputMatcher,
@@ -123,13 +124,20 @@ pub struct RunArgs {
     /// credentials the target declares. It is also the only way a build target
     /// gets stdin: a plain build's action reads /dev/null, since what it would
     /// read is no part of its cache key.
-    #[arg(long = "shell", num_args = 0..=1, require_equals = true, default_missing_value = "", value_name = "ADDRESS",)]
+    #[arg(
+        long = "shell",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "",
+        value_name = "ADDRESS",
+        conflicts_with = "output"
+    )]
     pub shell: Option<String>,
     /// Print output artifacts to stdout
-    #[arg(long = "cat-out", conflicts_with = "list_out")]
+    #[arg(long = "cat-out", conflicts_with_all = ["list_out", "output"])]
     pub cat_out: bool,
     /// Print output file list to stdout
-    #[arg(long = "list-out")]
+    #[arg(long = "list-out", conflicts_with = "output")]
     pub list_out: bool,
     /// Copy output artifacts into DIR (created if needed).
     /// Relative paths resolve against the current directory.
@@ -137,7 +145,8 @@ pub struct RunArgs {
     pub copy_out: Option<String>,
     /// Restrict --cat-out/--list-out/--copy-out to these output names
     /// (repeatable). When omitted, all of the target's outputs are considered.
-    #[arg(long = "output", value_name = "NAME")]
+    /// Under `--json`, also the set the `outputs` field lists.
+    #[arg(long = "output", id = "output_names", value_name = "NAME")]
     pub output: Vec<String>,
     /// Fail if generated output differs from the tree (CI check)
     #[arg(long = "frozen")]
@@ -158,8 +167,10 @@ pub struct RunArgs {
     /// capture, runners and the cache are unchanged, so a cache hit prints
     /// nothing. A build target's action reads no stdin with or without this
     /// flag; only `--shell` gets the keyboard. Refused with `--shell`.
-    #[arg(long = "raw")]
+    #[arg(long = "raw", conflicts_with = "output")]
     pub raw: bool,
+    #[command(flatten)]
+    pub out: output::JsonArgs<crate::commands::run_json::RunEntry>,
     /// Arguments for an entrypoint (`entrypoint = True`) that declares `args = True`,
     /// after `--`: appended to its command, verbatim. Everything after `--`
     /// is the program's, flags included (`heph run //t:go -- --version`).
@@ -1061,11 +1072,13 @@ impl App for RunApp {
                 self.auto_approve,
             ))
         };
+        let json = self.args.out.enabled();
+        let (events, json_events) = request_events(json, ctx.event_sender());
         // The shell target is fixed when the request is built: no frame may
         // resolve before it is known (see `ShellTarget`).
         let rs = self.engine.new_state_with_shell(
             self.fail_fast,
-            ctx.event_sender(),
+            events,
             ctx.bg_pending(),
             self.args.log_lines,
             Some(approval),
@@ -1087,6 +1100,19 @@ impl App for RunApp {
         // rather than saying a target nobody could read is not an entrypoint.
         if let Matcher::Addr(addr) = &self.matcher {
             match self.engine.is_entrypoint(&rs, addr).await {
+                // Only known once the matcher resolved, but before anything
+                // executes: an entrypoint runs a program on the terminal, and
+                // has no entry to report. A usage error (exit 2), as clap's
+                // refusals of the flags are.
+                Ok(true) if json => {
+                    return Err(output::OutputError::Refused(format!(
+                        "{} is an entrypoint (`entrypoint = True`): it runs a program rather \
+                         than building, so it has no `--json` form; run it without `--json`, \
+                         `--fields` and `--jq`",
+                        addr.format()
+                    ))
+                    .into());
+                }
                 Ok(true) => {
                     let addr = addr.clone();
                     let outcome = self.invoke(ctx, Arc::clone(&rs), addr).await;
@@ -1121,51 +1147,60 @@ impl App for RunApp {
         // `finalize` paved road handles rendering and exit uniformly. The engine
         // already returns `Err` for cancellation and genuine top-level failures;
         // per-addr failures (default, fail-fast off) live in the request's failure registry.
-        //
-        // Outputs are read only by `--cat-out`, `--list-out` and `--copy-out`.
-        // Without one, the selected targets are resolved for their hashouts
-        // alone, as dependencies are, so a remote hit transfers no blob. Asking
-        // for every output instead downloaded each selected target's bytes
-        // into the local cache for nobody: a fully cached CI run over 91 OCI
-        // images, each archive carrying its base's layers, spent minutes
-        // pulling them. Execution and the codegen write-back do not depend on
-        // this: a miss still runs and caches the full output set, and a
-        // codegen target still writes its tree.
-        //
-        // `--output` keeps naming groups even without a reader, so a group the
-        // target lacks stays an error.
-        let reads_outputs = self.args.cat_out || self.args.list_out || self.args.copy_out.is_some();
-        let outputs = if !self.args.output.is_empty() {
-            OutputMatcher::Exact(self.args.output.clone())
-        } else if reads_outputs {
-            OutputMatcher::All
-        } else {
-            OutputMatcher::None
-        };
-
-        let res = match self.matcher {
-            Matcher::Addr(addr) => self
-                .engine
-                .clone()
-                .result_addr(rs.clone(), &addr, outputs, &opts)
-                .await
-                .map(|r| vec![r]),
-            m => self
-                .engine
-                .clone()
-                .result(rs.clone(), &m, outputs, &opts)
-                .await
-                // NOT `.map(|batch| batch.ok)`: keep-going failures ride
-                // inside the Ok and must fold into `res`, or an error the
-                // registry didn't record exits 0 in silence. See `fold_batch`.
-                .and_then(crate::commands::errors::fold_batch)
-                // A selector that chose nothing is a failed run, not a
-                // successful empty one — see `require_non_empty`. Unless the
-                // walk skipped something: then the skips are the answer, not
-                // "check your selector".
-                .and_then(|results| {
-                    crate::commands::errors::require_non_empty_unless_incomplete(results, &gaps)
-                }),
+        let outputs = self.args.output_matcher();
+        let run = build(
+            Arc::clone(&self.engine),
+            Arc::clone(&rs),
+            self.matcher,
+            outputs.clone(),
+            &opts,
+            &gaps,
+        );
+        // The document's own end, under `--json`: whether stdout was closed,
+        // and its write or field error. The build's failures are rendered by
+        // `finalize` below first, whatever happened to the document.
+        let mut doc = None;
+        let res = match json_events {
+            None => run.await,
+            Some(events) => {
+                let src = run_json::Sources {
+                    engine: &self.engine,
+                    rs: &rs,
+                    out: &self.args.out,
+                    outputs: &outputs,
+                    opts: &opts,
+                };
+                let mut list = self.args.out.printer().start_list()?;
+                let collected =
+                    run_json::collect(run, events, ctx.event_sender(), &src, &mut list).await;
+                // Closed only when whole (D10): fail-fast, a skip, Ctrl-C, a
+                // closed stdout or an entry left unwritten leaves it without
+                // its `]`, and the exit below says why.
+                let close = collected.may_close(&gaps);
+                let run_json::Collected {
+                    res,
+                    events: mut rest,
+                    stopped,
+                    mut write_error,
+                    field_error,
+                    ..
+                } = collected;
+                // Background work (cache uploads) still reports to the display.
+                if let Some(tx) = ctx.event_sender() {
+                    tokio::spawn(async move {
+                        while let Some(ev) = rest.recv().await {
+                            if tx.send(ev).is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+                if close && let Err(e) = list.finish(&|| rs.ctoken().is_cancelled()) {
+                    write_error = Some(e);
+                }
+                doc = Some((stopped, write_error, field_error));
+                res
+            }
         };
 
         // A run with gaps skipped part of the graph, so it did not succeed:
@@ -1202,10 +1237,13 @@ impl App for RunApp {
                     }
                 }
             } else if self.args.list_out {
+                use std::io::Write as _;
+                let mut stdout = io::stdout().lock();
                 for r in &result {
                     for a in &r.artifacts {
                         for e in a.walk()? {
-                            println!("{}", e?.path.display());
+                            writeln!(stdout, "{}", e?.path.display())
+                                .context("printing the output list")?;
                         }
                     }
                 }
@@ -1231,7 +1269,110 @@ impl App for RunApp {
             Ok(())
         })
         .await;
-        finalized.map(|()| None)
+        match doc {
+            None => finalized,
+            Some((stopped, write_error, field_error)) => {
+                run_json::exit(stopped, write_error, field_error, finalized)
+            }
+        }
+        .map(|()| None)
+    }
+}
+
+/// Where a request's events go. Under `--json` (`json`), a channel of the
+/// command's own: the entry fold reads it first and forwards each event to
+/// the display. Otherwise the display's own sender (`display`) and no
+/// receiver, so nothing changes: no fold, no per-target state (I4).
+pub fn request_events(
+    json: bool,
+    display: Option<hcore::events::EventSender>,
+) -> (
+    Option<hcore::events::EventSender>,
+    Option<hcore::events::EventReceiver>,
+) {
+    if json {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (Some(tx), Some(rx))
+    } else {
+        (display, None)
+    }
+}
+
+/// The build `heph run` runs: one address resolved, or a matcher's batch
+/// folded into one result, `outputs` asked of each selected target.
+pub async fn build(
+    engine: Arc<Engine>,
+    rs: Arc<crate::engine::request_state::RequestState>,
+    matcher: Matcher,
+    outputs: OutputMatcher,
+    opts: &ResultOptions,
+    gaps: &Gaps,
+) -> anyhow::Result<Vec<Arc<crate::engine::EResult>>> {
+    match matcher {
+        Matcher::Addr(addr) => engine
+            .result_addr(rs, &addr, outputs, opts)
+            .await
+            .map(|r| vec![r]),
+        m => engine
+            .result(rs, &m, outputs, opts)
+            .await
+            // NOT `.map(|batch| batch.ok)`: keep-going failures ride
+            // inside the Ok and must fold into `res`, or an error the
+            // registry didn't record exits 0 in silence. See `fold_batch`.
+            .and_then(crate::commands::errors::fold_batch)
+            // A selector that chose nothing is a failed run, not a
+            // successful empty one — see `require_non_empty`. Unless the
+            // walk skipped something: then the skips are the answer, not
+            // "check your selector".
+            .and_then(|results| {
+                crate::commands::errors::require_non_empty_unless_incomplete(results, gaps)
+            }),
+    }
+}
+
+impl RunArgs {
+    /// Parse `heph run`'s arguments alone, as the command would see them.
+    /// For tests.
+    pub fn try_parse_from<I, T>(args: I) -> Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<OsString> + Clone,
+    {
+        use clap::FromArgMatches as _;
+        let cmd = Self::augment_args(clap::Command::new("run").no_binary_name(true));
+        Self::from_arg_matches(&cmd.try_get_matches_from(args)?)
+    }
+
+    /// Whether the run reads the selected targets' outputs.
+    ///
+    /// Outputs are read only by `--cat-out`, `--list-out`, `--copy-out` and
+    /// `--json`'s `outputs` field (which reads the same set, through the same
+    /// memoized result). Without one, the selected targets are resolved for
+    /// their hashouts alone, as dependencies are, so a remote hit transfers no
+    /// blob. Asking for every output instead downloaded each selected
+    /// target's bytes into the local cache for nobody: a fully cached CI run
+    /// over 91 OCI images, each archive carrying its base's layers, spent
+    /// minutes pulling them. Execution and the codegen write-back do not
+    /// depend on this: a miss still runs and caches the full output set, and
+    /// a codegen target still writes its tree.
+    pub fn reads_outputs(&self) -> bool {
+        self.cat_out
+            || self.list_out
+            || self.copy_out.is_some()
+            || (self.out.enabled() && self.out.wants(RunEntry::OUTPUTS))
+    }
+
+    /// The outputs the run asks of each selected target. `--output` keeps
+    /// naming groups even without a reader, so a group the target lacks stays
+    /// an error.
+    pub fn output_matcher(&self) -> OutputMatcher {
+        if !self.output.is_empty() {
+            OutputMatcher::Exact(self.output.clone())
+        } else if self.reads_outputs() {
+            OutputMatcher::All
+        } else {
+            OutputMatcher::None
+        }
     }
 }
 
@@ -1311,6 +1452,7 @@ async fn execute_async(
     let shell = shell_for_selection(shell, &m);
     let (engine, shutdown) = bootstrap::new_engine(&global, session)?;
     let raw = args.raw;
+    let json = args.out.enabled();
     let dashboard = args.dashboard.dashboard;
     let app = RunApp {
         args,
@@ -1324,7 +1466,8 @@ async fn execute_async(
         approval: tui::ApprovalCenter::new(),
         label: SharedLabel::new(String::new()),
     };
-    let interactive = tui::should_use_tui(global.no_tui || raw);
+    // Under `--json` stdout is the document's alone (I1): no TUI.
+    let interactive = tui::should_use_tui(global.no_tui || raw) && !json;
 
     // Stall watchdog. Registered before the run so it observes the whole stream.
     //
@@ -1413,6 +1556,107 @@ mod tests {
         Cli::try_parse_from(std::iter::once("run").chain(argv.iter().copied()))
             .expect("parse")
             .run
+    }
+
+    /// `--shell`, `--cat-out`, `--list-out` and `--raw` want stdout or the
+    /// terminal, which `--json`, `--fields` and `--jq` give the document:
+    /// each pair is a parse error, exit 2, before anything resolves. `--output`
+    /// (output names) is not the output group, and parses with `--json`.
+    #[test]
+    fn run_json_refusals() {
+        let mut checked = 0;
+        for mode in [
+            &["--shell"][..],
+            &["--shell=//p:t"],
+            &["--cat-out"],
+            &["--list-out"],
+            &["--raw"],
+        ] {
+            for flags in [&["--json"][..], &["--fields", "addr"], &["--jq", "."]] {
+                let argv: Vec<&str> = std::iter::once("run")
+                    .chain(["//p:t"])
+                    .chain(mode.iter().copied())
+                    .chain(flags.iter().copied())
+                    .collect();
+                let err = match Cli::try_parse_from(&argv) {
+                    Ok(_) => panic!("{argv:?} parsed"),
+                    Err(e) => e,
+                };
+                assert_eq!(
+                    err.kind(),
+                    clap::error::ErrorKind::ArgumentConflict,
+                    "{argv:?}: {err}"
+                );
+                assert_eq!(err.exit_code(), 2, "{argv:?}");
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 15);
+        let args = parse(&["//p:t", "--json", "--output", "bin", "--copy-out", "d"]);
+        assert!(args.out.enabled());
+        assert_eq!(args.output, ["bin"]);
+        assert!(!parse(&["//p:t", "--output", "bin"]).out.enabled());
+    }
+
+    /// Which flags read the selected targets' outputs, and so fetch a remote
+    /// hit's blobs: not `--json`'s default fields, but its `outputs` field,
+    /// and the readers without `--json`.
+    #[test]
+    fn reads_outputs_table() {
+        let rows: [(&[&str], bool); 8] = [
+            (&["//p:t"], false),
+            (&["//p:t", "--json"], false),
+            (&["//p:t", "--fields", "addr,hashin"], false),
+            (&["//p:t", "--json", "--fields", "+outputs"], true),
+            (&["//p:t", "--fields", "addr,outputs"], true),
+            (&["//p:t", "--list-out"], true),
+            (&["//p:t", "--cat-out"], true),
+            (&["//p:t", "--copy-out", "d"], true),
+        ];
+        for (argv, want) in rows {
+            let args = parse(argv);
+            assert_eq!(args.reads_outputs(), want, "{argv:?}");
+            let all = matches!(args.output_matcher(), OutputMatcher::All);
+            assert_eq!(all, want, "{argv:?}");
+            assert_eq!(
+                RunArgs::try_parse_from(argv)
+                    .expect("parse")
+                    .reads_outputs(),
+                want,
+                "{argv:?}"
+            );
+        }
+        // `--output` names the groups whatever reads them.
+        let args = parse(&["//p:t", "--json", "--output", "bin"]);
+        assert!(matches!(args.output_matcher(), OutputMatcher::Exact(g) if g == ["bin"]));
+    }
+
+    /// Without an output flag the request reports to the display's own
+    /// sender and nothing folds; under one it gets a channel of its own.
+    #[tokio::test]
+    async fn request_events_table() {
+        let ev = || hcore::events::BuildEvent {
+            at_unix_ms: 1,
+            kind: hcore::events::BuildEventKind::RemoteCacheMiss {
+                addr: "//p:t".into(),
+            },
+        };
+        let (display, mut shown) = tokio::sync::mpsc::unbounded_channel();
+
+        let (tx, rx) = request_events(false, Some(display.clone()));
+        assert!(rx.is_none(), "no fold");
+        tx.expect("the display's sender").send(ev()).expect("send");
+        assert!(shown.try_recv().is_ok(), "straight to the display");
+        let (tx, rx) = request_events(false, None);
+        assert!(tx.is_none() && rx.is_none(), "no display, no events");
+
+        let (tx, rx) = request_events(true, Some(display));
+        tx.expect("the fold's sender").send(ev()).expect("send");
+        assert!(rx.expect("the fold's receiver").try_recv().is_ok());
+        assert!(
+            shown.try_recv().is_err(),
+            "the fold forwards, not the request"
+        );
     }
 
     /// `-D` is the run's own flag, in either place on the label form

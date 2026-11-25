@@ -27,7 +27,7 @@ use crate::engine::{Engine, OutputMatcher, ResultOptions};
 use crate::htaddr::Addr;
 
 /// How a matched target ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, output::Shape)]
 #[serde(rename_all = "snake_case")]
 pub enum Outcome {
     /// Its result came from a cache; nothing ran.
@@ -43,7 +43,7 @@ pub enum Outcome {
 }
 
 /// Where a target's result was looked up, and what came of it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, output::Shape)]
 #[serde(rename_all = "snake_case")]
 pub enum CacheTier {
     /// The local cache had it.
@@ -56,7 +56,7 @@ pub enum CacheTier {
 
 /// What a failed run left in its failure slot, as `heph inspect failure`
 /// reports it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, output::Shape)]
 pub struct RunFailure {
     /// The failed run's full process log; null when it kept none.
     #[serde(serialize_with = "output::ser::opt_path")]
@@ -97,7 +97,10 @@ pub struct RunEntry {
     /// unless it failed running.
     pub failure: Option<RunFailure>,
     /// Its output files, the set `--list-out` prints (narrowed by
-    /// `--output`). Fetches the outputs of a remote hit.
+    /// `--output`). Selecting it costs what `--list-out` does: a remote
+    /// hit's outputs are downloaded, which the default fields never do.
+    /// Neither a spec, a def nor a hash is added, so its tier is `free`, and
+    /// the download is why it is not a default.
     #[record(opt_in)]
     #[serde(serialize_with = "opt_paths")]
     pub outputs: Option<Vec<PathBuf>>,
@@ -112,7 +115,6 @@ fn opt_paths<S: serde::Serializer>(ps: &Option<Vec<PathBuf>>, s: S) -> Result<S:
         None => s.serialize_none(),
     }
 }
-
 
 /// What the fold knows of one target while it resolves.
 #[derive(Debug, Default)]
@@ -317,10 +319,11 @@ impl Sources<'_> {
             .result_addr(Arc::clone(self.rs), addr, self.outputs.clone(), self.opts)
             .await
             .with_context(|| format!("reading the outputs of {}", addr.format()))?;
+        let listing = || format!("listing the outputs of {}", addr.format());
         let mut paths = Vec::new();
         for a in &result.artifacts {
-            for e in a.walk()? {
-                paths.push(e?.path);
+            for e in a.walk().with_context(listing)? {
+                paths.push(e.with_context(listing)?.path);
             }
         }
         Ok(paths)
@@ -348,8 +351,83 @@ pub struct Collected<T> {
     pub stopped: bool,
     /// Every matched target has its entry and the matched set is final.
     pub whole: bool,
-    /// Writing to stdout failed (not a closed pipe).
+    /// Writing to stdout failed (not a closed pipe). The request was
+    /// cancelled: there is nowhere left to write.
     pub write_error: Option<anyhow::Error>,
+    /// The first entry whose fields could not be read (its `outputs`, say).
+    /// That entry is not written, the list is not closed, and the build is
+    /// not cancelled: the command fails with it once the build's own
+    /// failures are rendered.
+    pub field_error: Option<anyhow::Error>,
+}
+
+impl<T> Collected<T> {
+    /// Whether the list is whole and may be closed (D10): every matched
+    /// target has its entry, the walk skipped nothing (`gaps`), the run was
+    /// not cancelled, and every entry was written. Otherwise it is left
+    /// without its `]`.
+    pub fn may_close(&self, gaps: &crate::engine::Gaps) -> bool {
+        self.whole
+            && gaps.is_empty()
+            && !self.stopped
+            && self.write_error.is_none()
+            && self.field_error.is_none()
+            && !self
+                .res
+                .as_ref()
+                .err()
+                .is_some_and(crate::commands::errors::is_cancelled)
+    }
+}
+
+/// The command's result once `finalized` (what `finalize` made of the
+/// build, its failures already rendered) is known.
+///
+/// A closed stdout (`stopped`) is exit 0 whatever the build did: the reader
+/// has what it wanted. Otherwise the document's own error (a write error,
+/// else a field error) is the command's, unless the build failed for itself
+/// (failed targets, an incomplete selection): that failure keeps its exit and
+/// the document's error is logged. A cancellation, which a write error
+/// causes, is not such a failure.
+pub fn exit(
+    stopped: bool,
+    write_error: Option<anyhow::Error>,
+    field_error: Option<anyhow::Error>,
+    finalized: anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    if stopped {
+        return Ok(());
+    }
+    let doc = match (write_error, field_error) {
+        (Some(w), Some(f)) => {
+            tracing::error!(error = %format!("{f:#}"), "reading a --json entry's fields");
+            Some(w)
+        }
+        (w, f) => w.or(f),
+    };
+    let Some(doc) = doc else {
+        return finalized;
+    };
+    match finalized {
+        Ok(()) => Err(doc),
+        Err(f)
+            if f.downcast_ref::<crate::commands::errors::FailedTargets>()
+                .is_some()
+                || f.downcast_ref::<crate::commands::errors::IncompleteSelection>()
+                    .is_some() =>
+        {
+            tracing::error!(error = %format!("{doc:#}"), "writing the --json document");
+            Err(f)
+        }
+        Err(f) => {
+            // Not a stop (`finish_exit`'s plain `cancelled` included): a
+            // genuine error the document's would otherwise hide.
+            if !crate::commands::errors::is_cancelled(&f) && f.to_string() != "cancelled" {
+                tracing::error!(error = %format!("{f:#}"), "the run failed");
+            }
+            Err(doc)
+        }
+    }
 }
 
 /// Run `run` while folding `events` (the request's own stream) into `list`,
@@ -378,6 +456,7 @@ pub async fn collect<T, W: Write>(
     let mut fold = Fold::default();
     let mut stopped = false;
     let mut write_error = None;
+    let mut field_error = None;
     let folding = async {
         let mut finished = false;
         loop {
@@ -401,18 +480,23 @@ pub async fn collect<T, W: Write>(
             };
             if !stopped && write_error.is_none() {
                 for mut entry in fold.on_event(&ev) {
-                    let pushed = match src.complete(&mut entry).await {
-                        Ok(()) => list.push(&entry).and_then(|flow| {
-                            // Flushed per entry: a reader sees each target as
-                            // it finishes, not when the buffer fills.
-                            Ok(if flow == output::Flow::Stop {
-                                flow
-                            } else {
-                                list.flush()?
-                            })
-                        }),
-                        Err(e) => Err(e),
-                    };
+                    // An entry whose fields cannot be read is not written,
+                    // and the list stays open (D10); the build goes on.
+                    if let Err(e) = src.complete(&mut entry).await {
+                        if field_error.is_none() {
+                            field_error = Some(e);
+                        }
+                        continue;
+                    }
+                    let pushed = list.push(&entry).and_then(|flow| {
+                        // Flushed per entry: a reader sees each target as it
+                        // finishes, not when the buffer fills.
+                        Ok(if flow == output::Flow::Stop {
+                            flow
+                        } else {
+                            list.flush()?
+                        })
+                    });
                     match pushed {
                         Ok(output::Flow::Continue) => {}
                         Ok(output::Flow::Stop) => {
@@ -441,6 +525,7 @@ pub async fn collect<T, W: Write>(
         stopped,
         whole: fold.whole(),
         write_error,
+        field_error,
     }
 }
 
@@ -687,5 +772,192 @@ mod tests {
         );
         assert_eq!(entries[2].outcome, Outcome::Failed);
         assert!(entries[2].timed_out);
+    }
+
+    fn collected(whole: bool, cancelled: bool) -> Collected<()> {
+        let (_tx, events) = tokio::sync::mpsc::unbounded_channel();
+        Collected {
+            res: if cancelled {
+                Err(anyhow::Error::new(crate::engine::error::CancelledError).context("result"))
+            } else {
+                Ok(())
+            },
+            events,
+            stopped: false,
+            whole,
+            write_error: None,
+            field_error: None,
+        }
+    }
+
+    /// D10: the list is closed only when every matched target has its
+    /// entry, nothing was skipped and nothing stopped the run, and every
+    /// entry was written.
+    #[test]
+    fn may_close_table() {
+        let clean = crate::engine::Gaps::new("//...");
+        let skipped = crate::engine::Gaps::new("//...");
+        skipped.record(
+            crate::engine::discovery::Stage::List,
+            "go",
+            "//a".into(),
+            &anyhow::anyhow!("boom"),
+        );
+        for whole in [false, true] {
+            for gaps in [&clean, &skipped] {
+                for cancelled in [false, true] {
+                    let want = whole && gaps.is_empty() && !cancelled;
+                    let got = collected(whole, cancelled).may_close(gaps);
+                    assert_eq!(
+                        got,
+                        want,
+                        "whole={whole} gaps={} {cancelled}",
+                        gaps.is_empty()
+                    );
+                }
+            }
+        }
+        let mut c = collected(true, false);
+        c.stopped = true;
+        assert!(!c.may_close(&clean), "stdout closed");
+        let mut c = collected(true, false);
+        c.write_error = Some(anyhow::anyhow!("EIO"));
+        assert!(!c.may_close(&clean), "a write error");
+        let mut c = collected(true, false);
+        c.field_error = Some(anyhow::anyhow!("no outputs"));
+        assert!(!c.may_close(&clean), "an entry left unwritten");
+    }
+
+    /// The exit once `finalize` ran: a closed stdout is 0; the document's
+    /// error is the command's unless the build failed for itself.
+    #[test]
+    fn exit_table() {
+        let doc = || Some(anyhow::anyhow!("doc"));
+        assert!(exit(true, doc(), doc(), Err(anyhow::anyhow!("cancelled"))).is_ok());
+        assert!(exit(false, None, None, Ok(())).is_ok());
+        let e = exit(false, None, doc(), Ok(())).expect_err("a field error fails");
+        assert_eq!(e.to_string(), "doc");
+        let e = exit(false, doc(), None, Err(anyhow::anyhow!("cancelled")))
+            .expect_err("a write error fails");
+        assert_eq!(e.to_string(), "doc", "not the cancellation it caused");
+        let failed = crate::commands::errors::FailedTargets::deferred(Vec::new()).into_error();
+        let e = exit(false, None, doc(), Err(failed)).expect_err("the build failed");
+        assert!(
+            e.downcast_ref::<crate::commands::errors::FailedTargets>()
+                .is_some(),
+            "the build's failure keeps its exit: {e:#}"
+        );
+    }
+
+    /// Writes its first chunk, then fails every write with `kind`.
+    struct FailsAfterFirst {
+        kind: std::io::ErrorKind,
+        wrote: bool,
+    }
+
+    impl Write for FailsAfterFirst {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.wrote {
+                return Err(self.kind.into());
+            }
+            self.wrote = true;
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `collect` over `events` (a whole run of them), the list written to
+    /// `w` under `flags`. Also whether the request was cancelled.
+    async fn collect_over<W: Write>(
+        flags: &[&str],
+        events: Vec<BuildEventKind>,
+        w: W,
+    ) -> (Collected<()>, bool) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine =
+            Arc::new(Engine::new(crate::engine::Config::for_tests(dir.path())).expect("engine"));
+        let rs = engine.new_state_with_events(false, None);
+        let out = output::JsonArgs::<RunEntry>::try_parse_from(flags).expect("flags");
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        for kind in events {
+            tx.send(ev(0, kind)).expect("send");
+        }
+        drop(tx);
+        let opts = ResultOptions::default();
+        let src = Sources {
+            engine: &engine,
+            rs: &rs,
+            out: &out,
+            outputs: &OutputMatcher::None,
+            opts: &opts,
+        };
+        let mut list = out
+            .printer_to(w, output::Style::Compact)
+            .start_list()
+            .expect("start the list");
+        let c = collect(async { Ok(()) }, rx, None, &src, &mut list).await;
+        (c, rs.ctoken().is_cancelled())
+    }
+
+    fn two_ran() -> Vec<BuildEventKind> {
+        vec![
+            matched(&["//p:a", "//p:b"], true),
+            execute("//p:a"),
+            end("//p:a", None, None),
+            execute("//p:b"),
+            end("//p:b", None, None),
+        ]
+    }
+
+    /// A write that fails (not a closed pipe) is the command's error and
+    /// cancels the request: there is nowhere left to write.
+    #[tokio::test]
+    async fn collect_failing_writer() {
+        let w = FailsAfterFirst {
+            kind: std::io::ErrorKind::Other,
+            wrote: false,
+        };
+        let (c, cancelled) = collect_over(&["--json"], two_ran(), w).await;
+        assert!(c.write_error.is_some(), "a write error");
+        assert!(!c.stopped);
+        assert!(cancelled, "the request is cancelled");
+        assert!(!c.may_close(&crate::engine::Gaps::new("t")));
+    }
+
+    /// A closed stdout stops the document and cancels the request; no error.
+    #[tokio::test]
+    async fn collect_closed_stdout() {
+        let w = FailsAfterFirst {
+            kind: std::io::ErrorKind::BrokenPipe,
+            wrote: false,
+        };
+        let (c, cancelled) = collect_over(&["--json"], two_ran(), w).await;
+        assert!(c.stopped, "stdout closed");
+        assert!(c.write_error.is_none(), "{:?}", c.write_error);
+        assert!(cancelled, "the request is cancelled");
+    }
+
+    /// An entry whose fields cannot be read is left out and recorded; the
+    /// build is not cancelled, later entries are written, the list stays
+    /// open.
+    #[tokio::test]
+    async fn collect_field_error_keeps_building() {
+        let mut buf = Vec::new();
+        let events = vec![
+            matched(&["not an addr", "//p:b"], true),
+            end("not an addr", None, None),
+            end("//p:b", None, None),
+        ];
+        let (c, cancelled) = collect_over(&["--fields", "+hashin"], events, &mut buf).await;
+        assert!(c.field_error.is_some(), "the unreadable entry's error");
+        assert!(c.write_error.is_none(), "{:?}", c.write_error);
+        assert!(!cancelled, "the build goes on");
+        assert!(c.whole);
+        assert!(!c.may_close(&crate::engine::Gaps::new("t")), "left open");
+        let text = String::from_utf8(buf).expect("utf-8");
+        assert!(text.contains("//p:b"), "{text}");
+        assert!(!text.contains("not an addr"), "{text}");
     }
 }

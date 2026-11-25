@@ -158,6 +158,7 @@ fn raw_refused_with_shell() {
         log_lines: 10,
         dashboard: Default::default(),
         raw: true,
+        out: Default::default(),
         args: Vec::new(),
     };
     let session = Arc::new(SessionSlot::new());
