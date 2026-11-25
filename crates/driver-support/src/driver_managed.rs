@@ -43,6 +43,90 @@ impl ManagedRunInput {
             )
         })
     }
+
+    /// The paths this Dep input's list file names: one absolute
+    /// materialized path per line, blank lines skipped. Every input of one
+    /// origin shares that file. Blocking IO: a driver calls it inside its
+    /// run's blocking job, or reads the list there through [`DepList`].
+    pub fn listed_paths(&self) -> anyhow::Result<Vec<PathBuf>> {
+        read_listed_paths(self.require_list_path()?)
+    }
+}
+
+/// The Dep inputs of `origin`, in input order. They share one list file (a
+/// group expands into several inputs of its origin).
+pub fn dep_inputs<'r>(
+    inputs: &'r [ManagedRunInput],
+    origin: &'r str,
+) -> impl Iterator<Item = &'r ManagedRunInput> {
+    inputs.iter().filter(move |m| {
+        m.input.origin_id == origin && matches!(m.input.artifact.r#type, inputartifact::Type::Dep)
+    })
+}
+
+/// The list file of the Dep input `origin`, owned, so the blocking job that
+/// reads it can take it along: `single_dep_file(&req.inputs, ORIGIN)?` on
+/// the async side, [`DepList::single_file`] inside the job.
+#[derive(Debug, Clone)]
+pub struct DepList {
+    list: PathBuf,
+    /// The target that produced the input, named in the errors.
+    producer: String,
+}
+
+/// The [`DepList`] of `origin`, for a driver option that names exactly one
+/// file. Errors when no Dep input of `origin` was staged.
+pub fn single_dep_file(inputs: &[ManagedRunInput], origin: &str) -> anyhow::Result<DepList> {
+    let input = dep_inputs(inputs, origin)
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no dep input {origin:?} was staged in the sandbox"))?;
+    Ok(DepList {
+        list: input.require_list_path()?.to_path_buf(),
+        producer: input.input.source_addr.format(),
+    })
+}
+
+impl DepList {
+    /// Every path the list names (see [`ManagedRunInput::listed_paths`]).
+    pub fn paths(&self) -> anyhow::Result<Vec<PathBuf>> {
+        read_listed_paths(&self.list)
+    }
+
+    /// The one file the list names. None, or several, have no defensible
+    /// answer (which one is meant would depend on walk order), so both are
+    /// refused with the producer and the count.
+    pub fn single_file(&self) -> anyhow::Result<PathBuf> {
+        let mut files = self.paths()?.into_iter();
+        let producer = &self.producer;
+        let Some(first) = files.next() else {
+            anyhow::bail!(
+                "{producer} must produce exactly one file, but it produced none; name a single \
+                 file target"
+            );
+        };
+        let extra = files.count();
+        if extra > 0 {
+            anyhow::bail!(
+                "{producer} must produce exactly one file, but it produced {} ({:?} and {extra} \
+                 more); name a single file target",
+                extra + 1,
+                first.display(),
+            );
+        }
+        Ok(first)
+    }
+}
+
+/// The paths the list file at `list` names: one absolute materialized path
+/// per line, blank lines skipped. Blocking IO.
+pub fn read_listed_paths(list: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let content = fs::read_to_string(list)
+        .with_context(|| format!("read staged file list {}", list.display()))?;
+    Ok(content
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(PathBuf::from)
+        .collect())
 }
 
 pub struct ManagedRunRequest<'a, 'io> {
@@ -384,28 +468,24 @@ fn staged_path(inputs: &[ManagedRunInput], origin_id: &str, arg: &str) -> anyhow
         .ok_or_else(|| {
             anyhow::anyhow!("`${{src:{arg}}}` was not staged (origin_id={origin_id})")
         })?;
-    let list_path = input.require_list_path()?;
-    let listed = std::fs::read_to_string(list_path)
-        .with_context(|| format!("read staged file list {list_path:?}"))?;
-    let mut paths = listed.lines().filter(|l| !l.is_empty());
-    let first = paths.next().ok_or_else(|| {
-        anyhow::anyhow!(
+    let mut listed = input.listed_paths()?;
+    match listed.len() {
+        0 => anyhow::bail!(
             "`${{src:{arg}}}` staged no files, so there is no path to substitute. A `${{src:}}` \
              producer emits one file — narrow its `out`, or name a group with `|<group>`"
-        )
-    })?;
-    let rest: Vec<&str> = paths.collect();
-    if !rest.is_empty() {
-        let mut all: Vec<&str> = std::iter::once(first).chain(rest).collect();
-        all.sort_unstable();
-        anyhow::bail!(
-            "`${{src:{arg}}}` staged {} files ({}), so there is no single path to substitute. \
-             Name one with `${{src:{arg}|<group>}}`, or narrow the producer's `out`",
-            all.len(),
-            all.join(", ")
-        );
+        ),
+        1 => Ok(listed.swap_remove(0).to_string_lossy().into_owned()),
+        n => {
+            listed.sort_unstable();
+            let all: Vec<_> = listed.iter().map(|p| p.to_string_lossy()).collect();
+            anyhow::bail!(
+                "`${{src:{arg}}}` staged {n} files ({}), so there is no single path to \
+                 substitute. Name one with `${{src:{arg}|<group>}}`, or narrow the producer's \
+                 `out`",
+                all.join(", ")
+            );
+        }
     }
-    Ok(first.to_string())
 }
 
 /// Tar, hash and stage every collectable output of a finished run, through
@@ -2112,6 +2192,109 @@ mod source_map_tests {
             "the tree must still be materialized"
         );
         assert_ran_on_blocking_pool(&thread, "unpacking an input");
+    }
+
+    /// `input` with its list file at `dir/<name>` naming `listed`.
+    fn listed_input(
+        dir: &Path,
+        origin_id: &str,
+        source_addr: &str,
+        listed: &str,
+    ) -> ManagedRunInput {
+        let list = dir.join(format!("{origin_id}.list"));
+        fs::write(&list, listed).expect("write list");
+        let mut input = make_input(origin_id, source_addr, &[]);
+        input.list_path = Some(list);
+        input
+    }
+
+    /// The list is read one path per line, blank lines skipped; a Support
+    /// input has none to read.
+    #[test]
+    fn listed_paths_reads_the_list_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let input = listed_input(dir.path(), "src", "//p:a", "/ws/p/a\n\n/ws/p/b\n");
+        assert_eq!(
+            input.listed_paths().expect("listed"),
+            [PathBuf::from("/ws/p/a"), PathBuf::from("/ws/p/b")]
+        );
+        let mut support = make_input("tool", "//p:t", &[]);
+        support.list_path = None;
+        let err = format!("{:#}", support.listed_paths().unwrap_err());
+        assert!(err.contains("support inputs have no list file"), "{err}");
+    }
+
+    /// `single_dep_file` finds the Dep input of its origin only, and the one
+    /// file is all it accepts: none or several are refused naming the
+    /// producer and the count.
+    #[test]
+    fn single_dep_file_accepts_exactly_one_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut support = listed_input(dir.path(), "src", "//p:support", "/ws/p/s\n");
+        support.input.artifact.r#type = inputartifact::Type::Support;
+        let one = listed_input(dir.path(), "one", "//p:one", "/ws/p/one\n");
+        let none = listed_input(dir.path(), "none", "//p:none", "\n");
+        let many = listed_input(
+            dir.path(),
+            "many",
+            "//p:many",
+            "/ws/p/x\n/ws/p/y\n/ws/p/z\n",
+        );
+        let inputs = [support, one, none, many];
+
+        let file = single_dep_file(&inputs, "one").expect("one").single_file();
+        assert_eq!(file.expect("single"), PathBuf::from("/ws/p/one"));
+
+        let err = format!("{:#}", single_dep_file(&inputs, "src").unwrap_err());
+        assert_eq!(err, "no dep input \"src\" was staged in the sandbox");
+
+        let err = format!(
+            "{:#}",
+            single_dep_file(&inputs, "none")
+                .unwrap()
+                .single_file()
+                .unwrap_err()
+        );
+        assert!(
+            err.starts_with("//p:none must produce exactly one file, but it produced none"),
+            "{err}"
+        );
+
+        let err = format!(
+            "{:#}",
+            single_dep_file(&inputs, "many")
+                .unwrap()
+                .single_file()
+                .unwrap_err()
+        );
+        assert!(
+            err.starts_with(
+                "//p:many must produce exactly one file, but it produced 3 (\"/ws/p/x\" and 2 more)"
+            ),
+            "{err}"
+        );
+    }
+
+    /// `${src:}` keeps its own words over the shared list reading: none or
+    /// several files say how to name one, the several sorted.
+    #[test]
+    fn staged_path_needs_exactly_one_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inputs = [
+            listed_input(dir.path(), "one", "//p:one", "/ws/p/one\n"),
+            listed_input(dir.path(), "none", "//p:none", ""),
+            listed_input(dir.path(), "many", "//p:many", "/ws/p/b\n/ws/p/a\n"),
+        ];
+        assert_eq!(staged_path(&inputs, "one", ":one").unwrap(), "/ws/p/one");
+        let err = format!("{:#}", staged_path(&inputs, "none", ":none").unwrap_err());
+        assert!(err.starts_with("`${src::none}` staged no files"), "{err}");
+        let err = format!("{:#}", staged_path(&inputs, "many", ":many").unwrap_err());
+        assert!(
+            err.starts_with("`${src::many}` staged 2 files (/ws/p/a, /ws/p/b)"),
+            "{err}"
+        );
+        let err = format!("{:#}", staged_path(&inputs, "gone", ":gone").unwrap_err());
+        assert!(err.contains("was not staged"), "{err}");
     }
 }
 

@@ -9,7 +9,7 @@
 //!
 //! Field/value types implement [`FromSpecValue`] in one of four ways:
 //!   * the primitive + container impls below (`String`, `bool`, `u32`,
-//!     `Vec<String>`, the two `HashMap` shapes) — several are themselves unions
+//!     `NonZeroU64`, `Vec<String>`, the two `HashMap` shapes) — several are themselves unions
 //!     (e.g. `string | list[string]`), reusing `hcore::htvalue::parse_*`;
 //!   * `#[derive(SpecStruct)]` — a nested object with well-known keys
 //!     (`map[...]`);
@@ -309,6 +309,25 @@ impl FromSpecValue for u32 {
                 u32::MAX
             )
         })
+    }
+
+    fn spec_param_type() -> ParamType {
+        ParamType::Int
+    }
+}
+
+/// A count that must be at least one (a size or entry limit).
+impl FromSpecValue for std::num::NonZeroU64 {
+    fn from_spec_value(v: &Value) -> anyhow::Result<Self> {
+        let n = match v {
+            Value::Uint(u) => i128::from(*u),
+            Value::Int(i) => i128::from(*i),
+            _ => anyhow::bail!("invalid: expected int, got: {:?}", v),
+        };
+        u64::try_from(n)
+            .ok()
+            .and_then(Self::new)
+            .ok_or_else(|| anyhow::anyhow!("invalid: expected a positive integer, got: {n}"))
     }
 
     fn spec_param_type() -> ParamType {
@@ -784,6 +803,32 @@ mod tests {
         assert_eq!(
             format!("{err:#}"),
             "invalid: expected a non-negative integer of at most 4294967295, got: -1"
+        );
+    }
+
+    /// A `NonZeroU64` takes any positive int, either sign of storage, and
+    /// refuses zero and negatives in a BUILD author's words.
+    #[test]
+    fn a_non_zero_u64_is_a_positive_integer() {
+        let ok = |v| std::num::NonZeroU64::from_spec_value(&v).unwrap().get();
+        assert_eq!(ok(Value::Int(1)), 1);
+        assert_eq!(ok(Value::Int(i64::MAX)), i64::MAX.unsigned_abs());
+        assert_eq!(ok(Value::Uint(u64::MAX)), u64::MAX);
+        for (v, shown) in [
+            (Value::Int(0), "0"),
+            (Value::Uint(0), "0"),
+            (Value::Int(-3), "-3"),
+        ] {
+            let err = std::num::NonZeroU64::from_spec_value(&v).unwrap_err();
+            assert_eq!(
+                format!("{err:#}"),
+                format!("invalid: expected a positive integer, got: {shown}")
+            );
+        }
+        let err = std::num::NonZeroU64::from_spec_value(&Value::String("1".into())).unwrap_err();
+        assert!(
+            format!("{err:#}").starts_with("invalid: expected int, got:"),
+            "{err:#}"
         );
     }
 

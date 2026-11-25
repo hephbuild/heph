@@ -1,0 +1,25 @@
+[package]
+name = "plugin-archive"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+hcore = { package = "core", path = "../core" }
+hplugin = { package = "plugin", path = "../plugin" }
+hdriver-support = { package = "driver-support", path = "../driver-support" }
+# The hardened unpacker `extract` runs and the reproducible writer `create`
+# runs.
+harchive = { package = "archive", path = "../archive" }
+anyhow = "1.0.104"
+async-trait = "0.1.92"
+serde = { version = "1", features = ["derive"] }
+xxhash-rust = { version = "0.8.21", features = ["xxh3", "std"] }
+
+[dev-dependencies]
+hmodel = { package = "model", path = "../model" }
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "macros"] }

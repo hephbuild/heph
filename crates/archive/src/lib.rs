@@ -104,6 +104,10 @@ impl Format {
     /// The format a file name's suffix implies, matched case-insensitively
     /// (`TOOL.TGZ` is a `tar.gz`). `None` when no suffix matches — the suffix
     /// must end the name, so `x.tar.gz.sha256` is not an archive.
+    ///
+    /// `archive.extract` keys an inferred format by these rules: a change to
+    /// what a name infers bumps its `INFERENCE_VERSION`
+    /// (`crates/plugin-archive/src/extract.rs`).
     pub fn infer(file_name: &str) -> Option<Self> {
         let lower = file_name.to_ascii_lowercase();
         Self::ALL.into_iter().find(|f| {
@@ -123,6 +127,10 @@ impl Format {
     /// `ustar` at offset 257. `head` is the first [`Format::SNIFF_LEN`] bytes
     /// or the whole file when it is shorter. A gzip or zstd stream is taken
     /// for a compressed tar: those are the only compressed formats there are.
+    ///
+    /// `archive.extract` keys an inferred format by these rules: a change to
+    /// what bytes sniff as bumps its `INFERENCE_VERSION`
+    /// (`crates/plugin-archive/src/extract.rs`).
     pub fn sniff(head: &[u8]) -> Option<Self> {
         if head.starts_with(&[0x1f, 0x8b]) {
             Some(Self::TarGz)

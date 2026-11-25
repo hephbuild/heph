@@ -2762,6 +2762,7 @@ dependencies = [
  "model",
  "object_store",
  "plugin",
+ "plugin-archive",
  "plugin-buildfile",
  "plugin-exec",
  "plugin-http",
@@ -5152,6 +5153,24 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "tracing",
+]
+
+[[package]]
+name = "plugin-archive"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "archive",
+ "async-trait",
+ "core",
+ "driver-support",
+ "model",
+ "plugin",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "xxhash-rust",
 ]
 
 [[package]]

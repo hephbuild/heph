@@ -243,6 +243,21 @@ Read `docs/TEMPLATE.md` before touching it. The one thing to know going in:
 `vars` is hashed from a `BTreeMap` because it arrives as a `HashMap`, and
 hashing it in iteration order would move the def hash on every run.
 
+### Archives
+
+The builtin `archive` plugin (`crates/plugin-archive`, over `crates/archive`)
+has two in-process drivers: `archive.extract` unpacks one archive file into a
+directory, `archive.create` packs `deps`' outputs into one archive file. The
+`tar` coreutil writes through the same writer as `archive.create`.
+
+Read `docs/ARCHIVE.md` before touching it. The one thing to know going in:
+`archive.create`'s bytes must be a function of the deps' content and the def
+hash alone — it reads no environment (not even `SOURCE_DATE_EPOCH`) and
+stamps mtime 0 — and the unpacker treats every archive as hostile, so each
+unpacking rule (no `..`/absolute paths, links resolved inside the output,
+normalized modes, duplicates refused, bounded output) is a security property
+with a unit test, not a nicety.
+
 ### GitHub release assets
 
 `heph.gh.release_asset(...)` (`crates/plugin-gh/src/release.rs`) declares an

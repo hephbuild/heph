@@ -341,6 +341,10 @@ flags anyone has to remember:
 There is deliberately no flag to turn any of that off. A recipe that wants a
 non-reproducible archive is a recipe with a bug.
 
+`tar -c` writes through `crates/archive`'s writer, the one the
+`archive.create` driver uses ([ARCHIVE.md](ARCHIVE.md)): given the same mtime,
+the two give the same bytes.
+
 Compression is detected from the magic bytes rather than the file name, so a
 `.tar` that is actually gzipped still extracts instead of failing confusingly.
 
