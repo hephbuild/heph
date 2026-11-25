@@ -948,3 +948,125 @@ async fn driver_kwargs_reach_no_target_def() {
         assert_eq!(hash, &first.2, "{label}: def hash, against {}", first.0);
     }
 }
+
+/// A record declared in one package types the packages that load it (the
+/// declared-types spec): a field the record does not have fails the loader's
+/// lint check, naming where the record was declared, and passes once fixed.
+/// A field renamed in the library fails the loader again, at lint time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lint_types_loaded_record() {
+    let loader = |field: &str| {
+        format!(
+            "load(\"//lib/defs.BUILD\", \"Lib\")\n\ndef use(l: Lib) -> str:\n    return l.{field}\n"
+        )
+    };
+    let ws = Ws::new(
+        &[
+            ("lib/BUILD", ""),
+            ("lib/defs.BUILD", "Lib = record(name = str)\n"),
+            ("app/BUILD", &loader("nme")),
+        ],
+        "",
+    );
+    let addr = "//app:build-lint-check";
+    assert_fails(&run_addr(&ws, addr).await, addr);
+    assert_eq!(
+        failure_log(&ws, addr).trim_end(),
+        "app/BUILD:4:14: type-error: The attribute `nme` is not available on the type `Lib` \
+         (Lib declared at lib/defs.BUILD:1)\n1 finding in //app"
+    );
+
+    ws.write("app/BUILD", &loader("name"));
+    assert_passes(&run_addr(&ws, addr).await, addr);
+
+    ws.write("lib/defs.BUILD", "Lib = record(title = str)\n");
+    assert_fails(&run_addr(&ws, addr).await, addr);
+    assert!(
+        failure_log(&ws, addr).contains("The attribute `name` is not available on the type `Lib`"),
+        "{}",
+        failure_log(&ws, addr)
+    );
+    assert_passes(
+        &run_addr(&ws, "//lib:build-lint-check").await,
+        "//lib:build-lint-check",
+    );
+}
+
+/// The repository's own BUILD files stay clean under the checker (I6 of the
+/// declared-types spec): every BUILD file under `example/` and the Go e2e
+/// fixtures (`crates/plugingo-e2e/testdata`), and the bench corpus's
+/// `go/BUILD`, linted in a workspace that holds them at their own paths.
+/// A new finding the checker adds there is either a bug in the BUILD file or
+/// one in the checker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repo_build_files_stay_clean() {
+    /// Every BUILD file under `dir`, by path relative to `root`.
+    fn build_files(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<String>) {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()))
+            .map(|e| e.expect("dir entry").path())
+            .collect();
+        entries.sort();
+        for path in entries {
+            if path.is_dir() {
+                build_files(root, &path, out);
+            } else if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n == "BUILD" || n.ends_with(".BUILD"))
+            {
+                let rel = path.strip_prefix(root).expect("under the repo root");
+                out.push(rel.to_str().expect("utf-8").to_owned());
+            }
+        }
+    }
+
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut files = Vec::new();
+    for dir in ["example", "crates/plugingo-e2e/testdata"] {
+        build_files(&repo, &repo.join(dir), &mut files);
+    }
+    assert!(files.len() >= 20, "the repo's BUILD files: {files:?}");
+    let mut contents: Vec<(String, String)> = files
+        .iter()
+        .map(|rel| {
+            let content = std::fs::read_to_string(repo.join(rel)).expect("read a BUILD file");
+            (rel.clone(), content)
+        })
+        .collect();
+    // Written to `<corpus>/go/BUILD` by `heph-bench corpus`.
+    contents.push((
+        "bench-corpus/go/BUILD".to_owned(),
+        std::fs::read_to_string(repo.join("crates/bench-corpus/src/go_variant.BUILD"))
+            .expect("read the corpus BUILD"),
+    ));
+    let borrowed: Vec<(&str, &str)> = contents
+        .iter()
+        .map(|(p, c)| (p.as_str(), c.as_str()))
+        .collect();
+    let ws = Ws::new(&borrowed, "");
+
+    let packages: BTreeSet<String> = contents
+        .iter()
+        .map(|(p, _)| {
+            let dir = std::path::Path::new(p).parent().expect("in a package");
+            format!("//{}:build-lint-check", dir.display())
+        })
+        .collect();
+    let r = run(&ws, &Matcher::Label("lint-check".to_string())).await;
+    let failed: Vec<String> = r
+        .failed
+        .keys()
+        .map(|addr| format!("{addr}:\n{}", failure_log(&ws, addr)))
+        .collect();
+    assert!(failed.is_empty(), "lint findings:\n{}", failed.join("\n"));
+    let checked: BTreeSet<String> =
+        r.ok.iter()
+            .filter(|a| a.ends_with(":build-lint-check"))
+            .cloned()
+            .collect();
+    assert_eq!(
+        checked, packages,
+        "every package with a BUILD file is checked"
+    );
+}
