@@ -4,6 +4,7 @@
 use super::mach::{MachCpu, MachVm, mach_busy, used_mach};
 use super::procfs::*;
 use super::*;
+use crate::tui::session::recorder;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -82,10 +83,25 @@ fn sampler_reads_every_source() {
             x = std::hint::black_box(x.wrapping_add(1));
         }
     };
-    spin(Duration::from_millis(300));
-    let first = core.sample(Instant::now());
-    assert!(first.failed.is_empty(), "{:?}", first.failed);
-    let busy = first.cpu_busy.expect("busy");
+    // The host's CPU ticks can stand still over one short window (macOS
+    // publishes HOST_CPU_LOAD_INFO lazily), and a window with no tick has no
+    // busy figure by design. Sample again until the ticks move, for at most
+    // ATTEMPTS windows; busy must still show up.
+    const ATTEMPTS: u32 = 10;
+    let mut attempt = 0;
+    let (first, busy) = loop {
+        attempt += 1;
+        spin(Duration::from_millis(300));
+        let sample = core.sample(Instant::now());
+        assert!(sample.failed.is_empty(), "{:?}", sample.failed);
+        if let Some(busy) = sample.cpu_busy {
+            break (sample, busy);
+        }
+        assert!(
+            attempt < ATTEMPTS,
+            "no busy figure in {ATTEMPTS} windows of 300 ms: the host's CPU ticks never moved"
+        );
+    };
     assert!((0.0..=1.0).contains(&busy), "busy {busy}");
     let used = first.memory_used.expect("used");
     assert!(used > 0 && used < ram, "used {used} of {ram}");
@@ -375,7 +391,7 @@ fn sampler_reads_cgroup_quota() {
 
 /// Sources a test scripts: busy 0.5 each tick, and faults on demand.
 #[derive(Default, Clone)]
-struct Fake {
+pub(crate) struct Fake {
     calls: Arc<[AtomicU32; 4]>,
     /// Fail the memory source from this call on (1-based).
     fail_memory_at: Option<u32>,
@@ -388,9 +404,49 @@ impl Fake {
     fn call(&self, source: Source) -> u32 {
         self.calls[source.index()].fetch_add(1, Ordering::SeqCst) + 1
     }
+    /// Sources whose memory source fails from its `at`th call on (1-based).
+    pub(crate) fn failing_memory_at(at: u32) -> Self {
+        Self {
+            fail_memory_at: Some(at),
+            ..Self::default()
+        }
+    }
     fn calls(&self, source: Source) -> u32 {
         self.calls[source.index()].load(Ordering::SeqCst)
     }
+}
+
+/// A recorder's sampler for the recorder's own tests: `fake`'s sources
+/// under a clock that ticks at once, `waits` times, so the sampler sends its
+/// info and `waits` samples (one 1 s interval each) and exits. With a
+/// `gate`, its sources are built, and so anything read, only once the gate
+/// opens. The receiver hears once per sampler started, after its last
+/// sample is sent.
+pub(crate) fn fake_sampler(
+    fake: Fake,
+    waits: u32,
+    gate: Option<recorder::Gate>,
+) -> (recorder::SpawnSampler, Receiver<()>) {
+    let (exhausted, sent) = std::sync::mpsc::sync_channel(8);
+    let spawn = recorder::SpawnSampler(Arc::new(move |latched| {
+        let (fake, gate) = (fake.clone(), gate.clone());
+        let clock = FakeClock {
+            exhausted: Some(exhausted.clone()),
+            ..FakeClock::new(Instant::now(), &[], Some(waits))
+        };
+        Sampler::spawn_with(
+            move || {
+                if let Some(gate) = &gate {
+                    recorder::wait_for(gate);
+                }
+                fake
+            },
+            clock,
+            TICK,
+            latched,
+        )
+    }));
+    (spawn, sent)
 }
 
 impl Sources for Fake {
@@ -442,11 +498,13 @@ impl Sources for Fake {
 }
 
 /// Virtual time: each wait lands on its deadline plus the next scripted
-/// stall, and the wait after `waits` returns `Stop`.
+/// stall, and the wait after `waits` returns `Stop` (signalling `exhausted`,
+/// when set: every sample the loop will send is sent).
 struct FakeClock {
     now: Mutex<Instant>,
     stalls: Mutex<VecDeque<Duration>>,
     waits: Mutex<Option<u32>>,
+    exhausted: Option<std::sync::mpsc::SyncSender<()>>,
 }
 
 impl FakeClock {
@@ -455,6 +513,7 @@ impl FakeClock {
             now: Mutex::new(start),
             stalls: Mutex::new(stalls.iter().copied().collect()),
             waits: Mutex::new(waits),
+            exhausted: None,
         }
     }
 }
@@ -470,6 +529,12 @@ impl Clock for FakeClock {
         let mut waits = self.waits.lock().unwrap();
         if let Some(left) = waits.as_mut() {
             if *left == 0 {
+                if let Some(exhausted) = &self.exhausted {
+                    // Full: the test already knows. Disconnected: it is gone.
+                    match exhausted.try_send(()) {
+                        Ok(()) | Err(_) => {}
+                    }
+                }
                 return Wake::Stop;
             }
             *left -= 1;
