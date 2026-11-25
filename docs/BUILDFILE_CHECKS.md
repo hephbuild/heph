@@ -107,10 +107,14 @@ app/BUILD:4:14: type-error: The attribute `nme` is not available on the type `Li
 ```
 
 A message about several declared types lists them in the order it mentions
-them, separated by `; `, and past three ends with `and N more`. An alias
+them, separated by `; `, and past three ends with `and N more`. A
+declaration is listed once, however often the message mentions it; two
+declarations on the same line of the same file count as one. An alias
 never gets a site, since it names no new type, and neither does a builtin
-type. The site is only in the line's text: findings are log lines, so there
-is no `declared_at` field to read it from.
+type. A finding names a declaration only when the checker's error carries
+the type itself, so some errors about a record have no site, for example
+``Type `record` is not callable``. The site is only in the line's text:
+findings are log lines, so there is no `declared_at` field to read it from.
 
 A record or enum value cannot be passed whole to `target()` or
 `provider_state()`, whose arguments hold only None, str, bool, int, float,
@@ -452,6 +456,13 @@ reading only: the key stays optional in the type.
   a loaded alias, and an attribute of a module-level call's result:
   `srcs = glob("*.c")`, then `srcs.foo` in a def, is now an error, since
   `glob` returns a `str`. See [Declared types](#declared-types).
+- A `type-error:` about a record or enum now ends with where it was
+  declared, such as `(Lib declared at lib/defs.star:3)`. The
+  `path:line:col: type-error:` prefix and starlark's message come first,
+  unchanged, so a script that matches a finding by prefix or by a substring
+  of the message keeps working; one that compares the whole line does not.
+- No setting silences a single finding: the typechecker has no per-rule
+  switch. A finding new in an upgrade is fixed in the code.
 - A field renamed in a library now fails every package that loads it and
   uses the old name, at lint time rather than when the def runs.
 - Builtins' declared return types, and the starlark fork's revision, now move
