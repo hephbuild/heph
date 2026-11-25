@@ -509,7 +509,7 @@ fn samples(readings: &[Reading]) -> Vec<Sample> {
         .iter()
         .filter_map(|r| match r {
             Reading::Sample(s) => Some(*s),
-            Reading::Info(_) => None,
+            Reading::Info { .. } => None,
         })
         .collect()
 }
@@ -522,7 +522,7 @@ fn sampler_ticks_at_fixed_rate() {
     // The third wait wakes 2.5 s late: 3.5 s after the sample before it.
     let clock = FakeClock::new(t0, &[ms(0), ms(0), ms(2500)], Some(5));
     let readings = run_to_end(Fake::default(), &clock, 16);
-    assert!(matches!(readings.first(), Some(Reading::Info(_))));
+    assert!(matches!(readings.first(), Some(Reading::Info { .. })));
     let got = samples(&readings);
     let at: Vec<Duration> = got.iter().map(|x| x.at.duration_since(t0)).collect();
     let interval: Vec<Duration> = got.iter().map(|x| x.interval).collect();
@@ -548,7 +548,7 @@ fn sampler_stops_without_waiting() {
     // End returns with no tick elapsed: the stop ends the wait.
     let (sampler, readings) =
         Sampler::spawn_with(Fake::default, StillClock(Instant::now()), TICK, || false).unwrap();
-    assert!(matches!(readings.recv().unwrap(), Reading::Info(_)));
+    assert!(matches!(readings.recv().unwrap(), Reading::Info { .. }));
     let asked = Instant::now();
     assert_eq!(sampler.stop(STOP_WAIT), SamplerExit::Exited);
     assert!(asked.elapsed() < STOP_WAIT * 5);
@@ -577,7 +577,7 @@ fn sampler_stops_without_waiting() {
     // Disconnected: the owner dropped without stopping it.
     let (sampler, readings) =
         Sampler::spawn_with(Fake::default, StillClock(Instant::now()), TICK, || false).unwrap();
-    assert!(matches!(readings.recv().unwrap(), Reading::Info(_)));
+    assert!(matches!(readings.recv().unwrap(), Reading::Info { .. }));
     drop(sampler);
     assert_eq!(
         readings.recv_timeout(Duration::from_secs(5)),
@@ -592,7 +592,7 @@ fn sampler_stops_without_waiting() {
         flag.load(Ordering::SeqCst)
     })
     .unwrap();
-    assert!(matches!(readings.recv().unwrap(), Reading::Info(_)));
+    assert!(matches!(readings.recv().unwrap(), Reading::Info { .. }));
     assert!(matches!(readings.recv().unwrap(), Reading::Sample(_)));
     latched.store(true, Ordering::SeqCst);
     // Drain what was queued before the latch; then the channel disconnects.

@@ -33,6 +33,8 @@ use std::io;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::time::{Duration, Instant};
 
+use super::format::{MachineInfoRecord, MachineSampleRecord, MachineSourceFailure};
+
 #[cfg(any(target_os = "macos", test))]
 mod mach;
 #[cfg(any(target_os = "linux", test))]
@@ -235,13 +237,92 @@ pub struct Sample {
 /// [`Sample`] a tick.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Reading {
-    Info(MachineInfo),
+    /// The start-time figures, read `at`: stamped as a sample is.
+    Info {
+        info: MachineInfo,
+        at: Instant,
+    },
     Sample(Sample),
 }
 
 /// The sampler's own preallocated channel.
 pub fn channel() -> (SyncSender<Reading>, Receiver<Reading>) {
     mpsc::sync_channel(CHANNEL_CAP)
+}
+
+/// The `MachineInfo` record of `info`, read at `time_unix_us`. Runs on the
+/// recorder's thread, not the sampler's: it may allocate.
+pub(crate) fn info_record(info: &MachineInfo, time_unix_us: u64) -> MachineInfoRecord {
+    use super::derive::machine;
+    let mut failed = Vec::new();
+    let mut ok = |metric: &'static str, e: Option<&SourceError>| {
+        if let Some(e) = e {
+            failed.push(MachineSourceFailure {
+                source: metric.to_owned(),
+                error: e.to_string(),
+            });
+        }
+    };
+    ok(machine::CPU_COUNT, info.cpu_count.as_ref().err());
+    ok(machine::CPU_LIMIT, info.cpu_limit.as_ref().err());
+    ok(machine::MEMORY_LIMIT, info.memory_limit.as_ref().err());
+    let cpu_limit = info.cpu_limit.as_ref().ok();
+    MachineInfoRecord {
+        time_unix_us,
+        cpu_count: info.cpu_count.ok(),
+        cpu_limit_ucpus: cpu_limit.map(|l| ucpus(l.cpus)),
+        cpu_limit_source: cpu_limit.map(|l| {
+            match l.from {
+                CpuLimitFrom::Quota => "quota",
+                CpuLimitFrom::Host => "host",
+            }
+            .to_owned()
+        }),
+        memory_limit_bytes: info.memory_limit.ok(),
+        memory_limit_source: info.memory_limit.is_ok().then(|| "host".to_owned()),
+        failed,
+    }
+}
+
+/// A CPU amount in micro-CPUs, rounded; a negative or non-finite one is 0.
+fn ucpus(cpus: f64) -> u64 {
+    let v = (cpus * hcore::capacity::MICROS_PER_CPU as f64).round();
+    if v.is_finite() && v > 0.0 {
+        #[expect(clippy::cast_sign_loss, reason = "positive, and `as` saturates")]
+        let n = v as u64;
+        n
+    } else {
+        0
+    }
+}
+
+/// The `MachineSample` record of `sample`, taken at `time_unix_us`. Runs on
+/// the recorder's thread.
+pub(crate) fn sample_record(sample: &Sample, time_unix_us: u64) -> MachineSampleRecord {
+    MachineSampleRecord {
+        time_unix_us,
+        interval_us: u64::try_from(sample.interval.as_micros()).unwrap_or(u64::MAX),
+        cpu_busy_ppm: sample.cpu_busy.map(|b| {
+            let v = (b.clamp(0.0, 1.0) * f64::from(super::derive::PPM)).round();
+            #[expect(clippy::cast_sign_loss, reason = "clamped to 0..=10^6")]
+            let ppm = v as u32;
+            ppm
+        }),
+        memory_used_bytes: sample.memory_used,
+        process_cpu_us: sample
+            .process_cpu
+            .map(|d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX)),
+        process_resident_bytes: sample.process_resident,
+        failed: sample
+            .failed
+            .iter()
+            .map(|(source, e)| MachineSourceFailure {
+                source: source.metric().to_owned(),
+                error: e.to_string(),
+            })
+            .collect(),
+        dropped: sample.dropped,
+    }
 }
 
 /// `heph.machine.cpu.limit`: the quota when it is tighter than the count,
@@ -474,7 +555,7 @@ pub(crate) fn run<S: Sources>(
     }
     let start = clock.now();
     let (mut core, info) = Core::start(sources, start);
-    if let Err(TrySendError::Disconnected(_)) = out.try_send(Reading::Info(info)) {
+    if let Err(TrySendError::Disconnected(_)) = out.try_send(Reading::Info { info, at: start }) {
         return;
     }
     let Some(mut next) = start.checked_add(tick) else {
@@ -542,6 +623,8 @@ impl Sampler {
                 let _done = done_tx;
                 run(sources(), &clock, &stop_rx, &out, tick, latched);
             })?;
+        #[cfg(any(test, feature = "test-support"))]
+        SPAWNED.with(|n| n.set(n.get() + 1));
         Ok((Self { stop, done }, readings))
     }
 
@@ -557,6 +640,20 @@ impl Sampler {
             Ok(()) | Err(RecvTimeoutError::Disconnected) => SamplerExit::Exited,
         }
     }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static SPAWNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many samplers were started from the calling thread: a recorder starts
+/// its sampler on the thread that opens the session, so a test tells a run
+/// that samples from one that does not. Per thread, so tests running in
+/// parallel in one binary do not count each other's.
+#[cfg(any(test, feature = "test-support"))]
+pub fn spawned_on_this_thread() -> usize {
+    SPAWNED.with(std::cell::Cell::get)
 }
 
 /// The sampler loop on the calling thread, with the host's sources, the

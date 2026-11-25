@@ -606,8 +606,9 @@ fn seal_leaves_one_self_contained_file() {
     assert!(!opened.is_copy() && !opened.live, "{opened:?}");
     assert!(sealed_column(&opened.conn));
     drop(opened);
-    let (records, skipped) = read_records(&dir);
+    let (mut records, skipped) = read_records(&dir);
     assert_eq!(skipped, 0);
+    records.retain(|r| !tests::is_machine(r));
     assert_eq!(records.len(), events().len() + 1, "every event and End");
     assert!(matches!(
         records.last().and_then(|r| r.session.as_ref()),
@@ -622,7 +623,11 @@ fn seal_leaves_one_self_contained_file() {
     std::fs::copy(dir.join(store::FILE), &copy).expect("copy");
     let conn = store::open_sealed(&copy).expect("open the copy");
     let n: i64 = conn
-        .query_row("SELECT count(*) FROM records", [], |r| r.get(0))
+        .query_row(
+            "SELECT count(*) FROM records WHERE kind NOT IN ('MachineInfo', 'MachineSample')",
+            [],
+            |r| r.get(0),
+        )
         .expect("count");
     assert_eq!(usize::try_from(n).expect("count"), records.len());
     assert!(sealed_column(&conn));

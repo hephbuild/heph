@@ -105,6 +105,15 @@ fn big_event() -> BuildEvent {
     }
 }
 
+/// A record the machine sampler wrote: a test that counts what the build
+/// sent leaves these out, since how many land depends on the clock.
+pub(super) fn is_machine(record: &SessionRecord) -> bool {
+    matches!(
+        record.session,
+        Some(SessionRecordKind::MachineInfo(_) | SessionRecordKind::MachineSample(_))
+    )
+}
+
 /// The local recording in `dir`, opened as a reader would (the sessions root
 /// is its parent).
 pub(super) fn open(dir: &Path) -> store::Opened {
@@ -1622,7 +1631,7 @@ async fn file_source_follows_until_end() {
     session.finish(Some(3), false);
     let ended = loop {
         match stream.next().await.expect("item").expect("ok") {
-            SessionItem::Record(_) => records += 1,
+            SessionItem::Record(r) => records += usize::from(!is_machine(&r)),
             SessionItem::CaughtUp { skipped } => {
                 assert_eq!(skipped, 0);
                 caught_up = true;
@@ -1653,7 +1662,7 @@ async fn until_caught_up(
     let mut records = 0;
     loop {
         match stream.next().await.expect("item").expect("ok") {
-            SessionItem::Record(_) => records += 1,
+            SessionItem::Record(r) => records += usize::from(!is_machine(&r)),
             SessionItem::CaughtUp { skipped } => {
                 assert_eq!(skipped, 0);
                 return records;
@@ -1698,7 +1707,7 @@ async fn follow_sees_an_end_written_mid_follow() {
             .expect("item")
             .expect("ok");
         match item {
-            SessionItem::Record(_) => records += 1,
+            SessionItem::Record(r) => records += usize::from(!is_machine(&r)),
             SessionItem::CaughtUp { .. } => panic!("caught up twice"),
             SessionItem::Ended { exit, lost } => break (exit, lost),
         }
