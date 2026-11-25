@@ -155,7 +155,8 @@ pub struct ListArgs {
     /// hit, failed, cancelled).
     #[arg(long, value_name = "ADDR")]
     pub addr: Option<String>,
-    /// Only the sessions that failed.
+    /// Only the sessions that failed. With `--addr`, only the sessions in
+    /// which that target failed, whatever the session's own exit.
     #[arg(long)]
     pub failed: bool,
     /// Only the sessions run by a human, an agent or CI.

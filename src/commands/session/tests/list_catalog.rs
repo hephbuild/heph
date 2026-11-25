@@ -484,3 +484,63 @@ async fn list_window_adversarial_inputs() {
     assert!(format!("{e:#}").contains("earlier than --since"), "{e:#}");
     assert_eq!(exit_code(&e), Some(125));
 }
+
+/// `--failed` with `--addr` keeps the sessions in which that target failed
+/// ("when did this target break"), whatever else failed in them; without
+/// `--addr` it keeps the sessions that failed.
+#[tokio::test]
+async fn list_failed_with_addr_is_the_target_failing() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    let now = hcore::events::now_unix_ms();
+    let hour = 60 * 60 * 1000;
+    // //p:t ran fine; //p:other failed, so the session exited 1.
+    let other_broke = {
+        let id = SessionId::new(now - 3 * hour, 7);
+        let start = id.started_unix_ms();
+        let mut records = resolved(ADDR, start, true, None);
+        records.extend(resolved("//p:other", start + 100, true, Some("boom")));
+        write_ended(
+            root,
+            &meta(id, 100, &["heph", "run", ADDR, "//p:other"]),
+            &records,
+            &ended(Some(1), start + 1_000),
+        );
+        id
+    };
+    let t_broke = session(root, now, 2 * hour, "run", ADDR, Did::Failed, &HUMAN);
+    let t_ran = session(root, now, hour, "run", ADDR, Did::Ran, &HUMAN);
+
+    let ids = |f: list::ListFilter| async move {
+        let (json, _) = list_at(root, now, &f, true).await;
+        json_ids(&serde_json::from_str(&json).expect("json"))
+    };
+    assert_eq!(
+        ids(list::ListFilter {
+            addr: Some(ADDR.to_owned()),
+            ..since(7, now)
+        })
+        .await,
+        [t_ran.encode(), t_broke.encode(), other_broke.encode()],
+        "every session that resolved //p:t"
+    );
+    assert_eq!(
+        ids(list::ListFilter {
+            addr: Some(ADDR.to_owned()),
+            failed: true,
+            ..since(7, now)
+        })
+        .await,
+        [t_broke.encode()],
+        "only the session in which //p:t failed"
+    );
+    assert_eq!(
+        ids(list::ListFilter {
+            failed: true,
+            ..since(7, now)
+        })
+        .await,
+        [t_broke.encode(), other_broke.encode()],
+        "without --addr, every session that failed"
+    );
+}

@@ -32,7 +32,8 @@ pub(crate) struct ListFilter {
     pub until_ms: Option<u64>,
     /// Only the sessions that resolved this target, with its outcome.
     pub addr: Option<String>,
-    /// Only the sessions that failed.
+    /// Only the sessions that failed; with `addr`, only those in which that
+    /// target failed.
     pub failed: bool,
     pub actor: Option<ActorKind>,
     /// The heph subcommand (`run`, `query`, ...).
@@ -433,8 +434,19 @@ fn keep(r: &Row<'_>, workspace: Workspace<'_>, filter: &ListFilter, opts: ViewOp
     if !in_workspace {
         return false;
     }
-    if filter.failed && r.state(opts) != SessionState::Failed {
-        return false;
+    if filter.failed {
+        // With `--addr`, the target failed in this session ("when did this
+        // target break"); without it, the session failed.
+        let failed = if filter.addr.is_some() {
+            r.cat
+                .and_then(|c| c.target.as_ref())
+                .is_some_and(|t| t.outcome == "failed")
+        } else {
+            r.state(opts) == SessionState::Failed
+        };
+        if !failed {
+            return false;
+        }
     }
     if let Some(kind) = filter.actor
         && r.cat.and_then(|c| c.actor_kind.as_deref()) != Some(kind.as_str())
