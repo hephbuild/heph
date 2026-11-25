@@ -127,10 +127,11 @@ async fn measure_latency(
 ) -> anyhow::Result<()> {
     let (engine, _shutdown) = bootstrap::new_engine(global, session)?;
     let set = engine.remote_caches();
-    let results = if set.is_empty() {
-        Vec::new()
-    } else {
+    // The snapshot tier is not measured: it is local disk, read first.
+    let results = if set.has_user_caches() {
         set.measure_latency().await
+    } else {
+        Vec::new()
     };
     if json.enabled() {
         return json.list_iter(

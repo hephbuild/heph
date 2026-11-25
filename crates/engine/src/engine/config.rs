@@ -151,6 +151,14 @@ pub struct Config {
     ///
     /// [`Engine::skip_dirs`]: crate::engine::Engine::skip_dirs
     pub cache_snapshot: Option<PathBuf>,
+    /// Whether `Engine::new` opens [`Self::cache_snapshot`]'s tier, reading it
+    /// first and reporting its state. On by default; off for the `snapshot`
+    /// command's own engine, which reads the dir directly.
+    pub snapshot_tier: bool,
+    /// The run is under CI (`CI` truthy), as the front end read it from its
+    /// environment: the engine never reads the variable. Turns on the
+    /// end-of-run reminder of a journal no snapshot has written yet.
+    pub ci: bool,
     /// Resource pools as written, each with its unit and capacity: the config
     /// file's `resources:`, with the run's overrides (`--resource`, `-j`,
     /// `HEPH_RESOURCE_<NAME>`) laid over it by the front end. A builtin absent
@@ -212,6 +220,8 @@ impl Config {
             keep_failed_sandboxes: false,
             record_working_set: false,
             cache_snapshot: None,
+            snapshot_tier: true,
+            ci: false,
             resources: BTreeMap::new(),
         }
     }
@@ -345,6 +355,9 @@ impl ConfigYamlExt for ConfigYaml {
                 snapshot_env,
                 self.cache_snapshot.as_ref(),
             ),
+            // Per engine and per run: the front end sets both.
+            snapshot_tier: defaults.snapshot_tier,
+            ci: defaults.ci,
             lock_backend: self
                 .lock
                 .and_then(|l| l.backend)

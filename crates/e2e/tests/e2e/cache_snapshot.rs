@@ -882,21 +882,78 @@ target(
     );
 }
 
-/// Diagnosability: each remote hit names its tier, so local, snapshot and
-/// bucket hits and misses fold into per-tier counts from the event stream
-/// (`--json` carries the same events), and the snapshot's hits are in the
-/// working set.
+/// Every `CacheSnapshotState` in `events`, as `(state, reason)`.
+fn snapshot_states(
+    events: &[BuildEvent],
+) -> Vec<(hcore::events::SnapshotTierState, Option<String>)> {
+    events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            BuildEventKind::CacheSnapshotState { state, reason, .. } => {
+                Some((*state, reason.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every `RemoteTierMiss` in `events`, as `(addr, tier, reason)`, the tier
+/// `"snapshot"` or a cache's name.
+fn tier_misses(events: &[BuildEvent]) -> Vec<(String, String, hcore::events::TierMissReason)> {
+    events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            BuildEventKind::RemoteTierMiss {
+                addr,
+                cache,
+                snapshot,
+                reason,
+            } => Some((
+                addr.clone(),
+                if *snapshot {
+                    "snapshot".to_owned()
+                } else {
+                    cache.clone()
+                },
+                *reason,
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Diagnosability: each remote hit names its tier and each tier passed over
+/// says why, so local, snapshot and bucket hits and misses fold into per-tier
+/// counts from the event stream (`--json` carries the same events); each
+/// request opens with the snapshot's state; and the snapshot's hits are in
+/// the working set.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn per_tier_hit_counts_are_reported() {
-    let f = Fixture::new(FOUR, &["//pkg:a", "//pkg:b", "//pkg:c"]).await;
-    // `c` only in the bucket; `d` nowhere.
+    use hcore::events::{SnapshotTierState, TierMissReason};
+    let f = Fixture::new(
+        r#"
+target(name = "a", driver = "bash", run = "echo a > $OUT", out = "a.txt")
+target(name = "b", driver = "bash", run = "echo b > $OUT", out = "b.txt")
+target(name = "c", driver = "bash", run = "echo c > $OUT", out = "c.txt")
+target(name = "d", driver = "bash", run = "echo d > $OUT", out = "d.txt")
+target(name = "e", driver = "bash", run = "echo e > $OUT", out = "e.txt")
+"#,
+        &["//pkg:a", "//pkg:b", "//pkg:c", "//pkg:e"],
+    )
+    .await;
+    // `b` in the snapshot under another `hashin` only; `c` only in the
+    // bucket; `e` in the snapshot without its output blob; `d` nowhere.
+    let stale = f.generation().join("pkg").join("b").join("0stale-hashin");
+    std::fs::rename(f.revision("b"), &stale).expect("move b to a stale hashin");
     std::fs::remove_dir_all(f.generation().join("pkg").join("c")).expect("drop c from the tier");
+    std::fs::remove_file(f.out_blob("e")).expect("evict e's blob");
     let e = f.engine(Bucket::ReadOnly, true);
-    // `a` from the snapshot, into the local cache.
-    run_one(&e, "//pkg:a").await;
 
+    // `a` from the snapshot, into the local cache, then from there.
     let mut events = Vec::new();
-    for a in ["//pkg:a", "//pkg:b", "//pkg:c", "//pkg:d"] {
+    for a in [
+        "//pkg:a", "//pkg:a", "//pkg:b", "//pkg:c", "//pkg:d", "//pkg:e",
+    ] {
         events.extend(run_one(&e, a).await.1);
     }
     let mut tiers = hcore::events::TierCounts::default();
@@ -910,8 +967,70 @@ async fn per_tier_hit_counts_are_reported() {
     );
     assert_eq!(
         tiers.remote,
-        std::collections::BTreeMap::from([("bucket".to_string(), 1)]),
+        std::collections::BTreeMap::from([("bucket".to_string(), 3)]),
         "{tiers:?}"
+    );
+    let mut misses = tier_misses(&events);
+    misses.sort();
+    assert_eq!(
+        misses,
+        vec![
+            (
+                "//pkg:b".to_owned(),
+                "snapshot".to_owned(),
+                TierMissReason::SnapshotOtherHashin
+            ),
+            (
+                "//pkg:c".to_owned(),
+                "snapshot".to_owned(),
+                TierMissReason::AddrAbsent
+            ),
+            (
+                "//pkg:d".to_owned(),
+                "bucket".to_owned(),
+                TierMissReason::RevisionAbsent
+            ),
+            (
+                "//pkg:d".to_owned(),
+                "snapshot".to_owned(),
+                TierMissReason::AddrAbsent
+            ),
+            (
+                "//pkg:e".to_owned(),
+                "snapshot".to_owned(),
+                TierMissReason::BlobMissingFellThrough
+            ),
+        ],
+        "{events:#?}"
+    );
+    // The run-end CI line, from the same fold.
+    assert_eq!(
+        tiers.line().as_deref(),
+        Some(
+            "cache tiers: local 1 hit 5 miss · snapshot 1 hit 4 miss \
+             (snapshot_other_hashin 1, addr_absent 2, blob_missing_fell_through 1) · \
+             bucket 3 hit 1 miss"
+        ),
+        "{tiers:?}"
+    );
+    // One state per request, each before the request's first tier event.
+    assert_eq!(
+        snapshot_states(&events),
+        vec![(SnapshotTierState::Serving, None); 6],
+        "{events:#?}"
+    );
+    let state = events
+        .iter()
+        .find_map(|ev| match &ev.kind {
+            BuildEventKind::CacheSnapshotState { .. } => {
+                hcore::events::snapshot_state_line(&ev.kind)
+            }
+            _ => None,
+        })
+        .expect("a state line");
+    assert!(
+        state.starts_with(&format!("snapshot: {}", f.dir().display())),
+        "a dir outside the workspace is shown whole: {state}"
     );
     let json: Vec<String> = events
         .iter()
@@ -936,6 +1055,87 @@ async fn per_tier_hit_counts_are_reported() {
             "{a} is in the working set whatever tier served it: {recorded:?}"
         );
     }
+
+    // A dir the restore never made, and a marker this heph cannot read, say
+    // so at the start of the request.
+    let absent = f.engine_at(
+        f.parent.path().join("never-restored"),
+        Bucket::Absent,
+        false,
+    );
+    let (_, events) = run_one(&absent, "//pkg:a").await;
+    assert_eq!(
+        snapshot_states(&events),
+        vec![(SnapshotTierState::Absent, None)]
+    );
+    drop(absent);
+    let newer = f.parent.path().join("newer");
+    std::fs::create_dir_all(newer.join("gen-x")).expect("mkdir newer");
+    std::fs::write(
+        newer.join("HEPH_SNAPSHOT"),
+        r#"{"format":9,"current":"gen-x"}"#,
+    )
+    .expect("write marker");
+    let (_, events) = run_one(&f.engine_at(newer, Bucket::Absent, false), "//pkg:a").await;
+    let states = snapshot_states(&events);
+    assert!(
+        matches!(
+            states.as_slice(),
+            [(SnapshotTierState::Unreadable, Some(reason))] if reason.contains("format 9")
+        ),
+        "{states:?}"
+    );
+}
+
+/// The CI reminder: a run under CI whose journal holds revisions says so
+/// once per engine, however many requests and reminders; outside CI never.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ci_reminds_of_an_unconsumed_journal() {
+    let f = Fixture::new(FOUR, &["//pkg:a"]).await;
+    let pending = |ci: bool| {
+        let f = &f;
+        async move {
+            let e = engine_with(Config {
+                record_working_set: true,
+                cache_snapshot: Some(f.dir()),
+                ci,
+                ..Config::for_tests(f.root.path())
+            });
+            let mut events = Vec::new();
+            for a in ["//pkg:a", "//pkg:b"] {
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                let rs = e.new_state_with_events(true, Some(tx));
+                let res = Arc::clone(&e)
+                    .result_addr(
+                        rs.clone(),
+                        &addr(a),
+                        OutputMatcher::All,
+                        &ResultOptions::default(),
+                    )
+                    .await
+                    .expect("build");
+                drop(res);
+                e.remind_unconsumed_journal(&rs);
+                drain(rs).await;
+                while let Ok(ev) = rx.try_recv() {
+                    events.push(ev);
+                }
+            }
+            events
+                .into_iter()
+                .filter_map(|ev| match ev.kind {
+                    BuildEventKind::SnapshotJournalPending { revisions } => Some(revisions),
+                    _ => None,
+                })
+                .collect::<Vec<u64>>()
+        }
+    };
+    assert_eq!(
+        pending(true).await,
+        vec![1],
+        "one reminder, after the first request recorded `a`"
+    );
+    assert_eq!(pending(false).await, Vec::<u64>::new(), "never outside CI");
 }
 
 /// I3: the per-tier rejections each move the lookup on to the bucket, or,

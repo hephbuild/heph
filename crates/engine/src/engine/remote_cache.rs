@@ -77,6 +77,7 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use chrono::Utc;
 use futures::future::join_all;
 use futures::stream::{self, StreamExt, TryStreamExt};
+use hcore::events::TierMissReason;
 use hcore::hasync::Cancellable;
 use hmodel::htaddr::Addr;
 use std::future::Future;
@@ -1212,6 +1213,34 @@ pub(crate) enum Need<'a> {
 struct Tried {
     tiers: Vec<usize>,
     damaged: bool,
+    /// Why each examined tier was passed over, collected only when `Some`:
+    /// the hit-decision walk asks for it, the others do not.
+    misses: Option<Vec<TierMiss>>,
+}
+
+impl Tried {
+    fn miss(&mut self, cache_idx: usize, reason: TierMissReason) {
+        if let Some(misses) = &mut self.misses {
+            misses.push(TierMiss { cache_idx, reason });
+        }
+    }
+}
+
+/// One tier a hit decision passed over, and why
+/// ([`RemoteCacheSet::tier_miss_event`] turns it into a
+/// [`RemoteTierMiss`](hcore::events::BuildEventKind::RemoteTierMiss)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TierMiss {
+    cache_idx: usize,
+    pub(crate) reason: TierMissReason,
+}
+
+/// What the hit decision found on the remote tiers: the revision and the
+/// manifest mirrored from it, when one served it, and every tier passed over
+/// on the way. A hit on the first tier allocates nothing for `misses`.
+pub(crate) struct RemoteProbe {
+    pub(crate) found: Option<(Manifest, RemoteRevision)>,
+    pub(crate) misses: Vec<TierMiss>,
 }
 
 /// What [`RemoteCacheSet::read_revision`] found on one cache.
@@ -1293,7 +1322,7 @@ impl RemoteRevision {
             .get_or_try_init(|| async {
                 let mut tried = Tried {
                     tiers: vec![self.cache_idx],
-                    damaged: false,
+                    ..Tried::default()
                 };
                 let mut revs = Vec::new();
                 while let Some(rev) = set
@@ -1483,6 +1512,9 @@ pub struct RemoteCacheSet {
     /// Readable cache indices, fastest-first. Computed once (probe or load from
     /// disk) on first read.
     read_order: OnceCell<Vec<usize>>,
+    /// The snapshot tier's generation directory, when the tier was set up:
+    /// where a miss on it looks for the target under another `hashin`.
+    snapshot_generation: Option<PathBuf>,
 }
 
 impl RemoteCacheSet {
@@ -1539,11 +1571,15 @@ impl RemoteCacheSet {
         // Hashed before the snapshot joins: the tier must not move the
         // persisted read order's key (I1).
         let config_hash = config_hash(defs);
+        let mut snapshot_generation = None;
         if let Some(generation) = snapshot {
             // A snapshot can leave a build cold, never fail it (I3): a tier
             // that can't be set up is one warning and no tier.
             match snapshot_tier(generation) {
-                Ok(tier) => caches.push(tier),
+                Ok(tier) => {
+                    caches.push(tier);
+                    snapshot_generation = Some(generation.to_path_buf());
+                }
                 Err(e) => warn!(
                     dir = %generation.display(),
                     error = ?e,
@@ -1556,6 +1592,7 @@ impl RemoteCacheSet {
             home,
             config_hash,
             read_order: OnceCell::new(),
+            snapshot_generation,
         }))
     }
 
@@ -1608,6 +1645,7 @@ impl RemoteCacheSet {
             home,
             config_hash: String::new(),
             read_order: OnceCell::new_with(Some(order)),
+            snapshot_generation: None,
         })
     }
 
@@ -1640,6 +1678,7 @@ impl RemoteCacheSet {
             home: PathBuf::new(),
             config_hash: String::new(),
             read_order: OnceCell::new(),
+            snapshot_generation: None,
         })
     }
 
@@ -1680,6 +1719,63 @@ impl RemoteCacheSet {
         self.caches.is_empty()
     }
 
+    /// Whether the user configured any cache under `caches:` — the snapshot
+    /// tier, which is not one, left out.
+    pub fn has_user_caches(&self) -> bool {
+        self.user_caches().next().is_some()
+    }
+
+    /// Whether the snapshot tier was set up.
+    pub(crate) fn has_snapshot_tier(&self) -> bool {
+        self.snapshot_idx().is_some()
+    }
+
+    /// `miss` as the event a target's hit decision emits for it.
+    pub(crate) fn tier_miss_event(
+        &self,
+        addr: &str,
+        miss: TierMiss,
+    ) -> hcore::events::BuildEventKind {
+        let cache = self.caches.get(miss.cache_idx);
+        let snapshot = cache.is_some_and(|c| c.role == CacheRole::Snapshot);
+        hcore::events::BuildEventKind::RemoteTierMiss {
+            addr: addr.to_owned(),
+            cache: match cache {
+                Some(c) if !snapshot => c.def.name.clone(),
+                _ => String::new(),
+            },
+            snapshot,
+            reason: miss.reason,
+        }
+    }
+
+    /// Why the snapshot tier, which has no manifest for `(addr, hashin)`,
+    /// missed: it holds the target under another `hashin`, or not at all.
+    ///
+    /// Asked of the filesystem, not of a `list_names`: a listing of the
+    /// target's prefix `pkg/t` also matches package `pkg/t`'s targets, where
+    /// a directory holding a manifest is only ever a revision of this target.
+    async fn snapshot_absence(&self, addr: &Addr) -> TierMissReason {
+        let Some(generation) = &self.snapshot_generation else {
+            return TierMissReason::AddrAbsent;
+        };
+        let dir = generation.join(Self::addr_prefix(addr));
+        hcore::blocking::run(move || {
+            let manifest = key_segment(MANIFEST_V2);
+            let other_hashin = std::fs::read_dir(&dir).is_ok_and(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .any(|e| e.path().join(&manifest).is_file())
+            });
+            if other_hashin {
+                TierMissReason::SnapshotOtherHashin
+            } else {
+                TierMissReason::AddrAbsent
+            }
+        })
+        .await
+    }
+
     pub(crate) fn has_writable(&self) -> bool {
         self.caches.iter().any(ConfiguredCache::writable)
     }
@@ -1708,14 +1804,21 @@ impl RemoteCacheSet {
     /// the artifact segment. One `list_names` of this prefix enumerates the whole
     /// revision, which is how presence is checked without a request per artifact.
     pub(crate) fn revision_prefix(addr: &Addr, hashin: &str) -> String {
+        let mut key = Self::addr_prefix(addr);
+        key.push('/');
+        key.push_str(&key_segment(hashin));
+        key
+    }
+
+    /// Key prefix shared by every revision of one target: [`Self::revision_prefix`]
+    /// without the `hashin` segment.
+    fn addr_prefix(addr: &Addr) -> String {
         let mut key = String::new();
         for c in addr.package.components() {
             key.push_str(&key_segment(c));
             key.push('/');
         }
         key.push_str(&key_segment(&addr_name_segment(addr)));
-        key.push('/');
-        key.push_str(&key_segment(hashin));
         key
     }
 
@@ -1968,6 +2071,28 @@ impl RemoteCacheSet {
             .await
     }
 
+    /// [`Self::locate`], plus every tier it passed over and why: the hit
+    /// decision's walk, whose misses become
+    /// [`RemoteTierMiss`](hcore::events::BuildEventKind::RemoteTierMiss)
+    /// events. A hit on the first tier allocates nothing for them.
+    pub(crate) async fn locate_explained(
+        &self,
+        ctoken: &dyn Cancellable,
+        addr: &Addr,
+        hashin: &str,
+        need: Need<'_>,
+    ) -> (Option<RemoteRevision>, Vec<TierMiss>) {
+        if !self.has_readable() {
+            return (None, Vec::new());
+        }
+        let mut tried = Tried {
+            misses: Some(Vec::new()),
+            ..Tried::default()
+        };
+        let rev = self.walk(ctoken, addr, hashin, &need, &mut tried).await;
+        (rev, tried.misses.unwrap_or_default())
+    }
+
     /// [`Self::locate`]'s walk, over the caches `tried` does not name yet.
     /// Every cache it examines goes into `tried`, the one it returns included,
     /// so walking again with the same `tried` resumes where this one stopped
@@ -2000,6 +2125,7 @@ impl RemoteCacheSet {
             // success/failure so a flaky cache trips.
             if cache.broken() {
                 cache.note_skipped();
+                tried.miss(i, TierMissReason::Unreachable);
                 continue;
             }
             let manifest = match self
@@ -2009,9 +2135,25 @@ impl RemoteCacheSet {
                 ReadRevision::Valid(manifest) => manifest,
                 ReadRevision::Damaged => {
                     tried.damaged = true;
+                    tried.miss(i, TierMissReason::Damaged);
                     continue;
                 }
-                ReadRevision::Absent | ReadRevision::Unreadable => continue,
+                ReadRevision::Unreadable => {
+                    tried.miss(i, TierMissReason::Unreachable);
+                    continue;
+                }
+                ReadRevision::Absent => {
+                    // The snapshot's reason costs a directory read, paid only
+                    // when a walk asks for reasons.
+                    if tried.misses.is_some() {
+                        let reason = match cache.role {
+                            CacheRole::Snapshot => self.snapshot_absence(addr).await,
+                            CacheRole::User => TierMissReason::RevisionAbsent,
+                        };
+                        tried.miss(i, reason);
+                    }
+                    continue;
+                }
             };
             if let Need::Groups(groups) = need {
                 // Resolve groups to blob names through the same "needed" rule
@@ -2032,6 +2174,7 @@ impl RemoteCacheSet {
                     .blobs_present(ctoken, cache, addr, hashin, names.into_iter())
                     .await
                 {
+                    tried.miss(i, TierMissReason::BlobMissingFellThrough);
                     continue;
                 }
             }
@@ -2795,22 +2938,30 @@ impl Engine {
     /// records the revision's identity and hashouts, not its residency. Every
     /// read path materializes what it needs first (see
     /// [`Engine::missing_local_blobs`]).
-    pub(crate) async fn probe_remote_revision(
+    ///
+    /// The probe also says which tiers it passed over and why
+    /// ([`RemoteProbe::misses`]), for the hit decision's
+    /// [`RemoteTierMiss`](hcore::events::BuildEventKind::RemoteTierMiss)
+    /// events.
+    pub(crate) async fn probe_remote_revision_explained(
         &self,
         ctoken: &dyn Cancellable,
         addr: &Addr,
         hashin: &str,
         output_groups: &[String],
-    ) -> anyhow::Result<Option<(Manifest, RemoteRevision)>> {
+    ) -> anyhow::Result<RemoteProbe> {
         // Every blob a caller of these groups could read must still be on the
         // cache for the hit to stand; a cache that lacks one is passed over for
         // the next.
-        let Some(rev) = self
+        let (rev, misses) = self
             .remote_caches
-            .locate(ctoken, addr, hashin, Need::Groups(output_groups))
-            .await
-        else {
-            return Ok(None);
+            .locate_explained(ctoken, addr, hashin, Need::Groups(output_groups))
+            .await;
+        let Some(rev) = rev else {
+            return Ok(RemoteProbe {
+                found: None,
+                misses,
+            });
         };
 
         let local_manifest = local_manifest_from_remote(&rev.manifest, hashin);
@@ -2837,7 +2988,24 @@ impl Engine {
             "mirrored a remote revision with no host paths; its local hits are unchecked",
         );
 
-        Ok(Some((local_manifest, rev)))
+        Ok(RemoteProbe {
+            found: Some((local_manifest, rev)),
+            misses,
+        })
+    }
+
+    /// [`Self::probe_remote_revision_explained`] without the misses.
+    #[cfg(test)]
+    pub(crate) async fn probe_remote_revision(
+        &self,
+        ctoken: &dyn Cancellable,
+        addr: &Addr,
+        hashin: &str,
+        output_groups: &[String],
+    ) -> anyhow::Result<Option<(Manifest, RemoteRevision)>> {
+        self.probe_remote_revision_explained(ctoken, addr, hashin, output_groups)
+            .await
+            .map(|probe| probe.found)
     }
 
     /// Pull exactly `names` from `rev`'s cache into the local cache, as stored.
@@ -3648,6 +3816,7 @@ mod tests {
             home,
             config_hash: String::new(),
             read_order: OnceCell::new(),
+            snapshot_generation: None,
         })
     }
 
@@ -4212,6 +4381,7 @@ mod tests {
             home: dir.path().to_path_buf(),
             config_hash: String::new(),
             read_order: OnceCell::new(),
+            snapshot_generation: None,
         });
 
         // More blob pulls than there are bulk slots, so the bulk half is
@@ -4330,6 +4500,7 @@ mod tests {
             home: dir.path().to_path_buf(),
             config_hash: String::new(),
             read_order: OnceCell::new(),
+            snapshot_generation: None,
         });
 
         let reads: Vec<_> = (0..CONCURRENCY)
@@ -4574,6 +4745,7 @@ mod tests {
             home,
             config_hash: String::new(),
             read_order: OnceCell::new(),
+            snapshot_generation: None,
         })
     }
 
@@ -5521,6 +5693,7 @@ mod tests {
             home: dir.path().to_path_buf(),
             config_hash: String::new(),
             read_order: OnceCell::new(),
+            snapshot_generation: None,
         };
 
         let blobs: Vec<(String, PathBuf)> = (0..BLOBS)

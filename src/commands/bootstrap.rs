@@ -450,6 +450,15 @@ impl EngineRole {
     }
 }
 
+/// Whether a `CI` value says the run is under CI: set, not empty, and not
+/// `false` or `0` (some shells export `CI=false`).
+fn ci_truthy(value: Option<&std::ffi::OsStr>) -> bool {
+    value.and_then(std::ffi::OsStr::to_str).is_some_and(|v| {
+        let v = v.trim();
+        !v.is_empty() && !v.eq_ignore_ascii_case("false") && v != "0"
+    })
+}
+
 /// What a malformed `HEPH_RESOURCE_<NAME>` does to engine construction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BadEnv {
@@ -508,10 +517,18 @@ fn engine_config(
         .find(|(k, _)| k == config_yaml::CACHE_SNAPSHOT_ENV)
         .map(|(_, v)| v.as_os_str());
     let mut config = file.resolve_with_env(root, snapshot_env)?;
+    config.ci = ci_truthy(
+        vars.iter()
+            .find(|(k, _)| k == "CI")
+            .map(|(_, v)| v.as_os_str()),
+    );
 
     // Only a build engine records what it used for the next CI job's
     // snapshot; a helper's lookups are not part of any build.
     config.record_working_set = role.records() && config.cache_snapshot.is_some();
+    // The snapshot command reads the dir itself: a tier over the snapshot it
+    // is about to replace would only log about it.
+    config.snapshot_tier = role != EngineRole::Snapshot;
 
     // The kill switch for listed facts: every candidate a fact would have
     // decided is resolved instead. Read here, never by the engine. It is
@@ -957,6 +974,11 @@ mod tests {
         let snapshot = config(EngineRole::Snapshot, None);
         assert_eq!(snapshot.cache_snapshot, build.cache_snapshot);
         assert!(!snapshot.record_working_set);
+        assert!(build.snapshot_tier && helper.snapshot_tier);
+        assert!(
+            !snapshot.snapshot_tier,
+            "the snapshot command reads the dir itself, not through a tier"
+        );
 
         let env = config(EngineRole::Build, Some("from-env"));
         assert_eq!(env.cache_snapshot, Some(build.root.join("from-env")));
@@ -980,6 +1002,18 @@ mod tests {
         let unset = config(EngineRole::Build, None);
         assert_eq!(unset.cache_snapshot, None);
         assert!(!unset.record_working_set);
+    }
+
+    #[test]
+    fn ci_truthy_values() {
+        use std::ffi::OsStr;
+        assert!(!ci_truthy(None), "unset");
+        for off in ["", " ", "0", "false", "FALSE"] {
+            assert!(!ci_truthy(Some(OsStr::new(off))), "{off:?}");
+        }
+        for on in ["1", "true", "yes"] {
+            assert!(ci_truthy(Some(OsStr::new(on))), "{on:?}");
+        }
     }
 
     #[test]

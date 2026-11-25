@@ -34,7 +34,9 @@
 //! its frame checksums. Anything that fails leaves the whole revision out,
 //! counted by [`LeftOut`] reason.
 
-use super::marker::{GENERATION_PREFIX, MARKER_TMP_PREFIX, NoTier, read_marker, write_marker};
+use super::marker::{
+    GENERATION_PREFIX, GenerationStats, MARKER_TMP_PREFIX, NoTier, read_marker, write_marker_with,
+};
 use super::{RecordedRevision, WorkingSet, working_set_dir};
 use crate::engine::Engine;
 use crate::engine::cache_codec;
@@ -867,8 +869,20 @@ impl Engine {
         before_pointer(&generation)?;
         {
             let (dir, name) = (dir.to_path_buf(), generation_name.clone());
+            // What the generation holds, for the next job's start-of-run line.
+            let revisions = [&report.kept, &report.new, &report.carried_over];
+            let scratch = &report.scratch;
+            let stats = GenerationStats {
+                revisions: revisions
+                    .iter()
+                    .fold(0u64, |n, t| n.saturating_add(t.count)),
+                bytes: revisions
+                    .iter()
+                    .chain([&scratch.new, &scratch.kept, &scratch.carried_over].iter())
+                    .fold(0u64, |n, t| n.saturating_add(t.bytes)),
+            };
             hcore::blocking::run(move || -> anyhow::Result<()> {
-                write_marker(&dir, &name, incomplete)?;
+                write_marker_with(&dir, &name, incomplete, Some(stats))?;
                 sweep(&dir)?;
                 Ok(())
             })

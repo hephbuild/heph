@@ -1318,11 +1318,15 @@ impl RequestState {
     ///
     /// `count` is the cpu capacity in CPUs; `pools` every pool's capacity
     /// (`None`: unbounded) and unit, called only by the announcing call.
+    /// `snapshot` is the engine's
+    /// [`CacheSnapshotState`](crate::engine::event::BuildEventKind::CacheSnapshotState),
+    /// announced right after, under the same guard.
     pub fn announce_request_config(
         &self,
         count: usize,
         scratch_disabled: bool,
         pools: impl FnOnce() -> PoolAnnouncement,
+        snapshot: Option<&crate::engine::event::BuildEventKind>,
     ) {
         if once(&self.data.workers_announced) {
             let pools = pools();
@@ -1333,6 +1337,9 @@ impl RequestState {
                 resources: pools.capacities,
                 units: pools.units,
             });
+            if let Some(snapshot) = snapshot {
+                self.emit(snapshot.clone());
+            }
         }
     }
 

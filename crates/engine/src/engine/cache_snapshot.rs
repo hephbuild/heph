@@ -64,8 +64,8 @@ pub use export::{
     SnapshotLock, Tally, lock_snapshot, try_lock_snapshot,
 };
 pub use marker::{
-    GENERATION_PREFIX, Generation, MARKER_FILE, MARKER_TMP_PREFIX, Marker, NoTier, SNAPSHOT_FORMAT,
-    is_generation_name, open_tier, read_marker, write_marker,
+    GENERATION_PREFIX, Generation, GenerationStats, MARKER_FILE, MARKER_TMP_PREFIX, Marker, NoTier,
+    SNAPSHOT_FORMAT, is_generation_name, open_tier, read_marker, write_marker, write_marker_with,
 };
 pub use take::{Consumption, LiveRecorder, RECORDER_WAIT, RecorderAliveError, SnapshotCancelled};
 
@@ -260,6 +260,9 @@ pub struct Journal {
     seen: Mutex<FxHashSet<(Addr, Arc<str>)>>,
     /// Every scratch entry this engine has batched.
     seen_scratch: Mutex<FxHashSet<RecordedScratch>>,
+    /// Set once the run-end reminder of an unwritten journal was sent, so an
+    /// engine sends it at most once.
+    reminded: AtomicBool,
 }
 
 impl Journal {
@@ -270,6 +273,7 @@ impl Journal {
             file: OnceLock::new(),
             seen: Mutex::new(FxHashSet::default()),
             seen_scratch: Mutex::new(FxHashSet::default()),
+            reminded: AtomicBool::new(false),
         }
     }
 
@@ -737,6 +741,90 @@ impl crate::engine::Engine {
     /// `None` when snapshots are off.
     pub fn cache_snapshot_dir(&self) -> Option<&Path> {
         self.cfg.cache_snapshot.as_deref()
+    }
+
+    /// Under CI ([`Config::ci`](crate::engine::Config::ci)), remind the run's
+    /// log that its journal holds revisions no `heph tool cache snapshot` has
+    /// written yet: a
+    /// [`SnapshotJournalPending`](crate::engine::event::BuildEventKind::SnapshotJournalPending)
+    /// on `rs`, at most once per engine. Called when `heph run` ends.
+    pub fn remind_unconsumed_journal(&self, rs: &crate::engine::request_state::RequestState) {
+        if !self.cfg.ci {
+            return;
+        }
+        let Some(journal) = &self.working_set else {
+            return;
+        };
+        let revisions = journal.revisions();
+        if revisions == 0 || journal.reminded.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        rs.emit(
+            crate::engine::event::BuildEventKind::SnapshotJournalPending {
+                revisions: u64::try_from(revisions).unwrap_or(u64::MAX),
+            },
+        );
+    }
+}
+
+/// The [`CacheSnapshotState`](crate::engine::event::BuildEventKind::CacheSnapshotState)
+/// of the snapshot dir `dir` as `Engine::new` opened it: `opened` is what
+/// [`open_tier`] answered, `tier` whether the remote set then set the tier up
+/// (a generation it could not open is reported unreadable). `dir` is shown
+/// relative to `root` when it is under it.
+pub(crate) fn snapshot_state_event(
+    root: &Path,
+    dir: &Path,
+    opened: &Result<Generation, NoTier>,
+    tier: bool,
+) -> crate::engine::event::BuildEventKind {
+    use hcore::events::SnapshotTierState;
+    let shown = dir.strip_prefix(root).unwrap_or(dir);
+    let shown = if shown.as_os_str().is_empty() {
+        ".".to_owned()
+    } else {
+        shown.display().to_string()
+    };
+    let skipped =
+        |state, format, reason| crate::engine::event::BuildEventKind::CacheSnapshotState {
+            dir: shown.clone(),
+            state,
+            format,
+            heph: String::new(),
+            incomplete: false,
+            revisions: None,
+            bytes: None,
+            reason,
+        };
+    match opened {
+        Ok(generation) if tier => {
+            let m = &generation.marker;
+            crate::engine::event::BuildEventKind::CacheSnapshotState {
+                dir: shown.clone(),
+                state: SnapshotTierState::Serving,
+                format: Some(u64::from(m.format)),
+                heph: m.heph.clone(),
+                incomplete: m.incomplete,
+                revisions: m.revisions,
+                bytes: m.bytes,
+                reason: None,
+            }
+        }
+        Ok(generation) => skipped(
+            SnapshotTierState::Unreadable,
+            Some(u64::from(generation.marker.format)),
+            Some(format!(
+                "generation {} could not be opened",
+                generation.marker.current
+            )),
+        ),
+        Err(NoTier::NoDir) => skipped(SnapshotTierState::Absent, None, None),
+        Err(NoTier::NoMarker) => skipped(SnapshotTierState::NoMarker, None, None),
+        Err(no_tier) => skipped(
+            SnapshotTierState::Unreadable,
+            no_tier.format(),
+            Some(no_tier.to_string()),
+        ),
     }
 }
 

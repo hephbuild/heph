@@ -55,6 +55,21 @@ pub struct Marker {
     /// failed", not "the restore missed". For diagnosis only.
     #[serde(default)]
     pub incomplete: bool,
+    /// The revisions the generation holds, for diagnosis only; `None` in a
+    /// marker written before it carried them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revisions: Option<u64>,
+    /// The bytes the generation holds (revisions and scratch slots), for
+    /// diagnosis only; `None` in a marker written before it carried them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+}
+
+/// What a generation holds, as its marker records it ([`write_marker_with`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GenerationStats {
+    pub revisions: u64,
+    pub bytes: u64,
 }
 
 /// The generation a readable marker names.
@@ -186,10 +201,11 @@ pub fn read_marker(dir: &Path) -> Result<Generation, NoTier> {
     }
 }
 
-/// The snapshot tier under `dir`, or `None` with the one diagnostic saying
-/// why: a `warn!` carrying the format seen, except for a `dir` that does not
-/// exist, which is a lineage's first job and only logged at `info`.
-pub fn open_tier(dir: &Path) -> Option<Generation> {
+/// The snapshot tier under `dir`, or why there is none, with the one
+/// diagnostic saying so: a `warn!` carrying the format seen, except for a
+/// `dir` that does not exist, which is a lineage's first job and only logged
+/// at `info`.
+pub fn open_tier(dir: &Path) -> Result<Generation, NoTier> {
     match read_marker(dir) {
         Ok(generation) => {
             tracing::debug!(
@@ -199,11 +215,11 @@ pub fn open_tier(dir: &Path) -> Option<Generation> {
                 heph = %generation.marker.heph,
                 "cache snapshot: serving",
             );
-            Some(generation)
+            Ok(generation)
         }
         Err(NoTier::NoDir) => {
             tracing::info!(dir = %dir.display(), "cache snapshot: no snapshot yet, building cold");
-            None
+            Err(NoTier::NoDir)
         }
         Err(reason) => {
             tracing::warn!(
@@ -212,16 +228,27 @@ pub fn open_tier(dir: &Path) -> Option<Generation> {
                 reason = %reason,
                 "cache snapshot: not used, building cold",
             );
-            None
+            Err(reason)
         }
     }
+}
+
+/// [`write_marker_with`] recording no counts.
+pub fn write_marker(dir: &Path, current: &str, incomplete: bool) -> anyhow::Result<()> {
+    write_marker_with(dir, current, incomplete, None)
 }
 
 /// Point `dir`'s marker at the generation `current`, by writing a temp file
 /// and renaming it over [`MARKER_FILE`]. The generation must already be
 /// complete: this is the last write of a snapshot. `incomplete` records
-/// whether the run that wrote it was ([`Marker::incomplete`]).
-pub fn write_marker(dir: &Path, current: &str, incomplete: bool) -> anyhow::Result<()> {
+/// whether the run that wrote it was ([`Marker::incomplete`]), `stats` what
+/// the generation holds.
+pub fn write_marker_with(
+    dir: &Path,
+    current: &str,
+    incomplete: bool,
+    stats: Option<GenerationStats>,
+) -> anyhow::Result<()> {
     anyhow::ensure!(
         is_generation_name(current),
         "{current:?} is not a `{GENERATION_PREFIX}<nonce>` generation name"
@@ -231,6 +258,8 @@ pub fn write_marker(dir: &Path, current: &str, incomplete: bool) -> anyhow::Resu
         heph: hcore::version::current().to_owned(),
         current: current.to_owned(),
         incomplete,
+        revisions: stats.map(|s| s.revisions),
+        bytes: stats.map(|s| s.bytes),
     };
     let bytes = serde_json::to_vec(&marker).context("encoding the snapshot marker")?;
     let nonce = uuid::Uuid::new_v4().simple().to_string();
@@ -277,9 +306,9 @@ mod tests {
         let tmp = snapshot_dir();
         let absent = tmp.path().join("nope");
         assert_eq!(read_marker(&absent), Err(NoTier::NoDir));
-        assert_eq!(open_tier(&absent), None);
+        assert_eq!(open_tier(&absent), Err(NoTier::NoDir));
         assert_eq!(read_marker(tmp.path()), Err(NoTier::NoMarker));
-        assert_eq!(open_tier(tmp.path()), None);
+        assert_eq!(open_tier(tmp.path()), Err(NoTier::NoMarker));
     }
 
     #[test]
@@ -311,7 +340,7 @@ mod tests {
         let err = read_marker(tmp.path()).expect_err("newer");
         assert_eq!(err, NoTier::Newer { format: 2 });
         assert!(err.to_string().contains("format 2"), "{err}");
-        assert_eq!(open_tier(tmp.path()), None);
+        assert_eq!(open_tier(tmp.path()), Err(NoTier::Newer { format: 2 }));
     }
 
     #[test]
@@ -357,14 +386,25 @@ mod tests {
                 heph: hcore::version::current().to_owned(),
                 current: "gen-0123abc_-Z".to_owned(),
                 incomplete: false,
+                revisions: None,
+                bytes: None,
             }
         );
         // A second write replaces the first and leaves no temp file behind.
         mkgen(tmp.path(), "gen-b");
-        write_marker(tmp.path(), "gen-b", true).expect("rewrite");
+        let stats = GenerationStats {
+            revisions: 3,
+            bytes: 4096,
+        };
+        write_marker_with(tmp.path(), "gen-b", true, Some(stats)).expect("rewrite");
         let marker = read_marker(tmp.path()).expect("served").marker;
         assert_eq!(marker.current, "gen-b");
         assert!(marker.incomplete, "the incomplete flag round-trips");
+        assert_eq!(
+            (marker.revisions, marker.bytes),
+            (Some(3), Some(4096)),
+            "the counts round-trip"
+        );
         let names: Vec<String> = std::fs::read_dir(tmp.path())
             .expect("read dir")
             .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())

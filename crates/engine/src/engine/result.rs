@@ -2568,9 +2568,12 @@ impl Engine {
         // Announce worker capacity once per request. Covers the single-target
         // entry (`run` of one addr) that bypasses `Engine::result`; the once-guard
         // makes the dep recursion below a no-op.
-        rs.announce_request_config(self.max_workers, opts.no_scratch, || {
-            self.pool_announcement()
-        });
+        rs.announce_request_config(
+            self.max_workers,
+            opts.no_scratch,
+            || self.pool_announcement(),
+            self.snapshot_state.as_ref(),
+        );
 
         // Single-target entry (`run` of one addr, which bypasses `Engine::result`):
         // claim the matched stream and emit the set-of-one as already-complete
@@ -2946,9 +2949,12 @@ impl Engine {
 
         // Announce worker capacity up front so the client can paint a fixed
         // worker-slot indicator before any execute lands.
-        rs.announce_request_config(self.max_workers, opts.no_scratch, || {
-            self.pool_announcement()
-        });
+        rs.announce_request_config(
+            self.max_workers,
+            opts.no_scratch,
+            || self.pool_announcement(),
+            self.snapshot_state.as_ref(),
+        );
 
         let fail_fast = rs.fail_fast();
         let mut set: JoinSet<(Addr, anyhow::Result<Arc<EResult>>)> = JoinSet::new();
@@ -4465,7 +4471,7 @@ impl Engine {
                         // plain `Miss`. Only a local error the probe propagates
                         // (mirroring the manifest) returns here, before any
                         // outcome: the resolution failed, nothing was settled.
-                        crate::engine::event::emit_scope(
+                        let probe = crate::engine::event::emit_scope(
                             &rs,
                             crate::engine::event::BuildEventKind::RemoteCacheReadStart {
                                 addr: addr_s.clone(),
@@ -4474,9 +4480,20 @@ impl Engine {
                                 addr: span_addr,
                                 error: error.map(crate::engine::event::ErrorDetail::into_message),
                             },
-                            self.probe_remote_revision(ctoken, addr, opts.hashin.as_str(), &needed),
+                            self.probe_remote_revision_explained(
+                                ctoken,
+                                addr,
+                                opts.hashin.as_str(),
+                                &needed,
+                            ),
                         )
-                        .await?
+                        .await?;
+                        // Every tier passed over, and why, ahead of the hit or
+                        // miss they explain.
+                        for miss in probe.misses {
+                            rs.emit(self.remote_caches.tier_miss_event(&addr_s, miss));
+                        }
+                        probe.found
                     } else {
                         None
                     };

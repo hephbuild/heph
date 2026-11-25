@@ -14,7 +14,7 @@ use ratatui::text::{Line, Span};
 use crate::tui::app::{CIAppView, TUIAppView};
 use crate::tui::session::{HolderNames, SessionId};
 use hcore::capacity::Unit;
-use hcore::events::{BuildEvent, BuildEventKind, CacheCounts};
+use hcore::events::{BuildEvent, BuildEventKind, CacheCounts, TierCounts};
 
 #[cfg(test)]
 mod approval_tests;
@@ -2731,6 +2731,13 @@ pub struct CiProgressView {
     /// Root failures already printed: a same-addr `ResultEnd` double-fire
     /// prints one block, not two.
     failures_printed: HashSet<String>,
+    /// Hits and misses per cache tier, the misses by reason, for the run-end
+    /// `cache tiers:` line. One line in all, never one per missed target: a
+    /// target's own reasons stay in `--json` and the session.
+    tiers: TierCounts,
+    /// The snapshot's start-of-run line is printed: every request announces
+    /// the state, and a command running several prints it once.
+    snapshot_state_printed: bool,
 }
 
 /// `heph run --log-lines`' default: how many tail lines a failure prints live
@@ -2745,6 +2752,8 @@ impl CiProgressView {
             stopped: false,
             log_lines: DEFAULT_LOG_LINES,
             failures_printed: HashSet::new(),
+            tiers: TierCounts::default(),
+            snapshot_state_printed: false,
         }
     }
 
@@ -2883,8 +2892,22 @@ impl CIAppView for CiProgressView {
                 );
                 tracing::error!("{block}");
             }
+            // The snapshot tier's state, once, at the top of the log: what
+            // every later hit and miss on it is read against.
+            BuildEventKind::CacheSnapshotState { .. } if !self.snapshot_state_printed => {
+                self.snapshot_state_printed = true;
+                if let Some(line) = hcore::events::snapshot_state_line(&ev.kind) {
+                    tracing::info!("{line}");
+                }
+            }
+            BuildEventKind::SnapshotJournalPending { .. } => {
+                if let Some(line) = hcore::events::snapshot_state_line(&ev.kind) {
+                    tracing::warn!("{line}");
+                }
+            }
             _ => {}
         }
+        self.tiers.apply(&ev.kind);
         self.core.fold(ev);
     }
 
@@ -2899,6 +2922,9 @@ impl CIAppView for CiProgressView {
             tracing::info!("scratch {scratch} serialized {waiters} targets, {total} of total wait");
         }
         for line in self.core.state.stale_lines() {
+            tracing::info!("{line}");
+        }
+        if let Some(line) = self.tiers.line() {
             tracing::info!("{line}");
         }
         tracing::info!("{}", self.summary_line());
@@ -4311,6 +4337,22 @@ mod tests {
 
     /// [`ci_view_log`] of a view built by the test.
     fn ci_view_log_of(mut v: CiProgressView, names: HolderNames, events: &[BuildEvent]) -> String {
+        captured_log(|| {
+            // As the backend does, before any event.
+            v.begin();
+            v.name_lock_holders(names.clone());
+            for e in events {
+                // As the backend's receiver does, before the fold.
+                if let Some(pid) = crate::tui::session::holder::event_holder_pid(e) {
+                    names.resolve_blocking(pid);
+                }
+                v.apply(e);
+            }
+        })
+    }
+
+    /// What `f` logs through `tracing`, as plain lines.
+    fn captured_log(f: impl FnOnce()) -> String {
         #[derive(Clone, Default)]
         struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
         impl std::io::Write for Buf {
@@ -4333,20 +4375,90 @@ mod tests {
             .with_target(false)
             .without_time()
             .finish();
-        tracing::subscriber::with_default(subscriber, || {
-            // As the backend does, before any event.
-            v.begin();
-            v.name_lock_holders(names.clone());
-            for e in events {
-                // As the backend's receiver does, before the fold.
-                if let Some(pid) = crate::tui::session::holder::event_holder_pid(e) {
-                    names.resolve_blocking(pid);
-                }
-                v.apply(e);
-            }
-        });
+        tracing::subscriber::with_default(subscriber, f);
         let bytes = buf.0.lock().expect("log buffer").clone();
         String::from_utf8(bytes).expect("utf-8 log")
+    }
+
+    /// The snapshot's state prints once at the top however many requests
+    /// announce it, the journal reminder prints as a warning, and the
+    /// per-tier counts, misses by reason, print once at the end — never a
+    /// line per missed target.
+    #[test]
+    fn ci_view_prints_the_snapshot_lines() {
+        use hcore::events::{SnapshotTierState, TierMissReason};
+        let state = BuildEventKind::CacheSnapshotState {
+            dir: ".heph-snapshot".to_owned(),
+            state: SnapshotTierState::Serving,
+            format: Some(1),
+            heph: "0.4.1".to_owned(),
+            incomplete: false,
+            revisions: Some(412),
+            bytes: Some(1024 * 1024),
+            reason: None,
+        };
+        let miss = |addr: &str, reason| BuildEventKind::RemoteTierMiss {
+            addr: addr.to_owned(),
+            cache: String::new(),
+            snapshot: true,
+            reason,
+        };
+        let events = [
+            ev(1, state.clone()),
+            ev(
+                2,
+                BuildEventKind::LocalCacheMiss {
+                    addr: "//p:a".into(),
+                },
+            ),
+            ev(3, miss("//p:a", TierMissReason::AddrAbsent)),
+            ev(
+                4,
+                BuildEventKind::LocalCacheMiss {
+                    addr: "//p:b".into(),
+                },
+            ),
+            ev(5, miss("//p:b", TierMissReason::SnapshotOtherHashin)),
+            ev(6, state),
+            ev(7, BuildEventKind::SnapshotJournalPending { revisions: 12 }),
+        ];
+        let mut v = CiProgressView::new("Running");
+        let log = captured_log(|| {
+            for e in &events {
+                v.apply(e);
+            }
+            v.finish();
+        });
+        let lines: Vec<&str> = log.lines().collect();
+        let state_lines: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.contains("snapshot: .heph-snapshot"))
+            .collect();
+        assert_eq!(state_lines.len(), 1, "{log}");
+        assert!(
+            state_lines[0].ends_with(
+                "snapshot: .heph-snapshot, 1.0 MiB, 412 revisions, written by heph 0.4.1"
+            ),
+            "{log}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("WARN")
+                && l.ends_with(
+                    "snapshot: journal holds 12 revisions; 'heph tool cache snapshot' writes them"
+                )),
+            "{log}"
+        );
+        assert!(
+            lines.iter().any(|l| l.ends_with(
+                "cache tiers: local 0 hit 2 miss · snapshot 0 hit 2 miss \
+                 (snapshot_other_hashin 1, addr_absent 1)"
+            )),
+            "{log}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("//p:a")),
+            "a missed target gets no line of its own: {log}"
+        );
     }
 
     /// The CI view opens with no header line: its label ("Running //p:chatty")

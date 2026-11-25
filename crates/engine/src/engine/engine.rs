@@ -397,6 +397,12 @@ pub struct Engine {
     /// [`Config::record_working_set`] is on. Every request but a hash-only
     /// one holds it; no file exists until the first recording request.
     pub(crate) working_set: Option<Arc<crate::engine::cache_snapshot::Journal>>,
+
+    /// The snapshot tier's state as this engine opened it, a
+    /// [`CacheSnapshotState`](crate::engine::event::BuildEventKind::CacheSnapshotState)
+    /// each request announces once; `None` when no snapshot dir is configured
+    /// or [`Config::snapshot_tier`] is off.
+    pub(crate) snapshot_state: Option<crate::engine::event::BuildEventKind>,
 }
 
 /// Per-process FUSE sandbox state. Owns the `<home>/sandboxfuse<pid>/`
@@ -898,16 +904,27 @@ impl Engine {
         // an unusable snapshot dir is one diagnostic and no tier, never an
         // error (I3). Helper engines read it too — reading is harmless; only
         // recording is the build engine's.
-        let snapshot = cfg
-            .cache_snapshot
-            .as_deref()
-            .and_then(crate::engine::cache_snapshot::open_tier);
+        // The snapshot command's own engine opens no tier: it reads the dir
+        // itself, and a tier would only log about the snapshot it replaces.
+        let snapshot_dir = cfg.cache_snapshot.as_deref().filter(|_| cfg.snapshot_tier);
+        let snapshot = snapshot_dir.map(crate::engine::cache_snapshot::open_tier);
         let remote_caches = crate::engine::RemoteCacheSet::with_snapshot(
             &cfg.remote_caches,
-            snapshot.as_ref().map(|g| g.path.as_path()),
+            snapshot
+                .as_ref()
+                .and_then(|s| s.as_ref().ok())
+                .map(|g| g.path.as_path()),
             home.to_path_buf(),
         )
         .context("configure remote caches")?;
+        let snapshot_state = snapshot_dir.zip(snapshot.as_ref()).map(|(dir, opened)| {
+            crate::engine::cache_snapshot::snapshot_state_event(
+                &cfg.root,
+                dir,
+                opened,
+                remote_caches.has_snapshot_tier(),
+            )
+        });
 
         // Shared cross-run filesystem-walk cache, handed to tree-walking plugins
         // via `PluginInit`. Its own sqlite db so it can be pruned independently.
@@ -1022,6 +1039,7 @@ impl Engine {
             working_set: cfg
                 .record_working_set
                 .then(|| Arc::new(crate::engine::cache_snapshot::Journal::new(&home))),
+            snapshot_state,
         };
         // Ended hephs' run logs, off the hot path: never awaited by a build.
         engine.run_logs.start_sweep(&engine.runtime);
