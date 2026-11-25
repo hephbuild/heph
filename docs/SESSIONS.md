@@ -157,11 +157,13 @@ heph: no session matched since 7d; the catalog holds sessions from up to 23 days
 
 The first line comes with `--addr` when a live session started in the
 window. The second comes when nothing matched and the catalog holds sessions
-older than the window; its `--since` reaches the oldest. It comes only when
-the window is all that narrowed the list (with `--addr` or without): the
-catalog's oldest session can be of any actor, user, command or workspace, so
-under `--actor`, `--user`, `--command`, `--failed`, or a workspace scope
-(inside a workspace, without `--all`), it says nothing.
+of the listed workspace older than the window; its `--since` reaches the
+oldest of them. Inside a workspace, or with `--workspace`, that is that
+workspace's oldest session; with `--all`, or outside a workspace, the
+catalog's. It comes only when the window is all that narrowed the list (with
+`--addr` or without): that oldest session can be of any actor, user or
+command, so under `--actor`, `--user`, `--command` or `--failed` it says
+nothing.
 
 ### `query`
 

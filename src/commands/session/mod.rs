@@ -464,7 +464,7 @@ fn execute(
                 sink.write_diagnostic(note);
             }
             // `list` heals and repairs the catalog it reads (D14).
-            let catalog = list::read_catalog(&root, opts.now_ms, &filter, &mut |note| {
+            let catalog = list::read_catalog(&root, opts.now_ms, &filter, scope, &mut |note| {
                 sink.write_diagnostic(note);
             });
             let shown = bootstrap::block_on(list::list(
@@ -476,14 +476,7 @@ fn execute(
                 a.json,
                 &mut stdout,
             ))??;
-            for hint in list::hints(
-                shown,
-                &filter,
-                scope,
-                catalog.as_ref(),
-                &a.since,
-                opts.now_ms,
-            ) {
+            for hint in list::hints(shown, &filter, catalog.as_ref(), &a.since, opts.now_ms) {
                 sink.write_diagnostic(&hint);
             }
             Ok(())

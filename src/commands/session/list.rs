@@ -94,18 +94,24 @@ pub(crate) struct CatalogRows {
     pub rows: Vec<Listed>,
     /// When its oldest session started: how far back it answers.
     pub oldest_started_ms: Option<u64>,
+    /// When its oldest session of the workspace in scope started: how far
+    /// back it answers for that workspace. The same as `oldest_started_ms`
+    /// unscoped.
+    pub oldest_in_scope_ms: Option<u64>,
     /// Answering from the recordings kept: there is no usable catalog.
     pub in_memory: bool,
 }
 
 /// Open (and so repair, D14) the catalog in `root` and read what `filter`
-/// asks of it. Its notes go to `note`, each a full line. `None` when there is
-/// no sessions directory yet, or the catalog cannot be read at all: `list`
-/// then answers from the session directories alone.
+/// asks of it, and how far back it reaches for `workspace`. Its notes go to
+/// `note`, each a full line. `None` when there is no sessions directory yet,
+/// or the catalog cannot be read at all: `list` then answers from the
+/// session directories alone.
 pub(crate) fn read_catalog(
     root: &Path,
     now_ms: u64,
     filter: &ListFilter,
+    workspace: Workspace<'_>,
     note: &mut dyn FnMut(&str),
 ) -> Option<CatalogRows> {
     if !root.is_dir() {
@@ -121,9 +127,15 @@ pub(crate) fn read_catalog(
             until_ms: filter.until_ms,
             addr: filter.addr.as_deref(),
         };
+        let oldest_started_ms = catalog::oldest_started_ms(&cat.conn)?;
+        let oldest_in_scope_ms = match workspace {
+            Workspace::All => oldest_started_ms,
+            Workspace::Only(w) => catalog::oldest_started_ms_in(&cat.conn, w)?,
+        };
         Ok(CatalogRows {
             rows: catalog::list_sessions(&cat.conn, &q)?,
-            oldest_started_ms: catalog::oldest_started_ms(&cat.conn)?,
+            oldest_started_ms,
+            oldest_in_scope_ms,
             in_memory: cat.in_memory,
         })
     };
@@ -528,15 +540,14 @@ pub(crate) struct Shown {
 /// The stderr lines that say what `list` did not look at: under `--addr`,
 /// the live sessions (their targets reach the catalog when they end); and,
 /// when nothing matched, how much further back the catalog reaches than the
-/// window `since` (the `--since` text) asked for. That one only when the
-/// window is all that narrowed the list (`--addr` aside, whose row the
-/// catalog reaches back as far): the catalog's oldest session is of any
-/// actor, user, command and workspace, so under another filter the
-/// suggested `--since` may still match nothing.
+/// window `since` (the `--since` text) asked for. That one reaches the
+/// oldest session of the workspace in scope, and is said only when no other
+/// filter narrowed the list (`--addr` aside, whose row the catalog reaches
+/// back as far): that oldest session is of any actor, user and command, so
+/// under one of those the suggested `--since` may still match nothing.
 pub(crate) fn hints(
     shown: Shown,
     filter: &ListFilter,
-    workspace: Workspace<'_>,
     catalog: Option<&CatalogRows>,
     since: &str,
     now_ms: u64,
@@ -551,15 +562,14 @@ pub(crate) fn hints(
             if n == 1 { "it" } else { "each" },
         ));
     }
-    let window_only = matches!(workspace, Workspace::All)
-        && !filter.failed
+    let window_only = !filter.failed
         && filter.actor.is_none()
         && filter.command.is_none()
         && filter.user.is_none();
     if shown.rows == 0
         && window_only
         && let Some(since_ms) = filter.since_ms
-        && let Some(oldest) = catalog.and_then(|c| c.oldest_started_ms)
+        && let Some(oldest) = catalog.and_then(|c| c.oldest_in_scope_ms)
         && oldest < since_ms
     {
         let days = now_ms.saturating_sub(oldest).div_ceil(DAY_MS).max(1);

@@ -1147,6 +1147,25 @@ pub fn oldest_started_ms(conn: &Connection) -> anyhow::Result<Option<u64>> {
     Ok(oldest.and_then(|o| u64::try_from(o).ok()))
 }
 
+/// When the oldest session of the workspace rooted at `workspace_root`
+/// started (unix ms): how far back the catalog answers for it. `None` when
+/// it holds none of that workspace's sessions.
+pub fn oldest_started_ms_in(
+    conn: &Connection,
+    workspace_root: &str,
+) -> anyhow::Result<Option<u64>> {
+    let oldest: Option<i64> = conn
+        .query_row(
+            "SELECT min(started_ms) FROM sessions WHERE workspace_root = ?1",
+            [workspace_root],
+            |r| r.get(0),
+        )
+        .with_context(|| {
+            format!("reading the session catalog's oldest session of {workspace_root}")
+        })?;
+    Ok(oldest.and_then(|o| u64::try_from(o).ok()))
+}
+
 // -------------------------------------------------------------- cleanup
 
 /// What a catalog cleanup did.

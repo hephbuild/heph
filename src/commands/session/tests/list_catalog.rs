@@ -129,7 +129,9 @@ async fn list_at(
     let file = FileSource::new(root);
     let sources: [&dyn SessionSource; 1] = [&file];
     let mut notes = Vec::new();
-    let catalog = list::read_catalog(root, now, filter, &mut |n| notes.push(n.to_owned()));
+    let catalog = list::read_catalog(root, now, filter, Workspace::All, &mut |n| {
+        notes.push(n.to_owned());
+    });
     let mut out = Vec::new();
     list::list(
         &sources,
@@ -688,7 +690,7 @@ async fn list_hints_in(
 ) -> (Vec<String>, Vec<String>) {
     let file = FileSource::new(root);
     let sources: [&dyn SessionSource; 1] = [&file];
-    let catalog = list::read_catalog(root, now, filter, &mut |_| {});
+    let catalog = list::read_catalog(root, now, filter, workspace, &mut |_| {});
     let mut out = Vec::new();
     let shown = list::list(
         &sources,
@@ -707,20 +709,35 @@ async fn list_hints_in(
     let json: serde_json::Value = serde_json::from_slice(&out).expect("json");
     (
         json_ids(&json),
-        list::hints(shown, filter, workspace, catalog.as_ref(), since, now),
+        list::hints(shown, filter, catalog.as_ref(), since, now),
     )
 }
 
 /// The catalog's reach is said only when the window is all that narrowed
-/// the list: its oldest session may be of another actor, user, command or
-/// workspace, so under any of those the hinted `--since` could match
-/// nothing again. `--addr` does not count (`list_says_what_it_did_not_search`).
+/// the list: its oldest session may be of another actor, user or command,
+/// so under any of those the hinted `--since` could match nothing again.
+/// `--addr` does not count (`list_says_what_it_did_not_search`). Under a
+/// workspace scope (the default inside a workspace) it is said too, and
+/// reaches that workspace's oldest session, not the catalog's.
 #[tokio::test]
 async fn the_reach_hint_is_for_the_window_alone() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path();
     let now = hcore::events::now_unix_ms();
+    // In /w/pacu (the fixture's workspace) 20 days ago; in another 40.
     session(root, now, 20 * DAY_MS, "run", ADDR, Did::Ran, &HUMAN);
+    let other = session(root, now, 40 * DAY_MS, "run", ADDR, Did::Ran, &HUMAN);
+    testing::alter(
+        &root.join(other.encode()),
+        "UPDATE session SET workspace_root = '/w/other'",
+    )
+    .expect("move it to another workspace");
+    let reach = |days: u64| {
+        format!(
+            "heph: no session matched since 7d; the catalog holds sessions from up to {days} \
+             days ago (it keeps 90 days): --since {days}d reads them\n"
+        )
+    };
     let narrowed: [(&str, list::ListFilter); 4] = [
         (
             "--failed",
@@ -752,10 +769,33 @@ async fn the_reach_hint_is_for_the_window_alone() {
         ),
     ];
     for (flag, filter) in &narrowed {
-        let (ids, hints) = list_hints(root, now, filter, "7d").await;
-        assert!(ids.is_empty(), "{flag}: {ids:?}");
-        assert!(hints.is_empty(), "{flag}: {hints:?}");
+        for scope in [Workspace::All, Workspace::Only("/w/pacu")] {
+            let (ids, hints) = list_hints_in(root, now, filter, scope, "7d").await;
+            assert!(ids.is_empty(), "{flag} {scope:?}: {ids:?}");
+            assert!(hints.is_empty(), "{flag} {scope:?}: {hints:?}");
+        }
     }
+
+    // The window alone: said, reaching the oldest session in scope.
+    let (_, hints) = list_hints(root, now, &since(7, now), "7d").await;
+    assert_eq!(hints, [reach(40)], "every workspace");
+    let (ids, hints) =
+        list_hints_in(root, now, &since(7, now), Workspace::Only("/w/pacu"), "7d").await;
+    assert!(ids.is_empty(), "{ids:?}");
+    assert_eq!(
+        hints,
+        [reach(20)],
+        "this workspace's oldest, not the other's"
+    );
+    let (ids, _) = list_hints_in(
+        root,
+        now,
+        &since(20, now),
+        Workspace::Only("/w/pacu"),
+        "20d",
+    )
+    .await;
+    assert_eq!(ids.len(), 1, "the hinted --since reads it: {ids:?}");
     let (ids, hints) = list_hints_in(
         root,
         now,
@@ -765,11 +805,10 @@ async fn the_reach_hint_is_for_the_window_alone() {
     )
     .await;
     assert!(ids.is_empty(), "{ids:?}");
-    assert!(hints.is_empty(), "a workspace narrows it too: {hints:?}");
-
-    // The window alone: said.
-    let (_, hints) = list_hints(root, now, &since(7, now), "7d").await;
-    assert_eq!(hints.len(), 1, "{hints:?}");
+    assert!(
+        hints.is_empty(),
+        "nothing of that workspace in the catalog: {hints:?}"
+    );
 }
 
 /// What `list` did not search is said on stderr: under `--addr`, the live
