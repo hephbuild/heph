@@ -29,12 +29,21 @@ struct Ran {
 }
 
 async fn run_query(root: &Path, argv: &[&str], stdin: &str) -> Ran {
+    run_query_with(root, argv, stdin, Arc::new(NoDownload)).await
+}
+
+async fn run_query_with(
+    root: &Path,
+    argv: &[&str],
+    stdin: &str,
+    download: Arc<dyn reference::Download>,
+) -> Ran {
     let a = args(argv);
     let file = FileSource::new(root);
     let sources: [&dyn SessionSource; 1] = [&file];
     let opener = reference::Opener {
         tmp_dir: store::tmp_dir(root).into(),
-        download: Arc::new(NoDownload),
+        download,
     };
     let notes = Arc::new(std::sync::Mutex::new(Vec::new()));
     let env = query::QueryEnv {
@@ -362,6 +371,77 @@ async fn query_stop_listener_is_armed_before_its_task_runs() {
     })
     .await
     .expect("the signal raised before the task ran sets the stop flag");
+}
+
+/// Serves `body` like [`super::refs::Serve`], counting the downloads.
+struct CountedServe {
+    body: Vec<u8>,
+    downloads: std::sync::atomic::AtomicUsize,
+}
+
+impl reference::Download for CountedServe {
+    fn get_to_temp(&self, url: &str, dir: &Path) -> anyhow::Result<tempfile::NamedTempFile> {
+        self.downloads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        super::refs::Serve(self.body.clone()).get_to_temp(url, dir)
+    }
+}
+
+/// `--from` naming one recording twice reads it once, with a note: the
+/// same id (in full or by suffix), the same file by another spelling of its
+/// path, the same URL (downloaded once). Distinct recordings are all read.
+#[tokio::test]
+async fn query_from_reads_each_recording_once() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().join("sessions");
+    let a = session(&root, 0, 1).encode();
+    let b = session(&root, 60_000, 2).encode();
+    let files = tmp.path().join("files");
+    std::fs::create_dir_all(&files).expect("mkdir");
+    let db = std::fs::read(root.join(&a).join(store::FILE)).expect("read the recording");
+    std::fs::write(files.join("a.db"), &db).expect("copy the recording");
+    let path = files.join("a.db").display().to_string();
+    let dotted = files.join(".").join("a.db").display().to_string();
+    let suffix = a.get(a.len() - 5..).expect("an id is 10 characters");
+    const URL: &str = "https://bucket.invalid/run.hephsession";
+    const URL_AGAIN: &str = "HTTPS://Bucket.INVALID/run.hephsession";
+
+    let cases: [(&[&str], usize); 5] = [
+        (&["--from", &a, "--from", &a], 1),
+        (&["--from", &a, "--from", suffix, "--from", &b], 2),
+        (&["--from", &path, "--from", &dotted], 1),
+        (&["--from", URL, "--from", URL_AGAIN], 1),
+        (&["--from", &a, "--from", &b], 2),
+    ];
+    for (from, recordings) in cases {
+        let serve = Arc::new(CountedServe {
+            body: db.clone(),
+            downloads: Default::default(),
+        });
+        let argv: Vec<&str> = from
+            .iter()
+            .copied()
+            .chain(["--format", "json", "SELECT count(*) AS n FROM sessions"])
+            .collect();
+        let ran = run_query_with(&root, &argv, "", serve.clone()).await;
+        let v = json(&ran.out.unwrap_or_else(|e| panic!("{argv:?}: {e:#}")));
+        assert_eq!(v["coverage"]["recordings"], recordings, "{argv:?}: {v}");
+        assert_eq!(v["rows"][0][0], recordings.to_string(), "{argv:?}: {v}");
+        let dropped = from.len() / 2 - recordings;
+        let notes: Vec<_> = ran
+            .notes
+            .iter()
+            .filter(|n| n.contains("names the same recording"))
+            .collect();
+        assert_eq!(notes.len(), dropped, "{argv:?}: {:?}", ran.notes);
+        if from.contains(&URL) {
+            assert_eq!(
+                serve.downloads.load(std::sync::atomic::Ordering::Relaxed),
+                1,
+                "the duplicate URL is not downloaded"
+            );
+        }
+    }
 }
 
 /// A query stopped by Ctrl-C exits 130, not 125 (the one `heph session`

@@ -163,7 +163,7 @@ runs unchanged on the catalog or on a directory of CI downloads.
 | --- | --- | --- |
 | the catalog | (default) `--since`, `--until`, `--all-workspaces` | this workspace's sessions started in the window (7 days by default; the catalog keeps 90). Opening it repairs it, as `list` does. Spans of the targets that ran, not of cache hits; no `logs`. |
 | every recording kept | `--full` | each recording that started in the window, in this workspace: cache hits included, at the cost of opening each file. A recording in a format this heph does not read, or that cannot be read, is skipped and counted. |
-| the recordings named | `--from <ref>`, repeatable | a session id (as `show` takes it), a `.hephsession` path, an `https://` URL. The window does not apply: `--since`, `--until`, `--all-workspaces` and `--full` are refused beside it. |
+| the recordings named | `--from <ref>`, repeatable | a session id (as `show` takes it), a `.hephsession` path, an `https://` URL. The window does not apply: `--since`, `--until`, `--all-workspaces` and `--full` are refused beside it. A recording named twice (the same session, however its id is abbreviated; the same file by its canonical path; the same URL) is read once, with a note on stderr; a duplicate URL is not downloaded again. |
 
 The window holds whole sessions by their start: every row of a session
 started in it, none of one started before it.

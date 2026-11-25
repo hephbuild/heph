@@ -3,8 +3,10 @@
 //! (`--from`). The engine is `htui::tui::session::query`; this module picks
 //! the sources, wires SIGINT to its stop flag, and prints the answer.
 
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::io::{IsTerminal as _, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -15,12 +17,12 @@ use rusqlite::types::Value;
 use serde::Serialize;
 use tokio::signal::unix::{SignalKind, signal};
 
-use super::reference::{self, Opener, Resolved};
+use super::reference::{self, Opener, RefKind, Resolved};
 use super::{QueryArgs, QueryFormat, SessionExit, ViewOpts, escape, escape_text, list_all};
 use crate::tui::session::query::{
     self as engine, Answer, Coverage, Limits, QueryError, RecordingFile, Scope, Source,
 };
-use crate::tui::session::{EntryMeta, SessionSource, catalog, store};
+use crate::tui::session::{EntryMeta, SessionId, SessionSource, catalog, store};
 
 /// `--format json`'s envelope version. Only gains fields within a version.
 pub const QUERY_JSON_VERSION: u32 = 1;
@@ -106,17 +108,58 @@ async fn sources(args: &QueryArgs, env: &QueryEnv<'_>) -> anyhow::Result<(Vec<So
     let note = Arc::clone(&env.note);
     if !args.from.is_empty() {
         let mut out = Vec::with_capacity(args.from.len());
+        // Each recording is read once: a second `--from` naming one already
+        // read is dropped with a note, so its rows are never counted twice.
+        let mut seen: HashMap<Identity, String> = HashMap::with_capacity(args.from.len());
+        let dropped = |first: &str, again: &str| {
+            note(&format!(
+                "heph: --from {again} names the same recording as --from {first}; reading it once\n"
+            ));
+        };
         for r in &args.from {
+            // A path or a URL is known by what it names before it is opened,
+            // so a duplicate is never downloaded or decompressed twice.
+            let (early, shown) = match reference::classify(r.trim())? {
+                RefKind::Path(p) => {
+                    let canonical = tokio::fs::canonicalize(p)
+                        .await
+                        .unwrap_or_else(|_| p.to_owned());
+                    (Some(Identity::Path(canonical)), r.clone())
+                }
+                RefKind::Url(u) => {
+                    let url = url::Url::parse(u).map_or_else(|_| u.to_owned(), String::from);
+                    (Some(Identity::Url(url)), reference::redact_url(u))
+                }
+                RefKind::Id(_) => (None, r.clone()),
+            };
+            if let Some(first) = early.as_ref().and_then(|k| seen.get(k)) {
+                dropped(first, &shown);
+                continue;
+            }
             let file = match reference::open_ref(env.sources, r, env.opts, env.opener).await? {
                 Resolved::Local { entry, .. } => {
+                    match seen.entry(Identity::Local(entry.id)) {
+                        Entry::Occupied(first) => {
+                            dropped(first.get(), &shown);
+                            continue;
+                        }
+                        Entry::Vacant(v) => {
+                            v.insert(shown);
+                        }
+                    }
                     let (root, dir) = (env.root.to_owned(), env.root.join(entry.id.encode()));
                     let note = Arc::clone(&note);
                     hcore::blocking::run(move || RecordingFile::local(&root, &dir, &*note))
                         .await
                         .with_context(|| format!("opening session {r}"))?
                 }
-                Resolved::Foreign(recording) => RecordingFile::foreign(recording)
-                    .with_context(|| format!("opening {}", reference::redact_url(r)))?,
+                Resolved::Foreign(recording) => {
+                    if let Some(key) = early {
+                        seen.insert(key, shown);
+                    }
+                    RecordingFile::foreign(recording)
+                        .with_context(|| format!("opening {}", reference::redact_url(r)))?
+                }
             };
             out.push(Source::Recording(file));
         }
@@ -144,6 +187,15 @@ async fn sources(args: &QueryArgs, env: &QueryEnv<'_>) -> anyhow::Result<(Vec<So
         workspace: env.workspace.clone(),
     };
     Ok((vec![Source::Catalog { catalog, scope }], 0))
+}
+
+/// What a `--from` ref names, for reading each recording once: a local
+/// session by id, a file by its canonical path, a download by its URL.
+#[derive(Debug, PartialEq, Eq, Hash)]
+enum Identity {
+    Local(SessionId),
+    Path(PathBuf),
+    Url(String),
 }
 
 /// `--full`: every recording kept that started in the window, in the
