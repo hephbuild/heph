@@ -183,8 +183,17 @@ method list to drift from the checker.
   attribute that any alternative has. So for `T | None`, a listed `.x` passes
   lint and can still fail at run time when the value is `None`.
 - An open type lists nothing: `Any`, a callable, an iterator, a type, a
-  namespace, a struct, a record whose fields are unknown. A driver's `Kwargs`
-  lists the dict methods the checker accepts on it.
+  record whose fields are unknown. A driver's `Kwargs` lists the dict methods
+  the checker accepts on it.
+- A struct or a namespace lists nothing either, but it is closed: the checker
+  rejects a name it does not have, and completion does not list the ones it
+  has (`members_not_listed`). One built with `**kwargs`, which accepts any
+  name, reports `members_not_listed` too.
+- A module-level binding to a literal other than a string (`{}`, `1`) types
+  as `Any` in the checker's pre-pass, so `typing = {}` then `typing.│` lists
+  nothing, with `empty_because: any`.
+- A def under a top-level `if` or `for` has its parameters typed `Any`: the
+  checker solves only top-level defs. They list nothing.
 - A name that a comprehension or a `lambda` binds in the cursor's bracket
   group, or on its line, lists nothing. The checker reports such a binding
   under the enclosing def, so the answer could be another binding's.
@@ -193,6 +202,23 @@ A receiver is looked up by the cursor's def path and its name, never by
 position, so a type found is never a different binding's. A name bound twice
 in one def, or one the checker cannot resolve, lists nothing, and
 `empty_because` says why.
+
+The def path is read from the tokens, so it holds in a broken document. An
+unclosed bracket encloses what follows it, as it does for the lexer, until a
+line starts with `def`, `return`, `pass`, `break`, `continue`, `elif` or
+`load`, keywords no expression continues with. It does not stop at the call's
+guessed extent: a call whose arguments sit at column 0 would end at the first
+of them as soon as its `)` is deleted. The cost is a line the bracket swallows
+by mistake:
+
+```python
+def f(l):
+    x = foo(
+    y = 1
+l.│
+```
+
+Here the cursor's def path is `[f]`, not `[]`.
 
 ### Literal receivers
 
@@ -244,6 +270,16 @@ The types are lint's, so completion and `build-lint-check` agree:
   keys with the ones its types were checked against. So an edit on disk to a
   file loaded two hops away is seen at the next member completion, with no
   edit to the document.
+- The load walk is kept too, one per document, under its package, load
+  strings and BUILD patterns. It is reused while the stat of every path it
+  read holds: each file it parsed, each path a load probed (so a file created
+  where a load found nothing is seen), and each directory a load listed (so a
+  BUILD file added to a loaded directory is seen). It runs again, through
+  evaluation's resolver, only when one of those moved.
+- A stat is racily clean when the file changed within 2 s of the moment it
+  was read: a same-length rewrite inside one timestamp tick would keep the
+  stat, and so the old answer. Such a stat validates nothing, and the file is
+  read again on the next lookup, until it is safely old.
 - An interface is evicted once no open document's loads reach it. That check
   runs on `didClose` and after every typecheck, since a document that changes
   its loads leaves the old ones behind. A document's types are dropped on
@@ -288,7 +324,8 @@ reason, degradations, item count and time:
 - `degraded` says what a present answer could not do in full:
   `call_extent_guessed` (with the line the extent stopped at),
   `edit_to_word_end`, `ast_stale` (with the versions behind), `ast_absent`,
-  `lex_error_before` (with its span).
+  `lex_error_before` (with its span), `explain_without_registry` (the CLI's
+  answer at a typed member site; see below).
 - A `member` site carries `path` (the receiver's chain of names, or `null`),
   `receiver` (`names`, `rebound` with the bound name in `rebound`, `literal`,
   or `expression`) and `scope` (the cursor's def path, outermost first),
@@ -299,16 +336,23 @@ reason, degradations, item count and time:
   - `type`: the receiver's type as the checker prints it, or `null`;
   - `source`: where the root came from: the declaration as `path:line`, or
     the `load()` string;
-  - `approximation`: the checker's reason for typing a declaration `Any`
-    (`conditional_binding`, `rebound`, `in_def`, …), or `null`;
+  - `approximation`: the reason the found binding carries, when the checker
+    typed its declaration `Any` (`conditional_binding`, `rebound`,
+    `non_literal_variant`, `star_args`, `in_def`, `invalid_declaration`), or
+    `null`. `rebound` and `in_def` can come with a non-empty list: the
+    binding still lists its `type`'s members;
   - `stale`: the types are from an earlier text than the current one;
   - `registry`: `ready`, or `pending` when the types were checked without the
     registry;
   - `empty_because`: why the list is empty, or `null`: `any`, `open_type`,
+    `members_not_listed` (a struct or a namespace: closed, since the checker
+    rejects a name it lacks, but its members are not listed),
     `unknown_binding`, `ambiguous_binding`, `no_members`, `no_types_yet`
-    (the document has never parsed), `approximation`.
+    (the document has never parsed), `approximation` (the binding carries
+    an `approximation` and the list is empty).
 
-  A literal receiver carries `type`, `registry` and `empty_because` only.
+  Beyond the member-site keys, a literal receiver carries `type`, `registry`
+  and `empty_because` only.
   `receiver`, `binding` and `empty_because` are open sets: a consumer
   tolerates a value it does not know.
 
@@ -320,6 +364,15 @@ $ heph tool build-lsp --explain BUILD:12:20 --json
 ```
 
 Line and column are 1-based, the column counted in characters.
+
+The CLI has no engine, so the registry never lands: a typed member answer
+says `registry: pending` and its resolution adds a `degraded` entry
+`explain_without_registry`. Its answer can differ from the editor's at the
+same position: a parameter annotated with a driver's `Kwargs` lists its
+members in the editor and nothing here, where it types as `Any`. Loads are typed under the
+workspace root found from the current directory (`explain_in` with
+`hconfig::get_root()`, in `lsp/mod.rs`); outside a workspace, loaded names
+are untyped.
 
 ## Adding a site kind
 
