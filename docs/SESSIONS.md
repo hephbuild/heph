@@ -11,7 +11,7 @@ heph session list [--all | --workspace DIR] [--since T] [--until T] [--addr ADDR
 heph session show <ref> [--json]
 heph session attach <ref>
 heph session inflight <id> [--json]
-heph session export <ref> [-o PATH|-] [--no-logs]
+heph session export <ref> [-o PATH|-] [--format hephsession|otlp] [--no-logs]
 ```
 
 The line backend announces the session on stderr when it starts, never on
@@ -37,7 +37,7 @@ path or `https://` URL (see [Opening a recording: `<ref>`](#opening-a-recording-
 | `show <ref>` | The TUI's frame printed once as text, then a "Stuck on" block: lock waits naming the session that holds the lock (followed to the root of the chain, falling back to the pid), admission waits, targets running over 30s, and one `Next:` line. An ended session adds one line per bounded resource pool (see [Pools](#pools)). | 0 |
 | `attach <ref>` | The interactive TUI on the session, following it until it ends; `q` or Ctrl-C detaches and never cancels it. Without a terminal it follows in line form. | the session's exit code; 0 on detach |
 | `inflight <id>` | The session's in-flight report (what the `SIGQUIT` dump carries), asked for through the session directory; waits 5s. Local sessions only. | 0 |
-| `export <ref>` | Writes the recording as one self-contained `.hephsession` file and prints its path (see [Export](#export-hephsession)). | 0 |
+| `export <ref>` | Writes the recording as one self-contained `.hephsession` file and prints its path (see [Export](#export-hephsession)); `--format otlp` writes its spans, logs and metrics as OTLP/JSON lines instead (see [OTLP](#otlp---format-otlp)). | 0 |
 | `query <sql>` | Read-only SQL over the [explorer](#the-explorer)'s six tables, from the catalog (this workspace's sessions of the last 7 days by default), every recording kept (`--full`), or the recordings named (`--from <ref>`). See [`query`](#query). | 0; 130 on Ctrl-C |
 
 Every error of `heph session` itself exits **125**: no such session, an
@@ -1154,8 +1154,11 @@ which for a line-backend session is its recorded log lines alone.
 ## Export: `.hephsession`
 
 ```
-heph session export <ref> [-o PATH|-] [--no-logs]
+heph session export <ref> [-o PATH|-] [--format hephsession|otlp] [--no-logs]
 ```
+
+`--format hephsession`, the default, is this section. `--format otlp` is
+[OTLP](#otlp---format-otlp), below.
 
 A `.hephsession` file is one session's recording, made to be read on another
 machine: a zstd frame whose content is a sealed `session.db` (format 1, the
@@ -1205,6 +1208,48 @@ copied out of a sessions directory while still in WAL mode (a live session,
 or a lost one) and opened by path misses whatever is still in its `-wal`:
 it shows as `incomplete`, ending where the last checkpoint did. Export it
 (`heph session export <id>`) to read it whole on another machine.
+
+### OTLP: `--format otlp`
+
+```
+heph session export <ref> --format otlp [-o PATH|-]
+```
+
+Writes one session's [explorer](#the-explorer) rows as OTLP/JSON: the file
+format an OpenTelemetry collector's `otlpjsonfile` receiver reads, and that
+any OTLP/JSON tool takes. It is written from the recording after the fact:
+nothing runs in the build to produce it.
+
+- `<ref>` is any `<ref>`: a local session, or a `.hephsession` file by path
+  or URL. A session and its `.hephsession` export write the same lines.
+- One line per signal, in this order: a `TracesData`, a `LogsData`, a
+  `MetricsData` (each the JSON of the matching collector export request).
+  A signal with nothing in it writes no line.
+- `-o PATH` writes `PATH` through a temp file beside it, renamed into place,
+  replacing a file already there; the default is `./heph-<id>.otlp.jsonl`.
+  `-o -` writes the lines to stdout, a terminal included (it is text). On
+  success it prints the path written on stdout.
+- A **running** session exports what it recorded so far, and `export` says
+  `snapshot of a running session` on stderr, as for a `.hephsession`. An
+  event of a span that is still open is left out: a span is written when it
+  ends, and its events with it.
+- `--no-logs` is refused (exit 125): an OTLP export holds no approval notice
+  text and no failure logs to leave out.
+- The lines are the OTLP/JSON encoding, not the plain proto3 JSON mapping:
+  `traceId`, `spanId` and `parentSpanId` are lowercase hex, enums (`kind`,
+  `status.code`, `severityNumber`, `aggregationTemporality`) are integers,
+  and 64-bit integers (`*UnixNano`, `intValue`) are decimal strings. The same
+  recording always writes the same bytes.
+
+What maps to what:
+
+| heph | OTLP |
+| --- | --- |
+| the session | one resource: `service.name` `heph`, `service.version` (the heph version), `host.name`, `user.name`, `process.pid` (the owner pid), `process.command_args` (argv, an array), `heph.session.id`, and every other `sessions` column as `heph.session.<column>` (a NULL column is left out). The instrumentation scope is `heph`, at the heph version. |
+| a `spans` row | a span with its name, trace and span ids (the session span's trace id for all of them), parent, start and end; kind `SPAN_KIND_INTERNAL`; `class`, `addr`, `driver` and `outcome` as `heph.class`, `heph.addr`, `heph.driver`, `heph.outcome`, beside its own attributes; `status` `ok` / `error` as the status codes, anything else unset |
+| a `span_events` row | an event of its span |
+| a `logs` row | a log record under the session span's ids: its `severity` as `severityText` and `severityNumber`, its body, `seq` as `heph.seq` |
+| `metrics` rows of one name, kind and unit | one metric: `counter` a monotonic cumulative sum from the session's start, `gauge` (and a kind this heph does not know) a gauge; one data point per row |
 
 ## Opening a recording: `<ref>`
 
