@@ -201,7 +201,7 @@ line:
 {"version":1,"columns":["addr","duration_us"],"types":["TEXT","INTEGER"],
  "rows":[["//p:t","81234"]],
  "coverage":{"catalog":["targets"],"recordings":0,"skipped":0,"truncated":0,
-             "reaches_ms":1763400000000}}
+             "reaches_ms":1763400000000,"partial":{}}}
 ```
 
 - `types` is each column's declared type, `null` for an expression.
@@ -216,7 +216,12 @@ line:
   catalog was read, is the start (unix ms) of the oldest session it holds:
   nothing older is in the answer, whatever `--since` asks for (the catalog
   keeps 90 days, and less once rebuilt or answering from the recordings
-  kept); `null` for `--full` and `--from`. `coverage` only gains fields.
+  kept); `null` for `--full` and `--from`. `partial` names each table read
+  from the catalog that it holds only in part, with what is missing:
+  `"spans"` and `"span_events"` are `"ran targets only"` (a cache hit's
+  spans are not kept), `"logs"` is `"not kept"`; `{}` when nothing read is
+  partial, and always for `--full` and `--from`. A non-empty `partial` is
+  also one line on stderr. `coverage` only gains fields.
 
 **Errors** exit 125, as `heph session`'s own errors do. A refused, invalid
 or stopped statement says so on stderr with SQLite's message (an unknown

@@ -17,7 +17,7 @@
 //! denylist and three schema pragmas; `trusted_schema` off, `DEFENSIVE` on, a
 //! 64 MiB value limit, and a progress handler that stops it at its timeout.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -215,6 +215,13 @@ GROUP BY package ORDER BY hit_pct, targets DESC, package",
 
 /// The explorer names the catalog holds: it keeps no logs.
 const CATALOG_HOLDS: &[&str] = &["sessions", "spans", "span_events", "metrics", "targets"];
+/// What the catalog holds of a table only in part (`coverage.partial`):
+/// the spans of what ran, not of cache hits, and no logs.
+const CATALOG_PARTIAL: &[(&str, &str)] = &[
+    ("spans", "ran targets only"),
+    ("span_events", "ran targets only"),
+    ("logs", "not kept"),
+];
 
 /// What a recording's explorer names derive from. Read only when each is a
 /// table, so a file whose `spans` is a view is not read at all.
@@ -427,6 +434,9 @@ pub struct Coverage {
     /// When the catalog was read: the start (unix ms) of the oldest session
     /// it holds. Nothing older is in the answer, whatever the window.
     pub reaches_ms: Option<u64>,
+    /// The tables read from the catalog that hold only part of what a
+    /// recording does, each with what is missing.
+    pub partial: BTreeMap<&'static str, &'static str>,
 }
 
 /// A query's answer.
@@ -983,6 +993,11 @@ fn in_place(
                 .iter()
                 .copied()
                 .filter(|t| CATALOG_HOLDS.contains(t))
+                .collect();
+            coverage.partial = CATALOG_PARTIAL
+                .iter()
+                .copied()
+                .filter(|(t, _)| checked.reads.contains(t))
                 .collect();
             coverage.reaches_ms =
                 catalog::reaches_ms(conn).context("reading how far the catalog reaches")?;

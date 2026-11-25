@@ -3,8 +3,8 @@
 //! (`--from`). The engine is `htui::tui::session::query`; this module picks
 //! the sources, wires SIGINT to its stop flag, and prints the answer.
 
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{IsTerminal as _, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -290,6 +290,18 @@ fn interrupted(stop: &AtomicBool) -> anyhow::Result<()> {
 
 /// The stderr lines saying the answer is incomplete.
 fn notes(c: &Coverage, note: &(dyn Fn(&str) + Send + Sync)) {
+    if !c.partial.is_empty() {
+        let what: Vec<String> = c
+            .partial
+            .iter()
+            .map(|(t, why)| format!("{t}: {why}"))
+            .collect();
+        note(&format!(
+            "heph: the catalog holds part of what was read ({}); --full or --from reads the \
+             recordings whole\n",
+            what.join("; ")
+        ));
+    }
     if c.skipped > 0 {
         note(&format!(
             "heph: skipped {} recording(s): a format this heph does not read, or unreadable\n",
@@ -453,6 +465,7 @@ struct JsonCoverage<'a> {
     skipped: usize,
     truncated: usize,
     reaches_ms: Option<u64>,
+    partial: &'a BTreeMap<&'static str, &'static str>,
 }
 
 /// A value under `--format json`: INTEGER a string, REAL a number (NaN and
@@ -488,6 +501,7 @@ fn write_json(answer: &Answer, out: &mut dyn Write) -> anyhow::Result<()> {
             skipped: answer.coverage.skipped,
             truncated: answer.coverage.truncated,
             reaches_ms: answer.coverage.reaches_ms,
+            partial: &answer.coverage.partial,
         },
     };
     serde_json::to_writer(&mut *out, &doc).context("writing the query's rows")?;

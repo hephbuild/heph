@@ -193,7 +193,8 @@ async fn query_formats() {
     assert_eq!(
         v["coverage"],
         serde_json::json!({
-            "catalog": [], "recordings": 1, "skipped": 0, "truncated": 0, "reaches_ms": null
+            "catalog": [], "recordings": 1, "skipped": 0, "truncated": 0, "reaches_ms": null,
+            "partial": {}
         })
     );
 
@@ -352,11 +353,7 @@ async fn query_sources_follow_the_window() {
     assert_eq!(v["rows"], serde_json::json!([["2"]]), "{v}");
     assert_eq!(v["coverage"]["catalog"], serde_json::json!(["sessions"]));
     // The catalog reaches its oldest session, outside the 7-day window.
-    assert_eq!(
-        v["coverage"]["reaches_ms"],
-        oldest.started_unix_ms(),
-        "{v}"
-    );
+    assert_eq!(v["coverage"]["reaches_ms"], oldest.started_unix_ms(), "{v}");
     let ran = run_query(&root, &["--format", "json", "--since", "30d", count], "").await;
     assert_eq!(
         json(&ran.out.expect("30d"))["rows"],
@@ -402,6 +399,68 @@ async fn query_stop_listener_is_armed_before_its_task_runs() {
     .expect("the signal raised before the task ran sets the stop flag");
 }
 
+/// PV2: a table the catalog holds only part of says so, in `--json`'s
+/// `coverage.partial` and in one stderr line: its spans are of the targets
+/// that ran, and it keeps no logs. A table it holds whole, and a recording,
+/// say nothing.
+#[tokio::test]
+async fn query_over_the_catalog_says_what_it_holds_in_part() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().join("sessions");
+    let id = session(&root, 0, 1).encode();
+    let cases: &[(&[&str], &str, serde_json::Value)] = &[
+        (
+            &[],
+            "SELECT count(*) FROM spans s JOIN span_events e ON e.span_id = s.span_id",
+            serde_json::json!({"spans": "ran targets only", "span_events": "ran targets only"}),
+        ),
+        (
+            &[],
+            "SELECT count(*) FROM logs",
+            serde_json::json!({"logs": "not kept"}),
+        ),
+        (&[], "SELECT count(*) FROM targets", serde_json::json!({})),
+        (
+            &["--from", &id],
+            "SELECT count(*) FROM spans, logs",
+            serde_json::json!({}),
+        ),
+        (
+            &["--full"],
+            "SELECT count(*) FROM logs",
+            serde_json::json!({}),
+        ),
+    ];
+    for (from, sql, want) in cases {
+        let argv: Vec<&str> = from
+            .iter()
+            .copied()
+            .chain(["--format", "json", sql])
+            .collect();
+        let ran = run_query(&root, &argv, "").await;
+        let v = json(&ran.out.unwrap_or_else(|e| panic!("{argv:?}: {e:#}")));
+        assert_eq!(&v["coverage"]["partial"], want, "{argv:?}");
+        let said: Vec<&String> = ran
+            .notes
+            .iter()
+            .filter(|n| n.contains("holds part of"))
+            .collect();
+        let partial = want.as_object().is_some_and(|m| !m.is_empty());
+        assert_eq!(
+            said.len(),
+            usize::from(partial),
+            "{argv:?}: {:?}",
+            ran.notes
+        );
+        if let Some(n) = said.first() {
+            for t in want.as_object().into_iter().flat_map(|m| m.keys()) {
+                assert!(n.contains(&format!("{t}: ")), "{n}");
+            }
+            assert!(n.contains("--full or --from"), "{n}");
+        }
+    }
+}
+
 /// A Ctrl-C while the sources open stops the query (`interrupted`, 130)
 /// over every kind of source, though the statement is too short for the
 /// engine's progress handler ever to look at the stop flag.
@@ -420,7 +479,11 @@ async fn query_stops_when_interrupted_opening_its_sources() {
         let ran = run_query_until(&root, &argv, "", Arc::new(NoDownload), stop).await;
         let e = ran.out.expect_err(&format!("{argv:?}: answered"));
         let (kind, code, _) = kind_and_code(e);
-        assert_eq!((kind, code), (ErrorKind::Interrupted, Some(130)), "{argv:?}");
+        assert_eq!(
+            (kind, code),
+            (ErrorKind::Interrupted, Some(130)),
+            "{argv:?}"
+        );
     }
 }
 
