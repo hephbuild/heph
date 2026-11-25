@@ -606,8 +606,10 @@ the recording passed its 256 MiB full cap, so output and log lines (and
 progress-only events) were dropped from there, and if it then reached its
 1 GiB ceiling, nothing but its `End` was recorded after that (see
 [Recording](#recording)). The text says which cap, how far into the run, and
-what was dropped. `pools` is `[{pool, unit, capacity, held_mean, held_peak,
-waiting_us}]`, one
+what was dropped. For a recording opened by path or URL, a non-null
+`foreign.partial` also means it is not whole, whatever `incomplete` says (see
+[Opening a recording](#opening-a-recording-ref)). `pools` is `[{pool, unit,
+capacity, held_mean, held_peak, waiting_us}]`, one
 per bounded pool with rows (see [Pools](#pools)): empty while the session is
 live, and for a build that admitted nothing. `capacity` is `null` when no
 row gave one. The comparison with machine samples (`declared_above_use_us`
@@ -630,11 +632,14 @@ the first lock chain, `null` when no chain leads to a session. `next` is
 
 The text `Next:` line prints `command` alone, its reason on the line below.
 
-A recording covers the whole run when `incomplete` is `false` and `state` is
-not `"lost"`, in `list --json` and `show --json` alike. `incomplete` speaks
-only of the size caps: a `lost` session's process went away without
-recording its end, so its last events may be missing whatever `incomplete`
-says (see "Why is my session `lost`?" under [Recipes](#recipes)).
+A recording covers the whole run when `state` is `"ok"` or `"failed"` and
+`incomplete` is `false`, in `list --json` and `show --json` alike. Any other
+`state` is not whole: `lost`, `snapshot` and `incomplete` say so, a live
+state (`running`, `waiting`, `quiet`) is a run not over yet, and a value this
+reader does not know is not whole either. `incomplete` speaks only of the
+size caps: a `lost` session's process went away without recording its end,
+so its last events may be missing whatever `incomplete` says (see "Why is my
+session `lost`?" under [Recipes](#recipes)).
 
 `inflight --json` is `{id, report}`.
 
@@ -920,6 +925,11 @@ snapshot, or a recording copied out of a run that never finished).
   `snapshot` (exported while it ran) or `incomplete` (no recorded end).
   Neither is `lost` or `running`, which describe a process this viewer
   cannot see. `state` is an open enum, as for a local session.
+- A recording read from a file is never a live stall: `show` draws no
+  "Stuck on" block for it, and its `blocked_on` is what the run waited on
+  at the time of the snapshot (or of its last record), with
+  `holder_session` and `chain_root` `null`, since the sessions that held
+  those locks are on the machine that ran it.
 - `attach <file>` says `heph: replaying <origin>` on stderr, replays the
   recording once, and exits with its recorded code. A recording with no
   `End` exits 125 ("has no recorded end"), never `lost`.

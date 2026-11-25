@@ -732,3 +732,67 @@ async fn a_snapshot_export_reads_only_itself() {
     );
     assert!(printed.starts_with("heph: replaying "), "{printed}");
 }
+
+/// A snapshot exported while its run waited on a lock: read elsewhere it is
+/// no live stall. The text draws no "Stuck on" block (that block is for a
+/// run this viewer watches), and `--json` keeps the wait in `blocked_on` as
+/// the recording left it, with no holder session: none of this machine's
+/// sessions is the one that held the lock.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_blocked_snapshot_is_no_live_stall() {
+    let sessions = tempfile::tempdir().expect("tempdir");
+    let id = SessionId::new(T0, 13);
+    let m = meta(id, 1, &["heph", "run", "//go/..."]);
+    let mut records = build_records("//go:sdk", T0, None);
+    records.push(record(
+        T0 + 100,
+        BuildEventKind::ResultLockWaitStart {
+            addr: "//go:sdk".into(),
+            holder_pid: Some(300),
+            in_use_by_readers: false,
+        },
+    ));
+    let live = write_live(sessions.path(), &m, &records, None);
+    let out = tempfile::tempdir().expect("tempdir");
+    let path = out.path().join("blocked.hephsession");
+    let exported = export::export_ref(
+        &FileSource::new(sessions.path()),
+        opts(),
+        &ExportArgs {
+            reference: id.encode(),
+            output: Some(path.clone()),
+            no_logs: true,
+        },
+        crate::engine::approval::read_notice_from_store,
+        &mut Vec::new(),
+        &no_opener(),
+    )
+    .await
+    .expect("export");
+    assert!(exported.snapshot);
+    drop((live, sessions));
+
+    let arg = path.display().to_string();
+    let ftmp = tempfile::tempdir().expect("tempdir");
+    let op = opener_in(ftmp.path(), NoDownload);
+    // A local session held by pid 300: a foreign wait never points at it.
+    let holder = SessionId::new(T0 + 9_000, 3);
+    let here = FakeSource {
+        sessions: vec![(
+            entry(meta(holder, 300, &["heph", "run", "//..."]), true, None),
+            Vec::new(),
+        )],
+    };
+    let sources: [&dyn SessionSource; 1] = [&here];
+    let text = show_with(&sources, &arg, false, &op).await.expect("show");
+    assert!(!text.contains("Stuck on"), "{text}");
+    assert!(!text.contains(&holder.encode()), "{text}");
+    let v = json(&show_with(&sources, &arg, true, &op).await.expect("show"));
+    assert_eq!(v["state"], "snapshot", "{v}");
+    assert_eq!(v["chain_root"], serde_json::Value::Null, "{v}");
+    assert_eq!(
+        v["blocked_on"],
+        serde_json::json!([{"kind": "lock", "addr": "//go:sdk", "holder_pid": 300, "holder_session": null}]),
+        "{v}"
+    );
+}
