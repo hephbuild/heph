@@ -325,6 +325,32 @@ fn human_report(dir: &Path, report: &ExportReport) -> Vec<String> {
     for (why, t) in &report.left_out {
         out.push(tally(&format!("left out: {why}"), t));
     }
+    let s = &report.scratch;
+    if [s.new, s.kept, s.carried_over, s.dropped]
+        .iter()
+        .any(|t| t.count > 0)
+        || s.skipped > 0
+    {
+        let slots = |label: &str, t: &Tally| {
+            format!(
+                "  scratch {label:<7} {:>5} slots      {}",
+                t.count,
+                human_bytes(t.bytes)
+            )
+        };
+        out.push(slots("kept", &s.kept));
+        out.push(slots("new", &s.new));
+        if s.carried_over.count > 0 {
+            out.push(slots("carried", &s.carried_over));
+        }
+        out.push(slots("dropped", &s.dropped));
+        if s.skipped > 0 {
+            out.push(format!(
+                "  scratch skipped {:>5} slots (opted out of the remote cache, or gone)",
+                s.skipped
+            ));
+        }
+    }
     out.push(format!("journals: {} consumed", report.journals.len()));
     for i in &report.incomplete {
         out.push(format!(

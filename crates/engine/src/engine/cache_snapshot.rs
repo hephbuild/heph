@@ -143,7 +143,9 @@ impl JournalAddr {
     }
 }
 
-/// A scratch slot this engine pulled or pushed: the snapshot meta it saw.
+/// A scratch slot this engine used in a build, pulled, or pushed: the
+/// snapshot meta its lineage descended from then (generation 0 and an empty
+/// `content_hash` when it descends from none).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RecordedScratch {
     pub slot: String,
@@ -281,6 +283,29 @@ impl Journal {
         self.seen.lock().len()
     }
 
+    /// Record a scratch slot published outside any request (`heph tool
+    /// scratch push`). Appended at once, with a clean `End` of its own: no
+    /// request's drop would flush it. Written once per engine, like a
+    /// request's entries.
+    pub(crate) fn record_scratch_now(&self, scratch: RecordedScratch) {
+        if !self.seen_scratch.lock().insert(scratch.clone()) {
+            return;
+        }
+        let Some(file) = self.file() else {
+            return;
+        };
+        let mut buf = Vec::with_capacity(256);
+        push_line(&mut buf, &Entry::Scratch(scratch).line());
+        push_line(
+            &mut buf,
+            &Line::End {
+                cancelled: false,
+                failed: false,
+            },
+        );
+        file.append(&buf);
+    }
+
     /// The open file, creating it on the first call.
     fn file(&self) -> Option<&JournalFile> {
         self.file
@@ -410,7 +435,7 @@ impl RequestJournal {
         });
     }
 
-    /// Record a scratch slot this request pulled.
+    /// Record a scratch slot this request used.
     pub(crate) fn record_scratch(&self, scratch: RecordedScratch) {
         if !self.journal.seen_scratch.lock().insert(scratch.clone()) {
             return;

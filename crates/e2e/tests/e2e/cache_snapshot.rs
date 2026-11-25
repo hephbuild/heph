@@ -1517,3 +1517,279 @@ async fn build_and_command_resolve_the_same_dir() {
         "the snapshot command never records"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Scratch slots (O3)
+// ---------------------------------------------------------------------------
+
+/// A traveling scratch (`c`) and one that opted out of the remote cache
+/// (`l`), and a target that reports what each held and leaves `marker` in
+/// both.
+fn scratch_build(marker: &str) -> String {
+    format!(
+        r#"
+target(name = "c", driver = "scratch", path = ".cache/c", env = "C", remote = True)
+target(name = "l", driver = "scratch", path = ".cache/l", env = "L", remote = False)
+target(name = "a", driver = "bash", out = "o.txt", scratch = ["//pkg:c", "//pkg:l"],
+       run = ["echo \"c=$(cat $C/m 2>/dev/null || echo cold) l=$(cat $L/m 2>/dev/null || echo cold)\" > $OUT",
+              "echo {marker} > $C/m", "echo {marker} > $L/m"])
+"#
+    )
+}
+
+/// One CI job's engine, or the snapshot command's (`record` false, no
+/// `dir`): scratch lineage `scope` falling back to `restore`, an optional
+/// `file://` bucket, and an optional snapshot dir.
+fn scratch_engine(
+    root: &Path,
+    dir: Option<&Path>,
+    bucket: Option<&Path>,
+    scope: &str,
+    restore: &[&str],
+    record: bool,
+) -> Arc<Engine> {
+    engine_with(Config {
+        remote_caches: bucket
+            .map(|b| heph::engine::RemoteCacheDef {
+                name: "shared".to_string(),
+                uri: format!("file://{}", b.display()),
+                read: true,
+                write: true,
+                concurrency: 10,
+                endpoint: None,
+                region: None,
+            })
+            .into_iter()
+            .collect(),
+        scratch: heph::engine::ScratchOptions {
+            scope: scope.to_string(),
+            restore_scopes: restore.iter().map(|s| (*s).to_string()).collect(),
+            seed_on_fork: true,
+        },
+        record_working_set: record,
+        cache_snapshot: dir.map(Path::to_path_buf),
+        ..Config::for_tests(root)
+    })
+}
+
+/// The slot `addr` declares, from the local store.
+fn slot_of(engine: &Engine, addr: &str) -> String {
+    engine
+        .scratch_slots()
+        .expect("scratch slots")
+        .into_iter()
+        .find(|s| s.meta.as_ref().is_some_and(|m| m.addr == addr))
+        .expect("a slot for the address")
+        .slot
+}
+
+/// Export the journals under `root` into `dir` as an engine in `scope`
+/// would (the snapshot command shares the build's config), consuming them.
+async fn export_scratch(root: &Path, dir: &Path, scope: &str, journals: usize) -> ExportReport {
+    let ws = WorkingSet::from_journals(read_settled(root, journals).await);
+    let lock = lock_snapshot(&home(root)).expect("snapshot lock");
+    let e = scratch_engine(root, None, None, scope, &[], false);
+    let report = e
+        .export_snapshot(&lock, dir, &ws, &StdCancellationToken::new())
+        .await
+        .expect("export");
+    for j in &ws.journals {
+        std::fs::remove_file(j).expect("consume journal");
+    }
+    report
+}
+
+/// The scratch entries of the current generation, as
+/// `<slot>/<scope>/<file>` relative to `scratch/v1/`, sorted.
+fn snapshot_scratch(dir: &Path) -> Vec<String> {
+    let current = read_marker(dir).expect("marker").marker.current;
+    let root = dir.join(current).join("scratch").join("v1");
+    let mut out = Vec::new();
+    for slot in std::fs::read_dir(&root).into_iter().flatten().flatten() {
+        for scope in std::fs::read_dir(slot.path()).expect("ls slot").flatten() {
+            for f in std::fs::read_dir(scope.path()).expect("ls scope").flatten() {
+                out.push(format!(
+                    "{}/{}/{}",
+                    slot.file_name().to_string_lossy(),
+                    scope.file_name().to_string_lossy(),
+                    f.file_name().to_string_lossy()
+                ));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+fn out_text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).trim().to_string()
+}
+
+/// A slot a job used is carried by its snapshot and pulled from it by the
+/// next job on a fresh machine with no bucket at all; a slot that opted out
+/// of the remote cache is not carried.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scratch_slots_are_carried_unless_opted_out() {
+    let parent = tempfile::tempdir().expect("parent");
+    let dir = parent.path().join("snap");
+
+    // Job 1: cold everywhere, no bucket. Using the slot is what puts it in
+    // the working set: there was nothing to pull and nothing was pushed.
+    let one = tempfile::tempdir().expect("machine one");
+    write_build(one.path(), &scratch_build("one"));
+    let e = scratch_engine(one.path(), Some(&dir), None, "main", &[], true);
+    let (out, _) = run_one(&e, "//pkg:a").await;
+    assert_eq!(out_text(&out), "c=cold l=cold");
+    let (carried, opted_out) = (slot_of(&e, "//pkg:c"), slot_of(&e, "//pkg:l"));
+    drop(e);
+    let report = export_scratch(one.path(), &dir, "main", 1).await;
+    assert_eq!(report.scratch.new.count, 1, "{report:?}");
+    assert!(report.scratch.new.bytes > 0, "{report:?}");
+    assert_eq!(report.scratch.skipped, 0, "{report:?}");
+    let entries = snapshot_scratch(&dir);
+    assert_eq!(entries.len(), 2, "{entries:?}");
+    assert!(
+        entries
+            .iter()
+            .all(|e| e.starts_with(&format!("{carried}/main/0000000000000000."))),
+        "{entries:?}"
+    );
+    assert!(
+        !entries.iter().any(|e| e.starts_with(&opted_out)),
+        "{entries:?}"
+    );
+
+    // Job 2: a fresh machine. The target changed, so it runs, and its
+    // scratch comes from the snapshot tier.
+    let two = tempfile::tempdir().expect("machine two");
+    write_build(two.path(), &scratch_build("two"));
+    let e = scratch_engine(two.path(), Some(&dir), None, "main", &[], true);
+    let head = e
+        .scratch_remote_head(&carried, "main", &[])
+        .await
+        .expect("the snapshot serves the slot");
+    assert_eq!(head.cache, "snapshot");
+    let (out, _) = run_one(&e, "//pkg:a").await;
+    assert_eq!(out_text(&out), "c=one l=cold");
+    drop(e);
+
+    // Its export publishes the changed slot as the next generation, and
+    // the previous one goes with the rest of what the job did not keep.
+    let report = export_scratch(two.path(), &dir, "main", 1).await;
+    assert_eq!(report.scratch.new.count, 1, "{report:?}");
+    assert_eq!(report.scratch.dropped.count, 1, "{report:?}");
+    let entries = snapshot_scratch(&dir);
+    assert_eq!(entries.len(), 2, "{entries:?}");
+    assert!(
+        entries
+            .iter()
+            .all(|e| e.starts_with(&format!("{carried}/main/0000000000000001."))),
+        "{entries:?}"
+    );
+}
+
+/// A slot `heph tool scratch push` published is in the working set though
+/// no request recorded the push, and is exported in the job's own scope
+/// only: as the pushed entry when unchanged (no new generation), and as
+/// `parent + 1` once a later job changed it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pushed_slot_is_exported_in_its_own_scope() {
+    let parent = tempfile::tempdir().expect("parent");
+    let dir = parent.path().join("snap");
+    let bucket = tempfile::tempdir().expect("bucket");
+
+    // The base branch published generation 0 of `main` to the bucket.
+    let base = tempfile::tempdir().expect("base machine");
+    write_build(base.path(), &scratch_build("base"));
+    let e = scratch_engine(base.path(), None, Some(bucket.path()), "main", &[], false);
+    run_one(&e, "//pkg:a").await;
+    let slot = slot_of(&e, "//pkg:c");
+    let head = heph::engine::scratch_store::head_dir(&e.home, &slot, "main");
+    e.scratch_push(&slot, "main", &head, None, "base")
+        .await
+        .expect("push main");
+    drop(e);
+
+    // A `feat` job: its build seeds the slot from `main` in the bucket...
+    let feat = tempfile::tempdir().expect("feat machine");
+    write_build(feat.path(), &scratch_build("feat"));
+    let e = scratch_engine(
+        feat.path(),
+        Some(&dir),
+        Some(bucket.path()),
+        "feat",
+        &["main"],
+        true,
+    );
+    let (out, _) = run_one(&e, "//pkg:a").await;
+    assert_eq!(out_text(&out), "c=base l=cold");
+    drop(e);
+    // ...and a separate process pushes it, as `heph tool scratch push` does.
+    let e = scratch_engine(
+        feat.path(),
+        Some(&dir),
+        Some(bucket.path()),
+        "feat",
+        &["main"],
+        true,
+    );
+    let head = heph::engine::scratch_store::head_dir(&e.home, &slot, "feat");
+    let from = heph::engine::scratch_remote::read_local_meta(&e.home, &slot, "feat");
+    assert_eq!(from.as_ref().map(|m| m.scope.as_str()), Some("main"));
+    let (generation, _) = e
+        .scratch_push(&slot, "feat", &head, from.as_ref(), "feat-1")
+        .await
+        .expect("push feat");
+    assert_eq!(generation, 0, "a fork starts its own lineage");
+    drop(e);
+    let journals = read_settled(feat.path(), 2).await;
+    assert!(
+        journals.iter().any(|j| j.revisions.is_empty()
+            && j.scratch
+                .iter()
+                .any(|s| s.slot == slot && s.scope == "feat")),
+        "the push alone records the slot: {journals:#?}"
+    );
+
+    let report = export_scratch(feat.path(), &dir, "feat", 2).await;
+    assert_eq!(
+        report.scratch.kept.count, 1,
+        "unchanged since the push: {report:?}"
+    );
+    assert_eq!(report.scratch.new.count, 0, "{report:?}");
+    let entries = snapshot_scratch(&dir);
+    assert_eq!(entries.len(), 2, "{entries:?}");
+    let prefix = format!("{slot}/feat/0000000000000000.");
+    assert!(
+        entries.iter().all(|e| e.starts_with(&prefix)),
+        "{entries:?}"
+    );
+    // The entry is the pushed one, byte for byte.
+    let current = read_marker(&dir).expect("marker").marker.current;
+    for e in &entries {
+        let rel = format!("scratch/v1/{e}");
+        assert_eq!(
+            std::fs::read(dir.join(&current).join(&rel)).expect("snapshot entry"),
+            std::fs::read(bucket.path().join(&rel)).expect("bucket entry"),
+            "{rel}"
+        );
+    }
+
+    // The next `feat` job, on a fresh machine with only the snapshot: it
+    // pulls generation 0, changes the slot, and exports generation 1.
+    let next = tempfile::tempdir().expect("next machine");
+    write_build(next.path(), &scratch_build("feat-2"));
+    let e = scratch_engine(next.path(), Some(&dir), None, "feat", &["main"], true);
+    let (out, _) = run_one(&e, "//pkg:a").await;
+    assert_eq!(out_text(&out), "c=feat l=cold");
+    drop(e);
+    let report = export_scratch(next.path(), &dir, "feat", 1).await;
+    assert_eq!(report.scratch.new.count, 1, "{report:?}");
+    let entries = snapshot_scratch(&dir);
+    let prefix = format!("{slot}/feat/0000000000000001.");
+    assert_eq!(entries.len(), 2, "{entries:?}");
+    assert!(
+        entries.iter().all(|e| e.starts_with(&prefix)),
+        "{entries:?}"
+    );
+}

@@ -155,6 +155,7 @@ fn json_report_and_exit_codes() {
         "incomplete",
         "top",
         "dropped_addrs",
+        "scratch",
     ];
     let at: Vec<usize> = order
         .iter()

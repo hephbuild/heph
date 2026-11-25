@@ -1017,10 +1017,14 @@ impl RequestState {
         }
     }
 
-    /// Record a scratch slot this request pulled, in the engine's journal.
-    pub(crate) fn record_scratch(&self, scratch: crate::engine::cache_snapshot::RecordedScratch) {
+    /// Record a scratch slot this request used, in the engine's journal.
+    /// `scratch` runs only when the engine records.
+    pub(crate) fn record_scratch(
+        &self,
+        scratch: impl FnOnce() -> crate::engine::cache_snapshot::RecordedScratch,
+    ) {
         if let Some(journal) = &self.data.journal {
-            journal.record_scratch(scratch);
+            journal.record_scratch(scratch());
         }
     }
 

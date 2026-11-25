@@ -585,13 +585,7 @@ impl Engine {
     /// `None` when the lineage was already warm, there was nothing to pull, or
     /// the pull failed — all three of which mean "cold", which by the scratch
     /// contract is a slowdown and nothing more.
-    async fn pull_if_cold(
-        &self,
-        rs: &RequestState,
-        slot: &str,
-        dir: &Path,
-        addr: &Addr,
-    ) -> Option<(u64, bool)> {
+    async fn pull_if_cold(&self, slot: &str, dir: &Path, addr: &Addr) -> Option<(u64, bool)> {
         // Unreadable counts as cold: if the directory cannot be listed, nothing
         // useful is in it either way.
         let cold = std::fs::read_dir(dir).map_or(true, |mut d| d.next().is_none());
@@ -635,14 +629,6 @@ impl Engine {
                     &opts.scope,
                     &head.meta,
                 );
-                // The working set: the slot, and the generation it came from
-                // (the parent the snapshot export publishes on top of).
-                rs.record_scratch(crate::engine::cache_snapshot::RecordedScratch {
-                    slot: slot.to_owned(),
-                    scope: head.meta.scope.clone(),
-                    generation: head.meta.generation,
-                    content_hash: head.meta.content_hash.clone(),
-                });
                 Some((bytes, path_mismatch))
             }
             Err(err) => {
@@ -769,13 +755,33 @@ impl Engine {
                     && !no_scratch
                     && !dropped
                     && let Some((bytes, path_mismatch)) =
-                        self.pull_if_cold(rs, slot, &dir, &r.addr).await
+                        self.pull_if_cold(slot, &dir, &r.addr).await
                 {
                     *cell.lock() = PrepareOutcome {
                         prepared: Some(Prepared::Pulled),
                         bytes,
                         path_mismatch,
                     };
+                }
+
+                // The working set: every slot a build used that may travel,
+                // pulled or not, so a cache snapshot carries a slot this job
+                // filled from cold as well as one it pulled. With the lineage
+                // it descends from, which the export publishes on top of.
+                if r.def.remote && !no_scratch {
+                    rs.record_scratch(|| {
+                        let scope = &self.cfg.scratch.scope;
+                        let parent =
+                            crate::engine::scratch_remote::read_local_meta(&self.home, slot, scope);
+                        crate::engine::cache_snapshot::RecordedScratch {
+                            slot: slot.to_owned(),
+                            scope: parent
+                                .as_ref()
+                                .map_or_else(|| scope.clone(), |p| p.scope.clone()),
+                            generation: parent.as_ref().map_or(0, |p| p.generation),
+                            content_hash: parent.map(|p| p.content_hash).unwrap_or_default(),
+                        }
+                    });
                 }
 
                 let prepared = cell.lock().prepared.unwrap_or(Prepared::Cold);

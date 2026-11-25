@@ -13,7 +13,11 @@
 //!    name is one this heph does not export.
 //! 4. Build `gen-<nonce>` revision by revision, each under its per-addr read
 //!    lock, with bounded concurrency on the blocking pool.
-//! 5. Point the marker at it (written last, by rename), then sweep again.
+//! 5. Publish the job's scratch slots into it under `scratch/v1/`, with
+//!    `scratch_push`'s rules ([`Engine::scratch_publish`]); on an incomplete
+//!    run, carry over the previous generation's entries of slots it did not
+//!    export.
+//! 6. Point the marker at it (written last, by rename), then sweep again.
 //!
 //! A crash anywhere before the marker moves leaves the previous generation
 //! current; the next export's sweep removes the half-built one.
@@ -212,6 +216,26 @@ pub struct ExportReport {
     pub top: Vec<RevisionBytes>,
     /// The targets of the dropped revisions, sorted.
     pub dropped_addrs: Vec<String>,
+    /// The scratch slots, counted by entry (a slot in one scope).
+    pub scratch: ScratchReport,
+}
+
+/// What an export did with scratch slots. Bytes are the archives'.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ScratchReport {
+    /// Slots the job used, published as a new generation of its scope.
+    pub new: Tally,
+    /// Slots the job used whose contents its lineage already held, written
+    /// under that entry: no new generation.
+    pub kept: Tally,
+    /// On an incomplete run, previous-generation entries of slots the job
+    /// exported nothing of.
+    pub carried_over: Tally,
+    /// Previous-generation entries the new generation does not hold.
+    pub dropped: Tally,
+    /// Slots the job used that were not exported: opted out of the remote
+    /// cache, no longer on disk, or unreadable.
+    pub skipped: u64,
 }
 
 impl ExportReport {
@@ -234,6 +258,7 @@ impl ExportReport {
                 .collect(),
             top: Vec::new(),
             dropped_addrs: Vec::new(),
+            scratch: ScratchReport::default(),
         }
     }
 
@@ -833,10 +858,11 @@ impl Engine {
         top.truncate(TOP_REVISIONS);
         report.top = top;
 
-        // Scratch seam: the job's scratch slots (`ws.scratch`) are written
-        // here, under `<generation>/scratch/v1/`, with `scratch_push`'s rules
-        // taking a destination — before the pointer moves, so they are part
-        // of the generation it names.
+        // Scratch slots, before the pointer moves, so they are part of the
+        // generation it names.
+        report.scratch = self
+            .export_scratch(ws, &generation, roots.prev.as_deref(), incomplete, ctoken)
+            .await?;
 
         before_pointer(&generation)?;
         {
@@ -853,6 +879,174 @@ impl Engine {
         };
         Ok(report)
     }
+
+    /// Write the job's scratch slots into `generation`, then carry or drop
+    /// the previous generation's.
+    ///
+    /// Each slot the job used is published in this engine's scope with
+    /// [`Engine::scratch_publish`]'s rules, from its local head and against
+    /// the lineage meta it descends from: `parent + 1`, or the parent's own
+    /// entry when the contents are unchanged. A slot that opted out of the
+    /// remote cache (or whose slot meta is gone, so it cannot say) is not
+    /// carried. One slot failing to pack is skipped and counted; a failed
+    /// write into `<dir>` (ENOSPC) fails the export.
+    async fn export_scratch(
+        &self,
+        ws: &WorkingSet,
+        generation: &Path,
+        prev: Option<&Path>,
+        incomplete: bool,
+        ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> anyhow::Result<ScratchReport> {
+        use crate::engine::scratch_remote::{ScratchDestination, read_local_meta};
+        use crate::engine::scratch_store::{head_dir, read_slot_meta};
+
+        let mut report = ScratchReport::default();
+        let scope = self.scratch_scope();
+        let mut exported: FxHashSet<&str> = FxHashSet::default();
+        let mut seen: FxHashSet<&str> = FxHashSet::default();
+        for slot in ws.scratch.iter().map(|s| s.slot.as_str()) {
+            if !seen.insert(slot) {
+                continue;
+            }
+            anyhow::ensure!(!ctoken.is_cancelled(), "cache snapshot export cancelled");
+            let dir = head_dir(&self.home, slot, scope);
+            if !read_slot_meta(&self.home, slot).is_some_and(|m| m.remote) || !dir.is_dir() {
+                tracing::debug!(slot, scope, "cache snapshot: scratch slot not carried");
+                report.skipped += 1;
+                continue;
+            }
+            let parent = read_local_meta(&self.home, slot, scope);
+            let dest = ScratchDestination::Dir {
+                root: generation,
+                prev,
+            };
+            match self
+                .scratch_publish(slot, scope, &dir, parent.as_ref(), "cache-snapshot", dest)
+                .await
+            {
+                Ok(p) if p.unchanged => report.kept.add(p.bytes),
+                Ok(p) => report.new.add(p.bytes),
+                Err(e) if is_storage_full(&e) => {
+                    return Err(e.context(format!("exporting scratch slot {slot}")));
+                }
+                Err(e) => {
+                    tracing::warn!(slot, scope, error = %format!("{e:#}"), "cache snapshot: could not export a scratch slot");
+                    report.skipped += 1;
+                    continue;
+                }
+            }
+            exported.insert(slot);
+        }
+
+        if let Some(prev) = prev {
+            let exported: FxHashSet<String> = exported.into_iter().map(str::to_owned).collect();
+            let (prev, generation) = (prev.to_path_buf(), generation.to_path_buf());
+            report = hcore::blocking::run(move || {
+                carry_scratch(&prev, &generation, &exported, incomplete, report)
+                    .map_err(io::Error::other)
+            })
+            .await?;
+        }
+        Ok(report)
+    }
+}
+
+fn is_storage_full(e: &anyhow::Error) -> bool {
+    e.chain()
+        .filter_map(|c| c.downcast_ref::<io::Error>())
+        .any(|io| io.kind() == io::ErrorKind::StorageFull)
+}
+
+/// Walk the previous generation's scratch entries
+/// (`scratch/v1/<slot>/<scope>/<stem>.{tar.gz,meta}`). One the new generation
+/// already holds was kept. On an incomplete run, one of a slot the job
+/// exported nothing of is carried over, linked or copied, when its meta
+/// decodes and its archive is a regular file. Every other one is dropped.
+fn carry_scratch(
+    prev: &Path,
+    generation: &Path,
+    exported: &FxHashSet<String>,
+    incomplete: bool,
+    mut report: ScratchReport,
+) -> anyhow::Result<ScratchReport> {
+    use crate::engine::scratch_remote::KEY_PREFIX;
+
+    let Ok(slots) = std::fs::read_dir(prev.join(KEY_PREFIX)) else {
+        return Ok(report);
+    };
+    for slot in slots.flatten() {
+        let slot_name = slot.file_name().to_string_lossy().into_owned();
+        let carry = incomplete && !exported.contains(&slot_name);
+        let Ok(scopes) = std::fs::read_dir(slot.path()) else {
+            continue;
+        };
+        for scope in scopes.flatten() {
+            let scope_name = scope.file_name().to_string_lossy().into_owned();
+            let Ok(files) = std::fs::read_dir(scope.path()) else {
+                continue;
+            };
+            for file in files.flatten() {
+                let name = file.file_name().to_string_lossy().into_owned();
+                let Some(stem) = name.strip_suffix(".meta") else {
+                    continue;
+                };
+                let rel = format!("{KEY_PREFIX}/{slot_name}/{scope_name}/{stem}");
+                if generation.join(format!("{rel}.meta")).exists() {
+                    continue;
+                }
+                let tar = prev.join(format!("{rel}.tar.gz"));
+                let bytes = std::fs::symlink_metadata(&tar)
+                    .ok()
+                    .filter(std::fs::Metadata::is_file)
+                    .map_or(0, |m| m.len());
+                if !carry {
+                    report.dropped.add(bytes);
+                    continue;
+                }
+                if carry_scratch_entry(prev, generation, &rel)? {
+                    report.carried_over.add(bytes);
+                } else {
+                    report.dropped.add(bytes);
+                }
+            }
+        }
+    }
+    Ok(report)
+}
+
+/// Carry one previous-generation scratch entry, archive then meta.
+/// `Ok(false)` when it is not one this heph reads.
+fn carry_scratch_entry(prev: &Path, generation: &Path, rel: &str) -> anyhow::Result<bool> {
+    use crate::engine::scratch_remote::{SNAPSHOT_FORMAT, SnapshotMeta};
+    use borsh::BorshDeserialize as _;
+
+    let meta_src = prev.join(format!("{rel}.meta"));
+    let tar_src = prev.join(format!("{rel}.tar.gz"));
+    // Only a regular file is linked: a symlink would point out of `<dir>`.
+    let regular = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_file());
+    if !regular(&meta_src) || !regular(&tar_src) {
+        return Ok(false);
+    }
+    let readable = std::fs::read(&meta_src)
+        .ok()
+        .and_then(|b| SnapshotMeta::try_from_slice(&b).ok())
+        .is_some_and(|m| m.format == SNAPSHOT_FORMAT);
+    if !readable {
+        return Ok(false);
+    }
+    let tar_dst = generation.join(format!("{rel}.tar.gz"));
+    let parent = tar_dst.parent().context("scratch entry has no parent")?;
+    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    for (src, dst) in [
+        (tar_src, tar_dst),
+        (meta_src, generation.join(format!("{rel}.meta"))),
+    ] {
+        if std::fs::hard_link(&src, &dst).is_err() {
+            std::fs::copy(&src, &dst).with_context(|| format!("copying {}", src.display()))?;
+        }
+    }
+    Ok(true)
 }
 
 #[cfg(test)]
