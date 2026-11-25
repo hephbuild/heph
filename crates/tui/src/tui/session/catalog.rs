@@ -1403,4 +1403,52 @@ mod tests {
             .expect("the session's row");
         assert_eq!(complete, 1);
     }
+
+    /// Which failed copies a heal blames on the catalog (and stops) rather
+    /// than on the recording (and records a heal failure): busy, full,
+    /// read-only and I/O always; corrupt and not-a-database only when the
+    /// catalog itself no longer reads, since a broken recording raises them
+    /// too.
+    #[test]
+    fn catalog_failed_blames_the_catalog_only_for_its_own_errors() {
+        use rusqlite::ffi;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let healthy = open_rw(tmp.path(), true).expect("open");
+        ensure_schema(&healthy, false).expect("schema");
+        let garbage = tmp.path().join("garbage.db");
+        std::fs::write(&garbage, [0x5a_u8; 8192]).expect("write");
+        let broken = Connection::open(&garbage).expect("open lazily");
+
+        let sqlite = |code| rusqlite::Error::SqliteFailure(ffi::Error::new(code), None);
+        // (case, error, blamed with a healthy catalog, with a broken one)
+        let cases = [
+            ("DiskFull", sqlite(ffi::SQLITE_FULL), true, true),
+            ("Busy", sqlite(ffi::SQLITE_BUSY), true, true),
+            ("Locked", sqlite(ffi::SQLITE_LOCKED), true, true),
+            ("ReadOnly", sqlite(ffi::SQLITE_READONLY), true, true),
+            ("IoErr", sqlite(ffi::SQLITE_IOERR_WRITE), true, true),
+            ("Corrupt", sqlite(ffi::SQLITE_CORRUPT), false, true),
+            ("NotADB", sqlite(ffi::SQLITE_NOTADB), false, true),
+            ("Constraint", sqlite(ffi::SQLITE_CONSTRAINT), false, false),
+            (
+                "not SQLite's",
+                rusqlite::Error::QueryReturnedNoRows,
+                false,
+                false,
+            ),
+        ];
+        for (case, e, on_healthy, on_broken) in &cases {
+            assert_eq!(
+                catalog_failed(&healthy, e),
+                *on_healthy,
+                "{case}, healthy catalog"
+            );
+            assert_eq!(
+                catalog_failed(&broken, e),
+                *on_broken,
+                "{case}, broken catalog"
+            );
+        }
+    }
 }
