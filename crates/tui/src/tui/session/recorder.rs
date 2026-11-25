@@ -44,8 +44,10 @@ use rusqlite::Connection;
 use tokio::sync::mpsc::error::TryRecvError;
 
 use super::cleanup::{self, Retention};
+use super::derive::machine;
 use super::format::{
-    ApprovalPrompt, ApprovalStanding, SessionEnd, SessionRecord, SessionRecordKind, SessionSnapshot,
+    ApprovalPrompt, ApprovalStanding, MachineInfoRecord, MachineSourceFailure, SessionEnd,
+    SessionRecord, SessionRecordKind, SessionSnapshot,
 };
 use super::holder::{HolderNames, event_holder_pid};
 use super::id::SessionId;
@@ -813,14 +815,34 @@ impl Anchor {
         };
         SessionRecord::session(time_unix_us / 1000, kind)
     }
+
+    /// The record of a sampler that failed to start: a `MachineInfo` with no
+    /// figure and one failure, source [`machine::SAMPLER_SOURCE`], so a
+    /// reader tells it from a recording made before machine stats (which has
+    /// no machine record at all).
+    fn start_failure(self, error: &io::Error) -> SessionRecord {
+        let rec = MachineInfoRecord {
+            time_unix_us: self.unix_us,
+            failed: vec![MachineSourceFailure {
+                source: machine::SAMPLER_SOURCE.to_owned(),
+                error: error.to_string(),
+            }],
+            ..MachineInfoRecord::default()
+        };
+        SessionRecord::session(
+            self.unix_us / 1000,
+            SessionRecordKind::MachineInfo(Box::new(rec)),
+        )
+    }
 }
 
 /// Start the recorder's sampler, or the test's in its place. A failure to
-/// start it only logs: the recording goes on without machine stats.
+/// start it does not stop the recording: it goes on without machine stats,
+/// and records the failure ([`Anchor::start_failure`]).
 fn spawn_sampler(
     faults: &Faults,
     shared: &Arc<Shared>,
-) -> Option<(Sampler, mpsc::Receiver<Reading>)> {
+) -> io::Result<(Sampler, mpsc::Receiver<Reading>)> {
     let shared = Arc::clone(shared);
     // The sampler stops once the recorder has latched stopped: nothing would
     // write its readings.
@@ -829,9 +851,7 @@ fn spawn_sampler(
         Some(spawn) => (spawn.0)(Box::new(latched)),
         None => Sampler::spawn(latched),
     };
-    spawned
-        .inspect_err(|e| tracing::debug!(error = %e, "cannot start the machine sampler"))
-        .ok()
+    spawned.inspect_err(|e| tracing::debug!(error = %e, "cannot start the machine sampler"))
 }
 
 /// What the recorder thread starts with.
@@ -994,7 +1014,10 @@ impl Recorder {
         }
         // The anchor first, so no reading predates it.
         let anchor = Anchor::now();
-        let (sampler, readings) = spawn_sampler(&faults, &thread_shared).unzip();
+        let (sampler, readings, sampler_failed) = match spawn_sampler(&faults, &thread_shared) {
+            Ok((sampler, readings)) => (Some(sampler), Some(readings), None),
+            Err(e) => (None, None, Some(anchor.start_failure(&e))),
+        };
         // One value, so the connection drops before its registration even if
         // the thread never starts (a tuple drops in order).
         let write = (conn, rw);
@@ -1029,6 +1052,12 @@ impl Recorder {
                     shared: thread_shared,
                     faults,
                 };
+                if let Some(rec) = &sampler_failed
+                    && let Err(e) = thread.record(rec)
+                {
+                    thread.fail("cannot record the machine sampler's failure", &e);
+                    return;
+                }
                 thread.run(&rx);
             })?;
         Ok(Self {

@@ -227,6 +227,9 @@ pub mod machine {
     pub const SESSION_RESIDENT_PEAK: &str = "heph.session.process.memory.resident.peak";
     /// The `heph.session` span event a stopped sampler source becomes.
     pub const SAMPLER_STOPPED: &str = "heph.sampler.stopped";
+    /// The `heph.sampler.source` of a sampler that never started: every
+    /// source at once, before the first reading.
+    pub const SAMPLER_SOURCE: &str = "sampler";
     /// The metrics a sample writes each tick: what the catalog never copies
     /// (D25).
     pub const PER_SAMPLE: [&str; 4] = [CPU_BUSY, MEMORY_USED, PROCESS_CPU_TIME, PROCESS_RESIDENT];

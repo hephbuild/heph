@@ -24,7 +24,7 @@ use super::{
 use crate::tui::session::recording::{ForeignSource, RecordingState};
 use crate::tui::session::{
     ApprovalStanding, HeaderKind, SessionEntry, SessionItem, SessionMeta, SessionRecordKind,
-    SessionSnapshot, SessionSource, Summaries,
+    SessionSnapshot, SessionSource, Summaries, derive,
     format::{
         AdmissionWaitEntry, ListTotals, LockWaitEntry, RunningTarget, SessionEnd, SnapshotCounts,
     },
@@ -725,9 +725,7 @@ fn machine_lines(m: &MachineSummary, started_ms: u64) -> String {
         MachineStatus::None => parts.push(match m.reason {
             Some(NoneReason::OlderDerivation) => "none: recorded before machine stats".to_owned(),
             _ if !limits.is_empty() => "no samples (shorter than one tick)".to_owned(),
-            _ => {
-                "none: no samples (shorter than one tick, or the sampler did not start)".to_owned()
-            }
+            _ => "none: no samples (shorter than one tick)".to_owned(),
         }),
         MachineStatus::Failed => parts.push("no samples: the sampler's sources stopped".to_owned()),
         MachineStatus::Sampled | MachineStatus::Partial => {
@@ -762,6 +760,13 @@ fn machine_lines(m: &MachineSummary, started_ms: u64) -> String {
     }
     let mut out = format!("machine: {}\n", parts.join("; "));
     for f in &m.sources_failed {
+        if f.source == derive::machine::SAMPLER_SOURCE {
+            out.push_str(&format!(
+                "the sampler did not start: {}\n",
+                escape(&f.error)
+            ));
+            continue;
+        }
         out.push_str(&format!(
             "the sampler stopped reading {} {} into the run: {}\n",
             escape(&f.source),

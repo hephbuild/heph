@@ -123,7 +123,11 @@ async fn show_both(sources: &[&dyn SessionSource], id: SessionId) -> (String, se
 fn machine_lines(out: &str) -> Vec<&str> {
     out.lines()
         .skip_while(|l| !l.starts_with("machine: "))
-        .take_while(|l| l.starts_with("machine: ") || l.starts_with("the sampler stopped"))
+        .take_while(|l| {
+            l.starts_with("machine: ")
+                || l.starts_with("the sampler stopped")
+                || l.starts_with("the sampler did not start")
+        })
         .collect()
 }
 
@@ -323,41 +327,57 @@ async fn show_prints_machine_line() {
     assert_eq!(m["cpus"], 8, "{m}");
     assert!(m.get("cpu_busy_mean").is_none(), "{m}");
 
-    // None, a sampler that never started: no machine row, but derived by a
-    // heph with machine stats. The wait reads unknown.
+    // Failed, a sampler that never started: the recorder writes its failure
+    // as a source named `sampler`, so it is not read as an older heph's.
+    // The wait reads unknown.
     let admission = [("heph.admission", 1_000_000, 2_000_000)];
-    let (unsampled, _) = write(run(Vec::new(), &admission), true);
+    let not_started = SessionRecord::session(
+        T0,
+        SessionRecordKind::MachineInfo(Box::new(MachineInfoRecord {
+            time_unix_us: T0_US,
+            failed: failures(&[("sampler", "Resource temporarily unavailable")]),
+            ..MachineInfoRecord::default()
+        })),
+    );
+    let (unsampled, _) = write(run(vec![not_started], &admission), true);
     let (text, m) = show_both(&sources, unsampled).await;
     assert_eq!(
         machine_lines(&text),
         [
-            "machine: none: no samples (shorter than one tick, or the sampler did not start); \
-             waiting: admission 1.0s (1.0s unknown)"
+            "machine: no samples: the sampler's sources stopped; \
+             waiting: admission 1.0s (1.0s unknown)",
+            "the sampler did not start: Resource temporarily unavailable",
         ],
         "{text}"
     );
-    assert_eq!(m["status"], "none", "{m}");
-    assert_eq!(m["reason"], "no_samples", "{m}");
+    assert_eq!(m["status"], "failed", "{m}");
+    assert!(m.get("reason").is_none(), "{m}");
     assert!(m.get("cpus").is_none(), "{m}");
+    assert_eq!(m["sources_failed"][0]["source"], "sampler", "{m}");
     assert_eq!(
         m["waiting"]["by_phase"]["admission"],
         json!({"busy_us": 0, "spare_us": 0, "unknown_us": 1_000_000}),
     );
 
-    // None, recorded before machine stats: derivation 1, read as it is.
-    let (older, _) = write(run(Vec::new(), &admission), true);
-    let conn = rusqlite::Connection::open(root.join(older.encode()).join(store::FILE))
-        .expect("open the recording");
-    conn.execute("UPDATE session SET derivation = 1", [])
-        .expect("as PR 4 derived it");
-    drop(conn);
-    let (text, m) = show_both(&sources, older).await;
-    assert_eq!(
-        machine_lines(&text),
-        ["machine: none: recorded before machine stats; waiting: admission 1.0s (1.0s unknown)"],
-        "{text}"
-    );
-    assert_eq!(m["status"], "none", "{m}");
-    assert_eq!(m["reason"], "older_derivation", "{m}");
-    assert_eq!(m["sources_failed"], json!([]), "{m}");
+    // None, recorded before machine stats: no machine record at all, as PR 4
+    // derived it (derivation 1) and as re-derived since (show repairs it).
+    for derivation in [Some(1), None] {
+        let (older, _) = write(run(Vec::new(), &admission), true);
+        if let Some(d) = derivation {
+            let conn = rusqlite::Connection::open(root.join(older.encode()).join(store::FILE))
+                .expect("open the recording");
+            conn.execute("UPDATE session SET derivation = ?1", [d])
+                .expect("as PR 4 derived it");
+        }
+        let (text, m) = show_both(&sources, older).await;
+        assert_eq!(
+            machine_lines(&text),
+            ["machine: none: recorded before machine stats; \
+                 waiting: admission 1.0s (1.0s unknown)"],
+            "{derivation:?}: {text}"
+        );
+        assert_eq!(m["status"], "none", "{m}");
+        assert_eq!(m["reason"], "older_derivation", "{m}");
+        assert_eq!(m["sources_failed"], json!([]), "{m}");
+    }
 }

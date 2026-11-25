@@ -1330,6 +1330,68 @@ fn machine_rows_are_non_critical() {
     assert_eq!(machine_rows, 0);
 }
 
+/// Decision (a): a sampler that fails to start is recorded as one failed
+/// source named `sampler` (a `MachineInfo` with no figure), so the
+/// recording reads `failed`, not as one from before machine stats; the
+/// recording itself goes on.
+#[test]
+fn a_sampler_that_does_not_start_is_recorded_as_failed() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let spawn = recorder::SpawnSampler(Arc::new(|_latched| {
+        Err(io::Error::other("no thread for the sampler"))
+    }));
+    let rec = recorder_with(
+        root.path(),
+        Faults {
+            sampler: Some(spawn),
+            ..Faults::default()
+        },
+    );
+    let tap = rec.tap();
+    for ev in events() {
+        tap.event(ev);
+    }
+    rec.recorder.finish(Some(1), false, Duration::from_secs(10));
+
+    let (records, _) = read_records(rec.dir());
+    let machine: Vec<_> = records.iter().filter(|r| is_machine(r)).collect();
+    let [only] = machine.as_slice() else {
+        panic!("one machine record: {machine:?}");
+    };
+    assert_eq!(
+        only.session,
+        Some(SessionRecordKind::MachineInfo(Box::new(
+            format::MachineInfoRecord {
+                time_unix_us: match &only.session {
+                    Some(SessionRecordKind::MachineInfo(i)) => i.time_unix_us,
+                    _ => 0,
+                },
+                failed: vec![format::MachineSourceFailure {
+                    source: "sampler".into(),
+                    error: "no thread for the sampler".into(),
+                }],
+                ..format::MachineInfoRecord::default()
+            }
+        )))
+    );
+    assert!(
+        records
+            .iter()
+            .any(|r| matches!(r.session, Some(SessionRecordKind::End { .. })))
+    );
+
+    let m = super::machine::read_machine(&open(rec.dir()).conn).expect("the machine summary");
+    assert_eq!(m.status, super::machine::MachineStatus::Failed, "{m:?}");
+    assert_eq!(m.reason, None);
+    assert_eq!(m.cpus, None);
+    let failed: Vec<_> = m
+        .sources_failed
+        .iter()
+        .map(|f| (f.source.as_str(), f.error.as_str()))
+        .collect();
+    assert_eq!(failed, [("sampler", "no thread for the sampler")]);
+}
+
 /// `count(*)` of `sql` over the recording in `dir`.
 fn open_conn_count(dir: &Path, sql: &str) -> i64 {
     open(dir).conn.query_row(sql, [], |r| r.get(0)).expect(sql)

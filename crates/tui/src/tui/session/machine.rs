@@ -9,8 +9,8 @@
 
 use std::collections::BTreeMap;
 
+use rusqlite::Connection;
 use rusqlite::types::ValueRef;
-use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 
 use super::derive::{SESSION_SPAN, machine as names};
@@ -49,16 +49,14 @@ pub enum MachineStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NoneReason {
-    /// Its explorer rows were derived by a heph from before machine stats
-    /// (a derivation below [`MACHINE_DERIVATION`]), read as they are.
+    /// No machine record at all: recorded by a heph from before machine
+    /// stats, whose recorder writes its start-time figures (or the failure
+    /// to start its sampler) first. Re-deriving it changes nothing.
     OlderDerivation,
-    /// Derived by a heph with machine stats, but nothing sampled: the run
-    /// was shorter than one tick, or the sampler never started.
+    /// The start-time figures, but no sample: the run was shorter than one
+    /// tick.
     NoSamples,
 }
-
-/// The derivation that first wrote machine rows (`store::DERIVATION` 2).
-pub const MACHINE_DERIVATION: u32 = 2;
 
 /// Where a limit came from. An open enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -286,18 +284,16 @@ pub fn read_machine(conn: &Connection) -> rusqlite::Result<MachineSummary> {
         (false, false) => MachineStatus::Failed,
         (false, true) => MachineStatus::None,
     };
-    m.reason = None;
-    if m.status == MachineStatus::None {
-        // Only the derivation tells an older heph's recording from a run
-        // whose sampler never started: neither has a machine row.
-        let derivation: Option<i64> = conn
-            .query_row("SELECT derivation FROM session", [], |r| r.get(0))
-            .optional()?;
-        m.reason = Some(match derivation {
-            Some(d) if d < i64::from(MACHINE_DERIVATION) => NoneReason::OlderDerivation,
-            _ => NoneReason::NoSamples,
-        });
-    }
+    // A heph with machine stats always records something first: the
+    // start-time figures, or why they (or the whole sampler) could not be
+    // read, which makes the status `failed`. So nothing at all is a
+    // recording from before machine stats, at any derivation.
+    let started = m.cpus.is_some() || m.cpu_limit.is_some() || m.memory_limit_bytes.is_some();
+    m.reason = (m.status == MachineStatus::None).then_some(if started {
+        NoneReason::NoSamples
+    } else {
+        NoneReason::OlderDerivation
+    });
     m.waiting.by_phase = read_waiting(conn)?;
     Ok(m)
 }
