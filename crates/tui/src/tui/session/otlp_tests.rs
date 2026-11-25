@@ -137,9 +137,14 @@ fn otlp_export_round_trips() {
         (1, 1, 1),
         "{text}"
     );
+    round_trips(&path, &d, written);
+}
 
+/// What `text` decoded to (`d`) holds every explorer row of the recording
+/// at `path`, whatever lines it was cut into.
+fn round_trips(path: &Path, d: &Decoded, written: Written) {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let ex = explorer(&path, tmp.path());
+    let ex = explorer(path, tmp.path());
     let conn = ex.conn();
     let count = |t: &str| -> usize {
         conn.query_row(&format!("SELECT count(*) FROM {t}"), [], |r| {
@@ -184,7 +189,13 @@ fn otlp_export_round_trips() {
     );
 
     // Every span, by id and name, with its events.
-    let spans: Vec<&trace::Span> = rs.scope_spans.iter().flat_map(|s| &s.spans).collect();
+    let spans: Vec<&trace::Span> = d
+        .traces
+        .iter()
+        .flat_map(|t| &t.resource_spans)
+        .flat_map(|r| &r.scope_spans)
+        .flat_map(|s| &s.spans)
+        .collect();
     assert_eq!(spans.len(), count("spans"));
     assert_eq!(written.spans, spans.len());
     let got: BTreeSet<String> = spans
@@ -339,6 +350,139 @@ fn otlp_export_round_trips() {
         ms.iter()
             .any(|m| matches!(m.data, Some(metrics::metric::Data::Gauge(_))))
     );
+}
+
+/// A session of thousands of spans, logs and metric points is cut into
+/// lines of at most `LINE_ITEMS` each (a metric runs on into the next
+/// line), each line a valid message of its signal, spans first, then logs,
+/// then metrics; and together the lines still hold every row exactly.
+#[test]
+fn otlp_cuts_a_large_session_into_bounded_lines() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join(store::FILE);
+    std::fs::copy(fixture(), &path).expect("copy the fixture");
+    let many = otlp::LINE_ITEMS * 2 + 500;
+    rusqlite::Connection::open(&path)
+        .expect("open the copy")
+        .execute_batch(&format!(
+            "CREATE TEMP TABLE k AS WITH RECURSIVE k(i) AS \
+               (SELECT 1 UNION ALL SELECT i + 1 FROM k WHERE i < {many}) SELECT i FROM k;
+             INSERT INTO spans (session_id, span_id, parent_span_id, name, class, addr, \
+               start_us, end_us, duration_us, status, attributes) \
+               SELECT s.id, 1000000 + i, NULL, 'heph.result', 'result', '//many:t' || i, \
+                 s.started_ms * 1000 + i, s.started_ms * 1000 + i + 10, 10, 'ok', \
+                 json_object('n', i) FROM temp.k, session s;
+             INSERT INTO span_events (session_id, span_id, name, time_us, attributes) \
+               SELECT s.id, 1000000 + i, 'cache.miss', s.started_ms * 1000 + i + 5, NULL \
+               FROM temp.k, session s WHERE i % 2 = 0;
+             INSERT INTO records (at_ms, kind, addr, body) \
+               SELECT s.started_ms + i, 'Log', NULL, json_object('session', \
+                 json_object('type', 'Log', 'level', 'info', 'msg', 'line ' || i)) \
+               FROM temp.k, session s;
+             INSERT INTO metrics (session_id, name, kind, unit, time_us, value, attributes) \
+               SELECT s.id, 'heph.many', 'gauge', '1', s.started_ms * 1000 + i, i, NULL \
+               FROM temp.k, session s;"
+        ))
+        .expect("grow the recording");
+
+    let (text, written) = export(&path);
+    assert!(written.spans > many && written.logs > many && written.points > many);
+    let d = decode(&text);
+    let lines = |items: usize| items.div_ceil(otlp::LINE_ITEMS);
+    assert_eq!(
+        (d.traces.len(), d.logs.len(), d.metrics.len()),
+        (
+            lines(written.spans),
+            lines(written.logs),
+            lines(written.points)
+        ),
+        "{written:?}"
+    );
+    let spans: Vec<usize> = d
+        .traces
+        .iter()
+        .map(|t| {
+            t.resource_spans
+                .iter()
+                .flat_map(|r| &r.scope_spans)
+                .map(|s| s.spans.len())
+                .sum()
+        })
+        .collect();
+    let logs: Vec<usize> = d
+        .logs
+        .iter()
+        .map(|l| {
+            l.resource_logs
+                .iter()
+                .flat_map(|r| &r.scope_logs)
+                .map(|s| s.log_records.len())
+                .sum()
+        })
+        .collect();
+    let points: Vec<usize> = d
+        .metrics
+        .iter()
+        .map(|m| {
+            m.resource_metrics
+                .iter()
+                .flat_map(|r| &r.scope_metrics)
+                .flat_map(|s| &s.metrics)
+                .map(|m| match m.data.as_ref().expect("data") {
+                    metrics::metric::Data::Gauge(g) => g.data_points.len(),
+                    metrics::metric::Data::Sum(s) => s.data_points.len(),
+                    other => panic!("unexpected metric data {other:?}"),
+                })
+                .sum()
+        })
+        .collect();
+    for (signal, per_line) in [("spans", &spans), ("logs", &logs), ("points", &points)] {
+        let (last, full) = per_line.split_last().expect("a line");
+        assert!(
+            full.iter().all(|&n| n == otlp::LINE_ITEMS) && (1..=otlp::LINE_ITEMS).contains(last),
+            "{signal} a line: {per_line:?}"
+        );
+    }
+    let many_in = d
+        .metrics
+        .iter()
+        .filter(|m| {
+            m.resource_metrics
+                .iter()
+                .flat_map(|r| &r.scope_metrics)
+                .flat_map(|s| &s.metrics)
+                .any(|m| m.name == "heph.many")
+        })
+        .count();
+    assert_eq!(many_in, 3, "one metric runs on across lines");
+    // Each line is bounded: a line of spans is far from the session's size.
+    let longest = text.lines().map(str::len).max().unwrap_or_default();
+    assert!(
+        longest < text.len() / 2,
+        "longest line {longest} of {}",
+        text.len()
+    );
+    // The signals' lines in order: every span line, then logs, then metrics.
+    let order: Vec<&str> = text
+        .lines()
+        .map(|l| {
+            let v: Json = serde_json::from_str(l).expect("a JSON line");
+            match v
+                .as_object()
+                .and_then(|o| o.keys().next())
+                .map(String::as_str)
+            {
+                Some("resourceSpans") => "spans",
+                Some("resourceLogs") => "logs",
+                _ => "metrics",
+            }
+        })
+        .collect();
+    let mut sorted = order.clone();
+    sorted.sort_by_key(|s| ["spans", "logs", "metrics"].iter().position(|x| x == s));
+    assert_eq!(order, sorted);
+
+    round_trips(&path, &d, written);
 }
 
 fn dps_start(points: &[metrics::NumberDataPoint]) -> bool {

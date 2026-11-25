@@ -1239,9 +1239,13 @@ nothing runs in the build to produce it.
 
 - `<ref>` is any `<ref>`: a local session, or a `.hephsession` file by path
   or URL. A session and its `.hephsession` export write the same lines.
-- One line per signal, in this order: a `TracesData`, a `LogsData`, a
-  `MetricsData` (each the JSON of the matching collector export request).
-  A signal with nothing in it writes no line.
+- Each line is a `TracesData`, a `LogsData` or a `MetricsData` (the JSON
+  of the matching collector export request) holding at most 1000 spans,
+  log records or metric data points. The span lines come first, then the
+  log lines, then the metric lines. A signal with nothing in it writes no
+  line. A metric with more points than fit goes on in the next line, as a
+  metric of the same name, kind and unit. The export holds one line in
+  memory, not the whole session.
 - `-o PATH` writes `PATH` through a temp file beside it, renamed into place,
   replacing a file already there; the default is `./heph-<id>.otlp.jsonl`.
   `-o -` writes the lines to stdout, a terminal included (it is text). On

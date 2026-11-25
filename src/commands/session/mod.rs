@@ -132,7 +132,7 @@ pub enum SessionCommands {
     /// is a snapshot, and says so. Prints the path written.
     ///
     /// `--format otlp` writes the session's spans, logs and metrics as
-    /// OTLP/JSON lines instead (one line per signal), for an OpenTelemetry
+    /// OTLP/JSON lines instead (at most 1000 items a line), for an OpenTelemetry
     /// collector's `otlpjsonfile` receiver or any OTLP tool.
     ///
     /// Examples:

@@ -1,8 +1,11 @@
 //! `heph session export --format otlp` (spec "OTLP out", D11, D13): a
 //! recording's spans, logs and metrics as OTLP/JSON, the file format the
-//! collector's `otlpjsonfile` receiver reads. One line per signal, each a
-//! `TracesData` / `LogsData` / `MetricsData` (the shape of the matching
-//! export request); a signal with nothing to say writes no line.
+//! collector's `otlpjsonfile` receiver reads. Each line is a `TracesData` /
+//! `LogsData` / `MetricsData` (the shape of the matching export request) of
+//! one session and at most [`LINE_ITEMS`] spans, log records or data points;
+//! the spans' lines come first, then the logs', then the metrics'. A signal
+//! with nothing to say writes no line. Rows are streamed: an export holds
+//! one line in memory, not the session.
 //!
 //! Written from the explorer names ([`Explorer`]), after the fact: nothing
 //! runs in the build to produce it. The messages are the OTLP proto types
@@ -26,7 +29,6 @@
 //!   monotonic cumulative sum from the session's start, `gauge` (and a kind
 //!   this heph does not know) a gauge.
 
-use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 
 use anyhow::Context as _;
@@ -56,68 +58,93 @@ pub struct Written {
     pub points: usize,
 }
 
+/// Spans, log records or metric data points one line holds at most, so an
+/// export holds one line's worth in memory, whatever the session's size.
+pub const LINE_ITEMS: usize = 1000;
+
 /// Write `explorer`'s sessions to `out` as OTLP/JSON lines.
 pub fn write(explorer: &Explorer, out: &mut dyn Write) -> anyhow::Result<Written> {
+    write_lines(explorer, out, LINE_ITEMS)
+}
+
+/// [`write`], with at most `per_line` items a line.
+pub(crate) fn write_lines(
+    explorer: &Explorer,
+    out: &mut dyn Write,
+    per_line: usize,
+) -> anyhow::Result<Written> {
+    let per_line = per_line.max(1);
     let conn = explorer.conn();
     let sessions = read_sessions(conn)?;
     let mut written = Written::default();
-    let mut traces = trace::TracesData::default();
-    let mut log_data = logs::LogsData::default();
-    let mut metric_data = metrics::MetricsData::default();
+    let mut lines = Lines { out, per_line };
     for s in &sessions {
-        let scope = || common::InstrumentationScope {
-            name: SCOPE.into(),
-            version: s.version.clone(),
-            ..Default::default()
-        };
-        let spans = read_spans(conn, s, &mut written)?;
-        if !spans.is_empty() {
-            traces.resource_spans.push(trace::ResourceSpans {
+        write_spans(conn, s, &mut lines, &mut written)?;
+    }
+    for s in &sessions {
+        write_logs(conn, s, &mut lines, &mut written)?;
+    }
+    for s in &sessions {
+        write_metrics(conn, s, &mut lines, &mut written)?;
+    }
+    lines.out.flush().context("flushing the export")?;
+    Ok(written)
+}
+
+/// Where a signal's lines go, each one resource's `per_line` items at most.
+struct Lines<'a> {
+    out: &'a mut dyn Write,
+    per_line: usize,
+}
+
+impl Lines<'_> {
+    fn spans(&mut self, s: &Session, spans: Vec<trace::Span>) -> anyhow::Result<()> {
+        let data = trace::TracesData {
+            resource_spans: vec![trace::ResourceSpans {
                 resource: s.resource.clone().into(),
                 scope_spans: vec![trace::ScopeSpans {
-                    scope: scope().into(),
+                    scope: s.scope().into(),
                     spans,
                     ..Default::default()
                 }],
                 ..Default::default()
-            });
-        }
-        let records = read_logs(conn, s, &mut written)?;
-        if !records.is_empty() {
-            log_data.resource_logs.push(logs::ResourceLogs {
+            }],
+            ..Default::default()
+        };
+        line(&data, self.out).context("writing the spans")
+    }
+
+    fn logs(&mut self, s: &Session, log_records: Vec<logs::LogRecord>) -> anyhow::Result<()> {
+        let data = logs::LogsData {
+            resource_logs: vec![logs::ResourceLogs {
                 resource: s.resource.clone().into(),
                 scope_logs: vec![logs::ScopeLogs {
-                    scope: scope().into(),
-                    log_records: records,
+                    scope: s.scope().into(),
+                    log_records,
                     ..Default::default()
                 }],
                 ..Default::default()
-            });
-        }
-        let ms = read_metrics(conn, s, &mut written)?;
-        if !ms.is_empty() {
-            metric_data.resource_metrics.push(metrics::ResourceMetrics {
+            }],
+            ..Default::default()
+        };
+        line(&data, self.out).context("writing the logs")
+    }
+
+    fn metrics(&mut self, s: &Session, ms: Vec<metrics::Metric>) -> anyhow::Result<()> {
+        let data = metrics::MetricsData {
+            resource_metrics: vec![metrics::ResourceMetrics {
                 resource: s.resource.clone().into(),
                 scope_metrics: vec![metrics::ScopeMetrics {
-                    scope: scope().into(),
+                    scope: s.scope().into(),
                     metrics: ms,
                     ..Default::default()
                 }],
                 ..Default::default()
-            });
-        }
+            }],
+            ..Default::default()
+        };
+        line(&data, self.out).context("writing the metrics")
     }
-    if !traces.resource_spans.is_empty() {
-        line(&traces, out).context("writing the spans")?;
-    }
-    if !log_data.resource_logs.is_empty() {
-        line(&log_data, out).context("writing the logs")?;
-    }
-    if !metric_data.resource_metrics.is_empty() {
-        line(&metric_data, out).context("writing the metrics")?;
-    }
-    out.flush().context("flushing the export")?;
-    Ok(written)
 }
 
 /// One message as one OTLP/JSON line.
@@ -182,6 +209,16 @@ struct Session {
     resource: resource::Resource,
 }
 
+impl Session {
+    fn scope(&self) -> common::InstrumentationScope {
+        common::InstrumentationScope {
+            name: SCOPE.into(),
+            version: self.version.clone(),
+            ..Default::default()
+        }
+    }
+}
+
 /// `sessions` columns that map to an OpenTelemetry semantic-convention
 /// resource attribute; every other column is `heph.session.<column>`.
 fn resource_key(column: &str) -> Option<&'static str> {
@@ -243,33 +280,97 @@ fn read_sessions(conn: &rusqlite::Connection) -> anyhow::Result<Vec<Session>> {
     Ok(out)
 }
 
-fn read_spans(
+/// A session's span events, read alongside its spans: both are in `span_id`
+/// order, so a span's events are the next ones of its id.
+struct SpanEvents<'s> {
+    rows: rusqlite::Rows<'s>,
+    /// The next event, read ahead.
+    next: Option<(i64, trace::span::Event)>,
+    /// Events whose span is not recorded, skipped.
+    orphans: usize,
+}
+
+impl<'s> SpanEvents<'s> {
+    fn new(rows: rusqlite::Rows<'s>) -> anyhow::Result<Self> {
+        let mut events = Self {
+            rows,
+            next: None,
+            orphans: 0,
+        };
+        events.advance()?;
+        Ok(events)
+    }
+
+    fn advance(&mut self) -> anyhow::Result<()> {
+        self.next = match self.rows.next().context("reading the span events")? {
+            None => None,
+            Some(r) => {
+                let span_id: i64 = r.get(0).context("reading a span event")?;
+                let attributes: Option<String> = r.get(3).context("reading a span event")?;
+                Some((
+                    span_id,
+                    trace::span::Event {
+                        name: r
+                            .get::<_, Option<String>>(1)
+                            .context("reading a span event")?
+                            .unwrap_or_default(),
+                        time_unix_nano: nanos(
+                            r.get::<_, Option<i64>>(2)
+                                .context("reading a span event")?
+                                .unwrap_or_default(),
+                        ),
+                        attributes: attrs(attributes.as_deref())
+                            .context("reading a span event's attributes")?,
+                        ..Default::default()
+                    },
+                ))
+            }
+        };
+        Ok(())
+    }
+
+    /// The events of `span_id`; those of a lower id, which no span had, are
+    /// skipped as orphans.
+    fn of(&mut self, span_id: i64) -> anyhow::Result<Vec<trace::span::Event>> {
+        let mut out = Vec::new();
+        while let Some((id, _)) = &self.next {
+            match (*id).cmp(&span_id) {
+                std::cmp::Ordering::Greater => break,
+                std::cmp::Ordering::Less => self.orphans += 1,
+                std::cmp::Ordering::Equal => {
+                    if let Some((_, e)) = self.next.take() {
+                        out.push(e);
+                    }
+                }
+            }
+            self.advance()?;
+        }
+        Ok(out)
+    }
+
+    /// Skip what is left: every one an orphan.
+    fn finish(mut self) -> anyhow::Result<usize> {
+        while self.next.is_some() {
+            self.orphans += 1;
+            self.advance()?;
+        }
+        Ok(self.orphans)
+    }
+}
+
+fn write_spans(
     conn: &rusqlite::Connection,
     s: &Session,
+    lines: &mut Lines<'_>,
     written: &mut Written,
-) -> anyhow::Result<Vec<trace::Span>> {
-    let mut events: HashMap<i64, Vec<trace::span::Event>> = HashMap::new();
+) -> anyhow::Result<()> {
     let mut stmt = conn
         .prepare(
             "SELECT span_id, name, time_us, attributes FROM span_events \
              WHERE session_id = ?1 ORDER BY span_id, time_us",
         )
         .context("reading the span events")?;
-    let mut rows = stmt.query([&s.id]).context("reading the span events")?;
-    let mut n_events = 0;
-    while let Some(r) = rows.next().context("reading the span events")? {
-        let span_id: i64 = r.get(0).context("reading a span event")?;
-        let attributes: Option<String> = r.get(3).context("reading a span event")?;
-        events.entry(span_id).or_default().push(trace::span::Event {
-            name: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
-            time_unix_nano: nanos(r.get::<_, Option<i64>>(2)?.unwrap_or_default()),
-            attributes: attrs(attributes.as_deref())
-                .context("reading a span event's attributes")?,
-            ..Default::default()
-        });
-        n_events += 1;
-    }
-    drop(rows);
+    let mut events = SpanEvents::new(stmt.query([&s.id]).context("reading the span events")?)?;
 
     let mut stmt = conn
         .prepare(
@@ -279,7 +380,6 @@ fn read_spans(
         .context("reading the spans")?;
     let mut rows = stmt.query([&s.id]).context("reading the spans")?;
     let mut out = Vec::new();
-    let mut attached = 0;
     while let Some(r) = rows.next().context("reading the spans")? {
         let span_id: i64 = r.get(0).context("reading a span")?;
         let parent: Option<i64> = r.get(1).context("reading a span")?;
@@ -313,8 +413,8 @@ fn read_spans(
             Some("error") => trace::status::StatusCode::STATUS_CODE_ERROR,
             _ => trace::status::StatusCode::STATUS_CODE_UNSET,
         };
-        let span_events = events.remove(&span_id).unwrap_or_default();
-        attached += span_events.len();
+        let span_events = events.of(span_id)?;
+        written.span_events += span_events.len();
         out.push(trace::Span {
             trace_id: s.trace_id.clone(),
             span_id: span_id.to_be_bytes().to_vec(),
@@ -335,17 +435,24 @@ fn read_spans(
             .into(),
             ..Default::default()
         });
+        if out.len() == lines.per_line {
+            written.spans += out.len();
+            lines.spans(s, std::mem::take(&mut out))?;
+        }
     }
-    written.spans += out.len();
-    written.span_events += attached;
-    if attached < n_events {
+    if !out.is_empty() {
+        written.spans += out.len();
+        lines.spans(s, out)?;
+    }
+    let orphans = events.finish()?;
+    if orphans > 0 {
         tracing::debug!(
             session = %s.id,
-            orphans = n_events - attached,
+            orphans,
             "span events whose span is not recorded are not exported"
         );
     }
-    Ok(out)
+    Ok(())
 }
 
 /// A recorded severity as OTLP's number; `UNSPECIFIED` for one it does not
@@ -362,11 +469,12 @@ fn severity(text: &str) -> logs::SeverityNumber {
     }
 }
 
-fn read_logs(
+fn write_logs(
     conn: &rusqlite::Connection,
     s: &Session,
+    lines: &mut Lines<'_>,
     written: &mut Written,
-) -> anyhow::Result<Vec<logs::LogRecord>> {
+) -> anyhow::Result<()> {
     let mut stmt = conn
         .prepare("SELECT seq, time_us, severity, body FROM logs WHERE session_id = ?1 ORDER BY seq")
         .context("reading the logs")?;
@@ -402,16 +510,55 @@ fn read_logs(
             span_id: derive::SESSION_SPAN.to_be_bytes().to_vec(),
             ..Default::default()
         });
+        if out.len() == lines.per_line {
+            written.logs += out.len();
+            lines.logs(s, std::mem::take(&mut out))?;
+        }
     }
-    written.logs += out.len();
-    Ok(out)
+    if !out.is_empty() {
+        written.logs += out.len();
+        lines.logs(s, out)?;
+    }
+    Ok(())
 }
 
-fn read_metrics(
+/// A metric's name, kind and unit: rows of one key are one metric.
+type MetricKey = (String, String, String);
+
+/// Rows of one key as one metric.
+fn metric(
+    (name, kind, unit): MetricKey,
+    data_points: Vec<metrics::NumberDataPoint>,
+) -> metrics::Metric {
+    let data = match kind.as_str() {
+        "counter" => metrics::metric::Data::Sum(Box::new(metrics::Sum {
+            data_points,
+            aggregation_temporality:
+                metrics::AggregationTemporality::AGGREGATION_TEMPORALITY_CUMULATIVE.into(),
+            is_monotonic: true,
+            ..Default::default()
+        })),
+        _ => metrics::metric::Data::Gauge(Box::new(metrics::Gauge {
+            data_points,
+            ..Default::default()
+        })),
+    };
+    metrics::Metric {
+        name,
+        unit,
+        data: Some(data),
+        ..Default::default()
+    }
+}
+
+/// A metric whose points run past a line goes on in the next line, as a
+/// metric of the same name, kind and unit.
+fn write_metrics(
     conn: &rusqlite::Connection,
     s: &Session,
+    lines: &mut Lines<'_>,
     written: &mut Written,
-) -> anyhow::Result<Vec<metrics::Metric>> {
+) -> anyhow::Result<()> {
     let mut stmt = conn
         .prepare(
             "SELECT name, kind, unit, time_us, value, attributes FROM metrics \
@@ -419,9 +566,10 @@ fn read_metrics(
         )
         .context("reading the metrics")?;
     let mut rows = stmt.query([&s.id]).context("reading the metrics")?;
-    // (name, kind, unit) -> points, in that order.
-    let mut grouped: BTreeMap<(String, String, String), Vec<metrics::NumberDataPoint>> =
-        BTreeMap::new();
+    // The line being filled, its points, and the metric being read.
+    let mut line_metrics = Vec::new();
+    let mut in_line = 0;
+    let mut current: Option<(MetricKey, Vec<metrics::NumberDataPoint>)> = None;
     while let Some(r) = rows.next().context("reading the metrics")? {
         let get = |i| -> anyhow::Result<String> {
             Ok(r.get::<_, Option<String>>(i)
@@ -431,49 +579,48 @@ fn read_metrics(
         let (name, kind, unit) = (get(0)?, get(1)?, get(2)?);
         let attributes: Option<String> = r.get(5).context("reading a metric")?;
         let counter = kind == "counter";
-        grouped
-            .entry((name, kind, unit))
-            .or_default()
-            .push(metrics::NumberDataPoint {
-                attributes: attrs(attributes.as_deref())
-                    .context("reading a metric's attributes")?,
-                start_time_unix_nano: if counter { s.started_ns } else { 0 },
-                time_unix_nano: nanos(
-                    r.get::<_, Option<i64>>(3)
-                        .context("reading a metric")?
-                        .unwrap_or_default(),
-                ),
-                value: r
-                    .get::<_, Option<f64>>(4)
+        let point = metrics::NumberDataPoint {
+            attributes: attrs(attributes.as_deref()).context("reading a metric's attributes")?,
+            start_time_unix_nano: if counter { s.started_ns } else { 0 },
+            time_unix_nano: nanos(
+                r.get::<_, Option<i64>>(3)
                     .context("reading a metric")?
-                    .map(metrics::number_data_point::Value::AsDouble),
-                ..Default::default()
-            });
-    }
-    let mut out = Vec::with_capacity(grouped.len());
-    for ((name, kind, unit), data_points) in grouped {
-        written.points += data_points.len();
-        let data = match kind.as_str() {
-            "counter" => metrics::metric::Data::Sum(Box::new(metrics::Sum {
-                data_points,
-                aggregation_temporality:
-                    metrics::AggregationTemporality::AGGREGATION_TEMPORALITY_CUMULATIVE.into(),
-                is_monotonic: true,
-                ..Default::default()
-            })),
-            _ => metrics::metric::Data::Gauge(Box::new(metrics::Gauge {
-                data_points,
-                ..Default::default()
-            })),
-        };
-        out.push(metrics::Metric {
-            name,
-            unit,
-            data: Some(data),
+                    .unwrap_or_default(),
+            ),
+            value: r
+                .get::<_, Option<f64>>(4)
+                .context("reading a metric")?
+                .map(metrics::number_data_point::Value::AsDouble),
             ..Default::default()
-        });
+        };
+        let key = (name, kind, unit);
+        match &mut current {
+            Some((k, points)) if *k == key => points.push(point),
+            _ => {
+                if let Some((k, points)) = current.take() {
+                    line_metrics.push(metric(k, points));
+                }
+                current = Some((key, vec![point]));
+            }
+        }
+        in_line += 1;
+        if in_line == lines.per_line {
+            if let Some((k, points)) = current.take() {
+                line_metrics.push(metric(k, points));
+            }
+            written.points += in_line;
+            in_line = 0;
+            lines.metrics(s, std::mem::take(&mut line_metrics))?;
+        }
     }
-    Ok(out)
+    if let Some((k, points)) = current {
+        line_metrics.push(metric(k, points));
+    }
+    if !line_metrics.is_empty() {
+        written.points += in_line;
+        lines.metrics(s, line_metrics)?;
+    }
+    Ok(())
 }
 
 /// Microseconds as nanoseconds; a negative time (never recorded) is 0.
