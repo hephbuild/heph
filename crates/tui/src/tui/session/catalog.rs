@@ -165,8 +165,19 @@ enum Rows {
     Start,
     /// Every row of the session, replaced, with `complete=1`. `recorded`
     /// false: a private session (`HEPH_NO_SESSION`), which keeps no
-    /// recording, writes only `sessions` and `targets`.
-    Full { recorded: bool },
+    /// recording, writes only `sessions` and `targets`. `explorer` false: an
+    /// owner's write into a catalog over its cap, which keeps the recording
+    /// but writes only `sessions` and `targets` too.
+    Full { recorded: bool, explorer: bool },
+}
+
+impl Rows {
+    /// Every row of a kept recording: what a command's heal or replace
+    /// writes.
+    const ALL: Self = Self::Full {
+        recorded: true,
+        explorer: true,
+    };
 }
 
 /// Copy the recording at `rec` into the catalog on `conn`: one transaction,
@@ -217,7 +228,7 @@ fn copy_attached(conn: &Connection, copy: Rows) -> rusqlite::Result<()> {
                 params![1, 0],
             )?;
         }
-        Rows::Full { recorded } => {
+        Rows::Full { recorded, explorer } => {
             let set = SESSION_COLUMNS
                 .iter()
                 .skip(1)
@@ -255,7 +266,7 @@ fn copy_attached(conn: &Connection, copy: Rows) -> rusqlite::Result<()> {
                     [&id],
                 )?;
             }
-            if recorded {
+            if recorded && explorer {
                 conn.execute_batch(&format!(
                     "INSERT INTO main.spans SELECT session_id, span_id, parent_span_id, name, class,
                        addr, driver, outcome, start_us, end_us, duration_us, status, attributes
@@ -457,24 +468,46 @@ fn ensure_schema(conn: &Connection, in_memory: bool) -> Result<(), Unusable> {
 /// The owner's start-of-session write: its `sessions` row with
 /// `complete=0`, from the live recording in `dir`. Never fails the run.
 pub fn record_start(root: &Path, dir: &Path) {
-    owner_write(root, dir, Rows::Start, WRITE_BOUND);
+    owner_write(root, dir, Rows::Start, OwnerLimits::DEFAULT);
 }
 
 /// The owner's seal-time write: every row of its session, replaced, with
 /// `complete=1`. `recorded` false for a private session, whose recording is
-/// removed right after. Never fails the run.
+/// removed right after. Over [`CAP`], only `sessions` and `targets`: the
+/// exit path does not grow a catalog the hourly cleanup has yet to trim.
+/// Never fails the run.
 pub fn record_seal(root: &Path, dir: &Path, recorded: bool) {
-    record_seal_within(root, dir, recorded, WRITE_BOUND);
+    record_seal_within(root, dir, recorded, OwnerLimits::DEFAULT);
 }
 
-/// [`record_seal`] with `bound` in place of [`WRITE_BOUND`], so a test
-/// reaches it with a small recording.
-pub(crate) fn record_seal_within(root: &Path, dir: &Path, recorded: bool, bound: Duration) {
-    owner_write(root, dir, Rows::Full { recorded }, bound);
+/// What bounds an owner's write.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OwnerLimits {
+    /// [`WRITE_BOUND`].
+    pub(crate) bound: Duration,
+    /// [`CAP`].
+    pub(crate) cap: u64,
 }
 
-fn owner_write(root: &Path, dir: &Path, copy: Rows, bound: Duration) {
-    match try_owner_write(root, dir, copy, bound) {
+impl OwnerLimits {
+    pub(crate) const DEFAULT: Self = Self {
+        bound: WRITE_BOUND,
+        cap: CAP,
+    };
+}
+
+/// [`record_seal`] with `limits` in place of the defaults, so a test
+/// reaches them with a small recording.
+pub(crate) fn record_seal_within(root: &Path, dir: &Path, recorded: bool, limits: OwnerLimits) {
+    let copy = Rows::Full {
+        recorded,
+        explorer: true,
+    };
+    owner_write(root, dir, copy, limits);
+}
+
+fn owner_write(root: &Path, dir: &Path, copy: Rows, limits: OwnerLimits) {
+    match try_owner_write(root, dir, copy, limits) {
         Ok(true) => {}
         Ok(false) => tracing::debug!(
             root = %root.display(),
@@ -513,8 +546,14 @@ fn bound_owner(conn: &mut Connection, deadline: Instant) -> rusqlite::Result<()>
 }
 
 /// `Ok(false)`: `catalog.lock` was not free at once (a repair). Past
-/// `bound`, the write is interrupted and its transaction rolled back.
-fn try_owner_write(root: &Path, dir: &Path, copy: Rows, bound: Duration) -> anyhow::Result<bool> {
+/// `limits.bound`, the write is interrupted and its transaction rolled
+/// back; past `limits.cap`, a full write leaves out the explorer rows.
+fn try_owner_write(
+    root: &Path,
+    dir: &Path,
+    mut copy: Rows,
+    limits: OwnerLimits,
+) -> anyhow::Result<bool> {
     let lock_path = root.join(LOCK);
     let lock = lockfile::open_shared_file(&lock_path)
         .with_context(|| format!("opening {}", lock_path.display()))?;
@@ -523,12 +562,21 @@ fn try_owner_write(root: &Path, dir: &Path, copy: Rows, bound: Duration) -> anyh
     {
         return Ok(false);
     }
-    let deadline = Instant::now() + bound;
+    let deadline = Instant::now() + limits.bound;
     let mut conn = open_rw(root, true).context("opening the session catalog")?;
     bound_owner(&mut conn, deadline).context("bounding the catalog write")?;
     ensure_schema(&conn, false)
         .map_err(|e| anyhow::anyhow!("{e}"))
         .context("checking the session catalog")?;
+    if let Rows::Full { explorer, .. } = &mut copy
+        && used_bytes(&conn).context("sizing the session catalog")? > limits.cap
+    {
+        tracing::debug!(
+            root = %root.display(),
+            "the session catalog is over its cap: this session's spans and metrics are left out"
+        );
+        *explorer = false;
+    }
     let rec = dir.join(store::FILE);
     copy_session(&conn, &rec, copy)
         .with_context(|| format!("copying {} into the catalog", rec.display()))?;
@@ -810,7 +858,7 @@ fn heal(conn: &Connection, root: &Path, now_ms: u64) -> rusqlite::Result<HealRep
             report.unknown += 1;
             continue;
         }
-        match copy_session(conn, &rec, Rows::Full { recorded: true }) {
+        match copy_session(conn, &rec, Rows::ALL) {
             Ok(()) => report.healed += 1,
             Err(e) if catalog_failed(conn, &e) => return Err(e),
             Err(e) => {
@@ -897,7 +945,7 @@ pub fn replace(root: &Path, dir: &Path) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("{e}"))
         .context("checking the session catalog")?;
     let rec = dir.join(store::FILE);
-    copy_session(&conn, &rec, Rows::Full { recorded: true })
+    copy_session(&conn, &rec, Rows::ALL)
         .with_context(|| format!("copying {} into the catalog", rec.display()))
 }
 
@@ -1307,12 +1355,7 @@ mod tests {
         assert_eq!(tables, 0, "the seal's connection caches an empty schema");
         record_start(root, &dir);
         ensure_schema(&stale, false).expect("made meanwhile");
-        copy_session(
-            &stale,
-            &dir.join(store::FILE),
-            Rows::Full { recorded: true },
-        )
-        .expect("the seal write lands");
+        copy_session(&stale, &dir.join(store::FILE), Rows::ALL).expect("the seal write lands");
         let complete: i64 = stale
             .query_row("SELECT complete FROM main.sessions", [], |r| r.get(0))
             .expect("the session's row");

@@ -715,6 +715,65 @@ fn catalog_write_failure_never_fails_the_run() {
     );
 }
 
+/// The owner's limits with `bound` in place of [`catalog::WRITE_BOUND`].
+fn within(bound: Duration) -> catalog::OwnerLimits {
+    catalog::OwnerLimits {
+        bound,
+        ..catalog::OwnerLimits::DEFAULT
+    }
+}
+
+/// Over its cap, an owner's seal write keeps `sessions` and `targets` and
+/// leaves the explorer rows out; under it, everything.
+#[test]
+fn an_owner_over_the_cap_writes_no_explorer_rows() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    let first = sealed(root, recent_id(1, 2_000));
+    catalog::record_seal(root, &first, true);
+    let spans_of = |id: &str| {
+        count(
+            &read(root),
+            &format!("SELECT count(*) FROM spans WHERE session_id = '{id}'"),
+        )
+    };
+    let first_id = first.file_name().and_then(|n| n.to_str()).expect("id");
+    assert!(spans_of(first_id) > 0, "under the cap: everything");
+
+    let over = sealed(root, recent_id(2, 1_000));
+    let limits = catalog::OwnerLimits {
+        cap: 0,
+        ..catalog::OwnerLimits::DEFAULT
+    };
+    catalog::record_seal_within(root, &over, true, limits);
+    let over_id = over.file_name().and_then(|n| n.to_str()).expect("id");
+    let conn = read(root);
+    assert_eq!(
+        count(
+            &conn,
+            &format!(
+                "SELECT count(*) FROM sessions WHERE session_id = '{over_id}' AND complete = 1 AND recorded = 1"
+            )
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &conn,
+            &format!("SELECT count(*) FROM targets WHERE session_id = '{over_id}'")
+        ),
+        3
+    );
+    assert_eq!(spans_of(over_id), 0, "over the cap: no spans");
+    assert_eq!(
+        count(
+            &conn,
+            &format!("SELECT count(*) FROM metrics WHERE session_id = '{over_id}'")
+        ),
+        0
+    );
+}
+
 /// An owner write past its bound is interrupted and rolled back whole: the
 /// start row stays `complete=0` with none of the session's other rows, and
 /// the next command heals it.
@@ -727,7 +786,7 @@ fn an_owner_write_past_its_bound_leaves_no_half_rows() {
     // first check; the `sessions` upsert before it does not.
     let dir = sealed_with(root, id, many_targets(500));
     catalog::record_start(root, &dir);
-    catalog::record_seal_within(root, &dir, true, Duration::ZERO);
+    catalog::record_seal_within(root, &dir, true, within(Duration::ZERO));
     {
         let conn = read(root);
         assert_eq!(
@@ -769,7 +828,7 @@ fn an_owner_waits_on_a_locked_catalog_only_until_its_bound() {
     holder.execute_batch("BEGIN IMMEDIATE").expect("hold");
     let dir = sealed(root, recent_id(2, 1_000));
     let started = Instant::now();
-    catalog::record_seal_within(root, &dir, true, Duration::from_millis(100));
+    catalog::record_seal_within(root, &dir, true, within(Duration::from_millis(100)));
     let took = started.elapsed();
     assert!(
         took < Duration::from_millis(350),
@@ -1078,7 +1137,7 @@ fn cleanup_yields_to_a_waiting_owner() {
         calls += 1;
         if calls == 1 {
             let started = Instant::now();
-            catalog::record_seal_within(root, &owner, true, Duration::from_millis(500));
+            catalog::record_seal_within(root, &owner, true, within(Duration::from_millis(500)));
             landed = Some((
                 count(
                     &watch,
