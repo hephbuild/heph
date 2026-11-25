@@ -61,7 +61,7 @@ pub mod marker;
 pub mod take;
 pub use export::{
     ExportOutcome, ExportReport, IncompleteJournal, LeftOut, RevisionBytes, SNAPSHOT_LOCK_FILE,
-    SnapshotLock, Tally, lock_snapshot, try_lock_snapshot,
+    SnapshotLock, Tally, try_lock_snapshot,
 };
 pub use marker::{
     GENERATION_PREFIX, Generation, GenerationStats, MARKER_FILE, MARKER_TMP_PREFIX, Marker, NoTier,

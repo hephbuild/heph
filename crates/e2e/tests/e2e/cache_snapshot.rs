@@ -17,8 +17,8 @@ use hcore::events::CacheOutcomeKind;
 use hcore::hasync::StdCancellationToken;
 use heph::engine::cache_snapshot::{
     Consumption, ExportOutcome, ExportReport, Incomplete, JournalContents, LeftOut, RECORDER_WAIT,
-    RecorderAliveError, WorkingSet, list_journals, lock_snapshot, read_journal, read_marker,
-    working_set_dir,
+    RecorderAliveError, SnapshotLock, WorkingSet, list_journals, read_journal, read_marker,
+    try_lock_snapshot, working_set_dir,
 };
 use heph::engine::event::{BuildEvent, BuildEventKind};
 use heph::engine::{Config, Discovery, Engine, HomeDir, OutputMatcher, ResultOptions};
@@ -1192,6 +1192,23 @@ mod degrades {
         }
     }
 
+    /// Every engine opens the tier, helper engines included: two engines
+    /// of one process over the same unusable marker warn once between them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unusable_marker_warns_once_per_process() {
+        let f = Fixture::new(FOUR, &["//pkg:a"]).await;
+        let marker = f.dir().join(heph::engine::cache_snapshot::MARKER_FILE);
+        std::fs::write(&marker, "{not json").expect("write marker");
+        let (engines, warnings) = warnings_while(|| {
+            (
+                f.engine(Bucket::Absent, false),
+                f.engine(Bucket::Absent, false),
+            )
+        });
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        drop(engines);
+    }
+
     /// A newer format is one warning naming it and no tier; an older one
     /// is served.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1306,9 +1323,16 @@ fn job_engine(root: &Path, dir: &Path) -> Arc<Engine> {
     })
 }
 
+/// The snapshot lock of `root`'s home, which no other export holds.
+fn snapshot_lock(root: &Path) -> SnapshotLock {
+    try_lock_snapshot(&home(root))
+        .expect("snapshot lock")
+        .expect("free")
+}
+
 /// Export `ws` into `dir`, then delete the journals it was read from.
 async fn export(root: &Path, dir: &Path, ws: &WorkingSet) -> ExportReport {
-    let lock = lock_snapshot(&home(root)).expect("snapshot lock");
+    let lock = snapshot_lock(root);
     let e = engine(root, None, false);
     let report = e
         .export_snapshot(&lock, dir, ws, &StdCancellationToken::new())
@@ -1546,6 +1570,52 @@ async fn waits_for_a_recorder_that_exits() {
 
 /// A journal whose recorder died without its trailer has no lock holder: it
 /// is read at once, as incomplete, never waited on.
+/// A consumed journal that will not delete once the snapshot is written is
+/// a report line, not a failure: the snapshot stands, and the next one reads
+/// the journal again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_undeletable_journal_is_reported_not_fatal() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let root = tempfile::tempdir().expect("root");
+    let parent = tempfile::tempdir().expect("parent");
+    let dir = parent.path().join("snap");
+    write_build(root.path(), FOUR);
+    let (ws, _) = job(root.path(), &dir, &["//pkg:a"]).await;
+
+    let tok = StdCancellationToken::new();
+    let c = Consumption::acquire(&home(root.path()), RECORDER_WAIT, &tok)
+        .await
+        .expect("acquire");
+    let journals = working_set_dir(&home(root.path()));
+    let mode = |m: u32| {
+        std::fs::set_permissions(&journals, std::fs::Permissions::from_mode(m)).expect("chmod");
+    };
+    mode(0o555);
+    if std::fs::write(journals.join("probe"), b"").is_ok() {
+        mode(0o755);
+        eprintln!("skipping: the mode does not bind this user (root)");
+        return;
+    }
+    let report = c
+        .export(&engine(root.path(), None, false), &dir, &tok)
+        .await;
+    mode(0o755);
+    let report = report.expect("the snapshot is written");
+    assert!(
+        matches!(report.outcome, ExportOutcome::Written { .. }),
+        "{report:?}"
+    );
+    assert_eq!(report.cleanup_errors.len(), 1, "{report:?}");
+    assert!(
+        report.cleanup_errors[0].contains("reads it again"),
+        "{report:?}"
+    );
+    assert_eq!(
+        list_journals(&home(root.path())).expect("list"),
+        ws.journals
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_dead_recorder_does_not_block() {
     let root = tempfile::tempdir().expect("root");
@@ -1787,7 +1857,7 @@ fn slot_of(engine: &Engine, addr: &str) -> String {
 /// would (the snapshot command shares the build's config), consuming them.
 async fn export_scratch(root: &Path, dir: &Path, scope: &str, journals: usize) -> ExportReport {
     let ws = WorkingSet::from_journals(read_settled(root, journals).await);
-    let lock = lock_snapshot(&home(root)).expect("snapshot lock");
+    let lock = snapshot_lock(root);
     let e = scratch_engine(root, None, None, scope, &[], false);
     let report = e
         .export_snapshot(&lock, dir, &ws, &StdCancellationToken::new())
@@ -1886,6 +1956,53 @@ async fn scratch_slots_are_carried_unless_opted_out() {
             .all(|e| e.starts_with(&format!("{carried}/main/0000000000000001."))),
         "{entries:?}"
     );
+}
+
+/// A complete job that used no scratch slot says nothing about them, so its
+/// snapshot carries the previous one's slots over unchanged, as an
+/// incomplete run does (the user's decision; a job that used some slots
+/// keeps the exact rule).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_job_that_used_no_slot_carries_them_over() {
+    let parent = tempfile::tempdir().expect("parent");
+    let dir = parent.path().join("snap");
+    let build = |marker: &str| {
+        format!(
+            "{}\ntarget(name = \"b\", driver = \"bash\", out = \"b.txt\", run = [\"echo b > $OUT\"])\n",
+            scratch_build(marker)
+        )
+    };
+
+    // Job 1 builds `a`, which uses the slot.
+    let one = tempfile::tempdir().expect("machine one");
+    write_build(one.path(), &build("one"));
+    let e = scratch_engine(one.path(), Some(&dir), None, "main", &[], true);
+    run_one(&e, "//pkg:a").await;
+    drop(e);
+    let report = export_scratch(one.path(), &dir, "main", 1).await;
+    assert_eq!(report.scratch.new.count, 1, "{report:?}");
+    let before = snapshot_scratch(&dir);
+
+    // Job 2, on a fresh machine, builds only `b`, which uses no slot.
+    let two = tempfile::tempdir().expect("machine two");
+    write_build(two.path(), &build("one"));
+    let e = scratch_engine(two.path(), Some(&dir), None, "main", &[], true);
+    let (out, _) = run_one(&e, "//pkg:b").await;
+    assert_eq!(out_text(&out), "b");
+    drop(e);
+    let report = export_scratch(two.path(), &dir, "main", 1).await;
+    assert!(report.incomplete.is_empty(), "a complete run: {report:?}");
+    assert_eq!(report.scratch.carried_over.count, 1, "{report:?}");
+    assert!(report.scratch.carried_over.bytes > 0, "{report:?}");
+    assert_eq!(report.scratch.dropped.count, 0, "{report:?}");
+    assert_eq!(snapshot_scratch(&dir), before);
+
+    // Job 3 still restores what job 1 left in the slot.
+    let three = tempfile::tempdir().expect("machine three");
+    write_build(three.path(), &build("three"));
+    let e = scratch_engine(three.path(), Some(&dir), None, "main", &[], true);
+    let (out, _) = run_one(&e, "//pkg:a").await;
+    assert_eq!(out_text(&out), "c=one l=cold");
 }
 
 /// A slot `heph tool scratch push` published is in the working set though

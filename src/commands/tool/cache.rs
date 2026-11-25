@@ -361,6 +361,9 @@ fn human_report(dir: &Path, report: &ExportReport) -> Vec<String> {
             human_bytes(report.carried_over.bytes)
         ));
     }
+    for e in &report.cleanup_errors {
+        out.push(format!("cleanup failed: {e}"));
+    }
     out
 }
 

@@ -499,7 +499,6 @@ impl Engine {
             let (root, prev) = (root.to_path_buf(), prev.map(Path::to_path_buf));
             let bytes = hcore::blocking::run(move || {
                 write_entry_into(&root, prev.as_deref(), &stem, file, blob_len, &meta_bytes)
-                    .map_err(std::io::Error::other)
             })
             .await?;
             return Ok(Published {
@@ -592,7 +591,8 @@ pub struct Published {
 ///
 /// Payload first, meta last, as on a bucket. The archive is hard-linked from
 /// `prev` when that holds a regular file of this key and length (the key
-/// carries the content hash), else streamed from `packed`.
+/// carries the content hash) under real directories, else streamed from
+/// `packed`: a symlinked slot or scope dir would lead out of `<dir>`.
 fn write_entry_into(
     root: &Path,
     prev: Option<&Path>,
@@ -607,7 +607,15 @@ fn write_entry_into(
     std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     let linked = prev.is_some_and(|prev| {
         let src = prev.join(&tar_rel);
-        std::fs::symlink_metadata(&src).is_ok_and(|m| m.is_file() && m.len() == len)
+        // Every directory between `prev` and the archive is a real one;
+        // `symlink_metadata` follows all but the last component.
+        let real_dirs = src
+            .ancestors()
+            .skip(1)
+            .take_while(|a| *a != prev)
+            .all(|a| std::fs::symlink_metadata(a).is_ok_and(|m| m.is_dir()));
+        real_dirs
+            && std::fs::symlink_metadata(&src).is_ok_and(|m| m.is_file() && m.len() == len)
             && std::fs::hard_link(&src, &dst).is_ok()
     });
     if !linked {

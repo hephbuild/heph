@@ -14,9 +14,10 @@
 //! 4. Build `gen-<nonce>` revision by revision, each under its per-addr read
 //!    lock, with bounded concurrency on the blocking pool.
 //! 5. Publish the job's scratch slots into it under `scratch/v1/`, with
-//!    `scratch_push`'s rules ([`Engine::scratch_publish`]); on an incomplete
-//!    run, carry over the previous generation's entries of slots it did not
-//!    export.
+//!    `scratch_push`'s rules ([`Engine::scratch_publish`]). On an incomplete
+//!    run, or a complete one that touched no slot at all, carry over the
+//!    previous generation's entries of slots it did not export; a complete
+//!    run that touched some slots drops the rest, as it does revisions.
 //! 6. Point the marker at it (written last, by rename), then sweep again.
 //!
 //! A crash anywhere before the marker moves leaves the previous generation
@@ -55,6 +56,7 @@ use std::collections::BTreeMap;
 use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// The snapshot lock's file name, under the working-set dir.
 pub const SNAPSHOT_LOCK_FILE: &str = "snapshot.lock";
@@ -86,8 +88,11 @@ fn open_lock_file(home: &Path) -> anyhow::Result<std::fs::File> {
         .with_context(|| format!("opening {}", path.display()))
 }
 
-/// Take the snapshot lock, waiting for a running export to finish.
-pub fn lock_snapshot(home: &Path) -> anyhow::Result<SnapshotLock> {
+/// Take the snapshot lock, waiting for a running export to finish. Only
+/// tests block on it; the command polls [`try_lock_snapshot`] so it can be
+/// cancelled.
+#[cfg(test)]
+pub(crate) fn lock_snapshot(home: &Path) -> anyhow::Result<SnapshotLock> {
     let file = open_lock_file(home)?;
     file.lock().context("locking the cache snapshot")?;
     Ok(SnapshotLock { _file: file })
@@ -100,6 +105,47 @@ pub fn try_lock_snapshot(home: &Path) -> anyhow::Result<Option<SnapshotLock>> {
         Ok(()) => Ok(Some(SnapshotLock { _file: file })),
         Err(std::fs::TryLockError::WouldBlock) => Ok(None),
         Err(std::fs::TryLockError::Error(e)) => Err(e).context("locking the cache snapshot"),
+    }
+}
+
+/// How often a held `<dir>` lock is retried.
+const DIR_LOCK_POLL: Duration = Duration::from_millis(50);
+
+/// Take the exclusive lock on `<dir>`'s own directory (flock on its fd, on
+/// both OSes), creating it first, and wait for it while another export holds
+/// it. The snapshot lock lives in `<home>`, so it does not keep two homes
+/// that share one `<dir>` from sweeping each other's generation; this does.
+/// Released when the returned file drops.
+async fn lock_dir(
+    dir: &Path,
+    ctoken: &(dyn Cancellable + Send + Sync),
+) -> anyhow::Result<std::fs::File> {
+    let file = {
+        let dir = dir.to_path_buf();
+        hcore::blocking::run(move || -> anyhow::Result<std::fs::File> {
+            std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+            std::fs::File::open(&dir).with_context(|| format!("opening {}", dir.display()))
+        })
+        .await?
+    };
+    let mut waited = false;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(e).with_context(|| format!("locking {}", dir.display()));
+            }
+        }
+        anyhow::ensure!(!ctoken.is_cancelled(), "cache snapshot export cancelled");
+        if !waited {
+            waited = true;
+            tracing::info!(
+                dir = %dir.display(),
+                "cache snapshot: another export is writing this dir; waiting for it",
+            );
+        }
+        tokio::time::sleep(DIR_LOCK_POLL).await;
     }
 }
 
@@ -220,6 +266,10 @@ pub struct ExportReport {
     pub dropped_addrs: Vec<String>,
     /// The scratch slots, counted by entry (a slot in one scope).
     pub scratch: ScratchReport,
+    /// Clean-up that failed after the new generation became current: a
+    /// sweep of `<dir>`, or a consumed journal that could not be deleted.
+    /// The snapshot is written and correct; each line says what is left.
+    pub cleanup_errors: Vec<String>,
 }
 
 /// What an export did with scratch slots. Bytes are the archives'.
@@ -230,8 +280,9 @@ pub struct ScratchReport {
     /// Slots the job used whose contents its lineage already held, written
     /// under that entry: no new generation.
     pub kept: Tally,
-    /// On an incomplete run, previous-generation entries of slots the job
-    /// exported nothing of.
+    /// Previous-generation entries of slots the job exported nothing of,
+    /// carried over on an incomplete run or on a complete one that touched
+    /// no slot.
     pub carried_over: Tally,
     /// Previous-generation entries the new generation does not hold.
     pub dropped: Tally,
@@ -261,6 +312,7 @@ impl ExportReport {
             top: Vec::new(),
             dropped_addrs: Vec::new(),
             scratch: ScratchReport::default(),
+            cleanup_errors: Vec::new(),
         }
     }
 
@@ -608,18 +660,45 @@ fn place_blob(
         .create_new(true)
         .open(dest)
         .with_context(|| format!("creating {}", dest.display()))?;
-    let mut reader = sized.reader.take(sized.size);
-    match io::copy(&mut reader, &mut file) {
-        Ok(_) => Ok(true),
-        // A source that fails mid-read is a missing blob; a destination that
-        // fails (ENOSPC) fails the export.
-        Err(e) if e.kind() == io::ErrorKind::StorageFull => {
-            Err(e).with_context(|| format!("writing {}", dest.display()))
-        }
-        Err(e) => {
-            tracing::debug!(addr = %job.addr, blob = local_name, error = ?e, "cache snapshot: copying a local blob failed");
+    match copy_from(sized.reader.take(sized.size), &mut file) {
+        Ok(true) => Ok(true),
+        Ok(false) => {
+            tracing::debug!(addr = %job.addr, blob = local_name, "cache snapshot: reading a local blob failed");
             Ok(false)
         }
+        Err(e) => Err(e).with_context(|| format!("writing {}", dest.display())),
+    }
+}
+
+/// A reader that remembers whether a read of it failed, so a copy can tell
+/// its source's failures from its destination's.
+struct ReadTagged<R> {
+    inner: R,
+    failed: bool,
+}
+
+impl<R: io::Read> io::Read for ReadTagged<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(buf).inspect_err(|e| {
+            // `io::copy` retries an interrupted read.
+            if e.kind() != io::ErrorKind::Interrupted {
+                self.failed = true;
+            }
+        })
+    }
+}
+
+/// Copy `src` into `dst`: `Ok(false)` when reading `src` failed (the blob is
+/// missing), an error when writing `dst` did (the export fails).
+fn copy_from(src: impl io::Read, dst: &mut impl io::Write) -> io::Result<bool> {
+    let mut src = ReadTagged {
+        inner: src,
+        failed: false,
+    };
+    match io::copy(&mut src, dst) {
+        Ok(_) => Ok(true),
+        Err(_) if src.failed => Ok(false),
+        Err(e) => Err(e),
     }
 }
 
@@ -749,27 +828,27 @@ impl Engine {
             return Ok(report);
         }
         let incomplete = !ws.is_complete();
+        // Held until the export returns: no export from another home sweeps
+        // `<dir>` meanwhile.
+        let _dir_lock = lock_dir(dir, ctoken).await?;
 
+        let generation_name = format!("{GENERATION_PREFIX}{}", uuid::Uuid::new_v4().simple());
+        let generation = dir.join(&generation_name);
         let (prev, index) = {
-            let dir = dir.to_path_buf();
+            let (dir, generation) = (dir.to_path_buf(), generation.clone());
             hcore::blocking::run(move || -> anyhow::Result<_> {
-                std::fs::create_dir_all(&dir)
-                    .with_context(|| format!("creating {}", dir.display()))?;
                 let prev = sweep(&dir)?;
                 let index = match &prev {
                     Some(prev) => index_generation(prev)?,
                     None => PrevIndex::default(),
                 };
+                std::fs::create_dir(&generation)
+                    .with_context(|| format!("creating {}", generation.display()))?;
                 Ok((prev, index))
             })
             .await?
         };
         let PrevIndex { mut entries } = index;
-
-        let generation_name = format!("{GENERATION_PREFIX}{}", uuid::Uuid::new_v4().simple());
-        let generation = dir.join(&generation_name);
-        std::fs::create_dir(&generation)
-            .with_context(|| format!("creating {}", generation.display()))?;
 
         // The recorded revisions, each once, then on an incomplete run every
         // previous-generation revision the job did not touch.
@@ -873,13 +952,16 @@ impl Engine {
 
         // Scratch slots, before the pointer moves, so they are part of the
         // generation it names.
+        // A run that touched no slot carries every previous entry, as an
+        // incomplete one does: it says nothing about the slots it never used.
+        let carry = incomplete || ws.scratch.is_empty();
         report.scratch = self
-            .export_scratch(ws, &generation, roots.prev.as_deref(), incomplete, ctoken)
+            .export_scratch(ws, &generation, roots.prev.as_deref(), carry, ctoken)
             .await?;
 
         before_pointer(&generation)?;
         {
-            let (dir, name) = (dir.to_path_buf(), generation_name.clone());
+            let (owned_dir, name) = (dir.to_path_buf(), generation_name.clone());
             // What the generation holds, for the next job's start-of-run line.
             let revisions = [&report.kept, &report.new, &report.carried_over];
             let scratch = &report.scratch;
@@ -892,12 +974,23 @@ impl Engine {
                     .chain([&scratch.new, &scratch.kept, &scratch.carried_over].iter())
                     .fold(0u64, |n, t| n.saturating_add(t.bytes)),
             };
-            hcore::blocking::run(move || -> anyhow::Result<()> {
-                write_marker_with(&dir, &name, incomplete, Some(stats))?;
-                sweep(&dir)?;
-                Ok(())
+            let swept = hcore::blocking::run(move || -> anyhow::Result<anyhow::Result<()>> {
+                write_marker_with(&owned_dir, &name, incomplete, Some(stats))?;
+                Ok(sweep(&owned_dir).map(drop))
             })
             .await?;
+            // The new generation is current: a failed sweep leaves only
+            // stale generations, which the next export's sweep removes.
+            if let Err(e) = swept {
+                tracing::warn!(
+                    dir = %dir.display(), error = %format!("{e:#}"),
+                    "cache snapshot: written, but removing the old generations failed",
+                );
+                report.cleanup_errors.push(format!(
+                    "removing old generations from {}: {e:#}; the next snapshot removes them",
+                    dir.display()
+                ));
+            }
         }
         report.outcome = ExportOutcome::Written {
             generation: generation_name,
@@ -906,7 +999,9 @@ impl Engine {
     }
 
     /// Write the job's scratch slots into `generation`, then carry or drop
-    /// the previous generation's.
+    /// the previous generation's: with `carry`, its entries of slots the job
+    /// exported nothing of are carried over, else every one not kept is
+    /// dropped.
     ///
     /// Each slot the job used is published in this engine's scope with
     /// [`Engine::scratch_publish`]'s rules, from its local head and against
@@ -920,7 +1015,7 @@ impl Engine {
         ws: &WorkingSet,
         generation: &Path,
         prev: Option<&Path>,
-        incomplete: bool,
+        carry: bool,
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ScratchReport> {
         use crate::engine::scratch_remote::{ScratchDestination, read_local_meta};
@@ -935,13 +1030,27 @@ impl Engine {
                 continue;
             }
             anyhow::ensure!(!ctoken.is_cancelled(), "cache snapshot export cancelled");
-            let dir = head_dir(&self.home, slot, scope);
-            if !read_slot_meta(&self.home, slot).is_some_and(|m| m.remote) || !dir.is_dir() {
+            // The slot's head and the lineage meta it descends from, when it
+            // travels at all.
+            let head = {
+                let (home, owned_slot, owned_scope) =
+                    (self.home.clone(), slot.to_owned(), scope.to_owned());
+                hcore::blocking::run(move || {
+                    let dir = head_dir(&home, &owned_slot, &owned_scope);
+                    let travels = read_slot_meta(&home, &owned_slot).is_some_and(|m| m.remote)
+                        && dir.is_dir();
+                    travels.then(|| {
+                        let parent = read_local_meta(&home, &owned_slot, &owned_scope);
+                        (dir, parent)
+                    })
+                })
+                .await
+            };
+            let Some((dir, parent)) = head else {
                 tracing::debug!(slot, scope, "cache snapshot: scratch slot not carried");
                 report.skipped += 1;
                 continue;
-            }
-            let parent = read_local_meta(&self.home, slot, scope);
+            };
             let dest = ScratchDestination::Dir {
                 root: generation,
                 prev,
@@ -968,8 +1077,7 @@ impl Engine {
             let exported: FxHashSet<String> = exported.into_iter().map(str::to_owned).collect();
             let (prev, generation) = (prev.to_path_buf(), generation.to_path_buf());
             report = hcore::blocking::run(move || {
-                carry_scratch(&prev, &generation, &exported, incomplete, report)
-                    .map_err(io::Error::other)
+                carry_scratch(&prev, &generation, &exported, carry, report)
             })
             .await?;
         }
@@ -985,28 +1093,32 @@ fn is_storage_full(e: &anyhow::Error) -> bool {
 
 /// Walk the previous generation's scratch entries
 /// (`scratch/v1/<slot>/<scope>/<stem>.{tar.gz,meta}`). One the new generation
-/// already holds was kept. On an incomplete run, one of a slot the job
-/// exported nothing of is carried over, linked or copied, when its meta
-/// decodes and its archive is a regular file. Every other one is dropped.
+/// already holds was kept. With `carry` (an incomplete run, or one that
+/// touched no slot), one of a slot the job exported nothing of is carried
+/// over, linked or copied, when its meta decodes and its archive is a
+/// regular file. Every other one is dropped. A slot or scope that is not a
+/// real directory (a symlink would lead out of `<dir>`) is not walked.
 fn carry_scratch(
     prev: &Path,
     generation: &Path,
     exported: &FxHashSet<String>,
-    incomplete: bool,
+    carry: bool,
     mut report: ScratchReport,
 ) -> anyhow::Result<ScratchReport> {
     use crate::engine::scratch_remote::KEY_PREFIX;
 
+    // `DirEntry::file_type` does not follow a symlink.
+    let real_dir = |e: &std::fs::DirEntry| e.file_type().is_ok_and(|t| t.is_dir());
     let Ok(slots) = std::fs::read_dir(prev.join(KEY_PREFIX)) else {
         return Ok(report);
     };
-    for slot in slots.flatten() {
+    for slot in slots.flatten().filter(real_dir) {
         let slot_name = slot.file_name().to_string_lossy().into_owned();
-        let carry = incomplete && !exported.contains(&slot_name);
+        let carry = carry && !exported.contains(&slot_name);
         let Ok(scopes) = std::fs::read_dir(slot.path()) else {
             continue;
         };
-        for scope in scopes.flatten() {
+        for scope in scopes.flatten().filter(real_dir) {
             let scope_name = scope.file_name().to_string_lossy().into_owned();
             let Ok(files) = std::fs::read_dir(scope.path()) else {
                 continue;
@@ -1370,6 +1482,82 @@ mod tests {
                 .join(RemoteCacheSet::key(&bad_zstd, "h", "o.zst"))
                 .exists()
         );
+    }
+
+    /// A local manifest that does not decode leaves its revision out as
+    /// corrupt; the export goes on with the rest.
+    #[tokio::test]
+    async fn an_undecodable_local_manifest_is_left_out() {
+        let (engine, _home) = test_engine();
+        let dir = snapshot_dir();
+        let (good, garbage) = (addr("good"), addr("garbage"));
+        put(&engine, &good, "h", &[raw("o", b"fine")]);
+        put_bytes(&engine, &garbage, "h", MANIFEST_V2, b"\xff\x00not borsh");
+        let report = export(&engine, dir.path(), &ws(&[(&good, "h"), (&garbage, "h")])).await;
+        assert_eq!(left(&report, LeftOut::Corrupt), 1, "{report:?}");
+        assert_eq!(report.new.count, 1, "{report:?}");
+        assert!(has(dir.path(), &good, "h"));
+        assert!(!has(dir.path(), &garbage, "h"));
+    }
+
+    /// A read of the source that fails is a missing blob; a write of the
+    /// destination that fails is the export's error.
+    #[test]
+    fn a_copy_tells_its_source_from_its_destination() {
+        struct Broken(io::ErrorKind);
+        impl io::Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(self.0.into())
+            }
+        }
+        impl io::Write for Broken {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(self.0.into())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut sink = Vec::new();
+        assert!(!copy_from(Broken(io::ErrorKind::StorageFull), &mut sink).expect("a read error"));
+        assert!(copy_from(&b"data"[..], &mut sink).expect("copied"));
+        assert_eq!(sink, b"data");
+        for kind in [io::ErrorKind::StorageFull, io::ErrorKind::PermissionDenied] {
+            let err = copy_from(&b"data"[..], &mut Broken(kind)).expect_err("a write error");
+            assert_eq!(err.kind(), kind);
+        }
+    }
+
+    /// Two homes share one `<dir>`: their snapshot locks are different
+    /// files, so `<dir>`'s own lock is what keeps one export from sweeping
+    /// the other's generation. While another holds it, this export waits
+    /// and sweeps nothing.
+    #[tokio::test]
+    async fn an_export_from_another_home_waits_for_the_dir() {
+        let (engine, _home) = test_engine();
+        let dir = snapshot_dir();
+        let a = addr("a");
+        put(&engine, &a, "h", &[raw("o", b"a")]);
+        // The other home's export, mid-way through its generation.
+        let theirs = dir.path().join("gen-x");
+        std::fs::create_dir(&theirs).expect("mkdir");
+        let held = std::fs::File::open(dir.path()).expect("open dir");
+        held.lock().expect("the other export holds the dir");
+
+        let lock = lock_snapshot(engine.home.as_path()).expect("lock");
+        let ctoken = StdCancellationToken::new();
+        let ws = ws(&[(&a, "h")]);
+        let export = engine.export_snapshot(&lock, dir.path(), &ws, &ctoken);
+        tokio::pin!(export);
+        let pending = tokio::time::timeout(Duration::from_millis(300), &mut export).await;
+        assert!(pending.is_err(), "the export must wait for the dir");
+        assert!(theirs.is_dir(), "a waiting export sweeps nothing");
+
+        drop(held);
+        let report = export.await.expect("export");
+        assert!(matches!(report.outcome, ExportOutcome::Written { .. }));
+        assert!(!theirs.exists(), "swept once the dir is free");
+        assert!(has(dir.path(), &a, "h"));
     }
 
     #[tokio::test]
