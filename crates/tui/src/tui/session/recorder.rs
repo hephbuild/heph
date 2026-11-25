@@ -691,9 +691,13 @@ pub(crate) fn is_critical(record: &SessionRecord) -> bool {
             | SessionRecordKind::RunLog(_)
             | SessionRecordKind::LockHolder { .. },
         ) => true,
+        // Machine stats are explorer inputs but not critical (D15): past the
+        // cap the waiting split reads unknown, never spare.
         Some(
             SessionRecordKind::Log { .. }
             | SessionRecordKind::Output { .. }
+            | SessionRecordKind::MachineInfo(_)
+            | SessionRecordKind::MachineSample(_)
             | SessionRecordKind::Unknown,
         )
         | None => false,

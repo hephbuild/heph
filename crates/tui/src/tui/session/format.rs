@@ -279,9 +279,97 @@ pub enum SessionRecordKind {
         #[serde(default)]
         session: Option<String>,
     },
+    /// The machine, read once as the sampler starts: its CPUs and memory,
+    /// and where each limit came from (session store PR 5). Not a critical
+    /// kind: dropped past the cap with `Log` and `Output` (D15).
+    MachineInfo(Box<MachineInfoRecord>),
+    /// One sampler tick: the machine's load and heph's own use over the
+    /// interval since the previous sample (session store PR 5). Not a
+    /// critical kind, like [`Self::MachineInfo`].
+    MachineSample(Box<MachineSampleRecord>),
     /// A record a newer heph writes.
     #[serde(other)]
     Unknown,
+}
+
+/// [`SessionRecordKind::MachineInfo`]. Fractions and CPUs are integers in
+/// millionths, so a record compares exactly; a figure whose source failed is
+/// absent, and the failure is in `failed`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MachineInfoRecord {
+    /// When the sampler read it: the recorder's anchor plus the monotonic
+    /// offset, as samples are stamped.
+    #[serde(default)]
+    pub time_unix_us: u64,
+    /// `heph.machine.cpu.count`: logical CPUs online.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_count: Option<u32>,
+    /// `heph.machine.cpu.limit` in micro-CPUs: the CPUs this process may use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_limit_ucpus: Option<u64>,
+    /// Where the CPU limit came from: `quota` (a cgroup v2 `cpu.max`) or
+    /// `host` (the CPU count). Open: a reader takes an unknown value as given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_limit_source: Option<String>,
+    /// `heph.machine.memory.limit`: physical RAM, bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_limit_bytes: Option<u64>,
+    /// Where the memory limit came from: `host`, the only source for now
+    /// (D23, O11).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_limit_source: Option<String>,
+    /// The start-time figures that could not be read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed: Vec<MachineSourceFailure>,
+}
+
+/// [`SessionRecordKind::MachineSample`]. A figure is absent when its source
+/// failed or is disabled, and `cpu_busy_ppm` also when the CPU counters did
+/// not move.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MachineSampleRecord {
+    /// When the sample was taken: the recorder's anchor plus the sample's
+    /// monotonic offset from it, so a wall-clock step moves no sample against
+    /// a span.
+    #[serde(default)]
+    pub time_unix_us: u64,
+    /// The interval it covers, ending at `time_unix_us`: since the previous
+    /// sample taken (a dropped one included), or since start.
+    #[serde(default)]
+    pub interval_us: u64,
+    /// `heph.machine.cpu.busy` in millionths of the CPU limit, 0 to 10^6.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_busy_ppm: Option<u32>,
+    /// `heph.machine.memory.used`, bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_used_bytes: Option<u64>,
+    /// `heph.process.cpu.time`: heph's user + system time, cumulative, us.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_cpu_us: Option<u64>,
+    /// `heph.process.memory.resident`, bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_resident_bytes: Option<u64>,
+    /// Sources that failed since the previous sample, each named once and
+    /// then never read again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed: Vec<MachineSourceFailure>,
+    /// Samples dropped on the sampler's full channel since the previous one.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub dropped: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+/// A sampler source that stopped, and why.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MachineSourceFailure {
+    /// The metric the source fed, e.g. `heph.machine.memory.used`.
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub error: String,
 }
 
 /// A pending approval prompt as [`SessionRecordKind::Approval`] records it.

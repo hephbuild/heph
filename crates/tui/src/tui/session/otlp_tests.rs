@@ -363,6 +363,8 @@ fn otlp_cuts_a_large_session_into_bounded_lines() {
     let path = tmp.path().join(store::FILE);
     std::fs::copy(fixture(), &path).expect("copy the fixture");
     let many = otlp::LINE_ITEMS * 2 + 500;
+    // Explorer rows written straight into the copy: it is stamped with the
+    // current derivation, or opening it re-derives them away.
     rusqlite::Connection::open(&path)
         .expect("open the copy")
         .execute_batch(&format!(
@@ -382,7 +384,9 @@ fn otlp_cuts_a_large_session_into_bounded_lines() {
                FROM temp.k, session s;
              INSERT INTO metrics (session_id, name, kind, unit, time_us, value, attributes) \
                SELECT s.id, 'heph.many', 'gauge', '1', s.started_ms * 1000 + i, i, NULL \
-               FROM temp.k, session s;"
+               FROM temp.k, session s;
+             UPDATE session SET derivation = {derivation};",
+            derivation = store::DERIVATION,
         ))
         .expect("grow the recording");
 
@@ -539,17 +543,20 @@ fn otlp_counts_span_events_toward_a_line() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let path = tmp.path().join(store::FILE);
     std::fs::copy(fixture(), &path).expect("copy the fixture");
+    // Stamped current, as in `otlp_cuts_a_large_session_into_bounded_lines`.
     rusqlite::Connection::open(&path)
         .expect("open the copy")
-        .execute_batch(
+        .execute_batch(&format!(
             "INSERT INTO spans (session_id, span_id, parent_span_id, name, class, start_us, \
                end_us, duration_us, status) \
                SELECT s.id, 2000000, NULL, 'heph.busy', 'phase', s.started_ms * 1000, \
                  s.started_ms * 1000 + 10, 10, 'ok' FROM session s;
              WITH RECURSIVE k(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM k WHERE i < 5) \
              INSERT INTO span_events (session_id, span_id, name, time_us, attributes) \
-               SELECT s.id, 2000000, 'tick', s.started_ms * 1000 + i, NULL FROM k, session s;",
-        )
+               SELECT s.id, 2000000, 'tick', s.started_ms * 1000 + i, NULL FROM k, session s;
+             UPDATE session SET derivation = {derivation};",
+            derivation = store::DERIVATION,
+        ))
         .expect("grow the recording");
     let per_line = 3;
     let work = tempfile::tempdir().expect("tempdir");

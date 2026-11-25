@@ -79,11 +79,12 @@ impl Source {
 
     /// The metric this source feeds.
     pub const fn metric(self) -> &'static str {
+        use super::derive::machine;
         match self {
-            Self::CpuBusy => "heph.machine.cpu.busy",
-            Self::MemoryUsed => "heph.machine.memory.used",
-            Self::ProcessCpu => "heph.process.cpu.time",
-            Self::ProcessResident => "heph.process.memory.resident",
+            Self::CpuBusy => machine::CPU_BUSY,
+            Self::MemoryUsed => machine::MEMORY_USED,
+            Self::ProcessCpu => machine::PROCESS_CPU_TIME,
+            Self::ProcessResident => machine::PROCESS_RESIDENT,
         }
     }
 

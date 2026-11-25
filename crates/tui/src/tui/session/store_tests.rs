@@ -372,6 +372,8 @@ fn session_variant(kind: &SessionRecordKind) -> usize {
         S::RunLog(_) => 8,
         S::LockHolder { .. } => 9,
         S::Unknown => 10,
+        S::MachineInfo(_) => 11,
+        S::MachineSample(_) => 12,
     }
 }
 
@@ -420,6 +422,31 @@ fn every_session_kind() -> Vec<SessionRecordKind> {
             session: Some("0abc".into()),
         },
         S::Unknown,
+        S::MachineInfo(Box::new(super::format::MachineInfoRecord {
+            time_unix_us: 1_700_000_000_000_123,
+            cpu_count: Some(8),
+            cpu_limit_ucpus: Some(2_500_000),
+            cpu_limit_source: Some("quota".into()),
+            memory_limit_bytes: None,
+            memory_limit_source: None,
+            failed: vec![super::format::MachineSourceFailure {
+                source: "heph.machine.memory.limit".into(),
+                error: "sysctl hw.memsize: unexpected format".into(),
+            }],
+        })),
+        S::MachineSample(Box::new(super::format::MachineSampleRecord {
+            time_unix_us: 1_700_000_001_000_123,
+            interval_us: 1_000_000,
+            cpu_busy_ppm: Some(415_000),
+            memory_used_bytes: Some(3 << 30),
+            process_cpu_us: Some(120_000),
+            process_resident_bytes: None,
+            failed: vec![super::format::MachineSourceFailure {
+                source: "heph.process.memory.resident".into(),
+                error: "reading /proc/self/statm: field missing".into(),
+            }],
+            dropped: 2,
+        })),
     ]
 }
 

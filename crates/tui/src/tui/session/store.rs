@@ -39,7 +39,12 @@ pub const APPLICATION_ID: u32 = 0x4845_5048;
 /// back to 1 and refuses a newer one by name.
 pub const FORMAT: u32 = 1;
 /// The version of the code that derives the explorer rows (D14).
-pub const DERIVATION: u32 = 1;
+///
+/// - 1: session store PR 4.
+/// - 2: the machine metrics and their session summaries (PR 5). A heph at 1
+///   reads a recording at 2 as it is, machine rows included, rather than
+///   re-deriving them away; every recording at 1 is re-derived once.
+pub const DERIVATION: u32 = 2;
 /// The derivation of a lost recording cleanup sealed: older than any real
 /// one, so a session command re-derives it before reading its explorer rows
 /// (D14), as it does a recording an older heph derived.
@@ -1165,6 +1170,8 @@ pub fn kind_and_addr(record: &SessionRecord) -> (&'static str, Option<&str>) {
         Some(SessionRecordKind::Output { .. }) => "Output",
         Some(SessionRecordKind::RunLog(run)) => return ("RunLog", Some(run.addr.as_str())),
         Some(SessionRecordKind::LockHolder { .. }) => "LockHolder",
+        Some(SessionRecordKind::MachineInfo(_)) => "MachineInfo",
+        Some(SessionRecordKind::MachineSample(_)) => "MachineSample",
         Some(SessionRecordKind::Unknown) | None => "Unknown",
     };
     (name, None)
