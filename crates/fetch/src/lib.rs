@@ -120,6 +120,15 @@ impl Fetcher {
     }
 }
 
+/// The HTTP status a failed download was answered with, if the failure was a
+/// status at all (rather than a connection, timeout or write error): read off
+/// the error chain [`Fetcher::open`] returns.
+pub fn http_status(err: &anyhow::Error) -> Option<u16> {
+    err.chain()
+        .find_map(|e| e.downcast_ref::<reqwest::Error>()?.status())
+        .map(|s| s.as_u16())
+}
+
 /// A username and password sent as HTTP basic auth. See [`Fetcher::open_with`].
 pub struct BasicAuth {
     pub username: String,
@@ -439,5 +448,19 @@ mod tests {
             w.finish("u").unwrap(),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    /// `{:?}` of a credential prints neither half: `Selected` in plugin-http
+    /// derives `Debug` around one.
+    #[test]
+    fn basic_auth_debug_prints_no_material() {
+        let shown = format!(
+            "{:?}",
+            BasicAuth {
+                username: "user-material".to_string(),
+                password: "password-material".to_string(),
+            }
+        );
+        assert!(!shown.contains("material"), "{shown}");
     }
 }

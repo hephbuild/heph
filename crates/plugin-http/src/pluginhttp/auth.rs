@@ -20,70 +20,64 @@
 //! Only `machine` entries count. A `default` entry would cover every host, so
 //! a declaration written for one server would authenticate a request to any
 //! other; the error for an uncovered host says it was skipped.
+//!
+//! Only over `https`, as Go's module fetch does with the same file: basic auth
+//! over plain `http` is the credential in clear text. A loopback host is the
+//! one exemption, since nothing leaves the machine.
 
 use anyhow::Context as _;
 use hfetch::BasicAuth;
 use hplugin::driver::CredentialMount;
-use hplugin::driver::targetdef::TargetDef;
 
 /// The variable `heph.auth.netrc` points at the file it presents.
 const NETRC_ENV: &str = "NETRC";
 
-/// The basic auth a run sends, and the credential it came from.
+/// The basic auth a run sends, and where it came from.
 #[derive(Debug)]
 pub(crate) struct Selected {
     pub(crate) auth: BasicAuth,
     /// The credential's address, for error context.
     pub(crate) credential: String,
+    /// The `machine` entry that matched.
+    pub(crate) host: String,
 }
 
-/// How many credentials `target` declared: its credential edges.
-pub(crate) fn declared(target: &TargetDef) -> usize {
-    target
-        .inputs
-        .iter()
-        .filter(|i| hdriver_support::credential::is_credential(&i.annotations))
-        .count()
+/// Refuse, at parse, a `url` that `credentials` cannot be sent to safely: one
+/// that does not parse, names its own user (two identities for one request,
+/// with the client choosing), or is not `https` to a non-loopback host.
+pub(crate) fn check_url(url: &str) -> anyhow::Result<()> {
+    let parsed = url::Url::parse(url).with_context(|| format!("parse url {url:?}"))?;
+    anyhow::ensure!(
+        parsed.username().is_empty() && parsed.password().is_none(),
+        "the url carries a username or password and the target names `credentials`; drop the \
+         one from the url"
+    );
+    let loopback = match parsed.host() {
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => anyhow::bail!("url {url:?} has no host to authenticate to"),
+    };
+    anyhow::ensure!(
+        parsed.scheme() == "https" || loopback,
+        "the target names `credentials` but its url is {}://, which would send them in clear \
+         text; use https (only a loopback host is exempt)",
+        parsed.scheme()
+    );
+    Ok(())
 }
 
-/// The auth for a run of `target`, which [`declared`] `declared` credentials,
-/// fetching `url`, given the `mounts` the host presented: `None` when the
-/// target declared none.
-///
-/// Decided by what the target declared and checked against what arrived. A
-/// target that declared credentials and received none is refused rather than
-/// fetched anonymously: a mount lost between host and driver would otherwise
-/// turn a declared identity into none, and the 401 that follows would point at
-/// the server rather than at the lost mount.
+/// The netrc entry for `url`'s host among the `mounts` a run of a target that
+/// declared credentials received (see
+/// [`check_presented`](hdriver_support::credential::check_presented)).
 ///
 /// Reads the presented files, so call it off the async workers.
-pub(crate) fn resolve(
-    target: &str,
-    declared: usize,
-    mounts: &[CredentialMount],
-    url: &str,
-) -> anyhow::Result<Option<Selected>> {
-    if declared == 0 && mounts.is_empty() {
-        return Ok(None);
-    }
-    anyhow::ensure!(
-        mounts.len() >= declared,
-        "{target} declares {declared} credential(s), but the host presented {}. The host is \
-         likely older than the driver; upgrade heph",
-        mounts.len()
-    );
-    let host = host_of(url)?;
-    select(mounts, &host).map(Some)
-}
-
-/// `url`'s host, the way a netrc `machine` names it: lowercase, and an IPv6
-/// literal without its brackets.
-fn host_of(url: &str) -> anyhow::Result<String> {
+pub(crate) fn select_for(mounts: &[CredentialMount], url: &str) -> anyhow::Result<Selected> {
     let parsed = url::Url::parse(url).with_context(|| format!("parse url {url:?}"))?;
     let host = parsed
         .host_str()
         .with_context(|| format!("url {url:?} has no host to authenticate to"))?;
-    Ok(normalize_host(host))
+    select(mounts, &normalize_host(host))
 }
 
 fn normalize_host(host: &str) -> String {
@@ -100,6 +94,9 @@ fn select(mounts: &[CredentialMount], host: &str) -> anyhow::Result<Selected> {
     let mut found: Vec<Selected> = Vec::new();
     let mut without_netrc: Vec<String> = Vec::new();
     let mut with_default: Vec<String> = Vec::new();
+    // What each consulted credential does cover: host names, not material, so
+    // the error can name the near miss.
+    let mut covers: Vec<String> = Vec::new();
     for m in mounts {
         let credential = m.addr.format();
         let Some(path) = m.env.get(NETRC_ENV) else {
@@ -115,6 +112,18 @@ fn select(mounts: &[CredentialMount], host: &str) -> anyhow::Result<Selected> {
         if entries.iter().any(|e| e.machine.is_none()) {
             with_default.push(credential.clone());
         }
+        let machines: Vec<&str> = entries
+            .iter()
+            .filter_map(|e| e.machine.as_deref())
+            .collect();
+        covers.push(format!(
+            "{credential} covers {}",
+            if machines.is_empty() {
+                "no machine".to_string()
+            } else {
+                machines.join(", ")
+            }
+        ));
         // The first entry for a host wins, as it does for curl.
         let Some(entry) = entries
             .into_iter()
@@ -131,6 +140,7 @@ fn select(mounts: &[CredentialMount], host: &str) -> anyhow::Result<Selected> {
         found.push(Selected {
             auth: BasicAuth { username, password },
             credential,
+            host: host.to_string(),
         });
     }
 
@@ -154,6 +164,9 @@ fn select(mounts: &[CredentialMount], host: &str) -> anyhow::Result<Selected> {
          ~/.netrc, so list {host:?} in a credential's `heph.auth.netrc([...])` presentation, or \
          add a credential that does"
     );
+    if !covers.is_empty() {
+        msg.push_str(&format!(" ({})", covers.join("; ")));
+    }
     if !with_default.is_empty() {
         msg.push_str(&format!(
             ". A netrc `default` entry covers no host, and was skipped in: {}",
@@ -179,7 +192,14 @@ struct NetrcEntry {
 
 /// Parse a netrc document: whitespace-separated `machine`, `default`,
 /// `login`, `password`, `account` and `macdef` tokens, entries free to span
-/// lines, a line starting with `#` a comment.
+/// lines, a line starting with `#` a comment, a `macdef` body running to the
+/// next empty line.
+///
+/// A keyword waiting for its value takes the next token whatever it looks
+/// like, so material that equals a keyword or starts with `#` is a value.
+/// Keywords are matched case-sensitively, and curl's quoted tokens are refused
+/// rather than read with their quotes: a password sent as `"s3cret"` would
+/// come back as a 401 that blames the server.
 ///
 /// No error quotes a token: the document holds material, and an error chain
 /// ends up in the run's log and failure event.
@@ -211,15 +231,20 @@ fn parse_netrc(text: &str) -> anyhow::Result<Vec<NetrcEntry>> {
     let mut in_macdef = false;
     for (i, line) in text.lines().enumerate() {
         let lineno = i + 1;
-        // A macro body runs to the next blank line, and is nothing heph uses.
+        // A macro body runs to the next empty line (`lines` has already
+        // dropped a `\r`), and is nothing heph uses.
         if in_macdef {
-            in_macdef = !line.trim().is_empty();
+            in_macdef = !line.is_empty();
             continue;
         }
-        if line.trim_start().starts_with('#') {
+        if pending.is_none() && line.trim_start().starts_with('#') {
             continue;
         }
         for token in line.split_ascii_whitespace() {
+            anyhow::ensure!(
+                !token.starts_with('"'),
+                "line {lineno}: quoted netrc tokens are not supported; write the value unquoted"
+            );
             if let Some((key, _)) = pending.take() {
                 match key {
                     Pending::Machine => entries.push(NetrcEntry {
@@ -279,11 +304,13 @@ fn parse_netrc(text: &str) -> anyhow::Result<Vec<NetrcEntry>> {
         }
     }
     if let Some((key, lineno)) = pending {
-        anyhow::bail!(
-            "line {lineno}: `{}` has no value. An empty login or password cannot be written in \
-             netrc",
-            key.keyword()
-        );
+        let why = match key {
+            Pending::Login | Pending::Password => {
+                ". An empty login or password cannot be written in netrc"
+            }
+            Pending::Machine | Pending::Account | Pending::Macdef => "",
+        };
+        anyhow::bail!("line {lineno}: `{}` has no value{why}", key.keyword());
     }
     Ok(entries)
 }
@@ -318,14 +345,14 @@ mod tests {
     }
 
     /// Entries span lines, `account` is skipped, a comment line is not a token
-    /// stream, a macro body runs to the blank line, and `default` is an entry
+    /// stream, a macro body runs to the empty line, and `default` is an entry
     /// with no machine.
     #[test]
     fn netrc_in_its_other_spellings() {
         let got = parse_netrc(
             "# a comment naming machine evil\n\
              machine\n  a.example\n\tlogin u1\n  account acct\n  password p#1\n\
-             macdef init\ncd /pub\nmachine inside-a-macro login x password y\n\n\
+             macdef init\ncd /pub\n  \nmachine inside-a-macro login x password y\n\n\
              default login anon password anon@\n",
         )
         .expect("parse");
@@ -338,11 +365,39 @@ mod tests {
         );
         assert_eq!(parse_netrc("").expect("empty"), vec![]);
         assert_eq!(parse_netrc("\n  \n").expect("blank"), vec![]);
+        // A macro body running to the end of the file is fine.
+        assert_eq!(
+            parse_netrc("machine h login u password p\nmacdef m\nls\n").expect("macdef at eof"),
+            vec![entry(Some("h"), Some("u"), Some("p"))]
+        );
     }
 
-    /// What `heph.auth.netrc` renders from material it cannot write: an empty
-    /// login, or a password with a space. Both are errors, and neither error
-    /// quotes the material.
+    /// Generated material is whatever bytes the source returned: a value that
+    /// starts with `#`, even on the line after its keyword, or equals a
+    /// keyword, is a value. CRLF line ends parse like LF.
+    #[test]
+    fn netrc_values_that_look_like_syntax() {
+        assert_eq!(
+            parse_netrc("machine h login u password #tok\n").expect("hash value"),
+            vec![entry(Some("h"), Some("u"), Some("#tok"))]
+        );
+        assert_eq!(
+            parse_netrc("machine h login u password\n#tok\n").expect("hash value next line"),
+            vec![entry(Some("h"), Some("u"), Some("#tok"))]
+        );
+        assert_eq!(
+            parse_netrc("machine h login machine password default\r\n").expect("keyword values"),
+            vec![entry(Some("h"), Some("machine"), Some("default"))]
+        );
+        assert_eq!(
+            parse_netrc("machine h password p\n").expect("no login"),
+            vec![entry(Some("h"), None, Some("p"))]
+        );
+    }
+
+    /// What `heph.auth.netrc` renders from material it cannot write (an empty
+    /// login, a password with a space), and what it never writes (curl's
+    /// quoting). All are errors, and none quotes the material.
     #[test]
     fn netrc_that_cannot_be_read_is_an_error_that_quotes_nothing() {
         for (text, wants) in [
@@ -355,17 +410,26 @@ mod tests {
                 "machine h login u password s3cr3t token\n",
                 "expected a netrc keyword",
             ),
-            ("machine h login u password\n", "`password` has no value"),
+            (
+                "machine h login u password\n",
+                "`password` has no value. An empty",
+            ),
             ("login u password s3cr3t-token\n", "before any `machine`"),
             (
                 "machine h login u passwd s3cr3t-token\n",
                 "expected a netrc keyword",
+            ),
+            (
+                "machine h login u password \"s3cr3t token\"\n",
+                "quoted netrc tokens are not supported",
             ),
         ] {
             let err = format!("{:#}", parse_netrc(text).expect_err(text));
             assert!(err.contains(wants), "{text:?}: {err}");
             assert!(!err.contains("s3cr3t"), "an error quoted material: {err}");
         }
+        let err = format!("{:#}", parse_netrc("machine").expect_err("bare machine"));
+        assert!(err.ends_with("`machine` has no value"), "{err}");
     }
 
     /// A presented netrc credential, the way the host writes one for
@@ -390,36 +454,8 @@ mod tests {
         }
     }
 
-    /// A def declaring `n` credentials, the way `http_fetch` parses one.
-    fn def(n: usize) -> TargetDef {
-        let refs: Vec<String> = (0..n).map(|i| format!("//auth:c{i}")).collect();
-        let addr = parse_addr("//dl:file").expect("addr");
-        TargetDef {
-            inputs: hdriver_support::credential::inputs(&refs, &addr.package).expect("inputs"),
-            addr,
-            ..Default::default()
-        }
-    }
-
-    fn resolve_def(
-        def: &TargetDef,
-        mounts: &[CredentialMount],
-        url: &str,
-    ) -> anyhow::Result<Option<Selected>> {
-        resolve(&def.addr.format(), declared(def), mounts, url)
-    }
-
-    fn resolve_for(mounts: &[CredentialMount], url: &str) -> anyhow::Result<Option<Selected>> {
-        resolve_def(&def(mounts.len()), mounts, url)
-    }
-
-    #[test]
-    fn no_credentials_is_anonymous() {
-        assert!(
-            resolve_for(&[], "https://x.example/f")
-                .expect("ok")
-                .is_none()
-        );
+    fn select_err(mounts: &[CredentialMount], url: &str) -> String {
+        format!("{:#}", select_for(mounts, url).expect_err(url))
     }
 
     #[test]
@@ -427,46 +463,56 @@ mod tests {
         let p = Presented::netrc(
             "//auth:files",
             "machine other.example login no password no\n\
-             machine files.example login u password the-token\n",
+             machine FILES.example login u password the-token\n\
+             machine files.example login second password entry\n",
         );
-        // Host matching ignores case, port, path and query.
-        let got = resolve_for(
+        // Host matching ignores case on both sides, port, path and query, and
+        // the first entry for a host wins.
+        let got = select_for(
             std::slice::from_ref(&p.mount),
-            "https://FILES.example:8443/a/b.tar.gz?x=1",
+            "https://Files.EXAMPLE:8443/a/b.tar.gz?x=1",
         )
-        .expect("resolve")
-        .expect("authenticated");
+        .expect("select");
         assert_eq!(got.auth.username, "u");
         assert_eq!(got.auth.password, "the-token");
         assert_eq!(got.credential, "//auth:files");
+        assert_eq!(got.host, "files.example");
     }
 
     #[test]
     fn an_ipv6_literal_matches_without_brackets() {
         let p = Presented::netrc("//auth:v6", "machine ::1 login u password p\n");
-        let got = resolve_for(std::slice::from_ref(&p.mount), "http://[::1]:8080/f")
-            .expect("resolve")
-            .expect("authenticated");
+        let got =
+            select_for(std::slice::from_ref(&p.mount), "http://[::1]:8080/f").expect("select");
         assert_eq!(got.auth.username, "u");
     }
 
-    /// The near miss: a declaration for `files.example` does not cover
-    /// `files.example.evil`, nor its parent domain, and a `default` entry is
-    /// not a fallback.
+    /// The near misses: a declaration for `files.example` covers neither a
+    /// longer name, nor its parent domain, nor its trailing-dot spelling, and
+    /// an entry naming a port or a `default` entry is no fallback. The error
+    /// lists what is covered, and never the material.
     #[test]
     fn an_uncovered_host_fails_rather_than_going_anonymous() {
         let p = Presented::netrc(
             "//auth:files",
-            "machine files.example login u password p\ndefault login a password b\n",
+            "machine files.example login u password s3cr3t\n\
+             machine other.example:443 login u password s3cr3t\n\
+             default login a password s3cr3t\n",
         );
-        for url in ["https://files.example.evil/f", "https://example/f"] {
-            let err = format!(
-                "{:#}",
-                resolve_for(std::slice::from_ref(&p.mount), url).expect_err(url)
-            );
+        for url in [
+            "https://files.example.evil/f",
+            "https://example/f",
+            "https://files.example./f",
+            "https://other.example/f",
+        ] {
+            let err = select_err(std::slice::from_ref(&p.mount), url);
             assert!(err.contains("no declared credential covers host"), "{err}");
+            assert!(
+                err.contains("//auth:files covers files.example, other.example:443"),
+                "{err}"
+            );
             assert!(err.contains("`default` entry"), "{err}");
-            assert!(err.contains("//auth:files"), "{err}");
+            assert!(!err.contains("s3cr3t"), "an error quoted material: {err}");
         }
     }
 
@@ -478,10 +524,7 @@ mod tests {
             path_prefix: vec![],
             redact: vec![],
         };
-        let err = format!(
-            "{:#}",
-            resolve_for(&[mount], "https://x.example/f").expect_err("uncovered")
-        );
+        let err = select_err(&[mount], "https://x.example/f");
         assert!(err.contains("not consulted: //auth:envonly"), "{err}");
     }
 
@@ -489,37 +532,48 @@ mod tests {
     fn two_credentials_for_one_host_are_refused() {
         let a = Presented::netrc("//auth:a", "machine x.example login u password p\n");
         let b = Presented::netrc("//auth:b", "machine x.example login v password q\n");
-        let err = format!(
-            "{:#}",
-            resolve_for(&[a.mount.clone(), b.mount.clone()], "https://x.example/f")
-                .expect_err("ambiguous")
-        );
+        let err = select_err(&[a.mount.clone(), b.mount.clone()], "https://x.example/f");
         assert!(err.contains("more than one declared credential"), "{err}");
         assert!(err.contains("//auth:a, //auth:b"), "{err}");
     }
 
     #[test]
-    fn an_entry_without_a_password_is_refused() {
-        let p = Presented::netrc("//auth:half", "machine x.example login u\n");
-        let err = format!(
-            "{:#}",
-            resolve_for(std::slice::from_ref(&p.mount), "https://x.example/f")
-                .expect_err("half an entry")
-        );
-        assert!(
-            err.contains("without both a `login` and a `password`"),
-            "{err}"
-        );
+    fn an_entry_without_both_halves_is_refused() {
+        for body in [
+            "machine x.example login u\n",
+            "machine x.example password p\n",
+        ] {
+            let p = Presented::netrc("//auth:half", body);
+            let err = select_err(std::slice::from_ref(&p.mount), "https://x.example/f");
+            assert!(
+                err.contains("without both a `login` and a `password`"),
+                "{err}"
+            );
+        }
     }
 
-    /// A target that declared credentials and received none fails, rather
-    /// than fetching anonymously.
     #[test]
-    fn declared_credentials_without_mounts_are_refused() {
-        let err = format!(
-            "{:#}",
-            resolve_def(&def(1), &[], "https://x.example/f").expect_err("lost mount")
-        );
-        assert!(err.contains("declares 1 credential(s)"), "{err}");
+    fn credentials_go_only_over_https_or_to_loopback() {
+        for ok in [
+            "https://files.example/f",
+            "http://127.0.0.1:8080/f",
+            "http://127.9.9.9/f",
+            "http://[::1]/f",
+            "http://LOCALHOST/f",
+        ] {
+            check_url(ok).unwrap_or_else(|e| panic!("{ok}: {e:#}"));
+        }
+        for (bad, wants) in [
+            ("http://files.example/f", "clear text"),
+            ("ftp://files.example/f", "clear text"),
+            ("http://localhost.example/f", "clear text"),
+            ("https://u:p@files.example/f", "username or password"),
+            ("https://u@files.example/f", "username or password"),
+            ("https://:p@files.example/f", "username or password"),
+            ("not a url", "parse url"),
+        ] {
+            let err = format!("{:#}", check_url(bad).expect_err(bad));
+            assert!(err.contains(wants), "{bad}: {err}");
+        }
     }
 }
