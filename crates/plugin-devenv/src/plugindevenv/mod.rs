@@ -96,7 +96,14 @@ use xxhash_rust::xxh3::Xxh3;
 /// 3: a `session` config carries `launch_env` (the `pass_env` snapshot).
 /// The session runner now starts the launch from an empty environment, so a
 /// runner cached without it would launch `devenv` with no `PATH` (#580).
-const FORMAT_VERSION: u32 = 3;
+///
+/// 4: a run roots one store path covering every store path `runner.json` names
+/// and declares it in `host_paths`. An entry cached before that declares
+/// nothing, so a garbage-collected path under it would never be noticed; the
+/// bump re-runs each runner once. The `runner.json` bytes are unchanged (this
+/// reaches the def hash only, not the fingerprint), so consumers keep their
+/// keys.
+const FORMAT_VERSION: u32 = 4;
 
 /// The file a runner target must produce.
 const OUT_FILE: &str = "runner.json";
