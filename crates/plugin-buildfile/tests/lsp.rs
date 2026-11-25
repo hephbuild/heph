@@ -1551,6 +1551,193 @@ fn reopen_starts_clean() {
     assert_eq!(counter(&reopened, "interface_checks"), 2, "{reopened}");
 }
 
+/// Wait out the memo's racy window (2s): a file written within it is read
+/// again on every lookup, so a test that proves a stat alone catches a change
+/// starts from stats that are safely old.
+fn past_racy_window() {
+    std::thread::sleep(Duration::from_millis(2100));
+}
+
+#[test]
+fn memo_hit_reads_no_loaded_file() {
+    let mut lsp = Lsp::start();
+    lsp.write("lib/mode.star", "Mode = record(level = str)\n");
+    lsp.write(
+        "lib/defs.star",
+        "load(\"//lib/mode.star\", \"Mode\")\n\nLib = record(name = str, mode = Mode)\n",
+    );
+    lsp.write("dir/BUILD", "D = record(d = str)\n");
+    past_racy_window();
+    let head = "load(\"//lib/defs.star\", \"Lib\")\nload(\"//dir\", \"D\")\n\
+                load(\"//lib/absent.star\", \"A\")\n\ndef f(l: Lib, d: D):\n";
+    let doc = open_dotted(
+        &mut lsp,
+        "pkg/BUILD",
+        &format!("{head}    x = l.mode\n"),
+        &format!("{head}    x = l.mode.│\n"),
+    );
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), ["level"]);
+    let first = counters(&mut lsp);
+    assert_eq!(counter(&first, "load_walks"), 1, "{first}");
+    // The walk parses each of the three files, the memo reads each for its
+    // digest.
+    assert_eq!(counter(&first, "loaded_file_reads"), 6, "{first}");
+
+    // Nothing moved: the walk is validated by stats, and no loaded file is
+    // read, parsed or checked.
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), ["level"]);
+    assert_eq!(counters(&mut lsp), first);
+}
+
+#[test]
+fn build_file_added_to_loaded_dir_is_seen() {
+    let mut lsp = Lsp::start();
+    lsp.write("lib/BUILD", "X = \"x\"\n");
+    past_racy_window();
+    let head = "load(\"//lib\", \"Lib\")\n\ndef f(l: Lib):\n";
+    let doc = open_dotted(
+        &mut lsp,
+        "pkg/BUILD",
+        &format!("{head}    x = l\n"),
+        &format!("{head}    x = l.│\n"),
+    );
+    assert!(sorted_labels(&lsp.completion(&doc)).is_empty());
+    // The walk is settled: the next one is the directory's stat moving.
+    assert!(sorted_labels(&lsp.completion(&doc)).is_empty());
+    assert_eq!(counter(&counters(&mut lsp), "load_walks"), 1);
+
+    lsp.write("lib/more.BUILD", DECLS);
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), LIB_FIELDS);
+    assert_eq!(counter(&counters(&mut lsp), "load_walks"), 2);
+}
+
+#[test]
+fn unresolved_load_resolves_once_created() {
+    let mut lsp = Lsp::start();
+    let head = "load(\"//lib/later.star\", \"Lib\")\n\ndef f(l: Lib):\n";
+    let doc = open_dotted(
+        &mut lsp,
+        "pkg/BUILD",
+        &format!("{head}    x = l\n"),
+        &format!("{head}    x = l.│\n"),
+    );
+    assert!(sorted_labels(&lsp.completion(&doc)).is_empty());
+    // A path that is not there is no racy stat: the walk is settled.
+    assert!(sorted_labels(&lsp.completion(&doc)).is_empty());
+    assert_eq!(counter(&counters(&mut lsp), "load_walks"), 1);
+
+    lsp.write("lib/later.star", DECLS);
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), LIB_FIELDS);
+    assert_eq!(counter(&counters(&mut lsp), "interfaces"), 1);
+}
+
+#[test]
+fn bad_load_leaves_the_others_typed() {
+    let fixed = "B = record(b = str)\n";
+    let cases: [(&str, &[u8]); 5] = [
+        ("does not parse", b"B = record(b = str\n"),
+        ("missing", b""),
+        (
+            "cycle back into the document",
+            b"load(\"//pkg/BUILD\", \"f\")\nB = record(b = str)\n",
+        ),
+        (
+            "cycle back into the document's directory",
+            b"load(\"//pkg\", \"f\")\nB = record(b = str)\n",
+        ),
+        ("not UTF-8", b"B = record(b = str)\n# \xff\xfe\n"),
+    ];
+    let head = "load(\"//good/defs.star\", \"G\")\nload(\"//bad/defs.star\", \"B\")\n\n\
+                def f(g: G, b: B):\n";
+    for (case, bad) in cases {
+        let mut lsp = Lsp::start();
+        lsp.write("good/defs.star", "G = record(g = str)\n");
+        let bad_path = lsp.root().join("bad/defs.star");
+        if !bad.is_empty() {
+            std::fs::create_dir_all(lsp.root().join("bad")).expect("mkdir");
+            std::fs::write(&bad_path, bad).expect("write bad");
+        }
+        let doc = lsp.open("pkg/BUILD", &format!("{head}    x = g\n"));
+        let members = |lsp: &mut Lsp, var: &str| {
+            let doc = lsp.change(&doc, &format!("{head}    x = {var}.│\n"));
+            sorted_labels(&lsp.completion(&doc))
+        };
+        assert_eq!(members(&mut lsp, "g"), ["g"], "{case}: the good load");
+        assert!(members(&mut lsp, "b").is_empty(), "{case}: the bad load");
+        let broken = counters(&mut lsp);
+        assert_eq!(counter(&broken, "interfaces"), 1, "{case}: {broken}");
+
+        lsp.write("bad/defs.star", fixed);
+        assert_eq!(members(&mut lsp, "b"), ["b"], "{case}: fixed");
+        assert_eq!(members(&mut lsp, "g"), ["g"], "{case}: fixed");
+        let fixed_counters = counters(&mut lsp);
+        assert_eq!(
+            counter(&fixed_counters, "interfaces"),
+            2,
+            "{case}: {fixed_counters}"
+        );
+
+        std::fs::remove_file(&bad_path).expect("remove bad");
+        assert!(members(&mut lsp, "b").is_empty(), "{case}: removed");
+        assert_eq!(members(&mut lsp, "g"), ["g"], "{case}: removed");
+        let removed = counters(&mut lsp);
+        assert_eq!(counter(&removed, "interfaces"), 1, "{case}: {removed}");
+    }
+}
+
+#[test]
+fn symlinked_load_follows_its_target() {
+    let mut lsp = Lsp::start();
+    lsp.write("real/one.star", "L = record(one = str)\n");
+    lsp.write("real/two.star", "L = record(two = str)\n");
+    std::fs::create_dir_all(lsp.root().join("link")).expect("mkdir");
+    let link = lsp.root().join("link/defs.star");
+    std::os::unix::fs::symlink(lsp.root().join("real/one.star"), &link).expect("symlink");
+    past_racy_window();
+    let head = "load(\"//link/defs.star\", \"L\")\n\ndef f(l: L):\n";
+    let doc = open_dotted(
+        &mut lsp,
+        "pkg/BUILD",
+        &format!("{head}    x = l\n"),
+        &format!("{head}    x = l.│\n"),
+    );
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), ["one"]);
+
+    // The target changes under the link, whose own stat does not move.
+    lsp.write("real/one.star", "L = record(one = str, more = str)\n");
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), ["more", "one"]);
+
+    // The link is pointed elsewhere.
+    std::fs::remove_file(&link).expect("unlink");
+    std::os::unix::fs::symlink(lsp.root().join("real/two.star"), &link).expect("symlink");
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), ["two"]);
+
+    // The link is removed: nothing of it is held.
+    std::fs::remove_file(&link).expect("unlink");
+    assert!(sorted_labels(&lsp.completion(&doc)).is_empty());
+    assert_eq!(counter(&counters(&mut lsp), "interfaces"), 0);
+}
+
+#[test]
+fn racy_same_length_rewrite_is_seen() {
+    // A rewrite within one timestamp tick can keep the whole stat; the memo
+    // reads a file again until its stat is older than the racy window. (On a
+    // filesystem with fine timestamps the ctime moves anyway; the racy rule
+    // itself is unit-tested in `lsp::memo`.)
+    let mut lsp = Lsp::start();
+    lsp.write("lib/defs.star", "Lib = record(aaa = str)\n");
+    let head = "load(\"//lib/defs.star\", \"Lib\")\n\ndef f(l: Lib):\n";
+    let doc = open_dotted(
+        &mut lsp,
+        "pkg/BUILD",
+        &format!("{head}    x = l\n"),
+        &format!("{head}    x = l.│\n"),
+    );
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), ["aaa"]);
+    lsp.write("lib/defs.star", "Lib = record(bbb = str)\n");
+    assert_eq!(sorted_labels(&lsp.completion(&doc)), ["bbb"]);
+}
+
 #[test]
 fn types_before_and_after_registry() {
     const RECORD: &str = "Lib = record(name = str)\n\ndef f(l: Lib):\n";
