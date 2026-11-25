@@ -2741,3 +2741,170 @@ fn actor_env_skips_non_utf8() {
     let actor = store::Actor::from_env(store::utf8_env(env));
     assert_eq!((actor.kind, actor.name), ("human", None));
 }
+
+/// A sealed recording of `events()` in a fresh session directory under
+/// `root`, as its owner leaves it.
+fn sealed_recording(root: &Path, id: SessionId) -> PathBuf {
+    let dir = session_dir(root, id);
+    let mut writer = writer_in(&dir, id);
+    for ev in events() {
+        insert(&mut writer, &event_record(ev));
+    }
+    writer.commit().expect("commit");
+    let conn = writer.finish(T_END, Some(0), false).expect("finish");
+    assert_eq!(
+        store::seal(conn, store::SEAL_TIMEOUT).expect("seal"),
+        store::Sealed::Done
+    );
+    dir
+}
+
+const T_END: u64 = 1_700_000_100_000;
+
+fn explorer_rows(dir: &Path) -> (u32, i64, Vec<u8>) {
+    let conn = store::open_sealed(&dir.join(store::FILE)).expect("open");
+    let derivation = conn
+        .query_row("SELECT derivation FROM session", [], |r| r.get(0))
+        .expect("derivation");
+    let spans = conn
+        .query_row("SELECT count(*) FROM spans", [], |r| r.get(0))
+        .expect("spans");
+    let records: Vec<u8> = conn
+        .query_row(
+            "SELECT group_concat(seq || ':' || kind || ':' || body, char(10)) FROM records",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .expect("records")
+        .into_bytes();
+    (derivation, spans, records)
+}
+
+/// `an_older_derivation_is_rederived_on_open` (I4, D14), the recording's
+/// half: a sealed recording stamped with an older derivation is re-derived
+/// once under its lock, its records unchanged; a second call does no work.
+/// `newer_derivation_is_left_alone`: a newer one is never rewritten.
+#[test]
+fn an_older_derivation_is_rederived_on_open() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = sealed_recording(tmp.path(), SessionId::new(1_700_000_000_000, 1));
+    let (live_derivation, live_spans, live_records) = explorer_rows(&dir);
+    assert!(
+        live_spans > 0,
+        "precondition: the live derivation wrote spans"
+    );
+    testing::alter(
+        &dir,
+        &format!(
+            "DELETE FROM spans; UPDATE session SET derivation = {}",
+            store::STALE_DERIVATION
+        ),
+    )
+    .expect("age the derivation");
+    let need = store::Need::default();
+    assert!(
+        store::pending_local(&dir, need)
+            .expect("pending")
+            .is_some_and(|p| p.rederive)
+    );
+    assert_eq!(
+        store::upgrade_local(&dir, need).expect("upgrade"),
+        store::Upgraded::Done
+    );
+    assert_eq!(
+        explorer_rows(&dir),
+        (live_derivation, live_spans, live_records.clone())
+    );
+    assert!(!header(&dir).wal, "still one sealed file");
+    assert!(!dir.join(store::REDERIVING).exists());
+    assert_eq!(
+        store::upgrade_local(&dir, need).expect("upgrade"),
+        store::Upgraded::Current
+    );
+
+    let newer = store::DERIVATION + 1;
+    testing::alter(
+        &dir,
+        &format!("DELETE FROM spans; UPDATE session SET derivation = {newer}"),
+    )
+    .expect("stamp a newer derivation");
+    assert_eq!(
+        store::upgrade_local(&dir, need).expect("upgrade"),
+        store::Upgraded::Current
+    );
+    assert_eq!(explorer_rows(&dir), (newer, 0, live_records));
+}
+
+/// `indexes_built_on_first_need`: a seal builds no index; a reader that asks
+/// for them gets them, under the lock, by the same rename.
+#[test]
+fn indexes_built_on_first_need() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = sealed_recording(tmp.path(), SessionId::new(1_700_000_000_000, 2));
+    let indexes = |dir: &Path| -> i64 {
+        store::open_sealed(&dir.join(store::FILE))
+            .expect("open")
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE type = 'index'
+                   AND name NOT LIKE 'sqlite_autoindex%'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("indexes")
+    };
+    assert_eq!(indexes(&dir), 0, "a seal builds no index");
+    assert_eq!(
+        store::upgrade_local(&dir, store::Need::default()).expect("upgrade"),
+        store::Upgraded::Current,
+        "a viewer that needs no index builds none"
+    );
+    let need = store::Need { indexes: true };
+    assert_eq!(
+        store::upgrade_local(&dir, need).expect("upgrade"),
+        store::Upgraded::Done
+    );
+    assert_eq!(indexes(&dir), 4);
+    assert_eq!(
+        store::upgrade_local(&dir, need).expect("upgrade"),
+        store::Upgraded::Current
+    );
+}
+
+/// `rederive_replaces_the_file` (I3): a reader holding the sealed file open
+/// keeps reading the rows it opened while another command re-derives it.
+/// `rederive_is_durable_and_safe`, the refusal half: beside a `-journal` the
+/// original stays byte-identical, and a live session is never written.
+#[test]
+fn rederive_replaces_the_file() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = sealed_recording(tmp.path(), SessionId::new(1_700_000_000_000, 3));
+    testing::alter(
+        &dir,
+        &format!(
+            "DELETE FROM spans; UPDATE session SET derivation = {}",
+            store::STALE_DERIVATION
+        ),
+    )
+    .expect("age the derivation");
+    let reader = store::open_sealed(&dir.join(store::FILE)).expect("open");
+    let spans = |c: &rusqlite::Connection| -> i64 {
+        c.query_row("SELECT count(*) FROM spans", [], |r| r.get(0))
+            .expect("spans")
+    };
+    assert_eq!(spans(&reader), 0);
+
+    let journal = store::sibling(&dir.join(store::FILE), "-journal");
+    std::fs::write(&journal, b"").expect("stray journal");
+    let before = std::fs::read(dir.join(store::FILE)).expect("read");
+    store::upgrade_local(&dir, store::Need::default()).expect_err("refused beside a -journal");
+    assert_eq!(std::fs::read(dir.join(store::FILE)).expect("read"), before);
+    std::fs::remove_file(&journal).expect("rm journal");
+
+    assert_eq!(
+        store::upgrade_local(&dir, store::Need::default()).expect("upgrade"),
+        store::Upgraded::Done
+    );
+    assert_eq!(spans(&reader), 0, "the open reader keeps the old file");
+    let fresh = store::open_sealed(&dir.join(store::FILE)).expect("reopen");
+    assert!(spans(&fresh) > 0);
+}

@@ -1399,13 +1399,9 @@ fn write_rows(conn: &Connection, session_id: &str, rows: &mut Vec<Row>) -> rusql
 
 /// Derive the explorer tables again from `records` and the session row
 /// alone, replacing what is there (I4). Stops where the recording's ceiling
-/// stopped derivation (`truncated_seq`). A session command's repair (D14);
-/// a build never calls it (I1).
-///
-/// Nothing re-derives on open yet, so today only the tests call it, as the
-/// oracle the live derivation is compared against. Re-derivation on open
-/// drops the `cfg(test)`.
-#[cfg(test)]
+/// stopped derivation (`truncated_seq`). A session command's repair (D14),
+/// always on a copy ([`upgrade_local`], [`derived_copy`]); a build never
+/// calls it (I1).
 pub(crate) fn rederive(conn: &Connection) -> rusqlite::Result<()> {
     let (id, started, ended, stop): (String, i64, Option<i64>, Option<i64>) = conn.query_row(
         "SELECT id, started_ms, ended_ms, truncated_seq FROM session",
@@ -1444,6 +1440,275 @@ pub(crate) fn rederive(conn: &Connection) -> rusqlite::Result<()> {
     write_rows(conn, &id, &mut rows)?;
     conn.execute("UPDATE session SET derivation = ?1", params![DERIVATION])?;
     Ok(())
+}
+
+/// The indexes a reader builds on first need, never the recorder or a seal
+/// (the seal stays bounded). Named, so their presence is one lookup.
+const INDEXES: &[(&str, &str)] = &[
+    (
+        "records_kind",
+        "CREATE INDEX IF NOT EXISTS records_kind ON records(kind, seq)",
+    ),
+    (
+        "spans_name",
+        "CREATE INDEX IF NOT EXISTS spans_name ON spans(name, addr)",
+    ),
+    (
+        "span_events_span",
+        "CREATE INDEX IF NOT EXISTS span_events_span ON span_events(session_id, span_id)",
+    ),
+    (
+        "metrics_name",
+        "CREATE INDEX IF NOT EXISTS metrics_name ON metrics(name, time_us)",
+    ),
+];
+
+/// The name a re-derivation writes its copy under, beside `session.db`, so
+/// the rename over it is atomic.
+pub(crate) const REDERIVING: &str = ".session.db.rederiving";
+
+/// What a reader of explorer rows wants of a recording before it reads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Need {
+    /// The indexes of [`INDEXES`] (a query); a viewer reading a handful of
+    /// rows (`show`) works without them.
+    pub indexes: bool,
+}
+
+/// What a recording lacks of a [`Need`], read from an open connection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Pending {
+    /// Its explorer rows were derived by an older derivation (D14). A newer
+    /// one is never re-derived, nor downgraded.
+    pub rederive: bool,
+    pub indexes: bool,
+}
+
+impl Pending {
+    pub fn any(self) -> bool {
+        self.rederive || self.indexes
+    }
+}
+
+/// What `conn`'s recording lacks of `need`.
+pub fn pending(conn: &Connection, need: Need) -> rusqlite::Result<Pending> {
+    let derivation: u32 = conn.query_row("SELECT derivation FROM session", [], |r| r.get(0))?;
+    let indexes = need.indexes && {
+        let have: i64 = conn.query_row(
+            "SELECT count(*) FROM sqlite_schema WHERE type = 'index' AND name IN
+               ('records_kind', 'spans_name', 'span_events_span', 'metrics_name')",
+            [],
+            |r| r.get(0),
+        )?;
+        usize::try_from(have).unwrap_or(0) < INDEXES.len()
+    };
+    Ok(Pending {
+        rederive: derivation < DERIVATION,
+        indexes,
+    })
+}
+
+/// What [`pending`] says of the local recording in `dir`, without taking
+/// anything: `None` when it is not a sealed recording in a known format (live,
+/// lost and not yet sealed, missing): those are never written.
+pub fn pending_local(dir: &Path, need: Need) -> anyhow::Result<Option<Pending>> {
+    let path = dir.join(FILE);
+    let header = match read_header(&path) {
+        Ok(Some(h)) => h,
+        Ok(None) => return Ok(None),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    if !header.is_known() || header.wal {
+        return Ok(None);
+    }
+    let conn = open_sealed(&path).with_context(|| format!("opening {}", path.display()))?;
+    Ok(Some(
+        pending(&conn, need).with_context(|| format!("reading {}", path.display()))?,
+    ))
+}
+
+/// How [`upgrade_local`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Upgraded {
+    /// Re-derived or indexed, and renamed over `session.db`.
+    Done,
+    /// Nothing to do (found current, perhaps after another command's
+    /// repair).
+    Current,
+    /// Not a local sealed recording in a known format, or its lock stayed
+    /// held: never written. Read as it is (or from [`derived_copy`]).
+    Skipped,
+}
+
+/// Bring the local, sealed recording in `dir` up to `need` (D14): under its
+/// `lock` taken exclusively, write a copy beside it whose explorer rows are
+/// re-derived from `records` (and whose indexes are built, when asked),
+/// sealed under `synchronous=FULL` (`fullfsync` on macOS) and fsynced, then
+/// rename it over `session.db` and fsync the directory. The records are the
+/// only durable copy of the run, so the copy is written durably; a reader
+/// that already opened the file keeps reading the old inode.
+///
+/// Refuses beside a `-journal` or `-wal`, and never writes a live, lost
+/// (unsealed) or unknown-format recording. An interruption, a full disk or a
+/// read-only directory leaves the original as it was. Two commands at once
+/// serialise on the lock; the second finds the recording current. A newer
+/// derivation is left alone.
+pub fn upgrade_local(dir: &Path, need: Need) -> anyhow::Result<Upgraded> {
+    let path = dir.join(FILE);
+    let lock = dir.join(super::format::files::LOCK);
+    let deadline = Instant::now() + SEAL_TIMEOUT;
+    let _guard = loop {
+        match lockfile::try_lock_free(&lock)
+            .with_context(|| format!("locking {}", lock.display()))?
+        {
+            Some(guard) => break guard,
+            // Held: its owner (live: never written), or another command or
+            // a cleanup writing it, which ends within its own bound.
+            None => {
+                let live = read_header(&path)
+                    .with_context(|| format!("reading {}", path.display()))?
+                    .is_none_or(|h| h.wal);
+                if live || Instant::now() >= deadline {
+                    return Ok(Upgraded::Skipped);
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    };
+    // Again under the lock: another command may have done it meanwhile.
+    let Some(pending) = pending_local(dir, need)? else {
+        return Ok(Upgraded::Skipped);
+    };
+    if !pending.any() {
+        return Ok(Upgraded::Current);
+    }
+    for suffix in ["-journal", "-wal"] {
+        if sibling(&path, suffix).exists() {
+            anyhow::bail!("{} has a {suffix} beside it", path.display());
+        }
+    }
+    let copy = Scratch::new(dir.join(REDERIVING));
+    copy.clear()?;
+    std::fs::copy(&path, copy.path()).with_context(|| format!("copying {}", path.display()))?;
+    derive_into(copy.path(), pending, true)?;
+    std::fs::File::open(copy.path())
+        .and_then(|f| f.sync_all())
+        .with_context(|| format!("syncing {}", copy.path().display()))?;
+    std::fs::rename(copy.path(), &path)
+        .with_context(|| format!("renaming over {}", path.display()))?;
+    copy.keep();
+    std::fs::File::open(dir)
+        .and_then(|d| d.sync_all())
+        .with_context(|| format!("syncing {}", dir.display()))?;
+    Ok(Upgraded::Done)
+}
+
+/// Re-derive (and index) the recording copy at `path` in place, then seal
+/// it. `durable`: `synchronous=FULL`, as the copy that replaces a recording
+/// needs; a temp copy for one command does not.
+fn derive_into(path: &Path, pending: Pending, durable: bool) -> anyhow::Result<()> {
+    let conn = open_existing_rw(path).with_context(|| format!("opening {}", path.display()))?;
+    let work = || -> rusqlite::Result<()> {
+        if durable {
+            conn.pragma_update(None, "synchronous", "FULL")?;
+            #[cfg(target_os = "macos")]
+            conn.pragma_update(None, "fullfsync", "ON")?;
+        }
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        if pending.rederive {
+            rederive(&conn)?;
+        }
+        if pending.indexes {
+            for (_, sql) in INDEXES {
+                conn.execute_batch(sql)?;
+            }
+        }
+        conn.execute_batch("COMMIT")
+    };
+    work().with_context(|| format!("deriving {}", path.display()))?;
+    match seal(conn, SEAL_TIMEOUT).with_context(|| format!("sealing {}", path.display()))? {
+        Sealed::Done => Ok(()),
+        Sealed::CutShort => anyhow::bail!("sealing {}: cut short", path.display()),
+    }
+}
+
+/// A recording's explorer rows derived into a temp copy for one command:
+/// what a reader falls back to when the recording itself cannot be
+/// re-derived (a full disk, a read-only directory, a stray journal), and
+/// what a foreign or live one always gets. The copy is removed when the
+/// result drops.
+pub fn derived_copy(root: &Path, source: &Path, need: Need) -> anyhow::Result<Opened> {
+    let tmp = tmp_dir(root);
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .create(&tmp)
+        .with_context(|| format!("creating {}", tmp.display()))?;
+    let base = tmp.join(format!(
+        "derived-{}-{}.db",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let copy = TempCopy {
+        files: vec![base.clone(), sibling(&base, "-journal")],
+    };
+    std::fs::copy(source, &base).with_context(|| format!("copying {}", source.display()))?;
+    let pending = {
+        let conn = open_sealed(&base).with_context(|| format!("opening {}", base.display()))?;
+        pending(&conn, need).with_context(|| format!("reading {}", base.display()))?
+    };
+    if pending.any() {
+        derive_into(&base, pending, false)?;
+    }
+    Ok(Opened {
+        conn: open_sealed(&base).with_context(|| format!("opening {}", base.display()))?,
+        live: false,
+        copy: Some(copy),
+    })
+}
+
+/// A file written beside a recording and renamed over it, removed (with its
+/// journal) unless it was [`kept`](Self::keep).
+#[derive(Debug)]
+struct Scratch {
+    path: PathBuf,
+    kept: bool,
+}
+
+impl Scratch {
+    fn new(path: PathBuf) -> Self {
+        Self { path, kept: false }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Remove what an interrupted run left.
+    fn clear(&self) -> anyhow::Result<()> {
+        for p in [self.path.clone(), sibling(&self.path, "-journal")] {
+            match std::fs::remove_file(&p) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e).with_context(|| format!("removing {}", p.display())),
+            }
+        }
+        Ok(())
+    }
+
+    fn keep(mut self) {
+        self.kept = true;
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        if !self.kept
+            && let Err(e) = self.clear()
+        {
+            tracing::debug!(error = %format!("{e:#}"), "cannot remove a re-derivation's copy");
+        }
+    }
 }
 
 /// How a seal ended.
