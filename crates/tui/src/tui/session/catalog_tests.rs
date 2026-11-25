@@ -779,6 +779,11 @@ fn an_owner_over_the_cap_writes_no_explorer_rows() {
     );
     assert_eq!(spans_of(over_id), 0, "over the cap: no spans");
     assert_eq!(
+        count(&conn, "SELECT count(*) FROM sessions WHERE capped = 1"),
+        1,
+        "only the session over the cap is marked"
+    );
+    assert_eq!(
         count(
             &conn,
             &format!("SELECT count(*) FROM metrics WHERE session_id = '{over_id}'")
@@ -1191,6 +1196,15 @@ fn catalog_targets_fit_the_cap() {
     );
     let conn = read(root);
     assert_eq!(count(&conn, "SELECT count(*) FROM target_rows"), 1_000_003);
+    assert_eq!(
+        usize::try_from(count(
+            &conn,
+            "SELECT count(*) FROM sessions WHERE capped = 1"
+        ))
+        .expect("count"),
+        report.capped_rows,
+        "each session whose explorer rows went is marked capped"
+    );
     drop(conn);
     let report = catalog::clean_with(root, SystemTime::now(), 0).expect("clean");
     assert!(report.capped_sessions >= 1, "{report:?}");

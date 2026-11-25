@@ -465,7 +465,8 @@ struct JsonCoverage<'a> {
     skipped: usize,
     truncated: usize,
     reaches_ms: Option<u64>,
-    partial: &'a BTreeMap<&'static str, &'static str>,
+    capped: usize,
+    partial: &'a BTreeMap<&'static str, String>,
 }
 
 /// A value under `--format json`: INTEGER a string, REAL a number (NaN and
@@ -501,6 +502,7 @@ fn write_json(answer: &Answer, out: &mut dyn Write) -> anyhow::Result<()> {
             skipped: answer.coverage.skipped,
             truncated: answer.coverage.truncated,
             reaches_ms: answer.coverage.reaches_ms,
+            capped: answer.coverage.capped,
             partial: &answer.coverage.partial,
         },
     };

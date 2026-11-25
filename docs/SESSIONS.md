@@ -219,7 +219,7 @@ line:
 {"version":1,"columns":["addr","duration_us"],"types":["TEXT","INTEGER"],
  "rows":[["//p:t","81234"]],
  "coverage":{"catalog":["targets"],"recordings":0,"skipped":0,"truncated":0,
-             "reaches_ms":1763400000000,"partial":{}}}
+             "reaches_ms":1763400000000,"capped":0,"partial":{}}}
 ```
 
 - `types` is each column's declared type, `null` for an expression.
@@ -234,12 +234,19 @@ line:
   catalog was read, is the start (unix ms) of the oldest session it holds:
   nothing older is in the answer, whatever `--since` asks for (the catalog
   keeps 90 days, and less once rebuilt or answering from the recordings
-  kept); `null` for `--full` and `--from`. `partial` names each table read
+  kept); `null` for `--full` and `--from`. `capped`, when the query read
+  `spans`, `span_events` or `metrics` from the catalog, counts the sessions
+  in scope whose rows of those three the catalog left out for its 1 GiB cap
+  (written while it was over the cap, or trimmed by its cleanup); their
+  `sessions` and `targets` rows are whole. `partial` names each table read
   from the catalog that it holds only in part, with what is missing:
   `"spans"` and `"span_events"` are `"ran targets only"` (a cache hit's
-  spans are not kept), `"logs"` is `"not kept"`; `{}` when nothing read is
-  partial, and always for `--full` and `--from`. A non-empty `partial` is
-  also one line on stderr. `coverage` only gains fields.
+  spans are not kept), `"logs"` is `"not kept"`, and with `capped` above 0,
+  `"spans"`, `"span_events"` and `"metrics"` also say `"none for N
+  session(s) over the catalog's cap"`; `{}` when nothing read is partial,
+  and always for `--full` and `--from`. A non-empty `partial` is also one
+  line on stderr. The `partial` texts are for people and can change; match
+  on its keys and on `capped`. `coverage` only gains fields.
 
 **Errors** exit 125, as `heph session`'s own errors do. A refused, invalid
 or stopped statement says so on stderr with SQLite's message (an unknown
@@ -763,12 +770,16 @@ never `records`.
 
 The run that owns the session writes twice:
 
-- At start, its `sessions` row with `complete=0`, from a thread of its own.
-  A private session skips this write.
+- At start, its `sessions` row with `complete=0`, from a thread of its own,
+  then it folds the catalog's WAL in. A private session skips the row and
+  only folds the public catalog's WAL in.
 - At seal, after `End`, every catalog row of its session in one transaction,
   with `complete=1` and the recording's `derivation`. A private session
   writes these rows with `recorded=0` into the public catalog, then removes
-  its directory. `--raw` writes nothing.
+  its directory. Over the catalog's 1 GiB cap, the seal writes only the
+  `sessions` and `targets` rows and marks the session capped, so a query
+  that reads `spans`, `span_events` or `metrics` says so in
+  `coverage.capped` and `coverage.partial`. `--raw` writes nothing.
 
 Each catalog connection holds `catalog.lock` shared for its whole life. An
 owner that cannot take it at once drops its write. A write that fails, or
@@ -1619,7 +1630,7 @@ catalog its seals write to is still kept.
 | What | Kept | Then |
 | --- | --- | --- |
 | A catalog session and its rows | while it started under **90 days** ago | its rows are deleted; an `addrs` row no target row uses any more goes too |
-| The catalog as a whole | up to **1 GiB** in use | the `spans`, `span_events` and `metrics` rows of the oldest sessions go first, keeping their `sessions` and `targets` rows; then whole sessions, oldest first |
+| The catalog as a whole | up to **1 GiB** in use | the `spans`, `span_events` and `metrics` rows of the oldest sessions go first, keeping their `sessions` and `targets` rows (each such session counts in a query's `coverage.capped`); then whole sessions, oldest first |
 | A corrupt catalog moved aside (`catalog.db.corrupt-<ms>`) | **7 days**, by the time in its name | deleted |
 
 The 90 days and the 1 GiB are fixed; no `.hephconfig` key sets them. The

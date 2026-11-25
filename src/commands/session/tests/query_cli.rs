@@ -194,7 +194,7 @@ async fn query_formats() {
         v["coverage"],
         serde_json::json!({
             "catalog": [], "recordings": 1, "skipped": 0, "truncated": 0, "reaches_ms": null,
-            "partial": {}
+            "capped": 0, "partial": {}
         })
     );
 

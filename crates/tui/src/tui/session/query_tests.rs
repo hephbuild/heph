@@ -620,3 +620,54 @@ fn query_walks_attributes_with_json_each() {
         "prohibited",
     );
 }
+
+/// A session an owner wrote over the catalog's cap has no spans, span
+/// events or metrics there: a query over the catalog that reads them says
+/// so in `coverage.partial`, rather than answering a silent empty.
+#[test]
+fn a_query_over_a_capped_session_says_it_is_partial() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().join("sessions");
+    let qtmp = tmp.path().join("qtmp");
+    let kept = recording(&root, 1, 2_000);
+    catalog::record_seal(&root, &kept, true);
+    let over = recording(&root, 2, 1_000);
+    let limits = catalog::OwnerLimits {
+        cap: 0,
+        ..catalog::OwnerLimits::DEFAULT
+    };
+    catalog::record_seal_within(&root, &over, true, limits);
+    let partial = |sql: &str, scope: Scope| {
+        let coverage = run(sql, vec![catalog_of(&root, scope)], &qtmp)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+            .coverage;
+        assert_eq!(
+            coverage.capped,
+            usize::from(coverage.partial.values().any(|why| why.contains("cap"))),
+            "{sql}: {coverage:?}"
+        );
+        coverage.partial
+    };
+    let capped = "none for 1 session(s) over the catalog's cap";
+
+    let metrics = partial("SELECT count(*) FROM metrics", Scope::default());
+    assert_eq!(
+        metrics.get("metrics").map(String::as_str),
+        Some(capped),
+        "{metrics:?}"
+    );
+    let spans = partial("SELECT count(*) FROM spans", Scope::default());
+    assert_eq!(
+        spans.get("spans").map(String::as_str),
+        Some(&*format!("ran targets only; {capped}")),
+        "{spans:?}"
+    );
+    // `targets` lost nothing to the cap.
+    assert!(partial("SELECT count(*) FROM targets", Scope::default()).is_empty());
+    // Out of scope, the capped session is not counted.
+    let before_over = Scope {
+        until_ms: Some(now_ms() - 1_500),
+        ..Scope::default()
+    };
+    assert!(partial("SELECT count(*) FROM metrics", before_over).is_empty());
+}

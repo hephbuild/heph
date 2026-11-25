@@ -253,6 +253,31 @@ const CATALOG_PARTIAL: &[(&str, &str)] = &[
     ("span_events", "ran targets only"),
     ("logs", "not kept"),
 ];
+/// The tables whose rows the catalog leaves out for a session over its cap.
+const CATALOG_CAPPED: &[&str] = &["spans", "span_events", "metrics"];
+
+/// `coverage.partial` for a catalog query reading `reads`, `capped`
+/// sessions in scope over the cap.
+fn catalog_partial(reads: &[&'static str], capped: usize) -> BTreeMap<&'static str, String> {
+    let mut partial: BTreeMap<&'static str, String> = CATALOG_PARTIAL
+        .iter()
+        .filter(|(t, _)| reads.contains(t))
+        .map(|&(t, why)| (t, why.to_owned()))
+        .collect();
+    if capped > 0 {
+        let none = format!("none for {capped} session(s) over the catalog's cap");
+        for t in CATALOG_CAPPED.iter().filter(|t| reads.contains(t)) {
+            partial
+                .entry(t)
+                .and_modify(|why| {
+                    why.push_str("; ");
+                    why.push_str(&none);
+                })
+                .or_insert_with(|| none.clone());
+        }
+    }
+    partial
+}
 
 /// What a recording's explorer names derive from. Read only when each is a
 /// table, so a file whose `spans` is a view is not read at all.
@@ -465,9 +490,12 @@ pub struct Coverage {
     /// When the catalog was read: the start (unix ms) of the oldest session
     /// it holds. Nothing older is in the answer, whatever the window.
     pub reaches_ms: Option<u64>,
+    /// Sessions in scope whose spans, span events and metrics the catalog
+    /// left out for its cap, when the query read any of those tables.
+    pub capped: usize,
     /// The tables read from the catalog that hold only part of what a
     /// recording does, each with what is missing.
-    pub partial: BTreeMap<&'static str, &'static str>,
+    pub partial: BTreeMap<&'static str, String>,
 }
 
 /// A query's answer.
@@ -1025,11 +1053,16 @@ fn in_place(
                 .copied()
                 .filter(|t| CATALOG_HOLDS.contains(t))
                 .collect();
-            coverage.partial = CATALOG_PARTIAL
-                .iter()
-                .copied()
-                .filter(|(t, _)| checked.reads.contains(t))
-                .collect();
+            if CATALOG_CAPPED.iter().any(|t| checked.reads.contains(t)) {
+                coverage.capped = count(
+                    conn,
+                    &format!(
+                        "SELECT count(*) FROM main.sessions WHERE capped = 1 AND {}",
+                        scope.sql("")
+                    ),
+                )?;
+            }
+            coverage.partial = catalog_partial(&checked.reads, coverage.capped);
             coverage.reaches_ms =
                 catalog::reaches_ms(conn).context("reading how far the catalog reaches")?;
             coverage.truncated = count(
@@ -1082,7 +1115,7 @@ fn in_place(
 fn count(conn: &Connection, sql: &str) -> Result<usize, QueryError> {
     let n: i64 = conn
         .query_row(sql, [], |r| r.get(0))
-        .context("counting a source's truncated sessions")?;
+        .context("counting a source's incomplete sessions")?;
     Ok(usize::try_from(n).unwrap_or(0))
 }
 

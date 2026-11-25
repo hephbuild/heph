@@ -75,7 +75,8 @@ CREATE TABLE IF NOT EXISTS sessions (
   workspace_root TEXT, home TEXT, git_head TEXT, label TEXT, interactive INTEGER,
   started_ms INTEGER NOT NULL, ended_ms INTEGER, exit_code INTEGER, panicked INTEGER,
   truncated INTEGER, truncated_seq INTEGER, sealed INTEGER, recorded INTEGER NOT NULL, snapshot INTEGER,
-  complete INTEGER NOT NULL DEFAULT 0, derivation INTEGER NOT NULL
+  complete INTEGER NOT NULL DEFAULT 0, derivation INTEGER NOT NULL,
+  capped INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS sessions_started ON sessions (started_ms);
 CREATE TABLE IF NOT EXISTS addrs (id INTEGER PRIMARY KEY, addr TEXT NOT NULL UNIQUE);
@@ -246,6 +247,12 @@ fn copy_attached(conn: &Connection, copy: Rows) -> rusqlite::Result<()> {
                 "SELECT sid, session_id FROM main.sessions WHERE session_id = (SELECT id FROM rec.session)",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            // A kept recording whose explorer rows the cap left out: a
+            // query over the catalog says so (`coverage.partial`).
+            conn.execute(
+                "UPDATE main.sessions SET capped = ?2 WHERE sid = ?1",
+                params![sid, i64::from(recorded && !explorer)],
             )?;
             conn.execute("DELETE FROM main.target_rows WHERE sid = ?1", [sid])?;
             conn.execute_batch(&format!(
@@ -1404,6 +1411,13 @@ fn enforce_cap(
                     rollback(conn);
                     return Err(e);
                 }
+            }
+            if let Err(e) = conn.execute(
+                "UPDATE sessions SET capped = 1 WHERE session_id = ?1",
+                [&id],
+            ) {
+                rollback(conn);
+                return Err(e);
             }
             conn.execute_batch("COMMIT")?;
             between();
