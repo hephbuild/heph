@@ -683,6 +683,7 @@ version = "0.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a92f2f5df67a9d5ccfc65237bfc954c56328aee40a04a9b92381ecba370be246"
 dependencies = [
+ "base64 0.22.1",
  "bytes",
  "foldhash 0.1.5",
  "hashbrown 0.15.5",
@@ -2688,6 +2689,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
  "foldhash 0.1.5",
+ "serde",
 ]
 
 [[package]]
@@ -4866,6 +4868,14 @@ dependencies = [
  "objc2-ui-kit",
  "serde",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "otlp-gen"
+version = "0.1.0"
+dependencies = [
+ "buffa",
+ "serde",
 ]
 
 [[package]]
@@ -7884,6 +7894,8 @@ dependencies = [
  "ansi-to-tui",
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
+ "buffa",
  "core",
  "crossterm",
  "futures",
@@ -7891,6 +7903,7 @@ dependencies = [
  "hex",
  "libc",
  "memchr",
+ "otlp-gen",
  "output-derive",
  "proc",
  "ratatui",

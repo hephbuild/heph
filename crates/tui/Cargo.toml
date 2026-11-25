@@ -58,6 +58,12 @@ hex = "0.4"
 # Deflate only, through the flate2 already in the tree.
 zstd = "0.14"
 zip = { version = "9.8", default-features = false, features = ["deflate-flate2"] }
+# `heph session export --format otlp` (`session::otlp`): the OTLP data model,
+# generated from the vendored .proto files (`gen`), serialised as OTLP/JSON.
+# `base64`: proto3 JSON writes ids as base64, which OTLP/JSON writes as hex.
+otlp-gen = { path = "../../gen/otlp" }
+buffa = { workspace = true, features = ["json"] }
+base64 = "0.22"
 
 # With stdin not a terminal, crossterm reads /dev/tty, and macOS kqueue refuses
 # that with EINVAL (measured), so `heph … < file` and `… | heph` timed out on the

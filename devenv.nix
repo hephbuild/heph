@@ -342,14 +342,19 @@ in
 
   # https://devenv.sh/scripts/
   scripts.gen-proto.exec = ''
+    set -e
     cd "$DEVENV_ROOT"
     buf generate
+    # The vendored OTLP data model, into its own crate (`gen/otlp`): it is
+    # generated with JSON, which the plugin ABI's types keep off.
+    buf generate --template buf.gen.otlp.yaml
   '';
   scripts.gen.exec = ''
     set -e
     rm -rf "$DEVENV_ROOT/gen"
     gen-proto
     cp "$DEVENV_ROOT/proto/Cargo.toml.tpl" "$DEVENV_ROOT/gen/proto/Cargo.toml"
+    cp "$DEVENV_ROOT/third_party/opentelemetry-proto/Cargo.toml.tpl" "$DEVENV_ROOT/gen/otlp/Cargo.toml"
   '';
   scripts.gen-go-large.exec = ''
     rm -rf $DEVENV_ROOT/example/go/large

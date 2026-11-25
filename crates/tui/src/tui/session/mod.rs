@@ -41,6 +41,7 @@ pub mod hephsession;
 pub mod holder;
 pub mod id;
 pub mod lockfile;
+pub mod otlp;
 pub mod query;
 pub mod recorder;
 pub mod recording;
@@ -52,6 +53,8 @@ pub mod testing;
 
 #[cfg(test)]
 mod catalog_tests;
+#[cfg(test)]
+mod otlp_tests;
 #[cfg(test)]
 mod query_tests;
 #[cfg(test)]

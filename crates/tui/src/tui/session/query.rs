@@ -336,6 +336,49 @@ impl RecordingFile {
             _keep: Box::new(recording),
         })
     }
+
+    /// A local recording still being written: what is read of it is the
+    /// session so far.
+    pub fn is_live(&self) -> bool {
+        !self.immutable
+    }
+}
+
+/// One recording's six explorer names, for heph's own statements (the OTLP
+/// export): the same TEMP views over heph's definitions a query reads in
+/// place, on a hardened read-only connection, with no authorizer and no row
+/// cap. Nothing a user wrote runs here.
+pub struct Explorer {
+    conn: Connection,
+    _file: RecordingFile,
+}
+
+impl fmt::Debug for Explorer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Explorer")
+            .field("file", &self._file)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Explorer {
+    pub fn open(file: RecordingFile) -> anyhow::Result<Self> {
+        let conn = open_read_only(&file.path, file.immutable)?;
+        harden(&conn)?;
+        require_tables(&conn, "main", RECORDING_BASES).map_err(|e| match e {
+            QueryError::Other(e) => e,
+            other => anyhow::anyhow!("{other}"),
+        })?;
+        define_views(&conn, &|name| format!("heph_x_{name}"), |name| {
+            recording_select(name, "main")
+        })?;
+        Ok(Self { conn, _file: file })
+    }
+
+    /// The connection; an unqualified explorer name reads heph's view.
+    pub fn conn(&self) -> &Connection {
+        &self.conn
+    }
 }
 
 fn conn_path(conn: &Connection) -> anyhow::Result<PathBuf> {
