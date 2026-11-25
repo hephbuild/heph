@@ -1522,7 +1522,11 @@ fn reopen_starts_clean() {
     let doc = lsp.open("pkg/BUILD", &dotted);
     assert!(items(&lsp.completion(&doc)).is_empty());
     let explained = lsp.explain(&doc);
-    assert_eq!(explained["site"]["binding"], Value::Null, "{explained}");
+    assert_eq!(explained["site"]["binding"], "none", "{explained}");
+    assert_eq!(
+        explained["site"]["empty_because"], "no_types_yet",
+        "{explained}"
+    );
     assert_eq!(explained["site"]["type"], Value::Null, "{explained}");
 
     // Once it parses, it is typechecked afresh, the loaded file with it.
@@ -3411,17 +3415,17 @@ fn did_close_frees_the_document_model() {
     };
     assert_eq!(
         counts(&mut lsp),
-        json!({"documents": 2, "parses": 2, "indexes": 2, "typechecks": 0})
+        json!({"documents": 2, "parses": 2, "indexes": 2})
     );
     lsp.close(&a);
     assert_eq!(
         counts(&mut lsp),
-        json!({"documents": 1, "parses": 1, "indexes": 1, "typechecks": 0})
+        json!({"documents": 1, "parses": 1, "indexes": 1})
     );
     lsp.close(&b);
     assert_eq!(
         counts(&mut lsp),
-        json!({"documents": 0, "parses": 0, "indexes": 0, "typechecks": 0})
+        json!({"documents": 0, "parses": 0, "indexes": 0})
     );
 }
 
@@ -3753,12 +3757,6 @@ const LIB_FIELDS: [&str; 3] = ["mode", "name", "srcs"];
 fn type_after(lsp: &mut Lsp, rel: &str, parses: &str, typed: &str) -> Doc {
     let doc = lsp.open(rel, parses);
     lsp.change(&doc, typed)
-}
-
-fn sorted_labels(result: &Value) -> Vec<String> {
-    let mut got = labels(result);
-    got.sort();
-    got
 }
 
 fn detail(result: &Value, label: &str) -> String {
