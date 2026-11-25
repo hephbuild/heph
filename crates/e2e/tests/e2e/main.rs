@@ -67,6 +67,7 @@ mod query;
 mod remote_cache;
 mod resources;
 mod result_outputs;
+mod run_json;
 mod run_log;
 mod run_timeout;
 mod sandbox_pool;

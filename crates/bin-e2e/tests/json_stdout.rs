@@ -200,6 +200,141 @@ fn stdout_is_only_json() {
     let args = ["tool", "codegen", "status", "--jq", ".items[].path"];
     let stdout = json_run(&ws, &dist, &args);
     assert_eq!(raw_lines(&args, &stdout), paths);
+
+    // run: one entry per matched target; the target's own output and the
+    // progress display stay off stdout.
+    let args = ["run", "//p:a", "--json"];
+    let entries = elements(&args, &document(&args, &json_run(&ws, &dist, &args)));
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0]["addr"], "//p:a", "{entries:?}");
+
+    let args = ["run", "//p:a", "--fields", "addr,outcome"];
+    let entries = elements(&args, &document(&args, &json_run(&ws, &dist, &args)));
+    assert!(
+        entries.iter().all(|e| keys(e) == ["addr", "outcome"]),
+        "{entries:?}"
+    );
+
+    let args = ["run", "//p:a", "--jq", ".[].addr"];
+    let stdout = json_run(&ws, &dist, &args);
+    assert_eq!(raw_lines(&args, &stdout), ["//p:a"]);
+}
+
+/// Ctrl-C under `heph run --json`: the entries written so far stay on stdout,
+/// the list gets no `]` (D10), and the exit is the one without `--json`.
+#[test]
+fn run_json_sigint() {
+    let dist = Dist::locate();
+    let ws = Workspace::new().expect("workspace");
+    // `slow` waits for `fast`, so `fast`'s entry is written before the signal.
+    ws.write(
+        "p/BUILD",
+        r#"
+target(name = "fast", driver = "bash", run = "echo f > $OUT", out = "f.txt")
+target(name = "slow", driver = "bash", run = "sleep 60; echo s > $OUT", out = "s.txt", deps = [":fast"])
+"#,
+    )
+    .expect("write BUILD");
+    let err_path = ws.root().join(".stderr");
+    let err = std::fs::File::create(&err_path).expect("create stderr file");
+    let mut child = ws
+        // Not `//p/...`: that also matches the package's BUILD-file checks,
+        // and a failed one makes the exit 1 rather than 130.
+        .cmd(&dist, &["run", "-e", "//p:fast || //p:slow", "--json"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(err)
+        .spawn()
+        .expect("spawn heph");
+    let pid = i32::try_from(child.id()).expect("pid");
+    let mut pipe = child.stdout.take().expect("piped stdout");
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let reader = std::thread::spawn({
+        let seen = std::sync::Arc::clone(&seen);
+        move || {
+            let mut chunk = [0_u8; 4096];
+            loop {
+                match pipe.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => seen
+                        .lock()
+                        .expect("stdout buffer")
+                        .extend_from_slice(chunk.get(..n).unwrap_or_default()),
+                }
+            }
+        }
+    });
+    // Each entry is flushed as its target ends: wait for `fast`'s.
+    let started = Instant::now();
+    loop {
+        let has_fast =
+            String::from_utf8_lossy(&seen.lock().expect("stdout buffer")).contains("\"//p:fast\"");
+        if has_fast {
+            break;
+        }
+        let late = started.elapsed() > DEADLINE;
+        if late {
+            common::signal(pid, libc::SIGKILL);
+        }
+        assert!(
+            !late,
+            "no entry for //p:fast within {DEADLINE:?}\n{}",
+            std::fs::read_to_string(&err_path).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    common::signal(pid, libc::SIGINT);
+    let (code, _) = reap(pid);
+    reader.join().expect("stdout reader");
+    drop(child);
+    let stderr = std::fs::read_to_string(&err_path).unwrap_or_default();
+    let stdout = String::from_utf8(seen.lock().expect("stdout buffer").clone()).expect("utf-8");
+    // The exit a cancelled build run has without `--json`: `finish_exit`'s
+    // "cancelled", 1 (only an entrypoint's run maps Ctrl-C to 130).
+    assert_eq!(
+        code, 1,
+        "exit\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+    assert!(stderr.contains("cancelled"), "{stderr}");
+    assert!(
+        stdout.starts_with('[') && !stdout.trim_end().ends_with(']'),
+        "a cancelled run's list is left open: {stdout:?}"
+    );
+    let entries: Vec<Value> = serde_json::from_str(&format!("{stdout}\n]"))
+        .with_context(|| format!("the entries so far are JSON: {stdout:?}"))
+        .expect("entries");
+    let fast = entries
+        .iter()
+        .find(|e| e["addr"] == "//p:fast")
+        .with_context(|| format!("{entries:?}"))
+        .expect("fast's entry");
+    assert_eq!(fast["outcome"], "ran", "{fast}");
+    // Nothing about `slow`: whether its cancelled entry is written before
+    // the exit is a race, and the open list already says the run stopped.
+}
+
+/// An entrypoint has no `--json` form: refused once the matcher resolves,
+/// before it runs, naming the target and what to do instead; stdout stays
+/// empty. A usage error: exit 2, as the flags' parse-time refusals.
+#[test]
+fn run_json_refuses_an_entrypoint() {
+    let dist = Dist::locate();
+    let ws = Workspace::new().expect("workspace");
+    ws.write(
+        "p/BUILD",
+        "target(name = \"ep\", driver = \"bash\", entrypoint = True, run = \"echo ran\")\n",
+    )
+    .expect("write BUILD");
+    let out = ws
+        .run(&dist, &["run", "//p:ep", "--json"])
+        .expect("run //p:ep");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{}", common::describe(&out));
+    assert!(out.stdout.is_empty(), "{}", common::describe(&out));
+    assert!(
+        stderr.contains("//p:ep is an entrypoint") && stderr.contains("without `--json`"),
+        "{stderr}"
+    );
 }
 
 /// How a measured run ended: its exit code, the CPU time it used, and stdout.
