@@ -2984,6 +2984,11 @@ pub const MAX_HOST_PATHS: usize = 64;
 /// The paths a driver declares must cover what its outputs name: for a nix
 /// store path, one path per closure is enough, since nix never collects a path
 /// a live one references.
+///
+/// Only entries written with a list are checked: v1/v2 entries, and revisions
+/// mirrored from the remote, are served unchecked. A driver that starts
+/// declaring host paths must therefore change its def hash (bump its format
+/// version), or the entries it cached before keep being served unchecked.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct HostPath(String);
 
@@ -3002,6 +3007,11 @@ impl HostPath {
             Some(t) if !t.is_empty() => t,
             _ => path,
         };
+        // `//` trims to `/`, but only `/` itself is the root.
+        anyhow::ensure!(
+            trimmed != "/" || path == "/",
+            "host path {path:?} is not normalized"
+        );
         if trimmed != "/" {
             for component in trimmed.split('/').skip(1) {
                 anyhow::ensure!(
@@ -3077,6 +3087,7 @@ mod host_path_tests {
             "/nix/store/x/../y",
             "/nix/store/./x",
             "/nix//store/x",
+            "//",
             "/nix/store/x\0y",
         ] {
             assert!(HostPath::new(bad).is_err(), "{bad:?} accepted");
