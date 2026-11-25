@@ -1746,6 +1746,11 @@ async fn run_once(
             Ok(artifacts) => pb::RunOutFrame {
                 msg: Some(pb::run_out_frame::Msg::from(pb::ManagedRunResponse {
                     artifacts,
+                    host_paths: resp
+                        .host_paths
+                        .into_iter()
+                        .map(|p| p.into_string())
+                        .collect(),
                     ..Default::default()
                 })),
                 ..Default::default()
@@ -2749,7 +2754,7 @@ mod tests {
                 _r: ManagedRunRequest<'a, 'io>,
                 _c: &(dyn Cancellable + Send + Sync),
             ) -> Result<ManagedRunResponse> {
-                Ok(ManagedRunResponse { artifacts: vec![] })
+                Ok(ManagedRunResponse::default())
             }
         }
 
@@ -4117,9 +4122,7 @@ mod tests {
                     biased;
                     () = ct.cancelled() => {}
                     () = self.release_b.notified() => {
-                        return Ok(hdriver_support::driver_managed::ManagedRunResponse {
-                            artifacts: vec![],
-                        });
+                        return Ok(hdriver_support::driver_managed::ManagedRunResponse::default());
                     }
                 }
             } else {
@@ -4408,7 +4411,7 @@ mod tests {
                     w.flush().await?;
                 }
             }
-            Ok(hdriver_support::driver_managed::ManagedRunResponse { artifacts: vec![] })
+            Ok(hdriver_support::driver_managed::ManagedRunResponse::default())
         }
     }
 

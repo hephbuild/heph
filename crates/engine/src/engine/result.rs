@@ -12614,7 +12614,7 @@ mod tests {
                         Ok(())
                     }) as crate::engine::driver::SandboxCleanupJob
                 }),
-                sandbox_guards: vec![],
+                ..Default::default()
             })
         }
         async fn run_shell<'a, 'io>(
@@ -15668,8 +15668,7 @@ mod tests {
                     }),
                     hashout: "feedface".to_string(),
                 }],
-                sandbox_cleanup: None,
-                sandbox_guards: vec![],
+                ..Default::default()
             })
         }
         async fn run_shell<'a, 'io>(
@@ -15678,11 +15677,7 @@ mod tests {
             _ctoken: &(dyn Cancellable + Send + Sync),
         ) -> anyhow::Result<RunResponse> {
             self.shell_runs.fetch_add(1, Ordering::SeqCst);
-            Ok(RunResponse {
-                artifacts: vec![],
-                sandbox_cleanup: None,
-                sandbox_guards: vec![],
-            })
+            Ok(RunResponse::default())
         }
     }
 

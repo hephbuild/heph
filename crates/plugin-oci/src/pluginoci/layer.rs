@@ -1071,7 +1071,7 @@ impl ManagedDriver for Driver {
         )
         .with_context(|| format!("write the layer descriptor to {descriptor_path:?}"))?;
 
-        Ok(ManagedRunResponse { artifacts: vec![] })
+        Ok(ManagedRunResponse::default())
     }
 }
 

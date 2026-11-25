@@ -146,6 +146,11 @@ message RunRequest {
 // constructed host-side after the remote run returns.
 message RunResponse {
   repeated OutputArtifactRef artifacts = 1;
+  // Host paths the run's outputs name (since 0.21.3): absolute, normalized,
+  // UTF-8, at most 64. The host stores them with the cache entry and treats a
+  // local hit whose path is gone as a miss. Never part of any hash. An older
+  // host ignores it.
+  repeated string host_paths = 2;
 }
 
 // ---- Managed run (driver-support ManagedDriver layer) ----
@@ -309,6 +314,9 @@ message ExitStatus {
 
 message ManagedRunResponse {
   repeated OutputArtifactRef artifacts = 1;
+  // As RunResponse.host_paths (since 0.21.3). Decoded through the same
+  // validation as an in-process driver's list; an older host ignores it.
+  repeated string host_paths = 2;
 }
 
 // ---- Bidi run streams (DriverMethod RUN over StableManagedDriver::invoke_bidi) ----

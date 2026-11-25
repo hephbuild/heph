@@ -578,12 +578,20 @@ fn drain_run(
         };
         match frame.msg {
             Some(pb::run_out_frame::Msg::Response(r)) => {
+                // The list is validated again on this side of the seam: a
+                // plugin's own check is not the host's.
+                let host_paths = {
+                    use anyhow::Context as _;
+                    hplugin::driver::HostPath::list(&r.host_paths)
+                        .context("decoding the run's host_paths")?
+                };
                 return Ok(ManagedRunResponse {
                     artifacts: r
                         .artifacts
                         .into_iter()
                         .map(convert::output_artifact_from_pb)
                         .collect::<anyhow::Result<_>>()?,
+                    host_paths,
                 });
             }
             // The message is the plugin's whole rendered chain, unchanged; a

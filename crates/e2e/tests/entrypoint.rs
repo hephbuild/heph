@@ -774,11 +774,7 @@ impl hplugin::driver::Driver for RecordingEntrypoint {
             allotment: req.allotment,
         });
         anyhow::ensure!(req.sandbox_dir.is_dir(), "the sandbox exists for the run");
-        Ok(hplugin::driver::RunResponse {
-            artifacts: vec![],
-            sandbox_cleanup: None,
-            sandbox_guards: vec![],
-        })
+        Ok(hplugin::driver::RunResponse::default())
     }
     fn supports_shell(&self) -> bool {
         !self.no_shell
@@ -1892,7 +1888,7 @@ impl heph::engine::driver_managed::ManagedDriver for ForegroundTool {
             .await
             .context("wait for the tool")?;
         if exit == Exit::Code(0) {
-            return Ok(heph::engine::driver_managed::ManagedRunResponse { artifacts: vec![] });
+            return Ok(heph::engine::driver_managed::ManagedRunResponse::default());
         }
         Err(hplugin::error::ProcessFailed::new(format!("{exit:?}"), Some(exit)).into())
     }

@@ -240,6 +240,13 @@ skipped in silence.
 
 ## History of breaks
 
+- **0.21.3** (additive patch) — host paths.
+  `RunResponse.host_paths` and `ManagedRunResponse.host_paths` (2, `repeated
+  string`) list host paths whose nix closures cover what a run's outputs name;
+  the host validates them on decode (absolute, normalized, UTF-8, at most 64),
+  stores them with the cache entry, and reruns a local hit whose path is gone.
+  Both skews degrade to 0.21.2's behaviour: an older plugin declares nothing,
+  a newer plugin's list is dropped by an older host. No plugin must be rebuilt.
 - **0.21.0** (break) — outputs from failed targets. `CODEGEN_MODE_IN_PLACE`
   (3) changes meaning: it now also asks the host to write back what a run that
   exited with a code from 1 to 127 left behind (`InPlace { write_on_failure:

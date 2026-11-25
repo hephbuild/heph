@@ -3278,8 +3278,7 @@ mod tests {
                 std::fs::write(&out, b"pass")?;
                 return Ok(crate::engine::driver::RunResponse {
                     artifacts: vec![sandbox_file("main", "out", Type::Output, &out)],
-                    sandbox_cleanup: None,
-                    sandbox_guards: vec![],
+                    ..Default::default()
                 });
             }
             let log = r.sandbox_dir.join("log.txt");

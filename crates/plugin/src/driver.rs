@@ -2969,9 +2969,158 @@ pub type SandboxCleanupJob = Box<dyn FnOnce() -> std::io::Result<()> + Send + 's
 /// whole contract layer above it) free of the `sandboxfuse`/`fuser`/libfuse edge.
 pub type SandboxGuard = Box<dyn std::any::Any + Send + 'static>;
 
+/// The most host paths one run may declare, after dedup (I8).
+pub const MAX_HOST_PATHS: usize = 64;
+
+/// A host path a run's outputs name, which the engine checks on every local
+/// cache hit: a hit whose path is gone is rebuilt rather than served.
+///
+/// Absolute, normalized (no `.` or `..` component, no empty one; a single
+/// trailing `/` is dropped), UTF-8, and free of NUL bytes: checked when
+/// constructed, so a list that crossed the plugin seam is checked again on
+/// decode. Whether it exists is the engine's to check, when it writes the
+/// entry. Never part of any hash.
+///
+/// The paths a driver declares must cover what its outputs name: for a nix
+/// store path, one path per closure is enough, since nix never collects a path
+/// a live one references.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct HostPath(String);
+
+impl HostPath {
+    /// Validate `path` as a host path.
+    pub fn new(path: &str) -> anyhow::Result<Self> {
+        anyhow::ensure!(!path.is_empty(), "host path is empty");
+        anyhow::ensure!(
+            !path.contains('\0'),
+            "host path {path:?} contains a NUL byte"
+        );
+        anyhow::ensure!(path.starts_with('/'), "host path {path:?} is not absolute");
+        // One trailing slash names the same path; strip it before the
+        // component check, so `/nix/store/x/` is `/nix/store/x`.
+        let trimmed = match path.strip_suffix('/') {
+            Some(t) if !t.is_empty() => t,
+            _ => path,
+        };
+        if trimmed != "/" {
+            for component in trimmed.split('/').skip(1) {
+                anyhow::ensure!(
+                    !component.is_empty() && component != "." && component != "..",
+                    "host path {path:?} is not normalized"
+                );
+            }
+        }
+        Ok(Self(trimmed.to_owned()))
+    }
+
+    /// Validate `path` as a host path; a non-UTF-8 path is refused.
+    pub fn from_path(path: &std::path::Path) -> anyhow::Result<Self> {
+        let s = path
+            .to_str()
+            .with_context(|| format!("host path {} is not UTF-8", path.display()))?;
+        Self::new(s)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn as_path(&self) -> &std::path::Path {
+        std::path::Path::new(&self.0)
+    }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+
+    /// Validate every path, deduplicate, and refuse a list longer than
+    /// [`MAX_HOST_PATHS`] after dedup. The result is sorted, so the list a run
+    /// declares never depends on the order a driver built it in.
+    pub fn list<S: AsRef<str>>(paths: impl IntoIterator<Item = S>) -> anyhow::Result<Vec<Self>> {
+        let mut out = paths
+            .into_iter()
+            .map(|p| Self::new(p.as_ref()))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Self::normalize_list(&mut out)?;
+        Ok(out)
+    }
+
+    /// Sort, deduplicate and cap an already-validated list (I8).
+    pub fn normalize_list(paths: &mut Vec<Self>) -> anyhow::Result<()> {
+        paths.sort();
+        paths.dedup();
+        anyhow::ensure!(
+            paths.len() <= MAX_HOST_PATHS,
+            "{} host paths declared, at most {MAX_HOST_PATHS} are allowed",
+            paths.len()
+        );
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for HostPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[cfg(test)]
+mod host_path_tests {
+    use super::{HostPath, MAX_HOST_PATHS};
+
+    /// The shape half of I8's adversarial table; existence is the engine's.
+    #[test]
+    fn host_path_shapes() {
+        for bad in [
+            "",
+            "nix/store/x",
+            "/nix/store/x/../y",
+            "/nix/store/./x",
+            "/nix//store/x",
+            "/nix/store/x\0y",
+        ] {
+            assert!(HostPath::new(bad).is_err(), "{bad:?} accepted");
+        }
+        assert_eq!(
+            HostPath::new("/nix/store/x/").unwrap().as_str(),
+            "/nix/store/x"
+        );
+        assert_eq!(
+            HostPath::new("/nix/store/x").unwrap().as_str(),
+            "/nix/store/x"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_host_path_is_refused() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let p = std::path::Path::new(std::ffi::OsStr::from_bytes(b"/nix/store/\xff"));
+        assert!(HostPath::from_path(p).is_err());
+    }
+
+    #[test]
+    fn host_path_list_dedups_then_caps() {
+        let n = |k: usize| (0..k).map(|i| format!("/p/{i}")).collect::<Vec<_>>();
+        assert_eq!(
+            HostPath::list(n(MAX_HOST_PATHS)).unwrap().len(),
+            MAX_HOST_PATHS
+        );
+        assert!(HostPath::list(n(MAX_HOST_PATHS + 1)).is_err());
+        let mut dup = n(MAX_HOST_PATHS);
+        dup.push("/p/0".to_owned());
+        assert_eq!(HostPath::list(dup).unwrap().len(), MAX_HOST_PATHS);
+        assert_eq!(HostPath::list(["/a", "/a/"]).unwrap().len(), 1);
+    }
+}
+
 #[derive(Default)]
 pub struct RunResponse {
     pub artifacts: Vec<outputartifact::OutputArtifact>,
+    /// Host paths the outputs name, checked on every local hit (see
+    /// [`HostPath`]). Empty for nearly every driver. Ignored for a target with
+    /// caching off; a target with `cache.remote` on that declares any fails.
+    pub host_paths: Vec<HostPath>,
     /// Cleanup closure owned by the layer that built the sandbox. The
     /// FUSE bridge rms its upper-side dir directly (bypassing the live
     /// mount, which has an orphan-on-upper bug for `unlink` of dirs);

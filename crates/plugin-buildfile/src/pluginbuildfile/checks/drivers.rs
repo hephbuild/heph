@@ -287,7 +287,7 @@ async fn finish(
     failure: Option<Failure>,
 ) -> anyhow::Result<ManagedRunResponse> {
     let Some(Failure { log: text, summary }) = failure else {
-        return Ok(ManagedRunResponse { artifacts: vec![] });
+        return Ok(ManagedRunResponse::default());
     };
     let mut log = RunLog::from_request(req, LOG_NAME);
     log.write(StreamId::Stderr, format!("{text}\n").as_bytes())
