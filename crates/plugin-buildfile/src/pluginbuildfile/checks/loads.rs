@@ -275,8 +275,10 @@ pub(crate) struct WalkReads {
     /// Every path a load probed (as [`resolve_load`] stats it: a file, a
     /// directory whose listing was read, or nothing, for a load that did not
     /// resolve) and every file parsed, whether the load succeeded or not, in
-    /// the order reached. A path may repeat.
-    pub paths: Vec<PathBuf>,
+    /// the order reached. A path may repeat. Each with whether the walk saw
+    /// something there: a path it saw that is gone by the time its caller
+    /// stats it vanished mid-walk, so that stat vouches for nothing.
+    pub paths: Vec<(PathBuf, bool)>,
     /// Files parsed.
     pub parsed: u64,
 }
@@ -319,11 +321,12 @@ impl Walker<'_> {
         if !self.in_flight.insert(path.to_path_buf()) {
             return Err(load_cycle(self.root, path));
         }
+        let meta = std::fs::symlink_metadata(path);
         if let Some(reads) = &mut self.reads {
-            reads.paths.push(path.to_path_buf());
+            reads.paths.push((path.to_path_buf(), meta.is_ok()));
             reads.parsed += 1;
         }
-        let symlink = std::fs::symlink_metadata(path)
+        let symlink = meta
             .with_context(|| format!("stat {rel}"))?
             .file_type()
             .is_symlink();
@@ -354,12 +357,19 @@ impl Walker<'_> {
     fn visit_load(&mut self, current_pkg: &str, module: &str) -> anyhow::Result<LoadEdge> {
         // The path `resolve_load` is about to stat, recorded before it can
         // fail: a load that does not resolve now may once the path exists.
-        if let Some(reads) = &mut self.reads
-            && let Ok(candidate) = resolve_load_target(self.root, current_pkg, module)
+        // Seen there once it resolves.
+        let probed = self.reads.as_mut().and_then(|reads| {
+            let candidate = resolve_load_target(self.root, current_pkg, module).ok()?;
+            reads.paths.push((candidate, false));
+            Some(reads.paths.len() - 1)
+        });
+        let resolved = resolve_load(self.root, self.walker, current_pkg, module, self.patterns)?;
+        if let Some(i) = probed
+            && let Some((_, seen)) = self.reads.as_mut().and_then(|r| r.paths.get_mut(i))
         {
-            reads.paths.push(candidate);
+            *seen = true;
         }
-        match resolve_load(self.root, self.walker, current_pkg, module, self.patterns)? {
+        match resolved {
             Resolved::File { path, pkg } => {
                 self.visit_file(&path, &pkg)?;
                 Ok(LoadEdge::File {

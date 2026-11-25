@@ -108,12 +108,10 @@ impl typed::MemberHost for CliHost<'_> {
         if !self.parses {
             return (None, false, false);
         }
-        // The workspace path, as the server types an open document under the
-        // engine's root; the file as given outside one.
-        let root = self.root.and_then(|r| r.canonicalize().ok());
-        let placed = root.and_then(|root| {
-            let abs = std::path::Path::new(self.file).canonicalize().ok()?;
-            let rel = abs.strip_prefix(&root).ok()?.to_str()?.replace('\\', "/");
+        // The workspace path, placed as the server places an open document
+        // under the engine's root; the file as given outside one.
+        let placed = self.root.and_then(|root| {
+            let (rel, abs) = server::Root::new(root).place(std::path::Path::new(self.file))?;
             Some((root, abs, rel))
         });
         let path = placed

@@ -20,6 +20,16 @@
 //! keep the stat, and so the old answer. Such a stat validates nothing, and
 //! the file is read again on the next lookup, until it is safely old.
 //!
+//! Two stats are judged further. A path the walk saw that is gone when it is
+//! stamped vanished mid-walk (a `git checkout` deleting a loaded file), so its
+//! absent stamp vouches for nothing and the walk runs again on the next
+//! lookup. And a time more than [`RACY`] past the clock after the stat was
+//! taken (a forged mtime, another host's clock) is no change anyone has made
+//! yet: it is left out, the stat judged by its other times. Counted, it would
+//! keep the stat racy until that future arrives, and every lookup would read
+//! the file again; left out, nothing is lost, since the next real change
+//! stamps the ctime with the clock and so moves the stat.
+//!
 //! An entry holds the `TypeInstanceId`s its typecheck minted, across
 //! requests, on purpose: a document typechecked twice against the same
 //! entries sees the same record types. I4 governs lint's checks, not this
@@ -64,11 +74,6 @@ impl Meta {
             ctime: ns(meta.ctime(), meta.ctime_nsec()),
         }
     }
-
-    /// The last time anything about the inode changed.
-    fn changed(&self) -> i128 {
-        self.mtime.max(self.ctime)
-    }
 }
 
 /// What a stat says of a path: if any of it moves, the path is read again.
@@ -97,13 +102,38 @@ impl Stat {
 
     /// Whether the path changed within [`RACY`] of `read_at` (nanoseconds
     /// since the epoch), or after it: a further change could then keep this
-    /// very stat.
-    fn racy(&self, read_at: i128) -> bool {
-        let changed = self.target.map_or(self.link.changed(), |t| {
-            t.changed().max(self.link.changed())
-        });
-        changed + RACY.as_nanos() as i128 > read_at
+    /// very stat. `now` is the clock after the stat was taken: a time more
+    /// than [`RACY`] past it is no change made yet, and is left out (see the
+    /// module doc).
+    fn racy(&self, read_at: i128, now: i128) -> bool {
+        let racy = RACY.as_nanos() as i128;
+        std::iter::once(&self.link)
+            .chain(&self.target)
+            .flat_map(|m| [m.mtime, m.ctime])
+            .filter(|&t| t <= now + racy)
+            .any(|t| t + racy > read_at)
     }
+}
+
+/// Stat each path a walk read, once, after it ran (`read_at` is a time
+/// before it started): the stamps, and whether any of them vouches for
+/// nothing — changed within [`RACY`] of `read_at` or after it, or gone though
+/// the walk saw it.
+fn stamp(
+    paths: impl IntoIterator<Item = (PathBuf, bool)>,
+    read_at: i128,
+) -> (HashMap<PathBuf, Option<Stat>>, bool) {
+    let paths = paths.into_iter();
+    let mut stamps: HashMap<PathBuf, Option<Stat>> = HashMap::with_capacity(paths.size_hint().0);
+    let mut vanished = false;
+    for (path, seen) in paths {
+        let stamp = stamps.entry(path).or_insert_with_key(|path| Stat::of(path));
+        vanished |= seen && stamp.is_none();
+    }
+    // After every stat: no change they show is later than this.
+    let now = now();
+    let racy = vanished || stamps.values().flatten().any(|s| s.racy(read_at, now));
+    (stamps, racy)
 }
 
 /// Nanoseconds since the epoch, now.
@@ -159,15 +189,7 @@ impl Walk {
             walk_loads(root, &walker, pkg, file, modules.iter().copied(), patterns);
         // Stamped after the walk: a path that changed while it ran changed
         // after `read_at`, so it is racy and the next lookup walks again.
-        let mut stamps = HashMap::with_capacity(reads.paths.len());
-        let mut racy = false;
-        for path in reads.paths {
-            stamps.entry(path).or_insert_with_key(|path| {
-                let stat = Stat::of(path);
-                racy |= stat.as_ref().is_some_and(|s| s.racy(read_at));
-                stat
-            });
-        }
+        let (stamps, racy) = stamp(reads.paths, read_at);
         let walked = Walk {
             pkg: pkg.to_owned(),
             modules: modules.iter().map(|&m| m.to_owned()).collect(),
@@ -360,7 +382,8 @@ impl InterfaceMemo {
                 let digest = src
                     .as_deref()
                     .map_or(UNREADABLE, |s| xxh3_128(s.as_bytes()));
-                (digest, stat.as_ref().is_some_and(|s| s.racy(read_at)))
+                let now = now();
+                (digest, stat.as_ref().is_some_and(|s| s.racy(read_at, now)))
             }
         };
         let key = chain(digest, walked, keys);
@@ -426,6 +449,11 @@ impl InterfaceMemo {
     /// Load walks run so far.
     pub(crate) fn walks_run(&self) -> u64 {
         self.walks_run
+    }
+
+    /// Load walks held, one per document typechecked since it opened.
+    pub(crate) fn walks_held(&self) -> usize {
+        self.walks.len()
     }
 
     /// Loaded files read from disk so far, by a walk or for a digest.
@@ -497,17 +525,72 @@ mod tests {
     fn a_stat_is_racy_within_a_tick_of_its_read() {
         let read_at = 100 * 1_000_000_000;
         let tick = RACY.as_nanos() as i128;
+        // Stat'ed a moment after the read.
+        let now = read_at + 1_000;
         // Changed in the same instant, just before, or after the read: a
         // later rewrite could keep the stat.
-        assert!(stat_changed_at(read_at).racy(read_at));
-        assert!(stat_changed_at(read_at - tick + 1).racy(read_at));
-        assert!(stat_changed_at(read_at + 1).racy(read_at));
+        assert!(stat_changed_at(read_at).racy(read_at, now));
+        assert!(stat_changed_at(read_at - tick + 1).racy(read_at, now));
+        assert!(stat_changed_at(read_at + 1).racy(read_at, now));
         // Safely old: any later change lands on a later timestamp.
-        assert!(!stat_changed_at(read_at - tick).racy(read_at));
+        assert!(!stat_changed_at(read_at - tick).racy(read_at, now));
         // A link's target counts as well as the link.
         let mut linked = stat_changed_at(read_at - 10 * tick);
-        assert!(!linked.racy(read_at));
+        assert!(!linked.racy(read_at, now));
         linked.target = Some(stat_changed_at(read_at).link);
-        assert!(linked.racy(read_at));
+        assert!(linked.racy(read_at, now));
+    }
+
+    #[test]
+    fn a_future_time_is_left_out() {
+        let read_at = 100 * 1_000_000_000;
+        let tick = RACY.as_nanos() as i128;
+        let now = read_at + 1_000;
+        // A forged mtime (`touch -d` a year on), its ctime safely old: no
+        // change anyone has made yet, so not racy, at this lookup or any.
+        let forged = |ctime: i128| Stat {
+            link: Meta {
+                mtime: read_at + 365 * 86_400 * 1_000_000_000,
+                ctime,
+                ..stat_changed_at(0).link
+            },
+            target: None,
+        };
+        assert!(!forged(read_at - 10 * tick).racy(read_at, now));
+        // Its ctime still counts: the forging itself was a change.
+        assert!(forged(read_at).racy(read_at, now));
+        // Within a tick of the clock it may be the clock's own granularity:
+        // still counted.
+        assert!(stat_changed_at(now + tick).racy(read_at, now));
+        assert!(!stat_changed_at(now + 2 * tick).racy(read_at, now));
+        // A change after the read, stat'ed long after it (a slow walk), is
+        // not in the future of the clock that stat'ed it: racy.
+        let late = read_at + 10 * tick;
+        assert!(stat_changed_at(late).racy(read_at, late + 1_000));
+    }
+
+    #[test]
+    fn a_path_gone_since_the_walk_saw_it_is_racy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let kept = dir.path().join("kept.star");
+        std::fs::write(&kept, "x = 1\n").expect("write");
+        let never = dir.path().join("never.star");
+        // Read long after any of these changed: only existence can be racy.
+        let read_at = now() + 10 * RACY.as_nanos() as i128;
+
+        let (stamps, racy) = stamp([(kept.clone(), true), (never.clone(), false)], read_at);
+        assert!(!racy, "a file still there and a path never there");
+        assert!(stamps[&kept].is_some());
+        assert!(stamps[&never].is_none());
+
+        // Deleted after the walk read it, before it was stamped.
+        let gone = dir.path().join("gone.star");
+        let (stamps, racy) = stamp([(kept.clone(), true), (gone.clone(), true)], read_at);
+        assert!(racy, "the walk saw a file that is gone");
+        assert!(stamps[&gone].is_none());
+
+        // A path seen once among repeats counts.
+        let (_, racy) = stamp([(gone.clone(), false), (gone, true)], read_at);
+        assert!(racy);
     }
 }

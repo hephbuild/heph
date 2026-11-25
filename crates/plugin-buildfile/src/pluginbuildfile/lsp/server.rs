@@ -83,6 +83,10 @@ struct Document {
     /// [`InterfaceMemo`] entries this document keeps alive. It outlives an
     /// edit, so the next typecheck finds them; `didClose` releases them.
     reach: Vec<String>,
+    /// The key its load walk is memoized under, once typechecked: `didClose`
+    /// forgets the walk by it, since a file deleted before then can no
+    /// longer be placed.
+    walked: Option<PathBuf>,
     /// Outside the bound repo: stock answers only, `reason: outside_root`.
     outside_root: bool,
 }
@@ -146,17 +150,38 @@ struct Server<'a> {
 
 /// The engine's root, as given and canonical (an editor may spell a path
 /// either way, `/var` against `/private/var` on macOS).
-struct Root {
+pub(super) struct Root {
     path: std::path::PathBuf,
     canonical: Option<std::path::PathBuf>,
 }
 
 impl Root {
-    fn new(path: &std::path::Path) -> Root {
+    pub(super) fn new(path: &std::path::Path) -> Root {
         Root {
             path: path.to_path_buf(),
             canonical: path.canonicalize().ok(),
         }
+    }
+
+    /// `path`'s workspace-relative path, and its absolute path under the
+    /// root as given, as the load walk spells it. `None` outside the root.
+    /// The path is canonicalized only when neither spelling of the root
+    /// prefixes it, so a symlinked package directory under the root keeps
+    /// its own spelling.
+    pub(super) fn place(&self, path: &Path) -> Option<(String, PathBuf)> {
+        let canonical = self.canonical.as_deref();
+        let rel = path
+            .strip_prefix(&self.path)
+            .ok()
+            .or_else(|| path.strip_prefix(canonical?).ok())
+            .map(Path::to_path_buf)
+            .or_else(|| {
+                let pc = path.canonicalize().ok()?;
+                pc.strip_prefix(canonical?).ok().map(Path::to_path_buf)
+            })?;
+        let rel = rel.to_str()?.replace('\\', "/");
+        let abs = self.path.join(&rel);
+        Some((rel, abs))
     }
 
     fn contains(&self, p: &std::path::Path) -> bool {
@@ -484,6 +509,7 @@ impl Server<'_> {
                     "interfaces": self.interfaces.len(),
                     "interface_checks": self.interfaces.checks(),
                     "load_walks": self.interfaces.walks_run(),
+                    "load_walks_held": self.interfaces.walks_held(),
                     "loaded_file_reads": self.interfaces.reads(),
                     "registry": match self.registry {
                         RegistryState::Loading(_) => "loading",
@@ -562,6 +588,7 @@ impl Server<'_> {
             None => matches!(&key, LspUri::File(p) if !self.root.contains(p)),
         };
         let reach = prev.as_mut().map(|p| std::mem::take(&mut p.reach));
+        let walked = prev.as_mut().and_then(|p| p.walked.take());
         let (ast_version, good_text, types) = match prev {
             _ if parsed => (Some(version), Some(Arc::from(text.as_str())), None),
             Some(prev) => (prev.ast_version, prev.good_text, prev.types),
@@ -578,6 +605,7 @@ impl Server<'_> {
                 good_text,
                 types,
                 reach: reach.unwrap_or_default(),
+                walked,
                 outside_root,
             },
         );
@@ -653,9 +681,8 @@ impl Server<'_> {
         let Some(key) = uri_key(&client_uri) else {
             return;
         };
-        self.documents.remove(&key);
-        if let Some((_, abs)) = self.workspace_path(&key) {
-            self.interfaces.forget(&abs);
+        if let Some(walked) = self.documents.remove(&key).and_then(|d| d.walked) {
+            self.interfaces.forget(&walked);
         }
         self.evict_unreached();
         self.backend.close(&key);
@@ -953,7 +980,7 @@ impl Server<'_> {
             let loaded = lookup(&names);
             if loaded.key == loads {
                 let reach = loaded.closure;
-                self.settle(key, reach, None);
+                self.settle(key, abs, reach, None);
                 return (Some(types), stale, ready);
             }
             fresh = Some(loaded);
@@ -982,15 +1009,23 @@ impl Server<'_> {
             loads,
             types: Arc::clone(types),
         });
-        self.settle(key, reach, memo);
+        self.settle(key, abs, reach, memo);
         (types, stale, ready)
     }
 
-    /// Record what `key`'s typecheck (or its memo's validation) reached and,
-    /// when it checked, its memo; then evict what no document reaches.
-    fn settle(&mut self, key: &LspUri, reach: Vec<String>, memo: Option<TypesMemo>) {
+    /// Record what `key`'s typecheck (or its memo's validation) reached, the
+    /// key its load walk is memoized under and, when it checked, its memo;
+    /// then evict what no document reaches.
+    fn settle(
+        &mut self,
+        key: &LspUri,
+        walked: PathBuf,
+        reach: Vec<String>,
+        memo: Option<TypesMemo>,
+    ) {
         if let Some(doc) = self.documents.get_mut(key) {
             doc.reach = reach;
+            doc.walked = Some(walked);
             if memo.is_some() {
                 doc.types = memo;
             }
@@ -1019,24 +1054,13 @@ impl Server<'_> {
     }
 
     /// `key`'s workspace-relative path, and its absolute path under the
-    /// engine's root as the load walk spells it. `None` outside the root.
+    /// engine's root as the load walk spells it ([`Root::place`]). `None`
+    /// outside the root.
     fn workspace_path(&self, key: &LspUri) -> Option<(String, PathBuf)> {
         let LspUri::File(path) = key else {
             return None;
         };
-        let canonical = self.root.canonical.as_deref();
-        let rel = path
-            .strip_prefix(&self.root.path)
-            .ok()
-            .or_else(|| path.strip_prefix(canonical?).ok())
-            .map(Path::to_path_buf)
-            .or_else(|| {
-                let pc = path.canonicalize().ok()?;
-                pc.strip_prefix(canonical?).ok().map(Path::to_path_buf)
-            })?;
-        let rel = rel.to_str()?.replace('\\', "/");
-        let abs = self.shared.root.join(&rel);
-        Some((rel, abs))
+        self.root.place(path)
     }
 
     fn stock_completion(
