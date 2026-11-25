@@ -547,6 +547,57 @@ fn bound_owner(conn: &mut Connection, deadline: Instant) -> rusqlite::Result<()>
     Ok(())
 }
 
+/// A private session's start: fold in the public catalog's WAL, as a public
+/// session's start does after writing its row ([`fold_wal`]), and write
+/// nothing. Without it, a user who only runs under `HEPH_NO_SESSION` leaves
+/// a WAL that grows by every seal. No catalog yet: nothing to fold. Never
+/// fails the run.
+pub fn fold(root: &Path) {
+    fold_within(root, WRITE_BOUND);
+}
+
+/// [`fold`], bounded at `bound` in place of [`WRITE_BOUND`].
+pub(crate) fn fold_within(root: &Path, bound: Duration) {
+    if !root.join(FILE).exists() {
+        return;
+    }
+    let folded = (|| -> anyhow::Result<bool> {
+        let Some(lock) = owner_lock(root)? else {
+            return Ok(false);
+        };
+        let deadline = Instant::now() + bound;
+        let mut conn = open_rw(root, false).context("opening the session catalog")?;
+        bound_owner(&mut conn, deadline).context("bounding the catalog's WAL fold")?;
+        fold_wal(&conn, deadline).context("folding in the catalog's WAL")?;
+        drop(conn);
+        drop(lock);
+        Ok(true)
+    })();
+    match folded {
+        Ok(true) => {}
+        Ok(false) => tracing::debug!(
+            root = %root.display(),
+            "the session catalog is locked: its WAL is not folded in"
+        ),
+        Err(e) => tracing::debug!(
+            root = %root.display(),
+            error = %format!("{e:#}"),
+            "the session catalog's WAL was not folded in"
+        ),
+    }
+}
+
+/// `catalog.lock` taken shared, without waiting; `None` when it is not free
+/// at once (a repair holds it).
+fn owner_lock(root: &Path) -> anyhow::Result<Option<File>> {
+    let lock_path = root.join(LOCK);
+    let lock = lockfile::open_shared_file(&lock_path)
+        .with_context(|| format!("opening {}", lock_path.display()))?;
+    let locked = lockfile::lock_within(&lock, false, Duration::ZERO)
+        .with_context(|| format!("locking {}", lock_path.display()))?;
+    Ok(locked.then_some(lock))
+}
+
 /// `Ok(false)`: `catalog.lock` was not free at once (a repair). Past
 /// `limits.bound`, the write is interrupted and its transaction rolled
 /// back; past `limits.cap`, a full write leaves out the explorer rows.
@@ -556,14 +607,9 @@ fn try_owner_write(
     mut copy: Rows,
     limits: OwnerLimits,
 ) -> anyhow::Result<bool> {
-    let lock_path = root.join(LOCK);
-    let lock = lockfile::open_shared_file(&lock_path)
-        .with_context(|| format!("opening {}", lock_path.display()))?;
-    if !lockfile::lock_within(&lock, false, Duration::ZERO)
-        .with_context(|| format!("locking {}", lock_path.display()))?
-    {
+    let Some(lock) = owner_lock(root)? else {
         return Ok(false);
-    }
+    };
     let deadline = Instant::now() + limits.bound;
     let mut conn = open_rw(root, true).context("opening the session catalog")?;
     bound_owner(&mut conn, deadline).context("bounding the catalog write")?;
@@ -596,8 +642,9 @@ fn try_owner_write(
     Ok(true)
 }
 
-/// Fold the catalog's WAL in at a session's start, so the WAL the owners
-/// leave unchecked ([`bound_owner`]) stays about one session's writes long.
+/// Fold the catalog's WAL in at a session's start (a private one's too,
+/// [`fold`]), so the WAL the owners leave unchecked ([`bound_owner`]) stays
+/// about one session's writes long.
 /// A passive checkpoint waits on no reader or writer; past `deadline`, it is
 /// interrupted. Only the start thread runs it, off the build path: the
 /// seal's exit path never checkpoints.

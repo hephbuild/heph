@@ -1611,7 +1611,10 @@ directly. So a killed run's private directory can linger up to an hour,
 while a run that ends normally removes its own at once.
 
 The same hourly cleanup then cleans the [catalog](#the-catalog-catalogdb),
-after the recordings:
+after the recordings. A private start's cleanup (its claim of the private
+root) cleans the public catalog too, and a private start folds the public
+catalog's WAL in as a public one does: under `HEPH_NO_SESSION=1` alone, the
+catalog its seals write to is still kept.
 
 | What | Kept | Then |
 | --- | --- | --- |

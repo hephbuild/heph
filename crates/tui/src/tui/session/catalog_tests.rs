@@ -952,6 +952,50 @@ fn a_build_never_repairs() {
     assert_eq!(std::fs::read(old.join(store::FILE)).expect("read"), before);
 }
 
+/// Under `HEPH_NO_SESSION` alone, the public catalog is still kept: each
+/// private session's start folds in the WAL the seals before it left, and
+/// its (hourly) cleanup expires the public catalog's old rows. Neither
+/// happened once, so a private-only user's WAL grew with every run.
+#[test]
+fn private_sessions_fold_and_clean_the_public_catalog() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let public = tmp.path().join(SESSIONS_DIR);
+    catalog::ensure_root(&public).expect("public root");
+    let old = sealed(&public, recent_id(1, 100 * DAY_MS));
+    catalog::record_seal(&public, &old, true);
+    let old_id = old.file_name().and_then(|n| n.to_str()).expect("id");
+    Connection::open(public.join(catalog::FILE))
+        .expect("open")
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .expect("fold the old row in");
+    let private = SessionRoot::private(tmp.path().join(PRIVATE_SESSIONS_DIR));
+    let folded = |id: &str| {
+        folded_sessions(&public)
+            .iter()
+            .any(|(sid, complete)| sid == id && *complete == 1)
+    };
+    assert!(folded(old_id), "the expired row is in catalog.db");
+    let mut seals: Vec<String> = Vec::new();
+    // Only the first start's cleanup is due: the interval is the default.
+    for _ in 0..3 {
+        let session = Session::open(&private, start()).expect("open");
+        if let Some(prev) = seals.last() {
+            assert!(
+                super::tests::eventually(|| folded(prev)),
+                "a private start did not fold in the previous private seal"
+            );
+        }
+        session.finish(Some(0), false);
+        seals.push(session.id().encode());
+    }
+    assert!(
+        super::tests::eventually(|| !folded_sessions(&public)
+            .iter()
+            .any(|(sid, _)| sid == old_id)),
+        "a private session's cleanup did not expire the public catalog's old rows"
+    );
+}
+
 /// `opt_outs_in_the_catalog` (D19): a private session leaves `sessions` and
 /// `targets` rows with `recorded=0`, no spans, and no recording. (`--raw`
 /// makes no session, so it has nothing to write.)

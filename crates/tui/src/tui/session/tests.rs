@@ -1479,7 +1479,7 @@ async fn no_session_private_dir() {
 }
 
 /// Poll `cond` for up to 20 s; `false` if it never held.
-fn eventually(mut cond: impl FnMut() -> bool) -> bool {
+pub(super) fn eventually(mut cond: impl FnMut() -> bool) -> bool {
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     while !cond() {
         if std::time::Instant::now() >= deadline {
