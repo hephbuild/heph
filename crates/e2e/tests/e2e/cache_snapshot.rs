@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 /// An engine over `root` — buildfile provider, bash driver — with an
 /// optional `file://` remote, recording its working set when `record`.
 fn engine(root: &Path, remote: Option<&Path>, record: bool) -> Arc<Engine> {
-    let mut e = Engine::new(Config {
+    engine_with(Config {
         remote_caches: remote
             .map(|dir| heph::engine::RemoteCacheDef {
                 name: "shared".to_string(),
@@ -41,7 +41,11 @@ fn engine(root: &Path, remote: Option<&Path>, record: bool) -> Arc<Engine> {
         record_working_set: record,
         ..Config::for_tests(root)
     })
-    .expect("engine");
+}
+
+/// [`engine`] over a config of the caller's.
+fn engine_with(config: Config) -> Arc<Engine> {
+    let mut e = Engine::new(config).expect("engine");
     e.register_provider(|init| {
         Box::new(pluginbuildfile::Provider::new(
             init.root.to_path_buf(),
@@ -392,4 +396,63 @@ async fn clean_and_gc_keep_the_journal() {
         vec![path.clone()]
     );
     assert_eq!(std::fs::read(&path).expect("read journal"), bytes);
+}
+
+/// I1: the walker prunes the resolved snapshot dir, so a root `**` glob
+/// hashes the same with and without files under it, whatever its name (not
+/// a `.heph*` one, which the home's prefix would prune anyway).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dir_under_a_root_glob_moves_no_hashin() {
+    let root = tempfile::tempdir().expect("root");
+    write_build(
+        root.path(),
+        r#"
+target(
+    name = "t",
+    driver = "bash",
+    deps = {"src": [glob("**/*", abs = True)]},
+    out = "out.txt",
+    run = "echo ok > $OUT",
+)
+"#,
+    );
+    std::fs::create_dir_all(root.path().join("src")).expect("mkdir src");
+    std::fs::write(root.path().join("src").join("a.txt"), "a").expect("write src");
+
+    let snap = root.path().join("snap");
+    let hashin_of = |snapshot: Option<&Path>| {
+        let e = engine_with(Config {
+            cache_snapshot: snapshot.map(Path::to_path_buf),
+            ..Config::for_tests(root.path())
+        });
+        async move {
+            Arc::clone(&e)
+                .meta(e.new_state(), &addr("//pkg:t"))
+                .await
+                .expect("meta")
+                .hashin
+        }
+    };
+
+    let before = hashin_of(Some(&snap)).await;
+    let generation = snap.join("gen-a").join("pkg").join("t");
+    std::fs::create_dir_all(&generation).expect("mkdir generation");
+    std::fs::write(generation.join("blob"), "restored").expect("write blob");
+    std::fs::write(
+        snap.join("HEPH_SNAPSHOT"),
+        r#"{"format":1,"current":"gen-a"}"#,
+    )
+    .expect("write marker");
+
+    assert_eq!(
+        hashin_of(Some(&snap)).await,
+        before,
+        "files under the snapshot dir moved a root glob's hashin"
+    );
+    // Control: without the dir configured, the same glob does see them.
+    assert_ne!(
+        hashin_of(None).await,
+        before,
+        "the glob never reached the snapshot dir, so the test proves nothing"
+    );
 }

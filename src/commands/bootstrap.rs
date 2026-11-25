@@ -318,7 +318,7 @@ pub fn new_engine(
 ) -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     new_engine_with(
         global,
-        BadEnv::Refuse,
+        EngineRole::Build,
         Some(session),
         pluginbuildfile::ShadowedChecks::default(),
     )
@@ -351,7 +351,8 @@ pub fn new_validate_engine_at(
     pluginbuildfile::ShadowedChecks,
 )> {
     let shadowed = pluginbuildfile::ShadowedChecks::default();
-    let (engine, trigger) = new_engine_at(root, global, BadEnv::Refuse, session, shadowed.clone())?;
+    let (engine, trigger) =
+        new_engine_at(root, global, EngineRole::Build, session, shadowed.clone())?;
     Ok((engine, trigger, shadowed))
 }
 
@@ -367,11 +368,12 @@ fn workspace_root() -> anyhow::Result<std::path::PathBuf> {
 /// completion and the credential helpers, which a shell or another tool runs
 /// and which execute no target. A malformed `HEPH_RESOURCE_<NAME>` is ignored
 /// with a warning there rather than breaking `<TAB>` or `git push`; the next
-/// real command still refuses it. They record no session.
+/// real command still refuses it. They record no session, and no working
+/// set.
 pub fn new_helper_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     new_engine_with(
         &super::GlobalOptions::default(),
-        BadEnv::Ignore,
+        EngineRole::Helper,
         None,
         pluginbuildfile::ShadowedChecks::default(),
     )
@@ -381,17 +383,46 @@ pub fn new_helper_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigg
 /// there, for `heph session attach`'s log and output readers: the config
 /// resolved from `root` (not the cwd), no plugin loaded, no hook, no SIGINT
 /// handler (attach's own Ctrl-C detaches, and must not cancel or hard-exit
-/// through an engine's), no session. Returns the home it resolved, which
-/// the caller checks against the one the session recorded.
+/// through an engine's), no session, no working set. Returns the home it
+/// resolved, which the caller checks against the one the session recorded.
 pub fn new_reader_engine(
     global: &super::GlobalOptions,
     root: &std::path::Path,
 ) -> anyhow::Result<(Arc<engine::Engine>, std::path::PathBuf)> {
-    let (_file, config) = engine_config(root, global, BadEnv::Ignore, std::env::vars_os())
+    let (_file, config) = engine_config(root, global, EngineRole::Helper, std::env::vars_os())
         .context("resolving the recorded workspace's config")?;
     let home = config.home_dir.to_path_buf();
     let engine = engine::Engine::new(config).context("building a reader engine")?;
     Ok((Arc::new(engine), home))
+}
+
+/// What an engine is built for, which decides what the environment may do
+/// to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EngineRole {
+    /// A command's own engine: a malformed `HEPH_RESOURCE_<NAME>` is refused,
+    /// and it records its working set when a cache snapshot dir is
+    /// configured.
+    Build,
+    /// Shell completion, the credential helpers, session attach's readers:
+    /// a malformed `HEPH_RESOURCE_<NAME>` is ignored, and nothing they do is
+    /// part of a build's working set.
+    Helper,
+}
+
+impl EngineRole {
+    fn bad_env(self) -> BadEnv {
+        match self {
+            Self::Build => BadEnv::Refuse,
+            Self::Helper => BadEnv::Ignore,
+        }
+    }
+
+    /// Whether this engine records its working set while a snapshot dir is
+    /// configured.
+    fn records(self) -> bool {
+        matches!(self, Self::Build)
+    }
 }
 
 /// What a malformed `HEPH_RESOURCE_<NAME>` does to engine construction.
@@ -438,13 +469,24 @@ fn apply_run_overrides(
 fn engine_config(
     root: &std::path::Path,
     global: &super::GlobalOptions,
-    bad_env: BadEnv,
+    role: EngineRole,
     vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
 ) -> anyhow::Result<(config_yaml::ConfigYaml, engine::Config)> {
+    let vars: Vec<_> = vars.into_iter().collect();
     // The config file is the all-optional, profile-layered YAML; `resolve`
     // applies every default in one place and yields the engine's runtime config.
+    // `HEPH_CACHE_SNAPSHOT` is read from `vars` here, so the engine never
+    // looks at the environment.
     let file = config_yaml::load_from_root(root)?;
-    let mut config = file.resolve(root)?;
+    let snapshot_env = vars
+        .iter()
+        .find(|(k, _)| k == config_yaml::CACHE_SNAPSHOT_ENV)
+        .map(|(_, v)| v.as_os_str());
+    let mut config = file.resolve_with_env(root, snapshot_env)?;
+
+    // Only a build engine records what it used for the next CI job's
+    // snapshot; a helper's lookups are not part of any build.
+    config.record_working_set = role.records() && config.cache_snapshot.is_some();
 
     // The kill switch for listed facts: every candidate a fact would have
     // decided is resolved instead. Read here, never by the engine. It is
@@ -463,27 +505,27 @@ fn engine_config(
     // the engine supplies the default for a pool none of them names. Read here,
     // like the kill switch above, so the engine never looks at the environment.
     // Parsed against the config's units, which is why they wait until now.
-    apply_run_overrides(&mut config.resources, vars, global, bad_env)?;
+    apply_run_overrides(&mut config.resources, vars, global, role.bad_env())?;
     Ok((file, config))
 }
 
 fn new_engine_with(
     global: &super::GlobalOptions,
-    bad_env: BadEnv,
+    role: EngineRole,
     session: Option<&Arc<SessionSlot>>,
     shadowed: pluginbuildfile::ShadowedChecks,
 ) -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
-    new_engine_at(&workspace_root()?, global, bad_env, session, shadowed)
+    new_engine_at(&workspace_root()?, global, role, session, shadowed)
 }
 
 fn new_engine_at(
     root: &std::path::Path,
     global: &super::GlobalOptions,
-    bad_env: BadEnv,
+    role: EngineRole,
     session: Option<&Arc<SessionSlot>>,
     shadowed: pluginbuildfile::ShadowedChecks,
 ) -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
-    let (file, config) = engine_config(root, global, bad_env, std::env::vars_os())?;
+    let (file, config) = engine_config(root, global, role, std::env::vars_os())?;
 
     // Point `SIGQUIT` dumps at the resolved home as soon as it is known — before
     // the engine is built and plugins are downloaded and loaded, which is where
@@ -840,7 +882,7 @@ mod tests {
         let root = tempfile::tempdir().expect("tempdir");
         std::fs::write(root.path().join(".hephconfig"), "").expect("write .hephconfig");
         let config = |global: &super::super::GlobalOptions| {
-            engine_config(root.path(), global, BadEnv::Refuse, Vec::new())
+            engine_config(root.path(), global, EngineRole::Build, Vec::new())
                 .expect("engine config")
                 .1
         };
@@ -850,6 +892,62 @@ mod tests {
             ..Default::default()
         };
         assert!(config(&keep).keep_failed_sandboxes);
+    }
+
+    /// With a snapshot dir configured, a build engine records its working
+    /// set and a helper or reader engine never does; `HEPH_CACHE_SNAPSHOT`,
+    /// read from the vars the front end passes, wins over the config file,
+    /// and empty turns both the dir and the recording off.
+    #[test]
+    fn only_a_build_engine_records_its_working_set() {
+        use std::ffi::OsString;
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            root.path().join(".hephconfig"),
+            "cacheSnapshot:\n  dir: snap\n",
+        )
+        .expect("write .hephconfig");
+        let global = super::super::GlobalOptions::default();
+        let config = |role: EngineRole, env: Option<&str>| {
+            let vars: Vec<(OsString, OsString)> = env
+                .map(|v| (config_yaml::CACHE_SNAPSHOT_ENV.into(), v.into()))
+                .into_iter()
+                .collect();
+            engine_config(root.path(), &global, role, vars)
+                .expect("engine config")
+                .1
+        };
+
+        let build = config(EngineRole::Build, None);
+        assert_eq!(build.cache_snapshot, Some(build.root.join("snap")));
+        assert!(build.record_working_set);
+
+        let helper = config(EngineRole::Helper, None);
+        assert_eq!(
+            helper.cache_snapshot, build.cache_snapshot,
+            "a helper still prunes the dir from its walks"
+        );
+        assert!(!helper.record_working_set);
+
+        let env = config(EngineRole::Build, Some("from-env"));
+        assert_eq!(env.cache_snapshot, Some(build.root.join("from-env")));
+        assert!(env.record_working_set);
+
+        let off = config(EngineRole::Build, Some(""));
+        assert_eq!(off.cache_snapshot, None);
+        assert!(!off.record_working_set);
+
+        // The reader engine reads the process environment; whatever it holds,
+        // the engine has no journal.
+        let runtime = build_runtime().expect("runtime");
+        let _in_runtime = runtime.enter();
+        let (reader, _home) = new_reader_engine(&global, root.path()).expect("reader engine");
+        assert!(reader.working_set_journal().is_none());
+
+        std::fs::write(root.path().join(".hephconfig"), "").expect("clear .hephconfig");
+        let unset = config(EngineRole::Build, None);
+        assert_eq!(unset.cache_snapshot, None);
+        assert!(!unset.record_working_set);
     }
 
     #[test]

@@ -56,6 +56,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
+pub mod marker;
+pub use marker::{
+    GENERATION_PREFIX, Generation, MARKER_FILE, MARKER_TMP_PREFIX, Marker, NoTier, SNAPSHOT_FORMAT,
+    is_generation_name, open_tier, read_marker, write_marker,
+};
+
 /// The first line's `magic`: what makes a file a working-set journal.
 pub const JOURNAL_MAGIC: &str = "heph-working-set";
 
@@ -956,5 +962,49 @@ mod tests {
         );
         assert_eq!(ws.journals.len(), 3);
         assert!(!ws.is_empty());
+    }
+
+    /// `HEPH_CACHE_SNAPSHOT` wins over `cacheSnapshot.dir`, an empty value
+    /// from either is off, a relative dir is under the (normalized) root,
+    /// and `resolve` alone never consults the environment.
+    #[test]
+    fn env_then_config() {
+        use crate::engine::config::ConfigYamlExt as _;
+        use std::ffi::OsStr;
+
+        let tmp = tempfile::tempdir().expect("root");
+        let root = hconfig::normalize(tmp.path()).expect("normalize root");
+        let yaml = |s: &str| -> hconfig::ConfigYaml { serde_yaml::from_str(s).expect("yaml") };
+        let snap = |cfg: &hconfig::ConfigYaml, env: Option<&str>| {
+            // Through a root spelled with a `.`, as `HEPH_CWD=.` can give.
+            cfg.resolve_with_env(&root.join("."), env.map(OsStr::new))
+                .expect("resolve")
+                .cache_snapshot
+        };
+
+        let configured = yaml("cacheSnapshot:\n  dir: ci/../.snap\n");
+        let off = yaml("cacheSnapshot:\n  dir: \"\"\n");
+        let none = yaml("{}\n");
+
+        assert_eq!(snap(&configured, None), Some(root.join(".snap")));
+        assert_eq!(snap(&configured, Some("env")), Some(root.join("env")));
+        assert_eq!(snap(&configured, Some("")), None);
+        assert_eq!(snap(&off, None), None);
+        assert_eq!(snap(&off, Some("env")), Some(root.join("env")));
+        assert_eq!(snap(&none, None), None);
+        assert_eq!(snap(&none, Some("/abs/s")), Some(PathBuf::from("/abs/s")));
+        assert_eq!(
+            configured.resolve(&root).expect("resolve").cache_snapshot,
+            Some(root.join(".snap")),
+            "resolve is resolve_with_env with no environment"
+        );
+        // Resolving the dir never turns recording on: that is the front end's
+        // call, per engine.
+        assert!(
+            !configured
+                .resolve(&root)
+                .expect("resolve")
+                .record_working_set
+        );
     }
 }

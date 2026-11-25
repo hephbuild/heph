@@ -143,6 +143,60 @@ pub struct ConfigYaml {
     /// per pool; a pool's unit cannot change across profiles.
     #[serde(default)]
     pub resources: ResourcesConfig,
+    /// CI cache snapshot: the directory a CI's own cache carries between jobs.
+    /// See [`CacheSnapshotConfig`]. `HEPH_CACHE_SNAPSHOT` wins over it; the
+    /// engine resolves the two together.
+    #[serde(default)]
+    pub cache_snapshot: Option<CacheSnapshotConfig>,
+}
+
+/// `cacheSnapshot:` in `.hephconfig`, usually set by a CI profile.
+///
+/// A profile that sets it replaces the whole block. Resolved, with
+/// `HEPH_CACHE_SNAPSHOT` over it, by [`resolve_cache_snapshot_dir`]: a
+/// relative `dir` is under the workspace root, and an empty one turns
+/// snapshots off.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[schemars(
+    description = "CI cache snapshot: the directory a CI cache carries from one job to the next. \
+                   While it is set, a build reads it as a cache tier and records what it used, \
+                   for `heph tool cache snapshot`. `HEPH_CACHE_SNAPSHOT` wins over it."
+)]
+pub struct CacheSnapshotConfig {
+    /// The snapshot directory. Relative to the workspace root unless
+    /// absolute; `""` turns snapshots off (a profile undoing the base).
+    #[schemars(
+        description = "The snapshot directory: relative to the workspace root, or absolute. \
+                       `\"\"` turns snapshots off."
+    )]
+    pub dir: PathBuf,
+}
+
+/// The environment variable that names the snapshot dir, over `cacheSnapshot:`.
+pub const CACHE_SNAPSHOT_ENV: &str = "HEPH_CACHE_SNAPSHOT";
+
+/// The snapshot dir a process uses, or `None` when snapshots are off: `env`
+/// (the value of [`CACHE_SNAPSHOT_ENV`], when set) wins over `configured`,
+/// and an empty value from either turns snapshots off. A relative path, from
+/// either, is under `root`; the result is lexically normalized like the home,
+/// so the walker's exact-path prune matches it.
+///
+/// The one resolution both the build and `heph tool cache snapshot` use, so
+/// they can never disagree about the directory.
+pub fn resolve_cache_snapshot_dir(
+    root: &Path,
+    env: Option<&std::ffi::OsStr>,
+    configured: Option<&CacheSnapshotConfig>,
+) -> Option<PathBuf> {
+    let dir = match env {
+        Some(v) => Path::new(v),
+        None => configured?.dir.as_path(),
+    };
+    if dir.as_os_str().is_empty() {
+        return None;
+    }
+    Some(hcore::paths::lexical(&root.join(dir)))
 }
 
 /// `resources:` in `.hephconfig`: pool name to its [`PoolDecl`], as written.
@@ -623,6 +677,9 @@ impl ConfigYaml {
         }
         if other.telemetry.is_some() {
             self.telemetry = other.telemetry;
+        }
+        if other.cache_snapshot.is_some() {
+            self.cache_snapshot = other.cache_snapshot;
         }
 
         // Caches deep-merge by key: a profile patches individual fields (e.g.
@@ -1662,6 +1719,57 @@ caches:
         let err = load_with_profiles(root, &["missing"]).expect_err("must error");
         let msg = format!("{err:#}");
         assert!(msg.contains("missing.hephconfig"), "{msg}");
+    }
+
+    /// A profile's `cacheSnapshot:` replaces the base's, an empty `dir`
+    /// turns it off, and a profile that does not mention it inherits it.
+    /// Resolution: env over config, empty from either is off, relative under
+    /// the root, normalized.
+    #[test]
+    fn cache_snapshot_layers_across_profiles() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(
+            root.join(".hephconfig"),
+            "cacheSnapshot:\n  dir: base-snap\n",
+        )
+        .expect("write base");
+        std::fs::write(
+            root.join("ci.hephconfig"),
+            "cacheSnapshot:\n  dir: ./ci/../ci-snap\n",
+        )
+        .expect("write ci");
+        std::fs::write(root.join("off.hephconfig"), "cacheSnapshot:\n  dir: \"\"\n")
+            .expect("write off");
+        std::fs::write(root.join("other.hephconfig"), "homeDir: .other\n").expect("write other");
+
+        let snap = |profiles: &[&str], env: Option<&str>| {
+            let cfg = load_with_profiles(root, profiles).expect("load");
+            resolve_cache_snapshot_dir(
+                root,
+                env.map(std::ffi::OsStr::new),
+                cfg.cache_snapshot.as_ref(),
+            )
+        };
+
+        assert_eq!(snap(&[], None), Some(root.join("base-snap")));
+        assert_eq!(snap(&["other"], None), Some(root.join("base-snap")));
+        assert_eq!(snap(&["ci"], None), Some(root.join("ci-snap")));
+        assert_eq!(snap(&["ci", "off"], None), None);
+        assert_eq!(snap(&["off", "ci"], None), Some(root.join("ci-snap")));
+        assert_eq!(snap(&["ci"], Some("")), None);
+        assert_eq!(
+            snap(&["off"], Some("env-snap")),
+            Some(root.join("env-snap"))
+        );
+        assert_eq!(
+            snap(&[], Some("/abs/snap")),
+            Some(PathBuf::from("/abs/snap"))
+        );
+
+        let err =
+            serde_yaml::from_str::<ConfigYaml>("cacheSnapshot: {}\n").expect_err("dir is required");
+        assert!(err.to_string().contains("dir"), "{err}");
     }
 
     #[test]

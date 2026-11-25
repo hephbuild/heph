@@ -1551,17 +1551,20 @@ impl Engine {
         Ok(())
     }
 
-    /// Absolute directories every plugin that walks the tree must prune by exact
-    /// path: the engine-owned home (cache/sandboxes/locks — never packages) plus
-    /// the literal (non-glob) `fs.skip` entries, resolved relative to the root.
     /// Whether anonymous usage telemetry is enabled for this engine (config
     /// `telemetry.enabled`, default `true`).
     pub fn telemetry_enabled(&self) -> bool {
         self.cfg.telemetry_enabled
     }
 
+    /// Absolute directories every plugin that walks the tree must prune by exact
+    /// path: the engine-owned home (cache/sandboxes/locks — never packages), the
+    /// CI cache snapshot dir when one is configured (I1: a root glob never reads
+    /// a snapshot, whatever its name), plus the literal (non-glob) `fs.skip`
+    /// entries, resolved relative to the root.
     pub fn skip_dirs(&self) -> Vec<PathBuf> {
         let mut dirs = vec![self.home.to_path_buf()];
+        dirs.extend(self.cfg.cache_snapshot.iter().cloned());
         dirs.extend(
             self.cfg
                 .fs_skip
