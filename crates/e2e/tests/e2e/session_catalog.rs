@@ -121,6 +121,29 @@ target(name = "u", driver = "bash", run = "echo u > $OUT", out = "u.txt")
         recording_kept(&sessions, cold),
         "the recording is kept beside its row"
     );
+
+    // The explorer rows keep what ran: the cold run's result span, and no
+    // result span for the warm run's hit (its `targets` row above is all
+    // the catalog keeps of it).
+    let result_spans = |id: SessionId| -> i64 {
+        cat.conn
+            .query_row(
+                &format!(
+                    "SELECT count(*) FROM spans WHERE session_id = '{}'
+                     AND name = 'heph.result' AND addr = '//p:t'",
+                    id.encode()
+                ),
+                (),
+                |r| r.get(0),
+            )
+            .expect("count result spans")
+    };
+    assert_eq!(
+        result_spans(cold),
+        1,
+        "the run that executed keeps its span"
+    );
+    assert_eq!(result_spans(warm), 0, "a cache hit keeps no result span");
 }
 
 fn recording_kept(sessions: &Path, id: SessionId) -> bool {
