@@ -227,6 +227,7 @@ dependencies = [
  "serde",
  "tar",
  "tempfile",
+ "xxhash-rust",
  "zip",
  "zstd",
 ]
@@ -1124,6 +1125,7 @@ name = "coreutils"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "archive",
  "findutils",
  "flate2",
  "grep-matcher",

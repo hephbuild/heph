@@ -72,6 +72,9 @@ walkdir = "2"
 tar = "0.4"
 flate2 = "1"
 zstd = "0.14"
+# `tar -c` writes through the shared reproducible writer, so its archives and
+# the `archive.create` driver's are the same bytes.
+harchive = { package = "archive", path = "../archive" }
 regex = "1"
 regex-syntax = "0.8"
 grep-matcher = "0.1"
