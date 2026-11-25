@@ -46,6 +46,7 @@ pub mod query;
 pub mod recorder;
 pub mod recording;
 pub mod run_logs;
+pub mod sampler;
 pub mod source;
 pub mod store;
 #[cfg(any(test, feature = "test-support"))]
