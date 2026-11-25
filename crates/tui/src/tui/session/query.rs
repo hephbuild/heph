@@ -402,7 +402,7 @@ fn check(sql: &str) -> Result<Checked, QueryError> {
     conn.authorizer(Some(authorizer(Allowed::Tables, Some(Arc::clone(&reads)))))
         .context("installing the authorizer")?;
     let (columns, types) = {
-        let stmt = prepare(&conn, sql)?;
+        let stmt = prepare(&conn, sql).map_err(|e| more_than_one(sql).unwrap_or(e))?;
         stmt.columns()
             .map(|c| (c.name().to_owned(), c.decl_type().map(str::to_owned)))
             .unzip()
@@ -421,6 +421,21 @@ fn check(sql: &str) -> Result<Checked, QueryError> {
         reads,
         conn,
     })
+}
+
+/// The refusal to give when `sql` holds more than one statement. rusqlite
+/// finds a second statement by preparing it, which the authorizer refuses
+/// first ("not authorized" for `SELECT 1; DELETE …`); so a refused `sql` is
+/// prepared again on a throwaway schema with no authorizer. Preparing
+/// changes nothing but that connection (a flag pragma takes effect at
+/// prepare), dropped here.
+fn more_than_one(sql: &str) -> Option<QueryError> {
+    let conn = Connection::open_in_memory().ok()?;
+    create_tables(&conn).ok()?;
+    match conn.prepare(sql) {
+        Err(e @ rusqlite::Error::MultipleStatement) => Some(sql_error(&e)),
+        _ => None,
+    }
 }
 
 /// `sql` prepared on `conn`, refused unless it is exactly one read-only
@@ -480,8 +495,45 @@ fn sql_error(e: &rusqlite::Error) -> QueryError {
 enum Allowed {
     /// The explorer tables of `main` (the empty schema, the copy).
     Tables,
-    /// Whatever heph's own views read, by their names; nothing else.
-    Views(Arc<[String]>),
+    /// Heph's own views (in `temp`), and what their inner views read from
+    /// the source; nothing else.
+    Views {
+        /// The inner views' nonce'd names.
+        inner: Arc<[String]>,
+        /// The source's tables the inner views read.
+        bases: &'static [&'static str],
+    },
+}
+
+/// Whether a statement may read `table.column`. SQLite also authorizes a
+/// "null read" (`column` empty, no accessor) of each FROM item no column
+/// of which is read (`count(*)`), naming its schema only as the statement
+/// wrote it; and once the flattener has folded heph's views into the
+/// statement, of the base table an inner view named. A null read gives row
+/// counts, never values.
+fn may_read(
+    allowed: &Allowed,
+    table: &str,
+    column: &str,
+    db: Option<&str>,
+    accessor: Option<&str>,
+) -> bool {
+    let null_read = column.is_empty();
+    match allowed {
+        // `check` resolved every name against the explorer tables, so an
+        // unqualified null read is one of them or a CTE.
+        Allowed::Tables => match db {
+            None => null_read,
+            Some(db) => db == "main" && TABLES.iter().any(|t| t.name == table),
+        },
+        // `temp` holds heph's views alone (a statement may create nothing),
+        // and only an inner view, by its nonce'd name, reads the source.
+        Allowed::Views { inner, bases } => {
+            db == Some("temp")
+                || accessor.is_some_and(|a| inner.iter().any(|n| n == a))
+                || (null_read && db.is_none_or(|db| db == "main" && bases.contains(&table)))
+        }
+    }
 }
 
 fn authorizer(
@@ -490,17 +542,17 @@ fn authorizer(
 ) -> impl FnMut(AuthContext<'_>) -> Authorization + Send + 'static {
     move |ctx| match ctx.action {
         AuthAction::Select | AuthAction::Recursive => Authorization::Allow,
-        AuthAction::Read { table_name, .. } => {
-            let ok = match &allowed {
-                Allowed::Tables => {
-                    ctx.database_name == Some("main")
-                        && TABLES.iter().any(|t| t.name == table_name)
-                }
-                Allowed::Views(names) => ctx
-                    .accessor
-                    .is_some_and(|a| names.iter().any(|n| n == a)),
-            };
-            if ok {
+        AuthAction::Read {
+            table_name,
+            column_name,
+        } => {
+            if may_read(
+                &allowed,
+                table_name,
+                column_name,
+                ctx.database_name,
+                ctx.accessor,
+            ) {
                 if let Some(r) = &reads {
                     r.lock()
                         .unwrap_or_else(PoisonError::into_inner)
@@ -772,11 +824,8 @@ fn in_place(
     // The catalog stays open (its lock held) until the answer is read.
     let mut catalog: Catalog;
     let mut file_conn: Connection;
-    let conn: &mut Connection = match source {
-        Source::Catalog {
-            catalog: c,
-            scope,
-        } => {
+    let (conn, bases): (&mut Connection, &'static [&'static str]) = match source {
+        Source::Catalog { catalog: c, scope } => {
             catalog = c;
             let conn = &mut catalog.conn;
             harden(conn)?;
@@ -795,7 +844,7 @@ fn in_place(
                     scope.sql("")
                 ),
             )?;
-            conn
+            (conn, CATALOG_BASES)
         }
         Source::Recording(f) => {
             file_conn = open_read_only(&f.path, f.immutable)?;
@@ -804,12 +853,18 @@ fn in_place(
             require_tables(conn, "main", RECORDING_BASES)?;
             define_views(conn, &inner, |name| recording_select(name, "main"))?;
             coverage.recordings = 1;
-            coverage.truncated = count(conn, "SELECT count(*) FROM main.session WHERE truncated = 1")?;
-            conn
+            coverage.truncated = count(
+                conn,
+                "SELECT count(*) FROM main.session WHERE truncated = 1",
+            )?;
+            (conn, RECORDING_BASES)
         }
     };
-    let names: Arc<[String]> = TABLES.iter().map(|t| inner(t.name)).collect();
-    let rows = execute(conn, sql, Allowed::Views(names), limits, deadline)?;
+    let allowed = Allowed::Views {
+        inner: TABLES.iter().map(|t| inner(t.name)).collect(),
+        bases,
+    };
+    let rows = execute(conn, sql, allowed, limits, deadline)?;
     Ok(Answer {
         columns: checked.columns,
         types: checked.types,
@@ -846,7 +901,8 @@ fn define_views(
             column_list(t),
         ));
     }
-    conn.execute_batch(&sql).context("defining the explorer views")
+    conn.execute_batch(&sql)
+        .context("defining the explorer views")
 }
 
 /// Several sources, copied into one temp database: only the tables the
@@ -893,9 +949,11 @@ fn copied(
             Source::Recording(f) => {
                 copy_recording(&conn, &f, &checked.reads, limits)?;
                 coverage.recordings += 1;
-                coverage.truncated +=
-                    count(&conn, "SELECT count(*) FROM src.session WHERE truncated = 1")
-                        .and_then(|n| detach(&conn).map(|()| n))?;
+                coverage.truncated += count(
+                    &conn,
+                    "SELECT count(*) FROM src.session WHERE truncated = 1",
+                )
+                .and_then(|n| detach(&conn).map(|()| n))?;
             }
             Source::Catalog { .. } => {
                 return Err(QueryError::Other(anyhow::anyhow!(

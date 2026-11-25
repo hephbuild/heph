@@ -41,9 +41,9 @@ pub mod hephsession;
 pub mod holder;
 pub mod id;
 pub mod lockfile;
+pub mod query;
 pub mod recorder;
 pub mod recording;
-pub mod query;
 pub mod run_logs;
 pub mod source;
 pub mod store;
@@ -52,6 +52,8 @@ pub mod testing;
 
 #[cfg(test)]
 mod catalog_tests;
+#[cfg(test)]
+mod query_tests;
 #[cfg(test)]
 mod replay_tests;
 #[cfg(test)]
