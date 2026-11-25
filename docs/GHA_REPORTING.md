@@ -821,6 +821,34 @@ Current: `refreshSecs`, `summaryPath`, `tokenEnv`. Keep the names and the camelC
 
 `summaryPath` keeps its name but changes semantics to **append**, matching GitHub's contract.
 
+**Where the options go.** The `gh` plugin also serves `heph.gh.release_asset`, which takes no
+option (its server is a `server_url` argument of each call, `docs/GH_RELEASES.md`), so the plugin's
+`options:` are the hook's, under `hook:`:
+
+```yaml
+plugins:
+  - url: https://…/heph-gh-plugin.json
+    options:
+      hook:
+        enable: true        # default false: no hook
+        refreshSecs: 30
+        jsonPath: /tmp/heph-summary.json
+```
+
+The options decode into one struct that refuses unknown keys at either level, so a hook option at
+the top level is refused as "unknown field `refreshSecs`", naming the key the top level allows
+(`hook`), and a `hook:` that is not a map is refused too. A bare `hook:` is the defaults.
+
+**When the hook exists.** Only when `hook.enable` is `true`. Nothing in the environment turns it on
+(not `GITHUB_ACTIONS`): the plugin is enabled in workspaces that never run in Actions, where a hook
+would only print a "no step summary" warning on every run, and a CI job that wants the report says
+so in its config. A local dry run sets `enable: true` with `summaryPath` or `jsonPath`. The hook's
+options are decoded on every run, enabled or not, so a wrong-typed `refreshSecs` fails before anyone
+turns the hook on. A bad option never aborts heph: the plugin is created before its log sink is
+installed, so the hook is replaced by one that logs the error on the first event (or when the
+command's request closes, for one that emits none). `release_asset`, reading no option, works
+either way.
+
 ---
 
 ## 13. Inherited bugs — fix as the foundation

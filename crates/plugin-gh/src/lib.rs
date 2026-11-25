@@ -1,6 +1,24 @@
-//! The `gh` plugin's GitHub Actions hook: folds the engine's build-event stream
-//! into a status [`Tally`] and surfaces it two ways. Published out-of-process as
-//! a cdylib (see `plugin-gh-cdylib`) and enabled via a config `plugins:` entry.
+//! The `gh` (GitHub) plugin. Published out-of-process as a cdylib (see
+//! `plugin-gh-cdylib`, which only wires these parts) and enabled via a config
+//! `plugins:` entry. Its parts:
+//!
+//! - **The Actions reporting hook** ([`GhaHook`], below): build status as a
+//!   sticky PR comment and a step summary. Its options sit under the plugin's
+//!   `hook:` key. They are always decoded, so a typo fails even while the hook
+//!   is off; the hook is constructed only when `hook.enable` is true.
+//! - **`heph.gh.release_asset(...)`** ([`release`]): a BUILD function declaring
+//!   an `http_fetch` of a release asset, and optionally an `extract` of it.
+//! - **The `extract` driver** ([`extract`]): unpacks an archive in-process
+//!   ([`harchive::unpack`]). See `docs/GH_RELEASES.md`.
+//!
+//! The plugin's `options:` are one [`GhOptions`]: the hook's, under `hook:`.
+//! `release_asset` reads no option; its server is an argument of each call.
+//! A bad option never aborts the host: a [`ConfigErrorHook`] logs it.
+//!
+//! # The Actions reporting hook
+//!
+//! Folds the engine's build-event stream into a status [`Tally`] and surfaces
+//! it two ways.
 //!
 //! The design, and the reasoning behind it, is `docs/GHA_REPORTING.md`. The two
 //! things to know before editing:
@@ -40,20 +58,49 @@
 
 #[cfg(test)]
 mod comment_tests;
+pub mod extract;
+pub mod release;
 mod render;
 mod report;
 mod tally;
+
+// The `htspec` derive macros expand to `crate::htvalue` / `crate::htspec`.
+pub(crate) use hcore::htvalue;
+pub(crate) use hplugin::htspec;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use anyhow::Context as _;
 use hcore::events::{BuildEvent, now_unix_ms};
-use hplugin::config::{Options, decode_opt, deny_unknown};
+use hplugin::config::Options;
 use hplugin::hook::Hook;
+use serde::Deserialize;
 
 use crate::tally::Tally;
+
+/// The plugin's `options:`: the hook's, under `hook:`. An unknown key is
+/// refused at either level, so a typo (or a hook option at the top level) is
+/// caught. Nothing here reaches `release_asset`, whose server is an argument
+/// of each call: one workspace may pull from github.com and from a GitHub
+/// Enterprise server.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct GhOptions {
+    /// Absent, or a bare `hook:`, is the defaults: no hook.
+    #[serde(default)]
+    pub hook: HookOptions,
+}
+
+impl GhOptions {
+    /// Decode the plugin's whole `options:` map. Reads nothing but the map.
+    pub fn decode(opts: &Options) -> anyhow::Result<Self> {
+        let value = serde_yaml::to_value(opts).context("gh: reading `options:`")?;
+        serde_path_to_error::deserialize(value).context("gh: invalid `options:`")
+    }
+}
 
 /// Scopes the sticky comment to one per job **leg**.
 ///
@@ -1421,39 +1468,24 @@ pub struct GhaHook {
 }
 
 impl GhaHook {
-    /// Build from the plugin's `options:` map. Options (all optional):
-    /// `refreshSecs` (live PR-comment PATCH interval, default 30), `summaryPath`
-    /// (final step-summary file, default `$GITHUB_STEP_SUMMARY`), `tokenEnv` (name
-    /// of the env var holding the API token, default `GITHUB_TOKEN`),
-    /// `slowAfterSecs` (how long a target must run before it is surfaced,
-    /// default 30). Spawns the live-update thread when a PR comment can be
-    /// created.
-    pub fn from_options(opts: &Options) -> anyhow::Result<Self> {
-        deny_unknown(
-            "gha hook",
-            opts,
-            &[
-                "refreshSecs",
-                "summaryPath",
-                "tokenEnv",
-                "slowAfterSecs",
-                "commentKey",
-                "jsonPath",
-                "annotations",
-            ],
-        )?;
+    /// Build from the plugin's `hook:` options, whatever their `enable` says
+    /// (that is the caller's decision). Reads the runner's environment
+    /// (`$GITHUB_STEP_SUMMARY`, the PR, the token); spawns nothing until the
+    /// first event.
+    pub fn new(opts: HookOptions) -> Self {
+        let HookOptions {
+            enable: _,
+            refresh_secs,
+            slow_after_secs,
+            summary_path,
+            json_path,
+            annotations,
+            token_env,
+            comment_key: comment_key_opt,
+        } = opts;
         tracing::debug!("gha hook loaded");
-        let refresh_secs: u64 = decode_opt(opts, "gha hook", "refreshSecs")?
-            .unwrap_or(30)
-            .max(1);
-        // 30s, not the previous hardcoded 10s: with a 30-second refresh, a 10s
-        // threshold lists half of a cold build as "slow".
-        let slow_after_secs: u64 = decode_opt(opts, "gha hook", "slowAfterSecs")?
-            .unwrap_or(30)
-            .max(1);
-        let summary_path = decode_opt::<String>(opts, "gha hook", "summaryPath")?
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("GITHUB_STEP_SUMMARY").map(PathBuf::from));
+        let summary_path =
+            summary_path.or_else(|| std::env::var_os("GITHUB_STEP_SUMMARY").map(PathBuf::from));
         if summary_path.is_none() {
             tracing::warn!(
                 "gha hook: neither `summaryPath` option nor $GITHUB_STEP_SUMMARY set; \
@@ -1469,16 +1501,12 @@ impl GhaHook {
         };
         let run_url = run_url_from_env();
 
-        let json_path = decode_opt::<String>(opts, "gha hook", "jsonPath")?.map(PathBuf::from);
-        let annotations = decode_opt::<bool>(opts, "gha hook", "annotations")?.unwrap_or(true);
-        let token_env = decode_opt::<String>(opts, "gha hook", "tokenEnv")?;
         // One sticky PR comment per job leg; within it, one section per heph
         // command so a job's steps each keep their own results.
-        let job_key =
-            match decode_opt::<String>(opts, "gha hook", "commentKey")?.filter(|s| !s.is_empty()) {
-                Some(explicit) => explicit,
-                None => comment_key(&command, std::env::var("GITHUB_JOB").ok(), runner_leg()),
-            };
+        let job_key = match comment_key_opt.filter(|k| !k.is_empty()) {
+            Some(explicit) => explicit,
+            None => comment_key(&command, std::env::var("GITHUB_JOB").ok(), runner_leg()),
+        };
         // Hashed: the raw command can contain the marker delimiter, which used to
         // append a new section on every step until the body hit GitHub's cap.
         let section_key = section_id(if command.is_empty() { "heph" } else { &command });
@@ -1497,8 +1525,8 @@ impl GhaHook {
             comment,
             stop: AtomicBool::new(false),
             started: AtomicBool::new(false),
-            refresh: Duration::from_secs(refresh_secs),
-            slow_after_ms: slow_after_secs.saturating_mul(1000),
+            refresh: Duration::from_secs(refresh_secs.max(1)),
+            slow_after_ms: slow_after_secs.max(1).saturating_mul(1000),
             run_url,
             json_path,
             annotations,
@@ -1506,7 +1534,93 @@ impl GhaHook {
             last_flush: Mutex::new(None),
         });
 
-        Ok(Self { inner })
+        Self { inner }
+    }
+}
+
+/// The hook's options, the plugin's `hook:` map. Decoding reads nothing but
+/// the map, so it runs everywhere — a wrong-typed `refreshSecs` fails the same
+/// on a laptop as in a runner — while [`GhaHook::new`] reads the runner's
+/// environment.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase", default)]
+pub struct HookOptions {
+    /// Whether the hook is built at all (default false). Nothing about the
+    /// environment turns it on, so a plugin enabled for `release_asset` alone
+    /// gets no hook (and no warning on every run), and a CI job says
+    /// `enable: true` in its config.
+    pub enable: bool,
+    /// Live PR-comment PATCH interval (at least 1).
+    refresh_secs: u64,
+    /// How long a target must run before it is surfaced (at least 1).
+    slow_after_secs: u64,
+    /// Final step-summary file; `$GITHUB_STEP_SUMMARY` when unset.
+    summary_path: Option<PathBuf>,
+    json_path: Option<PathBuf>,
+    annotations: bool,
+    /// The env var holding the API token; `GITHUB_TOKEN` when unset.
+    token_env: Option<String>,
+    /// Empty is unset.
+    comment_key: Option<String>,
+}
+
+impl Default for HookOptions {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            refresh_secs: 30,
+            // 30s, not the previous hardcoded 10s: with a 30-second refresh, a
+            // 10s threshold lists half of a cold build as "slow".
+            slow_after_secs: 30,
+            summary_path: None,
+            json_path: None,
+            annotations: true,
+            token_env: None,
+            comment_key: None,
+        }
+    }
+}
+
+/// A hook standing in for one whose configuration failed: it reports the
+/// error once, on the first event (or at close, for a command that emits
+/// none), through the host's log sink, which is installed by then — unlike at
+/// plugin creation, where an error has no channel and an abort kills the host
+/// with a bare `SIGABRT`.
+pub struct ConfigErrorHook {
+    error: String,
+    reported: AtomicBool,
+}
+
+impl ConfigErrorHook {
+    pub fn new(error: &anyhow::Error) -> Self {
+        Self {
+            error: format!("{error:#}"),
+            reported: AtomicBool::new(false),
+        }
+    }
+
+    fn report(&self) {
+        if !self.reported.swap(true, Ordering::AcqRel) {
+            tracing::error!(
+                "gh plugin: {}; no GitHub Actions report is written. Fix the plugin's \
+                 `options:` in .hephconfig",
+                self.error
+            );
+        }
+    }
+}
+
+impl Hook for ConfigErrorHook {
+    fn name(&self) -> String {
+        "gha".to_string()
+    }
+
+    fn on_event(&self, _ev: &BuildEvent) {
+        self.report();
+    }
+
+    fn on_close(&self) {
+        self.report();
     }
 }
 
@@ -2106,13 +2220,101 @@ mod tests {
     }
 
     fn hook_writing_to(path: &std::path::Path) -> GhaHook {
-        let opts: Options = [(
-            "summaryPath".to_string(),
-            serde_yaml::Value::String(path.to_string_lossy().into_owned()),
-        )]
-        .into_iter()
-        .collect();
-        GhaHook::from_options(&opts).expect("hook")
+        GhaHook::new(HookOptions {
+            summary_path: Some(path.to_path_buf()),
+            ..HookOptions::default()
+        })
+    }
+
+    /// The plugin's whole `options:`, from YAML, decoded.
+    fn decode(yaml: &str) -> anyhow::Result<GhOptions> {
+        GhOptions::decode(&serde_yaml::from_str(yaml)?)
+    }
+
+    fn err_of<T>(r: anyhow::Result<T>) -> String {
+        match r {
+            Ok(_) => panic!("must fail"),
+            Err(e) => format!("{e:#}"),
+        }
+    }
+
+    /// No `hook:`, a bare one, an empty one: the hook's defaults, so no hook.
+    #[test]
+    fn an_absent_or_empty_hook_is_the_defaults() {
+        for yaml in ["{}", "hook:", "hook: {}", "hook: {enable: false}"] {
+            assert_eq!(decode(yaml).unwrap().hook, HookOptions::default(), "{yaml}");
+        }
+        let defaults = HookOptions::default();
+        assert!(!defaults.enable);
+        assert_eq!((defaults.refresh_secs, defaults.slow_after_secs), (30, 30));
+        assert!(defaults.annotations);
+        assert!(decode("hook: {enable: true}").unwrap().hook.enable);
+    }
+
+    /// The options are decoded whether or not the hook is on, so a wrong-typed
+    /// one fails before anyone turns the hook on.
+    #[test]
+    fn a_bad_hook_option_fails_even_when_disabled() {
+        for yaml in [
+            "hook: {refreshSecs: soon}",
+            "hook: {enable: false, refreshSecs: soon}",
+            "hook: {enable: true, refreshSecs: soon}",
+        ] {
+            let msg = err_of(decode(yaml));
+            assert!(msg.contains("refreshSecs"), "{yaml}: {msg}");
+        }
+    }
+
+    #[test]
+    fn enable_must_be_a_bool() {
+        for yaml in [
+            "hook: {enable: 'yes'}",
+            "hook: {enable: 1}",
+            "hook: {enable: [true]}",
+        ] {
+            let msg = err_of(decode(yaml));
+            assert!(msg.contains("hook.enable"), "{yaml}: {msg}");
+            assert!(msg.contains("expected a boolean"), "{yaml}: {msg}");
+        }
+    }
+
+    /// The nested options reach the hook.
+    #[test]
+    fn nested_hook_options_reach_the_hook() {
+        let opts = decode("hook:\n  enable: true\n  refreshSecs: 5\n  commentKey: k\n").unwrap();
+        assert!(opts.hook.enable);
+        assert_eq!(opts.hook.refresh_secs, 5);
+        assert_eq!(opts.hook.comment_key.as_deref(), Some("k"));
+    }
+
+    #[test]
+    fn hook_must_be_a_map() {
+        for yaml in ["hook: true", "hook: 30", "hook: enable", "hook: [enable]"] {
+            let msg = err_of(decode(yaml));
+            assert!(msg.contains("hook: invalid type"), "{yaml}: {msg}");
+            assert!(msg.contains("expected struct HookOptions"), "{yaml}: {msg}");
+        }
+    }
+
+    /// An unknown key is refused at either level, naming the key and what the
+    /// level allows. A hook option at the top level (where it used to go) is
+    /// one, and so is a server URL: it is `release_asset`'s `server_url`
+    /// argument, per call, not a plugin option.
+    #[test]
+    fn unknown_keys_are_refused_at_either_level() {
+        let msg = err_of(decode("hook: {refreshSec: 5}"));
+        assert!(msg.contains("unknown field `refreshSec`"), "{msg}");
+        assert!(msg.contains("`refreshSecs`"), "{msg}");
+        for yaml in [
+            "serverUrl: https://ghe.example",
+            "refreshSecs: 30",
+            "enable: true",
+        ] {
+            let msg = err_of(decode(yaml));
+            let key = yaml.split(':').next().unwrap_or_default();
+            assert!(msg.contains(&format!("unknown field `{key}`")), "{msg}");
+            assert!(msg.contains("expected `hook`"), "{msg}");
+        }
     }
 
     #[test]
@@ -2294,17 +2496,12 @@ mod tests {
         command_label_from(args.iter().map(|s| (*s).to_string()))
     }
 
-    fn hook_with(opts: &[(&str, &str)]) -> GhaHook {
-        let opts: Options = opts
-            .iter()
-            .map(|(k, v)| {
-                (
-                    (*k).to_string(),
-                    serde_yaml::Value::String((*v).to_string()),
-                )
-            })
-            .collect();
-        GhaHook::from_options(&opts).expect("hook")
+    fn hook_with(summary: &std::path::Path, json: &std::path::Path) -> GhaHook {
+        GhaHook::new(HookOptions {
+            summary_path: Some(summary.to_path_buf()),
+            json_path: Some(json.to_path_buf()),
+            ..HookOptions::default()
+        })
     }
 
     #[test]
@@ -2312,10 +2509,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let summary = dir.path().join("summary.md");
         let json = dir.path().join("heph.json");
-        let hook = hook_with(&[
-            ("summaryPath", &summary.to_string_lossy()),
-            ("jsonPath", &json.to_string_lossy()),
-        ]);
+        let hook = hook_with(&summary, &json);
 
         hook.on_event(&ev(
             0,
@@ -2371,10 +2565,7 @@ mod tests {
     fn a_collateral_cone_does_not_reach_the_json_failure_list() {
         let dir = tempfile::tempdir().expect("tempdir");
         let json = dir.path().join("heph.json");
-        let hook = hook_with(&[
-            ("summaryPath", &dir.path().join("s.md").to_string_lossy()),
-            ("jsonPath", &json.to_string_lossy()),
-        ]);
+        let hook = hook_with(&dir.path().join("s.md"), &json);
         hook.on_event(&ev(
             10,
             BuildEventKind::ResultEnd {

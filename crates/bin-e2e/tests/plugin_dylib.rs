@@ -9,7 +9,11 @@
 
 mod common;
 
-use common::{BASE_CONFIG, Dist, Workspace, describe, sha256_file, write_manifest};
+use std::process::{Output, Stdio};
+
+use common::{
+    BASE_CONFIG, Dist, RUN_DEADLINE, Workspace, describe, sha256_file, wait_output, write_manifest,
+};
 
 /// A shipped cdylib must load *and answer*. Merely dlopening proves little —
 /// `inspect functions` renders the signatures the loaded plugin's function
@@ -240,13 +244,9 @@ provider_state(
     );
 }
 
-/// The second shipped cdylib, exporting a hook rather than a provider — a
-/// different export kind over the same seam, so a loader that only handles
-/// providers fails here and nowhere else.
-#[test]
-fn shipped_gh_cdylib_loads() {
-    let dist = Dist::locate();
-    let ws = Workspace::new().expect("workspace");
+/// (Re)write `ws`'s config to enable the shipped `gh` cdylib with `options`
+/// (YAML lines already indented under the entry's `options:`, or empty).
+fn configure_gh(ws: &Workspace, dist: &Dist, options: &str) {
     let dylib = dist.plugin("gh");
     assert!(dylib.is_file(), "missing {}", dylib.display());
 
@@ -254,24 +254,326 @@ fn shipped_gh_cdylib_loads() {
     let sum = sha256_file(&dylib).expect("hash gh cdylib");
     write_manifest(&manifest, "gh", &dylib, Some(&sum)).expect("write manifest");
 
-    ws.config(&format!("{BASE_CONFIG}  - path: {}\n", manifest.display()))
-        .expect("write config");
+    let options = if options.is_empty() {
+        String::new()
+    } else {
+        format!("    options:\n{options}")
+    };
+    ws.config(&format!(
+        "{BASE_CONFIG}  - path: {}\n{options}",
+        manifest.display()
+    ))
+    .expect("write config");
+}
+
+/// The `options:` lines for the gh plugin: `top` (top-level lines, already
+/// indented, or empty) and, `hook_enabled`, a `hook:` map turning the hook on.
+/// Disabled is no `hook:` at all, the default.
+fn gh_options(top: &str, hook_enabled: bool) -> String {
+    if hook_enabled {
+        format!("{top}      hook:\n        enable: true\n")
+    } else {
+        top.to_string()
+    }
+}
+
+/// `heph <args>` in a controlled GitHub Actions environment: every
+/// `GITHUB_*`/`RUNNER_*` variable of the test's own environment is removed (on
+/// a CI runner they would point the hook at the real job's summary and token),
+/// then `GITHUB_ACTIONS=true` with [`step_summary`] as the step summary. Set
+/// on the child only, never on this process. Whether the hook exists is the
+/// config's `hook.enable`, never this environment.
+fn run_gh(ws: &Workspace, dist: &Dist, args: &[&str]) -> Output {
+    let mut cmd = ws.cmd(dist, args);
+    for (key, _) in std::env::vars_os() {
+        let actions = key
+            .to_str()
+            .is_some_and(|k| k.starts_with("GITHUB_") || k.starts_with("RUNNER_"));
+        if actions {
+            cmd.env_remove(&key);
+        }
+    }
+    cmd.env("GITHUB_ACTIONS", "true")
+        .env("GITHUB_STEP_SUMMARY", step_summary(ws));
+    let child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn heph");
+    wait_output(child, RUN_DEADLINE).expect("heph ran")
+}
+
+/// The `$GITHUB_STEP_SUMMARY` [`run_gh`] points the hook at.
+fn step_summary(ws: &Workspace) -> std::path::PathBuf {
+    ws.root().join("step-summary.md")
+}
+
+/// The driver of `addr`'s spec, from `heph inspect spec` (which does not build).
+fn spec_driver(ws: &Workspace, dist: &Dist, addr: &str) -> String {
+    let out = run_gh(ws, dist, &["inspect", "spec", addr]);
+    assert!(out.status.success(), "{addr}: {}", describe(&out));
+    let driver = serde_json::from_slice::<serde_json::Value>(&out.stdout)
+        .ok()
+        .and_then(|out| Some(out.get("spec")?.get("driver")?.as_str()?.to_string()));
+    assert!(
+        driver.is_some(),
+        "{addr}: no driver in the spec: {}",
+        describe(&out)
+    );
+    driver.unwrap_or_default()
+}
+
+/// The second shipped cdylib, exporting a hook, a function and drivers rather
+/// than a provider — different export kinds over the same seam, so a loader
+/// that only handles providers fails here and nowhere else.
+///
+/// `heph.gh.release_asset` is called across the seam and its declarations come
+/// back: `inspect spec` resolves the declared targets without building, so no
+/// network is needed. The `gh.extract` driver then runs across the seam on an
+/// archive built offline by the builtin coreutils' `tar`. Both with the hook
+/// enabled (`hook: {enable: true}`, when it writes the step summary at the end
+/// of the run) and without (when it writes nothing, though `GITHUB_ACTIONS`
+/// is `true`).
+#[test]
+fn shipped_gh_cdylib_loads() {
+    let dist = Dist::locate();
+    let ws = Workspace::new().expect("workspace");
     ws.write(
         "pkg/BUILD",
         "target(name = \"ok\", driver = \"bash\", run = \"echo e2e-ok\", cache = False)\n",
     )
     .expect("write BUILD");
+    ws.write(
+        "rel/BUILD",
+        r#"
+heph.gh.release_asset(
+    name = "tool",
+    repo = "o/r",
+    tag = "v1",
+    asset = "t.tar.gz",
+    extract = True,
+)
+"#,
+    )
+    .expect("write BUILD");
+    let marker = ws.root().join("hello.txt");
+    ws.write(
+        "ex/BUILD",
+        &format!(
+            r#"
+target(
+    name = "archive",
+    driver = "bash",
+    run = "mkdir -p d/bin && printf 'hello from the archive\n' > d/bin/hello && chmod +x d/bin/hello && tar -czf t.tar.gz -C d bin",
+    out = "t.tar.gz",
+)
 
-    // A query still resolving the workspace graph means the hook registered and
-    // the engine came up with it attached. Subtree selection needs `-e`: a bare
-    // positional argument is parsed strictly as an address.
-    let out = ws.run(&dist, &["query", "-e", "//pkg/..."]).expect("run");
-    assert!(out.status.success(), "{}", describe(&out));
-    assert!(
-        String::from_utf8_lossy(&out.stdout).contains("//pkg:ok"),
-        "{}",
-        describe(&out)
-    );
+target(
+    name = "unpacked",
+    driver = "gh.extract",
+    src = ":archive",
+    format = "tar.gz",
+)
+
+target(
+    name = "check",
+    driver = "bash",
+    deps = [":unpacked"],
+    run = "test -x unpacked/bin/hello && cat unpacked/bin/hello > {marker}",
+    out = [],
+    cache = False,
+)
+"#,
+            marker = marker.display()
+        ),
+    )
+    .expect("write BUILD");
+
+    for hook in [false, true] {
+        configure_gh(&ws, &dist, &gh_options("", hook));
+        // A query still resolving the workspace graph means the plugin (and,
+        // enabled, its hook) registered and the engine came up with it
+        // attached. Subtree selection needs `-e`: a bare positional argument
+        // is parsed strictly as an address.
+        let out = run_gh(&ws, &dist, &["query", "-e", "//pkg/..."]);
+        assert!(out.status.success(), "{}", describe(&out));
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("//pkg:ok"),
+            "{}",
+            describe(&out)
+        );
+
+        assert_eq!(
+            spec_driver(&ws, &dist, "//rel:tool"),
+            "gh.extract",
+            "hook={hook}"
+        );
+        assert_eq!(
+            spec_driver(&ws, &dist, "//rel:tool_archive"),
+            "http_fetch",
+            "hook={hook}"
+        );
+
+        for stale in [&marker, &step_summary(&ws)] {
+            if stale.exists() {
+                std::fs::remove_file(stale).expect("remove the previous run's file");
+            }
+        }
+        let out = run_gh(&ws, &dist, &["run", "//ex:check"]);
+        assert!(out.status.success(), "{}", describe(&out));
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap_or_default(),
+            "hello from the archive\n",
+            "hook={hook}: {}",
+            describe(&out)
+        );
+        // `hook.enable` alone decides whether the hook reports, across the
+        // seam: `GITHUB_ACTIONS=true` on its own builds none.
+        assert_eq!(
+            step_summary(&ws).is_file(),
+            hook,
+            "hook={hook}: {}",
+            describe(&out)
+        );
+    }
+}
+
+/// A misused `release_asset` call fails the command with the function's
+/// message, as an exit code: the error crosses the seam as a value, not as a
+/// panic that would abort the host.
+#[test]
+fn shipped_gh_cdylib_reports_a_misused_call() {
+    let dist = Dist::locate();
+    let ws = Workspace::new().expect("workspace");
+    ws.write(
+        "bad/BUILD",
+        r#"
+heph.gh.release_asset(
+    name = "tool",
+    repo = "o/r",
+    tag = "v1",
+    asset = "t.tar.gz",
+    extract = True,
+    executable = True,
+)
+"#,
+    )
+    .expect("write BUILD");
+
+    for hook in [false, true] {
+        configure_gh(&ws, &dist, &gh_options("", hook));
+        let out = run_gh(&ws, &dist, &["inspect", "spec", "//bad:tool"]);
+        assert!(
+            out.status.code().is_some(),
+            "heph died on a signal: {}",
+            describe(&out)
+        );
+        assert!(!out.status.success(), "{}", describe(&out));
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("`executable` marks a fetched file"),
+            "hook={hook}: {}",
+            describe(&out)
+        );
+    }
+}
+
+/// A bad plugin option does not abort the host at load: the log sink is not up
+/// when the cdylib is created, so an abort there would be a bare `SIGABRT`.
+/// The plugin loads, the build resolves, and the hook that stands in for the
+/// one that could not be configured logs the option as an unknown key once a
+/// build sends it an event. A
+/// `serverUrl` (the server is `release_asset`'s `server_url` argument, not an
+/// option), with the hook on and off, and a hook option left at the top level.
+/// `release_asset` reads no option, so it still declares its targets; a bad
+/// `server_url` argument fails that call, naming the argument.
+#[test]
+fn shipped_gh_cdylib_survives_a_bad_option() {
+    let dist = Dist::locate();
+    let ws = Workspace::new().expect("workspace");
+    ws.write(
+        "pkg/BUILD",
+        "target(name = \"ok\", driver = \"bash\", run = \"echo e2e-ok\", cache = False)\n",
+    )
+    .expect("write BUILD");
+    ws.write(
+        "rel/BUILD",
+        r#"
+heph.gh.release_asset(name = "tool", repo = "o/r", tag = "v1", asset = "t.tar.gz")
+"#,
+    )
+    .expect("write BUILD");
+    ws.write(
+        "badserver/BUILD",
+        r#"
+heph.gh.release_asset(
+    name = "tool",
+    repo = "o/r",
+    tag = "v1",
+    asset = "t.tar.gz",
+    server_url = "github.com",
+)
+"#,
+    )
+    .expect("write BUILD");
+
+    let server = "      serverUrl: \"https://ghe.example\"\n";
+    for (options, wants) in [
+        (gh_options(server, false), "unknown field `serverUrl`"),
+        (gh_options(server, true), "unknown field `serverUrl`"),
+        (
+            "      refreshSecs: 30\n".to_string(),
+            "unknown field `refreshSecs`",
+        ),
+    ] {
+        configure_gh(&ws, &dist, &options);
+        let out = run_gh(&ws, &dist, &["query", "-e", "//pkg/..."]);
+        assert!(
+            out.status.code().is_some(),
+            "heph died on a signal: {}",
+            describe(&out)
+        );
+        assert!(out.status.success(), "{}", describe(&out));
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("//pkg:ok"),
+            "{}",
+            describe(&out)
+        );
+
+        // The stand-in hook logs on the build's first event, so it is a build
+        // (not a query, which sends hooks none) that names the bad key.
+        let out = run_gh(&ws, &dist, &["run", "//pkg:ok"]);
+        assert!(
+            out.status.code().is_some(),
+            "heph died on a signal: {}",
+            describe(&out)
+        );
+        assert!(out.status.success(), "{}", describe(&out));
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(wants),
+            "{options}: {}",
+            describe(&out)
+        );
+
+        assert_eq!(
+            spec_driver(&ws, &dist, "//rel:tool"),
+            "http_fetch",
+            "{options}"
+        );
+
+        let out = run_gh(&ws, &dist, &["inspect", "spec", "//badserver:tool"]);
+        assert!(
+            out.status.code().is_some(),
+            "heph died on a signal: {}",
+            describe(&out)
+        );
+        assert!(!out.status.success(), "{}", describe(&out));
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("`server_url` \"github.com\""),
+            "{options}: {}",
+            describe(&out)
+        );
+    }
 }
 
 /// The spawn-at-the-seam host mirror, across a REAL cdylib: the go provider's
