@@ -850,6 +850,53 @@ fn an_owner_waits_on_a_locked_catalog_only_until_its_bound() {
     );
 }
 
+/// The `sessions` rows `catalog.db` holds on its own, without its WAL:
+/// what a checkpoint folded in. Read from a copy, so the live catalog's WAL
+/// is not checkpointed by the read.
+fn folded_sessions(root: &Path) -> Vec<(String, i64)> {
+    let copy = tempfile::tempdir().expect("tempdir");
+    std::fs::copy(root.join(catalog::FILE), copy.path().join(catalog::FILE)).expect("copy");
+    let conn = Connection::open(copy.path().join(catalog::FILE)).expect("open the copy");
+    let Ok(mut stmt) =
+        conn.prepare("SELECT session_id, complete FROM sessions ORDER BY session_id")
+    else {
+        return Vec::new();
+    };
+    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .expect("query")
+        .collect::<rusqlite::Result<_>>()
+        .expect("rows")
+}
+
+/// Owners never checkpoint on the exit path, so the WAL would grow with
+/// every session; the next session's start thread folds it in. The seal's
+/// rows are in `catalog.db` itself after the next start, not only in the
+/// WAL.
+#[test]
+fn the_wal_folds_in_at_the_next_sessions_start() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    let first = sealed(root, recent_id(1, 2_000));
+    catalog::record_start(root, &first);
+    catalog::record_seal(root, &first, true);
+    let first_id = first.file_name().and_then(|n| n.to_str()).expect("id");
+    assert!(
+        !folded_sessions(root)
+            .iter()
+            .any(|(id, complete)| id == first_id && *complete == 1),
+        "the seal's rows are in the WAL only"
+    );
+
+    let next = sealed(root, recent_id(2, 1_000));
+    catalog::record_start(root, &next);
+    let next_id = next.file_name().and_then(|n| n.to_str()).expect("id");
+    assert_eq!(
+        folded_sessions(root),
+        [(first_id.to_owned(), 1), (next_id.to_owned(), 0)],
+        "the seal and the new start row, folded into catalog.db"
+    );
+}
+
 /// `a_build_never_repairs` (I1): a run with a missing catalog and a
 /// recording of an older derivation writes only its own rows and
 /// re-derives nothing.

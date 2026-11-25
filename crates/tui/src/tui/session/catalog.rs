@@ -22,6 +22,7 @@ use std::fs::{DirBuilder, File};
 use std::io;
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
@@ -528,7 +529,8 @@ fn owner_write(root: &Path, dir: &Path, copy: Rows, limits: OwnerLimits) {
 ///   deadline rather than after a fixed timeout;
 /// - its commit, by `synchronous=NORMAL` (no fsync on a WAL commit; the
 ///   catalog is rebuildable, I8), no auto-checkpoint, and no checkpoint when
-///   it closes: a command's connection or the next cleanup checkpoints.
+///   it closes: the next session's start ([`fold_wal`]), a command's
+///   connection or the next cleanup checkpoints.
 fn bound_owner(conn: &mut Connection, deadline: Instant) -> rusqlite::Result<()> {
     conn.progress_handler(1000, Some(move || Instant::now() >= deadline))?;
     conn.busy_handler(Some(move |_tries: i32| {
@@ -580,9 +582,49 @@ fn try_owner_write(
     let rec = dir.join(store::FILE);
     copy_session(&conn, &rec, copy)
         .with_context(|| format!("copying {} into the catalog", rec.display()))?;
+    if copy == Rows::Start
+        && let Err(e) = fold_wal(&conn, deadline)
+    {
+        tracing::debug!(
+            root = %root.display(),
+            error = %e,
+            "the session catalog's WAL was not folded in"
+        );
+    }
     drop(conn);
     drop(lock);
     Ok(true)
+}
+
+/// Fold the catalog's WAL in at a session's start, so the WAL the owners
+/// leave unchecked ([`bound_owner`]) stays about one session's writes long.
+/// A passive checkpoint waits on no reader or writer; past `deadline`, it is
+/// interrupted. Only the start thread runs it, off the build path: the
+/// seal's exit path never checkpoints.
+fn fold_wal(conn: &Connection, deadline: Instant) -> rusqlite::Result<()> {
+    let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+        return Ok(());
+    };
+    // The progress handler is not called inside the checkpoint's one VM
+    // step; an interrupt is, between the pages it copies.
+    let interrupt = conn.get_interrupt_handle();
+    let (done, wait) = mpsc::channel::<()>();
+    std::thread::scope(|s| {
+        let watchdog = std::thread::Builder::new()
+            .name("heph-session-catalog-fold".to_owned())
+            .spawn_scoped(s, move || {
+                if wait.recv_timeout(left) == Err(RecvTimeoutError::Timeout) {
+                    interrupt.interrupt();
+                }
+            });
+        if let Err(e) = watchdog {
+            tracing::debug!(error = %e, "cannot bound the catalog's WAL fold: skipped");
+            return Ok(());
+        }
+        let folded = conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()));
+        drop(done);
+        folded
+    })
 }
 
 // -------------------------------------------------------------- command
