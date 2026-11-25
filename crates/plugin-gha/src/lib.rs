@@ -21,9 +21,17 @@
 //!   `GITHUB_TOKEN`, and (unlike a check run) never nests under another workflow's
 //!   check suite. One comment per job, reused across runs (found by a hidden marker)
 //!   so it's never spammed; within it each heph command (each step) keeps its own
-//!   section, so a job's earlier steps' results are preserved, not overwritten. The
-//!   comment also records the workflow run id, so a *new* run's first step resets
-//!   the body instead of stacking its sections on the previous build's.
+//!   section, so a job's earlier steps' results are preserved, not overwritten.
+//!   The comment has one block for the PR's own CI and one for its merge-queue
+//!   run (`merge_group`, whose PR is read from the `gh-readonly-queue` ref), in
+//!   that order, each under a heading naming what it tested and the run that
+//!   wrote it. Each block records that run, so a *new* run's first step resets
+//!   only its own block instead of stacking its sections on the previous
+//!   build's — a merge-queue re-run keeps the PR's CI block, and a PR re-run
+//!   keeps the merge-queue block. The two can run at once, so every write
+//!   re-reads the comment first (a conditional `GET`, free when nothing
+//!   changed) and carries the other block as it is then; only a write by the
+//!   other run landing within that one round trip can be overwritten.
 //! - **At the end**: the final report is appended once to `$GITHUB_STEP_SUMMARY`.
 //!
 //! The aggregation is intentionally self-contained rather than reusing the TUI's
@@ -236,35 +244,207 @@ fn gh_headers(token: &str) -> reqwest::header::HeaderMap {
     h
 }
 
-/// The PR number for the current event, or `None` outside a PR. Prefers the event
-/// payload's `pull_request.number`, falling back to `GITHUB_REF`
-/// (`refs/pull/<N>/merge`).
-fn pr_number() -> Option<u64> {
-    if let Some(path) = std::env::var("GITHUB_EVENT_PATH")
-        .ok()
-        .filter(|s| !s.is_empty())
-        && let Ok(bytes) = std::fs::read(path)
-        && let Some(n) = pr_number_from_json(&bytes)
-    {
-        return Some(n);
-    }
-    pr_number_from_ref(&std::env::var("GITHUB_REF").unwrap_or_default())
+/// Which kind of workflow run this process belongs to.
+///
+/// A PR's comment keeps one block per kind, each with its own run marker, so a
+/// re-run of the PR's CI never wipes what the merge queue reported and a re-run
+/// of the merge queue never wipes the PR's CI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunKind {
+    /// A run for the PR itself (`pull_request`, `pull_request_target`, …).
+    PullRequest,
+    /// A merge-queue run (`merge_group`) for the group this PR heads.
+    MergeQueue,
 }
 
-/// Extract `pull_request.number` from raw event-payload JSON. Pure (testable).
-fn pr_number_from_json(bytes: &[u8]) -> Option<u64> {
-    let json: serde_json::Value = serde_json::from_slice(bytes).ok()?;
-    json.get("pull_request")?.get("number")?.as_u64()
+impl RunKind {
+    /// Display order in the comment: the PR's own CI, then the merge queue.
+    const ALL: [Self; 2] = [Self::PullRequest, Self::MergeQueue];
+
+    /// The id in the hidden group delimiters.
+    fn marker_id(self) -> &'static str {
+        match self {
+            Self::PullRequest => "pr",
+            Self::MergeQueue => "merge-queue",
+        }
+    }
+
+    /// The visible heading of the block.
+    fn heading(self) -> &'static str {
+        match self {
+            Self::PullRequest => "Pull request CI",
+            Self::MergeQueue => "Merge queue",
+        }
+    }
+}
+
+/// What a block's run tested, shown in its heading: the merge-queue group's base
+/// branch and commit, or the PR's head commit. Either part may be empty.
+///
+/// Carried in the block's hidden [`tested_marker`], never read back from the
+/// visible heading, because every write regenerates the heading from what the
+/// block carries — including the other kind's block, which this process did
+/// not write.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Tested {
+    /// The branch the group merges into; empty for a PR run.
+    base: String,
+    /// A short commit sha: the merge group's head commit (what the queue run
+    /// checks out and tests), or the PR's head.
+    sha: String,
+}
+
+/// Length of the short sha kept in [`Tested`]. GitHub links a bare sha of 7 or
+/// more hex characters to its commit.
+const SHORT_SHA: usize = 12;
+
+impl Tested {
+    /// The short form of `sha` when it is a hex commit id, else empty: the value
+    /// lands in a hidden marker and in a public heading, so anything that is
+    /// not plainly a sha is dropped.
+    fn short_sha(sha: &str) -> String {
+        if sha.len() < 7 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return String::new();
+        }
+        sha.chars().take(SHORT_SHA).collect()
+    }
+
+    /// `base` when it is a plain branch name, else empty. A git ref may hold
+    /// `<`, `>` and `` ` ``, which could close the hidden marker or the code
+    /// span it is shown in; `@` separates it from the sha in the marker.
+    fn clean_base(base: &str) -> String {
+        const MAX_BASE: usize = 100;
+        let plain = !base.is_empty()
+            && base.len() <= MAX_BASE
+            && base
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '+'));
+        if plain {
+            base.to_string()
+        } else {
+            String::new()
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.base.is_empty() && self.sha.is_empty()
+    }
+}
+
+/// The PR this process reports on, the kind of run it is, and what it tested.
+#[derive(Debug, PartialEq, Eq)]
+struct PrTarget {
+    pr: u64,
+    kind: RunKind,
+    tested: Tested,
+}
+
+/// The PR the current event reports on; `None` outside a PR or a merge queue.
+fn pr_target() -> Option<PrTarget> {
+    let payload = std::env::var("GITHUB_EVENT_PATH")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .and_then(|path| std::fs::read(path).ok());
+    let env = |name| std::env::var(name).unwrap_or_default();
+    pr_target_from(
+        payload.as_deref(),
+        &env("GITHUB_REF"),
+        &env("GITHUB_EVENT_NAME"),
+        &env("GITHUB_SHA"),
+    )
+}
+
+/// [`pr_target`] over a raw event payload, `GITHUB_REF`, `GITHUB_EVENT_NAME`
+/// and `GITHUB_SHA`. Pure (testable).
+///
+/// A merge-queue run is one whose event is `merge_group` (the payload has a
+/// `merge_group`, or the event name says so). Only then is its queue ref
+/// trusted — the payload's `merge_group.head_ref`, else `GITHUB_REF` — to name
+/// the PR the group was created for: a `push` to a `gh-readonly-queue/*` branch
+/// is neither a merge-queue run nor a PR run. What it tested is the payload's
+/// `merge_group.head_sha` (else `GITHUB_SHA`, the same commit on a
+/// `merge_group` event) on `merge_group.base_ref` (else the queue ref's base).
+/// Otherwise the payload's `pull_request.number`, falling back to a
+/// `refs/pull/<N>/merge` ref.
+fn pr_target_from(
+    payload: Option<&[u8]>,
+    git_ref: &str,
+    event_name: &str,
+    github_sha: &str,
+) -> Option<PrTarget> {
+    let json = payload.and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok());
+    let merge_group = json.as_ref().and_then(|j| j.get("merge_group"));
+    if merge_group.is_some() || event_name == "merge_group" {
+        let field = |name: &str| merge_group.and_then(|g| g.get(name)?.as_str());
+        let q = field("head_ref")
+            .and_then(parse_queue_ref)
+            .or_else(|| parse_queue_ref(git_ref))?;
+        let base = field("base_ref")
+            .map(|b| b.strip_prefix("refs/heads/").unwrap_or(b))
+            .unwrap_or(q.base);
+        return Some(PrTarget {
+            pr: q.pr,
+            kind: RunKind::MergeQueue,
+            tested: Tested {
+                base: Tested::clean_base(base),
+                sha: Tested::short_sha(field("head_sha").unwrap_or(github_sha)),
+            },
+        });
+    }
+    let pull_request = json.as_ref().and_then(|j| j.get("pull_request"));
+    let pr = pull_request
+        .and_then(|p| p.get("number")?.as_u64())
+        .or_else(|| pr_number_from_ref(git_ref))?;
+    let head_sha = pull_request
+        .and_then(|p| p.get("head")?.get("sha")?.as_str())
+        .map(Tested::short_sha)
+        .unwrap_or_default();
+    Some(PrTarget {
+        pr,
+        kind: RunKind::PullRequest,
+        tested: Tested {
+            base: String::new(),
+            sha: head_sha,
+        },
+    })
+}
+
+/// A merge-queue ref, split.
+#[derive(Debug)]
+struct QueueRef<'a> {
+    base: &'a str,
+    pr: u64,
+}
+
+/// Parse a merge-queue ref, `refs/heads/gh-readonly-queue/<base>/pr-<N>-<sha>`.
+/// The base branch may itself contain slashes, so the PR is read from the last
+/// segment. The trailing sha is not the commit the group tests, and is not
+/// read. Pure.
+fn parse_queue_ref(git_ref: &str) -> Option<QueueRef<'_>> {
+    let rest = git_ref
+        .strip_prefix("refs/heads/")
+        .unwrap_or(git_ref)
+        .strip_prefix("gh-readonly-queue/")?;
+    let (base, leaf) = rest.rsplit_once('/')?;
+    let pr_sha = leaf.strip_prefix("pr-")?;
+    let digits = pr_sha.split_once('-').map_or(pr_sha, |(d, _)| d);
+    Some(QueueRef {
+        base,
+        pr: parse_pr_number(digits)?,
+    })
+}
+
+/// A PR number: ASCII digits only. `u64::from_str` also takes a leading `+`.
+fn parse_pr_number(digits: &str) -> Option<u64> {
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 /// Parse the PR number out of a `refs/pull/<N>/merge` (or `/head`) ref. Pure.
 fn pr_number_from_ref(git_ref: &str) -> Option<u64> {
-    git_ref
-        .strip_prefix("refs/pull/")?
-        .split('/')
-        .next()?
-        .parse()
-        .ok()
+    parse_pr_number(git_ref.strip_prefix("refs/pull/")?.split('/').next()?)
 }
 
 /// Hidden delimiters wrapping one heph command's section inside the shared
@@ -285,45 +465,31 @@ fn run_marker(run_id: &str) -> String {
     format!("<!-- heph-gha-run:{run_id} -->")
 }
 
-/// Extract the run id from a comment body's [`run_marker`], or `None` if absent
-/// (e.g. a comment written before this marker existed). Pure (testable).
-fn parse_run_id(body: &str) -> Option<String> {
-    const OPEN: &str = "<!-- heph-gha-run:";
-    let after = body.find(OPEN).and_then(|i| body.get(i + OPEN.len()..))?;
-    let end = after.find(" -->")?;
-    after.get(..end).map(str::to_string)
+/// Hidden marker carrying a block's [`Tested`], so the heading can be
+/// regenerated from the block alone. `@` cannot occur in either part.
+fn tested_marker(tested: &Tested) -> String {
+    format!("<!-- heph-gha-tested:{}@{} -->", tested.base, tested.sha)
 }
 
-/// Parse the ordered `(key, content)` sections out of a comment body. Tolerant:
-/// anything outside a well-formed open/close pair is ignored.
+/// Every section of every block, in body order. Test shorthand.
+#[cfg(test)]
 fn parse_sections(body: &str) -> Vec<(String, String)> {
-    const OPEN: &str = "<!-- heph-gha-step:";
-    let mut out = Vec::new();
-    let mut rest = body;
-    // `.get(..)` (not `s[..]` slicing) throughout to satisfy the string-slice lint
-    // and stay panic-free on any malformed body.
-    while let Some(i) = rest.find(OPEN) {
-        let Some(after) = rest.get(i + OPEN.len()..) else {
-            break;
-        };
-        let Some(j) = after.find(" -->") else { break };
-        let (Some(key), Some(content_start)) = (after.get(..j), after.get(j + " -->".len()..))
-        else {
-            break;
-        };
-        let close = section_close(key);
-        let Some(k) = content_start.find(&close) else {
-            break;
-        };
-        let (Some(content), Some(next)) =
-            (content_start.get(..k), content_start.get(k + close.len()..))
-        else {
-            break;
-        };
-        out.push((key.to_string(), content.trim_matches('\n').to_string()));
-        rest = next;
-    }
-    out
+    let groups = parse_groups(body);
+    RunKind::ALL
+        .into_iter()
+        .filter_map(|k| groups.get(k))
+        .flat_map(|g| g.sections.iter().cloned())
+        .collect()
+}
+
+/// The run id of the first block. Test shorthand.
+#[cfg(test)]
+fn parse_run_id(body: &str) -> Option<String> {
+    let groups = parse_groups(body);
+    RunKind::ALL
+        .into_iter()
+        .find_map(|k| groups.get(k))
+        .map(|g| g.run_id.clone())
 }
 
 /// Replace the section named `key` in place, or append it if new (preserving the
@@ -336,20 +502,267 @@ fn upsert_section(sections: &mut Vec<(String, String)>, key: &str, content: &str
     }
 }
 
+/// Hidden delimiters wrapping one [`RunKind`]'s block of the comment.
+fn group_open(kind: RunKind) -> String {
+    format!("<!-- heph-gha-group:{} -->", kind.marker_id())
+}
+fn group_close(kind: RunKind) -> String {
+    format!("<!-- /heph-gha-group:{} -->", kind.marker_id())
+}
+
+/// One [`RunKind`]'s block: the run that last wrote it, what that run tested,
+/// and its sections.
+#[derive(Debug, PartialEq, Eq)]
+struct Group {
+    run_id: String,
+    tested: Tested,
+    sections: Vec<(String, String)>,
+}
+
+impl Group {
+    fn empty() -> Self {
+        Self {
+            run_id: String::new(),
+            tested: Tested::default(),
+            sections: Vec::new(),
+        }
+    }
+}
+
+/// Every block of the comment, by kind.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Groups {
+    pull_request: Option<Group>,
+    merge_queue: Option<Group>,
+}
+
+impl Groups {
+    fn get(&self, kind: RunKind) -> Option<&Group> {
+        match kind {
+            RunKind::PullRequest => self.pull_request.as_ref(),
+            RunKind::MergeQueue => self.merge_queue.as_ref(),
+        }
+    }
+
+    fn slot(&mut self, kind: RunKind) -> &mut Option<Group> {
+        match kind {
+            RunKind::PullRequest => &mut self.pull_request,
+            RunKind::MergeQueue => &mut self.merge_queue,
+        }
+    }
+}
+
+/// A run id read back from a body: `<run>-<attempt>`, both ASCII digits, else
+/// empty — an unknown run, which a run of the same kind resets. The id is
+/// echoed into the public heading, and the body is editable by anyone with
+/// write access to the PR.
+fn clean_run_id(run: &str) -> String {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    match run.split_once('-') {
+        Some((r, a)) if digits(r) && digits(a) => run.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// One hidden marker of the body, as [`parse_groups`] reads it.
+enum Marker<'a> {
+    GroupOpen(RunKind),
+    GroupClose(RunKind),
+    Run(&'a str),
+    Tested(&'a str),
+    /// A section's open tag, by key.
+    Step(&'a str),
+    /// Any other comment (the container marker, a section's close tag outside
+    /// its section).
+    Other,
+}
+
+impl<'a> Marker<'a> {
+    /// Classify the inside of `<!-- … -->`.
+    fn classify(inner: &'a str) -> Self {
+        let kind = |id: &str| RunKind::ALL.into_iter().find(|k| k.marker_id() == id);
+        if let Some(k) = inner.strip_prefix("heph-gha-group:").and_then(kind) {
+            Self::GroupOpen(k)
+        } else if let Some(k) = inner.strip_prefix("/heph-gha-group:").and_then(kind) {
+            Self::GroupClose(k)
+        } else if let Some(run) = inner.strip_prefix("heph-gha-run:") {
+            Self::Run(run)
+        } else if let Some(tested) = inner.strip_prefix("heph-gha-tested:") {
+            Self::Tested(tested)
+        } else if let Some(key) = inner.strip_prefix("heph-gha-step:") {
+            Self::Step(key)
+        } else {
+            Self::Other
+        }
+    }
+}
+
+/// Parse the blocks out of a comment body, in one pass. Tolerant: a malformed
+/// body yields what parsed before the damage, never a panic.
+///
+/// Group and run markers are recognised **only at the top level**. A section is
+/// skipped as a unit, from its open tag to its own close tag (which carries the
+/// section's hashed key, so it is unambiguous), because its content embeds raw
+/// log tails: a target printing `<!-- /heph-gha-group:pr -->` must not move a
+/// block's boundary. A section with no close tag ends its block, and reading
+/// resumes at the next open of the other kind's block, if any.
+///
+/// The limit: a section whose content holds its **own** close tag ends there,
+/// and the rest of its content is read as top level. The tag carries a hash of
+/// the command, so a target would have to print exactly that; log tails are
+/// not escaped.
+///
+/// A group open with no close ends at the next top-level group open, or at the
+/// end of the body. When a kind's block appears twice, the **first** wins. A
+/// run marker that is not `<run>-<attempt>` reads as no run.
+///
+/// A body with no group delimiters predates them: it is one run's sections under
+/// a single run marker, and only PR runs ever wrote one (a merge-queue run found
+/// no PR number), so it is read as the PR block.
+fn parse_groups(body: &str) -> Groups {
+    const OPEN: &str = "<!-- ";
+    const CLOSE: &str = " -->";
+    let mut groups = Groups::default();
+    // Top-level markers before any group delimiter: a legacy body.
+    let mut legacy = Group::empty();
+    let mut delimited = false;
+    // The block being read.
+    let mut current: Option<(RunKind, Group)> = None;
+    // Close the block being read; a kind already read keeps its first block.
+    fn finish(groups: &mut Groups, current: &mut Option<(RunKind, Group)>) {
+        if let Some((kind, g)) = current.take() {
+            groups.slot(kind).get_or_insert(g);
+        }
+    }
+    let mut rest = body;
+    // `.get(..)` (not `s[..]` slicing) throughout to satisfy the string-slice lint
+    // and stay panic-free on any malformed body.
+    while let Some(i) = rest.find(OPEN) {
+        let Some(after) = rest.get(i + OPEN.len()..) else {
+            break;
+        };
+        let Some(j) = after.find(CLOSE) else { break };
+        let (Some(inner), Some(next)) = (after.get(..j), after.get(j + CLOSE.len()..)) else {
+            break;
+        };
+        rest = next;
+        let target = match current.as_mut() {
+            Some((_, g)) => g,
+            None => &mut legacy,
+        };
+        match Marker::classify(inner) {
+            Marker::GroupOpen(kind) => {
+                finish(&mut groups, &mut current);
+                delimited = true;
+                current = Some((kind, Group::empty()));
+            }
+            Marker::GroupClose(kind) => {
+                if current.as_ref().is_some_and(|(k, _)| *k == kind) {
+                    finish(&mut groups, &mut current);
+                }
+            }
+            Marker::Run(run) => {
+                if target.run_id.is_empty() {
+                    target.run_id = clean_run_id(run);
+                }
+            }
+            Marker::Tested(tested) => {
+                let (base, sha) = tested.rsplit_once('@').unwrap_or(("", tested));
+                target.tested = Tested {
+                    base: Tested::clean_base(base),
+                    sha: Tested::short_sha(sha),
+                };
+            }
+            Marker::Step(key) => {
+                let close = section_close(key);
+                let section = rest
+                    .find(&close)
+                    .and_then(|k| Some((rest.get(..k)?, rest.get(k + close.len()..)?)));
+                let Some((content, next)) = section else {
+                    // Unclosed: where its content ends is unknown. It ends its
+                    // block; a later block of another kind is still read.
+                    let Some((kind, _)) = &current else { break };
+                    let other = group_open(match kind {
+                        RunKind::PullRequest => RunKind::MergeQueue,
+                        RunKind::MergeQueue => RunKind::PullRequest,
+                    });
+                    finish(&mut groups, &mut current);
+                    let Some(resume) = rest.find(&other).and_then(|k| rest.get(k..)) else {
+                        break;
+                    };
+                    rest = resume;
+                    continue;
+                };
+                target
+                    .sections
+                    .push((key.to_string(), content.trim_matches('\n').to_string()));
+                rest = next;
+            }
+            Marker::Other => {}
+        }
+    }
+    finish(&mut groups, &mut current);
+    if !delimited && !legacy.sections.is_empty() {
+        groups.pull_request = Some(legacy);
+    }
+    groups
+}
+
+/// The visible heading of a block: what its run tested, and a link to the run
+/// (and attempt) that wrote it.
+///
+/// `run_id` is `<run>-<attempt>` ([`CommentClient::from_env`]); `repo_url` is
+/// `<server>/<owner>/<repo>`, empty for no link. The sha is bare so GitHub
+/// links it to its commit; the base branch is a code span.
+fn group_heading(kind: RunKind, g: &Group, repo_url: &str) -> String {
+    let mut h = format!("# {}", kind.heading());
+    if !g.tested.base.is_empty() {
+        h.push_str(&format!(" · `{}`", g.tested.base));
+    }
+    if !g.tested.sha.is_empty() {
+        h.push_str(&format!(" · {}", g.tested.sha));
+    }
+    if let Some((run, attempt)) = g.run_id.rsplit_once('-')
+        && !repo_url.is_empty()
+        && !run.is_empty()
+        && !attempt.is_empty()
+    {
+        h.push_str(&format!(
+            " · [run {run}, attempt {attempt}]({repo_url}/actions/runs/{run}/attempts/{attempt})"
+        ));
+    }
+    h
+}
+
 /// Serialize the comment body: the container marker (used to find the comment),
-/// the run marker (used to detect a new run on adopt), then each section wrapped
-/// in its hidden delimiters.
-fn assemble_body(container_marker: &str, run_id: &str, sections: &[(String, String)]) -> String {
+/// then each kind's block in [`RunKind::ALL`] order — its delimiters, its run
+/// marker (used to detect a new run of that kind on adopt), its tested marker
+/// (when it has one), its heading, and each section wrapped in its hidden
+/// delimiters.
+fn assemble_body(container_marker: &str, repo_url: &str, groups: &Groups) -> String {
     let mut s = String::from(container_marker);
     s.push('\n');
-    s.push_str(&run_marker(run_id));
-    s.push('\n');
-    for (key, content) in sections {
-        s.push_str(&format!(
-            "{}\n{content}\n{}\n\n",
-            section_open(key),
-            section_close(key)
-        ));
+    for kind in RunKind::ALL {
+        let Some(g) = groups.get(kind) else { continue };
+        s.push_str(&group_open(kind));
+        s.push('\n');
+        s.push_str(&run_marker(&g.run_id));
+        s.push('\n');
+        if !g.tested.is_empty() {
+            s.push_str(&tested_marker(&g.tested));
+            s.push('\n');
+        }
+        s.push_str(&group_heading(kind, g, repo_url));
+        s.push_str("\n\n");
+        for (key, content) in &g.sections {
+            s.push_str(&format!(
+                "{}\n{content}\n{}\n\n",
+                section_open(key),
+                section_close(key)
+            ));
+        }
+        s.push_str(&group_close(kind));
+        s.push_str("\n\n");
     }
     s.trim_end().to_string()
 }
@@ -362,8 +775,13 @@ struct CommentState {
     loaded: bool,
     /// The comment id once found or created.
     id: Option<u64>,
-    /// All sections currently in the comment, including this process's.
-    sections: Vec<(String, String)>,
+    /// Every block currently in the comment, including this process's.
+    groups: Groups,
+    /// The `ETag` of our last response for the comment — the write's, or the
+    /// last re-read that returned a body. A re-read sends it as
+    /// `If-None-Match`, so an unchanged comment costs a `304`, which GitHub
+    /// does not count against the primary rate limit. `None` → a plain `GET`.
+    etag: Option<String>,
 }
 
 /// Live updates to a **sticky PR comment**. Unlike a check run, an issue comment is
@@ -397,26 +815,42 @@ struct CommentConfig {
     token: String,
     /// The PR to comment on.
     pr: u64,
+    /// Whether this is the PR's own CI or its merge-queue run: picks the block
+    /// of the comment this process owns.
+    kind: RunKind,
+    /// What this run tests, for its block's heading.
+    tested: Tested,
+    /// `<server>/<owner>/<repo>`, to link each block's run from its heading;
+    /// empty for no link.
+    repo_url: String,
     /// Scopes the comment — one per job leg.
     job_key: String,
     /// Identifies the current workflow run (run id + attempt). When an adopted
-    /// comment carries a different run, its sections are from a prior build and
-    /// are reset. Empty outside Actions (local runs keep reusing the comment).
+    /// comment's block for [`Self::kind`] carries a different run, its sections
+    /// are from a prior build and are reset; the other kind's block is kept.
+    /// Empty outside Actions (local runs keep reusing the comment).
     run_id: String,
     /// This process's section key within that comment.
     section_key: String,
     /// Per-request timeout. Explicit rather than reqwest's 30s default, because
-    /// `on_close` runs inside the host's drain barrier before process exit.
+    /// `on_close` runs inside the host's drain barrier before process exit. A
+    /// sync with a deadline lowers it to what is left of the deadline.
     timeout: Duration,
 }
 
-/// Total budget for the close-time sync.
+/// Budget for the close-time sync, counted from when it holds the comment
+/// lock; the write gets at least [`WRITE_FLOOR`] on top.
 ///
 /// `fetch_existing` can walk several pages, and the host awaits `Hook::drain`
 /// before exiting — so without a ceiling a slow or hanging GitHub API adds
 /// minutes to `heph`'s exit. The comment is best-effort; the step summary is the
 /// durable artifact, and it is written whether or not this succeeds.
 const CLOSE_SYNC_BUDGET: Duration = Duration::from_secs(10);
+
+/// The least a write is given, however much of the sync's budget the reads
+/// used: the write carries the closed render, and skipping it leaves the
+/// comment showing a finished build as running.
+const WRITE_FLOOR: Duration = Duration::from_secs(2);
 
 /// Per-request timeout for live updates.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -441,7 +875,12 @@ impl CommentClient {
             .unwrap_or_else(|| "GITHUB_TOKEN".to_string());
         let token = std::env::var(&token_var).ok().and_then(nonempty)?;
         let repo = std::env::var("GITHUB_REPOSITORY").ok().and_then(nonempty)?;
-        let pr = pr_number()?;
+        let PrTarget { pr, kind, tested } = pr_target()?;
+        let server = std::env::var("GITHUB_SERVER_URL")
+            .ok()
+            .and_then(nonempty)
+            .unwrap_or_else(|| "https://github.com".to_string());
+        let repo_url = format!("{}/{repo}", server.trim_end_matches('/'));
         let api_url = std::env::var("GITHUB_API_URL")
             .ok()
             .and_then(nonempty)
@@ -460,6 +899,9 @@ impl CommentClient {
             repo,
             token,
             pr,
+            kind,
+            tested,
+            repo_url,
             job_key: job_key.to_string(),
             run_id,
             section_key: section_key.to_string(),
@@ -476,6 +918,28 @@ impl CommentClient {
         })
     }
 
+    /// The timeout for the next request: the per-request timeout, lowered to
+    /// what is left of `deadline`. `None` once the deadline has passed.
+    ///
+    /// Checking the deadline before a request is not enough: the request then
+    /// runs for the whole per-request timeout, so a close-time sync of a re-read
+    /// and a write could take twice the budget.
+    fn request_timeout(&self, deadline: Option<Instant>) -> Option<Duration> {
+        let Some(d) = deadline else {
+            return Some(self.cfg.timeout);
+        };
+        let left = d.checked_duration_since(Instant::now())?;
+        (!left.is_zero()).then(|| left.min(self.cfg.timeout))
+    }
+
+    /// The URL of comment `cid`.
+    fn comment_url(&self, cid: u64) -> String {
+        format!(
+            "{}/repos/{}/issues/comments/{cid}",
+            self.cfg.api_url, self.cfg.repo
+        )
+    }
+
     /// Find this job's comment (by `container_marker`), returning its id + body.
     /// Pages through the PR's comments, capped to bound work.
     fn fetch_existing(&self, deadline: Option<Instant>) -> Option<(u64, String)> {
@@ -483,10 +947,10 @@ impl CommentClient {
         for page in 1..=MAX_PAGES {
             // The host awaits `Hook::drain` before process exit, so an unbounded
             // page walk here adds its latency straight onto `heph`'s exit.
-            if deadline.is_some_and(|d| Instant::now() >= d) {
+            let Some(timeout) = self.request_timeout(deadline) else {
                 tracing::warn!("listing PR comments hit the deadline; giving up");
                 return None;
-            }
+            };
             let resp = self
                 .http()
                 .get(format!(
@@ -494,6 +958,7 @@ impl CommentClient {
                     self.cfg.api_url, self.cfg.repo, self.cfg.pr
                 ))
                 .headers(gh_headers(&self.cfg.token))
+                .timeout(timeout)
                 .send()
                 .and_then(|r| r.error_for_status())
                 .and_then(|r| r.json::<Vec<serde_json::Value>>());
@@ -525,6 +990,80 @@ impl CommentClient {
         None
     }
 
+    /// Bring the other kinds' blocks in `st` up to date before a write.
+    ///
+    /// A conditional `GET` of the comment by id, with `If-None-Match` set to
+    /// the `ETag` of our last response for it:
+    ///
+    /// - `304`: nobody wrote since — the blocks in memory are current;
+    /// - `200`: take every *other* kind's block from the body (never our own,
+    ///   which only this process writes) and keep its `ETag`;
+    /// - anything else (an error, a timeout, a deleted comment): keep what we
+    ///   have and warn; the write still goes ahead.
+    ///
+    /// The re-read gets at most half of what is left of `deadline`, so a
+    /// hanging `GET` leaves the write its turn.
+    fn refresh_others(&self, st: &mut CommentState, cid: u64, deadline: Option<Instant>) {
+        let Some(timeout) = self.request_timeout(deadline) else {
+            tracing::warn!("no time left to re-read the status comment; writing what we have");
+            return;
+        };
+        let timeout = if deadline.is_some() {
+            timeout / 2
+        } else {
+            timeout
+        };
+        let mut req = self
+            .http()
+            .get(self.comment_url(cid))
+            .headers(gh_headers(&self.cfg.token))
+            .timeout(timeout);
+        if let Some(etag) = &st.etag {
+            req = req.header(reqwest::header::IF_NONE_MATCH, etag);
+        }
+        let resp = match req.send().and_then(|r| r.error_for_status()) {
+            Ok(r) if r.status() == reqwest::StatusCode::NOT_MODIFIED => return,
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("re-reading the status comment failed: {e}");
+                return;
+            }
+        };
+        let etag = response_etag(&resp);
+        let body = match resp.json::<serde_json::Value>() {
+            Ok(c) => c
+                .get("body")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            Err(e) => {
+                tracing::warn!("re-reading the status comment failed: {e}");
+                return;
+            }
+        };
+        let Some(body) = body else {
+            tracing::warn!("re-read status comment has no body; writing what we have");
+            return;
+        };
+        let mut fresh = parse_groups(&body);
+        let mut unchanged = true;
+        for other in RunKind::ALL.into_iter().filter(|k| *k != self.cfg.kind) {
+            let theirs = fresh.slot(other).take();
+            unchanged &= *st.groups.slot(other) == theirs;
+            *st.groups.slot(other) = theirs;
+        }
+        // The 304 saving rests on our write's `ETag` matching what a `GET` of
+        // the same body returns, which only a real run can show.
+        if unchanged && st.etag.is_some() {
+            tracing::debug!(
+                sent = st.etag.as_deref(),
+                got = etag.as_deref(),
+                "conditional re-read of the status comment returned 200 with the other \
+                 blocks unchanged; the write's ETag likely does not match the GET's"
+            );
+        }
+        st.etag = etag;
+    }
+
     /// Upsert this process's section and write the merged comment.
     ///
     /// `render` is called **under the comment lock**, not before it. That is the
@@ -536,40 +1075,67 @@ impl CommentClient {
     /// lock makes render-and-write atomic with respect to other syncs.
     ///
     /// On the first call it adopts any existing comment for this job (inheriting
-    /// the other steps' sections); afterwards it edits only its own block.
-    fn sync(&self, render: impl FnOnce() -> String, deadline: Option<Instant>) {
+    /// the other steps' sections). Every later call re-reads the comment first
+    /// ([`Self::refresh_others`]), so each write carries the other kind's block
+    /// as it was one round trip earlier, not as it was at adopt. The PR's CI and
+    /// its merge-queue run can overlap (a PR re-run while the PR is queued);
+    /// without the re-read, each live tick of one would write back a stale copy
+    /// of the other's block, over the other's final report.
+    ///
+    /// What this does **not** guarantee: GitHub has no compare-and-swap on a
+    /// comment, so a write by the other run landing between our re-read and our
+    /// write is overwritten. The window is one round trip per write.
+    ///
+    /// `budget` bounds the reads, starting **once the lock is held**: a close
+    /// that waited for a live tick's hung request must not find its budget
+    /// spent and skip the write, leaving the comment on its "⏳ running" render
+    /// for good. Each request's timeout is lowered to what is left of it, but
+    /// the write is never skipped: it gets at least [`WRITE_FLOOR`] (capped by
+    /// the per-request timeout), so a call takes at most `budget` plus that.
+    fn sync(&self, render: impl FnOnce() -> String, budget: Option<Duration>) {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let deadline = budget.map(|b| Instant::now() + b);
         let markdown = render();
+        let kind = self.cfg.kind;
         if !st.loaded {
             if let Some((cid, body)) = self.fetch_existing(deadline) {
                 st.id = Some(cid);
-                // Same run → inherit the other steps' sections. Different (or
-                // missing) run → the comment is from a prior build; start fresh so
-                // its stale sections don't pile up.
-                if parse_run_id(&body).as_deref() == Some(self.cfg.run_id.as_str()) {
-                    st.sections = parse_sections(&body);
+                // Every block is kept. Our kind's: same run → inherit the other
+                // steps' sections; different (or missing) run → it is from a
+                // prior build, so start fresh and its stale sections don't pile
+                // up. The other kind's block is never ours to reset.
+                let mut groups = parse_groups(&body);
+                let own = groups.slot(kind);
+                if own.as_ref().is_some_and(|g| g.run_id != self.cfg.run_id) {
+                    *own = None;
                 }
+                st.groups = groups;
             }
             st.loaded = true;
+        } else if let Some(cid) = st.id {
+            self.refresh_others(&mut st, cid, deadline);
         }
-        upsert_section(&mut st.sections, &self.cfg.section_key, &markdown);
-        let body = assemble_body(&self.container_marker, &self.cfg.run_id, &st.sections);
+        let own = st.groups.slot(kind).get_or_insert_with(Group::empty);
+        own.run_id.clone_from(&self.cfg.run_id);
+        own.tested.clone_from(&self.cfg.tested);
+        upsert_section(&mut own.sections, &self.cfg.section_key, &markdown);
+        let body = assemble_body(&self.container_marker, &self.cfg.repo_url, &st.groups);
 
-        let mut payload = serde_json::Map::new();
-        payload.insert("body".into(), serde_json::json!(body));
-
+        let timeout = self
+            .request_timeout(deadline)
+            .unwrap_or_default()
+            .max(WRITE_FLOOR.min(self.cfg.timeout));
+        let payload = serde_json::json!({ "body": body });
         let result = match st.id {
             Some(cid) => self
                 .http()
-                .patch(format!(
-                    "{}/repos/{}/issues/comments/{cid}",
-                    self.cfg.api_url, self.cfg.repo
-                ))
+                .patch(self.comment_url(cid))
                 .headers(gh_headers(&self.cfg.token))
-                .json(&serde_json::Value::Object(payload))
+                .timeout(timeout)
+                .json(&payload)
                 .send()
                 .and_then(|r| r.error_for_status())
-                .map(drop),
+                .map(|r| st.etag = response_etag(&r)),
             None => self
                 .http()
                 .post(format!(
@@ -577,13 +1143,18 @@ impl CommentClient {
                     self.cfg.api_url, self.cfg.repo, self.cfg.pr
                 ))
                 .headers(gh_headers(&self.cfg.token))
-                .json(&serde_json::Value::Object(payload))
+                .timeout(timeout)
+                .json(&payload)
                 .send()
                 .and_then(|r| r.error_for_status())
-                .and_then(|r| r.json::<serde_json::Value>())
-                .map(|v| {
+                .and_then(|r| {
+                    let etag = response_etag(&r);
+                    r.json::<serde_json::Value>().map(|v| (etag, v))
+                })
+                .map(|(etag, v)| {
                     if let Some(new_id) = v.get("id").and_then(serde_json::Value::as_u64) {
                         st.id = Some(new_id);
+                        st.etag = etag;
                     }
                     if let Some(url) = v.get("html_url").and_then(serde_json::Value::as_str) {
                         tracing::info!("status comment {url}");
@@ -594,6 +1165,15 @@ impl CommentClient {
             tracing::warn!("status-comment update failed: {e}");
         }
     }
+}
+
+/// A response's `ETag`, if it has a usable one.
+fn response_etag(resp: &reqwest::blocking::Response) -> Option<String> {
+    resp.headers()
+        .get(reqwest::header::ETAG)?
+        .to_str()
+        .ok()
+        .map(str::to_string)
 }
 
 struct Inner {
@@ -763,9 +1343,9 @@ impl Inner {
     /// Unconditional once the build starts: the comment is created on its first
     /// event and kept current for the whole run, so it is present and findable
     /// from the moment the build begins rather than appearing partway through.
-    fn sync_comment(&self, deadline: Option<Instant>) {
+    fn sync_comment(&self, budget: Option<Duration>) {
         let Some(c) = &self.comment else { return };
-        c.sync(|| self.render_live(), deadline);
+        c.sync(|| self.render_live(), budget);
     }
 
     /// The live comment body for the current tally.
@@ -990,9 +1570,10 @@ impl Hook for GhaHook {
             .unwrap_or_else(|e| e.into_inner())
             .set_closed();
         // No event, no build: nothing was posted, and nothing should be now.
+        // An ordinary sync: it re-reads the comment like every other, so the
+        // last write carries the other kind's block as it is now.
         if self.inner.started.load(Ordering::Acquire) {
-            self.inner
-                .sync_comment(Some(Instant::now() + CLOSE_SYNC_BUDGET));
+            self.inner.sync_comment(Some(CLOSE_SYNC_BUDGET));
         }
         // The summary is the durable report; the comment is only a notification.
         self.inner.write_summary();
@@ -1068,7 +1649,7 @@ mod tests {
         let mut sections = Vec::new();
         upsert_section(&mut sections, &nasty, "body one");
         upsert_section(&mut sections, &nasty, "body two");
-        let assembled = assemble_body("<!-- heph-gha:job -->", "1-1", &sections);
+        let assembled = assemble_body("<!-- heph-gha:job -->", "", &pr_only("1-1", sections));
         let parsed = parse_sections(&assembled);
         assert_eq!(
             parsed.len(),
@@ -1078,23 +1659,43 @@ mod tests {
         assert_eq!(parsed.first().map(|(_, c)| c.as_str()), Some("body two"));
     }
 
+    /// A comment holding only the PR's CI block.
+    pub(super) fn pr_only(run_id: &str, sections: Vec<(String, String)>) -> Groups {
+        Groups {
+            pull_request: Some(group(run_id, sections)),
+            merge_queue: None,
+        }
+    }
+
+    /// A block written by `run_id`, with nothing recorded about what it tested.
+    pub(super) fn group(run_id: &str, sections: Vec<(String, String)>) -> Group {
+        Group {
+            run_id: run_id.to_string(),
+            tested: Tested::default(),
+            sections,
+        }
+    }
+
     #[test]
     fn comment_sections_preserve_other_steps() {
         // Two steps wrote their sections into one job comment.
         let container = "<!-- heph-gha:test -->";
         let mut sections = parse_sections(&assemble_body(
             container,
-            "run1",
-            &[
-                ("run //a:x".into(), "## heph: run //a:x\nbuilt 1".into()),
-                ("run //b:y".into(), "## heph: run //b:y\nbuilt 2".into()),
-            ],
+            "",
+            &pr_only(
+                "run1",
+                vec![
+                    ("run //a:x".into(), "## heph: run //a:x\nbuilt 1".into()),
+                    ("run //b:y".into(), "## heph: run //b:y\nbuilt 2".into()),
+                ],
+            ),
         ));
         assert_eq!(sections.len(), 2);
 
         // A third step updates only its own section; the others stay.
         upsert_section(&mut sections, "run //a:x", "## heph: run //a:x\nbuilt 9");
-        let body = assemble_body(container, "run1", &sections);
+        let body = assemble_body(container, "", &pr_only("run1", sections.clone()));
         assert!(body.starts_with(container), "container marker kept: {body}");
         assert!(body.contains("built 9"), "own section updated: {body}");
         assert!(body.contains("built 2"), "other step preserved: {body}");
@@ -1107,56 +1708,401 @@ mod tests {
         // A brand-new command appends a section rather than clobbering.
         upsert_section(&mut sections, "query //...", "## heph: query //...\nok");
         assert_eq!(
-            parse_sections(&assemble_body(container, "run1", &sections)).len(),
+            parse_sections(&assemble_body(container, "", &pr_only("run1", sections))).len(),
             3
         );
     }
 
     #[test]
-    fn run_marker_round_trips_and_signals_new_run() {
+    fn both_blocks_round_trip_in_order_under_their_headings() {
         let container = "<!-- heph-gha:test -->";
-        // A first run wrote three steps' sections.
-        let body = assemble_body(
-            container,
-            "10-1",
-            &[
-                ("run //a:x".into(), "x".into()),
-                ("run //b:y".into(), "y".into()),
-                ("run //c:z".into(), "z".into()),
-            ],
-        );
-        assert_eq!(parse_run_id(&body).as_deref(), Some("10-1"));
-        assert_eq!(parse_sections(&body).len(), 3);
-
-        // The next build (different run id) detects the mismatch — its first step
-        // resets the sections instead of stacking onto the prior three.
-        let prev = parse_run_id(&body);
-        let current = "11-1";
-        let mut sections = if prev.as_deref() == Some(current) {
-            parse_sections(&body)
-        } else {
-            Vec::new()
+        let sha = "0123456789ab";
+        let groups = Groups {
+            pull_request: Some(Group {
+                run_id: "10-2".into(),
+                tested: Tested {
+                    base: String::new(),
+                    sha: "fedcba987654".into(),
+                },
+                sections: vec![
+                    ("a".into(), "pr step a".into()),
+                    ("b".into(), "pr step b".into()),
+                ],
+            }),
+            merge_queue: Some(Group {
+                run_id: "11-1".into(),
+                tested: Tested {
+                    base: "release/v2".into(),
+                    sha: sha.into(),
+                },
+                sections: vec![("a".into(), "queue step a".into())],
+            }),
         };
-        upsert_section(&mut sections, "run //a:x", "fresh");
-        let new_body = assemble_body(container, current, &sections);
-        let reparsed = parse_sections(&new_body);
-        assert_eq!(reparsed.len(), 1, "stale sections cleared: {new_body}");
-        assert_eq!(reparsed[0].0, "run //a:x");
-        assert_eq!(parse_run_id(&new_body).as_deref(), Some(current));
+        let body = assemble_body(container, "https://github.com/o/r", &groups);
 
-        // A comment from before this marker existed has no run id → also resets.
-        assert_eq!(parse_run_id("<!-- heph-gha:test -->\nlegacy"), None);
+        // What each run tested round-trips through the hidden markers: the
+        // heading is regenerated from them on every write.
+        assert_eq!(parse_groups(&body), groups, "{body}");
+        // The PR's CI first, then the merge queue, each under its own heading
+        // naming what it tested and linking the run and attempt that wrote it.
+        let pr = body
+            .find("# Pull request CI · fedcba987654 · [run 10, attempt 2](https://github.com/o/r/actions/runs/10/attempts/2)")
+            .expect("PR heading");
+        let mq = body
+            .find("# Merge queue · `release/v2` · 0123456789ab · [run 11, attempt 1](https://github.com/o/r/actions/runs/11/attempts/1)")
+            .expect("merge-queue heading");
+        assert!(pr < body.find("pr step a").expect("pr section"), "{body}");
+        assert!(pr < mq, "PR block first: {body}");
+        assert!(
+            mq < body.find("queue step a").expect("queue section"),
+            "{body}"
+        );
+
+        // An absent block has no heading at all; a block with nothing recorded
+        // about what it tested, and no repo url, has just its kind.
+        let only_queue = Groups {
+            pull_request: None,
+            merge_queue: Some(group("11-1", vec![("a".into(), "q".into())])),
+        };
+        let body = assemble_body(container, "", &only_queue);
+        assert!(!body.contains("Pull request CI"), "{body}");
+        assert!(
+            body.contains("# Merge queue\n"),
+            "no link without a repo url: {body}"
+        );
+        assert!(!body.contains("heph-gha-tested"), "{body}");
+        assert_eq!(parse_groups(&body), only_queue);
     }
 
     #[test]
-    fn pr_number_extracted_from_event_and_ref() {
+    fn a_tested_marker_is_sanitised_when_read() {
+        // The marker is in a body anyone with write access can edit, and is
+        // rendered into a public heading: only a plain branch and a hex sha
+        // survive the read.
+        let body = "<!-- heph-gha-group:merge-queue -->\n<!-- heph-gha-run:1-1 -->\n\
+                    <!-- heph-gha-tested:ma`in@nothex!! -->\n\
+                    <!-- heph-gha-step:a -->\nx\n<!-- /heph-gha-step:a -->\n\
+                    <!-- /heph-gha-group:merge-queue -->";
+        let g = parse_groups(body).merge_queue.expect("queue block");
+        assert_eq!(g.tested, Tested::default());
+    }
+
+    #[test]
+    fn group_markers_inside_a_section_do_not_move_block_boundaries() {
+        // A section embeds whatever a target printed. Its log tail can hold the
+        // group delimiters of either kind.
+        for injected in [
+            "<!-- /heph-gha-group:pr -->\n<!-- heph-gha-group:merge-queue -->\n<!-- heph-gha-run:6-6 -->",
+            "<!-- heph-gha-group:merge-queue -->\n<!-- heph-gha-step:z -->\nfake\n<!-- /heph-gha-step:z -->",
+            "<!-- /heph-gha-group:merge-queue -->\n<!-- heph-gha-group:pr -->\n<!-- heph-gha-run:6-6 -->",
+        ] {
+            let groups = Groups {
+                pull_request: Some(group(
+                    "1-1",
+                    vec![
+                        ("a".into(), format!("log:\n{injected}\nend")),
+                        ("b".into(), "pr b".into()),
+                    ],
+                )),
+                merge_queue: Some(group("2-1", vec![("a".into(), "queue a".into())])),
+            };
+            let body = assemble_body("<!-- heph-gha:test -->", "", &groups);
+            assert_eq!(parse_groups(&body), groups, "{body}");
+        }
+    }
+
+    #[test]
+    fn an_unclosed_block_ends_at_the_next_block() {
+        let body = "<!-- heph-gha:test -->\n\
+                    <!-- heph-gha-group:pr -->\n<!-- heph-gha-run:1-1 -->\n\
+                    <!-- heph-gha-step:a -->\npr a\n<!-- /heph-gha-step:a -->\n\
+                    <!-- heph-gha-group:merge-queue -->\n<!-- heph-gha-run:2-1 -->\n\
+                    <!-- heph-gha-step:b -->\nqueue b\n<!-- /heph-gha-step:b -->\n\
+                    <!-- /heph-gha-group:merge-queue -->";
+        assert_eq!(
+            parse_groups(body),
+            Groups {
+                pull_request: Some(group("1-1", vec![("a".into(), "pr a".into())])),
+                merge_queue: Some(group("2-1", vec![("b".into(), "queue b".into())])),
+            }
+        );
+    }
+
+    #[test]
+    fn blocks_out_of_order_are_assembled_pr_first() {
+        let body = "<!-- heph-gha:test -->\n\
+                    <!-- heph-gha-group:merge-queue -->\n<!-- heph-gha-run:2-1 -->\n\
+                    <!-- heph-gha-step:b -->\nqueue b\n<!-- /heph-gha-step:b -->\n\
+                    <!-- /heph-gha-group:merge-queue -->\n\
+                    <!-- heph-gha-group:pr -->\n<!-- heph-gha-run:1-1 -->\n\
+                    <!-- heph-gha-step:a -->\npr a\n<!-- /heph-gha-step:a -->\n\
+                    <!-- /heph-gha-group:pr -->";
+        let groups = parse_groups(body);
+        assert_eq!(
+            groups,
+            Groups {
+                pull_request: Some(group("1-1", vec![("a".into(), "pr a".into())])),
+                merge_queue: Some(group("2-1", vec![("b".into(), "queue b".into())])),
+            }
+        );
+        let out = assemble_body("<!-- heph-gha:test -->", "", &groups);
+        assert!(
+            out.find("pr a").expect("pr") < out.find("queue b").expect("queue"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_duplicated_block_keeps_the_first() {
+        let block = |run: &str, text: &str| {
+            format!(
+                "<!-- heph-gha-group:pr -->\n<!-- heph-gha-run:{run} -->\n\
+                 <!-- heph-gha-step:a -->\n{text}\n<!-- /heph-gha-step:a -->\n\
+                 <!-- /heph-gha-group:pr -->\n"
+            )
+        };
+        let body = format!(
+            "<!-- heph-gha:test -->\n{}{}",
+            block("1-1", "first"),
+            block("9-9", "second")
+        );
+        assert_eq!(
+            parse_groups(&body),
+            Groups {
+                pull_request: Some(group("1-1", vec![("a".into(), "first".into())])),
+                merge_queue: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_run_marker_that_is_not_a_run_reads_as_no_run() {
+        // The run id is echoed into the public heading's link.
+        for bad in [
+            "1-x",
+            "](https://evil)-1",
+            "12",
+            "-3",
+            "4-",
+            "+1-2",
+            "1-2-3",
+        ] {
+            let body = format!(
+                "<!-- heph-gha-group:pr -->\n<!-- heph-gha-run:{bad} -->\n\
+                 <!-- heph-gha-step:a -->\nx\n<!-- /heph-gha-step:a -->\n\
+                 <!-- /heph-gha-group:pr -->"
+            );
+            let g = parse_groups(&body).pull_request.expect("PR block");
+            assert_eq!(g.run_id, "", "{bad}");
+        }
+        assert_eq!(clean_run_id("123-4"), "123-4");
+    }
+
+    #[test]
+    fn an_unclosed_section_ends_its_block_not_the_parse() {
+        // A truncated PR section: its block ends there, and the merge-queue
+        // block after it is still read.
+        let body = "<!-- heph-gha:test -->\n\
+                    <!-- heph-gha-group:pr -->\n<!-- heph-gha-run:1-1 -->\n\
+                    <!-- heph-gha-step:a -->\npr a\n<!-- /heph-gha-step:a -->\n\
+                    <!-- heph-gha-step:b -->\ntruncated\n\
+                    <!-- heph-gha-group:merge-queue -->\n<!-- heph-gha-run:2-1 -->\n\
+                    <!-- heph-gha-step:c -->\nqueue c\n<!-- /heph-gha-step:c -->\n\
+                    <!-- /heph-gha-group:merge-queue -->";
+        assert_eq!(
+            parse_groups(body),
+            Groups {
+                pull_request: Some(group("1-1", vec![("a".into(), "pr a".into())])),
+                merge_queue: Some(group("2-1", vec![("c".into(), "queue c".into())])),
+            }
+        );
+    }
+
+    #[test]
+    fn a_section_holding_its_own_close_tag_ends_there() {
+        // The documented limit: the section ends at the first copy of its own
+        // close tag, and the rest of its content is read as top level. Nothing
+        // panics, and the other kind's block survives.
+        let groups = Groups {
+            pull_request: Some(group(
+                "1-1",
+                vec![(
+                    "a".into(),
+                    "before\n<!-- /heph-gha-step:a -->\nafter".into(),
+                )],
+            )),
+            merge_queue: Some(group("2-1", vec![("c".into(), "queue c".into())])),
+        };
+        let body = assemble_body("<!-- heph-gha:test -->", "", &groups);
+        let parsed = parse_groups(&body);
+        assert_eq!(
+            parsed.pull_request,
+            Some(group("1-1", vec![("a".into(), "before".into())]))
+        );
+        assert_eq!(parsed.merge_queue, groups.merge_queue);
+    }
+
+    #[test]
+    fn both_blocks_at_full_section_budget_fit_the_comment() {
+        // Three steps per block, each section rendered at the full live budget,
+        // with every marker and heading at its longest.
+        let filler = "x".repeat(render::LIVE_SECTION_BUDGET);
+        let sections = |n: usize| -> Vec<(String, String)> {
+            (0..n)
+                .map(|i| (section_id(&format!("step {i}")), filler.clone()))
+                .collect()
+        };
+        let long_run = format!("{}-{}", u64::MAX, u64::MAX);
+        let groups = Groups {
+            pull_request: Some(Group {
+                run_id: long_run.clone(),
+                tested: Tested {
+                    base: String::new(),
+                    sha: "0123456789ab".into(),
+                },
+                sections: sections(3),
+            }),
+            merge_queue: Some(Group {
+                run_id: long_run,
+                tested: Tested {
+                    base: "b".repeat(100),
+                    sha: "0123456789ab".into(),
+                },
+                sections: sections(3),
+            }),
+        };
+        let body = assemble_body(
+            &format!("<!-- heph-gha:{} -->", "k".repeat(200)),
+            "https://github.example.com/some-org/some-repository",
+            &groups,
+        );
+        assert!(
+            body.chars().count() <= render::COMMENT_LIMIT,
+            "{} chars",
+            body.chars().count()
+        );
+    }
+
+    #[test]
+    fn a_body_from_before_the_blocks_is_read_as_the_pr_block() {
+        // Before merge-queue runs reported, the body was one run marker and its
+        // sections. Only PR runs wrote it, so it is the PR block: a merge-queue
+        // run adopting it must keep it, not drop it.
+        let legacy = "<!-- heph-gha:test -->\n<!-- heph-gha-run:10-1 -->\n\
+                      <!-- heph-gha-step:a -->\nold a\n<!-- /heph-gha-step:a -->";
+        let groups = parse_groups(legacy);
+        assert_eq!(
+            groups.pull_request,
+            Some(group("10-1", vec![("a".into(), "old a".into())]))
+        );
+        assert_eq!(groups.merge_queue, None);
+        // Markers and nothing else: no block.
+        assert_eq!(
+            parse_groups("<!-- heph-gha:test -->\n<!-- heph-gha-run:1-1 -->"),
+            Groups::default()
+        );
+        assert_eq!(parse_groups(""), Groups::default());
+    }
+
+    #[test]
+    fn pr_and_run_kind_come_from_the_event_and_ref() {
+        let target = |pr, kind, base: &str, sha: &str| {
+            Some(PrTarget {
+                pr,
+                kind,
+                tested: Tested {
+                    base: base.into(),
+                    sha: sha.into(),
+                },
+            })
+        };
+        let pr = |n| target(n, RunKind::PullRequest, "", "");
+        let pr_at = |n, sha| target(n, RunKind::PullRequest, "", sha);
+        // `GITHUB_SHA`: the commit a merge-group run checked out.
+        let run_sha = "fedcba9876543210fedcba9876543210fedcba98";
+        let mq = |n, base| target(n, RunKind::MergeQueue, base, "fedcba987654");
+        let at = |payload: &str, git_ref: &str, event: &str| {
+            pr_target_from(Some(payload.as_bytes()), git_ref, event, run_sha)
+        };
+        let pr_target_from = |payload: Option<&[u8]>, git_ref: &str, event: &str| {
+            pr_target_from(payload, git_ref, event, run_sha)
+        };
+
+        let sha = "0123456789abcdef0123456789abcdef01234567";
         let payload = serde_json::json!({ "pull_request": { "number": 122 } }).to_string();
-        assert_eq!(pr_number_from_json(payload.as_bytes()), Some(122));
-        assert_eq!(pr_number_from_json(b"{}"), None);
+        assert_eq!(at(&payload, "", "pull_request"), pr(122));
+        // The PR's head commit, short.
+        let with_head =
+            serde_json::json!({ "pull_request": { "number": 122, "head": { "sha": sha } } })
+                .to_string();
+        assert_eq!(
+            at(&with_head, "", "pull_request"),
+            pr_at(122, "0123456789ab")
+        );
+        assert_eq!(at("{}", "", "push"), None);
+        assert_eq!(at("not json", "refs/pull/3/merge", "pull_request"), pr(3));
         // Ref fallback.
-        assert_eq!(pr_number_from_ref("refs/pull/122/merge"), Some(122));
-        assert_eq!(pr_number_from_ref("refs/pull/7/head"), Some(7));
-        assert_eq!(pr_number_from_ref("refs/heads/main"), None);
+        assert_eq!(pr_target_from(None, "refs/pull/122/merge", ""), pr(122));
+        assert_eq!(pr_target_from(None, "refs/pull/7/head", ""), pr(7));
+        assert_eq!(pr_target_from(None, "refs/heads/main", ""), None);
+        assert_eq!(pr_target_from(None, "refs/pull/+7/merge", ""), None);
+
+        // Merge queue: the payload's head_ref, else GITHUB_REF.
+        let queue_ref = format!("refs/heads/gh-readonly-queue/main/pr-42-{sha}");
+        let queue = serde_json::json!({ "merge_group": { "head_ref": queue_ref } }).to_string();
+        assert_eq!(at(&queue, "", "merge_group"), mq(42, "main"));
+        // The payload alone says it is a merge-group event.
+        assert_eq!(at(&queue, "", ""), mq(42, "main"));
+        // What was tested is the group's head commit on its base branch, from
+        // the payload — not the sha in the queue ref's name.
+        let full = serde_json::json!({ "merge_group": {
+            "head_ref": queue_ref,
+            "head_sha": "abcdef0123456789abcdef0123456789abcdef01",
+            "base_ref": "refs/heads/release/v2",
+        } })
+        .to_string();
+        assert_eq!(
+            at(&full, "", "merge_group"),
+            target(42, RunKind::MergeQueue, "release/v2", "abcdef012345")
+        );
+        assert_eq!(
+            pr_target_from(None, &queue_ref, "merge_group"),
+            mq(42, "main")
+        );
+        // An unparsable head_ref in the payload falls back to GITHUB_REF.
+        let bad =
+            serde_json::json!({ "merge_group": { "head_ref": "refs/heads/nope" } }).to_string();
+        assert_eq!(at(&bad, &queue_ref, "merge_group"), mq(42, "main"));
+        // A base branch with slashes, or named like a PR segment.
+        assert_eq!(
+            pr_target_from(
+                None,
+                &format!("refs/heads/gh-readonly-queue/release/pr-9-x/pr-17-{sha}"),
+                "merge_group"
+            ),
+            mq(17, "release/pr-9-x")
+        );
+
+        // A push to a queue branch is not a merge-queue run — nor a PR run.
+        assert_eq!(pr_target_from(None, &queue_ref, "push"), None);
+        assert_eq!(at("{}", &queue_ref, "push"), None);
+
+        // Near misses are not merge-queue refs.
+        for not_queue in [
+            "refs/heads/gh-readonly-queue/pr-42-abc", // no base
+            "refs/heads/gh-readonly-queue/main/pr--abc",
+            "refs/heads/gh-readonly-queue/main/prx-42-abc",
+            "refs/heads/gh-readonly-queue/main/pr-+42-abc",
+            "refs/heads/gh-readonly-queue/main/pr-99999999999999999999999-abc", // overflow
+            "refs/heads/gh-readonly-queue-x/main/pr-42-abc",
+            "refs/heads/feature/gh-readonly-queue/main/pr-42-abc",
+        ] {
+            assert_eq!(
+                pr_target_from(None, not_queue, "merge_group"),
+                None,
+                "{not_queue}"
+            );
+        }
     }
 
     fn hook_writing_to(path: &std::path::Path) -> GhaHook {
