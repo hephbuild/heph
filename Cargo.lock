@@ -6951,7 +6951,7 @@ dependencies = [
 [[package]]
 name = "starlark"
 version = "0.14.2"
-source = "git+https://github.com/hephbuild/starlark-rust.git?branch=heph%2Fv0.14.2#485740ea65e849e3c178a1515a7cc0925baf954c"
+source = "git+https://github.com/hephbuild/starlark-rust.git?branch=heph%2Fv0.14.2#3ed6f7ef9bc47503d6ec7dbc575c90f8dc8a4e3d"
 dependencies = [
  "allocative",
  "anyhow",

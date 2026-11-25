@@ -66,7 +66,7 @@ impl DocTypes {
         let (_errors, types, _iface, approximations) = ast.typecheck(globals, &interfaces);
 
         let mut defs: HashMap<Vec<String>, DefBindings> = HashMap::new();
-        for (owner, name, kind, ty) in types.bindings() {
+        for (owner, name, kind, ty, _approximation) in types.bindings() {
             defs.entry(owner.to_vec())
                 .or_default()
                 .entry(name.to_owned())
