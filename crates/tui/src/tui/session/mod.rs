@@ -31,6 +31,7 @@
 //! the environment — the session runner and `pass_env = ["*"]` would carry them
 //! into targets.
 
+pub mod catalog;
 pub mod cleanup;
 pub mod derive;
 pub mod export;
@@ -48,6 +49,8 @@ pub mod store;
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing;
 
+#[cfg(test)]
+mod catalog_tests;
 #[cfg(test)]
 mod replay_tests;
 #[cfg(test)]
@@ -391,6 +394,21 @@ impl Session {
             faults,
         })
         .context("starting the session recorder")?;
+        // The catalog's start row, off the build path: a late one never
+        // overwrites the seal's. A private session writes only at its end.
+        if !root.is_private() {
+            let (root_dir, rec_dir) = (root.path().to_path_buf(), dir.clone());
+            let dispatch = tracing::dispatcher::get_default(Clone::clone);
+            let spawned = std::thread::Builder::new()
+                .name("heph-session-catalog".to_owned())
+                .spawn(move || {
+                    let _dispatch = tracing::dispatcher::set_default(&dispatch);
+                    catalog::record_start(&root_dir, &rec_dir);
+                });
+            if let Err(e) = spawned {
+                tracing::debug!(error = %e, "cannot start the session catalog write");
+            }
+        }
         Ok(Self {
             id,
             root: root.path().to_path_buf(),
@@ -421,6 +439,9 @@ impl Session {
         let finished = self
             .recorder
             .finish(exit_code, panicked, recorder::FINISH_TIMEOUT);
+        if finished == recorder::Finished::Ended {
+            self.write_catalog();
+        }
         if let Some(export) = &self.export {
             match finished {
                 recorder::Finished::Ended => export.run(&self.root, &self.dir, self.id),
@@ -438,6 +459,26 @@ impl Session {
         {
             // The next session's start sweeps it.
             tracing::debug!(dir = %self.dir.display(), error = %e, "cannot remove a private session");
+        }
+    }
+
+    /// The seal-time catalog write, bounded at [`catalog::WRITE_BOUND`]. A
+    /// private session writes its `sessions` and `targets` rows
+    /// (`recorded=0`) into the public root's catalog, before its directory
+    /// is removed (D19).
+    fn write_catalog(&self) {
+        if !self.private {
+            catalog::record_seal(&self.root, &self.dir, true);
+            return;
+        }
+        let Some(public) = self.root.parent().map(|p| p.join(SESSIONS_DIR)) else {
+            return;
+        };
+        match catalog::ensure_root(&public) {
+            Ok(()) => catalog::record_seal(&public, &self.dir, false),
+            Err(e) => {
+                tracing::debug!(root = %public.display(), error = %e, "cannot make the sessions root");
+            }
         }
     }
 

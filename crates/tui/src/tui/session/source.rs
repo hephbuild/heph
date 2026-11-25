@@ -125,15 +125,42 @@ pub trait SessionSource: Send + Sync + std::fmt::Debug {
     }
 }
 
+/// Where a repairing [`FileSource`] says what it does: a full stderr line.
+pub type Note = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
 /// The sessions recorded under one directory (`~/.heph/sessions`).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct FileSource {
     root: PathBuf,
+    /// A command that repairs what it reads (D14): a recording whose
+    /// explorer rows an older heph derived is re-derived before they are
+    /// read, said through this. `None`: a viewer that never writes.
+    repair: Option<Note>,
+}
+
+impl std::fmt::Debug for FileSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileSource")
+            .field("root", &self.root)
+            .field("repair", &self.repair.is_some())
+            .finish()
+    }
 }
 
 impl FileSource {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            repair: None,
+        }
+    }
+
+    /// This source, re-deriving an older derivation's recording before it
+    /// reads its explorer rows, and saying so through `note`.
+    #[must_use]
+    pub fn repairing(mut self, note: Note) -> Self {
+        self.repair = Some(note);
+        self
     }
 
     pub fn root(&self) -> &Path {
@@ -190,16 +217,65 @@ impl SessionSource for FileSource {
     async fn pools(&self, id: SessionId) -> anyhow::Result<Vec<store::PoolSummary>> {
         let root = self.root.clone();
         let dir = self.dir(id);
+        let repair = self.repair.clone();
         tokio::task::spawn_blocking(move || {
-            let opened = store::open_local(&root, &dir)
-                .map_err(anyhow::Error::new)
-                .with_context(|| format!("opening session {id}'s recording"))?;
+            let opened = match &repair {
+                Some(note) => open_repaired(&root, &dir, note.as_ref()),
+                None => store::open_local(&root, &dir).map_err(anyhow::Error::new),
+            }
+            .with_context(|| format!("opening session {id}'s recording"))?;
             store::read_pools(&opened.conn)
                 .with_context(|| format!("reading session {id}'s pool usage"))
         })
         .await
         .context("reading pool usage")?
     }
+}
+
+/// Open the local recording in `dir` to read its explorer rows, re-deriving
+/// it first when an older heph derived them (D14): durably, under its lock,
+/// then its catalog rows replaced. When it cannot be re-derived in place (a
+/// full disk, a read-only directory, a stray journal, its lock held), the
+/// rows are derived into a temp copy for this command. A newer derivation is
+/// read as it is.
+pub(crate) fn open_repaired(
+    root: &Path,
+    dir: &Path,
+    note: &(dyn Fn(&str) + Send + Sync),
+) -> anyhow::Result<store::Opened> {
+    let need = store::Need::default();
+    match store::pending_local(dir, need) {
+        Ok(Some(p)) if p.any() => {
+            note("heph: re-deriving 1 recording\n");
+            match store::upgrade_local(dir, need) {
+                Ok(store::Upgraded::Done) => {
+                    if let Err(e) = super::catalog::replace(root, dir) {
+                        tracing::debug!(
+                            dir = %dir.display(),
+                            error = %format!("{e:#}"),
+                            "cannot replace a re-derived session's catalog rows"
+                        );
+                    }
+                }
+                Ok(store::Upgraded::Current) => {}
+                failed => {
+                    tracing::debug!(
+                        dir = %dir.display(),
+                        outcome = ?failed.map_err(|e| format!("{e:#}")),
+                        "re-deriving into a temp copy instead"
+                    );
+                    return store::derived_copy(root, &dir.join(store::FILE), need);
+                }
+            }
+        }
+        Ok(_) => {}
+        Err(e) => tracing::debug!(
+            dir = %dir.display(),
+            error = %format!("{e:#}"),
+            "cannot tell whether a recording needs re-deriving"
+        ),
+    }
+    store::open_local(root, dir).map_err(anyhow::Error::new)
 }
 
 /// `subscribe`'s blocking half: open the recording, refusing a format this

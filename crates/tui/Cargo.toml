@@ -48,7 +48,7 @@ shlex = "2"
 uuid = { version = "1.29.3", features = ["v4"] }
 # `session.db`, the recording; and its trace id (SHA-256 of the session id).
 # `limits`: a foreign recording's connection caps the size of a value.
-rusqlite = { version = "0.42", features = ["bundled", "blob", "limits"] }
+rusqlite = { version = "0.42", features = ["bundled", "blob", "hooks", "limits"] }
 sha2 = "0.11"
 hex = "0.4"
 # Opening a `.hephsession` (`session::hephsession`): a zstd frame of a sealed

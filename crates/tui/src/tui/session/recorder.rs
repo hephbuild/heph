@@ -801,6 +801,17 @@ fn clean_ended(
         Ok(_) => {}
         Err(e) => tracing::debug!(error = %e, "cannot clean ended sessions"),
     }
+    match super::catalog::clean(root, SystemTime::now()) {
+        Ok(report) if report != super::catalog::CleanReport::default() => tracing::debug!(
+            expired = report.expired,
+            corrupt = report.corrupt,
+            capped_rows = report.capped_rows,
+            capped_sessions = report.capped_sessions,
+            "cleaned the session catalog"
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::debug!(error = %format!("{e:#}"), "cannot clean the session catalog"),
+    }
     // A killed `HEPH_NO_SESSION` run's directory: nobody else reads it, so it
     // goes whatever its age. Missing is normal.
     if let Some(private) = private_root

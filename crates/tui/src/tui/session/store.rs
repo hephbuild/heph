@@ -362,7 +362,7 @@ impl From<rusqlite::Error> for OpenError {
 }
 
 /// `path` as a `file:` URI, `?`, `#` and `%` percent-encoded.
-fn file_uri(path: &Path, query: &str) -> String {
+pub(crate) fn file_uri(path: &Path, query: &str) -> String {
     let mut uri = String::from("file:");
     for c in path.to_string_lossy().chars() {
         match c {

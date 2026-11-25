@@ -289,14 +289,25 @@ fn execute(
             }
             bootstrap::block_on(list::list(&sources, opts, filter, &a.out, out))?
         }
-        SessionCommands::Show(a) => bootstrap::block_on(show::show(
-            &sources,
-            opts,
-            &a.reference,
-            &a.out,
-            out,
-            &opener,
-        ))?,
+        SessionCommands::Show(a) => {
+            // `show` reads explorer rows, so it repairs what it reads (D14);
+            // every other viewer reads as it is.
+            let note_sink = sink.clone();
+            let repairing = file
+                .clone()
+                .repairing(std::sync::Arc::new(move |line: &str| {
+                    note_sink.write_diagnostic(line);
+                }));
+            let sources: [&dyn SessionSource; 1] = [&repairing];
+            bootstrap::block_on(show::show(
+                &sources,
+                opts,
+                &a.reference,
+                &a.out,
+                out,
+                &opener,
+            ))?
+        }
         SessionCommands::Inflight(a) => {
             bootstrap::block_on(inflight(&sources, opts, &a.id, &a.out, out))?
         }
