@@ -781,10 +781,14 @@ The run that owns the session writes twice:
 
 - At start, its `sessions` row with `complete=0`, from a thread of its own,
   then it folds the catalog's WAL in. A private session skips the row and
-  only folds the public catalog's WAL in. The fold is a `TRUNCATE`
-  checkpoint: it waits for a reader or writer on the catalog, but only up to
-  the 1s write bound and only on that thread, never the build's; past it,
-  the fold is left for the next one.
+  only folds the public catalog's WAL in. The fold is a `PASSIVE`
+  checkpoint, which copies the WAL into `catalog.db` without blocking a
+  writer, then a `TRUNCATE` one that restarts the WAL only if nothing is in
+  its way: it does not wait for a writer, and a reader still holding a
+  snapshot (a long `query`) leaves the WAL as it is for the next start. So
+  the fold never holds another run's write up behind a reader. The copy
+  stops at the 1s write bound, on that thread, never the build's; the rest
+  is left for the next start.
 - At seal, after `End`, every catalog row of its session in one transaction,
   with `complete=1` and the recording's `derivation`. A private session
   writes these rows with `recorded=0` into the public catalog, then removes

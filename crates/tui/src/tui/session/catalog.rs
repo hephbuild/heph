@@ -670,20 +670,27 @@ fn try_owner_write(
 /// [`fold`]), so the WAL the owners leave unchecked ([`bound_owner`]) stays
 /// about one session's writes long.
 ///
-/// A `TRUNCATE` checkpoint, not a passive one: no connection keeps the
-/// catalog open between runs, so the next one to open it rebuilds the WAL
-/// index from the file and counts every frame as not yet folded in. A WAL
-/// only folded in is then never restarted, grows by every write, and each
-/// fold copies all of it again; truncated, it starts empty. Its waits on a
-/// writer or a reader go through the owner's busy handler, which gives up at
-/// `deadline`, having folded in what it could; past `deadline`, the copy is
-/// interrupted. Only the start thread runs it, off the build path: the
-/// seal's exit path never checkpoints.
+/// Two checkpoints. A `PASSIVE` one copies the WAL into the file without
+/// taking the WAL's writer lock and without waiting on anyone, so writers
+/// carry on while it copies. A `TRUNCATE` one then restarts the WAL: no
+/// connection keeps the catalog open between runs, so the next one to open
+/// it rebuilds the WAL index from the file and counts every frame as not
+/// yet folded in. A WAL only folded in is then never restarted, grows by
+/// every write, and each fold copies all of it again; truncated, it starts
+/// empty. The `TRUNCATE` runs with no busy handler: it takes the writer lock
+/// only if it is free, copies what was written since the `PASSIVE` one, and
+/// gives up at once when a reader still holds a snapshot of the WAL,
+/// leaving it for the next start. Waiting on that reader would hold the
+/// writer lock, and every seal with it, for as long as the reader reads.
+/// Past `deadline`, either copy is interrupted. Only the start thread runs
+/// it, off the build path: the seal's exit path never checkpoints. It
+/// leaves `conn` with no busy handler.
 fn fold_wal(conn: &Connection, deadline: Instant) -> rusqlite::Result<()> {
     // Prepared before the watchdog starts: preparing reads the schema, and
     // on a fresh connection rebuilds the WAL index first; an interrupt
     // landing then is cleared by the statement's first step, and lost.
-    let mut fold = conn.prepare("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    let mut copy = conn.prepare("PRAGMA wal_checkpoint(PASSIVE)")?;
+    let mut restart = conn.prepare("PRAGMA wal_checkpoint(TRUNCATE)")?;
     let Some(left) = deadline.checked_duration_since(Instant::now()) else {
         return Ok(());
     };
@@ -703,7 +710,10 @@ fn fold_wal(conn: &Connection, deadline: Instant) -> rusqlite::Result<()> {
             tracing::debug!(error = %e, "cannot bound the catalog's WAL fold: skipped");
             return Ok(());
         }
-        let folded = fold.query_row([], |_| Ok(()));
+        let folded = copy
+            .query_row([], |_| Ok(()))
+            .and_then(|()| conn.busy_timeout(Duration::ZERO))
+            .and_then(|()| restart.query_row([], |_| Ok(())));
         drop(done);
         folded
     })
@@ -1636,6 +1646,68 @@ mod tests {
         // In time, the same fold truncates it.
         fold_wal(&conn, Instant::now() + Duration::from_secs(10)).expect("fold");
         assert_eq!(wal_len(tmp.path()), 0);
+    }
+
+    /// A reader holding a snapshot (a long `query`) keeps the WAL from being
+    /// restarted. The fold then gives up at once instead of waiting on the
+    /// reader with the WAL's writer lock held: a seal's `BEGIN IMMEDIATE`
+    /// while it runs does not wait, and neither does the fold.
+    #[test]
+    fn a_fold_held_up_by_a_reader_does_not_hold_up_writers() {
+        const BOUND: Duration = Duration::from_secs(2);
+        const PROMPT: Duration = Duration::from_millis(500);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        unfolded(root, 200);
+        let reader = open_rw(root, false).expect("open the reader");
+        reader.execute_batch("BEGIN").expect("begin");
+        let _: i64 = reader
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .expect("read a snapshot");
+        // A write after the reader's snapshot, as the owner's start row.
+        let writer = open_rw(root, false).expect("open the writer");
+        writer
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .expect("no autocheckpoint");
+        writer
+            .execute("INSERT INTO t VALUES (randomblob(10))", [])
+            .expect("write");
+        // Long enough to measure the wait rather than give up on it.
+        writer
+            .busy_timeout(2 * BOUND)
+            .expect("a writer's busy timeout");
+
+        let mut folder = open_rw(root, false).expect("open the folder");
+        let deadline = Instant::now() + BOUND;
+        bound_owner(&mut folder, deadline).expect("bound");
+        let fold = std::thread::spawn(move || {
+            let began = Instant::now();
+            let folded = fold_wal(&folder, deadline);
+            (folded, began.elapsed())
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        let began = Instant::now();
+        writer
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("begin a write");
+        let waited = began.elapsed();
+        writer.execute_batch("COMMIT").expect("commit");
+        let (folded, took) = fold.join().expect("the fold");
+        folded.expect("the fold gives up without an error");
+        assert!(
+            waited < PROMPT,
+            "a writer waited {waited:?} on the fold (bound {BOUND:?})"
+        );
+        assert!(took < PROMPT, "the fold waited {took:?} on the reader");
+        assert!(wal_len(root) > 0, "the WAL was restarted under a reader");
+
+        // The reader gone, the next fold restarts the WAL.
+        reader.execute_batch("COMMIT").expect("end the read");
+        drop(reader);
+        drop(writer);
+        let folder = open_rw(root, false).expect("reopen");
+        fold_wal(&folder, Instant::now() + BOUND).expect("fold");
+        assert_eq!(wal_len(root), 0);
     }
 
     /// On a fresh connection, preparing the fold rebuilds the WAL index from
