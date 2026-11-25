@@ -5,9 +5,9 @@ use crate::tui::session::SessionSlot;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use serde_json::json;
+use serde::ser::SerializeStruct as _;
 
-use super::{JSON_SCHEMA, Report, blocking, display, read_gitignore, run_cli, write_gitignore};
+use super::{Report, blocking, display, read_gitignore, run_cli, write_gitignore};
 use crate::commands::GlobalOptions;
 use crate::engine::gitignore::{self, GitignoreEntry, StaleReason};
 use crate::engine::request_state::RequestState;
@@ -25,9 +25,8 @@ pub struct Args {
     /// Write nothing; exit 1 when the section is stale
     #[arg(long)]
     pub check: bool,
-    /// Print the result as JSON
-    #[arg(long)]
-    pub json: bool,
+    #[command(flatten)]
+    pub out: output::JsonArgs<GitignoreReport>,
     /// Package matcher (e.g. //pkg/...); only lines from targets under it
     /// change. Omit to rewrite the whole section.
     #[arg(value_name = "PACKAGE_MATCHER")]
@@ -54,26 +53,53 @@ pub struct LineChange {
     pub addr: Option<String>,
 }
 
+/// A line as `--json` prints it: `{op, pattern, addr}`, `op` being `add` or
+/// `remove`.
+impl serde::Serialize for LineChange {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut m = s.serialize_struct("LineChange", 3)?;
+        m.serialize_field("op", if self.added { "add" } else { "remove" })?;
+        m.serialize_field("pattern", &self.pattern)?;
+        m.serialize_field("addr", &self.addr)?;
+        m.end()
+    }
+}
+
 /// A recorded file the rewrite releases: no line covers it any more.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Released {
     pub path: String,
     pub addr: String,
 }
 
-#[derive(Debug, Clone)]
+/// What `gitignore` did; under `--json`, the record it prints.
+#[derive(Debug, Clone, serde::Serialize, output::Record)]
 pub struct GitignoreReport {
+    #[serde(skip)]
     pub check: bool,
+    /// Whether the section differed from what the targets emit.
     pub stale: bool,
+    /// Why it was stale: a sorted subset of `lines`, `malformed` and
+    /// `old_marker`, empty when current.
+    #[serde(serialize_with = "reason_strs")]
     pub reasons: Vec<StaleReason>,
+    /// Whether `.gitignore` was rewritten; always false under `--check`.
     pub written: bool,
-    /// Sorted by pattern, then target, then op.
+    /// The section lines added or removed, `{op, pattern, addr}`, sorted by
+    /// pattern, then target, then op.
     pub lines: Vec<LineChange>,
-    /// Sorted by path.
+    /// The recorded files no line covers any more, `{path, addr}`, sorted by
+    /// path.
     pub released: Vec<Released>,
     /// How many lines the section holds after the rewrite.
+    #[serde(skip)]
     pub entries: usize,
+    #[serde(skip)]
     pub gitignore: PathBuf,
+}
+
+fn reason_strs<S: serde::Serializer>(reasons: &[StaleReason], s: S) -> Result<S::Ok, S::Error> {
+    s.collect_seq(reasons.iter().map(|r| r.as_str()))
 }
 
 /// The message for a section whose BEGIN line predates this heph.
@@ -133,24 +159,6 @@ impl Report for GitignoreReport {
             ));
         }
         out
-    }
-
-    fn json(&self) -> serde_json::Value {
-        json!({
-            "schema": JSON_SCHEMA,
-            "stale": self.stale,
-            "reasons": self.reasons.iter().map(|r| r.as_str()).collect::<Vec<_>>(),
-            "written": self.written,
-            "lines": self.lines.iter().map(|l| json!({
-                "op": if l.added { "add" } else { "remove" },
-                "pattern": l.pattern,
-                "addr": l.addr,
-            })).collect::<Vec<_>>(),
-            "released": self.released.iter().map(|r| json!({
-                "path": r.path,
-                "addr": r.addr,
-            })).collect::<Vec<_>>(),
-        })
     }
 
     fn exit_code(&self) -> u8 {
@@ -280,7 +288,7 @@ pub fn execute(
     };
     run_cli(
         title,
-        args.json,
+        &args.out,
         args.dashboard.dashboard,
         sink,
         session,

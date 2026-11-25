@@ -5,9 +5,9 @@ use crate::tui::session::SessionSlot;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use serde_json::json;
+use serde::ser::SerializeStruct as _;
 
-use super::{JSON_SCHEMA, Report, blocking, display, empty_index_hint, read_gitignore, run_cli};
+use super::{Report, blocking, display, empty_index_hint, read_gitignore, run_cli};
 use crate::commands::GlobalOptions;
 use crate::engine::gitignore::{self, CopyTargets};
 use crate::engine::query::skip_unresolvable;
@@ -23,9 +23,8 @@ pub struct Args {
     /// Exit 1 when anything is listed
     #[arg(long)]
     pub check: bool,
-    /// Print the result as JSON
-    #[arg(long)]
-    pub json: bool,
+    #[command(flatten)]
+    pub out: output::JsonArgs<StatusReport>,
     #[command(flatten)]
     pub dashboard: crate::commands::progress_app::DashboardArgs,
 }
@@ -104,12 +103,40 @@ pub struct StatusItem {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+/// An item as `--json` prints it: `unresolved` has `package` and `error`
+/// instead of `path`, `addr` and `output`, so a consumer branches on `kind`.
+impl serde::Serialize for StatusItem {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        if self.kind == ItemKind::Unresolved {
+            let mut m = s.serialize_struct("StatusItem", 4)?;
+            m.serialize_field("kind", self.kind.as_str())?;
+            m.serialize_field("package", &self.package)?;
+            m.serialize_field("error", &self.error)?;
+            m.serialize_field("fix", &self.fix)?;
+            return m.end();
+        }
+        let mut m = s.serialize_struct("StatusItem", 5)?;
+        m.serialize_field("path", &self.path)?;
+        m.serialize_field("kind", self.kind.as_str())?;
+        m.serialize_field("addr", &self.addr)?;
+        m.serialize_field("output", &self.output)?;
+        m.serialize_field("fix", &self.fix)?;
+        m.end()
+    }
+}
+
+/// What `status` reports; under `--json`, the record it prints.
+#[derive(Debug, Clone, Default, serde::Serialize, output::Record)]
 pub struct StatusReport {
+    #[serde(skip)]
     pub check: bool,
-    /// Sorted by path (an `unresolved` item by its package), then kind.
+    /// What needs a decision, sorted by path (an `unresolved` item by its
+    /// package), then kind: `{path, kind, addr, output, fix}`, or
+    /// `{kind, package, error, fix}` for `unresolved`.
     pub items: Vec<StatusItem>,
-    /// The `codegen import` hint (Upgrade).
+    /// Present only when the index is empty but section lines match files on
+    /// disk: run `heph tool codegen import`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
 }
 
@@ -130,36 +157,6 @@ impl Report for StatusReport {
             out.push("nothing needs a decision".to_string());
         }
         out
-    }
-
-    fn json(&self) -> serde_json::Value {
-        let items: Vec<serde_json::Value> = self
-            .items
-            .iter()
-            .map(|i| {
-                if i.kind == ItemKind::Unresolved {
-                    json!({
-                        "kind": i.kind.as_str(),
-                        "package": i.package,
-                        "error": i.error,
-                        "fix": i.fix,
-                    })
-                } else {
-                    json!({
-                        "path": i.path,
-                        "kind": i.kind.as_str(),
-                        "addr": i.addr,
-                        "output": i.output,
-                        "fix": i.fix,
-                    })
-                }
-            })
-            .collect();
-        let mut doc = json!({ "schema": JSON_SCHEMA, "items": items });
-        if let (Some(h), Some(m)) = (&self.hint, doc.as_object_mut()) {
-            m.insert("hint".into(), json!(h));
-        }
-        doc
     }
 
     fn exit_code(&self) -> u8 {
@@ -449,7 +446,7 @@ pub fn execute(
     };
     run_cli(
         "Codegen status",
-        args.json,
+        &args.out,
         args.dashboard.dashboard,
         sink,
         session,

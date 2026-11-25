@@ -1,6 +1,6 @@
 //! `heph tool gen-gitignore` was removed with no alias (Decision 7): a hidden
-//! stub keeps the name only to fail with exit 2 and name its replacement,
-//! forwarding `--json`.
+//! stub keeps the name only to fail with exit 2 and name its replacement on
+//! stderr, swallowing an old `--json`.
 //!
 //! Drives the built `heph` binary, because what is under test is the
 //! process's exit status and what it prints.
@@ -65,19 +65,18 @@ fn gen_gitignore_removed_fails_with_hint() {
     }
 }
 
+/// An old `--json` is swallowed like any other argument: the removal goes to
+/// stderr, stdout stays empty, so `--json | jq` reads nothing.
 #[test]
-fn gen_gitignore_stub_forwards_json() {
+fn gen_gitignore_stub_swallows_json() {
     let (out, _ws) = run(&["tool", "gen-gitignore", "--json"]);
     assert_eq!(out.status.code(), Some(2), "{}", describe(&out));
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let doc: serde_json::Value = serde_json::from_str(stdout.trim())
-        .unwrap_or_else(|e| panic!("stdout is one JSON document ({e}): {}", describe(&out)));
-    assert_eq!(
-        doc,
-        serde_json::json!({
-            "schema": 1,
-            "error": "command_removed",
-            "use": "heph tool codegen gitignore",
-        })
+    assert!(out.stdout.is_empty(), "{}", describe(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("heph tool gen-gitignore was removed")
+            && stderr.contains("use heph tool codegen gitignore"),
+        "{}",
+        describe(&out)
     );
 }

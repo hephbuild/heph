@@ -165,39 +165,11 @@ where
     .await
 }
 
-/// [`run_engine_command`] for a command whose `--json` (`json`) keeps the TUI
-/// off. The terminal and `--no-tui` decide first, as for every other command,
-/// and that decision is the `interactive` telemetry records; `json` overrides
-/// it after.
-pub(crate) async fn run_engine_command_json<F, Fut>(
-    label: impl Into<String>,
-    sink: LogSink,
-    session: &Arc<SessionSlot>,
-    global: &GlobalOptions,
-    json: bool,
-    dashboard: bool,
-    body: F,
-) -> anyhow::Result<()>
-where
-    F: FnOnce(Arc<Engine>, Arc<RequestState>, AppContext) -> Fut + Send + 'static,
-    Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
-{
-    let no_tui = global.no_tui;
-    engine_command(
-        label,
-        sink,
-        session,
-        global,
-        dashboard,
-        unless_json(move || tui::should_use_tui(no_tui), json),
-        body,
-    )
-    .await
-}
-
-/// [`run_engine_command_json`] for a command that has opted into the output
+/// [`run_engine_command`] for a command that has opted into the output
 /// flags: the runner reads them, so under any of `--json`, `--fields`, `--jq`
-/// the TUI is off without the command having to remember (I1).
+/// the TUI is off without the command having to remember (I1). The terminal
+/// and `--no-tui` decide first, as for every other command, and that decision
+/// is the `interactive` telemetry records; the flags override it after.
 pub(crate) async fn run_engine_command_out<F, Fut>(
     label: impl Into<String>,
     sink: LogSink,
@@ -211,7 +183,17 @@ where
     F: FnOnce(Arc<Engine>, Arc<RequestState>, AppContext) -> Fut + Send + 'static,
     Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
 {
-    run_engine_command_json(label, sink, session, global, out.enabled(), dashboard, body).await
+    let (no_tui, json) = (global.no_tui, out.enabled());
+    engine_command(
+        label,
+        sink,
+        session,
+        global,
+        dashboard,
+        unless_json(move || tui::should_use_tui(no_tui), json),
+        body,
+    )
+    .await
 }
 
 /// The TUI decision of a command with `--json`: `decide` runs first, always,
