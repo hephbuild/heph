@@ -289,7 +289,8 @@ impl RunKind {
 struct Tested {
     /// The branch the group merges into; empty for a PR run.
     base: String,
-    /// A short commit sha: the group's merge commit, or the PR's head.
+    /// A short commit sha: the merge group's head commit (what the queue run
+    /// checks out and tests), or the PR's head.
     sha: String,
 }
 
@@ -344,36 +345,49 @@ fn pr_target() -> Option<PrTarget> {
         .ok()
         .filter(|s| !s.is_empty())
         .and_then(|path| std::fs::read(path).ok());
+    let env = |name| std::env::var(name).unwrap_or_default();
     pr_target_from(
         payload.as_deref(),
-        &std::env::var("GITHUB_REF").unwrap_or_default(),
-        &std::env::var("GITHUB_EVENT_NAME").unwrap_or_default(),
+        &env("GITHUB_REF"),
+        &env("GITHUB_EVENT_NAME"),
+        &env("GITHUB_SHA"),
     )
 }
 
-/// [`pr_target`] over a raw event payload, `GITHUB_REF` and
-/// `GITHUB_EVENT_NAME`. Pure (testable).
+/// [`pr_target`] over a raw event payload, `GITHUB_REF`, `GITHUB_EVENT_NAME`
+/// and `GITHUB_SHA`. Pure (testable).
 ///
 /// A merge-queue run is one whose event is `merge_group` (the payload has a
 /// `merge_group`, or the event name says so). Only then is its queue ref
 /// trusted — the payload's `merge_group.head_ref`, else `GITHUB_REF` — to name
 /// the PR the group was created for: a `push` to a `gh-readonly-queue/*` branch
-/// is neither a merge-queue run nor a PR run. Otherwise the payload's
-/// `pull_request.number`, falling back to a `refs/pull/<N>/merge` ref.
-fn pr_target_from(payload: Option<&[u8]>, git_ref: &str, event_name: &str) -> Option<PrTarget> {
+/// is neither a merge-queue run nor a PR run. What it tested is the payload's
+/// `merge_group.head_sha` (else `GITHUB_SHA`, the same commit on a
+/// `merge_group` event) on `merge_group.base_ref` (else the queue ref's base).
+/// Otherwise the payload's `pull_request.number`, falling back to a
+/// `refs/pull/<N>/merge` ref.
+fn pr_target_from(
+    payload: Option<&[u8]>,
+    git_ref: &str,
+    event_name: &str,
+    github_sha: &str,
+) -> Option<PrTarget> {
     let json = payload.and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok());
     let merge_group = json.as_ref().and_then(|j| j.get("merge_group"));
     if merge_group.is_some() || event_name == "merge_group" {
-        let q = merge_group
-            .and_then(|g| g.get("head_ref")?.as_str())
+        let field = |name: &str| merge_group.and_then(|g| g.get(name)?.as_str());
+        let q = field("head_ref")
             .and_then(parse_queue_ref)
             .or_else(|| parse_queue_ref(git_ref))?;
+        let base = field("base_ref")
+            .map(|b| b.strip_prefix("refs/heads/").unwrap_or(b))
+            .unwrap_or(q.base);
         return Some(PrTarget {
             pr: q.pr,
             kind: RunKind::MergeQueue,
             tested: Tested {
-                base: Tested::clean_base(q.base),
-                sha: Tested::short_sha(q.sha),
+                base: Tested::clean_base(base),
+                sha: Tested::short_sha(field("head_sha").unwrap_or(github_sha)),
             },
         });
     }
@@ -400,13 +414,12 @@ fn pr_target_from(payload: Option<&[u8]>, git_ref: &str, event_name: &str) -> Op
 struct QueueRef<'a> {
     base: &'a str,
     pr: u64,
-    /// Whatever follows `pr-<N>-`: the group's commit.
-    sha: &'a str,
 }
 
 /// Parse a merge-queue ref, `refs/heads/gh-readonly-queue/<base>/pr-<N>-<sha>`.
 /// The base branch may itself contain slashes, so the PR is read from the last
-/// segment. Pure.
+/// segment. The trailing sha is not the commit the group tests, and is not
+/// read. Pure.
 fn parse_queue_ref(git_ref: &str) -> Option<QueueRef<'_>> {
     let rest = git_ref
         .strip_prefix("refs/heads/")
@@ -414,11 +427,10 @@ fn parse_queue_ref(git_ref: &str) -> Option<QueueRef<'_>> {
         .strip_prefix("gh-readonly-queue/")?;
     let (base, leaf) = rest.rsplit_once('/')?;
     let pr_sha = leaf.strip_prefix("pr-")?;
-    let (digits, sha) = pr_sha.split_once('-').unwrap_or((pr_sha, ""));
+    let digits = pr_sha.split_once('-').map_or(pr_sha, |(d, _)| d);
     Some(QueueRef {
         base,
         pr: parse_pr_number(digits)?,
-        sha,
     })
 }
 
@@ -540,6 +552,18 @@ impl Groups {
     }
 }
 
+/// A run id read back from a body: `<run>-<attempt>`, both ASCII digits, else
+/// empty — an unknown run, which a run of the same kind resets. The id is
+/// echoed into the public heading, and the body is editable by anyone with
+/// write access to the PR.
+fn clean_run_id(run: &str) -> String {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    match run.split_once('-') {
+        Some((r, a)) if digits(r) && digits(a) => run.to_string(),
+        _ => String::new(),
+    }
+}
+
 /// One hidden marker of the body, as [`parse_groups`] reads it.
 enum Marker<'a> {
     GroupOpen(RunKind),
@@ -580,10 +604,17 @@ impl<'a> Marker<'a> {
 /// skipped as a unit, from its open tag to its own close tag (which carries the
 /// section's hashed key, so it is unambiguous), because its content embeds raw
 /// log tails: a target printing `<!-- /heph-gha-group:pr -->` must not move a
-/// block's boundary. A section with no close tag ends the parse.
+/// block's boundary. A section with no close tag ends its block, and reading
+/// resumes at the next open of the other kind's block, if any.
+///
+/// The limit: a section whose content holds its **own** close tag ends there,
+/// and the rest of its content is read as top level. The tag carries a hash of
+/// the command, so a target would have to print exactly that; log tails are
+/// not escaped.
 ///
 /// A group open with no close ends at the next top-level group open, or at the
-/// end of the body. When a kind's block appears twice, the **first** wins.
+/// end of the body. When a kind's block appears twice, the **first** wins. A
+/// run marker that is not `<run>-<attempt>` reads as no run.
 ///
 /// A body with no group delimiters predates them: it is one run's sections under
 /// a single run marker, and only PR runs ever wrote one (a merge-queue run found
@@ -632,7 +663,7 @@ fn parse_groups(body: &str) -> Groups {
             }
             Marker::Run(run) => {
                 if target.run_id.is_empty() {
-                    target.run_id = run.to_string();
+                    target.run_id = clean_run_id(run);
                 }
             }
             Marker::Tested(tested) => {
@@ -644,10 +675,23 @@ fn parse_groups(body: &str) -> Groups {
             }
             Marker::Step(key) => {
                 let close = section_close(key);
-                let Some(k) = rest.find(&close) else { break };
-                let (Some(content), Some(next)) = (rest.get(..k), rest.get(k + close.len()..))
-                else {
-                    break;
+                let section = rest
+                    .find(&close)
+                    .and_then(|k| Some((rest.get(..k)?, rest.get(k + close.len()..)?)));
+                let Some((content, next)) = section else {
+                    // Unclosed: where its content ends is unknown. It ends its
+                    // block; a later block of another kind is still read.
+                    let Some((kind, _)) = &current else { break };
+                    let other = group_open(match kind {
+                        RunKind::PullRequest => RunKind::MergeQueue,
+                        RunKind::MergeQueue => RunKind::PullRequest,
+                    });
+                    finish(&mut groups, &mut current);
+                    let Some(resume) = rest.find(&other).and_then(|k| rest.get(k..)) else {
+                        break;
+                    };
+                    rest = resume;
+                    continue;
                 };
                 target
                     .sections
@@ -794,13 +838,19 @@ struct CommentConfig {
     timeout: Duration,
 }
 
-/// Total budget for the close-time sync, every request included.
+/// Budget for the close-time sync, counted from when it holds the comment
+/// lock; the write gets at least [`WRITE_FLOOR`] on top.
 ///
 /// `fetch_existing` can walk several pages, and the host awaits `Hook::drain`
 /// before exiting — so without a ceiling a slow or hanging GitHub API adds
 /// minutes to `heph`'s exit. The comment is best-effort; the step summary is the
 /// durable artifact, and it is written whether or not this succeeds.
 const CLOSE_SYNC_BUDGET: Duration = Duration::from_secs(10);
+
+/// The least a write is given, however much of the sync's budget the reads
+/// used: the write carries the closed render, and skipping it leaves the
+/// comment showing a finished build as running.
+const WRITE_FLOOR: Duration = Duration::from_secs(2);
 
 /// Per-request timeout for live updates.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -995,8 +1045,21 @@ impl CommentClient {
             return;
         };
         let mut fresh = parse_groups(&body);
+        let mut unchanged = true;
         for other in RunKind::ALL.into_iter().filter(|k| *k != self.cfg.kind) {
-            *st.groups.slot(other) = fresh.slot(other).take();
+            let theirs = fresh.slot(other).take();
+            unchanged &= *st.groups.slot(other) == theirs;
+            *st.groups.slot(other) = theirs;
+        }
+        // The 304 saving rests on our write's `ETag` matching what a `GET` of
+        // the same body returns, which only a real run can show.
+        if unchanged && st.etag.is_some() {
+            tracing::debug!(
+                sent = st.etag.as_deref(),
+                got = etag.as_deref(),
+                "conditional re-read of the status comment returned 200 with the other \
+                 blocks unchanged; the write's ETag likely does not match the GET's"
+            );
         }
         st.etag = etag;
     }
@@ -1023,11 +1086,15 @@ impl CommentClient {
     /// comment, so a write by the other run landing between our re-read and our
     /// write is overwritten. The window is one round trip per write.
     ///
-    /// `deadline` bounds the whole call, every request included: each request's
-    /// timeout is lowered to what is left of it, and the write is skipped once
-    /// it has passed.
-    fn sync(&self, render: impl FnOnce() -> String, deadline: Option<Instant>) {
+    /// `budget` bounds the reads, starting **once the lock is held**: a close
+    /// that waited for a live tick's hung request must not find its budget
+    /// spent and skip the write, leaving the comment on its "⏳ running" render
+    /// for good. Each request's timeout is lowered to what is left of it, but
+    /// the write is never skipped: it gets at least [`WRITE_FLOOR`] (capped by
+    /// the per-request timeout), so a call takes at most `budget` plus that.
+    fn sync(&self, render: impl FnOnce() -> String, budget: Option<Duration>) {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let deadline = budget.map(|b| Instant::now() + b);
         let markdown = render();
         let kind = self.cfg.kind;
         if !st.loaded {
@@ -1054,10 +1121,10 @@ impl CommentClient {
         upsert_section(&mut own.sections, &self.cfg.section_key, &markdown);
         let body = assemble_body(&self.container_marker, &self.cfg.repo_url, &st.groups);
 
-        let Some(timeout) = self.request_timeout(deadline) else {
-            tracing::warn!("no time left to write the status comment");
-            return;
-        };
+        let timeout = self
+            .request_timeout(deadline)
+            .unwrap_or_default()
+            .max(WRITE_FLOOR.min(self.cfg.timeout));
         let payload = serde_json::json!({ "body": body });
         let result = match st.id {
             Some(cid) => self
@@ -1276,9 +1343,9 @@ impl Inner {
     /// Unconditional once the build starts: the comment is created on its first
     /// event and kept current for the whole run, so it is present and findable
     /// from the moment the build begins rather than appearing partway through.
-    fn sync_comment(&self, deadline: Option<Instant>) {
+    fn sync_comment(&self, budget: Option<Duration>) {
         let Some(c) = &self.comment else { return };
-        c.sync(|| self.render_live(), deadline);
+        c.sync(|| self.render_live(), budget);
     }
 
     /// The live comment body for the current tally.
@@ -1506,8 +1573,7 @@ impl Hook for GhaHook {
         // An ordinary sync: it re-reads the comment like every other, so the
         // last write carries the other kind's block as it is now.
         if self.inner.started.load(Ordering::Acquire) {
-            self.inner
-                .sync_comment(Some(Instant::now() + CLOSE_SYNC_BUDGET));
+            self.inner.sync_comment(Some(CLOSE_SYNC_BUDGET));
         }
         // The summary is the durable report; the comment is only a notification.
         self.inner.write_summary();
@@ -1810,6 +1876,73 @@ mod tests {
     }
 
     #[test]
+    fn a_run_marker_that_is_not_a_run_reads_as_no_run() {
+        // The run id is echoed into the public heading's link.
+        for bad in [
+            "1-x",
+            "](https://evil)-1",
+            "12",
+            "-3",
+            "4-",
+            "+1-2",
+            "1-2-3",
+        ] {
+            let body = format!(
+                "<!-- heph-gha-group:pr -->\n<!-- heph-gha-run:{bad} -->\n\
+                 <!-- heph-gha-step:a -->\nx\n<!-- /heph-gha-step:a -->\n\
+                 <!-- /heph-gha-group:pr -->"
+            );
+            let g = parse_groups(&body).pull_request.expect("PR block");
+            assert_eq!(g.run_id, "", "{bad}");
+        }
+        assert_eq!(clean_run_id("123-4"), "123-4");
+    }
+
+    #[test]
+    fn an_unclosed_section_ends_its_block_not_the_parse() {
+        // A truncated PR section: its block ends there, and the merge-queue
+        // block after it is still read.
+        let body = "<!-- heph-gha:test -->\n\
+                    <!-- heph-gha-group:pr -->\n<!-- heph-gha-run:1-1 -->\n\
+                    <!-- heph-gha-step:a -->\npr a\n<!-- /heph-gha-step:a -->\n\
+                    <!-- heph-gha-step:b -->\ntruncated\n\
+                    <!-- heph-gha-group:merge-queue -->\n<!-- heph-gha-run:2-1 -->\n\
+                    <!-- heph-gha-step:c -->\nqueue c\n<!-- /heph-gha-step:c -->\n\
+                    <!-- /heph-gha-group:merge-queue -->";
+        assert_eq!(
+            parse_groups(body),
+            Groups {
+                pull_request: Some(group("1-1", vec![("a".into(), "pr a".into())])),
+                merge_queue: Some(group("2-1", vec![("c".into(), "queue c".into())])),
+            }
+        );
+    }
+
+    #[test]
+    fn a_section_holding_its_own_close_tag_ends_there() {
+        // The documented limit: the section ends at the first copy of its own
+        // close tag, and the rest of its content is read as top level. Nothing
+        // panics, and the other kind's block survives.
+        let groups = Groups {
+            pull_request: Some(group(
+                "1-1",
+                vec![(
+                    "a".into(),
+                    "before\n<!-- /heph-gha-step:a -->\nafter".into(),
+                )],
+            )),
+            merge_queue: Some(group("2-1", vec![("c".into(), "queue c".into())])),
+        };
+        let body = assemble_body("<!-- heph-gha:test -->", "", &groups);
+        let parsed = parse_groups(&body);
+        assert_eq!(
+            parsed.pull_request,
+            Some(group("1-1", vec![("a".into(), "before".into())]))
+        );
+        assert_eq!(parsed.merge_queue, groups.merge_queue);
+    }
+
+    #[test]
     fn both_blocks_at_full_section_budget_fit_the_comment() {
         // Three steps per block, each section rendered at the full live budget,
         // with every marker and heading at its longest.
@@ -1885,9 +2018,14 @@ mod tests {
         };
         let pr = |n| target(n, RunKind::PullRequest, "", "");
         let pr_at = |n, sha| target(n, RunKind::PullRequest, "", sha);
-        let mq = |n, base| target(n, RunKind::MergeQueue, base, "0123456789ab");
+        // `GITHUB_SHA`: the commit a merge-group run checked out.
+        let run_sha = "fedcba9876543210fedcba9876543210fedcba98";
+        let mq = |n, base| target(n, RunKind::MergeQueue, base, "fedcba987654");
         let at = |payload: &str, git_ref: &str, event: &str| {
-            pr_target_from(Some(payload.as_bytes()), git_ref, event)
+            pr_target_from(Some(payload.as_bytes()), git_ref, event, run_sha)
+        };
+        let pr_target_from = |payload: Option<&[u8]>, git_ref: &str, event: &str| {
+            pr_target_from(payload, git_ref, event, run_sha)
         };
 
         let sha = "0123456789abcdef0123456789abcdef01234567";
@@ -1915,6 +2053,18 @@ mod tests {
         assert_eq!(at(&queue, "", "merge_group"), mq(42, "main"));
         // The payload alone says it is a merge-group event.
         assert_eq!(at(&queue, "", ""), mq(42, "main"));
+        // What was tested is the group's head commit on its base branch, from
+        // the payload — not the sha in the queue ref's name.
+        let full = serde_json::json!({ "merge_group": {
+            "head_ref": queue_ref,
+            "head_sha": "abcdef0123456789abcdef0123456789abcdef01",
+            "base_ref": "refs/heads/release/v2",
+        } })
+        .to_string();
+        assert_eq!(
+            at(&full, "", "merge_group"),
+            target(42, RunKind::MergeQueue, "release/v2", "abcdef012345")
+        );
         assert_eq!(
             pr_target_from(None, &queue_ref, "merge_group"),
             mq(42, "main")

@@ -580,10 +580,7 @@ fn a_failed_re_read_still_writes_the_final_report() {
 
         let c = CommentClient::new(config(&gh.url, "sec", "1-1"));
         c.sync(|| "pr ci running".to_string(), None);
-        c.sync(
-            || "pr ci finished".to_string(),
-            Some(std::time::Instant::now() + CLOSE_SYNC_BUDGET),
-        );
+        c.sync(|| "pr ci finished".to_string(), Some(CLOSE_SYNC_BUDGET));
 
         let reqs = gh.requests();
         assert_eq!(
@@ -662,14 +659,12 @@ fn the_close_deadline_bounds_a_hanging_api() {
     cfg.timeout = Duration::from_secs(30);
     let c = CommentClient::new(cfg);
 
+    let budget = Duration::from_millis(500);
     let start = std::time::Instant::now();
-    c.sync(
-        || "body".to_string(),
-        Some(std::time::Instant::now() + Duration::from_millis(500)),
-    );
+    c.sync(|| "body".to_string(), Some(budget));
     let elapsed = start.elapsed();
     assert!(
-        elapsed < Duration::from_secs(2),
+        elapsed < budget + WRITE_FLOOR + Duration::from_secs(1),
         "close sync must be bounded, took {elapsed:?}"
     );
 }
@@ -690,16 +685,15 @@ fn the_close_deadline_bounds_the_re_read_and_the_write_together() {
     let c = CommentClient::new(cfg);
     c.sync(|| "tick".to_string(), None);
 
-    let deadline = Duration::from_millis(600);
+    // The re-read gets half the budget; the write what is left, raised to the
+    // floor so it is never skipped.
+    let budget = Duration::from_millis(600);
     let start = std::time::Instant::now();
-    c.sync(
-        || "final".to_string(),
-        Some(std::time::Instant::now() + deadline),
-    );
+    c.sync(|| "final".to_string(), Some(budget));
     let elapsed = start.elapsed();
     assert!(
-        elapsed < deadline + Duration::from_secs(1),
-        "the whole close is bounded by the deadline, took {elapsed:?}"
+        elapsed < budget + WRITE_FLOOR + Duration::from_secs(1),
+        "the whole close is bounded by the budget and the write floor, took {elapsed:?}"
     );
     // The server records a request it leaves hanging on its own thread.
     eventually(|| gh.requests().len() >= 4);
@@ -709,6 +703,38 @@ fn the_close_deadline_bounds_the_re_read_and_the_write_together() {
         ["GET", "PATCH", "GET", "PATCH"],
         "the re-read leaves the write its turn"
     );
+}
+
+#[test]
+fn a_close_waiting_on_a_hung_live_tick_still_writes_the_closed_render() {
+    // The live thread holds the comment lock through a re-read that hangs for
+    // its whole per-request timeout. The close waits for the lock; its budget
+    // used to start before that wait, so it found no time left, skipped the
+    // write, and the comment kept the "running" render for good.
+    let both = both_blocks("1-1", "pr ci", "2-1", "queue results");
+    let gh = FakeGitHub::serve(vec![
+        listed(99, &both).into(),
+        ("200 OK", "{}".to_string()).into(),
+        (HANG, String::new()).into(),
+        ("200 OK", "{}".to_string()).into(),
+    ]);
+    let mut cfg = config(&gh.url, "sec", "1-1");
+    cfg.timeout = Duration::from_millis(800);
+    let c = Arc::new(CommentClient::new(cfg));
+    c.sync(|| "running".to_string(), None);
+
+    let live = Arc::clone(&c);
+    let tick = std::thread::spawn(move || live.sync(|| "still running".to_string(), None));
+    // The live tick's re-read is in flight: it holds the lock.
+    eventually(|| gh.hits() >= 3);
+    c.sync(|| "closed".to_string(), Some(Duration::from_millis(300)));
+    drop(tick.join());
+
+    let reqs = gh.requests();
+    let last = reqs.last().expect("requests");
+    assert_eq!(last.method, "PATCH", "{reqs:#?}");
+    assert!(last.body.contains("closed"), "{reqs:#?}");
+    assert!(!last.body.contains("running"), "{reqs:#?}");
 }
 
 /// Wait up to 5s for `cond`, for state another thread is about to reach.
