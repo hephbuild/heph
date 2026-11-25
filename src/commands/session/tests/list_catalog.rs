@@ -544,3 +544,110 @@ async fn list_failed_with_addr_is_the_target_failing() {
         "without --addr, every session that failed"
     );
 }
+
+/// FQ M6, catalog side: a truncated recording (`truncated=1`) and one in a
+/// format this heph does not know (`user_version=99`). The catalog keeps
+/// the first's `truncated` and `list` marks it `incomplete`, from the
+/// recording and, once that is gone, from the catalog row alone; the second
+/// is counted `heal.unknown` (no heal-failure row, so no retry), and `list`
+/// still answers (exit 0) with its placeholder.
+#[tokio::test]
+async fn list_over_a_truncated_and_an_unknown_format_recording() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    let now = hcore::events::now_unix_ms();
+    let hour = 60 * 60 * 1000;
+    // Cut at its ceiling: the status says so, and the session row stops
+    // the explorer rows (`truncated=1`), as the recorder leaves it.
+    let cut = SessionId::new(now - 2 * hour, 7);
+    let start = cut.started_unix_ms();
+    let dir = write_ended(
+        root,
+        &meta(cut, 100, &["heph", "run", ADDR]),
+        &resolved(ADDR, start, true, None),
+        &SessionSnapshot {
+            truncated: true,
+            ..ended(Some(0), start + 1_000)
+        },
+    );
+    testing::alter(&dir, "UPDATE session SET truncated = 1, truncated_seq = 3").expect("truncated");
+    let unknown = session(root, now, hour, "run", ADDR, Did::Ran, &AGENT);
+    testing::alter(&root.join(unknown.encode()), "PRAGMA user_version = 99")
+        .expect("an unknown format");
+
+    let cat = crate::tui::session::catalog::open(root, now).expect("open");
+    assert!(!cat.in_memory, "{:?}", cat.notes);
+    assert_eq!(cat.heal.unknown, 1, "{:?}", cat.heal);
+    assert_eq!(cat.heal.failed, 0, "{:?}", cat.heal);
+    let count = |sql: &str| -> i64 {
+        cat.conn
+            .query_row(sql, [], |r| r.get(0))
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+    };
+    assert_eq!(count("SELECT count(*) FROM heal_failures"), 0);
+    assert_eq!(
+        count(&format!(
+            "SELECT truncated FROM sessions WHERE session_id = '{}'",
+            cut.encode()
+        )),
+        1
+    );
+    assert_eq!(
+        count(&format!(
+            "SELECT count(*) FROM sessions WHERE session_id = '{}'",
+            unknown.encode()
+        )),
+        0,
+        "an unknown format is never copied"
+    );
+    drop(cat);
+
+    let row_of = |table: &str, id: SessionId| {
+        table
+            .lines()
+            .find(|l| l.starts_with(&id.encode()))
+            .unwrap_or_else(|| panic!("{} is listed:\n{table}", id.encode()))
+            .to_owned()
+    };
+    let session_of = |json: &serde_json::Value, id: SessionId| {
+        json["sessions"]
+            .as_array()
+            .expect("sessions")
+            .iter()
+            .find(|s| s["id"] == id.encode())
+            .unwrap_or_else(|| panic!("{} is listed: {json}", id.encode()))
+            .clone()
+    };
+    let (table, notes) = list_at(root, now, &since(7, now), false).await;
+    assert!(
+        row_of(&table, cut).contains("  incomplete"),
+        "{table}\n{notes:?}"
+    );
+    assert!(
+        row_of(&table, unknown).contains("format 99, needs newer heph"),
+        "{table}"
+    );
+    let (json, _) = list_at(root, now, &since(7, now), true).await;
+    let json: serde_json::Value = serde_json::from_str(&json).expect("json");
+    assert_eq!(session_of(&json, cut)["incomplete"], true, "{json}");
+    assert_eq!(session_of(&json, unknown)["format"], 99, "{json}");
+    assert_eq!(
+        session_of(&json, unknown)["incomplete"],
+        serde_json::Value::Null,
+        "{json}"
+    );
+
+    // The recording gone, the catalog row alone still says it.
+    std::fs::remove_dir_all(root.join(cut.encode())).expect("remove the recording");
+    let (json, _) = list_at(root, now, &since(7, now), true).await;
+    let json: serde_json::Value = serde_json::from_str(&json).expect("json");
+    assert_eq!(session_of(&json, cut)["incomplete"], true, "{json}");
+    let (table, _) = list_at(root, now, &since(7, now), false).await;
+    assert!(
+        row_of(&table, cut).contains(" incomplete "),
+        "the table agrees with --json:\n{table}"
+    );
+    let cat = crate::tui::session::catalog::open(root, now).expect("open again");
+    assert_eq!(cat.heal.unknown, 1, "skipped again, never failed");
+    assert_eq!(cat.heal.failed + cat.heal.deferred, 0, "{:?}", cat.heal);
+}

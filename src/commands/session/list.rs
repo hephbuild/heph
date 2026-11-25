@@ -787,7 +787,14 @@ fn catalog_row(c: &Listed, lead: [String; 5], state: SessionState, opts: ViewOpt
         (Some(_), Some(code)) => code.to_string(),
         (Some(_), None) => "signal".to_owned(),
     };
-    let progress = if c.recorded { "-" } else { "not recorded" };
+    // `incomplete` as a recording's status says it, from the catalog's
+    // `truncated` once the recording is gone (as `--json` does).
+    let progress = match (c.recorded, c.truncated) {
+        (true, false) => "-",
+        (true, true) => "incomplete",
+        (false, false) => "not recorded",
+        (false, true) => "not recorded  incomplete",
+    };
     let now = c.ended_ms.map_or_else(
         || "-".to_owned(),
         |end| format!("{} ago", ago(opts.now_ms, end)),

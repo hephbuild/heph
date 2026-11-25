@@ -471,3 +471,49 @@ fn query_interrupted_exits_130() {
         (Some(125), "stopped after --timeout 1s")
     );
 }
+
+/// FQ M6, query side: `coverage.truncated` counts a truncated recording
+/// (`truncated=1`) from each kind of source: the catalog, one recording in
+/// place (`--from`), and recordings copied (`--full`); a recording in an
+/// unknown format (`user_version=99`) is skipped, never a heal failure,
+/// and the query still answers.
+#[tokio::test]
+async fn query_coverage_counts_truncated_sessions() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().join("sessions");
+    let cut = session(&root, 0, 1);
+    testing::alter(&root.join(cut.encode()), "UPDATE session SET truncated = 1")
+        .expect("truncated");
+    session(&root, 60_000, 2);
+    let unknown = session(&root, 120_000, 3);
+    testing::alter(&root.join(unknown.encode()), "PRAGMA user_version = 99")
+        .expect("an unknown format");
+    let count = "SELECT count(*) AS n FROM sessions";
+
+    let ran = run_query(&root, &["--format", "json", count], "").await;
+    let v = json(&ran.out.expect("catalog"));
+    assert_eq!(v["rows"], serde_json::json!([["2"]]), "{v}");
+    assert_eq!(v["coverage"]["catalog"], serde_json::json!(["sessions"]));
+    assert_eq!(v["coverage"]["truncated"], 1, "{v}");
+
+    let id = cut.encode();
+    let ran = run_query(&root, &["--format", "json", "--from", &id, count], "").await;
+    let v = json(&ran.out.expect("in place"));
+    assert_eq!(v["coverage"]["recordings"], 1, "{v}");
+    assert_eq!(v["coverage"]["truncated"], 1, "{v}");
+
+    let ran = run_query(&root, &["--format", "json", "--full", count], "").await;
+    let v = json(&ran.out.expect("full"));
+    assert_eq!(v["coverage"]["recordings"], 2, "{v}");
+    assert_eq!(v["coverage"]["skipped"], 1, "{v}");
+    assert_eq!(v["coverage"]["truncated"], 1, "{v}");
+
+    let failures: i64 = rusqlite::Connection::open_with_flags(
+        root.join(crate::tui::session::catalog::FILE),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("open the catalog")
+    .query_row("SELECT count(*) FROM heal_failures", [], |r| r.get(0))
+    .expect("heal_failures");
+    assert_eq!(failures, 0, "an unknown format is skipped, not failed");
+}
