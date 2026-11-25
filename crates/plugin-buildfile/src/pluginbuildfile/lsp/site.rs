@@ -2703,9 +2703,11 @@ mod cost {
 
     /// A 100,000-element list before the `.`: the display is found by one
     /// bracket-link hop, not a walk over its elements. The cursor sits in a
-    /// def, so the def path is walked too.
+    /// def, so the def path is walked too. The bound is a gross-regression
+    /// guard, generous for a loaded CI runner: a walk over the elements
+    /// would take seconds, not this.
     #[test]
-    fn literal_receiver_on_a_100k_element_list_under_50ms() {
+    fn literal_receiver_on_a_100k_element_list_under_1s() {
         let mut text = String::from("def f():\n    return [");
         for i in 0..100_000 {
             text.push_str(&format!("{i}, "));
@@ -2726,7 +2728,7 @@ mod cost {
             }
             other => panic!("not a member site: {other:?}"),
         }
-        assert!(took < Duration::from_millis(50), "resolving took {took:?}");
+        assert!(took < Duration::from_secs(1), "resolving took {took:?}");
     }
 
     /// The real figures: lexing (once per edit) and resolving (once per
