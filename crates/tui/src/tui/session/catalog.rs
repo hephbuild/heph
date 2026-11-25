@@ -282,8 +282,24 @@ enum Unusable {
     Newer { writer: Option<String> },
     /// Not a heph catalog.
     Foreign,
+    /// A heph catalog in an older format (`user_version`): never stamped
+    /// current over its old tables, moved aside and rebuilt like a corrupt
+    /// one.
+    Older { version: u32 },
     /// Any SQLite error: [`is_corrupt`] says whether it means corrupt.
     Sql(rusqlite::Error),
+}
+
+impl Unusable {
+    /// Why a repair moves it aside and rebuilds it; `None`: it is left as
+    /// it is.
+    fn rebuilt_because(&self) -> Option<String> {
+        match self {
+            Self::Older { version } => Some(format!("was in an older format ({version})")),
+            Self::Sql(e) if is_corrupt(e) => Some("was corrupt".to_owned()),
+            _ => None,
+        }
+    }
 }
 
 impl From<rusqlite::Error> for Unusable {
@@ -300,6 +316,7 @@ impl std::fmt::Display for Unusable {
             }
             Self::Newer { writer: None } => write!(f, "it was written by a newer heph"),
             Self::Foreign => write!(f, "it is not a heph session catalog"),
+            Self::Older { version } => write!(f, "it is in an older format ({version})"),
             Self::Sql(e) => write!(f, "{e}"),
         }
     }
@@ -339,36 +356,56 @@ fn open_rw(root: &Path, create: bool) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
-/// Check the catalog's header and create its schema when it is new.
-fn ensure_schema(conn: &Connection, in_memory: bool) -> Result<(), Unusable> {
-    let header = |conn: &Connection| -> rusqlite::Result<(u32, u32)> {
-        Ok((
-            conn.pragma_query_value(None, "application_id", |r| r.get(0))?,
-            conn.pragma_query_value(None, "user_version", |r| r.get(0))?,
-        ))
-    };
-    let check = |app: u32, version: u32| -> Result<bool, Unusable> {
-        if version > FORMAT {
-            let writer = conn
-                .query_row("SELECT heph_version FROM info", [], |r| r.get(0))
-                .ok();
-            return Err(Unusable::Newer { writer });
+/// What [`classify`] found a usable catalog to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shape {
+    /// This heph's format.
+    Ready,
+    /// No table yet: the schema is to be made.
+    Empty,
+}
+
+/// Read the header and the table count in the caller's transaction, so both
+/// are one snapshot: a catalog another process made between two separate
+/// reads looked foreign (no application id, tables).
+///
+/// Another application's id is foreign whatever its `user_version`; heph's
+/// with a newer one is newer; with an older one and tables, older.
+fn classify(conn: &Connection) -> Result<Shape, Unusable> {
+    let app: u32 = conn.pragma_query_value(None, "application_id", |r| r.get(0))?;
+    let version: u32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    if app == APPLICATION_ID {
+        match version.cmp(&FORMAT) {
+            std::cmp::Ordering::Equal => return Ok(Shape::Ready),
+            std::cmp::Ordering::Greater => {
+                let writer = conn
+                    .query_row("SELECT heph_version FROM info", [], |r| r.get(0))
+                    .ok();
+                return Err(Unusable::Newer { writer });
+            }
+            std::cmp::Ordering::Less => {}
         }
-        if app == APPLICATION_ID && version == FORMAT {
-            return Ok(true);
-        }
-        if app != 0 && app != APPLICATION_ID {
-            return Err(Unusable::Foreign);
-        }
-        Ok(false)
-    };
-    let (app, version) = header(conn)?;
-    if check(app, version)? {
-        return Ok(());
+    } else if app != 0 {
+        return Err(Unusable::Foreign);
     }
     let tables: i64 = conn.query_row("SELECT count(*) FROM sqlite_schema", [], |r| r.get(0))?;
-    if tables > 0 && app == 0 {
-        return Err(Unusable::Foreign);
+    match (tables, app) {
+        (0, _) => Ok(Shape::Empty),
+        (_, APPLICATION_ID) => Err(Unusable::Older { version }),
+        _ => Err(Unusable::Foreign),
+    }
+}
+
+/// Check the catalog's header and create its schema when it is new.
+fn ensure_schema(conn: &Connection, in_memory: bool) -> Result<(), Unusable> {
+    conn.execute_batch("BEGIN")?;
+    let shape = classify(conn);
+    if !conn.is_autocommit() {
+        // A read: ending it is all a rollback does.
+        rollback(conn);
+    }
+    if shape? == Shape::Ready {
+        return Ok(());
     }
     if !in_memory {
         let mode: String =
@@ -386,8 +423,7 @@ fn ensure_schema(conn: &Connection, in_memory: bool) -> Result<(), Unusable> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let made = (|| -> Result<(), Unusable> {
         // Another process may have made it meanwhile.
-        let (app, version) = header(conn)?;
-        if check(app, version)? {
+        if classify(conn)? == Shape::Ready {
             return Ok(());
         }
         conn.execute_batch(SCHEMA)?;
@@ -548,7 +584,7 @@ fn open_on_disk(root: &Path, now_ms: u64) -> Result<Catalog, String> {
             .and_then(|c| ensure_schema(&c, false).map(|()| c));
         match opened {
             Ok(conn) => conn,
-            Err(Unusable::Sql(e)) if is_corrupt(&e) => {
+            Err(e) if e.rebuilt_because().is_some() => {
                 repair(root, &lock, now_ms, &mut notes, &mut rebuilt)?
             }
             Err(e) => return Err(e.to_string()),
@@ -574,10 +610,11 @@ fn open_on_disk(root: &Path, now_ms: u64) -> Result<Catalog, String> {
     })
 }
 
-/// Repair a missing or corrupt catalog: drop the shared lock (a shared to
-/// exclusive `flock` conversion is not atomic), take it exclusively — once no
-/// other connection holds it — and check again; then move a corrupt one
-/// aside (`-wal` and `-shm` before the file), delete an orphan `-wal`, and
+/// Repair a missing, corrupt or older-format catalog: drop the shared lock (a
+/// shared to exclusive `flock` conversion is not atomic), take it exclusively
+/// — once no other connection holds it — and check again; then move a
+/// corrupt or older one aside (`-wal` and `-shm` before the file, under
+/// [`CORRUPT_PREFIX`] so the sweep removes it), delete an orphan `-wal`, and
 /// rebuild it from every kept recording. Ends holding the lock shared again.
 fn repair(
     root: &Path,
@@ -601,10 +638,14 @@ fn repair(
                 downgrade(lock)?;
                 return Ok(conn);
             }
-            Err(Unusable::Sql(e)) if is_corrupt(&e) => {}
-            Err(e) => return Err(e.to_string()),
+            Err(e) => match e.rebuilt_because() {
+                Some(why) => {
+                    let to = move_aside(root, now_ms).map_err(|e| format!("{e:#}"))?;
+                    Some((why, to))
+                }
+                None => return Err(e.to_string()),
+            },
         }
-        Some(move_aside(root, now_ms).map_err(|e| format!("{e:#}"))?)
     } else {
         None
     };
@@ -633,7 +674,7 @@ fn repair(
         None => "no recording is kept".to_owned(),
     };
     let what = match &moved {
-        Some(to) => format!("the session catalog was corrupt, moved to {}", to.display()),
+        Some((why, to)) => format!("the session catalog {why}, moved to {}", to.display()),
         None => "the session catalog was missing".to_owned(),
     };
     notes.push(format!(

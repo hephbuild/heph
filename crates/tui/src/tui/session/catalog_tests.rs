@@ -433,6 +433,86 @@ fn a_lost_catalog_is_rebuilt_on_open() {
     );
 }
 
+/// A heph catalog in an older format (`user_version` below [`catalog::FORMAT`],
+/// tables in it) is never stamped current over its old tables: an owner
+/// leaves it as it is, and the next command moves it aside and rebuilds it.
+#[test]
+fn an_older_catalog_is_moved_aside_and_rebuilt() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    let dir = sealed(root, recent_id(1, 1_000));
+    catalog::record_seal(root, &dir, true);
+    let original = snapshot(&read(root));
+    let path = root.join(catalog::FILE);
+    {
+        let conn = Connection::open(&path).expect("open");
+        conn.execute_batch("PRAGMA user_version = 0; PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("stamp older");
+    }
+    let late = sealed(root, recent_id(2, 0));
+    catalog::record_seal(root, &late, true);
+    {
+        let conn = read(root);
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .expect("user_version");
+        assert_eq!(version, 0, "an owner never stamps an older catalog");
+        assert_eq!(
+            count(&conn, "SELECT count(*) FROM sessions"),
+            1,
+            "an owner never writes an older catalog"
+        );
+    }
+    std::fs::remove_dir_all(&late).expect("rm");
+
+    let opened = catalog::open(root, now_ms()).expect("open");
+    assert!(!opened.in_memory, "{:?}", opened.notes);
+    assert_eq!(snapshot(&opened.conn), original);
+    assert_eq!(opened.notes.len(), 1, "{:?}", opened.notes);
+    assert!(
+        opened.notes[0].contains("older format"),
+        "{:?}",
+        opened.notes
+    );
+    assert_eq!(corrupt_files(root).len(), 1, "{:?}", corrupt_files(root));
+    let version: u32 = opened
+        .conn
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .expect("user_version");
+    assert_eq!(version, catalog::FORMAT);
+}
+
+/// A file with another application's id is named foreign, whatever its
+/// `user_version`: never "written by a newer heph".
+#[test]
+fn a_foreign_catalog_is_foreign_before_newer() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    let path = root.join(catalog::FILE);
+    {
+        let conn = Connection::open(&path).expect("open");
+        conn.execute_batch(&format!(
+            "CREATE TABLE t (x); PRAGMA application_id = 305419896; PRAGMA user_version = {}",
+            catalog::FORMAT + 1
+        ))
+        .expect("a foreign file");
+    }
+    let before = std::fs::read(&path).expect("read");
+    let opened = catalog::open(root, now_ms()).expect("open");
+    assert!(opened.in_memory);
+    assert!(
+        opened.notes[0].contains("not a heph session catalog"),
+        "{:?}",
+        opened.notes
+    );
+    drop(opened);
+    assert!(
+        std::fs::read(&path).expect("read") == before,
+        "never written"
+    );
+    assert!(corrupt_files(root).is_empty());
+}
+
 /// `catalog_repair_is_guarded` (I8): busy and permission failures answer
 /// from the recordings and never move the catalog aside; a newer
 /// `user_version` is never written and names its writer. (FULL takes the
