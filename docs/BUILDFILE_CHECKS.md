@@ -36,7 +36,10 @@ they are exempt.
 A BUILD file can declare its own types and annotate with them. The available
 forms are `record` (with `field` for a default), `enum`, a type alias, and
 `typing` (`typing.Any`, `typing.Callable`, `typing.Iterable`,
-`typing.Never`). A declared type can be loaded like any other name:
+`typing.Never`). Starlark's `eval_type(x)`, which turns a value into a type,
+comes with `typing`. These are ordinary globals: a file that binds one of the
+names itself keeps its own binding. A declared type can be loaded like any
+other name:
 
 ```python
 Mode = enum("debug", "release")
@@ -48,19 +51,30 @@ def lib(l: Lib) -> Names:
     return [l.name]
 
 def app():
-    lib("a")              # not reported: `Lib` is `Any` to the checker
+    lib("a")              # currently not reported: `Lib` is `Any` to the checker
 ```
 
-Lint checks an alias, since it is a type expression. A `record` or `enum` is
-the result of a call, and the checker runs nothing, so it treats the
-annotation as `Any`. Evaluation enforces all three: `lib("a")` fails at
-`heph run` with ``Value `a` of type `string` does not match the type
-annotation `Lib` …``. The same applies to a record field of the wrong type
-and to an enum value that is not a variant.
+Lint checks an alias declared in the same file, since it is a type
+expression. Lint does not check a loaded alias, nor any `record` or `enum`. A
+record or enum is the result of a call, and the checker runs nothing, so it
+treats the annotation as `Any`.
 
-A record or enum value cannot be passed to `target()` itself, whose config
-holds only None, str, bool, int, float, list and dict. Pass its fields
-(`l.name`, `mode.value`) instead.
+A passing `build-lint-check` therefore does not prove that a record or enum
+annotation is respected. Evaluation enforces all of them: `lib("a")` fails at
+`heph run` with an error containing ``does not match the type annotation
+`Lib` ``. The same applies to a record field of the wrong type and to an enum
+value that is not a variant. That text is starlark's and may change with it,
+so match on a substring, not on the whole line.
+
+The lint gap is a limit of the current checker, not a promise. A starlark
+upgrade that types records statically would start reporting such calls, and
+would be listed under [What changes on upgrade](#what-changes-on-upgrade).
+
+A record or enum value cannot be passed whole to `target()` or
+`provider_state()`, whose arguments hold only None, str, bool, int, float,
+list and dict. The error names the argument and says what to pass instead:
+the record's fields (`l.name`) or the enum's `.value`. A non-str `driver` is
+an error too. `driver = None` keeps the provider's default driver.
 
 ## The targets
 

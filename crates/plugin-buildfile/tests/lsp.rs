@@ -1171,6 +1171,34 @@ fn types_completion_and_hover() {
     );
 }
 
+/// A document declaring its own types: `record`, `field` and `typing`
+/// complete, `record` hovers, and the document evaluates with no diagnostic,
+/// since the server's globals are evaluation's. (`typing.` members do not
+/// complete: no non-`heph` namespace's members do yet.)
+#[test]
+fn declared_types_complete_hover_and_evaluate() {
+    let mut lsp = Lsp::start();
+    let doc = lsp.open("rec/BUILD", "R = rec│\n");
+    assert!(has(&lsp.completion(&doc), "record"), "record completes");
+    let doc = lsp.open("field/BUILD", "R = record(a = fie│)\n");
+    assert!(has(&lsp.completion(&doc), "field"), "field completes");
+    let doc = lsp.open("typing/BUILD", "T = typ│\n");
+    assert!(has(&lsp.completion(&doc), "typing"), "typing completes");
+    let doc = lsp.open("hover/BUILD", "R = rec│ord(a = str)\n");
+    let text = hover_text(&lsp.hover(&doc));
+    assert!(text.contains("record"), "{text}");
+
+    let source = "Mode = enum(\"debug\", \"release\")\n\
+                  Lib = record(name = str, mode = Mode, srcs = field(list[str], []))\n\n\
+                  def lib(l: Lib, extra: typing.Any = None) -> None:\n    \
+                  target(name = l.name, driver = \"exec\", cmd = l.mode.value)\n\n\
+                  lib(Lib(name = \"a\", mode = Mode(\"debug\")))\n";
+    let doc = lsp.open("types/BUILD", source);
+    lsp.barrier();
+    let diagnostics = lsp.last_diagnostics(&doc).expect("diagnostics published");
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+}
+
 #[test]
 fn driver_kwargs_completion_and_hover() {
     let mut lsp = Lsp::start();

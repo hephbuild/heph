@@ -1049,5 +1049,39 @@ def f(k: heph.types.bash.Kwargs):
             lines(&lint_pkg(tmp.path(), "pkg", true)),
             ["pkg/BUILD:9:7: type-error: Expected type `list[str]` but got `int`"]
         );
+
+        // An alias is checked only in the file that declares it: a loaded
+        // name has no value for the checker to evaluate, so it is `Any`.
+        let tmp = ws(&[
+            (
+                "pkg/BUILD",
+                "load(\"//lib/defs.star\", \"Names\")\n\n\
+                 def f(n: Names) -> None:\n    pass\n\n\
+                 def g() -> None:\n    f(1)\n",
+            ),
+            ("lib/defs.star", "Names = list[str]\n"),
+        ]);
+        assert_eq!(lint_pkg(tmp.path(), "pkg", true), []);
+    }
+
+    /// A file that binds a name the type extensions add keeps its own binding
+    /// in the checker, as in evaluation (`run_file`'s
+    /// `user_bindings_shadow_type_globals`).
+    #[test]
+    fn user_bindings_shadow_type_globals() {
+        let tmp = ws(&[
+            (
+                "pkg/BUILD",
+                "load(\"//lib/defs.star\", \"field\")\n\
+                 enum = \"e\"\n\
+                 typing = {\"a\": \"t\"}\n\n\
+                 def eval_type(x: str) -> str:\n    return x\n\n\
+                 def name(record: str = \"r\") -> str:\n    \
+                 n: str = typing[\"a\"]\n    \
+                 return \"-\".join([record, enum, n, eval_type(field)])\n",
+            ),
+            ("lib/defs.star", "field = \"f\"\n"),
+        ]);
+        assert_eq!(lint_pkg(tmp.path(), "pkg", true), []);
     }
 }

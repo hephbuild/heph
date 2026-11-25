@@ -1009,9 +1009,16 @@ pub(crate) fn starlark_to_rust(v: &Value) -> anyhow::Result<htvalue::Value> {
         return Ok(htvalue::Value::Map(map));
     }
 
+    let ty = v.get_type();
+    // A declared type's value is the one a user naturally hands over whole;
+    // say what to pass instead.
+    let hint = match ty {
+        "record" => "; pass its fields (`r.name`), or build a dict from them",
+        "enum" => "; pass its `.value`",
+        _ => "",
+    };
     Err(anyhow::anyhow!(
-        "unsupported starlark value type: {} (expected None/str/bool/int/float/list/dict)",
-        v.get_type()
+        "unsupported starlark value type: {ty} (expected None/str/bool/int/float/list/dict){hint}"
     ))
 }
 
@@ -1190,8 +1197,23 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
                     }
                 }
                 "driver" => {
+                    // `None` leaves the provider's default driver, as a wrapper
+                    // passing `driver = None` through expects. Anything else
+                    // that is not a str is an error: dropping it silently ran
+                    // the default driver in place of, say, `Kind("exec")`.
                     if let Some(s) = value.unpack_str() {
                         driver = s.to_string();
+                    } else if !value.is_none() {
+                        let ty = value.get_type();
+                        let hint = if ty == "enum" {
+                            "; pass its `.value`"
+                        } else {
+                            ""
+                        };
+                        return Err(anyhow::anyhow!(
+                            "target() argument `driver` must be a str, got {ty}{hint}"
+                        )
+                        .into());
                     }
                 }
                 "labels" => {
@@ -1216,7 +1238,9 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
                         approval_from(starlark_to_rust(value)?).with_context(|| "approval")?;
                 }
                 key => {
-                    config.insert(key.to_string(), starlark_to_rust(value)?);
+                    let v = starlark_to_rust(value)
+                        .with_context(|| format!("target() argument `{key}`"))?;
+                    config.insert(key.to_string(), v);
                 }
             }
         }
@@ -1351,7 +1375,9 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
                     }
                 }
                 key => {
-                    kwargs.insert(key.to_string(), starlark_to_rust(value)?);
+                    let v = starlark_to_rust(value)
+                        .with_context(|| format!("provider_state() argument `{key}`"))?;
+                    kwargs.insert(key.to_string(), v);
                 }
             }
         }
@@ -5597,17 +5623,73 @@ def lib(l: Lib, extra: typing.Any = None) -> Names:
     }
 
     /// Evaluation checks a declared type wherever it is used: an annotation, a
-    /// record field, an enum variant.
+    /// record field, an enum variant. A record or enum value handed to
+    /// `target()` or `provider_state()` whole is refused, naming the argument
+    /// and what to pass instead, so it never reaches a spec or a hash.
     #[test]
     fn user_declared_types_checked_at_evaluation() {
+        let rec = "Lib(name = \"a\", mode = Mode(\"debug\"))";
         for (call, want) in [
-            ("lib(\"a\")", "type annotation `Lib`"),
-            ("lib(Lib(name = 1, mode = Mode(\"debug\")))", "`str`"),
-            ("lib(Lib(name = \"a\", mode = Mode(\"fast\")))", "fast"),
+            ("lib(\"a\")".to_string(), &["type annotation `Lib`"][..]),
+            (
+                "lib(Lib(name = 1, mode = Mode(\"debug\")))".to_string(),
+                &["`str`"],
+            ),
+            (
+                "lib(Lib(name = \"a\", mode = Mode(\"fast\")))".to_string(),
+                &["fast"],
+            ),
+            (
+                format!("target(name = \"t\", driver = \"d\", cfg = {rec})"),
+                &["target() argument `cfg`", "type: record", "pass its fields"],
+            ),
+            (
+                "target(name = \"t\", driver = \"d\", cfg = [Mode(\"debug\")])".to_string(),
+                &["target() argument `cfg`", "type: enum", "`.value`"],
+            ),
+            (
+                "target(name = \"t\", driver = Mode(\"debug\"))".to_string(),
+                &["argument `driver` must be a str, got enum", "`.value`"],
+            ),
+            (
+                format!("provider_state(provider = \"p\", x = {rec})"),
+                &["provider_state() argument `x`", "type: record"],
+            ),
         ] {
             let err = run_target_config_err(&format!("{USER_TYPES}\n{call}\n"));
-            assert!(err.contains(want), "{call}: {err}");
+            for w in want {
+                assert!(err.contains(w), "{call}: want {w:?} in {err}");
+            }
         }
+    }
+
+    /// The names the type extensions add are globals, so a BUILD file that
+    /// already binds one (top level, parameter, local, `load`) keeps its own.
+    #[test]
+    fn user_bindings_shadow_type_globals() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("names.BUILD"), "field = \"from-load\"\n").unwrap();
+        fs::create_dir_all(root.join("p")).unwrap();
+        fs::write(
+            root.join("p/BUILD"),
+            r#"load("//names.BUILD", "field")
+enum = "e"
+typing = {"a": "t"}
+def eval_type(x):
+    return x
+
+def name(record = "r"):
+    struct = "s"
+    return "-".join([record, struct, enum, typing["a"], eval_type(field)])
+
+target(name = name(), driver = None)
+"#,
+        )
+        .unwrap();
+        let provider = make_provider(&dir);
+        let result = run_pkg_blocking(&provider, "p").expect("evaluates");
+        assert_eq!(result.targets[0].name, "r-s-e-t-from-load");
     }
 
     /// A type declared in one file is the same type in the file that loads it,
