@@ -543,3 +543,34 @@ fn query_rederives_an_older_foreign_recording() {
     assert_eq!(rows(spans, vec![foreign(&file, &qtmp)], &qtmp), want);
     assert_eq!(std::fs::read(&file).expect("read"), before);
 }
+
+/// A refused pragma never takes effect. `soft_heap_limit` acts when its
+/// statement is prepared, process-wide; a refused statement is prepared a
+/// second time to tell "more than one statement" apart, alone or as the
+/// second statement, and that prepare must not run it either.
+#[test]
+fn a_refused_pragma_takes_no_effect_when_prepared() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let qtmp = tmp.path().join("qtmp");
+    let probe = Connection::open_in_memory().expect("probe");
+    let limit = || -> i64 {
+        probe
+            .query_row("PRAGMA soft_heap_limit", [], |r| r.get(0))
+            .expect("soft_heap_limit")
+    };
+    let before = limit();
+    // 1 TiB and change: distinctive, and harmless if it does take effect.
+    let set = (1_i64 << 40) + 12_345;
+    for sql in [
+        format!("PRAGMA soft_heap_limit = {set}"),
+        format!("SELECT 1; PRAGMA soft_heap_limit = {set}"),
+    ] {
+        let res = run(&sql, Vec::new(), &qtmp);
+        let after = limit();
+        probe
+            .pragma_update(None, "soft_heap_limit", before)
+            .expect("restore");
+        assert!(res.is_err(), "{sql}: answered");
+        assert_eq!(after, before, "{sql}: the refused pragma took effect");
+    }
+}

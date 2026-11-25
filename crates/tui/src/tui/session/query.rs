@@ -546,12 +546,20 @@ fn check(sql: &str) -> Result<Checked, QueryError> {
 /// The refusal to give when `sql` holds more than one statement. rusqlite
 /// finds a second statement by preparing it, which the authorizer refuses
 /// first ("not authorized" for `SELECT 1; DELETE …`); so a refused `sql` is
-/// prepared again on a throwaway schema with no authorizer. Preparing
-/// changes nothing but that connection (a flag pragma takes effect at
-/// prepare), dropped here.
+/// prepared again on a throwaway schema whose authorizer allows everything
+/// but a pragma. Some pragmas act when prepared, not when stepped, and
+/// some of those reach past the connection (`soft_heap_limit` and
+/// `hard_heap_limit` set the process's): the authorizer ignores every
+/// pragma, which prepares it as a no-op, so the second statement is still
+/// found and nothing is changed.
 fn more_than_one(sql: &str) -> Option<QueryError> {
-    let conn = Connection::open_in_memory().ok()?;
+    let mut conn = Connection::open_in_memory().ok()?;
     create_tables(&conn).ok()?;
+    conn.authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
+        AuthAction::Pragma { .. } => Authorization::Ignore,
+        _ => Authorization::Allow,
+    }))
+    .ok()?;
     match conn.prepare(sql) {
         Err(e @ rusqlite::Error::MultipleStatement) => Some(sql_error(&e)),
         _ => None,
