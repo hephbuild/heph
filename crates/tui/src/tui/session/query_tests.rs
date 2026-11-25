@@ -574,3 +574,49 @@ fn a_refused_pragma_takes_no_effect_when_prepared() {
         assert_eq!(after, before, "{sql}: the refused pragma took effect");
     }
 }
+
+/// `json_each` and `json_tree` over an `attributes` column read like the
+/// explorer tables they walk, the same over every kind of source.
+#[test]
+fn query_walks_attributes_with_json_each() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().join("sessions");
+    let qtmp = tmp.path().join("qtmp");
+    let dir = recording(&root, 1, 2_000);
+    let other = recording(&root, 2, 1_000);
+    for sql in [
+        "SELECT j.key, j.value FROM sessions s, json_each(json_array(s.session_id, s.started_ms)) j \
+         ORDER BY s.started_ms, j.key",
+        "SELECT count(*), group_concat(j.key) FROM spans s, json_each(s.attributes) j",
+        "SELECT count(*) FROM spans s, main.json_tree(s.attributes) j",
+    ] {
+        let one = rows(sql, vec![local(&root, &dir)], &qtmp);
+        assert!(!one.is_empty(), "{sql}: rows");
+        let both = rows(sql, vec![local(&root, &dir), local(&root, &other)], &qtmp);
+        assert!(!both.is_empty(), "{sql}: rows copied");
+        assert_eq!(
+            rows(sql, vec![catalog_of(&root, Scope::default())], &qtmp),
+            both,
+            "catalog: {sql}"
+        );
+    }
+    // A recording holding its own `json_each` would be read in its place:
+    // there, a walk is refused like any other name.
+    let shadowed = tmp.path().join("shadowed");
+    std::fs::create_dir_all(&shadowed).expect("mkdir");
+    let file = copy_out(&dir, &shadowed.join(store::FILE));
+    testing::alter(
+        &shadowed,
+        "CREATE TABLE json_each (key, value); INSERT INTO json_each VALUES ('secret', 1);",
+    )
+    .expect("shadow json_each");
+    assert_sql(
+        run(
+            "SELECT key FROM json_each",
+            vec![foreign(&file, &qtmp)],
+            &qtmp,
+        ),
+        "a shadowed json_each",
+        "prohibited",
+    );
+}

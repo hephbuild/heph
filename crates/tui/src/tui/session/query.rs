@@ -241,6 +241,8 @@ const PROGRESS_STEPS: i32 = 10_000;
 
 const DENIED_FUNCTIONS: &[&str] = &["load_extension", "readfile", "writefile", "edit"];
 const ALLOWED_PRAGMAS: &[&str] = &["table_info", "table_list", "index_list"];
+/// The table-valued functions a statement may read, over a JSON value.
+const JSON_WALKS: &[&str] = &["json_each", "json_tree"];
 
 /// The window and workspace the catalog is scoped to. Sessions are in it by
 /// their start; every row of a session in it is.
@@ -630,6 +632,9 @@ enum Allowed {
         inner: Arc<[String]>,
         /// The source's tables the inner views read.
         bases: &'static [&'static str],
+        /// Whether `json_each`/`json_tree` are SQLite's: the source holds
+        /// nothing by those names, which would shadow them.
+        walks: bool,
     },
 }
 
@@ -647,17 +652,26 @@ fn may_read(
     accessor: Option<&str>,
 ) -> bool {
     let null_read = column.is_empty();
+    // `json_each(x)` and `json_tree(x)` walk a value the statement already
+    // read, and read nothing of a source: allowed unless the source holds
+    // a table or view by that name, which SQLite would read instead.
+    let walk = db == Some("main") && JSON_WALKS.iter().any(|f| f.eq_ignore_ascii_case(table));
     match allowed {
         // `check` resolved every name against the explorer tables, so an
         // unqualified null read is one of them or a CTE.
         Allowed::Tables => match db {
             None => null_read,
-            Some(db) => db == "main" && TABLES.iter().any(|t| t.name == table),
+            Some(db) => walk || (db == "main" && TABLES.iter().any(|t| t.name == table)),
         },
         // `temp` holds heph's views alone (a statement may create nothing),
         // and only an inner view, by its nonce'd name, reads the source.
-        Allowed::Views { inner, bases } => {
-            db == Some("temp")
+        Allowed::Views {
+            inner,
+            bases,
+            walks,
+        } => {
+            (walk && *walks)
+                || db == Some("temp")
                 || accessor.is_some_and(|a| inner.iter().any(|n| n == a))
                 || (null_read && db.is_none_or(|db| db == "main" && bases.contains(&table)))
         }
@@ -988,9 +1002,18 @@ fn in_place(
             (conn, RECORDING_BASES)
         }
     };
+    let shadows: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM main.sqlite_schema \
+             WHERE lower(name) IN ('json_each', 'json_tree')",
+            [],
+            |r| r.get(0),
+        )
+        .context("reading a source's schema")?;
     let allowed = Allowed::Views {
         inner: TABLES.iter().map(|t| inner(t.name)).collect(),
         bases,
+        walks: shadows == 0,
     };
     let rows = execute(conn, sql, allowed, limits, deadline)?;
     Ok(Answer {
