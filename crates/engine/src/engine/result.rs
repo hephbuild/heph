@@ -13399,6 +13399,74 @@ mod tests {
         Ok(())
     }
 
+    /// A stale entry another request is still reading (its result held, so a
+    /// riding read on the entry) cannot be rebuilt until that read is
+    /// released: the second request waits on the write lock, re-probing the
+    /// entry as stale each time it looks. The wait is announced once it
+    /// outlasts `RESULT_LOCK_NOTICE` (in-use by readers), and cancelling the
+    /// waiter ends it at once, as a cancellation, without running anything.
+    #[tokio::test]
+    async fn a_stale_wait_on_a_held_entry_is_announced_and_cancellable() -> anyhow::Result<()> {
+        let store = tempdir()?;
+        let path = store.path().join("x");
+        let count = SArc::new(AtomicUsize::new(0));
+        let mut driver = HostPathDriver::new(count.clone(), vec![path.clone()]);
+        driver.create = true;
+        let (engine, _home, addr) = host_path_engine(driver)?;
+
+        let held = engine
+            .clone()
+            .result_addr(
+                engine.new_state(),
+                &addr,
+                OutputMatcher::All,
+                &ResultOptions::default(),
+            )
+            .await?;
+        std::fs::remove_file(&path)?;
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let rs = engine.new_state_with_events(true, Some(tx));
+        let waiter = tokio::spawn({
+            let (engine, rs, addr) = (engine.clone(), rs.clone(), addr.clone());
+            async move { run_host_path_target(&engine, rs, &addr).await }
+        });
+
+        let announced = tokio::time::timeout(Duration::from_secs(30), async {
+            while let Some(ev) = rx.recv().await {
+                if let BuildEventKind::ResultLockWaitStart {
+                    addr: a,
+                    in_use_by_readers,
+                    ..
+                } = ev.kind
+                    && a == addr.format()
+                {
+                    return Some(in_use_by_readers);
+                }
+            }
+            None
+        })
+        .await
+        .expect("the wait is announced");
+        assert_eq!(announced, Some(true), "the wait names the entry's readers");
+
+        rs.ctoken().cancel();
+        let res = tokio::time::timeout(Duration::from_secs(10), waiter)
+            .await
+            .expect("a cancelled wait returns promptly")
+            .expect("waiter task");
+        let err = res.expect_err("a cancelled wait fails");
+        // The lock wait reports a plain "cancelled" under its own context; the
+        // engine classifies it by the request's token (`is_cancellation`).
+        assert!(
+            format!("{err:#}").ends_with("cancelled"),
+            "expected a cancellation, got: {err:#}"
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 1, "the waiter ran nothing");
+        drop(held);
+        Ok(())
+    }
+
     /// I5: a stale entry's manifest is deleted under the write lock before its
     /// re-run. A re-run that commits a blob and then fails leaves the entry
     /// absent, so the next run misses — not the old manifest naming the new
