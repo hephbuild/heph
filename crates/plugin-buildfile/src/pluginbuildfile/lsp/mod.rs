@@ -71,7 +71,90 @@ pub fn run(connection: Connection, engine: Arc<dyn LspEngine>) -> anyhow::Result
 /// empty, and what a present one could not do in full. The same
 /// classification every editor request goes through, for "why did it do
 /// that?". `json` renders it as one JSON object.
+///
+/// Loads are typed against the workspace the cwd resolves to, as the server
+/// binds its engine to; there is no registry ([`explain_in`]).
 pub fn explain(target: &str, json: bool) -> anyhow::Result<String> {
+    explain_in(target, json, hconfig::get_root().ok().as_deref())
+}
+
+/// The CLI as a [`typed::MemberHost`]: one document read from disk, typed
+/// with lint's globals before the registry (`heph_globals`) and the loads
+/// `root` resolves, if any.
+struct CliHost<'a> {
+    doc: &'a site::Doc<'a>,
+    offset: usize,
+    /// The file as given on the command line.
+    file: &'a str,
+    parses: bool,
+    root: Option<&'a std::path::Path>,
+    globals: starlark::environment::Globals,
+}
+
+impl typed::MemberHost for CliHost<'_> {
+    fn registry_ready(&mut self) -> bool {
+        false
+    }
+
+    fn is_global(&mut self, name: &str) -> bool {
+        self.globals.names().any(|g| g.as_str() == name)
+    }
+
+    fn shadowed(&mut self, name: &str) -> Option<bool> {
+        Some(site::bound_in_group(self.doc, self.offset, name))
+    }
+
+    fn types(&mut self) -> (Option<Arc<typed::DocTypes>>, bool, bool) {
+        if !self.parses {
+            return (None, false, false);
+        }
+        // The workspace path, as the server types an open document under the
+        // engine's root; the file as given outside one.
+        let root = self.root.and_then(|r| r.canonicalize().ok());
+        let placed = root.and_then(|root| {
+            let abs = std::path::Path::new(self.file).canonicalize().ok()?;
+            let rel = abs.strip_prefix(&root).ok()?.to_str()?.replace('\\', "/");
+            Some((root, abs, rel))
+        });
+        let path = placed
+            .as_ref()
+            .map_or(self.file, |(_, _, rel)| rel.as_str());
+        let globals = &self.globals;
+        let types = typed::DocTypes::check(path, self.doc.text, globals, |modules| {
+            let Some((root, abs, _)) = &placed else {
+                return Default::default();
+            };
+            let patterns =
+                crate::pluginbuildfile::provider::FormatSettings::resolve(Some(root)).patterns;
+            memo::InterfaceMemo::default()
+                .loaded_interfaces(
+                    root,
+                    &handlers::pkg_of(root, abs),
+                    abs,
+                    modules.iter().copied(),
+                    &patterns,
+                    globals,
+                    0,
+                )
+                .interfaces
+        });
+        (types.map(Arc::new), false, false)
+    }
+}
+
+/// [`explain`] with loads resolved under `root` (`None`: loaded names are
+/// untyped).
+///
+/// It runs without an engine, so the registry never lands: a member answer
+/// says `registry: pending`, and the resolution carries a
+/// `explain_without_registry` degradation, because the editor's answer at the
+/// same position can differ (a driver's `Kwargs` parameter lists its fields
+/// there, not here).
+pub fn explain_in(
+    target: &str,
+    json: bool,
+    root: Option<&std::path::Path>,
+) -> anyhow::Result<String> {
     use anyhow::Context as _;
     let mut parts = target.rsplitn(3, ':');
     let (col, line, file) = match (parts.next(), parts.next(), parts.next()) {
@@ -110,42 +193,30 @@ pub fn explain(target: &str, json: bool) -> anyhow::Result<String> {
         None => site::Resolution::none(site::Reason::NotASite),
     };
     let mut value = resolution.to_json();
-    // Typed with `heph_globals` alone and no loads: there is no registry and
-    // no workspace here, so a loaded name is untyped.
-    let typed = match (&resolution.site, offset) {
-        (
-            site::Site::Member {
-                receiver, scope, ..
-            },
-            Some(offset),
-        ) => match receiver {
-            site::Receiver::Literal { kind } => Some((typed::Answer::literal(*kind, false), true)),
-            site::Receiver::Rebound { name, rest } => {
-                let globals = crate::pluginbuildfile::run_file::heph_globals(
+    // The server's member dispatch, over this host.
+    let typed = offset.and_then(|offset| {
+        typed::member_answer(
+            &resolution.site,
+            &mut CliHost {
+                doc: &doc,
+                offset,
+                file,
+                parses: parsed.is_some(),
+                root,
+                globals: crate::pluginbuildfile::run_file::heph_globals(
                     &crate::pluginbuildfile::types::DriverKwargs::default(),
                     |_| {},
-                );
-                let types = parsed
-                    .is_some()
-                    .then(|| typed::DocTypes::check(file, &text, &globals, |_| Default::default()));
-                let lookup = typed::Lookup {
-                    root: name,
-                    rest,
-                    scope,
-                    shadowed: site::bound_in_group(&doc, offset, name),
-                    stale: false,
-                    registry_ready: false,
-                };
-                Some((typed::Answer::of(types.flatten().as_ref(), &lookup), false))
-            }
-            site::Receiver::Names | site::Receiver::Expression => None,
-        },
-        _ => None,
-    };
-    if let Some((answer, literal)) = typed
-        && let Some(site) = value.get_mut("site").and_then(|s| s.as_object_mut())
-    {
-        answer.explain_into(site, literal);
+                ),
+            },
+        )
+    });
+    if let Some((answer, literal)) = typed {
+        if let Some(site) = value.get_mut("site").and_then(|s| s.as_object_mut()) {
+            answer.explain_into(site, literal);
+        }
+        if let Some(degraded) = value.get_mut("degraded").and_then(|d| d.as_array_mut()) {
+            degraded.push(serde_json::json!({"degraded": "explain_without_registry"}));
+        }
     }
     if json {
         let mut out = serde_json::json!({ "file": file, "line": line, "col": col });

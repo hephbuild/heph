@@ -4545,3 +4545,210 @@ fn untyped_receivers_list_nothing() {
         json!("no_types_yet")
     );
 }
+
+#[test]
+fn approximated_declarations_say_why() {
+    let mut lsp = Lsp::start();
+    let def = "def g():\n";
+    // (reason, the module-level declaration of `R`, what `R.│` lists)
+    for (reason, decl, listed) in [
+        (
+            "conditional_binding",
+            "c = True\nif c:\n    R = record(a = str)\n",
+            &[][..],
+        ),
+        // Bound twice, the name is the union of its two bindings' values, and
+        // the checker accepts what both record types have.
+        (
+            "rebound",
+            "R = record(a = str)\nR = record(b = str)\n",
+            &["type"][..],
+        ),
+        (
+            "non_literal_variant",
+            "V = \"a\"\nR = enum(V, \"b\")\n",
+            &[][..],
+        ),
+        ("star_args", "F = {\"a\": str}\nR = record(**F)\n", &[][..]),
+        ("invalid_declaration", "R = enum(\"a\", \"a\")\n", &[][..]),
+    ] {
+        let doc = type_after(
+            &mut lsp,
+            &format!("{reason}/BUILD"),
+            &format!("{decl}\n{def}    pass\n"),
+            &format!("{decl}\n{def}    x = R.│\n"),
+        );
+        let result = lsp.completion(&doc);
+        let explained = lsp.explain(&doc);
+        assert_eq!(sorted_labels(&result), listed, "{reason}: {explained}");
+        assert_eq!(
+            site_key(&explained, "binding"),
+            json!("module"),
+            "{reason}: {explained}"
+        );
+        assert_eq!(
+            site_key(&explained, "approximation"),
+            json!(reason),
+            "{explained}"
+        );
+        // Why the list is empty, when it is.
+        let because = listed.is_empty().then_some("approximation");
+        assert_eq!(
+            site_key(&explained, "empty_because"),
+            json!(because),
+            "{explained}"
+        );
+    }
+
+    // Declared in a def: the local's own reason.
+    let body = "    R = record(a = str)\n";
+    let doc = type_after(
+        &mut lsp,
+        "in_def/BUILD",
+        &format!("{def}{body}    pass\n"),
+        &format!("{def}{body}    x = R.│\n"),
+    );
+    let result = lsp.completion(&doc);
+    let explained = lsp.explain(&doc);
+    assert_eq!(
+        site_key(&explained, "binding"),
+        json!("local"),
+        "{explained}"
+    );
+    assert_eq!(
+        site_key(&explained, "approximation"),
+        json!("in_def"),
+        "{explained}"
+    );
+    // In a def, the call is typed by `record`'s declared return type, whose
+    // `type` the checker accepts: the reason is given, and the list holds.
+    assert_eq!(sorted_labels(&result), ["type"], "{explained}");
+    assert_eq!(
+        site_key(&explained, "empty_because"),
+        Value::Null,
+        "{result} {explained}"
+    );
+
+    // A parameter `R` shadows the conditional module `R`: the reason is the
+    // module binding's, never the parameter's.
+    let decl = "c = True\nif c:\n    R = record(a = str)\n\ndef h(R):\n";
+    let doc = type_after(
+        &mut lsp,
+        "shadowed/BUILD",
+        &format!("{decl}    pass\n"),
+        &format!("{decl}    x = R.│\n"),
+    );
+    let explained = lsp.explain(&doc);
+    assert_eq!(
+        site_key(&explained, "binding"),
+        json!("param"),
+        "{explained}"
+    );
+    assert_eq!(site_key(&explained, "approximation"), Value::Null);
+    assert_eq!(
+        site_key(&explained, "empty_because"),
+        json!("any"),
+        "{explained}"
+    );
+}
+
+#[test]
+fn large_enum_completes() {
+    const VARIANTS: usize = 10_000;
+    let mut lsp = Lsp::start();
+    let variants: Vec<String> = (0..VARIANTS).map(|i| format!("\"v{i}\"")).collect();
+    let decl = format!("Many = enum({})\n\ndef f():\n", variants.join(", "));
+    let doc = type_after(
+        &mut lsp,
+        "pkg/BUILD",
+        &format!("{decl}    pass\n"),
+        &format!("{decl}    x = Many.│\n"),
+    );
+    let started = std::time::Instant::now();
+    let result = lsp.completion(&doc);
+    let took = started.elapsed();
+    let got = labels(&result);
+    // Every variant, plus the enum type's own `type` and `values`.
+    assert_eq!(got.len(), VARIANTS + 2, "{:?}", got.get(..5));
+    assert!(has(&result, "v0") && has(&result, "v9999"));
+    // A gross-regression guard, generous for a loaded debug build: the
+    // first member completion typechecks the document too.
+    assert!(
+        took < Duration::from_secs(2),
+        "10,000-variant completion took {took:?}"
+    );
+}
+
+/// `--explain FILE:LINE:COL` as the CLI runs it, for a fixture written at
+/// `rel` under `root` with its cursor marked.
+fn cli_explain(root: &Path, rel: &str, fixture: &str) -> Value {
+    let at = fixture.find(CURSOR).expect("fixture has a cursor");
+    let text = fixture.replace(CURSOR, "");
+    let before = fixture.get(..at).expect("cursor on a char boundary");
+    let line = before.matches('\n').count() + 1;
+    let col = before.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+    let path = root.join(rel);
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&path, text).expect("write fixture");
+    let target = format!("{}:{line}:{col}", path.display());
+    let out = plugin_buildfile::pluginbuildfile::lsp_explain_in(&target, true, Some(root))
+        .expect("explain runs");
+    serde_json::from_str(&out).expect("explain prints JSON")
+}
+
+#[test]
+fn cli_explain_shares_the_member_dispatch() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().canonicalize().expect("canonical root");
+    std::fs::create_dir_all(root.join("lib")).expect("mkdir");
+    std::fs::write(root.join("lib/defs.star"), DECLS).expect("write lib");
+    let degraded_here =
+        |explained: &Value| degraded(explained).contains(&"explain_without_registry".to_string());
+
+    // A loaded receiver is typed: the CLI walks the loads as the editor does.
+    let explained = cli_explain(
+        &root,
+        "pkg/BUILD",
+        "load(\"//lib/defs.star\", \"Lib\")\n\ndef f(l: Lib):\n    x = l.│name\n",
+    );
+    assert_eq!(site_key(&explained, "type"), json!("Lib"), "{explained}");
+    assert_eq!(
+        site_key(&explained, "binding"),
+        json!("param"),
+        "{explained}"
+    );
+    assert_eq!(site_key(&explained, "empty_because"), Value::Null);
+    assert_eq!(
+        site_key(&explained, "registry"),
+        json!("pending"),
+        "{explained}"
+    );
+    assert!(degraded_here(&explained), "{explained}");
+
+    // A document that does not parse has no types yet, as in the editor: the
+    // receiver is a name no parse binds.
+    let explained = cli_explain(&root, "never/BUILD", "def f(a: str):\n    x = a.│\n");
+    assert_eq!(
+        site_key(&explained, "receiver"),
+        json!("names"),
+        "{explained}"
+    );
+    assert_eq!(
+        site_key(&explained, "empty_because"),
+        json!("no_types_yet"),
+        "{explained}"
+    );
+
+    // Bound by nothing in a document that parses.
+    let explained = cli_explain(&root, "nothing/BUILD", "def f():\n    x = nope.│name\n");
+    assert_eq!(
+        site_key(&explained, "empty_because"),
+        json!("unknown_binding"),
+        "{explained}"
+    );
+
+    // A global namespace is not typed: no typed keys, no degradation.
+    let explained = cli_explain(&root, "global/BUILD", "x = typing.│Any\n");
+    assert_eq!(site_key(&explained, "empty_because"), Value::Null);
+    assert!(!degraded_here(&explained), "{explained}");
+}

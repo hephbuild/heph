@@ -12,7 +12,7 @@ pub use checks::targets::{ChecksOptions, ShadowedCheck, ShadowedChecks};
 /// The transport-free LSP loop, for the editor-shaped harness in `tests/lsp.rs`.
 #[cfg(feature = "test-support")]
 pub use lsp::{RunOptions as LspRunOptions, run as lsp_run, run_with as lsp_run_with};
-pub use lsp::{explain as lsp_explain, serve_stdio};
+pub use lsp::{explain as lsp_explain, explain_in as lsp_explain_in, serve_stdio};
 
 /// `build-lint-check`'s findings for `pkg` under `root`, one line each, with
 /// the `(plugin, fn)` names `plugin_fns` callable and no driver's `Kwargs`:

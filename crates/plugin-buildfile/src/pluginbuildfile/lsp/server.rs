@@ -18,7 +18,7 @@ use super::lex::{self, Tokens};
 use super::memo::{InterfaceMemo, Loaded};
 use super::position::{self, Encoding};
 use super::site::{self, AstState, Resolution, Site};
-use super::typed::{Answer, DocTypes, Lookup};
+use super::typed::{self, Answer, DocTypes};
 use crate::pluginbuildfile::checks::lint::check_globals;
 use crate::pluginbuildfile::run_file::heph_globals;
 use crate::pluginbuildfile::types::DriverKwargs;
@@ -393,6 +393,46 @@ struct Located {
     key: LspUri,
     offset: usize,
     resolution: Resolution,
+}
+
+/// The server as a [`typed::MemberHost`], for one located request.
+struct ServerHost<'s, 'a> {
+    server: &'s mut Server<'a>,
+    located: &'s Located,
+}
+
+impl typed::MemberHost for ServerHost<'_, '_> {
+    fn registry_ready(&mut self) -> bool {
+        self.server.registry().is_some()
+    }
+
+    fn is_global(&mut self, name: &str) -> bool {
+        let registry = self.server.registry();
+        self.server.shared.namespaces.contains_key(name)
+            || self
+                .server
+                .globals(registry.as_deref())
+                .names()
+                .any(|g| g.as_str() == name)
+    }
+
+    fn shadowed(&mut self, name: &str) -> Option<bool> {
+        let doc = self.server.documents.get(&self.located.key)?;
+        Some(site::bound_in_group(
+            &site::Doc {
+                text: &doc.text,
+                tokens: &doc.tokens,
+                overlay: None,
+                ast: AstState::Current,
+            },
+            self.located.offset,
+            name,
+        ))
+    }
+
+    fn types(&mut self) -> (Option<Arc<DocTypes>>, bool, bool) {
+        self.server.doc_types(&self.located.key)
+    }
 }
 
 impl Server<'_> {
@@ -851,62 +891,13 @@ impl Server<'_> {
     /// literal's. `None` at any other site: a global namespace's members are
     /// not typed.
     fn member_answer(&mut self, located: &Located) -> Option<(Answer, bool)> {
-        let Site::Member {
-            receiver,
-            scope,
-            path,
-            ..
-        } = &located.resolution.site
-        else {
-            return None;
-        };
-        let (root, rest) = match receiver {
-            site::Receiver::Literal { kind } => {
-                return Some((Answer::literal(*kind, self.registry().is_some()), true));
-            }
-            site::Receiver::Expression => return None,
-            site::Receiver::Rebound { name, rest } => (name.as_str(), rest.as_slice()),
-            // A root that is no global, and that the last good parse does not
-            // bind: bound in text that has not parsed yet (`no_types_yet`,
-            // E4), or by nothing (`unknown_binding`). The answer is empty
-            // either way; the lookup says which.
-            site::Receiver::Names => {
-                let (root, rest) = path.as_deref()?.split_first()?;
-                let registry = self.registry();
-                let global = self.shared.namespaces.contains_key(root)
-                    || self
-                        .globals(registry.as_deref())
-                        .names()
-                        .any(|g| g.as_str() == root);
-                if global {
-                    return None;
-                }
-                (root.as_str(), rest)
-            }
-        };
-        let shadowed = {
-            let doc = self.documents.get(&located.key)?;
-            site::bound_in_group(
-                &site::Doc {
-                    text: &doc.text,
-                    tokens: &doc.tokens,
-                    overlay: None,
-                    ast: AstState::Current,
-                },
-                located.offset,
-                root,
-            )
-        };
-        let (types, stale, registry_ready) = self.doc_types(&located.key);
-        let lookup = Lookup {
-            root,
-            rest,
-            scope,
-            shadowed,
-            stale,
-            registry_ready,
-        };
-        Some((Answer::of(types.as_deref(), &lookup), false))
+        typed::member_answer(
+            &located.resolution.site,
+            &mut ServerHost {
+                server: self,
+                located,
+            },
+        )
     }
 
     /// The types of `key`'s last good text, checked now unless the memo is

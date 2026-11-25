@@ -10,10 +10,13 @@
 use crate::pluginbuildfile::run_file::parse_build_source;
 use serde_json::{Map, Value, json};
 use starlark::environment::Globals;
-use starlark::typing::{AstModuleTypecheck, BindingKind, Interface, Ty, TyBasic, members};
+use starlark::typing::{
+    AstModuleTypecheck, BindingKind, DeclarationApproximation, Interface, Ty, TyBasic, members,
+};
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use super::site::Literal;
+use super::site::{Literal, Receiver, Site};
 
 /// One module-level binding's type and where it came from.
 #[derive(Debug)]
@@ -23,11 +26,22 @@ struct ModuleType {
     load: Option<String>,
     /// `path:line` of the record or enum declaration it names.
     declaration: Option<String>,
+    /// Why the checker typed the declaration this binding holds as `Any`.
+    approximation: Option<DeclarationApproximation>,
+}
+
+/// One binding of a name inside a def.
+#[derive(Debug)]
+struct DefBinding {
+    kind: BindingKind,
+    ty: Ty,
+    /// Why the checker typed the declaration this binding holds as `Any`.
+    approximation: Option<DeclarationApproximation>,
 }
 
 /// One def's bindings by name: every binding of the name, with how it is
 /// bound.
-type DefBindings = HashMap<String, Vec<(BindingKind, Ty)>>;
+type DefBindings = HashMap<String, Vec<DefBinding>>;
 
 /// The types of one document's bindings, from one typecheck of its last good
 /// parse.
@@ -36,8 +50,6 @@ pub(crate) struct DocTypes {
     /// Def bindings by owner def path.
     defs: HashMap<Vec<String>, DefBindings>,
     module: HashMap<String, ModuleType>,
-    /// The checker's reason for typing a declaration as `Any`, by name.
-    approximations: HashMap<String, String>,
 }
 
 impl DocTypes {
@@ -63,15 +75,19 @@ impl DocTypes {
         }
         let interfaces = loads(&modules);
         drop(ast_loads);
-        let (_errors, types, _iface, approximations) = ast.typecheck(globals, &interfaces);
+        let (_errors, types, _iface, _approximations) = ast.typecheck(globals, &interfaces);
 
         let mut defs: HashMap<Vec<String>, DefBindings> = HashMap::new();
-        for (owner, name, kind, ty, _approximation) in types.bindings() {
+        for (owner, name, kind, ty, approximation) in types.bindings() {
             defs.entry(owner.to_vec())
                 .or_default()
                 .entry(name.to_owned())
                 .or_default()
-                .push((kind, ty.clone()));
+                .push(DefBinding {
+                    kind,
+                    ty: ty.clone(),
+                    approximation,
+                });
         }
         let module = types
             .module_bindings()
@@ -85,25 +101,77 @@ impl DocTypes {
                         ty: b.ty.clone(),
                         load: loaded.get(b.name).cloned(),
                         declaration,
+                        approximation: b.approximation,
                     },
                 )
             })
             .collect();
-        let approximations = approximations
-            .iter()
-            .filter(|a| a.category == "Declaration typed as Any")
-            .filter_map(|a| {
-                let message = a.message.trim_matches('"');
-                let (name, reason) = message.split_once(": ")?;
-                Some((name.to_owned(), reason.to_owned()))
-            })
-            .collect();
-        Some(DocTypes {
-            defs,
-            module,
-            approximations,
-        })
+        Some(DocTypes { defs, module })
     }
+}
+
+/// What a member answer needs from where it is asked: the editor's server,
+/// or the CLI's `--explain`. One dispatch ([`member_answer`]) serves both, so
+/// the two cannot answer the same site differently but for what the host
+/// holds.
+pub(crate) trait MemberHost {
+    /// Whether the registry has landed.
+    fn registry_ready(&mut self) -> bool;
+    /// `name` is a global the typing globals hold, or a namespace.
+    fn is_global(&mut self, name: &str) -> bool;
+    /// `name` is bound by a comprehension or lambda in the cursor's bracket
+    /// group or line ([`super::site::bound_in_group`]); `None` when the document
+    /// is gone.
+    fn shadowed(&mut self, name: &str) -> Option<bool>;
+    /// The document's types (`None`: it has never parsed), whether they are
+    /// from an earlier text than the current one, and whether the registry
+    /// had landed when they were checked.
+    fn types(&mut self) -> (Option<Arc<DocTypes>>, bool, bool);
+}
+
+/// The typed answer at a member site whose receiver is a name the file
+/// binds, a name that is no global, or a literal, and whether it is a
+/// literal's. `None` at any other site: a global namespace's members are not
+/// typed.
+pub(crate) fn member_answer(site: &Site, host: &mut impl MemberHost) -> Option<(Answer, bool)> {
+    let Site::Member {
+        receiver,
+        scope,
+        path,
+        ..
+    } = site
+    else {
+        return None;
+    };
+    let (root, rest) = match receiver {
+        Receiver::Literal { kind } => {
+            return Some((Answer::literal(*kind, host.registry_ready()), true));
+        }
+        Receiver::Expression => return None,
+        Receiver::Rebound { name, rest } => (name.as_str(), rest.as_slice()),
+        // A root that is no global, and that the last good parse does not
+        // bind: bound in text that has not parsed yet (`no_types_yet`, E4),
+        // or by nothing (`unknown_binding`). The answer is empty either way;
+        // the lookup says which.
+        Receiver::Names => {
+            let (root, rest) = path.as_deref()?.split_first()?;
+            if host.is_global(root) {
+                return None;
+            }
+            (root.as_str(), rest)
+        }
+    };
+    let shadowed = host.shadowed(root)?;
+    let (types, stale, registry_ready) = host.types();
+    let lookup = Lookup {
+        root,
+        rest,
+        scope,
+        shadowed,
+        stale,
+        registry_ready,
+    };
+    Some((Answer::of(types.as_deref(), &lookup), false))
 }
 
 /// A typed member answer: the items, and the keys `--explain` adds to a
@@ -188,33 +256,48 @@ impl Answer {
         if lookup.shadowed {
             return Answer::empty("comprehension", "ambiguous_binding", lookup);
         }
-        let (binding, root_ty, source) = match find(types, lookup.root, lookup.scope) {
-            Found::Def(BindingKind::Comprehension) => {
-                return Answer::empty("comprehension", "ambiguous_binding", lookup);
-            }
-            Found::Def(BindingKind::Lambda) => {
-                return Answer::empty("lambda", "ambiguous_binding", lookup);
-            }
-            Found::Ambiguous(kind) => {
-                return Answer::empty(kind.as_str(), "ambiguous_binding", lookup);
-            }
-            Found::Missing => return Answer::empty("none", "unknown_binding", lookup),
-            Found::Def(kind) => (kind.as_str(), def_ty(types, lookup), None),
-            Found::Module(m) => match &m.load {
-                Some(load) => ("loaded", Some(m.ty.clone()), Some(load.clone())),
-                None => ("module", Some(m.ty.clone()), m.declaration.clone()),
-            },
-        };
-        let Some(root_ty) = root_ty else {
-            return Answer::empty(binding, "unknown_binding", lookup);
-        };
+        // The reason is the found binding's own: a parameter `R` shadowing a
+        // conditionally declared module `R` has none.
+        let (binding, root_ty, source, root_approximation) =
+            match find(types, lookup.root, lookup.scope) {
+                Found::Def(DefBinding {
+                    kind: BindingKind::Comprehension,
+                    ..
+                }) => {
+                    return Answer::empty("comprehension", "ambiguous_binding", lookup);
+                }
+                Found::Def(DefBinding {
+                    kind: BindingKind::Lambda,
+                    ..
+                }) => {
+                    return Answer::empty("lambda", "ambiguous_binding", lookup);
+                }
+                Found::Ambiguous(kind) => {
+                    return Answer::empty(kind.as_str(), "ambiguous_binding", lookup);
+                }
+                Found::Missing => return Answer::empty("none", "unknown_binding", lookup),
+                Found::Def(b) => (b.kind.as_str(), b.ty.clone(), None, b.approximation),
+                Found::Module(m) => match &m.load {
+                    Some(load) => ("loaded", m.ty.clone(), Some(load.clone()), m.approximation),
+                    None => (
+                        "module",
+                        m.ty.clone(),
+                        m.declaration.clone(),
+                        m.approximation,
+                    ),
+                },
+            };
         // `l.mode.│`: each segment is a member of the type before it.
         // An open type's attribute is unknown (`Any`); a type that lists its
         // members and not the segment is not a receiver the checker accepts.
         let mut ty = root_ty;
         for seg in lookup.rest {
             let listed = members(&ty);
-            let open = listed.is_empty() && matches!(empty_because(&ty), "any" | "open_type");
+            let open = listed.is_empty()
+                && matches!(
+                    empty_because(&ty),
+                    "any" | "open_type" | "members_not_listed"
+                );
             ty = match listed.into_iter().find(|(name, _)| name == seg) {
                 Some((_, member)) => member,
                 None if open => Ty::any(),
@@ -226,9 +309,10 @@ impl Answer {
             };
         }
         let items = members(&ty);
-        let approximation = (lookup.rest.is_empty() && ty == Ty::any())
-            .then(|| types.approximations.get(lookup.root).cloned())
-            .flatten();
+        // A chain through an approximated root stays `Any` for its reason.
+        let approximation = root_approximation
+            .filter(|_| lookup.rest.is_empty() || ty == Ty::any())
+            .map(|a| a.as_str().to_owned());
         let empty_because = items.is_empty().then(|| {
             if approximation.is_some() {
                 "approximation"
@@ -274,7 +358,7 @@ impl Answer {
 
 /// Where a name resolved.
 enum Found<'t> {
-    Def(BindingKind),
+    Def(&'t DefBinding),
     /// Bound more than once under the innermost def that binds it.
     Ambiguous(BindingKind),
     Module(&'t ModuleType),
@@ -292,32 +376,29 @@ fn find<'t>(types: &'t DocTypes, name: &str, scope: &[String]) -> Found<'t> {
             continue;
         };
         return match entries.as_slice() {
-            [(kind, _)] => Found::Def(*kind),
-            [(kind, _), ..] => Found::Ambiguous(*kind),
+            [binding] => Found::Def(binding),
+            [first, ..] => Found::Ambiguous(first.kind),
             [] => continue,
         };
     }
     types.module.get(name).map_or(Found::Missing, Found::Module)
 }
 
-/// The type of the def binding [`find`] found for `lookup`.
-fn def_ty(types: &DocTypes, lookup: &Lookup<'_>) -> Option<Ty> {
-    (1..=lookup.scope.len()).rev().find_map(|depth| {
-        let entries = types
-            .defs
-            .get(lookup.scope.get(..depth)?)?
-            .get(lookup.root)?;
-        entries.first().map(|(_, ty)| ty.clone())
-    })
-}
-
-/// Why a type that is not `Any` lists no members: `open_type` when it accepts
-/// names it cannot list, `no_members` when it accepts none.
+/// Why a type that is not `Any` lists no members:
+/// - `open_type` when it accepts any name;
+/// - `members_not_listed` for a struct or a namespace, whose fields the
+///   checker knows (and holds an access to) but completion does not list;
+/// - `no_members` when it accepts none.
 fn empty_because(ty: &Ty) -> &'static str {
     if *ty == Ty::any() {
         return "any";
     }
+    let mut unlisted = false;
     let open = ty.iter_union().iter().any(|basic| match basic {
+        TyBasic::Custom(_) if matches!(basic.as_name(), Some("struct" | "namespace")) => {
+            unlisted = true;
+            false
+        }
         TyBasic::Any
         | TyBasic::Callable(_)
         | TyBasic::Iter(_)
@@ -328,7 +409,13 @@ fn empty_because(ty: &Ty) -> &'static str {
         }
         TyBasic::List(_) | TyBasic::Tuple(_) | TyBasic::Dict(..) | TyBasic::Set(_) => false,
     });
-    if open { "open_type" } else { "no_members" }
+    if open {
+        "open_type"
+    } else if unlisted {
+        "members_not_listed"
+    } else {
+        "no_members"
+    }
 }
 
 #[cfg(test)]
@@ -405,11 +492,21 @@ mod tests {
 
     #[test]
     fn empty_reasons() {
-        let t = types("def f(i: int, c: typing.Callable, a):\n    pass\n");
+        let t = types(
+            "n = typing\n\
+             def f(i: int, c: typing.Callable, a):\n    pass\n",
+        );
         let because = |name| answer(&t, name, &[], &["f"]).empty_because;
         assert_eq!(because("i"), Some("no_members"));
         assert_eq!(because("c"), Some("open_type"));
         assert_eq!(because("a"), Some("any"));
+        // A namespace is closed, but its fields are not listed. (heph's
+        // globals have no starlark `struct`; a struct classifies the same.)
+        let a = answer(&t, "n", &[], &["f"]);
+        assert_eq!(a.empty_because, Some("members_not_listed"), "{a:?}");
+        // A field of one is still a receiver: the chain folds through it.
+        let a = answer(&t, "n", &["Any"], &["f"]);
+        assert_ne!(a.empty_because, Some("unknown_binding"), "{a:?}");
         assert_eq!(
             Answer::of(
                 None,
