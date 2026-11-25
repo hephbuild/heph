@@ -120,16 +120,24 @@ pub(crate) fn read_under(root: &Path) -> impl FnMut(&str) -> anyhow::Result<Stri
 
 /// A typechecked file: its interface, and the exported names it binds at the
 /// top level.
-struct Checked {
-    iface: Interface,
-    exported: BTreeSet<String>,
+pub(crate) struct Checked {
+    pub(crate) iface: Interface,
+    pub(crate) exported: BTreeSet<String>,
 }
 
 /// The interface one `load()` sees. A file load is the file's own; a
 /// directory load merges its files' interfaces as evaluation merges their
 /// modules (`merge_pkg_results`): in order, a later file's name wins, and only
 /// exported names ([`is_exported`]) are re-exported.
-fn interface_of(edge: &LoadEdge, checked: &HashMap<&str, Checked>) -> anyhow::Result<Interface> {
+///
+/// A name carries two things, its value's type (`get`) and, when it is a type,
+/// the type it denotes in an annotation (`get_type`). The later file wins
+/// both at once, per name: a later `X = 1` drops an earlier file's record `X`
+/// as a type too, as evaluation's later value does.
+pub(crate) fn interface_of(
+    edge: &LoadEdge,
+    checked: &HashMap<&str, Checked>,
+) -> anyhow::Result<Interface> {
     let get = |path: &str| {
         checked
             .get(path)
@@ -138,16 +146,22 @@ fn interface_of(edge: &LoadEdge, checked: &HashMap<&str, Checked>) -> anyhow::Re
     match edge {
         LoadEdge::File { path, .. } => Ok(get(path)?.iface.clone()),
         LoadEdge::Dir { files, .. } => {
-            let mut merged = HashMap::new();
+            let mut values = HashMap::new();
+            let mut types = HashMap::new();
             for path in files {
                 let file = get(path)?;
                 for name in &file.exported {
-                    if let Some(ty) = file.iface.get(name) {
-                        merged.insert(name.clone(), ty.clone());
-                    }
+                    let Some(ty) = file.iface.get(name) else {
+                        continue;
+                    };
+                    values.insert(name.clone(), ty.clone());
+                    match file.iface.get_type(name) {
+                        Some(as_type) => types.insert(name.clone(), as_type.clone()),
+                        None => types.remove(name),
+                    };
                 }
             }
-            Ok(Interface::new(merged))
+            Ok(Interface::new_with_types(values, types))
         }
     }
 }
