@@ -623,7 +623,9 @@ pub fn definitions() -> Vec<PluginFnDef> {
             "Present the credential as a `0600` netrc file plus `NETRC` pointing at \
              it. The fallback of last resort: no callback and no expiry field, so it is \
              a snapshot. It is here because Go's module fetch over HTTPS honours it, \
-             and private Go modules otherwise have no credential path at all.",
+             and private Go modules otherwise have no credential path at all. It is \
+             also what `http_fetch` reads: the entry naming the URL's host is sent as \
+             basic auth.",
             |args| {
                 let machines = positional_strings(args, "netrc", "`machines`")?;
                 let login = opt_str(args, "login").unwrap_or_else(|| "${username}".to_string());

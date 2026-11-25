@@ -78,12 +78,7 @@ impl<'a> RegistryCredentials<'a> {
         cwd: &'a Path,
         ctoken: &'a (dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<Self> {
-        let declared = target
-            .inputs
-            .iter()
-            .filter(|i| hdriver_support::credential::is_credential(&i.annotations))
-            .count();
-        if declared == 0 && mounts.is_empty() {
+        if !hdriver_support::credential::check_presented(target, mounts)? {
             return Ok(if ambient { Self::Ambient } else { Self::None });
         }
         // Parse refuses both at once; a def that has both was not made by it.
@@ -91,15 +86,6 @@ impl<'a> RegistryCredentials<'a> {
             !ambient,
             "{} sets both `credentials` and `ambient_credentials`",
             target.addr.format()
-        );
-        // The host presents exactly one mount per declared credential, or
-        // fails the run itself.
-        anyhow::ensure!(
-            mounts.len() >= declared,
-            "{} declares {declared} credential(s), but the host presented {}. The host is likely \
-             older than the plugin; upgrade heph",
-            target.addr.format(),
-            mounts.len()
         );
         Ok(Self::Declared {
             mounts,

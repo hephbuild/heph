@@ -46,6 +46,43 @@ pub fn is_credential(annotations: &std::collections::BTreeMap<String, String>) -
     annotations.get(CREDENTIAL_ANNOTATION).map(String::as_str) == Some("true")
 }
 
+/// How many credentials `target` declared: its inputs the engine treats as
+/// credential references (both flags false *and* the annotation, the engine's
+/// own predicate).
+pub fn declared(target: &hplugin::driver::targetdef::TargetDef) -> usize {
+    target
+        .inputs
+        .iter()
+        .filter(|i| !i.hashed && !i.runtime && is_credential(&i.annotations))
+        .count()
+}
+
+/// Whether a run of `target` authenticates with the `mounts` the host
+/// presented: `false` when it declared no credentials and received none.
+///
+/// For a driver that consumes mounts itself rather than handing them to a
+/// subprocess. A target that declared credentials and received fewer mounts is
+/// refused rather than run anonymously: a mount lost between host and driver
+/// would otherwise turn a declared identity into none, and the 401 that
+/// follows would point at the server rather than at the lost mount.
+pub fn check_presented(
+    target: &hplugin::driver::targetdef::TargetDef,
+    mounts: &[hplugin::driver::CredentialMount],
+) -> anyhow::Result<bool> {
+    let declared = declared(target);
+    if declared == 0 && mounts.is_empty() {
+        return Ok(false);
+    }
+    anyhow::ensure!(
+        mounts.len() >= declared,
+        "{} declares {declared} credential(s), but the host presented {}. The host is likely \
+         older than the driver; upgrade heph",
+        target.addr.format(),
+        mounts.len()
+    );
+    Ok(true)
+}
+
 /// The dep edges for a target's `credentials` attribute, resolved against
 /// `package`.
 ///
@@ -121,5 +158,38 @@ mod tests {
     #[test]
     fn a_scratch_annotation_does_not_mark_a_credential() {
         assert!(!is_credential(&ann(&[("scratch", "true")])));
+    }
+
+    fn def(n: usize) -> hplugin::driver::targetdef::TargetDef {
+        let refs: Vec<String> = (0..n).map(|i| format!("//auth:c{i}")).collect();
+        let addr = hmodel::htaddr::parse_addr("//dl:file").expect("addr");
+        hplugin::driver::targetdef::TargetDef {
+            inputs: inputs(&refs, &addr.package).expect("inputs"),
+            addr,
+            ..Default::default()
+        }
+    }
+
+    fn mount() -> hplugin::driver::CredentialMount {
+        hplugin::driver::CredentialMount {
+            addr: hmodel::htaddr::parse_addr("//auth:c0").expect("addr"),
+            env: BTreeMap::new(),
+            path_prefix: vec![],
+            redact: vec![],
+        }
+    }
+
+    /// Nothing declared and nothing presented is anonymous; a declaration
+    /// that arrived without its mount is refused, never run anonymously.
+    #[test]
+    fn check_presented_refuses_a_lost_mount() {
+        assert_eq!(declared(&def(2)), 2);
+        assert!(!check_presented(&def(0), &[]).expect("anonymous"));
+        assert!(check_presented(&def(1), &[mount()]).expect("declared"));
+        let err = format!(
+            "{:#}",
+            check_presented(&def(1), &[]).expect_err("lost mount")
+        );
+        assert!(err.contains("declares 1 credential(s)"), "{err}");
     }
 }

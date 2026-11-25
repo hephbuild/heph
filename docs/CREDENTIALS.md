@@ -525,6 +525,72 @@ a generated directory would break the build rather than authenticate it. A
 private base image goes through `oci.pull(layout = True, credentials = [...])`
 and `bases`, which is also the hermetic way to take one.
 
+## `http_fetch`
+
+`http_fetch` downloads in-process too, so like the registry drivers it reads one
+presentation an HTTP client already understands: a netrc file, which
+`heph.auth.netrc([...])` writes at `0600` and points `NETRC` at.
+
+```python
+files = target(
+    name    = "files",
+    driver  = "auth.credential",
+    # `USERNAME` and `TOKEN` are read from the environment heph runs in: your
+    # shell, or CI secrets. `heph.auth.netrc` writes `login ${username} password
+    # ${token}` by default; pass `login =` / `password =` for other field names.
+    sources = [heph.auth.env(["USERNAME", "TOKEN"])],
+    present = heph.auth.netrc(["files.acme.dev"]),
+)
+
+target(name = "sdk", driver = "http_fetch", url = "https://files.acme.dev/sdk-1.2.tar.gz",
+       sha256 = "…", credentials = [files])
+```
+
+The `machine` entry naming the URL's host goes out as **basic auth, and only
+basic auth**. A server that wants a bearer token or a custom header (GitLab's
+`PRIVATE-TOKEN`) has no presentation here yet; many such servers also take the
+token as the password of basic auth, under a username they document.
+Non-secret headers go on the target as `headers = {...}`: they are hashed, and
+`Authorization`, `Proxy-Authorization` and `Cookie` are refused there. A GitHub
+release asset through the API, for one, needs `headers = {"Accept":
+"application/octet-stream"}` next to its `credentials`. Host
+matching is exact and ignores case, path and port, so two services on one host
+share one entry. The rules are the registry drivers' rules:
+
+- **No `credentials` means anonymous.** The developer's own `~/.netrc` is never
+  read. There is no `ambient_credentials` here.
+- **A host no credential covers is an error**, never an anonymous request, and
+  two credentials covering one host are refused. A netrc `default` entry covers
+  no host. Honoring it would let a declaration written for one server
+  authenticate a request to any other. The error says it was skipped.
+- **A credential that is not a netrc presentation is not consulted**, and the
+  error names it. The error for an uncovered host lists what each credential
+  does cover, so a typo or a different subdomain is visible at once.
+- **Only over `https`.** `credentials` on an `http://` URL is refused at parse:
+  basic auth there is the credential in clear text. A loopback host
+  (`localhost`, `127.0.0.0/8`, `::1`) is exempt. Go's module fetch makes the
+  same choice with the same file.
+- **A URL with `user:pass@` and `credentials` together is refused at parse.**
+- **The header goes to the URL's origin only.** A redirect to another host,
+  port or scheme drops it, so a release asset that redirects to a CDN's signed
+  URL does not hand that CDN the credential.
+- **A 401 or 403 says how the request went out**: anonymously (and how to add
+  `credentials`), or from which credential's `machine` entry.
+
+netrc cannot hold an empty value or one containing whitespace. Material like
+that renders into a file the driver cannot read, and the error says why
+without quoting the file. curl's quoted tokens are refused rather than sent
+with their quotes.
+
+The residual risk applies here too, and more directly: the rendered URL is the
+whole key, and a server can serve different bytes per identity. It includes no
+identity at all: an unpinned fetch that ran anonymously and cached the server's
+sign-in page keeps serving it after `credentials` is added, since the key did
+not move. A gated fetch with no `sha256` and caching on warns at parse. Set
+`sha256`, or `cache = False`. A pinned gated fetch is remote-cached like any
+other, so anyone who can read the remote cache can read the file: pinning
+restores reproducibility, not access control.
+
 ## The CLI
 
 | Command | Does |

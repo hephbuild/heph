@@ -38,6 +38,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use xxhash_rust::xxh3::Xxh3Default;
 
+mod auth;
+
 pub const DRIVER_NAME: &str = "http_fetch";
 
 /// Config for an `http_fetch` target.
@@ -60,6 +62,26 @@ struct HttpFetchSpec {
     out: Option<String>,
     /// Mark the fetched file executable (a downloaded tool binary).
     executable: bool,
+    /// Extra request headers, e.g. `{"Accept": "application/octet-stream"}`
+    /// for a GitHub release asset through the API. Hashed: a header can change
+    /// what the server answers, so it is part of the target's identity. Names
+    /// are case-insensitive (two spellings of one name are refused). Secrets
+    /// are refused here (`Authorization`, `Proxy-Authorization`, `Cookie`; use
+    /// `credentials`), and so are the headers the client owns (`Host`,
+    /// `Content-Length`, `Transfer-Encoding`, `Connection`). A `User-Agent`
+    /// replaces the default `heph/<version>`.
+    headers: BTreeMap<String, String>,
+    /// Credentials to fetch with, as `credential` target addresses presented
+    /// with `heph.auth.netrc([...])`. The URL's host is sent the basic auth of
+    /// the netrc entry naming it; a host none of them covers is an error, never
+    /// an anonymous request. When empty, the fetch is anonymous: the host's own
+    /// `~/.netrc` is not read.
+    ///
+    /// Not an input: nothing about a credential reaches the cache key. So a
+    /// credential-gated fetch is only as cacheable as it is pinned — without
+    /// `sha256`, two identities served different bytes would share one entry.
+    /// Set `sha256`, or `cache = False`.
+    credentials: Vec<String>,
     /// Caching for the fetched file. Defaults to on for both the local and
     /// remote cache — a fetch is content-addressed (pinned by `sha256`), so it
     /// is safe to share. `cache = False` disables both tiers; the dict form
@@ -81,6 +103,9 @@ struct HttpFetchDef {
     /// Package-relative output path.
     out: String,
     executable: bool,
+    /// Extra request headers, names lowercased, sorted by name.
+    #[serde(default)]
+    headers: Vec<(String, String)>,
 }
 
 /// Bump to invalidate cached fetches when the output layout changes.
@@ -93,6 +118,11 @@ impl Hash for HttpFetchDef {
         self.sha256.hash(state);
         self.out.hash(state);
         self.executable.hash(state);
+        // Only when set, so a target without headers keeps the key it had
+        // before they existed.
+        if !self.headers.is_empty() {
+            self.headers.hash(state);
+        }
     }
 }
 
@@ -136,11 +166,31 @@ impl ManagedDriver for Driver {
             format!("{pkg}/{out_rel}")
         };
 
+        let credential_inputs =
+            hdriver_support::credential::inputs(&spec.credentials, &addr.package)?;
+        let cache: hplugin::driver::targetdef::CacheConfig = spec.cache.into();
+        let sha256 = spec.sha256.unwrap_or_default();
+        if !credential_inputs.is_empty() {
+            auth::check_url(&url).with_context(|| addr.format())?;
+        }
+        if gated_and_unpinned(!credential_inputs.is_empty(), &sha256, &cache) {
+            tracing::warn!(
+                url,
+                "http_fetch: fetched with credentials and no `sha256`, so what the server \
+                 serves can depend on whichever identity ran it, and the cache entry is shared \
+                 across identities (and with the anonymous run before credentials were added). \
+                 Set `sha256 = \"…\"`, or `cache = False`"
+            );
+        }
+
+        let headers = normalize_headers(&spec.headers).with_context(|| addr.format())?;
+
         let def = HttpFetchDef {
             url,
-            sha256: spec.sha256.unwrap_or_default(),
+            sha256,
             out: out.clone(),
             executable: spec.executable,
+            headers,
         };
 
         let hash = {
@@ -156,8 +206,10 @@ impl ManagedDriver for Driver {
                 addr: addr.clone(),
                 labels: req.target_spec.labels.clone(),
                 raw_def: Arc::new(def),
-                // No inputs: the bytes come from the network, not from other
-                // targets or the host filesystem.
+                // The bytes come from the network, not from other targets or
+                // the host filesystem. The only edges are credentials, which
+                // materialize nothing and never reach the cache key.
+                inputs: credential_inputs,
                 outputs: vec![Output {
                     group: String::new(),
                     paths: vec![Path {
@@ -166,7 +218,7 @@ impl ManagedDriver for Driver {
                         collect: true,
                     }],
                 }],
-                cache: spec.cache.into(),
+                cache,
                 hash,
                 // Not in `hash` above: a declaration moves no key.
                 resources: spec
@@ -204,10 +256,88 @@ impl ManagedDriver for Driver {
             .ok_or_else(|| anyhow::anyhow!("http_fetch: out {:?} has no file name", def.out))?;
         let dest = req.sandbox_pkg_dir.join(name);
 
-        fetch_until_cancelled(&def.url, &def.sha256, def.executable, &dest, ctoken).await?;
+        let selected = if hdriver_support::credential::check_presented(
+            req.request.target,
+            &req.request.credentials,
+        )? {
+            // Off the async workers: it reads the presented netrc files.
+            let picked = hcore::blocking::run(enclose::enclose!(
+                (req.request.credentials => mounts, def.url => url)
+                move || auth::select_for(&mounts, &url)
+            ))
+            .await?;
+            Some(picked)
+        } else {
+            None
+        };
+
+        let fetched = fetch_until_cancelled(
+            &def.url,
+            hfetch::RequestOptions {
+                auth: selected.as_ref().map(|s| &s.auth),
+                headers: &def.headers,
+            },
+            &def.sha256,
+            def.executable,
+            &dest,
+            ctoken,
+        )
+        .await;
+        fetched.map_err(|err| match refusal_hint(&err, selected.as_ref()) {
+            Some(hint) => err.context(hint),
+            None => err,
+        })?;
 
         Ok(ManagedRunResponse { artifacts: vec![] })
     }
+}
+
+/// The `headers` attribute as the def holds it: each accepted by
+/// [`hfetch::check_header`], names lowercased so `Accept` and `accept` are one
+/// header with one hash, sorted by name so the map's order never reaches it.
+fn normalize_headers(headers: &BTreeMap<String, String>) -> anyhow::Result<Vec<(String, String)>> {
+    let mut out: BTreeMap<String, (&str, String)> = BTreeMap::new();
+    for (name, value) in headers {
+        let lower = hfetch::check_header(name, value)?;
+        if let Some((first, _)) = out.insert(lower, (name.as_str(), value.clone())) {
+            anyhow::bail!(
+                "headers {first:?} and {name:?} are one header (names are case-insensitive); \
+                 keep one"
+            );
+        }
+    }
+    Ok(out.into_iter().map(|(n, (_, v))| (n, v)).collect())
+}
+
+/// Whether a target's parse warns: it fetches with credentials, nothing pins
+/// the bytes, and they are cached, so the one entry its rendered URL keys is
+/// shared by every identity that runs it (see `docs/CREDENTIALS.md`).
+fn gated_and_unpinned(
+    gated: bool,
+    sha256: &str,
+    cache: &hplugin::driver::targetdef::CacheConfig,
+) -> bool {
+    gated && sha256.is_empty() && cache.enabled
+}
+
+/// What to add to a fetch the server refused (401 or 403), so the error says
+/// how the request was authenticated and what to check. `None` for any other
+/// failure: a checksum mismatch or a cancel says nothing about identity.
+fn refusal_hint(err: &anyhow::Error, selected: Option<&auth::Selected>) -> Option<String> {
+    if !matches!(hfetch::http_status(err), Some(401 | 403)) {
+        return None;
+    }
+    Some(match selected {
+        Some(s) => format!(
+            "sent basic auth from the netrc `machine {}` entry of credential {}, and the server \
+             refused it: check that credential's material and its scope on this server",
+            s.host, s.credential
+        ),
+        None => "the request was anonymous: this target names no `credentials`. A server that \
+                 needs auth takes `credentials = [...]` naming a credential presented with \
+                 `heph.auth.netrc([...])`"
+            .to_string(),
+    })
 }
 
 /// [`fetch`], abandoned the moment `ctoken` fires.
@@ -217,12 +347,22 @@ impl ManagedDriver for Driver {
 /// connection closes, and the partial file is removed before this returns.
 async fn fetch_until_cancelled(
     url: &str,
+    opts: hfetch::RequestOptions<'_>,
     expected_sha256: &str,
     executable: bool,
     dest: &std::path::Path,
     ctoken: &(dyn Cancellable + Send + Sync),
 ) -> anyhow::Result<()> {
-    match fetch(url, expected_sha256, executable, dest, ctoken.cancelled()).await {
+    match fetch(
+        url,
+        opts,
+        expected_sha256,
+        executable,
+        dest,
+        ctoken.cancelled(),
+    )
+    .await
+    {
         Ok(Fetched::Done) => Ok(()),
         Ok(Fetched::Cancelled) => anyhow::bail!("http_fetch: {url} cancelled"),
         Err(err) => Err(err).with_context(|| format!("fetch {url}")),
@@ -311,12 +451,13 @@ fn render(template: &str, args: &BTreeMap<String, String>) -> anyhow::Result<Str
 /// failed download, a mismatch or `cancelled` firing removes it again.
 async fn fetch(
     url: &str,
+    opts: hfetch::RequestOptions<'_>,
     expected_sha256: &str,
     executable: bool,
     dest: &std::path::Path,
     cancelled: impl Future<Output = ()>,
 ) -> anyhow::Result<Fetched> {
-    let verified = match download(url, dest, cancelled).await {
+    let verified = match download(url, opts, dest, cancelled).await {
         Ok(Some(got)) => verify_checksum(expected_sha256, &got, url),
         Ok(None) => {
             remove_partial(dest);
@@ -397,6 +538,7 @@ impl<T> Drop for Feed<'_, T> {
 /// blocking slot.
 async fn download(
     url: &str,
+    opts: hfetch::RequestOptions<'_>,
     dest: &std::path::Path,
     cancelled: impl Future<Output = ()>,
 ) -> anyhow::Result<Option<String>> {
@@ -448,7 +590,7 @@ async fn download(
     // is dropped.
     let send_body = async move {
         let tx = &feed.tx;
-        let mut body = hfetch::Fetcher::default().open(url).await?;
+        let mut body = hfetch::Fetcher::default().open_with(url, opts).await?;
         let mut batch = Vec::new();
         let mut batched = 0;
         loop {
@@ -617,9 +759,16 @@ mod tests {
         let url = serve("200 OK", BODY, 1);
 
         // Checksum unset → fetched unverified (warns); the bytes still land.
-        let fetched = fetch(&url, "", true, &dest, std::future::pending())
-            .await
-            .expect("fetch");
+        let fetched = fetch(
+            &url,
+            Default::default(),
+            "",
+            true,
+            &dest,
+            std::future::pending(),
+        )
+        .await
+        .expect("fetch");
         assert_eq!(fetched, Fetched::Done);
 
         assert_eq!(std::fs::read(&dest).expect("read"), BODY);
@@ -644,9 +793,16 @@ mod tests {
         let dest = dir.path().join("tool");
         let url = serve("200 OK", body, 1);
 
-        let fetched = fetch(&url, &sha, false, &dest, std::future::pending())
-            .await
-            .expect("fetch");
+        let fetched = fetch(
+            &url,
+            Default::default(),
+            &sha,
+            false,
+            &dest,
+            std::future::pending(),
+        )
+        .await
+        .expect("fetch");
         assert_eq!(fetched, Fetched::Done);
         assert!(std::fs::read(&dest).expect("read") == body, "body differs");
     }
@@ -657,9 +813,16 @@ mod tests {
         let dest = dir.path().join("tool");
         let url = serve("200 OK", b"tampered", 1);
 
-        let err = fetch(&url, BODY_SHA, false, &dest, std::future::pending())
-            .await
-            .expect_err("mismatch must fail");
+        let err = fetch(
+            &url,
+            Default::default(),
+            BODY_SHA,
+            false,
+            &dest,
+            std::future::pending(),
+        )
+        .await
+        .expect_err("mismatch must fail");
         assert!(
             format!("{err:#}").contains("checksum mismatch"),
             "got: {err:#}"
@@ -673,9 +836,16 @@ mod tests {
         let dest = dir.path().join("tool");
         let url = serve("404 Not Found", b"", 1);
 
-        let err = fetch(&url, "", false, &dest, std::future::pending())
-            .await
-            .expect_err("404 must fail");
+        let err = fetch(
+            &url,
+            Default::default(),
+            "",
+            false,
+            &dest,
+            std::future::pending(),
+        )
+        .await
+        .expect_err("404 must fail");
         assert!(format!("{err:#}").contains("GET"), "got: {err:#}");
     }
 
@@ -716,7 +886,7 @@ mod tests {
 
         let err = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            fetch_until_cancelled(&url, "", false, &dest, &ctoken),
+            fetch_until_cancelled(&url, Default::default(), "", false, &dest, &ctoken),
         )
         .await
         .expect("a cancelled fetch returns at once")
@@ -769,7 +939,7 @@ mod tests {
 
         let err = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            fetch_until_cancelled(&url, "", false, &dest, &ctoken),
+            fetch_until_cancelled(&url, Default::default(), "", false, &dest, &ctoken),
         )
         .await
         .expect("a cancelled fetch returns at once")
@@ -790,7 +960,9 @@ mod tests {
         let ctoken = StdCancellationToken::new();
         let download = tokio::spawn({
             let (dest, ctoken) = (dest.clone(), ctoken.clone());
-            async move { fetch_until_cancelled(&url, "", false, &dest, &ctoken).await }
+            async move {
+                fetch_until_cancelled(&url, Default::default(), "", false, &dest, &ctoken).await
+            }
         });
         let on_disk = || std::fs::metadata(&dest).map_or(0, |m| m.len());
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -825,7 +997,9 @@ mod tests {
         let ctoken = StdCancellationToken::new();
         let download = tokio::spawn({
             let (dest, ctoken) = (dest.clone(), ctoken.clone());
-            async move { fetch_until_cancelled(&url, "", false, &dest, &ctoken).await }
+            async move {
+                fetch_until_cancelled(&url, Default::default(), "", false, &dest, &ctoken).await
+            }
         });
         // The writer has created the file and waits on a body that never
         // starts.
@@ -883,7 +1057,7 @@ mod tests {
         let ctoken = hcore::hasync::StdCancellationToken::new();
         ctoken.cancel();
 
-        let err = fetch_until_cancelled(&url, "", false, &dest, &ctoken)
+        let err = fetch_until_cancelled(&url, Default::default(), "", false, &dest, &ctoken)
             .await
             .expect_err("a cancelled fetch fails");
         assert!(format!("{err:#}").contains("cancelled"), "got: {err:#}");
@@ -910,8 +1084,9 @@ mod tests {
             let dest = dir.path().join(format!("tool-{i}"));
             dests.push(dest.clone());
             let ctoken = ctoken.clone();
-            downloads
-                .spawn(async move { fetch_until_cancelled(&url, "", false, &dest, &ctoken).await });
+            downloads.spawn(async move {
+                fetch_until_cancelled(&url, Default::default(), "", false, &dest, &ctoken).await
+            });
         }
         // Every download has created its file and now waits on a body that
         // never ends. Waiting for the file, not for bytes in it: a writer that
@@ -1181,5 +1356,441 @@ mod tests {
             format!("{err:#}").contains("references arg `goos`"),
             "got: {err:#}"
         );
+    }
+
+    async fn parse_with_credentials(url: &str, credentials: &[&str]) -> anyhow::Result<TargetDef> {
+        let mut config = HashMap::from([
+            ("url".to_string(), Value::String(url.to_string())),
+            ("sha256".to_string(), Value::String(BODY_SHA.to_string())),
+        ]);
+        if !credentials.is_empty() {
+            config.insert(
+                "credentials".to_string(),
+                Value::List(
+                    credentials
+                        .iter()
+                        .map(|c| Value::String((*c).to_string()))
+                        .collect(),
+                ),
+            );
+        }
+        Ok(Driver
+            .parse(parse_req("//dl:tool", config), &StdCancellationToken::new())
+            .await?
+            .target_def)
+    }
+
+    /// A credential is an edge the cache key cannot see: annotated, neither
+    /// hashed nor materialized at runtime, resolved against the package, and
+    /// adding one leaves the def hash where it was.
+    #[tokio::test]
+    async fn credentials_are_unhashed_edges() {
+        let plain = parse_with_credentials("https://x/tool", &[])
+            .await
+            .expect("parse");
+        assert!(plain.inputs.is_empty());
+        let gated = parse_with_credentials("https://x/tool", &[":netrc"])
+            .await
+            .expect("parse");
+        let [edge] = gated.inputs.as_slice() else {
+            panic!("one credential edge, got {}", gated.inputs.len());
+        };
+        assert!(hdriver_support::credential::is_credential(
+            &edge.annotations
+        ));
+        assert!(!edge.hashed && !edge.runtime);
+        assert_eq!(edge.r#ref.to_string(), "//dl:netrc");
+        assert_eq!(gated.hash, plain.hash, "a credential must not move the key");
+    }
+
+    /// Parse refuses a URL credentials cannot be sent to safely: one naming
+    /// its own user (two identities, the client picking), or plain http to a
+    /// host off this machine. Neither is the target's business without
+    /// `credentials`.
+    #[tokio::test]
+    async fn credentials_refuse_userinfo_and_cleartext() {
+        for (url, wants) in [
+            ("https://u:p@x/tool", "url carries a username or password"),
+            ("http://x/tool", "clear text"),
+        ] {
+            let Err(err) = parse_with_credentials(url, &["//auth:netrc"]).await else {
+                panic!("{url} with credentials must fail parse");
+            };
+            let msg = format!("{err:#}");
+            assert!(msg.contains(wants), "{msg}");
+            assert!(
+                msg.contains("//dl:tool"),
+                "the error names the target: {msg}"
+            );
+            parse_with_credentials(url, &[])
+                .await
+                .expect("without credentials, the url is the author's own business");
+        }
+        parse_with_credentials("http://127.0.0.1:8080/tool", &["//auth:netrc"])
+            .await
+            .expect("loopback is exempt");
+    }
+
+    /// The parse warning fires exactly when the target is gated, unpinned and
+    /// cached.
+    #[test]
+    fn only_a_gated_unpinned_cached_fetch_warns() {
+        let on = hplugin::driver::targetdef::CacheConfig::on(false);
+        let off = hplugin::driver::targetdef::CacheConfig::off();
+        assert!(gated_and_unpinned(true, "", &on));
+        assert!(!gated_and_unpinned(true, BODY_SHA, &on), "pinned");
+        assert!(!gated_and_unpinned(true, "", &off), "uncached");
+        assert!(!gated_and_unpinned(false, "", &on), "anonymous");
+    }
+
+    /// Answer the requests on `listener` with `responses`, in order, and report
+    /// the `Authorization` header each arrived with (empty when none).
+    fn answer(
+        listener: std::net::TcpListener,
+        responses: Vec<String>,
+    ) -> std::sync::mpsc::Receiver<String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for resp in responses {
+                let Ok((mut sock, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buf = [0u8; 4096];
+                let n = std::io::Read::read(&mut sock, &mut buf).unwrap_or(0);
+                let head = String::from_utf8_lossy(buf.get(..n).unwrap_or_default()).into_owned();
+                let auth = head
+                    .lines()
+                    .find_map(|l| {
+                        l.split_once(':')
+                            .filter(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+                            .map(|(_, v)| v.trim().to_string())
+                    })
+                    .unwrap_or_default();
+                let _ = tx.send(auth);
+                let _ = std::io::Write::write_all(&mut sock, resp.as_bytes());
+            }
+        });
+        rx
+    }
+
+    fn bind() -> (std::net::TcpListener, String) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        (listener, url)
+    }
+
+    fn ok(body: &[u8]) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            String::from_utf8_lossy(body)
+        )
+    }
+
+    fn status(line: &str) -> String {
+        format!("HTTP/1.1 {line}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+    }
+
+    fn redirect(to: &str) -> String {
+        format!(
+            "HTTP/1.1 302 Found\r\nLocation: {to}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+    }
+
+    fn creds() -> hfetch::BasicAuth {
+        hfetch::BasicAuth {
+            username: "u".to_string(),
+            password: "p".to_string(),
+        }
+    }
+
+    fn authed(auth: &hfetch::BasicAuth) -> hfetch::RequestOptions<'_> {
+        hfetch::RequestOptions {
+            auth: Some(auth),
+            ..Default::default()
+        }
+    }
+
+    /// base64("u:p")
+    const BASIC_U_P: &str = "Basic dTpw";
+
+    /// Serve one request on `listener` and report its whole head, lowercased.
+    fn answer_head(listener: std::net::TcpListener) -> std::sync::mpsc::Receiver<String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let Ok((mut sock, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            let n = std::io::Read::read(&mut sock, &mut buf).unwrap_or(0);
+            let _ =
+                tx.send(String::from_utf8_lossy(buf.get(..n).unwrap_or_default()).to_lowercase());
+            let _ = std::io::Write::write_all(&mut sock, ok(b"x").as_bytes());
+        });
+        rx
+    }
+
+    /// Every request says who it is (`heph/<version>`; GitHub's API refuses one
+    /// that does not), and carries the target's headers.
+    #[tokio::test]
+    async fn fetch_sends_the_user_agent_and_the_targets_headers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("tool");
+        let ua = format!("user-agent: {}", hfetch::user_agent().to_lowercase());
+        assert!(ua.starts_with("user-agent: heph/"), "{ua}");
+
+        let (listener, url) = bind();
+        let head = answer_head(listener);
+        fetch(
+            &url,
+            Default::default(),
+            "",
+            false,
+            &dest,
+            std::future::pending(),
+        )
+        .await
+        .expect("fetch");
+        assert!(
+            head.recv().expect("request").contains(&ua),
+            "default user agent"
+        );
+
+        let (listener, url) = bind();
+        let head = answer_head(listener);
+        let headers = vec![
+            ("accept".to_string(), "application/octet-stream".to_string()),
+            ("user-agent".to_string(), "custom/1".to_string()),
+        ];
+        let opts = hfetch::RequestOptions {
+            auth: None,
+            headers: &headers,
+        };
+        fetch(&url, opts, "", false, &dest, std::future::pending())
+            .await
+            .expect("fetch");
+        let got = head.recv().expect("request");
+        assert!(got.contains("accept: application/octet-stream"), "{got}");
+        assert!(got.contains("user-agent: custom/1"), "{got}");
+        assert!(
+            !got.contains("heph/"),
+            "the target's user agent replaces the default: {got}"
+        );
+    }
+
+    async fn parse_with_headers(headers: &[(&str, &str)]) -> anyhow::Result<TargetDef> {
+        let mut config = HashMap::from([(
+            "url".to_string(),
+            Value::String("https://x/tool".to_string()),
+        )]);
+        if !headers.is_empty() {
+            config.insert(
+                "headers".to_string(),
+                Value::Map(
+                    headers
+                        .iter()
+                        .map(|(k, v)| ((*k).to_string(), Value::String((*v).to_string())))
+                        .collect(),
+                ),
+            );
+        }
+        Ok(Driver
+            .parse(parse_req("//dl:tool", config), &StdCancellationToken::new())
+            .await?
+            .target_def)
+    }
+
+    /// Headers are part of the target's identity, spelled any case; a target
+    /// without them keeps the key it had before they existed.
+    #[tokio::test]
+    async fn headers_are_hashed_case_insensitively() {
+        let plain = parse_with_headers(&[]).await.expect("parse");
+        let a = parse_with_headers(&[("Accept", "application/octet-stream")])
+            .await
+            .expect("parse");
+        let b = parse_with_headers(&[("accept", "application/octet-stream")])
+            .await
+            .expect("parse");
+        let c = parse_with_headers(&[("Accept", "application/json")])
+            .await
+            .expect("parse");
+        assert_ne!(a.hash, plain.hash, "a header moves the key");
+        assert_eq!(a.hash, b.hash, "header names are case-insensitive");
+        assert_ne!(a.hash, c.hash, "a header value moves the key");
+
+        // Pinned from before `headers` existed: the url/sha256/out/executable
+        // hash of this target must not move.
+        let mut h = DebugHasher::new(Xxh3Default::new(), || "pin".to_string());
+        HttpFetchDef {
+            url: "https://x/tool".to_string(),
+            sha256: String::new(),
+            out: "dl/tool".to_string(),
+            executable: false,
+            headers: vec![],
+        }
+        .hash(&mut h);
+        let mut old = DebugHasher::new(Xxh3Default::new(), || "pin".to_string());
+        HTTP_FETCH_FORMAT_VERSION.hash(&mut old);
+        "https://x/tool".hash(&mut old);
+        "".hash(&mut old);
+        "dl/tool".hash(&mut old);
+        false.hash(&mut old);
+        assert_eq!(h.finish(), old.finish(), "no headers hashes as before");
+    }
+
+    /// Secrets, client-owned headers, two spellings of one name, and bytes a
+    /// header cannot carry are refused at parse, without quoting the value.
+    #[tokio::test]
+    async fn headers_that_cannot_be_set_are_refused() {
+        for (headers, wants) in [
+            (
+                vec![("Authorization", "Bearer s3cr3t")],
+                "declare `credentials`",
+            ),
+            (vec![("cookie", "s=s3cr3t")], "declare `credentials`"),
+            (
+                vec![("Proxy-Authorization", "s3cr3t")],
+                "declare `credentials`",
+            ),
+            (vec![("Host", "evil.example")], "derives it from the url"),
+            (vec![("Content-Length", "1")], "the client sets it"),
+            (vec![("Accept", "a"), ("accept", "b")], "are one header"),
+            (vec![("bad name", "v")], "not a valid HTTP header name"),
+            (vec![("X-Token", "s3cr3t\nInjected: 1")], "cannot carry"),
+        ] {
+            let Err(err) = parse_with_headers(&headers).await else {
+                panic!("{headers:?} must fail parse");
+            };
+            let msg = format!("{err:#}");
+            assert!(msg.contains(wants), "{headers:?}: {msg}");
+            assert!(msg.contains("//dl:tool"), "names the target: {msg}");
+            assert!(!msg.contains("s3cr3t"), "quoted a value: {msg}");
+        }
+    }
+
+    /// The selected entry goes out as basic auth, and nothing goes out without
+    /// one.
+    #[tokio::test]
+    async fn fetch_sends_basic_auth_only_when_given() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("tool");
+
+        let (listener, url) = bind();
+        let auth = answer(listener, vec![ok(b"x")]);
+        fetch(
+            &url,
+            authed(&creds()),
+            "",
+            false,
+            &dest,
+            std::future::pending(),
+        )
+        .await
+        .expect("fetch");
+        assert_eq!(auth.recv().expect("request"), BASIC_U_P);
+
+        let (listener, url) = bind();
+        let auth = answer(listener, vec![ok(b"x")]);
+        fetch(
+            &url,
+            Default::default(),
+            "",
+            false,
+            &dest,
+            std::future::pending(),
+        )
+        .await
+        .expect("fetch");
+        assert_eq!(auth.recv().expect("request"), "");
+    }
+
+    /// A redirect to another origin (here another port) does not carry the
+    /// credential, so a CDN a release asset redirects to never sees it; a
+    /// redirect within the origin does. Ours to pin, not only reqwest's: a
+    /// redirect policy set on the client would silently change it.
+    #[tokio::test]
+    async fn a_cross_origin_redirect_drops_the_credential() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("tool");
+
+        let (cdn_listener, cdn) = bind();
+        let (origin_listener, origin) = bind();
+        let at_cdn = answer(cdn_listener, vec![ok(b"x")]);
+        let at_origin = answer(origin_listener, vec![redirect(&format!("{cdn}/signed"))]);
+        fetch(
+            &origin,
+            authed(&creds()),
+            "",
+            false,
+            &dest,
+            std::future::pending(),
+        )
+        .await
+        .expect("fetch");
+        assert_eq!(at_origin.recv().expect("origin request"), BASIC_U_P);
+        assert_eq!(at_cdn.recv().expect("cdn request"), "", "leaked to the CDN");
+
+        let (listener, url) = bind();
+        let seen = answer(listener, vec![redirect(&format!("{url}/next")), ok(b"x")]);
+        fetch(
+            &url,
+            authed(&creds()),
+            "",
+            false,
+            &dest,
+            std::future::pending(),
+        )
+        .await
+        .expect("fetch");
+        assert_eq!(seen.recv().expect("first"), BASIC_U_P);
+        assert_eq!(seen.recv().expect("same-origin hop"), BASIC_U_P);
+    }
+
+    /// A 401 or 403 says how the request was authenticated and what to check;
+    /// any other failure gets no identity hint.
+    #[tokio::test]
+    async fn a_refused_fetch_says_how_it_was_authenticated() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("tool");
+        let failed = |line: &'static str| {
+            let dest = dest.clone();
+            async move {
+                let (listener, url) = bind();
+                let _seen = answer(listener, vec![status(line)]);
+                fetch(
+                    &url,
+                    Default::default(),
+                    "",
+                    false,
+                    &dest,
+                    std::future::pending(),
+                )
+                .await
+                .expect_err(line)
+            }
+        };
+        let selected = auth::Selected {
+            auth: creds(),
+            credential: "//auth:files".to_string(),
+            host: "files.example".to_string(),
+        };
+
+        let unauthorized = failed("401 Unauthorized").await;
+        let anonymous = refusal_hint(&unauthorized, None).expect("hint");
+        assert!(
+            anonymous.contains("the request was anonymous"),
+            "{anonymous}"
+        );
+        let declared = refusal_hint(&unauthorized, Some(&selected)).expect("hint");
+        assert!(
+            declared.contains("`machine files.example` entry of credential //auth:files"),
+            "{declared}"
+        );
+
+        let forbidden = failed("403 Forbidden").await;
+        assert!(refusal_hint(&forbidden, Some(&selected)).is_some());
+
+        let missing = failed("404 Not Found").await;
+        assert_eq!(refusal_hint(&missing, Some(&selected)), None);
     }
 }

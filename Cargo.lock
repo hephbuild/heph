@@ -2069,6 +2069,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "core",
  "hex",
  "reqwest",
  "sha2 0.11.1",
@@ -5320,6 +5321,7 @@ dependencies = [
  "async-trait",
  "core",
  "driver-support",
+ "enclose",
  "fetch",
  "model",
  "plugin",
@@ -5327,6 +5329,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "url",
  "xxhash-rust",
 ]
 
