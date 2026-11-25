@@ -2,6 +2,7 @@ use crate::tui::session::SessionSlot;
 use std::ffi::OsString;
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -94,12 +95,26 @@ pub struct RunArgs {
     pub force: bool,
     /// Drop into an interactive shell in the target's sandbox instead of running it
     ///
-    /// The terminal goes to the single target you name, never to its
-    /// dependencies. A group of exactly one member *is* that member, so it can
-    /// be shelled into; a group of two or more inlines its members as
-    /// dependencies of the run, and dependencies are not interactive. Shell
-    /// into the member you want instead. Likewise for a multi-target selection,
-    /// which names no single target at all.
+    ///   heph run --shell //pkg:app            enter //pkg:app
+    ///
+    ///   heph run --shell=//pkg:lib //pkg:app   build //pkg:app, enter its dependency //pkg:lib
+    ///
+    ///   heph run --shell=//pkg:lib             same as `--shell //pkg:lib`
+    ///
+    /// Bare `--shell` enters the single target the run names. A group of exactly
+    /// one member *is* that member, so it can be shelled into; a group of two or
+    /// more, or a multi-target selection, names no single target, and the run is
+    /// refused rather than guessing which one you meant.
+    ///
+    /// `--shell=ADDRESS` says which one. ADDRESS may be any address this run
+    /// resolves — a selected target, a member a group inlines, or a dependency of
+    /// either; that is how you shell into a dependency without building it on its
+    /// own. Every other target in the run builds with no terminal. An address the
+    /// run never resolves is warned about, never silently ignored; the build
+    /// still runs.
+    ///
+    /// The target you enter always executes (never a cache hit) and its outputs
+    /// are not cached. Requires a terminal.
     ///
     /// The shell opens where the tool would run, and reads no system or personal
     /// bash config, so your aliases and prompt setup are absent.
@@ -108,7 +123,7 @@ pub struct RunArgs {
     /// credentials the target declares. It is also the only way a build target
     /// gets stdin: a plain build's action reads /dev/null, since what it would
     /// read is no part of its cache key.
-    #[arg(long = "shell", num_args = 0..=1, require_equals = true, default_missing_value = "", value_name = "TARGET",)]
+    #[arg(long = "shell", num_args = 0..=1, require_equals = true, default_missing_value = "", value_name = "ADDRESS",)]
     pub shell: Option<String>,
     /// Print output artifacts to stdout
     #[arg(long = "cat-out", conflicts_with = "list_out")]
@@ -511,11 +526,201 @@ struct Caller {
     env: Vec<(OsString, OsString)>,
 }
 
+/// What `--shell` asked for. The flag has three states and no two of them mean
+/// the same thing to the engine, so they get three variants rather than a
+/// `bool` plus an `Option` the reader has to recombine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ShellFlag {
+    /// No `--shell`.
+    Absent,
+    /// Bare `--shell` (`default_missing_value = ""`): the run infers its single
+    /// target, and the engine refuses the request when there isn't one.
+    Infer,
+    /// `--shell=ADDRESS`.
+    Target(crate::htaddr::Addr),
+}
+
+/// Parse the `--shell` flag. The address uses the same dialect as the positional
+/// target, so `:name` and `./sub:name` mean the same thing in both places.
+fn resolve_shell_target(
+    shell: Option<&str>,
+    base_pkg: &crate::htpkg::PkgBuf,
+) -> anyhow::Result<ShellFlag> {
+    let Some(value) = shell else {
+        return Ok(ShellFlag::Absent);
+    };
+    if value.is_empty() {
+        return Ok(ShellFlag::Infer);
+    }
+    let addr = crate::htaddr::parse_addr_with_base(value, base_pkg)
+        .with_context(|| format!("parse --shell={value}"))?;
+    Ok(ShellFlag::Target(addr))
+}
+
+/// `--shell=ADDRESS` naming the one address the run selects says nothing bare
+/// `--shell` does not, so it takes the bare form's path: the terminal rides on
+/// `ResultOptions` for a build, and an entrypoint is invoked with `run_shell`,
+/// its terminal mode decided at the handover as for `heph run --shell <ep>`.
+/// Only an address that is *not* the selection needs the request-scoped
+/// `ShellTarget`.
+fn shell_for_selection(shell: ShellFlag, matcher: &Matcher) -> ShellFlag {
+    match shell {
+        ShellFlag::Target(addr) if matches!(matcher, Matcher::Addr(m) if *m == addr) => {
+            ShellFlag::Infer
+        }
+        other => other,
+    }
+}
+
+/// How looking up a `--shell=ADDRESS` target before the run came out.
+///
+/// `heph run` owns both `--shell=` warnings because it owns the whole request:
+/// it is the only place that sees the run start and end. Whether the target
+/// was entered is observed on the terminal it hands the engine
+/// ([`record_entry`]); everything said to the user is decided here, from that
+/// and this lookup. The engine keeps no state about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellLookup {
+    /// A target has the address. Whether the run reaches it is known only
+    /// after the run.
+    Found,
+    /// No target has it: warned about before the run.
+    NotFound,
+    /// Resolving it failed some other way: warned about before the run. If
+    /// the address is part of the run, the run hits the same error and reports
+    /// it on its own terms.
+    Failed,
+}
+
+impl ShellLookup {
+    fn of<T>(lookup: &anyhow::Result<T>) -> Self {
+        match lookup {
+            Ok(_) => Self::Found,
+            Err(e)
+                if crate::hmemoizer::downcast_chain_ref::<hplugin::error::TargetNotFoundError>(
+                    e,
+                )
+                .is_some() =>
+            {
+                Self::NotFound
+            }
+            Err(_) => Self::Failed,
+        }
+    }
+}
+
+/// Warn, before the run, about a `--shell=ADDRESS` the lookup did not find.
+/// Nothing for one it found.
+///
+/// A typo is decidable in one memoized spec lookup, so the user hears about it
+/// while the build is still running rather than after waiting one out. Neither
+/// case fails the run: `--shell` is an interactive convenience, and a bad value
+/// for it is no reason to throw away a build that is otherwise what was asked.
+fn warn_shell_lookup(addr: &crate::htaddr::Addr, lookup: &anyhow::Result<impl Sized>) {
+    let Err(e) = lookup else {
+        return;
+    };
+    if ShellLookup::of(lookup) == ShellLookup::NotFound {
+        tracing::warn!(
+            shell = %addr.format(),
+            "--shell names no known target, so no shell will be opened; \
+             the build continues — check the address with `heph query //{}`",
+            addr.package,
+        );
+        return;
+    }
+    tracing::warn!(
+        shell = %addr.format(),
+        error = %format!("{e:#}"),
+        "could not resolve the --shell target, so no shell will be opened; \
+         the build continues",
+    );
+}
+
+/// Whether to warn, after the run, that `--shell=ADDRESS` was not part of it.
+///
+/// Only for an address the lookup found: one it did not was warned about
+/// before the run, so each warning fires at most once by construction. Only
+/// after a run that **succeeded**: an unreached shell target on a failed run is
+/// a consequence of that failure, and a "not part of this run" on top of, say,
+/// the refusal of `--shell=<group>` would talk over the message that names the
+/// group's members.
+fn warn_not_in_run(lookup: ShellLookup, run_succeeded: bool, entered: bool) -> bool {
+    lookup == ShellLookup::Found && run_succeeded && !entered
+}
+
+/// The after-run warning. Loud on purpose: the failure mode a warning permits is
+/// a typo quietly costing the user their shell, so it names the address, says
+/// no shell was opened, and gives the command that lists what the run holds.
+fn warn_shell_not_in_run(addr: &crate::htaddr::Addr, request: &str) {
+    tracing::warn!(
+        shell = %addr.format(),
+        request = %request,
+        "--shell target was not part of this run, so no shell was opened; \
+         nothing in the run resolved that address — list what it does contain \
+         with `heph query <selection>`",
+    );
+}
+
+/// The `--shell=` terminal, recording into `entered` when the engine calls it.
+///
+/// The engine calls a [`ShellTarget`]'s terminal only from the one frame that
+/// takes it for the shell, so a call is exactly "the shell was entered" — a
+/// target that did not exist, or that the run never reached, never calls it.
+///
+/// [`ShellTarget`]: crate::engine::ShellTarget
+fn record_entry(terminal: InteractiveWrapper, entered: Arc<AtomicBool>) -> InteractiveWrapper {
+    Arc::new(move |inner| {
+        // `Relaxed`: the flag publishes no data, and it is read only after the
+        // request's futures have completed.
+        entered.store(true, Ordering::Relaxed);
+        terminal(inner)
+    })
+}
+
+/// A `--shell=ADDRESS` checked before the run, to be judged after it.
+#[derive(Debug)]
+struct ShellCheck {
+    addr: crate::htaddr::Addr,
+    lookup: ShellLookup,
+}
+
+impl ShellCheck {
+    /// Look the request's `--shell=` target up and warn now if no target has
+    /// it. `None` when the request names none, or has no terminal for it: the
+    /// engine refuses that request outright, and the refusal is the message.
+    ///
+    /// The lookup is not wasted work on the happy path: `mem_spec` is keyed by
+    /// addr, so the run reuses this exact cell.
+    async fn before(
+        engine: &Arc<Engine>,
+        rs: &Arc<crate::engine::request_state::RequestState>,
+    ) -> Option<Self> {
+        let target = rs.shell_target().filter(|t| t.terminal.is_some())?;
+        let addr = target.addr.clone();
+        let lookup = Arc::clone(engine).get_spec(Arc::clone(rs), &addr).await;
+        warn_shell_lookup(&addr, &lookup);
+        Some(Self {
+            lookup: ShellLookup::of(&lookup),
+            addr,
+        })
+    }
+
+    /// Once the run is over: warn if the address exists, the run succeeded, and
+    /// no frame entered it.
+    fn after(&self, run_succeeded: bool, entered: bool, request: &str) {
+        if warn_not_in_run(self.lookup, run_succeeded, entered) {
+            warn_shell_not_in_run(&self.addr, request);
+        }
+    }
+}
+
 struct RunApp {
     args: RunArgs,
     engine: Arc<Engine>,
     matcher: Matcher,
     caller: Caller,
+    shell: ShellFlag,
     fail_fast: bool,
     auto_approve: bool,
     /// `--no-scratch`: run with every declared scratch cache absent. Implies a
@@ -580,10 +785,14 @@ impl RunApp {
         // the wrapper below once the run returned.
         let session: Arc<std::sync::Mutex<Option<tui::PtySession>>> = Arc::default();
         let raw = self.args.raw;
-        let shell = self.args.shell.is_some();
+        // Whether the entrypoint itself is entered. A `--shell=` naming the
+        // entrypoint became bare `--shell` (`shell_for_selection`); one naming
+        // something else is one of its deps, reached through the request's
+        // `ShellTarget`, and the entrypoint then runs as asked.
+        let shell = self.shell == ShellFlag::Infer;
         let mut req = InvokeRequest::new(addr, self.caller.cwd, self.caller.env)
             .with_args(self.args.args)
-            .with_shell(self.args.shell.is_some())
+            .with_shell(shell)
             .with_signals(signals)
             .with_dispositions(hcore::process::inherited_dispositions().to_vec())
             .with_nofile(hcore::process::inherited_nofile())
@@ -801,11 +1010,36 @@ impl App for RunApp {
         // resolve, then reports the rest and exits non-zero; `--fail-fast` keeps
         // today's all-or-nothing walk instead.
         let gaps = Gaps::new(crate::htquery::format(&self.matcher));
+        // `--shell=ADDRESS` names its target on the *request* instead of in
+        // `ResultOptions` (see `ShellTarget`), because `ResultOptions` does not
+        // reach a target resolved as a dependency — and because the engine's
+        // bare-`--shell` gates exist precisely to refuse the ambiguity that an
+        // address resolves. So the wrapper moves out of `opts` entirely: with a
+        // shell target named, every frame that is not it resolves with no
+        // terminal, and leaving a wrapper in `opts` would only tell
+        // `classify_failure` those targets had streamed their output — which
+        // suppresses the process-log tail of a failing one, the exact regression
+        // #225 fixed for group members.
+        let shell_target = match &self.shell {
+            ShellFlag::Target(addr) => Some(addr.clone()),
+            ShellFlag::Absent | ShellFlag::Infer => None,
+        };
+        // Whether the `--shell=` target was entered is observed here, on the
+        // terminal this command hands over: the engine calls it exactly when a
+        // frame takes the terminal for the shell, and for nothing else.
+        let shell_entered = Arc::new(AtomicBool::new(false));
+        let (shell_terminal, interactive) = match &shell_target {
+            Some(_) => (
+                interactive.map(|terminal| record_entry(terminal, Arc::clone(&shell_entered))),
+                None,
+            ),
+            None => (None, interactive),
+        };
         let opts = ResultOptions {
             // `--no-scratch` implies `--force`; the engine applies that from
             // `no_scratch` below, so it is not repeated here.
             force: self.args.force,
-            shell: self.args.shell.is_some(),
+            shell: self.shell == ShellFlag::Infer,
             interactive,
             frozen: self.args.frozen,
             no_scratch: self.scratch_off,
@@ -827,13 +1061,24 @@ impl App for RunApp {
                 self.auto_approve,
             ))
         };
-        let rs = self.engine.new_state_full(
+        // The shell target is fixed when the request is built: no frame may
+        // resolve before it is known (see `ShellTarget`).
+        let rs = self.engine.new_state_with_shell(
             self.fail_fast,
             ctx.event_sender(),
             ctx.bg_pending(),
             self.args.log_lines,
             Some(approval),
+            shell_target.map(|addr| crate::engine::ShellTarget {
+                addr,
+                terminal: shell_terminal,
+            }),
         );
+        // Both `--shell=` warnings are this command's: the one before the run
+        // here, the one after it below, on the entrypoint path and the build
+        // path alike.
+        let shell_check = ShellCheck::before(&self.engine, &rs).await;
+        let request = self.selection();
 
         // An entrypoint is invoked, not built: it takes its own path from here.
         // An unresolvable address falls through, so the build path reports it
@@ -844,7 +1089,17 @@ impl App for RunApp {
             match self.engine.is_entrypoint(&rs, addr).await {
                 Ok(true) => {
                     let addr = addr.clone();
-                    return self.invoke(ctx, rs, addr).await;
+                    let outcome = self.invoke(ctx, Arc::clone(&rs), addr).await;
+                    if let Some(check) = &shell_check {
+                        // `Some(exit)` is a tool that ran: everything it
+                        // depends on resolved, whatever its own status.
+                        check.after(
+                            matches!(outcome, Ok(Some(_))),
+                            shell_entered.load(Ordering::Relaxed),
+                            &request,
+                        );
+                    }
+                    return outcome;
                 }
                 Err(e) if !self.args.args.is_empty() => {
                     let res: anyhow::Result<()> = Err(e);
@@ -912,6 +1167,16 @@ impl App for RunApp {
                     crate::commands::errors::require_non_empty_unless_incomplete(results, &gaps)
                 }),
         };
+
+        // A run with gaps skipped part of the graph, so it did not succeed:
+        // the shell target may be in what it skipped.
+        if let Some(check) = &shell_check {
+            check.after(
+                res.is_ok() && gaps.is_empty(),
+                shell_entered.load(Ordering::Relaxed),
+                &request,
+            );
+        }
 
         // On success print `--cat-out` / `--list-out`; failures/cancellation are
         // rendered and turned into the right exit by `finalize`.
@@ -1034,7 +1299,16 @@ async fn execute_async(
     };
     let base_pkg = get_cwp()?;
     refuse_misplaced_tool_args(&args, &base_pkg)?;
-    let m = resolve_matcher(&args.expr, &args.arg1, &args.arg2, &base_pkg, false)?;
+    let shell = resolve_shell_target(args.shell.as_deref(), &base_pkg)?;
+    // `heph run --shell=//pkg:a` on its own is a complete request: it names the
+    // target to enter, so there is nothing left to ask for. Falling through to
+    // `resolve_matcher` would answer "missing TARGET_ADDRESS/LABEL" to a command
+    // line that named one.
+    let m = match (&shell, &args.expr, &args.arg1) {
+        (ShellFlag::Target(addr), None, None) => Matcher::Addr(addr.clone()),
+        _ => resolve_matcher(&args.expr, &args.arg1, &args.arg2, &base_pkg, false)?,
+    };
+    let shell = shell_for_selection(shell, &m);
     let (engine, shutdown) = bootstrap::new_engine(&global, session)?;
     let raw = args.raw;
     let dashboard = args.dashboard.dashboard;
@@ -1043,6 +1317,7 @@ async fn execute_async(
         engine: std::sync::Arc::clone(&engine),
         matcher: m,
         caller,
+        shell,
         fail_fast: global.fail_fast,
         auto_approve: global.auto_approve,
         scratch_off: global.no_scratch,
@@ -1125,6 +1400,7 @@ async fn execute_async(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::htpkg::PkgBuf;
     use clap::Parser;
 
     #[derive(Parser)]
@@ -1464,5 +1740,227 @@ mod tests {
         .expect("parse")
         .run;
         assert_eq!(args.args, [raw]);
+    }
+
+    /// `--shell=ADDRESS` must reach the command as a value. The whole feature
+    /// rests on clap keeping it: strip `num_args`/`require_equals` and this
+    /// invocation stops parsing altogether.
+    #[test]
+    fn shell_captures_its_value() {
+        let args = parse(&["--shell=//pkg:a", "//pkg:g"]);
+        assert_eq!(args.shell.as_deref(), Some("//pkg:a"));
+        assert_eq!(args.arg1.as_deref(), Some("//pkg:g"));
+    }
+
+    /// `--shell=X` naming the run's one selected address takes the bare form's
+    /// path (so an entrypoint `X` is invoked with `run_shell`); naming anything
+    /// else, or with a selection, stays a request-scoped shell target.
+    #[test]
+    fn shell_target_naming_the_selection_is_the_bare_form() -> anyhow::Result<()> {
+        let a = crate::htaddr::parse_addr("//pkg:a")?;
+        let b = crate::htaddr::parse_addr("//pkg:b")?;
+        assert_eq!(
+            shell_for_selection(ShellFlag::Target(a.clone()), &Matcher::Addr(a.clone())),
+            ShellFlag::Infer,
+        );
+        assert_eq!(
+            shell_for_selection(ShellFlag::Target(b.clone()), &Matcher::Addr(a.clone())),
+            ShellFlag::Target(b),
+        );
+        assert_eq!(
+            shell_for_selection(
+                ShellFlag::Target(a.clone()),
+                &Matcher::Package(PkgBuf::from("pkg"))
+            ),
+            ShellFlag::Target(a),
+        );
+        assert_eq!(
+            shell_for_selection(ShellFlag::Absent, &Matcher::Package(PkgBuf::from("pkg"))),
+            ShellFlag::Absent,
+        );
+        Ok(())
+    }
+
+    /// Bare `--shell` stays a mode: present, naming no target. `require_equals`
+    /// is what keeps the following word a positional rather than the value.
+    #[test]
+    fn bare_shell_names_no_target() {
+        let args = parse(&["--shell", "//pkg:a"]);
+        assert_eq!(args.shell.as_deref(), Some(""));
+        assert_eq!(args.arg1.as_deref(), Some("//pkg:a"));
+        assert!(
+            parse(&["//pkg:a"]).shell.is_none(),
+            "no --shell at all is distinct from the bare flag",
+        );
+    }
+
+    /// The three states are distinct, and only the addressed one names a target
+    /// on the request. Collapsing `Absent` and `Infer` would make a plain
+    /// `heph run` try to open a shell; collapsing `Infer` and `Target` would put
+    /// the run back to discarding the value.
+    #[test]
+    fn resolve_shell_target_distinguishes_the_three_forms() -> anyhow::Result<()> {
+        let pkg = PkgBuf::from("cmd/server");
+        assert_eq!(resolve_shell_target(None, &pkg)?, ShellFlag::Absent);
+        assert_eq!(resolve_shell_target(Some(""), &pkg)?, ShellFlag::Infer);
+        assert_eq!(
+            resolve_shell_target(Some("//lib:core"), &pkg)?,
+            ShellFlag::Target(crate::htaddr::parse_addr("//lib:core")?),
+        );
+        Ok(())
+    }
+
+    /// The value is an address in the same dialect as the positional target, so
+    /// `:name` means the same thing in both places.
+    #[test]
+    fn shell_target_resolves_relative_to_the_current_package() -> anyhow::Result<()> {
+        let pkg = PkgBuf::from("cmd/server");
+        assert_eq!(
+            resolve_shell_target(Some(":bin"), &pkg)?,
+            ShellFlag::Target(crate::htaddr::parse_addr("//cmd/server:bin")?),
+        );
+        Ok(())
+    }
+
+    /// The after-run warning fires only for an address that exists, on a run
+    /// that succeeded, when no frame entered it. Each other row is a case where
+    /// it would be wrong: the address was entered; the run failed (an unreached
+    /// target is then a consequence, and a `--shell=<group>` refusal must not
+    /// be talked over); the address was already warned about before the run.
+    /// The engine calling the handed-over terminal is the only signal that the
+    /// `--shell=` target was entered, so the wrapper must record the call and
+    /// still hand the target the real terminal: a wrapper that records but does
+    /// not pass through would open no shell, and one that passes through
+    /// without recording would warn "not part of this run" over a shell the
+    /// user just used.
+    #[tokio::test]
+    async fn record_entry_records_the_call_and_passes_it_through() -> anyhow::Result<()> {
+        let reached = Arc::new(AtomicBool::new(false));
+        let terminal: InteractiveWrapper =
+            Arc::new(|inner: crate::engine::InteractiveInner| inner(None, None, None, None));
+        let entered = Arc::new(AtomicBool::new(false));
+        let wrapped = record_entry(terminal, Arc::clone(&entered));
+        assert!(
+            !entered.load(Ordering::Relaxed),
+            "building the wrapper enters nothing"
+        );
+
+        let target = Arc::clone(&reached);
+        wrapped(Box::new(move |_, _, _, _| {
+            Box::pin(async move {
+                target.store(true, Ordering::Relaxed);
+                Ok(())
+            })
+        }))
+        .await?;
+
+        assert!(entered.load(Ordering::Relaxed), "a call is an entry");
+        assert!(
+            reached.load(Ordering::Relaxed),
+            "…and the target got the terminal"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn warn_not_in_run_only_for_a_found_target_a_successful_run_never_entered() {
+        use ShellLookup::{Failed, Found, NotFound};
+        for (lookup, succeeded, entered, warns) in [
+            (Found, true, false, true),
+            (Found, true, true, false),
+            (Found, false, false, false),
+            (Found, false, true, false),
+            (NotFound, true, false, false),
+            (NotFound, false, false, false),
+            (Failed, true, false, false),
+            (Failed, false, false, false),
+        ] {
+            assert_eq!(
+                warn_not_in_run(lookup, succeeded, entered),
+                warns,
+                "lookup={lookup:?} succeeded={succeeded} entered={entered}",
+            );
+        }
+    }
+
+    /// The lookup tells a missing target from one that failed to resolve: only
+    /// the first is "names no known target", and only `Found` is judged after.
+    #[test]
+    fn shell_lookup_classifies_the_spec_lookup() {
+        let addr = crate::htaddr::parse_addr("//pkg:typo").expect("addr");
+        let found: anyhow::Result<()> = Ok(());
+        assert_eq!(ShellLookup::of(&found), ShellLookup::Found);
+        let missing: anyhow::Result<()> = Err(anyhow::Error::new(
+            hplugin::error::TargetNotFoundError { addr },
+        )
+        .context("resolve spec"));
+        assert_eq!(ShellLookup::of(&missing), ShellLookup::NotFound);
+        let broken: anyhow::Result<()> = Err(anyhow::anyhow!("BUILD file does not parse"));
+        assert_eq!(ShellLookup::of(&broken), ShellLookup::Failed);
+    }
+
+    /// The warnings are really emitted, with the address, the consequence and
+    /// the command that finds the right address — and the before/after pair
+    /// says each thing once: a target the lookup did not find is warned about
+    /// before the run, and never again after it.
+    #[test]
+    fn shell_warnings_are_emitted_once_each() {
+        let typo = crate::htaddr::parse_addr("//pkg:typo").expect("addr");
+        let missing: anyhow::Result<()> =
+            Err(anyhow::Error::new(hplugin::error::TargetNotFoundError {
+                addr: typo.clone(),
+            }));
+        let log = captured_log(|| {
+            warn_shell_lookup(&typo, &missing);
+            ShellCheck {
+                addr: typo.clone(),
+                lookup: ShellLookup::of(&missing),
+            }
+            .after(true, false, "//pkg:a");
+        });
+        assert_eq!(log.matches("//pkg:typo").count(), 1, "log: {log}");
+        assert!(log.contains("names no known target"), "log: {log}");
+        assert!(log.contains("no shell will be opened"), "log: {log}");
+        assert!(log.contains("heph query //pkg"), "log: {log}");
+
+        let outside = crate::htaddr::parse_addr("//pkg:b").expect("addr");
+        let found: anyhow::Result<()> = Ok(());
+        let log = captured_log(|| {
+            warn_shell_lookup(&outside, &found);
+            let check = ShellCheck {
+                addr: outside.clone(),
+                lookup: ShellLookup::of(&found),
+            };
+            check.after(true, false, "//pkg:a");
+        });
+        assert_eq!(log.matches("shell=//pkg:b").count(), 1, "log: {log}");
+        assert!(log.contains("was not part of this run"), "log: {log}");
+        assert!(log.contains("no shell was opened"), "log: {log}");
+        assert!(log.contains("request=//pkg:a"), "log: {log}");
+
+        let log = captured_log(|| {
+            ShellCheck {
+                addr: outside.clone(),
+                lookup: ShellLookup::Found,
+            }
+            .after(true, true, "//pkg:a");
+        });
+        assert!(
+            log.is_empty(),
+            "an entered target is not warned about: {log}"
+        );
+    }
+
+    /// An unparseable value fails, with the value in the message — never a
+    /// silently ignored flag, which is the defect this feature fixes.
+    #[test]
+    fn unparseable_shell_target_is_rejected() {
+        let err = resolve_shell_target(Some("not an address"), &PkgBuf::from(""))
+            .err()
+            .expect("must reject");
+        assert!(
+            format!("{err:#}").contains("parse --shell=not an address"),
+            "{err:#}",
+        );
     }
 }
