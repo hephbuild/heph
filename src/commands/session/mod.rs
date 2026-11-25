@@ -58,8 +58,17 @@ pub struct SessionArgs {
 pub enum SessionCommands {
     /// One line per session, live first
     ///
-    /// Only this workspace's sessions unless `--all`. Reads each session's
-    /// `meta.json` and `status.json`, never its event log.
+    /// Lists the sessions started in the last 7 days (`--since`). It joins
+    /// two sources: the session directories, for the live sessions and the
+    /// ended ones still kept (7 days by default), and the session catalog,
+    /// for who ran each session, its targets, and the sessions whose
+    /// recording is gone, up to 90 days back (`--since 90d`). Opening the
+    /// catalog repairs it; what it did is said on stderr.
+    ///
+    /// Only this workspace's sessions, unless `--all` or `--workspace DIR`.
+    /// The filters combine: `--addr` (the sessions that resolved a target,
+    /// cache hits included, with its OUTCOME), `--failed`, `--actor`,
+    /// `--command`, `--user`, `--until`.
     ///
     /// STATE is computed by this viewer:
     ///
@@ -80,6 +89,10 @@ pub enum SessionCommands {
     /// `heph session list`
     ///
     /// `heph session list --all --json`
+    ///
+    /// `heph session list --addr //p:t --failed --json`
+    ///
+    /// `heph session list --since 90d --actor agent`
     List(ListArgs),
     /// Print a session's progress once, and what it is stuck on
     ///
@@ -133,7 +146,8 @@ pub enum SessionCommands {
     ///
     /// `--format otlp` writes the session's spans, logs and metrics as
     /// OTLP/JSON lines instead (at most 1000 items a line), for an OpenTelemetry
-    /// collector's `otlpjsonfile` receiver or any OTLP tool.
+    /// collector's `otlp_json_file` receiver or any OTLP tool. Each line is
+    /// also the body of one OTLP/HTTP export request.
     ///
     /// Examples:
     ///
@@ -165,6 +179,11 @@ pub enum SessionCommands {
     /// rows than `--limit` (100000 by default, 0 for none) is an error. A
     /// refused or failing statement exits 125. Ctrl-C stops it and exits
     /// 130.
+    ///
+    /// `--schema` also prints the built-in recipes, SQL for the questions
+    /// asked most: `time_by_phase`, `uncovered_wall`, `phase_percentiles`
+    /// and `hit_rate_by_package`. Copy one into a query, or into a file for
+    /// `-f`.
     ///
     /// Examples:
     ///
@@ -218,7 +237,8 @@ pub struct QueryArgs {
     /// Stop the query after this long (`30s`, `2m`).
     #[arg(long, value_name = "DURATION", default_value = "30s", value_parser = query::parse_timeout)]
     pub timeout: Duration,
-    /// Print the six tables with their columns and the schema version.
+    /// Print the six tables with their columns, the schema version, and the
+    /// built-in recipes as runnable SQL; run nothing.
     #[arg(long, conflicts_with_all = ["from", "full", "format"])]
     pub schema: bool,
 }
@@ -263,8 +283,9 @@ pub struct ListArgs {
     /// The sessions of the workspace at DIR, not this one's.
     #[arg(long, value_name = "DIR")]
     pub workspace: Option<std::path::PathBuf>,
-    /// Machine-readable output: `{version, sessions: [...], retention}`, live
-    /// sessions first, then ended ones newest first.
+    /// Machine-readable output: `{version, sessions: [...], retention}`, in
+    /// the table's order: live sessions first, then ended ones, each newest
+    /// first. A change to that order bumps `version`.
     #[arg(long)]
     pub json: bool,
 }
