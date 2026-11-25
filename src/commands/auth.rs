@@ -265,7 +265,8 @@ async fn status_body(
         // land inside a live frame.
         let out = render_status(&rows, gaps.is_empty())?;
         if !out.is_empty() {
-            tui::paused!(ctx, { print!("{out}") });
+            tui::paused!(ctx, { std::io::stdout().write_all(out.as_bytes()) })
+                .context("writing the credential table")?;
         }
     }
 
@@ -497,7 +498,8 @@ async fn explain_body(
         return json.record(&view, &cancelled);
     }
     let out = render_explain(&addr, &steps)?;
-    tui::paused!(ctx, { print!("{out}") });
+    tui::paused!(ctx, { std::io::stdout().write_all(out.as_bytes()) })
+        .context("writing the explanation")?;
     if !steps.iter().any(|s| s.chosen) {
         anyhow::bail!("no source applies here");
     }
@@ -626,8 +628,13 @@ async fn login_body(
                 due.push(step.index);
             } else if let Err(e) = engine.acquire_credential(&rs, addr, &Chain::root()).await {
                 tui::paused!(ctx, {
-                    println!("{addr}: {} does not work here: {e:#}", step.label)
-                });
+                    writeln!(
+                        std::io::stdout(),
+                        "{addr}: {} does not work here: {e:#}",
+                        step.label
+                    )
+                })
+                .context("writing the sign-in notice")?;
                 due.push(step.index);
             }
         }
@@ -645,7 +652,8 @@ async fn login_body(
                 // command. A no-op on the line backend.
                 let status = {
                     let _terminal = pauser.pause_for(tui::PauseFor::Input).await;
-                    println!("{addr}: {}", argv.join(" "));
+                    writeln!(std::io::stdout(), "{addr}: {}", argv.join(" "))
+                        .context("writing the sign-in command")?;
                     // Through the engine's exec-runner seam, so a source whose
                     // tool lives in a devenv shell signs in *there* — the same
                     // place its probe looked. Stdio is inherited: a browser flow
@@ -663,8 +671,12 @@ async fn login_body(
     }
     if ran == 0 && gaps.is_empty() {
         tui::paused!(ctx, {
-            println!("nothing to sign in to — every declared credential already applies here")
-        });
+            writeln!(
+                std::io::stdout(),
+                "nothing to sign in to — every declared credential already applies here"
+            )
+        })
+        .context("writing the sign-in summary")?;
     }
     crate::commands::errors::require_complete_selection(&gaps)
 }
