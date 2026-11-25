@@ -186,7 +186,7 @@ fn coreutils_shims(home_dir: &std::path::Path) -> pluginexec::CoreutilsShims {
 /// workspace-level policy reaches `Config`.
 /// The always-on builtins the binary adds beside the engine's own (`fs`,
 /// `group`, `scratch`, `auth`, `query`): each one plugin, named after itself.
-/// None takes options. The `go`, `oci`, `devenv` and `gha` plugins are not
+/// None takes options. The `go`, `oci`, `devenv` and `gh` plugins are not
 /// compiled in: they ship as cdylibs loaded from a `path:`/`url:` manifest
 /// entry, named by that manifest.
 pub fn register_builtin_plugins(

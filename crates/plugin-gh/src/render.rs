@@ -1610,7 +1610,7 @@ mod tests {
     /// `docs/GHA_REPORTING.md`. Ignored: it asserts nothing, it is a way to look
     /// at the output.
     ///
-    /// `cargo test -p plugin-gha preview -- --ignored --nocapture`
+    /// `cargo test -p plugin-gh preview -- --ignored --nocapture`
     #[test]
     #[ignore = "prints output for human review; asserts nothing"]
     fn preview() {

@@ -1,6 +1,6 @@
-//! A GitHub Actions hook: folds the engine's build-event stream into a status
-//! [`Tally`] and surfaces it two ways. Published out-of-process as a cdylib (see
-//! `plugin-gha-cdylib`) and enabled via a config `plugins:` entry.
+//! The `gh` plugin's GitHub Actions hook: folds the engine's build-event stream
+//! into a status [`Tally`] and surfaces it two ways. Published out-of-process as
+//! a cdylib (see `plugin-gh-cdylib`) and enabled via a config `plugins:` entry.
 //!
 //! The design, and the reasoning behind it, is `docs/GHA_REPORTING.md`. The two
 //! things to know before editing:

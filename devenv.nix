@@ -173,7 +173,7 @@ let
   };
 
   binLocation = "$HOME/.local/bin/heph3";
-  qualityCrates = "-p heph -p e2e -p bin-e2e -p testkit -p plugingo-e2e -p htspec-derive -p core -p config -p coreutils -p template -p sqlite -p walk -p proc -p execrunner -p model -p sandboxfuse -p plugin -p plugin-abi -p plugin-sdk -p plugin-stabby -p plugin-go-cdylib -p builtins -p plugin-buildfile -p driver-support -p driver-bridge -p plugin-exec -p plugin-nix -p plugin-devenv -p plugin-devenv-cdylib -p plugin-http -p plugin-oci -p plugin-query -p plugin-go -p plugin-gha -p plugin-gha-cdylib -p plugin-oci-cdylib -p plugin-entrypoint-test-cdylib -p telemetry -p tui -p lock -p fetch -p selfupdate -p engine -p xstarlark-fmt -p bench-corpus -p bench";
+  qualityCrates = "-p heph -p e2e -p bin-e2e -p testkit -p plugingo-e2e -p htspec-derive -p core -p config -p coreutils -p template -p sqlite -p walk -p proc -p execrunner -p model -p sandboxfuse -p plugin -p plugin-abi -p plugin-sdk -p plugin-stabby -p plugin-go-cdylib -p builtins -p plugin-buildfile -p driver-support -p driver-bridge -p plugin-exec -p plugin-nix -p plugin-devenv -p plugin-devenv-cdylib -p plugin-http -p plugin-oci -p plugin-query -p plugin-go -p plugin-gh -p plugin-gh-cdylib -p plugin-oci-cdylib -p plugin-entrypoint-test-cdylib -p telemetry -p tui -p lock -p fetch -p selfupdate -p engine -p xstarlark-fmt -p bench-corpus -p bench";
 in
 {
   # https://devenv.sh/basics/
@@ -386,7 +386,7 @@ in
   #   - Without `--workspace`: the repo root is itself a package (`heph`), so
   #     cargo's default selection is that package and *its dependency graph*.
   #     Two things fall outside it. Every member that the root binary does not
-  #     depend on is never compiled at all — `plugin-go`, `plugin-gha`, the
+  #     depend on is never compiled at all — `plugin-go`, `plugin-gh`, the
   #     cdylibs, `plugin-abi`/`sdk`/`stabby`, `testkit`, and the `e2e` crates.
   #     And no member's **test** targets are built, in the graph or out. (A
   #     member lib that *is* in the graph does get linted, because cargo passes
@@ -604,7 +604,7 @@ in
       src="$HEPH_E2E_FROM"
       cp "$src/heph_''${os}_''${arch}"                 "$dist/heph"
       cp "$src/heph-go-plugin_''${os}_''${arch}.$ext"  "$dist/heph-go-plugin.$ext"
-      cp "$src/heph-gha-plugin_''${os}_''${arch}.$ext" "$dist/heph-gha-plugin.$ext"
+      cp "$src/heph-gh-plugin_''${os}_''${arch}.$ext" "$dist/heph-gh-plugin.$ext"
       cp "$src/heph-oci-plugin_''${os}_''${arch}.$ext" "$dist/heph-oci-plugin.$ext"
       cp "$src/heph-devenv-plugin_''${os}_''${arch}.$ext" "$dist/heph-devenv-plugin.$ext"
       # A test fixture, not a shipped artifact: named `test-*` so that
@@ -615,7 +615,7 @@ in
       # invocation so cargo overlaps their LTO tails — see heph.yml).
       # Plus the test-only entrypoint cdylib, which the build job also builds
       # (and uploads unpublished).
-      cargo build --release --locked --bin heph --lib -p heph -p plugin-go-cdylib -p plugin-gha-cdylib -p plugin-oci-cdylib -p plugin-devenv-cdylib -p plugin-entrypoint-test-cdylib
+      cargo build --release --locked --bin heph --lib -p heph -p plugin-go-cdylib -p plugin-gh-cdylib -p plugin-oci-cdylib -p plugin-devenv-cdylib -p plugin-entrypoint-test-cdylib
       out="$target/release"
 
       # cargo's build lock covers the build but not the gap between it and the
@@ -632,16 +632,16 @@ in
       fingerprint() {
         stat -c '%i %s %Y' "$@" 2>/dev/null || stat -f '%i %z %m' "$@"
       }
-      before="$(fingerprint "$out/heph" "$out/libplugin_go_cdylib.$ext" "$out/libplugin_gha_cdylib.$ext" "$out/libplugin_oci_cdylib.$ext" "$out/libplugin_devenv_cdylib.$ext" "$out/libplugin_entrypoint_test_cdylib.$ext")"
+      before="$(fingerprint "$out/heph" "$out/libplugin_go_cdylib.$ext" "$out/libplugin_gh_cdylib.$ext" "$out/libplugin_oci_cdylib.$ext" "$out/libplugin_devenv_cdylib.$ext" "$out/libplugin_entrypoint_test_cdylib.$ext")"
 
       cp "$out/heph"                       "$dist/heph"
       cp "$out/libplugin_go_cdylib.$ext"   "$dist/heph-go-plugin.$ext"
-      cp "$out/libplugin_gha_cdylib.$ext"  "$dist/heph-gha-plugin.$ext"
+      cp "$out/libplugin_gh_cdylib.$ext"  "$dist/heph-gh-plugin.$ext"
       cp "$out/libplugin_oci_cdylib.$ext"  "$dist/heph-oci-plugin.$ext"
       cp "$out/libplugin_devenv_cdylib.$ext" "$dist/heph-devenv-plugin.$ext"
       cp "$out/libplugin_entrypoint_test_cdylib.$ext" "$dist/test-entrypoint-plugin.$ext"
 
-      after="$(fingerprint "$out/heph" "$out/libplugin_go_cdylib.$ext" "$out/libplugin_gha_cdylib.$ext" "$out/libplugin_oci_cdylib.$ext" "$out/libplugin_devenv_cdylib.$ext" "$out/libplugin_entrypoint_test_cdylib.$ext")"
+      after="$(fingerprint "$out/heph" "$out/libplugin_go_cdylib.$ext" "$out/libplugin_gh_cdylib.$ext" "$out/libplugin_oci_cdylib.$ext" "$out/libplugin_devenv_cdylib.$ext" "$out/libplugin_entrypoint_test_cdylib.$ext")"
       if [ "$before" != "$after" ]; then
         echo "e2e: $out changed while staging — another build in this" >&2
         echo "e2e: worktree raced this one. Re-run." >&2
@@ -651,7 +651,7 @@ in
       if [ "$os" = "darwin" ]; then
         # Same post-processing the shipped macOS artifacts get, so a local run
         # tests the same bytes CI would publish.
-        for f in "$dist/heph" "$dist/heph-go-plugin.$ext" "$dist/heph-gha-plugin.$ext" "$dist/heph-oci-plugin.$ext" "$dist/heph-devenv-plugin.$ext" "$dist/test-entrypoint-plugin.$ext"; do
+        for f in "$dist/heph" "$dist/heph-go-plugin.$ext" "$dist/heph-gh-plugin.$ext" "$dist/heph-oci-plugin.$ext" "$dist/heph-devenv-plugin.$ext" "$dist/test-entrypoint-plugin.$ext"; do
           bash "$DEVENV_ROOT/scripts/macos-portable.sh" "$f"
         done
       fi
@@ -667,7 +667,7 @@ in
       # After macos-portable.sh, not before: both re-sign, and this one must
       # have the last word or the signature covers pre-patch bytes.
       version="$(bash "$DEVENV_ROOT/.github/workflows/version.sh")"
-      for f in "$dist/heph" "$dist/heph-go-plugin.$ext" "$dist/heph-gha-plugin.$ext" "$dist/heph-oci-plugin.$ext" "$dist/heph-devenv-plugin.$ext" "$dist/test-entrypoint-plugin.$ext"; do
+      for f in "$dist/heph" "$dist/heph-go-plugin.$ext" "$dist/heph-gh-plugin.$ext" "$dist/heph-oci-plugin.$ext" "$dist/heph-devenv-plugin.$ext" "$dist/test-entrypoint-plugin.$ext"; do
         bash "$DEVENV_ROOT/scripts/patch-slot.sh" "$f" "version=$version"
       done
     fi
@@ -762,34 +762,35 @@ in
     echo "installed go plugin -> $dest"
   '';
 
-  # Build + install the GitHub Actions hook plugin (a cdylib + manifest), the same
+  # Build + install the GitHub plugin (a cdylib + manifest: the Actions
+  # reporting hook and the release-asset functions), the same
   # publish flow as `install-go-plugin`. Reference it from config with a `path:`
   # entry (e.g. in a `ci.hephconfig` profile overlay, enabled via HEPH_PROFILES).
-  scripts.install-gha-plugin.exec = ''
-    cargo build --release -p plugin-gha-cdylib
+  scripts.install-gh-plugin.exec = ''
+    cargo build --release -p plugin-gh-cdylib
     target="$(target-dir .)"
     if [ "$(uname -s)" = "Darwin" ]; then
-      lib="$target/release/libplugin_gha_cdylib.dylib"
-      name="heph-gha-plugin.dylib"
+      lib="$target/release/libplugin_gh_cdylib.dylib"
+      name="heph-gh-plugin.dylib"
       bash "$DEVENV_ROOT/scripts/macos-portable.sh" "$lib"
     else
-      lib="$target/release/libplugin_gha_cdylib.so"
-      name="heph-gha-plugin.so"
+      lib="$target/release/libplugin_gh_cdylib.so"
+      name="heph-gh-plugin.so"
     fi
-    dest="$HOME/.heph/plugins/gha"
+    dest="$HOME/.heph/plugins/gh"
     mkdir -p "$dest"
     cp "$lib" "$dest/$name.new"
     mv -f "$dest/$name.new" "$dest/$name"
     ( cd "$DEVENV_ROOT/tools/pluginmanifest" \
-        && go run . -name gha -host-path "$name" -checksum-from "$dest/$name" -out "$dest/heph-gha-plugin.json" )
-    echo "installed gha plugin -> $dest"
+        && go run . -name gh -host-path "$name" -checksum-from "$dest/$name" -out "$dest/heph-gh-plugin.json" )
+    echo "installed gh plugin -> $dest"
   '';
 
   # Build + install the devenv exec-runner plugin (a cdylib + manifest), the same
-  # publish flow as `install-gha-plugin`. Reference it from config with a
+  # publish flow as `install-gh-plugin`. Reference it from config with a
   # `path: ~/.heph/plugins/devenv/heph-devenv-plugin.json` entry.
   # Build + install the OCI plugin (a cdylib + manifest), the same publish flow
-  # as `install-gha-plugin`. Reference it from config with a
+  # as `install-gh-plugin`. Reference it from config with a
   # `path: ~/.heph/plugins/oci/heph-oci-plugin.json` entry.
   scripts.install-oci-plugin.exec = ''
     cargo build --release -p plugin-oci-cdylib

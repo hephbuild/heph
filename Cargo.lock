@@ -5240,7 +5240,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "plugin-gha"
+name = "plugin-gh"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -5255,12 +5255,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "plugin-gha-cdylib"
+name = "plugin-gh-cdylib"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "plugin",
- "plugin-gha",
+ "plugin-gh",
  "plugin-sdk",
  "stabby",
  "tracing",

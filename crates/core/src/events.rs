@@ -13,7 +13,7 @@
 //! Not a "future" one. `StableRemoteHook` serde-JSON-encodes **every** event
 //! across the plugin seam to out-of-process hooks
 //! (`crates/plugin-stabby/src/load_stable.rs`), and a plugin cdylib such as
-//! `plugin-gha-cdylib` ships as its own release artifact, pinned by manifest URL
+//! `plugin-gh-cdylib` ships as its own release artifact, pinned by manifest URL
 //! independently of which `heph` binary the user runs. **Host/plugin version
 //! skew is therefore a normal, reachable state**, and a skewed pair still loads
 //! successfully at `dlopen` — the ABI check covers the `StreamItem` envelope,

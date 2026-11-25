@@ -1,5 +1,5 @@
 [package]
-name = "plugin-gha"
+name = "plugin-gh"
 version = "0.1.0"
 edition = "2024"
 
