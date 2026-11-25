@@ -32,6 +32,7 @@ mod config_schema_cli;
 mod coreutils_cli;
 mod darwin_linker;
 mod dev_debuginfo;
+mod docs_ci;
 mod execrunner_gate;
 mod feature_unification;
 mod gc_cli;

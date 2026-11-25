@@ -234,6 +234,12 @@ Snapshots record the absolute path they were produced under, because a cache tha
 is portable in content but embeds absolute paths will restore and be inert —
 present, and useless. `heph tool scratch head` reports it.
 
+A CI cache snapshot ([`CI.md`](CI.md)) carries slots the same way: every slot a
+job used that may travel (`remote = True`), in the job's own scope, written by
+`heph tool cache snapshot` under `scratch/v1/` with the push's rules
+(generation parent + 1, an unchanged slot skipped). The next job pulls from it
+as from any remote. A slot with `remote = False` never goes in.
+
 ## Boundaries
 
 A scratch is the only mutable, unhashed thing inside a sandbox, so every boundary
