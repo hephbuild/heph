@@ -160,7 +160,11 @@ struct GoGolistDef {
 /// v17: `firstparty` joined the def, changing every golist target's def hash.
 /// v18: a failed module fetch fails the target. It used to be cached as a package
 /// with no Go files, and those entries must not outlive the fix.
-const GO_GOLIST_FORMAT_VERSION: u32 = 18;
+/// v19: `Dir` is portable (`portable_dir`). A thirdparty `Dir` used to be the
+/// absolute host GOMODCACHE path, so `package.bin` differed between machines
+/// under one `hashin`; an old entry rebuilt by this version would fail the run
+/// as non-reproducible, so none may be served to it.
+const GO_GOLIST_FORMAT_VERSION: u32 = 19;
 
 /// The environment `go list` runs under.
 ///
@@ -503,19 +507,20 @@ impl ManagedDriver for GoGolistDriver {
         // `pkg_test [pkg.test]`); we keep only the canonical entry whose ImportPath
         // matches the request — that one has the resolved TestEmbedFiles /
         // XTestEmbedFiles we actually need downstream.
-        let ws_prefix = req.sandbox_ws_dir.to_string_lossy();
-        let mut pkgs: Vec<GoPackage> = serde_json::Deserializer::from_slice(&output.stdout)
+        let pkgs: Vec<GoPackage> = serde_json::Deserializer::from_slice(&output.stdout)
             .into_iter::<GoPackage>()
             .collect::<Result<_, _>>()
             .context("parse go list output")?;
-        pkgs.retain(|p| p.import_path == def.import_path);
-        for p in &mut pkgs {
-            normalize_pkg_paths(p, &ws_prefix);
-        }
-
-        let pkg = pkgs.into_iter().next().ok_or_else(|| {
-            anyhow::anyhow!("go list returned no entry matching {}", def.import_path)
-        })?;
+        let mut pkg = pkgs
+            .into_iter()
+            .find(|p| p.import_path == def.import_path)
+            .ok_or_else(|| {
+                anyhow::anyhow!("go list returned no entry matching {}", def.import_path)
+            })?;
+        // The asm header scan below reads the package's real directory (the host
+        // module cache for a thirdparty package); `package.bin` must not carry it.
+        let source_dir =
+            normalize_pkg_paths(&mut pkg, &PathRoots::resolve(&req.sandbox_ws_dir, &goroot));
         check_package_resolved(def, &pkg, &output.stderr)?;
 
         let package_bin = encode_go_package(&pkg).context("encode package.bin")?;
@@ -548,7 +553,7 @@ impl ManagedDriver for GoGolistDriver {
         // siblings via the module-root download target at their module-relative
         // path — the path the `-I .` asm step resolves them against.
         if let (Some(dl), false) = (download_addr.as_ref(), pkg.s_files.is_empty())
-            && let Some(pkg_dir) = pkg.dir.as_deref()
+            && let Some(pkg_dir) = source_dir.as_deref()
         {
             let module_ws_root = dl.package.as_str();
             let subpath = pkg_str
@@ -685,33 +690,191 @@ fn golist_args(def: &GoGolistDef) -> Vec<String> {
     args
 }
 
-/// Strip every absolute path out of a `go list` package so the cached
+/// The machine-specific roots a `go list` path can sit under, each spelled both
+/// as heph handed it to go and as the OS resolves it: go reports the resolved
+/// one where it derives a path from its working directory, so a sandbox under a
+/// symlinked home would otherwise match on one machine and not another.
+#[derive(Debug, Default)]
+struct PathRoots {
+    ws: Vec<String>,
+    goroot: Vec<String>,
+}
+
+impl PathRoots {
+    fn resolve(ws: &std::path::Path, goroot: &std::path::Path) -> Self {
+        fn spellings(p: &std::path::Path) -> Vec<String> {
+            let mut out = vec![p.to_string_lossy().into_owned()];
+            if let Ok(real) = std::fs::canonicalize(p) {
+                let real = real.to_string_lossy().into_owned();
+                if !out.contains(&real) {
+                    out.push(real);
+                }
+            }
+            out
+        }
+        Self {
+            ws: spellings(ws),
+            goroot: spellings(goroot),
+        }
+    }
+}
+
+/// Strip every machine-specific path out of a `go list` package so the cached
 /// `package.bin` is byte-identical across machines (and sandboxes). go reports
-/// absolute paths in two places:
-/// - `Dir`: rewritten repo-root-relative (it lives under the sandbox ws).
+/// absolute paths in three places:
+/// - `Dir`: see [`portable_dir`].
+/// - `Error.Err`: go ends its "no Go files in", "build constraints exclude all
+///   Go files in" and "is not in std (…)" messages with the directory. These
+///   are the settled errors `check_package_resolved` lets through, so they are
+///   cached. Rewritten with the same roots, `Dir`'s own value first.
 /// - `Module.Dir`: an absolute sandbox-ws path (first-party) or host
 ///   GOMODCACHE path (thirdparty). Nothing downstream reads it — only
-///   `Module.Path` matters — so it's dropped. Left in, its per-machine
-///   absolute value would make this output (and every consumer's hashin)
-///   differ across machines, defeating the cache.
-fn normalize_pkg_paths(p: &mut GoPackage, ws_prefix: &str) {
-    if let Some(dir) = &p.dir {
-        p.dir = Some(normalize_dir(dir, ws_prefix));
+///   `Module.Path` matters — so it's dropped once the others have been
+///   rewritten against it.
+///
+/// Left in, a per-machine path makes this output differ across machines under
+/// one `hashin`. That is not only a cache-sharing loss: a revision cached on one
+/// machine (CI, through the remote) and rebuilt on another — because its blobs
+/// were reclaimed — fails the run as a non-reproducible target.
+///
+/// Returns the package's real directory, which only this run may read.
+fn normalize_pkg_paths(p: &mut GoPackage, roots: &PathRoots) -> Option<String> {
+    let module = p.module.as_ref();
+    let portable = p
+        .dir
+        .as_deref()
+        .map(|dir| portable_dir(dir, module, roots, &p.import_path));
+    if let Some(err) = &mut p.error {
+        let mut text = std::mem::take(&mut err.err);
+        if let (Some(dir), Some(portable)) = (&p.dir, &portable) {
+            text = replace_root(&text, dir, portable);
+        }
+        for ws in &roots.ws {
+            text = replace_root(&text, ws, "");
+        }
+        if let Some(m) = module
+            && let Some(md) = &m.dir
+        {
+            text = replace_root(&text, md, &module_form(m, ""));
+        }
+        for goroot in &roots.goroot {
+            text = replace_root(&text, goroot, "$GOROOT");
+        }
+        err.err = text;
     }
     if let Some(m) = &mut p.module {
         m.dir = None;
     }
+    std::mem::replace(&mut p.dir, portable)
 }
 
-/// Strip `ws_prefix/` from a go list `Dir` path so it becomes repo-root-relative.
-fn normalize_dir(dir: &str, ws_prefix: &str) -> String {
-    let prefix_slash = format!("{ws_prefix}/");
-    if let Some(rel) = dir.strip_prefix(&prefix_slash) {
-        rel.to_string()
-    } else if dir == ws_prefix {
-        String::new()
-    } else {
-        dir.to_string()
+/// A go list `Dir` with its machine-specific root replaced:
+/// - under the sandbox workspace (first-party): repo-root-relative;
+/// - under its module's directory (thirdparty, in the host GOMODCACHE):
+///   `<module path>@<version>/<subdir>`, the module cache's own layout minus
+///   its root;
+/// - under GOROOT (stdlib on a host toolchain): `$GOROOT/<subdir>`;
+/// - anywhere else: `$UNKNOWN/<import path>`, with a warning. No toolchain mode
+///   is known to reach it, and keeping the absolute path would bring back the
+///   bug this exists to prevent, on another machine, much later.
+///
+/// Nothing downstream reads the value beyond its presence — the asm header scan
+/// reads the real directory — so the rewrite only has to be stable, not
+/// resolvable.
+fn portable_dir(
+    dir: &str,
+    module: Option<&crate::plugingo::pkg_analysis::GoModule>,
+    roots: &PathRoots,
+    import_path: &str,
+) -> String {
+    if let Some(rel) = roots.ws.iter().find_map(|ws| strip_dir_prefix(dir, ws)) {
+        return rel.to_string();
+    }
+    if let Some(m) = module
+        && let Some(rel) = m.dir.as_deref().and_then(|md| strip_dir_prefix(dir, md))
+    {
+        return module_form(m, rel);
+    }
+    if let Some(rel) = roots
+        .goroot
+        .iter()
+        .find_map(|goroot| strip_dir_prefix(dir, goroot))
+    {
+        return if rel.is_empty() {
+            "$GOROOT".to_string()
+        } else {
+            format!("$GOROOT/{rel}")
+        };
+    }
+    tracing::warn!(
+        import_path,
+        dir,
+        "go list reported a package directory outside the workspace, its module and GOROOT"
+    );
+    format!("$UNKNOWN/{import_path}")
+}
+
+/// `<module path>[@<version>][/<rel>]`.
+fn module_form(m: &crate::plugingo::pkg_analysis::GoModule, rel: &str) -> String {
+    let mut out = m.path.clone();
+    if let Some(v) = &m.version {
+        out.push('@');
+        out.push_str(v);
+    }
+    if !rel.is_empty() {
+        out.push('/');
+        out.push_str(rel);
+    }
+    out
+}
+
+/// Replace every occurrence of the path `root` in free text with `repl`, on
+/// path-component boundaries only: `/a/b` is not replaced inside `/a/bc` or
+/// `/x/a/b`. An empty `repl` makes what follows root-relative — `root/sub`
+/// becomes `sub`, and `root` alone becomes `.`.
+fn replace_root(text: &str, root: &str, repl: &str) -> String {
+    fn path_char(c: char) -> bool {
+        c.is_alphanumeric() || "._-@+~!/".contains(c)
+    }
+    let root = root.trim_end_matches('/');
+    if root.is_empty() || !text.contains(root) {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find(root) {
+        let (before, at) = rest.split_at(i);
+        let after = at.strip_prefix(root).unwrap_or(at);
+        out.push_str(before);
+        let next = after.chars().next();
+        let bounded = !out.chars().next_back().is_some_and(path_char)
+            && next.is_none_or(|c| c == '/' || !path_char(c));
+        rest = after;
+        if !bounded {
+            out.push_str(root);
+        } else if !repl.is_empty() {
+            out.push_str(repl);
+        } else if let Some(sub) = after.strip_prefix('/') {
+            rest = sub;
+        } else {
+            out.push('.');
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `dir` relative to `root` when it is `root` itself (`""`) or below it — on a
+/// path-component boundary, so `/a/bc` is not under `/a/b`. An empty root
+/// matches nothing.
+fn strip_dir_prefix<'a>(dir: &'a str, root: &str) -> Option<&'a str> {
+    let root = root.trim_end_matches('/');
+    if root.is_empty() {
+        return None;
+    }
+    match dir.strip_prefix(root)? {
+        "" => Some(""),
+        rest => rest.strip_prefix('/'),
     }
 }
 
@@ -1662,8 +1825,9 @@ mod tests {
 
     /// Pinned pre-`race` value of `def_hash(def_with(false, vec![]))`. Update it
     /// only alongside a deliberate `GO_GOLIST_FORMAT_VERSION` bump — a change
-    /// here means every cached listing is being thrown away.
-    const NON_RACE_GOLIST_HASH: u64 = 12427067391495276547;
+    /// here means every cached listing is being thrown away. Last moved by v19
+    /// (portable `Dir`).
+    const NON_RACE_GOLIST_HASH: u64 = 17173191434746222950;
 
     /// `def`'s def hash with no dep inputs.
     fn def_hash(def: &GoGolistDef) -> u64 {
@@ -1696,20 +1860,133 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_normalize_dir_strips_ws_prefix() {
-        assert_eq!(normalize_dir("/sandbox/ws/mylib", "/sandbox/ws"), "mylib");
+    const GOROOT: &str = "/usr/local/go";
+
+    fn module(path: &str, version: Option<&str>, dir: &str) -> GoModule {
+        GoModule {
+            path: path.to_string(),
+            version: version.map(str::to_string),
+            dir: Some(dir.to_string()),
+        }
+    }
+
+    const WS: &str = "/sandbox/ws";
+
+    fn roots(ws: &[&str], goroot: &[&str]) -> PathRoots {
+        PathRoots {
+            ws: ws.iter().map(|s| s.to_string()).collect(),
+            goroot: goroot.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// `portable_dir` under the default roots.
+    fn pd(dir: &str, module: Option<&GoModule>) -> String {
+        portable_dir(dir, module, &roots(&[WS], &[GOROOT]), "example.com/imp")
     }
 
     #[test]
-    fn test_normalize_dir_equals_ws_prefix_yields_empty() {
-        assert_eq!(normalize_dir("/sandbox/ws", "/sandbox/ws"), "");
+    fn test_portable_dir_strips_ws_prefix() {
+        assert_eq!(pd("/sandbox/ws/mylib", None), "mylib");
     }
 
     #[test]
-    fn test_normalize_dir_leaves_third_party_unchanged() {
-        let dir = "/home/user/go/pkg/mod/github.com/foo/bar@v1.0.0";
-        assert_eq!(normalize_dir(dir, "/sandbox/ws"), dir);
+    fn test_portable_dir_equals_ws_prefix_yields_empty() {
+        assert_eq!(pd("/sandbox/ws", None), "");
+    }
+
+    /// go derives a first-party `Dir` from its resolved working directory, so
+    /// under a symlinked home it reports the real path, not the one heph used.
+    #[test]
+    fn test_portable_dir_matches_either_spelling_of_the_workspace() {
+        let both = roots(&["/link/ws", "/real/ws"], &[GOROOT]);
+        assert_eq!(portable_dir("/real/ws/lib", None, &both, "x"), "lib");
+        assert_eq!(portable_dir("/link/ws/lib", None, &both, "x"), "lib");
+    }
+
+    /// The bug this guards: a thirdparty `Dir` is the host module cache, so the
+    /// same listing on CI and on a laptop produced different `package.bin`s
+    /// under one `hashin`, and a rebuild of a revision cached on the other
+    /// machine failed the run as non-reproducible.
+    #[test]
+    fn test_portable_dir_thirdparty_is_the_same_on_every_machine() {
+        let on = |modcache: &str| {
+            let mod_dir = format!("{modcache}/google.golang.org/grpc@v1.74.2");
+            let m = module("google.golang.org/grpc", Some("v1.74.2"), &mod_dir);
+            pd(&format!("{mod_dir}/tap"), Some(&m))
+        };
+        let ci = on("/home/runner/go/pkg/mod");
+        assert_eq!(ci, "google.golang.org/grpc@v1.74.2/tap");
+        assert_eq!(on("/Users/someone/go/pkg/mod"), ci);
+    }
+
+    #[test]
+    fn test_portable_dir_module_root_package() {
+        let m = module("example.com/m", Some("v1.0.0"), "/mc/example.com/m@v1.0.0");
+        assert_eq!(
+            pd("/mc/example.com/m@v1.0.0", Some(&m)),
+            "example.com/m@v1.0.0"
+        );
+    }
+
+    /// A local `replace` outside the workspace, or a go.work member: no version.
+    #[test]
+    fn test_portable_dir_unversioned_module() {
+        let m = module("example.com/m", None, "/elsewhere/m/");
+        assert_eq!(pd("/elsewhere/m/sub", Some(&m)), "example.com/m/sub");
+    }
+
+    #[test]
+    fn test_portable_dir_stdlib_under_a_host_goroot() {
+        assert_eq!(
+            pd("/usr/local/go/src/net/http", None),
+            "$GOROOT/src/net/http"
+        );
+        assert_eq!(pd("/usr/local/go", None), "$GOROOT");
+        assert_eq!(
+            portable_dir(
+                "/usr/local/go/src/fmt",
+                None,
+                &roots(&[WS], &["/usr/local/go/"]),
+                "fmt"
+            ),
+            "$GOROOT/src/fmt",
+            "a trailing slash on GOROOT changes nothing"
+        );
+    }
+
+    /// Prefixes match whole path components only: `/sandbox/ws2` is not under
+    /// `/sandbox/ws`, nor `/usr/local/gopher` under `/usr/local/go`. What
+    /// matches no root never keeps its absolute path.
+    #[test]
+    fn test_portable_dir_near_miss_prefixes_fall_back_to_a_placeholder() {
+        let unknown = "$UNKNOWN/example.com/imp";
+        assert_eq!(pd("/sandbox/ws2/lib", None), unknown);
+        assert_eq!(pd("/usr/local/gopher/x", None), unknown);
+        let m = module("example.com/m", Some("v1.0.0"), "/mc/example.com/m@v1.0.0");
+        assert_eq!(pd("/mc/example.com/m@v1.0.01/x", Some(&m)), unknown);
+    }
+
+    /// A module go reports without a directory adds no root to match against.
+    #[test]
+    fn test_portable_dir_module_without_dir_falls_through() {
+        let m = GoModule {
+            path: "example.com/m".to_string(),
+            version: None,
+            dir: None,
+        };
+        assert_eq!(pd("/usr/local/go/src/x", Some(&m)), "$GOROOT/src/x");
+    }
+
+    #[test]
+    fn test_replace_root_only_on_component_boundaries() {
+        let r = |t: &str| replace_root(t, "/a/b", "R");
+        assert_eq!(r("in /a/b/c and (/a/b)"), "in R/c and (R)");
+        assert_eq!(r("/a/bc /x/a/b a/a/b"), "/a/bc /x/a/b a/a/b");
+        assert_eq!(r("/a/b"), "R");
+        // `.` continues a path (`/a/b.go`), so a root followed by one is not it.
+        assert_eq!(r("/a/b.go"), "/a/b.go");
+        assert_eq!(replace_root("in /a/b/c, /a/b", "/a/b/", ""), "in c, .");
+        assert_eq!(replace_root("unchanged", "", "R"), "unchanged");
     }
 
     #[test]
@@ -1726,10 +2003,115 @@ mod tests {
             }),
             ..Default::default()
         };
-        normalize_pkg_paths(&mut pkg, "/sandbox/ws");
+        let raw = normalize_pkg_paths(&mut pkg, &roots(&[WS], &[GOROOT]));
+        assert_eq!(raw.as_deref(), Some("/sandbox/ws/lib"));
         assert_eq!(pkg.dir.as_deref(), Some("lib"));
         let m = pkg.module.expect("module retained");
         assert_eq!(m.path, "example.com/m", "Module.Path must survive");
         assert_eq!(m.dir, None, "absolute Module.Dir must be dropped");
+    }
+
+    /// The thirdparty `Dir` is rewritten against `Module.Dir`, so that must be
+    /// read before it is dropped; and the caller gets the real directory back
+    /// for the asm header scan, which reads the module cache.
+    #[test]
+    fn test_normalize_pkg_paths_thirdparty() {
+        let mod_dir = "/home/runner/go/pkg/mod/github.com/c/circl@v1.3.0";
+        let mut pkg = GoPackage {
+            import_path: "github.com/c/circl/dh/x448".to_string(),
+            dir: Some(format!("{mod_dir}/dh/x448")),
+            module: Some(module("github.com/c/circl", Some("v1.3.0"), mod_dir)),
+            ..Default::default()
+        };
+        let raw = normalize_pkg_paths(&mut pkg, &roots(&[WS], &[GOROOT]));
+        assert_eq!(raw, Some(format!("{mod_dir}/dh/x448")));
+        assert_eq!(
+            pkg.dir.as_deref(),
+            Some("github.com/c/circl@v1.3.0/dh/x448")
+        );
+    }
+
+    /// go ends the settled errors `check_package_resolved` lets through — and
+    /// which are therefore cached — with an absolute directory. Each listing is
+    /// made on two machines with different roots; `package.bin` must not tell
+    /// them apart.
+    #[test]
+    fn test_normalized_errors_are_the_same_on_every_machine() {
+        struct Machine {
+            ws: &'static str,
+            modcache: &'static str,
+            goroot: &'static str,
+        }
+        let ci = Machine {
+            ws: "/home/runner/work/r/.heph/sandbox/x/ws",
+            modcache: "/home/runner/go/pkg/mod",
+            goroot: "/opt/hostedtoolcache/go/1.27/x64",
+        };
+        let laptop = Machine {
+            ws: "/Users/me/r/.heph/sandbox/x/ws",
+            modcache: "/Users/me/go/pkg/mod",
+            goroot: "/nix/store/abc-go/share/go",
+        };
+
+        type Listing = fn(&Machine) -> GoPackage;
+        fn mk(
+            import_path: &str,
+            dir: Option<String>,
+            module: Option<GoModule>,
+            err: String,
+        ) -> GoPackage {
+            GoPackage {
+                import_path: import_path.to_string(),
+                dir,
+                module,
+                error: Some(crate::plugingo::pkg_analysis::GoPackageError { err }),
+                ..Default::default()
+            }
+        }
+        let cases: [(Listing, &str); 4] = [
+            (
+                // A `//go:build tools` directory: first-party, very common.
+                |m| {
+                    let dir = format!("{}/tools", m.ws);
+                    let err = format!("build constraints exclude all Go files in {dir}");
+                    mk("example.com/r/tools", Some(dir), None, err)
+                },
+                "build constraints exclude all Go files in tools",
+            ),
+            (
+                |m| {
+                    let mod_dir = format!("{}/golang.org/x/sys@v0.30.0", m.modcache);
+                    let dir = format!("{mod_dir}/windows");
+                    let err = format!("build constraints exclude all Go files in {dir}");
+                    let module = module("golang.org/x/sys", Some("v0.30.0"), &mod_dir);
+                    mk("golang.org/x/sys/windows", Some(dir), Some(module), err)
+                },
+                "build constraints exclude all Go files in golang.org/x/sys@v0.30.0/windows",
+            ),
+            (
+                // No `Dir` at all: only the GOROOT root can catch it.
+                |m| {
+                    let err = format!("package fmtt is not in std ({}/src/fmtt)", m.goroot);
+                    mk("fmtt", None, None, err)
+                },
+                "package fmtt is not in std ($GOROOT/src/fmtt)",
+            ),
+            (
+                |m| {
+                    let err = format!("no Go files in {}", m.ws);
+                    mk("example.com/r", Some(m.ws.to_string()), None, err)
+                },
+                "no Go files in .",
+            ),
+        ];
+        for (listing, want) in cases {
+            let encoded = |m: &Machine| {
+                let mut p = listing(m);
+                normalize_pkg_paths(&mut p, &roots(&[m.ws], &[m.goroot]));
+                assert_eq!(p.error.as_ref().map(|e| e.err.as_str()), Some(want));
+                encode_go_package(&p).expect("encode")
+            };
+            assert_eq!(encoded(&ci), encoded(&laptop), "{want}");
+        }
     }
 }

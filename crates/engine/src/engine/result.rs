@@ -2048,16 +2048,23 @@ fn reconcile_rebuilt_hashouts(
     if promised == rebuilt {
         return Ok(());
     }
+    // The first line is what a one-line renderer (the TUI) shows, cut from the
+    // right after the addr it already prints — and the target-failure context
+    // names the addr again — so it leads with the action and repeats no addr.
+    // The rest is the account.
     anyhow::bail!(
-        "{addr}: cached revision {hashin} was accepted as a hit, then its artifacts turned out to \
-         be unavailable — and rebuilding it produced different outputs.\n  \
+        "re-run to continue: the rebuild differs from cached revision {hashin}\n\
+         The revision was used as a cache hit, then its blobs turned out to be unavailable \
+         (reclaimed by a local GC or an object-store lifecycle rule, or a failed transfer), and \
+         rebuilding it produced different outputs:\n  \
          cached:   {promised:?}\n  rebuilt:  {rebuilt:?}\n\
-         Anything that already folded the cached hashouts into its own cache key now describes \
-         outputs that do not exist. This target is not reproducible: same inputs must always \
-         produce the same outputs.\n\
-         This surfaced now because a cached blob had been reclaimed (a local GC, or an \
-         object-store lifecycle rule on a shared cache) and the revision had to be rebuilt; on a \
-         run where those bytes are still resident, nothing rebuilds and nothing checks."
+         This run stops because targets in it may already have keyed their cache entries on the \
+         cached outputs, which no longer exist. The rebuilt outputs have replaced them in this \
+         machine's cache, so re-running gets past this target.\n\
+         To prevent this: the same inputs must always produce the same outputs. Something this \
+         target writes depends on what it does not declare (an absolute path, a timestamp, host \
+         state), or a heph or plugin upgrade changed what it writes without changing its cache \
+         key. It goes unnoticed until a cached blob is gone and the revision is rebuilt."
     )
 }
 
@@ -8861,6 +8868,42 @@ mod tests {
         for h in &real {
             assert!(msg.contains(h), "must name the rebuilt hashout: {msg}");
         }
+        // The target-failure context already names the addr; the reconcile's
+        // own first line — all a one-line renderer shows after it — must lead
+        // with what to do.
+        let own = err.root_cause().to_string();
+        assert!(
+            own.lines()
+                .next()
+                .is_some_and(|l| l.starts_with("re-run to continue")),
+            "the first line must lead with what to do: {msg}"
+        );
+        drop(err);
+        drain_bg(rs2).await;
+
+        // What the message promises: the rebuild replaced the cached revision, so
+        // the next run is served the rebuilt outputs, from the cache, and succeeds.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let rs3 = engine.new_state_with_events(true, Some(tx));
+        let healed = resolve(&engine, &rs3, &addr, OutputMatcher::All).await?;
+        assert_eq!(healed.artifacts.len(), 1, "the outputs must be served");
+        let mut want = real.clone();
+        want.sort();
+        let mut got = hashouts(&healed);
+        got.sort();
+        assert_eq!(got, want, "the next run must see the rebuilt hashouts");
+        drop(healed);
+        drop(rs3);
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        assert!(
+            !events.iter().any(
+                |e| matches!(&e.kind, BuildEventKind::ExecuteStart { addr, .. } if addr == "//pkg:t")
+            ),
+            "the rebuilt revision must be a cache hit on the next run: {events:?}"
+        );
         Ok(())
     }
 
