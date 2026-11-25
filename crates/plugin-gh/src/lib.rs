@@ -8,8 +8,13 @@
 //!   is off; the hook is constructed only when `hook.enable` is true.
 //! - **`heph.gh.release_asset(...)`** ([`release`]): a BUILD function declaring
 //!   an `http_fetch` of a release asset, and optionally an `extract` of it.
+//!   With `credentials` (a private repository) it fetches through the API: an
+//!   `http_fetch` of the release JSON, an `asset_url` picking the asset's URL
+//!   out of it, and an `http_fetch` of that URL.
 //! - **The `extract` driver** ([`extract`]): unpacks an archive in-process
 //!   ([`harchive::unpack`]). See `docs/GH_RELEASES.md`.
+//! - **The `asset_url` driver** ([`asset_url`]): one asset's API URL from a
+//!   release JSON.
 //!
 //! The plugin's `options:` are one [`GhOptions`]: the hook's, under `hook:`.
 //! `release_asset` reads no option; its server is an argument of each call.
@@ -56,6 +61,7 @@
 //! `BuildState`: that aggregator is coupled to ratatui and lives in the
 //! (terminal) `tui` crate.
 
+pub mod asset_url;
 #[cfg(test)]
 mod comment_tests;
 pub mod extract;
@@ -2298,8 +2304,8 @@ mod tests {
 
     /// An unknown key is refused at either level, naming the key and what the
     /// level allows. A hook option at the top level (where it used to go) is
-    /// one, and so is a server URL: it is `release_asset`'s `server_url`
-    /// argument, per call, not a plugin option.
+    /// one, and so is a server or API URL: they are `release_asset`'s
+    /// `server_url` and `api_url` arguments, per call, not plugin options.
     #[test]
     fn unknown_keys_are_refused_at_either_level() {
         let msg = err_of(decode("hook: {refreshSec: 5}"));
@@ -2307,6 +2313,7 @@ mod tests {
         assert!(msg.contains("`refreshSecs`"), "{msg}");
         for yaml in [
             "serverUrl: https://ghe.example",
+            "apiUrl: https://api.ghe.example",
             "refreshSecs: 30",
             "enable: true",
         ] {

@@ -6,11 +6,24 @@
 //! (`sha256`) and caching are `http_fetch`'s, exactly as if the BUILD file had
 //! written the `target(...)` calls. See `docs/GH_RELEASES.md`.
 //!
+//! With `credentials` (a private repository) the asset cannot be fetched from
+//! its download URL, which takes no token: it is fetched from the API by id,
+//! and the id is only known at run. So the function declares three targets,
+//! and the network stays in `http_fetch`:
+//!
+//! 1. `<name>_release`: `http_fetch` of the release JSON
+//!    (`GET {api_url}/repos/{repo}/releases/tags/{tag}`), with the credentials
+//!    and `cache = False` (see [`RELEASE_SUFFIX`]);
+//! 2. `<name>_url`: `<plugin>.asset_url` ([`crate::asset_url`]), the asset's
+//!    API URL picked out of that JSON;
+//! 3. the asset: `http_fetch` with `url = "${read://<pkg>:<name>_url}"`,
+//!    `Accept: application/octet-stream` and the credentials.
+//!
 //! Like every plugin function it is pure (`hplugin::function::PluginFn`): the
 //! outcome depends on the arguments and the package, never on the network,
-//! the environment or the plugin's options. The server is an argument
-//! (`server_url`), not an option: one workspace may pull from a GitHub
-//! Enterprise server and from github.com.
+//! the environment or the plugin's options. The server and its API are
+//! arguments (`server_url`, `api_url`), not options: one workspace may pull
+//! from a GitHub Enterprise server and from github.com.
 
 use crate::extract::{Count, FormatArg};
 use anyhow::{Context as _, bail};
@@ -30,6 +43,26 @@ use std::sync::Arc;
 /// Where releases are downloaded from when `server_url` is not passed.
 pub const DEFAULT_SERVER_URL: &str = "https://github.com";
 
+/// The API of [`DEFAULT_SERVER_URL`]. Any other server (GitHub Enterprise)
+/// serves its API at `{server_url}/api/v3`.
+pub const GITHUB_API_URL: &str = "https://api.github.com";
+
+/// Suffix of the release-JSON fetch declared with `credentials`.
+///
+/// That fetch is `cache = False`: the JSON carries download counts (so its
+/// bytes move on every download, and a cached copy would be keyed on nothing
+/// that says when to re-read it), and a re-uploaded asset gets a new id under
+/// the same name. Re-reading it is one API call per private asset per build;
+/// the targets below it still hit the cache while the URL it resolves to is
+/// unchanged.
+pub const RELEASE_SUFFIX: &str = "_release";
+
+/// Suffix of the `asset_url` target declared with `credentials`.
+pub const URL_SUFFIX: &str = "_url";
+
+/// The API version the release lookup asks for.
+const GITHUB_API_VERSION: &str = "2022-11-28";
+
 /// The builtin driver the asset is fetched with. Named, not imported: the gh
 /// plugin is a cdylib and `http_fetch` lives in the host.
 const HTTP_FETCH: &str = "http_fetch";
@@ -38,40 +71,97 @@ const HTTP_FETCH: &str = "http_fetch";
 /// extracted tree takes `name`, the archive `<name>_archive`.
 pub const ARCHIVE_SUFFIX: &str = "_archive";
 
-/// The server one `release_asset` call downloads from, from its `server_url`
-/// argument.
+/// The server one `release_asset` call downloads from, and its API, from the
+/// call's `server_url` and `api_url` arguments.
 #[derive(Debug, Clone)]
 pub struct ReleaseConfig {
     /// Base URL of the GitHub server, no trailing `/`. `https://github.com`,
     /// or a GitHub Enterprise host.
     server_url: String,
+    /// Base URL of its REST API, no trailing `/`: where a private asset is
+    /// looked up and fetched (with `credentials`).
+    api_url: String,
 }
 
 impl ReleaseConfig {
-    /// A config downloading from `server_url`, checked and trimmed of trailing
-    /// `/`s; an error names the `server_url` argument.
-    pub fn new(server_url: &str) -> anyhow::Result<Self> {
-        let trimmed = server_url.trim_end_matches('/');
-        let rest = trimmed
-            .strip_prefix("https://")
-            .or_else(|| trimmed.strip_prefix("http://"))
-            .with_context(|| {
-                format!("`server_url` {server_url:?} must start with https:// or http://")
-            })?;
-        if rest.is_empty()
-            || rest
-                .chars()
-                .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '?' | '#'))
+    /// A config downloading from `server_url`, its API at `api_url` or, when
+    /// `None`, where GitHub serves it: [`GITHUB_API_URL`] for `github.com`,
+    /// `{server_url}/api/v3` for any other server (GitHub Enterprise). An
+    /// error names the argument at fault.
+    pub fn new(server_url: &str, api_url: Option<&str>) -> anyhow::Result<Self> {
+        let server_url = base_url("server_url", server_url)?;
+        // github.com is https only, and its API is not under it: an http
+        // spelling would download over a redirect and look the API up at
+        // `http://github.com/api/v3`, which does not exist.
+        if let Some(("http", host)) = scheme_and_host(&server_url)
+            && host.eq_ignore_ascii_case("github.com")
         {
             bail!(
-                "`server_url` {server_url:?} must be a scheme and host (and optional path), \
-                 with no query, fragment or whitespace"
+                "`server_url` {server_url:?}: github.com is served over https; write \
+                 https://github.com"
             );
         }
+        let api_url = match api_url {
+            Some(api) => base_url("api_url", api)?,
+            None if server_url.eq_ignore_ascii_case(DEFAULT_SERVER_URL) => {
+                GITHUB_API_URL.to_string()
+            }
+            None => format!("{server_url}/api/v3"),
+        };
         Ok(Self {
-            server_url: trimmed.to_string(),
+            server_url,
+            api_url,
         })
     }
+}
+
+/// The scheme and host (no port) of a URL [`base_url`] accepted.
+fn scheme_and_host(url: &str) -> Option<(&str, &str)> {
+    let (scheme, rest) = url.split_once("://")?;
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let host = match authority.rsplit_once(':') {
+        // `[::1]` is all host; `[::1]:80` and `h:80` end in a port.
+        Some((host, port)) if !port.contains(']') => host,
+        _ => authority,
+    };
+    Some((scheme, host))
+}
+
+/// A base URL argument, trimmed of trailing `/`s: a scheme, a host and an
+/// optional path, nothing a path could not be appended to. An error names the
+/// argument, `arg`.
+fn base_url(arg: &str, url: &str) -> anyhow::Result<String> {
+    // Before anything echoes the URL: a `user:password@` in it is a secret,
+    // and this URL is written into every target's config and log line.
+    let authority = url
+        .split_once("://")
+        .map_or(url, |(_, rest)| rest)
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    if authority.contains('@') {
+        bail!(
+            "`{arg}` must not carry a user or password (`user:password@host`): it would be \
+             written into every URL and log; pass a token with `credentials =`"
+        );
+    }
+    let trimmed = url.trim_end_matches('/');
+    let rest = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .with_context(|| format!("`{arg}` {url:?} must start with https:// or http://"))?;
+    if authority.is_empty()
+        || authority.starts_with(':')
+        || rest
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '?' | '#'))
+    {
+        bail!(
+            "`{arg}` {url:?} must be a scheme and host (and optional path), with no query, \
+             fragment or whitespace"
+        );
+    }
+    Ok(trimmed.to_string())
 }
 
 /// Every character but RFC 3986's unreserved set is percent-encoded in a path
@@ -126,15 +216,7 @@ pub fn asset_url(
     tag: &str,
     asset: &str,
 ) -> anyhow::Result<String> {
-    check_repo(repo)?;
-    for seg in tag.split('/') {
-        check_segment("tag", seg, tag)?;
-    }
-    if asset.contains('/') {
-        bail!("`asset` {asset:?} must be a file name, without `/`");
-    }
-    check_segment("asset", asset, asset)?;
-
+    check_release(repo, tag, asset)?;
     let tag = tag
         .split('/')
         .map(|s| utf8_percent_encode(s, SEGMENT).to_string())
@@ -144,6 +226,43 @@ pub fn asset_url(
         "{}/{repo}/releases/download/{tag}/{}",
         cfg.server_url,
         utf8_percent_encode(asset, SEGMENT)
+    );
+    Ok(url.replace('{', "{{").replace('}', "}}"))
+}
+
+/// The arguments naming an asset, as both URLs need them: `repo` is
+/// `owner/name`, no `tag` segment is empty, `.` or `..`, and `asset` is one
+/// file name.
+fn check_release(repo: &str, tag: &str, asset: &str) -> anyhow::Result<()> {
+    check_repo(repo)?;
+    for seg in tag.split('/') {
+        check_segment("tag", seg, tag)?;
+    }
+    if asset.contains('/') {
+        bail!("`asset` {asset:?} must be a file name, without `/`");
+    }
+    check_segment("asset", asset, asset)
+}
+
+/// The release lookup, `{api_url}/repos/{repo}/releases/tags/{tag}`, escaped for
+/// `http_fetch`'s `url` template.
+///
+/// Unlike the download URL, the tag is **one** encoded segment, its `/`s as
+/// `%2F`: in the API it is a single path parameter (`release/v1` is the tag
+/// `release/v1`, not a tag `release` followed by more path), and that is how
+/// GitHub's own clients send it. The segments are still checked as the
+/// download URL's are, so the same tags are accepted by both.
+pub fn release_json_url(
+    cfg: &ReleaseConfig,
+    repo: &str,
+    tag: &str,
+    asset: &str,
+) -> anyhow::Result<String> {
+    check_release(repo, tag, asset)?;
+    let url = format!(
+        "{}/repos/{repo}/releases/tags/{}",
+        cfg.api_url,
+        utf8_percent_encode(tag, SEGMENT)
     );
     Ok(url.replace('{', "{{").replace('}', "}}"))
 }
@@ -163,7 +282,8 @@ pub fn functions(plugin: &str) -> Vec<PluginFnDef> {
         },
         doc: format!(
             "Declare a target fetching a GitHub release asset (`http_fetch`), and with \
-             `extract = True` one unpacking it; returns the main target's address.\n\n{}",
+             `extract = True` one unpacking it; returns the main target's address. With \
+             `credentials` (a private repository) the asset is fetched through the API.\n\n{}",
             spec_params_doc(&ReleaseAssetArgs::schema())
         ),
         func: Arc::new(ReleaseAsset {
@@ -239,6 +359,15 @@ struct ReleaseAssetArgs {
     /// GitHub Enterprise server's URL, for one.
     #[spec(ty = ParamType::String)]
     server_url: Option<String>,
+    /// Its REST API, where a private asset is looked up and fetched. Default:
+    /// derived from this call's `server_url`, `https://api.github.com` for
+    /// github.com and `{server_url}/api/v3` for any other server.
+    #[spec(ty = ParamType::String)]
+    api_url: Option<String>,
+    /// Credential targets for a private repository: the asset is then fetched
+    /// through the API.
+    #[spec(ty = ParamType::list(ParamType::String))]
+    credentials: Addrs,
 }
 
 /// A string argument that may not be empty.
@@ -255,6 +384,34 @@ impl FromSpecValue for NonEmpty {
 
     fn spec_param_type() -> ParamType {
         ParamType::String
+    }
+}
+
+/// A list of target addresses: a list (a bare string is refused, unlike
+/// `Vec<String>`), of non-empty strings. `None` is the empty list.
+#[derive(Default)]
+struct Addrs(Vec<String>);
+
+impl FromSpecValue for Addrs {
+    fn from_spec_value(v: &Value) -> anyhow::Result<Self> {
+        match v {
+            Value::Null() => Ok(Self::default()),
+            Value::List(items) => items
+                .iter()
+                .map(|item| match NonEmpty::from_spec_value(item) {
+                    Ok(addr) => Ok(addr.0),
+                    Err(e) => {
+                        Err(e.context(format!("must be a list of target addresses, got {item:?}")))
+                    }
+                })
+                .collect::<anyhow::Result<_>>()
+                .map(Self),
+            other => bail!("must be a list of target addresses, got {other:?}"),
+        }
+    }
+
+    fn spec_param_type() -> ParamType {
+        ParamType::list(ParamType::String)
     }
 }
 
@@ -280,6 +437,15 @@ fn s(v: &str) -> Value {
     Value::String(v.to_string())
 }
 
+fn headers(pairs: &[(&str, &str)]) -> Value {
+    Value::Map(
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), s(v)))
+            .collect(),
+    )
+}
+
 /// The function's body, separated from the trait so it is a plain function of
 /// its inputs.
 fn release_asset(plugin: &str, pkg: &str, args: &FnArgs) -> anyhow::Result<FnOutcome> {
@@ -297,8 +463,13 @@ fn release_asset(plugin: &str, pkg: &str, args: &FnArgs) -> anyhow::Result<FnOut
         executable,
         out,
         server_url,
+        api_url,
+        credentials: Addrs(credentials),
     } = ReleaseAssetArgs::from(&args.named)?;
-    let cfg = &ReleaseConfig::new(server_url.as_deref().unwrap_or(DEFAULT_SERVER_URL))?;
+    let cfg = &ReleaseConfig::new(
+        server_url.as_deref().unwrap_or(DEFAULT_SERVER_URL),
+        api_url.as_deref(),
+    )?;
     let (name, repo, tag, asset) = (name.as_str(), repo.as_str(), tag.as_str(), asset.as_str());
     let out = out.as_deref();
     check_name(name)?;
@@ -309,17 +480,70 @@ fn release_asset(plugin: &str, pkg: &str, args: &FnArgs) -> anyhow::Result<FnOut
         .filter_map(|(key, count)| Some((key, count_value(count?))))
         .collect();
 
-    let url = asset_url(cfg, repo, tag, asset)?;
-    let fetch_config = |out: &str| {
-        let mut config: HashMap<String, Value> =
-            [("url".to_string(), s(&url)), ("out".to_string(), s(out))].into();
-        if let Some(sha) = &sha256 {
-            config.insert("sha256".to_string(), s(sha));
-        }
-        config
-    };
-
     let mut outcome = FnOutcome::from(Value::String(format!("//{pkg}:{name}")));
+
+    // The asset fetch's url and auth: the public download URL, or (with
+    // credentials) the API URL `<name>_url` resolves at run, fetched as bytes.
+    let mut asset_fetch: HashMap<String, Value> = if credentials.is_empty() {
+        [("url".to_string(), s(&asset_url(cfg, repo, tag, asset)?))].into()
+    } else {
+        let creds = Value::List(credentials.into_iter().map(Value::String).collect());
+        let release = format!("{name}{RELEASE_SUFFIX}");
+        let url_target = format!("{name}{URL_SUFFIX}");
+        outcome.declare_target(DeclaredTarget {
+            name: release.clone(),
+            driver: HTTP_FETCH.to_string(),
+            config: [
+                (
+                    "url".to_string(),
+                    s(&release_json_url(cfg, repo, tag, asset)?),
+                ),
+                ("out".to_string(), s(&format!("{release}.json"))),
+                (
+                    "headers".to_string(),
+                    headers(&[
+                        ("Accept", "application/vnd.github+json"),
+                        ("X-GitHub-Api-Version", GITHUB_API_VERSION),
+                    ]),
+                ),
+                ("credentials".to_string(), creds.clone()),
+                // See `RELEASE_SUFFIX`.
+                ("cache".to_string(), Value::Bool(false)),
+            ]
+            .into(),
+            ..Default::default()
+        });
+        outcome.declare_target(DeclaredTarget {
+            name: url_target.clone(),
+            driver: format!("{plugin}.{}", crate::asset_url::DRIVER_NAME),
+            config: [
+                ("src".to_string(), s(&format!(":{release}"))),
+                ("asset".to_string(), s(asset)),
+                ("api".to_string(), s(&cfg.api_url)),
+            ]
+            .into(),
+            ..Default::default()
+        });
+        [
+            (
+                "url".to_string(),
+                s(&format!("${{read://{pkg}:{url_target}}}")),
+            ),
+            (
+                "headers".to_string(),
+                headers(&[("Accept", "application/octet-stream")]),
+            ),
+            ("credentials".to_string(), creds),
+        ]
+        .into()
+    };
+    if let Some(sha) = sha256 {
+        asset_fetch.insert("sha256".to_string(), Value::String(sha));
+    }
+    let fetch_config = |out: &str| {
+        asset_fetch.insert("out".to_string(), s(out));
+        asset_fetch
+    };
     if !extract {
         if format.is_some() || strip != 0 || !limits.is_empty() {
             bail!(
@@ -396,7 +620,7 @@ mod tests {
     use super::*;
 
     fn gh() -> ReleaseConfig {
-        ReleaseConfig::new(DEFAULT_SERVER_URL).unwrap()
+        ReleaseConfig::new(DEFAULT_SERVER_URL, None).unwrap()
     }
 
     fn url(repo: &str, tag: &str, asset: &str) -> anyhow::Result<String> {
@@ -464,11 +688,73 @@ mod tests {
 
     #[test]
     fn server_url_braces_are_escaped_for_the_fetch_template() {
-        let cfg = ReleaseConfig::new("https://ghe.example/{x}/").unwrap();
+        let cfg = ReleaseConfig::new("https://ghe.example/{x}/", None).unwrap();
         assert_eq!(
             asset_url(&cfg, "o/r", "v1", "a").unwrap(),
             "https://ghe.example/{{x}}/o/r/releases/download/v1/a"
         );
+        assert_eq!(
+            release_json_url(&cfg, "o/r", "v1", "a").unwrap(),
+            "https://ghe.example/{{x}}/api/v3/repos/o/r/releases/tags/v1"
+        );
+    }
+
+    /// In the API the tag is one path parameter, so its `/` is `%2F`; the
+    /// segment checks are the download URL's, so both accept the same tags.
+    #[test]
+    fn the_release_lookup_encodes_the_tag_as_one_segment() {
+        for (tag, want) in [
+            ("v1.0", "v1.0"),
+            ("release/v1", "release%2Fv1"),
+            ("v1#2", "v1%232"),
+            ("v{1}", "v%7B1%7D"),
+            ("a/..b", "a%2F..b"),
+        ] {
+            assert_eq!(
+                release_json_url(&gh(), "o/r", tag, "a").unwrap(),
+                format!("https://api.github.com/repos/o/r/releases/tags/{want}"),
+                "{tag:?}"
+            );
+        }
+        for bad in ["a//b", "/a", "a/", "..", "a/../b", "a\nb"] {
+            assert!(
+                release_json_url(&gh(), "o/r", bad, "a").is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+        release_json_url(&gh(), "o/r/x", "v1", "a").unwrap_err();
+        release_json_url(&gh(), "o/r", "v1", "a/b").unwrap_err();
+    }
+
+    #[test]
+    fn the_api_url_is_derived_from_the_server_or_set() {
+        let api =
+            |server: &str, api: Option<&str>| ReleaseConfig::new(server, api).map(|c| c.api_url);
+        assert_eq!(api("https://github.com", None).unwrap(), GITHUB_API_URL);
+        assert_eq!(api("https://github.com/", None).unwrap(), GITHUB_API_URL);
+        assert_eq!(api("https://GitHub.com", None).unwrap(), GITHUB_API_URL);
+        assert_eq!(
+            api("https://ghe.example", None).unwrap(),
+            "https://ghe.example/api/v3"
+        );
+        assert_eq!(
+            api("https://ghe.example/sub/", None).unwrap(),
+            "https://ghe.example/sub/api/v3"
+        );
+        assert_eq!(
+            api("https://github.com", Some("http://127.0.0.1:9/")).unwrap(),
+            "http://127.0.0.1:9"
+        );
+        for bad in [
+            "api.github.com",
+            "ftp://x",
+            "https://",
+            "https://x?y",
+            "https://a b",
+        ] {
+            let msg = format!("{:#}", api(DEFAULT_SERVER_URL, Some(bad)).unwrap_err());
+            assert!(msg.contains("`api_url`"), "{bad:?}: {msg}");
+        }
     }
 
     #[test]
@@ -480,11 +766,89 @@ mod tests {
             "https://a b",
             "https://x?y",
         ] {
-            let msg = format!("{:#}", ReleaseConfig::new(bad).unwrap_err());
+            let msg = format!("{:#}", ReleaseConfig::new(bad, None).unwrap_err());
             assert!(msg.contains("`server_url`"), "{bad:?}: {msg}");
         }
-        let cfg = ReleaseConfig::new("http://127.0.0.1:8080/").unwrap();
+        let cfg = ReleaseConfig::new("http://127.0.0.1:8080/", None).unwrap();
         assert_eq!(cfg.server_url, "http://127.0.0.1:8080");
+    }
+
+    /// A URL with no host, or a `user:password@` (a secret that would be
+    /// written into every declared target's URL and every log line), is
+    /// refused in both arguments, and the refusal does not echo the secret.
+    #[test]
+    fn base_urls_need_a_host_and_carry_no_userinfo() {
+        let check = |server: &str, api: Option<&str>| {
+            ReleaseConfig::new(server, api).map_err(|e| format!("{e:#}"))
+        };
+        for bad in ["https:///x", "https://:443/x", "http:///", "https://:8080"] {
+            let msg = check(bad, None).unwrap_err();
+            assert!(msg.contains("`server_url`"), "{bad:?}: {msg}");
+            let msg = check(DEFAULT_SERVER_URL, Some(bad)).unwrap_err();
+            assert!(msg.contains("`api_url`"), "{bad:?}: {msg}");
+        }
+        for bad in [
+            "https://user:hunter2@ghe.example",
+            "https://hunter2@ghe.example/sub",
+            "http://user:hunter2@127.0.0.1:9",
+            "ftp://user:hunter2@x",
+        ] {
+            for (msg, arg) in [
+                (check(bad, None).unwrap_err(), "`server_url`"),
+                (
+                    check(DEFAULT_SERVER_URL, Some(bad)).unwrap_err(),
+                    "`api_url`",
+                ),
+            ] {
+                assert!(msg.contains(arg), "{bad:?}: {msg}");
+                assert!(msg.contains("user or password"), "{bad:?}: {msg}");
+                assert!(!msg.contains("hunter2"), "the secret is echoed: {msg}");
+            }
+        }
+        // An `@` past the host is a path, not userinfo.
+        check("https://ghe.example/@team", None).unwrap();
+        check("http://[::1]:8080", None).unwrap();
+    }
+
+    /// `http://github.com` is not treated as github.com: its API would be
+    /// derived as `http://github.com/api/v3`, which does not exist, so it is
+    /// refused with the spelling that works. Another host over http is a
+    /// GitHub Enterprise (or a test server) and is kept.
+    #[test]
+    fn http_github_com_is_refused() {
+        for bad in [
+            "http://github.com",
+            "http://GitHub.com/",
+            "http://github.com:80",
+            "http://github.com/sub",
+        ] {
+            let msg = format!("{:#}", ReleaseConfig::new(bad, None).unwrap_err());
+            assert!(msg.contains("write https://github.com"), "{bad:?}: {msg}");
+        }
+        for good in [
+            "http://github.company.example",
+            "http://ghe.example/github.com",
+        ] {
+            let cfg = ReleaseConfig::new(good, None).unwrap();
+            assert_eq!(cfg.api_url, format!("{good}/api/v3"));
+        }
+    }
+
+    /// An explicit `api_url` with a GitHub Enterprise `server_url`: downloads
+    /// come from the server, lookups from the API, neither derived from the
+    /// other.
+    #[test]
+    fn an_explicit_api_url_with_an_enterprise_server() {
+        let cfg =
+            ReleaseConfig::new("https://ghe.example/", Some("https://api.ghe.example/")).unwrap();
+        assert_eq!(
+            asset_url(&cfg, "o/r", "v1", "a").unwrap(),
+            "https://ghe.example/o/r/releases/download/v1/a"
+        );
+        assert_eq!(
+            release_json_url(&cfg, "o/r", "v1", "a").unwrap(),
+            "https://api.ghe.example/repos/o/r/releases/tags/v1"
+        );
     }
 
     fn call(pairs: &[(&str, Value)]) -> anyhow::Result<FnOutcome> {
@@ -603,9 +967,7 @@ mod tests {
             ("max_entries", Value::Int(9)),
         ]))
         .unwrap();
-        let [_, extract] = out.targets() else {
-            panic!("two targets: {:?}", out.targets())
-        };
+        let extract = target(&out, "tool");
         assert_eq!(extract.config.get("max_entries"), Some(&Value::Int(9)));
         assert_eq!(extract.config.get("max_bytes"), None);
     }
@@ -622,6 +984,179 @@ mod tests {
         let out = release_asset("github", "", &args).unwrap();
         assert_eq!(out.value(), &s("//:tool"));
         assert_eq!(out.targets()[1].driver, "github.extract");
+    }
+
+    fn creds(addrs: &[&str]) -> (&'static str, Value) {
+        (
+            "credentials",
+            Value::List(addrs.iter().map(|a| s(a)).collect()),
+        )
+    }
+
+    fn target<'a>(out: &'a FnOutcome, name: &str) -> &'a DeclaredTarget {
+        out.targets()
+            .iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("no target {name}: {:?}", out.targets()))
+    }
+
+    /// With credentials: the release lookup (uncached, API headers), the
+    /// `asset_url` over it, and the asset fetched from the URL it resolves to,
+    /// as bytes. The credentials go to both fetches and nowhere else.
+    #[test]
+    fn with_credentials_it_fetches_through_the_api() {
+        let out = call(&with(&[
+            creds(&["//auth:gh"]),
+            ("sha256", s("abc")),
+            ("executable", Value::Bool(true)),
+        ]))
+        .unwrap();
+        assert_eq!(out.value(), &s("//third_party/tool:tool"));
+        assert_eq!(out.targets().len(), 3, "{:?}", out.targets());
+        let gh_creds = Value::List(vec![s("//auth:gh")]);
+
+        let release = target(&out, "tool_release");
+        assert_eq!(release.driver, "http_fetch");
+        assert_eq!(
+            release.config.get("url"),
+            Some(&s("https://api.github.com/repos/o/r/releases/tags/v1"))
+        );
+        assert_eq!(release.config.get("out"), Some(&s("tool_release.json")));
+        assert_eq!(
+            release.config.get("headers"),
+            Some(&headers(&[
+                ("Accept", "application/vnd.github+json"),
+                ("X-GitHub-Api-Version", "2022-11-28"),
+            ]))
+        );
+        assert_eq!(release.config.get("credentials"), Some(&gh_creds));
+        assert_eq!(release.config.get("cache"), Some(&Value::Bool(false)));
+        assert_eq!(release.config.get("sha256"), None, "the JSON is not pinned");
+        assert_eq!(release.config.len(), 5, "{:?}", release.config);
+
+        let url = target(&out, "tool_url");
+        assert_eq!(url.driver, "gh.asset_url");
+        assert_eq!(url.config.get("src"), Some(&s(":tool_release")));
+        assert_eq!(url.config.get("asset"), Some(&s("tool-linux.tar.gz")));
+        assert_eq!(url.config.get("api"), Some(&s("https://api.github.com")));
+        assert_eq!(url.config.len(), 3, "no credentials: it reads a file");
+
+        let fetch = target(&out, "tool");
+        assert_eq!(fetch.driver, "http_fetch");
+        assert_eq!(
+            fetch.config.get("url"),
+            Some(&s("${read://third_party/tool:tool_url}"))
+        );
+        assert_eq!(
+            fetch.config.get("headers"),
+            Some(&headers(&[("Accept", "application/octet-stream")]))
+        );
+        assert_eq!(fetch.config.get("credentials"), Some(&gh_creds));
+        assert_eq!(fetch.config.get("sha256"), Some(&s("abc")));
+        assert_eq!(fetch.config.get("out"), Some(&s("tool-linux.tar.gz")));
+        assert_eq!(fetch.config.get("executable"), Some(&Value::Bool(true)));
+        assert_eq!(fetch.config.get("cache"), None, "the asset is cached");
+    }
+
+    #[test]
+    fn with_credentials_and_extract_the_archive_is_the_api_fetch() {
+        let out = call(&with(&[
+            creds(&["//auth:gh", "//auth:other"]),
+            ("extract", Value::Bool(true)),
+            ("sha256", s("abc")),
+        ]))
+        .unwrap();
+        assert_eq!(out.targets().len(), 4, "{:?}", out.targets());
+        let both = Value::List(vec![s("//auth:gh"), s("//auth:other")]);
+        let release = target(&out, "tool_release");
+        assert_eq!(release.config.get("credentials"), Some(&both));
+        assert_eq!(release.config.get("sha256"), None, "the JSON is not pinned");
+        assert_eq!(target(&out, "tool_url").config.get("sha256"), None);
+        let archive = target(&out, "tool_archive");
+        assert_eq!(
+            archive.config.get("url"),
+            Some(&s("${read://third_party/tool:tool_url}"))
+        );
+        assert_eq!(archive.config.get("credentials"), Some(&both));
+        assert_eq!(archive.config.get("out"), Some(&s("tool-linux.tar.gz")));
+        assert_eq!(
+            archive.config.get("sha256"),
+            Some(&s("abc")),
+            "the pin is the asset's bytes"
+        );
+        let extract = target(&out, "tool");
+        assert_eq!(extract.driver, "gh.extract");
+        assert_eq!(extract.config.get("src"), Some(&s(":tool_archive")));
+        assert_eq!(extract.config.get("credentials"), None);
+        assert_eq!(extract.config.get("sha256"), None);
+    }
+
+    /// GHES serves its API under the server, unless the call's `api_url` says
+    /// otherwise; an empty `credentials` list is the public path; and a
+    /// non-string entry is refused.
+    #[test]
+    fn credentials_follow_the_api_url_and_are_checked() {
+        let ghe = |extra: &[(&'static str, Value)]| {
+            let mut args = with(&[
+                creds(&["//auth:ghe"]),
+                ("tag", s("release/v1")),
+                ("server_url", s("https://ghe.example")),
+            ]);
+            args.extend(extra.iter().cloned());
+            let named = args.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+            release_asset(
+                "gh",
+                "",
+                &FnArgs {
+                    positional: vec![],
+                    named,
+                },
+            )
+            .unwrap()
+        };
+        let out = ghe(&[]);
+        assert_eq!(
+            target(&out, "tool_release").config.get("url"),
+            Some(&s(
+                "https://ghe.example/api/v3/repos/o/r/releases/tags/release%2Fv1"
+            ))
+        );
+        assert_eq!(
+            target(&out, "tool_url").config.get("api"),
+            Some(&s("https://ghe.example/api/v3"))
+        );
+        assert_eq!(
+            target(&out, "tool").config.get("url"),
+            Some(&s("${read://:tool_url}"))
+        );
+
+        let out = ghe(&[("api_url", s("https://api.ghe.example/"))]);
+        assert_eq!(
+            target(&out, "tool_release").config.get("url"),
+            Some(&s(
+                "https://api.ghe.example/repos/o/r/releases/tags/release%2Fv1"
+            ))
+        );
+        assert_eq!(
+            target(&out, "tool_url").config.get("api"),
+            Some(&s("https://api.ghe.example"))
+        );
+
+        let public = call(&with(&[creds(&[])])).unwrap();
+        let [t] = public.targets() else { panic!() };
+        assert_eq!(t.config.get("url"), Some(&s(URL)));
+
+        for bad in [
+            Value::List(vec![Value::Int(1)]),
+            Value::List(vec![s("")]),
+            s("//auth:gh"),
+        ] {
+            let msg = format!(
+                "{:#}",
+                call(&with(&[("credentials", bad.clone())])).unwrap_err()
+            );
+            assert!(msg.contains("`credentials`"), "{bad:?}: {msg}");
+        }
     }
 
     #[test]
@@ -732,8 +1267,8 @@ mod tests {
     }
 
     /// The server is the call's: a GitHub Enterprise `server_url` moves the
-    /// download URL of that call only, and a bad one fails the call through
-    /// the signature, naming the argument.
+    /// download URL of that call only, and a bad one (or a bad `api_url`)
+    /// fails the call through the signature, naming the argument.
     #[tokio::test]
     async fn the_server_is_a_per_call_argument() {
         let ghe = call(&with(&[("server_url", s("https://ghe.example/"))])).unwrap();
@@ -763,6 +1298,15 @@ mod tests {
                 assert!(msg.contains(want), "{bad:?}: {want}: {msg}");
             }
         }
+        let msg = format!(
+            "{:#}",
+            call_through_signature(&with(&[("api_url", s("api.ghe.example"))]))
+                .await
+                .unwrap_err()
+        );
+        for want in ["heph.gh.release_asset", "`api_url`"] {
+            assert!(msg.contains(want), "{want}: {msg}");
+        }
     }
 
     #[test]
@@ -772,7 +1316,9 @@ mod tests {
         assert_eq!(def.name, "release_asset");
         let names: Vec<_> = def.signature.named.iter().map(|p| p.name).collect();
         for want in [
+            "api_url",
             "asset",
+            "credentials",
             "executable",
             "extract",
             "format",
