@@ -59,13 +59,11 @@ use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3Default;
 
 use super::archive::{self, Blob, Blobs};
+use super::layer::{DESCRIPTOR_SUFFIX, LayerDescriptor, MEDIA_TYPE_TAR, MEDIA_TYPE_TAR_GZIP};
 use super::{
     ImageFormat, dep_files, is_os_arch, layout_path, normalize_platform, split_platform, ws_path,
 };
 
-/// Media type of an uncompressed layer. See [`super::layer`] for why layers are
-/// not gzipped.
-const LAYER_MEDIA_TYPE: &str = "application/vnd.oci.image.layer.v1.tar";
 const CONFIG_MEDIA_TYPE: &str = "application/vnd.oci.image.config.v1+json";
 
 const BASE_ORIGIN: &str = "base";
@@ -95,11 +93,18 @@ struct OciImageSpec {
     /// `oci_pull(layout = True, all_platforms = True)`.
     #[spec(ty = hcore::htvalue::signature::ParamType::String)]
     base: Option<String>,
-    /// `oci_layer` targets, bottom to top. **Order matters**: a later layer's
-    /// file shadows the same path in an earlier one.
+    /// `oci.layer` targets, bottom to top: one address or a list of them.
+    /// **Order matters**: a later layer's file shadows the same path in an
+    /// earlier one.
+    ///
+    /// Only `oci.layer` targets: any other target (a binary, a `group`, a tar
+    /// written by a script) fails the image build, naming it. Its output would
+    /// otherwise be filed as a layer blob as it is, and a runtime rejects that
+    /// only at deploy.
     layers: Vec<String>,
     /// Layers that differ per platform, appended after `layers`, keyed by the
-    /// platform they belong to.
+    /// platform they belong to. Each value is one `oci.layer` address or a
+    /// list of them.
     ///
     /// ```python
     /// platforms = ["linux/amd64", "linux/arm64"],
@@ -111,7 +116,7 @@ struct OciImageSpec {
     ///
     /// Every platform in `platforms` must have an entry, and vice versa — a
     /// missing one would silently ship an image without its binary.
-    layers_by_platform: HashMap<String, Vec<String>>,
+    layers_by_platform: BTreeMap<String, Vec<String>>,
     /// Target platforms, e.g. `["linux/amd64", "linux/arm64"]`. **Required.**
     ///
     /// There is deliberately no default. `platforms` is a label written into the
@@ -202,7 +207,11 @@ struct OciImageDef {
 /// canonicalization, the base-config merge rule, the layer media type, and the
 /// absence of `created`. Changing one of those without a bump is the
 /// same-key-different-artifact shape.
-const OCI_IMAGE_FORMAT_VERSION: u32 = 1;
+///
+/// 2: layers are read through their descriptor, and a dep without one is
+/// refused. The bump also evicts images cached from a non-layer dep, which a
+/// cache hit would otherwise keep serving.
+const OCI_IMAGE_FORMAT_VERSION: u32 = 2;
 
 impl Hash for OciImageDef {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -682,26 +691,29 @@ impl ManagedDriver for Driver {
             let mut diff_ids = base.diff_ids.clone();
             let mut own = Vec::new();
             for (i, _) in def.layers.iter().enumerate() {
-                own.push(layer_origin(None, i));
+                own.push((layer_origin(None, i), "`layers`".to_string()));
             }
             if let Some((_, list)) = def.layers_by_platform.iter().find(|(p, _)| p == platform) {
                 for (i, _) in list.iter().enumerate() {
-                    own.push(layer_origin(Some(platform), i));
+                    own.push((
+                        layer_origin(Some(platform), i),
+                        format!("`layers_by_platform[{platform:?}]`"),
+                    ));
                 }
             }
-            for origin in &own {
-                let path = layer_tar(&req, origin)?;
+            for (origin, attr) in &own {
+                let (path, descriptor) = layer_blob(&req, origin, attr)?;
                 // Streamed, not read: a layer can be most of an image, and this
                 // runs once per platform per image target.
                 let (digest, size) = archive::sha256_file(&path)?;
-                // Uncompressed, so the layer's digest and its diff_id are the
-                // same value — there is no second encoding to hash.
                 layer_descs.push(json!({
-                    "mediaType": LAYER_MEDIA_TYPE,
+                    "mediaType": descriptor.media_type,
                     "digest": digest,
                     "size": size,
                 }));
-                diff_ids.push(json!(digest));
+                // The uncompressed tar's digest, which only the layer could
+                // compute without inflating the blob again.
+                diff_ids.push(json!(descriptor.diff_id));
                 // Deduped by digest: two platforms sharing a static layer
                 // reference one blob, which is a thing buildx cannot do.
                 blobs.entry(digest).or_insert_with(|| Blob::File(path));
@@ -774,21 +786,71 @@ impl ManagedDriver for Driver {
     }
 }
 
-/// The single file an `oci_layer` dep produced.
-fn layer_tar(req: &ManagedRunRequest<'_, '_>, origin: &str) -> anyhow::Result<PathBuf> {
+/// The blob an `oci.layer` dep produced, and its descriptor.
+///
+/// The descriptor is what marks the dep as a layer. Anything else — a binary,
+/// a config file, a tar some other target wrote — is refused here: filed as a
+/// layer blob, it would build and push clean and fail only when a runtime
+/// tries to unpack it.
+fn layer_blob(
+    req: &ManagedRunRequest<'_, '_>,
+    origin: &str,
+    attr: &str,
+) -> anyhow::Result<(PathBuf, LayerDescriptor)> {
+    let dep = super::find_dep_input(req, origin)
+        .map(|m| m.input.source_addr.format())
+        .unwrap_or_else(|| origin.to_string());
     let paths = dep_files(req, origin)?;
-    match paths.as_slice() {
-        [only] => Ok(only.clone()),
-        [] => anyhow::bail!(
-            "the {origin} dep produced no file; an `oci.image` layer must be an `oci.layer` \
-             target, which produces exactly one tar"
-        ),
+    let file_name = |p: &PathBuf| {
+        p.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
+    let descriptors: Vec<&PathBuf> = paths
+        .iter()
+        .filter(|p| file_name(p).ends_with(DESCRIPTOR_SUFFIX))
+        .collect();
+    let descriptor_path = match descriptors.as_slice() {
+        [only] => *only,
+        [] => {
+            let produced = if paths.is_empty() {
+                "nothing".to_string()
+            } else {
+                paths.iter().map(file_name).collect::<Vec<_>>().join(", ")
+            };
+            anyhow::bail!(
+                "{attr} entry {dep} is not an `oci.layer` target (it produced: {produced}). An \
+                 image layer must be built by `oci.layer`, which puts the files at a path inside \
+                 the image and records the layer's digests. Wrap it:\n  target(name = \
+                 \"<name>\", driver = \"oci.layer\", srcs = [\"{dep}\"], prefix = \"/usr/bin\")"
+            )
+        }
         many => anyhow::bail!(
-            "the {origin} dep produced {} files, expected one layer tar; `layers` takes \
-             `oci.layer` targets, not arbitrary ones",
+            "{attr} entry {dep} produced {} layers; list each `oci.layer` target on its own, \
+             in the order they stack",
             many.len()
         ),
-    }
+    };
+    let descriptor: LayerDescriptor = serde_json::from_slice(
+        &std::fs::read(descriptor_path)
+            .with_context(|| format!("read the layer descriptor {descriptor_path:?}"))?,
+    )
+    .with_context(|| format!("parse the layer descriptor {descriptor_path:?} of {dep}"))?;
+    anyhow::ensure!(
+        [MEDIA_TYPE_TAR, MEDIA_TYPE_TAR_GZIP].contains(&descriptor.media_type.as_str()),
+        "{dep}'s layer descriptor has media type {:?}, which this heph does not write",
+        descriptor.media_type
+    );
+    let blob = paths
+        .iter()
+        .find(|p| file_name(p) == descriptor.blob)
+        .with_context(|| {
+            format!(
+                "{dep}'s layer descriptor names the blob {:?}, which it did not produce",
+                descriptor.blob
+            )
+        })?;
+    Ok((blob.clone(), descriptor))
 }
 
 /// Write the docker-format archive a daemon's `docker load` accepts.
@@ -1165,8 +1227,8 @@ mod tests {
             "mediaType": oci_client::manifest::OCI_IMAGE_MEDIA_TYPE,
             "config": {"mediaType": CONFIG_MEDIA_TYPE, "digest": config_digest, "size": config_size},
             "layers": [
-                {"mediaType": LAYER_MEDIA_TYPE, "digest": disk_digest, "size": disk_size},
-                {"mediaType": LAYER_MEDIA_TYPE, "digest": mem_digest, "size": mem_size},
+                {"mediaType": MEDIA_TYPE_TAR, "digest": disk_digest, "size": disk_size},
+                {"mediaType": MEDIA_TYPE_TAR, "digest": mem_digest, "size": mem_size},
             ],
         }))
         .expect("encode manifest");

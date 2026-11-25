@@ -111,6 +111,32 @@ fn manifest_of(bytes: &[u8]) -> serde_json::Value {
     }
 }
 
+/// The bytes of one file of a layer target's output: it holds the blob and
+/// its descriptor, and `artifact_bytes` would concatenate the two.
+#[expect(
+    clippy::panic,
+    reason = "a test helper's failure is the test's failure"
+)]
+fn layer_blob(result: &heph::engine::EResult, path: &str) -> Vec<u8> {
+    use std::io::Read as _;
+    for artifact in &result.artifacts {
+        for entry in artifact.walk().expect("walk artifacts") {
+            let entry = entry.expect("artifact entry");
+            if entry.path == std::path::Path::new(path)
+                && let heph::hartifactcontent::WalkEntryKind::File { mut data, .. } = entry.kind
+            {
+                let mut out = Vec::new();
+                data.read_to_end(&mut out).expect("read artifact");
+                return out;
+            }
+        }
+    }
+    panic!(
+        "no {path} in the layer's output: {:?}",
+        htestkit::artifact_paths(result)
+    )
+}
+
 fn config_of(bytes: &[u8]) -> serde_json::Value {
     let manifest = manifest_of(bytes);
     let digest = manifest["config"]["digest"]
@@ -175,8 +201,8 @@ async fn test_an_image_is_assembled_from_layers_without_docker() -> anyhow::Resu
     assert_eq!(layers.len(), 2, "one blob per oci.layer target");
     for layer in layers {
         assert_eq!(
-            layer["mediaType"], "application/vnd.oci.image.layer.v1.tar",
-            "layers are uncompressed, so the digest cannot depend on a deflate backend"
+            layer["mediaType"], "application/vnd.oci.image.layer.v1.tar+gzip",
+            "layers are gzipped by default"
         );
     }
 
@@ -193,16 +219,121 @@ async fn test_an_image_is_assembled_from_layers_without_docker() -> anyhow::Resu
         "a wall clock in the config would re-digest the image on every build"
     );
 
-    // Uncompressed layers: the diff_id *is* the layer digest, and nothing else
-    // would make that true.
+    // Each diff_id is the digest of the *inflated* blob. A runtime checks
+    // exactly this on unpack, so a compressed digest here is an image that
+    // pushes and then fails to start.
     let diff_ids = config["rootfs"]["diff_ids"].as_array().expect("diff_ids");
-    let digests: Vec<&serde_json::Value> = layers.iter().map(|l| &l["digest"]).collect();
+    let blobs = layout_blobs(&bytes);
+    let inflated_digests: Vec<serde_json::Value> = layers
+        .iter()
+        .map(|l| {
+            use std::io::Read as _;
+            let blob = blobs
+                .get(l["digest"].as_str().expect("layer digest"))
+                .expect("layer blob");
+            let mut tar = Vec::new();
+            flate2::read::GzDecoder::new(blob.as_slice())
+                .read_to_end(&mut tar)
+                .expect("the blob is gzip");
+            serde_json::json!(format!(
+                "sha256:{}",
+                hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&tar))
+            ))
+        })
+        .collect();
     assert_eq!(
-        diff_ids.iter().collect::<Vec<_>>(),
-        digests,
-        "with no compression the diff_id and the layer digest are one value"
+        diff_ids.to_vec(),
+        inflated_digests,
+        "a diff_id is the uncompressed tar's digest"
     );
     Ok(())
+}
+
+/// `compress = False` files the tar as it is, under the uncompressed media
+/// type, and its diff_id is then the blob's own digest.
+#[tokio::test]
+async fn test_an_uncompressed_layer_keeps_the_tar_media_type() -> anyhow::Result<()> {
+    let ws = workspace();
+    ws.write_build_file(
+        "app",
+        r#"
+target(name = "conf", driver = "bash", run = "echo k=v > $OUT", out = "app.conf")
+target(name = "etc", driver = "oci.layer", srcs = [":conf"], prefix = "/etc", compress = False)
+target(name = "img", driver = "oci.image", layers = [":etc"], platforms = ["linux/amd64"])
+"#,
+    );
+    let bytes = htestkit::artifact_bytes(&*ws.run("//app:img").await?);
+    let manifest = manifest_of(&bytes);
+    let layer = &manifest["layers"][0];
+    assert_eq!(layer["mediaType"], "application/vnd.oci.image.layer.v1.tar");
+    assert_eq!(
+        config_of(&bytes)["rootfs"]["diff_ids"],
+        serde_json::json!([layer["digest"]]),
+        "uncompressed, the diff_id and the blob digest are one value"
+    );
+    let blob = layout_blobs(&bytes)
+        .remove(layer["digest"].as_str().expect("digest"))
+        .expect("layer blob");
+    let mut ar = tar::Archive::new(blob.as_slice());
+    let names: Vec<String> = ar
+        .entries()?
+        .map(|e| Ok(e?.path()?.to_string_lossy().into_owned()))
+        .collect::<std::io::Result<_>>()?;
+    assert_eq!(names, vec!["etc/app/app.conf"]);
+    Ok(())
+}
+
+/// The reported bug: a target that is not an `oci.layer` was filed into the
+/// image as a layer blob, as it was, under a tar media type. The build and the
+/// push both succeeded; Cloud Run refused it at deploy with "Container import
+/// failed". Through `layers` and through `layers_by_platform` (with a bare
+/// string, which is one address), the image must fail, name the dep and say
+/// what to wrap it in.
+#[tokio::test]
+async fn test_a_non_layer_dep_is_refused_by_name() {
+    let ws = workspace();
+    ws.write_build_file(
+        "app",
+        r#"
+target(name = "file", driver = "bash", run = "echo not a tar > $OUT", out = "hello")
+target(name = "img_layers", driver = "oci.image", platforms = ["linux/amd64"], layers = [":file"])
+target(
+    name = "img_by_platform",
+    driver = "oci.image",
+    platforms = ["linux/amd64"],
+    layers_by_platform = {"linux/amd64": ":file"},
+)
+"#,
+    );
+    for (addr, attr) in [
+        ("//app:img_layers", "`layers`"),
+        (
+            "//app:img_by_platform",
+            "`layers_by_platform[\"linux/amd64\"]`",
+        ),
+    ] {
+        let err = format!(
+            "{:#}",
+            ws.run(addr)
+                .await
+                .err()
+                .expect("a non-layer dep must fail the image")
+        );
+        assert!(
+            err.contains(&format!(
+                "{attr} entry //app:file is not an `oci.layer` target"
+            )),
+            "{addr}: names the attribute and the dep: {err}"
+        );
+        assert!(
+            err.contains("it produced: hello"),
+            "{addr}: says what it produced: {err}"
+        );
+        assert!(
+            err.contains("driver = \"oci.layer\", srcs = [\"//app:file\"]"),
+            "{addr}: shows the wrapper: {err}"
+        );
+    }
 }
 
 /// Same inputs, same bytes. This is the claim the rule is built on, and the one
@@ -361,7 +492,7 @@ target(
     // Both instances name the same layer digest, so the layer appears once.
     let layer_blobs: Vec<&String> = blobs
         .iter()
-        .filter(|(_, v)| v.starts_with(b"etc/app.conf") || v.len() > 512)
+        .filter(|(_, v)| v.starts_with(&[0x1f, 0x8b]))
         .map(|(k, _)| k)
         .collect();
     assert!(
@@ -574,7 +705,7 @@ async fn test_the_image_digest_is_the_same_on_every_supported_target() -> anyhow
         hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&raw))
     );
     assert_eq!(
-        digest, "sha256:729f38276dc0b50b996908f034e3c25516cf33d0d12e83946b0a750dca744e2b",
+        digest, "sha256:f787941bf061e31b7b8caf02fbb4027e3412170adde99b7815d1d310b280f8d7",
         "the image manifest's bytes changed. If that was deliberate, bump \
          OCI_IMAGE_FORMAT_VERSION (or OCI_LAYER_FORMAT_VERSION) in the same commit — \
          otherwise every cached image keeps its old key with new meaning. If it was not \
@@ -798,8 +929,8 @@ target(
             ),
         );
         let r = ws.run("//app:layer").await?;
-        let bytes = htestkit::artifact_bytes(&r);
-        let mut ar = tar::Archive::new(std::io::Cursor::new(bytes));
+        let blob = layer_blob(&r, "app/layer.tar.gz");
+        let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(blob.as_slice()));
         let mut got = Vec::new();
         for e in ar.entries()? {
             let mut e = e?;

@@ -31,12 +31,23 @@
 //!   the dep's hash, and the link's mode is pinned to `0o777` rather than
 //!   lstat'ed (Linux reports `0777` there, macOS `0755`).
 //!
-//! Layers are written **uncompressed** (`application/vnd.oci.image.layer.v1.tar`).
-//! Spec-legal, and it keeps the layer digest out of the hands of whichever
-//! deflate implementation cargo's feature resolution happens to pick — a
-//! backend swap would otherwise move every layer digest in every cache with no
-//! code change. It also avoids gzipping bytes that heph's remote cache is about
-//! to gzip again.
+//! Layers are **gzipped** by default (`application/vnd.oci.image.layer.v1.tar+gzip`),
+//! once, here, and the compressed blob is what the cache keeps and every image
+//! that lists the layer reuses. The encoder is [`super::gzip`], which pins the
+//! deflate implementation and the header so the blob digest stays a function of
+//! the tar. `compress = False` writes the tar as it is
+//! (`application/vnd.oci.image.layer.v1.tar`), for a layer of already-compressed
+//! files where deflate buys nothing.
+//!
+//! # The descriptor
+//!
+//! Next to the blob, a layer writes `<name>.oci-layer.json`
+//! ([`LayerDescriptor`]): the blob's file name, its media type, and the digest
+//! of the *uncompressed* tar, which an image config lists as the layer's
+//! `diff_id`. `oci.image` reads the layer through it. That makes the descriptor
+//! what marks an `oci.layer` output: an image refuses a `layers` entry that
+//! has none rather than filing someone's file as a layer blob, which no build
+//! or push step checks and a runtime only rejects at deploy.
 
 use anyhow::Context as _;
 use async_trait::async_trait;
@@ -62,6 +73,27 @@ use super::{dep_files, ws_path};
 /// `HEPH_DEBUG_HASH` trace names the entry rather than "a src".
 fn src_origin(i: usize) -> String {
     format!("srcs|{i}")
+}
+
+/// Media type of a layer written with `compress = False`.
+pub(crate) const MEDIA_TYPE_TAR: &str = "application/vnd.oci.image.layer.v1.tar";
+/// Media type of a gzipped layer, the default.
+pub(crate) const MEDIA_TYPE_TAR_GZIP: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
+
+/// File name suffix of a layer's [`LayerDescriptor`].
+pub(crate) const DESCRIPTOR_SUFFIX: &str = ".oci-layer.json";
+
+/// What a layer tells the image that lists it, written next to the blob.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct LayerDescriptor {
+    /// File name of the blob, in the same output as this descriptor.
+    pub(crate) blob: String,
+    /// [`MEDIA_TYPE_TAR`] or [`MEDIA_TYPE_TAR_GZIP`].
+    pub(crate) media_type: String,
+    /// `sha256:<hex>` of the uncompressed tar: the layer's `diff_id`. The same
+    /// value as the blob's digest when the layer is not compressed.
+    pub(crate) diff_id: String,
 }
 
 /// Packs target outputs into a single image layer, for `oci_image`. No
@@ -103,6 +135,15 @@ struct OciLayerSpec {
     /// alone would promise something the next layer could not keep.
     #[spec(ty = hcore::htvalue::signature::ParamType::String)]
     mode: Option<String>,
+    /// Gzip the layer. Default `True`.
+    ///
+    /// The layer is compressed once, here, and every image that lists it
+    /// reuses the compressed blob, so the cost is paid once per change to its
+    /// sources. Turn it off for a layer of files that are already compressed
+    /// (archives, images, a UPX-packed binary), where deflate costs time and
+    /// saves nothing.
+    #[spec(default = true)]
+    compress: bool,
     /// Caching for the layer tar. Defaults to on for both tiers.
     cache: TargetSpecCache,
     /// What the target reserves from the resource pools while it runs, e.g.
@@ -112,8 +153,12 @@ struct OciLayerSpec {
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct OciLayerDef {
-    /// Workspace-relative output path of the layer tar.
+    /// Workspace-relative output path of the layer blob.
     out: String,
+    /// Workspace-relative output path of its [`LayerDescriptor`].
+    descriptor_out: String,
+    /// Gzip the blob.
+    compress: bool,
     /// The `srcs` addresses, normalized and sorted.
     ///
     /// In the hash because `hashin` cannot carry them: it folds a *sorted,
@@ -136,14 +181,19 @@ struct OciLayerDef {
 ///
 /// This covers the parts of the encoding that are *transforms* rather than
 /// hashed values — the GNU header format, mtime 0, uid/gid 0, the sort key, the
-/// exec-bit mode rule. Changing any of them alters the bytes without altering a
-/// single field below, which is the same-key-different-artifact shape.
-const OCI_LAYER_FORMAT_VERSION: u32 = 1;
+/// exec-bit mode rule, the gzip encoder and the descriptor. Changing any of
+/// them alters the bytes without altering a single field below, which is the
+/// same-key-different-artifact shape.
+///
+/// 2: gzip by default, and the descriptor next to the blob.
+const OCI_LAYER_FORMAT_VERSION: u32 = 2;
 
 impl Hash for OciLayerDef {
     fn hash<H: Hasher>(&self, state: &mut H) {
         OCI_LAYER_FORMAT_VERSION.hash(state);
         self.out.hash(state);
+        self.descriptor_out.hash(state);
+        self.compress.hash(state);
         self.srcs.hash(state);
         self.prefix.hash(state);
         self.strip.hash(state);
@@ -233,10 +283,65 @@ fn reject_whiteout(dest: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Write the entries as an uncompressed layer tar at `out`.
-fn write_layer(out: &Path, entries: &[Entry], mode: Option<u32>) -> anyhow::Result<()> {
-    let file = std::fs::File::create(out).with_context(|| format!("create layer {out:?}"))?;
-    let mut ar = tar::Builder::new(std::io::BufWriter::new(file));
+/// Forwards every byte to `inner` and hashes it on the way: the uncompressed
+/// tar's digest, computed in the one pass that writes it.
+struct DiffIdWriter<W> {
+    inner: W,
+    hasher: sha2::Sha256,
+}
+
+impl<W> DiffIdWriter<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            hasher: <sha2::Sha256 as sha2::Digest>::new(),
+        }
+    }
+}
+
+impl<W: std::io::Write> std::io::Write for DiffIdWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        sha2::Digest::update(&mut self.hasher, buf.get(..n).unwrap_or_default());
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Write the entries as a layer blob at `out`, gzipped when `compress` is set.
+/// Returns the `diff_id`: `sha256:<hex>` of the uncompressed tar.
+fn write_layer(
+    out: &Path,
+    entries: &[Entry],
+    mode: Option<u32>,
+    compress: bool,
+) -> anyhow::Result<String> {
+    let file = std::io::BufWriter::new(
+        std::fs::File::create(out).with_context(|| format!("create layer {out:?}"))?,
+    );
+    let (file, hasher) = if compress {
+        let gz = super::gzip::GzipWriter::new(file).context("start the gzip stream")?;
+        let DiffIdWriter { inner, hasher } = write_tar(DiffIdWriter::new(gz), entries, mode)?;
+        (inner.finish().context("finish the gzip stream")?, hasher)
+    } else {
+        let DiffIdWriter { inner, hasher } = write_tar(DiffIdWriter::new(file), entries, mode)?;
+        (inner, hasher)
+    };
+    file.into_inner()
+        .map_err(std::io::IntoInnerError::into_error)
+        .with_context(|| format!("flush layer {out:?}"))?;
+    Ok(format!(
+        "sha256:{}",
+        hex::encode(sha2::Digest::finalize(hasher))
+    ))
+}
+
+/// Write the entries as a tar into `w`, and hand `w` back.
+fn write_tar<W: std::io::Write>(w: W, entries: &[Entry], mode: Option<u32>) -> anyhow::Result<W> {
+    let mut ar = tar::Builder::new(w);
     for entry in entries {
         let meta = std::fs::symlink_metadata(&entry.source)
             .with_context(|| format!("lstat {:?}", entry.source))?;
@@ -271,8 +376,7 @@ fn write_layer(out: &Path, entries: &[Entry], mode: Option<u32>) -> anyhow::Resu
         ar.append_data(&mut header, &entry.dest, &mut src)
             .with_context(|| format!("append {}", entry.dest))?;
     }
-    ar.finish().context("finish the layer tar")?;
-    Ok(())
+    ar.into_inner().context("finish the layer tar")
 }
 
 #[cfg(unix)]
@@ -338,9 +442,13 @@ impl ManagedDriver for Driver {
         }
         srcs.sort();
 
-        let out = ws_path(pkg.as_str(), &format!("{}.tar", addr.name));
+        let ext = if spec.compress { "tar.gz" } else { "tar" };
+        let out = ws_path(pkg.as_str(), &format!("{}.{ext}", addr.name));
+        let descriptor_out = ws_path(pkg.as_str(), &format!("{}{DESCRIPTOR_SUFFIX}", addr.name));
         let def = OciLayerDef {
             out: out.clone(),
+            descriptor_out: descriptor_out.clone(),
+            compress: spec.compress,
             srcs,
             prefix,
             strip: spec.strip,
@@ -360,13 +468,18 @@ impl ManagedDriver for Driver {
                 labels: req.target_spec.labels.clone(),
                 raw_def: Arc::new(def),
                 inputs,
+                // One group: the descriptor travels with the blob wherever the
+                // layer is referenced, which is how an image finds both.
                 outputs: vec![Output {
                     group: String::new(),
-                    paths: vec![OutPath {
-                        content: Content::FilePath(out),
-                        codegen_tree: CodegenMode::None,
-                        collect: true,
-                    }],
+                    paths: [out, descriptor_out]
+                        .into_iter()
+                        .map(|p| OutPath {
+                            content: Content::FilePath(p),
+                            codegen_tree: CodegenMode::None,
+                            collect: true,
+                        })
+                        .collect(),
                 }],
                 cache: spec.cache.into(),
                 hash,
@@ -473,8 +586,29 @@ impl ManagedDriver for Driver {
             );
         }
 
-        write_layer(&out_path, &entries, def.mode)
+        let diff_id = write_layer(&out_path, &entries, def.mode, def.compress)
             .with_context(|| format!("write the layer to {out_path:?}"))?;
+        let descriptor = LayerDescriptor {
+            blob: out_name
+                .to_str()
+                .with_context(|| format!("layer file name {out_name:?} is not UTF-8"))?
+                .to_string(),
+            media_type: if def.compress {
+                MEDIA_TYPE_TAR_GZIP
+            } else {
+                MEDIA_TYPE_TAR
+            }
+            .to_string(),
+            diff_id,
+        };
+        let descriptor_path = req
+            .sandbox_pkg_dir
+            .join(super::basename(&def.descriptor_out)?);
+        std::fs::write(
+            &descriptor_path,
+            serde_json::to_vec(&descriptor).context("encode the layer descriptor")?,
+        )
+        .with_context(|| format!("write the layer descriptor to {descriptor_path:?}"))?;
 
         Ok(ManagedRunResponse { artifacts: vec![] })
     }
@@ -592,8 +726,8 @@ mod tests {
 
         let a = dir.path().join("a.tar");
         let b = dir.path().join("b.tar");
-        write_layer(&a, &sorted, None).expect("a");
-        write_layer(&b, &sorted, None).expect("b");
+        write_layer(&a, &sorted, None, false).expect("a");
+        write_layer(&b, &sorted, None, false).expect("b");
         assert_eq!(
             std::fs::read(&a).expect("a"),
             std::fs::read(&b).expect("b"),
@@ -617,7 +751,7 @@ mod tests {
             std::fs::set_permissions(&sorted[0].source, std::fs::Permissions::from_mode(0o600))
                 .expect("chmod");
             let c = dir.path().join("c.tar");
-            write_layer(&c, &sorted, None).expect("c");
+            write_layer(&c, &sorted, None, false).expect("c");
             assert_eq!(
                 std::fs::read(&a).expect("a"),
                 std::fs::read(&c).expect("c"),
@@ -648,7 +782,7 @@ mod tests {
             },
         ];
         let out = dir.path().join("l.tar");
-        write_layer(&out, &entries, None).expect("write");
+        write_layer(&out, &entries, None, false).expect("write");
 
         let f = std::fs::File::open(&out).expect("open");
         let mut ar = tar::Archive::new(f);
@@ -687,9 +821,65 @@ mod tests {
         }];
         let err = format!(
             "{:#}",
-            write_layer(&dir.path().join("x.tar"), &entries, None).expect_err("absolute")
+            write_layer(&dir.path().join("x.tar"), &entries, None, false).expect_err("absolute")
         );
         assert!(err.contains("absolute path"), "got: {err}");
+    }
+
+    /// A gzipped layer holds the same tar the uncompressed one is, and its
+    /// `diff_id` is that tar's digest — not the blob's, which is what an image
+    /// config would otherwise list and a runtime reject on unpack.
+    #[test]
+    fn a_gzipped_layer_holds_the_tar_its_diff_id_names() {
+        use std::io::Read as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let entries = vec![
+            entry(dir.path(), "etc/app.conf", b"k=v", false),
+            entry(dir.path(), "usr/bin/server", b"elf", true),
+        ];
+        let plain = dir.path().join("l.tar");
+        let gz = dir.path().join("l.tar.gz");
+        let plain_id = write_layer(&plain, &entries, None, false).expect("plain");
+        let gz_id = write_layer(&gz, &entries, None, true).expect("gz");
+
+        let plain_bytes = std::fs::read(&plain).expect("read plain");
+        let mut inflated = Vec::new();
+        flate2::read::GzDecoder::new(std::fs::File::open(&gz).expect("open gz"))
+            .read_to_end(&mut inflated)
+            .expect("the blob is gzip");
+        assert_eq!(inflated, plain_bytes, "gzip wraps the same tar");
+
+        let tar_digest = format!(
+            "sha256:{}",
+            hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&plain_bytes))
+        );
+        assert_eq!(plain_id, tar_digest);
+        assert_eq!(
+            gz_id, tar_digest,
+            "diff_id is the uncompressed tar's digest"
+        );
+    }
+
+    /// The compressed blob's digest, frozen. It moves if the gzip encoder's
+    /// output does — a `miniz_oxide` bump, a header change — and every cached
+    /// layer would then keep its old key with new bytes. If this fails on
+    /// purpose, bump `OCI_LAYER_FORMAT_VERSION` in the same commit.
+    #[test]
+    fn the_gzipped_blob_digest_is_pinned() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let entries = vec![
+            entry(dir.path(), "etc/app.conf", b"k=v\n", false),
+            entry(dir.path(), "usr/bin/server", &b"elf ".repeat(4096), true),
+        ];
+        let out = dir.path().join("l.tar.gz");
+        write_layer(&out, &entries, None, true).expect("write");
+        let digest = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
+            std::fs::read(&out).expect("read"),
+        ));
+        assert_eq!(
+            digest, "07437eabade76ae29f87607f4ddeb8876768b7c394fe535e292431ba52b114ed",
+            "the gzipped layer's bytes changed: bump OCI_LAYER_FORMAT_VERSION if deliberate"
+        );
     }
 
     /// The sort is on the raw bytes of the entry name, which is not the same
@@ -705,7 +895,7 @@ mod tests {
         ];
         entries.sort_by(|x, y| x.dest.as_bytes().cmp(y.dest.as_bytes()));
         let out = dir.path().join("s.tar");
-        write_layer(&out, &entries, None).expect("write");
+        write_layer(&out, &entries, None, false).expect("write");
         assert_eq!(
             members(&out)
                 .into_iter()

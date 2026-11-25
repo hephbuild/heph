@@ -25,6 +25,7 @@ pub mod archive;
 mod auth;
 pub mod docker_build;
 pub mod exec_runner;
+mod gzip;
 pub mod image;
 pub mod index;
 pub mod layer;
