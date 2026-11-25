@@ -244,8 +244,10 @@ line:
 **Errors** exit 125, as `heph session`'s own errors do. A refused, invalid
 or stopped statement says so on stderr with SQLite's message (an unknown
 table or column lists the real ones); under `--format json` stdout stays
-empty. Ctrl-C stops the query, removes its temp files, and exits **130**,
-the one `heph session` error that is not 125.
+empty. The message is for people: its text can change in any release,
+SQLite's part with the SQLite heph links. Match on the exit code, never on
+the message. Ctrl-C stops the query, removes its temp files, and exits
+**130**, the one `heph session` error that is not 125.
 
 ### heph inside a target
 
@@ -500,11 +502,15 @@ They key on `class`, never on a span's name: the same target shows
 
 ```sql
 -- time_by_phase: Where did time go, by class and phase (busy time, not wall time)?
+-- The catalog keeps the spans of targets that ran, not of cache hits:
+-- for a warm run, use --full or --from.
 SELECT class, name, count(*) AS n, sum(duration_us) / 1e6 AS busy_s
 FROM spans WHERE class IS NOT NULL
 GROUP BY class, name ORDER BY busy_s DESC, class, name;
 
 -- uncovered_wall: How much of each session's wall time had no target running?
+-- The catalog keeps the spans of targets that ran, not of cache hits:
+-- for a warm run, use --full or --from.
 WITH runs AS (
   SELECT session_id, start_us, end_us,
          max(end_us) OVER (PARTITION BY session_id ORDER BY start_us, end_us
@@ -530,6 +536,8 @@ WHERE s.ended_ms > s.started_ms
 ORDER BY s.started_ms DESC;
 
 -- phase_percentiles: How long does each phase take: p50, p90, p99 and max, in ms?
+-- The catalog keeps the spans of targets that ran, not of cache hits:
+-- for a warm run, use --full or --from.
 SELECT class, name, count(*) AS n,
        min(CASE WHEN cd >= 0.5 THEN duration_us END) / 1e3 AS p50_ms,
        min(CASE WHEN cd >= 0.9 THEN duration_us END) / 1e3 AS p90_ms,
@@ -541,6 +549,8 @@ FROM (SELECT class, name, duration_us,
 GROUP BY class, name ORDER BY p90_ms DESC, class, name;
 
 -- hit_rate_by_package: Which packages miss the cache most?
+-- Failed targets count as misses, those whose dependency failed included.
+-- A target with cache = False never hits.
 SELECT substr(addr, 1, instr(addr, ':') - 1) AS package,
        count(*) AS targets, sum(outcome = 'hit') AS hits,
        round(100.0 * sum(outcome = 'hit') / count(*), 1) AS hit_pct
@@ -550,15 +560,24 @@ GROUP BY package ORDER BY hit_pct, targets DESC, package;
 
 Over the catalog, `hit_rate_by_package` counts hits from `targets`, which
 keeps them; the other three read `spans`, which the catalog keeps only for
-targets that ran (`--full` reads every recording instead).
+targets that ran (`--full` reads every recording instead). Their comment
+says so, and `query --format json` names those tables in
+`coverage.partial`.
+
+The recipes are not part of the explorer contract (I9). A release may
+change a recipe's SQL, its columns or its name. A script that runs one
+should keep its own copy of the SQL: the six names it reads are the
+contract.
 
 **Who ran `//p:t`, and how did it end?** `heph session list --addr //p:t`
-answers it; as SQL, for more columns:
+answers it; as SQL, for more columns. It reads `targets`, which the catalog
+keeps for cache hits too, so it finds the same sessions as `list --addr`:
 
 ```sql
-SELECT s.started_ms, s.user, s.actor_name, s.argv, r.outcome, r.duration_us / 1e3 AS ms
-FROM spans r JOIN sessions s USING (session_id)
-WHERE r.name = 'heph.result' AND r.addr = '//p:t';
+SELECT s.started_ms, s.user, s.actor_name, s.argv, t.outcome, t.duration_us / 1e3 AS ms
+FROM targets t JOIN sessions s USING (session_id)
+WHERE t.addr = '//p:t'
+ORDER BY s.started_ms DESC;
 ```
 
 ### Pools
@@ -728,6 +747,12 @@ It holds:
   the session's own spans, the `heph.result` spans of targets that were not
   cache hits with their phase spans, and every metric point.
 
+These tables, and the `addrs`, `target_rows`, `heal_failures` and `info`
+tables behind them, are internal: their names and columns may change within
+a format. The contract is what `heph session query` presents over the
+catalog, the six explorer names (I9). Read the catalog through `query`,
+not with `sqlite3`.
+
 The catalog holds nothing a recording does not, so it can be rebuilt from
 the recordings still kept. Every write copies from a recording with the same
 SQL, whether the owner writes it, `list` heals it, or a repair rebuilds it.
@@ -790,8 +815,9 @@ that bound, and a build never repairs anything (I1).
 
   `list --json` then has `retention.catalog.keep_ms: null`.
 
-Only `list` opens the catalog. `show` replaces a session's catalog rows after
-it re-derives that session's recording (below).
+`list` and `query` over the catalog (without `--full` or `--from`) open
+the catalog, so both repair it as above. `show` replaces a session's catalog
+rows after it re-derives that session's recording (below).
 
 ### Re-derivation on `show`
 
@@ -884,9 +910,12 @@ there leaves the file for the next cleanup.
 `list --json` is `{version, sessions: [{id, owner_pid, argv, workspace_root,
 cwd, state, started_unix_ms, ended_unix_ms, last_event_unix_ms, exit_code,
 panicked, actor, user, command, recorded, recording_kept, target, progress,
-now, blocked_on, incomplete, format}], retention}`, times in absolute unix ms. `sessions` is
-in the table's order: live sessions first, then ended ones, each newest
-first. (Before the catalog it was sorted by id.)
+now, blocked_on, incomplete, format}], retention}`, times in absolute unix ms.
+
+The order of `sessions` is part of the contract, and is the table's order:
+live sessions first, then ended ones; within each, by start time, newest
+first; between sessions that started in the same millisecond, by id,
+greatest first. A change to this order bumps `version`.
 
 - `actor` is `{kind, name}`: `kind` is `human`, `agent` or `ci` (an open
   set), `name` the agent or CI system when known. `null` when the catalog has
@@ -1258,7 +1287,7 @@ heph session export <ref> --format otlp [-o PATH|-]
 ```
 
 Writes one session's [explorer](#the-explorer) rows as OTLP/JSON: the file
-format an OpenTelemetry collector's `otlpjsonfile` receiver reads, and that
+format an OpenTelemetry collector's `otlp_json_file` receiver reads, and that
 any OTLP/JSON tool takes. It is written from the recording after the fact:
 nothing runs in the build to produce it.
 
@@ -1284,8 +1313,16 @@ nothing runs in the build to produce it.
 - The lines are the OTLP/JSON encoding, not the plain proto3 JSON mapping:
   `traceId`, `spanId` and `parentSpanId` are lowercase hex, enums (`kind`,
   `status.code`, `severityNumber`, `aggregationTemporality`) are integers,
-  and 64-bit integers (`*UnixNano`, `intValue`) are decimal strings. The same
-  recording always writes the same bytes.
+  and 64-bit integers (`*UnixNano`, `intValue`) are decimal strings.
+- The same recording exported by the same heph writes the same bytes.
+  Another heph version can write different bytes: `service.version` and the
+  scope version change, and so can the mapping below.
+- The messages are those of `opentelemetry-proto` v1.11.1, vendored under
+  `third_party/opentelemetry-proto`. The resource attribute names
+  (`service.*`, `host.name`, `user.name`, `process.*`) are those of the
+  OpenTelemetry semantic conventions v1.27.0, the first release with
+  `user.name`. heph does not follow later renames on its own: a rename
+  reaches the export only with a heph release that adopts it.
 
 What maps to what:
 
@@ -1296,6 +1333,45 @@ What maps to what:
 | a `span_events` row | an event of its span |
 | a `logs` row | a log record under the session span's ids: its `severity` as `severityText` and `severityNumber`, its body, `seq` as `heph.seq` |
 | `metrics` rows of one name, kind and unit | one metric: `counter` a monotonic cumulative sum from the session's start, `gauge` (and a kind this heph does not know) a gauge; one data point per row |
+
+**Into a collector.** The `otlp_json_file` receiver of
+`opentelemetry-collector-contrib` (`otlpjsonfile` before it was renamed)
+reads the file as it is. One file holds all three signals; give the receiver
+to each pipeline:
+
+```yaml
+receivers:
+  otlp_json_file:
+    include: [/srv/heph/*.otlp.jsonl]
+    start_at: beginning   # the default, end, skips the lines already there
+    max_log_size: 64MiB   # a line can pass the 1MiB default
+exporters:
+  otlp:
+    endpoint: otel-backend.internal:4317
+service:
+  pipelines:
+    traces:  {receivers: [otlp_json_file], exporters: [otlp]}
+    logs:    {receivers: [otlp_json_file], exporters: [otlp]}
+    metrics: {receivers: [otlp_json_file], exporters: [otlp]}
+```
+
+**Pushed over OTLP/HTTP.** Each line is the body of one export request.
+Its single top-level key says where it goes: `resourceSpans` to
+`/v1/traces`, `resourceLogs` to `/v1/logs`, `resourceMetrics` to
+`/v1/metrics`:
+
+```sh
+while IFS= read -r line; do
+  case "$(printf '%s' "$line" | jq -r 'keys[0]')" in
+    resourceSpans) path=traces ;;
+    resourceLogs) path=logs ;;
+    resourceMetrics) path=metrics ;;
+    *) continue ;;
+  esac
+  printf '%s' "$line" | curl -sSf -H 'Content-Type: application/json' \
+    --data-binary @- "http://localhost:4318/v1/$path"
+done < heph-<id>.otlp.jsonl
+```
 
 ## Opening a recording: `<ref>`
 

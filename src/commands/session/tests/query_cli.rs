@@ -373,11 +373,16 @@ async fn query_schema_lists_every_name() {
         }
     }
     // The built-in recipes follow, each under its `-- name: purpose` line
-    // (`recipes_run` runs them as printed).
+    // and its notes (`recipes_run` runs them as printed).
     let recipes = out.split_once("\nrecipes\n").expect("a recipes section").1;
     for r in crate::tui::session::query::RECIPES {
         assert!(
-            recipes.contains(&format!("\n-- {}: {}\n{};\n", r.name, r.purpose, r.sql)),
+            recipes.contains(&format!("\n-- {}: {}\n", r.name, r.purpose)),
+            "{}: {recipes}",
+            r.name
+        );
+        assert!(
+            recipes.contains(&format!("\n{}{};\n", r.comment(), r.sql)),
             "{}: {recipes}",
             r.name
         );

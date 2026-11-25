@@ -111,7 +111,14 @@ fn recipes_run() {
         .collect();
     let built_in: Vec<(String, String)> = RECIPES
         .iter()
-        .map(|r| (format!("{}: {}", r.name, r.purpose), r.sql.to_owned()))
+        .map(|r| {
+            let header: Vec<String> = r
+                .comment()
+                .lines()
+                .map(|l| l.trim_start_matches("--").trim().to_owned())
+                .collect();
+            (header.join(" "), r.sql.to_owned())
+        })
         .collect();
     assert_eq!(documented, built_in, "docs/SESSIONS.md's built-in recipes");
 

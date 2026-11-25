@@ -368,7 +368,7 @@ fn write_schema(out: &mut dyn Write) -> anyhow::Result<()> {
     }
     text.push_str("\nrecipes\n");
     for r in engine::RECIPES {
-        text.push_str(&format!("\n-- {}: {}\n{};\n", r.name, r.purpose, r.sql));
+        text.push_str(&format!("\n{}{};\n", r.comment(), r.sql));
     }
     out.write_all(text.as_bytes()).context("writing the schema")
 }

@@ -144,16 +144,41 @@ pub struct Recipe {
     pub name: &'static str,
     /// One line: the question it answers.
     pub purpose: &'static str,
+    /// What to know before trusting its answer, a comment line each. No
+    /// `;`: `recipes_run` splits the docs' SQL blocks on it.
+    pub notes: &'static [&'static str],
     /// One statement, no trailing `;`. Keys on `class`, never on a span's
     /// name (E5).
     pub sql: &'static str,
 }
+
+impl Recipe {
+    /// Its comment, as `--schema` prints it above the SQL: `-- name:
+    /// purpose`, then a `-- ` line per note, each `\n`-ended.
+    pub fn comment(&self) -> String {
+        let mut out = format!("-- {}: {}\n", self.name, self.purpose);
+        for n in self.notes {
+            out.push_str("-- ");
+            out.push_str(n);
+            out.push('\n');
+        }
+        out
+    }
+}
+
+/// The note of a recipe over `spans`: the catalog does not keep a cache
+/// hit's spans, so over it a warm run looks empty.
+const SPANS_NOTE: &[&str] = &[
+    "The catalog keeps the spans of targets that ran, not of cache hits:",
+    "for a warm run, use --full or --from.",
+];
 
 /// The built-in recipes, in the order `--schema` prints them.
 pub const RECIPES: &[Recipe] = &[
     Recipe {
         name: "time_by_phase",
         purpose: "Where did time go, by class and phase (busy time, not wall time)?",
+        notes: SPANS_NOTE,
         sql: "\
 SELECT class, name, count(*) AS n, sum(duration_us) / 1e6 AS busy_s
 FROM spans WHERE class IS NOT NULL
@@ -162,6 +187,7 @@ GROUP BY class, name ORDER BY busy_s DESC, class, name",
     Recipe {
         name: "uncovered_wall",
         purpose: "How much of each session's wall time had no target running?",
+        notes: SPANS_NOTE,
         sql: "\
 WITH runs AS (
   SELECT session_id, start_us, end_us,
@@ -190,6 +216,7 @@ ORDER BY s.started_ms DESC",
     Recipe {
         name: "phase_percentiles",
         purpose: "How long does each phase take: p50, p90, p99 and max, in ms?",
+        notes: SPANS_NOTE,
         sql: "\
 SELECT class, name, count(*) AS n,
        min(CASE WHEN cd >= 0.5 THEN duration_us END) / 1e3 AS p50_ms,
@@ -204,6 +231,10 @@ GROUP BY class, name ORDER BY p90_ms DESC, class, name",
     Recipe {
         name: "hit_rate_by_package",
         purpose: "Which packages miss the cache most?",
+        notes: &[
+            "Failed targets count as misses, those whose dependency failed included.",
+            "A target with cache = False never hits.",
+        ],
         sql: "\
 SELECT substr(addr, 1, instr(addr, ':') - 1) AS package,
        count(*) AS targets, sum(outcome = 'hit') AS hits,
