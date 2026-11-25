@@ -3056,3 +3056,4 @@ mod list_catalog;
 mod query_cli;
 mod recipes;
 mod refs;
+mod show_machine;

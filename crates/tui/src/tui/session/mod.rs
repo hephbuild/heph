@@ -89,7 +89,7 @@ pub use run_logs::{
     FeedRunLogLocator, FoundRunLog, RunLogLookup, SessionRunLog, SessionRunLogLocator,
     find_run_log, lookup_run_log, session_run_log,
 };
-pub use source::{EntryMeta, FileSource, SessionEntry, SessionItem, SessionSource};
+pub use source::{EntryMeta, FileSource, SessionEntry, SessionItem, SessionSource, Summaries};
 
 use cleanup::Retention;
 use recorder::{Faults, RecorderStart};

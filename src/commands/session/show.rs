@@ -24,11 +24,13 @@ use super::{
 use crate::tui::session::recording::{ForeignSource, RecordingState};
 use crate::tui::session::{
     ApprovalStanding, HeaderKind, SessionEntry, SessionItem, SessionMeta, SessionRecordKind,
-    SessionSnapshot, SessionSource,
+    SessionSnapshot, SessionSource, Summaries,
     format::{
         AdmissionWaitEntry, ListTotals, LockWaitEntry, RunningTarget, SessionEnd, SnapshotCounts,
     },
-    holder_session, recorder,
+    holder_session,
+    machine::{LimitSource, MachineStatus, MachineSummary, NoneReason, Split},
+    recorder,
     store::PoolSummary,
 };
 use crate::tui::{self, TUIAppView as _};
@@ -199,6 +201,9 @@ pub struct ShowView<'a> {
     /// while it runs (the summaries are written at its end). PR 5 adds the
     /// `resources_vs_machine` totals to each entry.
     pools: &'a [PoolSummary],
+    /// The machine the session ran on, and its waiting split. Always
+    /// present; `status` says what was sampled.
+    machine: &'a MachineSummary,
     /// A recording opened by path or URL: where from, whether it is whole,
     /// and what its export carried. Absent for a local session.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -221,6 +226,7 @@ impl<'a> ShowView<'a> {
         skipped: u64,
         incomplete: bool,
         pools: &'a [PoolSummary],
+        machine: &'a MachineSummary,
         foreign: Option<ForeignJson<'a>>,
         snapshot: &'a SessionSnapshot,
     ) -> Self {
@@ -262,6 +268,7 @@ impl<'a> ShowView<'a> {
             incomplete,
             incomplete_reason: incomplete.then_some(IncompleteReason::SizeCap),
             pools,
+            machine,
             foreign,
         }
     }
@@ -441,7 +448,7 @@ async fn render(
         folded.view.set_finished(end.at_unix_ms);
     }
     let snapshot = current_snapshot(&folded, entry.status.as_ref());
-    let pools = source.pools(entry.id).await?;
+    let Summaries { pools, machine } = source.summaries(entry.id).await?;
     let every = list_all(sources).await?;
     let every: Vec<&SessionEntry> = every.iter().map(|(_, e)| e).collect();
     // The stuck-on block is drawn whatever the output, for the chain root.
@@ -524,6 +531,7 @@ async fn render(
             folded.skipped,
             incomplete,
             &pools,
+            &machine,
             foreign.map(|f| ForeignJson {
                 origin: f.origin(),
                 partial,
@@ -609,6 +617,7 @@ async fn render(
         }
     }
 
+    text.push_str(&machine_lines(&machine, meta.started_unix_ms));
     for pool in &pools {
         text.push_str(&pool_line(pool));
     }
@@ -683,6 +692,116 @@ fn incomplete_line(folded: &Folded, started_ms: u64) -> String {
             "incomplete: the recording passed its {full_cap} size cap: output and log lines \
              were dropped from there\n"
         ),
+    }
+}
+
+/// The machine line, e.g. `machine: 8 CPUs (host), 16 GiB RAM (host); CPU
+/// busy 42% mean, 97% peak; memory used 12 GiB peak (75% of RAM); heph
+/// resident 210 MiB peak; waiting: admission 1.2s (0.8s busy, 0.4s spare)`,
+/// then a line per sampler source that stopped. A figure with nothing
+/// behind it is left out; with nothing sampled, the line says why.
+fn machine_lines(m: &MachineSummary, started_ms: u64) -> String {
+    let bytes = hcore::units::human_bytes;
+    let pct = |f: f64| format!("{:.0}%", f * 100.0);
+    let mut limits: Vec<String> = Vec::new();
+    match (m.cpu_limit, m.cpu_limit_source, m.cpus) {
+        (Some(limit), Some(LimitSource::Quota), cpus) => limits.push(format!(
+            "{} CPUs (quota{})",
+            cpu_amount(limit),
+            cpus.map(|n| format!(", of {n}")).unwrap_or_default()
+        )),
+        (_, _, Some(n)) => limits.push(format!("{n} CPU{} (host)", if n == 1 { "" } else { "s" })),
+        (Some(limit), _, None) => limits.push(format!("{} CPUs (host)", cpu_amount(limit))),
+        (None, _, None) => {}
+    }
+    if let Some(ram) = m.memory_limit_bytes {
+        limits.push(format!("{} RAM (host)", bytes(ram)));
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if !limits.is_empty() {
+        parts.push(limits.join(", "));
+    }
+    match m.status {
+        MachineStatus::None => parts.push(match m.reason {
+            Some(NoneReason::OlderDerivation) => "none: recorded before machine stats".to_owned(),
+            _ if !limits.is_empty() => "no samples (shorter than one tick)".to_owned(),
+            _ => {
+                "none: no samples (shorter than one tick, or the sampler did not start)".to_owned()
+            }
+        }),
+        MachineStatus::Failed => parts.push("no samples: the sampler's sources stopped".to_owned()),
+        MachineStatus::Sampled | MachineStatus::Partial => {
+            let busy: Vec<String> = [(m.cpu_busy_mean, "mean"), (m.cpu_busy_peak, "peak")]
+                .into_iter()
+                .filter_map(|(v, what)| v.map(|v| format!("{} {what}", pct(v))))
+                .collect();
+            if !busy.is_empty() {
+                parts.push(format!("CPU busy {}", busy.join(", ")));
+            }
+            if let Some(used) = m.memory_used_peak_bytes {
+                let share = m
+                    .memory_limit_bytes
+                    .filter(|&l| l > 0)
+                    .map(|l| format!(" ({} of RAM)", pct(used as f64 / l as f64)))
+                    .unwrap_or_default();
+                parts.push(format!("memory used {} peak{share}", bytes(used)));
+            }
+            if let Some(resident) = m.heph_resident_peak_bytes {
+                parts.push(format!("heph resident {} peak", bytes(resident)));
+            }
+        }
+    }
+    if !m.waiting.by_phase.is_empty() {
+        let phases: Vec<String> = m
+            .waiting
+            .by_phase
+            .iter()
+            .map(|(phase, split)| format!("{} {}", escape(phase), split_text(split)))
+            .collect();
+        parts.push(format!("waiting: {}", phases.join(", ")));
+    }
+    let mut out = format!("machine: {}\n", parts.join("; "));
+    for f in &m.sources_failed {
+        out.push_str(&format!(
+            "the sampler stopped reading {} {} into the run: {}\n",
+            escape(&f.source),
+            ago(f.at_unix_us / 1_000, started_ms),
+            escape(&f.error)
+        ));
+    }
+    out
+}
+
+/// `1.2s (0.8s busy, 0.4s spare)`: a phase's waiting time and the parts of
+/// it that are not 0.
+fn split_text(s: &Split) -> String {
+    let parts: Vec<String> = [
+        (s.busy_us, "busy"),
+        (s.spare_us, "spare"),
+        (s.unknown_us, "unknown"),
+    ]
+    .into_iter()
+    .filter(|&(us, _)| us > 0)
+    .map(|(us, what)| format!("{} {what}", wait_time(us)))
+    .collect();
+    format!("{} ({})", wait_time(s.total_us()), parts.join(", "))
+}
+
+/// A wait: tenths of a second under a minute, as waits are often short.
+fn wait_time(us: u64) -> String {
+    if us < 60_000_000 {
+        format!("{:.1}s", us as f64 / 1e6)
+    } else {
+        hcore::units::human_duration(std::time::Duration::from_micros(us))
+    }
+}
+
+/// A CPU count that may be fractional (a quota): `2.5`, or `8`.
+fn cpu_amount(v: f64) -> String {
+    if (v - v.round()).abs() < 0.05 {
+        format!("{v:.0}")
+    } else {
+        format!("{v:.1}")
     }
 }
 
