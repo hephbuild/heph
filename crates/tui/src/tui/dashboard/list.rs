@@ -304,7 +304,8 @@ impl Default for ListState {
     fn default() -> Self {
         Self {
             tab: Tab::All,
-            scope: CountScope::Matched,
+            // Every target the run touched; `m` narrows to the matched ones.
+            scope: CountScope::All,
             selected: None,
             offset: 0,
             filter: String::new(),

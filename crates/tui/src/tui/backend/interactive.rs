@@ -809,11 +809,13 @@ pub async fn run<A: App + 'static>(
                         kind: KeyEventKind::Press,
                         ..
                     }))) => view.tab(false),
+                    // `m` narrows the dashboard to the matched targets and
+                    // back; the line has no scope to toggle.
                     Some(Ok(Event::Key(KeyEvent {
-                        code: KeyCode::Char('a'),
+                        code: KeyCode::Char('m'),
                         kind: KeyEventKind::Press,
                         ..
-                    }))) => view.toggle_scope(),
+                    }))) if view.full_screen() => view.toggle_scope(),
                     // `/` opens the addr filter on the Done/Failed tabs (no-op on
                     // the live view). While searching it is captured as input above.
                     Some(Ok(Event::Key(KeyEvent {

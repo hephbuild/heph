@@ -404,10 +404,10 @@ pub trait TUIAppView: Send {
     /// views with a single view.
     fn tab(&mut self, _forward: bool) {}
 
-    /// Toggle the header counters between the matched-target set and every
-    /// observed target (the `a` key). Called from the backend's key handler; the
-    /// repaint happens on the next render tick. No-op by default for views without
-    /// a scope toggle.
+    /// Toggle a full screen's list between every observed target and the
+    /// matched-target set (the `m` key, only while a full screen is up).
+    /// Called from the backend's key handler; the repaint happens on the next
+    /// render tick. No-op by default for views without a scope toggle.
     fn toggle_scope(&mut self) {}
 
     /// Whether the view is showing its main (default) body rather than a tabbed

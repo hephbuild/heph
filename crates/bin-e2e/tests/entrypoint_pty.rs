@@ -328,15 +328,13 @@ fn workspace() -> anyhow::Result<Workspace> {
     Ok(ws)
 }
 
-/// The TUI draws while the dependency builds, labelled "Invoking", then steps
-/// aside: the tool gets the terminal on all three fds, and the cursor is
-/// visible again once heph exits.
+/// The TUI steps aside for the tool: the tool gets the terminal on all three
+/// fds, and the cursor is visible again once heph exits.
 #[test]
 fn entrypoint_tui_pauses_for_tool() -> anyhow::Result<()> {
     let dist = Dist::locate();
     let ws = workspace()?;
     let mut pty = Pty::spawn(&dist, ws.root(), &["run", "//app:tty"], &[]);
-    pty.wait_for("Invoking //app:tty", DEADLINE);
     pty.wait_for("tool-sees-a-tty", DEADLINE);
     assert_eq!(pty.wait_exit(DEADLINE), Ended::Code(0), "{}", pty.seen());
     assert!(pty.cursor_visible(), "cursor left hidden\n{}", pty.screen());

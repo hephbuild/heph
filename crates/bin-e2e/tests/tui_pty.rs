@@ -1817,9 +1817,8 @@ fn wheel_scrolls_the_view() {
         Step::Until("the line", on_line),
         Step::Keys(TAB),
         Step::Until("the dashboard, mouse captured", dashboard_captured),
-        // `a`: every target, not only the one matched, so the list is
-        // taller than the window.
-        Step::Keys(b"a"),
+        // The dashboard lists every target, not only the one matched, so
+        // the list is taller than the window.
         Step::Until("a list taller than the window", |s| {
             rows_of(s).any(|r| r.contains(" of ") && r.trim_end().ends_with(" ↓"))
         }),
