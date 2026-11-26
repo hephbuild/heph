@@ -1618,3 +1618,58 @@ pub fn write_bytes_atomically(dir: &Path, name: &str, bytes: &[u8]) -> io::Resul
     tmp.persist(dir.join(name)).map_err(|e| e.error)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod anchor_tests {
+    use super::*;
+
+    /// A reading is stamped at the anchor's wall-clock time plus its
+    /// monotonic offset from the anchor's instant, whatever the wall clock
+    /// does meanwhile; an instant before the anchor saturates to it, and an
+    /// offset past `u64` microseconds to `u64::MAX`. The record carries the
+    /// same stamp, in ms, as the sample's `time_unix_us`.
+    #[test]
+    fn anchor_stamps_from_its_monotonic_offset() {
+        let at = Instant::now() + Duration::from_secs(10);
+        let anchor = Anchor {
+            at,
+            unix_us: 1_000_000,
+        };
+        assert_eq!(anchor.unix_us(at), 1_000_000);
+        assert_eq!(anchor.unix_us(at + Duration::from_micros(1_500)), 1_001_500);
+        assert_eq!(
+            anchor.unix_us(at + Duration::from_secs(3_600)),
+            3_601_000_000
+        );
+        // Before the anchor: no reading is stamped earlier than the anchor.
+        let before = at
+            .checked_sub(Duration::from_secs(5))
+            .expect("at is now + 10 s");
+        assert_eq!(anchor.unix_us(before), 1_000_000);
+        let late = Anchor {
+            at,
+            unix_us: u64::MAX - 10,
+        };
+        assert_eq!(late.unix_us(at + Duration::from_secs(1)), u64::MAX);
+
+        let sample = sampler::Sample {
+            at: at + Duration::from_millis(2_500),
+            interval: Duration::from_secs(1),
+            cpu_busy: Some(0.5),
+            memory_used: None,
+            process_cpu: None,
+            process_resident: None,
+            failed: sampler::Failures::default(),
+            dropped: 0,
+        };
+        let rec = anchor.record(&Reading::Sample(sample));
+        assert_eq!(rec.at_unix_ms, 3_500);
+        match rec.session {
+            Some(SessionRecordKind::MachineSample(s)) => {
+                assert_eq!(s.time_unix_us, 3_500_000);
+                assert_eq!(s.interval_us, 1_000_000);
+            }
+            other => panic!("not a sample: {other:?}"),
+        }
+    }
+}
