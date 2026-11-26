@@ -1756,7 +1756,10 @@ fn sandbox_pool_ws(slots: usize) -> anyhow::Result<htestkit::Workspace> {
     })?;
     let engine = Arc::new(engine);
     engine.install_exec_runner_host();
-    Ok(htestkit::Workspace { dir, engine })
+    Ok(htestkit::Workspace {
+        dir: dir.into(),
+        engine,
+    })
 }
 
 /// How many runs are queued for admission (cpu or a `sandbox` slot) right

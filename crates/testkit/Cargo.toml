@@ -11,5 +11,5 @@ workspace = true
 # Register an exec runner in a harness workspace, as a cdylib does via NamedRunner.
 hexecrunner = { package = "execrunner", path = "../execrunner" }
 heph = { path = "../.." }
+hcore = { package = "core", path = "../core" }
 anyhow = "1"
-tempfile = "3"

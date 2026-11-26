@@ -18,7 +18,9 @@ use heph::pluginstatictarget;
 use htestkit::{Workspace, WorkspaceBuilder, copy_dir_to_tempdir};
 use plugin_go::plugingo;
 use std::path::PathBuf;
-use tempfile::TempDir;
+// Not `tempfile::TempDir`: a run stages a Go toolchain read-only in the
+// workspace, and tempfile's drop cannot remove it.
+use hcore::fsutil::TempDir;
 
 pub use htestkit::{artifact_bytes, artifact_paths, artifact_string};
 

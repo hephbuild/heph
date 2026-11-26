@@ -153,7 +153,7 @@ fn write_fixture(dir: &std::path::Path) -> anyhow::Result<()> {
 async fn host_toolchain_under_a_devenv_runner_uses_the_devenvs_go() -> anyhow::Result<()> {
     skip_unless_opted_in!();
 
-    let dir = tempfile::tempdir()?;
+    let dir = hcore::fsutil::tempdir()?;
     write_fixture(dir.path())?;
 
     // Deliberately not a skip. Past the opt-in gate, an environment that will

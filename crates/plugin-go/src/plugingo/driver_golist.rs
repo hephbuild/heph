@@ -894,8 +894,8 @@ mod tests {
     mod has_go_file {
         use super::super::has_go_file;
 
-        fn dir_with(names: &[&str]) -> tempfile::TempDir {
-            let d = tempfile::tempdir().expect("tempdir");
+        fn dir_with(names: &[&str]) -> hcore::fsutil::TempDir {
+            let d = hcore::fsutil::tempdir().expect("tempdir");
             for n in names {
                 std::fs::write(d.path().join(n), b"").expect("write");
             }
@@ -947,7 +947,7 @@ mod tests {
 
         #[test]
         fn a_directory_named_like_a_source_does_not_count() {
-            let d = tempfile::tempdir().expect("tempdir");
+            let d = hcore::fsutil::tempdir().expect("tempdir");
             std::fs::create_dir(d.path().join("weird.go")).expect("mkdir");
             assert!(
                 !has_go_file(d.path()).expect("scan"),
@@ -957,7 +957,7 @@ mod tests {
 
         #[test]
         fn a_subdirectorys_sources_do_not_count() {
-            let d = tempfile::tempdir().expect("tempdir");
+            let d = hcore::fsutil::tempdir().expect("tempdir");
             std::fs::create_dir(d.path().join("sub")).expect("mkdir");
             std::fs::write(d.path().join("sub").join("lib.go"), b"").expect("write");
             assert!(
@@ -1224,7 +1224,7 @@ mod tests {
             // `go list`'s outputs are the stub's to write, and it writes none.
             def.outputs.clear();
 
-            let home = tempfile::tempdir().expect("home");
+            let home = hcore::fsutil::tempdir().expect("home");
             let stage = home.path().join("stage");
             let sandbox = home.path().join("sandbox/mylib/__target__golist");
             let goroot = crate::plugingo::toolchain::staged_goroot(version);
@@ -1339,7 +1339,7 @@ mod tests {
                 .clone();
             def.outputs.clear();
 
-            let home = tempfile::tempdir().expect("home");
+            let home = hcore::fsutil::tempdir().expect("home");
             let sandbox = home.path().join("sandbox/mylib/__target__golist");
             let goroot = crate::plugingo::toolchain::staged_goroot(version);
             let os = ManagedDriverOs {

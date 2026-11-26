@@ -1200,7 +1200,7 @@ pub(crate) mod tests {
 
     /// Tar content with the given hashout: `(path, body, executable)` per file.
     pub(crate) fn content(hash: &str, files: &[(&str, &str, bool)]) -> Arc<dyn Content> {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = hcore::fsutil::tempdir().expect("tempdir");
         let mut packer = TarPacker::new();
         for (rel, body, x) in files {
             if *x {
@@ -1231,7 +1231,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn stages_once_and_links_into_two_sandboxes() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = hcore::fsutil::tempdir().expect("tempdir");
         let stage = tmp.path().join("stage");
         let link_a = tmp.path().join("a");
         let link_b = tmp.path().join("b");
@@ -1275,7 +1275,7 @@ pub(crate) mod tests {
         // Removing the sandbox must succeed (unlink needs write on the sandbox
         // dir, not on the read-only inode) and must NOT destroy the staged copy
         // (its inode survives via the remaining stage-side link).
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = hcore::fsutil::tempdir().expect("tempdir");
         let stage = tmp.path().join("stage");
         let sandbox = tmp.path().join("sandbox/ws");
         let c = content("rm1", &[("d/f.txt", "x", true)]); // +x → 0o555 staged
@@ -1296,7 +1296,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn staged_tree_is_read_only() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = hcore::fsutil::tempdir().expect("tempdir");
         let stage = tmp.path().join("stage");
         let link = tmp.path().join("ws");
         let c = content("cafe", &[("d/f.txt", "x", false)]);
@@ -1320,7 +1320,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn executable_stays_runnable_through_link() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = hcore::fsutil::tempdir().expect("tempdir");
         let stage = tmp.path().join("stage");
         let link = tmp.path().join("ws");
         let c = content("e0", &[("run.sh", "#!/bin/sh\necho ok\n", true)]);
@@ -1344,7 +1344,7 @@ pub(crate) mod tests {
         // recreates a staged symlink as a symlink preserving its target. (The
         // unfiltered path instead symlinks whole subtrees — see
         // `unfiltered_input_is_directory_symlinked`.)
-        let src = tempfile::tempdir().expect("src");
+        let src = hcore::fsutil::tempdir().expect("src");
         std::fs::write(src.path().join("target.txt"), b"hi").expect("write");
         symlink("target.txt", src.path().join("link.txt")).expect("symlink");
         let mut packer = TarPacker::new();
@@ -1363,7 +1363,7 @@ pub(crate) mod tests {
             hash: "sym1".to_string(),
         });
 
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = hcore::fsutil::tempdir().expect("tempdir");
         let stage = tmp.path().join("stage");
         let link = tmp.path().join("ws");
         let keep = ["target.txt".to_string(), "link.txt".to_string()];
@@ -1386,7 +1386,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn filters_restrict_linked_files() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = hcore::fsutil::tempdir().expect("tempdir");
         let stage = tmp.path().join("stage");
         let link = tmp.path().join("ws");
         let c = content("f1", &[("a.txt", "a", false), ("b.txt", "b", false)]);
@@ -1412,7 +1412,7 @@ pub(crate) mod tests {
         // An unfiltered read-only tree is exposed by symlinking its top-level
         // subtree (O(depth)) rather than hardlinking every file. The Go SDK is
         // the real-world case: ~11k files behind one symlink.
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = hcore::fsutil::tempdir().expect("tempdir");
         let stage = tmp.path().join("stage");
         let link = tmp.path().join("ws");
         let c = content(
@@ -1460,7 +1460,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn per_file_input_is_a_regular_file_with_the_staged_bytes_and_mode() {
         use std::os::unix::fs::PermissionsExt as _;
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = hcore::fsutil::tempdir().expect("tempdir");
         let stage = tmp.path().join("stage");
         let link = tmp.path().join("ws");
         let c = content("tool1", &[("tools/bin/node", "NODE", true)]);
@@ -1547,7 +1547,7 @@ pub(crate) mod tests {
     /// (keeping its header): the next consumer places exactly what it names.
     #[tokio::test]
     async fn per_file_consumers_reuse_the_cached_file_list() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = hcore::fsutil::tempdir().expect("tempdir");
         let (files, link1, list1) = stage_two_file_tool(tmp.path(), "ws1").await;
         assert_eq!(
             listed(&list1),
@@ -1582,7 +1582,7 @@ pub(crate) mod tests {
     /// that do not parse — is walked over and replaced, never trusted.
     #[tokio::test]
     async fn an_unusable_cached_file_list_is_walked_over_and_replaced() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = hcore::fsutil::tempdir().expect("tempdir");
         let (files, _, _) = stage_two_file_tool(tmp.path(), "ws0").await;
         let good = std::fs::read(&files).expect("cached list");
 
@@ -1670,7 +1670,7 @@ pub(crate) mod tests {
     /// replaces it rather than writing there.
     #[tokio::test]
     async fn a_reused_list_file_records_every_input_in_order() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = hcore::fsutil::tempdir().expect("tempdir");
         let stage = tmp.path().join("stage");
         let link = tmp.path().join("ws");
         let list = tmp.path().join("input_7.list");
@@ -1746,7 +1746,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn clear_stage_removes_the_cached_file_list() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = hcore::fsutil::tempdir().expect("tempdir");
         let (files, _, _) = stage_two_file_tool(tmp.path(), "ws").await;
         assert!(files.exists());
         let (removed, _) = clear_stage(&tmp.path().join("stage"));
@@ -1759,7 +1759,7 @@ pub(crate) mod tests {
         // `per_file` (exec tools) must hardlink each file and record every file
         // in the list — the consumer flattens tool files into a bin/ dir by
         // basename, so a single subtree-root symlink (the default) is unusable.
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = hcore::fsutil::tempdir().expect("tempdir");
         let stage = tmp.path().join("stage");
         let link = tmp.path().join("ws");
         let list = tmp.path().join("tool.list");
@@ -1806,7 +1806,7 @@ pub(crate) mod tests {
         // Several inputs in one sandbox can resolve to the same stage entry
         // (e.g. multiple `gosdk` deps → one SDK). Re-linking the same content
         // into the same root must be a no-op, not a collision error.
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = hcore::fsutil::tempdir().expect("tempdir");
         let stage = tmp.path().join("stage");
         let link = tmp.path().join("ws");
         // `goroot` branches (bin + pkg), so it is the content root and is
@@ -1842,7 +1842,7 @@ pub(crate) mod tests {
         // @heph would make the consumer's pkg dir fall inside the read-only
         // stage. The single-child chain must stay real dirs so the sibling path
         // is creatable.
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = hcore::fsutil::tempdir().expect("tempdir");
         let stage = tmp.path().join("stage");
         let link = tmp.path().join("ws");
         let c = content(
@@ -1883,7 +1883,7 @@ pub(crate) mod tests {
     async fn symlink_descends_into_colliding_prefix() {
         // When an earlier input already placed a real directory at a shared
         // prefix, the symlink path descends so neither input is shadowed.
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = hcore::fsutil::tempdir().expect("tempdir");
         let stage = tmp.path().join("stage");
         let link = tmp.path().join("ws");
         // Pre-existing content from a notional earlier input.
@@ -1921,7 +1921,7 @@ pub(crate) mod tests {
         // symlinks `tools/heph/bin` whole; the second must explode that symlink
         // into a real dir and merge both subtrees instead of bailing with a
         // collision.
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = hcore::fsutil::tempdir().expect("tempdir");
         let stage = tmp.path().join("stage");
         let link = tmp.path().join("ws");
 
@@ -1967,7 +1967,7 @@ pub(crate) mod tests {
     /// read-only stage entry the symlink points at.
     #[tokio::test]
     async fn per_file_input_under_a_symlinked_tree_never_writes_through_it() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = hcore::fsutil::tempdir().expect("tempdir");
         let stage = tmp.path().join("stage");
         let link = tmp.path().join("ws");
         let support = content(
@@ -2045,7 +2045,7 @@ pub(crate) mod tests {
         // no-op, not a collision. (One side is placed as a real file by the
         // filtered hardlink path; the other arrives via the unfiltered symlink
         // path — the real-world exec_tools shape.)
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = hcore::fsutil::tempdir().expect("tempdir");
         let stage = tmp.path().join("stage");
         let link = tmp.path().join("ws");
 
@@ -2099,7 +2099,7 @@ pub(crate) mod tests {
         // skipped because identical content is already present must still be
         // recorded in *this* input's list — otherwise a consumer reading the
         // per-input list (e.g. exec tools) sees a short/empty list.
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = hcore::fsutil::tempdir().expect("tempdir");
         let stage = tmp.path().join("stage");
         let link = tmp.path().join("ws");
         let list_b = tmp.path().join("b.list");
@@ -2148,7 +2148,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn two_inputs_with_differing_leaf_file_bail() {
         // Same path, different bytes → a genuine collision that must surface.
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = hcore::fsutil::tempdir().expect("tempdir");
         let stage = tmp.path().join("stage");
         let link = tmp.path().join("ws");
         let a = content("v1", &[("tools/bin/node", "ONE", true)]);
@@ -2170,7 +2170,7 @@ pub(crate) mod tests {
     async fn genuine_file_collision_still_bails() {
         // Exploding symlinked dirs must not mask a real conflict: two inputs
         // claiming the same *file* path with different bytes is an error.
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = hcore::fsutil::tempdir().expect("tempdir");
         let stage = tmp.path().join("stage");
         let link = tmp.path().join("ws");
         let a = content("ca", &[("d/f", "one", false)]);
@@ -2190,7 +2190,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn list_file_records_linked_paths() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = hcore::fsutil::tempdir().expect("tempdir");
         let stage = tmp.path().join("stage");
         let link = tmp.path().join("ws");
         let list = tmp.path().join("input.list");
@@ -2221,7 +2221,7 @@ pub(crate) mod tests {
 
     #[test]
     fn clear_stage_deletes_all_entries() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = hcore::fsutil::tempdir().expect("tempdir");
         let root = tmp.path().join("stage");
         let a = make_stage_entry(&root, "g1", "aaaa");
         let b = make_stage_entry(&root, "g2", "bbbb");
@@ -2240,7 +2240,7 @@ pub(crate) mod tests {
     /// a plain `rm -rf` refuses; the sweep `heph tool gc` runs still removes it.
     #[tokio::test]
     async fn clear_stage_removes_a_read_only_entry() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = hcore::fsutil::tempdir().expect("tempdir");
         let stage = tmp.path().join("stage");
         let c = content("cafe", &[("d/e/f.txt", "x", false)]);
         stage_and_link(
@@ -2268,13 +2268,13 @@ pub(crate) mod tests {
 
     #[test]
     fn clear_stage_missing_root_is_noop() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = hcore::fsutil::tempdir().expect("tempdir");
         assert_eq!(clear_stage(&tmp.path().join("nope")), (0, 0));
     }
 
     #[tokio::test]
     async fn clear_stage_skips_locked_entry() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = hcore::fsutil::tempdir().expect("tempdir");
         let root = tmp.path().join("stage");
         let busy = make_stage_entry(&root, "g", "held");
 
@@ -2290,7 +2290,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn no_content_hash_falls_back_to_copy() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = hcore::fsutil::tempdir().expect("tempdir");
         let stage = tmp.path().join("stage");
         let link = tmp.path().join("ws");
         let c = content("", &[("x.txt", "x", false)]);
@@ -2356,7 +2356,7 @@ pub(crate) mod tests {
             *g = Some(hcore::blocking::in_blocking_job());
         }
 
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = hcore::fsutil::tempdir().expect("tempdir");
         let stage = tmp.path().join("stage");
         let link = tmp.path().join("ws");
         let in_job = Arc::new(std::sync::Mutex::new(None));
@@ -2454,7 +2454,7 @@ pub(crate) mod tests {
         /// lives, and `clear_stage` reclaims the entry only once it drops (N3).
         #[tokio::test]
         async fn stage_link_holds_until_guard_drops() -> anyhow::Result<()> {
-            let tmp = tempfile::tempdir()?;
+            let tmp = hcore::fsutil::tempdir()?;
             let stage = tmp.path().join("stage");
             let c = content("aaa", &[("sdk/bin/go", "go", true)]);
             let hold = link(&c, &stage, &tmp.path().join("a")).await?;
@@ -2483,7 +2483,7 @@ pub(crate) mod tests {
         /// process or another fd, keeps the entry and its `.ready` (R16).
         #[tokio::test]
         async fn clear_stage_skips_held_entry() -> anyhow::Result<()> {
-            let tmp = tempfile::tempdir()?;
+            let tmp = hcore::fsutil::tempdir()?;
             let root = tmp.path().join("stage");
             let entry = make_stage_entry(&root, "g", "h");
             let hold = {
@@ -2504,7 +2504,7 @@ pub(crate) mod tests {
         /// release never deletes it (R16).
         #[tokio::test]
         async fn warm_hold_creates_a_missing_lock_file() -> anyhow::Result<()> {
-            let tmp = tempfile::tempdir()?;
+            let tmp = hcore::fsutil::tempdir()?;
             let stage = tmp.path().join("stage");
             let c = content("fff", &[("sdk/bin/go", "go", true)]);
             let cold = link(&c, &stage, &tmp.path().join("a")).await?;
@@ -2538,7 +2538,7 @@ pub(crate) mod tests {
         /// fails as cancelled, links nothing and holds nothing (R16).
         #[tokio::test]
         async fn cancelled_acquire_holds_nothing() -> anyhow::Result<()> {
-            let tmp = tempfile::tempdir()?;
+            let tmp = hcore::fsutil::tempdir()?;
             let stage = tmp.path().join("stage");
             let c = content("ggg", &[("sdk/bin/go", "go", true)]);
             let group = stage.join(sanitize_component("//sdk:go"));
@@ -2576,7 +2576,7 @@ pub(crate) mod tests {
         /// partial or vanished one (R16, E14).
         #[test]
         fn gc_concurrent_with_build_never_links_partial_tree() -> anyhow::Result<()> {
-            let tmp = tempfile::tempdir()?;
+            let tmp = hcore::fsutil::tempdir()?;
             let stage = tmp.path().join("stage");
             let files: Vec<(String, String, bool)> = (0..64)
                 .map(|i| (format!("sdk/f{i:02}"), format!("body-{i}"), false))
@@ -2717,7 +2717,7 @@ pub(crate) mod tests {
                 }),
             ];
             for (row, interfere) in rows {
-                let tmp = tempfile::tempdir()?;
+                let tmp = hcore::fsutil::tempdir()?;
                 let stage = tmp.path().join("stage");
                 let c = content("bbb", &[("sdk/bin/go", "go", true)]);
                 // Materialized and ready before the hold starts, as a warm call finds it.
@@ -2771,7 +2771,7 @@ pub(crate) mod tests {
         /// leaves an entry that is not ready — never `.ready` over a partial tree.
         #[test]
         fn clear_stage_interrupted_never_looks_ready() {
-            let tmp = tempfile::tempdir().expect("tempdir");
+            let tmp = hcore::fsutil::tempdir().expect("tempdir");
             let root = tmp.path().join("stage");
             let entry = make_stage_entry(&root, "g", "h");
             CLEAR_STEP.with(|s| {
@@ -2798,7 +2798,7 @@ pub(crate) mod tests {
         /// never deadlocks against them.
         #[tokio::test]
         async fn one_entry_held_twice_and_a_sibling_staged() -> anyhow::Result<()> {
-            let tmp = tempfile::tempdir()?;
+            let tmp = hcore::fsutil::tempdir()?;
             let stage = tmp.path().join("stage");
             let sdk = content("ccc", &[("sdk/bin/go", "go", true)]);
             let a = link(&sdk, &stage, &tmp.path().join("a")).await?;

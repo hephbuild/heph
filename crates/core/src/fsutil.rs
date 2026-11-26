@@ -288,6 +288,60 @@ pub fn make_readonly_tree(_root: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// A temporary directory that is removed on drop even when it holds a
+/// read-only tree.
+///
+/// `tempfile::TempDir` removes itself with `std::fs::remove_dir_all`, which
+/// cannot unlink the children of a `0555` directory, and every staged or
+/// cached tree is sealed exactly that way ([`make_readonly_tree`]). Its drop
+/// ignores the error, so a test that staged anything left its whole directory
+/// in `$TMPDIR` for good: 466 of them, a real Go toolchain (~240 MB) in some,
+/// after one day of test runs on one machine. This one removes through
+/// [`remove_dir_all`], which restores the write bits and retries, and logs a
+/// removal that still fails instead of dropping it.
+///
+/// Use it, through [`tempdir`], for any directory an engine, a stage or a
+/// cache writes into.
+#[derive(Debug)]
+pub struct TempDir {
+    path: std::path::PathBuf,
+}
+
+/// Create a [`TempDir`] in the system temp directory.
+pub fn tempdir() -> io::Result<TempDir> {
+    tempfile::tempdir().map(TempDir::from)
+}
+
+impl TempDir {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl From<tempfile::TempDir> for TempDir {
+    /// Takes over removal from `dir`, whose own drop could not do it.
+    fn from(dir: tempfile::TempDir) -> Self {
+        Self { path: dir.keep() }
+    }
+}
+
+impl AsRef<Path> for TempDir {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        match remove_dir_all(&self.path) {
+            Err(err) if err.kind() != io::ErrorKind::NotFound => {
+                tracing::warn!(path = %self.path.display(), error = %err, "removing temp dir");
+            }
+            _ => {}
+        }
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -326,6 +380,47 @@ mod tests {
             Path::new("/somewhere/else")
         );
         assert!(!dst.join("sock").exists(), "a socket is skipped");
+    }
+
+    /// A dir holding a tree sealed by [`make_readonly_tree`], the way a stage
+    /// leaves one, and the path that must be gone once the dir is dropped.
+    fn sealed_tree_in(dir: &Path) -> std::path::PathBuf {
+        let tree = dir.join("stage/__pkg_t/hash/sdk/bin");
+        fs::create_dir_all(&tree).expect("mkdir");
+        fs::write(tree.join("go"), b"x").expect("write");
+        make_readonly_tree(&dir.join("stage/__pkg_t")).expect("seal");
+        dir.to_path_buf()
+    }
+
+    /// The bug [`TempDir`] exists for: `tempfile`'s own drop leaves a sealed
+    /// tree, and everything around it, behind. If this starts failing,
+    /// `tempfile` learned to remove read-only trees and [`TempDir`] can go.
+    #[test]
+    fn tempfile_tempdir_leaks_a_sealed_tree() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = sealed_tree_in(dir.path());
+        drop(dir);
+        assert!(path.exists(), "tempfile removed a read-only tree");
+        make_readwrite_tree(&path);
+        fs::remove_dir_all(&path).expect("clean up the leak this test made");
+    }
+
+    #[test]
+    fn tempdir_removes_a_sealed_tree() {
+        let dir = tempdir().expect("tempdir");
+        let path = sealed_tree_in(dir.path());
+        drop(dir);
+        assert!(!path.exists(), "{} left behind", path.display());
+    }
+
+    /// The conversion takes removal over from `tempfile`, rather than both
+    /// trying it or neither.
+    #[test]
+    fn a_converted_tempfile_dir_is_removed_with_its_sealed_tree() {
+        let dir = TempDir::from(tempfile::tempdir().expect("tempdir"));
+        let path = sealed_tree_in(dir.path());
+        drop(dir);
+        assert!(!path.exists(), "{} left behind", path.display());
     }
 
     fn write_script(path: &Path) -> fs::File {

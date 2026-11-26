@@ -67,6 +67,60 @@ for a live TUI, `kache explain <crate>` to explain a miss, `kache key explain` /
 for a real miss-then-hit) when something looks wrong. `KACHE_DISABLED=1` bypasses
 it entirely.
 
+### Out of disk
+
+`No space left on device` / `os error 28` (a plugingo-e2e Go download is often
+the first to hit it) means the disk is full, not that the code regressed.
+Free space, then re-run.
+
+Where the space goes, measured on 2026-11-25 with 8 worktrees building at once:
+- **Each worktree's `target/`: 12–25 GB that is its own, about 106 GB in all.**
+  The 5–17 GB of incremental state per worktree is the largest part. The rest
+  is the same crate built many times over: `cargo test -p A -p B` resolves
+  features differently from another `-p` set, so each set builds its own copy
+  of every shared workspace crate (21 of `engine` in one tree).
+- **kache's store: about 10 GB, under 1 GB of it its own.** The rest is shared
+  with `target/` dirs as reflinks.
+- **Leaked test tempdirs in `$TMPDIR`**, if a test used `tempfile::tempdir()` where
+  a run staged read-only trees (see `.claude/testing.md`).
+
+**Measure before deleting.** `du` counts every reflinked file at full size, so it
+overstates a `target/` and kache's store. `kache clean --dry-run` lists every
+`target/` kache tracks with what removing it would really free.
+
+In this order, each only as far as needed:
+
+1. **Leaked test tempdirs.** Skip any touched in the last 3 hours, which a
+   running test may own. `chmod` first: a read-only tree is why they leaked.
+   ```bash
+   T=$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || echo "${TMPDIR:-/tmp}")
+   find "$T" -mindepth 1 -maxdepth 1 -type d -name '.tmp*' | while read -r d; do
+     recent=$(find "$d" -mmin -180 -print -quit) || continue
+     [ -z "$recent" ] && chmod -R u+w "$d" && rm -rf "$d"
+   done
+   ```
+   Keep the `|| continue`: an age test `find` rejects prints nothing, and
+   nothing reads as "old". `-newermt '-3 hours'` is GNU-only, and an agent's
+   shell may run `find` as `bfs`, which rejects it. With that flag the loop
+   once deleted every tempdir, live ones included.
+2. **The `target/` of a worktree nobody is using**: `kache clean <worktree>`.
+   First check that no session is working in it. `orca worktree list` lists the
+   worktrees. `lsof +D <worktree>` showing a shell, `gh run watch` or
+   rust-analyzer means someone is using it.
+3. **Agent worktrees under `<worktree>/.claude/worktrees/`**, which orca does not
+   track. Only one whose branch is pushed (`git rev-list --count @{u}..HEAD` is
+   0), whose `git status` is clean and that has no live process: `git worktree
+   remove <path>`.
+4. **kache's store** keeps itself under its limit and frees space when the disk
+   runs low, but it holds little of its own. `kache clean --cache` empties it
+   and costs a cold build in every worktree; ask the user first.
+
+Never delete:
+- another session's active worktree, or its `target/` mid-build;
+- anything under `<home>/codegen/` (see "Codegen index": losing the index
+  changes answers);
+- `~/.heph/sessions/` of a live run.
+
 ## Commands
 
 ```bash
