@@ -1,7 +1,7 @@
 //! The sampler: its parsers and formulas on fixtures (every host), the host's
 //! own sources, and the thread under an injected clock.
 
-use super::mach::{MachCpu, MachVm, mach_busy, used_mach};
+use super::mach::{MachCpu, MachVm, mach_busy, mach_result, used_mach};
 use super::procfs::*;
 use super::*;
 use crate::tui::session::recorder;
@@ -273,6 +273,26 @@ fn sampler_parses_memory_fixtures() {
         ..MachVm::default()
     };
     assert_eq!(used_mach(odd, 4096), 0);
+
+    // A Mach count is what the kernel wrote, at most the buffer handed in:
+    // a kernel older than libc's struct writes fewer units (40 of 56 seen on
+    // a CI runner), which is fine while it covers every field read.
+    const W: &str = "host_statistics64(HOST_VM_INFO64)";
+    assert_eq!(mach_result(W, 0, 40, 56, 36), Ok(()));
+    assert_eq!(mach_result(W, 0, 56, 56, 36), Ok(()));
+    assert_eq!(mach_result(W, 0, 36, 56, 36), Ok(()));
+    assert_eq!(
+        mach_result(W, 0, 35, 56, 36),
+        Err(SourceError::new(W, ErrorCode::Count(35)))
+    );
+    assert_eq!(
+        mach_result(W, 0, 57, 56, 36),
+        Err(SourceError::new(W, ErrorCode::Count(57)))
+    );
+    assert_eq!(
+        mach_result(W, 5, 56, 56, 36),
+        Err(SourceError::new(W, ErrorCode::Kern(5)))
+    );
 
     // Linux resident: statm's second field × the page size, never 4096 assumed.
     for page in [4096, 16384, 65536] {

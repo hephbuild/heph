@@ -113,8 +113,8 @@ pub enum ErrorCode {
     Io(io::ErrorKind),
     /// A Mach call's `kern_return_t`.
     Kern(i32),
-    /// A Mach call or `sysctl` returned this many units, not the size of the
-    /// struct it was handed.
+    /// A Mach call or `sysctl` returned this many units: fewer than the
+    /// fields read, or more than the buffer it was handed.
     Count(u32),
     /// The source's text was not in the expected format.
     Malformed,

@@ -2,6 +2,8 @@
 //! formulas are compiled on every host under `cfg(test)`, so their fixtures
 //! run everywhere; the FFI only on macOS.
 
+use super::{ErrorCode, SourceError};
+
 /// `HOST_CPU_LOAD_INFO`'s ticks, 32-bit and wrapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct MachCpu {
@@ -39,13 +41,41 @@ pub(crate) fn used_mach(vm: MachVm, page_size: u64) -> u64 {
     pages.saturating_mul(page_size)
 }
 
+/// A Mach info call's result: `KERN_SUCCESS` (0), and a count that covers
+/// the fields read without passing the buffer.
+///
+/// `passed` is the buffer's size in `integer_t`/`natural_t` units, handed in
+/// through the count argument; on return the count is how many units the
+/// kernel wrote. A kernel whose struct is older than libc's writes fewer
+/// (xnu fills a flavor's revision up to what the caller's count allows and
+/// reports that revision's count: `HOST_VM_INFO64` is 38 or 40 units on
+/// kernels before libc's tag-storage fields), so equality with libc's count
+/// is the wrong test. `needed` is the units up to the end of the last field
+/// read; the rest of the buffer stays as it was handed in.
+pub(crate) fn mach_result(
+    what: &'static str,
+    kr: i32,
+    count: u32,
+    passed: u32,
+    needed: u32,
+) -> Result<(), SourceError> {
+    if kr != 0 {
+        return Err(SourceError::new(what, ErrorCode::Kern(kr)));
+    }
+    if count < needed || count > passed {
+        return Err(SourceError::new(what, ErrorCode::Count(count)));
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
 pub(crate) use ffi::host_sources;
 
 #[cfg(target_os = "macos")]
 mod ffi {
     use super::super::{ErrorCode, MachineInfo, SourceError, Sources, cpu_count, cpu_limit};
-    use super::{MachCpu, MachVm, mach_busy, used_mach};
+    use super::{MachCpu, MachVm, mach_busy, mach_result, used_mach};
+    use std::mem::offset_of;
     use std::time::Duration;
 
     // The order `cpu` destructures `cpu_ticks` in.
@@ -62,22 +92,28 @@ mod ffi {
         MachSources::open()
     }
 
-    /// A Mach call's result: `KERN_SUCCESS`, and the count it wrote equal to
-    /// the struct's.
-    fn check(
-        what: &'static str,
-        kr: libc::kern_return_t,
-        count: u32,
-        expected: u32,
-    ) -> Result<(), SourceError> {
-        if kr != libc::KERN_SUCCESS {
-            return Err(SourceError::new(what, ErrorCode::Kern(kr)));
-        }
-        if count != expected {
-            return Err(SourceError::new(what, ErrorCode::Count(count)));
-        }
-        Ok(())
+    const _: () = assert!(libc::KERN_SUCCESS == 0);
+
+    /// The `integer_t` units from a struct's start to the end of a field
+    /// ending `end` bytes in: what a Mach count must cover for it to be read.
+    const fn units_to(end: usize) -> u32 {
+        let units = end.div_ceil(size_of::<libc::integer_t>());
+        assert!(units <= u32::MAX as usize);
+        units as u32
     }
+
+    /// `HOST_VM_INFO64` up to `internal_page_count`, the last field read.
+    const VM_INFO64_NEEDED: u32 = units_to(
+        offset_of!(libc::vm_statistics64, internal_page_count) + size_of::<libc::natural_t>(),
+    );
+    const _: () = assert!(
+        offset_of!(libc::vm_statistics64, wire_count)
+            < offset_of!(libc::vm_statistics64, internal_page_count)
+            && offset_of!(libc::vm_statistics64, purgeable_count)
+                < offset_of!(libc::vm_statistics64, internal_page_count)
+            && offset_of!(libc::vm_statistics64, compressor_page_count)
+                < offset_of!(libc::vm_statistics64, internal_page_count)
+    );
 
     /// Physical RAM.
     fn memsize() -> Result<u64, SourceError> {
@@ -191,7 +227,13 @@ mod ffi {
                     &raw mut count,
                 )
             };
-            check(WHAT, kr, count, libc::HOST_CPU_LOAD_INFO_COUNT)?;
+            mach_result(
+                WHAT,
+                kr,
+                count,
+                libc::HOST_CPU_LOAD_INFO_COUNT,
+                libc::HOST_CPU_LOAD_INFO_COUNT,
+            )?;
             let [user, system, idle, nice] = load.cpu_ticks;
             Ok(MachCpu {
                 user,
@@ -224,7 +266,13 @@ mod ffi {
                     &raw mut count,
                 )
             };
-            check(WHAT, kr, count, libc::HOST_VM_INFO64_COUNT)?;
+            mach_result(
+                WHAT,
+                kr,
+                count,
+                libc::HOST_VM_INFO64_COUNT,
+                VM_INFO64_NEEDED,
+            )?;
             Ok(used_mach(
                 MachVm {
                     internal: vm.internal_page_count,
@@ -260,7 +308,15 @@ mod ffi {
                     &raw mut count,
                 )
             };
-            check(WHAT, kr, count, libc::MACH_TASK_BASIC_INFO_COUNT)?;
+            mach_result(
+                WHAT,
+                kr,
+                count,
+                libc::MACH_TASK_BASIC_INFO_COUNT,
+                units_to(
+                    offset_of!(libc::mach_task_basic_info, resident_size) + size_of::<u64>(),
+                ),
+            )?;
             Ok(info.resident_size)
         }
     }
