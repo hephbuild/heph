@@ -1527,7 +1527,9 @@ nothing runs in the build to produce it.
   (`service.*`, `host.name`, `user.name`, `process.*`) are those of the
   OpenTelemetry semantic conventions v1.27.0, the first release with
   `user.name`. heph does not follow later renames on its own: a rename
-  reaches the export only with a heph release that adopts it.
+  reaches the export only with a heph release that adopts it. Every
+  resource and scope carries that version as its `schemaUrl`,
+  `https://opentelemetry.io/schemas/1.27.0`.
 
 What maps to what:
 
@@ -1538,6 +1540,7 @@ What maps to what:
 | a `span_events` row | an event of its span |
 | a `logs` row | a log record under the session span's ids: its `severity` as `severityText` and `severityNumber`, its body, `seq` as `heph.seq` |
 | `metrics` rows of one name, kind and unit | one metric: `counter` a monotonic cumulative sum from the session's start, `gauge` (and a kind this heph does not know) a gauge; one data point per row |
+| a machine metric with a semantic convention of the same meaning | that convention's name and instrument instead, as in the table under [Machine stats](#machine-stats): `system.cpu.logical.count`, `system.memory.limit` and `process.memory.usage` are up-down counters (a non-monotonic cumulative sum from the session's start), `process.cpu.time` a counter. The rest keep heph's name. |
 
 **Into a collector.** The `otlp_json_file` receiver of
 `opentelemetry-collector-contrib` (alpha for traces, metrics and logs) reads

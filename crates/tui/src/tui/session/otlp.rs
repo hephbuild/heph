@@ -29,7 +29,11 @@
 //!   number, its `seq` as `heph.seq`;
 //! - metric rows of one name, kind and unit are one metric: `counter` a
 //!   monotonic cumulative sum from the session's start, `gauge` (and a kind
-//!   this heph does not know) a gauge.
+//!   this heph does not know) a gauge;
+//! - a machine metric whose meaning matches an OpenTelemetry semantic
+//!   convention is written under that name and instrument
+//!   ([`MACHINE_METRICS`], D27), and every resource and scope carries the
+//!   pinned semconv version as [`SCHEMA_URL`].
 
 use std::io::Write;
 
@@ -49,6 +53,138 @@ use super::query::Explorer;
 
 /// The instrumentation scope every signal is under.
 pub const SCOPE: &str = "heph";
+
+/// The OpenTelemetry semantic-convention version the export's names follow
+/// (D27): the resource attributes and [`MACHINE_METRICS`]' mapping.
+pub const SEMCONV_VERSION: &str = "1.27.0";
+/// [`SEMCONV_VERSION`]'s schema, on every resource and scope written.
+pub const SCHEMA_URL: &str = "https://opentelemetry.io/schemas/1.27.0";
+
+/// An OpenTelemetry instrument, as the export writes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Instrument {
+    Gauge,
+    /// A monotonic cumulative sum from the session's start.
+    Counter,
+    /// A non-monotonic cumulative sum from the session's start.
+    UpDownCounter,
+}
+
+impl Instrument {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Gauge => "gauge",
+            Self::Counter => "counter",
+            Self::UpDownCounter => "updowncounter",
+        }
+    }
+}
+
+/// A machine metric (Design, "Machine stats"): its heph name, kind and unit,
+/// frozen (I9), and the semantic convention it is exported as, if one means
+/// the same.
+#[derive(Debug, Clone, Copy)]
+pub struct MachineMetric {
+    pub name: &'static str,
+    /// The `metrics.kind` heph writes.
+    pub kind: &'static str,
+    pub unit: &'static str,
+    /// The semconv name and instrument the OTLP export writes it as; `None`:
+    /// no convention means the same, so it keeps its heph name.
+    pub otel: Option<(&'static str, Instrument)>,
+}
+
+/// Every machine metric heph writes, and its OTLP mapping (D27), checked
+/// against semantic conventions [`SEMCONV_VERSION`]. `--schema` prints it.
+///
+/// Not mapped, as the meaning differs: `heph.machine.cpu.busy` is the
+/// non-idle share of `cpu.limit` (a quota), where `system.cpu.utilization`
+/// is per `cpu.mode` and of every CPU; `heph.machine.memory.used` is what
+/// cannot be reclaimed, where `system.memory.usage` is by state and its
+/// states sum to the limit; `heph.machine.cpu.limit` has no convention; the
+/// `heph.session.*` summaries are heph's own.
+pub const MACHINE_METRICS: [MachineMetric; 11] = {
+    use super::derive::machine as m;
+    const fn heph(name: &'static str, kind: &'static str, unit: &'static str) -> MachineMetric {
+        MachineMetric {
+            name,
+            kind,
+            unit,
+            otel: None,
+        }
+    }
+    const fn otel(
+        name: &'static str,
+        kind: &'static str,
+        unit: &'static str,
+        to: &'static str,
+        instrument: Instrument,
+    ) -> MachineMetric {
+        MachineMetric {
+            name,
+            kind,
+            unit,
+            otel: Some((to, instrument)),
+        }
+    }
+    [
+        otel(
+            m::CPU_COUNT,
+            "gauge",
+            "{cpu}",
+            "system.cpu.logical.count",
+            Instrument::UpDownCounter,
+        ),
+        heph(m::CPU_LIMIT, "gauge", "{cpu}"),
+        heph(m::CPU_BUSY, "gauge", "1"),
+        otel(
+            m::MEMORY_LIMIT,
+            "gauge",
+            "By",
+            "system.memory.limit",
+            Instrument::UpDownCounter,
+        ),
+        heph(m::MEMORY_USED, "gauge", "By"),
+        otel(
+            m::PROCESS_CPU_TIME,
+            "counter",
+            "s",
+            "process.cpu.time",
+            Instrument::Counter,
+        ),
+        otel(
+            m::PROCESS_RESIDENT,
+            "gauge",
+            "By",
+            "process.memory.usage",
+            Instrument::UpDownCounter,
+        ),
+        heph(m::SESSION_BUSY_MEAN, "gauge", "1"),
+        heph(m::SESSION_BUSY_PEAK, "gauge", "1"),
+        heph(m::SESSION_MEMORY_USED_PEAK, "gauge", "By"),
+        heph(m::SESSION_RESIDENT_PEAK, "gauge", "By"),
+    ]
+};
+
+/// The name and instrument rows of `key` are exported as: a machine
+/// metric's semconv mapping when its kind and unit are the ones heph writes
+/// (`Some` name), else its own name (`None`), a `counter` as a counter and
+/// anything else a gauge.
+fn exported((name, kind, unit): &MetricKey) -> (Option<&'static str>, Instrument) {
+    if let Some((to, instrument)) = MACHINE_METRICS
+        .iter()
+        .find(|m| m.name == name && m.kind == kind && m.unit == unit)
+        .and_then(|m| m.otel)
+    {
+        return (Some(to), instrument);
+    }
+    let instrument = if kind == "counter" {
+        Instrument::Counter
+    } else {
+        Instrument::Gauge
+    };
+    (None, instrument)
+}
 
 /// What an export wrote.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -109,8 +245,10 @@ impl Lines<'_> {
                 scope_spans: vec![trace::ScopeSpans {
                     scope: s.scope().into(),
                     spans,
+                    schema_url: SCHEMA_URL.into(),
                     ..Default::default()
                 }],
+                schema_url: SCHEMA_URL.into(),
                 ..Default::default()
             }],
             ..Default::default()
@@ -125,8 +263,10 @@ impl Lines<'_> {
                 scope_logs: vec![logs::ScopeLogs {
                     scope: s.scope().into(),
                     log_records,
+                    schema_url: SCHEMA_URL.into(),
                     ..Default::default()
                 }],
+                schema_url: SCHEMA_URL.into(),
                 ..Default::default()
             }],
             ..Default::default()
@@ -141,8 +281,10 @@ impl Lines<'_> {
                 scope_metrics: vec![metrics::ScopeMetrics {
                     scope: s.scope().into(),
                     metrics: ms,
+                    schema_url: SCHEMA_URL.into(),
                     ..Default::default()
                 }],
+                schema_url: SCHEMA_URL.into(),
                 ..Default::default()
             }],
             ..Default::default()
@@ -536,24 +678,27 @@ fn write_logs(
 /// A metric's name, kind and unit: rows of one key are one metric.
 type MetricKey = (String, String, String);
 
-/// Rows of one key as one metric.
-fn metric(
-    (name, kind, unit): MetricKey,
-    data_points: Vec<metrics::NumberDataPoint>,
-) -> metrics::Metric {
-    let data = match kind.as_str() {
-        "counter" => metrics::metric::Data::Sum(Box::new(metrics::Sum {
-            data_points,
-            aggregation_temporality:
-                metrics::AggregationTemporality::AGGREGATION_TEMPORALITY_CUMULATIVE.into(),
-            is_monotonic: true,
-            ..Default::default()
-        })),
-        _ => metrics::metric::Data::Gauge(Box::new(metrics::Gauge {
+/// Rows of one key as one metric, under the name and instrument it is
+/// [`exported`] as.
+fn metric(key: MetricKey, data_points: Vec<metrics::NumberDataPoint>) -> metrics::Metric {
+    let (mapped, instrument) = exported(&key);
+    let data = match instrument {
+        Instrument::Gauge => metrics::metric::Data::Gauge(Box::new(metrics::Gauge {
             data_points,
             ..Default::default()
         })),
+        Instrument::Counter | Instrument::UpDownCounter => {
+            metrics::metric::Data::Sum(Box::new(metrics::Sum {
+                data_points,
+                aggregation_temporality:
+                    metrics::AggregationTemporality::AGGREGATION_TEMPORALITY_CUMULATIVE.into(),
+                is_monotonic: instrument == Instrument::Counter,
+                ..Default::default()
+            }))
+        }
     };
+    let (name, _, unit) = key;
+    let name = mapped.map_or(name, str::to_owned);
     metrics::Metric {
         name,
         unit,
@@ -581,18 +726,22 @@ fn write_metrics(
     let mut line_metrics = Vec::new();
     let mut in_line = 0;
     let mut current: Option<(MetricKey, Vec<metrics::NumberDataPoint>)> = None;
+    let mut is_sum = false;
     while let Some(r) = rows.next().context("reading the metrics")? {
         let get = |i| -> anyhow::Result<String> {
             Ok(r.get::<_, Option<String>>(i)
                 .context("reading a metric")?
                 .unwrap_or_default())
         };
-        let (name, kind, unit) = (get(0)?, get(1)?, get(2)?);
+        let key = (get(0)?, get(1)?, get(2)?);
         let attributes: Option<String> = r.get(5).context("reading a metric")?;
-        let counter = kind == "counter";
+        // A sum's points start at the session; looked up once a metric.
+        if current.as_ref().is_none_or(|(k, _)| *k != key) {
+            is_sum = exported(&key).1 != Instrument::Gauge;
+        }
         let point = metrics::NumberDataPoint {
             attributes: attrs(attributes.as_deref()).context("reading a metric's attributes")?,
-            start_time_unix_nano: if counter { s.started_ns } else { 0 },
+            start_time_unix_nano: if is_sum { s.started_ns } else { 0 },
             time_unix_nano: nanos(
                 r.get::<_, Option<i64>>(3)
                     .context("reading a metric")?
@@ -604,7 +753,6 @@ fn write_metrics(
                 .map(metrics::number_data_point::Value::AsDouble),
             ..Default::default()
         };
-        let key = (name, kind, unit);
         match &mut current {
             Some((k, points)) if *k == key => points.push(point),
             _ => {

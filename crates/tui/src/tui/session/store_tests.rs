@@ -1962,7 +1962,7 @@ fn execute_start(
 
 /// `records` written and finished at `ended_ms` in a fresh recording; the
 /// writer's connection, to query the explorer rows.
-fn derived(
+pub(super) fn derived(
     id: SessionId,
     records: &[SessionRecord],
     ended_ms: u64,
