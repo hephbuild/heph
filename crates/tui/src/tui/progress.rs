@@ -2879,6 +2879,8 @@ impl CIAppView for CiProgressView {
                 error: Some(error),
                 upstream_of: None,
                 exit_status,
+                // `exit_status` already names it.
+                exit_code: _,
                 log_tail,
                 timed_out,
                 cancelled: false,
@@ -3169,6 +3171,7 @@ mod tests {
             error,
             upstream_of: None,
             exit_status: None,
+            exit_code: None,
             log_tail: None,
             timed_out: None,
         }
@@ -3827,7 +3830,10 @@ mod tests {
             ));
             s.apply(&ev(
                 2,
-                BuildEventKind::RemoteCacheHit { addr: addr.clone() },
+                BuildEventKind::RemoteCacheHit {
+                    addr: addr.clone(),
+                    cache: None,
+                },
             ));
             s.apply(&ev(2, remote_cache_hit(&addr)));
         }
@@ -4454,6 +4460,7 @@ mod tests {
             error: Some(format!("{addr}: exit status: 1")),
             upstream_of: upstream_of.map(Into::into),
             exit_status: Some("exit status: 1".into()),
+            exit_code: None,
             log_tail: tail.map(|text| hcore::events::LogTailData {
                 text: text.into(),
                 start_line: 1,
@@ -4505,6 +4512,7 @@ mod tests {
             error: Some("//a:b: exit status: 1".into()),
             upstream_of: None,
             exit_status: Some("exit status: 1".into()),
+            exit_code: None,
             log_tail: Some(hcore::events::LogTailData {
                 text: TAIL.into(),
                 start_line: 1,
@@ -4568,6 +4576,7 @@ mod tests {
             error: Some("timed out".into()),
             upstream_of: None,
             exit_status: None,
+            exit_code: None,
             log_tail: Some(hcore::events::LogTailData {
                 text: "a\x1b[31mred\x1b[0m\r\nb\x07ell\n10%\r20%\n".into(),
                 start_line: 1,
@@ -4599,6 +4608,7 @@ mod tests {
             error: Some("staging\x1b[2J failed".into()),
             upstream_of: None,
             exit_status: None,
+            exit_code: None,
             log_tail: Some(hcore::events::LogTailData {
                 text: "\n\n".into(),
                 start_line: 1,
@@ -5955,6 +5965,7 @@ mod tests {
                 error: None,
                 upstream_of: None,
                 exit_status: None,
+                exit_code: None,
                 log_tail: None,
                 timed_out: None,
             });

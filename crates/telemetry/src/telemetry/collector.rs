@@ -541,6 +541,7 @@ mod tests {
             error: None,
             upstream_of: None,
             exit_status: None,
+            exit_code: None,
             log_tail: None,
             timed_out: None,
         });
@@ -555,7 +556,10 @@ mod tests {
     fn observe_event_tallies_remote_cache() {
         let c = TelemetryCollector::new();
         let addr = || "//pkg:a".to_string();
-        c.observe_event(&BuildEventKind::RemoteCacheHit { addr: addr() });
+        c.observe_event(&BuildEventKind::RemoteCacheHit {
+            addr: addr(),
+            cache: None,
+        });
         c.observe_event(&BuildEventKind::RemoteCacheMiss { addr: addr() });
         c.observe_event(&BuildEventKind::RemoteCacheMiss { addr: addr() });
         c.observe_event(&BuildEventKind::RemoteCacheWriteStart { addr: addr() });

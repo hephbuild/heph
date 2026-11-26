@@ -12,6 +12,7 @@ pub mod log;
 pub mod progress_app;
 pub mod query;
 pub mod run;
+pub mod run_json;
 pub mod session;
 pub mod tool;
 mod utils;

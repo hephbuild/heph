@@ -1651,6 +1651,11 @@ impl RemoteCacheSet {
         }))
     }
 
+    /// The configured name of the cache `rev` was located on.
+    pub(crate) fn cache_name(&self, rev: &RemoteRevision) -> Option<&str> {
+        self.caches.get(rev.cache_idx).map(|c| c.def.name.as_str())
+    }
+
     /// Whether `rev`'s cache still holds every one of `names` — presence only, no
     /// bytes transferred.
     ///

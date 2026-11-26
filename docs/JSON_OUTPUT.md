@@ -56,6 +56,7 @@ rejects it instead of reading a short list as whole, with or without
 - an error in the middle of the walk;
 - a keep-going walk that left packages it could not evaluate (`query`,
   `inspect labels`, `auth status`, …), the same gaps the text output reports;
+- a `run` that `--fail-fast` stopped before every matched target ended;
 - Ctrl-C (the command's own exit code; 130 only for a `--jq` filter it
   stopped).
 
@@ -151,7 +152,7 @@ the document, inside heph: no `jq` needs to be installed.
 |---|---|
 | the command's own | the document was printed; a command's exit code is the same with or without the flags (`auth status` is non-zero unless every row is `ok`, `tool codegen … --check` exits 1 on findings and still prints its record) |
 | 0 | `--fields help`; a reader closed the pipe; `inspect failure` of a target with no recorded failure, which prints `null` (its text form exits 1, the one command whose code differs) |
-| 2 | a bad `--jq` filter, an unknown `--fields` name, or an output flag on a command without JSON, all before anything runs; a `--jq` filter that failed while it ran |
+| 2 | a bad `--jq` filter, an unknown `--fields` name, or an output flag on a command without JSON (or on a `run` of an entrypoint), all before anything runs; a `--jq` filter that failed while it ran |
 | 130 | Ctrl-C stopped a running `--jq` filter, one that never produces included |
 
 Ctrl-C anywhere else is the command's own cancellation, and keeps the exit
@@ -206,7 +207,7 @@ meant to branch on, which each command's doc names.
 
 | Shape | Commands |
 |---|---|
-| list | `query`; `inspect packages`, `labels`, `hashout`, `deps`, `revdeps`, `path`, `states`, `functions`; `auth status`; `session list`; `tool plugins`, `tool cache measure-latency`, `tool scratch ls`, `push`, `pull` |
+| list | `query`; `run` (below); `inspect packages`, `labels`, `hashout`, `deps`, `revdeps`, `path`, `states`, `functions`; `auth status`; `session list`; `tool plugins`, `tool cache measure-latency`, `tool scratch ls`, `push`, `pull` |
 | record | `version`, `validate`; `inspect hashin`, `outputs`, `failure` (`null` when none); `auth explain`, `auth logout`; `session show`, `session inflight`; `tool gc`, `clean`, `build-fmt`, `resolve-plugins`, `telemetry status`, `coreutils list`, `coreutils which`, `scratch head`, `path`, `rm`; every `tool codegen` command; `tool build-lsp --explain` |
 | always JSON, unstable | `inspect spec`, `inspect def` |
 | always JSON | `tool config-schema` |
@@ -216,13 +217,70 @@ about one command's document: `docs/CODEGEN.md`, `docs/SESSIONS.md`,
 `docs/CREDENTIALS.md`, `docs/FAILURE_OUTPUTS.md`, `docs/TELEMETRY.md`,
 `docs/LSP.md`.
 
+### `heph run`
+
+`heph run --json` prints one entry per matched target, written as each one
+finishes (completion order, not address order). A dependency the selector did
+not match gets no entry.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `addr` | yes | the target's address |
+| `outcome` | yes | `cached`, `ran`, `failed`, `blocked` or `cancelled` |
+| `cache` | yes | `local`, `remote` or `miss`; null when no cache was consulted (`--force`, caching off, or it failed before the lookup) |
+| `remote` | yes | the name of the remote cache a `remote` hit came from |
+| `duration_ms` | yes | from the start of its resolution to its end |
+| `exit_code` | yes | its process's exit code: 0 for `ran`, the code for a `failed` run; null when nothing ran or a signal ended it. Read from the run's structured exit status, never parsed out of the error text |
+| `timed_out` | yes | it failed because its run outlasted its `timeout` |
+| `error` | yes | why it failed, on one line; null on success |
+| `blocked_by` | yes | for `blocked`: the failed dependency at the root of it |
+| `failure` | yes | `{log, out, fixes}`, as `heph inspect failure`; null unless it failed running |
+| `outputs` | no | its output files, the set `--list-out` prints, narrowed by `--output`. Its tier is *free* (no spec, def or hash is added), but selecting it costs what `--list-out` does: a remote hit's outputs are downloaded, which the default fields never do. That is why it is not a default |
+| `hashin` | no (built) | its input hash |
+
+How the outcome is decided:
+
+- `cached`: no process ran; the result came from a cache (`cache` says which).
+- `ran`: it ran and succeeded (`cache: miss`, or null under `--force`). A
+  cache hit whose blobs turned out to be gone is rebuilt, and reads as a miss.
+- `failed`: its own run failed, or resolving it did (parse, hash, sandbox).
+- `blocked`: it did not run because a dependency failed.
+- `cancelled`: Ctrl-C stopped the run while it was pending.
+
+The exit code is the one the run has without `--json`, and so is everything on
+stderr: failure boxes, the skipped-package report. The list is closed only
+when it is whole: every matched target has its entry, the selector walk
+skipped no package, and the run was not cancelled. A failed target does not
+leave it open; `--fail-fast` stopping the walk, a skipped package and Ctrl-C
+do (a cancelled build run exits 1, with or without `--json`). A selector that
+matches nothing prints `[]` and fails as it does without `--json`.
+
+When the list cannot be printed whole for a reason of its own:
+
+- A field that cannot be read for one entry (its `outputs` could not be
+  listed, say) skips that entry and nothing else: the build carries on, the
+  other entries are printed, the list is left without its `]`, and the error
+  is printed after the run's summary. The command fails with it unless the
+  build failed for itself (a failed target, a skipped package), whose exit
+  code it keeps.
+- A reader that closes stdout ends the command with exit 0, as for every
+  command. Any other error writing stdout cancels the build and is printed
+  after the summary; the command exits 1.
+
+`--shell`, `--cat-out`, `--list-out` and `--raw` all want stdout or the
+terminal, so with `--json`, `--fields` or `--jq` they exit 2 at parse time.
+`--copy-out` and `--output` combine with it. An entrypoint
+(`entrypoint = True`) runs a program on your terminal instead of building, so
+it has no entry to report: `heph run <entrypoint> --json` is refused once the
+selector resolves, before anything runs, naming the target. It is a usage
+error, exit 2, like the flags refused at parse time.
+
 ### Commands without JSON
 
 These have no output flags; `--json`, `--fields` or `--jq` on them exits 2.
 
 | Command | Why | Instead |
 |---|---|---|
-| `heph run` | not yet | `heph inspect failure --json <addr>` after a failed run |
 | `heph log` | its output is the log's bytes | `heph inspect failure --json` for the log's path |
 | `heph session attach` | a terminal UI | `heph session show --json` |
 | `heph inspect deps -i` | a terminal UI | `heph inspect deps --json` |

@@ -89,13 +89,6 @@ pub const NO_JSON: &[Exempt] = &[
         refusal: Refusal::BeforeClap,
         reason: "hidden; its stdout is the AWS, GCP, Docker and git credential-helper protocols",
     },
-    // `heph run --json` is the second PR of the machine-readable output
-    // spec. It deletes this entry.
-    Exempt {
-        path: "run",
-        refusal: Refusal::NoFlags,
-        reason: "not yet: `heph run --json` lands on its own",
-    },
 ];
 
 /// Every leaf of `cmd`'s tree, hidden ones included, with its path after the
@@ -506,6 +499,9 @@ mod tests {
             "RemoteView" => Derived(tool::scratch::RemoteView::__OUTPUT_SHAPE),
             "PushOutcome" => Derived(tool::scratch::PushOutcome::__OUTPUT_SHAPE),
             "PullOutcome" => Derived(tool::scratch::PullOutcome::__OUTPUT_SHAPE),
+            "Outcome" => Derived(crate::commands::run_json::Outcome::__OUTPUT_SHAPE),
+            "CacheTier" => Derived(crate::commands::run_json::CacheTier::__OUTPUT_SHAPE),
+            "RunFailure" => Derived(crate::commands::run_json::RunFailure::__OUTPUT_SHAPE),
             _ => return None,
         })
     }

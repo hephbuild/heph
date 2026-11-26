@@ -197,7 +197,9 @@ it would inherit without the flag too; `--raw` also drops the progress, and hold
 on a terminal as well.
 
 With no TUI, an `approval`-gated target in the closure is refused unless you pass
-`--auto-approve`. `run` has no `--json`.
+`--auto-approve`. An entrypoint has no `--json` form: `heph run --json` of
+one is refused before it runs, since its output is the program's (see
+`docs/JSON_OUTPUT.md`).
 
 ### `heph run` of a build target
 

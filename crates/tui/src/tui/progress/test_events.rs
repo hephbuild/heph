@@ -27,6 +27,7 @@ pub(crate) fn end(addr: &str, error: Option<&str>, upstream_of: Option<&str>) ->
         error: error.map(Into::into),
         upstream_of: upstream_of.map(Into::into),
         exit_status: None,
+        exit_code: None,
         log_tail: None,
         timed_out: None,
     }

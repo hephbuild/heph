@@ -39,8 +39,13 @@ pub struct ErrorDetail {
     /// `None`): the result scope fills it from the failure classifier, the
     /// one rule that also decides what the run records as a root.
     pub upstream_of: Option<String>,
-    /// The subprocess's exit status as the OS reported it.
+    /// The subprocess's exit status, spelled by `Exit`'s `Display` whenever
+    /// the driver reported it structured (in-process or across the seam), so
+    /// both spell it alike; else the driver's own text.
     pub exit_status: Option<String>,
+    /// The code the subprocess exited with: `None` for a signal, or when the
+    /// driver reported no structured status.
+    pub exit_code: Option<i32>,
     /// The tail a recorded [`TargetFailure`](hplugin::error::TargetFailure)
     /// on the chain already read.
     pub log_tail: Option<hcore::events::LogTailData>,
@@ -113,8 +118,24 @@ impl ErrorDetail {
         // `ResultEnd` from the `execute` memoizer, so its `ProcessFailed` and
         // the slot `execute` filled sit behind a `SharedAnyhow` a plain chain
         // walk stops at.
-        d.exit_status =
-            hcore::hmemoizer::downcast_chain_ref::<ProcessFailed>(e).map(|p| p.status.clone());
+        // A cdylib driver's failure crosses the seam as `RemoteProcessFailed`,
+        // whose status is structured. A structured status is spelled by
+        // `Exit`'s one `Display` on both paths (std would add a signal's name
+        // and `(core dumped)`, which the wire does not carry); only a driver
+        // that reports none keeps its own text.
+        let local = hcore::hmemoizer::downcast_chain_ref::<ProcessFailed>(e);
+        let exit = local.and_then(|p| p.exit).or_else(|| {
+            hcore::hmemoizer::downcast_chain_ref::<hplugin::error::RemoteProcessFailed>(e)
+                .map(|r| r.exit)
+        });
+        d.exit_status = match exit {
+            Some(x) => Some(x.to_string()),
+            None => local.map(|p| p.status.clone()),
+        };
+        d.exit_code = match exit {
+            Some(hcore::process::Exit::Code(c)) => Some(c),
+            _ => None,
+        };
         if d.log_tail.is_none() {
             d.log = slot.and_then(|s| s.log.clone());
         }

@@ -50,6 +50,20 @@ impl Exit {
     }
 }
 
+/// The one spelling of a status, in std's words for the plain cases
+/// (`exit status: 3`, `signal: 9`): what `ProcessFailed.status` and the
+/// `exit_status` event field say, whichever side of the plugin seam the
+/// process ran on. No signal name and no `(core dumped)`, which a status
+/// rebuilt from the plugin wire does not carry.
+impl std::fmt::Display for Exit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Exit::Code(code) => write!(f, "exit status: {code}"),
+            Exit::Signal(sig) => write!(f, "signal: {sig}"),
+        }
+    }
+}
+
 /// Signals whose default action stops, continues or ignores rather than
 /// terminates: no process dies of one.
 const NON_TERMINATING: &[libc::c_int] = &[

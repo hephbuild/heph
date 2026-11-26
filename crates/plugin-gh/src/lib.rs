@@ -2360,6 +2360,7 @@ mod tests {
                 error: None,
                 upstream_of: None,
                 exit_status: None,
+                exit_code: None,
                 log_tail: None,
             },
         ));
@@ -2534,6 +2535,7 @@ mod tests {
                 error: Some("target failed".into()),
                 upstream_of: None,
                 exit_status: Some("exit status: 1".into()),
+                exit_code: None,
                 log_tail: None,
             },
         ));
@@ -2582,6 +2584,7 @@ mod tests {
                 error: Some("boom".into()),
                 upstream_of: None,
                 exit_status: None,
+                exit_code: None,
                 log_tail: None,
             },
         ));
@@ -2596,6 +2599,7 @@ mod tests {
                     error: Some("dependency failed".into()),
                     upstream_of: Some("//base:proto".into()),
                     exit_status: None,
+                    exit_code: None,
                     log_tail: None,
                 },
             ));

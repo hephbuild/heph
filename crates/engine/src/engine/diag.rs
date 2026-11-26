@@ -3095,6 +3095,7 @@ mod tests {
             error: Some("boom".into()),
             upstream_of: None,
             exit_status: None,
+            exit_code: None,
             log_tail: None,
             timed_out: None,
         }));

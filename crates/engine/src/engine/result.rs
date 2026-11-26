@@ -2300,6 +2300,7 @@ fn result_end_event(
                 error: Some(d.message),
                 upstream_of: d.upstream_of,
                 exit_status: d.exit_status,
+                exit_code: d.exit_code,
                 log_tail: crate::engine::event::ErrorDetail::result_log_tail(
                     d.log_tail,
                     d.log.as_ref(),
@@ -2316,6 +2317,7 @@ fn result_end_event(
             error: None,
             upstream_of: None,
             exit_status: None,
+            exit_code: None,
             log_tail: None,
             timed_out: None,
             left_behind: None,
@@ -4477,6 +4479,7 @@ impl Engine {
                             // hits, not just local ones.
                             rs.emit(crate::engine::event::BuildEventKind::RemoteCacheHit {
                                 addr: addr_s.clone(),
+                                cache: self.remote_caches.cache_name(&rev).map(str::to_owned),
                             });
                             rs.emit(crate::engine::event::BuildEventKind::CacheOutcome {
                                 addr: addr_s,
@@ -9244,7 +9247,7 @@ mod tests {
         );
         assert!(
             !events.iter().any(
-                |e| matches!(&e.kind, BuildEventKind::RemoteCacheHit { addr } if addr == "//pkg:t")
+                |e| matches!(&e.kind, BuildEventKind::RemoteCacheHit { addr, .. } if addr == "//pkg:t")
             ),
             "a miss must not emit RemoteCacheHit: {events:?}"
         );
@@ -9278,7 +9281,7 @@ mod tests {
         assert_eq!(
             count_kind(
                 &events,
-                |e| matches!(e, BuildEventKind::RemoteCacheHit { addr } if addr == "//pkg:t")
+                |e| matches!(e, BuildEventKind::RemoteCacheHit { addr, .. } if addr == "//pkg:t")
             ),
             1,
             "a remote pull must emit exactly one RemoteCacheHit: {events:?}"
@@ -11541,6 +11544,16 @@ mod tests {
         .context("driver run");
         let e = slotted(&engine, &rs, &addr, dir.path(), e).await;
 
+        // The status `ResultEnd` carries, and the code `run --json` reports
+        // as `exit_code`, read structured rather than parsed from the text.
+        let detail = crate::engine::event::ErrorDetail::from_error(&e);
+        assert_eq!(detail.exit_status.as_deref(), Some("exit status: 1"));
+        let end = result_end_event(&rs, addr.format(), Some(detail), None, false, None);
+        let crate::engine::event::BuildEventKind::ResultEnd { exit_code, .. } = end else {
+            panic!("not a ResultEnd: {end:?}");
+        };
+        assert_eq!(exit_code, Some(1));
+
         let _ = classify_failure(&rs, &addr, false, e);
         let recorded = rs.get_failure(&addr).expect("failure must be recorded");
         let tail = recorded.log_tail.as_ref().expect("the remote log's tail");
@@ -11549,6 +11562,34 @@ mod tests {
             "the stray byte is replaced, the tail kept"
         );
         assert_eq!(tail.start_line, 1);
+
+        // A status is spelled alike on both sides of the seam: std's own
+        // display of a local child (`signal: 9 (SIGKILL)`, maybe `(core
+        // dumped)`) does not leak into the field.
+        use std::os::unix::process::ExitStatusExt as _;
+        for (raw, exit, status, code) in [
+            (
+                3 << 8,
+                hplugin::error::Exit::Code(3),
+                "exit status: 3",
+                Some(3),
+            ),
+            (9, hplugin::error::Exit::Signal(9), "signal: 9", None),
+            (0x80 | 6, hplugin::error::Exit::Signal(6), "signal: 6", None),
+        ] {
+            let local = anyhow::Error::new(hplugin::error::ProcessFailed::from_status(
+                std::process::ExitStatus::from_raw(raw),
+            ));
+            let remote = anyhow::Error::new(hplugin::error::RemoteProcessFailed::new(
+                "failed".into(),
+                exit,
+            ));
+            for e in [local, remote] {
+                let d = crate::engine::event::ErrorDetail::from_error(&e);
+                assert_eq!(d.exit_status.as_deref(), Some(status), "{e:#}");
+                assert_eq!(d.exit_code, code, "{e:#}");
+            }
+        }
         Ok(())
     }
 

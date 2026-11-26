@@ -788,6 +788,7 @@ mod tests {
                 error: Some(format!("exec failed\n{SANDBOX}/run.sh: exit status: 101")),
                 upstream_of: None,
                 exit_status: Some("exit status: 101".into()),
+                exit_code: None,
                 log_tail: None,
                 timed_out: None,
             },
@@ -855,6 +856,7 @@ mod tests {
                 error: Some(error),
                 upstream_of: upstream_of.map(str::to_owned),
                 exit_status: None,
+                exit_code: None,
                 log_tail: None,
                 timed_out: None,
             };
@@ -908,6 +910,7 @@ mod tests {
             error: Some(if cancelled { "cancelled" } else { "boom" }.into()),
             upstream_of: upstream_of.map(str::to_owned),
             exit_status: (!cancelled && upstream_of.is_none()).then(|| "exit status: 1".into()),
+            exit_code: None,
             log_tail: None,
             timed_out: None,
             cancelled,
