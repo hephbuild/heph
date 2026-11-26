@@ -3,8 +3,8 @@
 //! Left to right: spinner and clock, the counts, the CPU the running targets
 //! reserved, a standing approval decision, the spotlight, and the hint for
 //! the dashboard right-aligned. It never wraps (I2). As the terminal
-//! narrows, segments go in a fixed order — a standing label ("Invoking …"),
-//! then the spotlight (shortened first), then the CPU figure, then
+//! narrows, segments go in a fixed order — the spotlight (shortened first),
+//! then the CPU figure, then
 //! the words collapse to short forms; below [`BARE_BELOW`] columns only the
 //! clock and the counts are left. The clock, the done count, the failed count
 //! and a standing decision never drop above that.
@@ -89,9 +89,6 @@ pub(super) struct LineModel<'a> {
     pub(super) status: Status<'a>,
     /// Unpadded: `1m05s`.
     pub(super) clock: String,
-    /// What is about to take the terminal ("Invoking …"), while the run
-    /// lasts. Dropped first.
-    pub(super) label: Option<Cow<'a, str>>,
     pub(super) body: Body<'a>,
     pub(super) standing: Option<ApprovalStanding>,
     pub(super) spot: Option<Spot>,
@@ -343,33 +340,12 @@ fn layout(m: &LineModel<'_>, tier: Tier, cols: usize) -> Option<Line<'static>> {
         return None;
     }
 
-    let optional = running && matches!(tier, Tier::Full | Tier::NoSpot);
-    let label = m
-        .label
-        .as_deref()
-        .filter(|_| optional)
-        .map(|r| Seg::styled(clean_inline(r).into_owned(), dim()));
-    let spot_candidate = m.spot.as_ref().filter(|_| running);
-    let spot_seg = spot_candidate.filter(|_| tier == Tier::Full);
-
-    // Everything, when it fits; else the label goes first, then the
-    // spotlight is shortened, then it goes too. A tier without the spotlight
-    // shows the label only when there is no spotlight to drop before it,
-    // so nothing comes back as the line narrows.
-    let whole_spot = spot_seg.and_then(|s| spot(s, usize::MAX));
-    let extra = label.as_ref().map_or(0, |r| r.width + sep_w)
-        + whole_spot.as_ref().map_or(0, |s| s.width + sep_w);
-    let (label, spot_seg) = if base + extra <= room && whole_spot.is_some() {
-        (label, whole_spot)
-    } else if spot_candidate.is_none() {
-        (label.filter(|r| base + r.width + sep_w <= room), None)
-    } else {
-        let fitted = spot_seg.and_then(|s| spot(s, room.checked_sub(base + sep_w)?));
-        (None, fitted)
-    };
-    if let Some(r) = label {
-        segs.insert(1, r);
-    }
+    // The whole spotlight when it fits; else it is shortened, then it goes.
+    let spot_seg = m
+        .spot
+        .as_ref()
+        .filter(|_| running && tier == Tier::Full)
+        .and_then(|s| spot(s, room.checked_sub(base + sep_w)?));
     segs.extend(spot_seg);
     if m.held && !running && joined_width(&segs, sep) + sep_w + width(HELD) <= room {
         segs.push(Seg::styled(HELD.to_owned(), dim()));
@@ -425,7 +401,6 @@ mod tests {
         LineModel {
             status: Status::Running("⠹"),
             clock: "1m05s".to_owned(),
-            label: None,
             body: Body::Build(BuildCounts {
                 done: 128,
                 total: Some((412, false)),
@@ -577,21 +552,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn label_goes_before_the_spotlight_shortens() {
-        let mut m = model(Some(run_spot("//go/cmd/heph-govet:build")));
-        m.label = Some(Cow::Borrowed("Invoking //app:tty"));
-        let wide = text(&render(&m, 160));
-        assert!(
-            wide.starts_with("⠹ 1m05s · Invoking //app:tty · 128"),
-            "{wide}"
-        );
-        assert!(wide.contains("▶ //go/cmd/heph-govet:build 42s"), "{wide}");
-        let narrow = text(&render(&m, 105));
-        assert!(!narrow.contains("Invoking"), "{narrow}");
-        assert!(narrow.contains("▶ "), "{narrow}");
-    }
-
     /// The standing decision stays at every width its compact form fits in
     /// (`⠹ 1m05s 128/412 3w 0f auto-N ⇥`); narrower, the line is bare.
     #[test]
@@ -612,7 +572,6 @@ mod tests {
         let m = LineModel {
             status: Status::Running("⠋"),
             clock: "3s".to_owned(),
-            label: None,
             body: Body::Text(Cow::Borrowed(
                 "12 targets · 40 revisions · 1.2 GiB freed · cache.db 4 MiB",
             )),
@@ -667,7 +626,6 @@ mod tests {
         ];
         for spot in spots {
             let mut m = model(Some(spot.clone()));
-            m.label = Some(Cow::Borrowed("Invoking //漢字:工具"));
             m.standing = Some(ApprovalStanding::Approve);
             for cols in 0..=300_u16 {
                 let line = render(&m, cols);
@@ -689,22 +647,17 @@ mod tests {
                 );
             }
 
-            // Segments drop in the stated order: the label, the spotlight
-            // (shortened first), the CPU figure, then the long words, then the
-            // cached count.
-            let label = drops_at(&m, |t| t.contains("Invoking"));
+            // Segments drop in the stated order: the spotlight (shortened
+            // first), the CPU figure, then the long words, then the cached
+            // count.
             let shortened = drops_at(&m, |t| t.contains(&spot.text()));
             let spotlit = drops_at(&m, |t| t.contains(spot.icon));
             let cpu = drops_at(&m, |t| t.contains("cpu 11/12"));
             let words = drops_at(&m, |t| t.contains("3 waiting"));
             let cached = drops_at(&m, |t| t.contains("96 cached"));
             assert!(
-                label >= shortened
-                    && shortened >= spotlit
-                    && spotlit > cpu
-                    && cpu >= words
-                    && words > cached,
-                "{label} {shortened} {spotlit} {cpu} {words} {cached}"
+                shortened >= spotlit && spotlit > cpu && cpu >= words && words > cached,
+                "{shortened} {spotlit} {cpu} {words} {cached}"
             );
             // Gone below its tier at the latest; earlier when the content
             // overflows the tier and falls to the next.
@@ -716,7 +669,7 @@ mod tests {
     }
 
     /// Text the line draws from the stream — an address, a failure, the
-    /// label, the approval prompt — reaches the terminal with no control
+    /// approval prompt — reaches the terminal with no control
     /// byte left in it, whatever the stream carried.
     #[test]
     fn control_bytes_never_reach_terminal_line() {

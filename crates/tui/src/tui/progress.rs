@@ -1143,12 +1143,6 @@ pub trait ProgressHeader: Send {
     }
     /// The bottom-border label.
     fn label(&self) -> String;
-    /// Whether the line keeps [`label`](Self::label) up once the matcher has
-    /// completed, not only while it streams: an entrypoint's "Invoking …",
-    /// which names what is about to take the terminal.
-    fn label_stands(&self) -> bool {
-        false
-    }
     /// Final summary segment printed after the run (after the elapsed clock).
     /// Empty ⇒ nothing is printed. Like the line, it counts the matched
     /// targets only, whatever the dashboard was left showing.
@@ -1997,21 +1991,9 @@ impl TuiProgressView {
         } else {
             line::Body::Text(Cow::Owned(self.model.segment()))
         };
-        // Until the run ends, a label the header keeps up ("Invoking …": what
-        // is about to take the terminal, on the line while its dependencies
-        // build). The view's own label ("Running //…") is not repeated: the
-        // command it names is on the row above.
-        let stands = self.finished_at_ms.is_none()
-            && matches!(self.role, Role::Live { .. })
-            && self.model.label_stands();
-        let label = (dashboard && stands)
-            .then(|| self.label())
-            .filter(|l| !l.is_empty())
-            .map(Cow::Owned);
         let model = line::LineModel {
             status,
             clock,
-            label,
             body,
             standing: self.approval_standing(),
             spot: self
@@ -4855,46 +4837,20 @@ mod tests {
         }
     }
 
-    /// An entrypoint's "Invoking …" is on the line while the matcher streams
-    /// and after it completed, while its dependencies build and up to the
-    /// pause that hands it the terminal, and leaves with the run's end. An
-    /// ordinary label ("Running //…") is never on the line: the command
-    /// above already names it.
+    /// The header's label ("Running //…", an entrypoint's "Invoking //…") is
+    /// never on the line, while the matcher streams, while dependencies
+    /// build, or once the run has ended: the command above already names it.
     #[test]
-    fn a_standing_label_outlives_the_matcher() {
-        struct Invoking(bool);
-        impl ProgressHeader for Invoking {
-            fn label(&self) -> String {
-                "Invoking //app:tty".to_owned()
-            }
-            fn label_stands(&self) -> bool {
-                self.0
-            }
-            fn last_render(&self, core: &BuildState) -> String {
-                BuildHeader::new(String::new()).last_render(core)
-            }
-        }
+    fn the_label_is_never_on_the_line() {
         let text = |v: &TuiProgressView| line_text(&v.line("⠋", 1, 200, true));
-        for stands in [true, false] {
-            let mut v = TuiProgressView::with_header(Box::new(Invoking(stands)));
-            v.apply(&ev(0, matched(&["//app:tty"], false)));
-            assert_eq!(
-                text(&v).contains("Invoking //app:tty"),
-                stands,
-                "streaming, stands={stands}: {}",
-                text(&v)
-            );
-            v.apply(&ev(1, matched(&[], true)));
-            v.apply(&ev(2, result_start("//dep:slow")));
-            assert_eq!(
-                text(&v).contains("Invoking //app:tty"),
-                stands,
-                "stands={stands}: {}",
-                text(&v)
-            );
-            v.set_finished(3);
-            assert!(!text(&v).contains("Invoking"), "{}", text(&v));
-        }
+        let mut v = TuiProgressView::new("Invoking //app:tty");
+        v.apply(&ev(0, matched(&["//app:tty"], false)));
+        assert!(!text(&v).contains("Invoking"), "streaming: {}", text(&v));
+        v.apply(&ev(1, matched(&[], true)));
+        v.apply(&ev(2, result_start("//dep:slow")));
+        assert!(!text(&v).contains("Invoking"), "building: {}", text(&v));
+        v.set_finished(3);
+        assert!(!text(&v).contains("Invoking"), "finished: {}", text(&v));
     }
 
     /// The line and the exit summary count the matched targets only, whatever
