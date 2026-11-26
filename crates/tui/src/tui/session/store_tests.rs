@@ -1969,6 +1969,25 @@ fn explorer_golden_rows() {
                 session: Some("cbszjpg002".into()),
             },
         ),
+        // A stale local entry: a miss with its reason, then a rebuild whose
+        // output differs from the entry it replaced.
+        start_record(s + 10, "//q:c"),
+        ev(
+            s + 10,
+            BuildEventKind::CacheOutcome {
+                addr: "//q:c".into(),
+                outcome: CacheOutcomeKind::Miss,
+                reason: Some("stale: host path /nix/store/x-tool is gone".into()),
+                stale_host_path: Some("/nix/store/x-tool".into()),
+            },
+        ),
+        ev(
+            s + 10,
+            BuildEventKind::StaleOutputChanged {
+                addr: "//q:c".into(),
+            },
+        ),
+        end_record(s + 10, "//q:c"),
         end_record(s + 10, "//q:a"),
         session_record(s + 11, SessionRecordKind::Truncated),
         start_record(s + 11, "//q:b"),
@@ -2003,7 +2022,14 @@ fn explorer_golden_rows() {
             "1|heph.approval.prompt|7000|NULL",
             "1|heph.approval.cleared|8000|NULL",
             r#"1|heph.lock.holder_seen|9000|{"heph.lock.holder_pid":7,"heph.lock.holder_session":"cbszjpg002"}"#,
+            "3|heph.cache.stale_output_changed|10000|NULL",
             "1|heph.truncated|11000|NULL",
+        ]
+    );
+    assert_eq!(
+        dump(&conn, "SELECT attributes FROM spans WHERE addr = '//q:c'"),
+        [
+            r#"{"heph.cache":"miss","heph.cache.reason":"stale: host path /nix/store/x-tool is gone","heph.cache.stale_host_path":"/nix/store/x-tool"}"#
         ]
     );
 

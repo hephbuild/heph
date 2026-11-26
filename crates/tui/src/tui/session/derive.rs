@@ -485,13 +485,34 @@ impl Deriver {
                     None,
                 ));
             }
-            // `reason`/`stale_host_path` are not mapped yet: span attribute
-            // names freeze at release (I9), so naming them is a follow-up.
-            K::CacheOutcome { addr, outcome, .. } => {
+            K::CacheOutcome {
+                addr,
+                outcome,
+                reason,
+                stale_host_path,
+            } => {
                 let v = serde_json::to_value(outcome).unwrap_or(Value::Null);
                 if let Some(open) = self.oldest(addr) {
                     open.attrs.insert("heph.cache".into(), v);
+                    // Present only on a stale miss today. The path is the
+                    // machine signal; the reason is prose for a human.
+                    if let Some(r) = reason {
+                        open.attrs
+                            .insert("heph.cache.reason".into(), Value::from(r.as_str()));
+                    }
+                    if let Some(p) = stale_host_path {
+                        open.attrs
+                            .insert("heph.cache.stale_host_path".into(), Value::from(p.as_str()));
+                    }
                 }
+            }
+            K::StaleOutputChanged { addr } => {
+                rows.push(Self::event(
+                    self.span_of(addr),
+                    "heph.cache.stale_output_changed",
+                    t,
+                    None,
+                ));
             }
             K::CacheHitRebuilt { addr, was } => {
                 let mut a = Map::new();
@@ -614,9 +635,6 @@ impl Deriver {
             | K::GcFailureLogsSwept { .. }
             | K::GcCacheDb { .. }
             | K::CodegenImported { .. }
-            // A span event for it is a follow-up: event names freeze at
-            // release (I9).
-            | K::StaleOutputChanged { .. }
             | K::Unknown => {}
         }
     }

@@ -240,7 +240,9 @@ heph.session                     root, span_id 1; trace id derived from the sess
     (attribute `heph.cache.was`, the hit's tier) when a target whose outcome
     was a hit is rebuilt after all because the manifest outlived its blobs.
     `heph.cache` keeps the hit; this event on the span means it became a
-    miss.
+    miss. `heph.cache.stale_output_changed` when a target rebuilt because
+    its local entry was stale produced different outputs than that entry,
+    so its dependents rebuild too.
   - `heph.codegen.excluded` on the result's span, or the session span when
     no result is open: a generated file kept out of a glob.
   - On the session span: `heph.lock.holder_seen`, once per pid the first
@@ -283,6 +285,8 @@ heph.session                     root, span_id 1; trace id derived from the sess
 | Key | On | Value |
 | --- | --- | --- |
 | `heph.cache` | `heph.result` span | the cache outcome: `local_hit`, `remote_hit`, `miss` (open) |
+| `heph.cache.stale_host_path` | `heph.result` span | on a miss because the local entry was stale: the declared host path found gone, as the entry stored it |
+| `heph.cache.reason` | `heph.result` span | why the outcome is what it is, as prose for a human (today only a stale miss); match on `heph.cache.stale_host_path`, not on this text |
 | `heph.upstream_of` | `heph.result` span | the addr whose failure stopped this one |
 | `heph.timed_out` | `heph.result` span | `true` when its run timed out |
 | `heph.resources.declared.<pool>` | `heph.result` span | what the target declared of `<pool>`, in the pool's unit |
