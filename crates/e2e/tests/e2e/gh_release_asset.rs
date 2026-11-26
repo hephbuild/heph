@@ -350,9 +350,8 @@ const ASSET_PATH: &str = "/repos/o/r/releases/assets/7";
 /// credential, the asset's URL is picked out of it and read by the asset
 /// fetch as a deferred value, and the bytes arrive only because that fetch
 /// sent the credential and `Accept: application/octet-stream` to the URL from
-/// the JSON. A second build looks the release up again (`cache = False`), gets
-/// different bytes (the download count moved), and still hits the cache for the
-/// asset, whose URL did not change.
+/// the JSON. A second build makes no request at all: the release JSON is
+/// cached by its URL (`unpinned`, not `cache = False`), and so is the asset.
 #[tokio::test]
 async fn release_asset_with_credentials_fetches_a_private_asset() -> anyhow::Result<()> {
     const SCRIPT: &[u8] = b"#!/bin/sh\necho private\n";
@@ -418,8 +417,8 @@ heph.gh.release_asset(
     ws.run("//p:tool").await?;
     assert_eq!(
         paths(&requests),
-        [RELEASE_PATH, ASSET_PATH, RELEASE_PATH],
-        "the release is looked up again; the unchanged asset is a cache hit"
+        [RELEASE_PATH, ASSET_PATH],
+        "a warm build hits the cache for the release JSON and the asset"
     );
     Ok(())
 }

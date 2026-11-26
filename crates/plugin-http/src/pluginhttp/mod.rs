@@ -67,10 +67,17 @@ struct HttpFetchSpec {
     url: Deferred<String>,
     /// Expected SHA-256 of the downloaded bytes (hex). Omitted → the file is
     /// fetched **unverified**: the target is then only as reproducible as the
-    /// remote server. The driver warns unless `cache = False`, which already
-    /// declares the content volatile.
+    /// remote server. The driver warns unless `cache = False` (the content is
+    /// re-fetched every run) or `unpinned = True`.
     #[spec(ty = ParamType::String)]
     sha256: Option<String>,
+    /// The content is deliberately not pinned: it changes on the server while
+    /// still meaning the same thing (an API response carrying a counter), so
+    /// no `sha256` can be written for it. Silences the unverified-download
+    /// warning and the credentials-without-`sha256` one. Cached as usual, by
+    /// URL and headers. Refused together with `sha256`. Never hashed: it
+    /// changes no byte the target produces.
+    unpinned: bool,
     /// Output filename, relative to the target's package. Defaults to the URL's
     /// last path segment (`…/heph-govet_linux_amd64` → `heph-govet_linux_amd64`),
     /// which is what the server is serving; set it to rename the fetched file.
@@ -125,6 +132,9 @@ struct HttpFetchDef {
     /// Extra request headers, names lowercased, sorted by name.
     #[serde(default)]
     headers: Vec<(String, String)>,
+    /// The spec's `unpinned`. Only silences warnings, so it is not hashed.
+    #[serde(default)]
+    unpinned: bool,
 }
 
 /// Bump to invalidate cached fetches when the output layout changes.
@@ -224,7 +234,13 @@ impl ManagedDriver for Driver {
         if !credential_inputs.is_empty() && !deferred {
             auth::check_url(url.raw()).with_context(|| addr.format())?;
         }
-        if gated_and_unpinned(!credential_inputs.is_empty(), &sha256, &cache) {
+        if spec.unpinned && !sha256.is_empty() {
+            anyhow::bail!(
+                "{}: `unpinned = True` and `sha256` contradict each other; drop one",
+                addr.format()
+            );
+        }
+        if !spec.unpinned && gated_and_unpinned(!credential_inputs.is_empty(), &sha256, &cache) {
             tracing::warn!(
                 url = url.raw(),
                 "http_fetch: fetched with credentials and no `sha256`, so what the server \
@@ -242,6 +258,7 @@ impl ManagedDriver for Driver {
             out: out.clone(),
             executable: spec.executable,
             headers,
+            unpinned: spec.unpinned,
         };
 
         let hash = {
@@ -349,11 +366,19 @@ impl ManagedDriver for Driver {
             ctoken,
         )
         .await;
-        let unpinned = fetched.map_err(|err| match refusal_hint(&err, selected.as_ref()) {
-            Some(hint) => err.context(hint),
-            None => err,
+        let unpinned = fetched.map_err(|err| {
+            match refusal_hint(&err, selected.as_ref())
+                .or_else(|| stale_url_hint(&err, def.url.raw()))
+            {
+                Some(hint) => err.context(hint),
+                None => err,
+            }
         })?;
-        warn_if_unpinned(&url, unpinned.as_deref(), req.request.target.cache.enabled);
+        warn_if_unpinned(
+            &url,
+            unpinned.as_deref().filter(|_| !def.unpinned),
+            req.request.target.cache.enabled,
+        );
 
         Ok(ManagedRunResponse::default())
     }
@@ -405,6 +430,22 @@ fn refusal_hint(err: &anyhow::Error, selected: Option<&auth::Selected>) -> Optio
                  `heph.auth.netrc([...])`"
             .to_string(),
     })
+}
+
+/// What to add to a 404 on a url read from another target (`raw` is the url as
+/// written, `${read://…}`), so the error says where the url came from: a value
+/// derived from a cached lookup can name something the server no longer has
+/// (a GitHub release asset uploaded again gets a new id). `None` for a literal
+/// url or any other failure.
+fn stale_url_hint(err: &anyhow::Error, raw: &str) -> Option<String> {
+    if hfetch::http_status(err) != Some(404) || !hcore::template::has_deferred_ref(raw) {
+        return None;
+    }
+    Some(format!(
+        "the url was read from `{raw}`, and the server has nothing there: if what it was \
+         computed from is cached (a `heph.gh.release_asset`'s `<name>_release`), it may be \
+         stale; `heph tool clean` that target and run again"
+    ))
 }
 
 /// [`fetch`], abandoned the moment `ctoken` fires.
@@ -1502,6 +1543,42 @@ mod tests {
         assert!(cache.remote_enabled, "remote cache on by default");
     }
 
+    /// `unpinned` reaches the def and moves no key, and contradicts a `sha256`.
+    #[tokio::test]
+    async fn parse_unpinned_reaches_the_def_but_not_the_hash() {
+        let parse = |extra: &[(&str, Value)]| {
+            let mut config = HashMap::from([(
+                "url".to_string(),
+                Value::String("https://x/tool".to_string()),
+            )]);
+            config.extend(extra.iter().map(|(k, v)| ((*k).to_string(), v.clone())));
+            async move {
+                Driver
+                    .parse(parse_req("//t:fetch", config), &StdCancellationToken::new())
+                    .await
+            }
+        };
+        let plain = parse(&[]).await.expect("parse").target_def;
+        let unpinned = parse(&[("unpinned", Value::Bool(true))])
+            .await
+            .expect("parse")
+            .target_def;
+        assert!(unpinned.def_de::<HttpFetchDef>().unpinned);
+        assert!(!plain.def_de::<HttpFetchDef>().unpinned);
+        assert_eq!(unpinned.hash, plain.hash, "`unpinned` moves no key");
+        assert!(unpinned.cache.enabled, "an unpinned fetch is still cached");
+
+        let Err(err) = parse(&[
+            ("unpinned", Value::Bool(true)),
+            ("sha256", Value::String(BODY_SHA.to_string())),
+        ])
+        .await
+        else {
+            panic!("unpinned and sha256 contradict");
+        };
+        assert!(format!("{err:#}").contains("contradict"), "{err:#}");
+    }
+
     /// `cache = False` turns off both tiers.
     #[tokio::test]
     async fn parse_cache_false_disables_both_tiers() {
@@ -2017,7 +2094,8 @@ mod tests {
         assert_ne!(a.hash, c.hash, "a header value moves the key");
 
         // Pinned from before `headers` existed: the url/sha256/out/executable
-        // hash of this target must not move.
+        // hash of this target must not move. `unpinned` only silences
+        // warnings, so it moves no key either.
         let mut h = DebugHasher::new(Xxh3Default::new(), || "pin".to_string());
         HttpFetchDef {
             url: Deferred::new("https://x/tool"),
@@ -2025,6 +2103,7 @@ mod tests {
             out: "dl/tool".to_string(),
             executable: false,
             headers: vec![],
+            unpinned: true,
         }
         .hash(&mut h);
         let mut old = DebugHasher::new(Xxh3Default::new(), || "pin".to_string());
@@ -2190,5 +2269,16 @@ mod tests {
 
         let missing = failed("404 Not Found").await;
         assert_eq!(refusal_hint(&missing, Some(&selected)), None);
+
+        // A 404 on a url read from another target names where it came from;
+        // a literal url, or any other status, gets no such hint.
+        let read = "${read://tools:gh_url}";
+        let stale = stale_url_hint(&missing, read).expect("hint");
+        assert!(
+            stale.contains(read) && stale.contains("heph tool clean"),
+            "{stale}"
+        );
+        assert_eq!(stale_url_hint(&missing, "https://x/tool"), None);
+        assert_eq!(stale_url_hint(&forbidden, read), None);
     }
 }

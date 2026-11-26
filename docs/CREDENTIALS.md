@@ -590,7 +590,10 @@ whole key, and a server can serve different bytes per identity. It includes no
 identity at all: an unpinned fetch that ran anonymously and cached the server's
 sign-in page keeps serving it after `credentials` is added, since the key did
 not move. A gated fetch with no `sha256` and caching on warns at parse. Set
-`sha256`, or `cache = False`. A pinned gated fetch is remote-cached like any
+`sha256`, or `cache = False`, or `unpinned = True` for content that cannot be
+pinned but is the same for every identity that can read it (a private
+`heph.gh.release_asset`'s release JSON: one without access gets a 404, which
+caches nothing). A pinned gated fetch is remote-cached like any
 other, so anyone who can read the remote cache can read the file: pinning
 restores reproducibility, not access control.
 

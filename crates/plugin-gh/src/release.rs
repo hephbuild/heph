@@ -13,8 +13,8 @@
 //! and the network stays in `http_fetch`:
 //!
 //! 1. `<name>_release`: `http_fetch` of the release JSON
-//!    (`GET {api_url}/repos/{repo}/releases/tags/{tag}`), with the credentials
-//!    and `cache = False` (see [`RELEASE_SUFFIX`]);
+//!    (`GET {api_url}/repos/{repo}/releases/tags/{tag}`), with the credentials,
+//!    cached and `unpinned` (see [`RELEASE_SUFFIX`]);
 //! 2. `<name>_url`: `<plugin>.asset_url` ([`crate::asset_url`]), the asset's
 //!    API URL picked out of that JSON;
 //! 3. the asset: `http_fetch` with `url = "${read://<pkg>:<name>_url}"`,
@@ -35,7 +35,7 @@ use hplugin::function::{
     DeclaredTarget, FnArgs, FnCallContext, FnOutcome, PluginFn, PluginFnDef, spec_params,
     spec_params_doc,
 };
-use hplugin::htspec::{FromSpecValue, Spec};
+use hplugin::htspec::{FromSpecValue, Spec, TargetSpecCache};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use std::collections::HashMap;
 use std::num::NonZeroU64;
@@ -50,12 +50,14 @@ pub const GITHUB_API_URL: &str = "https://api.github.com";
 
 /// Suffix of the release-JSON fetch declared with `credentials`.
 ///
-/// That fetch is `cache = False`: the JSON carries download counts (so its
-/// bytes move on every download, and a cached copy would be keyed on nothing
-/// that says when to re-read it), and a re-uploaded asset gets a new id under
-/// the same name. Re-reading it is one API call per private asset per build;
-/// the targets below it still hit the cache while the URL it resolves to is
-/// unchanged.
+/// That fetch is cached like any other, by its URL and headers, so a warm
+/// build makes no API call. It is `unpinned = True`: the JSON carries download
+/// counts, so no `sha256` can be written for it, and `http_fetch` would
+/// otherwise warn about it. Its key is the tag, not the bytes: a cached copy
+/// keeps naming the asset id it was fetched with. An asset uploaded again
+/// under the same name gets a new id, and a fetch of the old one fails with a
+/// 404 whose hint says to clean this target. Remote caching exposes nothing
+/// new: the pinned asset it leads to is remote-cached too.
 pub const RELEASE_SUFFIX: &str = "_release";
 
 /// Suffix of the `asset_url` target declared with `credentials`.
@@ -374,6 +376,12 @@ struct ReleaseAssetArgs {
     /// through the API.
     #[spec(ty = ParamType::list(ParamType::String))]
     credentials: Addrs,
+    /// Caching for what this declares: the asset (fetched, and with `extract`
+    /// unpacked) and, with `credentials`, the release JSON. The shape every
+    /// driver's `cache` takes: `False` turns off both tiers,
+    /// `{"remote": False}` keeps it local-only. Default: local and remote.
+    #[spec(ty = TargetSpecCache::spec_param_type())]
+    cache: Option<TargetSpecCache>,
 }
 
 /// A string argument that may not be empty.
@@ -437,6 +445,19 @@ impl FromSpecValue for FormatArg {
     }
 }
 
+/// The `cache` argument as the declared targets' own `cache` option: the dict
+/// form, so each of them parses exactly what was passed.
+fn cache_value(c: TargetSpecCache) -> Value {
+    Value::Map(
+        [
+            ("enabled".to_string(), Value::Bool(c.local)),
+            ("remote".to_string(), Value::Bool(c.remote)),
+            ("history".to_string(), Value::Int(i64::from(c.history))),
+        ]
+        .into(),
+    )
+}
+
 /// A count argument (`max_bytes`, `max_entries`), forwarded to the extract as
 /// passed: an `Int` unless it does not fit one.
 fn count_value(n: NonZeroU64) -> Value {
@@ -488,7 +509,17 @@ fn release_asset(plugin: &str, pkg: &str, args: &FnArgs) -> anyhow::Result<FnOut
         server_url,
         api_url,
         credentials: Addrs(credentials),
+        cache,
     } = ReleaseAssetArgs::from(&args.named)?;
+    // Forwarded only when passed, so a call without it declares what it did
+    // before the argument existed.
+    let cache = cache.map(cache_value);
+    let with_cache = |mut config: HashMap<String, Value>| {
+        if let Some(cache) = &cache {
+            config.insert("cache".to_string(), cache.clone());
+        }
+        config
+    };
     let cfg = &ReleaseConfig::new(
         server_url.as_deref().unwrap_or(DEFAULT_SERVER_URL),
         api_url.as_deref(),
@@ -507,7 +538,7 @@ fn release_asset(plugin: &str, pkg: &str, args: &FnArgs) -> anyhow::Result<FnOut
 
     // The asset fetch's url and auth: the public download URL, or (with
     // credentials) the API URL `<name>_url` resolves at run, fetched as bytes.
-    let mut asset_fetch: HashMap<String, Value> = if credentials.is_empty() {
+    let mut asset_fetch = with_cache(if credentials.is_empty() {
         [("url".to_string(), s(&asset_url(cfg, repo, tag, asset)?))].into()
     } else {
         let creds = Value::List(credentials.into_iter().map(Value::String).collect());
@@ -516,24 +547,26 @@ fn release_asset(plugin: &str, pkg: &str, args: &FnArgs) -> anyhow::Result<FnOut
         outcome.declare_target(DeclaredTarget {
             name: release.clone(),
             driver: HTTP_FETCH.to_string(),
-            config: [
-                (
-                    "url".to_string(),
-                    s(&release_json_url(cfg, repo, tag, asset)?),
-                ),
-                ("out".to_string(), s(&format!("{release}.json"))),
-                (
-                    "headers".to_string(),
-                    headers(&[
-                        ("Accept", "application/vnd.github+json"),
-                        ("X-GitHub-Api-Version", GITHUB_API_VERSION),
-                    ]),
-                ),
-                ("credentials".to_string(), creds.clone()),
-                // See `RELEASE_SUFFIX`.
-                ("cache".to_string(), Value::Bool(false)),
-            ]
-            .into(),
+            config: with_cache(
+                [
+                    (
+                        "url".to_string(),
+                        s(&release_json_url(cfg, repo, tag, asset)?),
+                    ),
+                    ("out".to_string(), s(&format!("{release}.json"))),
+                    (
+                        "headers".to_string(),
+                        headers(&[
+                            ("Accept", "application/vnd.github+json"),
+                            ("X-GitHub-Api-Version", GITHUB_API_VERSION),
+                        ]),
+                    ),
+                    ("credentials".to_string(), creds.clone()),
+                    // See `RELEASE_SUFFIX`.
+                    ("unpinned".to_string(), Value::Bool(true)),
+                ]
+                .into(),
+            ),
             ..Default::default()
         });
         outcome.declare_target(DeclaredTarget {
@@ -559,7 +592,7 @@ fn release_asset(plugin: &str, pkg: &str, args: &FnArgs) -> anyhow::Result<FnOut
             ("credentials".to_string(), creds),
         ]
         .into()
-    };
+    });
     if let Some(sha) = sha256 {
         asset_fetch.insert("sha256".to_string(), Value::String(sha));
     }
@@ -632,7 +665,7 @@ fn release_asset(plugin: &str, pkg: &str, args: &FnArgs) -> anyhow::Result<FnOut
     outcome.declare_target(DeclaredTarget {
         name: name.to_string(),
         driver: ARCHIVE_EXTRACT.to_string(),
-        config,
+        config: with_cache(config),
         ..Default::default()
     });
     Ok(outcome)
@@ -1057,8 +1090,13 @@ mod tests {
             ]))
         );
         assert_eq!(release.config.get("credentials"), Some(&gh_creds));
-        assert_eq!(release.config.get("cache"), Some(&Value::Bool(false)));
+        assert_eq!(release.config.get("cache"), None, "the JSON is cached");
         assert_eq!(release.config.get("sha256"), None, "the JSON is not pinned");
+        assert_eq!(
+            release.config.get("unpinned"),
+            Some(&Value::Bool(true)),
+            "and says so, so http_fetch does not warn about it"
+        );
         assert_eq!(release.config.len(), 5, "{:?}", release.config);
 
         let url = target(&out, "tool_url");
@@ -1083,6 +1121,66 @@ mod tests {
         assert_eq!(fetch.config.get("out"), Some(&s("tool-linux.tar.gz")));
         assert_eq!(fetch.config.get("executable"), Some(&Value::Bool(true)));
         assert_eq!(fetch.config.get("cache"), None, "the asset is cached");
+    }
+
+    /// `cache` reaches every target that stores something — the release JSON,
+    /// the fetched archive and the unpacked tree — and not `<name>_url`, which
+    /// is never cached. Without it, none of them carries a `cache` key.
+    #[test]
+    fn cache_is_forwarded_to_every_stored_target() {
+        let local_only = Value::Map([("remote".to_string(), Value::Bool(false))].into());
+        let out = call(&with(&[
+            creds(&["//auth:gh"]),
+            ("extract", Value::Bool(true)),
+            ("cache", local_only),
+        ]))
+        .unwrap();
+        let want = Value::Map(
+            [
+                ("enabled".to_string(), Value::Bool(true)),
+                ("remote".to_string(), Value::Bool(false)),
+                ("history".to_string(), Value::Int(1)),
+            ]
+            .into(),
+        );
+        for name in ["tool_release", "tool_archive", "tool"] {
+            assert_eq!(
+                target(&out, name).config.get("cache"),
+                Some(&want),
+                "{name}"
+            );
+        }
+        assert_eq!(target(&out, "tool_url").config.get("cache"), None);
+
+        let off = call(&with(&[("cache", Value::Bool(false))])).unwrap();
+        assert_eq!(
+            target(&off, "tool")
+                .config
+                .get("cache")
+                .map(|v| { hplugin::htspec::TargetSpecCache::from_spec_value(v).unwrap() }),
+            Some(hplugin::htspec::TargetSpecCache {
+                local: false,
+                remote: false,
+                history: 1
+            })
+        );
+
+        let plain = call(&with(&[
+            creds(&["//auth:gh"]),
+            ("extract", Value::Bool(true)),
+        ]))
+        .unwrap();
+        assert!(
+            plain
+                .targets()
+                .iter()
+                .all(|t| !t.config.contains_key("cache")),
+            "{:?}",
+            plain.targets()
+        );
+
+        let err = call(&with(&[("cache", s("remote"))])).unwrap_err();
+        assert!(format!("{err:#}").contains("cache"), "{err:#}");
     }
 
     #[test]

@@ -152,11 +152,11 @@ impl ManagedDriver for Driver {
                 hash,
                 // Not in `hash` above: a declaration moves no key.
                 resources: spec.resources,
-                // Uncached (`CacheConfig::off()`, the default): its input, the
-                // release JSON, is itself uncached and re-read every build, so
-                // a cache entry would be keyed on fresh bytes each time and
-                // never hit, while the run is a JSON parse. The fetch below it
-                // still hits while the URL it writes is unchanged.
+                // Uncached (`CacheConfig::off()`, the default): the run is a
+                // JSON parse of a file already on disk, cheaper than a cache
+                // lookup, and its output is a function of that file. The
+                // fetch below it still hits while the URL it writes is
+                // unchanged.
                 ..Default::default()
             },
         })
