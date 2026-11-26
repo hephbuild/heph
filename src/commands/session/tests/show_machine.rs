@@ -381,3 +381,84 @@ async fn show_prints_machine_line() {
         assert_eq!(m["sources_failed"], json!([]), "{m}");
     }
 }
+
+/// D30's show totals (spec `show_prints_pool_lines`, PR 5 half): a `cpu`
+/// pool's line ends with its `resources_vs_machine` totals and its `--json`
+/// entry carries them; a pool with no machine counterpart has neither.
+#[tokio::test]
+async fn show_prints_pool_vs_machine() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().join("sessions");
+    let pool = |name: &str, held: u64, capacity: u64| {
+        record(
+            T0,
+            BuildEventKind::PoolUsage {
+                pool: name.into(),
+                held,
+                capacity,
+                waiting: 0,
+                removals_pending: 0,
+            },
+        )
+    };
+    // The cpu pool full from the start, the machine 30% busy: the two
+    // intervals the samples close are declared above use; the first second
+    // (no sample opens it) and the last (after the last sample) unknown.
+    let mut records = run(
+        vec![
+            pool("cpu", 8_000_000, 8_000_000),
+            pool("docker", 1, 4),
+            info(8, 8_000_000, &[]),
+            sample(1, 300_000, Some(4 * GIB), 100 * MIB, &[]),
+            sample(2, 300_000, Some(4 * GIB), 100 * MIB, &[]),
+            sample(3, 300_000, Some(4 * GIB), 100 * MIB, &[]),
+        ],
+        &[],
+    );
+    ended_run(&mut records);
+    let id = SessionId::new(T0, 1);
+    write_ended(
+        &root,
+        &meta(id, 1, &["heph", "run", "//a:b"]),
+        &records,
+        &ended(Some(0), T0 + 4_000),
+    );
+    let file = crate::tui::session::FileSource::new(&root);
+    let sources: [&dyn SessionSource; 1] = [&file];
+
+    let text = run_show(&sources, &id.encode(), false).await.expect("show");
+    let pools: Vec<&str> = text.lines().filter(|l| l.contains(" pool (")).collect();
+    assert_eq!(
+        pools,
+        [
+            "cpu pool (capacity 8): held 8 mean while in use (100%), 8 peak; nothing waited \
+             for it; against the machine: 2.0s declared above use, 2.0s unknown",
+            "docker pool (capacity 4): held 1 mean while in use (25%), 1 peak; nothing waited \
+             for it",
+        ],
+        "{text}"
+    );
+
+    let json: serde_json::Value = serde_json::from_str(
+        &run_show(&sources, &id.encode(), true)
+            .await
+            .expect("show --json"),
+    )
+    .expect("json");
+    assert_eq!(
+        json["pools"],
+        json!([
+            {
+                "pool": "cpu", "unit": "{cpu}", "capacity": 8.0,
+                "held_mean": 8.0, "held_peak": 8.0, "waiting_us": 0,
+                "declared_above_use_us": 2_000_000, "use_above_declared_us": 0,
+                "matched_us": 0, "unknown_us": 2_000_000,
+            },
+            {
+                "pool": "docker", "unit": "1", "capacity": 4.0,
+                "held_mean": 1.0, "held_peak": 1.0, "waiting_us": 0,
+            },
+        ]),
+        "{json}"
+    );
+}

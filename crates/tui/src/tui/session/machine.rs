@@ -371,6 +371,51 @@ pub fn read_waiting(conn: &Connection) -> rusqlite::Result<BTreeMap<String, Spli
     Ok(by_phase)
 }
 
+/// One pool's `resources_vs_machine` totals (D30): its held fraction set
+/// against the machine's over the session. Part of `heph session show
+/// --json`'s `pools` entries, flattened.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct VsMachine {
+    /// Held at 90% or more while the machine was under 50%.
+    pub declared_above_use_us: u64,
+    /// The machine at 90% or more while held was under 50%.
+    pub use_above_declared_us: u64,
+    pub matched_us: u64,
+    /// No sample or no pool row covers it.
+    pub unknown_us: u64,
+}
+
+/// The `resources_vs_machine` recipe over `conn`, by pool, summed over the
+/// sessions it holds (a recording holds one). Only `cpu` and `memory` have
+/// a row.
+pub fn read_vs_machine(conn: &Connection) -> rusqlite::Result<BTreeMap<String, VsMachine>> {
+    let mut stmt = conn.prepare(super::query::RESOURCES_VS_MACHINE.sql)?;
+    let mut rows = stmt.query([])?;
+    let mut by_pool: BTreeMap<String, VsMachine> = BTreeMap::new();
+    while let Some(r) = rows.next()? {
+        let ValueRef::Text(pool) = r.get_ref(1)? else {
+            continue;
+        };
+        if pool.len() > TEXT_CAP {
+            continue;
+        }
+        let pool = String::from_utf8_lossy(pool).into_owned();
+        if by_pool.len() >= super::store::POOLS_CAP && !by_pool.contains_key(&pool) {
+            continue;
+        }
+        let t = by_pool.entry(pool).or_default();
+        t.declared_above_use_us = t
+            .declared_above_use_us
+            .saturating_add(micros(r.get_ref(2)?));
+        t.use_above_declared_us = t
+            .use_above_declared_us
+            .saturating_add(micros(r.get_ref(3)?));
+        t.matched_us = t.matched_us.saturating_add(micros(r.get_ref(4)?));
+        t.unknown_us = t.unknown_us.saturating_add(micros(r.get_ref(5)?));
+    }
+    Ok(by_pool)
+}
+
 /// A non-negative whole number of microseconds, or 0 for anything else.
 fn micros(v: ValueRef<'_>) -> u64 {
     match v {

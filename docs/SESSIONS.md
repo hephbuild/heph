@@ -774,13 +774,20 @@ ORDER BY s.started_ms DESC;
 from the `heph.session.pool.*` metrics and the last `heph.pool.capacity`:
 
 ```
+cpu pool (capacity 8): held 7.6 mean while in use (95%), 8 peak; nothing waited for it; against the machine: 6m12s declared above use, 1m0s matched, 2.0s unknown
 docker pool (capacity 4): held 3 mean while in use (75%), 4 peak; something was waiting for 1s
-cpu pool (capacity 8): held 7.6 mean while in use (95%), 8 peak; nothing waited for it
 ```
 
 "While in use": the mean is over the pool's in-use window, from its first
 row to the session's end. "Something was waiting" is `waiting_us`, the time
 with at least one request queued, not the sum of every request's wait.
+
+"Against the machine" is the [`resources_vs_machine`](#built-in-recipes)
+recipe's totals for that pool, the non-zero ones: the session's time, split
+by the pool's held fraction against the machine's over each sample
+interval. Only `cpu` (against CPU busy) and `memory` (against memory used
+over RAM) have a machine counterpart; any other pool's line stops at its
+waiters. See [Machine stats](#machine-stats).
 
 A live session has none yet (the rows come at its end), and neither does a
 build that admitted nothing (an all-hit build). These rows are read from
@@ -1190,9 +1197,11 @@ what was dropped. For a recording opened by path or URL, a non-null
 capacity, held_mean, held_peak, waiting_us}]`, one
 per bounded pool with rows (see [Pools](#pools)): empty while the session is
 live, and for a build that admitted nothing. `capacity` is `null` when no
-row gave one. The comparison with machine samples (`declared_above_use_us`
-and the rest) comes later, as added fields. `chain_root` is the id of the
-session at the root of
+row gave one. A `cpu` or `memory` entry adds the `resources_vs_machine`
+totals, `declared_above_use_us`, `use_above_declared_us`, `matched_us` and
+`unknown_us`; an entry for a pool with no machine counterpart has none of
+the four. `machine` is described under [Machine stats](#machine-stats).
+`chain_root` is the id of the session at the root of
 the first lock chain, `null` when no chain leads to a session. `next` is
 `{kind, command, argv, cwd, reason}`; `kind` is one of `attach`, `show_holder`, `inflight`,
 `inspect_failure`, `rerun`, `list`, `none` and may gain values.

@@ -198,8 +198,10 @@ pub struct ShowView<'a> {
     /// Why the recording is incomplete, `null` when it is not. An open enum.
     incomplete_reason: Option<IncompleteReason>,
     /// One entry per bounded pool the session admitted from, by name; empty
-    /// while it runs (the summaries are written at its end). PR 5 adds the
-    /// `resources_vs_machine` totals to each entry.
+    /// while it runs (the summaries are written at its end). A `cpu` or
+    /// `memory` entry also carries the `resources_vs_machine` totals
+    /// (`declared_above_use_us`, `use_above_declared_us`, `matched_us`,
+    /// `unknown_us`); a pool with no machine counterpart has none.
     pools: &'a [PoolSummary],
     /// The machine the session ran on, and its waiting split. Always
     /// present; `status` says what was sampled.
@@ -812,7 +814,9 @@ fn cpu_amount(v: f64) -> String {
 
 /// One bounded pool's line, e.g.
 /// `cpu pool (capacity 8): held 7.6 mean while in use (95%), 8 peak; something
-/// was waiting for 1m2s`. PR 5 adds the machine comparison after the peak.
+/// was waiting for 1m2s; against the machine: 6m12s declared above use,
+/// 1m0s matched`: the `resources_vs_machine` totals, non-zero ones only, for
+/// a pool with a machine counterpart (`cpu`, `memory`).
 fn pool_line(p: &PoolSummary) -> String {
     let amount = |v: f64| {
         if p.unit == "By" {
@@ -838,13 +842,30 @@ fn pool_line(p: &PoolSummary) -> String {
         amount(p.held_peak),
     ));
     if p.waiting_us == 0 {
-        line.push_str("nothing waited for it\n");
+        line.push_str("nothing waited for it");
     } else {
         line.push_str(&format!(
-            "something was waiting for {}\n",
+            "something was waiting for {}",
             hcore::units::human_duration(std::time::Duration::from_micros(p.waiting_us))
         ));
     }
+    if let Some(vs) = &p.machine {
+        let parts: Vec<String> = [
+            (vs.declared_above_use_us, "declared above use"),
+            (vs.use_above_declared_us, "use above declared"),
+            (vs.matched_us, "matched"),
+            (vs.unknown_us, "unknown"),
+        ]
+        .into_iter()
+        .filter(|&(us, _)| us > 0)
+        .map(|(us, what)| format!("{} {what}", wait_time(us)))
+        .collect();
+        if !parts.is_empty() {
+            line.push_str("; against the machine: ");
+            line.push_str(&parts.join(", "));
+        }
+    }
+    line.push('\n');
     line
 }
 

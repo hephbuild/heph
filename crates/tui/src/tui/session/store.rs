@@ -1082,6 +1082,14 @@ pub struct PoolSummary {
     /// Time with at least one request waiting for the pool (the queue was
     /// not empty), not the sum of every request's wait.
     pub waiting_us: u64,
+    /// The `resources_vs_machine` totals (PR 5), flattened into the entry;
+    /// absent for a pool with no machine counterpart (`docker`, `sandbox`).
+    /// [`read_pools`] leaves it `None`; the session's [`Summaries`] fills
+    /// it in.
+    ///
+    /// [`Summaries`]: super::Summaries
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<super::machine::VsMachine>,
 }
 
 /// The most pools [`read_pools`] holds. A foreign file is untrusted: without
@@ -1133,6 +1141,7 @@ pub fn read_pools(conn: &Connection) -> rusqlite::Result<Vec<PoolSummary>> {
             held_mean: 0.0,
             held_peak: 0.0,
             waiting_us: 0,
+            machine: None,
         });
         match name.as_str() {
             "heph.session.pool.held.mean" => {

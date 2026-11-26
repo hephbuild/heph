@@ -149,8 +149,16 @@ impl Default for Summaries {
 impl Summaries {
     /// Read from the recording `conn` holds.
     pub fn read(conn: &rusqlite::Connection) -> anyhow::Result<Self> {
+        let mut pools = store::read_pools(conn).context("reading the pool usage")?;
+        if !pools.is_empty() {
+            let mut vs = super::machine::read_vs_machine(conn)
+                .context("setting the pools against the machine")?;
+            for p in &mut pools {
+                p.machine = vs.remove(&p.pool);
+            }
+        }
         Ok(Self {
-            pools: store::read_pools(conn).context("reading the pool usage")?,
+            pools,
             machine: super::machine::read_machine(conn).context("reading the machine figures")?,
         })
     }
