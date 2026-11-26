@@ -922,4 +922,27 @@ fn a_dropped_sample_passes_its_failure_and_count_on() {
     assert_eq!(last.dropped, 1);
     assert!(last.failed.get(Source::MemoryUsed).is_some(), "{last:?}");
     assert!(last.memory_used.is_none());
+    // Taken at the stop, no time after tick 2: too short for a busy figure.
+    assert_eq!(last.interval, Duration::ZERO);
+    assert_eq!(last.cpu_busy, None, "{last:?}");
+}
+
+/// A sample over less than `MIN_BUSY_INTERVAL` has no busy figure: over a
+/// few ms the host's 10 ms tick counts move by 0 or 1 per CPU, and the figure
+/// would read 0 or 1. The CPU counters are still read, so the next sample's
+/// figure covers only its own interval.
+#[test]
+fn a_short_sample_has_no_busy_figure() {
+    let start = Instant::now();
+    let (mut core, _) = Core::start(Fake::default(), start);
+    // The Fake's counters move by the same amount each read, whatever the
+    // interval: busy 0.5 on every sample that gets a figure.
+    let short = start + MIN_BUSY_INTERVAL.saturating_sub(Duration::from_nanos(1));
+    let sample = core.sample(short);
+    assert_eq!(sample.cpu_busy, None, "{sample:?}");
+    assert!(sample.memory_used.is_some() && sample.process_cpu.is_some());
+    let at_bound = short + MIN_BUSY_INTERVAL;
+    let sample = core.sample(at_bound);
+    assert!(sample.cpu_busy.is_some_and(|b| close(b, 0.5)), "{sample:?}");
+    assert_eq!(core.sources.cpu_reads(), 3, "baseline, then each sample");
 }

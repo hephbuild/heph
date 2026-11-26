@@ -18,7 +18,9 @@
 //!   waits on a done channel for at most [`STOP_WAIT`] and then detaches the
 //!   thread, never a bare join, so a source that blocks cannot hang the exit.
 //!   At a stop, a drop count or failure not yet delivered goes out on one
-//!   last sample if the channel has room.
+//!   last sample if the channel has room. That sample covers only the time
+//!   since the last tick, so it has no busy figure when that is under
+//!   [`MIN_BUSY_INTERVAL`].
 //! - **Sources.** Each is independent: one that fails is disabled for the rest
 //!   of the run and named once, in the next delivered sample. Nothing is
 //!   retried. Linux reads `/proc` and, under a cgroup v2 CPU quota, the quota
@@ -51,6 +53,16 @@ use procfs::host_sources;
 
 /// The sampling interval. Not a setting (D22).
 pub const TICK: Duration = Duration::from_secs(1);
+
+/// The shortest interval a sample gives a busy figure for. Both hosts count
+/// CPU time in 10 ms clock ticks (`/proc/stat` in `USER_HZ`, Mach's
+/// `host_processor_info` at `hz`), and each tick lands whole on busy or idle,
+/// so a figure over an interval `t` can be off by up to 10 ms / `t` on each
+/// CPU. Under half a tick a CPU's count moves by 0 or 1, and the figure
+/// reads 0 or 1 — a false peak. 100 ms is ten ticks, which bounds the error
+/// at 0.1. Every tick-paced sample is a whole [`TICK`] apart; the stop's
+/// last sample, taken whenever the stop lands, is the one this cuts.
+pub const MIN_BUSY_INTERVAL: Duration = Duration::from_millis(100);
 
 /// The readings channel's capacity: what the recorder may fall behind by
 /// before a sample is dropped.
@@ -212,7 +224,8 @@ impl Failures {
 
 /// One tick: the `MachineSample` record. A figure is `None` when its source
 /// failed or is disabled, and `cpu_busy` also when the CPU counters did not
-/// move (no NaN is ever written).
+/// move (no NaN is ever written) or the interval is under
+/// [`MIN_BUSY_INTERVAL`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Sample {
     /// When it was taken. The recorder stamps it from its anchor plus this
@@ -458,8 +471,12 @@ impl<S: Sources> Core<S> {
         let interval = now.saturating_duration_since(self.prev_at);
         self.prev_at = now;
         let cpu = self.read(Source::CpuBusy, S::cpu);
+        // The counters are read even when the interval is too short for a
+        // figure, so the next sample's figure covers only its own interval.
         let cpu_busy = match (&self.prev_cpu, &cpu) {
-            (Some(prev), Some(cur)) => self.sources.busy(prev, cur, interval),
+            (Some(prev), Some(cur)) if interval >= MIN_BUSY_INTERVAL => {
+                self.sources.busy(prev, cur, interval)
+            }
             _ => None,
         };
         if cpu.is_some() {
