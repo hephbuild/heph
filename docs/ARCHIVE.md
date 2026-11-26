@@ -42,6 +42,21 @@ target(
 `create`'s `strip_prefix` + `prefix` and `extract`'s `strip_components` are
 inverses: the example round-trips to `unpacked/bin/tool`.
 
+The unpacked directory is not a tool itself: a tool is one file. To put one
+binary from it on a target's `PATH`, pick it out with a `group`:
+
+```python
+target(name = "tool", driver = "group", deps = [":unpacked"],
+       include = ["tool/unpacked/bin/tool"])
+
+target(name = "use", driver = "bash", run = ["tool --version"],
+       tools = [":tool"])
+```
+
+A tool whose output is a glob or a directory, as a filtering `group`'s is, is
+held to one file when it has run: an `include` that matches two files fails
+the consumer, naming the group and the files.
+
 ## `archive.extract`
 
 | Option | Default | |

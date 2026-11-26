@@ -379,3 +379,40 @@ target(
     );
     Ok(())
 }
+
+/// One binary out of an unpacked archive is a tool: `archive.extract`'s
+/// output is a directory, and a group with `include` picks the binary out
+/// of it.
+#[tokio::test]
+async fn a_file_picked_out_of_an_extracted_archive_is_a_tool() -> anyhow::Result<()> {
+    let ws = workspace()?;
+    let mut build = PRODUCERS.to_string();
+    build.push_str(
+        r#"
+target(
+    name = "pack",
+    driver = "archive.create",
+    deps = [":a", ":b"],
+    strip_prefix = "p/out",
+    out = "pack.tar.gz",
+)
+target(name = "unpacked", driver = "archive.extract", src = ":pack")
+target(name = "b_tool", driver = "group", deps = [":unpacked"], include = ["p/unpacked/sub/b.sh"])
+target(
+    name = "use",
+    driver = "bash",
+    run = ["b.sh > $OUT"],
+    out = "out.txt",
+    tools = [":b_tool"],
+)
+"#,
+    );
+    ws.write_build_file("p", &build);
+
+    let result = ws.run("//p:use").await?;
+    assert_eq!(
+        files(&result),
+        vec![("p/out.txt".to_string(), "bee\n".to_string(), false)]
+    );
+    Ok(())
+}

@@ -663,3 +663,81 @@ target(
     assert!(common::artifact_string(&result).contains("a"));
     Ok(())
 }
+
+/// A filtering or relocating group whose output is one file is a tool like
+/// the target that produced the file: its declared output is a glob, so how
+/// many files it holds is known only once it has run, and linking must not
+/// count the declaration's `FilePath`s.
+#[tokio::test]
+async fn transforming_group_of_one_file_is_a_tool() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        PKG,
+        r##"
+target(
+    name = "bin",
+    driver = "bash",
+    run = 'printf "#!/bin/sh\necho hello from tool\n" > $OUT && chmod +x $OUT',
+    out = "tool",
+)
+target(name = "g_include", driver = "group", deps = [":bin"], include = ["reloc/tool"])
+target(name = "g_rename", driver = "group", deps = [":bin"], rename = "tool2")
+target(name = "g_prefix", driver = "group", deps = [":bin"], prefix = "x")
+[
+    target(
+        name = "use_" + n,
+        driver = "bash",
+        run = [cmd + " > $OUT"],
+        out = "out.txt",
+        tools = [":g_" + n],
+    )
+    for n, cmd in [("include", "tool"), ("rename", "tool2"), ("prefix", "tool")]
+]
+"##,
+    );
+
+    for n in ["include", "rename", "prefix"] {
+        let result = ws.run(&format!("//reloc:use_{n}")).await?;
+        assert_eq!(
+            common::artifact_string(&result),
+            "hello from tool\n",
+            "use_{n}"
+        );
+    }
+    Ok(())
+}
+
+/// The tool rule still holds once the count is known: a transforming group
+/// that re-exports two files is not one tool, and the run says so, naming
+/// the group.
+#[tokio::test]
+async fn transforming_group_of_two_files_is_not_a_tool() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        PKG,
+        r#"
+target(name = "a", driver = "bash", run = "echo a > $OUT", out = "a")
+target(name = "b", driver = "bash", run = "echo b > $OUT", out = "b")
+target(name = "g", driver = "group", deps = [":a", ":b"], prefix = "x")
+target(
+    name = "use",
+    driver = "bash",
+    run = ["a > $OUT"],
+    out = "out.txt",
+    tools = [":g"],
+)
+"#,
+    );
+
+    let err = ws
+        .run("//reloc:use")
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("a two-file group must not link as a tool"))?;
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("//reloc:g") && msg.contains("exactly 1 file"),
+        "{msg}"
+    );
+    Ok(())
+}

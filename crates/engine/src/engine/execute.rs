@@ -870,7 +870,19 @@ impl Engine {
         let fail_fast = rc.fail_fast();
         let futs = inputs.iter().map(|input| {
             enclose!((self => engine, rc) async move {
-                let res = engine.result_addr(rc, &input.target.addr, OutputMatcher::Exact(input.output_names.clone()), &ResultOptions::default()).await?;
+                let res = engine.clone().result_addr(rc.clone(), &input.target.addr, OutputMatcher::Exact(input.output_names.clone()), &ResultOptions::default()).await?;
+                for output in &input.tool_outputs_counted_at_run {
+                    // The one selected output's artifacts are `res`'s; with
+                    // several, ask for that output's alone (memoized).
+                    let own;
+                    let artifacts = if input.output_names.len() == 1 {
+                        &res.artifacts
+                    } else {
+                        own = engine.clone().result_addr(rc.clone(), &input.target.addr, OutputMatcher::Exact(vec![output.clone()]), &ResultOptions::default()).await?;
+                        &own.artifacts
+                    };
+                    crate::engine::link::check_tool_output_files(&input.target.addr, output, artifacts)?;
+                }
                 let dep_inputs = res.artifacts.iter().map(|art| RunInput {
                     artifact: InputArtifact {
                         r#type: Type::Dep,
