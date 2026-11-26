@@ -525,8 +525,8 @@ impl tui::ProgressHeader for RunHeader {
         self.label.stands()
     }
 
-    fn last_render(&self, core: &tui::BuildState, scope: tui::CountScope) -> String {
-        self.counts.last_render(core, scope)
+    fn last_render(&self, core: &tui::BuildState) -> String {
+        self.counts.last_render(core)
     }
 }
 

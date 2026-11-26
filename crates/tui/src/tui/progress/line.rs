@@ -1004,11 +1004,12 @@ mod tests {
             v.apply(&at(i as u64, e));
         }
 
-        for (scope, want) in [
-            (CountScope::Matched, (3, 9, 2, 2, 2)),
-            (CountScope::All, (4, 10, 3, 2, 2)),
-        ] {
-            v.list.scope = scope;
+        // The line counts the matched scope whichever scope the dashboard's
+        // list was left on.
+        let scope = CountScope::Matched;
+        let want = (3, 9, 2, 2, 2);
+        for list_scope in [CountScope::Matched, CountScope::All] {
+            v.list.scope = list_scope;
             let line = all_text(&v.render("⠋", T0 + 1_000, 200, 40));
             let m = v.state.dashboard();
             let tab = |t: Tab| m.tab_len(t, scope);

@@ -30,7 +30,8 @@ pub use spotlight::{HOLD_MS, Spot};
 /// The most list rows `heph session show` prints.
 pub const SNAPSHOT_ROWS: u16 = 15;
 
-const FINISHED_DASHBOARD_HINTS: &str = "↑/↓ select · enter details · l log · tab/⇧tab list · / filter · a all targets · q or esc leave";
+const FINISHED_DASHBOARD_HINTS: &str =
+    "↑/↓ select · enter details · l log · tab/⇧tab list · / filter · a matched · q or esc leave";
 
 /// A target is considered "taking long" once its execute span exceeds this.
 pub const LONG_RUNNING_THRESHOLD_MS: u64 = 5_000;
@@ -63,13 +64,14 @@ fn human_elapsed_ms(ms: u64) -> String {
     human_elapsed(ms)
 }
 
-/// Which target set the header counters are scoped to. `Matched` (the default)
-/// counts only the matched top-level targets; `All` counts every target the view
-/// has observed, including transitive deps. The `a` key toggles between them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Which target set a count or a list covers. `Matched` counts only the
+/// matched top-level targets; `All` counts every target the view has
+/// observed, including transitive deps. The line and the final summary are
+/// always `Matched`; the dashboard starts on `All`, and its `a` key toggles
+/// it to `Matched` and back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CountScope {
     /// Counters scoped to the matched top-level target set.
-    #[default]
     Matched,
     /// Counters across every target the view has seen (incl. transitive deps).
     All,
@@ -1148,10 +1150,9 @@ pub trait ProgressHeader: Send {
         false
     }
     /// Final summary segment printed after the run (after the elapsed clock).
-    /// Empty ⇒ nothing is printed. `scope` is the count scope the view was left
-    /// on (the `a` toggle), so the printed summary matches the header the user
-    /// was reading; state-private headers ignore it.
-    fn last_render(&self, core: &BuildState, scope: CountScope) -> String;
+    /// Empty ⇒ nothing is printed. Like the line, it counts the matched
+    /// targets only, whatever the dashboard was left showing.
+    fn last_render(&self, core: &BuildState) -> String;
     /// Which header a session viewer should rebuild for this run. Defaults to
     /// the build counts.
     fn session_kind(&self) -> crate::tui::session::HeaderKind {
@@ -1184,20 +1185,11 @@ impl ProgressHeader for BuildHeader {
         self.label.clone()
     }
 
-    fn last_render(&self, core: &BuildState, scope: CountScope) -> String {
+    fn last_render(&self, core: &BuildState) -> String {
         if !core.has_activity() {
             return String::new();
         }
-        // Report the scope the view was left on: switching to `All` mid-run
-        // carries through to the printed exit summary.
-        match scope {
-            CountScope::Matched => core.counts_segment(scope),
-            // The printed line outlives the header (scrollback, copy-paste),
-            // where nothing else says which population the counts cover — so
-            // the non-default scope labels itself. Matched output stays
-            // byte-identical to what it always was.
-            CountScope::All => format!("{} · all targets", core.counts_segment(scope)),
-        }
+        core.counts_segment(CountScope::Matched)
     }
 }
 
@@ -1353,7 +1345,7 @@ impl ProgressHeader for GcHeader {
         false
     }
 
-    fn last_render(&self, _core: &BuildState, _scope: CountScope) -> String {
+    fn last_render(&self, _core: &BuildState) -> String {
         if self.targets > 0
             || self.failure_logs.is_some_and(|(n, _)| n > 0)
             || self.cache_db.is_some()
@@ -1718,12 +1710,11 @@ impl TuiProgressView {
         lines
     }
 
-    /// The final summary segment, scoped to whatever the `a` toggle was left on
-    /// — a user who switched the header to `All` reads the same scope after
-    /// teardown. Split out from [`TUIAppView::last_render`], which writes it
+    /// The final summary segment: the matched targets' counts, as the line
+    /// shows them. Split out from [`TUIAppView::last_render`], which writes it
     /// straight to stderr and so cannot be asserted on.
     fn final_summary_segment(&self) -> String {
-        self.model.last_render(&self.state, self.list.scope)
+        self.model.last_render(&self.state)
     }
 
     /// The final summary line [`TUIAppView::last_render`] prints, `None` when
@@ -1752,8 +1743,8 @@ impl TuiProgressView {
         let segment = self.final_summary_segment();
         // The failed count and its split, as `counts_segment` wrote them.
         let segment = {
-            let (_, _, failed) = self.state.count_fields(self.list.scope);
-            let tabs = self.state.dash.counts(self.list.scope);
+            let (_, _, failed) = self.state.count_fields(CountScope::Matched);
+            let tabs = self.state.dash.counts(CountScope::Matched);
             let split = failure_split_text((tabs.failed, tabs.dep_failed));
             let whole = format!("{failed}{split}");
             match segment.split_once(&whole) {
@@ -1812,7 +1803,7 @@ impl TuiProgressView {
         let (text, ok) = match self.outcome() {
             Outcome::Stopped => ("✗ stopped".to_owned(), false),
             Outcome::Failed => {
-                let (_, _, failed) = self.state.count_fields(self.list.scope);
+                let (_, _, failed) = self.state.count_fields(CountScope::Matched);
                 if failed.starts_with("0 ") {
                     ("✗ cancelled".to_owned(), false)
                 } else {
@@ -1988,10 +1979,12 @@ impl TuiProgressView {
             None => line::Status::Running(spinner),
         };
         let dashboard = self.model.has_dashboard();
-        let scope = self.list.scope;
+        // The line counts what the selector matched, whatever the dashboard
+        // shows: the scope toggle is the dashboard's alone.
+        let scope = CountScope::Matched;
         let body = if dashboard {
             // The same `TabCounts` the dashboard's tabs read, so the line
-            // and the tabs cannot disagree.
+            // and the tabs on the matched scope cannot disagree.
             let tabs = self.state.dash.counts(scope);
             line::Body::Build(line::BuildCounts {
                 done: tabs.finished_ok(),
@@ -2334,7 +2327,9 @@ impl TUIAppView for TuiProgressView {
     }
 
     fn toggle_scope(&mut self) {
-        if self.target.is_some() || self.approval.is_some() {
+        // The dashboard's list only: the line always counts the matched
+        // targets.
+        if !self.dashboard_open || self.target.is_some() || self.approval.is_some() {
             return;
         }
         self.list.scope = match self.list.scope {
@@ -4665,7 +4660,7 @@ mod tests {
         assert!(seg.contains("2 targets"), "{seg}");
         assert!(seg.contains("1.0 KiB"), "{seg}");
         assert_eq!(h.label(), "GC");
-        assert!(!h.last_render(&core, CountScope::Matched).is_empty());
+        assert!(!h.last_render(&core).is_empty());
     }
 
     /// The failure-log sweep is appended after the unchanged revision segment,
@@ -4697,7 +4692,7 @@ mod tests {
                 bytes_removed: 5,
             },
         ));
-        assert!(!only.last_render(&core, CountScope::Matched).is_empty());
+        assert!(!only.last_render(&core).is_empty());
     }
 
     #[expect(clippy::too_many_arguments, reason = "the event's fields")]
@@ -4823,7 +4818,7 @@ mod tests {
             0,
             gc_cache_db(GIB, GIB, 0, "incremental", "unchanged", 0, 0, 0, None),
         ));
-        let last = only.last_render(&core, CountScope::Matched);
+        let last = only.last_render(&core);
         assert!(last.ends_with("incremental): unchanged"), "{last}");
     }
 
@@ -4875,8 +4870,8 @@ mod tests {
             fn label_stands(&self) -> bool {
                 self.0
             }
-            fn last_render(&self, core: &BuildState, scope: CountScope) -> String {
-                BuildHeader::new(String::new()).last_render(core, scope)
+            fn last_render(&self, core: &BuildState) -> String {
+                BuildHeader::new(String::new()).last_render(core)
             }
         }
         let text = |v: &TuiProgressView| line_text(&v.line("⠋", 1, 200, true));
@@ -4902,12 +4897,11 @@ mod tests {
         }
     }
 
-    /// The exit summary follows the `a` scope toggle: a user who switched the
-    /// header to `All` reads the all-targets counts after teardown, not a
-    /// hardcoded matched-scope line that disagrees with the header they were
-    /// just looking at.
+    /// The line and the exit summary count the matched targets only, whatever
+    /// scope the dashboard was left on: the dashboard opens on every target,
+    /// and its `a` toggle never reaches the line.
     #[test]
-    fn final_summary_follows_scope_toggle() {
+    fn line_and_final_summary_count_matched_targets_only() {
         let mut v = TuiProgressView::new("L");
         v.apply(&ev(0, matched(&["//a:b"], true)));
         v.apply(&ev(1, result_start("//a:b")));
@@ -4918,19 +4912,22 @@ mod tests {
 
         // The production seam itself — `last_render` prints exactly this.
         let segment = |v: &TuiProgressView| v.final_summary_segment();
-        assert!(segment(&v).contains("1 / 1 done"), "{}", segment(&v));
-        assert!(
-            !segment(&v).contains("all targets"),
-            "matched scope must not be labeled: {}",
-            segment(&v)
-        );
+        let line = |v: &TuiProgressView| line_at(v, 100);
+        let check = |v: &TuiProgressView, when: &str| {
+            assert!(segment(v).contains("1 / 1 done"), "{when}: {}", segment(v));
+            assert!(line(v).contains("1 / 1 done"), "{when}: {}", line(v));
+        };
+        check(&v, "on the line");
+        // `a` on the line does nothing.
         v.toggle_scope();
-        assert!(segment(&v).contains("2 / 2 done"), "{}", segment(&v));
-        // The line outlives the header, so the non-default scope names itself.
-        assert!(segment(&v).ends_with("· all targets"), "{}", segment(&v));
-        // Toggling back restores the matched-scope summary.
+        assert_eq!(v.list.scope, CountScope::All);
+        check(&v, "after `a` on the line");
+        // The dashboard shows every target, the line still the matched ones.
+        v.open_dashboard();
+        check(&v, "dashboard on All");
         v.toggle_scope();
-        assert!(segment(&v).contains("1 / 1 done"), "{}", segment(&v));
+        assert_eq!(v.list.scope, CountScope::Matched);
+        check(&v, "dashboard on Matched");
     }
 
     #[test]
@@ -5122,9 +5119,9 @@ mod tests {
     }
 
     /// The three count fields `(done, cached, failed)` as the line draws them
-    /// in `scope` (the live-only waiting count is not in the summary).
-    fn header_count_fields(v: &mut TuiProgressView, scope: CountScope) -> (String, String, String) {
-        v.list.scope = scope;
+    /// (the live-only waiting count is not in the summary). The line counts
+    /// the matched scope whatever the dashboard's is.
+    fn header_count_fields(v: &TuiProgressView) -> (String, String, String) {
         let line = line_at(v, 100);
         let field = |suffix: &str| {
             line.split(" · ")
@@ -5144,9 +5141,20 @@ mod tests {
     fn split_header_count_fields_match_the_plain_count_fields() {
         // The line draws its counts from the dashboard's tab counts;
         // `count_fields` renders `Counts` as flat strings for the final
-        // summary. The two must stay character-identical in every scope and in
-        // every branch of the done segment.
+        // summary. The two must stay character-identical in every branch of
+        // the done segment. The line is always the matched scope, whatever
+        // the dashboard's list shows.
         let mut v = TuiProgressView::new("L");
+        let agree = |v: &mut TuiProgressView| {
+            for scope in [CountScope::Matched, CountScope::All] {
+                v.list.scope = scope;
+                assert_eq!(
+                    header_count_fields(v),
+                    v.state.count_fields(CountScope::Matched),
+                    "dashboard on {scope:?}"
+                );
+            }
+        };
 
         // Before any Matched event: the done segment has no denominator, and
         // done is Done + Cached of every target.
@@ -5157,20 +5165,15 @@ mod tests {
         v.apply(&ev(2, result_end("//a:cached", None)));
         v.apply(&ev(3, result_start("//a:failed")));
         v.apply(&ev(4, result_end("//a:failed", Some("boom".into()))));
-        for scope in [CountScope::Matched, CountScope::All] {
-            assert_eq!(
-                header_count_fields(&mut v, scope),
-                v.state.count_fields(scope)
-            );
-        }
+        agree(&mut v);
         // The no-denominator branch is the one the done segment re-sources, so
         // pin it to a literal rather than only cross-checking it.
         assert_eq!(
-            header_count_fields(&mut v, CountScope::Matched),
+            header_count_fields(&v),
             fields("2 done", "1 cached", "1 failed"),
         );
         assert_eq!(
-            header_count_fields(&mut v, CountScope::All),
+            v.state.count_fields(CountScope::All),
             fields("2 / 3 done", "1 cached", "1 failed"),
         );
 
@@ -5183,43 +5186,39 @@ mod tests {
         v.apply(&ev(8, local_cache_hit("//m:y")));
         v.apply(&ev(9, result_end("//m:x", None)));
         v.apply(&ev(10, result_start("//m:y")));
-        for scope in [CountScope::Matched, CountScope::All] {
-            assert_eq!(
-                header_count_fields(&mut v, scope),
-                v.state.count_fields(scope)
-            );
-        }
+        agree(&mut v);
         assert_eq!(
-            header_count_fields(&mut v, CountScope::Matched),
+            header_count_fields(&v),
             fields("1 / ~3 done", "1 cached", "0 failed"),
         );
         assert_eq!(
-            header_count_fields(&mut v, CountScope::All),
+            v.state.count_fields(CountScope::All),
             fields("3 / 6 done", "2 cached", "1 failed"),
         );
 
-        // Matcher resolves: the `~` drops on both paths.
+        // Matcher resolves: the `~` drops.
         v.apply(&ev(11, matched(&[], true)));
-        for scope in [CountScope::Matched, CountScope::All] {
-            assert_eq!(
-                header_count_fields(&mut v, scope),
-                v.state.count_fields(scope)
-            );
-        }
+        agree(&mut v);
         assert_eq!(
-            header_count_fields(&mut v, CountScope::Matched),
+            header_count_fields(&v),
             fields("1 / 3 done", "1 cached", "0 failed"),
         );
     }
 
+    /// The dashboard opens on every target; `a` there narrows it to the
+    /// matched ones and back. On the line, `a` is not a key.
     #[test]
-    fn toggle_scope_flips_view_count_scope() {
+    fn toggle_scope_flips_the_dashboard_scope_only() {
         let mut v = TuiProgressView::new("L");
+        assert_eq!(v.list.scope, CountScope::All);
+        v.toggle_scope();
+        assert_eq!(v.list.scope, CountScope::All, "no toggle on the line");
+        v.open_dashboard();
+        assert_eq!(v.list.scope, CountScope::All, "the dashboard opens on All");
+        v.toggle_scope();
         assert_eq!(v.list.scope, CountScope::Matched);
         v.toggle_scope();
         assert_eq!(v.list.scope, CountScope::All);
-        v.toggle_scope();
-        assert_eq!(v.list.scope, CountScope::Matched);
     }
 
     #[test]
@@ -5561,8 +5560,8 @@ mod tests {
         );
     }
 
-    /// The Done and Cached tabs list matched targets only, until `a` widens
-    /// them to every target the run touched; a failure is in neither.
+    /// The Done and Cached tabs list every target the run touched, until `a`
+    /// narrows them to the matched targets; a failure is in neither.
     #[test]
     fn done_and_cached_tabs_follow_the_count_scope() {
         use crate::tui::dashboard::Tab;
@@ -5588,19 +5587,6 @@ mod tests {
         };
 
         let done = list(&mut v, Tab::Done);
-        assert!(done.contains("//a:top"), "{done}");
-        assert!(
-            !done.contains("//dep:lib") && !done.contains("//a:bad"),
-            "{done}"
-        );
-        let cached = list(&mut v, Tab::Cached);
-        assert!(
-            cached.contains("//a:hit") && !cached.contains("//dep:hit"),
-            "{cached}"
-        );
-
-        v.toggle_scope();
-        let done = list(&mut v, Tab::Done);
         assert!(
             done.contains("//a:top") && done.contains("//dep:lib"),
             "{done}"
@@ -5609,6 +5595,19 @@ mod tests {
         let cached = list(&mut v, Tab::Cached);
         assert!(
             cached.contains("//a:hit") && cached.contains("//dep:hit"),
+            "{cached}"
+        );
+
+        v.toggle_scope();
+        let done = list(&mut v, Tab::Done);
+        assert!(done.contains("//a:top"), "{done}");
+        assert!(
+            !done.contains("//dep:lib") && !done.contains("//a:bad"),
+            "{done}"
+        );
+        let cached = list(&mut v, Tab::Cached);
+        assert!(
+            cached.contains("//a:hit") && !cached.contains("//dep:hit"),
             "{cached}"
         );
     }

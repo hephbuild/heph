@@ -42,8 +42,8 @@ impl ProgressHeader for SharedLabel {
             .clone()
     }
 
-    fn last_render(&self, core: &BuildState, scope: CountScope) -> String {
-        self.inner.last_render(core, scope)
+    fn last_render(&self, core: &BuildState) -> String {
+        self.inner.last_render(core)
     }
 }
 
