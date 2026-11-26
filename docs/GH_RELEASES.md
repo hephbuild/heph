@@ -113,9 +113,9 @@ A wrong `sha256` fails the fetch with `checksum mismatch … expected …, got �
 
 ## Per-platform assets
 
-A release ships one asset per platform, each with its own `sha256`. Pick by the
-host's `heph.core.os()` (`linux`, `darwin`) and `heph.core.arch()` (`amd64`,
-`arm64`):
+A release ships one asset per platform, each with its own `sha256`. Declare one
+`release_asset` per platform with `heph.core.matrix` (see `docs/MATRIX.md`),
+naming each cell `<name>.<os>-<arch>`:
 
 ```python
 ASSETS = {
@@ -123,23 +123,37 @@ ASSETS = {
     "linux/arm64":  ("tool-1.2.0-aarch64-unknown-linux-gnu.tar.gz", "<sha256>"),
     "darwin/arm64": ("tool-1.2.0-aarch64-apple-darwin.tar.gz",      "<sha256>"),
 }
-asset, sha = ASSETS[heph.core.os() + "/" + heph.core.arch()]
 
-heph.gh.release_asset(
-    name = "tool",
-    repo = "acme/tool",
-    tag = "v1.2.0",
-    asset = asset,
-    sha256 = sha,
-    extract = True,
-    strip_components = 1,
+def _tool(platform):
+    asset, sha = ASSETS[platform]
+    n = "tool." + platform.replace("/", "-")
+    heph.gh.release_asset(
+        name = n,
+        repo = "acme/tool",
+        tag = "v1.2.0",
+        asset = asset,
+        sha256 = sha,
+        extract = True,
+        strip_components = 1,
+    )
+    return ":" + n
+
+TOOL = heph.core.matrix(
+    axes = {"platform": ["linux/amd64", "linux/arm64", "darwin/arm64"]},
+    cell = _tool,
+    default = "host",
 )
 ```
 
-Consumers name `//p:tool` on every host. A host missing from the dict fails the
-BUILD file's evaluation on the dict lookup, naming the key. The asset name is not templated:
-`http_fetch`'s `{goos}`-style placeholders take one `sha256` for every
-platform, so they cannot pin a per-platform asset.
+`TOOL.default` is the host's tool (`tools = [TOOL.default]`); `TOOL.cells` maps
+every platform to its tool, so a darwin laptop can bundle the `linux/arm64` one.
+Every cell is an ordinary target (`//p:tool.linux-arm64`). A host with no cell
+fails only where `.default` is read, with a message listing the cells. A
+consumer of `TOOL.default` has the host's address in its config, so its cache
+key moves with the host.
+
+The asset name is not templated: `http_fetch`'s `{goos}`-style placeholders
+take one `sha256` for every platform, so they cannot pin a per-platform asset.
 
 ## Troubleshooting
 

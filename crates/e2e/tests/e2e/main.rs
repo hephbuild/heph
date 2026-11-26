@@ -55,6 +55,7 @@ mod label_select;
 mod listed_facts;
 mod log_api;
 mod log_cmd;
+mod matrix;
 mod oci;
 mod oci_docker;
 mod oci_image;

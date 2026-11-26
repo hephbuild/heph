@@ -879,3 +879,68 @@ async fn api_url_reaches_the_asset_url_def_hash() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// T8: the per-platform example in `docs/MATRIX.md` (the block after its
+/// marker) evaluates through the real `release_asset`: three cells named
+/// `tool.<os>-<arch>`, each an `archive.extract` over its own fetch, and the
+/// matrix's `cells`/`default` naming them.
+#[tokio::test]
+async fn gh_release_matrix_example() -> anyhow::Result<()> {
+    const DOC: &str = include_str!("../../../../docs/MATRIX.md");
+    let (_, after) = DOC
+        .split_once("gh_release_matrix_example evaluates the block below")
+        .expect("the marker is in docs/MATRIX.md");
+    let block = after
+        .split_once("```python\n")
+        .and_then(|(_, rest)| rest.split_once("```"))
+        .map(|(block, _)| block)
+        .expect("a python block follows the marker");
+    let ws = workspace()?;
+    ws.write_build_file(
+        "p",
+        &format!(
+            "{}\ntarget(name = \"probe\", driver = \"http_fetch\", url = \"https://x\", cells = TOOL.cells, default = TOOL.default)\n",
+            block.replace("<sha256>", &"0".repeat(64))
+        ),
+    );
+
+    let names = ["tool.linux-amd64", "tool.linux-arm64", "tool.darwin-arm64"];
+    for n in names {
+        assert_eq!(
+            ws.get_spec(&format!("//p:{n}")).await?.driver,
+            "archive.extract"
+        );
+        assert_eq!(
+            ws.get_spec(&format!("//p:{n}_archive")).await?.driver,
+            "http_fetch"
+        );
+    }
+    let probe = ws.get_spec("//p:probe").await?;
+    let want_cells: std::collections::HashMap<String, hcore::htvalue::Value> = [
+        ("linux/amd64", names[0]),
+        ("linux/arm64", names[1]),
+        ("darwin/arm64", names[2]),
+    ]
+    .into_iter()
+    .map(|(k, n)| {
+        (
+            k.to_string(),
+            hcore::htvalue::Value::String(format!(":{n}")),
+        )
+    })
+    .collect();
+    assert_eq!(
+        probe.config.get("cells"),
+        Some(&hcore::htvalue::Value::Map(want_cells))
+    );
+    assert_eq!(
+        probe.config.get("default"),
+        Some(&hcore::htvalue::Value::String(format!(
+            ":tool.{}-{}",
+            hcore::htplatform::os(),
+            hcore::htplatform::arch()
+        ))),
+        "the host's cell, on every supported host"
+    );
+    Ok(())
+}
