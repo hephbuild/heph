@@ -847,10 +847,12 @@ fn spawn_sampler(
     faults: &Faults,
     shared: &Arc<Shared>,
 ) -> io::Result<(Sampler, mpsc::Receiver<Reading>)> {
-    let shared = Arc::clone(shared);
     // The sampler stops once the recorder has latched stopped: nothing would
-    // write its readings.
-    let latched = move || shared.is_stopped();
+    // write its readings. Weak, so a detached sampler thread does not keep
+    // the recorder's state (and the lock it owns) alive; once that is gone
+    // there is no recorder either.
+    let shared = Arc::downgrade(shared);
+    let latched = move || shared.upgrade().is_none_or(|s| s.is_stopped());
     let spawned = match &faults.sampler {
         Some(spawn) => (spawn.0)(Box::new(latched)),
         None => Sampler::spawn(latched),
@@ -1106,8 +1108,10 @@ impl Recorder {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
-        if let Some(sampler) = sampler {
-            sampler.stop(sampler::STOP_WAIT.min(timeout));
+        if let Some(sampler) = sampler
+            && sampler.stop(sampler::STOP_WAIT.min(timeout)) == sampler::SamplerExit::Detached
+        {
+            tracing::debug!("the machine sampler did not stop in time; detached");
         }
         if !shared.is_stopped() {
             let (ack, acked) = mpsc::sync_channel(1);
@@ -1129,7 +1133,8 @@ impl Recorder {
                 shared.pending.fetch_sub(1, Ordering::Relaxed);
             }
             if sent {
-                match acked.recv_timeout(timeout) {
+                // What is left of `timeout` after the sampler's stop.
+                match acked.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                     Ok(()) | Err(RecvTimeoutError::Disconnected) => {}
                     // The thread still holds the write connection and may yet
                     // commit `End` and seal: the lock stays with it (I2, I3).
