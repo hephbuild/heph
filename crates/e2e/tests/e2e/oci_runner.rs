@@ -294,15 +294,38 @@ target(name = "runner", driver = "oci.runner", image = ":load")
 #[cfg(unix)]
 #[tokio::test]
 async fn a_reload_under_a_fixed_tag_moves_the_fingerprint() -> anyhow::Result<()> {
+    reload_moves_the_fingerprint(
+        r#"target(name = "runner", driver = "oci.runner", image = ":load")"#,
+    )
+    .await
+}
+
+/// The same reload, with `image` given as the ref and the load in `deps`. The
+/// load's output is as unchanged as above, so a cached runner would keep
+/// serving the old digest: this form is not cached either.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_reload_under_a_fixed_tag_moves_a_reference_runners_fingerprint() -> anyhow::Result<()> {
+    reload_moves_the_fingerprint(
+        r#"target(name = "runner", driver = "oci.runner", image = "app:dev", deps = [":load"])"#,
+    )
+    .await
+}
+
+/// Builds `//svc:runner` (declared by `runner`, beside a load writing the fixed
+/// ref `app:dev`), swaps the image the daemon holds under that ref, and builds
+/// it again: the second build must inspect again and see the new digest.
+#[cfg(unix)]
+async fn reload_moves_the_fingerprint(runner: &str) -> anyhow::Result<()> {
     let bin = tempfile::tempdir()?;
     std::fs::write(bin.path().join("digest"), "sha256:one\n")?;
     let ws = stub_docker_workspace(bin.path())?;
     ws.write_build_file(
         "svc",
-        r#"
-target(name = "load", driver = "bash", run = "printf 'app:dev' > $OUT", out = "load.ref")
-target(name = "runner", driver = "oci.runner", image = ":load")
-"#,
+        &format!(
+            "target(name = \"load\", driver = \"bash\", run = \"printf 'app:dev' > $OUT\", \
+             out = \"load.ref\")\n{runner}\n"
+        ),
     );
     let before = common::artifact_string(&*ws.run("//svc:runner").await?);
 
@@ -315,6 +338,12 @@ target(name = "runner", driver = "oci.runner", image = ":load")
         after.contains("oci:sha256:two"),
         "the runner must re-resolve the digest behind an unchanged ref; got {after}"
     );
+    let calls = std::fs::read_to_string(bin.path().join("calls.log"))?;
+    assert_eq!(
+        calls.lines().collect::<Vec<_>>(),
+        ["image inspect --format {{.Id}} app:dev"; 2],
+        "each build must ask docker once"
+    );
     Ok(())
 }
 
@@ -323,22 +352,77 @@ target(name = "runner", driver = "oci.runner", image = ":load")
 #[cfg(unix)]
 #[tokio::test]
 async fn an_image_target_that_wrote_no_ref_is_refused() -> anyhow::Result<()> {
+    image_target_is_refused(
+        r#"target(name = "load", driver = "bash", run = "printf 'a:1\nb:2\n' > $OUT", out = "load.ref")"#,
+    )
+    .await
+}
+
+/// A ref the daemon does not hold names the ref, the `image` target that wrote
+/// it, and what that target must do — not the advice for a literal ref.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_absent_target_image_names_the_target() -> anyhow::Result<()> {
     let bin = tempfile::tempdir()?;
-    std::fs::write(bin.path().join("digest"), "sha256:one\n")?;
+    // No `digest` file: the stub's `cat` fails, as `docker image inspect` does
+    // for an image the daemon does not hold.
     let ws = stub_docker_workspace(bin.path())?;
     ws.write_build_file(
         "svc",
         r#"
-target(name = "load", driver = "bash", run = "printf 'a:1\nb:2\n' > $OUT", out = "load.ref")
+target(name = "load", driver = "bash", run = "printf 'app:dev' > $OUT", out = "load.ref")
 target(name = "runner", driver = "oci.runner", image = ":load")
 "#,
     );
 
     let err = match ws.run("//svc:runner").await {
-        Ok(_) => panic!("a two-line ref must fail the runner"),
+        Ok(_) => panic!("an image the daemon does not have must fail the build"),
         Err(e) => format!("{e:#}"),
     };
+    assert!(
+        err.contains("\"app:dev\", the ref the `image` target //svc:load wrote"),
+        "{err}"
+    );
     assert!(err.contains("oci.load"), "{err}");
+    assert!(!err.contains("as `image`"), "{err}");
+    Ok(())
+}
+
+/// A target with two outputs has no one ref to read: refused, not guessed.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_image_target_with_two_outputs_is_refused() -> anyhow::Result<()> {
+    image_target_is_refused(
+        r#"target(name = "load", driver = "bash", run = "printf 'app:dev' > a.ref; printf 'app:dev' > b.ref", out = ["a.ref", "b.ref"])"#,
+    )
+    .await
+}
+
+/// A target with no output wrote no ref at all.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_image_target_with_no_output_is_refused() -> anyhow::Result<()> {
+    image_target_is_refused(r#"target(name = "load", driver = "bash", run = "true")"#).await
+}
+
+/// Building `//svc:runner` with `image = ":load"` beside `load` fails naming
+/// what `image` expects and the target it named, before docker is asked.
+#[cfg(unix)]
+async fn image_target_is_refused(load: &str) -> anyhow::Result<()> {
+    let bin = tempfile::tempdir()?;
+    std::fs::write(bin.path().join("digest"), "sha256:one\n")?;
+    let ws = stub_docker_workspace(bin.path())?;
+    ws.write_build_file(
+        "svc",
+        &format!("{load}\ntarget(name = \"runner\", driver = \"oci.runner\", image = \":load\")\n"),
+    );
+
+    let Err(err) = ws.run("//svc:runner").await else {
+        anyhow::bail!("an `image` target that wrote no one ref must fail the runner");
+    };
+    let err = format!("{err:#}");
+    assert!(err.contains("oci.load"), "{err}");
+    assert!(err.contains("//svc:load"), "{err}");
     assert!(
         !bin.path().join("calls.log").exists(),
         "docker must not be asked about a guessed ref"

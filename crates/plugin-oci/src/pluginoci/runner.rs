@@ -62,6 +62,10 @@ const IMAGE_ORIGIN: &str = "image";
 /// mistake), and is refused before it is read into memory.
 const MAX_REF_LEN: u64 = 4096;
 
+/// What a target `image` must be, said wherever one turns out not to be.
+const NOT_A_REF: &str =
+    "`image` must name a target whose output is one image ref, such as an `oci.load`";
+
 #[derive(Spec)]
 pub(crate) struct TargetSpec {
     /// The image to run targets in: an `oci.load` target (`":load"`,
@@ -77,8 +81,9 @@ pub(crate) struct TargetSpec {
     #[spec(required)]
     pub image: String,
     /// Targets that must build first — with a reference `image`, normally the
-    /// `oci.load` that puts it in the daemon. Hashed, so a rebuilt image
-    /// re-derives the runner.
+    /// `oci.load` that puts it in the daemon. They only order the build: the
+    /// runner is never cached, so it inspects the image again on every build
+    /// whatever they produced.
     pub deps: Vec<String>,
     /// Extra `docker run` arguments for the held container: `--network`,
     /// additional `-v` mounts, `--user`. The workspace and heph mounts are
@@ -101,8 +106,10 @@ pub enum ImageSource {
     /// A reference written in the BUILD file, already in the daemon.
     Ref(String),
     /// The ref the `image` target wrote to its single output (an `oci.load`),
-    /// read at run. The address is in the input, not here.
-    Target,
+    /// read at run. Holds that target's address, formatted, for messages only:
+    /// it is kept off the def hash, where the input edge hashes the target by
+    /// its content.
+    Target(String),
 }
 
 #[derive(Debug)]
@@ -188,8 +195,8 @@ impl ManagedDriver for Driver {
         };
 
         let def = OciRunnerDef {
-            image: match image_target {
-                Some(_) => ImageSource::Target,
+            image: match &image_target {
+                Some(addr) => ImageSource::Target(addr.to_string()),
                 None => ImageSource::Ref(spec.image.clone()),
             },
             run_args: spec.run_args.clone(),
@@ -204,7 +211,7 @@ impl ManagedDriver for Driver {
             ImageSource::Ref(r) => h.update(r.as_bytes()),
             // A NUL no reference can hold keeps this apart from every `Ref`.
             // The address is hashed through the input edge, by its content.
-            ImageSource::Target => h.update(b"\0target"),
+            ImageSource::Target(_) => h.update(b"\0target"),
         }
         for a in &def.run_args {
             h.update(a.as_bytes());
@@ -239,22 +246,18 @@ impl ManagedDriver for Driver {
             });
         }
 
-        // With a reference `image`, local yes, remote never: the answer is a
-        // fact about *this* daemon's image store, and publishing it would let
-        // one machine's resolution key another's builds.
+        // Never cached, whichever way `image` is given. The answer is a fact
+        // about *this* daemon's image store, and nothing in this target's key
+        // follows it: a load's output is its ref, and a fixed `tag` makes that
+        // the same bytes whichever image it loaded. A target `image` (or a load
+        // in `deps` beside a reference) therefore keeps its key across a
+        // reload, and a cached runner would keep describing the old image.
+        // Remotely it would be worse still: one machine's resolution keying
+        // another's builds.
         //
-        // With a target `image`, not cached at all. The load's output is its
-        // ref, and a fixed `tag` makes that the same bytes whichever image it
-        // loaded — so the load's hashout, and with it this target's key, would
-        // not move when the image did, and a cached runner would keep
-        // describing the old one. Re-resolving the digest is one `docker image
-        // inspect` beside an `oci.load` that runs every build anyway, and the
-        // consumers still key on `runner.json`'s bytes, which move exactly when
-        // the digest does.
-        let cache = match def.image {
-            ImageSource::Ref(_) => CacheConfig::on(false),
-            ImageSource::Target => CacheConfig::off(),
-        };
+        // The cost is one `docker image inspect` per build. Consumers still key
+        // on `runner.json`'s bytes, which move exactly when the digest does, so
+        // they stay cache hits until the image really changes.
 
         let out_path = hmodel::htpkg::join_rel_checked(pkg.as_str(), OUT_FILE)
             .with_context(|| format!("resolving {OUT_FILE} in package {pkg}"))?;
@@ -273,7 +276,7 @@ impl ManagedDriver for Driver {
                         collect: true,
                     }],
                 }],
-                cache,
+                cache: CacheConfig::off(),
                 hash,
                 resources: spec.resources,
                 ..Default::default()
@@ -305,16 +308,21 @@ impl ManagedDriver for Driver {
             )
         })?;
         let def = req.request.target.def_de::<OciRunnerDef>().clone();
-        let image = match def.image {
-            ImageSource::Ref(r) => r,
-            ImageSource::Target => {
-                let path = super::dep_single_file(&req, IMAGE_ORIGIN).context(
-                    "`image` must name a target with one output holding an image ref, such as \
-                     an `oci.load`",
-                )?;
-                read_image_ref(&path)?
+        let image = match &def.image {
+            ImageSource::Ref(r) => r.clone(),
+            ImageSource::Target(addr) => {
+                let path = super::dep_single_file(&req, IMAGE_ORIGIN).with_context(|| {
+                    format!("locating the ref the `image` target {addr} wrote; {NOT_A_REF}")
+                })?;
+                read_image_ref(&path, addr)?
             }
         };
+        match &def.image {
+            ImageSource::Ref(_) => tracing::info!(image = %image, source = "ref", "inspecting"),
+            ImageSource::Target(addr) => {
+                tracing::info!(image = %image, source = "target", target = %addr, "inspecting");
+            }
+        }
 
         // The digest, from the daemon. Resolved rather than trusted: a tag is a
         // moving pointer, and a fingerprint that recorded the tag would not move
@@ -340,12 +348,17 @@ impl ManagedDriver for Driver {
                 ctoken,
             )
             .await
-            .with_context(|| {
-                format!(
+            .with_context(|| match &def.image {
+                ImageSource::Ref(_) => format!(
                     "resolving the digest of image {image:?}. It must already be in the local \
                      daemon — name the `oci.load` target that puts it there as `image`, so \
                      loading it comes first and its ref is the one inspected."
-                )
+                ),
+                ImageSource::Target(addr) => format!(
+                    "resolving the digest of image {image:?}, the ref the `image` target {addr} \
+                     wrote. It must be in the local daemon this runner asks: {addr} must load \
+                     the image it names there, as an `oci.load` does."
+                ),
             })?
             .trim()
             .to_string()
@@ -406,32 +419,38 @@ impl ManagedDriver for Driver {
 /// Strict on everything else: a ref that came out empty, or as more than one
 /// line, is a producer that did not write a ref, and inspecting a guess at one
 /// would fingerprint the wrong image or fail with a message about the guess.
-fn read_image_ref(path: &std::path::Path) -> anyhow::Result<String> {
+/// A leading `-` is refused too: docker would read the ref as a flag.
+///
+/// `addr` is the `image` target's address, named in every error.
+fn read_image_ref(path: &std::path::Path, addr: &str) -> anyhow::Result<String> {
     use std::io::Read as _;
-    let not_a_ref = "`image` must name a target whose output is one image ref, such as an \
-                     `oci.load`";
     let mut raw = Vec::new();
     std::fs::File::open(path)
-        .with_context(|| format!("open the `image` target's output {path:?}"))?
+        .with_context(|| format!("open the output of the `image` target {addr} ({path:?})"))?
         // One byte over the cap, so an over-long file is told apart from one
         // exactly at it without reading the rest of it.
         .take(MAX_REF_LEN + 1)
         .read_to_end(&mut raw)
-        .with_context(|| format!("read the `image` target's output {path:?}"))?;
+        .with_context(|| format!("read the output of the `image` target {addr} ({path:?})"))?;
+    let what = || format!("the output of the `image` target {addr} ({path:?})");
     anyhow::ensure!(
         u64::try_from(raw.len()).is_ok_and(|n| n <= MAX_REF_LEN),
-        "the `image` target's output {path:?} is over {MAX_REF_LEN} bytes; {not_a_ref}"
+        "{} is over {MAX_REF_LEN} bytes; {NOT_A_REF}",
+        what()
     );
     let text = std::str::from_utf8(&raw)
-        .with_context(|| format!("the `image` target's output {path:?} is not text; {not_a_ref}"))?
+        .with_context(|| format!("{} is not text; {NOT_A_REF}", what()))?
         .trim();
-    anyhow::ensure!(
-        !text.is_empty(),
-        "the `image` target's output {path:?} is empty; {not_a_ref}"
-    );
+    anyhow::ensure!(!text.is_empty(), "{} is empty; {NOT_A_REF}", what());
     anyhow::ensure!(
         !text.contains(char::is_whitespace),
-        "the `image` target's output {path:?} holds more than one word ({text:?}); {not_a_ref}"
+        "{} holds more than one word ({text:?}); {NOT_A_REF}",
+        what()
+    );
+    anyhow::ensure!(
+        !text.starts_with('-'),
+        "{} starts with `-` ({text:?}), which docker would read as a flag; {NOT_A_REF}",
+        what()
     );
     Ok(text.to_string())
 }
@@ -480,7 +499,10 @@ mod tests {
             .expect("an `image` edge");
         assert_eq!(edge.r#ref.r#ref.format(), "//svc:load");
         assert!(edge.hashed && edge.runtime);
-        assert_eq!(def.def::<OciRunnerDef>().image, ImageSource::Target);
+        assert_eq!(
+            def.def::<OciRunnerDef>().image,
+            ImageSource::Target("//svc:load".to_string())
+        );
         assert!(!def.cache.enabled);
 
         let abs = parse("//svc:runner", &[("image", s("//img:load"))]).await?;
@@ -492,21 +514,105 @@ mod tests {
         Ok(())
     }
 
-    /// A reference `image` is as before: no edge, cached locally, never remotely.
+    /// The edge of an `image` target, as `image = value` in `//svc:runner`
+    /// parses it.
+    async fn image_edge(runner: &str, value: &str) -> anyhow::Result<Input> {
+        let def = parse(runner, &[("image", s(value))]).await?;
+        def.inputs
+            .into_iter()
+            .find(|i| i.origin_id == IMAGE_ORIGIN)
+            .context("an `image` edge")
+    }
+
+    /// An output group and variant args are part of the address the edge
+    /// names, and the address the def keeps for messages is the same one.
     #[tokio::test]
-    async fn a_reference_image_adds_no_edge_and_stays_locally_cached() -> anyhow::Result<()> {
+    async fn a_target_image_keeps_its_group_and_args() -> anyhow::Result<()> {
+        let edge = image_edge("//svc:runner", "//svc:load|grp").await?;
+        assert_eq!(edge.r#ref.r#ref.format(), "//svc:load");
+        assert_eq!(edge.r#ref.output.as_deref(), Some("grp"));
+        assert_eq!(edge.r#ref.to_string(), "//svc:load|grp");
+
+        let edge = image_edge("//svc:runner", "//svc:load@os=linux").await?;
+        assert_eq!(edge.r#ref.r#ref.format(), "//svc:load@os=linux");
+
+        let def = parse("//svc:runner", &[("image", s("//svc:load|grp"))]).await?;
+        assert_eq!(
+            def.def::<OciRunnerDef>().image,
+            ImageSource::Target("//svc:load|grp".to_string())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_target_image_names_the_value() -> anyhow::Result<()> {
+        let Err(err) = parse("//svc:runner", &[("image", s("//svc:lo:ad"))]).await else {
+            anyhow::bail!("`//svc:lo:ad` is not an address");
+        };
+        let err = format!("{err:#}");
+        assert!(
+            err.contains("parse `image` target \"//svc:lo:ad\""),
+            "{err}"
+        );
+        Ok(())
+    }
+
+    /// A relative `image` in the root package resolves there, not to `//svc`
+    /// or to an empty package that is not the root.
+    #[tokio::test]
+    async fn a_root_package_runner_resolves_a_relative_image_to_the_root() -> anyhow::Result<()> {
+        let edge = image_edge("//:runner", ":load").await?;
+        assert_eq!(edge.r#ref.r#ref.format(), "//:load");
+        Ok(())
+    }
+
+    /// Naming the load both as `image` and in `deps` is two edges, not one
+    /// that either origin could shadow.
+    #[tokio::test]
+    async fn a_target_image_also_in_deps_is_two_edges() -> anyhow::Result<()> {
+        let def = parse(
+            "//svc:runner",
+            &[
+                ("image", s(":load")),
+                ("deps", Value::List(vec![s(":load")])),
+            ],
+        )
+        .await?;
+        let mut origins = def
+            .inputs
+            .iter()
+            .map(|i| (i.origin_id.as_str(), i.r#ref.r#ref.format()))
+            .collect::<Vec<_>>();
+        origins.sort();
+        assert_eq!(
+            origins,
+            [
+                (IMAGE_ORIGIN, "//svc:load".to_string()),
+                ("oci_runner|0", "//svc:load".to_string()),
+            ]
+        );
+        Ok(())
+    }
+
+    /// A reference `image` adds no edge, and is not cached either: a load in
+    /// `deps` under a fixed tag writes the same ref whichever image it loaded.
+    #[tokio::test]
+    async fn a_reference_image_adds_no_edge_and_is_uncached() -> anyhow::Result<()> {
         let def = parse("//svc:runner", &[("image", s("app:dev"))]).await?;
         assert!(def.inputs.iter().all(|i| i.origin_id != IMAGE_ORIGIN));
         assert_eq!(
             def.def::<OciRunnerDef>().image,
             ImageSource::Ref("app:dev".to_string())
         );
-        assert!(def.cache.enabled && !def.cache.remote_enabled);
+        assert!(!def.cache.enabled && !def.cache.remote_enabled);
         Ok(())
     }
 
     /// Changing how `image` is given must not move an existing runner's def
     /// hash: every consumer of every reference runner would full-miss.
+    ///
+    /// The literal is what the driver hashed before target images existed
+    /// (at 51523fd80), so a change to the hash code is caught, not followed.
     #[tokio::test]
     async fn a_reference_runner_keeps_its_def_hash() -> anyhow::Result<()> {
         let def = parse(
@@ -517,13 +623,9 @@ mod tests {
             ],
         )
         .await?;
-        let mut h = Xxh3::new();
-        h.update(b"oci_runner");
-        h.update(&FORMAT_VERSION.to_le_bytes());
-        h.update(b"app:dev");
-        h.update(b"--network=host");
-        h.update(b"\x1f");
-        assert_eq!(def.hash, format!("{:x}", h.digest()).into_bytes());
+        // XXH3-64 of b"oci_runner" ‖ 1u32 LE ‖ b"app:dev" ‖ b"--network=host" ‖
+        // 0x1f, as base hashed it (`xxhsum -H3` agrees).
+        assert_eq!(std::str::from_utf8(&def.hash)?, "2d2132ad84fbad3d");
         Ok(())
     }
 
@@ -541,9 +643,15 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("load.ref");
         std::fs::write(&path, "bwan-rc-playwright:v1.57.0\n")?;
-        assert_eq!(read_image_ref(&path)?, "bwan-rc-playwright:v1.57.0");
+        assert_eq!(
+            read_image_ref(&path, "//svc:load")?,
+            "bwan-rc-playwright:v1.57.0"
+        );
         std::fs::write(&path, "localhost:5000/app:9f2c")?;
-        assert_eq!(read_image_ref(&path)?, "localhost:5000/app:9f2c");
+        assert_eq!(
+            read_image_ref(&path, "//svc:load")?,
+            "localhost:5000/app:9f2c"
+        );
         Ok(())
     }
 
@@ -555,22 +663,28 @@ mod tests {
         let path = dir.path().join("out");
         let over = "a".repeat(usize::try_from(MAX_REF_LEN)? + 1);
         let at_cap = "a".repeat(usize::try_from(MAX_REF_LEN)?);
-        let cases: [(&[u8], &str); 6] = [
+        let cases: [(&[u8], &str); 8] = [
             (b"", "is empty"),
             (b" \n\t\n", "is empty"),
             (b"app:dev\nother:tag\n", "more than one word"),
             (b"app dev", "more than one word"),
             (b"\xff\xfe\x00", "is not text"),
             (over.as_bytes(), "over 4096 bytes"),
+            (b"--help", "read as a flag"),
+            (b"-app:dev\n", "read as a flag"),
         ];
         for (body, want) in cases {
             std::fs::write(&path, body)?;
-            let err = format!("{:#}", read_image_ref(&path).expect_err("refused"));
+            let err = format!(
+                "{:#}",
+                read_image_ref(&path, "//svc:load").expect_err("refused")
+            );
             assert!(err.contains(want), "{body:?}: {err}");
             assert!(err.contains("oci.load"), "{body:?}: {err}");
+            assert!(err.contains("//svc:load"), "{body:?}: {err}");
         }
         std::fs::write(&path, &at_cap)?;
-        assert_eq!(read_image_ref(&path)?, at_cap);
+        assert_eq!(read_image_ref(&path, "//svc:load")?, at_cap);
         Ok(())
     }
 

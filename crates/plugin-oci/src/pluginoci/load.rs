@@ -812,6 +812,9 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         // The default group: the ref is the whole of what this target produces.
         assert_eq!(outputs[0].group, "");
+        // Exactly one path: `oci.runner` reads a target `image`'s single
+        // output as the ref, and a second file would make that fail.
+        assert_eq!(outputs[0].paths.len(), 1, "{:?}", outputs[0].paths);
         assert!(
             matches!(&outputs[0].paths[0].content, Content::FilePath(p) if p == "app/load.ref"),
             "got: {:?}",
