@@ -7,6 +7,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 struct Ws {
     dir: tempfile::TempDir,
@@ -37,6 +38,11 @@ impl Ws {
     /// `heph <args>` with the snapshot dir `snapshot` (`None`: not
     /// configured).
     fn heph(&self, snapshot: Option<&Path>, args: &[&str]) -> Output {
+        self.command(snapshot, args).output().expect("run heph")
+    }
+
+    /// The [`Self::heph`] command, not yet started.
+    fn command(&self, snapshot: Option<&Path>, args: &[&str]) -> Command {
         let mut cmd = Command::new(PathBuf::from(env!("CARGO_BIN_EXE_heph")));
         cmd.args(args)
             .current_dir(self.dir.path())
@@ -50,7 +56,7 @@ impl Ws {
             Some(dir) => cmd.env("HEPH_CACHE_SNAPSHOT", dir),
             None => cmd.env_remove("HEPH_CACHE_SNAPSHOT"),
         };
-        cmd.output().expect("run heph")
+        cmd
     }
 
     fn snapshot(&self, dir: Option<&Path>) -> (i32, serde_json::Value, Output) {
@@ -191,8 +197,9 @@ fn json_report_and_exit_codes() {
     assert_eq!(code, 0, "{}", describe(&out));
     assert_eq!(doc["outcome"]["kind"], "unchanged", "{doc}");
 
-    // 0, incomplete: a journal without its trailer is flagged, not refused.
-    ws.build(&snap, &["//:a"]);
+    // 0, incomplete: a journal without its trailer is flagged, not refused,
+    // and what it didn't touch (`a`) is carried over.
+    ws.build(&snap, &["//:b"]);
     let journal = ws.journals().pop().expect("a journal");
     let text = std::fs::read_to_string(&journal).expect("read journal");
     let cut: String = text
@@ -205,7 +212,13 @@ fn json_report_and_exit_codes() {
     assert_eq!(code, 0, "{}", describe(&out));
     assert_eq!(doc["complete"], false, "{doc}");
     assert_eq!(doc["incomplete"].as_array().map(Vec::len), Some(1), "{doc}");
-    // The human report flags it too.
+    assert_eq!(
+        doc["incomplete"][0]["reason"], "a recorder ended without its trailer",
+        "{doc}"
+    );
+    assert_eq!(u64_at(&doc, "/carried_over/count"), 1, "{doc}");
+    assert!(u64_at(&doc, "/carried_over/bytes") > 0, "{doc}");
+    // The human report flags it too, with what it carried (`b`).
     ws.build(&snap, &["//:a"]);
     let journal = ws.journals().pop().expect("a journal");
     let text = std::fs::read_to_string(&journal).expect("read journal");
@@ -214,7 +227,19 @@ fn json_report_and_exit_codes() {
     assert!(out.status.success(), "{}", describe(&out));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("snapshot: wrote gen-"), "{stdout}");
-    assert!(stdout.contains("incomplete: "), "{stdout}");
+    assert!(
+        stdout.contains("incomplete: a recorder ended without its trailer ("),
+        "{stdout}"
+    );
+    let carried = stdout
+        .lines()
+        .find(|l| l.starts_with("carried over: "))
+        .unwrap_or_else(|| panic!("a carried-over total: {stdout}"));
+    assert!(!carried.starts_with("carried over: 0 B"), "{stdout}");
+    assert!(
+        carried.contains("(1 revisions, 0 scratch slots)"),
+        "{stdout}"
+    );
 
     // 4: a journal from a newer heph; the message names it and says deleting
     // it is safe. Nothing is consumed.
@@ -242,4 +267,60 @@ fn json_report_and_exit_codes() {
     // 2: a usage error.
     let out = ws.heph(Some(&snap), &["tool", "cache", "snapshot", "--nope"]);
     assert_eq!(out.status.code(), Some(2), "{}", describe(&out));
+}
+
+/// 130: Ctrl-C while the command waits on a journal a live recorder holds.
+/// Nothing is consumed.
+#[test]
+fn ctrl_c_while_waiting_exits_130() {
+    let ws = Ws::new();
+    let snap = ws.dir.path().join("snap");
+    ws.build(&snap, &["//:a"]);
+    let journal = ws.journals().pop().expect("a journal");
+    // A live recorder: this process holds the journal's lock.
+    let recorder = std::fs::File::open(&journal).expect("open journal");
+    recorder.try_lock().expect("lock the journal");
+
+    let mut child = ws
+        .command(Some(&snap), &["tool", "cache", "snapshot", "--json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn heph");
+    // The command takes the snapshot lock, then waits on the journals; its
+    // Ctrl-C handler is armed before either.
+    let snapshot_lock = journal.with_file_name("snapshot.lock");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let probe = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&snapshot_lock)
+            .expect("open the snapshot lock");
+        if matches!(probe.try_lock(), Err(std::fs::TryLockError::WouldBlock)) {
+            break;
+        }
+        drop(probe);
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            panic!("heph exited before it waited: {status}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "heph never took the snapshot lock"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let pid = libc::pid_t::try_from(child.id()).expect("pid");
+    // SAFETY: kill(2) takes plain integers and touches no memory of ours.
+    unsafe { libc::kill(pid, libc::SIGINT) };
+
+    let out = child.wait_with_output().expect("wait for heph");
+    assert_eq!(out.status.code(), Some(130), "{}", describe(&out));
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("stdout is one JSON document ({e}): {}", describe(&out)));
+    assert_eq!(doc["reason"], "cancelled", "{doc}");
+    assert!(journal.exists(), "a cancelled snapshot consumes nothing");
+    drop(recorder);
 }

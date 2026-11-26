@@ -574,36 +574,60 @@ impl Fixture {
 
     /// The snapshot's one revision directory of `//pkg:<target>`.
     fn revision(&self, target: &str) -> std::path::PathBuf {
-        let mut dirs: Vec<std::path::PathBuf> =
-            std::fs::read_dir(self.generation().join("pkg").join(target))
-                .expect("the snapshot holds the target")
-                .map(|e| e.expect("dir entry").path())
-                .filter(|p| p.join("manifest-v2.borsh").is_file())
-                .collect();
-        assert_eq!(dirs.len(), 1, "one revision of {target}: {dirs:?}");
-        dirs.remove(0)
+        revision_in(&self.generation(), target)
     }
 
     /// The output blob of the snapshot's revision of `//pkg:<target>`.
     fn out_blob(&self, target: &str) -> std::path::PathBuf {
-        let dir = self.revision(target);
-        let blobs: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
-            .expect("read revision")
-            .map(|e| e.expect("dir entry").path())
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with("out_"))
-            })
-            .collect();
-        assert_eq!(
-            blobs.len(),
-            1,
-            "one output blob in {}: {blobs:?}",
-            dir.display()
-        );
-        blobs.into_iter().next().expect("one blob")
+        out_blob_in(&self.generation(), target)
     }
+}
+
+/// The one revision directory of `//pkg:<target>` in `generation`.
+fn revision_in(generation: &Path, target: &str) -> std::path::PathBuf {
+    let mut dirs: Vec<std::path::PathBuf> = std::fs::read_dir(generation.join("pkg").join(target))
+        .expect("the snapshot holds the target")
+        .map(|e| e.expect("dir entry").path())
+        .filter(|p| p.join("manifest-v2.borsh").is_file())
+        .collect();
+    assert_eq!(dirs.len(), 1, "one revision of {target}: {dirs:?}");
+    dirs.remove(0)
+}
+
+/// The output blob of `//pkg:<target>`'s one revision in `generation`.
+fn out_blob_in(generation: &Path, target: &str) -> std::path::PathBuf {
+    let dir = revision_in(generation, target);
+    let blobs: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+        .expect("read revision")
+        .map(|e| e.expect("dir entry").path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("out_"))
+        })
+        .collect();
+    assert_eq!(
+        blobs.len(),
+        1,
+        "one output blob in {}: {blobs:?}",
+        dir.display()
+    );
+    blobs.into_iter().next().expect("one blob")
+}
+
+/// The bytes of every file under `dir`.
+fn tree_bytes(dir: &Path) -> u64 {
+    std::fs::read_dir(dir)
+        .expect("read tree")
+        .map(|e| {
+            let e = e.expect("dir entry");
+            if e.file_type().expect("file type").is_dir() {
+                tree_bytes(&e.path())
+            } else {
+                e.metadata().expect("stat").len()
+            }
+        })
+        .sum()
 }
 
 fn rm_local_cache(root: &Path) {
@@ -1268,6 +1292,76 @@ mod degrades {
         }
     }
 
+    /// A revision of the same target planted under another `hashin`'s key
+    /// is passed over as damaged: the target rebuilds rather than be served
+    /// the old revision.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn same_target_under_another_key() {
+        let f = Fixture::new(RANDOM, &["//pkg:t"]).await;
+        // `t`'s command changes, so its key moves; the snapshot's revision
+        // of the old command is planted under the new key.
+        write_build(
+            f.root.path(),
+            r#"target(name = "t", driver = "bash", run = "echo moved > $OUT", out = "out.txt")"#,
+        );
+        let moved = hashin(f.root.path(), "//pkg:t").await;
+        let old = f.revision("t");
+        assert_ne!(
+            old.file_name().and_then(|n| n.to_str()),
+            Some(moved.as_str())
+        );
+        std::fs::rename(&old, old.with_file_name(&moved)).expect("plant the revision");
+
+        let (out, events) = run_one(&f.engine(Bucket::ReadOnly, false), "//pkg:t").await;
+        assert_eq!(served_by(&events, "//pkg:t"), None, "{events:#?}");
+        assert_eq!(outcome_of(&events, "//pkg:t"), Some(CacheOutcomeKind::Miss));
+        assert!(
+            tier_misses(&events).contains(&(
+                "//pkg:t".to_owned(),
+                "snapshot".to_owned(),
+                hcore::events::TierMissReason::Damaged
+            )),
+            "{events:#?}"
+        );
+        assert_eq!(out_text(&out), "moved");
+    }
+
+    /// A blob cut short after the hit, with no bucket behind the snapshot:
+    /// a reproducible target rebuilds to the bytes its manifest names, raw
+    /// and zstd alike.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn truncated_blob_without_a_bucket_rebuilds() {
+        let f = Fixture::new(
+            r#"
+target(name = "z", driver = "bash", run = "echo z > $OUT", out = "out.txt")
+target(name = "r", driver = "bash", run = "seq 1 600000 | gzip -n > $OUT", out = "out.gz")
+"#,
+            &["//pkg:z", "//pkg:r"],
+        )
+        .await;
+        for (target, zstd) in [("z", true), ("r", false)] {
+            let blob = f.out_blob(target);
+            assert_eq!(
+                blob.to_string_lossy().ends_with(".zst"),
+                zstd,
+                "{}",
+                blob.display()
+            );
+            let len = std::fs::metadata(&blob).expect("stat").len();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&blob)
+                .expect("open blob")
+                .set_len(len / 2)
+                .expect("truncate");
+        }
+        let e = f.engine(Bucket::Absent, false);
+        for a in ["//pkg:z", "//pkg:r"] {
+            let (out, _) = run_one(&e, a).await;
+            assert!(out == f.cold(a), "{a}: the rebuild matches");
+        }
+    }
+
     /// A zstd blob and a raw blob cut short after the restore: the hit stands
     /// on the snapshot's manifest, and the pull falls through to the bucket.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1453,6 +1547,82 @@ async fn export_skips_a_gc_trimmed_revision() {
         "{report:?}"
     );
     assert_eq!(report.new.count, 0, "{report:?}");
+}
+
+/// A leaf under `mid`, and two leaves of `top` beside it: `big`, a gzip
+/// payload over 1 MiB that is stored verbatim, and `small`, stored zstd.
+/// Reproducible; only `leaf`'s line moves with `version`.
+fn pass_through_build(version: &str) -> String {
+    format!(
+        r#"
+target(name = "leaf", driver = "bash", run = "echo leaf-{version} > $OUT", out = "leaf.txt")
+target(name = "big", driver = "bash", run = "seq 1 600000 | gzip -n > $OUT", out = "big.gz")
+target(name = "small", driver = "bash", run = "echo small > $OUT", out = "small.txt")
+target(name = "mid", driver = "bash", deps = {{"leaf": [":leaf"]}},
+       run = "cat $SRC_LEAF > $OUT", out = "mid.txt")
+target(name = "top", driver = "bash", deps = {{"mid": [":mid"], "big": [":big"], "small": [":small"]}},
+       run = "{{ cat $SRC_MID; gzip -dc $SRC_BIG | tail -n 1; cat $SRC_SMALL; }} > $OUT",
+       out = "top.txt")
+"#
+    )
+}
+
+/// A generation written by a job that never pulled its blobs still holds
+/// them: job 2 hits `top`, so its deps' blobs stay on the tier, and its
+/// export carries them from the previous generation. Job 3 changes the leaf
+/// and rebuilds its dependents from those blobs, raw and zstd alike.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blobs_survive_a_pass_through_generation() {
+    let root = tempfile::tempdir().expect("root");
+    let parent = tempfile::tempdir().expect("parent");
+    let dir = parent.path().join("snap");
+    let current = |dir: &Path| dir.join(read_marker(dir).expect("marker").marker.current);
+
+    // Job 1 builds everything.
+    write_build(root.path(), &pass_through_build("one"));
+    let (ws, _) = job(root.path(), &dir, &["//pkg:top"]).await;
+    let report = export(root.path(), &dir, &ws).await;
+    assert_eq!(report.new.count, 5, "{report:?}");
+    let big = out_blob_in(&current(&dir), "big");
+    assert!(
+        !big.to_string_lossy().ends_with(".zst")
+            && std::fs::metadata(&big).expect("stat").len() > 1 << 20,
+        "big is stored raw: {}",
+        big.display()
+    );
+    assert!(
+        out_blob_in(&current(&dir), "small")
+            .to_string_lossy()
+            .ends_with(".zst"),
+        "small is stored zstd"
+    );
+    rm_local_cache(root.path());
+
+    // Job 2, a fresh machine: `top` hits, and no dep's blob is pulled.
+    let (ws, events) = job(root.path(), &dir, &["//pkg:top"]).await;
+    assert_eq!(served_by(&events, "//pkg:top").as_deref(), Some("snapshot"));
+    let local = tree_bytes(&home(root.path()).join("cache"));
+    assert!(
+        local < 1 << 20,
+        "big's blob was pulled: {local} bytes local"
+    );
+    let report = export(root.path(), &dir, &ws).await;
+    assert_eq!(report.kept.count, 5, "{report:?}");
+    assert!(report.left_out.is_empty(), "{report:?}");
+    rm_local_cache(root.path());
+
+    // Job 3, a fresh machine, a changed leaf: its dependents rebuild from
+    // the pass-through generation's blobs.
+    write_build(root.path(), &pass_through_build("three"));
+    let e = job_engine(root.path(), &dir);
+    let (out, events) = run_one(&e, "//pkg:top").await;
+    assert_eq!(out_text(&out), "leaf-three\n600000\nsmall");
+    for a in ["//pkg:leaf", "//pkg:mid", "//pkg:top"] {
+        assert_eq!(outcome_of(&events, a), Some(CacheOutcomeKind::Miss), "{a}");
+    }
+    for a in ["//pkg:big", "//pkg:small"] {
+        assert_eq!(served_by(&events, a).as_deref(), Some("snapshot"), "{a}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1857,10 +2027,15 @@ fn slot_of(engine: &Engine, addr: &str) -> String {
 /// would (the snapshot command shares the build's config), consuming them.
 async fn export_scratch(root: &Path, dir: &Path, scope: &str, journals: usize) -> ExportReport {
     let ws = WorkingSet::from_journals(read_settled(root, journals).await);
+    export_scratch_ws(root, dir, scope, &ws).await
+}
+
+/// [`export_scratch`] of a working set the caller read.
+async fn export_scratch_ws(root: &Path, dir: &Path, scope: &str, ws: &WorkingSet) -> ExportReport {
     let lock = snapshot_lock(root);
     let e = scratch_engine(root, None, None, scope, &[], false);
     let report = e
-        .export_snapshot(&lock, dir, &ws, &StdCancellationToken::new())
+        .export_snapshot(&lock, dir, ws, &StdCancellationToken::new())
         .await
         .expect("export");
     for j in &ws.journals {
@@ -2000,6 +2175,103 @@ async fn a_job_that_used_no_slot_carries_them_over() {
     // Job 3 still restores what job 1 left in the slot.
     let three = tempfile::tempdir().expect("machine three");
     write_build(three.path(), &build("three"));
+    let e = scratch_engine(three.path(), Some(&dir), None, "main", &[], true);
+    let (out, _) = run_one(&e, "//pkg:a").await;
+    assert_eq!(out_text(&out), "c=one l=cold");
+}
+
+/// An incomplete job that used one slot carries over the previous
+/// generation's entries of the slots it did not use, when they are ones
+/// this heph reads: an entry whose meta does not decode, or whose archive is
+/// not a regular file, is dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_incomplete_run_carries_the_slots_it_did_not_use() {
+    let parent = tempfile::tempdir().expect("parent");
+    let dir = parent.path().join("snap");
+    // `x` uses a second traveling slot, `d`; `a`'s and `x`'s markers move
+    // apart.
+    let build = |a: &str, x: &str| {
+        format!(
+            "{}\ntarget(name = \"d\", driver = \"scratch\", path = \".cache/d\", env = \"D\", remote = True)\n\
+             target(name = \"x\", driver = \"bash\", out = \"x.txt\", scratch = [\"//pkg:d\"],\n       \
+             run = [\"echo \\\"d=$(cat $D/m 2>/dev/null || echo cold)\\\" > $OUT\", \"echo {x} > $D/m\"])\n",
+            scratch_build(a)
+        )
+    };
+
+    // Job 1 uses both slots.
+    let one = tempfile::tempdir().expect("machine one");
+    write_build(one.path(), &build("one", "one"));
+    let e = scratch_engine(one.path(), Some(&dir), None, "main", &[], true);
+    run_one(&e, "//pkg:a").await;
+    run_one(&e, "//pkg:x").await;
+    let carried = slot_of(&e, "//pkg:c");
+    drop(e);
+    let report = export_scratch(one.path(), &dir, "main", 1).await;
+    assert_eq!(report.scratch.new.count, 2, "{report:?}");
+    let carried_entries: Vec<String> = snapshot_scratch(&dir)
+        .into_iter()
+        .filter(|e| e.starts_with(&carried))
+        .collect();
+    assert_eq!(carried_entries.len(), 2, "{carried_entries:?}");
+
+    // Two entries this heph can't carry, beside `c`'s in the generation.
+    let current = read_marker(&dir).expect("marker").marker.current;
+    let v1 = dir.join(current).join("scratch").join("v1");
+    let c_meta = carried_entries
+        .iter()
+        .find(|e| e.ends_with(".meta"))
+        .map(|e| v1.join(e))
+        .expect("c's meta");
+    let stem = c_meta
+        .strip_prefix(v1.join(&carried))
+        .expect("under c's slot")
+        .to_string_lossy()
+        .trim_end_matches(".meta")
+        .to_owned();
+    let c_tar = v1.join(format!("{carried}/{stem}.tar.gz"));
+    for bad in ["bad-meta", "tar-not-a-file"] {
+        std::fs::create_dir_all(v1.join(bad).join("main")).expect("mkdir bad slot");
+    }
+    std::fs::write(v1.join(format!("bad-meta/{stem}.meta")), b"not borsh").expect("bad meta");
+    std::fs::copy(&c_tar, v1.join(format!("bad-meta/{stem}.tar.gz"))).expect("tar");
+    std::fs::copy(&c_meta, v1.join(format!("tar-not-a-file/{stem}.meta"))).expect("meta");
+    std::fs::create_dir(v1.join(format!("tar-not-a-file/{stem}.tar.gz"))).expect("tar dir");
+
+    // Job 2, a fresh machine: `x` changed and runs, `a` is not built, and
+    // a target failed.
+    let two = tempfile::tempdir().expect("machine two");
+    write_build(two.path(), &build("one", "two"));
+    let e = scratch_engine(two.path(), Some(&dir), None, "main", &[], true);
+    let (out, _) = run_one(&e, "//pkg:x").await;
+    assert_eq!(out_text(&out), "d=one");
+    drop(e);
+    let mut ws = WorkingSet::from_journals(read_settled(two.path(), 1).await);
+    ws.incomplete
+        .push((ws.journals[0].clone(), Incomplete::Failed));
+    let report = export_scratch_ws(two.path(), &dir, "main", &ws).await;
+    assert_eq!(report.incomplete.len(), 1, "{report:?}");
+    assert_eq!(report.scratch.new.count, 1, "`d`: {report:?}");
+    assert_eq!(report.scratch.carried_over.count, 1, "`c`: {report:?}");
+    assert!(report.scratch.carried_over.bytes > 0, "{report:?}");
+    assert_eq!(
+        report.scratch.dropped.count, 3,
+        "`d`'s previous entry and the two unreadable ones: {report:?}"
+    );
+    let entries = snapshot_scratch(&dir);
+    for e in &carried_entries {
+        assert!(entries.contains(e), "{e} carried: {entries:?}");
+    }
+    assert!(
+        !entries
+            .iter()
+            .any(|e| e.starts_with("bad-meta") || e.starts_with("tar-not-a-file")),
+        "{entries:?}"
+    );
+
+    // Job 3, `a` changed: it restores what job 1 left in `c`.
+    let three = tempfile::tempdir().expect("machine three");
+    write_build(three.path(), &build("three", "two"));
     let e = scratch_engine(three.path(), Some(&dir), None, "main", &[], true);
     let (out, _) = run_one(&e, "//pkg:a").await;
     assert_eq!(out_text(&out), "c=one l=cold");
