@@ -2726,6 +2726,37 @@ fn machine_names_pinned() {
     );
 }
 
+/// Spec row `short_recording_has_cpus_and_ram_only`, the derivation's half
+/// (show's half is in `show_prints_machine_line`): a recording that ended
+/// before the first tick derives the start-time figures only, with no busy
+/// row and no `heph.session.machine.*` / `heph.session.process.*` summary
+/// rows, rather than a NaN mean or a 0 peak.
+#[test]
+fn short_recording_has_cpus_and_ram_only() {
+    let id = now_id(35);
+    let s = id.started_unix_ms();
+    let info = tests::machine_records(s)
+        .into_iter()
+        .take(1)
+        .collect::<Vec<_>>();
+    let (_root, conn) = derived(id, &info, s + 500);
+    assert_eq!(
+        dump(&conn, "SELECT DISTINCT name FROM metrics ORDER BY name"),
+        [
+            "heph.machine.cpu.count",
+            "heph.machine.cpu.limit",
+            "heph.machine.memory.limit",
+        ]
+    );
+    assert_eq!(
+        dump(
+            &conn,
+            "SELECT count(*) FROM metrics WHERE value IS NULL OR value = 0"
+        ),
+        ["0"]
+    );
+}
+
 /// D30, the recording's half: per pool, a time-weighted held mean, the held
 /// peak and the time anything waited, written at the end and read back by
 /// [`store::read_pools`]. A value holds until the next row, and the last one
