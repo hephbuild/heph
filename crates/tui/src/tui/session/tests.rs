@@ -556,6 +556,7 @@ fn failed_derived_insert_rolls_back_the_batch() {
                     error: None,
                     upstream_of: None,
                     exit_status: None,
+                    exit_code: None,
                     log_tail: None,
                     timed_out: None,
                     cancelled: false,

@@ -67,6 +67,7 @@ fn end_record(at: u64, addr: &str) -> SessionRecord {
             error: None,
             upstream_of: None,
             exit_status: None,
+            exit_code: None,
             log_tail: None,
             timed_out: None,
             cancelled: false,
@@ -138,6 +139,7 @@ fn event_variant(kind: &BuildEventKind) -> usize {
         K::CodegenExcluded { .. } => 32,
         K::CodegenImported { .. } => 33,
         K::Unknown => 34,
+        K::StaleOutputChanged { .. } => 35,
     }
 }
 
@@ -189,6 +191,7 @@ fn every_event_kind() -> Vec<BuildEventKind> {
             error: err(),
             upstream_of: Some("//a:up".into()),
             exit_status: Some("exit 2".into()),
+            exit_code: Some(2),
             log_tail: Some(LogTailData {
                 text: "tail\n".into(),
                 start_line: 9,
@@ -244,6 +247,8 @@ fn every_event_kind() -> Vec<BuildEventKind> {
         K::CacheOutcome {
             addr: a(),
             outcome: CacheOutcomeKind::RemoteHit,
+            reason: Some("stale: host path /nix/store/x is gone".into()),
+            stale_host_path: Some("/nix/store/x".into()),
         },
         K::CacheHitRebuilt {
             addr: a(),
@@ -302,7 +307,10 @@ fn every_event_kind() -> Vec<BuildEventKind> {
             path_mismatch: true,
             error: err(),
         },
-        K::RemoteCacheHit { addr: a() },
+        K::RemoteCacheHit {
+            addr: a(),
+            cache: Some("r2".into()),
+        },
         K::RemoteCacheMiss { addr: a() },
         K::RemoteCacheReadStart { addr: a() },
         K::RemoteCacheReadEnd {
@@ -345,6 +353,7 @@ fn every_event_kind() -> Vec<BuildEventKind> {
             skipped: 1,
         },
         K::Unknown,
+        K::StaleOutputChanged { addr: a() },
     ]
 }
 
@@ -1419,6 +1428,8 @@ fn write_fixture(dir: &Path) {
             BuildEventKind::CacheOutcome {
                 addr: "//p:dep".into(),
                 outcome: CacheOutcomeKind::LocalHit,
+                reason: None,
+                stale_host_path: None,
             },
         ),
         end_record(s + 5, "//p:dep"),
@@ -1921,6 +1932,7 @@ fn explorer_golden_rows() {
             s + 3,
             BuildEventKind::RemoteCacheHit {
                 addr: "//q:a".into(),
+                cache: None,
             },
         ),
         ev(
@@ -1967,6 +1979,7 @@ fn explorer_golden_rows() {
                 error: Some("dep failed".into()),
                 upstream_of: Some("//q:a".into()),
                 exit_status: None,
+                exit_code: None,
                 log_tail: None,
                 timed_out: Some(TimedOutData {
                     timeout_ms: 1000,

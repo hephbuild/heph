@@ -650,6 +650,7 @@ pub(crate) fn is_critical(record: &SessionRecord) -> bool {
             | K::RemoteCacheMiss { .. }
             | K::CacheOutcome { .. }
             | K::CacheHitRebuilt { .. }
+            | K::StaleOutputChanged { .. }
             | K::ResultLockWaitStart { .. }
             | K::ResultLockWaitEnd { .. }
             | K::AdmissionWaitStart { .. }

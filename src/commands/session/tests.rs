@@ -2046,7 +2046,7 @@ async fn list_json_incomplete_is_null_when_the_status_is_unreadable() {
     let sources: [&dyn SessionSource; 1] = [&source];
     let json: serde_json::Value =
         serde_json::from_str(&run_list(&sources, Workspace::All, true).await).expect("json");
-    let s = &json["sessions"][0];
+    let s = &json[0];
     assert_eq!(s["state"], "unknown", "{s}");
     assert_eq!(s["incomplete"], serde_json::Value::Null, "{s}");
 }
@@ -2293,7 +2293,7 @@ async fn show_says_incomplete_when_truncated() {
     assert_eq!(json["incomplete_reason"], "size_cap", "{json}");
     let listed = run_list(&sources, Workspace::All, true).await;
     let listed: serde_json::Value = serde_json::from_str(&listed).expect("list json");
-    assert_eq!(listed["sessions"][0]["incomplete"], true, "{listed}");
+    assert_eq!(listed[0]["incomplete"], true, "{listed}");
     let table = run_list(&sources, Workspace::All, false).await;
     assert!(table.contains("  incomplete"), "{table}");
 
@@ -2338,7 +2338,7 @@ async fn show_says_incomplete_when_truncated() {
     assert_eq!(json["incomplete_reason"], serde_json::Value::Null, "{json}");
     let listed = run_list(&sources, Workspace::All, true).await;
     let listed: serde_json::Value = serde_json::from_str(&listed).expect("list json");
-    assert_eq!(listed["sessions"][0]["incomplete"], false, "{listed}");
+    assert_eq!(listed[0]["incomplete"], false, "{listed}");
 }
 
 /// A record that does not decode is skipped, counted in the text and in
@@ -2407,6 +2407,7 @@ async fn a_lost_session_sealed_by_cleanup_still_reads() {
             error: None,
             upstream_of: None,
             exit_status: None,
+            exit_code: None,
             log_tail: None,
             timed_out: None,
             spans: Vec::new(),
@@ -2488,9 +2489,15 @@ async fn a_lost_session_sealed_by_cleanup_still_reads() {
     let sources: [&dyn SessionSource; 1] = [&file];
 
     let mut out = Vec::new();
-    list::list(&sources, opts(), Workspace::All, false, &mut out)
-        .await
-        .expect("list");
+    list::list(
+        &sources,
+        opts(),
+        Workspace::All,
+        &json_args(false),
+        piped(&mut out),
+    )
+    .await
+    .expect("list");
     let table = String::from_utf8(out).expect("utf-8");
     let row = table
         .lines()
@@ -2499,19 +2506,31 @@ async fn a_lost_session_sealed_by_cleanup_still_reads() {
     assert!(row.contains("lost"), "{table}");
 
     let mut out = Vec::new();
-    list::list(&sources, opts(), Workspace::All, true, &mut out)
-        .await
-        .expect("list --json");
+    list::list(
+        &sources,
+        opts(),
+        Workspace::All,
+        &json_args(true),
+        piped(&mut out),
+    )
+    .await
+    .expect("list --json");
     let json: serde_json::Value = serde_json::from_slice(&out).expect("json");
-    let s = &json["sessions"][0];
+    let s = &json[0];
     assert_eq!(s["id"], id.encode(), "{json}");
     assert_eq!(s["state"], "lost", "{s}");
     assert_eq!(s["exit_code"], serde_json::Value::Null, "{s}");
 
     let mut out = Vec::new();
-    show::show(&sources, opts(), &id.encode(), false, &mut out)
-        .await
-        .expect("show");
+    show::show(
+        &sources,
+        opts(),
+        &id.encode(),
+        &json_args(false),
+        piped(&mut out),
+    )
+    .await
+    .expect("show");
     let text = String::from_utf8(out).expect("utf-8");
     assert!(
         text.contains("the process went away without recording its end"),
@@ -2523,9 +2542,15 @@ async fn a_lost_session_sealed_by_cleanup_still_reads() {
     );
 
     let mut out = Vec::new();
-    show::show(&sources, opts(), &id.encode(), true, &mut out)
-        .await
-        .expect("show --json");
+    show::show(
+        &sources,
+        opts(),
+        &id.encode(),
+        &json_args(true),
+        piped(&mut out),
+    )
+    .await
+    .expect("show --json");
     let json: serde_json::Value = serde_json::from_slice(&out).expect("json");
     assert_eq!(json["state"], "lost", "{json}");
     assert_eq!(json["pools"], serde_json::json!([]), "{json}");

@@ -384,6 +384,7 @@ mod tests {
                 error: Some(r#"said "type":"Log""#.into()),
                 upstream_of: None,
                 exit_status: None,
+                exit_code: None,
                 log_tail: None,
                 timed_out: None,
                 spans: Vec::new(),

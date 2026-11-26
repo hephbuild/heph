@@ -368,6 +368,7 @@ mod tests {
             progress: None,
             now: Some("//a:b (1s)".to_owned()),
             blocked_on: Vec::new(),
+            incomplete: Some(true),
             format: Some(2),
         })
     }

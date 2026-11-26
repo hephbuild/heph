@@ -283,7 +283,7 @@ pub(crate) struct Next {
 /// and the text says why.
 #[derive(Debug, Clone, Copy, Serialize, output::Shape)]
 #[serde(rename_all = "snake_case")]
-enum IncompleteReason {
+pub(crate) enum IncompleteReason {
     /// The recording passed its size cap: output and log lines past it were
     /// dropped, and past the ceiling nothing but the end was recorded.
     SizeCap,
@@ -808,6 +808,14 @@ mod tests {
     #[test]
     fn record_keys_subset_of_fields() -> anyhow::Result<()> {
         let snapshot = SessionSnapshot::default();
+        let pools = [PoolSummary {
+            pool: "cpu".to_owned(),
+            unit: "{cpu}".to_owned(),
+            capacity: Some(8.0),
+            held_mean: 1.5,
+            held_peak: 4.0,
+            waiting_us: 10,
+        }];
         let view = ShowView::new(
             "id".to_owned(),
             SessionState::Running,
@@ -821,6 +829,9 @@ mod tests {
                 reason: String::new(),
             },
             Some(ApprovalStanding::Approve),
+            1,
+            true,
+            &pools,
             &snapshot,
         );
         output::check_keys(&view)?;

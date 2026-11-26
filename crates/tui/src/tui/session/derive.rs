@@ -485,7 +485,9 @@ impl Deriver {
                     None,
                 ));
             }
-            K::CacheOutcome { addr, outcome } => {
+            // `reason`/`stale_host_path` are not mapped yet: span attribute
+            // names freeze at release (I9), so naming them is a follow-up.
+            K::CacheOutcome { addr, outcome, .. } => {
                 let v = serde_json::to_value(outcome).unwrap_or(Value::Null);
                 if let Some(open) = self.oldest(addr) {
                     open.attrs.insert("heph.cache".into(), v);
@@ -612,6 +614,9 @@ impl Deriver {
             | K::GcFailureLogsSwept { .. }
             | K::GcCacheDb { .. }
             | K::CodegenImported { .. }
+            // A span event for it is a follow-up: event names freeze at
+            // release (I9).
+            | K::StaleOutputChanged { .. }
             | K::Unknown => {}
         }
     }

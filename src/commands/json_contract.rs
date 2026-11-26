@@ -453,6 +453,8 @@ mod tests {
                 Derived(htui::tui::session::format::ApprovalStanding::__OUTPUT_SHAPE)
             }
             "ListTotal" => Derived(htui::tui::session::format::ListTotal::__OUTPUT_SHAPE),
+            "PoolSummary" => Derived(htui::tui::session::store::PoolSummary::__OUTPUT_SHAPE),
+            "IncompleteReason" => Derived(session::show::IncompleteReason::__OUTPUT_SHAPE),
             "PathResult" => Derived(tool::codegen::keep::PathResult::__OUTPUT_SHAPE),
             "PathResultKind" => Derived(tool::codegen::keep::PathResultKind::__OUTPUT_SHAPE),
             "WhyItem" => Derived(tool::codegen::why::WhyItem::__OUTPUT_SHAPE),

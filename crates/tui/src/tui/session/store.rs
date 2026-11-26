@@ -1012,7 +1012,7 @@ pub fn read_status(conn: &Connection) -> rusqlite::Result<Option<String>> {
 /// `heph.session.pool.*` rows derivation writes when the session finishes,
 /// and the pool's last `heph.pool.capacity`. Amounts are in `unit` (`{cpu}`,
 /// `By` or `1`). Part of `heph session show --json`'s `pools`.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, output_derive::Shape)]
 pub struct PoolSummary {
     pub pool: String,
     pub unit: String,
@@ -1116,6 +1116,7 @@ pub fn event_kind_and_addr(kind: &BuildEventKind) -> (&'static str, Option<&str>
         K::LocalCacheMiss { addr } => ("LocalCacheMiss", Some(addr)),
         K::CacheOutcome { addr, .. } => ("CacheOutcome", Some(addr)),
         K::CacheHitRebuilt { addr, .. } => ("CacheHitRebuilt", Some(addr)),
+        K::StaleOutputChanged { addr } => ("StaleOutputChanged", Some(addr)),
         K::LocalCacheWriteStart { addr } => ("LocalCacheWriteStart", Some(addr)),
         K::LocalCacheWriteEnd { addr, .. } => ("LocalCacheWriteEnd", Some(addr)),
         K::ResultLockWaitStart { addr, .. } => ("ResultLockWaitStart", Some(addr)),
