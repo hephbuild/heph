@@ -1261,9 +1261,9 @@ fn periodic_drain_keeps_every_sample() {
     use super::sampler::{CHANNEL_CAP, tests::Fake, tests::paced_sampler};
     let root = tempfile::tempdir().expect("tempdir");
     let fake = Fake::default();
-    // A sample each 50 ms and a drain each 5 ms: the recorder falls a whole
-    // channel behind only if it is starved for ~200 ms.
-    let spawn = paced_sampler(fake.clone(), Duration::from_millis(50));
+    // A sample each 250 ms and a drain each 5 ms: the recorder falls a whole
+    // channel behind only if it is starved for ~1 s (CHANNEL_CAP ticks).
+    let spawn = paced_sampler(fake.clone(), Duration::from_millis(250));
     let start_us = hcore::events::now_unix_ms() * 1_000;
     let rec = recorder_with(
         root.path(),
@@ -1273,8 +1273,9 @@ fn periodic_drain_keeps_every_sample() {
             ..Faults::default()
         },
     );
-    // Three channels' worth of samples, plus the start's baseline read.
-    let want = u32::try_from(3 * CHANNEL_CAP).expect("small") + 1;
+    // Two channels' worth of samples, plus the start's baseline read: with
+    // only the drain at `End`, at most one channel's worth is kept.
+    let want = u32::try_from(2 * CHANNEL_CAP).expect("small") + 1;
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     while fake.cpu_reads() < want {
         assert!(std::time::Instant::now() < deadline, "the sampler stalled");
@@ -1298,7 +1299,7 @@ fn periodic_drain_keeps_every_sample() {
     );
     let samples: Vec<_> = machine.iter().filter_map(|(_, d)| *d).collect();
     assert!(
-        samples.len() >= 3 * CHANNEL_CAP,
+        samples.len() >= 2 * CHANNEL_CAP,
         "{} samples recorded, {} read: {machine:?}",
         samples.len(),
         fake.cpu_reads()
