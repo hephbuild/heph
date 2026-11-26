@@ -141,16 +141,17 @@ def _tool(platform):
 TOOL = heph.core.matrix(
     axes = {"platform": ["linux/amd64", "linux/arm64", "darwin/arm64"]},
     cell = _tool,
-    default = "host",
+    default = {"platform": heph.core.host()},
 )
 ```
 
 `TOOL.default` is the host's tool (`tools = [TOOL.default]`); `TOOL.cells` maps
 every platform to its tool, so a darwin laptop can bundle the `linux/arm64` one.
-Every cell is an ordinary target (`//p:tool.linux-arm64`). A host with no cell
-fails only where `.default` is read, with a message listing the cells. A
-consumer of `TOOL.default` has the host's address in its config, so its cache
-key moves with the host.
+Every cell is an ordinary target (`//p:tool.linux-arm64`). On a host with no
+cell the `heph.core.matrix()` call fails, with a message listing the cells
+(leave `default` out to evaluate the file anywhere). A consumer of
+`TOOL.default` has the host's address in its config, so its cache key moves
+with the host.
 
 The asset name is not templated: `http_fetch`'s `{goos}`-style placeholders
 take one `sha256` for every platform, so they cannot pin a per-platform asset.
