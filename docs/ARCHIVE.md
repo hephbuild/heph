@@ -42,6 +42,30 @@ target(
 `create`'s `strip_prefix` + `prefix` and `extract`'s `strip_components` are
 inverses: the example round-trips to `unpacked/bin/tool`.
 
+A tool is one file, so the unpacked directory is a tool only when it holds
+exactly one. To put one binary from a larger archive on a target's `PATH`,
+pick it out with a `group` (still in `//tool/BUILD`):
+
+```python
+target(name = "tool", driver = "group", deps = [":unpacked"],
+       include = ["tool/unpacked/bin/tool"])
+
+target(name = "use", driver = "bash", run = ["tool --version"],
+       tools = [":tool"])
+```
+
+An `include` matches a dep's paths workspace-relative, `<package>/<out>/…`
+(here package `tool`, directory `unpacked`), or as the dep's own BUILD file
+writes them (`unpacked/bin/tool`). `heph inspect outputs //tool:unpacked`
+lists them. A `[filter]` on the tool reference does the same job without a
+group, and takes the workspace-relative form only:
+`tools = ["//tool:unpacked[tool/unpacked/bin/tool]"]`.
+
+A tool whose output is a glob or a directory, as a filtering `group`'s or an
+`archive.extract`'s is, is held to one file when the consumer runs, not at
+`heph query` or `heph validate`: an `include` that matches two files, or
+none, fails the consumer, naming the tool and the files it found.
+
 ## `archive.extract`
 
 | Option | Default | |

@@ -379,3 +379,84 @@ target(
     );
     Ok(())
 }
+
+/// One binary out of an unpacked archive is a tool: `archive.extract`'s
+/// output is a directory, and a group with `include` picks the binary out
+/// of it.
+#[tokio::test]
+async fn a_file_picked_out_of_an_extracted_archive_is_a_tool() -> anyhow::Result<()> {
+    let ws = workspace()?;
+    let mut build = PRODUCERS.to_string();
+    build.push_str(
+        r#"
+target(
+    name = "pack",
+    driver = "archive.create",
+    deps = [":a", ":b"],
+    strip_prefix = "p/out",
+    out = "pack.tar.gz",
+)
+target(name = "unpacked", driver = "archive.extract", src = ":pack")
+target(name = "b_tool", driver = "group", deps = [":unpacked"], include = ["p/unpacked/sub/b.sh"])
+target(
+    name = "use",
+    driver = "bash",
+    run = ["b.sh > $OUT"],
+    out = "out.txt",
+    tools = [":b_tool"],
+)
+"#,
+    );
+    ws.write_build_file("p", &build);
+
+    let result = ws.run("//p:use").await?;
+    assert_eq!(
+        files(&result),
+        vec![("p/out.txt".to_string(), "bee\n".to_string(), false)]
+    );
+    Ok(())
+}
+
+/// An `archive.extract` used directly as a tool is held to one file when the
+/// consumer runs: a one-file archive is a tool, a two-file one fails naming
+/// the extract, and a `[filter]` on the reference that leaves one file is a
+/// tool again — the count sees what staging places.
+#[tokio::test]
+async fn an_extracted_directory_is_a_tool_when_it_holds_one_file() -> anyhow::Result<()> {
+    let ws = workspace()?;
+    let mut build = PRODUCERS.to_string();
+    build.push_str(
+        r#"
+target(name = "pack1", driver = "archive.create", deps = [":b"], strip_prefix = "p/out", out = "pack1.tar.gz")
+target(name = "pack2", driver = "archive.create", deps = [":a", ":b"], strip_prefix = "p/out", out = "pack2.tar.gz")
+target(name = "one", driver = "archive.extract", src = ":pack1")
+target(name = "two", driver = "archive.extract", src = ":pack2")
+[
+    target(name = "use_" + n, driver = "bash", run = ["b.sh > $OUT"], out = "out.txt", tools = [t])
+    for n, t in [("one", ":one"), ("two", ":two"), ("filtered", ":two[p/two/sub/b.sh]")]
+]
+"#,
+    );
+    ws.write_build_file("p", &build);
+
+    for addr in ["//p:use_one", "//p:use_filtered"] {
+        let result = ws.run(addr).await?;
+        assert_eq!(
+            files(&result),
+            vec![("p/out.txt".to_string(), "bee\n".to_string(), false)],
+            "{addr}"
+        );
+    }
+
+    let err = ws
+        .run("//p:use_two")
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("a two-file extract must not be a tool"))?;
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("tool target '//p:two' must produce exactly 1 file, found 2: p/two/a.txt, p/two/sub/b.sh"),
+        "{msg}"
+    );
+    Ok(())
+}

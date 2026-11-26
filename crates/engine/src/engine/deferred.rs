@@ -605,14 +605,13 @@ impl Engine {
         // build target — a binary, an OCI layer — would otherwise buffer its whole
         // output in memory and only then discover there is no single value, which
         // makes the *error* path the expensive one.
-        let mut names: Vec<String> = Vec::new();
-        for artifact in &res.artifacts {
-            for path in artifact.entry_paths()? {
-                names.push(path.to_string_lossy().into_owned());
-            }
-        }
+        let names = crate::engine::link::exposed_entry_paths(
+            &res.artifacts,
+            // No filter: every path. (`PathFilter::default()` matches none.)
+            &hcore::hartifactcontent::PathFilter::new(&[]),
+        )
+        .with_context(|| format!("listing {addr}'s files"))?;
         if names.len() != 1 {
-            names.sort();
             anyhow::bail!(
                 "{addr} produces {} files ({}), so there is no single value to read. A value \
                  producer emits one file — split the target, or narrow its `out`",
@@ -620,7 +619,11 @@ impl Engine {
                 if names.is_empty() {
                     "none".to_string()
                 } else {
-                    names.join(", ")
+                    names
+                        .iter()
+                        .map(|p| p.to_string_lossy())
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 }
             );
         }

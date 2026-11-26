@@ -663,3 +663,141 @@ target(
     assert!(common::artifact_string(&result).contains("a"));
     Ok(())
 }
+
+/// A filtering or relocating group whose output is one file is a tool like
+/// the target that produced the file: its declared output is a glob, so how
+/// many files it holds is known only once it has run, and linking must not
+/// count the declaration's `FilePath`s.
+#[tokio::test]
+async fn transforming_group_of_one_file_is_a_tool() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        PKG,
+        r##"
+target(
+    name = "bin",
+    driver = "bash",
+    run = 'printf "#!/bin/sh\necho hello from tool\n" > $OUT && chmod +x $OUT',
+    out = "tool",
+)
+target(name = "g_include", driver = "group", deps = [":bin"], include = ["reloc/tool"])
+target(name = "g_rename", driver = "group", deps = [":bin"], rename = "tool2")
+target(name = "g_prefix", driver = "group", deps = [":bin"], prefix = "x")
+[
+    target(
+        name = "use_" + n,
+        driver = "bash",
+        run = [cmd + " > $OUT"],
+        out = "out.txt",
+        tools = [":g_" + n],
+    )
+    for n, cmd in [("include", "tool"), ("rename", "tool2"), ("prefix", "tool")]
+]
+"##,
+    );
+
+    for n in ["include", "rename", "prefix"] {
+        let result = ws.run(&format!("//reloc:use_{n}")).await?;
+        assert_eq!(
+            common::artifact_string(&result),
+            "hello from tool\n",
+            "use_{n}"
+        );
+    }
+    Ok(())
+}
+
+/// The tool rule still holds once the count is known: a transforming group
+/// that re-exports two files is not one tool, and the run says so, naming
+/// the group.
+#[tokio::test]
+async fn transforming_group_of_two_files_is_not_a_tool() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        PKG,
+        r#"
+target(name = "a", driver = "bash", run = "echo a > $OUT", out = "a")
+target(name = "b", driver = "bash", run = "echo b > $OUT", out = "b")
+target(name = "g", driver = "group", deps = [":a", ":b"], prefix = "x")
+target(
+    name = "use",
+    driver = "bash",
+    run = ["a > $OUT"],
+    out = "out.txt",
+    tools = [":g"],
+)
+"#,
+    );
+
+    let err = ws
+        .run("//reloc:use")
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("a two-file group must not link as a tool"))?;
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("//reloc:g") && msg.contains("exactly 1 file"),
+        "{msg}"
+    );
+    Ok(())
+}
+
+/// An `include` that matches nothing is a tool of no file: the run says so,
+/// names the group, and says how the paths are spelled.
+#[tokio::test]
+async fn transforming_group_of_no_file_says_how_paths_are_spelled() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        PKG,
+        r#"
+target(name = "bin", driver = "bash", run = "echo a > $OUT", out = "tool")
+target(name = "g", driver = "group", deps = [":bin"], include = ["nope"])
+target(name = "use", driver = "bash", run = ["tool > $OUT"], out = "out.txt", tools = [":g"])
+"#,
+    );
+
+    let err = ws
+        .run("//reloc:use")
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("an empty group must not link as a tool"))?;
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("tool target '//reloc:g' must produce exactly 1 file, found 0")
+            && msg.contains("`<package>/<out>/…`")
+            && msg.contains("heph inspect outputs"),
+        "{msg}"
+    );
+    Ok(())
+}
+
+/// [`changing_the_transform_invalidates_the_consumers_cache_key`] through a
+/// tool reference: the group is counted at run, and its transform must still
+/// reach the consumer's cache key.
+#[tokio::test]
+async fn changing_a_tool_groups_transform_invalidates_the_consumers_cache_key() -> anyhow::Result<()>
+{
+    let build = |rename: &str| {
+        format!(
+            r#"
+target(name = "bin", driver = "bash", run = "echo a > $OUT", out = "tool")
+target(name = "g", driver = "group", deps = [":bin"], rename = "{rename}")
+target(name = "consumer", driver = "bash", run = "ls bin > $OUT", out = "r.txt", tools = [":g"])
+"#
+        )
+    };
+
+    let ws = Workspace::new();
+    ws.write_build_file(PKG, &build("t1"));
+    let with_t1 = hashin(&ws, "//reloc:consumer").await?;
+
+    let ws2 = Workspace::new();
+    ws2.write_build_file(PKG, &build("t2"));
+    let with_t2 = hashin(&ws2, "//reloc:consumer").await?;
+
+    assert_ne!(
+        with_t1, with_t2,
+        "a consumer's hashin must change when its tool group's `rename` changes"
+    );
+    Ok(())
+}

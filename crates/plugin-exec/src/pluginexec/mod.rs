@@ -2298,7 +2298,9 @@ impl Driver {
             //
             // Multi-output tool refs produce N RunInputs sharing one
             // origin_id; the bridge appends every output's file path to the
-            // same list file. engine/link.rs validates 1 FilePath per output.
+            // same list file. The engine holds each output to 1 file: at link
+            // (engine/link.rs) when its declaration counts them, else at run
+            // over its artifacts (`Engine::inputs_result_exec`).
             let mut linked: std::collections::HashSet<std::ffi::OsString> =
                 std::collections::HashSet::new();
             for (group, inputs) in &def.tool_group_inputs {
