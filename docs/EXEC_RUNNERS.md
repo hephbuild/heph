@@ -405,14 +405,22 @@ gcroot.
 target(
     name = "runner",
     driver = "oci.runner",
-    image = "myimage:dev",
-    deps = ["//svc:load"],      # the oci.load that puts it in the daemon
+    image = "//svc:load",       # the oci.load that puts the image in the daemon
 )
 ```
 
+`image` names the `oci.load` target, and the runner inspects the ref that load
+wrote to its output: the ref is written once, on the load, whether its `tag` is
+derived or fixed. `image` may instead be a reference already in the daemon
+(`image = "myimage:dev"`, with the load in `deps` so it runs first).
+
 The fingerprint is the image's content digest, resolved from the daemon. A tag
 is a moving pointer; retagging `:latest` moves the digest, which re-keys every
-consumer. The container is launched **by digest**, so the container that runs
+consumer. A runner whose `image` is a target is therefore not cached: a load
+with a fixed `tag` writes the same ref whichever image it loaded, so nothing in
+the runner's inputs moves on a reload, and the digest is re-read on every build
+(one `docker image inspect`, beside a load that runs every build anyway). A
+runner given a reference is cached locally and never remotely. The container is launched **by digest**, so the container that runs
 the build is the one the fingerprint describes even if the tag moves mid-build.
 
 One container is held open and each target enters it with `docker exec`. The
