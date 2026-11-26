@@ -741,3 +741,63 @@ target(
     );
     Ok(())
 }
+
+/// An `include` that matches nothing is a tool of no file: the run says so,
+/// names the group, and says how the paths are spelled.
+#[tokio::test]
+async fn transforming_group_of_no_file_says_how_paths_are_spelled() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        PKG,
+        r#"
+target(name = "bin", driver = "bash", run = "echo a > $OUT", out = "tool")
+target(name = "g", driver = "group", deps = [":bin"], include = ["nope"])
+target(name = "use", driver = "bash", run = ["tool > $OUT"], out = "out.txt", tools = [":g"])
+"#,
+    );
+
+    let err = ws
+        .run("//reloc:use")
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("an empty group must not link as a tool"))?;
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("tool target '//reloc:g' must produce exactly 1 file, found 0")
+            && msg.contains("`<package>/<out>/…`")
+            && msg.contains("heph inspect outputs"),
+        "{msg}"
+    );
+    Ok(())
+}
+
+/// [`changing_the_transform_invalidates_the_consumers_cache_key`] through a
+/// tool reference: the group is counted at run, and its transform must still
+/// reach the consumer's cache key.
+#[tokio::test]
+async fn changing_a_tool_groups_transform_invalidates_the_consumers_cache_key() -> anyhow::Result<()>
+{
+    let build = |rename: &str| {
+        format!(
+            r#"
+target(name = "bin", driver = "bash", run = "echo a > $OUT", out = "tool")
+target(name = "g", driver = "group", deps = [":bin"], rename = "{rename}")
+target(name = "consumer", driver = "bash", run = "ls bin > $OUT", out = "r.txt", tools = [":g"])
+"#
+        )
+    };
+
+    let ws = Workspace::new();
+    ws.write_build_file(PKG, &build("t1"));
+    let with_t1 = hashin(&ws, "//reloc:consumer").await?;
+
+    let ws2 = Workspace::new();
+    ws2.write_build_file(PKG, &build("t2"));
+    let with_t2 = hashin(&ws2, "//reloc:consumer").await?;
+
+    assert_ne!(
+        with_t1, with_t2,
+        "a consumer's hashin must change when its tool group's `rename` changes"
+    );
+    Ok(())
+}

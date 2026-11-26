@@ -2,7 +2,7 @@ use crate::engine::driver::inputartifact::{InputArtifact, Type};
 use crate::engine::driver::outputartifact::OutputArtifact;
 use crate::engine::driver::{RunInput, RunRequest, RunResponse};
 use crate::engine::error::SandboxFate;
-use crate::engine::link::{LinkedTargetDef, LinkedTargetDefInput};
+use crate::engine::link::{self, LinkedTargetDef, LinkedTargetDefInput};
 use crate::engine::provider::TargetSpec;
 use crate::engine::request_state::RequestState;
 use crate::engine::result::{OutputMatcher, ResultOptions};
@@ -10,6 +10,7 @@ use crate::engine::{Engine, InteractiveInner, InteractiveWrapper};
 use anyhow::Context;
 use async_recursion::async_recursion;
 use enclose::enclose;
+use hcore::hartifactcontent::PathFilter;
 use hmodel::htaddr::Addr;
 use std::sync::Arc;
 
@@ -874,14 +875,17 @@ impl Engine {
                 for output in &input.tool_outputs_counted_at_run {
                     // The one selected output's artifacts are `res`'s; with
                     // several, ask for that output's alone (memoized).
-                    let own;
                     let artifacts = if input.output_names.len() == 1 {
-                        &res.artifacts
+                        res.artifacts.clone()
                     } else {
-                        own = engine.clone().result_addr(rc.clone(), &input.target.addr, OutputMatcher::Exact(vec![output.clone()]), &ResultOptions::default()).await?;
-                        &own.artifacts
+                        engine.clone().result_addr(rc.clone(), &input.target.addr, OutputMatcher::Exact(vec![output.clone()]), &ResultOptions::default()).await?.artifacts.clone()
                     };
-                    crate::engine::link::check_tool_output_files(&input.target.addr, output, artifacts)?;
+                    // Counting reads artifact indexes: off the workers.
+                    let (addr, output, filters) = (input.target.addr.clone(), output.clone(), input.filters.clone());
+                    hcore::blocking::run(move || {
+                        link::check_tool_output_files(&addr, &output, &artifacts, &PathFilter::new(&filters))
+                    })
+                    .await?;
                 }
                 let dep_inputs = res.artifacts.iter().map(|art| RunInput {
                     artifact: InputArtifact {

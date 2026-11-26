@@ -95,12 +95,17 @@ heph.gh.release_asset(name = "gh", repo = "cli/cli", tag = "v2.40.0",
 # the directory p/tools/gh/
 ```
 
-A directory is not a tool; to put `gh` on a target's `PATH`, pick the binary
-out of it with a `group` ([ARCHIVE.md](ARCHIVE.md)):
+A tool is one file; to put `gh` on a target's `PATH`, pick the binary out of
+the directory with a `group` ([ARCHIVE.md](ARCHIVE.md)):
 
 ```python
 target(name = "gh_bin", driver = "group", deps = [":gh"], include = ["p/gh/bin/gh"])
 ```
+
+An `include` matches a dep's paths workspace-relative, `<package>/<out>/…`
+(`p/gh/bin/gh`), or package-relative (`gh/bin/gh`); `heph inspect outputs //p:gh`
+lists them. The one-file check happens when the consumer runs, not at
+`heph query` or `heph validate`.
 
 With `extract`, `out` may not be `asset`: the archive is already that file.
 

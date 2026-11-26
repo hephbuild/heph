@@ -771,3 +771,46 @@ target(
     assert_eq!(content.trim(), "/mine", "got {content:?}");
     Ok(())
 }
+
+/// A tool with several outputs, one a glob: the glob output is counted on
+/// its own artifacts when the consumer runs, beside a file output linking
+/// already counted. One file in the glob links both onto `PATH`; two fail,
+/// naming that output.
+#[tokio::test]
+async fn a_multi_output_tool_counts_its_glob_output_at_run() -> anyhow::Result<()> {
+    let build = |files: &str| {
+        format!(
+            r##"
+target(
+    name = "t",
+    driver = "bash",
+    run = 'mkdir g && for f in {files}; do printf "#!/bin/sh\necho $f\n" > g/$f; done && printf "#!/bin/sh\necho c\n" > conf && chmod +x g/* conf',
+    out = {{"g": "g/*", "conf": "conf"}},
+)
+target(name = "use", driver = "bash", run = "x > $OUT && conf >> $OUT", out = "out.txt", tools = [":t"])
+"##
+        )
+    };
+
+    let ws = Workspace::new();
+    ws.write_build_file("multi", &build("x"));
+    let result = ws.run("//multi:use").await?;
+    assert_eq!(common::artifact_string(&result), "x\nc\n");
+
+    let ws = Workspace::new();
+    ws.write_build_file("multi", &build("x y"));
+    let err = ws
+        .run("//multi:use")
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("two files in the glob output must not be a tool"))?;
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains(
+            "tool target '//multi:t' output 'g' must produce exactly 1 file, found 2: \
+             multi/g/x, multi/g/y"
+        ),
+        "{msg}"
+    );
+    Ok(())
+}
