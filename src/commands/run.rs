@@ -837,17 +837,24 @@ impl RunApp {
             let pauser = pauser.clone();
             let session = Arc::clone(&session);
             Box::pin(async move {
-                let _guard = match &pauser {
+                let guard = match &pauser {
                     Some(p) => Some(p.pause_for(tui::PauseFor::Output).await),
                     None => None,
                 };
                 let _quiet = hengine::engine::diag::global().suppress_stall();
                 let result = inner(None, None, None, None).await;
-                // Before `_guard` resumes the TUI, and before any error renders:
-                // this leaves the terminal cooked again, whatever the run returned.
+                // Before any error renders: this leaves the terminal cooked
+                // again, whatever the run returned.
                 let pump = session.lock().unwrap_or_else(|e| e.into_inner()).take();
                 if let Some(pump) = pump {
                     pump.finish().await;
+                }
+                // The TUI does not come back once the tool has gone: what heph
+                // still does (removing the sandbox, uploads) runs with it down.
+                // A resume reads the terminal, and would take what the user
+                // typed for their shell.
+                if let Some(guard) = guard {
+                    guard.keep_until_exit();
                 }
                 result
             })

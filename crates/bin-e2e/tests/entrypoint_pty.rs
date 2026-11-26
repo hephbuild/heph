@@ -166,6 +166,14 @@ echo "tool-pid-$$."
 echo "quick-""end"
 exit 0
 """)
+target(name = "litter", driver = "bash", entrypoint = True, workdir = "sandbox", run = """
+# Removing these takes heph far longer than a TUI tick, once the tool has gone.
+mkdir -p d{1..100}/e{1..100}
+echo "tool-pid-$$."
+echo "heph-pid-$PPID."
+echo "litter-""end"
+exit 0
+""")
 target(name = "daemon", driver = "bash", entrypoint = True, run = """
 (
   trap '' HUP
@@ -1401,6 +1409,26 @@ fn bytes_typed_after_exit_reach_the_shell() -> anyhow::Result<()> {
     common::wait_until("the tool to be gone", SHORT, || !common::alive(tool));
     pty.type_line("echo typed''-after");
     pty.wait_for("typed-after", SHORT);
+    Ok(())
+}
+
+/// The same while heph is still finishing: the TUI stays down after the tool,
+/// since coming back means reading the terminal. The sandbox the tool filled
+/// takes heph long enough to remove that a resume would have happened, and
+/// taken the line.
+#[test]
+fn bytes_typed_while_heph_finishes_reach_the_shell() -> anyhow::Result<()> {
+    let dist = Dist::locate();
+    let ws = workspace()?;
+    let mut pty = Pty::shell(&dist, ws.root(), &[]);
+    pty.type_line(r#""$HEPH" run //app:litter"#);
+    pty.wait_for("litter-end", DEADLINE);
+    let (heph, tool) = (pty.number_after("heph-pid-"), pty.number_after("tool-pid-"));
+    common::wait_until("the tool to be gone", SHORT, || !common::alive(tool));
+    pty.type_line("echo typed''-while-finishing");
+    // Or the line went in after heph, which tests nothing.
+    assert!(running(heph), "heph had already left\n{}", pty.seen());
+    pty.wait_for("typed-while-finishing", SHORT);
     Ok(())
 }
 
