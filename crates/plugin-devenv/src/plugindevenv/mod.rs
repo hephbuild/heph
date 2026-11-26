@@ -1412,7 +1412,8 @@ mod log_tests {
                     ..Default::default()
                 }),
             };
-            let err = match Driver::new()
+            let home = tempfile::tempdir().expect("tempdir");
+            let err = match Driver::new(home.path())
                 .parse(parse, &StdCancellationToken::new())
                 .await
             {

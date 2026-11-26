@@ -48,6 +48,12 @@ pub const NO_JSON: &[Exempt] = &[
         reason: "a terminal UI; `heph session show --json` is the snapshot",
     },
     Exempt {
+        path: "session export",
+        refusal: Refusal::NoFlags,
+        reason: "its output is a `.hephsession` file, or its path; \
+                 `heph session show <file> --json` reads one",
+    },
+    Exempt {
         path: "auth login",
         refusal: Refusal::NoFlags,
         reason: "interactive: runs sign-in commands that talk to the user",
@@ -455,6 +461,11 @@ mod tests {
             "ListTotal" => Derived(htui::tui::session::format::ListTotal::__OUTPUT_SHAPE),
             "PoolSummary" => Derived(htui::tui::session::store::PoolSummary::__OUTPUT_SHAPE),
             "IncompleteReason" => Derived(session::show::IncompleteReason::__OUTPUT_SHAPE),
+            "StateJson" => Derived(session::show::StateJson::__OUTPUT_SHAPE),
+            "ForeignJson" => Derived(session::show::ForeignJson::__OUTPUT_SHAPE),
+            "Partial" => Derived(session::show::Partial::__OUTPUT_SHAPE),
+            "NoticeJson" => Derived(session::show::NoticeJson::__OUTPUT_SHAPE),
+            "FailureLogJson" => Derived(session::show::FailureLogJson::__OUTPUT_SHAPE),
             "PathResult" => Derived(tool::codegen::keep::PathResult::__OUTPUT_SHAPE),
             "PathResultKind" => Derived(tool::codegen::keep::PathResultKind::__OUTPUT_SHAPE),
             "WhyItem" => Derived(tool::codegen::why::WhyItem::__OUTPUT_SHAPE),

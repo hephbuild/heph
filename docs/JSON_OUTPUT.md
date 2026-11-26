@@ -283,6 +283,7 @@ These have no output flags; `--json`, `--fields` or `--jq` on them exits 2.
 |---|---|---|
 | `heph log` | its output is the log's bytes | `heph inspect failure --json` for the log's path |
 | `heph session attach` | a terminal UI | `heph session show --json` |
+| `heph session export` | its output is a `.hephsession` file, or its path | `heph session show <file> --json` |
 | `heph inspect deps -i` | a terminal UI | `heph inspect deps --json` |
 | `heph auth login` | interactive: it runs sign-in commands that talk to the user | `heph auth status --json` for what needs signing in to |
 | `heph tool completions` | its output is a shell script | |

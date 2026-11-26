@@ -241,12 +241,12 @@ impl SessionArgs {
 }
 
 impl SessionCommands {
-    /// Whether the command was asked for `--json`.
+    /// Whether the command was asked for `--json` (or `--fields`/`--jq`).
     fn json(&self) -> bool {
         match self {
-            Self::List(a) => a.json,
-            Self::Show(a) => a.json,
-            Self::Inflight(a) => a.json,
+            Self::List(a) => a.out.enabled(),
+            Self::Show(a) => a.out.enabled(),
+            Self::Inflight(a) => a.out.enabled(),
             Self::Attach(_) | Self::Export(_) => false,
         }
     }

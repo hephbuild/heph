@@ -45,7 +45,15 @@ pub(super) async fn show_with(
     opener: &reference::Opener,
 ) -> anyhow::Result<String> {
     let mut out = Vec::new();
-    show::show(sources, opts(), arg, json, &mut out, opener).await?;
+    show::show(
+        sources,
+        opts(),
+        arg,
+        &json_args(json),
+        piped(&mut out),
+        opener,
+    )
+    .await?;
     Ok(String::from_utf8(out).expect("utf-8"))
 }
 
@@ -59,7 +67,8 @@ pub(super) async fn attach_captured(
     let sink = crate::tui::LogSink::new_direct_with(Arc::clone(&slot));
     // The line backend never switches the sink back: every line lands here.
     let mut rx = sink.switch_to_buffered();
-    let res = attach::attach(
+    // Boxed: `attach`'s future is over clippy's `large_futures` threshold.
+    let res = Box::pin(attach::attach(
         sources,
         opts(),
         arg,
@@ -70,7 +79,7 @@ pub(super) async fn attach_captured(
             ..Default::default()
         },
         opener,
-    )
+    ))
     .await;
     let mut printed = Vec::new();
     while let Ok(line) = rx.try_recv() {

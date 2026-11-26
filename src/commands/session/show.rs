@@ -325,7 +325,7 @@ pub(crate) enum NextKind {
 /// it came from, whether it is whole, and the notices and root failure logs
 /// its export carried. Absent for a local session.
 #[derive(Serialize, output::Shape)]
-struct ForeignJson<'a> {
+pub(crate) struct ForeignJson<'a> {
     /// The path, or the URL without its credentials.
     origin: &'a str,
     /// `snapshot` (exported while it ran) or `incomplete` (no end
@@ -337,7 +337,7 @@ struct ForeignJson<'a> {
 
 #[derive(Debug, Clone, Copy, Serialize, output::Shape)]
 #[serde(rename_all = "snake_case")]
-enum Partial {
+pub(crate) enum Partial {
     Snapshot,
     Incomplete,
 }
@@ -350,7 +350,7 @@ enum Partial {
 /// layer's field table cannot list; the values are the same strings.
 #[derive(Debug, Clone, Copy, Serialize, output::Shape)]
 #[serde(rename_all = "snake_case")]
-enum StateJson {
+pub(crate) enum StateJson {
     Running,
     Waiting,
     Quiet,
@@ -379,7 +379,7 @@ impl StateJson {
 }
 
 #[derive(Serialize, output::Shape)]
-struct NoticeJson<'a> {
+pub(crate) struct NoticeJson<'a> {
     addr: &'a str,
     seq: u64,
     name: &'a str,
@@ -387,7 +387,7 @@ struct NoticeJson<'a> {
 }
 
 #[derive(Serialize, output::Shape)]
-struct FailureLogJson<'a> {
+pub(crate) struct FailureLogJson<'a> {
     addr: &'a str,
     /// The log's last bytes (at most 1 MiB), as UTF-8 with invalid bytes
     /// replaced.

@@ -1491,7 +1491,8 @@ async fn attach_mirrors_the_session_exit() {
         let sources = &sources;
         let slot = &slot;
         async move {
-            attach::attach(
+            // Boxed: `attach`'s future is over clippy's `large_futures` threshold.
+            Box::pin(attach::attach(
                 sources,
                 opts(),
                 &id.encode(),
@@ -1502,7 +1503,7 @@ async fn attach_mirrors_the_session_exit() {
                     ..Default::default()
                 },
                 &no_opener(),
-            )
+            ))
             .await
         }
     };
@@ -2479,6 +2480,7 @@ async fn export_is_self_contained() {
             error: Some("exit status: 1".to_owned()),
             upstream_of: upstream_of.map(str::to_owned),
             exit_status: None,
+            exit_code: None,
             log_tail: None,
             timed_out: None,
             cancelled: false,

@@ -218,6 +218,16 @@ impl Fetcher {
             .client_builder()
             .build()
             .context("build download client")?;
+        self.open_on(&client, url, opts).await
+    }
+
+    /// [`open_with`](Self::open_with) past its scheme check, on `client`.
+    async fn open_on<'u>(
+        &self,
+        client: &reqwest::Client,
+        url: &'u str,
+        opts: RequestOptions<'_>,
+    ) -> anyhow::Result<Body<'u>> {
         let mut req = client.get(url);
         for (name, value) in opts.headers {
             req = req.header(name.as_str(), value.as_str());
@@ -881,7 +891,10 @@ mod tests {
             let client = fetcher.client_builder().https_only(false).build().unwrap();
             let url = format!("http://{addr}/x.hephsession");
             let err = block_on_own_runtime(&url, async {
-                fetcher.open_with(&client, &url).await.map(|_body| ())
+                fetcher
+                    .open_on(&client, &url, RequestOptions::default())
+                    .await
+                    .map(|_body| ())
             })
             .expect_err(&location);
             let refused = err
