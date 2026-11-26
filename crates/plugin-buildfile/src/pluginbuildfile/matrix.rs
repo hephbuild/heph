@@ -5,21 +5,19 @@
 //! The builtin declares nothing and never reads what a cell returns (I1, I3):
 //! a target a cell declares is exactly what the cell called, as if the BUILD
 //! file had written the same calls on that line. Keys and cell order are a pure
-//! function of `axes`, `exclude` and `include` (I4); only *which* cell
-//! `.default` reads depends on the host, and a host with no cell raises only
-//! when `.default` is read (I8).
+//! function of `axes`, `exclude` and `include` (I4). `default` is a dict of
+//! fixed axis values, checked at the call like every other argument: the
+//! builtin never reads the host (`default = {"platform": heph.core.host()}` is
+//! the BUILD file reading it).
 //!
 //! The planning half (validation, the cross product, `exclude`/`include`, the
 //! default) is plain Rust over strings, so it is tested without an evaluator;
 //! [`matrix`] is the Starlark half.
 
-use crate::pluginbuildfile::run_file::{Extra, Host, rel_display};
+use crate::pluginbuildfile::run_file::{Extra, render_span};
 use allocative::Allocative;
-use either::Either;
 use starlark::any::ProvidesStaticType;
-use starlark::environment::{Methods, MethodsBuilder, MethodsStatic};
 use starlark::eval::Evaluator;
-use starlark::starlark_module;
 use starlark::values::dict::{AllocDict, DictRef, DictType};
 use starlark::values::list::{ListRef, ListType};
 use starlark::values::none::NoneOr;
@@ -29,6 +27,7 @@ use starlark::values::{
     AllocValue, Freeze, FreezeResult, Freezer, FrozenValue, Heap, NoSerialize, StarlarkValue,
     Trace, UnpackValue, Value, ValueLike, starlark_value,
 };
+use std::collections::HashSet;
 use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
@@ -39,7 +38,7 @@ use std::sync::Arc;
 /// breaks nothing.
 pub(crate) const MAX_CELLS: u64 = 1024;
 
-/// How many cells the "no cell for this host" error lists before eliding.
+/// How many cells the "default names no cell" error lists before eliding.
 const LISTED_CELLS: usize = 16;
 
 /// Starlark keywords: an axis named like one could not be a parameter of the
@@ -80,10 +79,14 @@ pub(crate) type Cell = Vec<String>;
 pub(crate) type Entry = Vec<(String, String)>;
 
 impl Axes {
+    /// Validates the axes. The cross product is checked against the limit
+    /// before any value is, so the work here is bounded by [`MAX_CELLS`]
+    /// whatever the input (I10).
     pub(crate) fn new(site: &Site, entries: Vec<(String, Vec<String>)>) -> anyhow::Result<Self> {
         if entries.is_empty() {
             return Err(site.err("`axes` is empty; give at least one axis"));
         }
+        check_count(site, entries.iter().map(|(_, v)| v.len()), 0)?;
         let mut names = Vec::with_capacity(entries.len());
         let mut values = Vec::with_capacity(entries.len());
         for (name, vals) in entries {
@@ -96,12 +99,14 @@ impl Axes {
             if vals.is_empty() {
                 return Err(site.err(format_args!("axis {name:?} has no values")));
             }
-            for (i, v) in vals.iter().enumerate() {
+            let mut seen: HashSet<&str> = HashSet::with_capacity(vals.len());
+            for v in &vals {
                 validate_value(site, &name, v)?;
-                if vals.get(..i).is_some_and(|before| before.contains(v)) {
+                if !seen.insert(v) {
                     return Err(site.err(format_args!("axis {name:?} lists {v:?} twice")));
                 }
             }
+            drop(seen);
             names.push(name);
             values.push(vals);
         }
@@ -168,6 +173,33 @@ fn thousands(n: u64) -> String {
     out
 }
 
+/// Refuses a matrix of more than [`MAX_CELLS`] cells: the product of the axis
+/// lengths, multiplied with overflow checks, plus `include`. Counted before
+/// `exclude`: the count a run would pay for, not what is left after it.
+pub(crate) fn check_count(
+    site: &Site,
+    lens: impl IntoIterator<Item = usize>,
+    include: usize,
+) -> anyhow::Result<()> {
+    let total = lens
+        .into_iter()
+        .try_fold(1u64, |acc, n| acc.checked_mul(n as u64))
+        .and_then(|p| p.checked_add(include as u64));
+    match total {
+        Some(n) if n <= MAX_CELLS => Ok(()),
+        Some(n) => Err(anyhow::anyhow!(
+            "heph.core.matrix() at {site} would have {} cells; the limit is {}",
+            thousands(n),
+            thousands(MAX_CELLS),
+        )),
+        None => Err(anyhow::anyhow!(
+            "heph.core.matrix() at {site} would have more than {} cells; the limit is {}",
+            thousands(u64::MAX),
+            thousands(MAX_CELLS),
+        )),
+    }
+}
+
 /// The cells of the matrix, in cell order: the cross product (last axis
 /// fastest) minus `exclude`, then `include` in list order (D15). Checks the
 /// cell limit before enumerating anything (I10).
@@ -177,36 +209,19 @@ pub(crate) fn plan(
     exclude: &[Entry],
     include: &[Entry],
 ) -> anyhow::Result<Vec<Cell>> {
-    // Multiplied with overflow checks, before `exclude`: the count a run would
-    // pay for, not what is left after it.
-    let product = axes
-        .values
-        .iter()
-        .try_fold(1u64, |acc, v| acc.checked_mul(v.len() as u64));
-    let total = product.and_then(|p| p.checked_add(include.len() as u64));
-    match total {
-        Some(n) if n <= MAX_CELLS => {}
-        Some(n) => {
-            return Err(anyhow::anyhow!(
-                "heph.core.matrix() at {site} would have {} cells; the limit is {}",
-                thousands(n),
-                thousands(MAX_CELLS),
-            ));
-        }
-        None => {
-            return Err(anyhow::anyhow!(
-                "heph.core.matrix() at {site} would have more than {} cells; the limit is {}",
-                thousands(u64::MAX),
-                thousands(MAX_CELLS),
-            ));
-        }
-    }
+    check_count(site, axes.values.iter().map(Vec::len), include.len())?;
 
     // An exclude may name a subset of the axes, only axes that exist, and must
     // match a cell of the full cross product: a value outside its axis is a
-    // stale exclude, which is a typo.
+    // stale exclude, which is a typo. An empty one would match every cell.
     let mut excludes: Vec<Vec<(usize, &str)>> = Vec::with_capacity(exclude.len());
     for e in exclude {
+        if e.is_empty() {
+            return Err(site.err(
+                "exclude {} names no axis, so it would remove every cell; an exclude entry \
+                 names at least one axis",
+            ));
+        }
         let mut m = Vec::with_capacity(e.len());
         for (axis, value) in e {
             let Some(i) = axes.index(axis) else {
@@ -256,7 +271,8 @@ pub(crate) fn plan(
     }
 
     // An include gives every axis and nothing else; its value may be outside
-    // the axis list. It may add back an excluded cell, never one still there.
+    // the axis list (which it does not extend). It may add back an excluded
+    // cell, never one still there.
     for e in include {
         let mut cell: Vec<Option<String>> = vec![None; axes.names.len()];
         for (axis, value) in e {
@@ -304,106 +320,25 @@ fn describe_entry(e: &Entry) -> String {
     format!("{{{}}}", describe(&names, &values))
 }
 
-/// The `default` argument, once unpacked.
-#[derive(Debug)]
-pub(crate) enum DefaultArg {
-    /// `default = "host"`.
-    Host,
-    /// `default = {axis: value}`; `"host"` stands for the host's platform.
-    Dict(Entry),
-}
-
-/// Which cell `.default` reads, worked out at the call.
-#[derive(Debug, PartialEq)]
-pub(crate) enum DefaultCell {
-    /// The index into the plan's cells.
-    Index(usize),
-    /// The host has no cell: the error `.default` raises when read.
-    NoHostCell(String),
-}
-
-/// The value `"host"` stands for on `axis`, if it stands for one there.
-fn host_value(axis: &str, host: Host) -> Option<String> {
-    match axis {
-        "platform" => Some(host.platform()),
-        "os" => Some(host.os.to_string()),
-        "arch" => Some(host.arch.to_string()),
-        _ => None,
-    }
-}
-
-/// Resolve `default` against the planned cells. Structural mistakes (an
-/// unknown axis, a missing one, a dict naming no cell, `"host"` on axes that
-/// cannot take it) fail here; only a host with no cell waits for the read.
+/// The index of the cell `default` names. Every mistake fails here, at the
+/// call: an axis that does not exist, one left out, or values naming no cell
+/// (which is also what a host-derived dict on a host with no cell is).
 pub(crate) fn resolve_default(
     site: &Site,
     axes: &Axes,
     cells: &[Cell],
-    arg: &DefaultArg,
-    host: Host,
-) -> anyhow::Result<DefaultCell> {
-    let entry: Entry = match arg {
-        DefaultArg::Host => {
-            let names: Vec<&str> = axes.names.iter().map(String::as_str).collect();
-            match names.as_slice() {
-                ["platform"] => vec![("platform".into(), "host".into())],
-                ["os", "arch"] | ["arch", "os"] => {
-                    vec![("os".into(), "host".into()), ("arch".into(), "host".into())]
-                }
-                _ => {
-                    let example: Vec<String> = axes
-                        .names
-                        .iter()
-                        .map(|n| match n.as_str() {
-                            "platform" | "os" | "arch" => format!("{n:?}: \"host\""),
-                            _ => format!("{n:?}: \"<value>\""),
-                        })
-                        .collect();
-                    return Err(site.err(format_args!(
-                        "default = \"host\" needs one axis named platform, or two named os and \
-                         arch; this matrix has axes {}. Pass a dict instead: default = {{{}}}",
-                        axes.known(),
-                        example.join(", ")
-                    )));
-                }
-            }
-        }
-        DefaultArg::Dict(e) => e.clone(),
-    };
-
-    let mut fixed: Vec<(usize, String)> = Vec::new();
-    let mut wanted: Vec<Option<String>> = vec![None; axes.names.len()];
-    for (axis, value) in &entry {
+    entry: &Entry,
+) -> anyhow::Result<usize> {
+    let mut wanted: Vec<Option<&str>> = vec![None; axes.names.len()];
+    for (axis, value) in entry {
         let Some(i) = axes.index(axis) else {
             return Err(site.err(format_args!(
                 "default names axis {axis:?}, which is not an axis of this matrix ({})",
                 axes.known()
             )));
         };
-        let v = if value == "host" {
-            let Some(hv) = host_value(axis, host) else {
-                return Err(site.err(format_args!(
-                    "default {axis:?}: \"host\" stands for the host's platform; only an axis \
-                     named platform, os or arch takes it"
-                )));
-            };
-            if axis == "platform"
-                && let Some(bad) = cells
-                    .iter()
-                    .filter_map(|c| c.get(i))
-                    .find(|v| !v.contains('/'))
-            {
-                return Err(site.err(format_args!(
-                    "default = \"host\" matches platform values as os/arch, and {bad:?} has no `/`"
-                )));
-            }
-            hv
-        } else {
-            fixed.push((i, value.clone()));
-            value.clone()
-        };
         if let Some(slot) = wanted.get_mut(i) {
-            *slot = Some(v);
+            *slot = Some(value);
         }
     }
     let missing: Vec<&str> = axes
@@ -415,30 +350,16 @@ pub(crate) fn resolve_default(
         .collect();
     if !missing.is_empty() {
         return Err(site.err(format_args!(
-            "default gives no value for axis {}; a dict default names every axis",
+            "default gives no value for axis {}; a default names every axis",
             missing.join(", ")
         )));
     }
-    // The fixed part must name a cell whatever the host: a typo there is the
-    // user's on every host.
-    if !cells
+    let wanted: Vec<&str> = wanted.into_iter().flatten().collect();
+    if let Some(i) = cells
         .iter()
-        .any(|c| fixed.iter().all(|(i, v)| c.get(*i) == Some(v)))
+        .position(|c| c.iter().map(String::as_str).eq(wanted.iter().copied()))
     {
-        let names: Vec<String> = fixed
-            .iter()
-            .filter_map(|(i, _)| axes.names.get(*i).cloned())
-            .collect();
-        let values: Vec<String> = fixed.iter().map(|(_, v)| v.clone()).collect();
-        return Err(site.err(format_args!(
-            "default {{{}}} names no cell of this matrix",
-            describe(&names, &values)
-        )));
-    }
-
-    let wanted: Cell = wanted.into_iter().flatten().collect();
-    if let Some(i) = cells.iter().position(|c| *c == wanted) {
-        return Ok(DefaultCell::Index(i));
+        return Ok(i);
     }
     let mut listed: Vec<String> = cells
         .iter()
@@ -448,37 +369,27 @@ pub(crate) fn resolve_default(
     if cells.len() > LISTED_CELLS {
         listed.push(format!("and {} more", cells.len() - LISTED_CELLS));
     }
-    Ok(DefaultCell::NoHostCell(format!(
-        "heph.core.matrix() at {site} has no cell for this host ({}). Its cells: {}. Add the host \
-         with include, or pass default={{...}}.",
+    let wanted: Vec<String> = wanted.into_iter().map(str::to_string).collect();
+    Err(site.err(format_args!(
+        "default {{{}}} names no cell of this matrix. Its cells: {}. Add it with include, or \
+         name another cell",
         describe(&axes.names, &wanted),
-        listed.join(", ")
+        if listed.is_empty() {
+            "none".to_string()
+        } else {
+            listed.join(", ")
+        }
     )))
 }
 
-/// What `.default` reads, stored at the call. Never looked up in `cells`,
-/// which BUILD code can mutate before freezing (D16).
-#[derive(Debug, Allocative)]
-enum DefaultState {
-    /// `default = None`.
-    Absent { site: Box<str> },
-    /// The default cell's value is in [`MatrixGen::default`].
-    Present {
-        site: Box<str>,
-        host: Box<str>,
-        cell: Box<str>,
-    },
-    /// The host has no cell: the error a read raises.
-    Missing { error: Box<str> },
-}
-
-/// The value `heph.core.matrix()` returns: `cells` and `default` are
-/// attributes. Stores the default value, or the error, at the call.
+/// The value `heph.core.matrix()` returns. `cells` is always an attribute;
+/// `default` is one only when the call named a default cell. The default's
+/// value is stored at the call, never looked up in `cells`, which BUILD code
+/// can mutate before freezing (D16).
 #[derive(Debug, Trace, ProvidesStaticType, NoSerialize, Allocative)]
 pub(crate) struct MatrixGen<V> {
     cells: V,
     default: Option<V>,
-    state: DefaultState,
 }
 
 impl<V: fmt::Display> fmt::Display for MatrixGen<V> {
@@ -494,7 +405,6 @@ impl<'v> Freeze for MatrixGen<Value<'v>> {
         Ok(MatrixGen {
             cells: self.cells.freeze(freezer)?,
             default: self.default.map(|v| v.freeze(freezer)).transpose()?,
-            state: self.state,
         })
     }
 }
@@ -505,73 +415,39 @@ impl<'v> AllocValue<'v> for MatrixGen<Value<'v>> {
     }
 }
 
+/// `cells`: what each cell's function returned, keyed by cell, in cell order
+/// (the bare value for one axis, a tuple in axis order for several).
+const CELLS: &str = "cells";
+/// `default`: the default cell's value, present only with a default.
+const DEFAULT: &str = "default";
+
 #[starlark_value(type = "matrix")]
 impl<'v, V: ValueLike<'v>> StarlarkValue<'v> for MatrixGen<V>
 where
     Self: ProvidesStaticType<'v>,
 {
-    fn get_methods() -> Option<&'static Methods> {
-        static RES: MethodsStatic = MethodsStatic::new("heph.core.matrix", matrix_methods);
-        Some(RES.methods())
-    }
-}
-
-/// The fields of a matrix value, whether it is frozen or not.
-fn view<'v>(this: Value<'v>) -> starlark::Result<(Value<'v>, Option<Value<'v>>, &'v DefaultState)> {
-    if let Some(m) = this.downcast_ref::<MatrixGen<Value<'v>>>() {
-        return Ok((m.cells, m.default, &m.state));
-    }
-    if let Some(m) = this
-        .unpack_frozen()
-        .and_then(|f| f.downcast_ref::<MatrixGen<FrozenValue>>())
-    {
-        return Ok((
-            m.cells.to_value(),
-            m.default.map(|v| v.to_value()),
-            &m.state,
-        ));
-    }
-    Err(starlark::Error::new_other(anyhow::anyhow!(
-        "expected a matrix, got {}",
-        this.get_type()
-    )))
-}
-
-#[starlark_module]
-fn matrix_methods(builder: &mut MethodsBuilder) {
-    /// What each cell's function returned, keyed by cell, in cell order: the
-    /// bare value for one axis, a tuple in axis order for several.
-    #[starlark(attribute)]
-    fn cells<'v>(this: Value<'v>) -> starlark::Result<Value<'v>> {
-        Ok(view(this)?.0)
-    }
-
-    /// The default cell's value. Raises when the host has no cell, or when the
-    /// matrix was made with `default = None`.
-    #[starlark(attribute)]
-    fn default<'v>(this: Value<'v>) -> starlark::Result<Value<'v>> {
-        let (_, value, state) = view(this)?;
-        match (state, value) {
-            (DefaultState::Present { site, host, cell }, Some(v)) => {
-                tracing::debug!(
-                    site = &**site,
-                    host = &**host,
-                    cell = &**cell,
-                    "matrix default read"
-                );
-                Ok(v)
-            }
-            (DefaultState::Missing { error }, _) => {
-                Err(starlark::Error::new_other(anyhow::anyhow!("{error}")))
-            }
-            (DefaultState::Absent { site }, _) => Err(starlark::Error::new_other(anyhow::anyhow!(
-                "heph.core.matrix() at {site} has no default: it was made without `default`. \
-                 Pass default = \"host\" or a dict of axis values to pick one"
-            ))),
-            (DefaultState::Present { site, .. }, None) => Err(starlark::Error::new_other(
-                anyhow::anyhow!("heph.core.matrix() at {site}: default value missing"),
-            )),
+    fn get_attr(&self, attribute: &str, _heap: Heap<'v>) -> Option<Value<'v>> {
+        match attribute {
+            CELLS => Some(self.cells.to_value()),
+            DEFAULT => self.default.map(ValueLike::to_value),
+            _ => None,
         }
+    }
+
+    fn has_attr(&self, attribute: &str, _heap: Heap<'v>) -> bool {
+        match attribute {
+            CELLS => true,
+            DEFAULT => self.default.is_some(),
+            _ => false,
+        }
+    }
+
+    fn dir_attr(&self) -> Vec<String> {
+        let mut out = vec![CELLS.to_string()];
+        if self.default.is_some() {
+            out.push(DEFAULT.to_string());
+        }
+        out
     }
 }
 
@@ -586,14 +462,7 @@ impl Drop for CellGuard<'_> {
 
 /// The call site of the builtin being run: `p/BUILD:12`.
 pub(crate) fn call_site(eval: &Evaluator, root: &Path) -> Site {
-    match eval.call_stack_top_location() {
-        Some(span) => Site(format!(
-            "{}:{}",
-            rel_display(root, Path::new(span.filename())),
-            span.resolve_span().begin.line + 1
-        )),
-        None => Site("<unknown>".to_string()),
-    }
+    Site(render_span(root, eval.call_stack_top_location().as_ref()))
 }
 
 fn type_err(site: &Site, what: &str, v: Value) -> starlark::Error {
@@ -669,8 +538,8 @@ fn unpack_entries<'v>(
 pub(crate) type AxesTy = DictType<String, ListType<String>>;
 /// `None | typing.Callable`.
 pub(crate) type CellTy<'v> = NoneOr<StarlarkCallable<'v>>;
-/// `None | str | dict[str, str]`.
-pub(crate) type DefaultTy = NoneOr<Either<String, DictType<String, String>>>;
+/// `None | dict[str, str]`.
+pub(crate) type DefaultTy = NoneOr<DictType<String, String>>;
 /// `None | list[dict[str, str]]`.
 pub(crate) type EntriesTy = NoneOr<ListType<DictType<String, String>>>;
 
@@ -692,7 +561,7 @@ pub(crate) fn matrix<'v>(
     let site = call_site(eval, extra.root);
     if extra.cell.borrow().is_some() {
         return Err(starlark::Error::new_other(
-            site.err("heph.core.matrix() inside a cell"),
+            site.err("a cell may not call heph.core.matrix()"),
         ));
     }
 
@@ -716,30 +585,31 @@ pub(crate) fn matrix<'v>(
         })
         .collect::<starlark::Result<Vec<_>>>()?;
     drop(axes_dict);
-    let axes = Axes::new(&site, entries).map_err(starlark::Error::new_other)?;
     let exclude = unpack_entries(&site, "exclude", args.exclude)?;
     let include = unpack_entries(&site, "include", args.include)?;
+    // The whole count, include too, before a value is validated (I10).
+    check_count(&site, entries.iter().map(|(_, v)| v.len()), include.len())
+        .map_err(starlark::Error::new_other)?;
+    let axes = Axes::new(&site, entries).map_err(starlark::Error::new_other)?;
     let cells = plan(&site, &axes, &exclude, &include).map_err(starlark::Error::new_other)?;
 
-    let default_arg = match args.default.filter(|v| !v.is_none()) {
+    let default_cell = match args.default.filter(|v| !v.is_none()) {
         None => None,
-        Some(v) if v.unpack_str() == Some("host") => Some(DefaultArg::Host),
         Some(v) if DictRef::from_value(v).is_some() => {
-            Some(DefaultArg::Dict(unpack_entry(&site, "`default`", v)?))
+            let entry = unpack_entry(&site, "`default`", v)?;
+            Some(
+                resolve_default(&site, &axes, &cells, &entry)
+                    .map_err(starlark::Error::new_other)?,
+            )
         }
         Some(v) => {
-            return Err(type_err(
-                &site,
-                "`default` must be None, \"host\" or a dict of axis to value",
-                v,
-            ));
+            return Err(starlark::Error::new_other(site.err(format_args!(
+                "`default` must be None or a dict of axis to value; for the host's cell write \
+                 default = {{\"platform\": heph.core.host()}} (got {})",
+                v.get_type()
+            ))));
         }
     };
-    let default_cell = default_arg
-        .as_ref()
-        .map(|a| resolve_default(&site, &axes, &cells, a, extra.host))
-        .transpose()
-        .map_err(starlark::Error::new_other)?;
 
     let cell_fn = match args.cell.filter(|v| !v.is_none()) {
         None => None,
@@ -777,43 +647,32 @@ pub(crate) fn matrix<'v>(
                     .zip(cell.iter().map(|v| heap.alloc(v.as_str())))
                     .collect();
                 eval.eval_function(f, &[], &named).map_err(|e| {
-                    e.with_context(format!("heph.core.matrix() at {site}: cell {desc}"))
+                    // The label of starlark's diagnostic shows only the
+                    // outermost context, so the cause is written into it:
+                    // otherwise "missing parameter `go`" never reaches the user.
+                    let cause = e.without_diagnostic().to_string();
+                    e.with_context(format!(
+                        "heph.core.matrix() at {site}: cell {desc}: {cause}"
+                    ))
                 })?
             }
         };
-        if default_cell == Some(DefaultCell::Index(i)) {
+        if default_cell == Some(i) {
             default_value = Some(value);
         }
         pairs.push((key, value));
     }
 
-    let state = match default_cell {
-        None => DefaultState::Absent {
-            site: site.0.into(),
-        },
-        Some(DefaultCell::Index(i)) => DefaultState::Present {
-            site: site.0.into(),
-            host: extra.host.platform().into(),
-            cell: cells
-                .get(i)
-                .map(|c| describe(&axes.names, c))
-                .unwrap_or_default()
-                .into(),
-        },
-        Some(DefaultCell::NoHostCell(error)) => DefaultState::Missing {
-            error: error.into(),
-        },
-    };
     Ok(heap.alloc(MatrixGen {
         cells: heap.alloc(AllocDict(pairs)),
         default: default_value,
-        state,
     }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pluginbuildfile::run_file::Host;
 
     fn site() -> Site {
         Site("p/BUILD:12".to_string())
@@ -877,8 +736,24 @@ mod tests {
             cells_of(&got),
             ["1.23 on", "1.23 off", "1.22 on", "1.24rc1 off"]
         );
-        // Excluding every cell is allowed.
-        assert!(plan(&site(), &a, &[entry(&[])], &[]).unwrap().is_empty());
+        // Excluding every cell, entry by entry, is allowed.
+        assert!(
+            plan(
+                &site(),
+                &a,
+                &[entry(&[("go", "1.22")]), entry(&[("go", "1.23")])],
+                &[]
+            )
+            .unwrap()
+            .is_empty()
+        );
+        // An empty entry would match every cell, and is refused.
+        let e = format!("{:#}", plan(&site(), &a, &[entry(&[])], &[]).unwrap_err());
+        assert_eq!(
+            e,
+            "heph.core.matrix() at p/BUILD:12: exclude {} names no axis, so it would remove \
+             every cell; an exclude entry names at least one axis"
+        );
     }
 
     #[test]
@@ -891,6 +766,13 @@ mod tests {
         assert!(e.starts_with("heph.core.matrix() at p/BUILD:12: "), "{e}");
         let e = err(&[entry(&[("go", "1.21")])], &[]);
         assert!(e.contains("matches no cell"), "{e}");
+        // An include's value outside its axis does not extend the axis: an
+        // exclude naming it is stale.
+        let e = err(
+            &[entry(&[("go", "1.24")])],
+            &[entry(&[("go", "1.24"), ("race", "on")])],
+        );
+        assert!(e.contains("\"1.24\" is not a value of axis \"go\""), "{e}");
         let e = err(&[], &[entry(&[("go", "1.22")])]);
         assert!(e.contains("gives no value for axis race"), "{e}");
         let e = err(
@@ -926,6 +808,11 @@ mod tests {
         for ok in ["..", "/", "a//b", "1.2+x_y-Z"] {
             assert!(axes(&[("v", &[ok])]).is_ok(), "{ok:?} was refused");
         }
+        // Over the limit before any value is validated.
+        let mut big: Vec<String> = (0..1024).map(|i| i.to_string()).collect();
+        big.push("bad value".to_string());
+        let big: Vec<&str> = big.iter().map(String::as_str).collect();
+        assert!(err(&[("v", &big)]).contains("would have 1,025 cells"));
     }
 
     #[test]
@@ -946,120 +833,65 @@ mod tests {
         // 40 axes of 2: the limit error, not an overflow or an enumeration.
         let forty: Vec<(String, &[&str])> = (0..40).map(|i| (format!("a{i}"), two)).collect();
         let forty: Vec<(&str, &[&str])> = forty.iter().map(|(n, v)| (n.as_str(), *v)).collect();
-        let e = format!(
-            "{:#}",
-            plan(&site(), &axes(&forty).unwrap(), &[], &[]).unwrap_err()
-        );
+        let e = format!("{:#}", axes(&forty).unwrap_err());
         assert!(e.contains("would have 1,099,511,627,776 cells"), "{e}");
         // 70 axes of 2 overflow a u64.
         let seventy: Vec<(String, &[&str])> = (0..70).map(|i| (format!("a{i}"), two)).collect();
         let seventy: Vec<(&str, &[&str])> = seventy.iter().map(|(n, v)| (n.as_str(), *v)).collect();
-        let e = format!(
-            "{:#}",
-            plan(&site(), &axes(&seventy).unwrap(), &[], &[]).unwrap_err()
-        );
+        let e = format!("{:#}", axes(&seventy).unwrap_err());
         assert!(e.contains("would have more than"), "{e}");
     }
 
     #[test]
-    fn host_default_picks_the_hosts_cell() {
-        let a = axes(&[("platform", PLATS)]).unwrap();
-        let cells = plan(&site(), &a, &[], &[]).unwrap();
-        for (i, (os, arch)) in [("linux", "amd64"), ("linux", "arm64"), ("darwin", "arm64")]
-            .into_iter()
-            .enumerate()
-        {
-            assert_eq!(
-                resolve_default(&site(), &a, &cells, &DefaultArg::Host, host(os, arch)).unwrap(),
-                DefaultCell::Index(i)
-            );
-        }
-        let got = resolve_default(
-            &site(),
-            &a,
-            &cells,
-            &DefaultArg::Host,
-            host("linux", "riscv64"),
-        )
-        .unwrap();
-        assert_eq!(
-            got,
-            DefaultCell::NoHostCell(
-                "heph.core.matrix() at p/BUILD:12 has no cell for this host \
-                 (platform=linux/riscv64). Its cells: platform=linux/amd64, platform=linux/arm64, \
-                 platform=darwin/arm64. Add the host with include, or pass default={...}."
-                    .to_string()
-            )
-        );
-
-        // os + arch axes, in either order.
-        let a = axes(&[("arch", &["amd64", "arm64"]), ("os", &["linux"])]).unwrap();
-        let cells = plan(&site(), &a, &[], &[]).unwrap();
-        assert_eq!(
-            resolve_default(
-                &site(),
-                &a,
-                &cells,
-                &DefaultArg::Host,
-                host("linux", "arm64")
-            )
-            .unwrap(),
-            DefaultCell::Index(1)
-        );
-    }
-
-    #[test]
-    fn dict_default_and_its_structural_errors() {
+    fn default_names_one_cell_and_every_mistake_fails_at_the_call() {
         let a = axes(&[("go", &["1.22", "1.23"]), ("platform", PLATS)]).unwrap();
         let cells = plan(&site(), &a, &[], &[]).unwrap();
-        let resolve = |e: &[(&str, &str)], h: Host| {
-            resolve_default(&site(), &a, &cells, &DefaultArg::Dict(entry(e)), h)
-        };
-        let h = host("darwin", "arm64");
+        let resolve = |e: &[(&str, &str)]| resolve_default(&site(), &a, &cells, &entry(e));
+        // Dict order does not matter.
         assert_eq!(
-            resolve(&[("platform", "host"), ("go", "1.23")], h).unwrap(),
-            DefaultCell::Index(5)
+            resolve(&[("platform", "darwin/arm64"), ("go", "1.23")]).unwrap(),
+            5
         );
         assert_eq!(
-            resolve(&[("platform", "linux/amd64"), ("go", "1.22")], h).unwrap(),
-            DefaultCell::Index(0)
+            resolve(&[("go", "1.22"), ("platform", "linux/amd64")]).unwrap(),
+            0
         );
-        // The host part waits for the read; the fixed part does not.
-        assert!(matches!(
-            resolve(
-                &[("platform", "host"), ("go", "1.23")],
-                host("linux", "riscv64")
-            )
-            .unwrap(),
-            DefaultCell::NoHostCell(_)
-        ));
-        let err = |e: &[(&str, &str)]| format!("{:#}", resolve(e, h).unwrap_err());
-        assert!(err(&[("platform", "host"), ("go", "1.21")]).contains("names no cell"));
-        assert!(err(&[("platform", "host")]).contains("gives no value for axis go"));
+        let err = |e: &[(&str, &str)]| format!("{:#}", resolve(e).unwrap_err());
+        assert!(err(&[("platform", "darwin/arm64")]).contains("gives no value for axis go"));
         assert!(
-            err(&[("platform", "host"), ("go", "1.23"), ("os", "x")]).contains("names axis \"os\"")
+            err(&[("platform", "darwin/arm64"), ("go", "1.23"), ("os", "x")])
+                .contains("names axis \"os\"")
         );
-        assert!(err(&[("platform", "host"), ("go", "host")]).contains("only an axis named"));
-
-        // "host" with a third axis says how to write a dict default.
-        let e = format!(
-            "{:#}",
-            resolve_default(&site(), &a, &cells, &DefaultArg::Host, h).unwrap_err()
-        );
-        assert!(
-            e.contains(
-                "Pass a dict instead: default = {\"go\": \"<value>\", \"platform\": \"host\"}"
+        // "host" is a value like any other: no cell has it.
+        assert!(err(&[("platform", "host"), ("go", "1.23")]).contains("names no cell"));
+        // A host with no cell, as `{"platform": heph.core.host()}` gives it.
+        let a = axes(&[("platform", PLATS)]).unwrap();
+        let cells = plan(&site(), &a, &[], &[]).unwrap();
+        assert_eq!(
+            format!(
+                "{:#}",
+                resolve_default(
+                    &site(),
+                    &a,
+                    &cells,
+                    &entry(&[("platform", "linux/riscv64")])
+                )
+                .unwrap_err()
             ),
-            "{e}"
+            "heph.core.matrix() at p/BUILD:12: default {platform=linux/riscv64} names no cell of \
+             this matrix. Its cells: platform=linux/amd64, platform=linux/arm64, \
+             platform=darwin/arm64. Add it with include, or name another cell"
         );
-        // A platform value without `/`.
-        let a = axes(&[("platform", &["linux-amd64"])]).unwrap();
+        // A long cell list is elided.
+        let many: Vec<String> = (0..20).map(|i| i.to_string()).collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        let a = axes(&[("v", &many)]).unwrap();
         let cells = plan(&site(), &a, &[], &[]).unwrap();
         let e = format!(
             "{:#}",
-            resolve_default(&site(), &a, &cells, &DefaultArg::Host, h).unwrap_err()
+            resolve_default(&site(), &a, &cells, &entry(&[("v", "x")])).unwrap_err()
         );
-        assert!(e.contains("has no `/`"), "{e}");
+        assert!(e.contains("v=15, and 4 more. Add it"), "{e}");
     }
 
     /// Evaluate package `pkg` of a workspace holding `files`, on `host`. Every
@@ -1240,16 +1072,17 @@ eq(heph.core.matrix(axes = {"a": ["1"]}, exclude = [{"a": "1"}]).cells, {})
                 "`cell` must be callable, got int",
             ),
             (
-                r#"heph.core.matrix(axes = {"go": ["1"]}, default = "host")"#,
-                "default = \"host\" needs one axis named platform",
+                r#"heph.core.matrix(axes = {"go": ["1"]}, exclude = [{}])"#,
+                "exclude {} names no axis",
             ),
             (
-                r#"heph.core.matrix(axes = {"platform": ["linux"]}, default = "host")"#,
-                "has no `/`",
+                r#"heph.core.matrix(axes = {"platform": ["linux/amd64"]}, default = "host")"#,
+                "`default` must be None or a dict of axis to value; for the host's cell write \
+                 default = {\"platform\": heph.core.host()} (got string)",
             ),
             (
-                r#"heph.core.matrix(axes = {"go": ["1"], "platform": ["linux/amd64"]}, default = "host")"#,
-                "Pass a dict instead",
+                r#"heph.core.matrix(axes = {"go": ["1"]}, default = {"go": 1})"#,
+                "`default` must map axis names to string values, got int",
             ),
             (
                 r#"heph.core.matrix(axes = {"go": ["1"]}, default = {"os": "x", "go": "1"})"#,
@@ -1265,11 +1098,11 @@ eq(heph.core.matrix(axes = {"a": ["1"]}, exclude = [{"a": "1"}]).cells, {})
             ),
             (
                 r#"heph.core.matrix(axes = {"go": ["1"]}, default = "linux")"#,
-                "`default` must be None, \"host\" or a dict",
+                "`default` must be None or a dict of axis to value",
             ),
             (
                 r#"heph.core.matrix(axes = {"go": ["1"]}, default = 1)"#,
-                "`default` must be None, \"host\" or a dict",
+                "(got int)",
             ),
         ];
         for (call, want) in cases {
@@ -1281,14 +1114,25 @@ eq(heph.core.matrix(axes = {"a": ["1"]}, exclude = [{"a": "1"}]).cells, {})
         }
 
         // A cell whose parameters do not match the axes fails at the first
-        // call, naming the call site, the cell and the parameter.
+        // call, naming the call site and the cell, with starlark's own text
+        // naming the parameter: one the axes do not give...
         let err = eval_err(
-            "def _c(go):\n    return go\nheph.core.matrix(axes = {\"platform\": [\"linux/amd64\"]}, cell = _c)",
+            "def _c(go, platform):\n    return go\nheph.core.matrix(axes = {\"platform\": [\"linux/amd64\"]}, cell = _c)",
             darwin(),
         );
         assert!(
             err.contains("heph.core.matrix() at p/BUILD:4: cell platform=linux/amd64")
-                && err.contains("platform"),
+                && err.contains(": Missing parameter `go` for call to `"),
+            "{err}"
+        );
+        // ...and an axis the cell does not take.
+        let err = eval_err(
+            "def _c(go):\n    return go\nheph.core.matrix(axes = {\"go\": [\"1\"], \"platform\": [\"linux/amd64\"]}, cell = _c)",
+            darwin(),
+        );
+        assert!(
+            err.contains("heph.core.matrix() at p/BUILD:4: cell go=1, platform=linux/amd64")
+                && err.contains(": Found `platform` extra named parameter(s) for call to "),
             "{err}"
         );
         // `**kwargs` takes whatever the axes are.
@@ -1350,13 +1194,18 @@ heph.core.matrix(axes = {"platform": ["linux/amd64", "linux/arm64"]}, cell = _ce
     /// T6.
     #[test]
     fn matrix_default() {
+        // The host's cell, as the BUILD file names it.
         let body = r#"
-M = heph.core.matrix(axes = {"platform": ["linux/amd64", "linux/arm64", "darwin/arm64"]}, cell = lambda platform: ":t." + platform, default = "host")
+M = heph.core.matrix(axes = {"platform": ["linux/amd64", "linux/arm64", "darwin/arm64"]}, cell = lambda platform: ":t." + platform, default = {"platform": heph.core.host()})
 eq(M.default, ":t." + heph.core.host())
 eq(M.default, M.default)
+eq(hasattr(M, "default"), True)
+eq(dir(M), ["cells", "default"])
 eq(heph.core.host(), heph.core.os() + "/" + heph.core.arch())
-D = heph.core.matrix(axes = {"go": ["1.22", "1.23"], "platform": ["linux/amd64", "linux/arm64", "darwin/arm64"]}, default = {"platform": "host", "go": "1.23"})
+D = heph.core.matrix(axes = {"go": ["1.22", "1.23"], "platform": ["linux/amd64", "linux/arm64", "darwin/arm64"]}, default = {"platform": heph.core.host(), "go": "1.23"})
 eq(D.default, {"go": "1.23", "platform": heph.core.host()})
+F = heph.core.matrix(axes = {"go": ["1.22", "1.23"], "race": ["on", "off"]}, default = {"race": "off", "go": "1.22"})
+eq(F.default, {"go": "1.22", "race": "off"})
 "#;
         for (os, arch) in [("linux", "amd64"), ("linux", "arm64"), ("darwin", "arm64")] {
             eval(body, host(os, arch)).unwrap_or_else(|e| panic!("{os}/{arch}: {e:#}"));
@@ -1368,35 +1217,76 @@ eq(D.default, {"go": "1.23", "platform": heph.core.host()})
         )
         .expect("real host");
 
-        // A host with no cell raises on read only, with the stated text.
+        // A host with no cell fails at the call, not at a read.
         let riscv = host("linux", "riscv64");
-        let m = "M = heph.core.matrix(axes = {\"platform\": [\"linux/amd64\", \"linux/arm64\", \"darwin/arm64\"]}, default = \"host\")";
-        eval(&format!("{m}\neq(len(M.cells), 3)"), riscv).expect("never reads .default");
-        let err = eval_err(&format!("{m}\nX = M.default"), riscv);
+        let err = eval_err(
+            "M = heph.core.matrix(axes = {\"platform\": [\"linux/amd64\", \"linux/arm64\", \"darwin/arm64\"]}, default = {\"platform\": heph.core.host()})",
+            riscv,
+        );
         assert!(
             err.contains(
-                "heph.core.matrix() at p/BUILD:2 has no cell for this host (platform=linux/riscv64). \
-                 Its cells: platform=linux/amd64, platform=linux/arm64, platform=darwin/arm64. \
-                 Add the host with include, or pass default={...}."
+                "heph.core.matrix() at p/BUILD:2: default {platform=linux/riscv64} names no cell \
+                 of this matrix. Its cells: platform=linux/amd64, platform=linux/arm64, \
+                 platform=darwin/arm64. Add it with include, or name another cell"
             ),
             "{err}"
         );
+        // Without a default, the host plays no part.
+        eval(
+            "eq(len(heph.core.matrix(axes = {\"platform\": [\"linux/amd64\"]}).cells), 1)",
+            riscv,
+        )
+        .expect("no default, no host");
 
-        // `default = None` (or omitted): no default to read.
+        // `default = None` (or omitted): no `default` attribute at all.
+        eval(
+            r#"
+N = heph.core.matrix(axes = {"go": ["1"]})
+eq(hasattr(N, "default"), False)
+eq(hasattr(N, "cells"), True)
+eq(dir(N), ["cells"])
+eq(hasattr(heph.core.matrix(axes = {"go": ["1"]}, default = None), "default"), False)
+eq(getattr(N, "default", "none"), "none")
+"#,
+            darwin(),
+        )
+        .expect("no default attribute");
         let err = eval_err(
             "M = heph.core.matrix(axes = {\"go\": [\"1\"]}, default = None)\nX = M.default",
             darwin(),
         );
         assert!(
-            err.contains("heph.core.matrix() at p/BUILD:2 has no default"),
+            err.contains("Object of type `matrix` has no attribute `default`"),
             "{err}"
         );
+    }
+
+    /// D16: what `.default` reads is stored at the call, so mutating `cells`
+    /// before the module freezes does not move it.
+    #[test]
+    fn matrix_default_survives_mutating_cells() {
+        eval(
+            r#"
+M = heph.core.matrix(axes = {"k": ["a", "b"]}, cell = lambda k: k + "!", default = {"k": "a"})
+M.cells["a"] = "changed"
+M.cells.pop("b")
+eq(M.cells, {"a": "changed"})
+eq(M.default, "a!")
+"#,
+            darwin(),
+        )
+        .expect("default kept");
     }
 
     /// T7.
     #[test]
     fn matrix_result_through_load() {
-        let defs = r#"M = heph.core.matrix(axes = {"platform": ["linux/amd64"]}, default = "host")
+        let defs = r#"M = heph.core.matrix(
+    axes = {"platform": ["linux/amd64", "darwin/arm64"]},
+    cell = lambda platform: "//lib:t." + platform.replace("/", "-"),
+    default = {"platform": "darwin/arm64"},
+)
+N = heph.core.matrix(axes = {"platform": ["linux/amd64"]})
 
 def make(name):
     return heph.core.matrix(
@@ -1404,28 +1294,43 @@ def make(name):
         cell = lambda platform: target(name = name + "." + platform.replace("/", "-"), driver = "d"),
     )
 "#;
+        // Both packages read the frozen value: `cells`, `default`, and
+        // `hasattr` on one without a default.
+        let consumer = r#"load("//t/eq.star", "eq")
+load("//lib/defs.star", "M", "N")
+eq(M.cells, {"linux/amd64": "//lib:t.linux-amd64", "darwin/arm64": "//lib:t.darwin-arm64"})
+eq(hasattr(M, "default"), True)
+eq(hasattr(N, "default"), False)
+eq(dir(N), ["cells"])
+target(name = "use", driver = "d", tool = M.default, all = list(M.cells.values()))
+"#;
         let files = [
             ("lib/defs.star", defs),
-            (
-                "a/BUILD",
-                "load(\"//t/eq.star\", \"eq\")\nload(\"//lib/defs.star\", \"M\")\neq(M.cells, {\"linux/amd64\": {\"platform\": \"linux/amd64\"}})\n",
-            ),
-            (
-                "b/BUILD",
-                "load(\"//lib/defs.star\", \"M\")\nX = M.default\n",
-            ),
+            ("a/BUILD", consumer),
+            ("b/BUILD", consumer),
             (
                 "c/BUILD",
                 "load(\"//t/eq.star\", \"eq\")\nload(\"//lib/defs.star\", \"make\")\nT = make(\"tool\")\neq(T.cells[\"darwin/arm64\"], \"//c:tool.darwin-arm64\")\n",
             ),
         ];
         let riscv = host("linux", "riscv64");
-        eval_pkg(&files, "a", riscv).expect("cells readable through load");
-        let err = format!("{:#}", eval_pkg(&files, "b", riscv).unwrap_err());
-        assert!(
-            err.contains("heph.core.matrix() at lib/defs.star:1 has no cell for this host"),
-            "{err}"
+        let config = |pkg: &str| {
+            let r = eval_pkg(&files, pkg, riscv).unwrap_or_else(|e| panic!("{pkg}: {e:#}"));
+            r.target("use").expect("use").config.clone()
+        };
+        let (a, b) = (config("a"), config("b"));
+        assert_eq!(
+            a.get("tool"),
+            Some(&hcore::htvalue::Value::String(
+                "//lib:t.darwin-arm64".to_string()
+            ))
         );
+        assert_eq!(
+            a.get("tool"),
+            b.get("tool"),
+            "`.default` is one value across packages"
+        );
+        assert_eq!(a.get("all"), b.get("all"));
         let c = eval_pkg(&files, "c", riscv).expect("a matrix in a def");
         let names: Vec<&str> = c.targets().iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, ["tool.linux-amd64", "tool.darwin-arm64"]);
@@ -1444,7 +1349,9 @@ heph.core.matrix(axes = {"platform": ["linux/amd64", "linux/arm64"]}, cell = _c)
             err.contains(
                 "//p:tool is declared twice with different configs: \
                  p/BUILD:3 (cell platform=linux/amd64) and p/BUILD:3 (cell platform=linux/arm64). \
-                 They differ in config.url: remove one declaration, or make them identical"
+                 They differ in config.url. If both come from a matrix cell, put the cell's axis \
+                 values in the target name; otherwise remove one declaration, or make them \
+                 identical"
             ),
             "{err}"
         );
@@ -1464,6 +1371,18 @@ heph.core.matrix(axes = {"v": ["a"]}, cell = lambda v: target(name = "tool", dri
         );
         assert!(
             err.contains("(cell platform=linux/arm64) and p/BUILD:2 (cell platform=linux-arm64)"),
+            "{err}"
+        );
+        // ...and over two axes: `1.2` + `3` against `1` + `2.3`.
+        let err = eval_err(
+            r#"heph.core.matrix(axes = {"a": ["1.2", "1"], "b": ["3", "2.3"]}, cell = lambda a, b: target(name = "t." + a + "." + b, driver = "d", a = a, b = b))"#,
+            darwin(),
+        );
+        assert!(
+            err.contains(
+                "//p:t.1.2.3 is declared twice with different configs: p/BUILD:2 (cell a=1.2, \
+                 b=3) and p/BUILD:2 (cell a=1, b=2.3). They differ in config.a, config.b."
+            ),
             "{err}"
         );
 
@@ -1502,18 +1421,41 @@ heph.core.matrix(axes = {"v": ["a"]}, cell = lambda v: target(name = "tool", dri
             darwin(),
         )
         .expect("exactly the limit");
+        // A huge axis is refused by its length, before any value is checked
+        // (the bad last value is never reached), so validation never runs
+        // over more than the limit.
+        let err = eval_err(
+            "heph.core.matrix(axes = {\"v\": [str(i) for i in range(200000)] + [\"bad value\"]})",
+            darwin(),
+        );
+        assert!(
+            err.contains("would have 200,001 cells; the limit is 1,024"),
+            "{err}"
+        );
+        // `include` counts before the axes are validated, too.
+        let err = eval_err(
+            "heph.core.matrix(axes = {\"v\": [str(i) for i in range(1024)]}, include = [{\"v\": \"x\"}])",
+            darwin(),
+        );
+        assert!(err.contains("would have 1,025 cells"), "{err}");
 
         let err = eval_err(
             "heph.core.matrix(axes = {\"a\": [\"1\"]}, cell = lambda a: heph.core.matrix(axes = {\"b\": [\"2\"]}))",
             darwin(),
         );
-        assert!(err.contains("heph.core.matrix() inside a cell"), "{err}");
+        assert!(
+            err.contains("heph.core.matrix() at p/BUILD:2: a cell may not call heph.core.matrix()"),
+            "{err}"
+        );
         // A cell passing itself ends in the same error, not a stack overflow.
         let err = eval_err(
             "def _c(a):\n    return heph.core.matrix(axes = {\"a\": [\"1\"]}, cell = _c)\n_c(\"x\")",
             darwin(),
         );
-        assert!(err.contains("heph.core.matrix() inside a cell"), "{err}");
+        assert!(
+            err.contains("a cell may not call heph.core.matrix()"),
+            "{err}"
+        );
     }
 
     #[test]

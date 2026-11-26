@@ -413,17 +413,18 @@ TOP = heph.core.os()
     fn matrix_signature_is_typed() {
         let src = "\
 def f() -> None:
-    ok = heph.core.matrix(axes = {\"platform\": [\"linux/amd64\"]}, cell = lambda platform: platform, default = \"host\")
+    ok = heph.core.matrix(axes = {\"platform\": [\"linux/amd64\"]}, cell = lambda platform: platform, default = {\"platform\": heph.core.host()})
     bad_axes = heph.core.matrix(axes = 1)
     bad_name = heph.core.matrix(axis = {\"a\": [\"b\"]})
     bad_default = heph.core.matrix(axes = {\"a\": [\"b\"]}, default = 1)
+    host_string = heph.core.matrix(axes = {\"a\": [\"b\"]}, default = \"host\")
     host: str = heph.core.host()
 ";
         let tmp = ws(&[("pkg/BUILD", src)]);
         let found = lint_pkg(tmp.path(), "pkg", true);
         let got = lines(&found);
-        assert_eq!(got.len(), 3, "{got:#?}");
-        for (line, finding) in [3, 4, 5].iter().zip(&got) {
+        assert_eq!(got.len(), 4, "{got:#?}");
+        for (line, finding) in [3, 4, 5, 6].iter().zip(&got) {
             assert!(
                 finding.starts_with(&format!("pkg/BUILD:{line}:"))
                     && finding.contains("type-error"),

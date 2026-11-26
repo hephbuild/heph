@@ -8,7 +8,7 @@ use hcore::htvalue::signature::{FnSignature, ParamType};
 use hcore::htvalue::{self, parse_map_string_string, parse_map_string_strings, parse_strings};
 use hmodel::htaddr;
 use hmodel::htpkg::PkgBuf;
-use hplugin::driver::sandbox::{Dep, Env, EnvValue, Mode, Sandbox, Tool};
+use hplugin::driver::sandbox::{Dep, Env, EnvValue, Mode, Sandbox, SandboxParts, Tool};
 use hplugin::driver::{DriverSchema, TargetAddr};
 use hplugin::function::{FnArgs, FnCallContext, FunctionRegistry, PluginFn};
 use hplugin::provider::{Approval, ProvenanceFrame};
@@ -674,20 +674,26 @@ impl DeclSite {
 
     /// `p/BUILD:12 (cell platform=linux/amd64)`.
     fn render(&self, root: &Path) -> String {
-        let mut out = match &self.span {
-            Some(span) => format!(
-                "{}:{}",
-                rel_display(root, Path::new(span.filename())),
-                span.resolve_span().begin.line + 1
-            ),
-            None => "<unknown>".to_string(),
-        };
+        let mut out = render_span(root, self.span.as_ref());
         if let Some(cell) = &self.cell {
             out.push_str(" (cell ");
             out.push_str(cell);
             out.push(')');
         }
         out
+    }
+}
+
+/// `p/BUILD:12`: a span as errors name it, its file relative to the workspace
+/// root and its line 1-based.
+pub(crate) fn render_span(root: &Path, span: Option<&starlark::codemap::FileSpan>) -> String {
+    match span {
+        Some(span) => format!(
+            "{}:{}",
+            rel_display(root, Path::new(span.filename())),
+            span.resolve_span().begin.line + 1
+        ),
+        None => "<unknown>".to_string(),
     }
 }
 
@@ -698,70 +704,153 @@ impl DeclSite {
 /// one file pass one run and fail the next); provenance and site are not part
 /// of a declaration. Floats compare by bits, so `-0.0` and `0.0` diverge, and an
 /// omitted driver diverges from the explicit default.
+///
+/// Every struct is destructured and every enum matched without a wildcard, so
+/// a field or variant added to any of them fails to compile here until it is
+/// decided whether it is part of a declaration.
 fn diverging_fields(a: &OnTargetPayload, b: &OnTargetPayload) -> Vec<String> {
+    let OnTargetPayload {
+        name: _,
+        driver: driver_a,
+        labels: labels_a,
+        transitive: transitive_a,
+        approval: approval_a,
+        config: config_a,
+        provenance: _,
+        site: _,
+    } = a;
+    let OnTargetPayload {
+        name: _,
+        driver: driver_b,
+        labels: labels_b,
+        transitive: transitive_b,
+        approval: approval_b,
+        config: config_b,
+        provenance: _,
+        site: _,
+    } = b;
     let mut out = Vec::new();
-    if a.driver != b.driver {
+    if driver_a != driver_b {
         out.push("driver".to_string());
     }
-    let mut keys: Vec<&String> = a.config.keys().chain(b.config.keys()).collect();
+    let mut keys: Vec<&String> = config_a.keys().chain(config_b.keys()).collect();
     keys.sort_unstable();
     keys.dedup();
     for k in keys {
-        let same = match (a.config.get(k), b.config.get(k)) {
+        let same = match (config_a.get(k), config_b.get(k)) {
             (Some(x), Some(y)) => same_value(x, y),
-            _ => false,
+            (Some(_), None) | (None, Some(_)) | (None, None) => false,
         };
         if !same {
             out.push(format!("config.{k}"));
         }
     }
-    if a.labels != b.labels {
+    if labels_a != labels_b {
         out.push("labels".to_string());
     }
-    let (ta, tb) = (&a.transitive, &b.transitive);
-    let same_tools = ta.tools.len() == tb.tools.len()
-        && ta.tools.iter().zip(&tb.tools).all(|(x, y)| {
-            x.r#ref == y.r#ref && x.group == y.group && x.hash == y.hash && x.id == y.id
-        });
-    if !same_tools {
+    let SandboxParts {
+        tools: tools_a,
+        deps: deps_a,
+        env: env_a,
+    } = transitive_a.parts();
+    let SandboxParts {
+        tools: tools_b,
+        deps: deps_b,
+        env: env_b,
+    } = transitive_b.parts();
+    if !(tools_a.len() == tools_b.len()
+        && tools_a.iter().zip(tools_b).all(|(x, y)| same_tool(x, y)))
+    {
         out.push("transitive.tools".to_string());
     }
-    let same_deps = ta.deps.len() == tb.deps.len()
-        && ta.deps.iter().zip(&tb.deps).all(|(x, y)| {
-            x.r#ref == y.r#ref
-                && matches!(
-                    (&x.mode, &y.mode),
-                    (Mode::None, Mode::None) | (Mode::Link, Mode::Link)
-                )
-                && x.group == y.group
-                && x.runtime == y.runtime
-                && x.hash == y.hash
-                && x.id == y.id
-        });
-    if !same_deps {
+    if !(deps_a.len() == deps_b.len() && deps_a.iter().zip(deps_b).all(|(x, y)| same_dep(x, y))) {
         out.push("transitive.deps".to_string());
     }
-    let same_env = ta.env.len() == tb.env.len()
-        && ta.env.iter().all(|(k, x)| {
-            tb.env.get(k).is_some_and(|y| {
-                let value = match (&x.value, &y.value) {
-                    (EnvValue::Literal(p), EnvValue::Literal(q)) => p == q,
-                    (EnvValue::Pass, EnvValue::Pass) => true,
-                    _ => false,
-                };
-                value
-                    && x.hash == y.hash
-                    && x.append == y.append
-                    && x.append_prefix == y.append_prefix
-            })
-        });
-    if !same_env {
+    if !(env_a.len() == env_b.len()
+        && env_a
+            .iter()
+            .all(|(k, x)| env_b.get(k).is_some_and(|y| same_env(x, y))))
+    {
         out.push("transitive.env".to_string());
     }
-    if a.approval != b.approval {
+    let Approval {
+        required: required_a,
+        notice: notice_a,
+    } = approval_a;
+    let Approval {
+        required: required_b,
+        notice: notice_b,
+    } = approval_b;
+    if required_a != required_b || notice_a != notice_b {
         out.push("approval".to_string());
     }
     out
+}
+
+fn same_tool(a: &Tool, b: &Tool) -> bool {
+    let Tool {
+        r#ref: ref_a,
+        group: group_a,
+        hash: hash_a,
+        id: id_a,
+    } = a;
+    let Tool {
+        r#ref: ref_b,
+        group: group_b,
+        hash: hash_b,
+        id: id_b,
+    } = b;
+    ref_a == ref_b && group_a == group_b && hash_a == hash_b && id_a == id_b
+}
+
+fn same_dep(a: &Dep, b: &Dep) -> bool {
+    let Dep {
+        r#ref: ref_a,
+        mode: mode_a,
+        group: group_a,
+        runtime: runtime_a,
+        hash: hash_a,
+        id: id_a,
+    } = a;
+    let Dep {
+        r#ref: ref_b,
+        mode: mode_b,
+        group: group_b,
+        runtime: runtime_b,
+        hash: hash_b,
+        id: id_b,
+    } = b;
+    let same_mode = match (mode_a, mode_b) {
+        (Mode::None, Mode::None) | (Mode::Link, Mode::Link) => true,
+        (Mode::None, Mode::Link) | (Mode::Link, Mode::None) => false,
+    };
+    ref_a == ref_b
+        && same_mode
+        && group_a == group_b
+        && runtime_a == runtime_b
+        && hash_a == hash_b
+        && id_a == id_b
+}
+
+fn same_env(a: &Env, b: &Env) -> bool {
+    let Env {
+        value: value_a,
+        hash: hash_a,
+        append: append_a,
+        append_prefix: prefix_a,
+    } = a;
+    let Env {
+        value: value_b,
+        hash: hash_b,
+        append: append_b,
+        append_prefix: prefix_b,
+    } = b;
+    let same_value = match (value_a, value_b) {
+        (EnvValue::Literal(p), EnvValue::Literal(q)) => p == q,
+        (EnvValue::Pass, EnvValue::Pass) => true,
+        (EnvValue::Literal(_), EnvValue::Pass) | (EnvValue::Pass, EnvValue::Literal(_)) => false,
+    };
+    same_value && hash_a == hash_b && append_a == append_b && prefix_a == prefix_b
 }
 
 /// Structural equality of two config values, order-free for maps and with
@@ -784,7 +873,19 @@ fn same_value(a: &htvalue::Value, b: &htvalue::Value) -> bool {
         (V::Int(x), V::Int(y)) => x == y,
         (V::Uint(x), V::Uint(y)) => x == y,
         (V::Null(), V::Null()) => true,
-        _ => false,
+        // Different variants; listed rather than `_`, so a new variant fails
+        // to compile until it gets its own arm above.
+        (
+            V::Float(_)
+            | V::Map(_)
+            | V::List(_)
+            | V::String(_)
+            | V::Bool(_)
+            | V::Int(_)
+            | V::Uint(_)
+            | V::Null(),
+            _,
+        ) => false,
     }
 }
 
@@ -1035,9 +1136,10 @@ fn merge_pkg_results(
     pkg: &str,
     parts: &[Arc<RunResult>],
 ) -> anyhow::Result<RunResult> {
-    let mut targets: Vec<OnTargetPayload> = Vec::new();
+    let declared: usize = parts.iter().map(|p| p.targets.len()).sum();
+    let mut targets: Vec<OnTargetPayload> = Vec::with_capacity(declared);
     let mut states = vec![];
-    let mut seen: HashMap<&str, usize> = HashMap::new();
+    let mut seen: HashMap<&str, usize> = HashMap::with_capacity(declared);
     for part in parts {
         for t in &part.targets {
             let Some(&first) = seen.get(t.name.as_str()) else {
@@ -1051,8 +1153,9 @@ fn merge_pkg_results(
             let fields = diverging_fields(kept, t);
             if !fields.is_empty() {
                 anyhow::bail!(
-                    "{} is declared twice with different configs: {} and {}. They differ in {}: \
-                     remove one declaration, or make them identical",
+                    "{} is declared twice with different configs: {} and {}. They differ in {}. \
+                     If both come from a matrix cell, put the cell's axis values in the target \
+                     name; otherwise remove one declaration, or make them identical",
                     htaddr::Addr::new(PkgBuf::from(pkg), t.name.clone(), Default::default())
                         .format(),
                     kept.site.render(root),
@@ -1094,9 +1197,9 @@ fn merge_pkg_results(
     Ok(RunResult::new(targets, states, frozen))
 }
 
-/// The platform `heph.core.os()` and the other host readers report, and the
-/// one `heph.core.matrix(default = "host")` matches. Read once per evaluation
-/// from [`hcore::htplatform`]; tests inject another.
+/// The platform `heph.core.host()` and the other host readers report. Read
+/// once per [`BuildFileLoader`] from [`hcore::htplatform`] and handed to each
+/// evaluation through [`Extra`]; tests inject another.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Host {
     /// Canonical (Go/OCI) naming: `linux`, `darwin`.
@@ -1632,24 +1735,23 @@ fn heph_core_module(builder: &mut GlobalsBuilder) {
     }
 
     /// The host platform as `os/arch` in canonical naming, e.g.
-    /// `darwin/arm64`: the string `heph.core.matrix(default = "host")` matches
-    /// against an axis named `platform`.
+    /// `darwin/arm64`. A matrix picks the host's cell with
+    /// `default = {"platform": heph.core.host()}`.
     fn host<'v>(eval: &mut Evaluator<'v, '_, '_>) -> starlark::Result<String> {
         Ok(extra_of(eval, "heph.core.host()")?.host.platform())
     }
 
     /// Enumerate the cells of a matrix and call `cell` once per cell, with one
-    /// keyword argument per axis. Returns a value with two attributes:
+    /// keyword argument per axis. Returns a value with these attributes:
     ///
     /// - `cells`: what each call returned, unchanged, keyed by cell, in cell
     ///   order (the cross product, last axis fastest, minus `exclude`, then
     ///   `include`). A key is the bare value for one axis (`"linux/arm64"`), a
     ///   tuple in axis order for several (`("1.23.1", "linux/arm64")`).
-    /// - `default`: the value of the cell `default` selects. `"host"` needs an
-    ///   axis named `platform` (`os/arch`, as `heph.core.host()` prints it) or
-    ///   axes named `os` and `arch`; a dict names a value per axis, where
-    ///   `"host"` stands for the host's. Reading it raises when the host has no
-    ///   cell, or when no `default` was given.
+    /// - `default`: only when `default` names a cell (a dict giving a value for
+    ///   every axis, e.g. `{"platform": heph.core.host()}`): that cell's value.
+    ///   A dict naming no cell fails the call. Without `default` there is no
+    ///   such attribute (`hasattr(m, "default")` is false).
     ///
     /// `axes` maps each axis name (a Starlark identifier) to its values
     /// (strings of `A-Z a-z 0-9 . _ / + -`); its order orders tuple keys.
@@ -1660,8 +1762,9 @@ fn heph_core_module(builder: &mut GlobalsBuilder) {
     /// `heph.core.matrix()`.
     ///
     /// The matrix declares nothing: a target a cell declares is exactly what the
-    /// cell called. A target whose config reads `.default` has the host's cell
-    /// in its config, so its key moves with the host. See `docs/MATRIX.md`.
+    /// cell called. A target whose config reads a host-derived `.default` has
+    /// the host's cell in its config, so its key moves with the host. See
+    /// `docs/MATRIX.md`.
     fn matrix<'v>(
         eval: &mut Evaluator<'v, '_, '_>,
         #[starlark(require = named)] axes: ValueOfUnchecked<'v, matrix::AxesTy>,
@@ -5432,11 +5535,46 @@ target(name = "use", driver = "d", dep = a)"#,
         assert!(
             e.contains(
                 "//mypkg:t is declared twice with different configs: mypkg/BUILD:1 and \
-                 mypkg/BUILD:2. They differ in config.url, labels: remove one declaration, or \
-                 make them identical"
+                 mypkg/BUILD:2. They differ in config.url, labels. If both come from a matrix \
+                 cell, put the cell's axis values in the target name; otherwise remove one \
+                 declaration, or make them identical"
             ),
             "{e}"
         );
+
+        // Each declared field on its own.
+        for (a, b, field) in [
+            ("labels = [\"x\"]", "labels = [\"y\"]", "labels"),
+            (
+                "transitive = {\"deps\": {\"g\": [\":a\"]}}",
+                "transitive = {\"deps\": {\"g\": [\":b\"]}}",
+                "transitive.deps",
+            ),
+            (
+                "transitive = {\"tools\": {\"g\": [\":a\"]}}",
+                "transitive = {\"tools\": {\"g\": [\":b\"]}}",
+                "transitive.tools",
+            ),
+            (
+                "transitive = {\"env\": {\"A\": \"1\"}}",
+                "transitive = {\"env\": {\"A\": \"2\"}}",
+                "transitive.env",
+            ),
+            ("approval = True", "approval = False", "approval"),
+            (
+                "approval = {\"required\": True, \"notice\": [\"a\"]}",
+                "approval = {\"required\": True, \"notice\": [\"b\"]}",
+                "approval",
+            ),
+        ] {
+            let e = err(&format!(
+                "target(name = \"t\", driver = \"d\", {a})\ntarget(name = \"t\", driver = \"d\", {b})\n"
+            ));
+            assert!(
+                e.contains(&format!("They differ in {field}. If both")),
+                "{a} vs {b}: {e}"
+            );
+        }
 
         // Identical, with config dicts built in different orders: one target,
         // the first occurrence keeping its position.
@@ -5447,18 +5585,25 @@ target(name = "use", driver = "d", dep = a)"#,
         .expect("identical declarations collapse");
         let names: Vec<&str> = ok.targets.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, ["t", "u"]);
+        // ...and with deps, tools, env, labels and approval.
+        let full = "driver = \"d\", deps = [\":a\", \":b\"], tools = [\":t\"], labels = [\"l\"], \
+                    approval = True, transitive = {\"deps\": {\"g\": [\":c\"]}, \"tools\": {\"g\": [\":u\"]}, \"env\": {\"A\": \"1\"}}";
+        let ok = run_declaring(
+            &format!("target(name = \"t\", {full})\ntarget(name = \"t\", {full})\n"),
+            none,
+        )
+        .expect("identical declarations with deps and tools collapse");
+        assert_eq!(ok.targets.len(), 1);
+        assert!(!ok.targets[0].transitive.deps().is_empty());
+        assert!(!ok.targets[0].transitive.tools().is_empty());
 
         // -0.0 and 0.0 diverge; so do an omitted driver and an explicit one.
         let e = err(
             "target(name = \"t\", driver = \"d\", f = 0.0)\ntarget(name = \"t\", driver = \"d\", f = -0.0)\n",
         );
-        assert!(e.contains("They differ in config.f:"), "{e}");
+        assert!(e.contains("They differ in config.f."), "{e}");
         let e = err("target(name = \"t\")\ntarget(name = \"t\", driver = \"exec\")\n");
-        assert!(e.contains("They differ in driver:"), "{e}");
-        let e = err(
-            "target(name = \"t\", driver = \"d\", transitive = {\"env\": {\"A\": \"1\"}})\ntarget(name = \"t\", driver = \"d\", transitive = {\"env\": {\"A\": \"2\"}})\n",
-        );
-        assert!(e.contains("They differ in transitive.env:"), "{e}");
+        assert!(e.contains("They differ in driver."), "{e}");
 
         // A plugin function and a `target()` declaring one address.
         let e = format!(
@@ -5470,7 +5615,7 @@ target(name = "use", driver = "d", dep = a)"#,
             .unwrap_err()
         );
         assert!(
-            e.contains("//mypkg:x is declared twice with different configs: mypkg/BUILD:1 and mypkg/BUILD:2. They differ in driver:"),
+            e.contains("//mypkg:x is declared twice with different configs: mypkg/BUILD:1 and mypkg/BUILD:2. They differ in driver."),
             "{e}"
         );
         // ...and identical ones collapse.
@@ -5505,7 +5650,7 @@ target(name = "use", driver = "d", dep = a)"#,
         };
         let e = format!("{:#}", run_pkg_blocking(&provider, "mypkg").unwrap_err());
         assert!(
-            e.contains("mypkg/BUILD:1 and mypkg/more.BUILD:2. They differ in config.v:"),
+            e.contains("mypkg/BUILD:1 and mypkg/more.BUILD:2. They differ in config.v."),
             "{e}"
         );
     }
