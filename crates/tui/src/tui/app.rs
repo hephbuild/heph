@@ -405,7 +405,7 @@ pub trait TUIAppView: Send {
     fn tab(&mut self, _forward: bool) {}
 
     /// Toggle a full screen's list between every observed target and the
-    /// matched-target set (the `a` key, only while a full screen is up).
+    /// matched-target set (the `m` key, only while a full screen is up).
     /// Called from the backend's key handler; the repaint happens on the next
     /// render tick. No-op by default for views without a scope toggle.
     fn toggle_scope(&mut self) {}

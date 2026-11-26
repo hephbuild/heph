@@ -31,7 +31,7 @@ pub use spotlight::{HOLD_MS, Spot};
 pub const SNAPSHOT_ROWS: u16 = 15;
 
 const FINISHED_DASHBOARD_HINTS: &str =
-    "↑/↓ select · enter details · l log · tab/⇧tab list · / filter · a matched · q or esc leave";
+    "↑/↓ select · enter details · l log · tab/⇧tab list · / filter · m matched · q or esc leave";
 
 /// A target is considered "taking long" once its execute span exceeds this.
 pub const LONG_RUNNING_THRESHOLD_MS: u64 = 5_000;
@@ -67,7 +67,7 @@ fn human_elapsed_ms(ms: u64) -> String {
 /// Which target set a count or a list covers. `Matched` counts only the
 /// matched top-level targets; `All` counts every target the view has
 /// observed, including transitive deps. The line and the final summary are
-/// always `Matched`; the dashboard starts on `All`, and its `a` key toggles
+/// always `Matched`; the dashboard starts on `All`, and its `m` key toggles
 /// it to `Matched` and back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CountScope {
@@ -4899,7 +4899,7 @@ mod tests {
 
     /// The line and the exit summary count the matched targets only, whatever
     /// scope the dashboard was left on: the dashboard opens on every target,
-    /// and its `a` toggle never reaches the line.
+    /// and its `m` toggle never reaches the line.
     #[test]
     fn line_and_final_summary_count_matched_targets_only() {
         let mut v = TuiProgressView::new("L");
@@ -4918,10 +4918,10 @@ mod tests {
             assert!(line(v).contains("1 / 1 done"), "{when}: {}", line(v));
         };
         check(&v, "on the line");
-        // `a` on the line does nothing.
+        // `m` on the line does nothing.
         v.toggle_scope();
         assert_eq!(v.list.scope, CountScope::All);
-        check(&v, "after `a` on the line");
+        check(&v, "after `m` on the line");
         // The dashboard shows every target, the line still the matched ones.
         v.open_dashboard();
         check(&v, "dashboard on All");
@@ -5205,8 +5205,8 @@ mod tests {
         );
     }
 
-    /// The dashboard opens on every target; `a` there narrows it to the
-    /// matched ones and back. On the line, `a` is not a key.
+    /// The dashboard opens on every target; `m` there narrows it to the
+    /// matched ones and back. On the line, `m` is not a key.
     #[test]
     fn toggle_scope_flips_the_dashboard_scope_only() {
         let mut v = TuiProgressView::new("L");
@@ -5560,7 +5560,7 @@ mod tests {
         );
     }
 
-    /// The Done and Cached tabs list every target the run touched, until `a`
+    /// The Done and Cached tabs list every target the run touched, until `m`
     /// narrows them to the matched targets; a failure is in neither.
     #[test]
     fn done_and_cached_tabs_follow_the_count_scope() {

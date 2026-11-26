@@ -8,7 +8,7 @@ use super::header::{Title, header_lines_hits};
 use super::list::{ListInputs, ListState, list_lines};
 
 /// The dashboard's key hints, as the spec draws them.
-pub const DASHBOARD_HINTS: &str = "↑/↓ select · enter details · l log · tab/⇧tab list · / filter · a matched · esc close dashboard · ctrl-c stop";
+pub const DASHBOARD_HINTS: &str = "↑/↓ select · enter details · l log · tab/⇧tab list · / filter · m matched · esc close dashboard · ctrl-c stop";
 
 /// The header's rows.
 const HEADER_ROWS: u16 = 4;
@@ -169,7 +169,7 @@ mod tests {
             "",
             "                                    1–3 of 3",
             "",
-            "  ↑/↓ select · enter details · l log · tab/⇧tab list · / filter · a matched · e…",
+            "  ↑/↓ select · enter details · l log · tab/⇧tab list · / filter · m matched · e…",
         ];
         assert_eq!(drawn, want, "{}", drawn.join("\n"));
 

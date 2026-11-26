@@ -809,10 +809,10 @@ pub async fn run<A: App + 'static>(
                         kind: KeyEventKind::Press,
                         ..
                     }))) => view.tab(false),
-                    // `a` narrows the dashboard to the matched targets and
+                    // `m` narrows the dashboard to the matched targets and
                     // back; the line has no scope to toggle.
                     Some(Ok(Event::Key(KeyEvent {
-                        code: KeyCode::Char('a'),
+                        code: KeyCode::Char('m'),
                         kind: KeyEventKind::Press,
                         ..
                     }))) if view.full_screen() => view.toggle_scope(),
