@@ -494,6 +494,24 @@ pub(crate) fn fake_sampler(
     (spawn, sent)
 }
 
+/// A recorder's sampler on the real clock with `fake`'s sources, one sample
+/// each `tick` until it is stopped: its stamps are real instants, so they
+/// fall within the recording.
+pub(crate) fn paced_sampler(fake: Fake, tick: Duration) -> recorder::SpawnSampler {
+    recorder::SpawnSampler(Arc::new(move |latched| {
+        let fake = fake.clone();
+        Sampler::spawn_with(move || fake, super::RealClock, tick, latched)
+    }))
+}
+
+impl Fake {
+    /// How many times the CPU source was read: the start's baseline, then
+    /// once a sample.
+    pub(crate) fn cpu_reads(&self) -> u32 {
+        self.calls(Source::CpuBusy)
+    }
+}
+
 impl Sources for Fake {
     type Cpu = StatCpu;
     fn busy(&self, prev: &StatCpu, cur: &StatCpu, _interval: Duration) -> Option<f64> {

@@ -1251,6 +1251,73 @@ fn machine_count(records: &[SessionRecord]) -> usize {
     records.iter().filter(|r| is_machine(r)).count()
 }
 
+/// The recorder drains the sampler's readings as it goes, not only at `End`:
+/// a sampler that sends several channels' worth over a run loses none. Each
+/// sample is recorded with `dropped` 0, the info first, and stamps strictly
+/// increasing within the run. With only the drain at `End`, the channel
+/// fills after `CHANNEL_CAP` readings and the rest are dropped.
+#[test]
+fn periodic_drain_keeps_every_sample() {
+    use super::sampler::{CHANNEL_CAP, tests::Fake, tests::paced_sampler};
+    let root = tempfile::tempdir().expect("tempdir");
+    let fake = Fake::default();
+    // A sample each 50 ms and a drain each 5 ms: the recorder falls a whole
+    // channel behind only if it is starved for ~200 ms.
+    let spawn = paced_sampler(fake.clone(), Duration::from_millis(50));
+    let start_us = hcore::events::now_unix_ms() * 1_000;
+    let rec = recorder_with(
+        root.path(),
+        Faults {
+            sampler: Some(spawn),
+            drain_every: Some(Duration::from_millis(5)),
+            ..Faults::default()
+        },
+    );
+    // Three channels' worth of samples, plus the start's baseline read.
+    let want = u32::try_from(3 * CHANNEL_CAP).expect("small") + 1;
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while fake.cpu_reads() < want {
+        assert!(std::time::Instant::now() < deadline, "the sampler stalled");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    rec.recorder.finish(Some(0), false, Duration::from_secs(10));
+    let end_us = (hcore::events::now_unix_ms() + 1) * 1_000;
+
+    let (records, _) = read_records(rec.dir());
+    let machine: Vec<_> = records
+        .iter()
+        .filter_map(|r| match &r.session {
+            Some(SessionRecordKind::MachineInfo(info)) => Some((info.time_unix_us, None)),
+            Some(SessionRecordKind::MachineSample(s)) => Some((s.time_unix_us, Some(s.dropped))),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        matches!(machine.first(), Some((_, None))),
+        "the info first: {machine:?}"
+    );
+    let samples: Vec<_> = machine.iter().filter_map(|(_, d)| *d).collect();
+    assert!(
+        samples.len() >= 3 * CHANNEL_CAP,
+        "{} samples recorded, {} read: {machine:?}",
+        samples.len(),
+        fake.cpu_reads()
+    );
+    assert!(
+        samples.iter().all(|d| *d == 0),
+        "a sample dropped: {machine:?}"
+    );
+    let stamps: Vec<u64> = machine.iter().map(|(t, _)| *t).collect();
+    assert!(
+        stamps.is_sorted_by(|a, b| a < b),
+        "stamps not strictly increasing: {stamps:?}"
+    );
+    assert!(
+        stamps.iter().all(|t| (start_us..=end_us).contains(t)),
+        "a stamp outside {start_us}..={end_us}: {stamps:?}"
+    );
+}
+
 /// D15: machine records are explorer inputs, not critical. A sampler whose
 /// readings reach the recorder only past the full cap has none of them
 /// kept, while a critical record sent after them still lands; the same

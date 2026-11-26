@@ -753,6 +753,10 @@ pub(crate) struct Faults {
     /// A sampler in place of the host's: scripted sources, or a spawn that
     /// fails (no sampler at all).
     pub(crate) sampler: Option<SpawnSampler>,
+    /// [`sampler::TICK`] in its place as the drain interval, so a test's
+    /// sampler can send more readings than its channel holds within a few
+    /// drains.
+    pub(crate) drain_every: Option<Duration>,
 }
 
 /// What starts a recorder's sampler, given its `latched` check.
@@ -1012,6 +1016,7 @@ impl Recorder {
                 tracing::debug!(error = %e, "cannot start the session cleanup");
             }
         }
+        let drain_every = faults.drain_every.unwrap_or(sampler::TICK);
         // The anchor first, so no reading predates it.
         let anchor = Anchor::now();
         let (sampler, readings, sampler_failed) = match spawn_sampler(&faults, &thread_shared) {
@@ -1048,7 +1053,8 @@ impl Recorder {
                     line: String::new(),
                     readings,
                     anchor,
-                    next_drain: anchor.at + sampler::TICK,
+                    next_drain: anchor.at + drain_every,
+                    drain_every,
                     shared: thread_shared,
                     faults,
                 };
@@ -1201,6 +1207,8 @@ struct RecorderThread {
     /// When the readings are next drained: once a [`sampler::TICK`], into
     /// the open transaction (no commit of their own).
     next_drain: Instant,
+    /// [`sampler::TICK`], or [`Faults::drain_every`].
+    drain_every: Duration,
     shared: Arc<Shared>,
     faults: Faults,
 }
@@ -1285,7 +1293,7 @@ impl RecorderThread {
     fn tick(&mut self) -> Flow {
         let now = Instant::now();
         if self.readings.is_some() && now >= self.next_drain {
-            self.next_drain = sampler::next_tick(self.next_drain, now, sampler::TICK);
+            self.next_drain = sampler::next_tick(self.next_drain, now, self.drain_every);
             if let Err(e) = self.drain_readings().and_then(|()| self.commit_if_full()) {
                 return self.fail("cannot write the machine's samples", &e);
             }
