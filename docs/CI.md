@@ -16,9 +16,14 @@ kept, even one the job never pulled.
   remote, and never writes to it. A hit is a revision whose `hashin` already
   matched, so nothing about a snapshot reaches a def hash, a `hashin` or a
   cache key.
-- **It can make a build faster or leave it cold, never fail it.** A missing,
-  empty or unreadable snapshot, a newer format, a damaged manifest or a
-  missing blob is a miss, and the lookup moves on to the next tier.
+- **It can make a build faster or leave it cold, never fail it**, with one
+  exception. A missing, empty or unreadable snapshot, a newer format, a
+  damaged manifest or a missing blob is a miss, and the lookup moves on to
+  the next tier. The exception: a blob found cut short only after the hit was
+  decided, with no tier behind the snapshot to serve it, makes heph rebuild
+  the target, and a target whose rebuild isn't byte-identical stops the build.
+  The snapshot written after that job leaves the cut revision out, so a
+  re-run builds it as a plain miss and succeeds.
 - **One job's working set, not the lineage's history.** `heph tool cache
   snapshot` rewrites the directory to what this job read or wrote, so it
   doesn't grow with every job that came before.
@@ -33,6 +38,7 @@ kept, even one the job never pulled.
 | Revisions this job read from any tier, or wrote, each with all its non-log blobs | Targets with `cache = False`, revisions kept out of the remote cache, tmp revisions |
 | On an incomplete run, the restored revisions the job didn't touch | A revision that can't be completed or fails an integrity check (counted in the report) |
 | Scratch slots this job used, in its own scope ([`SCRATCH.md`](SCRATCH.md)) | Scratch slots with `remote = False`; failure outputs and logs |
+| On an incomplete run, or one that used no scratch slot, the previous snapshot's slots the job didn't use | On a complete run that used some slot, the previous snapshot's slots it didn't use |
 
 ## A job, end to end
 
@@ -133,6 +139,9 @@ the pin it fails on the key it doesn't know.
 version: vX.Y.Z   # a release with cacheSnapshot
 ```
 
+`vX.Y.Z` stays a placeholder until the release that ships `cacheSnapshot:`
+is cut; this page then names it.
+
 ## Recipes
 
 Each key carries the **job name, the runner's OS and arch, and the matrix
@@ -208,10 +217,15 @@ build:
     - heph tool cache snapshot
 ```
 
+- `$CI_JOB_NAME_SLUG` needs GitLab 15.4 or later, and `fallback_keys` 16.0.
 - A GitLab cache key is overwritten in place, so the key needs no run id.
 - `after_script` runs when `script` fails, and the cache is saved after it.
-  It has its own timeout, 5 minutes by default; a large snapshot on a slow
-  disk can need more.
+  It doesn't run when the job times out or fails for any reason other than
+  its script. It has its own timeout, 5 minutes by default; a large snapshot
+  on a slow disk can need more.
+- **A failed `after_script` doesn't fail the job**: a snapshot that exits 2,
+  3 or 4 there leaves the job green, and the cache saves the directory as it
+  was. Only the job log shows it.
 - **Write scoping:** protected and unprotected branches get separate caches
   only while the project's "Use separate caches for protected branches"
   setting is on (the default). Keep it on, and protect the default branch.
@@ -350,7 +364,9 @@ snapshot: .heph-snapshot unreadable format 2 (skipped): newer than this heph rea
 snapshot marked `incomplete run` means an earlier job failed, not that the
 restore missed. `absent` is a lineage's first job, or a restore that missed.
 
-At the end of a run, hits and misses per tier, the misses by reason:
+At the end of a run, hits and misses per tier, the misses by reason. The
+line is left out when no snapshot or remote cache was consulted (every
+target hit the local cache, or none was cacheable):
 
 ```text
 cache tiers: local 0 hit 2 miss · snapshot 0 hit 2 miss (snapshot_other_hashin 1, addr_absent 1)
@@ -369,8 +385,9 @@ All hits and `snapshot_other_hashin` misses: the snapshot is working, and the
 inputs changed. All `addr_absent`: the restore brought back another job's
 snapshot, or none.
 
-When `CI` is set and a run recorded revisions, heph reminds you once per
-process:
+When `CI` is set (to anything but empty, `0` or `false`) and a run recorded
+revisions, heph notes once per process that the snapshot step still has to
+run. Every correct job prints it, since that step comes after the build:
 
 ```text
 snapshot: journal holds 12 revisions; 'heph tool cache snapshot' writes them
@@ -391,17 +408,43 @@ journals: 3 consumed
   over**: restored revisions kept because the run was incomplete. **left
   out**: revisions it couldn't write whole, by reason (trimmed by gc, a
   missing blob, a failed integrity check, …).
-- `incomplete: <reason> (<journal>); <bytes> carried over` appears when a
+- **scratch kept / new / carried / dropped**, when the job or the previous
+  generation had scratch slots, counted by slot. A slot the job used is
+  written as it left it. A slot it didn't use is carried over when the run
+  was incomplete or used no slot at all, and dropped when the run was
+  complete and used some other slot. An entry this heph can't read is
+  dropped.
+- `incomplete: <reason> (<journal>)`, one line per journal, appears when a
   process ended without its trailer (killed, or a second Ctrl-C), a request
   failed or was cancelled, or a journal has a line this heph can't read.
+  Then one `carried over: <bytes> (<n> revisions, <m> scratch slots)` line
+  totals what the run kept that it didn't touch.
+- `cleanup failed: …` means the new generation is written and current, but
+  removing an old generation or deleting a consumed journal failed. The
+  exit code is still 0. The line says what is left: an old generation goes
+  with the next snapshot, and a journal that is still there is read again by
+  it, which makes that snapshot bigger, never wrong.
 - An empty working set leaves the directory as it was:
-  `snapshot: unchanged, the working set is empty`.
+  `snapshot: unchanged, the working set is empty (<dir>)`.
+
+Every zstd blob the new generation holds is decoded once per snapshot, kept
+ones included, to check it against its manifest (a raw blob's length is
+checked). That is the snapshot's CPU cost: it grows with the whole working
+set, not with what the job built.
 
 `--json` prints one document: `schema` (an integer), `dir`, `complete`, then
 the report with integer bytes, the top revisions by bytes and the dropped
 addresses, in a stable order with no timestamps. A failure prints
 `{"schema": 1, "error": "…", "reason": "…"}`. Adding a field keeps `schema`;
 removing or retyping one bumps it. Ignore fields you don't know.
+
+- `complete` is the machine signal for an incomplete run; each
+  `incomplete[].reason` is text for a human and may change.
+- `error` is text for a human and may change. Branch on `reason`, whose set
+  can grow: treat a value you don't know like `error`.
+- The `left_out` keys (`trimmed`, `missing_blob`, `corrupt`, `key_mismatch`,
+  `case_collision`, `unsupported`, `unknown_manifest`) are permanent: one may
+  be added, none is renamed or reused.
 
 | Exit | `reason` | Means |
 | --- | --- | --- |
@@ -426,7 +469,13 @@ removing or retyping one bumps it. Ignore fields you don't know.
   run incomplete, so restored revisions are carried over each time. The
   report's `incomplete:` line says why and how many bytes were carried.
 - **Exit 3.** A heph process of the job is still alive: a background
-  `heph run`, or a step that didn't wait for one.
+  `heph run`, or a step that didn't wait for one. The message names its pid;
+  pid 1 is a container's main process, so look for it in the container that
+  recorded the journal.
+- **Exit 4 on a persistent runner.** A newer heph ran on this machine and
+  left a journal this heph can't read. The message names the file: delete
+  it. Its revisions are only missing from this snapshot; the next job that
+  uses them records them again.
 - **`unreadable format N (skipped)`.** The snapshot was written by a newer
   heph. The run is cold for the tier, and the next `heph tool cache snapshot`
   replaces it.
