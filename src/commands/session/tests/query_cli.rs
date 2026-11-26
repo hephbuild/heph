@@ -389,6 +389,64 @@ async fn query_schema_lists_every_name() {
     }
 }
 
+/// Spec row `schema_lists_machine_names`: `--schema` lists every machine
+/// metric name with its kind, unit and OTLP mapping, between the tables and
+/// the recipes, and the six built-in recipes.
+#[tokio::test]
+async fn schema_lists_machine_names() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let out = run_query(tmp.path(), &["--schema"], "")
+        .await
+        .out
+        .expect("schema");
+    let (head, recipes) = out.split_once("\nrecipes\n").expect("a recipes section");
+    let machine = head
+        .split_once("\nmachine metrics (OTLP: semantic conventions 1.27.0, https://opentelemetry.io/schemas/1.27.0)\n")
+        .expect("a machine metrics section")
+        .1;
+    let lines: Vec<Vec<&str>> = machine
+        .lines()
+        .map(|l| l.split_whitespace().collect())
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "heph.machine.cpu.count gauge {cpu} otlp system.cpu.logical.count, updowncounter",
+            "heph.machine.cpu.limit gauge {cpu} otlp as named, gauge",
+            "heph.machine.cpu.busy gauge 1 otlp as named, gauge",
+            "heph.machine.memory.limit gauge By otlp system.memory.limit, updowncounter",
+            "heph.machine.memory.used gauge By otlp as named, gauge",
+            "heph.process.cpu.time counter s otlp process.cpu.time, counter",
+            "heph.process.memory.resident gauge By otlp process.memory.usage, updowncounter",
+            "heph.session.machine.cpu.busy.mean gauge 1 otlp as named, gauge",
+            "heph.session.machine.cpu.busy.peak gauge 1 otlp as named, gauge",
+            "heph.session.machine.memory.used.peak gauge By otlp as named, gauge",
+            "heph.session.process.memory.resident.peak gauge By otlp as named, gauge",
+        ]
+        .map(|l| l.split(' ').collect::<Vec<_>>()),
+        "{machine}"
+    );
+    // Each recipe opens, after a blank line, with `-- name: purpose`.
+    let names: Vec<&str> = recipes
+        .split("\n\n")
+        .filter_map(|r| r.trim_start_matches('\n').strip_prefix("-- "))
+        .filter_map(|l| l.split_once(": "))
+        .map(|(name, _)| name)
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "time_by_phase",
+            "uncovered_wall",
+            "phase_percentiles",
+            "hit_rate_by_package",
+            "waiting_by_load",
+            "resources_vs_machine",
+        ],
+        "{recipes}"
+    );
+}
+
 /// The default source is the catalog scoped by the window; `--full` reads
 /// every recording kept in the window instead, counting one in a format
 /// this heph does not read as skipped (and saying so on stderr).

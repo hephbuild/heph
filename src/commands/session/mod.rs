@@ -182,9 +182,11 @@ pub enum SessionCommands {
     /// refused or failing statement exits 125. Ctrl-C stops it and exits
     /// 130.
     ///
-    /// `--schema` also prints the built-in recipes, SQL for the questions
-    /// asked most: `time_by_phase`, `uncovered_wall`, `phase_percentiles`
-    /// and `hit_rate_by_package`. Copy one into a query, or into a file for
+    /// `--schema` also prints the machine metric names with their OTLP
+    /// mapping, and the built-in recipes, SQL for the questions asked most:
+    /// `time_by_phase`, `uncovered_wall`, `phase_percentiles`,
+    /// `hit_rate_by_package`, `waiting_by_load` and `resources_vs_machine`.
+    /// Copy one into a query, or into a file for
     /// `-f`. A recipe sums every session in scope: for one session, run it
     /// with `--from <id>`, or add `session_id = '<id>'` to its `WHERE`.
     /// Past 7 days (`--since 30d`), the catalog answers, up to 90 days back,
@@ -243,8 +245,9 @@ pub struct QueryArgs {
     /// Stop the query after this long (`30s`, `2m`).
     #[arg(long, value_name = "DURATION", default_value = "30s", value_parser = query::parse_timeout)]
     pub timeout: Duration,
-    /// Print the six tables with their columns, the schema version, and the
-    /// built-in recipes as runnable SQL; run nothing.
+    /// Print the six tables with their columns, the schema version, the
+    /// machine metric names with their OTLP mapping, and the built-in
+    /// recipes as runnable SQL; run nothing.
     #[arg(long, conflicts_with_all = ["from", "full", "format"])]
     pub schema: bool,
 }

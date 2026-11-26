@@ -188,8 +188,9 @@ started in it, none of one started before it.
 
 The SQL is the argument, `-` reads it from stdin, `-f FILE` from a file.
 `--schema` prints the six tables with a line per column, the schema
-version and the [built-in recipes](#built-in-recipes) as runnable SQL, and
-runs nothing.
+version, the [machine metric names](#machine-stats) with their kind, unit
+and OTLP mapping, and the [built-in recipes](#built-in-recipes) as runnable
+SQL, and runs nothing.
 
 **Read-only by construction.** The statement is prepared first against
 empty copies of the six tables: more than one statement, any write
