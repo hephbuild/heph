@@ -840,8 +840,6 @@ that bound, and a build never repairs anything (I1).
   The reach is rounded down: a session 6 days and 20 hours old covers "the
   last 6 days"; under a day, the hours.
 
-  `list --json` then has `retention.catalog.keep_ms: null`.
-
 `list` and `query` over the catalog (without `--full` or `--from`) open
 the catalog, so both repair it as above. `show` replaces a session's catalog
 rows after it re-derives that session's recording (below).
@@ -934,15 +932,16 @@ there leaves the file for the next cleanup.
 
 ### `--json`
 
-`list --json` is `{version, sessions: [{id, owner_pid, argv, workspace_root,
-cwd, state, started_unix_ms, ended_unix_ms, last_event_unix_ms, exit_code,
-panicked, actor, user, command, recorded, recording_kept, target, progress,
-now, blocked_on, incomplete, format}], retention}`, times in absolute unix ms.
+`list --json` is an array, one element per session, `[{id, owner_pid, argv,
+workspace_root, cwd, state, started_unix_ms, ended_unix_ms,
+last_event_unix_ms, exit_code, panicked, actor, user, command, recorded,
+recording_kept, target, progress, now, blocked_on, incomplete, format}]`,
+times in absolute unix ms; `[]` when there is no session.
 
-The order of `sessions` is part of the contract, and is the table's order:
-live sessions first, then ended ones; within each, by start time, newest
-first; between sessions that started in the same millisecond, by id,
-greatest first. A change to this order bumps `version`.
+Its order is the table's ([`JSON_OUTPUT.md`](JSON_OUTPUT.md)): live
+sessions first, then ended ones; within each, by start time, newest first;
+between sessions that started in the same millisecond, by id, greatest
+first.
 
 - `actor` is `{kind, name}`: `kind` is `human`, `agent` or `ci` (an open
   set), `name` the agent or CI system when known. `null` when the catalog has
@@ -962,14 +961,6 @@ greatest first. A change to this order bumps `version`.
 - `target` appears only with `--addr`: `{addr, outcome, duration_ms}`, that
   target in this session. `outcome` is `ran`, `hit`, `failed` or `cancelled`,
   an open set.
-- `retention` says how far back each source answers:
-  `{recordings: {keep_ms, keep_bytes}, catalog: {keep_ms,
-  oldest_started_unix_ms}}`. `recordings` is `session.keep` and
-  `session.keepBytes`. `catalog.keep_ms` is 90 days, or `null` when there is
-  no usable catalog and `list` answered from the recordings kept.
-  `catalog.oldest_started_unix_ms` is when the catalog's oldest session
-  started (a rebuilt catalog covers only the recordings kept then), `null`
-  when it holds none or there is no usable catalog.
 
 - `progress` is PROGRESS as numbers, `{done, total, total_complete,
   running_ops, failed}`, `null` before the session wrote its first

@@ -183,8 +183,8 @@ async fn run_list(sources: &[&dyn SessionSource], ws: Workspace<'_>, json: bool)
         ws,
         &list::ListFilter::default(),
         None,
-        json,
-        &mut out,
+        &json_args(json),
+        piped(&mut out),
     )
     .await
     .expect("list");
@@ -667,12 +667,7 @@ async fn commands_run_against_any_source() {
         ],
         "live newest first, then ended"
     );
-    assert_eq!(
-        json["retention"]["catalog"]["keep_ms"],
-        serde_json::Value::Null,
-        "no catalog read"
-    );
-    let a_json = &json["sessions"][2];
+    let a_json = &json[2];
     assert_eq!(a_json["state"], "waiting");
     assert_eq!(a_json["owner_pid"], 100);
     assert_eq!(a_json["started_unix_ms"], T0);
@@ -688,7 +683,7 @@ async fn commands_run_against_any_source() {
     assert_eq!(a_json["progress"]["running_ops"], 0);
     assert_eq!(a_json["panicked"], false);
     assert!(a_json.get("format").is_none(), "only on too-new rows");
-    let b_json = &json["sessions"][3];
+    let b_json = &json[3];
     assert_eq!(b_json["exit_code"], 0);
     assert_eq!(b_json["state"], "ok");
     assert_eq!(b_json["now"], serde_json::Value::Null, "it ended");
@@ -3000,7 +2995,7 @@ async fn a_lost_session_sealed_by_cleanup_still_reads() {
 
     let json: serde_json::Value =
         serde_json::from_str(&run_list(&sources, Workspace::All, true).await).expect("json");
-    let s = &json["sessions"][0];
+    let s = &json[0];
     assert_eq!(s["id"], id.encode(), "{json}");
     assert_eq!(s["state"], "lost", "{s}");
     assert_eq!(s["exit_code"], serde_json::Value::Null, "{s}");

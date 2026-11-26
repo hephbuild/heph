@@ -11,7 +11,7 @@ use anyhow::Context as _;
 use serde::Serialize;
 
 use super::{
-    ActorKind, BlockedOn, SessionState, ViewOpts, Workspace, ago, blocked_on, command_line,
+    ActorKind, BlockedOn, Out, SessionState, ViewOpts, Workspace, ago, blocked_on, command_line,
     derive_state, escape, list_all, truncate,
 };
 use crate::tui::session::catalog::{self, ListQuery, Listed};
@@ -92,14 +92,9 @@ pub(crate) fn window(
 pub(crate) struct CatalogRows {
     /// The catalog's sessions in the window, with the target under `--addr`.
     pub rows: Vec<Listed>,
-    /// When its oldest session started: how far back it answers.
-    pub oldest_started_ms: Option<u64>,
-    /// When its oldest session of the workspace in scope started: how far
-    /// back it answers for that workspace. The same as `oldest_started_ms`
-    /// unscoped.
+    /// When its oldest session of the workspace in scope started (of any
+    /// workspace, unscoped): how far back it answers for that workspace.
     pub oldest_in_scope_ms: Option<u64>,
-    /// Answering from the recordings kept: there is no usable catalog.
-    pub in_memory: bool,
 }
 
 /// Open (and so repair, D14) the catalog in `root` and read what `filter`
@@ -127,16 +122,13 @@ pub(crate) fn read_catalog(
             until_ms: filter.until_ms,
             addr: filter.addr.as_deref(),
         };
-        let oldest_started_ms = catalog::oldest_started_ms(&cat.conn)?;
         let oldest_in_scope_ms = match workspace {
-            Workspace::All => oldest_started_ms,
+            Workspace::All => catalog::oldest_started_ms(&cat.conn)?,
             Workspace::Only(w) => catalog::oldest_started_ms_in(&cat.conn, w)?,
         };
         Ok(CatalogRows {
             rows: catalog::list_sessions(&cat.conn, &q)?,
-            oldest_started_ms,
             oldest_in_scope_ms,
-            in_memory: cat.in_memory,
         })
     };
     match read() {
@@ -148,42 +140,12 @@ pub(crate) fn read_catalog(
     }
 }
 
-#[derive(Debug, Serialize)]
-struct ListJson {
-    version: u32,
-    /// Live sessions first, then ended ones newest first.
-    sessions: Vec<ListJsonEntry>,
-    retention: RetentionJson,
-}
-
-/// How far back each half of `list` answers.
-#[derive(Debug, Serialize)]
-struct RetentionJson {
-    recordings: RecordingsRetention,
-    catalog: CatalogRetention,
-}
-
-#[derive(Debug, Serialize)]
-struct RecordingsRetention {
-    /// `session.keep`: an ended recording is removed this long after it ended.
-    keep_ms: u64,
-    /// `session.keepBytes`.
-    keep_bytes: u64,
-}
-
-#[derive(Debug, Serialize)]
-struct CatalogRetention {
-    /// How long a catalog row is kept; `null` when there is no usable
-    /// catalog and `list` answered from the recordings kept.
-    keep_ms: Option<u64>,
-    /// When the catalog's oldest session started: a rebuilt catalog covers
-    /// only the recordings kept then. `null` when it holds none.
-    oldest_started_unix_ms: Option<u64>,
-}
-
-/// One session in `list --json`. Times are absolute unix milliseconds.
-#[derive(Debug, Serialize)]
-struct ListJsonEntry {
+/// One session in `list --json`, which is an array of these in the table's
+/// order: live sessions first, then ended ones, each newest first. Times are
+/// absolute unix milliseconds.
+#[derive(Debug, Serialize, output::Record)]
+pub struct ListRow {
+    /// The session id.
     id: String,
     /// The recording process's pid; `null` only for a session in a newer
     /// directory format.
@@ -243,16 +205,18 @@ struct ListJsonEntry {
     format: Option<u32>,
 }
 
-#[derive(Debug, Serialize)]
-struct ActorJson {
+/// Who ran a session, in `list --json`.
+#[derive(Debug, Serialize, output::Shape)]
+pub(crate) struct ActorJson {
     /// `human`, `agent` or `ci`; an open set.
     kind: String,
     /// The agent or CI system, when known.
     name: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-struct TargetJson {
+/// The `--addr` target in one session, in `list --json`.
+#[derive(Debug, Serialize, output::Shape)]
+pub(crate) struct TargetJson {
     addr: String,
     /// `ran`, `hit`, `failed` or `cancelled`; an open set.
     outcome: String,
@@ -490,8 +454,8 @@ pub(crate) async fn list(
     workspace: Workspace<'_>,
     filter: &ListFilter,
     catalog: Option<&CatalogRows>,
-    json: bool,
-    out: &mut dyn Write,
+    json: &output::JsonArgs<ListRow>,
+    out: Out<'_>,
 ) -> anyhow::Result<Shown> {
     let all = list_all(sources).await?;
     let every: Vec<&SessionEntry> = all.iter().map(|(_, e)| e).collect();
@@ -519,10 +483,12 @@ pub(crate) async fn list(
     } else {
         0
     };
-    if json {
-        write_json(&shown, &every, catalog, opts, out)?;
+    if json.enabled() {
+        let rows = shown.iter().map(|r| json_row(r, &every, opts));
+        json.printer_to(out.w, out.style)
+            .list_iter(rows, &output::never_cancelled)?;
     } else {
-        write_table(&shown, &every, workspace, filter, opts, out)?;
+        write_table(&shown, &every, workspace, filter, opts, out.w)?;
     }
     Ok(Shown {
         rows: shown.len(),
@@ -593,53 +559,8 @@ pub(crate) fn scope_note(all: bool, workspace: Option<&str>) -> Option<&'static 
         .then_some("heph: not in a workspace; listing the sessions of every workspace\n")
 }
 
-fn write_json(
-    shown: &[Row<'_>],
-    every: &[&SessionEntry],
-    catalog: Option<&CatalogRows>,
-    opts: ViewOpts,
-    out: &mut dyn Write,
-) -> anyhow::Result<()> {
-    let sessions = shown.iter().map(|r| json_entry(r, every, opts)).collect();
-    let on_disk = catalog.filter(|c| !c.in_memory);
-    let retention = RetentionJson {
-        recordings: RecordingsRetention {
-            keep_ms: u64::try_from(opts.retention.max_age.as_millis()).unwrap_or(u64::MAX),
-            keep_bytes: opts.retention.max_bytes,
-        },
-        catalog: CatalogRetention {
-            keep_ms: on_disk.map(|_| u64::try_from(catalog::KEEP.as_millis()).unwrap_or(u64::MAX)),
-            oldest_started_unix_ms: on_disk.and_then(|c| c.oldest_started_ms),
-        },
-    };
-    serde_json::to_writer_pretty(
-        &mut *out,
-        &ListJson {
-            version: LIST_JSON_VERSION,
-            sessions,
-            retention,
-        },
-        EntryMeta::TooNew { found, .. } => ListRow {
-            id: e.id.encode(),
-            owner_pid: None,
-            argv: Vec::new(),
-            workspace_root: None,
-            cwd: None,
-            state,
-            started_unix_ms: e.id.started_unix_ms(),
-            last_event_unix_ms: None,
-            exit_code: None,
-            panicked: false,
-            progress: None,
-            now: None,
-            blocked_on: Vec::new(),
-            incomplete: None,
-            format: Some(*found),
-        },
-    }
-}
-
-fn json_entry(r: &Row<'_>, every: &[&SessionEntry], opts: ViewOpts) -> ListJsonEntry {
+/// `r`'s element of `list --json`.
+fn json_row(r: &Row<'_>, every: &[&SessionEntry], opts: ViewOpts) -> ListRow {
     let state = r.state(opts);
     let cat = r.cat;
     let actor = cat.and_then(|c| {
@@ -653,7 +574,7 @@ fn json_entry(r: &Row<'_>, every: &[&SessionEntry], opts: ViewOpts) -> ListJsonE
         outcome: t.outcome.clone(),
         duration_ms: t.duration_us.map(|d| d / 1000),
     });
-    let mut j = ListJsonEntry {
+    let mut j = ListRow {
         id: r.id(),
         owner_pid: cat.and_then(|c| c.owner_pid),
         argv: cat.map(|c| c.argv.clone()).unwrap_or_default(),
@@ -960,9 +881,23 @@ mod tests {
             cwd: Some("/w".to_owned()),
             state: SessionState::Running,
             started_unix_ms: 1,
+            ended_unix_ms: Some(3),
             last_event_unix_ms: Some(2),
             exit_code: None,
             panicked: false,
+            actor: Some(ActorJson {
+                kind: "agent".to_owned(),
+                name: Some("claude-code".to_owned()),
+            }),
+            user: Some("bob".to_owned()),
+            command: Some("run".to_owned()),
+            recorded: true,
+            recording_kept: true,
+            target: Some(TargetJson {
+                addr: "//a:b".to_owned(),
+                outcome: "ran".to_owned(),
+                duration_ms: Some(4),
+            }),
             progress: None,
             now: Some("//a:b (1s)".to_owned()),
             blocked_on: Vec::new(),

@@ -155,6 +155,7 @@ async fn export_otlp_local_foreign_stdout_and_file() {
             error: None,
             upstream_of: None,
             exit_status: None,
+            exit_code: None,
             log_tail: None,
             timed_out: None,
         },

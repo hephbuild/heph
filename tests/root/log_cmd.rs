@@ -382,10 +382,9 @@ fn entries(dir: &Path) -> Vec<String> {
 fn listed(ws: &Ws) -> Vec<serde_json::Value> {
     let out = ws.run(&["session", "list", "--all", "--json"]);
     assert!(out.status.success(), "{}", describe(&out));
-    let mut v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("list --json");
-    match v.get_mut("sessions").map(serde_json::Value::take) {
-        Some(serde_json::Value::Array(sessions)) => sessions,
-        other => panic!("sessions: {other:?}"),
+    match serde_json::from_slice(&out.stdout).expect("list --json") {
+        serde_json::Value::Array(sessions) => sessions,
+        other => panic!("list --json is a bare array: {other}"),
     }
 }
 

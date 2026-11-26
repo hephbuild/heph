@@ -289,11 +289,10 @@ pub struct ListArgs {
     /// The sessions of the workspace at DIR, not this one's.
     #[arg(long, value_name = "DIR")]
     pub workspace: Option<std::path::PathBuf>,
-    /// Machine-readable output: `{version, sessions: [...], retention}`, in
-    /// the table's order: live sessions first, then ended ones, each newest
-    /// first. A change to that order bumps `version`.
-    #[arg(long)]
-    pub json: bool,
+    /// `--json` is an array of sessions in the table's order: live sessions
+    /// first, then ended ones, each newest first.
+    #[command(flatten)]
+    pub out: output::JsonArgs<list::ListRow>,
 }
 
 /// Who ran a session, as `list --actor` selects it.
@@ -500,8 +499,8 @@ fn execute(
                 scope,
                 &filter,
                 catalog.as_ref(),
-                a.json,
-                &mut stdout,
+                &a.out,
+                out,
             ))??;
             for hint in list::hints(shown, &filter, catalog.as_ref(), &a.since, opts.now_ms) {
                 sink.write_diagnostic(&hint);

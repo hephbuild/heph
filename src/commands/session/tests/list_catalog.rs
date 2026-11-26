@@ -40,6 +40,7 @@ fn resolved(addr: &str, at: u64, ran: bool, error: Option<&str>) -> Vec<SessionR
             error: error.map(Into::into),
             upstream_of: None,
             exit_status: None,
+            exit_code: None,
             log_tail: None,
             timed_out: None,
         },
@@ -142,8 +143,8 @@ async fn list_at(
         Workspace::All,
         filter,
         catalog.as_ref(),
-        json,
-        &mut out,
+        &json_args(json),
+        piped(&mut out),
     )
     .await
     .expect("list");
@@ -158,9 +159,8 @@ fn since(days: u64, now: u64) -> list::ListFilter {
 }
 
 fn json_ids(json: &serde_json::Value) -> Vec<String> {
-    json["sessions"]
-        .as_array()
-        .expect("sessions")
+    json.as_array()
+        .expect("a bare array of sessions")
         .iter()
         .map(|s| s["id"].as_str().expect("id").to_owned())
         .collect()
@@ -211,7 +211,7 @@ async fn list_who_ran() {
     assert!(notes.is_empty(), "a second list repairs nothing: {notes:?}");
     let json: serde_json::Value = serde_json::from_str(&json).expect("json");
     assert_eq!(json_ids(&json), [failed.encode(), ran.encode()]);
-    let f = &json["sessions"][0];
+    let f = &json[0];
     assert_eq!(f["target"]["addr"], ADDR);
     assert_eq!(f["target"]["outcome"], "failed");
     assert!(f["target"]["duration_ms"].is_u64(), "{f}");
@@ -224,21 +224,7 @@ async fn list_who_ran() {
     assert_eq!(f["recorded"], true);
     assert_eq!(f["recording_kept"], true);
     assert_eq!(f["ended_unix_ms"], failed.started_unix_ms() + 1_000);
-    assert_eq!(json["sessions"][1]["target"]["outcome"], "ran");
-    assert_eq!(
-        json["retention"]["catalog"]["keep_ms"],
-        90 * DAY_MS,
-        "{}",
-        json["retention"]
-    );
-    assert_eq!(
-        json["retention"]["catalog"]["oldest_started_unix_ms"],
-        old.started_unix_ms()
-    );
-    assert_eq!(
-        json["retention"]["recordings"]["keep_ms"],
-        u64::try_from(opts().retention.max_age.as_millis()).expect("ms")
-    );
+    assert_eq!(json[1]["target"]["outcome"], "ran");
 
     // Further back, the older run too.
     let (json, _) = list_at(
@@ -322,9 +308,9 @@ async fn list_who_ran() {
     assert!(row.contains(" ran ") && row.contains(" ok "), "{row}");
     let (json, _) = list_at(root, now, &who_ran, true).await;
     let json: serde_json::Value = serde_json::from_str(&json).expect("json");
-    let gone = json["sessions"]
+    let gone = json
         .as_array()
-        .expect("sessions")
+        .expect("a bare array of sessions")
         .iter()
         .find(|s| s["id"] == ran.encode())
         .unwrap_or_else(|| panic!("the catalog row is listed: {json}"));
@@ -361,8 +347,8 @@ async fn list_json_shows_the_addr_outcome() {
     .await;
     let json: serde_json::Value = serde_json::from_str(&json).expect("json");
     assert_eq!(json_ids(&json), [warm.encode(), cold.encode()]);
-    assert_eq!(json["sessions"][0]["target"]["outcome"], "hit");
-    assert_eq!(json["sessions"][1]["target"]["outcome"], "ran");
+    assert_eq!(json[0]["target"]["outcome"], "hit");
+    assert_eq!(json[1]["target"]["outcome"], "ran");
 }
 
 /// Live sessions first, then ended ones, each newest first: the table and
@@ -477,8 +463,8 @@ async fn list_window_adversarial_inputs() {
             ..list::ListFilter::default()
         },
         None,
-        false,
-        &mut out,
+        &json_args(false),
+        piped(&mut out),
     )
     .await
     .expect("list");
@@ -495,7 +481,7 @@ async fn list_window_adversarial_inputs() {
         command: None,
         user: None,
         workspace: None,
-        json: false,
+        out: output::JsonArgs::default(),
     };
     let e = wrap_exit(args.filter(NOW).map(|_| ())).expect_err("refused");
     assert!(format!("{e:#}").contains("earlier than --since"), "{e:#}");
@@ -627,9 +613,8 @@ async fn list_over_a_truncated_and_an_unknown_format_recording() {
             .to_owned()
     };
     let session_of = |json: &serde_json::Value, id: SessionId| {
-        json["sessions"]
-            .as_array()
-            .expect("sessions")
+        json.as_array()
+            .expect("a bare array of sessions")
             .iter()
             .find(|s| s["id"] == id.encode())
             .unwrap_or_else(|| panic!("{} is listed: {json}", id.encode()))
@@ -701,8 +686,8 @@ async fn list_hints_in(
         workspace,
         filter,
         catalog.as_ref(),
-        true,
-        &mut out,
+        &json_args(true),
+        piped(&mut out),
     )
     .await
     .expect("list");
