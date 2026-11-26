@@ -12,7 +12,9 @@
 use anyhow::Context as _;
 use async_trait::async_trait;
 use hcore::hasync::Cancellable;
-use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
+use hdriver_support::driver_managed::{
+    ManagedDriver, ManagedRunRequest, ManagedRunResponse, single_dep_file,
+};
 use hplugin::driver::targetdef::path::{CodegenMode, Content, Path};
 use hplugin::driver::targetdef::{Input, InputMode, Output, TargetDef};
 use hplugin::driver::{
@@ -178,11 +180,14 @@ impl ManagedDriver for Driver {
         let def = req.request.target.def_de::<AssetUrlDef>().clone();
         let addr = req.request.target.addr.format();
         let context = format!("{addr}: release asset {:?}", def.asset);
-        let json = crate::extract::single_file(&req, SRC_ORIGIN)
-            .with_context(|| format!("{addr}: `src`"))?;
+        let src =
+            single_dep_file(&req.inputs, SRC_ORIGIN).with_context(|| format!("{addr}: `src`"))?;
         // The output is `<pkg>/<name>` (see `parse`).
         let dest = req.sandbox_pkg_dir.join(&req.request.target.addr.name);
         hcore::blocking::run(move || {
+            let json = src
+                .single_file()
+                .with_context(|| format!("{addr}: `src`"))?;
             let bytes = std::fs::read(&json).with_context(|| format!("read {}", json.display()))?;
             let url = pick(&bytes, &def.asset, &def.api)?;
             if let Some(dir) = dest.parent() {

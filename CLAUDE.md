@@ -243,22 +243,35 @@ Read `docs/TEMPLATE.md` before touching it. The one thing to know going in:
 `vars` is hashed from a `BTreeMap` because it arrives as a `HashMap`, and
 hashing it in iteration order would move the def hash on every run.
 
+### Archives
+
+The builtin `archive` plugin (`crates/plugin-archive`, over `crates/archive`)
+has two in-process drivers: `archive.extract` unpacks one archive file into a
+directory, `archive.create` packs `deps`' outputs into one archive file. The
+`tar` coreutil writes through the same writer as `archive.create`.
+
+Read `docs/ARCHIVE.md` before touching it. The one thing to know going in:
+`archive.create`'s bytes must be a function of the deps' content and the def
+hash alone — it reads no environment (not even `SOURCE_DATE_EPOCH`) and
+stamps mtime 0 — and the unpacker treats every archive as hostile, so each
+unpacking rule (no `..`/absolute paths, links resolved inside the output,
+normalized modes, duplicates refused, bounded output) is a security property
+with a unit test, not a nicety.
+
 ### GitHub release assets
 
 `heph.gh.release_asset(...)` (`crates/plugin-gh/src/release.rs`) declares an
-`http_fetch` of a release asset's download URL and, with `extract = True`, a
-`gh.extract` that unpacks it in-process (`crates/archive`).
+`http_fetch` of a release asset's download URL and, with `extract = True`, an
+`archive.extract` that unpacks it (the builtin, named rather than linked into
+the gh cdylib; see "Archives").
 With `credentials` (a private repository) it goes through the API instead: an
 uncached `http_fetch` of the release JSON, a `gh.asset_url` picking the asset's
 API URL out of it, and an `http_fetch` whose `url` reads it (`${read://…}`).
 
 Read `docs/GH_RELEASES.md` before touching it. The one thing to know going in:
 the function only *declares* targets and must stay pure (no network, no
-environment), and the archive is untrusted input, so every unpacking rule
-(no `..`/absolute paths, links resolved inside the output, normalized modes,
-duplicates refused) is a security property with a unit test, not a nicety.
-So is `asset_url` refusing a URL outside `api_url`: the credentials are sent to
-whatever URL it writes.
+environment), and `asset_url` refusing a URL outside `api_url` is a security
+property: the credentials are sent to whatever URL it writes.
 
 ### Failure outputs
 

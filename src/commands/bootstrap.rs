@@ -9,8 +9,8 @@ use crate::engine::config::ConfigYamlExt;
 use crate::engine::config_yaml;
 use crate::tui::session::SessionSlot;
 use crate::{
-    engine, pluginbuildfile, pluginexec, pluginhostbin, pluginhttp, pluginnix, plugintemplate,
-    plugintextfile,
+    engine, pluginarchive, pluginbuildfile, pluginexec, pluginhostbin, pluginhttp, pluginnix,
+    plugintemplate, plugintextfile,
 };
 
 /// Builds the multi-thread runtime used by every command entry point.
@@ -209,6 +209,13 @@ pub fn register_builtin_plugins(
     // cacheable file output — how tool binaries are provisioned off the internet.
     e.register_plugin(pluginhttp::DRIVER_NAME, |_| {
         Ok(PluginParts::default().with_managed_driver(Box::new(pluginhttp::Driver)))
+    })?;
+    // `archive.extract` / `archive.create`: unpack and pack archives
+    // in-process (`docs/ARCHIVE.md`).
+    e.register_plugin(pluginarchive::PLUGIN_NAME, |_| {
+        Ok(PluginParts::default()
+            .with_managed_driver(Box::new(pluginarchive::extract::Driver))
+            .with_managed_driver(Box::new(pluginarchive::create::Driver)))
     })?;
     let nix_dir = home_dir.join("nix-driver");
     e.register_plugin(pluginnix::DRIVER_NAME, |_| {
@@ -990,6 +997,8 @@ plugins:
         assert_eq!(
             sorted(e.drivers_by_name.keys()),
             [
+                "archive.create",
+                "archive.extract",
                 "auth.credential",
                 "bash",
                 // The BUILD-file check targets' drivers.

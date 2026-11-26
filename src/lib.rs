@@ -30,6 +30,7 @@ pub use hengine::engine;
 pub use hlock::hlock;
 pub use hmodel::{htaddr, htlabel, htmatcher, htpkg, htquery};
 pub use hplugin::htspec;
+pub use hplugin_archive as pluginarchive;
 pub use hplugin_buildfile::pluginbuildfile;
 pub use hplugin_exec::pluginexec;
 pub use hplugin_http::pluginhttp;

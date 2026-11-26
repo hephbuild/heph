@@ -3,8 +3,11 @@
 //! Exports a single stabby `create` entry that wires the parts of
 //! `plugin-gh` into ABI-stable handles: the GitHub Actions reporting
 //! [`GhaHook`] (when the options say `hook: {enable: true}`), the
-//! `release_asset` function and the `extract` and `asset_url` drivers. No
-//! provider.
+//! `release_asset` function and the `asset_url` driver. No provider. The
+//! extract `release_asset` declares is the host's builtin `archive.extract`,
+//! named rather than called: `plugin-gh` does not request `archive`'s codec
+//! feature (cargo may unify it on in a build alongside `heph`), and the linker
+//! drops the codecs from this cdylib since nothing in it calls them.
 //!
 //! A bad `options:` entry does not abort the host: the log sink is not
 //! installed at creation, so an abort would be a bare `SIGABRT` with no
@@ -15,7 +18,7 @@
 use std::sync::Arc;
 
 use hplugin::hook::Hook;
-use hplugin_gh::{ConfigErrorHook, GhOptions, GhaHook, asset_url, extract, release};
+use hplugin_gh::{ConfigErrorHook, GhOptions, GhaHook, asset_url, release};
 use plugin_sdk::stabby::abi::{DynFunctionRegistry, NamedHook, PluginComponents};
 use plugin_sdk::stabby::{
     create_config_from_bytes, make_dyn_hook, make_plugin_functions, named_managed_driver,
@@ -67,7 +70,6 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
     let (functions, function_handle) = make_plugin_functions(&cfg.name, defs)?;
 
     let mut drivers = stabby::vec::Vec::new();
-    drivers.push(named_managed_driver(extract::Driver)?);
     drivers.push(named_managed_driver(asset_url::Driver)?);
 
     Ok(PluginComponents {

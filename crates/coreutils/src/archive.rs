@@ -15,13 +15,16 @@
 //! * mtime from `SOURCE_DATE_EPOCH` when set, otherwise 0;
 //! * no gzip header name or timestamp.
 //!
+//! `tar -c` writes through `harchive::write` (`crates/archive`), the writer the
+//! `archive.create` driver uses; only `SOURCE_DATE_EPOCH` is read here.
+//!
 //! There is deliberately no flag to turn any of that off. A recipe that wants a
 //! non-reproducible archive is a recipe with a bug.
 
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 const OK: i32 = 0;
 const ERROR: i32 = 1;
@@ -146,99 +149,61 @@ fn walk_sorted(root: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-/// Add `path` under `name`, with every machine-specific field flattened.
-fn append_reproducible<W: Write>(
-    builder: &mut tar::Builder<W>,
-    path: &Path,
-    name: &Path,
-    mtime: u64,
-) -> io::Result<()> {
-    let meta = std::fs::symlink_metadata(path)?;
-    let mut header = tar::Header::new_gnu();
-    header.set_mtime(mtime);
-    header.set_uid(0);
-    header.set_gid(0);
-    // Names, not just ids: a numeric 0 with "raphael" beside it still records
-    // who built it.
-    header.set_username("")?;
-    header.set_groupname("")?;
-
-    if meta.is_symlink() {
-        let target = std::fs::read_link(path)?;
-        header.set_entry_type(tar::EntryType::Symlink);
-        header.set_size(0);
-        // Mode is normalised too — a symlink's own bits are not portable.
-        header.set_mode(0o777);
-        header.set_cksum();
-        builder.append_link(&mut header, name, &target)
-    } else {
-        // Only the executable bit survives; the rest is umask, which is
-        // ambient state and has no business in an artifact.
-        #[cfg(unix)]
-        let mode = {
-            use std::os::unix::fs::PermissionsExt as _;
-            if meta.permissions().mode() & 0o111 != 0 {
-                0o755
-            } else {
-                0o644
-            }
-        };
-        header.set_mode(mode);
-        header.set_size(meta.len());
-        header.set_entry_type(tar::EntryType::Regular);
-        header.set_cksum();
-        let mut f = File::open(path)?;
-        builder.append_data(&mut header, name, &mut f)
-    }
+fn tar_create(o: &TarOptions) -> io::Result<()> {
+    tar_create_at(o, source_date_epoch())
 }
 
-fn tar_create(o: &TarOptions) -> io::Result<()> {
+/// The archive itself is written by the shared reproducible writer
+/// (`harchive::write`), the one the `archive.create` driver uses: it sorts the
+/// members by name and flattens owners, modes and times. What stays here is
+/// turning the command line into members.
+fn tar_create_at(o: &TarOptions, mtime: u64) -> io::Result<()> {
     let Some(file) = &o.file else {
         return Err(io::Error::other("-f is required"));
     };
     let base = o.dir.clone().unwrap_or_else(|| PathBuf::from("."));
-    let out = File::create(file)?;
-    let out = BufWriter::new(out);
-    let mtime = source_date_epoch();
+    let mut members = Vec::new();
+    for p in &o.paths {
+        let full = base.join(p);
+        if full.is_dir() {
+            for found in walk_sorted(&full)? {
+                let rel = found.strip_prefix(&base).unwrap_or(&found).to_path_buf();
+                members.push(harchive::Member {
+                    name: rel,
+                    source: found,
+                });
+            }
+        } else {
+            // The shared writer refuses `.` and empty components in a name;
+            // `tar -cf out.tar ./a.txt` (or `a//b`, `a/./b`) has always
+            // archived as the normalized name, so normalize it here.
+            let name = p
+                .components()
+                .filter(|c| !matches!(c, Component::CurDir))
+                .collect::<PathBuf>();
+            members.push(harchive::Member { name, source: full });
+        }
+    }
 
     // The compressor is chosen here rather than by extension: guessing from a
     // name is how you end up with a `.tar.gz` that is not gzipped.
-    let mut sink: Box<dyn Write> = if o.gzip {
-        Box::new(
-            flate2::GzBuilder::new()
-                .mtime(0)
-                .write(out, flate2::Compression::default()),
-        )
+    let format = if o.gzip {
+        harchive::Format::TarGz
     } else if o.zstd {
-        Box::new(zstd::stream::Encoder::new(out, 3)?.auto_finish())
+        harchive::Format::TarZst
     } else {
-        Box::new(out)
+        harchive::Format::Tar
     };
-    {
-        let mut builder = tar::Builder::new(&mut sink);
-        builder.follow_symlinks(false);
-        let mut members: Vec<(PathBuf, PathBuf)> = Vec::new();
-        for p in &o.paths {
-            let full = base.join(p);
-            if full.is_dir() {
-                for found in walk_sorted(&full)? {
-                    let rel = found.strip_prefix(&base).unwrap_or(&found).to_path_buf();
-                    members.push((found, rel));
-                }
-            } else {
-                members.push((full, p.clone()));
-            }
-        }
-        // The archive's member order: by name, so it depends neither on the
-        // filesystem's directory order nor on the order the paths were given
-        // in, either of which would otherwise end up in the archive's bytes.
-        members.sort_by(|a, b| a.1.cmp(&b.1));
-        for (full, rel) in &members {
-            append_reproducible(&mut builder, full, rel, mtime)?;
-        }
-        builder.finish()?;
-    }
-    sink.flush()
+    let out = BufWriter::new(File::create(file)?);
+    harchive::write(
+        out,
+        format,
+        members,
+        harchive::WriteOptions { mtime },
+        &|| false,
+    )
+    .map_err(|e| io::Error::other(format!("{e:#}")))?
+    .flush()
 }
 
 fn open_maybe_compressed(path: &Path) -> io::Result<Box<dyn Read>> {
@@ -630,6 +595,109 @@ mod tests {
             seen += 1;
         }
         assert_eq!(seen, 1);
+    }
+
+    /// `tar -c`'s bytes, pinned: the hashes were captured from the writer as it
+    /// was before it moved into the shared `archive` crate, so a change to that
+    /// writer which moves a single byte of what `tar -c` produces fails here.
+    /// The tree covers what reaches a header: an executable and a
+    /// non-executable file (and modes beyond the execute bit), a nested
+    /// directory, symlinks, and a path over tar's 100-byte name field.
+    #[test]
+    fn tar_create_bytes_are_pinned() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "a.txt", "aye");
+        write(dir.path(), "bin/tool", "#!/bin/sh\necho hi\n");
+        write(dir.path(), "secret", "s");
+        let long = format!("sub/{}.txt", "x".repeat(120));
+        write(dir.path(), &long, "long");
+        let chmod = |rel: &str, mode: u32| {
+            std::fs::set_permissions(dir.path().join(rel), std::fs::Permissions::from_mode(mode))
+                .unwrap();
+        };
+        chmod("bin/tool", 0o750);
+        chmod("secret", 0o600);
+        std::os::unix::fs::symlink("a.txt", dir.path().join("link")).unwrap();
+        std::os::unix::fs::symlink("../bin", dir.path().join("sub/dirlink")).unwrap();
+
+        let outs = tempfile::tempdir().unwrap();
+        let digest = |gzip: bool, zstd: bool, mtime: u64| {
+            let out = outs.path().join("out");
+            let o = TarOptions {
+                create: true,
+                gzip,
+                zstd,
+                file: Some(out.clone()),
+                dir: Some(dir.path().to_path_buf()),
+                paths: vec![PathBuf::from(".")],
+                ..TarOptions::default()
+            };
+            tar_create_at(&o, mtime).unwrap();
+            let bytes = std::fs::read(&out).unwrap();
+            format!("{:016x}", xxhash_rust::xxh3::xxh3_64(&bytes))
+        };
+        let got = [
+            digest(false, false, 0),
+            digest(false, false, 1_700_000_000),
+            digest(true, false, 0),
+            digest(false, true, 0),
+        ];
+        assert_eq!(
+            got,
+            [
+                "8f0956b970fb5ab2",
+                "f6642111ec18513d",
+                "01e664c7a5e40f2a",
+                "c673fbe7852eb226"
+            ],
+            "tar, tar at a non-zero epoch, tar.gz, tar.zst"
+        );
+    }
+
+    /// A FILE argument spelled with `.` or doubled separators archives under
+    /// its normalized name, as it did before the shared writer, which refuses
+    /// such names, took over.
+    #[test]
+    fn a_file_argument_is_archived_under_its_normalized_name() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "a.txt", "aye");
+        write(dir.path(), "a/b", "bee");
+        let outs = tempfile::tempdir().unwrap();
+        let build = |name: &str, path: &str| {
+            let out = outs.path().join(name);
+            assert_eq!(
+                tar(argv(&[
+                    "tar",
+                    "-cf",
+                    &out.to_string_lossy(),
+                    "-C",
+                    &dir.path().to_string_lossy(),
+                    path,
+                ])),
+                OK,
+                "tar -c {path}"
+            );
+            std::fs::read(out).unwrap()
+        };
+        let names = |bytes: &[u8]| -> Vec<String> {
+            tar::Archive::new(bytes)
+                .entries()
+                .unwrap()
+                .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
+                .collect()
+        };
+
+        let dotted = build("dotted.tar", "./a.txt");
+        assert_eq!(names(&dotted), ["a.txt"]);
+        assert_eq!(
+            dotted,
+            build("plain.tar", "a.txt"),
+            "`./a.txt` must archive to the same bytes as `a.txt`"
+        );
+        assert_eq!(names(&build("inner-dot.tar", "a/./b")), ["a/b"]);
+        assert_eq!(names(&build("double-slash.tar", "a//b")), ["a/b"]);
     }
 
     #[test]
