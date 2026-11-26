@@ -119,12 +119,14 @@ async fn show_both(sources: &[&dyn SessionSource], id: SessionId) -> (String, se
     )
 }
 
-/// The line starting `machine: `, and every sampler line after it.
+/// The line starting `machine: `, its indented hint, and every sampler line
+/// after it.
 fn machine_lines(out: &str) -> Vec<&str> {
     out.lines()
         .skip_while(|l| !l.starts_with("machine: "))
         .take_while(|l| {
             l.starts_with("machine: ")
+                || l.starts_with("  admission waited")
                 || l.starts_with("the sampler stopped")
                 || l.starts_with("the sampler did not start")
         })
@@ -284,6 +286,52 @@ async fn show_prints_machine_line() {
     assert_eq!(live_m, m, "a live session's figures are its seal's");
     assert_eq!(machine_lines(&live_text), machine_lines(&text));
 
+    // The admission hint: admission waited mostly (and over 1 s) with the
+    // machine to spare. Only admission earns it, and only past 1 s: a deps
+    // wait as spare, or an admission wait of exactly 1 s spare, has none.
+    // The first sample opens the timeline: the first second is unknown.
+    let idle = || {
+        vec![
+            info(8, 8_000_000, &[]),
+            sample(1, 300_000, Some(4 * GIB), 100 * MIB, &[]),
+            sample(2, 300_000, Some(4 * GIB), 100 * MIB, &[]),
+            sample(3, 300_000, Some(4 * GIB), 100 * MIB, &[]),
+        ]
+    };
+    let (hinted, _) = write(run(idle(), &[("heph.admission", 500_000, 3_000_000)]), true);
+    let (text, _) = show_both(&sources, hinted).await;
+    let lines = machine_lines(&text);
+    assert_eq!(
+        lines.get(1..),
+        Some(
+            &[
+                "  admission waited 2.0s of 2.5s with the machine to spare: the pools' capacity \
+                 or the targets' declared `resources` held them back, not the machine"
+            ][..]
+        ),
+        "{text}"
+    );
+    let (unhinted, _) = write(
+        run(
+            idle(),
+            &[
+                ("heph.admission", 1_000_000, 2_000_000),
+                ("heph.deps", 0, 3_000_000),
+            ],
+        ),
+        true,
+    );
+    let (text, m) = show_both(&sources, unhinted).await;
+    assert_eq!(machine_lines(&text).len(), 1, "{text}");
+    assert_eq!(
+        m["waiting"]["by_phase"],
+        json!({
+            "admission": {"busy_us": 0, "spare_us": SEC, "unknown_us": 0},
+            "deps": {"busy_us": 0, "spare_us": 2 * SEC, "unknown_us": SEC},
+        }),
+        "{m}"
+    );
+
     // Partial, under a quota: the memory source stopped at the first
     // sample, so the memory peak is absent rather than 0.
     let stopped = (
@@ -350,7 +398,8 @@ async fn show_prints_machine_line() {
         machine_lines(&text),
         [
             format!(
-                "machine: 8 CPUs (host), {} RAM (host); no samples: the sampler's sources stopped",
+                "machine: none: the sampler's sources stopped before a sample (see below); \
+                 8 CPUs (host), {} RAM (host)",
                 human_bytes(16 * GIB),
             ),
             "the sampler stopped reading heph.machine.cpu.busy 0s into the run: \
@@ -376,7 +425,7 @@ async fn show_prints_machine_line() {
     assert_eq!(
         machine_lines(&text),
         [format!(
-            "machine: 8 CPUs (host), {} RAM (host); no samples (shorter than one tick)",
+            "machine: none: no samples (shorter than one tick); 8 CPUs (host), {} RAM (host)",
             human_bytes(16 * GIB),
         )],
         "{text}"
@@ -403,9 +452,10 @@ async fn show_prints_machine_line() {
     assert_eq!(
         machine_lines(&text),
         [
-            "machine: no samples: the sampler's sources stopped; \
+            "machine: none: the sampler did not start (see below); \
              waiting: admission 1.0s (1.0s unknown)",
-            "the sampler did not start: Resource temporarily unavailable",
+            "the sampler did not start: Resource temporarily unavailable \
+             (build unaffected; no machine data recorded)",
         ],
         "{text}"
     );
@@ -431,8 +481,10 @@ async fn show_prints_machine_line() {
         let (text, m) = show_both(&sources, older).await;
         assert_eq!(
             machine_lines(&text),
-            ["machine: none: recorded before machine stats; \
-                 waiting: admission 1.0s (1.0s unknown)"],
+            [
+                "machine: none: recorded before machine stats (no machine record); \
+                 waiting: admission 1.0s (1.0s unknown)"
+            ],
             "{derivation:?}: {text}"
         );
         assert_eq!(m["status"], "none", "{m}");
@@ -486,12 +538,18 @@ async fn show_prints_pool_vs_machine() {
     let sources: [&dyn SessionSource; 1] = [&file];
 
     let text = run_show(&sources, &id.encode(), false).await.expect("show");
-    let pools: Vec<&str> = text.lines().filter(|l| l.contains(" pool (")).collect();
+    let pools: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains(" pool (") || l.starts_with("  against the machine"))
+        .collect();
     assert_eq!(
         pools,
         [
             "cpu pool (capacity 8): held 8 mean while in use (100%), 8 peak; nothing waited \
-             for it; against the machine: 2.0s declared above use, 2.0s unknown",
+             for it",
+            "  against the machine: 2.0s with the pool 90%+ held while the machine was under \
+             50%, 2.0s not compared (no sample); targets may declare more CPU than they use: \
+             consider lowering their `resources`",
             "docker pool (capacity 4): held 1 mean while in use (25%), 1 peak; nothing waited \
              for it",
         ],
@@ -519,5 +577,37 @@ async fn show_prints_pool_vs_machine() {
             },
         ]),
         "{json}"
+    );
+}
+
+/// The pool's second line: plain words for each non-zero total, and advice
+/// only when one side was out of step for over half the time compared
+/// (unknown time is not compared).
+#[test]
+fn pool_versus_line_advises_only_a_majority() {
+    use super::super::show::versus_line;
+    use crate::tui::session::machine::VsMachine;
+    let vs = |declared: u64, used: u64, matched: u64, unknown: u64| VsMachine {
+        declared_above_use_us: declared * SEC,
+        use_above_declared_us: used * SEC,
+        matched_us: matched * SEC,
+        unknown_us: unknown * SEC,
+    };
+    assert_eq!(versus_line("cpu", &vs(0, 0, 0, 0)), "");
+    assert_eq!(
+        versus_line("memory", &vs(0, 3, 2, 9)),
+        "  against the machine: 3.0s with the machine 90%+ while the pool was under 50% held, \
+         2.0s in step, 9.0s not compared (no sample); targets may use more memory than they \
+         declare, or other work shares the machine: consider raising their `resources`\n"
+    );
+    // Half the compared time is not a majority: no advice either way.
+    assert_eq!(
+        versus_line("cpu", &vs(2, 0, 2, 0)),
+        "  against the machine: 2.0s with the pool 90%+ held while the machine was under 50%, \
+         2.0s in step\n"
+    );
+    assert_eq!(
+        versus_line("cpu", &vs(0, 0, 0, 4)),
+        "  against the machine: 4.0s not compared (no sample)\n"
     );
 }
