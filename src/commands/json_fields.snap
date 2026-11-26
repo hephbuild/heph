@@ -1,0 +1,381 @@
+# contract 1
+# Every JSON path of every `--json` record: command, path, kind, tier, default.
+# A line is never removed or changed (I3); `HEPH_UPDATE_FIELD_SNAPSHOT=1` only adds.
+auth explain	addr	string	free	default
+auth explain	sources	[object]	free	default
+auth explain	sources[].chosen	bool	free	default
+auth explain	sources[].hint	string	free	default
+auth explain	sources[].index	number	free	default
+auth explain	sources[].skipped	string?	free	default
+auth explain	sources[].source	string	free	default
+auth logout	cleared	string	free	default
+auth status	addr	string	free	default
+auth status	expires_at	string?	free	default
+auth status	login	[[string]]	free	default
+auth status	source	string	free	default
+auth status	state	"needs_sign_in"	free	default
+auth status	state	"ok"	free	default
+auth status	state	"unavailable"	free	default
+auth status	state	string	free	default
+inspect deps	ref	string	free	default
+inspect failure	addr	string	free	default
+inspect failure	failed_at	number	free	default
+inspect failure	fixes	string?	free	default
+inspect failure	hashin	string	free	default
+inspect failure	log	string?	free	default
+inspect failure	out	string?	free	default
+inspect failure	slot	string	free	default
+inspect functions	name	string	free	default
+inspect functions	plugin	string	free	default
+inspect functions	signature	string	free	default
+inspect hashin	addr	string	free	default
+inspect hashin	hashin	string	free	default
+inspect hashout	hashout	string	free	default
+inspect labels	label	string	free	default
+inspect outputs	addr	string	free	default
+inspect outputs	paths	[string]	free	default
+inspect outputs	support_paths	[string]	free	default
+inspect packages	package	string	free	default
+inspect path	addr	string	free	default
+inspect revdeps	addr	string	free	default
+inspect states	package	string	free	default
+inspect states	states	[object]	free	default
+inspect states	states[].declared_in	string	free	default
+inspect states	states[].provider	string	free	default
+inspect states	states[].state	any	free	default
+query	addr	string	free	default
+query	deps	[string]?	resolved	opt-in
+query	driver	string?	free	opt-in
+query	hashin	string?	built	opt-in
+query	labels	[string]?	free	default
+query	name	string	free	default
+query	package	string	free	default
+session inflight	id	string	free	default
+session inflight	report	string	free	default
+session list	argv	[string]	free	default
+session list	blocked_on	[object]	free	default
+session list	blocked_on[].kind	"admission"	free	default
+session list	blocked_on[].kind	"lock"	free	default
+session list	blocked_on[]{kind=admission}.addr	string	free	default
+session list	blocked_on[]{kind=admission}.pool	string	free	default
+session list	blocked_on[]{kind=lock}.addr	string	free	default
+session list	blocked_on[]{kind=lock}.holder_pid	number?	free	default
+session list	blocked_on[]{kind=lock}.holder_session	string?	free	default
+session list	cwd	string?	free	default
+session list	exit_code	number?	free	default
+session list	format	number?	free	default
+session list	id	string	free	default
+session list	last_event_unix_ms	number?	free	default
+session list	now	string?	free	default
+session list	owner_pid	number?	free	default
+session list	panicked	bool	free	default
+session list	progress	object?	free	default
+session list	progress.done	number	free	default
+session list	progress.failed	number	free	default
+session list	progress.running_ops	number	free	default
+session list	progress.total	number?	free	default
+session list	progress.total_complete	bool	free	default
+session list	started_unix_ms	number	free	default
+session list	state	"failed"	free	default
+session list	state	"lost"	free	default
+session list	state	"ok"	free	default
+session list	state	"quiet"	free	default
+session list	state	"running"	free	default
+session list	state	"unknown"	free	default
+session list	state	"waiting"	free	default
+session list	state	string	free	default
+session list	workspace_root	string?	free	default
+session show	admission_waits	[object]	free	default
+session show	admission_waits[].addr	string	free	default
+session show	admission_waits[].ahead	number	free	default
+session show	admission_waits[].free	number	free	default
+session show	admission_waits[].need	number	free	default
+session show	admission_waits[].pool	string	free	default
+session show	admission_waits[].since_unix_ms	number	free	default
+session show	approval_standing	"approve"	free	default
+session show	approval_standing	"reject"	free	default
+session show	approval_standing	string?	free	default
+session show	blocked_on	[object]	free	default
+session show	blocked_on[].kind	"admission"	free	default
+session show	blocked_on[].kind	"lock"	free	default
+session show	blocked_on[]{kind=admission}.addr	string	free	default
+session show	blocked_on[]{kind=admission}.pool	string	free	default
+session show	blocked_on[]{kind=lock}.addr	string	free	default
+session show	blocked_on[]{kind=lock}.holder_pid	number?	free	default
+session show	blocked_on[]{kind=lock}.holder_session	string?	free	default
+session show	chain_root	string?	free	default
+session show	counts	object	free	default
+session show	counts.executed	number	free	default
+session show	counts.failed	number	free	default
+session show	counts.finished	number	free	default
+session show	counts.in_flight	number	free	default
+session show	counts.matched	number?	free	default
+session show	counts.matched_cached	number	free	default
+session show	counts.matched_complete	bool	free	default
+session show	counts.matched_done	number	free	default
+session show	counts.running_unblocked	number?	free	default
+session show	end	object?	free	default
+session show	end.at_unix_ms	number	free	default
+session show	end.exit_code	number?	free	default
+session show	end.panicked	bool	free	default
+session show	failed	[string]	free	default
+session show	first_event_unix_ms	number?	free	default
+session show	id	string	free	default
+session show	last_event_unix_ms	number?	free	default
+session show	lock_waits	[object]	free	default
+session show	lock_waits[].addr	string	free	default
+session show	lock_waits[].holder_pid	number?	free	default
+session show	lock_waits[].in_use_by_readers	bool	free	default
+session show	lock_waits[].since_unix_ms	number	free	default
+session show	next	object	free	default
+session show	next.argv	[string]?	free	default
+session show	next.command	string?	free	default
+session show	next.cwd	string?	free	default
+session show	next.kind	"attach"	free	default
+session show	next.kind	"inflight"	free	default
+session show	next.kind	"inspect_failure"	free	default
+session show	next.kind	"list"	free	default
+session show	next.kind	"none"	free	default
+session show	next.kind	"rerun"	free	default
+session show	next.kind	"show_holder"	free	default
+session show	next.kind	string	free	default
+session show	next.reason	string	free	default
+session show	running	[object]	free	default
+session show	running[].addr	string	free	default
+session show	running[].op	string	free	default
+session show	running[].since_unix_ms	number	free	default
+session show	state	"failed"	free	default
+session show	state	"lost"	free	default
+session show	state	"ok"	free	default
+session show	state	"quiet"	free	default
+session show	state	"running"	free	default
+session show	state	"unknown"	free	default
+session show	state	"waiting"	free	default
+session show	state	string	free	default
+session show	totals	object	free	default
+session show	totals.admission_waits	object	free	default
+session show	totals.admission_waits.total	number	free	default
+session show	totals.admission_waits.truncated	bool	free	default
+session show	totals.failed	object	free	default
+session show	totals.failed.total	number	free	default
+session show	totals.failed.truncated	bool	free	default
+session show	totals.lock_waits	object	free	default
+session show	totals.lock_waits.total	number	free	default
+session show	totals.lock_waits.truncated	bool	free	default
+session show	totals.running	object	free	default
+session show	totals.running.total	number	free	default
+session show	totals.running.truncated	bool	free	default
+session show	totals.waiting	object	free	default
+session show	totals.waiting.total	number	free	default
+session show	totals.waiting.truncated	bool	free	default
+session show	truncated	bool	free	default
+session show	waiting	[string]	free	default
+tool build-fmt	checked	number	free	default
+tool build-fmt	unformatted	[string]	free	default
+tool build-fmt	written	bool	free	default
+tool build-lsp	col	number	free	default
+tool build-lsp	degraded	[any]	free	default
+tool build-lsp	file	string	free	default
+tool build-lsp	line	number	free	default
+tool build-lsp	reason	any	free	default
+tool build-lsp	site	any	free	default
+tool cache measure-latency	latency_ms	number?	free	default
+tool cache measure-latency	name	string	free	default
+tool cache measure-latency	readable	bool	free	default
+tool cache measure-latency	uri	string	free	default
+tool cache measure-latency	writable	bool	free	default
+tool clean	bytes_removed	number	free	default
+tool clean	errored	number	free	default
+tool clean	revisions_removed	number	free	default
+tool clean	run_log_dirs_removed	number	free	default
+tool clean	scratch_bytes_removed	number?	free	default
+tool clean	scratch_caches_removed	number?	free	default
+tool clean	targets_cleaned	number	free	default
+tool codegen discard	lines	[object]	free	default
+tool codegen discard	lines[].addr	string	free	default
+tool codegen discard	lines[].op	"remove"	free	default
+tool codegen discard	lines[].pattern	string	free	default
+tool codegen discard	released	[string]	free	default
+tool codegen discard	results	[object]	free	default
+tool codegen discard	results[].path	string	free	default
+tool codegen discard	results[].reason	string?	free	default
+tool codegen discard	results[].result	"discarded"	free	default
+tool codegen discard	results[].result	"explained"	free	default
+tool codegen discard	results[].result	"kept"	free	default
+tool codegen discard	results[].result	"refused"	free	default
+tool codegen discard	results[].result	"unknown"	free	default
+tool codegen discard	results[].result	"would_discard"	free	default
+tool codegen discard	results[].result	string	free	default
+tool codegen gitignore	lines	[object]	free	default
+tool codegen gitignore	lines[].addr	string	free	default
+tool codegen gitignore	lines[].op	"add"	free	default
+tool codegen gitignore	lines[].op	"remove"	free	default
+tool codegen gitignore	lines[].pattern	string	free	default
+tool codegen gitignore	reasons	[string]	free	default
+tool codegen gitignore	reasons[]	"lines"	free	default
+tool codegen gitignore	reasons[]	"malformed"	free	default
+tool codegen gitignore	reasons[]	"old_marker"	free	default
+tool codegen gitignore	released	[object]	free	default
+tool codegen gitignore	released[].addr	string	free	default
+tool codegen gitignore	released[].path	string	free	default
+tool codegen gitignore	stale	bool	free	default
+tool codegen gitignore	written	bool	free	default
+tool codegen import	recorded	number	free	default
+tool codegen import	skipped	number	free	default
+tool codegen import	unchanged	number	free	default
+tool codegen keep	lines	[object]	free	default
+tool codegen keep	lines[].addr	string	free	default
+tool codegen keep	lines[].op	"remove"	free	default
+tool codegen keep	lines[].pattern	string	free	default
+tool codegen keep	released	[string]	free	default
+tool codegen keep	results	[object]	free	default
+tool codegen keep	results[].path	string	free	default
+tool codegen keep	results[].reason	string?	free	default
+tool codegen keep	results[].result	"discarded"	free	default
+tool codegen keep	results[].result	"explained"	free	default
+tool codegen keep	results[].result	"kept"	free	default
+tool codegen keep	results[].result	"refused"	free	default
+tool codegen keep	results[].result	"unknown"	free	default
+tool codegen keep	results[].result	"would_discard"	free	default
+tool codegen keep	results[].result	string	free	default
+tool codegen status	hint	string?	free	default
+tool codegen status	items	[object]	free	default
+tool codegen status	items[].addr	string?	free	default
+tool codegen status	items[].error	string?	free	default
+tool codegen status	items[].fix	string?	free	default
+tool codegen status	items[].kind	string	free	default
+tool codegen status	items[].output	string?	free	default
+tool codegen status	items[].package	string?	free	default
+tool codegen status	items[].path	string?	free	default
+tool codegen why	hint	string?	free	default
+tool codegen why	results	[object]	free	default
+tool codegen why	results[].path	string	free	default
+tool codegen why	results[].reason	string?	free	default
+tool codegen why	results[].result	"discarded"	free	default
+tool codegen why	results[].result	"explained"	free	default
+tool codegen why	results[].result	"kept"	free	default
+tool codegen why	results[].result	"refused"	free	default
+tool codegen why	results[].result	"unknown"	free	default
+tool codegen why	results[].result	"would_discard"	free	default
+tool codegen why	results[].result	string	free	default
+tool codegen why	results[].row	object?	free	default
+tool codegen why	results[].row.addr	string	free	default
+tool codegen why	results[].row.output	string?	free	default
+tool codegen why	results[].row.path	string	free	default
+tool codegen why	results[].row.pending	bool	free	default
+tool codegen why	results[].row.state	string	free	default
+tool codegen why	results[].row.verified	string	free	default
+tool codegen why	results[].row.written_at	number?	free	default
+tool codegen why	results[].section_line	object?	free	default
+tool codegen why	results[].section_line.heph_wrote	bool	free	default
+tool codegen why	results[].section_line.line	number	free	default
+tool codegen why	results[].section_line.negated	bool	free	default
+tool codegen why	results[].section_line.pattern	string	free	default
+tool codegen why	results[].status	string?	free	default
+tool codegen why	results[].status_reason	string?	free	default
+tool coreutils list	applets	[string]	free	default
+tool coreutils list	upstream	string	free	default
+tool coreutils list	version	number	free	default
+tool coreutils which	builtin	bool	free	default
+tool coreutils which	host	string?	free	default
+tool coreutils which	name	string	free	default
+tool gc	bytes_removed	number	free	default
+tool gc	errored	number	free	default
+tool gc	failure_log_bytes_removed	number	free	default
+tool gc	failure_logs_removed	number	free	default
+tool gc	fswalk_rows_removed	number	free	default
+tool gc	invoke_sandboxes_removed	number	free	default
+tool gc	orphan_targets_removed	number	free	default
+tool gc	revisions_kept	number	free	default
+tool gc	revisions_removed	number	free	default
+tool gc	run_log_dirs_removed	number	free	default
+tool gc	scratch_bytes_removed	number?	free	default
+tool gc	scratch_caches_removed	number?	free	default
+tool gc	stage_entries_removed	number	free	default
+tool plugins	drivers	[string]	free	default
+tool plugins	functions	[string]	free	default
+tool plugins	hooks	number	free	default
+tool plugins	name	string	free	default
+tool plugins	provider	string?	free	default
+tool plugins	runners	[string]	free	default
+tool plugins	source	string	free	default
+tool resolve-plugins	drivers	[string]	free	default
+tool resolve-plugins	providers	[string]	free	default
+tool scratch head	addr	string	free	default
+tool scratch head	lineage	string	free	default
+tool scratch head	local	[object]	free	default
+tool scratch head	local[].lineage	string	free	default
+tool scratch head	local[].path	string	free	default
+tool scratch head	local[].warm	bool	free	default
+tool scratch head	remote	[object]?	free	default
+tool scratch head	remote[].bytes	number?	free	default
+tool scratch head	remote[].cache	string?	free	default
+tool scratch head	remote[].generation	number?	free	default
+tool scratch head	remote[].lineage	string	free	default
+tool scratch head	remote[].produced_at	string?	free	default
+tool scratch head	remote[].producer	string?	free	default
+tool scratch head	remote_skipped	"declared_local"	free	default
+tool scratch head	remote_skipped	"no_remote_cache"	free	default
+tool scratch head	remote_skipped	string?	free	default
+tool scratch head	restores_from	"local"	free	default
+tool scratch head	restores_from	"remote"	free	default
+tool scratch head	restores_from	string?	free	default
+tool scratch head	restores_lineage	string?	free	default
+tool scratch head	slot	string	free	default
+tool scratch ls	access	string?	free	default
+tool scratch ls	addr	string?	free	default
+tool scratch ls	bytes	number	free	default
+tool scratch ls	env	string?	free	default
+tool scratch ls	lineages	[string]	free	default
+tool scratch ls	path	string?	free	default
+tool scratch ls	remote	bool?	free	default
+tool scratch ls	slot	string	free	default
+tool scratch ls	version	string?	free	default
+tool scratch path	addr	string	free	default
+tool scratch path	path	string	free	default
+tool scratch pull	addr	string	free	default
+tool scratch pull	bytes	number?	free	default
+tool scratch pull	error	string?	free	default
+tool scratch pull	generation	number?	free	default
+tool scratch pull	lineage	string?	free	default
+tool scratch pull	outcome	"failed"	free	default
+tool scratch pull	outcome	"fetched"	free	default
+tool scratch pull	outcome	"nothing_published"	free	default
+tool scratch pull	outcome	string	free	default
+tool scratch push	addr	string	free	default
+tool scratch push	bytes	number?	free	default
+tool scratch push	error	string?	free	default
+tool scratch push	generation	number?	free	default
+tool scratch push	outcome	"failed"	free	default
+tool scratch push	outcome	"published"	free	default
+tool scratch push	outcome	"skipped"	free	default
+tool scratch push	outcome	"unchanged"	free	default
+tool scratch push	outcome	string	free	default
+tool scratch rm	bytes_removed	number	free	default
+tool scratch rm	removed	number	free	default
+tool telemetry status	ci	bool	free	default
+tool telemetry status	disabled_by	[string]	free	default
+tool telemetry status	disabled_by[]	"config"	free	default
+tool telemetry status	disabled_by[]	"env"	free	default
+tool telemetry status	enabled	bool	free	default
+tool telemetry status	endpoint	string	free	default
+tool telemetry status	endpoint_error	string?	free	default
+tool telemetry status	endpoint_overridden	bool	free	default
+tool telemetry status	flush_mode	"detached"	free	default
+tool telemetry status	flush_mode	"off"	free	default
+tool telemetry status	flush_mode	"synchronous"	free	default
+tool telemetry status	flush_mode	string	free	default
+tool telemetry status	last_flush_error	string?	free	default
+tool telemetry status	last_flush_ms	number?	free	default
+tool telemetry status	last_flush_ok	bool?	free	default
+tool telemetry status	last_flusher_spawn_ms	number?	free	default
+tool telemetry status	next_flush_due_ms	number?	free	default
+tool telemetry status	now_ms	number	free	default
+tool telemetry status	oldest_event_age_ms	number?	free	default
+tool telemetry status	oldest_event_ms	number?	free	default
+tool telemetry status	pending_events	number	free	default
+tool telemetry status	spool_path	string?	free	default
+validate	problems	[string]	free	default
+validate	warnings	[string]	free	default
+version	output_contract	number	free	default
+version	version	string	free	default

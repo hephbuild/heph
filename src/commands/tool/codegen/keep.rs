@@ -9,12 +9,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use serde_json::json;
+use serde::ser::SerializeStruct as _;
 
 use super::status::{AddrState, resolve_addrs};
 use super::{
-    JSON_SCHEMA, Report, ResolvedPath, blocking, display, read_gitignore, resolve_path, root_hint,
-    run_cli, with_hint, write_gitignore,
+    Report, ResolvedPath, blocking, display, read_gitignore, resolve_path, root_hint, run_cli,
+    with_hint, write_gitignore,
 };
 use crate::commands::GlobalOptions;
 use crate::engine::gitignore::{self, CopyTargets, GitignoreEntry};
@@ -31,9 +31,8 @@ pub struct KeepArgs {
     /// Files to make source (cwd-relative, //root-relative or absolute)
     #[arg(value_name = "PATH", required = true)]
     pub paths: Vec<String>,
-    /// Print the result as JSON
-    #[arg(long)]
-    pub json: bool,
+    #[command(flatten)]
+    pub out: output::JsonArgs<PathsReport>,
     #[command(flatten)]
     pub dashboard: crate::commands::progress_app::DashboardArgs,
 }
@@ -56,15 +55,15 @@ pub struct DiscardArgs {
     /// Delete an edited or imported file too
     #[arg(long)]
     pub force: bool,
-    /// Print the result as JSON
-    #[arg(long)]
-    pub json: bool,
+    #[command(flatten)]
+    pub out: output::JsonArgs<PathsReport>,
     #[command(flatten)]
     pub dashboard: crate::commands::progress_app::DashboardArgs,
 }
 
 /// One path's result.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, output::Shape)]
+#[serde(rename_all = "snake_case")]
 pub enum PathResultKind {
     Kept,
     Discarded,
@@ -92,7 +91,7 @@ impl PathResultKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, output::Shape)]
 pub struct PathResult {
     /// As given when refused for being outside the workspace; root-relative
     /// otherwise.
@@ -101,18 +100,45 @@ pub struct PathResult {
     pub reason: Option<String>,
 }
 
-/// What `keep` or `discard` did.
-#[derive(Debug, Clone, Default)]
+/// What `keep` or `discard` did; under `--json`, the record it prints.
+#[derive(Debug, Clone, Default, serde::Serialize, output::Record)]
 pub struct PathsReport {
-    /// Sorted by path.
+    /// One result per path, `{path, result, reason}`, sorted by path;
+    /// `result` is `kept`, `discarded`, `would_discard`, `refused` or
+    /// `unknown`.
     pub results: Vec<PathResult>,
-    /// The section lines dropped (or, dry run, that would be), sorted.
+    /// The section lines dropped (or, under `--dry-run`, that would be),
+    /// `{op: "remove", pattern, addr}`, sorted.
+    #[serde(rename = "lines", serialize_with = "removed_lines")]
     pub lines_removed: Vec<GitignoreEntry>,
     /// Other recorded files the dropped lines covered, now released; sorted.
+    #[serde(rename = "released")]
     pub also_released: Vec<String>,
+    #[serde(skip)]
     pub dry_run: bool,
     /// `keep`: print the `git add` to commit the kept files.
+    #[serde(skip)]
     pub git_add: bool,
+}
+
+/// A dropped section line as `--json` prints it.
+struct RemovedLine<'a>(&'a GitignoreEntry);
+
+impl serde::Serialize for RemovedLine<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut m = s.serialize_struct("RemovedLine", 3)?;
+        m.serialize_field("op", "remove")?;
+        m.serialize_field("pattern", &self.0.pattern)?;
+        m.serialize_field(
+            "addr",
+            &self.0.addr.as_ref().map(crate::htaddr::Addr::format),
+        )?;
+        m.end()
+    }
+}
+
+fn removed_lines<S: serde::Serializer>(lines: &[GitignoreEntry], s: S) -> Result<S::Ok, S::Error> {
+    s.collect_seq(lines.iter().map(RemovedLine))
 }
 
 impl Report for PathsReport {
@@ -156,23 +182,6 @@ impl Report for PathsReport {
             }
         }
         out
-    }
-
-    fn json(&self) -> serde_json::Value {
-        json!({
-            "schema": JSON_SCHEMA,
-            "results": self.results.iter().map(|r| json!({
-                "path": r.path,
-                "result": r.result.as_str(),
-                "reason": r.reason,
-            })).collect::<Vec<_>>(),
-            "lines": self.lines_removed.iter().map(|l| json!({
-                "op": "remove",
-                "pattern": l.pattern,
-                "addr": l.addr.as_ref().map(crate::htaddr::Addr::format),
-            })).collect::<Vec<_>>(),
-            "released": self.also_released,
-        })
     }
 
     fn exit_code(&self) -> u8 {
@@ -621,7 +630,7 @@ pub fn execute_keep(
     let cwd = cwd()?;
     run_cli(
         "Keeping generated files",
-        args.json,
+        &args.out,
         args.dashboard.dashboard,
         sink,
         session,
@@ -648,7 +657,7 @@ pub fn execute_discard(
     };
     run_cli(
         "Discarding generated files",
-        args.json,
+        &args.out,
         args.dashboard.dashboard,
         sink,
         session,

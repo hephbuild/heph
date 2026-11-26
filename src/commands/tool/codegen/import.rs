@@ -6,9 +6,7 @@ use crate::tui::session::SessionSlot;
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde_json::json;
-
-use super::{JSON_SCHEMA, Report, blocking, run_cli};
+use super::{Report, blocking, run_cli};
 use crate::commands::GlobalOptions;
 use crate::engine::Engine;
 use crate::engine::event::BuildEventKind;
@@ -18,19 +16,23 @@ use hwalk::codegen_index::import::{ImportCounts, scan};
 
 #[derive(clap::Args, Clone, Debug, Default)]
 pub struct Args {
-    /// Print the result as JSON
-    #[arg(long)]
-    pub json: bool,
+    #[command(flatten)]
+    pub out: output::JsonArgs<ImportReport>,
     #[command(flatten)]
     pub dashboard: crate::commands::progress_app::DashboardArgs,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// What `import` recorded; under `--json`, the record it prints.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, output::Record)]
 pub struct ImportReport {
+    /// Files recorded as `imported` rows by this run.
     pub recorded: usize,
+    /// Files whose xattr is empty or not a target address.
     pub skipped: usize,
+    /// Files already recorded.
     pub unchanged: usize,
     /// `false` when the filesystem has no xattrs: nothing was read.
+    #[serde(skip)]
     pub supported: bool,
 }
 
@@ -48,15 +50,6 @@ impl Report for ImportReport {
             self.skipped,
             self.unchanged
         )]
-    }
-
-    fn json(&self) -> serde_json::Value {
-        json!({
-            "schema": JSON_SCHEMA,
-            "recorded": self.recorded,
-            "skipped": self.skipped,
-            "unchanged": self.unchanged,
-        })
     }
 
     fn exit_code(&self) -> u8 {
@@ -154,7 +147,7 @@ pub fn execute(
 ) -> anyhow::Result<()> {
     run_cli(
         "Importing codegen xattrs",
-        args.json,
+        &args.out,
         args.dashboard.dashboard,
         sink,
         session,

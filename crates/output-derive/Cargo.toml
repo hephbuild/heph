@@ -1,0 +1,21 @@
+[package]
+name = "output-derive"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+proc-macro = true
+
+[lints]
+workspace = true
+
+[dependencies]
+syn = { version = "3", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"
+# serde's own attribute model, so the names `Record` lists are exactly the keys
+# `derive(Serialize)` writes: `rename`, `rename_all`, `skip*` read the same way.
+serde_derive_internals = "0.30.0"
+
+# The emitted tokens reference `::output::…` in the consuming crate; the tests
+# that exercise the derive live in `crates/output`, which depends on this crate.

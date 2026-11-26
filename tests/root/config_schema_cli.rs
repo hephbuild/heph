@@ -1,12 +1,12 @@
 //! `heph tool config-schema` exits 0 and prints exactly
-//! `config_json_schema_text()`, outside a workspace and next to a config with
+//! `config_json_schema()`, outside a workspace and next to a config with
 //! a key this binary does not know.
 //!
 //! A cargo-built `heph` reports `DEV_VERSION`, so its self-upgrade opts out
 //! before it looks for a workspace: these tests do not reach
 //! `no_config_tolerable`, whose predicate the unit tests in `src/main.rs`
 //! cover. What they cover is the command itself: it reads no config, and its
-//! stdout is the rendered schema byte for byte.
+//! stdout is the schema.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -40,12 +40,13 @@ fn assert_prints_the_schema(out: &Output) {
         "stderr:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let expected =
-        heph::engine::config_yaml::config_json_schema_text().expect("render the config schema");
+    // Piped, the schema is one compact line (the output rules, D5).
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(stdout.lines().count(), 1, "not one line:\n{stdout}");
+    let printed: serde_json::Value = serde_json::from_str(&stdout).expect("stdout is JSON");
     assert!(
-        String::from_utf8_lossy(&out.stdout) == expected,
-        "stdout is not config_json_schema_text():\n{}",
-        String::from_utf8_lossy(&out.stdout)
+        printed == heph::engine::config_yaml::config_json_schema(),
+        "stdout is not config_json_schema():\n{stdout}"
     );
 }
 

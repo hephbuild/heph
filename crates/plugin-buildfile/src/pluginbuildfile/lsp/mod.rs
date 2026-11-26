@@ -68,8 +68,8 @@ pub fn run(connection: Connection, engine: Arc<dyn LspEngine>) -> anyhow::Result
 /// the column counted in characters): the site, why a heph answer would be
 /// empty, and what a present one could not do in full. The same
 /// classification every editor request goes through, for "why did it do
-/// that?". `json` renders it as one JSON object.
-pub fn explain(target: &str, json: bool) -> anyhow::Result<String> {
+/// that?".
+pub fn explain(target: &str) -> anyhow::Result<Explanation> {
     use anyhow::Context as _;
     let mut parts = target.rsplitn(3, ':');
     let (col, line, file) = match (parts.next(), parts.next(), parts.next()) {
@@ -108,42 +108,74 @@ pub fn explain(target: &str, json: bool) -> anyhow::Result<String> {
         ),
         None => site::Resolution::none(site::Reason::NotASite),
     };
-    let value = resolution.to_json();
-    if json {
-        let mut out = serde_json::json!({ "file": file, "line": line, "col": col });
-        if let (Some(map), serde_json::Value::Object(r)) = (out.as_object_mut(), value) {
-            map.extend(r);
+    let mut value = resolution.to_json();
+    let mut take = |key: &str| value.get_mut(key).map(serde_json::Value::take);
+    Ok(Explanation {
+        file: file.to_string(),
+        line,
+        col,
+        site: take("site").unwrap_or_default(),
+        reason: take("reason").unwrap_or_default(),
+        degraded: match take("degraded") {
+            Some(serde_json::Value::Array(d)) => d,
+            _ => Vec::new(),
+        },
+    })
+}
+
+/// [`explain`]'s answer for one position: where it is, and the resolver's
+/// classification of it, as `heph/explain` reports it to an editor.
+#[derive(Debug, Clone)]
+pub struct Explanation {
+    /// The BUILD file, as given.
+    pub file: String,
+    /// 1-based line.
+    pub line: u32,
+    /// 1-based column, counted in characters.
+    pub col: u32,
+    /// The site under the cursor: its `kind` and what the resolver read there.
+    pub site: serde_json::Value,
+    /// Why heph's answer there would be empty; `null` when heph answers.
+    pub reason: serde_json::Value,
+    /// What a present answer could not do in full.
+    pub degraded: Vec<serde_json::Value>,
+}
+
+impl Explanation {
+    /// The classification for a human: the position, then one `key: value`
+    /// line per thing the resolver found.
+    pub fn text(&self) -> String {
+        let Explanation {
+            file,
+            line,
+            col,
+            site,
+            reason,
+            degraded,
+        } = self;
+        let kind = site.get("kind").and_then(|k| k.as_str()).unwrap_or("none");
+        let mut out = format!("{file}:{line}:{col}\n  site: {kind}");
+        for key in ["call", "keyword", "prefix", "quote", "plugin", "selected"] {
+            if let Some(v) = site.get(key).filter(|v| !v.is_null()) {
+                out.push_str(&format!("\n  {key}: {v}"));
+            }
         }
-        return serde_json::to_string_pretty(&out).context("rendering the resolution");
-    }
-    let none = serde_json::Value::Null;
-    let site = value.get("site").unwrap_or(&none);
-    let kind = site.get("kind").and_then(|k| k.as_str()).unwrap_or("none");
-    let mut out = format!("{file}:{line}:{col}\n  site: {kind}");
-    for key in ["call", "keyword", "prefix", "quote", "plugin", "selected"] {
-        if let Some(v) = site.get(key).filter(|v| !v.is_null()) {
-            out.push_str(&format!("\n  {key}: {v}"));
+        if let Some(keys) = site
+            .get("present_keys")
+            .and_then(|k| k.as_array())
+            .filter(|k| !k.is_empty())
+        {
+            let keys: Vec<&str> = keys.iter().filter_map(|k| k.as_str()).collect();
+            out.push_str(&format!("\n  present keys: {}", keys.join(", ")));
         }
+        if reason.is_null() {
+            out.push_str("\n  reason: none (heph answers here)");
+        } else {
+            out.push_str(&format!("\n  reason: {reason}"));
+        }
+        for d in degraded {
+            out.push_str(&format!("\n  degraded: {d}"));
+        }
+        out
     }
-    if let Some(keys) = site
-        .get("present_keys")
-        .and_then(|k| k.as_array())
-        .filter(|k| !k.is_empty())
-    {
-        let keys: Vec<&str> = keys.iter().filter_map(|k| k.as_str()).collect();
-        out.push_str(&format!("\n  present keys: {}", keys.join(", ")));
-    }
-    match value.get("reason").filter(|r| !r.is_null()) {
-        Some(r) => out.push_str(&format!("\n  reason: {r}")),
-        None => out.push_str("\n  reason: none (heph answers here)"),
-    }
-    for d in value
-        .get("degraded")
-        .and_then(|d| d.as_array())
-        .into_iter()
-        .flatten()
-    {
-        out.push_str(&format!("\n  degraded: {d}"));
-    }
-    Ok(out)
 }

@@ -598,10 +598,10 @@ restores reproducibility, not access control.
 
 | Command | Does |
 |---|---|
-| `heph auth status` | one row per declared credential. Exits non-zero unless every row is `ok`. `--json` carries `addr`, `state`, `source`, `expires_at`, `login`. |
-| `heph auth explain <addr>` | the whole chain walk: every source, why each was skipped, which won. |
-| `heph auth login [addr] [--force]` | runs the login commands of the sources the probe found stale, and of the chosen source when acquiring from it fails — a probe only checks that the tool is there, so an expired session behind an installed tool is caught by the acquire. `--force` runs the chosen source's login regardless and forgets the credential's cached material. Never requires a terminal. |
-| `heph auth logout` | clears the disk tier. |
+| `heph auth status` | one row per declared credential. Exits non-zero unless every row is `ok`. `--json` is an array, one `{addr, state, source, expires_at, login}` per credential; the exit code is the same, and a walk that left packages unevaluated leaves the array without its `]`. |
+| `heph auth explain <addr>` | the whole chain walk: every source, why each was skipped, which won. `--json` is `{addr, sources}`, one entry per source in chain order; it exits 0 when nothing applies. |
+| `heph auth login [addr] [--force]` | runs the login commands of the sources the probe found stale, and of the chosen source when acquiring from it fails — a probe only checks that the tool is there, so an expired session behind an installed tool is caught by the acquire. `--force` runs the chosen source's login regardless and forgets the credential's cached material. Never requires a terminal. No `--json`: it is interactive, and `heph auth status --json` lists what needs signing in to. |
+| `heph auth logout` | clears the disk tier. `--json` is `{cleared}`, the store's directory. |
 | `heph __auth-helper` | hidden. Speaks one callback dialect; parsed before the argument parser, since its argv and stdin belong to the calling tool. |
 
 **A build never signs anyone in.** It fails with the exact command to run, and a

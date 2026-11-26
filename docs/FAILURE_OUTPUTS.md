@@ -192,12 +192,15 @@ heph uploads nothing. A CI step uploads the slots itself, for example:
 ```
 
 The glob assumes the default `<home>`, `.heph`. To upload one target's
-failure wherever `<home>` is, read the path from `heph inspect failure --json`:
+failure wherever `<home>` is, read the path from `heph inspect failure`'s
+JSON. `--jq` filters it in heph, so the runner needs no `jq`; a string result
+prints unquoted, and `empty` prints nothing when the part (or the whole
+failure) is `null`:
 
 ```yaml
 - id: e2e_failure
   if: failure()
-  run: echo "out=$(heph inspect failure --json //web:e2e | jq -r '.out // empty')" >> "$GITHUB_OUTPUT"
+  run: echo "out=$(heph inspect failure //web:e2e --jq '.out // empty')" >> "$GITHUB_OUTPUT"
 - uses: actions/upload-artifact@v4
   if: failure() && steps.e2e_failure.outputs.out != ''
   with:
@@ -260,7 +263,9 @@ log: /ws/.heph/failures/web_e2e-…/log.txt
 out: /ws/.heph/failures/web_e2e-…/out
 ```
 
-`--json` prints one object. Paths are absolute, and an absent part is `null`:
+`--json` prints one object (pretty on a terminal, as here; one line when
+piped). Paths are absolute, and an absent part is `null`. `--fields` picks
+keys and `--jq` filters it, as on every command (`docs/JSON_OUTPUT.md`):
 
 ```json
 {
@@ -282,7 +287,8 @@ With no recorded failure (the target never failed, or passed or hit the cache
 since):
 
 - the text form prints `no recorded failure for <addr>` on stderr and exits 1;
-- `--json` prints `null` on stdout and exits 0.
+- `--json` prints `null` on stdout and exits 0 (with `--jq`, the filter runs
+  over `null`).
 
 So a script reads "no failure" as `null`, and a non-zero exit only means the
 command itself failed.

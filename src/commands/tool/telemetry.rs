@@ -1,5 +1,8 @@
+use std::io::Write as _;
+
 use anyhow::Context;
 use clap::{Args, Subcommand};
+use serde::Serialize;
 
 use crate::commands::bootstrap;
 use crate::telemetry::{DisabledBy, FlushMode, Status};
@@ -31,9 +34,8 @@ pub enum TelemetryCommands {
 
 #[derive(Args, Clone)]
 pub struct StatusArgs {
-    /// Emit JSON instead of the text report
-    #[arg(long)]
-    pub json: bool,
+    #[command(flatten)]
+    pub out: output::JsonArgs<StatusView<'static>>,
 }
 
 impl TelemetryArgs {
@@ -47,17 +49,103 @@ impl TelemetryArgs {
 fn status(args: &StatusArgs) -> anyhow::Result<()> {
     let status = crate::telemetry::status(bootstrap::telemetry_enabled_from_config())
         .context("reading the telemetry status")?;
-    if args.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&status).context("encoding the telemetry status")?
-        );
-    } else {
-        for line in render_text(&status) {
-            println!("{line}");
-        }
+    if args.out.enabled() {
+        return args
+            .out
+            .record(&StatusView::of(&status), &output::never_cancelled);
+    }
+    let mut out = std::io::stdout().lock();
+    for line in render_text(&status) {
+        writeln!(out, "{line}").context("writing the telemetry status")?;
     }
     Ok(())
+}
+
+/// `heph tool telemetry status --json`: [`Status`] field for field. Its keys
+/// are documented in docs/TELEMETRY.md. Times are milliseconds since the Unix
+/// epoch, ages are milliseconds.
+#[derive(Debug, Serialize, output::Record)]
+pub struct StatusView<'a> {
+    /// Whether this process would record and send events.
+    enabled: bool,
+    /// Every opt-out in force: `env`, `config` (both can be).
+    disabled_by: &'a [DisabledBy],
+    /// Whether this looks like a CI runner.
+    ci: bool,
+    /// How events are delivered: `detached`, `synchronous` (CI) or `off`.
+    flush_mode: FlushMode,
+    /// Where events are sent.
+    endpoint: &'a str,
+    /// Whether the endpoint was overridden through the environment.
+    endpoint_overridden: bool,
+    /// Why the overriding endpoint was rejected (nothing is sent then).
+    endpoint_error: Option<&'a str>,
+    /// The spool file; `null` when neither `XDG_CONFIG_HOME` nor `HOME` is set.
+    spool_path: Option<&'a str>,
+    /// Events waiting to be sent.
+    pending_events: u64,
+    /// When the oldest pending event was recorded.
+    oldest_event_ms: Option<i64>,
+    /// How old the oldest pending event is.
+    oldest_event_age_ms: Option<i64>,
+    /// When the last flush that ran to completion finished.
+    last_flush_ms: Option<i64>,
+    /// Whether that flush sent everything; `null` before the first one.
+    last_flush_ok: Option<bool>,
+    /// Why it failed.
+    last_flush_error: Option<&'a str>,
+    /// When a command last spawned a flusher.
+    last_flusher_spawn_ms: Option<i64>,
+    /// When the next command will spawn a flusher; `null` with nothing
+    /// pending, on CI, and when disabled.
+    next_flush_due_ms: Option<i64>,
+    /// The clock these were computed against.
+    now_ms: i64,
+}
+
+impl<'a> StatusView<'a> {
+    fn of(s: &'a Status) -> Self {
+        // Destructured, so a field added to `Status` is a compile error here
+        // rather than silently missing from `--json`.
+        let Status {
+            enabled,
+            disabled_by,
+            ci,
+            flush_mode,
+            endpoint,
+            endpoint_overridden,
+            endpoint_error,
+            spool_path,
+            pending_events,
+            oldest_event_ms,
+            oldest_event_age_ms,
+            last_flush_ms,
+            last_flush_ok,
+            last_flush_error,
+            last_flusher_spawn_ms,
+            next_flush_due_ms,
+            now_ms,
+        } = s;
+        Self {
+            enabled: *enabled,
+            disabled_by,
+            ci: *ci,
+            flush_mode: *flush_mode,
+            endpoint,
+            endpoint_overridden: *endpoint_overridden,
+            endpoint_error: endpoint_error.as_deref(),
+            spool_path: spool_path.as_deref(),
+            pending_events: *pending_events,
+            oldest_event_ms: *oldest_event_ms,
+            oldest_event_age_ms: *oldest_event_age_ms,
+            last_flush_ms: *last_flush_ms,
+            last_flush_ok: *last_flush_ok,
+            last_flush_error: last_flush_error.as_deref(),
+            last_flusher_spawn_ms: *last_flusher_spawn_ms,
+            next_flush_due_ms: *next_flush_due_ms,
+            now_ms: *now_ms,
+        }
+    }
 }
 
 /// A difference of two epoch-ms timestamps as a human age (`42s`, `3m05s`). A
@@ -235,6 +323,27 @@ mod tests {
             ),
             "{lines:#?}"
         );
+    }
+
+    #[test]
+    fn record_keys_subset_of_fields() -> anyhow::Result<()> {
+        output::check_keys(&StatusView::of(&status()))
+    }
+
+    /// The view is `Status` key for key, in order: the `--json` keys
+    /// docs/TELEMETRY.md promises did not move.
+    #[test]
+    fn json_keeps_the_status_keys() -> anyhow::Result<()> {
+        let s = status();
+        let mut view = Vec::new();
+        output::JsonArgs::<StatusView<'static>>::try_parse_from(["--json"])?
+            .printer_to(&mut view, output::Style::Compact)
+            .record(&StatusView::of(&s), &output::never_cancelled)?;
+        assert_eq!(
+            String::from_utf8(view)?.trim_end(),
+            serde_json::to_string(&s)?
+        );
+        Ok(())
     }
 
     #[test]

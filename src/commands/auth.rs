@@ -23,7 +23,9 @@
 
 use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
-use crate::commands::progress_app::{DashboardArgs, request_state, run_with_progress};
+use crate::commands::progress_app::{
+    DashboardArgs, request_state, run_with_progress, run_with_progress_out,
+};
 use crate::engine::credential::{Chain, source_login};
 use crate::engine::{Engine, get_cwp};
 use crate::tui::session::SessionSlot;
@@ -33,6 +35,7 @@ use clap::{Args, Subcommand};
 use hbuiltins::plugincredential::{CredentialDef, DRIVER_NAME, parse_declaration};
 use hmodel::htaddr::Addr;
 use hmodel::htmatcher::Matcher;
+use std::io::Write as _;
 use std::sync::Arc;
 
 #[derive(Args)]
@@ -90,7 +93,7 @@ pub enum AuthCommands {
     /// Clears `<home>/auth`. The vendor CLIs' own sessions are untouched — heph
     /// does not own those, and signing you out of `aws` because you asked heph to
     /// forget a cache entry would be a surprise.
-    Logout,
+    Logout(LogoutArgs),
 }
 
 #[derive(Args, Clone)]
@@ -99,11 +102,10 @@ pub struct StatusArgs {
     /// whole workspace.
     #[arg(value_name = "PACKAGE_MATCHER")]
     pub matcher: Option<String>,
-    /// Machine-readable output: `addr`, `state`, `source`, `expires_at`, `login`.
-    #[arg(long)]
-    pub json: bool,
     #[command(flatten)]
     pub dashboard: DashboardArgs,
+    #[command(flatten)]
+    pub out: output::JsonArgs<Row>,
 }
 
 #[derive(Args, Clone)]
@@ -111,10 +113,10 @@ pub struct ExplainArgs {
     /// The credential to explain.
     #[arg(value_name = "TARGET_ADDRESS")]
     pub addr: String,
-    #[arg(long)]
-    pub json: bool,
     #[command(flatten)]
     pub dashboard: DashboardArgs,
+    #[command(flatten)]
+    pub out: output::JsonArgs<ExplainView>,
 }
 
 #[derive(Args, Clone)]
@@ -129,6 +131,12 @@ pub struct LoginArgs {
     pub force: bool,
     #[command(flatten)]
     pub dashboard: DashboardArgs,
+}
+
+#[derive(Args, Clone)]
+pub struct LogoutArgs {
+    #[command(flatten)]
+    pub out: output::JsonArgs<LogoutRecord>,
 }
 
 impl AuthArgs {
@@ -152,7 +160,7 @@ impl AuthArgs {
             AuthCommands::Login(a) => {
                 bootstrap::block_on(login(a.clone(), sink, session, global.clone()))?
             }
-            AuthCommands::Logout => bootstrap::block_on(logout(session, global))?,
+            AuthCommands::Logout(a) => bootstrap::block_on(logout(a, session, global))?,
         }
     }
 }
@@ -162,9 +170,9 @@ impl AuthArgs {
 /// Three states, and the distinction between the last two is the whole value of
 /// the command: "you need to run something" is actionable, "nothing here can
 /// work" is a configuration bug.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, output::Shape)]
 #[serde(rename_all = "snake_case")]
-enum State {
+pub enum State {
     /// A source applies here.
     Ok,
     /// No source applies, but one of them has a sign-in command.
@@ -183,19 +191,24 @@ impl State {
     }
 }
 
-#[derive(serde::Serialize)]
-struct Row {
+/// `heph auth status --json`: one element per credential, sorted by address.
+#[derive(Debug, serde::Serialize, output::Record)]
+pub struct Row {
+    /// The credential's address.
     addr: String,
+    /// `ok`, `needs_sign_in` or `unavailable`.
     state: State,
     /// The winning source, or the first one that could be repaired.
     source: String,
-    /// Absolute, never a relative `expires_in` — which is only true at the moment
-    /// it was emitted, and a caller that stores the answer would be wrong by
-    /// however long it took to get there.
+    /// When the cached material expires, RFC 3339; absent when unknown.
+    // Absolute, never a relative `expires_in` — which is only true at the
+    // moment it was emitted, and a caller that stores the answer would be
+    // wrong by however long it took to get there.
     #[serde(skip_serializing_if = "Option::is_none")]
     expires_at: Option<String>,
-    /// The sign-in commands a human should run, as structured data rather than
-    /// prose, so `--json` consumers and the terminal render the same instruction.
+    /// The sign-in commands to run, each an argv; absent when there is none.
+    // Structured data rather than prose, so `--json` consumers and the
+    // terminal render the same instruction.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     login: Vec<Vec<String>>,
 }
@@ -213,11 +226,12 @@ async fn status(
         args.matcher.as_deref().unwrap_or("//...")
     );
     let dashboard = args.dashboard.dashboard;
-    run_with_progress(
+    run_with_progress_out(
         label,
         sink,
         session,
         global.no_tui,
+        &args.out.clone(),
         dashboard,
         shutdown,
         move |ctx| status_body(engine, args, m, global.fail_fast, ctx),
@@ -242,11 +256,18 @@ async fn status_body(
         rows.push(row_for(&engine, &rs, addr, def).await);
     }
 
-    // Rendered whole, then printed with the TUI paused: the table must not land
-    // inside a live frame.
-    let out = render_status(&rows, gaps.is_empty(), args.json)?;
-    if !out.is_empty() {
-        tui::paused!(ctx, { print!("{out}") });
+    if args.out.enabled() {
+        // The TUI is off: the document goes straight to stdout.
+        let cancelled = || rs.ctoken().is_cancelled();
+        status_json(args.out.printer(), &rows, gaps.is_empty(), &cancelled)?;
+    } else {
+        // Rendered whole, then printed with the TUI paused: the table must not
+        // land inside a live frame.
+        let out = render_status(&rows, gaps.is_empty())?;
+        if !out.is_empty() {
+            tui::paused!(ctx, { std::io::stdout().write_all(out.as_bytes()) })
+                .context("writing the credential table")?;
+        }
     }
 
     // A credential the walk could not reach is not in the table at all, which
@@ -255,16 +276,26 @@ async fn status_body(
     status_verdict(&rows)
 }
 
+/// `status --json`: the rows, closed only when the walk reached the whole
+/// selection (D10).
+fn status_json<W: std::io::Write>(
+    printer: output::Printer<'_, Row, W>,
+    rows: &[Row],
+    complete: bool,
+    cancelled: output::Cancelled<'_>,
+) -> anyhow::Result<()> {
+    let mut list = printer.start_list()?;
+    if list.push_iter(rows)? == output::Flow::Continue && complete {
+        list.finish(cancelled)?;
+    }
+    Ok(())
+}
+
 /// What `status` prints on stdout. `complete` is whether the walk reached the
 /// whole selection.
-fn render_status(rows: &[Row], complete: bool, json: bool) -> anyhow::Result<String> {
+fn render_status(rows: &[Row], complete: bool) -> anyhow::Result<String> {
     use std::fmt::Write as _;
 
-    if json {
-        let mut s = serde_json::to_string_pretty(rows).context("render --json")?;
-        s.push('\n');
-        return Ok(s);
-    }
     if rows.is_empty() {
         // "None here" would be a claim the walk cannot make if it skipped
         // part of the workspace; the incomplete block says that instead.
@@ -378,13 +409,29 @@ fn cached_expiry(
     Some(at.to_rfc3339())
 }
 
-#[derive(serde::Serialize)]
-struct ExplainStep {
+/// `heph auth explain --json`.
+#[derive(Debug, serde::Serialize, output::Record)]
+pub struct ExplainView {
+    /// The credential's address.
+    addr: String,
+    /// Every source of its chain, in order: whether it applies here, and why
+    /// not.
+    sources: Vec<ExplainStep>,
+}
+
+/// One source in [`ExplainView::sources`].
+#[derive(Debug, serde::Serialize, output::Shape)]
+pub struct ExplainStep {
+    /// Its position in the chain, from 0.
     index: usize,
+    /// The source, as `status` names it (`env(TOKEN)`).
     source: String,
+    /// Whether it is the one that applies here.
     chosen: bool,
+    /// Why it was skipped; absent for the chosen one.
     #[serde(skip_serializing_if = "Option::is_none")]
     skipped: Option<String>,
+    /// What to do about the skip.
     hint: String,
 }
 
@@ -399,14 +446,15 @@ async fn explain(
     let (engine, shutdown) = bootstrap::new_engine(&global, session)?;
     let label = format!("Explaining {addr}");
     let dashboard = args.dashboard.dashboard;
-    run_with_progress(
+    run_with_progress_out(
         label,
         sink,
         session,
         global.no_tui,
+        &args.out.clone(),
         dashboard,
         shutdown,
-        move |ctx| explain_body(engine, addr, args.json, ctx),
+        move |ctx| explain_body(engine, addr, args.out, ctx),
     )
     .await
 }
@@ -414,7 +462,7 @@ async fn explain(
 async fn explain_body(
     engine: Arc<Engine>,
     addr: Addr,
-    json: bool,
+    json: output::JsonArgs<ExplainView>,
     ctx: AppContext,
 ) -> anyhow::Result<()> {
     let rs = request_state(&engine, &ctx);
@@ -439,29 +487,29 @@ async fn explain_body(
         })
         .collect();
 
-    let out = render_explain(&addr, &steps, json)?;
-    tui::paused!(ctx, { print!("{out}") });
-    // `--json` reports the walk and exits 0 either way: whether a source was
-    // chosen is in the document.
-    if !json && !steps.iter().any(|s| s.chosen) {
+    if json.enabled() {
+        // `--json` reports the walk and exits 0 either way: whether a source
+        // was chosen is in the document.
+        let view = ExplainView {
+            addr: addr.format(),
+            sources: steps,
+        };
+        let cancelled = || rs.ctoken().is_cancelled();
+        return json.record(&view, &cancelled);
+    }
+    let out = render_explain(&addr, &steps)?;
+    tui::paused!(ctx, { std::io::stdout().write_all(out.as_bytes()) })
+        .context("writing the explanation")?;
+    if !steps.iter().any(|s| s.chosen) {
         anyhow::bail!("no source applies here");
     }
     Ok(())
 }
 
 /// What `explain` prints on stdout.
-fn render_explain(addr: &Addr, steps: &[ExplainStep], json: bool) -> anyhow::Result<String> {
+fn render_explain(addr: &Addr, steps: &[ExplainStep]) -> anyhow::Result<String> {
     use std::fmt::Write as _;
 
-    if json {
-        let mut s = serde_json::to_string_pretty(&serde_json::json!({
-            "addr": addr.format(),
-            "sources": steps,
-        }))
-        .context("render --json")?;
-        s.push('\n');
-        return Ok(s);
-    }
     let mut out = String::new();
     let mut line = |s: std::fmt::Arguments<'_>| {
         out.write_fmt(s)
@@ -580,8 +628,13 @@ async fn login_body(
                 due.push(step.index);
             } else if let Err(e) = engine.acquire_credential(&rs, addr, &Chain::root()).await {
                 tui::paused!(ctx, {
-                    println!("{addr}: {} does not work here: {e:#}", step.label)
-                });
+                    writeln!(
+                        std::io::stdout(),
+                        "{addr}: {} does not work here: {e:#}",
+                        step.label
+                    )
+                })
+                .context("writing the sign-in notice")?;
                 due.push(step.index);
             }
         }
@@ -599,7 +652,8 @@ async fn login_body(
                 // command. A no-op on the line backend.
                 let status = {
                     let _terminal = pauser.pause_for(tui::PauseFor::Input).await;
-                    println!("{addr}: {}", argv.join(" "));
+                    writeln!(std::io::stdout(), "{addr}: {}", argv.join(" "))
+                        .context("writing the sign-in command")?;
                     // Through the engine's exec-runner seam, so a source whose
                     // tool lives in a devenv shell signs in *there* — the same
                     // place its probe looked. Stdio is inherited: a browser flow
@@ -617,13 +671,29 @@ async fn login_body(
     }
     if ran == 0 && gaps.is_empty() {
         tui::paused!(ctx, {
-            println!("nothing to sign in to — every declared credential already applies here")
-        });
+            writeln!(
+                std::io::stdout(),
+                "nothing to sign in to — every declared credential already applies here"
+            )
+        })
+        .context("writing the sign-in summary")?;
     }
     crate::commands::errors::require_complete_selection(&gaps)
 }
 
-async fn logout(session: &Arc<SessionSlot>, global: &GlobalOptions) -> anyhow::Result<()> {
+/// `heph auth logout --json`.
+#[derive(Debug, serde::Serialize, output::Record)]
+pub struct LogoutRecord {
+    /// The credential store's directory, now empty.
+    #[serde(serialize_with = "output::ser::path")]
+    cleared: std::path::PathBuf,
+}
+
+async fn logout(
+    args: &LogoutArgs,
+    session: &Arc<SessionSlot>,
+    global: &GlobalOptions,
+) -> anyhow::Result<()> {
     let (engine, _shutdown) = bootstrap::new_engine(global, session)?;
     // Both tiers. The process one is empty in a fresh `heph auth logout`, but
     // clearing only the disk would make this command mean something different
@@ -631,8 +701,14 @@ async fn logout(session: &Arc<SessionSlot>, global: &GlobalOptions) -> anyhow::R
     engine.forget_credentials();
     let store = crate::engine::CredentialStore::new(&engine.home);
     store.clear()?;
-    println!("cleared {}", store.root().display());
-    Ok(())
+    if args.out.enabled() {
+        let record = LogoutRecord {
+            cleared: store.root().to_path_buf(),
+        };
+        return args.out.record(&record, &output::never_cancelled);
+    }
+    writeln!(std::io::stdout(), "cleared {}", store.root().display())
+        .context("printing the cleared store")
 }
 
 /// The selection `credentials_matching` walks: the workspace, or `matcher`.
@@ -893,8 +969,8 @@ mod tests {
         let (shutdown, _rx) = hcore::shutdown::ShutdownTrigger::new();
         let args = StatusArgs {
             matcher: None,
-            json,
             dashboard: DashboardArgs::default(),
+            out: json_args(json),
         };
         let session = Arc::new(SessionSlot::new());
         let sink = LogSink::new_direct_with(Arc::clone(&session));
@@ -941,7 +1017,7 @@ mod tests {
         let session = Arc::new(SessionSlot::new());
         let sink = LogSink::new_direct_with(Arc::clone(&session));
         run_with_progress("t", sink, &session, true, false, shutdown, move |ctx| {
-            explain_body(engine, token(), json, ctx)
+            explain_body(engine, token(), json_args(json), ctx)
         })
         .await
     }
@@ -976,6 +1052,30 @@ mod tests {
             login_body(engine, Wanted::One(token()), force, false, ctx)
         })
         .await
+    }
+
+    /// The output flags as `--json` gives them, or as none does.
+    fn json_args<R: output::Record + 'static>(json: bool) -> output::JsonArgs<R> {
+        if json {
+            output::JsonArgs::try_parse_from(["--json"]).expect("--json parses")
+        } else {
+            output::JsonArgs::default()
+        }
+    }
+
+    #[test]
+    fn record_keys_subset_of_fields() -> anyhow::Result<()> {
+        let mut aws = row("//auth:aws", State::NeedsSignIn, "exec(aws)");
+        aws.expires_at = Some("2026-09-08T15:41:00+00:00".to_string());
+        aws.login = vec![vec!["aws".to_string()]];
+        output::check_keys(&aws)?;
+        output::check_keys(&ExplainView {
+            addr: "//auth:token".to_string(),
+            sources: Vec::new(),
+        })?;
+        output::check_keys(&LogoutRecord {
+            cleared: "/home/.heph/auth".into(),
+        })
     }
 
     /// An `exec` source whose tool *is* on PATH, so the probe chooses it, and
@@ -1106,28 +1206,54 @@ mod tests {
         let rows = [aws, gh, ci];
 
         assert_eq!(
-            render_status(&rows, true, false)?,
+            render_status(&rows, true)?,
             "//auth:aws  needs sign-in  exec(aws)                run: heph auth login //auth:aws\n\
              //auth:gh   ok             env(GH_TOKEN)            expires 2026-09-08T15:41:00+00:00\n\
              //ci:x      unavailable    oidc(github_actions)     \n"
         );
 
-        let json: serde_json::Value = serde_json::from_str(&render_status(&rows, true, true)?)?;
-        assert_eq!(json.as_array().map(Vec::len), Some(3));
-        assert_eq!(json[0]["state"], "needs_sign_in");
+        // Piped, one element per line; absent fields stay absent.
+        assert_eq!(
+            status_json_text(&rows, true),
+            "[\n\
+             {\"addr\":\"//auth:aws\",\"state\":\"needs_sign_in\",\"source\":\"exec(aws)\",\"login\":[[\"aws\",\"sso\",\"login\"]]},\n\
+             {\"addr\":\"//auth:gh\",\"state\":\"ok\",\"source\":\"env(GH_TOKEN)\",\"expires_at\":\"2026-09-08T15:41:00+00:00\"},\n\
+             {\"addr\":\"//ci:x\",\"state\":\"unavailable\",\"source\":\"oidc(github_actions)\"}\n\
+             ]\n"
+        );
         Ok(())
     }
 
+    fn status_json_text(rows: &[Row], complete: bool) -> String {
+        let json = json_args::<Row>(true);
+        let mut out = Vec::new();
+        status_json(
+            json.printer_to(&mut out, output::Style::Compact),
+            rows,
+            complete,
+            &output::never_cancelled,
+        )
+        .expect("print");
+        String::from_utf8(out).expect("utf-8")
+    }
+
     /// An empty table says "none here" only when the walk reached everything;
-    /// otherwise the incomplete-selection block is the answer.
+    /// otherwise the incomplete-selection block is the answer. Under `--json`
+    /// a walk that left gaps leaves the list unclosed (D10).
     #[test]
     fn an_empty_status_claims_none_only_for_a_complete_walk() -> anyhow::Result<()> {
         assert_eq!(
-            render_status(&[], true, false)?,
+            render_status(&[], true)?,
             "no `credential` targets in this workspace\n"
         );
-        assert_eq!(render_status(&[], false, false)?, "");
-        assert_eq!(render_status(&[], false, true)?, "[]\n");
+        assert_eq!(render_status(&[], false)?, "");
+        let complete: serde_json::Value = serde_json::from_str(&status_json_text(&[], true))?;
+        assert_eq!(complete, serde_json::json!([]));
+        let gaps = status_json_text(&[row("//a:b", State::Ok, "env(X)")], false);
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&gaps).is_err(),
+            "{gaps:?}"
+        );
         Ok(())
     }
 
@@ -1150,16 +1276,27 @@ mod tests {
             },
         ];
         assert_eq!(
-            render_explain(&token(), &steps, false)?,
+            render_explain(&token(), &steps)?,
             "//auth:token\n  \
              1. env(TOKEN)               skipped: TOKEN unset\n                            \
              → export TOKEN\n  \
              2. exec(gh)                 applies here\n"
         );
-        let json: serde_json::Value =
-            serde_json::from_str(&render_explain(&token(), &steps, true)?)?;
-        assert_eq!(json["addr"], "//auth:token");
-        assert_eq!(json["sources"][1]["chosen"], true);
+        let json = json_args::<ExplainView>(true);
+        let mut out = Vec::new();
+        json.printer_to(&mut out, output::Style::Compact).record(
+            &ExplainView {
+                addr: token().format(),
+                sources: steps.into(),
+            },
+            &output::never_cancelled,
+        )?;
+        assert_eq!(
+            String::from_utf8(out)?,
+            "{\"addr\":\"//auth:token\",\"sources\":[\
+             {\"index\":0,\"source\":\"env(TOKEN)\",\"chosen\":false,\"skipped\":\"TOKEN unset\",\"hint\":\"export TOKEN\"},\
+             {\"index\":1,\"source\":\"exec(gh)\",\"chosen\":true,\"hint\":\"\"}]}\n"
+        );
         Ok(())
     }
 

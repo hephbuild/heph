@@ -194,11 +194,31 @@ fn main() -> ExitCode {
     // command or bad flags. Keeping the matches also lets the telemetry
     // reporter enumerate the exact args/flags set — generically, for every
     // command, with no per-command list.
-    let matches = soft_match.unwrap_or_else(|e| e.exit());
+    // An output flag on a command without a JSON form gets a tip naming what
+    // to use instead; the exit code stays clap's 2.
+    let matches = soft_match.unwrap_or_else(|e| {
+        commands::json_contract::with_no_json_hint(e, &Cli::command(), std::env::args_os()).exit()
+    });
     let cli = match Cli::from_arg_matches(&matches) {
         Ok(cli) => cli,
         Err(e) => e.exit(),
     };
+    // `--fields help`: the command's field table on stdout, exit 0, before
+    // anything starts. clap cannot print it from the value parser (its help
+    // errors are rendered with an `error:` prefix).
+    if let Some(table) = output::fields_help(&matches) {
+        use std::io::Write as _;
+        return match std::io::stdout().write_all(table.as_bytes()) {
+            // A reader that closed the pipe (`| head -1`) took what it
+            // wanted: exit 0, as every other output path does.
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+            Err(e) => {
+                error!(error = %e, "printing the field table");
+                ExitCode::FAILURE
+            }
+        };
+    }
 
     // Set up the supervisor sidecar that will SIGKILL every tracked child
     // process group when this binary exits — including hard-kill scenarios.
@@ -343,6 +363,14 @@ fn exit_code_for(
             // Re-raised by the caller, once everything else on the way out has run.
             _ => 1,
         };
+    }
+    // `--jq`: a filter that failed while it ran is 2 on every command, so it
+    // never reads as a command's own code; a cancelled one is 130. An output
+    // flag a command refused after parsing (`tool build-fmt -`) is 2, as
+    // clap's refusals are.
+    if let Some(code) = output::exit_code(e) {
+        report(e, session);
+        return code;
     }
     // `heph tool codegen`: 1 for findings, 2 for a failure (Decision 20).
     if let Some(exit) = e.downcast_ref::<commands::tool::codegen::CodegenExit>() {

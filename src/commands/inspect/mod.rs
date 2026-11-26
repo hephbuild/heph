@@ -11,7 +11,7 @@ mod packages;
 mod path;
 mod revdeps;
 mod spec;
-mod states;
+pub(crate) mod states;
 
 use crate::tui::session::SessionSlot;
 use clap::{Args, Subcommand};
@@ -90,21 +90,24 @@ pub enum InspectCommands {
     ///
     /// `heph inspect outputs //cmd/server:bin`
     ///
-    /// `heph inspect outputs //cmd:dist --json` — also lists support files
+    /// `heph inspect outputs //cmd:dist --json` — one object, which also lists
+    /// support files
     Outputs(outputs::Args),
     /// Print a target's spec, as supplied by its provider
     ///
     /// Prints the raw spec — the unresolved definition a provider returns
-    /// before a driver parses it — as pretty JSON.
+    /// before a driver parses it — as JSON by default (pretty on a terminal,
+    /// one line when piped). The shape follows the engine and is not stable.
     ///
     /// Example: `heph inspect spec //cmd/server:bin`
     Spec(spec::Args),
     /// Print a target's resolved def (inputs, outputs, sandbox)
     ///
-    /// Parses the target's spec into a def and prints it as pretty JSON,
-    /// including declared inputs, outputs, and sandbox configuration. By
-    /// default transitive deps are applied; pass --no-transitive for the
-    /// direct def only.
+    /// Parses the target's spec into a def and prints it as JSON by default
+    /// (pretty on a terminal, one line when piped), including declared
+    /// inputs, outputs, and sandbox configuration. The shape follows the
+    /// engine and is not stable. By default transitive deps are applied;
+    /// pass --no-transitive for the direct def only.
     ///
     /// Examples:
     ///

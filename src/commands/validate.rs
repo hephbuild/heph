@@ -30,11 +30,50 @@ pub struct ValidateArgs {
     pub matcher: Option<String>,
     #[command(flatten)]
     pub dashboard: crate::commands::progress_app::DashboardArgs,
+    #[command(flatten)]
+    pub out: output::JsonArgs<ValidateView>,
+}
+
+/// `heph validate --json`: what the checks found. Printed whether or not they
+/// passed; a problem still fails the command, as without `--json`. A target
+/// that fails to resolve or link is a build failure, reported on stderr with
+/// no document.
+#[derive(Debug, Default, serde::Serialize, output::Record)]
+pub struct ValidateView {
+    /// One message per problem that fails validation; empty when it passed.
+    problems: Vec<String>,
+    /// Findings that do not fail it: generated files local to this checkout,
+    /// and a check skipped because validation is scoped.
+    warnings: Vec<String>,
+}
+
+impl ValidateView {
+    /// The view of a check that ended with `checked`: its problems, flattened
+    /// out of [`finish`]'s error, and the `warnings` it printed.
+    fn new(checked: &anyhow::Result<()>, warnings: Vec<String>) -> Self {
+        let problems = match checked {
+            Ok(()) => Vec::new(),
+            Err(e) => match e.downcast_ref::<MultiError>() {
+                Some(MultiError(inner)) => inner.iter().map(|p| format!("{p:#}")).collect(),
+                // One problem, under `finish`'s "validation failed".
+                None => {
+                    let under: Vec<String> = e.chain().skip(1).map(ToString::to_string).collect();
+                    if under.is_empty() {
+                        vec![format!("{e:#}")]
+                    } else {
+                        vec![under.join(": ")]
+                    }
+                }
+            },
+        };
+        Self { problems, warnings }
+    }
 }
 
 struct ValidateApp {
     validate: Validate,
     fail_fast: bool,
+    out: output::JsonArgs<ValidateView>,
 }
 
 /// What validate checks, and against which engine.
@@ -67,6 +106,7 @@ impl App for ValidateApp {
         let ValidateApp {
             validate,
             fail_fast,
+            out: json,
         } = self;
         let rs = validate
             .engine
@@ -76,6 +116,31 @@ impl App for ValidateApp {
         // a correct file as out of date.
         let gaps = Gaps::new(crate::htquery::format(&validate.matcher));
         let discovery = Discovery::keep_going_unless(fail_fast, &gaps);
+
+        if json.enabled() {
+            // Stdout is the document's (I1): the warnings go into it.
+            let warnings = std::sync::Mutex::new(Vec::new());
+            let res = validate
+                .check(&rs, discovery, &|line: &str| {
+                    if let Ok(mut w) = warnings.lock() {
+                        w.push(line.to_owned());
+                    }
+                })
+                .await;
+            // The problems are the document's, so they reach the body; a
+            // cancellation stays an error for `finalize` to surface.
+            let res = match res {
+                Err(e) if crate::commands::errors::is_cancelled(&e) => Err(e),
+                checked => Ok(checked),
+            };
+            let cancelled = || rs.ctoken().is_cancelled();
+            return crate::commands::errors::finalize(&ctx, &rs, res, Some(&gaps), |checked| {
+                let warnings = warnings.into_inner().unwrap_or_default();
+                json.record(&ValidateView::new(&checked, warnings), &cancelled)?;
+                checked
+            })
+            .await;
+        }
 
         let out = BufferedStdout::new(&ctx);
         let res = validate
@@ -386,8 +451,10 @@ async fn execute_async(
             shadowed,
         },
         fail_fast: global.fail_fast,
+        out: args.out.clone(),
     };
-    let interactive = tui::should_use_tui(global.no_tui);
+    // Under the output flags stdout carries the record alone (I1).
+    let interactive = tui::should_use_tui(global.no_tui) && !args.out.enabled();
     tui::run_app_with(
         app,
         sink,
@@ -499,6 +566,29 @@ mod tests {
         assert!(rendered.contains("target a failed"), "got: {rendered}");
         assert!(rendered.contains("target b failed"), "got: {rendered}");
         assert!(rendered.contains("overlap c"), "got: {rendered}");
+    }
+
+    #[test]
+    fn json_view_lists_every_problem_without_the_envelope() -> anyhow::Result<()> {
+        let several = finish(vec![
+            Err(MultiError(vec![anyhow::anyhow!("target a failed")]).into()),
+            Ok(vec!["overlap c".to_string()]),
+        ]);
+        let view = super::ValidateView::new(&several, vec!["warning: w".to_string()]);
+        assert_eq!(view.problems, ["target a failed", "overlap c"]);
+        assert_eq!(view.warnings, ["warning: w"]);
+
+        let one = finish(vec![Err(anyhow::anyhow!("inner").context("outer"))]);
+        let view = super::ValidateView::new(&one, Vec::new());
+        assert_eq!(
+            view.problems,
+            ["outer: inner"],
+            "not \"validation failed: …\""
+        );
+
+        let ok = super::ValidateView::new(&Ok(()), Vec::new());
+        assert!(ok.problems.is_empty());
+        output::check_keys(&view)
     }
 
     #[test]

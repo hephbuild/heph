@@ -1,14 +1,13 @@
 use crate::tui::session::SessionSlot;
 use std::sync::Arc;
 
-use anyhow::Context;
 use clap_complete::engine::ArgValueCompleter;
 use serde::Serialize;
 
 use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
 use crate::commands::completion::complete_target_addr;
-use crate::commands::progress_app::run_engine_command;
+use crate::commands::progress_app::run_engine_command_out;
 use crate::commands::utils::parse_addr_arg;
 use crate::engine::driver::sandbox::Sandbox;
 use crate::engine::driver::targetdef::TargetDef;
@@ -24,6 +23,10 @@ pub struct Args {
     pub no_transitive: bool,
     #[command(flatten)]
     pub dashboard: crate::commands::progress_app::DashboardArgs,
+    // JSON either way, with no field table: the shape follows the engine and
+    // is not stable (D11).
+    #[command(flatten)]
+    pub out: output::DocArgs,
 }
 
 #[derive(Serialize)]
@@ -62,11 +65,13 @@ async fn execute_async(
 ) -> anyhow::Result<()> {
     let addr = parse_addr_arg(&args.addr)?;
     let no_transitive = args.no_transitive;
-    run_engine_command(
+    let json = args.out.clone();
+    run_engine_command_out(
         format!("Def {}", addr.format()),
         sink,
         session,
         &global,
+        &args.out,
         args.dashboard.dashboard,
         move |engine, rs, ctx| async move {
             // `get_def` may run provider targets, recording rich failures in `rs`;
@@ -76,15 +81,14 @@ async fn execute_async(
             } else {
                 Arc::clone(&engine).get_def(rs.clone(), &addr).await
             };
+            let cancelled = || rs.ctoken().is_cancelled();
             crate::commands::errors::finalize(&ctx, &rs, res, None, |def| {
                 let view = DefView {
                     runs_as: runs_as(&def.driver, &def.target_def),
                     target_def: &def.target_def,
                     applied_transitive: def.applied_transitive.as_ref(),
                 };
-                let json = serde_json::to_string_pretty(&view).context("serialize def")?;
-                println!("{json}");
-                Ok(())
+                json.print(&view, &cancelled)
             })
             .await
         },

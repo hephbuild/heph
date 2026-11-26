@@ -69,9 +69,8 @@ where
     }
 }
 
-/// Run `body` under the TUI (on a terminal, unless `no_tui`) or the line
-/// backend, and return what it returns — the exit code is the body's.
-/// `dashboard` is the command's `-D` ([`DashboardArgs`]).
+/// [`run_with_progress_out`] for a command without output flags: `auth login`,
+/// which runs sign-in commands that talk to the user.
 pub(crate) async fn run_with_progress<F, Fut>(
     label: impl Into<String>,
     sink: LogSink,
@@ -89,7 +88,34 @@ where
     run_progress_app(label, sink, session, interactive, dashboard, shutdown, body).await
 }
 
-/// [`run_with_progress`] with the TUI decision already made: `interactive`.
+/// Run `body` under the TUI (on a terminal, unless `no_tui`) or the line
+/// backend, and return what it returns — the exit code is the body's.
+/// `dashboard` is the command's `-D` ([`DashboardArgs`]). Under any of the
+/// output flags the TUI stays off, so stdout carries the document and nothing
+/// else (I1).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "run_with_progress's arguments plus the output flags"
+)]
+pub(crate) async fn run_with_progress_out<F, Fut>(
+    label: impl Into<String>,
+    sink: LogSink,
+    session: &Arc<SessionSlot>,
+    no_tui: bool,
+    out: &impl output::OutputFlags,
+    dashboard: bool,
+    shutdown: hcore::shutdown::ShutdownTrigger,
+    body: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce(AppContext) -> Fut + Send + 'static,
+    Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    let interactive = unless_json(|| tui::should_use_tui(no_tui), out.enabled())();
+    run_progress_app(label, sink, session, interactive, dashboard, shutdown, body).await
+}
+
+/// [`run_with_progress_out`] with the TUI decision already made: `interactive`.
 async fn run_progress_app<F, Fut>(
     label: impl Into<String>,
     sink: LogSink,
@@ -111,16 +137,21 @@ where
 }
 
 /// Build the engine `global` describes, then run `body` on it under
-/// [`run_with_progress`]. `body` gets the engine and a request on it from
-/// [`engine_request`]; the exit code is the body's.
+/// [`run_progress_app`]. `body` gets the engine and a request on it from
+/// [`engine_request`]; the exit code is the body's. `dashboard` is the
+/// command's `-D`.
 ///
-/// The terminal and `--no-tui` (`global.no_tui`) decide the TUI. `dashboard`
-/// is the command's `-D`.
-pub(crate) async fn run_engine_command<F, Fut>(
+/// For a command that has opted into the output
+/// flags: the runner reads them, so under any of `--json`, `--fields`, `--jq`
+/// the TUI is off without the command having to remember (I1). The terminal
+/// and `--no-tui` decide first, as for every other command, and that decision
+/// is the `interactive` telemetry records; the flags override it after.
+pub(crate) async fn run_engine_command_out<F, Fut>(
     label: impl Into<String>,
     sink: LogSink,
     session: &Arc<SessionSlot>,
     global: &GlobalOptions,
+    out: &impl output::OutputFlags,
     dashboard: bool,
     body: F,
 ) -> anyhow::Result<()>
@@ -128,37 +159,7 @@ where
     F: FnOnce(Arc<Engine>, Arc<RequestState>, AppContext) -> Fut + Send + 'static,
     Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
 {
-    let no_tui = global.no_tui;
-    engine_command(
-        label,
-        sink,
-        session,
-        global,
-        dashboard,
-        move || tui::should_use_tui(no_tui),
-        body,
-    )
-    .await
-}
-
-/// [`run_engine_command`] for a command whose `--json` (`json`) keeps the TUI
-/// off. The terminal and `--no-tui` decide first, as for every other command,
-/// and that decision is the `interactive` telemetry records; `json` overrides
-/// it after.
-pub(crate) async fn run_engine_command_json<F, Fut>(
-    label: impl Into<String>,
-    sink: LogSink,
-    session: &Arc<SessionSlot>,
-    global: &GlobalOptions,
-    json: bool,
-    dashboard: bool,
-    body: F,
-) -> anyhow::Result<()>
-where
-    F: FnOnce(Arc<Engine>, Arc<RequestState>, AppContext) -> Fut + Send + 'static,
-    Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
-{
-    let no_tui = global.no_tui;
+    let (no_tui, json) = (global.no_tui, out.enabled());
     engine_command(
         label,
         sink,
@@ -243,7 +244,7 @@ where
     .await
 }
 
-/// The request a [`run_engine_command`] body runs on: its build events reach
+/// The request a [`run_engine_command_out`] body runs on: its build events reach
 /// `ctx`'s view, and it is fail-fast as the command line says (`fail_fast`),
 /// unlike [`request_state`].
 fn engine_request(engine: &Arc<Engine>, fail_fast: bool, ctx: &AppContext) -> Arc<RequestState> {

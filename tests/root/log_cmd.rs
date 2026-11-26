@@ -380,10 +380,7 @@ fn listed(ws: &Ws) -> usize {
     let out = ws.run(&["session", "list", "--all", "--json"]);
     assert!(out.status.success(), "{}", describe(&out));
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("list --json");
-    v.get("sessions")
-        .and_then(serde_json::Value::as_array)
-        .expect("sessions")
-        .len()
+    v.as_array().expect("list --json is a bare array").len()
 }
 
 /// The binary routes `HEPH_NO_SESSION=1` to the private root: while the run

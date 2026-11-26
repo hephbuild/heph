@@ -133,9 +133,11 @@ old the oldest is, how the last flush went, and when the next one is due. If
 telemetry is off and events are still pending from before, it says that they
 will be sent once as the command exits, and that the spool is deleted after.
 
-`heph tool telemetry status --json` prints the same as one JSON object. Its keys
-are a stable interface: fields may be added, never renamed or removed. Times are
-milliseconds since the Unix epoch, ages milliseconds.
+`heph tool telemetry status --json` prints the same as one JSON object;
+`--fields` picks keys and `--jq` filters it. Its keys follow heph's output
+stability rule (`docs/JSON_OUTPUT.md`): a key may be added, never renamed or
+removed, and never changes type. Times are milliseconds since the Unix epoch,
+ages milliseconds.
 
 | Key | Type | Meaning |
 |---|---|---|

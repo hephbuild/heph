@@ -8,38 +8,38 @@ use anyhow::Context as _;
 use serde::Serialize;
 
 use super::{
-    BlockedOn, SessionState, ViewOpts, Workspace, ago, blocked_on, command_line, derive_state,
+    BlockedOn, Out, SessionState, ViewOpts, Workspace, ago, blocked_on, command_line, derive_state,
     escape, list_all, truncate,
 };
 use crate::tui::session::{EntryMeta, SessionEntry, SessionSource, holder_session};
-
-/// `list --json`'s own version, bumped only on an incompatible change.
-pub const LIST_JSON_VERSION: u32 = 1;
 
 /// The widest COMMAND cell.
 const COMMAND_WIDTH: usize = 40;
 /// The widest NOW cell.
 const NOW_WIDTH: usize = 60;
 
-#[derive(Debug, Serialize)]
-struct ListJson {
-    version: u32,
-    sessions: Vec<ListJsonEntry>,
-}
-
-/// One session in `list --json`. Times are absolute unix milliseconds.
-#[derive(Debug, Serialize)]
-struct ListJsonEntry {
+/// One session in `list --json`, which is an array of these sorted by id.
+/// Times are absolute unix milliseconds.
+#[derive(Debug, Serialize, output::Record)]
+pub struct ListRow {
+    /// The session id.
     id: String,
-    /// `null` only for a session in a newer directory format.
+    /// The recording process's pid; `null` only for a session in a newer
+    /// directory format.
     owner_pid: Option<u32>,
+    /// The command line it ran, as recorded.
     argv: Vec<String>,
+    /// The workspace it ran in, when it ran in one.
     workspace_root: Option<String>,
+    /// The directory it ran from.
     cwd: Option<String>,
-    /// Viewer-computed; see [`SessionState`].
+    /// Viewer-computed: running, waiting, quiet, ok, failed, lost or unknown.
     state: SessionState,
+    /// When it started.
     started_unix_ms: u64,
+    /// Its latest build event; `null` before the first.
     last_event_unix_ms: Option<u64>,
+    /// Its exit code once it ended; `null` while live, or killed by a signal.
     exit_code: Option<i32>,
     /// Set when the session ended in a panic (its `exit_code` may still be 0).
     panicked: bool,
@@ -51,6 +51,7 @@ struct ListJsonEntry {
     /// Human text, not a stable field: an agent reads `blocked_on` and
     /// `progress`.
     now: Option<String>,
+    /// Every wait of a live session, each lock holder mapped to its session.
     blocked_on: Vec<BlockedOn>,
     /// Set only for a session in a newer directory format, which this heph
     /// does not read further.
@@ -59,8 +60,8 @@ struct ListJsonEntry {
 }
 
 /// How far a session got, as PROGRESS shows it.
-#[derive(Debug, Serialize)]
-struct Progress {
+#[derive(Debug, Serialize, output::Shape)]
+pub(crate) struct Progress {
     /// Matched targets that finished once `total` is known; before that,
     /// every target that finished.
     done: u64,
@@ -101,8 +102,8 @@ pub(crate) async fn list(
     sources: &[&dyn SessionSource],
     opts: ViewOpts,
     workspace: Workspace<'_>,
-    json: bool,
-    out: &mut dyn Write,
+    json: &output::JsonArgs<ListRow>,
+    out: Out<'_>,
 ) -> anyhow::Result<()> {
     let all = list_all(sources).await?;
     let shown: Vec<&SessionEntry> = all
@@ -116,10 +117,12 @@ pub(crate) async fn list(
         })
         .collect();
     let every: Vec<&SessionEntry> = all.iter().map(|(_, e)| e).collect();
-    if json {
-        write_json(&shown, &every, opts, out)
+    if json.enabled() {
+        let rows = shown.iter().map(|e| json_row(e, &every, opts));
+        json.printer_to(out.w, out.style)
+            .list_iter(rows, &output::never_cancelled)
     } else {
-        write_table(&shown, &every, workspace, opts, out)
+        write_table(&shown, &every, workspace, opts, out.w)
     }
 }
 
@@ -130,73 +133,54 @@ pub(crate) fn scope_note(all: bool, workspace: Option<&str>) -> Option<&'static 
         .then_some("heph: not in a workspace; listing the sessions of every workspace\n")
 }
 
-fn write_json(
-    shown: &[&SessionEntry],
-    every: &[&SessionEntry],
-    opts: ViewOpts,
-    out: &mut dyn Write,
-) -> anyhow::Result<()> {
-    let sessions = shown
-        .iter()
-        .map(|e| {
-            let state = derive_state(e, opts.now_ms, opts.stall);
-            let status = e.status.as_ref();
-            let blocked_on = status.map(|s| blocked_on(s, e, every)).unwrap_or_default();
-            let end = status.and_then(|s| s.end.as_ref());
-            let exit_code = end.and_then(|x| x.exit_code);
-            let last_event_unix_ms = status.and_then(|s| s.last_event_unix_ms);
-            let now = match state {
-                SessionState::Running | SessionState::Waiting | SessionState::Quiet => status
-                    .map(|s| now_cell(s, e, every, opts))
-                    .filter(|n| n != "-"),
-                _ => None,
-            };
-            match &e.meta {
-                EntryMeta::Known(m) => ListJsonEntry {
-                    id: e.id.encode(),
-                    owner_pid: Some(m.owner_pid),
-                    argv: m.argv.clone(),
-                    workspace_root: m.workspace_root.clone(),
-                    cwd: m.cwd.clone(),
-                    state,
-                    started_unix_ms: m.started_unix_ms,
-                    last_event_unix_ms,
-                    exit_code,
-                    panicked: end.is_some_and(|x| x.panicked),
-                    progress: status.map(Progress::of),
-                    now,
-                    blocked_on,
-                    format: None,
-                },
-                EntryMeta::TooNew { found, .. } => ListJsonEntry {
-                    id: e.id.encode(),
-                    owner_pid: None,
-                    argv: Vec::new(),
-                    workspace_root: None,
-                    cwd: None,
-                    state,
-                    started_unix_ms: e.id.started_unix_ms(),
-                    last_event_unix_ms: None,
-                    exit_code: None,
-                    panicked: false,
-                    progress: None,
-                    now: None,
-                    blocked_on: Vec::new(),
-                    format: Some(*found),
-                },
-            }
-        })
-        .collect();
-    serde_json::to_writer_pretty(
-        &mut *out,
-        &ListJson {
-            version: LIST_JSON_VERSION,
-            sessions,
+/// `e`'s element of `list --json`.
+fn json_row(e: &SessionEntry, every: &[&SessionEntry], opts: ViewOpts) -> ListRow {
+    let state = derive_state(e, opts.now_ms, opts.stall);
+    let status = e.status.as_ref();
+    let blocked_on = status.map(|s| blocked_on(s, e, every)).unwrap_or_default();
+    let end = status.and_then(|s| s.end.as_ref());
+    let exit_code = end.and_then(|x| x.exit_code);
+    let last_event_unix_ms = status.and_then(|s| s.last_event_unix_ms);
+    let now = match state {
+        SessionState::Running | SessionState::Waiting | SessionState::Quiet => status
+            .map(|s| now_cell(s, e, every, opts))
+            .filter(|n| n != "-"),
+        _ => None,
+    };
+    match &e.meta {
+        EntryMeta::Known(m) => ListRow {
+            id: e.id.encode(),
+            owner_pid: Some(m.owner_pid),
+            argv: m.argv.clone(),
+            workspace_root: m.workspace_root.clone(),
+            cwd: m.cwd.clone(),
+            state,
+            started_unix_ms: m.started_unix_ms,
+            last_event_unix_ms,
+            exit_code,
+            panicked: end.is_some_and(|x| x.panicked),
+            progress: status.map(Progress::of),
+            now,
+            blocked_on,
+            format: None,
         },
-    )
-    .context("writing the session list")?;
-    writeln!(out).context("writing the session list")?;
-    Ok(())
+        EntryMeta::TooNew { found, .. } => ListRow {
+            id: e.id.encode(),
+            owner_pid: None,
+            argv: Vec::new(),
+            workspace_root: None,
+            cwd: None,
+            state,
+            started_unix_ms: e.id.started_unix_ms(),
+            last_event_unix_ms: None,
+            exit_code: None,
+            panicked: false,
+            progress: None,
+            now: None,
+            blocked_on: Vec::new(),
+            format: Some(*found),
+        },
+    }
 }
 
 const HEADERS: [&str; 7] = [
@@ -349,5 +333,30 @@ fn now_cell(
             ago(opts.now_ms, r.since_unix_ms)
         ),
         None => "-".to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn record_keys_subset_of_fields() -> anyhow::Result<()> {
+        output::check_keys(&ListRow {
+            id: "id".to_owned(),
+            owner_pid: Some(1),
+            argv: vec!["heph".to_owned()],
+            workspace_root: Some("/w".to_owned()),
+            cwd: Some("/w".to_owned()),
+            state: SessionState::Running,
+            started_unix_ms: 1,
+            last_event_unix_ms: Some(2),
+            exit_code: None,
+            panicked: false,
+            progress: None,
+            now: Some("//a:b (1s)".to_owned()),
+            blocked_on: Vec::new(),
+            format: Some(2),
+        })
     }
 }

@@ -39,8 +39,9 @@ by ignoring it:
    //p:integration timed out after 10m (its `timeout`)
    ```
 
-   (the limit exactly as declared, `hcore::units::format_duration`; `inspect
-   def --json` shows it as `timeout_ms`)
+   (the limit exactly as declared, `hcore::units::format_duration`; `heph
+   inspect def` prints it as `target_def.timeout_ms`, e.g. `--jq
+   '.target_def.timeout_ms'`, a debugging view whose shape follows the engine)
 
    with `; the run did not stop within 10s of being cancelled and was
    abandoned, so its process may still be running` appended when step 2 ran

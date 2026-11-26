@@ -71,8 +71,7 @@ pub fn list_entry(ws: &Workspace, dist: &Dist, id: &str) -> serde_json::Value {
     assert!(out.status.success(), "{}", describe(&out));
     let list: serde_json::Value = serde_json::from_slice(&out.stdout).expect("list --json");
     let entry = list
-        .get("sessions")
-        .and_then(serde_json::Value::as_array)
+        .as_array()
         .and_then(|all| all.iter().find(|s| s.get("id").is_some_and(|i| i == id)));
     assert!(entry.is_some(), "{id} is not listed: {list}");
     entry.cloned().unwrap_or_default()

@@ -1,11 +1,11 @@
 use crate::tui::session::SessionSlot;
 use std::sync::Arc;
 
-use anyhow::Context;
+use serde::Serialize;
 
 use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
-use crate::commands::progress_app::run_engine_command;
+use crate::commands::progress_app::run_engine_command_out;
 use crate::commands::utils::package_matcher_or_all;
 use crate::engine::{PackageStates, StatesOptions};
 use crate::htpkg::PkgBuf;
@@ -25,11 +25,10 @@ pub struct Args {
     #[arg(short, long)]
     pub provider: Option<String>,
 
-    /// Emit JSON instead of the text listing
-    #[arg(long)]
-    pub json: bool,
     #[command(flatten)]
     pub dashboard: crate::commands::progress_app::DashboardArgs,
+    #[command(flatten)]
+    pub out: output::JsonArgs<PackageStatesRow<'static>>,
 }
 
 /// Render a state value as JSON. BUILD files spell booleans `True`, but every
@@ -127,25 +126,40 @@ fn render_text(found: &[&PackageStates], inherited: bool) -> Vec<String> {
     lines
 }
 
-fn render_json(found: &[&PackageStates]) -> anyhow::Result<String> {
-    let out: Vec<serde_json::Value> = found
-        .iter()
-        .map(|ps| {
-            let states: Vec<serde_json::Value> = ps
-                .states
-                .iter()
-                .map(|s| {
-                    serde_json::json!({
-                        "declared_in": fmt_pkg(&s.package),
-                        "provider": s.provider,
-                        "state": value_to_json(&Value::Map(s.state.clone())),
-                    })
-                })
-                .collect();
-            serde_json::json!({ "package": fmt_pkg(&ps.package), "states": states })
-        })
-        .collect();
-    serde_json::to_string_pretty(&out).context("serialize states")
+/// `heph inspect states --json`: one element per package that declares or
+/// inherits a state.
+#[derive(Debug, Serialize, output::Record)]
+pub struct PackageStatesRow<'a> {
+    /// The package, as `//pkg`.
+    package: String,
+    /// Each state that applies there, in the text output's order.
+    states: Vec<StateRow<'a>>,
+}
+
+/// One `provider_state(...)` in [`PackageStatesRow::states`].
+#[derive(Debug, Serialize, output::Shape)]
+pub struct StateRow<'a> {
+    /// The package whose BUILD file declared it, as `//pkg`.
+    declared_in: String,
+    /// The provider it configures.
+    provider: &'a str,
+    /// Its fields, keys sorted.
+    state: serde_json::Value,
+}
+
+fn json_row<'a>(ps: &'a PackageStates) -> PackageStatesRow<'a> {
+    PackageStatesRow {
+        package: fmt_pkg(&ps.package),
+        states: ps
+            .states
+            .iter()
+            .map(|s| StateRow {
+                declared_in: fmt_pkg(&s.package),
+                provider: &s.provider,
+                state: value_to_json(&Value::Map(s.state.clone())),
+            })
+            .collect(),
+    }
 }
 
 pub fn execute(
@@ -168,36 +182,39 @@ async fn execute_async(
         inherited: args.inherited,
         provider: args.provider.clone(),
     };
-    let json = args.json;
-    run_engine_command(
+    let json = args.out.clone();
+    run_engine_command_out(
         format!("States {matcher:?}"),
         sink,
         session,
         &global,
+        &args.out,
         args.dashboard.dashboard,
         move |engine, rs, ctx| async move {
             // Probing runs BUILD evaluation, which records rich failures in `rs`;
             // `finalize` prefers those over the returned error.
-            let out = BufferedStdout::new(&ctx);
-            let res: anyhow::Result<()> = async {
-                let found = Arc::clone(&engine)
-                    .states(rs.clone(), &matcher, &opts)
-                    .await?;
-                // A package with nothing to say is noise in a workspace-wide scan,
-                // and "absent" already reads as "no state here" for a single one.
-                let found: Vec<&PackageStates> =
-                    found.iter().filter(|p| !p.states.is_empty()).collect();
-
-                if json {
-                    out.println(render_json(&found)?);
-                } else {
-                    for line in render_text(&found, opts.inherited) {
-                        out.println(line);
-                    }
-                }
-                Ok(())
+            let res = Arc::clone(&engine)
+                .states(rs.clone(), &matcher, &opts)
+                .await;
+            // A package with nothing to say is noise in a workspace-wide scan,
+            // and "absent" already reads as "no state here" for a single one.
+            fn declaring(found: &[PackageStates]) -> Vec<&PackageStates> {
+                found.iter().filter(|p| !p.states.is_empty()).collect()
             }
-            .await;
+            if json.enabled() {
+                let cancelled = || rs.ctoken().is_cancelled();
+                return crate::commands::errors::finalize(&ctx, &rs, res, None, |found| {
+                    let rows = declaring(&found).into_iter().map(json_row);
+                    json.list_iter(rows, &cancelled)
+                })
+                .await;
+            }
+            let out = BufferedStdout::new(&ctx);
+            let res = res.map(|found| {
+                for line in render_text(&declaring(&found), opts.inherited) {
+                    out.println(line);
+                }
+            });
             out.close().await;
 
             crate::commands::errors::finalize(&ctx, &rs, res, None, |_| Ok(())).await
@@ -322,11 +339,24 @@ mod tests {
             states: vec![state("a", "go", &[("strict", Value::Bool(true))])],
         };
 
-        let parsed: serde_json::Value = serde_json::from_str(&render_json(&[&ps])?)?;
+        let args = output::JsonArgs::<PackageStatesRow<'static>>::try_parse_from(["--json"])?;
+        let mut out = Vec::new();
+        args.printer_to(&mut out, output::Style::Compact)
+            .list_iter([json_row(&ps)], &output::never_cancelled)?;
+        let parsed: serde_json::Value = serde_json::from_slice(&out)?;
         assert_eq!(parsed[0]["package"], "//a/b");
         assert_eq!(parsed[0]["states"][0]["declared_in"], "//a");
         assert_eq!(parsed[0]["states"][0]["provider"], "go");
         assert_eq!(parsed[0]["states"][0]["state"]["strict"], true);
         Ok(())
+    }
+
+    #[test]
+    fn record_keys_subset_of_fields() {
+        let ps = PackageStates {
+            package: PkgBuf::from("a/b"),
+            states: vec![state("a", "go", &[("strict", Value::Bool(true))])],
+        };
+        output::check_keys(&json_row(&ps)).unwrap();
     }
 }

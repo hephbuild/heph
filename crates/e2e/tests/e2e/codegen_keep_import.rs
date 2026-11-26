@@ -573,8 +573,8 @@ async fn keep_prints_git_add() -> anyhow::Result<()> {
         Some("git add p/a.txt q/b.txt .gitignore"),
         "{text:?}"
     );
-    let json = report.json();
-    assert_eq!(json["schema"], 1);
+    let json = serde_json::to_value(&report)?;
+    assert!(json.get("schema").is_none(), "{json}");
     assert_eq!(json["results"][0]["path"], "p/a.txt");
     assert_eq!(json["results"][0]["result"], "kept");
     assert_eq!(json["results"][1]["path"], "q/b.txt");
@@ -1235,7 +1235,7 @@ async fn status_hints_import_when_index_empty_and_lines_match() -> anyhow::Resul
         "{:?}",
         report.text()
     );
-    assert_eq!(report.json()["hint"], hint.as_str());
+    assert_eq!(serde_json::to_value(&report)?["hint"], hint.as_str());
 
     ws.write_build_file("q", &copy_target("gen", "gen.txt", "g"));
     let engine = ws.reopen()?;
@@ -1370,8 +1370,7 @@ async fn codegen_import_is_idempotent() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `--json`: `{"schema": 1, "recorded", "skipped", "unchanged"}`, nothing
-/// else.
+/// `--json`: `{"recorded", "skipped", "unchanged"}`, nothing else.
 #[tokio::test]
 async fn codegen_import_json_shape() -> anyhow::Result<()> {
     let ws = Workspace::new();
@@ -1382,13 +1381,13 @@ async fn codegen_import_json_shape() -> anyhow::Result<()> {
 
     let report = import(&ws.engine).await?;
     assert_eq!(
-        report.json(),
-        serde_json::json!({"schema": 1, "recorded": 1, "skipped": 1, "unchanged": 0})
+        serde_json::to_value(&report)?,
+        serde_json::json!({"recorded": 1, "skipped": 1, "unchanged": 0})
     );
     let report = import(&ws.engine).await?;
     assert_eq!(
-        report.json(),
-        serde_json::json!({"schema": 1, "recorded": 0, "skipped": 1, "unchanged": 1})
+        serde_json::to_value(&report)?,
+        serde_json::json!({"recorded": 0, "skipped": 1, "unchanged": 1})
     );
     Ok(())
 }

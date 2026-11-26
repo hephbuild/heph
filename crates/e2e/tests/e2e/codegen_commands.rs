@@ -391,13 +391,16 @@ async fn gitignore_check_stale_on_old_marker() -> anyhow::Result<()> {
         "{text}"
     );
     assert!(!text.contains("out of date"), "lines are current: {text}");
-    assert_eq!(report.json()["reasons"], serde_json::json!(["old_marker"]));
+    assert_eq!(
+        serde_json::to_value(&report)?["reasons"],
+        serde_json::json!(["old_marker"])
+    );
     assert_eq!(read(&ws, ".gitignore"), before, "--check writes nothing");
     Ok(())
 }
 
-/// `{"schema": 1, "stale", "reasons", "written", "lines": [{op, pattern,
-/// addr}], "released": [{path, addr}]}`, arrays sorted.
+/// `{"stale", "reasons", "written", "lines": [{op, pattern, addr}],
+/// "released": [{path, addr}]}`, arrays sorted, no `schema` envelope.
 #[tokio::test]
 async fn gitignore_json_schema() -> anyhow::Result<()> {
     let ws = Workspace::new();
@@ -411,17 +414,16 @@ async fn gitignore_json_schema() -> anyhow::Result<()> {
     );
     write_section(&ws, &["# //p:gone", "/p/gone.txt"]);
 
-    let check = gitignore_check(&ws.engine).await?.json();
-    assert_eq!(check["schema"], 1);
+    let check = serde_json::to_value(gitignore_check(&ws.engine).await?)?;
     assert_eq!(check["stale"], true);
     assert_eq!(check["written"], false, "--check never writes");
     assert_eq!(check["reasons"], serde_json::json!(["lines"]));
 
-    let doc = gitignore(&ws.engine).await?.json();
+    let doc = serde_json::to_value(gitignore(&ws.engine).await?)?;
     let keys: Vec<&String> = doc.as_object().context("object")?.keys().collect();
     assert_eq!(
         keys,
-        ["lines", "reasons", "released", "schema", "stale", "written"],
+        ["lines", "reasons", "released", "stale", "written"],
         "{doc}"
     );
     assert_eq!(doc["written"], true);
@@ -436,7 +438,7 @@ async fn gitignore_json_schema() -> anyhow::Result<()> {
     );
     assert_eq!(doc["released"], serde_json::json!([]));
 
-    let clean = gitignore(&ws.engine).await?.json();
+    let clean = serde_json::to_value(gitignore(&ws.engine).await?)?;
     assert_eq!(clean["stale"], false);
     assert_eq!(clean["reasons"], serde_json::json!([]));
     assert_eq!(clean["lines"], serde_json::json!([]));
@@ -696,7 +698,7 @@ async fn status_unresolved_item_has_no_path() -> anyhow::Result<()> {
     assert_eq!(unresolved.len(), 1, "{report:?}");
     assert_eq!(unresolved[0].path, None);
 
-    let doc = report.json();
+    let doc = serde_json::to_value(&report)?;
     let items = doc["items"].as_array().context("items")?;
     let item = items
         .iter()
@@ -712,8 +714,8 @@ async fn status_unresolved_item_has_no_path() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `{"schema": 1, "items": [{path, kind, addr, output, fix}]}`: sorted by
-/// path, `kind` from the enum, and no `written_at`.
+/// `{"items": [{path, kind, addr, output, fix}]}`: sorted by path, `kind`
+/// from the enum, and no `written_at` or `schema`.
 #[tokio::test]
 async fn status_json_schema() -> anyhow::Result<()> {
     let ws = Workspace::new();
@@ -723,8 +725,8 @@ async fn status_json_schema() -> anyhow::Result<()> {
     ws.write_file("p/b.txt", "edited");
     ws.write_file("p/a.txt", "edited too");
 
-    let doc = status(&ws.engine).await?.json();
-    assert_eq!(doc["schema"], 1);
+    let doc = serde_json::to_value(status(&ws.engine).await?)?;
+    assert!(doc.get("schema").is_none(), "{doc}");
     let items = doc["items"].as_array().context("items")?;
     let paths: Vec<&str> = items.iter().filter_map(|i| i["path"].as_str()).collect();
     assert_eq!(paths, ["p/a.txt", "p/b.txt"], "sorted: {doc}");
@@ -968,10 +970,9 @@ async fn why_json_shape() -> anyhow::Result<()> {
     run_on(&ws.engine, "//p:gen").await?;
     gitignore(&ws.engine).await?;
 
-    let doc = why_in(&ws.engine, ws.dir.path(), &["p/gen.txt", "../out"])
-        .await?
-        .json();
-    assert_eq!(doc["schema"], 1);
+    let doc =
+        serde_json::to_value(why_in(&ws.engine, ws.dir.path(), &["p/gen.txt", "../out"]).await?)?;
+    assert!(doc.get("schema").is_none(), "{doc}");
     let results = doc["results"].as_array().context("results")?;
     assert_eq!(results.len(), 2);
     let r = &results[0];

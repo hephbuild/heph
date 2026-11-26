@@ -1,6 +1,8 @@
 use crate::tui::session::SessionSlot;
+use std::io::Write;
 use std::sync::Arc;
 
+use anyhow::Context;
 use async_trait::async_trait;
 use clap_complete::engine::ArgValueCompleter;
 
@@ -47,6 +49,41 @@ pub struct CleanArgs {
     /// thinking about scratch.
     #[arg(long)]
     pub scratch: bool,
+    #[command(flatten)]
+    pub out: output::JsonArgs<CleanView>,
+}
+
+/// `heph tool clean --json`: what the clean removed.
+#[derive(Debug, Default, serde::Serialize, output::Record)]
+pub struct CleanView {
+    /// Targets that lost at least one revision; 0 when nothing matched.
+    targets_cleaned: usize,
+    /// Cache revisions deleted.
+    revisions_removed: usize,
+    /// Bytes freed by the deleted revisions.
+    bytes_removed: u64,
+    /// Selected targets whose deletion failed; each is logged.
+    errored: usize,
+    /// Run-log directories of hephs that ended without removing them.
+    run_log_dirs_removed: usize,
+    /// Scratch caches deleted; `null` without `--scratch`.
+    scratch_caches_removed: Option<usize>,
+    /// Bytes those scratch caches held; `null` without `--scratch`.
+    scratch_bytes_removed: Option<u64>,
+}
+
+impl CleanView {
+    fn new(stats: &CleanStats, scratch: Option<(usize, u64)>) -> Self {
+        Self {
+            targets_cleaned: stats.targets_cleaned,
+            revisions_removed: stats.revisions_removed,
+            bytes_removed: stats.bytes_removed,
+            errored: stats.errored,
+            run_log_dirs_removed: stats.run_log_dirs_removed,
+            scratch_caches_removed: scratch.map(|(n, _)| n),
+            scratch_bytes_removed: scratch.map(|(_, bytes)| bytes),
+        }
+    }
 }
 
 /// Resolve the selection — `run`'s and `query`'s, with **no default**.
@@ -71,6 +108,9 @@ struct CleanApp {
     engine: Arc<Engine>,
     matcher: Matcher,
     fail_fast: bool,
+    out: output::JsonArgs<CleanView>,
+    /// What `--scratch` with an address removed, before the clean ran.
+    scratch: Option<(usize, u64)>,
 }
 
 impl CleanApp {
@@ -114,9 +154,14 @@ impl App for CleanApp {
             )
             .await;
 
+        let (out, scratch) = (self.out, self.scratch);
+        let cancelled = || rs.ctoken().is_cancelled();
         crate::commands::errors::finalize(&ctx, &rs, res, Some(&gaps), |stats| {
-            print_summary(&stats, &selection);
-            Ok(())
+            if out.enabled() {
+                return out.record(&CleanView::new(&stats, scratch), &cancelled);
+            }
+            print_summary(&mut std::io::stdout().lock(), &stats, &selection)
+                .context("writing the clean summary")
         })
         .await
     }
@@ -129,26 +174,38 @@ impl App for CleanApp {
 /// holds — but it is the outcome most likely to be a typo, so it says so
 /// explicitly instead of reporting a `0`-shaped success that reads identically to
 /// having freed nothing.
-fn print_summary(stats: &CleanStats, selection: &str) {
+fn print_summary(out: &mut impl Write, stats: &CleanStats, selection: &str) -> std::io::Result<()> {
     if stats.targets_cleaned == 0 && stats.errored == 0 {
-        println!("Nothing to clean: no cached entries match {selection}");
-        return;
+        return writeln!(out, "Nothing to clean: no cached entries match {selection}");
     }
-    println!(
+    writeln!(
+        out,
         "Cleaned {} target(s) · {} revision(s) · {} freed",
         stats.targets_cleaned,
         stats.revisions_removed,
         human_bytes(stats.bytes_removed),
-    );
+    )?;
     if stats.errored > 0 {
         // Counted, not fatal: the run kept going past a target it could not
         // delete, and a summary that hid that would claim a cleaner cache than
         // there is.
-        println!(
+        writeln!(
+            out,
             "{} target(s) could not be cleaned; see the logs above",
             stats.errored
-        );
+        )?;
     }
+    Ok(())
+}
+
+/// The line `--scratch` prints for what it removed.
+fn print_scratch(removed: (usize, u64)) -> anyhow::Result<()> {
+    let (n, freed) = removed;
+    writeln!(
+        std::io::stdout(),
+        "Removed {n} scratch cache(s), freed {freed} bytes."
+    )
+    .context("writing the scratch summary")
 }
 
 pub fn execute(
@@ -173,25 +230,36 @@ async fn execute_async(
     // deliberately refuses an empty one rather than wiping the target cache.
     if args.scratch && args.arg1.is_none() && args.expr.is_none() {
         let (engine, _shutdown) = bootstrap::new_engine(&global, session)?;
-        let (n, freed) = engine.scratch_remove(None)?;
-        println!("Removed {n} scratch cache(s), freed {freed} bytes.");
-        return Ok(());
+        let removed = engine.scratch_remove(None)?;
+        if args.out.enabled() {
+            // No target selection was made, so no target was cleaned.
+            let view = CleanView::new(&CleanStats::default(), Some(removed));
+            return args.out.record(&view, &output::never_cancelled);
+        }
+        return print_scratch(removed);
     }
 
     let matcher = selection(&args, &cwp)?;
     let (engine, shutdown) = bootstrap::new_engine(&global, session)?;
+    let mut scratch = None;
     if args.scratch
         && let Some(addr) = args.arg1.as_deref()
     {
-        let (n, freed) = engine.scratch_remove(Some(addr))?;
-        println!("Removed {n} scratch cache(s), freed {freed} bytes.");
+        let removed = engine.scratch_remove(Some(addr))?;
+        if !args.out.enabled() {
+            print_scratch(removed)?;
+        }
+        scratch = Some(removed);
     }
+    // Under the output flags stdout carries the record alone (I1).
+    let interactive = tui::should_use_tui(global.no_tui) && !args.out.enabled();
     let app = CleanApp {
         engine,
         matcher,
         fail_fast: global.fail_fast,
+        out: args.out,
+        scratch,
     };
-    let interactive = tui::should_use_tui(global.no_tui);
     tui::run_app(app, sink, session, interactive, shutdown).await
 }
 
@@ -247,7 +315,26 @@ mod tests {
             arg2: None,
             expr: expr.map(str::to_string),
             scratch: false,
+            out: output::JsonArgs::default(),
         }
+    }
+
+    #[test]
+    fn record_keys_subset_of_fields() -> anyhow::Result<()> {
+        let view = CleanView::new(&CleanStats::default(), Some((1, 10)));
+        assert_eq!(view.scratch_caches_removed, Some(1));
+        output::check_keys(&view)
+    }
+
+    #[test]
+    fn an_empty_clean_says_nothing_matched() -> anyhow::Result<()> {
+        let mut out = Vec::new();
+        print_summary(&mut out, &CleanStats::default(), "//a:b")?;
+        assert_eq!(
+            String::from_utf8(out)?,
+            "Nothing to clean: no cached entries match //a:b\n"
+        );
+        Ok(())
     }
 
     /// Parse a full `heph <args>` command line the way `main` does.

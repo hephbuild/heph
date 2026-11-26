@@ -50,6 +50,7 @@ mod home_dir;
 mod host_paths;
 mod http_fetch;
 mod inspect_failure;
+mod json_field_costs;
 mod label_select;
 mod listed_facts;
 mod log_api;

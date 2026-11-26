@@ -6,12 +6,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use serde_json::json;
 
 use super::keep::PathResultKind;
 use super::{
-    JSON_SCHEMA, Report, ResolvedPath, blocking, display, empty_index_hint, resolve_path,
-    root_hint, run_cli, with_hint,
+    Report, ResolvedPath, blocking, display, empty_index_hint, resolve_path, root_hint, run_cli,
+    with_hint,
 };
 use crate::commands::GlobalOptions;
 use crate::engine::Engine;
@@ -26,15 +25,14 @@ pub struct Args {
     /// Paths to explain (cwd-relative, //root-relative or absolute)
     #[arg(value_name = "PATH", required = true)]
     pub paths: Vec<String>,
-    /// Print the result as JSON
-    #[arg(long)]
-    pub json: bool,
+    #[command(flatten)]
+    pub out: output::JsonArgs<WhyReport>,
     #[command(flatten)]
     pub dashboard: crate::commands::progress_app::DashboardArgs,
 }
 
 /// The row that decided, as `why` shows it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, output::Shape)]
 pub struct WhyRow {
     /// The row's own path: another casing of the argument after a fold hit.
     pub path: String,
@@ -51,7 +49,7 @@ pub struct WhyRow {
 }
 
 /// The section line that matched.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, output::Shape)]
 pub struct WhyLine {
     pub line: usize,
     pub pattern: String,
@@ -61,7 +59,7 @@ pub struct WhyLine {
     pub negated: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, output::Shape)]
 pub struct WhyItem {
     pub path: String,
     pub result: PathResultKind,
@@ -74,10 +72,17 @@ pub struct WhyItem {
     pub section_line: Option<WhyLine>,
 }
 
-#[derive(Debug, Clone, Default)]
+/// What `why` found; under `--json`, the record it prints.
+#[derive(Debug, Clone, Default, serde::Serialize, output::Record)]
 pub struct WhyReport {
-    /// In argument order, deduplicated.
+    /// One per path, in argument order, deduplicated: `{path, result, reason,
+    /// status, status_reason, row, section_line}`; `result` is `explained`,
+    /// `unknown` or `refused`.
+    #[serde(rename = "results")]
     pub items: Vec<WhyItem>,
+    /// Present only when the index is empty but section lines match files on
+    /// disk: run `heph tool codegen import`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
 }
 
@@ -164,42 +169,6 @@ impl Report for WhyReport {
             out.push(h.clone());
         }
         out
-    }
-
-    fn json(&self) -> serde_json::Value {
-        let results: Vec<serde_json::Value> = self
-            .items
-            .iter()
-            .map(|i| {
-                json!({
-                    "path": i.path,
-                    "result": i.result.as_str(),
-                    "reason": i.reason,
-                    "status": i.status,
-                    "status_reason": i.status_reason,
-                    "row": i.row.as_ref().map(|r| json!({
-                        "path": r.path,
-                        "addr": r.addr,
-                        "output": r.output,
-                        "state": r.state,
-                        "written_at": r.written_at,
-                        "pending": r.pending,
-                        "verified": r.verified,
-                    })),
-                    "section_line": i.section_line.as_ref().map(|l| json!({
-                        "line": l.line,
-                        "pattern": l.pattern,
-                        "heph_wrote": l.heph_wrote,
-                        "negated": l.negated,
-                    })),
-                })
-            })
-            .collect();
-        let mut doc = json!({ "schema": JSON_SCHEMA, "results": results });
-        if let (Some(h), Some(m)) = (&self.hint, doc.as_object_mut()) {
-            m.insert("hint".into(), json!(h));
-        }
-        doc
     }
 
     fn exit_code(&self) -> u8 {
@@ -358,7 +327,7 @@ pub fn execute(
     let cwd: PathBuf = std::env::current_dir().context("reading the working directory")?;
     run_cli(
         "Explaining",
-        args.json,
+        &args.out,
         args.dashboard.dashboard,
         sink,
         session,

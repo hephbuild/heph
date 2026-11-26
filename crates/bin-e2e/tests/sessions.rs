@@ -302,14 +302,12 @@ fn list_filters_by_workspace() {
         let out = run_in(&a, a.root(), &args);
         assert!(out.status.success(), "{}", describe(&out));
         let list: serde_json::Value = serde_json::from_slice(&out.stdout).expect("list --json");
-        let mut ids: Vec<String> = list["sessions"]
+        let mut ids: Vec<String> = list
             .as_array()
-            .map(|all| {
-                all.iter()
-                    .filter_map(|s| s["id"].as_str().map(str::to_owned))
-                    .collect()
-            })
-            .unwrap_or_default();
+            .unwrap_or_else(|| panic!("list --json is a bare array: {list}"))
+            .iter()
+            .filter_map(|s| s["id"].as_str().map(str::to_owned))
+            .collect();
         ids.sort();
         ids
     };
@@ -338,14 +336,12 @@ fn list_filters_by_workspace() {
     );
     let list: serde_json::Value = serde_json::from_slice(&out.stdout)
         .unwrap_or_else(|e| panic!("stdout is not JSON: {e}\n{}", describe(&out)));
-    let mut widened: Vec<String> = list["sessions"]
+    let mut widened: Vec<String> = list
         .as_array()
-        .map(|all| {
-            all.iter()
-                .filter_map(|s| s["id"].as_str().map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_default();
+        .unwrap_or_else(|| panic!("list --json is a bare array: {list}"))
+        .iter()
+        .filter_map(|s| s["id"].as_str().map(str::to_owned))
+        .collect();
     widened.sort();
     assert_eq!(widened, both, "outside a workspace lists every workspace's");
 }

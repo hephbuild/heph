@@ -1,11 +1,14 @@
 use crate::tui::session::SessionSlot;
 use std::sync::Arc;
 
+use anyhow::Context;
 use async_trait::async_trait;
+use std::io::Write;
 
 use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
-use crate::engine::Engine;
+use crate::engine::failure_gc::FailureGcStats;
+use crate::engine::{Engine, GcStats};
 use crate::tui::{self, App, AppContext, LogSink};
 
 #[derive(clap::Args, Clone)]
@@ -30,10 +33,65 @@ pub struct GcArgs {
         default_value_t = 7
     )]
     pub failure_max_age_days: u64,
+    #[command(flatten)]
+    pub out: output::JsonArgs<GcView>,
+}
+
+/// `heph tool gc --json`: what the sweep removed.
+#[derive(Debug, Default, serde::Serialize, output::Record)]
+pub struct GcView {
+    /// Targets whose spec no longer resolves; all their revisions were removed.
+    orphan_targets_removed: usize,
+    /// Cache revisions deleted (orphan drops and history trims).
+    revisions_removed: usize,
+    /// Cache revisions kept on live targets.
+    revisions_kept: usize,
+    /// Bytes freed by the deleted revisions.
+    bytes_removed: u64,
+    /// Targets that could not be processed; each is logged.
+    errored: usize,
+    /// Rows pruned from the filesystem-walk cache.
+    fswalk_rows_removed: usize,
+    /// Staged read-only input entries no surviving revision references.
+    stage_entries_removed: usize,
+    /// Entrypoint invocation sandboxes a killed heph left behind.
+    invoke_sandboxes_removed: usize,
+    /// Run-log directories of hephs that ended without removing them.
+    run_log_dirs_removed: usize,
+    /// Last-failure slots removed (`<home>/failures/`).
+    failure_logs_removed: usize,
+    /// Bytes those failure slots held.
+    failure_log_bytes_removed: u64,
+    /// Scratch caches dropped by the size and age budgets; `null` when the
+    /// sweep failed (logged, never fatal).
+    scratch_caches_removed: Option<usize>,
+    /// Bytes those scratch caches held; `null` when the sweep failed.
+    scratch_bytes_removed: Option<u64>,
+}
+
+impl GcView {
+    fn new(stats: &GcStats, failures: &FailureGcStats, scratch: Option<(usize, u64)>) -> Self {
+        Self {
+            orphan_targets_removed: stats.orphan_targets_removed,
+            revisions_removed: stats.revisions_removed,
+            revisions_kept: stats.revisions_kept,
+            bytes_removed: stats.bytes_removed,
+            errored: stats.errored,
+            fswalk_rows_removed: stats.fswalk_rows_removed,
+            stage_entries_removed: stats.stage_entries_removed,
+            invoke_sandboxes_removed: stats.invoke_sandboxes_removed,
+            run_log_dirs_removed: stats.run_log_dirs_removed,
+            failure_logs_removed: failures.removed,
+            failure_log_bytes_removed: failures.bytes_removed,
+            scratch_caches_removed: scratch.map(|(n, _)| n),
+            scratch_bytes_removed: scratch.map(|(_, bytes)| bytes),
+        }
+    }
 }
 
 struct GcApp {
     engine: Arc<Engine>,
+    out: output::JsonArgs<GcView>,
     fail_fast: bool,
     /// Cap for the whole scratch store; `None` leaves it unbounded.
     scratch_max_bytes: Option<u64>,
@@ -85,13 +143,22 @@ impl App for GcApp {
         // Reported separately and never fatal — reclaiming scratch is an
         // optimization, and failing a GC because one directory would not be
         // removed would be a worse outcome than leaving it.
-        match self
+        let scratch = match self
             .engine
             .scratch_sweep(self.scratch_max_bytes, self.scratch_max_age)
         {
-            Ok((0, _)) => {}
-            Ok((n, freed)) => println!("Swept {n} scratch cache(s), freed {freed} bytes."),
-            Err(err) => tracing::warn!(error = %err, "sweeping scratch caches"),
+            Ok(swept) => Some(swept),
+            Err(err) => {
+                tracing::warn!(error = %err, "sweeping scratch caches");
+                None
+            }
+        };
+        if let Some((n, freed)) = scratch.filter(|&(n, _)| n > 0 && !self.out.enabled()) {
+            writeln!(
+                std::io::stdout(),
+                "Swept {n} scratch cache(s), freed {freed} bytes."
+            )
+            .context("writing the scratch sweep")?;
         }
         // Plugin checksum stamps are keyed by the plugin's path, so a plugin
         // that was removed or moved leaves its stamp behind. Tiny, but nothing
@@ -103,8 +170,17 @@ impl App for GcApp {
             }
         }
         // The progress view renders the sweep summary (TUI final line / CI finish);
-        // no extra print here, which would duplicate it.
-        crate::commands::errors::finalize(&ctx, &rs, res, None, |_stats| Ok(())).await
+        // no extra print here, which would duplicate it. Under the output flags
+        // the record is the summary on stdout; the view's line stays on stderr.
+        let out = self.out;
+        let cancelled = || rs.ctoken().is_cancelled();
+        crate::commands::errors::finalize(&ctx, &rs, res, None, |stats| {
+            if !out.enabled() {
+                return Ok(());
+            }
+            out.record(&GcView::new(&stats, &failures, scratch), &cancelled)
+        })
+        .await
     }
 }
 
@@ -124,8 +200,11 @@ async fn execute_async(
     global: GlobalOptions,
 ) -> anyhow::Result<()> {
     let (engine, shutdown) = bootstrap::new_engine(&global, session)?;
+    // Under the output flags stdout carries the record alone (I1).
+    let interactive = tui::should_use_tui(global.no_tui) && !_args.out.enabled();
     let app = GcApp {
         engine,
+        out: _args.out.clone(),
         fail_fast: global.fail_fast,
         scratch_max_bytes: _args
             .scratch_max_size
@@ -139,12 +218,21 @@ async fn execute_async(
             _args.failure_max_age_days.saturating_mul(24 * 60 * 60),
         ),
     };
-    let interactive = tui::should_use_tui(global.no_tui);
     tui::run_app(app, sink, session, interactive, shutdown).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hcore::units::parse_size;
+
+    #[test]
+    fn record_keys_subset_of_fields() -> anyhow::Result<()> {
+        let view = GcView::new(
+            &GcStats::default(),
+            &FailureGcStats::default(),
+            Some((2, 1024)),
+        );
+        assert_eq!(view.scratch_bytes_removed, Some(1024));
+        output::check_keys(&view)
+    }
 }

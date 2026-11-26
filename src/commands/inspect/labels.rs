@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
-use crate::commands::progress_app::run_engine_command;
+use crate::commands::progress_app::run_engine_command_out;
 use crate::commands::utils::package_matcher_or_all;
 use crate::tui::{BufferedStdout, LogSink};
 
@@ -19,6 +19,15 @@ pub struct Args {
     pub exact: bool,
     #[command(flatten)]
     pub dashboard: crate::commands::progress_app::DashboardArgs,
+    #[command(flatten)]
+    pub out: output::JsonArgs<LabelRow<'static>>,
+}
+
+/// `heph inspect labels --json`: one element per label, sorted.
+#[derive(Debug, serde::Serialize, output::Record)]
+pub struct LabelRow<'a> {
+    /// The label.
+    label: &'a str,
 }
 
 impl Args {
@@ -48,41 +57,50 @@ async fn execute_async(
 ) -> anyhow::Result<()> {
     let matcher = package_matcher_or_all(args.matcher.as_deref())?;
     let source = args.source();
-    run_engine_command(
+    let json = args.out.clone();
+    run_engine_command_out(
         format!("Labels {matcher:?}"),
         sink,
         session,
         &global,
+        &args.out,
         args.dashboard.dashboard,
         move |engine, rs, ctx| async move {
             // Labels are collected across all matched targets, so there is nothing to
             // print until the full set is known; resolving targets records rich
             // failures in `rs`, which `finalize` prefers over the returned error.
-            let out = BufferedStdout::new(&ctx);
             let gaps = crate::engine::Gaps::new(crate::htquery::format(&matcher));
-            let res: anyhow::Result<()> = async {
-                for label in Arc::clone(&engine)
-                    .labels(
-                        rs.clone(),
-                        &matcher,
-                        crate::engine::Discovery::keep_going_unless(rs.fail_fast(), &gaps),
-                        source,
-                    )
-                    .await?
-                {
+            let res = Arc::clone(&engine)
+                .labels(
+                    rs.clone(),
+                    &matcher,
+                    crate::engine::Discovery::keep_going_unless(rs.fail_fast(), &gaps),
+                    source,
+                )
+                .await;
+            // To the log (stderr), never stdout: the label set stays the whole
+            // of the output. A matcher an addr cannot decide was resolved.
+            if res.is_ok() && source == crate::engine::LabelSource::Listed && matcher.is_addr_only()
+            {
+                tracing::info!(
+                    "labels read from provider listings, which may include labels of \
+                     targets that do not exist; --exact prints the exact set"
+                );
+            }
+            if json.enabled() {
+                let cancelled = || rs.ctoken().is_cancelled();
+                return crate::commands::errors::finalize(&ctx, &rs, res, Some(&gaps), |labels| {
+                    let rows = labels.iter().map(|label| LabelRow { label });
+                    crate::commands::utils::json_list(&json, rows, &gaps, &cancelled)
+                })
+                .await;
+            }
+            let out = BufferedStdout::new(&ctx);
+            let res = res.map(|labels| {
+                for label in labels {
                     out.println(label);
                 }
-                // To the log (stderr), never stdout: the label set stays the whole
-                // of the output. A matcher an addr cannot decide was resolved.
-                if source == crate::engine::LabelSource::Listed && matcher.is_addr_only() {
-                    tracing::info!(
-                        "labels read from provider listings, which may include labels of \
-                         targets that do not exist; --exact prints the exact set"
-                    );
-                }
-                Ok(())
-            }
-            .await;
+            });
             out.close().await;
 
             crate::commands::errors::finalize(&ctx, &rs, res, Some(&gaps), |_| Ok(())).await
@@ -110,5 +128,10 @@ mod tests {
         let exact = Cli::try_parse_from(["labels", "--exact", "//foo/..."])?.args;
         assert_eq!(exact.source(), crate::engine::LabelSource::Resolved);
         Ok(())
+    }
+
+    #[test]
+    fn record_keys_subset_of_fields() {
+        output::check_keys(&LabelRow { label: "test" }).unwrap();
     }
 }

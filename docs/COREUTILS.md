@@ -60,6 +60,12 @@ whether heph ships that name and what the host would supply instead — the two
 candidates a target's `PATH` chooses between. `heph tool coreutils run cp -r a b`
 runs one directly, for checking what a flag does.
 
+`list --json` is `{version, upstream, applets}` (`version` is
+`COREUTILS_VERSION`) and `which --json` is `{name, builtin, host}`, `host`
+null when the host has none; both take `--fields` and `--jq`
+(`docs/JSON_OUTPUT.md`). `run` has no JSON form: its output is the applet's,
+and every argument after the applet's name is the applet's.
+
 ## What a target's PATH looks like
 
 `hexecrunner` composes it (see `EXEC_RUNNERS.md`); the driver only contributes a

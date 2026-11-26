@@ -156,9 +156,26 @@ impl SessionSource for FakeSource {
     }
 }
 
+/// The output flags as `--json` gives them, or as none does.
+fn json_args<R: output::Record + 'static>(json: bool) -> output::JsonArgs<R> {
+    if json {
+        output::JsonArgs::try_parse_from(["--json"]).expect("--json parses")
+    } else {
+        output::JsonArgs::default()
+    }
+}
+
+/// A buffer as piped stdout.
+fn piped(w: &mut Vec<u8>) -> Out<'_> {
+    Out {
+        w,
+        style: output::Style::Compact,
+    }
+}
+
 async fn run_list(sources: &[&dyn SessionSource], ws: Workspace<'_>, json: bool) -> String {
     let mut out = Vec::new();
-    list::list(sources, opts(), ws, json, &mut out)
+    list::list(sources, opts(), ws, &json_args(json), piped(&mut out))
         .await
         .expect("list");
     String::from_utf8(out).expect("utf-8")
@@ -166,7 +183,7 @@ async fn run_list(sources: &[&dyn SessionSource], ws: Workspace<'_>, json: bool)
 
 async fn run_show(sources: &[&dyn SessionSource], id: &str, json: bool) -> anyhow::Result<String> {
     let mut out = Vec::new();
-    show::show(sources, opts(), id, json, &mut out).await?;
+    show::show(sources, opts(), id, &json_args(json), piped(&mut out)).await?;
     Ok(String::from_utf8(out).expect("utf-8"))
 }
 
@@ -584,17 +601,16 @@ async fn commands_run_against_any_source() {
     let json: serde_json::Value =
         serde_json::from_str(&run_list(&sources, Workspace::Only("/w/pacu"), true).await)
             .expect("json");
-    assert_eq!(json["version"], 1);
-    let ids: Vec<&str> = json["sessions"]
+    let ids: Vec<&str> = json
         .as_array()
-        .expect("sessions")
+        .expect("a bare array of sessions")
         .iter()
         .map(|s| s["id"].as_str().expect("id"))
         .collect();
     let mut sorted = ids.clone();
     sorted.sort_unstable();
     assert_eq!(ids, sorted, "sorted by id");
-    let a_json = &json["sessions"][0];
+    let a_json = &json[0];
     assert_eq!(a_json["state"], "waiting");
     assert_eq!(a_json["owner_pid"], 100);
     assert_eq!(a_json["started_unix_ms"], T0);
@@ -610,7 +626,7 @@ async fn commands_run_against_any_source() {
     assert_eq!(a_json["progress"]["running_ops"], 0);
     assert_eq!(a_json["panicked"], false);
     assert!(a_json.get("format").is_none(), "only on too-new rows");
-    let b_json = &json["sessions"][1];
+    let b_json = &json[1];
     assert_eq!(b_json["exit_code"], 0);
     assert_eq!(b_json["state"], "ok");
     assert_eq!(b_json["now"], serde_json::Value::Null, "it ended");
@@ -689,15 +705,37 @@ async fn commands_run_against_any_source() {
     assert_eq!(json["chain_root"], serde_json::Value::Null);
     assert_eq!(json["next"]["kind"], "none");
     assert_eq!(json["next"]["command"], serde_json::Value::Null);
+    // The snapshot's own `version` versions `status.json`, not this output.
+    assert!(json.get("version").is_none(), "{json}");
 
     // inflight goes to the source that has the session.
     let mut out = Vec::new();
-    inflight(&sources, opts(), &b.encode(), false, &mut out)
-        .await
-        .expect("inflight");
+    inflight(
+        &sources,
+        opts(),
+        &b.encode(),
+        &json_args(false),
+        piped(&mut out),
+    )
+    .await
+    .expect("inflight");
     assert_eq!(
         String::from_utf8(out).expect("utf-8"),
         format!("in-flight report for {b}\n")
+    );
+    let mut out = Vec::new();
+    inflight(
+        &sources,
+        opts(),
+        &b.encode(),
+        &json_args(true),
+        piped(&mut out),
+    )
+    .await
+    .expect("inflight --json");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&out).expect("json"),
+        serde_json::json!({"id": b.encode(), "report": format!("in-flight report for {b}\n")})
     );
 }
 
@@ -1132,12 +1170,12 @@ async fn show_prints_the_standing_decision() {
         (
             Some(ApprovalStanding::Approve),
             Some("auto-approving (Y) · approval requests are approved without a prompt"),
-            Some("\"approval_standing\": \"approve\""),
+            Some("\"approval_standing\":\"approve\""),
         ),
         (
             Some(ApprovalStanding::Reject),
             Some("auto-rejecting (N) · approval requests are rejected (their targets fail)"),
-            Some("\"approval_standing\": \"reject\""),
+            Some("\"approval_standing\":\"reject\""),
         ),
         (None, None, None),
     ] {
@@ -1272,7 +1310,7 @@ async fn status_lists_are_capped_and_show_has_them_all() {
     // `list` reads only status.json, and still sees every waiter.
     let listed: serde_json::Value =
         serde_json::from_str(&run_list(&sources, Workspace::All, true).await).expect("json");
-    assert_eq!(listed["sessions"][0]["state"], "waiting");
+    assert_eq!(listed[0]["state"], "waiting");
 
     let out = run_show(&sources, &id.encode(), false).await.expect("show");
     assert!(out.contains(&format!("{N} failed")), "{out}");
@@ -1965,7 +2003,7 @@ async fn list_json_says_panicked() {
     let sources: [&dyn SessionSource; 1] = [&source];
     let json: serde_json::Value =
         serde_json::from_str(&run_list(&sources, Workspace::All, true).await).expect("json");
-    let s = &json["sessions"][0];
+    let s = &json[0];
     assert_eq!(s["panicked"], true, "{s}");
     assert_eq!(s["exit_code"], 0);
     assert_eq!(s["state"], "failed");
@@ -1998,13 +2036,14 @@ async fn list_shows_newer_format_placeholder() {
 
     let json: serde_json::Value =
         serde_json::from_str(&run_list(&sources, Workspace::All, true).await).expect("json");
-    assert_eq!(json["sessions"][0]["format"], 999);
-    assert_eq!(json["sessions"][0]["state"], "unknown");
-    assert_eq!(json["sessions"][0]["started_unix_ms"], T0);
+    let s = &json[0];
+    assert_eq!(s["format"], 999);
+    assert_eq!(s["state"], "unknown");
+    assert_eq!(s["started_unix_ms"], T0);
     // Nothing more is read of it: no pid, no progress.
-    assert_eq!(json["sessions"][0]["owner_pid"], serde_json::Value::Null);
-    assert_eq!(json["sessions"][0]["progress"], serde_json::Value::Null);
-    assert_eq!(json["sessions"][0]["panicked"], false);
+    assert_eq!(s["owner_pid"], serde_json::Value::Null);
+    assert_eq!(s["progress"], serde_json::Value::Null);
+    assert_eq!(s["panicked"], false);
 
     let err = run_show(&sources, &id.encode(), false)
         .await
@@ -2063,4 +2102,23 @@ fn attach_refuses_dashboard() {
             "{argv:?}: -D is no global flag"
         );
     }
+}
+
+#[test]
+fn inflight_record_keys_subset_of_fields() -> anyhow::Result<()> {
+    output::check_keys(&InflightView {
+        id: "id".to_owned(),
+        report: "report",
+    })
+}
+
+/// A `--jq` failure keeps the output layer's exit code instead of becoming
+/// this command's own 125.
+#[test]
+fn jq_failure_keeps_its_exit_code() {
+    let e = wrap_exit(Err(output::OutputError::JqRuntime("boom".to_owned()).into()))
+        .expect_err("still an error");
+    assert_eq!(output::exit_code(&e), Some(2));
+    let e = wrap_exit(Err(anyhow::anyhow!("no such session"))).expect_err("an error");
+    assert_eq!(exit_code(&e), Some(SessionExit::OWN_FAILURE));
 }

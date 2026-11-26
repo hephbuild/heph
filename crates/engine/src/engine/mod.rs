@@ -73,7 +73,7 @@ pub use states::{PackageStates, StatesOptions};
 mod remote_cache_latency;
 mod remote_cache_objstore;
 pub use hplugin::provider;
-pub use remote_cache::{RemoteCacheDef, RemoteCacheSet};
+pub use remote_cache::{CacheLatency, RemoteCacheDef, RemoteCacheSet};
 mod deppath;
 pub mod query;
 pub mod request_state;

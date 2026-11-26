@@ -2,9 +2,10 @@
 //! `codegen = copy` target writes into the tree, and to the managed section of
 //! the root `.gitignore` (spec: codegen file index, Commands).
 //!
-//! Each subcommand's logic is a `pub async fn` returning a report (text, JSON
-//! and exit code), so a test can drive it in-process against a real engine;
-//! the clap layer only parses, runs it inside the TUI app and prints.
+//! Each subcommand's logic is a `pub async fn` returning a report (text, the
+//! `--json` record and exit code), so a test can drive it in-process against
+//! a real engine; the clap layer only parses, runs it inside the TUI app and
+//! prints.
 //!
 //! Exit codes are 0 / 1 / 2 (Decision 20), unlike every other heph command:
 //! `--check` must tell findings from failures. A command ends in a typed
@@ -25,7 +26,7 @@ use clap::Subcommand;
 
 use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
-use crate::commands::progress_app::run_engine_command_json;
+use crate::commands::progress_app::run_engine_command_out;
 use crate::engine::Engine;
 use crate::engine::request_state::RequestState;
 use crate::tui::{BufferedStdout, LogSink};
@@ -34,9 +35,6 @@ pub use paths::{ResolvedPath, resolve_path, root_hint, with_hint};
 
 /// The `--help` epilogue every codegen subcommand carries.
 pub const EXIT_CODES_HELP: &str = "Exit codes:\n  0  OK\n  1  findings (--check), or a refused or unknown path\n  2  error; a usage error (an unknown flag, a missing argument) also exits 2";
-
-/// The `--json` schema version of every codegen command.
-pub const JSON_SCHEMA: u32 = 1;
 
 /// How a codegen command ended, when not with 0. `main.rs` exits with
 /// `code`; `error`, when set, is rendered first (any failure that is not a
@@ -76,12 +74,11 @@ impl std::fmt::Display for CodegenExit {
 
 impl std::error::Error for CodegenExit {}
 
-/// What a codegen command prints and how it exits.
-pub trait Report: Send + 'static {
+/// What a codegen command prints and how it exits. The report itself is the
+/// `--json` record: every codegen command is record-shaped.
+pub trait Report: serde::Serialize + output::Record<Static = Self> + Send + Sync + 'static {
     /// The human output, one entry per line.
     fn text(&self) -> Vec<String>;
-    /// The `--json` document (`{"schema": 1, ...}`).
-    fn json(&self) -> serde_json::Value;
     /// 0 or 1; a failure is an `Err`, not a report.
     fn exit_code(&self) -> u8;
 }
@@ -167,10 +164,12 @@ impl CodegenArgs {
     }
 }
 
-/// Any error that is not already a [`CodegenExit`] becomes one with code 2.
+/// Any error that is not already a [`CodegenExit`], or an output failure
+/// that decides its own code (a `--jq` runtime error), becomes one with
+/// code 2.
 pub fn wrap_exit(res: anyhow::Result<()>) -> anyhow::Result<()> {
     res.map_err(|e| {
-        if e.downcast_ref::<CodegenExit>().is_some() {
+        if e.downcast_ref::<CodegenExit>().is_some() || output::exit_code(&e).is_some() {
             e
         } else {
             CodegenExit::failed(e).into()
@@ -179,10 +178,10 @@ pub fn wrap_exit(res: anyhow::Result<()>) -> anyhow::Result<()> {
 }
 
 /// The removed `heph tool gen-gitignore`: kept only to fail (Decision 7).
+/// It has no output flags; `rest` swallows an old `--json` too, so every
+/// invocation reaches the message.
 #[derive(clap::Args, Clone, Debug)]
 pub struct RemovedGenGitignoreArgs {
-    #[arg(long)]
-    pub json: bool,
     /// Accepted and ignored, so an old invocation reaches the message.
     #[arg(hide = true, num_args = 0.., trailing_var_arg = true, allow_hyphen_values = true)]
     pub rest: Vec<String>,
@@ -191,31 +190,20 @@ pub struct RemovedGenGitignoreArgs {
 /// The message the removed command fails with.
 pub const GEN_GITIGNORE_REMOVED: &str = "heph tool gen-gitignore was removed; use heph tool codegen gitignore (and --check for the up-to-date test)";
 
-/// `heph tool gen-gitignore`: prints the removal and exits 2.
-pub fn removed_gen_gitignore(args: &RemovedGenGitignoreArgs) -> anyhow::Result<()> {
-    if args.json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "schema": JSON_SCHEMA,
-                "error": "command_removed",
-                "use": "heph tool codegen gitignore",
-            })
-        );
-        return Err(CodegenExit {
-            code: 2,
-            error: None,
-        }
-        .into());
-    }
+/// `heph tool gen-gitignore`: the removal on stderr, exit 2, nothing on
+/// stdout.
+pub fn removed_gen_gitignore(_args: &RemovedGenGitignoreArgs) -> anyhow::Result<()> {
     Err(CodegenExit::failed(anyhow::anyhow!(GEN_GITIGNORE_REMOVED)).into())
 }
 
 /// Run `job` as a codegen command: bootstrap the engine, run it inside the
-/// TUI app, print its report, and end with its exit code.
+/// TUI app, print its report (the text, or the record under the output
+/// flags), and end with its exit code. Findings (exit 1) print their record
+/// too; a failure (exit 2) prints nothing on stdout, and `main` renders it on
+/// stderr.
 fn run_cli<R, F, Fut>(
     title: &'static str,
-    json: bool,
+    out: &output::JsonArgs<R>,
     dashboard: bool,
     sink: LogSink,
     session: &Arc<SessionSlot>,
@@ -227,30 +215,31 @@ where
     F: FnOnce(Arc<Engine>, Arc<RequestState>) -> Fut + Send + 'static,
     Fut: Future<Output = anyhow::Result<R>> + Send + 'static,
 {
-    let res = bootstrap::block_on(run_engine_command_json(
+    let json = out.clone();
+    bootstrap::block_on(run_engine_command_out(
         title,
         sink,
         session,
         global,
-        json,
+        out,
         dashboard,
         move |engine, rs, ctx| async move {
-            let out = BufferedStdout::new(&ctx);
             let res = job(Arc::clone(&engine), rs.clone()).await;
             let code = match &res {
+                Ok(report) if json.enabled() => {
+                    let cancelled = || rs.ctoken().is_cancelled();
+                    json.record(report, &cancelled).map(|()| report.exit_code())
+                }
                 Ok(report) => {
-                    if json {
-                        out.println(report.json().to_string());
-                    } else {
-                        for line in report.text() {
-                            out.println(line);
-                        }
+                    let text = BufferedStdout::new(&ctx);
+                    for line in report.text() {
+                        text.println(line);
                     }
+                    text.close().await;
                     Ok(report.exit_code())
                 }
                 Err(_) => Ok(0),
             };
-            out.close().await;
             let res = res.and(code);
             crate::commands::errors::finalize(&ctx, &rs, res, None, |code| {
                 if code == 0 {
@@ -262,29 +251,7 @@ where
             .await
         },
     ))
-    .and_then(|r| r);
-    // The app has ended (and `--json` never takes the TUI), so stdout is
-    // ours. The error is still rendered on stderr by `main`.
-    if json && let Some(doc) = json_error(&res) {
-        println!("{doc}");
-    }
-    res
-}
-
-/// The `--json` document for a run that failed (exit 2): `{"schema": 1,
-/// "error": "<message>"}`, so a consumer of stdout never reads an empty
-/// document. `None` for success and for findings (exit 1), which printed
-/// their report, and for an exit that already printed its own document.
-fn json_error(res: &anyhow::Result<()>) -> Option<serde_json::Value> {
-    let err = res.as_ref().err()?;
-    let message = match err.downcast_ref::<CodegenExit>() {
-        Some(exit) => match &exit.error {
-            Some(e) if exit.code >= 2 => format!("{e:#}"),
-            _ => return None,
-        },
-        None => format!("{err:#}"),
-    };
-    Some(serde_json::json!({ "schema": JSON_SCHEMA, "error": message }))
+    .and_then(|r| r)
 }
 
 /// Run a blocking job on the blocking pool.
@@ -467,34 +434,208 @@ mod tests {
         assert_eq!(c.code, 2);
         assert!(format!("{e}").contains("boom"));
         assert!(wrap_exit(Ok(())).is_ok());
+
+        // A `--jq` runtime error keeps its own code: 2 on every command, so
+        // it is never read as `--check`'s findings.
+        let jq: anyhow::Result<()> = Err(anyhow::Error::from(output::OutputError::JqRuntime(
+            "boom".into(),
+        ))
+        .context("printing"));
+        let e = wrap_exit(jq).unwrap_err();
+        assert!(e.downcast_ref::<CodegenExit>().is_none());
+        assert_eq!(output::exit_code(&e), Some(2));
+    }
+
+    fn status_report() -> status::StatusReport {
+        let item = |kind, path: Option<&str>, package: Option<&str>| status::StatusItem {
+            kind,
+            path: path.map(str::to_string),
+            addr: path.map(|_| "//p:gen".to_string()),
+            output: path.map(|_| "out".to_string()),
+            fix: "fix it".to_string(),
+            detail: "detail".to_string(),
+            package: package.map(str::to_string),
+            error: package.map(|_| "boom".to_string()),
+        };
+        status::StatusReport {
+            check: true,
+            items: vec![
+                item(status::ItemKind::Modified, Some("p/a.go"), None),
+                item(status::ItemKind::Unresolved, None, Some("//q")),
+            ],
+            hint: Some("run import".to_string()),
+        }
+    }
+
+    fn gitignore_report() -> gitignore::GitignoreReport {
+        gitignore::GitignoreReport {
+            check: false,
+            stale: true,
+            reasons: vec![
+                crate::engine::gitignore::StaleReason::Lines,
+                crate::engine::gitignore::StaleReason::OldMarker,
+            ],
+            written: true,
+            lines: vec![gitignore::LineChange {
+                added: true,
+                pattern: "/p/a.go".to_string(),
+                addr: Some("//p:gen".to_string()),
+            }],
+            released: vec![gitignore::Released {
+                path: "p/old.go".to_string(),
+                addr: "//p:gen".to_string(),
+            }],
+            entries: 1,
+            gitignore: std::path::PathBuf::from(".gitignore"),
+        }
+    }
+
+    fn paths_report() -> keep::PathsReport {
+        keep::PathsReport {
+            results: vec![keep::PathResult {
+                path: "p/a.go".to_string(),
+                result: keep::PathResultKind::WouldDiscard,
+                reason: None,
+            }],
+            lines_removed: vec![crate::engine::gitignore::GitignoreEntry {
+                pattern: "/p/a.go".to_string(),
+                addr: Some(crate::htaddr::parse_addr("//p:gen").expect("addr")),
+            }],
+            also_released: vec!["p/b.go".to_string()],
+            dry_run: true,
+            git_add: false,
+        }
+    }
+
+    fn why_report() -> why::WhyReport {
+        why::WhyReport {
+            items: vec![why::WhyItem {
+                path: "p/a.go".to_string(),
+                result: keep::PathResultKind::Explained,
+                reason: None,
+                status: Some("generated"),
+                status_reason: Some("recorded"),
+                row: Some(why::WhyRow {
+                    path: "p/a.go".to_string(),
+                    addr: "//p:gen".to_string(),
+                    output: None,
+                    state: "written",
+                    written_at: Some(7),
+                    pending: false,
+                    verified: "stat",
+                }),
+                section_line: Some(why::WhyLine {
+                    line: 3,
+                    pattern: "/p/a.go".to_string(),
+                    heph_wrote: true,
+                    negated: false,
+                }),
+            }],
+            hint: None,
+        }
+    }
+
+    /// The record `--json` prints for `report`, compact, parsed back.
+    fn printed<R: Report>(report: &R) -> anyhow::Result<serde_json::Value> {
+        let mut buf = Vec::new();
+        output::JsonArgs::<R>::try_parse_from(["--json"])?
+            .printer_to(&mut buf, output::Style::Compact)
+            .record(report, &output::never_cancelled)?;
+        Ok(serde_json::from_slice(&buf)?)
     }
 
     #[test]
-    fn json_error_only_for_a_failure() {
-        let failed: anyhow::Result<()> =
-            Err(anyhow::anyhow!("opening the index").context("codegen status"));
+    fn record_keys_subset_of_fields() -> anyhow::Result<()> {
+        output::check_keys(&status_report())?;
+        output::check_keys(&gitignore_report())?;
+        output::check_keys(&paths_report())?;
+        output::check_keys(&why_report())?;
+        output::check_keys(&import::ImportReport {
+            recorded: 1,
+            skipped: 2,
+            unchanged: 3,
+            supported: true,
+        })
+    }
+
+    /// The records keep the documents' keys, minus the `schema` envelope
+    /// (docs/CODEGEN.md).
+    #[test]
+    fn records_keep_the_document_keys() -> anyhow::Result<()> {
         assert_eq!(
-            json_error(&failed),
-            Some(serde_json::json!({
-                "schema": 1,
-                "error": "codegen status: opening the index",
-            }))
+            printed(&status_report())?,
+            serde_json::json!({
+                "items": [
+                    {"path": "p/a.go", "kind": "modified", "addr": "//p:gen", "output": "out", "fix": "fix it"},
+                    {"kind": "unresolved", "package": "//q", "error": "boom", "fix": "fix it"},
+                ],
+                "hint": "run import",
+            })
         );
-        let wrapped: anyhow::Result<()> = Err(CodegenExit::failed(anyhow::anyhow!("boom")).into());
         assert_eq!(
-            json_error(&wrapped),
-            Some(serde_json::json!({ "schema": 1, "error": "boom" }))
+            printed(&status::StatusReport::default())?,
+            serde_json::json!({ "items": [] }),
+            "no hint key without a hint"
         );
-        // Findings printed their report; an exit with no error its own
-        // document.
-        assert_eq!(json_error(&Err(CodegenExit::findings().into())), None);
-        let silent: anyhow::Result<()> = Err(CodegenExit {
-            code: 2,
-            error: None,
-        }
-        .into());
-        assert_eq!(json_error(&silent), None);
-        assert_eq!(json_error(&Ok(())), None);
+        assert_eq!(
+            printed(&gitignore_report())?,
+            serde_json::json!({
+                "stale": true,
+                "reasons": ["lines", "old_marker"],
+                "written": true,
+                "lines": [{"op": "add", "pattern": "/p/a.go", "addr": "//p:gen"}],
+                "released": [{"path": "p/old.go", "addr": "//p:gen"}],
+            })
+        );
+        assert_eq!(
+            printed(&paths_report())?,
+            serde_json::json!({
+                "results": [{"path": "p/a.go", "result": "would_discard", "reason": null}],
+                "lines": [{"op": "remove", "pattern": "/p/a.go", "addr": "//p:gen"}],
+                "released": ["p/b.go"],
+            })
+        );
+        assert_eq!(
+            printed(&why_report())?,
+            serde_json::json!({
+                "results": [{
+                    "path": "p/a.go", "result": "explained", "reason": null,
+                    "status": "generated", "status_reason": "recorded",
+                    "row": {"path": "p/a.go", "addr": "//p:gen", "output": null, "state": "written",
+                            "written_at": 7, "pending": false, "verified": "stat"},
+                    "section_line": {"line": 3, "pattern": "/p/a.go", "heph_wrote": true, "negated": false},
+                }],
+            })
+        );
+        assert_eq!(
+            printed(&import::ImportReport {
+                recorded: 412,
+                skipped: 3,
+                unchanged: 0,
+                supported: true,
+            })?,
+            serde_json::json!({ "recorded": 412, "skipped": 3, "unchanged": 0 })
+        );
+        Ok(())
+    }
+
+    /// `--check` findings still print their record and exit 1, and a `--jq`
+    /// filter that fails at runtime is exit 2, never read as findings.
+    #[test]
+    fn jq_runtime_error_is_not_findings() -> anyhow::Result<()> {
+        let report = status_report();
+        assert_eq!(report.exit_code(), 1);
+        let mut buf = Vec::new();
+        let err =
+            output::JsonArgs::<status::StatusReport>::try_parse_from(["--jq", ".items | error"])?
+                .printer_to(&mut buf, output::Style::Compact)
+                .record(&report, &output::never_cancelled)
+                .unwrap_err();
+        assert_eq!(
+            output::exit_code(&wrap_exit(Err(err)).unwrap_err()),
+            Some(2)
+        );
+        Ok(())
     }
 
     #[test]

@@ -1439,7 +1439,7 @@ fn flush_blocking() {
 }
 
 /// Why telemetry is off; empty when it is on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, output_derive::Shape)]
 #[serde(rename_all = "snake_case")]
 pub enum DisabledBy {
     /// `HEPH_DISABLE_TELEMETRY` is set.
@@ -1449,7 +1449,7 @@ pub enum DisabledBy {
 }
 
 /// How this process would deliver its events.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, output_derive::Shape)]
 #[serde(rename_all = "snake_case")]
 pub enum FlushMode {
     /// Spooled, and sent by a detached `heph __telemetry-flush` once due.
