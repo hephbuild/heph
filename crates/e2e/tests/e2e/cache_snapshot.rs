@@ -111,7 +111,7 @@ fn outcomes(events: &[BuildEvent]) -> Vec<(String, CacheOutcomeKind)> {
     events
         .iter()
         .filter_map(|e| match &e.kind {
-            BuildEventKind::CacheOutcome { addr, outcome } => Some((addr.clone(), *outcome)),
+            BuildEventKind::CacheOutcome { addr, outcome, .. } => Some((addr.clone(), *outcome)),
             _ => None,
         })
         .collect()

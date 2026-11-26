@@ -42,10 +42,12 @@ use super::{RecordedRevision, WorkingSet, working_set_dir};
 use crate::engine::Engine;
 use crate::engine::cache_codec;
 use crate::engine::local_cache::{
-    LocalCache, MANIFEST_V1, MANIFEST_V2, Manifest, ManifestArtifactEncoding, ManifestArtifactType,
-    NotFoundError,
+    LocalCache, MANIFEST_V1, MANIFEST_V2, MANIFEST_V3, Manifest, ManifestArtifactEncoding,
+    ManifestArtifactType, NotFoundError,
 };
-use crate::engine::remote_cache::{RemoteCacheSet, RemoteManifest, RemoteManifestArtifact};
+use crate::engine::remote_cache::{
+    REMOTE_MANIFEST, RemoteCacheSet, RemoteManifest, RemoteManifestArtifact,
+};
 use anyhow::Context as _;
 use futures::StreamExt as _;
 use hcore::hasync::Cancellable;
@@ -196,7 +198,8 @@ pub enum LeftOut {
     /// case-insensitive filesystem.
     CaseCollision,
     /// A blob is stored in an encoding the snapshot does not carry (gzip, or
-    /// a v1 blob that is not raw).
+    /// a v1 blob that is not raw), or the revision declares host paths, which
+    /// keep it on this host.
     Unsupported,
     /// A previous-generation entry under a manifest name this heph does not
     /// export, or one whose manifest does not decode.
@@ -438,8 +441,8 @@ fn index_generation(root: &Path) -> anyhow::Result<PrevIndex> {
         if manifests.is_empty() {
             continue;
         }
-        let entry = if manifests.iter().any(|m| m == MANIFEST_V2) {
-            read_prev_manifest(&dir.join(MANIFEST_V2), &rel, bytes)
+        let entry = if manifests.iter().any(|m| m == REMOTE_MANIFEST) {
+            read_prev_manifest(&dir.join(REMOTE_MANIFEST), &rel, bytes)
         } else {
             PrevEntry {
                 revision: None,
@@ -570,7 +573,12 @@ fn reference(cache: &Arc<dyn LocalCache>, job: &Job) -> Result<Reference, (LeftO
                 local_names,
             })
         }
-        MANIFEST_V2 => Ok(Reference {
+        // A revision that declares host paths is valid only on a host that has
+        // them, so it never leaves this one, as the upload refuses it.
+        MANIFEST_V3 if !local.host_paths.is_empty() => Err((LeftOut::Unsupported, decoded)),
+        // `from_local` names each blob as the remote does: a v3 one under its
+        // v2 name, which the local cache stores behind the v3 prefix.
+        MANIFEST_V2 | MANIFEST_V3 => Ok(Reference {
             manifest: RemoteManifest::from_local(&local, &job.hashin),
             local_names: local
                 .artifacts
@@ -733,7 +741,7 @@ fn export_revision(
     {
         return Ok(Placed::LeftOut(LeftOut::Unsupported, decoded));
     }
-    let manifest_key = RemoteCacheSet::key(&job.addr, &job.hashin, MANIFEST_V2);
+    let manifest_key = RemoteCacheSet::key(&job.addr, &job.hashin, REMOTE_MANIFEST);
     let mut folded: FxHashSet<String> = FxHashSet::default();
     folded.insert(manifest_key.to_lowercase());
     if !carried
@@ -1192,7 +1200,7 @@ mod tests {
     use crate::engine::cache_snapshot::{Incomplete, JournalContents, MARKER_FILE};
     use crate::engine::cache_test_support::{addr, test_engine};
     use crate::engine::local_cache::{
-        MANIFEST_V2_VERSION, ManifestArtifact, ManifestArtifactContentType,
+        MANIFEST_V2_VERSION, ManifestArtifact, ManifestArtifactContentType, ManifestV2,
     };
     use crate::engine::remote_cache::Need;
     use hcore::hasync::StdCancellationToken;
@@ -1240,6 +1248,7 @@ mod tests {
             created_at_nanos: 1,
             hashin: hashin.to_string(),
             artifacts,
+            host_paths: Vec::new(),
         }
     }
 
@@ -1252,14 +1261,22 @@ mod tests {
         w.commit().expect("commit");
     }
 
+    /// Write `m` as the manifest `name`, in that name's layout: a v1 or v2
+    /// one has no host paths.
     fn put_manifest(engine: &Engine, addr: &Addr, hashin: &str, name: &str, m: &Manifest) {
-        put_bytes(
-            engine,
-            addr,
-            hashin,
-            name,
-            &borsh::to_vec(m).expect("encode"),
-        );
+        let bytes = if name == MANIFEST_V3 {
+            borsh::to_vec(m)
+        } else {
+            assert!(m.host_paths.is_empty(), "a {name} has no host paths");
+            borsh::to_vec(&ManifestV2 {
+                version: m.version.clone(),
+                target: m.target.clone(),
+                created_at_nanos: m.created_at_nanos,
+                hashin: m.hashin.clone(),
+                artifacts: m.artifacts.clone(),
+            })
+        };
+        put_bytes(engine, addr, hashin, name, &bytes.expect("encode"));
         assert!(
             engine
                 .local_cache
@@ -1615,6 +1632,42 @@ mod tests {
         assert_eq!(m.artifacts[0].name, "o.raw");
         assert_eq!(
             std::fs::read(gen_dir.join(RemoteCacheSet::key(&v1, "h", "o.raw"))).expect("blob"),
+            b"data"
+        );
+    }
+
+    /// A v3 revision, whose local names carry the v3 prefix, goes in under
+    /// the remote's v2 names, as the upload stores it. One that declares host
+    /// paths never leaves this host: it is left out.
+    #[tokio::test]
+    async fn a_v3_revision_goes_in_under_v2_names_unless_it_declares_host_paths() {
+        let (engine, _home) = test_engine();
+        let dir = snapshot_dir();
+        let (v3, host) = (addr("v3"), addr("host"));
+        let b = raw("o", b"data");
+        let local = cache_codec::v3_entry_name("o", &ManifestArtifactEncoding::None);
+        for a in [&v3, &host] {
+            put_bytes(&engine, a, "h", &local, b"data");
+        }
+        let mut m = manifest(&v3, "h", vec![artifact(local.clone(), &b)]);
+        m.version = crate::engine::local_cache::MANIFEST_V3_VERSION.to_string();
+        put_manifest(&engine, &v3, "h", MANIFEST_V3, &m);
+        let mut hm = manifest(&host, "h", vec![artifact(local, &b)]);
+        hm.version = crate::engine::local_cache::MANIFEST_V3_VERSION.to_string();
+        hm.host_paths = vec!["/nix/store/x".to_string()];
+        put_manifest(&engine, &host, "h", MANIFEST_V3, &hm);
+
+        let report = export(&engine, dir.path(), &ws(&[(&v3, "h"), (&host, "h")])).await;
+        assert_eq!(report.new.count, 1, "{report:?}");
+        assert_eq!(left(&report, LeftOut::Unsupported), 1, "{report:?}");
+        assert!(!has(dir.path(), &host, "h"));
+        let gen_dir = current(dir.path());
+        let bytes = std::fs::read(gen_dir.join(RemoteCacheSet::key(&v3, "h", REMOTE_MANIFEST)))
+            .expect("remote manifest");
+        let rm: RemoteManifest = borsh::from_slice(&bytes).expect("decode");
+        assert_eq!(rm.artifacts[0].name, "o.raw");
+        assert_eq!(
+            std::fs::read(gen_dir.join(RemoteCacheSet::key(&v3, "h", "o.raw"))).expect("blob"),
             b"data"
         );
     }

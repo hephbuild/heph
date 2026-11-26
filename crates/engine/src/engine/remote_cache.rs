@@ -1761,7 +1761,7 @@ impl RemoteCacheSet {
         };
         let dir = generation.join(Self::addr_prefix(addr));
         hcore::blocking::run(move || {
-            let manifest = key_segment(MANIFEST_V2);
+            let manifest = key_segment(REMOTE_MANIFEST);
             let other_hashin = std::fs::read_dir(&dir).is_ok_and(|entries| {
                 entries
                     .filter_map(Result::ok)
