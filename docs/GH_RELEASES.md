@@ -219,7 +219,9 @@ the network stays in `http_fetch`:
 The release JSON is not cached: its bytes change with every download (they
 carry download counts), and an asset uploaded again gets a new id under the
 same name. That is one API call per private asset per build. The targets below
-it still hit the cache while the URL it resolves to is unchanged.
+it still hit the cache while the URL it resolves to is unchanged. It also has
+no `sha256`, and `http_fetch` does not warn about an unpinned fetch that is
+not cached, so pinning the asset is enough to build without a warning.
 
 The credential is a netrc presentation for the API host (`docs/CREDENTIALS.md`),
 the token as the password. GitHub ignores the login, but netrc needs one:

@@ -66,8 +66,9 @@ struct HttpFetchSpec {
     #[spec(required)]
     url: Deferred<String>,
     /// Expected SHA-256 of the downloaded bytes (hex). Omitted → the file is
-    /// fetched **unverified** (the driver warns): the target is then only as
-    /// reproducible as the remote server.
+    /// fetched **unverified**: the target is then only as reproducible as the
+    /// remote server. The driver warns unless `cache = False`, which already
+    /// declares the content volatile.
     #[spec(ty = ParamType::String)]
     sha256: Option<String>,
     /// Output filename, relative to the target's package. Defaults to the URL's
@@ -348,10 +349,11 @@ impl ManagedDriver for Driver {
             ctoken,
         )
         .await;
-        fetched.map_err(|err| match refusal_hint(&err, selected.as_ref()) {
+        let unpinned = fetched.map_err(|err| match refusal_hint(&err, selected.as_ref()) {
             Some(hint) => err.context(hint),
             None => err,
         })?;
+        warn_if_unpinned(&url, unpinned.as_deref(), req.request.target.cache.enabled);
 
         Ok(ManagedRunResponse::default())
     }
@@ -417,7 +419,7 @@ async fn fetch_until_cancelled(
     executable: bool,
     dest: &std::path::Path,
     ctoken: &(dyn Cancellable + Send + Sync),
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<String>> {
     match fetch(
         url,
         opts,
@@ -428,7 +430,8 @@ async fn fetch_until_cancelled(
     )
     .await
     {
-        Ok(Fetched::Done) => Ok(()),
+        Ok(Fetched::Done) => Ok(None),
+        Ok(Fetched::Unpinned(got)) => Ok(Some(got)),
         Ok(Fetched::Cancelled) => anyhow::bail!("http_fetch: {url} cancelled"),
         Err(err) => Err(err).with_context(|| format!("fetch {url}")),
     }
@@ -437,7 +440,10 @@ async fn fetch_until_cancelled(
 /// How [`fetch`] ended, when it did not fail.
 #[derive(Debug, PartialEq, Eq)]
 enum Fetched {
+    /// The bytes matched the expected `sha256`.
     Done,
+    /// No `sha256` was expected; the bytes landed unverified and hash to this.
+    Unpinned(String),
     /// The cancel signal fired first. Nothing is left at `dest`.
     Cancelled,
 }
@@ -589,15 +595,18 @@ async fn fetch(
         }
         Err(err) => Err(err),
     };
-    if let Err(err) = verified {
-        remove_partial(dest);
-        return Err(err);
-    }
+    let fetched = match verified {
+        Ok(fetched) => fetched,
+        Err(err) => {
+            remove_partial(dest);
+            return Err(err);
+        }
+    };
 
     if executable {
         set_executable(dest).with_context(|| format!("chmod +x {dest:?}"))?;
     }
-    Ok(Fetched::Done)
+    Ok(fetched)
 }
 
 /// How many batches of the body may wait for the file writer, on top of the
@@ -776,28 +785,66 @@ fn set_executable(_dest: &std::path::Path) -> anyhow::Result<()> {
 }
 
 /// Compare the fetched bytes' `got` SHA-256 against the `expected` one. An empty
-/// `expected` (no `sha256` on the target) fetches **unverified** — allowed, but
-/// warned: the target's output is then whatever the server serves today. A
-/// mismatch fails closed.
-fn verify_checksum(expected: &str, got: &str, url: &str) -> anyhow::Result<()> {
+/// `expected` (no `sha256` on the target) fetches **unverified**:
+/// [`Fetched::Unpinned`], which the caller may warn about (see
+/// [`warn_if_unpinned`]). A mismatch fails closed.
+fn verify_checksum(expected: &str, got: &str, url: &str) -> anyhow::Result<Fetched> {
     if expected.is_empty() {
-        tracing::warn!(
-            url,
-            got,
-            "http_fetch: downloading {url} without checksum verification — set `sha256` on the \
-             target to pin its content (the fetched bytes hash to {got})"
-        );
-        return Ok(());
+        return Ok(Fetched::Unpinned(got.to_owned()));
     }
     if got != expected {
         anyhow::bail!("http_fetch: checksum mismatch for {url}: expected {expected}, got {got}");
     }
-    Ok(())
+    Ok(Fetched::Done)
+}
+
+/// Warn that `url` was fetched unverified, when it was (`unpinned` holds the
+/// bytes' hash) and the target is cached: a cached unpinned fetch stores
+/// whatever the server served that day as the target's content.
+///
+/// An uncached one (`cache = False`) is not warned about. It declares itself
+/// volatile and is fetched again on every run — the release JSON behind a
+/// private `heph.gh.release_asset`, which changes with every download count
+/// and so cannot be pinned. Warning there would fire on every run and suggest
+/// a pin that breaks the next one.
+///
+/// Returns whether it warned.
+fn warn_if_unpinned(url: &str, unpinned: Option<&str>, cached: bool) -> bool {
+    let Some(got) = unpinned.filter(|_| cached) else {
+        return false;
+    };
+    tracing::warn!(
+        url,
+        got,
+        "http_fetch: downloading {url} without checksum verification — set `sha256` on the \
+         target to pin its content (the fetched bytes hash to {got})"
+    );
+    true
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An unpinned fetch warns only when it is cached: an uncached one (the
+    /// release JSON behind a private `heph.gh.release_asset`) runs on every
+    /// build and cannot be pinned, so warning there fires on every build.
+    #[test]
+    fn warns_about_an_unpinned_fetch_only_when_it_is_cached() {
+        let cases = [
+            (Some("abc"), true, true),
+            (Some("abc"), false, false),
+            (None, true, false),
+            (None, false, false),
+        ];
+        for (unpinned, cached, want) in cases {
+            assert_eq!(
+                warn_if_unpinned("https://x/a", unpinned, cached),
+                want,
+                "unpinned={unpinned:?} cached={cached}"
+            );
+        }
+    }
     use hcore::hasync::StdCancellationToken;
     use hcore::htvalue::Value;
     use hmodel::htaddr::parse_addr;
@@ -882,7 +929,8 @@ mod tests {
         let dest = dir.path().join("tool");
         let url = serve("200 OK", BODY, 1);
 
-        // Checksum unset → fetched unverified (warns); the bytes still land.
+        // Checksum unset → fetched unverified, reporting the bytes' hash; the
+        // bytes still land.
         let fetched = fetch(
             &url,
             Default::default(),
@@ -893,7 +941,8 @@ mod tests {
         )
         .await
         .expect("fetch");
-        assert_eq!(fetched, Fetched::Done);
+        let (sha, _len) = hfetch::sha256_hex_of(BODY).expect("hash");
+        assert_eq!(fetched, Fetched::Unpinned(sha));
 
         assert_eq!(std::fs::read(&dest).expect("read"), BODY);
         #[cfg(unix)]
