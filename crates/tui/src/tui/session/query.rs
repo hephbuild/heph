@@ -247,15 +247,240 @@ SELECT substr(addr, 1, instr(addr, ':') - 1) AS package,
 FROM targets WHERE outcome IN ('ran', 'hit', 'failed')
 GROUP BY package ORDER BY hit_pct, targets DESC, package",
     },
+    WAITING_BY_LOAD,
+    RESOURCES_VS_MACHINE,
 ];
+
+/// The waiting split (D29), which `heph session show` runs too: each
+/// `waiting`-class span's time, cut at the CPU samples, as busy, spare or
+/// unknown by the sample whose interval covers it.
+///
+/// Sample `i` covers `(t[i-1], t[i]]`. It is busy at CPU busy ≥
+/// [`super::machine::THRESHOLD_CPU`] or memory used ≥
+/// [`super::machine::THRESHOLD_MEMORY`] of the limit, spare when both are
+/// known and below, and unknown otherwise: before the first sample, across a
+/// gap over 2 s, with a busy value outside 0–1 (NaN is stored as NULL), or
+/// with memory unread. Samples sharing a time are one, the busier.
+///
+/// No range join, so no index is needed: each span end is matched to the
+/// first sample at or after it by a running count over one sorted timeline,
+/// and the split of `[s, e]` is the difference of two running totals. The
+/// `(name, time_us)` index serves the three metric reads when it exists.
+///
+/// The `+` in `+w.start_us AS s` is load-bearing: it strips the column's
+/// INTEGER affinity, so `a.x = w.s` compares like `b.x = w.e` and SQLite's
+/// automatic index on the marks can look the start up by `x`. Without it,
+/// each wait scanned every mark of its session: 50k waits took minutes
+/// (`waiting_split_uses_index` checks the plan).
+pub const WAITING_BY_LOAD: Recipe = Recipe {
+    name: "waiting_by_load",
+    purpose: "Was the machine the limit while work waited, by waiting phase?",
+    notes: &[
+        "Busy: CPU busy at 0.9 or more, or memory used at 95% of the limit or more,",
+        "in the sample covering the time. Spare: below both. Unknown: no sample",
+        "covers it (before the first, after the last, across a gap over 2 s).",
+        "Microseconds summed across targets, so concurrent waits add up.",
+        "The catalog keeps no machine samples, and the spans of ran targets only:",
+        "over it every wait reads unknown. Use --full or --from.",
+    ],
+    sql: "\
+WITH busy AS (
+  SELECT session_id, time_us AS t, max(value) AS cpu
+  FROM metrics WHERE name = 'heph.machine.cpu.busy'
+  GROUP BY session_id, time_us
+), used AS (
+  SELECT session_id, time_us AS t, max(value) AS used
+  FROM metrics WHERE name = 'heph.machine.memory.used'
+  GROUP BY session_id, time_us
+), mem AS (
+  SELECT session_id, max(value) AS mem_limit
+  FROM metrics WHERE name = 'heph.machine.memory.limit'
+  GROUP BY session_id
+), intervals AS (
+  SELECT b.session_id, b.t, b.cpu, u.used, m.mem_limit,
+         lag(b.t) OVER (PARTITION BY b.session_id ORDER BY b.t) AS prev
+  FROM busy b
+  LEFT JOIN used u ON u.session_id = b.session_id AND u.t = b.t
+  LEFT JOIN mem m ON m.session_id = b.session_id
+), loads AS (
+  SELECT session_id, t, t - prev AS len,
+         CASE
+           WHEN prev IS NULL OR t - prev > 2000000
+             OR cpu IS NULL OR cpu < 0 OR cpu > 1 THEN 0
+           WHEN cpu >= 0.9 THEN 1
+           WHEN used IS NULL OR mem_limit IS NULL OR used < 0 OR mem_limit <= 0 THEN 0
+           WHEN 100 * used >= 95 * mem_limit THEN 1
+           ELSE 2
+         END AS load
+  FROM intervals
+), cum AS (
+  SELECT session_id, t, load,
+         sum(CASE load WHEN 1 THEN len ELSE 0 END) OVER w AS busy_to,
+         sum(CASE load WHEN 2 THEN len ELSE 0 END) OVER w AS spare_to,
+         count(*) OVER (PARTITION BY session_id ORDER BY t DESC) AS nth
+  FROM loads WINDOW w AS (PARTITION BY session_id ORDER BY t)
+), waits AS (
+  SELECT w.session_id,
+         CASE WHEN substr(w.name, 1, 5) = 'heph.' THEN substr(w.name, 6) ELSE w.name END
+           AS phase,
+         +w.start_us AS s, coalesce(w.end_us, max(w.start_us, l.t)) AS e
+  FROM spans w
+  LEFT JOIN (SELECT session_id, t FROM cum WHERE nth = 1) l ON l.session_id = w.session_id
+  WHERE w.class = 'waiting' AND w.start_us IS NOT NULL
+), points AS (
+  SELECT session_id, s AS x, 0 AS sample FROM waits WHERE e > s
+  UNION SELECT session_id, e, 0 FROM waits WHERE e > s
+  UNION SELECT session_id, t, 1 FROM cum
+), ranked AS (
+  SELECT session_id, x, sample,
+         sum(sample) OVER (PARTITION BY session_id ORDER BY x DESC, sample DESC
+                           ROWS UNBOUNDED PRECEDING) AS nth
+  FROM points
+), marks AS (
+  SELECT r.session_id, r.x,
+         coalesce(c.busy_to - CASE c.load WHEN 1 THEN c.t - r.x ELSE 0 END,
+                  f.busy_to, 0) AS busy_at,
+         coalesce(c.spare_to - CASE c.load WHEN 2 THEN c.t - r.x ELSE 0 END,
+                  f.spare_to, 0) AS spare_at
+  FROM ranked r
+  LEFT JOIN cum c ON c.session_id = r.session_id AND c.nth = r.nth
+  LEFT JOIN cum f ON f.session_id = r.session_id AND f.nth = 1
+  WHERE r.sample = 0
+)
+SELECT w.session_id, w.phase,
+       sum(b.busy_at - a.busy_at) AS busy_us,
+       sum(b.spare_at - a.spare_at) AS spare_us,
+       sum(w.e - w.s - (b.busy_at - a.busy_at) - (b.spare_at - a.spare_at)) AS unknown_us
+FROM waits w
+JOIN marks a ON a.session_id = w.session_id AND a.x = w.s
+JOIN marks b ON b.session_id = w.session_id AND b.x = w.e
+WHERE w.e > w.s
+GROUP BY w.session_id, w.phase
+ORDER BY w.session_id, w.phase",
+};
+
+/// Declared resources against the machine (D30), which `heph session show`
+/// runs too: over each sample interval, the `cpu` pool's held fraction
+/// (held over capacity) against `heph.machine.cpu.busy`, and the `memory`
+/// pool's against `heph.machine.memory.used` over the limit.
+///
+/// An interval is **declared above use** when held is at 0.9 or more and the
+/// machine under 0.5, **use above declared** when the machine is at 0.9 or
+/// more and held under 0.5, and **matched** otherwise. Fractions are
+/// compared, never amounts: a pool's capacity can differ from the machine's
+/// CPUs (`-j`, `.hephconfig`). Held is the time-weighted mean of the pool's
+/// rows over the interval (a row holds until the next, the last until the
+/// end), rounded to 10⁻⁶ so float noise cannot move a value across a
+/// threshold. The rest of the session is **unknown**: before the pool's
+/// first row, before the first sample, across a gap over 2 s, after the
+/// source stopped, or with a machine value outside what heph writes. Other
+/// pools have no machine counterpart and no row.
+///
+/// No range join, as in [`WAITING_BY_LOAD`]: pool rows and samples are one
+/// timeline per (session, pool), and each sample reads the running area
+/// under the held fraction from the last pool row before it, so the mean
+/// over an interval is a difference of two areas.
+pub const RESOURCES_VS_MACHINE: Recipe = Recipe {
+    name: "resources_vs_machine",
+    purpose: "Do the declared resources match what the machine used, by pool?",
+    notes: &[
+        "Declared above use: the pool at 90% held or more while the machine is under 50%.",
+        "Use above declared: the machine at 90% or more while the pool is under 50% held.",
+        "Matched: the rest. Unknown: no sample or no pool row covers the time.",
+        "cpu against CPU busy, memory against memory used over RAM. Other pools have no row.",
+        "The catalog keeps no machine samples: over it everything reads unknown.",
+        "Use --full or --from.",
+    ],
+    sql: "\
+WITH pool AS (
+  SELECT session_id, pool, time_us AS x, held FROM (
+    SELECT session_id, json_extract(attributes, '$.\"heph.pool\"') AS pool, time_us,
+           1.0 * max(CASE name WHEN 'heph.pool.held' THEN value END)
+             / max(CASE name WHEN 'heph.pool.capacity' THEN value END) AS held
+    FROM metrics WHERE name IN ('heph.pool.held', 'heph.pool.capacity')
+    GROUP BY session_id, pool, time_us)
+  WHERE pool IN ('cpu', 'memory') AND held >= 0
+), area AS (
+  SELECT session_id, pool, x, held,
+         coalesce(sum(held * (nx - x)) OVER (PARTITION BY session_id, pool ORDER BY x
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0) AS area
+  FROM (SELECT *, lead(x) OVER (PARTITION BY session_id, pool ORDER BY x) AS nx FROM pool)
+), machine AS (
+  SELECT session_id, 'cpu' AS pool, time_us AS x,
+         CASE WHEN max(value) BETWEEN 0 AND 1 THEN max(value) END AS m
+  FROM metrics WHERE name = 'heph.machine.cpu.busy'
+  GROUP BY session_id, time_us
+  UNION ALL
+  SELECT u.session_id, 'memory', u.x,
+         CASE WHEN u.used >= 0 AND l.mem_limit > 0 THEN 1.0 * u.used / l.mem_limit END
+  FROM (SELECT session_id, time_us AS x, max(value) AS used
+        FROM metrics WHERE name = 'heph.machine.memory.used'
+        GROUP BY session_id, time_us) u
+  LEFT JOIN (SELECT session_id, max(value) AS mem_limit
+             FROM metrics WHERE name = 'heph.machine.memory.limit'
+             GROUP BY session_id) l ON l.session_id = u.session_id
+), timeline AS (
+  SELECT session_id, pool, x, 0 AS kind, held, area, NULL AS m FROM area
+  UNION ALL
+  SELECT session_id, pool, x, 1, NULL, NULL, m FROM machine
+), grouped AS (
+  SELECT *, sum(1 - kind) OVER (PARTITION BY session_id, pool ORDER BY x, kind
+                                ROWS UNBOUNDED PRECEDING) AS grp
+  FROM timeline
+), samples AS (
+  SELECT session_id, pool, x AS t, kind, m,
+         first_value(area) OVER g
+           + first_value(held) OVER g * (x - first_value(x) OVER g) AS f
+  FROM grouped
+  WINDOW g AS (PARTITION BY session_id, pool, grp ORDER BY x, kind)
+), intervals AS (
+  SELECT session_id, pool, t, m, f,
+         lag(t) OVER w AS prev, lag(f) OVER w AS fprev
+  FROM samples WHERE kind = 1
+  WINDOW w AS (PARTITION BY session_id, pool ORDER BY t)
+), bounds AS (
+  SELECT p.session_id, p.pool, p.fx, s.started_ms * 1000 AS a,
+         coalesce(s.ended_ms * 1000, p.last) AS b
+  FROM (SELECT session_id, pool, min(CASE kind WHEN 0 THEN x END) AS fx, max(x) AS last
+        FROM timeline GROUP BY session_id, pool) p
+  JOIN sessions s ON s.session_id = p.session_id
+  WHERE p.fx IS NOT NULL
+), pieces AS (
+  SELECT i.session_id, i.pool, i.m,
+         max(0, min(i.t, b.b) - max(i.prev, b.fx, b.a)) AS len,
+         round((i.f - CASE WHEN i.prev >= b.fx THEN i.fprev ELSE 0 END)
+               / (i.t - max(i.prev, b.fx)), 6) AS held
+  FROM intervals i
+  JOIN bounds b ON b.session_id = i.session_id AND b.pool = i.pool
+  WHERE i.t - i.prev <= 2000000 AND i.m IS NOT NULL AND i.t > b.fx
+)
+SELECT b.session_id, b.pool,
+       coalesce(sum(CASE WHEN c.held >= 0.9 AND c.m < 0.5 THEN c.len END), 0)
+         AS declared_above_use_us,
+       coalesce(sum(CASE WHEN c.m >= 0.9 AND c.held < 0.5 THEN c.len END), 0)
+         AS use_above_declared_us,
+       coalesce(sum(CASE WHEN c.held >= 0.9 AND c.m < 0.5 THEN 0
+                         WHEN c.m >= 0.9 AND c.held < 0.5 THEN 0
+                         ELSE c.len END), 0) AS matched_us,
+       max(b.b - b.a, 0) - coalesce(sum(c.len), 0) AS unknown_us
+FROM bounds b
+LEFT JOIN pieces c ON c.session_id = b.session_id AND c.pool = b.pool
+GROUP BY b.session_id, b.pool
+ORDER BY b.session_id, b.pool",
+};
 
 /// The explorer names the catalog holds: it keeps no logs.
 const CATALOG_HOLDS: &[&str] = &["sessions", "spans", "span_events", "metrics", "targets"];
 /// What the catalog holds of a table only in part (`coverage.partial`):
-/// the spans of what ran, not of cache hits, and no logs.
+/// the spans of what ran, not of cache hits; the machine's start-time
+/// figures and session summaries, not its samples (D25); and no logs.
 const CATALOG_PARTIAL: &[(&str, &str)] = &[
     ("spans", "ran targets only"),
     ("span_events", "ran targets only"),
+    (
+        "metrics",
+        "machine samples not kept; start-time figures and summaries only",
+    ),
     ("logs", "not kept"),
 ];
 /// The tables whose rows the catalog leaves out for a session over its cap.

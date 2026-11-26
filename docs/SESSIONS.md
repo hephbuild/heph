@@ -188,8 +188,9 @@ started in it, none of one started before it.
 
 The SQL is the argument, `-` reads it from stdin, `-f FILE` from a file.
 `--schema` prints the six tables with a line per column, the schema
-version and the [built-in recipes](#built-in-recipes) as runnable SQL, and
-runs nothing.
+version, the [machine metric names](#machine-stats) with their kind, unit
+and OTLP mapping, and the [built-in recipes](#built-in-recipes) as runnable
+SQL, and runs nothing.
 
 **Read-only by construction.** The statement is prepared first against
 empty copies of the six tables: more than one statement, any write
@@ -241,7 +242,10 @@ line:
   `sessions` and `targets` rows are whole. `partial` names each table read
   from the catalog that it holds only in part, with what is missing:
   `"spans"` and `"span_events"` are `"ran targets only"` (a cache hit's
-  spans are not kept), `"logs"` is `"not kept"`, and with `capped` above 0,
+  spans are not kept), `"metrics"` is `"machine samples not kept; summaries
+  only"` (the catalog copies the `heph.session.*` summaries and the
+  start-time figures, never the per-sample rows), `"logs"` is `"not kept"`,
+  and with `capped` above 0,
   `"spans"`, `"span_events"` and `"metrics"` also say `"none for N
   session(s) over the catalog's cap"`; `{}` when nothing read is partial,
   and always for `--full` and `--from`. A non-empty `partial` is also one
@@ -433,7 +437,9 @@ heph.session                     root, span_id 1; trace id derived from the sess
     no result is open: a generated file kept out of a glob.
   - On the session span: `heph.lock.holder_seen`, once per pid the first
     time this run sees it holding a lock it waits on; `heph.truncated` at
-    each cap the recording passed (full cap, then ceiling).
+    each cap the recording passed (full cap, then ceiling);
+    `heph.sampler.stopped`, once per machine-stats source that stopped
+    (see [Machine stats](#machine-stats)).
   - `heph.approval.prompt` and `heph.approval.cleared`, on the session span.
     An `Approval` record is written each time the approval banner's state
     changes: the pending prompt (its queue of targets) or the standing Y/N
@@ -456,7 +462,9 @@ heph.session                     root, span_id 1; trace id derived from the sess
   after they all closed (a second request in the same process) counts again.
   A pool's unit comes from `RequestConfig.units`: a `cpu`
   pool in CPUs (`{cpu}`, the engine's micro-CPUs over 10^6), a `bytes` pool in
-  `By`, anything else `1`.
+  `By`, anything else `1`. The machine's own figures, `heph.machine.*`,
+  `heph.process.*` and their `heph.session.*` summaries, are listed under
+  [Machine stats](#machine-stats).
 - **Views**: `logs` (`Log` and `Output` records: `session_id`, `seq`,
   `time_us`, `severity`, `body`), `sessions` (the session row as resource
   attributes, plus `schema_version`), and `targets` (`session_id`, `addr`,
@@ -483,6 +491,7 @@ heph.session                     root, span_id 1; trace id derived from the sess
 | `heph.lock.holder_pid`, `heph.lock.holder_session` | `heph.lock.holder_seen` event | the holder's pid, and its session id when known |
 | `heph.pool` | `heph.pool.*`, `heph.session.pool.*` metrics | the pool's name |
 | `heph.outcome` | `heph.session.results` metric | `ran`, `hit`, `failed`, `cancelled` |
+| `heph.sampler.source`, `heph.sampler.error` | `heph.sampler.stopped` event | the metric the stopped source fed (or `sampler` when the sampler did not start), and why |
 
 The trace id is the first 16 bytes of SHA-256 over `heph.trace.v1:`
 followed by the session id; a span id is written as its 8-byte big-endian
@@ -513,6 +522,8 @@ recordings are kept, 7 days by default.
 | `uncovered_wall` | `session_id`, `wall_s`, `target_s` (wall time with at least one `target`-class span open, overlaps counted once), `uncovered_pct` (the rest, as a share of the wall); ended sessions only |
 | `phase_percentiles` | `class`, `name`, `n`, `p50_ms`, `p90_ms`, `p99_ms` (nearest rank), `max_ms` |
 | `hit_rate_by_package` | `package`, `targets` (resolved: ran, hit or failed; cancelled ones are left out), `hits`, `hit_pct`; lowest rate first |
+| `waiting_by_load` | `session_id`, `phase` (the waiting phase, its span name without heph.), `busy_us`, `spare_us`, `unknown_us` (span-microseconds summed across targets, split by the machine sample covering them: ten targets waiting the same second count 10 s, so a phase's total can exceed the session's wall time; `show` prints the same split on its machine line) |
+| `resources_vs_machine` | `session_id`, `pool` (`cpu` or `memory`: the pools with a machine counterpart), `declared_above_use_us`, `use_above_declared_us`, `matched_us`, `unknown_us` (wall-clock microseconds of the session, each counted once, so the four add up to the session's duration; split by the pool's held fraction against the machine's over each sample interval; `show` prints the same totals under the pool's line) |
 
 ```sql
 -- time_by_phase: Where did time go, by class and phase (busy time, not wall time)?
@@ -572,12 +583,179 @@ SELECT substr(addr, 1, instr(addr, ':') - 1) AS package,
        round(100.0 * sum(outcome = 'hit') / count(*), 1) AS hit_pct
 FROM targets WHERE outcome IN ('ran', 'hit', 'failed')
 GROUP BY package ORDER BY hit_pct, targets DESC, package;
+
+-- waiting_by_load: Was the machine the limit while work waited, by waiting phase?
+-- Busy: CPU busy at 0.9 or more, or memory used at 95% of the limit or more,
+-- in the sample covering the time. Spare: below both. Unknown: no sample
+-- covers it (before the first, after the last, across a gap over 2 s).
+-- Microseconds summed across targets, so concurrent waits add up.
+-- The catalog keeps no machine samples, and the spans of ran targets only:
+-- over it every wait reads unknown. Use --full or --from.
+WITH busy AS (
+  SELECT session_id, time_us AS t, max(value) AS cpu
+  FROM metrics WHERE name = 'heph.machine.cpu.busy'
+  GROUP BY session_id, time_us
+), used AS (
+  SELECT session_id, time_us AS t, max(value) AS used
+  FROM metrics WHERE name = 'heph.machine.memory.used'
+  GROUP BY session_id, time_us
+), mem AS (
+  SELECT session_id, max(value) AS mem_limit
+  FROM metrics WHERE name = 'heph.machine.memory.limit'
+  GROUP BY session_id
+), intervals AS (
+  SELECT b.session_id, b.t, b.cpu, u.used, m.mem_limit,
+         lag(b.t) OVER (PARTITION BY b.session_id ORDER BY b.t) AS prev
+  FROM busy b
+  LEFT JOIN used u ON u.session_id = b.session_id AND u.t = b.t
+  LEFT JOIN mem m ON m.session_id = b.session_id
+), loads AS (
+  SELECT session_id, t, t - prev AS len,
+         CASE
+           WHEN prev IS NULL OR t - prev > 2000000
+             OR cpu IS NULL OR cpu < 0 OR cpu > 1 THEN 0
+           WHEN cpu >= 0.9 THEN 1
+           WHEN used IS NULL OR mem_limit IS NULL OR used < 0 OR mem_limit <= 0 THEN 0
+           WHEN 100 * used >= 95 * mem_limit THEN 1
+           ELSE 2
+         END AS load
+  FROM intervals
+), cum AS (
+  SELECT session_id, t, load,
+         sum(CASE load WHEN 1 THEN len ELSE 0 END) OVER w AS busy_to,
+         sum(CASE load WHEN 2 THEN len ELSE 0 END) OVER w AS spare_to,
+         count(*) OVER (PARTITION BY session_id ORDER BY t DESC) AS nth
+  FROM loads WINDOW w AS (PARTITION BY session_id ORDER BY t)
+), waits AS (
+  SELECT w.session_id,
+         CASE WHEN substr(w.name, 1, 5) = 'heph.' THEN substr(w.name, 6) ELSE w.name END
+           AS phase,
+         +w.start_us AS s, coalesce(w.end_us, max(w.start_us, l.t)) AS e
+  FROM spans w
+  LEFT JOIN (SELECT session_id, t FROM cum WHERE nth = 1) l ON l.session_id = w.session_id
+  WHERE w.class = 'waiting' AND w.start_us IS NOT NULL
+), points AS (
+  SELECT session_id, s AS x, 0 AS sample FROM waits WHERE e > s
+  UNION SELECT session_id, e, 0 FROM waits WHERE e > s
+  UNION SELECT session_id, t, 1 FROM cum
+), ranked AS (
+  SELECT session_id, x, sample,
+         sum(sample) OVER (PARTITION BY session_id ORDER BY x DESC, sample DESC
+                           ROWS UNBOUNDED PRECEDING) AS nth
+  FROM points
+), marks AS (
+  SELECT r.session_id, r.x,
+         coalesce(c.busy_to - CASE c.load WHEN 1 THEN c.t - r.x ELSE 0 END,
+                  f.busy_to, 0) AS busy_at,
+         coalesce(c.spare_to - CASE c.load WHEN 2 THEN c.t - r.x ELSE 0 END,
+                  f.spare_to, 0) AS spare_at
+  FROM ranked r
+  LEFT JOIN cum c ON c.session_id = r.session_id AND c.nth = r.nth
+  LEFT JOIN cum f ON f.session_id = r.session_id AND f.nth = 1
+  WHERE r.sample = 0
+)
+SELECT w.session_id, w.phase,
+       sum(b.busy_at - a.busy_at) AS busy_us,
+       sum(b.spare_at - a.spare_at) AS spare_us,
+       sum(w.e - w.s - (b.busy_at - a.busy_at) - (b.spare_at - a.spare_at)) AS unknown_us
+FROM waits w
+JOIN marks a ON a.session_id = w.session_id AND a.x = w.s
+JOIN marks b ON b.session_id = w.session_id AND b.x = w.e
+WHERE w.e > w.s
+GROUP BY w.session_id, w.phase
+ORDER BY w.session_id, w.phase;
+
+-- resources_vs_machine: Do the declared resources match what the machine used, by pool?
+-- Declared above use: the pool at 90% held or more while the machine is under 50%.
+-- Use above declared: the machine at 90% or more while the pool is under 50% held.
+-- Matched: the rest. Unknown: no sample or no pool row covers the time.
+-- cpu against CPU busy, memory against memory used over RAM. Other pools have no row.
+-- The catalog keeps no machine samples: over it everything reads unknown.
+-- Use --full or --from.
+WITH pool AS (
+  SELECT session_id, pool, time_us AS x, held FROM (
+    SELECT session_id, json_extract(attributes, '$."heph.pool"') AS pool, time_us,
+           1.0 * max(CASE name WHEN 'heph.pool.held' THEN value END)
+             / max(CASE name WHEN 'heph.pool.capacity' THEN value END) AS held
+    FROM metrics WHERE name IN ('heph.pool.held', 'heph.pool.capacity')
+    GROUP BY session_id, pool, time_us)
+  WHERE pool IN ('cpu', 'memory') AND held >= 0
+), area AS (
+  SELECT session_id, pool, x, held,
+         coalesce(sum(held * (nx - x)) OVER (PARTITION BY session_id, pool ORDER BY x
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0) AS area
+  FROM (SELECT *, lead(x) OVER (PARTITION BY session_id, pool ORDER BY x) AS nx FROM pool)
+), machine AS (
+  SELECT session_id, 'cpu' AS pool, time_us AS x,
+         CASE WHEN max(value) BETWEEN 0 AND 1 THEN max(value) END AS m
+  FROM metrics WHERE name = 'heph.machine.cpu.busy'
+  GROUP BY session_id, time_us
+  UNION ALL
+  SELECT u.session_id, 'memory', u.x,
+         CASE WHEN u.used >= 0 AND l.mem_limit > 0 THEN 1.0 * u.used / l.mem_limit END
+  FROM (SELECT session_id, time_us AS x, max(value) AS used
+        FROM metrics WHERE name = 'heph.machine.memory.used'
+        GROUP BY session_id, time_us) u
+  LEFT JOIN (SELECT session_id, max(value) AS mem_limit
+             FROM metrics WHERE name = 'heph.machine.memory.limit'
+             GROUP BY session_id) l ON l.session_id = u.session_id
+), timeline AS (
+  SELECT session_id, pool, x, 0 AS kind, held, area, NULL AS m FROM area
+  UNION ALL
+  SELECT session_id, pool, x, 1, NULL, NULL, m FROM machine
+), grouped AS (
+  SELECT *, sum(1 - kind) OVER (PARTITION BY session_id, pool ORDER BY x, kind
+                                ROWS UNBOUNDED PRECEDING) AS grp
+  FROM timeline
+), samples AS (
+  SELECT session_id, pool, x AS t, kind, m,
+         first_value(area) OVER g
+           + first_value(held) OVER g * (x - first_value(x) OVER g) AS f
+  FROM grouped
+  WINDOW g AS (PARTITION BY session_id, pool, grp ORDER BY x, kind)
+), intervals AS (
+  SELECT session_id, pool, t, m, f,
+         lag(t) OVER w AS prev, lag(f) OVER w AS fprev
+  FROM samples WHERE kind = 1
+  WINDOW w AS (PARTITION BY session_id, pool ORDER BY t)
+), bounds AS (
+  SELECT p.session_id, p.pool, p.fx, s.started_ms * 1000 AS a,
+         coalesce(s.ended_ms * 1000, p.last) AS b
+  FROM (SELECT session_id, pool, min(CASE kind WHEN 0 THEN x END) AS fx, max(x) AS last
+        FROM timeline GROUP BY session_id, pool) p
+  JOIN sessions s ON s.session_id = p.session_id
+  WHERE p.fx IS NOT NULL
+), pieces AS (
+  SELECT i.session_id, i.pool, i.m,
+         max(0, min(i.t, b.b) - max(i.prev, b.fx, b.a)) AS len,
+         round((i.f - CASE WHEN i.prev >= b.fx THEN i.fprev ELSE 0 END)
+               / (i.t - max(i.prev, b.fx)), 6) AS held
+  FROM intervals i
+  JOIN bounds b ON b.session_id = i.session_id AND b.pool = i.pool
+  WHERE i.t - i.prev <= 2000000 AND i.m IS NOT NULL AND i.t > b.fx
+)
+SELECT b.session_id, b.pool,
+       coalesce(sum(CASE WHEN c.held >= 0.9 AND c.m < 0.5 THEN c.len END), 0)
+         AS declared_above_use_us,
+       coalesce(sum(CASE WHEN c.m >= 0.9 AND c.held < 0.5 THEN c.len END), 0)
+         AS use_above_declared_us,
+       coalesce(sum(CASE WHEN c.held >= 0.9 AND c.m < 0.5 THEN 0
+                         WHEN c.m >= 0.9 AND c.held < 0.5 THEN 0
+                         ELSE c.len END), 0) AS matched_us,
+       max(b.b - b.a, 0) - coalesce(sum(c.len), 0) AS unknown_us
+FROM bounds b
+LEFT JOIN pieces c ON c.session_id = b.session_id AND c.pool = b.pool
+GROUP BY b.session_id, b.pool
+ORDER BY b.session_id, b.pool;
 ```
 
 Over the catalog, `hit_rate_by_package` counts hits from `targets`, which
-keeps them; the other three read `spans`, which the catalog keeps only for
-targets that ran (`--full` reads every recording instead). Their comment
-says so, and `query --format json` names those tables in
+keeps them; the other four read `spans`, which the catalog keeps only for
+targets that ran (`--full` reads every recording instead).
+`waiting_by_load` and `resources_vs_machine` read the machine samples in
+`metrics`, which the catalog does not keep at all, so over it every wait,
+and every pool's whole session, reads unknown. Their comment says so, and
+`query --format json` names `spans` (and, for those two, `metrics`) in
 `coverage.partial`.
 
 The recipes are not part of the explorer contract (I9). A release may
@@ -602,18 +780,197 @@ ORDER BY s.started_ms DESC;
 from the `heph.session.pool.*` metrics and the last `heph.pool.capacity`:
 
 ```
+cpu pool (capacity 8): held 7.6 mean while in use (95%), 8 peak; something was waiting for 5m40s
+  against the machine: 6m12s with the pool 90%+ held while the machine was under 50%, 1m00s in step, 2.0s not compared (no sample); targets may declare more CPU than they use: consider lowering their `resources`
 docker pool (capacity 4): held 3 mean while in use (75%), 4 peak; something was waiting for 1s
-cpu pool (capacity 8): held 7.6 mean while in use (95%), 8 peak; nothing waited for it
 ```
 
 "While in use": the mean is over the pool's in-use window, from its first
 row to the session's end. "Something was waiting" is `waiting_us`, the time
-with at least one request queued, not the sum of every request's wait.
+with at least one request queued, not the sum of every request's wait. The
+advice to lower a pool's `resources` comes only when something waited for
+it: with nothing queued, declaring more than is used held nothing back.
+
+The indented "against the machine" line is the
+[`resources_vs_machine`](#built-in-recipes) recipe's totals for that pool,
+the non-zero ones: the session's wall time, split by the pool's held
+fraction against the machine's over each sample interval. Only `cpu`
+(against CPU busy) and `memory` (against memory used over RAM) have a
+machine counterpart; any other pool has no second line. Each phrase is one
+`--json` field:
+
+| Words | `--json` field | Meaning |
+| --- | --- | --- |
+| with the pool 90%+ held while the machine was under 50% | `declared_above_use_us` | targets reserved most of the pool and the machine sat mostly idle |
+| with the machine 90%+ while the pool was under 50% held | `use_above_declared_us` | the machine was loaded while little of the pool was reserved |
+| in step | `matched_us` | the rest of the time compared |
+| not compared (no sample) | `unknown_us` | before the pool's first row or the first sample, across a gap over 2 s, or after the source stopped |
+
+When one of the first two covers over half the time compared (unknown time
+left out), the line ends with what to try: lower the targets' `resources`
+for the first, raise them (or look for other work on the machine) for the
+second. See [Machine stats](#machine-stats).
 
 A live session has none yet (the rows come at its end), and neither does a
 build that admitted nothing (an all-hit build). These rows are read from
 events the engine already emits; nothing flows back into admission, a
 target, or a hash.
+
+### Machine stats
+
+A recording samples the machine once a second, so a slow build can be read
+against what the machine was doing: out of CPU, short of memory, or neither.
+
+| Name | Kind | Unit | Value | OTLP export |
+| --- | --- | --- | --- | --- |
+| `heph.machine.cpu.count` | gauge | `{cpu}` | once, at start: logical CPUs online | `system.cpu.logical.count`, up-down counter |
+| `heph.machine.cpu.limit` | gauge | `{cpu}` | once, at start: the CPUs heph may use; the cgroup v2 `cpu.max` quota on Linux when one is tighter, else `cpu.count` | as named |
+| `heph.machine.cpu.busy` | gauge | `1` | each sample: busy share of `cpu.limit` over the interval since the previous sample, 0–1 | as named |
+| `heph.machine.memory.limit` | gauge | `By` | once, at start: physical RAM | `system.memory.limit`, up-down counter |
+| `heph.machine.memory.used` | gauge | `By` | each sample: memory that cannot be reclaimed without swapping | as named |
+| `heph.process.cpu.time` | counter | `s` | each sample: heph's own user + system time, cumulative | `process.cpu.time`, counter |
+| `heph.process.memory.resident` | gauge | `By` | each sample: heph's resident set | `process.memory.usage`, up-down counter |
+| `heph.session.machine.cpu.busy.mean`, `.peak` | gauge | `1` | at the end; absent with no busy sample | as named |
+| `heph.session.machine.memory.used.peak`, `heph.session.process.memory.resident.peak` | gauge | `By` | at the end | as named |
+
+The names carry no attributes and are frozen, with their kind and unit,
+from the first release that contains them (I9). `query --schema` prints
+this table. The OTLP export renames only where a semantic convention
+(v1.27.0) means the same thing. One deviation: `process.cpu.time` is
+exported as one series, user and system time together, without the
+convention's `process.cpu.state` attribute.
+
+One name means the same thing on each OS, read from a different source
+(below), so compare figures within an OS rather than across:
+
+- `memory.used` is approximate, and the two OSes approximate differently.
+  Linux counts `MemTotal − MemAvailable`; macOS counts what Activity
+  Monitor calls Memory Used (app, wired and compressed pages). The same
+  build can read a few GiB apart on the two.
+- `cpu.limit` is the cgroup v2 quota on Linux when one is tighter than the
+  CPU count; macOS has no quota, so it is always the CPU count there.
+- `memory.limit` is the host's physical RAM on both. heph reads no memory
+  cgroup: inside a container with a `memory.max`, the limit and
+  `memory.used` are the host's, so a build close to its container's limit
+  can read as spare. Read `memory.used` against the container's own limit
+  there.
+
+- **Sources.** Linux: the first line of `/proc/stat`, `/proc/meminfo`
+  (`MemTotal − MemAvailable`) and `/proc/self/statm`; under a cgroup v2
+  quota, the cgroup's `cpu.stat`. macOS: `host_processor_info` (CPU
+  ticks, summed over the CPUs), `host_statistics64` (memory), `task_info`
+  and `hw.memsize`, memory used as Activity Monitor's Memory Used. A
+  source that fails stops for the rest of the run and becomes one
+  `heph.sampler.stopped` event; the others go on, and nothing stops the
+  build.
+- **Records.** One `MachineInfo` at start, one `MachineSample` a tick. They
+  are not critical: past the 256 MiB cap they are dropped like `Log` lines.
+  A recording shorter than one tick has no busy row and no CPU summary.
+- **Cost.** One thread, one record and four rows a second, written in the
+  recorder's existing flush. `--raw` starts no sampler; a private session
+  samples. The catalog keeps the three start-time rows (`cpu.count`,
+  `cpu.limit`, `memory.limit`) and the four summaries, never the samples;
+  a catalog query reading `metrics` says so in `coverage.partial`. The
+  first `show` of a kept recording builds its `(name, time_us)` index on
+  `metrics`, since the waiting split reads samples by name, as a first
+  `query` does: about a megabyte per hour recorded, written once.
+- **Clocks (a known limit).** Samples are stamped from the recorder's start
+  plus a monotonic offset; spans from the engine's own anchors (per request
+  and per target run); pool rows from the wall clock when each was emitted.
+  A wall-clock step during the build, or a suspend (a monotonic clock does
+  not advance while the machine sleeps), shifts the samples against spans
+  and pool rows by that amount, and both splits misattribute the time after
+  it.
+- **Nothing flows back.** No figure reaches a hash, a target, admission or a
+  `${resource:…}` allotment.
+
+`show` prints one machine line, then the admission hint when it applies,
+then a line per source that stopped:
+
+```
+machine: 8 CPUs (host), 16.0 GiB RAM (host); CPU busy 65% mean, 95% peak; memory used 12.0 GiB peak (75% of RAM); heph resident 200.0 MiB peak; waiting: admission 0.2s (0.2s busy), deps 1.0s (0.5s spare, 0.5s unknown)
+```
+
+```
+machine: 2.5 CPUs (quota, of 8), 16.0 GiB RAM (host); CPU busy 50% mean, 75% peak; heph resident 100.0 MiB peak
+the sampler stopped reading heph.machine.memory.used 1s into the run: no MemAvailable in /proc/meminfo
+```
+
+When admission waited over 1 s, more than half of it with the machine to
+spare, an indented line says what held the targets back:
+
+```
+machine: 8 CPUs (host), 16.0 GiB RAM (host); CPU busy 30% mean, 30% peak; memory used 4.0 GiB peak (25% of RAM); heph resident 100.0 MiB peak; waiting: admission 2.5s (2.0s spare, 0.5s unknown)
+  admission waited 2.0s of 2.5s with the machine to spare: the pools' capacity or the targets' declared `resources` held them back, not the machine
+```
+
+With nothing sampled the line opens `none:` and says why, then whatever
+start-time figures there are. A machine figure never changes the build's
+outcome, so none of these is a failure of the run:
+
+| Line | `--json` `status` / `reason` | Meaning |
+| --- | --- | --- |
+| `machine: none: recorded before machine stats (no machine record)` | `none` / `older_derivation` | a heph without machine stats recorded it; re-deriving it cannot add what was never sampled |
+| `machine: none: no samples (shorter than one tick); 8 CPUs (host), …` | `none` / `no_samples` | the run ended before the first sample |
+| `machine: none: the sampler's sources stopped before a sample (see below); …` | `failed` | every source failed; the lines below say why |
+| `machine: none: the sampler did not start (see below)` | `failed` | followed by `the sampler did not start: <error> (build unaffected; no machine data recorded)` |
+
+`older_derivation` means exactly "no machine record": a recording from a heph
+with machine stats that lost its `MachineInfo` before it was read reads the
+same way.
+
+**Waiting, split.** Each `waiting` span (`heph.admission`, `heph.deps`,
+`heph.lock_wait`, `heph.scratch`) is cut at the samples. A piece is **busy**
+when its sample has CPU busy at 0.9 or more, or memory used at 95% of RAM or
+more; **spare** when both are known and below; **unknown** where no sample
+covers it (before the first, after the sampler stopped, past the cap, across
+a gap over 2 s). Totals are span time summed across targets, so concurrent
+waits add up: ten targets queued for the same second count 10 s, and a
+phase's total can exceed the session's wall time. `show` prints seconds;
+`--json` and the recipe give microseconds.
+
+Only `admission` depends on `resources`: it is the wait for a pool to have
+room for what a target declared. `deps` waits for upstream targets,
+`lock_wait` for another process's lock, `scratch` for scratch space; their
+split says how loaded the machine was meanwhile, nothing about the
+declarations.
+
+| What `show` says | What it means | What to try |
+| --- | --- | --- |
+| `admission` mostly **spare** (the hint above) | targets queued for a pool while the machine had room | raise the pool's capacity (`-j`, `--resource`, `.hephconfig` `resources:`), or lower what the targets declare |
+| `admission` mostly **busy** | the machine was the limit; the pool kept it from being overloaded | a larger machine or fewer builds at once; the declarations are not the cause |
+| `deps`, `lock_wait`, `scratch`, any split | not a resources question | `show`'s blocked-on lines and `time_by_phase` |
+| mostly **unknown** | no sample covered the wait | nothing to conclude |
+| a pool line's "90%+ held while the machine was under 50%" | `declared_above_use_us` | lower the targets' `resources`, if something waited for the pool |
+| a pool line's "machine 90%+ while the pool was under 50% held" | `use_above_declared_us` | raise the targets' `resources`, or look for other work on the machine |
+
+A worked example: a 40 s build whose `admission` reads `30.0s (24.0s spare,
+6.0s unknown)` had targets queued for 30 s of summed span time, 24 s of it
+while the machine sat under 90% CPU and 95% memory: the pool, not the
+machine, set the pace. If its `cpu` pool line also reads mostly "90%+ held
+while the machine was under 50%", the targets reserve more CPU than they
+burn, and lowering their `cpu` declarations lets more run at once.
+
+This is the `waiting_by_load` recipe, which `show` runs; the pool lines'
+"against the machine" totals are `resources_vs_machine` (see [Pools](#pools)
+and [Built-in recipes](#built-in-recipes)). Their SQL, thresholds and
+wording are not contract, and neither is the hint: `show --json` carries
+the totals, never a verdict, so a script applies its own rule to
+`by_phase`.
+
+`show --json`'s `machine` is `{status, reason, cpus, cpu_limit,
+cpu_limit_source, memory_limit_bytes, memory_limit_source, cpu_busy_mean,
+cpu_busy_peak, memory_used_peak_bytes, heph_resident_peak_bytes,
+sources_failed: [{source, error, at_unix_us}], waiting: {threshold_cpu,
+threshold_memory, by_phase: {<phase>: {busy_us, spare_us, unknown_us}}}}`.
+`status` is `sampled`, `partial` (a source stopped), `failed` (no sample, a
+source stopped) or `none`, with `reason` `older_derivation` or `no_samples`
+only then; all are open enums. The keys of `by_phase` are an open set too:
+the phases above today, any waiting phase a later heph adds, and a phase
+nothing waited in is absent. A figure with no sample is absent, never 0.
+`cpu_limit_source` is `quota` when the limit is below the CPU count, else
+`host`; `memory_limit_source` is always `host`. While the session runs, the
+summaries are computed from the samples so far.
 
 ## Records
 
@@ -633,8 +990,13 @@ UTF-8, stored verbatim and escaped by the viewer on output; `seq` numbers the
 sink's lines from 1), `End {exit_code,
 panicked}`, `Truncated`, `InflightWritten`, `LockHolder {pid, session}` (the
 run resolved a lock holder's pid to a session, or found none: see [The run's
-own lock-wait notice](#the-runs-own-lock-wait-notice)), and `Unknown` for
-anything newer. Both keys are optional; a body with neither is skipped.
+own lock-wait notice](#the-runs-own-lock-wait-notice)), `MachineInfo
+{time_unix_us, cpu_count, cpu_limit_ucpus, cpu_limit_source,
+memory_limit_bytes, memory_limit_source, failed}` (once, at start) and
+`MachineSample {time_unix_us, interval_us, cpu_busy_ppm, memory_used_bytes,
+process_cpu_us, process_resident_bytes, failed, dropped}` (each tick; see
+[Machine stats](#machine-stats)), and `Unknown` for anything newer. Both
+keys are optional; a body with neither is skipped.
 
 What the run's terminal showed besides events and log lines is recorded too,
 so `attach` draws it (see [Attach](#attach)):
@@ -720,7 +1082,8 @@ incompatible change:
 - **The explorer contract** (I9) is `sessions.schema_version` (1). Within a
   format the six names only gain tables, columns, names and enum values; a
   derivation bump may add rows or attributes, and may correct a value that
-  was wrong.
+  was wrong. The machine metric names, with their unit, kind and
+  attributes, are frozen from the first release that contains them.
 - **Within a format the schema only grows** (I5). Every table, view and
   index of the format's fixture stays, its columns in their order; new ones
   may be added beside them. The stored definitions of the six public names
@@ -1018,9 +1381,11 @@ what was dropped. For a recording opened by path or URL, a non-null
 capacity, held_mean, held_peak, waiting_us}]`, one
 per bounded pool with rows (see [Pools](#pools)): empty while the session is
 live, and for a build that admitted nothing. `capacity` is `null` when no
-row gave one. The comparison with machine samples (`declared_above_use_us`
-and the rest) comes later, as added fields. `chain_root` is the id of the
-session at the root of
+row gave one. A `cpu` or `memory` entry adds the `resources_vs_machine`
+totals as `machine: {declared_above_use_us, use_above_declared_us,
+matched_us, unknown_us}`; an entry for a pool with no machine counterpart
+has no `machine`. `machine` is described under [Machine stats](#machine-stats).
+`chain_root` is the id of the session at the root of
 the first lock chain, `null` when no chain leads to a session. `next` is
 `{kind, command, argv, cwd, reason}`; `kind` is one of `attach`, `show_holder`, `inflight`,
 `inspect_failure`, `rerun`, `list`, `none` and may gain values.
@@ -1071,7 +1436,7 @@ stable signal for "has it gone silent".
 | I5 | A record's `kind` is a `BuildEvent` exactly as on the plugin wire. The recording names its format in its header; a reader refuses a newer one by name and reads every older one, and each released format has a committed fixture a test opens. |
 | I6 | A session holds nothing the terminal would not have shown (argv, log lines, failing log tails), user-only. |
 | I7 | A viewer **never signals** a process. `inflight` drops `inflight.request`; the owner's diag sweeper (one `stat` per 200ms tick) writes `inflight.txt`, removes the request and records `InflightWritten`, which the viewer waits for. The session row's `capabilities` must list `inflight`. |
-| I9 | The six explorer names (`sessions`, `spans`, `span_events`, `metrics`, `logs`, `targets`) are the public contract. Within a format they only gain tables, columns, names and enum values; released span and metric names, the trace-id rule and the span-id encoding never change. |
+| I9 | The six explorer names (`sessions`, `spans`, `span_events`, `metrics`, `logs`, `targets`) are the public contract. Within a format they only gain tables, columns, names and enum values; released span and metric names, the trace-id rule and the span-id encoding never change. The machine metric names (see [Machine stats](#machine-stats)), with their unit, kind and attributes, are frozen from the first release that contains them. |
 
 ### Recording
 
@@ -1346,7 +1711,9 @@ nothing runs in the build to produce it.
   (`service.*`, `host.name`, `user.name`, `process.*`) are those of the
   OpenTelemetry semantic conventions v1.27.0, the first release with
   `user.name`. heph does not follow later renames on its own: a rename
-  reaches the export only with a heph release that adopts it.
+  reaches the export only with a heph release that adopts it. Every
+  resource and scope carries that version as its `schemaUrl`,
+  `https://opentelemetry.io/schemas/1.27.0`.
 
 What maps to what:
 
@@ -1357,6 +1724,7 @@ What maps to what:
 | a `span_events` row | an event of its span |
 | a `logs` row | a log record under the session span's ids: its `severity` as `severityText` and `severityNumber`, its body, `seq` as `heph.seq` |
 | `metrics` rows of one name, kind and unit | one metric: `counter` a monotonic cumulative sum from the session's start, `gauge` (and a kind this heph does not know) a gauge; one data point per row |
+| a machine metric with a semantic convention of the same meaning | that convention's name and instrument instead, as in the table under [Machine stats](#machine-stats): `system.cpu.logical.count`, `system.memory.limit` and `process.memory.usage` are up-down counters (a non-monotonic cumulative sum from the session's start), `process.cpu.time` a counter. The rest keep heph's name. |
 
 **Into a collector.** The `otlp_json_file` receiver of
 `opentelemetry-collector-contrib` (alpha for traces, metrics and logs) reads
@@ -1743,11 +2111,15 @@ FROM spans WHERE name = 'heph.result'
 ORDER BY queued_ms DESC;
 ```
 
-A pool held near its capacity with a long `waiting_s` held work back. Whether
-the machine had room while it did needs the machine's own usage beside these
-rows, which this heph does not record yet: until it does, compare with the
-machine's load over the same window by hand. Nothing here flows back into
-admission (see [Pools](#pools)).
+A pool held near its capacity with a long `waiting_s` held work back.
+Whether the machine had room while it did is what the built-in
+`resources_vs_machine` recipe answers, from the machine samples beside these
+rows (`show` prints its totals on the pool's line), and `waiting_by_load`
+says, phase by phase, whether waiting work met a busy machine or a spare
+one: spare time in `admission` means the declarations held work back on a
+machine with room. Both need a recording (`--full` or `--from`): the catalog
+keeps no samples. Nothing here flows back into admission (see
+[Machine stats](#machine-stats)).
 
 ## Run logs
 

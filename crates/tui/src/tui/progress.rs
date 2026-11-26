@@ -2979,7 +2979,7 @@ impl CIAppView for GcCiView {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use hcore::events::CacheOutcomeKind;
 
@@ -5902,8 +5902,9 @@ mod tests {
     #[global_allocator]
     static ALLOCATOR: CountingAlloc = CountingAlloc;
 
-    /// Allocations `f` makes on this thread.
-    fn allocs_during(f: impl FnOnce()) -> usize {
+    /// Allocations `f` makes on this thread. The lib's test allocator, so
+    /// other modules' tests count through it too.
+    pub(crate) fn allocs_during(f: impl FnOnce()) -> usize {
         let before = ALLOCS.with(Cell::get);
         f();
         ALLOCS.with(Cell::get).saturating_sub(before)

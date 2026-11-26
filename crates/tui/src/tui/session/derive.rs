@@ -16,7 +16,9 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use hcore::events::BuildEventKind;
 use serde_json::{Map, Value};
 
-use super::format::SessionRecordKind;
+use super::format::{
+    MachineInfoRecord, MachineSampleRecord, MachineSourceFailure, SessionRecordKind,
+};
 
 /// The session span's id. Span ids are never 0.
 pub const SESSION_SPAN: i64 = 1;
@@ -195,6 +197,44 @@ impl PoolAcc {
     }
 }
 
+/// The machine samples' running totals for the `heph.session.machine.*` and
+/// `heph.session.process.*` rows (D25). A figure no sample carried stays
+/// `None`, and its summary row is absent.
+#[derive(Debug, Default)]
+struct MachineAcc {
+    /// Busy fraction times the interval it covers, summed, and the intervals
+    /// summed: the mean is time-weighted.
+    busy_area: f64,
+    busy_us: f64,
+    busy_peak: Option<f64>,
+    memory_used_peak: Option<u64>,
+    resident_peak: Option<u64>,
+}
+
+/// The machine metric names (Design, "Machine stats"): frozen with their
+/// unit and kind from the first release that contains them (I9, D27).
+pub mod machine {
+    pub const CPU_COUNT: &str = "heph.machine.cpu.count";
+    pub const CPU_LIMIT: &str = "heph.machine.cpu.limit";
+    pub const CPU_BUSY: &str = "heph.machine.cpu.busy";
+    pub const MEMORY_LIMIT: &str = "heph.machine.memory.limit";
+    pub const MEMORY_USED: &str = "heph.machine.memory.used";
+    pub const PROCESS_CPU_TIME: &str = "heph.process.cpu.time";
+    pub const PROCESS_RESIDENT: &str = "heph.process.memory.resident";
+    pub const SESSION_BUSY_MEAN: &str = "heph.session.machine.cpu.busy.mean";
+    pub const SESSION_BUSY_PEAK: &str = "heph.session.machine.cpu.busy.peak";
+    pub const SESSION_MEMORY_USED_PEAK: &str = "heph.session.machine.memory.used.peak";
+    pub const SESSION_RESIDENT_PEAK: &str = "heph.session.process.memory.resident.peak";
+    /// The `heph.session` span event a stopped sampler source becomes.
+    pub const SAMPLER_STOPPED: &str = "heph.sampler.stopped";
+    /// The `heph.sampler.source` of a sampler that never started: every
+    /// source at once, before the first reading.
+    pub const SAMPLER_SOURCE: &str = "sampler";
+    /// The metrics a sample writes each tick: what the catalog never copies
+    /// (D25).
+    pub const PER_SAMPLE: [&str; 4] = [CPU_BUSY, MEMORY_USED, PROCESS_CPU_TIME, PROCESS_RESIDENT];
+}
+
 /// A phase span as `ResultEnd.spans` carries it (session store PR 1). Read
 /// from the record's body, so a host that does not send it yields none.
 #[derive(Debug, serde::Deserialize)]
@@ -228,6 +268,7 @@ pub(crate) struct Deriver {
     units: BTreeMap<String, String>,
     pools: BTreeMap<String, PoolAcc>,
     outcomes: BTreeMap<&'static str, u64>,
+    machine: MachineAcc,
 }
 
 fn us(at_ms: u64) -> i64 {
@@ -235,6 +276,13 @@ fn us(at_ms: u64) -> i64 {
         .unwrap_or(i64::MAX / 1000)
         .saturating_mul(1000)
 }
+
+fn unix_us(at_us: u64) -> i64 {
+    i64::try_from(at_us).unwrap_or(i64::MAX)
+}
+
+/// A busy fraction's denominator in [`MachineSampleRecord::cpu_busy_ppm`].
+pub const PPM: u32 = 1_000_000;
 
 fn attrs_json(map: &Map<String, Value>) -> Option<String> {
     (!map.is_empty()).then(|| Value::Object(map.clone()).to_string())
@@ -252,6 +300,7 @@ impl Deriver {
             units: BTreeMap::new(),
             pools: BTreeMap::new(),
             outcomes: BTreeMap::new(),
+            machine: MachineAcc::default(),
         }
     }
 
@@ -393,6 +442,8 @@ impl Deriver {
             SessionRecordKind::Truncated => {
                 rows.push(Self::event(SESSION_SPAN, "heph.truncated", t, None));
             }
+            SessionRecordKind::MachineInfo(info) => self.machine_info(info, rows),
+            SessionRecordKind::MachineSample(sample) => self.machine_sample(sample, rows),
             SessionRecordKind::Log { .. }
             | SessionRecordKind::End { .. }
             | SessionRecordKind::InflightWritten
@@ -401,6 +452,106 @@ impl Deriver {
             | SessionRecordKind::Output { .. }
             | SessionRecordKind::RunLog(_)
             | SessionRecordKind::Unknown => {}
+        }
+    }
+
+    /// The three start-time rows, each present only when its source read.
+    fn machine_info(&mut self, info: &MachineInfoRecord, rows: &mut Vec<Row>) {
+        let t = unix_us(info.time_unix_us);
+        if let Some(n) = info.cpu_count {
+            rows.push(Self::metric(
+                machine::CPU_COUNT,
+                "gauge",
+                "{cpu}",
+                t,
+                f64::from(n),
+                None,
+            ));
+        }
+        if let Some(limit) = info.cpu_limit_ucpus {
+            rows.push(Self::metric(
+                machine::CPU_LIMIT,
+                "gauge",
+                "{cpu}",
+                t,
+                limit as f64 / hcore::capacity::MICROS_PER_CPU as f64,
+                None,
+            ));
+        }
+        if let Some(bytes) = info.memory_limit_bytes {
+            rows.push(Self::metric(
+                machine::MEMORY_LIMIT,
+                "gauge",
+                "By",
+                t,
+                bytes as f64,
+                None,
+            ));
+        }
+        Self::sampler_stopped(t, &info.failed, rows);
+    }
+
+    /// One tick's rows, toward the session summaries.
+    fn machine_sample(&mut self, s: &MachineSampleRecord, rows: &mut Vec<Row>) {
+        let t = unix_us(s.time_unix_us);
+        let acc = &mut self.machine;
+        if let Some(ppm) = s.cpu_busy_ppm {
+            let busy = f64::from(ppm.min(PPM)) / f64::from(PPM);
+            rows.push(Self::metric(machine::CPU_BUSY, "gauge", "1", t, busy, None));
+            // A sample always covers some time; a zero interval still counts.
+            let weight = s.interval_us.max(1) as f64;
+            acc.busy_area += busy * weight;
+            acc.busy_us += weight;
+            acc.busy_peak = Some(acc.busy_peak.map_or(busy, |p| p.max(busy)));
+        }
+        if let Some(bytes) = s.memory_used_bytes {
+            rows.push(Self::metric(
+                machine::MEMORY_USED,
+                "gauge",
+                "By",
+                t,
+                bytes as f64,
+                None,
+            ));
+            acc.memory_used_peak = Some(acc.memory_used_peak.map_or(bytes, |p| p.max(bytes)));
+        }
+        if let Some(cpu_us) = s.process_cpu_us {
+            rows.push(Self::metric(
+                machine::PROCESS_CPU_TIME,
+                "counter",
+                "s",
+                t,
+                cpu_us as f64 / 1e6,
+                None,
+            ));
+        }
+        if let Some(bytes) = s.process_resident_bytes {
+            rows.push(Self::metric(
+                machine::PROCESS_RESIDENT,
+                "gauge",
+                "By",
+                t,
+                bytes as f64,
+                None,
+            ));
+            acc.resident_peak = Some(acc.resident_peak.map_or(bytes, |p| p.max(bytes)));
+        }
+        Self::sampler_stopped(t, &s.failed, rows);
+    }
+
+    /// One `heph.sampler.stopped` event on the session span per source that
+    /// stopped: which metric it fed, and why.
+    fn sampler_stopped(t: i64, failed: &[MachineSourceFailure], rows: &mut Vec<Row>) {
+        for f in failed {
+            let mut a = Map::new();
+            a.insert("heph.sampler.source".into(), Value::from(f.source.as_str()));
+            a.insert("heph.sampler.error".into(), Value::from(f.error.as_str()));
+            rows.push(Self::event(
+                SESSION_SPAN,
+                machine::SAMPLER_STOPPED,
+                t,
+                attrs_json(&a),
+            ));
         }
     }
 
@@ -834,6 +985,32 @@ impl Deriver {
                 waiting as f64,
             ));
         }
+        // The machine summaries (D25): each absent when no sample carried
+        // its figure, so a recording shorter than a tick has none of the CPU
+        // rows.
+        let acc = &self.machine;
+        let summary = |name, unit, value: Option<f64>| {
+            value.map(|v| Self::metric(name, "gauge", unit, end, v, None))
+        };
+        let busy_mean = (acc.busy_us > 0.0).then(|| acc.busy_area / acc.busy_us);
+        rows.extend(
+            [
+                summary(machine::SESSION_BUSY_MEAN, "1", busy_mean),
+                summary(machine::SESSION_BUSY_PEAK, "1", acc.busy_peak),
+                summary(
+                    machine::SESSION_MEMORY_USED_PEAK,
+                    "By",
+                    acc.memory_used_peak.map(|b| b as f64),
+                ),
+                summary(
+                    machine::SESSION_RESIDENT_PEAK,
+                    "By",
+                    acc.resident_peak.map(|b| b as f64),
+                ),
+            ]
+            .into_iter()
+            .flatten(),
+        );
         for (outcome, n) in &self.outcomes {
             let mut a = Map::new();
             a.insert("heph.outcome".into(), Value::from(*outcome));

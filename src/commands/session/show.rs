@@ -24,11 +24,13 @@ use super::{
 use crate::tui::session::recording::{ForeignSource, RecordingState};
 use crate::tui::session::{
     ApprovalStanding, HeaderKind, SessionEntry, SessionItem, SessionMeta, SessionRecordKind,
-    SessionSnapshot, SessionSource,
+    SessionSnapshot, SessionSource, Summaries, derive,
     format::{
         AdmissionWaitEntry, ListTotals, LockWaitEntry, RunningTarget, SessionEnd, SnapshotCounts,
     },
-    holder_session, recorder,
+    holder_session,
+    machine::{LimitSource, MachineStatus, MachineSummary, NoneReason, Split, VsMachine},
+    recorder,
     store::PoolSummary,
 };
 use crate::tui::{self, TUIAppView as _};
@@ -196,9 +198,15 @@ pub struct ShowView<'a> {
     /// Why the recording is incomplete, `null` when it is not. An open enum.
     incomplete_reason: Option<IncompleteReason>,
     /// One entry per bounded pool the session admitted from, by name; empty
-    /// while it runs (the summaries are written at its end). PR 5 adds the
-    /// `resources_vs_machine` totals to each entry.
+    /// while it runs (the summaries are written at its end). A `cpu` or
+    /// `memory` entry also carries the `resources_vs_machine` totals as
+    /// `machine` (`declared_above_use_us`, `use_above_declared_us`,
+    /// `matched_us`, `unknown_us`); a pool with no machine counterpart has
+    /// none.
     pools: &'a [PoolSummary],
+    /// The machine the session ran on, and its waiting split. Always
+    /// present; `status` says what was sampled.
+    machine: &'a MachineSummary,
     /// A recording opened by path or URL: where from, whether it is whole,
     /// and what its export carried. Absent for a local session.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -221,6 +229,7 @@ impl<'a> ShowView<'a> {
         skipped: u64,
         incomplete: bool,
         pools: &'a [PoolSummary],
+        machine: &'a MachineSummary,
         foreign: Option<ForeignJson<'a>>,
         snapshot: &'a SessionSnapshot,
     ) -> Self {
@@ -262,6 +271,7 @@ impl<'a> ShowView<'a> {
             incomplete,
             incomplete_reason: incomplete.then_some(IncompleteReason::SizeCap),
             pools,
+            machine,
             foreign,
         }
     }
@@ -441,7 +451,7 @@ async fn render(
         folded.view.set_finished(end.at_unix_ms);
     }
     let snapshot = current_snapshot(&folded, entry.status.as_ref());
-    let pools = source.pools(entry.id).await?;
+    let Summaries { pools, machine } = source.summaries(entry.id).await?;
     let every = list_all(sources).await?;
     let every: Vec<&SessionEntry> = every.iter().map(|(_, e)| e).collect();
     // The stuck-on block is drawn whatever the output, for the chain root.
@@ -524,6 +534,7 @@ async fn render(
             folded.skipped,
             incomplete,
             &pools,
+            &machine,
             foreign.map(|f| ForeignJson {
                 origin: f.origin(),
                 partial,
@@ -609,6 +620,7 @@ async fn render(
         }
     }
 
+    text.push_str(&machine_lines(&machine, meta.started_unix_ms));
     for pool in &pools {
         text.push_str(&pool_line(pool));
     }
@@ -686,9 +698,162 @@ fn incomplete_line(folded: &Folded, started_ms: u64) -> String {
     }
 }
 
+/// The waiting phase `resources` decide: the engine's admission.
+const ADMISSION_PHASE: &str = "admission";
+/// How much spare admission time earns the hint: less is noise.
+const HINT_MIN_US: u64 = 1_000_000;
+
+/// The machine line, e.g. `machine: 8 CPUs (host), 16 GiB RAM (host); CPU
+/// busy 42% mean, 97% peak; memory used 12 GiB peak (75% of RAM); heph
+/// resident 210 MiB peak; waiting: admission 1.2s (0.8s busy, 0.4s spare)`,
+/// then the admission hint when it applies, then a line per sampler source
+/// that stopped. A figure with nothing behind it is left out; with nothing
+/// sampled, the line opens `none:` and says why.
+fn machine_lines(m: &MachineSummary, started_ms: u64) -> String {
+    let bytes = hcore::units::human_bytes;
+    let pct = |f: f64| format!("{:.0}%", f * 100.0);
+    let mut limits: Vec<String> = Vec::new();
+    match (m.cpu_limit, m.cpu_limit_source, m.cpus) {
+        (Some(limit), Some(LimitSource::Quota), cpus) => limits.push(format!(
+            "{} CPUs (quota{})",
+            cpu_amount(limit),
+            cpus.map(|n| format!(", of {n}")).unwrap_or_default()
+        )),
+        (_, _, Some(n)) => limits.push(format!("{n} CPU{} (host)", if n == 1 { "" } else { "s" })),
+        (Some(limit), _, None) => limits.push(format!("{} CPUs (host)", cpu_amount(limit))),
+        (None, _, None) => {}
+    }
+    if let Some(ram) = m.memory_limit_bytes {
+        limits.push(format!("{} RAM (host)", bytes(ram)));
+    }
+    // With nothing sampled the line opens `none: <why>`, then whatever
+    // start-time figures there are.
+    let mut parts: Vec<String> = Vec::new();
+    let not_started = m
+        .sources_failed
+        .iter()
+        .any(|f| f.source == derive::machine::SAMPLER_SOURCE);
+    match m.status {
+        MachineStatus::None => parts.push(match m.reason {
+            Some(NoneReason::OlderDerivation) => {
+                "none: recorded before machine stats (no machine record)".to_owned()
+            }
+            _ => "none: no samples (shorter than one tick)".to_owned(),
+        }),
+        MachineStatus::Failed if not_started => {
+            parts.push("none: the sampler did not start (see below)".to_owned());
+        }
+        MachineStatus::Failed => {
+            parts
+                .push("none: the sampler's sources stopped before a sample (see below)".to_owned());
+        }
+        MachineStatus::Sampled | MachineStatus::Partial => {}
+    }
+    if !limits.is_empty() {
+        parts.push(limits.join(", "));
+    }
+    match m.status {
+        MachineStatus::None | MachineStatus::Failed => {}
+        MachineStatus::Sampled | MachineStatus::Partial => {
+            let busy: Vec<String> = [(m.cpu_busy_mean, "mean"), (m.cpu_busy_peak, "peak")]
+                .into_iter()
+                .filter_map(|(v, what)| v.map(|v| format!("{} {what}", pct(v))))
+                .collect();
+            if !busy.is_empty() {
+                parts.push(format!("CPU busy {}", busy.join(", ")));
+            }
+            if let Some(used) = m.memory_used_peak_bytes {
+                let share = m
+                    .memory_limit_bytes
+                    .filter(|&l| l > 0)
+                    .map(|l| format!(" ({} of RAM)", pct(used as f64 / l as f64)))
+                    .unwrap_or_default();
+                parts.push(format!("memory used {} peak{share}", bytes(used)));
+            }
+            if let Some(resident) = m.heph_resident_peak_bytes {
+                parts.push(format!("heph resident {} peak", bytes(resident)));
+            }
+        }
+    }
+    if !m.waiting.by_phase.is_empty() {
+        let phases: Vec<String> = m
+            .waiting
+            .by_phase
+            .iter()
+            .map(|(phase, split)| format!("{} {}", escape(phase), split_text(split)))
+            .collect();
+        parts.push(format!("waiting: {}", phases.join(", ")));
+    }
+    let mut out = format!("machine: {}\n", parts.join("; "));
+    // Of the waits, only admission depends on `resources`: when it waited
+    // mostly with the machine to spare, the declarations (or the pools'
+    // capacity) were the limit, not the machine.
+    if let Some(admission) = m.waiting.by_phase.get(ADMISSION_PHASE)
+        && admission.spare_us > HINT_MIN_US
+        && admission.spare_us.saturating_mul(2) > admission.total_us()
+    {
+        out.push_str(&format!(
+            "  admission waited {} of {} with the machine to spare: the pools' capacity or \
+             the targets' declared `resources` held them back, not the machine\n",
+            wait_time(admission.spare_us),
+            wait_time(admission.total_us()),
+        ));
+    }
+    for f in &m.sources_failed {
+        if f.source == derive::machine::SAMPLER_SOURCE {
+            out.push_str(&format!(
+                "the sampler did not start: {} (build unaffected; no machine data recorded)\n",
+                escape(&f.error)
+            ));
+            continue;
+        }
+        out.push_str(&format!(
+            "the sampler stopped reading {} {} into the run: {}\n",
+            escape(&f.source),
+            ago(f.at_unix_us / 1_000, started_ms),
+            escape(&f.error)
+        ));
+    }
+    out
+}
+
+/// `1.2s (0.8s busy, 0.4s spare)`: a phase's waiting time and the parts of
+/// it that are not 0.
+fn split_text(s: &Split) -> String {
+    let parts: Vec<String> = [
+        (s.busy_us, "busy"),
+        (s.spare_us, "spare"),
+        (s.unknown_us, "unknown"),
+    ]
+    .into_iter()
+    .filter(|&(us, _)| us > 0)
+    .map(|(us, what)| format!("{} {what}", wait_time(us)))
+    .collect();
+    format!("{} ({})", wait_time(s.total_us()), parts.join(", "))
+}
+
+/// A wait: tenths of a second under a minute, as waits are often short.
+fn wait_time(us: u64) -> String {
+    if us < 60_000_000 {
+        format!("{:.1}s", us as f64 / 1e6)
+    } else {
+        hcore::units::human_duration(std::time::Duration::from_micros(us))
+    }
+}
+
+/// A CPU count that may be fractional (a quota): `2.5`, or `8`.
+fn cpu_amount(v: f64) -> String {
+    if (v - v.round()).abs() < 0.05 {
+        format!("{v:.0}")
+    } else {
+        format!("{v:.1}")
+    }
+}
+
 /// One bounded pool's line, e.g.
 /// `cpu pool (capacity 8): held 7.6 mean while in use (95%), 8 peak; something
-/// was waiting for 1m2s`. PR 5 adds the machine comparison after the peak.
+/// was waiting for 1m2s`, and for a pool with a machine counterpart (`cpu`,
+/// `memory`) the [`versus_line`] under it.
 fn pool_line(p: &PoolSummary) -> String {
     let amount = |v: f64| {
         if p.unit == "By" {
@@ -714,13 +879,70 @@ fn pool_line(p: &PoolSummary) -> String {
         amount(p.held_peak),
     ));
     if p.waiting_us == 0 {
-        line.push_str("nothing waited for it\n");
+        line.push_str("nothing waited for it");
     } else {
         line.push_str(&format!(
-            "something was waiting for {}\n",
+            "something was waiting for {}",
             hcore::units::human_duration(std::time::Duration::from_micros(p.waiting_us))
         ));
     }
+    line.push('\n');
+    if let Some(vs) = &p.machine {
+        line.push_str(&versus_line(&p.pool, vs, p.waiting_us > 0));
+    }
+    line
+}
+
+/// A pool's `resources_vs_machine` totals in plain words, as an indented
+/// line under the pool's, e.g. `  against the machine: 2.0s with the pool
+/// 90%+ held while the machine was under 50%, 2.0s not compared (no sample);
+/// targets may declare more CPU than they use: consider lowering their
+/// `resources``. The non-zero totals only, and nothing when all are 0. The
+/// advice comes when one side was out of step for over half the time
+/// compared; the advice to lower only when something `waited` for the pool,
+/// since with nothing queued, declaring more than is used costs nothing.
+pub(super) fn versus_line(pool: &str, vs: &VsMachine, waited: bool) -> String {
+    let parts: Vec<String> = [
+        (
+            vs.declared_above_use_us,
+            "with the pool 90%+ held while the machine was under 50%",
+        ),
+        (
+            vs.use_above_declared_us,
+            "with the machine 90%+ while the pool was under 50% held",
+        ),
+        (vs.matched_us, "in step"),
+        (vs.unknown_us, "not compared (no sample)"),
+    ]
+    .into_iter()
+    .filter(|&(us, _)| us > 0)
+    .map(|(us, what)| format!("{} {what}", wait_time(us)))
+    .collect();
+    if parts.is_empty() {
+        return String::new();
+    }
+    let mut line = format!("  against the machine: {}", parts.join(", "));
+    let what = if pool == "memory" { "memory" } else { "CPU" };
+    let compared = vs
+        .declared_above_use_us
+        .saturating_add(vs.use_above_declared_us)
+        .saturating_add(vs.matched_us);
+    if vs.declared_above_use_us.saturating_mul(2) > compared {
+        // With nothing queued for the pool, the declarations held nothing
+        // back: no advice.
+        if waited {
+            line.push_str(&format!(
+                "; targets may declare more {what} than they use: consider lowering their \
+                 `resources`"
+            ));
+        }
+    } else if vs.use_above_declared_us.saturating_mul(2) > compared {
+        line.push_str(&format!(
+            "; targets may use more {what} than they declare, or other work shares the \
+             machine: consider raising their `resources`"
+        ));
+    }
+    line.push('\n');
     line
 }
 
@@ -1020,7 +1242,35 @@ mod tests {
             held_mean: 1.5,
             held_peak: 4.0,
             waiting_us: 10,
+            machine: Some(VsMachine {
+                declared_above_use_us: 1,
+                use_above_declared_us: 2,
+                matched_us: 3,
+                unknown_us: 4,
+            }),
         }];
+        let machine = MachineSummary {
+            status: MachineStatus::Partial,
+            reason: Some(NoneReason::NoSamples),
+            cpus: Some(8),
+            cpu_limit: Some(4.0),
+            cpu_limit_source: Some(LimitSource::Quota),
+            memory_limit_bytes: Some(1 << 30),
+            memory_limit_source: Some(LimitSource::Host),
+            cpu_busy_mean: Some(0.5),
+            cpu_busy_peak: Some(1.0),
+            memory_used_peak_bytes: Some(1 << 29),
+            heph_resident_peak_bytes: Some(1 << 20),
+            sources_failed: vec![crate::tui::session::machine::SourceFailed {
+                source: "heph.machine.memory.used".to_owned(),
+                error: "gone".to_owned(),
+                at_unix_us: 1,
+            }],
+            waiting: crate::tui::session::machine::Waiting {
+                by_phase: [("admission".to_owned(), Split::default())].into(),
+                ..Default::default()
+            },
+        };
         let view = ShowView::new(
             "id".to_owned(),
             StateJson::Running,
@@ -1037,6 +1287,7 @@ mod tests {
             1,
             true,
             &pools,
+            &machine,
             Some(ForeignJson {
                 origin: "origin",
                 partial: Some(Partial::Snapshot),

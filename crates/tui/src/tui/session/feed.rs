@@ -202,6 +202,8 @@ impl SessionFeed {
             }
             SessionRecordKind::Truncated
             | SessionRecordKind::InflightWritten
+            | SessionRecordKind::MachineInfo(_)
+            | SessionRecordKind::MachineSample(_)
             | SessionRecordKind::Unknown => return Routed::Nothing,
         };
         if text.is_empty() {

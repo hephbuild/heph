@@ -23,6 +23,7 @@ use super::format::{
 };
 use super::id::SessionId;
 use super::lockfile;
+use super::machine::{MachineSummary, NoneReason};
 use super::store::{self, OpenError, RecordCursor};
 
 /// How often a follower looks for new records (and at the lock).
@@ -108,11 +109,12 @@ pub trait SessionSource: Send + Sync + std::fmt::Debug {
     /// [`CAPABILITY_INFLIGHT`] or is not live.
     async fn inflight(&self, id: SessionId, timeout: Duration) -> anyhow::Result<String>;
 
-    /// The session's per-pool summaries (D30), by pool name. Empty while it
-    /// runs, and from a source that keeps none.
-    async fn pools(&self, id: SessionId) -> anyhow::Result<Vec<store::PoolSummary>> {
+    /// What `show` reads from the session's explorer rows: its per-pool
+    /// summaries and its machine figures. From a source that keeps no
+    /// recording, no pools and nothing sampled.
+    async fn summaries(&self, id: SessionId) -> anyhow::Result<Summaries> {
         let _ = id;
-        Ok(Vec::new())
+        Ok(Summaries::default())
     }
 
     /// How a viewer of session `attached` names a lock holder's pid. Empty:
@@ -122,6 +124,43 @@ pub trait SessionSource: Send + Sync + std::fmt::Debug {
     fn holder_names(&self, attached: SessionId) -> super::HolderNames {
         let _ = attached;
         super::HolderNames::default()
+    }
+}
+
+/// A session's summaries, read from one open of its recording.
+#[derive(Debug, Clone)]
+pub struct Summaries {
+    /// Per-pool summaries (D30), by pool name. Empty while the session
+    /// runs: they are written at its end.
+    pub pools: Vec<store::PoolSummary>,
+    /// The machine it ran on (PR 5).
+    pub machine: MachineSummary,
+}
+
+impl Default for Summaries {
+    fn default() -> Self {
+        Self {
+            pools: Vec::new(),
+            machine: MachineSummary::none(NoneReason::NoSamples),
+        }
+    }
+}
+
+impl Summaries {
+    /// Read from the recording `conn` holds.
+    pub fn read(conn: &rusqlite::Connection) -> anyhow::Result<Self> {
+        let mut pools = store::read_pools(conn).context("reading the pool usage")?;
+        if !pools.is_empty() {
+            let mut vs = super::machine::read_vs_machine(conn)
+                .context("setting the pools against the machine")?;
+            for p in &mut pools {
+                p.machine = vs.remove(&p.pool);
+            }
+        }
+        Ok(Self {
+            pools,
+            machine: super::machine::read_machine(conn).context("reading the machine figures")?,
+        })
     }
 }
 
@@ -214,21 +253,26 @@ impl SessionSource for FileSource {
             .context("asking for the in-flight report")?
     }
 
-    async fn pools(&self, id: SessionId) -> anyhow::Result<Vec<store::PoolSummary>> {
+    async fn summaries(&self, id: SessionId) -> anyhow::Result<Summaries> {
         let root = self.root.clone();
         let dir = self.dir(id);
         let repair = self.repair.clone();
         tokio::task::spawn_blocking(move || {
+            // The waiting split reads the samples by name: a repairing
+            // command builds the `(name, time_us)` index on this first need,
+            // as `query` does.
             let opened = match &repair {
-                Some(note) => open_repaired(&root, &dir, note.as_ref()),
+                Some(note) => {
+                    open_repaired_with(&root, &dir, store::Need { indexes: true }, note.as_ref())
+                }
                 None => store::open_local(&root, &dir).map_err(anyhow::Error::new),
             }
             .with_context(|| format!("opening session {id}'s recording"))?;
-            store::read_pools(&opened.conn)
-                .with_context(|| format!("reading session {id}'s pool usage"))
+            Summaries::read(&opened.conn)
+                .with_context(|| format!("reading session {id}'s summaries"))
         })
         .await
-        .context("reading pool usage")?
+        .context("reading a session's summaries")?
     }
 }
 
@@ -238,6 +282,7 @@ impl SessionSource for FileSource {
 /// full disk, a read-only directory, a stray journal, its lock held), the
 /// rows are derived into a temp copy for this command. A newer derivation is
 /// read as it is.
+#[cfg(test)]
 pub(crate) fn open_repaired(
     root: &Path,
     dir: &Path,

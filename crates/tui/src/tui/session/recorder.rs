@@ -44,11 +44,14 @@ use rusqlite::Connection;
 use tokio::sync::mpsc::error::TryRecvError;
 
 use super::cleanup::{self, Retention};
+use super::derive::machine;
 use super::format::{
-    ApprovalPrompt, ApprovalStanding, SessionEnd, SessionRecord, SessionRecordKind, SessionSnapshot,
+    ApprovalPrompt, ApprovalStanding, MachineInfoRecord, MachineSourceFailure, SessionEnd,
+    SessionRecord, SessionRecordKind, SessionSnapshot,
 };
 use super::holder::{HolderNames, event_holder_pid};
 use super::id::SessionId;
+use super::sampler::{self, Reading, Sampler};
 use super::store;
 use crate::tui::app::TUIAppView;
 use crate::tui::progress::BuildState;
@@ -691,9 +694,13 @@ pub(crate) fn is_critical(record: &SessionRecord) -> bool {
             | SessionRecordKind::RunLog(_)
             | SessionRecordKind::LockHolder { .. },
         ) => true,
+        // Machine stats are explorer inputs but not critical (D15): past the
+        // cap the waiting split reads unknown, never spare.
         Some(
             SessionRecordKind::Log { .. }
             | SessionRecordKind::Output { .. }
+            | SessionRecordKind::MachineInfo(_)
+            | SessionRecordKind::MachineSample(_)
             | SessionRecordKind::Unknown,
         )
         | None => false,
@@ -743,6 +750,114 @@ pub(crate) struct Faults {
     pub(crate) cleanup_interval: Option<Duration>,
     /// Refuse WAL mode when creating the recording, as some filesystems do.
     pub(crate) refuse_wal: bool,
+    /// A sampler in place of the host's: scripted sources, or a spawn that
+    /// fails (no sampler at all).
+    pub(crate) sampler: Option<SpawnSampler>,
+    /// [`sampler::TICK`] in its place as the drain interval, so a test's
+    /// sampler can send more readings than its channel holds within a few
+    /// drains.
+    pub(crate) drain_every: Option<Duration>,
+}
+
+/// What starts a recorder's sampler, given its `latched` check.
+type SpawnFn = dyn Fn(Box<dyn FnMut() -> bool + Send>) -> io::Result<(Sampler, mpsc::Receiver<Reading>)>
+    + Send
+    + Sync;
+
+/// [`Faults::sampler`].
+#[derive(Clone)]
+pub(crate) struct SpawnSampler(pub(crate) Arc<SpawnFn>);
+
+impl std::fmt::Debug for SpawnSampler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SpawnSampler")
+    }
+}
+
+/// The recorder's clock anchor: a wall-clock reading and the `Instant` it was
+/// taken at, once, as the recorder starts. A machine reading is stamped at
+/// the anchor plus its monotonic offset from it, so a suspend or an NTP step
+/// moves no sample against another. The engine anchors per request and per
+/// run and the recorder reaches neither (I10), so it keeps its own.
+#[derive(Debug, Clone, Copy)]
+struct Anchor {
+    at: Instant,
+    unix_us: u64,
+}
+
+impl Anchor {
+    fn now() -> Self {
+        let unix_us = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX));
+        Self {
+            at: Instant::now(),
+            unix_us,
+        }
+    }
+
+    /// The wall-clock time of `at`, in unix microseconds.
+    fn unix_us(self, at: Instant) -> u64 {
+        let offset = at.saturating_duration_since(self.at).as_micros();
+        self.unix_us
+            .saturating_add(u64::try_from(offset).unwrap_or(u64::MAX))
+    }
+
+    /// The record of `reading`.
+    fn record(self, reading: &Reading) -> SessionRecord {
+        let (time_unix_us, kind) = match reading {
+            Reading::Info { info, at } => {
+                let us = self.unix_us(*at);
+                let rec = sampler::info_record(info, us);
+                (us, SessionRecordKind::MachineInfo(Box::new(rec)))
+            }
+            Reading::Sample(sample) => {
+                let us = self.unix_us(sample.at);
+                let rec = sampler::sample_record(sample, us);
+                (us, SessionRecordKind::MachineSample(Box::new(rec)))
+            }
+        };
+        SessionRecord::session(time_unix_us / 1000, kind)
+    }
+
+    /// The record of a sampler that failed to start: a `MachineInfo` with no
+    /// figure and one failure, source [`machine::SAMPLER_SOURCE`], so a
+    /// reader tells it from a recording made before machine stats (which has
+    /// no machine record at all).
+    fn start_failure(self, error: &io::Error) -> SessionRecord {
+        let rec = MachineInfoRecord {
+            time_unix_us: self.unix_us,
+            failed: vec![MachineSourceFailure {
+                source: machine::SAMPLER_SOURCE.to_owned(),
+                error: error.to_string(),
+            }],
+            ..MachineInfoRecord::default()
+        };
+        SessionRecord::session(
+            self.unix_us / 1000,
+            SessionRecordKind::MachineInfo(Box::new(rec)),
+        )
+    }
+}
+
+/// Start the recorder's sampler, or the test's in its place. A failure to
+/// start it does not stop the recording: it goes on without machine stats,
+/// and records the failure ([`Anchor::start_failure`]).
+fn spawn_sampler(
+    faults: &Faults,
+    shared: &Arc<Shared>,
+) -> io::Result<(Sampler, mpsc::Receiver<Reading>)> {
+    // The sampler stops once the recorder has latched stopped: nothing would
+    // write its readings. Weak, so a detached sampler thread does not keep
+    // the recorder's state (and the lock it owns) alive; once that is gone
+    // there is no recorder either.
+    let shared = Arc::downgrade(shared);
+    let latched = move || shared.upgrade().is_none_or(|s| s.is_stopped());
+    let spawned = match &faults.sampler {
+        Some(spawn) => (spawn.0)(Box::new(latched)),
+        None => Sampler::spawn(latched),
+    };
+    spawned.inspect_err(|e| tracing::debug!(error = %e, "cannot start the machine sampler"))
 }
 
 /// What the recorder thread starts with.
@@ -836,6 +951,11 @@ fn clean_ended(
 #[derive(Debug)]
 pub struct Recorder {
     tap: SessionTap,
+    /// The machine sampler, stopped by [`Self::finish`] before `End` so the
+    /// recorder's last drain has every reading. Dropping it, as dropping the
+    /// recorder without `finish` does, stops it too. Behind a mutex because
+    /// `Sampler` is `Send` but not `Sync`, and a session is shared.
+    sampler: Mutex<Option<Sampler>>,
 }
 
 impl Recorder {
@@ -898,6 +1018,13 @@ impl Recorder {
                 tracing::debug!(error = %e, "cannot start the session cleanup");
             }
         }
+        let drain_every = faults.drain_every.unwrap_or(sampler::TICK);
+        // The anchor first, so no reading predates it.
+        let anchor = Anchor::now();
+        let (sampler, readings, sampler_failed) = match spawn_sampler(&faults, &thread_shared) {
+            Ok((sampler, readings)) => (Some(sampler), Some(readings), None),
+            Err(e) => (None, None, Some(anchor.start_failure(&e))),
+        };
         // One value, so the connection drops before its registration even if
         // the thread never starts (a tuple drops in order).
         let write = (conn, rw);
@@ -926,13 +1053,24 @@ impl Recorder {
                     dirty: true,
                     last_status: None,
                     line: String::new(),
+                    readings,
+                    anchor,
+                    next_drain: anchor.at + drain_every,
+                    drain_every,
                     shared: thread_shared,
                     faults,
                 };
+                if let Some(rec) = &sampler_failed
+                    && let Err(e) = thread.record(rec)
+                {
+                    thread.fail("cannot record the machine sampler's failure", &e);
+                    return;
+                }
                 thread.run(&rx);
             })?;
         Ok(Self {
             tap: SessionTap { tx, shared },
+            sampler: Mutex::new(sampler),
         })
     }
 
@@ -962,6 +1100,19 @@ impl Recorder {
             return Finished::Again;
         }
         let deadline = Instant::now() + timeout;
+        // Stopped before `End` is sent, so what it read is queued before the
+        // recorder's last drain. A source that blocks is detached, not waited
+        // for.
+        let sampler = self
+            .sampler
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(sampler) = sampler
+            && sampler.stop(sampler::STOP_WAIT.min(timeout)) == sampler::SamplerExit::Detached
+        {
+            tracing::debug!("the machine sampler did not stop in time; detached");
+        }
         if !shared.is_stopped() {
             let (ack, acked) = mpsc::sync_channel(1);
             // Counted like every other message: the thread uncounts each one
@@ -982,7 +1133,8 @@ impl Recorder {
                 shared.pending.fetch_sub(1, Ordering::Relaxed);
             }
             if sent {
-                match acked.recv_timeout(timeout) {
+                // What is left of `timeout` after the sampler's stop.
+                match acked.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                     Ok(()) | Err(RecvTimeoutError::Disconnected) => {}
                     // The thread still holds the write connection and may yet
                     // commit `End` and seal: the lock stays with it (I2, I3).
@@ -1053,6 +1205,15 @@ struct RecorderThread {
     last_status: Option<Instant>,
     /// Reused serialization buffer.
     line: String,
+    /// The sampler's readings: `None` with no sampler, or once it is gone.
+    readings: Option<mpsc::Receiver<Reading>>,
+    /// What machine readings are stamped from.
+    anchor: Anchor,
+    /// When the readings are next drained: once a [`sampler::TICK`], into
+    /// the open transaction (no commit of their own).
+    next_drain: Instant,
+    /// [`sampler::TICK`], or [`Faults::drain_every`].
+    drain_every: Duration,
     shared: Arc<Shared>,
     faults: Faults,
 }
@@ -1089,6 +1250,9 @@ impl RecorderThread {
                 // Every tap dropped without an `End`: commit what there is and
                 // stop. The lock stays with whoever finishes the session.
                 Err(RecvTimeoutError::Disconnected) => {
+                    if let Err(e) = self.drain_readings() {
+                        tracing::debug!(error = %e, "cannot write the machine's last samples");
+                    }
                     if let Err(e) = self.upsert_status() {
                         tracing::debug!(error = %e, "cannot write the session's last status");
                     }
@@ -1101,22 +1265,44 @@ impl RecorderThread {
         }
     }
 
-    /// The next instant something is due: a commit or a status upsert.
+    /// The next instant something is due: a commit, a status upsert or a
+    /// drain of the sampler's readings.
     fn next_deadline(&self) -> Option<Instant> {
         let flush = self.uncommitted_since.map(|t| t + self.flush_every);
         let status = self.dirty.then(|| {
             self.last_status
                 .map_or_else(Instant::now, |t| t + self.status_every)
         });
-        match (flush, status) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
+        let drain = self.readings.as_ref().map(|_| self.next_drain);
+        [flush, status, drain].into_iter().flatten().min()
+    }
+
+    /// Record every reading the sampler has queued. Its channel disconnected
+    /// (the sampler exited): there will be no more, and no more drains.
+    fn drain_readings(&mut self) -> io::Result<()> {
+        let Some(readings) = self.readings.take() else {
+            return Ok(());
+        };
+        loop {
+            match readings.try_recv() {
+                Ok(reading) => self.record(&self.anchor.record(&reading))?,
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
+            }
         }
+        self.readings = Some(readings);
+        Ok(())
     }
 
     /// Do whatever is due.
     fn tick(&mut self) -> Flow {
         let now = Instant::now();
+        if self.readings.is_some() && now >= self.next_drain {
+            self.next_drain = sampler::next_tick(self.next_drain, now, self.drain_every);
+            if let Err(e) = self.drain_readings().and_then(|()| self.commit_if_full()) {
+                return self.fail("cannot write the machine's samples", &e);
+            }
+        }
         let commit_due = self
             .uncommitted_since
             .is_some_and(|t| now >= t + self.flush_every);
@@ -1216,6 +1402,12 @@ impl RecorderThread {
             if let Flow::Stop = self.handle(msg, rx) {
                 return;
             }
+        }
+        // `finish` stopped the sampler before sending `End`: what it read is
+        // queued, and lands before `End`.
+        if let Err(e) = self.drain_readings() {
+            self.fail("cannot write the machine's samples", &e);
+            return;
         }
         let end = SessionRecord::session(
             at_unix_ms,
@@ -1430,4 +1622,59 @@ pub fn write_bytes_atomically(dir: &Path, name: &str, bytes: &[u8]) -> io::Resul
     io::Write::write_all(tmp.as_file_mut(), bytes)?;
     tmp.persist(dir.join(name)).map_err(|e| e.error)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod anchor_tests {
+    use super::*;
+
+    /// A reading is stamped at the anchor's wall-clock time plus its
+    /// monotonic offset from the anchor's instant, whatever the wall clock
+    /// does meanwhile; an instant before the anchor saturates to it, and an
+    /// offset past `u64` microseconds to `u64::MAX`. The record carries the
+    /// same stamp, in ms, as the sample's `time_unix_us`.
+    #[test]
+    fn anchor_stamps_from_its_monotonic_offset() {
+        let at = Instant::now() + Duration::from_secs(10);
+        let anchor = Anchor {
+            at,
+            unix_us: 1_000_000,
+        };
+        assert_eq!(anchor.unix_us(at), 1_000_000);
+        assert_eq!(anchor.unix_us(at + Duration::from_micros(1_500)), 1_001_500);
+        assert_eq!(
+            anchor.unix_us(at + Duration::from_secs(3_600)),
+            3_601_000_000
+        );
+        // Before the anchor: no reading is stamped earlier than the anchor.
+        let before = at
+            .checked_sub(Duration::from_secs(5))
+            .expect("at is now + 10 s");
+        assert_eq!(anchor.unix_us(before), 1_000_000);
+        let late = Anchor {
+            at,
+            unix_us: u64::MAX - 10,
+        };
+        assert_eq!(late.unix_us(at + Duration::from_secs(1)), u64::MAX);
+
+        let sample = sampler::Sample {
+            at: at + Duration::from_millis(2_500),
+            interval: Duration::from_secs(1),
+            cpu_busy: Some(0.5),
+            memory_used: None,
+            process_cpu: None,
+            process_resident: None,
+            failed: sampler::Failures::default(),
+            dropped: 0,
+        };
+        let rec = anchor.record(&Reading::Sample(sample));
+        assert_eq!(rec.at_unix_ms, 3_500);
+        match rec.session {
+            Some(SessionRecordKind::MachineSample(s)) => {
+                assert_eq!(s.time_unix_us, 3_500_000);
+                assert_eq!(s.interval_us, 1_000_000);
+            }
+            other => panic!("not a sample: {other:?}"),
+        }
+    }
 }

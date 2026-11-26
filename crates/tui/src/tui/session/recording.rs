@@ -23,7 +23,7 @@ use super::export::{FAILURE_LOG_CAP, FAILURE_LOGS_CAP};
 use super::format::{ApprovalPromptNotice, SessionMeta, SessionRecordKind, SessionSnapshot};
 use super::hephsession::{self, ForeignError, ForeignFile};
 use super::id::SessionId;
-use super::source::{EntryMeta, FOLLOW_BATCH, SessionEntry, SessionItem, SessionSource};
+use super::source::{EntryMeta, FOLLOW_BATCH, SessionEntry, SessionItem, SessionSource, Summaries};
 use super::store::{self, OpenError, Opened, RecordCursor};
 
 /// A recording opened for viewing.
@@ -295,7 +295,7 @@ pub struct ForeignSource {
     entry: SessionEntry,
     origin: String,
     state: RecordingState,
-    pools: Vec<store::PoolSummary>,
+    summaries: Summaries,
     notices: RecordedNotices,
     failure_logs: Vec<FailureLog>,
     cursor: Mutex<Option<RecordCursor>>,
@@ -317,7 +317,7 @@ impl ForeignSource {
             },
             None => (None, false),
         };
-        let pools = store::read_pools(conn).with_context(what)?;
+        let summaries = Summaries::read(conn).with_context(what)?;
         let notices = read_notices(conn, RECORDED_NOTICES_CAP).with_context(what)?;
         let failure_logs = read_failure_logs(conn, None, FAILURE_LOGS_CAP).with_context(what)?;
         let Foreign {
@@ -357,7 +357,7 @@ impl ForeignSource {
             },
             origin,
             state,
-            pools,
+            summaries,
             notices: Arc::new(notices),
             failure_logs,
             cursor: Mutex::new(Some(RecordCursor::new(Opened::foreign(conn, files)))),
@@ -425,11 +425,11 @@ impl SessionSource for ForeignSource {
         )
     }
 
-    async fn pools(&self, id: SessionId) -> anyhow::Result<Vec<store::PoolSummary>> {
+    async fn summaries(&self, id: SessionId) -> anyhow::Result<Summaries> {
         Ok(if id == self.entry.id {
-            self.pools.clone()
+            self.summaries.clone()
         } else {
-            Vec::new()
+            Summaries::default()
         })
     }
 }

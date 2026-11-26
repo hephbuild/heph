@@ -70,7 +70,14 @@ base64 = "0.22"
 # first cursor query. This source polls with select, which accepts it.
 [target.'cfg(target_os = "macos")'.dependencies]
 crossterm = { version = "0.29", features = ["use-dev-tty"] }
+# Machine stats (`session::sampler`): the host port and the kernel page size,
+# which libc has deprecated or lacks. Already in the tree (the root's SIGQUIT
+# dump).
+mach2 = "0.7"
 
 [dev-dependencies]
 tokio = { version = "1.54.1", features = ["test-util"] }
 hcore = { package = "core", path = "../core", features = ["test-support"] }
+# `tests/sampler_alloc.rs` drives the sampler loop through `test-support`,
+# so `cargo test -p tui` runs it rather than skipping it.
+tui = { path = ".", features = ["test-support"] }

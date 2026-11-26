@@ -363,6 +363,8 @@ fn otlp_cuts_a_large_session_into_bounded_lines() {
     let path = tmp.path().join(store::FILE);
     std::fs::copy(fixture(), &path).expect("copy the fixture");
     let many = otlp::LINE_ITEMS * 2 + 500;
+    // Explorer rows written straight into the copy: it is stamped with the
+    // current derivation, or opening it re-derives them away.
     rusqlite::Connection::open(&path)
         .expect("open the copy")
         .execute_batch(&format!(
@@ -382,7 +384,9 @@ fn otlp_cuts_a_large_session_into_bounded_lines() {
                FROM temp.k, session s;
              INSERT INTO metrics (session_id, name, kind, unit, time_us, value, attributes) \
                SELECT s.id, 'heph.many', 'gauge', '1', s.started_ms * 1000 + i, i, NULL \
-               FROM temp.k, session s;"
+               FROM temp.k, session s;
+             UPDATE session SET derivation = {derivation};",
+            derivation = store::DERIVATION,
         ))
         .expect("grow the recording");
 
@@ -539,17 +543,20 @@ fn otlp_counts_span_events_toward_a_line() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let path = tmp.path().join(store::FILE);
     std::fs::copy(fixture(), &path).expect("copy the fixture");
+    // Stamped current, as in `otlp_cuts_a_large_session_into_bounded_lines`.
     rusqlite::Connection::open(&path)
         .expect("open the copy")
-        .execute_batch(
+        .execute_batch(&format!(
             "INSERT INTO spans (session_id, span_id, parent_span_id, name, class, start_us, \
                end_us, duration_us, status) \
                SELECT s.id, 2000000, NULL, 'heph.busy', 'phase', s.started_ms * 1000, \
                  s.started_ms * 1000 + 10, 10, 'ok' FROM session s;
              WITH RECURSIVE k(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM k WHERE i < 5) \
              INSERT INTO span_events (session_id, span_id, name, time_us, attributes) \
-               SELECT s.id, 2000000, 'tick', s.started_ms * 1000 + i, NULL FROM k, session s;",
-        )
+               SELECT s.id, 2000000, 'tick', s.started_ms * 1000 + i, NULL FROM k, session s;
+             UPDATE session SET derivation = {derivation};",
+            derivation = store::DERIVATION,
+        ))
         .expect("grow the recording");
     let per_line = 3;
     let work = tempfile::tempdir().expect("tempdir");
@@ -769,4 +776,203 @@ fn otlp_shape_leaves_attribute_values_alone() {
     assert_eq!(v["kind"], 1);
     let text = v.to_string();
     assert_eq!(text.matches("\"AAAA\"").count(), 4, "{text}");
+}
+
+/// Spec row `otlp_maps_machine_metrics` (D27): a recording with every
+/// machine name exports each mapped one under its semconv name and
+/// instrument (`process.cpu.time` a monotonic cumulative sum, the
+/// up-down counters non-monotonic, both from the session's start), keeps
+/// the rest under heph's name as gauges, and stamps the semconv version as
+/// `schema_url` on every resource and scope. A row with a machine name but
+/// a kind or unit heph does not write is not mapped.
+#[test]
+fn otlp_maps_machine_metrics() {
+    let id = super::id::SessionId::new(hcore::events::now_unix_ms(), 41);
+    let s = id.started_unix_ms();
+    let (root, conn) =
+        super::store_tests::derived(id, &super::tests::machine_records(s), s + 6_000);
+    // The table is what derivation writes: names, kinds and units.
+    let written = strings(
+        &conn,
+        "SELECT DISTINCT name || ' ' || kind || ' ' || unit FROM metrics",
+    );
+    let table: BTreeSet<String> = otlp::MACHINE_METRICS
+        .iter()
+        .map(|m| format!("{} {} {}", m.name, m.kind, m.unit))
+        .collect();
+    assert_eq!(written, table);
+    conn.execute(
+        "INSERT INTO metrics (session_id, name, kind, unit, time_us, value, attributes) \
+         SELECT id, 'heph.machine.cpu.count', 'gauge', 'By', ?1, 3, NULL FROM session",
+        [i64::try_from((s + 2_000) * 1000).expect("time")],
+    )
+    .expect("a row heph does not write");
+    drop(conn);
+    let path = root.path().join(id.encode()).join(store::FILE);
+    let (text, _) = export(&path);
+    let d = decode(&text);
+
+    // Every resource and scope, of every signal, names the semconv version.
+    let mut stamped = 0;
+    for t in &d.traces {
+        for r in &t.resource_spans {
+            assert_eq!(r.schema_url, otlp::SCHEMA_URL);
+            stamped += 1;
+            for sc in &r.scope_spans {
+                assert_eq!(sc.schema_url, otlp::SCHEMA_URL);
+            }
+        }
+    }
+    for l in &d.logs {
+        for r in &l.resource_logs {
+            assert_eq!(r.schema_url, otlp::SCHEMA_URL);
+            stamped += 1;
+            for sc in &r.scope_logs {
+                assert_eq!(sc.schema_url, otlp::SCHEMA_URL);
+            }
+        }
+    }
+    for m in &d.metrics {
+        for r in &m.resource_metrics {
+            assert_eq!(r.schema_url, otlp::SCHEMA_URL);
+            stamped += 1;
+            for sc in &r.scope_metrics {
+                assert_eq!(sc.schema_url, otlp::SCHEMA_URL);
+            }
+        }
+    }
+    assert!(stamped >= 2, "spans and metrics at least: {stamped}");
+    assert_eq!(
+        otlp::SCHEMA_URL,
+        format!("https://opentelemetry.io/schemas/{}", otlp::SEMCONV_VERSION)
+    );
+
+    // Each exported metric: (name, unit) → (instrument, points as
+    // (start, time, value)).
+    type Points = Vec<(u64, u64, f64)>;
+    let mut got: std::collections::BTreeMap<(String, String), (&str, Points)> = Default::default();
+    for m in d
+        .metrics
+        .iter()
+        .flat_map(|m| &m.resource_metrics)
+        .flat_map(|r| &r.scope_metrics)
+        .flat_map(|s| &s.metrics)
+    {
+        let (instrument, dps) = match m.data.as_ref().expect("data") {
+            metrics::metric::Data::Gauge(g) => ("gauge", &g.data_points),
+            metrics::metric::Data::Sum(sum) => {
+                assert_eq!(
+                    sum.aggregation_temporality.to_i32(),
+                    metrics::AggregationTemporality::AGGREGATION_TEMPORALITY_CUMULATIVE.to_i32(),
+                    "{}",
+                    m.name
+                );
+                assert!(dps_start(&sum.data_points), "{}", m.name);
+                (
+                    if sum.is_monotonic {
+                        "counter"
+                    } else {
+                        "updowncounter"
+                    },
+                    &sum.data_points,
+                )
+            }
+            other => panic!("unexpected metric data {other:?}"),
+        };
+        let entry = got
+            .entry((m.name.clone(), m.unit.clone()))
+            .or_insert((instrument, Vec::new()));
+        assert_eq!(entry.0, instrument, "{}", m.name);
+        entry.1.extend(dps.iter().map(|p| {
+            let v = match p.value {
+                Some(metrics::number_data_point::Value::AsDouble(f)) => f,
+                _ => panic!("a double"),
+            };
+            (p.start_time_unix_nano, p.time_unix_nano / 1000, v)
+        }));
+    }
+
+    let start_ns = s * 1_000_000;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ex = explorer(&path, tmp.path());
+    for m in otlp::MACHINE_METRICS {
+        let (name, instrument) = m
+            .otel
+            .map_or((m.name, otlp::Instrument::Gauge), |(to, i)| (to, i));
+        let want: Vec<(u64, u64, f64)> = {
+            let mut stmt = ex
+                .conn()
+                .prepare(
+                    "SELECT time_us, value FROM metrics WHERE name = ?1 AND unit = ?2 \
+                     ORDER BY time_us",
+                )
+                .expect("prepare");
+            stmt.query_map([m.name, m.unit], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?))
+            })
+            .expect("query")
+            .map(|r| {
+                let (t, v) = r.expect("row");
+                let start = if instrument == otlp::Instrument::Gauge {
+                    0
+                } else {
+                    start_ns
+                };
+                (start, u64::try_from(t).expect("time"), v)
+            })
+            .collect()
+        };
+        assert!(!want.is_empty(), "{} is in the recording", m.name);
+        assert_eq!(
+            got.remove(&(name.to_owned(), m.unit.to_owned())),
+            Some((instrument.as_str(), want)),
+            "{} exported as {name}",
+            m.name
+        );
+    }
+    // What is left: the row with a unit heph does not write, under its own
+    // name as a gauge, and no other machine name.
+    assert_eq!(
+        got.into_iter()
+            .filter(|((name, _), _)| name.starts_with("heph.machine.")
+                || name.starts_with("heph.process.")
+                || name.starts_with("heph.session.")
+                || name.starts_with("system.")
+                || name.starts_with("process."))
+            .map(|((name, unit), (instrument, points))| (name, unit, instrument, points.len()))
+            .collect::<Vec<_>>(),
+        [(
+            "heph.machine.cpu.count".to_owned(),
+            "By".to_owned(),
+            "gauge",
+            1
+        )]
+    );
+
+    // The table: the four semconv names and instruments, the rest unmapped.
+    let mapped: Vec<(&str, &str, &str)> = otlp::MACHINE_METRICS
+        .iter()
+        .filter_map(|m| m.otel.map(|(to, i)| (m.name, to, i.as_str())))
+        .collect();
+    assert_eq!(
+        mapped,
+        [
+            (
+                "heph.machine.cpu.count",
+                "system.cpu.logical.count",
+                "updowncounter"
+            ),
+            (
+                "heph.machine.memory.limit",
+                "system.memory.limit",
+                "updowncounter"
+            ),
+            ("heph.process.cpu.time", "process.cpu.time", "counter"),
+            (
+                "heph.process.memory.resident",
+                "process.memory.usage",
+                "updowncounter"
+            ),
+        ]
+    );
 }

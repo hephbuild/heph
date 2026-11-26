@@ -21,6 +21,13 @@ cargo test -p tui --lib generate_format_fixture -- --ignored
 cargo test -p tui --lib generate_export_fixture -- --ignored
 ```
 
+`derivation-N/session.db` is a sealed recording whose explorer rows were
+derived by derivation `N` (`store::DERIVATION`), committed so that
+`store_tests::older_derivation_keeps_machine_rows` proves an older heph
+reads PR 5's machine rows as they are instead of re-deriving them away. It
+is frozen too; `generate_derivation_fixture` writes one for a new
+derivation that needs it.
+
 They write `format-<store::FORMAT>/session.db` from
 `store_tests::write_fixture`, and `format-<store::FORMAT>/example.hephsession`
 from `export_tests::write_export_fixture`.

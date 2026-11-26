@@ -22,7 +22,7 @@ use super::{QueryArgs, QueryFormat, SessionExit, ViewOpts, escape, escape_text, 
 use crate::tui::session::query::{
     self as engine, Answer, Coverage, Limits, QueryError, RecordingFile, Scope, Source,
 };
-use crate::tui::session::{EntryMeta, SessionId, SessionSource, catalog, store};
+use crate::tui::session::{EntryMeta, SessionId, SessionSource, catalog, otlp, store};
 
 /// `--format json`'s envelope version. Only gains fields within a version.
 pub const QUERY_JSON_VERSION: u32 = 1;
@@ -355,9 +355,9 @@ impl Drop for StopOn {
     }
 }
 
-/// `--schema`: the six names, a line per column, the contract version, and
-/// the built-in recipes as runnable SQL, each under a `-- name: purpose`
-/// line.
+/// `--schema`: the six names, a line per column, the contract version, the
+/// machine metric names with their kind, unit and OTLP mapping, and the
+/// built-in recipes as runnable SQL, each under a `-- name: purpose` line.
 fn write_schema(out: &mut dyn Write) -> anyhow::Result<()> {
     let mut text = format!("explorer schema version {}\n", store::SCHEMA_VERSION);
     for t in engine::TABLES {
@@ -368,6 +368,28 @@ fn write_schema(out: &mut dyn Write) -> anyhow::Result<()> {
         for (c, ty) in t.columns {
             text.push_str(&format!("  {c:width$}  {ty}\n"));
         }
+    }
+    // The machine metric names, frozen (I9), and what the OTLP export
+    // writes each as (D27).
+    text.push_str(&format!(
+        "\nmachine metrics (OTLP: semantic conventions {}, {})\n",
+        otlp::SEMCONV_VERSION,
+        otlp::SCHEMA_URL
+    ));
+    let width = otlp::MACHINE_METRICS
+        .iter()
+        .map(|m| m.name.len())
+        .max()
+        .unwrap_or(0);
+    for m in otlp::MACHINE_METRICS {
+        let (to, instrument) = m.otel.unwrap_or(("as named", otlp::Instrument::Gauge));
+        text.push_str(&format!(
+            "  {name:width$}  {kind:7}  {unit:5}  otlp {to}, {instrument}\n",
+            name = m.name,
+            kind = m.kind,
+            unit = m.unit,
+            instrument = instrument.as_str(),
+        ));
     }
     text.push_str("\nrecipes\n");
     for r in engine::RECIPES {
