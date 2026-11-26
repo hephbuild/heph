@@ -191,7 +191,7 @@ impl ManagedDriver for Driver {
             .iter()
             .find(|i| i.origin_id == SRC_ORIGIN)
             .map(|i| i.r#ref.r#ref.format())
-            .context("no `src` input")?;
+            .with_context(|| format!("{addr}: no `src` input"))?;
         // The output is `<pkg>/<name>` (see `parse`).
         let dest = req.sandbox_pkg_dir.join(&req.request.target.addr.name);
         hcore::blocking::run(move || {

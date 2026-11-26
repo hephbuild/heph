@@ -34,7 +34,7 @@ gh = heph.gh.release_asset(
 | `credentials` | none | Credential targets (`docs/CREDENTIALS.md`) for a private repository: the asset is fetched through the API. See [Private repositories](#private-repositories). |
 | `server_url` | `https://github.com` | The GitHub server the release is on. See [`server_url` and `api_url`](#server_url-and-api_url). |
 | `api_url` | derived from `server_url` | Its REST API, where a private asset is looked up and fetched. |
-| `cache` | local and remote; the release JSON local only | Caching for the asset (fetched, and unpacked with `extract`) and, with `credentials`, the release JSON. The shape every driver's `cache` takes: `False` turns off both tiers, `{"remote": False}` keeps them local-only. Passed, it applies to the release JSON too. See [Private repositories](#private-repositories). |
+| `cache` | local and remote; the release JSON local only | Caching for the asset (fetched, and unpacked with `extract`) and, with `credentials`, the release JSON. The shape every driver's `cache` takes: `False` turns off both tiers, `{"remote": False}` keeps them local-only. The release JSON takes its `enabled` and `history` (`False` turns it off too) but stays local-only unless this is a dict that says `"remote": True`. See [Private repositories](#private-repositories). |
 
 ## What it declares
 
@@ -53,6 +53,9 @@ exactly as if the BUILD file had written them, and the engine builds them:
 The same holds for `credentials`: `<name>_release` sets `http_fetch`'s
 `unpinned` option, so a private `release_asset` needs a heph whose `http_fetch`
 knows it. An older one refuses the unknown key when it parses that target.
+Likewise the asset fetch sets `http_fetch`'s `refresh` option: a newer gh
+plugin on a host whose `http_fetch` predates it gets a loud unknown-key refusal
+at parse, never a silently different target.
 
 `<name>_archive` (and, with `credentials`, `<name>_release` and `<name>_url`)
 are reserved in the calling package. Nothing refuses a hand-written target with
@@ -219,7 +222,9 @@ the network stays in `http_fetch`:
   fails here, and the error lists the names it does have.
 - the asset (`name`, or `<name>_archive` with `extract`): an `http_fetch` with
   `url = "${read://<pkg>:<name>_url}"` (`docs/DEFERRED_VALUES.md`),
-  `Accept: application/octet-stream`, the credentials and `sha256`.
+  `Accept: application/octet-stream`, the credentials, `sha256`, and
+  `refresh = [":<name>_release"]`, so a 404 there names the command that
+  refetches the JSON.
 
 The release JSON is cached by its URL and headers, so a warm build makes no API
 call. Its bytes change with every download (they carry download counts), so it
@@ -228,24 +233,28 @@ warn about it. Pinning the asset is enough to build without a warning.
 
 It is cached **locally only** by default. The JSON holds more than the asset it
 leads to: the release notes, every asset's name, size and id, and the logins of
-whoever uploaded them. `cache = True` (or `{"remote": True}`) puts it in the
-remote cache with the other targets, where anyone who can read that cache can
-read it. `cache = False` caches nothing, so every build looks the release up
-again: one API call per private asset per build.
+whoever uploaded them. Only `cache = {"remote": True}`, written as such, puts
+it in the remote cache with the other targets, where anyone who can read that
+cache can read it. Any other `cache` gives it its `enabled` and `history` and
+keeps it local: `cache = True` or `{"history": 3}` sends the asset to the
+remote cache but not the JSON. `cache = False` caches nothing, so every build
+looks the release up again: one API call per private asset per build.
 
 A cached JSON is a snapshot of the release when it was fetched, and its key is
 the tag, not the content:
 
 - An asset uploaded again under the same name gets a new id. The cached JSON
   still names the old one, so the asset fetch 404s, and its error names
-  `//<pkg>:<name>_url`, the target the URL came from.
+  `//<pkg>:<name>_url`, the target the URL came from, and prints the command
+  below.
 - A JSON fetched after the release was created but before the asset was
   uploaded lacks the asset, so `<name>_url` fails with `the release has no
   asset named …`, and its error prints the command below.
 
 Either way, refetch the JSON with `heph run --force //<pkg>:<name>_release`,
 then build again. A forced run overwrites the cached entry, in the remote
-cache too when it is stored there.
+cache too when it is stored there, from a machine that writes the remote
+cache; a read-only client refreshes only its own.
 
 The credential is a netrc presentation for the API host (`docs/CREDENTIALS.md`),
 the token as the password. GitHub ignores the login, but netrc needs one:
@@ -288,7 +297,9 @@ there: `http_fetch` drops it on any redirect to another origin.
   can read the release but not the asset. A `checksum mismatch` there is a
   wrong `sha256`, as for a public asset.
 - 404 on the asset fetch after the asset was uploaded again: the cached
-  release JSON names its old id. `heph run --force //<pkg>:<name>_release`.
+  release JSON names its old id. The error names `//<pkg>:<name>_url`, where
+  the URL came from, and prints the exact command that fixes it:
+  `heph run --force //<pkg>:<name>_release`, not the uncached `_url`.
 - An identity without access to the repository gets a 404 on `<name>_release`
   only when the JSON is not cached. On a hit (a JSON fetched by another
   identity, from the same local cache or the remote one) it gets the JSON, then

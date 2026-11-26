@@ -36,7 +36,7 @@ use hplugin::driver::targetdef::path::{CodegenMode, Content, Path};
 use hplugin::driver::targetdef::{Output, TargetDef};
 use hplugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, Deferred,
-    ParseRequest, ParseResponse,
+    ParseRequest, ParseResponse, TargetAddr,
 };
 use hplugin::htspec::{Spec, TargetSpecCache};
 use std::collections::BTreeMap;
@@ -83,6 +83,13 @@ struct HttpFetchSpec {
     /// not the bytes, so a cached entry that has gone stale is refreshed with
     /// `heph run --force <this target>`.
     unpinned: bool,
+    /// Targets to refresh when the fetched url turns out stale, as addresses
+    /// relative to the package (`[":tool_release"]`). Only with a computed
+    /// `url` (`${read://…}`): when the server answers 404, the error says
+    /// `heph run --force <addr>` for each, naming the cached lookup the url was
+    /// derived from rather than the producer of the url. Never hashed: it only
+    /// words an error.
+    refresh: Vec<String>,
     /// Output filename, relative to the target's package. Defaults to the URL's
     /// last path segment (`…/heph-govet_linux_amd64` → `heph-govet_linux_amd64`),
     /// which is what the server is serving; set it to rename the fetched file.
@@ -140,6 +147,10 @@ struct HttpFetchDef {
     /// The spec's `unpinned`. Only silences warnings, so it is not hashed.
     #[serde(default)]
     unpinned: bool,
+    /// The spec's `refresh`, each a full `//pkg:name`. Only words the error
+    /// of a stale computed url, so it is not hashed.
+    #[serde(default)]
+    refresh: Vec<String>,
 }
 
 /// Bump to invalidate cached fetches when the output layout changes.
@@ -261,6 +272,8 @@ impl ManagedDriver for Driver {
         }
 
         let headers = normalize_headers(&spec.headers).with_context(|| addr.format())?;
+        let refresh = refresh_addrs(&spec.refresh, deferred, &addr.package)
+            .with_context(|| format!("{}: `refresh`", addr.format()))?;
 
         let def = HttpFetchDef {
             url,
@@ -269,6 +282,7 @@ impl ManagedDriver for Driver {
             executable: spec.executable,
             headers,
             unpinned: spec.unpinned,
+            refresh,
         };
 
         let hash = {
@@ -378,7 +392,7 @@ impl ManagedDriver for Driver {
         .await;
         let checked = fetched.map_err(|err| {
             match refusal_hint(&err, selected.as_ref())
-                .or_else(|| stale_url_hint(&err, def.url.raw()))
+                .or_else(|| stale_url_hint(&err, def.url.raw(), &def.refresh))
             {
                 Some(hint) => err.context(hint),
                 None => err,
@@ -450,22 +464,69 @@ fn refusal_hint(err: &anyhow::Error, selected: Option<&auth::Selected>) -> Optio
     })
 }
 
+/// The `refresh` attribute as the def holds it: each address resolved against
+/// the target's package and written in full (`//pkg:name`), the form
+/// `heph run --force` takes. Refused on a literal url, where no stale lookup
+/// can be behind a 404, and on an address that picks part of a target's
+/// output (`|group`, `[filters]`), which `heph run --force` does not take.
+fn refresh_addrs(
+    refresh: &[String],
+    deferred: bool,
+    package: &hmodel::htpkg::PkgBuf,
+) -> anyhow::Result<Vec<String>> {
+    if !refresh.is_empty() && !deferred {
+        anyhow::bail!(
+            "applies only to a url computed by another target (`${{read://…}}`); this url is \
+             literal"
+        );
+    }
+    refresh
+        .iter()
+        .map(|s| {
+            let a = TargetAddr::parse(s, package)
+                .with_context(|| format!("parsing target address {s:?}"))?;
+            anyhow::ensure!(
+                a.output.is_none() && a.filters.is_empty(),
+                "{s:?} names part of a target's output; name the target itself"
+            );
+            Ok(a.r#ref.format())
+        })
+        .collect()
+}
+
 /// What to add to a 404 on a url read from another target (`raw` is the url as
 /// written, `${read://…}`), so the error names the target the url came from: a
 /// value derived from a cached lookup can name something the server no longer
-/// has. `None` for a literal url or any other failure.
-fn stale_url_hint(err: &anyhow::Error, raw: &str) -> Option<String> {
+/// has. With `refresh` (full addresses, see [`refresh_addrs`]), it says the
+/// exact command for each; without, how to find it. `None` for a literal url or
+/// any other failure.
+fn stale_url_hint(err: &anyhow::Error, raw: &str, refresh: &[String]) -> Option<String> {
     if hfetch::http_status(err) != Some(404) {
         return None;
     }
     let r = hcore::template::first_ref_of(raw, &[hcore::template::READ_KIND])?;
     let producer =
         hmodel::htaddr::parse_addr(r.arg).map_or_else(|_| r.arg.to_string(), |a| a.format());
-    Some(format!(
+    let head = format!(
         "the url is the output of {producer}, and the server has nothing there, or nothing \
-         this identity may read. If {producer} computed it from a cached lookup, that lookup \
-         may be stale: refresh it with `heph run --force <the lookup's address>` and build again"
-    ))
+         this identity may read"
+    );
+    Some(if refresh.is_empty() {
+        format!(
+            "{head}. If {producer} computed it from a cached lookup, that lookup may be stale: \
+             refresh it with `heph run --force <the lookup's address>` and build again"
+        )
+    } else {
+        let commands = refresh
+            .iter()
+            .map(|a| format!("`heph run --force {a}`"))
+            .collect::<Vec<_>>()
+            .join(", then ");
+        format!(
+            "{head}. {producer} computed it from a cached lookup, which may be stale: refresh it \
+             with {commands} and build again"
+        )
+    })
 }
 
 /// [`fetch`], abandoned the moment `ctoken` fires.
@@ -1610,6 +1671,64 @@ mod tests {
         assert!(format!("{err:#}").contains("contradict"), "{err:#}");
     }
 
+    /// `refresh` resolves against the package into full addresses, moves no
+    /// key, and is refused on a literal url and on a partial address.
+    #[tokio::test]
+    async fn parse_refresh_resolves_addresses_but_moves_no_key() {
+        let parse = |url: &str, extra: &[(&str, Value)]| {
+            let mut config = HashMap::from([
+                ("url".to_string(), Value::String(url.to_string())),
+                ("out".to_string(), Value::String("tool".to_string())),
+            ]);
+            config.extend(extra.iter().map(|(k, v)| ((*k).to_string(), v.clone())));
+            async move {
+                Driver
+                    .parse(parse_req("//p:fetch", config), &StdCancellationToken::new())
+                    .await
+            }
+        };
+        let list = |addrs: &[&str]| {
+            Value::List(
+                addrs
+                    .iter()
+                    .map(|a| Value::String((*a).to_string()))
+                    .collect(),
+            )
+        };
+        let read = "${read://p:tool_url}";
+        let plain = parse(read, &[]).await.expect("parse").target_def;
+        let with = parse(read, &[("refresh", list(&[":tool_release", "//q:other"]))])
+            .await
+            .expect("parse")
+            .target_def;
+        assert_eq!(
+            with.def_de::<HttpFetchDef>().refresh,
+            ["//p:tool_release", "//q:other"]
+        );
+        assert!(plain.def_de::<HttpFetchDef>().refresh.is_empty());
+        assert_eq!(with.hash, plain.hash, "`refresh` moves no key");
+
+        for (url, refresh, why) in [
+            (
+                "https://x/tool",
+                ":tool_release",
+                "applies only to a url computed",
+            ),
+            (read, ":tool_release|out", "names part of a target's output"),
+            (
+                read,
+                ":tool_release[x.json]",
+                "names part of a target's output",
+            ),
+        ] {
+            let Err(err) = parse(url, &[("refresh", list(&[refresh]))]).await else {
+                panic!("{url} {refresh}: refused");
+            };
+            let err = format!("{err:#}");
+            assert!(err.contains("`refresh`") && err.contains(why), "{err}");
+        }
+    }
+
     /// `cache = False` turns off both tiers.
     #[tokio::test]
     async fn parse_cache_false_disables_both_tiers() {
@@ -2145,7 +2264,8 @@ mod tests {
 
         // Pinned from before `headers` existed: the url/sha256/out/executable
         // hash of this target must not move. `unpinned` only silences
-        // warnings, so it moves no key either.
+        // warnings, and `refresh` only words an error, so they move no key
+        // either.
         let mut h = DebugHasher::new(Xxh3Default::new(), || "pin".to_string());
         HttpFetchDef {
             url: Deferred::new("https://x/tool"),
@@ -2154,6 +2274,7 @@ mod tests {
             executable: false,
             headers: vec![],
             unpinned: true,
+            refresh: vec!["//p:tool_release".to_string()],
         }
         .hash(&mut h);
         let mut old = DebugHasher::new(Xxh3Default::new(), || "pin".to_string());
@@ -2324,14 +2445,24 @@ mod tests {
         // address, and how to refresh a stale lookup; a literal url, or any
         // other status, gets no such hint.
         let read = "${read://tools:gh_url}";
-        let stale = stale_url_hint(&missing, read).expect("hint");
+        let stale = stale_url_hint(&missing, read, &[]).expect("hint");
         assert!(
             stale.contains("//tools:gh_url")
                 && !stale.contains("${read")
-                && stale.contains("heph run --force"),
+                && stale.contains("`heph run --force <the lookup's address>`"),
             "{stale}"
         );
-        assert_eq!(stale_url_hint(&missing, "https://x/tool"), None);
-        assert_eq!(stale_url_hint(&forbidden, read), None);
+        // With `refresh`, the exact command for each lookup, never the
+        // producer of the url (it is uncached: forcing it recovers nothing).
+        let refresh = ["//tools:gh_release".to_string(), "//t:b".to_string()];
+        let exact = stale_url_hint(&missing, read, &refresh).expect("hint");
+        assert!(
+            exact.contains("`heph run --force //tools:gh_release`, then `heph run --force //t:b`")
+                && !exact.contains("--force //tools:gh_url")
+                && !exact.contains("<the lookup's address>"),
+            "{exact}"
+        );
+        assert_eq!(stale_url_hint(&missing, "https://x/tool", &refresh), None);
+        assert_eq!(stale_url_hint(&forbidden, read, &refresh), None);
     }
 }

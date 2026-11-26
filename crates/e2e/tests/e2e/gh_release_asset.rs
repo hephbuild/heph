@@ -740,9 +740,9 @@ async fn run_forced(ws: &htestkit::Workspace, addr: &str) -> anyhow::Result<()> 
 
 /// The cached release JSON names an asset id the server no longer has (the
 /// asset was uploaded again): the asset fetch 404s, and the error names the
-/// target the URL came from and `heph run --force`, without the JSON being
-/// looked up again. Forcing `<name>_release` refetches it, and the next build
-/// fetches the new id.
+/// target the URL came from and the exact `heph run --force` command for the
+/// JSON's target, without the JSON being looked up again. Forcing
+/// `<name>_release` refetches it, and the next build fetches the new id.
 #[tokio::test]
 async fn release_asset_with_a_stale_cached_release_json_says_how_to_refresh_it()
 -> anyhow::Result<()> {
@@ -758,10 +758,11 @@ async fn release_asset_with_a_stale_cached_release_json_says_how_to_refresh_it()
     for want in [
         "404",
         "the url is the output of //p:tool_url",
-        "heph run --force",
+        "`heph run --force //p:tool_release`",
     ] {
         assert!(msg.contains(want), "{want}: {msg}");
     }
+    assert!(!msg.contains("--force //p:tool_url"), "uncached: {msg}");
     assert_eq!(
         paths(&requests),
         [RELEASE_PATH, asset_path(7).as_str()],
