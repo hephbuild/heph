@@ -744,6 +744,38 @@ fn resources_vs_machine() {
             want: vec![("cpu", 2000, 0, 0, 8000)],
         },
         VersusCase {
+            row: "cpu and memory pools in one session: a row each, each against its own \
+                  machine figure (cpu 8/8 against busy 30%, memory 2/32 GiB against \
+                  60 of 64 GiB used)",
+            end_ms: Some(2000),
+            pools: vec![
+                held("cpu", 0, 8.0, 8.0),
+                held("memory", 0, 2.0 * GIB, 32.0 * GIB),
+            ],
+            metrics: [
+                vec![(MEM_LIMIT, 0, 64.0 * GIB)],
+                busy_at([0, 1000, 2000], 0.3),
+                [0, 1000, 2000].map(|t| (USED, t, 60.0 * GIB)).to_vec(),
+            ]
+            .concat(),
+            want: vec![("cpu", 2000, 0, 0, 0), ("memory", 0, 2000, 0, 0)],
+        },
+        VersusCase {
+            row: "a pool of capacity 0: no held fraction, so no row (and no division error)",
+            end_ms: Some(2000),
+            pools: vec![held("cpu", 0, 0.0, 0.0), held("cpu", 1000, 2.0, 0.0)],
+            metrics: busy_at([0, 1000, 2000], 0.3),
+            want: vec![],
+        },
+        VersusCase {
+            row: "held above capacity (10/8): held over 90%, so against busy 30% it is \
+                  declared above use, never clamped into matched",
+            end_ms: Some(2000),
+            pools: vec![held("cpu", 0, 10.0, 8.0)],
+            metrics: busy_at([0, 1000, 2000], 0.3),
+            want: vec![("cpu", 2000, 0, 0, 0)],
+        },
+        VersusCase {
             row: "a live session: up to its last row",
             end_ms: None,
             pools: vec![held("cpu", 0, 8.0, 8.0)],
