@@ -430,6 +430,83 @@ fn sampler_reads_cgroup_quota() {
     .unwrap();
     let busy = core.sample(start + TICK).cpu_busy.expect("busy");
     assert!(close(busy, 0.75), "{busy}");
+
+    // End to end, a quota looser than the CPU count: the limit is the host's,
+    // and busy comes from /proc/stat, never from the cgroup's cpu.stat.
+    let dir = with(&[
+        (&format!("{leaf}/cpu.max"), "800000 100000\n"),
+        (&format!("{leaf}/cpu.stat"), "usage_usec 1000000\n"),
+        ("proc/stat", "cpu 1 1 1 1\n"),
+        ("proc/meminfo", MEMINFO),
+        ("proc/self/statm", "1 1\n"),
+    ]);
+    let (mut core, info) = Core::start(ProcSources::open(dir.path(), Ok(4096), Ok(4)), start);
+    let limit = info.cpu_limit.expect("limit");
+    assert_eq!(limit.from, CpuLimitFrom::Host);
+    assert!(close(limit.cpus, 4.0));
+    // cpu.stat would read 3.5 s over 1 s of 8 CPUs, 0.4375; /proc/stat reads
+    // 1 busy tick of 4, 0.25.
+    std::fs::write(
+        dir.path().join(leaf).join("cpu.stat"),
+        "usage_usec 4500000\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("proc/stat"), "cpu 2 1 1 4\n").unwrap();
+    let busy = core.sample(start + TICK).cpu_busy.expect("busy");
+    assert!(close(busy, 0.25), "{busy}");
+}
+
+/// `Core::sample` over the Linux file sources allocates nothing, under a
+/// quota (cpu.stat read whole) and on the host (/proc/stat's first line):
+/// each tick re-reads the open files into the one buffer.
+#[test]
+fn sampler_samples_files_without_allocating() {
+    use crate::tui::progress::tests::allocs_during;
+
+    let leaf = "sys/fs/cgroup/a/b";
+    let quota = tree(&[
+        ("proc/self/cgroup", "0::/a/b\n"),
+        (&format!("{leaf}/cpu.max"), "200000 100000\n"),
+        (&format!("{leaf}/cpu.stat"), "usage_usec 1000000\n"),
+        ("proc/stat", "cpu 1 1 1 1\n"),
+        ("proc/meminfo", MEMINFO),
+        ("proc/self/statm", "100 25\n"),
+    ]);
+    let host = tree(&[
+        ("proc/stat", "cpu 1 1 1 1\n"),
+        ("proc/meminfo", MEMINFO),
+        ("proc/self/statm", "100 25\n"),
+    ]);
+    // Each tick: 1 s of usage over a 2-CPU quota, or one busy and one idle
+    // tick on the host; 0.5 either way.
+    let usage = |k: u32| format!("usage_usec {}\n", 1_000_000 * (1 + k));
+    let ticks = |k: u32| format!("cpu {} 1 1 {}\n", 1 + k, 1 + k);
+    for (line, dir, counter, contents) in [
+        (
+            "quota",
+            &quota,
+            format!("{leaf}/cpu.stat"),
+            &usage as &dyn Fn(u32) -> String,
+        ),
+        ("host", &host, "proc/stat".to_owned(), &ticks),
+    ] {
+        let start = Instant::now();
+        let (mut core, _) = Core::start(ProcSources::open(dir.path(), Ok(4096), Ok(8)), start);
+        let counter = dir.path().join(counter);
+        for k in 1..=5u32 {
+            // Advance the counter outside the measured closure.
+            std::fs::write(&counter, contents(k)).unwrap();
+            let at = start + TICK * k;
+            let mut sample = None;
+            let n = allocs_during(|| sample = Some(core.sample(at)));
+            let sample = sample.expect("sample");
+            assert_eq!(n, 0, "{line}: tick {k} allocated {n} times");
+            assert!(sample.failed.is_empty(), "{line}: {:?}", sample.failed);
+            assert!(close(sample.cpu_busy.expect("busy"), 0.5), "{line}");
+            assert_eq!(sample.memory_used, Some(12_000_000 * 1024), "{line}");
+            assert_eq!(sample.process_resident, Some(25 * 4096), "{line}");
+        }
+    }
 }
 
 // ---- the thread ----
