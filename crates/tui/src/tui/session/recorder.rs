@@ -191,14 +191,15 @@ impl Shared {
 
     /// The owner's say: the session is finished. The lock goes now if the
     /// thread has exited, after waiting for that until `deadline`; otherwise
-    /// the thread's exit frees it ([`ReleaseOnExit`]).
-    fn finish_lock(&self, deadline: Instant) {
+    /// the thread's exit frees it ([`ReleaseOnExit`]). Whether the thread had
+    /// exited: nothing writes the recording any more.
+    fn finish_lock(&self, deadline: Instant) -> bool {
         let mut state = self.lock_state();
         state.finished = true;
         while !state.exited {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
-                return;
+                return false;
             }
             state = self
                 .exited
@@ -207,6 +208,7 @@ impl Shared {
                 .0;
         }
         drop(state.file.take());
+        true
     }
 }
 
@@ -703,7 +705,7 @@ pub(crate) fn is_critical(record: &SessionRecord) -> bool {
 pub(crate) type Gate = Arc<(Mutex<bool>, std::sync::Condvar)>;
 
 /// Block until `gate` opens.
-fn wait_for(gate: &Gate) {
+pub(crate) fn wait_for(gate: &Gate) {
     let (open, opened) = &**gate;
     let mut open = open.lock().unwrap_or_else(PoisonError::into_inner);
     while !*open {
@@ -922,11 +924,15 @@ impl Recorder {
     /// write connection closed: this waits for that within `timeout`. If the
     /// thread does not answer or exit in time, the lock stays held: the thread
     /// releases it once its `End` and seal are done, or as it exits.
-    pub fn finish(&self, exit_code: Option<i32>, panicked: bool, timeout: Duration) {
+    ///
+    /// What came of it says whether the seal-time export may read the
+    /// recording: [`Finished::Ended`] only once the thread has exited, its
+    /// write connection and `rw_open` registration closed.
+    pub fn finish(&self, exit_code: Option<i32>, panicked: bool, timeout: Duration) -> Finished {
         let shared = &self.tap.shared;
         // From here every tap drops its sends: nothing may follow `End`.
         if shared.finished.swap(true, Ordering::AcqRel) {
-            return;
+            return Finished::Again;
         }
         let deadline = Instant::now() + timeout;
         if !shared.is_stopped() {
@@ -963,8 +969,25 @@ impl Recorder {
                 }
             }
         }
-        shared.finish_lock(deadline);
+        if shared.finish_lock(deadline) {
+            Finished::Ended
+        } else {
+            Finished::Late
+        }
     }
+}
+
+/// What [`Recorder::finish`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Finished {
+    /// This call ended the recording: its thread has exited, so nothing
+    /// writes it any more.
+    Ended,
+    /// The recorder did not answer, or its thread did not exit, in time: it
+    /// may still be writing.
+    Late,
+    /// A call before this one did it.
+    Again,
 }
 
 /// Where the recording is against its caps (D15).

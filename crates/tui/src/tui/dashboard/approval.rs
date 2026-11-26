@@ -51,35 +51,63 @@ const WHEEL_ROWS: isize = 3;
 
 /// Where notices are read from: the run's store under `roots` (heph's home
 /// and the workspace root), through `read` — the engine's
-/// `read_notice_from_store`, which this crate cannot reach.
+/// `read_notice_from_store`, which this crate cannot reach — or, for a
+/// recording opened from a file (spec I7), the texts its export recorded.
 #[derive(Clone)]
-pub struct NoticeStore {
-    roots: NoticeRoots,
-    read: ReadNotice,
+pub enum NoticeStore {
+    Store {
+        roots: NoticeRoots,
+        read: ReadNotice,
+    },
+    Recorded(crate::tui::session::recording::RecordedNotices),
 }
 
 impl std::fmt::Debug for NoticeStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("NoticeStore")
-            .field("roots", &self.roots)
-            .finish_non_exhaustive()
+        match self {
+            Self::Store { roots, .. } => f
+                .debug_struct("NoticeStore")
+                .field("roots", roots)
+                .finish_non_exhaustive(),
+            Self::Recorded(n) => f.debug_tuple("Recorded").field(&n.len()).finish(),
+        }
     }
 }
 
 impl NoticeStore {
     pub fn new(roots: NoticeRoots, read: ReadNotice) -> Self {
-        Self { roots, read }
+        Self::Store { roots, read }
     }
 
-    /// The notice kept in `sources`, at most `NOTICE_READ_CAP` bytes plus the
-    /// truncation line; `None` when a source is not where it was recorded or
-    /// there is none. Blocking.
-    pub fn read(&self, sources: &[NoticeSource]) -> Option<String> {
+    /// Notice `name` of request `seq` of `addr`, kept in `sources`: at most
+    /// `NOTICE_READ_CAP` bytes plus the truncation line; `None` when a source
+    /// is not where it was recorded, there is none, or (recorded) the export
+    /// holds no text for it. Blocking.
+    pub fn read(
+        &self,
+        addr: &str,
+        seq: u64,
+        name: &str,
+        sources: &[NoticeSource],
+    ) -> Option<String> {
         if sources.is_empty() {
             return None;
         }
-        (self.read)(&self.roots, sources)
+        match self {
+            Self::Store { roots, read } => read(roots, sources),
+            Self::Recorded(n) => n.get(&(addr.to_owned(), seq, name.to_owned())).cloned(),
+        }
     }
+}
+
+/// What the notice reader is asked for: notice `name` of request `seq` of
+/// `addr`, kept in `sources`.
+#[derive(Debug)]
+struct NoticeAsk {
+    key: NoticeKey,
+    addr: String,
+    name: String,
+    sources: Vec<NoticeSource>,
 }
 
 /// A notice's lines as a screen draws them, or why there are none.
@@ -102,20 +130,22 @@ struct NoticeKey {
 /// out.
 #[derive(Debug)]
 struct NoticeFeed {
-    ask: Sender<(NoticeKey, Vec<NoticeSource>)>,
+    ask: Sender<NoticeAsk>,
     found: Receiver<(NoticeKey, Option<Vec<String>>)>,
 }
 
 impl NoticeFeed {
     fn spawn(store: NoticeStore, redact: Redact) -> Option<Self> {
-        let (ask, todo) = mpsc::channel::<(NoticeKey, Vec<NoticeSource>)>();
+        let (ask, todo) = mpsc::channel::<NoticeAsk>();
         let (send, found) = mpsc::channel();
         std::thread::Builder::new()
             .name("heph-notice".into())
             .spawn(move || {
-                while let Ok((key, sources)) = todo.recv() {
-                    let lines = store.read(&sources).map(|text| drawable(&text, &redact));
-                    if send.send((key, lines)).is_err() {
+                while let Ok(a) = todo.recv() {
+                    let lines = store
+                        .read(&a.addr, a.key.seq, &a.name, &a.sources)
+                        .map(|text| drawable(&text, &redact));
+                    if send.send((a.key, lines)).is_err() {
                         break;
                     }
                 }
@@ -465,10 +495,16 @@ impl ApprovalScreen {
         }
         // A notice that names no source is unavailable without asking.
         let asked = !n.sources.is_empty()
-            && self
-                .feed
-                .as_ref()
-                .is_some_and(|f| f.ask.send((key, n.sources.clone())).is_ok());
+            && self.feed.as_ref().is_some_and(|f| {
+                f.ask
+                    .send(NoticeAsk {
+                        key,
+                        addr: self.req.addr.clone(),
+                        name: n.name.clone(),
+                        sources: n.sources.clone(),
+                    })
+                    .is_ok()
+            });
         let text = if asked {
             NoticeText::Reading
         } else {

@@ -9,16 +9,19 @@
 //! `heph.session.pool.*` rows of an ended session), then what the run is stuck
 //! on and what to do next.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 
 use anyhow::Context as _;
 use futures::StreamExt as _;
 use serde::Serialize;
 
+use super::reference::{Opener, Resolved, open_ref};
 use super::{
     BlockedOn, Out, SessionState, ViewOpts, ago, blocked_on, command_line, derive_state, escape,
-    list_all, recorded_by_newer, require_known, resolve,
+    escape_text, list_all, recorded_by_newer, require_known,
 };
+use crate::tui::session::recording::{ForeignSource, RecordingState};
 use crate::tui::session::{
     ApprovalStanding, HeaderKind, SessionEntry, SessionItem, SessionMeta, SessionRecordKind,
     SessionSnapshot, SessionSource,
@@ -149,8 +152,10 @@ async fn fold(
 pub struct ShowView<'a> {
     /// The session id.
     id: String,
-    /// Viewer-computed: running, waiting, quiet, ok, failed, lost or unknown.
-    state: SessionState,
+    /// Viewer-computed: running, waiting, quiet, ok, failed, lost or unknown;
+    /// for a recording opened by path or URL that is not whole, snapshot or
+    /// incomplete. An open enum.
+    state: StateJson,
     /// Every wait, each holder mapped to its session: `list --json`'s shape.
     blocked_on: Vec<BlockedOn>,
     /// The session at the root of the first lock chain, the one the run is
@@ -194,6 +199,10 @@ pub struct ShowView<'a> {
     /// while it runs (the summaries are written at its end). PR 5 adds the
     /// `resources_vs_machine` totals to each entry.
     pools: &'a [PoolSummary],
+    /// A recording opened by path or URL: where from, whether it is whole,
+    /// and what its export carried. Absent for a local session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    foreign: Option<ForeignJson<'a>>,
 }
 
 impl<'a> ShowView<'a> {
@@ -204,7 +213,7 @@ impl<'a> ShowView<'a> {
     )]
     fn new(
         id: String,
-        state: SessionState,
+        state: StateJson,
         blocked_on: Vec<BlockedOn>,
         chain_root: Option<String>,
         next: Next,
@@ -212,6 +221,7 @@ impl<'a> ShowView<'a> {
         skipped: u64,
         incomplete: bool,
         pools: &'a [PoolSummary],
+        foreign: Option<ForeignJson<'a>>,
         snapshot: &'a SessionSnapshot,
     ) -> Self {
         // Destructured, so a field added to the snapshot is a compile error
@@ -252,6 +262,7 @@ impl<'a> ShowView<'a> {
             incomplete,
             incomplete_reason: incomplete.then_some(IncompleteReason::SizeCap),
             pools,
+            foreign,
         }
     }
 }
@@ -310,18 +321,118 @@ pub(crate) enum NextKind {
     None,
 }
 
+/// What `show` adds for a recording opened by path or URL (spec I7): where
+/// it came from, whether it is whole, and the notices and root failure logs
+/// its export carried. Absent for a local session.
+#[derive(Serialize, output::Shape)]
+pub(crate) struct ForeignJson<'a> {
+    /// The path, or the URL without its credentials.
+    origin: &'a str,
+    /// `snapshot` (exported while it ran) or `incomplete` (no end
+    /// recorded); `null` for a whole recording. An open enum.
+    partial: Option<Partial>,
+    notices: Vec<NoticeJson<'a>>,
+    failure_logs: Vec<FailureLogJson<'a>>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, output::Shape)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Partial {
+    Snapshot,
+    Incomplete,
+}
+
+/// `show --json`'s `state`: a [`SessionState`], or, for a recording opened by
+/// path or URL that is not whole, its [`Partial`] (`snapshot`,
+/// `incomplete`). Derived from a local session's liveness, those would read
+/// `lost`, which says something about a process this viewer cannot see. An
+/// open enum. Flat rather than `untagged` over the two, which the output
+/// layer's field table cannot list; the values are the same strings.
+#[derive(Debug, Clone, Copy, Serialize, output::Shape)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum StateJson {
+    Running,
+    Waiting,
+    Quiet,
+    Ok,
+    Failed,
+    Lost,
+    Unknown,
+    Snapshot,
+    Incomplete,
+}
+
+impl StateJson {
+    fn new(state: SessionState, partial: Option<Partial>) -> Self {
+        match (partial, state) {
+            (Some(Partial::Snapshot), _) => Self::Snapshot,
+            (Some(Partial::Incomplete), _) => Self::Incomplete,
+            (None, SessionState::Running) => Self::Running,
+            (None, SessionState::Waiting) => Self::Waiting,
+            (None, SessionState::Quiet) => Self::Quiet,
+            (None, SessionState::Ok) => Self::Ok,
+            (None, SessionState::Failed) => Self::Failed,
+            (None, SessionState::Lost) => Self::Lost,
+            (None, SessionState::Unknown) => Self::Unknown,
+        }
+    }
+}
+
+#[derive(Serialize, output::Shape)]
+pub(crate) struct NoticeJson<'a> {
+    addr: &'a str,
+    seq: u64,
+    name: &'a str,
+    text: &'a str,
+}
+
+#[derive(Serialize, output::Shape)]
+pub(crate) struct FailureLogJson<'a> {
+    addr: &'a str,
+    /// The log's last bytes (at most 1 MiB), as UTF-8 with invalid bytes
+    /// replaced.
+    log: Cow<'a, str>,
+    /// What came before them and was left out.
+    cut_bytes: u64,
+}
+
+/// `heph session show <ref>`: a local session, or a recording opened by path
+/// or URL.
 pub(crate) async fn show(
     sources: &[&dyn SessionSource],
     opts: ViewOpts,
     arg: &str,
     json: &output::JsonArgs<ShowView<'static>>,
     out: Out<'_>,
+    opener: &Opener,
 ) -> anyhow::Result<()> {
-    let (i, entry) = resolve(sources, arg, opts).await?;
+    match open_ref(sources, arg, opts, opener).await? {
+        Resolved::Local { index, entry } => {
+            let source = *sources
+                .get(index)
+                .context("the session's source went missing")?;
+            render(source, sources, entry, None, opts, json, out).await
+        }
+        Resolved::Foreign(rec) => {
+            // Reads the whole recording's session-wide rows: blocking work.
+            let foreign = hcore::blocking::run(move || rec.into_source()).await?;
+            let sources: [&dyn SessionSource; 1] = [&foreign];
+            let entry = foreign.entry().clone();
+            render(&foreign, &sources, entry, Some(&foreign), opts, json, out).await
+        }
+    }
+}
+
+async fn render(
+    source: &dyn SessionSource,
+    sources: &[&dyn SessionSource],
+    entry: SessionEntry,
+    foreign: Option<&ForeignSource>,
+    opts: ViewOpts,
+    json: &output::JsonArgs<ShowView<'static>>,
+    out: Out<'_>,
+) -> anyhow::Result<()> {
     let meta = require_known(&entry)?;
-    let source = *sources
-        .get(i)
-        .context("the session's source went missing")?;
     let state = derive_state(&entry, opts.now_ms, opts.stall);
 
     let mut folded = fold(source, &entry, meta).await?;
@@ -343,7 +454,55 @@ pub(crate) async fn show(
     } else {
         None
     };
-    let next = next_action(&entry, meta, state, &snapshot, chain_root);
+    let next = match foreign {
+        // Every other next step reads this machine's sessions or store.
+        Some(f) => Next {
+            kind: NextKind::None,
+            command: None,
+            argv: None,
+            cwd: None,
+            reason: if !f.failure_logs().is_empty() {
+                "a recording read from a file: the logs of its root failures are above".to_owned()
+            } else if state == SessionState::Failed {
+                // `--no-logs`, or a failure that left no log.
+                "a recording read from a file, with no failure logs in it: `heph inspect failure \
+                 <addr>` prints them on the machine that ran it"
+                    .to_owned()
+            } else {
+                "a recording read from a file: nothing to do from here".to_owned()
+            },
+        },
+        None => next_action(&entry, meta, state, &snapshot, chain_root),
+    };
+    let partial = foreign.and_then(|f| match f.state() {
+        RecordingState::Snapshot => Some(Partial::Snapshot),
+        RecordingState::Incomplete => Some(Partial::Incomplete),
+        RecordingState::Live | RecordingState::Finished { .. } => None,
+    });
+    let notices = foreign.map(|f| f.notices());
+    let notices: Vec<NoticeJson<'_>> = notices.as_deref().map_or_else(Vec::new, |n| {
+        let mut v: Vec<NoticeJson<'_>> = n
+            .iter()
+            .map(|((addr, seq, name), text)| NoticeJson {
+                addr,
+                seq: *seq,
+                name,
+                text,
+            })
+            .collect();
+        v.sort_by(|a, b| (a.seq, a.addr, a.name).cmp(&(b.seq, b.addr, b.name)));
+        v
+    });
+    let failure_logs: Vec<FailureLogJson<'_>> = foreign.map_or_else(Vec::new, |f| {
+        f.failure_logs()
+            .iter()
+            .map(|l| FailureLogJson {
+                addr: &l.addr,
+                log: String::from_utf8_lossy(&l.log),
+                cut_bytes: l.cut_bytes,
+            })
+            .collect()
+    });
     // A Y/N still acting on the build: shown for as long as it acts, never
     // for a run that is over.
     let standing = folded.standing.filter(|_| {
@@ -357,7 +516,7 @@ pub(crate) async fn show(
     if json.enabled() {
         let view = ShowView::new(
             entry.id.encode(),
-            state,
+            StateJson::new(state, partial),
             blocked_on(&snapshot, &entry, &every),
             chain_root.map(|r| r.id.encode()),
             next,
@@ -365,6 +524,12 @@ pub(crate) async fn show(
             folded.skipped,
             incomplete,
             &pools,
+            foreign.map(|f| ForeignJson {
+                origin: f.origin(),
+                partial,
+                notices,
+                failure_logs,
+            }),
             &snapshot,
         );
         return json
@@ -374,6 +539,14 @@ pub(crate) async fn show(
     let out = out.w;
 
     let mut text = String::new();
+    // A snapshot or an incomplete recording says so on its first line.
+    if let Some(f) = foreign {
+        text.push_str(&format!("read from {}", escape(f.origin())));
+        if let Some(caveat) = f.state().caveat() {
+            text.push_str(&format!(": {caveat}"));
+        }
+        text.push('\n');
+    }
     header(&mut text, &entry, meta, opts.now_ms);
     if recorded_by_newer(&meta.heph_version, opts.version) {
         text.push_str(&format!(
@@ -399,7 +572,9 @@ pub(crate) async fn show(
             if running == 1 { "" } else { "s" }
         ));
     }
-    if state == SessionState::Lost {
+    // A foreign recording with no end said so on its first line: nothing
+    // here knows whether its process went away.
+    if state == SessionState::Lost && foreign.is_none() {
         text.push_str(
             "the process went away without recording its end: the last events may be missing\n",
         );
@@ -441,6 +616,26 @@ pub(crate) async fn show(
         text.push_str(&standing_line(standing));
     }
     text.push_str(&stuck);
+    for n in &notices {
+        text.push_str(&format!(
+            "\napproval notice {} of request {} for {}:\n",
+            escape(n.name),
+            n.seq,
+            escape(n.addr)
+        ));
+        push_block(&mut text, n.text);
+    }
+    for l in &failure_logs {
+        text.push_str(&format!("\nlog of {}", escape(l.addr)));
+        if l.cut_bytes > 0 {
+            text.push_str(&format!(
+                " (its first {} left out)",
+                hcore::units::human_bytes(l.cut_bytes)
+            ));
+        }
+        text.push_str(":\n");
+        push_block(&mut text, &l.log);
+    }
     // The command alone on its line, so it can be copied; the reason below.
     text.push_str(&format!(
         "\nNext: {}\n  {}\n",
@@ -450,6 +645,16 @@ pub(crate) async fn show(
     out.write_all(text.as_bytes())
         .context("writing the session")?;
     Ok(())
+}
+
+/// Text from a recording (a notice, a log), escaped for the terminal with
+/// its lines kept, ending in a newline.
+fn push_block(text: &mut String, block: &str) {
+    let escaped = escape_text(block);
+    text.push_str(&escaped);
+    if !escaped.ends_with('\n') {
+        text.push('\n');
+    }
 }
 
 /// Why the recording is short of the run, which cap it hit, how far into the
@@ -818,7 +1023,7 @@ mod tests {
         }];
         let view = ShowView::new(
             "id".to_owned(),
-            SessionState::Running,
+            StateJson::Running,
             Vec::new(),
             None,
             Next {
@@ -832,6 +1037,12 @@ mod tests {
             1,
             true,
             &pools,
+            Some(ForeignJson {
+                origin: "origin",
+                partial: Some(Partial::Snapshot),
+                notices: Vec::new(),
+                failure_logs: Vec::new(),
+            }),
             &snapshot,
         );
         output::check_keys(&view)?;

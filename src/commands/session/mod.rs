@@ -16,7 +16,9 @@
 //! `attach` names a mirrored 125 on stderr. See [`SessionExit`].
 
 mod attach;
+mod export;
 pub(crate) mod list;
+mod reference;
 pub(crate) mod show;
 #[cfg(test)]
 mod tests;
@@ -79,28 +81,36 @@ pub enum SessionCommands {
     List(ListArgs),
     /// Print a session's progress once, and what it is stuck on
     ///
-    /// `<id>` is a full session id, the pid of a live session, or a unique
+    /// `<ref>` is a full session id, the pid of a live session, or a unique
     /// prefix or suffix of an id. Give the suffix (the last 4–5 characters)
     /// or the pid: the leading characters are the start time, so sessions
-    /// started minutes apart share them.
+    /// started minutes apart share them. Anything with a `/` or a `.` is a
+    /// `.hephsession` file (`./02kf5` forces a path), and an `https://` URL
+    /// is downloaded and read; either is read only from itself.
     ///
     /// Examples:
     ///
     /// `heph session show 02kf5`
     ///
     /// `heph session show 48213 --json`
+    ///
+    /// `heph session show ./heph-02kf5.hephsession`
     Show(ShowArgs),
     /// Follow a session live, until it ends or you detach
     ///
     /// `q` (or Ctrl-C) detaches and leaves the session running. Exits with the
     /// session's exit code once it ends, 0 on detach, and 125 when heph cannot
-    /// follow it. A 125 that is the session's own is named on stderr.
+    /// follow it. A 125 that is the session's own is named on stderr. A
+    /// `.hephsession` file or URL is replayed to its end, and exits with the
+    /// code it recorded.
     ///
     /// Examples:
     ///
     /// `heph session attach 02kf5`
     ///
     /// `heph session attach 48213`
+    ///
+    /// `heph session attach ci/heph-02kf5.hephsession`
     Attach(AttachArgs),
     /// Ask a running session for its in-flight report
     ///
@@ -111,6 +121,22 @@ pub enum SessionCommands {
     ///
     /// `heph session inflight 02kf5`
     Inflight(InflightArgs),
+    /// Write a session as one `.hephsession` file, to read on another machine
+    ///
+    /// The file is self-contained: it also holds the text of each approval
+    /// notice the session showed and the last 1 MiB of each root failure's
+    /// log (32 MiB in all), which a reader elsewhere could not look up.
+    /// `--no-logs` leaves both out. A running session exports too: the file
+    /// is a snapshot, and says so. Prints the path written.
+    ///
+    /// Examples:
+    ///
+    /// `heph session export 02kf5`
+    ///
+    /// `heph session export 48213 -o build.hephsession --no-logs`
+    ///
+    /// `heph session export 02kf5 -o -`
+    Export(ExportArgs),
 }
 
 #[derive(Args, Clone, Debug)]
@@ -126,8 +152,10 @@ pub struct ListArgs {
 #[derive(Args, Clone, Debug)]
 pub struct ShowArgs {
     /// Session id, its last 4–5 characters, or a live session's pid (any
-    /// unique prefix or suffix of an id works).
-    pub id: String,
+    /// unique prefix or suffix of an id works); or a `.hephsession` path or
+    /// `https://` URL.
+    #[arg(value_name = "REF")]
+    pub reference: String,
     /// `--json` is the session's snapshot, with the viewer-computed `state`.
     #[command(flatten)]
     pub out: output::JsonArgs<show::ShowView<'static>>,
@@ -136,8 +164,10 @@ pub struct ShowArgs {
 #[derive(Args, Clone, Debug)]
 pub struct AttachArgs {
     /// Session id, its last 4–5 characters, or a live session's pid (any
-    /// unique prefix or suffix of an id works).
-    pub id: String,
+    /// unique prefix or suffix of an id works); or a `.hephsession` path or
+    /// `https://` URL.
+    #[arg(value_name = "REF")]
+    pub reference: String,
     /// Accepted only to be refused with a reason: `-D` belongs to `run`, and
     /// a viewer has no build of its own to open the dashboard on or hold.
     #[arg(short = 'D', long = "dashboard", hide = true)]
@@ -171,6 +201,22 @@ pub struct InflightArgs {
 pub(crate) struct Out<'a> {
     pub w: &'a mut dyn Write,
     pub style: output::Style,
+}
+
+#[derive(Args, Clone, Debug)]
+pub struct ExportArgs {
+    /// Session id, its last 4–5 characters, or a live session's pid (any
+    /// unique prefix or suffix of an id works); or a `.hephsession` path or
+    /// `https://` URL, written again.
+    #[arg(value_name = "REF")]
+    pub reference: String,
+    /// The file to write, replaced if it exists; `-` writes to stdout.
+    /// Default: `./heph-<id>.hephsession`.
+    #[arg(short = 'o', long = "output", value_name = "PATH")]
+    pub output: Option<std::path::PathBuf>,
+    /// Leave out approval notice text and root-failure logs.
+    #[arg(long)]
+    pub no_logs: bool,
 }
 
 impl SessionArgs {
@@ -209,8 +255,10 @@ fn execute(
     let root = hcore::userdir::heph_user_dir_from(std::env::var_os("HOME").as_deref())
         .context("locating ~/.heph/sessions")?
         .join(crate::tui::session::SESSIONS_DIR);
+    let tmp_dir = crate::tui::session::store::tmp_dir(&root);
     let file = FileSource::new(root);
     let sources: [&dyn SessionSource; 1] = [&file];
+    let opener = reference::Opener::new(tmp_dir);
     let opts = ViewOpts {
         now_ms: hcore::events::now_unix_ms(),
         stall: stall_threshold(global.stall_notice),
@@ -241,16 +289,46 @@ fn execute(
             }
             bootstrap::block_on(list::list(&sources, opts, filter, &a.out, out))?
         }
-        SessionCommands::Show(a) => {
-            bootstrap::block_on(show::show(&sources, opts, &a.id, &a.out, out))?
-        }
+        SessionCommands::Show(a) => bootstrap::block_on(show::show(
+            &sources,
+            opts,
+            &a.reference,
+            &a.out,
+            out,
+            &opener,
+        ))?,
         SessionCommands::Inflight(a) => {
             bootstrap::block_on(inflight(&sources, opts, &a.id, &a.out, out))?
         }
         SessionCommands::Attach(a) => {
             a.refuse_dashboard()?;
             drop(stdout);
-            bootstrap::block_on(attach::attach(&sources, opts, &a.id, sink, session, global))?
+            bootstrap::block_on(attach::attach(
+                &sources,
+                opts,
+                &a.reference,
+                sink,
+                session,
+                global,
+                &opener,
+            ))?
+        }
+        SessionCommands::Export(a) => {
+            let exported = bootstrap::block_on(export::export_ref(
+                &file,
+                opts,
+                a,
+                crate::engine::approval::read_notice_from_store,
+                &mut stdout,
+                &opener,
+            ))??;
+            if exported.snapshot {
+                sink.write_diagnostic(export::SNAPSHOT_NOTE);
+            }
+            if let Some(path) = exported.path {
+                writeln!(stdout, "{}", path.display()).context("writing the path")?;
+            }
+            Ok(())
         }
     }
 }
@@ -504,9 +582,8 @@ pub(crate) async fn resolve(
         }
     }
     let all = list_all(sources).await?;
-    if arg.bytes().all(|b| b.is_ascii_digit())
-        && let Ok(pid) = arg.parse::<u32>()
-    {
+    let digits = arg.bytes().all(|b| b.is_ascii_digit());
+    if digits && let Ok(pid) = arg.parse::<u32>() {
         let mut by_pid: Vec<&(usize, SessionEntry)> = all
             .iter()
             .filter(|(_, e)| e.live && e.known_meta().is_some_and(|m| m.owner_pid == pid))
@@ -532,10 +609,16 @@ pub(crate) async fn resolve(
         .collect();
     match matches.as_slice() {
         [one] => Ok((*one).clone()),
-        [] => anyhow::bail!(
+        // Digits read two ways (spec: `12345`): say that neither matched.
+        [] if digits => Err(anyhow::anyhow!(
+            "no session {arg}: no live session has pid {arg}, and no session id starts or ends \
+             with {needle} (`heph session list --all` lists them): {}",
+            gone_hint(opts.retention)
+        )),
+        [] => Err(anyhow::anyhow!(
             "no session {arg} (`heph session list --all` lists them): {}",
             gone_hint(opts.retention)
-        ),
+        )),
         _ => Err(ambiguous(arg, &matches, opts)),
     }
 }
@@ -559,11 +642,11 @@ pub(crate) fn require_known(
 ) -> anyhow::Result<&crate::tui::session::SessionMeta> {
     match &entry.meta {
         EntryMeta::Known(m) => Ok(m),
-        EntryMeta::TooNew { found, supported } => anyhow::bail!(
-            "session {} was recorded in session format {found}; this heph reads format {supported} \
-             and older — use a newer heph to view it",
+        EntryMeta::TooNew { found, supported } => Err(anyhow::anyhow!(
+            "session {} was recorded in session format {found}; this heph reads format \
+             {supported} and older — use a newer heph to view it",
             entry.id
-        ),
+        )),
     }
 }
 

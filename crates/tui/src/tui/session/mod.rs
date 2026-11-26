@@ -33,12 +33,15 @@
 
 pub mod cleanup;
 pub mod derive;
+pub mod export;
 pub mod feed;
 pub mod format;
+pub mod hephsession;
 pub mod holder;
 pub mod id;
 pub mod lockfile;
 pub mod recorder;
+pub mod recording;
 pub mod run_logs;
 pub mod source;
 pub mod store;
@@ -184,16 +187,106 @@ pub struct SessionStart {
     pub cwd: Option<String>,
     pub workspace_root: Option<String>,
     pub home_dir: Option<String>,
+    /// Where the session also writes `<id>.hephsession` once it ends
+    /// (`HEPH_SESSION_EXPORT_DIR`). Never for a private session.
+    pub export: Option<SealExport>,
+}
+
+/// The seal-time export (D7): once the session has ended and the recorder let
+/// go of the recording, write `<dir>/<id>.hephsession`, within `bound`.
+#[derive(Debug, Clone)]
+pub struct SealExport {
+    /// An absolute directory.
+    pub dir: PathBuf,
+    /// Reads the approval notices into the export (the engine's
+    /// `read_notice_from_store`).
+    pub read: hcore::approval_notice::ReadNotice,
+    /// [`export::EXPORT_DIR_BOUND`] outside a test.
+    pub bound: std::time::Duration,
+    /// A test's slow export: where it holds until a gate opens. Always the
+    /// default (no gate) outside tests.
+    pub(crate) hold: export::Hold,
+}
+
+impl SealExport {
+    /// Export the ended session `id` in `dir` under the sessions `root`, on
+    /// a thread this waits at most `bound` for. Silent on success; one
+    /// `warn!` otherwise, and the exit code is never touched. Past the bound
+    /// the export is stopped without waiting on it ([`export::Abort`]): its
+    /// temp files are removed, by the export itself when a write of its was
+    /// stuck, and once it stops itself it writes nothing more.
+    fn run(&self, root: &Path, dir: &Path, id: SessionId) {
+        let abort = export::Abort::with_hold(self.hold.clone());
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
+        let (root, dir, export_dir, read, thread_abort) = (
+            root.to_path_buf(),
+            dir.to_path_buf(),
+            self.dir.clone(),
+            self.read,
+            abort.clone(),
+        );
+        let spawned = std::thread::Builder::new()
+            .name("heph-session-export".to_owned())
+            .spawn(move || {
+                let _dispatch = tracing::dispatcher::set_default(&dispatch);
+                let written = export::to_dir(&root, &dir, id, &export_dir, read, &thread_abort);
+                // Past the bound nobody waits: the result is dropped.
+                if tx.send(written).is_err() {
+                    tracing::debug!("the session export finished past its bound");
+                }
+            });
+        // Every warning names the directory and why: the one line a CI log
+        // keeps of an export that did not happen.
+        if let Err(e) = spawned {
+            tracing::warn!(
+                dir = %self.dir.display(),
+                error = %e,
+                "cannot export the session"
+            );
+            return;
+        }
+        match rx.recv_timeout(self.bound) {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => tracing::warn!(
+                dir = %self.dir.display(),
+                error = %format!("{e:#}"),
+                "cannot export the session"
+            ),
+            // Not stopped: it wrote its file just as the bound passed.
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) if !abort.abort() => {
+                tracing::debug!("the session export finished at its bound");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                tracing::warn!(
+                    dir = %self.dir.display(),
+                    bound_s = self.bound.as_secs(),
+                    reason = "it ran past its bound and was stopped",
+                    "the session export did not finish in time: nothing written"
+                );
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                tracing::warn!(
+                    dir = %self.dir.display(),
+                    reason = "the export thread panicked",
+                    "the session export stopped: nothing written"
+                );
+            }
+        }
+    }
 }
 
 /// An open session: its directory, and the recorder writing it.
 #[derive(Debug)]
 pub struct Session {
     id: SessionId,
+    /// The sessions root it is under.
+    root: PathBuf,
     dir: PathBuf,
     recorder: Recorder,
     /// Under a private root: removed when finished.
     private: bool,
+    export: Option<SealExport>,
 }
 
 /// What a new session's recorder cleans before it records.
@@ -282,6 +375,8 @@ impl Session {
             interactive: start.interactive,
             capabilities: vec![CAPABILITY_INFLIGHT.to_owned()],
         };
+        // A private session keeps no recording to export.
+        let export = start.export.filter(|_| !root.is_private());
         let (conn, rw) =
             store::create(&dir, &meta, &store::Provenance::detect(), faults.refuse_wal)
                 .context("creating the session's recording")?;
@@ -298,9 +393,11 @@ impl Session {
         .context("starting the session recorder")?;
         Ok(Self {
             id,
+            root: root.path().to_path_buf(),
             dir,
             recorder,
             private: root.is_private(),
+            export,
         })
     }
 
@@ -316,11 +413,25 @@ impl Session {
         self.recorder.tap()
     }
 
-    /// Write `End` and release the lock. See [`Recorder::finish`]. A private
-    /// session's directory is then removed: nothing reads it after its owner.
+    /// Write `End` and release the lock. See [`Recorder::finish`]. Then the
+    /// seal-time export, when asked for and the recorder let go in time. A
+    /// private session's directory is then removed: nothing reads it after
+    /// its owner.
     pub fn finish(&self, exit_code: Option<i32>, panicked: bool) {
-        self.recorder
+        let finished = self
+            .recorder
             .finish(exit_code, panicked, recorder::FINISH_TIMEOUT);
+        if let Some(export) = &self.export {
+            match finished {
+                recorder::Finished::Ended => export.run(&self.root, &self.dir, self.id),
+                recorder::Finished::Late => tracing::warn!(
+                    dir = %export.dir.display(),
+                    reason = "the recorder did not let go of the recording within its bound",
+                    "the session's recording did not end in time: it is not exported"
+                ),
+                recorder::Finished::Again => {}
+            }
+        }
         if self.private
             && let Err(e) = std::fs::remove_dir_all(&self.dir)
             && e.kind() != io::ErrorKind::NotFound
@@ -390,6 +501,18 @@ struct SlotInner {
     attempted: bool,
     /// Injected by a test ([`SessionSlot::set_faults`]); default otherwise.
     faults: Faults,
+    /// The seal-time export ([`SessionSlot::configure_export`]).
+    export: ExportSetup,
+}
+
+/// How the front end configured the seal-time export.
+#[derive(Debug, Default)]
+enum ExportSetup {
+    #[default]
+    Off,
+    On(SealExport),
+    /// A value refused, for this reason: warned when the session opens.
+    Refused(String),
 }
 
 /// The process's session (design amendment A2): built and configured by the
@@ -446,6 +569,23 @@ impl SessionSlot {
             };
             s.argv = argv;
         });
+    }
+
+    /// The seal-time export: `HEPH_SESSION_EXPORT_DIR` as the front end read
+    /// it (an absolute directory, else refused with a warning when the
+    /// session opens), and the reader that fills the export's notices.
+    pub fn configure_export(&self, dir: Option<&OsStr>, read: hcore::approval_notice::ReadNotice) {
+        let export = match export::export_dir_from_env(dir) {
+            Ok(None) => ExportSetup::Off,
+            Ok(Some(dir)) => ExportSetup::On(SealExport {
+                dir,
+                read,
+                bound: export::EXPORT_DIR_BOUND,
+                hold: export::Hold::default(),
+            }),
+            Err(why) => ExportSetup::Refused(why),
+        };
+        self.with(|s| s.export = export);
     }
 
     /// Where to read other sessions from to name a lock's holder (from
@@ -515,6 +655,11 @@ impl SessionSlot {
                 return Err(Ok(None));
             }
             s.attempted = true;
+            let (export, refused) = match &s.export {
+                ExportSetup::Off => (None, None),
+                ExportSetup::On(e) => (Some(e.clone()), None),
+                ExportSetup::Refused(why) => (None, Some(why.clone())),
+            };
             match &s.setup {
                 Setup::Unconfigured | Setup::Off => Err(Ok(None)),
                 Setup::Unavailable(why) => Err(Err(why.clone())),
@@ -527,13 +672,15 @@ impl SessionSlot {
                         cwd: s.cwd.clone(),
                         workspace_root: s.workspace_root.clone(),
                         home_dir: s.home_dir.clone(),
+                        export,
                     },
                     s.retention,
                     s.faults.clone(),
+                    refused,
                 )),
             }
         });
-        let (root, start, retention, faults) = match prepared {
+        let (root, start, retention, faults, refused) = match prepared {
             Ok(prepared) => prepared,
             Err(Ok(already)) => return already,
             Err(Err(why)) => {
@@ -541,6 +688,15 @@ impl SessionSlot {
                 return None;
             }
         };
+        // An export directory inside the workspace: every heph writes there
+        // when it exits, so a target that reads or writes it misses the cache
+        // every run. Said once, as the session opens, never refused.
+        let in_workspace = start
+            .export
+            .as_ref()
+            .zip(start.workspace_root.as_deref())
+            .filter(|(e, ws)| export::dir_in_workspace(&e.dir, Path::new(ws)))
+            .map(|(e, ws)| (e.dir.clone(), ws.to_owned()));
         // Opened outside the slot's lock: it does IO.
         let session = match Session::open_with(&root, start, retention, faults) {
             Ok(s) => std::sync::Arc::new(s),
@@ -554,6 +710,24 @@ impl SessionSlot {
                 return None;
             }
         };
+        // Once per run, and only for a session there would be to export.
+        if let Some(why) = refused
+            && !session.is_private()
+        {
+            tracing::warn!(reason = %why, "this run's session is not exported");
+        }
+        if let Some((dir, workspace)) = in_workspace
+            && !session.is_private()
+        {
+            tracing::warn!(
+                dir = %dir.display(),
+                workspace = %workspace,
+                "{} is inside the workspace: every heph writes its session there when it exits, \
+                 so a target whose inputs or outputs cover it misses the cache every run; \
+                 point it outside the workspace (CI: under the runner's temp directory)",
+                hcore::session_record::SESSION_EXPORT_DIR_ENV
+            );
+        }
         let opened = OpenedSession {
             id: session.id(),
             tap: session.tap(),

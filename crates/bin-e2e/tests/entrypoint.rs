@@ -57,7 +57,8 @@ fn via_shell(ws: &Workspace, dist: &Dist, setup: &str, args: &[&str]) -> std::pr
         .arg(dist.heph())
         .args(args)
         .current_dir(ws.root())
-        .envs(envs);
+        .envs(envs)
+        .env_remove(common::SESSION_EXPORT_DIR_ENV);
     cmd
 }
 

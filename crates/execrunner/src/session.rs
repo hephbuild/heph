@@ -414,8 +414,17 @@ fn launch_command(
     cmd.args(args)
         .current_dir(cfg.cwd.as_deref().unwrap_or("/"))
         .env_clear()
-        .envs(&cfg.launch_env)
-        .env(SOCK_ENV, socket);
+        .envs(&cfg.launch_env);
+    // heph's own names are never the environment's (spec E4), even when
+    // `launch_env` names one: every target would inherit it. Such a key is
+    // dropped here without a word, not refused when `runner.json` parses: a
+    // runner written before the list grew keeps working, and the key still
+    // reaches the runner's fingerprint through `launch_env`, so dropping it
+    // changes no hash, only the launch.
+    for name in hcore::session_record::HEPH_OWNED_ENV {
+        cmd.env_remove(name);
+    }
+    cmd.env(SOCK_ENV, socket);
     cmd
 }
 
@@ -774,6 +783,34 @@ mod tests {
             vec![format!("{SOCK_ENV}=/s.sock"), "XR_DECLARED=yes".to_string()],
             "the launch's environment is exactly what the config declares, with heph's socket"
         );
+    }
+
+    /// Spec E4: heph's own names (the session export directory, the tools
+    /// directory) never reach the launch, even named in `launch_env`.
+    #[test]
+    fn the_launch_never_carries_the_session_export_dir() {
+        let owned = hcore::session_record::HEPH_OWNED_ENV;
+        let cfg = SessionConfig {
+            launch: vec!["/usr/bin/env".to_string()],
+            cwd: None,
+            launch_env: owned
+                .iter()
+                .map(|key| (key.to_string(), "/ci/sessions".to_string()))
+                .chain([("XR_DECLARED".to_string(), "yes".to_string())])
+                .collect(),
+        };
+        let out = launch_command(&cfg, Path::new("/usr/bin/env"), &[], Path::new("/s.sock"))
+            .output()
+            .expect("run env");
+        assert!(out.status.success(), "{out:?}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        for key in owned {
+            assert!(
+                !stdout.lines().any(|l| l.starts_with(&format!("{key}="))),
+                "{key}: {stdout}"
+            );
+        }
+        assert!(stdout.lines().any(|l| l == "XR_DECLARED=yes"), "{stdout}");
     }
 
     /// `launch_env` is optional, so a `runner.json` written before it still

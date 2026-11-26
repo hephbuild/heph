@@ -2542,6 +2542,40 @@ fn pool_summaries() {
     assert_eq!(docker.waiting_us, 50_000, "{docker:?}");
 }
 
+/// A foreign file's metrics are untrusted: [`store::read_pools`] holds at
+/// most [`store::POOLS_CAP`] pools, and a pool name or unit no heph writes
+/// (longer than a pool name may be, or a unit is) is skipped.
+#[test]
+fn foreign_pools_are_bounded() {
+    let id = now_id(33);
+    let (_root, conn) = derived(id, &[], id.started_unix_ms() + 100);
+    let insert = |pool: &str, name: &str, unit: &str| {
+        conn.execute(
+            "INSERT INTO metrics (name, unit, time_us, value, attributes) \
+             VALUES (?1, ?2, 0, 1.0, json_object('heph.pool', ?3))",
+            rusqlite::params![name, unit, pool],
+        )
+        .expect("insert");
+    };
+    for i in 0..store::POOLS_CAP * 3 {
+        insert(&format!("p{i}"), "heph.session.pool.held.mean", "1");
+        insert(&format!("c{i}"), "heph.pool.capacity", "1");
+    }
+    let long = "x".repeat(hcore::capacity::MAX_POOL_NAME_LEN + 1);
+    insert(&long, "heph.session.pool.held.mean", "1");
+    insert(&long, "heph.pool.capacity", "1");
+    insert("cpu", "heph.session.pool.held.mean", &"u".repeat(10_000));
+    let pools = store::read_pools(&conn).expect("read pools");
+    assert_eq!(pools.len(), store::POOLS_CAP);
+    assert!(
+        pools
+            .iter()
+            .all(|p| p.pool.len() <= hcore::capacity::MAX_POOL_NAME_LEN && p.unit.len() <= 64),
+        "{:?}",
+        pools.iter().map(|p| (p.pool.len(), p.unit.len())).max()
+    );
+}
+
 /// O5: who ran the session, from the environment alone. An agent first
 /// (it may run in CI), then CI, then a human; only the exact values the
 /// tools set count, and a near-miss name counts for nothing.

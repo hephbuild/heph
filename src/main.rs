@@ -293,6 +293,12 @@ fn main() -> ExitCode {
     // A lock-wait notice names the holder's session even when this run records
     // none: `HEPH_NO_SESSION` turns recording off, not looking.
     session.configure_lookup(SessionRoot::for_reading(home.as_deref()));
+    // The seal-time export (D7). Read here, like the root: never by a target,
+    // whose wildcards strip it (E4).
+    session.configure_export(
+        std::env::var_os(hcore::session_record::SESSION_EXPORT_DIR_ENV).as_deref(),
+        heph::engine::approval::read_notice_from_store,
+    );
 
     let exec_result = cli.command.execute(sink, &session, &cli.global);
     // An entrypoint's program ended without success: heph exits as it did.

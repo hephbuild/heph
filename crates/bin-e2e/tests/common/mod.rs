@@ -37,6 +37,12 @@ pub mod session;
 /// a suite that never ran must not read as a suite that passed.
 pub const DIST_ENV: &str = "HEPH_E2E_DIST";
 
+/// Removed from every heph the suite spawns: it runs under a CI step that
+/// sets it, and every test's heph would otherwise add its session to the
+/// job's upload. Spelled out rather than imported: this crate links no
+/// workspace crate.
+pub const SESSION_EXPORT_DIR_ENV: &str = "HEPH_SESSION_EXPORT_DIR";
+
 /// Native shared-library extension for the host, matching the suffix the build
 /// job gives the published plugin cdylibs.
 pub const DYLIB_EXT: &str = if cfg!(target_os = "macos") {
@@ -131,7 +137,8 @@ impl Workspace {
 
     /// A `heph` invocation rooted at this workspace, with the ambient
     /// environment neutralized: self-update off (a run must not re-exec into
-    /// some other binary mid-test), telemetry off, `HOME` redirected.
+    /// some other binary mid-test), telemetry off, `HOME` redirected, and no
+    /// [`SESSION_EXPORT_DIR_ENV`].
     pub fn cmd(&self, dist: &Dist, args: &[&str]) -> Command {
         let mut cmd = Command::new(dist.heph());
         cmd.args(args)
@@ -140,6 +147,7 @@ impl Workspace {
             .env("HEPH_CWD", self.root())
             .env("HEPH_NO_SELF_UPDATE", "1")
             .env("HEPH_DISABLE_TELEMETRY", "1")
+            .env_remove(SESSION_EXPORT_DIR_ENV)
             .env("RUST_BACKTRACE", "1");
         cmd
     }

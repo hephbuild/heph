@@ -185,8 +185,34 @@ async fn run_list(sources: &[&dyn SessionSource], ws: Workspace<'_>, json: bool)
 
 async fn run_show(sources: &[&dyn SessionSource], id: &str, json: bool) -> anyhow::Result<String> {
     let mut out = Vec::new();
-    show::show(sources, opts(), id, &json_args(json), piped(&mut out)).await?;
+    show::show(
+        sources,
+        opts(),
+        id,
+        &json_args(json),
+        piped(&mut out),
+        &no_opener(),
+    )
+    .await?;
     Ok(String::from_utf8(out).expect("utf-8"))
+}
+
+/// A download that never happens: a test that reaches it named a URL.
+struct NoDownload;
+
+impl reference::Download for NoDownload {
+    fn get_to_temp(&self, url: &str, _dir: &Path) -> anyhow::Result<tempfile::NamedTempFile> {
+        anyhow::bail!("no download in this test: {url}")
+    }
+}
+
+/// An opener for tests that name sessions by id: nothing is downloaded, and
+/// a path `<ref>` puts its temp files in a directory that does not exist.
+fn no_opener() -> reference::Opener {
+    reference::Opener {
+        tmp_dir: Path::new("/nonexistent/heph-session-tmp").into(),
+        download: Arc::new(NoDownload),
+    }
 }
 
 #[test]
@@ -1465,7 +1491,8 @@ async fn attach_mirrors_the_session_exit() {
         let sources = &sources;
         let slot = &slot;
         async move {
-            attach::attach(
+            // Boxed: `attach`'s future is over clippy's `large_futures` threshold.
+            Box::pin(attach::attach(
                 sources,
                 opts(),
                 &id.encode(),
@@ -1475,7 +1502,8 @@ async fn attach_mirrors_the_session_exit() {
                     no_tui: true,
                     ..Default::default()
                 },
-            )
+                &no_opener(),
+            ))
             .await
         }
     };
@@ -1576,7 +1604,7 @@ async fn attach_reads_a_pending_notice_from_the_run_home() {
         let app = attach::AttachApp::new(
             &global,
             m,
-            true,
+            attach::Origin::Local { live: true },
             source.holder_names(id),
             futures::stream::empty().boxed(),
             detach_rx,
@@ -2377,6 +2405,437 @@ async fn show_reports_skipped_records() {
     assert_eq!(json["pools"], serde_json::json!([]), "{json}");
 }
 
+/// Spec row `export_is_self_contained` (I6, I7): an export carries what a
+/// reader elsewhere cannot look up — each approval notice's text, read by the
+/// engine's reader, and the tail of each root failure's log — and opens with
+/// the sessions root, the home and the workspace gone. A collateral failure's
+/// log and a log outside the failure slots are not exported; `--no-logs`
+/// leaves both tables empty; `-o -` writes the same file to stdout.
+///
+/// Viewing it through `show` comes with `<ref>` resolution; this reads the
+/// foreign recording's tables, which is what `show` will render.
+#[tokio::test(flavor = "multi_thread")]
+async fn export_is_self_contained() {
+    use crate::tui::session::export::FAILURE_LOG_CAP;
+    use crate::tui::session::recording::Recording as Opened;
+    use crate::tui::session::{ApprovalPrompt, ApprovalPromptNotice, ApprovalQueued, FileSource};
+    use hcore::events::LeftBehindData;
+
+    const NOTICE: &str = "drop the table";
+    let ws = tempfile::tempdir().expect("tempdir");
+    std::fs::write(ws.path().join(".hephconfig"), "").expect("write .hephconfig");
+    let global = crate::commands::GlobalOptions::default();
+    let (engine, home) =
+        crate::commands::bootstrap::new_reader_engine(&global, ws.path()).expect("reader engine");
+    drop(engine);
+    std::fs::write(ws.path().join("PLAN"), NOTICE).expect("write the notice source");
+    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+    hasher.update(NOTICE.as_bytes());
+    hasher.update(&[0]);
+    let notice = ApprovalPromptNotice {
+        name: "plan".to_owned(),
+        sources: vec![hcore::approval_notice::NoticeSource {
+            addr: "//a:plan".to_owned(),
+            origin: hcore::approval_notice::NoticeOrigin::File {
+                path: "PLAN".to_owned(),
+                out_path: "PLAN".to_owned(),
+                x: false,
+                hashout: format!("{:x}", hasher.digest()),
+            },
+        }],
+    };
+
+    // The root failure's log is longer than what an export keeps of it.
+    const CUT: u64 = 100;
+    let root_log = home.join("failures").join("k1").join("log.txt");
+    let mut log = vec![b'a'; usize::try_from(CUT).expect("small")];
+    log.extend((0..FAILURE_LOG_CAP).map(|i| b'0' + u8::try_from(i % 10).expect("digit")));
+    // The slot of `//a:later` was rewritten by a later session: its log is
+    // newer than this session's end, so it is not this session's.
+    let later_log = home.join("failures").join("k3").join("log.txt");
+    let at = |ms: u64| std::time::UNIX_EPOCH + Duration::from_millis(ms);
+    for (path, bytes, mtime) in [
+        (&root_log, log.as_slice(), at(T0 + 5)),
+        (
+            &home.join("failures").join("k2").join("log.txt"),
+            b"collateral".as_slice(),
+            at(T0 + 5),
+        ),
+        (&later_log, b"a later session's".as_slice(), at(T0 + 60_000)),
+    ] {
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(path, bytes).expect("write a log");
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .and_then(|f| f.set_modified(mtime))
+            .expect("set the log's mtime");
+    }
+    let outside = ws.path().join("outside.log");
+    std::fs::write(&outside, b"not a failure slot").expect("write");
+    let failed = |addr: &str, upstream_of: Option<&str>, log: &Path| SessionRecord {
+        at_unix_ms: T0,
+        kind: Some(BuildEventKind::ResultEnd {
+            addr: addr.to_owned(),
+            error: Some("exit status: 1".to_owned()),
+            upstream_of: upstream_of.map(str::to_owned),
+            exit_status: None,
+            exit_code: None,
+            log_tail: None,
+            timed_out: None,
+            cancelled: false,
+            left_behind: Some(Box::new(LeftBehindData {
+                log_path: Some(log.display().to_string()),
+                ..LeftBehindData::default()
+            })),
+            spans: Vec::new(),
+        }),
+        session: None,
+    };
+
+    let sessions = tempfile::tempdir().expect("tempdir");
+    let id = SessionId::new(T0, 7);
+    let mut m = meta(id, 1, &["heph", "run"]);
+    m.workspace_root = Some(ws.path().display().to_string());
+    m.home_dir = Some(home.display().to_string());
+    let records = [
+        SessionRecord::session(
+            T0,
+            SessionRecordKind::Approval {
+                prompt: Some(Box::new(ApprovalPrompt {
+                    queue: vec![ApprovalQueued {
+                        seq: 1,
+                        addr: "//a:gate".to_owned(),
+                        queued_at_unix_ms: T0,
+                        notices: vec![notice],
+                    }],
+                })),
+                standing: None,
+            },
+        ),
+        failed("//a:root", None, &root_log),
+        failed(
+            "//a:collateral",
+            Some("//a:root"),
+            &home.join("failures").join("k2").join("log.txt"),
+        ),
+        failed("//a:outside", None, &outside),
+        failed("//a:later", None, &later_log),
+        SessionRecord::session(
+            T0 + 10,
+            SessionRecordKind::End {
+                exit_code: Some(1),
+                panicked: false,
+            },
+        ),
+    ];
+    write_ended(sessions.path(), &m, &records, &ended(Some(1), T0 + 10));
+
+    let out = tempfile::tempdir().expect("tempdir");
+    let file = FileSource::new(sessions.path());
+    let export = |output: PathBuf, no_logs: bool| {
+        let args = ExportArgs {
+            reference: id.encode(),
+            output: Some(output),
+            no_logs,
+        };
+        let file = &file;
+        async move {
+            let mut stdout = Vec::new();
+            let exported = export::export_ref(
+                file,
+                opts(),
+                &args,
+                crate::engine::approval::read_notice_from_store,
+                &mut stdout,
+                &no_opener(),
+            )
+            .await
+            .expect("export");
+            assert!(stdout.is_empty(), "a file export writes nothing to stdout");
+            assert!(!exported.snapshot);
+            exported.path.expect("a path")
+        }
+    };
+    let full = export(out.path().join("full.hephsession"), false).await;
+    let bare = export(out.path().join("bare.hephsession"), true).await;
+    // `-o -`: the same export, on stdout.
+    let piped = out.path().join("piped.hephsession");
+    {
+        let rec = Opened::open_local(sessions.path(), &sessions.path().join(id.encode()))
+            .expect("open local");
+        let mut stdout = Vec::new();
+        let exported = export::export(
+            &rec,
+            export::Dest::Stdout,
+            Some(crate::engine::approval::read_notice_from_store),
+            &crate::tui::session::store::tmp_dir(sessions.path()),
+            &mut stdout,
+        )
+        .expect("export to stdout");
+        assert!(exported.path.is_none());
+        std::fs::write(&piped, stdout).expect("write");
+    }
+
+    // Nothing local is left to look anything up in.
+    drop((sessions, ws));
+    assert!(!home.exists(), "the home was under the workspace");
+    let ftmp = tempfile::tempdir().expect("tempdir");
+    for path in [&full, &piped] {
+        let rec = Opened::open_foreign(path, ftmp.path()).expect("open the export");
+        let Opened::Foreign(f) = &rec else {
+            panic!("foreign")
+        };
+        assert_eq!(
+            f.recorded_notice("//a:gate", 1, "plan").expect("notice"),
+            Some(NOTICE.to_owned()),
+            "{}",
+            path.display()
+        );
+        let kept = log
+            .get(usize::try_from(CUT).expect("small")..)
+            .expect("tail");
+        assert_eq!(
+            f.failure_logs("//a:root").expect("logs"),
+            [(kept.to_vec(), CUT)],
+            "the root failure's last 1 MiB, and how much came before it"
+        );
+        assert!(f.failure_logs("//a:collateral").expect("logs").is_empty());
+        assert!(f.failure_logs("//a:outside").expect("logs").is_empty());
+        assert!(
+            f.failure_logs("//a:later").expect("logs").is_empty(),
+            "a log newer than the session's end is a later session's"
+        );
+    }
+    // A foreign recording exports again: as it is, or `--no-logs`.
+    for (name, logs) in [
+        ("again.hephsession", true),
+        ("again-bare.hephsession", false),
+    ] {
+        let rec = Opened::open_foreign(&full, ftmp.path()).expect("open the export");
+        let again = out.path().join(name);
+        let mut stdout = Vec::new();
+        export::export(
+            &rec,
+            export::Dest::File(again.clone()),
+            logs.then_some(
+                crate::engine::approval::read_notice_from_store
+                    as hcore::approval_notice::ReadNotice,
+            ),
+            ftmp.path(),
+            &mut stdout,
+        )
+        .expect("re-export a foreign recording");
+        drop(rec);
+        let rec = Opened::open_foreign(&again, ftmp.path()).expect("open the re-export");
+        let Opened::Foreign(f) = &rec else {
+            panic!("foreign")
+        };
+        assert_eq!(rec.meta().expect("meta").id, id, "{name}");
+        assert_eq!(
+            f.recorded_notice("//a:gate", 1, "plan").expect("notice"),
+            logs.then(|| NOTICE.to_owned()),
+            "{name}"
+        );
+        assert_eq!(
+            f.failure_logs("//a:root").expect("logs").len(),
+            usize::from(logs),
+            "{name}"
+        );
+    }
+    let rec = Opened::open_foreign(&bare, ftmp.path()).expect("open the export");
+    let Opened::Foreign(f) = &rec else {
+        panic!("foreign")
+    };
+    assert_eq!(
+        f.recorded_notice("//a:gate", 1, "plan").expect("notice"),
+        None
+    );
+    assert!(f.failure_logs("//a:root").expect("logs").is_empty());
+    assert_eq!(rec.meta().expect("meta").id, id);
+    drop(rec);
+
+    // The viewers, by path and by URL, with nothing local to read.
+    let empty = FakeSource::default();
+    let sources: [&dyn SessionSource; 1] = [&empty];
+    let by_path = refs::opener_in(ftmp.path(), NoDownload);
+    let full_arg = full.display().to_string();
+    let text = refs::show_with(&sources, &full_arg, false, &by_path)
+        .await
+        .expect("show the export");
+    assert_eq!(
+        text.lines().next(),
+        Some(format!("read from {full_arg}").as_str()),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "approval notice plan of request 1 for //a:gate:\n{NOTICE}\n"
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("log of //a:root (its first {CUT} B left out):\n")),
+        "{text}"
+    );
+    assert!(!text.contains("//a:collateral (its") && !text.contains("log of //a:outside"));
+    assert!(!text.contains("the process went away"), "{text}");
+    let v: serde_json::Value = serde_json::from_str(
+        &refs::show_with(&sources, &full_arg, true, &by_path)
+            .await
+            .expect("show --json"),
+    )
+    .expect("json");
+    // A whole recording keeps the state a local one would have.
+    assert_eq!(v["state"], "failed", "{v}");
+    let foreign = &v["foreign"];
+    assert_eq!(foreign["origin"], full_arg.as_str(), "{v}");
+    assert!(foreign["partial"].is_null(), "{v}");
+    assert_eq!(
+        foreign["notices"],
+        serde_json::json!([{"addr": "//a:gate", "seq": 1, "name": "plan", "text": NOTICE}]),
+        "{v}"
+    );
+    assert_eq!(foreign["failure_logs"][0]["addr"], "//a:root", "{v}");
+    assert_eq!(foreign["failure_logs"][0]["cut_bytes"], CUT, "{v}");
+    assert_eq!(
+        foreign["failure_logs"].as_array().map(Vec::len),
+        Some(1),
+        "{v}"
+    );
+    assert_eq!(v["next"]["kind"], "none", "{v}");
+    // Without logs, nothing of either.
+    let text = refs::show_with(&sources, &bare.display().to_string(), false, &by_path)
+        .await
+        .expect("show the bare export");
+    assert!(!text.contains(NOTICE) && !text.contains("log of"), "{text}");
+    // A failed build's Next: says where its failure logs are: above, or,
+    // exported without them, on the machine that ran it.
+    assert!(
+        text.contains(
+            "\nNext: nothing\n  a recording read from a file, with no failure logs in it: \
+             `heph inspect failure <addr>` prints them on the machine that ran it\n"
+        ),
+        "{text}"
+    );
+    let full_text = refs::show_with(&sources, &full_arg, false, &by_path)
+        .await
+        .expect("show the export");
+    assert!(
+        full_text.contains(
+            "\nNext: nothing\n  a recording read from a file: the logs of its root failures are above\n"
+        ),
+        "{full_text}"
+    );
+    // The same bytes served over https.
+    const URL: &str = "https://example.invalid/full.hephsession";
+    let by_url = refs::opener_in(
+        ftmp.path(),
+        refs::Serve(std::fs::read(&full).expect("read the export")),
+    );
+    let text = refs::show_with(&sources, URL, false, &by_url)
+        .await
+        .expect("show the download");
+    assert_eq!(
+        text.lines().next(),
+        Some(format!("read from {URL}").as_str()),
+        "{text}"
+    );
+    // attach replays it to its end and mirrors the recorded exit code.
+    let (res, printed) = refs::attach_captured(&sources, &full_arg, &by_path).await;
+    assert_eq!(exit_code(&res.expect_err("exit 1")), Some(1));
+    assert!(
+        printed.starts_with(&format!("heph: replaying {full_arg}\n")),
+        "{printed}"
+    );
+}
+
+/// `export`'s stderr note on a running session and every viewer's caveat on
+/// the file it wrote say the same words, so one grep finds both.
+#[test]
+fn the_snapshot_note_is_the_viewers_caveat() {
+    let caveat = crate::tui::session::recording::RecordingState::Snapshot
+        .caveat()
+        .expect("a snapshot has a caveat");
+    assert_eq!(caveat, "snapshot of a running session");
+    assert!(
+        export::SNAPSHOT_NOTE.starts_with(&format!("heph: {caveat}: ")),
+        "{}",
+        export::SNAPSHOT_NOTE
+    );
+}
+
+/// `-o` as given, `-` for stdout, else `./heph-<id>.hephsession`.
+#[test]
+fn export_destination() {
+    let id = SessionId::new(T0, 7);
+    assert_eq!(
+        export::Dest::from_arg(None, id),
+        export::Dest::File(PathBuf::from(format!("heph-{}.hephsession", id.encode())))
+    );
+    assert_eq!(
+        export::Dest::from_arg(Some(Path::new("-")), id),
+        export::Dest::Stdout
+    );
+    // A file named `-` is spelled `./-`.
+    assert_eq!(
+        export::Dest::from_arg(Some(Path::new("./-")), id),
+        export::Dest::File(PathBuf::from("./-"))
+    );
+}
+
+/// `export -o PATH` replaces a file already at `PATH` with an export that
+/// opens (unlike the seal-time export, which never does); `-o` into a
+/// directory that does not exist fails naming it, and creates nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn export_o_replaces_a_file_and_wants_its_parent() {
+    let sessions = tempfile::tempdir().expect("tempdir");
+    let id = SessionId::new(T0, 12);
+    write_ended(
+        sessions.path(),
+        &meta(id, 1, &["heph", "run", "//a:b"]),
+        &build_records("//a:b", T0, Some(0)),
+        &ended(Some(0), T0 + 10),
+    );
+    let file = crate::tui::session::FileSource::new(sessions.path());
+    let out = tempfile::tempdir().expect("tempdir");
+    let export_to = |output: PathBuf| {
+        let file = &file;
+        async move {
+            export::export_ref(
+                file,
+                opts(),
+                &ExportArgs {
+                    reference: id.encode(),
+                    output: Some(output),
+                    no_logs: false,
+                },
+                crate::engine::approval::read_notice_from_store,
+                &mut Vec::new(),
+                &no_opener(),
+            )
+            .await
+        }
+    };
+
+    let path = out.path().join("run.hephsession");
+    std::fs::write(&path, "an older export").expect("write");
+    let exported = export_to(path.clone()).await.expect("export over a file");
+    assert_eq!(exported.path.as_deref(), Some(path.as_path()));
+    let rec = crate::tui::session::recording::Recording::open_foreign(&path, out.path())
+        .expect("the replacement opens");
+    assert_eq!(rec.meta().expect("meta").id, id);
+    drop(rec);
+
+    let missing = out.path().join("missing");
+    let e = export_to(missing.join("run.hephsession"))
+        .await
+        .expect_err("no parent");
+    let msg = format!("{e:#}");
+    assert!(msg.contains(&missing.display().to_string()), "{msg}");
+    assert!(!missing.exists());
+}
+
 /// The `.hephconfig` defaults a bad value's warning names are the ones the
 /// cleanup applies.
 /// A lost session sealed by cleanup carries `derivation` 0: no
@@ -2528,6 +2987,7 @@ async fn a_lost_session_sealed_by_cleanup_still_reads() {
         &id.encode(),
         &json_args(false),
         piped(&mut out),
+        &no_opener(),
     )
     .await
     .expect("show");
@@ -2548,6 +3008,7 @@ async fn a_lost_session_sealed_by_cleanup_still_reads() {
         &id.encode(),
         &json_args(true),
         piped(&mut out),
+        &no_opener(),
     )
     .await
     .expect("show --json");
@@ -2569,3 +3030,5 @@ fn retention_defaults_agree() {
         }
     );
 }
+
+mod refs;

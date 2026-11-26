@@ -1563,6 +1563,18 @@ impl TuiProgressView {
         self
     }
 
+    /// Read the approval view's notices from the texts a foreign recording's
+    /// export carried (spec I7): never from a store.
+    pub fn with_recorded_notices(
+        mut self,
+        notices: crate::tui::session::recording::RecordedNotices,
+    ) -> Self {
+        self.notices = Some(crate::tui::dashboard::approval::NoticeStore::Recorded(
+            notices,
+        ));
+        self
+    }
+
     /// The approval glyph at `now_ms`, flashing unless motion is reduced.
     fn glyph(&self, now_ms: u64) -> &'static str {
         crate::tui::dashboard::model::approval_glyph(now_ms, self.motion)

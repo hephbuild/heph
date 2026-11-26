@@ -233,6 +233,13 @@ A target that declares a variable gets what it declared even when the
 environment has an opinion, and so a runner can never replace a credential or
 scratch variable behind the collision check rows 10 and 11 perform.
 
+heph's own names, `HEPH_TOOLS_DIR` and `HEPH_SESSION_EXPORT_DIR`
+(`hcore::session_record::HEPH_OWNED_ENV`), are never in a session runner's
+half: its launch drops them even when `launch_env` names them, and its agent
+leaves them out of the base it hands every target. A target that sets or
+passes one by name, where the rules above allow it, still gets it, in its own
+half.
+
 ### `PATH`
 
 `PATH` is the exception everywhere, because it is a *list* and several parties

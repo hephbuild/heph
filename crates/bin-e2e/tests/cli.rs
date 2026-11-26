@@ -30,6 +30,7 @@ fn shipped_binary_launches_outside_a_workspace() {
         .env("HOME", home.path())
         .env("HEPH_NO_SELF_UPDATE", "1")
         .env("HEPH_DISABLE_TELEMETRY", "1")
+        .env_remove(common::SESSION_EXPORT_DIR_ENV)
         .output()
         .expect("spawn heph version");
 

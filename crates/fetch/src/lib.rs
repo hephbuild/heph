@@ -10,21 +10,35 @@
 //! future stops the transfer and closes the connection. The blocking client
 //! offers only the total bound, so the blocking entry points ([`Fetcher::get`],
 //! [`get`], [`get_sha256`]) run that same future on a runtime of their own.
+//!
+//! A URL a user hands heph to read (a `.hephsession` by `<ref>`) is untrusted:
+//! [`Fetcher::https_capped`] refuses anything but `https://`, redirects
+//! included, and stops at a size cap, into a temp file deleted on drop
+//! ([`Fetcher::get_to_temp`]).
 
 use std::future::Future;
 use std::io::{Read, Write};
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::Context;
 use sha2::{Digest, Sha256};
 
-/// Timeouts for a download. See the crate docs for why there is no total one.
+/// Timeouts and limits for a download. See the crate docs for why there is no
+/// total timeout.
 #[derive(Debug, Clone, Copy)]
 pub struct Fetcher {
     /// Bound on establishing the connection.
     pub connect_timeout: Duration,
     /// Bound on a single read making no progress.
     pub read_timeout: Duration,
+    /// The most body bytes accepted: a larger announced length fails before
+    /// any byte is written, and a body that grows past it fails as it does
+    /// ([`TooLarge`]). `None` is no cap.
+    pub max_bytes: Option<u64>,
+    /// Refuse a URL, or a redirect, whose scheme is not `https`: [`NotHttps`]
+    /// for the URL itself, and for a redirect, in the error's source chain.
+    pub https_only: bool,
 }
 
 impl Default for Fetcher {
@@ -32,11 +46,92 @@ impl Default for Fetcher {
         Self {
             connect_timeout: Duration::from_secs(30),
             read_timeout: Duration::from_secs(60),
+            max_bytes: None,
+            https_only: false,
         }
     }
 }
 
+/// The body is larger than [`Fetcher::max_bytes`]. Reached through
+/// `anyhow::Error::downcast_ref`, so a caller can tell it from a network
+/// failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TooLarge {
+    pub max_bytes: u64,
+}
+
+impl std::fmt::Display for TooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the body is larger than the {} byte cap", self.max_bytes)
+    }
+}
+
+impl std::error::Error for TooLarge {}
+
+/// The URL is not `https://` and [`Fetcher::https_only`] is set. Nothing was
+/// sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotHttps {
+    pub url: String,
+}
+
+impl std::fmt::Display for NotHttps {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "refusing {}: only https:// URLs are fetched", self.url)
+    }
+}
+
+impl std::error::Error for NotHttps {}
+
+/// `url` as it may appear in a message: no userinfo, no query, no fragment.
+/// A signed URL (`?X-Amz-Signature=…`) carries its credential in the query,
+/// so every error this crate builds names the URL this way, and reqwest's own
+/// errors lose theirs ([`reqwest::Error::without_url`]). Text that does not
+/// parse as a URL is not echoed at all.
+pub fn redact_url(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(mut u) => {
+            // Only fails for a URL that cannot have credentials.
+            let _ok = u.set_username("");
+            let _ok = u.set_password(None);
+            u.set_query(None);
+            u.set_fragment(None);
+            u.to_string()
+        }
+        Err(_) => "the URL".to_owned(),
+    }
+}
+
 impl Fetcher {
+    /// The default timeouts, `https://` only, at most `max_bytes` of body.
+    pub fn https_capped(max_bytes: u64) -> Self {
+        Self {
+            max_bytes: Some(max_bytes),
+            https_only: true,
+            ..Self::default()
+        }
+    }
+
+    /// GET `url` into a new temp file in `dir`, deleted when the returned
+    /// handle drops, including when the download fails part way.
+    ///
+    /// Blocks the calling thread, as [`get`](Self::get) does.
+    pub fn get_to_temp(&self, url: &str, dir: &Path) -> anyhow::Result<tempfile::NamedTempFile> {
+        let mut file = tempfile::NamedTempFile::new_in(dir).with_context(|| {
+            format!(
+                "create a temp file in {} for {}",
+                dir.display(),
+                redact_url(url)
+            )
+        })?;
+        self.get(
+            url,
+            &mut std::io::BufWriter::new(file.as_file_mut()),
+            |_| {},
+        )?;
+        Ok(file)
+    }
+
     /// GET `url` and stream its body into `w`, returning the number of bytes
     /// written. `on_content_length` is called once with the announced body size,
     /// when the server sends one, before any byte reaches `w`.
@@ -73,10 +168,11 @@ impl Fetcher {
         let mut written = 0u64;
         while let Some(chunk) = body.chunk().await? {
             w.write_all(&chunk)
-                .with_context(|| format!("write body of {url}"))?;
+                .with_context(|| format!("write body of {}", redact_url(url)))?;
             written += chunk.len() as u64;
         }
-        w.flush().with_context(|| format!("write body of {url}"))?;
+        w.flush()
+            .with_context(|| format!("write body of {}", redact_url(url)))?;
         Ok(written)
     }
 
@@ -87,6 +183,10 @@ impl Fetcher {
     ///
     /// For a caller that writes the body somewhere other than the polling
     /// worker; [`get_async`](Self::get_async) writes each chunk inline.
+    ///
+    /// With [`max_bytes`](Self::max_bytes) set, an announced length over it
+    /// fails here, before any byte is read, and [`Body::chunk`] fails on the
+    /// chunk that would pass it.
     pub async fn open<'u>(&self, url: &'u str) -> anyhow::Result<Body<'u>> {
         self.open_with(url, RequestOptions::default()).await
     }
@@ -103,12 +203,31 @@ impl Fetcher {
         url: &'u str,
         opts: RequestOptions<'_>,
     ) -> anyhow::Result<Body<'u>> {
-        let client = reqwest::Client::builder()
-            .connect_timeout(self.connect_timeout)
-            .read_timeout(self.read_timeout)
-            .user_agent(user_agent())
+        // Every message names the URL without what may be a credential.
+        if self.https_only {
+            let parsed = reqwest::Url::parse(url)
+                .with_context(|| format!("parse URL {}", redact_url(url)))?;
+            if parsed.scheme() != "https" {
+                return Err(NotHttps {
+                    url: redact_url(url),
+                }
+                .into());
+            }
+        }
+        let client = self
+            .client_builder()
             .build()
             .context("build download client")?;
+        self.open_on(&client, url, opts).await
+    }
+
+    /// [`open_with`](Self::open_with) past its scheme check, on `client`.
+    async fn open_on<'u>(
+        &self,
+        client: &reqwest::Client,
+        url: &'u str,
+        opts: RequestOptions<'_>,
+    ) -> anyhow::Result<Body<'u>> {
         let mut req = client.get(url);
         for (name, value) in opts.headers {
             req = req.header(name.as_str(), value.as_str());
@@ -120,9 +239,79 @@ impl Fetcher {
             .send()
             .await
             .and_then(|r| r.error_for_status())
-            .with_context(|| format!("GET {url}"))?;
-        Ok(Body { url, resp })
+            .map_err(reqwest::Error::without_url)
+            .with_context(|| format!("GET {}", redact_url(url)))?;
+        if self.https_only && resp.status().is_redirection() {
+            // A redirect the client handed back unfollowed: one whose
+            // `Location` is not an http(s) URI (`file:`), or none at all.
+            // Its body is not the download.
+            return Err(unfollowed_redirect(&resp))
+                .with_context(|| format!("GET {}", redact_url(url)));
+        }
+        let body = Body {
+            url,
+            resp,
+            max_bytes: self.max_bytes,
+            read: 0,
+        };
+        if let (Some(len), Some(max)) = (body.content_length(), self.max_bytes)
+            && len > max
+        {
+            return Err(body.too_large(max));
+        }
+        Ok(body)
     }
+
+    /// The client [`open`](Self::open) sends with. With
+    /// [`https_only`](Self::https_only), every redirect is checked by heph's
+    /// own policy as well as by reqwest's `https_only`: a `Location` that is
+    /// not `https` is refused with [`NotHttps`], whatever reqwest does.
+    fn client_builder(&self) -> reqwest::ClientBuilder {
+        reqwest::Client::builder()
+            .connect_timeout(self.connect_timeout)
+            .read_timeout(self.read_timeout)
+            .user_agent(user_agent())
+            .https_only(self.https_only)
+            .redirect(redirect_policy(self.https_only))
+    }
+}
+
+/// A 3xx `resp` the client did not follow: [`NotHttps`] when its `Location`
+/// resolves to anything but `https`, else a plain error naming the status.
+fn unfollowed_redirect(resp: &reqwest::Response) -> anyhow::Error {
+    let target = resp
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|loc| loc.to_str().ok())
+        .and_then(|loc| resp.url().join(loc).ok());
+    match target {
+        Some(target) if target.scheme() != "https" => NotHttps {
+            url: redact_url(target.as_str()),
+        }
+        .into(),
+        _ => anyhow::anyhow!("a {} redirect that was not followed", resp.status()),
+    }
+}
+
+/// reqwest's default redirect limit, kept by [`redirect_policy`].
+const MAX_REDIRECTS: usize = 10;
+
+/// reqwest's default policy, or with `https_only` one that also refuses a
+/// redirect to anything but `https`, naming it redacted.
+fn redirect_policy(https_only: bool) -> reqwest::redirect::Policy {
+    if !https_only {
+        return reqwest::redirect::Policy::default();
+    }
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.url().scheme() != "https" {
+            let url = redact_url(attempt.url().as_str());
+            attempt.error(NotHttps { url })
+        } else if attempt.previous().len() > MAX_REDIRECTS {
+            attempt.error(format!("more than {MAX_REDIRECTS} redirects"))
+        } else {
+            attempt.follow()
+        }
+    })
 }
 
 /// What a GET sends beyond its URL. See [`Fetcher::open_with`].
@@ -214,6 +403,10 @@ impl std::fmt::Debug for BasicAuth {
 pub struct Body<'u> {
     url: &'u str,
     resp: reqwest::Response,
+    /// [`Fetcher::max_bytes`].
+    max_bytes: Option<u64>,
+    /// Body bytes returned so far.
+    read: u64,
 }
 
 impl Body<'_> {
@@ -223,16 +416,32 @@ impl Body<'_> {
     }
 
     /// The next chunk of the body, or `None` once it has ended. Each read is
-    /// bounded by the [`Fetcher`]'s `read_timeout`.
+    /// bounded by the [`Fetcher`]'s `read_timeout`, and the body as a whole by
+    /// its `max_bytes` ([`TooLarge`]).
     ///
     /// Cancel-safe: dropping the future before it resolves loses no bytes;
     /// `plugin-http`'s download `select!`s on it.
     pub async fn chunk(&mut self) -> anyhow::Result<Option<bytes::Bytes>> {
         let url = self.url;
-        self.resp
+        let chunk = self
+            .resp
             .chunk()
             .await
-            .with_context(|| format!("download {url}"))
+            .map_err(reqwest::Error::without_url)
+            .with_context(|| format!("download {}", redact_url(url)))?;
+        if let Some(chunk) = &chunk {
+            let read = self.read.saturating_add(chunk.len() as u64);
+            if let Some(max) = self.max_bytes.filter(|max| read > *max) {
+                return Err(self.too_large(max));
+            }
+            self.read = read;
+        }
+        Ok(chunk)
+    }
+
+    fn too_large(&self, max_bytes: u64) -> anyhow::Error {
+        anyhow::Error::new(TooLarge { max_bytes })
+            .context(format!("download {}", redact_url(self.url)))
     }
 }
 
@@ -254,7 +463,7 @@ fn block_on_own_runtime<T: Send>(
                 .block_on(fut)
         })
         .join()
-        .map_err(|_e| anyhow::anyhow!("download thread for {url} panicked"))?
+        .map_err(|_e| anyhow::anyhow!("download thread for {} panicked", redact_url(url)))?
     })
 }
 
@@ -351,18 +560,18 @@ impl<W: Write> Sha256Writer<W> {
         for chunk in chunks {
             self.hw
                 .write_all(chunk.as_ref())
-                .with_context(|| format!("write body of {url}"))?;
+                .with_context(|| format!("write body of {}", redact_url(url)))?;
         }
         self.hw
             .flush()
-            .with_context(|| format!("write body of {url}"))
+            .with_context(|| format!("write body of {}", redact_url(url)))
     }
 
     /// Flush what was written and return its lowercase hex SHA-256.
     pub fn finish(mut self, url: &str) -> anyhow::Result<String> {
         self.hw
             .flush()
-            .with_context(|| format!("write body of {url}"))?;
+            .with_context(|| format!("write body of {}", redact_url(url)))?;
         Ok(hex::encode(self.hw.hasher.finalize()))
     }
 }
@@ -526,5 +735,251 @@ mod tests {
             }
         );
         assert!(!shown.contains("material"), "{shown}");
+    }
+
+    /// A signed URL's query and fragment, and any userinfo, never reach an
+    /// error's text: not this crate's contexts, not reqwest's own message,
+    /// not [`NotHttps`].
+    #[test]
+    fn errors_never_carry_a_query_fragment_or_userinfo() {
+        // Tokens no symbol name can contain: `{err:?}` carries a backtrace
+        // when RUST_BACKTRACE is set (as in CI), and this test's own name
+        // has "frag" in it.
+        const SECRETS: [&str; 3] = ["Q9sekritQ9", "Q9fragQ9", "Q9hunter2Q9"];
+        let check = |err: &anyhow::Error, base: &str| {
+            for text in [format!("{err:#}"), format!("{err:?}")] {
+                for s in SECRETS {
+                    assert!(!text.contains(s), "{s} in: {text}");
+                }
+                assert!(text.contains(base), "{base} not in: {text}");
+            }
+        };
+        let signed = |base: &str| format!("{base}?X-Amz-Signature=Q9sekritQ9#Q9fragQ9");
+
+        // An error status: reqwest names the URL in its own message.
+        let addr = serve_raw(
+            b"HTTP/1.1 404 Not Found\r\ncontent-length: 4\r\nconnection: close\r\n\r\nnope"
+                .to_vec(),
+        );
+        let base = format!("http://{addr}/x");
+        let err = get(&signed(&base), &mut Vec::new()).expect_err("404");
+        check(&err, &base);
+
+        // A connect failure.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let base = format!("http://{addr}/x");
+        let err = get(&signed(&base), &mut Vec::new()).expect_err("refused");
+        check(&err, &base);
+
+        // A body over the cap.
+        let addr = serve_raw(
+            b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\nconnection: close\r\n\r\ntests".to_vec(),
+        );
+        let base = format!("http://{addr}/x");
+        let err = capped(4)
+            .get(&signed(&base), &mut Vec::new(), |_| {})
+            .expect_err("over the cap");
+        check(&err, &base);
+
+        // Refused by scheme, userinfo included.
+        let err = Fetcher::https_capped(1)
+            .get(
+                "http://u:Q9hunter2Q9@h.invalid/x?X-Amz-Signature=Q9sekritQ9#Q9fragQ9",
+                &mut Vec::new(),
+                |_| {},
+            )
+            .expect_err("http");
+        check(&err, "http://h.invalid/x");
+        assert_eq!(
+            err.downcast_ref::<NotHttps>().map(|e| e.url.as_str()),
+            Some("http://h.invalid/x")
+        );
+    }
+
+    /// Serve `response` verbatim to one request, then close. Returns the
+    /// address.
+    fn serve_raw(response: Vec<u8>) -> std::net::SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let n = s.read(&mut buf).unwrap();
+            assert!(n > 0, "empty request");
+            // The client may hang up as soon as the cap is passed.
+            if let Err(e) = s.write_all(&response) {
+                assert!(
+                    matches!(
+                        e.kind(),
+                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                    ),
+                    "serve: {e}"
+                );
+            }
+        });
+        addr
+    }
+
+    /// A capped fetcher over plain http, which only a test can reach: the
+    /// cap is what is under test.
+    fn capped(max_bytes: u64) -> Fetcher {
+        Fetcher {
+            https_only: false,
+            ..Fetcher::https_capped(max_bytes)
+        }
+    }
+
+    /// `https_only` refuses `http://` (any case) before connecting: the
+    /// port here has no listener, so a connect would fail differently.
+    #[test]
+    fn https_only_refuses_http_before_sending() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        for url in [
+            format!("http://{addr}/x.hephsession"),
+            format!("HTTP://{addr}/x.hephsession"),
+            format!("ftp://{addr}/x.hephsession"),
+        ] {
+            let mut out = Vec::new();
+            let err = Fetcher::https_capped(1 << 30)
+                .get(&url, &mut out, |_| {})
+                .expect_err("http must be refused");
+            assert_eq!(
+                err.downcast_ref::<NotHttps>(),
+                Some(&NotHttps {
+                    url: redact_url(&url)
+                }),
+                "{err:#}"
+            );
+            assert!(format!("{err:#}").contains("only https://"), "{err:#}");
+        }
+        // Not a URL at all: a parse error, not a request.
+        let err = Fetcher::https_capped(1)
+            .get("not a url", &mut Vec::new(), |_| {})
+            .expect_err("garbage must fail");
+        assert!(format!("{err:#}").contains("parse URL"), "{err:#}");
+    }
+
+    /// An `https_only` fetcher's redirect to `http://` or `file:` is refused,
+    /// naming the target without its query: `http://` by heph's redirect
+    /// policy, `file:` (which the client hands back unfollowed, as a 302
+    /// with an empty body) by `open`'s status check. reqwest's `https_only`
+    /// would refuse the first, plain-http, request this local server can
+    /// answer, so the test lifts only that, keeping the client and the path
+    /// `open` uses; the `http://` target has no listener, so following it
+    /// would fail differently.
+    #[test]
+    fn https_only_refuses_a_redirect_off_https() {
+        let nobody = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let nobody_addr = nobody.local_addr().unwrap();
+        drop(nobody);
+        for location in [
+            format!("http://{nobody_addr}/y.hephsession?sig=hunter2"),
+            "file:///etc/passwd".to_owned(),
+        ] {
+            let addr = serve_raw(
+                format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\n\
+                     Connection: close\r\n\r\n"
+                )
+                .into_bytes(),
+            );
+            let fetcher = Fetcher::https_capped(1 << 20);
+            let client = fetcher.client_builder().https_only(false).build().unwrap();
+            let url = format!("http://{addr}/x.hephsession");
+            let err = block_on_own_runtime(&url, async {
+                fetcher
+                    .open_on(&client, &url, RequestOptions::default())
+                    .await
+                    .map(|_body| ())
+            })
+            .expect_err(&location);
+            let refused = err
+                .chain()
+                .find_map(|e| e.downcast_ref::<NotHttps>())
+                .unwrap_or_else(|| panic!("{location}: not NotHttps: {err:#}"));
+            assert_eq!(refused.url, redact_url(&location), "{err:#}");
+            assert!(!format!("{err:#}").contains("hunter2"), "{err:#}");
+        }
+    }
+
+    /// An announced length over the cap fails before any byte is written.
+    #[test]
+    fn cap_refuses_an_announced_length_before_writing() {
+        let addr = serve_raw(
+            b"HTTP/1.1 200 OK\r\ncontent-length: 11\r\nconnection: close\r\n\r\n01234567890"
+                .to_vec(),
+        );
+        let mut out = Vec::new();
+        let err = capped(10)
+            .get(&format!("http://{addr}/x"), &mut out, |_| {
+                panic!("the length callback runs only within the cap")
+            })
+            .expect_err("over the cap");
+        assert_eq!(
+            err.downcast_ref::<TooLarge>(),
+            Some(&TooLarge { max_bytes: 10 })
+        );
+        assert!(out.is_empty());
+    }
+
+    /// A body with no length that grows past the cap fails as it does; one
+    /// exactly at the cap is accepted.
+    #[test]
+    fn cap_stops_an_unannounced_body() {
+        let body = |n: usize| {
+            let mut r = b"HTTP/1.1 200 OK\r\nconnection: close\r\n\r\n".to_vec();
+            r.extend(std::iter::repeat_n(b'x', n));
+            r
+        };
+        let addr = serve_raw(body(64 * 1024));
+        let mut out = Vec::new();
+        let err = capped(1000)
+            .get(&format!("http://{addr}/x"), &mut out, |_| {})
+            .expect_err("over the cap");
+        assert_eq!(
+            err.downcast_ref::<TooLarge>(),
+            Some(&TooLarge { max_bytes: 1000 })
+        );
+        assert!(out.len() <= 1000, "wrote {} bytes past the cap", out.len());
+
+        let addr = serve_raw(body(1000));
+        let mut out = Vec::new();
+        let n = capped(1000)
+            .get(&format!("http://{addr}/x"), &mut out, |_| {})
+            .expect("exactly at the cap");
+        assert_eq!(n, 1000);
+    }
+
+    /// `get_to_temp` leaves the body in a file in `dir`; a failed download
+    /// leaves nothing behind.
+    #[test]
+    fn get_to_temp_keeps_only_a_complete_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let addr = serve_raw(
+            b"HTTP/1.1 200 OK\r\ncontent-length: 4\r\nconnection: close\r\n\r\ntest".to_vec(),
+        );
+        let file = capped(4)
+            .get_to_temp(&format!("http://{addr}/x"), dir.path())
+            .unwrap();
+        assert_eq!(file.path().parent(), Some(dir.path()));
+        assert_eq!(std::fs::read(file.path()).unwrap(), b"test");
+        drop(file);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+
+        let addr = serve_raw(
+            b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\nconnection: close\r\n\r\ntests".to_vec(),
+        );
+        capped(4)
+            .get_to_temp(&format!("http://{addr}/x"), dir.path())
+            .expect_err("over the cap");
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "a failed download left a file"
+        );
     }
 }

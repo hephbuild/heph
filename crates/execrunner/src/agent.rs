@@ -47,6 +47,7 @@
 //! non-UTF-8 argument or environment value is legal on every supported target,
 //! and a text encoding would either corrupt it or bloat it several-fold.
 
+use hcore::session_record::is_heph_owned_env;
 use hproc::proc_exec;
 use rustix::fd::{AsFd, BorrowedFd, OwnedFd};
 use rustix::net::{
@@ -922,9 +923,7 @@ fn agent_environment(request: Vec<(OsString, OsString)>) -> Vec<(OsString, OsStr
     let target_path = find("PATH");
     let suffix = find(PATH_SUFFIX_ENV);
 
-    let mut env: Vec<(OsString, OsString)> = std::env::vars_os()
-        .filter(|(k, _)| k != SOCK_ENV && k != PATH_SUFFIX_ENV && k != "PATH")
-        .collect();
+    let mut env = runner_base(std::env::vars_os());
     let runner_path = std::env::var_os("PATH");
 
     for (k, v) in request {
@@ -941,6 +940,22 @@ fn agent_environment(request: Vec<(OsString, OsString)>) -> Vec<(OsString, OsStr
         env.push((OsString::from("PATH"), path));
     }
     env
+}
+
+/// The runner's half of [`agent_environment`]: the agent's `environ` minus
+/// the keys that are the agent's own (`PATH` is joined separately) and
+/// heph's own names ([`hcore::session_record::HEPH_OWNED_ENV`]), which the launch is started
+/// without ([`crate::session`]) and which an environment that exports them
+/// anyway must not hand every target (spec E4): `HEPH_SESSION_EXPORT_DIR`
+/// would send a nested heph's export there unasked, `HEPH_TOOLS_DIR` would
+/// hand a target without tools another sandbox's tool tree. A target that
+/// sets one itself, or names it in `runtime_pass_env`, still gets it,
+/// through `request`.
+fn runner_base(env: impl Iterator<Item = (OsString, OsString)>) -> Vec<(OsString, OsString)> {
+    env.filter(|(k, _)| {
+        k != SOCK_ENV && k != PATH_SUFFIX_ENV && k != "PATH" && !is_heph_owned_env(k)
+    })
+    .collect()
 }
 
 async fn run_one(
@@ -1224,5 +1239,29 @@ mod tests {
             !env.iter().any(|(k, _)| k == PATH_SUFFIX_ENV),
             "a control value must not reach the target"
         );
+    }
+
+    /// Spec E4: an environment that exports the session export directory
+    /// (or another sandbox's tools directory) does not hand it to every
+    /// target; a near-miss name is kept.
+    #[test]
+    fn the_runner_base_never_carries_the_session_export_dir() {
+        let base = runner_base(
+            [
+                (
+                    hcore::session_record::SESSION_EXPORT_DIR_ENV,
+                    "/ci/sessions",
+                ),
+                (hcore::session_record::TOOLS_DIR_ENV, "/outer/tools"),
+                ("HEPH_SESSION_EXPORT_DIRS", "near miss"),
+                (SOCK_ENV, "/s.sock"),
+                ("PATH", "/env/bin"),
+                ("GOFLAGS", "-mod=mod"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (OsString::from(k), OsString::from(v))),
+        );
+        let keys: Vec<_> = base.iter().map(|(k, _)| k.to_string_lossy()).collect();
+        assert_eq!(keys, ["HEPH_SESSION_EXPORT_DIRS", "GOFLAGS"]);
     }
 }

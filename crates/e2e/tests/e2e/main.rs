@@ -6,7 +6,8 @@
 //! file with a name filter: `cargo test -p e2e --test e2e clean::`.
 //!
 //! Not every file belongs here. `credential.rs`, `oci_credential.rs`,
-//! `deferred.rs`, `entrypoint.rs` and `run_terminal.rs` stay separate binaries
+//! `deferred.rs`, `entrypoint.rs`, `run_terminal.rs` and
+//! `session_export_env.rs` stay separate binaries
 //! under `tests/` because they call
 //! `std::env::set_var`, and libtest runs a binary's tests as threads of one
 //! process: a variable one test sets would be visible to every other test in

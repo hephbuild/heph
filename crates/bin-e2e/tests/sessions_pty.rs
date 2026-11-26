@@ -18,10 +18,12 @@ use std::time::{Duration, Instant};
 const DEADLINE: Duration = Duration::from_secs(120);
 
 /// `slow` keeps a session live long enough to attach and detach; `hold` is a
-/// single named target, so it gets the terminal and the TUI pauses for it.
+/// single named target, so it gets the terminal and the TUI pauses for it;
+/// `fail` fails at once, for a finished session to export.
 const BUILD: &str = r#"
 target(name = "slow", driver = "bash", run = "sleep 15", cache = False)
 target(name = "hold", driver = "bash", run = 'echo hold-""started; sleep 6; echo hold-""done', cache = False)
+target(name = "fail", driver = "bash", run = "exit 1", cache = False)
 "#;
 
 fn workspace() -> Workspace {
@@ -75,6 +77,71 @@ echo "after-attach=$?="; read -r _
         "detach ended the session: {entry}"
     );
     assert!(run.wait().success(), "{}", run.stderr());
+}
+
+/// Spec row `attach_a_downloaded_file`: a finished run's session, exported
+/// to a file (as a CI artifact is downloaded), is attached by path on a
+/// terminal: it replays to its end, exits with the run's code, and hands the
+/// terminal back as it found it. `export -o -` onto that terminal is
+/// refused with 125: the file is binary.
+#[test]
+fn attach_a_downloaded_file() {
+    let dist = Dist::locate();
+    let ws = workspace();
+    let run = ws.run(&dist, &["run", "//pkg:fail"]).expect("run");
+    let code = run.status.code().expect("the run exited with a code");
+    assert_ne!(code, 0, "{}", common::describe(&run));
+    let id = common::session::id_in(&String::from_utf8_lossy(&run.stderr))
+        .unwrap_or_else(|| panic!("no session announced\n{}", common::describe(&run)));
+    let out = tempfile::tempdir().expect("tempdir");
+    let path = out.path().join("downloaded.hephsession");
+    let path_arg = path.to_str().expect("a UTF-8 temp path");
+    let exported = ws
+        .run(&dist, &["session", "export", &id, "-o", path_arg])
+        .expect("export");
+    assert!(exported.status.success(), "{}", common::describe(&exported));
+    // The file stands alone: the session it came from is gone.
+    std::fs::remove_dir_all(sessions_dir(ws.home())).expect("remove the sessions");
+
+    let home = ws.home().to_string_lossy().into_owned();
+    let script = format!(
+        r#"
+echo "before-""attach"; read -r _
+"$HEPH" session attach '{path_arg}'
+echo "attach=$?="; read -r _
+"$HEPH" session export '{path_arg}' -o -
+echo "piped=$?="; read -r _
+"#
+    );
+    let mut pty = Pty::script(&dist, ws.root(), &script, &[("HOME", &home)]);
+    pty.wait_for("before-attach", SHORT);
+    let before = pty.termios();
+    assert!(before.is_cooked(), "{before:?}");
+    pty.send(b"\n");
+    pty.wait_for("attach=", SHORT);
+    assert_eq!(pty.number_after("attach="), code, "{}", pty.seen());
+    let seen = pty.seen();
+    assert!(
+        seen.contains(&format!("heph: replaying {path_arg}")),
+        "{seen}"
+    );
+    assert!(seen.contains("//pkg:fail"), "{seen}");
+    assert_eq!(pty.termios(), before, "attach left the terminal changed");
+    assert!(pty.cursor_visible(), "cursor left hidden\n{}", pty.screen());
+    assert!(!pty.alternate_screen(), "{}", pty.screen());
+
+    // The file exported again, onto the terminal: it opens, then the
+    // terminal is refused, naming why.
+    pty.send(b"\n");
+    pty.wait_for("piped=", SHORT);
+    assert_eq!(pty.number_after("piped="), 125, "{}", pty.seen());
+    assert!(
+        pty.seen().contains("not writing it to a terminal"),
+        "{}",
+        pty.seen()
+    );
+    pty.send(b"\n");
+    assert_eq!(pty.wait_exit(DEADLINE), Ended::Code(0), "{}", pty.seen());
 }
 
 /// The dashboard's hint row starts with this; nothing on the line says it.
