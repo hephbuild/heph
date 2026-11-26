@@ -467,6 +467,11 @@ in
     # `fuser` after a transitive version bump, a resolver error) as "feature
     # off" and wave the wrong arm through, which is the silent-green failure
     # this whole gate exists to remove.
+    #
+    # The feature-off arm needs cargo's per-selection resolve: a local shell
+    # resolves features for the whole workspace (see `enterShell`), so the
+    # excluded members' default features would turn fuse-sandbox back on.
+    unset __CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS CARGO_UNSTABLE_FEATURE_UNIFICATION CARGO_RESOLVER_FEATURE_UNIFICATION
     echo '> checking --no-default-features really disables fuse-sandbox'
     if fuser_tree=$(cargo tree --workspace --exclude e2e --exclude plugingo-e2e --exclude testkit --exclude bench --no-default-features --locked -i fuser 2>&1); then
       echo "error: --no-default-features left 'fuser' in the dependency graph, so the pass below would lint the fuse-sandbox=on arm and the feature-off code is still covered by nothing." >&2
@@ -502,6 +507,8 @@ in
   scripts.fix.exec = ''
     set -euo pipefail
     cargo clippy --fix --workspace --all-targets --allow-dirty --allow-staged
+    # Per-selection resolve for the feature-off arm, as in `lint`.
+    unset __CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS CARGO_UNSTABLE_FEATURE_UNIFICATION CARGO_RESOLVER_FEATURE_UNIFICATION
     cargo clippy --fix --workspace --exclude e2e --exclude plugingo-e2e --exclude testkit --exclude bench --all-targets --no-default-features --allow-dirty --allow-staged
     cargo fmt ${qualityCrates}
   '';
@@ -614,8 +621,10 @@ in
       # Local: build the same artifacts the build job builds, the same way (one
       # invocation so cargo overlaps their LTO tails — see heph.yml).
       # Plus the test-only entrypoint cdylib, which the build job also builds
-      # (and uploads unpublished).
-      cargo build --release --locked --bin heph --lib -p heph -p plugin-go-cdylib -p plugin-gh-cdylib -p plugin-oci-cdylib -p plugin-devenv-cdylib -p plugin-entrypoint-test-cdylib
+      # (and uploads unpublished). Without the local shell's workspace-wide
+      # feature unification (see `enterShell`): the build job does not have it.
+      env -u __CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS -u CARGO_UNSTABLE_FEATURE_UNIFICATION -u CARGO_RESOLVER_FEATURE_UNIFICATION \
+        cargo build --release --locked --bin heph --lib -p heph -p plugin-go-cdylib -p plugin-gh-cdylib -p plugin-oci-cdylib -p plugin-devenv-cdylib -p plugin-entrypoint-test-cdylib
       out="$target/release"
 
       # cargo's build lock covers the build but not the gap between it and the
@@ -906,7 +915,29 @@ in
   # `ld64.heph` (above) execs `$HEPH_DARWIN_LD`. Resolving ld-prime costs
   # an `xcrun` and an `ld -v`, about 40ms — a tenth of a debug link — so it is
   # done once per shell, not once per link.
-  enterShell = lib.optionalString pkgs.stdenv.isDarwin ''
+  #
+  # Local shells resolve features once for the whole workspace, whatever `-p` a
+  # command selects. Stable cargo unifies a dependency's features only across
+  # the selected packages, so `cargo test -p engine`, `cargo test -p e2e` and
+  # `cargo clippy --workspace` each built their own copy of every shared crate,
+  # and each new `-p` set an agent ran added another: 21 copies of `engine` in
+  # one worktree's `target/` after a day. With this, every test build shares one
+  # copy per crate. What still splits is a plain `cargo build` (no dev-dependency
+  # features), check vs build, and the profile.
+  #
+  # `resolver.feature-unification` is nightly-only in cargo 1.100; the channel
+  # override unlocks it for cargo alone (rustc and build scripts still see a
+  # stable toolchain). CI runs in this shell too and is left alone: it builds
+  # the release artifacts, and should build them as cargo does by default.
+  # `scripts.e2e` drops these for its release build for the same reason.
+  # `tests/root/feature_unification.rs` fails if cargo stops honoring them.
+  enterShell = ''
+    if [ -z "''${CI:-}" ]; then
+      export __CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS=nightly
+      export CARGO_UNSTABLE_FEATURE_UNIFICATION=true
+      export CARGO_RESOLVER_FEATURE_UNIFICATION=workspace
+    fi
+  '' + lib.optionalString pkgs.stdenv.isDarwin ''
     export HEPH_DARWIN_LD=ld64.lld
     _heph_ld=$(env -u DEVELOPER_DIR /usr/bin/xcrun --find ld 2>/dev/null) || _heph_ld=
     # `PROJECT:ld-1230.1` is ld-prime; ld64 prints `PROJECT:ld64-954.16`.

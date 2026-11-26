@@ -32,6 +32,7 @@ mod config_schema_cli;
 mod coreutils_cli;
 mod darwin_linker;
 mod execrunner_gate;
+mod feature_unification;
 mod gc_cli;
 mod json_cli;
 mod json_print_gate;
