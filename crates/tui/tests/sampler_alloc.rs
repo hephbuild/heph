@@ -72,19 +72,19 @@ fn sampler_allocates_nothing_per_sample() {
     );
 
     let (out, readings) = sampler::channel();
-    // A slow consumer, so the loop's try_send both delivers and finds the
-    // channel full.
-    let drain = std::thread::spawn(move || {
-        let (mut delivered, mut dropped) = (0u64, 0u64);
-        for reading in readings {
-            if let Reading::Sample(s) = reading {
-                delivered += 1;
-                dropped += u64::from(s.dropped);
-            }
-            std::thread::sleep(Duration::from_millis(3));
+    // The channel is read only at wake 60, on this thread, and after the
+    // loop: whatever the timing, the loop's try_send delivers until the
+    // channel is full, finds it full until wake 60, then delivers a sample
+    // carrying the drop count. `try_recv` on a bounded channel allocates
+    // nothing, and a `Reading` is `Copy`.
+    // (samples delivered, drops they carried)
+    let mut seen = (0u64, 0u64);
+    fn take(seen: &mut (u64, u64), reading: Reading) {
+        if let Reading::Sample(s) = reading {
+            seen.0 += 1;
+            seen.1 += u64::from(s.dropped);
         }
-        (delivered, dropped)
-    });
+    }
 
     // The loop runs on this thread, so the thread-local counters are its.
     // Wake 1 comes before the first tick, wake 2 after it, and wake 102 after
@@ -92,10 +92,17 @@ fn sampler_allocates_nothing_per_sample() {
     let mut wakes = 0u32;
     let mut after_first = (0, 0);
     let mut after_last = (0, 0);
+    let mut drained_at_60 = 0usize;
     sampler::run_host_loop(Duration::from_millis(1), &out, || {
         wakes += 1;
         match wakes {
             2 => after_first = snapshot(),
+            60 => {
+                while let Ok(reading) = readings.try_recv() {
+                    drained_at_60 += 1;
+                    take(&mut seen, reading);
+                }
+            }
             102 => {
                 after_last = snapshot();
                 return true;
@@ -105,7 +112,11 @@ fn sampler_allocates_nothing_per_sample() {
         false
     });
     drop(out);
-    let (delivered, dropped) = drain.join().expect("drain");
+    let dropped_before_60 = seen.1;
+    for reading in readings {
+        take(&mut seen, reading);
+    }
+    let (delivered, dropped) = seen;
 
     assert_eq!(wakes, 102, "the loop ran 101 ticks");
     assert_eq!(
@@ -113,6 +124,12 @@ fn sampler_allocates_nothing_per_sample() {
         (0, 0),
         "allocations and bytes over 100 ticks on the sampler thread"
     );
+    assert_eq!(
+        drained_at_60,
+        sampler::CHANNEL_CAP,
+        "the channel was full by wake 60"
+    );
+    assert_eq!(dropped_before_60, 0, "nothing was delivered after a drop");
     assert!(delivered > 0, "some samples were delivered");
-    assert!(dropped > 0, "some samples met a full channel");
+    assert!(dropped > 0, "a sample after wake 60 carried the drop count");
 }
