@@ -74,9 +74,14 @@ struct HttpFetchSpec {
     /// The content is deliberately not pinned: it changes on the server while
     /// still meaning the same thing (an API response carrying a counter), so
     /// no `sha256` can be written for it. Silences the unverified-download
-    /// warning and the credentials-without-`sha256` one. Cached as usual, by
-    /// URL and headers. Refused together with `sha256`. Never hashed: it
-    /// changes no byte the target produces.
+    /// warning and the credentials-without-`sha256` one. Refused together
+    /// with `sha256`. Never hashed: it changes no byte the target produces.
+    ///
+    /// Setting it, the author asserts the content is semantically stable and,
+    /// with `credentials`, the same bytes for every identity that can read the
+    /// URL; heph does not check either. The cache key is the URL and headers,
+    /// not the bytes, so a cached entry that has gone stale is refreshed with
+    /// `heph run --force <this target>`.
     unpinned: bool,
     /// Output filename, relative to the target's package. Defaults to the URL's
     /// last path segment (`…/heph-govet_linux_amd64` → `heph-govet_linux_amd64`),
@@ -103,7 +108,7 @@ struct HttpFetchSpec {
     /// Not an input: nothing about a credential reaches the cache key. So a
     /// credential-gated fetch is only as cacheable as it is pinned — without
     /// `sha256`, two identities served different bytes would share one entry.
-    /// Set `sha256`, or `cache = False`.
+    /// Set `sha256`, or `cache = False`, or `unpinned = True` (see there).
     credentials: Vec<String>,
     /// Caching for the fetched file. Defaults to on for both the local and
     /// remote cache — a fetch is content-addressed (pinned by `sha256`), so it
@@ -240,7 +245,12 @@ impl ManagedDriver for Driver {
                 addr.format()
             );
         }
-        if !spec.unpinned && gated_and_unpinned(!credential_inputs.is_empty(), &sha256, &cache) {
+        if gated_and_unpinned(
+            !credential_inputs.is_empty(),
+            &sha256,
+            &cache,
+            spec.unpinned,
+        ) {
             tracing::warn!(
                 url = url.raw(),
                 "http_fetch: fetched with credentials and no `sha256`, so what the server \
@@ -366,7 +376,7 @@ impl ManagedDriver for Driver {
             ctoken,
         )
         .await;
-        let unpinned = fetched.map_err(|err| {
+        let checked = fetched.map_err(|err| {
             match refusal_hint(&err, selected.as_ref())
                 .or_else(|| stale_url_hint(&err, def.url.raw()))
             {
@@ -374,11 +384,16 @@ impl ManagedDriver for Driver {
                 None => err,
             }
         })?;
-        warn_if_unpinned(
-            &url,
-            unpinned.as_deref().filter(|_| !def.unpinned),
-            req.request.target.cache.enabled,
-        );
+        if let Some(got) =
+            unverified_warning(&checked, req.request.target.cache.enabled, def.unpinned)
+        {
+            tracing::warn!(
+                url,
+                got,
+                "http_fetch: downloading {url} without checksum verification — set `sha256` on \
+                 the target to pin its content (the fetched bytes hash to {got})"
+            );
+        }
 
         Ok(ManagedRunResponse::default())
     }
@@ -403,13 +418,16 @@ fn normalize_headers(headers: &BTreeMap<String, String>) -> anyhow::Result<Vec<(
 
 /// Whether a target's parse warns: it fetches with credentials, nothing pins
 /// the bytes, and they are cached, so the one entry its rendered URL keys is
-/// shared by every identity that runs it (see `docs/CREDENTIALS.md`).
+/// shared by every identity that runs it (see `docs/CREDENTIALS.md`). Not when
+/// the target says `unpinned = True` (`declared_unpinned`): its author has
+/// asserted the bytes are the same for every identity that can read the URL.
 fn gated_and_unpinned(
     gated: bool,
     sha256: &str,
     cache: &hplugin::driver::targetdef::CacheConfig,
+    declared_unpinned: bool,
 ) -> bool {
-    gated && sha256.is_empty() && cache.enabled
+    gated && sha256.is_empty() && cache.enabled && !declared_unpinned
 }
 
 /// What to add to a fetch the server refused (401 or 403), so the error says
@@ -433,18 +451,20 @@ fn refusal_hint(err: &anyhow::Error, selected: Option<&auth::Selected>) -> Optio
 }
 
 /// What to add to a 404 on a url read from another target (`raw` is the url as
-/// written, `${read://…}`), so the error says where the url came from: a value
-/// derived from a cached lookup can name something the server no longer has
-/// (a GitHub release asset uploaded again gets a new id). `None` for a literal
-/// url or any other failure.
+/// written, `${read://…}`), so the error names the target the url came from: a
+/// value derived from a cached lookup can name something the server no longer
+/// has. `None` for a literal url or any other failure.
 fn stale_url_hint(err: &anyhow::Error, raw: &str) -> Option<String> {
-    if hfetch::http_status(err) != Some(404) || !hcore::template::has_deferred_ref(raw) {
+    if hfetch::http_status(err) != Some(404) {
         return None;
     }
+    let r = hcore::template::first_ref_of(raw, &[hcore::template::READ_KIND])?;
+    let producer =
+        hmodel::htaddr::parse_addr(r.arg).map_or_else(|_| r.arg.to_string(), |a| a.format());
     Some(format!(
-        "the url was read from `{raw}`, and the server has nothing there: if what it was \
-         computed from is cached (a `heph.gh.release_asset`'s `<name>_release`), it may be \
-         stale; `heph tool clean` that target and run again"
+        "the url is the output of {producer}, and the server has nothing there, or nothing \
+         this identity may read. If {producer} computed it from a cached lookup, that lookup \
+         may be stale: refresh it with `heph run --force <the lookup's address>` and build again"
     ))
 }
 
@@ -460,7 +480,7 @@ async fn fetch_until_cancelled(
     executable: bool,
     dest: &std::path::Path,
     ctoken: &(dyn Cancellable + Send + Sync),
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<Checked> {
     match fetch(
         url,
         opts,
@@ -471,8 +491,7 @@ async fn fetch_until_cancelled(
     )
     .await
     {
-        Ok(Fetched::Done) => Ok(None),
-        Ok(Fetched::Unpinned(got)) => Ok(Some(got)),
+        Ok(Fetched::Done(checked)) => Ok(checked),
         Ok(Fetched::Cancelled) => anyhow::bail!("http_fetch: {url} cancelled"),
         Err(err) => Err(err).with_context(|| format!("fetch {url}")),
     }
@@ -481,12 +500,19 @@ async fn fetch_until_cancelled(
 /// How [`fetch`] ended, when it did not fail.
 #[derive(Debug, PartialEq, Eq)]
 enum Fetched {
-    /// The bytes matched the expected `sha256`.
-    Done,
-    /// No `sha256` was expected; the bytes landed unverified and hash to this.
-    Unpinned(String),
+    /// The bytes landed at `dest`.
+    Done(Checked),
     /// The cancel signal fired first. Nothing is left at `dest`.
     Cancelled,
+}
+
+/// What [`verify_checksum`] found about bytes that landed.
+#[derive(Debug, PartialEq, Eq)]
+enum Checked {
+    /// They matched the expected `sha256`.
+    Pinned,
+    /// No `sha256` was expected: they landed unverified, and hash to `got`.
+    Unpinned { got: String },
 }
 
 /// Remove what an abandoned or failed download left at `dest`, if anything.
@@ -636,8 +662,8 @@ async fn fetch(
         }
         Err(err) => Err(err),
     };
-    let fetched = match verified {
-        Ok(fetched) => fetched,
+    let checked = match verified {
+        Ok(checked) => checked,
         Err(err) => {
             remove_partial(dest);
             return Err(err);
@@ -647,7 +673,7 @@ async fn fetch(
     if executable {
         set_executable(dest).with_context(|| format!("chmod +x {dest:?}"))?;
     }
-    Ok(fetched)
+    Ok(Fetched::Done(checked))
 }
 
 /// How many batches of the body may wait for the file writer, on top of the
@@ -827,70 +853,75 @@ fn set_executable(_dest: &std::path::Path) -> anyhow::Result<()> {
 
 /// Compare the fetched bytes' `got` SHA-256 against the `expected` one. An empty
 /// `expected` (no `sha256` on the target) fetches **unverified**:
-/// [`Fetched::Unpinned`], which the caller may warn about (see
-/// [`warn_if_unpinned`]). A mismatch fails closed.
-fn verify_checksum(expected: &str, got: &str, url: &str) -> anyhow::Result<Fetched> {
+/// [`Checked::Unpinned`], which `run` may warn about (see
+/// [`unverified_warning`]). A mismatch fails closed.
+fn verify_checksum(expected: &str, got: &str, url: &str) -> anyhow::Result<Checked> {
     if expected.is_empty() {
-        return Ok(Fetched::Unpinned(got.to_owned()));
+        return Ok(Checked::Unpinned {
+            got: got.to_owned(),
+        });
     }
     if got != expected {
         anyhow::bail!("http_fetch: checksum mismatch for {url}: expected {expected}, got {got}");
     }
-    Ok(Fetched::Done)
+    Ok(Checked::Pinned)
 }
 
-/// Warn that `url` was fetched unverified, when it was (`unpinned` holds the
-/// bytes' hash) and the target is cached: a cached unpinned fetch stores
-/// whatever the server served that day as the target's content.
+/// Whether `run` warns that a fetch landed unverified, and if so the bytes'
+/// hash to suggest as `sha256`. It warns only when all three hold:
 ///
-/// An uncached one (`cache = False`) is not warned about. It declares itself
-/// volatile and is fetched again on every run — the release JSON behind a
-/// private `heph.gh.release_asset`, which changes with every download count
-/// and so cannot be pinned. Warning there would fire on every run and suggest
-/// a pin that breaks the next one.
-///
-/// Returns whether it warned.
-fn warn_if_unpinned(url: &str, unpinned: Option<&str>, cached: bool) -> bool {
-    let Some(got) = unpinned.filter(|_| cached) else {
-        return false;
-    };
-    tracing::warn!(
-        url,
-        got,
-        "http_fetch: downloading {url} without checksum verification — set `sha256` on the \
-         target to pin its content (the fetched bytes hash to {got})"
-    );
-    true
+/// - the bytes were not checked against a `sha256` ([`Checked::Unpinned`]);
+/// - the target is cached (`cached`): a cached unverified fetch stores
+///   whatever the server served that day as the target's content. An uncached
+///   one (`cache = False`) is fetched again on every run, and a warning there
+///   would fire on every run;
+/// - the target does not say `unpinned = True` (`declared_unpinned`): its
+///   author has stated the bytes cannot be pinned (an API response carrying a
+///   counter), so suggesting a pin would break the next fetch.
+fn unverified_warning(checked: &Checked, cached: bool, declared_unpinned: bool) -> Option<&str> {
+    match checked {
+        Checked::Unpinned { got } if cached && !declared_unpinned => Some(got),
+        Checked::Unpinned { .. } | Checked::Pinned => None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// An unpinned fetch warns only when it is cached: an uncached one (the
-    /// release JSON behind a private `heph.gh.release_asset`) runs on every
-    /// build and cannot be pinned, so warning there fires on every build.
-    #[test]
-    fn warns_about_an_unpinned_fetch_only_when_it_is_cached() {
-        let cases = [
-            (Some("abc"), true, true),
-            (Some("abc"), false, false),
-            (None, true, false),
-            (None, false, false),
-        ];
-        for (unpinned, cached, want) in cases {
-            assert_eq!(
-                warn_if_unpinned("https://x/a", unpinned, cached),
-                want,
-                "unpinned={unpinned:?} cached={cached}"
-            );
-        }
-    }
     use hcore::hasync::StdCancellationToken;
     use hcore::htvalue::Value;
     use hmodel::htaddr::parse_addr;
     use hplugin::provider::TargetSpec;
     use std::collections::HashMap;
+
+    /// `run` warns about an unverified fetch only when it is cached and not
+    /// declared `unpinned`.
+    #[test]
+    fn warns_about_an_unverified_fetch_only_when_cached_and_not_declared_unpinned() {
+        let unpinned = Checked::Unpinned {
+            got: "abc".to_string(),
+        };
+        // (checked, cached, declared unpinned, warns)
+        let cases = [
+            (&unpinned, true, false, true),
+            (&unpinned, false, false, false),
+            (&unpinned, true, true, false),
+            (&unpinned, false, true, false),
+            (&Checked::Pinned, true, false, false),
+            (&Checked::Pinned, false, false, false),
+        ];
+        for (checked, cached, declared, want) in cases {
+            let got = unverified_warning(checked, cached, declared);
+            assert_eq!(
+                got.is_some(),
+                want,
+                "{checked:?} cached={cached} unpinned={declared}"
+            );
+            if want {
+                assert_eq!(got, Some("abc"), "the warning suggests the bytes' hash");
+            }
+        }
+    }
 
     fn args(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         pairs
@@ -983,7 +1014,7 @@ mod tests {
         .await
         .expect("fetch");
         let (sha, _len) = hfetch::sha256_hex_of(BODY).expect("hash");
-        assert_eq!(fetched, Fetched::Unpinned(sha));
+        assert_eq!(fetched, Fetched::Done(Checked::Unpinned { got: sha }));
 
         assert_eq!(std::fs::read(&dest).expect("read"), BODY);
         #[cfg(unix)]
@@ -1017,7 +1048,7 @@ mod tests {
         )
         .await
         .expect("fetch");
-        assert_eq!(fetched, Fetched::Done);
+        assert_eq!(fetched, Fetched::Done(Checked::Pinned));
         assert!(std::fs::read(&dest).expect("read") == body, "body differs");
     }
 
@@ -1906,16 +1937,35 @@ mod tests {
         );
     }
 
-    /// The parse warning fires exactly when the target is gated, unpinned and
-    /// cached.
+    /// The parse warning fires exactly when the target is gated, has no
+    /// `sha256`, is cached, and does not say `unpinned = True`.
     #[test]
     fn only_a_gated_unpinned_cached_fetch_warns() {
         let on = hplugin::driver::targetdef::CacheConfig::on(false);
         let off = hplugin::driver::targetdef::CacheConfig::off();
-        assert!(gated_and_unpinned(true, "", &on));
-        assert!(!gated_and_unpinned(true, BODY_SHA, &on), "pinned");
-        assert!(!gated_and_unpinned(true, "", &off), "uncached");
-        assert!(!gated_and_unpinned(false, "", &on), "anonymous");
+        // (gated, sha256, cache, declared unpinned, warns, why)
+        let cases = [
+            (true, "", &on, false, true, "gated, no sha256, cached"),
+            (true, BODY_SHA, &on, false, false, "pinned"),
+            (true, "", &off, false, false, "uncached"),
+            (false, "", &on, false, false, "anonymous"),
+            (true, "", &on, true, false, "declared unpinned"),
+            (
+                false,
+                "",
+                &on,
+                true,
+                false,
+                "anonymous and declared unpinned",
+            ),
+        ];
+        for (gated, sha, cache, declared, want, why) in cases {
+            assert_eq!(
+                gated_and_unpinned(gated, sha, cache, declared),
+                want,
+                "{why}"
+            );
+        }
     }
 
     /// Answer the requests on `listener` with `responses`, in order, and report
@@ -2270,12 +2320,15 @@ mod tests {
         let missing = failed("404 Not Found").await;
         assert_eq!(refusal_hint(&missing, Some(&selected)), None);
 
-        // A 404 on a url read from another target names where it came from;
-        // a literal url, or any other status, gets no such hint.
+        // A 404 on a url read from another target names that target, as an
+        // address, and how to refresh a stale lookup; a literal url, or any
+        // other status, gets no such hint.
         let read = "${read://tools:gh_url}";
         let stale = stale_url_hint(&missing, read).expect("hint");
         assert!(
-            stale.contains(read) && stale.contains("heph tool clean"),
+            stale.contains("//tools:gh_url")
+                && !stale.contains("${read")
+                && stale.contains("heph run --force"),
             "{stale}"
         );
         assert_eq!(stale_url_hint(&missing, "https://x/tool"), None);

@@ -182,6 +182,16 @@ impl ManagedDriver for Driver {
         let context = format!("{addr}: release asset {:?}", def.asset);
         let src =
             single_dep_file(&req.inputs, SRC_ORIGIN).with_context(|| format!("{addr}: `src`"))?;
+        // The producer's address, without the `|group`/`[filters]` that pick
+        // its file: what `heph run --force` takes.
+        let src_addr = req
+            .request
+            .target
+            .inputs
+            .iter()
+            .find(|i| i.origin_id == SRC_ORIGIN)
+            .map(|i| i.r#ref.r#ref.format())
+            .context("no `src` input")?;
         // The output is `<pkg>/<name>` (see `parse`).
         let dest = req.sandbox_pkg_dir.join(&req.request.target.addr.name);
         hcore::blocking::run(move || {
@@ -189,7 +199,7 @@ impl ManagedDriver for Driver {
                 .single_file()
                 .with_context(|| format!("{addr}: `src`"))?;
             let bytes = std::fs::read(&json).with_context(|| format!("read {}", json.display()))?;
-            let url = pick(&bytes, &def.asset, &def.api)?;
+            let url = pick(&bytes, &def.asset, &def.api, &src_addr)?;
             if let Some(dir) = dest.parent() {
                 std::fs::create_dir_all(dir)
                     .with_context(|| format!("create {}", dir.display()))?;
@@ -209,10 +219,14 @@ impl ManagedDriver for Driver {
 /// sent to next, so a JSON naming another host or path is refused rather than
 /// followed. It must also be one line, since it is written to a file the next
 /// fetch reads whole.
-fn pick(bytes: &[u8], asset: &str, api: &str) -> anyhow::Result<String> {
-    let release: Release = serde_json::from_slice(bytes).context(
-        "the release lookup did not return a GitHub release (a JSON object with `assets`)",
-    )?;
+///
+/// `src` is the address of the target the JSON came from: a JSON that is not
+/// a release, or that lacks `asset`, may be a cached copy taken before the
+/// release had it, and the error says how to refresh it.
+fn pick(bytes: &[u8], asset: &str, api: &str, src: &str) -> anyhow::Result<String> {
+    let release: Release = serde_json::from_slice(bytes)
+        .context("the release lookup did not return a GitHub release (a JSON object with `assets`)")
+        .with_context(|| stale_release_hint(src))?;
     let mut matching = release.assets.iter().filter(|a| a.name == asset);
     let Some(found) = matching.next() else {
         let names: Vec<&str> = release
@@ -222,7 +236,7 @@ fn pick(bytes: &[u8], asset: &str, api: &str) -> anyhow::Result<String> {
             .map(|a| a.name.as_str())
             .collect();
         let more = release.assets.len().saturating_sub(LISTED_NAMES);
-        anyhow::bail!(
+        return Err(anyhow::anyhow!(
             "the release has no asset named {asset:?}; it has {}{}",
             if names.is_empty() {
                 "none".to_string()
@@ -234,7 +248,8 @@ fn pick(bytes: &[u8], asset: &str, api: &str) -> anyhow::Result<String> {
             } else {
                 String::new()
             }
-        );
+        )
+        .context(stale_release_hint(src)));
     };
     anyhow::ensure!(
         matching.next().is_none(),
@@ -255,6 +270,18 @@ fn pick(bytes: &[u8], asset: &str, api: &str) -> anyhow::Result<String> {
     Ok(url.to_string())
 }
 
+/// What a JSON that names no usable asset adds to its error: the JSON is the
+/// output of `src`, a cached snapshot (`heph.gh.release_asset` caches its
+/// release lookup), so a release changed since it was taken is refreshed by
+/// running `src` again.
+fn stale_release_hint(src: &str) -> String {
+    format!(
+        "the release JSON is the output of {src}, a cached snapshot of the release as it was \
+         when that target last ran; if the release has changed since (an asset uploaded or \
+         replaced), refresh it with `heph run --force {src}` and build again"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,6 +292,30 @@ mod tests {
     use std::collections::HashMap;
 
     const API: &str = "https://api.github.com";
+
+    const SRC: &str = "//pkg:tool_release";
+
+    /// [`super::pick`] from [`SRC`].
+    fn pick(bytes: &[u8], asset: &str, api: &str) -> anyhow::Result<String> {
+        super::pick(bytes, asset, api, SRC)
+    }
+
+    /// A JSON that is not a release, or lacks the asset, may be a stale cached
+    /// copy: the error names the target it came from and the exact command
+    /// that refreshes it. A JSON that names the asset badly is not staleness,
+    /// so its error does not.
+    #[test]
+    fn a_json_without_the_asset_says_how_to_refresh_it() {
+        let refresh = format!("`heph run --force {SRC}`");
+        for msg in [pick(&release(&[]), "a", API), pick(b"{}", "a", API)]
+            .map(|r| format!("{:#}", r.unwrap_err()))
+        {
+            assert!(msg.contains(&refresh), "{msg}");
+        }
+        let json = release(&[("a", "https://evil.example/1")]);
+        let msg = format!("{:#}", pick(&json, "a", API).unwrap_err());
+        assert!(!msg.contains("heph run"), "{msg}");
+    }
 
     fn release(assets: &[(&str, &str)]) -> Vec<u8> {
         let assets: Vec<String> = assets
