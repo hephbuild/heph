@@ -31,6 +31,7 @@
 //! the environment — the session runner and `pass_env = ["*"]` would carry them
 //! into targets.
 
+pub mod catalog;
 pub mod cleanup;
 pub mod derive;
 pub mod export;
@@ -40,6 +41,8 @@ pub mod hephsession;
 pub mod holder;
 pub mod id;
 pub mod lockfile;
+pub mod otlp;
+pub mod query;
 pub mod recorder;
 pub mod recording;
 pub mod run_logs;
@@ -48,6 +51,12 @@ pub mod store;
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing;
 
+#[cfg(test)]
+mod catalog_tests;
+#[cfg(test)]
+mod otlp_tests;
+#[cfg(test)]
+mod query_tests;
 #[cfg(test)]
 mod replay_tests;
 #[cfg(test)]
@@ -124,6 +133,15 @@ impl SessionRoot {
 
     pub fn is_private(&self) -> bool {
         self.private
+    }
+
+    /// The root whose catalog this root's sessions write to, fold and clean:
+    /// a private root's is the public one beside it (D19).
+    fn catalog_root(&self) -> Option<PathBuf> {
+        if !self.private {
+            return Some(self.path.clone());
+        }
+        self.path.parent().map(|parent| parent.join(SESSIONS_DIR))
     }
 
     /// Where private sessions go beside this public root, to be swept.
@@ -286,6 +304,8 @@ pub struct Session {
     recorder: Recorder,
     /// Under a private root: removed when finished.
     private: bool,
+    /// [`SessionRoot::catalog_root`].
+    catalog_root: Option<PathBuf>,
     export: Option<SealExport>,
 }
 
@@ -293,6 +313,9 @@ pub struct Session {
 struct Cleanups {
     /// For the session's own root.
     retention: Retention,
+    /// [`SessionRoot::catalog_root`]: a private session's cleanup keeps the
+    /// public catalog, which nothing else does under `HEPH_NO_SESSION`.
+    catalog_root: Option<PathBuf>,
     /// The private root beside a public one, swept of every ended session: a
     /// killed `HEPH_NO_SESSION` run's directory goes at the next cleanup.
     private_root: Option<PathBuf>,
@@ -334,6 +357,7 @@ impl Session {
             } else {
                 retention
             },
+            catalog_root: root.catalog_root(),
             private_root: root.private_sibling(),
         };
         Self::populate(root, id, dir.clone(), start, cleanups, faults).inspect_err(|_| {
@@ -387,16 +411,38 @@ impl Session {
             rw,
             session_id: id,
             retention: cleanups.retention,
+            catalog_root: cleanups.catalog_root.clone(),
             private_root: cleanups.private_root,
             faults,
         })
         .context("starting the session recorder")?;
+        // The catalog's start row, off the build path: a late one never
+        // overwrites the seal's. A private session writes only at its end,
+        // but folds in the public catalog's WAL as a public start does.
+        if let Some(catalog_root) = cleanups.catalog_root.clone() {
+            let (private, rec_dir) = (root.is_private(), dir.clone());
+            let dispatch = tracing::dispatcher::get_default(Clone::clone);
+            let spawned = std::thread::Builder::new()
+                .name("heph-session-catalog".to_owned())
+                .spawn(move || {
+                    let _dispatch = tracing::dispatcher::set_default(&dispatch);
+                    if private {
+                        catalog::fold(&catalog_root);
+                    } else {
+                        catalog::record_start(&catalog_root, &rec_dir);
+                    }
+                });
+            if let Err(e) = spawned {
+                tracing::debug!(error = %e, "cannot start the session catalog write");
+            }
+        }
         Ok(Self {
             id,
             root: root.path().to_path_buf(),
             dir,
             recorder,
             private: root.is_private(),
+            catalog_root: cleanups.catalog_root,
             export,
         })
     }
@@ -421,6 +467,9 @@ impl Session {
         let finished = self
             .recorder
             .finish(exit_code, panicked, recorder::FINISH_TIMEOUT);
+        if finished == recorder::Finished::Ended {
+            self.write_catalog();
+        }
         if let Some(export) = &self.export {
             match finished {
                 recorder::Finished::Ended => export.run(&self.root, &self.dir, self.id),
@@ -438,6 +487,26 @@ impl Session {
         {
             // The next session's start sweeps it.
             tracing::debug!(dir = %self.dir.display(), error = %e, "cannot remove a private session");
+        }
+    }
+
+    /// The seal-time catalog write, bounded at [`catalog::WRITE_BOUND`]. A
+    /// private session writes its `sessions` and `targets` rows
+    /// (`recorded=0`) into the public root's catalog, before its directory
+    /// is removed (D19).
+    fn write_catalog(&self) {
+        let Some(public) = &self.catalog_root else {
+            return;
+        };
+        if !self.private {
+            catalog::record_seal(public, &self.dir, true);
+            return;
+        }
+        match catalog::ensure_root(public) {
+            Ok(()) => catalog::record_seal(public, &self.dir, false),
+            Err(e) => {
+                tracing::debug!(root = %public.display(), error = %e, "cannot make the sessions root");
+            }
         }
     }
 

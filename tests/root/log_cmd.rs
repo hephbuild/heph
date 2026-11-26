@@ -364,8 +364,9 @@ fn log_cmd_follow_says_how_the_run_ended() {
     }
 }
 
-/// The entries of `dir`, none when it does not exist. A root's cleanup stamp
-/// is not a session, and is left out.
+/// The session directories in `dir`, none when it does not exist. What else
+/// a root holds (the catalog and its lock, the cleanup stamp, scratch) is not
+/// a session, and is left out.
 fn entries(dir: &Path) -> Vec<String> {
     if !dir.exists() {
         return Vec::new();
@@ -373,22 +374,36 @@ fn entries(dir: &Path) -> Vec<String> {
     std::fs::read_dir(dir)
         .expect("read_dir")
         .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
-        .filter(|name| name != htui::tui::session::cleanup::STAMP)
+        .filter(|name| htui::tui::session::SessionId::parse(name).is_ok())
         .collect()
 }
 
 /// The sessions `heph session list --all --json` shows.
-fn listed(ws: &Ws) -> usize {
+fn listed(ws: &Ws) -> Vec<serde_json::Value> {
     let out = ws.run(&["session", "list", "--all", "--json"]);
     assert!(out.status.success(), "{}", describe(&out));
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("list --json");
-    v.as_array().expect("list --json is a bare array").len()
+    match serde_json::from_slice(&out.stdout).expect("list --json") {
+        serde_json::Value::Array(sessions) => sessions,
+        other => panic!("list --json is a bare array: {other}"),
+    }
+}
+
+/// `recorded` and `recording_kept` of a `list --json` entry.
+fn recorded(entry: &serde_json::Value) -> (Option<bool>, Option<bool>) {
+    (
+        entry.get("recorded").and_then(serde_json::Value::as_bool),
+        entry
+            .get("recording_kept")
+            .and_then(serde_json::Value::as_bool),
+    )
 }
 
 /// The binary routes `HEPH_NO_SESSION=1` to the private root: while the run
 /// goes on it records under `~/.heph/private-sessions/`, `heph session list`
-/// shows nothing for it, and the directory is gone once it exits. A public
-/// run afterwards is listed, so the empty list is not a broken one.
+/// shows nothing for it, and the directory is gone once it exits. What it
+/// leaves is the catalog's row for it: listed once it ended, as a session
+/// that was not recorded, with no recording dir anywhere. A public run
+/// afterwards is listed as recorded, so the private row is not a broken one.
 #[test]
 fn no_session_records_privately_and_removes_it_at_exit() {
     let ws = workspace();
@@ -421,7 +436,11 @@ fn no_session_records_privately_and_removes_it_at_exit() {
         Vec::<String>::new(),
         "nothing public"
     );
-    assert_eq!(listed(&ws), 0, "a private session is never listed");
+    assert_eq!(
+        listed(&ws),
+        Vec::<serde_json::Value>::new(),
+        "a live private session is never listed"
+    );
 
     ws.touch("g.1");
     ws.touch("g.2");
@@ -429,8 +448,33 @@ fn no_session_records_privately_and_removes_it_at_exit() {
     let seen: Vec<String> = err.try_iter().collect();
     assert!(status.success(), "{status}: {seen:?}");
     assert_eq!(entries(&private), Vec::<String>::new(), "removed at exit");
+    assert_eq!(
+        entries(&heph.join("sessions")),
+        Vec::<String>::new(),
+        "still nothing public"
+    );
+    let rows = listed(&ws);
+    assert_eq!(
+        rows.len(),
+        1,
+        "the ended private run's catalog row: {rows:?}"
+    );
+    assert_eq!(
+        recorded(&rows[0]),
+        (Some(false), Some(false)),
+        "listed as not recorded: {rows:?}"
+    );
 
     let out = ws.run(&["run", "//p:t"]);
     assert!(out.status.success(), "{}", describe(&out));
-    assert_eq!(listed(&ws), 1, "a public run is listed");
+    let rows = listed(&ws);
+    assert_eq!(rows.len(), 2, "a public run is listed too: {rows:?}");
+    let mut kinds: Vec<_> = rows.iter().map(recorded).collect();
+    kinds.sort_unstable();
+    assert_eq!(
+        kinds,
+        vec![(Some(false), Some(false)), (Some(true), Some(true))],
+        "one not recorded, one recorded and kept: {rows:?}"
+    );
+    assert_eq!(entries(&heph.join("sessions")).len(), 1, "one recording");
 }

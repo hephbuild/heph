@@ -48,7 +48,9 @@ shlex = "2"
 uuid = { version = "1.29.3", features = ["v4"] }
 # `session.db`, the recording; and its trace id (SHA-256 of the session id).
 # `limits`: a foreign recording's connection caps the size of a value.
-rusqlite = { version = "0.42", features = ["bundled", "blob", "limits"] }
+# `hooks`: `session query`'s authorizer and timeout; `column_decltype`: its
+# `--json` `types`.
+rusqlite = { version = "0.42", features = ["bundled", "blob", "hooks", "limits", "column_decltype"] }
 sha2 = "0.11"
 hex = "0.4"
 # Opening a `.hephsession` (`session::hephsession`): a zstd frame of a sealed
@@ -56,6 +58,12 @@ hex = "0.4"
 # Deflate only, through the flate2 already in the tree.
 zstd = "0.14"
 zip = { version = "9.8", default-features = false, features = ["deflate-flate2"] }
+# `heph session export --format otlp` (`session::otlp`): the OTLP data model,
+# generated from the vendored .proto files (`gen`), serialised as OTLP/JSON.
+# `base64`: proto3 JSON writes ids as base64, which OTLP/JSON writes as hex.
+otlp-gen = { path = "../../gen/otlp" }
+buffa = { workspace = true, features = ["json"] }
+base64 = "0.22"
 
 # With stdin not a terminal, crossterm reads /dev/tty, and macOS kqueue refuses
 # that with EINVAL (measured), so `heph … < file` and `… | heph` timed out on the

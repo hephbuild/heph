@@ -757,6 +757,9 @@ pub(crate) struct RecorderStart {
     pub(crate) rw: store::RwOpen,
     pub(crate) session_id: SessionId,
     pub(crate) retention: Retention,
+    /// The root whose catalog the cleanup cleans: `root`, or for a private
+    /// session the public root beside it.
+    pub(crate) catalog_root: Option<std::path::PathBuf>,
     /// A private-sessions root to sweep of every ended session too.
     pub(crate) private_root: Option<std::path::PathBuf>,
     pub(crate) faults: Faults,
@@ -775,11 +778,13 @@ fn claimed(root: &std::path::Path, interval: Duration) -> bool {
     }
 }
 
-/// The start-of-session cleanup of `root`, then of `private_root`, each when
-/// this process claims it: at most once an `interval` per root.
+/// The start-of-session cleanup of `root` and of `catalog_root`'s catalog,
+/// then of `private_root`, each when this process claims it: at most once an
+/// `interval` per root.
 fn clean_ended(
     root: &std::path::Path,
     retention: Retention,
+    catalog_root: Option<&std::path::Path>,
     private_root: Option<&std::path::Path>,
     interval: Duration,
 ) {
@@ -800,6 +805,21 @@ fn clean_ended(
         }
         Ok(_) => {}
         Err(e) => tracing::debug!(error = %e, "cannot clean ended sessions"),
+    }
+    // A private root's claim cleans the public catalog too: under
+    // `HEPH_NO_SESSION` alone, nothing else would.
+    match catalog_root.map(|c| super::catalog::clean(c, SystemTime::now())) {
+        Some(Ok(report)) if report != super::catalog::CleanReport::default() => tracing::debug!(
+            expired = report.expired,
+            corrupt = report.corrupt,
+            capped_rows = report.capped_rows,
+            capped_sessions = report.capped_sessions,
+            "cleaned the session catalog"
+        ),
+        Some(Ok(_)) | None => {}
+        Some(Err(e)) => {
+            tracing::debug!(error = %format!("{e:#}"), "cannot clean the session catalog");
+        }
     }
     // A killed `HEPH_NO_SESSION` run's directory: nobody else reads it, so it
     // goes whatever its age. Missing is normal.
@@ -845,6 +865,7 @@ impl Recorder {
             rw,
             session_id,
             retention,
+            catalog_root,
             private_root,
             faults,
             ..
@@ -865,7 +886,13 @@ impl Recorder {
                     if let Some(gate) = &cleanup_gate {
                         wait_for(gate);
                     }
-                    clean_ended(&root, retention, private_root.as_deref(), interval);
+                    clean_ended(
+                        &root,
+                        retention,
+                        catalog_root.as_deref(),
+                        private_root.as_deref(),
+                        interval,
+                    );
                 });
             if let Err(e) = spawned {
                 tracing::debug!(error = %e, "cannot start the session cleanup");

@@ -75,6 +75,9 @@ run	remote	string?	free	default
 run	timed_out	bool	free	default
 session inflight	id	string	free	default
 session inflight	report	string	free	default
+session list	actor	object?	free	default
+session list	actor.kind	string	free	default
+session list	actor.name	string?	free	default
 session list	argv	[string]	free	default
 session list	blocked_on	[object]	free	default
 session list	blocked_on[].kind	"admission"	free	default
@@ -84,7 +87,9 @@ session list	blocked_on[]{kind=admission}.pool	string	free	default
 session list	blocked_on[]{kind=lock}.addr	string	free	default
 session list	blocked_on[]{kind=lock}.holder_pid	number?	free	default
 session list	blocked_on[]{kind=lock}.holder_session	string?	free	default
+session list	command	string?	free	default
 session list	cwd	string?	free	default
+session list	ended_unix_ms	number?	free	default
 session list	exit_code	number?	free	default
 session list	format	number?	free	default
 session list	id	string	free	default
@@ -99,6 +104,8 @@ session list	progress.failed	number	free	default
 session list	progress.running_ops	number	free	default
 session list	progress.total	number?	free	default
 session list	progress.total_complete	bool	free	default
+session list	recorded	bool	free	default
+session list	recording_kept	bool	free	default
 session list	started_unix_ms	number	free	default
 session list	state	"failed"	free	default
 session list	state	"lost"	free	default
@@ -108,6 +115,11 @@ session list	state	"running"	free	default
 session list	state	"unknown"	free	default
 session list	state	"waiting"	free	default
 session list	state	string	free	default
+session list	target	object?	free	default
+session list	target.addr	string	free	default
+session list	target.duration_ms	number?	free	default
+session list	target.outcome	string	free	default
+session list	user	string?	free	default
 session list	workspace_root	string?	free	default
 session show	admission_waits	[object]	free	default
 session show	admission_waits[].addr	string	free	default

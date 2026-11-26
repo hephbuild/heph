@@ -54,6 +54,11 @@ pub const NO_JSON: &[Exempt] = &[
                  `heph session show <file> --json` reads one",
     },
     Exempt {
+        path: "session query",
+        refusal: Refusal::NoFlags,
+        reason: "its columns are the SQL's, not a record's; `--format json` prints the rows",
+    },
+    Exempt {
         path: "auth login",
         refusal: Refusal::NoFlags,
         reason: "interactive: runs sign-in commands that talk to the user",
@@ -447,6 +452,8 @@ mod tests {
             "BlockedOn" => Derived(session::BlockedOn::__OUTPUT_SHAPE),
             "SessionState" => Derived(session::SessionState::__OUTPUT_SHAPE),
             "Progress" => Derived(session::list::Progress::__OUTPUT_SHAPE),
+            "ActorJson" => Derived(session::list::ActorJson::__OUTPUT_SHAPE),
+            "TargetJson" => Derived(session::list::TargetJson::__OUTPUT_SHAPE),
             "SessionEnd" => Derived(htui::tui::session::format::SessionEnd::__OUTPUT_SHAPE),
             "RunningTarget" => Derived(htui::tui::session::format::RunningTarget::__OUTPUT_SHAPE),
             "LockWaitEntry" => Derived(htui::tui::session::format::LockWaitEntry::__OUTPUT_SHAPE),

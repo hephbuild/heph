@@ -9,7 +9,8 @@
 mod common;
 
 use common::session::{
-    Bg, SHORT, id_in, last_end, list_entry, lock_free, recorded_dirs, sessions_dir,
+    Bg, SHORT, id_in, last_end, list_entry, lock_free, private_sessions_dir, recorded_dirs,
+    session_dirs, sessions_dir,
 };
 use common::{Dist, Workspace, describe, signal, wait_until};
 
@@ -232,11 +233,21 @@ fn no_session_env() {
         "{}",
         describe(&out)
     );
+    // It may leave the catalog's row for itself (and so the catalog under
+    // the sessions root), but no recording, public or private.
     let sessions = sessions_dir(ws.home());
-    assert!(
-        std::fs::read_dir(&sessions).map_or(true, |mut d| d.next().is_none()),
+    assert_eq!(
+        session_dirs(&sessions),
+        Vec::<std::path::PathBuf>::new(),
         "a session was recorded under {}",
         sessions.display()
+    );
+    let private = private_sessions_dir(ws.home());
+    assert_eq!(
+        session_dirs(&private),
+        Vec::<std::path::PathBuf>::new(),
+        "the private recording outlived its run under {}",
+        private.display()
     );
 
     // The same run without it records one: the check above can see one.

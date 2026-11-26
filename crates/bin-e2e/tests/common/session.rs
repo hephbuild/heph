@@ -26,6 +26,33 @@ pub fn sessions_dir(home: &Path) -> PathBuf {
     home.join(".heph").join("sessions")
 }
 
+/// Where `HEPH_NO_SESSION=1` runs record, until they exit.
+pub fn private_sessions_dir(home: &Path) -> PathBuf {
+    home.join(".heph").join("private-sessions")
+}
+
+/// The session directories under a sessions root, none when it does not
+/// exist. A root holds more than sessions: the catalog (`catalog.db`, its
+/// lock, a set-aside `catalog.db.corrupt-*`), the cleanup stamp (`.cleanup`)
+/// and scratch (`.tmp`). A session's directory is named by its id, which is
+/// all ASCII letters and digits.
+pub fn session_dirs(root: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<PathBuf> = entries
+        .map(|e| e.expect("sessions root entry").path())
+        .filter(|p| {
+            p.is_dir()
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_alphanumeric()))
+        })
+        .collect();
+    dirs.sort();
+    dirs
+}
+
 /// A read-only connection on a session's `session.db`, as a viewer opens
 /// it; `None` while the owner has not created it yet.
 fn open(dir: &Path) -> Option<rusqlite::Connection> {

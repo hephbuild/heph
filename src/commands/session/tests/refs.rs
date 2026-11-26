@@ -630,10 +630,12 @@ async fn a_snapshot_export_reads_only_itself() {
                 reference: id.encode(),
                 output: Some(path.clone()),
                 no_logs: false,
+                format: ExportFormat::Hephsession,
             },
             crate::engine::approval::read_notice_from_store,
             &mut stdout,
             &no_opener(),
+            no_note(),
         )
         .await
         .expect("export")
@@ -749,10 +751,12 @@ async fn a_blocked_snapshot_is_no_live_stall() {
             reference: id.encode(),
             output: Some(path.clone()),
             no_logs: true,
+            format: ExportFormat::Hephsession,
         },
         crate::engine::approval::read_notice_from_store,
         &mut Vec::new(),
         &no_opener(),
+        no_note(),
     )
     .await
     .expect("export");

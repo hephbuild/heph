@@ -45,6 +45,49 @@ pub(crate) fn try_lock_exclusive(file: &File) -> io::Result<bool> {
     flock_nb(file, libc::LOCK_EX)
 }
 
+/// Open (creating it `0600`) a lock file many processes share, such as
+/// `catalog.lock`. No lock is taken.
+pub(crate) fn open_shared_file(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+}
+
+/// Take `LOCK_EX` (or `LOCK_SH`) on `file`, retrying until `wait` has passed:
+/// `Ok(false)` when it stayed held. On a file that already holds the other
+/// kind, this converts it — not atomically: the old lock may be released
+/// first.
+pub(crate) fn lock_within(file: &File, exclusive: bool, wait: Duration) -> io::Result<bool> {
+    let op = if exclusive {
+        libc::LOCK_EX
+    } else {
+        libc::LOCK_SH
+    };
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        if flock_nb(file, op)? {
+            return Ok(true);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(OWNER_GAP);
+    }
+}
+
+/// Release whatever `flock` `file` holds.
+pub(crate) fn unlock(file: &File) -> io::Result<()> {
+    // SAFETY: `file` owns a valid open fd for the duration of the call.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 /// Create the owner's lock file (`0600`) and take `LOCK_EX` on it, retrying
 /// while a viewer's probe is in the way. The returned file *is* the lock:
 /// dropping it releases the session.

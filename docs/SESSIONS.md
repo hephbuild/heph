@@ -6,11 +6,12 @@ directory. Another terminal lists the sessions, prints a snapshot of one, or
 attaches the same TUI to it. Nothing has to be decided before the run starts.
 
 ```
-heph session list [--all] [--json]
+heph session list [--all | --workspace DIR] [--since T] [--until T] [--addr ADDR]
+                  [--failed] [--actor human|agent|ci] [--command CMD] [--user USER] [--json]
 heph session show <ref> [--json]
 heph session attach <ref>
 heph session inflight <id> [--json]
-heph session export <ref> [-o PATH|-] [--no-logs]
+heph session export <ref> [-o PATH|-] [--format hephsession|otlp] [--no-logs]
 ```
 
 The line backend announces the session on stderr when it starts, never on
@@ -32,11 +33,12 @@ path or `https://` URL (see [Opening a recording: `<ref>`](#opening-a-recording-
 
 | Command | Does | Exit |
 | --- | --- | --- |
-| `list` | One row per session of this workspace (`--all`: every workspace; outside a workspace, every one, with a note on stderr), live first: ID, WORKTREE, COMMAND, STATE, EXIT, PROGRESS, NOW. Reads each recording's `session` and `status` rows only, never `records`. | 0 |
+| `list` | One row per session of this workspace started in the last 7 days (`--all`: every workspace; outside a workspace, every one, with a note on stderr), live first, then ended ones newest first: ID, ACTOR, STARTED, TOOK, WORKTREE, COMMAND, STATE, EXIT, PROGRESS, NOW. Reads each recording's `session` and `status` rows and the [catalog](#the-catalog-catalogdb), never `records`. See [`list`](#list). | 0 |
 | `show <ref>` | The TUI's frame printed once as text, then a "Stuck on" block: lock waits naming the session that holds the lock (followed to the root of the chain, falling back to the pid), admission waits, targets running over 30s, and one `Next:` line. An ended session adds one line per bounded resource pool (see [Pools](#pools)). | 0 |
 | `attach <ref>` | The interactive TUI on the session, following it until it ends; `q` or Ctrl-C detaches and never cancels it. Without a terminal it follows in line form. | the session's exit code; 0 on detach |
 | `inflight <id>` | The session's in-flight report (what the `SIGQUIT` dump carries), asked for through the session directory; waits 5s. Local sessions only. | 0 |
-| `export <ref>` | Writes the recording as one self-contained `.hephsession` file and prints its path (see [Export](#export-hephsession)). | 0 |
+| `export <ref>` | Writes the recording as one self-contained `.hephsession` file and prints its path (see [Export](#export-hephsession)); `--format otlp` writes its spans, logs and metrics as OTLP/JSON lines instead (see [OTLP](#otlp---format-otlp)). | 0 |
+| `query <sql>` | Read-only SQL over the [explorer](#the-explorer)'s six tables, from the catalog (this workspace's sessions of the last 7 days by default), every recording kept (`--full`), or the recordings named (`--from <ref>`). See [`query`](#query). | 0; 130 on Ctrl-C |
 
 Every error of `heph session` itself exits **125**: no such session, an
 ambiguous id, a file that is not a heph session, a URL refused or not
@@ -52,9 +54,13 @@ session whose `End` carries no code (killed by a signal, or it panicked) is
 reported as an error with that reason. An agent tells "the run failed" from
 "the wait failed" by that line, or by `heph session show <id> --json`.
 
-Under `--json` (`list`, `show`, `inflight`), an error is what it is on every
-heph command (`docs/JSON_OUTPUT.md`): the message on stderr and the exit code,
-125 here, with nothing on stdout. No JSON error object is printed.
+The one exception is a `query` stopped by Ctrl-C: it exits **130**, as an
+interrupted command does.
+
+Under `--json` (`list`, `show`, `inflight`, and `query --format json`), an
+error is what it is on every heph command (`docs/JSON_OUTPUT.md`): the
+message on stderr and the exit code (125, or 130 for an interrupted query),
+with nothing on stdout. No JSON error object is printed.
 
 STATE is computed by the viewer, never stored: `running`; `waiting` (every
 open target is in a lock or admission wait); `quiet` (no event for longer
@@ -72,6 +78,12 @@ never reads that directory, so `show` and `attach` cannot name it. The run
 removes it when it finishes. A killed run's directory stays until the next
 cleanup sweeps it, which runs at most once an hour (see
 [Retention](#retention)), so it can linger for up to an hour.
+When it ends, the run writes its `sessions` and `targets` rows to the
+public [catalog](#the-catalog-catalogdb) with `recorded=0`, before it removes
+its directory. So `list` shows that it ran, with PROGRESS `not recorded`, and
+`list --addr` finds it, but there is no recording to `show` or `attach`.
+Private hides the run from other terminals while it runs, not from the
+history.
 It is read once, by the front end, beside `HOME`; with no `HOME` it records
 nothing. This is a change of contract: before run logs, `HEPH_NO_SESSION=1`
 wrote nothing under `~/.heph` at all. It now writes there while the run
@@ -82,10 +94,167 @@ a public run records
 nothing and says so once with a `warn!`.
 
 `heph run --raw` sets up no session at all: no directory, no recorder, no
-start line, and no warning, so its stderr carries only the tool's bytes and
+catalog row, no start line, and no warning, so its stderr carries only the tool's bytes and
 heph's failures. (`--raw` is also what lowers heph's log to `warn`; there is
 no separate quiet flag.) It still names another session in a lock-wait
 notice: that only reads.
+
+### `list`
+
+`list` joins two sources. The session directories give the live sessions
+and the ended ones still kept (7 days by default). The
+[catalog](#the-catalog-catalogdb) gives who ran each session, its targets,
+and the sessions whose recording is gone, up to 90 days back. A session
+only the catalog holds is listed from its catalog row: STATE is `ok` or
+`failed` from its exit code, PROGRESS is `-` (`not recorded` for a private
+session), and NOW is how long ago it ended.
+
+Columns:
+
+| Column | Shows |
+| --- | --- |
+| ID | the session id |
+| ACTOR | `human`, `ci`, `agent (<name>)` when the agent's name is known, else `agent`; `-` with no catalog row |
+| STARTED | how long ago it started |
+| TOOK | how long it ran; `-` while it runs or when its end is unknown |
+| WORKTREE, COMMAND | where it ran and its command line |
+| OUTCOME | with `--addr` only: that target's outcome in the session, `ran`, `hit`, `failed` or `cancelled` (an open set) |
+| STATE, EXIT, PROGRESS, NOW | as described above |
+
+Rows are ordered live sessions first, then ended ones, each newest first by
+start time. `--json` uses the same order.
+
+Filters (they combine; each keeps a row only if it matches):
+
+| Flag | Keeps |
+| --- | --- |
+| `--since T` | sessions started at or after `T`. Default `7d`. `T` is a duration back from now (`7d`, `12h`, `30m`) or an RFC 3339 time, seconds optional (`2026-11-20T10:00+02:00`, `2026-11-20T08:00Z`). `--since 0d` lists nothing. Use `--since 90d` for older catalog rows. |
+| `--until T` | sessions started at or before `T`, in the same forms. An `--until` earlier than `--since` is refused (exit 125). |
+| `--addr ADDR` | sessions in the catalog that resolved `ADDR`, cache hits included, with its OUTCOME. A session gets its target rows when it ends, so a live session is not listed. |
+| `--failed` | sessions that failed (STATE `failed`). With `--addr`, the sessions in which that target failed, whatever the session's own exit: "when did this target break". |
+| `--actor human\|agent\|ci` | sessions run by that kind of actor. Read from the catalog. |
+| `--command CMD` | sessions of that heph subcommand (`run`, `query`, ...). |
+| `--user USER` | sessions run by that user (`$USER`). Read from the catalog. |
+| `--workspace DIR` | the sessions of the workspace at `DIR` instead of this one. Conflicts with `--all`. |
+
+A session with no catalog row has no ACTOR and no user, so `--actor` and
+`--user` never keep it. That is a live session whose start write was
+dropped, a lost recording not yet sealed, or every session when the catalog
+cannot be read at all.
+
+Before it lists, `list` opens the catalog, and that open repairs it: it
+writes the rows of any ended recording the catalog lacks, and rebuilds a
+missing or corrupt catalog. What it did goes to stderr, never stdout (see
+[The catalog](#the-catalog-catalogdb)).
+
+After it lists, `list` says on stderr what it did not search, in the table
+and with `--json` alike:
+
+```
+heph: --addr searches ended sessions only; 2 live sessions are not searched until each ends
+heph: no session matched since 7d; the catalog holds sessions from up to 23 days ago (it keeps 90 days): --since 23d reads them
+```
+
+The first line comes with `--addr` when a live session started in the
+window. The second comes when nothing matched and the catalog holds sessions
+of the listed workspace older than the window; its `--since` reaches the
+oldest of them. Inside a workspace, or with `--workspace`, that is that
+workspace's oldest session; with `--all`, or outside a workspace, the
+catalog's. It comes only when the window is all that narrowed the list (with
+`--addr` or without): that oldest session can be of any actor, user or
+command, so under `--actor`, `--user`, `--command` or `--failed` it says
+nothing.
+
+### `query`
+
+```
+heph session query [--from <ref>]... [--since 7d] [--until T] [--all-workspaces] [--full]
+                   [--format table|csv|json] [--limit N] [--timeout 30s] [--schema]
+                   ('SELECT ...' | - | -f FILE)
+```
+
+One SQL statement over the [explorer](#the-explorer)'s six tables. Every
+source presents the same names, so a query written against one recording
+runs unchanged on the catalog or on a directory of CI downloads.
+
+| Source | Flags | Reads |
+| --- | --- | --- |
+| the catalog | (default) `--since`, `--until`, `--all-workspaces` | this workspace's sessions started in the window (7 days by default; the catalog keeps 90). Opening it repairs it, as `list` does. Spans of the targets that ran, not of cache hits; no `logs`. |
+| every recording kept | `--full` | each recording that started in the window, in this workspace: cache hits included, at the cost of opening each file. A recording in a format this heph does not read, or that cannot be read, is skipped and counted. |
+| the recordings named | `--from <ref>`, repeatable | a session id (as `show` takes it), a `.hephsession` path, an `https://` URL. The window does not apply: `--since`, `--until`, `--all-workspaces` and `--full` are refused beside it. A recording named twice (the same session, however its id is abbreviated; the same file by its canonical path; the same URL) is read once, with a note on stderr; a duplicate URL is not downloaded again. |
+
+The window holds whole sessions by their start: every row of a session
+started in it, none of one started before it.
+
+The SQL is the argument, `-` reads it from stdin, `-f FILE` from a file.
+`--schema` prints the six tables with a line per column, the schema
+version and the [built-in recipes](#built-in-recipes) as runnable SQL, and
+runs nothing.
+
+**Read-only by construction.** The statement is prepared first against
+empty copies of the six tables: more than one statement, any write
+(`INSERT`, `DELETE`, `CREATE`, `VACUUM`), `ATTACH`, a pragma other than
+`table_info`, `table_list` and `index_list`, `load_extension` and the
+file functions, and a read of anything but the six tables are refused
+before a source is opened. A single source is queried in place, read-only,
+through heph's own views, never a file's stored ones; several are copied
+into a temp database (under `~/.heph/sessions/.tmp/`, at most 2 GiB) of only
+the tables the statement reads, removed when the query ends or on Ctrl-C.
+A recording heph keeps gets its indexes on its first query; a file named by
+path or URL is never written.
+
+**Limits.** `--timeout` (30s) stops the query, copies included. More rows
+than `--limit` (100000; `0` for no cap) is an error, not a truncated
+answer, so a partial result is never read as a whole one. Strings and
+blobs are capped at 64 MiB.
+
+**Output.** `--format table` (the default) aligns the columns, one line per
+row, every control character escaped; NULL is an empty cell and a BLOB is
+base64. `--format csv` is a header line then RFC 4180 rows, `\n`-ended,
+with the same NULL and BLOB rendering; on a terminal its control
+characters are escaped, newlines and tabs kept. `--format json` is one
+line:
+
+```json
+{"version":1,"columns":["addr","duration_us"],"types":["TEXT","INTEGER"],
+ "rows":[["//p:t","81234"]],
+ "coverage":{"catalog":["targets"],"recordings":0,"skipped":0,"truncated":0,
+             "reaches_ms":1763400000000,"capped":0,"partial":{}}}
+```
+
+- `types` is each column's declared type, `null` for an expression.
+- In `rows`, an INTEGER is a string (a 64-bit value survives a JSON
+  parser), a REAL a number (NaN and infinities `null`), a BLOB base64, NULL
+  `null`.
+- `coverage` says where the rows came from: `catalog` the tables read from
+  the catalog, `recordings` how many recordings were read, `skipped` how
+  many were not (`--full`), `truncated` how many sessions read stopped
+  recording at their size ceiling, so their rows are incomplete. Skipped
+  and truncated sources are also named on stderr. `reaches_ms`, when the
+  catalog was read, is the start (unix ms) of the oldest session it holds:
+  nothing older is in the answer, whatever `--since` asks for (the catalog
+  keeps 90 days, and less once rebuilt or answering from the recordings
+  kept); `null` for `--full` and `--from`. `capped`, when the query read
+  `spans`, `span_events` or `metrics` from the catalog, counts the sessions
+  in scope whose rows of those three the catalog left out for its 1 GiB cap
+  (written while it was over the cap, or trimmed by its cleanup); their
+  `sessions` and `targets` rows are whole. `partial` names each table read
+  from the catalog that it holds only in part, with what is missing:
+  `"spans"` and `"span_events"` are `"ran targets only"` (a cache hit's
+  spans are not kept), `"logs"` is `"not kept"`, and with `capped` above 0,
+  `"spans"`, `"span_events"` and `"metrics"` also say `"none for N
+  session(s) over the catalog's cap"`; `{}` when nothing read is partial,
+  and always for `--full` and `--from`. A non-empty `partial` is also one
+  line on stderr. The `partial` texts are for people and can change; match
+  on its keys and on `capped`. `coverage` only gains fields.
+
+**Errors** exit 125, as `heph session`'s own errors do. A refused, invalid
+or stopped statement says so on stderr with SQLite's message (an unknown
+table or column lists the real ones); under `--format json` stdout stays
+empty. The message is for people: its text can change in any release,
+SQLite's part with the SQLite heph links. Match on the exit code, never on
+the message. Ctrl-C stops the query, removes its temp files, and exits
+**130**, the one `heph session` error that is not 125.
 
 ### heph inside a target
 
@@ -128,6 +297,10 @@ workspace rooted at `$HOME`, whose home is `~/.heph`.
                              decompressed .hephsession files (swept by the hourly
                              cleanup once older than 10 minutes)
   .removing-<id>-<pid>/      a removal in progress (a tomb)
+  catalog.db                 the catalog (+ -wal, -shm): see "The catalog"
+  catalog.lock               flock held shared by every catalog connection,
+                             exclusively by a repair
+  catalog.db.corrupt-<ms>    a corrupt catalog moved aside (+ -wal, -shm), kept 7 days
   <id>/
     lock                     flock held while alive (frozen for every format)
     session.db               the recording (+ -wal, -shm while live)
@@ -317,22 +490,111 @@ value, never 0. Both are frozen, as are released span and metric names.
 Enumerations (`class`, `status`, `outcome`, `metrics.kind`) are open: a
 consumer handles a value it does not know.
 
-Two recipes:
+#### Built-in recipes
+
+heph ships recipes, not reports: SQL for the questions asked most, which
+`heph session query --schema` prints and this section carries word for
+word. Each reads only the six explorer names, so it runs over the catalog,
+every recording kept, or the recordings named (see [`query`](#query));
+`sqlite3` on a sealed recording (or a copy of a live one) answers them too.
+They key on `class`, never on a span's name: the same target shows
+`heph.process` or `heph.driver.run` depending on its driver.
+
+A recipe answers over every session in its source. For one session, query
+it with `--from <id>` (the recording itself, cache hits included), or add
+`session_id = '<id>'` to the recipe's `WHERE` over the catalog. Past the
+default 7 days, `--since 30d` reads the catalog, which keeps 90 days of rows
+but only the spans of what ran; `--full` reaches only as far back as
+recordings are kept, 7 days by default.
+
+| Recipe | Columns |
+| --- | --- |
+| `time_by_phase` | `class`, `name`, `n` (spans), `busy_s` (their summed time: busy, not wall, since phases of different targets overlap) |
+| `uncovered_wall` | `session_id`, `wall_s`, `target_s` (wall time with at least one `target`-class span open, overlaps counted once), `uncovered_pct` (the rest, as a share of the wall); ended sessions only |
+| `phase_percentiles` | `class`, `name`, `n`, `p50_ms`, `p90_ms`, `p99_ms` (nearest rank), `max_ms` |
+| `hit_rate_by_package` | `package`, `targets` (resolved: ran, hit or failed; cancelled ones are left out), `hits`, `hit_pct`; lowest rate first |
 
 ```sql
--- Where did time go, by class and phase (busy time, not wall time)?
+-- time_by_phase: Where did time go, by class and phase (busy time, not wall time)?
+-- The catalog keeps the spans of targets that ran, not of cache hits:
+-- for a warm run, use --full or --from.
+-- It sums every session in scope. For one, query it with --from <id>,
+-- or add AND session_id = '<id>' to its WHERE.
 SELECT class, name, count(*) AS n, sum(duration_us) / 1e6 AS busy_s
 FROM spans WHERE class IS NOT NULL
-GROUP BY class, name ORDER BY busy_s DESC;
+GROUP BY class, name ORDER BY busy_s DESC, class, name;
 
--- How did //p:t end, and who ran it?
-SELECT s.started_ms, s.user, s.actor_name, s.argv, r.outcome, r.duration_us / 1e3 AS ms
-FROM spans r JOIN sessions s USING (session_id)
-WHERE r.name = 'heph.result' AND r.addr = '//p:t';
+-- uncovered_wall: How much of each session's wall time had no target running?
+-- The catalog keeps the spans of targets that ran, not of cache hits:
+-- for a warm run, use --full or --from.
+WITH runs AS (
+  SELECT session_id, start_us, end_us,
+         max(end_us) OVER (PARTITION BY session_id ORDER BY start_us, end_us
+                           ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS before_end
+  FROM spans WHERE class = 'target' AND end_us IS NOT NULL
+), islands AS (
+  SELECT session_id, start_us, end_us,
+         sum(before_end IS NULL OR start_us > before_end)
+           OVER (PARTITION BY session_id ORDER BY start_us, end_us) AS island
+  FROM runs
+), covered AS (
+  SELECT session_id, sum(island_us) AS target_us
+  FROM (SELECT session_id, max(end_us) - min(start_us) AS island_us
+        FROM islands GROUP BY session_id, island)
+  GROUP BY session_id
+)
+SELECT s.session_id, (s.ended_ms - s.started_ms) / 1e3 AS wall_s,
+       coalesce(c.target_us, 0) / 1e6 AS target_s,
+       round(100 - coalesce(c.target_us, 0) / 10.0 / (s.ended_ms - s.started_ms), 1)
+         AS uncovered_pct
+FROM sessions s LEFT JOIN covered c USING (session_id)
+WHERE s.ended_ms > s.started_ms
+ORDER BY s.started_ms DESC;
+
+-- phase_percentiles: How long does each phase take: p50, p90, p99 and max, in ms?
+-- The catalog keeps the spans of targets that ran, not of cache hits:
+-- for a warm run, use --full or --from.
+SELECT class, name, count(*) AS n,
+       min(CASE WHEN cd >= 0.5 THEN duration_us END) / 1e3 AS p50_ms,
+       min(CASE WHEN cd >= 0.9 THEN duration_us END) / 1e3 AS p90_ms,
+       min(CASE WHEN cd >= 0.99 THEN duration_us END) / 1e3 AS p99_ms,
+       max(duration_us) / 1e3 AS max_ms
+FROM (SELECT class, name, duration_us,
+             cume_dist() OVER (PARTITION BY class, name ORDER BY duration_us) AS cd
+      FROM spans WHERE class IS NOT NULL AND duration_us IS NOT NULL)
+GROUP BY class, name ORDER BY p90_ms DESC, class, name;
+
+-- hit_rate_by_package: Which packages miss the cache most?
+-- Failed targets count as misses, those whose dependency failed included.
+-- A target with cache = False never hits.
+SELECT substr(addr, 1, instr(addr, ':') - 1) AS package,
+       count(*) AS targets, sum(outcome = 'hit') AS hits,
+       round(100.0 * sum(outcome = 'hit') / count(*), 1) AS hit_pct
+FROM targets WHERE outcome IN ('ran', 'hit', 'failed')
+GROUP BY package ORDER BY hit_pct, targets DESC, package;
 ```
 
-There is no query command yet; `sqlite3` on a sealed recording (or a copy of
-a live one) answers them.
+Over the catalog, `hit_rate_by_package` counts hits from `targets`, which
+keeps them; the other three read `spans`, which the catalog keeps only for
+targets that ran (`--full` reads every recording instead). Their comment
+says so, and `query --format json` names those tables in
+`coverage.partial`.
+
+The recipes are not part of the explorer contract (I9). A release may
+change a recipe's SQL, its columns or its name. A script that runs one
+should keep its own copy of the SQL: the six names it reads are the
+contract.
+
+**Who ran `//p:t`, and how did it end?** `heph session list --addr //p:t`
+answers it; as SQL, for more columns. It reads `targets`, which the catalog
+keeps for cache hits too, so it finds the same sessions as `list --addr`:
+
+```sql
+SELECT s.started_ms, s.user, s.actor_name, s.argv, t.outcome, t.duration_us / 1e3 AS ms
+FROM targets t JOIN sessions s USING (session_id)
+WHERE t.addr = '//p:t'
+ORDER BY s.started_ms DESC;
+```
 
 ### Pools
 
@@ -482,6 +744,141 @@ There is no reader for the `meta.json` / `events.ndjson` / `status.json`
 directories an earlier heph wrote (spec D9): it has no `session.db`, so
 `list` skips it, `show` does not find it, and retention removes it by age.
 
+## The catalog: `catalog.db`
+
+`~/.heph/sessions/catalog.db` answers "who ran what" for up to 90 days
+without opening every recording. It is a SQLite file in WAL mode, with its
+own format: `application_id` `0x48455043` (`HEPC`), `user_version` 1, and
+the version of the heph that created it in its `info` table.
+
+It holds:
+
+- `sessions`: one row per session: who ran it (`user`, `actor_kind`,
+  `actor_name`), its command, argv, cwd and workspace, start, end and exit,
+  and `recorded` (0 for a private session).
+- `targets`: a view over `target_rows` and `addrs`, one row per target the
+  session resolved, cache hits included, with its outcome (`ran`, `hit`,
+  `failed`, `cancelled`) and duration.
+- `spans`, `span_events`, `metrics`: the same tables as a recording, but only
+  the session's own spans, the `heph.result` spans of targets that were not
+  cache hits with their phase spans, and every metric point.
+
+These tables, and the `addrs`, `target_rows`, `heal_failures` and `info`
+tables behind them, are internal: their names and columns may change within
+a format. The contract is what `heph session query` presents over the
+catalog, the six explorer names (I9). Read the catalog through `query`,
+not with `sqlite3`.
+
+The catalog holds nothing a recording does not, so it can be rebuilt from
+the recordings still kept. Every write copies from a recording with the same
+SQL, whether the owner writes it, `list` heals it, or a repair rebuilds it.
+A copy reads the recording's `session`, `spans`, `span_events` and `metrics`,
+never `records`.
+
+### Writes
+
+The run that owns the session writes twice:
+
+- At start, its `sessions` row with `complete=0`, from a thread of its own,
+  then it folds the catalog's WAL in. A private session skips the row and
+  only folds the public catalog's WAL in. The fold is a `PASSIVE`
+  checkpoint, which copies the WAL into `catalog.db` without blocking a
+  writer, then a `TRUNCATE` one that restarts the WAL only if nothing is in
+  its way: it does not wait for a writer, and a reader still holding a
+  snapshot (a long `query`) leaves the WAL as it is for the next start. So
+  the fold never holds another run's write up behind a reader. The copy
+  stops at the 1s write bound, on that thread, never the build's; the rest
+  is left for the next start.
+- At seal, after `End`, every catalog row of its session in one transaction,
+  with `complete=1` and the recording's `derivation`. A private session
+  writes these rows with `recorded=0` into the public catalog, then removes
+  its directory. Over the catalog's 1 GiB cap, the seal writes only the
+  `sessions` and `targets` rows and marks the session capped, so a query
+  that reads `spans`, `span_events` or `metrics` says so in
+  `coverage.capped` and `coverage.partial`. `--raw` writes nothing.
+
+Each catalog connection holds `catalog.lock` shared for its whole life. An
+owner that cannot take it at once drops its write. A write that fails, or
+that is still running after 1s (with a 500ms `busy_timeout` on the file), is
+dropped with a `debug!`. A catalog write never fails or slows the run past
+that bound, and a build never repairs anything (I1).
+
+### Repair on open
+
+`list` opens the catalog and repairs what it finds:
+
+- **Missing rows.** It copies every kept, sealed recording whose `sessions`
+  row is missing or has `complete=0`. It also re-copies a complete row whose
+  `derivation` is older than its recording's, which happens when `show`
+  re-derived a recording and the catalog update after it was dropped. There
+  is no watermark, so a write dropped before a later session's succeeded is
+  still found. A recording whose copy fails is noted in the catalog and
+  tried again at most once a day.
+- **Missing or corrupt catalog.** Only `SQLITE_CORRUPT` and `SQLITE_NOTADB`
+  mean corrupt. The repair drops its shared lock, takes `catalog.lock`
+  exclusively (waiting up to 5s), and checks again. A corrupt catalog is
+  moved to `catalog.db.corrupt-<unix-ms>`, its `-wal` and `-shm` first. An
+  orphan `-wal` or `-shm` is removed. The catalog is then rebuilt from every
+  kept recording. Rows older than the oldest kept recording are lost, so
+  `list` says how far back the rebuilt catalog reaches. On stderr:
+
+  ```
+  heph: the session catalog was missing: rebuilt from 12 recordings kept; it covers the last 7 days
+  heph: the session catalog was corrupt, moved to /home/ana/.heph/sessions/catalog.db.corrupt-1764000000000: rebuilt from 12 recordings kept; it covers the last 7 days
+  ```
+
+- **Anything else.** A busy repair elsewhere, a full disk, a permission
+  error, a filesystem that refuses WAL, a file that is not a heph catalog,
+  or a catalog written by a newer heph: the catalog is not written or moved.
+  `list` answers from an in-memory catalog filled from the recordings kept,
+  and says why on stderr:
+
+  ```
+  heph: the session catalog cannot be used (it was written by heph 0.9.0, newer than this one): answering from the recordings kept; it covers the last 6 days
+  ```
+
+  The reach is rounded down: a session 6 days and 20 hours old covers "the
+  last 6 days"; under a day, the hours.
+
+`list` and `query` over the catalog (without `--full` or `--from`) open
+the catalog, so both repair it as above. `show` replaces a session's catalog
+rows after it re-derives that session's recording (below).
+
+### Re-derivation on `show`
+
+Each recording's `session.derivation` names the version of the code that
+derived its explorer rows. When `show` opens a local, sealed recording whose
+derivation is older than this heph's, it re-derives it once, in place, and
+says so on stderr, one line per recording, naming the session and why:
+
+```
+heph: re-deriving session 02kf5…: an older heph derived it (derivation 1, this heph 2)
+heph: re-deriving session 02kf7…: its session was lost, and cleanup sealed it
+```
+
+It takes the session's `lock` exclusively and writes a copy beside the
+recording whose explorer rows are re-derived from `records`. The copy is
+sealed under `synchronous=FULL` (`fullfsync` on macOS) and fsynced, renamed
+over `session.db`, and the directory is fsynced. The records are the only
+durable copy of the run, so the copy is written durably. A reader that
+already opened the file keeps reading the old inode. Then `show` replaces the
+session's catalog rows, when a catalog exists. If that write is dropped, the
+next `list` re-copies the row (see [Repair on open](#repair-on-open)).
+
+When the recording cannot be re-derived in place (its lock is held, a
+`-journal` or `-wal` sits beside it, a full disk, a read-only directory),
+`show` derives the rows into a temporary copy for this command only and
+leaves the original as it was, and says so on stderr with the reason:
+
+```
+heph: session 02kf5… cannot be re-derived in place (…: Permission denied (os error 13)); reading a re-derived temp copy for this command
+```
+
+A recording with a newer derivation is read
+as it is, never re-derived or downgraded. A live or lost (not yet sealed)
+recording is never written. Two commands at once serialise on the lock; the
+second finds the recording current.
+
 ## Reading
 
 A viewer opens a local recording one of three ways, from the lock and the
@@ -535,14 +932,35 @@ there leaves the file for the next cleanup.
 
 ### `--json`
 
-`list`, `show` and `inflight` take `--json`, `--fields` and `--jq`, with the
-rules every heph command follows (`docs/JSON_OUTPUT.md`): `--fields help`
-lists each command's fields.
-
 `list --json` is an array, one element per session, `[{id, owner_pid, argv,
-workspace_root, cwd, state, started_unix_ms, last_event_unix_ms, exit_code,
-panicked, progress, now, blocked_on, incomplete, format}]`, sorted by id,
-times in absolute unix ms; `[]` when there is no session:
+workspace_root, cwd, state, started_unix_ms, ended_unix_ms,
+last_event_unix_ms, exit_code, panicked, actor, user, command, recorded,
+recording_kept, target, progress, now, blocked_on, incomplete, format}]`,
+times in absolute unix ms; `[]` when there is no session.
+
+Its order is the table's ([`JSON_OUTPUT.md`](JSON_OUTPUT.md)): live
+sessions first, then ended ones; within each, by start time, newest first;
+between sessions that started in the same millisecond, by id, greatest
+first.
+
+- `actor` is `{kind, name}`: `kind` is `human`, `agent` or `ci` (an open
+  set), `name` the agent or CI system when known. `null` when the catalog has
+  no row for the session; `user` likewise.
+- `command` is the heph subcommand (`run`, `query`, ...).
+- `ended_unix_ms` is `null` while the session runs, and when it never
+  recorded its end.
+- `recorded` says the session wrote a recording. It is `false` only for a
+  private session: only its catalog row is kept, there is no recording. It
+  stays `true` after cleanup removed the recording.
+- `recording_kept` says the recording is still on disk, so `show`, `attach`,
+  `export` and `query --from` can open it. It is `false` for a private
+  session, and for a session the catalog still lists after cleanup removed
+  its recording (`recorded` `true`). It says the directory is there, not
+  that this heph can read it: a recording a newer heph wrote is `true`, and
+  opening it fails with exit 125, naming its format.
+- `target` appears only with `--addr`: `{addr, outcome, duration_ms}`, that
+  target in this session. `outcome` is `ran`, `hit`, `failed` or `cancelled`,
+  an open set.
 
 - `progress` is PROGRESS as numbers, `{done, total, total_complete,
   running_ops, failed}`, `null` before the session wrote its first
@@ -648,7 +1066,7 @@ stable signal for "has it gone silent".
 | --- | --- |
 | I1 | Watching never changes the build. The recorder reaches no hash and no target's argv, env or files; a recording failure never fails, blocks or slows a build task. The session id and directory are **never exported to the environment**: a session runner or `pass_env = ["*"]` would carry them into targets. |
 | I2 | A session is alive exactly while its lock is held. The fd is `O_CLOEXEC`, so a child outliving heph cannot keep it alive. The `lock` name and meaning are frozen for every format; SQLite's locks never carry liveness. |
-| I3 | While the lock is held only the owner writes `session.db`. After that, only a cleanup holding the lock exclusively writes it, to seal it or remove it. A viewer writes no row; its file writes are `inflight.request` and, for a live WAL reader, SQLite's `-shm` index. |
+| I3 | While the lock is held only the owner writes `session.db`. After that, only a holder of the lock taken exclusively writes it: a cleanup, to seal it or remove it, and `show`, to replace a sealed recording of an older derivation with a re-derived copy (see [Re-derivation on `show`](#re-derivation-on-show)). Otherwise a viewer writes no row; its file writes are `inflight.request` and, for a live WAL reader, SQLite's `-shm` index. |
 | I4 | `records` is the one source of truth. `status` and the explorer tables are derived from `records` plus the session row, and a re-derivation from `records` alone writes exactly what the recorder wrote live, a capped recording included. |
 | I5 | A record's `kind` is a `BuildEvent` exactly as on the plugin wire. The recording names its format in its header; a reader refuses a newer one by name and reads every older one, and each released format has a committed fixture a test opens. |
 | I6 | A session holds nothing the terminal would not have shown (argv, log lines, failing log tails), user-only. |
@@ -827,8 +1245,11 @@ which for a line-backend session is its recorded log lines alone.
 ## Export: `.hephsession`
 
 ```
-heph session export <ref> [-o PATH|-] [--no-logs]
+heph session export <ref> [-o PATH|-] [--format hephsession|otlp] [--no-logs]
 ```
+
+`--format hephsession`, the default, is this section. `--format otlp` is
+[OTLP](#otlp---format-otlp), below.
 
 A `.hephsession` file is one session's recording, made to be read on another
 machine: a zstd frame whose content is a sealed `session.db` (format 1, the
@@ -878,6 +1299,104 @@ copied out of a sessions directory while still in WAL mode (a live session,
 or a lost one) and opened by path misses whatever is still in its `-wal`:
 it shows as `incomplete`, ending where the last checkpoint did. Export it
 (`heph session export <id>`) to read it whole on another machine.
+
+### OTLP: `--format otlp`
+
+```
+heph session export <ref> --format otlp [-o PATH|-]
+```
+
+Writes one session's [explorer](#the-explorer) rows as OTLP/JSON: the file
+format an OpenTelemetry collector's `otlp_json_file` receiver reads, and that
+any OTLP/JSON tool takes. It is written from the recording after the fact:
+nothing runs in the build to produce it.
+
+- `<ref>` is any `<ref>`: a local session, or a `.hephsession` file by path
+  or URL. A session and its `.hephsession` export write the same lines.
+- Each line is a `TracesData`, a `LogsData` or a `MetricsData` (the JSON
+  of the matching collector export request) holding at most 1000 spans and
+  span events, log records or metric data points. A span is never split
+  from its events, so a span with more than 1000 is a line on its own. The
+  span lines come first, then the log lines, then the metric lines. A
+  signal with nothing in it writes no line. A metric with more points than
+  fit goes on in the next line, as a metric of the same name, kind and
+  unit, under the same resource and scope, and for a counter from the same
+  start time: one series, which a backend that keys series on those joins
+  back together. The export holds one line in memory, not the whole
+  session.
+- `-o PATH` writes `PATH` through a temp file beside it, renamed into place,
+  replacing a file already there; the default is `./heph-<id>.otlp.jsonl`.
+  `-o -` writes the lines to stdout, a terminal included (it is text). On
+  success it prints the path written on stdout.
+- A **running** session exports what it recorded so far, and `export` says
+  `snapshot of a running session` on stderr, as for a `.hephsession`. An
+  event of a span that is still open is left out: a span is written when it
+  ends, and its events with it.
+- `--no-logs` is refused (exit 125): an OTLP export holds no approval notice
+  text and no failure logs to leave out.
+- The lines are the OTLP/JSON encoding, not the plain proto3 JSON mapping:
+  `traceId`, `spanId` and `parentSpanId` are lowercase hex, enums (`kind`,
+  `status.code`, `severityNumber`, `aggregationTemporality`) are integers,
+  and 64-bit integers (`*UnixNano`, `intValue`) are decimal strings.
+- The same recording exported by the same heph writes the same bytes.
+  Another heph version can write different bytes: `service.version` and the
+  scope version change, and so can the mapping below.
+- The messages are those of `opentelemetry-proto` v1.11.1, vendored under
+  `third_party/opentelemetry-proto`. The resource attribute names
+  (`service.*`, `host.name`, `user.name`, `process.*`) are those of the
+  OpenTelemetry semantic conventions v1.27.0, the first release with
+  `user.name`. heph does not follow later renames on its own: a rename
+  reaches the export only with a heph release that adopts it.
+
+What maps to what:
+
+| heph | OTLP |
+| --- | --- |
+| the session | one resource: `service.name` `heph`, `service.version` (the heph version), `host.name`, `user.name`, `process.pid` (the owner pid), `process.command_args` (argv, an array), `heph.session.id`, and every other `sessions` column as `heph.session.<column>` (a NULL column is left out). The instrumentation scope is `heph`, at the heph version. |
+| a `spans` row | a span with its name, trace and span ids (the session span's trace id for all of them), parent, start and end; kind `SPAN_KIND_INTERNAL`; `class`, `addr`, `driver` and `outcome` as `heph.class`, `heph.addr`, `heph.driver`, `heph.outcome`, beside its own attributes; `status` `ok` / `error` as the status codes, anything else unset |
+| a `span_events` row | an event of its span |
+| a `logs` row | a log record under the session span's ids: its `severity` as `severityText` and `severityNumber`, its body, `seq` as `heph.seq` |
+| `metrics` rows of one name, kind and unit | one metric: `counter` a monotonic cumulative sum from the session's start, `gauge` (and a kind this heph does not know) a gauge; one data point per row |
+
+**Into a collector.** The `otlp_json_file` receiver of
+`opentelemetry-collector-contrib` (alpha for traces, metrics and logs) reads
+the file as it is. Its older name, `otlpjsonfile`, is a deprecated alias: it
+still works, and logs a deprecation warning. One file holds all three
+signals; give the receiver to each pipeline:
+
+```yaml
+receivers:
+  otlp_json_file:
+    include: [/srv/heph/*.otlp.jsonl]
+    start_at: beginning   # the default, end, skips the lines already there
+    max_log_size: 64MiB   # a line can pass the 1MiB default
+exporters:
+  otlp:
+    endpoint: otel-backend.internal:4317
+service:
+  pipelines:
+    traces:  {receivers: [otlp_json_file], exporters: [otlp]}
+    logs:    {receivers: [otlp_json_file], exporters: [otlp]}
+    metrics: {receivers: [otlp_json_file], exporters: [otlp]}
+```
+
+**Pushed over OTLP/HTTP.** Each line is the body of one export request.
+Its single top-level key says where it goes: `resourceSpans` to
+`/v1/traces`, `resourceLogs` to `/v1/logs`, `resourceMetrics` to
+`/v1/metrics`:
+
+```sh
+while IFS= read -r line; do
+  case "$(printf '%s' "$line" | jq -r 'keys[0]')" in
+    resourceSpans) path=traces ;;
+    resourceLogs) path=logs ;;
+    resourceMetrics) path=metrics ;;
+    *) continue ;;
+  esac
+  printf '%s' "$line" | curl -sSf -H 'Content-Type: application/json' \
+    --data-binary @- "http://localhost:4318/v1/$path"
+done < heph-<id>.otlp.jsonl
+```
 
 ## Opening a recording: `<ref>`
 
@@ -1014,10 +1533,12 @@ heph session attach sessions/<id>.hephsession
 ## Retention
 
 Cleanup runs only at session start, on a thread of its own beside the new
-session's recorder, so a slow seal never holds up the recording; `list` and
-every other viewer stay read-only. It decides on lock state,
-modification times and a recording's 100-byte header, **never** on its
-contents.
+session's recorder, so a slow seal never holds up the recording. Viewers do
+not clean up. They write in two places only: `list` repairs the catalog,
+and `show` re-derives a recording made by an older heph (see
+[The catalog](#the-catalog-catalogdb)). Cleanup of recordings decides on
+lock state, modification times and a recording's 100-byte header, **never**
+on its contents.
 
 It runs **at most once an hour per sessions root**, asynchronously (a user
 decision, 2026-11-24: nothing about it needs to be inline). The root's
@@ -1113,6 +1634,23 @@ still starting is left alone as above. A public start sweeps it only when it
 has claimed its own root's cleanup; a private start claims the private root
 directly. So a killed run's private directory can linger up to an hour,
 while a run that ends normally removes its own at once.
+
+The same hourly cleanup then cleans the [catalog](#the-catalog-catalogdb),
+after the recordings. A private start's cleanup (its claim of the private
+root) cleans the public catalog too, and a private start folds the public
+catalog's WAL in as a public one does: under `HEPH_NO_SESSION=1` alone, the
+catalog its seals write to is still kept.
+
+| What | Kept | Then |
+| --- | --- | --- |
+| A catalog session and its rows | while it started under **90 days** ago | its rows are deleted; an `addrs` row no target row uses any more goes too |
+| The catalog as a whole | up to **1 GiB** in use | the `spans`, `span_events` and `metrics` rows of the oldest sessions go first, keeping their `sessions` and `targets` rows (each such session counts in a query's `coverage.capped`); then whole sessions, oldest first |
+| A corrupt catalog moved aside (`catalog.db.corrupt-<ms>`) | **7 days**, by the time in its name | deleted |
+
+The 90 days and the 1 GiB are fixed; no `.hephconfig` key sets them. The
+catalog cleanup takes
+`catalog.lock` shared without waiting: when a repair holds it, the cleanup
+skips the catalog until the next hour.
 
 ## Recipes
 

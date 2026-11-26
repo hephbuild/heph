@@ -13,11 +13,13 @@
 //! ambiguous id, a format this heph cannot read, a lost session on attach, an
 //! in-flight request that went unanswered); `attach` otherwise exits with the
 //! session's exit code, and 0 on detach. A session can exit 125 too, so
-//! `attach` names a mirrored 125 on stderr. See [`SessionExit`].
+//! `attach` names a mirrored 125 on stderr. A `query` stopped by Ctrl-C exits
+//! 130, the one exception. See [`SessionExit`].
 
 mod attach;
 mod export;
 pub(crate) mod list;
+mod query;
 mod reference;
 pub(crate) mod show;
 #[cfg(test)]
@@ -56,8 +58,17 @@ pub struct SessionArgs {
 pub enum SessionCommands {
     /// One line per session, live first
     ///
-    /// Only this workspace's sessions unless `--all`. Reads each session's
-    /// `meta.json` and `status.json`, never its event log.
+    /// Lists the sessions started in the last 7 days (`--since`). It joins
+    /// two sources: the session directories, for the live sessions and the
+    /// ended ones still kept (7 days by default), and the session catalog,
+    /// for who ran each session, its targets, and the sessions whose
+    /// recording is gone, up to 90 days back (`--since 90d`). Opening the
+    /// catalog repairs it; what it did is said on stderr.
+    ///
+    /// Only this workspace's sessions, unless `--all` or `--workspace DIR`.
+    /// The filters combine: `--addr` (the sessions that resolved a target,
+    /// cache hits included, with its OUTCOME), `--failed`, `--actor`,
+    /// `--command`, `--user`, `--until`.
     ///
     /// STATE is computed by this viewer:
     ///
@@ -78,6 +89,10 @@ pub enum SessionCommands {
     /// `heph session list`
     ///
     /// `heph session list --all --json`
+    ///
+    /// `heph session list --addr //p:t --failed --json`
+    ///
+    /// `heph session list --since 90d --actor agent`
     List(ListArgs),
     /// Print a session's progress once, and what it is stuck on
     ///
@@ -129,6 +144,13 @@ pub enum SessionCommands {
     /// `--no-logs` leaves both out. A running session exports too: the file
     /// is a snapshot, and says so. Prints the path written.
     ///
+    /// `--format otlp` writes the session's spans, logs and metrics as
+    /// OTLP/JSON lines instead (at most 1000 items a line), for an OpenTelemetry
+    /// collector's `otlp_json_file` receiver or any OTLP tool. Each line is
+    /// also the body of one OTLP/HTTP export request. What maps to what, a
+    /// collector config and a push loop are in the OTLP section of
+    /// docs/SESSIONS.md.
+    ///
     /// Examples:
     ///
     /// `heph session export 02kf5`
@@ -136,17 +158,176 @@ pub enum SessionCommands {
     /// `heph session export 48213 -o build.hephsession --no-logs`
     ///
     /// `heph session export 02kf5 -o -`
+    ///
+    /// `heph session export 02kf5 --format otlp -o -`
     Export(ExportArgs),
+    /// Read-only SQL over the sessions recorded
+    ///
+    /// Every source is presented as the same six tables (`sessions`,
+    /// `targets`, `spans`, `span_events`, `metrics`, `logs`; `--schema`
+    /// lists their columns), so one query works on any of them:
+    ///
+    /// - by default, the catalog: this workspace's sessions started in the
+    ///   window (`--since 7d`), `--all-workspaces` for every workspace's. The
+    ///   catalog holds the spans of the targets that ran, not of cache hits,
+    ///   and no logs.
+    /// - `--full`: every recording kept that started in the window instead,
+    ///   cache hits included, at the cost of opening each file.
+    /// - `--from <ref>`: the recordings named, a session id, a `.hephsession`
+    ///   path or an `https://` URL; repeatable.
+    ///
+    /// The query is read-only by construction: one statement, reads and
+    /// side-effect-free functions only. It stops after `--timeout`, and more
+    /// rows than `--limit` (100000 by default, 0 for none) is an error. A
+    /// refused or failing statement exits 125. Ctrl-C stops it and exits
+    /// 130.
+    ///
+    /// `--schema` also prints the built-in recipes, SQL for the questions
+    /// asked most: `time_by_phase`, `uncovered_wall`, `phase_percentiles`
+    /// and `hit_rate_by_package`. Copy one into a query, or into a file for
+    /// `-f`. A recipe sums every session in scope: for one session, run it
+    /// with `--from <id>`, or add `session_id = '<id>'` to its `WHERE`.
+    /// Past 7 days (`--since 30d`), the catalog answers, up to 90 days back,
+    /// with the spans of what ran only; `--full` reaches only the recordings
+    /// still kept (7 days by default).
+    ///
+    /// Examples:
+    ///
+    /// `heph session query 'SELECT addr, duration_us FROM targets ORDER BY duration_us DESC LIMIT 10'`
+    ///
+    /// `heph session query --since 30d --format json -f slowest.sql`
+    ///
+    /// `heph session query --from ci/heph-02kf5.hephsession 'SELECT count(*) FROM spans'`
+    ///
+    /// `heph session query --schema`
+    Query(QueryArgs),
+}
+
+#[derive(Args, Clone, Debug)]
+#[command(group(
+    clap::ArgGroup::new("statement").required(true).args(["sql", "file", "schema"])
+))]
+pub struct QueryArgs {
+    /// The SQL; `-` reads it from stdin.
+    #[arg(value_name = "SQL")]
+    pub sql: Option<String>,
+    /// Read the SQL from FILE.
+    #[arg(short = 'f', long = "file", value_name = "FILE")]
+    pub file: Option<std::path::PathBuf>,
+    /// Query this recording instead of the window: a session id (or its last
+    /// 4–5 characters, or a live session's pid), a `.hephsession` path or an
+    /// `https://` URL. Repeatable.
+    #[arg(long = "from", value_name = "REF")]
+    pub from: Vec<String>,
+    /// Sessions started since: a duration back from now (`7d`, `12h`) or an
+    /// RFC 3339 time. The catalog keeps 90 days, recordings 7.
+    #[arg(long, value_name = "T", default_value = "7d", conflicts_with = "from")]
+    pub since: String,
+    /// Sessions started before: a duration back from now or an RFC 3339 time.
+    #[arg(long, value_name = "T", conflicts_with = "from")]
+    pub until: Option<String>,
+    /// Every workspace's sessions, not only this one's.
+    #[arg(long, conflicts_with = "from")]
+    pub all_workspaces: bool,
+    /// Every recording kept in the window instead of the catalog: the spans
+    /// of cache hits too.
+    #[arg(long, conflicts_with = "from")]
+    pub full: bool,
+    /// `table` (aligned, for a terminal), `csv`, or `json`:
+    /// `{version, columns, types, rows, coverage}`.
+    #[arg(long, value_enum, default_value = "table")]
+    pub format: QueryFormat,
+    /// Rows returned at most; more is an error. 0: no cap.
+    #[arg(long, value_name = "N")]
+    pub limit: Option<usize>,
+    /// Stop the query after this long (`30s`, `2m`).
+    #[arg(long, value_name = "DURATION", default_value = "30s", value_parser = query::parse_timeout)]
+    pub timeout: Duration,
+    /// Print the six tables with their columns, the schema version, and the
+    /// built-in recipes as runnable SQL; run nothing.
+    #[arg(long, conflicts_with_all = ["from", "full", "format"])]
+    pub schema: bool,
+}
+
+/// How `heph session query` prints its rows.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueryFormat {
+    Table,
+    Csv,
+    Json,
 }
 
 #[derive(Args, Clone, Debug)]
 pub struct ListArgs {
     /// Every workspace's sessions, not only this one's.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "workspace")]
     pub all: bool,
-    /// `--json` is an array of sessions, sorted by id.
+    /// Sessions started since: a duration back from now (`7d`, `12h`) or an
+    /// RFC 3339 time (`2026-11-20T10:00+02:00`). The catalog keeps 90 days.
+    #[arg(long, value_name = "T", default_value = "7d")]
+    pub since: String,
+    /// Sessions started before: a duration back from now or an RFC 3339 time.
+    #[arg(long, value_name = "T")]
+    pub until: Option<String>,
+    /// Only the sessions that resolved this target, with its OUTCOME (ran,
+    /// hit, failed, cancelled).
+    #[arg(long, value_name = "ADDR")]
+    pub addr: Option<String>,
+    /// Only the sessions that failed. With `--addr`, only the sessions in
+    /// which that target failed, whatever the session's own exit.
+    #[arg(long)]
+    pub failed: bool,
+    /// Only the sessions run by a human, an agent or CI.
+    #[arg(long, value_enum)]
+    pub actor: Option<ActorKind>,
+    /// Only the sessions of this heph command (`run`, `query`, ...).
+    #[arg(long, value_name = "COMMAND")]
+    pub command: Option<String>,
+    /// Only the sessions run by this user (`$USER`).
+    #[arg(long, value_name = "USER")]
+    pub user: Option<String>,
+    /// The sessions of the workspace at DIR, not this one's.
+    #[arg(long, value_name = "DIR")]
+    pub workspace: Option<std::path::PathBuf>,
+    /// `--json` is an array of sessions in the table's order: live sessions
+    /// first, then ended ones, each newest first.
     #[command(flatten)]
     pub out: output::JsonArgs<list::ListRow>,
+}
+
+/// Who ran a session, as `list --actor` selects it.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActorKind {
+    Human,
+    Agent,
+    Ci,
+}
+
+impl ActorKind {
+    /// The catalog's `actor_kind`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Human => "human",
+            Self::Agent => "agent",
+            Self::Ci => "ci",
+        }
+    }
+}
+
+impl ListArgs {
+    /// The filter these flags select, as of `now_ms`.
+    fn filter(&self, now_ms: u64) -> anyhow::Result<list::ListFilter> {
+        let (since_ms, until_ms) = list::window(&self.since, self.until.as_deref(), now_ms)?;
+        Ok(list::ListFilter {
+            since_ms: Some(since_ms),
+            until_ms,
+            addr: self.addr.clone(),
+            failed: self.failed,
+            actor: self.actor,
+            command: self.command.clone(),
+            user: self.user.clone(),
+        })
+    }
 }
 
 #[derive(Args, Clone, Debug)]
@@ -211,12 +392,25 @@ pub struct ExportArgs {
     #[arg(value_name = "REF")]
     pub reference: String,
     /// The file to write, replaced if it exists; `-` writes to stdout.
-    /// Default: `./heph-<id>.hephsession`.
+    /// Default: `./heph-<id>.hephsession`, or `./heph-<id>.otlp.jsonl` with
+    /// `--format otlp`.
     #[arg(short = 'o', long = "output", value_name = "PATH")]
     pub output: Option<std::path::PathBuf>,
-    /// Leave out approval notice text and root-failure logs.
+    /// Leave out approval notice text and root-failure logs. Refused with
+    /// `--format otlp`, which holds neither.
     #[arg(long)]
     pub no_logs: bool,
+    /// `hephsession` (the recording, for `heph session show`/`attach`/`query`
+    /// elsewhere) or `otlp` (OTLP/JSON lines: spans, logs, metrics).
+    #[arg(long, value_enum, default_value = "hephsession")]
+    pub format: ExportFormat,
+}
+
+/// What `heph session export` writes.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExportFormat {
+    Hephsession,
+    Otlp,
 }
 
 impl SessionArgs {
@@ -233,7 +427,8 @@ impl SessionArgs {
 /// Every error that is not already a [`SessionExit`] is this command's own:
 /// exit 125, so it is never read as an exit code `attach` mirrored. A `--jq`
 /// failure keeps the output layer's code (2, or 130 when cancelled), as on
-/// every command.
+/// every command. A query stopped by Ctrl-C is already a [`SessionExit`]
+/// with code 130, as an interrupted command exits.
 pub(crate) fn wrap_exit(res: anyhow::Result<()>) -> anyhow::Result<()> {
     res.map_err(|e| {
         if e.downcast_ref::<SessionExit>().is_some() || output::exit_code(&e).is_some() {
@@ -256,7 +451,7 @@ fn execute(
         .context("locating ~/.heph/sessions")?
         .join(crate::tui::session::SESSIONS_DIR);
     let tmp_dir = crate::tui::session::store::tmp_dir(&root);
-    let file = FileSource::new(root);
+    let file = FileSource::new(root.clone());
     let sources: [&dyn SessionSource; 1] = [&file];
     let opener = reference::Opener::new(tmp_dir);
     let opts = ViewOpts {
@@ -273,30 +468,64 @@ fn execute(
     match cmd {
         SessionCommands::List(a) => {
             // Outside a workspace there is no "this one": list them all.
+            let filter = a.filter(opts.now_ms)?;
             let workspace = if a.all {
                 None
+            } else if let Some(dir) = &a.workspace {
+                // As a workspace root is recorded: absolute, links resolved.
+                let dir = std::fs::canonicalize(dir)
+                    .or_else(|_| std::path::absolute(dir))
+                    .with_context(|| format!("resolving --workspace {}", dir.display()))?;
+                Some(dir.to_string_lossy().into_owned())
             } else {
                 crate::engine::get_root()
                     .ok()
                     .map(|p| p.to_string_lossy().into_owned())
             };
-            let filter = match &workspace {
+            let scope = match &workspace {
                 Some(w) => Workspace::Only(w),
                 None => Workspace::All,
             };
             if let Some(note) = list::scope_note(a.all, workspace.as_deref()) {
                 sink.write_diagnostic(note);
             }
-            bootstrap::block_on(list::list(&sources, opts, filter, &a.out, out))?
+            // `list` heals and repairs the catalog it reads (D14).
+            let catalog = list::read_catalog(&root, opts.now_ms, &filter, scope, &mut |note| {
+                sink.write_diagnostic(note);
+            });
+            let shown = bootstrap::block_on(list::list(
+                &sources,
+                opts,
+                scope,
+                &filter,
+                catalog.as_ref(),
+                &a.out,
+                out,
+            ))??;
+            for hint in list::hints(shown, &filter, catalog.as_ref(), &a.since, opts.now_ms) {
+                sink.write_diagnostic(&hint);
+            }
+            Ok(())
         }
-        SessionCommands::Show(a) => bootstrap::block_on(show::show(
-            &sources,
-            opts,
-            &a.reference,
-            &a.out,
-            out,
-            &opener,
-        ))?,
+        SessionCommands::Show(a) => {
+            // `show` reads explorer rows, so it repairs what it reads (D14);
+            // every other viewer reads as it is.
+            let note_sink = sink.clone();
+            let repairing = file
+                .clone()
+                .repairing(std::sync::Arc::new(move |line: &str| {
+                    note_sink.write_diagnostic(line);
+                }));
+            let sources: [&dyn SessionSource; 1] = [&repairing];
+            bootstrap::block_on(show::show(
+                &sources,
+                opts,
+                &a.reference,
+                &a.out,
+                out,
+                &opener,
+            ))?
+        }
         SessionCommands::Inflight(a) => {
             bootstrap::block_on(inflight(&sources, opts, &a.id, &a.out, out))?
         }
@@ -314,6 +543,9 @@ fn execute(
             ))?
         }
         SessionCommands::Export(a) => {
+            let note_sink = sink.clone();
+            let note: Arc<dyn Fn(&str) + Send + Sync> =
+                Arc::new(move |line: &str| note_sink.write_diagnostic(line));
             let exported = bootstrap::block_on(export::export_ref(
                 &file,
                 opts,
@@ -321,6 +553,7 @@ fn execute(
                 crate::engine::approval::read_notice_from_store,
                 &mut stdout,
                 &opener,
+                note,
             ))??;
             if exported.snapshot {
                 sink.write_diagnostic(export::SNAPSHOT_NOTE);
@@ -329,6 +562,36 @@ fn execute(
                 writeln!(stdout, "{}", path.display()).context("writing the path")?;
             }
             Ok(())
+        }
+        SessionCommands::Query(a) => {
+            let workspace = if a.all_workspaces {
+                None
+            } else {
+                crate::engine::get_root()
+                    .ok()
+                    .map(|p| p.to_string_lossy().into_owned())
+            };
+            let windowed = a.from.is_empty() && !a.schema;
+            if windowed && !a.all_workspaces && workspace.is_none() {
+                sink.write_diagnostic(
+                    "heph: not in a workspace; querying the sessions of every workspace\n",
+                );
+            }
+            let note_sink = sink.clone();
+            let env = query::QueryEnv {
+                root: &root,
+                sources: &sources,
+                opts,
+                opener: &opener,
+                workspace,
+                note: Arc::new(move |line: &str| note_sink.write_diagnostic(line)),
+            };
+            bootstrap::block_on(query::query(
+                a,
+                env,
+                &mut std::io::stdin().lock(),
+                &mut stdout,
+            ))?
         }
     }
 }
@@ -345,6 +608,8 @@ impl SessionExit {
     /// The command's own failure (A14). A session can exit 125 as well;
     /// `attach` says so on stderr when it mirrors one (`attach::exit_note`).
     pub const OWN_FAILURE: u8 = 125;
+    /// `query` stopped by Ctrl-C: 128 + SIGINT, as a shell reports it.
+    pub const INTERRUPTED: u8 = 130;
 
     pub fn own(error: anyhow::Error) -> Self {
         Self {

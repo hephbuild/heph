@@ -177,9 +177,17 @@ fn piped(w: &mut Vec<u8>) -> Out<'_> {
 
 async fn run_list(sources: &[&dyn SessionSource], ws: Workspace<'_>, json: bool) -> String {
     let mut out = Vec::new();
-    list::list(sources, opts(), ws, &json_args(json), piped(&mut out))
-        .await
-        .expect("list");
+    list::list(
+        sources,
+        opts(),
+        ws,
+        &list::ListFilter::default(),
+        None,
+        &json_args(json),
+        piped(&mut out),
+    )
+    .await
+    .expect("list");
     String::from_utf8(out).expect("utf-8")
 }
 
@@ -213,6 +221,11 @@ fn no_opener() -> reference::Opener {
         tmp_dir: Path::new("/nonexistent/heph-session-tmp").into(),
         download: Arc::new(NoDownload),
     }
+}
+
+/// Where a command's stderr notes go in a test that does not read them.
+fn no_note() -> Arc<dyn Fn(&str) + Send + Sync> {
+    Arc::new(|_: &str| {})
 }
 
 #[test]
@@ -593,7 +606,13 @@ async fn commands_run_against_any_source() {
         assert!(lines[0].contains(col), "{table}");
     }
     assert_eq!(lines.len(), 5, "header + 4 sessions:\n{table}");
-    // Live first; the ended one last.
+    for col in ["ACTOR", "STARTED", "TOOK"] {
+        assert!(lines[0].contains(col), "{table}");
+    }
+    assert!(!lines[0].contains("OUTCOME"), "only with --addr:\n{table}");
+    // Live first, newest first; the ended one last.
+    assert!(lines[1].starts_with(&root_holder.encode()), "{table}");
+    assert!(lines[3].starts_with(&a.encode()), "{table}");
     assert!(lines[4].starts_with(&b.encode()), "{table}");
     assert!(lines[4].contains("ok"), "{table}");
     assert!(lines[4].contains("1/1"), "{table}");
@@ -637,10 +656,18 @@ async fn commands_run_against_any_source() {
         .iter()
         .map(|s| s["id"].as_str().expect("id"))
         .collect();
-    let mut sorted = ids.clone();
-    sorted.sort_unstable();
-    assert_eq!(ids, sorted, "sorted by id");
-    let a_json = &json[0];
+    // Live first, then ended; newest first within each.
+    assert_eq!(
+        ids,
+        [
+            root_holder.encode(),
+            holder.encode(),
+            a.encode(),
+            b.encode()
+        ],
+        "live newest first, then ended"
+    );
+    let a_json = &json[2];
     assert_eq!(a_json["state"], "waiting");
     assert_eq!(a_json["owner_pid"], 100);
     assert_eq!(a_json["started_unix_ms"], T0);
@@ -656,7 +683,7 @@ async fn commands_run_against_any_source() {
     assert_eq!(a_json["progress"]["running_ops"], 0);
     assert_eq!(a_json["panicked"], false);
     assert!(a_json.get("format").is_none(), "only on too-new rows");
-    let b_json = &json[1];
+    let b_json = &json[3];
     assert_eq!(b_json["exit_code"], 0);
     assert_eq!(b_json["state"], "ok");
     assert_eq!(b_json["now"], serde_json::Value::Null, "it ended");
@@ -2538,6 +2565,7 @@ async fn export_is_self_contained() {
             reference: id.encode(),
             output: Some(output),
             no_logs,
+            format: ExportFormat::Hephsession,
         };
         let file = &file;
         async move {
@@ -2549,6 +2577,7 @@ async fn export_is_self_contained() {
                 crate::engine::approval::read_notice_from_store,
                 &mut stdout,
                 &no_opener(),
+                no_note(),
             )
             .await
             .expect("export");
@@ -2765,23 +2794,31 @@ fn the_snapshot_note_is_the_viewers_caveat() {
     );
 }
 
-/// `-o` as given, `-` for stdout, else `./heph-<id>.hephsession`.
+/// `-o` as given, `-` for stdout, else `./heph-<id>.hephsession` (or
+/// `./heph-<id>.otlp.jsonl` with `--format otlp`).
 #[test]
 fn export_destination() {
     let id = SessionId::new(T0, 7);
+    let (heph, otlp) = (ExportFormat::Hephsession, ExportFormat::Otlp);
     assert_eq!(
-        export::Dest::from_arg(None, id),
+        export::Dest::from_arg(None, id, heph),
         export::Dest::File(PathBuf::from(format!("heph-{}.hephsession", id.encode())))
     );
     assert_eq!(
-        export::Dest::from_arg(Some(Path::new("-")), id),
-        export::Dest::Stdout
+        export::Dest::from_arg(None, id, otlp),
+        export::Dest::File(PathBuf::from(format!("heph-{}.otlp.jsonl", id.encode())))
     );
-    // A file named `-` is spelled `./-`.
-    assert_eq!(
-        export::Dest::from_arg(Some(Path::new("./-")), id),
-        export::Dest::File(PathBuf::from("./-"))
-    );
+    for format in [heph, otlp] {
+        assert_eq!(
+            export::Dest::from_arg(Some(Path::new("-")), id, format),
+            export::Dest::Stdout
+        );
+        // A file named `-` is spelled `./-`.
+        assert_eq!(
+            export::Dest::from_arg(Some(Path::new("./-")), id, format),
+            export::Dest::File(PathBuf::from("./-"))
+        );
+    }
 }
 
 /// `export -o PATH` replaces a file already at `PATH` with an export that
@@ -2809,10 +2846,12 @@ async fn export_o_replaces_a_file_and_wants_its_parent() {
                     reference: id.encode(),
                     output: Some(output),
                     no_logs: false,
+                    format: ExportFormat::Hephsession,
                 },
                 crate::engine::approval::read_notice_from_store,
                 &mut Vec::new(),
                 &no_opener(),
+                no_note(),
             )
             .await
         }
@@ -2947,34 +2986,15 @@ async fn a_lost_session_sealed_by_cleanup_still_reads() {
     let file = crate::tui::session::FileSource::new(&root);
     let sources: [&dyn SessionSource; 1] = [&file];
 
-    let mut out = Vec::new();
-    list::list(
-        &sources,
-        opts(),
-        Workspace::All,
-        &json_args(false),
-        piped(&mut out),
-    )
-    .await
-    .expect("list");
-    let table = String::from_utf8(out).expect("utf-8");
+    let table = run_list(&sources, Workspace::All, false).await;
     let row = table
         .lines()
         .find(|l| l.contains(&id.encode()))
         .unwrap_or_else(|| panic!("no row: {table}"));
     assert!(row.contains("lost"), "{table}");
 
-    let mut out = Vec::new();
-    list::list(
-        &sources,
-        opts(),
-        Workspace::All,
-        &json_args(true),
-        piped(&mut out),
-    )
-    .await
-    .expect("list --json");
-    let json: serde_json::Value = serde_json::from_slice(&out).expect("json");
+    let json: serde_json::Value =
+        serde_json::from_str(&run_list(&sources, Workspace::All, true).await).expect("json");
     let s = &json[0];
     assert_eq!(s["id"], id.encode(), "{json}");
     assert_eq!(s["state"], "lost", "{s}");
@@ -3031,4 +3051,8 @@ fn retention_defaults_agree() {
     );
 }
 
+mod export_otlp;
+mod list_catalog;
+mod query_cli;
+mod recipes;
 mod refs;

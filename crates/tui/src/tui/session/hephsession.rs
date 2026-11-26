@@ -28,7 +28,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rusqlite::Connection;
-use rusqlite::limits::Limit;
 
 use super::store;
 
@@ -481,11 +480,7 @@ fn open_db(db: &Path) -> Result<Connection, ForeignError> {
     // foreign file is never written, and nothing is created beside it.
     let conn = store::open_sealed(db)
         .map_err(|e| not_a_session(format!("cannot open it as SQLite: {e}")))?;
-    conn.execute_batch("PRAGMA trusted_schema=OFF; PRAGMA query_only=1;")
-        .and_then(|()| {
-            conn.set_limit(Limit::SQLITE_LIMIT_LENGTH, VALUE_CAP)
-                .map(drop)
-        })
+    store::distrust(&conn, true)
         .map_err(|e| not_a_session(format!("cannot open it as SQLite: {e}")))?;
     let has_session: bool = conn
         .query_row(

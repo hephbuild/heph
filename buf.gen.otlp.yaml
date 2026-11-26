@@ -1,0 +1,18 @@
+version: v2
+# The OTLP data model (`heph session export --format otlp`), vendored from
+# open-telemetry/opentelemetry-proto under third_party/. Its own crate,
+# `gen/otlp`, because it needs JSON: `buf.gen.yaml` keeps JSON off for the
+# plugin ABI's types, which every plugin links.
+inputs:
+  - directory: third_party/opentelemetry-proto
+plugins:
+  - local: protoc-gen-buffa
+    out: gen/otlp/src
+    # One run over every file: its packages refer to each other.
+    strategy: all
+    opt:
+      - views=false
+      - json=true
+  - local: protoc-gen-buffa-packaging
+    out: gen/otlp/src
+    strategy: all

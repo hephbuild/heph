@@ -10,7 +10,7 @@
 mod common;
 
 use common::pty::{Ended, Pty};
-use common::session::{Bg, SHORT, list_entry, recorded, sessions_dir};
+use common::session::{Bg, SHORT, list_entry, recorded, session_dirs, sessions_dir};
 use common::{Dist, Workspace};
 use std::time::{Duration, Instant};
 
@@ -298,12 +298,8 @@ fn records_while_paused() {
     // Printed by the target on the terminal: the TUI has stepped aside.
     pty.wait_for("hold-started", DEADLINE);
 
-    // The root's cleanup stamp (`.cleanup`) is not a session.
-    let dirs: Vec<_> = std::fs::read_dir(sessions_dir(ws.home()))
-        .expect("a sessions dir")
-        .map(|e| e.expect("entry").path())
-        .filter(|p| p.file_name() != Some(std::ffi::OsStr::new(".cleanup")))
-        .collect();
+    // The root's catalog and cleanup stamp are not sessions.
+    let dirs = session_dirs(&sessions_dir(ws.home()));
     let [dir] = dirs.as_slice() else {
         panic!("one session expected: {dirs:?}")
     };
