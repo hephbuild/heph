@@ -199,9 +199,10 @@ pub struct ShowView<'a> {
     incomplete_reason: Option<IncompleteReason>,
     /// One entry per bounded pool the session admitted from, by name; empty
     /// while it runs (the summaries are written at its end). A `cpu` or
-    /// `memory` entry also carries the `resources_vs_machine` totals
-    /// (`declared_above_use_us`, `use_above_declared_us`, `matched_us`,
-    /// `unknown_us`); a pool with no machine counterpart has none.
+    /// `memory` entry also carries the `resources_vs_machine` totals as
+    /// `machine` (`declared_above_use_us`, `use_above_declared_us`,
+    /// `matched_us`, `unknown_us`); a pool with no machine counterpart has
+    /// none.
     pools: &'a [PoolSummary],
     /// The machine the session ran on, and its waiting split. Always
     /// present; `status` says what was sampled.
@@ -1241,7 +1242,35 @@ mod tests {
             held_mean: 1.5,
             held_peak: 4.0,
             waiting_us: 10,
+            machine: Some(VsMachine {
+                declared_above_use_us: 1,
+                use_above_declared_us: 2,
+                matched_us: 3,
+                unknown_us: 4,
+            }),
         }];
+        let machine = MachineSummary {
+            status: MachineStatus::Partial,
+            reason: Some(NoneReason::NoSamples),
+            cpus: Some(8),
+            cpu_limit: Some(4.0),
+            cpu_limit_source: Some(LimitSource::Quota),
+            memory_limit_bytes: Some(1 << 30),
+            memory_limit_source: Some(LimitSource::Host),
+            cpu_busy_mean: Some(0.5),
+            cpu_busy_peak: Some(1.0),
+            memory_used_peak_bytes: Some(1 << 29),
+            heph_resident_peak_bytes: Some(1 << 20),
+            sources_failed: vec![crate::tui::session::machine::SourceFailed {
+                source: "heph.machine.memory.used".to_owned(),
+                error: "gone".to_owned(),
+                at_unix_us: 1,
+            }],
+            waiting: crate::tui::session::machine::Waiting {
+                by_phase: [("admission".to_owned(), Split::default())].into(),
+                ..Default::default()
+            },
+        };
         let view = ShowView::new(
             "id".to_owned(),
             StateJson::Running,
@@ -1258,6 +1287,7 @@ mod tests {
             1,
             true,
             &pools,
+            &machine,
             Some(ForeignJson {
                 origin: "origin",
                 partial: Some(Partial::Snapshot),

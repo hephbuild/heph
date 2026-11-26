@@ -1082,13 +1082,14 @@ pub struct PoolSummary {
     /// Time with at least one request waiting for the pool (the queue was
     /// not empty), not the sum of every request's wait.
     pub waiting_us: u64,
-    /// The `resources_vs_machine` totals (PR 5), flattened into the entry;
-    /// absent for a pool with no machine counterpart (`docker`, `sandbox`).
-    /// [`read_pools`] leaves it `None`; the session's [`Summaries`] fills
-    /// it in.
+    /// The `resources_vs_machine` totals (PR 5), as the entry's `machine`
+    /// object (not flattened: the output contract's field table must know
+    /// every key); absent for a pool with no machine counterpart (`docker`,
+    /// `sandbox`). [`read_pools`] leaves it `None`; the session's
+    /// [`Summaries`] fills it in.
     ///
     /// [`Summaries`]: super::Summaries
-    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub machine: Option<super::machine::VsMachine>,
 }
 

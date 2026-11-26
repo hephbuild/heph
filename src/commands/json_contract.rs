@@ -467,6 +467,16 @@ mod tests {
             }
             "ListTotal" => Derived(htui::tui::session::format::ListTotal::__OUTPUT_SHAPE),
             "PoolSummary" => Derived(htui::tui::session::store::PoolSummary::__OUTPUT_SHAPE),
+            "VsMachine" => Derived(htui::tui::session::machine::VsMachine::__OUTPUT_SHAPE),
+            "MachineSummary" => {
+                Derived(htui::tui::session::machine::MachineSummary::__OUTPUT_SHAPE)
+            }
+            "MachineStatus" => Derived(htui::tui::session::machine::MachineStatus::__OUTPUT_SHAPE),
+            "NoneReason" => Derived(htui::tui::session::machine::NoneReason::__OUTPUT_SHAPE),
+            "LimitSource" => Derived(htui::tui::session::machine::LimitSource::__OUTPUT_SHAPE),
+            "SourceFailed" => Derived(htui::tui::session::machine::SourceFailed::__OUTPUT_SHAPE),
+            "Waiting" => Derived(htui::tui::session::machine::Waiting::__OUTPUT_SHAPE),
+            "Split" => Derived(htui::tui::session::machine::Split::__OUTPUT_SHAPE),
             "IncompleteReason" => Derived(session::show::IncompleteReason::__OUTPUT_SHAPE),
             "StateJson" => Derived(session::show::StateJson::__OUTPUT_SHAPE),
             "ForeignJson" => Derived(session::show::ForeignJson::__OUTPUT_SHAPE),

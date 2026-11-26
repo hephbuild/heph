@@ -1382,9 +1382,9 @@ capacity, held_mean, held_peak, waiting_us}]`, one
 per bounded pool with rows (see [Pools](#pools)): empty while the session is
 live, and for a build that admitted nothing. `capacity` is `null` when no
 row gave one. A `cpu` or `memory` entry adds the `resources_vs_machine`
-totals, `declared_above_use_us`, `use_above_declared_us`, `matched_us` and
-`unknown_us`; an entry for a pool with no machine counterpart has none of
-the four. `machine` is described under [Machine stats](#machine-stats).
+totals as `machine: {declared_above_use_us, use_above_declared_us,
+matched_us, unknown_us}`; an entry for a pool with no machine counterpart
+has no `machine`. `machine` is described under [Machine stats](#machine-stats).
 `chain_root` is the id of the session at the root of
 the first lock chain, `null` when no chain leads to a session. `next` is
 `{kind, command, argv, cwd, reason}`; `kind` is one of `attach`, `show_holder`, `inflight`,

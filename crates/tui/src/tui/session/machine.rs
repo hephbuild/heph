@@ -35,7 +35,7 @@ const TEXT_CAP: usize = 1024;
 
 /// What the sampler left in the recording. An open enum: a consumer reads a
 /// value it does not know as `partial`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, output_derive::Shape)]
 #[serde(rename_all = "snake_case")]
 pub enum MachineStatus {
     /// Samples, and no source stopped.
@@ -49,7 +49,7 @@ pub enum MachineStatus {
 }
 
 /// Why a recording has no machine figures. An open enum.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, output_derive::Shape)]
 #[serde(rename_all = "snake_case")]
 pub enum NoneReason {
     /// No machine record at all: recorded by a heph from before machine
@@ -62,7 +62,7 @@ pub enum NoneReason {
 }
 
 /// Where a limit came from. An open enum.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, output_derive::Shape)]
 #[serde(rename_all = "snake_case")]
 pub enum LimitSource {
     /// A cgroup v2 `cpu.max` quota tighter than the CPU count.
@@ -81,7 +81,7 @@ impl LimitSource {
 }
 
 /// One sampler source that stopped: a `heph.sampler.stopped` span event.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, output_derive::Shape)]
 pub struct SourceFailed {
     /// The metric the source fed, e.g. `heph.machine.memory.used`.
     pub source: String,
@@ -91,7 +91,7 @@ pub struct SourceFailed {
 
 /// One waiting phase's time, split by load (D29). Span-microseconds summed
 /// across targets, so concurrent waits add up.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, output_derive::Shape)]
 pub struct Split {
     pub busy_us: u64,
     pub spare_us: u64,
@@ -107,7 +107,7 @@ impl Split {
 }
 
 /// The waiting split: `--json`'s `machine.waiting`.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, output_derive::Shape)]
 pub struct Waiting {
     pub threshold_cpu: f64,
     pub threshold_memory: f64,
@@ -128,7 +128,7 @@ impl Default for Waiting {
 
 /// `heph session show --json`'s `machine`. A figure with no sample behind
 /// it is absent, never 0 or null.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, output_derive::Shape)]
 pub struct MachineSummary {
     pub status: MachineStatus,
     /// Only with `status: none`.
@@ -373,8 +373,8 @@ pub fn read_waiting(conn: &Connection) -> rusqlite::Result<BTreeMap<String, Spli
 
 /// One pool's `resources_vs_machine` totals (D30): its held fraction set
 /// against the machine's over the session. Part of `heph session show
-/// --json`'s `pools` entries, flattened.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+/// --json`'s `pools[].machine`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, output_derive::Shape)]
 pub struct VsMachine {
     /// Held at 90% or more while the machine was under 50%.
     pub declared_above_use_us: u64,

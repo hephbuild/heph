@@ -1391,6 +1391,7 @@ fn machine_rows_are_non_critical() {
             error: None,
             upstream_of: None,
             exit_status: None,
+            exit_code: None,
             log_tail: None,
             timed_out: None,
         },

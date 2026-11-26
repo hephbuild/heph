@@ -83,6 +83,7 @@ fn result_with(waits: &[(&'static str, u64, u64)]) -> SessionRecord {
             error: None,
             upstream_of: None,
             exit_status: None,
+            exit_code: None,
             log_tail: None,
             timed_out: None,
             cancelled: false,
@@ -570,8 +571,10 @@ async fn show_prints_pool_vs_machine() {
             {
                 "pool": "cpu", "unit": "{cpu}", "capacity": 8.0,
                 "held_mean": 8.0, "held_peak": 8.0, "waiting_us": 0,
-                "declared_above_use_us": 2_000_000, "use_above_declared_us": 0,
-                "matched_us": 0, "unknown_us": 2_000_000,
+                "machine": {
+                    "declared_above_use_us": 2_000_000, "use_above_declared_us": 0,
+                    "matched_us": 0, "unknown_us": 2_000_000,
+                },
             },
             {
                 "pool": "docker", "unit": "1", "capacity": 4.0,
