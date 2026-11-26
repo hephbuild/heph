@@ -824,7 +824,8 @@ this table. The OTLP export renames only where a semantic convention
 
 - **Sources.** Linux: the first line of `/proc/stat`, `/proc/meminfo`
   (`MemTotal − MemAvailable`) and `/proc/self/statm`; under a cgroup v2
-  quota, the cgroup's `cpu.stat`. macOS: `host_statistics64`, `task_info`
+  quota, the cgroup's `cpu.stat`. macOS: `host_processor_info` (CPU
+  ticks, summed over the CPUs), `host_statistics64` (memory), `task_info`
   and `hw.memsize`, memory used as Activity Monitor's Memory Used. A
   source that fails stops for the rest of the run and becomes one
   `heph.sampler.stopped` event; the others go on, and nothing stops the

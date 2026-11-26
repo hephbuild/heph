@@ -1,7 +1,7 @@
 //! The sampler: its parsers and formulas on fixtures (every host), the host's
 //! own sources, and the thread under an injected clock.
 
-use super::mach::{MachCpu, MachVm, mach_busy, mach_result, used_mach};
+use super::mach::{MachCpu, MachVm, mach_busy, mach_result, sum_cpu_load, used_mach};
 use super::procfs::*;
 use super::*;
 use crate::tui::session::recorder;
@@ -83,10 +83,13 @@ fn sampler_reads_every_source() {
             x = std::hint::black_box(x.wrapping_add(1));
         }
     };
-    // The host's CPU ticks can stand still over one short window (macOS
-    // publishes HOST_CPU_LOAD_INFO lazily), and a window with no tick has no
-    // busy figure by design. Sample again until the ticks move, for at most
-    // ATTEMPTS windows; busy must still show up.
+    // A window in which the host's ticks did not move has no busy figure by
+    // design. The spin moves them (they count at the scheduler's clock), so
+    // one window should do; sample again, for at most ATTEMPTS windows, only
+    // so a spin descheduled on a loaded runner does not fail the test. The
+    // stale ticks this test once saw on macOS were host_statistics64's
+    // machine-wide rate limit answering with a cached copy, which the CPU
+    // source no longer calls (host_processor_info instead).
     const ATTEMPTS: u32 = 10;
     let mut attempt = 0;
     let (first, busy) = loop {
@@ -206,6 +209,28 @@ fn sampler_parses_cpu_fixtures() {
     let busy = mach_busy(&before, &after).unwrap();
     assert!(close(busy, 40.0 / 109.0), "{busy}");
     assert_eq!(mach_busy(&after, &after), None);
+
+    // macOS ticks come per CPU and are summed per state; the sums wrap like
+    // the ticks, and busy over the sums is busy over all CPUs.
+    let cpu0_before = [u32::MAX - 9, 100, 1000, 0];
+    let cpu1_before = [500, u32::MAX, 2000, 7];
+    let cpu0_after = [20, 110, 1039, 0]; // user 30, system 10, idle 39
+    let cpu1_after = [500, 9, 2030, 7]; // system 10, idle 30
+    let sum = |a: [u32; 4], b: [u32; 4]| {
+        let units: Vec<u32> = a.into_iter().chain(b).collect();
+        sum_cpu_load(2, &units).unwrap()
+    };
+    let before = sum(cpu0_before, cpu1_before);
+    assert_eq!(before, m(u32::MAX.wrapping_add(491), 99, 3000, 7));
+    let busy = mach_busy(&before, &sum(cpu0_after, cpu1_after)).unwrap();
+    assert!(close(busy, 50.0 / 119.0), "{busy}");
+    // The buffer must be exactly `cpus` rows of four, and at least one.
+    let one = [1, 2, 3, 4];
+    assert_eq!(sum_cpu_load(1, &one), Some(m(1, 2, 3, 4)));
+    assert_eq!(sum_cpu_load(2, &one), None);
+    assert_eq!(sum_cpu_load(1, &one[..3]), None);
+    assert_eq!(sum_cpu_load(1, &[1, 2, 3, 4, 5]), None);
+    assert_eq!(sum_cpu_load(0, &[]), None);
 }
 
 #[test]
