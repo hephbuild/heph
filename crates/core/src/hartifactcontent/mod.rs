@@ -20,9 +20,26 @@ use std::path::PathBuf;
 /// `stop` is polled on every `read` call, i.e. once per buffer-sized chunk:
 /// for a cancellation token that is an atomic load per chunk, and nothing is
 /// allocated unless it fires.
-pub(crate) struct StopRead<'a, R: ?Sized> {
+///
+/// Public for a driver that unpacks in-process (`plugin-gh`'s `extract`),
+/// whose decompressor would otherwise run to the end of a stream past a
+/// cancellation.
+pub struct StopRead<'a, R: ?Sized> {
     pub(crate) inner: &'a mut R,
     pub(crate) stop: &'a dyn Fn() -> bool,
+}
+
+impl<'a, R: ?Sized> StopRead<'a, R> {
+    /// `inner`, failing every `read` once `stop` reads true.
+    pub fn new(inner: &'a mut R, stop: &'a dyn Fn() -> bool) -> Self {
+        Self { inner, stop }
+    }
+}
+
+impl<R: ?Sized> std::fmt::Debug for StopRead<'_, R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StopRead").finish_non_exhaustive()
+    }
 }
 
 impl<R: io::Read + ?Sized> io::Read for StopRead<'_, R> {

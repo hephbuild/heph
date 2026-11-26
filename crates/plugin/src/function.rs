@@ -9,7 +9,7 @@
 use crate::provider::Approval;
 use async_trait::async_trait;
 use hcore::htvalue::Value;
-use hcore::htvalue::signature::FnSignature;
+use hcore::htvalue::signature::{FnSignature, Param};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::{Arc, OnceLock, Weak};
@@ -270,6 +270,50 @@ pub struct PluginFnDef {
     /// functions (the hover then shows just the rendered signature).
     pub doc: String,
     pub func: Arc<dyn PluginFn>,
+}
+
+/// The keyword parameters of a function whose arguments a `#[derive(Spec)]`
+/// struct `S` decodes (`S::from(&args.named)`), from its schema: one [`Param`]
+/// per field, in field order, with the field's type. A `required` field is a
+/// required parameter; any other is optional with a `None` default, so an
+/// omitted argument reaches the decoder as `Null`. Each optional field's type
+/// must therefore decode `Null` as its default, as `Option<T>`, `bool` and
+/// `Vec<String>` do; a bare `u32` field would fail the call instead.
+///
+/// A [`Param`] borrows its name for `'static` and a schema owns its names, so
+/// the names come from [`SpecFields::KEYS`], the derive's literals.
+///
+/// [`SpecFields::KEYS`]: crate::htspec::SpecFields::KEYS
+pub fn spec_params<S: crate::htspec::SpecFields>() -> Vec<Param> {
+    S::KEYS
+        .iter()
+        .zip(S::schema().fields)
+        .map(|(&name, f)| {
+            debug_assert_eq!(name, f.name, "SpecFields::KEYS out of step with schema()");
+            if f.required {
+                Param::required(name, f.ty)
+            } else {
+                Param::optional(name, f.ty, Value::Null())
+            }
+        })
+        .collect()
+}
+
+/// The schema's field docs as a Markdown list, one item per documented field,
+/// for a function's [`PluginFnDef::doc`]: a [`Param`] has no doc of its own,
+/// so this is how the decoding struct's doc comments reach the LSP hover.
+/// Empty when no field is documented.
+pub fn spec_params_doc(schema: &crate::driver::DriverSchema) -> String {
+    schema
+        .fields
+        .iter()
+        .filter(|f| !f.doc.is_empty())
+        .map(|f| {
+            let required = if f.required { " (required)" } else { "" };
+            format!("- `{}`{required}: {}", f.name, f.doc)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// A function as held in the [`FunctionRegistry`]: its signature (shared, so
@@ -679,5 +723,79 @@ mod tests {
         drop(reg);
         let err = slot.get().expect_err("owner gone");
         assert!(format!("{err:#}").contains("is gone"), "{err:#}");
+    }
+
+    /// The arguments of a function decoded by a `#[derive(Spec)]` struct.
+    #[derive(crate::htspec::Spec)]
+    struct Args {
+        /// What to call it.
+        #[spec(required)]
+        name: String,
+        /// A label, if any.
+        label: Option<String>,
+        verbose: bool,
+        tags: Vec<String>,
+    }
+
+    /// The parameters are the struct's fields, and an omitted optional
+    /// argument, substituted by the signature, decodes as the struct's own
+    /// default: the two stay one definition.
+    #[test]
+    fn spec_params_follow_the_decoding_struct() {
+        use hcore::htvalue::signature::ParamType;
+        let params = spec_params::<Args>();
+        let shape: Vec<_> = params
+            .iter()
+            .map(|p| (p.name, p.ty.render(), p.default.clone()))
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                ("name", ParamType::String.render(), None),
+                (
+                    "label",
+                    <Option<String> as crate::htspec::FromSpecValue>::spec_param_type().render(),
+                    Some(Value::Null()),
+                ),
+                ("verbose", ParamType::Bool.render(), Some(Value::Null())),
+                (
+                    "tags",
+                    <Vec<String> as crate::htspec::FromSpecValue>::spec_param_type().render(),
+                    Some(Value::Null()),
+                ),
+            ]
+        );
+
+        let sig = FnSignature {
+            positional: vec![],
+            named: params,
+            variadic: None,
+            returns: ParamType::Null,
+        };
+        let (_, named) = sig
+            .validate_args(
+                "f",
+                vec![],
+                HashMap::from([("name".to_string(), Value::String("x".into()))]),
+            )
+            .unwrap();
+        let args = Args::from(&named).unwrap();
+        assert_eq!(args.name, "x");
+        assert_eq!(args.label, None);
+        assert!(!args.verbose);
+        assert!(args.tags.is_empty());
+
+        let err = sig
+            .validate_args("f", vec![], HashMap::new())
+            .expect_err("name is required");
+        assert!(format!("{err:#}").contains("`name`"), "{err:#}");
+    }
+
+    #[test]
+    fn spec_params_doc_lists_the_documented_fields() {
+        assert_eq!(
+            spec_params_doc(&Args::schema()),
+            "- `name` (required): What to call it.\n- `label`: A label, if any."
+        );
     }
 }

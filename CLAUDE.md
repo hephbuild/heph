@@ -243,6 +243,18 @@ Read `docs/TEMPLATE.md` before touching it. The one thing to know going in:
 `vars` is hashed from a `BTreeMap` because it arrives as a `HashMap`, and
 hashing it in iteration order would move the def hash on every run.
 
+### GitHub release assets
+
+`heph.gh.release_asset(...)` (`crates/plugin-gh/src/release.rs`) declares an
+`http_fetch` of a release asset's download URL and, with `extract = True`, a
+`gh.extract` that unpacks it in-process (`crates/archive`).
+
+Read `docs/GH_RELEASES.md` before touching it. The one thing to know going in:
+the function only *declares* targets and must stay pure (no network, no
+environment), and the archive is untrusted input, so every unpacking rule
+(no `..`/absolute paths, links resolved inside the output, normalized modes,
+duplicates refused) is a security property with a unit test, not a nicety.
+
 ### Failure outputs
 
 A failed target's slot (`<home>/failures/<addr-key>/`) holds its `log.txt`, its

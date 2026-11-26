@@ -39,6 +39,20 @@ mod rename;
 // so those expansions resolve wherever the macro is used.
 pub use crate::driver::{DriverField, DriverSchema};
 
+/// What a `#[derive(Spec)]` struct knows about its own fields, for code that
+/// must name them as `'static` strings (a function signature's
+/// [`Param`](hcore::htvalue::signature::Param) borrows its name for
+/// `'static`, while a [`DriverField`] owns its own, as the plugin ABI wants).
+/// Implemented by the derive; see `hplugin::function::spec_params`.
+pub trait SpecFields {
+    /// Each field's key, in field order: the literals the derive read them
+    /// from, so `KEYS[i]` is the name of `schema().fields[i]`.
+    const KEYS: &'static [&'static str];
+
+    /// The struct's schema, as its inherent `schema()`.
+    fn schema() -> DriverSchema;
+}
+
 /// A type parsable from a BUILD-file [`Value`] that also describes its own
 /// accepted shape. Implemented for the primitive + container shapes specs use;
 /// implement it by hand (or via `#[derive(SpecUnion)]`) for bespoke union types.
@@ -288,7 +302,13 @@ impl FromSpecValue for u32 {
             }
             _ => anyhow::bail!("invalid: expected int, got: {:?}", v),
         };
-        u32::try_from(n).map_err(|_e| anyhow::anyhow!("invalid: expected u32, got: {n}"))
+        // Said in a BUILD author's words: `u32` is not a type they wrote.
+        u32::try_from(n).map_err(|_e| {
+            anyhow::anyhow!(
+                "invalid: expected a non-negative integer of at most {}, got: {n}",
+                u32::MAX
+            )
+        })
     }
 
     fn spec_param_type() -> ParamType {
@@ -739,6 +759,32 @@ mod tests {
         let err =
             ReqSpec::from(&HashMap::from([("bogus".to_string(), Value::Null())])).unwrap_err();
         assert_eq!(format!("{err:#}"), "missing required `name`");
+    }
+
+    /// `KEYS` are the keys the config is read by (a renamed field's new
+    /// name), in the schema's order.
+    #[test]
+    fn spec_fields_keys_name_the_schema_fields_in_order() {
+        let names: Vec<_> = <DemoSpec as SpecFields>::schema()
+            .fields
+            .into_iter()
+            .map(|f| f.name)
+            .collect();
+        assert_eq!(names, DemoSpec::KEYS);
+        assert_eq!(
+            DemoSpec::KEYS,
+            ["run", "deps", "env", "out", "count", "mode"]
+        );
+    }
+
+    /// An out-of-range `u32` says what is accepted in a BUILD author's words.
+    #[test]
+    fn a_negative_u32_names_the_accepted_range() {
+        let err = u32::from_spec_value(&Value::Int(-1)).unwrap_err();
+        assert_eq!(
+            format!("{err:#}"),
+            "invalid: expected a non-negative integer of at most 4294967295, got: -1"
+        );
     }
 
     #[derive(SpecStruct, Debug, PartialEq)]

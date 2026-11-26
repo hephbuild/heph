@@ -17,12 +17,27 @@ tracing = "0.1"
 # the other crates' reqwest config.
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls", "json"] }
 serde_json = "1"
+# The plugin's `options:` (an `Options` value), decoded into one struct.
+serde_yaml = "0.9"
+# Names the option a decode error is about (`hook.enable: …`): serde_yaml's
+# `Value` deserializer reports no path.
+serde_path_to_error = "0.1"
 # Hash maps on the event-drain path. `BTreeSet<String>` costs O(log n) string
 # comparisons per insert, each walking a long shared `//deep/package/…` prefix
 # before diverging; FxHash hashes the bytes once.
 rustc-hash = "2"
+# `heph.gh.release_asset` and the `extract` driver it declares.
+async-trait = "0.1.92"
+hdriver-support = { package = "driver-support", path = "../driver-support" }
+serde = { version = "1", features = ["derive"] }
+xxhash-rust = { version = "0.8.21", features = ["xxh3", "std"] }
+# Path segments of a release download URL (already in the tree through `url`).
+percent-encoding = "2.3"
+# The hardened unpacker `extract` runs.
+harchive = { package = "archive", path = "../archive" }
 
 [dev-dependencies]
 tempfile = "3"
-serde_yaml = "0.9"
 hcore = { package = "core", path = "../core", features = ["test-support"] }
+hmodel = { package = "model", path = "../model" }
+tokio = { version = "1", features = ["rt", "macros"] }

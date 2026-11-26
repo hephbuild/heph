@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// A one-shot-per-request loopback HTTP server. Returns its base URL plus a
 /// counter of the requests it served — the whole point of caching a fetch is that
 /// the second build does not hit the network, and only the server can prove it.
-fn serve(body: &'static [u8], max_requests: usize) -> (String, Arc<AtomicUsize>) {
+pub(crate) fn serve(body: &'static [u8], max_requests: usize) -> (String, Arc<AtomicUsize>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let url = format!("http://{}", listener.local_addr().expect("addr"));
     let hits = Arc::new(AtomicUsize::new(0));

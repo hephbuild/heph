@@ -40,6 +40,7 @@ mod failure_report;
 mod failure_slot;
 mod force;
 mod fs_glob;
+mod gh_release_asset;
 mod glob_metachar_package;
 mod go_format_glob;
 mod group;
