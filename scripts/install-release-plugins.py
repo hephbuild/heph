@@ -81,7 +81,7 @@ def check_version(version: str, binary: str) -> None:
         die(
             f"`{binary}` is a local build ({version}), not a release",
             "its plugins must come from the same tree: run install-go-plugin / "
-            "install-devenv-plugin / install-oci-plugin / install-gha-plugin",
+            "install-devenv-plugin / install-oci-plugin / install-gh-plugin",
             "or install a released binary first, then re-run this",
         )
 

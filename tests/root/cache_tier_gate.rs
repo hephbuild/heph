@@ -30,7 +30,7 @@ const ALLOWED: &[(&str, &str)] = &[
         "touches the target's progress; counts nothing",
     ),
     (
-        "crates/plugin-gha/src/tally.rs",
+        "crates/plugin-gh/src/tally.rs",
         "an explicit no-op match arm; never counts them",
     ),
     (

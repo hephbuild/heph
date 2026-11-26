@@ -1,5 +1,5 @@
 [package]
-name = "plugin-gha-cdylib"
+name = "plugin-gh-cdylib"
 version = "0.1.0"
 edition = "2024"
 
@@ -10,7 +10,7 @@ crate-type = ["cdylib"]
 workspace = true
 
 [dependencies]
-hplugin-gha = { package = "plugin-gha", path = "../plugin-gha" }
+hplugin-gh = { package = "plugin-gh", path = "../plugin-gh" }
 hplugin = { package = "plugin", path = "../plugin" }
 plugin-sdk = { path = "../plugin-sdk", features = ["stabby"] }
 stabby = "72.1.16"

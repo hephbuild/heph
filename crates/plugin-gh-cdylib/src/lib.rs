@@ -1,13 +1,13 @@
-//! The GitHub Actions hook as a loadable cdylib behind the stable ABI.
+//! The `gh` (GitHub) plugin as a loadable cdylib behind the stable ABI.
 //!
-//! Exports a single stabby `create` entry that constructs the [`GhaHook`] and
-//! hands it back as an ABI-stable handle. A hook-only plugin: it carries no
-//! provider, no drivers and no functions.
+//! Exports a single stabby `create` entry that constructs the GitHub Actions
+//! reporting [`GhaHook`] and hands it back as an ABI-stable handle. It carries
+//! no provider, no drivers and no functions.
 
 use std::sync::Arc;
 
 use hplugin::hook::Hook;
-use hplugin_gha::GhaHook;
+use hplugin_gh::GhaHook;
 use plugin_sdk::stabby::abi::{DynFunctionRegistry, NamedHook, PluginComponents};
 use plugin_sdk::stabby::{create_config_from_bytes, make_dyn_hook};
 
@@ -25,7 +25,7 @@ pub extern "C" fn heph_plugin_create(
     match build(&cfg) {
         Ok(c) => c,
         Err(e) => {
-            tracing::error!("heph-gha-plugin: plugin construction failed: {e:#}");
+            tracing::error!("heph-gh-plugin: plugin construction failed: {e:#}");
             std::process::abort();
         }
     }

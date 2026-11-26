@@ -1,6 +1,6 @@
 //! The cdylib plugin loader, against the cdylibs CI actually publishes.
 //!
-//! In-process tests construct `plugin-go` / `plugin-gha` directly and call
+//! In-process tests construct `plugin-go` / `plugin-gh` directly and call
 //! them through Rust generics — the dynamic seam is never crossed. Everything
 //! that can only break at the seam is invisible to them: a symbol missing from
 //! the built `.so`/`.dylib`, an ABI version the host refuses, a plugin whose
@@ -244,15 +244,15 @@ provider_state(
 /// different export kind over the same seam, so a loader that only handles
 /// providers fails here and nowhere else.
 #[test]
-fn shipped_gha_cdylib_loads() {
+fn shipped_gh_cdylib_loads() {
     let dist = Dist::locate();
     let ws = Workspace::new().expect("workspace");
-    let dylib = dist.plugin("gha");
+    let dylib = dist.plugin("gh");
     assert!(dylib.is_file(), "missing {}", dylib.display());
 
-    let manifest = ws.root().join("heph-gha-plugin.json");
-    let sum = sha256_file(&dylib).expect("hash gha cdylib");
-    write_manifest(&manifest, "gha", &dylib, Some(&sum)).expect("write manifest");
+    let manifest = ws.root().join("heph-gh-plugin.json");
+    let sum = sha256_file(&dylib).expect("hash gh cdylib");
+    write_manifest(&manifest, "gh", &dylib, Some(&sum)).expect("write manifest");
 
     ws.config(&format!("{BASE_CONFIG}  - path: {}\n", manifest.display()))
         .expect("write config");

@@ -2,7 +2,7 @@
 
 Status: **design, not yet implemented.** Reviewed by `product-vision` and `feature-quality`.
 
-Scope: what `crates/plugin-gha` renders, and the event-stream changes that reporting needs.
+Scope: what the `gh` plugin's Actions hook (`crates/plugin-gh`) renders, and the event-stream changes that reporting needs.
 Not in scope: the sticky-comment transport (found-or-create, per-step sections, run markers) —
 that plumbing is sound and is kept.
 
@@ -76,7 +76,7 @@ finished.
 
 ## 3. What the hook throws away today
 
-`Tally::apply` has a `_ => {}` arm (`crates/plugin-gha/src/lib.rs:142`). Silently dropped:
+`Tally::apply` has a `_ => {}` arm (`crates/plugin-gh/src/lib.rs:142`). Silently dropped:
 
 - `MaxWorkers` — worker saturation, the "is it stuck vs busy" signal
 - `ResultLockWaitStart { holder_pid }` / `End` — the other half of that signal
@@ -498,7 +498,7 @@ free — the engine constructs `UpstreamFailed { root }` at that exact site
 
 `BuildEvent` is **already a live cross-process, cross-artifact boundary**, not the hypothetical one
 the module doc implies. `StableRemoteHook` serde-JSON-encodes every event to out-of-process hooks
-(`crates/plugin-stabby/src/load_stable.rs:826`), and `plugin-gha-cdylib` ships as its own release
+(`crates/plugin-stabby/src/load_stable.rs:826`), and `plugin-gh-cdylib` ships as its own release
 artifact pinned by manifest URL independently of the `heph` binary — so host/plugin version skew is
 a normal reachable state.
 
@@ -842,7 +842,7 @@ Current: `refreshSecs`, `summaryPath`, `tokenEnv`. Keep the names and the camelC
 
 ## 14. Test plan
 
-`crates/plugin-gha` `#[cfg(test)]` — everything below is provable in-process:
+`crates/plugin-gh` `#[cfg(test)]` — everything below is provable in-process:
 
 - **Byte-budget truncation at both limits**, adversarial: 500 failures × 4 KB single-line messages;
   3k packages; a 3 KB section key. Assert `body.len() <= 65_536`, the first root survives, and the

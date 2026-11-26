@@ -1210,7 +1210,7 @@ fn every_release_asset_has_an_uploader() {
         "\"heph-bench_${OS}_${ARCH}\"".to_string(),
         "dist/heph-govet_*".to_string(),
     ];
-    for plugin in ["go", "gha", "oci", "devenv"] {
+    for plugin in ["go", "gh", "oci", "devenv"] {
         families.push(format!(
             "\"heph-{plugin}-plugin_${{OS}}_${{ARCH}}.${{EXT}}\""
         ));
