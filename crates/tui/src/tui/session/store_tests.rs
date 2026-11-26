@@ -2198,6 +2198,11 @@ fn explorer_golden_rows() {
     let committed = tests::open(&committed);
     let mut written: BTreeSet<String> = attribute_keys(&committed.conn);
     written.extend(attribute_keys(&conn));
+    // And a stopped machine-stats source's event (PR 5).
+    let id = now_id(35);
+    let s = id.started_unix_ms();
+    let (_machine_root, machine) = derived(id, &tests::machine_records(s), s + 6_000);
+    written.extend(attribute_keys(&machine));
     assert_eq!(written, documented_attribute_keys());
 }
 

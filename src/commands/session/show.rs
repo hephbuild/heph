@@ -815,7 +815,7 @@ fn cpu_amount(v: f64) -> String {
 /// One bounded pool's line, e.g.
 /// `cpu pool (capacity 8): held 7.6 mean while in use (95%), 8 peak; something
 /// was waiting for 1m2s; against the machine: 6m12s declared above use,
-/// 1m0s matched`: the `resources_vs_machine` totals, non-zero ones only, for
+/// 1m00s matched`: the `resources_vs_machine` totals, non-zero ones only, for
 /// a pool with a machine counterpart (`cpu`, `memory`).
 fn pool_line(p: &PoolSummary) -> String {
     let amount = |v: f64| {

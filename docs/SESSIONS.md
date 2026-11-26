@@ -437,7 +437,9 @@ heph.session                     root, span_id 1; trace id derived from the sess
     no result is open: a generated file kept out of a glob.
   - On the session span: `heph.lock.holder_seen`, once per pid the first
     time this run sees it holding a lock it waits on; `heph.truncated` at
-    each cap the recording passed (full cap, then ceiling).
+    each cap the recording passed (full cap, then ceiling);
+    `heph.sampler.stopped`, once per machine-stats source that stopped
+    (see [Machine stats](#machine-stats)).
   - `heph.approval.prompt` and `heph.approval.cleared`, on the session span.
     An `Approval` record is written each time the approval banner's state
     changes: the pending prompt (its queue of targets) or the standing Y/N
@@ -460,7 +462,9 @@ heph.session                     root, span_id 1; trace id derived from the sess
   after they all closed (a second request in the same process) counts again.
   A pool's unit comes from `RequestConfig.units`: a `cpu`
   pool in CPUs (`{cpu}`, the engine's micro-CPUs over 10^6), a `bytes` pool in
-  `By`, anything else `1`.
+  `By`, anything else `1`. The machine's own figures, `heph.machine.*`,
+  `heph.process.*` and their `heph.session.*` summaries, are listed under
+  [Machine stats](#machine-stats).
 - **Views**: `logs` (`Log` and `Output` records: `session_id`, `seq`,
   `time_us`, `severity`, `body`), `sessions` (the session row as resource
   attributes, plus `schema_version`), and `targets` (`session_id`, `addr`,
@@ -487,6 +491,7 @@ heph.session                     root, span_id 1; trace id derived from the sess
 | `heph.lock.holder_pid`, `heph.lock.holder_session` | `heph.lock.holder_seen` event | the holder's pid, and its session id when known |
 | `heph.pool` | `heph.pool.*`, `heph.session.pool.*` metrics | the pool's name |
 | `heph.outcome` | `heph.session.results` metric | `ran`, `hit`, `failed`, `cancelled` |
+| `heph.sampler.source`, `heph.sampler.error` | `heph.sampler.stopped` event | the metric the stopped source fed (or `sampler` when the sampler did not start), and why |
 
 The trace id is the first 16 bytes of SHA-256 over `heph.trace.v1:`
 followed by the session id; a span id is written as its 8-byte big-endian
@@ -775,7 +780,7 @@ ORDER BY s.started_ms DESC;
 from the `heph.session.pool.*` metrics and the last `heph.pool.capacity`:
 
 ```
-cpu pool (capacity 8): held 7.6 mean while in use (95%), 8 peak; nothing waited for it; against the machine: 6m12s declared above use, 1m0s matched, 2.0s unknown
+cpu pool (capacity 8): held 7.6 mean while in use (95%), 8 peak; nothing waited for it; against the machine: 6m12s declared above use, 1m00s matched, 2.0s unknown
 docker pool (capacity 4): held 3 mean while in use (75%), 4 peak; something was waiting for 1s
 ```
 
@@ -795,6 +800,83 @@ build that admitted nothing (an all-hit build). These rows are read from
 events the engine already emits; nothing flows back into admission, a
 target, or a hash.
 
+### Machine stats
+
+A recording samples the machine once a second, so a slow build can be read
+against what the machine was doing: out of CPU, short of memory, or neither.
+
+| Name | Kind | Unit | Value | OTLP export |
+| --- | --- | --- | --- | --- |
+| `heph.machine.cpu.count` | gauge | `{cpu}` | once, at start: logical CPUs online | `system.cpu.logical.count`, up-down counter |
+| `heph.machine.cpu.limit` | gauge | `{cpu}` | once, at start: the CPUs heph may use; the cgroup v2 `cpu.max` quota on Linux when one is tighter, else `cpu.count` | as named |
+| `heph.machine.cpu.busy` | gauge | `1` | each sample: busy share of `cpu.limit` over the interval since the previous sample, 0–1 | as named |
+| `heph.machine.memory.limit` | gauge | `By` | once, at start: physical RAM | `system.memory.limit`, up-down counter |
+| `heph.machine.memory.used` | gauge | `By` | each sample: memory that cannot be reclaimed without swapping | as named |
+| `heph.process.cpu.time` | counter | `s` | each sample: heph's own user + system time, cumulative | `process.cpu.time`, counter |
+| `heph.process.memory.resident` | gauge | `By` | each sample: heph's resident set | `process.memory.usage`, up-down counter |
+| `heph.session.machine.cpu.busy.mean`, `.peak` | gauge | `1` | at the end; absent with no busy sample | as named |
+| `heph.session.machine.memory.used.peak`, `heph.session.process.memory.resident.peak` | gauge | `By` | at the end | as named |
+
+The names carry no attributes and are frozen, with their kind and unit,
+from the first release that contains them (I9). `query --schema` prints
+this table. The OTLP export renames only where a semantic convention
+(v1.27.0) means the same thing.
+
+- **Sources.** Linux: the first line of `/proc/stat`, `/proc/meminfo`
+  (`MemTotal − MemAvailable`) and `/proc/self/statm`; under a cgroup v2
+  quota, the cgroup's `cpu.stat`. macOS: `host_statistics64`, `task_info`
+  and `hw.memsize`, memory used as Activity Monitor's Memory Used. A
+  source that fails stops for the rest of the run and becomes one
+  `heph.sampler.stopped` event; the others go on, and nothing stops the
+  build.
+- **Records.** One `MachineInfo` at start, one `MachineSample` a tick. They
+  are not critical: past the 256 MiB cap they are dropped like `Log` lines.
+  A recording shorter than one tick has no busy row and no CPU summary.
+- **Cost.** One thread, one record and four rows a second, written in the
+  recorder's existing flush. `--raw` starts no sampler; a private session
+  samples. The catalog keeps the four summaries, never the samples.
+- **Nothing flows back.** No figure reaches a hash, a target, admission or a
+  `${resource:…}` allotment.
+
+`show` prints one machine line, then a line per source that stopped:
+
+```
+machine: 8 CPUs (host), 16.0 GiB RAM (host); CPU busy 65% mean, 95% peak; memory used 12.0 GiB peak (75% of RAM); heph resident 200.0 MiB peak; waiting: admission 0.2s (0.2s busy), deps 1.0s (0.5s spare, 0.5s unknown)
+```
+
+```
+machine: 2.5 CPUs (quota, of 8), 16.0 GiB RAM (host); CPU busy 50% mean, 75% peak; heph resident 100.0 MiB peak
+the sampler stopped reading heph.machine.memory.used 1s into the run: no MemAvailable in /proc/meminfo
+```
+
+With nothing sampled it says why: `machine: none: recorded before machine
+stats`, `no samples (shorter than one tick)`, `no samples: the sampler's
+sources stopped`, or `the sampler did not start: <error>`.
+
+**Waiting, split.** Each `waiting` span (`heph.admission`, `heph.deps`,
+`heph.lock_wait`, `heph.scratch`) is cut at the samples. A piece is **busy**
+when its sample has CPU busy at 0.9 or more, or memory used at 95% of RAM or
+more; **spare** when both are known and below; **unknown** where no sample
+covers it (before the first, after the sampler stopped, past the cap, across
+a gap over 2 s). Totals are summed across targets, so concurrent waits add
+up. Spare time in `admission` means the declared `resources` held work back
+on a machine with room. This is the `waiting_by_load` recipe, which `show`
+runs; the pool lines' "against the machine" totals are `resources_vs_machine`
+(see [Pools](#pools) and [Built-in recipes](#built-in-recipes)). Their SQL and
+thresholds are not contract.
+
+`show --json`'s `machine` is `{status, reason, cpus, cpu_limit,
+cpu_limit_source, memory_limit_bytes, memory_limit_source, cpu_busy_mean,
+cpu_busy_peak, memory_used_peak_bytes, heph_resident_peak_bytes,
+sources_failed: [{source, error, at_unix_us}], waiting: {threshold_cpu,
+threshold_memory, by_phase: {<phase>: {busy_us, spare_us, unknown_us}}}}`.
+`status` is `sampled`, `partial` (a source stopped), `failed` (no sample, a
+source stopped) or `none`, with `reason` `older_derivation` or `no_samples`
+only then; all are open enums. A figure with no sample is absent, never 0.
+`cpu_limit_source` is `quota` when the limit is below the CPU count, else
+`host`; `memory_limit_source` is always `host`. While the session runs, the
+summaries are computed from the samples so far.
+
 ## Records
 
 One row of `records` has a `body` like
@@ -813,8 +895,13 @@ UTF-8, stored verbatim and escaped by the viewer on output; `seq` numbers the
 sink's lines from 1), `End {exit_code,
 panicked}`, `Truncated`, `InflightWritten`, `LockHolder {pid, session}` (the
 run resolved a lock holder's pid to a session, or found none: see [The run's
-own lock-wait notice](#the-runs-own-lock-wait-notice)), and `Unknown` for
-anything newer. Both keys are optional; a body with neither is skipped.
+own lock-wait notice](#the-runs-own-lock-wait-notice)), `MachineInfo
+{time_unix_us, cpu_count, cpu_limit_ucpus, cpu_limit_source,
+memory_limit_bytes, memory_limit_source, failed}` (once, at start) and
+`MachineSample {time_unix_us, interval_us, cpu_busy_ppm, memory_used_bytes,
+process_cpu_us, process_resident_bytes, failed, dropped}` (each tick; see
+[Machine stats](#machine-stats)), and `Unknown` for anything newer. Both
+keys are optional; a body with neither is skipped.
 
 What the run's terminal showed besides events and log lines is recorded too,
 so `attach` draws it (see [Attach](#attach)):
@@ -900,7 +987,8 @@ incompatible change:
 - **The explorer contract** (I9) is `sessions.schema_version` (1). Within a
   format the six names only gain tables, columns, names and enum values; a
   derivation bump may add rows or attributes, and may correct a value that
-  was wrong.
+  was wrong. The machine metric names, with their unit, kind and
+  attributes, are frozen from the first release that contains them.
 - **Within a format the schema only grows** (I5). Every table, view and
   index of the format's fixture stays, its columns in their order; new ones
   may be added beside them. The stored definitions of the six public names
@@ -1253,7 +1341,7 @@ stable signal for "has it gone silent".
 | I5 | A record's `kind` is a `BuildEvent` exactly as on the plugin wire. The recording names its format in its header; a reader refuses a newer one by name and reads every older one, and each released format has a committed fixture a test opens. |
 | I6 | A session holds nothing the terminal would not have shown (argv, log lines, failing log tails), user-only. |
 | I7 | A viewer **never signals** a process. `inflight` drops `inflight.request`; the owner's diag sweeper (one `stat` per 200ms tick) writes `inflight.txt`, removes the request and records `InflightWritten`, which the viewer waits for. The session row's `capabilities` must list `inflight`. |
-| I9 | The six explorer names (`sessions`, `spans`, `span_events`, `metrics`, `logs`, `targets`) are the public contract. Within a format they only gain tables, columns, names and enum values; released span and metric names, the trace-id rule and the span-id encoding never change. |
+| I9 | The six explorer names (`sessions`, `spans`, `span_events`, `metrics`, `logs`, `targets`) are the public contract. Within a format they only gain tables, columns, names and enum values; released span and metric names, the trace-id rule and the span-id encoding never change. The machine metric names (see [Machine stats](#machine-stats)), with their unit, kind and attributes, are frozen from the first release that contains them. |
 
 ### Recording
 
@@ -1928,11 +2016,15 @@ FROM spans WHERE name = 'heph.result'
 ORDER BY queued_ms DESC;
 ```
 
-A pool held near its capacity with a long `waiting_s` held work back. Whether
-the machine had room while it did needs the machine's own usage beside these
-rows, which this heph does not record yet: until it does, compare with the
-machine's load over the same window by hand. Nothing here flows back into
-admission (see [Pools](#pools)).
+A pool held near its capacity with a long `waiting_s` held work back.
+Whether the machine had room while it did is what the built-in
+`resources_vs_machine` recipe answers, from the machine samples beside these
+rows (`show` prints its totals on the pool's line), and `waiting_by_load`
+says, phase by phase, whether waiting work met a busy machine or a spare
+one: spare time in `admission` means the declarations held work back on a
+machine with room. Both need a recording (`--full` or `--from`): the catalog
+keeps no samples. Nothing here flows back into admission (see
+[Machine stats](#machine-stats)).
 
 ## Run logs
 
