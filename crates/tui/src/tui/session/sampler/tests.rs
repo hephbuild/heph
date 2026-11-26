@@ -673,16 +673,18 @@ fn sampler_ticks_at_fixed_rate() {
 
 #[test]
 fn sampler_stops_without_waiting() {
-    // End returns with no tick elapsed: the stop ends the wait.
+    // End returns with no tick elapsed: the stop ends the wait (StillClock's
+    // wait ends on nothing else, so `Exited` proves it). A generous wait for
+    // the thread to exit, so a loaded runner does not read it as detached;
+    // STOP_WAIT itself is what the detached case below times.
+    const EXIT_WAIT: Duration = Duration::from_secs(5);
     let (sampler, readings) =
         Sampler::spawn_with(Fake::default, StillClock(Instant::now()), TICK, || false).unwrap();
     assert!(matches!(readings.recv().unwrap(), Reading::Info { .. }));
-    let asked = Instant::now();
-    assert_eq!(sampler.stop(STOP_WAIT), SamplerExit::Exited);
-    assert!(asked.elapsed() < STOP_WAIT * 5);
+    assert_eq!(sampler.stop(EXIT_WAIT), SamplerExit::Exited);
     assert!(readings.iter().next().is_none(), "no sample taken");
     // Idempotent.
-    assert_eq!(sampler.stop(STOP_WAIT), SamplerExit::Exited);
+    assert_eq!(sampler.stop(EXIT_WAIT), SamplerExit::Exited);
 
     // A source that blocks does not hang the exit: the wait times out, the
     // thread is detached.
