@@ -226,106 +226,8 @@ impl SessionArgs {
         session: &Arc<SessionSlot>,
         global: &GlobalOptions,
     ) -> anyhow::Result<()> {
-        let res = execute(&self.command, sink, session, global);
-        if let Err(e) = &res
-            && self.command.json()
-        {
-            // The human line still goes to stderr, rendered by main.
-            let mut stdout = std::io::stdout().lock();
-            if let Err(w) = write_json_error(e, &mut stdout) {
-                tracing::debug!(error = %w, "cannot write the error as JSON");
-            }
-        }
-        wrap_exit(res)
+        wrap_exit(execute(&self.command, sink, session, global))
     }
-}
-
-impl SessionCommands {
-    /// Whether the command was asked for `--json` (or `--fields`/`--jq`).
-    fn json(&self) -> bool {
-        match self {
-            Self::List(a) => a.out.enabled(),
-            Self::Show(a) => a.out.enabled(),
-            Self::Inflight(a) => a.out.enabled(),
-            Self::Attach(_) | Self::Export(_) => false,
-        }
-    }
-}
-
-/// What kind of failure a `heph session` error is, under `--json`'s
-/// `error.kind`. An open enum: a consumer reads a value it does not know as
-/// a failure, with `error.message` saying what. Every one exits 125.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum ErrorKind {
-    /// No session matches the `<ref>`.
-    NotFound,
-    /// More than one session matches the `<ref>`; the message lists them.
-    Ambiguous,
-    /// The file or download is not a heph session.
-    NotASession,
-    /// A heph recording in a format newer than this heph reads. The message
-    /// names both formats.
-    FormatTooNew,
-    /// The URL was refused or its download failed.
-    Fetch,
-    /// A file could not be read or written.
-    Io,
-    /// Anything else; the message says what.
-    Other,
-}
-
-/// An error with its [`ErrorKind`].
-#[derive(Debug)]
-pub(crate) struct Kinded {
-    pub kind: ErrorKind,
-    pub error: anyhow::Error,
-}
-
-impl std::fmt::Display for Kinded {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:#}", self.error)
-    }
-}
-
-impl std::error::Error for Kinded {}
-
-pub(crate) fn kinded(kind: ErrorKind, error: anyhow::Error) -> anyhow::Error {
-    anyhow::Error::new(Kinded { kind, error })
-}
-
-/// The kind of `e`: the first [`Kinded`] or local-recording `OpenError` in
-/// its chain, else `Other`.
-pub(crate) fn error_kind(e: &anyhow::Error) -> ErrorKind {
-    use crate::tui::session::store::OpenError;
-    e.chain()
-        .find_map(|c| {
-            if let Some(k) = c.downcast_ref::<Kinded>() {
-                return Some(k.kind);
-            }
-            c.downcast_ref::<OpenError>().map(|o| match o {
-                OpenError::Missing => ErrorKind::NotFound,
-                OpenError::NotASession => ErrorKind::NotASession,
-                OpenError::TooNew { .. } => ErrorKind::FormatTooNew,
-                OpenError::Other(_) => ErrorKind::Other,
-            })
-        })
-        .unwrap_or(ErrorKind::Other)
-}
-
-/// `{"error": {"kind", "message"}}` on one line, for `--json`.
-pub(crate) fn write_json_error(e: &anyhow::Error, out: &mut dyn Write) -> anyhow::Result<()> {
-    serde_json::to_writer(
-        &mut *out,
-        &serde_json::json!({
-            "error": {
-                "kind": error_kind(e),
-                "message": format!("{e:#}"),
-            }
-        }),
-    )
-    .context("writing the error")?;
-    writeln!(out).context("writing the error")
 }
 
 /// Every error that is not already a [`SessionExit`] is this command's own:
@@ -666,10 +568,7 @@ pub(crate) async fn resolve(
 ) -> anyhow::Result<(usize, SessionEntry)> {
     let arg = arg.trim();
     if arg.is_empty() {
-        return Err(kinded(
-            ErrorKind::NotFound,
-            anyhow::anyhow!("no session id given"),
-        ));
+        anyhow::bail!("no session id given");
     }
     if let Ok(id) = SessionId::parse(arg) {
         for (i, source) in sources.iter().enumerate() {
@@ -698,11 +597,8 @@ pub(crate) async fn resolve(
             return Err(ambiguous(arg, &by_pid, opts));
         }
     }
-    let not_found = |msg: String| kinded(ErrorKind::NotFound, anyhow::anyhow!(msg));
     let Some(needle) = crate::tui::session::id::normalize(arg) else {
-        return Err(not_found(format!(
-            "no session {arg}: not a session id, a live session's pid, or part of an id"
-        )));
+        anyhow::bail!("no session {arg}: not a session id, a live session's pid, or part of an id");
     };
     let matches: Vec<&(usize, SessionEntry)> = all
         .iter()
@@ -714,15 +610,15 @@ pub(crate) async fn resolve(
     match matches.as_slice() {
         [one] => Ok((*one).clone()),
         // Digits read two ways (spec: `12345`): say that neither matched.
-        [] if digits => Err(not_found(format!(
+        [] if digits => Err(anyhow::anyhow!(
             "no session {arg}: no live session has pid {arg}, and no session id starts or ends \
              with {needle} (`heph session list --all` lists them): {}",
             gone_hint(opts.retention)
-        ))),
-        [] => Err(not_found(format!(
+        )),
+        [] => Err(anyhow::anyhow!(
             "no session {arg} (`heph session list --all` lists them): {}",
             gone_hint(opts.retention)
-        ))),
+        )),
         _ => Err(ambiguous(arg, &matches, opts)),
     }
 }
@@ -737,7 +633,7 @@ fn ambiguous(arg: &str, candidates: &[&(usize, SessionEntry)], opts: ViewOpts) -
         msg.push_str(&format!("\n  {}  {:<8} {command}", e.id, state.label()));
     }
     msg.push_str("\nGive more of the id (or its last characters).");
-    kinded(ErrorKind::Ambiguous, anyhow::anyhow!(msg))
+    anyhow::anyhow!(msg)
 }
 
 /// Refuse a session whose directory format this heph does not read (A6).
@@ -746,13 +642,10 @@ pub(crate) fn require_known(
 ) -> anyhow::Result<&crate::tui::session::SessionMeta> {
     match &entry.meta {
         EntryMeta::Known(m) => Ok(m),
-        EntryMeta::TooNew { found, supported } => Err(kinded(
-            ErrorKind::FormatTooNew,
-            anyhow::anyhow!(
-                "session {} was recorded in session format {found}; this heph reads format \
-                 {supported} and older — use a newer heph to view it",
-                entry.id
-            ),
+        EntryMeta::TooNew { found, supported } => Err(anyhow::anyhow!(
+            "session {} was recorded in session format {found}; this heph reads format \
+             {supported} and older — use a newer heph to view it",
+            entry.id
         )),
     }
 }

@@ -44,8 +44,19 @@ pub(super) async fn show_with(
     json: bool,
     opener: &reference::Opener,
 ) -> anyhow::Result<String> {
+    let (res, out) = show_captured(sources, arg, json, opener).await;
+    res.map(|()| out)
+}
+
+/// `show`, and what it wrote to stdout, whether or not it failed.
+async fn show_captured(
+    sources: &[&dyn SessionSource],
+    arg: &str,
+    json: bool,
+    opener: &reference::Opener,
+) -> (anyhow::Result<()>, String) {
     let mut out = Vec::new();
-    show::show(
+    let res = show::show(
         sources,
         opts(),
         arg,
@@ -53,8 +64,25 @@ pub(super) async fn show_with(
         piped(&mut out),
         opener,
     )
-    .await?;
-    Ok(String::from_utf8(out).expect("utf-8"))
+    .await;
+    (res, String::from_utf8(out).expect("utf-8"))
+}
+
+/// `show --json` failing on `arg`: stdout gets nothing, not even an error
+/// object (docs/JSON_OUTPUT.md), and the error exits 125. Returns the error,
+/// whose `{e:#}` is the line main prints on stderr.
+async fn show_json_fails(
+    sources: &[&dyn SessionSource],
+    arg: &str,
+    opener: &reference::Opener,
+) -> anyhow::Error {
+    let (res, out) = show_captured(sources, arg, true, opener).await;
+    let e = res.expect_err(arg);
+    assert_eq!(out, "", "{arg}: stdout under --json on an error");
+    let msg = format!("{e:#}");
+    let wrapped = wrap_exit(Err(e)).expect_err("err");
+    assert_eq!(exit_code(&wrapped), Some(125), "{arg}: {msg}");
+    wrapped
 }
 
 /// `attach` on the line backend, and everything it printed through its sink.
@@ -127,7 +155,6 @@ fn ref_classification() {
         "http://u:hunter2@h/x",
     ] {
         let e = classify(arg).expect_err(arg);
-        assert_eq!(error_kind(&e), ErrorKind::Fetch, "{arg}");
         let msg = format!("{e:#}");
         assert!(msg.contains("https://"), "{msg}");
         assert!(!msg.contains("hunter2"), "{msg}");
@@ -174,23 +201,20 @@ async fn credentials_in_a_url_are_refused_and_never_echoed() {
         "https://hunter2@h.invalid/x.hephsession",
         "HTTPS://u:hunter2@h.invalid/x",
     ] {
-        let e = show_with(&sources, url, false, &op).await.expect_err(url);
-        assert_eq!(error_kind(&e), ErrorKind::Fetch, "{url}");
-        let mut out = Vec::new();
-        write_json_error(&e, &mut out).expect("json");
-        for text in [
-            format!("{e:#}"),
-            format!("{e:?}"),
-            String::from_utf8(out).expect("utf-8"),
-        ] {
+        let e = show_json_fails(&sources, url, &op).await;
+        for text in [format!("{e:#}"), format!("{e:?}")] {
             assert!(!text.contains("hunter2"), "{url}: {text}");
         }
+        assert!(
+            format!("{e:#}").contains("credentials in a URL are not supported"),
+            "{e:#}"
+        );
     }
 }
 
 /// A signed URL's query and fragment are a credential: they never reach
 /// `foreign.origin`, the "read from" or "replaying" lines, or an error's
-/// `--json` message. What the download itself reports is `hfetch`'s to
+/// message. What the download itself reports is `hfetch`'s to
 /// redact (its own test).
 #[tokio::test]
 async fn a_signed_url_query_never_reaches_the_output() {
@@ -247,26 +271,15 @@ async fn a_signed_url_query_never_reaches_the_output() {
         SIGNED,
         "http://bucket.invalid/run?X-Amz-Signature=sekrit#frag",
     ] {
-        let e = show_with(&sources, url, true, &html)
-            .await
-            .expect_err("not a session");
-        let mut out = Vec::new();
-        write_json_error(&e, &mut out).expect("json");
-        let out = String::from_utf8(out).expect("utf-8");
-        clean(&out);
-        clean(&format!("{e:#}"));
-        assert!(
-            json(&out)["error"]["message"]
-                .as_str()
-                .is_some_and(|m| m.contains("bucket.invalid/run")),
-            "{out}"
-        );
+        let msg = format!("{:#}", show_json_fails(&sources, url, &html).await);
+        clean(&msg);
+        assert!(msg.contains("bucket.invalid/run"), "{msg}");
     }
 }
 
-/// A path that cannot be read is `io`, and its message names it once.
+/// A path that cannot be read is named once in the message.
 #[tokio::test]
-async fn an_unreadable_path_is_io_and_named_once() {
+async fn an_unreadable_path_is_named_once() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let empty = FakeSource::default();
     let sources: [&dyn SessionSource; 1] = [&empty];
@@ -275,25 +288,8 @@ async fn an_unreadable_path_is_io_and_named_once() {
     let e = show_with(&sources, &arg, false, &op)
         .await
         .expect_err("missing");
-    assert_eq!(error_kind(&e), ErrorKind::Io);
     let msg = format!("{e:#}");
     assert_eq!(msg.matches("nope.hephsession").count(), 1, "{msg}");
-}
-
-/// A local recording's `OpenError` keeps its kind through the context the
-/// command adds: `error.kind` reads it, not `other`.
-#[test]
-fn an_open_error_keeps_its_kind() {
-    use crate::tui::session::store::OpenError;
-    for (e, kind) in [
-        (OpenError::Missing, ErrorKind::NotFound),
-        (OpenError::NotASession, ErrorKind::NotASession),
-        (OpenError::TooNew { found: 99 }, ErrorKind::FormatTooNew),
-        (OpenError::Other(anyhow::anyhow!("disk")), ErrorKind::Other),
-    ] {
-        let e = anyhow::Error::new(e).context("opening session x");
-        assert_eq!(error_kind(&e), kind, "{e:#}");
-    }
 }
 
 /// The spec's `12345`: a live session's pid first, then an id that starts or
@@ -327,7 +323,6 @@ async fn digits_are_a_live_pid_then_part_of_an_id() {
         sessions: vec![session(other, 12345, false)],
     };
     let e = resolved(neither).await.expect_err("no match");
-    assert_eq!(error_kind(&e), ErrorKind::NotFound);
     let msg = format!("{e:#}");
     assert!(
         msg.contains("no live session has pid 12345")
@@ -337,8 +332,8 @@ async fn digits_are_a_live_pid_then_part_of_an_id() {
     );
 }
 
-/// https serving a web page: not a session, 125, and under `--json` the
-/// typed error object.
+/// https serving a web page: not a session, 125, and under `--json` nothing
+/// on stdout, the message on stderr only.
 #[tokio::test]
 async fn a_url_serving_html_is_not_a_session() {
     const URL: &str = "https://example.invalid/run.hephsession";
@@ -349,17 +344,8 @@ async fn a_url_serving_html_is_not_a_session() {
         tmp.path(),
         Serve(b"<!doctype html><html><body>Sign in</body></html>".to_vec()),
     );
-    let e = show_with(&sources, URL, true, &op).await.expect_err("html");
-    assert_eq!(error_kind(&e), ErrorKind::NotASession);
-    let mut out = Vec::new();
-    write_json_error(&e, &mut out).expect("json");
-    let out = String::from_utf8(out).expect("utf-8");
-    assert_eq!(out.lines().count(), 1, "{out}");
-    let v = json(&out);
-    assert_eq!(v["error"]["kind"], "not_a_session", "{out}");
-    let msg = v["error"]["message"].as_str().expect("message");
+    let msg = format!("{:#}", show_json_fails(&sources, URL, &op).await);
     assert!(msg.contains(URL), "{msg}");
-    assert_eq!(exit_code(&wrap_exit(Err(e)).expect_err("err")), Some(125));
     // The download went with the error.
     assert_eq!(
         std::fs::read_dir(tmp.path()).expect("read_dir").count(),
@@ -368,8 +354,8 @@ async fn a_url_serving_html_is_not_a_session() {
     );
 }
 
-/// An empty `<ref>` names nothing; a heph recording in a newer format says
-/// so by kind, and still exits 125.
+/// An empty `<ref>` names nothing; a heph recording in a newer format names
+/// both formats, and still exits 125.
 #[tokio::test]
 async fn an_empty_or_too_new_ref() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -380,7 +366,10 @@ async fn an_empty_or_too_new_ref() {
         let e = show_with(&sources, arg, false, &op)
             .await
             .expect_err("empty");
-        assert_eq!(error_kind(&e), ErrorKind::NotFound, "{arg:?}");
+        assert!(
+            format!("{e:#}").contains("no session id given"),
+            "{arg:?}: {e:#}"
+        );
         assert_eq!(exit_code(&wrap_exit(Err(e)).expect_err("err")), Some(125));
     }
 
@@ -393,11 +382,7 @@ async fn an_empty_or_too_new_ref() {
         ))
         .expect("write a newer format");
     let arg = newer.display().to_string();
-    let e = show_with(&sources, &arg, false, &op)
-        .await
-        .expect_err("too new");
-    assert_eq!(error_kind(&e), ErrorKind::FormatTooNew);
-    let msg = format!("{e:#}");
+    let msg = format!("{:#}", show_json_fails(&sources, &arg, &op).await);
     // Both formats, and what to do.
     assert!(
         msg.contains(&arg)
@@ -406,13 +391,6 @@ async fn an_empty_or_too_new_ref() {
             && msg.contains("upgrade heph"),
         "{msg}"
     );
-    let mut out = Vec::new();
-    write_json_error(&e, &mut out).expect("json");
-    assert_eq!(
-        json(std::str::from_utf8(&out).expect("utf-8"))["error"]["kind"],
-        "format_too_new"
-    );
-    assert_eq!(exit_code(&wrap_exit(Err(e)).expect_err("err")), Some(125));
 }
 
 /// I7: a path is read from itself alone. The same session, live in the

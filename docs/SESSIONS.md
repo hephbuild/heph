@@ -52,21 +52,9 @@ session whose `End` carries no code (killed by a signal, or it panicked) is
 reported as an error with that reason. An agent tells "the run failed" from
 "the wait failed" by that line, or by `heph session show <id> --json`.
 
-Under `--json` (`list`, `show`, `inflight`), an error of `heph session`
-itself also prints one line on stdout, `{"error":{"kind":…,"message":…}}`,
-beside the usual line on stderr; the exit stays 125. `kind` says which
-failure it is, and is an open enum: a consumer reads a value it does not know
-as a failure, with `message` saying what.
-
-| `kind` | When |
-| --- | --- |
-| `not_found` | no session matches the `<ref>`; for digits, neither a live pid nor an id prefix or suffix |
-| `ambiguous` | several sessions match; the message lists them |
-| `not_a_session` | the file or download is not a heph recording (an HTML error page, a zip without exactly one `.hephsession`, a truncated file) |
-| `format_too_new` | a heph recording in a format newer than this heph reads; the message names both formats |
-| `fetch` | an `http://` URL, a URL carrying credentials, or a download that failed or passed its cap |
-| `io` | a file could not be read or written |
-| `other` | anything else; the message says what |
+Under `--json` (`list`, `show`, `inflight`), an error is what it is on every
+heph command (`docs/JSON_OUTPUT.md`): the message on stderr and the exit code,
+125 here, with nothing on stdout. No JSON error object is printed.
 
 STATE is computed by the viewer, never stored: `running`; `waiting` (every
 open target is in a lock or admission wait); `quiet` (no event for longer
