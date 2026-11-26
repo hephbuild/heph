@@ -553,6 +553,8 @@ pub async fn run<A: App + 'static>(
     // still paused. The usual case is the pause that prints a run's results at
     // the very end, whose resume would rebuild a box only to tear it down again.
     let mut resume_pending = false;
+    // Set by `Control::StayPaused`: no resume is carried out from then on.
+    let mut stay_paused = false;
     let mut cols = terminal_cols(&terminal);
     // Set when a resize event arrives; handled (coalesced) at the next tick so a
     // drag-resize burst triggers at most one re-anchor per tick instead of a
@@ -652,10 +654,23 @@ pub async fn run<A: App + 'static>(
                     Some(Control::Resume) if paused => {
                         // The terminal is rebuilt at the next tick (see
                         // `resume_pending`). The keyboard is heph's again now.
-                        resume_pending = true;
+                        // Unless the run stays paused: then a later pause's
+                        // resume (a diagnostic printed after the tool) leaves
+                        // the TUI down.
+                        resume_pending = !stay_paused;
                         suppression.set(false);
                     }
                     Some(Control::Resume) => {}
+                    Some(Control::StayPaused) => {
+                        // The run's terminal was handed over for good
+                        // (`OwnedPauseGuard::keep_until_exit`): nothing reads
+                        // the keyboard again, so nothing could leave a held
+                        // screen either, and the run leaves as if `q` had
+                        // been pressed.
+                        stay_paused = true;
+                        resume_pending = false;
+                        end.quit = true;
+                    }
                     None => {}
                 }
             }
@@ -1892,6 +1907,7 @@ mod tests {
                             ack.send(()).expect("ack");
                         }
                         Some(Control::Resume) => paused = false,
+                        Some(Control::StayPaused) => {}
                         None => control_open = false,
                     },
                     // As in `run`: no pause guard on this arm.

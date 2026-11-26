@@ -12,6 +12,8 @@ use hcore::pending::PendingCounter;
 pub(crate) enum Control {
     Pause(oneshot::Sender<()>, PauseFor),
     Resume,
+    /// [`OwnedPauseGuard::keep_until_exit`].
+    StayPaused,
 }
 
 /// Why the TUI is stepping aside — which decides who owns Ctrl-C while it is
@@ -195,6 +197,22 @@ impl Pauser {
 
 pub struct OwnedPauseGuard {
     control: Option<mpsc::UnboundedSender<Control>>,
+}
+
+impl OwnedPauseGuard {
+    /// End the pause without resuming: the TUI stays down until the run
+    /// ends, and resumes asked for later are ignored. A finished run is then
+    /// not held on screen either, since holding it means reading keys.
+    ///
+    /// For a run whose terminal was handed to a tool that has now exited
+    /// (`heph run <entrypoint>`): a resume puts the terminal in raw mode,
+    /// queries the cursor and reads events, which takes whatever the user typed
+    /// for their shell once the tool had gone.
+    pub fn keep_until_exit(mut self) {
+        if let Some(tx) = self.control.take() {
+            drop(tx.send(Control::StayPaused));
+        }
+    }
 }
 
 impl Drop for OwnedPauseGuard {
