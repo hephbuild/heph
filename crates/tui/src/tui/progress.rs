@@ -2900,9 +2900,11 @@ impl CIAppView for CiProgressView {
                     tracing::info!("{line}");
                 }
             }
+            // A note, not a warning: every correct CI job sees it, since
+            // the snapshot step runs after the build.
             BuildEventKind::SnapshotJournalPending { .. } => {
                 if let Some(line) = hcore::events::snapshot_state_line(&ev.kind) {
-                    tracing::warn!("{line}");
+                    tracing::info!("{line}");
                 }
             }
             _ => {}
@@ -4381,7 +4383,7 @@ mod tests {
     }
 
     /// The snapshot's state prints once at the top however many requests
-    /// announce it, the journal reminder prints as a warning, and the
+    /// announce it, the journal reminder prints as a note, and the
     /// per-tier counts, misses by reason, print once at the end — never a
     /// line per missed target.
     #[test]
@@ -4442,7 +4444,7 @@ mod tests {
             "{log}"
         );
         assert!(
-            lines.iter().any(|l| l.contains("WARN")
+            lines.iter().any(|l| l.contains("INFO")
                 && l.ends_with(
                     "snapshot: journal holds 12 revisions; 'heph tool cache snapshot' writes them"
                 )),

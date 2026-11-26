@@ -58,6 +58,13 @@ fn describe_alive(recorders: &[LiveRecorder], waited: Duration) -> String {
     let who = recorders
         .iter()
         .map(|r| match r.pid {
+            // A container's main process is pid 1 in its own namespace, so
+            // `ps -p 1` in another container names the wrong process.
+            Some(1) => format!(
+                "pid 1 (a container's main process: `ps -p 1` in the container that recorded \
+                 it), journal {}",
+                r.journal.display()
+            ),
             Some(pid) => format!("pid {pid} (`ps -p {pid}`), journal {}", r.journal.display()),
             None => format!("journal {}", r.journal.display()),
         })
@@ -319,6 +326,33 @@ mod tests {
         assert_eq!(journal_pid(Path::new("/w/123-abc.log")), Some(123));
         assert_eq!(journal_pid(Path::new("/w/x-abc.log")), None);
         assert_eq!(journal_pid(Path::new("/w/abc.log")), None);
+    }
+
+    /// The refusal names each recorder by pid, and says where to look for
+    /// pid 1, a container's main process.
+    #[test]
+    fn the_refusal_names_each_recorder() {
+        let recorder = |pid, journal: &str| LiveRecorder {
+            journal: PathBuf::from(journal),
+            pid,
+        };
+        let message = describe_alive(
+            &[
+                recorder(Some(1), "/w/1-a.log"),
+                recorder(Some(42), "/w/42-b.log"),
+                recorder(None, "/w/c.log"),
+            ],
+            Duration::from_secs(10),
+        );
+        assert!(
+            message.contains("pid 1 (a container's main process: `ps -p 1` in the container"),
+            "{message}"
+        );
+        assert!(
+            message.contains("pid 42 (`ps -p 42`), journal /w/42-b.log"),
+            "{message}"
+        );
+        assert!(message.contains("; journal /w/c.log."), "{message}");
     }
 
     /// Only an old, unlocked `.tmp` goes: a young one may be a recorder

@@ -355,10 +355,17 @@ fn human_report(dir: &Path, report: &ExportReport) -> Vec<String> {
     out.push(format!("journals: {} consumed", report.journals.len()));
     for i in &report.incomplete {
         out.push(format!(
-            "incomplete: {} ({}); {} carried over",
+            "incomplete: {} ({})",
             i.reason,
-            i.journal.display(),
-            human_bytes(report.carried_over.bytes)
+            i.journal.display()
+        ));
+    }
+    if !report.incomplete.is_empty() {
+        out.push(format!(
+            "carried over: {} ({} revisions, {} scratch slots)",
+            human_bytes(report.carried_over.bytes + report.scratch.carried_over.bytes),
+            report.carried_over.count,
+            report.scratch.carried_over.count
         ));
     }
     for e in &report.cleanup_errors {
@@ -411,5 +418,56 @@ mod tests {
         for (e, want) in cases {
             assert_eq!(exit_code(&e).0, want, "{e:#}");
         }
+    }
+
+    /// Each incomplete journal gets its reason on a line of its own, and
+    /// what was carried over (revisions and scratch slots) is one total.
+    #[test]
+    fn an_incomplete_run_reports_each_reason_and_one_carried_total() {
+        use crate::engine::cache_snapshot::IncompleteJournal;
+        use crate::engine::cache_snapshot::export::ScratchReport;
+        let tally = |count, bytes| Tally { count, bytes };
+        let incomplete = |journal: &str, reason: &str| IncompleteJournal {
+            journal: PathBuf::from(journal),
+            reason: reason.to_owned(),
+        };
+        let report = ExportReport {
+            outcome: ExportOutcome::Written {
+                generation: "gen-1".to_owned(),
+            },
+            kept: tally(1, 10),
+            new: Tally::default(),
+            carried_over: tally(3, 2048),
+            dropped: Tally::default(),
+            left_out: std::collections::BTreeMap::new(),
+            journals: vec![PathBuf::from("/w/1-a.log"), PathBuf::from("/w/2-b.log")],
+            incomplete: vec![
+                incomplete("/w/1-a.log", "a target failed"),
+                incomplete("/w/2-b.log", "a recorder ended without its trailer"),
+            ],
+            top: Vec::new(),
+            dropped_addrs: Vec::new(),
+            scratch: ScratchReport {
+                carried_over: tally(1, 1024),
+                ..ScratchReport::default()
+            },
+            cleanup_errors: Vec::new(),
+        };
+        let lines = human_report(Path::new("/snap"), &report);
+        let tail: Vec<&str> = lines
+            .iter()
+            .map(String::as_str)
+            .skip_while(|l| !l.starts_with("journals:"))
+            .collect();
+        assert_eq!(
+            tail,
+            [
+                "journals: 2 consumed",
+                "incomplete: a target failed (/w/1-a.log)",
+                "incomplete: a recorder ended without its trailer (/w/2-b.log)",
+                "carried over: 3.0 KiB (3 revisions, 1 scratch slots)",
+            ],
+            "{lines:#?}"
+        );
     }
 }
