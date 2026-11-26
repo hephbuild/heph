@@ -135,6 +135,65 @@ fn machine_lines(out: &str) -> Vec<&str> {
 /// partial, failed and none (each reason); a figure with no sample is
 /// absent; quota and host labels; a live session's figures are the ones its
 /// seal would write.
+/// A live session's busy mean weights each sample by the interval it covers,
+/// as the seal does: a tick the sampler dropped (or a sample with no busy
+/// figure) adds no weight to the next one. Busy 1, 1, 0 after a dropped
+/// tick, none, then 1 is 3/4 on both sides, not the 2/3 that weighting by
+/// the gap between busy rows gives.
+#[tokio::test]
+async fn live_busy_mean_weights_like_the_seal() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().join("sessions");
+    let file = crate::tui::session::FileSource::new(&root);
+    let sources: [&dyn SessionSource; 1] = [&file];
+    let machine = || {
+        let mut after_drop = sample(4, 0, Some(GIB), MIB, &[]);
+        if let Some(SessionRecordKind::MachineSample(s)) = &mut after_drop.session {
+            s.dropped = 1;
+        }
+        // A tick whose CPU counters did not move: no busy figure.
+        let mut still = sample(5, 0, Some(GIB), MIB, &[]);
+        if let Some(SessionRecordKind::MachineSample(s)) = &mut still.session {
+            s.cpu_busy_ppm = None;
+        }
+        vec![
+            info(8, 8_000_000, &[]),
+            sample(1, 1_000_000, Some(GIB), MIB, &[]),
+            sample(2, 1_000_000, Some(GIB), MIB, &[]),
+            after_drop,
+            still,
+            sample(6, 1_000_000, Some(GIB), MIB, &[]),
+        ]
+    };
+    let sealed_id = SessionId::new(T0, 1);
+    let mut records = run(machine(), &[]);
+    ended_run(&mut records);
+    write_ended(
+        &root,
+        &meta(sealed_id, 1, &["heph", "run", "//a:b"]),
+        &records,
+        &ended(Some(0), T0 + 4_000),
+    );
+    let live_id = SessionId::new(T0, 2);
+    let _held = write_live(
+        &root,
+        &meta(live_id, 2, &["heph", "run", "//a:b"]),
+        &run(machine(), &[]),
+        None,
+    );
+    let (_, sealed) = show_both(&sources, sealed_id).await;
+    let (_, live) = show_both(&sources, live_id).await;
+    let mean = |m: &serde_json::Value| m["cpu_busy_mean"].as_f64().expect("a mean");
+    assert!(
+        (mean(&sealed) - 0.75).abs() < 1e-9,
+        "sealed, 3 busy seconds of 4: {sealed}"
+    );
+    assert!(
+        (mean(&live) - mean(&sealed)).abs() < 1e-9,
+        "live {live} vs sealed {sealed}"
+    );
+}
+
 #[tokio::test]
 async fn show_prints_machine_line() {
     let tmp = tempfile::tempdir().expect("tempdir");
