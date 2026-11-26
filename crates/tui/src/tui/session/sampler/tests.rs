@@ -809,7 +809,38 @@ fn a_dropped_sample_passes_its_failure_and_count_on() {
     let (out, readings) = std::sync::mpsc::sync_channel(2);
     let (_stop, stop_rx) = std::sync::mpsc::sync_channel(1);
     run(Fake::default(), &clock, &stop_rx, &out, TICK, || false);
-    // Info and tick 1 queued; ticks 2 and 3 dropped.
+    // Info and tick 1 queued; ticks 2 and 3 dropped. The stop finds the
+    // channel still full: nothing more.
     let queued: Vec<Reading> = readings.try_iter().collect();
     assert_eq!(queued.len(), 2);
+
+    // A stop delivers what a dropped sample carried, on one last sample,
+    // when the channel has room: here the info is read at the stop's wake.
+    let clock = FakeClock::new(Instant::now(), &[], Some(3));
+    let (out, readings) = std::sync::mpsc::sync_channel(3);
+    let (_stop, stop_rx) = std::sync::mpsc::sync_channel(1);
+    let mut checks = 0;
+    // Check 1 is at start; checks 2-4 at ticks 1-3 (tick 3 is dropped, and
+    // its memory read fails); check 5 at the stop.
+    run(
+        Fake::failing_memory_at(3),
+        &clock,
+        &stop_rx,
+        &out,
+        TICK,
+        || {
+            checks += 1;
+            if checks == 5 {
+                assert!(matches!(readings.try_recv(), Ok(Reading::Info { .. })));
+            }
+            false
+        },
+    );
+    drop(out);
+    let got = samples(&readings.into_iter().collect::<Vec<_>>());
+    assert_eq!(got.len(), 3, "ticks 1 and 2, and the stop's: {got:?}");
+    let last = got[2];
+    assert_eq!(last.dropped, 1);
+    assert!(last.failed.get(Source::MemoryUsed).is_some(), "{last:?}");
+    assert!(last.memory_used.is_none());
 }

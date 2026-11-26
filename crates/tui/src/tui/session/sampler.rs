@@ -17,6 +17,8 @@
 //!   once its `latched` check says the recorder stopped. [`Sampler::stop`]
 //!   waits on a done channel for at most [`STOP_WAIT`] and then detaches the
 //!   thread, never a bare join, so a source that blocks cannot hang the exit.
+//!   At a stop, a drop count or failure not yet delivered goes out on one
+//!   last sample if the channel has room.
 //! - **Sources.** Each is independent: one that fails is disabled for the rest
 //!   of the run and named once, in the next delivered sample. Nothing is
 //!   retried. Linux reads `/proc` and, under a cgroup v2 CPU quota, the quota
@@ -482,6 +484,11 @@ impl<S: Sources> Core<S> {
         self.dropped = 0;
     }
 
+    /// Whether a failure or a drop count waits for a sample to carry it.
+    pub(crate) fn undelivered(&self) -> bool {
+        self.dropped > 0 || !self.pending.is_empty()
+    }
+
     /// The last sample was dropped on a full channel: what it carried rides
     /// on the next one.
     pub(crate) fn missed(&mut self) {
@@ -562,7 +569,19 @@ pub(crate) fn run<S: Sources>(
         return;
     };
     loop {
-        if clock.wait_until(stop, next) == Wake::Stop || latched() {
+        let wake = clock.wait_until(stop, next);
+        if latched() {
+            return;
+        }
+        if wake == Wake::Stop {
+            // A failure or a drop count that rode on a dropped sample (or a
+            // failed baseline read) goes out on one last sample, taken now,
+            // if the channel has room: the recorder drains after the stop.
+            if core.undelivered() {
+                match out.try_send(Reading::Sample(core.sample(clock.now()))) {
+                    Ok(()) | Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {}
+                }
+            }
             return;
         }
         let now = clock.now();
