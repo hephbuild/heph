@@ -1,30 +1,49 @@
 //! Removing ended sessions.
 //!
-//! Runs only at session start, on the recorder thread (design amendment A7):
-//! the owner of a new session is the only writer of the sessions directory, and
-//! a viewer stays strictly read-only.
+//! Runs only at session start, on a thread of its own beside the recorder's
+//! (design amendment A7; its own so a slow seal never holds up the record
+//! loop, I1): the owner of a new session is the only writer of the sessions
+//! directory, and a viewer stays strictly read-only.
 //!
-//! The decision reads the lock and modification times, **never** `meta.json`:
-//! a newer heph may have changed `meta.json`, but the `lock` file name and its
-//! `flock` meaning are frozen for every format, so a session of a format this
-//! heph cannot read is still cleaned correctly — and one whose lock is held is
-//! a live session of unknown format, never removed.
+//! At most once an hour per sessions root (user decision 2026-11-24: it need
+//! not run inline). The root's [`STAMP`] file's modification time is when its
+//! last cleanup was claimed: a start whose stamp is younger than [`INTERVAL`]
+//! does one `stat` ([`due`]) and nothing else. Otherwise the cleanup thread
+//! [`claim`]s the run, which stamps it before any work, then cleans. An exit
+//! mid-cleanup leaves the rest to the first start an hour later; every step
+//! is idempotent. So a removal, and the sealing of a lost session, can lag by
+//! up to an hour.
+//!
+//! The decision reads the lock, modification times and a recording's 100-byte
+//! header, never its contents. The `lock` file name and its `flock` meaning are
+//! frozen for every format, so a session of a format this heph cannot read is
+//! still cleaned correctly, and one whose lock is held is a live session of
+//! unknown format, never counted and never removed.
 //!
 //! An ended session (lock free) is kept while it was last written less than
-//! [`Retention::max_age`] ago and is among the [`Retention::max_ended`] most
-//! recent ended sessions. Then the byte budget (design amendment A10): the
-//! sessions kept so far — every ended one, the newest included; never a live
-//! one — must total at most [`Retention::max_bytes`], and the oldest go until
-//! they do. A directory with no `lock` file written less than `max_age` ago is
-//! a session being created (`mkdir`, `meta.json`, then the lock): neither
-//! counted nor removed.
+//! [`Retention::max_age`] ago. Then the byte budget: the recordings kept so far,
+//! the newest included, must total at most [`Retention::max_bytes`], and the
+//! oldest go until they do. There is no count cap.
+//!
+//! A lost session (lock free, recording still in WAL mode, in a format this heph
+//! knows) is **sealed** with [`store::seal_lost`] under its lock taken
+//! exclusively before it is counted, so the byte budget counts the
+//! self-contained file. A recording this heph cannot seal (an unknown format,
+//! not a heph recording, killed before its schema was written, or a seal that
+//! failed) is never written: it is removed by age only, and left out of the
+//! byte budget.
+//!
+//! A directory whose `lock` file is younger than [`STARTING`], or that has no
+//! `lock` file and was written less than [`STARTING`] ago, may be a session
+//! still starting (`mkdir`, then the lock): neither counted nor removed.
 //!
 //! The lock state is read with a shared probe, released at once; a directory
-//! removed is then locked exclusively by this process, so two cleanups racing
-//! each other never both remove one session, and a session cannot start
-//! inside a directory being removed (ids are never reused). A stale tomb
-//! (see [`TOMB_PREFIX`]) is deleted with no lock, so two cleanups can both
-//! delete one; that is harmless, one of them finds it gone.
+//! sealed or removed is then locked exclusively by this process, so two
+//! cleanups racing each other never both seal or remove one session, and a
+//! session cannot start inside a directory being removed (ids are never
+//! reused). A stale tomb (see [`TOMB_PREFIX`]) or reader copy (see
+//! [`store::tmp_dir`]) is deleted with no lock, so two cleanups can both delete
+//! one; that is harmless, one of them finds it gone.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -32,21 +51,39 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use super::format::files;
 use super::id::SessionId;
 use super::lockfile;
+use super::store;
 
-/// How long and how many ended sessions are kept.
-#[derive(Debug, Clone, Copy)]
+/// How long, and how many bytes of, ended recordings are kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Retention {
     pub max_age: Duration,
-    pub max_ended: usize,
     pub max_bytes: u64,
 }
 
+impl Retention {
+    /// What `.hephconfig`'s `session.keep` and `session.keepBytes` set, each
+    /// defaulting to [`Retention::default`]'s.
+    pub fn from_config(keep: Option<Duration>, keep_bytes: Option<u64>) -> Self {
+        let default = Self::default();
+        Self {
+            max_age: keep.unwrap_or(default.max_age),
+            max_bytes: keep_bytes.unwrap_or(default.max_bytes),
+        }
+    }
+
+    /// What a private root's cleanup keeps: no ended session, whatever its age.
+    pub const PRIVATE: Self = Self {
+        max_age: Duration::ZERO,
+        max_bytes: 0,
+    };
+}
+
 impl Default for Retention {
+    /// 7 days, and the newest 2 GiB of recordings.
     fn default() -> Self {
         Self {
-            max_age: Duration::from_secs(10 * 60),
-            max_ended: 20,
-            max_bytes: 256 * 1024 * 1024,
+            max_age: Duration::from_secs(7 * 24 * 60 * 60),
+            max_bytes: 2 * 1024 * 1024 * 1024,
         }
     }
 }
@@ -55,28 +92,149 @@ impl Default for Retention {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct CleanupReport {
     pub removed: Vec<SessionId>,
+    /// Lost sessions sealed (whether or not retention then removed them).
+    pub sealed: Vec<SessionId>,
     /// Directories skipped because their lock is held (or another cleanup has
     /// it).
     pub live: usize,
     /// Stale tombs removed: see [`TOMB_PREFIX`].
     pub tombs: usize,
+    /// Stale reader copies removed from [`store::tmp_dir`].
+    pub tmp: usize,
 }
+
+/// How long a session may take to start: a directory with no `lock` file, or a
+/// free `lock` file, younger than this may be one whose owner has not taken its
+/// lock yet. Also how old a lost session's `lock` file must be before cleanup
+/// seals it.
+pub const STARTING: Duration = Duration::from_secs(60);
+
+/// How long a tomb or a reader copy is left alone: either may be in use right
+/// now (a removal in progress, a viewer reading its copy).
+pub const SCRATCH_GRACE: Duration = Duration::from_secs(10 * 60);
 
 /// The name prefix of a session directory being removed (`.removing-<id>-<pid>`):
 /// [`remove`] renames it there first, then deletes it. A tomb outlives that only
 /// when the delete failed or the process died in it, and nothing else ever
-/// reads one, so a tomb last written longer than [`Retention::max_age`] ago is
+/// reads one, so a tomb last written longer than [`SCRATCH_GRACE`] ago is
 /// removed outright. One a cleanup is removing right now may be removed by
 /// two at once, which costs a `debug!` and nothing else.
 const TOMB_PREFIX: &str = ".removing-";
 
+/// How often a sessions root is cleaned, at most.
+pub const INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// The file in a sessions root whose modification time is when its last
+/// cleanup was claimed. Not a session id, so nothing reads it as a session.
+pub const STAMP: &str = ".cleanup";
+
+/// Whether `root`'s cleanup is due: its stamp is missing, unreadable, or
+/// older than `interval`. One `stat`; the session start calls it, and starts
+/// the cleanup thread only when it says yes. [`claim`] decides for real.
+pub(crate) fn due(root: &Path, interval: Duration) -> bool {
+    match std::fs::metadata(root.join(STAMP)).and_then(|m| m.modified()) {
+        Ok(claimed) => expired(claimed, SystemTime::now(), interval),
+        Err(_) => true,
+    }
+}
+
+/// Claim `root`'s cleanup for this process: `Ok(true)` when it is due and
+/// this call stamped it, so this process runs it and nobody else does for
+/// `interval`.
+///
+/// Sound with any number of hephs starting at once, on Linux and macOS alike:
+/// - No stamp yet: `O_CREAT | O_EXCL` lets exactly one creator through, and
+///   the new file's mtime is the claim. Every other caller finds it fresh.
+/// - A stamp: the check and the touch happen under `flock(LOCK_EX |
+///   LOCK_NB)` on it, the discipline session locks already use. A caller that
+///   finds it locked is beside a claim in progress and goes; one that gets
+///   the lock after a claim sees the new mtime and goes too. `now` is read
+///   under the lock, so it is never older than a claim the lock ordered first.
+/// - The lock is held for the check and the touch only, never for the
+///   cleanup, and the kernel drops it with a crashed process: a claim cannot
+///   outlive its process. What a crash leaves is the stamp, which expires
+///   after `interval` like any other.
+///
+/// A stamp from more than `interval` in the future (the clock went back) is
+/// expired, so cleanup is not held off until the clock catches up. A missing
+/// `root` is `Err(NotFound)`: nothing to clean, and no root is created.
+pub(crate) fn claim(root: &Path, interval: Duration) -> std::io::Result<bool> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = root.join(STAMP);
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+    {
+        Ok(_) => return Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    let stamp = std::fs::OpenOptions::new().write(true).open(&path)?;
+    if !lockfile::try_lock_exclusive(&stamp)? {
+        return Ok(false);
+    }
+    let now = SystemTime::now();
+    if !expired(stamp.metadata()?.modified()?, now, interval) {
+        return Ok(false);
+    }
+    stamp.set_modified(now)?;
+    Ok(true)
+}
+
+/// Whether a cleanup claimed at `claimed` is `interval` or more before `now`
+/// (or more than `interval` after it: the clock went back).
+fn expired(claimed: SystemTime, now: SystemTime, interval: Duration) -> bool {
+    match now.duration_since(claimed) {
+        Ok(since) => since >= interval,
+        Err(ahead) => ahead.duration() > interval,
+    }
+}
+
 /// Remove the ended sessions `retention` does not keep, under `root`, as of
-/// `now`. Per-directory failures are skipped (a vanished directory is another
-/// cleanup's work); only an unreadable `root` is an error.
+/// `now`, sealing lost ones first. Per-directory failures are skipped (a
+/// vanished directory is another cleanup's work); only an unreadable `root` is
+/// an error.
 pub fn cleanup(
     root: &Path,
     now: SystemTime,
     retention: Retention,
+) -> std::io::Result<CleanupReport> {
+    cleanup_with(root, now, retention, &mut Removal::log)
+}
+
+/// One recording retention removed: which, how old, and which setting
+/// removed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Removal {
+    pub(crate) id: SessionId,
+    /// `human_duration` of its age.
+    pub(crate) age: String,
+    /// `keep`, `keep_bytes`, or `private`.
+    pub(crate) reason: &'static str,
+}
+
+impl Removal {
+    /// "Where did my session go?", answered at `debug`: cleanup runs during a
+    /// build, whose output it must not change (I1), and the default filter
+    /// shows (and records) `info`. `HEPH_LOG=debug` shows these lines.
+    fn log(&self) {
+        tracing::debug!(
+            id = %self.id,
+            age = self.age,
+            reason = self.reason,
+            "removed an ended session recording"
+        );
+    }
+}
+
+/// [`cleanup`], telling `removed` of each recording it removes.
+pub(crate) fn cleanup_with(
+    root: &Path,
+    now: SystemTime,
+    retention: Retention,
+    removed: &mut dyn FnMut(&Removal),
 ) -> std::io::Result<CleanupReport> {
     let mut sessions: Vec<(SessionId, PathBuf)> = Vec::new();
     let mut tombs: Vec<PathBuf> = Vec::new();
@@ -94,8 +252,7 @@ pub fn cleanup(
 
     let mut report = CleanupReport::default();
     for tomb in tombs {
-        let (last_write, _) = last_write_and_size(&tomb);
-        if now.duration_since(last_write).unwrap_or(Duration::ZERO) < retention.max_age {
+        if age(now, scan_dir(&tomb).map_or(UNIX_EPOCH, |s| s.latest)) < SCRATCH_GRACE {
             continue;
         }
         match std::fs::remove_dir_all(&tomb) {
@@ -105,17 +262,25 @@ pub fn cleanup(
             }
         }
     }
+    report.tmp = sweep_tmp(&store::tmp_dir(root), now);
 
-    // Classify, newest first, from the lock and metadata alone. Every directory
-    // is probed: the byte budget counts the newest ended sessions too, and only
-    // the probe tells an ended one from a live one.
+    // Classify, newest first, from the lock, the metadata and the header. Every
+    // directory is probed: only the probe tells an ended one from a live one.
     let mut ended: Vec<Ended> = Vec::new();
-    let mut kept = 0usize;
     for (id, dir) in sessions {
-        let lock_path = dir.join(files::LOCK);
-        let has_lock = lock_path.exists();
-        if has_lock {
-            match lockfile::is_held(&lock_path) {
+        // One pass over the directory: its last write, its size and its lock.
+        let scan = match scan_dir(&dir) {
+            Ok(scan) => scan,
+            // Removed since the listing: another cleanup's work.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                tracing::debug!(dir = %dir.display(), error = %e, "skipping session in cleanup");
+                continue;
+            }
+        };
+        let lock_written = scan.lock;
+        if lock_written.is_some() {
+            match lockfile::is_held(&dir.join(files::LOCK)) {
                 Ok(false) => {}
                 Ok(true) => {
                     report.live += 1;
@@ -127,41 +292,75 @@ pub fn cleanup(
                 }
             }
         }
-        let (last_write, bytes) = last_write_and_size(&dir);
-        let age = now.duration_since(last_write).unwrap_or(Duration::ZERO);
-        // No lock file yet and freshly written: a session being created right
-        // now. Older than that, it was killed before taking its lock: ended.
-        if !has_lock && age < retention.max_age {
+        // Possibly still starting: its owner may not hold the lock yet.
+        let starting = match lock_written {
+            Some(written) => age(now, written) < STARTING,
+            None => age(now, scan.latest) < STARTING,
+        };
+        if starting {
             continue;
         }
-        let keep = age < retention.max_age && kept < retention.max_ended;
-        kept += usize::from(keep);
+        let since = age(now, scan.latest);
+        let keep = since < retention.max_age;
+        // Sealing one that age removes anyway would be wasted work.
+        let sealed_before = report.sealed.len();
+        let budgeted = if keep && lock_written.is_some() {
+            seal_if_lost(&dir, id, &mut report)
+        } else {
+            false
+        };
+        let bytes = if !budgeted {
+            0
+        } else if report.sealed.len() > sealed_before {
+            // Sealed just now: measured again, with the WAL folded in.
+            scan_dir(&dir).map_or(0, |s| s.bytes)
+        } else {
+            scan.bytes
+        };
         ended.push(Ended {
             id,
             dir,
             bytes,
+            age: since,
             keep,
+            over_budget: false,
+            budgeted,
         });
     }
 
-    // The byte budget over every ended session still kept, oldest dropped first.
+    // The byte budget over every sealed recording still kept, oldest dropped
+    // first. A recording this heph cannot seal is left to age.
     let mut total: u64 = ended
         .iter()
-        .filter(|e| e.keep)
+        .filter(|e| e.keep && e.budgeted)
         .fold(0, |sum, e| sum.saturating_add(e.bytes));
     for e in ended.iter_mut().rev() {
         if total <= retention.max_bytes {
             break;
         }
-        if e.keep {
+        if e.keep && e.budgeted {
             e.keep = false;
+            e.over_budget = true;
             total = total.saturating_sub(e.bytes);
         }
     }
 
+    let private = retention == Retention::PRIVATE;
     for e in ended.iter().filter(|e| !e.keep) {
         if remove(root, e) {
             report.removed.push(e.id);
+            let reason = if private {
+                "private"
+            } else if e.over_budget {
+                "keep_bytes"
+            } else {
+                "keep"
+            };
+            removed(&Removal {
+                id: e.id,
+                age: hcore::units::human_duration(e.age),
+                reason,
+            });
         }
     }
     Ok(report)
@@ -173,7 +372,91 @@ struct Ended {
     id: SessionId,
     dir: PathBuf,
     bytes: u64,
+    /// Since its last write.
+    age: Duration,
     keep: bool,
+    /// Removed by the byte budget, not by age.
+    over_budget: bool,
+    /// A sealed recording in a format this heph knows: counted in the byte
+    /// budget. Anything else is removed by age only.
+    budgeted: bool,
+}
+
+/// Seal `dir`'s recording if it is lost (WAL mode, a known format), under its
+/// lock taken exclusively. `true` when the recording is sealed (now or
+/// already) in a format this heph knows, so the byte budget may count it.
+fn seal_if_lost(dir: &Path, id: SessionId, report: &mut CleanupReport) -> bool {
+    let path = dir.join(store::FILE);
+    let header = match store::read_header(&path) {
+        Ok(Some(h)) if h.is_known() => h,
+        // Missing, empty, not SQLite, not ours, or a newer format: never
+        // written, left to age.
+        Ok(_) => return false,
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::debug!(file = %path.display(), error = %e, "cannot read a recording's header");
+            }
+            return false;
+        }
+    };
+    if !header.wal {
+        return true;
+    }
+    let lock_path = dir.join(files::LOCK);
+    let held = match lock_exclusive(&lock_path) {
+        Ok(Some(held)) => held,
+        // A viewer copying it, or another cleanup sealing it: next time.
+        Ok(None) => return false,
+        Err(e) => {
+            tracing::debug!(dir = %dir.display(), error = %e, "cannot lock a lost session");
+            return false;
+        }
+    };
+    let sealed = match store::seal_lost(&path) {
+        Ok(store::Sealed::Done) => {
+            report.sealed.push(id);
+            true
+        }
+        Ok(store::Sealed::CutShort) => {
+            tracing::debug!(file = %path.display(), "sealing a lost session was cut short");
+            false
+        }
+        Err(e) => {
+            tracing::debug!(file = %path.display(), error = %format!("{e:#}"), "cannot seal a lost session");
+            false
+        }
+    };
+    drop(held);
+    sealed
+}
+
+/// Remove the files in `tmp` last written [`SCRATCH_GRACE`] or longer ago: a
+/// viewer's copy outlives it only when the viewer died. How many went.
+fn sweep_tmp(tmp: &Path, now: SystemTime) -> usize {
+    let Ok(entries) = std::fs::read_dir(tmp) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.filter_map(Result::ok) {
+        let Ok(meta) = entry.metadata() else { continue };
+        if age(now, meta.modified().unwrap_or(UNIX_EPOCH)) < SCRATCH_GRACE {
+            continue;
+        }
+        let path = entry.path();
+        let result = if meta.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        match result {
+            Ok(()) => removed += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::debug!(file = %path.display(), error = %e, "cannot remove a stale session copy");
+            }
+        }
+    }
+    removed
 }
 
 /// Remove one ended session under its own lock. `true` when this call removed
@@ -229,25 +512,49 @@ fn lock_exclusive(path: &Path) -> std::io::Result<Option<std::fs::File>> {
     Ok(None)
 }
 
-/// The latest modification time of `dir` and its files, and their total size.
-/// Reads metadata only — never a file's contents.
-fn last_write_and_size(dir: &Path) -> (SystemTime, u64) {
-    let mut latest = std::fs::metadata(dir)
-        .and_then(|m| m.modified())
-        .unwrap_or(UNIX_EPOCH);
+/// How long before `now` `written` was; zero for a time in the future.
+fn age(now: SystemTime, written: SystemTime) -> Duration {
+    now.duration_since(written).unwrap_or(Duration::ZERO)
+}
+
+/// What one pass over a session directory reads: metadata only, never a
+/// file's contents.
+#[derive(Debug)]
+struct DirScan {
+    /// The latest modification time of the directory and its files.
+    latest: SystemTime,
+    /// Their total size.
+    bytes: u64,
+    /// The `lock` file's modification time, if it has one.
+    lock: Option<SystemTime>,
+}
+
+/// Scan `dir` once. An error reading the directory, or the metadata of its
+/// `lock` file, is the caller's to skip it on; any other file's unreadable
+/// metadata is left out.
+fn scan_dir(dir: &Path) -> std::io::Result<DirScan> {
+    let mut latest = std::fs::metadata(dir)?.modified().unwrap_or(UNIX_EPOCH);
     let mut bytes = 0u64;
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for meta in entries
-            .filter_map(Result::ok)
-            .filter_map(|e| e.metadata().ok())
-        {
-            bytes = bytes.saturating_add(meta.len());
-            if let Ok(m) = meta.modified() {
-                latest = latest.max(m);
-            }
+    let mut lock = None;
+    for entry in std::fs::read_dir(dir)?.filter_map(Result::ok) {
+        let is_lock = entry.file_name() == files::LOCK;
+        let meta = match entry.metadata() {
+            Ok(meta) => meta,
+            Err(e) if is_lock => return Err(e),
+            Err(_) => continue,
+        };
+        let written = meta.modified().unwrap_or(UNIX_EPOCH);
+        if is_lock {
+            lock = Some(written);
         }
+        bytes = bytes.saturating_add(meta.len());
+        latest = latest.max(written);
     }
-    (latest, bytes)
+    Ok(DirScan {
+        latest,
+        bytes,
+        lock,
+    })
 }
 
 #[cfg(test)]
@@ -255,15 +562,28 @@ mod tests {
     use super::*;
 
     const MIN: Duration = Duration::from_secs(60);
+    const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 
-    /// A session directory started `started_ago` before `now`, with `bytes` of
-    /// events, its lock file present and free.
-    fn ended(
+    /// The 100-byte header of a sealed recording (rollback mode) in `format`,
+    /// padded to `bytes`: all cleanup reads of it.
+    fn sealed_header(format: u32, bytes: usize) -> Vec<u8> {
+        let mut b = vec![0u8; bytes.max(100)];
+        b[..16].copy_from_slice(b"SQLite format 3\0");
+        b[18] = 1;
+        b[19] = 1;
+        b[60..64].copy_from_slice(&format.to_be_bytes());
+        b[68..72].copy_from_slice(&store::APPLICATION_ID.to_be_bytes());
+        b
+    }
+
+    /// A session directory started `started_ago` before `now`, holding
+    /// `recording` as its `session.db`, its lock file present and free.
+    fn session_with(
         root: &Path,
         now: SystemTime,
         started_ago: Duration,
         rand: u8,
-        bytes: usize,
+        recording: &[u8],
     ) -> SessionId {
         let start = now.checked_sub(started_ago).expect("time");
         let ms = u64::try_from(start.duration_since(UNIX_EPOCH).expect("epoch").as_millis())
@@ -272,8 +592,29 @@ mod tests {
         let dir = root.join(id.encode());
         std::fs::create_dir(&dir).expect("mkdir");
         std::fs::write(dir.join(files::LOCK), b"").expect("lock");
-        std::fs::write(dir.join(files::EVENTS), vec![b'x'; bytes]).expect("events");
+        std::fs::write(dir.join(store::FILE), recording).expect("recording");
         id
+    }
+
+    /// An ended session with a sealed recording of `bytes`.
+    fn ended(
+        root: &Path,
+        now: SystemTime,
+        started_ago: Duration,
+        rand: u8,
+        bytes: usize,
+    ) -> SessionId {
+        session_with(
+            root,
+            now,
+            started_ago,
+            rand,
+            &sealed_header(store::FORMAT, bytes),
+        )
+    }
+
+    fn hold(root: &Path, id: SessionId) -> std::fs::File {
+        lockfile::acquire_owner_lock(&root.join(id.encode()).join(files::LOCK)).expect("hold")
     }
 
     fn remaining(root: &Path) -> Vec<String> {
@@ -285,50 +626,49 @@ mod tests {
         v
     }
 
+    fn sorted(mut v: Vec<SessionId>) -> Vec<SessionId> {
+        v.sort();
+        v
+    }
+
     /// I3: a session whose lock is held is never removed, however old.
     #[test]
     fn cleanup_skips_live_sessions() {
         let root = tempfile::tempdir().expect("tempdir");
         let now = SystemTime::now();
-        let live = ended(root.path(), now, Duration::ZERO, 1, 10);
-        let old = ended(root.path(), now, Duration::ZERO, 2, 10);
-        let lock = lockfile::acquire_owner_lock(&root.path().join(live.encode()).join(files::LOCK))
-            .expect("hold");
-        // An hour later, both are past their age; only the free one goes.
-        let report = cleanup(root.path(), now + 60 * MIN, Retention::default()).expect("cleanup");
+        let live = ended(root.path(), now, Duration::ZERO, 1, 100);
+        let old = ended(root.path(), now, Duration::ZERO, 2, 100);
+        let lock = hold(root.path(), live);
+        // Eight days later, both are past their age; only the free one goes.
+        let report = cleanup(root.path(), now + 8 * DAY, Retention::default()).expect("cleanup");
         assert_eq!(report.removed, vec![old]);
         assert_eq!(report.live, 1);
         assert_eq!(remaining(root.path()), vec![live.encode()]);
         drop(lock);
     }
 
-    /// Retention: ended sessions are kept 10 minutes, at most 20, and within the
-    /// byte budget counted from the newest.
+    /// Retention: ended recordings are kept 7 days, with no count cap.
     #[test]
-    fn cleanup_keeps_recent_ended() {
+    fn cleanup_keeps_seven_days_uncapped() {
         let root = tempfile::tempdir().expect("tempdir");
         let now = SystemTime::now();
-        let ids: Vec<SessionId> = (0..25u8)
-            .map(|i| ended(root.path(), now, Duration::ZERO, i, 1))
+        let ids: Vec<SessionId> = (0..40u8)
+            .map(|i| ended(root.path(), now, Duration::ZERO, i, 100))
             .collect();
-        // One minute on: none is old, but only the 20 newest stay. The probe
-        // skip must not keep the 5 oldest — they are outside the newest 20.
-        let report = cleanup(root.path(), now + MIN, Retention::default()).expect("cleanup");
-        let mut removed = report.removed.clone();
-        removed.sort();
-        assert_eq!(removed, ids.get(..5).expect("five").to_vec());
-        assert_eq!(remaining(root.path()).len(), 20);
+        // Six days on: none is old, and 40 is no reason to drop any.
+        let report = cleanup(root.path(), now + 6 * DAY, Retention::default()).expect("cleanup");
+        assert!(report.removed.is_empty(), "{report:?}");
+        assert_eq!(remaining(root.path()).len(), ids.len());
 
-        // Eleven minutes on: every one is past the age.
-        let report = cleanup(root.path(), now + 11 * MIN, Retention::default()).expect("cleanup");
-        assert_eq!(report.removed.len(), 20);
+        // Eight days on: every one is past the age.
+        let report = cleanup(root.path(), now + 8 * DAY, Retention::default()).expect("cleanup");
+        assert_eq!(sorted(report.removed), ids);
         assert!(remaining(root.path()).is_empty());
     }
 
-    /// A10: the byte budget counts every ended session — the newest, which age
-    /// and count keep, included — and never a live one; the oldest go until the
-    /// rest fit. All of these are recent and well inside the newest 20, so
-    /// only the budget removes anything.
+    /// The byte budget counts every ended recording kept — the newest
+    /// included — and never a live one; the oldest go until the rest fit.
+    /// All of these are recent, so only the budget removes anything.
     #[test]
     fn cleanup_total_byte_budget() {
         let root = tempfile::tempdir().expect("tempdir");
@@ -339,17 +679,14 @@ mod tests {
         let new = ended(root.path(), now, Duration::ZERO, 4, 300);
         // Live and far over the budget on its own: neither counted nor removed.
         let live = ended(root.path(), now, Duration::ZERO, 5, 5_000);
-        let lock = lockfile::acquire_owner_lock(&root.path().join(live.encode()).join(files::LOCK))
-            .expect("hold");
+        let lock = hold(root.path(), live);
         let retention = Retention {
             max_bytes: 700,
             ..Retention::default()
         };
-        let report = cleanup(root.path(), now, retention).expect("cleanup");
-        let mut removed = report.removed.clone();
-        removed.sort();
+        let report = cleanup(root.path(), now + 2 * MIN, retention).expect("cleanup");
         assert_eq!(
-            removed,
+            sorted(report.removed),
             vec![oldest, old],
             "oldest first, until 600 bytes fit"
         );
@@ -362,32 +699,245 @@ mod tests {
         drop(lock);
     }
 
-    /// A7: cleanup decides on the lock and mtimes alone. A `meta.json` that is
-    /// garbage (or from a format this heph cannot read) changes nothing, and a
-    /// held lock with garbage meta is a live session.
+    /// "Where did my session go?": each removal names the id, its age and
+    /// which setting removed it (logged at `debug`, `Removal::log`). Asserted
+    /// on the values handed to the logger, not on captured log text: a
+    /// scoped subscriber races tracing's process-wide callsite cache when
+    /// other tests log on other threads.
     #[test]
-    fn cleanup_never_parses_meta() {
+    fn removals_are_logged_with_their_reason() {
         let root = tempfile::tempdir().expect("tempdir");
         let now = SystemTime::now();
-        let live = ended(root.path(), now, Duration::ZERO, 1, 1);
-        let dead = ended(root.path(), now, Duration::ZERO, 2, 1);
-        for id in [live, dead] {
-            std::fs::write(
-                root.path().join(id.encode()).join(files::META),
-                b"{\"format\": 99, \"not\": json",
-            )
-            .expect("meta");
+        let old = ended(root.path(), now, 2 * MIN, 1, 100);
+        let new = ended(root.path(), now, MIN, 2, 100);
+        let retention = Retention {
+            max_bytes: 150,
+            ..Retention::default()
+        };
+        let mut removals = Vec::new();
+        let report = cleanup_with(root.path(), now + 2 * MIN, retention, &mut |r| {
+            removals.push(r.clone());
+        })
+        .expect("cleanup");
+        assert_eq!(report.removed, vec![old]);
+        // The age is measured from the recording's last write, not from
+        // `now`: pin the clock to that write. Its mtime comes from the
+        // kernel's coarse clock (Linux stamps inode times at tick
+        // granularity), which can read behind `SystemTime::now()`, so `now +
+        // 8 days` was sometimes exactly 8 days after the write ("8d00h") and
+        // sometimes a hair under ("7d23h").
+        let written = scan_dir(&root.path().join(new.encode()))
+            .expect("scan")
+            .latest;
+        let at = written + 8 * DAY - 30 * MIN;
+        let report = cleanup_with(root.path(), at, retention, &mut |r| {
+            removals.push(r.clone());
+        })
+        .expect("cleanup");
+        assert_eq!(report.removed, vec![new]);
+        let named: Vec<_> = removals.iter().map(|r| (r.id, r.reason)).collect();
+        assert_eq!(named, vec![(old, "keep_bytes"), (new, "keep")]);
+        assert_eq!(removals[1].age, "7d23h");
+
+        // A private root's removals say so.
+        let private = tempfile::tempdir().expect("tempdir");
+        let gone = ended(private.path(), now, MIN, 3, 100);
+        let mut removals = Vec::new();
+        cleanup_with(
+            private.path(),
+            now + 2 * MIN,
+            Retention::PRIVATE,
+            &mut |r| {
+                removals.push(r.reason);
+            },
+        )
+        .expect("cleanup");
+        assert_eq!(removals, vec!["private"], "{gone}");
+    }
+
+    /// Cleanup never writes or budgets what it cannot seal: garbage, a
+    /// recording in a newer format, a file killed before its header was
+    /// written. Each is removed by age only, and a held lock over garbage is
+    /// a live session.
+    #[test]
+    fn cleanup_leaves_unknown_recordings_to_age() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let now = SystemTime::now();
+        let garbage: &[u8] = b"SQLite format 3\0 but not really";
+        let newer = sealed_header(store::FORMAT + 1, 4096);
+        let mut newer_wal = newer.clone();
+        newer_wal[18] = 2;
+        newer_wal[19] = 2;
+        let live = session_with(root.path(), now, Duration::ZERO, 1, garbage);
+        let unknown = [
+            session_with(root.path(), now, Duration::ZERO, 2, garbage),
+            session_with(root.path(), now, Duration::ZERO, 3, &newer),
+            session_with(root.path(), now, Duration::ZERO, 4, &newer_wal),
+            session_with(root.path(), now, Duration::ZERO, 5, b""),
+        ];
+        let lock = hold(root.path(), live);
+        let before: Vec<Vec<u8>> = unknown
+            .iter()
+            .map(|id| std::fs::read(root.path().join(id.encode()).join(store::FILE)).expect("read"))
+            .collect();
+
+        // A zero budget removes nothing it cannot count.
+        let retention = Retention {
+            max_bytes: 0,
+            ..Retention::default()
+        };
+        let report = cleanup(root.path(), now + 2 * MIN, retention).expect("cleanup");
+        assert!(report.removed.is_empty(), "{report:?}");
+        assert!(report.sealed.is_empty(), "{report:?}");
+        for (id, bytes) in unknown.iter().zip(&before) {
+            let after =
+                std::fs::read(root.path().join(id.encode()).join(store::FILE)).expect("read");
+            assert_eq!(&after, bytes, "{id} was written");
         }
-        let lock = lockfile::acquire_owner_lock(&root.path().join(live.encode()).join(files::LOCK))
-            .expect("hold");
-        let report = cleanup(root.path(), now + 60 * MIN, Retention::default()).expect("cleanup");
-        assert_eq!(report.removed, vec![dead]);
+
+        let report = cleanup(root.path(), now + 8 * DAY, retention).expect("cleanup");
+        assert_eq!(sorted(report.removed), sorted(unknown.to_vec()));
         assert_eq!(remaining(root.path()), vec![live.encode()]);
         drop(lock);
     }
 
-    /// A7: a directory killed before its lock existed is an ended session, and
-    /// names that are not ids are not ours to touch.
+    /// A lost session (lock free, WAL mode, known format) is sealed under its
+    /// lock before it is counted, but only once its lock file is older than a
+    /// minute: younger, it may be a session still starting, and is neither
+    /// sealed, counted nor removed.
+    #[test]
+    fn cleanup_seals_lost_sessions() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let now = SystemTime::now();
+        let id = SessionId::new(
+            u64::try_from(now.duration_since(UNIX_EPOCH).expect("epoch").as_millis()).expect("ms"),
+            1,
+        );
+        let dir = root.path().join(id.encode());
+        std::fs::create_dir(&dir).expect("mkdir");
+        std::fs::write(dir.join(files::LOCK), b"").expect("lock");
+        super::super::tests::unsealed_recording(&dir, id, &[]);
+        let path = dir.join(store::FILE);
+        assert!(
+            store::read_header(&path)
+                .expect("header")
+                .expect("sqlite")
+                .wal,
+            "a lost recording is in WAL mode"
+        );
+
+        let early = cleanup(
+            root.path(),
+            now + Duration::from_secs(30),
+            Retention::default(),
+        )
+        .expect("cleanup");
+        assert!(
+            early.sealed.is_empty() && early.removed.is_empty(),
+            "{early:?}"
+        );
+        assert!(
+            store::read_header(&path)
+                .expect("header")
+                .expect("sqlite")
+                .wal
+        );
+
+        let report = cleanup(root.path(), now + 2 * MIN, Retention::default()).expect("cleanup");
+        assert_eq!(report.sealed, vec![id]);
+        assert!(report.removed.is_empty(), "{report:?}");
+        let header = store::read_header(&path).expect("header").expect("sqlite");
+        assert!(!header.wal, "sealed: rollback mode");
+        assert!(!store::sibling(&path, "-wal").exists());
+        let conn = store::open_sealed(&path).expect("open sealed");
+        let sealed: bool = conn
+            .query_row("SELECT sealed FROM session", [], |r| r.get(0))
+            .expect("sealed");
+        assert!(sealed);
+    }
+
+    /// `session.keep: 0` keeps no ended recording: at the next session start
+    /// every ended one past the start grace goes, however young, while a live
+    /// one stays (one still starting stays too, as under
+    /// `private_retention_keeps_nothing_ended`, the same zero retention).
+    /// `keepBytes: 0` removes every sealed recording it can count, however
+    /// young (one it cannot count is left to age:
+    /// `cleanup_leaves_unknown_recordings_to_age`). Zero is a value, never
+    /// "unset" or "unlimited".
+    #[test]
+    fn zero_retention_keeps_no_ended_recording() {
+        let now = SystemTime::now();
+        for retention in [
+            Retention::from_config(Some(Duration::ZERO), None),
+            Retention::from_config(None, Some(0)),
+        ] {
+            let root = tempfile::tempdir().expect("tempdir");
+            let young = ended(root.path(), now, Duration::ZERO, 1, 100);
+            let live = ended(root.path(), now, Duration::ZERO, 2, 100);
+            let lock = hold(root.path(), live);
+            // Two minutes after its files were written: past the start grace,
+            // and far younger than any default.
+            let report = cleanup(root.path(), now + 2 * MIN, retention).expect("cleanup");
+            assert_eq!(report.removed, vec![young], "{retention:?}");
+            assert_eq!(remaining(root.path()), vec![live.encode()], "{retention:?}");
+            drop(lock);
+        }
+    }
+
+    /// `Retention::from_config` sets each field from its own key, and an
+    /// unset key keeps its own default.
+    #[test]
+    fn retention_from_config_fields() {
+        let default = Retention::default();
+        assert_eq!(Retention::from_config(None, None), default);
+        assert_eq!(
+            Retention::from_config(Some(DAY), Some(5)),
+            Retention {
+                max_age: DAY,
+                max_bytes: 5
+            }
+        );
+        assert_eq!(
+            Retention::from_config(Some(DAY), None),
+            Retention {
+                max_age: DAY,
+                ..default
+            }
+        );
+        assert_eq!(
+            Retention::from_config(None, Some(5)),
+            Retention {
+                max_bytes: 5,
+                ..default
+            }
+        );
+    }
+
+    /// The private root keeps no ended session, but leaves one that may still
+    /// be starting.
+    #[test]
+    fn private_retention_keeps_nothing_ended() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let now = SystemTime::now();
+        let ended_one = ended(root.path(), now, 2 * MIN, 1, 100);
+        let starting = SessionId::new(
+            u64::try_from(now.duration_since(UNIX_EPOCH).expect("epoch").as_millis()).expect("ms"),
+            2,
+        );
+        std::fs::create_dir(root.path().join(starting.encode())).expect("mkdir");
+        // The lock file of the first was written now: two minutes on, it is
+        // past the start grace; the lockless one was written now as well.
+        let report = cleanup(root.path(), now + 2 * MIN, Retention::PRIVATE).expect("cleanup");
+        assert_eq!(sorted(report.removed), sorted(vec![ended_one, starting]));
+        let root2 = tempfile::tempdir().expect("tempdir");
+        let young = ended(root2.path(), now, Duration::ZERO, 3, 100);
+        let report = cleanup(root2.path(), now, Retention::PRIVATE).expect("cleanup");
+        assert!(report.removed.is_empty(), "{report:?}");
+        assert_eq!(remaining(root2.path()), vec![young.encode()]);
+    }
+
+    /// A directory killed before its lock existed is an ended session,
+    /// removed by age, and names that are not ids are not ours to touch.
     #[test]
     fn cleanup_removes_lockless_and_ignores_foreign_names() {
         let root = tempfile::tempdir().expect("tempdir");
@@ -398,14 +948,17 @@ mod tests {
         // Freshly written: it may be a session being created right now.
         let report = cleanup(root.path(), now, Retention::default()).expect("cleanup");
         assert!(report.removed.is_empty(), "{report:?}");
+        // Past the start grace, but nothing to count: age decides.
         let report = cleanup(root.path(), now + 60 * MIN, Retention::default()).expect("cleanup");
+        assert!(report.removed.is_empty(), "{report:?}");
+        let report = cleanup(root.path(), now + 8 * DAY, Retention::default()).expect("cleanup");
         assert_eq!(report.removed, vec![id]);
         assert_eq!(remaining(root.path()), vec!["not-a-session".to_owned()]);
     }
 
     /// A tomb left by a removal that failed or died is removed once it is
-    /// older than retention, and kept before that (a cleanup may be removing
-    /// it right now).
+    /// older than ten minutes, and kept before that (a cleanup may be
+    /// removing it right now).
     #[test]
     fn cleanup_removes_stale_tombs() {
         let root = tempfile::tempdir().expect("tempdir");
@@ -414,15 +967,148 @@ mod tests {
             .path()
             .join(format!("{TOMB_PREFIX}{}-42", SessionId::new(1, 1)));
         std::fs::create_dir(&tomb).expect("mkdir");
-        std::fs::write(tomb.join(files::EVENTS), b"x").expect("events");
+        std::fs::write(tomb.join(store::FILE), b"x").expect("recording");
 
-        let report = cleanup(root.path(), now, Retention::default()).expect("cleanup");
+        let report = cleanup(root.path(), now + 9 * MIN, Retention::default()).expect("cleanup");
         assert_eq!(report.tombs, 0);
         assert!(tomb.exists(), "a fresh tomb is kept");
 
-        let report = cleanup(root.path(), now + 60 * MIN, Retention::default()).expect("cleanup");
+        let report = cleanup(root.path(), now + 11 * MIN, Retention::default()).expect("cleanup");
         assert_eq!(report.tombs, 1);
         assert!(remaining(root.path()).is_empty(), "the stale tomb is gone");
+    }
+
+    /// A reader's copy in `.tmp` older than ten minutes is swept: its viewer
+    /// died. A younger one may be open right now.
+    #[test]
+    fn cleanup_sweeps_stale_reader_copies() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let now = SystemTime::now();
+        let tmp = store::tmp_dir(root.path());
+        std::fs::create_dir(&tmp).expect("mkdir");
+        std::fs::write(tmp.join("copy.db"), b"x").expect("copy");
+        std::fs::write(tmp.join("copy.db-wal"), b"x").expect("copy");
+
+        let report = cleanup(root.path(), now + 9 * MIN, Retention::default()).expect("cleanup");
+        assert_eq!(report.tmp, 0);
+        let report = cleanup(root.path(), now + 11 * MIN, Retention::default()).expect("cleanup");
+        assert_eq!(report.tmp, 2);
+        assert_eq!(std::fs::read_dir(&tmp).expect("read").count(), 0);
+        assert_eq!(remaining(root.path()), vec![store::TMP_DIR.to_owned()]);
+    }
+
+    fn set_stamp(root: &Path, at: SystemTime) {
+        std::fs::File::options()
+            .write(true)
+            .open(root.join(STAMP))
+            .and_then(|f| f.set_modified(at))
+            .expect("set the stamp");
+    }
+
+    fn stamped(root: &Path) -> SystemTime {
+        std::fs::metadata(root.join(STAMP))
+            .and_then(|m| m.modified())
+            .expect("stamp")
+    }
+
+    /// The hourly gate: no stamp is due and the claim creates it; a fresh
+    /// stamp is neither due nor claimable and stays as it was; an expired one
+    /// (an hour old, or more than an hour in the future after the clock went
+    /// back) is due, and the claim moves it to now.
+    #[test]
+    fn the_stamp_gates_cleanup_hourly() {
+        let root = tempfile::tempdir().expect("tempdir");
+        assert!(due(root.path(), INTERVAL), "no stamp: due");
+        assert!(claim(root.path(), INTERVAL).expect("claim"), "first claim");
+        assert!(!due(root.path(), INTERVAL), "just claimed: fresh");
+        assert!(
+            !claim(root.path(), INTERVAL).expect("claim"),
+            "a fresh stamp is not claimed again"
+        );
+
+        let now = SystemTime::now();
+        let fresh = now - INTERVAL + MIN;
+        set_stamp(root.path(), fresh);
+        assert!(!due(root.path(), INTERVAL));
+        assert!(!claim(root.path(), INTERVAL).expect("claim"));
+        assert!(
+            stamped(root.path()) < now - MIN,
+            "a refused claim stamps nothing"
+        );
+
+        for expired_at in [now - (INTERVAL + MIN), now + INTERVAL + MIN] {
+            set_stamp(root.path(), expired_at);
+            assert!(due(root.path(), INTERVAL), "{expired_at:?}");
+            assert!(
+                claim(root.path(), INTERVAL).expect("claim"),
+                "{expired_at:?}"
+            );
+            let at = stamped(root.path());
+            assert!(
+                at > now - MIN && at < now + MIN,
+                "the claim stamps now: {at:?}"
+            );
+        }
+        // A little in the future (another clock's write) is fresh.
+        set_stamp(root.path(), now + MIN);
+        assert!(!claim(root.path(), INTERVAL).expect("claim"));
+
+        let missing = root.path().join("nobody");
+        assert_eq!(
+            claim(&missing, INTERVAL).expect_err("no root").kind(),
+            std::io::ErrorKind::NotFound,
+            "a missing root is never created"
+        );
+        assert!(!missing.exists());
+    }
+
+    /// Concurrent starts, with no stamp and with an expired one: exactly one
+    /// claims the run.
+    #[test]
+    fn concurrent_claims_run_one_cleanup() {
+        let root = tempfile::tempdir().expect("tempdir");
+        for round in 0..2 {
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+            let threads: Vec<_> = (0..8)
+                .map(|_| {
+                    let root = root.path().to_path_buf();
+                    let barrier = std::sync::Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        claim(&root, INTERVAL).expect("claim")
+                    })
+                })
+                .collect();
+            let won = threads
+                .into_iter()
+                .map(|t| t.join().expect("join"))
+                .filter(|claimed| *claimed)
+                .count();
+            assert_eq!(won, 1, "round {round}: one claim of {won}");
+            set_stamp(root.path(), SystemTime::now() - (INTERVAL + MIN));
+        }
+    }
+
+    /// A claim in progress (its lock held) turns other claims away; a process
+    /// that died after claiming leaves only the stamp, whose lock the kernel
+    /// released, and the first start after the interval claims again.
+    #[test]
+    fn a_stale_claim_expires() {
+        let root = tempfile::tempdir().expect("tempdir");
+        assert!(claim(root.path(), INTERVAL).expect("claim"));
+        set_stamp(root.path(), SystemTime::now() - (INTERVAL + MIN));
+        let in_progress = std::fs::File::open(root.path().join(STAMP)).expect("open");
+        assert!(lockfile::try_lock_exclusive(&in_progress).expect("lock"));
+        assert!(
+            !claim(root.path(), INTERVAL).expect("claim"),
+            "a claim in progress turns this one away"
+        );
+        // The claimer died: its lock goes with it, its stamp stays.
+        drop(in_progress);
+        assert!(
+            claim(root.path(), INTERVAL).expect("claim"),
+            "the expired stamp of a dead claimer is claimed"
+        );
     }
 
     /// Two sessions starting at once both clean: neither errors, each dead
@@ -432,26 +1118,27 @@ mod tests {
         let root = tempfile::tempdir().expect("tempdir");
         let now = SystemTime::now();
         let ids: Vec<SessionId> = (0..40u8)
-            .map(|i| ended(root.path(), now, Duration::ZERO, i, 1))
+            .map(|i| ended(root.path(), now, Duration::ZERO, i, 100))
             .collect();
         let live = ids.last().copied().expect("one");
-        let lock = lockfile::acquire_owner_lock(&root.path().join(live.encode()).join(files::LOCK))
-            .expect("hold");
-        let later = now + 60 * MIN;
+        let lock = hold(root.path(), live);
+        let later = now + 8 * DAY;
         let threads: Vec<_> = (0..4)
             .map(|_| {
                 let root = root.path().to_path_buf();
                 std::thread::spawn(move || cleanup(&root, later, Retention::default()))
             })
             .collect();
-        let mut removed: Vec<SessionId> = threads
+        let removed: Vec<SessionId> = threads
             .into_iter()
             .flat_map(|t| t.join().expect("join").expect("cleanup").removed)
             .collect();
-        removed.sort();
-        let mut expected: Vec<SessionId> = ids.iter().copied().filter(|i| *i != live).collect();
-        expected.sort();
-        assert_eq!(removed, expected, "each dead session removed once");
+        let expected: Vec<SessionId> = ids.iter().copied().filter(|i| *i != live).collect();
+        assert_eq!(
+            sorted(removed),
+            sorted(expected),
+            "each dead session removed once"
+        );
         assert_eq!(remaining(root.path()), vec![live.encode()]);
         drop(lock);
     }

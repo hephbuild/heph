@@ -467,6 +467,18 @@ fn engine_config(
     Ok((file, config))
 }
 
+/// The session retention the config file's `session:` sets, `None` when it
+/// has none (the default stays). An invalid value is warned about and that
+/// field keeps its default.
+fn session_retention(
+    file: &config_yaml::ConfigYaml,
+) -> Option<crate::tui::session::cleanup::Retention> {
+    let (keep, keep_bytes) = file.session.as_ref()?.retention();
+    Some(crate::tui::session::cleanup::Retention::from_config(
+        keep, keep_bytes,
+    ))
+}
+
 fn new_engine_with(
     global: &super::GlobalOptions,
     bad_env: BadEnv,
@@ -496,6 +508,9 @@ fn new_engine_at(
     let cwd = engine::get_cwd().context("resolving the working directory")?;
     if let Some(session) = session {
         session.set_workspace(&cwd, root, &config.home_dir);
+        if let Some(retention) = session_retention(&file) {
+            session.set_retention(retention);
+        }
     }
 
     // Captured before `config` is moved into the engine: the nix driver's state
@@ -850,6 +865,81 @@ mod tests {
             ..Default::default()
         };
         assert!(config(&keep).keep_failed_sandboxes);
+    }
+
+    /// `.hephconfig`'s `session: {keep, keepBytes}` reaches the cleanup's
+    /// retention, each value in its own field: written to a workspace, read
+    /// through `engine_config` like every command, then `session_retention`.
+    /// An invalid field keeps its default and the other still applies; `0`
+    /// is zero (keep no ended recording), not "unset"; no `session:` key
+    /// leaves the default in place.
+    #[test]
+    fn session_retention_reaches_the_cleanup() {
+        use crate::tui::session::cleanup::Retention;
+        use std::time::Duration;
+        const DAY: u64 = 86_400;
+        let retention = |yaml: &str| {
+            let root = tempfile::tempdir().expect("tempdir");
+            std::fs::write(root.path().join(".hephconfig"), yaml).expect("write .hephconfig");
+            let (file, _) = engine_config(
+                root.path(),
+                &super::super::GlobalOptions::default(),
+                BadEnv::Refuse,
+                Vec::new(),
+            )
+            .expect("engine config");
+            session_retention(&file)
+        };
+        let default = Retention::default();
+        let cases = [
+            ("", None),
+            ("session: {}\n", Some(default)),
+            (
+                "session: {keep: 3d, keepBytes: 5M}\n",
+                Some(Retention {
+                    max_age: Duration::from_secs(3 * DAY),
+                    max_bytes: 5 * 1024 * 1024,
+                }),
+            ),
+            (
+                "session: {keep: 3d}\n",
+                Some(Retention {
+                    max_age: Duration::from_secs(3 * DAY),
+                    ..default
+                }),
+            ),
+            (
+                "session: {keepBytes: 5M}\n",
+                Some(Retention {
+                    max_bytes: 5 * 1024 * 1024,
+                    ..default
+                }),
+            ),
+            (
+                "session: {keep: 5x, keepBytes: 5M}\n",
+                Some(Retention {
+                    max_bytes: 5 * 1024 * 1024,
+                    ..default
+                }),
+            ),
+            (
+                "session: {keep: 0, keepBytes: 0}\n",
+                Some(Retention {
+                    max_age: Duration::ZERO,
+                    max_bytes: 0,
+                }),
+            ),
+            (
+                "session: {keep: 365d}\n",
+                Some(Retention {
+                    max_age: Duration::from_secs(90 * DAY),
+                    ..default
+                }),
+            ),
+        ];
+        for (yaml, want) in cases {
+            assert_eq!(retention(yaml), want, "{yaml:?}");
+        }
     }
 
     #[test]

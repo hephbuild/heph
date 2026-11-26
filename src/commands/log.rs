@@ -32,8 +32,7 @@ use crate::engine::{
     LogUnavailable, NoOutputYet, OpenLog,
 };
 use crate::htaddr::{self, Addr};
-use crate::tui::session::format::files;
-use crate::tui::session::{SessionId, SessionMeta, SessionRoot, SessionRunLogLocator, SessionSlot};
+use crate::tui::session::{SessionId, SessionRoot, SessionRunLogLocator, SessionSlot, store};
 
 #[derive(clap::Args, Clone, Debug)]
 pub struct Args {
@@ -491,12 +490,11 @@ impl<'a> Status<'a> {
 /// The longest command the status line repeats, in characters.
 const OWNER_COMMAND_MAX: usize = 80;
 
-/// `heph run //p:t, pid 4242`: the command and pid `session`'s `meta.json`
+/// `heph run //p:t, pid 4242`: the command and pid `session`'s session row
 /// records, `None` when it cannot be read.
 fn session_owner(root: &SessionRoot, session: &str) -> Option<String> {
     let id = SessionId::parse(session).ok()?;
-    let meta = std::fs::read(root.path().join(id.encode()).join(files::META)).ok()?;
-    let meta = SessionMeta::decode(&meta).ok()?;
+    let meta = store::read_meta_in(root.path(), &root.path().join(id.encode())).ok()?;
     let mut argv = meta.argv.iter();
     // The program as its name, not the path it was started by.
     let program = argv.next().map(|p| {

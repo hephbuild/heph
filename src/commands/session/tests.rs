@@ -14,6 +14,7 @@ use super::*;
 use crate::tui::session::format::{
     LockWaitEntry, RunningTarget, SessionEnd, SnapshotCounts, files,
 };
+use crate::tui::session::testing::{self, Recording};
 use crate::tui::session::{
     HeaderKind, SessionItem, SessionMeta, SessionRecord, SessionRecordKind, SessionSnapshot,
 };
@@ -26,6 +27,7 @@ fn opts() -> ViewOpts {
         now_ms: NOW,
         stall: Duration::from_secs(60),
         version: "v0.48.1",
+        retention: crate::tui::session::cleanup::Retention::default(),
     }
 }
 
@@ -1127,6 +1129,17 @@ async fn ids_resolve_prefix_suffix_pid() {
         .await
         .expect_err("an ended session's pid is not an id");
     assert!(format!("{err:#}").contains("no session 5151"), "{err:#}");
+    // A well-formed id that is gone: retention is the likely reason, named.
+    let gone = SessionId::new(T0 - 30 * 86_400_000, 9).encode();
+    let err = resolve_id(gone.clone()).await.expect_err("gone");
+    assert_eq!(
+        format!("{err:#}"),
+        format!(
+            "no session {gone} (`heph session list --all` lists them): an ended recording is \
+             removed once it is older than 7d00h (`session.keep`), or sooner when all of them \
+             together pass 2.0 GiB (`session.keepBytes`); see docs/SESSIONS.md#retention"
+        )
+    );
     let err = resolve_id("zz-not!".to_owned())
         .await
         .expect_err("not an id");
@@ -1556,8 +1569,7 @@ async fn attach_reads_a_pending_notice_from_the_run_home() {
                 standing: None,
             },
         )];
-        let dir = write_session(sessions.path(), &m, &records, None);
-        let _live = hold_lock(&dir);
+        let _live = write_live(sessions.path(), &m, &records, None);
 
         let source = FileSource::new(sessions.path());
         let (_detach_tx, detach_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1836,35 +1848,42 @@ async fn shown_text_never_carries_control_bytes() {
 
 // ---- Against the real files ----
 
-/// Write a session directory as a recorder would, without one.
-fn write_session(
+/// A live session as its owner holds it, without a recorder: the recording
+/// open and the lock taken, for as long as this lives.
+struct Live {
+    _recording: Recording,
+    _lock: std::fs::File,
+}
+
+/// Write a live session's directory under `root`.
+fn write_live(
     root: &Path,
     meta: &SessionMeta,
     records: &[SessionRecord],
     status: Option<&SessionSnapshot>,
-) -> PathBuf {
+) -> Live {
     let dir = root.join(meta.id.encode());
-    std::fs::create_dir_all(&dir).expect("mkdir");
-    std::fs::write(
-        dir.join(files::META),
-        serde_json::to_vec(meta).expect("meta"),
-    )
-    .expect("meta");
-    std::fs::write(dir.join(files::LOCK), b"").expect("lock");
-    let mut events = Vec::new();
-    for r in records {
-        serde_json::to_writer(&mut events, r).expect("record");
-        events.push(b'\n');
+    let recording = Recording::create(&dir, meta, records, status).expect("recording");
+    let lock = hold_lock(&dir);
+    Live {
+        _recording: recording,
+        _lock: lock,
     }
-    std::fs::write(dir.join(files::EVENTS), events).expect("events");
-    if let Some(s) = status {
-        std::fs::write(
-            dir.join(files::STATUS),
-            serde_json::to_vec(s).expect("status"),
-        )
-        .expect("status");
-    }
-    dir
+}
+
+/// Write an ended session's directory under `root`, sealed with `status`'s
+/// end, as its owner leaves it.
+fn write_ended(
+    root: &Path,
+    meta: &SessionMeta,
+    records: &[SessionRecord],
+    status: &SessionSnapshot,
+) -> PathBuf {
+    let end = status.end.as_ref().expect("an ended status");
+    Recording::create(&root.join(meta.id.encode()), meta, records, Some(status))
+        .expect("recording")
+        .seal(end.at_unix_ms, end.exit_code, end.panicked)
+        .expect("seal")
 }
 
 /// Hold `dir`'s lock as a live owner does.
@@ -1912,13 +1931,13 @@ async fn viewers_never_write() {
     let root = tmp.path().join("sessions");
     let done = SessionId::new(T0, 1);
     let live = SessionId::new(T0 + 3_000, 2);
-    write_session(
+    write_ended(
         &root,
         &meta(done, 1, &["heph", "run", "//a:b"]),
         &build_records("//a:b", T0, Some(0)),
-        Some(&ended(Some(0), T0 + 1_000)),
+        &ended(Some(0), T0 + 1_000),
     );
-    let live_dir = write_session(
+    let _live = write_live(
         &root,
         &meta(live, 2, &["heph", "run", "//c:d"]),
         &build_records("//c:d", T0 + 3_000, None),
@@ -1927,7 +1946,6 @@ async fn viewers_never_write() {
             ..SessionSnapshot::default()
         }),
     );
-    let _lock = hold_lock(&live_dir);
     chmod_tree(&root, 0o555, 0o444);
     let before = tree(&root);
 
@@ -1959,14 +1977,14 @@ async fn list_never_reads_events() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path().join("sessions");
     let id = SessionId::new(T0, 1);
-    let dir = write_session(
+    let dir = write_ended(
         &root,
         &meta(id, 1, &["heph", "run", "//a:b"]),
         &build_records("//a:b", T0, Some(0)),
-        Some(&ended(Some(0), T0 + 1_000)),
+        &ended(Some(0), T0 + 1_000),
     );
-    let events = dir.join(files::EVENTS);
-    std::fs::set_permissions(&events, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+    // No records table: list reads the session and status rows only.
+    testing::alter(&dir, "ALTER TABLE records RENAME TO gone").expect("hide the records");
     let file = crate::tui::session::FileSource::new(&root);
     let sources: [&dyn SessionSource; 1] = [&file];
     let table = run_list(&sources, Workspace::All, false).await;
@@ -1976,14 +1994,10 @@ async fn list_never_reads_events() {
     );
     let json = run_list(&sources, Workspace::All, true).await;
     assert!(json.contains(&id.encode()), "{json}");
-    // The log really is unreadable (unless the tests run as root), so show,
-    // which folds it, fails.
-    if std::fs::read(&events).is_err() {
-        run_show(&sources, &id.encode(), false)
-            .await
-            .expect_err("show reads the events");
-    }
-    std::fs::set_permissions(&events, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+    // Show, which folds the records, fails.
+    run_show(&sources, &id.encode(), false)
+        .await
+        .expect_err("show reads the records");
 }
 
 #[tokio::test]
@@ -2015,19 +2029,40 @@ async fn list_json_says_panicked() {
     assert_eq!(s["state"], "failed");
 }
 
+/// A status row this heph cannot read: `incomplete` is unknown (`null`), not
+/// "complete" (`false`).
+#[tokio::test]
+async fn list_json_incomplete_is_null_when_the_status_is_unreadable() {
+    let id = SessionId::new(T0, 1);
+    let source = FakeSource {
+        sessions: vec![(
+            SessionEntry {
+                status_unreadable: true,
+                ..entry(meta(id, 1, &["heph", "run"]), false, None)
+            },
+            Vec::new(),
+        )],
+    };
+    let sources: [&dyn SessionSource; 1] = [&source];
+    let json: serde_json::Value =
+        serde_json::from_str(&run_list(&sources, Workspace::All, true).await).expect("json");
+    let s = &json[0];
+    assert_eq!(s["state"], "unknown", "{s}");
+    assert_eq!(s["incomplete"], serde_json::Value::Null, "{s}");
+}
+
 #[tokio::test]
 async fn list_shows_newer_format_placeholder() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path().join("sessions");
     let id = SessionId::new(T0, 1);
-    let dir = root.join(id.encode());
-    std::fs::create_dir_all(&dir).expect("mkdir");
-    std::fs::write(
-        dir.join(files::META),
-        br#"{"format": 999, "whatever": true}"#,
-    )
-    .expect("meta");
-    std::fs::write(dir.join(files::LOCK), b"").expect("lock");
+    let dir = write_ended(
+        &root,
+        &meta(id, 1, &["heph", "run", "//a:b"]),
+        &build_records("//a:b", T0, Some(0)),
+        &ended(Some(0), T0 + 1_000),
+    );
+    testing::alter(&dir, "PRAGMA user_version=999").expect("a newer format");
 
     let file = crate::tui::session::FileSource::new(&root);
     let sources: [&dyn SessionSource; 1] = [&file];
@@ -2049,6 +2084,7 @@ async fn list_shows_newer_format_placeholder() {
     // Nothing more is read of it: no pid, no progress.
     assert_eq!(s["owner_pid"], serde_json::Value::Null);
     assert_eq!(s["progress"], serde_json::Value::Null);
+    assert_eq!(s["incomplete"], serde_json::Value::Null);
     assert_eq!(s["panicked"], false);
 
     let err = run_show(&sources, &id.encode(), false)
@@ -2127,4 +2163,409 @@ fn jq_failure_keeps_its_exit_code() {
     assert_eq!(output::exit_code(&e), Some(2));
     let e = wrap_exit(Err(anyhow::anyhow!("no such session"))).expect_err("an error");
     assert_eq!(exit_code(&e), Some(SessionExit::OWN_FAILURE));
+}
+
+/// D30: an ended session's `show` prints one line per bounded pool, and
+/// `--json` a `pools` entry each, from the session-wide `heph.session.pool.*`
+/// rows derived when it finished. A live session has none yet.
+#[tokio::test]
+async fn show_prints_pool_usage() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().join("sessions");
+    let pool = |at: u64, held: u64, waiting: u64| {
+        record(
+            at,
+            BuildEventKind::PoolUsage {
+                pool: "docker".into(),
+                held,
+                capacity: 4,
+                waiting,
+                removals_pending: 0,
+            },
+        )
+    };
+    let id = SessionId::new(T0, 1);
+    let mut records = build_records("//a:b", T0, None);
+    records.extend([pool(T0 + 1_000, 2, 1), pool(T0 + 2_000, 4, 0)]);
+    records.push(SessionRecord::session(
+        T0 + 3_000,
+        SessionRecordKind::End {
+            exit_code: Some(0),
+            panicked: false,
+        },
+    ));
+    write_ended(
+        &root,
+        &meta(id, 1, &["heph", "run", "//a:b"]),
+        &records,
+        &ended(Some(0), T0 + 3_000),
+    );
+    let live_id = SessionId::new(T0 + 10, 2);
+    let _live = write_live(
+        &root,
+        &meta(live_id, 2, &["heph", "run", "//a:c"]),
+        &[pool(T0 + 20, 1, 0)],
+        None,
+    );
+
+    let file = crate::tui::session::FileSource::new(&root);
+    let sources: [&dyn SessionSource; 1] = [&file];
+    let out = run_show(&sources, &id.encode(), false).await.expect("show");
+    let line = out
+        .lines()
+        .find(|l| l.starts_with("docker pool (capacity 4): held "))
+        .unwrap_or_else(|| panic!("no pool line: {out}"));
+    assert!(line.contains(" mean while in use ("), "{line}");
+    assert!(
+        line.ends_with(", 4 peak; something was waiting for 1s"),
+        "{line}"
+    );
+
+    let json: serde_json::Value = serde_json::from_str(
+        &run_show(&sources, &id.encode(), true)
+            .await
+            .expect("show --json"),
+    )
+    .expect("json");
+    let pools = json["pools"].as_array().expect("pools");
+    assert_eq!(pools.len(), 1, "{json}");
+    let p = &pools[0];
+    assert_eq!(p["pool"], "docker");
+    assert_eq!(p["unit"], "1");
+    assert_eq!(p["capacity"], 4.0);
+    assert_eq!(p["held_peak"], 4.0);
+    let mean = p["held_mean"].as_f64().expect("mean");
+    assert!(mean > 2.0 && mean < 4.0, "time-weighted: {p}");
+    assert_eq!(p["waiting_us"], 1_000_000, "one second with a waiter: {p}");
+
+    let live: serde_json::Value = serde_json::from_str(
+        &run_show(&sources, &live_id.encode(), true)
+            .await
+            .expect("show --json"),
+    )
+    .expect("json");
+    assert_eq!(live["pools"], serde_json::json!([]), "{live}");
+    let out = run_show(&sources, &live_id.encode(), false)
+        .await
+        .expect("show");
+    assert!(!out.contains(" pool "), "{out}");
+}
+
+/// A recording cut at its size cap says so: "incomplete" in the text, and
+/// `truncated` in `--json`.
+#[tokio::test]
+async fn show_says_incomplete_when_truncated() {
+    let id = SessionId::new(T0, 1);
+    let mut records = build_records("//a:b", T0, None);
+    records.push(SessionRecord::session(
+        T0 + 5_000,
+        SessionRecordKind::Truncated,
+    ));
+    let source = FakeSource {
+        sessions: vec![(
+            entry(
+                meta(id, 1, &["heph", "run", "//a:b"]),
+                true,
+                Some(SessionSnapshot {
+                    last_event_unix_ms: Some(NOW - 1_000),
+                    truncated: true,
+                    ..SessionSnapshot::default()
+                }),
+            ),
+            records,
+        )],
+    };
+    let sources: [&dyn SessionSource; 1] = [&source];
+    let out = run_show(&sources, &id.encode(), false).await.expect("show");
+    // The cap, how far into the run, and what was dropped.
+    assert!(
+        out.contains(
+            "\nincomplete: the recording passed its 256.0 MiB size cap 5s into the run: \
+             output and log lines were dropped from there"
+        ),
+        "{out}"
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&run_show(&sources, &id.encode(), true).await.expect("show"))
+            .expect("json");
+    assert_eq!(json["truncated"], true, "{json}");
+    assert_eq!(json["incomplete"], true, "{json}");
+    assert_eq!(json["incomplete_reason"], "size_cap", "{json}");
+    let listed = run_list(&sources, Workspace::All, true).await;
+    let listed: serde_json::Value = serde_json::from_str(&listed).expect("list json");
+    assert_eq!(listed[0]["incomplete"], true, "{listed}");
+    let table = run_list(&sources, Workspace::All, false).await;
+    assert!(table.contains("  incomplete"), "{table}");
+
+    // Cut twice: the ceiling too, with when it stopped.
+    let mut records = build_records("//a:b", T0, None);
+    records.push(SessionRecord::session(
+        T0 + 5_000,
+        SessionRecordKind::Truncated,
+    ));
+    records.push(SessionRecord::session(
+        T0 + 20_000,
+        SessionRecordKind::Truncated,
+    ));
+    let twice = FakeSource {
+        sessions: vec![(source.sessions[0].0.clone(), records)],
+    };
+    let sources: [&dyn SessionSource; 1] = [&twice];
+    let out = run_show(&sources, &id.encode(), false).await.expect("show");
+    assert!(
+        out.contains("it reached its 1.0 GiB ceiling 20s into the run and recorded nothing after"),
+        "{out}"
+    );
+
+    // Not cut: no such line.
+    let whole = FakeSource {
+        sessions: vec![(
+            entry(
+                meta(id, 1, &["heph", "run", "//a:b"]),
+                false,
+                Some(ended(Some(0), T0 + 1_000)),
+            ),
+            build_records("//a:b", T0, Some(0)),
+        )],
+    };
+    let sources: [&dyn SessionSource; 1] = [&whole];
+    let out = run_show(&sources, &id.encode(), false).await.expect("show");
+    assert!(!out.contains("incomplete"), "{out}");
+    let json: serde_json::Value =
+        serde_json::from_str(&run_show(&sources, &id.encode(), true).await.expect("show"))
+            .expect("json");
+    assert_eq!(json["incomplete"], false, "{json}");
+    assert_eq!(json["incomplete_reason"], serde_json::Value::Null, "{json}");
+    let listed = run_list(&sources, Workspace::All, true).await;
+    let listed: serde_json::Value = serde_json::from_str(&listed).expect("list json");
+    assert_eq!(listed[0]["incomplete"], false, "{listed}");
+}
+
+/// A record that does not decode is skipped, counted in the text and in
+/// `--json`'s `skipped`; the rest still folds.
+#[tokio::test]
+async fn show_reports_skipped_records() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().join("sessions");
+    let id = SessionId::new(T0, 1);
+    let dir = write_ended(
+        &root,
+        &meta(id, 1, &["heph", "run", "//a:b"]),
+        &build_records("//a:b", T0, Some(0)),
+        &ended(Some(0), T0 + 1_000),
+    );
+    testing::alter(
+        &dir,
+        "UPDATE records SET body = 'not json' WHERE seq = (SELECT min(seq) FROM records)",
+    )
+    .expect("damage one record");
+
+    let file = crate::tui::session::FileSource::new(&root);
+    let sources: [&dyn SessionSource; 1] = [&file];
+    let out = run_show(&sources, &id.encode(), false).await.expect("show");
+    assert!(
+        out.contains(
+            "\n1 record could not be read and was skipped, so the progress below leaves it out: \
+             damaged, or written in a shape this heph does not know (a newer heph may read it)\n"
+        ),
+        "{out}"
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&run_show(&sources, &id.encode(), true).await.expect("show"))
+            .expect("json");
+    assert_eq!(json["skipped"], 1, "{json}");
+    assert_eq!(json["pools"], serde_json::json!([]), "{json}");
+}
+
+/// The `.hephconfig` defaults a bad value's warning names are the ones the
+/// cleanup applies.
+/// A lost session sealed by cleanup carries `derivation` 0: no
+/// `heph.session` span and no session-wide rows (re-derivation on open does
+/// not exist yet). `list` and `show`, text and `--json`, still read it with
+/// no error and say `lost`. What comes from the session-wide rows is absent,
+/// not zero: `pools` is `[]` and `show` prints no pool line, although the
+/// recording holds `PoolUsage` records. The documented "Why is my session
+/// `lost`?" recipe runs on the sealed file and names the target that was
+/// still running.
+#[tokio::test]
+async fn a_lost_session_sealed_by_cleanup_still_reads() {
+    use crate::tui::session::cleanup::{self, Retention};
+    use crate::tui::session::store;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().join("sessions");
+    let now_ms = hcore::events::now_unix_ms();
+    let id = SessionId::new(now_ms - 5_000, 1);
+    let at = id.started_unix_ms();
+    let mut records = build_records("//a:done", at, None);
+    records.push(record(
+        at + 20,
+        BuildEventKind::ResultEnd {
+            left_behind: None,
+            cancelled: false,
+            addr: "//a:done".into(),
+            error: None,
+            upstream_of: None,
+            exit_status: None,
+            exit_code: None,
+            log_tail: None,
+            timed_out: None,
+            spans: Vec::new(),
+        },
+    ));
+    records.push(record(
+        at + 30,
+        BuildEventKind::ResultStart {
+            addr: "//a:running".into(),
+        },
+    ));
+    records.push(record(
+        at + 40,
+        BuildEventKind::PoolUsage {
+            pool: "docker".into(),
+            held: 1,
+            capacity: 4,
+            waiting: 0,
+            removals_pending: 0,
+        },
+    ));
+    let dir = Recording::create(
+        &root.join(id.encode()),
+        &meta(id, 1, &["heph", "run", "//a:..."]),
+        &records,
+        None,
+    )
+    .expect("recording")
+    .abandon();
+    // Past the start grace, so cleanup reads it as lost and seals it.
+    let later = std::time::SystemTime::now() + 2 * cleanup::STARTING;
+    let report = cleanup::cleanup(&root, later, Retention::default()).expect("cleanup");
+    assert_eq!(report.sealed, vec![id], "{report:?}");
+
+    let db = store::open_sealed(&dir.join(store::FILE)).expect("open sealed");
+    let (derivation, sealed, exit_code): (i64, i64, Option<i64>) = db
+        .query_row(
+            "SELECT derivation, sealed, exit_code FROM session",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .expect("session row");
+    assert_eq!((derivation, sealed, exit_code), (0, 1, None));
+    let session_wide: i64 = db
+        .query_row(
+            "SELECT (SELECT count(*) FROM spans WHERE name = 'heph.session')
+                  + (SELECT count(*) FROM metrics WHERE name LIKE 'heph.session.%')",
+            [],
+            |r| r.get(0),
+        )
+        .expect("count");
+    assert_eq!(session_wide, 0, "cleanup seals, it does not derive");
+
+    // The recipe, as documented.
+    let doc =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/SESSIONS.md"))
+            .expect("read docs/SESSIONS.md");
+    let recipe = doc
+        .split("**Why is my session `lost`?**")
+        .nth(1)
+        .and_then(|rest| rest.split("```sql\n").nth(1))
+        .and_then(|rest| rest.split("```").next())
+        .expect("the lost recipe's sql block");
+    let mut stmt = db.prepare(recipe).expect("the recipe compiles");
+    let running: Vec<(String, f64)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .expect("the recipe runs")
+        .collect::<Result<_, _>>()
+        .expect("rows");
+    assert_eq!(running, vec![("//a:running".to_owned(), 0.03)]);
+    drop(stmt);
+    drop(db);
+
+    let opts = || ViewOpts {
+        now_ms: hcore::events::now_unix_ms(),
+        ..opts()
+    };
+    let file = crate::tui::session::FileSource::new(&root);
+    let sources: [&dyn SessionSource; 1] = [&file];
+
+    let mut out = Vec::new();
+    list::list(
+        &sources,
+        opts(),
+        Workspace::All,
+        &json_args(false),
+        piped(&mut out),
+    )
+    .await
+    .expect("list");
+    let table = String::from_utf8(out).expect("utf-8");
+    let row = table
+        .lines()
+        .find(|l| l.contains(&id.encode()))
+        .unwrap_or_else(|| panic!("no row: {table}"));
+    assert!(row.contains("lost"), "{table}");
+
+    let mut out = Vec::new();
+    list::list(
+        &sources,
+        opts(),
+        Workspace::All,
+        &json_args(true),
+        piped(&mut out),
+    )
+    .await
+    .expect("list --json");
+    let json: serde_json::Value = serde_json::from_slice(&out).expect("json");
+    let s = &json[0];
+    assert_eq!(s["id"], id.encode(), "{json}");
+    assert_eq!(s["state"], "lost", "{s}");
+    assert_eq!(s["exit_code"], serde_json::Value::Null, "{s}");
+
+    let mut out = Vec::new();
+    show::show(
+        &sources,
+        opts(),
+        &id.encode(),
+        &json_args(false),
+        piped(&mut out),
+    )
+    .await
+    .expect("show");
+    let text = String::from_utf8(out).expect("utf-8");
+    assert!(
+        text.contains("the process went away without recording its end"),
+        "{text}"
+    );
+    assert!(
+        !text.contains(" pool "),
+        "no pool line without the rows: {text}"
+    );
+
+    let mut out = Vec::new();
+    show::show(
+        &sources,
+        opts(),
+        &id.encode(),
+        &json_args(true),
+        piped(&mut out),
+    )
+    .await
+    .expect("show --json");
+    let json: serde_json::Value = serde_json::from_slice(&out).expect("json");
+    assert_eq!(json["state"], "lost", "{json}");
+    assert_eq!(json["pools"], serde_json::json!([]), "{json}");
+    assert_eq!(json["incomplete"], false, "{json}");
+}
+
+#[test]
+fn retention_defaults_agree() {
+    use crate::engine::config_yaml::SessionConfig;
+    use crate::tui::session::cleanup::Retention;
+    assert_eq!(
+        Retention::default(),
+        Retention {
+            max_age: SessionConfig::KEEP_DEFAULT,
+            max_bytes: SessionConfig::KEEP_BYTES_DEFAULT,
+        }
+    );
 }

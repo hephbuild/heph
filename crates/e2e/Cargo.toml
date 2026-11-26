@@ -11,6 +11,8 @@ workspace = true
 heph = { path = "../.." }
 # `heph::engine::fault_provider`; unifies into the `engine` `heph` links.
 hengine = { package = "engine", path = "../engine", features = ["test-support"] }
+# `heph::tui::session::testing`; unifies into the `tui` `heph` links.
+htui = { package = "tui", path = "../tui", features = ["test-support"] }
 htestkit = { package = "testkit", path = "../testkit" }
 hplugin-oci = { package = "plugin-oci", path = "../plugin-oci" }
 # `heph.gh.release_asset` + `gh.asset_url`, behind the function ABI.

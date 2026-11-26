@@ -3,14 +3,17 @@
 //!
 //! This module is the recording side and the shared on-disk types:
 //!
-//! - [`format`]: `meta.json`, the `events.ndjson` record envelope, the
-//!   `status.json` [`SessionSnapshot`], and their versions.
+//! - [`format`]: the [`SessionMeta`], the [`SessionRecord`] envelope, the
+//!   [`SessionSnapshot`] status, and their versions.
+//! - [`store`]: `session.db`, the one SQLite file a session records into —
+//!   its schema, the owner's writer, the seal, and the
+//!   [`RecordCursor`](store::RecordCursor) readers use.
+//! - [`derive`]: the explorer rows derived from the records.
 //! - [`id`]: [`SessionId`], 10 Crockford base32 characters sorting by start.
 //! - [`recorder`]: the recorder thread, its [`SessionTap`], and the
 //!   [`TappedReceiver`] both backends consume.
-//! - [`reader`]: [`RecordReader`], reading `events.ndjson` back (torn lines
-//!   wait, bad lines are skipped and counted).
-//! - [`cleanup`]: removing ended sessions, at session start only.
+//! - [`cleanup`]: removing ended sessions, at session start only, at most
+//!   hourly per root.
 //! - [`run_logs`]: finding a running target's live log through the sessions
 //!   that recorded it ([`find_run_log`]).
 //! - [`SessionSlot`]: the process's one session. `main` builds it and hands it
@@ -29,18 +32,23 @@
 //! into targets.
 
 pub mod cleanup;
+pub mod derive;
 pub mod feed;
 pub mod format;
 pub mod holder;
 pub mod id;
 pub mod lockfile;
-pub mod reader;
 pub mod recorder;
 pub mod run_logs;
 pub mod source;
+pub mod store;
+#[cfg(any(test, feature = "test-support"))]
+pub mod testing;
 
 #[cfg(test)]
 mod replay_tests;
+#[cfg(test)]
+mod store_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -48,9 +56,9 @@ mod view_tests;
 
 use anyhow::Context as _;
 use std::ffi::OsStr;
-use std::fs::{DirBuilder, OpenOptions, Permissions};
+use std::fs::{DirBuilder, Permissions};
 use std::io;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
@@ -62,7 +70,6 @@ pub use format::{
 };
 pub use holder::{HolderNames, holder_session};
 pub use id::SessionId;
-pub use reader::RecordReader;
 pub use recorder::{FlushFailed, Recorder, SessionTap, StopNotice, TappedReceiver};
 pub use run_logs::{
     FeedRunLogLocator, FoundRunLog, RunLogLookup, SessionRunLog, SessionRunLogLocator,
@@ -157,16 +164,6 @@ impl SessionRoot {
     }
 }
 
-/// What a private root's cleanup keeps: no ended session, whatever its age.
-/// A directory still being created (no lock yet, young) is left alone.
-fn private_retention() -> Retention {
-    Retention {
-        max_ended: 0,
-        max_bytes: 0,
-        ..Retention::default()
-    }
-}
-
 fn switched_on(v: Option<&OsStr>) -> bool {
     let Some(v) = v else { return false };
     let Some(s) = v.to_str() else { return true };
@@ -204,7 +201,7 @@ struct Cleanups {
     /// For the session's own root.
     retention: Retention,
     /// The private root beside a public one, swept of every ended session: a
-    /// killed `HEPH_NO_SESSION` run's directory goes at the next start.
+    /// killed `HEPH_NO_SESSION` run's directory goes at the next cleanup.
     private_root: Option<PathBuf>,
 }
 
@@ -240,7 +237,7 @@ impl Session {
             })?;
         let cleanups = Cleanups {
             retention: if root.is_private() {
-                private_retention()
+                Retention::PRIVATE
             } else {
                 retention
             },
@@ -255,8 +252,8 @@ impl Session {
     }
 
     /// Fill a freshly created session directory: the lock first, so a viewer
-    /// never sees `meta.json` with a free lock and no `End` (a "lost" session)
-    /// for one being created.
+    /// never sees `session.db` with a free lock and no `End` (a "lost"
+    /// session) for one being created.
     fn populate(
         root: &SessionRoot,
         id: SessionId,
@@ -285,18 +282,15 @@ impl Session {
             interactive: start.interactive,
             capabilities: vec![CAPABILITY_INFLIGHT.to_owned()],
         };
-        recorder::write_atomically(&dir, files::META, &meta).context("writing meta.json")?;
-        let events = OpenOptions::new()
-            .create_new(true)
-            .append(true)
-            .mode(0o600)
-            .open(dir.join(files::EVENTS))
-            .context("creating events.ndjson")?;
+        let (conn, rw) =
+            store::create(&dir, &meta, &store::Provenance::detect(), faults.refuse_wal)
+                .context("creating the session's recording")?;
         let recorder = Recorder::spawn(RecorderStart {
-            dir: dir.clone(),
             root: root.path().to_path_buf(),
             lock,
-            events: Box::new(events),
+            conn,
+            rw,
+            session_id: id,
             retention: cleanups.retention,
             private_root: cleanups.private_root,
             faults,
@@ -385,6 +379,8 @@ struct SlotInner {
     cwd: Option<String>,
     workspace_root: Option<String>,
     home_dir: Option<String>,
+    /// What the session's cleanup keeps (`.hephconfig` `session:`).
+    retention: Retention,
     session: Option<std::sync::Arc<Session>>,
     /// Where other sessions are read from, to name a lock's holder. Set even
     /// when this process records nothing.
@@ -392,6 +388,8 @@ struct SlotInner {
     /// The open was attempted (successfully or not): a process opens at most
     /// one session, and warns at most once.
     attempted: bool,
+    /// Injected by a test ([`SessionSlot::set_faults`]); default otherwise.
+    faults: Faults,
 }
 
 /// The process's session (design amendment A2): built and configured by the
@@ -479,6 +477,26 @@ impl SessionSlot {
         });
     }
 
+    /// What the cleanup of a session opened after this keeps: the
+    /// workspace's `.hephconfig` `session.keep` and `session.keepBytes`.
+    /// Unset, [`Retention::default`]. A private session keeps nothing,
+    /// whatever this says.
+    pub fn set_retention(&self, retention: Retention) {
+        self.with(|s| s.retention = retention);
+    }
+
+    /// What [`Self::set_retention`] set, else [`Retention::default`]: what a
+    /// viewer names when a session it is asked for is gone.
+    pub fn retention(&self) -> Retention {
+        self.with(|s| s.retention)
+    }
+
+    /// The faults the session opened after this injects.
+    #[cfg(test)]
+    pub(crate) fn set_faults(&self, faults: Faults) {
+        self.with(|s| s.faults = faults);
+    }
+
     /// The session, opening it on the first call. `None` when recording is off,
     /// unavailable or failed to open (each said at most once).
     pub fn open(&self, header: SessionHeader, interactive: bool) -> Option<OpenedSession> {
@@ -510,10 +528,12 @@ impl SessionSlot {
                         workspace_root: s.workspace_root.clone(),
                         home_dir: s.home_dir.clone(),
                     },
+                    s.retention,
+                    s.faults.clone(),
                 )),
             }
         });
-        let (root, start) = match prepared {
+        let (root, start, retention, faults) = match prepared {
             Ok(prepared) => prepared,
             Err(Ok(already)) => return already,
             Err(Err(why)) => {
@@ -522,7 +542,7 @@ impl SessionSlot {
             }
         };
         // Opened outside the slot's lock: it does IO.
-        let session = match Session::open(&root, start) {
+        let session = match Session::open_with(&root, start, retention, faults) {
             Ok(s) => std::sync::Arc::new(s),
             Err(e) => {
                 // Once per run: the slot opens at most once.
@@ -587,14 +607,10 @@ impl SessionSlot {
         tap.log(seq, level, text.to_owned())
     }
 
-    /// The open session's tap and its `events.ndjson`, for a replay of the
-    /// sink's lines. `None` when no session is open.
+    /// The open session's tap and its directory, for a replay of the sink's
+    /// lines. `None` when no session is open.
     pub(crate) fn replay_source(&self) -> Option<(SessionTap, PathBuf)> {
-        self.with(|s| {
-            s.session
-                .as_ref()
-                .map(|x| (x.tap(), x.dir().join(files::EVENTS)))
-        })
+        self.with(|s| s.session.as_ref().map(|x| (x.tap(), x.dir().to_path_buf())))
     }
 
     /// Record text the process just wrote straight to its terminal (the
@@ -648,9 +664,9 @@ impl hcore::session_record::RunLogAnnouncer for SessionSlot {
     }
 }
 
-/// The most bytes of text one `Output` record keeps. A failure report is
-/// written past the event log's cap (it is what a viewer needs at the end),
-/// so without this a huge report would make the cap no bound at all.
+/// The most bytes of text one `Output` record keeps, so one failure report
+/// cannot take a large share of [`recorder::FULL_CAP`] on its own. Past that
+/// cap `Output` is dropped.
 pub(crate) const OUTPUT_CAP: usize = 1024 * 1024;
 
 /// `text` cut to its first [`OUTPUT_CAP`] bytes (at a character boundary),

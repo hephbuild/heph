@@ -53,6 +53,10 @@ pub struct ListRow {
     now: Option<String>,
     /// Every wait of a live session, each lock holder mapped to its session.
     blocked_on: Vec<BlockedOn>,
+    /// The recording is short of the run (it passed its size cap; `show
+    /// --json`'s `incomplete_reason` says more). `null` when this heph cannot
+    /// tell: a session in a newer format, or a status row it cannot read.
+    incomplete: Option<bool>,
     /// Set only for a session in a newer directory format, which this heph
     /// does not read further.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -162,6 +166,9 @@ fn json_row(e: &SessionEntry, every: &[&SessionEntry], opts: ViewOpts) -> ListRo
             progress: status.map(Progress::of),
             now,
             blocked_on,
+            // Unknown, not "complete", when the status row is there but this
+            // heph cannot read it.
+            incomplete: (!e.status_unreadable).then(|| status.is_some_and(|s| s.truncated)),
             format: None,
         },
         EntryMeta::TooNew { found, .. } => ListRow {
@@ -178,6 +185,7 @@ fn json_row(e: &SessionEntry, every: &[&SessionEntry], opts: ViewOpts) -> ListRo
             progress: None,
             now: None,
             blocked_on: Vec::new(),
+            incomplete: None,
             format: Some(*found),
         },
     }
@@ -277,6 +285,10 @@ fn row(e: &SessionEntry, every: &[&SessionEntry], opts: ViewOpts) -> [String; 7]
             if c.failed > 0 {
                 p.push_str(&format!("  {} fail", c.failed));
             }
+            // Past its size cap the recording is short of the run.
+            if s.truncated {
+                p.push_str("  incomplete");
+            }
             p
         },
     );
@@ -356,6 +368,7 @@ mod tests {
             progress: None,
             now: Some("//a:b (1s)".to_owned()),
             blocked_on: Vec::new(),
+            incomplete: Some(true),
             format: Some(2),
         })
     }

@@ -284,7 +284,7 @@ impl AttachApp {
         interactive: bool,
     ) -> Self {
         let (quit_tx, quit_rx) = mpsc::unbounded_channel();
-        let feed = SessionFeed::default();
+        let feed = SessionFeed::with_holders(holders.clone());
         let readers =
             interactive.then(|| Readers::for_session(global, &meta, meta.id, live, &feed));
         Self {

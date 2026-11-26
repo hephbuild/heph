@@ -668,10 +668,10 @@ fn debug_log_numbers(rows: &[String]) -> Vec<u64> {
 /// diagnostic, in turn, from a thread writing one every 40 ms from before
 /// `tab` until after `esc` — are printed on return, once each and in order,
 /// with none lost around either key. The backend drops them while the screen
-/// is up, so the only way back is the replay from `events.ndjson`. The same
+/// is up, so the only way back is the replay from `session.db`. The same
 /// with `HEPH_NO_SESSION=1`, whose session directory is private.
 ///
-/// Not covered here: `events.ndjson` past its cap (the binary has no knob
+/// Not covered here: `Log` records past the full cap (the binary has no knob
 /// for a small cap; `LogSink::replay` past the cap is a unit test).
 #[test]
 fn logs_while_dashboard_open_flush_in_order() {

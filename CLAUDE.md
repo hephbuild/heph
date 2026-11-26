@@ -351,12 +351,12 @@ idempotent.
 ### Sessions
 
 Every heph process running under `tui::run_app` records itself to
-`~/.heph/sessions/<id>/` (`meta.json`, a `lock` held while alive,
-`events.ndjson`, `status.json`), so another terminal can `heph session
+`~/.heph/sessions/<id>/` (a `lock` held while alive, and `session.db`, one
+SQLite recording sealed at exit), so another terminal can `heph session
 list|show|attach|inflight` it. `HEPH_NO_SESSION=1` makes the session
 private, not absent: it still records, into an unlisted
 `~/.heph/private-sessions/<id>/` no other terminal can find, removed when the
-run ends. `--raw` records nothing. The `crates/bin-e2e` `sessions` files test
+run ends (a killed run's within the hour). `--raw` records nothing. The `crates/bin-e2e` `sessions` files test
 it as a second terminal would.
 
 Read `docs/SESSIONS.md` before touching it. The one thing to know going in:

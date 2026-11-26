@@ -34,6 +34,7 @@ use serde::{Deserialize, Serialize};
 use super::GlobalOptions;
 use super::bootstrap;
 use crate::tui::LogSink;
+use crate::tui::session::cleanup::Retention;
 use crate::tui::session::{EntryMeta, FileSource, SessionEntry, SessionId, SessionSource};
 
 /// How long `heph session inflight` waits for the session to answer.
@@ -214,6 +215,7 @@ fn execute(
         now_ms: hcore::events::now_unix_ms(),
         stall: stall_threshold(global.stall_notice),
         version: hcore::version::current(),
+        retention: session.retention(),
     };
     let mut stdout = std::io::stdout().lock();
     let out = Out {
@@ -307,6 +309,8 @@ pub(crate) struct ViewOpts {
     pub stall: Duration,
     /// This heph's version, against which a session's recorder is "newer".
     pub version: &'static str,
+    /// The retention in force here, named when a session asked for is gone.
+    pub retention: Retention,
 }
 
 pub(crate) fn stall_threshold(stall_notice: Duration) -> Duration {
@@ -528,7 +532,10 @@ pub(crate) async fn resolve(
         .collect();
     match matches.as_slice() {
         [one] => Ok((*one).clone()),
-        [] => anyhow::bail!("no session {arg} (`heph session list --all` lists them)"),
+        [] => anyhow::bail!(
+            "no session {arg} (`heph session list --all` lists them): {}",
+            gone_hint(opts.retention)
+        ),
         _ => Err(ambiguous(arg, &matches, opts)),
     }
 }
@@ -740,6 +747,17 @@ pub(crate) fn recorded_by_newer(recorded: &str, viewer: &str) -> bool {
         (Some(r), Some(v)) => r > v,
         _ => false,
     }
+}
+
+/// Why a session id that once existed is not found: retention removed it.
+fn gone_hint(r: Retention) -> String {
+    format!(
+        "an ended recording is removed once it is older than {} (`session.keep`), or sooner \
+         when all of them together pass {} (`session.keepBytes`); see \
+         docs/SESSIONS.md#retention",
+        hcore::units::human_duration(r.max_age),
+        hcore::units::human_bytes(r.max_bytes),
+    )
 }
 
 /// A duration between two unix-ms instants, for a person.

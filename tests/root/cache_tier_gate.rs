@@ -12,9 +12,12 @@
 //! non-test source file outside the allowlist that names either event fails.
 //!
 //! Scoped to `src/` of each workspace member and of the root package, minus
-//! each file's `#[cfg(test)] mod`: a test feeding a tier event to prove a
-//! consumer *ignores* it is the point, not an offence. Cheap on purpose: a
-//! walk and some string work, no build.
+//! test code: each file's inline `#[cfg(test)] mod … { … }`, and every file
+//! an out-of-line `#[cfg(test)] mod name;` declares. A test feeding a tier
+//! event to prove a consumer *ignores* it is the point, not an offence. Cheap
+//! on purpose: a walk and some string work, no build.
+
+use std::path::{Path, PathBuf};
 
 use super::execrunner_gate::{repo_root, rust_files, workspace_members};
 
@@ -37,23 +40,98 @@ const ALLOWED: &[(&str, &str)] = &[
         "crates/telemetry/src/telemetry/collector.rs",
         "the deprecated tier counters, documented as tier events",
     ),
+    (
+        "crates/tui/src/tui/progress.rs",
+        "an explicit no-op match arm; never counts them",
+    ),
+    (
+        "crates/tui/src/tui/session/derive.rs",
+        "records each tier probe as its own span event (`heph.cache.local_miss` …), \
+         documented as a probe, not the outcome; the span's `heph.cache` attribute, \
+         from `CacheOutcome`, is the outcome. Records, counts nothing",
+    ),
+    (
+        "crates/tui/src/tui/session/recorder.rs",
+        "an exhaustive match deciding which kinds survive the recording cap; counts nothing",
+    ),
+    (
+        "crates/tui/src/tui/session/store.rs",
+        "maps each event kind to its wire tag for the recording; counts nothing",
+    ),
 ];
 
 /// The part of `text` before its test module — the first `#[cfg(test)]` that
-/// is directly followed by a top-level `mod`. A `#[cfg(test)]` on a single
-/// item (a const, a helper fn) does not end the production code.
+/// is directly followed by a top-level inline `mod name {`. A `#[cfg(test)]`
+/// on a single item (a const, a helper fn) does not end the production code,
+/// and neither does an out-of-line `mod name;`: the code after that
+/// declaration is still production code (the declared file is excluded by
+/// [`test_module_paths`] instead).
 fn non_test(text: &str) -> &str {
     let mut offset = 0;
     let mut lines = text.split_inclusive('\n').peekable();
     while let Some(line) = lines.next() {
         if line.trim_end() == "#[cfg(test)]"
-            && lines.peek().is_some_and(|next| next.starts_with("mod "))
+            && lines
+                .peek()
+                .is_some_and(|next| next.starts_with("mod ") && next.trim_end().ends_with('{'))
         {
             return text.get(..offset).unwrap_or(text);
         }
         offset += line.len();
     }
     text
+}
+
+/// The name an out-of-line module declaration declares: `mod name;`, with
+/// any `pub` / `pub(crate)` visibility in front. `None` for anything else,
+/// an inline `mod name {` included.
+fn out_of_line_mod(line: &str) -> Option<&str> {
+    let line = line.trim_end();
+    let rest = line
+        .strip_prefix("pub(crate) ")
+        .or_else(|| line.strip_prefix("pub(super) "))
+        .or_else(|| line.strip_prefix("pub "))
+        .unwrap_or(line);
+    let name = rest.strip_prefix("mod ")?.strip_suffix(';')?;
+    name.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        .then_some(name)
+}
+
+/// Where the test modules `file` declares out of line live: for each
+/// `#[cfg(test)]` directly followed by `mod name;`, the path `name.rs` or
+/// `name/mod.rs` is reached by, minus its extension. Such a file carries no
+/// `#[cfg(test)]` of its own — the attribute is on its declaration, in the
+/// parent — so [`non_test`] alone reads all of it as production code.
+fn test_module_paths(file: &Path, text: &str) -> Vec<PathBuf> {
+    let Some(dir) = file.parent() else {
+        return Vec::new();
+    };
+    // `mod.rs`, `lib.rs` and `main.rs` own their directory; `foo.rs` owns
+    // `foo/`.
+    let base = match file.file_stem().and_then(|s| s.to_str()) {
+        Some("mod" | "lib" | "main") | None => dir.to_path_buf(),
+        Some(stem) => dir.join(stem),
+    };
+    let mut out = Vec::new();
+    let mut lines = text.lines().peekable();
+    while let Some(line) = lines.next() {
+        if line.trim_end() != "#[cfg(test)]" {
+            continue;
+        }
+        if let Some(name) = lines.peek().and_then(|next| out_of_line_mod(next)) {
+            out.push(base.join(name));
+        }
+    }
+    out
+}
+
+/// Whether `file` is (inside) one of `test_mods`: `<m>.rs`, or anything
+/// under `<m>/`.
+fn is_test_module(file: &Path, test_mods: &[PathBuf]) -> bool {
+    test_mods
+        .iter()
+        .any(|m| file.with_extension("") == *m || file.starts_with(m))
 }
 
 /// `line` up to the `//` that starts a line comment, if any. A `//` inside a
@@ -91,7 +169,8 @@ fn tier_mentions(code: &str) -> impl Iterator<Item = usize> + '_ {
     })
 }
 
-/// Every non-test source file in the workspace, relative to the repo root.
+/// Every non-test source file in the workspace, relative to the repo root. A
+/// file an out-of-line `#[cfg(test)] mod` declares is test code and left out.
 fn source_files() -> Vec<(String, String)> {
     let root = repo_root();
     let manifest = std::fs::read_to_string(root.join("Cargo.toml")).expect("read root Cargo.toml");
@@ -103,16 +182,27 @@ fn source_files() -> Vec<(String, String)> {
     for member in &members {
         rust_files(&root.join(member).join("src"), &mut files);
     }
-    files
+    let files: Vec<(PathBuf, String)> = files
         .into_iter()
         .filter_map(|file| {
             let text = std::fs::read_to_string(&file).ok()?;
+            Some((file, text))
+        })
+        .collect();
+    let test_mods: Vec<PathBuf> = files
+        .iter()
+        .flat_map(|(file, text)| test_module_paths(file, text))
+        .collect();
+    files
+        .into_iter()
+        .filter(|(file, _)| !is_test_module(file, &test_mods))
+        .map(|(file, text)| {
             let rel = file
                 .strip_prefix(&root)
                 .unwrap_or(&file)
                 .display()
                 .to_string();
-            Some((rel, text))
+            (rel, text)
         })
         .collect()
 }
@@ -172,4 +262,43 @@ fn non_test_stops_at_the_test_module_only() {
     let text = "a\n#[cfg(test)]\nconst X: u8 = 1;\nb\n#[cfg(test)]\nmod tests {\nc\n}\n";
     assert_eq!(non_test(text), "a\n#[cfg(test)]\nconst X: u8 = 1;\nb\n");
     assert_eq!(non_test("no tests\n"), "no tests\n");
+}
+
+/// An out-of-line `#[cfg(test)] mod name;` near the top of a file declares
+/// a test file; the production code after it is still scanned. Stopping
+/// there once hid every line of `progress.rs` below its first such
+/// declaration.
+#[test]
+fn non_test_reads_past_an_out_of_line_test_module() {
+    let text = "a\n#[cfg(test)]\nmod approval_tests;\nb\n#[cfg(test)]\nmod tests {\nc\n}\n";
+    assert_eq!(non_test(text), "a\n#[cfg(test)]\nmod approval_tests;\nb\n");
+}
+
+/// The file an out-of-line test module lives in is test code, whichever
+/// layout reaches it; a sibling whose name merely starts the same is not.
+#[test]
+fn out_of_line_test_modules_are_test_files() {
+    let text = "mod derive;\n#[cfg(test)]\nmod store_tests;\n#[cfg(test)]\n\
+                pub(crate) mod test_events;\n#[cfg(test)]\nmod inline {\n}\n";
+    let in_mod = test_module_paths(Path::new("/c/src/session/mod.rs"), text);
+    assert_eq!(
+        in_mod,
+        vec![
+            PathBuf::from("/c/src/session/store_tests"),
+            PathBuf::from("/c/src/session/test_events"),
+        ]
+    );
+    let in_file = test_module_paths(Path::new("/c/src/progress.rs"), text);
+    assert_eq!(
+        in_file.first(),
+        Some(&PathBuf::from("/c/src/progress/store_tests"))
+    );
+
+    let test = |p: &str| is_test_module(Path::new(p), &in_mod);
+    assert!(test("/c/src/session/store_tests.rs"));
+    assert!(test("/c/src/session/store_tests/mod.rs"));
+    assert!(test("/c/src/session/test_events/more.rs"));
+    assert!(!test("/c/src/session/derive.rs"));
+    assert!(!test("/c/src/session/store_tests_extra.rs"));
+    assert!(!test("/c/src/session/store.rs"));
 }

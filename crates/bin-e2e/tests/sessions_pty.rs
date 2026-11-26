@@ -217,7 +217,7 @@ echo "after-end=$?="; read -r _
 }
 
 /// While a target holds the terminal the TUI is paused, and the run still
-/// records: the target's `ExecuteStart` reaches `events.ndjson` while it runs.
+/// records: the target's `ExecuteStart` reaches `session.db` while it runs.
 ///
 /// A lone target sends nothing between its pause and its resume, so this sees
 /// what was queued as the pause began; a run that builds while paused has no
@@ -231,9 +231,11 @@ fn records_while_paused() {
     // Printed by the target on the terminal: the TUI has stepped aside.
     pty.wait_for("hold-started", DEADLINE);
 
+    // The root's cleanup stamp (`.cleanup`) is not a session.
     let dirs: Vec<_> = std::fs::read_dir(sessions_dir(ws.home()))
         .expect("a sessions dir")
         .map(|e| e.expect("entry").path())
+        .filter(|p| p.file_name() != Some(std::ffi::OsStr::new(".cleanup")))
         .collect();
     let [dir] = dirs.as_slice() else {
         panic!("one session expected: {dirs:?}")

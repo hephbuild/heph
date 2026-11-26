@@ -9,7 +9,6 @@
 //! session for its in-flight report drops `inflight.request` in its directory.
 //! It never signals a process and never cleans anything up.
 
-use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -20,41 +19,46 @@ use futures::StreamExt as _;
 use futures::stream::BoxStream;
 
 use super::format::{
-    CAPABILITY_INFLIGHT, MetaError, SessionMeta, SessionRecord, SessionRecordKind, SessionSnapshot,
-    files,
+    CAPABILITY_INFLIGHT, SessionMeta, SessionRecord, SessionRecordKind, SessionSnapshot, files,
 };
 use super::id::SessionId;
 use super::lockfile;
-use super::reader::RecordReader;
+use super::store::{self, OpenError, RecordCursor};
 
 /// How often a follower looks for new records (and at the lock).
 pub const FOLLOW_TICK: Duration = Duration::from_millis(100);
 
-/// What a viewer can say about a session's `meta.json`.
+/// Records a follower reads before handing them on, so a slow consumer holds
+/// the follower back rather than a whole recording buffering in memory.
+const FOLLOW_BATCH: usize = 256;
+
+/// What a viewer can say about a session's recording.
 #[derive(Debug, Clone)]
 pub enum EntryMeta {
     Known(Box<SessionMeta>),
-    /// Written by a heph whose directory contract this one does not know: a
-    /// placeholder, never decoded further.
+    /// Recorded in a format this heph does not know: a placeholder, never
+    /// decoded further.
     TooNew {
         found: u32,
         supported: u32,
     },
 }
 
-/// One session as a source lists it. Never built from `events.ndjson`.
+/// One session as a source lists it: its session row and `status` row, never
+/// its records.
 #[derive(Debug, Clone)]
 pub struct SessionEntry {
     pub id: SessionId,
     pub meta: EntryMeta,
-    /// The owner held its lock when probed. The probe comes before any file is
+    /// The owner held its lock when probed. The probe comes before any row is
     /// read, so an `End` written before the lock was released is in what was.
     pub live: bool,
-    /// The latest snapshot (`status.json`), when there is one this heph reads.
+    /// The latest snapshot (the `status` row), when there is one this heph
+    /// reads.
     pub status: Option<SessionSnapshot>,
-    /// A `status.json` is there but this heph cannot read it (a newer
-    /// snapshot version, or a corrupt file). An ended session's state is then
-    /// unknown, not lost: its `End` may well be in the file.
+    /// A `status` row is there but this heph cannot read it (a newer
+    /// snapshot version, or a corrupt one). An ended session's state is then
+    /// unknown, not lost: its `End` may well be recorded.
     pub status_unreadable: bool,
 }
 
@@ -104,10 +108,17 @@ pub trait SessionSource: Send + Sync + std::fmt::Debug {
     /// [`CAPABILITY_INFLIGHT`] or is not live.
     async fn inflight(&self, id: SessionId, timeout: Duration) -> anyhow::Result<String>;
 
-    /// How a viewer of session `attached` names a lock holder's pid: from
-    /// the sessions this source lists, never naming `attached` itself (the
-    /// run's own view never named its own session). Nothing by default: the
-    /// notice falls back to the pid.
+    /// The session's per-pool summaries (D30), by pool name. Empty while it
+    /// runs, and from a source that keeps none.
+    async fn pools(&self, id: SessionId) -> anyhow::Result<Vec<store::PoolSummary>> {
+        let _ = id;
+        Ok(Vec::new())
+    }
+
+    /// How a viewer of session `attached` names a lock holder's pid. Empty:
+    /// the attached session's own `LockHolder` records fill it in as the
+    /// feed reads them (D6), so a viewer names a holder exactly as the run
+    /// did, and a pid with no record falls back to the pid.
     fn holder_names(&self, attached: SessionId) -> super::HolderNames {
         let _ = attached;
         super::HolderNames::default()
@@ -136,10 +147,6 @@ impl FileSource {
 
 #[async_trait]
 impl SessionSource for FileSource {
-    fn holder_names(&self, attached: SessionId) -> super::HolderNames {
-        super::HolderNames::new(Some(super::SessionRoot::new(&self.root)), Some(attached))
-    }
-
     async fn list(&self) -> anyhow::Result<Vec<SessionEntry>> {
         let root = self.root.clone();
         tokio::task::spawn_blocking(move || list_dir(&root))
@@ -148,8 +155,8 @@ impl SessionSource for FileSource {
     }
 
     async fn snapshot(&self, id: SessionId) -> anyhow::Result<Option<SessionEntry>> {
-        let dir = self.dir(id);
-        tokio::task::spawn_blocking(move || read_entry(&dir, id))
+        let root = self.root.clone();
+        tokio::task::spawn_blocking(move || read_entry(&root, id))
             .await
             .context("reading a session")?
     }
@@ -158,42 +165,54 @@ impl SessionSource for FileSource {
         &self,
         id: SessionId,
     ) -> anyhow::Result<BoxStream<'static, anyhow::Result<SessionItem>>> {
+        let root = self.root.clone();
         let dir = self.dir(id);
-        let (dir, events) = tokio::task::spawn_blocking(move || open_follow(dir, id))
+        let (dir, cursor) = tokio::task::spawn_blocking(move || open_follow(&root, dir, id))
             .await
             .context("opening a session to follow")??;
         // Bounded, so a slow consumer holds the follower back rather than
-        // buffering a whole 64 MiB log in memory.
-        let (tx, mut rx) = tokio::sync::mpsc::channel(256);
+        // buffering a whole recording in memory.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(FOLLOW_BATCH);
         std::thread::Builder::new()
             .name("heph-session-follow".to_owned())
-            .spawn(move || follow(&dir, events, &tx))
+            .spawn(move || follow(&dir, cursor, &tx))
             .context("starting the session follower")?;
         Ok(futures::stream::poll_fn(move |cx| rx.poll_recv(cx)).boxed())
     }
 
     async fn inflight(&self, id: SessionId, timeout: Duration) -> anyhow::Result<String> {
-        let dir = self.dir(id);
-        tokio::task::spawn_blocking(move || request_inflight(&dir, id, timeout))
+        let root = self.root.clone();
+        tokio::task::spawn_blocking(move || request_inflight(&root, id, timeout))
             .await
             .context("asking for the in-flight report")?
     }
+
+    async fn pools(&self, id: SessionId) -> anyhow::Result<Vec<store::PoolSummary>> {
+        let root = self.root.clone();
+        let dir = self.dir(id);
+        tokio::task::spawn_blocking(move || {
+            let opened = store::open_local(&root, &dir)
+                .map_err(anyhow::Error::new)
+                .with_context(|| format!("opening session {id}'s recording"))?;
+            store::read_pools(&opened.conn)
+                .with_context(|| format!("reading session {id}'s pool usage"))
+        })
+        .await
+        .context("reading pool usage")?
+    }
 }
 
-/// `subscribe`'s blocking half: refuse a format this heph cannot read before
-/// reading any record, then open the event log (absent: nothing recorded yet).
-fn open_follow(dir: PathBuf, id: SessionId) -> anyhow::Result<(PathBuf, Option<File>)> {
-    let meta = std::fs::read(dir.join(files::META))
-        .with_context(|| format!("reading session {id}'s meta.json"))?;
-    SessionMeta::decode(&meta).with_context(|| format!("session {id}"))?;
-    let events = match File::open(dir.join(files::EVENTS)) {
-        Ok(f) => Some(f),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-        Err(e) => {
-            return Err(e).with_context(|| format!("opening session {id}'s events.ndjson"));
-        }
-    };
-    Ok((dir, events))
+/// `subscribe`'s blocking half: open the recording, refusing a format this
+/// heph cannot read before reading any record.
+fn open_follow(
+    root: &Path,
+    dir: PathBuf,
+    id: SessionId,
+) -> anyhow::Result<(PathBuf, RecordCursor)> {
+    let opened = store::open_local(root, &dir)
+        .map_err(anyhow::Error::new)
+        .with_context(|| format!("opening session {id}'s recording"))?;
+    Ok((dir, RecordCursor::new(opened)))
 }
 
 pub(crate) fn list_dir(root: &Path) -> anyhow::Result<Vec<SessionEntry>> {
@@ -212,7 +231,7 @@ pub(crate) fn list_dir(root: &Path) -> anyhow::Result<Vec<SessionEntry>> {
         else {
             continue;
         };
-        match read_entry(&entry.path(), id) {
+        match read_entry(root, id) {
             Ok(Some(e)) => out.push(e),
             Ok(None) => {}
             Err(e) => tracing::debug!(session = %id, error = %format!("{e:#}"), "skipping session"),
@@ -221,29 +240,39 @@ pub(crate) fn list_dir(root: &Path) -> anyhow::Result<Vec<SessionEntry>> {
     Ok(out)
 }
 
-/// Probe the lock, then read `meta.json` and `status.json`. Never
-/// `events.ndjson`. `None`: no usable `meta.json` (a session killed between
-/// `mkdir` and its first write, or removed meanwhile).
-fn read_entry(dir: &Path, id: SessionId) -> anyhow::Result<Option<SessionEntry>> {
-    // First: an `End` written before the release is then in what is read next.
-    let live = lockfile::is_held(&dir.join(files::LOCK))
-        .with_context(|| format!("probing session {id}'s lock"))?;
-    let meta = match std::fs::read(dir.join(files::META)) {
-        Ok(b) => b,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e).with_context(|| format!("reading session {id}'s meta.json")),
-    };
-    let meta = match SessionMeta::decode(&meta) {
-        Ok(m) => EntryMeta::Known(Box::new(m)),
-        Err(MetaError::TooNew { found, supported }) => EntryMeta::TooNew { found, supported },
-        Err(e @ MetaError::Invalid(_)) => {
-            tracing::debug!(session = %id, error = %e, "skipping session");
-            return Ok(None);
+/// Open the recording (probing the lock first), then read its session row and
+/// `status` row. Never its records. `None`: no recording, or not a heph one
+/// (a session killed before it created its file, or removed meanwhile).
+fn read_entry(root: &Path, id: SessionId) -> anyhow::Result<Option<SessionEntry>> {
+    let dir = root.join(id.encode());
+    let opened = match store::open_local(root, &dir) {
+        Ok(opened) => opened,
+        Err(OpenError::Missing | OpenError::NotASession) => return Ok(None),
+        Err(OpenError::TooNew { found }) => {
+            let live = lockfile::is_held(&dir.join(files::LOCK))
+                .with_context(|| format!("probing session {id}'s lock"))?;
+            return Ok(Some(SessionEntry {
+                id,
+                meta: EntryMeta::TooNew {
+                    found,
+                    supported: store::FORMAT,
+                },
+                live,
+                status: None,
+                status_unreadable: false,
+            }));
+        }
+        Err(OpenError::Other(e)) => {
+            return Err(e.context(format!("opening session {id}'s recording")));
         }
     };
+    let meta = store::read_meta(&opened.conn)
+        .with_context(|| format!("reading session {id}'s session row"))?;
     let mut status_unreadable = false;
-    let status = match std::fs::read(dir.join(files::STATUS)) {
-        Ok(b) => match SessionSnapshot::decode(&b) {
+    let status = match store::read_status(&opened.conn)
+        .with_context(|| format!("reading session {id}'s status"))?
+    {
+        Some(json) => match SessionSnapshot::decode(json.as_bytes()) {
             Ok(s) => Some(s),
             Err(e) => {
                 tracing::debug!(session = %id, error = %e, "ignoring session status");
@@ -251,13 +280,12 @@ fn read_entry(dir: &Path, id: SessionId) -> anyhow::Result<Option<SessionEntry>>
                 None
             }
         },
-        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-        Err(e) => return Err(e).with_context(|| format!("reading session {id}'s status.json")),
+        None => None,
     };
     Ok(Some(SessionEntry {
         id,
-        meta,
-        live,
+        meta: EntryMeta::Known(Box::new(meta)),
+        live: opened.live,
         status,
         status_unreadable,
     }))
@@ -266,14 +294,21 @@ fn read_entry(dir: &Path, id: SessionId) -> anyhow::Result<Option<SessionEntry>>
 /// The follower thread behind [`FileSource::subscribe`]: read what is there,
 /// say so, then poll every [`FOLLOW_TICK`] — lock first, then the tail — until
 /// `End`, a free lock, or the stream is dropped.
+///
+/// Records are read a batch at a time and sent after. A batch holding `End`
+/// drops the cursor before it is sent: the owner seals the file once `End`
+/// is committed, and a reader still open on it (behind a slow consumer)
+/// would hold the seal up.
 fn follow(
     dir: &Path,
-    events: Option<File>,
+    cursor: RecordCursor,
     tx: &tokio::sync::mpsc::Sender<anyhow::Result<SessionItem>>,
 ) {
-    let mut reader = events.map(RecordReader::new);
+    let mut cursor = Some(cursor);
     let lock = dir.join(files::LOCK);
     let mut caught_up = false;
+    let mut skipped = 0;
+    let mut batch: Vec<SessionRecord> = Vec::with_capacity(FOLLOW_BATCH);
     loop {
         let held = match lockfile::is_held(&lock) {
             Ok(held) => held,
@@ -283,33 +318,44 @@ fn follow(
             }
         };
         let mut end = None;
-        if let Some(reader) = reader.as_mut() {
-            loop {
-                match reader.next_record() {
+        let mut more = false;
+        if let Some(c) = cursor.as_mut() {
+            while batch.len() < FOLLOW_BATCH && end.is_none() {
+                match c.next_record() {
                     Ok(Some(record)) => {
                         if let Some(SessionRecordKind::End { exit_code, .. }) = &record.session {
                             end = Some(*exit_code);
                         }
-                        if tx
-                            .blocking_send(Ok(SessionItem::Record(Box::new(record))))
-                            .is_err()
-                        {
-                            return;
-                        }
+                        batch.push(record);
                     }
                     Ok(None) => break,
                     Err(e) => {
                         drop(tx.blocking_send(Err(
-                            anyhow::Error::new(e).context("reading events.ndjson"),
+                            anyhow::Error::new(e).context("reading the session's records"),
                         )));
                         return;
                     }
                 }
             }
+            more = end.is_none() && batch.len() >= FOLLOW_BATCH;
+            skipped = c.skipped();
+        }
+        if end.is_some() {
+            cursor = None;
+        }
+        for record in batch.drain(..) {
+            if tx
+                .blocking_send(Ok(SessionItem::Record(Box::new(record))))
+                .is_err()
+            {
+                return;
+            }
+        }
+        if more {
+            continue;
         }
         if !caught_up {
             caught_up = true;
-            let skipped = reader.as_ref().map_or(0, RecordReader::skipped);
             if tx
                 .blocking_send(Ok(SessionItem::CaughtUp { skipped }))
                 .is_err()
@@ -338,18 +384,17 @@ fn follow(
 
 /// A13: drop `inflight.request` (temp + rename) and wait for the owner's
 /// `InflightWritten` record, then read `inflight.txt`.
-fn request_inflight(dir: &Path, id: SessionId, timeout: Duration) -> anyhow::Result<String> {
-    let Some(entry) = read_entry(dir, id)? else {
+fn request_inflight(root: &Path, id: SessionId, timeout: Duration) -> anyhow::Result<String> {
+    let dir = &root.join(id.encode());
+    let Some(entry) = read_entry(root, id)? else {
         anyhow::bail!("no session {id}");
     };
     let meta = match &entry.meta {
         EntryMeta::Known(m) => m,
         EntryMeta::TooNew { found, supported } => {
-            return Err(MetaError::TooNew {
-                found: *found,
-                supported: *supported,
-            })
-            .with_context(|| format!("session {id}"));
+            anyhow::bail!(
+                "session {id} is recorded in format {found}; this heph reads up to format {supported}"
+            );
         }
     };
     if !meta.has_capability(CAPABILITY_INFLIGHT) {
@@ -362,10 +407,13 @@ fn request_inflight(dir: &Path, id: SessionId, timeout: Duration) -> anyhow::Res
         anyhow::bail!("session {id} has ended; only a running session has an in-flight report");
     }
     // Follow from the current end: only an answer to this request counts.
-    let mut events = File::open(dir.join(files::EVENTS))
-        .with_context(|| format!("opening session {id}'s events.ndjson"))?;
-    io::Seek::seek(&mut events, io::SeekFrom::End(0)).context("seeking to the end")?;
-    let mut reader = RecordReader::new(events);
+    let opened = store::open_local(root, dir)
+        .map_err(anyhow::Error::new)
+        .with_context(|| format!("opening session {id}'s recording"))?;
+    let mut reader = RecordCursor::new(opened);
+    reader
+        .skip_to_end()
+        .with_context(|| format!("reading session {id}'s last record"))?;
 
     let mut tmp = tempfile::NamedTempFile::new_in(dir)
         .with_context(|| format!("creating the in-flight request in {}", dir.display()))?;
@@ -377,7 +425,10 @@ fn request_inflight(dir: &Path, id: SessionId, timeout: Duration) -> anyhow::Res
     let deadline = Instant::now() + timeout;
     loop {
         let held = lockfile::is_held(&dir.join(files::LOCK)).context("probing the lock")?;
-        while let Some(record) = reader.next_record().context("reading events.ndjson")? {
+        while let Some(record) = reader
+            .next_record()
+            .context("reading the session's records")?
+        {
             match record.session {
                 Some(SessionRecordKind::InflightWritten) => {
                     return std::fs::read_to_string(dir.join(files::INFLIGHT_REPORT))

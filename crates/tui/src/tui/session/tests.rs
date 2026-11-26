@@ -15,13 +15,13 @@ use std::time::Duration;
 use async_trait::async_trait;
 use hcore::events::{BuildEvent, BuildEventKind};
 
-use super::cleanup::Retention;
-use super::recorder::{Faults, RecorderStart};
+use super::cleanup::{self, Retention};
+use super::recorder::{Faults, Gate, RecorderStart};
 use super::*;
 use crate::tui::app::{App, AppContext, CIAppView, TUIAppView};
 use crate::tui::progress::BuildState;
 
-fn events() -> Vec<BuildEvent> {
+pub(super) fn events() -> Vec<BuildEvent> {
     let ev = |at, kind| BuildEvent {
         at_unix_ms: at,
         kind,
@@ -105,11 +105,81 @@ fn big_event() -> BuildEvent {
     }
 }
 
+/// The local recording in `dir`, opened as a reader would (the sessions root
+/// is its parent).
+pub(super) fn open(dir: &Path) -> store::Opened {
+    store::open_local(dir.parent().expect("a sessions root"), dir).expect("open the recording")
+}
+
+/// Every record in `dir`'s recording, in order, and how many did not decode.
 pub(super) fn read_records(dir: &Path) -> (Vec<SessionRecord>, u64) {
-    let file = std::fs::File::open(dir.join(files::EVENTS)).expect("events");
-    let mut r = RecordReader::new(file);
+    let mut r = store::RecordCursor::new(open(dir));
     let recs = std::iter::from_fn(|| r.next_record().expect("read")).collect();
     (recs, r.skipped())
+}
+
+/// The recording's `status` row, decoded, and its JSON size.
+pub(super) fn read_status(dir: &Path) -> Option<(usize, SessionSnapshot)> {
+    let json = store::read_status(&open(dir).conn).expect("read status")?;
+    Some((
+        json.len(),
+        SessionSnapshot::decode(json.as_bytes()).expect("decode status"),
+    ))
+}
+
+/// The recording's session row.
+pub(super) fn read_meta(dir: &Path) -> SessionMeta {
+    store::read_meta(&open(dir).conn).expect("read the session row")
+}
+
+/// A read-write connection on `dir`'s recording, for a test that alters it
+/// as another heph (or damage) would.
+pub(super) fn alter(dir: &Path) -> rusqlite::Connection {
+    let conn = rusqlite::Connection::open(dir.join(store::FILE)).expect("open rw");
+    conn.busy_timeout(store::BUSY_TIMEOUT)
+        .expect("busy timeout");
+    conn
+}
+
+/// A session row for `id`, as an owner writes it.
+pub(super) fn meta_for(id: SessionId) -> SessionMeta {
+    SessionMeta {
+        format: META_FORMAT,
+        id,
+        owner_pid: std::process::id(),
+        started_unix_ms: id.started_unix_ms(),
+        heph_version: hcore::version::current().to_owned(),
+        argv: vec!["heph".into(), "run".into()],
+        cwd: None,
+        workspace_root: None,
+        home_dir: None,
+        label: "run //a:...".into(),
+        header: HeaderKind::Build,
+        interactive: false,
+        capabilities: vec![CAPABILITY_INFLIGHT.to_owned()],
+    }
+}
+
+/// `ev` as the record the recorder writes for it.
+pub(super) fn event_record(ev: BuildEvent) -> SessionRecord {
+    SessionRecord {
+        at_unix_ms: ev.at_unix_ms,
+        kind: Some(ev.kind),
+        session: None,
+    }
+}
+
+/// A recording in `dir` holding `records`, left as a `kill -9` leaves one:
+/// committed, unsealed (WAL mode), no `End`. The caller owns the lock.
+pub(super) fn unsealed_recording(dir: &Path, id: SessionId, records: &[SessionRecord]) {
+    let (conn, _rw) =
+        store::create(dir, &meta_for(id), &store::Provenance::default(), false).expect("create");
+    let mut writer = store::Writer::new(conn, id);
+    for r in records {
+        let body = serde_json::to_string(r).expect("encode");
+        writer.insert(r, &body).expect("insert");
+    }
+    writer.commit().expect("commit");
 }
 
 pub(super) fn start() -> SessionStart {
@@ -123,7 +193,7 @@ pub(super) fn start() -> SessionStart {
     }
 }
 
-/// Folding `events.ndjson` gives the view's state, and the session ends with
+/// Folding the recorded records gives the view's state, and the session ends with
 /// `End`, a final status carrying the exit, and a released lock.
 #[test]
 fn recorder_round_trip_matches_live_view() {
@@ -159,16 +229,19 @@ fn recorder_round_trip_matches_live_view() {
             panicked: false
         })
     );
-    let status = SessionSnapshot::decode(&std::fs::read(dir.join(files::STATUS)).expect("status"))
-        .expect("decode");
+    let (_, status) = read_status(&dir).expect("a status row");
     assert_eq!(status.failed, vec!["//a:bad".to_owned()]);
     assert_eq!(
         status.lock_waits.first().and_then(|w| w.holder_pid),
         Some(77)
     );
     assert_eq!(status.end.as_ref().and_then(|e| e.exit_code), Some(1));
-    let meta =
-        SessionMeta::decode(&std::fs::read(dir.join(files::META)).expect("meta")).expect("meta");
+    let opened = open(&dir);
+    assert!(!opened.live && !opened.is_copy(), "sealed: read in place");
+    let end = store::read_row_end(&opened.conn).expect("row end");
+    assert!(end.sealed && !end.truncated, "{end:?}");
+    drop(opened);
+    let meta = read_meta(&dir);
     assert_eq!(meta.id, session.id());
     assert_eq!(meta.owner_pid, std::process::id());
     assert!(meta.has_capability(CAPABILITY_INFLIGHT));
@@ -189,8 +262,14 @@ fn files_are_user_only() {
     let mode = |p: &Path| std::fs::metadata(p).expect("stat").permissions().mode() & 0o777;
     assert_eq!(mode(&sessions), 0o700);
     assert_eq!(mode(session.dir()), 0o700);
-    for f in [files::META, files::LOCK, files::EVENTS, files::STATUS] {
+    for f in [files::LOCK, store::FILE] {
         assert_eq!(mode(&session.dir().join(f)), 0o600, "{f}");
+    }
+    // Whatever else the run left (a `-wal`, a `-shm` the seal did not
+    // remove) is user-only too.
+    for entry in std::fs::read_dir(session.dir()).expect("read dir") {
+        let path = entry.expect("entry").path();
+        assert_eq!(mode(&path), 0o600, "{}", path.display());
     }
 }
 
@@ -209,7 +288,7 @@ fn failed_lock_leaves_no_directory() {
             &SessionRoot::new(&sessions),
             start(),
             Retention::default(),
-            faults,
+            faults.clone(),
         )
         .expect_err("the lock fails");
         assert!(format!("{err:#}").contains("lock"), "{err:#}");
@@ -217,18 +296,19 @@ fn failed_lock_leaves_no_directory() {
     assert_eq!(entries(&sessions), 0, "a failed open leaked a directory");
 }
 
-/// An ended session whose `status.json` a newer heph wrote is listed as
+/// An ended session whose `status` row a newer heph wrote is listed as
 /// unreadable, never as having no status (which reads `lost`).
 #[test]
 fn newer_status_is_unreadable_not_missing() {
     let root = tempfile::tempdir().expect("tempdir");
     let session = Session::open(&SessionRoot::new(root.path()), start()).expect("open");
     session.finish(Some(0), false);
-    std::fs::write(
-        session.dir().join(files::STATUS),
-        format!(r#"{{"version": {}}}"#, SNAPSHOT_VERSION + 1),
-    )
-    .expect("write");
+    alter(session.dir())
+        .execute(
+            "UPDATE status SET snapshot = ?1 WHERE id = 1",
+            [format!(r#"{{"version": {}}}"#, SNAPSHOT_VERSION + 1)],
+        )
+        .expect("write");
     let listed = source::list_dir(root.path()).expect("list");
     assert_eq!(listed.len(), 1);
     assert!(!listed[0].live);
@@ -258,25 +338,19 @@ fn unwritable_root_fails_cleanly() {
 }
 
 /// I2: the lock is held while the session lives, released by `finish`, and
-/// its fd (like the events fd) is close-on-exec, so no child keeps it alive.
+/// its fd is close-on-exec, so no child keeps it alive. (The recording's
+/// SQLite fds are SQLite's, opened `O_CLOEXEC`; a child holding one would
+/// not hold the lock.)
 #[test]
 fn lock_released_on_exit_and_not_inherited() {
     let dir = tempfile::tempdir().expect("tempdir");
     let lock = lockfile::acquire_owner_lock(&dir.path().join(files::LOCK)).expect("lock");
-    let events = std::fs::OpenOptions::new()
-        .create_new(true)
-        .append(true)
-        .open(dir.path().join(files::EVENTS))
-        .expect("events");
-    for fd in [lock.as_raw_fd(), events.as_raw_fd()] {
-        // SAFETY: querying the flags of an fd this test owns.
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-        assert!(
-            flags >= 0 && flags & libc::FD_CLOEXEC != 0,
-            "fd {fd} is CLOEXEC"
-        );
-    }
-    drop(events);
+    // SAFETY: querying the flags of an fd this test owns.
+    let flags = unsafe { libc::fcntl(lock.as_raw_fd(), libc::F_GETFD) };
+    assert!(
+        flags >= 0 && flags & libc::FD_CLOEXEC != 0,
+        "the lock fd is CLOEXEC"
+    );
     drop(lock);
 
     let root = tempfile::tempdir().expect("tempdir");
@@ -298,48 +372,28 @@ fn lock_released_on_exit_and_not_inherited() {
     child.wait().expect("wait");
 }
 
-/// A writer that fails like a full disk.
-struct Enospc;
-
-impl Write for Enospc {
-    fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
-        Err(io::Error::from_raw_os_error(libc::ENOSPC))
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Err(io::Error::from_raw_os_error(libc::ENOSPC))
-    }
-}
-
-/// A writer that blocks until released.
-struct Blocked(Arc<(Mutex<bool>, std::sync::Condvar)>);
-
-impl Write for Blocked {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let (lock, cv) = &*self.0;
-        let mut open = lock.lock().expect("lock");
-        while !*open {
-            open = cv.wait(open).expect("wait");
-        }
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-fn recorder_with(dir: &Path, events: Box<dyn Write + Send>, faults: Faults) -> Recorder {
-    let lock = lockfile::acquire_owner_lock(&dir.join(files::LOCK)).expect("lock");
-    Recorder::spawn(RecorderStart {
-        dir: dir.to_path_buf(),
-        root: dir.join("no-root"),
-        lock,
-        events,
-        retention: Retention::default(),
-        private_root: None,
+/// A session under `root` whose recorder runs with `faults`.
+pub(super) fn recorder_with(root: &Path, faults: Faults) -> Session {
+    Session::open_with(
+        &SessionRoot::new(root),
+        start(),
+        Retention::default(),
         faults,
-    })
-    .expect("spawn")
+    )
+    .expect("open")
 }
+
+/// A test's caps: [`recorder::FULL_CAP`] and [`recorder::CEILING`] small
+/// enough to reach with a few [`big_event`]s.
+fn capped(full_cap: u64, ceiling: u64) -> Faults {
+    Faults {
+        full_cap: Some(full_cap),
+        ceiling: Some(ceiling),
+        ..Faults::default()
+    }
+}
+
+const MIB: u64 = 1024 * 1024;
 
 /// A `MakeWriter` collecting log output, to count warnings.
 #[derive(Clone, Default)]
@@ -397,10 +451,15 @@ fn enospc_warns_once() {
         .with_writer(captured.clone())
         .with_ansi(false)
         .finish();
-    tracing::subscriber::with_default(subscriber, || {
-        let rec = recorder_with(dir.path(), Box::new(Enospc), Faults::default());
+    let lock = tracing::subscriber::with_default(subscriber, || {
+        let rec = recorder_with(
+            dir.path(),
+            Faults {
+                fail_writes: true,
+                ..Faults::default()
+            },
+        );
         let tap = rec.tap();
-        // Past one BufWriter's worth, so the failure surfaces mid-stream.
         for _ in 0..2000 {
             for ev in events() {
                 tap.event(ev);
@@ -414,11 +473,187 @@ fn enospc_warns_once() {
         for ev in events() {
             tap.event(ev);
         }
-        rec.finish(Some(0), false, Duration::from_secs(1));
+        rec.recorder.finish(Some(0), false, Duration::from_secs(1));
+        rec.dir().join(files::LOCK)
     });
     let log = captured.settled_log();
     assert_eq!(log.matches("WARN").count(), 1, "{log}");
-    assert!(!lockfile::is_held(&dir.path().join(files::LOCK)).expect("probe"));
+    assert!(!lockfile::is_held(&lock).expect("probe"));
+}
+
+/// I1: a transaction past [`recorder::COMMIT_BYTES`] commits without waiting
+/// for the flush tick, so what the exiting process waits on is bounded. The
+/// flush and status ticks are an hour here (the first status upsert, which
+/// commits before any event, holds no record), so records a reader sees were
+/// committed by size; with the transaction left to the ticks, it sees none.
+#[test]
+fn a_full_transaction_commits_before_the_tick() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let session = recorder_with(
+        dir.path(),
+        Faults {
+            ticks: Some(Duration::from_secs(3600)),
+            commit_bytes: Some(1),
+            ..Faults::default()
+        },
+    );
+    let db = session.dir().join(store::FILE);
+    let tap = session.tap();
+    let sent = events();
+    let want = i64::try_from(sent.len()).expect("count");
+    for ev in sent {
+        tap.event(ev);
+    }
+    let reader = rusqlite::Connection::open_with_flags(
+        &db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .expect("a read-only connection");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut seen = 0;
+    while seen < want && std::time::Instant::now() < deadline {
+        seen = reader
+            .query_row("SELECT count(*) FROM records", [], |r| r.get(0))
+            .expect("count records");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        seen, want,
+        "every record committed by size, before the tick"
+    );
+    drop(reader);
+    session.finish(Some(0), false);
+}
+
+/// I1: a write that fails half way through a batch (the record went in, the
+/// explorer row it completes did not) lands none of that batch. A trigger
+/// refuses the `spans` row of `//boom`'s `ResultEnd`, after its record was
+/// inserted in the same transaction. What is on disk afterwards is whole
+/// batches: `//boom`'s `ResultEnd` record is not there, and every
+/// `ResultEnd` record that is has its `heph.result` span. A fail path that
+/// committed what it had (or a writer in autocommit) leaves the record
+/// without its span and fails here.
+#[test]
+fn failed_derived_insert_rolls_back_the_batch() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let captured = Captured::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(captured.clone())
+        .with_ansi(false)
+        .finish();
+    let session_dir = tracing::subscriber::with_default(subscriber, || {
+        let rec = recorder_with(dir.path(), Faults::default());
+        let tap = rec.tap();
+        let result = |addr: &str| {
+            tap.event(BuildEvent {
+                at_unix_ms: hcore::events::now_unix_ms(),
+                kind: BuildEventKind::ResultStart { addr: addr.into() },
+            });
+            tap.event(BuildEvent {
+                at_unix_ms: hcore::events::now_unix_ms(),
+                kind: BuildEventKind::ResultEnd {
+                    addr: addr.into(),
+                    error: None,
+                    upstream_of: None,
+                    exit_status: None,
+                    exit_code: None,
+                    log_tail: None,
+                    timed_out: None,
+                    cancelled: false,
+                    left_behind: None,
+                    spans: Vec::new(),
+                },
+            });
+        };
+        result("//p:before");
+        tap.flush(Duration::from_secs(10)).expect("flush");
+        alter(rec.dir())
+            .execute_batch(
+                "CREATE TRIGGER boom BEFORE INSERT ON spans WHEN NEW.addr = '//boom'
+                 BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+            )
+            .expect("the trigger");
+        result("//p:same_batch");
+        result("//boom");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !tap.is_stopped() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(tap.is_stopped(), "the failure latched");
+        rec.recorder.finish(Some(0), false, Duration::from_secs(1));
+        rec.dir().to_path_buf()
+    });
+    let log = captured.settled_log();
+    assert_eq!(log.matches("WARN").count(), 1, "{log}");
+    assert!(log.contains("injected"), "{log}");
+
+    let opened = open(&session_dir);
+    let ends: Vec<String> = opened
+        .conn
+        .prepare("SELECT addr FROM records WHERE kind = 'ResultEnd' ORDER BY seq")
+        .expect("prepare")
+        .query_map([], |r| r.get(0))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("rows");
+    let spans: Vec<String> = opened
+        .conn
+        .prepare("SELECT addr FROM spans WHERE name = 'heph.result' ORDER BY span_id")
+        .expect("prepare")
+        .query_map([], |r| r.get(0))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("rows");
+    assert!(ends.iter().any(|a| a == "//p:before"), "{ends:?}");
+    assert!(!ends.iter().any(|a| a == "//boom"), "{ends:?}");
+    assert_eq!(ends, spans, "every committed ResultEnd has its span");
+}
+
+/// I1/A8: a recorder that falls more than its cap of messages behind stops
+/// with one warning naming it, every later send is dropped without blocking,
+/// and finish still releases the lock. (The cap lowered to 8 here; the write
+/// gate keeps the thread from draining.)
+#[test]
+fn falling_behind_the_pending_cap_stops_once() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let captured = Captured::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(captured.clone())
+        .with_ansi(false)
+        .finish();
+    let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let lock = tracing::subscriber::with_default(subscriber, || {
+        let rec = recorder_with(
+            dir.path(),
+            Faults {
+                gate: Some(Arc::clone(&gate)),
+                max_pending: Some(8),
+                ..Faults::default()
+            },
+        );
+        let tap = rec.tap();
+        let mut sent = 0;
+        while !tap.is_stopped() && sent < 100 {
+            for ev in events() {
+                tap.event(ev);
+                sent += 1;
+            }
+        }
+        assert!(tap.is_stopped(), "a full queue latched the stop");
+        assert!(sent < 100, "stopped after {sent} sends, cap 8");
+        for ev in events() {
+            tap.event(ev);
+        }
+        let (open, cv) = &*gate;
+        *open.lock().expect("gate") = true;
+        cv.notify_all();
+        rec.recorder.finish(Some(0), false, Duration::from_secs(5));
+        rec.dir().join(files::LOCK)
+    });
+    let log = captured.settled_log();
+    assert_eq!(log.matches("WARN").count(), 1, "{log}");
+    assert!(log.contains("fell more than"), "{log}");
+    assert!(!lockfile::is_held(&lock).expect("probe"));
 }
 
 /// A send after `finish` (a log line on the way out: `--pprof-cpu`'s, the
@@ -433,10 +668,10 @@ fn send_after_finish_is_dropped_silently() {
         .with_ansi(false)
         .finish();
     tracing::subscriber::with_default(subscriber, || {
-        let rec = recorder_with(dir.path(), Box::new(io::sink()), Faults::default());
+        let rec = recorder_with(dir.path(), Faults::default());
         let tap = rec.tap();
         assert!(tap.log(1, "INFO", "before".into()).is_none());
-        rec.finish(Some(0), false, Duration::from_secs(5));
+        rec.recorder.finish(Some(0), false, Duration::from_secs(5));
         assert!(tap.log(2, "INFO", "after".into()).is_none());
         for ev in events() {
             tap.event(ev);
@@ -458,8 +693,10 @@ fn recorder_blocked_write_does_not_block_app() {
     let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
     let rec = recorder_with(
         dir.path(),
-        Box::new(Blocked(Arc::clone(&gate))),
-        Faults::default(),
+        Faults {
+            gate: Some(Arc::clone(&gate)),
+            ..Faults::default()
+        },
     );
     let tap = rec.tap();
     let started = std::time::Instant::now();
@@ -473,15 +710,293 @@ fn recorder_blocked_write_does_not_block_app() {
         "sends never block"
     );
     let finishing = std::time::Instant::now();
-    rec.finish(Some(0), false, Duration::from_millis(200));
+    rec.recorder
+        .finish(Some(0), false, Duration::from_millis(200));
     assert!(
         finishing.elapsed() < Duration::from_secs(2),
         "finish is bounded"
     );
-    assert!(!lockfile::is_held(&dir.path().join(files::LOCK)).expect("probe"));
+    // I2, I3: the thread still holds the write connection and will commit
+    // `End`, so the lock stays held until it has.
+    let lock_path = rec.dir().join(files::LOCK);
+    assert!(
+        lockfile::is_held(&lock_path).expect("probe"),
+        "a timed-out finish released the lock under a live writer"
+    );
     let (lock, cv) = &*gate;
     *lock.lock().expect("lock") = true;
     cv.notify_all();
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while lockfile::is_held(&lock_path).expect("probe") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the recorder thread never released the lock"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let opened = open(rec.dir());
+    assert!(!opened.is_copy(), "the thread sealed it");
+    let end = store::read_row_end(&opened.conn).expect("end");
+    assert!(end.sealed, "{end:?}");
+    drop(opened);
+    let (read, _) = read_records(rec.dir());
+    assert!(
+        matches!(
+            read.last().and_then(|r| r.session.as_ref()),
+            Some(SessionRecordKind::End { .. })
+        ),
+        "End landed last"
+    );
+}
+
+/// A finish that timed out leaves the lock to the recorder thread. If the
+/// thread then stops before it reaches `End` (here: the hung write fails), it
+/// releases the lock as it exits, so a process that lives on after `finish`
+/// does not keep its session looking live. The session reads as lost: no
+/// `End` landed.
+#[test]
+fn a_stop_after_a_timed_out_finish_releases_the_lock() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let rec = recorder_with(
+        dir.path(),
+        Faults {
+            gate: Some(Arc::clone(&gate)),
+            fail_writes: true,
+            ..Faults::default()
+        },
+    );
+    let tap = rec.tap();
+    for ev in events() {
+        tap.event(ev);
+    }
+    rec.recorder
+        .finish(Some(0), false, Duration::from_millis(200));
+    let lock_path = rec.dir().join(files::LOCK);
+    assert!(
+        lockfile::is_held(&lock_path).expect("probe"),
+        "a timed-out finish released the lock under a live writer"
+    );
+    // The hung write now fails: the thread stops without handling `End`.
+    let (lock, cv) = &*gate;
+    *lock.lock().expect("lock") = true;
+    cv.notify_all();
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while lockfile::is_held(&lock_path).expect("probe") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the stopped recorder thread kept the lock while the process lives on"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // `rec` (and so the recorder's shared state) is still alive here.
+    drop(rec);
+}
+
+/// A recorder that stopped (here: it fell behind its pending cap while a
+/// write hangs) still has its thread, and the thread its write connection,
+/// until that write returns. `finish` must not free the lock under it: the
+/// connection's close checkpoints and deletes the `-wal`, so a viewer of
+/// another process that saw the lock free could copy a half-checkpointed
+/// `session.db` with its `-wal` gone. The lock goes once the thread has
+/// exited, its connection and registration closed first.
+#[test]
+fn finish_after_a_stop_keeps_the_lock_until_the_thread_exits() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let gate: Gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let rec = recorder_with(
+        dir.path(),
+        Faults {
+            gate: Some(Arc::clone(&gate)),
+            max_pending: Some(8),
+            ..Faults::default()
+        },
+    );
+    let tap = rec.tap();
+    let mut evs = events().into_iter().cycle();
+    // The thread takes the first event into its write, which the gate holds,
+    // before the stop is latched: a stop latched first would end the thread
+    // before it wrote anything.
+    tap.event(evs.next().expect("an event"));
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while tap.pending() > 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the thread never took the first event"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    for ev in evs.by_ref().take(100) {
+        tap.event(ev);
+        if tap.is_stopped() {
+            break;
+        }
+    }
+    assert!(tap.is_stopped(), "a full queue latched the stop");
+    rec.recorder
+        .finish(Some(0), false, Duration::from_millis(200));
+    let lock_path = rec.dir().join(files::LOCK);
+    let db = rec.dir().join(store::FILE);
+    assert!(
+        store::rw_open::is_open(&db).expect("stat"),
+        "the stopped thread's write is still held at the gate"
+    );
+    assert!(
+        lockfile::is_held(&lock_path).expect("probe"),
+        "finish freed the lock under the stopped thread's open write connection"
+    );
+    let (open, cv) = &*gate;
+    *open.lock().expect("gate") = true;
+    cv.notify_all();
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while lockfile::is_held(&lock_path).expect("probe") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the stopped thread's exit never released the lock"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !store::rw_open::is_open(&db).expect("stat"),
+        "the lock was freed before the thread closed its write connection"
+    );
+    drop(rec);
+}
+
+/// I1: a lost recording left beside a new session is cleanup's to seal, on
+/// its own thread. With that cleanup held up, the new session's records still
+/// commit at once and its `finish` seals it without waiting.
+#[test]
+fn cleanup_does_not_hold_up_the_recording() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let lost = SessionId::new(hcore::events::now_unix_ms() - 120_000, 7);
+    let lost_dir = root.path().join(lost.encode());
+    std::fs::create_dir(&lost_dir).expect("mkdir");
+    let lost_lock = lost_dir.join(files::LOCK);
+    std::fs::write(&lost_lock, b"").expect("lock");
+    let records: Vec<SessionRecord> = (0..200).flat_map(|_| events()).map(event_record).collect();
+    unsealed_recording(&lost_dir, lost, &records);
+    // Past the start grace: cleanup seals it.
+    std::fs::File::options()
+        .write(true)
+        .open(&lost_lock)
+        .and_then(|f| f.set_modified(std::time::SystemTime::now() - Duration::from_secs(120)))
+        .expect("age the lock");
+    let lost_wal = || {
+        store::read_header(&lost_dir.join(store::FILE))
+            .expect("header")
+            .expect("heph")
+            .wal
+    };
+    assert!(lost_wal(), "precondition: lost and unsealed");
+
+    let gate: Gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let rec = recorder_with(
+        root.path(),
+        Faults {
+            cleanup_gate: Some(Arc::clone(&gate)),
+            ..Faults::default()
+        },
+    );
+    let tap = rec.tap();
+    for ev in events() {
+        tap.event(ev);
+    }
+    tap.flush(Duration::from_secs(5))
+        .expect("the first records commit while cleanup is held up");
+    assert_eq!(read_records(rec.dir()).0.len(), events().len());
+    let finishing = std::time::Instant::now();
+    rec.recorder.finish(Some(0), false, Duration::from_secs(5));
+    assert!(
+        finishing.elapsed() < Duration::from_secs(2),
+        "finish waited on cleanup: {:?}",
+        finishing.elapsed()
+    );
+    let opened = open(rec.dir());
+    assert!(!opened.is_copy(), "the new session sealed");
+    assert!(store::read_row_end(&opened.conn).expect("end").sealed);
+    drop(opened);
+    assert!(lost_wal(), "cleanup is still held up");
+
+    let (open_gate, cv) = &*gate;
+    *open_gate.lock().expect("gate") = true;
+    cv.notify_all();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while lost_wal() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "cleanup never sealed the lost session"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// I1 and the PR 2 gate: a foreign connection on the live file (a `sqlite3`
+/// shell, an editor's SQLite browser) keeps the seal from switching the
+/// journal mode. `finish` gives the seal [`recorder::SEAL_BUDGET`] and goes,
+/// with `End` committed; the next cleanup seals the recording.
+#[test]
+fn a_foreign_connection_does_not_hold_up_finish() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let session = Session::open(&SessionRoot::new(root.path()), start()).expect("open");
+    let id = session.id();
+    let dir = session.dir().to_path_buf();
+    let db = dir.join(store::FILE);
+    let tap = session.tap();
+    for ev in events() {
+        tap.event(ev);
+    }
+    tap.flush(Duration::from_secs(5))
+        .expect("records committed");
+    drop(tap);
+    let foreign = rusqlite::Connection::open_with_flags(
+        &db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .expect("a foreign read-only connection");
+    foreign
+        .execute_batch("BEGIN; SELECT count(*) FROM records;")
+        .expect("a read held open");
+
+    let finishing = std::time::Instant::now();
+    session.finish(Some(0), false);
+    let took = finishing.elapsed();
+    assert!(
+        took < Duration::from_millis(600),
+        "finish waited {took:?} on a foreign connection"
+    );
+    assert!(
+        !lockfile::is_held(&dir.join(files::LOCK)).expect("probe"),
+        "the lock is free once finish returns"
+    );
+    foreign.execute_batch("COMMIT").expect("end the read");
+    let end = store::read_row_end(&foreign).expect("row end");
+    assert!(end.sealed, "End is committed: {end:?}");
+    let last: String = foreign
+        .query_row(
+            "SELECT kind FROM records ORDER BY seq DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .expect("the last record");
+    assert_eq!(last, "End");
+    drop(foreign);
+    assert!(
+        store::read_header(&db).expect("header").expect("heph").wal,
+        "the cut-short seal left the file in WAL mode"
+    );
+
+    let report = cleanup::cleanup(
+        root.path(),
+        std::time::SystemTime::now() + cleanup::STARTING * 2,
+        Retention::default(),
+    )
+    .expect("cleanup");
+    assert_eq!(report.sealed, vec![id], "{report:?}");
+    assert!(
+        !store::read_header(&db).expect("header").expect("heph").wal,
+        "cleanup sealed it"
+    );
 }
 
 /// I1: a recorder that panics costs the recording, not the run.
@@ -490,7 +1005,6 @@ fn recorder_panic_does_not_fail_app() {
     let dir = tempfile::tempdir().expect("tempdir");
     let rec = recorder_with(
         dir.path(),
-        Box::new(io::sink()),
         Faults {
             panic_on_event: true,
             ..Faults::default()
@@ -502,27 +1016,60 @@ fn recorder_panic_does_not_fail_app() {
             tap.event(ev);
         }
     }
-    rec.finish(Some(0), false, Duration::from_secs(1));
-    assert!(!lockfile::is_held(&dir.path().join(files::LOCK)).expect("probe"));
+    rec.recorder.finish(Some(0), false, Duration::from_secs(1));
+    assert!(!lockfile::is_held(&rec.dir().join(files::LOCK)).expect("probe"));
 }
 
-/// A10: past the cap, one `Truncated` and nothing else but `End`.
+/// A10/D15: past the full cap a `Truncated`, and only the critical kinds;
+/// past the ceiling a second `Truncated` (the session row's `truncated_seq`)
+/// and nothing else but `End`. The records stay under the ceiling.
 #[test]
-fn events_cap_truncates() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let file = std::fs::File::create(dir.path().join(files::EVENTS)).expect("events");
-    let rec = recorder_with(dir.path(), Box::new(file), Faults::default());
+fn caps_truncate_twice() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let rec = recorder_with(root.path(), capped(4 * MIB, 16 * MIB));
     let tap = rec.tap();
     for _ in 0..70 {
         tap.event(big_event());
     }
     tap.event(events().remove(0));
-    rec.finish(Some(0), false, Duration::from_secs(10));
-    let size = std::fs::metadata(dir.path().join(files::EVENTS))
+    rec.recorder.finish(Some(0), false, Duration::from_secs(10));
+    let dir = rec.dir();
+
+    let opened = open(dir);
+    let bodies: i64 = opened
+        .conn
+        .query_row("SELECT sum(length(body)) FROM records", [], |r| r.get(0))
+        .expect("size");
+    assert!(
+        u64::try_from(bodies).expect("size") <= 16 * MIB + 1024,
+        "{bodies}"
+    );
+    // The caps count record bodies (and the explorer rows' estimated bytes),
+    // not SQLite's pages: the sealed file is larger than what was counted,
+    // by its page overhead, but stays in proportion to it. Here, with 1 MiB
+    // bodies, within a quarter over the ceiling (SESSIONS.md, Recording).
+    let on_disk = std::fs::metadata(dir.join(store::FILE))
         .expect("stat")
         .len();
-    assert!(size <= recorder::EVENTS_CAP + 1024, "{size}");
-    let (records, _) = read_records(dir.path());
+    assert!(
+        on_disk <= 16 * MIB + 16 * MIB / 4,
+        "{on_disk} bytes on disk for a 16 MiB ceiling"
+    );
+    let truncated: Vec<i64> = opened
+        .conn
+        .prepare("SELECT seq FROM records WHERE kind = 'Truncated' ORDER BY seq")
+        .expect("prepare")
+        .query_map([], |r| r.get(0))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("rows");
+    assert_eq!(truncated.len(), 2, "{truncated:?}");
+    let end = store::read_row_end(&opened.conn).expect("row end");
+    assert!(end.truncated && end.sealed, "{end:?}");
+    assert_eq!(end.truncated_seq, truncated.last().copied());
+    drop(opened);
+
+    let (records, _) = read_records(dir);
     let kinds: Vec<_> = records
         .iter()
         .rev()
@@ -539,9 +1086,21 @@ fn events_cap_truncates() {
             SessionRecordKind::Truncated
         ]
     );
-    let status =
-        SessionSnapshot::decode(&std::fs::read(dir.path().join(files::STATUS)).expect("status"))
-            .expect("decode");
+    let first = records
+        .iter()
+        .position(|r| r.session == Some(SessionRecordKind::Truncated))
+        .expect("a first Truncated");
+    assert!(
+        records[first + 1..records.len() - 2]
+            .iter()
+            .all(recorder::is_critical),
+        "only critical kinds between the two caps"
+    );
+    assert!(
+        records.len() - first > 3,
+        "big events are critical: they are kept past the full cap"
+    );
+    let (_, status) = read_status(dir).expect("a status row");
     assert!(status.truncated);
     assert!(
         status.counts.matched.is_some(),
@@ -549,17 +1108,16 @@ fn events_cap_truncates() {
     );
 }
 
-/// Past the cap, the view records a truncated session still needs at its end
-/// are written: the failure report, a label change, every approval prompt
-/// (its notices' sources, its clear, the standing decision) and `Finished`, and
-/// log lines (a replay reads them). A build event is not.
+/// Past the full cap, the view records a truncated session still needs at its
+/// end are written: a label change, every approval prompt (its notices'
+/// sources, its clear, the standing decision) and `Finished`. Output, log
+/// lines and a progress-only build event are dropped (D15).
 #[test]
-fn events_cap_keeps_the_ending_view_records() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let file = std::fs::File::create(dir.path().join(files::EVENTS)).expect("events");
-    let rec = recorder_with(dir.path(), Box::new(file), Faults::default());
+fn full_cap_keeps_the_ending_view_records() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let rec = recorder_with(root.path(), capped(4 * MIB, recorder::CEILING));
     let tap = rec.tap();
-    for _ in 0..70 {
+    for _ in 0..5 {
         tap.event(big_event());
     }
     let kept = [
@@ -581,34 +1139,35 @@ fn events_cap_keeps_the_ending_view_records() {
             standing: Some(ApprovalStanding::Approve),
         },
         SessionRecordKind::Finished { stopped: true },
-        SessionRecordKind::Output {
-            text: "failed: //a:bad\n".into(),
-        },
     ];
+    // `Matched` is progress-only.
     tap.event(events().remove(0));
     for kind in kept.iter().cloned() {
         tap.view(1, kind);
     }
+    tap.view(
+        1,
+        SessionRecordKind::Output {
+            text: "failed: //a:bad\n".into(),
+        },
+    );
     assert!(tap.log(1, "INFO", "after the cap".into()).is_none());
-    rec.finish(Some(1), false, Duration::from_secs(10));
+    rec.recorder.finish(Some(1), false, Duration::from_secs(10));
 
-    let (records, _) = read_records(dir.path());
+    let (records, _) = read_records(rec.dir());
     let tail: Vec<_> = records
         .iter()
         .skip_while(|r| r.session != Some(SessionRecordKind::Truncated))
         .collect();
     assert!(
-        tail.iter().all(|r| r.kind.is_none()),
-        "no build event past the cap"
+        tail.iter()
+            .filter(|r| r.kind.is_some())
+            .all(|r| recorder::is_critical(r)),
+        "only critical build events past the cap"
     );
     let kinds: Vec<_> = tail.iter().filter_map(|r| r.session.clone()).collect();
     let mut want = vec![SessionRecordKind::Truncated];
     want.extend(kept);
-    want.push(SessionRecordKind::Log {
-        level: "INFO".into(),
-        msg: "after the cap".into(),
-        seq: 1,
-    });
     want.push(SessionRecordKind::End {
         exit_code: Some(1),
         panicked: false,
@@ -616,15 +1175,15 @@ fn events_cap_keeps_the_ending_view_records() {
     assert_eq!(kinds, want);
 }
 
-/// `status.json` stays bounded however many targets wait: 50k lock waits and
-/// 50k admission waits through a real recorder, read back from the file it
+/// The `status` row stays bounded however many targets wait: 50k lock waits
+/// and 50k admission waits through a real recorder, read back from the row it
 /// wrote — while live and after `End` — have every list cut to
 /// `STATUS_LIST_CAP` and every total and count in full.
 #[test]
-fn status_json_is_capped_through_the_recorder() {
+fn status_row_is_capped_through_the_recorder() {
     const N: u64 = 50_000;
     let dir = tempfile::tempdir().expect("tempdir");
-    let rec = recorder_with(dir.path(), Box::new(io::sink()), Faults::default());
+    let rec = recorder_with(dir.path(), Faults::default());
     let tap = rec.tap();
     let ev = |kind| BuildEvent {
         at_unix_ms: 1,
@@ -665,12 +1224,9 @@ fn status_json_is_capped_through_the_recorder() {
             yielding_to: None,
         }));
     }
-    let read = || -> Option<(usize, SessionSnapshot)> {
-        let bytes = std::fs::read(dir.path().join(files::STATUS)).ok()?;
-        Some((bytes.len(), SessionSnapshot::decode(&bytes).ok()?))
-    };
+    let read = || read_status(rec.dir());
     let check = |when: &str, size: usize, s: &SessionSnapshot| {
-        assert!(size < 48 * 1024, "{when}: status.json is {size} bytes");
+        assert!(size < 48 * 1024, "{when}: the status row is {size} bytes");
         let cap = STATUS_LIST_CAP;
         assert_eq!(s.running.len(), cap, "{when}");
         assert_eq!(s.waiting.len(), cap, "{when}");
@@ -704,15 +1260,15 @@ fn status_json_is_capped_through_the_recorder() {
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "the recorder never wrote a status.json with every wait"
+            "the recorder never wrote a status row with every wait"
         );
         std::thread::sleep(Duration::from_millis(50));
     };
     assert!(live.1.end.is_none());
     check("live", live.0, &live.1);
 
-    rec.finish(Some(0), false, Duration::from_secs(30));
-    let (size, last) = read().expect("the final status.json");
+    rec.recorder.finish(Some(0), false, Duration::from_secs(30));
+    let (size, last) = read().expect("the final status row");
     assert!(last.end.is_some(), "the final write carries End");
     check("after End", size, &last);
 }
@@ -818,8 +1374,7 @@ async fn run_app_records_through_the_slot() {
     assert!(run_in(&slot, true).await);
     let dir = slot.dir().expect("a session opened");
     assert!(dir.starts_with(home.path().join(".heph").join(SESSIONS_DIR)));
-    let meta =
-        SessionMeta::decode(&std::fs::read(dir.join(files::META)).expect("meta")).expect("meta");
+    let meta = read_meta(&dir);
     assert_eq!(meta.cwd.as_deref(), Some(&*cwd.to_string_lossy()));
     assert_eq!(
         meta.workspace_root.as_deref(),
@@ -854,7 +1409,17 @@ fn killed_private_session(private: &Path) -> std::path::PathBuf {
     let dir = private.join(id.encode());
     std::fs::create_dir_all(&dir).expect("mkdir");
     std::fs::write(dir.join(files::LOCK), b"").expect("lock");
-    std::fs::write(dir.join(files::EVENTS), b"{}\n").expect("events");
+    unsealed_recording(&dir, id, &[event_record(events().remove(0))]);
+    // Killed more than a minute ago: a younger free lock may be a session
+    // still starting, which cleanup leaves alone.
+    let started = std::time::SystemTime::now()
+        .checked_sub(2 * cleanup::STARTING)
+        .expect("time");
+    std::fs::File::options()
+        .write(true)
+        .open(dir.join(files::LOCK))
+        .and_then(|f| f.set_modified(started))
+        .expect("backdate the lock");
     dir
 }
 
@@ -890,12 +1455,19 @@ async fn no_session_private_dir() {
     slot.finish(Some(0));
     assert!(!dir.exists(), "removed at exit");
 
+    // Each start below cleans: the hourly gate is `cleanup_runs_at_most_hourly`'s.
+    let every_start = Faults {
+        cleanup_interval: Some(Duration::ZERO),
+        ..Faults::default()
+    };
     for next in [public, SessionRoot::private(&private)] {
         let killed = killed_private_session(&private);
-        let session = Session::open(&next, start()).expect("open");
+        let session = Session::open_with(&next, start(), Retention::default(), every_start.clone())
+            .expect("open");
         session.finish(Some(0), false);
+        // The sweep is on the detached cleanup thread.
         assert!(
-            !killed.exists(),
+            eventually(|| !killed.exists()),
             "a {} start sweeps a killed private session",
             if next.is_private() {
                 "private"
@@ -904,6 +1476,72 @@ async fn no_session_private_dir() {
             }
         );
     }
+}
+
+/// Poll `cond` for up to 20 s; `false` if it never held.
+fn eventually(mut cond: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !cond() {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    true
+}
+
+/// Backdate `root`'s cleanup stamp past the interval, as an hour going by
+/// would.
+fn expire_stamp(root: &Path) {
+    let then = std::time::SystemTime::now()
+        .checked_sub(cleanup::INTERVAL + Duration::from_secs(60))
+        .expect("time");
+    std::fs::File::options()
+        .write(true)
+        .open(root.join(cleanup::STAMP))
+        .and_then(|f| f.set_modified(then))
+        .expect("backdate the stamp");
+}
+
+/// Cleanup runs at most once an hour per root, off the build's path (user
+/// decision 2026-11-24). The first start in a root cleans it; a start within
+/// the hour leaves an ended session it would remove alone; once the stamp is
+/// an hour old, the next start removes it. The private root beside a public
+/// one is cleaned in the same pass, under its own stamp.
+#[test]
+fn cleanup_runs_at_most_hourly() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let public = SessionRoot::for_reading(Some(home.path().as_os_str())).expect("home");
+    let private = home.path().join(".heph").join(PRIVATE_SESSIONS_DIR);
+
+    let first = killed_private_session(&private);
+    Session::open(&public, start())
+        .expect("open")
+        .finish(Some(0), false);
+    assert!(
+        eventually(|| !first.exists()),
+        "the first start in a root cleans it"
+    );
+
+    let second = killed_private_session(&private);
+    Session::open(&public, start())
+        .expect("open")
+        .finish(Some(0), false);
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(
+        second.exists(),
+        "a start within the hour of the last cleanup leaves the root alone"
+    );
+
+    expire_stamp(public.path());
+    expire_stamp(&private);
+    Session::open(&public, start())
+        .expect("open")
+        .finish(Some(0), false);
+    assert!(
+        eventually(|| !second.exists()),
+        "a start an hour after the last cleanup cleans again"
+    );
 }
 
 /// A4: no `HOME` means no session, and the build still runs.
@@ -926,6 +1564,35 @@ async fn home_unset_runs_without_session() {
     assert!(run_in(&slot, true).await);
     assert!(slot.dir().is_none());
     std::fs::set_permissions(ro.path(), std::fs::Permissions::from_mode(0o700)).expect("chmod");
+}
+
+/// I1: a filesystem whose `journal_mode=WAL` answers another mode stops the
+/// recording before it starts, with one warning; the build still runs and
+/// ends as it would have, and the session's directory is gone.
+#[tokio::test]
+async fn wal_refused_stops_the_recorder() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let root = home.path().join("sessions");
+    let slot = Arc::new(SessionSlot::new());
+    slot.configure(Ok(Some(SessionRoot::new(&root))), vec!["heph".into()]);
+    slot.set_faults(Faults {
+        refuse_wal: true,
+        ..Faults::default()
+    });
+    let captured = Captured::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(captured.clone())
+        .with_ansi(false)
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    let ran = run_in(&slot, true).await;
+    drop(guard);
+    assert!(ran, "the build ran");
+    assert!(slot.dir().is_none(), "no session");
+    let log = captured.settled_log();
+    assert_eq!(log.matches("WARN").count(), 1, "{log}");
+    assert!(log.contains("WAL"), "{log}");
+    assert_eq!(entries(&root), 0, "nothing left under the root");
 }
 
 /// The file source follows a live session from its directory: the records so
@@ -1046,25 +1713,17 @@ async fn follow_sees_an_end_written_mid_follow() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn follow_reads_a_lock_freed_without_end_as_lost() {
     use futures::StreamExt as _;
-    // A real session gives a real `meta.json` and a first record; the owner
-    // below is hand-made so it can die without writing `End`.
-    let template = tempfile::tempdir().expect("tempdir");
-    let real = Session::open(&SessionRoot::new(template.path()), start()).expect("open");
-    real.tap()
-        .event(events().into_iter().next().expect("one event"));
-    real.finish(Some(0), false);
-    let events_file = std::fs::read_to_string(real.dir().join(files::EVENTS)).expect("events");
-    let first = events_file.lines().next().expect("a first record");
-
+    // A hand-made owner, so it can die without writing `End`: the lock, then
+    // a recording with a first record.
     let root = tempfile::tempdir().expect("tempdir");
-    let dir = root.path().join(real.id().encode());
+    let id = SessionId::new(hcore::events::now_unix_ms(), 3);
+    let dir = root.path().join(id.encode());
     std::fs::create_dir(&dir).expect("mkdir");
-    std::fs::copy(real.dir().join(files::META), dir.join(files::META)).expect("meta");
-    std::fs::write(dir.join(files::EVENTS), format!("{first}\n")).expect("events");
     let lock = lockfile::acquire_owner_lock(&dir.join(files::LOCK)).expect("lock");
+    unsealed_recording(&dir, id, &[event_record(events().remove(0))]);
 
     let source = FileSource::new(root.path());
-    let mut stream = source.subscribe(real.id()).await.expect("subscribe");
+    let mut stream = source.subscribe(id).await.expect("subscribe");
     assert_eq!(until_caught_up(&mut stream).await, 1);
     // Held: several ticks pass with nothing to say.
     assert!(
@@ -1099,11 +1758,13 @@ async fn follow_reads_a_lock_freed_without_end_as_lost() {
 async fn inflight_is_refused_without_the_capability() {
     let root = tempfile::tempdir().expect("tempdir");
     let session = Session::open(&SessionRoot::new(root.path()), start()).expect("open");
-    let meta_path = session.dir().join(files::META);
-    let mut meta = SessionMeta::decode(&std::fs::read(&meta_path).expect("meta")).expect("meta");
-    assert!(meta.has_capability(CAPABILITY_INFLIGHT), "precondition");
-    meta.capabilities.clear();
-    std::fs::write(&meta_path, serde_json::to_vec(&meta).expect("encode")).expect("write meta");
+    assert!(
+        read_meta(session.dir()).has_capability(CAPABILITY_INFLIGHT),
+        "precondition"
+    );
+    alter(session.dir())
+        .execute("UPDATE session SET capabilities = '[]'", [])
+        .expect("write the session row");
 
     let err = FileSource::new(root.path())
         .inflight(session.id(), Duration::from_secs(5))
@@ -1400,4 +2061,168 @@ fn output_records_are_capped() {
             huge.len() - kept.len()
         )
     );
+}
+
+/// Every row of the explorer tables, each as its columns' debug text, sorted.
+fn explorer_rows(conn: &rusqlite::Connection) -> Vec<String> {
+    let mut rows = Vec::new();
+    for table in ["spans", "span_events", "metrics"] {
+        let mut stmt = conn
+            .prepare(&format!("SELECT * FROM {table}"))
+            .expect("prepare");
+        let n = stmt.column_count();
+        let mut q = stmt.query([]).expect("query");
+        while let Some(row) = q.next().expect("row") {
+            let cols: Vec<String> = (0..n)
+                .map(|i| format!("{:?}", row.get_ref(i).expect("column")))
+                .collect();
+            rows.push(format!("{table}: {}", cols.join(" | ")));
+        }
+    }
+    rows.sort();
+    rows
+}
+
+/// I4: re-deriving a sealed recording from its records gives exactly the
+/// explorer rows the owner derived live — for a whole run, for one past its
+/// full cap only (derivation goes on over the critical kinds), and for one
+/// cut at the ceiling, where both stop at the same record. Each case checks
+/// it reached the cap it claims (the `Truncated` count, `truncated_seq`
+/// set only at the ceiling), and that past the full cap only critical kinds
+/// were kept, so a cap that stopped firing turns a capped case into a whole
+/// run and fails here rather than passing vacuously.
+#[test]
+fn rederive_matches_the_live_derivation() {
+    let cases = [
+        (Faults::default(), 0),
+        (capped(2 * MIB, 64 * MIB), 1),
+        (capped(2 * MIB, 4 * MIB), 2),
+    ];
+    for (faults, cuts) in cases {
+        let root = tempfile::tempdir().expect("tempdir");
+        let rec = recorder_with(root.path(), faults.clone());
+        let tap = rec.tap();
+        for ev in events() {
+            tap.event(ev);
+        }
+        for i in 0..8 {
+            let addr = format!("//b:t{i}");
+            tap.event(BuildEvent {
+                at_unix_ms: 10 + i,
+                kind: BuildEventKind::ResultStart { addr: addr.clone() },
+            });
+            let mut end = big_event();
+            end.at_unix_ms = 11 + i;
+            if let BuildEventKind::ResultEnd { addr: a, .. } = &mut end.kind {
+                *a = addr;
+            }
+            tap.event(end);
+        }
+        // Progress-only and a log line: dropped once past the full cap.
+        tap.event(events().remove(0));
+        assert!(tap.log(1, "INFO", "late".into()).is_none());
+        rec.recorder.finish(Some(1), false, Duration::from_secs(10));
+
+        let (records, skipped) = read_records(rec.dir());
+        assert_eq!(skipped, 0);
+        let truncated: Vec<usize> = records
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.session == Some(SessionRecordKind::Truncated))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(truncated.len(), cuts, "{faults:?}");
+        if let Some(&first) = truncated.first() {
+            assert!(
+                records[first + 1..].iter().all(recorder::is_critical),
+                "only critical kinds past the full cap ({faults:?})"
+            );
+            assert!(
+                records[first + 1..]
+                    .iter()
+                    .any(|r| matches!(r.kind, Some(BuildEventKind::ResultEnd { .. }))),
+                "a critical kind is kept past the full cap ({faults:?})"
+            );
+        }
+        let conn = alter(rec.dir());
+        let end = store::read_row_end(&conn).expect("row end");
+        // The session row's `truncated` is the ceiling's mark (I8); the
+        // full cap alone shows in the `status` row and a `Truncated` record.
+        assert_eq!(end.truncated, cuts == 2, "{faults:?}");
+        assert_eq!(end.truncated_seq.is_some(), cuts == 2, "{faults:?}");
+        let (_, status) = read_status(rec.dir()).expect("a status row");
+        assert_eq!(status.truncated, cuts > 0, "{faults:?}");
+        let live = explorer_rows(&conn);
+        assert!(
+            live.iter().any(|r| r.starts_with("spans: ")),
+            "the live derivation wrote spans ({faults:?})"
+        );
+        store::rederive(&conn).expect("rederive");
+        assert_eq!(explorer_rows(&conn), live, "{faults:?}");
+    }
+}
+
+/// A recording a `kill -9` left (WAL mode, no `End`, `sealed=0`) is sealed
+/// in place by `seal_lost`: rollback mode, `sealed`, its last record's time
+/// as its end, no exit code. It runs during a build, so it repairs nothing
+/// (I1, D14): the explorer rows stay what the crash left, and the derivation
+/// is stamped stale for a session command to re-derive.
+#[test]
+fn seal_lost_seals_a_killed_recording() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let id = SessionId::new(hcore::events::now_unix_ms(), 9);
+    let dir = root.path().join(id.encode());
+    std::fs::create_dir(&dir).expect("mkdir");
+    std::fs::write(dir.join(files::LOCK), b"").expect("lock");
+    let records: Vec<SessionRecord> = events().into_iter().map(event_record).collect();
+    unsealed_recording(&dir, id, &records);
+    let path = dir.join(store::FILE);
+    let before = {
+        let conn = alter(&dir);
+        let rows = explorer_rows(&conn);
+        assert!(
+            rows.iter().any(|r| r.starts_with("spans: ")),
+            "precondition: the live derivation wrote result spans"
+        );
+        rows
+    };
+    assert!(
+        store::read_header(&path)
+            .expect("header")
+            .expect("heph")
+            .wal,
+        "precondition: left in WAL mode"
+    );
+
+    assert_eq!(store::seal_lost(&path).expect("seal"), store::Sealed::Done);
+    assert!(
+        !store::read_header(&path)
+            .expect("header")
+            .expect("heph")
+            .wal
+    );
+    let opened = open(&dir);
+    assert!(!opened.is_copy(), "sealed: read in place");
+    let end = store::read_row_end(&opened.conn).expect("row end");
+    assert!(end.sealed, "{end:?}");
+    let last = records.last().map(|r| r.at_unix_ms).expect("records");
+    assert_eq!(end.ended_ms, Some(i64::try_from(last).expect("ms")));
+    let exit: Option<i64> = opened
+        .conn
+        .query_row("SELECT exit_code FROM session", [], |r| r.get(0))
+        .expect("exit code");
+    assert_eq!(exit, None);
+    assert_eq!(
+        explorer_rows(&opened.conn),
+        before,
+        "a build's cleanup re-derives nothing"
+    );
+    let derivation: u32 = opened
+        .conn
+        .query_row("SELECT derivation FROM session", [], |r| r.get(0))
+        .expect("derivation");
+    assert_eq!(derivation, store::STALE_DERIVATION);
+    drop(opened);
+    let (read, _) = read_records(&dir);
+    assert_eq!(read.len(), records.len(), "every record kept");
 }

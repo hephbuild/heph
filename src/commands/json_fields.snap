@@ -88,6 +88,7 @@ session list	cwd	string?	free	default
 session list	exit_code	number?	free	default
 session list	format	number?	free	default
 session list	id	string	free	default
+session list	incomplete	bool?	free	default
 session list	last_event_unix_ms	number?	free	default
 session list	now	string?	free	default
 session list	owner_pid	number?	free	default
@@ -144,6 +145,9 @@ session show	end.panicked	bool	free	default
 session show	failed	[string]	free	default
 session show	first_event_unix_ms	number?	free	default
 session show	id	string	free	default
+session show	incomplete	bool	free	default
+session show	incomplete_reason	"size_cap"	free	default
+session show	incomplete_reason	string?	free	default
 session show	last_event_unix_ms	number?	free	default
 session show	lock_waits	[object]	free	default
 session show	lock_waits[].addr	string	free	default
@@ -163,10 +167,18 @@ session show	next.kind	"rerun"	free	default
 session show	next.kind	"show_holder"	free	default
 session show	next.kind	string	free	default
 session show	next.reason	string	free	default
+session show	pools	[object]	free	default
+session show	pools[].capacity	number?	free	default
+session show	pools[].held_mean	number	free	default
+session show	pools[].held_peak	number	free	default
+session show	pools[].pool	string	free	default
+session show	pools[].unit	string	free	default
+session show	pools[].waiting_us	number	free	default
 session show	running	[object]	free	default
 session show	running[].addr	string	free	default
 session show	running[].op	string	free	default
 session show	running[].since_unix_ms	number	free	default
+session show	skipped	number	free	default
 session show	state	"failed"	free	default
 session show	state	"lost"	free	default
 session show	state	"ok"	free	default

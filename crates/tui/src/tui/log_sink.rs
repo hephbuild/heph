@@ -1,4 +1,4 @@
-use std::io::{self, Seek as _, SeekFrom, Write};
+use std::io::{self, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 use tracing::Level;
 use tracing_subscriber::fmt::MakeWriter;
 
-use crate::tui::session::{RecordReader, SessionRecordKind, SessionSlot};
+use crate::tui::session::{SessionRecordKind, SessionSlot, store};
 
 /// One write to the sink — a formatted log line or a diagnostic — and its
 /// number, from 1, in the order the sink took them. The session's `Log`
@@ -48,12 +48,12 @@ pub struct LogSink {
 }
 
 /// Where a full screen took the terminal over: the last line printed before
-/// it, and a byte offset in `events.ndjson` at or before the record of every
-/// later line. See [`LogSink::replay_mark`].
+/// it, and a record `seq` in the session's recording before the record of
+/// every later line. See [`LogSink::replay_mark`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReplayMark {
     pub last_printed: u64,
-    offset: u64,
+    after_seq: i64,
 }
 
 /// What a [`LogSink::replay`] did.
@@ -62,7 +62,7 @@ pub struct Replayed {
     /// The last number the replay covers: the printer drops every queued line
     /// numbered at most this, and prints the later ones.
     pub through: u64,
-    /// Lines printed from `events.ndjson`.
+    /// Lines printed from the session's recording.
     pub printed: u64,
     /// Lines in the range that were not on disk (past the ceiling, dropped,
     /// or no session to read): the one `WARN` says how many.
@@ -133,19 +133,20 @@ impl LogSink {
     /// when the screen closes. While the screen is up the caller keeps only
     /// the numbers of the lines it drops, never their text.
     ///
-    /// The offset is read **before** the lock is taken: every line numbered
+    /// The `seq` is read **before** the lock is taken: every line numbered
     /// past the mark is numbered after it, so its record lands after every
-    /// byte already on disk. Read after, a record flushed in between would be
-    /// behind it and never replayed.
+    /// record already committed. Read after, a record committed in between
+    /// would be behind it and never replayed.
     pub fn replay_mark(
         &self,
         rx: &mut mpsc::UnboundedReceiver<SinkLine>,
     ) -> (Vec<SinkLine>, ReplayMark) {
-        let offset = self
+        let after_seq = self
             .session
             .replay_source()
-            .and_then(|(_, events)| std::fs::metadata(events).ok())
-            .map_or(0, |m| m.len());
+            .and_then(|(_, dir)| store::open_live(&dir.join(store::FILE)).ok())
+            .and_then(|conn| store::last_seq(&conn).ok())
+            .unwrap_or(0);
         let state = self.lock();
         let mut queued = Vec::new();
         while let Ok(line) = rx.try_recv() {
@@ -153,14 +154,14 @@ impl LogSink {
         }
         let mark = ReplayMark {
             last_printed: state.seq,
-            offset,
+            after_seq,
         };
         drop(state);
         (queued, mark)
     }
 
     /// The lines numbered past `mark.last_printed`, read back from the
-    /// session's `events.ndjson` and handed to `print` in order, each once,
+    /// session's recording and handed to `print` in order, each once,
     /// with its newline: what a closed full screen kept off the terminal.
     ///
     /// It first takes the latest number, then flushes the recorder through it
@@ -194,16 +195,16 @@ impl LogSink {
         let mut why: Option<String> = None;
         match self.session.replay_source() {
             None => why = Some("this run records no session".to_owned()),
-            Some((tap, events)) => {
+            Some((tap, dir)) => {
                 if let Err(e) = tap.flush(flush_timeout) {
                     why = Some(e.to_string());
                 }
                 // What is on disk is printed even when the flush failed.
-                if let Err(e) = read_lines(&events, mark, through, |bytes| {
+                if let Err(e) = read_lines(&dir, mark, through, |bytes| {
                     printed += 1;
                     print(bytes);
                 }) {
-                    why = Some(format!("reading {}: {e}", events.display()));
+                    why = Some(format!("reading {}: {e}", dir.join(store::FILE).display()));
                 }
             }
         }
@@ -259,28 +260,24 @@ impl LogSink {
     }
 }
 
-/// What every encoded `Log` record contains: the recorder writes compact
-/// JSON, and `SessionRecordKind` is tagged by `type`.
-const LOG_RECORD: &[u8] = br#""type":"Log""#;
-
-/// Hand `print` each `Log` record of `events` numbered in
-/// `(mark.last_printed, through]`, from `mark`'s offset, in order and once
-/// each, with its newline back on. Only lines holding [`LOG_RECORD`] are
-/// decoded: the build events between them, the bulk of a busy file, are
-/// passed over.
+/// Hand `print` each `Log` record of the session recorded in `dir` numbered
+/// in `(mark.last_printed, through]`, from `mark`'s `seq`, in order and once
+/// each, with its newline back on. Only `Log` rows are decoded: the build
+/// events between them, the bulk of a busy recording, are passed over by the
+/// `kind` column.
 fn read_lines(
-    events: &Path,
+    dir: &Path,
     mark: ReplayMark,
     through: u64,
     mut print: impl FnMut(&[u8]),
 ) -> io::Result<()> {
-    let mut file = std::fs::File::open(events)?;
-    file.seek(SeekFrom::Start(mark.offset))?;
-    let mut reader = RecordReader::new(io::BufReader::new(file));
-    let needle = memchr::memmem::Finder::new(LOG_RECORD);
+    let root = dir.parent().unwrap_or(dir);
+    let opened = store::open_local(root, dir).map_err(io::Error::other)?;
+    let mut cursor = store::RecordCursor::new(opened);
+    cursor.start_after(mark.after_seq);
     let mut last = mark.last_printed;
     let mut line = Vec::new();
-    while let Some(record) = reader.next_containing(&needle)? {
+    while let Some(record) = cursor.next_of_kind("Log")? {
         let Some(SessionRecordKind::Log { msg, seq, .. }) = record.session else {
             continue;
         };
@@ -357,56 +354,56 @@ impl<'a> MakeWriter<'a> for MakeLogSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::session::SessionRecord;
+    use crate::tui::session::{Session, SessionRoot, SessionStart};
 
-    fn log_record(seq: u64, msg: &str) -> Vec<u8> {
-        let mut line = serde_json::to_vec(&SessionRecord::session(
-            seq,
-            SessionRecordKind::Log {
-                level: "INFO".into(),
-                msg: msg.into(),
-                seq,
-            },
-        ))
-        .expect("encode");
-        line.push(b'\n');
-        line
-    }
-
-    /// The replay reads only the `Log` records in the range, however many
-    /// build events lie between the mark and the replay, and its prefilter
-    /// matches what the recorder writes.
+    /// The replay reads only the `Log` records in the range, from the
+    /// recording a real recorder wrote, however many build events (pages of
+    /// them) lie between the mark and the replay — one naming `Log` in a
+    /// string included.
     #[test]
     fn replay_reads_logs_through_a_large_event_volume() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("events.ndjson");
-        let mut bytes = log_record(1, "before the mark");
-        assert!(
-            memchr::memmem::find(&bytes, LOG_RECORD).is_some(),
-            "a Log record holds the prefilter's needle"
-        );
-        let offset = bytes.len() as u64;
-        // A build event naming the needle in a string is escaped, so it is
-        // passed over too.
-        let event = concat!(
-            r#"{"at_unix_ms":5,"kind":{"type":"ResultEnd","addr":"//a:b","#,
-            r#""error":"said \"type\":\"Log\""}}"#,
-            "\n"
-        );
+        let root = tempfile::tempdir().expect("tempdir");
+        let session =
+            Session::open(&SessionRoot::new(root.path()), SessionStart::default()).expect("open");
+        let tap = session.tap();
+        drop(tap.log(1, "INFO", "before the mark".into()));
+        tap.flush(Duration::from_secs(10)).expect("flush");
+        let after_seq = store::last_seq(
+            &store::open_local(root.path(), session.dir())
+                .expect("open")
+                .conn,
+        )
+        .expect("last seq");
+        assert!(after_seq > 0, "the first line is recorded");
+        let event = || hcore::events::BuildEvent {
+            at_unix_ms: 5,
+            kind: hcore::events::BuildEventKind::ResultEnd {
+                left_behind: None,
+                cancelled: false,
+                addr: "//a:b".into(),
+                error: Some(r#"said "type":"Log""#.into()),
+                upstream_of: None,
+                exit_status: None,
+                exit_code: None,
+                log_tail: None,
+                timed_out: None,
+                spans: Vec::new(),
+            },
+        };
         for seq in 2..=5 {
-            for _ in 0..50_000 {
-                bytes.extend_from_slice(event.as_bytes());
+            for _ in 0..2_000 {
+                tap.event(event());
             }
-            bytes.extend_from_slice(&log_record(seq, &format!("line {seq}")));
+            drop(tap.log(seq, "INFO", format!("line {seq}")));
         }
-        std::fs::write(&path, &bytes).expect("write");
+        session.finish(Some(0), false);
 
         let mark = ReplayMark {
             last_printed: 1,
-            offset,
+            after_seq,
         };
         let mut printed = Vec::new();
-        read_lines(&path, mark, 4, |line| printed.push(line.to_vec())).expect("replay");
+        read_lines(session.dir(), mark, 4, |line| printed.push(line.to_vec())).expect("replay");
         assert_eq!(
             printed,
             vec![

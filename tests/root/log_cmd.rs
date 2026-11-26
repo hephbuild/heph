@@ -364,7 +364,8 @@ fn log_cmd_follow_says_how_the_run_ended() {
     }
 }
 
-/// The entries of `dir`, none when it does not exist.
+/// The entries of `dir`, none when it does not exist. A root's cleanup stamp
+/// is not a session, and is left out.
 fn entries(dir: &Path) -> Vec<String> {
     if !dir.exists() {
         return Vec::new();
@@ -372,6 +373,7 @@ fn entries(dir: &Path) -> Vec<String> {
     std::fs::read_dir(dir)
         .expect("read_dir")
         .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .filter(|name| name != htui::tui::session::cleanup::STAMP)
         .collect()
 }
 

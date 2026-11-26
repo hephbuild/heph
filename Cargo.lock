@@ -462,6 +462,7 @@ dependencies = [
  "hex",
  "libc",
  "portable-pty",
+ "rusqlite",
  "serde_json",
  "sha2 0.11.1",
  "tempfile",
@@ -989,6 +990,7 @@ dependencies = [
  "serde_yaml",
  "tempfile",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1791,6 +1793,7 @@ dependencies = [
  "testkit",
  "tokio",
  "tracing-subscriber",
+ "tui",
  "xattr",
 ]
 
@@ -7881,13 +7884,16 @@ dependencies = [
  "crossterm",
  "futures",
  "hashbrown 0.17.1",
+ "hex",
  "libc",
  "memchr",
  "output-derive",
  "proc",
  "ratatui",
+ "rusqlite",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "shlex",
  "telemetry",
  "tempfile",
