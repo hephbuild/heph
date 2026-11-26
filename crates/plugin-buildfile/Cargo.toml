@@ -39,6 +39,9 @@ starlark = "0.14.2"
 starlark_syntax = "0.14.2"
 strsim = "0.11.1"
 allocative = "0.3"
+# `str | dict` in `heph.core.matrix`'s typed signature: starlark's
+# `StarlarkTypeRepr` takes a union as `Either`.
+either = "1.19"
 # The LSP owns its loop and vendors starlark_lsp's analysis modules
 # (`vendored-starlark-lsp`), so these pins no longer follow starlark's release
 # cadence; they stay where the vendored modules were written against

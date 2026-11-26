@@ -1,4 +1,5 @@
 use crate::pluginbuildfile::checks::targets::CheckKind;
+use crate::pluginbuildfile::matrix;
 use crate::pluginbuildfile::provider::{PackageList, Provider};
 use anyhow::Context;
 use enclose::enclose;
@@ -20,7 +21,7 @@ use starlark::syntax::{AstModule, Dialect};
 use starlark::values::dict::DictRef;
 use starlark::values::float::UnpackFloat;
 use starlark::values::list::{AllocList, ListRef, UnpackList};
-use starlark::values::{UnpackValue, Value};
+use starlark::values::{UnpackValue, Value, ValueOfUnchecked};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -546,6 +547,7 @@ impl<'v> starlark::values::StarlarkValue<'v> for ProviderNativeFn {
                     approval: dt.approval,
                     config: dt.config,
                     provenance: Vec::new(),
+                    site: DeclSite::default(),
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()
@@ -568,8 +570,10 @@ impl<'v> starlark::values::StarlarkValue<'v> for ProviderNativeFn {
             } else {
                 Vec::new()
             };
+            let site = DeclSite::capture(eval, extra);
             for mut t in targets {
                 t.provenance = provenance.clone();
+                t.site = site.clone();
                 (extra.on_target)(t).map_err(starlark::Error::new_other)?;
             }
         }
@@ -645,6 +649,143 @@ pub(crate) struct OnTargetPayload {
     /// Source call sites that produced this target (innermost `target()` call
     /// first). See [`hplugin::provider::ProvenanceFrame`].
     pub provenance: Vec<ProvenanceFrame>,
+    /// Where it was declared, for the error two diverging declarations of one
+    /// name raise. Never reaches the `TargetSpec` (I1).
+    pub site: DeclSite,
+}
+
+/// The call that declared a target: the `target()` (or plugin function) call
+/// and the matrix cell it ran in, if any. Captured on every declaration (one
+/// span clone, unlike [`capture_provenance`]'s stack walk), rendered only when a
+/// duplicate needs naming.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DeclSite {
+    pub span: Option<starlark::codemap::FileSpan>,
+    pub cell: Option<Arc<str>>,
+}
+
+impl DeclSite {
+    fn capture(eval: &Evaluator, extra: &Extra) -> Self {
+        Self {
+            span: eval.call_stack_top_location(),
+            cell: extra.cell.borrow().clone(),
+        }
+    }
+
+    /// `p/BUILD:12 (cell platform=linux/amd64)`.
+    fn render(&self, root: &Path) -> String {
+        let mut out = match &self.span {
+            Some(span) => format!(
+                "{}:{}",
+                rel_display(root, Path::new(span.filename())),
+                span.resolve_span().begin.line + 1
+            ),
+            None => "<unknown>".to_string(),
+        };
+        if let Some(cell) = &self.cell {
+            out.push_str(" (cell ");
+            out.push_str(cell);
+            out.push(')');
+        }
+        out
+    }
+}
+
+/// The fields two declarations of one name differ in, as the user wrote them
+/// (`driver`, `config.url`, `labels`, `transitive.deps`, `approval`); empty
+/// when they are identical. Compares the normalized fields that become the
+/// `TargetSpec`, never their `Debug` or serde output (whose map order would make
+/// one file pass one run and fail the next); provenance and site are not part
+/// of a declaration. Floats compare by bits, so `-0.0` and `0.0` diverge, and an
+/// omitted driver diverges from the explicit default.
+fn diverging_fields(a: &OnTargetPayload, b: &OnTargetPayload) -> Vec<String> {
+    let mut out = Vec::new();
+    if a.driver != b.driver {
+        out.push("driver".to_string());
+    }
+    let mut keys: Vec<&String> = a.config.keys().chain(b.config.keys()).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    for k in keys {
+        let same = match (a.config.get(k), b.config.get(k)) {
+            (Some(x), Some(y)) => same_value(x, y),
+            _ => false,
+        };
+        if !same {
+            out.push(format!("config.{k}"));
+        }
+    }
+    if a.labels != b.labels {
+        out.push("labels".to_string());
+    }
+    let (ta, tb) = (&a.transitive, &b.transitive);
+    let same_tools = ta.tools.len() == tb.tools.len()
+        && ta.tools.iter().zip(&tb.tools).all(|(x, y)| {
+            x.r#ref == y.r#ref && x.group == y.group && x.hash == y.hash && x.id == y.id
+        });
+    if !same_tools {
+        out.push("transitive.tools".to_string());
+    }
+    let same_deps = ta.deps.len() == tb.deps.len()
+        && ta.deps.iter().zip(&tb.deps).all(|(x, y)| {
+            x.r#ref == y.r#ref
+                && matches!(
+                    (&x.mode, &y.mode),
+                    (Mode::None, Mode::None) | (Mode::Link, Mode::Link)
+                )
+                && x.group == y.group
+                && x.runtime == y.runtime
+                && x.hash == y.hash
+                && x.id == y.id
+        });
+    if !same_deps {
+        out.push("transitive.deps".to_string());
+    }
+    let same_env = ta.env.len() == tb.env.len()
+        && ta.env.iter().all(|(k, x)| {
+            tb.env.get(k).is_some_and(|y| {
+                let value = match (&x.value, &y.value) {
+                    (EnvValue::Literal(p), EnvValue::Literal(q)) => p == q,
+                    (EnvValue::Pass, EnvValue::Pass) => true,
+                    _ => false,
+                };
+                value
+                    && x.hash == y.hash
+                    && x.append == y.append
+                    && x.append_prefix == y.append_prefix
+            })
+        });
+    if !same_env {
+        out.push("transitive.env".to_string());
+    }
+    if a.approval != b.approval {
+        out.push("approval".to_string());
+    }
+    out
+}
+
+/// Structural equality of two config values, order-free for maps and with
+/// floats compared by their bits (`PartialEq` on `f64` calls `-0.0` and `0.0`
+/// equal, and a `NaN` unequal to itself).
+fn same_value(a: &htvalue::Value, b: &htvalue::Value) -> bool {
+    use htvalue::Value as V;
+    match (a, b) {
+        (V::Float(x), V::Float(y)) => x.to_bits() == y.to_bits(),
+        (V::Map(x), V::Map(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .all(|(k, v)| y.get(k).is_some_and(|w| same_value(v, w)))
+        }
+        (V::List(x), V::List(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(v, w)| same_value(v, w))
+        }
+        (V::String(x), V::String(y)) => x == y,
+        (V::Bool(x), V::Bool(y)) => x == y,
+        (V::Int(x), V::Int(y)) => x == y,
+        (V::Uint(x), V::Uint(y)) => x == y,
+        (V::Null(), V::Null()) => true,
+        _ => false,
+    }
 }
 
 /// Parse a BUILD-file `approval` value into an [`Approval`]. Two spellings:
@@ -885,11 +1026,41 @@ fn empty_run_result() -> anyhow::Result<RunResult> {
     })
 }
 
-fn merge_pkg_results(parts: &[Arc<RunResult>]) -> anyhow::Result<RunResult> {
-    let mut targets = vec![];
+/// Merge the results of a package's BUILD files (in file order) into the
+/// package's. Two declarations of one name with diverging configs fail, naming
+/// both sites and the fields that differ (I9, D19); identical ones collapse to
+/// the first, which keeps its position, so target order stays stable.
+fn merge_pkg_results(
+    root: &Path,
+    pkg: &str,
+    parts: &[Arc<RunResult>],
+) -> anyhow::Result<RunResult> {
+    let mut targets: Vec<OnTargetPayload> = Vec::new();
     let mut states = vec![];
+    let mut seen: HashMap<&str, usize> = HashMap::new();
     for part in parts {
-        targets.extend(part.targets.iter().cloned());
+        for t in &part.targets {
+            let Some(&first) = seen.get(t.name.as_str()) else {
+                seen.insert(t.name.as_str(), targets.len());
+                targets.push(t.clone());
+                continue;
+            };
+            let Some(kept) = targets.get(first) else {
+                continue;
+            };
+            let fields = diverging_fields(kept, t);
+            if !fields.is_empty() {
+                anyhow::bail!(
+                    "{} is declared twice with different configs: {} and {}. They differ in {}: \
+                     remove one declaration, or make them identical",
+                    htaddr::Addr::new(PkgBuf::from(pkg), t.name.clone(), Default::default())
+                        .format(),
+                    kept.site.render(root),
+                    t.site.render(root),
+                    fields.join(", "),
+                );
+            }
+        }
         states.extend(part.states.iter().cloned());
     }
     let frozen = Module::with_temp_heap(|module| -> anyhow::Result<FrozenModule> {
@@ -923,10 +1094,47 @@ fn merge_pkg_results(parts: &[Arc<RunResult>]) -> anyhow::Result<RunResult> {
     Ok(RunResult::new(targets, states, frozen))
 }
 
+/// The platform `heph.core.os()` and the other host readers report, and the
+/// one `heph.core.matrix(default = "host")` matches. Read once per evaluation
+/// from [`hcore::htplatform`]; tests inject another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Host {
+    /// Canonical (Go/OCI) naming: `linux`, `darwin`.
+    pub os: &'static str,
+    /// Canonical (Go/OCI) naming: `amd64`, `arm64`.
+    pub arch: &'static str,
+    /// As Rust reports it: `linux`, `macos`.
+    pub os_raw: &'static str,
+    /// As Rust reports it: `x86_64`, `aarch64`.
+    pub arch_raw: &'static str,
+}
+
+impl Host {
+    pub(crate) fn current() -> Self {
+        Self {
+            os: hcore::htplatform::os(),
+            arch: hcore::htplatform::arch(),
+            os_raw: hcore::htplatform::os_raw(),
+            arch_raw: hcore::htplatform::arch_raw(),
+        }
+    }
+
+    /// `os/arch`, as `heph.core.host()` prints it.
+    pub(crate) fn platform(&self) -> String {
+        format!("{}/{}", self.os, self.arch)
+    }
+}
+
 #[derive(ProvidesStaticType)]
 pub(crate) struct Extra<'a> {
     pub pkg: &'a str,
     pub root: &'a Path,
+    /// The host every `heph.core` host reader reports.
+    pub host: Host,
+    /// The cell being run while a `heph.core.matrix()` cell function runs
+    /// (`platform=linux/arm64`), else `None`: stamped on what the cell declares,
+    /// for the duplicate-declaration error, and how a nested matrix is refused.
+    pub cell: std::cell::RefCell<Option<Arc<str>>>,
     pub on_state: Box<dyn Fn(OnStatePayload) -> anyhow::Result<()>>,
     pub on_target: Box<dyn Fn(OnTargetPayload) -> anyhow::Result<()>>,
     /// Every package in the workspace (dir with a matching BUILD file, plus its
@@ -1229,6 +1437,7 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
             approval,
             config,
             provenance,
+            site: DeclSite::capture(eval, extra),
         };
 
         (extra.on_target)(p)?;
@@ -1383,26 +1592,96 @@ fn host_resource(name: &str) -> anyhow::Result<HostAmount> {
     }
 }
 
+/// The evaluation's [`Extra`], for a builtin that reads it.
+fn extra_of<'a>(eval: &Evaluator<'_, 'a, '_>, builtin: &str) -> starlark::Result<&'a Extra<'a>> {
+    eval.extra
+        .and_then(|e| e.downcast_ref::<Extra>())
+        .ok_or_else(|| {
+            starlark::Error::new_other(anyhow::anyhow!(
+                "{builtin} needs a BUILD-file evaluation (no evaluator extra is set)"
+            ))
+        })
+}
+
 #[starlark_module]
 fn heph_core_module(builder: &mut GlobalsBuilder) {
     /// Host operating system in canonical (Go/OCI) naming, e.g. `linux`, `darwin`.
-    fn os() -> starlark::Result<String> {
-        Ok(hcore::htplatform::os().to_string())
+    fn os<'v>(eval: &mut Evaluator<'v, '_, '_>) -> starlark::Result<String> {
+        Ok(extra_of(eval, "heph.core.os()")?.host.os.to_string())
     }
 
     /// Host architecture in canonical (Go/OCI) naming, e.g. `amd64`, `arm64`.
-    fn arch() -> starlark::Result<String> {
-        Ok(hcore::htplatform::arch().to_string())
+    fn arch<'v>(eval: &mut Evaluator<'v, '_, '_>) -> starlark::Result<String> {
+        Ok(extra_of(eval, "heph.core.arch()")?.host.arch.to_string())
     }
 
     /// Host operating system as Rust reports it, e.g. `linux`, `macos`.
-    fn os_raw() -> starlark::Result<String> {
-        Ok(hcore::htplatform::os_raw().to_string())
+    fn os_raw<'v>(eval: &mut Evaluator<'v, '_, '_>) -> starlark::Result<String> {
+        Ok(extra_of(eval, "heph.core.os_raw()")?
+            .host
+            .os_raw
+            .to_string())
     }
 
     /// Host architecture as Rust reports it, e.g. `x86_64`, `aarch64`.
-    fn arch_raw() -> starlark::Result<String> {
-        Ok(hcore::htplatform::arch_raw().to_string())
+    fn arch_raw<'v>(eval: &mut Evaluator<'v, '_, '_>) -> starlark::Result<String> {
+        Ok(extra_of(eval, "heph.core.arch_raw()")?
+            .host
+            .arch_raw
+            .to_string())
+    }
+
+    /// The host platform as `os/arch` in canonical naming, e.g.
+    /// `darwin/arm64`: the string `heph.core.matrix(default = "host")` matches
+    /// against an axis named `platform`.
+    fn host<'v>(eval: &mut Evaluator<'v, '_, '_>) -> starlark::Result<String> {
+        Ok(extra_of(eval, "heph.core.host()")?.host.platform())
+    }
+
+    /// Enumerate the cells of a matrix and call `cell` once per cell, with one
+    /// keyword argument per axis. Returns a value with two attributes:
+    ///
+    /// - `cells`: what each call returned, unchanged, keyed by cell, in cell
+    ///   order (the cross product, last axis fastest, minus `exclude`, then
+    ///   `include`). A key is the bare value for one axis (`"linux/arm64"`), a
+    ///   tuple in axis order for several (`("1.23.1", "linux/arm64")`).
+    /// - `default`: the value of the cell `default` selects. `"host"` needs an
+    ///   axis named `platform` (`os/arch`, as `heph.core.host()` prints it) or
+    ///   axes named `os` and `arch`; a dict names a value per axis, where
+    ///   `"host"` stands for the host's. Reading it raises when the host has no
+    ///   cell, or when no `default` was given.
+    ///
+    /// `axes` maps each axis name (a Starlark identifier) to its values
+    /// (strings of `A-Z a-z 0-9 . _ / + -`); its order orders tuple keys.
+    /// Without `cell`, each value is the cell's dict of axis values. `exclude`
+    /// removes cells of the cross product (each entry names a subset of the
+    /// axes and must match a cell); `include` adds cells after it (each names
+    /// every axis). At most 1,024 cells, and a cell may not call
+    /// `heph.core.matrix()`.
+    ///
+    /// The matrix declares nothing: a target a cell declares is exactly what the
+    /// cell called. A target whose config reads `.default` has the host's cell
+    /// in its config, so its key moves with the host. See `docs/MATRIX.md`.
+    fn matrix<'v>(
+        eval: &mut Evaluator<'v, '_, '_>,
+        #[starlark(require = named)] axes: ValueOfUnchecked<'v, matrix::AxesTy>,
+        #[starlark(require = named)] cell: Option<ValueOfUnchecked<'v, matrix::CellTy<'v>>>,
+        #[starlark(require = named)] default: Option<ValueOfUnchecked<'v, matrix::DefaultTy>>,
+        #[starlark(require = named)] exclude: Option<ValueOfUnchecked<'v, matrix::EntriesTy>>,
+        #[starlark(require = named)] include: Option<ValueOfUnchecked<'v, matrix::EntriesTy>>,
+    ) -> starlark::Result<Value<'v>> {
+        let extra = extra_of(eval, "heph.core.matrix()")?;
+        matrix::matrix(
+            eval,
+            extra,
+            matrix::Args {
+                axes: axes.get(),
+                cell: cell.map(|v| v.get()),
+                default: default.map(|v| v.get()),
+                exclude: exclude.map(|v| v.get()),
+                include: include.map(|v| v.get()),
+            },
+        )
     }
 
     /// The number of CPUs available to the process, falling back to 1 when the
@@ -1650,6 +1929,9 @@ impl Provider {
 /// even when reached via different load paths or via top-level `run_pkg`.
 pub(crate) struct BuildFileLoader {
     root: PathBuf,
+    /// The host every evaluation through this loader reports
+    /// ([`Host::current`]; a test injects another with [`Self::with_host`]).
+    host: Host,
     patterns: Vec<glob::Pattern>,
     file_cache: Arc<Mutex<HashMap<PathBuf, Arc<RunResult>>>>,
     dir_cache: Arc<Mutex<HashMap<PathBuf, Arc<RunResult>>>>,
@@ -1700,6 +1982,7 @@ impl BuildFileLoader {
         let chain = loads.new_chain();
         Self {
             root,
+            host: Host::current(),
             patterns,
             file_cache,
             dir_cache,
@@ -1712,6 +1995,13 @@ impl BuildFileLoader {
             loads,
             chain,
         }
+    }
+
+    /// This loader, evaluating as if on `host`.
+    #[cfg(test)]
+    pub(crate) fn with_host(mut self, host: Host) -> Self {
+        self.host = host;
+        self
     }
 
     /// The Starlark globals for this loader, built once from the function
@@ -1784,7 +2074,7 @@ impl BuildFileLoader {
             );
         }
 
-        let merged = Arc::new(merge_pkg_results(&parts)?);
+        let merged = Arc::new(merge_pkg_results(&self.root, pkg, &parts)?);
         self.dir_cache
             .lock()
             .map_err(|_e| anyhow::anyhow!("dir_cache lock poisoned"))?
@@ -2426,6 +2716,8 @@ fn eval_ast(
         let extra = Extra {
             pkg,
             root: &loader.root,
+            host: loader.host,
+            cell: std::cell::RefCell::new(None),
             capture_provenance,
             on_target: {
                 let targets = targets.clone();
@@ -2495,6 +2787,7 @@ pub(crate) mod tests {
             approval: Approval::default(),
             config: HashMap::new(),
             provenance: vec![],
+            site: DeclSite::default(),
         }
     }
 
@@ -2533,16 +2826,30 @@ pub(crate) mod tests {
     fn target_lookup_on_empty_and_merged_results() {
         assert!(result_of(vec![]).target("a").is_none());
 
-        // Across a package's files, the earlier file's target wins.
+        // Across a package's files, an identical repeat collapses into the
+        // earlier file's target, which keeps its position.
         let parts = [
-            Arc::new(result_of(vec![named("x", "first"), named("y", "y")])),
-            Arc::new(result_of(vec![named("x", "second"), named("w", "w")])),
+            Arc::new(result_of(vec![named("x", "d"), named("y", "y")])),
+            Arc::new(result_of(vec![named("w", "w"), named("x", "d")])),
         ];
-        let merged = merge_pkg_results(&parts).expect("merge");
-        assert_eq!(merged.target("x").map(|t| t.driver.as_str()), Some("first"));
+        let merged = merge_pkg_results(Path::new("/"), "p", &parts).expect("merge");
+        assert_eq!(merged.target("x").map(|t| t.driver.as_str()), Some("d"));
         assert_eq!(merged.target("w").map(|t| t.driver.as_str()), Some("w"));
         assert_eq!(merged.target("y").map(|t| t.driver.as_str()), Some("y"));
         assert!(merged.target("z").is_none());
+        let order: Vec<&str> = merged.targets.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(order, ["x", "y", "w"]);
+
+        // A diverging one fails the package (D19).
+        let parts = [
+            Arc::new(result_of(vec![named("x", "first")])),
+            Arc::new(result_of(vec![named("x", "second")])),
+        ];
+        let err = merge_pkg_results(Path::new("/"), "p", &parts).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("//p:x is declared twice with different configs"),
+            "{err:#}"
+        );
     }
 
     fn hovers() -> BuiltinHovers {
@@ -5110,6 +5417,97 @@ target(name = "use", driver = "d", dep = a)"#,
         fs::write(pkg.join("BUILD"), build).unwrap();
         let provider = provider_with_fn(&tmp_dir, "rule", Arc::new(DeclareFn(f)));
         run_pkg_blocking(&provider, "mypkg")
+    }
+
+    /// T16: two declarations of one address with diverging configs fail the
+    /// package, wherever they are; identical ones collapse to the first (D19).
+    #[test]
+    fn duplicate_target_diverging_configs() {
+        let none = || declared(vec![], vec![]);
+        let err = |build: &str| format!("{:#}", run_declaring(build, none).unwrap_err());
+
+        let e = err(
+            "target(name = \"t\", driver = \"d\", url = \"a\")\ntarget(name = \"t\", driver = \"d\", url = \"b\", labels = [\"x\"])\n",
+        );
+        assert!(
+            e.contains(
+                "//mypkg:t is declared twice with different configs: mypkg/BUILD:1 and \
+                 mypkg/BUILD:2. They differ in config.url, labels: remove one declaration, or \
+                 make them identical"
+            ),
+            "{e}"
+        );
+
+        // Identical, with config dicts built in different orders: one target,
+        // the first occurrence keeping its position.
+        let ok = run_declaring(
+            "target(name = \"t\", driver = \"d\", m = {\"a\": 1, \"b\": [2.5]}, n = 1)\ntarget(name = \"u\", driver = \"d\")\ntarget(n = 1, driver = \"d\", name = \"t\", m = {\"b\": [2.5], \"a\": 1})\n",
+            none,
+        )
+        .expect("identical declarations collapse");
+        let names: Vec<&str> = ok.targets.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["t", "u"]);
+
+        // -0.0 and 0.0 diverge; so do an omitted driver and an explicit one.
+        let e = err(
+            "target(name = \"t\", driver = \"d\", f = 0.0)\ntarget(name = \"t\", driver = \"d\", f = -0.0)\n",
+        );
+        assert!(e.contains("They differ in config.f:"), "{e}");
+        let e = err("target(name = \"t\")\ntarget(name = \"t\", driver = \"exec\")\n");
+        assert!(e.contains("They differ in driver:"), "{e}");
+        let e = err(
+            "target(name = \"t\", driver = \"d\", transitive = {\"env\": {\"A\": \"1\"}})\ntarget(name = \"t\", driver = \"d\", transitive = {\"env\": {\"A\": \"2\"}})\n",
+        );
+        assert!(e.contains("They differ in transitive.env:"), "{e}");
+
+        // A plugin function and a `target()` declaring one address.
+        let e = format!(
+            "{:#}",
+            run_declaring(
+                "target(name = \"x\", driver = \"bash\")\nheph.codegen.rule(name = \"x\")\n",
+                || declared(vec![exec_target("x")], vec![]),
+            )
+            .unwrap_err()
+        );
+        assert!(
+            e.contains("//mypkg:x is declared twice with different configs: mypkg/BUILD:1 and mypkg/BUILD:2. They differ in driver:"),
+            "{e}"
+        );
+        // ...and identical ones collapse.
+        let ok = run_declaring(
+            "target(name = \"x\", driver = \"exec\")\nheph.codegen.rule(name = \"x\")\n",
+            || declared(vec![exec_target("x")], vec![]),
+        )
+        .expect("identical plugin declaration");
+        assert_eq!(ok.targets.len(), 1);
+
+        // Across two BUILD files of one package.
+        let tmp_dir = tempdir().unwrap();
+        let pkg = tmp_dir.path().join("mypkg");
+        fs::create_dir_all(&pkg).unwrap();
+        fs::write(
+            pkg.join("BUILD"),
+            "target(name = \"t\", driver = \"d\", v = 1)\n",
+        )
+        .unwrap();
+        fs::write(
+            pkg.join("more.BUILD"),
+            "\ntarget(name = \"t\", driver = \"d\", v = 2)\n",
+        )
+        .unwrap();
+        let provider = Provider {
+            root: tmp_dir.path().to_path_buf(),
+            build_file_patterns: vec![
+                glob::Pattern::new("BUILD").unwrap(),
+                glob::Pattern::new("*.BUILD").unwrap(),
+            ],
+            ..Provider::default()
+        };
+        let e = format!("{:#}", run_pkg_blocking(&provider, "mypkg").unwrap_err());
+        assert!(
+            e.contains("mypkg/BUILD:1 and mypkg/more.BUILD:2. They differ in config.v:"),
+            "{e}"
+        );
     }
 
     fn declaring_err(f: fn() -> FnOutcome) -> String {
