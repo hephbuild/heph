@@ -780,14 +780,16 @@ ORDER BY s.started_ms DESC;
 from the `heph.session.pool.*` metrics and the last `heph.pool.capacity`:
 
 ```
-cpu pool (capacity 8): held 7.6 mean while in use (95%), 8 peak; nothing waited for it
+cpu pool (capacity 8): held 7.6 mean while in use (95%), 8 peak; something was waiting for 5m40s
   against the machine: 6m12s with the pool 90%+ held while the machine was under 50%, 1m00s in step, 2.0s not compared (no sample); targets may declare more CPU than they use: consider lowering their `resources`
 docker pool (capacity 4): held 3 mean while in use (75%), 4 peak; something was waiting for 1s
 ```
 
 "While in use": the mean is over the pool's in-use window, from its first
 row to the session's end. "Something was waiting" is `waiting_us`, the time
-with at least one request queued, not the sum of every request's wait.
+with at least one request queued, not the sum of every request's wait. The
+advice to lower a pool's `resources` comes only when something waited for
+it: with nothing queued, declaring more than is used held nothing back.
 
 The indented "against the machine" line is the
 [`resources_vs_machine`](#built-in-recipes) recipe's totals for that pool,
@@ -939,7 +941,7 @@ declarations.
 | `admission` mostly **busy** | the machine was the limit; the pool kept it from being overloaded | a larger machine or fewer builds at once; the declarations are not the cause |
 | `deps`, `lock_wait`, `scratch`, any split | not a resources question | `show`'s blocked-on lines and `time_by_phase` |
 | mostly **unknown** | no sample covered the wait | nothing to conclude |
-| a pool line's "90%+ held while the machine was under 50%" | `declared_above_use_us` | lower the targets' `resources` |
+| a pool line's "90%+ held while the machine was under 50%" | `declared_above_use_us` | lower the targets' `resources`, if something waited for the pool |
 | a pool line's "machine 90%+ while the pool was under 50% held" | `use_above_declared_us` | raise the targets' `resources`, or look for other work on the machine |
 
 A worked example: a 40 s build whose `admission` reads `30.0s (24.0s spare,

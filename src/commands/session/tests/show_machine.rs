@@ -547,9 +547,11 @@ async fn show_prints_pool_vs_machine() {
         [
             "cpu pool (capacity 8): held 8 mean while in use (100%), 8 peak; nothing waited \
              for it",
+            // Declared above use for all the time compared, but nothing
+            // waited for the pool: the declarations held nothing back, so
+            // no advice to lower them.
             "  against the machine: 2.0s with the pool 90%+ held while the machine was under \
-             50%, 2.0s not compared (no sample); targets may declare more CPU than they use: \
-             consider lowering their `resources`",
+             50%, 2.0s not compared (no sample)",
             "docker pool (capacity 4): held 1 mean while in use (25%), 1 peak; nothing waited \
              for it",
         ],
@@ -582,7 +584,9 @@ async fn show_prints_pool_vs_machine() {
 
 /// The pool's second line: plain words for each non-zero total, and advice
 /// only when one side was out of step for over half the time compared
-/// (unknown time is not compared).
+/// (unknown time is not compared). The advice to lower comes only when
+/// something waited for the pool: with nothing queued, over-declaring cost
+/// nothing.
 #[test]
 fn pool_versus_line_advises_only_a_majority() {
     use super::super::show::versus_line;
@@ -593,21 +597,35 @@ fn pool_versus_line_advises_only_a_majority() {
         matched_us: matched * SEC,
         unknown_us: unknown * SEC,
     };
-    assert_eq!(versus_line("cpu", &vs(0, 0, 0, 0)), "");
+    assert_eq!(versus_line("cpu", &vs(0, 0, 0, 0), true), "");
     assert_eq!(
-        versus_line("memory", &vs(0, 3, 2, 9)),
+        versus_line("cpu", &vs(3, 0, 2, 0), true),
+        "  against the machine: 3.0s with the pool 90%+ held while the machine was under 50%, \
+         2.0s in step; targets may declare more CPU than they use: consider lowering their \
+         `resources`\n"
+    );
+    assert_eq!(
+        versus_line("cpu", &vs(3, 0, 2, 0), false),
+        "  against the machine: 3.0s with the pool 90%+ held while the machine was under 50%, \
+         2.0s in step\n",
+        "nothing waited: no advice to lower"
+    );
+    // Raising is advice whether or not anything waited: the machine, not the
+    // pool, was the limit.
+    assert_eq!(
+        versus_line("memory", &vs(0, 3, 2, 9), false),
         "  against the machine: 3.0s with the machine 90%+ while the pool was under 50% held, \
          2.0s in step, 9.0s not compared (no sample); targets may use more memory than they \
          declare, or other work shares the machine: consider raising their `resources`\n"
     );
     // Half the compared time is not a majority: no advice either way.
     assert_eq!(
-        versus_line("cpu", &vs(2, 0, 2, 0)),
+        versus_line("cpu", &vs(2, 0, 2, 0), true),
         "  against the machine: 2.0s with the pool 90%+ held while the machine was under 50%, \
          2.0s in step\n"
     );
     assert_eq!(
-        versus_line("cpu", &vs(0, 0, 0, 4)),
+        versus_line("cpu", &vs(0, 0, 0, 4), true),
         "  against the machine: 4.0s not compared (no sample)\n"
     );
 }

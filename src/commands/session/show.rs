@@ -887,7 +887,7 @@ fn pool_line(p: &PoolSummary) -> String {
     }
     line.push('\n');
     if let Some(vs) = &p.machine {
-        line.push_str(&versus_line(&p.pool, vs));
+        line.push_str(&versus_line(&p.pool, vs, p.waiting_us > 0));
     }
     line
 }
@@ -898,8 +898,9 @@ fn pool_line(p: &PoolSummary) -> String {
 /// targets may declare more CPU than they use: consider lowering their
 /// `resources``. The non-zero totals only, and nothing when all are 0. The
 /// advice comes when one side was out of step for over half the time
-/// compared.
-pub(super) fn versus_line(pool: &str, vs: &VsMachine) -> String {
+/// compared; the advice to lower only when something `waited` for the pool,
+/// since with nothing queued, declaring more than is used costs nothing.
+pub(super) fn versus_line(pool: &str, vs: &VsMachine, waited: bool) -> String {
     let parts: Vec<String> = [
         (
             vs.declared_above_use_us,
@@ -926,10 +927,14 @@ pub(super) fn versus_line(pool: &str, vs: &VsMachine) -> String {
         .saturating_add(vs.use_above_declared_us)
         .saturating_add(vs.matched_us);
     if vs.declared_above_use_us.saturating_mul(2) > compared {
-        line.push_str(&format!(
-            "; targets may declare more {what} than they use: consider lowering their \
-             `resources`"
-        ));
+        // With nothing queued for the pool, the declarations held nothing
+        // back: no advice.
+        if waited {
+            line.push_str(&format!(
+                "; targets may declare more {what} than they use: consider lowering their \
+                 `resources`"
+            ));
+        }
     } else if vs.use_above_declared_us.saturating_mul(2) > compared {
         line.push_str(&format!(
             "; targets may use more {what} than they declare, or other work shares the \
