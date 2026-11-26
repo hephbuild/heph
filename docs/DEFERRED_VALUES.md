@@ -362,7 +362,18 @@ FUSE the sandbox root is redirected after the host has set it). Consumers: the
 credential driver's presentation templates, the `exec` driver's `run`, `env`
 and `runtime_env` values in **both exec and bash mode**, `oci.push`'s `ref`, and the `template` driver's
 `vars` (`${read:}` only — it renders without a sandbox, so `${src:}` is refused at
-parse; see [TEMPLATE.md](TEMPLATE.md)).
+parse; see [TEMPLATE.md](TEMPLATE.md)), and `http_fetch`'s `url`.
+
+`http_fetch`'s `url` takes `${read:}` only: `${src:}` names no URL and
+`${resource:}` would make what is fetched depend on the allotment, so both are
+refused at parse. A url with a reference is not an `{arg}` template, so any other
+`{`/`}` in it is refused rather than read either way; it needs `out`, since there
+is no URL to name the file after at parse; and the resolved value gets at run the
+checks a literal url gets at parse (an absolute `http`/`https` URL, and with
+`credentials` the https and no-userinfo rules). A url with no reference renders
+and hashes exactly as before. `heph.gh.release_asset` uses it to fetch a private
+release asset from the API URL a release lookup resolved
+([GH_RELEASES.md](GH_RELEASES.md)).
 
 `oci.push`'s `ref` also takes `${image_hashout}`. That one is **not** a deferred
 value: the host does not resolve it, and it adds no edge. It is a driver-local

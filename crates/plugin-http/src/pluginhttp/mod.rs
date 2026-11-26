@@ -14,6 +14,13 @@
 //! arg combination is its own cache entry, and an unresolvable placeholder is an
 //! error rather than a silently mis-fetched file.
 //!
+//! The URL may instead be computed by another target, `url =
+//! "${read://pkg:name}"` (a deferred value, `docs/DEFERRED_VALUES.md`): the
+//! def then holds the reference, the producer's content reaches the key through
+//! the edge the host appends, and the resolved URL gets at run the checks a
+//! literal one gets at parse. `heph.gh.release_asset` uses it to fetch a
+//! private asset by the API URL its release JSON names.
+//!
 //! Fetching is a side-effect-free, content-addressed step like any other target:
 //! `sha256` (when set) is verified before the target succeeds — a mismatched
 //! file is removed again — so a changed remote asset fails the build closed
@@ -28,8 +35,8 @@ use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedR
 use hplugin::driver::targetdef::path::{CodegenMode, Content, Path};
 use hplugin::driver::targetdef::{Output, TargetDef};
 use hplugin::driver::{
-    ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
-    ParseResponse,
+    ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, Deferred,
+    ParseRequest, ParseResponse,
 };
 use hplugin::htspec::{Spec, TargetSpecCache};
 use std::collections::BTreeMap;
@@ -48,8 +55,16 @@ struct HttpFetchSpec {
     /// URL to download. `{arg}` placeholders are substituted with the target
     /// addr's args (e.g. `…/heph-govet_{goos}_{goarch}` on
     /// `:heph-govet@goos=linux,goarch=amd64`); `{{` / `}}` are literal braces.
+    ///
+    /// Or a URL computed by another target: `${read://pkg:name}` is that
+    /// target's single output, substituted at run (`docs/DEFERRED_VALUES.md`).
+    /// Such a url is not an `{arg}` template (any other `{`/`}` is refused),
+    /// needs `out` (there is no URL to name the file after at parse), and is
+    /// checked at run as a literal one is at parse. The def hash covers the
+    /// reference as written; the producer's content reaches the key through
+    /// its edge.
     #[spec(required)]
-    url: String,
+    url: Deferred<String>,
     /// Expected SHA-256 of the downloaded bytes (hex). Omitted → the file is
     /// fetched **unverified** (the driver warns): the target is then only as
     /// reproducible as the remote server.
@@ -97,8 +112,11 @@ struct HttpFetchSpec {
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct HttpFetchDef {
-    /// The *rendered* URL (placeholders already substituted from the addr args).
-    url: String,
+    /// The *rendered* URL (placeholders already substituted from the addr
+    /// args), or the unresolved `${read:…}` text of a deferred one. Hashed and
+    /// serialized as the plain string either way (`Deferred` is transparent),
+    /// so a literal URL's def is what it was before `url` was deferrable.
+    url: Deferred<String>,
     sha256: String,
     /// Package-relative output path.
     out: String,
@@ -149,15 +167,45 @@ impl ManagedDriver for Driver {
         let spec =
             HttpFetchSpec::from(&req.target_spec.config).context("parse http_fetch config")?;
 
-        // Rendered here, not at run time: the URL an arg combination resolves to
-        // is part of the target's identity, so it must feed the hash below.
-        let url = render(&spec.url, &addr.args)
-            .with_context(|| format!("render url of {}", addr.format()))?;
-
-        let out_rel = match spec.out {
-            Some(out) => out,
-            None => file_name_of(&url)
-                .with_context(|| format!("{url:?} has no file name — set `out` explicitly"))?,
+        let deferred = hcore::template::has_deferred_ref(spec.url.raw());
+        let (url, out_rel) = if deferred {
+            // Held unresolved: the host substitutes the producer's bytes at
+            // run, and its content reaches `hashin` through the edge it
+            // appends. Nothing to render and nothing to name the file after.
+            check_deferred_url(spec.url.raw()).with_context(|| addr.format())?;
+            let out = spec.out.with_context(|| {
+                format!(
+                    "{}: the url {:?} is computed at run, so there is no URL to name the file \
+                     after at parse; set `out`",
+                    addr.format(),
+                    spec.url.raw()
+                )
+            })?;
+            (spec.url, out)
+        } else {
+            // Rendered here, not at run time: the URL an arg combination
+            // resolves to is part of the target's identity, so it must feed
+            // the hash below.
+            let url = render(spec.url.raw(), &addr.args)
+                .with_context(|| format!("render url of {}", addr.format()))?;
+            // `${{read://…}}` renders to a reference the host never saw (it
+            // walks the config as written), so it would reach the run
+            // unresolved.
+            if let Some(r) = hcore::template::first_deferred_ref(&url) {
+                anyhow::bail!(
+                    "{}: the url renders to {:?}, a reference written with escaped braces; \
+                     write `{}` to have it resolved",
+                    addr.format(),
+                    url,
+                    r.raw
+                );
+            }
+            let out = match spec.out {
+                Some(out) => out,
+                None => file_name_of(&url)
+                    .with_context(|| format!("{url:?} has no file name — set `out` explicitly"))?,
+            };
+            (Deferred::new(url), out)
         };
         let pkg = addr.package.as_str();
         let out = if pkg.is_empty() {
@@ -170,12 +218,14 @@ impl ManagedDriver for Driver {
             hdriver_support::credential::inputs(&spec.credentials, &addr.package)?;
         let cache: hplugin::driver::targetdef::CacheConfig = spec.cache.into();
         let sha256 = spec.sha256.unwrap_or_default();
-        if !credential_inputs.is_empty() {
-            auth::check_url(&url).with_context(|| addr.format())?;
+        // A computed url is checked at run, once it exists (`run` repeats the
+        // check for every url, so neither path can skip it).
+        if !credential_inputs.is_empty() && !deferred {
+            auth::check_url(url.raw()).with_context(|| addr.format())?;
         }
         if gated_and_unpinned(!credential_inputs.is_empty(), &sha256, &cache) {
             tracing::warn!(
-                url,
+                url = url.raw(),
                 "http_fetch: fetched with credentials and no `sha256`, so what the server \
                  serves can depend on whichever identity ran it, and the cache entry is shared \
                  across identities (and with the anonymous run before credentials were added). \
@@ -255,14 +305,29 @@ impl ManagedDriver for Driver {
             .map(std::ffi::OsStr::to_os_string)
             .ok_or_else(|| anyhow::anyhow!("http_fetch: out {:?} has no file name", def.out))?;
         let dest = req.sandbox_pkg_dir.join(name);
+        let addr = req.request.target.addr.format();
+
+        // A literal url resolves to its own text; a `${read:…}` one to the
+        // producer's bytes, which parse never saw, so they get parse's checks
+        // here.
+        let url = req
+            .request
+            .resolve(&def.url)
+            .with_context(|| format!("{addr}: resolving `url`"))?
+            .into_owned();
+        if hcore::template::has_deferred_ref(def.url.raw()) {
+            check_resolved_url(&url)
+                .with_context(|| format!("{addr}: `url` {:?}", def.url.raw()))?;
+        }
 
         let selected = if hdriver_support::credential::check_presented(
             req.request.target,
             &req.request.credentials,
         )? {
+            auth::check_url(&url).with_context(|| addr.clone())?;
             // Off the async workers: it reads the presented netrc files.
             let picked = hcore::blocking::run(enclose::enclose!(
-                (req.request.credentials => mounts, def.url => url)
+                (req.request.credentials => mounts, url)
                 move || auth::select_for(&mounts, &url)
             ))
             .await?;
@@ -272,7 +337,7 @@ impl ManagedDriver for Driver {
         };
 
         let fetched = fetch_until_cancelled(
-            &def.url,
+            &url,
             hfetch::RequestOptions {
                 auth: selected.as_ref().map(|s| &s.auth),
                 headers: &def.headers,
@@ -398,6 +463,65 @@ fn file_name_of(url: &str) -> Option<String> {
     let (_authority, path) = path.split_once('/')?;
     let name = path.rsplit('/').next()?;
     (!name.is_empty()).then(|| name.to_string())
+}
+
+/// A url holding a deferred reference: only `${read://…}` references and text
+/// without braces.
+///
+/// - `${src:}` is a sandbox path, which no URL names.
+/// - `${resource:}` is this run's allotment, and an output must not depend on
+///   it (`docs/RESOURCES.md`).
+/// - A `{`/`}` elsewhere is refused rather than read either way: such a url is
+///   not rendered from the addr args (an `{arg}` beside a reference would be
+///   fetched as written), and a literal brace reads as one.
+fn check_deferred_url(raw: &str) -> anyhow::Result<()> {
+    use hcore::template::{Piece, READ_KIND, RESOURCE_KIND, SRC_KIND, claims};
+    for piece in hcore::template::parse(raw).context("parse url")? {
+        match piece {
+            Piece::Ref(r) if claims(r.kind, r.arg, &[READ_KIND]) => {}
+            Piece::Ref(r) if claims(r.kind, r.arg, &[SRC_KIND]) => anyhow::bail!(
+                "`{}` in `url`: a url names no sandbox path; use `${{read://…}}` for a \
+                 producer's contents",
+                r.raw
+            ),
+            Piece::Ref(r) if claims(r.kind, r.arg, &[RESOURCE_KIND]) => anyhow::bail!(
+                "`{}` in `url`: what is fetched must not depend on the run's allotment",
+                r.raw
+            ),
+            Piece::Ref(r) => anyhow::bail!(
+                "`{}` in `url`, beside a `${{read://…}}` reference: a url with a reference is \
+                 not an `{{arg}}` template, so no other `{{…}}` is accepted",
+                r.raw
+            ),
+            Piece::Text(t) if t.contains(['{', '}']) => anyhow::bail!(
+                "url {raw:?} mixes a `${{read://…}}` reference with `{{`/`}}`: a url with a \
+                 reference is not an `{{arg}}` template; compute the whole url in the producer"
+            ),
+            Piece::Text(_) | Piece::Escape => {}
+        }
+    }
+    Ok(())
+}
+
+/// A url a deferred reference resolved to: what a literal url is held to,
+/// checked once it exists. An absolute `http`/`https` URL, without whitespace
+/// or control characters (a producer writing two lines must not have them
+/// joined into one request).
+fn check_resolved_url(url: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !url.is_empty(),
+        "resolved to an empty value: the producer's output file is empty"
+    );
+    anyhow::ensure!(
+        !url.chars().any(|c| c.is_whitespace() || c.is_control()),
+        "resolved to {url:?}, which contains whitespace or a control character"
+    );
+    let parsed = url::Url::parse(url).with_context(|| format!("resolved to {url:?}"))?;
+    anyhow::ensure!(
+        matches!(parsed.scheme(), "https" | "http"),
+        "resolved to {url:?}; only http and https are fetched"
+    );
+    Ok(())
 }
 
 /// Substitute `{arg}` placeholders in `template` from the target addr's `args`.
@@ -1196,7 +1320,7 @@ mod tests {
             .expect("parse");
 
         let def = resp.target_def.def::<HttpFetchDef>();
-        assert_eq!(def.url, "https://x/rel/tool_linux.bin");
+        assert_eq!(def.url.raw(), "https://x/rel/tool_linux.bin");
         // Named after the URL, not after the target (`fetch`).
         assert_eq!(def.out, "tools/dl/tool_linux.bin");
         assert!(matches!(
@@ -1222,7 +1346,7 @@ mod tests {
             .expect("parse");
 
         let def = resp.target_def.def::<HttpFetchDef>();
-        assert_eq!(def.url, "https://x/linux/tool_linux");
+        assert_eq!(def.url.raw(), "https://x/linux/tool_linux");
         assert_eq!(def.out, "tools/dl/tool");
         assert!(def.executable);
     }
@@ -1265,6 +1389,47 @@ mod tests {
             .expect("parse darwin");
 
         assert_ne!(linux.target_def.hash, darwin.target_def.hash);
+    }
+
+    /// A literal url's def hash, pinned from before `url` became deferrable:
+    /// every existing target must keep its key (and its remote-cache entries).
+    #[tokio::test]
+    async fn a_literal_url_keeps_its_def_hash() {
+        let config = HashMap::from([
+            (
+                "url".to_string(),
+                Value::String("https://x/{goos}/tool_{{v}}".to_string()),
+            ),
+            ("sha256".to_string(), Value::String(BODY_SHA.to_string())),
+            ("executable".to_string(), Value::Bool(true)),
+        ]);
+        let def = Driver
+            .parse(
+                parse_req("//tools/dl:tool@goos=linux", config),
+                &StdCancellationToken::new(),
+            )
+            .await
+            .expect("parse")
+            .target_def;
+        assert_eq!(String::from_utf8_lossy(&def.hash), "2063a9b3bc1835a4");
+        assert_eq!(
+            def.def::<HttpFetchDef>().url.raw(),
+            "https://x/linux/tool_{v}"
+        );
+
+        // A def serialized before `url` was deferrable (a cdylib host's
+        // `raw_def` bytes, a cached def) still reads: `Deferred` is
+        // `serde(transparent)`, so the url is the same plain string.
+        let old = TargetDef {
+            raw_def: Arc::new(
+                hplugin::driver::targetdef::RawDefBytes::from_json_slice(
+                    br#"{"url":"https://x/tool","sha256":"","out":"dl/tool","executable":false}"#,
+                )
+                .expect("wrap"),
+            ),
+            ..Default::default()
+        };
+        assert_eq!(old.def_de::<HttpFetchDef>().url.raw(), "https://x/tool");
     }
 
     /// A fetch defaults to caching in both the local and remote tiers: the
@@ -1429,6 +1594,190 @@ mod tests {
         parse_with_credentials("http://127.0.0.1:8080/tool", &["//auth:netrc"])
             .await
             .expect("loopback is exempt");
+    }
+
+    const REF: &str = "${read://gh:tool_url}";
+
+    async fn parse_deferred(url: &str, extra: &[(&str, Value)]) -> anyhow::Result<TargetDef> {
+        let mut config = HashMap::from([("url".to_string(), Value::String(url.to_string()))]);
+        config.extend(extra.iter().map(|(k, v)| ((*k).to_string(), v.clone())));
+        Ok(Driver
+            .parse(
+                parse_req("//dl:tool@goos=linux", config),
+                &StdCancellationToken::new(),
+            )
+            .await?
+            .target_def)
+    }
+
+    fn out(name: &str) -> (&'static str, Value) {
+        ("out", Value::String(name.to_string()))
+    }
+
+    /// A computed url is held as written (no `{arg}` rendering, the reference
+    /// is what the def hash covers) and needs `out`.
+    #[tokio::test]
+    async fn a_deferred_url_is_held_unresolved_and_needs_out() {
+        let def = parse_deferred(REF, &[out("tool.tgz")])
+            .await
+            .expect("parse");
+        assert_eq!(def.def::<HttpFetchDef>().url.raw(), REF);
+        assert_eq!(def.def::<HttpFetchDef>().out, "dl/tool.tgz");
+        let other = parse_deferred("${read://gh:other_url}", &[out("tool.tgz")])
+            .await
+            .expect("parse");
+        assert_ne!(def.hash, other.hash, "the reference is hashed as written");
+        // Text around the reference is fine; `$$` is reproduced.
+        parse_deferred(&format!("{REF}?x=$$1"), &[out("t")])
+            .await
+            .expect("text beside a reference");
+
+        let Err(err) = parse_deferred(REF, &[]).await else {
+            panic!("no file name to default to at parse");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("set `out`") && msg.contains("//dl:tool"),
+            "{msg}"
+        );
+    }
+
+    /// A reference url is not an `{arg}` template, and only `${read:}` makes
+    /// sense in one: each other `${…}` or brace is refused, naming the reason.
+    #[tokio::test]
+    async fn a_deferred_url_refuses_placeholders_and_other_kinds() {
+        for (url, wants) in [
+            (
+                format!("https://x/{{goos}}/{REF}"),
+                "not an `{arg}` template",
+            ),
+            (format!("{REF}/{{{{v}}}}"), "not an `{arg}` template"),
+            (format!("{REF}${{FOO}}"), "no other `{…}`"),
+            (
+                format!("{REF}/${{src://dl:other}}"),
+                "names no sandbox path",
+            ),
+            ("${src://dl:other}".to_string(), "names no sandbox path"),
+            ("${resource:cpu}".to_string(), "allotment"),
+        ] {
+            let Err(err) = parse_deferred(&url, &[out("t")]).await else {
+                panic!("{url} must be refused");
+            };
+            let msg = format!("{err:#}");
+            assert!(msg.contains(wants), "{url}: {msg}");
+            assert!(msg.contains("//dl:tool"), "names the target: {msg}");
+        }
+    }
+
+    /// `${{read://…}}` is a literal url to the renderer, so the host never
+    /// resolves it; it renders to a reference and is refused at parse rather
+    /// than reaching the run as unresolved text.
+    #[tokio::test]
+    async fn an_escaped_reference_in_a_literal_url_is_refused() {
+        let Err(err) = parse_deferred("${{read://gh:tool_url}}", &[out("t")]).await else {
+            panic!("must be refused");
+        };
+        assert!(format!("{err:#}").contains("escaped braces"), "{err:#}");
+    }
+
+    /// Run a parsed def with `deferred` resolved as the host would, and one
+    /// credential mount when the def declares one.
+    async fn run_resolved(def: &TargetDef, resolved: &str) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let id = "test".to_string();
+        let mut request = hplugin::driver::RunRequest::new(&id, def, dir.path());
+        request.deferred = [(
+            REF.to_string(),
+            hplugin::driver::DeferredValue::Ready(resolved.to_string()),
+        )]
+        .into();
+        if !def.inputs.is_empty() {
+            request.credentials = vec![hplugin::driver::CredentialMount::default()];
+        }
+        Driver
+            .run(
+                ManagedRunRequest {
+                    request,
+                    sandbox_dir: dir.path().to_path_buf(),
+                    sandbox_ws_dir: dir.path().to_path_buf(),
+                    sandbox_pkg_dir: dir.path().to_path_buf(),
+                    inputs: vec![],
+                },
+                &StdCancellationToken::new(),
+            )
+            .await
+            .map(|_| ())
+    }
+
+    /// What parse checks on a literal url is checked at run on a resolved one:
+    /// with credentials, plain http off this machine and userinfo are refused
+    /// before any request; and a value that is no http(s) URL at all is
+    /// refused with or without them.
+    #[tokio::test]
+    async fn a_resolved_url_gets_the_literal_urls_checks() {
+        let gated = parse_deferred(
+            REF,
+            &[
+                out("t"),
+                (
+                    "credentials",
+                    Value::List(vec![Value::String("//auth:netrc".to_string())]),
+                ),
+            ],
+        )
+        .await
+        .expect("a computed url with credentials parses: it is checked at run");
+        for (resolved, wants) in [
+            ("http://x.example/asset", "clear text"),
+            ("https://u:p@x.example/asset", "username or password"),
+        ] {
+            let msg = format!("{:#}", run_resolved(&gated, resolved).await.unwrap_err());
+            assert!(msg.contains(wants), "{resolved}: {msg}");
+            assert!(msg.contains("//dl:tool"), "names the target: {msg}");
+        }
+
+        let anonymous = parse_deferred(REF, &[out("t")]).await.expect("parse");
+        for (resolved, wants) in [
+            ("file:///etc/passwd", "only http and https"),
+            ("not a url", "whitespace"),
+            ("https://x/a\nhttps://y/b", "whitespace"),
+            ("relative/path", "resolved to"),
+            ("", "resolved to an empty value"),
+        ] {
+            let msg = format!(
+                "{:#}",
+                run_resolved(&anonymous, resolved).await.unwrap_err()
+            );
+            assert!(msg.contains(wants), "{resolved:?}: {msg}");
+            assert!(msg.contains(REF), "names the reference: {msg}");
+        }
+    }
+
+    /// A resolved url is the producer's bytes, not a template: a `{` in it is
+    /// sent as a literal (percent-encoded) character, never substituted from
+    /// the target's args or refused as an unknown placeholder.
+    #[tokio::test]
+    async fn a_resolved_url_is_not_a_template() {
+        let (listener, base) = bind();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let Ok((mut sock, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            let n = std::io::Read::read(&mut sock, &mut buf).unwrap_or(0);
+            let head = String::from_utf8_lossy(buf.get(..n).unwrap_or_default()).into_owned();
+            let _ = tx.send(head.lines().next().unwrap_or_default().to_string());
+            let _ = std::io::Write::write_all(&mut sock, ok(BODY).as_bytes());
+        });
+        let def = parse_deferred(REF, &[out("t")]).await.expect("parse");
+        run_resolved(&def, &format!("{base}/tool-{{os}}}}.bin"))
+            .await
+            .expect("a brace in a resolved url is fetched as written");
+        assert_eq!(
+            rx.recv().expect("one request"),
+            "GET /tool-%7Bos%7D%7D.bin HTTP/1.1"
+        );
     }
 
     /// The parse warning fires exactly when the target is gated, unpinned and
@@ -1622,7 +1971,7 @@ mod tests {
         // hash of this target must not move.
         let mut h = DebugHasher::new(Xxh3Default::new(), || "pin".to_string());
         HttpFetchDef {
-            url: "https://x/tool".to_string(),
+            url: Deferred::new("https://x/tool"),
             sha256: String::new(),
             out: "dl/tool".to_string(),
             executable: false,

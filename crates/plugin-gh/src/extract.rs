@@ -222,7 +222,7 @@ impl ManagedDriver for Driver {
         let def = req.request.target.def_de::<ExtractDef>();
         let addr = req.request.target.addr.format();
         let format = def.format;
-        let archive = single_archive(&req).with_context(|| format!("{addr}: `src`"))?;
+        let archive = single_file(&req, SRC_ORIGIN).with_context(|| format!("{addr}: `src`"))?;
         let dest = req.sandbox_pkg_dir.join(&def.out);
         let (strip, limits) = (def.strip_components, def.limits);
 
@@ -261,21 +261,25 @@ fn check_out(out: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The archive: the one file the `src` dep materialized. Several files have
-/// no defensible answer (which one is the archive would depend on walk
-/// order), so it is refused with the count.
-fn single_archive(req: &ManagedRunRequest<'_, '_>) -> anyhow::Result<PathBuf> {
+/// The one file the dep input `origin` materialized (the archive here, the
+/// release JSON for `asset_url`). Several files have no defensible answer
+/// (which one is meant would depend on walk order), so it is refused with the
+/// count.
+pub(crate) fn single_file(
+    req: &ManagedRunRequest<'_, '_>,
+    origin: &str,
+) -> anyhow::Result<PathBuf> {
     let input = req
         .inputs
         .iter()
         .find(|m| {
-            m.input.origin_id == SRC_ORIGIN
+            m.input.origin_id == origin
                 && matches!(
                     m.input.artifact.r#type,
                     hplugin::driver::inputartifact::Type::Dep
                 )
         })
-        .context("no archive input in the sandbox")?;
+        .context("no `src` input in the sandbox")?;
     let mut files = dep_files(input)?.into_iter();
     let first = files
         .next()

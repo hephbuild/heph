@@ -478,6 +478,50 @@ heph.gh.release_asset(
     }
 }
 
+/// With `credentials`, `release_asset` declares the API lookup, the
+/// `gh.asset_url` driver that reads it, and the asset fetch, all across the
+/// seam. Resolved by `inspect spec`, so neither the token nor the network is
+/// touched.
+#[test]
+fn shipped_gh_cdylib_declares_a_private_asset() {
+    let dist = Dist::locate();
+    let ws = Workspace::new().expect("workspace");
+    ws.write(
+        "priv/BUILD",
+        r#"
+target(
+    name    = "github",
+    driver  = "auth.credential",
+    sources = [heph.auth.env(["GITHUB_TOKEN"])],
+    present = heph.auth.netrc(["api.github.com"],
+                              login = "x-access-token", password = "${github_token}"),
+)
+
+heph.gh.release_asset(
+    name = "tool",
+    repo = "o/r",
+    tag = "v1",
+    asset = "t.tar.gz",
+    extract = True,
+    credentials = [":github"],
+)
+"#,
+    )
+    .expect("write BUILD");
+
+    for hook in [false, true] {
+        configure_gh(&ws, &dist, &gh_options("", hook));
+        for (addr, driver) in [
+            ("//priv:tool", "gh.extract"),
+            ("//priv:tool_archive", "http_fetch"),
+            ("//priv:tool_url", "gh.asset_url"),
+            ("//priv:tool_release", "http_fetch"),
+        ] {
+            assert_eq!(spec_driver(&ws, &dist, addr), driver, "{addr}, hook={hook}");
+        }
+    }
+}
+
 /// A bad plugin option does not abort the host at load: the log sink is not up
 /// when the cdylib is created, so an abort there would be a bare `SIGABRT`.
 /// The plugin loads, the build resolves, and the hook that stands in for the
