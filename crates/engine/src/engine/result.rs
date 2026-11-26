@@ -12731,6 +12731,9 @@ mod tests {
         /// When set, every output is this file as a borrowed `TarPath` instead
         /// of a raw `hi` — the shape whose storage the content scan decides.
         container: Option<SArc<std::path::PathBuf>>,
+        /// When set, `run` notifies it, waits for its token and returns a bare
+        /// `"cancelled"`, as exec does when the cancel lands after its spawn.
+        bare_cancel: Option<SArc<tokio::sync::Notify>>,
     }
 
     #[async_trait]
@@ -12777,9 +12780,14 @@ mod tests {
         async fn run<'a, 'io>(
             &self,
             _req: RunRequest<'a, 'io>,
-            _ctoken: &(dyn Cancellable + Send + Sync),
+            ctoken: &(dyn Cancellable + Send + Sync),
         ) -> anyhow::Result<RunResponse> {
             self.exec_count.fetch_add(1, Ordering::SeqCst);
+            if let Some(started) = &self.bare_cancel {
+                started.notify_one();
+                ctoken.cancelled().await;
+                anyhow::bail!("cancelled");
+            }
             Ok(RunResponse {
                 artifacts: self
                     .outputs
@@ -12940,6 +12948,7 @@ mod tests {
                 outputs: SArc::new(outputs),
                 cleanup_thread,
                 container: None,
+                bare_cancel: None,
             })
         })?;
         let addr = Addr::new(
@@ -12954,6 +12963,66 @@ mod tests {
         };
         engine.register_provider(move |_| Box::new(OneTargetProvider { spec }))?;
         Ok((Arc::new(engine), dir, addr))
+    }
+
+    /// A Ctrl-C that lands while the driver runs is a cancellation, even when
+    /// the driver reports it as an error of its own (exec's bare
+    /// "cancelled"): typed, so the CLI reports an abort, and not recorded as
+    /// the target's failure. Before, only a cancel that landed before the
+    /// spawn came back typed, and `run_json_entries_cancelled` lost the race
+    /// on CI.
+    #[tokio::test]
+    async fn a_cancel_during_the_run_is_a_cancellation_whatever_the_driver_says()
+    -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let mut engine = Engine::new(Config {
+            parallelism: None,
+            ..Config::for_tests(dir.path())
+        })?;
+        let started = SArc::new(tokio::sync::Notify::new());
+        engine.register_driver(enclose!((started) move |_| {
+            Box::new(BlockingDriver {
+                exec_count: SArc::new(AtomicUsize::new(0)),
+                outputs: SArc::new(vec![("main".to_string(), "out".to_string())]),
+                cleanup_thread: None,
+                container: None,
+                bare_cancel: Some(started),
+            })
+        }))?;
+        let addr = Addr::new(PkgBuf::from("pkg"), "a".to_string(), Default::default());
+        let spec = TargetSpec {
+            addr: addr.clone(),
+            driver: "blocking".to_string(),
+            ..Default::default()
+        };
+        engine.register_provider(move |_| Box::new(OneTargetProvider { spec }))?;
+        let engine = Arc::new(engine);
+
+        let rs = engine.new_state();
+        let run = tokio::spawn(enclose!((engine, rs, addr) async move {
+            engine
+                .result_addr(rs, &addr, OutputMatcher::All, &ResultOptions::default())
+                .await
+                .map(drop)
+        }));
+        tokio::time::timeout(Duration::from_secs(30), started.notified())
+            .await
+            .expect("the driver runs");
+        rs.ctoken().cancel();
+        let err = tokio::time::timeout(Duration::from_secs(30), run)
+            .await
+            .expect("the cancelled run ends")
+            .expect("run task")
+            .expect_err("cancelled");
+        assert!(
+            downcast_chain_ref::<CancelledError>(&err).is_some(),
+            "expected a cancellation, got: {err:#}"
+        );
+        assert!(
+            rs.get_failure(&addr).is_none(),
+            "a cancellation is not the target's failure"
+        );
+        Ok(())
     }
 
     // ----------------------------------------------------------------------
@@ -13601,6 +13670,7 @@ mod tests {
                     outputs: SArc::new(vec![("main".to_string(), "out_main".to_string())]),
                     cleanup_thread: None,
                     container: container.clone(),
+                    bare_cancel: None,
                 })
             })
             .expect("driver");
@@ -14098,6 +14168,7 @@ mod tests {
                         outputs: SArc::new(vec![("main".to_string(), "out".to_string())]),
                         cleanup_thread: None,
                         container: None,
+                        bare_cancel: None,
                     })
                 }
             ))
