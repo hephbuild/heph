@@ -282,6 +282,7 @@ mod tests {
             t.apply(&ev(
                 1_000,
                 BuildEventKind::ResultEnd {
+                    spans: Vec::new(),
                     left_behind: None,
                     cancelled: false,
                     timed_out: None,
@@ -301,6 +302,7 @@ mod tests {
             t.apply(&ev(
                 2_000,
                 BuildEventKind::ResultEnd {
+                    spans: Vec::new(),
                     left_behind: None,
                     cancelled: false,
                     timed_out: None,
@@ -409,6 +411,7 @@ mod tests {
         t.apply(&ev(
             0,
             BuildEventKind::ResultEnd {
+                spans: Vec::new(),
                 left_behind: None,
                 cancelled: false,
                 timed_out: None,

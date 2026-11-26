@@ -398,6 +398,41 @@ pub enum BuildEventKind {
         /// predates it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         left_behind: Option<Box<LeftBehindData>>,
+        /// Where the result's time went, phase by phase ([`PhaseSpan`]),
+        /// ordered by start. Never on a result, a cache entry or any hash.
+        ///
+        /// - **Per `ResultEnd`, never per addr.** A target can end more than
+        ///   once in one request: one result scope per output selection
+        ///   asked of it (its hashout for one consumer, its outputs for
+        ///   another), each with its own `ResultStart`/`ResultEnd` and its
+        ///   own spans. Exactly one of them did the lookup and the run; the
+        ///   others waited on it. There is no scope id: pair each
+        ///   `ResultStart` with the next `ResultEnd` of the same addr, in
+        ///   stream order, take the spans from that `ResultEnd`, and sum
+        ///   spans per `ResultEnd`. Summed per addr, a target's time counts
+        ///   twice; a `ResultEnd` with no run phases does not mean the
+        ///   target was free.
+        /// - **They do not tile the result.** The time between `ResultStart`
+        ///   and `ResultEnd` is more than the sum of the spans. Known gaps:
+        ///   waiting on a computation another scope started (a shared
+        ///   cell: the scope that created it records its phases, the others
+        ///   record the wait as nothing), acquiring the target's
+        ///   credentials, and waiting for an approval gate.
+        /// - **Sequential and non-overlapping** within one `ResultEnd`:
+        ///   each span starts at or after the previous one's end.
+        /// - **Names repeat.** A phase entered twice is two spans (the
+        ///   result lock's wait and the execute lock's, both
+        ///   `heph.lock_wait`), and start order is the only thing that tells
+        ///   them apart. Collapse same-named spans only for a total.
+        /// - **May be truncated.** A result records a bounded number of
+        ///   spans; one that goes past it (a run retried for lapsing
+        ///   credentials, a contended lock) drops its latest phases.
+        /// - **Empty means unknown, not zero:** a host that predates the
+        ///   field, a request nothing listened to (spans are measured only
+        ///   then), a result that ended before any phase began, or a failure
+        ///   reported outside a result's scope.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        spans: Vec<PhaseSpan>,
     },
     ExecuteStart {
         addr: String,
@@ -920,6 +955,137 @@ pub struct TimedOutData {
     pub abandoned: bool,
 }
 
+/// One phase of a target's result, carried on `ResultEnd.spans`: where the
+/// time between its `ResultStart` and its `ResultEnd` went.
+///
+/// Times are microseconds since the Unix epoch, but they are not read off the
+/// wall clock: the engine stamps the request's start once and adds a monotonic
+/// offset, so a clock step during a build moves no span against another and
+/// changes no duration.
+///
+/// `name` is one of [`Phase::name`] from this build, or a name a newer host
+/// added: a consumer keeps a span it does not know rather than dropping it.
+/// A name may repeat (a phase entered twice is two spans, never one that
+/// covers what ran between), and the spans' start order is the only thing
+/// that tells repeats apart.
+///
+/// The spans of one `ResultEnd` are sequential and never overlap, but they
+/// need not be contiguous and need not cover the whole result, and the list
+/// may be truncated: see `ResultEnd.spans` for how to read them, and why a
+/// consumer sums them per `ResultEnd`, never per addr.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PhaseSpan {
+    pub name: std::borrow::Cow<'static, str>,
+    pub start_unix_us: u64,
+    pub end_unix_us: u64,
+}
+
+impl PhaseSpan {
+    /// The phase this build knows the span as, `None` for a newer host's.
+    pub fn phase(&self) -> Option<Phase> {
+        Phase::from_name(&self.name)
+    }
+
+    /// How long the phase lasted.
+    pub fn duration_us(&self) -> u64 {
+        self.end_unix_us.saturating_sub(self.start_unix_us)
+    }
+}
+
+/// Declares `Phase` and `Phase::ALL` from one list of variants, so a variant
+/// cannot be left out of `ALL`.
+macro_rules! phases {
+    (
+        $(#[$attr:meta])*
+        pub enum Phase { $($(#[$vattr:meta])* $variant:ident,)+ }
+    ) => {
+        $(#[$attr])*
+        pub enum Phase { $($(#[$vattr])* $variant,)+ }
+
+        impl Phase {
+            /// Every phase, in declaration order.
+            pub const ALL: [Phase; [$(Phase::$variant),+].len()] = [$(Phase::$variant),+];
+        }
+    };
+}
+
+phases! {
+/// The phases the engine measures in a target's result, named only when a
+/// `ResultEnd` is built ([`PhaseSpan`]).
+///
+/// The names are a public contract: the session store's explorer, its
+/// recipes and its OTLP export key on them, and a name, once released, never
+/// changes meaning. A new phase is a new variant with a new name; a phase
+/// whose meaning changes gets a new name too.
+///
+/// `Deps`, `LockWait`, `Admission` and `Scratch` are waits on something
+/// else; the rest is heph's or the target's own work. The process time of
+/// different drivers is not comparable: a driver that arms the run clock
+/// gets `Stage` / `Process` / `Collect`, one that does not — every cdylib
+/// driver, for one — gets `Stage` and a whole `DriverRun`, its own setup
+/// and teardown inside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Phase {
+    /// Waiting on the results of the target's dependencies, and only that:
+    /// the ones its cache key folds in (their hashouts), and the runtime
+    /// ones its run reads (their outputs). A target with no dependency has
+    /// no such span. heph's own work around the wait is `Resolve`.
+    Deps,
+    /// heph working out what the target is and what its cache key is: its
+    /// spec and def, its expanded inputs and the defs they name, and the
+    /// hash over its dependencies' hashouts. The wait on those
+    /// dependencies splits it, so a result usually has more than one.
+    Resolve,
+    /// Waiting on another holder of the target's result or execute lock.
+    /// The first is the result lock's, a later one the execute lock's (or
+    /// a re-taken read on the result); only their order tells them apart.
+    LockWait,
+    /// Reading the cache: probing for a revision and, on a hit, reading it.
+    CacheRead,
+    /// Waiting to be admitted against the resource pools.
+    Admission,
+    /// Waiting on the target's scratch slots.
+    Scratch,
+    /// Preparing the run: the sandbox, the inputs, the runner, up to the
+    /// target's process spawning.
+    Stage,
+    /// The target's process, from its spawn to its exit, for a driver that
+    /// arms the run clock.
+    Process,
+    /// A whole `Driver::run`, for a driver that does not arm the run clock:
+    /// its own setup is inside it.
+    DriverRun,
+    /// From the target's process exiting to the run returning its outputs.
+    Collect,
+    /// Writing the run's outputs to the cache.
+    CacheWrite,
+}
+}
+
+impl Phase {
+    /// The span name, as `ResultEnd.spans` spells it. Frozen once released.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Phase::Deps => "heph.deps",
+            Phase::Resolve => "heph.resolve",
+            Phase::LockWait => "heph.lock_wait",
+            Phase::CacheRead => "heph.cache.read",
+            Phase::Admission => "heph.admission",
+            Phase::Scratch => "heph.scratch",
+            Phase::Stage => "heph.stage",
+            Phase::Process => "heph.process",
+            Phase::DriverRun => "heph.driver.run",
+            Phase::Collect => "heph.collect",
+            Phase::CacheWrite => "heph.cache.write",
+        }
+    }
+
+    /// The phase spelled `name`, `None` for one this build does not know.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|p| p.name() == name)
+    }
+}
+
 /// How a run was admitted, carried on [`BuildEventKind::ExecuteStart`].
 /// Diagnostic: it explains the order runs started in, and decides nothing.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -1163,6 +1329,7 @@ pub mod test_support {
             log_not_streamed: false,
         };
         let end = |addr: &str| BuildEventKind::ResultEnd {
+            spans: Vec::new(),
             left_behind: None,
             addr: addr.to_string(),
             error: None,
@@ -1328,6 +1495,7 @@ mod tests {
                 timed_out,
                 cancelled,
                 left_behind,
+                spans,
             } => {
                 assert_eq!(addr, "//a:x");
                 assert!(!cancelled, "an older host's stop reads as a failure");
@@ -1338,6 +1506,7 @@ mod tests {
                 assert_eq!(log_tail, None);
                 assert_eq!(timed_out, None);
                 assert_eq!(left_behind, None);
+                assert!(spans.is_empty(), "an older host measured no phase");
             }
             other => panic!("wrong variant: {other:?}"),
         }
@@ -1954,6 +2123,7 @@ mod tests {
         let ev = BuildEvent {
             at_unix_ms: 7,
             kind: BuildEventKind::ResultEnd {
+                spans: Vec::new(),
                 left_behind: None,
                 addr: "//a:x".into(),
                 error: Some("target failed".into()),
@@ -1998,6 +2168,147 @@ mod tests {
             }
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    /// The phase names are frozen (session store I9): this list changes only
+    /// by growing. Each name reads back as its phase, and no two collide.
+    #[test]
+    fn phase_names_are_frozen() {
+        let names: Vec<&str> = Phase::ALL.iter().map(|p| p.name()).collect();
+        assert_eq!(
+            names,
+            [
+                "heph.deps",
+                "heph.resolve",
+                "heph.lock_wait",
+                "heph.cache.read",
+                "heph.admission",
+                "heph.scratch",
+                "heph.stage",
+                "heph.process",
+                "heph.driver.run",
+                "heph.collect",
+                "heph.cache.write",
+            ]
+        );
+        for p in Phase::ALL {
+            assert_eq!(Phase::from_name(p.name()), Some(p));
+        }
+        assert_eq!(Phase::from_name("heph.something_later"), None);
+    }
+
+    /// A reader built before `ResultEnd.spans` decodes a frame that carries
+    /// them: the field is ignored, and everything it knew reads as before.
+    #[test]
+    fn result_end_spans_decode_in_an_older_reader() {
+        #[derive(Deserialize)]
+        struct OldEvent {
+            at_unix_ms: u64,
+            kind: OldKind,
+        }
+        /// `ResultEnd` as it was before `spans`.
+        #[derive(Deserialize)]
+        #[serde(tag = "type")]
+        enum OldKind {
+            ResultEnd {
+                addr: String,
+                error: Option<String>,
+                #[serde(default)]
+                timed_out: Option<TimedOutData>,
+                #[serde(default)]
+                cancelled: bool,
+                #[serde(default)]
+                left_behind: Option<Box<LeftBehindData>>,
+            },
+        }
+
+        let ev = BuildEvent {
+            at_unix_ms: 9,
+            kind: BuildEventKind::ResultEnd {
+                spans: vec![PhaseSpan {
+                    name: Phase::Process.name().into(),
+                    start_unix_us: 100,
+                    end_unix_us: 250,
+                }],
+                left_behind: None,
+                addr: "//a:x".into(),
+                error: Some("boom".into()),
+                upstream_of: None,
+                exit_status: None,
+                exit_code: None,
+                log_tail: None,
+                timed_out: None,
+                cancelled: true,
+            },
+        };
+        let json = serde_json::to_string(&ev).expect("encode");
+        assert!(json.contains(r#""spans":["#), "{json}");
+        let old: OldEvent = serde_json::from_str(&json).expect("an older reader decodes it");
+        assert_eq!(old.at_unix_ms, 9);
+        let OldKind::ResultEnd {
+            addr,
+            error,
+            timed_out,
+            cancelled,
+            left_behind,
+        } = old.kind;
+        assert_eq!(addr, "//a:x");
+        assert_eq!(error.as_deref(), Some("boom"));
+        assert!(timed_out.is_none());
+        assert!(cancelled);
+        assert!(left_behind.is_none());
+    }
+
+    /// `ResultEnd.spans` is additive on the wire (D21): an empty list is not
+    /// written, so an older reader sees the frame it always saw; a list
+    /// round-trips; a span named by a newer host is kept, not dropped.
+    #[test]
+    fn result_end_spans_round_trip_and_skew() {
+        let end = |spans: Vec<PhaseSpan>| BuildEvent {
+            at_unix_ms: 1,
+            kind: BuildEventKind::ResultEnd {
+                spans,
+                left_behind: None,
+                addr: "//a:x".into(),
+                error: None,
+                upstream_of: None,
+                exit_status: None,
+                exit_code: None,
+                log_tail: None,
+                timed_out: None,
+                cancelled: false,
+            },
+        };
+        let empty = serde_json::to_string(&end(Vec::new())).expect("encode");
+        assert!(!empty.contains("spans"), "{empty}");
+
+        let spans = vec![
+            PhaseSpan {
+                name: Phase::Resolve.name().into(),
+                start_unix_us: 10,
+                end_unix_us: 25,
+            },
+            PhaseSpan {
+                name: "heph.something_later".into(),
+                start_unix_us: 25,
+                end_unix_us: 40,
+            },
+        ];
+        let json = serde_json::to_string(&end(spans.clone())).expect("encode");
+        assert!(
+            json.contains(
+                r#""spans":[{"name":"heph.resolve","start_unix_us":10,"end_unix_us":25}"#
+            ),
+            "{json}"
+        );
+        let back: BuildEvent = serde_json::from_str(&json).expect("decode");
+        let BuildEventKind::ResultEnd { spans: got, .. } = back.kind else {
+            panic!("wrong variant: {:?}", back.kind);
+        };
+        assert_eq!(got, spans);
+        assert_eq!(got[0].phase(), Some(Phase::Resolve));
+        assert_eq!(got[0].duration_us(), 15);
+        assert_eq!(got[1].phase(), None, "a newer host's phase is kept by name");
     }
 
     /// `ResultOutputs` round-trips, a frame missing its groups decodes, a

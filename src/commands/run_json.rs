@@ -564,6 +564,7 @@ mod tests {
             timed_out: None,
             cancelled: false,
             left_behind: None,
+            spans: Vec::new(),
         }
     }
 

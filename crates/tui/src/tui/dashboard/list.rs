@@ -1178,6 +1178,7 @@ mod tests {
         apply(
             &mut m,
             BuildEventKind::ResultEnd {
+                spans: Vec::new(),
                 left_behind: None,
                 cancelled: false,
                 addr: "//p:done".into(),

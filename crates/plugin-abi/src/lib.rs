@@ -32,6 +32,16 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// the new `x.y.0`. The 0.14.0 and 0.15.0 entries below predate it — they were
 /// additive minors, and there was no version check to read them.
 ///
+/// 0.21.4 (additive, a patch): phase spans. `BuildEventKind::ResultEnd` gained
+/// `spans` (a list of `{name, start_unix_us, end_unix_us}`): where a target's
+/// result spent its time, phase by phase, under names frozen once released
+/// (`heph.resolve`, `heph.process`, …). A build event crosses the seam as JSON
+/// and the field is `serde(default)` and omitted when empty, so a hook built
+/// before it ignores it and a host that predates it sends none — a hook reads
+/// an empty list, never an error. No vtable, struct or proto message changed;
+/// no plugin must be rebuilt. The bump tells a hook author that the host now
+/// emits it.
+///
 /// 0.21.3 (additive, a patch): host paths.
 /// `RunResponse.host_paths` / `ManagedRunResponse.host_paths` (2, `repeated
 /// string`) list the host paths a run's outputs name; the host stores them with
@@ -346,7 +356,7 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// 0.3.0: `PluginComponents` gained a `hooks` field (a layout change to the
 /// create-entry struct) for the Hook plugin kind — a hard break, so every plugin
 /// must be rebuilt against this ABI.
-pub const ABI_SEMVER: &str = "0.21.3";
+pub const ABI_SEMVER: &str = "0.21.4";
 
 /// The start of the ABI lane this host loads: a plugin is accepted iff its
 /// version matches the caret requirement `^MIN_PLUGIN_ABI` — pre-1.0, one
@@ -363,7 +373,7 @@ pub const MIN_PLUGIN_ABI: &str = "0.21.0";
 
 /// [`ABI_SEMVER`], NUL-terminated: what a plugin's `heph_plugin_abi_semver`
 /// entry returns a pointer to. Bumped with it; a test holds the two equal.
-pub const ABI_SEMVER_C: &std::ffi::CStr = c"0.21.3";
+pub const ABI_SEMVER_C: &std::ffi::CStr = c"0.21.4";
 
 /// The first plugin ABI that reads `ManagedRunRequest.log_capture`. The host
 /// sends it only to a plugin at this version or later; an older one returns

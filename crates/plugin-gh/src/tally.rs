@@ -393,6 +393,9 @@ impl Tally {
                 // The job summary names the failure; where its log is
                 // stays in the step's own output.
                 left_behind: _,
+                // The report times a target by its whole result; where the
+                // time went is the session store's.
+                spans: _,
             } => {
                 self.finish(
                     addr,
@@ -1002,6 +1005,7 @@ mod tests {
         t.apply(&ev(
             end,
             BuildEventKind::ResultEnd {
+                spans: Vec::new(),
                 left_behind: None,
                 cancelled: false,
                 timed_out: None,
@@ -1023,6 +1027,7 @@ mod tests {
         t.apply(&ev(
             10,
             BuildEventKind::ResultEnd {
+                spans: Vec::new(),
                 left_behind: None,
                 cancelled: false,
                 timed_out: None,
@@ -1038,6 +1043,7 @@ mod tests {
             t.apply(&ev(
                 20,
                 BuildEventKind::ResultEnd {
+                    spans: Vec::new(),
                     left_behind: None,
                     cancelled: false,
                     timed_out: None,
@@ -1075,6 +1081,7 @@ mod tests {
             t.apply(&ev(
                 5,
                 BuildEventKind::ResultEnd {
+                    spans: Vec::new(),
                     left_behind: None,
                     cancelled: false,
                     timed_out: None,
@@ -1742,6 +1749,7 @@ mod tests {
         t.apply(&ev(
             5,
             BuildEventKind::ResultEnd {
+                spans: Vec::new(),
                 left_behind: None,
                 cancelled: false,
                 timed_out: None,
@@ -1763,6 +1771,7 @@ mod tests {
             t.apply(&ev(
                 0,
                 BuildEventKind::ResultEnd {
+                    spans: Vec::new(),
                     left_behind: None,
                     cancelled: false,
                     timed_out: None,
@@ -1788,6 +1797,7 @@ mod tests {
             t.apply(&ev(
                 0,
                 BuildEventKind::ResultEnd {
+                    spans: Vec::new(),
                     left_behind: None,
                     cancelled: false,
                     timed_out: None,
@@ -1812,6 +1822,7 @@ mod tests {
         t.apply(&ev(
             10,
             BuildEventKind::ResultEnd {
+                spans: Vec::new(),
                 left_behind: None,
                 cancelled: false,
                 timed_out: None,
@@ -1860,6 +1871,7 @@ mod tests {
         t.apply(&ev(
             5_000,
             BuildEventKind::ResultEnd {
+                spans: Vec::new(),
                 left_behind: None,
                 cancelled: false,
                 timed_out: None,

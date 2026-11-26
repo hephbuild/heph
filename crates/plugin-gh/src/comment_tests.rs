@@ -835,6 +835,7 @@ fn a_failed_build_s_last_comment_is_final() {
     hook.on_event(&ev(
         1_000,
         hcore::events::BuildEventKind::ResultEnd {
+            spans: Vec::new(),
             left_behind: None,
             cancelled: false,
             timed_out: None,

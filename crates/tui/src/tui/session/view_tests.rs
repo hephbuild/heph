@@ -56,6 +56,7 @@ fn ev(at: u64, kind: BuildEventKind) -> BuildEvent {
 
 fn result_end(addr: &str, error: Option<&str>) -> BuildEventKind {
     BuildEventKind::ResultEnd {
+        spans: Vec::new(),
         left_behind: None,
         cancelled: false,
         addr: addr.into(),

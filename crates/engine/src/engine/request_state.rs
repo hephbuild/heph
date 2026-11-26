@@ -461,6 +461,9 @@ pub struct RequestStateData {
     /// ([`RequestState::sample_pool`]) and finished when the request's data
     /// drops, before the hooks close. Empty for a request that admits nothing.
     pool_sampler: std::sync::OnceLock<Arc<PoolSampler>>,
+    /// The request's time origin, which every result's phase spans are
+    /// offset from ([`RequestState::phase_recorder`]).
+    clock_anchor: crate::engine::phase_spans::ClockAnchor,
     /// Guards the `Matched` stream so only the first/top-level `result` (or the
     /// single-addr entry in `run`) announces the matched set. Inner `result`
     /// invocations sharing this request's data must stay silent — re-emitting
@@ -1242,6 +1245,17 @@ impl RequestState {
         self.data.events.is_some() || !self.data.hooks.is_empty()
     }
 
+    /// A recorder for one result scope's phase spans, anchored at this
+    /// request's start; `None` when nothing listens, so an unobserved
+    /// request measures nothing.
+    pub(crate) fn phase_recorder(&self) -> Option<Arc<crate::engine::phase_spans::PhaseRecorder>> {
+        self.has_listeners().then(|| {
+            Arc::new(crate::engine::phase_spans::PhaseRecorder::new(
+                self.data.clock_anchor,
+            ))
+        })
+    }
+
     /// Start this request's `PoolUsage` sampler, once, on its first admission:
     /// call it before the acquire, so the admission is the first change it
     /// sends. A request nobody listens to starts none.
@@ -1806,6 +1820,7 @@ impl Engine {
             codegen_reported: Mutex::new(FxHashSet::default()),
             workers_announced: std::sync::atomic::AtomicBool::new(false),
             pool_sampler: std::sync::OnceLock::new(),
+            clock_anchor: crate::engine::phase_spans::ClockAnchor::now(),
             matched_announced: std::sync::atomic::AtomicBool::new(false),
             bg_pending: Arc::clone(&bg_pending),
             sandbox_removals: crate::engine::sandbox_cleaner::PendingCounter::default(),
@@ -2719,6 +2734,7 @@ mod tests {
                 addr: "//a:b".into(),
             },
             |error: Option<crate::engine::event::ErrorDetail>| BuildEventKind::ResultEnd {
+                spans: Vec::new(),
                 left_behind: None,
                 cancelled: false,
                 addr: "//a:b".into(),

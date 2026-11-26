@@ -550,6 +550,8 @@ impl Engine {
                     allotment: Some(allotment),
                     // An entrypoint's run is never logged (R22).
                     log: None,
+                    // An invocation has no result scope, so no `ResultEnd`.
+                    phases: None,
                 },
             )
             .await;
