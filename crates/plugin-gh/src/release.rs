@@ -13,8 +13,8 @@
 //! and the network stays in `http_fetch`:
 //!
 //! 1. `<name>_release`: `http_fetch` of the release JSON
-//!    (`GET {api_url}/repos/{repo}/releases/tags/{tag}`), with the credentials
-//!    and `cache = False` (see [`RELEASE_SUFFIX`]);
+//!    (`GET {api_url}/repos/{repo}/releases/tags/{tag}`), with the credentials,
+//!    `unpinned`, and cached locally only by default (see [`RELEASE_SUFFIX`]);
 //! 2. `<name>_url`: `<plugin>.asset_url` ([`crate::asset_url`]), the asset's
 //!    API URL picked out of that JSON;
 //! 3. the asset: `http_fetch` with `url = "${read://<pkg>:<name>_url}"`,
@@ -35,7 +35,7 @@ use hplugin::function::{
     DeclaredTarget, FnArgs, FnCallContext, FnOutcome, PluginFn, PluginFnDef, spec_params,
     spec_params_doc,
 };
-use hplugin::htspec::{FromSpecValue, Spec};
+use hplugin::htspec::{FromSpecValue, Spec, TargetSpecCache};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use std::collections::HashMap;
 use std::num::NonZeroU64;
@@ -50,12 +50,26 @@ pub const GITHUB_API_URL: &str = "https://api.github.com";
 
 /// Suffix of the release-JSON fetch declared with `credentials`.
 ///
-/// That fetch is `cache = False`: the JSON carries download counts (so its
-/// bytes move on every download, and a cached copy would be keyed on nothing
-/// that says when to re-read it), and a re-uploaded asset gets a new id under
-/// the same name. Re-reading it is one API call per private asset per build;
-/// the targets below it still hit the cache while the URL it resolves to is
-/// unchanged.
+/// That fetch is cached by its URL and headers, so a warm build makes no API
+/// call. It is `unpinned = True`: the JSON carries download counts, so no
+/// `sha256` can be written for it, and `http_fetch` would otherwise warn about
+/// it.
+///
+/// It is cached **locally only** unless the call's `cache` is a dict that says
+/// `"remote": True`. Otherwise it takes the call's `enabled` and `history` and
+/// stays local (`cache = False` still turns it off). The JSON holds more than the asset
+/// it leads to: the release notes, every asset's name, size and id, and the
+/// uploaders' logins. In the remote cache, anyone who can read that cache can
+/// read those.
+///
+/// Its key is the tag, not the bytes: a cached copy keeps naming the asset id
+/// it was fetched with. An asset uploaded again under the same name gets a new
+/// id, so the asset fetch 404s; an asset uploaded after the JSON was cached is
+/// missing from it, so `<name>_url` fails. Both errors say
+/// `heph run --force //<pkg>:<name>_release` (the asset fetch's through its
+/// `refresh`), which refetches it and overwrites the cached copy: in the remote
+/// cache too from a machine that writes the remote cache; a read-only client
+/// refreshes only its own.
 pub const RELEASE_SUFFIX: &str = "_release";
 
 /// Suffix of the `asset_url` target declared with `credentials`.
@@ -374,6 +388,14 @@ struct ReleaseAssetArgs {
     /// through the API.
     #[spec(ty = ParamType::list(ParamType::String))]
     credentials: Addrs,
+    /// Caching for what this declares: the asset (fetched, and with `extract`
+    /// unpacked) and, with `credentials`, the release JSON. The shape every
+    /// driver's `cache` takes: `False` turns off both tiers,
+    /// `{"remote": False}` keeps it local-only. Default: local and remote,
+    /// except the release JSON, which takes `enabled` and `history` from this
+    /// but is local-only unless this is a dict saying `"remote": True`.
+    #[spec(ty = TargetSpecCache::spec_param_type())]
+    cache: Option<TargetSpecCache>,
 }
 
 /// A string argument that may not be empty.
@@ -437,6 +459,40 @@ impl FromSpecValue for FormatArg {
     }
 }
 
+/// The `cache` argument as the declared targets' own `cache` option: the dict
+/// form, so each of them parses exactly what was passed.
+fn cache_value(c: TargetSpecCache) -> Value {
+    // Destructured, so a field added to `TargetSpecCache` fails to compile
+    // here instead of being dropped on the way to the declared targets.
+    let TargetSpecCache {
+        local,
+        remote,
+        history,
+    } = c;
+    Value::Map(
+        [
+            ("enabled".to_string(), Value::Bool(local)),
+            ("remote".to_string(), Value::Bool(remote)),
+            ("history".to_string(), Value::Int(i64::from(history))),
+        ]
+        .into(),
+    )
+}
+
+/// The release JSON's `cache` when the call passes none: local only (see
+/// [`RELEASE_SUFFIX`]).
+fn release_json_cache() -> Value {
+    Value::Map([("remote".to_string(), Value::Bool(false))].into())
+}
+
+/// Whether the call's `cache` argument, as written, is a dict saying
+/// `"remote": True`. [`TargetSpecCache`] cannot tell that from the default it
+/// fills in for `True` or `{"history": 3}`, and only the written form sends
+/// the release JSON to the remote cache.
+fn writes_remote(cache: Option<&Value>) -> bool {
+    matches!(cache, Some(Value::Map(m)) if matches!(m.get("remote"), Some(Value::Bool(true))))
+}
+
 /// A count argument (`max_bytes`, `max_entries`), forwarded to the extract as
 /// passed: an `Int` unless it does not fit one.
 fn count_value(n: NonZeroU64) -> Value {
@@ -488,7 +544,19 @@ fn release_asset(plugin: &str, pkg: &str, args: &FnArgs) -> anyhow::Result<FnOut
         server_url,
         api_url,
         credentials: Addrs(credentials),
+        cache,
     } = ReleaseAssetArgs::from(&args.named)?;
+    // The release JSON's: the caller's `enabled` and `history`, but remote only
+    // when written (see `RELEASE_SUFFIX`).
+    let release_cache = cache.map_or_else(release_json_cache, |c| {
+        cache_value(TargetSpecCache {
+            remote: writes_remote(args.named.get("cache")),
+            ..c
+        })
+    });
+    // Forwarded only when passed, so a call without it declares for the asset
+    // and the extract what it did before the argument existed.
+    let cache = cache.map(cache_value);
     let cfg = &ReleaseConfig::new(
         server_url.as_deref().unwrap_or(DEFAULT_SERVER_URL),
         api_url.as_deref(),
@@ -531,7 +599,8 @@ fn release_asset(plugin: &str, pkg: &str, args: &FnArgs) -> anyhow::Result<FnOut
                 ),
                 ("credentials".to_string(), creds.clone()),
                 // See `RELEASE_SUFFIX`.
-                ("cache".to_string(), Value::Bool(false)),
+                ("unpinned".to_string(), Value::Bool(true)),
+                ("cache".to_string(), release_cache),
             ]
             .into(),
             ..Default::default()
@@ -557,11 +626,20 @@ fn release_asset(plugin: &str, pkg: &str, args: &FnArgs) -> anyhow::Result<FnOut
                 headers(&[("Accept", "application/octet-stream")]),
             ),
             ("credentials".to_string(), creds),
+            // A 404 here means the cached release JSON is stale, not the
+            // uncached `<name>_url` derived from it: name the one to force.
+            (
+                "refresh".to_string(),
+                Value::List(vec![s(&format!(":{release}"))]),
+            ),
         ]
         .into()
     };
     if let Some(sha) = sha256 {
         asset_fetch.insert("sha256".to_string(), Value::String(sha));
+    }
+    if let Some(cache) = &cache {
+        asset_fetch.insert("cache".to_string(), cache.clone());
     }
     let fetch_config = |out: &str| {
         asset_fetch.insert("out".to_string(), s(out));
@@ -628,6 +706,9 @@ fn release_asset(plugin: &str, pkg: &str, args: &FnArgs) -> anyhow::Result<FnOut
     config.extend(limits.into_iter().map(|(k, v)| (k.to_string(), v)));
     if let Some(out) = out {
         config.insert("out".to_string(), s(out));
+    }
+    if let Some(cache) = cache {
+        config.insert("cache".to_string(), cache);
     }
     outcome.declare_target(DeclaredTarget {
         name: name.to_string(),
@@ -1057,9 +1138,20 @@ mod tests {
             ]))
         );
         assert_eq!(release.config.get("credentials"), Some(&gh_creds));
-        assert_eq!(release.config.get("cache"), Some(&Value::Bool(false)));
+        assert_eq!(
+            release.config.get("cache"),
+            Some(&Value::Map(
+                [("remote".to_string(), Value::Bool(false))].into()
+            )),
+            "the JSON is cached, locally only"
+        );
         assert_eq!(release.config.get("sha256"), None, "the JSON is not pinned");
-        assert_eq!(release.config.len(), 5, "{:?}", release.config);
+        assert_eq!(
+            release.config.get("unpinned"),
+            Some(&Value::Bool(true)),
+            "and says so, so http_fetch does not warn about it"
+        );
+        assert_eq!(release.config.len(), 6, "{:?}", release.config);
 
         let url = target(&out, "tool_url");
         assert_eq!(url.driver, "gh.asset_url");
@@ -1083,6 +1175,81 @@ mod tests {
         assert_eq!(fetch.config.get("out"), Some(&s("tool-linux.tar.gz")));
         assert_eq!(fetch.config.get("executable"), Some(&Value::Bool(true)));
         assert_eq!(fetch.config.get("cache"), None, "the asset is cached");
+        assert_eq!(
+            fetch.config.get("refresh"),
+            Some(&Value::List(vec![s(":tool_release")])),
+            "a 404 names the cached JSON, not the uncached url"
+        );
+    }
+
+    /// `cache` reaches every target that stores something — the release JSON,
+    /// the fetched archive and the unpacked tree — and not `<name>_url`, which
+    /// is never cached. The asset and the extract take it as passed, and carry
+    /// no `cache` key without it. The release JSON takes its `enabled` and
+    /// `history`, but goes to the remote cache only when the call writes
+    /// `"remote": True`: `True` or `{"history": 3}` leave it local-only.
+    #[test]
+    fn cache_is_forwarded_to_every_stored_target() {
+        let tsc = |local, remote, history| TargetSpecCache {
+            local,
+            remote,
+            history,
+        };
+        let map = |pairs: &[(&str, Value)]| {
+            Value::Map(
+                pairs
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), v.clone()))
+                    .collect(),
+            )
+        };
+        // (cache passed, release JSON's, asset's and extract's, why)
+        let rows = [
+            (None, tsc(true, false, 1), None, "default: local-only"),
+            (
+                Some(Value::Bool(true)),
+                tsc(true, false, 1),
+                Some(tsc(true, true, 1)),
+                "True: local-only",
+            ),
+            (
+                Some(map(&[("history", Value::Int(3))])),
+                tsc(true, false, 3),
+                Some(tsc(true, true, 3)),
+                "history: local-only, history 3",
+            ),
+            (
+                Some(map(&[("remote", Value::Bool(true))])),
+                tsc(true, true, 1),
+                Some(tsc(true, true, 1)),
+                "remote written: remote",
+            ),
+            (
+                Some(Value::Bool(false)),
+                tsc(false, false, 1),
+                Some(tsc(false, false, 1)),
+                "False: off",
+            ),
+        ];
+        for (passed, release, rest, why) in rows {
+            let mut args = with(&[creds(&["//auth:gh"]), ("extract", Value::Bool(true))]);
+            args.extend(passed.map(|v| ("cache", v)));
+            let out = call(&args).unwrap();
+            let cache_of = |name: &str| {
+                target(&out, name)
+                    .config
+                    .get("cache")
+                    .map(|v| TargetSpecCache::from_spec_value(v).unwrap())
+            };
+            assert_eq!(cache_of("tool_release"), Some(release), "{why}");
+            for name in ["tool_archive", "tool"] {
+                assert_eq!(cache_of(name), rest, "{why}: {name}");
+            }
+            assert_eq!(cache_of("tool_url"), None, "{why}");
+        }
+
+        let err = call(&with(&[("cache", s("remote"))])).unwrap_err();
+        assert!(format!("{err:#}").contains("cache"), "{err:#}");
     }
 
     #[test]

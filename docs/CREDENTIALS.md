@@ -589,8 +589,20 @@ The residual risk applies here too, and more directly: the rendered URL is the
 whole key, and a server can serve different bytes per identity. It includes no
 identity at all: an unpinned fetch that ran anonymously and cached the server's
 sign-in page keeps serving it after `credentials` is added, since the key did
-not move. A gated fetch with no `sha256` and caching on warns at parse. Set
-`sha256`, or `cache = False`. A pinned gated fetch is remote-cached like any
+not move. A gated fetch with no `sha256` and caching on warns at parse. To
+silence it, do one of:
+
+- set `sha256`, which pins the bytes;
+- set `cache = False`, which stores nothing, and fetches again every build;
+- set `unpinned = True`, for content that cannot be pinned but means the same
+  thing every time and is the same bytes for every identity that can read the
+  URL. The author asserts this; heph does not check it. A private
+  `heph.gh.release_asset`'s release JSON is one. An identity without access
+  gets a 404 from the server only on a cache miss: on a hit it reads the
+  cached JSON, then fails at the asset fetch (or reads a cached asset). A
+  stale entry is refreshed with `heph run --force` on that target.
+
+A pinned gated fetch is remote-cached like any
 other, so anyone who can read the remote cache can read the file: pinning
 restores reproducibility, not access control.
 

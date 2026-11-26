@@ -227,23 +227,44 @@ const BASIC_AUTH: &str = "Basic ZmV0Y2hlcjpuZXRyYy1lMmUtdG9rZW4=";
 ///
 /// Every route answers 401 without [`BASIC_AUTH`], and anything else is a 404.
 /// Returns the base URL and every request served, in order.
-fn serve_api(asset: &'static [u8]) -> (String, Arc<Mutex<Vec<ApiRequest>>>) {
+fn serve_api(asset: &'static [u8]) -> (String, Requests) {
+    let (base, seen, _tool_id) = serve_api_live(asset, Some(7));
+    (base, seen)
+}
+
+/// Every request a fake API served, in order.
+type Requests = Arc<Mutex<Vec<ApiRequest>>>;
+
+/// `tool.sh`'s id on a fake API, `None` while it is not uploaded.
+type ToolId = Arc<Mutex<Option<u32>>>;
+
+/// [`serve_api`], with `tool.sh`'s id under the test's control: the third
+/// value is its id now, `None` while it is not uploaded. The JSON lists it
+/// under that id (not at all under `None`), and only that id's URL serves it;
+/// a former id answers 404, as GitHub does once an asset is replaced.
+fn serve_api_live(asset: &'static [u8], tool_id: Option<u32>) -> (String, Requests, ToolId) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let base = format!("http://{}", listener.local_addr().expect("addr"));
     let seen = Arc::new(Mutex::new(Vec::new()));
+    let tool_id = Arc::new(Mutex::new(tool_id));
     // As on GitHub, the JSON's bytes change between lookups: the download
     // count moves with every download.
     let api = base.clone();
-    let release = move |downloads: usize| {
+    let release = move |downloads: usize, id: Option<u32>| {
+        let tool = id.map_or_else(String::new, |id| {
+            format!(
+                r#", {{"name": "tool.sh", "url": "{api}/repos/o/r/releases/assets/{id}", "download_count": {downloads}}}"#
+            )
+        });
         format!(
             r#"{{"tag_name": "v1", "assets": [
-            {{"name": "other.txt", "url": "{api}/repos/o/r/releases/assets/6", "download_count": 3}},
-            {{"name": "tool.sh", "url": "{api}/repos/o/r/releases/assets/7", "download_count": {downloads}}}
+            {{"name": "other.txt", "url": "{api}/repos/o/r/releases/assets/6", "download_count": 3}}{tool}
         ]}}"#
         )
     };
 
     let log = Arc::clone(&seen);
+    let current = Arc::clone(&tool_id);
     std::thread::spawn(move || {
         let mut downloads = 0;
         for sock in listener.incoming() {
@@ -274,13 +295,14 @@ fn serve_api(asset: &'static [u8]) -> (String, Arc<Mutex<Vec<ApiRequest>>>) {
                 accept,
                 authorization,
             };
+            let id = *current.lock().expect("tool id");
             let json;
             let (status, body): (&str, &[u8]) = if req.authorization != BASIC_AUTH {
                 ("401 Unauthorized", b"Bad credentials")
             } else if req.path == RELEASE_PATH {
-                json = release(downloads);
+                json = release(downloads, id);
                 ("200 OK", json.as_bytes())
-            } else if req.path == ASSET_PATH {
+            } else if id.is_some_and(|id| req.path == asset_path(id)) {
                 if req.accept == "application/octet-stream" {
                     downloads += 1;
                     ("200 OK", asset)
@@ -299,7 +321,12 @@ fn serve_api(asset: &'static [u8]) -> (String, Arc<Mutex<Vec<ApiRequest>>>) {
             let _ = sock.write_all(body);
         }
     });
-    (base, seen)
+    (base, seen, tool_id)
+}
+
+/// The API path of the asset with id `id`.
+fn asset_path(id: u32) -> String {
+    format!("/repos/o/r/releases/assets/{id}")
 }
 
 /// `//auth:files`: a credential presenting `fetcher:netrc-e2e-token` as a
@@ -350,9 +377,8 @@ const ASSET_PATH: &str = "/repos/o/r/releases/assets/7";
 /// credential, the asset's URL is picked out of it and read by the asset
 /// fetch as a deferred value, and the bytes arrive only because that fetch
 /// sent the credential and `Accept: application/octet-stream` to the URL from
-/// the JSON. A second build looks the release up again (`cache = False`), gets
-/// different bytes (the download count moved), and still hits the cache for the
-/// asset, whose URL did not change.
+/// the JSON. A second build makes no request at all: the release JSON is
+/// cached by its URL (`unpinned`, not `cache = False`), and so is the asset.
 #[tokio::test]
 async fn release_asset_with_credentials_fetches_a_private_asset() -> anyhow::Result<()> {
     const SCRIPT: &[u8] = b"#!/bin/sh\necho private\n";
@@ -418,8 +444,8 @@ heph.gh.release_asset(
     ws.run("//p:tool").await?;
     assert_eq!(
         paths(&requests),
-        [RELEASE_PATH, ASSET_PATH, RELEASE_PATH],
-        "the release is looked up again; the unchanged asset is a cache hit"
+        [RELEASE_PATH, ASSET_PATH],
+        "a warm build hits the cache for the release JSON and the asset"
     );
     Ok(())
 }
@@ -669,6 +695,121 @@ heph.gh.release_asset(
         "got: {msg}"
     );
     assert_eq!(paths(&requests), [RELEASE_PATH]);
+    Ok(())
+}
+
+const STALE_SCRIPT: &[u8] = b"#!/bin/sh\necho stale\n";
+
+/// A workspace over [`serve_api_live`] whose `//p:tool` is the private
+/// `tool.sh`, pinned to [`STALE_SCRIPT`].
+fn stale_workspace(
+    tool_id: Option<u32>,
+) -> anyhow::Result<(htestkit::Workspace, Requests, ToolId)> {
+    let (api, requests, id) = serve_api_live(STALE_SCRIPT, tool_id);
+    let (ws, at_api) = private_workspace(&api)?;
+    ws.write_build_file(
+        "p",
+        &format!(
+            r#"
+heph.gh.release_asset(
+    name = "tool",
+    repo = "o/r",
+    tag = "v1",
+    asset = "tool.sh",
+    sha256 = "{}",
+    credentials = ["//auth:files"],
+    {at_api}
+)
+"#,
+            sha256(STALE_SCRIPT)
+        ),
+    );
+    Ok((ws, requests, id))
+}
+
+/// `heph run --force <addr>`.
+async fn run_forced(ws: &htestkit::Workspace, addr: &str) -> anyhow::Result<()> {
+    let m = heph::htmatcher::Matcher::Addr(heph::htaddr::parse_addr(addr)?);
+    let forced = heph::engine::ResultOptions {
+        force: true,
+        ..Default::default()
+    };
+    ws.run_matcher_with(&m, &forced).await?;
+    Ok(())
+}
+
+/// The cached release JSON names an asset id the server no longer has (the
+/// asset was uploaded again): the asset fetch 404s, and the error names the
+/// target the URL came from and the exact `heph run --force` command for the
+/// JSON's target, without the JSON being looked up again. Forcing
+/// `<name>_release` refetches it, and the next build fetches the new id.
+#[tokio::test]
+async fn release_asset_with_a_stale_cached_release_json_says_how_to_refresh_it()
+-> anyhow::Result<()> {
+    let (ws, requests, tool_id) = stale_workspace(Some(7))?;
+    // The JSON is cached; the asset is not (not built yet, or evicted).
+    ws.run("//p:tool_release").await?;
+    *tool_id.lock().expect("tool id") = Some(8);
+
+    let Err(err) = ws.run("//p:tool").await else {
+        panic!("the asset id the cached JSON names is gone");
+    };
+    let msg = format!("{err:#}");
+    for want in [
+        "404",
+        "the url is the output of //p:tool_url",
+        "`heph run --force //p:tool_release`",
+    ] {
+        assert!(msg.contains(want), "{want}: {msg}");
+    }
+    assert!(!msg.contains("--force //p:tool_url"), "uncached: {msg}");
+    assert_eq!(
+        paths(&requests),
+        [RELEASE_PATH, asset_path(7).as_str()],
+        "the release JSON was served from the cache"
+    );
+
+    run_forced(&ws, "//p:tool_release").await?;
+    let result = ws.run("//p:tool").await?;
+    assert_eq!(files(&result)[0].1, "#!/bin/sh\necho stale\n");
+    assert_eq!(
+        paths(&requests)[2..],
+        [RELEASE_PATH, asset_path(8).as_str()],
+        "the forced run looked the release up again, and the asset came from the new id"
+    );
+    Ok(())
+}
+
+/// A release JSON cached before the asset was uploaded lacks it: `<name>_url`
+/// fails with the exact `heph run --force` command for the JSON's target, and
+/// keeps failing from the cache once the asset is up. Forcing the JSON
+/// recovers.
+#[tokio::test]
+async fn release_asset_cached_before_the_upload_says_how_to_refresh_it() -> anyhow::Result<()> {
+    let (ws, requests, tool_id) = stale_workspace(None)?;
+    for attempt in 0..2 {
+        let Err(err) = ws.run("//p:tool").await else {
+            panic!("attempt {attempt}: the cached JSON lists no tool.sh");
+        };
+        let msg = format!("{err:#}");
+        for want in [
+            r#"the release has no asset named "tool.sh""#,
+            "`heph run --force //p:tool_release`",
+        ] {
+            assert!(msg.contains(want), "attempt {attempt}: {want}: {msg}");
+        }
+        // Uploaded after the first build looked the release up.
+        *tool_id.lock().expect("tool id") = Some(7);
+    }
+    assert_eq!(paths(&requests), [RELEASE_PATH], "the JSON is cached");
+
+    run_forced(&ws, "//p:tool_release").await?;
+    ws.run("//p:tool").await?;
+    assert_eq!(
+        paths(&requests),
+        [RELEASE_PATH, RELEASE_PATH, ASSET_PATH],
+        "recovered by the forced lookup"
+    );
     Ok(())
 }
 
