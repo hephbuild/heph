@@ -1,9 +1,12 @@
 //! What a recording says about the machine it ran on (session store PR 5):
 //! `heph session show`'s machine line and its `--json` `machine`.
 //!
-//! Read from the explorer rows only (`metrics`, `span_events`, `spans`), the
-//! same rows a query reads (I9), and the waiting split by running the
-//! [`WAITING_BY_LOAD`](super::query::WAITING_BY_LOAD) recipe itself. A file
+//! Read from the explorer rows (`metrics`, `span_events`, `spans`), the same
+//! rows a query reads (I9), and the waiting split by running the
+//! [`WAITING_BY_LOAD`](super::query::WAITING_BY_LOAD) recipe itself. The one
+//! exception is a recording the seal has not summarised (live or lost): its
+//! busy mean is weighted by each sample's `interval_us`, which only the
+//! `records` table carries, so that mean alone reads `records`. A file
 //! may be foreign: every count is capped, every number checked, and a value
 //! that is not one heph could write is left out rather than trusted.
 

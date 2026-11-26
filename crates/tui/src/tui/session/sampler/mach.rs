@@ -36,8 +36,12 @@ pub(crate) fn mach_busy(a: &MachCpu, b: &MachCpu) -> Option<f64> {
 /// `PROCESSOR_CPU_LOAD_INFO`'s buffer, `cpus` × (user, system, idle, nice)
 /// in that order, summed per state. The sums wrap like the ticks they add:
 /// a wrapping delta of sums is the sum of the per-CPU deltas, so `mach_busy`
-/// reads them as it would one CPU's. `None` when the buffer is not exactly
-/// `cpus` such rows, or there is no CPU.
+/// reads them as it would one CPU's. That holds only while the processor
+/// count is the same between the two reads: a CPU brought on or offline in
+/// between adds or drops its whole cumulative count from one sum, and that
+/// interval's figure is wrong (each read checks its buffer against its own
+/// count; nothing compares one read's count with the last's). `None`
+/// when the buffer is not exactly `cpus` such rows, or there is no CPU.
 pub(crate) fn sum_cpu_load(cpus: u32, units: &[u32]) -> Option<MachCpu> {
     let (rows, []) = units.as_chunks::<4>() else {
         return None;
