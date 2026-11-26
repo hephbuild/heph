@@ -240,6 +240,10 @@ skipped in silence.
 
 ## History of breaks
 
+- **0.21.4** (additive patch) — phase spans. `BuildEventKind::ResultEnd`
+  gained `spans`, a build event's JSON field that is `serde(default)` and
+  omitted when empty: an older hook ignores it, an older host sends none. No
+  vtable, struct or proto message changed. No plugin must be rebuilt.
 - **0.21.3** (additive patch) — host paths.
   `RunResponse.host_paths` and `ManagedRunResponse.host_paths` (2, `repeated
   string`) list host paths whose nix closures cover what a run's outputs name;
