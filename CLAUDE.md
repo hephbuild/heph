@@ -150,7 +150,7 @@ The `gen` script is a devenv-provided alias, assume its present. It must be run 
 
 `crates/e2e` and the root package link their integration tests into **one binary each**, so a file is a module, not a `--test` target: `cargo test -p e2e --test e2e clean::`, `cargo test --test root ci_gate::`. A few files stay separate binaries because they touch process-global state (`set_var`, re-exec, the child watcher); `tests/root/test_layout.rs` lists them and fails on a file that is neither declared in its `main.rs` nor on that list.
 
-Debug builds carry line tables only, and dependencies no debuginfo (`[profile.dev]` in `Cargo.toml`): backtraces keep file:line, a debugger loses variables. `CARGO_PROFILE_DEV_DEBUG=full cargo build` restores full debuginfo for the workspace crates only; dependencies need `--config 'profile.dev.package."*".debug=true'` as well.
+Debug builds carry line tables only, and dependencies no debuginfo (`[profile.dev]` in `Cargo.toml`): backtraces keep file:line, a debugger loses variables. `CARGO_PROFILE_DEV_DEBUG=full cargo build` restores full debuginfo for the workspace crates only; dependencies need `--config 'profile.dev.package."*".debug=true'` as well. A local mac shell sets `CARGO_PROFILE_DEV_SPLIT_DEBUGINFO=packed` (`enterShell` in `devenv.nix`): each debug binary gets a `.dSYM` beside it, and no object files are left behind in `target/`.
 
 `lint`, `fix`, `tst` and `e2e` are devenv scripts, and their text is **baked into the shell when it starts**. After editing `devenv.nix`, the running shell still has the old scripts. For example, a new crate added to `qualityCrates` is not format-checked, so `lint` is green locally and red in CI. Start a new `devenv shell` before trusting them.
 

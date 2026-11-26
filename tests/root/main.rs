@@ -31,6 +31,7 @@ mod codegen_removed_cli;
 mod config_schema_cli;
 mod coreutils_cli;
 mod darwin_linker;
+mod dev_debuginfo;
 mod execrunner_gate;
 mod feature_unification;
 mod gc_cli;
