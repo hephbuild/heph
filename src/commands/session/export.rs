@@ -13,7 +13,7 @@ use anyhow::Context as _;
 use hcore::approval_notice::ReadNotice;
 
 use super::reference::{Opener, Resolved, open_ref};
-use super::{ErrorKind, ExportArgs, ExportFormat, ViewOpts, kinded};
+use super::{ExportArgs, ExportFormat, ViewOpts};
 use crate::tui::session::export::{self as core, Abort};
 use crate::tui::session::hephsession::EXTENSION;
 use crate::tui::session::otlp;
@@ -156,12 +156,9 @@ async fn export_otlp(
     note: Arc<dyn Fn(&str) + Send + Sync>,
 ) -> anyhow::Result<Exported> {
     if args.no_logs {
-        return Err(kinded(
-            ErrorKind::Other,
-            anyhow::anyhow!(
-                "--no-logs does not apply to --format otlp: OTLP holds no notice text or failure logs"
-            ),
-        ));
+        anyhow::bail!(
+            "--no-logs does not apply to --format otlp: OTLP holds no notice text or failure logs"
+        );
     }
     let sources: [&dyn SessionSource; 1] = [file];
     let (id, rf) = match open_ref(&sources, &args.reference, opts, opener).await? {

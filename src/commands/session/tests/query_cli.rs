@@ -533,10 +533,10 @@ async fn query_stops_when_interrupted_opening_its_sources() {
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let ran = run_query_until(&root, &argv, "", Arc::new(NoDownload), stop).await;
         let e = ran.out.expect_err(&format!("{argv:?}: answered"));
-        let (kind, code, _) = kind_and_code(e);
+        let (code, msg) = code_and_msg(e);
         assert_eq!(
-            (kind, code),
-            (ErrorKind::Interrupted, Some(130)),
+            (code, msg.as_str()),
+            (Some(130), "query interrupted"),
             "{argv:?}"
         );
     }
@@ -553,8 +553,8 @@ async fn query_stops_the_catalog_heal_when_interrupted() {
     session(&root, 60_000, 2);
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let ran = run_query_until(&root, &["SELECT 1"], "", Arc::new(NoDownload), stop).await;
-    let (kind, _, _) = kind_and_code(ran.out.expect_err("answered"));
-    assert_eq!(kind, ErrorKind::Interrupted);
+    let (code, _) = code_and_msg(ran.out.expect_err("answered"));
+    assert_eq!(code, Some(130));
     let healed: i64 = rusqlite::Connection::open_with_flags(
         root.join(crate::tui::session::catalog::FILE),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,

@@ -82,8 +82,7 @@ pub(crate) async fn query_until(
     interrupted(&limits.stop)?;
     let tmp = store::tmp_dir(env.root);
     if sources.len() > 1 {
-        std::fs::create_dir_all(&tmp)
-            .with_context(|| format!("creating {}", tmp.display()))?;
+        std::fs::create_dir_all(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
     }
     let run_limits = limits.clone();
     let mut answer = hcore::blocking::run(move || engine::run(&sql, sources, &tmp, &run_limits))

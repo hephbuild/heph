@@ -138,7 +138,6 @@ async fn export_otlp_local_foreign_stdout_and_file() {
         run_export(&file, &otlp_args(id.encode(), &refused, true), &no_opener()).await;
     let e = res.expect_err("--no-logs is refused");
     assert!(format!("{e:#}").contains("--no-logs"), "{e:#}");
-    assert_eq!(error_kind(&e), ErrorKind::Other);
     assert!(!refused.exists());
     assert!(stdout.is_empty());
 

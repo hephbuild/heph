@@ -957,7 +957,7 @@ first.
   session, and for a session the catalog still lists after cleanup removed
   its recording (`recorded` `true`). It says the directory is there, not
   that this heph can read it: a recording a newer heph wrote is `true`, and
-  opening it fails (`error.kind` `format_too_new`), naming its format.
+  opening it fails with exit 125, naming its format.
 - `target` appears only with `--addr`: `{addr, outcome, duration_ms}`, that
   target in this session. `outcome` is `ran`, `hit`, `failed` or `cancelled`,
   an open set.
