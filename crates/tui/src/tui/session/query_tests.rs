@@ -650,7 +650,7 @@ fn a_query_over_a_capped_session_says_it_is_partial() {
     };
     let capped = "none for 1 session(s) over the catalog's cap";
 
-    let samples = "machine samples not kept; summaries only";
+    let samples = "machine samples not kept; start-time figures and summaries only";
     let metrics = partial("SELECT count(*) FROM metrics", Scope::default());
     assert_eq!(
         metrics.get("metrics").map(String::as_str),

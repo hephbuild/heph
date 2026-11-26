@@ -522,8 +522,8 @@ recordings are kept, 7 days by default.
 | `uncovered_wall` | `session_id`, `wall_s`, `target_s` (wall time with at least one `target`-class span open, overlaps counted once), `uncovered_pct` (the rest, as a share of the wall); ended sessions only |
 | `phase_percentiles` | `class`, `name`, `n`, `p50_ms`, `p90_ms`, `p99_ms` (nearest rank), `max_ms` |
 | `hit_rate_by_package` | `package`, `targets` (resolved: ran, hit or failed; cancelled ones are left out), `hits`, `hit_pct`; lowest rate first |
-| `waiting_by_load` | `session_id`, `phase` (the waiting phase, its span name without heph.), `busy_us`, `spare_us`, `unknown_us` (span-microseconds summed across targets, split by the machine sample covering them; `show` prints the same split on its machine line) |
-| `resources_vs_machine` | `session_id`, `pool` (`cpu` or `memory`: the pools with a machine counterpart), `declared_above_use_us`, `use_above_declared_us`, `matched_us`, `unknown_us` (the session's time, split by the pool's held fraction against the machine's over each sample interval; `show` prints the same totals on the pool's line) |
+| `waiting_by_load` | `session_id`, `phase` (the waiting phase, its span name without heph.), `busy_us`, `spare_us`, `unknown_us` (span-microseconds summed across targets, split by the machine sample covering them: ten targets waiting the same second count 10 s, so a phase's total can exceed the session's wall time; `show` prints the same split on its machine line) |
+| `resources_vs_machine` | `session_id`, `pool` (`cpu` or `memory`: the pools with a machine counterpart), `declared_above_use_us`, `use_above_declared_us`, `matched_us`, `unknown_us` (wall-clock microseconds of the session, each counted once, so the four add up to the session's duration; split by the pool's held fraction against the machine's over each sample interval; `show` prints the same totals under the pool's line) |
 
 ```sql
 -- time_by_phase: Where did time go, by class and phase (busy time, not wall time)?
@@ -780,7 +780,8 @@ ORDER BY s.started_ms DESC;
 from the `heph.session.pool.*` metrics and the last `heph.pool.capacity`:
 
 ```
-cpu pool (capacity 8): held 7.6 mean while in use (95%), 8 peak; nothing waited for it; against the machine: 6m12s declared above use, 1m00s matched, 2.0s unknown
+cpu pool (capacity 8): held 7.6 mean while in use (95%), 8 peak; nothing waited for it
+  against the machine: 6m12s with the pool 90%+ held while the machine was under 50%, 1m00s in step, 2.0s not compared (no sample); targets may declare more CPU than they use: consider lowering their `resources`
 docker pool (capacity 4): held 3 mean while in use (75%), 4 peak; something was waiting for 1s
 ```
 
@@ -788,12 +789,25 @@ docker pool (capacity 4): held 3 mean while in use (75%), 4 peak; something was 
 row to the session's end. "Something was waiting" is `waiting_us`, the time
 with at least one request queued, not the sum of every request's wait.
 
-"Against the machine" is the [`resources_vs_machine`](#built-in-recipes)
-recipe's totals for that pool, the non-zero ones: the session's time, split
-by the pool's held fraction against the machine's over each sample
-interval. Only `cpu` (against CPU busy) and `memory` (against memory used
-over RAM) have a machine counterpart; any other pool's line stops at its
-waiters. See [Machine stats](#machine-stats).
+The indented "against the machine" line is the
+[`resources_vs_machine`](#built-in-recipes) recipe's totals for that pool,
+the non-zero ones: the session's wall time, split by the pool's held
+fraction against the machine's over each sample interval. Only `cpu`
+(against CPU busy) and `memory` (against memory used over RAM) have a
+machine counterpart; any other pool has no second line. Each phrase is one
+`--json` field:
+
+| Words | `--json` field | Meaning |
+| --- | --- | --- |
+| with the pool 90%+ held while the machine was under 50% | `declared_above_use_us` | targets reserved most of the pool and the machine sat mostly idle |
+| with the machine 90%+ while the pool was under 50% held | `use_above_declared_us` | the machine was loaded while little of the pool was reserved |
+| in step | `matched_us` | the rest of the time compared |
+| not compared (no sample) | `unknown_us` | before the pool's first row or the first sample, across a gap over 2 s, or after the source stopped |
+
+When one of the first two covers over half the time compared (unknown time
+left out), the line ends with what to try: lower the targets' `resources`
+for the first, raise them (or look for other work on the machine) for the
+second. See [Machine stats](#machine-stats).
 
 A live session has none yet (the rows come at its end), and neither does a
 build that admitted nothing (an all-hit build). These rows are read from
@@ -820,7 +834,24 @@ against what the machine was doing: out of CPU, short of memory, or neither.
 The names carry no attributes and are frozen, with their kind and unit,
 from the first release that contains them (I9). `query --schema` prints
 this table. The OTLP export renames only where a semantic convention
-(v1.27.0) means the same thing.
+(v1.27.0) means the same thing. One deviation: `process.cpu.time` is
+exported as one series, user and system time together, without the
+convention's `process.cpu.state` attribute.
+
+One name means the same thing on each OS, read from a different source
+(below), so compare figures within an OS rather than across:
+
+- `memory.used` is approximate, and the two OSes approximate differently.
+  Linux counts `MemTotal − MemAvailable`; macOS counts what Activity
+  Monitor calls Memory Used (app, wired and compressed pages). The same
+  build can read a few GiB apart on the two.
+- `cpu.limit` is the cgroup v2 quota on Linux when one is tighter than the
+  CPU count; macOS has no quota, so it is always the CPU count there.
+- `memory.limit` is the host's physical RAM on both. heph reads no memory
+  cgroup: inside a container with a `memory.max`, the limit and
+  `memory.used` are the host's, so a build close to its container's limit
+  can read as spare. Read `memory.used` against the container's own limit
+  there.
 
 - **Sources.** Linux: the first line of `/proc/stat`, `/proc/meminfo`
   (`MemTotal − MemAvailable`) and `/proc/self/statm`; under a cgroup v2
@@ -835,11 +866,24 @@ this table. The OTLP export renames only where a semantic convention
   A recording shorter than one tick has no busy row and no CPU summary.
 - **Cost.** One thread, one record and four rows a second, written in the
   recorder's existing flush. `--raw` starts no sampler; a private session
-  samples. The catalog keeps the four summaries, never the samples.
+  samples. The catalog keeps the three start-time rows (`cpu.count`,
+  `cpu.limit`, `memory.limit`) and the four summaries, never the samples;
+  a catalog query reading `metrics` says so in `coverage.partial`. The
+  first `show` of a kept recording builds its `(name, time_us)` index on
+  `metrics`, since the waiting split reads samples by name, as a first
+  `query` does: about a megabyte per hour recorded, written once.
+- **Clocks (a known limit).** Samples are stamped from the recorder's start
+  plus a monotonic offset; spans from the engine's own anchors (per request
+  and per target run); pool rows from the wall clock when each was emitted.
+  A wall-clock step during the build, or a suspend (a monotonic clock does
+  not advance while the machine sleeps), shifts the samples against spans
+  and pool rows by that amount, and both splits misattribute the time after
+  it.
 - **Nothing flows back.** No figure reaches a hash, a target, admission or a
   `${resource:…}` allotment.
 
-`show` prints one machine line, then a line per source that stopped:
+`show` prints one machine line, then the admission hint when it applies,
+then a line per source that stopped:
 
 ```
 machine: 8 CPUs (host), 16.0 GiB RAM (host); CPU busy 65% mean, 95% peak; memory used 12.0 GiB peak (75% of RAM); heph resident 200.0 MiB peak; waiting: admission 0.2s (0.2s busy), deps 1.0s (0.5s spare, 0.5s unknown)
@@ -850,21 +894,67 @@ machine: 2.5 CPUs (quota, of 8), 16.0 GiB RAM (host); CPU busy 50% mean, 75% pea
 the sampler stopped reading heph.machine.memory.used 1s into the run: no MemAvailable in /proc/meminfo
 ```
 
-With nothing sampled it says why: `machine: none: recorded before machine
-stats`, `no samples (shorter than one tick)`, `no samples: the sampler's
-sources stopped`, or `the sampler did not start: <error>`.
+When admission waited over 1 s, more than half of it with the machine to
+spare, an indented line says what held the targets back:
+
+```
+machine: 8 CPUs (host), 16.0 GiB RAM (host); CPU busy 30% mean, 30% peak; memory used 4.0 GiB peak (25% of RAM); heph resident 100.0 MiB peak; waiting: admission 2.5s (2.0s spare, 0.5s unknown)
+  admission waited 2.0s of 2.5s with the machine to spare: the pools' capacity or the targets' declared `resources` held them back, not the machine
+```
+
+With nothing sampled the line opens `none:` and says why, then whatever
+start-time figures there are. A machine figure never changes the build's
+outcome, so none of these is a failure of the run:
+
+| Line | `--json` `status` / `reason` | Meaning |
+| --- | --- | --- |
+| `machine: none: recorded before machine stats (no machine record)` | `none` / `older_derivation` | a heph without machine stats recorded it; re-deriving it cannot add what was never sampled |
+| `machine: none: no samples (shorter than one tick); 8 CPUs (host), …` | `none` / `no_samples` | the run ended before the first sample |
+| `machine: none: the sampler's sources stopped before a sample (see below); …` | `failed` | every source failed; the lines below say why |
+| `machine: none: the sampler did not start (see below)` | `failed` | followed by `the sampler did not start: <error> (build unaffected; no machine data recorded)` |
+
+`older_derivation` means exactly "no machine record": a recording from a heph
+with machine stats that lost its `MachineInfo` before it was read reads the
+same way.
 
 **Waiting, split.** Each `waiting` span (`heph.admission`, `heph.deps`,
 `heph.lock_wait`, `heph.scratch`) is cut at the samples. A piece is **busy**
 when its sample has CPU busy at 0.9 or more, or memory used at 95% of RAM or
 more; **spare** when both are known and below; **unknown** where no sample
 covers it (before the first, after the sampler stopped, past the cap, across
-a gap over 2 s). Totals are summed across targets, so concurrent waits add
-up. Spare time in `admission` means the declared `resources` held work back
-on a machine with room. This is the `waiting_by_load` recipe, which `show`
-runs; the pool lines' "against the machine" totals are `resources_vs_machine`
-(see [Pools](#pools) and [Built-in recipes](#built-in-recipes)). Their SQL and
-thresholds are not contract.
+a gap over 2 s). Totals are span time summed across targets, so concurrent
+waits add up: ten targets queued for the same second count 10 s, and a
+phase's total can exceed the session's wall time. `show` prints seconds;
+`--json` and the recipe give microseconds.
+
+Only `admission` depends on `resources`: it is the wait for a pool to have
+room for what a target declared. `deps` waits for upstream targets,
+`lock_wait` for another process's lock, `scratch` for scratch space; their
+split says how loaded the machine was meanwhile, nothing about the
+declarations.
+
+| What `show` says | What it means | What to try |
+| --- | --- | --- |
+| `admission` mostly **spare** (the hint above) | targets queued for a pool while the machine had room | raise the pool's capacity (`-j`, `--resource`, `.hephconfig` `resources:`), or lower what the targets declare |
+| `admission` mostly **busy** | the machine was the limit; the pool kept it from being overloaded | a larger machine or fewer builds at once; the declarations are not the cause |
+| `deps`, `lock_wait`, `scratch`, any split | not a resources question | `show`'s blocked-on lines and `time_by_phase` |
+| mostly **unknown** | no sample covered the wait | nothing to conclude |
+| a pool line's "90%+ held while the machine was under 50%" | `declared_above_use_us` | lower the targets' `resources` |
+| a pool line's "machine 90%+ while the pool was under 50% held" | `use_above_declared_us` | raise the targets' `resources`, or look for other work on the machine |
+
+A worked example: a 40 s build whose `admission` reads `30.0s (24.0s spare,
+6.0s unknown)` had targets queued for 30 s of summed span time, 24 s of it
+while the machine sat under 90% CPU and 95% memory: the pool, not the
+machine, set the pace. If its `cpu` pool line also reads mostly "90%+ held
+while the machine was under 50%", the targets reserve more CPU than they
+burn, and lowering their `cpu` declarations lets more run at once.
+
+This is the `waiting_by_load` recipe, which `show` runs; the pool lines'
+"against the machine" totals are `resources_vs_machine` (see [Pools](#pools)
+and [Built-in recipes](#built-in-recipes)). Their SQL, thresholds and
+wording are not contract, and neither is the hint: `show --json` carries
+the totals, never a verdict, so a script applies its own rule to
+`by_phase`.
 
 `show --json`'s `machine` is `{status, reason, cpus, cpu_limit,
 cpu_limit_source, memory_limit_bytes, memory_limit_source, cpu_busy_mean,
@@ -873,7 +963,9 @@ sources_failed: [{source, error, at_unix_us}], waiting: {threshold_cpu,
 threshold_memory, by_phase: {<phase>: {busy_us, spare_us, unknown_us}}}}`.
 `status` is `sampled`, `partial` (a source stopped), `failed` (no sample, a
 source stopped) or `none`, with `reason` `older_derivation` or `no_samples`
-only then; all are open enums. A figure with no sample is absent, never 0.
+only then; all are open enums. The keys of `by_phase` are an open set too:
+the phases above today, any waiting phase a later heph adds, and a phase
+nothing waited in is absent. A figure with no sample is absent, never 0.
 `cpu_limit_source` is `quota` when the limit is below the CPU count, else
 `host`; `memory_limit_source` is always `host`. While the session runs, the
 summaries are computed from the samples so far.

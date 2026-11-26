@@ -536,7 +536,9 @@ async fn query_over_the_catalog_says_what_it_holds_in_part() {
         (
             &[],
             "SELECT count(*) FROM metrics",
-            serde_json::json!({"metrics": "machine samples not kept; summaries only"}),
+            serde_json::json!({
+                "metrics": "machine samples not kept; start-time figures and summaries only"
+            }),
         ),
         (&[], "SELECT count(*) FROM targets", serde_json::json!({})),
         (
