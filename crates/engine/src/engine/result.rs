@@ -2433,9 +2433,10 @@ fn result_end_event(
     match error {
         Some(mut d) => {
             d.upstream_of = None;
-            let duplicate = matches!(blame, EndBlame::Duplicate);
+            let duplicate = matches!(blame, EndBlame::Duplicate { .. });
             let (upstream_file, path) = match blame {
-                EndBlame::Unknown | EndBlame::Duplicate => (None, Vec::new()),
+                EndBlame::Unknown => (None, Vec::new()),
+                EndBlame::Duplicate { file } => (file, Vec::new()),
                 EndBlame::Skipped { of, file } => {
                     d.upstream_of = Some(of);
                     (file, Vec::new())
@@ -2502,8 +2503,11 @@ enum EndBlame {
     Culprit { path: Vec<String> },
     /// A culprit's own end that lost the claim (another end, a synthetic
     /// pair or a `FileFailed` announced the culprit first): it closes the
-    /// row, flagged so no consumer boxes or counts it (D1.d).
-    Duplicate,
+    /// row, flagged so no consumer boxes or counts it (D1.d). `file` is set
+    /// when the culprit is a BUILD file `addr` itself lives in: the end
+    /// names it in `upstream_file`, so a consumer can tell the target was
+    /// skipped because of its own file.
+    Duplicate { file: Option<String> },
 }
 
 impl EndBlame {
@@ -2529,13 +2533,15 @@ impl EndBlame {
             // A broken file reached through `addr` itself: the file's box is
             // its `FileFailed`, announced by the claim's winner.
             FailureFate::Blame {
-                culprit: Culprit::File(_),
+                culprit: Culprit::File(file),
                 ..
             }
             | FailureFate::Each {
-                culprit: Culprit::File(_),
+                culprit: Culprit::File(file),
                 ..
-            } => Self::Duplicate,
+            } => Self::Duplicate {
+                file: Some(file.to_string()),
+            },
             FailureFate::Blame { .. } | FailureFate::Each { .. } => Self::Culprit {
                 path: rs.culprit_path(addr).iter().map(Addr::format).collect(),
             },
@@ -3809,6 +3815,18 @@ impl Engine {
             walk.abort();
         }
 
+        // Keep-going's counterpart of the failed walk's blame: a named package
+        // whose BUILD file did not evaluate is the file's failure, not a gap.
+        if walk_finished
+            && fatal.is_none()
+            && let Some(gaps) = opts.discovery.gaps()
+        {
+            let blamed = Arc::clone(&self)
+                .blame_gapped_files(&rs, matcher, gaps, owns_matched)
+                .await;
+            errors.extend(blamed);
+        }
+
         // Matcher fully resolved: mark the matched set final (drops the `~`).
         // Not on a failed walk — the set never became final, so claiming it did
         // would paint a wrong denominator over an aborting run.
@@ -3843,6 +3861,80 @@ impl Engine {
         }
 
         Ok(BatchResult { ok, errors })
+    }
+
+    /// Keep-going's counterpart of [`blame_walk_failure`] (U2, D5).
+    ///
+    /// A selection that names its targets by address only (`//d:t1
+    /// //d:t2`), whose walk could not probe a named package because a BUILD
+    /// file did not evaluate, recorded that package as a gap, and nothing in
+    /// it ran. Every named address there is the file's. The file is recorded
+    /// once, entered through the first of them, and announced as
+    /// `FileFailed`. Each address is matched and ends as a target of a broken
+    /// file does when it is built: a duplicate end naming the file. The
+    /// package is then accounted for, so its gap is withdrawn.
+    ///
+    /// Any other gap is left as the walk recorded it, and so is every gap of
+    /// a selection that names a label or a package: what else the package
+    /// held is unknown. Returns each blamed address with its marker, for the
+    /// batch's errors. The probe is memoized, so this evaluates nothing the
+    /// walk did not.
+    async fn blame_gapped_files(
+        self: Arc<Self>,
+        rs: &Arc<RequestState>,
+        matcher: &Matcher,
+        gaps: &crate::engine::discovery::Gaps,
+        owns_matched: bool,
+    ) -> Vec<(Addr, anyhow::Error)> {
+        fn named_only(m: &Matcher, out: &mut Vec<Addr>) -> bool {
+            match m {
+                Matcher::Addr(a) => {
+                    out.push(a.clone());
+                    true
+                }
+                Matcher::Or(ms) => ms.iter().all(|m| named_only(m, out)),
+                _ => false,
+            }
+        }
+        use crate::engine::event::{BuildEventKind, ErrorDetail};
+        let mut named = Vec::new();
+        if gaps.is_empty() || rs.ctoken().is_cancelled() || !named_only(matcher, &mut named) {
+            return Vec::new();
+        }
+        let mut seen = rustc_hash::FxHashSet::default();
+        let mut blamed = Vec::new();
+        for addr in named {
+            if !seen.insert(addr.clone()) {
+                continue;
+            }
+            let Err(e) = Arc::clone(&self).probe_segments(rs, &addr.package).await else {
+                continue;
+            };
+            if is_stop(&e) || hcore::hmemoizer::find::<FileEvalFailed>(&e).is_none() {
+                continue;
+            }
+            let addr_str = addr.format();
+            rs.mark_requested(&addr);
+            if owns_matched {
+                rs.emit(BuildEventKind::Matched {
+                    addrs: vec![addr_str.clone()],
+                    complete: false,
+                });
+            }
+            rs.emit(BuildEventKind::ResultStart {
+                addr: addr_str.clone(),
+            });
+            let detail = ErrorDetail::from_error(&e);
+            let end = EndBlame::of(rs, &addr, &failure_fate(&addr, &e));
+            let (marker, _) = classify_failure_fresh(rs, &addr, e);
+            rs.emit(result_end_event(rs, addr_str, Some(detail), end, None));
+            gaps.withdraw(
+                crate::engine::discovery::Stage::Probe,
+                &format!("//{}", addr.package),
+            );
+            blamed.push((addr, marker));
+        }
+        blamed
     }
 
     /// Scope this request's `--force` / `--no-scratch` to `matcher`. See
@@ -3924,7 +4016,7 @@ impl Engine {
                 // dependent that announced it first) closes non-announcing.
                 let (e, fresh) = classify_failure_fresh(&fate_rs, addr, e);
                 *blame.lock() = if own && !fresh {
-                    EndBlame::Duplicate
+                    EndBlame::Duplicate { file: None }
                 } else {
                     end
                 };

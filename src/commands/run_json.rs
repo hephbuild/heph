@@ -347,9 +347,22 @@ impl Fold {
                 ..
             } => {
                 let live = self.live.remove(addr).unwrap_or_default();
+                if self.done.contains(addr) {
+                    return Vec::new();
+                }
                 // A duplicate end closes a row another end (or a file's
-                // record) already reported.
-                if *duplicate || self.done.contains(addr) {
+                // record) already reported. One naming a file is a target of
+                // that broken file the file's record was not entered
+                // through: skipped because of its own file.
+                if *duplicate {
+                    if let Some(file) = upstream_file {
+                        let held = Held {
+                            entry: blank(Some(addr.clone()), Outcome::Skipped),
+                            of: addr.clone(),
+                            file: Some(file.clone()),
+                        };
+                        self.hold(addr, held);
+                    }
                     return Vec::new();
                 }
                 let outcome = match (error, upstream_of) {
@@ -1163,18 +1176,28 @@ mod tests {
     /// down; the requested target that led into it is held as skipped.
     #[test]
     fn file_failed_one_record_and_holds_its_entry() {
+        let dup = |a: &str, file: Option<&str>| {
+            let mut dup = end(a, Some("eval"), None);
+            if let BuildEventKind::ResultEnd {
+                duplicate,
+                upstream_file,
+                ..
+            } = &mut dup
+            {
+                *duplicate = true;
+                *upstream_file = file.map(str::to_string);
+            }
+            dup
+        };
         let (entries, f) = fold_with(
             vec![
-                ev(0, matched(&["//d:t1"], true)),
+                ev(0, matched(&["//d:t1", "//d:t3"], true)),
                 ev(1, file_failed("d/BUILD", "//d:t1", &["//d:t1"])),
                 ev(2, file_failed("d/BUILD", "//d:t2", &["//d:t2"])),
-                ev(3, {
-                    let mut dup = end("//d:t1", Some("eval"), None);
-                    if let BuildEventKind::ResultEnd { duplicate, .. } = &mut dup {
-                        *duplicate = true;
-                    }
-                    dup
-                }),
+                ev(3, dup("//d:t1", Some("d/BUILD"))),
+                // Another requested target of the same file: its duplicate
+                // end names the file, so it is skipped because of it.
+                ev(4, dup("//d:t3", Some("d/BUILD"))),
             ],
             &Known::default(),
         );
@@ -1196,7 +1219,13 @@ mod tests {
             .iter()
             .map(|h| (h.entry.addr.as_deref(), h.of.as_str(), h.file.as_deref()))
             .collect();
-        assert_eq!(held, [(Some("//d:t1"), "//d:t1", Some("d/BUILD"))]);
+        assert_eq!(
+            held,
+            [
+                (Some("//d:t1"), "//d:t1", Some("d/BUILD")),
+                (Some("//d:t3"), "//d:t3", Some("d/BUILD"))
+            ]
+        );
     }
 
     /// A culprit's `error` is its recorded cause on one line, not the

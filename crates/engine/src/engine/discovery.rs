@@ -215,6 +215,33 @@ impl Gaps {
         }
     }
 
+    /// Withdraw every skip of `scope` at `stage`, whichever provider recorded
+    /// it: the scope turned out to be accounted for. A keep-going run whose
+    /// selection names only addresses blames the BUILD file a named package
+    /// could not be probed through (U2), and every target the selection could
+    /// have found there then has its record.
+    pub fn withdraw(&self, stage: Stage, scope: &str) {
+        let mut inner = self.inner.lock();
+        let gone: Vec<(Stage, String, String)> = inner
+            .seen
+            .iter()
+            .filter(|(s, _, sc)| *s == stage && sc == scope)
+            .cloned()
+            .collect();
+        for key in gone {
+            inner.seen.remove(&key);
+            let (stage, provider, scope) = key;
+            let group_key = (stage, provider);
+            if let Some(group) = inner.groups.get_mut(&group_key) {
+                group.count = group.count.saturating_sub(1);
+                group.examples.remove(&scope);
+                if group.count == 0 {
+                    inner.groups.remove(&group_key);
+                }
+            }
+        }
+    }
+
     /// A snapshot of what was skipped, groups in (stage, provider) order.
     pub fn report(&self) -> GapReport {
         let inner = self.inner.lock();
@@ -402,6 +429,25 @@ mod tests {
         assert_eq!(report.skipped, 2);
         assert_eq!(report.groups.len(), 1);
         assert_eq!(report.groups[0].count, 2);
+    }
+
+    /// A withdrawn scope leaves the count, the examples and, once its group
+    /// is empty, the group; other stages of the same scope stay.
+    #[test]
+    fn withdraw_removes_one_scope_at_one_stage() {
+        let gaps = Gaps::new("//d:t1 + //d:t2");
+        gaps.record(Stage::Probe, "buildfile", "//d".into(), &err("boom"));
+        gaps.record(Stage::Probe, "buildfile", "//e".into(), &err("boom"));
+        gaps.record(Stage::List, "buildfile", "//d".into(), &err("boom"));
+        gaps.withdraw(Stage::Probe, "//d");
+        let report = gaps.report();
+        assert_eq!(report.skipped, 2);
+        let probe = &report.groups[0];
+        assert_eq!((probe.stage, probe.count), (Stage::Probe, 1));
+        gaps.withdraw(Stage::Probe, "//e");
+        gaps.withdraw(Stage::List, "//d");
+        assert!(gaps.is_empty());
+        assert!(gaps.report().groups.is_empty());
     }
 
     #[test]
