@@ -219,23 +219,8 @@ impl fmt::Display for CycleError {
 
 impl std::error::Error for CycleError {}
 
-/// Aggregates multiple errors from a concurrent fanout when `RequestState::fail_fast`
-/// is disabled. Each inner error is rendered with anyhow's alternate `{:#}` so the
-/// full context chain shows up.
-#[derive(Debug)]
-pub struct MultiError(pub Vec<anyhow::Error>);
-
-impl fmt::Display for MultiError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "{} errors:", self.0.len())?;
-        for (i, e) in self.0.iter().enumerate() {
-            writeln!(f, "  [{}] {:#}", i, e)?;
-        }
-        Ok(())
-    }
-}
-
-impl std::error::Error for MultiError {}
+/// Lives next to the error walker, which visits its members.
+pub use hcore::hmemoizer::MultiError;
 
 /// Lightweight propagation marker meaning "I failed only because a dependency
 /// failed." Propagates UP the graph and is **never** rendered. It NEVER wraps a
@@ -616,13 +601,19 @@ impl std::error::Error for RemoteProcessFailed {}
 /// `None` when no process exit is behind the failure, or the driver that
 /// produced it predates [`ProcessFailed::exit`].
 pub fn process_exit(err: &anyhow::Error) -> Option<Exit> {
-    err.chain().find_map(|e| {
-        if let Some(pf) = e.downcast_ref::<ProcessFailed>() {
-            pf.exit
-        } else {
-            e.downcast_ref::<RemoteProcessFailed>().map(|r| r.exit)
+    // Through the walker: a failure a memoizer shared, or one under a stage
+    // frame, has its process behind a `SharedAnyhow` that `chain()` stops at.
+    hcore::hmemoizer::walk(err, &mut |f| {
+        let exit = match f.downcast_ref::<ProcessFailed>() {
+            Some(pf) => pf.exit,
+            None => f.downcast_ref::<RemoteProcessFailed>().map(|r| r.exit),
+        };
+        match exit {
+            Some(exit) => std::ops::ControlFlow::Break(exit),
+            None => std::ops::ControlFlow::Continue(()),
         }
     })
+    .break_value()
 }
 
 /// The rich, human-facing diagnostic for a genuinely-failing target. Recorded
