@@ -2594,3 +2594,656 @@ fn a_drag_scrolls_the_approval_notice_and_copies_all_it_spans() {
     );
     assert_restored(&g.pty, "drag in the notice");
 }
+
+// --- Failure boxes: streamed or not, and what a tail does to the terminal ---
+//
+// The error-reporting spec's rule (E1): a failed target's box carries the
+// pointer `(output not shown here: N lines · heph log //t)` instead of its tail
+// exactly when some of the target's bytes reached a terminal, and its tail
+// otherwise. Only a PTY can tell the two apart: a linked test has no terminal,
+// so nothing it runs ever streams.
+
+/// What the tty matrix runs: `//pkg:t` prints to stdout and fails, `//pkg:top`
+/// fails because its dependency `//pkg:dep` did, and `//pkg:empty` fails
+/// having printed nothing.
+const TTY_BUILD: &str = concat!(
+    "target(name = \"t\", driver = \"bash\", cache = False,",
+    " run = [\"echo tty-target-line\", \"exit 1\"])\n",
+    "target(name = \"s\", driver = \"bash\", cache = False,",
+    " run = [\"echo run-stderr-line >&2\", \"exit 1\"])\n",
+    "target(name = \"dep\", driver = \"bash\", cache = False,",
+    " run = [\"echo tty-dep-line\", \"exit 1\"])\n",
+    "target(name = \"top\", driver = \"bash\", cache = False,",
+    " run = [\"echo tty-top-ran\"], deps = {\"dep\": [\"//pkg:dep\"]})\n",
+    "target(name = \"empty\", driver = \"bash\", cache = False, run = [\"exit 1\"])\n",
+    "target(name = \"nonl\", driver = \"bash\", cache = False,",
+    " run = [\"printf nonl-tail\", \"exit 1\"])\n",
+);
+
+/// One script run to its end on its own terminal, over its own workspace.
+/// `$OUT` names a directory for the script's redirections, outside the
+/// workspace so nothing it writes can reach a target's inputs.
+struct Boxed {
+    pty: common::pty::Pty,
+    ended: common::pty::Ended,
+    files: tempfile::TempDir,
+    ws: common::Workspace,
+}
+
+/// Run `script` (bash, `$HEPH` the binary) over a workspace whose `pkg/BUILD`
+/// is `build`. The terminal answers cursor queries with where its cursor is,
+/// so the inline viewport anchors below what was printed before it rather
+/// than over it, as on a real terminal.
+fn boxed(build: &str, script: &str) -> Boxed {
+    boxed_while(|_| build.to_owned(), script, |_, _| {})
+}
+
+/// [`boxed`], the BUILD file written from `$OUT`'s path, and `during` run
+/// against the terminal and `$OUT` while the script is still running.
+fn boxed_while(
+    build: impl FnOnce(&std::path::Path) -> String,
+    script: &str,
+    during: impl FnOnce(&mut common::pty::Pty, &std::path::Path),
+) -> Boxed {
+    let dist = Dist::locate();
+    let ws = common::Workspace::new().expect("workspace");
+    let files = tempfile::tempdir().expect("files tempdir");
+    ws.write("pkg/BUILD", &build(files.path()))
+        .expect("write BUILD");
+    let out = files.path().to_string_lossy().into_owned();
+    // The workspace's HOME, so a later `ws.run` sees what this run left.
+    let home = ws.home().to_string_lossy().into_owned();
+    let mut pty = common::pty::Pty::script_at_cursor(
+        &dist,
+        ws.root(),
+        script,
+        &[("OUT", &out), ("HOME", &home)],
+    );
+    during(&mut pty, files.path());
+    let ended = pty.wait_exit(DEADLINE);
+    Boxed {
+        pty,
+        ended,
+        files,
+        ws,
+    }
+}
+
+impl Boxed {
+    /// A file the script redirected into `$OUT`, lossily decoded; "" if it
+    /// never wrote one.
+    fn file(&self, name: &str) -> String {
+        std::fs::read(self.files.path().join(name))
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default()
+    }
+
+    /// The screen as heph left it, row by row.
+    fn rows(&self) -> Vec<String> {
+        self.pty.rows()
+    }
+
+    fn report(&self) -> String {
+        let files: String = std::fs::read_dir(self.files.path())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                format!("--- $OUT/{name} ---\n{}\n", self.file(&name))
+            })
+            .collect();
+        format!(
+            "ended: {:?}\n--- screen now ---\n{}\n--- every screen ---\n{}\n{files}",
+            self.ended,
+            self.pty.screen(),
+            self.pty.seen()
+        )
+    }
+
+    /// The run failed, as each of these fixtures must.
+    fn assert_failed(&self) {
+        assert!(
+            matches!(self.ended, common::pty::Ended::Code(c) if c != 0),
+            "the run was meant to fail\n{}",
+            self.report()
+        );
+    }
+
+    /// Whether the interactive TUI engaged: only its inline viewport asks the
+    /// terminal where the cursor is.
+    fn tui_engaged(&self) -> bool {
+        self.pty.dsr_queries() > 0
+    }
+}
+
+/// The pointer row of a streamed target whose log has one line.
+fn pointer_one_line(addr: &str) -> String {
+    format!("(output not shown here: 1 line · heph log {addr})")
+}
+
+/// Some line of `text` is a box row showing `line` from a log tail.
+fn has_tail_row(text: &str, line: &str) -> bool {
+    count_tail_rows(text, line) > 0
+}
+
+/// How a box row showing `line` from a log tail ends.
+fn tail_row(line: &str) -> String {
+    format!("│ {line}")
+}
+
+/// How many lines of `text` are box rows showing `line` from a log tail.
+fn count_tail_rows(text: &str, line: &str) -> usize {
+    let row = tail_row(line);
+    text.lines().filter(|l| l.contains(&row)).count()
+}
+
+/// `//pkg:t` as in [`TTY_BUILD`], and `//pkg:wait`, which runs until the
+/// test creates `$OUT/open` ([`open_live_gate`]). Both are selected by
+/// `-e '//pkg/...'` (an address selects one target). While `//pkg:wait` runs, the
+/// run cannot end, so whatever reaches the terminal before the gate opens
+/// was printed while the run was still going.
+fn live_build(out: &std::path::Path) -> String {
+    format!(
+        concat!(
+            "target(name = \"t\", driver = \"bash\", cache = False,",
+            " run = [\"echo tty-target-line\", \"exit 1\"])\n",
+            "target(name = \"wait\", driver = \"bash\", cache = False,",
+            " run = [\"while [ ! -e {gate} ]; do sleep 0.1; done\"])\n",
+        ),
+        gate = out.join("open").display()
+    )
+}
+
+/// Let `//pkg:wait` finish, so the run can end.
+fn open_live_gate(out: &std::path::Path) {
+    std::fs::write(out.join("open"), "").expect("open the gate");
+}
+
+/// Block until the file at `path` contains `needle`, or fail after
+/// [`DEADLINE`].
+fn wait_file_has(path: &std::path::Path, needle: &str) {
+    let started = Instant::now();
+    loop {
+        let text = std::fs::read(path)
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default();
+        if text.contains(needle) {
+            return;
+        }
+        assert!(
+            started.elapsed() < DEADLINE,
+            "{} never had {needle:?} within {DEADLINE:?}\n{text}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Some row is `line` and nothing else: the target's own bytes, as it wrote
+/// them, outside any box.
+fn has_bare_row(rows: &[String], line: &str) -> bool {
+    rows.iter().any(|r| r == line)
+}
+
+/// The box of a streamed target: the pointer, its raw line above the report
+/// as the target wrote it, and its tail nowhere in a box.
+fn assert_streamed(b: &Boxed, addr: &str, line: &str) {
+    let rows = b.rows();
+    assert!(
+        rows.iter().any(|r| r.contains(&pointer_one_line(addr))),
+        "{addr} streamed, so its box points at `heph log` instead of a tail\n{}",
+        b.report()
+    );
+    assert!(
+        has_bare_row(&rows, line),
+        "{addr}'s own line should be on the terminal, outside the box\n{}",
+        b.report()
+    );
+    assert!(
+        !has_tail_row(&b.pty.seen(), line),
+        "{addr} streamed, so its tail is not repeated in the box\n{}",
+        b.report()
+    );
+}
+
+/// The box of a target that did not stream: its tail, and no pointer.
+fn assert_not_streamed(b: &Boxed, report: &str, addr: &str, line: &str) {
+    assert!(
+        has_tail_row(report, line),
+        "{addr} did not stream, so its box shows its tail\n{}",
+        b.report()
+    );
+    assert!(
+        !report.contains("output not shown here"),
+        "{addr} did not stream, yet its box points elsewhere\n{}",
+        b.report()
+    );
+}
+
+/// RUN-STDERR: a requested target writing to stderr under the TUI has the
+/// terminal lent to it, so what it printed is already on screen; its box
+/// says where the rest is instead of printing it again.
+#[test]
+fn streamed_target_box_has_pointer_not_tail() {
+    let b = boxed(TTY_BUILD, r#""$HEPH" run //pkg:s"#);
+    b.assert_failed();
+    assert!(b.tui_engaged(), "the TUI never engaged\n{}", b.report());
+    assert_streamed(&b, "//pkg:s", "run-stderr-line");
+}
+
+/// RUN-STDERR: the same target with stderr redirected reaches no terminal,
+/// so the box, in the redirected file, carries its tail.
+#[test]
+fn redirected_output_box_has_tail() {
+    let b = boxed(TTY_BUILD, r#""$HEPH" run //pkg:s 2> "$OUT/err""#);
+    b.assert_failed();
+    assert_not_streamed(&b, &b.file("err"), "//pkg:s", "run-stderr-line");
+    assert!(
+        !b.pty.seen().contains("run-stderr-line"),
+        "nothing of the target's should have reached the terminal\n{}",
+        b.report()
+    );
+}
+
+/// TTY row "stdout and stderr a TTY, requested target, TUI": streamed.
+#[test]
+fn tty_tui_streamed() {
+    let b = boxed(TTY_BUILD, r#""$HEPH" run //pkg:t"#);
+    b.assert_failed();
+    assert!(b.tui_engaged(), "the TUI never engaged\n{}", b.report());
+    assert_streamed(&b, "//pkg:t", "tty-target-line");
+}
+
+/// TTY row "the same in the line backend": not streamed.
+///
+/// Corrects the spec row "the same in the line backend (`TERM=dumb`) →
+/// streamed". That row assumed the line backend lends the terminal to the
+/// requested target; it does not (only the TUI's pause and `--raw` do, and
+/// PR 5 makes no stdio change), so none of the target's bytes reach the PTY
+/// and by the spec's own rule it did not stream. `TERM` does not pick the
+/// backend; `--no-tui` does.
+///
+/// U35: not streamed, but the box reaches the terminal as `//pkg:t` fails,
+/// not at the end of the run. `//pkg:wait`, requested beside it, holds the
+/// run open until the box is on screen, so a box printed only at the end
+/// never shows up in time. The end of the run does not print it again.
+#[test]
+fn tty_no_tui_not_streamed() {
+    let b = boxed_while(
+        live_build,
+        r#""$HEPH" run --no-tui -e '//pkg/...' --allow-all"#,
+        |pty, out| {
+            pty.wait_for(&tail_row("tty-target-line"), DEADLINE);
+            open_live_gate(out);
+        },
+    );
+    b.assert_failed();
+    assert!(!b.tui_engaged(), "--no-tui engaged the TUI\n{}", b.report());
+    let seen = b.pty.seen();
+    assert_not_streamed(&b, &seen, "//pkg:t", "tty-target-line");
+    let rows = b.rows();
+    assert!(
+        !has_bare_row(&rows, "tty-target-line"),
+        "the line backend lent the target the terminal\n{}",
+        b.report()
+    );
+    assert_eq!(
+        count_tail_rows(&rows.join("\n"), "tty-target-line"),
+        1,
+        "the box went out once, as it failed\n{}",
+        b.report()
+    );
+}
+
+/// TTY row "`heph run //t > file`, stderr a TTY": the target prints to
+/// stdout, which is the file, so nothing of it reached the terminal although
+/// the TUI ran there.
+#[test]
+fn tty_stdout_redirected_not_streamed() {
+    let b = boxed(TTY_BUILD, r#""$HEPH" run //pkg:t > "$OUT/out""#);
+    b.assert_failed();
+    assert!(b.tui_engaged(), "the TUI never engaged\n{}", b.report());
+    let rows = b.rows().join("\n");
+    assert_not_streamed(&b, &rows, "//pkg:t", "tty-target-line");
+    assert!(
+        b.file("out").lines().any(|l| l == "tty-target-line"),
+        "the target's stdout should have gone to the file\n{}",
+        b.report()
+    );
+}
+
+/// TTY row "stdout a TTY, stderr redirected": not streamed.
+///
+/// Corrects the spec row "stdout a TTY, stderr redirected → streamed". With
+/// stderr not a terminal the TUI is off, and without it the CLI has no
+/// wrapper to lend the target its stdout (PR 5 makes no stdio change), so
+/// none of the target's bytes reach the PTY: by the spec's own rule it did
+/// not stream, and the box in the stderr file carries the tail.
+///
+/// U35: the box is written to stderr as `//pkg:t` fails, while
+/// `//pkg:wait` still holds the run open, and only then.
+#[test]
+fn tty_stderr_redirected_not_streamed() {
+    let b = boxed_while(
+        live_build,
+        r#""$HEPH" run -e '//pkg/...' --allow-all 2> "$OUT/err""#,
+        |_, out| {
+            wait_file_has(&out.join("err"), &tail_row("tty-target-line"));
+            open_live_gate(out);
+        },
+    );
+    b.assert_failed();
+    assert!(
+        !b.tui_engaged(),
+        "the TUI engaged without a tty stderr\n{}",
+        b.report()
+    );
+    let err = b.file("err");
+    assert_not_streamed(&b, &err, "//pkg:t", "tty-target-line");
+    assert_eq!(
+        count_tail_rows(&err, "tty-target-line"),
+        1,
+        "the box went out once, as it failed\n{}",
+        b.report()
+    );
+    assert!(
+        !b.pty.seen().contains("tty-target-line"),
+        "nothing of the target's should have reached the terminal\n{}",
+        b.report()
+    );
+}
+
+/// TTY row "both redirected": not streamed, the tail in the stderr file.
+#[test]
+fn tty_both_redirected_not_streamed() {
+    let b = boxed(
+        TTY_BUILD,
+        r#""$HEPH" run //pkg:t > "$OUT/out" 2> "$OUT/err""#,
+    );
+    b.assert_failed();
+    assert_not_streamed(&b, &b.file("err"), "//pkg:t", "tty-target-line");
+}
+
+/// TTY row "`--raw` on a TTY": the target's bytes go straight to the
+/// terminal, so it streamed.
+#[test]
+fn tty_raw_streamed() {
+    let b = boxed(TTY_BUILD, r#""$HEPH" run --raw //pkg:t"#);
+    b.assert_failed();
+    assert_streamed(&b, "//pkg:t", "tty-target-line");
+}
+
+/// TTY row "a failing dependency, not requested": a dependency never gets
+/// the terminal, so its tail is in its box.
+#[test]
+fn tty_failing_dependency_not_streamed() {
+    let b = boxed(TTY_BUILD, r#""$HEPH" run //pkg:top"#);
+    b.assert_failed();
+    assert!(b.tui_engaged(), "the TUI never engaged\n{}", b.report());
+    let rows = b.rows().join("\n");
+    assert_not_streamed(&b, &rows, "//pkg:dep", "tty-dep-line");
+    assert!(
+        !has_bare_row(&b.rows(), "tty-dep-line"),
+        "a dependency's output reached the terminal raw\n{}",
+        b.report()
+    );
+}
+
+/// TTY row "requested target that printed nothing": `(no output)`.
+#[test]
+#[ignore = "needs PR 4 RUN-19: an empty log fills no slot"]
+fn tty_printed_nothing() {
+    let b = boxed(TTY_BUILD, r#""$HEPH" run //pkg:empty"#);
+    b.assert_failed();
+    assert!(
+        b.rows().iter().any(|r| r.contains("│ (no output)")),
+        "a target that printed nothing says so\n{}",
+        b.report()
+    );
+}
+
+/// D6.3: a requested target whose last byte on the terminal is not a line
+/// break leaves the line open. The CLI ends it, so heph's summary starts on
+/// its own line and the TUI coming back does not paint over the target's
+/// last line.
+#[test]
+fn missing_trailing_newline_summary_on_own_line() {
+    let b = boxed(TTY_BUILD, r#""$HEPH" run //pkg:nonl"#);
+    b.assert_failed();
+    assert!(b.tui_engaged(), "the TUI never engaged\n{}", b.report());
+    let rows = b.rows();
+    assert!(
+        has_bare_row(&rows, "nonl-tail"),
+        "the target's unterminated line should stand alone on its row\n{}",
+        b.report()
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|r| r.contains("nonl-tail") && r != "nonl-tail"),
+        "something was written onto the target's unterminated line\n{}",
+        b.report()
+    );
+    assert!(
+        rows.iter().any(|r| r.starts_with("✗ //pkg:nonl")),
+        "the summary's header should start its own row\n{}",
+        b.report()
+    );
+}
+
+/// The bytes a failing dependency prints in each `teardown_tail_<row>` case,
+/// as a `printf` format inside a Starlark string, and how its box shows them.
+fn teardown_build(printf: &str) -> String {
+    format!(
+        concat!(
+            "target(name = \"dep\", driver = \"bash\", cache = False,",
+            " run = [\"printf '{printf}'\", \"exit 1\"])\n",
+            "target(name = \"top\", driver = \"bash\", cache = False,",
+            " run = [\"echo td-top-ran\"], deps = {{\"dep\": [\"//pkg:dep\"]}})\n",
+        ),
+        printf = printf,
+    )
+}
+
+/// Printed before heph starts: a screen the tail clears loses it.
+const PRE_RUN: &str = "pre-run-marker";
+
+/// A failing dependency prints `printf` (so its tail is in its box, not
+/// streamed raw) under the TUI; the box must show it as `shown`, and the
+/// terminal must be handed back whole whatever the bytes were.
+fn teardown_tail(printf: &str, shown: &str) -> Boxed {
+    let b = boxed(
+        &teardown_build(printf),
+        &format!(r#"echo {PRE_RUN}; "$HEPH" run //pkg:top"#),
+    );
+    b.assert_failed();
+    assert!(b.tui_engaged(), "the TUI never engaged\n{}", b.report());
+    assert!(
+        b.rows().iter().any(|r| r.contains(&format!("│ {shown}"))),
+        "the dependency's tail should be in its box as {shown:?}\n{}",
+        b.report()
+    );
+    assert!(b.pty.cursor_visible(), "cursor left hidden\n{}", b.report());
+    assert!(
+        !b.pty.alternate_screen(),
+        "left on the alternate screen\n{}",
+        b.report()
+    );
+    b
+}
+
+/// `\x1b[?25l` in a tail is shown, not obeyed: the cursor is visible after.
+#[test]
+fn teardown_tail_cursor_hide() {
+    teardown_tail(r"td-cursor\\033[?25l-end\\n", r"td-cursor\x1b[?25l-end");
+}
+
+/// `\x1b[?1049h` in a tail does not leave the terminal on the alternate
+/// screen.
+#[test]
+fn teardown_tail_alt_screen() {
+    teardown_tail(r"td-alt\\033[?1049h-end\\n", r"td-alt\x1b[?1049h-end");
+}
+
+/// `\x1b[2J` in a tail does not clear the screen: what was printed before
+/// heph started is still there.
+#[test]
+fn teardown_tail_clear() {
+    let b = teardown_tail(r"td-clear\\033[2J-end\\n", r"td-clear\x1b[2J-end");
+    assert!(
+        has_bare_row(&b.rows(), PRE_RUN),
+        "the screen was cleared\n{}",
+        b.report()
+    );
+}
+
+/// SGR in a tail keeps its colour on a terminal (the target's own escape,
+/// not one heph adds) and is shown escaped when stderr is a file.
+#[test]
+fn teardown_tail_sgr() {
+    let b = boxed(
+        &teardown_build(r"td-\\033[31mred\\033[0m-end\\n"),
+        r#""$HEPH" run //pkg:top; "$HEPH" run --no-tui //pkg:top 2> "$OUT/err""#,
+    );
+    b.assert_failed();
+    assert!(b.tui_engaged(), "the TUI never engaged\n{}", b.report());
+    let colours = b.pty.with_screen(|s| {
+        find_cell(s, "td-red-end").map(|(row, col)| {
+            let fg = |c: u16| s.cell(row, col + c).map(vt100::Cell::fgcolor);
+            (fg(3), fg(7))
+        })
+    });
+    assert_eq!(
+        colours,
+        Some((Some(vt100::Color::Idx(1)), Some(vt100::Color::Default))),
+        "`red` in the target's red, `-end` after its reset\n{}",
+        b.report()
+    );
+    assert!(
+        !b.pty.seen().contains(r"\x1b[31m"),
+        "the SGR was shown escaped on a terminal\n{}",
+        b.report()
+    );
+    let err = b.file("err");
+    assert!(
+        has_tail_row(&err, r"td-\x1b[31mred\x1b[0m-end"),
+        "in a file the SGR is shown escaped\n{}",
+        b.report()
+    );
+    assert!(
+        !err.contains('\x1b'),
+        "an escape byte reached the redirected stderr\n{}",
+        b.report()
+    );
+}
+
+/// `\r` progress rewrites in a tail are shown escaped, so every frame of it
+/// stays readable.
+#[test]
+fn teardown_tail_cr() {
+    teardown_tail(r"td-10%%\\r20%%-end\\n", r"td-10%\r20%-end");
+}
+
+/// Invalid UTF-8 in a tail is shown as U+FFFD.
+#[test]
+fn teardown_tail_invalid_utf8() {
+    teardown_tail(r"td-bad\\377utf8-end\\n", "td-bad\u{FFFD}utf8-end");
+}
+
+/// E9: a target whose output streamed to the PTY and the same target run
+/// redirected have one cache key: `streamed` is in no hash. The second run is
+/// a cache hit — its output carries a value only a fresh run would change —
+/// and `hashin` is the same after each.
+#[test]
+fn streamed_and_redirected_same_hashin() {
+    let build = concat!(
+        "target(name = \"e9\", driver = \"bash\", out = \"out.txt\",",
+        " run = [\"echo e9-ran >&2\", \"echo $RANDOM$RANDOM$RANDOM > out.txt\"])\n",
+    );
+    let b = boxed(
+        build,
+        concat!(
+            "set -e\n",
+            r#""$HEPH" run --cat-out //pkg:e9 > "$OUT/c1""#,
+            "\n",
+            r#""$HEPH" inspect hashin --json //pkg:e9 > "$OUT/h1" 2>/dev/null"#,
+            "\n",
+            r#""$HEPH" run --cat-out //pkg:e9 > "$OUT/c2" 2> "$OUT/e2""#,
+            "\n",
+            r#""$HEPH" inspect hashin --json //pkg:e9 > "$OUT/h2" 2>/dev/null"#,
+            "\n",
+        ),
+    );
+    assert_eq!(b.ended, common::pty::Ended::Code(0), "{}", b.report());
+    assert!(
+        b.pty.seen().lines().any(|l| l == "e9-ran"),
+        "the first run's output should have streamed to the terminal\n{}",
+        b.report()
+    );
+    let (c1, c2) = (b.file("c1"), b.file("c2"));
+    assert!(!c1.trim().is_empty(), "no output printed\n{}", b.report());
+    assert_eq!(
+        c1,
+        c2,
+        "the redirected run was not a cache hit\n{}",
+        b.report()
+    );
+    let hashin = |name: &str| -> String {
+        let v: serde_json::Value = serde_json::from_str(&b.file(name))
+            .unwrap_or_else(|e| panic!("{name} is not JSON: {e}\n{}", b.report()));
+        v["hashin"].as_str().unwrap_or_default().to_owned()
+    };
+    let (h1, h2) = (hashin("h1"), hashin("h2"));
+    assert!(!h1.is_empty(), "no hashin\n{}", b.report());
+    assert_eq!(h1, h2, "streaming changed the cache key\n{}", b.report());
+}
+
+/// U13: a requested target that succeeds is in no failure report, so what it
+/// wrote to stderr is in neither the TUI's report nor the line backend's; it
+/// is in its log.
+#[test]
+fn success_stderr_in_neither_report_but_in_log() {
+    let build = concat!(
+        "target(name = \"u13_tui\", driver = \"bash\", out = \"out.txt\",",
+        " run = [\"echo u13-stderr-tui >&2\", \"echo ok > out.txt\"])\n",
+        "target(name = \"u13_plain\", driver = \"bash\", out = \"out.txt\",",
+        " run = [\"echo u13-stderr-plain >&2\", \"echo ok > out.txt\"])\n",
+    );
+    let b = boxed(build, r#""$HEPH" run //pkg:u13_tui"#);
+    assert_eq!(b.ended, common::pty::Ended::Code(0), "{}", b.report());
+    assert!(b.tui_engaged(), "the TUI never engaged\n{}", b.report());
+    assert!(
+        !has_tail_row(&b.pty.seen(), "u13-stderr-tui"),
+        "a success's stderr was reported in a box under the TUI\n{}",
+        b.report()
+    );
+
+    let dist = Dist::locate();
+    let plain =
+        b.ws.run(&dist, &["run", "//pkg:u13_plain"])
+            .expect("heph run //pkg:u13_plain");
+    assert!(plain.status.success(), "{}", common::describe(&plain));
+    for stream in [&plain.stdout, &plain.stderr] {
+        assert!(
+            !String::from_utf8_lossy(stream).contains("u13-stderr-plain"),
+            "a success's stderr reached the line backend's output\n{}",
+            common::describe(&plain)
+        );
+    }
+
+    for (addr, line) in [
+        ("//pkg:u13_tui", "u13-stderr-tui"),
+        ("//pkg:u13_plain", "u13-stderr-plain"),
+    ] {
+        let log = b.ws.run(&dist, &["log", addr]).expect("heph log");
+        assert!(log.status.success(), "{addr}: {}", common::describe(&log));
+        assert!(
+            String::from_utf8_lossy(&log.stdout)
+                .lines()
+                .any(|l| l == line),
+            "{addr}'s log should have its stderr\n{}",
+            common::describe(&log)
+        );
+    }
+}
