@@ -1363,6 +1363,13 @@ impl RequestState {
             .collect()
     }
 
+    /// Every recorded failure, in insertion order, leaving the registry as
+    /// it is: what `run --json` reads at request end, before `finalize`
+    /// takes them.
+    pub fn failures(&self) -> Vec<Arc<TargetFailure>> {
+        self.data.failures.lock().values().cloned().collect()
+    }
+
     /// [`take_failures`](Self::take_failures), each failure saying whether
     /// the engine can open its log ([`TargetFailure::log_readable`]): the
     /// log API over local sources, never fetching (a remote hit's log it
