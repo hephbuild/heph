@@ -536,6 +536,7 @@ impl BuildState {
                 addr,
                 error,
                 upstream_of,
+                upstream_file,
                 exit_status,
                 timed_out,
                 cancelled,
@@ -578,7 +579,11 @@ impl BuildState {
                             if *duplicate {
                                 // The row closed on a losing end; the
                                 // announcing one, still to come, is the root.
-                                self.root_pending.insert(addr.clone());
+                                // A target in a broken file has none: the
+                                // file's `FileFailed` counted the root.
+                                if upstream_file.is_none() {
+                                    self.root_pending.insert(addr.clone());
+                                }
                             } else {
                                 self.root_failed += 1;
                             }
@@ -2913,7 +2918,8 @@ impl CIAppView for CiProgressView {
                 addr,
                 error: Some(error),
                 upstream_of: None,
-                // Set only beside `upstream_of`, which this arm rules out.
+                // Set beside `upstream_of` or on a duplicate end, both of
+                // which this arm rules out.
                 upstream_file: _,
                 path,
                 exit_status,
@@ -4708,6 +4714,61 @@ mod tests {
         let log = ci_live_log(1, &[file.clone(), file]);
         assert_eq!(log.matches('✗').count(), 1, "{log}");
         assert!(log.contains("✗ d/BUILD"), "{log}");
+    }
+
+    /// A broken file announced through `//d:t1`, and `//d:t2` in the same
+    /// file ending `duplicate` with `upstream_file` and no `upstream_of`:
+    /// one block, one root and one taken down, nothing left waiting for an
+    /// announcing end that never comes, and `//d:t2`'s row is a dependency
+    /// failure under the file's row rather than a second failure. In either
+    /// order of the two events the counts agree.
+    #[test]
+    fn duplicate_end_in_a_broken_file_is_taken_down_by_it() {
+        use crate::tui::dashboard::RowState;
+        let file = BuildEventKind::FileFailed {
+            file: "d/BUILD".into(),
+            entry: "//d:t1".into(),
+            error: "evaluating d/BUILD: boom".into(),
+            path: vec!["//d:t1".into()],
+        };
+        let mut dup = failed_end("//d:t2", None, false, None);
+        if let BuildEventKind::ResultEnd {
+            duplicate,
+            upstream_file,
+            ..
+        } = &mut dup
+        {
+            *duplicate = true;
+            *upstream_file = Some("d/BUILD".into());
+        }
+        let start = BuildEventKind::ResultStart {
+            addr: "//d:t2".into(),
+        };
+        let log = ci_live_log(1, &[file.clone(), start.clone(), dup.clone()]);
+        assert_eq!(log.matches('✗').count(), 1, "{log}");
+
+        let mut s = BuildState::default();
+        for (at, kind) in [file.clone(), start.clone(), dup.clone()]
+            .into_iter()
+            .enumerate()
+        {
+            s.apply(&ev(at as u64, kind));
+        }
+        assert_eq!(s.failure_split(), (1, 1), "the file, and //d:t2 under it");
+        assert!(s.root_pending.is_empty(), "{:?}", s.root_pending);
+        let t2 = rec(&s, "//d:t2");
+        assert_eq!(t2.state, RowState::DepFailed);
+        let id = s.dash.id("//d:t2").expect("an id");
+        assert_eq!(s.dash.root_of(id), Some("//d:t1"));
+        assert_eq!(rec(&s, "//d:t1").state, RowState::Failed);
+
+        let mut s = BuildState::default();
+        for (at, kind) in [start, dup, file].into_iter().enumerate() {
+            s.apply(&ev(at as u64, kind));
+        }
+        assert_eq!(s.failure_split(), (1, 1), "the dup end first");
+        assert!(s.root_pending.is_empty(), "{:?}", s.root_pending);
+        assert_eq!(rec(&s, "//d:t2").state, RowState::DepFailed);
     }
 
     /// U3: a culprit three deep names how the request reached it, after the

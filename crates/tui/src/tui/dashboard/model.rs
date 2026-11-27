@@ -471,6 +471,10 @@ pub struct Model {
     open: HashSet<Id>,
     /// How many records carry `IN_FLIGHT`.
     in_flight: usize,
+    /// Each BUILD file that did not evaluate, and the row its failure is on
+    /// (its `FileFailed` entry): the root a target in that file names. One
+    /// per broken file.
+    file_rows: HashMap<Box<str>, Id>,
     matched_seen: bool,
     matched_complete: bool,
     /// What the target screen's Overview reads beside the record: phase
@@ -588,11 +592,25 @@ impl Model {
                 addr,
                 error,
                 upstream_of,
+                upstream_file,
                 exit_status,
                 timed_out,
                 cancelled,
+                duplicate,
                 ..
             } => {
+                // A target in a broken file whose failure is another row's
+                // (its `FileFailed` entry): taken down by that file, not a
+                // second failure of it.
+                let file_root = match (duplicate, upstream_of, upstream_file) {
+                    (true, None, Some(file)) => Some(
+                        self.file_rows
+                            .get(file.as_str())
+                            .copied()
+                            .unwrap_or(NO_ROOT),
+                    ),
+                    _ => None,
+                };
                 let id = self.touch(addr);
                 let Some(r) = self.rec_mut(id) else {
                     return;
@@ -611,6 +629,12 @@ impl Model {
                 }
                 let state = match (error, upstream_of) {
                     (Some(_), _) if *cancelled => RowState::Stopped,
+                    (Some(_), None) if file_root.is_some() => {
+                        if let (Some(r), Some(root)) = (self.rec_mut(id), file_root) {
+                            r.root = root;
+                        }
+                        RowState::DepFailed
+                    }
                     (Some(_), Some(root)) => {
                         let root = self.names.get(root).unwrap_or(NO_ROOT);
                         if let Some(r) = self.rec_mut(id) {
@@ -635,8 +659,13 @@ impl Model {
             // A BUILD file that did not evaluate: its failure is shown on the
             // row of the address that led into it (the root its collateral
             // names), which never had a scope of its own.
-            BuildEventKind::FileFailed { entry, error, .. } => {
+            BuildEventKind::FileFailed {
+                file, entry, error, ..
+            } => {
                 let id = self.touch(entry);
+                if !self.file_rows.contains_key(file.as_str()) {
+                    self.file_rows.insert(file.as_str().into(), id);
+                }
                 let Some(r) = self.rec_mut(id) else {
                     return;
                 };

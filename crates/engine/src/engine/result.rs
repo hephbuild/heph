@@ -3096,20 +3096,41 @@ impl Engine {
     /// printed. When it is this target's own and this call recorded it, it
     /// gets the `ResultStart`/`ResultEnd` pair the scope would have emitted;
     /// a failure another caller recorded first was announced by that caller.
+    ///
+    /// A requested target (`is_top`) skipped because of another culprit (a
+    /// dependency's broken BUILD file, a group member's failure) gets the
+    /// pair too, with the skipped end its scope would have had: every
+    /// requested target ends (D5). Only the top frame announces it, so a
+    /// dependency reached by many callers is not announced once per caller.
     async fn fail_unscoped(
         self: &Arc<Self>,
         rs: &RequestState,
         addr: &Addr,
         e: anyhow::Error,
+        is_top: bool,
     ) -> anyhow::Error {
         // Announced here when it is this target's own failure. Any other
         // culprit (an input whose def failed, a BUILD file that did not
         // evaluate) is announced by `classify_failure_fresh`'s winner.
-        let detail = failure_fate(addr, &e)
-            .is_own(addr)
-            .then(|| crate::engine::event::ErrorDetail::from_error(&e));
+        let fate = failure_fate(addr, &e);
+        let own = fate.is_own(addr);
+        let skipped = match (is_top && !own).then(|| EndBlame::of(rs, addr, &fate)) {
+            Some(end @ EndBlame::Skipped { .. }) => Some(end),
+            _ => None,
+        };
+        let detail =
+            (own || skipped.is_some()).then(|| crate::engine::event::ErrorDetail::from_error(&e));
         let (e, fresh) = classify_failure_fresh(rs, addr, e);
-        if let Some(detail) = detail
+        if let Some(end) = skipped
+            && let Some(detail) = detail
+        {
+            let addr_str = addr.format();
+            rs.emit(crate::engine::event::BuildEventKind::ResultStart {
+                addr: addr_str.clone(),
+            });
+            rs.emit(result_end_event(rs, addr_str, Some(detail), end, None));
+        } else if let Some(detail) = detail
+            && own
             && fresh
         {
             let addr_str = addr.format();
@@ -3204,7 +3225,7 @@ impl Engine {
         let def = match Arc::clone(&self).get_def_no_track(rs.clone(), addr).await {
             Ok(def) => def,
             Err(e) => {
-                let e = self.fail_unscoped(&rs, addr, e).await;
+                let e = self.fail_unscoped(&rs, addr, e, is_top).await;
                 return Err(surface_top(is_top, &rs, e));
             }
         };
@@ -3306,7 +3327,7 @@ impl Engine {
                 match crate::engine::fanout::join_all_failable(futures, rs.fail_fast()).await {
                     Ok(results) => results,
                     Err(e) => {
-                        let e = self.fail_unscoped(&rs, addr, e).await;
+                        let e = self.fail_unscoped(&rs, addr, e, is_top).await;
                         return Err(surface_top(is_top, &rs, e));
                     }
                 };
