@@ -1127,15 +1127,15 @@ fn completion_after_heph_dot_lists_plugins_and_core() {
     }
 }
 
-/// T10: `heph.core.matrix` and `heph.core.host` complete under `heph.core.`,
-/// with their typed signatures as the detail.
+/// T10: `heph.core.matrix` completes under `heph.core.`, with its typed
+/// signature as the detail.
 #[test]
-fn completion_under_heph_core_offers_matrix_and_host() {
+fn completion_under_heph_core_offers_matrix() {
     let mut lsp = Lsp::start();
     let doc = lsp.open("BUILD", "x = heph.core.│\n");
     let result = lsp.completion(&doc);
     let got = labels(&result);
-    for want in ["host", "matrix", "os", "arch"] {
+    for want in ["matrix", "os", "arch"] {
         assert!(got.iter().any(|l| l == want), "no {want} in {got:?}");
     }
     let detail = item(&result, "matrix")["detail"]
@@ -1143,7 +1143,8 @@ fn completion_under_heph_core_offers_matrix_and_host() {
         .expect("detail")
         .to_string();
     assert!(
-        detail.contains("axes: dict[str, list[str]]") && detail.contains("default:"),
+        detail.contains("axes: dict[str, list]")
+            && detail.contains("default: None | dict[str, typing.Any]"),
         "{detail}"
     );
 }

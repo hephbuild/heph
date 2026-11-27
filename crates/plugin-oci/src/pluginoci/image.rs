@@ -1626,7 +1626,8 @@ mod tests {
     }
 
     /// T9 of the matrix spec: `layers_by_platform` takes one address string
-    /// per platform, which is what `heph.core.matrix(...).cells` gives, and it
+    /// per platform, which is what `{c.axes["platform"]: c.value for c in
+    /// heph.core.matrix(...).cells}` gives when each cell returns one, and it
     /// hashes as the one-element list does. Pinned, so a change to how either
     /// spelling decodes moves the value here first.
     #[test]

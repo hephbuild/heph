@@ -1,33 +1,35 @@
-//! `heph.core.matrix()`: enumerate the cells of a matrix, call a cell function
-//! once per cell, and return what each call returned keyed by cell, plus the
-//! value of a default cell. See `docs/MATRIX.md`.
+//! `heph.core.matrix()`: the cross product of some axes, a cell function called
+//! once per cell, and a list of what each call returned, in cell order, plus
+//! the value of a default cell. See `docs/MATRIX.md`.
+//!
+//! The matrix is a generic cross product: axis names are any strings, axis
+//! values any Starlark values, passed to the cell function as they are. It
+//! knows nothing about targets or platforms. Values are compared by Starlark
+//! equality (`exclude`, `include`, `default` and duplicate values) and shown in
+//! errors by their repr.
 //!
 //! The builtin declares nothing and never reads what a cell returns (I1, I3):
 //! a target a cell declares is exactly what the cell called, as if the BUILD
-//! file had written the same calls on that line. Keys and cell order are a pure
-//! function of `axes`, `exclude` and `include` (I4). `default` is a dict of
-//! fixed axis values, checked at the call like every other argument: the
-//! builtin never reads the host (`default = {"platform": heph.core.host()}` is
-//! the BUILD file reading it).
+//! file had written the same calls on that line. Cell order is a pure function
+//! of `axes`, `exclude` and `include` (I4).
 //!
 //! The planning half (validation, the cross product, `exclude`/`include`, the
-//! default) is plain Rust over strings, so it is tested without an evaluator;
-//! [`matrix`] is the Starlark half.
+//! default) is generic over [`AxisValue`], so it is tested over plain strings
+//! without an evaluator; [`matrix`] is the Starlark half.
 
 use crate::pluginbuildfile::run_file::{Extra, render_span};
 use allocative::Allocative;
 use starlark::any::ProvidesStaticType;
 use starlark::eval::Evaluator;
 use starlark::values::dict::{AllocDict, DictRef, DictType};
-use starlark::values::list::{ListRef, ListType};
+use starlark::values::list::{AllocList, ListRef, ListType};
 use starlark::values::none::NoneOr;
-use starlark::values::tuple::AllocTuple;
+use starlark::values::structs::AllocStruct;
 use starlark::values::typing::{StarlarkCallable, StarlarkCallableParamAny};
 use starlark::values::{
     AllocValue, Freeze, FreezeResult, Freezer, FrozenValue, Heap, NoSerialize, StarlarkValue,
     Trace, UnpackValue, Value, ValueLike, starlark_value,
 };
-use std::collections::HashSet;
 use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
@@ -57,24 +59,69 @@ impl fmt::Display for Site {
     }
 }
 
-/// The validated axes, in declaration order: that order orders tuple keys.
+/// An axis value as planning sees it: compared by Starlark equality, shown by
+/// its repr.
+pub(crate) trait AxisValue: Clone {
+    /// Starlark `==`. Fallible: comparing deeply nested values can hit
+    /// starlark's recursion limit.
+    fn same(&self, other: &Self) -> anyhow::Result<bool>;
+    /// How errors show the value: `"1.23"`, `True`, `["-race"]`.
+    fn repr(&self) -> String;
+}
+
+impl AxisValue for Value<'_> {
+    fn same(&self, other: &Self) -> anyhow::Result<bool> {
+        self.equals(*other).map_err(starlark::Error::into_anyhow)
+    }
+
+    fn repr(&self) -> String {
+        self.to_repr()
+    }
+}
+
+/// The index of the first of `vs` equal to `v`.
+fn index_of<'a, V: AxisValue + 'a>(
+    vs: impl IntoIterator<Item = &'a V>,
+    v: &V,
+) -> anyhow::Result<Option<usize>> {
+    for (i, x) in vs.into_iter().enumerate() {
+        if x.same(v)? {
+            return Ok(Some(i));
+        }
+    }
+    Ok(None)
+}
+
+/// Whether two cells (one value per axis, in axis order) are equal.
+fn same_cell<V: AxisValue>(a: &[V], b: &[V]) -> anyhow::Result<bool> {
+    for (x, y) in a.iter().zip(b) {
+        if !x.same(y)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// The validated axes, in declaration order: that order is the order of a
+/// cell's values, of its `axes` dict and of the cell function's arguments.
 #[derive(Debug)]
-pub(crate) struct Axes {
+pub(crate) struct Axes<V> {
     names: Vec<String>,
-    values: Vec<Vec<String>>,
+    values: Vec<Vec<V>>,
 }
 
 /// One cell: a value per axis, in axis order.
-pub(crate) type Cell = Vec<String>;
+pub(crate) type Cell<V> = Vec<V>;
 
-/// An `exclude` or `include` entry as written: axis to value, in dict order.
-pub(crate) type Entry = Vec<(String, String)>;
+/// An `exclude`, `include` or `default` entry as written: axis to value, in
+/// dict order.
+pub(crate) type Entry<V> = Vec<(String, V)>;
 
-impl Axes {
+impl<V: AxisValue> Axes<V> {
     /// Validates the axes. The cross product is checked against the limit
-    /// before any value is, so the work here is bounded by [`MAX_CELLS`]
-    /// whatever the input (I10).
-    pub(crate) fn new(site: &Site, entries: Vec<(String, Vec<String>)>) -> anyhow::Result<Self> {
+    /// before any value is compared, so the work here is bounded by
+    /// [`MAX_CELLS`] whatever the input (I10).
+    pub(crate) fn new(site: &Site, entries: Vec<(String, Vec<V>)>) -> anyhow::Result<Self> {
         if entries.is_empty() {
             return Err(site.err("`axes` is empty; give at least one axis"));
         }
@@ -82,23 +129,16 @@ impl Axes {
         let mut names = Vec::with_capacity(entries.len());
         let mut values = Vec::with_capacity(entries.len());
         for (name, vals) in entries {
-            if !is_identifier(&name) {
-                return Err(site.err(format_args!(
-                    "axis {name:?} is not a Starlark identifier; it becomes a keyword argument of \
-                     the cell function (use `_`, not `-`)"
-                )));
-            }
             if vals.is_empty() {
                 return Err(site.err(format_args!("axis {name:?} has no values")));
             }
-            let mut seen: HashSet<&str> = HashSet::with_capacity(vals.len());
-            for v in &vals {
-                validate_value(site, &name, v)?;
-                if !seen.insert(v) {
-                    return Err(site.err(format_args!("axis {name:?} lists {v:?} twice")));
+            // Quadratic, and bounded: an axis has at most MAX_CELLS values.
+            // Values need not be hashable (a list is a fine value).
+            for (j, v) in vals.iter().enumerate() {
+                if index_of(vals.iter().take(j), v)?.is_some() {
+                    return Err(site.err(format_args!("axis {name:?} lists {} twice", v.repr())));
                 }
             }
-            drop(seen);
             names.push(name);
             values.push(vals);
         }
@@ -110,48 +150,36 @@ impl Axes {
     }
 
     fn known(&self) -> String {
-        self.names.join(", ")
+        self.names
+            .iter()
+            .map(|n| format!("{n:?}"))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
-/// `[A-Za-z_][A-Za-z0-9_]*`. A keyword (`if`) passes: it cannot be a named
-/// parameter of a `def`, but it reaches a `**kwargs` cell, and the default
-/// cell's dict.
-fn is_identifier(s: &str) -> bool {
-    let mut chars = s.chars();
-    chars
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
-/// A value is `[A-Za-z0-9._/+-]+`, ASCII only: it ends up in target names
-/// (D8) and in error texts.
-fn validate_value(site: &Site, axis: &str, v: &str) -> anyhow::Result<()> {
-    let ok = !v.is_empty()
-        && v.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'/' | b'+' | b'-'));
-    if ok {
-        Ok(())
-    } else {
-        Err(site.err(format_args!(
-            "axis {axis:?} value {v:?} is not allowed; a value is one or more of A-Z a-z 0-9 . _ / + -"
-        )))
-    }
-}
-
-/// `axis=value, axis=value`: how errors and logs name a cell.
-pub(crate) fn describe(names: &[String], cell: &[String]) -> String {
+/// `axis=repr, axis=repr`: how errors and logs name a cell or an entry.
+fn render<'a, V: AxisValue + 'a>(pairs: impl IntoIterator<Item = (&'a String, &'a V)>) -> String {
     let mut out = String::new();
-    for (i, (n, v)) in names.iter().zip(cell).enumerate() {
+    for (i, (n, v)) in pairs.into_iter().enumerate() {
         if i > 0 {
             out.push_str(", ");
         }
         out.push_str(n);
         out.push('=');
-        out.push_str(v);
+        out.push_str(&v.repr());
     }
     out
+}
+
+/// `go="1.23", race=True`: how errors and logs name a cell.
+pub(crate) fn describe<V: AxisValue>(names: &[String], cell: &[V]) -> String {
+    render(names.iter().zip(cell))
+}
+
+/// `{go="1.23", race=True}`: how errors name an entry as written.
+fn describe_entry<V: AxisValue>(e: &Entry<V>) -> String {
+    format!("{{{}}}", render(e.iter().map(|(n, v)| (n, v))))
 }
 
 /// `2048` as `2,048`.
@@ -197,18 +225,20 @@ pub(crate) fn check_count(
 /// The cells of the matrix, in cell order: the cross product (last axis
 /// fastest) minus `exclude`, then `include` in list order (D15). Checks the
 /// cell limit before enumerating anything (I10).
-pub(crate) fn plan(
+pub(crate) fn plan<V: AxisValue>(
     site: &Site,
-    axes: &Axes,
-    exclude: &[Entry],
-    include: &[Entry],
-) -> anyhow::Result<Vec<Cell>> {
+    axes: &Axes<V>,
+    exclude: &[Entry<V>],
+    include: &[Entry<V>],
+) -> anyhow::Result<Vec<Cell<V>>> {
     check_count(site, axes.values.iter().map(Vec::len), include.len())?;
 
     // An exclude may name a subset of the axes, only axes that exist, and must
     // match a cell of the full cross product: a value outside its axis is a
     // stale exclude, which is a typo. An empty one would match every cell.
-    let mut excludes: Vec<Vec<(usize, &str)>> = Vec::with_capacity(exclude.len());
+    // Each is resolved to (axis, value index) once, so the product compares
+    // indices, not values.
+    let mut excludes: Vec<Vec<(usize, usize)>> = Vec::with_capacity(exclude.len());
     for e in exclude {
         if e.is_empty() {
             return Err(site.err(
@@ -224,27 +254,24 @@ pub(crate) fn plan(
                     axes.known()
                 )));
             };
-            if !axes.values.get(i).is_some_and(|vs| vs.contains(value)) {
+            let Some(j) = index_of(axes.values.get(i).into_iter().flatten(), value)? else {
                 return Err(site.err(format_args!(
-                    "exclude {} matches no cell: {value:?} is not a value of axis {axis:?}",
-                    describe_entry(e)
+                    "exclude {} matches no cell: {} is not a value of axis {axis:?}",
+                    describe_entry(e),
+                    value.repr()
                 )));
-            }
-            m.push((i, value.as_str()));
+            };
+            m.push((i, j));
         }
         excludes.push(m);
     }
 
-    let mut cells: Vec<Cell> = Vec::new();
+    let mut cells: Vec<Cell<V>> = Vec::new();
     let mut at = vec![0usize; axes.values.len()];
     'product: loop {
-        let excluded = excludes.iter().any(|m| {
-            m.iter().all(|&(i, v)| {
-                at.get(i)
-                    .and_then(|&j| axes.values.get(i).and_then(|vs| vs.get(j)))
-                    .is_some_and(|x| x == v)
-            })
-        });
+        let excluded = excludes
+            .iter()
+            .any(|m| m.iter().all(|&(i, j)| at.get(i) == Some(&j)));
         if !excluded {
             cells.push(
                 at.iter()
@@ -268,7 +295,7 @@ pub(crate) fn plan(
     // the axis list (which it does not extend). It may add back an excluded
     // cell, never one still there.
     for e in include {
-        let mut cell: Vec<Option<String>> = vec![None; axes.names.len()];
+        let mut cell: Vec<Option<V>> = vec![None; axes.names.len()];
         for (axis, value) in e {
             let Some(i) = axes.index(axis) else {
                 return Err(site.err(format_args!(
@@ -277,17 +304,16 @@ pub(crate) fn plan(
                     axes.known()
                 )));
             };
-            validate_value(site, axis, value)?;
             if let Some(slot) = cell.get_mut(i) {
                 *slot = Some(value.clone());
             }
         }
-        let missing: Vec<&str> = axes
+        let missing: Vec<String> = axes
             .names
             .iter()
             .zip(&cell)
             .filter(|(_, v)| v.is_none())
-            .map(|(n, _)| n.as_str())
+            .map(|(n, _)| format!("{n:?}"))
             .collect();
         if !missing.is_empty() {
             return Err(site.err(format_args!(
@@ -296,34 +322,29 @@ pub(crate) fn plan(
                 missing.join(", ")
             )));
         }
-        let cell: Cell = cell.into_iter().flatten().collect();
-        if cells.contains(&cell) {
-            return Err(site.err(format_args!(
-                "include {} is already a cell of this matrix",
-                describe(&axes.names, &cell)
-            )));
+        let cell: Cell<V> = cell.into_iter().flatten().collect();
+        for c in &cells {
+            if same_cell(c, &cell)? {
+                return Err(site.err(format_args!(
+                    "include {} is already a cell of this matrix",
+                    describe_entry(e)
+                )));
+            }
         }
         cells.push(cell);
     }
     Ok(cells)
 }
 
-fn describe_entry(e: &Entry) -> String {
-    let names: Vec<String> = e.iter().map(|(n, _)| n.clone()).collect();
-    let values: Vec<String> = e.iter().map(|(_, v)| v.clone()).collect();
-    format!("{{{}}}", describe(&names, &values))
-}
-
 /// The index of the cell `default` names. Every mistake fails here, at the
-/// call: an axis that does not exist, one left out, or values naming no cell
-/// (which is also what a host-derived dict on a host with no cell is).
-pub(crate) fn resolve_default(
+/// call: an axis that does not exist, one left out, or values naming no cell.
+pub(crate) fn resolve_default<V: AxisValue>(
     site: &Site,
-    axes: &Axes,
-    cells: &[Cell],
-    entry: &Entry,
+    axes: &Axes<V>,
+    cells: &[Cell<V>],
+    entry: &Entry<V>,
 ) -> anyhow::Result<usize> {
-    let mut wanted: Vec<Option<&str>> = vec![None; axes.names.len()];
+    let mut wanted: Vec<Option<V>> = vec![None; axes.names.len()];
     for (axis, value) in entry {
         let Some(i) = axes.index(axis) else {
             return Err(site.err(format_args!(
@@ -332,15 +353,15 @@ pub(crate) fn resolve_default(
             )));
         };
         if let Some(slot) = wanted.get_mut(i) {
-            *slot = Some(value);
+            *slot = Some(value.clone());
         }
     }
-    let missing: Vec<&str> = axes
+    let missing: Vec<String> = axes
         .names
         .iter()
         .zip(&wanted)
         .filter(|(_, v)| v.is_none())
-        .map(|(n, _)| n.as_str())
+        .map(|(n, _)| format!("{n:?}"))
         .collect();
     if !missing.is_empty() {
         return Err(site.err(format_args!(
@@ -348,22 +369,20 @@ pub(crate) fn resolve_default(
             missing.join(", ")
         )));
     }
-    let wanted: Vec<&str> = wanted.into_iter().flatten().collect();
-    if let Some(i) = cells
-        .iter()
-        .position(|c| c.iter().map(String::as_str).eq(wanted.iter().copied()))
-    {
-        return Ok(i);
+    let wanted: Cell<V> = wanted.into_iter().flatten().collect();
+    for (i, c) in cells.iter().enumerate() {
+        if same_cell(c, &wanted)? {
+            return Ok(i);
+        }
     }
     let mut listed: Vec<String> = cells
         .iter()
         .take(LISTED_CELLS)
-        .map(|c| describe(&axes.names, c))
+        .map(|c| format!("{{{}}}", describe(&axes.names, c)))
         .collect();
     if cells.len() > LISTED_CELLS {
         listed.push(format!("and {} more", cells.len() - LISTED_CELLS));
     }
-    let wanted: Vec<String> = wanted.into_iter().map(str::to_string).collect();
     Err(site.err(format_args!(
         "default {{{}}} names no cell of this matrix. Its cells: {}. Add it with include, or \
          name another cell",
@@ -409,11 +428,15 @@ impl<'v> AllocValue<'v> for MatrixGen<Value<'v>> {
     }
 }
 
-/// `cells`: what each cell's function returned, keyed by cell, in cell order
-/// (the bare value for one axis, a tuple in axis order for several).
+/// `cells`: a list, in cell order, of one struct per cell.
 const CELLS: &str = "cells";
 /// `default`: the default cell's value, present only with a default.
 const DEFAULT: &str = "default";
+/// A cell's `axes`: its dict of axis name to value, in axis order.
+const CELL_AXES: &str = "axes";
+/// A cell's `value`: what the cell function returned (without one, the
+/// `axes` dict).
+const CELL_VALUE: &str = "value";
 
 #[starlark_value(type = "matrix")]
 impl<'v, V: ValueLike<'v>> StarlarkValue<'v> for MatrixGen<V>
@@ -463,44 +486,23 @@ fn type_err(site: &Site, what: &str, v: Value) -> starlark::Error {
     starlark::Error::new_other(site.err(format_args!("{what}, got {}", v.get_type())))
 }
 
-/// A list of strings, refusing anything else (a string is not iterated).
-fn unpack_strs<'v>(site: &Site, what: &str, v: Value<'v>) -> starlark::Result<Vec<String>> {
-    let Some(list) = ListRef::from_value(v) else {
-        return Err(type_err(
-            site,
-            &format!("{what} must be a list of strings"),
-            v,
-        ));
-    };
-    list.content()
-        .iter()
-        .map(|e| {
-            e.unpack_str()
-                .map(str::to_string)
-                .ok_or_else(|| type_err(site, &format!("{what} must hold strings"), *e))
-        })
-        .collect()
-}
-
-/// A dict of string to string, in dict order.
-fn unpack_entry<'v>(site: &Site, what: &str, v: Value<'v>) -> starlark::Result<Entry> {
+/// A dict of axis name to any value, in dict order.
+fn unpack_entry<'v>(site: &Site, what: &str, v: Value<'v>) -> starlark::Result<Entry<Value<'v>>> {
     let Some(d) = DictRef::from_value(v) else {
         return Err(type_err(
             site,
-            &format!("{what} must be a dict of axis to value"),
+            &format!("{what} must be a dict of axis name to value"),
             v,
         ));
     };
     d.iter()
-        .map(|(k, val)| {
-            let (Some(k), Some(val)) = (k.unpack_str(), val.unpack_str()) else {
-                return Err(type_err(
-                    site,
-                    &format!("{what} must map axis names to string values"),
-                    if k.unpack_str().is_none() { k } else { val },
-                ));
-            };
-            Ok((k.to_string(), val.to_string()))
+        .map(|(k, val)| match k.unpack_str() {
+            Some(k) => Ok((k.to_string(), val)),
+            None => Err(type_err(
+                site,
+                &format!("{what} must map axis names (strings) to values"),
+                k,
+            )),
         })
         .collect()
 }
@@ -509,7 +511,7 @@ fn unpack_entries<'v>(
     site: &Site,
     what: &str,
     v: Option<Value<'v>>,
-) -> starlark::Result<Vec<Entry>> {
+) -> starlark::Result<Vec<Entry<Value<'v>>>> {
     let Some(v) = v.filter(|v| !v.is_none()) else {
         return Ok(vec![]);
     };
@@ -528,14 +530,14 @@ fn unpack_entries<'v>(
 
 // The parameter types the lint and the LSP see. Unchecked at run time: the
 // builtin refuses a wrong shape itself, with an error naming the call.
-/// `dict[str, list[str]]`.
-pub(crate) type AxesTy = DictType<String, ListType<String>>;
+/// `dict[str, list[typing.Any]]`, which starlark prints `dict[str, list]`.
+pub(crate) type AxesTy = DictType<String, ListType<FrozenValue>>;
 /// `None | typing.Callable`.
 pub(crate) type CellTy<'v> = NoneOr<StarlarkCallable<'v>>;
-/// `None | dict[str, str]`.
-pub(crate) type DefaultTy = NoneOr<DictType<String, String>>;
-/// `None | list[dict[str, str]]`.
-pub(crate) type EntriesTy = NoneOr<ListType<DictType<String, String>>>;
+/// `None | dict[str, typing.Any]`.
+pub(crate) type DefaultTy = NoneOr<DictType<String, FrozenValue>>;
+/// `None | list[dict[str, typing.Any]]`.
+pub(crate) type EntriesTy = NoneOr<ListType<DictType<String, FrozenValue>>>;
 
 /// The arguments of one `heph.core.matrix()` call.
 pub(crate) struct Args<'v> {
@@ -566,24 +568,37 @@ pub(crate) fn matrix<'v>(
             args.axes,
         ));
     };
-    let entries = axes_dict
+    let lists = axes_dict
         .iter()
         .map(|(k, v)| {
             let Some(name) = k.unpack_str() else {
                 return Err(type_err(&site, "an axis name must be a string", k));
             };
-            Ok((
-                name.to_string(),
-                unpack_strs(&site, &format!("axis {name:?}"), v)?,
-            ))
+            let Some(list) = ListRef::from_value(v) else {
+                return Err(type_err(
+                    &site,
+                    &format!("axis {name:?} must be a list of values"),
+                    v,
+                ));
+            };
+            Ok((name.to_string(), list))
         })
         .collect::<starlark::Result<Vec<_>>>()?;
     drop(axes_dict);
+    // The whole count, include too, before a value is copied or compared
+    // (I10).
+    let include_len = args
+        .include
+        .and_then(ListRef::from_value)
+        .map_or(0, |l| l.content().len());
+    check_count(&site, lists.iter().map(|(_, l)| l.len()), include_len)
+        .map_err(starlark::Error::new_other)?;
+    let entries = lists
+        .into_iter()
+        .map(|(name, l)| (name, l.content().to_vec()))
+        .collect();
     let exclude = unpack_entries(&site, "exclude", args.exclude)?;
     let include = unpack_entries(&site, "include", args.include)?;
-    // The whole count, include too, before a value is validated (I10).
-    check_count(&site, entries.iter().map(|(_, v)| v.len()), include.len())
-        .map_err(starlark::Error::new_other)?;
     let axes = Axes::new(&site, entries).map_err(starlark::Error::new_other)?;
     let cells = plan(&site, &axes, &exclude, &include).map_err(starlark::Error::new_other)?;
 
@@ -598,8 +613,7 @@ pub(crate) fn matrix<'v>(
         }
         Some(v) => {
             return Err(starlark::Error::new_other(site.err(format_args!(
-                "`default` must be None or a dict of axis to value; for the host's cell write \
-                 default = {{\"platform\": heph.core.host()}} (got {})",
+                "`default` must be None or a dict of axis name to value (got {})",
                 v.get_type()
             ))));
         }
@@ -616,20 +630,19 @@ pub(crate) fn matrix<'v>(
     };
 
     let heap = eval.heap();
-    let mut pairs: Vec<(Value<'v>, Value<'v>)> = Vec::with_capacity(cells.len());
+    let axes_dict = |cell: &[Value<'v>]| {
+        heap.alloc(AllocDict(
+            axes.names
+                .iter()
+                .map(String::as_str)
+                .zip(cell.iter().copied()),
+        ))
+    };
+    let mut out: Vec<Value<'v>> = Vec::with_capacity(cells.len());
     let mut default_value = None;
     for (i, cell) in cells.iter().enumerate() {
-        let key = match cell.as_slice() {
-            [one] => heap.alloc(one.as_str()),
-            many => heap.alloc(AllocTuple(many.iter().map(String::as_str))),
-        };
         let value = match cell_fn {
-            None => heap.alloc(AllocDict(
-                axes.names
-                    .iter()
-                    .map(String::as_str)
-                    .zip(cell.iter().map(String::as_str)),
-            )),
+            None => axes_dict(cell),
             Some(f) => {
                 let desc = describe(&axes.names, cell);
                 *extra.cell.borrow_mut() = Some(Arc::from(desc.as_str()));
@@ -638,7 +651,7 @@ pub(crate) fn matrix<'v>(
                     .names
                     .iter()
                     .map(String::as_str)
-                    .zip(cell.iter().map(|v| heap.alloc(v.as_str())))
+                    .zip(cell.iter().copied())
                     .collect();
                 eval.eval_function(f, &[], &named).map_err(|e| {
                     // The label of starlark's diagnostic shows only the
@@ -654,11 +667,14 @@ pub(crate) fn matrix<'v>(
         if default_cell == Some(i) {
             default_value = Some(value);
         }
-        pairs.push((key, value));
+        out.push(heap.alloc(AllocStruct([
+            (CELL_AXES, axes_dict(cell)),
+            (CELL_VALUE, value),
+        ])));
     }
 
     Ok(heap.alloc(MatrixGen {
-        cells: heap.alloc(AllocDict(pairs)),
+        cells: heap.alloc(AllocList(out)),
         default: default_value,
     }))
 }
@@ -666,13 +682,24 @@ pub(crate) fn matrix<'v>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pluginbuildfile::run_file::Host;
+
+    /// Planning over plain strings: `==`, shown quoted as starlark shows a
+    /// string.
+    impl AxisValue for String {
+        fn same(&self, other: &Self) -> anyhow::Result<bool> {
+            Ok(self == other)
+        }
+
+        fn repr(&self) -> String {
+            format!("{self:?}")
+        }
+    }
 
     fn site() -> Site {
         Site("p/BUILD:12".to_string())
     }
 
-    fn axes(entries: &[(&str, &[&str])]) -> anyhow::Result<Axes> {
+    fn axes(entries: &[(&str, &[&str])]) -> anyhow::Result<Axes<String>> {
         Axes::new(
             &site(),
             entries
@@ -682,26 +709,15 @@ mod tests {
         )
     }
 
-    fn entry(pairs: &[(&str, &str)]) -> Entry {
+    fn entry(pairs: &[(&str, &str)]) -> Entry<String> {
         pairs
             .iter()
             .map(|(a, v)| (a.to_string(), v.to_string()))
             .collect()
     }
 
-    fn cells_of(cells: &[Cell]) -> Vec<String> {
+    fn cells_of(cells: &[Cell<String>]) -> Vec<String> {
         cells.iter().map(|c| c.join(" ")).collect()
-    }
-
-    const PLATS: &[&str] = &["linux/amd64", "linux/arm64", "darwin/arm64"];
-
-    fn host(os: &'static str, arch: &'static str) -> Host {
-        Host {
-            os,
-            arch,
-            os_raw: os,
-            arch_raw: arch,
-        }
     }
 
     #[test]
@@ -753,13 +769,21 @@ mod tests {
     #[test]
     fn plan_refuses_bad_excludes_and_includes() {
         let a = axes(&[("go", &["1.22", "1.23"]), ("race", &["on", "off"])]).unwrap();
-        let err =
-            |ex: &[Entry], inc: &[Entry]| format!("{:#}", plan(&site(), &a, ex, inc).unwrap_err());
+        let err = |ex: &[Entry<String>], inc: &[Entry<String>]| {
+            format!("{:#}", plan(&site(), &a, ex, inc).unwrap_err())
+        };
         let e = err(&[entry(&[("os", "linux")])], &[]);
-        assert!(e.contains("exclude names axis \"os\""), "{e}");
-        assert!(e.starts_with("heph.core.matrix() at p/BUILD:12: "), "{e}");
+        assert_eq!(
+            e,
+            "heph.core.matrix() at p/BUILD:12: exclude names axis \"os\", which is not an axis \
+             of this matrix (\"go\", \"race\")"
+        );
         let e = err(&[entry(&[("go", "1.21")])], &[]);
-        assert!(e.contains("matches no cell"), "{e}");
+        assert_eq!(
+            e,
+            "heph.core.matrix() at p/BUILD:12: exclude {go=\"1.21\"} matches no cell: \"1.21\" \
+             is not a value of axis \"go\""
+        );
         // An include's value outside its axis does not extend the axis: an
         // exclude naming it is stale.
         let e = err(
@@ -768,42 +792,40 @@ mod tests {
         );
         assert!(e.contains("\"1.24\" is not a value of axis \"go\""), "{e}");
         let e = err(&[], &[entry(&[("go", "1.22")])]);
-        assert!(e.contains("gives no value for axis race"), "{e}");
+        assert!(
+            e.contains("include {go=\"1.22\"} gives no value for axis \"race\""),
+            "{e}"
+        );
         let e = err(
             &[],
             &[entry(&[("go", "1.22"), ("race", "on"), ("os", "x")])],
         );
         assert!(e.contains("names axis \"os\""), "{e}");
-        let e = err(&[], &[entry(&[("go", "1.22"), ("race", "on")])]);
-        assert!(e.contains("is already a cell"), "{e}");
+        let e = err(&[], &[entry(&[("race", "on"), ("go", "1.22")])]);
+        assert!(
+            e.contains("include {race=\"on\", go=\"1.22\"} is already a cell"),
+            "{e}"
+        );
         // Two equal includes: the second duplicates the first.
         let inc = entry(&[("go", "1.24"), ("race", "on")]);
         let e = err(&[], &[inc.clone(), inc]);
         assert!(e.contains("is already a cell"), "{e}");
-        let e = err(&[], &[entry(&[("go", "1 24"), ("race", "on")])]);
-        assert!(e.contains("is not allowed"), "{e}");
     }
 
     #[test]
-    fn axes_refuse_bad_names_and_values() {
+    fn axes_refuse_empty_and_repeated_values() {
         let err = |entries: &[(&str, &[&str])]| format!("{:#}", axes(entries).unwrap_err());
         assert!(err(&[]).contains("`axes` is empty"));
-        assert!(err(&[("go", &[])]).contains("has no values"));
-        assert!(err(&[("go-version", &["1"])]).contains("not a Starlark identifier"));
-        assert!(err(&[("1go", &["1"])]).contains("not a Starlark identifier"));
-        assert!(err(&[("go", &["1", "1"])]).contains("lists \"1\" twice"));
-        for bad in ["a b", "a@b", "a:b", "a|b", "a\nb", "é", "１", ""] {
-            assert!(
-                err(&[("v", &[bad])]).contains("is not allowed"),
-                "{bad:?} was accepted"
-            );
+        assert!(err(&[("go", &[])]).contains("axis \"go\" has no values"));
+        assert!(err(&[("go", &["1", "2", "1"])]).contains("axis \"go\" lists \"1\" twice"));
+        // Any string is a name, and any string a value.
+        for name in ["go-version", "if", "1go", "with space", "", "é"] {
+            assert!(axes(&[(name, &["a b", "", "é"])]).is_ok(), "{name:?}");
         }
-        for ok in ["..", "/", "a//b", "1.2+x_y-Z"] {
-            assert!(axes(&[("v", &[ok])]).is_ok(), "{ok:?} was refused");
-        }
-        // Over the limit before any value is validated.
+        // Over the limit before any value is compared: the repeated last
+        // value is never reached.
         let mut big: Vec<String> = (0..1024).map(|i| i.to_string()).collect();
-        big.push("bad value".to_string());
+        big.push("0".to_string());
         let big: Vec<&str> = big.iter().map(String::as_str).collect();
         assert!(err(&[("v", &big)]).contains("would have 1,025 cells"));
     }
@@ -837,43 +859,25 @@ mod tests {
 
     #[test]
     fn default_names_one_cell_and_every_mistake_fails_at_the_call() {
-        let a = axes(&[("go", &["1.22", "1.23"]), ("platform", PLATS)]).unwrap();
+        let a = axes(&[("go", &["1.22", "1.23"]), ("race", &["on", "off", "auto"])]).unwrap();
         let cells = plan(&site(), &a, &[], &[]).unwrap();
         let resolve = |e: &[(&str, &str)]| resolve_default(&site(), &a, &cells, &entry(e));
         // Dict order does not matter.
-        assert_eq!(
-            resolve(&[("platform", "darwin/arm64"), ("go", "1.23")]).unwrap(),
-            5
-        );
-        assert_eq!(
-            resolve(&[("go", "1.22"), ("platform", "linux/amd64")]).unwrap(),
-            0
-        );
+        assert_eq!(resolve(&[("race", "auto"), ("go", "1.23")]).unwrap(), 5);
+        assert_eq!(resolve(&[("go", "1.22"), ("race", "on")]).unwrap(), 0);
         let err = |e: &[(&str, &str)]| format!("{:#}", resolve(e).unwrap_err());
-        assert!(err(&[("platform", "darwin/arm64")]).contains("gives no value for axis go"));
-        assert!(
-            err(&[("platform", "darwin/arm64"), ("go", "1.23"), ("os", "x")])
-                .contains("names axis \"os\"")
-        );
-        // "host" is a value like any other: no cell has it.
-        assert!(err(&[("platform", "host"), ("go", "1.23")]).contains("names no cell"));
-        // A host with no cell, as `{"platform": heph.core.host()}` gives it.
-        let a = axes(&[("platform", PLATS)]).unwrap();
+        assert!(err(&[("race", "on")]).contains("gives no value for axis \"go\""));
+        assert!(err(&[("race", "on"), ("go", "1.23"), ("os", "x")]).contains("names axis \"os\""));
+        let a = axes(&[("race", &["on", "off"])]).unwrap();
         let cells = plan(&site(), &a, &[], &[]).unwrap();
         assert_eq!(
             format!(
                 "{:#}",
-                resolve_default(
-                    &site(),
-                    &a,
-                    &cells,
-                    &entry(&[("platform", "linux/riscv64")])
-                )
-                .unwrap_err()
+                resolve_default(&site(), &a, &cells, &entry(&[("race", "auto")])).unwrap_err()
             ),
-            "heph.core.matrix() at p/BUILD:12: default {platform=linux/riscv64} names no cell of \
-             this matrix. Its cells: platform=linux/amd64, platform=linux/arm64, \
-             platform=darwin/arm64. Add it with include, or name another cell"
+            "heph.core.matrix() at p/BUILD:12: default {race=\"auto\"} names no cell of this \
+             matrix. Its cells: {race=\"on\"}, {race=\"off\"}. Add it with include, or name \
+             another cell"
         );
         // A long cell list is elided.
         let many: Vec<String> = (0..20).map(|i| i.to_string()).collect();
@@ -884,15 +888,14 @@ mod tests {
             "{:#}",
             resolve_default(&site(), &a, &cells, &entry(&[("v", "x")])).unwrap_err()
         );
-        assert!(e.contains("v=15, and 4 more. Add it"), "{e}");
+        assert!(e.contains("{v=\"15\"}, and 4 more. Add it"), "{e}");
     }
 
-    /// Evaluate package `pkg` of a workspace holding `files`, on `host`. Every
-    /// BUILD file may `load("//t/eq.star", "eq")` for assertions.
+    /// Evaluate package `pkg` of a workspace holding `files`. Every BUILD file
+    /// may `load("//t/eq.star", "eq")` for assertions.
     fn eval_pkg(
         files: &[(&str, &str)],
         pkg: &str,
-        h: Host,
     ) -> anyhow::Result<Arc<crate::pluginbuildfile::run_file::RunResult>> {
         let tmp = tempfile::tempdir().expect("tempdir");
         let all = files.iter().copied().chain([(
@@ -905,64 +908,192 @@ mod tests {
             std::fs::write(p, content).expect("write");
         }
         crate::pluginbuildfile::run_file::tests::source_loader(tmp.path().to_path_buf())
-            .with_host(h)
             .load_pkg(pkg)
     }
 
     /// `p/BUILD` holding `eq`'s load on line 1, then `body` from line 2.
-    fn eval(
-        body: &str,
-        h: Host,
-    ) -> anyhow::Result<Arc<crate::pluginbuildfile::run_file::RunResult>> {
+    fn eval(body: &str) -> anyhow::Result<Arc<crate::pluginbuildfile::run_file::RunResult>> {
         let src = format!("load(\"//t/eq.star\", \"eq\")\n{body}");
-        eval_pkg(&[("p/BUILD", &src)], "p", h)
+        eval_pkg(&[("p/BUILD", &src)], "p")
     }
 
-    fn eval_err(body: &str, h: Host) -> String {
-        match eval(body, h) {
+    fn eval_err(body: &str) -> String {
+        match eval(body) {
             Ok(_) => panic!("evaluated:\n{body}"),
             Err(e) => format!("{e:#}"),
         }
     }
 
-    fn darwin() -> Host {
-        host("darwin", "arm64")
-    }
-
-    /// T1.
+    /// T1: `cells` is a list in cell order (last axis fastest), each entry a
+    /// struct of `.axes` (in axis declaration order) and `.value`.
     #[test]
-    fn matrix_keys_and_cells() {
+    fn matrix_cells_order_and_shape() {
         eval(
             r#"
-ONE = heph.core.matrix(axes = {"platform": ["linux/amd64", "darwin/arm64"]})
-eq(ONE.cells, {"linux/amd64": {"platform": "linux/amd64"}, "darwin/arm64": {"platform": "darwin/arm64"}})
-eq(list(ONE.cells.keys()), ["linux/amd64", "darwin/arm64"])
-
-TWO = heph.core.matrix(
-    axes = {"go": ["1.22", "1.23"], "race": ["on", "off"]},
-    cell = lambda go, race: go + "-" + race,
+M = heph.core.matrix(
+    axes = {"go": ["1.22", "1.23"], "race": [True, False]},
+    cell = lambda go, race: go + ("-race" if race else ""),
 )
-eq(list(TWO.cells.keys()), [("1.22", "on"), ("1.22", "off"), ("1.23", "on"), ("1.23", "off")])
-eq(TWO.cells[("1.23", "off")], "1.23-off")
-eq(heph.core.matrix(axes = {"go": ["1.23"], "race": ["on"]}).cells[("1.23", "on")], {"go": "1.23", "race": "on"})
+eq(type(M.cells), "list")
+eq(type(M.cells[0]), "struct")
+eq([c.axes for c in M.cells], [
+    {"go": "1.22", "race": True},
+    {"go": "1.22", "race": False},
+    {"go": "1.23", "race": True},
+    {"go": "1.23", "race": False},
+])
+eq([c.value for c in M.cells], ["1.22-race", "1.22", "1.23-race", "1.23"])
+eq(list(M.cells[0].axes.keys()), ["go", "race"])
+eq(list(heph.core.matrix(axes = {"race": [True], "go": ["1.23"]}).cells[0].axes.keys()), ["race", "go"])
+
+# Without `cell`, a cell's value is its axes dict.
+N = heph.core.matrix(axes = {"go": ["1.23"], "race": [False]})
+eq(N.cells[0].value, {"go": "1.23", "race": False})
+eq(N.cells[0].value, N.cells[0].axes)
 
 THREE = heph.core.matrix(
-    axes = {"a": ["1", "2"], "b": ["x"], "c": ["p", "q"]},
-    cell = lambda a, b, c: a + b + c,
-    exclude = [{"a": "1"}, {"a": "1", "c": "p"}],
-    include = [{"c": "p", "b": "x", "a": "1"}, {"a": "3", "b": "y", "c": "r"}],
+    axes = {"a": [1, 2], "b": ["x"], "c": ["p", "q"]},
+    cell = lambda a, b, c: "%d%s%s" % (a, b, c),
+    exclude = [{"a": 1}, {"a": 1, "c": "p"}],
+    include = [{"c": "p", "b": "x", "a": 1}, {"a": 3, "b": "y", "c": "r"}],
 )
-eq(list(THREE.cells.items()), [
-    (("2", "x", "p"), "2xp"),
-    (("2", "x", "q"), "2xq"),
-    (("1", "x", "p"), "1xp"),
-    (("3", "y", "r"), "3yr"),
-])
-eq(heph.core.matrix(axes = {"a": ["1"]}, exclude = [{"a": "1"}]).cells, {})
+eq([c.value for c in THREE.cells], ["2xp", "2xq", "1xp", "3yr"])
+eq(list(THREE.cells[2].axes.items()), [("a", 1), ("b", "x"), ("c", "p")])
+eq(heph.core.matrix(axes = {"a": [1]}, exclude = [{"a": 1}]).cells, [])
 "#,
-            darwin(),
         )
         .expect("evaluates");
+    }
+
+    /// An axis name is any string. One a `def` cannot take as a parameter
+    /// (`go-version`, `if`) reaches a `**kwargs` cell, and every entry.
+    #[test]
+    fn matrix_axis_names_are_any_string() {
+        eval(
+            r#"
+M = heph.core.matrix(
+    axes = {"go-version": ["1.22", "1.23"], "if": [1], "with space": [None], "": [0]},
+    cell = lambda **kw: kw,
+)
+eq([c.value for c in M.cells], [
+    {"go-version": "1.22", "if": 1, "with space": None, "": 0},
+    {"go-version": "1.23", "if": 1, "with space": None, "": 0},
+])
+eq(M.cells[1].axes, M.cells[1].value)
+D = heph.core.matrix(
+    axes = {"go-version": ["1.22", "1.23"], "lambda": [True]},
+    cell = lambda **kw: kw["go-version"] + ("!" if kw["lambda"] else ""),
+    exclude = [{"go-version": "1.22"}],
+    include = [{"lambda": True, "go-version": "1.24"}],
+    default = {"go-version": "1.24", "lambda": True},
+)
+eq([c.value for c in D.cells], ["1.23!", "1.24!"])
+eq(D.default, "1.24!")
+"#,
+        )
+        .expect("any string");
+        // A cell without `**kwargs` cannot take it: starlark's own text says
+        // so.
+        let err =
+            eval_err("heph.core.matrix(axes = {\"go-version\": [\"1\"]}, cell = lambda: None)");
+        assert!(
+            err.contains("heph.core.matrix() at p/BUILD:2: cell go-version=\"1\"")
+                && err.contains("Found `go-version` extra named parameter(s)"),
+            "{err}"
+        );
+    }
+
+    /// An axis value is any Starlark value, passed to `cell` and kept in
+    /// `.axes` as it is.
+    #[test]
+    fn matrix_values_are_any_starlark_value() {
+        eval(
+            r#"
+S = heph.core.matrix(axes = {"s": [1]}).cells[0]
+eq(type(S), "struct")
+V = [1, None, ("a", 2), [1, 2], {"k": "v"}, S, 2.5, True, "s"]
+M = heph.core.matrix(axes = {"v": V}, cell = lambda v: v)
+eq([c.value for c in M.cells], V)
+eq([c.axes["v"] for c in M.cells], V)
+eq(M.cells[5].value.axes, {"s": 1})
+eq(heph.core.matrix(axes = {"v": V}).cells[3].value, {"v": [1, 2]})
+
+# The very object, not a copy.
+L = [1]
+def _grow(l):
+    l.append(2)
+heph.core.matrix(axes = {"l": [L]}, cell = _grow)
+eq(L, [1, 2])
+"#,
+        )
+        .expect("verbatim values");
+    }
+
+    /// Values are compared by Starlark equality: repeats are refused, and
+    /// `exclude`, `include` and `default` match by it, lists included.
+    #[test]
+    fn matrix_values_compare_by_equality() {
+        for (values, dup) in [
+            ("[1, 1]", "1"),
+            ("[[1], [1]]", "[1]"),
+            ("[{\"a\": 1}, {\"a\": 1}]", "{\"a\": 1}"),
+            ("[(1, \"x\"), (1, \"x\")]", "(1, \"x\")"),
+            ("[1, 1.0]", "1.0"),
+            ("[None, 2, None]", "None"),
+            ("[\"a\", \"b\", \"a\"]", "\"a\""),
+        ] {
+            let err = eval_err(&format!("heph.core.matrix(axes = {{\"v\": {values}}})"));
+            assert!(
+                err.contains(&format!(
+                    "heph.core.matrix() at p/BUILD:2: axis \"v\" lists {dup} twice"
+                )),
+                "{values}: {err}"
+            );
+        }
+        eval(
+            r#"
+M = heph.core.matrix(
+    axes = {"flags": [["-a"], ["-b"]], "n": [1, None]},
+    cell = lambda flags, n: (flags, n),
+    exclude = [{"flags": ["-a"], "n": None}],
+    include = [{"n": 2, "flags": []}],
+    default = {"n": None, "flags": ["-b"]},
+)
+eq([c.value for c in M.cells], [(["-a"], 1), (["-b"], 1), (["-b"], None), ([], 2)])
+eq(M.default, (["-b"], None))
+eq(heph.core.matrix(axes = {"d": [{"k": 1}, {"k": 2}]}, exclude = [{"d": {"k": 1}}]).cells[0].axes, {"d": {"k": 2}})
+eq(heph.core.matrix(axes = {"n": [1]}, include = [{"n": 1.5}], default = {"n": 1.5}).default, {"n": 1.5})
+eq(heph.core.matrix(axes = {"t": [(1, "a"), (2, "b")]}, default = {"t": (2, "b")}).default, {"t": (2, "b")})
+"#,
+        )
+        .expect("matching by equality");
+        // 1 == 1.0, so an include of 1.0 is the cell 1.
+        let err = eval_err("heph.core.matrix(axes = {\"n\": [1]}, include = [{\"n\": 1.0}])");
+        assert!(
+            err.contains("include {n=1.0} is already a cell of this matrix"),
+            "{err}"
+        );
+        // A list value naming no cell, shown by its repr.
+        let err = eval_err(
+            "heph.core.matrix(axes = {\"flags\": [[\"-a\"]], \"n\": [1]}, default = {\"flags\": [\"-b\"], \"n\": 1})",
+        );
+        assert!(
+            err.contains(
+                "heph.core.matrix() at p/BUILD:2: default {flags=[\"-b\"], n=1} names no cell of \
+                 this matrix. Its cells: {flags=[\"-a\"], n=1}. Add it with include, or name \
+                 another cell"
+            ),
+            "{err}"
+        );
+        let err = eval_err(
+            "heph.core.matrix(axes = {\"flags\": [[\"-a\"]]}, exclude = [{\"flags\": [\"-b\"]}])",
+        );
+        assert!(
+            err.contains(
+                "exclude {flags=[\"-b\"]} matches no cell: [\"-b\"] is not a value of axis \"flags\""
+            ),
+            "{err}"
+        );
     }
 
     /// T2.
@@ -974,71 +1105,35 @@ eq(heph.core.matrix(axes = {"a": ["1"]}, exclude = [{"a": "1"}]).cells, {})
             (r#"heph.core.matrix(axes = {"go": []})"#, "has no values"),
             (
                 r#"heph.core.matrix(axes = {"go": "1.23"})"#,
-                "must be a list of strings, got string",
+                "axis \"go\" must be a list of values, got string",
             ),
             (
                 r#"heph.core.matrix(axes = {"go": 1})"#,
-                "must be a list of strings, got int",
+                "must be a list of values, got int",
             ),
             (
                 r#"heph.core.matrix(axes = {"go": ("1",)})"#,
-                "must be a list of strings, got tuple",
+                "must be a list of values, got tuple",
             ),
             (
                 r#"heph.core.matrix(axes = {"go": {"1": "2"}})"#,
-                "must be a list of strings, got dict",
-            ),
-            (
-                r#"heph.core.matrix(axes = {"go": [1]})"#,
-                "must hold strings, got int",
+                "must be a list of values, got dict",
             ),
             (
                 r#"heph.core.matrix(axes = {1: ["a"]})"#,
-                "an axis name must be a string",
-            ),
-            (
-                r#"heph.core.matrix(axes = {"go-version": ["1"]})"#,
-                "not a Starlark identifier",
-            ),
-            (
-                r#"heph.core.matrix(axes = {"go": ["1 2"]})"#,
-                "is not allowed",
-            ),
-            (
-                r#"heph.core.matrix(axes = {"go": ["a@b"]})"#,
-                "is not allowed",
-            ),
-            (
-                r#"heph.core.matrix(axes = {"go": ["a:b"]})"#,
-                "is not allowed",
-            ),
-            (
-                r#"heph.core.matrix(axes = {"go": ["a|b"]})"#,
-                "is not allowed",
-            ),
-            (
-                r#"heph.core.matrix(axes = {"go": ["a\nb"]})"#,
-                "is not allowed",
-            ),
-            (
-                r#"heph.core.matrix(axes = {"go": ["é"]})"#,
-                "is not allowed",
-            ),
-            (
-                r#"heph.core.matrix(axes = {"go": ["１"]})"#,
-                "is not allowed",
+                "an axis name must be a string, got int",
             ),
             (
                 r#"heph.core.matrix(axes = {"go": ["1", "1"]})"#,
-                "lists \"1\" twice",
+                "axis \"go\" lists \"1\" twice",
             ),
             (
                 r#"heph.core.matrix(axes = {"go": ["1"]}, exclude = [{"os": "x"}])"#,
-                "exclude names axis \"os\"",
+                "exclude names axis \"os\", which is not an axis of this matrix (\"go\")",
             ),
             (
-                r#"heph.core.matrix(axes = {"go": ["1"]}, exclude = [{"go": "2"}])"#,
-                "matches no cell",
+                r#"heph.core.matrix(axes = {"go": ["1"]}, exclude = [{"go": 1}])"#,
+                "exclude {go=1} matches no cell: 1 is not a value of axis \"go\"",
             ),
             (
                 r#"heph.core.matrix(axes = {"go": ["1"]}, exclude = {"go": "1"})"#,
@@ -1046,7 +1141,7 @@ eq(heph.core.matrix(axes = {"a": ["1"]}, exclude = [{"a": "1"}]).cells, {})
             ),
             (
                 r#"heph.core.matrix(axes = {"go": ["1"], "r": ["a"]}, include = [{"go": "2"}])"#,
-                "gives no value for axis r",
+                "gives no value for axis \"r\"",
             ),
             (
                 r#"heph.core.matrix(axes = {"go": ["1"]}, include = [{"go": "2", "os": "x"}])"#,
@@ -1054,11 +1149,11 @@ eq(heph.core.matrix(axes = {"a": ["1"]}, exclude = [{"a": "1"}]).cells, {})
             ),
             (
                 r#"heph.core.matrix(axes = {"go": ["1"]}, include = [{"go": "1"}])"#,
-                "is already a cell",
+                "include {go=\"1\"} is already a cell",
             ),
             (
-                r#"heph.core.matrix(axes = {"go": ["1"]}, include = [{"go": 2}])"#,
-                "must map axis names to string values",
+                r#"heph.core.matrix(axes = {"go": ["1"]}, include = [{1: "2"}])"#,
+                "each `include` entry must map axis names (strings) to values, got int",
             ),
             (
                 r#"heph.core.matrix(axes = {"go": ["1"]}, cell = 1)"#,
@@ -1069,37 +1164,36 @@ eq(heph.core.matrix(axes = {"a": ["1"]}, exclude = [{"a": "1"}]).cells, {})
                 "exclude {} names no axis",
             ),
             (
-                r#"heph.core.matrix(axes = {"platform": ["linux/amd64"]}, default = "host")"#,
-                "`default` must be None or a dict of axis to value; for the host's cell write \
-                 default = {\"platform\": heph.core.host()} (got string)",
+                r#"heph.core.matrix(axes = {"go": ["1"]}, default = "1")"#,
+                "`default` must be None or a dict of axis name to value (got string)",
             ),
             (
                 r#"heph.core.matrix(axes = {"go": ["1"]}, default = {"go": 1})"#,
-                "`default` must map axis names to string values, got int",
+                "default {go=1} names no cell",
             ),
             (
                 r#"heph.core.matrix(axes = {"go": ["1"]}, default = {"os": "x", "go": "1"})"#,
-                "names axis \"os\"",
+                "default names axis \"os\"",
             ),
             (
                 r#"heph.core.matrix(axes = {"go": ["1"], "r": ["a"]}, default = {"go": "1"})"#,
-                "gives no value for axis r",
+                "default gives no value for axis \"r\"",
             ),
             (
                 r#"heph.core.matrix(axes = {"go": ["1"]}, default = {"go": "2"})"#,
                 "names no cell",
             ),
             (
-                r#"heph.core.matrix(axes = {"go": ["1"]}, default = "linux")"#,
-                "`default` must be None or a dict of axis to value",
-            ),
-            (
                 r#"heph.core.matrix(axes = {"go": ["1"]}, default = 1)"#,
                 "(got int)",
             ),
+            (
+                r#"heph.core.matrix(axes = {"go": ["1"]}, default = ["1"])"#,
+                "(got list)",
+            ),
         ];
         for (call, want) in cases {
-            let err = eval_err(call, darwin());
+            let err = eval_err(call);
             assert!(
                 err.contains("heph.core.matrix() at p/BUILD:2") && err.contains(want),
                 "{call}\nwant {want:?} at p/BUILD:2, got:\n{err}"
@@ -1110,53 +1204,22 @@ eq(heph.core.matrix(axes = {"a": ["1"]}, exclude = [{"a": "1"}]).cells, {})
         // call, naming the call site and the cell, with starlark's own text
         // naming the parameter: one the axes do not give...
         let err = eval_err(
-            "def _c(go, platform):\n    return go\nheph.core.matrix(axes = {\"platform\": [\"linux/amd64\"]}, cell = _c)",
-            darwin(),
+            "def _c(go, race):\n    return go\nheph.core.matrix(axes = {\"race\": [True]}, cell = _c)",
         );
         assert!(
-            err.contains("heph.core.matrix() at p/BUILD:4: cell platform=linux/amd64")
+            err.contains("heph.core.matrix() at p/BUILD:4: cell race=True")
                 && err.contains(": Missing parameter `go` for call to `"),
             "{err}"
         );
         // ...and an axis the cell does not take.
         let err = eval_err(
-            "def _c(go):\n    return go\nheph.core.matrix(axes = {\"go\": [\"1\"], \"platform\": [\"linux/amd64\"]}, cell = _c)",
-            darwin(),
+            "def _c(go):\n    return go\nheph.core.matrix(axes = {\"go\": [\"1\"], \"race\": [True]}, cell = _c)",
         );
         assert!(
-            err.contains("heph.core.matrix() at p/BUILD:4: cell go=1, platform=linux/amd64")
-                && err.contains(": Found `platform` extra named parameter(s) for call to "),
+            err.contains("heph.core.matrix() at p/BUILD:4: cell go=\"1\", race=True")
+                && err.contains(": Found `race` extra named parameter(s) for call to "),
             "{err}"
         );
-        // `**kwargs` takes whatever the axes are.
-        eval(
-            "eq(heph.core.matrix(axes = {\"a\": [\"1\"], \"b\": [\"2\"]}, cell = lambda **kw: kw).cells, {(\"1\", \"2\"): {\"a\": \"1\", \"b\": \"2\"}})",
-            darwin(),
-        )
-        .expect("**kwargs");
-        // A keyword is an axis name: it reaches `**kwargs` and the default cell.
-        eval(
-            "eq(heph.core.matrix(axes = {\"if\": [\"1\"], \"lambda\": [\"2\"]}, cell = lambda **kw: kw[\"if\"] + kw[\"lambda\"]).cells, {(\"1\", \"2\"): \"12\"})\n\
-             eq(heph.core.matrix(axes = {\"if\": [\"1\"]}).cells, {\"1\": {\"if\": \"1\"}})",
-            darwin(),
-        )
-        .expect("keyword axis");
-        // `..`, `/` and `a//b` are values; their D8 names are valid target names.
-        let result = eval(
-            "heph.core.matrix(axes = {\"v\": [\"..\", \"/\", \"a//b\"]}, cell = lambda v: target(name = \"t.\" + v.replace(\"/\", \"-\"), driver = \"d\"))",
-            darwin(),
-        )
-        .expect("odd values");
-        let names: Vec<&str> = result.targets().iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, ["t...", "t.-", "t.a--b"]);
-        for n in names {
-            let addr = format!("//p:{n}");
-            assert_eq!(
-                hmodel::htaddr::parse_addr(&addr).expect("parses").format(),
-                addr,
-                "{n} round-trips"
-            );
-        }
     }
 
     /// T3.
@@ -1166,24 +1229,22 @@ eq(heph.core.matrix(axes = {"a": ["1"]}, exclude = [{"a": "1"}]).cells, {})
             r#"
 V = {"a": "s", "b": ":rel", "c": {"bin": ":x"}, "d": [1, ":y"], "e": None}
 M = heph.core.matrix(axes = {"k": ["a", "b", "c", "d", "e"]}, cell = lambda k: V[k])
-eq(M.cells, V)
+eq([c.value for c in M.cells], V.values())
 for k in V:
     eq(heph.core.matrix(axes = {"k": ["a", "b", "c", "d", "e"]}, cell = lambda k: V[k], default = {"k": k}).default, V[k])
 "#,
-            darwin(),
         )
         .expect("verbatim");
 
         let err = eval_err(
-            r#"def _cell(platform):
-    if platform == "linux/arm64":
+            r#"def _cell(go, race):
+    if race:
         fail("boom")
-    return platform
-heph.core.matrix(axes = {"platform": ["linux/amd64", "linux/arm64"]}, cell = _cell)"#,
-            darwin(),
+    return go
+heph.core.matrix(axes = {"go": ["1.23"], "race": [False, True]}, cell = _cell)"#,
         );
         assert!(
-            err.contains("heph.core.matrix() at p/BUILD:6: cell platform=linux/arm64"),
+            err.contains("heph.core.matrix() at p/BUILD:6: cell go=\"1.23\", race=True"),
             "{err}"
         );
         assert!(err.contains("boom"), "{err}");
@@ -1194,49 +1255,35 @@ heph.core.matrix(axes = {"platform": ["linux/amd64", "linux/arm64"]}, cell = _ce
     /// T6.
     #[test]
     fn matrix_default() {
-        // The host's cell, as the BUILD file names it.
-        let body = r#"
-M = heph.core.matrix(axes = {"platform": ["linux/amd64", "linux/arm64", "darwin/arm64"]}, cell = lambda platform: ":t." + platform, default = {"platform": heph.core.host()})
-eq(M.default, ":t." + heph.core.host())
-eq(M.default, M.default)
+        eval(
+            r#"
+M = heph.core.matrix(
+    axes = {"go": ["1.22", "1.23"], "race": [True, False]},
+    cell = lambda go, race: go + ("-race" if race else ""),
+    default = {"race": False, "go": "1.23"},
+)
+eq(M.default, "1.23")
 eq(hasattr(M, "default"), True)
 eq(dir(M), ["cells", "default"])
-eq(heph.core.host(), heph.core.os() + "/" + heph.core.arch())
-D = heph.core.matrix(axes = {"go": ["1.22", "1.23"], "platform": ["linux/amd64", "linux/arm64", "darwin/arm64"]}, default = {"platform": heph.core.host(), "go": "1.23"})
-eq(D.default, {"go": "1.23", "platform": heph.core.host()})
-F = heph.core.matrix(axes = {"go": ["1.22", "1.23"], "race": ["on", "off"]}, default = {"race": "off", "go": "1.22"})
-eq(F.default, {"go": "1.22", "race": "off"})
-"#;
-        for (os, arch) in [("linux", "amd64"), ("linux", "arm64"), ("darwin", "arm64")] {
-            eval(body, host(os, arch)).unwrap_or_else(|e| panic!("{os}/{arch}: {e:#}"));
-        }
-        // The real host.
-        eval(
-            "eq(heph.core.host(), heph.core.os() + \"/\" + heph.core.arch())",
-            Host::current(),
+F = heph.core.matrix(axes = {"go": ["1.22", "1.23"], "race": [True, False]}, default = {"race": False, "go": "1.22"})
+eq(F.default, {"go": "1.22", "race": False})
+"#,
         )
-        .expect("real host");
+        .expect("default");
 
-        // A host with no cell fails at the call, not at a read.
-        let riscv = host("linux", "riscv64");
+        // A default naming no cell fails at the call, not at a read.
         let err = eval_err(
-            "M = heph.core.matrix(axes = {\"platform\": [\"linux/amd64\", \"linux/arm64\", \"darwin/arm64\"]}, default = {\"platform\": heph.core.host()})",
-            riscv,
+            "M = heph.core.matrix(axes = {\"go\": [\"1.22\", \"1.23\"], \"race\": [True, False]}, default = {\"go\": \"1.24\", \"race\": True})",
         );
         assert!(
             err.contains(
-                "heph.core.matrix() at p/BUILD:2: default {platform=linux/riscv64} names no cell \
-                 of this matrix. Its cells: platform=linux/amd64, platform=linux/arm64, \
-                 platform=darwin/arm64. Add it with include, or name another cell"
+                "heph.core.matrix() at p/BUILD:2: default {go=\"1.24\", race=True} names no cell \
+                 of this matrix. Its cells: {go=\"1.22\", race=True}, {go=\"1.22\", race=False}, \
+                 {go=\"1.23\", race=True}, {go=\"1.23\", race=False}. Add it with include, or \
+                 name another cell"
             ),
             "{err}"
         );
-        // Without a default, the host plays no part.
-        eval(
-            "eq(len(heph.core.matrix(axes = {\"platform\": [\"linux/amd64\"]}).cells), 1)",
-            riscv,
-        )
-        .expect("no default, no host");
 
         // `default = None` (or omitted): no `default` attribute at all.
         eval(
@@ -1248,12 +1295,10 @@ eq(dir(N), ["cells"])
 eq(hasattr(heph.core.matrix(axes = {"go": ["1"]}, default = None), "default"), False)
 eq(getattr(N, "default", "none"), "none")
 "#,
-            darwin(),
         )
         .expect("no default attribute");
         let err = eval_err(
             "M = heph.core.matrix(axes = {\"go\": [\"1\"]}, default = None)\nX = M.default",
-            darwin(),
         );
         assert!(
             err.contains("Object of type `matrix` has no attribute `default`"),
@@ -1268,12 +1313,11 @@ eq(getattr(N, "default", "none"), "none")
         eval(
             r#"
 M = heph.core.matrix(axes = {"k": ["a", "b"]}, cell = lambda k: k + "!", default = {"k": "a"})
-M.cells["a"] = "changed"
-M.cells.pop("b")
-eq(M.cells, {"a": "changed"})
+M.cells[0] = "changed"
+M.cells.pop()
+eq(M.cells, ["changed"])
 eq(M.default, "a!")
 "#,
-            darwin(),
         )
         .expect("default kept");
     }
@@ -1282,27 +1326,28 @@ eq(M.default, "a!")
     #[test]
     fn matrix_result_through_load() {
         let defs = r#"M = heph.core.matrix(
-    axes = {"platform": ["linux/amd64", "darwin/arm64"]},
-    cell = lambda platform: "//lib:t." + platform.replace("/", "-"),
-    default = {"platform": "darwin/arm64"},
+    axes = {"go": ["1.22", "1.23"], "flags": [["-race"]]},
+    cell = lambda go, flags: "//lib:t." + go,
+    default = {"flags": ["-race"], "go": "1.23"},
 )
-N = heph.core.matrix(axes = {"platform": ["linux/amd64"]})
+N = heph.core.matrix(axes = {"go": ["1.22"]})
 
 def make(name):
     return heph.core.matrix(
-        axes = {"platform": ["linux/amd64", "darwin/arm64"]},
-        cell = lambda platform: target(name = name + "." + platform.replace("/", "-"), driver = "d"),
+        axes = {"go": ["1.22", "1.23"]},
+        cell = lambda go: target(name = name + "." + go, driver = "d"),
     )
 "#;
         // Both packages read the frozen value: `cells`, `default`, and
         // `hasattr` on one without a default.
         let consumer = r#"load("//t/eq.star", "eq")
 load("//lib/defs.star", "M", "N")
-eq(M.cells, {"linux/amd64": "//lib:t.linux-amd64", "darwin/arm64": "//lib:t.darwin-arm64"})
+eq([c.value for c in M.cells], ["//lib:t.1.22", "//lib:t.1.23"])
+eq(M.cells[1].axes, {"go": "1.23", "flags": ["-race"]})
 eq(hasattr(M, "default"), True)
 eq(hasattr(N, "default"), False)
 eq(dir(N), ["cells"])
-target(name = "use", driver = "d", tool = M.default, all = list(M.cells.values()))
+target(name = "use", driver = "d", tool = M.default, all = [c.value for c in M.cells])
 "#;
         let files = [
             ("lib/defs.star", defs),
@@ -1310,20 +1355,21 @@ target(name = "use", driver = "d", tool = M.default, all = list(M.cells.values()
             ("b/BUILD", consumer),
             (
                 "c/BUILD",
-                "load(\"//t/eq.star\", \"eq\")\nload(\"//lib/defs.star\", \"make\")\nT = make(\"tool\")\neq(T.cells[\"darwin/arm64\"], \"//c:tool.darwin-arm64\")\n",
+                "load(\"//t/eq.star\", \"eq\")\nload(\"//lib/defs.star\", \"make\")\nT = make(\"tool\")\neq(T.cells[1].value, \"//c:tool.1.23\")\n",
+            ),
+            (
+                "d/BUILD",
+                "load(\"//lib/defs.star\", \"M\")\nM.cells.append(1)\n",
             ),
         ];
-        let riscv = host("linux", "riscv64");
         let config = |pkg: &str| {
-            let r = eval_pkg(&files, pkg, riscv).unwrap_or_else(|e| panic!("{pkg}: {e:#}"));
+            let r = eval_pkg(&files, pkg).unwrap_or_else(|e| panic!("{pkg}: {e:#}"));
             r.target("use").expect("use").config.clone()
         };
         let (a, b) = (config("a"), config("b"));
         assert_eq!(
             a.get("tool"),
-            Some(&hcore::htvalue::Value::String(
-                "//lib:t.darwin-arm64".to_string()
-            ))
+            Some(&hcore::htvalue::Value::String("//lib:t.1.23".to_string()))
         );
         assert_eq!(
             a.get("tool"),
@@ -1331,24 +1377,26 @@ target(name = "use", driver = "d", tool = M.default, all = list(M.cells.values()
             "`.default` is one value across packages"
         );
         assert_eq!(a.get("all"), b.get("all"));
-        let c = eval_pkg(&files, "c", riscv).expect("a matrix in a def");
+        let c = eval_pkg(&files, "c").expect("a matrix in a def");
         let names: Vec<&str> = c.targets().iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, ["tool.linux-amd64", "tool.darwin-arm64"]);
+        assert_eq!(names, ["tool.1.22", "tool.1.23"]);
+        // A loaded result is frozen.
+        let err = format!("{:#}", eval_pkg(&files, "d").unwrap_err());
+        assert!(err.contains("Immutable"), "{err}");
     }
 
     /// T13.
     #[test]
     fn matrix_duplicate_names() {
         let err = eval_err(
-            r#"def _c(platform):
-    return target(name = "tool", driver = "http_fetch", url = "https://x/" + platform)
-heph.core.matrix(axes = {"platform": ["linux/amd64", "linux/arm64"]}, cell = _c)"#,
-            darwin(),
+            r#"def _c(go):
+    return target(name = "tool", driver = "http_fetch", url = "https://x/" + go)
+heph.core.matrix(axes = {"go": ["1.22", "1.23"]}, cell = _c)"#,
         );
         assert!(
             err.contains(
                 "//p:tool is declared twice with different configs: \
-                 p/BUILD:3 (cell platform=linux/amd64) and p/BUILD:3 (cell platform=linux/arm64). \
+                 p/BUILD:3 (cell go=\"1.22\") and p/BUILD:3 (cell go=\"1.23\"). \
                  They differ in config.url. If both come from a matrix cell, put the cell's axis \
                  values in the target name; otherwise remove one declaration, or make them \
                  identical"
@@ -1360,36 +1408,27 @@ heph.core.matrix(axes = {"platform": ["linux/amd64", "linux/arm64"]}, cell = _c)
         let err = eval_err(
             r#"target(name = "tool", driver = "d", v = "top")
 heph.core.matrix(axes = {"v": ["a"]}, cell = lambda v: target(name = "tool", driver = "d", v = v))"#,
-            darwin(),
-        );
-        assert!(err.contains("p/BUILD:2 and p/BUILD:3 (cell v=a)"), "{err}");
-
-        // D8 names that collide: `linux/arm64` and `linux-arm64`.
-        let err = eval_err(
-            r#"heph.core.matrix(axes = {"platform": ["linux/arm64", "linux-arm64"]}, cell = lambda platform: target(name = "t." + platform.replace("/", "-"), driver = "d", p = platform))"#,
-            darwin(),
         );
         assert!(
-            err.contains("(cell platform=linux/arm64) and p/BUILD:2 (cell platform=linux-arm64)"),
+            err.contains("p/BUILD:2 and p/BUILD:3 (cell v=\"a\")"),
             "{err}"
         );
-        // ...and over two axes: `1.2` + `3` against `1` + `2.3`.
+
+        // Names a cell builds that collide: `1.2` + `3` against `1` + `2.3`.
         let err = eval_err(
             r#"heph.core.matrix(axes = {"a": ["1.2", "1"], "b": ["3", "2.3"]}, cell = lambda a, b: target(name = "t." + a + "." + b, driver = "d", a = a, b = b))"#,
-            darwin(),
         );
         assert!(
             err.contains(
-                "//p:t.1.2.3 is declared twice with different configs: p/BUILD:2 (cell a=1.2, \
-                 b=3) and p/BUILD:2 (cell a=1, b=2.3). They differ in config.a, config.b."
+                "//p:t.1.2.3 is declared twice with different configs: p/BUILD:2 (cell a=\"1.2\", \
+                 b=\"3\") and p/BUILD:2 (cell a=\"1\", b=\"2.3\"). They differ in config.a, config.b."
             ),
             "{err}"
         );
 
         // The same declaration from every cell collapses to one target.
         let result = eval(
-            r#"heph.core.matrix(axes = {"platform": ["linux/amd64", "linux/arm64"]}, cell = lambda platform: target(name = "shared", driver = "d"))"#,
-            darwin(),
+            r#"heph.core.matrix(axes = {"go": ["1.22", "1.23"]}, cell = lambda go: target(name = "shared", driver = "d"))"#,
         )
         .expect("identical declarations");
         assert_eq!(result.targets().len(), 1);
@@ -1399,8 +1438,7 @@ heph.core.matrix(axes = {"v": ["a"]}, cell = lambda v: target(name = "tool", dri
     #[test]
     fn matrix_limits() {
         let err = eval_err(
-            "heph.core.matrix(axes = {\"v\": [str(i) for i in range(1025)]}, cell = lambda v: fail(\"ran\"))",
-            darwin(),
+            "heph.core.matrix(axes = {\"v\": list(range(1025))}, cell = lambda v: fail(\"ran\"))",
         );
         assert!(
             err.contains(
@@ -1410,38 +1448,31 @@ heph.core.matrix(axes = {"v": ["a"]}, cell = lambda v: target(name = "tool", dri
         );
         let err = eval_err(
             "heph.core.matrix(axes = {\"a%d\" % i: [\"x\", \"y\"] for i in range(40)}, cell = lambda **kw: fail(\"ran\"))",
-            darwin(),
         );
         assert!(
             err.contains("would have 1,099,511,627,776 cells; the limit is 1,024"),
             "{err}"
         );
         eval(
-            "eq(len(heph.core.matrix(axes = {\"v\": [str(i) for i in range(1024)]}, cell = lambda v: None).cells), 1024)",
-            darwin(),
+            "eq(len(heph.core.matrix(axes = {\"v\": list(range(1024))}, cell = lambda v: None).cells), 1024)",
         )
         .expect("exactly the limit");
-        // A huge axis is refused by its length, before any value is checked
-        // (the bad last value is never reached), so validation never runs
-        // over more than the limit.
-        let err = eval_err(
-            "heph.core.matrix(axes = {\"v\": [str(i) for i in range(200000)] + [\"bad value\"]})",
-            darwin(),
-        );
+        // A huge axis is refused by its length, before any value is compared
+        // (the repeated last value is never reached), so the quadratic
+        // duplicate check never runs over more than the limit.
+        let err = eval_err("heph.core.matrix(axes = {\"v\": list(range(200000)) + [0]})");
         assert!(
             err.contains("would have 200,001 cells; the limit is 1,024"),
             "{err}"
         );
         // `include` counts before the axes are validated, too.
         let err = eval_err(
-            "heph.core.matrix(axes = {\"v\": [str(i) for i in range(1024)]}, include = [{\"v\": \"x\"}])",
-            darwin(),
+            "heph.core.matrix(axes = {\"v\": list(range(1024))}, include = [{\"v\": \"x\"}])",
         );
         assert!(err.contains("would have 1,025 cells"), "{err}");
 
         let err = eval_err(
             "heph.core.matrix(axes = {\"a\": [\"1\"]}, cell = lambda a: heph.core.matrix(axes = {\"b\": [\"2\"]}))",
-            darwin(),
         );
         assert!(
             err.contains("heph.core.matrix() at p/BUILD:2: a cell may not call heph.core.matrix()"),
@@ -1450,7 +1481,6 @@ heph.core.matrix(axes = {"v": ["a"]}, cell = lambda v: target(name = "tool", dri
         // A cell passing itself ends in the same error, not a stack overflow.
         let err = eval_err(
             "def _c(a):\n    return heph.core.matrix(axes = {\"a\": [\"1\"]}, cell = _c)\n_c(\"x\")",
-            darwin(),
         );
         assert!(
             err.contains("a cell may not call heph.core.matrix()"),

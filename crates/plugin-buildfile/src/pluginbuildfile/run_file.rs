@@ -672,7 +672,7 @@ impl DeclSite {
         }
     }
 
-    /// `p/BUILD:12 (cell platform=linux/amd64)`.
+    /// `p/BUILD:12 (cell go="1.23", race=True)`.
     fn render(&self, root: &Path) -> String {
         let mut out = render_span(root, self.span.as_ref());
         if let Some(cell) = &self.cell {
@@ -1197,45 +1197,12 @@ fn merge_pkg_results(
     Ok(RunResult::new(targets, states, frozen))
 }
 
-/// The platform `heph.core.host()` and the other host readers report. Read
-/// once per [`BuildFileLoader`] from [`hcore::htplatform`] and handed to each
-/// evaluation through [`Extra`]; tests inject another.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Host {
-    /// Canonical (Go/OCI) naming: `linux`, `darwin`.
-    pub os: &'static str,
-    /// Canonical (Go/OCI) naming: `amd64`, `arm64`.
-    pub arch: &'static str,
-    /// As Rust reports it: `linux`, `macos`.
-    pub os_raw: &'static str,
-    /// As Rust reports it: `x86_64`, `aarch64`.
-    pub arch_raw: &'static str,
-}
-
-impl Host {
-    pub(crate) fn current() -> Self {
-        Self {
-            os: hcore::htplatform::os(),
-            arch: hcore::htplatform::arch(),
-            os_raw: hcore::htplatform::os_raw(),
-            arch_raw: hcore::htplatform::arch_raw(),
-        }
-    }
-
-    /// `os/arch`, as `heph.core.host()` prints it.
-    pub(crate) fn platform(&self) -> String {
-        format!("{}/{}", self.os, self.arch)
-    }
-}
-
 #[derive(ProvidesStaticType)]
 pub(crate) struct Extra<'a> {
     pub pkg: &'a str,
     pub root: &'a Path,
-    /// The host every `heph.core` host reader reports.
-    pub host: Host,
     /// The cell being run while a `heph.core.matrix()` cell function runs
-    /// (`platform=linux/arm64`), else `None`: stamped on what the cell declares,
+    /// (`go="1.23", race=True`), else `None`: stamped on what the cell declares,
     /// for the duplicate-declaration error, and how a nested matrix is refused.
     pub cell: std::cell::RefCell<Option<Arc<str>>>,
     pub on_state: Box<dyn Fn(OnStatePayload) -> anyhow::Result<()>>,
@@ -1709,62 +1676,49 @@ fn extra_of<'a>(eval: &Evaluator<'_, 'a, '_>, builtin: &str) -> starlark::Result
 #[starlark_module]
 fn heph_core_module(builder: &mut GlobalsBuilder) {
     /// Host operating system in canonical (Go/OCI) naming, e.g. `linux`, `darwin`.
-    fn os<'v>(eval: &mut Evaluator<'v, '_, '_>) -> starlark::Result<String> {
-        Ok(extra_of(eval, "heph.core.os()")?.host.os.to_string())
+    fn os() -> starlark::Result<String> {
+        Ok(hcore::htplatform::os().to_string())
     }
 
     /// Host architecture in canonical (Go/OCI) naming, e.g. `amd64`, `arm64`.
-    fn arch<'v>(eval: &mut Evaluator<'v, '_, '_>) -> starlark::Result<String> {
-        Ok(extra_of(eval, "heph.core.arch()")?.host.arch.to_string())
+    fn arch() -> starlark::Result<String> {
+        Ok(hcore::htplatform::arch().to_string())
     }
 
     /// Host operating system as Rust reports it, e.g. `linux`, `macos`.
-    fn os_raw<'v>(eval: &mut Evaluator<'v, '_, '_>) -> starlark::Result<String> {
-        Ok(extra_of(eval, "heph.core.os_raw()")?
-            .host
-            .os_raw
-            .to_string())
+    fn os_raw() -> starlark::Result<String> {
+        Ok(hcore::htplatform::os_raw().to_string())
     }
 
     /// Host architecture as Rust reports it, e.g. `x86_64`, `aarch64`.
-    fn arch_raw<'v>(eval: &mut Evaluator<'v, '_, '_>) -> starlark::Result<String> {
-        Ok(extra_of(eval, "heph.core.arch_raw()")?
-            .host
-            .arch_raw
-            .to_string())
+    fn arch_raw() -> starlark::Result<String> {
+        Ok(hcore::htplatform::arch_raw().to_string())
     }
 
-    /// The host platform as `os/arch` in canonical naming, e.g.
-    /// `darwin/arm64`. A matrix picks the host's cell with
-    /// `default = {"platform": heph.core.host()}`.
-    fn host<'v>(eval: &mut Evaluator<'v, '_, '_>) -> starlark::Result<String> {
-        Ok(extra_of(eval, "heph.core.host()")?.host.platform())
-    }
-
-    /// Enumerate the cells of a matrix and call `cell` once per cell, with one
-    /// keyword argument per axis. Returns a value with these attributes:
+    /// The cross product of `axes`: call `cell` once per cell, with one
+    /// keyword argument per axis (an axis name that cannot be a parameter,
+    /// like `go-version`, reaches a `**kwargs` cell). Returns a value with
+    /// these attributes:
     ///
-    /// - `cells`: what each call returned, unchanged, keyed by cell, in cell
-    ///   order (the cross product, last axis fastest, minus `exclude`, then
-    ///   `include`). A key is the bare value for one axis (`"linux/arm64"`), a
-    ///   tuple in axis order for several (`("1.23.1", "linux/arm64")`).
+    /// - `cells`: a list, in cell order (the cross product, last axis fastest,
+    ///   minus `exclude`, then `include`), of structs with `axes` (a dict of
+    ///   axis name to value, in axis order) and `value` (what `cell` returned,
+    ///   unchanged; without `cell`, the `axes` dict).
     /// - `default`: only when `default` names a cell (a dict giving a value for
-    ///   every axis, e.g. `{"platform": heph.core.host()}`): that cell's value.
-    ///   A dict naming no cell fails the call. Without `default` there is no
-    ///   such attribute (`hasattr(m, "default")` is false).
+    ///   every axis): that cell's `value`. A dict naming no cell fails the
+    ///   call. Without `default` there is no such attribute
+    ///   (`hasattr(m, "default")` is false).
     ///
-    /// `axes` maps each axis name (a Starlark identifier) to its values
-    /// (strings of `A-Z a-z 0-9 . _ / + -`); its order orders tuple keys.
-    /// Without `cell`, each value is the cell's dict of axis values. `exclude`
-    /// removes cells of the cross product (each entry names a subset of the
-    /// axes and must match a cell); `include` adds cells after it (each names
-    /// every axis). At most 1,024 cells, and a cell may not call
+    /// `axes` maps each axis name (any string) to a list of values (any
+    /// Starlark values, passed to `cell` as they are). Values within an axis
+    /// must differ, and `exclude`, `include` and `default` match cells by
+    /// equality. `exclude` removes cells of the cross product (each entry names
+    /// a subset of the axes and must match a cell); `include` adds cells after
+    /// it (each names every axis). At most 1,024 cells, and a cell may not call
     /// `heph.core.matrix()`.
     ///
-    /// The matrix declares nothing: a target a cell declares is exactly what the
-    /// cell called. A target whose config reads a host-derived `.default` has
-    /// the host's cell in its config, so its key moves with the host. See
-    /// `docs/MATRIX.md`.
+    /// The matrix declares nothing: a target a cell declares is exactly what
+    /// the cell called. See `docs/MATRIX.md`.
     fn matrix<'v>(
         eval: &mut Evaluator<'v, '_, '_>,
         #[starlark(require = named)] axes: ValueOfUnchecked<'v, matrix::AxesTy>,
@@ -2032,9 +1986,6 @@ impl Provider {
 /// even when reached via different load paths or via top-level `run_pkg`.
 pub(crate) struct BuildFileLoader {
     root: PathBuf,
-    /// The host every evaluation through this loader reports
-    /// ([`Host::current`]; a test injects another with [`Self::with_host`]).
-    host: Host,
     patterns: Vec<glob::Pattern>,
     file_cache: Arc<Mutex<HashMap<PathBuf, Arc<RunResult>>>>,
     dir_cache: Arc<Mutex<HashMap<PathBuf, Arc<RunResult>>>>,
@@ -2085,7 +2036,6 @@ impl BuildFileLoader {
         let chain = loads.new_chain();
         Self {
             root,
-            host: Host::current(),
             patterns,
             file_cache,
             dir_cache,
@@ -2098,13 +2048,6 @@ impl BuildFileLoader {
             loads,
             chain,
         }
-    }
-
-    /// This loader, evaluating as if on `host`.
-    #[cfg(test)]
-    pub(crate) fn with_host(mut self, host: Host) -> Self {
-        self.host = host;
-        self
     }
 
     /// The Starlark globals for this loader, built once from the function
@@ -2819,7 +2762,6 @@ fn eval_ast(
         let extra = Extra {
             pkg,
             root: &loader.root,
-            host: loader.host,
             cell: std::cell::RefCell::new(None),
             capture_provenance,
             on_target: {

@@ -61,7 +61,7 @@ B = heph.core.matrix(
     cell = _cell,
     exclude = [{"go": "1.22", "platform": "darwin/arm64"}],
 )
-target(name = "all", driver = "bash", run = "cat $SRC > $OUT", out = "all.txt", deps = B.cells.values())
+target(name = "all", driver = "bash", run = "cat $SRC > $OUT", out = "all.txt", deps = [c.value for c in B.cells])
 "#,
     )
     .await?;
