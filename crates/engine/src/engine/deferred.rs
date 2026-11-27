@@ -317,13 +317,22 @@ fn origin_id_for(r: &DeferredRef, p: &Producer, via: Option<&Addr>) -> String {
 
 /// How a declared input's origin reads to its author: `${read://}` /
 /// `${src://}` for a deferred edge (whose `origin_id` is a synthesized
-/// `option|…` path), the `origin_id` itself for every other input.
+/// `option|…` path), the option a `deps` / `tools` / `scratch` /
+/// `credentials` edge was declared in (`dep|<group>|<i>` reads `deps`), and
+/// the `origin_id` itself for every other input.
 pub(crate) fn declared_origin(origin_id: &str) -> String {
     let Some(rest) = origin_id
         .strip_prefix(DEFERRED_ORIGIN_PREFIX)
         .and_then(|r| r.strip_prefix('|'))
     else {
-        return origin_id.to_owned();
+        let option = match origin_id.split('|').next() {
+            Some("dep") => "deps",
+            Some("tool") => "tools",
+            Some("scratch") => "scratch",
+            Some("credential") => "credentials",
+            _ => return origin_id.to_owned(),
+        };
+        return option.to_owned();
     };
     let kinds = rest.split('|');
     match kinds.into_iter().find(|k| *k == READ || *k == SRC) {
