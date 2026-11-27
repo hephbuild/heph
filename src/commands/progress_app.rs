@@ -194,6 +194,7 @@ where
     Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
 {
     let engine = bootstrap::new_engine(global, session)?;
+    bootstrap::cancel_on_term_and_hup(&engine.1);
     engine_command_on(
         engine,
         label,

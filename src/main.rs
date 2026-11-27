@@ -306,7 +306,12 @@ fn main() -> ExitCode {
     // records the number.
     let code: u8 = match &exec_result {
         Ok(_) => 0,
-        Err(e) => exit_code_for(e, tool_exit, &session),
+        Err(e) => exit_code_for(
+            e,
+            tool_exit,
+            &session,
+            commands::bootstrap::cancel_requested(),
+        ),
     };
     let result = ExitCode::from(code);
     // `End` and the lock release, before anything slow on the way out
@@ -350,10 +355,13 @@ fn main() -> ExitCode {
 
 /// The exit code for a failed command, rendering the error on the way. The
 /// first type in the chain that claims the failure decides, in this order.
+/// `cancel_requested` is [`commands::bootstrap::cancel_requested`]: the user
+/// stopped the command.
 fn exit_code_for(
     e: &anyhow::Error,
     tool_exit: Option<hcore::process::Exit>,
     session: &SessionSlot,
+    cancel_requested: bool,
 ) -> u8 {
     // An entrypoint's program ended without success: heph exits as it did.
     if let Some(exit) = tool_exit {
@@ -403,7 +411,17 @@ fn exit_code_for(
         return failed.code;
     }
     report(e, session);
-    1
+    // A cancel exits 130 (error-reporting I6), in every mode, and a failure
+    // the user then stopped too: the stop is read from the trigger, since the
+    // failure boxes carry no trace of it. The walker finds a cancel inside a
+    // `MultiError` or a memoizer-shared error.
+    let cancelled = cancel_requested
+        || hcore::hmemoizer::find::<heph::engine::error::CancelledError>(e).is_some();
+    if cancelled {
+        commands::run::EXIT_CANCELLED
+    } else {
+        1
+    }
 }
 
 /// Render a graphical diagnostic if the error chain carries one
@@ -582,6 +600,43 @@ fn names_command(m: &clap::ArgMatches, path: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A cancel exits 130 (I6): a cancel in the chain, one inside a
+    /// `MultiError` or behind a memoizer's shared error, and any failure the
+    /// user then stopped (the trigger fired). An ordinary failure exits 1.
+    #[test]
+    fn exit_code_for_maps_a_cancel_to_130() {
+        use heph::engine::error::CancelledError;
+        let session = SessionSlot::new();
+        let code = |e: anyhow::Error, stopped: bool| exit_code_for(&e, None, &session, stopped);
+
+        let cancel = || anyhow::Error::new(CancelledError).context("running //p:a");
+        assert_eq!(code(cancel(), false), 130, "a cancel in the chain");
+        let multi = anyhow::Error::new(hcore::hmemoizer::MultiError(vec![
+            anyhow::anyhow!("boom"),
+            cancel(),
+        ]));
+        assert_eq!(code(multi, false), 130, "a cancel inside a MultiError");
+        // A second holder, so the memoizer cannot hand the error back whole.
+        let shared = Arc::new(cancel());
+        let behind = hcore::hmemoizer::unwrap_arc_err(Arc::clone(&shared));
+        assert!(
+            behind.downcast_ref::<CancelledError>().is_none(),
+            "the shared wrapper hides the type from a plain downcast"
+        );
+        assert_eq!(code(behind, false), 130, "a cancel behind SharedAnyhow");
+
+        assert_eq!(
+            code(anyhow::anyhow!("boom"), true),
+            130,
+            "a failure, then a stop"
+        );
+        assert_eq!(
+            code(anyhow::anyhow!("boom"), false),
+            1,
+            "an ordinary failure"
+        );
+    }
 
     fn soft(args: &[&str]) -> Result<clap::ArgMatches, clap::Error> {
         Cli::command().try_get_matches_from(args)

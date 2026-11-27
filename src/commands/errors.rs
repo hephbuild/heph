@@ -680,10 +680,11 @@ async fn take_failure_outcome(
 }
 
 /// Map the cancelled flag to an exit result for the no-failures path. Registry
-/// failures never reach here — they exit as [`FailedTargets`].
+/// failures never reach here — they exit as [`FailedTargets`]. A
+/// [`CancelledError`], so `main` reads it as a cancel: exit 130.
 pub(crate) fn finish_exit(cancelled: bool) -> anyhow::Result<()> {
     if cancelled {
-        anyhow::bail!("cancelled");
+        return Err(CancelledError.into());
     }
     Ok(())
 }
@@ -1031,6 +1032,7 @@ mod tests {
         // Cancellation (no registry failures) → `cancelled`.
         let e = finish_exit(true).unwrap_err();
         assert_eq!(e.to_string(), "cancelled");
+        assert!(is_cancelled(&e), "a CancelledError, so main exits 130");
 
         // Not cancelled → Ok.
         assert!(finish_exit(false).is_ok());
