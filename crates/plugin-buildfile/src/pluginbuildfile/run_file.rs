@@ -705,9 +705,11 @@ pub(crate) fn render_span(root: &Path, span: Option<&starlark::codemap::FileSpan
 /// of a declaration. Floats compare by bits, so `-0.0` and `0.0` diverge, and an
 /// omitted driver diverges from the explicit default.
 ///
-/// Every struct is destructured and every enum matched without a wildcard, so
-/// a field or variant added to any of them fails to compile here until it is
-/// decided whether it is part of a declaration.
+/// The payload, the sandbox and the approval are destructured without `..`,
+/// so a field added to any of them fails to compile here until it is decided
+/// whether it is part of a declaration. Tools, deps and env compare with their
+/// derived `PartialEq`, which covers a new field on its own; config values with
+/// [`htvalue::Value::same`].
 fn diverging_fields(a: &OnTargetPayload, b: &OnTargetPayload) -> Vec<String> {
     let OnTargetPayload {
         name: _,
@@ -738,7 +740,7 @@ fn diverging_fields(a: &OnTargetPayload, b: &OnTargetPayload) -> Vec<String> {
     keys.dedup();
     for k in keys {
         let same = match (config_a.get(k), config_b.get(k)) {
-            (Some(x), Some(y)) => same_value(x, y),
+            (Some(x), Some(y)) => x.same(y),
             (Some(_), None) | (None, Some(_)) | (None, None) => false,
         };
         if !same {
@@ -758,19 +760,13 @@ fn diverging_fields(a: &OnTargetPayload, b: &OnTargetPayload) -> Vec<String> {
         deps: deps_b,
         env: env_b,
     } = transitive_b.parts();
-    if !(tools_a.len() == tools_b.len()
-        && tools_a.iter().zip(tools_b).all(|(x, y)| same_tool(x, y)))
-    {
+    if tools_a != tools_b {
         out.push("transitive.tools".to_string());
     }
-    if !(deps_a.len() == deps_b.len() && deps_a.iter().zip(deps_b).all(|(x, y)| same_dep(x, y))) {
+    if deps_a != deps_b {
         out.push("transitive.deps".to_string());
     }
-    if !(env_a.len() == env_b.len()
-        && env_a
-            .iter()
-            .all(|(k, x)| env_b.get(k).is_some_and(|y| same_env(x, y))))
-    {
+    if env_a != env_b {
         out.push("transitive.env".to_string());
     }
     let Approval {
@@ -785,108 +781,6 @@ fn diverging_fields(a: &OnTargetPayload, b: &OnTargetPayload) -> Vec<String> {
         out.push("approval".to_string());
     }
     out
-}
-
-fn same_tool(a: &Tool, b: &Tool) -> bool {
-    let Tool {
-        r#ref: ref_a,
-        group: group_a,
-        hash: hash_a,
-        id: id_a,
-    } = a;
-    let Tool {
-        r#ref: ref_b,
-        group: group_b,
-        hash: hash_b,
-        id: id_b,
-    } = b;
-    ref_a == ref_b && group_a == group_b && hash_a == hash_b && id_a == id_b
-}
-
-fn same_dep(a: &Dep, b: &Dep) -> bool {
-    let Dep {
-        r#ref: ref_a,
-        mode: mode_a,
-        group: group_a,
-        runtime: runtime_a,
-        hash: hash_a,
-        id: id_a,
-    } = a;
-    let Dep {
-        r#ref: ref_b,
-        mode: mode_b,
-        group: group_b,
-        runtime: runtime_b,
-        hash: hash_b,
-        id: id_b,
-    } = b;
-    let same_mode = match (mode_a, mode_b) {
-        (Mode::None, Mode::None) | (Mode::Link, Mode::Link) => true,
-        (Mode::None, Mode::Link) | (Mode::Link, Mode::None) => false,
-    };
-    ref_a == ref_b
-        && same_mode
-        && group_a == group_b
-        && runtime_a == runtime_b
-        && hash_a == hash_b
-        && id_a == id_b
-}
-
-fn same_env(a: &Env, b: &Env) -> bool {
-    let Env {
-        value: value_a,
-        hash: hash_a,
-        append: append_a,
-        append_prefix: prefix_a,
-    } = a;
-    let Env {
-        value: value_b,
-        hash: hash_b,
-        append: append_b,
-        append_prefix: prefix_b,
-    } = b;
-    let same_value = match (value_a, value_b) {
-        (EnvValue::Literal(p), EnvValue::Literal(q)) => p == q,
-        (EnvValue::Pass, EnvValue::Pass) => true,
-        (EnvValue::Literal(_), EnvValue::Pass) | (EnvValue::Pass, EnvValue::Literal(_)) => false,
-    };
-    same_value && hash_a == hash_b && append_a == append_b && prefix_a == prefix_b
-}
-
-/// Structural equality of two config values, order-free for maps and with
-/// floats compared by their bits (`PartialEq` on `f64` calls `-0.0` and `0.0`
-/// equal, and a `NaN` unequal to itself).
-fn same_value(a: &htvalue::Value, b: &htvalue::Value) -> bool {
-    use htvalue::Value as V;
-    match (a, b) {
-        (V::Float(x), V::Float(y)) => x.to_bits() == y.to_bits(),
-        (V::Map(x), V::Map(y)) => {
-            x.len() == y.len()
-                && x.iter()
-                    .all(|(k, v)| y.get(k).is_some_and(|w| same_value(v, w)))
-        }
-        (V::List(x), V::List(y)) => {
-            x.len() == y.len() && x.iter().zip(y).all(|(v, w)| same_value(v, w))
-        }
-        (V::String(x), V::String(y)) => x == y,
-        (V::Bool(x), V::Bool(y)) => x == y,
-        (V::Int(x), V::Int(y)) => x == y,
-        (V::Uint(x), V::Uint(y)) => x == y,
-        (V::Null(), V::Null()) => true,
-        // Different variants; listed rather than `_`, so a new variant fails
-        // to compile until it gets its own arm above.
-        (
-            V::Float(_)
-            | V::Map(_)
-            | V::List(_)
-            | V::String(_)
-            | V::Bool(_)
-            | V::Int(_)
-            | V::Uint(_)
-            | V::Null(),
-            _,
-        ) => false,
-    }
 }
 
 /// Parse a BUILD-file `approval` value into an [`Approval`]. Two spellings:

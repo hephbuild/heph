@@ -375,7 +375,7 @@ pub mod sandbox {
         pub env: &'a HashMap<String, Env>,
     }
 
-    #[derive(Default, Clone, Debug, Serialize, Deserialize)]
+    #[derive(Default, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub struct Tool {
         pub r#ref: TargetAddr,
         pub group: String,
@@ -383,7 +383,7 @@ pub mod sandbox {
         pub id: String,
     }
 
-    #[derive(Default, Clone, Debug, Serialize, Deserialize)]
+    #[derive(Default, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub struct Dep {
         pub r#ref: TargetAddr,
         pub mode: Mode,
@@ -393,14 +393,14 @@ pub mod sandbox {
         pub id: String,
     }
 
-    #[derive(Clone, SmartDefault, Debug, Serialize, Deserialize)]
+    #[derive(Clone, SmartDefault, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub enum Mode {
         #[default]
         None,
         Link,
     }
 
-    #[derive(Clone, Debug, Serialize, Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub struct Env {
         pub value: EnvValue,
         pub hash: bool,
@@ -408,7 +408,7 @@ pub mod sandbox {
         pub append_prefix: String,
     }
 
-    #[derive(Clone, Debug, Serialize, Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub enum EnvValue {
         Literal(String),
         Pass,
