@@ -55,10 +55,10 @@ fn addr(a: &str) -> Matcher {
 }
 
 /// What a `heph run --json` printed.
-struct JsonRun {
-    entries: Vec<Value>,
+pub(crate) struct JsonRun {
+    pub(crate) entries: Vec<Value>,
     /// The list got its `]`.
-    closed: bool,
+    pub(crate) closed: bool,
     /// The run's own result, which `finalize` turns into the exit code.
     res: anyhow::Result<()>,
     /// Every event the display saw.
@@ -67,16 +67,16 @@ struct JsonRun {
     /// part of the selection.
     complete: anyhow::Result<()>,
     /// The failure boxes a text run of the same request prints.
-    boxes: String,
+    pub(crate) boxes: String,
 }
 
 impl JsonRun {
     /// How many failure boxes the text run prints.
-    fn box_count(&self) -> usize {
+    pub(crate) fn box_count(&self) -> usize {
         self.boxes.matches("× target failed:").count()
     }
 
-    fn entry(&self, addr: &str) -> &Value {
+    pub(crate) fn entry(&self, addr: &str) -> &Value {
         self.entries
             .iter()
             .find(|e| e["addr"] == addr)
@@ -88,7 +88,7 @@ impl JsonRun {
 /// `heph run <m> <flags>`, as `RunApp` runs it under an output flag. With
 /// `cancel_at`, the request is cancelled (Ctrl-C) once that target starts
 /// executing.
-async fn run_json(
+pub(crate) async fn run_json(
     engine: &Arc<Engine>,
     m: &Matcher,
     flags: &[&str],
@@ -658,6 +658,62 @@ async fn file_culprit_record_shape() {
         assert_eq!(e["more"], 0, "{e}");
         assert!(e["file"].is_null(), "{e}");
         assert!(e["error"].is_null(), "{e}");
+    }
+}
+
+/// D5 under a package matcher: `//q:a` and `//q:b` both depend on `//d:t`,
+/// and `d/BUILD` does not parse. Their defs fail before a result scope
+/// opens, on another culprit. The file's record, then both selected targets
+/// skipped because of it, and the list closed: every requested target is
+/// accounted for. The text run prints one box, the file's. The same
+/// selection by address takes the same path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn package_matcher_broken_dep_file() {
+    let root = tempfile::tempdir().expect("root tempdir");
+    let dep = r#", deps = ["//d:t"]"#;
+    write_pkg(
+        root.path(),
+        "q",
+        &format!("{}\n{}\n", bash("a", dep), bash("b", dep)),
+    );
+    write_pkg(root.path(), "d", "target(name = \"t\"\nbroken(\n");
+    let engine = build_engine_with_remote(root.path(), None);
+
+    for m in [
+        Matcher::Package(PkgBuf::from("q")),
+        Matcher::Or(vec![addr("//q:a"), addr("//q:b")]),
+    ] {
+        let run = run_json(&engine, &m, &["--json"], None).await;
+        let shown: Vec<String> = run.events.iter().map(|e| format!("{:?}", e.kind)).collect();
+        assert!(run.res.is_err(), "{m:?}: the run fails");
+        assert!(
+            run.closed,
+            "{m:?}: every requested target is accounted for: {:?}\nevents: {shown:#?}",
+            run.entries
+        );
+        assert_eq!(run.entries.len(), 3, "{m:?}: {:?}", run.entries);
+        let file = &run.entries[0];
+        assert!(file["addr"].is_null(), "{m:?}: {file}");
+        assert_eq!(file["file"], "d/BUILD", "{m:?}: {file}");
+        assert_eq!(file["root"], "d/BUILD", "{m:?}: {file}");
+        assert_eq!(file["outcome"], "failed", "{m:?}: {file}");
+        assert_eq!(file["selected"], false, "{m:?}: {file}");
+        for t in ["//q:a", "//q:b"] {
+            let e = run.entry(t);
+            assert_eq!(e["outcome"], "skipped", "{m:?}: {e}");
+            assert_eq!(e["selected"], true, "{m:?}: {e}");
+            assert_eq!(e["root"], "d/BUILD", "{m:?}: {e}");
+            assert_eq!(e["path"], serde_json::json!([t, "//d:t"]), "{m:?}: {e}");
+            assert_eq!(e["more"], 0, "{m:?}: {e}");
+            assert!(e["error"].is_null(), "{m:?}: {e}");
+        }
+        assert!(run.complete.is_ok(), "{m:?}: {:?}", run.complete);
+        assert_eq!(
+            run.box_count(),
+            1,
+            "{m:?}: one box, the file's: {}",
+            run.boxes
+        );
     }
 }
 

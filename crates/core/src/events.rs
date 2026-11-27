@@ -360,10 +360,17 @@ pub enum BuildEventKind {
         /// targets reporting the same underlying failure.
         #[serde(default)]
         upstream_of: Option<String>,
-        /// Set with `upstream_of` when the root is a BUILD/`.bzl` file that
-        /// did not evaluate: the workspace-relative file, while `upstream_of`
-        /// stays the address that led into it. A path never goes in an
-        /// address field. `None` from a host that predates it.
+        /// The workspace-relative BUILD/`.bzl` file that did not evaluate,
+        /// when it is why this target failed. A path never goes in an
+        /// address field. Two shapes carry it:
+        /// - beside `upstream_of`, which stays the address that led into the
+        ///   file: a target the file took down;
+        /// - on a `duplicate` end with no `upstream_of`: a target in that
+        ///   file, whose `FileFailed` was announced through another address
+        ///   (or through this one). The target was skipped because of its
+        ///   own file; it is neither a root nor a second box.
+        ///
+        /// `None` from a host that predates it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         upstream_file: Option<String>,
         /// On a culprit's own failure: the shortest path from a requested
@@ -802,7 +809,9 @@ pub enum BuildEventKind {
     /// file has no target scope, so it rides this kind rather than a
     /// `ResultEnd` (a path never goes in an address field, where
     /// `package_of` would misread it). Targets it took down end with
-    /// `upstream_of` = `entry` and `upstream_file` = `file`. An older
+    /// `upstream_of` = `entry` and `upstream_file` = `file`; a target in the
+    /// file itself ends `duplicate` with `upstream_file` = `file` and no
+    /// `upstream_of`. An older
     /// consumer reads it as [`BuildEventKind::Unknown`].
     FileFailed {
         /// The workspace-relative file.
@@ -2058,6 +2067,45 @@ mod tests {
                         abandoned: true
                     })
                 );
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// A duplicate end naming its own broken file, with no `upstream_of`,
+    /// keeps that shape across the wire (a session records and replays it):
+    /// the file is not paired with an address on the way back.
+    #[test]
+    fn duplicate_end_with_file_round_trips() {
+        let ev = BuildEvent {
+            at_unix_ms: 7,
+            kind: BuildEventKind::ResultEnd {
+                left_behind: None,
+                duplicate: true,
+                addr: "//d:t2".into(),
+                error: Some("evaluating d/BUILD: boom".into()),
+                upstream_of: None,
+                upstream_file: Some("d/BUILD".into()),
+                path: Vec::new(),
+                exit_status: None,
+                exit_code: None,
+                log_tail: None,
+                timed_out: None,
+                cancelled: false,
+            },
+        };
+        let json = serde_json::to_string(&ev).expect("encode");
+        let back: BuildEvent = serde_json::from_str(&json).expect("decode");
+        match back.kind {
+            BuildEventKind::ResultEnd {
+                duplicate,
+                upstream_of,
+                upstream_file,
+                ..
+            } => {
+                assert!(duplicate, "{json}");
+                assert_eq!(upstream_of, None, "{json}");
+                assert_eq!(upstream_file.as_deref(), Some("d/BUILD"), "{json}");
             }
             other => panic!("wrong variant: {other:?}"),
         }

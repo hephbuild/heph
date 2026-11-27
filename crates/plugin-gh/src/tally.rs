@@ -1132,11 +1132,20 @@ mod tests {
     /// A broken BUILD file is one root however many requested targets live in
     /// it: its `FileFailed` is the root, keyed by the address that led into
     /// it, the targets it took down count against that root, and a
-    /// non-announcing end closes its row without a second root.
+    /// non-announcing end closes its row without a second root. That end
+    /// carries the file in `upstream_file` with no `upstream_of`, as the
+    /// engine sends it, and the entry's own duplicate end (its `FileFailed`
+    /// first) counts nothing either.
     #[test]
     fn tally_counts_file_culprit_once() {
         let mut t = Tally::default();
         matched(&mut t, &["//d:t1", "//d:t2", "//a:x"], true);
+        t.apply(&ev(
+            9,
+            BuildEventKind::ResultStart {
+                addr: "//d:t1".into(),
+            },
+        ));
         t.apply(&ev(
             10,
             BuildEventKind::FileFailed {
@@ -1149,7 +1158,7 @@ mod tests {
         let end =
             |addr: &str, upstream_of: Option<&str>, duplicate: bool| BuildEventKind::ResultEnd {
                 duplicate,
-                upstream_file: upstream_of.map(|_| "d/BUILD".into()),
+                upstream_file: Some("d/BUILD".into()),
                 path: Vec::new(),
                 left_behind: None,
                 cancelled: false,
@@ -1161,6 +1170,7 @@ mod tests {
                 exit_code: None,
                 log_tail: None,
             };
+        t.apply(&ev(10, end("//d:t1", None, true)));
         t.apply(&ev(
             11,
             BuildEventKind::ResultStart {
@@ -1187,7 +1197,11 @@ mod tests {
         assert!(root.message.contains("d/BUILD"), "{}", root.message);
         assert_eq!(root.blocked, 1);
         let (done, total, _) = t.progress();
-        assert_eq!((done, total), (2, 3), "the duplicate end closed //d:t2");
+        assert_eq!(
+            (done, total),
+            (3, 3),
+            "the duplicate ends closed //d:t1 and //d:t2"
+        );
 
         // Every surface names the file as what failed: the comment's
         // headings, the annotation's title, and the JSON beside the address.

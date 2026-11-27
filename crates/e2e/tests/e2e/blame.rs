@@ -6,8 +6,10 @@
 //! Each test reads the request's failure registry (`take_failures`), which
 //! holds one record per culprit, its events, and the request-end pass over
 //! its skipped targets (D1.e: each one's `root`, `path` and `more`, from the
-//! request's `DepDag`). How a renderer prints them (`reached by:`, JSON) is
-//! a later stage's; these pin the blame and the graph answers.
+//! request's `DepDag`). These pin the blame and the graph answers; a few
+//! also read what the renderers make of them (the `run --json` records and
+//! the text boxes), through `run_json`'s harness, whose own tests own the
+//! record's shape.
 //! The pure classification rules are unit tests next to `failure_fate` in
 //! `crates/engine/src/engine/result.rs`.
 #![expect(
@@ -360,7 +362,7 @@ fn assert_not_blamed(r: &Run, not: &[&str]) {
 
 /// EVAL-16: `//a:t → //b:t → //c:t → //d:t`, `d/BUILD` a parse error. The
 /// file is the culprit, entered through `//d:t`; no target is.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn deep_broken_build_blames_the_file() -> anyhow::Result<()> {
     let ws = build_ws(&[
         ("a", &t("t", r#"deps = ["//b:t"]"#)),
@@ -404,7 +406,41 @@ async fn deep_broken_build_blames_the_file() -> anyhow::Result<()> {
         assert_eq!(s, ("//d:t", Some("d/BUILD"), 0));
     }
     assert_eq!(r.skipped("//a:t").0, "d/BUILD");
-    // stage C: `addr: null`, `reached by:`.
+
+    // What the renderers make of it: the file's JSON record has no address
+    // and names the file, with the whole path; `//a:t` is skipped because
+    // of it; the text run prints one box, the file's, reached through the
+    // chain.
+    let json =
+        crate::run_json::run_json(&ws.engine, &Matcher::Addr(addr("//a:t")), &["--json"], None)
+            .await;
+    assert!(json.closed, "{:?}", json.entries);
+    assert_eq!(json.entries.len(), 2, "{:?}", json.entries);
+    let file = &json.entries[0];
+    assert!(
+        file["addr"].is_null(),
+        "a path never goes in `addr`: {file}"
+    );
+    assert_eq!(file["file"], "d/BUILD", "{file}");
+    assert_eq!(file["outcome"], "failed", "{file}");
+    assert_eq!(file["root"], "d/BUILD", "{file}");
+    assert_eq!(file["selected"], false, "{file}");
+    assert_eq!(
+        file["path"],
+        serde_json::json!(["//a:t", "//b:t", "//c:t", "//d:t"]),
+        "{file}"
+    );
+    let top = json.entry("//a:t");
+    assert_eq!(top["outcome"], "skipped", "{top}");
+    assert_eq!(top["root"], "d/BUILD", "{top}");
+    assert_eq!(top["path"], file["path"], "{top}");
+    assert_eq!(json.box_count(), 1, "{}", json.boxes);
+    assert!(json.boxes.contains("d/BUILD"), "{}", json.boxes);
+    assert!(
+        json.boxes.contains("reached by: //a:t → //b:t → //c:t"),
+        "{}",
+        json.boxes
+    );
     Ok(())
 }
 
@@ -924,7 +960,7 @@ async fn cancel_during_deps_is_cancelled_not_self_blamed() -> anyhow::Result<()>
 
 /// RUN-03: two independent leaves fail; both are recorded, the target
 /// depending on both is not.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_failed_leaves_both_reported() -> anyhow::Result<()> {
     let ws = build_ws(&[(
         "a",
@@ -943,7 +979,32 @@ target(name = "par", driver = "bash", run = "echo ok > $OUT", out = "o.txt", dep
         r.skipped("//a:par"),
         ("//a:l1".into(), vec!["//a:par".into(), "//a:l1".into()], 1)
     );
-    // stage C: JSON `error` is one line.
+
+    // Each culprit's JSON `error` is one non-empty line; the skipped target
+    // has none, and counts the other culprit in `more`.
+    let json = crate::run_json::run_json(
+        &ws.engine,
+        &Matcher::Addr(addr("//a:par")),
+        &["--json"],
+        None,
+    )
+    .await;
+    assert!(json.closed, "{:?}", json.entries);
+    for leaf in ["//a:l1", "//a:l2"] {
+        let e = json.entry(leaf);
+        assert_eq!(e["outcome"], "failed", "{e}");
+        assert!(
+            e["error"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty() && !s.contains('\n')),
+            "one line: {e}"
+        );
+    }
+    let par = json.entry("//a:par");
+    assert_eq!(par["outcome"], "skipped", "{par}");
+    assert!(par["error"].is_null(), "{par}");
+    assert_eq!(par["root"], "//a:l1", "{par}");
+    assert_eq!(par["more"], 1, "{par}");
     Ok(())
 }
 
