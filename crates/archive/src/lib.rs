@@ -19,7 +19,7 @@ mod unpack;
 mod write;
 
 #[cfg(feature = "codec")]
-pub use unpack::{UnpackOptions, gz_holds_tar, unpack};
+pub use unpack::{Executable, Globs, UnpackOptions, gz_holds_tar, unpack};
 #[cfg(feature = "codec")]
 pub use write::{GZIP_LEVEL, Member, WriteOptions, ZIP_DEFLATE_LEVEL, ZSTD_LEVEL, write};
 
@@ -28,7 +28,14 @@ use anyhow::Context as _;
 /// How much one archive may unpack to. Exceeding either fails the run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Limits {
-    /// Total bytes written for files (hard-link copies included).
+    /// Total bytes decoded for the archive's entries, whether written or
+    /// read past: files written (hard-link copies included), and in a tar
+    /// the data of entries `include` or `strip_components` left out, which
+    /// are decoded to reach the next entry (and, in a `tar.xz`, what the
+    /// stream holds after tar's end marker). A zip entry left out is never
+    /// read and is not counted. This bounds the decoding, not only the disk:
+    /// an excluded entry of terabytes of zeros fails instead of decoding
+    /// forever.
     pub max_bytes: u64,
     /// Entries read from the archive, whatever their kind.
     pub max_entries: u64,
@@ -67,8 +74,8 @@ pub enum Format {
     Zip,
     /// One gzip-compressed file, not a tar (`tool-linux.gz`): it unpacks to
     /// one file, named after the archive with its `.gz` removed, as `gzip -d`
-    /// names it. gzip records no mode, so the file is `0o644` unless the
-    /// caller asks for `0o755`.
+    /// names it. gzip records no mode, so the file is `0o644` unless
+    /// `executable` makes it `0o755`.
     #[serde(rename = "gz")]
     Gz,
 }
@@ -93,13 +100,6 @@ impl Format {
     /// Whether [`write`] writes this format.
     pub fn is_writable(self) -> bool {
         Self::WRITABLE.contains(&self)
-    }
-
-    /// Whether an `executable` option means something for this format: only
-    /// a bare `gz`, whose one file has no recorded mode. An archive format's
-    /// entries carry their own modes.
-    pub fn takes_executable(self) -> bool {
-        matches!(self, Self::Gz)
     }
 
     /// The spelling a BUILD file uses.

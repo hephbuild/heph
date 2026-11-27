@@ -33,9 +33,11 @@
 //!   archivers routinely emit those. A zip whose central directory names one
 //!   path twice is refused outright (the zip crate keys entries by name, so it
 //!   would otherwise yield only the last).
-//! - **The output is bounded.** At most [`Limits::max_bytes`] bytes written
-//!   and [`Limits::max_entries`] entries, counted while copying, so a
-//!   decompression bomb fails instead of filling the disk.
+//! - **The output and the decoding are bounded.** At most
+//!   [`Limits::max_bytes`] bytes decoded for the archive's entries, whether
+//!   written or read past, and [`Limits::max_entries`] entries, counted while
+//!   copying, so a decompression bomb fails instead of filling the disk or
+//!   decoding forever.
 //! - **A decoder's memory is bounded.** An xz stream whose dictionary and
 //!   decoder overhead need more than [`XZ_MEM_LIMIT_KIB`] is refused before
 //!   it is allocated.
@@ -60,8 +62,33 @@
 //! the link). An archive from which nothing remains is an error, not an empty
 //! output.
 //!
+//! `include` ([`UnpackOptions::include`]) picks entries by path: each pattern
+//! is a glob in `group`'s `include` syntax ([`Globs`]), matched against the
+//! entry's path below `dest` (after `strip_components`, `/`-separated:
+//! `./bin/tool` and `bin/./tool` are both `bin/tool`). Set, only the files,
+//! symlinks and hard links whose own path matches are extracted; directory
+//! entries are skipped, and the parents an extracted entry needs are
+//! created. An entry left out is still checked by the rules above and counts
+//! towards [`Limits::max_entries`]. In a tar its bytes are decoded to reach
+//! the next entry, and count towards [`Limits::max_bytes`] as written ones
+//! do; a zip entry left out is never read, and costs nothing. A hard link
+//! whose target is left out is an error; so is a symlink that does not
+//! resolve to an extracted path (its target, or a link on the way, was left
+//! out, or the archive never held it), and a pattern that matches nothing (a
+//! typo guard: the error lists the first entry paths it was matched
+//! against).
+//!
+//! `executable` ([`UnpackOptions::executable`]) only ever adds the bit: every
+//! extracted regular file, hard-link copies included ([`Executable::All`]),
+//! or those whose path matches ([`Executable::Matching`], each pattern of
+//! which must match one), is `0o755`; every other file keeps its normalized
+//! mode. A hard-link copy is its target's file in the archive, so it takes
+//! the mode its target was written with, a raised bit included, and `0o755`
+//! when its own path matches. Symlinks are untouched.
+//!
 //! A bare `gz` is one entry: a file named after the archive (see
-//! [`gz_file_name`]), held to the same rules as a tar's file entry.
+//! [`gz_file_name`]), held to the same rules as a tar's file entry, `include`
+//! and `executable` included.
 
 use crate::{DIR_MODE, Format, Limits, file_mode};
 use anyhow::{Context as _, bail};
@@ -90,17 +117,128 @@ const MAX_LINK_TARGET: usize = 1023;
 /// bump (`crates/plugin-archive/src/extract.rs`).
 const XZ_MEM_LIMIT_KIB: u32 = 256 << 10;
 
+/// Glob patterns over an archive's entry paths, in the syntax of `group`'s
+/// `include` (wax: `*` within a component, `**` across them, `{a,b}`,
+/// `[…]`), each matched against an entry's path below the output, after
+/// `strip_components`, `/`-separated (`bin/tool`). No pattern is empty or
+/// holds a NUL; the list may be empty.
+///
+/// Matching is wax's, on the path's bytes: case-sensitive, `*` matches a
+/// leading `.` (dotfiles), `**/x` matches a top-level `x` too, and a name
+/// is compared as written, so an NFD name (a zip made on macOS) needs an NFD
+/// pattern, or a `*`. The `matching_is_pinned` test holds those answers.
+///
+/// `archive.extract` keys a target by its pattern strings, not by what they
+/// match: a wax upgrade or a matcher change here that changes what a pattern
+/// matches bumps its `GLOB_VERSION` (`crates/plugin-archive/src/extract.rs`).
+#[derive(Clone, Debug, Default)]
+pub struct Globs(Vec<(String, wax::Glob<'static>)>);
+
+impl Globs {
+    /// Compile `patterns`, refusing an empty one, a NUL, one that could
+    /// never match an entry path (see [`never_matches`]), and anything wax
+    /// does not compile, naming the pattern.
+    pub fn new(patterns: &[String]) -> anyhow::Result<Self> {
+        patterns
+            .iter()
+            .map(|p| {
+                if p.is_empty() {
+                    bail!("an empty pattern matches no path");
+                }
+                if p.contains('\0') {
+                    bail!("pattern {p:?} must not contain a NUL byte");
+                }
+                never_matches(p)?;
+                let glob = wax::Glob::new(p)
+                    .map(wax::Glob::into_owned)
+                    .with_context(|| format!("invalid glob pattern {p:?}"))?;
+                Ok((p.clone(), glob))
+            })
+            .collect::<anyhow::Result<_>>()
+            .map(Self)
+    }
+
+    /// Whether there are no patterns.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// Refuse a pattern no entry path can match: an entry's path below the
+/// output is relative, has no `.`, `..` or empty component, and names a file
+/// or a link, never a directory with a trailing `/`. The check is on the
+/// pattern's text, component by component.
+fn never_matches(p: &str) -> anyhow::Result<()> {
+    if let Some(rest) = p.strip_prefix('/') {
+        bail!(
+            "{p:?} matches no path: entry paths are relative to the output; write {:?}",
+            rest.trim_start_matches('/')
+        );
+    }
+    if let Some(rest) = p.strip_prefix("./") {
+        bail!("{p:?} matches no path: entry paths have no leading `./`; write {rest:?}");
+    }
+    if p.ends_with('/') {
+        bail!(
+            "{p:?} matches no file; to take a directory's files write {:?}",
+            format!("{}/**", p.trim_end_matches('/'))
+        );
+    }
+    for c in p.split('/') {
+        match c {
+            "" => bail!(
+                "{p:?} matches no path: it has an empty component; write {:?}",
+                p.split('/')
+                    .filter(|c| !c.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("/")
+            ),
+            "." => bail!(
+                "{p:?} matches no path: entry paths have no `.` component; write {:?}",
+                p.split('/')
+                    .filter(|c| *c != ".")
+                    .collect::<Vec<_>>()
+                    .join("/")
+            ),
+            ".." => bail!(
+                "{p:?} matches no path: entry paths have no `..` component, they never \
+                 leave the output"
+            ),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Which extracted regular files [`unpack`] makes executable. The bit is
+/// only ever added: a file that is `0o755` in the archive stays so.
+#[derive(Clone, Debug, Default)]
+pub enum Executable {
+    /// The archive's normalized modes (`0o755` when any execute bit is set,
+    /// else `0o644`; a bare `gz`'s file, which records none, `0o644`).
+    #[default]
+    Archive,
+    /// Every extracted regular file, hard-link copies included, is `0o755`:
+    /// a zip built on Windows records no Unix mode.
+    All,
+    /// A regular file whose path matches one of the patterns is `0o755`.
+    /// Each pattern must match one, or the run fails naming it.
+    Matching(Globs),
+}
+
 /// How [`unpack`] lays the archive out, besides the archive and the
 /// destination.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default)]
 pub struct UnpackOptions {
     /// Leading path components dropped from every entry, as `tar
     /// --strip-components` (see the module docs).
     pub strip_components: u32,
-    /// The mode of a [`Format::Gz`]'s one file, which gzip does not record:
-    /// `0o755` when set, else `0o644`. Only a format that
-    /// [`Format::takes_executable`] accepts it; with any other it is refused.
-    pub executable: bool,
+    /// Only the files, symlinks and hard links whose path matches one of
+    /// these are extracted, and directory entries are skipped; each pattern
+    /// must match one (see the module docs). Empty: every entry.
+    pub include: Globs,
+    /// Which regular files are made executable.
+    pub executable: Executable,
     /// How much the archive may unpack to.
     pub limits: Limits,
 }
@@ -118,15 +256,10 @@ pub fn unpack(
 ) -> anyhow::Result<usize> {
     let UnpackOptions {
         strip_components,
+        include,
         executable,
         limits,
     } = opts;
-    if executable && !format.takes_executable() {
-        bail!(
-            "`executable` applies only to a bare `gz`; a {} records each entry's mode",
-            format.as_str()
-        );
-    }
     // Before `dest` exists, so a name it cannot take leaves nothing behind.
     // Only a `gz` reads it.
     let gz_name = match format {
@@ -142,7 +275,14 @@ pub fn unpack(
     let file =
         std::fs::File::open(archive).with_context(|| format!("open {}", archive.display()))?;
     let mut reader = std::io::BufReader::new(file);
-    let mut tree = Tree::new(dest, strip_components, limits, cancelled);
+    let mut tree = Tree::new(
+        dest,
+        strip_components,
+        include,
+        executable,
+        limits,
+        cancelled,
+    );
     match format {
         Format::Tar => unpack_tar(StopRead::new(&mut reader, cancelled), &mut tree)?,
         // Multi-member: a gzip stream may be several members back to back
@@ -156,7 +296,7 @@ pub fn unpack(
         Format::TarXz => {
             let mut xz = lzma_rust2::XzReader::new_mem_limit(reader, true, XZ_MEM_LIMIT_KIB);
             unpack_tar(StopRead::new(&mut xz, cancelled), &mut tree)
-                .and_then(|()| drain(&mut xz, &tree))
+                .and_then(|()| drain(&mut xz, &mut tree))
                 .map_err(xz_context)?;
         }
         Format::Gz => {
@@ -164,9 +304,9 @@ pub fn unpack(
             // verified, and anything after the last member is an error.
             let mut gz = flate2::read::MultiGzDecoder::new(reader);
             tree.entry()?;
-            let mode = if executable { 0o755 } else { 0o644 };
-            // `Tree::file` reads through `StopRead` itself.
-            tree.file(&gz_name, &mut gz, mode)
+            // gzip records no mode; `executable` may raise it. `Tree::file`
+            // reads through `StopRead` itself.
+            tree.file(&gz_name, &mut gz, 0o644)
                 .with_context(|| format!("gz file {gz_name:?}"))?;
         }
         // Read only to tar's end marker: the frame checksum is not verified.
@@ -185,17 +325,8 @@ pub fn unpack(
 /// would extract a corrupted payload without an error. What it decodes to
 /// counts against [`Limits::max_bytes`], so trailing padding cannot be a
 /// bomb.
-fn drain(xz: &mut dyn Read, tree: &Tree<'_>) -> anyhow::Result<()> {
-    let left = tree.bytes_left();
-    let n = std::io::copy(
-        &mut StopRead::new(xz, tree.cancelled).take(left.saturating_add(1)),
-        &mut std::io::sink(),
-    )
-    .context("read the xz stream to its end")?;
-    if n > left {
-        return Err(tree.too_many_bytes());
-    }
-    Ok(())
+fn drain(xz: &mut dyn Read, tree: &mut Tree<'_>) -> anyhow::Result<()> {
+    tree.skip(xz).context("read the xz stream to its end")
 }
 
 /// Name the memory cap on the error lzma-rust2 gives for a dictionary over
@@ -297,7 +428,12 @@ fn unpack_tar(reader: impl Read, tree: &mut Tree<'_>) -> anyhow::Result<()> {
                 Err(anyhow::anyhow!("device and fifo entries are refused"))
             }
             other => Err(anyhow::anyhow!("unsupported tar entry type {other:?}")),
-        };
+        }
+        // Whatever the entry left unread (all of a file left out or
+        // stripped, a directory's or a link's stray data) is decoded by tar
+        // to reach the next header; read it here instead, so it is counted
+        // against `max_bytes`.
+        .and_then(|()| tree.skip(&mut entry).context("read past the entry"));
         result.with_context(|| format!("tar entry {path:?}"))?;
     }
     Ok(())
@@ -407,20 +543,85 @@ struct Tree<'a> {
     written: usize,
     /// Archive entries seen, against [`Limits::max_entries`].
     entries: u64,
-    /// File bytes written, against [`Limits::max_bytes`].
+    /// Entry bytes decoded, written or read past, against
+    /// [`Limits::max_bytes`].
     bytes: u64,
     /// Every symlink written, checked once the tree is complete.
     links: Vec<Vec<String>>,
     /// The first [`STRIPPED_SHOWN`] entry paths `strip_components` removed
     /// whole, so an archive it empties says what it held.
     stripped: Vec<String>,
+    /// `include`'s patterns; `None` when every entry is extracted.
+    include: Option<Selector>,
+    /// The first [`STRIPPED_SHOWN`] paths `include` was matched against,
+    /// and how many there were, so a pattern that matches none says what it
+    /// could have matched.
+    candidates: Vec<String>,
+    candidate_count: u64,
+    exec: Exec,
 }
 
-/// How many stripped entry paths the "nothing to extract" error lists.
+/// How many entry paths an error lists.
 const STRIPPED_SHOWN: usize = 5;
 
+/// A pattern list being matched, remembering which patterns matched a path.
+struct Selector {
+    globs: Globs,
+    hit: Vec<bool>,
+}
+
+impl Selector {
+    fn new(globs: Globs) -> Self {
+        let hit = vec![false; globs.0.len()];
+        Self { globs, hit }
+    }
+
+    /// Whether `path` matches a pattern, marking every pattern that does.
+    fn select(&mut self, path: &str) -> bool {
+        use wax::Program as _;
+        let mut any = false;
+        for ((_, glob), hit) in self.globs.0.iter().zip(&mut self.hit) {
+            if glob.is_match(path) {
+                *hit = true;
+                any = true;
+            }
+        }
+        any
+    }
+
+    /// Whether `path` matches a pattern, marking none.
+    fn matches(&self, path: &str) -> bool {
+        use wax::Program as _;
+        self.globs.0.iter().any(|(_, glob)| glob.is_match(path))
+    }
+
+    /// The first pattern that matched no path.
+    fn unmatched(&self) -> Option<&str> {
+        self.globs
+            .0
+            .iter()
+            .zip(&self.hit)
+            .find(|(_, hit)| !**hit)
+            .map(|((p, _), _)| p.as_str())
+    }
+}
+
+/// [`Executable`], with its patterns being matched.
+enum Exec {
+    Archive,
+    All,
+    Matching(Selector),
+}
+
 impl<'a> Tree<'a> {
-    fn new(root: &Path, strip: u32, limits: Limits, cancelled: &'a dyn Fn() -> bool) -> Self {
+    fn new(
+        root: &Path,
+        strip: u32,
+        include: Globs,
+        executable: Executable,
+        limits: Limits,
+        cancelled: &'a dyn Fn() -> bool,
+    ) -> Self {
         Self {
             root: root.to_path_buf(),
             strip: strip as usize,
@@ -431,6 +632,48 @@ impl<'a> Tree<'a> {
             bytes: 0,
             links: Vec::new(),
             stripped: Vec::new(),
+            include: (!include.is_empty()).then(|| Selector::new(include)),
+            candidates: Vec::new(),
+            candidate_count: 0,
+            exec: match executable {
+                Executable::Archive => Exec::Archive,
+                Executable::All => Exec::All,
+                // No pattern: nothing to match, the archive's modes.
+                Executable::Matching(g) if g.is_empty() => Exec::Archive,
+                Executable::Matching(g) => Exec::Matching(Selector::new(g)),
+            },
+        }
+    }
+
+    /// Whether the file, symlink or hard link at `comps` is extracted:
+    /// always without `include`, else when its path matches a pattern.
+    fn included(&mut self, comps: &[String]) -> bool {
+        let Some(sel) = &mut self.include else {
+            return true;
+        };
+        let path = comps.join("/");
+        let selected = sel.select(&path);
+        self.candidate_count += 1;
+        if self.candidates.len() < STRIPPED_SHOWN {
+            self.candidates.push(path);
+        }
+        selected
+    }
+
+    /// The mode of the regular file at `comps`, whose normalized mode in the
+    /// archive is `archived`: raised to `0o755` by `executable`, never
+    /// lowered.
+    fn file_mode_of(&mut self, comps: &[String], archived: u32) -> u32 {
+        match &mut self.exec {
+            Exec::Archive => archived,
+            Exec::All => 0o755,
+            Exec::Matching(sel) => {
+                if sel.select(&comps.join("/")) {
+                    0o755
+                } else {
+                    archived
+                }
+            }
         }
     }
 
@@ -457,6 +700,24 @@ impl<'a> Tree<'a> {
                 self.limits.max_entries
             );
         }
+        Ok(())
+    }
+
+    /// Decode what is left of `data` into nothing, counting it against
+    /// [`Limits::max_bytes`] and polling cancellation on every read: a tar
+    /// entry left out, or removed whole by `strip_components`, is decoded to
+    /// reach the next one, and without the bound an excluded entry of
+    /// terabytes of zeros would decode forever.
+    fn skip(&mut self, data: &mut dyn Read) -> anyhow::Result<()> {
+        let left = self.bytes_left();
+        let n = std::io::copy(
+            &mut StopRead::new(data, self.cancelled).take(left.saturating_add(1)),
+            &mut std::io::sink(),
+        )?;
+        if n > left {
+            return Err(self.too_many_bytes());
+        }
+        self.bytes += n;
         Ok(())
     }
 
@@ -531,6 +792,10 @@ impl<'a> Tree<'a> {
         let Some(comps) = self.entry_components(raw)? else {
             return Ok(());
         };
+        // With `include`, only what an extracted entry needs is created.
+        if self.include.is_some() {
+            return Ok(());
+        }
         self.parents(&comps)?;
         let path = self.path_of(&comps);
         match std::fs::symlink_metadata(&path) {
@@ -551,6 +816,11 @@ impl<'a> Tree<'a> {
         let Some(comps) = self.entry_components(raw)? else {
             return Ok(());
         };
+        // Left out: not written. A tar's bytes are read past and counted by
+        // `unpack_tar`; a zip's are never read.
+        if !self.included(&comps) {
+            return Ok(());
+        }
         self.parents(&comps)?;
         let path = self.path_of(&comps);
         // `create_new` is O_EXCL: it refuses an existing path, a symlink
@@ -574,7 +844,8 @@ impl<'a> Tree<'a> {
         }
         self.bytes += n;
         drop(out);
-        set_mode(&path, file_mode(mode))?;
+        let mode = self.file_mode_of(&comps, file_mode(mode));
+        set_mode(&path, mode)?;
         self.written += 1;
         Ok(())
     }
@@ -583,6 +854,9 @@ impl<'a> Tree<'a> {
         let Some(comps) = self.entry_components(raw)? else {
             return Ok(());
         };
+        if !self.included(&comps) {
+            return Ok(());
+        }
         if target.is_empty() {
             bail!("symlink with an empty target");
         }
@@ -626,12 +900,26 @@ impl<'a> Tree<'a> {
         let Some(comps) = self.entry_components(raw)? else {
             return Ok(());
         };
+        if !self.included(&comps) {
+            return Ok(());
+        }
         let target_comps = self
             .components(target)
             .with_context(|| format!("hard link target {target:?}"))?
             .with_context(|| {
                 format!("hard link target {target:?} is removed by strip_components")
             })?;
+        let target_path = target_comps.join("/");
+        if self
+            .include
+            .as_ref()
+            .is_some_and(|sel| !sel.matches(&target_path))
+        {
+            bail!(
+                "hard link target {target_path:?} is not included: `include` matches the link \
+                 but not the file it is a copy of; include that too"
+            );
+        }
         // The target is reached without following any link, and must be a
         // file this archive already wrote.
         let mut path = self.root.clone();
@@ -662,11 +950,33 @@ impl<'a> Tree<'a> {
         let n = std::fs::copy(&path, &dest)
             .with_context(|| format!("copy {} to {}", path.display(), dest.display()))?;
         self.bytes += n;
+        // The link is its target's file in the archive, so it takes the mode
+        // the target was written with, a bit a pattern raised included.
+        let archived = {
+            use std::os::unix::fs::PermissionsExt as _;
+            file_mode(meta.permissions().mode())
+        };
+        let mode = self.file_mode_of(&comps, archived);
+        set_mode(&dest, mode)?;
         self.written += 1;
         Ok(())
     }
 
     fn finish(self) -> anyhow::Result<usize> {
+        // First: a typo in a pattern is likelier than an empty archive, and
+        // this error says what the pattern was matched against.
+        if let Some(p) = self.include.as_ref().and_then(Selector::unmatched) {
+            bail!(
+                "`include` pattern {p:?} matches no file or link in the archive; the paths it \
+                 was matched against (below the output, after strip_components) begin {:?}{}",
+                self.candidates,
+                if self.candidate_count > self.candidates.len() as u64 {
+                    " and more"
+                } else {
+                    ""
+                }
+            );
+        }
         if self.written == 0 {
             if self.stripped.is_empty() {
                 bail!("nothing to extract: the archive is empty");
@@ -683,11 +993,19 @@ impl<'a> Tree<'a> {
                 }
             );
         }
+        if let Exec::Matching(sel) = &self.exec
+            && let Some(p) = sel.unmatched()
+        {
+            bail!("`executable` pattern {p:?} matches no extracted regular file");
+        }
+        // Under `include` a link must resolve: a dangling one is likelier a
+        // target the patterns left out than one the archive meant.
+        let must_resolve = self.include.is_some();
         for link in &self.links {
             if (self.cancelled)() {
                 bail!("cancelled");
             }
-            stays_inside(&self.root, link)
+            stays_inside(&self.root, link, must_resolve)
                 .with_context(|| format!("symlink {:?}", link.join("/")))?;
         }
         Ok(self.written)
@@ -698,8 +1016,8 @@ impl<'a> Tree<'a> {
 /// would — component by component, following every link met on the way — and
 /// fail if the walk ever climbs above `root`. A component that does not exist
 /// ends the physical walk: nothing below it can be a link, so the rest is
-/// lexical.
-fn stays_inside(root: &Path, link: &[String]) -> anyhow::Result<()> {
+/// lexical — unless `must_resolve`, when it is an error (the link dangles).
+fn stays_inside(root: &Path, link: &[String], must_resolve: bool) -> anyhow::Result<()> {
     let split = |t: &Path| -> anyhow::Result<VecDeque<String>> {
         let t = t
             .to_str()
@@ -716,7 +1034,8 @@ fn stays_inside(root: &Path, link: &[String]) -> anyhow::Result<()> {
     };
 
     let mut cur: Vec<String> = link.to_vec();
-    let mut pending = split(&read(&cur)?)?;
+    let target = read(&cur)?;
+    let mut pending = split(&target)?;
     cur.pop();
     let mut hops = 1;
     while let Some(c) = pending.pop_front() {
@@ -731,8 +1050,14 @@ fn stays_inside(root: &Path, link: &[String]) -> anyhow::Result<()> {
                 cur.push(c);
                 let mut p = root.to_path_buf();
                 p.extend(&cur);
-                let is_link =
-                    std::fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_symlink());
+                let meta = std::fs::symlink_metadata(&p);
+                if must_resolve && meta.is_err() {
+                    bail!(
+                        "points at {target:?}, which `include` left out (or the archive does \
+                         not hold); include it too"
+                    );
+                }
+                let is_link = meta.is_ok_and(|m| m.file_type().is_symlink());
                 if is_link {
                     hops += 1;
                     if hops > MAX_LINK_HOPS {
@@ -842,17 +1167,45 @@ mod tests {
         strip: u32,
         executable: bool,
     ) -> (tempfile::TempDir, anyhow::Result<usize>) {
+        let opts = UnpackOptions {
+            strip_components: strip,
+            executable: if executable {
+                Executable::All
+            } else {
+                Executable::Archive
+            },
+            ..UnpackOptions::default()
+        };
+        run_opts(name, bytes, format, opts)
+    }
+
+    /// Unpack `bytes`, written to a file called `name`, into `out/` with
+    /// `opts`.
+    fn run_opts(
+        name: &str,
+        bytes: &[u8],
+        format: Format,
+        opts: UnpackOptions,
+    ) -> (tempfile::TempDir, anyhow::Result<usize>) {
         let dir = tempfile::tempdir().unwrap();
         let archive = dir.path().join(name);
         std::fs::write(&archive, bytes).unwrap();
         let out = dir.path().join("out");
-        let opts = UnpackOptions {
-            strip_components: strip,
-            executable,
-            ..UnpackOptions::default()
-        };
         let r = unpack(&archive, format, opts, &out, &never);
         (dir, r)
+    }
+
+    fn globs(patterns: &[&str]) -> Globs {
+        let owned: Vec<String> = patterns.iter().map(|p| (*p).to_string()).collect();
+        Globs::new(&owned).unwrap()
+    }
+
+    /// `include` = `patterns`, and nothing else set.
+    fn including(patterns: &[&str]) -> UnpackOptions {
+        UnpackOptions {
+            include: globs(patterns),
+            ..UnpackOptions::default()
+        }
     }
 
     /// The files under `out/`, sorted, workspace-style (`a/b`).
@@ -1177,14 +1530,618 @@ mod tests {
         let (dir, r) = run_named("tool.gz", &gz(b"bin"), Format::Gz, 0, true);
         r.unwrap();
         assert_eq!(mode(&dir, "tool"), 0o755);
-        // An archive format carries its own modes: `executable` is refused,
-        // before anything is created.
-        for format in Format::ALL.into_iter().filter(|f| *f != Format::Gz) {
-            let (dir, r) = run_named("a", &sample_tar(), format, 0, true);
-            let msg = err(r);
-            assert!(msg.contains("only to a bare `gz`"), "{msg}");
-            assert!(!dir.path().join("out").exists(), "{}", format.as_str());
+        let (dir, r) = run_named("tool.gz", &gz(b"bin"), Format::Gz, 0, false);
+        r.unwrap();
+        assert_eq!(mode(&dir, "tool"), 0o644);
+    }
+
+    /// `include` and `executable` patterns match a gz's one file by the
+    /// name it takes, and a pattern for another name fails the run.
+    #[test]
+    fn a_bare_gz_takes_include_and_executable_patterns() {
+        let opts = UnpackOptions {
+            include: globs(&["tool"]),
+            executable: Executable::Matching(globs(&["t*"])),
+            ..UnpackOptions::default()
+        };
+        let (dir, r) = run_opts("tool.gz", &gz(b"bin"), Format::Gz, opts);
+        assert_eq!(r.unwrap(), 1);
+        assert_eq!(listing(&dir), ["tool"]);
+        assert_eq!(mode(&dir, "tool"), 0o755);
+
+        let (_dir, r) = run_opts("tool.gz", &gz(b"bin"), Format::Gz, including(&["tool.gz"]));
+        let msg = err(r);
+        assert!(
+            msg.contains(r#"`include` pattern "tool.gz""#) && msg.contains(r#"["tool"]"#),
+            "{msg}"
+        );
+    }
+
+    /// `include` keeps only the matching files and links, under their own
+    /// paths, with the parents they need and no other directory.
+    #[test]
+    fn include_keeps_only_the_matches() {
+        let bytes = tar_bytes(&[
+            E::Dir("bin/", 0o755),
+            E::File("bin/tool", b"tool", 0o755),
+            E::File("bin/helper", b"helper", 0o755),
+            E::File("README.md", b"readme", 0o644),
+            E::Symlink("bin/alias", "tool"),
+            E::Dir("share/", 0o755),
+            E::File("share/doc", b"doc", 0o644),
+        ]);
+        let (dir, r) = run_opts(
+            "a",
+            &bytes,
+            Format::Tar,
+            including(&["bin/tool", "**/alias"]),
+        );
+        assert_eq!(r.unwrap(), 2);
+        assert_eq!(listing(&dir), ["bin/alias", "bin/tool"]);
+        assert_eq!(read(&dir, "bin/alias"), "tool");
+        assert!(!dir.path().join("out/share").exists());
+        // A string pattern without metacharacters is a literal path.
+        let (dir, r) = run_opts("a", &bytes, Format::Tar, including(&["README.md"]));
+        assert_eq!(r.unwrap(), 1);
+        assert_eq!(listing(&dir), ["README.md"]);
+        // `*` stays within a component.
+        let (dir, r) = run_opts("a", &bytes, Format::Tar, including(&["*"]));
+        r.unwrap();
+        assert_eq!(listing(&dir), ["README.md"]);
+    }
+
+    /// Under `include` a directory entry is never written: an empty
+    /// directory the archive lists is not created, nor a matching one.
+    #[test]
+    fn include_skips_directory_entries() {
+        let bytes = tar_bytes(&[
+            E::Dir("empty/", 0o755),
+            E::Dir("bin/", 0o700),
+            E::File("bin/tool", b"t", 0o755),
+        ]);
+        let (dir, r) = run_opts("a", &bytes, Format::Tar, including(&["bin/tool"]));
+        assert_eq!(r.unwrap(), 1, "the file only");
+        assert!(!dir.path().join("out/empty").exists());
+        assert_eq!(mode(&dir, "bin"), 0o755, "a parent made as needed");
+        // A pattern that matches only a directory matches nothing.
+        let (_dir, r) = run_opts("a", &bytes, Format::Tar, including(&["empty"]));
+        let msg = err(r);
+        assert!(msg.contains(r#"`include` pattern "empty""#), "{msg}");
+    }
+
+    /// A pattern is matched against the path after `strip_components`.
+    #[test]
+    fn include_matches_the_stripped_path() {
+        let (dir, r) = run_opts(
+            "a",
+            &sample_tar(),
+            Format::Tar,
+            UnpackOptions {
+                strip_components: 1,
+                include: globs(&["bin/tool"]),
+                ..UnpackOptions::default()
+            },
+        );
+        assert_eq!(r.unwrap(), 1);
+        assert_eq!(listing(&dir), ["bin/tool"]);
+        // The unstripped path matches nothing once it is stripped.
+        let (_dir, r) = run_opts(
+            "a",
+            &sample_tar(),
+            Format::Tar,
+            UnpackOptions {
+                strip_components: 1,
+                include: globs(&["tool-1.0/bin/tool"]),
+                ..UnpackOptions::default()
+            },
+        );
+        let msg = err(r);
+        assert!(msg.contains(r#"["bin/tool", "README"]"#), "{msg}");
+    }
+
+    /// A pattern that matches nothing fails the run, naming it and listing
+    /// the first paths it was matched against; one pattern matching is not
+    /// enough.
+    #[test]
+    fn an_unmatched_include_pattern_fails_naming_itself() {
+        let (_dir, r) = run_opts(
+            "a",
+            &sample_tar(),
+            Format::Tar,
+            including(&["tool-1.0/bin/tool", "tool-1.0/bin/tol"]),
+        );
+        let msg = err(r);
+        assert!(
+            msg.contains(r#"`include` pattern "tool-1.0/bin/tol" matches no file"#)
+                && msg.contains(r#"["tool-1.0/bin/tool", "tool-1.0/README"]"#)
+                && !msg.contains("and more"),
+            "{msg}"
+        );
+        let many: Vec<String> = (0..7).map(|i| format!("f{i}")).collect();
+        let entries: Vec<E<'_>> = many.iter().map(|p| E::File(p, b"x", 0o644)).collect();
+        let (_dir, r) = run_opts("a", &tar_bytes(&entries), Format::Tar, including(&["g"]));
+        let msg = err(r);
+        assert!(
+            msg.contains(r#"["f0", "f1", "f2", "f3", "f4"] and more"#),
+            "{msg}"
+        );
+    }
+
+    /// An included hard link copies its target, so the target must be
+    /// included too; one only the target's pattern matches is not written.
+    #[test]
+    fn an_included_hard_link_to_an_excluded_target_fails() {
+        let bytes = tar_bytes(&[E::File("a", b"same", 0o755), E::Hardlink("b", "a")]);
+        let (dir, r) = run_opts("t", &bytes, Format::Tar, including(&["b"]));
+        let msg = err(r);
+        assert!(
+            msg.contains(r#"hard link target "a" is not included"#),
+            "{msg}"
+        );
+        assert!(!dir.path().join("out/a").exists());
+        // Both included: the copy is written.
+        let (dir, r) = run_opts("t", &bytes, Format::Tar, including(&["a", "b"]));
+        assert_eq!(r.unwrap(), 2);
+        assert_eq!(read(&dir, "b"), "same");
+        // Only the target: the link is left out.
+        let (dir, r) = run_opts("t", &bytes, Format::Tar, including(&["a"]));
+        r.unwrap();
+        assert_eq!(listing(&dir), ["a"]);
+    }
+
+    /// An included symlink is held to the in-tree check, whether or not
+    /// what it points at was included.
+    #[test]
+    fn an_included_symlink_is_still_checked() {
+        let bytes = tar_bytes(&[
+            E::Dir("d/", 0o755),
+            E::Symlink("d/up", ".."),
+            E::Symlink("b", "d/up/.."),
+        ]);
+        let (_dir, r) = run_opts("t", &bytes, Format::Tar, including(&["b", "d/up"]));
+        let msg = err(r);
+        assert!(msg.contains("resolves outside the output"), "{msg}");
+        let bytes = tar_bytes(&[E::Symlink("l", "../outside")]);
+        let (_dir, r) = run_opts("t", &bytes, Format::Tar, including(&["l"]));
+        assert!(err(r).contains("escapes the output"));
+        // A left-out entry's path is checked all the same.
+        let bytes = tar_bytes(&[E::File("../x", b"x", 0o644), E::File("y", b"y", 0o644)]);
+        let (_dir, r) = run_opts("t", &bytes, Format::Tar, including(&["y"]));
+        assert!(err(r).contains("`..`"));
+    }
+
+    /// A tar entry left out is decoded to reach the next one, so its bytes
+    /// count against `max_bytes` as written ones do: an excluded bomb fails
+    /// instead of decoding forever. Its entry counts against `max_entries`.
+    #[test]
+    fn excluded_bytes_count_against_max_bytes() {
+        let big = vec![0u8; 64 << 20];
+        let bytes = gz(&tar_bytes(&[
+            E::File("big", &big, 0o644),
+            E::File("small", b"0123456789", 0o644),
+        ]));
+        let limits = Limits {
+            max_bytes: 1 << 20,
+            ..Limits::default()
+        };
+        let opts = UnpackOptions {
+            include: globs(&["small"]),
+            limits,
+            ..UnpackOptions::default()
+        };
+        let (dir, r) = run_opts("t", &bytes, Format::TarGz, opts.clone());
+        let msg = err(r);
+        assert!(
+            msg.contains("`max_bytes`") && msg.contains(r#"tar entry "big""#),
+            "{msg}"
+        );
+        assert!(!dir.path().join("out/small").exists());
+        // Under the limit, the excluded entry's bytes are read past.
+        let opts = UnpackOptions {
+            limits: Limits::default(),
+            ..opts
+        };
+        let (dir, r) = run_opts("t", &bytes, Format::TarGz, opts.clone());
+        assert_eq!(r.unwrap(), 1);
+        assert_eq!(listing(&dir), ["small"]);
+        let opts = UnpackOptions {
+            limits: Limits {
+                max_entries: 1,
+                ..Limits::default()
+            },
+            ..opts
+        };
+        let (_dir, r) = run_opts("t", &bytes, Format::TarGz, opts);
+        assert!(err(r).contains("`max_entries`"));
+    }
+
+    /// An entry `strip_components` removes whole is decoded past too, and
+    /// counted.
+    #[test]
+    fn stripped_bytes_count_against_max_bytes() {
+        let bytes = tar_bytes(&[
+            E::File("top", &[0u8; 4096], 0o644),
+            E::File("d/small", b"s", 0o644),
+        ]);
+        let limits = Limits {
+            max_bytes: 1024,
+            ..Limits::default()
+        };
+        let (_dir, r) = run_with(&bytes, Format::Tar, 1, limits, &never);
+        let msg = err(r);
+        assert!(
+            msg.contains("`max_bytes`") && msg.contains(r#"tar entry "top""#),
+            "{msg}"
+        );
+    }
+
+    /// A zip entry left out is never read: it is not counted against
+    /// `max_bytes`, and a corrupted one is not even noticed; a corrupted
+    /// entry that is included still fails its CRC.
+    #[test]
+    fn an_excluded_zip_entry_is_not_read() {
+        let big: Vec<u8> = (0..4096u32).flat_map(u32::to_le_bytes).collect();
+        let small = b"small-entry-payload";
+        let mut zip = zip_bytes(|w| {
+            let stored = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            w.start_file("big", stored).unwrap();
+            w.write_all(&big).unwrap();
+            w.start_file("small", stored).unwrap();
+            w.write_all(small).unwrap();
+        });
+        let flip = |zip: &mut [u8], needle: &[u8]| {
+            let at = zip
+                .windows(needle.len())
+                .position(|w| w == needle)
+                .expect("stored data is in the archive verbatim");
+            zip[at + 1] ^= 0xff;
+        };
+        flip(&mut zip, &big[64..96]);
+        let opts = UnpackOptions {
+            include: globs(&["small"]),
+            limits: Limits {
+                max_bytes: 1024,
+                ..Limits::default()
+            },
+            ..UnpackOptions::default()
+        };
+        let (dir, r) = run_opts("t.zip", &zip, Format::Zip, opts.clone());
+        assert_eq!(r.unwrap(), 1, "the big entry is neither read nor counted");
+        assert_eq!(read(&dir, "small"), "small-entry-payload");
+        // Included, the corrupted entry fails its CRC.
+        let (_dir, r) = run_opts("t.zip", &zip, Format::Zip, including(&["big"]));
+        let msg = err(r);
+        assert!(msg.to_lowercase().contains("checksum"), "{msg}");
+        flip(&mut zip, &small[..]);
+        let (_dir, r) = run_opts("t.zip", &zip, Format::Zip, opts);
+        let msg = err(r);
+        assert!(msg.to_lowercase().contains("checksum"), "{msg}");
+    }
+
+    /// A cancel that fires while an excluded entry is being read past stops
+    /// the run there.
+    #[test]
+    fn cancellation_stops_mid_skip() {
+        let big = vec![0u8; 16 << 20];
+        let bytes = gz(&tar_bytes(&[
+            E::File("big", &big, 0o644),
+            E::File("small", b"s", 0o644),
+        ]));
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("t");
+        std::fs::write(&archive, &bytes).unwrap();
+        // Entries: `big`'s header is polled once; then the skip's reads.
+        let polls = std::cell::Cell::new(0u32);
+        let cancelled = || {
+            polls.set(polls.get() + 1);
+            polls.get() > 8
+        };
+        let r = unpack(
+            &archive,
+            Format::TarGz,
+            including(&["small"]),
+            &dir.path().join("out"),
+            &cancelled,
+        );
+        let msg = err(r);
+        assert!(
+            msg.contains("cancelled") && msg.contains(r#"tar entry "big": read past the entry"#),
+            "{msg}"
+        );
+    }
+
+    /// `executable = True`: every regular file is `0o755`, a hard link's
+    /// copy included, whatever the archive recorded; symlinks are links.
+    #[test]
+    fn executable_all_marks_every_file() {
+        let bytes = tar_bytes(&[
+            E::File("a", b"a", 0o644),
+            E::File("d/b", b"b", 0o600),
+            E::Hardlink("c", "a"),
+            E::Symlink("l", "a"),
+        ]);
+        let opts = UnpackOptions {
+            executable: Executable::All,
+            ..UnpackOptions::default()
+        };
+        let (dir, r) = run_opts("t", &bytes, Format::Tar, opts.clone());
+        r.unwrap();
+        for f in ["a", "d/b", "c"] {
+            assert_eq!(mode(&dir, f), 0o755, "{f}");
         }
+        assert!(
+            std::fs::symlink_metadata(dir.path().join("out/l"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        // A zip made on Windows: no Unix mode, only DOS attributes.
+        let mut zip = zip_bytes(|w| {
+            w.start_file("tool", zip_opts(0o644)).unwrap();
+            w.write_all(b"#!/bin/sh\n").unwrap();
+        });
+        windows_built(&mut zip);
+        let (dir, r) = run_opts("t.zip", &zip, Format::Zip, UnpackOptions::default());
+        r.unwrap();
+        assert_eq!(mode(&dir, "tool"), 0o644, "a Windows zip records no mode");
+        let (dir, r) = run_opts("t.zip", &zip, Format::Zip, opts);
+        r.unwrap();
+        assert_eq!(mode(&dir, "tool"), 0o755);
+    }
+
+    /// Mark a one-entry zip as made on MS-DOS/Windows (version made by,
+    /// offset 5 of its central record) with the archive attribute only.
+    fn windows_built(zip: &mut [u8]) {
+        patch_central(zip, |c| {
+            c[5] = 0;
+            c[38..42].copy_from_slice(&0x20u32.to_le_bytes());
+        });
+    }
+
+    /// Executable patterns mark only the regular files they match; every
+    /// other file keeps its mode. A hard link is its target's file in the
+    /// archive: copied from a raised file it is executable too, and raised
+    /// itself when its own path matches.
+    #[test]
+    fn executable_patterns_mark_only_the_matches() {
+        let bytes = tar_bytes(&[
+            E::File("bin/tool", b"t", 0o644),
+            E::File("bin/other", b"o", 0o644),
+            E::File("lib/run.sh", b"r", 0o755),
+            E::Hardlink("bin/copy", "bin/tool"),
+            E::Hardlink("bin/tool2", "bin/other"),
+        ]);
+        let opts = UnpackOptions {
+            executable: Executable::Matching(globs(&["bin/tool", "bin/tool2"])),
+            ..UnpackOptions::default()
+        };
+        let (dir, r) = run_opts("t", &bytes, Format::Tar, opts);
+        r.unwrap();
+        for (f, want) in [
+            ("bin/tool", 0o755),
+            ("bin/other", 0o644),
+            ("lib/run.sh", 0o755),
+            ("bin/copy", 0o755),
+            ("bin/tool2", 0o755),
+        ] {
+            assert_eq!(mode(&dir, f), want, "{f}");
+        }
+    }
+
+    /// An executable pattern must match a regular file that is extracted:
+    /// one matching only a symlink, a left-out file or nothing fails.
+    #[test]
+    fn an_unmatched_executable_pattern_fails() {
+        let bytes = tar_bytes(&[
+            E::File("bin/tool", b"t", 0o644),
+            E::File("README", b"r", 0o644),
+            E::Symlink("bin/alias", "tool"),
+        ]);
+        for (include, pattern) in [
+            (&[][..], "bin/tol"),
+            (&[][..], "bin/alias"),
+            (&["bin/*"][..], "README"),
+        ] {
+            let opts = UnpackOptions {
+                include: globs(include),
+                executable: Executable::Matching(globs(&["bin/tool", pattern])),
+                ..UnpackOptions::default()
+            };
+            let (_dir, r) = run_opts("t", &bytes, Format::Tar, opts);
+            let msg = err(r);
+            assert!(
+                msg.contains(&format!(
+                    "`executable` pattern {pattern:?} matches no extracted regular file"
+                )),
+                "{pattern}: {msg}"
+            );
+        }
+    }
+
+    /// The bit is only ever added: a file the archive records as executable
+    /// stays so when no pattern matches it.
+    #[test]
+    fn the_executable_bit_is_never_cleared() {
+        let bytes = tar_bytes(&[
+            E::File("a", b"a", 0o755),
+            E::File("b", b"b", 0o700),
+            E::File("c", b"c", 0o644),
+        ]);
+        for exec in [
+            Executable::Archive,
+            Executable::Matching(globs(&["c"])),
+            Executable::All,
+        ] {
+            let opts = UnpackOptions {
+                executable: exec.clone(),
+                ..UnpackOptions::default()
+            };
+            let (dir, r) = run_opts("t", &bytes, Format::Tar, opts);
+            r.unwrap();
+            assert_eq!(mode(&dir, "a"), 0o755, "{exec:?}");
+            assert_eq!(mode(&dir, "b"), 0o755, "{exec:?}");
+        }
+    }
+
+    #[test]
+    fn globs_refuse_empty_nul_and_invalid_patterns() {
+        for (bad, want) in [
+            ("", "empty pattern"),
+            ("a\0b", "NUL"),
+            ("a/**b", "invalid glob pattern"),
+            ("/bin/tool", r#"relative to the output; write "bin/tool""#),
+            ("//bin/tool", r#"write "bin/tool""#),
+            ("./bin/tool", r#"no leading `./`; write "bin/tool""#),
+            (
+                "bin/",
+                r#""bin/" matches no file; to take a directory's files write "bin/**""#,
+            ),
+            ("bin/./tool", r#"no `.` component; write "bin/tool""#),
+            (".", "no `.` component"),
+            ("bin/../tool", "no `..` component"),
+            ("..", "no `..` component"),
+            ("bin//tool", r#"empty component; write "bin/tool""#),
+        ] {
+            let msg = format!("{:#}", Globs::new(&[bad.to_string()]).unwrap_err());
+            assert!(msg.contains(want), "{bad:?}: {msg}");
+        }
+        assert!(Globs::new(&[]).unwrap().is_empty());
+        // Near misses that can match are accepted.
+        for ok in [
+            "bin/**",
+            ".hidden",
+            "..x",
+            "a.",
+            "bin/.tool",
+            "{a,b}/x",
+            "**",
+        ] {
+            Globs::new(&[ok.to_string()]).unwrap_or_else(|e| panic!("{ok:?}: {e:#}"));
+        }
+    }
+
+    /// What a pattern matches is wax's answer, and `archive.extract` keys a
+    /// target by the pattern's text alone; this table pins those answers.
+    #[test]
+    fn matching_is_pinned() {
+        use wax::Program as _;
+        let nfc = "\u{e9}/tool";
+        let nfd = "e\u{301}/tool";
+        for (pattern, path, want) in [
+            ("*", "tool", true),
+            ("*", "bin/tool", false),
+            ("*", ".hidden", true),
+            ("bin/*", "bin/.hidden", true),
+            ("**/tool", "tool", true),
+            ("**/tool", "a/b/tool", true),
+            ("bin/**", "bin/a/b", true),
+            ("bin/**", "bin", true),
+            ("**", "a/b/c", true),
+            ("**", "a", true),
+            ("{a,b}/x", "a/x", true),
+            ("{a,b}/x", "b/x", true),
+            ("{a,b}/x", "c/x", false),
+            ("[!x]", "y", true),
+            ("[!x]", "x", false),
+            ("[^x]", "y", false),
+            ("[^x]", "x", true),
+            ("[^x]", "^", true),
+            ("?", "a", true),
+            ("?", "ab", false),
+            ("\\*", "*", true),
+            ("\\*", "a", false),
+            ("bin/*", "Bin/tool", false),
+            ("(?i)bin/*", "Bin/tool", true),
+            ("\u{e9}/*", nfc, true),
+            ("\u{e9}/*", nfd, false),
+            ("*/tool", nfd, true),
+        ] {
+            let glob = wax::Glob::new(pattern).unwrap();
+            assert_eq!(
+                glob.is_match(path),
+                want,
+                "{pattern:?} against {path:?} changed its answer: a pattern's meaning is in \
+                 every `archive.extract` key that uses it, so bump GLOB_VERSION in \
+                 crates/plugin-archive/src/extract.rs, then update this table"
+            );
+        }
+    }
+
+    /// The path a pattern sees: after `strip_components`, which counts a
+    /// leading `.` as GNU tar does, and without any `.` component.
+    #[test]
+    fn a_pattern_sees_the_path_without_dot_components() {
+        let bytes = tar_bytes(&[E::File("./tool-1.0/bin/tool", b"t", 0o755)]);
+        let opts = UnpackOptions {
+            strip_components: 1,
+            include: globs(&["tool-1.0/bin/tool"]),
+            ..UnpackOptions::default()
+        };
+        let (dir, r) = run_opts("t", &bytes, Format::Tar, opts);
+        assert_eq!(r.unwrap(), 1, "the strip eats the `.`");
+        assert_eq!(listing(&dir), ["tool-1.0/bin/tool"]);
+        for raw in ["./bin/tool", "bin/./tool"] {
+            let bytes = tar_bytes(&[E::File(raw, b"t", 0o755)]);
+            let (dir, r) = run_opts("t", &bytes, Format::Tar, including(&["bin/tool"]));
+            assert_eq!(r.unwrap(), 1, "{raw}");
+            assert_eq!(listing(&dir), ["bin/tool"], "{raw}");
+        }
+    }
+
+    /// Under `include`, a symlink must resolve to an extracted path: a
+    /// target left out, or a link on the way left out, fails the run. Both
+    /// included, or without `include`, it is written.
+    #[test]
+    fn under_include_a_dangling_symlink_fails() {
+        let to_file = tar_bytes(&[
+            E::File("libexec/tool", b"t", 0o755),
+            E::Symlink("bin/tool", "../libexec/tool"),
+        ]);
+        let (_dir, r) = run_opts("t", &to_file, Format::Tar, including(&["bin/tool"]));
+        let msg = err(r);
+        assert!(
+            msg.contains(
+                r#"symlink "bin/tool": points at "../libexec/tool", which `include` left out"#
+            ) && msg.contains("include it too"),
+            "{msg}"
+        );
+        let (dir, r) = run_opts("t", &to_file, Format::Tar, including(&["**/tool"]));
+        assert_eq!(r.unwrap(), 2);
+        assert_eq!(read(&dir, "bin/tool"), "t");
+        let (_dir, r) = run_opts("t", &to_file, Format::Tar, UnpackOptions::default());
+        r.unwrap();
+
+        // Through a link that was left out: `s/d -> ..`, `s/l -> d/x`.
+        let through = tar_bytes(&[
+            E::File("x", b"x", 0o644),
+            E::Symlink("s/d", ".."),
+            E::Symlink("s/l", "d/x"),
+        ]);
+        let (_dir, r) = run_opts("t", &through, Format::Tar, including(&["s/l", "x"]));
+        let msg = err(r);
+        assert!(
+            msg.contains(r#"symlink "s/l": points at "d/x", which `include` left out"#),
+            "{msg}"
+        );
+        let (dir, r) = run_opts("t", &through, Format::Tar, including(&["s/*", "x"]));
+        assert_eq!(r.unwrap(), 3);
+        assert_eq!(read(&dir, "s/l"), "x");
+
+        // A link that dangles in the archive itself: fine without
+        // `include`, refused with it.
+        let dangling = tar_bytes(&[E::Symlink("l", "nowhere"), E::File("f", b"f", 0o644)]);
+        let (dir, r) = run_opts("t", &dangling, Format::Tar, UnpackOptions::default());
+        assert_eq!(r.unwrap(), 2);
+        assert!(
+            std::fs::symlink_metadata(dir.path().join("out/l"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let (_dir, r) = run_opts("t", &dangling, Format::Tar, including(&["*"]));
+        assert!(err(r).contains(r#"points at "nowhere""#));
     }
 
     #[test]

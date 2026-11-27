@@ -11,7 +11,7 @@ default = ["codec"]
 # `unpack` and `write`, and the codecs they need. Off, the crate is `Format`
 # and `Limits` only: what a crate that just names a format (the `gh` plugin)
 # links.
-codec = ["dep:hcore", "dep:tar", "dep:flate2", "dep:zstd", "dep:zip", "dep:lzma-rust2"]
+codec = ["dep:hcore", "dep:tar", "dep:flate2", "dep:zstd", "dep:zip", "dep:lzma-rust2", "dep:wax"]
 
 [dependencies]
 anyhow = "1.0.104"
@@ -34,6 +34,9 @@ zip = { version = "9.8", default-features = false, features = ["deflate-flate2"]
 # hostile input, and measured no faster here; without it the crate is
 # `forbid(unsafe_code)`.
 lzma-rust2 = { version = "0.26", default-features = false, features = ["std", "xz"], optional = true }
+# `include` and `executable`'s globs: the syntax of `group`'s `include`,
+# compiled by the same crate `hcore`'s path filters use.
+wax = { version = "0.7", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

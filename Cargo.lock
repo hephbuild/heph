@@ -228,6 +228,7 @@ dependencies = [
  "serde",
  "tar",
  "tempfile",
+ "wax",
  "xxhash-rust",
  "zip",
  "zstd",
@@ -1794,6 +1795,7 @@ dependencies = [
  "tokio",
  "tracing-subscriber",
  "xattr",
+ "zip",
 ]
 
 [[package]]

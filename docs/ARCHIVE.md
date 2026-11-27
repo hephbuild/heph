@@ -47,21 +47,34 @@ inverses: the example round-trips to `unpacked/bin/tool`.
 
 A tool is one file, so the unpacked directory is a tool only when it holds
 exactly one. To put one binary from a larger archive on a target's `PATH`,
-pick it out with a `group` (still in `//tool/BUILD`):
+extract only that binary with `include` (still in `//tool/BUILD`):
 
 ```python
-target(name = "tool", driver = "group", deps = [":unpacked"],
-       include = ["tool/unpacked/bin/tool"])
+target(
+    name = "tool",
+    driver = "archive.extract",
+    src = ":dist",
+    strip_components = 1,
+    include = "bin/tool",          # the path after strip_components
+    executable = True,             # in case the archive recorded no mode
+)
 
 target(name = "use", driver = "bash", run = ["tool --version"],
        tools = [":tool"])
 ```
 
-An `include` matches a dep's paths workspace-relative, `<package>/<out>/…`
-(here package `tool`, directory `unpacked`), or as the dep's own BUILD file
-writes them (`unpacked/bin/tool`). `heph inspect outputs //tool:unpacked`
-lists them. A `[filter]` on the tool reference does the same job without a
-group, and takes the workspace-relative form only:
+To pick one file out of a dep that is not an extract, use a `group`:
+
+```python
+target(name = "tool", driver = "group", deps = [":unpacked"],
+       include = ["tool/unpacked/bin/tool"])
+```
+
+A `group`'s `include` matches a dep's paths workspace-relative,
+`<package>/<out>/…` (here package `tool`, directory `unpacked`), or as the
+dep's own BUILD file writes them (`unpacked/bin/tool`). `heph inspect outputs
+//tool:unpacked` lists them. A `[filter]` on the tool reference does the same
+job without a group, and takes the workspace-relative form only:
 `tools = ["//tool:unpacked[tool/unpacked/bin/tool]"]`.
 
 A tool whose output is a glob or a directory, as a filtering `group`'s or an
@@ -76,9 +89,10 @@ none, fails the consumer, naming the tool and the files it found.
 | `src` | required | The target whose **single** output file is the archive. A target with several files is refused with the count: which one is meant would depend on walk order. |
 | `format` | inferred | `tar`, `tar.gz`, `tar.xz`, `tar.zst`, `zip` or `gz`. When omitted, it is taken from the archive file's name suffix (the longest one that matches: `x.tar.gz` is a `tar.gz`, `x.gz` a `gz`), else from its leading bytes (gzip `1f 8b`, xz `fd 37 7a 58 5a 00`, zstd `28 b5 2f fd`, zip `PK\3\4` or `PK\5\6`, tar `ustar` at offset 257; a gzip stream sniffs as a `tar.gz`); neither → an error asking for `format`. Given, it overrides both and is hashed. Omitted, the key holds the inference rules' version (`INFERENCE_VERSION` in `crates/plugin-archive/src/extract.rs`), so a change to those rules re-keys only the targets that infer. |
 | `strip_components` | `0` | Leading path components dropped from every entry, as `tar --strip-components`. Refused with a `gz`: at parse when `format = "gz"` is named, at run when it is inferred. |
-| `executable` | `False` | With a `gz` only: its one file is `0o755` rather than `0o644`. Refused at parse with any other named `format`, and at run when an inferred one turns out not to be a `gz`. Hashed when set. |
+| `include` | every entry | Glob patterns, a string or a list, in the syntax of `group`'s `include` (`*` within a path component, `**` across them, `{a,b}`, `[…]`), matched against each entry's path below `out` after `strip_components` (`bin/tool`). Only the files and links that match one are extracted; see [Unpacking rules](#unpacking-rules) and [Patterns](#patterns). An empty, NUL-holding or invalid pattern is refused at parse, and so is one no entry path can match (a leading `/` or `./`, a trailing `/`, a `.`, `..` or empty component). Hashed when set, sorted and deduped, with `GLOB_VERSION`. |
+| `executable` | `False` | `True`: every extracted regular file is `0o755`, as a `gz`'s one file (gzip records no mode) or a zip built on Windows (no Unix mode) needs. A list of glob patterns (a string or a list, `include`'s syntax and refusals): only the files that match one. Holds for every format. Hashed when set; `[]` is `False`. |
 | `out` | the target name | A **directory**, relative to the package, the archive unpacks into. |
-| `max_bytes` | 4 GiB | The most bytes the archive may unpack to. |
+| `max_bytes` | 4 GiB | The most bytes the archive may decode to for its entries, written or read past: in a tar, the entries `include` or `strip_components` leave out are decoded to reach the next one, and count. A zip entry left out is never read and costs nothing. |
 | `max_entries` | 1,000,000 | The most entries the archive may hold. |
 | `cache` | `True` | See [Cache keys](#cache-keys). |
 | `resources` | `{"cpu": 1}` | Never hashed ([RESOURCES.md](RESOURCES.md)). |
@@ -99,14 +113,48 @@ with a unit test in `crates/archive`, not a nicety:
   directories `0o755`. Owners and mtimes are not applied.
 - A path that appears twice is an error, except a directory listed again. A
   zip whose central directory names a path twice is refused as a whole.
-- The output is bounded: at most `max_bytes` written and `max_entries`
-  entries, counted while unpacking. The bounds are not hashed: exceeding one
-  fails the run, and a failure is never cached.
+- The output and the decoding are bounded: at most `max_bytes` decoded for
+  the archive's entries, written or read past, and `max_entries` entries,
+  counted while unpacking. A tar entry left out (by `include`, or removed
+  whole by `strip_components`) is decoded to reach the next one, so its
+  bytes count as a written entry's do: an excluded entry of terabytes of
+  zeros fails instead of decoding forever. A zip entry left out is never
+  read, and is not counted. The bounds are not hashed: exceeding one fails
+  the run, and a failure is never cached.
 - `strip_components` counts a leading `.` as GNU tar and bsdtar do
   (`./tool-1.0/bin/tool` with 1 is `tool-1.0/bin/tool`); a hard link's target
   is stripped too, a symlink's is not. An entry with no more components than
   `strip_components` is skipped; an archive from which nothing remains is an
   error listing its first five entries.
+- A pattern sees an entry's path after both steps, in this order: first
+  `strip_components` (which counts a `.`), then every `.` and empty
+  component dropped. So `./tool-1.0/bin/tool` with `strip_components = 1` is
+  matched as `tool-1.0/bin/tool` (the strip ate the `.`), and `./bin/tool`
+  and `bin/./tool` with none are both matched as `bin/tool`.
+- With `include` set, only the files, symlinks and hard links whose path
+  matches a pattern are extracted. Directory entries are skipped, and the
+  parent directories an extracted entry needs are created. An entry left out
+  is still checked by the rules above and counts towards `max_entries` (and
+  in a tar towards `max_bytes`, above), but is not written.
+- Each `include` pattern must match a file or link in the archive, and each
+  `executable` pattern an extracted regular file; one that matches nothing
+  fails the run, naming it (a typo guard). A pattern matching only a
+  directory matches nothing.
+- A hard link whose target `include` leaves out is an error: the link is a
+  copy of its target, which was never extracted.
+- With `include` set, every extracted symlink must resolve to a path in the
+  output: one whose target, or a link on the way to it, `include` left out
+  fails the run (`` symlink "bin/tool": points at "../libexec/tool", which
+  `include` left out …; include it too ``). That includes a link that already
+  dangles in the archive: under `include` it is refused, since a dangling
+  link there is likelier a target the patterns missed. Without `include`, a
+  dangling link is extracted as it is.
+- `executable` only ever adds the execute bit: a file the archive marks
+  `0o755` stays so whatever `executable` says. `True` raises every regular
+  file, hard-link copies included. With patterns, a hard-link copy is its
+  target's file in the archive: it takes the mode its target was written
+  with, a bit a pattern raised included, and is raised too when its own path
+  matches. Symlinks are untouched.
 
 - An xz stream's decoder may use at most 256 MiB. The decoder adds about
   100 KiB to the dictionary, so a dictionary of 256 MiB or more is refused
@@ -128,6 +176,35 @@ with a unit test in `crates/archive`, not a nicety:
     archive's own bytes with `sha256` where it is fetched.
   - A `zip` entry's CRC32 is verified as the entry is read.
 
+### Patterns
+
+`include` and an `executable` list are matched by wax, the engine behind
+`group`'s `include`, against an entry's path as the rules above give it
+(`bin/tool`). What to expect:
+
+- Patterns are **case-sensitive**: `bin/*` does not match `Bin/tool`
+  (`(?i)bin/*` does).
+- `*` stays within a component and **matches dotfiles**: `*` matches
+  `.hidden`, and `bin/*` matches `bin/.hidden`.
+- `**/x` also matches a top-level `x`, and `bin/**` matches everything
+  below `bin` (and a file named `bin` itself).
+- A class is negated with `!`, not `^`: `[!x]` is any character but `x`,
+  while `[^x]` is the class holding `^` and `x`.
+- Names are compared **byte for byte**, with no Unicode normalization. A
+  zip made on macOS may store `é` decomposed (NFD: `e` + U+0301); a
+  pattern typed as the precomposed `é` (NFC) does not match it. Write the
+  pattern in NFD, or use a `*` there.
+- A pattern no entry path can match is refused at parse, with the fix: a
+  leading `/` or `./`, a trailing `/` (`"bin/"`: write `"bin/**"` to take a
+  directory's files), a `.`, `..` or empty (`bin//tool`) component.
+
+The key holds the patterns' text, not what they match, so it also holds
+`GLOB_VERSION` (`crates/plugin-archive/src/extract.rs`) in each pattern
+section: a wax upgrade or a matcher change that changes what a pattern
+matches bumps it. `crates/archive`'s `matching_is_pinned` test pins the
+answers above and names `GLOB_VERSION` when one moves. A target without
+patterns hashes no `GLOB_VERSION`, and keeps its key across such a bump.
+
 ### A bare `gz`
 
 A `gz` is one file, gzip-compressed, not a tar: some projects ship a binary
@@ -137,8 +214,9 @@ as `gzip -d` names it (`a.gz.gz` is `a.gz`; the whole name when it has no
 `.gz` or is only `.gz`). A name that leaves `.` or `..` (`..gz`) is
 refused. The name the gzip header may record is ignored: it is the archive
 author's to choose. gzip records no mode, so the file is `0o644` unless
-`executable = True`. It is held to the rules above as a tar's one file
-entry would be, so the output is bounded; `strip_components` with a `gz`
+`executable` makes it `0o755`. It is held to the rules above as a tar's one
+file entry would be, `include` included, so the output is bounded;
+`strip_components` with a `gz`
 would leave nothing, so it is refused. Concatenated gzip members are one
 file, and an empty file gzipped is one empty file.
 
@@ -278,10 +356,26 @@ engine, not here:
 - `the xz stream's dictionary needs more decoder memory than the 256 MiB
   cap` (extract, `tar.xz`): the archive was compressed with a dictionary of
   256 MiB or more; recompress it with a smaller one (`xz -9` uses 64 MiB).
-- `` `executable` applies only to a bare `gz` `` (extract): the archive's
-  entries carry their own modes; drop `executable`. When the message says
-  the format was inferred, and the archive is one gzipped file, set
-  `format = "gz"`.
+- `` `include` pattern "…" matches no file or link in the archive ``
+  (extract): the error lists the first paths the pattern was matched
+  against, below the output and after `strip_components`. Fix the pattern
+  to match one of them; a pattern written with the top-level directory
+  `strip_components` removed (`tool-1.0/bin/tool` for `bin/tool`) is the
+  usual cause, and so is one matching only a directory (`bin` for
+  `bin/*`).
+- `` `executable` pattern "…" matches no extracted regular file ``
+  (extract): the pattern names no file that was extracted, because of a
+  typo, because it names a directory or a symlink, or because `include`
+  left the file out.
+- `hard link target "…" is not included` (extract): `include` keeps a hard
+  link but not the file it is a copy of; add that file's path to `include`.
+- `` symlink "…": points at "…", which `include` left out `` (extract):
+  `include` keeps a symlink whose target (or a link on the way to it) was
+  not extracted, or that dangles in the archive itself; add the target's
+  path to `include`.
+- `"bin/" matches no file; to take a directory's files write "bin/**"`
+  (extract, at parse): the pattern can never match an entry path; write
+  what the error suggests.
 - `` `strip_components` with `format = "gz"` `` (extract, or with a `gz`
   asset): a bare `gz` is one file; drop `strip_components`.
 - `archive.create cannot write a "tar.xz"` (or `"gz"`): pick a written

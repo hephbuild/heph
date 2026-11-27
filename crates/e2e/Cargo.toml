@@ -54,6 +54,8 @@ tar = "0.4"
 flate2 = "1.1.11"
 # `gh_release_asset`: a `.tar.xz` release asset to fetch and unpack.
 lzma-rust2 = { version = "0.26", default-features = false, features = ["std", "xz", "encoder"] }
+# `gh_release_asset`: a Windows-built `.zip` release asset (no Unix modes).
+zip = { version = "9.8", default-features = false, features = ["deflate-flate2"] }
 serde_json = "1"
 # `json_field_costs` parses `--fields` and writes `heph query --json` rows.
 output = { path = "../output" }
