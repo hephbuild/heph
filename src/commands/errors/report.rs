@@ -163,7 +163,7 @@ impl ReportContext {
         };
         if status.is_none() {
             // No status to name it: the error says what went wrong.
-            let cause = cause_chain(&f.source, &addr);
+            let cause = cause_chain(&f.source);
             body.extend(
                 sanitize_log(self.redact.apply(&cause).as_bytes())
                     .lines()
@@ -672,11 +672,15 @@ mod tests {
             ],
             3,
         );
+        let web_gen = parse_addr("//web:gen").expect("addr");
         let second = TargetFailure::new(
-            parse_addr("//web:gen").expect("addr"),
+            web_gen.clone(),
             None,
-            anyhow::anyhow!("staging {HOME}/sandbox/ab/in: permission denied")
-                .context("execute //web:gen"),
+            hplugin::diagnostic::with_stage(
+                anyhow::anyhow!("staging {HOME}/sandbox/ab/in: permission denied"),
+                hplugin::diagnostic::Boundary::Execute,
+                &web_gen,
+            ),
         );
         let out = report(
             vec![first, second],

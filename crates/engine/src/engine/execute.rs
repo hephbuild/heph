@@ -12,6 +12,7 @@ use async_recursion::async_recursion;
 use enclose::enclose;
 use hcore::hartifactcontent::PathFilter;
 use hmodel::htaddr::Addr;
+use hplugin::diagnostic::{Boundary, StageContext, with_stage};
 use std::sync::Arc;
 
 /// How [`Engine::execute`] runs a target, beyond the target itself.
@@ -290,7 +291,7 @@ impl Engine {
                 // Past it the driver was called, and a managed one has made
                 // its tree.
                 let had_sandbox = managed && ran.is_ok();
-                let run = ran.and_then(|ran| ran.context("run"));
+                let run = ran.and_then(|ran| ran.stage(Boundary::Run, addr));
                 // End the live log while the sandbox still exists: a log the
                 // driver returned as an artifact is read from it.
                 let (run, live) = match live {
@@ -430,7 +431,9 @@ impl Engine {
                         };
                         // Past the reclaim: it reads no sandbox, and a lookup
                         // of the generator must not hold the `sandbox` slot.
-                        let err = Arc::clone(&self).reword_removed_generator(&rs, err).await;
+                        let err = Arc::clone(&self)
+                            .reword_removed_generator(&rs, addr, err)
+                            .await;
                         let out_error = slot.out_error.clone();
                         let err = err.context(slot);
                         // I7: the keep failed, the failure did not.
@@ -617,6 +620,7 @@ impl Engine {
     async fn reword_removed_generator(
         self: Arc<Self>,
         rs: &Arc<RequestState>,
+        addr: &Addr,
         err: anyhow::Error,
     ) -> anyhow::Error {
         use hbuiltins::pluginfs::{CodegenFileError, CodegenFileErrorKind};
@@ -636,11 +640,11 @@ impl Engine {
                 >(&e)
                 .is_some() =>
             {
-                anyhow::Error::new(CodegenFileError {
+                let removed = anyhow::Error::new(CodegenFileError {
                     kind: CodegenFileErrorKind::TargetRemoved,
                     ..cg.clone()
-                })
-                .context("run")
+                });
+                with_stage(removed, Boundary::Run, addr)
             }
             Ok(_) | Err(_) => err,
         }
@@ -865,7 +869,7 @@ impl Engine {
         ));
 
         hcore::hmemoizer::set_phase("execute:driver_run");
-        exec_wrapper(inner).await.with_context(|| "run")?;
+        exec_wrapper(inner).await.stage(Boundary::Run, addr)?;
 
         hcore::hmemoizer::set_phase("execute:oneshot_rx");
         rx.await

@@ -120,13 +120,17 @@ pub(super) fn assert_matches_eval(root: &Path, pkg: &str, name: &str) -> Option<
         }
         (Err(walk_err), Err(eval_err)) => {
             let eval_text = chain(&eval_err);
+            // A failed evaluation is a diagnostic: starlark's message without
+            // its `-->` layout, which the walk's raw error still has.
+            let diagnostic = hplugin::diagnostic::find_diagnostic(&eval_err).map(|d| &d.message);
             for message in walk_err
                 .chain()
                 .map(ToString::to_string)
                 .filter(|m| !m.contains(": load(\""))
             {
                 assert!(
-                    eval_text.contains(&message),
+                    eval_text.contains(&message)
+                        || diagnostic.is_some_and(|d| message.contains(d.as_str())),
                     "{name}: evaluation's error does not carry the walk's `{message}`\n\
                      walk: {}\neval: {eval_text}",
                     chain(&walk_err)

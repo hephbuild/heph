@@ -18,17 +18,13 @@ use crate::tui::session::SessionSlot;
 mod report;
 pub use report::ReportContext;
 
-/// Render the cause chain of an `anyhow::Error`, dropping the leading frames that
-/// merely restate the target address (engine boundaries like `execute //addr`,
-/// already shown in the title) and joining the rest the way anyhow's `{:#}`
-/// would. If every frame mentions the addr (e.g. a bare `target not found`), the
-/// whole chain is kept. Frames are [`chain_frames`]: an empty one (a failure's
-/// artifacts riding the chain) is skipped, and one that repeats its source's
-/// text is cut back to its own part.
-fn cause_chain(source: &anyhow::Error, addr: &str) -> String {
-    let frames = chain_frames(source);
-    let start = frames.iter().position(|f| !f.contains(addr)).unwrap_or(0);
-    frames.get(start..).unwrap_or(&[]).join(": ")
+/// Render the cause chain of an `anyhow::Error` the way anyhow's `{:#}` would,
+/// without the engine's boundary frames (`get_def: //p:t`, `link`, `execute
+/// //p:t`, `run`: typed [`hplugin::diagnostic::StageFrame`]s, whose target is
+/// already in the title). A [`hplugin::diagnostic::Diagnostic`] in the chain is
+/// rendered alone. See [`hplugin::diagnostic::cause_frames`].
+fn cause_chain(source: &anyhow::Error) -> String {
+    hplugin::diagnostic::cause_frames(source).join(": ")
 }
 
 /// Render the log tail inside a framed box, indented two spaces. The `▶` of the
@@ -136,7 +132,7 @@ fn render_target_failure(f: &TargetFailure, color: bool) -> String {
         render_diff_box(&mut out, &fc.diff, color);
         return out;
     }
-    let cause = cause_chain(&f.source, &f.addr.format());
+    let cause = cause_chain(&f.source);
     if !cause.is_empty() {
         let arrow = if color {
             format!("{}", "╰─▶".red())
@@ -931,11 +927,12 @@ mod tests {
         );
 
         let a = crate::htaddr::parse_addr("//p:a").unwrap();
-        let e = anyhow::Error::new(embedded()).context("execute //p:a");
-        assert_eq!(
-            cause_chain(&e, &a.format()),
-            "Generic GCS error: token refused"
+        let e = hplugin::diagnostic::with_stage(
+            anyhow::Error::new(embedded()),
+            hplugin::diagnostic::Boundary::Execute,
+            &a,
         );
+        assert_eq!(cause_chain(&e), "Generic GCS error: token refused");
     }
 
     #[test]
@@ -1792,10 +1789,13 @@ mod tests {
     #[test]
     fn renders_target_failure_with_log_box() {
         let addr = crate::htaddr::parse_addr("//simple_fail:d1").unwrap();
-        let source = anyhow::Error::new(dummy_process_failed())
-            .context("driver run")
-            .context("run")
-            .context("execute //simple_fail:d1");
+        use hplugin::diagnostic::{Boundary, with_stage};
+        let source = anyhow::Error::new(dummy_process_failed()).context("driver run");
+        let source = with_stage(
+            with_stage(source, Boundary::Run, &addr),
+            Boundary::Execute,
+            &addr,
+        );
         let log = "stuff\nstuff\nstuff\nstuff\nstuff\nstuff\nstuff\nstuff\nnot gucci";
         let f = TargetFailure::new(
             addr,
@@ -1809,7 +1809,7 @@ mod tests {
         let rendered = render_target_failure(&f, false);
         let expected = "\
 × target failed: //simple_fail:d1
-╰─▶ run: driver run: process exited with status: exit status: 1
+╰─▶ driver run: process exited with status: exit status: 1
     ╭─[log]
   1 │ stuff
   2 │ stuff
@@ -1983,11 +1983,14 @@ mod tests {
         // raw multi-line Display dumped into the inline cause.
         let addr = crate::htaddr::parse_addr("//gen:proto").unwrap();
         let diff = "--- tree\n+++ generated\n-old line\n+new line\n";
-        let source = anyhow::Error::new(FrozenCheckError {
-            addr: addr.clone(),
-            diff: diff.to_string(),
-        })
-        .context("execute //gen:proto");
+        let source = hplugin::diagnostic::with_stage(
+            anyhow::Error::new(FrozenCheckError {
+                addr: addr.clone(),
+                diff: diff.to_string(),
+            }),
+            hplugin::diagnostic::Boundary::Execute,
+            &addr,
+        );
         let f = TargetFailure::new(addr, None, source);
 
         let rendered = render_target_failure(&f, false);

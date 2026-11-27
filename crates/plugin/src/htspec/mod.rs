@@ -22,7 +22,7 @@ use anyhow::Context as _;
 use hcore::htvalue::signature::ParamType;
 use hcore::htvalue::{
     Value, parse_bool, parse_map_string_map_string_strings, parse_map_string_string,
-    parse_map_string_strings, parse_string, parse_strings,
+    parse_map_string_strings, parse_string, parse_strings, starlark_str,
 };
 
 pub use htspec_derive::{Spec, SpecEnum, SpecStruct, SpecUnion};
@@ -242,11 +242,11 @@ fn ordered_map<T>(
             .iter()
             .map(|(k, v)| {
                 reject_deferred_reference(k)?;
-                let parsed = value(v).with_context(|| format!("key {k:?}"))?;
+                let parsed = value(v).with_context(|| format!("key {}", starlark_str(k)))?;
                 Ok((k.clone(), parsed))
             })
             .collect(),
-        other => anyhow::bail!("invalid: expected {expected}, got: {other:?}"),
+        other => anyhow::bail!("invalid: expected {expected}, got: {}", other.to_starlark()),
     }
 }
 
@@ -300,7 +300,7 @@ impl FromSpecValue for u32 {
             Value::Uint(u) => {
                 i64::try_from(*u).map_err(|_e| anyhow::anyhow!("integer too large"))?
             }
-            _ => anyhow::bail!("invalid: expected int, got: {:?}", v),
+            _ => anyhow::bail!("invalid: expected int, got: {}", v.to_starlark()),
         };
         // Said in a BUILD author's words: `u32` is not a type they wrote.
         u32::try_from(n).map_err(|_e| {
@@ -322,7 +322,7 @@ impl FromSpecValue for std::num::NonZeroU64 {
         let n = match v {
             Value::Uint(u) => i128::from(*u),
             Value::Int(i) => i128::from(*i),
-            _ => anyhow::bail!("invalid: expected int, got: {:?}", v),
+            _ => anyhow::bail!("invalid: expected int, got: {}", v.to_starlark()),
         };
         u64::try_from(n)
             .ok()

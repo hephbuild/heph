@@ -1867,9 +1867,10 @@ impl Provider {
                         let _slot = slot;
                         let loader =
                             BuildFileLoader::new(root, patterns, file_cache, dir_cache, registry, kwargs, globals, walker, packages, loads);
-                        loader
-                            .load_pkg(&key)
-                            .with_context(|| format!("pkg: `{}`", key))
+                        // No `pkg:` context: the engine's frames name the
+                        // package, and an evaluation failure is a diagnostic
+                        // naming its file.
+                        loader.load_pkg(&key)
                     })
                     .await
                 }),
@@ -2012,10 +2013,9 @@ impl BuildFileLoader {
 
         let mut parts = Vec::with_capacity(files.len());
         for file in files {
-            parts.push(
-                self.load_file(file, pkg)
-                    .with_context(|| format!("file: {}", file.display()))?,
-            );
+            // No context: a failed evaluation is a diagnostic that already
+            // names the file, workspace-relative.
+            parts.push(self.load_file(file, pkg)?);
         }
 
         let merged = Arc::new(merge_pkg_results(&self.root, pkg, &parts)?);
@@ -2084,7 +2084,7 @@ impl BuildFileLoader {
 
             let result = Arc::new(
                 eval_file(file_path, pkg, self)
-                    .with_context(|| format!("evaluating {}", file_path.display()))?,
+                    .map_err(|e| eval_diagnostic(&self.root, file_path, e))?,
             );
             self.file_cache
                 .lock()
@@ -2397,7 +2397,137 @@ pub(crate) fn rel_display(root: &Path, path: &Path) -> String {
 /// ([`hxstarlark_fmt::DIALECT`]). The one parse both evaluation and the load
 /// walk go through.
 pub(crate) fn parse_build_file(path: &Path) -> anyhow::Result<AstModule> {
-    AstModule::parse_file(path, &hxstarlark_fmt::DIALECT).map_err(starlark::Error::into_anyhow)
+    AstModule::parse_file(path, &hxstarlark_fmt::DIALECT).map_err(StarlarkError::into_anyhow)
+}
+
+/// A starlark parse or evaluation error, kept typed inside `anyhow` so the
+/// loader can read its span when it reports the failure ([`eval_diagnostic`]).
+/// It displays and chains exactly as `starlark::Error::into_anyhow` does.
+struct StarlarkError(starlark::Error);
+
+impl StarlarkError {
+    fn into_anyhow(e: starlark::Error) -> anyhow::Error {
+        anyhow::Error::new(Self(e))
+    }
+}
+
+impl std::fmt::Display for StarlarkError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::fmt::Debug for StarlarkError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for StarlarkError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0.kind().source()
+    }
+}
+
+/// `file`'s failed evaluation as the user's [`Diagnostic`] (`Stage::Eval`):
+/// starlark's own message, at a workspace-relative `file:line:col` taken from
+/// its span, with the spanned source lines as the snippet. Starlark's own
+/// `-->`/`|` layout is not kept: the renderer frames the snippet itself.
+///
+/// - A `load()` whose file failed carries that file's diagnostic, which is the
+///   culprit: it is returned as is, under a context naming the load site.
+/// - An error with no span is placed at `file`, by path alone.
+/// - An error that is not starlark's (the function-reference check, a freeze)
+///   keeps its text, with a leading absolute `file` made workspace-relative.
+///
+/// The diagnostic replaces the error: nothing below it is kept, as starlark's
+/// wrapper already hid it from a typed lookup.
+fn eval_diagnostic(root: &Path, file: &Path, e: anyhow::Error) -> anyhow::Error {
+    use hplugin::diagnostic::{Diagnostic, SourceLoc, Stage, find_diagnostic};
+    use starlark::ErrorKind;
+
+    let rel = rel_display(root, file);
+    let se = match e.downcast::<StarlarkError>() {
+        Ok(StarlarkError(se)) => se,
+        Err(e) => {
+            if find_diagnostic(&e).is_some() {
+                return e;
+            }
+            let text = hcore::hmemoizer::chain_message(&e);
+            let abs = file.display().to_string();
+            let message = match text.strip_prefix(abs.as_str()) {
+                Some(rest) => format!("{rel}{rest}"),
+                None => format!("{rel}: {text}"),
+            };
+            return anyhow::Error::new(Diagnostic::new(Stage::Eval, message).bounded());
+        }
+    };
+
+    let at = se.span().map(|span| {
+        let resolved = span.resolve_span();
+        let line = |l: usize| u32::try_from(l + 1).unwrap_or(u32::MAX);
+        let span_file = rel_display(root, Path::new(span.filename()));
+        let loc = SourceLoc::checked(
+            span_file.clone(),
+            line(resolved.begin.line),
+            line(resolved.begin.column),
+        );
+        let snippet = (resolved.begin.line..=resolved.end.line)
+            .map_while(|l| span.file.line_span_opt(l))
+            .map(|s| span.file.source_span(s).trim_end_matches(['\n', '\r']))
+            .collect::<Vec<_>>()
+            .join("\n");
+        (loc, span_file, resolved.begin, snippet)
+    });
+
+    let loaded = matches!(
+        se.kind(),
+        ErrorKind::Other(inner) | ErrorKind::Native(inner) if find_diagnostic(inner).is_some()
+    );
+    let mut message = match se.kind() {
+        ErrorKind::Other(inner) | ErrorKind::Native(inner) => {
+            hcore::hmemoizer::chain_message(inner)
+        }
+        kind => format!("{kind:#}"),
+    };
+    // Starlark's traceback, as it writes it, with each file workspace-relative:
+    // the calls (a macro's, a matrix cell's) that led to the error.
+    let frames = &se.call_stack().frames;
+    if !frames.is_empty() {
+        message.push_str("\nTraceback (most recent call last):");
+        let mut caller = "<module>";
+        for frame in frames {
+            let entry = match &frame.location {
+                Some(loc) => {
+                    let at = loc.resolve().begin_file_line();
+                    let file = rel_display(root, Path::new(&at.file));
+                    let line = loc.file.source_line_at_pos(loc.span.begin()).trim();
+                    format!("\n  * {file}:{}, in {caller}\n      {line}", at.line + 1)
+                }
+                None => format!("\n  File <builtin>, in {caller}"),
+            };
+            message.push_str(&entry);
+            caller = &frame.name;
+        }
+    }
+    let site = match &at {
+        Some((Ok(loc), ..)) => loc.to_string(),
+        Some((Err(_), span_file, begin, _)) => format!("{span_file}:{begin}"),
+        None => rel,
+    };
+    if loaded && let ErrorKind::Other(inner) | ErrorKind::Native(inner) = se.into_kind() {
+        return inner.context(format!("load() at {site}"));
+    }
+
+    let d = match at {
+        Some((Ok(loc), _, _, snippet)) => Diagnostic::new(Stage::Eval, message)
+            .with_location(loc)
+            .with_snippet(snippet),
+        // Outside the workspace (or no span at all): the position goes in the
+        // text, since a location is workspace-relative by contract.
+        _ => Diagnostic::new(Stage::Eval, format!("{site}: {message}")),
+    };
+    anyhow::Error::new(d.bounded())
 }
 
 /// [`parse_build_file`] over source already read, named `name` in spans and
@@ -2694,7 +2824,7 @@ fn eval_ast(
         eval.set_loader(&scoped);
 
         eval.eval_module(ast, globals)
-            .map_err(starlark::Error::into_anyhow)?;
+            .map_err(StarlarkError::into_anyhow)?;
         // Drop the evaluator (and its borrow of `module`) before freezing.
         drop(eval);
         module
@@ -3507,6 +3637,80 @@ target(
             chain.contains("undefined_symbol"),
             "eval error must name the offending symbol: {chain}"
         );
+    }
+
+    /// D2 / F2: a BUILD file that does not evaluate fails with one `Eval`
+    /// diagnostic at a workspace-relative `file:line:col`, carrying starlark's
+    /// message once, the spanned line as its snippet, and none of the old
+    /// `pkg:` / `file:` / `evaluating` frames or the absolute path.
+    #[test]
+    fn eval_error_is_a_diagnostic_at_a_workspace_relative_location() {
+        use hplugin::diagnostic::{Stage, find_diagnostic};
+        let tmp_dir = tempdir().unwrap();
+        let pkg = tmp_dir.path().join("p");
+        fs::create_dir_all(&pkg).unwrap();
+        fs::write(pkg.join("BUILD"), "A = 1\nX = undefined_symbol\n").unwrap();
+        let provider = make_provider(&tmp_dir);
+        let err = run_pkg_blocking(&provider, "p").unwrap_err();
+
+        let d = find_diagnostic(&err).unwrap_or_else(|| panic!("a diagnostic: {err:#}"));
+        assert_eq!(d.stage, Stage::Eval);
+        assert_eq!(d.addr, None, "a file culprit has no target");
+        let loc = d.location.as_ref().expect("a location");
+        assert_eq!((loc.file.as_str(), loc.line, loc.col), ("p/BUILD", 2, 5));
+        assert_eq!(d.snippet.as_deref(), Some("X = undefined_symbol"));
+        assert_eq!(
+            d.message.matches("undefined_symbol").count(),
+            1,
+            "{}",
+            d.message
+        );
+
+        let chain = format!("{err:#}");
+        let abs = tmp_dir.path().display().to_string();
+        for leak in ["pkg: `", "file: ", "evaluating", "-->", abs.as_str()] {
+            assert!(!chain.contains(leak), "{leak:?} in {chain}");
+        }
+        assert!(chain.starts_with("p/BUILD:2:5: "), "{chain}");
+    }
+
+    /// A `load()` of a file that does not evaluate is blamed on that file: the
+    /// loaded file's diagnostic is the one found, not the load statement's.
+    #[test]
+    fn failed_load_is_a_diagnostic_in_the_loaded_file() {
+        use hplugin::diagnostic::find_diagnostic;
+        let tmp_dir = tempdir().unwrap();
+        let root = tmp_dir.path();
+        fs::write(root.join("defs.BUILD"), "\nN = nope\n").unwrap();
+        let pkg = root.join("p");
+        fs::create_dir_all(&pkg).unwrap();
+        fs::write(pkg.join("BUILD"), "load(\"//defs.BUILD\", \"N\")\n").unwrap();
+        let provider = make_provider(&tmp_dir);
+        let err = run_pkg_blocking(&provider, "p").unwrap_err();
+
+        let d = find_diagnostic(&err).unwrap_or_else(|| panic!("a diagnostic: {err:#}"));
+        let loc = d.location.as_ref().expect("a location");
+        assert_eq!((loc.file.as_str(), loc.line, loc.col), ("defs.BUILD", 2, 5));
+        assert!(d.message.contains("nope"), "{}", d.message);
+        let chain = format!("{err:#}");
+        assert!(chain.starts_with("load() at p/BUILD:1:"), "{chain}");
+    }
+
+    /// A parse error is a diagnostic too, at the offending token.
+    #[test]
+    fn parse_error_is_a_diagnostic_with_a_location() {
+        use hplugin::diagnostic::find_diagnostic;
+        let tmp_dir = tempdir().unwrap();
+        let pkg = tmp_dir.path().join("p");
+        fs::create_dir_all(&pkg).unwrap();
+        fs::write(pkg.join("BUILD"), "target(name = \n").unwrap();
+        let provider = make_provider(&tmp_dir);
+        let err = run_pkg_blocking(&provider, "p").unwrap_err();
+
+        let d = find_diagnostic(&err).unwrap_or_else(|| panic!("a diagnostic: {err:#}"));
+        let loc = d.location.as_ref().expect("a location");
+        assert_eq!(loc.file, "p/BUILD");
+        assert!(!d.message.contains("-->"), "{}", d.message);
     }
 
     /// `transitive_ty` lists exactly `SANDBOX_KEYS`, and every listed key reaches
