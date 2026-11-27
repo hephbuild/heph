@@ -1207,6 +1207,12 @@ impl RequestState {
         self.data.engine.upgrade().map(|e| e.home.to_path_buf())
     }
 
+    /// The workspace root, while the engine is alive: what a report's
+    /// messages name paths relative to.
+    pub fn workspace_root(&self) -> Option<std::path::PathBuf> {
+        self.data.engine.upgrade().map(|e| e.root().to_path_buf())
+    }
+
     /// The first recorded failure in insertion order, if any. Fallback for
     /// boundary surfacing when the marker's named root wasn't itself recorded
     /// (e.g. a link-time resolution aggregation whose causes were recorded

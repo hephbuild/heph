@@ -1876,7 +1876,12 @@ pub(crate) fn material_from_text(
             serde_json::Value::String(s) => s.clone(),
             serde_json::Value::Number(n) => n.to_string(),
             serde_json::Value::Bool(b) => b.to_string(),
-            other => anyhow::bail!("`{key}` is {other}, which is not a credential field"),
+            // Names the JSON type only: the value is the source's output, and
+            // an object or array under a credential key holds material (I7).
+            other => anyhow::bail!(
+                "`{key}` is {}, which is not a credential field",
+                json_type(other)
+            ),
         };
         out.insert(field.clone(), s);
     }
@@ -1889,6 +1894,18 @@ pub(crate) fn material_from_text(
         files: BTreeMap::new(),
         expires_at,
     })
+}
+
+/// A JSON value's type, as an error names it in place of the value.
+fn json_type(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
 }
 
 /// A dotted path into a JSON document: `data.token`.
@@ -2302,6 +2319,30 @@ mod tests {
         )
         .expect_err("must fail");
         assert!(format!("{err:#}").contains("SecretAccessKey"), "{err:#}");
+    }
+
+    /// A field map pointing at a subtree: the error names the subtree's JSON
+    /// type, never its content, which is the source's material (I7).
+    #[test]
+    fn credential_json_subtree_names_type_only() {
+        for (doc, ty) in [
+            (r#"{"creds":{"secret":"s3cr3t-obj"}}"#, "an object"),
+            (r#"{"creds":["s3cr3t-arr"]}"#, "an array"),
+            (r#"{"creds":null}"#, "null"),
+        ] {
+            let err = material_from_text(
+                doc,
+                &BTreeMap::from([("token".to_string(), "creds".to_string())]),
+                None,
+            )
+            .expect_err("a subtree is not a field");
+            let err = format!("{err:#}");
+            assert!(
+                err.contains(&format!("`creds` is {ty}, which is not a credential field")),
+                "{err}"
+            );
+            assert!(!err.contains("s3cr3t"), "the error quoted material: {err}");
+        }
     }
 
     #[test]
