@@ -498,6 +498,14 @@ pub struct RequestStateData {
     /// execution for rendering. Shared via `Arc<RequestStateData>`, so
     /// `with_parent` / `with_skip_provider` children record into the same map.
     pub failures: Mutex<indexmap::IndexMap<Culprit, Arc<TargetFailure>>>,
+    /// The target behind each `_transitive_<hash>_<i>` origin id a
+    /// dependent's merged transitive inputs carry, keyed by `<hash>`
+    /// (`Addr::hash_str`): who declared a merged input, for a failure that
+    /// blames the declarer ([`MissingDep`](hplugin::error::MissingDep)).
+    /// Filled by `collect_transitive_deps` only when a transitive merges, and
+    /// read only on a failure. Never reaches a hash: the origin ids keep
+    /// their text; this is the reverse lookup, held for the request.
+    transitive_declarers: Mutex<FxHashMap<String, Addr>>,
     /// What each root failure took down, keyed by the root's formatted addr:
     /// the targets whose `ResultEnd` named it as `upstream_of`. Read by the
     /// interactive failure report's `took down:` row.
@@ -1145,6 +1153,33 @@ impl RequestState {
     /// [`get_failure`](Self::get_failure) for any culprit, a file included.
     pub fn get_culprit_failure(&self, culprit: &Culprit) -> Option<Arc<TargetFailure>> {
         self.data.failures.lock().get(culprit).cloned()
+    }
+
+    /// Note that `_transitive_<hash>_…` origin ids name `addr`'s transitive
+    /// declarations; `hash` is `addr.hash_str()`.
+    pub(crate) fn note_transitive_declarer(&self, hash: &str, addr: &Addr) {
+        let mut map = self.data.transitive_declarers.lock();
+        if !map.contains_key(hash) {
+            map.insert(hash.to_owned(), addr.clone());
+        }
+    }
+
+    /// The target that declared a merged transitive input, from its origin
+    /// id: the innermost `_transitive_<hash>_` segment this request noted
+    /// (a group's merged transitive nests its member's), else the next one
+    /// out. `None` for an id that is not a merged transitive's, or one whose
+    /// declarer this request never merged.
+    pub(crate) fn transitive_declarer(&self, origin_id: &str) -> Option<Addr> {
+        const PREFIX: &str = "_transitive_";
+        let map = self.data.transitive_declarers.lock();
+        origin_id
+            .rmatch_indices(PREFIX)
+            .filter_map(|(at, _)| {
+                let rest = origin_id.get(at + PREFIX.len()..)?;
+                map.get(rest.split('_').next()?)
+            })
+            .next()
+            .cloned()
     }
 
     /// Note that `addr` failed only because `root` did. Bounded per root: the
@@ -1825,6 +1860,7 @@ impl Engine {
             bg_pending: Arc::clone(&bg_pending),
             sandbox_removals: crate::engine::sandbox_cleaner::PendingCounter::default(),
             failures: Mutex::new(indexmap::IndexMap::new()),
+            transitive_declarers: Mutex::new(FxHashMap::default()),
             took_down: Mutex::new(FxHashMap::default()),
             cancelled: Mutex::new(FxHashSet::default()),
             approval,

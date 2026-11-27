@@ -411,16 +411,27 @@ impl Engine {
         inputs
             .iter()
             .map(move |input| {
+                // A dependent's merged transitive input was declared by the
+                // target it came from, not by `declarer`: keep what can look
+                // that target up (only for such an input; a failure reads it).
+                let transitive = transitive_origin(&input.origin_id).map(|_| rs.clone());
                 Arc::clone(self)
                     .get_def(rs.clone(), &input.r#ref.r#ref)
                     .map(move |def| {
                         let def = def.map_err(|e| {
                             let dep = &input.r#ref.r#ref;
+                            let real = transitive
+                                .as_ref()
+                                .and_then(|rs| rs.transitive_declarer(&input.origin_id));
+                            let declarer = real.as_ref().unwrap_or(declarer);
                             MissingDep::wrap_or(
                                 e,
                                 dep,
                                 declarer,
-                                || declared_origin(&input.origin_id),
+                                || {
+                                    transitive_origin(&input.origin_id)
+                                        .unwrap_or_else(|| declared_origin(&input.origin_id))
+                                },
                                 || {
                                     Some(InputDefFailed {
                                         input: dep.clone(),
@@ -442,6 +453,38 @@ impl Engine {
                     })
             })
             .collect::<FuturesOrdered<_>>()
+    }
+}
+
+/// The option a merged transitive input was declared under, from its origin
+/// id (`_transitive_<hash>_<i>_<kind>_<id>`, nested once per group it came
+/// through): `transitive.deps` / `transitive.tools` for the innermost
+/// declaration. `None` for an id that is not a merged transitive's.
+fn transitive_origin(origin_id: &str) -> Option<String> {
+    const PREFIX: &str = "_transitive_";
+    let at = origin_id.rfind(PREFIX)?;
+    let rest = origin_id.get(at + PREFIX.len()..)?;
+    let inner = rest.splitn(4, '_').nth(3)?;
+    Some(format!("transitive.{}", declared_origin(inner)))
+}
+
+#[cfg(test)]
+mod transitive_origin_tests {
+    use super::transitive_origin;
+
+    #[test]
+    fn transitive_origin_names_innermost_option() {
+        assert_eq!(
+            transitive_origin("_transitive_ab12_0_dep_dep||0").as_deref(),
+            Some("transitive.deps")
+        );
+        // Through a group: the member's own declaration.
+        assert_eq!(
+            transitive_origin("_transitive_99_1_dep__transitive_ab12_0_tool_tool||3").as_deref(),
+            Some("transitive.tools")
+        );
+        assert_eq!(transitive_origin("dep||0"), None);
+        assert_eq!(transitive_origin("_transitive_ab12_0"), None);
     }
 }
 
