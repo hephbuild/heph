@@ -405,15 +405,40 @@ gcroot.
 target(
     name = "runner",
     driver = "oci.runner",
-    image = "myimage:dev",
-    deps = ["//svc:load"],      # the oci.load that puts it in the daemon
+    image = "//svc:load",       # the oci.load that puts the image in the daemon
 )
 ```
 
-The fingerprint is the image's content digest, resolved from the daemon. A tag
-is a moving pointer; retagging `:latest` moves the digest, which re-keys every
-consumer. The container is launched **by digest**, so the container that runs
-the build is the one the fingerprint describes even if the tag moves mid-build.
+`image` is usually the `oci.load` target that puts the image in the daemon.
+The runner depends on it and inspects the ref it wrote, so the ref is stated
+once, on the load, whether its `tag` is derived or fixed.
+
+`image` may instead be a literal reference (`image = "myimage:dev"`), for an
+image put in the daemon from outside the build. The runner then depends on
+nothing. `oci.runner` takes no `deps`: an image the build loads is named by its
+`oci.load` target.
+
+The target named as `image` must write exactly one file holding one ref.
+`oci.load`'s `<name>.ref` is that file. Anything else (no output, two files,
+two lines, a ref starting with `-`) fails the runner, naming the target,
+before docker is asked about it.
+
+The fingerprint is the image's content digest, resolved from the daemon. A
+tag is a moving pointer: retagging `:latest` moves the digest, which re-keys
+every consumer. The runner is therefore **never cached**, whichever way
+`image` is given. A load with a fixed `tag` writes the same ref whichever
+image it loaded, so nothing in the runner's own key moves on a reload, and a
+cached runner would keep describing the old image. The cost is one
+`docker image inspect` per build, and a build that uses the runner fails when
+the daemon is down. Consumers key on `runner.json`'s bytes, which move only
+when the digest does, so they stay cache hits until the image changes.
+
+With a fixed `tag`, two builds sharing one daemon can race: another build's
+load can retag the image between this build's load and its runner's inspect.
+A derived tag (no `tag`, or a repository only) is immune.
+
+The container is launched **by digest**, so the container that runs the build
+is the one the fingerprint describes even if the tag moves mid-build.
 
 One container is held open and each target enters it with `docker exec`. The
 plugin implements the `oci` runner itself rather than naming `session`, for two

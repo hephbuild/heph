@@ -42,12 +42,11 @@ target(
 # The image the service actually ships in, so a check can run against the real
 # runtime rather than against the developer's machine. Needs a docker daemon.
 #
-# `image` must already be in the daemon, which is what the `deps` on the
-# `oci.load` target below arranges — and, because that load is a hashed dep, a
-# rebuilt image re-derives this runner and re-keys everything that ran in it.
+# `image` names the `oci.load` target that puts the image in the daemon: the
+# runner depends on it and inspects the ref it loaded, so a rebuilt image moves
+# this runner's digest and re-keys everything that ran in it.
 target(
     name = "container",
     driver = "oci.runner",
-    image = "heph-example-billing:dev",
-    deps = ["//execrunner/app:load"],
+    image = "//execrunner/app:load",
 )

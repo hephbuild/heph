@@ -225,6 +225,211 @@ async fn the_mounted_home_is_the_resolved_one_even_in_a_package_named_sandbox() 
     Ok(())
 }
 
+/// A workspace whose `docker` is a stub: it records its argv to `calls.log` and
+/// answers `image inspect` with whatever `digest` holds, beside it in `bin`.
+#[cfg(unix)]
+fn stub_docker_workspace(bin: &std::path::Path) -> anyhow::Result<htestkit::Workspace> {
+    let docker = bin.join("docker");
+    let dir = bin.to_string_lossy();
+    hcore::fsutil::write_executable(
+        &docker,
+        format!("#!/bin/sh\necho \"$@\" >> '{dir}/calls.log'\ncat '{dir}/digest'\n").as_bytes(),
+    )?;
+    WorkspaceBuilder::new()?
+        .with_provider(|init| {
+            Box::new(heph::pluginbuildfile::Provider::new(
+                init.root.to_path_buf(),
+                init.runtime.clone(),
+                std::sync::Arc::clone(&init.functions),
+            ))
+        })
+        .with_managed_driver(Box::new(
+            heph::pluginexec::Driver::new_bash().with_host_path(),
+        ))
+        .with_plugin("oci", move |init| {
+            Ok(
+                heph::engine::PluginParts::default().with_managed_driver(Box::new(
+                    pluginoci::runner::Driver::new(init.home.to_path_buf())
+                        .with_docker_bin(docker.to_string_lossy().into_owned()),
+                )),
+            )
+        })
+        .build()
+}
+
+/// `image` may name the target that loaded the image: the runner inspects the
+/// ref that target wrote, so the BUILD file states the ref once, on the load.
+///
+/// The load is a bash stand-in writing a fixed ref, as `oci.load` with a fixed
+/// `tag` does. No daemon needed.
+#[cfg(unix)]
+#[tokio::test]
+async fn image_can_name_the_target_that_loaded_it() -> anyhow::Result<()> {
+    let bin = tempfile::tempdir()?;
+    std::fs::write(bin.path().join("digest"), "sha256:one\n")?;
+    let ws = stub_docker_workspace(bin.path())?;
+    ws.write_build_file(
+        "svc",
+        r#"
+target(name = "load", driver = "bash", run = "printf 'app:dev' > $OUT", out = "load.ref")
+target(name = "runner", driver = "oci.runner", image = ":load")
+"#,
+    );
+
+    let doc = common::artifact_string(&*ws.run("//svc:runner").await?);
+    assert!(doc.contains("oci:sha256:one"), "{doc}");
+    let calls = std::fs::read_to_string(bin.path().join("calls.log"))?;
+    assert_eq!(
+        calls.trim(),
+        "image inspect --format {{.Id}} app:dev",
+        "the runner must inspect the ref the load target wrote"
+    );
+    Ok(())
+}
+
+/// **Why a target `image` re-resolves on every build.** A load with a fixed
+/// `tag` writes the same ref whichever image it loaded, so nothing in the
+/// runner's inputs moves when the image does. The runner must still see the
+/// new digest, or every consumer keeps its cache entries from the old image.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_reload_under_a_fixed_tag_moves_the_fingerprint() -> anyhow::Result<()> {
+    reload_moves_the_fingerprint(
+        r#"target(name = "runner", driver = "oci.runner", image = ":load")"#,
+    )
+    .await
+}
+
+/// The same reload, with `image` given as the ref. Nothing in the runner's key
+/// moves when the daemon retags it, so a cached runner would keep serving the
+/// old digest: this form is not cached either.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_reload_under_a_fixed_tag_moves_a_reference_runners_fingerprint() -> anyhow::Result<()> {
+    reload_moves_the_fingerprint(
+        r#"target(name = "runner", driver = "oci.runner", image = "app:dev")"#,
+    )
+    .await
+}
+
+/// Builds `//svc:runner` (declared by `runner`, beside a load writing the fixed
+/// ref `app:dev`), swaps the image the daemon holds under that ref, and builds
+/// it again: the second build must inspect again and see the new digest.
+#[cfg(unix)]
+async fn reload_moves_the_fingerprint(runner: &str) -> anyhow::Result<()> {
+    let bin = tempfile::tempdir()?;
+    std::fs::write(bin.path().join("digest"), "sha256:one\n")?;
+    let ws = stub_docker_workspace(bin.path())?;
+    ws.write_build_file(
+        "svc",
+        &format!(
+            "target(name = \"load\", driver = \"bash\", run = \"printf 'app:dev' > $OUT\", \
+             out = \"load.ref\")\n{runner}\n"
+        ),
+    );
+    let before = common::artifact_string(&*ws.run("//svc:runner").await?);
+
+    // The daemon now holds a different image under the same tag.
+    std::fs::write(bin.path().join("digest"), "sha256:two\n")?;
+    let after = common::artifact_string(&*ws.run("//svc:runner").await?);
+
+    assert!(before.contains("oci:sha256:one"), "{before}");
+    assert!(
+        after.contains("oci:sha256:two"),
+        "the runner must re-resolve the digest behind an unchanged ref; got {after}"
+    );
+    let calls = std::fs::read_to_string(bin.path().join("calls.log"))?;
+    assert_eq!(
+        calls.lines().collect::<Vec<_>>(),
+        ["image inspect --format {{.Id}} app:dev"; 2],
+        "each build must ask docker once"
+    );
+    Ok(())
+}
+
+/// A target whose output is not a ref (here, two lines) fails naming what
+/// `image` expects, before docker is asked anything.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_image_target_that_wrote_no_ref_is_refused() -> anyhow::Result<()> {
+    image_target_is_refused(
+        r#"target(name = "load", driver = "bash", run = "printf 'a:1\nb:2\n' > $OUT", out = "load.ref")"#,
+    )
+    .await
+}
+
+/// A ref the daemon does not hold names the ref, the `image` target that wrote
+/// it, and what that target must do — not the advice for a literal ref.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_absent_target_image_names_the_target() -> anyhow::Result<()> {
+    let bin = tempfile::tempdir()?;
+    // No `digest` file: the stub's `cat` fails, as `docker image inspect` does
+    // for an image the daemon does not hold.
+    let ws = stub_docker_workspace(bin.path())?;
+    ws.write_build_file(
+        "svc",
+        r#"
+target(name = "load", driver = "bash", run = "printf 'app:dev' > $OUT", out = "load.ref")
+target(name = "runner", driver = "oci.runner", image = ":load")
+"#,
+    );
+
+    let err = match ws.run("//svc:runner").await {
+        Ok(_) => panic!("an image the daemon does not have must fail the build"),
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(
+        err.contains("\"app:dev\", the ref the `image` target //svc:load wrote"),
+        "{err}"
+    );
+    assert!(err.contains("oci.load"), "{err}");
+    assert!(!err.contains("as `image`"), "{err}");
+    Ok(())
+}
+
+/// A target with two outputs has no one ref to read: refused, not guessed.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_image_target_with_two_outputs_is_refused() -> anyhow::Result<()> {
+    image_target_is_refused(
+        r#"target(name = "load", driver = "bash", run = "printf 'app:dev' > a.ref; printf 'app:dev' > b.ref", out = ["a.ref", "b.ref"])"#,
+    )
+    .await
+}
+
+/// A target with no output wrote no ref at all.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_image_target_with_no_output_is_refused() -> anyhow::Result<()> {
+    image_target_is_refused(r#"target(name = "load", driver = "bash", run = "true")"#).await
+}
+
+/// Building `//svc:runner` with `image = ":load"` beside `load` fails naming
+/// what `image` expects and the target it named, before docker is asked.
+#[cfg(unix)]
+async fn image_target_is_refused(load: &str) -> anyhow::Result<()> {
+    let bin = tempfile::tempdir()?;
+    std::fs::write(bin.path().join("digest"), "sha256:one\n")?;
+    let ws = stub_docker_workspace(bin.path())?;
+    ws.write_build_file(
+        "svc",
+        &format!("{load}\ntarget(name = \"runner\", driver = \"oci.runner\", image = \":load\")\n"),
+    );
+
+    let Err(err) = ws.run("//svc:runner").await else {
+        anyhow::bail!("an `image` target that wrote no one ref must fail the runner");
+    };
+    let err = format!("{err:#}");
+    assert!(err.contains("oci.load"), "{err}");
+    assert!(err.contains("//svc:load"), "{err}");
+    assert!(
+        !bin.path().join("calls.log").exists(),
+        "docker must not be asked about a guessed ref"
+    );
+    Ok(())
+}
+
 /// The fingerprint is the image's content digest, taken from the daemon.
 ///
 /// Asserted against what `docker image inspect` reports rather than against a

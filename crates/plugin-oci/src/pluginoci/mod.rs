@@ -339,7 +339,7 @@ pub(crate) fn dep_single_file(
         .with_context(|| format!("dep {origin_id:?} produced no files"))?;
     anyhow::ensure!(
         paths.next().is_none(),
-        "dep {origin_id:?} produced more than one file; expected exactly one archive"
+        "dep {origin_id:?} produced more than one file; expected exactly one file"
     );
     Ok(first)
 }

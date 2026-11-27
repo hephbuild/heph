@@ -604,3 +604,68 @@ async fn link_reports_each_missing_named_output() -> anyhow::Result<()> {
     assert_eq!(format!("{err:#}"), missing_a);
     Ok(())
 }
+
+/// A `cache = False` producer runs on every build, but a cached consumer keys
+/// on what it *produced*: the same bytes again leave the consumer a hit, and
+/// only bytes that moved re-run it. `oci.runner` is never cached and relies on
+/// this, so a target running in its container is not rebuilt on every build.
+#[tokio::test]
+async fn an_uncached_producer_with_unchanged_bytes_leaves_its_consumer_cached() -> anyhow::Result<()>
+{
+    let ws = Workspace::new();
+    let producer_runs = ws.dir.path().join("producer-runs");
+    let consumer_runs = ws.dir.path().join("consumer-runs");
+    ws.write_file("p/value", "one\n");
+    ws.write_build_file(
+        "p",
+        &format!(
+            r#"
+target(name = "producer", driver = "bash", out = "value.txt", cache = False,
+       deps = {{"v": [file("value")]}},
+       run = "echo x >> {p}; cat $SRC_V > $OUT")
+target(name = "consumer", driver = "bash", out = "copy.txt",
+       deps = {{"producer": [":producer"]}},
+       run = "echo x >> {c}; cat $SRC_PRODUCER > $OUT")
+"#,
+            p = producer_runs.display(),
+            c = consumer_runs.display(),
+        ),
+    );
+    let runs =
+        |path: &std::path::Path| std::fs::read_to_string(path).map_or(0, |s| s.lines().count());
+    let build = async |engine: &std::sync::Arc<heph::engine::Engine>| {
+        let addr = heph::htaddr::parse_addr("//p:consumer")?;
+        let r = std::sync::Arc::clone(engine)
+            .result_addr(
+                engine.new_state(),
+                &addr,
+                heph::engine::OutputMatcher::All,
+                &heph::engine::ResultOptions::default(),
+            )
+            .await?;
+        anyhow::Ok(common::artifact_string(&r))
+    };
+
+    assert_eq!(build(&ws.engine).await?, "one\n");
+    assert_eq!(build(&ws.reopen()?).await?, "one\n");
+    assert_eq!(
+        runs(&producer_runs),
+        2,
+        "an uncached producer runs every build"
+    );
+    assert_eq!(
+        runs(&consumer_runs),
+        1,
+        "the producer wrote the same bytes, so the consumer is a cache hit"
+    );
+
+    ws.write_file("p/value", "two\n");
+    assert_eq!(build(&ws.reopen()?).await?, "two\n");
+    assert_eq!(runs(&producer_runs), 3);
+    assert_eq!(
+        runs(&consumer_runs),
+        2,
+        "the producer's bytes moved, so the consumer must run again"
+    );
+    Ok(())
+}
