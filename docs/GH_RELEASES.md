@@ -25,11 +25,11 @@ gh = heph.gh.release_asset(
 | `asset` | required | The asset's file name. |
 | `sha256` | none | Forwarded to `http_fetch`. Without it the fetch is unverified and `http_fetch` warns. |
 | `extract` | `False` | Unpack the asset. |
-| `format` | inferred | Archive format, with `extract` only: `tar`, `tar.gz` (`.tgz`), `tar.zst` (`.tzst`), `zip`. Inferred from `asset`'s suffix, case-insensitively; an unknown suffix needs `format =`. |
-| `strip_components` | `0` | With `extract` only: leading path components dropped, as `tar --strip-components`. Usually `1` for a GitHub tarball, which holds one top-level directory. |
+| `format` | inferred | Archive format, with `extract` only: `tar`, `tar.gz` (`.tgz`), `tar.xz` (`.txz`), `tar.zst` (`.tzst`), `zip`, or `gz` (`.gz`: one gzipped file, not a tar). Inferred from `asset`'s suffix, case-insensitively, the longest suffix winning (`x.tar.gz` is a `tar.gz`, `x.gz` a `gz`); an unknown suffix needs `format =`. |
+| `strip_components` | `0` | With `extract` only: leading path components dropped, as `tar --strip-components`. Usually `1` for a GitHub tarball, which holds one top-level directory. Refused with a `gz` asset, which is one file. |
 | `max_bytes` | 4 GiB | With `extract` only: the most bytes the archive may unpack to. |
 | `max_entries` | 1,000,000 | With `extract` only: the most entries the archive may hold. |
-| `executable` | `False` | Without `extract` only: mark the fetched file executable. |
+| `executable` | `False` | Mark the fetched file executable. With `extract`, only for a `gz` asset, whose one unpacked file it marks (gzip records no mode); refused with any other format, whose entries carry their own modes. |
 | `out` | see below | Without `extract`: the fetched file's name (default `asset`). With it: the output directory (default `name`). See [`out`](#out). |
 | `credentials` | none | Credential targets (`docs/CREDENTIALS.md`) for a private repository: the asset is fetched through the API. See [Private repositories](#private-repositories). |
 | `server_url` | `https://github.com` | The GitHub server the release is on. See [`server_url` and `api_url`](#server_url-and-api_url). |
@@ -93,6 +93,12 @@ heph.gh.release_asset(name = "gh", repo = "cli/cli", tag = "v2.40.0",
                       extract = True, strip_components = 1)
 # //p:gh is the directory p/gh/ (bin/gh, share/…); with out = "tools/gh",
 # the directory p/tools/gh/
+
+heph.gh.release_asset(name = "ra", repo = "rust-lang/rust-analyzer", tag = "2025-01-06",
+                      asset = "rust-analyzer-x86_64-unknown-linux-gnu.gz",
+                      extract = True, executable = True)
+# //p:ra is the directory p/ra/ holding one executable file,
+# rust-analyzer-x86_64-unknown-linux-gnu: a tool as it is
 ```
 
 A tool is one file; to put `gh` on a target's `PATH`, pick the binary out of

@@ -52,6 +52,21 @@ fn workspace() -> anyhow::Result<htestkit::Workspace> {
 /// A release tarball the way most projects ship one: everything under one
 /// top-level directory.
 fn tarball() -> &'static [u8] {
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gz.write_all(&plain_tar()).expect("gzip");
+    gz.finish().expect("gzip").leak()
+}
+
+/// [`tarball`]'s tar, xz-compressed.
+fn tar_xz() -> &'static [u8] {
+    let opts = lzma_rust2::XzOptions::with_preset(1);
+    let mut xz = lzma_rust2::XzWriter::new(Vec::new(), opts).expect("xz");
+    xz.write_all(&plain_tar()).expect("xz");
+    xz.finish().expect("xz").leak()
+}
+
+/// [`tarball`]'s tar, uncompressed.
+fn plain_tar() -> Vec<u8> {
     let mut b = tar::Builder::new(Vec::new());
     for (path, data, mode) in [
         ("tool-1.0/bin/hello", &b"#!/bin/sh\necho hello\n"[..], 0o755),
@@ -63,10 +78,7 @@ fn tarball() -> &'static [u8] {
         h.set_cksum();
         b.append_data(&mut h, path, data).expect("append");
     }
-    let tar = b.into_inner().expect("tar");
-    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    gz.write_all(&tar).expect("gzip");
-    gz.finish().expect("gzip").leak()
+    b.into_inner().expect("tar")
 }
 
 fn sha256(bytes: &[u8]) -> String {
@@ -167,6 +179,98 @@ heph.gh.release_asset(
     };
     let msg = format!("{err:#}");
     assert!(msg.contains("checksum mismatch"), "got: {msg}");
+    Ok(())
+}
+
+/// A `.tar.xz` asset: the format is inferred from the name, and the tree
+/// unpacks with its modes.
+#[tokio::test]
+async fn release_asset_extracts_a_tar_xz() -> anyhow::Result<()> {
+    let body = tar_xz();
+    let (url, _hits) = serve(body, 2);
+    let ws = workspace()?;
+    ws.write_build_file(
+        "p",
+        &format!(
+            r#"
+heph.gh.release_asset(
+    name = "tool",
+    repo = "acme/tool",
+    tag = "v1.0",
+    asset = "tool-1.0.tar.xz",
+    sha256 = "{}",
+    extract = True,
+    strip_components = 1,
+    server_url = "{url}",
+)
+"#,
+            sha256(body)
+        ),
+    );
+    assert_eq!(
+        ws.get_spec("//p:tool").await?.config.get("format"),
+        Some(&heph::htvalue::Value::String("tar.xz".to_string()))
+    );
+    let result = ws.run("//p:tool").await?;
+    assert_eq!(
+        files(&result),
+        vec![
+            ("p/tool/README".to_string(), "readme\n".to_string(), false),
+            (
+                "p/tool/bin/hello".to_string(),
+                "#!/bin/sh\necho hello\n".to_string(),
+                true
+            ),
+        ]
+    );
+    Ok(())
+}
+
+/// A binary shipped as one gzipped file (`tool-linux.gz`, as rust-analyzer
+/// ships): it unpacks to one file named after the asset minus `.gz`, and
+/// `executable = True` makes it runnable, since gzip records no mode.
+#[tokio::test]
+async fn release_asset_extracts_a_bare_gz_as_an_executable() -> anyhow::Result<()> {
+    const BIN: &[u8] = b"#!/bin/sh\necho gunzipped\n";
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gz.write_all(BIN)?;
+    let body: &'static [u8] = gz.finish()?.leak();
+    let (url, _hits) = serve(body, 4);
+    let ws = workspace()?;
+    ws.write_build_file(
+        "p",
+        &format!(
+            r#"
+[
+    heph.gh.release_asset(
+        name = name,
+        repo = "acme/tool",
+        tag = "v1.0",
+        asset = "tool-linux.gz",
+        sha256 = "{sha}",
+        extract = True,
+        executable = exe,
+        server_url = "{url}",
+    )
+    for name, exe in [("tool", True), ("data", False)]
+]
+"#,
+            sha = sha256(body)
+        ),
+    );
+    for (addr, x) in [("//p:tool", true), ("//p:data", false)] {
+        let result = ws.run(addr).await?;
+        let dir = addr.trim_start_matches("//p:");
+        assert_eq!(
+            files(&result),
+            vec![(
+                format!("p/{dir}/tool-linux"),
+                "#!/bin/sh\necho gunzipped\n".to_string(),
+                x
+            )],
+            "{addr}"
+        );
+    }
     Ok(())
 }
 

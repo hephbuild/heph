@@ -352,8 +352,9 @@ struct ReleaseAssetArgs {
     sha256: Option<String>,
     /// Unpack the asset (default `False`).
     extract: bool,
-    /// With `extract` only: the archive format, `tar`, `tar.gz`, `tar.zst` or
-    /// `zip`. Inferred from `asset`'s suffix by default.
+    /// With `extract` only: the archive format, `tar`, `tar.gz`, `tar.xz`,
+    /// `tar.zst`, `zip`, or `gz` (one gzipped file). Inferred from `asset`'s
+    /// suffix by default.
     #[spec(ty = FormatArg::spec_param_type())]
     format: Option<FormatArg>,
     /// With `extract` only: leading path components dropped, as `tar
@@ -368,8 +369,8 @@ struct ReleaseAssetArgs {
     /// 1,000,000).
     #[spec(ty = ParamType::Int)]
     max_entries: Option<NonZeroU64>,
-    /// Without `extract` only: mark the fetched file executable (default
-    /// `False`).
+    /// Mark the fetched file executable (default `False`); with `extract`,
+    /// a `gz` asset's one unpacked file, and refused for any other format.
     executable: bool,
     /// Without `extract`: the fetched file's name (default `asset`). With it:
     /// the output directory (default `name`).
@@ -665,12 +666,6 @@ fn release_asset(plugin: &str, pkg: &str, args: &FnArgs) -> anyhow::Result<FnOut
         return Ok(outcome);
     }
 
-    if executable {
-        bail!(
-            "`executable` marks a fetched file, and with `extract = True` there is none: \
-             the archive's own modes decide which extracted files are executable"
-        );
-    }
     let format = match format {
         Some(FormatArg(f)) => f,
         None => Format::infer(asset).with_context(|| {
@@ -681,6 +676,21 @@ fn release_asset(plugin: &str, pkg: &str, args: &FnArgs) -> anyhow::Result<FnOut
             )
         })?,
     };
+    // A bare `gz` is one file and records no mode, so it is the one format
+    // `executable` means something for; an archive's entries carry their own.
+    if executable && !format.takes_executable() {
+        bail!(
+            "`executable` with `extract = True` applies only to a `gz` asset (one gzipped \
+             file); a {} records each entry's mode",
+            format.as_str()
+        );
+    }
+    if format == Format::Gz && strip != 0 {
+        bail!(
+            "`strip_components` with a `gz` asset would remove its one file, which has no \
+             directory to strip; drop it"
+        );
+    }
     if out == Some(asset) || (out.is_none() && name == asset) {
         bail!(
             "the extracted directory and the fetched archive would both be {asset:?} in the \
@@ -702,6 +712,9 @@ fn release_asset(plugin: &str, pkg: &str, args: &FnArgs) -> anyhow::Result<FnOut
     .into();
     if strip != 0 {
         config.insert("strip_components".to_string(), Value::Int(i64::from(strip)));
+    }
+    if executable {
+        config.insert("executable".to_string(), Value::Bool(true));
     }
     config.extend(limits.into_iter().map(|(k, v)| (k.to_string(), v)));
     if let Some(out) = out {
@@ -1042,6 +1055,61 @@ mod tests {
             extract.config.get("max_entries"),
             None,
             "defaults in the driver"
+        );
+    }
+
+    /// A `.tar.xz` and a bare `.gz` asset infer their format from the name;
+    /// only the `gz`, one file with no recorded mode, takes `executable`, and
+    /// it reaches the extract, not the fetch.
+    #[test]
+    fn xz_and_gz_assets_infer_their_format_and_gz_takes_executable() {
+        let asset = |name: &'static str, extra: &[(&'static str, Value)]| {
+            let mut args: Vec<_> = base().into_iter().filter(|(k, _)| *k != "asset").collect();
+            args.extend([("asset", s(name)), ("extract", Value::Bool(true))]);
+            args.extend_from_slice(extra);
+            call(&args)
+        };
+        let out = asset("tool-linux.tar.xz", &[]).unwrap();
+        assert_eq!(
+            target(&out, "tool").config.get("format"),
+            Some(&s("tar.xz"))
+        );
+
+        let exe = [("executable", Value::Bool(true))];
+        let out = asset("tool-linux.gz", &exe).unwrap();
+        let extract = target(&out, "tool");
+        assert_eq!(extract.config.get("format"), Some(&s("gz")));
+        assert_eq!(extract.config.get("executable"), Some(&Value::Bool(true)));
+        let fetch = target(&out, "tool_archive");
+        assert_eq!(fetch.config.get("out"), Some(&s("tool-linux.gz")));
+        assert!(
+            !fetch.config.contains_key("executable"),
+            "the archive is data"
+        );
+
+        let plain = asset("tool-linux.gz", &[]).unwrap();
+        assert!(!target(&plain, "tool").config.contains_key("executable"));
+
+        let msg = format!("{:#}", asset("tool-linux.tar.xz", &exe).unwrap_err());
+        assert!(msg.contains("a tar.xz records each entry's mode"), "{msg}");
+
+        // A `gz` is one file: `strip_components` could only fail at run, so
+        // it is refused here, whether the format is inferred or named.
+        let strip = ("strip_components", Value::Int(1));
+        for extra in [
+            vec![strip.clone()],
+            vec![strip.clone(), ("format", s("gz"))],
+        ] {
+            let msg = format!("{:#}", asset("tool-linux.gz", &extra).unwrap_err());
+            assert!(
+                msg.contains("`strip_components` with a `gz` asset"),
+                "{msg}"
+            );
+        }
+        let out = asset("tool-linux.tar.xz", &[strip]).unwrap();
+        assert_eq!(
+            target(&out, "tool").config.get("strip_components"),
+            Some(&Value::Int(1))
         );
     }
 
@@ -1408,7 +1476,7 @@ mod tests {
                     ("extract", Value::Bool(true)),
                     ("executable", Value::Bool(true)),
                 ],
-                "`executable`",
+                "applies only to a `gz` asset",
             ),
             (&[("format", s("tar"))], "only with `extract = True`"),
             (
