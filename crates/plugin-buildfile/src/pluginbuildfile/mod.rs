@@ -1,6 +1,7 @@
 mod ast;
 mod checks;
 mod lsp;
+mod matrix;
 mod provider;
 mod run_file;
 #[cfg(test)]

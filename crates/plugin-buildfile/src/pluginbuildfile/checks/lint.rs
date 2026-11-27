@@ -408,6 +408,31 @@ TOP = heph.core.os()
         );
     }
 
+    /// T10: `heph.core.matrix` has a typed signature.
+    #[test]
+    fn matrix_signature_is_typed() {
+        let src = "\
+def f() -> None:
+    ok = heph.core.matrix(axes = {\"go-version\": [\"1.22\", 1, None], \"if\": [[1], {\"a\": 1}]}, cell = lambda **kw: kw, default = {\"go-version\": 1, \"if\": [1]}, exclude = [{\"if\": {\"a\": 1}}], include = [{\"go-version\": (1,), \"if\": True}])
+    bad_axes = heph.core.matrix(axes = 1)
+    bad_name = heph.core.matrix(axis = {\"a\": [\"b\"]})
+    bad_default = heph.core.matrix(axes = {\"a\": [\"b\"]}, default = 1)
+    string_default = heph.core.matrix(axes = {\"a\": [\"b\"]}, default = \"b\")
+    bad_values = heph.core.matrix(axes = {\"a\": \"b\"})
+";
+        let tmp = ws(&[("pkg/BUILD", src)]);
+        let found = lint_pkg(tmp.path(), "pkg", true);
+        let got = lines(&found);
+        assert_eq!(got.len(), 5, "{got:#?}");
+        for (line, finding) in [3, 4, 5, 6, 7].iter().zip(&got) {
+            assert!(
+                finding.starts_with(&format!("pkg/BUILD:{line}:"))
+                    && finding.contains("type-error"),
+                "{got:#?}"
+            );
+        }
+    }
+
     #[test]
     fn non_owned_findings_discarded() {
         let tmp = ws(&[

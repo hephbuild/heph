@@ -1,4 +1,5 @@
 use crate::pluginbuildfile::checks::targets::CheckKind;
+use crate::pluginbuildfile::matrix;
 use crate::pluginbuildfile::provider::{PackageList, Provider};
 use anyhow::Context;
 use enclose::enclose;
@@ -7,7 +8,7 @@ use hcore::htvalue::signature::{FnSignature, ParamType};
 use hcore::htvalue::{self, parse_map_string_string, parse_map_string_strings, parse_strings};
 use hmodel::htaddr;
 use hmodel::htpkg::PkgBuf;
-use hplugin::driver::sandbox::{Dep, Env, EnvValue, Mode, Sandbox, Tool};
+use hplugin::driver::sandbox::{Dep, Env, EnvValue, Mode, Sandbox, SandboxParts, Tool};
 use hplugin::driver::{DriverSchema, TargetAddr};
 use hplugin::function::{FnArgs, FnCallContext, FunctionRegistry, PluginFn};
 use hplugin::provider::{Approval, ProvenanceFrame};
@@ -20,7 +21,7 @@ use starlark::syntax::{AstModule, Dialect};
 use starlark::values::dict::DictRef;
 use starlark::values::float::UnpackFloat;
 use starlark::values::list::{AllocList, ListRef, UnpackList};
-use starlark::values::{UnpackValue, Value};
+use starlark::values::{UnpackValue, Value, ValueOfUnchecked};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -546,6 +547,7 @@ impl<'v> starlark::values::StarlarkValue<'v> for ProviderNativeFn {
                     approval: dt.approval,
                     config: dt.config,
                     provenance: Vec::new(),
+                    site: DeclSite::default(),
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()
@@ -568,8 +570,10 @@ impl<'v> starlark::values::StarlarkValue<'v> for ProviderNativeFn {
             } else {
                 Vec::new()
             };
+            let site = DeclSite::capture(eval, extra);
             for mut t in targets {
                 t.provenance = provenance.clone();
+                t.site = site.clone();
                 (extra.on_target)(t).map_err(starlark::Error::new_other)?;
             }
         }
@@ -645,6 +649,138 @@ pub(crate) struct OnTargetPayload {
     /// Source call sites that produced this target (innermost `target()` call
     /// first). See [`hplugin::provider::ProvenanceFrame`].
     pub provenance: Vec<ProvenanceFrame>,
+    /// Where it was declared, for the error two diverging declarations of one
+    /// name raise. Never reaches the `TargetSpec` (I1).
+    pub site: DeclSite,
+}
+
+/// The call that declared a target: the `target()` (or plugin function) call
+/// and the matrix cell it ran in, if any. Captured on every declaration (one
+/// span clone, unlike [`capture_provenance`]'s stack walk), rendered only when a
+/// duplicate needs naming.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DeclSite {
+    pub span: Option<starlark::codemap::FileSpan>,
+    pub cell: Option<Arc<str>>,
+}
+
+impl DeclSite {
+    fn capture(eval: &Evaluator, extra: &Extra) -> Self {
+        Self {
+            span: eval.call_stack_top_location(),
+            cell: extra.cell.borrow().clone(),
+        }
+    }
+
+    /// `p/BUILD:12 (cell go="1.23", race=True)`.
+    fn render(&self, root: &Path) -> String {
+        let mut out = render_span(root, self.span.as_ref());
+        if let Some(cell) = &self.cell {
+            out.push_str(" (cell ");
+            out.push_str(cell);
+            out.push(')');
+        }
+        out
+    }
+}
+
+/// `p/BUILD:12`: a span as errors name it, its file relative to the workspace
+/// root and its line 1-based.
+pub(crate) fn render_span(root: &Path, span: Option<&starlark::codemap::FileSpan>) -> String {
+    match span {
+        Some(span) => format!(
+            "{}:{}",
+            rel_display(root, Path::new(span.filename())),
+            span.resolve_span().begin.line + 1
+        ),
+        None => "<unknown>".to_string(),
+    }
+}
+
+/// The fields two declarations of one name differ in, as the user wrote them
+/// (`driver`, `config.url`, `labels`, `transitive.deps`, `approval`); empty
+/// when they are identical. Compares the normalized fields that become the
+/// `TargetSpec`, never their `Debug` or serde output (whose map order would make
+/// one file pass one run and fail the next); provenance and site are not part
+/// of a declaration. Floats compare by bits, so `-0.0` and `0.0` diverge, and an
+/// omitted driver diverges from the explicit default.
+///
+/// The payload, the sandbox and the approval are destructured without `..`,
+/// so a field added to any of them fails to compile here until it is decided
+/// whether it is part of a declaration. Tools, deps and env compare with their
+/// derived `PartialEq`, which covers a new field on its own; config values with
+/// [`htvalue::Value::same`].
+fn diverging_fields(a: &OnTargetPayload, b: &OnTargetPayload) -> Vec<String> {
+    let OnTargetPayload {
+        name: _,
+        driver: driver_a,
+        labels: labels_a,
+        transitive: transitive_a,
+        approval: approval_a,
+        config: config_a,
+        provenance: _,
+        site: _,
+    } = a;
+    let OnTargetPayload {
+        name: _,
+        driver: driver_b,
+        labels: labels_b,
+        transitive: transitive_b,
+        approval: approval_b,
+        config: config_b,
+        provenance: _,
+        site: _,
+    } = b;
+    let mut out = Vec::new();
+    if driver_a != driver_b {
+        out.push("driver".to_string());
+    }
+    let mut keys: Vec<&String> = config_a.keys().chain(config_b.keys()).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    for k in keys {
+        let same = match (config_a.get(k), config_b.get(k)) {
+            (Some(x), Some(y)) => x.same(y),
+            (Some(_), None) | (None, Some(_)) | (None, None) => false,
+        };
+        if !same {
+            out.push(format!("config.{k}"));
+        }
+    }
+    if labels_a != labels_b {
+        out.push("labels".to_string());
+    }
+    let SandboxParts {
+        tools: tools_a,
+        deps: deps_a,
+        env: env_a,
+    } = transitive_a.parts();
+    let SandboxParts {
+        tools: tools_b,
+        deps: deps_b,
+        env: env_b,
+    } = transitive_b.parts();
+    if tools_a != tools_b {
+        out.push("transitive.tools".to_string());
+    }
+    if deps_a != deps_b {
+        out.push("transitive.deps".to_string());
+    }
+    if env_a != env_b {
+        out.push("transitive.env".to_string());
+    }
+    let Approval {
+        required: required_a,
+        notice: notice_a,
+    } = approval_a;
+    let Approval {
+        required: required_b,
+        notice: notice_b,
+    } = approval_b;
+    if required_a != required_b || notice_a != notice_b {
+        out.push("approval".to_string());
+    }
+    out
 }
 
 /// Parse a BUILD-file `approval` value into an [`Approval`]. Two spellings:
@@ -885,11 +1021,43 @@ fn empty_run_result() -> anyhow::Result<RunResult> {
     })
 }
 
-fn merge_pkg_results(parts: &[Arc<RunResult>]) -> anyhow::Result<RunResult> {
-    let mut targets = vec![];
+/// Merge the results of a package's BUILD files (in file order) into the
+/// package's. Two declarations of one name with diverging configs fail, naming
+/// both sites and the fields that differ (I9, D19); identical ones collapse to
+/// the first, which keeps its position, so target order stays stable.
+fn merge_pkg_results(
+    root: &Path,
+    pkg: &str,
+    parts: &[Arc<RunResult>],
+) -> anyhow::Result<RunResult> {
+    let declared: usize = parts.iter().map(|p| p.targets.len()).sum();
+    let mut targets: Vec<OnTargetPayload> = Vec::with_capacity(declared);
     let mut states = vec![];
+    let mut seen: HashMap<&str, usize> = HashMap::with_capacity(declared);
     for part in parts {
-        targets.extend(part.targets.iter().cloned());
+        for t in &part.targets {
+            let Some(&first) = seen.get(t.name.as_str()) else {
+                seen.insert(t.name.as_str(), targets.len());
+                targets.push(t.clone());
+                continue;
+            };
+            let Some(kept) = targets.get(first) else {
+                continue;
+            };
+            let fields = diverging_fields(kept, t);
+            if !fields.is_empty() {
+                anyhow::bail!(
+                    "{} is declared twice with different configs: {} and {}. They differ in {}. \
+                     If both come from a matrix cell, put the cell's axis values in the target \
+                     name; otherwise remove one declaration, or make them identical",
+                    htaddr::Addr::new(PkgBuf::from(pkg), t.name.clone(), Default::default())
+                        .format(),
+                    kept.site.render(root),
+                    t.site.render(root),
+                    fields.join(", "),
+                );
+            }
+        }
         states.extend(part.states.iter().cloned());
     }
     let frozen = Module::with_temp_heap(|module| -> anyhow::Result<FrozenModule> {
@@ -927,6 +1095,10 @@ fn merge_pkg_results(parts: &[Arc<RunResult>]) -> anyhow::Result<RunResult> {
 pub(crate) struct Extra<'a> {
     pub pkg: &'a str,
     pub root: &'a Path,
+    /// The cell being run while a `heph.core.matrix()` cell function runs
+    /// (`go="1.23", race=True`), else `None`: stamped on what the cell declares,
+    /// for the duplicate-declaration error, and how a nested matrix is refused.
+    pub cell: std::cell::RefCell<Option<Arc<str>>>,
     pub on_state: Box<dyn Fn(OnStatePayload) -> anyhow::Result<()>>,
     pub on_target: Box<dyn Fn(OnTargetPayload) -> anyhow::Result<()>>,
     /// Every package in the workspace (dir with a matching BUILD file, plus its
@@ -1229,6 +1401,7 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
             approval,
             config,
             provenance,
+            site: DeclSite::capture(eval, extra),
         };
 
         (extra.on_target)(p)?;
@@ -1383,6 +1556,17 @@ fn host_resource(name: &str) -> anyhow::Result<HostAmount> {
     }
 }
 
+/// The evaluation's [`Extra`], for a builtin that reads it.
+fn extra_of<'a>(eval: &Evaluator<'_, 'a, '_>, builtin: &str) -> starlark::Result<&'a Extra<'a>> {
+    eval.extra
+        .and_then(|e| e.downcast_ref::<Extra>())
+        .ok_or_else(|| {
+            starlark::Error::new_other(anyhow::anyhow!(
+                "{builtin} needs a BUILD-file evaluation (no evaluator extra is set)"
+            ))
+        })
+}
+
 #[starlark_module]
 fn heph_core_module(builder: &mut GlobalsBuilder) {
     /// Host operating system in canonical (Go/OCI) naming, e.g. `linux`, `darwin`.
@@ -1403,6 +1587,52 @@ fn heph_core_module(builder: &mut GlobalsBuilder) {
     /// Host architecture as Rust reports it, e.g. `x86_64`, `aarch64`.
     fn arch_raw() -> starlark::Result<String> {
         Ok(hcore::htplatform::arch_raw().to_string())
+    }
+
+    /// The cross product of `axes`: call `cell` once per cell, with one
+    /// keyword argument per axis (an axis name that cannot be a parameter,
+    /// like `go-version`, reaches a `**kwargs` cell). Returns a value with
+    /// these attributes:
+    ///
+    /// - `cells`: a list, in cell order (the cross product, last axis fastest,
+    ///   minus `exclude`, then `include`), of structs with `axes` (a dict of
+    ///   axis name to value, in axis order) and `value` (what `cell` returned,
+    ///   unchanged; without `cell`, the `axes` dict).
+    /// - `default`: only when `default` names a cell (a dict giving a value for
+    ///   every axis): that cell's `value`. A dict naming no cell fails the
+    ///   call. Without `default` there is no such attribute
+    ///   (`hasattr(m, "default")` is false).
+    ///
+    /// `axes` maps each axis name (any string) to a list of values (any
+    /// Starlark values, passed to `cell` as they are). Values within an axis
+    /// must differ, and `exclude`, `include` and `default` match cells by
+    /// equality. `exclude` removes cells of the cross product (each entry names
+    /// a subset of the axes and must match a cell); `include` adds cells after
+    /// it (each names every axis). At most 1,024 cells, and a cell may not call
+    /// `heph.core.matrix()`.
+    ///
+    /// The matrix declares nothing: a target a cell declares is exactly what
+    /// the cell called. See `docs/MATRIX.md`.
+    fn matrix<'v>(
+        eval: &mut Evaluator<'v, '_, '_>,
+        #[starlark(require = named)] axes: ValueOfUnchecked<'v, matrix::AxesTy>,
+        #[starlark(require = named)] cell: Option<ValueOfUnchecked<'v, matrix::CellTy<'v>>>,
+        #[starlark(require = named)] default: Option<ValueOfUnchecked<'v, matrix::DefaultTy>>,
+        #[starlark(require = named)] exclude: Option<ValueOfUnchecked<'v, matrix::EntriesTy>>,
+        #[starlark(require = named)] include: Option<ValueOfUnchecked<'v, matrix::EntriesTy>>,
+    ) -> starlark::Result<Value<'v>> {
+        let extra = extra_of(eval, "heph.core.matrix()")?;
+        matrix::matrix(
+            eval,
+            extra,
+            matrix::Args {
+                axes: axes.get(),
+                cell: cell.map(|v| v.get()),
+                default: default.map(|v| v.get()),
+                exclude: exclude.map(|v| v.get()),
+                include: include.map(|v| v.get()),
+            },
+        )
     }
 
     /// The number of CPUs available to the process, falling back to 1 when the
@@ -1784,7 +2014,7 @@ impl BuildFileLoader {
             );
         }
 
-        let merged = Arc::new(merge_pkg_results(&parts)?);
+        let merged = Arc::new(merge_pkg_results(&self.root, pkg, &parts)?);
         self.dir_cache
             .lock()
             .map_err(|_e| anyhow::anyhow!("dir_cache lock poisoned"))?
@@ -2426,6 +2656,7 @@ fn eval_ast(
         let extra = Extra {
             pkg,
             root: &loader.root,
+            cell: std::cell::RefCell::new(None),
             capture_provenance,
             on_target: {
                 let targets = targets.clone();
@@ -2495,6 +2726,7 @@ pub(crate) mod tests {
             approval: Approval::default(),
             config: HashMap::new(),
             provenance: vec![],
+            site: DeclSite::default(),
         }
     }
 
@@ -2533,16 +2765,30 @@ pub(crate) mod tests {
     fn target_lookup_on_empty_and_merged_results() {
         assert!(result_of(vec![]).target("a").is_none());
 
-        // Across a package's files, the earlier file's target wins.
+        // Across a package's files, an identical repeat collapses into the
+        // earlier file's target, which keeps its position.
         let parts = [
-            Arc::new(result_of(vec![named("x", "first"), named("y", "y")])),
-            Arc::new(result_of(vec![named("x", "second"), named("w", "w")])),
+            Arc::new(result_of(vec![named("x", "d"), named("y", "y")])),
+            Arc::new(result_of(vec![named("w", "w"), named("x", "d")])),
         ];
-        let merged = merge_pkg_results(&parts).expect("merge");
-        assert_eq!(merged.target("x").map(|t| t.driver.as_str()), Some("first"));
+        let merged = merge_pkg_results(Path::new("/"), "p", &parts).expect("merge");
+        assert_eq!(merged.target("x").map(|t| t.driver.as_str()), Some("d"));
         assert_eq!(merged.target("w").map(|t| t.driver.as_str()), Some("w"));
         assert_eq!(merged.target("y").map(|t| t.driver.as_str()), Some("y"));
         assert!(merged.target("z").is_none());
+        let order: Vec<&str> = merged.targets.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(order, ["x", "y", "w"]);
+
+        // A diverging one fails the package (D19).
+        let parts = [
+            Arc::new(result_of(vec![named("x", "first")])),
+            Arc::new(result_of(vec![named("x", "second")])),
+        ];
+        let err = merge_pkg_results(Path::new("/"), "p", &parts).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("//p:x is declared twice with different configs"),
+            "{err:#}"
+        );
     }
 
     fn hovers() -> BuiltinHovers {
@@ -5110,6 +5356,139 @@ target(name = "use", driver = "d", dep = a)"#,
         fs::write(pkg.join("BUILD"), build).unwrap();
         let provider = provider_with_fn(&tmp_dir, "rule", Arc::new(DeclareFn(f)));
         run_pkg_blocking(&provider, "mypkg")
+    }
+
+    /// T16: two declarations of one address with diverging configs fail the
+    /// package, wherever they are; identical ones collapse to the first (D19).
+    #[test]
+    fn duplicate_target_diverging_configs() {
+        let none = || declared(vec![], vec![]);
+        let err = |build: &str| format!("{:#}", run_declaring(build, none).unwrap_err());
+
+        let e = err(
+            "target(name = \"t\", driver = \"d\", url = \"a\")\ntarget(name = \"t\", driver = \"d\", url = \"b\", labels = [\"x\"])\n",
+        );
+        assert!(
+            e.contains(
+                "//mypkg:t is declared twice with different configs: mypkg/BUILD:1 and \
+                 mypkg/BUILD:2. They differ in config.url, labels. If both come from a matrix \
+                 cell, put the cell's axis values in the target name; otherwise remove one \
+                 declaration, or make them identical"
+            ),
+            "{e}"
+        );
+
+        // Each declared field on its own.
+        for (a, b, field) in [
+            ("labels = [\"x\"]", "labels = [\"y\"]", "labels"),
+            (
+                "transitive = {\"deps\": {\"g\": [\":a\"]}}",
+                "transitive = {\"deps\": {\"g\": [\":b\"]}}",
+                "transitive.deps",
+            ),
+            (
+                "transitive = {\"tools\": {\"g\": [\":a\"]}}",
+                "transitive = {\"tools\": {\"g\": [\":b\"]}}",
+                "transitive.tools",
+            ),
+            (
+                "transitive = {\"env\": {\"A\": \"1\"}}",
+                "transitive = {\"env\": {\"A\": \"2\"}}",
+                "transitive.env",
+            ),
+            ("approval = True", "approval = False", "approval"),
+            (
+                "approval = {\"required\": True, \"notice\": [\"a\"]}",
+                "approval = {\"required\": True, \"notice\": [\"b\"]}",
+                "approval",
+            ),
+        ] {
+            let e = err(&format!(
+                "target(name = \"t\", driver = \"d\", {a})\ntarget(name = \"t\", driver = \"d\", {b})\n"
+            ));
+            assert!(
+                e.contains(&format!("They differ in {field}. If both")),
+                "{a} vs {b}: {e}"
+            );
+        }
+
+        // Identical, with config dicts built in different orders: one target,
+        // the first occurrence keeping its position.
+        let ok = run_declaring(
+            "target(name = \"t\", driver = \"d\", m = {\"a\": 1, \"b\": [2.5]}, n = 1)\ntarget(name = \"u\", driver = \"d\")\ntarget(n = 1, driver = \"d\", name = \"t\", m = {\"b\": [2.5], \"a\": 1})\n",
+            none,
+        )
+        .expect("identical declarations collapse");
+        let names: Vec<&str> = ok.targets.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["t", "u"]);
+        // ...and with deps, tools, env, labels and approval.
+        let full = "driver = \"d\", deps = [\":a\", \":b\"], tools = [\":t\"], labels = [\"l\"], \
+                    approval = True, transitive = {\"deps\": {\"g\": [\":c\"]}, \"tools\": {\"g\": [\":u\"]}, \"env\": {\"A\": \"1\"}}";
+        let ok = run_declaring(
+            &format!("target(name = \"t\", {full})\ntarget(name = \"t\", {full})\n"),
+            none,
+        )
+        .expect("identical declarations with deps and tools collapse");
+        assert_eq!(ok.targets.len(), 1);
+        assert!(!ok.targets[0].transitive.deps().is_empty());
+        assert!(!ok.targets[0].transitive.tools().is_empty());
+
+        // -0.0 and 0.0 diverge; so do an omitted driver and an explicit one.
+        let e = err(
+            "target(name = \"t\", driver = \"d\", f = 0.0)\ntarget(name = \"t\", driver = \"d\", f = -0.0)\n",
+        );
+        assert!(e.contains("They differ in config.f."), "{e}");
+        let e = err("target(name = \"t\")\ntarget(name = \"t\", driver = \"exec\")\n");
+        assert!(e.contains("They differ in driver."), "{e}");
+
+        // A plugin function and a `target()` declaring one address.
+        let e = format!(
+            "{:#}",
+            run_declaring(
+                "target(name = \"x\", driver = \"bash\")\nheph.codegen.rule(name = \"x\")\n",
+                || declared(vec![exec_target("x")], vec![]),
+            )
+            .unwrap_err()
+        );
+        assert!(
+            e.contains("//mypkg:x is declared twice with different configs: mypkg/BUILD:1 and mypkg/BUILD:2. They differ in driver."),
+            "{e}"
+        );
+        // ...and identical ones collapse.
+        let ok = run_declaring(
+            "target(name = \"x\", driver = \"exec\")\nheph.codegen.rule(name = \"x\")\n",
+            || declared(vec![exec_target("x")], vec![]),
+        )
+        .expect("identical plugin declaration");
+        assert_eq!(ok.targets.len(), 1);
+
+        // Across two BUILD files of one package.
+        let tmp_dir = tempdir().unwrap();
+        let pkg = tmp_dir.path().join("mypkg");
+        fs::create_dir_all(&pkg).unwrap();
+        fs::write(
+            pkg.join("BUILD"),
+            "target(name = \"t\", driver = \"d\", v = 1)\n",
+        )
+        .unwrap();
+        fs::write(
+            pkg.join("more.BUILD"),
+            "\ntarget(name = \"t\", driver = \"d\", v = 2)\n",
+        )
+        .unwrap();
+        let provider = Provider {
+            root: tmp_dir.path().to_path_buf(),
+            build_file_patterns: vec![
+                glob::Pattern::new("BUILD").unwrap(),
+                glob::Pattern::new("*.BUILD").unwrap(),
+            ],
+            ..Provider::default()
+        };
+        let e = format!("{:#}", run_pkg_blocking(&provider, "mypkg").unwrap_err());
+        assert!(
+            e.contains("mypkg/BUILD:1 and mypkg/more.BUILD:2. They differ in config.v."),
+            "{e}"
+        );
     }
 
     fn declaring_err(f: fn() -> FnOutcome) -> String {

@@ -16,6 +16,42 @@ pub enum Value {
     List(Vec<Value>),
 }
 
+impl Value {
+    /// Structural equality, order-free for maps, with floats compared by
+    /// their bits: `==` calls `-0.0` and `0.0` equal and a `NaN` unequal to
+    /// itself, and both would misjudge whether two values are the same.
+    pub fn same(&self, other: &Self) -> bool {
+        use Value as V;
+        match (self, other) {
+            (V::Float(x), V::Float(y)) => x.to_bits() == y.to_bits(),
+            (V::Map(x), V::Map(y)) => {
+                x.len() == y.len() && x.iter().all(|(k, v)| y.get(k).is_some_and(|w| v.same(w)))
+            }
+            (V::List(x), V::List(y)) => {
+                x.len() == y.len() && x.iter().zip(y).all(|(v, w)| v.same(w))
+            }
+            (V::String(x), V::String(y)) => x == y,
+            (V::Bool(x), V::Bool(y)) => x == y,
+            (V::Int(x), V::Int(y)) => x == y,
+            (V::Uint(x), V::Uint(y)) => x == y,
+            (V::Null(), V::Null()) => true,
+            // Listed rather than `_`, so a new variant fails to compile until
+            // it gets its own arm above.
+            (
+                V::Float(_)
+                | V::Map(_)
+                | V::List(_)
+                | V::String(_)
+                | V::Bool(_)
+                | V::Int(_)
+                | V::Uint(_)
+                | V::Null(),
+                _,
+            ) => false,
+        }
+    }
+}
+
 pub fn parse_string(v: &Value) -> anyhow::Result<Option<String>> {
     match v {
         Value::Null() => Ok(None),
@@ -121,6 +157,23 @@ mod tests {
 
     fn s(v: &str) -> Value {
         Value::String(v.to_string())
+    }
+
+    #[test]
+    fn same_compares_floats_by_bits_and_maps_order_free() {
+        assert!(!Value::Float(-0.0).same(&Value::Float(0.0)));
+        assert!(Value::Float(f64::NAN).same(&Value::Float(f64::NAN)));
+        assert!(!Value::Int(1).same(&Value::Uint(1)));
+        let a = Value::Map(HashMap::from([
+            ("x".to_string(), s("1")),
+            ("y".to_string(), s("2")),
+        ]));
+        let b = Value::Map(HashMap::from([
+            ("y".to_string(), s("2")),
+            ("x".to_string(), s("1")),
+        ]));
+        assert!(a.same(&b));
+        assert!(!Value::List(vec![s("1"), s("2")]).same(&Value::List(vec![s("2"), s("1")])));
     }
 
     fn list(vs: Vec<Value>) -> Value {

@@ -350,9 +350,32 @@ pub mod sandbox {
         pub fn empty(&self) -> bool {
             self.tools.is_empty() && self.deps.is_empty() && self.env.is_empty()
         }
+
+        /// What was declared: every field but the dedup indexes derived from
+        /// them. Destructured without `..`, so a new field fails to compile
+        /// here, and then in every caller that destructures the parts, until
+        /// it is decided whether it is declared.
+        pub fn parts(&self) -> SandboxParts<'_> {
+            let Sandbox {
+                tools,
+                deps,
+                env,
+                tool_keys: _,
+                dep_keys: _,
+            } = self;
+            SandboxParts { tools, deps, env }
+        }
     }
 
-    #[derive(Default, Clone, Debug, Serialize, Deserialize)]
+    /// The declared fields of a [`Sandbox`], from [`Sandbox::parts`].
+    #[derive(Debug, Clone, Copy)]
+    pub struct SandboxParts<'a> {
+        pub tools: &'a [Tool],
+        pub deps: &'a [Dep],
+        pub env: &'a HashMap<String, Env>,
+    }
+
+    #[derive(Default, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub struct Tool {
         pub r#ref: TargetAddr,
         pub group: String,
@@ -360,7 +383,7 @@ pub mod sandbox {
         pub id: String,
     }
 
-    #[derive(Default, Clone, Debug, Serialize, Deserialize)]
+    #[derive(Default, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub struct Dep {
         pub r#ref: TargetAddr,
         pub mode: Mode,
@@ -370,14 +393,14 @@ pub mod sandbox {
         pub id: String,
     }
 
-    #[derive(Clone, SmartDefault, Debug, Serialize, Deserialize)]
+    #[derive(Clone, SmartDefault, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub enum Mode {
         #[default]
         None,
         Link,
     }
 
-    #[derive(Clone, Debug, Serialize, Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub struct Env {
         pub value: EnvValue,
         pub hash: bool,
@@ -385,7 +408,7 @@ pub mod sandbox {
         pub append_prefix: String,
     }
 
-    #[derive(Clone, Debug, Serialize, Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub enum EnvValue {
         Literal(String),
         Pass,

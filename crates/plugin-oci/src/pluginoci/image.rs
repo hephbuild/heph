@@ -1625,6 +1625,48 @@ mod tests {
         )
     }
 
+    /// T9 of the matrix spec: `layers_by_platform` takes one address string
+    /// per platform, which is what `{c.axes["platform"]: c.value for c in
+    /// heph.core.matrix(...).cells}` gives when each cell returns one, and it
+    /// hashes as the one-element list does. Pinned, so a change to how either
+    /// spelling decodes moves the value here first.
+    #[test]
+    fn oci_image_layers_accept_string() {
+        use hcore::htvalue::Value;
+        let s = |v: &str| Value::String(v.to_string());
+        let platforms = || {
+            (
+                "platforms",
+                Value::List(vec![s("linux/amd64"), s("linux/arm64")]),
+            )
+        };
+        let hash = |amd: Value, arm: Value| {
+            let parsed = parse_image(&[
+                platforms(),
+                (
+                    "layers_by_platform",
+                    Value::Map(HashMap::from([
+                        ("linux/amd64".to_string(), amd),
+                        ("linux/arm64".to_string(), arm),
+                    ])),
+                ),
+            ])
+            .expect("parses");
+            String::from_utf8(parsed.target_def.hash).expect("utf-8 hash")
+        };
+        let strings = hash(s(":layer.linux-amd64"), s(":layer.linux-arm64"));
+        let lists = hash(
+            Value::List(vec![s(":layer.linux-amd64")]),
+            Value::List(vec![s(":layer.linux-arm64")]),
+        );
+        assert_eq!(strings, lists, "a string is the one-element list");
+        assert_eq!(strings, LAYERS_BY_PLATFORM_DEF_HASH);
+    }
+
+    /// Computed at 2bc03b623 (before `heph.core.matrix`; this crate is
+    /// unchanged by it).
+    const LAYERS_BY_PLATFORM_DEF_HASH: &str = "afac9d2a322327b";
+
     /// Two spellings of one platform must not collapse into whichever sorts
     /// last: the other entry's layers would silently leave the image.
     #[test]

@@ -125,9 +125,10 @@ A wrong `sha256` fails the fetch with `checksum mismatch … expected …, got �
 
 ## Per-platform assets
 
-A release ships one asset per platform, each with its own `sha256`. Pick by the
-host's `heph.core.os()` (`linux`, `darwin`) and `heph.core.arch()` (`amd64`,
-`arm64`):
+A release ships one asset per platform, each with its own `sha256`. Declare one
+`release_asset` per platform with `heph.core.matrix` (see `docs/MATRIX.md`).
+Each cell names its own target and returns what `release_asset` returns,
+`//<pkg>:<name>`:
 
 ```python
 ASSETS = {
@@ -135,23 +136,38 @@ ASSETS = {
     "linux/arm64":  ("tool-1.2.0-aarch64-unknown-linux-gnu.tar.gz", "<sha256>"),
     "darwin/arm64": ("tool-1.2.0-aarch64-apple-darwin.tar.gz",      "<sha256>"),
 }
-asset, sha = ASSETS[heph.core.os() + "/" + heph.core.arch()]
 
-heph.gh.release_asset(
-    name = "tool",
-    repo = "acme/tool",
-    tag = "v1.2.0",
-    asset = asset,
-    sha256 = sha,
-    extract = True,
-    strip_components = 1,
+def _tool(platform):
+    asset, sha = ASSETS[platform]
+    return heph.gh.release_asset(
+        name = "tool." + platform.replace("/", "-"),
+        repo = "acme/tool",
+        tag = "v1.2.0",
+        asset = asset,
+        sha256 = sha,
+        extract = True,
+        strip_components = 1,
+    )
+
+TOOL = heph.core.matrix(
+    axes = {"platform": ["linux/amd64", "linux/arm64", "darwin/arm64"]},
+    cell = _tool,
+    default = {"platform": heph.core.os() + "/" + heph.core.arch()},
 )
 ```
 
-Consumers name `//p:tool` on every host. A host missing from the dict fails the
-BUILD file's evaluation on the dict lookup, naming the key. The asset name is not templated:
-`http_fetch`'s `{goos}`-style placeholders take one `sha256` for every
-platform, so they cannot pin a per-platform asset.
+`TOOL.cells` is a list with one entry per platform, in axis order:
+`[c.value for c in TOOL.cells]` is every platform's tool
+(`//p:tool.linux-amd64`, ...), so a darwin laptop can bundle the `linux/arm64`
+one, and `c.axes["platform"]` says which platform an entry is. Every cell is an
+ordinary target. `TOOL.default` is this machine's tool
+(`tools = [TOOL.default]`). On a machine with no cell the `heph.core.matrix()`
+call fails, with a message listing the cells (leave `default` out to evaluate
+the file anywhere). A consumer of `TOOL.default` has this machine's address in
+its config, so its cache key moves with the machine.
+
+The asset name is not templated: `http_fetch`'s `{goos}`-style placeholders
+take one `sha256` for every platform, so they cannot pin a per-platform asset.
 
 ## Troubleshooting
 
