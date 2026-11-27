@@ -226,19 +226,217 @@ pub use hcore::hmemoizer::MultiError;
 /// failed." Propagates UP the graph and is **never** rendered. It NEVER wraps a
 /// cause — collateral hops replace their incoming error with a fresh
 /// `UpstreamFailed`, keeping chain depth O(1) on any graph. `root` identifies the
-/// genuinely-failing target whose `TargetFailure` is recorded in the registry.
+/// culprit whose `TargetFailure` is recorded in the registry.
 #[derive(Debug, Clone)]
 pub struct UpstreamFailed {
-    pub root: Addr,
+    pub root: Culprit,
 }
 
 impl fmt::Display for UpstreamFailed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "dependency failed (root: {})", self.root.format())
+        write!(f, "dependency failed (root: {})", self.root)
     }
 }
 
 impl std::error::Error for UpstreamFailed {}
+
+/// What a failure is recorded against: the one thing that is actually wrong.
+///
+/// A target whose own spec, def or run failed, or that declared a dependency
+/// that does not exist, is a [`Culprit::Target`]. A BUILD (or `.bzl`) file
+/// that did not evaluate is a [`Culprit::File`]: none of its targets was ever
+/// defined, so none of them is to blame. The file is the workspace-relative
+/// path, and it never goes into an [`Addr`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Culprit {
+    Target(Addr),
+    File(std::sync::Arc<str>),
+}
+
+impl Culprit {
+    /// The target, for a target culprit.
+    pub fn target(&self) -> Option<&Addr> {
+        match self {
+            Self::Target(addr) => Some(addr),
+            Self::File(_) => None,
+        }
+    }
+
+    /// The workspace-relative path, for a file culprit.
+    pub fn file(&self) -> Option<&str> {
+        match self {
+            Self::Target(_) => None,
+            Self::File(file) => Some(file),
+        }
+    }
+}
+
+impl From<Addr> for Culprit {
+    fn from(addr: Addr) -> Self {
+        Self::Target(addr)
+    }
+}
+
+impl fmt::Display for Culprit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Target(addr) => write!(f, "{}", addr.format()),
+            Self::File(file) => f.write_str(file),
+        }
+    }
+}
+
+/// Context: `declarer` was resolving `input`'s def, named by its option
+/// `origin_id` (deps, tools, a runner, a group member, …), and the def failed.
+///
+/// A context, holding no error: `downcast_chain_ref` looks through contexts
+/// and the memoizer's shared wrapper, never into a struct's field, so a
+/// `source` field would hide a `CancelledError` or `CycleError` beneath it.
+/// The failure classifier blames the innermost such frame's `input` (or a
+/// deeper [`StageFrame`]'s address), never the declarer.
+#[derive(Debug, Clone)]
+pub struct InputDefFailed {
+    pub input: Addr,
+    pub declarer: Addr,
+    pub origin_id: String,
+}
+
+impl fmt::Display for InputDefFailed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} (`{}` of {})",
+            self.input.format(),
+            self.origin_id,
+            self.declarer.format()
+        )
+    }
+}
+
+impl std::error::Error for InputDefFailed {}
+
+/// Context over a [`TargetNotFoundError`]: `declarer` names `dep` in
+/// `origin_id`, and no target `dep` exists. The declarer is the culprit.
+///
+/// Raised at a site that resolves a declared ref only when the not-found
+/// names that very ref (output group aside): a not-found for a deeper
+/// address passes through and is blamed where *that* ref is declared. The
+/// `TargetNotFoundError` stays underneath, downcastable.
+#[derive(Debug, Clone)]
+pub struct MissingDep {
+    pub dep: Addr,
+    pub declarer: Addr,
+    pub origin_id: String,
+}
+
+impl fmt::Display for MissingDep {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Until targets carry their source location, the package is the
+        // closest the message can point to: the BUILD file that declares it.
+        let pkg = self.declarer.package.as_str();
+        write!(
+            f,
+            "{} depends on {}, which does not exist (`{}`, declared in ",
+            self.declarer.format(),
+            self.dep.format(),
+            self.origin_id,
+        )?;
+        if pkg.is_empty() {
+            f.write_str("the BUILD file at the workspace root)")
+        } else {
+            write!(f, "the BUILD file in {pkg}/)")
+        }
+    }
+}
+
+impl std::error::Error for MissingDep {}
+
+impl MissingDep {
+    /// Whether `e` is a not-found of `dep` itself, as a site resolving the
+    /// ref `dep` must check before raising a [`MissingDep`]. A not-found for
+    /// any other address (`//p:a` while resolving `//p:ab`, a dep of `dep`)
+    /// is not.
+    pub fn names(e: &anyhow::Error, dep: &Addr) -> bool {
+        hcore::hmemoizer::downcast_chain_ref::<TargetNotFoundError>(e)
+            .is_some_and(|nf| nf.addr == *dep)
+    }
+
+    /// `e` with a [`MissingDep`] when it is a not-found of `dep`, else with
+    /// what `otherwise` gives (`None` leaves `e` as it is).
+    pub fn wrap_or<C>(
+        e: anyhow::Error,
+        dep: &Addr,
+        declarer: &Addr,
+        origin_id: impl FnOnce() -> String,
+        otherwise: impl FnOnce() -> Option<C>,
+    ) -> anyhow::Error
+    where
+        C: fmt::Display + fmt::Debug + Send + Sync + 'static,
+    {
+        if Self::names(&e, dep) {
+            return e.context(Self {
+                dep: dep.clone(),
+                declarer: declarer.clone(),
+                origin_id: origin_id(),
+            });
+        }
+        match otherwise() {
+            Some(c) => e.context(c),
+            None => e,
+        }
+    }
+}
+
+/// Context: the evaluation of this file failed. `file` is workspace-relative;
+/// `shown` is what the message prints, unchanged from the untyped context it
+/// replaced (`evaluating {shown}`).
+///
+/// A file that loads a broken file carries a plain string context instead,
+/// so the one `FileEvalFailed` on a chain is the innermost: the file that is
+/// actually broken.
+#[derive(Debug, Clone)]
+pub struct FileEvalFailed {
+    pub file: std::sync::Arc<str>,
+    pub shown: String,
+}
+
+impl fmt::Display for FileEvalFailed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "evaluating {}", self.shown)
+    }
+}
+
+impl std::error::Error for FileEvalFailed {}
+
+/// Which stage of a target a [`StageFrame`] was resolving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    Spec,
+    Def,
+}
+
+/// Context: the engine was resolving `addr`'s own spec or def when the error
+/// below was raised, so the error is `addr`'s.
+///
+/// Minimal on purpose: only the frames the failure classifier needs today
+/// (`collect_transitive_deps`' spec lookup). The typed-diagnostics work
+/// extends the stage set and replaces the remaining string frames.
+#[derive(Debug, Clone)]
+pub struct StageFrame {
+    pub stage: Stage,
+    pub addr: Addr,
+}
+
+impl fmt::Display for StageFrame {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.stage {
+            Stage::Spec => write!(f, "get spec: {}", self.addr.format()),
+            Stage::Def => write!(f, "get_def: {}", self.addr.format()),
+        }
+    }
+}
+
+impl std::error::Error for StageFrame {}
 
 /// A target's own process exited non-zero. Carries the exit status only: the
 /// process's log rides the same error as a [`FailureArtifacts`] context (see
@@ -626,7 +824,12 @@ pub fn process_exit(err: &anyhow::Error) -> Option<Exit> {
 /// propagates internally), while the registry keeps the original for rendering.
 #[derive(Debug, Clone)]
 pub struct TargetFailure {
+    /// The culprit target; for a file culprit, the address that led into the
+    /// file (a target the file would have defined).
     pub addr: Addr,
+    /// The workspace-relative BUILD/`.bzl` file that did not evaluate, when
+    /// the culprit is that file rather than a target ([`Culprit::File`]).
+    pub file: Option<std::sync::Arc<str>>,
     /// The last lines of the target's process log (the full log is still saved
     /// as the `log.txt` artifact), with the real starting line number so the box
     /// renders true file positions. Rendered as a framed `log` box.
@@ -742,6 +945,7 @@ impl TargetFailure {
     pub fn new(addr: Addr, log_tail: Option<LogTail>, source: anyhow::Error) -> Self {
         Self {
             addr,
+            file: None,
             log_tail,
             log: None,
             outputs: None,
@@ -757,6 +961,21 @@ impl TargetFailure {
     pub fn with_streamed(mut self, streamed: bool) -> Self {
         self.streamed = streamed;
         self
+    }
+
+    /// The same failure, blamed on `file` (which did not evaluate) rather
+    /// than on [`addr`](Self::addr), the address that led into it.
+    pub fn with_file(mut self, file: Option<std::sync::Arc<str>>) -> Self {
+        self.file = file;
+        self
+    }
+
+    /// What this failure is recorded against.
+    pub fn culprit(&self) -> Culprit {
+        match &self.file {
+            Some(file) => Culprit::File(std::sync::Arc::clone(file)),
+            None => Culprit::Target(self.addr.clone()),
+        }
     }
 
     /// The same failure, saying whether the engine can open its log.
@@ -845,7 +1064,10 @@ pub fn left_behind(
 
 impl fmt::Display for TargetFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "target failed: {}", self.addr.format())
+        match &self.file {
+            Some(file) => write!(f, "{file} could not be evaluated"),
+            None => write!(f, "target failed: {}", self.addr.format()),
+        }
     }
 }
 

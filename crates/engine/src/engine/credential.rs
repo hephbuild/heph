@@ -371,8 +371,18 @@ impl Engine {
             let spec = Arc::clone(self)
                 .get_spec(rs.clone(), &addr)
                 .await
-                .with_context(|| {
-                    format!("{consumer} references credential {addr}, which does not resolve")
+                .map_err(|e| {
+                    hplugin::error::MissingDep::wrap_or(
+                        e,
+                        &addr,
+                        consumer,
+                        || input.origin_id.clone(),
+                        || {
+                            Some(format!(
+                                "{consumer} references credential {addr}, which does not resolve"
+                            ))
+                        },
+                    )
                 })?;
 
             if spec.driver != DRIVER_NAME {
