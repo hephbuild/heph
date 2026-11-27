@@ -1,145 +1,153 @@
 # Matrices: one declaration, many variants
 
-`heph.core.matrix()` enumerates the cells of a matrix (platforms, or any
-other axes), calls a cell function once per cell, and returns what each call
-returned keyed by cell, plus the value of a default cell when you ask for one.
-What a cell does is its own business: declare targets, compute a URL, or
-nothing at all.
+`heph.core.matrix()` is a cross product. It enumerates the cells of some axes,
+calls a cell function once per cell with that cell's values, and returns a list
+of what each call returned, plus the value of a default cell when you ask for
+one. It knows nothing about targets, platforms or the host. What a cell does is
+its own business: declare targets, compute a URL, or nothing at all.
 
 ```python
-def _tool(platform):
-    asset, sha = ASSETS[platform]
-    n = "tool." + platform.replace("/", "-")
-    heph.gh.release_asset(name = n, repo = "acme/tool", tag = "v1.2.0",
-                          asset = asset, sha256 = sha, extract = True)
-    return ":" + n
+def _test(go, race):
+    return target(
+        name = "test.go" + go + (".race" if race else ""),
+        driver = "bash",
+        run = "go test %s ./..." % ("-race" if race else ""),
+        tools = ["//tools/go:go" + go],
+    )
 
-TOOL = heph.core.matrix(
-    axes = {"platform": ["linux/amd64", "linux/arm64", "darwin/arm64"]},
-    cell = _tool,
-    default = {"platform": heph.core.host()},
+TESTS = heph.core.matrix(
+    axes = {"go": ["1.22", "1.23"], "race": [False, True]},
+    cell = _test,
+    default = {"go": "1.23", "race": False},
 )
-# TOOL.cells   == {"linux/amd64":  ":tool.linux-amd64",
-#                  "linux/arm64":  ":tool.linux-arm64",
-#                  "darwin/arm64": ":tool.darwin-arm64"}
-# TOOL.default == ":tool.darwin-arm64"   (on a darwin/arm64 host)
+# [c.axes for c in TESTS.cells] == [{"go": "1.22", "race": False}, {"go": "1.22", "race": True},
+#                                   {"go": "1.23", "race": False}, {"go": "1.23", "race": True}]
+# [c.value for c in TESTS.cells] == ["//p:test.go1.22", "//p:test.go1.22.race",
+#                                    "//p:test.go1.23", "//p:test.go1.23.race"]
+# TESTS.default == "//p:test.go1.23"
 
-target(name = "fmt", driver = "bash", run = "tool fmt .", tools = [TOOL.default])
-target(name = "bundle", driver = "archive.create", deps = TOOL.cells.values())
+target(name = "test", driver = "group", deps = [TESTS.default])
+target(name = "test-all", driver = "group", deps = [c.value for c in TESTS.cells])
 ```
-
-`:fmt` reads `TOOL.default`, so it has the host's cell in its config and its
-cache key moves with the host; `:bundle` takes `cells` explicitly and does not.
 
 The matrix itself declares nothing and adds nothing to any hash. A target a
 cell declares is exactly what the cell called, as if the BUILD file had written
-the same calls on that line: `:tool.linux-arm64` is an ordinary target, built
-from a darwin laptop like any other. Because a cell built on one host is served
-from the cache to every other, **a cell's output must not depend on the host**:
-pass the cell's values (`platform`, `go`, ...) into its config rather than
-reading `heph.core.host()` inside it.
+the same calls on that line: `:test.go1.22.race` is an ordinary target. A cell
+names its own targets; two cells that build the same name declare one address
+twice, which is refused (see "Duplicate declarations").
 
-`.cells`, `.default`, the key shape (the bare value for one axis, a tuple for
-several) and the cell names below are stable contracts: BUILD files and
-`load()`ers depend on them.
+A target a cell declares is cached and served to every machine like any other,
+so **its config should come from the cell's arguments**, not from
+`heph.core.os()` or `heph.core.arch()` read inside the cell.
+
+`.cells` (a list in cell order), each cell's `.axes` and `.value`, and
+`.default` are stable contracts: BUILD files and `load()`ers depend on them.
 
 ## Arguments
 
 | Argument | Meaning |
 | --- | --- |
-| `axes` | A dict of axis name to a list of values, in declaration order. That order orders tuple keys. Axis names are made of `A-Z a-z 0-9 _` and do not start with a digit (they become keyword arguments of `cell`). A keyword such as `if` is allowed; a `def` cannot name it as a parameter, so read it from `**kwargs`. At least one axis, at least one value each, no repeated value. Values are one or more of `A-Z a-z 0-9 . _ / + -`. A string, tuple or dict where a list is expected is refused, not iterated. |
-| `cell` | Called once per cell, in cell order, with one keyword argument per axis. Returns any value, `None` included. Omitted: each cell's value is its dict of axis values. |
-| `default` | Which cell `.default` reads: `None` (the default: no `.default` at all) or a dict giving a value for every axis, e.g. `{"platform": heph.core.host()}`. |
-| `exclude` | A list of dicts: cells removed from the cross product. An entry names at least one axis (an empty `{}` is refused: it would match every cell), and only axes that exist. Each must match a cell of the full cross product (a stale exclude is a typo); overlapping excludes are fine, and excluding every cell with entries that each name an axis is allowed. |
+| `axes` | A dict of axis name to a list of values, in declaration order. A name is any string and is passed to `cell` as a keyword argument; a name a `def` cannot take as a parameter (`go-version`, `if`) reaches a `**kwargs` cell. A value is any Starlark value (a string, a bool, a list, a dict...) and is passed through unchanged. At least one axis, at least one value each, no two equal values in one axis. A string, tuple or dict where a list is expected is refused, not iterated. |
+| `cell` | Called once per cell, in cell order, with one keyword argument per axis. Returns any value, `None` included. Omitted: each cell's value is its `axes` dict. |
+| `default` | Which cell `.default` reads: `None` (the default: no `.default` at all) or a dict giving a value for every axis, e.g. `{"go": "1.23", "race": False}`. |
+| `exclude` | A list of dicts: cells removed from the cross product. An entry names at least one axis (`exclude = [{}]` is refused: it would match every cell), and only axes that exist. Each must match a cell of the full cross product (a stale exclude is a typo); overlapping excludes are fine, and excluding every cell with entries that each name an axis is allowed. |
 | `include` | A list of dicts: cells added after the cross product, in list order. Each names every axis and nothing else; a value may be outside the axis list, and does not extend it (an `exclude` naming that value is still stale). An include equal to an excluded cell adds it back; one equal to a cell still present is refused. |
 
-These are [GitHub Actions' `exclude`/`include` rules](https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/running-variations-of-jobs-in-a-workflow#expanding-or-adding-matrix-configurations).
+Values are compared by Starlark equality: for repeated values, and for matching
+`exclude`, `include` and `default` against cells. So `1` and `1.0` are one
+value, and `["-race"]` matches `["-race"]`.
+
+These are [GitHub Actions' `exclude`/`include` rules](https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/running-variations-of-jobs-in-a-workflow#expanding-or-adding-matrix-configurations),
+with one difference: an Actions matrix is a list of jobs, and a heph cell is a
+function call whose return value you keep.
 
 ## The result
 
-`cells` is a dict, cell key to what the cell function returned, unchanged, in
-cell order: the cross product (last axis fastest) minus `exclude`, then
-`include`. A key is the bare value for one axis (`"linux/arm64"`) and a tuple in
-axis order for several (`("1.23.1", "linux/arm64")`). Neither keys nor order
-depend on the host, so `cells.values()` lists an image's layers in the same
-order on every machine.
+`cells` is a list, one entry per cell, in cell order: the cross product (last
+axis fastest) minus `exclude`, then `include`. Each entry has two attributes:
+
+- `axes`: a dict of axis name to the cell's value, in axis declaration order.
+- `value`: what `cell` returned, unchanged. Without `cell`, a dict equal to
+  `axes`.
+
+Cell order depends only on the arguments, so `[c.value for c in M.cells]` is
+the same list on every machine.
 
 ```python
-URLS = heph.core.matrix(
-    axes = {"go": ["1.22.5", "1.23.1"], "platform": PLATS},
-    cell = lambda go, platform: "https://go.dev/dl/go%s.%s.tar.gz" % (go, platform.replace("/", "-")),
+CMDS = heph.core.matrix(
+    axes = {"go": ["1.22.5", "1.23.1"], "flags": [[], ["-race"]]},
+    cell = lambda go, flags: "go%s test %s" % (go, " ".join(flags + ["./..."])),
+    exclude = [{"go": "1.22.5", "flags": ["-race"]}],
 )
-# URLS.cells[("1.23.1", "linux/arm64")] == "https://go.dev/dl/go1.23.1.linux-arm64.tar.gz"
+# [c.value for c in CMDS.cells] ==
+#     ["go1.22.5 test ./...", "go1.23.1 test ./...", "go1.23.1 test -race ./..."]
+# CMDS.cells[2].axes == {"go": "1.23.1", "flags": ["-race"]}
+```
 
-CELLS = heph.core.matrix(axes = {"go": ["1.22.5", "1.23.1"], "race": ["on", "off"]})
-# CELLS.cells[("1.23.1", "on")] == {"go": "1.23.1", "race": "on"}
+To look a cell up by its values, build the dict you need:
+
+```python
+PLAIN = {c.axes["go"]: c.value for c in CMDS.cells if c.axes["flags"] == []}
+# PLAIN == {"1.22.5": "go1.22.5 test ./...", "1.23.1": "go1.23.1 test ./..."}
+```
+
+An axis whose name is not an identifier reaches a `**kwargs` cell:
+
+```python
+V = heph.core.matrix(
+    axes = {"go-version": ["1.22", "1.23"]},
+    cell = lambda **kw: "go" + kw["go-version"],
+)
+# [c.value for c in V.cells] == ["go1.22", "go1.23"]
 ```
 
 The builtin never reads, checks or rewrites a cell's value. A relative address
 a cell returns stays relative: it means the package whose BUILD file made the
 call, as any string in that file does. A cell that is several targets returns a
-dict, and `cells` holds the dicts:
-
-```python
-def _sdk(platform):
-    p = platform.replace("/", "-")
-    # ... declares :sdk.<p>.bin and :sdk.<p>.headers
-    return {"bin": ":sdk." + p + ".bin", "headers": ":sdk." + p + ".headers"}
-
-SDK = heph.core.matrix(axes = {"platform": PLATS}, cell = _sdk)
-# SDK.cells["linux/arm64"]["bin"] == ":sdk.linux-arm64.bin"
-```
+dict, and each `.value` is that dict.
 
 The result is an ordinary value: a `.star` file may build it at top level and
 several packages may `load()` it.
 
 ## The default
 
-`default` is a dict giving one value for every axis; `.default` is the value
-of the cell it names. The values are fixed strings: the builtin never reads the
-host itself.
+`default` is a dict giving one value for every axis; `.default` is the `value`
+of the cell it names.
 
-- The host's cell: `default = {"platform": heph.core.host()}`, where
-  `heph.core.host()` returns `os/arch` (`darwin/arm64`). With `os` and `arch`
-  axes, `{"os": heph.core.os(), "arch": heph.core.arch()}`.
-- A matrix with another axis names its value too:
-  `default = {"platform": heph.core.host(), "go": "1.23.1"}`.
-- The default need not be the host: `default = {"go": "1.23.1", "race": "off"}`
-  names one cell of a test matrix outright.
+- `default = {"go": "1.23", "race": False}` names one cell of the matrix
+  above. Dict order does not matter.
 - Without `default` (or with `default = None`) the result has no `default`
   attribute: `hasattr(M, "default")` is false, and reading it fails.
-- `default = "host"`, or any other string, is refused with the spelling above.
+- A string or any other non-dict is refused.
 
 Every mistake fails at the call: an unknown axis, a missing one, or values that
-name no cell. A host-derived dict on a host with no cell is the last of these,
-so on a riscv64 machine the call itself fails (a matrix without `default`
-evaluates anywhere):
+name no cell.
 
 ```
-heph.core.matrix() at p/BUILD:12: default {platform=linux/riscv64} names no cell of this
-matrix. Its cells: platform=linux/amd64, platform=linux/arm64, platform=darwin/arm64.
-Add it with include, or name another cell
+heph.core.matrix() at p/BUILD:12: default {go="1.24", race=False} names no cell of this
+matrix. Its cells: {go="1.22", race=False}, {go="1.22", race=True}, {go="1.23", race=False},
+{go="1.23", race=True}. Add it with include, or name another cell
 ```
 
-**A host-derived `.default` depends on the host, and so does every target that
-uses it.** A consumer of `TOOL.default` has the host's cell address in its
-config, so its cache key moves with the host even when its output would not (a
-formatter misses across hosts). A cell's own key does not move:
-`:tool.linux-arm64` is the same target on every host. To see which cell a
-consumer got, run `heph inspect spec //p:fmt`.
+A default built from `heph.core.os()` and `heph.core.arch()` (see the release
+example below) depends on the host, and so does every target that uses it: a
+consumer's config holds this host's cell, so its cache key moves with the host.
+On a host with no cell the call itself fails; a matrix without `default`
+evaluates anywhere. To see which cell a consumer got, run
+`heph inspect spec //p:test`.
 
 There is no alias target. A consumer that wants one stable name writes one
-`group` over `TOOL.default` itself.
+`group` over `M.default` itself.
 
-## Naming cells
+## Errors
 
-A cell names its own targets. The convention, which these docs and every paved
-road follow, is `<name>.<v1>.<v2>…` with `/` written as `-`:
-`tool.linux-arm64`, `test.1.23.linux-arm64`. These names are addresses users
-type, so treat them as stable once published.
+Every error names the call site, and a failing cell names the cell by its
+values, shown as Starlark reprs:
 
-Two cells that map to one name (`linux/arm64` and `linux-arm64`, or `1.2` + `3`
-against `1` + `2.3`) declare one address twice, which is refused (below).
+```
+heph.core.matrix() at p/BUILD:4: cell go="1.23", race=True: Found `race` extra named
+parameter(s) for call to …
+```
 
 ## Duplicate declarations
 
@@ -148,10 +156,9 @@ evaluation, wherever they are, in a cell or not, in one BUILD file or two of one
 package:
 
 ```
-//p:tool is declared twice with different configs: p/BUILD:12 (cell platform=linux/amd64)
-and p/BUILD:12 (cell platform=linux/arm64). They differ in config.url. If both come from
-a matrix cell, put the cell's axis values in the target name; otherwise remove one
-declaration, or make them identical
+//p:tool is declared twice with different configs: p/BUILD:3 (cell go="1.22") and p/BUILD:3
+(cell go="1.23"). They differ in config.url. If both come from a matrix cell, put the cell's
+axis values in the target name; otherwise remove one declaration, or make them identical
 ```
 
 Identical declarations (the same `.star` helper called twice) collapse to one,
@@ -162,7 +169,8 @@ driver differ), the config as values (dict order does not matter; `-0.0` and
 
 Before matrices, the first of two same-named declarations won and the second
 was dropped without a word, so `name = "tool"` in every cell would have shipped
-one platform's bits for all of them.
+one cell's bits for all of them. Joining values into a name can collide too
+(`"1.2"` + `"3"` against `"1"` + `"2.3"`); that is refused the same way.
 
 ## Limits
 
@@ -174,8 +182,8 @@ one platform's bits for all of them.
 ## Per-platform release assets
 
 The common download case: one `heph.gh.release_asset` per platform, each
-pinned by its own `sha256`, plus the host's for tools. `release_asset` itself
-is unchanged.
+pinned by its own `sha256`. `release_asset` returns `//<pkg>:<name>`, so the
+cell returns its result.
 
 <!-- crates/e2e gh_release_asset::gh_release_matrix_example evaluates the block below. -->
 ```python
@@ -187,9 +195,8 @@ ASSETS = {
 
 def _tool(platform):
     asset, sha = ASSETS[platform]
-    n = "tool." + platform.replace("/", "-")
-    heph.gh.release_asset(
-        name = n,
+    return heph.gh.release_asset(
+        name = "tool." + platform.replace("/", "-"),
         repo = "acme/tool",
         tag = "v1.2.0",
         asset = asset,
@@ -197,41 +204,42 @@ def _tool(platform):
         extract = True,
         strip_components = 1,
     )
-    return ":" + n
 
 TOOL = heph.core.matrix(
     axes = {"platform": ["linux/amd64", "linux/arm64", "darwin/arm64"]},
     cell = _tool,
-    default = {"platform": heph.core.host()},
+    default = {"platform": heph.core.os() + "/" + heph.core.arch()},
 )
 ```
 
-`TOOL.default` is the host's tool (`tools = [TOOL.default]`), and
-`TOOL.cells` every platform's.
+`TOOL.default` is this machine's tool (`tools = [TOOL.default]`), and
+`[c.value for c in TOOL.cells]` every platform's, so a darwin laptop can bundle
+the `linux/arm64` one.
 
 ## Multi-arch OCI images
 
-`oci.image(layers_by_platform = ...)` takes one address per platform, so
-`cells` passes straight in:
+`oci.image(layers_by_platform = ...)` takes a dict of platform to address, so
+build it from the cells:
 
 ```python
 LAYER = heph.core.matrix(axes = {"platform": ["linux/amd64", "linux/arm64"]}, cell = _layer)
-heph.oci.image(name = "image", layers_by_platform = LAYER.cells, ...)
+heph.oci.image(
+    name = "image",
+    layers_by_platform = {c.axes["platform"]: c.value for c in LAYER.cells},
+    ...
+)
 ```
 
 ## What a matrix is not
 
-- **Not a configuration.** Building `:app.linux-arm64` does not rebuild its
+- **Not a configuration.** Building a `linux/arm64` cell does not rebuild its
   deps for `linux/arm64`: each cell names its own deps.
-- **Not remote execution.** A cell whose command only runs on its own platform
-  still runs on the host, and fails there as it would today. Pick which cells to
-  run.
-- **No host override.** A plugin function called in a cell does not see the
-  cell's platform as its host: pass `goos`/`goarch` (or whatever it takes)
-  explicitly.
-- **No address sugar.** A cell is a named target; there is no
+- **Not remote execution.** A cell whose command only runs on one platform
+  still runs on the host, and fails there as it would today. Pick which cells
+  to run.
+- **No implicit context.** A cell sees only its arguments. A plugin function
+  called in a cell does not learn the cell's values: pass them (`goos`,
+  `goarch`, or whatever it takes) explicitly.
+- **No address sugar.** A cell's target is a named target; there is no
   `//p:tool@platform=linux/arm64` form, and `@args` keep their meaning for
   `http_fetch` and Go.
-
-`heph.core.host()` returns the host as `os/arch` (`darwin/arm64`), the value
-`default = {"platform": heph.core.host()}` names.
