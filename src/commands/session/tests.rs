@@ -525,6 +525,7 @@ async fn commands_run_against_any_source() {
                         record(
                             T0 + 5_500,
                             BuildEventKind::ResultEnd {
+                                duplicate: false,
                                 upstream_file: None,
                                 path: Vec::new(),
                                 left_behind: None,
@@ -764,6 +765,7 @@ async fn next_is_structured_for_every_state() {
             record(
                 T0 + 2,
                 BuildEventKind::ResultEnd {
+                    duplicate: false,
                     upstream_file: None,
                     path: Vec::new(),
                     left_behind: None,
@@ -1251,6 +1253,7 @@ async fn status_lists_are_capped_and_show_has_them_all() {
         records.push(record(
             T0 + 2,
             BuildEventKind::ResultEnd {
+                duplicate: false,
                 upstream_file: None,
                 path: Vec::new(),
                 left_behind: None,

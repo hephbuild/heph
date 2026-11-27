@@ -212,6 +212,7 @@ impl Fold {
                 exit_code,
                 timed_out,
                 cancelled,
+                duplicate: false,
                 ..
             } if self.tracks(addr) => {
                 let live = self.live.remove(addr).unwrap_or_default();
@@ -247,18 +248,44 @@ impl Fold {
                     outputs: None,
                     hashin: None,
                 };
-                if self.pending.remove(addr) {
-                    self.done.insert(addr.clone());
-                    vec![entry]
-                } else {
-                    // Not matched (yet): a dependency, or a selected target
-                    // the walk has not reported. `tracks` held, so the set is
-                    // still incomplete.
-                    self.early.entry(addr.clone()).or_insert(entry);
-                    Vec::new()
-                }
+                self.place(entry)
+            }
+            // A BUILD file that did not evaluate, reached through a selected
+            // target that has no scope of its own: that target's record, as
+            // the end the engine sent for it before the file had its own
+            // event (the file's own record is a later change).
+            BuildEventKind::FileFailed { entry, error, .. } if self.tracks(entry) => {
+                self.live.remove(entry);
+                self.place(RunEntry {
+                    addr: entry.clone(),
+                    outcome: Outcome::Failed,
+                    remote: None,
+                    cache: None,
+                    duration_ms: 0,
+                    exit_code: None,
+                    timed_out: false,
+                    error: Some(error.clone()),
+                    blocked_by: None,
+                    failure: None,
+                    outputs: None,
+                    hashin: None,
+                })
             }
             _ => Vec::new(),
+        }
+    }
+
+    /// Hand out `entry` if its target was matched, else keep it until it is.
+    fn place(&mut self, entry: RunEntry) -> Vec<RunEntry> {
+        if self.pending.remove(&entry.addr) {
+            self.done.insert(entry.addr.clone());
+            vec![entry]
+        } else {
+            // Not matched (yet): a dependency, or a selected target the walk
+            // has not reported. `tracks` held, so the set is still
+            // incomplete.
+            self.early.entry(entry.addr.clone()).or_insert(entry);
+            Vec::new()
         }
     }
 
@@ -555,6 +582,7 @@ mod tests {
 
     fn end(addr: &str, error: Option<&str>, upstream_of: Option<&str>) -> BuildEventKind {
         BuildEventKind::ResultEnd {
+            duplicate: false,
             upstream_file: None,
             path: Vec::new(),
             addr: addr.to_string(),

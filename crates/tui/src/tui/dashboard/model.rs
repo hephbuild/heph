@@ -632,6 +632,30 @@ impl Model {
                 };
                 self.set_state(id, state);
             }
+            // A BUILD file that did not evaluate: its failure is shown on the
+            // row of the address that led into it (the root its collateral
+            // names), which never had a scope of its own.
+            BuildEventKind::FileFailed { entry, error, .. } => {
+                let id = self.touch(entry);
+                let Some(r) = self.rec_mut(id) else {
+                    return;
+                };
+                if r.flags & ENDED != 0 {
+                    return;
+                }
+                let was_in_flight = r.flags & IN_FLIGHT != 0;
+                r.flags = (r.flags | ENDED) & !(OP_OPEN | IN_FLIGHT);
+                r.waits = 0;
+                r.end_ms = at;
+                self.open.remove(&id);
+                if was_in_flight {
+                    self.in_flight -= 1;
+                }
+                let reason = failure_reason(error, None, None, redact);
+                self.reasons.insert(id, reason.into_boxed_str());
+                self.errors.insert(id, capped_error(&redact.apply(error)));
+                self.set_state(id, RowState::Failed);
+            }
             BuildEventKind::PoolUsage {
                 pool,
                 held,
@@ -1229,6 +1253,7 @@ mod tests {
                     _ => (Some("boom".to_owned()), Some(addr(rng)), false),
                 };
                 BuildEventKind::ResultEnd {
+                    duplicate: false,
                     upstream_file: None,
                     path: Vec::new(),
                     left_behind: None,

@@ -1265,3 +1265,129 @@ target(name = "fixed", driver = "bash", run = "echo ok > $OUT", out = "o.txt", d
     }
     Ok(())
 }
+
+/// Every `ResultStart` of `r` has a `ResultEnd` of the same address.
+fn assert_every_start_ends(r: &Run) {
+    let mut open: std::collections::HashMap<&str, i64> = std::collections::HashMap::new();
+    for e in &r.events {
+        match &e.kind {
+            BuildEventKind::ResultStart { addr } => *open.entry(addr).or_default() += 1,
+            BuildEventKind::ResultEnd { addr, .. } => *open.entry(addr).or_default() -= 1,
+            _ => {}
+        }
+    }
+    open.retain(|_, n| *n != 0);
+    assert!(open.is_empty(), "unbalanced scopes: {open:?}");
+}
+
+/// The announcing failed ends of `r`: what a renderer boxes and counts.
+fn announcing_ends(r: &Run) -> Vec<&str> {
+    r.events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            BuildEventKind::ResultEnd {
+                addr,
+                error: Some(_),
+                upstream_of: None,
+                cancelled: false,
+                duplicate: false,
+                ..
+            } => Some(addr.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// D1.d / P24: `//a:x` fails in two scopes (requested itself, and as
+/// `//b:y`'s dep, a second memo cell): both end, one announcing.
+#[tokio::test]
+async fn losing_scope_ends_non_announcing() -> anyhow::Result<()> {
+    let ws = build_ws(&[
+        (
+            "a",
+            r#"target(name = "x", driver = "bash", run = "exit 1", out = "o.txt")"#,
+        ),
+        ("b", &t("y", r#"deps = ["//a:x"]"#)),
+    ]);
+    let r = run_matcher(
+        &ws.engine,
+        &Matcher::Or(vec![
+            Matcher::Addr(addr("//a:x")),
+            Matcher::Addr(addr("//b:y")),
+        ]),
+    )
+    .await;
+    assert_every_start_ends(&r);
+    assert_eq!(r.culprits(), ["//a:x"], "{}", r.describe());
+    assert_eq!(announcing_ends(&r), ["//a:x"], "one box: {:#?}", r.events);
+    let own: Vec<_> = r
+        .ends("//a:x")
+        .into_iter()
+        .filter(|k| matches!(k, BuildEventKind::ResultEnd { error: Some(_), .. }))
+        .collect();
+    // Two scopes of `//a:x` ended failed; the losing one is flagged.
+    assert_eq!(own.len(), 2, "{:#?}", r.events);
+    assert!(
+        own.iter().any(|k| matches!(
+            k,
+            BuildEventKind::ResultEnd {
+                duplicate: true,
+                ..
+            }
+        )),
+        "{:#?}",
+        r.events
+    );
+    Ok(())
+}
+
+/// D1.d / P15: a broken BUILD file rides its own `FileFailed`, once, and
+/// no path ever lands in `ResultEnd.addr` / `upstream_of`.
+#[tokio::test]
+async fn file_culprit_rides_its_own_event_kind() -> anyhow::Result<()> {
+    let ws = build_ws(&[
+        ("a", &t("t", r#"deps = ["//b:t"]"#)),
+        ("b", &t("t", r#"deps = ["//d:t"]"#)),
+        ("d", "target(name = \"t\"\nbroken(\n"),
+    ]);
+    let r = run(&ws.engine, "//a:t").await;
+    assert_every_start_ends(&r);
+    let files: Vec<_> = r
+        .events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            BuildEventKind::FileFailed {
+                file, entry, path, ..
+            } => Some((file.as_str(), entry.as_str(), path.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        files,
+        [(
+            "d/BUILD",
+            "//d:t",
+            vec!["//a:t".to_owned(), "//b:t".to_owned(), "//d:t".to_owned()]
+        )],
+        "{:#?}",
+        r.events
+    );
+    assert!(
+        announcing_ends(&r).is_empty(),
+        "the file's box is its own kind"
+    );
+    for e in &r.events {
+        if let BuildEventKind::ResultEnd {
+            addr, upstream_of, ..
+        } = &e.kind
+        {
+            for a in std::iter::once(addr).chain(upstream_of) {
+                assert!(
+                    a.starts_with("//") && !a.contains("BUILD"),
+                    "a path in an addr: {a}"
+                );
+            }
+        }
+    }
+    Ok(())
+}

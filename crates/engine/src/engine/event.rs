@@ -219,19 +219,29 @@ pub async fn emit_scope<T>(
     make_end: impl FnOnce(Option<ErrorDetail>) -> BuildEventKind + Send + 'static,
     fut: impl Future<Output = anyhow::Result<T>>,
 ) -> anyhow::Result<T> {
-    emit_scope_with(rs, start, make_end, |_| None::<std::future::Ready<()>>, fut).await
+    emit_scope_with(
+        rs,
+        start,
+        make_end,
+        |e| (e, None::<std::future::Ready<()>>),
+        fut,
+    )
+    .await
 }
 
-/// [`emit_scope`], awaiting what `on_error` returns for a failure before the
-/// end event is built: for an end that carries something only an await can
-/// learn, which `on_error` leaves where `make_end` reads it. The failure is
-/// recorded first, so a scope cancelled during that await still ends as the
-/// failure it was, without what the await would have added.
+/// [`emit_scope`], handing a failure to `on_error` before the end event is
+/// built. `on_error` returns the error the scope returns (the result scope
+/// classifies it there, so its end knows whether it won the culprit's claim)
+/// and, for an end that carries something only an await can learn, a future
+/// that leaves it where `make_end` reads it. The failure's detail is taken
+/// from the error as the body returned it, first, so a scope cancelled
+/// during that await still ends as the failure it was, without what the
+/// await would have added.
 pub async fn emit_scope_with<T, F: Future<Output = ()>>(
     rs: &RequestState,
     start: BuildEventKind,
     make_end: impl FnOnce(Option<ErrorDetail>) -> BuildEventKind + Send + 'static,
-    on_error: impl FnOnce(&anyhow::Error) -> Option<F>,
+    on_error: impl FnOnce(anyhow::Error) -> (anyhow::Error, Option<F>),
     fut: impl Future<Output = anyhow::Result<T>>,
 ) -> anyhow::Result<T> {
     rs.emit(start);
@@ -240,12 +250,17 @@ pub async fn emit_scope_with<T, F: Future<Output = ()>>(
         make_end: Some(make_end),
         error: None,
     };
-    let out = fut.await; // guard still armed if this is cancelled mid-await
-    if let Err(e) = &out {
-        guard.error = Some(ErrorDetail::from_error(e));
-        if let Some(more) = on_error(e) {
-            more.await;
+    // The guard stays armed if this is cancelled mid-await, and drops at
+    // return → emits *End.
+    match fut.await {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            guard.error = Some(ErrorDetail::from_error(&e));
+            let (e, more) = on_error(e);
+            if let Some(more) = more {
+                more.await;
+            }
+            Err(e)
         }
     }
-    out // guard drops here → emits *End
 }

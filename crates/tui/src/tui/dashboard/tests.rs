@@ -67,6 +67,7 @@ fn hit(addr: &str) -> BuildEventKind {
 /// A `ResultEnd`; `error` with `upstream_of` is a dependency failure.
 fn end(addr: &str, error: Option<&str>, upstream_of: Option<&str>) -> BuildEventKind {
     BuildEventKind::ResultEnd {
+        duplicate: false,
         upstream_file: None,
         path: Vec::new(),
         left_behind: None,
@@ -83,6 +84,7 @@ fn end(addr: &str, error: Option<&str>, upstream_of: Option<&str>) -> BuildEvent
 
 fn stopped(addr: &str) -> BuildEventKind {
     BuildEventKind::ResultEnd {
+        duplicate: false,
         upstream_file: None,
         path: Vec::new(),
         left_behind: None,
@@ -569,6 +571,7 @@ fn timed_out_root_reads_as_failure_failed_tab() {
         at(
             600_000,
             BuildEventKind::ResultEnd {
+                duplicate: false,
                 upstream_file: None,
                 path: Vec::new(),
                 left_behind: None,
@@ -1083,6 +1086,7 @@ fn overview_took_down_and_timeout() {
         at(
             600_000,
             BuildEventKind::ResultEnd {
+                duplicate: false,
                 upstream_file: None,
                 path: Vec::new(),
                 left_behind: None,
@@ -1166,6 +1170,7 @@ fn no_home_path_on_any_screen_dashboard_and_target() {
     let home = "/home/u/.heph";
     let redact = Redact::of([std::path::PathBuf::from(home)]);
     let fail = |addr: &str| BuildEventKind::ResultEnd {
+        duplicate: false,
         upstream_file: None,
         path: Vec::new(),
         left_behind: None,
@@ -1301,6 +1306,7 @@ fn log_tab_says_a_driver_does_not_stream_its_log_until_the_run_ends() {
 /// did not resolve, an output the run never wrote.
 fn failed_without_status(addr: &str, error: &str) -> BuildEventKind {
     BuildEventKind::ResultEnd {
+        duplicate: false,
         upstream_file: None,
         path: Vec::new(),
         left_behind: None,

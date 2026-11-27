@@ -397,7 +397,14 @@ impl Tally {
                 // The job summary names the failure; where its log is
                 // stays in the step's own output.
                 left_behind: _,
+                duplicate,
             } => {
+                // Another end announced this culprit: close the row, count
+                // nothing (one root per culprit).
+                if *duplicate {
+                    self.close(addr);
+                    return;
+                }
                 self.finish(
                     addr,
                     error.as_deref().map(|message| Failure {
@@ -578,6 +585,28 @@ impl Tally {
             // which the SDK treats as end-of-stream and would silently truncate
             // everything after it.
             BuildEventKind::Unknown => {}
+
+            // A BUILD file that did not evaluate: one root however many
+            // targets reached it, keyed by the address that led into it,
+            // which is what the targets it took down name as `upstream_of`.
+            BuildEventKind::FileFailed {
+                entry,
+                error,
+                // The message names the file; the path reaches the report in
+                // a later change.
+                file: _,
+                path: _,
+            } => self.record_root(
+                entry,
+                Failure {
+                    message: error,
+                    upstream_of: None,
+                    exit_status: None,
+                    log_tail: None,
+                },
+                None,
+                ev.at_unix_ms,
+            ),
         }
     }
 
@@ -631,7 +660,8 @@ impl Tally {
         self.misses_by_pkg.insert(pkg.into(), 1);
     }
 
-    fn finish(&mut self, addr: &str, error: Option<Failure<'_>>, at: u64) {
+    /// Drop `addr`'s in-flight record and mark it done in the matched set.
+    fn close(&mut self, addr: &str) -> Option<TargetRec> {
         let rec = self.live.remove(addr);
 
         // Progress is over the matched top-level set, deduped: the memoizer can
@@ -643,6 +673,11 @@ impl Tally {
             *done = true;
             self.matched_done = self.matched_done.saturating_add(1);
         }
+        rec
+    }
+
+    fn finish(&mut self, addr: &str, error: Option<Failure<'_>>, at: u64) {
+        let rec = self.close(addr);
 
         // From its own `ExecuteStart` to its `ResultEnd`: the run and its cache
         // write, none of the wait for its deps or for admission.
@@ -1006,6 +1041,7 @@ mod tests {
         t.apply(&ev(
             end,
             BuildEventKind::ResultEnd {
+                duplicate: false,
                 upstream_file: None,
                 path: Vec::new(),
                 left_behind: None,
@@ -1029,6 +1065,7 @@ mod tests {
         t.apply(&ev(
             10,
             BuildEventKind::ResultEnd {
+                duplicate: false,
                 upstream_file: None,
                 path: Vec::new(),
                 left_behind: None,
@@ -1046,6 +1083,7 @@ mod tests {
             t.apply(&ev(
                 20,
                 BuildEventKind::ResultEnd {
+                    duplicate: false,
                     upstream_file: None,
                     path: Vec::new(),
                     left_behind: None,
@@ -1075,6 +1113,66 @@ mod tests {
         );
     }
 
+    /// A broken BUILD file is one root however many requested targets live in
+    /// it: its `FileFailed` is the root, keyed by the address that led into
+    /// it, the targets it took down count against that root, and a
+    /// non-announcing end closes its row without a second root.
+    #[test]
+    fn tally_counts_file_culprit_once() {
+        let mut t = Tally::default();
+        matched(&mut t, &["//d:t1", "//d:t2", "//a:x"], true);
+        t.apply(&ev(
+            10,
+            BuildEventKind::FileFailed {
+                file: "d/BUILD".into(),
+                entry: "//d:t1".into(),
+                error: "evaluating d/BUILD: name 'nope' is not defined".into(),
+                path: vec!["//d:t1".into()],
+            },
+        ));
+        let end =
+            |addr: &str, upstream_of: Option<&str>, duplicate: bool| BuildEventKind::ResultEnd {
+                duplicate,
+                upstream_file: upstream_of.map(|_| "d/BUILD".into()),
+                path: Vec::new(),
+                left_behind: None,
+                cancelled: false,
+                timed_out: None,
+                addr: addr.into(),
+                error: Some("evaluating d/BUILD: name 'nope' is not defined".into()),
+                upstream_of: upstream_of.map(str::to_owned),
+                exit_status: None,
+                exit_code: None,
+                log_tail: None,
+            };
+        t.apply(&ev(
+            11,
+            BuildEventKind::ResultStart {
+                addr: "//a:x".into(),
+            },
+        ));
+        t.apply(&ev(12, end("//a:x", Some("//d:t1"), false)));
+        t.apply(&ev(
+            13,
+            BuildEventKind::ResultStart {
+                addr: "//d:t2".into(),
+            },
+        ));
+        t.apply(&ev(14, end("//d:t2", None, true)));
+
+        let c = t.counters();
+        assert_eq!(c.roots_total, 1, "one root for the file");
+        assert_eq!(c.blocked, 1);
+        let [root] = t.roots() else {
+            panic!("one root: {:?}", t.roots());
+        };
+        assert_eq!(root.addr, "//d:t1");
+        assert!(root.message.contains("d/BUILD"), "{}", root.message);
+        assert_eq!(root.blocked, 1);
+        let (done, total, _) = t.progress();
+        assert_eq!((done, total), (2, 3), "the duplicate end closed //d:t2");
+    }
+
     #[test]
     fn duplicate_result_end_is_not_double_counted() {
         // The result memoizer keys on `(addr, outputs, is_top)`, so one addr can
@@ -1085,6 +1183,7 @@ mod tests {
             t.apply(&ev(
                 5,
                 BuildEventKind::ResultEnd {
+                    duplicate: false,
                     upstream_file: None,
                     path: Vec::new(),
                     left_behind: None,
@@ -1754,6 +1853,7 @@ mod tests {
         t.apply(&ev(
             5,
             BuildEventKind::ResultEnd {
+                duplicate: false,
                 upstream_file: None,
                 path: Vec::new(),
                 left_behind: None,
@@ -1777,6 +1877,7 @@ mod tests {
             t.apply(&ev(
                 0,
                 BuildEventKind::ResultEnd {
+                    duplicate: false,
                     upstream_file: None,
                     path: Vec::new(),
                     left_behind: None,
@@ -1804,6 +1905,7 @@ mod tests {
             t.apply(&ev(
                 0,
                 BuildEventKind::ResultEnd {
+                    duplicate: false,
                     upstream_file: None,
                     path: Vec::new(),
                     left_behind: None,
@@ -1830,6 +1932,7 @@ mod tests {
         t.apply(&ev(
             10,
             BuildEventKind::ResultEnd {
+                duplicate: false,
                 upstream_file: None,
                 path: Vec::new(),
                 left_behind: None,
@@ -1881,6 +1984,7 @@ mod tests {
         t.apply(&ev(
             5_000,
             BuildEventKind::ResultEnd {
+                duplicate: false,
                 upstream_file: None,
                 path: Vec::new(),
                 left_behind: None,

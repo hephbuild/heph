@@ -275,6 +275,10 @@ pub struct BuildState {
     /// Failures with no `upstream_of`: the roots. `errored` less this is
     /// what they took down, as the finished line splits it.
     root_failed: usize,
+    /// Targets whose row a non-announcing `ResultEnd` closed before the
+    /// announcing one arrived: that one counts the root. Bounded by the
+    /// roots, and only filled when a scope loses a culprit's claim.
+    root_pending: HashSet<String>,
     /// heph's home, redacted from every error text this state keeps (I9).
     redact: crate::tui::text::Redact,
     /// The dashboard's fold: one record per target in per-state buckets,
@@ -535,14 +539,17 @@ impl BuildState {
                 exit_status,
                 timed_out,
                 cancelled,
+                duplicate,
                 ..
             } => {
                 // A root failure — one no dependency caused — takes the
                 // spotlight until a newer one does. Collateral ones never do,
-                // nor a stop: Ctrl-C is not a failure to explain.
+                // nor a stop: Ctrl-C is not a failure to explain, nor an end
+                // that lost the culprit's claim: another announced it.
                 if let Some(err) = error
                     && upstream_of.is_none()
                     && !cancelled
+                    && !duplicate
                     && self
                         .spot
                         .root_failure
@@ -568,11 +575,42 @@ impl BuildState {
                     } else if error.is_some() {
                         self.errored += 1;
                         if upstream_of.is_none() {
-                            self.root_failed += 1;
+                            if *duplicate {
+                                // The row closed on a losing end; the
+                                // announcing one, still to come, is the root.
+                                self.root_pending.insert(addr.clone());
+                            } else {
+                                self.root_failed += 1;
+                            }
                         }
                     } else {
                         self.completed += 1;
                     }
+                } else if error.is_some()
+                    && upstream_of.is_none()
+                    && !cancelled
+                    && !duplicate
+                    && self.root_pending.remove(addr)
+                {
+                    self.root_failed += 1;
+                }
+            }
+            // A BUILD file that did not evaluate: one failure and one root,
+            // on the row of the address that led into it (folded by `dash`).
+            BuildEventKind::FileFailed { entry, error, .. } => {
+                self.errored += 1;
+                self.root_failed += 1;
+                if self
+                    .spot
+                    .root_failure
+                    .as_ref()
+                    .is_none_or(|f| f.is_replaced_by(ev.at_unix_ms, entry))
+                {
+                    self.spot.root_failure = Some(spotlight::RootFailure {
+                        at_ms: ev.at_unix_ms,
+                        addr: entry.clone(),
+                        reason: spotlight::RootFailure::reason(error, None, None, &self.redact),
+                    });
                 }
             }
             // The op timeline (folded above) tracks Execute's duration; here we
@@ -2881,6 +2919,9 @@ impl CIAppView for CiProgressView {
                 log_tail,
                 timed_out,
                 cancelled: false,
+                // An end that lost the culprit's claim prints nothing: the
+                // announcing one carries the block (one box per culprit).
+                duplicate: false,
                 left_behind,
             } if !self.failures_printed.contains(addr) => {
                 self.failures_printed.insert(addr.clone());
@@ -2897,6 +2938,24 @@ impl CIAppView for CiProgressView {
                     ),
                     addr,
                     left_behind.as_deref(),
+                );
+                tracing::error!("{block}");
+            }
+            // A BUILD file that did not evaluate: its block, once, headed by
+            // the file (it is not a target).
+            BuildEventKind::FileFailed {
+                file, entry, error, ..
+            } if !self.failures_printed.contains(entry) => {
+                self.failures_printed.insert(entry.clone());
+                let block = live_failure_block(
+                    file,
+                    error,
+                    None,
+                    None,
+                    None,
+                    None,
+                    self.log_lines,
+                    &self.core.state.redact,
                 );
                 tracing::error!("{block}");
             }
@@ -3163,6 +3222,7 @@ mod tests {
     }
     fn result_end(addr: &str, error: Option<String>) -> BuildEventKind {
         BuildEventKind::ResultEnd {
+            duplicate: false,
             upstream_file: None,
             path: Vec::new(),
             left_behind: None,
@@ -4455,6 +4515,7 @@ mod tests {
         tail: Option<&str>,
     ) -> BuildEventKind {
         BuildEventKind::ResultEnd {
+            duplicate: false,
             upstream_file: None,
             path: Vec::new(),
             left_behind: None,
@@ -4546,6 +4607,7 @@ mod tests {
     #[test]
     fn ci_view_live_block_carries_the_box_rows() {
         let end = BuildEventKind::ResultEnd {
+            duplicate: false,
             upstream_file: None,
             path: Vec::new(),
             addr: "//a:b".into(),
@@ -4598,6 +4660,48 @@ mod tests {
         assert_eq!(log.matches('✗').count(), 1, "{log}");
     }
 
+    /// An end that lost the culprit's claim prints no box, even when it
+    /// arrives before the announcing one, which then prints the only block;
+    /// the finished line counts one failure, one root. A file culprit's
+    /// `FileFailed` prints one block headed by the file.
+    #[test]
+    fn ci_view_prints_no_box_for_a_non_announcing_end() {
+        let mut dup = failed_end("//a:b", None, false, Some(TAIL));
+        if let BuildEventKind::ResultEnd { duplicate, .. } = &mut dup {
+            *duplicate = true;
+        }
+        assert_eq!(ci_live_log(1, std::slice::from_ref(&dup)), "");
+
+        let announcing = failed_end("//a:b", None, false, Some(TAIL));
+        let log = ci_live_log(1, &[dup.clone(), announcing.clone()]);
+        assert_eq!(log.matches('✗').count(), 1, "{log}");
+
+        let mut s = BuildState::default();
+        for (at, kind) in [
+            BuildEventKind::ResultStart {
+                addr: "//a:b".into(),
+            },
+            dup,
+            announcing,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            s.apply(&ev(at as u64, kind));
+        }
+        assert_eq!(s.failure_split(), (1, 0), "one root, nothing taken down");
+
+        let file = BuildEventKind::FileFailed {
+            file: "d/BUILD".into(),
+            entry: "//d:t".into(),
+            error: "evaluating d/BUILD: boom".into(),
+            path: vec!["//d:t".into()],
+        };
+        let log = ci_live_log(1, &[file.clone(), file]);
+        assert_eq!(log.matches('✗').count(), 1, "{log}");
+        assert!(log.contains("✗ d/BUILD"), "{log}");
+    }
+
     /// Collateral failures and stops print nothing live: the root's block
     /// explains the first, and a stop is not a failure.
     #[test]
@@ -4614,6 +4718,7 @@ mod tests {
     #[test]
     fn ci_view_live_block_words_and_sanitizing() {
         let timed_out = BuildEventKind::ResultEnd {
+            duplicate: false,
             upstream_file: None,
             path: Vec::new(),
             left_behind: None,
@@ -4650,6 +4755,7 @@ mod tests {
         );
 
         let no_status = BuildEventKind::ResultEnd {
+            duplicate: false,
             upstream_file: None,
             path: Vec::new(),
             left_behind: None,
@@ -5987,6 +6093,7 @@ mod tests {
                 });
             }
             ev(BuildEventKind::ResultEnd {
+                duplicate: false,
                 upstream_file: None,
                 path: Vec::new(),
                 left_behind: None,

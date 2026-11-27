@@ -3076,6 +3076,7 @@ mod tests {
                 addr: "//a:b".into(),
             },
             |error: Option<crate::engine::event::ErrorDetail>| BuildEventKind::ResultEnd {
+                duplicate: false,
                 left_behind: None,
                 cancelled: false,
                 addr: "//a:b".into(),
