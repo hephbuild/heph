@@ -1,4 +1,4 @@
-# contract 1
+# contract 2
 # Every JSON path of every `--json` record: command, path, kind, tier, default.
 # A line is never removed or changed (I3); `HEPH_UPDATE_FIELD_SNAPSHOT=1` only adds.
 auth explain	addr	string	free	default
@@ -18,10 +18,10 @@ auth status	state	"ok"	free	default
 auth status	state	"unavailable"	free	default
 auth status	state	string	free	default
 inspect deps	ref	string	free	default
-inspect failure	addr	string	free	default
-inspect failure	failed_at	number	free	default
+inspect failure	addr	string?	free	default
+inspect failure	failed_at	number?	free	default
 inspect failure	fixes	string?	free	default
-inspect failure	hashin	string	free	default
+inspect failure	hashin	string?	free	default
 inspect failure	log	string?	free	default
 inspect failure	out	string?	free	default
 inspect failure	slot	string	free	default

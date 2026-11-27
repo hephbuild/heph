@@ -2695,10 +2695,11 @@ fn live_failure_block(
     timed_out: Option<&hcore::events::TimedOutData>,
     tail: Option<&hcore::events::LogTailData>,
     left_behind: Option<&hcore::events::LeftBehindData>,
+    (path, file): (&[String], bool),
     log_lines: usize,
     redact: &crate::tui::text::Redact,
 ) -> String {
-    use crate::tui::failure_rows::tail_rows;
+    use crate::tui::failure_rows::{reached_by_rows, tail_rows};
     use crate::tui::text::{clean_inline, escape_log_tail, expand_tabs, sanitize_log};
     let row = |line: &str| expand_tabs(&redact.apply(line)).into_owned();
 
@@ -2716,6 +2717,8 @@ fn live_failure_block(
     } else {
         body.extend(sanitize_log(error.as_bytes()).lines().map(row));
     }
+    // How the request reached the culprit (U3), as the report's body says it.
+    body.extend(reached_by_rows(path, file));
     if log_lines > 0
         && let Some(tail) = tail
     {
@@ -2910,9 +2913,9 @@ impl CIAppView for CiProgressView {
                 addr,
                 error: Some(error),
                 upstream_of: None,
-                // The box's `reached by:` row is a later change.
+                // Set only beside `upstream_of`, which this arm rules out.
                 upstream_file: _,
-                path: _,
+                path,
                 exit_status,
                 // `exit_status` already names it.
                 exit_code: _,
@@ -2933,6 +2936,7 @@ impl CIAppView for CiProgressView {
                         timed_out.as_ref(),
                         log_tail.as_ref(),
                         left_behind.as_deref(),
+                        (path, false),
                         self.log_lines,
                         &self.core.state.redact,
                     ),
@@ -2944,7 +2948,10 @@ impl CIAppView for CiProgressView {
             // A BUILD file that did not evaluate: its block, once, headed by
             // the file (it is not a target).
             BuildEventKind::FileFailed {
-                file, entry, error, ..
+                file,
+                entry,
+                error,
+                path,
             } if !self.failures_printed.contains(entry) => {
                 self.failures_printed.insert(entry.clone());
                 let block = live_failure_block(
@@ -2954,6 +2961,7 @@ impl CIAppView for CiProgressView {
                     None,
                     None,
                     None,
+                    (path, true),
                     self.log_lines,
                     &self.core.state.redact,
                 );
@@ -4700,6 +4708,44 @@ mod tests {
         let log = ci_live_log(1, &[file.clone(), file]);
         assert_eq!(log.matches('✗').count(), 1, "{log}");
         assert!(log.contains("✗ d/BUILD"), "{log}");
+    }
+
+    /// U3: a culprit three deep names how the request reached it, after the
+    /// header and before the tail; one that was itself requested gets no row.
+    /// A file culprit's block names the edge into the file.
+    #[test]
+    fn ci_view_live_block_shows_reached_by() {
+        let mut deep = failed_end("//a:t", None, false, Some("one\n"));
+        if let BuildEventKind::ResultEnd { path, .. } = &mut deep {
+            *path = vec!["//a:root".into(), "//a:mid".into(), "//a:t".into()];
+        }
+        assert_eq!(
+            ci_live_log(1, &[deep]),
+            "ERROR ✗ //a:t · exit status: 1\
+             \n  │ reached by: //a:root → //a:mid → //a:t\
+             \n  │ one\n",
+        );
+
+        let mut requested = failed_end("//a:t", None, false, Some("one\n"));
+        if let BuildEventKind::ResultEnd { path, .. } = &mut requested {
+            *path = vec!["//a:t".into()];
+        }
+        let log = ci_live_log(1, &[requested]);
+        assert!(!log.contains("reached by:"), "{log}");
+
+        let file = BuildEventKind::FileFailed {
+            file: "d/BUILD".into(),
+            entry: "//d:t".into(),
+            error: "boom".into(),
+            path: vec!["//a:root".into(), "//c:y".into(), "//d:t".into()],
+        };
+        assert_eq!(
+            ci_live_log(1, &[file]),
+            "ERROR ✗ d/BUILD\
+             \n  │ boom\
+             \n  │ reached by: //a:root → //c:y\
+             \n  │ //c:y depends on //d:t, which this file defines\n",
+        );
     }
 
     /// Collateral failures and stops print nothing live: the root's block

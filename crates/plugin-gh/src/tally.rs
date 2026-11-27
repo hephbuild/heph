@@ -129,7 +129,11 @@ impl PartialOrd for Completed {
 /// to fix. Collateral failures are folded into `blocked` / `blocked_by_pkg`.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RootFailure {
+    /// The culprit target; for a file culprit, the address that led into it.
     pub addr: String,
+    /// The workspace-relative BUILD/`.bzl` file that did not evaluate, when
+    /// the culprit is that file rather than a target: what a reader is shown.
+    pub file: Option<String>,
     pub message: String,
     /// The subprocess's exit status, when the failure was a subprocess.
     pub exit_status: Option<String>,
@@ -144,6 +148,14 @@ pub(crate) struct RootFailure {
     /// Where those blocked targets live, for the rollup line. Bounded by package
     /// count (~1–3k), not target count.
     pub blocked_by_pkg: FxHashMap<Box<str>, usize>,
+}
+
+impl RootFailure {
+    /// What a reader is told failed: the file, for a file culprit, else the
+    /// target.
+    pub(crate) fn culprit(&self) -> &str {
+        self.file.as_deref().unwrap_or(&self.addr)
+    }
 }
 
 /// A target whose admission has waited past the notice threshold for what it
@@ -316,6 +328,8 @@ pub(crate) struct Tally {
 /// split with it.
 #[derive(Clone, Copy)]
 pub(crate) struct Failure<'a> {
+    /// The file that did not evaluate, for a file culprit.
+    pub file: Option<&'a str>,
     pub message: &'a str,
     pub upstream_of: Option<&'a str>,
     pub exit_status: Option<&'a str>,
@@ -408,6 +422,7 @@ impl Tally {
                 self.finish(
                     addr,
                     error.as_deref().map(|message| Failure {
+                        file: None,
                         message,
                         upstream_of: upstream_of.as_deref(),
                         exit_status: exit_status.as_deref(),
@@ -592,13 +607,13 @@ impl Tally {
             BuildEventKind::FileFailed {
                 entry,
                 error,
-                // The message names the file; the path reaches the report in
-                // a later change.
-                file: _,
+                file,
+                // The report names no path: the job log's block has it.
                 path: _,
             } => self.record_root(
                 entry,
                 Failure {
+                    file: Some(file.as_str()),
                     message: error,
                     upstream_of: None,
                     exit_status: None,
@@ -741,6 +756,7 @@ impl Tally {
         self.root_index.insert(addr.into(), self.roots.len());
         self.roots.push(RootFailure {
             addr: addr.to_string(),
+            file: failure.file.map(str::to_string),
             message: failure.message.to_string(),
             exit_status: failure.exit_status.map(str::to_string),
             log_tail: failure.log_tail.cloned(),
@@ -1167,10 +1183,31 @@ mod tests {
             panic!("one root: {:?}", t.roots());
         };
         assert_eq!(root.addr, "//d:t1");
+        assert_eq!(root.file.as_deref(), Some("d/BUILD"));
         assert!(root.message.contains("d/BUILD"), "{}", root.message);
         assert_eq!(root.blocked, 1);
         let (done, total, _) = t.progress();
         assert_eq!((done, total), (2, 3), "the duplicate end closed //d:t2");
+
+        // Every surface names the file as what failed: the comment's
+        // headings, the annotation's title, and the JSON beside the address.
+        let ctx = crate::render::RenderCtx {
+            heading: "heph",
+            now_ms: 20,
+            slow_after_ms: 30_000,
+            run_url: None,
+        };
+        let live = crate::render::render_live(&t, &ctx, usize::MAX);
+        assert!(live.contains("### `d/BUILD` — failed"), "{live}");
+        let done = crate::render::render_final(&t, &ctx, usize::MAX);
+        assert!(done.contains("### `d/BUILD`\n"), "{done}");
+        let [note] = crate::report::annotations(t.roots(), 10)
+            .try_into()
+            .expect("one");
+        assert!(note.starts_with("::error title=heph d/BUILD::"), "{note}");
+        let doc = crate::report::full_document(&t, &c, 20, "run //...", None);
+        assert_eq!(doc["failures"][0]["file"], "d/BUILD");
+        assert_eq!(doc["failures"][0]["addr"], "//d:t1");
     }
 
     #[test]

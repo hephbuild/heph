@@ -28,7 +28,9 @@ use crate::engine::error::{
 };
 use crate::engine::request_state::TookDown;
 use crate::hmemoizer::downcast_chain_ref;
-use crate::tui::failure_rows::{FIXES_SHOWN, log_line_count, shell_quote, tail_rows};
+use crate::tui::failure_rows::{
+    FIXES_SHOWN, log_line_count, reached_by_rows, shell_quote, tail_rows,
+};
 use crate::tui::text::{
     Redact, WorkspaceRel, clean_inline, cut_right, escape_log_tail, expand_tabs, fit_styled,
     message, sanitize_log,
@@ -184,6 +186,14 @@ impl ReportContext {
                     .map(|l| self.cut_row(l)),
             );
         }
+        // How the request reached the culprit (U3): after what went wrong,
+        // before the log it printed.
+        let path: Vec<String> = f.path.iter().map(|a| a.format()).collect();
+        body.extend(
+            reached_by_rows(&path, f.file.is_some())
+                .iter()
+                .map(|l| self.cut_row(l)),
+        );
         if let Some((text, start)) = &block.tail {
             // The pointer, `(no output)` or the earlier-lines row, worded once
             // for every box (D6.1); the tail is already `--log-lines` long.
@@ -667,6 +677,28 @@ mod tests {
             );
         }
         assert!(!colored.contains('\u{9b}'), "{colored:?}");
+    }
+
+    /// U3: a culprit three deep names how the request reached it, after the
+    /// status and before the log; one that was itself requested gets no row.
+    #[test]
+    fn failure_report_shows_reached_by() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let addrs =
+            |a: &[&str]| -> Vec<_> { a.iter().map(|s| parse_addr(s).expect("addr")).collect() };
+        let deep = exited(dir.path(), "//p:t", &["one"], 3)
+            .with_path(addrs(&["//p:root", "//p:mid", "//p:t"]));
+        let out = report(vec![deep], &[]);
+        assert!(
+            out.contains(
+                "✗ //p:t · exit status: 101\n  │ reached by: //p:root → //p:mid → //p:t\n  │ one\n"
+            ),
+            "{out}"
+        );
+
+        let requested = exited(dir.path(), "//p:r", &["one"], 3).with_path(addrs(&["//p:r"]));
+        let out = report(vec![requested], &[]);
+        assert!(!out.contains("reached by:"), "{out}");
     }
 
     /// D6.1: a target whose output streamed to a terminal gets its box, with
