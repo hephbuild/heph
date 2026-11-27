@@ -556,6 +556,51 @@ async fn byte_move_failure_parent_is_a_file() -> anyhow::Result<()> {
     .await
 }
 
+/// A write-back that fails after a run that streamed (D6.1c, "a later step
+/// failed"): it runs outside the memoized execute, and the failure still
+/// records that the log streamed, so the box points at the log instead of
+/// repeating it. The same failure after a run that did not stream records
+/// that it did not.
+#[tokio::test]
+async fn codegen_write_back_failure_after_a_streamed_run_records_streamed() -> anyhow::Result<()> {
+    for streamed in [true, false] {
+        let ws = Workspace::new();
+        ws.write_build_file("p", &copy_target("gen", "gen.txt", "v1"));
+        std::fs::create_dir_all(ws.dir.path().join("p/gen.txt/inner"))?;
+
+        let wrapper: heph::engine::InteractiveWrapper =
+            Arc::new(move |inner: heph::engine::InteractiveInner| {
+                Box::pin(async move {
+                    let (mut out, mut err) = (tokio::io::sink(), tokio::io::sink());
+                    inner(None, Some(&mut out), Some(&mut err), None).await?;
+                    Ok(heph::engine::TerminalUse { streamed })
+                })
+            });
+        let opts = ResultOptions {
+            interactive: Some(wrapper),
+            ..ResultOptions::default()
+        };
+        let rs = ws.engine.new_state();
+        let res = Arc::clone(&ws.engine)
+            .result_addr(
+                Arc::clone(&rs),
+                &parse_addr("//p:gen")?,
+                OutputMatcher::All,
+                &opts,
+            )
+            .await;
+        assert!(res.is_err(), "the write-back cannot succeed");
+        let failures = rs.take_failures();
+        let [failure] = failures.as_slice() else {
+            panic!("one failure: {failures:?}");
+        };
+        let msg = format!("{:#}", failure.source);
+        assert!(msg.contains("gen.txt"), "the write-back's error: {msg}");
+        assert_eq!(failure.streamed, streamed, "{msg}");
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Row 4: a glob output that produces fewer files
 // ---------------------------------------------------------------------------
