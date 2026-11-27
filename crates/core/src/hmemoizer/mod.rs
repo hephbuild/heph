@@ -538,7 +538,7 @@ pub fn own_parts(frames: Vec<String>) -> Vec<String> {
 
 /// `frame` without a trailing copy of its source's text `next`, and without the
 /// separator before that copy. `frame` itself when it does not end that way.
-fn own_part<'a>(frame: &'a str, next: &str) -> &'a str {
+pub fn own_part<'a>(frame: &'a str, next: &str) -> &'a str {
     let Some(head) = frame.strip_suffix(next) else {
         return frame;
     };
@@ -704,6 +704,13 @@ fn push_frames<'a>(level: &'a anyhow::Error, out: &mut Vec<ErrorFrame<'a>>) {
 /// Visit every frame of `e` in walk order: [`frames`]' order, and after a
 /// [`MultiError`] frame, each member's frames in the members' order. Stops at
 /// the first `Break`.
+///
+/// It descends into an anyhow error only where one is held by a
+/// [`SharedAnyhow`] or a [`MultiError`]. An anyhow error that rides as another
+/// error's std `source()` (a `TargetFailure`'s cause, starlark's wrapper) is
+/// walked as plain std frames: its root object is found, but a typed
+/// *context* in it is not. Look in such an error directly (a
+/// `TargetFailure`'s `source`).
 pub fn walk<'a, B>(
     e: &'a anyhow::Error,
     visit: &mut dyn FnMut(ErrorFrame<'a>) -> std::ops::ControlFlow<B>,

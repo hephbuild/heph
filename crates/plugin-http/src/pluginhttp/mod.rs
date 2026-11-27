@@ -229,8 +229,12 @@ impl ManagedDriver for Driver {
             }
             let out = match spec.out {
                 Some(out) => out,
-                None => file_name_of(&url)
-                    .with_context(|| format!("{url:?} has no file name — set `out` explicitly"))?,
+                None => file_name_of(&url).with_context(|| {
+                    format!(
+                        "{:?} has no file name — set `out` explicitly",
+                        hfetch::redact_url(&url)
+                    )
+                })?,
             };
             (Deferred::new(url), out)
         };
@@ -247,9 +251,16 @@ impl ManagedDriver for Driver {
         let sha256 = spec.sha256.unwrap_or_default();
         // A computed url is checked at run, once it exists (`run` repeats the
         // check for every url, so neither path can skip it).
+        // The literal url is quoted without its userinfo or query: the check
+        // refuses a url that carries a password, which must not be printed.
         if !credential_inputs.is_empty() && !deferred {
-            auth::check_url(url.raw())
-                .with_context(|| format!("{}: `url` {:?}", addr.format(), url.raw()))?;
+            auth::check_url(url.raw()).with_context(|| {
+                format!(
+                    "{}: `url` {:?}",
+                    addr.format(),
+                    hfetch::redact_url(url.raw())
+                )
+            })?;
         }
         if spec.unpinned && !sha256.is_empty() {
             anyhow::bail!(
@@ -368,8 +379,9 @@ impl ManagedDriver for Driver {
             &req.request.credentials,
         )? {
             // Each names the url as written: `url` may be a `${read://…}`
-            // reference's resolved value, which no message quotes (I7).
-            let shown = || format!("{addr}: `url` {:?}", def.url.raw());
+            // reference's resolved value, which no message quotes (I7). A
+            // literal one is quoted without its userinfo or query.
+            let shown = || format!("{addr}: `url` {:?}", hfetch::redact_url(def.url.raw()));
             auth::check_url(&url).with_context(shown)?;
             // Off the async workers: it reads the presented netrc files.
             let picked = hcore::blocking::run(enclose::enclose!(
@@ -2082,6 +2094,24 @@ mod tests {
             let msg = format!("{:#}", auth::check_url(bad).expect_err(bad));
             assert!(!msg.contains("S3CRET"), "{bad:?}: {msg}");
         }
+        // A literal url refused at parse for the password it carries is quoted
+        // without it (and without its query).
+        let err = parse_deferred(
+            "https://u:S3CRET@x.example/asset?sig=S3CRET",
+            &[
+                out("t"),
+                (
+                    "credentials",
+                    Value::List(vec![Value::String("//auth:netrc".to_string())]),
+                ),
+            ],
+        )
+        .await
+        .err()
+        .expect("a url with a password and credentials is refused");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("https://x.example/asset"), "{msg}");
+        assert!(!msg.contains("S3CRET"), "quoted the password: {msg}");
     }
 
     /// A resolved url is the producer's bytes, not a template: a `{` in it is

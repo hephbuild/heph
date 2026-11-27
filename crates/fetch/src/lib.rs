@@ -192,10 +192,15 @@ pub fn check_header(name: &str, value: &str) -> anyhow::Result<String> {
 /// A presigned URL (S3's `X-Amz-Signature`, a CDN token) carries its secret in
 /// the query, and a URL a `${read://…}` reference resolved to may be one, so no
 /// error or log quotes a URL any other way (I7). Text that does not parse as a
-/// URL is cut at its first `?` or `#`.
+/// URL with a host (`u:p@h/x` parses as scheme `u`) is cut at its first `?` or
+/// `#`, and to what follows its last `@`.
 pub fn redact_url(url: &str) -> std::borrow::Cow<'_, str> {
-    let Ok(mut parsed) = reqwest::Url::parse(url) else {
-        return std::borrow::Cow::Borrowed(url.split(['?', '#']).next().unwrap_or(url));
+    let mut parsed = match reqwest::Url::parse(url) {
+        Ok(parsed) if parsed.has_host() => parsed,
+        _ => {
+            let cut = url.split(['?', '#']).next().unwrap_or(url);
+            return std::borrow::Cow::Borrowed(cut.rsplit('@').next().unwrap_or(cut));
+        }
     };
     if parsed.query().is_none()
         && parsed.fragment().is_none()
@@ -212,8 +217,9 @@ pub fn redact_url(url: &str) -> std::borrow::Cow<'_, str> {
 fn strip_secrets(url: &mut reqwest::Url) {
     url.set_query(None);
     url.set_fragment(None);
-    // Both refuse only a URL that cannot be a base, which has no userinfo to
-    // strip: either outcome leaves none.
+    // Both refuse only a URL that has no host or cannot be a base (and
+    // `set_username` a `file:` one), none of which can carry userinfo: either
+    // outcome leaves none.
     let (Ok(()) | Err(())) = url.set_password(None);
     let (Ok(()) | Err(())) = url.set_username("");
 }
@@ -535,6 +541,9 @@ mod tests {
             ("https://u:s3cr3t@h.example/a", "https://h.example/a"),
             ("https://s3cr3t@h.example/a", "https://h.example/a"),
             ("not a url?sig=s3cr3t", "not a url"),
+            ("u:s3cr3t@h.example/a", "h.example/a"),
+            ("//u:s3cr3t@h.example/a?q=1", "h.example/a"),
+            ("${read://gh:tool_url}", "${read://gh:tool_url}"),
             ("", ""),
         ] {
             assert_eq!(redact_url(url), want, "{url}");

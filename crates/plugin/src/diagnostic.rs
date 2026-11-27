@@ -7,7 +7,43 @@
 //! renderer recognises it by type: it takes the stage and the target from the
 //! innermost one ([`innermost_stage_frame`]) and leaves the frames themselves
 //! out of the cause it prints ([`cause_frames`]).
+//!
+//! **Never hashed** (I1). None of these types implements `Hash`, so nothing
+//! about a diagnostic or a stage frame can reach a def hash, `hashin` or a
+//! cache key. Each refusal below follows a twin that compiles and differs only
+//! in the derive, and is pinned to `E0277` (the missing `Hash`), so it cannot
+//! pass for another reason.
+//!
+//! ```
+//! #[derive(Clone)]
+//! struct Keyed(plugin::diagnostic::Diagnostic, plugin::diagnostic::SourceLoc);
+//! #[derive(Clone)]
+//! struct Framed(plugin::diagnostic::StageFrame);
+//! # fn main() {}
+//! ```
+//!
+//! `no_hash_on_diagnostic`:
+//! ```compile_fail,E0277
+//! #[derive(Hash)]
+//! struct Keyed(plugin::diagnostic::Diagnostic);
+//! # fn main() {}
+//! ```
+//!
+//! `no_hash_on_source_loc`:
+//! ```compile_fail,E0277
+//! #[derive(Hash)]
+//! struct Keyed(plugin::diagnostic::SourceLoc);
+//! # fn main() {}
+//! ```
+//!
+//! `no_hash_on_stage_frame`:
+//! ```compile_fail,E0277
+//! #[derive(Hash)]
+//! struct Framed(plugin::diagnostic::StageFrame);
+//! # fn main() {}
+//! ```
 
+use crate::error::MultiError;
 use hmodel::htaddr::Addr;
 use std::fmt;
 
@@ -96,16 +132,23 @@ pub fn innermost_stage_frame(e: &anyhow::Error) -> Option<&StageFrame> {
     hcore::hmemoizer::innermost::<StageFrame>(e)
 }
 
-/// The first [`Diagnostic`] in `e`, in walk order.
+/// `e`'s own [`Diagnostic`]: the first on its chain, through shared errors
+/// ([`hcore::hmemoizer::frames`]). One inside a [`MultiError`]'s member is that
+/// member's, one failure among several, and is not `e`'s: taking it would
+/// print one member as the whole error and drop the rest.
 pub fn find_diagnostic(e: &anyhow::Error) -> Option<&Diagnostic> {
-    hcore::hmemoizer::find::<Diagnostic>(e)
+    hcore::hmemoizer::frames(e)
+        .into_iter()
+        .find_map(|f| f.downcast_ref::<Diagnostic>())
 }
 
 /// `e`'s cause as text frames, outermost first: every frame but the
 /// [`StageFrame`]s, an empty frame (data riding the chain) dropped, and a frame
 /// that ends with its source's text cut back to its own part (as
-/// `hcore::hmemoizer::chain_frames` does). A [`Diagnostic`] is printed alone:
-/// when there is one, it is the only frame.
+/// `hcore::hmemoizer::chain_frames` does). `e`'s own [`Diagnostic`]
+/// ([`find_diagnostic`]) is printed alone: when there is one, it is the only
+/// frame. A [`MultiError`] is one frame listing each member's cause, so every
+/// member is shown, each as this function shows it.
 pub fn cause_frames(e: &anyhow::Error) -> Vec<String> {
     if let Some(d) = find_diagnostic(e) {
         return vec![d.to_string()];
@@ -113,10 +156,23 @@ pub fn cause_frames(e: &anyhow::Error) -> Vec<String> {
     let texts: Vec<String> = hcore::hmemoizer::frames(e)
         .into_iter()
         .filter(|f| f.downcast_ref::<StageFrame>().is_none())
-        .map(|f| f.error().to_string())
+        .map(|f| match f.downcast_ref::<MultiError>() {
+            Some(multi) => members_cause(multi),
+            None => f.error().to_string(),
+        })
         .filter(|s| !s.is_empty())
         .collect();
     hcore::hmemoizer::own_parts(texts)
+}
+
+/// A [`MultiError`]'s text with each member's [`cause_frames`] in place of its
+/// `{:#}`, in the layout its `Display` has.
+fn members_cause(multi: &MultiError) -> String {
+    let mut out = format!("{} errors:", multi.0.len());
+    for (i, member) in multi.0.iter().enumerate() {
+        out.push_str(&format!("\n  [{i}] {}", cause_frames(member).join(": ")));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -209,5 +265,49 @@ mod tests {
             .context("probing package `//p`");
         let e = with_stage(e, Boundary::GetDef, &addr("//p:t"));
         assert_eq!(cause_frames(&e), ["p/BUILD:3:1: name `x` is not defined"]);
+    }
+
+    /// A keep-going link fanout records every broken input as one
+    /// `MultiError`: one member's diagnostic is that member's, so it does not
+    /// stand for the whole error, and no member's stage frames are printed.
+    #[test]
+    fn multierror_members_each_keep_their_cause() {
+        let d = Diagnostic::new(Stage::Eval, "name `x` is not defined")
+            .with_location(SourceLoc::checked("a/BUILD".into(), 3, 1).expect("loc"));
+        let with_d = with_stage(anyhow::Error::new(d), Boundary::GetDef, &addr("//a:x"));
+        let plain = with_stage(
+            anyhow::anyhow!("target //b:y not found"),
+            Boundary::GetDef,
+            &addr("//b:y"),
+        );
+        let e = with_stage(
+            anyhow::Error::new(MultiError(vec![with_d, plain])),
+            Boundary::Link,
+            &addr("//app:bin"),
+        );
+        assert!(
+            find_diagnostic(&e).is_none(),
+            "a member's is not the error's"
+        );
+        assert_eq!(
+            cause_frames(&e),
+            ["2 errors:\n  [0] a/BUILD:3:1: name `x` is not defined\n  [1] target //b:y not found"]
+        );
+
+        // Two members with stage frames and no diagnostic.
+        let staged = |s: &str, a: &str| {
+            with_stage(
+                with_stage(anyhow::anyhow!("{s}"), Boundary::Run, &addr(a)),
+                Boundary::Execute,
+                &addr(a),
+            )
+        };
+        let e = anyhow::Error::new(MultiError(vec![
+            staged("exit 1", "//a:x"),
+            staged("exit 2", "//b:y"),
+        ]));
+        let frames = cause_frames(&e);
+        assert_eq!(frames, ["2 errors:\n  [0] exit 1\n  [1] exit 2"]);
+        assert!(!frames[0].contains("execute "), "{frames:?}");
     }
 }

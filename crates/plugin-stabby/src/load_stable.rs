@@ -790,7 +790,8 @@ impl Provider for StableRemoteProvider {
                     ))),
                     Ok(_) => Err(GetError::Other(convert::plugin_error(
                         ge.message.unwrap_or_default(),
-                        convert::diagnostic_from_pb(ge.diagnostic, Stage::Spec),
+                        ge.diagnostic,
+                        Stage::Spec,
                     ))),
                     Err(kind) => Err(GetError::Other(
                         kind.context(ge.message.unwrap_or_default()),
