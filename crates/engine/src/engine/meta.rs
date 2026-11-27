@@ -1,4 +1,4 @@
-use crate::engine::expand::ExpandedInputs;
+use crate::engine::expand::{ExpandedInputs, PartialExpansion};
 use crate::engine::request_state::{AddrKey, RequestState};
 use crate::engine::result::ExtendedTargetDef;
 use crate::engine::{EResult, Engine, OutputMatcher, ResultOptions};
@@ -6,7 +6,7 @@ use anyhow::Context;
 use async_recursion::async_recursion;
 use enclose::enclose;
 use hcore::debug_hash::DebugHasher;
-use hcore::hmemoizer::unwrap_arc_err;
+use hcore::hmemoizer::{downcast_chain_ref, unwrap_arc_err};
 use hmodel::htaddr::Addr;
 use std::hash::Hasher;
 use std::sync::Arc;
@@ -64,7 +64,7 @@ impl Engine {
         // _no_track: meta is invoked from inner_result_addr after parent was
         // already set to addr — tracked get_def would record addr→addr.
         let def = Arc::clone(&self).get_def_no_track(rs.clone(), addr).await?;
-        let (inputs, results) = self.clone().inputs_result_meta(rs.clone(), addr).await?;
+        let (inputs, results) = self.clone().inputs_result_meta(rs.clone(), &def).await?;
 
         // `results` is the hashed inputs' results, index for index: each is
         // paired with its addr, which only the `HEPH_DEBUG_HASH` trace reads.
@@ -120,16 +120,48 @@ impl Engine {
         Ok(format!("{:x}", h.finish()))
     }
 
-    /// The expanded inputs of `addr`, and the result of each hashed one, in the
+    /// The expanded inputs of `def`, and the result of each hashed one, in the
     /// order the hashed inputs appear in them.
+    ///
+    /// An expansion that failed is never hashed: this fails with its errors.
+    /// It first builds the hashed inputs that did resolve (D1.f), so their own
+    /// failures are found and their successes cached, as they would have been
+    /// had the broken input not been there.
     async fn inputs_result_meta(
         self: Arc<Self>,
         rc: Arc<RequestState>,
-        addr: &Addr,
+        def: &ExtendedTargetDef,
     ) -> anyhow::Result<(Arc<ExpandedInputs>, Vec<Arc<EResult>>)> {
-        let inputs = Arc::clone(&self)
-            .expanded_inputs_for(rc.clone(), addr)
-            .await?;
+        let declared = &def.target_def;
+        let inputs = match Arc::clone(&self)
+            .expanded_inputs_for(rc.clone(), &declared.addr)
+            .await
+        {
+            Ok(inputs) => inputs,
+            Err(e) => {
+                if let Some(partial) = downcast_chain_ref::<PartialExpansion>(&e) {
+                    let hashed: Vec<&Addr> = partial
+                        .resolved()
+                        .filter(|(_, idx)| declared.inputs.get(*idx).is_some_and(|i| i.hashed))
+                        .map(|(def, _)| &def.target_def.addr)
+                        .collect();
+                    // Each one's failure is its own scope's to record; the
+                    // expansion's errors are what this target fails with.
+                    let opts = ResultOptions::default();
+                    let _built: Vec<anyhow::Result<Arc<EResult>>> =
+                        futures::future::join_all(hashed.into_iter().map(|input| {
+                            Arc::clone(&self).result_addr(
+                                rc.clone(),
+                                input,
+                                OutputMatcher::None,
+                                &opts,
+                            )
+                        }))
+                        .await;
+                }
+                return Err(e);
+            }
+        };
 
         let fail_fast = rc.fail_fast();
         // Only `hashed=true` inputs contribute their hashout to the parent's

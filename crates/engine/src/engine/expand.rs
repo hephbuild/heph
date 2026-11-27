@@ -2,7 +2,7 @@ use crate::engine::Engine;
 use crate::engine::deferred::declared_origin;
 use crate::engine::driver::TargetAddr;
 use crate::engine::driver::targetdef::{Input, InputMode, TargetDef};
-use crate::engine::error::{InputDefFailed, MissingDep};
+use crate::engine::error::{InputDefFailed, MissingDep, MultiError};
 use crate::engine::invoke::EntrypointAsInput;
 use crate::engine::request_state::{AddrKey, RequestState};
 use crate::engine::result::ExtendedTargetDef;
@@ -10,7 +10,7 @@ use async_recursion::async_recursion;
 use enclose::enclose;
 use futures::FutureExt as _;
 use futures::stream::{FuturesOrdered, Stream, StreamExt as _};
-use hcore::hmemoizer::unwrap_arc_err;
+use hcore::hmemoizer::{nest, unwrap_arc_err};
 use hmodel::htaddr::Addr;
 use rustc_hash::FxHashSet;
 use std::collections::BTreeMap;
@@ -227,12 +227,81 @@ impl std::ops::Deref for ExpandedInputs {
     }
 }
 
+/// The context on an expansion that failed without `--fail-fast` (D1.f,
+/// STAGE-16), over the error of every input that failed: a sole one bare,
+/// several as a [`MultiError`] in input order, so the walker finds a
+/// cancellation or a cycle among them like anywhere else. It holds no error
+/// and renders as nothing, like any data riding a chain.
+///
+/// Nothing consumes the inputs that resolved as an input set: the expansion
+/// is an `Err`, so `link`, `hashin` and `hash_dep_count` never see them, and
+/// a partial set is never hashed, whichever input failed (hashed or not).
+/// Only `meta` reads them, to build the hashed ones before it fails with the
+/// errors, so a fault in one subtree does not keep its healthy siblings from
+/// running.
+pub(crate) struct PartialExpansion {
+    /// Each input that resolved, with the index in the declaring target's own
+    /// input list of the input it came through (a group member's is its
+    /// group's, whose `hashed`/`runtime` it carries).
+    resolved: Vec<(Arc<ExtendedTargetDef>, usize)>,
+}
+
+impl PartialExpansion {
+    /// Each input that resolved, with the index of the declared input it
+    /// came through.
+    pub(crate) fn resolved(&self) -> impl Iterator<Item = (&Arc<ExtendedTargetDef>, usize)> {
+        self.resolved.iter().map(|(def, idx)| (def, *idx))
+    }
+
+    /// The expansion's error: this context over `errors` (not empty). Each
+    /// of several is nested, so a classifier can hand one member to whoever
+    /// records it ([`hcore::hmemoizer::share`]).
+    fn into_error(self, mut errors: Vec<anyhow::Error>) -> anyhow::Error {
+        let errors = match errors.pop() {
+            Some(sole) if errors.is_empty() => sole,
+            last => {
+                errors.extend(last);
+                MultiError(errors.into_iter().map(nest).collect()).into()
+            }
+        };
+        errors.context(self)
+    }
+}
+
+impl std::fmt::Debug for PartialExpansion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(
+                self.resolved
+                    .iter()
+                    .map(|(def, idx)| (def.target_def.addr.format(), idx)),
+            )
+            .finish()
+    }
+}
+
+impl std::fmt::Display for PartialExpansion {
+    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Ok(())
+    }
+}
+
+impl std::error::Error for PartialExpansion {}
+
 /// What a group's expansion appends to, and the path it is on.
 struct GroupWalk<'a> {
     /// The target's expanded inputs so far.
     inputs: &'a mut Vec<Input>,
     /// The def of each of `inputs`, index for index.
     defs: &'a mut Vec<Arc<ExtendedTargetDef>>,
+    /// For each of `defs`, the index of the declared input it came through.
+    origins: &'a mut Vec<usize>,
+    /// The declared input (a group) this walk expands.
+    origin: usize,
+    /// Each failure met so far, in walk order, when not `fail_fast`.
+    errors: &'a mut Vec<anyhow::Error>,
+    /// Whether the first failure ends the walk.
+    fail_fast: bool,
     /// The groups on the path being expanded, to refuse one that contains
     /// itself. Expansion is sequential within one task, so the walk borrows
     /// it mutably across the recursion.
@@ -266,8 +335,7 @@ impl Engine {
                         .await?;
                     let expanded = Arc::clone(&engine)
                         .expand_inputs(rs, &def.target_def)
-                        .await
-                        .map_err(|e| EntrypointAsInput::name_consumer(e, &addr))?;
+                        .await?;
                     Ok(Arc::new(expanded))
                 }),
             )
@@ -283,50 +351,81 @@ impl Engine {
     /// nothing is copied, which is the common case. Otherwise the list is
     /// allocated the first time a group is met, with the inputs before it
     /// copied in.
+    ///
+    /// Under `--fail-fast` the first failing input, in declaration order, is
+    /// the error. Otherwise every input is resolved, a group walked to its
+    /// end, and any failure fails the expansion with all of them under a
+    /// [`PartialExpansion`] (D1.f).
     pub(crate) async fn expand_inputs(
         self: Arc<Self>,
         rs: Arc<RequestState>,
         declared: &Arc<TargetDef>,
     ) -> anyhow::Result<ExpandedInputs> {
+        let consumer = &declared.addr;
+        let fail_fast = rs.fail_fast();
         let inputs = &declared.inputs;
         let mut expanded: Option<Vec<Input>> = None;
         let mut defs = Vec::with_capacity(inputs.len());
+        let mut origins = Vec::with_capacity(inputs.len());
+        let mut errors = Vec::new();
         let mut visited = FxHashSet::default();
 
-        let mut resolved = self.input_defs(&rs, &declared.addr, inputs).enumerate();
+        let mut resolved = self.input_defs(&rs, consumer, inputs).enumerate();
         while let Some((idx, next)) = resolved.next().await {
-            let (input, def) = next?;
-
-            if def.target_def.transparent {
-                let out = expanded.get_or_insert_with(|| {
-                    let mut v = Vec::with_capacity(inputs.len());
-                    v.extend_from_slice(inputs.get(..idx).unwrap_or_default());
-                    v
-                });
-                let mut walk = GroupWalk {
-                    inputs: out,
-                    defs: &mut defs,
-                    visited: &mut visited,
-                };
-                Arc::clone(&self)
-                    .expand_group_into(
-                        rs.clone(),
-                        input,
-                        &def.target_def.inputs,
-                        &ParentOverride::of(input),
-                        &mut walk,
-                    )
-                    .await?;
-            } else {
-                if let Some(out) = expanded.as_mut() {
-                    // A group earlier in the list allocated the result: copy
-                    // this pass-through into it.
-                    out.push(input.clone());
+            let step = match next {
+                Ok((input, def)) if def.target_def.transparent => {
+                    let out = expanded.get_or_insert_with(|| {
+                        let mut v = Vec::with_capacity(inputs.len());
+                        v.extend_from_slice(inputs.get(..idx).unwrap_or_default());
+                        v
+                    });
+                    let mut walk = GroupWalk {
+                        inputs: out,
+                        defs: &mut defs,
+                        origins: &mut origins,
+                        origin: idx,
+                        errors: &mut errors,
+                        fail_fast,
+                        visited: &mut visited,
+                    };
+                    Arc::clone(&self)
+                        .expand_group_into(
+                            rs.clone(),
+                            input,
+                            &def.target_def.inputs,
+                            &ParentOverride::of(input),
+                            &mut walk,
+                        )
+                        .await
                 }
-                defs.push(def);
+                Ok((input, def)) => {
+                    if let Some(out) = expanded.as_mut() {
+                        // A group earlier in the list allocated the result:
+                        // copy this pass-through into it.
+                        out.push(input.clone());
+                    }
+                    defs.push(def);
+                    origins.push(idx);
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            };
+            if let Err(e) = step {
+                if fail_fast {
+                    return Err(EntrypointAsInput::name_consumer(e, consumer));
+                }
+                errors.push(e);
             }
         }
 
+        if !errors.is_empty() {
+            let errors = errors
+                .into_iter()
+                .map(|e| EntrypointAsInput::name_consumer(e, consumer))
+                .collect();
+            let resolved = defs.into_iter().zip(origins).collect();
+            return Err(PartialExpansion { resolved }.into_error(errors));
+        }
         let inputs = match expanded {
             Some(inputs) => InputList::Expanded(inputs),
             None => InputList::Declared(Arc::clone(declared)),
@@ -342,6 +441,11 @@ impl Engine {
     /// (SRC_*) and routing (e.g. `unpack_root=tools`) reflect the target's
     /// intent, not the group's internal ids. Its annotations form the base; a
     /// member's own annotations override them on key conflict.
+    ///
+    /// A member that fails ends the walk under `fail_fast` (the error is
+    /// returned); otherwise it joins `walk.errors` and the walk goes on. Either
+    /// way `group` leaves the path before this returns, so a later walk that
+    /// meets it again (a second group sharing it) is not a cycle.
     #[async_recursion]
     async fn expand_group_into(
         self: Arc<Self>,
@@ -358,26 +462,39 @@ impl Engine {
 
         // A member is the group's declaration, not the outer target's.
         let mut resolved = self.input_defs(&rs, addr, members);
+        let mut ended = Ok(());
         while let Some(next) = resolved.next().await {
-            let (member, def) = next?;
-            if def.target_def.transparent {
-                Arc::clone(&self)
-                    .expand_group_into(
-                        rs.clone(),
-                        member,
-                        &def.target_def.inputs,
-                        &routing.nested(member),
-                        walk,
-                    )
-                    .await?;
-            } else {
-                walk.inputs.push(routing.apply(member));
-                walk.defs.push(def);
+            let step = match next {
+                Ok((member, def)) if def.target_def.transparent => {
+                    Arc::clone(&self)
+                        .expand_group_into(
+                            rs.clone(),
+                            member,
+                            &def.target_def.inputs,
+                            &routing.nested(member),
+                            walk,
+                        )
+                        .await
+                }
+                Ok((member, def)) => {
+                    walk.inputs.push(routing.apply(member));
+                    walk.defs.push(def);
+                    walk.origins.push(walk.origin);
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            };
+            if let Err(e) = step {
+                if walk.fail_fast {
+                    ended = Err(e);
+                    break;
+                }
+                walk.errors.push(e);
             }
         }
 
         walk.visited.remove(addr);
-        Ok(())
+        ended
     }
 
     /// Each of `inputs` with its def, in declaration order, refusing an
@@ -885,6 +1002,153 @@ mod tests {
             .unwrap_or_else(|| panic!("want input 0's EntrypointAsInput, got: {err:#}"));
         assert_eq!(refused.entrypoint, ep);
         assert_eq!(refused.origin_id, "dep|0");
+        Ok(())
+    }
+
+    /// An engine over `targets` (exec `true`, `deps` as given, an entrypoint
+    /// when named `//pkg:ep…`) served by a
+    /// [`FaultProvider`](crate::engine::fault_provider::FaultProvider) with
+    /// `faults`.
+    fn faulty_engine(
+        targets: &[(&str, &[&str])],
+        faults: crate::engine::fault_provider::Faults,
+    ) -> anyhow::Result<(Arc<Engine>, tempfile::TempDir)> {
+        use hbuiltins::pluginstatictarget::Target;
+        let targets = targets
+            .iter()
+            .map(|(addr, deps)| Target {
+                addr: (*addr).to_string(),
+                driver: "exec".to_string(),
+                run: Some("true".to_string()),
+                deps: HashMap::from([(
+                    String::new(),
+                    deps.iter().map(|d| (*d).to_string()).collect(),
+                )]),
+                raw_config: if addr.starts_with("//pkg:ep") {
+                    HashMap::from([("entrypoint".to_string(), Value::Bool(true))])
+                } else {
+                    HashMap::new()
+                },
+                ..Default::default()
+            })
+            .collect();
+        let provider = crate::engine::fault_provider::FaultProvider::new(targets, faults)?;
+        let root = tempfile::tempdir()?;
+        let mut engine = Engine::new(Config {
+            parallelism: None,
+            ..Config::for_tests(root.path())
+        })?;
+        engine.register_managed_driver(|_| {
+            Box::new(hplugin_exec::pluginexec::Driver::new_exec().with_host_path())
+        })?;
+        engine.register_provider(move |_| Box::new(provider))?;
+        Ok((Arc::new(engine), root))
+    }
+
+    /// D1.f: a failed hashed input fails `meta` with the expansion's error,
+    /// and `hash_dep_count` too: no `hashin` is ever computed over the
+    /// inputs that did resolve.
+    #[tokio::test]
+    async fn partial_expansion_is_never_hashed() -> anyhow::Result<()> {
+        // The input fails in expansion only (an entrypoint is refused there):
+        // a spec failure would already fail `//pkg:top`'s own def.
+        let (engine, _root) = faulty_engine(
+            &[
+                ("//pkg:top", &["//pkg:ok", "//pkg:ep_bad"]),
+                ("//pkg:ok", &[]),
+                ("//pkg:ep_bad", &[]),
+            ],
+            crate::engine::fault_provider::Faults::default(),
+        )?;
+        let top = hmodel::htaddr::parse_addr("//pkg:top")?;
+        let rs = engine.new_state_with_fail_fast(false);
+        let Err(err) = Arc::clone(&engine).meta(rs.clone(), &top).await else {
+            panic!("a partial expansion was hashed");
+        };
+        let partial = hcore::hmemoizer::downcast_chain_ref::<PartialExpansion>(&err)
+            .unwrap_or_else(|| panic!("meta fails with the expansion: {err:#}"));
+        let resolved: Vec<String> = partial
+            .resolved()
+            .map(|(d, _)| d.target_def.addr.format())
+            .collect();
+        assert_eq!(resolved, ["//pkg:ok"]);
+        assert!(format!("{err:#}").contains("//pkg:ep_bad"), "{err:#}");
+        assert!(
+            Arc::clone(&engine).hash_dep_count(rs, &top).await.is_err(),
+            "hash_dep_count cannot count a partial set"
+        );
+        Ok(())
+    }
+
+    /// P25: an input that is not hashed (a `runtime_deps` one) failing still
+    /// fails the expansion; nothing hands out the rest as the input set.
+    #[tokio::test]
+    async fn partial_expansion_unhashed_input_fails_expansion() -> anyhow::Result<()> {
+        let bad = hmodel::htaddr::parse_addr("//pkg:bad")?;
+        let (engine, _root) = faulty_engine(
+            &[("//pkg:ok", &[]), ("//pkg:bad", &[])],
+            crate::engine::fault_provider::Faults {
+                fail_get: vec![bad],
+                ..Default::default()
+            },
+        )?;
+        let mut unhashed = input("//pkg:bad", "runtime_dep|0", &[]);
+        unhashed.hashed = false;
+        let inputs = declaring(vec![input("//pkg:ok", "dep|0", &[]), unhashed]);
+        let rs = engine.new_state_with_fail_fast(false);
+        let Err(err) = Arc::clone(&engine).expand_inputs(rs, &inputs).await else {
+            panic!("an unhashed failed input left the expansion whole");
+        };
+        let partial = hcore::hmemoizer::downcast_chain_ref::<PartialExpansion>(&err)
+            .unwrap_or_else(|| panic!("a partial expansion: {err:#}"));
+        assert_eq!(partial.resolved().map(|(_, i)| i).collect::<Vec<_>>(), [0]);
+        Ok(())
+    }
+
+    /// P25: a cancellation among the expansion's errors is found by the one
+    /// walker, beside another input's real failure, so the classifier reads
+    /// the expansion as a stop.
+    #[tokio::test]
+    async fn partial_expansion_cancel_found_by_walker() -> anyhow::Result<()> {
+        use crate::engine::discovery::Stage;
+        let bad = hmodel::htaddr::parse_addr("//pkg:bad")?;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let (engine, _root) = faulty_engine(
+            &[("//pkg:bad", &[]), ("//pkg:slow", &[])],
+            crate::engine::fault_provider::Faults {
+                fail_get: vec![bad],
+                cancel_at: Some((Stage::Spec, "//pkg:slow".to_string(), Arc::clone(&started))),
+                ..Default::default()
+            },
+        )?;
+        let inputs = declaring(vec![
+            input("//pkg:bad", "dep|0", &[]),
+            input("//pkg:slow", "dep|1", &[]),
+        ]);
+        let rs = engine.new_state_with_fail_fast(false);
+        let (res, ()) = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            futures::future::join(
+                Arc::clone(&engine).expand_inputs(rs.clone(), &inputs),
+                async {
+                    started.notified().await;
+                    rs.ctoken().cancel();
+                },
+            ),
+        )
+        .await
+        .context("the cancelled expansion never ended")?;
+        let Err(err) = res else {
+            panic!("a cancelled expansion succeeded");
+        };
+        assert!(
+            hcore::hmemoizer::downcast_chain_ref::<PartialExpansion>(&err).is_some(),
+            "{err:#}"
+        );
+        assert!(
+            hcore::hmemoizer::find::<crate::engine::error::CancelledError>(&err).is_some(),
+            "the walker finds the cancel: {err:#}"
+        );
         Ok(())
     }
 

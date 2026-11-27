@@ -2219,6 +2219,9 @@ fn classify_failure_fresh(
         FailureFate::Cancelled => return (anyhow::Error::new(CancelledError), false),
         FailureFate::Upstream(root) => return (UpstreamFailed { root }.into(), false),
         FailureFate::Shell(shell) => return (anyhow::Error::new(shell.clone()), false),
+        FailureFate::Each {
+            members, culprit, ..
+        } => return classify_each(rs, addr, members, culprit),
         FailureFate::Blame { culprit, entry } => (culprit, entry.clone()),
     };
 
@@ -2278,6 +2281,44 @@ fn classify_failure_fresh(
         announce_culprit(rs, &culprit, &entry, detail, &path);
     }
     (UpstreamFailed { root: culprit }.into(), fresh)
+}
+
+/// [`FailureFate::Each`]: each culprit's members recorded against it (one
+/// bare, several as an aggregate), through the same chokepoint as any other
+/// failure, and a marker naming the lead `culprit` returned. Fresh when the
+/// lead's record was this call's.
+fn classify_each(
+    rs: &RequestState,
+    addr: &Addr,
+    members: &MultiError,
+    lead: Culprit,
+) -> (anyhow::Error, bool) {
+    let mut by_culprit: Vec<(Culprit, Vec<anyhow::Error>)> = Vec::new();
+    for inner in unrecorded(members) {
+        let Some(owned) = hcore::hmemoizer::share(inner) else {
+            continue;
+        };
+        let (culprit, _) = blame(addr, inner);
+        match by_culprit.iter_mut().find(|(c, _)| *c == culprit) {
+            Some((_, errs)) => errs.push(owned),
+            None => by_culprit.push((culprit, vec![owned])),
+        }
+    }
+    let mut fresh = false;
+    for (culprit, mut errs) in by_culprit {
+        let e = match errs.pop() {
+            Some(sole) if errs.is_empty() => sole,
+            last => {
+                errs.extend(last);
+                MultiError(errs).into()
+            }
+        };
+        let (_, recorded) = classify_failure_fresh(rs, addr, e);
+        if culprit == lead {
+            fresh = recorded;
+        }
+    }
+    (UpstreamFailed { root: lead }.into(), fresh)
 }
 
 /// The event that announces a culprit with no scope of its own, sent once by
@@ -2477,17 +2518,25 @@ impl EndBlame {
                 },
                 None => Self::Unknown,
             },
-            FailureFate::Blame { culprit, entry } if entry != addr => Self::Skipped {
-                of: entry.format(),
-                file: culprit.file().map(str::to_owned),
-            },
+            FailureFate::Blame { culprit, entry } | FailureFate::Each { culprit, entry, .. }
+                if entry != addr =>
+            {
+                Self::Skipped {
+                    of: entry.format(),
+                    file: culprit.file().map(str::to_owned),
+                }
+            }
             // A broken file reached through `addr` itself: the file's box is
             // its `FileFailed`, announced by the claim's winner.
             FailureFate::Blame {
                 culprit: Culprit::File(_),
                 ..
+            }
+            | FailureFate::Each {
+                culprit: Culprit::File(_),
+                ..
             } => Self::Duplicate,
-            FailureFate::Blame { .. } => Self::Culprit {
+            FailureFate::Blame { .. } | FailureFate::Each { .. } => Self::Culprit {
                 path: rs.culprit_path(addr).iter().map(Addr::format).collect(),
             },
             FailureFate::Propagate | FailureFate::Cancelled | FailureFate::Shell(_) => {
@@ -2517,13 +2566,35 @@ enum FailureFate<'a> {
     /// led into it). This target's own when `culprit` is `Target(addr)`;
     /// otherwise this target is skipped.
     Blame { culprit: Culprit, entry: Addr },
+    /// An expansion's failures (D1.f) blaming several culprits: each member
+    /// is recorded against its own, those sharing one together. `culprit`
+    /// and `entry` are the lead's, which this target's end reads as it
+    /// would a `Blame`'s: this target's own when one member blames it, else
+    /// the first member's.
+    Each {
+        members: &'a MultiError,
+        culprit: Culprit,
+        entry: Addr,
+    },
 }
 
 impl FailureFate<'_> {
     /// Whether this target is itself the culprit.
     fn is_own(&self, addr: &Addr) -> bool {
-        matches!(self, Self::Blame { culprit: Culprit::Target(c), .. } if c == addr)
+        matches!(
+            self,
+            Self::Blame { culprit: Culprit::Target(c), .. }
+                | Self::Each { culprit: Culprit::Target(c), .. } if c == addr
+        )
     }
+}
+
+/// The members of an aggregate that are not already a recorded marker.
+fn unrecorded(multi: &MultiError) -> impl Iterator<Item = &anyhow::Error> {
+    multi
+        .0
+        .iter()
+        .filter(|inner| downcast_chain_ref::<UpstreamFailed>(inner).is_none())
 }
 
 /// A stop: a `CancelledError` on the chain, or inside any member of an
@@ -2646,16 +2717,29 @@ fn failure_fate<'a>(addr: &Addr, e: &'a anyhow::Error) -> FailureFate<'a> {
         // never passes through its `result_addr`): when every one of them
         // blames the same culprit, that culprit; otherwise the aggregation
         // is recorded against this target, so no broken input is lost.
-        let mut blamed = multi
-            .0
-            .iter()
-            .filter(|inner| downcast_chain_ref::<UpstreamFailed>(inner).is_none())
-            .map(|inner| blame(addr, inner));
+        let mut blamed = unrecorded(multi).map(|inner| blame(addr, inner));
         if let Some(first) = blamed.next()
             && blamed.all(|other| other == first)
         {
             let (culprit, entry) = first;
             return FailureFate::Blame { culprit, entry };
+        }
+        // An expansion's members are shared (D1.f), so each can be recorded
+        // against its own culprit; the lead is this target when one of them
+        // blames it.
+        if unrecorded(multi).all(hcore::hmemoizer::is_shared) {
+            let mut blamed = unrecorded(multi).map(|inner| blame(addr, inner));
+            if let Some(first) = blamed.next() {
+                let own = std::iter::once(first.clone())
+                    .chain(blamed)
+                    .find(|(c, _)| matches!(c, Culprit::Target(t) if t == addr));
+                let (culprit, entry) = own.unwrap_or(first);
+                return FailureFate::Each {
+                    members: multi,
+                    culprit,
+                    entry,
+                };
+            }
         }
         return FailureFate::Blame {
             culprit: Culprit::Target(addr.clone()),
@@ -2723,6 +2807,7 @@ mod failure_fate_tests {
             FailureFate::Cancelled => panic!("cancelled: {e:#}"),
             FailureFate::Upstream(root) => panic!("upstream of {root}: {e:#}"),
             FailureFate::Shell(_) => panic!("shell: {e:#}"),
+            FailureFate::Each { culprit, .. } => panic!("each, led by {culprit}: {e:#}"),
         }
     }
 
