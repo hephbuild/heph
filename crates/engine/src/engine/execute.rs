@@ -418,7 +418,15 @@ impl Engine {
                             teardown.reclaim(self.fuse_upper(&sandbox_dir));
                         }
                         let Some((slot, write_back_error)) = kept else {
-                            return Err(err);
+                            // The stop decided, so the error says so: what
+                            // classifies it from here (`failure_fate`, the
+                            // CLI's exit) reads the type, not the token, and
+                            // would record exec's bare "cancelled" as this
+                            // target's failure.
+                            if hplugin::error::is_cancelled(&err) {
+                                return Err(err);
+                            }
+                            return Err(err.context(hplugin::error::CancelledError));
                         };
                         // Past the reclaim: it reads no sandbox, and a lookup
                         // of the generator must not hold the `sandbox` slot.
