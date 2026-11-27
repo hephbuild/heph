@@ -5506,7 +5506,20 @@ impl Engine {
                                 .extend(cached.into_iter().map(ResultArtifact::from_cache));
                             (produced, artifacts_meta)
                         })
-                        .with_context(|| format!("cache_locally {addr}"));
+                        .with_context(|| format!("cache_locally {addr}"))
+                        // A store that failed after a run that streamed: the
+                        // failure records that it streamed (D6.1c), on an
+                        // empty slot as a failure past the run does above.
+                        .map_err(|e| {
+                            if streamed {
+                                e.context(
+                                    crate::engine::failure_slot::FailureSlot::default()
+                                        .with_streamed(true),
+                                )
+                            } else {
+                                e
+                            }
+                        });
 
                     // Remote push: fire-and-forget on a background task (tracked
                     // by `bg_pending`, so the CLI/TUI stays open until it drains).
