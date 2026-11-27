@@ -14,7 +14,7 @@
 //! from the environment — `SOURCE_DATE_EPOCH` is the `tar` coreutil's
 //! convention, and read here it would be an input no key covers.
 
-use crate::{FormatArg, check_rel, in_package};
+use crate::{WritableFormatArg, check_rel, in_package, read_only, writable_spellings};
 use anyhow::Context as _;
 use async_trait::async_trait;
 use harchive::{Format, Member, WriteOptions};
@@ -61,9 +61,9 @@ struct CreateSpec {
     #[spec(required)]
     deps: Vec<String>,
     /// Archive format: `tar`, `tar.gz`, `tar.zst` or `zip`. Inferred from
-    /// `out`'s suffix when omitted.
-    #[spec(ty = FormatArg::spec_param_type())]
-    format: Option<FormatArg>,
+    /// `out`'s suffix when omitted. `tar.xz` and `gz` are read only.
+    #[spec(ty = WritableFormatArg::spec_param_type())]
+    format: Option<WritableFormatArg>,
     /// Output file, relative to the target's package. Defaults to
     /// `<name>.<format>`.
     #[spec(ty = ParamType::String)]
@@ -131,36 +131,44 @@ impl Layout {
 /// `out`, or `<name>.<format>`, and the format: the option, else what `out`'s
 /// suffix implies. Both set and disagreeing (`format = "zip"`, `out =
 /// "x.tar.gz"`) is refused: whichever won, the file would lie about its
-/// content. An `out` whose suffix names no format takes the option.
+/// content. An `out` whose suffix names no format takes the option, and so
+/// does one whose suffix names a format only `archive.extract` reads (`x.gz`,
+/// `x.txz`): those named none before `extract` read them, and still parse.
+/// With `out` alone, such a suffix is refused as read only.
 fn out_and_format(
     name: &str,
     out: Option<String>,
-    format: Option<FormatArg>,
+    format: Option<WritableFormatArg>,
 ) -> anyhow::Result<(String, Format)> {
     match (out, format) {
-        (Some(out), Some(FormatArg(f))) => match Format::infer(&out) {
-            Some(named) if named != f => anyhow::bail!(
-                "`format` is {:?} but `out` {out:?} names a {:?}; make them agree, or drop \
+        (Some(out), Some(WritableFormatArg(f))) => {
+            match Format::infer(&out).filter(|named| named.is_writable()) {
+                Some(named) if named != f => anyhow::bail!(
+                    "`format` is {:?} but `out` {out:?} names a {:?}; make them agree, or drop \
                  `format` to take it from `out`",
-                f.as_str(),
-                named.as_str()
-            ),
-            _ => Ok((out, f)),
-        },
-        (None, Some(FormatArg(f))) => Ok((format!("{name}.{}", f.as_str()), f)),
+                    f.as_str(),
+                    named.as_str()
+                ),
+                _ => Ok((out, f)),
+            }
+        }
+        (None, Some(WritableFormatArg(f))) => Ok((format!("{name}.{}", f.as_str()), f)),
         (Some(out), None) => {
             let f = Format::infer(&out).with_context(|| {
                 format!(
                     "`format` is not set and `out` {out:?} names none (a suffix: {}); set \
                      `format`",
-                    Format::spellings().join(", ")
+                    writable_spellings()
                 )
             })?;
+            if !f.is_writable() {
+                return Err(read_only(f).context(format!("`out` {out:?}")));
+            }
             Ok((out, f))
         }
         (None, None) => anyhow::bail!(
             "set `format` ({}), or an `out` whose suffix names one",
-            Format::spellings().join(", ")
+            writable_spellings()
         ),
     }
 }
@@ -632,6 +640,18 @@ mod tests {
                 "pkg/t.bin",
                 Format::Tar,
             ),
+            // An `out` whose suffix names only a read-only format names none
+            // here, as it did before `archive.extract` read those formats.
+            (
+                vec![("out", s("x.gz")), ("format", s("tar.gz"))],
+                "pkg/x.gz",
+                Format::TarGz,
+            ),
+            (
+                vec![("out", s("x.txz")), ("format", s("tar"))],
+                "pkg/x.txz",
+                Format::Tar,
+            ),
             // Both set and agreeing, in another spelling of the suffix.
             (
                 vec![("out", s("t.tgz")), ("format", s("tar.gz"))],
@@ -657,6 +677,20 @@ mod tests {
             (vec![a()], "set `format`"),
             (vec![a(), ("out", s("t.rar"))], "names none"),
             (vec![a(), ("format", s("rar"))], "unknown archive format"),
+            // The formats only `extract` reads, named or implied by `out`.
+            (
+                vec![a(), ("format", s("tar.xz"))],
+                "archive.create cannot write a \"tar.xz\"",
+            ),
+            (
+                vec![a(), ("format", s("gz"))],
+                "archive.create cannot write a \"gz\"",
+            ),
+            (
+                vec![a(), ("out", s("t.tar.xz"))],
+                "cannot write a \"tar.xz\"",
+            ),
+            (vec![a(), ("out", s("t.gz"))], "cannot write a \"gz\""),
             // `format` and `out`'s suffix disagree: the file would lie.
             (
                 vec![a(), ("format", s("zip")), ("out", s("x.tar.gz"))],

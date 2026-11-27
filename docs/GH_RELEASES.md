@@ -25,11 +25,12 @@ gh = heph.gh.release_asset(
 | `asset` | required | The asset's file name. |
 | `sha256` | none | Forwarded to `http_fetch`. Without it the fetch is unverified and `http_fetch` warns. |
 | `extract` | `False` | Unpack the asset. |
-| `format` | inferred | Archive format, with `extract` only: `tar`, `tar.gz` (`.tgz`), `tar.zst` (`.tzst`), `zip`. Inferred from `asset`'s suffix, case-insensitively; an unknown suffix needs `format =`. |
-| `strip_components` | `0` | With `extract` only: leading path components dropped, as `tar --strip-components`. Usually `1` for a GitHub tarball, which holds one top-level directory. |
-| `max_bytes` | 4 GiB | With `extract` only: the most bytes the archive may unpack to. |
+| `format` | inferred | Archive format, with `extract` only: `tar`, `tar.gz` (`.tgz`), `tar.xz` (`.txz`), `tar.zst` (`.tzst`), `zip`, or `gz` (`.gz`: one gzipped file, not a tar). Inferred from `asset`'s suffix, case-insensitively, the longest suffix winning (`x.tar.gz` is a `tar.gz`, `x.gz` a `gz`); an unknown suffix needs `format =`. |
+| `strip_components` | `0` | With `extract` only: leading path components dropped, as `tar --strip-components`. Usually `1` for a GitHub tarball, which holds one top-level directory. Refused with a `gz` asset, which is one file. |
+| `include` | every entry | With `extract` only: glob patterns, a string or a list, in the syntax of `group`'s `include`, over each unpacked path after `strip_components` (`bin/tool`). Only the files and links that match one are extracted, and each pattern must match one. See [Picking the binary](#picking-the-binary). |
+| `max_bytes` | 4 GiB | With `extract` only: the most bytes the archive may decode to for its entries, written or (in a tar, an entry `include` leaves out) read past. |
 | `max_entries` | 1,000,000 | With `extract` only: the most entries the archive may hold. |
-| `executable` | `False` | Without `extract` only: mark the fetched file executable. |
+| `executable` | `False` | `True` marks the fetched file executable, or with `extract` every unpacked file, for any format: a `gz` records no mode, and neither does a zip built on Windows. With `extract` only, a list of glob patterns (a string or a list, `include`'s syntax) marks only the unpacked files that match one. The bit is only ever added. |
 | `out` | see below | Without `extract`: the fetched file's name (default `asset`). With it: the output directory (default `name`). See [`out`](#out). |
 | `credentials` | none | Credential targets (`docs/CREDENTIALS.md`) for a private repository: the asset is fetched through the API. See [Private repositories](#private-repositories). |
 | `server_url` | `https://github.com` | The GitHub server the release is on. See [`server_url` and `api_url`](#server_url-and-api_url). |
@@ -76,7 +77,7 @@ download URLs do); the asset is one encoded segment. Braces are escaped, so
 
 Fetching, verification and caching are `http_fetch`'s (see its driver docs).
 The extracted tree's cache key comes from the archive's content through the
-dep, plus `format`, `strip_components` and `out`.
+dep, plus `format`, `strip_components`, `include`, `executable` and `out`.
 
 ## `out`
 
@@ -93,21 +94,65 @@ heph.gh.release_asset(name = "gh", repo = "cli/cli", tag = "v2.40.0",
                       extract = True, strip_components = 1)
 # //p:gh is the directory p/gh/ (bin/gh, share/…); with out = "tools/gh",
 # the directory p/tools/gh/
+
+heph.gh.release_asset(name = "ra", repo = "rust-lang/rust-analyzer", tag = "2025-01-06",
+                      asset = "rust-analyzer-x86_64-unknown-linux-gnu.gz",
+                      extract = True, executable = True)
+# //p:ra is the directory p/ra/ holding one executable file,
+# rust-analyzer-x86_64-unknown-linux-gnu: a tool as it is
 ```
-
-A tool is one file; to put `gh` on a target's `PATH`, pick the binary out of
-the directory with a `group` ([ARCHIVE.md](ARCHIVE.md)):
-
-```python
-target(name = "gh_bin", driver = "group", deps = [":gh"], include = ["p/gh/bin/gh"])
-```
-
-An `include` matches a dep's paths workspace-relative, `<package>/<out>/…`
-(`p/gh/bin/gh`), or package-relative (`gh/bin/gh`); `heph inspect outputs //p:gh`
-lists them. The one-file check happens when the consumer runs, not at
-`heph query` or `heph validate`.
 
 With `extract`, `out` may not be `asset`: the archive is already that file.
+
+## Picking the binary
+
+A tool is one file, so an extracted directory is a tool only when it holds
+exactly one. Most release archives ship a binary next to a README or a
+license: extract only the binary with `include`, and the result goes straight
+into `tools`:
+
+```python
+heph.gh.release_asset(name = "gh", repo = "cli/cli", tag = "v2.40.0",
+                      asset = "gh_2.40.0_linux_amd64.tar.gz",
+                      extract = True, strip_components = 1,
+                      include = "bin/gh")
+# //p:gh is the directory p/gh/ holding only bin/gh
+
+# tool-linux.zip holds `tool` and `README.md`, built on Windows: no
+# entry records a Unix mode, so `executable = True` makes `tool` runnable.
+heph.gh.release_asset(name = "tool", repo = "acme/tool", tag = "v1.0",
+                      asset = "tool-linux.zip", sha256 = "<sha256>",
+                      extract = True, include = "tool", executable = True)
+
+target(name = "use", driver = "bash", run = "tool --version > $OUT",
+       out = "version.txt", tools = [":tool"])
+```
+
+`include` matches each path below the output, after `strip_components`
+(`bin/gh`, not `gh_2.40.0_linux_amd64/bin/gh`). A pattern that matches
+nothing fails the extract, listing the paths it was matched against
+([ARCHIVE.md](ARCHIVE.md#unpacking-rules) has the rules). `executable` takes
+the same patterns, to mark some files only (`executable = ["bin/*"]`).
+A symlink `include` keeps must point at something it keeps too.
+
+Patterns match as wax does ([ARCHIVE.md](ARCHIVE.md#patterns)):
+
+- they are case-sensitive (`bin/*` misses `Bin/gh`);
+- `*` matches dotfiles (`bin/*` takes `bin/.hidden`);
+- `**/gh` also matches a top-level `gh`;
+- names are compared byte for byte: a zip made on macOS may store an
+  accented name decomposed (NFD), which a pattern typed precomposed (NFC)
+  does not match. Write the pattern in NFD, or use a `*` there.
+
+A pattern no path can match (`"/bin/gh"`, `"./bin/gh"`, `"bin/"`,
+`"bin//gh"`) is refused when the extract is parsed, with the fix
+(`"bin/"`: write `"bin/**"`).
+
+To pick a file out of a target that is not an extract, use a `group`
+([ARCHIVE.md](ARCHIVE.md)). Its `include` matches a dep's paths
+workspace-relative, `<package>/<out>/…` (`p/gh/bin/gh`), or package-relative
+(`gh/bin/gh`); `heph inspect outputs //p:gh` lists them. The one-file check
+happens when the consumer runs, not at `heph query` or `heph validate`.
 
 ## Pinning: `sha256`
 
@@ -178,6 +223,11 @@ take one `sha256` for every platform, so they cannot pin a per-platform asset.
 - `nothing to extract: strip_components = N removed every entry`: the error
   lists the first entries; count their leading directories and lower
   `strip_components`.
+- `` `include` pattern "…" matches no file or link in the archive ``: the
+  error lists the first unpacked paths, after `strip_components`; match one
+  of those.
+- `` `executable` as glob patterns applies only with `extract = True` ``:
+  without `extract` the asset is one file; use `executable = True`.
 - `raise max_bytes` / `raise max_entries`: the archive is larger than the
   default bounds; set the argument if it is meant to be.
 
@@ -229,8 +279,8 @@ With `extract = True` the archive is unpacked by `archive.extract`, in-process
 and with the same code on every supported platform. The archive is untrusted
 input; the rules it is held to (paths, links, modes, duplicates, bounds,
 `strip_components`) are [ARCHIVE.md's](ARCHIVE.md#unpacking-rules). The call's
-`format`, `strip_components`, `max_bytes`, `max_entries` and `out` are
-forwarded to it as passed; the bounds are not hashed, and the extracted tree
+`format`, `strip_components`, `include`, `executable`, `max_bytes`,
+`max_entries` and `out` are forwarded to it as passed; the bounds are not hashed, and the extracted tree
 is cached as a pure function of the archive's bytes.
 
 ## Private repositories

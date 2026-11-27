@@ -456,8 +456,7 @@ heph.gh.release_asset(
     repo = "o/r",
     tag = "v1",
     asset = "t.tar.gz",
-    extract = True,
-    executable = True,
+    include = "tool",
 )
 "#,
     )
@@ -473,7 +472,7 @@ heph.gh.release_asset(
         );
         assert!(!out.status.success(), "{}", describe(&out));
         assert!(
-            String::from_utf8_lossy(&out.stderr).contains("`executable` marks a fetched file"),
+            String::from_utf8_lossy(&out.stderr).contains("apply only with `extract = True`"),
             "hook={hook}: {}",
             describe(&out)
         );

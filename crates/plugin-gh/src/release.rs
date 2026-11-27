@@ -352,25 +352,34 @@ struct ReleaseAssetArgs {
     sha256: Option<String>,
     /// Unpack the asset (default `False`).
     extract: bool,
-    /// With `extract` only: the archive format, `tar`, `tar.gz`, `tar.zst` or
-    /// `zip`. Inferred from `asset`'s suffix by default.
+    /// With `extract` only: the archive format, `tar`, `tar.gz`, `tar.xz`,
+    /// `tar.zst`, `zip`, or `gz` (one gzipped file). Inferred from `asset`'s
+    /// suffix by default.
     #[spec(ty = FormatArg::spec_param_type())]
     format: Option<FormatArg>,
     /// With `extract` only: leading path components dropped, as `tar
     /// --strip-components` (default 0).
     #[spec(ty = ParamType::Int)]
     strip_components: Option<u32>,
-    /// With `extract` only: the most bytes the archive may unpack to (default
-    /// 4 GiB).
+    /// With `extract` only: the most bytes the archive may decode to for its
+    /// entries, written or (in a tar, an entry `include` leaves out) read
+    /// past (default 4 GiB).
     #[spec(ty = ParamType::Int)]
     max_bytes: Option<NonZeroU64>,
     /// With `extract` only: the most entries the archive may hold (default
     /// 1,000,000).
     #[spec(ty = ParamType::Int)]
     max_entries: Option<NonZeroU64>,
-    /// Without `extract` only: mark the fetched file executable (default
-    /// `False`).
-    executable: bool,
+    /// With `extract` only: glob patterns (a string or a list, the syntax of
+    /// `group`'s `include`) over the unpacked paths; only the files that
+    /// match one are extracted, and each must match one. Default: every
+    /// entry.
+    include: Vec<String>,
+    /// `True` marks the fetched file executable, or with `extract` every
+    /// unpacked file (default `False`). With `extract` only: a list of glob
+    /// patterns naming the unpacked files to make executable instead.
+    #[spec(ty = ExecutableArg::spec_param_type())]
+    executable: ExecutableArg,
     /// Without `extract`: the fetched file's name (default `asset`). With it:
     /// the output directory (default `name`).
     #[spec(ty = ParamType::String)]
@@ -459,6 +468,55 @@ impl FromSpecValue for FormatArg {
     }
 }
 
+/// The `executable` argument: a bool, or glob patterns (a string or a list)
+/// naming the unpacked files to make executable. An empty list is `False`.
+/// The patterns are the extract's to check: this crate links no glob engine,
+/// and the declared `archive.extract` refuses a bad one at its parse.
+#[derive(Debug, Default)]
+enum ExecutableArg {
+    #[default]
+    No,
+    All,
+    Patterns(Vec<String>),
+}
+
+impl FromSpecValue for ExecutableArg {
+    fn from_spec_value(v: &Value) -> anyhow::Result<Self> {
+        match v {
+            Value::Null() | Value::Bool(false) => Ok(Self::No),
+            Value::Bool(true) => Ok(Self::All),
+            Value::String(_) | Value::List(_) => {
+                let patterns = Vec::<String>::from_spec_value(v)?;
+                Ok(if patterns.is_empty() {
+                    Self::No
+                } else {
+                    Self::Patterns(patterns)
+                })
+            }
+            other => bail!("{EXECUTABLE_TYPE_ERROR}, got {other:?}"),
+        }
+    }
+
+    fn spec_param_type() -> ParamType {
+        ParamType::union(vec![
+            ParamType::Bool,
+            ParamType::String,
+            ParamType::list(ParamType::String),
+        ])
+    }
+}
+
+/// What a wrong `executable` value is told, word for word what
+/// `archive.extract`'s says (`crates/plugin-archive/src/extract.rs`): the
+/// one option, two entry points.
+const EXECUTABLE_TYPE_ERROR: &str =
+    "`executable` must be a bool, a glob pattern or a list of glob patterns";
+
+/// A pattern list as the extract's option.
+fn patterns_value(patterns: Vec<String>) -> Value {
+    Value::List(patterns.into_iter().map(Value::String).collect())
+}
+
 /// The `cache` argument as the declared targets' own `cache` option: the dict
 /// form, so each of them parses exactly what was passed.
 fn cache_value(c: TargetSpecCache) -> Value {
@@ -539,6 +597,7 @@ fn release_asset(plugin: &str, pkg: &str, args: &FnArgs) -> anyhow::Result<FnOut
         strip_components,
         max_bytes,
         max_entries,
+        include,
         executable,
         out,
         server_url,
@@ -646,15 +705,22 @@ fn release_asset(plugin: &str, pkg: &str, args: &FnArgs) -> anyhow::Result<FnOut
         asset_fetch
     };
     if !extract {
-        if format.is_some() || strip != 0 || !limits.is_empty() {
+        if format.is_some() || strip != 0 || !include.is_empty() || !limits.is_empty() {
             bail!(
-                "`format`, `strip_components`, `max_bytes` and `max_entries` apply only with \
-                 `extract = True`"
+                "`format`, `strip_components`, `include`, `max_bytes` and `max_entries` apply \
+                 only with `extract = True`"
             );
         }
         let mut config = fetch_config(out.unwrap_or(asset));
-        if executable {
-            config.insert("executable".to_string(), Value::Bool(true));
+        match executable {
+            ExecutableArg::No => {}
+            ExecutableArg::All => {
+                config.insert("executable".to_string(), Value::Bool(true));
+            }
+            ExecutableArg::Patterns(_) => bail!(
+                "`executable` as glob patterns applies only with `extract = True`; without it \
+                 the asset is one file: set `executable = True`"
+            ),
         }
         outcome.declare_target(DeclaredTarget {
             name: name.to_string(),
@@ -665,12 +731,6 @@ fn release_asset(plugin: &str, pkg: &str, args: &FnArgs) -> anyhow::Result<FnOut
         return Ok(outcome);
     }
 
-    if executable {
-        bail!(
-            "`executable` marks a fetched file, and with `extract = True` there is none: \
-             the archive's own modes decide which extracted files are executable"
-        );
-    }
     let format = match format {
         Some(FormatArg(f)) => f,
         None => Format::infer(asset).with_context(|| {
@@ -681,6 +741,12 @@ fn release_asset(plugin: &str, pkg: &str, args: &FnArgs) -> anyhow::Result<FnOut
             )
         })?,
     };
+    if format == Format::Gz && strip != 0 {
+        bail!(
+            "`strip_components` with a `gz` asset would remove its one file, which has no \
+             directory to strip; drop it"
+        );
+    }
     if out == Some(asset) || (out.is_none() && name == asset) {
         bail!(
             "the extracted directory and the fetched archive would both be {asset:?} in the \
@@ -702,6 +768,18 @@ fn release_asset(plugin: &str, pkg: &str, args: &FnArgs) -> anyhow::Result<FnOut
     .into();
     if strip != 0 {
         config.insert("strip_components".to_string(), Value::Int(i64::from(strip)));
+    }
+    if !include.is_empty() {
+        config.insert("include".to_string(), patterns_value(include));
+    }
+    match executable {
+        ExecutableArg::No => {}
+        ExecutableArg::All => {
+            config.insert("executable".to_string(), Value::Bool(true));
+        }
+        ExecutableArg::Patterns(p) => {
+            config.insert("executable".to_string(), patterns_value(p));
+        }
     }
     config.extend(limits.into_iter().map(|(k, v)| (k.to_string(), v)));
     if let Some(out) = out {
@@ -1045,6 +1123,146 @@ mod tests {
         );
     }
 
+    /// `archive.extract` declares `executable` with its own type, and says
+    /// the same: the two are pinned to the same literal.
+    #[test]
+    fn executable_accepts_and_refuses_as_the_extract_does() {
+        assert_eq!(
+            ExecutableArg::spec_param_type(),
+            ParamType::union(vec![
+                ParamType::Bool,
+                ParamType::String,
+                ParamType::list(ParamType::String),
+            ])
+        );
+        let e = ExecutableArg::from_spec_value(&Value::Int(1)).unwrap_err();
+        assert_eq!(
+            format!("{e:#}"),
+            "`executable` must be a bool, a glob pattern or a list of glob patterns, got Int(1)"
+        );
+    }
+
+    /// A `.tar.xz` and a bare `.gz` asset infer their format from the name;
+    /// `executable` holds for either, and reaches the extract, not the fetch.
+    #[test]
+    fn xz_and_gz_assets_infer_their_format_and_executable_reaches_the_extract() {
+        let asset = |name: &'static str, extra: &[(&'static str, Value)]| {
+            let mut args: Vec<_> = base().into_iter().filter(|(k, _)| *k != "asset").collect();
+            args.extend([("asset", s(name)), ("extract", Value::Bool(true))]);
+            args.extend_from_slice(extra);
+            call(&args)
+        };
+        let out = asset("tool-linux.tar.xz", &[]).unwrap();
+        assert_eq!(
+            target(&out, "tool").config.get("format"),
+            Some(&s("tar.xz"))
+        );
+
+        let exe = [("executable", Value::Bool(true))];
+        let out = asset("tool-linux.gz", &exe).unwrap();
+        let extract = target(&out, "tool");
+        assert_eq!(extract.config.get("format"), Some(&s("gz")));
+        assert_eq!(extract.config.get("executable"), Some(&Value::Bool(true)));
+        let fetch = target(&out, "tool_archive");
+        assert_eq!(fetch.config.get("out"), Some(&s("tool-linux.gz")));
+        assert!(
+            !fetch.config.contains_key("executable"),
+            "the archive is data"
+        );
+
+        let plain = asset("tool-linux.gz", &[]).unwrap();
+        assert!(!target(&plain, "tool").config.contains_key("executable"));
+
+        let out = asset("tool-linux.tar.xz", &exe).unwrap();
+        assert_eq!(
+            target(&out, "tool").config.get("executable"),
+            Some(&Value::Bool(true))
+        );
+
+        // A `gz` is one file: `strip_components` could only fail at run, so
+        // it is refused here, whether the format is inferred or named.
+        let strip = ("strip_components", Value::Int(1));
+        for extra in [
+            vec![strip.clone()],
+            vec![strip.clone(), ("format", s("gz"))],
+        ] {
+            let msg = format!("{:#}", asset("tool-linux.gz", &extra).unwrap_err());
+            assert!(
+                msg.contains("`strip_components` with a `gz` asset"),
+                "{msg}"
+            );
+        }
+        let out = asset("tool-linux.tar.xz", &[strip]).unwrap();
+        assert_eq!(
+            target(&out, "tool").config.get("strip_components"),
+            Some(&Value::Int(1))
+        );
+    }
+
+    /// `include` and an executable pattern list reach the extract (a string
+    /// as a one-pattern list), never the fetch; `executable = True` with an
+    /// archive format holds; an empty list is as if unset.
+    #[test]
+    fn include_and_executable_patterns_are_forwarded_to_the_extract() {
+        let list = |ps: &[&str]| Value::List(ps.iter().map(|p| s(p)).collect());
+        let out = call(&with(&[
+            ("extract", Value::Bool(true)),
+            ("include", list(&["bin/tool", "LICENSE"])),
+            ("executable", list(&["bin/tool"])),
+        ]))
+        .unwrap();
+        let extract = target(&out, "tool");
+        assert_eq!(
+            extract.config.get("include"),
+            Some(&list(&["bin/tool", "LICENSE"]))
+        );
+        assert_eq!(extract.config.get("executable"), Some(&list(&["bin/tool"])));
+        let fetch = target(&out, "tool_archive");
+        assert!(
+            !fetch.config.contains_key("include") && !fetch.config.contains_key("executable"),
+            "{:?}",
+            fetch.config
+        );
+
+        let out = call(&with(&[
+            ("extract", Value::Bool(true)),
+            ("include", s("tool")),
+            ("executable", s("tool")),
+        ]))
+        .unwrap();
+        let extract = target(&out, "tool");
+        assert_eq!(extract.config.get("include"), Some(&list(&["tool"])));
+        assert_eq!(extract.config.get("executable"), Some(&list(&["tool"])));
+
+        // `True` with a tar.gz: every unpacked file.
+        let out = call(&with(&[
+            ("extract", Value::Bool(true)),
+            ("executable", Value::Bool(true)),
+        ]))
+        .unwrap();
+        assert_eq!(
+            target(&out, "tool").config.get("executable"),
+            Some(&Value::Bool(true))
+        );
+
+        let out = call(&with(&[
+            ("extract", Value::Bool(true)),
+            ("include", list(&[])),
+            ("executable", list(&[])),
+        ]))
+        .unwrap();
+        let extract = target(&out, "tool");
+        assert!(
+            !extract.config.contains_key("include") && !extract.config.contains_key("executable"),
+            "{:?}",
+            extract.config
+        );
+        // Without `extract`, an empty list is `False`, not a misuse.
+        let out = call(&with(&[("include", list(&[])), ("executable", list(&[]))])).unwrap();
+        let [fetch] = out.targets() else { panic!() };
+        assert!(!fetch.config.contains_key("executable"));
+    }
+
     /// The unpack limits reach the extract target as passed, and only there.
     #[test]
     fn the_unpack_limits_are_forwarded_to_the_extract() {
@@ -1379,7 +1597,7 @@ mod tests {
 
     #[test]
     fn misused_options_are_refused() {
-        let cases: [(&[(&'static str, Value)], &str); 10] = [
+        let cases: [(&[(&'static str, Value)], &str); 13] = [
             (
                 &[("max_bytes", Value::Int(1))],
                 "only with `extract = True`",
@@ -1403,12 +1621,22 @@ mod tests {
                 &[("extract", Value::Bool(true)), ("max_bytes", s("4G"))],
                 "parse `max_bytes`: invalid: expected int",
             ),
+            (&[("include", s("tool"))], "only with `extract = True`"),
+            (
+                &[("executable", Value::List(vec![s("tool")]))],
+                "`executable` as glob patterns applies only with `extract = True`",
+            ),
+            (
+                &[("executable", s("tool"))],
+                "`executable` as glob patterns applies only with `extract = True`",
+            ),
             (
                 &[
                     ("extract", Value::Bool(true)),
-                    ("executable", Value::Bool(true)),
+                    ("executable", Value::Int(1)),
                 ],
-                "`executable`",
+                "`executable` must be a bool, a glob pattern or a list of glob patterns, \
+                 got Int(1)",
             ),
             (&[("format", s("tar"))], "only with `extract = True`"),
             (
@@ -1516,6 +1744,7 @@ mod tests {
             "executable",
             "extract",
             "format",
+            "include",
             "max_bytes",
             "max_entries",
             "name",

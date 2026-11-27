@@ -28,8 +28,8 @@ fn behind_the_abi(plugin: &str, defs: Vec<PluginFnDef>) -> anyhow::Result<Vec<Pl
     hplugin_stabby::load_stable::decode_functions(plugin, named.into_iter().collect(), handle)
 }
 
-/// A workspace with BUILD files, `http_fetch`, the builtin `archive` plugin,
-/// and the `gh` plugin's function and `asset_url` driver. The BUILD files pass
+/// A workspace with BUILD files, `http_fetch`, `bash`, the builtin `archive`
+/// plugin, and the `gh` plugin's function and `asset_url` driver. The BUILD files pass
 /// `server_url` (and `api_url`).
 fn workspace() -> anyhow::Result<htestkit::Workspace> {
     crate::archive::archive_plugin(htestkit::WorkspaceBuilder::new()?)
@@ -41,6 +41,9 @@ fn workspace() -> anyhow::Result<htestkit::Workspace> {
             ))
         })
         .with_managed_driver(Box::new(heph::pluginhttp::Driver))
+        .with_managed_driver(Box::new(
+            heph::pluginexec::Driver::new_bash().with_host_path(),
+        ))
         .with_plugin("gh", |_| {
             Ok(PluginParts::default()
                 .with_functions(behind_the_abi("gh", hplugin_gh::release::functions("gh"))?)
@@ -52,6 +55,21 @@ fn workspace() -> anyhow::Result<htestkit::Workspace> {
 /// A release tarball the way most projects ship one: everything under one
 /// top-level directory.
 fn tarball() -> &'static [u8] {
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gz.write_all(&plain_tar()).expect("gzip");
+    gz.finish().expect("gzip").leak()
+}
+
+/// [`tarball`]'s tar, xz-compressed.
+fn tar_xz() -> &'static [u8] {
+    let opts = lzma_rust2::XzOptions::with_preset(1);
+    let mut xz = lzma_rust2::XzWriter::new(Vec::new(), opts).expect("xz");
+    xz.write_all(&plain_tar()).expect("xz");
+    xz.finish().expect("xz").leak()
+}
+
+/// [`tarball`]'s tar, uncompressed.
+fn plain_tar() -> Vec<u8> {
     let mut b = tar::Builder::new(Vec::new());
     for (path, data, mode) in [
         ("tool-1.0/bin/hello", &b"#!/bin/sh\necho hello\n"[..], 0o755),
@@ -63,10 +81,7 @@ fn tarball() -> &'static [u8] {
         h.set_cksum();
         b.append_data(&mut h, path, data).expect("append");
     }
-    let tar = b.into_inner().expect("tar");
-    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    gz.write_all(&tar).expect("gzip");
-    gz.finish().expect("gzip").leak()
+    b.into_inner().expect("tar")
 }
 
 fn sha256(bytes: &[u8]) -> String {
@@ -167,6 +182,192 @@ heph.gh.release_asset(
     };
     let msg = format!("{err:#}");
     assert!(msg.contains("checksum mismatch"), "got: {msg}");
+    Ok(())
+}
+
+/// A `.tar.xz` asset: the format is inferred from the name, and the tree
+/// unpacks with its modes.
+#[tokio::test]
+async fn release_asset_extracts_a_tar_xz() -> anyhow::Result<()> {
+    let body = tar_xz();
+    let (url, _hits) = serve(body, 2);
+    let ws = workspace()?;
+    ws.write_build_file(
+        "p",
+        &format!(
+            r#"
+heph.gh.release_asset(
+    name = "tool",
+    repo = "acme/tool",
+    tag = "v1.0",
+    asset = "tool-1.0.tar.xz",
+    sha256 = "{}",
+    extract = True,
+    strip_components = 1,
+    server_url = "{url}",
+)
+"#,
+            sha256(body)
+        ),
+    );
+    assert_eq!(
+        ws.get_spec("//p:tool").await?.config.get("format"),
+        Some(&heph::htvalue::Value::String("tar.xz".to_string()))
+    );
+    let result = ws.run("//p:tool").await?;
+    assert_eq!(
+        files(&result),
+        vec![
+            ("p/tool/README".to_string(), "readme\n".to_string(), false),
+            (
+                "p/tool/bin/hello".to_string(),
+                "#!/bin/sh\necho hello\n".to_string(),
+                true
+            ),
+        ]
+    );
+    Ok(())
+}
+
+/// A binary shipped as one gzipped file (`tool-linux.gz`, as rust-analyzer
+/// ships): it unpacks to one file named after the asset minus `.gz`, and
+/// `executable = True` makes it runnable, since gzip records no mode.
+#[tokio::test]
+async fn release_asset_extracts_a_bare_gz_as_an_executable() -> anyhow::Result<()> {
+    const BIN: &[u8] = b"#!/bin/sh\necho gunzipped\n";
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gz.write_all(BIN)?;
+    let body: &'static [u8] = gz.finish()?.leak();
+    let (url, _hits) = serve(body, 4);
+    let ws = workspace()?;
+    ws.write_build_file(
+        "p",
+        &format!(
+            r#"
+[
+    heph.gh.release_asset(
+        name = name,
+        repo = "acme/tool",
+        tag = "v1.0",
+        asset = "tool-linux.gz",
+        sha256 = "{sha}",
+        extract = True,
+        executable = exe,
+        server_url = "{url}",
+    )
+    for name, exe in [("tool", True), ("data", False)]
+]
+"#,
+            sha = sha256(body)
+        ),
+    );
+    for (addr, x) in [("//p:tool", true), ("//p:data", false)] {
+        let result = ws.run(addr).await?;
+        let dir = addr.trim_start_matches("//p:");
+        assert_eq!(
+            files(&result),
+            vec![(
+                format!("p/{dir}/tool-linux"),
+                "#!/bin/sh\necho gunzipped\n".to_string(),
+                x
+            )],
+            "{addr}"
+        );
+    }
+    Ok(())
+}
+
+/// A zip built on Windows holding `tool` and `README.md`: no entry records a
+/// Unix mode. Each central-directory record is marked as made on MS-DOS
+/// (version made by, offset 5, system byte 0) with the archive attribute
+/// only (external attributes, offset 38).
+#[expect(
+    clippy::indexing_slicing,
+    reason = "test fixture: a record the writer just laid out; an offset past the end is a \
+              broken fixture, and the panic says so"
+)]
+fn windows_zip() -> &'static [u8] {
+    let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    for (name, data) in [
+        ("tool", &b"#!/bin/sh\necho from-the-zip\n"[..]),
+        ("README.md", &b"# tool\n"[..]),
+    ] {
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        w.start_file(name, opts).expect("zip entry");
+        w.write_all(data).expect("zip data");
+    }
+    let mut bytes = w.finish().expect("zip").into_inner();
+    // Walk the central directory from the end record: its entry count
+    // (offset 10) and start (offset 16).
+    let eocd = bytes
+        .windows(4)
+        .rposition(|s| s == b"PK\x05\x06")
+        .expect("end of central directory");
+    let u16_at = |b: &[u8], at: usize| usize::from(u16::from_le_bytes([b[at], b[at + 1]]));
+    let count = u16_at(&bytes, eocd + 10);
+    let mut at = u32::from_le_bytes(bytes[eocd + 16..eocd + 20].try_into().expect("u32")) as usize;
+    for _ in 0..count {
+        assert_eq!(&bytes[at..at + 4], b"PK\x01\x02", "central record");
+        bytes[at + 5] = 0;
+        bytes[at + 38..at + 42].copy_from_slice(&0x20u32.to_le_bytes());
+        at += 46 + u16_at(&bytes, at + 28) + u16_at(&bytes, at + 30) + u16_at(&bytes, at + 32);
+    }
+    bytes.leak()
+}
+
+/// The common shape of a release zip: a binary next to a README, built where
+/// no Unix mode is recorded. `include` keeps only the binary,
+/// `executable = True` makes it runnable, and the extract is a tool another
+/// target runs directly.
+#[tokio::test]
+async fn release_asset_picks_the_binary_out_of_a_zip_and_makes_it_executable() -> anyhow::Result<()>
+{
+    let body = windows_zip();
+    let (url, _hits) = serve(body, 4);
+    let ws = workspace()?;
+    ws.write_build_file(
+        "p",
+        &format!(
+            r#"
+tool = heph.gh.release_asset(
+    name = "tool",
+    repo = "acme/tool",
+    tag = "v1.0",
+    asset = "tool-linux.zip",
+    sha256 = "{}",
+    extract = True,
+    include = "tool",
+    executable = True,
+    server_url = "{url}",
+)
+
+target(
+    name = "use",
+    driver = "bash",
+    tools = [":tool"],
+    run = "tool > $OUT",
+    out = "out.txt",
+)
+"#,
+            sha256(body)
+        ),
+    );
+    let result = ws.run("//p:tool").await?;
+    assert_eq!(
+        files(&result),
+        vec![(
+            "p/tool/tool".to_string(),
+            "#!/bin/sh\necho from-the-zip\n".to_string(),
+            true
+        )],
+        "only the binary, executable"
+    );
+    let result = ws.run("//p:use").await?;
+    assert_eq!(
+        files(&result),
+        vec![("p/out.txt".to_string(), "from-the-zip\n".to_string(), false)]
+    );
     Ok(())
 }
 
@@ -578,6 +779,50 @@ heph.gh.release_asset(
         1,
         "the archive itself is cached"
     );
+    Ok(())
+}
+
+/// An `include` pattern that matches nothing is no error of the
+/// `release_asset` call, which only declares targets: the BUILD file
+/// evaluates and the fetch builds. The declared extract fails at run, naming
+/// itself and the pattern, and listing what the pattern was matched against.
+#[tokio::test]
+async fn release_asset_with_an_unmatched_include_fails_the_extract() -> anyhow::Result<()> {
+    let body = tarball();
+    let (url, _hits) = serve(body, 4);
+    let ws = workspace()?;
+    ws.write_build_file(
+        "p",
+        &format!(
+            r#"
+heph.gh.release_asset(
+    name = "tool",
+    repo = "acme/tool",
+    tag = "v1.0",
+    asset = "tool-1.0.tar.gz",
+    sha256 = "{}",
+    extract = True,
+    strip_components = 1,
+    include = ["bin/hello", "bin/helo"],
+    server_url = "{url}",
+)
+"#,
+            sha256(body)
+        ),
+    );
+    assert_eq!(ws.get_spec("//p:tool").await?.driver, "archive.extract");
+    ws.run("//p:tool_archive").await?;
+    let Err(err) = ws.run("//p:tool").await else {
+        panic!("an unmatched `include` pattern must fail the extract");
+    };
+    let msg = format!("{err:#}");
+    for want in [
+        "//p:tool",
+        r#"`include` pattern "bin/helo" matches no file or link in the archive"#,
+        r#"["bin/hello", "README"]"#,
+    ] {
+        assert!(msg.contains(want), "{want}: {msg}");
+    }
     Ok(())
 }
 
