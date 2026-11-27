@@ -70,8 +70,9 @@ pub struct FeedRunLog {
 /// What to do with one record.
 #[derive(Debug, Clone)]
 pub enum Routed {
-    /// Fold it into the view.
-    Event(BuildEvent),
+    /// Fold it into the view. Boxed: a `ResultEnd` is far larger than the
+    /// text variants.
+    Event(Box<BuildEvent>),
     /// Print it above the viewport now, as the run did. Verbatim: the caller
     /// escapes it.
     Print(String),
@@ -123,10 +124,10 @@ impl SessionFeed {
                 }
                 _ => {}
             }
-            return Routed::Event(BuildEvent {
+            return Routed::Event(Box::new(BuildEvent {
                 at_unix_ms: at,
                 kind,
-            });
+            }));
         }
         let Some(kind) = record.session else {
             return Routed::Nothing;
