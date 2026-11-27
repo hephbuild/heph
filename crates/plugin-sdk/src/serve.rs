@@ -231,7 +231,7 @@ fn frame_iter<T: 'static>(
             }))),
             Some(Err(e)) => {
                 done = true;
-                Some(frame_bytes(stream_err(err_message(&e))))
+                Some(frame_bytes(stream_err(&e)))
             }
             None => {
                 done = true;
@@ -241,9 +241,18 @@ fn frame_iter<T: 'static>(
     })
 }
 
-/// A response stream that fails immediately with `msg` (one `StreamEnd{error}`).
+/// A response stream that fails immediately with `msg` (one `StreamEnd{error}`):
+/// a panic's text.
 fn error_item_stream(msg: String) -> DynItemStream {
-    item_stream(std::iter::once(frame_bytes(stream_err(msg))))
+    item_stream(std::iter::once(frame_bytes(Body::from(pb::StreamEnd {
+        error: wire_error(pb::error::Kind::Other, msg).into(),
+        ..Default::default()
+    }))))
+}
+
+/// A response stream that fails immediately with `e` (one `StreamEnd{error}`).
+fn err_item_stream(e: &anyhow::Error) -> DynItemStream {
+    item_stream(std::iter::once(frame_bytes(stream_err(e))))
 }
 
 /// A response stream for an unimplemented streaming method — the stream-shaped
@@ -607,7 +616,7 @@ async fn provider_list_stream(
     })();
     let lreq = match lreq {
         Ok(r) => r,
-        Err(e) => return error_item_stream(err_message(&e)),
+        Err(e) => return err_item_stream(&e),
     };
     match provider.list(lreq, &tok).await {
         Ok(iter) => item_stream(frame_iter(iter, |lr| {
@@ -618,7 +627,7 @@ async fn provider_list_stream(
             }
             .encode_to_vec()
         })),
-        Err(e) => error_item_stream(err_message(&e)),
+        Err(e) => err_item_stream(&e),
     }
 }
 
@@ -629,7 +638,7 @@ async fn provider_list_packages_stream(
     let tok = StdCancellationToken::new();
     let prefix = match required(req.prefix, "ListPackagesRequest.prefix") {
         Ok(p) => p,
-        Err(e) => return error_item_stream(err_message(&e)),
+        Err(e) => return err_item_stream(&e),
     };
     let lreq = ListPackagesRequest {
         prefix: PkgBuf::from(prefix),
@@ -642,7 +651,7 @@ async fn provider_list_packages_stream(
             }
             .encode_to_vec()
         })),
-        Err(e) => error_item_stream(err_message(&e)),
+        Err(e) => err_item_stream(&e),
     }
 }
 
@@ -672,17 +681,24 @@ async fn provider_get(
             ..Default::default()
         }),
         Err(GetError::NotFound) => get_err(pb::get_error::Kind::NotFound, String::new()),
-        Err(GetError::Other(e)) => get_err(get_error_kind(&e), err_message(&e)),
+        Err(GetError::Other(e)) => Body::from(pb::GetError {
+            diagnostic: convert::diagnostic_to_pb(&e),
+            ..get_error(get_error_kind(&e), err_message(&e))
+        }),
     };
     frame_bytes(body)
 }
 
-fn get_err(kind: pb::get_error::Kind, message: String) -> Body {
-    Body::from(pb::GetError {
+fn get_error(kind: pb::get_error::Kind, message: String) -> pb::GetError {
+    pb::GetError {
         kind: Some(kind.into()),
         message: Some(message),
         ..Default::default()
-    })
+    }
+}
+
+fn get_err(kind: pb::get_error::Kind, message: String) -> Body {
+    Body::from(get_error(kind, message))
 }
 
 async fn provider_probe(
@@ -698,7 +714,7 @@ async fn provider_probe(
     })();
     let preq = match preq {
         Ok(r) => r,
-        Err(e) => return frame_bytes(error_body(err_message(&e))),
+        Err(e) => return frame_bytes(err_body(&e)),
     };
     let guard = cancels.enter(&preq.request_id);
     let body = match provider.probe(preq, guard.token()).await {
@@ -706,7 +722,7 @@ async fn provider_probe(
             states: pr.states.iter().map(convert::state_to_pb).collect(),
             ..Default::default()
         }),
-        Err(e) => error_body(err_message(&e)),
+        Err(e) => err_body(&e),
     };
     frame_bytes(body)
 }
@@ -721,9 +737,9 @@ async fn plugin_call_function(
     let call = match FunctionCall::from_pb(req) {
         Ok(c) => c,
         Err(e) => {
-            return frame_bytes(error_body(err_message(
+            return frame_bytes(err_body(
                 &e.context(format!("the call of plugin function {name:?}")),
-            )));
+            ));
         }
     };
     let ctx = FnCallContext {
@@ -755,7 +771,7 @@ async fn plugin_call_function(
     };
     let body = match res {
         Ok(resp) => Body::from(resp),
-        Err(e) => error_body(err_message(&e)),
+        Err(e) => err_body(&e),
     };
     frame_bytes(body)
 }
@@ -934,7 +950,7 @@ impl StableProvider for StableProviderImpl {
                 let req = match decode_req::<pb::ProbeRequest>(&req[..], "ProbeRequest") {
                     Ok(r) => r,
                     Err(e) => {
-                        let body = frame_bytes(error_body(err_message(&e)));
+                        let body = frame_bytes(err_body(&e));
                         return ready(body);
                     }
                 };
@@ -964,7 +980,7 @@ impl StableProvider for StableProviderImpl {
                     match decode_req::<pb::ListPackagesRequest>(&req[..], "ListPackagesRequest") {
                         Ok(r) => r,
                         Err(e) => {
-                            let stream = error_item_stream(err_message(&e));
+                            let stream = err_item_stream(&e);
                             return ready(stream);
                         }
                     };
@@ -993,7 +1009,7 @@ impl StableProvider for StableProviderImpl {
                 let req = match decode_req::<pb::ListRequest>(&req[..], "ListRequest") {
                     Ok(r) => r,
                     Err(e) => {
-                        let stream = error_item_stream(err_message(&e));
+                        let stream = err_item_stream(&e);
                         return ready(stream);
                     }
                 };
@@ -1099,11 +1115,17 @@ impl FunctionCaller for GuestFunctions {
     }
 }
 
-fn stream_err(message: String) -> Body {
+fn stream_err(e: &anyhow::Error) -> Body {
     Body::from(pb::StreamEnd {
-        error: wire_error(pb::error::Kind::Other, message).into(),
+        error: convert::error_to_pb(pb::error::Kind::Other, e).into(),
         ..Default::default()
     })
+}
+
+/// The `Error{Other}` reply for `e`: its whole chain, and its
+/// [`Diagnostic`](hplugin::diagnostic::Diagnostic) when it carries one.
+fn err_body(e: &anyhow::Error) -> Body {
+    Body::from(convert::error_to_pb(pb::error::Kind::Other, e))
 }
 
 /// Wraps an author `ManagedDriver` as a [`StableManagedDriver`].
@@ -1156,7 +1178,7 @@ async fn driver_parse(
     })();
     let preq = match preq {
         Ok(r) => r,
-        Err(e) => return frame_bytes(error_body(err_message(&e))),
+        Err(e) => return frame_bytes(err_body(&e)),
     };
     let guard = cancels.enter(&preq.request_id);
     let body = match driver.parse(preq, guard.token()).await {
@@ -1165,9 +1187,9 @@ async fn driver_parse(
                 target_def: td.into(),
                 ..Default::default()
             }),
-            Err(e) => error_body(err_message(&e)),
+            Err(e) => err_body(&e),
         },
-        Err(e) => error_body(err_message(&e)),
+        Err(e) => err_body(&e),
     };
     frame_bytes(body)
 }
@@ -1194,7 +1216,7 @@ async fn driver_apply_transitive(
     })();
     let areq = match areq {
         Ok(r) => r,
-        Err(e) => return frame_bytes(error_body(err_message(&e))),
+        Err(e) => return frame_bytes(err_body(&e)),
     };
     let guard = cancels.enter(&areq.request_id);
     let body = match driver.apply_transitive(areq, guard.token()).await {
@@ -1203,9 +1225,9 @@ async fn driver_apply_transitive(
                 target_def: td.into(),
                 ..Default::default()
             }),
-            Err(e) => error_body(err_message(&e)),
+            Err(e) => err_body(&e),
         },
-        Err(e) => error_body(err_message(&e)),
+        Err(e) => err_body(&e),
     };
     frame_bytes(body)
 }
@@ -1238,7 +1260,7 @@ impl StableManagedDriver for StableManagedDriverImpl {
                 let req = match decode_req::<pb::ParseRequest>(&req[..], "ParseRequest") {
                     Ok(r) => r,
                     Err(e) => {
-                        let body = frame_bytes(error_body(err_message(&e)));
+                        let body = frame_bytes(err_body(&e));
                         return ready(body);
                     }
                 };
@@ -1258,7 +1280,7 @@ impl StableManagedDriver for StableManagedDriverImpl {
                 ) {
                     Ok(r) => r,
                     Err(e) => {
-                        let body = frame_bytes(error_body(err_message(&e)));
+                        let body = frame_bytes(err_body(&e));
                         return ready(body);
                     }
                 };
@@ -2326,6 +2348,58 @@ mod tests {
                 named: Default::default(),
             },
         ))
+    }
+
+    /// Fails with a [`Diagnostic`](hplugin::diagnostic::Diagnostic) under a
+    /// context, as a plugin's error chains.
+    struct DiagnosticFn;
+    #[async_trait::async_trait]
+    impl PluginFn for DiagnosticFn {
+        async fn call(&self, _ctx: &FnCallContext<'_>, _args: FnArgs) -> Result<FnOutcome> {
+            use hplugin::diagnostic::{Diagnostic, Hint, HintKind, SourceLoc, Stage};
+            let d = Diagnostic::new(Stage::Eval, "no image named `bse`")
+                .with_location(
+                    SourceLoc::checked("p/BUILD".into(), 3, 9).map_err(anyhow::Error::msg)?,
+                )
+                .with_hint(Hint::new(HintKind::DidYouMean, "base"));
+            Err(anyhow::Error::new(d).context("resolving the image"))
+        }
+    }
+
+    /// D2 (0.21.4): the diagnostic a plugin's error carries crosses the seam
+    /// on the plugin's side (`Error.diagnostic`) and comes back on the host's
+    /// error chain, where `find_diagnostic` finds it, while the error's text
+    /// stays the plugin's chain with the diagnostic's text once.
+    #[test]
+    fn a_plugin_error_diagnostic_crosses_the_seam() {
+        use hplugin::diagnostic::{HintKind, SourceLoc, Stage, find_diagnostic};
+        let defs = through_the_seam(
+            "mock",
+            vec![PluginFnDef {
+                name: "fail".into(),
+                signature: FnSignature {
+                    positional: vec![],
+                    named: vec![],
+                    variadic: None,
+                    returns: ParamType::String,
+                },
+                doc: String::new(),
+                func: Arc::new(DiagnosticFn),
+            }],
+        );
+        let err = call(&defs[0], "p", vec![]).expect_err("the call fails");
+        let d = find_diagnostic(&err).expect("the diagnostic crossed");
+        assert_eq!(d.stage, Stage::Eval);
+        assert_eq!(d.message, "no image named `bse`");
+        assert_eq!(
+            d.location,
+            Some(SourceLoc::checked("p/BUILD".into(), 3, 9).expect("relative"))
+        );
+        assert_eq!(d.hints.len(), 1);
+        assert_eq!(d.hints[0].kind, HintKind::DidYouMean);
+        let text = hcore::hmemoizer::chain_message(&err);
+        assert!(text.contains("resolving the image"), "{text}");
+        assert_eq!(text.matches("no image named").count(), 1, "{text}");
     }
 
     struct EchoFn;

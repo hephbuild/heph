@@ -32,6 +32,19 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// the new `x.y.0`. The 0.14.0 and 0.15.0 entries below predate it — they were
 /// additive minors, and there was no version check to read them.
 ///
+/// 0.21.4 (additive, a patch): diagnostics on errors. `Error.diagnostic` (3),
+/// `GetError.diagnostic` (3) and `RunFailure.diagnostic` (6), a `Diagnostic`
+/// (common.proto: stage, message, location, snippet, hints, plugin, truncated),
+/// carry the user-facing diagnostic a plugin's error holds, beside the
+/// flattened `message`, which is unchanged. The host decodes it leniently:
+/// capped and escaped (`Diagnostic::bounded`), a location whose file is empty,
+/// absolute or climbs out with `..` dropped with a `debug!`, an unknown stage
+/// read as the failed call's and an unknown hint kind as `other`; nothing in it
+/// fails the decode or reaches a hash. The skew, both ways: a 0.21.3 plugin
+/// sends none and its error decodes as before; a 0.21.4 plugin on a 0.21.3
+/// host has it skipped, and the message still says what failed. No plugin must
+/// be rebuilt.
+///
 /// 0.21.3 (additive, a patch): host paths.
 /// `RunResponse.host_paths` / `ManagedRunResponse.host_paths` (2, `repeated
 /// string`) list the host paths a run's outputs name; the host stores them with
@@ -346,7 +359,7 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// 0.3.0: `PluginComponents` gained a `hooks` field (a layout change to the
 /// create-entry struct) for the Hook plugin kind — a hard break, so every plugin
 /// must be rebuilt against this ABI.
-pub const ABI_SEMVER: &str = "0.21.3";
+pub const ABI_SEMVER: &str = "0.21.4";
 
 /// The start of the ABI lane this host loads: a plugin is accepted iff its
 /// version matches the caret requirement `^MIN_PLUGIN_ABI` — pre-1.0, one
@@ -363,7 +376,7 @@ pub const MIN_PLUGIN_ABI: &str = "0.21.0";
 
 /// [`ABI_SEMVER`], NUL-terminated: what a plugin's `heph_plugin_abi_semver`
 /// entry returns a pointer to. Bumped with it; a test holds the two equal.
-pub const ABI_SEMVER_C: &std::ffi::CStr = c"0.21.3";
+pub const ABI_SEMVER_C: &std::ffi::CStr = c"0.21.4";
 
 /// The first plugin ABI that reads `ManagedRunRequest.log_capture`. The host
 /// sends it only to a plugin at this version or later; an older one returns

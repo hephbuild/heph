@@ -204,3 +204,44 @@ message Sandbox {
   repeated Dep deps = 2;
   map<string, Env> env = 3;
 }
+
+// A user-facing diagnostic riding a plugin's error (since 0.21.4): what is
+// wrong, at which stage, where in the user's source, and what to do. Mirrors
+// hcore::diagnostic::Diagnostic, less the target it is about, which the host
+// takes from its own boundary. Optional everywhere it appears: an error without
+// one decodes exactly as before, and an older host skips it and reads the
+// error's flattened `message`, which still holds the diagnostic's text.
+//
+// The host caps and escapes every text field on decode
+// (`Diagnostic::bounded`), and drops a `location` whose file is empty,
+// absolute, climbs out of the workspace (`..`) or is over 1024 bytes, keeping
+// the rest. Nothing in it reaches a hash.
+message Diagnostic {
+  // Where in the user's source: a workspace-relative file, and a 1-based line
+  // and column, the column counted in chars.
+  message Location {
+    string file = 1;
+    uint32 line = 2;
+    uint32 col = 3;
+  }
+  message Hint {
+    // As hcore::diagnostic::HintKind::as_str spells it (`did_you_mean`, …);
+    // absent or unknown is `other`.
+    string kind = 1;
+    string text = 2;
+  }
+  // As hcore::diagnostic::Stage::as_str spells it (`eval`, `spec`, `parse`,
+  // `link`, `run`, …). Absent or unknown is the stage of the call that failed.
+  string stage = 1;
+  // One sentence, in the user's words. Required: a diagnostic without one is
+  // dropped.
+  string message = 2;
+  Location location = 3;
+  // Source lines around `location`, as the plugin framed them.
+  string snippet = 4;
+  repeated Hint hints = 5;
+  // Which plugin or driver raised it.
+  string plugin = 6;
+  // The plugin cut something to fit.
+  bool truncated = 7;
+}
