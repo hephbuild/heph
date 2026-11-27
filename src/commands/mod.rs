@@ -47,7 +47,9 @@ pub enum Commands {
     ///
     /// `heph run -e '//cmd/... && label(test)'` — run via a query expression
     ///
-    /// `heph run -e '//... && !//vendor/...'` — run, excluding a subtree
+    /// `heph run -e '//... && !//vendor/...' --allow-all` — run every target, excluding a subtree
+    ///
+    /// A `-e` selection that takes whole packages needs `--allow-all`.
     #[command(visible_alias = "r")]
     Run(run::RunArgs),
     /// Inspect targets, packages, hashes, and deps

@@ -101,7 +101,10 @@ pub fn matcher_from_args(
 
         if label == "all" {
             if !allow_all {
-                anyhow::bail!("label `all` not allowed")
+                anyhow::bail!(
+                    "label `all` selects every target of `{package_matcher}`; \
+                     pass --allow-all to run them all"
+                )
             }
 
             htpkg::parse(package_matcher, base_pkg)
@@ -115,7 +118,7 @@ pub fn matcher_from_args(
     } else {
         let addr_str = arg1;
         let addr = htaddr::parse_addr_with_base(addr_str, base_pkg)
-            .map_err(|err| annotate_lone_package_matcher(err, addr_str, base_pkg))
+            .map_err(|err| annotate_lone_package_matcher(err, addr_str, base_pkg, allow_all))
             .with_context(|| format!("parse {}", addr_str))?;
         Ok(Matcher::Addr(addr))
     }
@@ -129,17 +132,22 @@ pub fn matcher_from_args(
 /// nothing to suggest that the selection belongs behind `-e`. Only annotate
 /// when the argument really is a well-formed package matcher; a genuine typo in
 /// an address keeps its own error.
+///
+/// `allow_all` false is `run` without `--allow-all`, which refuses a bare
+/// package behind `-e` too, so the pointer carries the flag.
 fn annotate_lone_package_matcher(
     err: anyhow::Error,
     input: &str,
     base_pkg: &PkgBuf,
+    allow_all: bool,
 ) -> anyhow::Error {
     if htpkg::parse(input, base_pkg).is_err() {
         return err;
     }
+    let flag = if allow_all { "" } else { " --allow-all" };
     err.context(format!(
         "`{input}` is a package matcher, not a target address — the single-argument \
-         form takes one address (`//pkg:name`); to select a package use `-e '{input}'`, \
+         form takes one address (`//pkg:name`); to select a package use `-e '{input}'{flag}`, \
          or name a label first, e.g. `test {input}`"
     ))
 }

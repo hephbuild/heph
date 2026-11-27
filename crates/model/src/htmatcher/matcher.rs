@@ -162,6 +162,28 @@ impl Matcher {
         }
     }
 
+    /// Whether `self` can select every target of a package, whatever the
+    /// targets are: some branch of it is bounded only by package paths. `heph
+    /// run` asks for `--allow-all` before running such a selection.
+    ///
+    /// An address, a label, a driver and a codegen tree each name a deliberate
+    /// set of targets, and an intersection with one of them is bounded by it
+    /// (`//a/... && label(test)`). A package, a package prefix and a negation
+    /// are not: `!label(slow)` is every target but a few. A union is bounded
+    /// only if each branch is. Decided from the syntax alone, so nothing
+    /// resolves: `!!label(x)` and `//a:b || //a/...` count as unbounded.
+    pub fn selects_whole_packages(&self) -> bool {
+        match self {
+            Matcher::Addr(_)
+            | Matcher::Label(_)
+            | Matcher::Driver(_)
+            | Matcher::TreeOutputTo(_) => false,
+            Matcher::Package(_) | Matcher::PackagePrefix(_) | Matcher::Not(_) => true,
+            Matcher::Or(terms) => terms.iter().any(Matcher::selects_whole_packages),
+            Matcher::And(terms) => terms.iter().all(Matcher::selects_whole_packages),
+        }
+    }
+
     /// Whether evaluating `self` can read a listed fact. A walk merges listings
     /// only for a matcher that will act on them — an `Addr` clone and a map
     /// entry per candidate otherwise bought nothing.
@@ -306,6 +328,45 @@ mod tests {
         assert!(!Matcher::Package(PkgBuf::from("")).is_whole_graph());
         assert!(!Matcher::Or(vec![root.clone()]).is_whole_graph());
         assert!(!Matcher::Not(Box::new(root)).is_whole_graph());
+    }
+
+    /// What `heph run` asks `--allow-all` for, over the expressions a user types:
+    /// bounded by a package path alone, or by a negation, is whole packages;
+    /// an address, label, driver or codegen tree anywhere in a conjunction
+    /// bounds it.
+    #[test]
+    fn selects_whole_packages_by_expression() {
+        let cases = [
+            ("//some/pkg", true),
+            ("//some/...", true),
+            ("//...", true),
+            (".", true),
+            ("//a/... && !//a/vendor/...", true),
+            ("//a/... && //a/b/...", true),
+            ("!label(slow)", true),
+            ("//a/... && !label(slow)", true),
+            ("//a:b || //c", true),
+            ("label(test) || //c/...", true),
+            // Syntactic: a double negation is not seen through.
+            ("!!label(x)", true),
+            ("//pkg && !//pkg:x", true),
+            // A driver names a class of target, as a label does.
+            ("driver(exec)", false),
+            ("//a:b", false),
+            ("//a:b || //c:d", false),
+            ("label(test)", false),
+            ("//a/... && label(test)", false),
+            ("//... && !//vendor/... && label(test)", false),
+            ("//a/... && driver(exec)", false),
+            ("tree_output(gen)", false),
+            ("(//a/... || //b/...) && tree_output(gen)", false),
+            ("label(test) && !label(slow)", false),
+            ("//a/... && (label(x) || //b:c)", false),
+        ];
+        for (expr, want) in cases {
+            let m = crate::htquery::parse(expr, &PkgBuf::from("p")).expect(expr);
+            assert_eq!(m.selects_whole_packages(), want, "{expr}");
+        }
     }
 
     #[test]
