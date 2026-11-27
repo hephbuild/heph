@@ -114,6 +114,27 @@ Only `build-lint-check` checks these types. Evaluation (`heph run`, `query`,
 `validate`) checks annotations alone, so it still accepts any argument for a
 parameter typed only by its default.
 
+### Functions and `Any`
+
+Starlark's `typing` namespace is in every BUILD file: `typing.Callable`,
+`typing.Any`, `typing.Iterable` and `typing.Never`. A parameter that takes a
+function names the function's parameter types and return type:
+
+```python
+def apply(fn: typing.Callable[[str], str], x: str) -> str:
+    return fn(x)
+
+def keep(xs: list[str], filter: list[str] | typing.Callable[[str], bool]) -> list[str]:
+    ...
+```
+
+`build-lint-check` checks a function passed there against that signature:
+`apply(_len, "s")`, with `def _len(s: str) -> int`, reports
+``type-error: Expected type `typing.Callable[[str], str]` but got `def(s: str) -> int` ``.
+Evaluation checks only that the argument is a function. Bare `typing.Callable`
+takes any function, and `typing.Any` takes any value; both satisfy
+`requireTypeAnnotations`, and neither is checked any further.
+
 ### Allowing `None`
 
 A parameter takes `None` only when its annotation says `| None`, or when its
@@ -256,7 +277,9 @@ One more alias is not built from a field: `heph.types.Number` is
 annotation finding suggests it.
 
 `heph.types.Nope` fails before evaluation, naming the known aliases and the
-driver namespaces. The editor completes `heph.types.` with the aliases, then
+driver namespaces. `heph.types.Callable`, `heph.types.Any` and the other
+names of starlark's `typing` fail pointing at `typing.<name>` (see
+[Functions and `Any`](#functions-and-any)). The editor completes `heph.types.` with the aliases, then
 the driver namespaces, and shows each alias's expansion on hover.
 
 ### Driver kwargs
