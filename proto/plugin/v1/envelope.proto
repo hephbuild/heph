@@ -6,6 +6,7 @@ edition = "2024";
 // transports reuse the same logical bodies.
 package heph.plugin.v1;
 
+import "plugin/v1/common.proto";
 import "plugin/v1/provider.proto";
 import "plugin/v1/driver.proto";
 import "plugin/v1/callback.proto";
@@ -68,6 +69,9 @@ message Error {
   }
   Kind kind = 1;
   string message = 2;
+  // The error's user-facing diagnostic, when the plugin raised one (since
+  // 0.21.4). `message` still carries the whole flattened chain.
+  Diagnostic diagnostic = 3;
 }
 
 // One element of a streamed response (e.g. an encoded ListResponse, or a chunk

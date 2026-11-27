@@ -240,6 +240,16 @@ skipped in silence.
 
 ## History of breaks
 
+- **0.21.4** (additive patch) — diagnostics on errors.
+  `Error.diagnostic` (3), `GetError.diagnostic` (3) and `RunFailure.diagnostic`
+  (6) carry a `Diagnostic` (common.proto: stage, message, location, snippet,
+  hints, plugin, truncated) beside the unchanged flattened `message`. The host
+  decodes it leniently: every text capped and escaped, a location whose file
+  is empty, absolute or contains `..` dropped (the rest kept), an unknown stage
+  read as the failed call's, an unknown hint kind as `other`. Nothing in it
+  fails a decode or reaches a hash. Both skews degrade to 0.21.3's behaviour:
+  an older plugin sends none, a newer plugin's is skipped by an older host,
+  whose message still holds its text. No plugin must be rebuilt.
 - **0.21.3** (additive patch) — host paths.
   `RunResponse.host_paths` and `ManagedRunResponse.host_paths` (2, `repeated
   string`) list host paths whose nix closures cover what a run's outputs name;
