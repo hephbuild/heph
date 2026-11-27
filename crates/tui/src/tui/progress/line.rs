@@ -735,6 +735,8 @@ mod tests {
         v.apply(&at(
             10,
             BuildEventKind::ResultEnd {
+                upstream_file: None,
+                path: Vec::new(),
                 left_behind: None,
                 cancelled: false,
                 addr: "//p:fail".into(),
@@ -803,6 +805,8 @@ mod tests {
         const HOME: &str = "/home/u/.heph";
         let fail =
             |addr: &str, error: String, upstream_of: Option<&str>| BuildEventKind::ResultEnd {
+                upstream_file: None,
+                path: Vec::new(),
                 left_behind: None,
                 cancelled: false,
                 addr: addr.into(),
@@ -858,6 +862,8 @@ mod tests {
         cancelled: bool,
     ) -> hcore::events::BuildEventKind {
         hcore::events::BuildEventKind::ResultEnd {
+            upstream_file: None,
+            path: Vec::new(),
             left_behind: None,
             addr: addr.into(),
             error: Some(if cancelled { "cancelled" } else { "boom" }.into()),

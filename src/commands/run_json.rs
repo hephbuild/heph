@@ -555,6 +555,8 @@ mod tests {
 
     fn end(addr: &str, error: Option<&str>, upstream_of: Option<&str>) -> BuildEventKind {
         BuildEventKind::ResultEnd {
+            upstream_file: None,
+            path: Vec::new(),
             addr: addr.to_string(),
             error: error.map(str::to_string),
             upstream_of: upstream_of.map(str::to_string),

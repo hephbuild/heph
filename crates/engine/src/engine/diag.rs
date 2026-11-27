@@ -3094,6 +3094,8 @@ mod tests {
             addr: "//a:b".into(),
             error: Some("boom".into()),
             upstream_of: None,
+            upstream_file: None,
+            path: Vec::new(),
             exit_status: None,
             exit_code: None,
             log_tail: None,

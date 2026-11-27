@@ -830,6 +830,11 @@ pub struct TargetFailure {
     /// The workspace-relative BUILD/`.bzl` file that did not evaluate, when
     /// the culprit is that file rather than a target ([`Culprit::File`]).
     pub file: Option<std::sync::Arc<str>>,
+    /// The shortest path from a requested target to [`addr`](Self::addr),
+    /// inclusive (`[addr]` when it was itself requested), read off the
+    /// request's dependency graph when the failure was recorded. Empty when
+    /// no requested target reaches it, or when nobody computed it.
+    pub path: Vec<Addr>,
     /// The last lines of the target's process log (the full log is still saved
     /// as the `log.txt` artifact), with the real starting line number so the box
     /// renders true file positions. Rendered as a framed `log` box.
@@ -946,6 +951,7 @@ impl TargetFailure {
         Self {
             addr,
             file: None,
+            path: Vec::new(),
             log_tail,
             log: None,
             outputs: None,
@@ -967,6 +973,12 @@ impl TargetFailure {
     /// than on [`addr`](Self::addr), the address that led into it.
     pub fn with_file(mut self, file: Option<std::sync::Arc<str>>) -> Self {
         self.file = file;
+        self
+    }
+
+    /// The same failure, reached from a requested target along `path`.
+    pub fn with_path(mut self, path: Vec<Addr>) -> Self {
+        self.path = path;
         self
     }
 

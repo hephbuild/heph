@@ -2872,6 +2872,9 @@ impl CIAppView for CiProgressView {
                 addr,
                 error: Some(error),
                 upstream_of: None,
+                // The box's `reached by:` row is a later change.
+                upstream_file: _,
+                path: _,
                 exit_status,
                 // `exit_status` already names it.
                 exit_code: _,
@@ -3160,6 +3163,8 @@ mod tests {
     }
     fn result_end(addr: &str, error: Option<String>) -> BuildEventKind {
         BuildEventKind::ResultEnd {
+            upstream_file: None,
+            path: Vec::new(),
             left_behind: None,
             cancelled: false,
             addr: addr.into(),
@@ -4450,6 +4455,8 @@ mod tests {
         tail: Option<&str>,
     ) -> BuildEventKind {
         BuildEventKind::ResultEnd {
+            upstream_file: None,
+            path: Vec::new(),
             left_behind: None,
             addr: addr.into(),
             error: Some(format!("{addr}: exit status: 1")),
@@ -4539,6 +4546,8 @@ mod tests {
     #[test]
     fn ci_view_live_block_carries_the_box_rows() {
         let end = BuildEventKind::ResultEnd {
+            upstream_file: None,
+            path: Vec::new(),
             addr: "//a:b".into(),
             error: Some("//a:b: exit status: 1".into()),
             upstream_of: None,
@@ -4605,6 +4614,8 @@ mod tests {
     #[test]
     fn ci_view_live_block_words_and_sanitizing() {
         let timed_out = BuildEventKind::ResultEnd {
+            upstream_file: None,
+            path: Vec::new(),
             left_behind: None,
             addr: "//e2e:it".into(),
             error: Some("timed out".into()),
@@ -4639,6 +4650,8 @@ mod tests {
         );
 
         let no_status = BuildEventKind::ResultEnd {
+            upstream_file: None,
+            path: Vec::new(),
             left_behind: None,
             addr: "//a:\x1b[2Jb".into(),
             error: Some("staging\x1b[2J failed".into()),
@@ -5974,6 +5987,8 @@ mod tests {
                 });
             }
             ev(BuildEventKind::ResultEnd {
+                upstream_file: None,
+                path: Vec::new(),
                 left_behind: None,
                 cancelled: false,
                 addr: a,

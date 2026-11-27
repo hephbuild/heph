@@ -1229,6 +1229,8 @@ mod tests {
                     _ => (Some("boom".to_owned()), Some(addr(rng)), false),
                 };
                 BuildEventKind::ResultEnd {
+                    upstream_file: None,
+                    path: Vec::new(),
                     left_behind: None,
                     cancelled,
                     addr: addr(rng),
