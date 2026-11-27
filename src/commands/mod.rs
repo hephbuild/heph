@@ -14,6 +14,7 @@ pub mod query;
 pub mod run;
 pub mod run_json;
 pub mod session;
+pub mod terminal_tap;
 pub mod tool;
 mod utils;
 pub mod validate;

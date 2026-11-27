@@ -293,6 +293,7 @@ mod tests {
                     log_tail: Some(LogTailData {
                         text: "FAIL\nline two".into(),
                         start_line: 1,
+                        streamed: false,
                     }),
                 },
             ));
@@ -422,6 +423,7 @@ mod tests {
                 log_tail: Some(LogTailData {
                     text: "safe 100% done\n::error title=spoofed::not really failing".into(),
                     start_line: 1,
+                    streamed: false,
                 }),
             },
         ));

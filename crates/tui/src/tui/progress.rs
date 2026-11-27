@@ -2730,8 +2730,9 @@ pub struct CiProgressView {
 }
 
 /// `heph run --log-lines`' default: how many tail lines a failure prints live
-/// when the command has no such flag.
-const DEFAULT_LOG_LINES: usize = 10;
+/// when the command has no such flag. The same as `Engine::DEFAULT_LOG_TAIL_LINES`,
+/// which this crate cannot name.
+const DEFAULT_LOG_LINES: usize = 1000;
 
 impl CiProgressView {
     pub fn new(label: impl Into<String>) -> Self {
@@ -4441,6 +4442,7 @@ mod tests {
             log_tail: tail.map(|text| hcore::events::LogTailData {
                 text: text.into(),
                 start_line: 1,
+                streamed: false,
             }),
             timed_out: None,
             cancelled,
@@ -4493,6 +4495,7 @@ mod tests {
             log_tail: Some(hcore::events::LogTailData {
                 text: TAIL.into(),
                 start_line: 1,
+                streamed: false,
             }),
             timed_out: None,
             cancelled: false,
@@ -4557,6 +4560,7 @@ mod tests {
             log_tail: Some(hcore::events::LogTailData {
                 text: "a\x1b[31mred\x1b[0m\r\nb\x07ell\n10%\r20%\n".into(),
                 start_line: 1,
+                streamed: false,
             }),
             timed_out: Some(hcore::events::TimedOutData {
                 timeout_ms: 600_000,
@@ -4589,6 +4593,7 @@ mod tests {
             log_tail: Some(hcore::events::LogTailData {
                 text: "\n\n".into(),
                 start_line: 1,
+                streamed: false,
             }),
             timed_out: None,
             cancelled: false,

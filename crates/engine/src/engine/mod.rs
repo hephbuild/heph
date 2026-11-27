@@ -86,7 +86,7 @@ pub use result::CopyOutputs;
 pub use result::EResult;
 pub use result::OutputMatcher;
 pub use result::ResultOptions;
-pub use result::{InteractiveInner, InteractiveWrapper};
+pub use result::{InteractiveInner, InteractiveWrapper, TerminalUse};
 pub use spec::EngineTargetSpec;
 // The managed-driver contract lives in fuse-free `heph-driver-support`; the
 // FUSE backend + routing bridge live in `heph-driver-bridge`. Re-export both at

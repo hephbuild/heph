@@ -1628,8 +1628,10 @@ impl Engine {
     }
 
     /// Default number of trailing process-log lines shown in a failure box when a
-    /// caller (e.g. `gc`, non-`run` commands) does not override it.
-    pub const DEFAULT_LOG_TAIL_LINES: usize = 10;
+    /// caller (e.g. `gc`, non-`run` commands) does not override it (U5). The
+    /// read is also capped at 256 KiB, whichever is less
+    /// ([`hplugin::error::TAIL_MAX_BYTES`]).
+    pub const DEFAULT_LOG_TAIL_LINES: usize = 1000;
 
     pub fn new_state_with_fail_fast(self: &Arc<Self>, fail_fast: bool) -> Arc<RequestState> {
         self.new_state_with_events(fail_fast, None)
