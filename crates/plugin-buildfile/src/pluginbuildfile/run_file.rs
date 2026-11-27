@@ -331,7 +331,11 @@ pub(crate) fn heph_globals(
     kwargs: &crate::pluginbuildfile::types::DriverKwargs,
     plugins: impl Fn(&mut GlobalsBuilder),
 ) -> Globals {
-    GlobalsBuilder::standard()
+    // `Typing` is starlark's `typing` namespace (`typing.Any`, `typing.Never`,
+    // `typing.Iterable`, `typing.Callable[[str], str]`) plus `isinstance` and
+    // `eval_type`: without it a `def` parameter that takes a function, or one
+    // that takes anything, has no type to annotate it with.
+    GlobalsBuilder::extended_by(&[starlark::environment::LibraryExtension::Typing])
         .with(starlark_module)
         .with_namespace("heph", |hb| {
             // Static `heph.core` host/platform builtins.

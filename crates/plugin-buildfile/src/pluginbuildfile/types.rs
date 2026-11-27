@@ -42,6 +42,11 @@ use std::sync::{Arc, LazyLock, OnceLock};
 /// The `heph.<name>` namespace the aliases live in.
 pub(crate) const NAMESPACE: &str = "types";
 
+/// The members of starlark's `typing` namespace (`LibraryExtension::Typing`,
+/// in every BUILD file's globals). `heph.types` does not alias them; an
+/// unknown-alias error for one of these names points at `typing` instead.
+const TYPING_MEMBERS: &[&str] = &["Any", "Callable", "Iterable", "Never"];
+
 /// One shipped alias: its name and what it stands for.
 struct AliasDef {
     name: &'static str,
@@ -443,6 +448,19 @@ impl DriverKwargs {
             let aliases: Vec<&str> = aliases().iter().map(|a| a.name).collect();
             let roots: Vec<&str> = next.into_iter().collect();
             if alone {
+                // A name starlark's own `typing` namespace has is not heph's to
+                // alias: point there instead of at the nearest heph alias.
+                if TYPING_MEMBERS.contains(&name) {
+                    return format!(
+                        "no type alias named \"{name}\"; it is starlark's: use `typing.{name}`{}",
+                        if name == "Callable" {
+                            ", e.g. `typing.Callable[[str], bool]` for a function from a `str` \
+                             to a `bool`"
+                        } else {
+                            ""
+                        }
+                    );
+                }
                 let mut candidates = aliases.clone();
                 candidates.extend(&roots);
                 let drivers = if roots.is_empty() {
@@ -872,6 +890,56 @@ pub(crate) mod tests {
             ),
             "{msg}"
         );
+        // A name of starlark's `typing` points there, and `typing` itself
+        // evaluates, a precise callable included.
+        let msg = fails("x = heph.types.Callable\n");
+        assert!(
+            msg.contains(
+                "heph.types.Callable: no type alias named \"Callable\"; it is starlark's: use \
+                 `typing.Callable`, e.g. `typing.Callable[[str], bool]` for a function from a \
+                 `str` to a `bool`"
+            ),
+            "{msg}"
+        );
+        let msg = fails("x = heph.types.Any\n");
+        assert!(
+            msg.contains(
+                "heph.types.Any: no type alias named \"Any\"; it is starlark's: use `typing.Any`"
+            ),
+            "{msg}"
+        );
+        let src = "def f(p: list[str] | typing.Callable[[str], bool], v: typing.Any) -> None:\n    \
+                   pass\n";
+        eval_source("BUILD", src.to_string(), "pkg", &loader).expect("typing evaluates");
+        // Evaluation checks a callable type's shape only: a function of the
+        // wrong signature evaluates (lint reports it), a non-function does not.
+        let apply = "def apply(fn: typing.Callable[[str], str]) -> str:\n    return \"\"\n\n\
+                     def _count(n: int) -> int:\n    return n\n\n";
+        eval_source(
+            "BUILD",
+            format!("{apply}x = apply(_count)\n"),
+            "pkg",
+            &loader,
+        )
+        .expect("a function of another signature evaluates");
+        let msg = fails(&format!("{apply}x = apply(1)\n"));
+        assert!(
+            msg.contains(
+                "Value `1` of type `int` does not match the type annotation \
+                 `typing.Callable[[str], str]` for argument `fn`"
+            ),
+            "{msg}"
+        );
+        // The hint names only what `typing` really has.
+        for m in TYPING_MEMBERS {
+            eval_source("BUILD", format!("x = typing.{m}\n"), "pkg", &loader)
+                .unwrap_or_else(|e| panic!("typing.{m} exists: {e:#}"));
+        }
+        // A file that already binds one of the new global names keeps its own.
+        let src = "typing = 1\neval_type = 2\n\ndef isinstance(x: int) -> int:\n    return x\n\n\
+                   y = isinstance(typing + eval_type)\n";
+        eval_source("BUILD", src.to_string(), "pkg", &loader)
+            .expect("a module binding shadows the typing globals");
         // A driver namespace is a value; an attribute of a type is evaluation's.
         let src = "x = heph.types.oci\ny = heph.types.oci.image\n";
         eval_source("BUILD", src.to_string(), "pkg", &loader).expect("namespaces evaluate");

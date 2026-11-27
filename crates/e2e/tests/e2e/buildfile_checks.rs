@@ -358,6 +358,58 @@ async fn require_annotations_gate() {
     );
 }
 
+/// A macro that takes a callback: `typing.Callable[[str], str]` annotates it,
+/// alone or in a union, so `requireTypeAnnotations` passes, and the package
+/// still evaluates.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn require_annotations_callable_param() {
+    let ws = Ws::new(
+        &[(
+            "pkg/BUILD",
+            "def apply(fn: typing.Callable[[str], str], x: str) -> str:\n    return fn(x)\n\n\
+             def keep(xs: list[str], filter: list[str] | typing.Callable[[str], bool]) -> \
+             list[str]:\n    \
+             if type(filter) == \"list\":\n        return [x for x in xs if x in filter]\n    \
+             return [x for x in xs if filter(x)]\n\n\
+             def _upper(s: str) -> str:\n    return s.upper()\n\n\
+             def _short(s: str) -> bool:\n    return len(s) < 3\n\n\
+             target(name = \"a\", driver = \"textfile\", \
+             text = apply(_upper, \"hi\") + \",\".join(keep([\"a\", \"bcd\"], _short)))\n",
+        )],
+        "requireTypeAnnotations: true",
+    );
+    let r = run_addr(&ws, "//pkg:build-lint-check").await;
+    assert_passes(&r, "//pkg:build-lint-check");
+    assert_passes(&run_addr(&ws, "//pkg:a").await, "//pkg:a");
+}
+
+/// The callable type is precise: a callback whose parameters, or whose return
+/// type, do not match the parameter's `typing.Callable[[str], str]` is a type
+/// error, not a pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn callable_param_signature_is_checked() {
+    let ws = Ws::new(
+        &[(
+            "pkg/BUILD",
+            "def apply(fn: typing.Callable[[str], str], x: str) -> str:\n    return fn(x)\n\n\
+             def _count(n: int) -> str:\n    return str(n)\n\n\
+             def _len(s: str) -> int:\n    return len(s)\n\n\
+             def use() -> list[str]:\n    return [apply(_count, \"hi\"), apply(_len, \"hi\")]\n",
+        )],
+        "",
+    );
+    let r = run_addr(&ws, "//pkg:build-lint-check").await;
+    assert_fails(&r, "//pkg:build-lint-check");
+    assert_eq!(
+        failure_log(&ws, "//pkg:build-lint-check").trim_end(),
+        "pkg/BUILD:11:19: type-error: Expected type `typing.Callable[[str], str]` but got \
+         `def(n: int) -> str`\n\
+         pkg/BUILD:11:40: type-error: Expected type `typing.Callable[[str], str]` but got \
+         `def(s: str) -> int`\n\
+         2 findings in //pkg"
+    );
+}
+
 /// The option is in the lint def hash (I4): a pass cached with it off is not
 /// reused once it is on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
