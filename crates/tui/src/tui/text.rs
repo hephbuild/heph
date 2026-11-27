@@ -10,8 +10,8 @@
 //!
 //! A failure box's log tail is the exception (error-reporting spec D6.1b,
 //! which supersedes I13's strip there): [`escape_log_tail`] shows every
-//! control byte escaped (`\x1b`, `\r`) instead of removing it, so nothing
-//! the target printed is hidden and nothing acts on the terminal; and, in
+//! control byte escaped (`\x1b`, `\r`) instead of removing it, so no byte
+//! the target printed is dropped and nothing acts on the terminal; and, in
 //! colour on a terminal, it keeps the target's own SGR colours, each line
 //! reset at its end. The dashboard's Log tab and LAST LINE keep stripping
 //! everything.
@@ -134,7 +134,9 @@ fn push_escaped(c: char, out: &mut String) {
 }
 
 /// A failure box's log tail as it is printed (D6.1b): nothing in it acts on
-/// the terminal, and nothing is hidden.
+/// the terminal, and no control byte is removed. A kept SGR can still render
+/// text invisible (conceal, black on black), as the target's own output
+/// would; with colour off every SGR is shown escaped.
 ///
 /// - Tab and newline stay. A CR right before a newline is part of the line
 ///   break (CRLF) and goes with it.

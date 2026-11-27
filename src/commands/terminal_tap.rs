@@ -10,6 +10,14 @@
 //!
 //! The same tap ends a line the target left open on the terminal, so heph's
 //! own summary does not glue onto it (D6.3).
+//!
+//! The tap sees the order the bytes were handed to tokio's stdout and stderr,
+//! not the order they reached the terminal: each hands its bytes to its own
+//! blocking thread, so a stdout chunk and the stderr chunk after it can land
+//! either way round (as in `log.txt`, U18). The line break is then decided on
+//! the wrong last byte: a missing break or a blank line, never lost output.
+//! Likewise `--raw` over several targets at once gives each run its own tap
+//! on one shared terminal. Both are cosmetic, and accepted.
 
 use std::io::{self, IsTerminal as _};
 use std::os::fd::AsFd;
@@ -165,6 +173,108 @@ mod tests {
             "no newline at the end"
         );
         assert_eq!(std::fs::read_to_string(dir.path().join("err"))?, "boom");
+        Ok(())
+    }
+
+    /// A stream as `Tapped::new` makes it over a terminal (`tap`) or a file
+    /// (`None`), writing into memory.
+    fn in_memory(tap: Option<&Arc<TerminalTap>>) -> Tapped<Vec<u8>> {
+        Tapped {
+            inner: Vec::new(),
+            tap: tap.map(Arc::clone),
+        }
+    }
+
+    /// A line left open on the terminal is ended on stderr, where heph's own
+    /// lines go next, when stderr is a terminal; on stdout when only stdout
+    /// is. A closed line gets nothing added; nothing written, nothing added.
+    #[tokio::test]
+    async fn finish_ends_an_open_line_on_the_terminal_stream() -> anyhow::Result<()> {
+        // Both terminals: stdout left the line open, stderr gets the break.
+        let tap = TerminalTap::new();
+        let (mut out, mut err) = (in_memory(Some(&tap)), in_memory(Some(&tap)));
+        err.write_all(b"warn\n").await?;
+        out.write_all(b"50%").await?;
+        let used = finish(&tap, &mut out, &mut err).await;
+        assert!(used.streamed);
+        assert_eq!(
+            (out.inner.as_slice(), err.inner.as_slice()),
+            (&b"50%"[..], &b"warn\n\n"[..])
+        );
+
+        // Only stdout a terminal: the break goes there, not into the file.
+        let tap = TerminalTap::new();
+        let (mut out, mut err) = (in_memory(Some(&tap)), in_memory(None));
+        out.write_all(b"open").await?;
+        err.write_all(b"to a file").await?;
+        let used = finish(&tap, &mut out, &mut err).await;
+        assert!(used.streamed);
+        assert_eq!(
+            (out.inner.as_slice(), err.inner.as_slice()),
+            (&b"open\n"[..], &b"to a file"[..])
+        );
+
+        // A closed line, and nothing written: nothing added.
+        let tap = TerminalTap::new();
+        let (mut out, mut err) = (in_memory(Some(&tap)), in_memory(Some(&tap)));
+        out.write_all(b"done\n").await?;
+        let used = finish(&tap, &mut out, &mut err).await;
+        assert!(used.streamed);
+        assert_eq!(
+            (out.inner.as_slice(), err.inner.as_slice()),
+            (&b"done\n"[..], &b""[..])
+        );
+        let tap = TerminalTap::new();
+        let (mut out, mut err) = (in_memory(Some(&tap)), in_memory(Some(&tap)));
+        let used = finish(&tap, &mut out, &mut err).await;
+        assert!(!used.streamed, "a terminal that got no byte did not stream");
+        assert!(out.inner.is_empty() && err.inner.is_empty());
+        Ok(())
+    }
+
+    /// A writer that takes at most `max` bytes per write.
+    struct Short {
+        got: Vec<u8>,
+        max: usize,
+    }
+
+    impl AsyncWrite for Short {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let n = buf.len().min(self.max);
+            self.got.extend_from_slice(buf.get(..n).unwrap_or_default());
+            Poll::Ready(Ok(n))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A short write records the last byte the writer took, not the last
+    /// byte it was offered.
+    #[tokio::test]
+    async fn a_short_write_records_the_last_byte_taken() -> anyhow::Result<()> {
+        let tap = TerminalTap::new();
+        let mut out = Tapped {
+            inner: Short {
+                got: Vec::new(),
+                max: 2,
+            },
+            tap: Some(Arc::clone(&tap)),
+        };
+        let n = out.write(b"a\nb").await?;
+        assert_eq!(n, 2);
+        assert!(
+            !tap.ends_open(),
+            "the writer took `a\\n`: the line is closed"
+        );
+        assert_eq!(out.inner.got, b"a\n");
         Ok(())
     }
 

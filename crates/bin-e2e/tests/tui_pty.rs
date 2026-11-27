@@ -2757,6 +2757,16 @@ fn assert_not_streamed(b: &Boxed, report: &str, addr: &str, line: &str) {
     );
 }
 
+/// No pointer anywhere in what reached the terminal, not only on the final
+/// screen, where a box that scrolled off would make the check vacuous.
+fn assert_no_pointer_ever(b: &Boxed) {
+    assert!(
+        !b.pty.seen().contains("output not shown here"),
+        "a pointer reached the terminal\n{}",
+        b.report()
+    );
+}
+
 /// RUN-STDERR: a requested target writing to stderr under the TUI has the
 /// terminal lent to it, so what it printed is already on screen; its box
 /// says where the rest is instead of printing it again.
@@ -2823,6 +2833,7 @@ fn tty_stdout_redirected_not_streamed() {
     assert!(b.tui_engaged(), "the TUI never engaged\n{}", b.report());
     let rows = b.rows().join("\n");
     assert_not_streamed(&b, &rows, "//pkg:t", "tty-target-line");
+    assert_no_pointer_ever(&b);
     assert!(
         b.file("out").lines().any(|l| l == "tty-target-line"),
         "the target's stdout should have gone to the file\n{}",
@@ -2883,6 +2894,7 @@ fn tty_failing_dependency_not_streamed() {
     assert!(b.tui_engaged(), "the TUI never engaged\n{}", b.report());
     let rows = b.rows().join("\n");
     assert_not_streamed(&b, &rows, "//pkg:dep", "tty-dep-line");
+    assert_no_pointer_ever(&b);
     assert!(
         !has_bare_row(&b.rows(), "tty-dep-line"),
         "a dependency's output reached the terminal raw\n{}",
@@ -3052,9 +3064,12 @@ fn teardown_tail_invalid_utf8() {
 }
 
 /// E9: a target whose output streamed to the PTY and the same target run
-/// redirected have one cache key: `streamed` is in no hash. The second run is
-/// a cache hit — its output carries a value only a fresh run would change —
-/// and `hashin` is the same after each.
+/// redirected have one cache key. The proof is the cache hit: the second
+/// run's output carries a value only a fresh run would change. The `hashin`
+/// comparison is a smoke check only: both `inspect` calls run with the same
+/// stdio and run nothing. That `streamed` reaches no hash is structural
+/// (it exists only after the run, and nothing that hashes or stores takes
+/// it); this test proves the wiring half.
 #[test]
 fn streamed_and_redirected_same_hashin() {
     let build = concat!(

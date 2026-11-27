@@ -558,9 +558,8 @@ async fn byte_move_failure_parent_is_a_file() -> anyhow::Result<()> {
 
 /// A write-back that fails after a run that streamed (D6.1c, "a later step
 /// failed"): it runs outside the memoized execute, and the failure still
-/// records that the log streamed, so the box points at the log instead of
-/// repeating it. The same failure after a run that did not stream records
-/// that it did not.
+/// records that the run streamed. The same failure after a run that did not
+/// stream records that it did not.
 #[tokio::test]
 async fn codegen_write_back_failure_after_a_streamed_run_records_streamed() -> anyhow::Result<()> {
     for streamed in [true, false] {

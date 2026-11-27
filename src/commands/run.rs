@@ -430,7 +430,8 @@ fn build_display(raw: bool, shell: bool) -> BuildDisplay {
 }
 
 /// A build target's `--raw`: the action's output goes to `streams`, through the
-/// driver's tee, so it is what `log.txt` holds, redaction included. It never
+/// driver's tee, so it is what `log.txt` holds, redaction included (heph's
+/// own line break after a line left open on a terminal aside, D6.3). It never
 /// passes stdin: the action reads /dev/null, or `printf A | heph run //x --raw`
 /// and `printf B | …` would share a hashin and B would get A's outputs.
 ///

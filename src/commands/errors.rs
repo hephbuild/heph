@@ -40,7 +40,7 @@ fn cause_chain(source: &anyhow::Error) -> String {
 /// earlier-lines row. Its lines go through [`escape_log_tail`] (D6.1b).
 /// ```text
 ///      ╭─[log]
-///      │ … 90 earlier lines (heph log //p:t)
+///      │ … 90 earlier lines
 ///   91 │ line one
 ///   92 │ line two
 ///      ╰────
@@ -54,6 +54,7 @@ fn render_log_box(out: &mut String, f: &TargetFailure, tail: &LogTail, color: bo
         &tail.text,
         tail.start_line,
         f.streamed,
+        f.points_at_log(),
         usize::MAX,
     );
     let note = shown.note.as_deref().map(clean_inline);
@@ -1717,7 +1718,14 @@ mod tests {
             )
             .with_streamed(streamed)
         };
-        let streamed = render_failures_to_string(&[Arc::new(failure(true))], false);
+        // No log `heph log` can open: the pointer names no command.
+        let unreadable = render_failures_to_string(&[Arc::new(failure(true))], false);
+        assert!(
+            unreadable.contains("  (output not shown here: 10 lines)\n"),
+            "{unreadable}"
+        );
+        let streamed =
+            render_failures_to_string(&[Arc::new(failure(true).with_log_readable(true))], false);
         assert!(
             streamed.contains("  (output not shown here: 10 lines · heph log //p:t)\n"),
             "{streamed}"
@@ -1728,7 +1736,7 @@ mod tests {
         let shown = render_failures_to_string(&[Arc::new(failure(false))], false);
         assert!(
             shown.contains(
-                "     ╭─[log]\n     │ … 8 earlier lines (heph log //p:t)\n   9 │ secret\\x1b[?25l\n  10 │ last\n"
+                "     ╭─[log]\n     │ … 8 earlier lines\n   9 │ secret\\x1b[?25l\n  10 │ last\n"
             ),
             "{shown}"
         );
@@ -2112,7 +2120,7 @@ mod tests {
 × target failed: //simple_fail:d1
 ╰─▶ boom
       ╭─[log]
-      │ … 97 earlier lines (heph log //simple_fail:d1)
+      │ … 97 earlier lines
    98 │ line98
    99 │ line99
   100 │ boom

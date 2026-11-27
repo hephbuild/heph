@@ -186,6 +186,37 @@ impl fmt::Display for FailureSlot {
 
 impl std::error::Error for FailureSlot {}
 
+/// A failure after a run whose output reached a terminal, where no
+/// [`FailureSlot`] rides the chain: the cache store, the codegen write-back
+/// (D6.1c). Its own type, not an empty slot: a slot on the chain says
+/// `execute` decided the run failed and kept it (`ErrorDetail::kept`), and
+/// whether a failure is a stop must not depend on a TTY being attached.
+/// Empty `Display`, like the slot.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RunStreamed;
+
+impl RunStreamed {
+    /// `e`, marked as following a run that streamed when `streamed`.
+    pub(crate) fn mark(e: anyhow::Error, streamed: bool) -> anyhow::Error {
+        if streamed { e.context(Self) } else { e }
+    }
+
+    /// Whether `e`'s run streamed: its slot says so, or a [`RunStreamed`]
+    /// marks it.
+    pub(crate) fn on(e: &anyhow::Error) -> bool {
+        hcore::hmemoizer::downcast_chain_ref::<FailureSlot>(e).is_some_and(|s| s.streamed)
+            || hcore::hmemoizer::downcast_chain_ref::<Self>(e).is_some()
+    }
+}
+
+impl fmt::Display for RunStreamed {
+    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Ok(())
+    }
+}
+
+impl std::error::Error for RunStreamed {}
+
 /// The bytes of the log to keep.
 enum LogSource {
     File(PathBuf),
