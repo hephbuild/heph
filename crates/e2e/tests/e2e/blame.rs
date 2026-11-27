@@ -1001,6 +1001,77 @@ async fn three_faults_three_boxes() -> anyhow::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Every failure reported (D1.f, STAGE-16)
+// ---------------------------------------------------------------------------
+
+/// STAGE-16: three of `//f:root`'s four inputs fail to resolve, one deep in
+/// its subtree (`//f:l3`'s `get`) and two at the input (`parse` of `//f:s2`
+/// and `//f:s3`). Each is its own culprit, the root is not one, and the
+/// healthy sibling `//f:s1` still ran.
+#[tokio::test]
+async fn independent_faults_all_reported_siblings_run() -> anyhow::Result<()> {
+    let ws = stage_ws(
+        Faults {
+            fail_get: vec![addr("//f:l3")],
+            ..Default::default()
+        },
+        DriverFaults {
+            parse: vec![addr("//f:s2"), addr("//f:s3")],
+            ..Default::default()
+        },
+        |_| {},
+    )?;
+    let r = run(&ws.engine, "//f:root").await;
+    assert_eq!(
+        r.culprits(),
+        ["//f:l3", "//f:s2", "//f:s3"],
+        "{}",
+        r.describe()
+    );
+    assert_not_blamed(&r, &["//f:root", "//f:l1", "//f:s1"]);
+    let s1_ran = r.ends("//f:s1").iter().any(|k| {
+        matches!(
+            k,
+            BuildEventKind::ResultEnd {
+                error: None,
+                cancelled: false,
+                ..
+            }
+        )
+    });
+    assert!(s1_ran, "the healthy sibling ran: {:?}", r.ends("//f:s1"));
+    Ok(())
+}
+
+/// D1.f: two groups share a nested group whose member is refused (an
+/// entrypoint). The walk of the second group meets the nested group again;
+/// it must report the refusal, not a "circular group dependency" left
+/// behind by the first walk's error.
+#[tokio::test]
+async fn group_error_is_not_a_false_cycle() -> anyhow::Result<()> {
+    let ws = build_ws(&[
+        ("a", &t("x", r#"deps = {"p": "//g:g1", "q": "//g:g2"}"#)),
+        (
+            "g",
+            r#"
+target(name = "g1", driver = "group", deps = [":h"])
+target(name = "g2", driver = "group", deps = [":h"])
+target(name = "h", driver = "group", deps = ["//e:ep"])
+"#,
+        ),
+        (
+            "e",
+            r#"target(name = "ep", driver = "bash", entrypoint = True, run = "true")"#,
+        ),
+    ]);
+    let r = run(&ws.engine, "//a:x").await;
+    let text = r.describe();
+    assert!(!text.contains("circular group dependency"), "{text}");
+    assert!(text.contains("is an entrypoint"), "{text}");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Paths and counts (D1.e, P18, U17)
 // ---------------------------------------------------------------------------
 
