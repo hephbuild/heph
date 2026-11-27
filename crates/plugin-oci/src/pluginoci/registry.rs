@@ -11,6 +11,10 @@
 //! the `docker-credential-*` helpers when it declares none (see [`super::auth`])
 //! — and pushing a manifest list rather than a single image when the layout
 //! holds more than one platform.
+//!
+//! Also the manifest-only operations on an image already in a registry: a
+//! lookup ([`manifest_ref`], for `oci_exists`) and a retag ([`tag`], for
+//! `oci_tag`).
 
 use anyhow::Context as _;
 use oci_client::client::{ClientConfig, ClientProtocol};
@@ -218,6 +222,178 @@ fn pinned_ref(reference: &Reference, digest: &str) -> String {
     )
 }
 
+/// The manifest types every manifest request accepts: an image or a list, OCI or
+/// Docker.
+///
+/// All four, always. A registry answers with the type it stored when the client
+/// accepts it, and converts otherwise: Docker Hub serves a manifest *list* as the
+/// one instance it picks when the list type is missing from `Accept`. A tag copy
+/// that took that instance would retag one platform of a multi-platform image.
+const MANIFEST_TYPES: &[&str] = &[
+    oci_client::manifest::OCI_IMAGE_INDEX_MEDIA_TYPE,
+    oci_client::manifest::IMAGE_MANIFEST_LIST_MEDIA_TYPE,
+    oci_client::manifest::OCI_IMAGE_MEDIA_TYPE,
+    oci_client::manifest::IMAGE_MANIFEST_MEDIA_TYPE,
+];
+
+/// Whether `e` is the registry saying the manifest or the repository is not
+/// there, as opposed to any other failure.
+///
+/// Narrow on purpose. A 401 or 403 is not "missing": many registries answer an
+/// identity that cannot read a repository that way whether it exists or not, and
+/// reading that as absence would let an expired credential report a published
+/// image as missing. Only a 404, or an error envelope whose every code says
+/// "unknown", counts.
+fn is_not_found(e: &oci_client::errors::OciDistributionError) -> bool {
+    use oci_client::errors::{OciDistributionError as E, OciErrorCode as C};
+    match e {
+        E::ServerError { code: 404, .. } | E::ImageManifestNotFoundError(_) => true,
+        E::RegistryError { envelope, .. } => {
+            !envelope.errors.is_empty()
+                && envelope
+                    .errors
+                    .iter()
+                    .all(|e| matches!(e.code, C::ManifestUnknown | C::NameUnknown | C::NotFound))
+        }
+        _ => false,
+    }
+}
+
+/// Authenticate `client` for `op` on `reference`'s repository, up front.
+///
+/// The manifest calls would authenticate on their own, but they swallow a
+/// failed token exchange and go on anonymously, so a rejected credential comes
+/// back as a 401 — or, from a registry that hides private repositories, as a
+/// 404 that [`manifest_ref`] would report as a missing image. Asking first
+/// makes a credential the registry refuses an error that says so.
+async fn authenticate(
+    client: &Client,
+    reference: &Reference,
+    creds: &RegistryCredentials<'_>,
+    op: oci_client::RegistryOperation,
+) -> anyhow::Result<oci_client::secrets::RegistryAuth> {
+    let auth = creds.resolve(reference.resolve_registry()).await?;
+    client
+        .auth(reference, &auth, op)
+        .await
+        .with_context(|| format!("authenticate to {}", reference.resolve_registry()))?;
+    Ok(auth)
+}
+
+/// The pinned reference (`registry/repository@digest`, see [`pinned_ref`]) of
+/// the manifest `reference` names, or `None` when the registry says there is no
+/// such manifest or repository.
+///
+/// A `HEAD` on the manifest: nothing is downloaded when the registry sends the
+/// digest header, which every mainstream one does. Any failure other than "not
+/// found" (see [`is_not_found`]) is an error, never `None`.
+pub(crate) async fn manifest_ref(
+    reference: &str,
+    insecure: bool,
+    creds: &RegistryCredentials<'_>,
+) -> anyhow::Result<Option<String>> {
+    let reference: Reference = reference
+        .parse()
+        .with_context(|| format!("parse image reference {reference:?}"))?;
+    let client = client(insecure);
+    let auth = authenticate(
+        &client,
+        &reference,
+        creds,
+        oci_client::RegistryOperation::Pull,
+    )
+    .await?;
+    match client.fetch_manifest_digest(&reference, &auth).await {
+        Ok(digest) => Ok(Some(pinned_ref(&reference, &digest))),
+        Err(e) if is_not_found(&e) => {
+            tracing::debug!(%reference, error = %e, "the registry has no such manifest");
+            Ok(None)
+        }
+        Err(e) => Err(e).with_context(|| format!("look up the manifest of {reference}")),
+    }
+}
+
+/// The media type to push a manifest's bytes back as.
+///
+/// Its own `mediaType` when it has one, which Docker manifests always do and
+/// OCI ones should. Without it the OCI image spec tells the two shapes apart
+/// by `manifests`, which only an index has.
+fn manifest_media_type(raw: &[u8]) -> anyhow::Result<String> {
+    #[derive(serde::Deserialize)]
+    struct Shape {
+        #[serde(rename = "mediaType")]
+        media_type: Option<String>,
+        manifests: Option<serde::de::IgnoredAny>,
+    }
+    let shape: Shape = serde_json::from_slice(raw).context("parse the manifest")?;
+    Ok(match (shape.media_type, shape.manifests) {
+        (Some(t), _) => t,
+        (None, Some(_)) => oci_client::manifest::OCI_IMAGE_INDEX_MEDIA_TYPE.to_string(),
+        (None, None) => oci_client::manifest::OCI_IMAGE_MEDIA_TYPE.to_string(),
+    })
+}
+
+/// Point each of `tags` in `reference`'s repository at the manifest `reference`
+/// names, and return its pinned reference (see [`pinned_ref`]).
+///
+/// The manifest's own bytes are pushed back under each tag, unchanged, so every
+/// tag resolves to the same digest — a re-serialized manifest would get a new
+/// one. Nothing else moves: the blobs and, for a list, the per-platform
+/// manifests are already in the repository, which is why a tag can only be
+/// added in the repository the image is in.
+pub(crate) async fn tag(
+    reference: &str,
+    tags: &[String],
+    insecure: bool,
+    creds: &RegistryCredentials<'_>,
+) -> anyhow::Result<String> {
+    let reference: Reference = reference
+        .parse()
+        .with_context(|| format!("parse image reference {reference:?}"))?;
+    let client = client(insecure);
+    let auth = authenticate(
+        &client,
+        &reference,
+        creds,
+        oci_client::RegistryOperation::Push,
+    )
+    .await?;
+
+    let (raw, digest) = match client
+        .pull_manifest_raw(&reference, &auth, MANIFEST_TYPES)
+        .await
+    {
+        Ok(found) => found,
+        Err(e) if is_not_found(&e) => anyhow::bail!(
+            "{reference} is not in the registry, so there is nothing to tag: push it first ({e})"
+        ),
+        Err(e) => return Err(e).with_context(|| format!("pull the manifest of {reference}")),
+    };
+    let media_type =
+        manifest_media_type(&raw).with_context(|| format!("read the manifest of {reference}"))?;
+
+    for tag in tags {
+        let dest: Reference = format!(
+            "{}/{}:{tag}",
+            reference.registry().trim_end_matches('/'),
+            reference.repository()
+        )
+        .parse()
+        .with_context(|| format!("build the reference for tag {tag:?}"))?;
+        client
+            .push_manifest_raw(
+                &dest,
+                raw.clone(),
+                media_type
+                    .parse()
+                    .with_context(|| format!("manifest media type {media_type:?}"))?,
+            )
+            .await
+            .with_context(|| format!("point {dest} at {digest}"))?;
+    }
+    Ok(pinned_ref(&reference, &digest))
+}
+
 /// What a pull resolved to, beyond the bytes.
 pub(crate) struct Pulled {
     pub index: OciImageIndex,
@@ -250,14 +426,8 @@ pub(crate) async fn pull_layout(
     let client = client(insecure);
     let auth = creds.resolve(reference.resolve_registry()).await?;
 
-    const ACCEPTED: &[&str] = &[
-        oci_client::manifest::OCI_IMAGE_INDEX_MEDIA_TYPE,
-        oci_client::manifest::IMAGE_MANIFEST_LIST_MEDIA_TYPE,
-        oci_client::manifest::OCI_IMAGE_MEDIA_TYPE,
-        oci_client::manifest::IMAGE_MANIFEST_MEDIA_TYPE,
-    ];
     let (raw, digest) = client
-        .pull_manifest_raw(&reference, &auth, ACCEPTED)
+        .pull_manifest_raw(&reference, &auth, MANIFEST_TYPES)
         .await
         .with_context(|| format!("pull the manifest of {reference}"))?;
 
@@ -302,7 +472,7 @@ pub(crate) async fn pull_layout(
         .parse()
         .context("build a digest reference")?;
         let (raw, _) = client
-            .pull_manifest_raw(&by_digest, &auth, ACCEPTED)
+            .pull_manifest_raw(&by_digest, &auth, MANIFEST_TYPES)
             .await
             .with_context(|| format!("pull the manifest for {}", entry.digest))?;
         let manifest: oci_client::manifest::OciImageManifest =
@@ -411,6 +581,216 @@ async fn pull_one(
         blobs.insert(digest, Blob::File(path));
     }
     Ok(())
+}
+
+/// An in-memory registry speaking enough of the distribution protocol for the
+/// manifest operations: `HEAD`/`GET`/`PUT` on `/v2/<repo>/manifests/<ref>`,
+/// with an optional basic-auth requirement.
+#[cfg(test)]
+pub(crate) mod testreg {
+    use sha2::Digest as _;
+    use std::collections::BTreeMap;
+    use std::io::{BufRead as _, Read as _, Write as _};
+    use std::sync::{Arc, Mutex};
+
+    /// What the presented test credential answers, and the header it becomes.
+    pub(crate) const BOT_ANSWER: &str = r#"{"Username":"bot","Secret":"s3cret-material"}"#;
+    pub(crate) const BOT_BASIC: &str = "Basic Ym90OnMzY3JldC1tYXRlcmlhbA==";
+
+    #[derive(Default)]
+    struct State {
+        /// `(repo, tag or digest)` → `(content type, bytes)`.
+        manifests: BTreeMap<(String, String), (String, Vec<u8>)>,
+        requests: Vec<String>,
+        authorizations: Vec<String>,
+    }
+
+    pub(crate) struct MockRegistry {
+        port: u16,
+        state: Arc<Mutex<State>>,
+    }
+
+    /// A one-config, no-layer OCI image manifest, with its `mediaType`.
+    pub(crate) fn oci_manifest() -> Vec<u8> {
+        serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": oci_client::manifest::OCI_IMAGE_MEDIA_TYPE,
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+                "size": 2,
+            },
+            "layers": [],
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    pub(crate) fn digest_of(bytes: &[u8]) -> String {
+        format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)))
+    }
+
+    fn content_type_of(bytes: &[u8]) -> String {
+        super::manifest_media_type(bytes).expect("a manifest the test wrote")
+    }
+
+    impl MockRegistry {
+        /// `basic`: the `Authorization` every request must carry, or `None`
+        /// for an open registry.
+        pub(crate) fn start(basic: Option<&'static str>) -> Self {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let port = listener.local_addr().expect("addr").port();
+            let state = Arc::new(Mutex::new(State::default()));
+            let shared = Arc::clone(&state);
+            std::thread::spawn(move || {
+                for conn in listener.incoming() {
+                    let Ok(conn) = conn else { return };
+                    let state = Arc::clone(&shared);
+                    std::thread::spawn(move || serve(conn, basic, &state));
+                }
+            });
+            MockRegistry { port, state }
+        }
+
+        pub(crate) fn host(&self) -> String {
+            format!("127.0.0.1:{}", self.port)
+        }
+
+        /// Store `bytes` under `tag` (and its digest) in `repo`; returns the digest.
+        pub(crate) fn put(&self, repo: &str, tag: &str, bytes: &[u8]) -> String {
+            let digest = digest_of(bytes);
+            let entry = (content_type_of(bytes), bytes.to_vec());
+            let mut s = self.state.lock().expect("lock");
+            s.manifests
+                .insert((repo.to_string(), tag.to_string()), entry.clone());
+            s.manifests
+                .insert((repo.to_string(), digest.clone()), entry);
+            digest
+        }
+
+        /// The `(content type, bytes)` stored under `reference` in `repo`.
+        pub(crate) fn get(&self, repo: &str, reference: &str) -> Option<(String, Vec<u8>)> {
+            self.state
+                .lock()
+                .expect("lock")
+                .manifests
+                .get(&(repo.to_string(), reference.to_string()))
+                .cloned()
+        }
+
+        /// `METHOD path` of every request received, in order.
+        pub(crate) fn requests(&self) -> Vec<String> {
+            self.state.lock().expect("lock").requests.clone()
+        }
+
+        /// Every `Authorization` header received.
+        pub(crate) fn authorizations(&self) -> Vec<String> {
+            self.state.lock().expect("lock").authorizations.clone()
+        }
+    }
+
+    fn envelope(code: &str) -> Vec<u8> {
+        serde_json::json!({"errors": [{"code": code, "message": code}]})
+            .to_string()
+            .into_bytes()
+    }
+
+    fn serve(conn: std::net::TcpStream, basic: Option<&str>, state: &Mutex<State>) {
+        let mut out = conn.try_clone().expect("clone stream");
+        let mut rd = std::io::BufReader::new(conn);
+        loop {
+            let mut line = String::new();
+            if rd.read_line(&mut line).unwrap_or(0) == 0 {
+                return;
+            }
+            let mut parts = line.split_whitespace();
+            let method = parts.next().unwrap_or_default().to_string();
+            let path = parts.next().unwrap_or_default().to_string();
+            let (mut len, mut auth, mut ctype) = (0usize, None, String::new());
+            loop {
+                let mut h = String::new();
+                if rd.read_line(&mut h).unwrap_or(0) == 0 {
+                    return;
+                }
+                let h = h.trim_end();
+                if h.is_empty() {
+                    break;
+                }
+                if let Some((k, v)) = h.split_once(':') {
+                    let v = v.trim().to_string();
+                    if k.eq_ignore_ascii_case("content-length") {
+                        len = v.parse().expect("content-length");
+                    } else if k.eq_ignore_ascii_case("authorization") {
+                        auth = Some(v);
+                    } else if k.eq_ignore_ascii_case("content-type") {
+                        ctype = v;
+                    }
+                }
+            }
+            let mut body = vec![0u8; len];
+            rd.read_exact(&mut body).expect("body");
+
+            let mut s = state.lock().expect("lock");
+            s.requests.push(format!("{method} {path}"));
+            if let Some(a) = &auth {
+                s.authorizations.push(a.clone());
+            }
+            let mut headers = Vec::new();
+            let (status, resp): (&str, Vec<u8>) = if basic.is_some() && auth.as_deref() != basic {
+                headers.push("WWW-Authenticate: Basic realm=\"mock\"".to_string());
+                ("401 Unauthorized", envelope("UNAUTHORIZED"))
+            } else if path == "/v2/" {
+                ("200 OK", b"{}".to_vec())
+            } else if let Some((repo, reference)) = path
+                .strip_prefix("/v2/")
+                .and_then(|p| p.split_once("/manifests/"))
+            {
+                let key = (repo.to_string(), reference.to_string());
+                match method.as_str() {
+                    "PUT" => {
+                        let digest = digest_of(&body);
+                        let entry = (ctype.clone(), body.clone());
+                        s.manifests.insert(key, entry.clone());
+                        s.manifests
+                            .insert((repo.to_string(), digest.clone()), entry);
+                        headers.push(format!("Location: /v2/{repo}/manifests/{digest}"));
+                        headers.push(format!("Docker-Content-Digest: {digest}"));
+                        ("201 Created", Vec::new())
+                    }
+                    _ => match s.manifests.get(&key) {
+                        Some((ctype, bytes)) => {
+                            headers.push(format!("Content-Type: {ctype}"));
+                            headers.push(format!("Docker-Content-Digest: {}", digest_of(bytes)));
+                            ("200 OK", bytes.clone())
+                        }
+                        None if s.manifests.keys().any(|(r, _)| r == repo) => {
+                            ("404 Not Found", envelope("MANIFEST_UNKNOWN"))
+                        }
+                        None => ("404 Not Found", envelope("NAME_UNKNOWN")),
+                    },
+                }
+            } else {
+                ("404 Not Found", envelope("NOT_FOUND"))
+            };
+            drop(s);
+            let headers: String = headers.iter().map(|h| format!("{h}\r\n")).collect();
+            let head = format!(
+                "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\n\r\n",
+                resp.len()
+            );
+            // A HEAD answer carries the length of the body it does not send.
+            let sent = out.write_all(head.as_bytes()).and_then(|()| {
+                if method == "HEAD" {
+                    Ok(())
+                } else {
+                    out.write_all(&resp)
+                }
+            });
+            if sent.is_err() {
+                return;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -663,5 +1043,136 @@ mod tests {
                 .collect();
             assert_eq!(methods, ["POST", "PUT"], "no PATCH for an empty blob");
         }
+    }
+
+    /// Only the registry saying "unknown" is missing. Anything an identity
+    /// problem or an outage looks like is an error, so an expired credential
+    /// never reports a published image as absent.
+    #[test]
+    fn only_an_unknown_answer_counts_as_not_found() {
+        use oci_client::errors::{OciDistributionError as E, OciEnvelope, OciError, OciErrorCode};
+        let env = |codes: Vec<OciErrorCode>| E::RegistryError {
+            envelope: OciEnvelope {
+                errors: codes
+                    .into_iter()
+                    .map(|code| OciError {
+                        code,
+                        message: String::new(),
+                        detail: serde_json::Value::Null,
+                    })
+                    .collect(),
+            },
+            url: "u".into(),
+        };
+        let server = |code| E::ServerError {
+            code,
+            url: "u".into(),
+            message: String::new(),
+        };
+        for (e, missing) in [
+            (server(404), true),
+            (env(vec![OciErrorCode::ManifestUnknown]), true),
+            (env(vec![OciErrorCode::NameUnknown]), true),
+            (env(vec![OciErrorCode::NotFound]), true),
+            (E::ImageManifestNotFoundError("x".into()), true),
+            (server(401), false),
+            (server(403), false),
+            (server(500), false),
+            (E::UnauthorizedError { url: "u".into() }, false),
+            (E::AuthenticationFailure("no".into()), false),
+            (env(vec![OciErrorCode::Denied]), false),
+            (env(vec![OciErrorCode::Unauthorized]), false),
+            (env(vec![OciErrorCode::Toomanyrequests]), false),
+            // One unknown beside a denial is still a denial.
+            (
+                env(vec![OciErrorCode::ManifestUnknown, OciErrorCode::Denied]),
+                false,
+            ),
+            (env(vec![]), false),
+            (
+                env(vec![OciErrorCode::Other("MANIFEST_UNKNOWN_ISH".into())]),
+                false,
+            ),
+        ] {
+            assert_eq!(is_not_found(&e), missing, "{e}");
+        }
+    }
+
+    #[test]
+    fn a_manifest_is_pushed_back_as_its_own_media_type() {
+        use oci_client::manifest::{
+            IMAGE_MANIFEST_LIST_MEDIA_TYPE, OCI_IMAGE_INDEX_MEDIA_TYPE, OCI_IMAGE_MEDIA_TYPE,
+        };
+        for (raw, want) in [
+            (
+                format!(r#"{{"mediaType":"{IMAGE_MANIFEST_LIST_MEDIA_TYPE}","manifests":[]}}"#),
+                IMAGE_MANIFEST_LIST_MEDIA_TYPE,
+            ),
+            // No `mediaType`: an index is told apart by its `manifests`.
+            (
+                r#"{"schemaVersion":2,"manifests":[]}"#.to_string(),
+                OCI_IMAGE_INDEX_MEDIA_TYPE,
+            ),
+            (
+                r#"{"schemaVersion":2,"config":{},"layers":[]}"#.to_string(),
+                OCI_IMAGE_MEDIA_TYPE,
+            ),
+        ] {
+            assert_eq!(
+                manifest_media_type(raw.as_bytes()).expect(&raw),
+                want,
+                "{raw}"
+            );
+        }
+        assert!(manifest_media_type(b"not json").is_err());
+        assert!(manifest_media_type(br#"{"mediaType":1}"#).is_err());
+    }
+
+    /// A multi-platform list is retagged whole, as its own type, and a
+    /// reference by digest works as well as one by tag.
+    #[tokio::test]
+    async fn a_list_is_retagged_whole_by_tag_or_digest() {
+        use oci_client::manifest::IMAGE_MANIFEST_LIST_MEDIA_TYPE;
+        let reg = testreg::MockRegistry::start(None);
+        let list = format!(
+            r#"{{"schemaVersion":2,"mediaType":"{IMAGE_MANIFEST_LIST_MEDIA_TYPE}","manifests":[]}}"#
+        )
+        .into_bytes();
+        let digest = reg.put("acme/app", "build-1", &list);
+        for (source, tag) in [
+            (format!("{}/acme/app:build-1", reg.host()), "by-tag"),
+            (format!("{}/acme/app@{digest}", reg.host()), "by-digest"),
+        ] {
+            let pinned = super::tag(
+                &source,
+                &[tag.to_string()],
+                true,
+                &RegistryCredentials::None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{source}: {e:#}"));
+            assert_eq!(pinned, format!("{}/acme/app@{digest}", reg.host()));
+            let (ctype, bytes) = reg.get("acme/app", tag).expect(tag);
+            assert_eq!(ctype, IMAGE_MANIFEST_LIST_MEDIA_TYPE);
+            assert_eq!(bytes, list);
+        }
+    }
+
+    /// A lookup is a `HEAD`: nothing is downloaded when the registry sends the
+    /// digest header.
+    #[tokio::test]
+    async fn a_lookup_downloads_no_manifest() {
+        let reg = testreg::MockRegistry::start(None);
+        let digest = reg.put("acme/app", "1", &testreg::oci_manifest());
+        let source = format!("{}/acme/app:1", reg.host());
+        let found = manifest_ref(&source, true, &RegistryCredentials::None)
+            .await
+            .expect("lookup");
+        assert_eq!(found, Some(format!("{}/acme/app@{digest}", reg.host())));
+        assert!(
+            !reg.requests().iter().any(|r| r.starts_with("GET /v2/acme")),
+            "{:?}",
+            reg.requests()
+        );
     }
 }

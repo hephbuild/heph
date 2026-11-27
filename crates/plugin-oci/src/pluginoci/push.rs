@@ -32,7 +32,7 @@ use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3Default;
 
 use super::auth::RegistryCredentials;
-use super::{archive::Layout, dep_input, dep_single_file, registry};
+use super::{archive::Layout, dep_input, dep_single_file, ref_out_name, registry};
 
 /// The `origin_id` of the single image-archive dep input.
 const IMAGE_ORIGIN: &str = "image";
@@ -92,11 +92,6 @@ struct OciPushDef {
 /// gone, so neither is in the key any more.
 /// v3: the pushed reference is an output, `<name>.ref`.
 const OCI_PUSH_FORMAT_VERSION: u32 = 3;
-
-/// The output file holding the reference a push went to, in the package dir.
-fn ref_out_name(target_name: &str) -> String {
-    format!("{target_name}.ref")
-}
 
 impl Hash for OciPushDef {
     fn hash<H: Hasher>(&self, state: &mut H) {

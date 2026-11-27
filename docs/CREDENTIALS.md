@@ -443,9 +443,9 @@ only once the material has earned the right to outlive the process. An unbounded
 producer credential works for the whole run; what it does not do is leave a
 `0600` secret behind that only `heph auth logout` would collect.
 
-## Registry drivers: `oci.pull` and `oci.push`
+## Registry drivers: `oci.pull`, `oci.push`, `oci.exists` and `oci.tag`
 
-These two speak the registry protocol in-process rather than spawning a tool, so
+These speak the registry protocol in-process rather than spawning a tool, so
 they cannot simply inherit a presented environment. Instead they read the one
 presentation a registry client already understands, the Docker helper:
 
@@ -461,7 +461,20 @@ ghcr = target(
 
 target(name = "base", driver = "oci.pull", ref = "ghcr.io/acme/base@sha256:…", credentials = [ghcr])
 target(name = "push", driver = "oci.push", image = ":img", ref = "ghcr.io/acme/app:1.2", credentials = [ghcr])
+# Fails unless the reference resolves; writes `exists.ref`, pinned by digest.
+target(name = "exists", driver = "oci.exists", ref = "${read://app:push}", credentials = [ghcr])
+# Points more tags, in the same repository, at the image `ref` names.
+target(name = "release", driver = "oci.tag", ref = "${read://app:push}", tags = ["latest"], credentials = [ghcr])
 ```
+
+`oci.exists` and `oci.tag` act on the registry as it is when they run, so
+neither is cached. `oci.exists` counts an image as missing only when the
+registry says it is unknown (a 404, `MANIFEST_UNKNOWN` or `NAME_UNKNOWN`). A
+401, a 403 or a credential the token exchange refuses is an error of its own,
+so an expired credential cannot report a published image as missing. `oci.tag`
+needs push access. It pushes the manifest's own bytes back under each tag, so
+every tag resolves to the digest `ref` did, and a multi-platform list is
+retagged whole.
 
 The driver reads `credHelpers` from the mount's `DOCKER_CONFIG` and calls the
 `docker-credential-heph` shim the same way the docker CLI would. The pinned
@@ -499,7 +512,7 @@ anonymous, and names both attributes.
 The two attributes are exclusive, and setting both is refused at parse. With
 `credentials`, a registry none of them covers is an error that names the
 registry. Two credentials covering one registry are also refused. Falling back
-would let a typo in a declaration run the pull or push as someone else.
+would let a typo in a declaration run the request as someone else.
 
 The registry must be listed in `heph.auth.docker([...])`. Scheme, path and the
 Docker Hub aliases (`docker.io`, `index.docker.io`, `registry-1.docker.io`) are

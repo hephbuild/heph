@@ -1153,6 +1153,10 @@ fn shipped_names_match_the_name_map() {
                 ("oci.load", "oci_load"),
                 ("oci.builder_platform", "oci_builder_platform"),
                 ("oci.runner", "oci_runner"),
+                // Never had a flat name; listed so the shipped cdylib is held
+                // to registering them.
+                ("oci.exists", "oci_exists"),
+                ("oci.tag", "oci_tag"),
             ],
         ),
         ("devenv", "", &[("devenv.runner", "devenv_runner")]),
