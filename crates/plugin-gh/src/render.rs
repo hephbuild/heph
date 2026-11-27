@@ -388,7 +388,7 @@ fn push_live_failures(b: &mut Budgeted, t: &Tally, c: &Counters) {
             .unwrap_or_default();
         let head = format!(
             "### `{}` — failed{}\n\n{}\n",
-            addr_cell(&r.addr),
+            addr_cell(r.culprit()),
             dur,
             one_line(&r.message, MAX_MSG_CHARS)
         );
@@ -774,7 +774,7 @@ fn push_zero_hit_diagnosis(b: &mut Budgeted, t: &Tally, c: &Counters) {
 
 fn push_final_failures(b: &mut Budgeted, t: &Tally, c: &Counters) {
     for r in t.roots() {
-        let mut s = format!("### `{}`\n\n", addr_cell(&r.addr));
+        let mut s = format!("### `{}`\n\n", addr_cell(r.culprit()));
         // A target that failed before it started executing has neither. Omit the
         // line rather than rendering a lone `unknown`.
         let mut meta: Vec<String> = Vec::new();

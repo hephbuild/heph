@@ -111,6 +111,7 @@ pub(crate) fn full_document(
 fn root_json(r: &RootFailure) -> serde_json::Value {
     serde_json::json!({
         "addr": r.addr,
+        "file": r.file,
         "driver": r.driver,
         "duration_ms": r.duration_ms,
         "exit_status": r.exit_status,
@@ -207,7 +208,7 @@ pub(crate) fn annotations(roots: &[RootFailure], limit: usize) -> Vec<String> {
             }
             format!(
                 "::error title=heph {}::{}",
-                escape_annotation(&r.addr),
+                escape_annotation(r.culprit()),
                 escape_annotation(&truncate_chars(&detail, 400))
             )
         })

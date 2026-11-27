@@ -741,7 +741,7 @@ line of a colon-joined chain serves it badly. Three surfaces, in priority order:
                 "bytes_pulled": 1288490188 }
   },
   "failures": [
-    { "addr": "//base:proto", "driver": "exec", "duration_ms": 3000, "exit_code": 1,
+    { "addr": "//base:proto", "file": null, "driver": "exec", "duration_ms": 3000, "exit_code": 1,
       "upstream_of": null, "blocked_count": 4109,
       "message": "process exited with status 1",
       "log_tail": ["proto/api.proto:41:3: \"UserId\" is not defined."] }

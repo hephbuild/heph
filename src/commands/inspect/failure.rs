@@ -29,16 +29,19 @@ pub struct Args {
 /// `None` (`null` in `--json`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, output::Record)]
 pub struct FailureView {
-    /// The target's address.
-    pub addr: String,
+    /// The target's address. Always set today; nullable since contract 2,
+    /// for a failure that is not a target's (a BUILD file's).
+    pub addr: Option<String>,
     /// The failure slot's directory.
     #[serde(serialize_with = "output::ser::path")]
     pub slot: PathBuf,
     /// The input hash of the run that failed. It may no longer be the
-    /// target's: nothing is resolved to compare.
-    pub hashin: String,
-    /// When it failed, in milliseconds since the Unix epoch.
-    pub failed_at: u64,
+    /// target's: nothing is resolved to compare. Always set today; nullable
+    /// since contract 2, for a failure that had no run to hash.
+    pub hashin: Option<String>,
+    /// When it failed, in milliseconds since the Unix epoch. Always set
+    /// today; nullable since contract 2.
+    pub failed_at: Option<u64>,
     /// The failed run's full process log; null when it kept none.
     #[serde(serialize_with = "output::ser::opt_path")]
     pub log: Option<PathBuf>,
@@ -65,9 +68,9 @@ pub fn failure_view(slots: &FailureSlots, addr: &Addr) -> anyhow::Result<Option<
         is(&p).then_some(p)
     };
     Ok(Some(FailureView {
-        addr: manifest.addr,
-        hashin: manifest.hashin,
-        failed_at: manifest.failed_at,
+        addr: Some(manifest.addr),
+        hashin: Some(manifest.hashin),
+        failed_at: Some(manifest.failed_at),
         log: part(LOG, std::path::Path::is_file),
         out: part(OUT, std::path::Path::is_dir),
         fixes: part(FIXES, std::path::Path::is_file),
@@ -288,10 +291,10 @@ mod tests {
         use std::os::unix::ffi::OsStrExt as _;
         let addr = htaddr::parse_addr("//web:lint").expect("addr");
         let view = FailureView {
-            addr: addr.format(),
+            addr: Some(addr.format()),
             slot: PathBuf::from(std::ffi::OsStr::from_bytes(b"/tmp/\xff")),
-            hashin: "h".into(),
-            failed_at: 1,
+            hashin: Some("h".into()),
+            failed_at: Some(1),
             log: None,
             out: None,
             fixes: None,
