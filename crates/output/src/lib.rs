@@ -123,7 +123,9 @@ pub use write::{Flow, ListWriter, Printer, Style};
 /// removed or retyped) is ever broken.
 ///
 /// 2: error reporting retyped `inspect failure`'s `addr`, `hashin` and
-/// `failed_at` to nullable.
+/// `failed_at` to nullable, and reshaped `run`: `blocked_by` and the
+/// `blocked` outcome removed, `skipped` added, `addr` nullable, and `file`,
+/// `root`, `more`, `path` and `selected` added.
 pub const OUTPUT_CONTRACT: u32 = 2;
 
 /// A type a command prints as JSON. Implemented by `#[derive(Record)]`.

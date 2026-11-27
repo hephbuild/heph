@@ -711,6 +711,79 @@ mod tests {
         );
     }
 
+    /// Contract 2 (error reporting, D5): `run` lost `blocked_by` and the
+    /// `"blocked"` outcome, gained `"skipped"`, and the fields a culprit
+    /// carries are nullable where a record may lack them (a BUILD file that
+    /// did not evaluate has no `addr`; a target with no requested root above
+    /// it has no `root`, `more` or `path`). `inspect failure` describes a slot
+    /// that may hold no record of its target. Checked over the committed
+    /// snapshot and over the tables it is generated from, so neither side can
+    /// drift back to contract 1 alone.
+    #[test]
+    fn json_contract_2_snapshot() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(SNAPSHOT);
+        let text = std::fs::read_to_string(&path).expect("read the snapshot");
+        assert_eq!(snapshot_contract(&text), Some(2), "{SNAPSHOT} header");
+        assert_eq!(output::OUTPUT_CONTRACT, 2, "output::OUTPUT_CONTRACT");
+
+        let shipped: BTreeSet<&str> = text
+            .lines()
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .collect();
+        let (current, _) = field_lines();
+        let sources: [(&str, BTreeSet<&str>); 2] = [
+            ("snapshot", shipped),
+            ("field tables", current.iter().map(String::as_str).collect()),
+        ];
+        // `(command, path)` → the kinds it has, from a `command\tpath\tkind\t…` line.
+        let kinds = |lines: &BTreeSet<&str>, cmd: &str, field: &str| -> Vec<String> {
+            lines
+                .iter()
+                .filter_map(|l| {
+                    let mut cols = l.split('\t');
+                    (cols.next() == Some(cmd) && cols.next() == Some(field))
+                        .then(|| cols.next().unwrap_or_default().to_string())
+                })
+                .collect()
+        };
+        for (source, lines) in &sources {
+            let run: Vec<&&str> = lines.iter().filter(|l| l.starts_with("run\t")).collect();
+            assert!(!run.is_empty(), "{source}: no `run` lines");
+            assert!(
+                run.iter().all(|l| !l.contains("blocked_by")),
+                "{source}: `run` still has `blocked_by`"
+            );
+            assert!(
+                run.iter().all(|l| !l.contains("\"blocked\"")),
+                "{source}: `run` still has the `\"blocked\"` outcome"
+            );
+            assert!(
+                kinds(lines, "run", "outcome")
+                    .iter()
+                    .any(|k| k == "\"skipped\""),
+                "{source}: `run outcome \"skipped\"` missing"
+            );
+            for (cmd, field) in [
+                ("run", "addr"),
+                ("run", "file"),
+                ("run", "root"),
+                ("run", "more"),
+                ("run", "path"),
+                ("run", "exit_code"),
+                ("inspect failure", "addr"),
+                ("inspect failure", "hashin"),
+                ("inspect failure", "failed_at"),
+            ] {
+                let ks = kinds(lines, cmd, field);
+                assert!(!ks.is_empty(), "{source}: `{cmd} {field}` missing");
+                assert!(
+                    ks.iter().all(|k| k.ends_with('?')),
+                    "{source}: `{cmd} {field}` is not nullable: {ks:?}"
+                );
+            }
+        }
+    }
+
     /// I4: the default set adds no resolved or built work.
     #[test]
     fn default_fields_are_free() {
