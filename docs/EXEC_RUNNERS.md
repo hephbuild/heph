@@ -622,6 +622,15 @@ environment that applies everywhere else here.
 
 ## Known gaps
 
+- **stdout and stderr interleave in chunks.** A target's stdout and stderr
+  are two pipes, drained by two threads into one `log.txt` (and one live
+  stream). Each stream keeps its own order; their relative order is not kept.
+  Two writes made close together on different streams can land in either
+  order, so a compiler's `error:` line on stderr may follow the summary it
+  printed on stdout, and a bash target's `set -x` trace (stderr) can drift
+  from its commands' stdout. The streams are kept apart on purpose: a driver
+  that needs them apart gets them apart. A target that needs one exact order
+  writes both to one stream (`2>&1`).
 - **FUSE.** Runners are untested under `fuse.enabled`; bind-mounting a FUSE
   mount into a container, in particular, is not something to assume works.
 - **`docker exec` line discipline.** Under `--shell`, and a `--raw` run on a
