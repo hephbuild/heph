@@ -1823,6 +1823,7 @@ mod tests {
                 log_tail: Some(LogTailData {
                     text: "--- FAIL: TestCreateUser (0.03s)\n    want 201, got 500".into(),
                     start_line: 88,
+                    streamed: false,
                 }),
             },
         ));

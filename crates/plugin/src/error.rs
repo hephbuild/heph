@@ -652,6 +652,12 @@ pub struct TargetFailure {
     /// decides between `heph log <addr>` and "none kept". `None` when nobody
     /// asked; a renderer then falls back to whether `log` has a path.
     pub log_readable: Option<bool>,
+    /// The run's output reached a terminal while it ran: heph wrote at least
+    /// one byte of it to a TTY. The log and its tail are kept regardless; a
+    /// renderer leaves the tail out of the box and points at the log instead
+    /// (D6.1). False for a target that printed nothing, and for output that
+    /// went to a file or a pipe.
+    pub streamed: bool,
     pub source: std::sync::Arc<anyhow::Error>,
 }
 
@@ -742,8 +748,15 @@ impl TargetFailure {
             fixes: None,
             sandbox: None,
             log_readable: None,
+            streamed: false,
             source: std::sync::Arc::new(source),
         }
+    }
+
+    /// The same failure, saying whether its output streamed to a terminal.
+    pub fn with_streamed(mut self, streamed: bool) -> Self {
+        self.streamed = streamed;
+        self
     }
 
     /// The same failure, saying whether the engine can open its log.
@@ -915,9 +928,21 @@ const TAIL_CHUNK: u64 = 8 * 1024;
 /// count its lines.
 const COUNT_CHUNK: usize = 64 * 1024;
 
+/// The most bytes of a log's end a tail holds, whatever its line count (D6.1b):
+/// a thousand lines of a minified bundle would otherwise be most of the file,
+/// in memory and on every event that carries the tail.
+pub const TAIL_MAX_BYTES: usize = 256 * 1024;
+
+/// What a tail starts with when [`TAIL_MAX_BYTES`] cut it inside a line.
+pub const TAIL_CUT_MARK: &str = "…";
+
 /// The last `n` lines of a log of `len` bytes, read through `read_at` (a
 /// positional read: `read_at(buf, offset)`), with the same text and start
 /// line [`last_n_lines_with_start`] gives for the whole log, lossily decoded.
+///
+/// At most [`TAIL_MAX_BYTES`] of the log are kept, whichever limit comes
+/// first. A cut inside a line resumes at a char boundary and starts with
+/// [`TAIL_CUT_MARK`]; `start_line` is then the number of the line it cut.
 ///
 /// Seek-based: it reads backwards from the end in [`TAIL_CHUNK`] steps until
 /// it holds `n` line breaks, so only the tail is ever held in memory. The
@@ -962,7 +987,10 @@ pub fn read_tail_at(
 }
 
 /// The backward half of [`read_tail_at`]: the offset the tail starts at (just
-/// past a line break, or 0) and the bytes from there to `len`.
+/// past a line break, or 0) and the bytes from there to `len`, at most
+/// [`TAIL_MAX_BYTES`] of them. A cut inside a line is the exception: the
+/// offset is where the kept part of that line starts, and the bytes start
+/// with [`TAIL_CUT_MARK`].
 pub fn tail_window(
     len: u64,
     read_at: &mut impl FnMut(&mut [u8], u64) -> std::io::Result<usize>,
@@ -987,10 +1015,12 @@ pub fn tail_window(
             .nth(n - 1)
         {
             let tail = window.split_off(i + 1);
-            return Ok((start + i as u64 + 1, tail));
+            return Ok(cap_window(start + i as u64 + 1, tail));
         }
-        if start == 0 {
-            return Ok((0, window));
+        // Past the cap with the byte before the cut in hand, which tells a
+        // cut at a line break from one inside a line.
+        if start == 0 || window.len() > TAIL_MAX_BYTES {
+            return Ok(cap_window(start, window));
         }
         let take = start.min(TAIL_CHUNK);
         let off = start - take;
@@ -1000,6 +1030,35 @@ pub fn tail_window(
         window = chunk;
         start = off;
     }
+}
+
+/// `window`, which starts at `start` in the log, cut to its last
+/// [`TAIL_MAX_BYTES`]. A cut right after a line break keeps whole lines; one
+/// inside a line moves forward to a char boundary and is marked.
+fn cap_window(start: u64, mut window: Vec<u8>) -> (u64, Vec<u8>) {
+    let Some(drop) = window
+        .len()
+        .checked_sub(TAIL_MAX_BYTES)
+        .filter(|&drop| drop > 0)
+    else {
+        return (start, window);
+    };
+    let at_break = window.get(drop - 1) == Some(&b'\n');
+    let mut cut = drop;
+    if !at_break {
+        // A UTF-8 char is at most 4 bytes: at most 3 continuation bytes to skip.
+        while cut < drop + 3 && window.get(cut).is_some_and(|b| b & 0xC0 == 0x80) {
+            cut += 1;
+        }
+    }
+    let kept = window.split_off(cut);
+    if at_break {
+        return (start + cut as u64, kept);
+    }
+    let mut marked = Vec::with_capacity(TAIL_CUT_MARK.len() + kept.len());
+    marked.extend_from_slice(TAIL_CUT_MARK.as_bytes());
+    marked.extend_from_slice(&kept);
+    (start + cut as u64, marked)
 }
 
 fn read_exact_at(
@@ -1099,6 +1158,62 @@ impl FailureLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tail_of_bytes(bytes: &[u8], n: usize) -> LogTail {
+        read_tail_at(
+            bytes.len() as u64,
+            |buf, off| {
+                let src = bytes
+                    .get(usize::try_from(off).unwrap_or(usize::MAX)..)
+                    .unwrap_or_default();
+                let k = src.len().min(buf.len());
+                buf.get_mut(..k)
+                    .unwrap_or_default()
+                    .copy_from_slice(src.get(..k).unwrap_or_default());
+                Ok(k)
+            },
+            n,
+        )
+        .expect("tail")
+    }
+
+    /// 1000 lines of 1 KiB are ~1 MiB: the tail keeps the last 256 KiB. A cut
+    /// inside a line resumes at a char boundary (a 3-byte `€` is never split)
+    /// and is marked, and `start_line` is the number of the line it cut. A cut
+    /// that lands right after a break keeps whole lines and has no mark.
+    #[test]
+    fn tail_byte_cap_256k_with_long_lines() {
+        let line = "€".repeat(340); // 1020 bytes, +1 for the break.
+        let log: String = (0..1000).map(|_| format!("{line}\n")).collect();
+        let tail = tail_of_bytes(log.as_bytes(), 1000);
+        assert!(tail.text.starts_with(TAIL_CUT_MARK), "the cut is marked");
+        // The cap falls 253 bytes into line 744, mid-`€`: two continuation
+        // bytes are skipped (and the text drops the log's final break).
+        assert_eq!(
+            tail.text.len() - TAIL_CUT_MARK.len(),
+            TAIL_MAX_BYTES - 2 - 1
+        );
+        assert_eq!(tail.start_line, 744);
+        assert!(!tail.text.contains('\u{fffd}'), "no char was split");
+        assert!(tail.text.ends_with(&line), "the last line is whole");
+
+        // Lines of exactly 1 KiB: 256 of them are the cap, cut at a break.
+        let line = "x".repeat(1023);
+        let log: String = (0..1000).map(|_| format!("{line}\n")).collect();
+        let tail = tail_of_bytes(log.as_bytes(), 1000);
+        assert!(
+            !tail.text.starts_with(TAIL_CUT_MARK),
+            "whole lines: no mark"
+        );
+        assert_eq!(tail.text.lines().count(), 256);
+        assert_eq!(tail.start_line, 1000 - 256 + 1);
+
+        // One line past the cap and no break at all.
+        let log = "y".repeat(TAIL_MAX_BYTES + 10);
+        let tail = tail_of_bytes(log.as_bytes(), 1000);
+        assert_eq!(tail.text.len(), TAIL_CUT_MARK.len() + TAIL_MAX_BYTES);
+        assert_eq!(tail.start_line, 1);
+    }
 
     /// A captured child's failure lands in the log (appended, both streams),
     /// and the error carries that log and the exit — not the output itself.

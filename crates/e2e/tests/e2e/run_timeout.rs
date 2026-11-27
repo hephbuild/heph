@@ -998,11 +998,9 @@ async fn a_timed_out_result_end_carries_its_log_tail() -> anyhow::Result<()> {
     let tail = tail.expect("a timed-out run's tail");
     let lines: Vec<&str> = tail.text.lines().collect();
     assert_eq!(lines.last(), Some(&"line 30"), "{lines:?}");
-    assert_eq!(
-        lines.len(),
-        Engine::DEFAULT_LOG_TAIL_LINES,
-        "bounded to the request's tail size: {lines:?}"
-    );
+    // 30 lines are under the default tail (1000): the whole log.
+    assert_eq!(lines.first(), Some(&"line 1"), "{lines:?}");
+    assert_eq!(lines.len(), 30, "{lines:?}");
     Ok(())
 }
 
@@ -1043,7 +1041,8 @@ async fn an_abandoned_result_end_carries_its_log_tail() -> anyhow::Result<()> {
     let tail = tail.expect("an abandoned run's tail");
     let lines: Vec<&str> = tail.text.lines().collect();
     assert_eq!(lines.last(), Some(&"line 30"), "{lines:?}");
-    assert_eq!(lines.len(), Engine::DEFAULT_LOG_TAIL_LINES, "{lines:?}");
+    assert_eq!(lines.first(), Some(&"line 1"), "{lines:?}");
+    assert_eq!(lines.len(), 30, "{lines:?}");
     Ok(())
 }
 

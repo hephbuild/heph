@@ -700,7 +700,9 @@ async fn shell_exit_1_writes_nothing() -> anyhow::Result<()> {
         Box::pin(async move {
             let mut typed: &[u8] = b"printf SHELL-EDIT > \"$OUT\"\nexit 1\n";
             let (mut out, mut err) = (tokio::io::sink(), tokio::io::sink());
-            inner(Some(&mut typed), Some(&mut out), Some(&mut err), None).await
+            inner(Some(&mut typed), Some(&mut out), Some(&mut err), None)
+                .await
+                .map(|()| heph::engine::TerminalUse::default())
         })
     });
     let opts = ResultOptions {

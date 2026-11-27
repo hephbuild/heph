@@ -154,6 +154,12 @@ pub struct FailureSlot {
     /// failure after the run, while hashing its artifacts, fills no slot and
     /// carries a default one with only this set.
     pub sandbox: Option<hplugin::error::SandboxFate>,
+    /// The run's output reached a terminal as it ran ([`TerminalUse`]): the
+    /// log is kept all the same, and a renderer leaves its tail out of the
+    /// box. Set by the engine ([`with_streamed`](Self::with_streamed)).
+    ///
+    /// [`TerminalUse`]: crate::engine::TerminalUse
+    pub streamed: bool,
 }
 
 impl FailureSlot {
@@ -161,6 +167,13 @@ impl FailureSlot {
     #[must_use]
     pub fn with_sandbox(mut self, sandbox: Option<hplugin::error::SandboxFate>) -> Self {
         self.sandbox = sandbox;
+        self
+    }
+
+    /// The same slot, saying whether the run's output streamed to a terminal.
+    #[must_use]
+    pub fn with_streamed(mut self, streamed: bool) -> Self {
+        self.streamed = streamed;
         self
     }
 }
@@ -444,6 +457,7 @@ impl FailureSlots {
             out_error: filled.out_error,
             fixes,
             sandbox: None,
+            streamed: false,
         }
     }
 }

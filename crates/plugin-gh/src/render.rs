@@ -1463,6 +1463,7 @@ mod tests {
                     log_tail: Some(hcore::events::LogTailData {
                         text: tail(i),
                         start_line: 1,
+                        streamed: false,
                     }),
                 },
             ));
