@@ -187,9 +187,10 @@ pub(crate) struct SharedState {
     /// symbol's package directory and scan its files for the definition.
     pub root: std::path::PathBuf,
     pub patterns: Vec<glob::Pattern>,
-    /// The `heph.core` builtin functions, for member completion/hover of that
-    /// static namespace (which isn't in the plugin-function registry).
-    pub core_members: Vec<crate::pluginbuildfile::run_file::CoreMember>,
+    /// Every namespace in the globals (`typing`, `heph.core`, …) by dotted
+    /// path, with its members, for member completion/hover. Static: none of
+    /// them is in the plugin-function registry.
+    pub namespaces: HashMap<String, Vec<crate::pluginbuildfile::run_file::NamespaceMember>>,
     /// Renders hover markdown for the `target` / `provider_state` builtins — the
     /// stock server only knows their raw `*args, **kwargs` prototype. Rendered
     /// per hover so the prototype can narrow to the driver/provider the call
@@ -211,14 +212,14 @@ impl SharedState {
         engine: Arc<dyn LspEngine>,
         root: std::path::PathBuf,
         patterns: Vec<glob::Pattern>,
-        core_members: Vec<crate::pluginbuildfile::run_file::CoreMember>,
+        namespaces: HashMap<String, Vec<crate::pluginbuildfile::run_file::NamespaceMember>>,
         builtin_hovers: crate::pluginbuildfile::run_file::BuiltinHovers,
     ) -> Arc<SharedState> {
         Arc::new(SharedState {
             engine,
             root,
             patterns,
-            core_members,
+            namespaces,
             builtin_hovers,
             docs: Mutex::new(HashMap::new()),
             overlays: Mutex::new(HashMap::new()),

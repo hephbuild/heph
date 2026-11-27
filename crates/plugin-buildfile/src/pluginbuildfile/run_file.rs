@@ -13,7 +13,7 @@ use hplugin::function::{FnArgs, FnCallContext, FunctionRegistry, PluginFn};
 use hplugin::provider::{Approval, ProvenanceFrame};
 use hwalk::{CachedWalker, EntryKind};
 use starlark::any::ProvidesStaticType;
-use starlark::environment::{FrozenModule, Globals, GlobalsBuilder, Module};
+use starlark::environment::{FrozenModule, Globals, GlobalsBuilder, LibraryExtension, Module};
 use starlark::eval::{Arguments, Evaluator, FileLoader};
 use starlark::starlark_module;
 use starlark::syntax::{AstModule, Dialect};
@@ -25,64 +25,70 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-/// Build the Starlark globals: the static `starlark_module` builtins, the static
-/// `heph.core` host/platform namespace, plus a dynamic `heph.<provider>.<fn>`
-/// namespace for every function the providers expose. Built once per
-/// buildfile-provider lifetime (the registry is fixed after the engine injects it).
-/// One `heph.core.<fn>` builtin, for LSP member completion/hover: bare name, a
-/// one-line signature for the completion detail, and the full rendered doc.
-pub(crate) struct CoreMember {
+/// One member of a namespace in the globals (`typing.Any`, `heph.core.os`),
+/// for LSP member completion/hover: bare name, a one-line signature for the
+/// completion detail, and the full rendered doc.
+#[derive(Debug)]
+pub(crate) struct NamespaceMember {
     pub name: String,
     pub detail: String,
     pub doc: String,
 }
 
-/// Enumerate the `heph.core` namespace's functions from the globals doc. These
-/// are static `#[starlark_module]` builtins (not provider-registry functions),
-/// so the proxy can't get them from the registry — it reads this list instead.
-pub(crate) fn heph_core_members(globals_doc: &starlark::docs::DocModule) -> Vec<CoreMember> {
+/// Every namespace in the globals doc, keyed by its dotted path (`typing`,
+/// `heph`, `heph.core`), each with its members. A namespace's members are
+/// static (`heph.core`'s are `#[starlark_module]` builtins, not registry
+/// functions), so the LSP reads them here rather than from the registry.
+pub(crate) fn namespace_members(
+    globals_doc: &starlark::docs::DocModule,
+) -> HashMap<String, Vec<NamespaceMember>> {
+    use starlark::docs::DocModule;
     use starlark::docs::markdown::render_doc_item_no_link;
     use starlark::docs::{DocItem, DocMember};
 
-    // Navigate `heph` → `core`; both are namespaces (nested `DocModule`s).
-    let nested = |item: &DocItem, key: &str| -> Option<DocItem> {
-        match item {
-            DocItem::Module(m) => m.members.get(key).cloned(),
-            _ => None,
-        }
-    };
-    let Some(heph) = globals_doc.members.get("heph") else {
-        return vec![];
-    };
-    let core = match nested(heph, "core") {
-        Some(DocItem::Module(m)) => m.members,
-        _ => return vec![],
-    };
-
-    core.iter()
-        .map(|(name, item)| {
-            let detail = match item {
-                DocItem::Member(DocMember::Function(f)) => {
-                    let params = f
-                        .params
-                        .pos_only
-                        .iter()
-                        .chain(f.params.pos_or_named.iter())
-                        .chain(f.params.named_only.iter())
-                        .map(|p| format!("{}: {}", p.name, p.typ))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    format!("{name}({params}) -> {}", f.ret.typ)
+    fn walk(path: String, module: &DocModule, out: &mut HashMap<String, Vec<NamespaceMember>>) {
+        let members = module
+            .members
+            .iter()
+            .map(|(name, item)| {
+                let detail = match item {
+                    DocItem::Member(DocMember::Function(f)) => {
+                        let params = f
+                            .params
+                            .pos_only
+                            .iter()
+                            .chain(f.params.pos_or_named.iter())
+                            .chain(f.params.named_only.iter())
+                            .map(|p| format!("{}: {}", p.name, p.typ))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!("{name}({params}) -> {}", f.ret.typ)
+                    }
+                    DocItem::Module(_) => "namespace".to_string(),
+                    _ => String::new(),
+                };
+                NamespaceMember {
+                    name: name.clone(),
+                    detail,
+                    doc: render_doc_item_no_link(name, item),
                 }
-                _ => String::new(),
-            };
-            CoreMember {
-                name: name.clone(),
-                detail,
-                doc: render_doc_item_no_link(name, item),
+            })
+            .collect();
+        for (name, item) in &module.members {
+            if let DocItem::Module(m) = item {
+                walk(format!("{path}.{name}"), m, out);
             }
-        })
-        .collect()
+        }
+        out.insert(path, members);
+    }
+
+    let mut out = HashMap::new();
+    for (name, item) in &globals_doc.members {
+        if let DocItem::Module(m) = item {
+            walk(name.clone(), m, &mut out);
+        }
+    }
+    out
 }
 
 /// Hover markdown for the `target` and `provider_state` builtins, rendered on
@@ -320,6 +326,18 @@ pub(crate) fn build_globals(
     })
 }
 
+/// The starlark extensions a BUILD file declares its own types with, on top of
+/// the standard globals: `record`/`field`, `enum`, and `typing` (`typing.Any`,
+/// `typing.Callable`, `typing.Iterable`, `typing.Never`, and `eval_type`).
+///
+/// `StructType` is deliberately absent: `struct` is heph's own builtin, which
+/// returns a dict `target()` accepts.
+const USER_TYPE_EXTENSIONS: &[LibraryExtension] = &[
+    LibraryExtension::RecordType,
+    LibraryExtension::EnumType,
+    LibraryExtension::Typing,
+];
+
 /// The globals every BUILD file sees: the static `starlark_module` builtins
 /// (`target`, …), `heph.core` and `heph.types` (with `kwargs`, each driver's
 /// `heph.types.<driver>.Kwargs`), plus whatever `plugins` adds to the `heph`
@@ -330,7 +348,7 @@ pub(crate) fn heph_globals(
     kwargs: &crate::pluginbuildfile::types::DriverKwargs,
     plugins: impl Fn(&mut GlobalsBuilder),
 ) -> Globals {
-    GlobalsBuilder::standard()
+    GlobalsBuilder::extended_by(USER_TYPE_EXTENSIONS)
         .with(starlark_module)
         .with_namespace("heph", |hb| {
             // Static `heph.core` host/platform builtins.
@@ -997,9 +1015,16 @@ pub(crate) fn starlark_to_rust(v: &Value) -> anyhow::Result<htvalue::Value> {
         return Ok(htvalue::Value::Map(map));
     }
 
+    let ty = v.get_type();
+    // A declared type's value is the one a user naturally hands over whole;
+    // say what to pass instead.
+    let hint = match ty {
+        "record" => "; pass its fields (`r.name`), or build a dict from them",
+        "enum" => "; pass its `.value`",
+        _ => "",
+    };
     Err(anyhow::anyhow!(
-        "unsupported starlark value type: {} (expected None/str/bool/int/float/list/dict)",
-        v.get_type()
+        "unsupported starlark value type: {ty} (expected None/str/bool/int/float/list/dict){hint}"
     ))
 }
 
@@ -1178,8 +1203,23 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
                     }
                 }
                 "driver" => {
+                    // `None` leaves the provider's default driver, as a wrapper
+                    // passing `driver = None` through expects. Anything else
+                    // that is not a str is an error: dropping it silently ran
+                    // the default driver in place of, say, `Kind("exec")`.
                     if let Some(s) = value.unpack_str() {
                         driver = s.to_string();
+                    } else if !value.is_none() {
+                        let ty = value.get_type();
+                        let hint = if ty == "enum" {
+                            "; pass its `.value`"
+                        } else {
+                            ""
+                        };
+                        return Err(anyhow::anyhow!(
+                            "target() argument `driver` must be a str, got {ty}{hint}"
+                        )
+                        .into());
                     }
                 }
                 "labels" => {
@@ -1204,7 +1244,9 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
                         approval_from(starlark_to_rust(value)?).with_context(|| "approval")?;
                 }
                 key => {
-                    config.insert(key.to_string(), starlark_to_rust(value)?);
+                    let v = starlark_to_rust(value)
+                        .with_context(|| format!("target() argument `{key}`"))?;
+                    config.insert(key.to_string(), v);
                 }
             }
         }
@@ -1339,7 +1381,9 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
                     }
                 }
                 key => {
-                    kwargs.insert(key.to_string(), starlark_to_rust(value)?);
+                    let v = starlark_to_rust(value)
+                        .with_context(|| format!("provider_state() argument `{key}`"))?;
+                    kwargs.insert(key.to_string(), v);
                 }
             }
         }
@@ -2502,6 +2546,34 @@ pub(crate) mod tests {
         let mut result = empty_run_result().expect("empty result");
         result.targets = targets;
         result
+    }
+
+    /// The LSP's member completion looks namespaces up by these dotted keys.
+    #[test]
+    fn namespace_members_are_keyed_by_dotted_path() {
+        let doc = build_globals(
+            &FunctionRegistry::default(),
+            &crate::pluginbuildfile::types::DriverKwargs::default(),
+        )
+        .documentation();
+        let namespaces = namespace_members(&doc);
+        for key in ["typing", "heph", "heph.core"] {
+            assert!(
+                namespaces.contains_key(key),
+                "{key}: {:?}",
+                namespaces.keys()
+            );
+        }
+        let core: Vec<&str> = namespaces["heph.core"]
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect();
+        assert!(core.contains(&"os"), "{core:?}");
+        let typing: Vec<&str> = namespaces["typing"]
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect();
+        assert!(typing.contains(&"Callable"), "{typing:?}");
     }
 
     #[test]
@@ -5557,5 +5629,134 @@ target(name = "hand", driver = "exec", transitive = {"deps": {"g": [":sib", "//o
         let typo = Value::Map(HashMap::from([("requred".to_string(), Value::Bool(true))]));
         approval_from(typo.clone()).expect_err("unknown key");
         assert!(!ty.matches(&typo));
+    }
+
+    /// The types a BUILD file declares for itself: a `record` (with a `field`
+    /// default), an `enum`, a type alias, and `typing`, each usable as an
+    /// annotation.
+    const USER_TYPES: &str = r#"
+Mode = enum("debug", "release")
+Lib = record(name = str, mode = Mode, srcs = field(list[str], []))
+Names = list[str]
+
+def lib(l: Lib, extra: typing.Any = None) -> Names:
+    target(name = l.name, driver = "d", mode = l.mode.value, srcs = l.srcs)
+    return [l.name]
+"#;
+
+    #[test]
+    fn user_declared_types_evaluate() {
+        let config = run_target_config(&format!(
+            "{USER_TYPES}\nlib(Lib(name = \"a\", mode = Mode(\"release\")))\n"
+        ));
+        assert_eq!(
+            config.get("mode"),
+            Some(&htvalue::Value::String("release".to_string()))
+        );
+        assert_eq!(config.get("srcs"), Some(&htvalue::Value::List(vec![])));
+    }
+
+    /// Evaluation checks a declared type wherever it is used: an annotation, a
+    /// record field, an enum variant. A record or enum value handed to
+    /// `target()` or `provider_state()` whole is refused, naming the argument
+    /// and what to pass instead, so it never reaches a spec or a hash.
+    #[test]
+    fn user_declared_types_checked_at_evaluation() {
+        let rec = "Lib(name = \"a\", mode = Mode(\"debug\"))";
+        for (call, want) in [
+            ("lib(\"a\")".to_string(), &["type annotation `Lib`"][..]),
+            (
+                "lib(Lib(name = 1, mode = Mode(\"debug\")))".to_string(),
+                &["`str`"],
+            ),
+            (
+                "lib(Lib(name = \"a\", mode = Mode(\"fast\")))".to_string(),
+                &["fast"],
+            ),
+            (
+                format!("target(name = \"t\", driver = \"d\", cfg = {rec})"),
+                &["target() argument `cfg`", "type: record", "pass its fields"],
+            ),
+            (
+                "target(name = \"t\", driver = \"d\", cfg = [Mode(\"debug\")])".to_string(),
+                &["target() argument `cfg`", "type: enum", "`.value`"],
+            ),
+            (
+                "target(name = \"t\", driver = Mode(\"debug\"))".to_string(),
+                &["argument `driver` must be a str, got enum", "`.value`"],
+            ),
+            (
+                format!("provider_state(provider = \"p\", x = {rec})"),
+                &["provider_state() argument `x`", "type: record"],
+            ),
+        ] {
+            let err = run_target_config_err(&format!("{USER_TYPES}\n{call}\n"));
+            for w in want {
+                assert!(err.contains(w), "{call}: want {w:?} in {err}");
+            }
+        }
+    }
+
+    /// The names the type extensions add are globals, so a BUILD file that
+    /// already binds one (top level, parameter, local, `load`) keeps its own.
+    #[test]
+    fn user_bindings_shadow_type_globals() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("names.BUILD"), "field = \"from-load\"\n").unwrap();
+        fs::create_dir_all(root.join("p")).unwrap();
+        fs::write(
+            root.join("p/BUILD"),
+            r#"load("//names.BUILD", "field")
+enum = "e"
+typing = {"a": "t"}
+def eval_type(x):
+    return x
+
+def name(record = "r"):
+    struct = "s"
+    return "-".join([record, struct, enum, typing["a"], eval_type(field)])
+
+target(name = name(), driver = None)
+"#,
+        )
+        .unwrap();
+        let provider = make_provider(&dir);
+        let result = run_pkg_blocking(&provider, "p").expect("evaluates");
+        assert_eq!(result.targets[0].name, "r-s-e-t-from-load");
+    }
+
+    /// A type declared in one file is the same type in the file that loads it,
+    /// through a file load and through a directory load (which re-exports each
+    /// file's frozen values, [`merge_pkg_results`]).
+    #[test]
+    fn user_declared_types_cross_loads() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("types.BUILD"), USER_TYPES).unwrap();
+        fs::create_dir_all(root.join("lib")).unwrap();
+        fs::write(root.join("lib/BUILD"), USER_TYPES).unwrap();
+        let write_pkg = |pkg: &str, load: &str, call: &str| {
+            fs::create_dir_all(root.join(pkg)).unwrap();
+            let src = format!(
+                "load(\"{load}\", \"Lib\", \"Mode\", \"lib\")\n\n\
+                 def wrap(l: Lib) -> None:\n    lib(l)\n\n{call}\n"
+            );
+            fs::write(root.join(pkg).join("BUILD"), src).unwrap();
+        };
+        let provider = make_provider(&dir);
+        for (pkg, load) in [("fromfile", "//types.BUILD"), ("fromdir", "//lib")] {
+            write_pkg(pkg, load, "wrap(Lib(name = \"a\", mode = Mode(\"debug\")))");
+            let result = run_pkg_blocking(&provider, pkg).expect(load);
+            assert_eq!(result.targets.len(), 1, "{load}");
+
+            let bad = format!("{pkg}_bad");
+            write_pkg(&bad, load, "wrap(\"a\")");
+            let err = run_pkg_blocking(&provider, &bad).expect_err(load);
+            assert!(
+                format!("{err:#}").contains("type annotation `Lib`"),
+                "{load}: {err:#}"
+            );
+        }
     }
 }

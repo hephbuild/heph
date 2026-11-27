@@ -618,7 +618,12 @@ impl Server<'_> {
         );
         let resolution = if doc.outside_root {
             Resolution::none(site::Reason::OutsideRoot)
-        } else if !ready && !matches!(resolution.site, Site::None | Site::ArgKey { .. }) {
+        } else if !ready
+            && !matches!(
+                resolution.site,
+                Site::None | Site::ArgKey { .. } | Site::Member { .. }
+            )
+        {
             Resolution::none(site::Reason::ProvidersLoading)
         } else {
             resolution
@@ -723,14 +728,24 @@ impl Server<'_> {
                     None => stock,
                 }
             }
-            Merge::Replace => match self.registry() {
-                Some(registry) => self
-                    .with_ctx(&located.key, &registry, |ctx| {
-                        handlers::items(&located.resolution.site, ctx)
+            Merge::Replace => {
+                let site = &located.resolution.site;
+                let registry = match self.registry() {
+                    Some(registry) => Some(registry),
+                    // A namespace's members are the globals', not the
+                    // registry's. Any other site answers nothing until the
+                    // registry lands, whatever `locate` let through.
+                    None if matches!(site, Site::Member { .. }) => {
+                        Some(Arc::new(Registry::default()))
+                    }
+                    None => None,
+                };
+                registry
+                    .and_then(|registry| {
+                        self.with_ctx(&located.key, &registry, |ctx| handlers::items(site, ctx))
                     })
-                    .unwrap_or_default(),
-                None => Vec::new(),
-            },
+                    .unwrap_or_default()
+            }
         };
         self.log("completion", &located, items.len(), started);
         serde_json::to_value(items).unwrap_or_else(|_| serde_json::json!([]))
@@ -779,6 +794,23 @@ impl Server<'_> {
         let hover = match site {
             Site::None | Site::ArgKey { .. } | Site::FieldValue { .. } => {
                 self.stock_hover(params, &located, reg)
+            }
+            // A global namespace's member is heph's to answer, a member it
+            // does not have included; any other receiver's member is whatever
+            // the stock analysis knows.
+            Site::Member { path, .. } => {
+                // `Some(answer)` for a known namespace, `answer` possibly
+                // empty; `None` hands the member to the stock analysis.
+                let heph = self
+                    .with_ctx(&located.key, reg, |ctx| {
+                        handlers::is_namespace(path.as_deref(), ctx)
+                            .then(|| handlers::hover(site, ctx))
+                    })
+                    .flatten();
+                match heph {
+                    Some(answer) => answer,
+                    None => self.stock_hover(params, &located, reg),
+                }
             }
             _ => self
                 .with_ctx(&located.key, reg, |ctx| {

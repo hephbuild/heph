@@ -60,6 +60,7 @@ evaluated again and its diagnostics are republished, with no edit needed.
 | `arg_key` | a keyword-name position inside a call to any other plain-named function (`my_rule(`, `glob(`; not `x.f(`, not a `def`'s parameters) | the callee's unwritten parameters, each inserting `name = `, ranked first; then stock (see below) | stock | stock |
 | `plugin_namespace` | after `heph.` | plugins, `core` and `types` | — | — |
 | `plugin_member` | after `heph.<plugin>.`, or on the function name | the plugin's functions; under `heph.types.`, every type alias, then the driver namespaces; under `heph.types.<driver…>.`, `Kwargs` where the path names a driver, then the namespaces under it | the function's signature and doc; for an alias, its expansion; for `Kwargs`, its keys and their types, each key the driver requires marked `(required by the driver)` | — |
+| `member` | any other position after a `.` (`typing.│`, `l.na│`, `f().│`), whitespace and newlines between the tokens included | where the receiver is a chain of names whose root is a global the file does not bind (`typing`, `heph.core`), that namespace's members; otherwise nothing | a namespace's member: its doc, or nothing for a name it does not have; any other receiver: stock | stock |
 | `address` | a string starting `//` or `:`, inside a call or not | packages, then targets, both forms | — | the call that declared the target (see below), or the package's BUILD file |
 | `load_path` | the first argument of `load(` | package paths | — | the loaded file |
 | `load_symbol` | a later string argument of `load(` | the loaded file's exported `def`s | — | the `def` line, from the loaded file's AST |
@@ -84,6 +85,39 @@ Wherever heph controls or knows the answer for sure, heph is authoritative and
 covers keyword names, driver and provider names, plugin namespaces and members,
 addresses, and load paths and symbols. The stock answer **passes through**
 only where heph cannot know: free expressions, locals, other value positions.
+
+A `member` completion always replaces, even where heph knows nothing of the
+receiver: the stock analysis never completes attributes. After a `.` it would
+offer the global list, which is never valid there, so an empty list is the
+correct answer. A namespace's members come from the globals' documentation,
+the same globals evaluation uses, so they need no registry and answer before
+it lands. Whether a root is the global is read from the overlay: a file that
+binds `typing` itself (an assignment, a parameter, a `load`) gets no member
+list for it. That holds for `heph` too: a file that binds `heph` gets an
+empty `member` site after `heph.`, not `plugin_namespace`.
+
+A member position is any position whose previous significant token is a `.`:
+a `.` only ever means attribute access (a float is one number token), so
+`typing. A│`, `typing.\n    A│` and `typing\n  .│` all have the receiver
+`typing`, and the chain walks left over name-dot pairs whatever lies between
+them (`a.\n typing.│` is `a.typing`). The receiver has one of three shapes,
+which `--explain` reports as `receiver`:
+
+- `names`: a chain of names whose root the file does not bind. `path` is the
+  chain. A path that names no namespace (`typing.Any.│`, a function's member)
+  completes nothing, and `path` shows which.
+- `rebound`: a chain of names whose root the file binds; `rebound` names it.
+- `expression`: a call, an index, a literal (`f().│`, `l[0].│`, `"s".│`).
+
+A name bound by the file (`l = record(…)`, then `l.│`) completes nothing even
+where its value has fields: values have no static types here, so a declared
+`record`'s fields are not offered. That is a known gap.
+
+A type position (`def f(x: │`) completes as an expression does. The stock
+analysis offered only `str`, `int`, `bool`, `None` and `float` there, and a
+Starlark type is any expression: `list[str]`, `typing.Any`, a declared
+`record`. This is a divergence of the vendored crate, recorded in its
+`NOTICE`.
 
 `field_value` merges **by field**: the field's type decides, not the site. The
 field's string literals (`ParamType::Literal`, alone or in a union) matching the prefix **replace** the stock items (which
@@ -169,6 +203,9 @@ reason, degradations, item count and time:
   `call_extent_guessed` (with the line the extent stopped at),
   `edit_to_word_end`, `ast_stale` (with the versions behind), `ast_absent`,
   `lex_error_before` (with its span).
+- A `member` site carries `path` (the receiver's chain of names, or `null`)
+  and `receiver` (`names`, `rebound` with the bound name in `rebound`, or
+  `expression`), which together say why its list is empty.
 
 To see it for one position without an editor:
 
