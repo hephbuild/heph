@@ -116,11 +116,13 @@ pub(crate) async fn push_layout(
         .parse()
         .with_context(|| format!("parse image reference {reference:?}"))?;
     let client = client(insecure);
-    let auth = creds.resolve(reference.resolve_registry()).await?;
-    client
-        .auth(&reference, &auth, oci_client::RegistryOperation::Push)
-        .await
-        .with_context(|| format!("authenticate to {}", reference.resolve_registry()))?;
+    let auth = authenticate(
+        &client,
+        &reference,
+        creds,
+        &[oci_client::RegistryOperation::Push],
+    )
+    .await?;
 
     let manifests = layout.manifests()?;
     anyhow::ensure!(
@@ -242,56 +244,77 @@ const MANIFEST_TYPES: &[&str] = &[
 /// Narrow on purpose. A 401 or 403 is not "missing": many registries answer an
 /// identity that cannot read a repository that way whether it exists or not, and
 /// reading that as absence would let an expired credential report a published
-/// image as missing. Only a 404, or an error envelope whose every code says
-/// "unknown", counts.
+/// image as missing.
+///
+/// Two shapes count. A bare 404 (`ServerError`, a body that is no error
+/// envelope). And an error envelope whose every code says "unknown": the client
+/// turns any failed response with an envelope into `RegistryError`, which does
+/// not carry the HTTP status, so an envelope is classified by its codes alone.
 fn is_not_found(e: &oci_client::errors::OciDistributionError) -> bool {
     use oci_client::errors::{OciDistributionError as E, OciErrorCode as C};
     match e {
-        E::ServerError { code: 404, .. } | E::ImageManifestNotFoundError(_) => true,
+        E::ServerError { code: 404, .. } => true,
         E::RegistryError { envelope, .. } => {
             !envelope.errors.is_empty()
-                && envelope
-                    .errors
-                    .iter()
-                    .all(|e| matches!(e.code, C::ManifestUnknown | C::NameUnknown | C::NotFound))
+                && envelope.errors.iter().all(|err| {
+                    matches!(err.code, C::ManifestUnknown | C::NameUnknown | C::NotFound)
+                })
         }
         _ => false,
     }
 }
 
-/// Authenticate `client` for `op` on `reference`'s repository, up front.
+/// Authenticate `client` for each of `ops` on `reference`'s repository, up
+/// front, and return the credential resolved for its registry.
 ///
 /// The manifest calls would authenticate on their own, but they swallow a
 /// failed token exchange and go on anonymously, so a rejected credential comes
 /// back as a 401 — or, from a registry that hides private repositories, as a
-/// 404 that [`manifest_ref`] would report as a missing image. Asking first
-/// makes a credential the registry refuses an error that says so.
+/// 404 that [`manifest_ref`] would report as a missing image. Exchanging first
+/// makes a token request the registry refuses an error that says so. A
+/// registry that challenges with Basic has no exchange to make: it checks the
+/// credential on the request itself, which then fails with a 401.
+///
+/// Every op a caller makes a request for is named: the client caches a token
+/// per operation, and one it was not handed here is fetched lazily, with the
+/// failure swallowed.
 async fn authenticate(
     client: &Client,
     reference: &Reference,
     creds: &RegistryCredentials<'_>,
-    op: oci_client::RegistryOperation,
+    ops: &[oci_client::RegistryOperation],
 ) -> anyhow::Result<oci_client::secrets::RegistryAuth> {
     let auth = creds.resolve(reference.resolve_registry()).await?;
-    client
-        .auth(reference, &auth, op)
-        .await
-        .with_context(|| format!("authenticate to {}", reference.resolve_registry()))?;
+    for &op in ops {
+        client
+            .auth(reference, &auth, op)
+            .await
+            .with_context(|| format!("authenticate to {}", reference.resolve_registry()))?;
+    }
     Ok(auth)
 }
 
-/// The pinned reference (`registry/repository@digest`, see [`pinned_ref`]) of
-/// the manifest `reference` names, or `None` when the registry says there is no
-/// such manifest or repository.
+/// What a lookup found.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Lookup {
+    /// The pinned reference (`registry/repository@digest`, see [`pinned_ref`])
+    /// of the manifest.
+    Found(String),
+    /// The registry says there is no such manifest or repository; holds what
+    /// it answered, for the error the caller writes.
+    Missing(String),
+}
+
+/// Look up the manifest `reference` names.
 ///
 /// A `HEAD` on the manifest: nothing is downloaded when the registry sends the
 /// digest header, which every mainstream one does. Any failure other than "not
-/// found" (see [`is_not_found`]) is an error, never `None`.
+/// found" (see [`is_not_found`]) is an error, never [`Lookup::Missing`].
 pub(crate) async fn manifest_ref(
     reference: &str,
     insecure: bool,
     creds: &RegistryCredentials<'_>,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<Lookup> {
     let reference: Reference = reference
         .parse()
         .with_context(|| format!("parse image reference {reference:?}"))?;
@@ -300,14 +323,14 @@ pub(crate) async fn manifest_ref(
         &client,
         &reference,
         creds,
-        oci_client::RegistryOperation::Pull,
+        &[oci_client::RegistryOperation::Pull],
     )
     .await?;
     match client.fetch_manifest_digest(&reference, &auth).await {
-        Ok(digest) => Ok(Some(pinned_ref(&reference, &digest))),
+        Ok(digest) => Ok(Lookup::Found(pinned_ref(&reference, &digest))),
         Err(e) if is_not_found(&e) => {
             tracing::debug!(%reference, error = %e, "the registry has no such manifest");
-            Ok(None)
+            Ok(Lookup::Missing(e.to_string()))
         }
         Err(e) => Err(e).with_context(|| format!("look up the manifest of {reference}")),
     }
@@ -341,6 +364,11 @@ fn manifest_media_type(raw: &[u8]) -> anyhow::Result<String> {
 /// one. Nothing else moves: the blobs and, for a list, the per-platform
 /// manifests are already in the repository, which is why a tag can only be
 /// added in the repository the image is in.
+///
+/// A tag that already exists is moved, silently. The tags move one `PUT` at a
+/// time, so a failure partway leaves the earlier ones moved: the error names
+/// them, and a re-run moves the rest (pointing a tag where it already points
+/// is a no-op).
 pub(crate) async fn tag(
     reference: &str,
     tags: &[String],
@@ -351,11 +379,16 @@ pub(crate) async fn tag(
         .parse()
         .with_context(|| format!("parse image reference {reference:?}"))?;
     let client = client(insecure);
+    // Pull for the manifest fetch, push for the tags: both up front, or the
+    // fetch's token is exchanged lazily and a refusal is swallowed.
     let auth = authenticate(
         &client,
         &reference,
         creds,
-        oci_client::RegistryOperation::Push,
+        &[
+            oci_client::RegistryOperation::Pull,
+            oci_client::RegistryOperation::Push,
+        ],
     )
     .await?;
 
@@ -371,25 +404,27 @@ pub(crate) async fn tag(
     };
     let media_type =
         manifest_media_type(&raw).with_context(|| format!("read the manifest of {reference}"))?;
-
-    for tag in tags {
-        let dest: Reference = format!(
-            "{}/{}:{tag}",
-            reference.registry().trim_end_matches('/'),
-            reference.repository()
-        )
+    let content_type = media_type
         .parse()
-        .with_context(|| format!("build the reference for tag {tag:?}"))?;
+        .with_context(|| format!("manifest media type {media_type:?}"))?;
+
+    let mut moved: Vec<&str> = Vec::with_capacity(tags.len());
+    for tag in tags {
+        let dest: Reference = format!("{}/{}:{tag}", reference.registry(), reference.repository())
+            .parse()
+            .with_context(|| format!("build the reference for tag {tag:?}"))?;
         client
-            .push_manifest_raw(
-                &dest,
-                raw.clone(),
-                media_type
-                    .parse()
-                    .with_context(|| format!("manifest media type {media_type:?}"))?,
-            )
+            .push_manifest_raw(&dest, raw.clone(), Clone::clone(&content_type))
             .await
-            .with_context(|| format!("point {dest} at {digest}"))?;
+            .with_context(|| {
+                let moved = if moved.is_empty() {
+                    "none".to_string()
+                } else {
+                    moved.join(", ")
+                };
+                format!("point {dest} at {digest}; already moved: {moved} (a re-run is idempotent)")
+            })?;
+        moved.push(tag);
     }
     Ok(pinned_ref(&reference, &digest))
 }
@@ -585,24 +620,55 @@ async fn pull_one(
 
 /// An in-memory registry speaking enough of the distribution protocol for the
 /// manifest operations: `HEAD`/`GET`/`PUT` on `/v2/<repo>/manifests/<ref>`,
-/// with an optional basic-auth requirement.
+/// open, behind Basic auth, or behind a Bearer token exchange.
 #[cfg(test)]
 pub(crate) mod testreg {
     use sha2::Digest as _;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::io::{BufRead as _, Read as _, Write as _};
     use std::sync::{Arc, Mutex};
 
     /// What the presented test credential answers, and the header it becomes.
     pub(crate) const BOT_ANSWER: &str = r#"{"Username":"bot","Secret":"s3cret-material"}"#;
     pub(crate) const BOT_BASIC: &str = "Basic Ym90OnMzY3JldC1tYXRlcmlhbA==";
+    /// The same identity with the wrong secret: what an expired or rotated
+    /// password looks like.
+    pub(crate) const BOT_WRONG_ANSWER: &str = r#"{"Username":"bot","Secret":"stale"}"#;
+    /// The token a bearer-mode registry's `/token` grants.
+    pub(crate) const BEARER_TOKEN: &str = "mock-token";
+
+    /// How the registry authenticates a request.
+    #[derive(Clone, Copy)]
+    enum Auth {
+        Open,
+        /// Every request carries this `Authorization`, or gets a 401 with a
+        /// Basic challenge.
+        Basic(&'static str),
+        /// The token flow: `/v2/` challenges with `Bearer realm=…/token`,
+        /// `/token` grants [`BEARER_TOKEN`] to a request carrying this Basic
+        /// `Authorization` (and a 401 to anything else), and a manifest request
+        /// needs `Bearer <token>`. A manifest read without it is a 404, as a
+        /// registry that hides private repositories answers.
+        Bearer(&'static str),
+    }
+
+    /// One request received.
+    #[derive(Clone, Debug)]
+    pub(crate) struct Request {
+        /// `METHOD path`, the query included.
+        pub line: String,
+        pub authorization: Option<String>,
+    }
 
     #[derive(Default)]
     struct State {
         /// `(repo, tag or digest)` → `(content type, bytes)`.
         manifests: BTreeMap<(String, String), (String, Vec<u8>)>,
-        requests: Vec<String>,
-        authorizations: Vec<String>,
+        /// `(repo, tag)` a `PUT` is refused on, as an immutable tag is.
+        immutable: BTreeSet<(String, String)>,
+        requests: Vec<Request>,
+        /// The `scope` of every `/token` request, decoded.
+        scopes: Vec<String>,
     }
 
     pub(crate) struct MockRegistry {
@@ -638,6 +704,16 @@ pub(crate) mod testreg {
         /// `basic`: the `Authorization` every request must carry, or `None`
         /// for an open registry.
         pub(crate) fn start(basic: Option<&'static str>) -> Self {
+            Self::start_with(basic.map_or(Auth::Open, Auth::Basic))
+        }
+
+        /// A registry behind the token flow (see [`Auth::Bearer`]): `/token`
+        /// grants a token only to a request carrying `basic`.
+        pub(crate) fn start_bearer(basic: &'static str) -> Self {
+            Self::start_with(Auth::Bearer(basic))
+        }
+
+        fn start_with(auth: Auth) -> Self {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
             let port = listener.local_addr().expect("addr").port();
             let state = Arc::new(Mutex::new(State::default()));
@@ -646,10 +722,20 @@ pub(crate) mod testreg {
                 for conn in listener.incoming() {
                     let Ok(conn) = conn else { return };
                     let state = Arc::clone(&shared);
-                    std::thread::spawn(move || serve(conn, basic, &state));
+                    std::thread::spawn(move || serve(conn, auth, port, &state));
                 }
             });
             MockRegistry { port, state }
+        }
+
+        /// Refuse every `PUT` on `tag` in `repo`, as a registry refuses to move
+        /// an immutable tag.
+        pub(crate) fn make_immutable(&self, repo: &str, tag: &str) {
+            self.state
+                .lock()
+                .expect("lock")
+                .immutable
+                .insert((repo.to_string(), tag.to_string()));
         }
 
         pub(crate) fn host(&self) -> String {
@@ -678,14 +764,27 @@ pub(crate) mod testreg {
                 .cloned()
         }
 
+        /// Every request received, in order.
+        pub(crate) fn log(&self) -> Vec<Request> {
+            self.state.lock().expect("lock").requests.clone()
+        }
+
         /// `METHOD path` of every request received, in order.
         pub(crate) fn requests(&self) -> Vec<String> {
-            self.state.lock().expect("lock").requests.clone()
+            self.log().into_iter().map(|r| r.line).collect()
         }
 
         /// Every `Authorization` header received.
         pub(crate) fn authorizations(&self) -> Vec<String> {
-            self.state.lock().expect("lock").authorizations.clone()
+            self.log()
+                .into_iter()
+                .filter_map(|r| r.authorization)
+                .collect()
+        }
+
+        /// The `scope` of every `/token` request, in order.
+        pub(crate) fn scopes(&self) -> Vec<String> {
+            self.state.lock().expect("lock").scopes.clone()
         }
     }
 
@@ -695,7 +794,34 @@ pub(crate) mod testreg {
             .into_bytes()
     }
 
-    fn serve(conn: std::net::TcpStream, basic: Option<&str>, state: &Mutex<State>) {
+    /// `application/x-www-form-urlencoded` decoding, enough for a scope.
+    fn form_decode(s: &str) -> String {
+        let mut out = Vec::with_capacity(s.len());
+        let mut bytes = s.bytes();
+        while let Some(b) = bytes.next() {
+            match b {
+                b'+' => out.push(b' '),
+                b'%' => {
+                    let hex: Vec<u8> = bytes.by_ref().take(2).collect();
+                    let hex = std::str::from_utf8(&hex).expect("ascii escape");
+                    out.push(u8::from_str_radix(hex, 16).expect("hex escape"));
+                }
+                b => out.push(b),
+            }
+        }
+        String::from_utf8(out).expect("utf-8 query")
+    }
+
+    /// The value of `key` in `query`, decoded.
+    fn query_param(query: &str, key: &str) -> Option<String> {
+        query
+            .split('&')
+            .filter_map(|kv| kv.split_once('='))
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| form_decode(v))
+    }
+
+    fn serve(conn: std::net::TcpStream, auth_mode: Auth, port: u16, state: &Mutex<State>) {
         let mut out = conn.try_clone().expect("clone stream");
         let mut rd = std::io::BufReader::new(conn);
         loop {
@@ -731,14 +857,44 @@ pub(crate) mod testreg {
             rd.read_exact(&mut body).expect("body");
 
             let mut s = state.lock().expect("lock");
-            s.requests.push(format!("{method} {path}"));
-            if let Some(a) = &auth {
-                s.authorizations.push(a.clone());
-            }
+            s.requests.push(Request {
+                line: format!("{method} {path}"),
+                authorization: auth.clone(),
+            });
             let mut headers = Vec::new();
-            let (status, resp): (&str, Vec<u8>) = if basic.is_some() && auth.as_deref() != basic {
+            let is_manifest = path.starts_with("/v2/") && path.contains("/manifests/");
+            let has_token = auth
+                .as_deref()
+                .and_then(|a| a.strip_prefix("Bearer "))
+                .is_some_and(|t| t == BEARER_TOKEN);
+            let (status, resp): (&str, Vec<u8>) = if let Auth::Basic(basic) = auth_mode
+                && auth.as_deref() != Some(basic)
+            {
                 headers.push("WWW-Authenticate: Basic realm=\"mock\"".to_string());
                 ("401 Unauthorized", envelope("UNAUTHORIZED"))
+            } else if let Auth::Bearer(basic) = auth_mode
+                && let Some(query) = path.strip_prefix("/token?")
+            {
+                if let Some(scope) = query_param(query, "scope") {
+                    s.scopes.push(scope);
+                }
+                if auth.as_deref() == Some(basic) {
+                    let token = serde_json::json!({ "token": BEARER_TOKEN });
+                    ("200 OK", token.to_string().into_bytes())
+                } else {
+                    ("401 Unauthorized", envelope("UNAUTHORIZED"))
+                }
+            } else if let Auth::Bearer(_) = auth_mode
+                && !has_token
+            {
+                if is_manifest && (method == "HEAD" || method == "GET") {
+                    ("404 Not Found", envelope("NAME_UNKNOWN"))
+                } else {
+                    headers.push(format!(
+                        "WWW-Authenticate: Bearer realm=\"http://127.0.0.1:{port}/token\",service=\"mock\""
+                    ));
+                    ("401 Unauthorized", envelope("UNAUTHORIZED"))
+                }
             } else if path == "/v2/" {
                 ("200 OK", b"{}".to_vec())
             } else if let Some((repo, reference)) = path
@@ -747,6 +903,9 @@ pub(crate) mod testreg {
             {
                 let key = (repo.to_string(), reference.to_string());
                 match method.as_str() {
+                    "PUT" if s.immutable.contains(&key) => {
+                        ("400 Bad Request", envelope("TAG_INVALID"))
+                    }
                     "PUT" => {
                         let digest = digest_of(&body);
                         let entry = (ctype.clone(), body.clone());
@@ -1074,7 +1233,6 @@ mod tests {
             (env(vec![OciErrorCode::ManifestUnknown]), true),
             (env(vec![OciErrorCode::NameUnknown]), true),
             (env(vec![OciErrorCode::NotFound]), true),
-            (E::ImageManifestNotFoundError("x".into()), true),
             (server(401), false),
             (server(403), false),
             (server(500), false),
@@ -1168,7 +1326,10 @@ mod tests {
         let found = manifest_ref(&source, true, &RegistryCredentials::None)
             .await
             .expect("lookup");
-        assert_eq!(found, Some(format!("{}/acme/app@{digest}", reg.host())));
+        assert_eq!(
+            found,
+            Lookup::Found(format!("{}/acme/app@{digest}", reg.host()))
+        );
         assert!(
             !reg.requests().iter().any(|r| r.starts_with("GET /v2/acme")),
             "{:?}",

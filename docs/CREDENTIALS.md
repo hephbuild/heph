@@ -468,13 +468,27 @@ target(name = "release", driver = "oci.tag", ref = "${read://app:push}", tags = 
 ```
 
 `oci.exists` and `oci.tag` act on the registry as it is when they run, so
-neither is cached. `oci.exists` counts an image as missing only when the
-registry says it is unknown (a 404, `MANIFEST_UNKNOWN` or `NAME_UNKNOWN`). A
-401, a 403 or a credential the token exchange refuses is an error of its own,
-so an expired credential cannot report a published image as missing. `oci.tag`
-needs push access. It pushes the manifest's own bytes back under each tag, so
-every tag resolves to the digest `ref` did, and a multi-platform list is
-retagged whole.
+neither is cached: both run every time they are requested, and `oci.exists` is
+a check, not a cache gate. Each writes `<name>.ref` as the pinned
+`registry/repository@digest`, where `oci.push` writes the `registry/repository:tag`
+it pushed to.
+
+`oci.exists` counts an image as missing only when the registry says it is
+unknown (a 404, `MANIFEST_UNKNOWN` or `NAME_UNKNOWN`), and its error quotes the
+registry's answer. A 401 or a 403 is an error of its own. The token exchange
+runs before any manifest request, so a credential the registry's token endpoint
+refuses is an error that names the registry, not an anonymous request that
+comes back as "missing". A registry that challenges with Basic has no exchange:
+it checks the credential on the manifest request, which then fails with a 401,
+also an error. One case no client can tell apart: a registry that hides private
+repositories behind a 404 answers an identity that may not read the image
+exactly as it answers for an image that is not there.
+
+`oci.tag` needs push access. It pushes the manifest's own bytes back under each
+tag, so every tag resolves to the digest `ref` did, and a multi-platform list
+is retagged whole. A tag that already exists is moved, silently. The tags are
+not moved atomically: each is its own request, so a failure partway leaves the
+earlier ones moved. The error names them, and a re-run is idempotent.
 
 The driver reads `credHelpers` from the mount's `DOCKER_CONFIG` and calls the
 `docker-credential-heph` shim the same way the docker CLI would. The pinned

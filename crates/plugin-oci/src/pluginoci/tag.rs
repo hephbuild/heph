@@ -10,16 +10,20 @@
 //! repository `ref` names: the blobs are already there, and copying an image to
 //! another repository is a push, not a tag.
 //!
+//! A tag that already exists is moved, silently. The tags are not moved
+//! atomically: each is its own `PUT`, so a failure partway leaves the earlier
+//! ones moved. The error names them, and a re-run is idempotent.
+//!
 //! Its one output, `<name>.ref`, is the reference pinned to what the tags now
-//! point at, `registry/repository@digest`.
+//! point at, `registry/repository@digest` — the digest, unlike `oci.push`'s
+//! `registry/repository:tag`.
 
 use anyhow::Context as _;
 use async_trait::async_trait;
 use hcore::debug_hash::DebugHasher;
 use hcore::hasync::Cancellable;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
-use hplugin::driver::targetdef::path::{CodegenMode, Content, Path as OutPath};
-use hplugin::driver::targetdef::{Output, TargetDef};
+use hplugin::driver::targetdef::TargetDef;
 use hplugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, Deferred,
     ParseRequest, ParseResponse,
@@ -30,7 +34,7 @@ use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3Default;
 
 use super::auth::RegistryCredentials;
-use super::{ref_out_name, registry};
+use super::{ref_output, registry, write_ref};
 
 /// Config for an `oci_tag` target.
 #[derive(Spec)]
@@ -76,7 +80,9 @@ struct OciTagDef {
     /// Checked and deduplicated, in the order written.
     tags: Vec<String>,
     insecure: bool,
-    /// Who tags, not what is tagged: deliberately not hashed.
+    /// Not hashed: the target is never cached, and its output is a content
+    /// address, the same digest whoever tagged. A `cache` option would need
+    /// the identity in the key.
     ambient_credentials: bool,
 }
 
@@ -188,17 +194,7 @@ impl ManagedDriver for Driver {
                 labels: req.target_spec.labels.clone(),
                 raw_def: Arc::new(def),
                 inputs,
-                outputs: vec![Output {
-                    group: String::new(),
-                    paths: vec![OutPath {
-                        content: Content::FilePath(super::ws_path(
-                            addr.package.as_str(),
-                            &ref_out_name(&addr.name),
-                        )),
-                        codegen_tree: CodegenMode::None,
-                        collect: true,
-                    }],
-                }],
+                outputs: vec![ref_output(addr)],
                 // An action with an external side effect: never cached (the
                 // default `CacheConfig::off()`), always runs.
                 hash,
@@ -252,12 +248,7 @@ impl ManagedDriver for Driver {
             })?;
         tracing::debug!(target_addr = %req.request.target.addr.format(), %reference, tags = ?def.tags, %pinned, "tagged");
 
-        let out = req
-            .sandbox_pkg_dir
-            .join(ref_out_name(&req.request.target.addr.name));
-        tokio::fs::write(&out, &pinned)
-            .await
-            .with_context(|| format!("write the tagged reference to {out:?}"))?;
+        write_ref(&req, &pinned).await?;
         Ok(ManagedRunResponse::default())
     }
 }
@@ -265,11 +256,15 @@ impl ManagedDriver for Driver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pluginoci::registry::testreg::{BOT_ANSWER, BOT_BASIC, MockRegistry, oci_manifest};
+    use crate::pluginoci::auth::tests::Presented;
+    use crate::pluginoci::registry::testreg::{
+        BEARER_TOKEN, BOT_ANSWER, BOT_BASIC, BOT_WRONG_ANSWER, MockRegistry, oci_manifest,
+    };
     use crate::pluginoci::testfake::{Sandbox, run_request};
     use hcore::hasync::StdCancellationToken;
     use hcore::htvalue::Value;
     use hmodel::htaddr::parse_addr;
+    use hplugin::driver::targetdef::path::Content;
     use hplugin::provider::TargetSpec;
     use std::collections::HashMap;
 
@@ -462,8 +457,8 @@ mod tests {
         assert_eq!(out, format!("{}/acme/app@{digest}", reg.host()));
     }
 
-    /// The tag is checked before anything is written: a missing source pushes
-    /// nothing.
+    /// The source is fetched before any tag is written: a source the registry
+    /// does not have pushes nothing.
     #[tokio::test]
     async fn a_missing_source_tags_nothing() {
         let reg = MockRegistry::start(None);
@@ -491,8 +486,7 @@ mod tests {
         assert!(err.contains("anonymous"), "{err}");
         assert!(reg.get("acme/app", "1").is_none());
 
-        let p =
-            crate::pluginoci::auth::tests::Presented::new("//auth:c0", &[&reg.host()], BOT_ANSWER);
+        let p = Presented::new("//auth:c0", &[&reg.host()], BOT_ANSWER);
         let (_sbx, res) = run(&reference, &["1"], vec![p.mount.clone()]).await;
         res.expect("authenticated tag");
         assert!(reg.get("acme/app", "1").is_some());
@@ -501,5 +495,169 @@ mod tests {
             "only the declared identity is sent: {:?}",
             reg.authorizations()
         );
+    }
+
+    /// A Basic-challenge registry refusing the password fails the fetch of the
+    /// source with a 401: an error, not "nothing to tag", and nothing written.
+    #[tokio::test]
+    async fn a_wrong_password_is_an_error_and_tags_nothing() {
+        let reg = MockRegistry::start(Some(BOT_BASIC));
+        reg.put("acme/app", "build-1", &oci_manifest());
+        let p = Presented::new("//auth:c0", &[&reg.host()], BOT_WRONG_ANSWER);
+        let (_sbx, res) = run(
+            &format!("{}/acme/app:build-1", reg.host()),
+            &["1"],
+            vec![p.mount.clone()],
+        )
+        .await;
+        let err = format!("{:#}", res.err().expect("a wrong password is refused"));
+        assert!(!err.contains("nothing to tag"), "{err}");
+        assert!(err.contains("declared credentials"), "{err}");
+        assert!(
+            !reg.requests().iter().any(|r| r.starts_with("PUT")),
+            "{:?}",
+            reg.requests()
+        );
+    }
+
+    /// A registry behind the token flow: the credential goes, as Basic, to the
+    /// token endpoint, for a pull and for a push scope, and every manifest
+    /// request carries the token.
+    #[tokio::test]
+    async fn a_bearer_registry_exchanges_the_credential_for_pull_and_push() {
+        let reg = MockRegistry::start_bearer(BOT_BASIC);
+        reg.put("acme/app", "build-1", &oci_manifest());
+        let p = Presented::new("//auth:c0", &[&reg.host()], BOT_ANSWER);
+        let (_sbx, res) = run(
+            &format!("{}/acme/app:build-1", reg.host()),
+            &["1"],
+            vec![p.mount.clone()],
+        )
+        .await;
+        res.expect("authenticated tag");
+        assert_eq!(
+            reg.get("acme/app", "1").map(|(_, b)| b),
+            Some(oci_manifest())
+        );
+
+        let log = reg.log();
+        assert!(
+            log.iter().any(|r| r.line.starts_with("GET /token?")
+                && r.authorization.as_deref() == Some(BOT_BASIC)),
+            "{log:?}"
+        );
+        let bearer = format!("Bearer {BEARER_TOKEN}");
+        let manifests: Vec<_> = log
+            .iter()
+            .filter(|r| r.line.contains("/manifests/"))
+            .collect();
+        assert!(
+            manifests.iter().any(|r| r.line.starts_with("PUT")),
+            "{log:?}"
+        );
+        assert!(
+            manifests
+                .iter()
+                .all(|r| r.authorization.as_deref() == Some(bearer.as_str())),
+            "{log:?}"
+        );
+        let scopes = reg.scopes();
+        assert!(
+            scopes.iter().any(|s| s == "repository:acme/app:pull"),
+            "{scopes:?}"
+        );
+        assert!(
+            scopes.iter().any(|s| s == "repository:acme/app:pull,push"),
+            "{scopes:?}"
+        );
+    }
+
+    /// A token endpoint refusing the credential is an error naming the
+    /// registry, before any manifest request: neither a fall back to an
+    /// anonymous fetch (which this registry answers with a 404, "nothing to
+    /// tag") nor a write.
+    #[tokio::test]
+    async fn a_refused_token_exchange_is_an_error_and_touches_no_manifest() {
+        let reg = MockRegistry::start_bearer(BOT_BASIC);
+        reg.put("acme/app", "build-1", &oci_manifest());
+        let p = Presented::new("//auth:c0", &[&reg.host()], BOT_WRONG_ANSWER);
+        let (_sbx, res) = run(
+            &format!("{}/acme/app:build-1", reg.host()),
+            &["1"],
+            vec![p.mount.clone()],
+        )
+        .await;
+        let err = format!("{:#}", res.err().expect("a refused exchange fails"));
+        assert!(
+            err.contains(&format!("authenticate to {}", reg.host())),
+            "{err}"
+        );
+        assert!(!err.contains("nothing to tag"), "{err}");
+        assert!(
+            !reg.requests().iter().any(|r| r.contains("/manifests/")),
+            "{:?}",
+            reg.requests()
+        );
+    }
+
+    /// A tag that already points elsewhere is moved to the source.
+    #[tokio::test]
+    async fn an_existing_tag_is_moved() {
+        let reg = MockRegistry::start(None);
+        let digest = reg.put("acme/app", "build-2", &oci_manifest());
+        let old = br#"{"schemaVersion":2,"manifests":[]}"#;
+        reg.put("acme/app", "1.2", old);
+        let (_sbx, res) = run(
+            &format!("{}/acme/app:build-2", reg.host()),
+            &["1.2"],
+            vec![],
+        )
+        .await;
+        res.expect("tag");
+        let (_, bytes) = reg.get("acme/app", "1.2").expect("1.2");
+        assert_eq!(bytes, oci_manifest());
+        assert_eq!(
+            crate::pluginoci::registry::testreg::digest_of(&bytes),
+            digest
+        );
+    }
+
+    /// A `PUT` the registry refuses partway names the tag it failed on and the
+    /// ones already moved, and stops there.
+    #[tokio::test]
+    async fn a_refused_tag_names_the_tags_already_moved() {
+        let reg = MockRegistry::start(None);
+        reg.put("acme/app", "build-1", &oci_manifest());
+        reg.make_immutable("acme/app", "latest");
+        let (_sbx, res) = run(
+            &format!("{}/acme/app:build-1", reg.host()),
+            &["1.2", "latest", "2"],
+            vec![],
+        )
+        .await;
+        let err = format!("{:#}", res.err().expect("the immutable tag is refused"));
+        assert!(
+            err.contains(&format!("point {}/acme/app:latest at", reg.host())),
+            "{err}"
+        );
+        assert!(err.contains("already moved: 1.2 "), "{err}");
+        assert!(err.contains("a re-run is idempotent"), "{err}");
+        assert!(reg.get("acme/app", "1.2").is_some());
+        assert!(reg.get("acme/app", "2").is_none(), "stops at the failure");
+    }
+
+    /// The target is never cached, which is what keeps the identity off its
+    /// hash safe (see `OciTagDef::ambient_credentials`): `cache` is no option.
+    #[tokio::test]
+    async fn cache_is_refused() {
+        let err = parse(&[
+            ("ref", s("reg.io/app:1")),
+            ("tags", list(&["latest"])),
+            ("cache", Value::Bool(true)),
+        ])
+        .await
+        .err()
+        .expect("cache = True must be refused");
+        assert!(format!("{err:#}").contains("cache"), "{err:#}");
     }
 }

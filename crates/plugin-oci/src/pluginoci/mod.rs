@@ -74,6 +74,31 @@ pub(crate) fn ref_out_name(target_name: &str) -> String {
     format!("{target_name}.ref")
 }
 
+/// The one output of a registry driver: `<name>.ref` in the package dir (see
+/// [`ref_out_name`]), collected, not codegen.
+pub(crate) fn ref_output(addr: &hmodel::htaddr::Addr) -> hplugin::driver::targetdef::Output {
+    use hplugin::driver::targetdef::path::{CodegenMode, Content, Path as OutPath};
+    hplugin::driver::targetdef::Output {
+        group: String::new(),
+        paths: vec![OutPath {
+            content: Content::FilePath(ws_path(addr.package.as_str(), &ref_out_name(&addr.name))),
+            codegen_tree: CodegenMode::None,
+            collect: true,
+        }],
+    }
+}
+
+/// Write `value`, the reference a registry driver resolved, to its
+/// [`ref_output`] in the sandbox.
+pub(crate) async fn write_ref(req: &ManagedRunRequest<'_, '_>, value: &str) -> anyhow::Result<()> {
+    let out = req
+        .sandbox_pkg_dir
+        .join(ref_out_name(&req.request.target.addr.name));
+    tokio::fs::write(&out, value)
+        .await
+        .with_context(|| format!("write the reference to {out:?}"))
+}
+
 /// Archive format an image is built/consumed as: a `format` field's type, so
 /// its schema (`"oci" | "docker"`) and its parse are one table.
 #[derive(

@@ -1,25 +1,29 @@
 //! The `oci_exists` driver: checks that an image reference resolves in a
 //! registry, and fails when it does not.
 //!
-//! A *check* against outside state, so it is **not cached**: the answer is the
-//! registry's at the moment the target runs, and a cached "yes" would outlive a
-//! deleted tag.
+//! A *check* against outside state, so it is **not cached**: it runs every
+//! time it is requested, and the answer is the registry's at that moment — a
+//! cached "yes" would outlive a deleted tag. For the same reason it is no cache
+//! gate: a target depending on it does not skip work because the image exists.
 //!
 //! Its one output, `<name>.ref`, is the reference pinned to what it resolved
 //! to, `registry/repository@digest` — the form a deploy wants, and what
-//! `${read://pkg:name}` hands a later target.
+//! `${read://pkg:name}` hands a later target. Unlike `oci.push`'s
+//! `registry/repository:tag`, it names the digest, not the tag.
 //!
 //! "Missing" is only ever the registry saying so (a 404, or `MANIFEST_UNKNOWN` /
-//! `NAME_UNKNOWN`): a refused credential, a 401 or a network failure is an
-//! error of its own, so an expired token never reads as an unpublished image.
+//! `NAME_UNKNOWN`): a token exchange the registry refuses, a 401 or a network
+//! failure is an error of its own, so an expired token never reads as an
+//! unpublished image. What no client can tell apart: a registry that hides
+//! private repositories behind a 404 answers an identity that may not read the
+//! image exactly as it answers for an image that is not there.
 
 use anyhow::Context as _;
 use async_trait::async_trait;
 use hcore::debug_hash::DebugHasher;
 use hcore::hasync::Cancellable;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
-use hplugin::driver::targetdef::path::{CodegenMode, Content, Path as OutPath};
-use hplugin::driver::targetdef::{Output, TargetDef};
+use hplugin::driver::targetdef::TargetDef;
 use hplugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, Deferred,
     ParseRequest, ParseResponse,
@@ -30,7 +34,8 @@ use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3Default;
 
 use super::auth::RegistryCredentials;
-use super::{ref_out_name, registry};
+use super::registry::{self, Lookup};
+use super::{ref_output, write_ref};
 
 /// Config for an `oci_exists` target.
 #[derive(Spec)]
@@ -69,7 +74,11 @@ struct OciExistsDef {
     /// wrote.
     reference: Deferred<String>,
     insecure: bool,
-    /// Who looks, not what is looked up: deliberately not hashed.
+    /// Not hashed, although the identity can change the answer: a registry
+    /// that filters by permission tells one identity an image exists and
+    /// another that it does not. It is safe off the hash because the target is
+    /// never cached and its output is a content address, the same digest
+    /// whoever looked. A `cache` option would need the identity in the key.
     ambient_credentials: bool,
 }
 
@@ -136,17 +145,7 @@ impl ManagedDriver for Driver {
                 labels: req.target_spec.labels.clone(),
                 raw_def: Arc::new(def),
                 inputs,
-                outputs: vec![Output {
-                    group: String::new(),
-                    paths: vec![OutPath {
-                        content: Content::FilePath(super::ws_path(
-                            addr.package.as_str(),
-                            &ref_out_name(&addr.name),
-                        )),
-                        codegen_tree: CodegenMode::None,
-                        collect: true,
-                    }],
-                }],
+                outputs: vec![ref_output(addr)],
                 // The registry's answer now, not a function of any input:
                 // never cached (the default `CacheConfig::off()`).
                 hash,
@@ -189,23 +188,20 @@ impl ManagedDriver for Driver {
             &req.sandbox_dir,
             ctoken,
         )?;
-        let pinned = registry::manifest_ref(&reference, def.insecure, &creds)
+        let lookup = registry::manifest_ref(&reference, def.insecure, &creds)
             .await
             .with_context(|| format!("look up {reference} ({})", creds.failure_hint()))?;
-        let Some(pinned) = pinned else {
-            anyhow::bail!(
-                "{reference} does not exist: the registry has no such manifest or repository ({})",
+        let pinned = match lookup {
+            Lookup::Found(pinned) => pinned,
+            Lookup::Missing(answer) => anyhow::bail!(
+                "{reference} does not exist: the registry answered {answer}. Check the \
+                 repository and tag, or that the target pushing it ran first ({})",
                 creds.failure_hint()
-            );
+            ),
         };
         tracing::debug!(target_addr = %req.request.target.addr.format(), %reference, %pinned, "exists");
 
-        let out = req
-            .sandbox_pkg_dir
-            .join(ref_out_name(&req.request.target.addr.name));
-        tokio::fs::write(&out, &pinned)
-            .await
-            .with_context(|| format!("write the resolved reference to {out:?}"))?;
+        write_ref(&req, &pinned).await?;
         Ok(ManagedRunResponse::default())
     }
 }
@@ -213,11 +209,15 @@ impl ManagedDriver for Driver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pluginoci::registry::testreg::{MockRegistry, oci_manifest};
+    use crate::pluginoci::auth::tests::Presented;
+    use crate::pluginoci::registry::testreg::{
+        BEARER_TOKEN, BOT_ANSWER, BOT_BASIC, BOT_WRONG_ANSWER, MockRegistry, oci_manifest,
+    };
     use crate::pluginoci::testfake::{Sandbox, run_request};
     use hcore::hasync::StdCancellationToken;
     use hcore::htvalue::Value;
     use hmodel::htaddr::parse_addr;
+    use hplugin::driver::targetdef::path::Content;
     use hplugin::provider::TargetSpec;
     use std::collections::HashMap;
 
@@ -374,6 +374,9 @@ mod tests {
                 err.contains(&format!("{reference} does not exist")),
                 "{err}"
             );
+            assert!(err.contains("the registry answered"), "{err}");
+            assert!(err.contains("UNKNOWN"), "carries the answer: {err}");
+            assert!(err.contains("Check the repository and tag"), "{err}");
             assert!(err.contains("anonymous"), "{err}");
             assert!(!sbx.pkg.join("exists.ref").exists());
         }
@@ -383,7 +386,7 @@ mod tests {
     /// refusing the anonymous request is an error, not "missing".
     #[tokio::test]
     async fn a_declared_credential_authenticates_and_a_refusal_is_not_missing() {
-        let reg = MockRegistry::start(Some(crate::pluginoci::registry::testreg::BOT_BASIC));
+        let reg = MockRegistry::start(Some(BOT_BASIC));
         reg.put("acme/app", "1", &oci_manifest());
         let reference = format!("{}/acme/app:1", reg.host());
 
@@ -395,21 +398,130 @@ mod tests {
         );
         assert!(err.contains("anonymous"), "{err}");
 
-        let p = crate::pluginoci::auth::tests::Presented::new(
-            "//auth:c0",
-            &[&reg.host()],
-            crate::pluginoci::registry::testreg::BOT_ANSWER,
-        );
+        let p = Presented::new("//auth:c0", &[&reg.host()], BOT_ANSWER);
         let (sbx, res) = run(&reference, vec![p.mount.clone()], 1).await;
         res.expect("authenticated lookup");
         assert!(sbx.pkg.join("exists.ref").exists());
         assert!(
-            reg.authorizations()
-                .iter()
-                .any(|a| a == crate::pluginoci::registry::testreg::BOT_BASIC),
+            reg.authorizations().iter().any(|a| a == BOT_BASIC),
             "{:?}",
             reg.authorizations()
         );
+    }
+
+    /// A Basic-challenge registry checks the password on the manifest request
+    /// itself: a wrong one is a 401 there, an error, never "missing".
+    #[tokio::test]
+    async fn a_wrong_password_is_an_error_not_missing() {
+        let reg = MockRegistry::start(Some(BOT_BASIC));
+        reg.put("acme/app", "1", &oci_manifest());
+        let p = Presented::new("//auth:c0", &[&reg.host()], BOT_WRONG_ANSWER);
+        let (sbx, res) = run(
+            &format!("{}/acme/app:1", reg.host()),
+            vec![p.mount.clone()],
+            1,
+        )
+        .await;
+        let err = format!("{:#}", res.err().expect("a wrong password is refused"));
+        assert!(!err.contains("does not exist"), "{err}");
+        assert!(err.contains("declared credentials"), "{err}");
+        assert!(!sbx.pkg.join("exists.ref").exists());
+    }
+
+    /// A registry behind the token flow: the declared credential is sent, as
+    /// Basic, to the token endpoint only, for a pull scope; the manifest request
+    /// carries the token it granted.
+    #[tokio::test]
+    async fn a_bearer_registry_exchanges_the_credential_for_a_pull_token() {
+        let reg = MockRegistry::start_bearer(BOT_BASIC);
+        let digest = reg.put("acme/app", "1", &oci_manifest());
+        let p = Presented::new("//auth:c0", &[&reg.host()], BOT_ANSWER);
+        let (sbx, res) = run(
+            &format!("{}/acme/app:1", reg.host()),
+            vec![p.mount.clone()],
+            1,
+        )
+        .await;
+        res.expect("authenticated lookup");
+        assert_eq!(
+            std::fs::read_to_string(sbx.pkg.join("exists.ref")).expect("output"),
+            format!("{}/acme/app@{digest}", reg.host())
+        );
+
+        let log = reg.log();
+        assert!(
+            log.iter().any(|r| r.line.starts_with("GET /token?")
+                && r.authorization.as_deref() == Some(BOT_BASIC)),
+            "{log:?}"
+        );
+        let manifests: Vec<_> = log
+            .iter()
+            .filter(|r| r.line.contains("/manifests/"))
+            .collect();
+        assert!(!manifests.is_empty(), "{log:?}");
+        let bearer = format!("Bearer {BEARER_TOKEN}");
+        assert!(
+            manifests
+                .iter()
+                .all(|r| r.authorization.as_deref() == Some(bearer.as_str())),
+            "{log:?}"
+        );
+        assert_eq!(reg.scopes(), ["repository:acme/app:pull"]);
+    }
+
+    /// A token endpoint refusing the credential is an error naming the
+    /// registry, and no manifest request is made: the lookup does not fall back
+    /// to an anonymous one, which this registry would answer with a 404 that
+    /// reads as "missing".
+    #[tokio::test]
+    async fn a_refused_token_exchange_is_an_error_not_missing() {
+        let reg = MockRegistry::start_bearer(BOT_BASIC);
+        reg.put("acme/app", "1", &oci_manifest());
+        let p = Presented::new("//auth:c0", &[&reg.host()], BOT_WRONG_ANSWER);
+        let (sbx, res) = run(
+            &format!("{}/acme/app:1", reg.host()),
+            vec![p.mount.clone()],
+            1,
+        )
+        .await;
+        let err = format!("{:#}", res.err().expect("a refused exchange fails"));
+        assert!(
+            err.contains(&format!("authenticate to {}", reg.host())),
+            "{err}"
+        );
+        assert!(!err.contains("does not exist"), "{err}");
+        assert!(
+            !reg.requests().iter().any(|r| r.contains("/manifests/")),
+            "{:?}",
+            reg.requests()
+        );
+        assert!(!sbx.pkg.join("exists.ref").exists());
+    }
+
+    /// A reference by digest alone resolves to itself.
+    #[tokio::test]
+    async fn a_digest_reference_writes_itself() {
+        let reg = MockRegistry::start(None);
+        let digest = reg.put("acme/app", "1", &oci_manifest());
+        let reference = format!("{}/acme/app@{digest}", reg.host());
+        let (sbx, res) = run(&reference, vec![], 0).await;
+        res.expect("exists");
+        assert_eq!(
+            std::fs::read_to_string(sbx.pkg.join("exists.ref")).expect("output"),
+            reference
+        );
+    }
+
+    /// The target is never cached, which is what keeps the identity off its
+    /// hash safe (see `OciExistsDef::ambient_credentials`): `cache` is no
+    /// option.
+    #[tokio::test]
+    async fn cache_is_refused() {
+        let err = parse(&[("ref", s("reg.io/app:1")), ("cache", Value::Bool(true))])
+            .await
+            .err()
+            .expect("cache = True must be refused");
+        assert!(format!("{err:#}").contains("cache"), "{err:#}");
     }
 
     /// A target that declared credentials and received none is refused rather
