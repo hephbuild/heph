@@ -56,7 +56,10 @@ The same holds for `credentials`: `<name>_release` sets `http_fetch`'s
 knows it. An older one refuses the unknown key when it parses that target.
 Likewise the asset fetch sets `http_fetch`'s `refresh` option: a newer gh
 plugin on a host whose `http_fetch` predates it gets a loud unknown-key refusal
-at parse, never a silently different target.
+at parse, never a silently different target. `support_files` is forwarded to
+the `archive.extract` only when set: on a host whose extract predates it, a
+call that uses it is refused at parse as an unknown key, and every other call
+declares what it did before.
 
 `<name>_archive` (and, with `credentials`, `<name>_release` and `<name>_url`)
 are reserved in the calling package. Nothing refuses a hand-written target with
@@ -77,7 +80,8 @@ download URLs do); the asset is one encoded segment. Braces are escaped, so
 
 Fetching, verification and caching are `http_fetch`'s (see its driver docs).
 The extracted tree's cache key comes from the archive's content through the
-dep, plus `format`, `strip_components`, `include`, `executable` and `out`.
+dep, plus `format`, `strip_components`, `include`, `support_files`,
+`executable` and `out`.
 
 ## `out`
 
@@ -147,6 +151,20 @@ Patterns match as wax does ([ARCHIVE.md](ARCHIVE.md#patterns)):
 A pattern no path can match (`"/bin/gh"`, `"./bin/gh"`, `"bin/"`,
 `"bin//gh"`) is refused when the extract is parsed, with the fix
 (`"bin/"`: write `"bin/**"`).
+
+A binary that needs files from its release beside it takes them as
+`support_files`: extracted and staged with the binary, never on `PATH`, so
+the binary stays a one-file tool ([ARCHIVE.md](ARCHIVE.md#archiveextract)):
+
+```python
+heph.gh.release_asset(name = "protoc", repo = "protocolbuffers/protobuf",
+                      tag = "v29.3", asset = "protoc-29.3-linux-x86_64.zip",
+                      extract = True, include = "bin/protoc",
+                      support_files = "include/**", executable = ["bin/protoc"])
+# //p:protoc outputs p/protoc/bin/protoc; p/protoc/include/… rides with it
+# as support files, at $HEPH_TOOLS_DIR/p/protoc/include in a tool user:
+# pass it as `protoc -I "$HEPH_TOOLS_DIR/p/protoc/include" …`
+```
 
 To pick a file out of a target that is not an extract, use a `group`
 ([ARCHIVE.md](ARCHIVE.md)). Its `include` matches a dep's paths

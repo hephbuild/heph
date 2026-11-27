@@ -63,8 +63,13 @@ target(
 
 /// Every file of a result, by path, with its contents and executable bit.
 fn files(result: &heph::engine::EResult) -> Vec<(String, String, bool)> {
+    files_in(&result.artifacts)
+}
+
+/// Every file of `artifacts`, as [`files`] lists a result's.
+fn files_in(artifacts: &[Arc<dyn heph::hartifactcontent::Content>]) -> Vec<(String, String, bool)> {
     let mut out = Vec::new();
-    for artifact in &result.artifacts {
+    for artifact in artifacts {
         for entry in artifact.walk().expect("walk") {
             let entry = entry.expect("entry");
             if let heph::hartifactcontent::WalkEntryKind::File { mut data, x, .. } = entry.kind {
@@ -458,5 +463,196 @@ target(name = "two", driver = "archive.extract", src = ":pack2")
         msg.contains("tool target '//p:two' must produce exactly 1 file, found 2: p/two/a.txt, p/two/sub/b.sh"),
         "{msg}"
     );
+    Ok(())
+}
+
+/// `support_files` splits an extracted tree per file: the binary is the
+/// output, so the extract is a tool on its own, and the support files are
+/// staged beside it in the tool tree (`$HEPH_TOOLS_DIR/<pkg>/<out>/…`) —
+/// the layout of a protoc release, `bin/protoc` and `include/`. A cache hit
+/// serves the same split.
+#[tokio::test]
+async fn support_files_ride_beside_a_one_file_tool() -> anyhow::Result<()> {
+    const SCRIPT: &str = "#!/bin/sh\ncat \"$HEPH_TOOLS_DIR/p/tool/include/a.h\"\n";
+    let ws = workspace()?;
+    ws.write_build_file(
+        "p",
+        r##"
+target(
+    name = "bin",
+    driver = "bash",
+    run = """mkdir -p "$(dirname "$OUT")" && printf '%s\\n' '#!/bin/sh' 'cat "$HEPH_TOOLS_DIR/p/tool/include/a.h"' > "$OUT" && chmod +x "$OUT" """,
+    out = "out/bin/tool",
+)
+target(
+    name = "hdr",
+    driver = "bash",
+    run = 'mkdir -p "$(dirname "$OUT")" && printf header > "$OUT"',
+    out = "out/include/a.h",
+)
+target(
+    name = "doc",
+    driver = "bash",
+    run = 'printf doc > "$OUT"',
+    out = "out/README",
+)
+target(name = "pack", driver = "archive.create", deps = [":bin", ":hdr", ":doc"], strip_prefix = "p/out", out = "pack.zip")
+target(
+    name = "tool",
+    driver = "archive.extract",
+    src = ":pack",
+    include = "bin/tool",
+    support_files = "include/**",
+)
+target(name = "use", driver = "bash", run = ["tool > $OUT"], out = "out.txt", tools = [":tool"])
+target(name = "all_support", driver = "archive.extract", src = ":pack", support_files = "**")
+"##,
+    );
+
+    let err = ws
+        .run("//p:all_support")
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("an extract with no output file must fail"))?;
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("every file under \"p/all_support\" is a support file (3 of them)"),
+        "{msg}"
+    );
+
+    let tool = ws.run("//p:tool").await?;
+    assert_eq!(
+        files(&tool),
+        vec![("p/tool/bin/tool".to_string(), SCRIPT.to_string(), true)],
+        "only the binary is the output; README is not extracted"
+    );
+    assert_eq!(
+        files_in(&tool.support_artifacts),
+        vec![(
+            "p/tool/include/a.h".to_string(),
+            "header".to_string(),
+            false
+        )]
+    );
+
+    let result = ws.run("//p:use").await?;
+    assert_eq!(
+        files(&result),
+        vec![("p/out.txt".to_string(), "header".to_string(), false)]
+    );
+
+    let again = ws.run("//p:tool").await?;
+    assert_eq!(
+        hashouts(&again),
+        hashouts(&tool),
+        "a hit serves the same split"
+    );
+    assert_eq!(
+        files_in(&again.support_artifacts),
+        files_in(&tool.support_artifacts)
+    );
+    Ok(())
+}
+
+/// The cases `support_files` has to get right on a real release tree: a
+/// top-level directory stripped first (protoc's layout, matched after
+/// `strip_components`), a file both `include` and `support_files` match (a
+/// support file), a symlink inside one artifact (kept), and a symlink from
+/// either artifact into the other (refused, naming the link). A plain
+/// dependent gets the output in `$SRC` and the support files on disk.
+#[tokio::test]
+async fn support_files_split_a_stripped_tree_and_refuse_links_across_it() -> anyhow::Result<()> {
+    let ws = workspace()?;
+    ws.write_build_file(
+        "p",
+        r#"
+target(
+    name = "tree",
+    driver = "bash",
+    run = 'mkdir -p tree/bin tree/include/sub && printf tool > tree/bin/tool && printf helper > tree/bin/helper && printf a > tree/include/a.h && ln -s ../a.h tree/include/sub/a.h',
+    out = "tree/",
+)
+target(name = "pack", driver = "archive.create", deps = [":tree"], strip_prefix = "p/tree", prefix = "rel-1", out = "pack.tar.gz")
+target(
+    name = "split",
+    driver = "archive.extract",
+    src = ":pack",
+    strip_components = 1,
+    include = "bin/**",
+    support_files = ["include/**", "bin/helper"],
+)
+target(
+    name = "dep",
+    driver = "bash",
+    deps = [":split"],
+    run = 'echo "$SRC" > $OUT && d="$(dirname "$SRC")/.." && cat "$d/include/a.h" "$d/include/sub/a.h" "$d/bin/helper" >> $OUT',
+    out = "dep.txt",
+)
+target(
+    name = "out_to_support",
+    driver = "bash",
+    run = 'mkdir -p t/bin t/include && printf a > t/include/a.h && ln -s ../include/a.h t/bin/tool',
+    out = "t/",
+)
+target(
+    name = "support_to_out",
+    driver = "bash",
+    run = 'mkdir -p t/bin t/include && printf tool > t/bin/tool && ln -s ../bin/tool t/include/tool',
+    out = "t/",
+)
+[
+    [
+        target(name = n + "_pack", driver = "archive.create", deps = [":" + n], strip_prefix = "p/t", out = n + ".tar"),
+        target(name = n + "_x", driver = "archive.extract", src = ":" + n + "_pack", support_files = "include/**"),
+    ]
+    for n in ["out_to_support", "support_to_out"]
+]
+"#,
+    );
+
+    let split = ws.run("//p:split").await?;
+    assert_eq!(
+        files(&split),
+        vec![("p/split/bin/tool".to_string(), "tool".to_string(), false)],
+        "`bin/helper` matches both lists: a support file"
+    );
+    assert_eq!(
+        files_in(&split.support_artifacts),
+        vec![
+            (
+                "p/split/bin/helper".to_string(),
+                "helper".to_string(),
+                false
+            ),
+            ("p/split/include/a.h".to_string(), "a".to_string(), false),
+        ]
+    );
+
+    let dep = ws.run("//p:dep").await?;
+    let [(_, text, _)] = files(&dep)
+        .try_into()
+        .map_err(|f| anyhow::anyhow!("{f:?}"))?;
+    let (src, staged) = text.split_once('\n').unwrap_or_default();
+    assert!(
+        src.ends_with("p/split/bin/tool") && !src.contains("include") && !src.contains("helper"),
+        "$SRC names the output only: {src:?}"
+    );
+    assert_eq!(staged, "aahelper", "the support files are staged for a dep");
+
+    for (addr, link) in [
+        ("//p:out_to_support_x", "bin/tool"),
+        ("//p:support_to_out_x", "include/tool"),
+    ] {
+        let err = ws
+            .run(addr)
+            .await
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("{addr}: a link across the split must fail"))?;
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("split by `support_files`") && msg.contains(link),
+            "{addr}: {msg}"
+        );
+    }
     Ok(())
 }

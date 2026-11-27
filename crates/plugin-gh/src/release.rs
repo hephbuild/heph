@@ -375,6 +375,12 @@ struct ReleaseAssetArgs {
     /// match one are extracted, and each must match one. Default: every
     /// entry.
     include: Vec<String>,
+    /// With `extract` only: glob patterns (`include`'s syntax) naming the
+    /// unpacked files that are support files, staged beside the output but
+    /// never on `PATH`: one binary as the tool, the rest of its release
+    /// carried with it. Each is extracted whether or not `include` matches
+    /// it, and must match one. Default: none.
+    support_files: Vec<String>,
     /// `True` marks the fetched file executable, or with `extract` every
     /// unpacked file (default `False`). With `extract` only: a list of glob
     /// patterns naming the unpacked files to make executable instead.
@@ -598,6 +604,7 @@ fn release_asset(plugin: &str, pkg: &str, args: &FnArgs) -> anyhow::Result<FnOut
         max_bytes,
         max_entries,
         include,
+        support_files,
         executable,
         out,
         server_url,
@@ -705,10 +712,15 @@ fn release_asset(plugin: &str, pkg: &str, args: &FnArgs) -> anyhow::Result<FnOut
         asset_fetch
     };
     if !extract {
-        if format.is_some() || strip != 0 || !include.is_empty() || !limits.is_empty() {
+        if format.is_some()
+            || strip != 0
+            || !include.is_empty()
+            || !support_files.is_empty()
+            || !limits.is_empty()
+        {
             bail!(
-                "`format`, `strip_components`, `include`, `max_bytes` and `max_entries` apply \
-                 only with `extract = True`"
+                "`format`, `strip_components`, `include`, `support_files`, `max_bytes` and \
+                 `max_entries` apply only with `extract = True`"
             );
         }
         let mut config = fetch_config(out.unwrap_or(asset));
@@ -771,6 +783,9 @@ fn release_asset(plugin: &str, pkg: &str, args: &FnArgs) -> anyhow::Result<FnOut
     }
     if !include.is_empty() {
         config.insert("include".to_string(), patterns_value(include));
+    }
+    if !support_files.is_empty() {
+        config.insert("support_files".to_string(), patterns_value(support_files));
     }
     match executable {
         ExecutableArg::No => {}
@@ -1196,6 +1211,47 @@ mod tests {
         assert_eq!(
             target(&out, "tool").config.get("strip_components"),
             Some(&Value::Int(1))
+        );
+    }
+
+    /// `support_files` reaches the extract (a string as a one-pattern list),
+    /// never the fetch; an empty list is as if unset, and without `extract`
+    /// it is refused like `include`.
+    #[test]
+    fn support_files_are_forwarded_to_the_extract() {
+        let list = |ps: &[&str]| Value::List(ps.iter().map(|p| s(p)).collect());
+        let out = call(&with(&[
+            ("extract", Value::Bool(true)),
+            ("include", s("bin/protoc")),
+            ("support_files", s("include/**")),
+        ]))
+        .unwrap();
+        let extract = target(&out, "tool");
+        assert_eq!(
+            extract.config.get("support_files"),
+            Some(&list(&["include/**"]))
+        );
+        assert!(
+            !target(&out, "tool_archive")
+                .config
+                .contains_key("support_files")
+        );
+
+        let out = call(&with(&[
+            ("extract", Value::Bool(true)),
+            ("support_files", list(&[])),
+        ]))
+        .unwrap();
+        assert!(!target(&out, "tool").config.contains_key("support_files"));
+
+        let Err(err) = call(&with(&[("support_files", s("include/**"))])) else {
+            panic!("refused without extract");
+        };
+        assert!(
+            format!("{err:#}").contains(
+                "`support_files`, `max_bytes` and `max_entries` apply only with `extract = True`"
+            ),
+            "{err:#}"
         );
     }
 

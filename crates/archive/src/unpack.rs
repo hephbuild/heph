@@ -86,6 +86,14 @@
 //! the mode its target was written with, a raised bit included, and `0o755`
 //! when its own path matches. Symlinks are untouched.
 //!
+//! `support` ([`UnpackOptions::support`]) names the entries a caller keeps
+//! apart from the rest (`archive.extract`'s `support_files`): they are
+//! patterns in `include`'s syntax, an entry matching one is extracted
+//! whether or not `include` matches it, and each must match a file or link
+//! the archive holds. What is extracted is the same tree either way; which
+//! of its files are support files the caller answers with
+//! [`Globs::is_match`] over the same paths.
+//!
 //! A bare `gz` is one entry: a file named after the archive (see
 //! [`gz_file_name`]), held to the same rules as a tar's file entry, `include`
 //! and `executable` included.
@@ -162,6 +170,13 @@ impl Globs {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+
+    /// Whether `path` (below the output, `/`-separated, as [`unpack`]
+    /// matches it) matches one of the patterns.
+    pub fn is_match(&self, path: &str) -> bool {
+        use wax::Program as _;
+        self.0.iter().any(|(_, glob)| glob.is_match(path))
+    }
 }
 
 /// Refuse a pattern no entry path can match: an entry's path below the
@@ -237,6 +252,10 @@ pub struct UnpackOptions {
     /// these are extracted, and directory entries are skipped; each pattern
     /// must match one (see the module docs). Empty: every entry.
     pub include: Globs,
+    /// The files and links the caller keeps apart (see the module docs):
+    /// each one matching is extracted even where `include` does not match
+    /// it, and each pattern must match one. Empty: none.
+    pub support: Globs,
     /// Which regular files are made executable.
     pub executable: Executable,
     /// How much the archive may unpack to.
@@ -257,6 +276,7 @@ pub fn unpack(
     let UnpackOptions {
         strip_components,
         include,
+        support,
         executable,
         limits,
     } = opts;
@@ -279,6 +299,7 @@ pub fn unpack(
         dest,
         strip_components,
         include,
+        support,
         executable,
         limits,
         cancelled,
@@ -553,7 +574,11 @@ struct Tree<'a> {
     stripped: Vec<String>,
     /// `include`'s patterns; `None` when every entry is extracted.
     include: Option<Selector>,
-    /// The first [`STRIPPED_SHOWN`] paths `include` was matched against,
+    /// `support`'s patterns, extracted whatever `include` says; `None`
+    /// when there are none.
+    support: Option<Selector>,
+    /// The first [`STRIPPED_SHOWN`] paths `include` and `support` were
+    /// matched against,
     /// and how many there were, so a pattern that matches none says what it
     /// could have matched.
     candidates: Vec<String>,
@@ -591,8 +616,7 @@ impl Selector {
 
     /// Whether `path` matches a pattern, marking none.
     fn matches(&self, path: &str) -> bool {
-        use wax::Program as _;
-        self.globs.0.iter().any(|(_, glob)| glob.is_match(path))
+        self.globs.is_match(path)
     }
 
     /// The first pattern that matched no path.
@@ -618,6 +642,7 @@ impl<'a> Tree<'a> {
         root: &Path,
         strip: u32,
         include: Globs,
+        support: Globs,
         executable: Executable,
         limits: Limits,
         cancelled: &'a dyn Fn() -> bool,
@@ -633,6 +658,7 @@ impl<'a> Tree<'a> {
             links: Vec::new(),
             stripped: Vec::new(),
             include: (!include.is_empty()).then(|| Selector::new(include)),
+            support: (!support.is_empty()).then(|| Selector::new(support)),
             candidates: Vec::new(),
             candidate_count: 0,
             exec: match executable {
@@ -646,18 +672,42 @@ impl<'a> Tree<'a> {
     }
 
     /// Whether the file, symlink or hard link at `comps` is extracted:
-    /// always without `include`, else when its path matches a pattern.
+    /// always without `include`, else when its path matches a pattern of
+    /// `include` or of `support`. Every pattern that matches is marked.
     fn included(&mut self, comps: &[String]) -> bool {
-        let Some(sel) = &mut self.include else {
+        if self.include.is_none() && self.support.is_none() {
             return true;
-        };
+        }
         let path = comps.join("/");
-        let selected = sel.select(&path);
+        // Both, not `||`: a pattern of each that matches is marked.
+        let included = self.include.as_mut().is_none_or(|sel| sel.select(&path));
+        let support = self.support.as_mut().is_some_and(|sel| sel.select(&path));
         self.candidate_count += 1;
         if self.candidates.len() < STRIPPED_SHOWN {
             self.candidates.push(path);
         }
-        selected
+        included || support
+    }
+
+    /// Whether `path` is extracted, marking no pattern: [`Self::included`]
+    /// without its bookkeeping.
+    fn would_include(&self, path: &str) -> bool {
+        self.include.as_ref().is_none_or(|sel| sel.matches(path))
+            || self.support.as_ref().is_some_and(|sel| sel.matches(path))
+    }
+
+    /// The paths a pattern was matched against, for an error saying it
+    /// matched none of them.
+    fn candidates_shown(&self) -> String {
+        format!(
+            "{:?}{}",
+            self.candidates,
+            if self.candidate_count > self.candidates.len() as u64 {
+                " and more"
+            } else {
+                ""
+            }
+        )
     }
 
     /// The mode of the regular file at `comps`, whose normalized mode in the
@@ -910,14 +960,10 @@ impl<'a> Tree<'a> {
                 format!("hard link target {target:?} is removed by strip_components")
             })?;
         let target_path = target_comps.join("/");
-        if self
-            .include
-            .as_ref()
-            .is_some_and(|sel| !sel.matches(&target_path))
-        {
+        if !self.would_include(&target_path) {
             bail!(
-                "hard link target {target_path:?} is not included: `include` matches the link \
-                 but not the file it is a copy of; include that too"
+                "hard link target {target_path:?} is not included: the link is extracted but \
+                 the file it is a copy of is not; include that too"
             );
         }
         // The target is reached without following any link, and must be a
@@ -965,17 +1011,14 @@ impl<'a> Tree<'a> {
     fn finish(self) -> anyhow::Result<usize> {
         // First: a typo in a pattern is likelier than an empty archive, and
         // this error says what the pattern was matched against.
-        if let Some(p) = self.include.as_ref().and_then(Selector::unmatched) {
-            bail!(
-                "`include` pattern {p:?} matches no file or link in the archive; the paths it \
-                 was matched against (below the output, after strip_components) begin {:?}{}",
-                self.candidates,
-                if self.candidate_count > self.candidates.len() as u64 {
-                    " and more"
-                } else {
-                    ""
-                }
-            );
+        for (option, sel) in [("include", &self.include), ("support_files", &self.support)] {
+            if let Some(p) = sel.as_ref().and_then(Selector::unmatched) {
+                bail!(
+                    "`{option}` pattern {p:?} matches no file or link in the archive; the paths \
+                     it was matched against (below the output, after strip_components) begin {}",
+                    self.candidates_shown()
+                );
+            }
         }
         if self.written == 0 {
             if self.stripped.is_empty() {
@@ -1665,6 +1708,85 @@ mod tests {
             msg.contains(r#"["f0", "f1", "f2", "f3", "f4"] and more"#),
             "{msg}"
         );
+    }
+
+    fn supporting(include: &[&str], support: &[&str]) -> UnpackOptions {
+        UnpackOptions {
+            include: globs(include),
+            support: globs(support),
+            ..UnpackOptions::default()
+        }
+    }
+
+    fn sdk_tar() -> Vec<u8> {
+        tar_bytes(&[
+            E::File("bin/tool", b"bin", 0o755),
+            E::File("include/a.h", b"a", 0o644),
+            E::File("include/sub/b.h", b"b", 0o644),
+            E::File("README", b"r", 0o644),
+        ])
+    }
+
+    /// A `support` match is extracted whether or not `include` matches it,
+    /// and the tree is the same one `include` naming both would write.
+    #[test]
+    fn support_patterns_are_extracted_beside_the_included_files() {
+        let (dir, r) = run_opts(
+            "t",
+            &sdk_tar(),
+            Format::Tar,
+            supporting(&["bin/tool"], &["include/**"]),
+        );
+        assert_eq!(r.unwrap(), 3);
+        assert_eq!(
+            listing(&dir),
+            ["bin/tool", "include/a.h", "include/sub/b.h"]
+        );
+        // Without `include`, everything, as before.
+        let (dir, r) = run_opts(
+            "t",
+            &sdk_tar(),
+            Format::Tar,
+            supporting(&[], &["include/**"]),
+        );
+        assert_eq!(r.unwrap(), 4);
+        assert_eq!(
+            listing(&dir),
+            ["README", "bin/tool", "include/a.h", "include/sub/b.h"]
+        );
+        // `Globs::is_match` answers the caller's split over the same paths.
+        let support = globs(&["include/**"]);
+        assert!(support.is_match("include/sub/b.h") && !support.is_match("bin/tool"));
+    }
+
+    /// A `support` pattern that matches nothing fails like an `include` one,
+    /// naming itself as the option it came from, with `include` set or not.
+    #[test]
+    fn an_unmatched_support_pattern_fails_naming_itself() {
+        for include in [&["bin/tool"][..], &[]] {
+            let (_dir, r) = run_opts(
+                "t",
+                &sdk_tar(),
+                Format::Tar,
+                supporting(include, &["include/**", "lib/**"]),
+            );
+            let msg = err(r);
+            assert!(
+                msg.contains(r#"`support_files` pattern "lib/**" matches no file"#)
+                    && msg.contains(r#"["bin/tool", "include/a.h""#),
+                "{msg}"
+            );
+        }
+    }
+
+    /// A hard link `include` takes, whose target only `support` takes, is a
+    /// copy of an extracted file, so it is written.
+    #[test]
+    fn a_hard_link_to_a_support_file_is_written() {
+        let bytes = tar_bytes(&[E::File("lib/a", b"same", 0o644), E::Hardlink("b", "lib/a")]);
+        let (dir, r) = run_opts("t", &bytes, Format::Tar, supporting(&["b"], &["lib/**"]));
+        assert_eq!(r.unwrap(), 2);
+        assert_eq!(read(&dir, "b"), "same");
     }
 
     /// An included hard link copies its target, so the target must be
