@@ -66,9 +66,16 @@ struct JsonRun {
     /// What `finalize` makes of the walk's skips: an error when it skipped
     /// part of the selection.
     complete: anyhow::Result<()>,
+    /// The failure boxes a text run of the same request prints.
+    boxes: String,
 }
 
 impl JsonRun {
+    /// How many failure boxes the text run prints.
+    fn box_count(&self) -> usize {
+        self.boxes.matches("× target failed:").count()
+    }
+
     fn entry(&self, addr: &str) -> &Value {
         self.entries
             .iter()
@@ -146,6 +153,8 @@ async fn run_json(
         }
         (closed, c.res.map(drop), events)
     };
+    // The failure boxes the text run prints, from the same request.
+    let boxes = heph::commands::errors::render_failures_to_string(&rs.failures(), false);
     drain(rs).await;
     let text = String::from_utf8(buf).expect("utf-8");
     let entries = if closed {
@@ -165,6 +174,7 @@ async fn run_json(
         res,
         events,
         complete: heph::commands::errors::require_complete_selection(&gaps),
+        boxes,
     }
 }
 
@@ -426,11 +436,12 @@ async fn run_json_entries_broken_package() {
     );
 }
 
-/// The duplicate-end risk: two requested targets of one broken `d/BUILD`.
-/// The walk probes `d` and, keep-going, records a gap: no end and no record
-/// for either, and the list is left open (D10), so no duplicate end can keep
-/// it pending. One requested target is the file's entry: the file's record
-/// (`addr: null`), then the target skipped because of it, closed.
+/// Two requested targets of one broken `d/BUILD`, under the default
+/// keep-going walk: the walk's probe of `d` fails, and the file is blamed
+/// rather than left a gap (D5, U2): the file's record (`addr: null`), then
+/// both targets skipped because of it, each reaching the file through
+/// itself, and the list closed. One requested target is the file's entry:
+/// the same file record, then the target, closed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_json_broken_build_two_requested_targets() {
     let root = tempfile::tempdir().expect("root tempdir");
@@ -445,9 +456,33 @@ async fn run_json_broken_build_two_requested_targets() {
     let engine = build_engine_with_remote(root.path(), None);
     let m = Matcher::Or(vec![addr("//d:t1"), addr("//d:t2")]);
     let two = run_json(&engine, &m, &["--json"], None).await;
-    assert!(!two.closed, "a gap leaves the list open: {:?}", two.entries);
-    assert!(two.entries.is_empty(), "{:?}", two.entries);
-    assert!(two.complete.is_err(), "the walk skipped `d`");
+    assert!(
+        two.closed,
+        "every requested target is accounted for: {:?}",
+        two.entries
+    );
+    assert!(
+        two.complete.is_ok(),
+        "the file is blamed, not skipped: {:?}",
+        two.complete
+    );
+    assert!(two.res.is_err(), "the run fails");
+    assert_eq!(two.box_count(), 1, "one box, the file's: {}", two.boxes);
+    assert_eq!(two.entries.len(), 3, "{:?}", two.entries);
+    let file = &two.entries[0];
+    assert!(file["addr"].is_null(), "{file}");
+    assert_eq!(file["file"], "d/BUILD", "{file}");
+    assert_eq!(file["root"], "d/BUILD", "{file}");
+    assert_eq!(file["selected"], false, "{file}");
+    assert_eq!(file["path"], serde_json::json!(["//d:t1"]), "{file}");
+    for t in ["//d:t1", "//d:t2"] {
+        let e = two.entry(t);
+        assert_eq!(e["outcome"], "skipped", "{e}");
+        assert_eq!(e["root"], "d/BUILD", "{e}");
+        assert_eq!(e["selected"], true, "{e}");
+        assert_eq!(e["path"], serde_json::json!([t]), "{e}");
+        assert!(e["error"].is_null(), "{e}");
+    }
 
     let one = run_json(&engine, &addr("//d:t1"), &["--json"], None).await;
     assert!(one.closed, "{:?}", one.entries);
@@ -512,4 +547,203 @@ async fn json_flag_keeps_cache_hit() {
         )),
         "the plain run re-ran //p:ok"
     );
+}
+
+/// A bash target named `name`, with `extra` keyword arguments.
+fn bash(name: &str, extra: &str) -> String {
+    format!(
+        r#"target(name = "{name}", driver = "bash", run = "echo ok > $OUT", out = "o.txt"{extra})"#
+    )
+}
+
+/// D5: a culprit the selection did not name still has its record, with
+/// `selected: false`, and the selected target it took down names it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unselected_culprit_emitted_selected_false() {
+    let root = tempfile::tempdir().expect("root tempdir");
+    write_pkg(root.path(), "p", BUILD);
+    let engine = build_engine_with_remote(root.path(), None);
+
+    let run = run_json(&engine, &addr("//p:blk"), &["--json"], None).await;
+    assert!(run.res.is_err(), "a dependency failed: the run fails");
+    assert!(run.closed, "{:?}", run.entries);
+    assert_eq!(run.entries.len(), 2, "{:?}", run.entries);
+    let bad = run.entry("//p:bad");
+    assert_eq!(keys(bad), DEFAULT_KEYS, "{bad}");
+    assert_eq!(bad["outcome"], "failed", "{bad}");
+    assert_eq!(bad["selected"], false, "not named by the selection: {bad}");
+    assert_eq!(bad["root"], "//p:bad", "{bad}");
+    assert_eq!(
+        bad["path"],
+        serde_json::json!(["//p:blk", "//p:bad"]),
+        "{bad}"
+    );
+    assert_eq!(bad["exit_code"], 3, "{bad}");
+    assert!(bad["failure"]["log"].is_string(), "{bad}");
+    let blk = run.entry("//p:blk");
+    assert_eq!(blk["outcome"], "skipped", "{blk}");
+    assert_eq!(blk["selected"], true, "{blk}");
+    assert_eq!(blk["root"], "//p:bad", "{blk}");
+}
+
+/// D5 / U2: `//a:t1` and `//a:t2` both reach `//d:t` through `//b:t` and
+/// `//c:t`, and `d/BUILD` does not parse. One record for the file:
+/// `addr: null`, `file` set, its own root, never selected, with the path
+/// from the smaller requested address to the address that led into it. Each
+/// requested target is skipped because of the file, with its full path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn file_culprit_record_shape() {
+    let root = tempfile::tempdir().expect("root tempdir");
+    let dep = |d: &str| format!(r#", deps = ["{d}"]"#);
+    write_pkg(
+        root.path(),
+        "a",
+        &format!(
+            "{}\n{}\n",
+            bash("t1", &dep("//b:t")),
+            bash("t2", &dep("//b:t"))
+        ),
+    );
+    write_pkg(root.path(), "b", &bash("t", &dep("//c:t")));
+    write_pkg(root.path(), "c", &bash("t", &dep("//d:t")));
+    write_pkg(root.path(), "d", "target(name = \"t\"\nbroken(\n");
+    let engine = build_engine_with_remote(root.path(), None);
+
+    let m = Matcher::Or(vec![addr("//a:t1"), addr("//a:t2")]);
+    let run = run_json(&engine, &m, &["--json"], None).await;
+    assert!(run.res.is_err(), "the run fails");
+    assert!(run.closed, "{:?}", run.entries);
+    assert_eq!(
+        run.entries.len(),
+        3,
+        "the file and the two requested: {:?}",
+        run.entries
+    );
+    let file = &run.entries[0];
+    assert_eq!(keys(file), DEFAULT_KEYS, "{file}");
+    assert!(
+        file["addr"].is_null(),
+        "a path never goes in `addr`: {file}"
+    );
+    assert_eq!(file["file"], "d/BUILD", "{file}");
+    assert_eq!(file["outcome"], "failed", "{file}");
+    assert_eq!(file["root"], "d/BUILD", "a culprit is its own root: {file}");
+    assert_eq!(file["selected"], false, "a file is never selected: {file}");
+    assert_eq!(
+        file["path"],
+        serde_json::json!(["//a:t1", "//b:t", "//c:t", "//d:t"]),
+        "{file}"
+    );
+    assert!(
+        file["error"]
+            .as_str()
+            .is_some_and(|e| !e.is_empty() && !e.contains('\n')),
+        "one line: {file}"
+    );
+    for null in ["exit_code", "cache", "remote", "more", "failure"] {
+        assert!(file[null].is_null(), "{null}: {file}");
+    }
+    assert_eq!(run.box_count(), 1, "{}", run.boxes);
+    for t in ["//a:t1", "//a:t2"] {
+        let e = run.entry(t);
+        assert_eq!(keys(e), DEFAULT_KEYS, "{e}");
+        assert_eq!(e["outcome"], "skipped", "{e}");
+        assert_eq!(e["selected"], true, "{e}");
+        assert_eq!(e["root"], "d/BUILD", "{e}");
+        assert_eq!(
+            e["path"],
+            serde_json::json!([t, "//b:t", "//c:t", "//d:t"]),
+            "{e}"
+        );
+        assert_eq!(e["more"], 0, "{e}");
+        assert!(e["file"].is_null(), "{e}");
+        assert!(e["error"].is_null(), "{e}");
+    }
+}
+
+/// D5: whichever order the selection names them in, a culprit's record is
+/// written before the records of the targets it took down: a reader that
+/// meets a `root` has already read it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn culprit_record_precedes_its_skipped_records() {
+    let root = tempfile::tempdir().expect("root tempdir");
+    write_pkg(root.path(), "p", BUILD);
+    let engine = build_engine_with_remote(root.path(), None);
+
+    for m in [
+        Matcher::Or(vec![addr("//p:blk"), addr("//p:bad")]),
+        Matcher::Or(vec![addr("//p:bad"), addr("//p:blk")]),
+        addr("//p:blk"),
+    ] {
+        let run = run_json(&engine, &m, &["--json"], None).await;
+        assert!(run.closed, "{m:?}: {:?}", run.entries);
+        let id = |e: &Value| {
+            e["addr"]
+                .as_str()
+                .or_else(|| e["file"].as_str())
+                .map(str::to_owned)
+        };
+        let seen: Vec<_> = run.entries.iter().filter_map(id).collect();
+        for e in &run.entries {
+            if e["outcome"] != "skipped" {
+                continue;
+            }
+            let root = e["root"].as_str().expect("a skipped record names its root");
+            let me = id(e).expect("an id");
+            let at = |x: &str| seen.iter().position(|s| s == x);
+            assert!(
+                at(root).is_some_and(|r| Some(r) < at(&me)),
+                "{m:?}: {root} before {me}: {seen:?}"
+            );
+        }
+        assert!(
+            run.entries.iter().any(|e| e["outcome"] == "skipped"),
+            "{m:?}: {:?}",
+            run.entries
+        );
+    }
+}
+
+/// U3: a 500-deep chain to a culprit. The text box elides the path; the
+/// JSON record carries all of it: 501 entries, from the requested target
+/// to the culprit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn long_chain_elided_in_text_full_in_json() {
+    const DEPTH: usize = 500;
+    let root = tempfile::tempdir().expect("root tempdir");
+    let mut build = bash("leaf", r#", deps = [":missing"]"#);
+    for i in 0..DEPTH {
+        let dep = if i + 1 == DEPTH {
+            "leaf".to_string()
+        } else {
+            format!("n{:03}", i + 1)
+        };
+        build.push('\n');
+        build.push_str(&bash(
+            &format!("n{i:03}"),
+            &format!(r#", deps = [":{dep}"]"#),
+        ));
+    }
+    write_pkg(root.path(), "a", &build);
+    let engine = build_engine_with_remote(root.path(), None);
+
+    let run = run_json(&engine, &addr("//a:n000"), &["--json"], None).await;
+    assert!(run.closed, "{:?}", run.entries);
+    let leaf = run.entry("//a:leaf");
+    let path = leaf["path"].as_array().expect("a path");
+    assert_eq!(path.len(), DEPTH + 1, "{leaf}");
+    assert_eq!(path.first().and_then(Value::as_str), Some("//a:n000"));
+    assert_eq!(path.last().and_then(Value::as_str), Some("//a:leaf"));
+    let top = run.entry("//a:n000");
+    assert_eq!(top["path"], leaf["path"], "{top}");
+
+    assert_eq!(run.box_count(), 1, "{}", run.boxes);
+    assert!(
+        run.boxes.contains(
+            "reached by: //a:n000 → //a:n001 → … 497 more (--json has the full path) … → //a:n499 → //a:leaf"
+        ),
+        "{}",
+        run.boxes
+    );
+    assert!(!run.boxes.contains("//a:n250"), "elided: {}", run.boxes);
 }
