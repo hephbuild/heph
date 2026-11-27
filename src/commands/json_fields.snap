@@ -50,8 +50,7 @@ query	hashin	string?	built	opt-in
 query	labels	[string]?	free	default
 query	name	string	free	default
 query	package	string	free	default
-run	addr	string	free	default
-run	blocked_by	string?	free	default
+run	addr	string?	free	default
 run	cache	"local"	free	default
 run	cache	"miss"	free	default
 run	cache	"remote"	free	default
@@ -63,15 +62,20 @@ run	failure	object?	free	default
 run	failure.fixes	string?	free	default
 run	failure.log	string?	free	default
 run	failure.out	string?	free	default
+run	file	string?	free	default
 run	hashin	string?	built	opt-in
-run	outcome	"blocked"	free	default
+run	more	number?	free	default
 run	outcome	"cached"	free	default
 run	outcome	"cancelled"	free	default
 run	outcome	"failed"	free	default
 run	outcome	"ran"	free	default
+run	outcome	"skipped"	free	default
 run	outcome	string	free	default
 run	outputs	[string]?	free	opt-in
+run	path	[string]?	free	default
 run	remote	string?	free	default
+run	root	string?	free	default
+run	selected	bool	free	default
 run	timed_out	bool	free	default
 session inflight	id	string	free	default
 session inflight	report	string	free	default

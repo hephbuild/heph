@@ -28,16 +28,20 @@ target(name = "blk", driver = "bash", run = "echo b > $OUT", out = "blk.txt", de
 "#;
 
 /// The default fields: every `free` one but `outputs`.
-const DEFAULT_KEYS: [&str; 10] = [
+const DEFAULT_KEYS: [&str; 14] = [
     "addr",
-    "blocked_by",
     "cache",
     "duration_ms",
     "error",
     "exit_code",
     "failure",
+    "file",
+    "more",
     "outcome",
+    "path",
     "remote",
+    "root",
+    "selected",
     "timed_out",
 ];
 
@@ -194,7 +198,8 @@ async fn run_json_entries() {
     assert_eq!(e["cache"], "miss", "{e}");
     assert_eq!(e["exit_code"], 0, "{e}");
     assert_eq!(e["timed_out"], false, "{e}");
-    for null in ["error", "blocked_by", "failure", "remote"] {
+    assert_eq!(e["selected"], true, "{e}");
+    for null in ["error", "failure", "remote", "file", "root", "more", "path"] {
         assert!(e[null].is_null(), "{null}: {e}");
     }
 
@@ -236,8 +241,16 @@ async fn run_json_entries() {
     assert!(bad["outputs"].is_null(), "a failure has no outputs: {bad}");
 
     let blk = all.entry("//p:blk");
-    assert_eq!(blk["outcome"], "blocked", "{blk}");
-    assert_eq!(blk["blocked_by"], "//p:bad", "{blk}");
+    assert_eq!(bad["root"], "//p:bad", "a culprit is its own root: {bad}");
+    assert_eq!(blk["outcome"], "skipped", "{blk}");
+    assert_eq!(blk["root"], "//p:bad", "{blk}");
+    assert_eq!(
+        blk["path"],
+        serde_json::json!(["//p:blk", "//p:bad"]),
+        "{blk}"
+    );
+    assert_eq!(blk["more"], 0, "{blk}");
+    assert!(blk["error"].is_null(), "{blk}");
     assert!(blk["exit_code"].is_null(), "{blk}");
     assert!(blk["failure"].is_null(), "{blk}");
 
@@ -411,6 +424,51 @@ async fn run_json_entries_broken_package() {
             .is_some(),
         "{skipped:#}"
     );
+}
+
+/// The duplicate-end risk: two requested targets of one broken `d/BUILD`.
+/// The walk probes `d` and, keep-going, records a gap: no end and no record
+/// for either, and the list is left open (D10), so no duplicate end can keep
+/// it pending. One requested target is the file's entry: the file's record
+/// (`addr: null`), then the target skipped because of it, closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_json_broken_build_two_requested_targets() {
+    let root = tempfile::tempdir().expect("root tempdir");
+    let t = |n: &str| {
+        format!(r#"target(name = "{n}", driver = "bash", run = "echo ok > $OUT", out = "o.txt")"#)
+    };
+    write_pkg(
+        root.path(),
+        "d",
+        &format!("{}\n{}\nfail(\"boom\")\n", t("t1"), t("t2")),
+    );
+    let engine = build_engine_with_remote(root.path(), None);
+    let m = Matcher::Or(vec![addr("//d:t1"), addr("//d:t2")]);
+    let two = run_json(&engine, &m, &["--json"], None).await;
+    assert!(!two.closed, "a gap leaves the list open: {:?}", two.entries);
+    assert!(two.entries.is_empty(), "{:?}", two.entries);
+    assert!(two.complete.is_err(), "the walk skipped `d`");
+
+    let one = run_json(&engine, &addr("//d:t1"), &["--json"], None).await;
+    assert!(one.closed, "{:?}", one.entries);
+    assert_eq!(one.entries.len(), 2, "{:?}", one.entries);
+    let file = &one.entries[0];
+    assert!(file["addr"].is_null(), "{file}");
+    assert_eq!(file["file"], "d/BUILD", "{file}");
+    assert_eq!(file["root"], "d/BUILD", "{file}");
+    assert_eq!(file["outcome"], "failed", "{file}");
+    assert_eq!(file["selected"], false, "{file}");
+    assert_eq!(file["path"], serde_json::json!(["//d:t1"]), "{file}");
+    assert!(
+        file["error"].as_str().is_some_and(|e| !e.contains('\n')),
+        "{file}"
+    );
+    let t1 = &one.entries[1];
+    assert_eq!(t1["addr"], "//d:t1", "{t1}");
+    assert_eq!(t1["outcome"], "skipped", "{t1}");
+    assert_eq!(t1["root"], "d/BUILD", "{t1}");
+    assert_eq!(t1["selected"], true, "{t1}");
+    assert_eq!(t1["path"], serde_json::json!(["//d:t1"]), "{t1}");
 }
 
 /// I6: `--json` reaches no cache key, so the plain run after it is a local
