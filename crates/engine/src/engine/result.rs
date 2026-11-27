@@ -3,8 +3,9 @@ use crate::engine::discovery::{Discovery, InProvider};
 use crate::engine::driver::targetdef::{Input, TargetDef};
 use crate::engine::driver::{ApplyTransitiveRequest, ParseRequest, outputartifact};
 use crate::engine::error::{
-    CancelledError, CycleError, HashUnknownError, MultiError, RevisionChangedError,
-    ShellNeedsSingleTarget, TargetFailure, TargetNotFoundError, UpstreamFailed,
+    CancelledError, Culprit, CycleError, FileEvalFailed, HashUnknownError, InputDefFailed,
+    MissingDep, MultiError, RevisionChangedError, ShellNeedsSingleTarget, StageFrame,
+    TargetFailure, TargetNotFoundError, UpstreamFailed,
 };
 use crate::engine::provider::{
     GetError, GetRequest, GetResponse, ListRequest, ProbeRequest, ProviderExecutor, State,
@@ -2213,15 +2214,19 @@ fn classify_failure_fresh(
     addr: &Addr,
     e: anyhow::Error,
 ) -> (anyhow::Error, bool) {
-    match failure_fate(addr, &e) {
+    let (culprit, entry) = match failure_fate(addr, &e) {
         FailureFate::Propagate => return (e, false),
+        FailureFate::Cancelled => return (anyhow::Error::new(CancelledError), false),
         FailureFate::Upstream(root) => return (UpstreamFailed { root }.into(), false),
         FailureFate::Shell(shell) => return (anyhow::Error::new(shell.clone()), false),
-        FailureFate::Own => {}
-    }
+        FailureFate::Blame { culprit, entry } => (culprit, entry.clone()),
+    };
 
-    // This target's own failure (or an aggregation of unrecorded causes): record
-    // the rich diagnostic once (first-writer-wins) and propagate a cheap marker.
+    // A culprit's failure — this target's own, an input whose def failed, a
+    // declarer naming a missing dep, a BUILD file that did not evaluate:
+    // record the rich diagnostic once against the culprit (first-writer-wins)
+    // and propagate a cheap marker naming it. This target, when it is not the
+    // culprit, is skipped.
     // The log and its tail are always kept (D6.1): whether the output already
     // streamed to the user's terminal is recorded beside them, from what the
     // wrapper wrote, and each renderer decides what to show.
@@ -2233,9 +2238,13 @@ fn classify_failure_fresh(
     let sandbox = slot.and_then(|s| s.sandbox.clone());
     let streamed = crate::engine::failure_slot::RunStreamed::on(&e);
     let fresh = rs.record_failure(
-        addr.clone(),
+        culprit.clone(),
         Arc::new(
-            TargetFailure::new(addr.clone(), log_tail, e)
+            TargetFailure::new(entry, log_tail, e)
+                .with_file(match &culprit {
+                    Culprit::File(file) => Some(Arc::clone(file)),
+                    Culprit::Target(_) => None,
+                })
                 .with_log(log)
                 .with_outputs(outputs)
                 .with_fixes(fixes)
@@ -2243,7 +2252,17 @@ fn classify_failure_fresh(
                 .with_streamed(streamed),
         ),
     );
-    (UpstreamFailed { root: addr.clone() }.into(), fresh)
+    (UpstreamFailed { root: culprit }.into(), fresh)
+}
+
+/// The address a collateral end names as `upstream_of` for `root`: the
+/// culprit target, or for a file the address that led into it (read from
+/// its record). A path never goes in an address field.
+fn upstream_addr(rs: &RequestState, root: &Culprit) -> Option<String> {
+    match root {
+        Culprit::Target(addr) => Some(addr.format()),
+        Culprit::File(_) => rs.get_culprit_failure(root).map(|f| f.addr.format()),
+    }
 }
 
 /// `addr`'s `ResultEnd`, for its result scope and for a failure
@@ -2308,13 +2327,83 @@ enum FailureFate<'a> {
     /// Not a target's failure (a stop, a cycle, a request-shape error):
     /// propagated unchanged, never recorded.
     Propagate,
+    /// A stop inside an aggregate: surfaced as a fresh `CancelledError`, so
+    /// a Ctrl-C during deps never reads as a failure of this target.
+    Cancelled,
     /// Collateral: a fresh marker naming the root, never recorded.
-    Upstream(Addr),
+    Upstream(Culprit),
     /// A request-shape error aggregated with its identical siblings,
     /// surfaced alone.
     Shell(&'a ShellNeedsSingleTarget),
-    /// This target's own failure: recorded.
-    Own,
+    /// A culprit's failure: recorded against `culprit`, with `entry` as the
+    /// record's address (the culprit target, or for a file the address that
+    /// led into it). This target's own when `culprit` is `Target(addr)`;
+    /// otherwise this target is skipped.
+    Blame { culprit: Culprit, entry: Addr },
+}
+
+impl FailureFate<'_> {
+    /// Whether this target is itself the culprit.
+    fn is_own(&self, addr: &Addr) -> bool {
+        matches!(self, Self::Blame { culprit: Culprit::Target(c), .. } if c == addr)
+    }
+
+    /// Whether the failure is recorded with this target as its address: its
+    /// own, or a file that did not evaluate reached through it.
+    fn is_entry(&self, addr: &Addr) -> bool {
+        matches!(self, Self::Blame { entry, .. } if entry == addr)
+    }
+}
+
+/// A stop: a `CancelledError` on the chain, or inside any member of an
+/// aggregate on it.
+fn is_stop(e: &anyhow::Error) -> bool {
+    downcast_chain_ref::<CancelledError>(e).is_some()
+        || downcast_chain_ref::<MultiError>(e).is_some_and(|m| m.0.iter().any(is_stop))
+}
+
+/// The culprit of a failure that is not a marker, a stop or a request
+/// error (D1.c rules 4–6), and the address its record carries.
+///
+/// Walks every level of the chain (the memoizer's shared wrappers
+/// included) and keeps the innermost frame of each kind:
+/// - a [`MissingDep`] blames its declarer;
+/// - else the innermost [`InputDefFailed`] input or [`StageFrame`] address
+///   is the target whose own spec or def raised the error — or, when a
+///   [`FileEvalFailed`] is on the chain, that file, entered through it;
+/// - else the error is `addr`'s own (or its file's, for a requested target
+///   in a BUILD file that did not evaluate).
+///
+/// Within one level anyhow only shows the outermost frame of a type; the
+/// engine adds these frames across memoized calls, one per level.
+fn blame(addr: &Addr, e: &anyhow::Error) -> (Culprit, Addr) {
+    let mut missing: Option<&MissingDep> = None;
+    let mut frame: Option<&Addr> = None;
+    let mut file: Option<&FileEvalFailed> = None;
+    for level in hcore::hmemoizer::shared_levels(e) {
+        if let Some(m) = level.downcast_ref::<MissingDep>() {
+            missing = Some(m);
+        }
+        if let Some(i) = level.downcast_ref::<InputDefFailed>() {
+            frame = Some(&i.input);
+        }
+        // A stage frame is added inside the def an `InputDefFailed` wraps, so
+        // on one level it is the inner of the two.
+        if let Some(s) = level.downcast_ref::<StageFrame>() {
+            frame = Some(&s.addr);
+        }
+        if let Some(f) = level.downcast_ref::<FileEvalFailed>() {
+            file = Some(f);
+        }
+    }
+    if let Some(m) = missing {
+        return (Culprit::Target(m.declarer.clone()), m.declarer.clone());
+    }
+    let entry = frame.unwrap_or(addr).clone();
+    match file {
+        Some(f) => (Culprit::File(Arc::clone(&f.file)), entry),
+        None => (Culprit::Target(entry.clone()), entry),
+    }
 }
 
 fn failure_fate<'a>(addr: &Addr, e: &'a anyhow::Error) -> FailureFate<'a> {
@@ -2354,14 +2443,7 @@ fn failure_fate<'a>(addr: &Addr, e: &'a anyhow::Error) -> FailureFate<'a> {
         return FailureFate::Upstream(uf.root.clone());
     }
 
-    // Aggregation of child failures. If *every* child is already a recorded
-    // collateral marker (or a cancellation), the real root causes live in the
-    // registry downstream — this target has no own work to blame, so collapse to
-    // a cheap marker without recording. But if any child is a genuine,
-    // unrecorded cause (e.g. a `TargetNotFound` raised while resolving an input's
-    // def in `link`/`meta`, which never passes through `result_addr`), fall
-    // through and record the whole aggregation against this target so the detail
-    // (every broken input) isn't lost.
+    // Aggregation of child failures.
     if let Some(multi) = downcast_chain_ref::<MultiError>(e) {
         // A request-shape error aggregated with `fail_fast = false` is still a
         // request error, not this target's failure. Surface it alone: every
@@ -2371,23 +2453,44 @@ fn failure_fate<'a>(addr: &Addr, e: &'a anyhow::Error) -> FailureFate<'a> {
                 return FailureFate::Shell(shell);
             }
         }
-        let all_collateral = multi.0.iter().all(|inner| {
-            downcast_chain_ref::<UpstreamFailed>(inner).is_some()
-                || downcast_chain_ref::<CancelledError>(inner).is_some()
-        });
-        if all_collateral {
-            let root = multi
-                .0
-                .iter()
-                .find_map(|inner| {
-                    downcast_chain_ref::<UpstreamFailed>(inner).map(|u| u.root.clone())
-                })
-                .unwrap_or_else(|| addr.clone());
-            return FailureFate::Upstream(root);
+        // A stop among them is a stop (rule 1, RUN-22): never a failure
+        // this target is blamed for, nor collateral naming itself.
+        if multi.0.iter().any(is_stop) {
+            return FailureFate::Cancelled;
         }
+        // Every child already a recorded marker: the real causes live in the
+        // registry downstream, so collapse to a cheap marker naming one.
+        let markers: Option<Vec<&Culprit>> = multi
+            .0
+            .iter()
+            .map(|inner| downcast_chain_ref::<UpstreamFailed>(inner).map(|u| &u.root))
+            .collect();
+        if let Some(first) = markers.and_then(|m| m.first().copied().cloned()) {
+            return FailureFate::Upstream(first);
+        }
+        // Unrecorded causes (an input's def failing in `link`/`meta`, which
+        // never passes through its `result_addr`): when every one of them
+        // blames the same culprit, that culprit; otherwise the aggregation
+        // is recorded against this target, so no broken input is lost.
+        let mut blamed = multi
+            .0
+            .iter()
+            .filter(|inner| downcast_chain_ref::<UpstreamFailed>(inner).is_none())
+            .map(|inner| blame(addr, inner));
+        if let Some(first) = blamed.next()
+            && blamed.all(|other| other == first)
+        {
+            let (culprit, entry) = first;
+            return FailureFate::Blame { culprit, entry };
+        }
+        return FailureFate::Blame {
+            culprit: Culprit::Target(addr.clone()),
+            entry: addr.clone(),
+        };
     }
 
-    FailureFate::Own
+    let (culprit, entry) = blame(addr, e);
+    FailureFate::Blame { culprit, entry }
 }
 
 /// `ResultEnd`'s `left_behind`: what the failure slot holds, plus whether the
@@ -2441,7 +2544,7 @@ fn surface_top(is_top: bool, rs: &RequestState, e: anyhow::Error) -> anyhow::Err
     }
     // Prefer the rich failure for the marker's named root.
     if let Some(tf) =
-        downcast_chain_ref::<UpstreamFailed>(&e).and_then(|uf| rs.get_failure(&uf.root))
+        downcast_chain_ref::<UpstreamFailed>(&e).and_then(|uf| rs.get_culprit_failure(&uf.root))
     {
         return anyhow::Error::new((*tf).clone());
     }
@@ -2487,7 +2590,11 @@ impl Engine {
         addr: &Addr,
         e: anyhow::Error,
     ) -> anyhow::Error {
-        let detail = matches!(failure_fate(addr, &e), FailureFate::Own)
+        // Announced here when the record carries this target's address: its
+        // own failure, or (until a file culprit has its own event) a BUILD
+        // file that did not evaluate, reached through it.
+        let detail = failure_fate(addr, &e)
+            .is_entry(addr)
             .then(|| crate::engine::event::ErrorDetail::from_error(&e));
         let (e, fresh) = classify_failure_fresh(rs, addr, e);
         if let Some(detail) = detail
@@ -3276,6 +3383,7 @@ impl Engine {
         // own rule when the scope fails, before its end is built.
         let upstream: Arc<std::sync::OnceLock<String>> = Arc::default();
         let end_upstream = Arc::clone(&upstream);
+        let fate_rs = Arc::clone(&rs);
         let log_engine = Arc::clone(&self);
         crate::engine::event::emit_scope_with(
             &rs,
@@ -3297,11 +3405,20 @@ impl Engine {
             },
             |e| {
                 let fate = failure_fate(addr, e);
-                if let FailureFate::Upstream(root) = &fate {
+                // A skipped target names its culprit's address: the culprit
+                // target, or the address that led into a broken file.
+                let root = match &fate {
+                    FailureFate::Upstream(root) => upstream_addr(&fate_rs, root),
+                    FailureFate::Blame { entry, .. } if !fate.is_own(addr) => {
+                        Some(entry.format()).filter(|e| *e != addr.format())
+                    }
+                    _ => None,
+                };
+                if let Some(root) = root {
                     // Set once: this scope ends once.
-                    let _first: Result<(), String> = upstream.set(root.format());
+                    let _first: Result<(), String> = upstream.set(root);
                 }
-                matches!(fate, FailureFate::Own).then(|| async move {
+                fate.is_own(addr).then_some(async move {
                     // Set once: this scope ends once.
                     let _first: Result<(), bool> =
                         readable.set(log_engine.log_readable(addr).await);
@@ -6242,7 +6359,7 @@ impl Engine {
 
         let all_transitive = if apply_transitive {
             let sb = Arc::clone(&self)
-                .collect_transitive_deps(rs.clone(), &def.inputs)
+                .collect_transitive_deps(rs.clone(), addr, &def.inputs)
                 .await?;
 
             if sb.empty() { None } else { Some(sb) }
@@ -6381,6 +6498,7 @@ impl Engine {
     async fn collect_transitive_deps(
         self: Arc<Self>,
         rs: Arc<RequestState>,
+        declarer: &Addr,
         inputs: &[Input],
     ) -> anyhow::Result<Sandbox> {
         // Hash-only inputs (`hash_deps`) don't participate in the runtime
@@ -6404,10 +6522,24 @@ impl Engine {
             .map(|(i, input)| {
                 let input_ref = &input.r#ref;
                 enclose!((self => engine, rs) async move {
+                    let dep = &input_ref.r#ref;
                     let spec = Arc::clone(&engine)
-                        .get_spec(rs.clone(), &input_ref.r#ref)
+                        .get_spec(rs.clone(), dep)
                         .await
-                        .with_context(|| format!("get spec: {}", input_ref))?;
+                        .map_err(|e| {
+                            MissingDep::wrap_or(
+                                e,
+                                dep,
+                                declarer,
+                                || crate::engine::deferred::declared_origin(&input.origin_id),
+                                || {
+                                    Some(hplugin::error::StageFrame {
+                                        stage: hplugin::error::Stage::Spec,
+                                        addr: dep.clone(),
+                                    })
+                                },
+                            )
+                        })?;
 
                     // For transparent targets (groups), use the pre-computed applied_transitive
                     // which already recursively aggregates all nested deps' transitives.

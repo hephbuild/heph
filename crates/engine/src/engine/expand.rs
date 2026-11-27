@@ -1,6 +1,8 @@
 use crate::engine::Engine;
 use crate::engine::driver::TargetAddr;
 use crate::engine::driver::targetdef::{Input, InputMode, TargetDef};
+use crate::engine::deferred::declared_origin;
+use crate::engine::error::{InputDefFailed, MissingDep};
 use crate::engine::invoke::EntrypointAsInput;
 use crate::engine::request_state::{AddrKey, RequestState};
 use crate::engine::result::ExtendedTargetDef;
@@ -291,7 +293,7 @@ impl Engine {
         let mut defs = Vec::with_capacity(inputs.len());
         let mut visited = FxHashSet::default();
 
-        let mut resolved = self.input_defs(&rs, inputs).enumerate();
+        let mut resolved = self.input_defs(&rs, &declared.addr, inputs).enumerate();
         while let Some((idx, next)) = resolved.next().await {
             let (input, def) = next?;
 
@@ -354,7 +356,8 @@ impl Engine {
             anyhow::bail!("circular group dependency at '{}'", addr.format());
         }
 
-        let mut resolved = self.input_defs(&rs, members);
+        // A member is the group's declaration, not the outer target's.
+        let mut resolved = self.input_defs(&rs, addr, members);
         while let Some(next) = resolved.next().await {
             let (member, def) = next?;
             if def.target_def.transparent {
@@ -393,19 +396,40 @@ impl Engine {
     /// a credential edge, and the members of a group — so this is the one
     /// place an entrypoint is refused as one (I8). Otherwise a build step
     /// could run something in a developer's cwd.
+    ///
+    /// A def that fails is marked where it fails, for the failure classifier:
+    /// a not-found of the input itself is `declarer`'s [`MissingDep`] (the
+    /// target, or the group, that names it), anything else the input's own
+    /// failure ([`InputDefFailed`]), never `declarer`'s.
     fn input_defs<'a>(
         self: &Arc<Self>,
         rs: &Arc<RequestState>,
+        declarer: &'a Addr,
         inputs: &'a [Input],
     ) -> impl Stream<Item = anyhow::Result<(&'a Input, Arc<ExtendedTargetDef>)>> + Send + use<'a>
     {
         inputs
             .iter()
-            .map(|input| {
+            .map(move |input| {
                 Arc::clone(self)
                     .get_def(rs.clone(), &input.r#ref.r#ref)
                     .map(move |def| {
-                        let def = def?;
+                        let def = def.map_err(|e| {
+                            let dep = &input.r#ref.r#ref;
+                            MissingDep::wrap_or(
+                                e,
+                                dep,
+                                declarer,
+                                || declared_origin(&input.origin_id),
+                                || {
+                                    Some(InputDefFailed {
+                                        input: dep.clone(),
+                                        declarer: declarer.clone(),
+                                        origin_id: input.origin_id.clone(),
+                                    })
+                                },
+                            )
+                        })?;
                         if def.target_def.entrypoint.is_some() {
                             return Err(EntrypointAsInput {
                                 entrypoint: input.r#ref.r#ref.clone(),

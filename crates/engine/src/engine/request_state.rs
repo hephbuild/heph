@@ -1,6 +1,6 @@
 use crate::engine::Engine;
 use crate::engine::driver::targetdef::TargetDef;
-use crate::engine::error::{CycleError, TargetFailure};
+use crate::engine::error::{Culprit, CycleError, TargetFailure};
 use crate::engine::meta::ResultMeta;
 use crate::engine::provider::{State, TargetSpec};
 use crate::engine::resource_pool::sampler::PoolSampler;
@@ -492,11 +492,12 @@ pub struct RequestStateData {
     /// `PoolUsage` waits for it (bounded), so the report a request ends on
     /// shows the slots its runs freed.
     sandbox_removals: crate::engine::sandbox_cleaner::PendingCounter,
-    /// Per-request registry of genuinely-failing targets, keyed by addr. Populated
-    /// by the `result_addr` classifier (first-writer-wins dedup) and drained once
-    /// at the end of execution for rendering. Shared via `Arc<RequestStateData>`,
-    /// so `with_parent` / `with_skip_provider` children record into the same map.
-    pub failures: Mutex<indexmap::IndexMap<Addr, Arc<TargetFailure>>>,
+    /// Per-request registry of culprits, keyed by what is to blame (a target,
+    /// or a BUILD file that did not evaluate). Populated by the `result_addr`
+    /// classifier (first-writer-wins dedup) and drained once at the end of
+    /// execution for rendering. Shared via `Arc<RequestStateData>`, so
+    /// `with_parent` / `with_skip_provider` children record into the same map.
+    pub failures: Mutex<indexmap::IndexMap<Culprit, Arc<TargetFailure>>>,
     /// What each root failure took down, keyed by the root's formatted addr:
     /// the targets whose `ResultEnd` named it as `upstream_of`. Read by the
     /// interactive failure report's `took down:` row.
@@ -1071,12 +1072,13 @@ impl RequestState {
             .store(frozen, std::sync::atomic::Ordering::Release);
     }
 
-    /// Records a genuinely-failing target's rich diagnostic. First-writer-wins:
-    /// if `addr` already has an entry (e.g. shared via the memoizer to multiple
-    /// waiters), the existing one is kept. Whether this call was the one
-    /// that recorded it.
-    pub fn record_failure(&self, addr: Addr, failure: Arc<TargetFailure>) -> bool {
-        match self.data.failures.lock().entry(addr) {
+    /// Records a culprit's rich diagnostic. First-writer-wins: if `culprit`
+    /// already has an entry (e.g. shared via the memoizer to multiple
+    /// waiters, or a broken BUILD file reached through several of its
+    /// targets), the existing one is kept. Whether this call was the one
+    /// that recorded it: the claim to announce the failure.
+    pub fn record_failure(&self, culprit: impl Into<Culprit>, failure: Arc<TargetFailure>) -> bool {
+        match self.data.failures.lock().entry(culprit.into()) {
             indexmap::map::Entry::Occupied(_) => false,
             indexmap::map::Entry::Vacant(v) => {
                 v.insert(failure);
@@ -1137,7 +1139,12 @@ impl RequestState {
     /// outermost `result_addr` frame to surface the rich root-cause diagnostic
     /// to its direct caller in place of the `UpstreamFailed` marker.
     pub fn get_failure(&self, addr: &Addr) -> Option<Arc<TargetFailure>> {
-        self.data.failures.lock().get(addr).cloned()
+        self.get_culprit_failure(&Culprit::Target(addr.clone()))
+    }
+
+    /// [`get_failure`](Self::get_failure) for any culprit, a file included.
+    pub fn get_culprit_failure(&self, culprit: &Culprit) -> Option<Arc<TargetFailure>> {
+        self.data.failures.lock().get(culprit).cloned()
     }
 
     /// Note that `addr` failed only because `root` did. Bounded per root: the

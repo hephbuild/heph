@@ -315,6 +315,23 @@ fn origin_id_for(r: &DeferredRef, p: &Producer, via: Option<&Addr>) -> String {
     }
 }
 
+/// How a declared input's origin reads to its author: `${read://}` /
+/// `${src://}` for a deferred edge (whose `origin_id` is a synthesized
+/// `option|…` path), the `origin_id` itself for every other input.
+pub(crate) fn declared_origin(origin_id: &str) -> String {
+    let Some(rest) = origin_id
+        .strip_prefix(DEFERRED_ORIGIN_PREFIX)
+        .and_then(|r| r.strip_prefix('|'))
+    else {
+        return origin_id.to_owned();
+    };
+    let kinds = rest.split('|');
+    match kinds.into_iter().find(|k| *k == READ || *k == SRC) {
+        Some(kind) => format!("${{{kind}://}}"),
+        None => origin_id.to_owned(),
+    }
+}
+
 pub fn inputs_for_labelled(refs: &[DeferredRef], via: Option<&Addr>) -> Vec<Input> {
     // Keyed on the *cell* as well as the address. Deduping on the address alone
     // silently dropped one of them the moment two kinds existed: `collect` sorts
@@ -532,7 +549,15 @@ impl Engine {
                 let value = self
                     .read_deferred_value_cached(rs, &p.addr)
                     .await
-                    .with_context(|| format!("{consumer}: `{}` in `{}`", r.raw, r.path))?;
+                    .map_err(|e| {
+                        hplugin::error::MissingDep::wrap_or(
+                            e,
+                            &p.addr.r#ref,
+                            consumer,
+                            || format!("${{{READ}://}}"),
+                            || Some(format!("{consumer}: `{}` in `{}`", r.raw, r.path)),
+                        )
+                    })?;
                 by_addr.insert(key, value);
             }
         }

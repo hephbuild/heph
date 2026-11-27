@@ -2082,10 +2082,23 @@ impl BuildFileLoader {
             }
             self.loads.evaluation_started();
 
-            let result = Arc::new(
-                eval_file(file_path, pkg, self)
-                    .map_err(|e| eval_diagnostic(&self.root, file_path, e))?,
-            );
+            let result = Arc::new(eval_file(file_path, pkg, self).map_err(|e| {
+                let e = eval_diagnostic(&self.root, file_path, e);
+                // Only the innermost file is typed: a file that failed because
+                // one it loads did is not itself the broken one (its error
+                // already carries the loaded file's, under `load() at …`).
+                if hcore::hmemoizer::downcast_chain_ref::<hplugin::error::FileEvalFailed>(&e)
+                    .is_some()
+                {
+                    return e;
+                }
+                let shown = file_path.display().to_string();
+                let rel = file_path.strip_prefix(&self.root).unwrap_or(file_path);
+                e.context(hplugin::error::FileEvalFailed {
+                    file: Arc::from(rel.to_string_lossy().as_ref()),
+                    shown,
+                })
+            })?);
             self.file_cache
                 .lock()
                 .map_err(|_e| anyhow::anyhow!("file_cache lock poisoned"))?
