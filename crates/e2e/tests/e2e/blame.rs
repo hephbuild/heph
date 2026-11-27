@@ -4,8 +4,10 @@
 //! never the dependent that happened to resolve it.
 //!
 //! Each test reads the request's failure registry (`take_failures`), which
-//! holds one record per culprit. What the report prints about it (`path`,
-//! `more`, `reached by:`, JSON) is the next stage's; these pin the blame.
+//! holds one record per culprit, its events, and the request-end pass over
+//! its skipped targets (D1.e: each one's `root`, `path` and `more`, from the
+//! request's `DepDag`). How a renderer prints them (`reached by:`, JSON) is
+//! a later stage's; these pin the blame and the graph answers.
 //! The pure classification rules are unit tests next to `failure_fate` in
 //! `crates/engine/src/engine/result.rs`.
 #![expect(
@@ -18,6 +20,7 @@ use crate::common::Workspace;
 use hcore::hmemoizer::downcast_chain_ref;
 use heph::engine::event::{BuildEvent, BuildEventKind};
 use heph::engine::fault_provider::{FaultProvider, Faults};
+use heph::engine::request_state::SkippedReport;
 use heph::engine::{Engine, OutputMatcher, ResultOptions};
 use heph::htaddr::{Addr, parse_addr};
 use heph::htmatcher::Matcher;
@@ -38,9 +41,49 @@ use std::sync::Arc;
 struct Run {
     err: Option<anyhow::Error>,
     failures: Vec<Arc<TargetFailure>>,
+    /// Every event the request emitted.
+    events: Vec<BuildEvent>,
+    /// The request-end pass over every skipped target (a non-cancelled
+    /// `ResultEnd` naming an `upstream_of`).
+    skipped: SkippedReport,
 }
 
 impl Run {
+    /// The recorded failure of culprit `c` (an address or a file).
+    fn failure(&self, c: &str) -> &TargetFailure {
+        self.failures
+            .iter()
+            .find(|f| f.culprit().to_string() == c)
+            .unwrap_or_else(|| panic!("no failure of {c}:\n{}", self.describe()))
+    }
+
+    /// `c`'s recorded path, formatted.
+    fn path(&self, c: &str) -> Vec<String> {
+        self.failure(c).path.iter().map(Addr::format).collect()
+    }
+
+    /// Skipped `a`'s `(root, path, more)` from the request-end pass.
+    fn skipped(&self, a: &str) -> (String, Vec<String>, usize) {
+        let rec = self
+            .skipped
+            .get(&addr(a))
+            .unwrap_or_else(|| panic!("{a} skipped with a root:\n{}", self.describe()));
+        (
+            rec.root.to_string(),
+            rec.path.iter().map(Addr::format).collect(),
+            rec.more,
+        )
+    }
+
+    /// The `ResultEnd` events of `a`.
+    fn ends(&self, a: &str) -> Vec<&BuildEventKind> {
+        self.events
+            .iter()
+            .map(|e| &e.kind)
+            .filter(|k| matches!(k, BuildEventKind::ResultEnd { addr, .. } if addr == a))
+            .collect()
+    }
+
     /// Every recorded culprit, sorted.
     fn culprits(&self) -> Vec<String> {
         let mut c: Vec<String> = self
@@ -92,11 +135,30 @@ fn addr(a: &str) -> Addr {
 
 /// `matcher` in a fresh request with fail-fast off.
 async fn run_matcher(engine: &Arc<Engine>, m: &Matcher) -> Run {
-    let rs = engine.new_state_with_fail_fast(false);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<BuildEvent>();
+    let rs = engine.new_state_with_events(false, Some(tx));
     let res = Arc::clone(engine)
         .result(rs.clone(), m, OutputMatcher::All, &ResultOptions::default())
         .await;
+    let mut events = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        events.push(ev);
+    }
     let failures = rs.take_failures();
+    let skipped_addrs: Vec<Addr> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            BuildEventKind::ResultEnd {
+                addr: a,
+                upstream_of: Some(_),
+                cancelled: false,
+                ..
+            } => Some(addr(a)),
+            _ => None,
+        })
+        .collect();
+    let skipped = rs.skipped_report(failures.iter().map(|f| &**f), &skipped_addrs);
+    assert_eq!(rs.report_passes(), 1, "one request-end pass");
     drop(rs);
     // A selection's per-target errors ride the batch; the request error is
     // only for one that failed as a whole.
@@ -104,7 +166,12 @@ async fn run_matcher(engine: &Arc<Engine>, m: &Matcher) -> Run {
         Ok(batch) => batch.errors.into_iter().next().map(|(_, e)| e),
         Err(e) => Some(e),
     };
-    Run { err, failures }
+    Run {
+        err,
+        failures,
+        events,
+        skipped,
+    }
 }
 
 /// `heph run <a>`, which must fail.
@@ -316,7 +383,29 @@ async fn deep_broken_build_blames_the_file() -> anyhow::Result<()> {
         "//d:t",
         "the address that led into the file"
     );
-    // stage B: `path` ending at //d:t, `addr: null`, `reached by:`.
+    // The path ends at the address that led into the file.
+    assert_eq!(r.path("d/BUILD"), ["//a:t", "//b:t", "//c:t", "//d:t"]);
+    // A skipped end names that address, with the file beside it: never a
+    // path in an address field.
+    let skipped: Vec<_> = r
+        .events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            BuildEventKind::ResultEnd {
+                upstream_of: Some(of),
+                upstream_file,
+                path,
+                ..
+            } => Some((of.as_str(), upstream_file.as_deref(), path.len())),
+            _ => None,
+        })
+        .collect();
+    assert!(!skipped.is_empty(), "//a:t's end is skipped");
+    for s in skipped {
+        assert_eq!(s, ("//d:t", Some("d/BUILD"), 0));
+    }
+    assert_eq!(r.skipped("//a:t").0, "d/BUILD");
+    // stage C: `addr: null`, `reached by:`.
     Ok(())
 }
 
@@ -381,7 +470,7 @@ async fn deep_missing_dep_blames_declarer() -> anyhow::Result<()> {
     assert_eq!(m.declarer.format(), "//c:y");
     assert_eq!(m.origin_id, "deps");
     assert_not_blamed(&r, &["//a:root", "//b:x"]);
-    // stage B: path //a:root → //b:x → //c:y.
+    assert_eq!(r.path("//c:y"), ["//a:root", "//b:x", "//c:y"]);
     Ok(())
 }
 
@@ -847,7 +936,14 @@ target(name = "par", driver = "bash", run = "echo ok > $OUT", out = "o.txt", dep
     )]);
     let r = run(&ws.engine, "//a:par").await;
     assert_eq!(r.culprits(), ["//a:l1", "//a:l2"], "{}", r.describe());
-    // stage B: the skipped root's `more: 1`, its path.
+    assert_eq!(r.path("//a:l1"), ["//a:par", "//a:l1"]);
+    assert_eq!(r.path("//a:l2"), ["//a:par", "//a:l2"]);
+    // Both one hop away: the smaller is the root, the other counted.
+    assert_eq!(
+        r.skipped("//a:par"),
+        ("//a:l1".into(), vec!["//a:par".into(), "//a:l1".into()], 1)
+    );
+    // stage C: JSON `error` is one line.
     Ok(())
 }
 
@@ -865,7 +961,16 @@ target(name = "top", driver = "bash", run = "echo ok > $OUT", out = "o.txt", dep
     )]);
     let r = run(&ws.engine, "//a:top").await;
     assert_eq!(r.culprits(), ["//a:shared"], "{}", r.describe());
-    // stage B: `more: 0`, path through //a:left.
+    // Two equal paths: through the smaller address.
+    assert_eq!(r.path("//a:shared"), ["//a:top", "//a:left", "//a:shared"]);
+    assert_eq!(
+        r.skipped("//a:top"),
+        (
+            "//a:shared".into(),
+            vec!["//a:top".into(), "//a:left".into(), "//a:shared".into()],
+            0
+        )
+    );
     Ok(())
 }
 
@@ -892,5 +997,271 @@ async fn three_faults_three_boxes() -> anyhow::Result<()> {
         "{}",
         r.describe()
     );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Paths and counts (D1.e, P18, U17)
+// ---------------------------------------------------------------------------
+
+/// GRAPH-08: a diamond over a declarer naming a missing dep: one culprit,
+/// and the same path through the smaller address on every run, whatever
+/// order the scheduler resolved the two sides in.
+#[tokio::test]
+async fn diamond_missing_dep_same_path_20_runs() -> anyhow::Result<()> {
+    let build = r#"
+target(name = "shared", driver = "bash", run = "echo ok > $OUT", out = "o.txt", deps = [":missing"])
+target(name = "left", driver = "bash", run = "echo ok > $OUT", out = "o.txt", deps = [":shared"])
+target(name = "right", driver = "bash", run = "echo ok > $OUT", out = "o.txt", deps = [":shared"])
+target(name = "top", driver = "bash", run = "echo ok > $OUT", out = "o.txt", deps = {"r": ":right", "l": ":left"})
+"#;
+    for i in 0..20 {
+        let ws = build_ws(&[("a", build)]);
+        let r = run(&ws.engine, "//a:top").await;
+        assert_eq!(r.culprits(), ["//a:shared"], "run {i}: {}", r.describe());
+        assert_eq!(
+            r.path("//a:shared"),
+            ["//a:top", "//a:left", "//a:shared"],
+            "run {i}"
+        );
+    }
+    Ok(())
+}
+
+/// D1.e ties: `//a:top` reaches two culprits two hops away, declared the
+/// larger first: the root is the smaller address, the other one counted.
+#[tokio::test]
+async fn two_roots_tie_broken_by_addr() -> anyhow::Result<()> {
+    let ws = build_ws(&[(
+        "a",
+        r#"
+target(name = "c2", driver = "bash", run = "exit 2", out = "o.txt")
+target(name = "c1", driver = "bash", run = "exit 1", out = "o.txt")
+target(name = "m2", driver = "bash", run = "echo ok > $OUT", out = "o.txt", deps = [":c2"])
+target(name = "m1", driver = "bash", run = "echo ok > $OUT", out = "o.txt", deps = [":c1"])
+target(name = "top", driver = "bash", run = "echo ok > $OUT", out = "o.txt", deps = {"x": ":m2", "y": ":m1"})
+"#,
+    )]);
+    let r = run(&ws.engine, "//a:top").await;
+    assert_eq!(r.culprits(), ["//a:c1", "//a:c2"], "{}", r.describe());
+    assert_eq!(
+        r.skipped("//a:top"),
+        (
+            "//a:c1".into(),
+            vec!["//a:top".into(), "//a:m1".into(), "//a:c1".into()],
+            1
+        )
+    );
+    assert_eq!(r.skipped("//a:m2").2, 0, "//a:m2 reaches only //a:c2");
+    Ok(())
+}
+
+/// D1.e: two requested targets one hop above the culprit, the larger
+/// named first: the path starts at the smaller.
+#[tokio::test]
+async fn several_requested_path_starts_at_smallest_addr() -> anyhow::Result<()> {
+    let ws = build_ws(&[(
+        "a",
+        r#"
+target(name = "c", driver = "bash", run = "exit 1", out = "o.txt")
+target(name = "r2", driver = "bash", run = "echo ok > $OUT", out = "o.txt", deps = [":c"])
+target(name = "r1", driver = "bash", run = "echo ok > $OUT", out = "o.txt", deps = [":c"])
+"#,
+    )]);
+    let r = run_matcher(
+        &ws.engine,
+        &Matcher::Or(vec![
+            Matcher::Addr(addr("//a:r2")),
+            Matcher::Addr(addr("//a:r1")),
+        ]),
+    )
+    .await;
+    assert_eq!(r.culprits(), ["//a:c"], "{}", r.describe());
+    assert_eq!(r.path("//a:c"), ["//a:r1", "//a:c"]);
+    Ok(())
+}
+
+/// D1.e / P18: on the event stream a skipped end names its root and never
+/// a path (the stream would grow by skipped × depth); the culprit's own end
+/// carries its path.
+#[tokio::test]
+async fn skipped_result_end_carries_root_not_path() -> anyhow::Result<()> {
+    let ws = build_ws(&[(
+        "a",
+        r#"
+target(name = "c", driver = "bash", run = "exit 1", out = "o.txt")
+target(name = "mid", driver = "bash", run = "echo ok > $OUT", out = "o.txt", deps = [":c"])
+target(name = "top", driver = "bash", run = "echo ok > $OUT", out = "o.txt", deps = [":mid"])
+"#,
+    )]);
+    let r = run(&ws.engine, "//a:top").await;
+    assert_eq!(r.culprits(), ["//a:c"], "{}", r.describe());
+    for skipped in ["//a:top", "//a:mid"] {
+        let ends = r.ends(skipped);
+        let [
+            end @ BuildEventKind::ResultEnd {
+                upstream_of,
+                upstream_file,
+                path,
+                ..
+            },
+        ] = ends.as_slice()
+        else {
+            panic!("one end for {skipped}: {ends:?}")
+        };
+        assert_eq!(upstream_of.as_deref(), Some("//a:c"), "{skipped}");
+        assert_eq!(*upstream_file, None, "{skipped}");
+        assert!(path.is_empty(), "{skipped} carries no path: {path:?}");
+        let wire = serde_json::to_string(end)?;
+        assert!(!wire.contains("\"path\""), "no `path` on the wire: {wire}");
+    }
+    let culprit = r.ends("//a:c");
+    let [
+        BuildEventKind::ResultEnd {
+            path, upstream_of, ..
+        },
+    ] = culprit.as_slice()
+    else {
+        panic!("one end for //a:c: {culprit:?}")
+    };
+    assert_eq!(*upstream_of, None);
+    assert_eq!(path, &["//a:top", "//a:mid", "//a:c"]);
+    assert_eq!(r.path("//a:c"), ["//a:top", "//a:mid", "//a:c"]);
+    Ok(())
+}
+
+/// D1.e / P18: 20k targets, ~100k edges, 20k skipped under 5 culprits. The
+/// graph is built straight into a request's `DepDag` (`add_dep_for_test`),
+/// as resolution would commit it, rather than by running 20k targets: the
+/// cost under test is the request-end pass, not the build. One pass, done
+/// well within 2 s in a debug build.
+#[tokio::test]
+async fn failure_report_cost_20k() -> anyhow::Result<()> {
+    const N: usize = 20_000;
+    let ws = Workspace::new();
+    let rs = ws.engine.new_state_with_fail_fast(false);
+    let nodes: Vec<Addr> = (0..N).map(|i| addr(&format!("//p:n{i:05}"))).collect();
+    let culprits: Vec<Addr> = (0..5).map(|k| addr(&format!("//c:c{k}"))).collect();
+    // The spine first, so every later edge runs forward in the order and
+    // the cycle check stays O(1): building the graph is not what is timed.
+    for w in nodes.windows(2) {
+        if let [from, to] = w {
+            rs.add_dep_for_test(from, to)?;
+        }
+    }
+    let mut edges = N - 1;
+    for (i, from) in nodes.iter().enumerate() {
+        for step in [3, 7, 131, 1031, 7919] {
+            if let Some(to) = nodes.get(i + step) {
+                rs.add_dep_for_test(from, to)?;
+                edges += 1;
+            }
+        }
+        if i % 4000 == 3999
+            && let Some(c) = culprits.get(i / 4000)
+        {
+            rs.add_dep_for_test(from, c)?;
+            edges += 1;
+        }
+    }
+    assert!(edges > 95_000, "~100k edges, got {edges}");
+    for r in nodes.iter().take(100) {
+        rs.mark_requested(r);
+    }
+    for c in &culprits {
+        rs.record_failure(
+            c.clone(),
+            Arc::new(TargetFailure::new(c.clone(), None, anyhow::anyhow!("boom"))),
+        );
+    }
+    let failures = rs.take_failures();
+    let started = std::time::Instant::now();
+    let report = rs.skipped_report(failures.iter().map(|f| &**f), &nodes);
+    let took = started.elapsed();
+    assert_eq!(rs.report_passes(), 1, "one request-end pass");
+    assert_eq!(report.len(), N, "every skipped target has a root");
+    assert!(took < std::time::Duration::from_secs(2), "took {took:?}");
+    // The spine reaches every culprit from the top; the last stretch only
+    // the last culprit.
+    let top = report.get(&nodes[0]).expect("top");
+    assert_eq!(top.more, 4);
+    let tail = report.get(&nodes[N - 1]).expect("tail");
+    assert_eq!((tail.root.to_string().as_str(), tail.more), ("//c:c4", 0));
+    Ok(())
+}
+
+/// D1.a: the culprit record of a 500-deep chain is the size of a 5-deep
+/// one: each level above the culprit adds nothing to the recorded error.
+#[tokio::test]
+async fn deep_chain_error_size_is_constant() -> anyhow::Result<()> {
+    async fn recorded(depth: usize) -> (usize, usize, Vec<String>) {
+        let mut build = String::from(
+            "target(name = \"leaf\", driver = \"bash\", run = \"echo ok > $OUT\", out = \"o.txt\", deps = [\":missing\"])\n",
+        );
+        for i in 0..depth {
+            // Fixed-width names, so the two chains' addresses are the same
+            // length and only depth differs.
+            let dep = if i + 1 == depth {
+                "leaf".to_string()
+            } else {
+                format!("n{:03}", i + 1)
+            };
+            build.push_str(&format!(
+                "target(name = \"n{i:03}\", driver = \"bash\", run = \"echo ok > $OUT\", out = \"o.txt\", deps = [\":{dep}\"])\n"
+            ));
+        }
+        let ws = build_ws(&[("a", &build)]);
+        let r = run(&ws.engine, "//a:n000").await;
+        let f = r.assert_blames("//a:leaf");
+        (
+            format!("{:#}", f.source).len(),
+            f.source.chain().count(),
+            r.path("//a:leaf"),
+        )
+    }
+    let (shallow_len, shallow_chain, shallow_path) = recorded(5).await;
+    let (deep_len, deep_chain, deep_path) = recorded(500).await;
+    assert_eq!(deep_len, shallow_len, "Display size");
+    assert_eq!(deep_chain, shallow_chain, "chain length");
+    assert_eq!(shallow_path.len(), 6);
+    assert_eq!(deep_path.len(), 501, "the path is the full chain");
+    Ok(())
+}
+
+/// I5: the path and the roots live for one request. On the same engine, a
+/// second request whose graph no longer holds the culprit (the engine has no
+/// in-process way to re-read a fixed BUILD file mid-test, so the "fix" is
+/// asking for the healthy side) reports nothing from the first request.
+#[tokio::test]
+async fn second_request_after_fix_has_no_stale_path() -> anyhow::Result<()> {
+    let ws = build_ws(&[(
+        "a",
+        r#"
+target(name = "c", driver = "bash", run = "exit 1", out = "o.txt")
+target(name = "ok", driver = "bash", run = "echo ok > $OUT", out = "o.txt")
+target(name = "top", driver = "bash", run = "echo ok > $OUT", out = "o.txt", deps = [":c", ":ok"])
+target(name = "fixed", driver = "bash", run = "echo ok > $OUT", out = "o.txt", deps = [":ok"])
+"#,
+    )]);
+    let first = run(&ws.engine, "//a:top").await;
+    assert_eq!(first.path("//a:c"), ["//a:top", "//a:c"]);
+    assert_eq!(first.skipped("//a:top").0, "//a:c");
+
+    let second = run_matcher(&ws.engine, &Matcher::Addr(addr("//a:fixed"))).await;
+    assert!(second.err.is_none(), "fixed: {:?}", second.err);
+    assert!(second.failures.is_empty(), "{}", second.describe());
+    assert!(second.skipped.is_empty());
+    for ev in &second.events {
+        if let BuildEventKind::ResultEnd {
+            addr,
+            upstream_of,
+            path,
+            ..
+        } = &ev.kind
+        {
+            assert_eq!(*upstream_of, None, "{addr}");
+            assert!(path.is_empty(), "{addr}: {path:?}");
+        }
+    }
     Ok(())
 }

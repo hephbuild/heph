@@ -2237,10 +2237,19 @@ fn classify_failure_fresh(
     let fixes = slot.and_then(|s| s.fixes.clone());
     let sandbox = slot.and_then(|s| s.sandbox.clone());
     let streamed = crate::engine::failure_slot::RunStreamed::on(&e);
+    // Walked before the claim, never under the failures lock (`dep_dag`
+    // stays a leaf). Skipped when another caller already holds the claim:
+    // this record would be dropped.
+    let path = if rs.get_culprit_failure(&culprit).is_none() {
+        rs.culprit_path(&entry)
+    } else {
+        Vec::new()
+    };
     let fresh = rs.record_failure(
         culprit.clone(),
         Arc::new(
             TargetFailure::new(entry, log_tail, e)
+                .with_path(path)
                 .with_file(match &culprit {
                     Culprit::File(file) => Some(Arc::clone(file)),
                     Culprit::Target(_) => None,
@@ -2276,6 +2285,9 @@ fn blame_walk_failure(rs: &RequestState, matcher: &Matcher, e: anyhow::Error) ->
     let Some(entry) = walk_entry(matcher, pkg) else {
         return e;
     };
+    // Named by the selection, so requested though its match never resolved:
+    // the record's path is `[entry]`.
+    rs.mark_requested(&entry);
     classify_failure_fresh(rs, &entry, e).0
 }
 
@@ -2324,12 +2336,20 @@ fn result_end_event(
     rs: &RequestState,
     addr: String,
     error: Option<crate::engine::event::ErrorDetail>,
-    upstream_of: Option<String>,
+    blame: EndBlame,
     log_readable: Option<bool>,
 ) -> crate::engine::event::BuildEventKind {
     match error {
         Some(mut d) => {
-            d.upstream_of = upstream_of;
+            d.upstream_of = None;
+            let (upstream_file, path) = match blame {
+                EndBlame::Unknown => (None, Vec::new()),
+                EndBlame::Skipped { of, file } => {
+                    d.upstream_of = Some(of);
+                    (file, Vec::new())
+                }
+                EndBlame::Culprit { path } => (None, path),
+            };
             let cancelled = rs.end_is_cancelled(&addr, &d);
             // The final report's `took down:` row reads the same
             // `upstream_of` the event carries.
@@ -2342,6 +2362,8 @@ fn result_end_event(
                 addr,
                 error: Some(d.message),
                 upstream_of: d.upstream_of,
+                upstream_file,
+                path,
                 exit_status: d.exit_status,
                 exit_code: d.exit_code,
                 log_tail: crate::engine::event::ErrorDetail::result_log_tail(
@@ -2359,12 +2381,56 @@ fn result_end_event(
             addr,
             error: None,
             upstream_of: None,
+            upstream_file: None,
+            path: Vec::new(),
             exit_status: None,
             exit_code: None,
             log_tail: None,
             timed_out: None,
             left_behind: None,
         },
+    }
+}
+
+/// What a failed `ResultEnd` says about blame, decided by [`failure_fate`]
+/// when the scope fails (D1.e): a skipped end names its root and never a
+/// path; a culprit's own end carries its path from a requested target.
+#[derive(Debug, Default)]
+enum EndBlame {
+    /// Neither (a stop, a cycle, a request-shape error, or a success).
+    #[default]
+    Unknown,
+    /// Skipped because `of` failed: the culprit target, or the address that
+    /// led into `file`, a BUILD file that did not evaluate.
+    Skipped { of: String, file: Option<String> },
+    /// This end is the culprit's (or, for a broken file, the address that
+    /// led into it): the shortest path from a requested target, inclusive.
+    Culprit { path: Vec<String> },
+}
+
+impl EndBlame {
+    /// The end `fate` gives `addr`. Walks the request's `DepDag` for a
+    /// culprit's path: never call it holding the failures lock.
+    fn of(rs: &RequestState, addr: &Addr, fate: &FailureFate<'_>) -> Self {
+        match fate {
+            FailureFate::Upstream(root) => match upstream_addr(rs, root) {
+                Some(of) => Self::Skipped {
+                    of,
+                    file: root.file().map(str::to_owned),
+                },
+                None => Self::Unknown,
+            },
+            FailureFate::Blame { culprit, entry } if entry != addr => Self::Skipped {
+                of: entry.format(),
+                file: culprit.file().map(str::to_owned),
+            },
+            FailureFate::Blame { .. } => Self::Culprit {
+                path: rs.culprit_path(addr).iter().map(Addr::format).collect(),
+            },
+            FailureFate::Propagate | FailureFate::Cancelled | FailureFate::Shell(_) => {
+                Self::Unknown
+            }
+        }
     }
 }
 
@@ -2903,11 +2969,12 @@ impl Engine {
                 addr: addr_str.clone(),
             });
             let readable = self.log_readable(addr).await;
+            let path = rs.culprit_path(addr).iter().map(Addr::format).collect();
             rs.emit(result_end_event(
                 rs,
                 addr_str,
                 Some(detail),
-                None,
+                EndBlame::Culprit { path },
                 Some(readable),
             ));
         }
@@ -2951,6 +3018,8 @@ impl Engine {
         // result_addr calls under a batch `result` (which already claimed) — only
         // a genuine top-level single addr wins the claim here.
         if rs.claim_matched_stream() {
+            // Where a failure's path starts (D1.e).
+            rs.mark_requested(addr);
             rs.emit(crate::engine::event::BuildEventKind::Matched {
                 addrs: vec![addr.format()],
                 complete: true,
@@ -3431,6 +3500,8 @@ impl Engine {
                                 // render a provisional "done X / ~N" that grows while
                                 // the matcher streams.
                                 if owns_matched {
+                                    // Where a failure's path starts (D1.e).
+                                    rs.mark_requested(&addr);
                                     rs.emit(crate::engine::event::BuildEventKind::Matched {
                                         addrs: vec![addr.format()],
                                         complete: false,
@@ -3678,10 +3749,11 @@ impl Engine {
         // never for collateral (a marker, thousands of them).
         let readable: Arc<std::sync::OnceLock<bool>> = Arc::default();
         let end_readable = Arc::clone(&readable);
-        // The root a collateral failure names, decided by the classifier's
-        // own rule when the scope fails, before its end is built.
-        let upstream: Arc<std::sync::OnceLock<String>> = Arc::default();
-        let end_upstream = Arc::clone(&upstream);
+        // The root a collateral failure names, or a culprit's path, decided
+        // by the classifier's own rule when the scope fails, before its end
+        // is built.
+        let blame: Arc<parking_lot::Mutex<EndBlame>> = Arc::default();
+        let end_blame = Arc::clone(&blame);
         let fate_rs = Arc::clone(&rs);
         let log_engine = Arc::clone(&self);
         crate::engine::event::emit_scope_with(
@@ -3694,29 +3766,21 @@ impl Engine {
             // (root vs collateral), the exit status, the log tail and a timeout
             // belong.
             move |error| {
+                let blame = std::mem::take(&mut *end_blame.lock());
                 result_end_event(
                     &end_rs,
                     addr_str,
                     error,
-                    end_upstream.get().cloned(),
+                    blame,
                     end_readable.get().copied(),
                 )
             },
             |e| {
                 let fate = failure_fate(addr, e);
-                // A skipped target names its culprit's address: the culprit
-                // target, or the address that led into a broken file.
-                let root = match &fate {
-                    FailureFate::Upstream(root) => upstream_addr(&fate_rs, root),
-                    FailureFate::Blame { entry, .. } if !fate.is_own(addr) => {
-                        Some(entry.format()).filter(|e| *e != addr.format())
-                    }
-                    _ => None,
-                };
-                if let Some(root) = root {
-                    // Set once: this scope ends once.
-                    let _first: Result<(), String> = upstream.set(root);
-                }
+                // A skipped target names its culprit's address (the culprit
+                // target, or the address that led into a broken file, with
+                // the file beside it); a culprit's own end, its path.
+                *blame.lock() = EndBlame::of(&fate_rs, addr, &fate);
                 fate.is_own(addr).then_some(async move {
                     // Set once: this scope ends once.
                     let _first: Result<(), bool> =
@@ -12002,7 +12066,7 @@ mod tests {
         // as `exit_code`, read structured rather than parsed from the text.
         let detail = crate::engine::event::ErrorDetail::from_error(&e);
         assert_eq!(detail.exit_status.as_deref(), Some("exit status: 1"));
-        let end = result_end_event(&rs, addr.format(), Some(detail), None, None);
+        let end = result_end_event(&rs, addr.format(), Some(detail), EndBlame::Unknown, None);
         let crate::engine::event::BuildEventKind::ResultEnd { exit_code, .. } = end else {
             panic!("not a ResultEnd: {end:?}");
         };

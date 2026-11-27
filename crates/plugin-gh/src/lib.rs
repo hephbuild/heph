@@ -2353,6 +2353,8 @@ mod tests {
         hook.on_event(&ev(
             5,
             BuildEventKind::ResultEnd {
+                upstream_file: None,
+                path: Vec::new(),
                 left_behind: None,
                 cancelled: false,
                 timed_out: None,
@@ -2528,6 +2530,8 @@ mod tests {
         hook.on_event(&ev(
             1_000,
             BuildEventKind::ResultEnd {
+                upstream_file: None,
+                path: Vec::new(),
                 left_behind: None,
                 cancelled: false,
                 timed_out: None,
@@ -2577,6 +2581,8 @@ mod tests {
         hook.on_event(&ev(
             10,
             BuildEventKind::ResultEnd {
+                upstream_file: None,
+                path: Vec::new(),
                 left_behind: None,
                 cancelled: false,
                 timed_out: None,
@@ -2592,6 +2598,8 @@ mod tests {
             hook.on_event(&ev(
                 20,
                 BuildEventKind::ResultEnd {
+                    upstream_file: None,
+                    path: Vec::new(),
                     left_behind: None,
                     cancelled: false,
                     timed_out: None,

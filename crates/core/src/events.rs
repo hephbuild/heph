@@ -360,6 +360,20 @@ pub enum BuildEventKind {
         /// targets reporting the same underlying failure.
         #[serde(default)]
         upstream_of: Option<String>,
+        /// Set with `upstream_of` when the root is a BUILD/`.bzl` file that
+        /// did not evaluate: the workspace-relative file, while `upstream_of`
+        /// stays the address that led into it. A path never goes in an
+        /// address field. `None` from a host that predates it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        upstream_file: Option<String>,
+        /// On a culprit's own failure: the shortest path from a requested
+        /// target to it, inclusive (`[addr]` when it was itself requested),
+        /// ties broken by address byte order. A skipped end never carries
+        /// one (it names its root in `upstream_of`): a path per skipped
+        /// target would grow the stream by skipped × depth. Empty from a host
+        /// that predates it.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        path: Vec<String>,
         /// The process's exit status as the OS reported it (e.g. `exit status:
         /// 1`), when the failure was a subprocess.
         ///
@@ -1173,6 +1187,8 @@ pub mod test_support {
             addr: addr.to_string(),
             error: None,
             upstream_of: None,
+            upstream_file: None,
+            path: Vec::new(),
             exit_status: None,
             exit_code: None,
             log_tail: None,
@@ -1328,6 +1344,8 @@ mod tests {
                 addr,
                 error,
                 upstream_of,
+                upstream_file,
+                path,
                 exit_status,
                 exit_code,
                 log_tail,
@@ -1339,6 +1357,8 @@ mod tests {
                 assert!(!cancelled, "an older host's stop reads as a failure");
                 assert_eq!(error.as_deref(), Some("boom"));
                 assert_eq!(upstream_of, None);
+                assert_eq!(upstream_file, None);
+                assert!(path.is_empty());
                 assert_eq!(exit_status, None);
                 assert_eq!(exit_code, None);
                 assert_eq!(log_tail, None);
@@ -1964,6 +1984,8 @@ mod tests {
                 addr: "//a:x".into(),
                 error: Some("target failed".into()),
                 upstream_of: Some("//base:proto".into()),
+                upstream_file: Some("base/BUILD".into()),
+                path: vec!["//a:top".into(), "//a:x".into()],
                 exit_status: Some("exit status: 1".into()),
                 exit_code: Some(1),
                 log_tail: Some(LogTailData {

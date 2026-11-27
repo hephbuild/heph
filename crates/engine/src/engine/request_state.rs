@@ -153,7 +153,15 @@ pub struct DepDag {
     /// under the request-wide `dep_dag` lock does not allocate once they have
     /// grown.
     pk: PkScratch,
+    /// The nodes the request asked for (its matched selection, or the one
+    /// address of a single-target run): where a failure's path starts.
+    /// Held here rather than beside the graph so a walk reads it under the
+    /// one `dep_dag` lock, which stays a leaf.
+    requested: FxHashSet<u32>,
 }
+
+/// Unvisited, in the dense per-node tables of a [`DepDag`] walk.
+const UNSEEN: u32 = u32::MAX;
 
 /// Working buffers for one Pearce-Kelly reorder. Contents are meaningless
 /// between reorders; only the capacity carries over.
@@ -340,6 +348,255 @@ impl DepDag {
         self.index_of.insert(key, idx);
         idx
     }
+
+    fn index(&self, addr: &Addr) -> Option<u32> {
+        self.index_of.get(&ptr_key(addr)).copied()
+    }
+
+    /// Record `addr` as one the request asked for.
+    pub fn mark_requested(&mut self, addr: &Addr) {
+        let n = self.get_or_insert(addr);
+        self.requested.insert(n);
+    }
+
+    /// The shortest path from a requested target to `culprit`, inclusive:
+    /// `[culprit]` when it was itself requested, empty when no requested
+    /// target reaches it (or it is not in the graph).
+    ///
+    /// A predecessor BFS from the culprit, level by level, that stops at the
+    /// first level holding a requested target. Ties go by address byte order:
+    /// each level is visited sorted, so a node's next hop toward the culprit
+    /// is its smallest-addressed neighbour one step closer, and the path
+    /// starts at the smallest requested address at the shortest distance.
+    /// The same graph gives the same path, whatever order its edges came in.
+    /// Each visited node is formatted once; nothing is visited twice.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "node indices come from index_of or the adjacency lists, both bound to the vectors' lengths"
+    )]
+    pub fn culprit_path(&self, culprit: &Addr) -> Vec<Addr> {
+        let Some(c) = self.index(culprit) else {
+            return Vec::new();
+        };
+        if self.requested.contains(&c) {
+            return vec![culprit.clone()];
+        }
+        // Each visited node's next hop toward the culprit (`UNSEEN` at it).
+        let mut next: FxHashMap<u32, u32> = FxHashMap::default();
+        next.insert(c, UNSEEN);
+        let mut level = vec![c];
+        let mut above = Vec::new();
+        while !level.is_empty() {
+            above.clear();
+            for &v in &level {
+                for &p in &self.pred[v as usize] {
+                    if let std::collections::hash_map::Entry::Vacant(e) = next.entry(p) {
+                        e.insert(v);
+                        above.push(p);
+                    }
+                }
+            }
+            above.sort_by_cached_key(|&n| self.nodes[n as usize].format());
+            if let Some(&start) = above.iter().find(|n| self.requested.contains(n)) {
+                return self.follow(start, |n| next.get(&n).copied().unwrap_or(UNSEEN));
+            }
+            std::mem::swap(&mut level, &mut above);
+        }
+        Vec::new()
+    }
+
+    /// `start`'s addresses along `next` until it reaches `UNSEEN`.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "every hop is a node index a walk over this graph recorded"
+    )]
+    fn follow(&self, start: u32, next: impl Fn(u32) -> u32) -> Vec<Addr> {
+        let mut path = Vec::new();
+        let mut n = start;
+        while n != UNSEEN {
+            path.push(self.nodes[n as usize].clone());
+            n = next(n);
+        }
+        path
+    }
+
+    /// The request-end pass: for each of `skipped` that reaches one of
+    /// `culprits` (each a culprit and the node it is recorded at: the target,
+    /// or for a file the address that led into it), its nearest culprit, the
+    /// path from it to that culprit, and how many *other* culprits it reaches.
+    ///
+    /// One multi-source BFS from every culprit over predecessor edges, level
+    /// by level, each level sorted by (root, address): a node takes its root
+    /// and next hop from the first neighbour one step closer, so its root is
+    /// the smallest culprit (by its text's byte order) at the shortest
+    /// distance, and its next hop the smallest address leading there. Then
+    /// one pass in reverse topological order ORs each node's successors'
+    /// culprit bitsets into its own, for an exact count. O(nodes + edges)
+    /// plus the sorts, once per failed request; memory is one bitset of
+    /// `culprits / 64` words per node that reaches a culprit.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "node indices come from index_of or the adjacency lists and dense positions from `pos`, all bound to their tables' lengths"
+    )]
+    pub fn skipped_report<'a>(
+        &self,
+        culprits: impl IntoIterator<Item = (Culprit, &'a Addr)>,
+        skipped: impl IntoIterator<Item = &'a Addr>,
+    ) -> SkippedReport {
+        let mut ranked: Vec<(String, Culprit, u32)> = culprits
+            .into_iter()
+            .filter_map(|(c, at)| Some((c.to_string(), c, self.index(at)?)))
+            .collect();
+        ranked.sort_by(|a, b| a.0.cmp(&b.0));
+        ranked.dedup_by(|a, b| a.1 == b.1);
+
+        let mut root = vec![UNSEEN; self.nodes.len()];
+        let mut next = vec![UNSEEN; self.nodes.len()];
+        let mut seen: Vec<u32> = Vec::new();
+        for (k, (_, _, n)) in ranked.iter().enumerate() {
+            if root[*n as usize] == UNSEEN {
+                root[*n as usize] = k as u32;
+                seen.push(*n);
+            }
+        }
+        seen.sort_by_cached_key(|&n| (root[n as usize], self.nodes[n as usize].format()));
+        let mut start = 0;
+        while start < seen.len() {
+            let end = seen.len();
+            for i in start..end {
+                let v = seen[i];
+                for &p in &self.pred[v as usize] {
+                    if root[p as usize] == UNSEEN {
+                        root[p as usize] = root[v as usize];
+                        next[p as usize] = v;
+                        seen.push(p);
+                    }
+                }
+            }
+            let (_, level) = seen.split_at_mut(end);
+            level.sort_by_cached_key(|&n| (root[n as usize], self.nodes[n as usize].format()));
+            start = end;
+        }
+
+        // Dense position of each visited node, for the bitsets and the report.
+        let mut pos = vec![UNSEEN; self.nodes.len()];
+        for (i, &n) in seen.iter().enumerate() {
+            pos[n as usize] = i as u32;
+        }
+        let words = ranked.len().div_ceil(64);
+        let mut bits = vec![0u64; seen.len() * words];
+        for (k, (_, _, n)) in ranked.iter().enumerate() {
+            bits[pos[*n as usize] as usize * words + k / 64] |= 1 << (k % 64);
+        }
+        let mut topo = seen.clone();
+        topo.sort_unstable_by_key(|&n| std::cmp::Reverse(self.ord[n as usize]));
+        let mut more = vec![0u32; seen.len()];
+        for &u in &topo {
+            let pu = pos[u as usize] as usize;
+            for &s in &self.succ[u as usize] {
+                let ps = pos[s as usize];
+                if ps == UNSEEN {
+                    continue;
+                }
+                for w in 0..words {
+                    let from = bits[ps as usize * words + w];
+                    bits[pu * words + w] |= from;
+                }
+            }
+            let reached: u32 = bits[pu * words..(pu + 1) * words]
+                .iter()
+                .map(|w| w.count_ones())
+                .sum();
+            more[pu] = reached.saturating_sub(1);
+        }
+
+        let mut index = FxHashMap::default();
+        for addr in skipped {
+            if let Some(n) = self.index(addr)
+                && pos[n as usize] != UNSEEN
+            {
+                index.insert(ptr_key(addr), pos[n as usize]);
+            }
+        }
+        SkippedReport {
+            culprits: ranked.into_iter().map(|(_, c, _)| c).collect(),
+            addrs: seen
+                .iter()
+                .map(|&n| self.nodes[n as usize].clone())
+                .collect(),
+            next: seen
+                .iter()
+                .map(|&n| match next[n as usize] {
+                    UNSEEN => UNSEEN,
+                    hop => pos[hop as usize],
+                })
+                .collect(),
+            root: seen.iter().map(|&n| root[n as usize]).collect(),
+            more,
+            index,
+        }
+    }
+}
+
+/// What the request-end pass ([`DepDag::skipped_report`]) found for the
+/// skipped targets it was asked about. Owns what it read, so it outlives the
+/// `dep_dag` lock it was computed under.
+#[derive(Debug, Default)]
+pub struct SkippedReport {
+    /// The culprits, in byte order of their text: what `root` indexes.
+    culprits: Vec<Culprit>,
+    /// Every node that reaches a culprit, by dense position.
+    addrs: Vec<Addr>,
+    /// Each node's next hop toward its root (`UNSEEN` at a culprit).
+    next: Vec<u32>,
+    root: Vec<u32>,
+    more: Vec<u32>,
+    /// The asked-about skipped targets that reach a culprit, keyed by
+    /// pointer (the `addrs` above keep each interned address alive).
+    index: FxHashMap<AddrPtrKey, u32>,
+}
+
+/// One skipped target's entry in a [`SkippedReport`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedRecord {
+    /// Its nearest culprit; ties by byte order.
+    pub root: Culprit,
+    /// From the skipped target to the address `root` is recorded at,
+    /// inclusive both ends.
+    pub path: Vec<Addr>,
+    /// The exact count of culprits other than `root` it reaches.
+    pub more: usize,
+}
+
+impl SkippedReport {
+    /// `addr`'s record, when it was asked about and reaches a culprit.
+    pub fn get(&self, addr: &Addr) -> Option<SkippedRecord> {
+        let i = *self.index.get(&ptr_key(addr))?;
+        let root = self
+            .culprits
+            .get(*self.root.get(i as usize)? as usize)?
+            .clone();
+        let mut path = Vec::new();
+        let mut n = i;
+        while let Some(a) = self.addrs.get(n as usize) {
+            path.push(a.clone());
+            n = self.next.get(n as usize).copied().unwrap_or(UNSEEN);
+        }
+        Some(SkippedRecord {
+            root,
+            path,
+            more: self.more.get(i as usize).copied().unwrap_or(0) as usize,
+        })
+    }
+
+    /// How many asked-about targets have a record.
+    pub fn len(&self) -> usize {
+        self.index.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.index.is_empty()
+    }
 }
 
 /// The targets one root failure took down: the first few by name, in the
@@ -506,6 +763,9 @@ pub struct RequestStateData {
     /// read only on a failure. Never reaches a hash: the origin ids keep
     /// their text; this is the reverse lookup, held for the request.
     transitive_declarers: Mutex<FxHashMap<String, Addr>>,
+    /// How many request-end passes ([`RequestState::skipped_report`]) ran:
+    /// one per failed request is the budget.
+    report_passes: std::sync::atomic::AtomicUsize,
     /// What each root failure took down, keyed by the root's formatted addr:
     /// the targets whose `ResultEnd` named it as `upstream_of`. Read by the
     /// interactive failure report's `took down:` row.
@@ -1153,6 +1413,51 @@ impl RequestState {
     /// [`get_failure`](Self::get_failure) for any culprit, a file included.
     pub fn get_culprit_failure(&self, culprit: &Culprit) -> Option<Arc<TargetFailure>> {
         self.data.failures.lock().get(culprit).cloned()
+    }
+
+    /// Record `addr` as one this request asked for: where a failure's
+    /// [`culprit_path`](Self::culprit_path) starts. Called for each matched
+    /// target of the top-level selection, and for the one address of a
+    /// single-target run.
+    pub fn mark_requested(&self, addr: &Addr) {
+        self.data.dep_dag.lock().mark_requested(addr);
+    }
+
+    /// The shortest path from a requested target to `addr` (a culprit, or
+    /// the address that led into a broken file), inclusive; see
+    /// [`DepDag::culprit_path`]. Takes only the `dep_dag` lock, never under
+    /// the failures lock.
+    pub fn culprit_path(&self, addr: &Addr) -> Vec<Addr> {
+        self.data.dep_dag.lock().culprit_path(addr)
+    }
+
+    /// The request-end pass over `failures` (what the run recorded, e.g.
+    /// from [`take_failures`](Self::take_failures)): each of `skipped`'s
+    /// nearest culprit, path to it and count of other culprits reached; see
+    /// [`DepDag::skipped_report`]. Run once, after the scheduler stopped
+    /// adding edges; counted by [`report_passes`](Self::report_passes).
+    pub fn skipped_report<'a>(
+        &self,
+        failures: impl IntoIterator<Item = &'a TargetFailure>,
+        skipped: impl IntoIterator<Item = &'a Addr>,
+    ) -> SkippedReport {
+        self.data.report_passes.fetch_add(1, Ordering::Relaxed);
+        self.data.dep_dag.lock().skipped_report(
+            failures.into_iter().map(|f| (f.culprit(), &f.addr)),
+            skipped,
+        )
+    }
+
+    /// How many request-end passes this request ran.
+    pub fn report_passes(&self) -> usize {
+        self.data.report_passes.load(Ordering::Relaxed)
+    }
+
+    /// Commit `from → to` to the request's graph as a real resolution would.
+    /// For tests that build a large graph without running it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn add_dep_for_test(&self, from: &Addr, to: &Addr) -> Result<(), CycleError> {
+        self.data.dep_dag.lock().add_dep(from, to)
     }
 
     /// Note that `_transitive_<hash>_…` origin ids name `addr`'s transitive
@@ -1861,6 +2166,7 @@ impl Engine {
             sandbox_removals: crate::engine::sandbox_cleaner::PendingCounter::default(),
             failures: Mutex::new(indexmap::IndexMap::new()),
             transitive_declarers: Mutex::new(FxHashMap::default()),
+            report_passes: std::sync::atomic::AtomicUsize::new(0),
             took_down: Mutex::new(FxHashMap::default()),
             cancelled: Mutex::new(FxHashSet::default()),
             approval,
@@ -2775,6 +3081,8 @@ mod tests {
                 addr: "//a:b".into(),
                 error: error.map(crate::engine::event::ErrorDetail::into_message),
                 upstream_of: None,
+                upstream_file: None,
+                path: Vec::new(),
                 exit_status: None,
                 exit_code: None,
                 log_tail: None,
@@ -2851,5 +3159,240 @@ mod tests {
     fn addr_key_debug_names_the_target() {
         let a = addr("t");
         assert_eq!(format!("{:?}", AddrKey(a.clone())), format!("{a:?}"));
+    }
+
+    /// The `DepDag` walks behind a failure's `path`, `root` and `more` (D1.e).
+    mod walks {
+        use super::*;
+
+        fn dag(edges: &[(&str, &str)], requested: &[&str]) -> DepDag {
+            let mut dag = DepDag::new();
+            for (from, to) in edges {
+                dag.add_dep(&addr(from), &addr(to))
+                    .expect("acyclic fixture");
+            }
+            for r in requested {
+                dag.mark_requested(&addr(r));
+            }
+            dag
+        }
+
+        fn names(path: &[Addr]) -> Vec<String> {
+            path.iter().map(|a| a.name.to_string()).collect()
+        }
+
+        fn report(dag: &DepDag, culprits: &[&str], skipped: &[&str]) -> SkippedReport {
+            let culprits: Vec<Addr> = culprits.iter().map(|c| addr(c)).collect();
+            let skipped: Vec<Addr> = skipped.iter().map(|s| addr(s)).collect();
+            dag.skipped_report(
+                culprits.iter().map(|c| (Culprit::from(c.clone()), c)),
+                &skipped,
+            )
+        }
+
+        fn record(r: &SkippedReport, s: &str) -> (String, Vec<String>, usize) {
+            let rec = r.get(&addr(s)).expect("a skipped target with a record");
+            (rec.root.to_string(), names(&rec.path), rec.more)
+        }
+
+        #[test]
+        fn requested_culprit_path_is_itself() {
+            let d = dag(&[("top", "c")], &["top", "c"]);
+            assert_eq!(names(&d.culprit_path(&addr("c"))), ["c"]);
+        }
+
+        #[test]
+        fn shortest_path_wins_over_a_longer_one() {
+            let d = dag(&[("r", "a"), ("a", "b"), ("b", "c"), ("r", "c")], &["r"]);
+            assert_eq!(names(&d.culprit_path(&addr("c"))), ["r", "c"]);
+        }
+
+        /// The diamond's two equal paths: the one through the smaller
+        /// address, whichever edge came first.
+        #[test]
+        fn diamond_path_goes_through_the_smaller_neighbour() {
+            let right_first = dag(
+                &[
+                    ("top", "right"),
+                    ("top", "left"),
+                    ("right", "leaf"),
+                    ("left", "leaf"),
+                ],
+                &["top"],
+            );
+            let left_first = dag(
+                &[
+                    ("left", "leaf"),
+                    ("right", "leaf"),
+                    ("top", "left"),
+                    ("top", "right"),
+                ],
+                &["top"],
+            );
+            for d in [&right_first, &left_first] {
+                assert_eq!(
+                    names(&d.culprit_path(&addr("leaf"))),
+                    ["top", "left", "leaf"]
+                );
+            }
+        }
+
+        #[test]
+        fn several_requested_at_equal_distance_start_at_the_smallest() {
+            let d = dag(&[("r2", "x"), ("r1", "x"), ("x", "c")], &["r2", "r1"]);
+            assert_eq!(names(&d.culprit_path(&addr("c"))), ["r1", "x", "c"]);
+        }
+
+        /// Distance first: a larger requested address one hop away beats a
+        /// smaller one two hops away.
+        #[test]
+        fn a_nearer_requested_target_beats_a_smaller_farther_one() {
+            let d = dag(&[("z", "c"), ("a", "m"), ("m", "c")], &["z", "a"]);
+            assert_eq!(names(&d.culprit_path(&addr("c"))), ["z", "c"]);
+        }
+
+        #[test]
+        fn unrequested_culprit_has_no_path() {
+            let d = dag(&[("p", "c")], &[]);
+            assert!(d.culprit_path(&addr("c")).is_empty());
+            assert!(
+                d.culprit_path(&addr("absent")).is_empty(),
+                "an address the graph never saw has no path"
+            );
+        }
+
+        /// The graph is acyclic by construction: a rejected back-edge is never
+        /// recorded, so a walk over what remains terminates with the same
+        /// answer as before the attempt.
+        #[test]
+        fn a_rejected_cycle_edge_leaves_the_walks_unchanged() {
+            let mut d = dag(&[("r", "a"), ("a", "c")], &["r"]);
+            assert!(d.add_dep(&addr("c"), &addr("r")).is_err());
+            assert_eq!(names(&d.culprit_path(&addr("c"))), ["r", "a", "c"]);
+            let r = report(&d, &["c"], &["r", "a"]);
+            assert_eq!(
+                record(&r, "r"),
+                ("//pkg:c".into(), names_of(&["r", "a", "c"]), 0)
+            );
+        }
+
+        fn names_of(n: &[&str]) -> Vec<String> {
+            n.iter().map(|s| (*s).to_string()).collect()
+        }
+
+        #[test]
+        fn skipped_nearest_culprit_is_its_root() {
+            // s reaches c2 in one hop and c1 in two.
+            let d = dag(&[("s", "c2"), ("s", "m"), ("m", "c1")], &["s"]);
+            let r = report(&d, &["c1", "c2"], &["s", "m"]);
+            assert_eq!(
+                record(&r, "s"),
+                ("//pkg:c2".into(), names_of(&["s", "c2"]), 1)
+            );
+            assert_eq!(
+                record(&r, "m"),
+                ("//pkg:c1".into(), names_of(&["m", "c1"]), 0)
+            );
+        }
+
+        #[test]
+        fn equal_distance_culprits_tie_by_byte_order() {
+            // Inserted larger-first, so neither edge order nor insertion
+            // order can be what picks c1.
+            let d = dag(&[("s", "y"), ("y", "c2"), ("s", "x"), ("x", "c1")], &["s"]);
+            let r = report(&d, &["c2", "c1"], &["s"]);
+            assert_eq!(
+                record(&r, "s"),
+                ("//pkg:c1".into(), names_of(&["s", "x", "c1"]), 1)
+            );
+        }
+
+        /// The root's tie-break wins over the next hop's: through `a` lies
+        /// the larger culprit, through `b` the smaller.
+        #[test]
+        fn root_tie_beats_the_hops_address_order() {
+            let d = dag(&[("s", "a"), ("a", "c2"), ("s", "b"), ("b", "c1")], &["s"]);
+            let r = report(&d, &["c1", "c2"], &["s"]);
+            assert_eq!(
+                record(&r, "s"),
+                ("//pkg:c1".into(), names_of(&["s", "b", "c1"]), 1)
+            );
+        }
+
+        #[test]
+        fn diamond_counts_its_one_culprit_once() {
+            let d = dag(
+                &[
+                    ("top", "right"),
+                    ("top", "left"),
+                    ("right", "leaf"),
+                    ("left", "leaf"),
+                ],
+                &["top"],
+            );
+            let r = report(&d, &["leaf"], &["top", "left", "right"]);
+            assert_eq!(
+                record(&r, "top"),
+                ("//pkg:leaf".into(), names_of(&["top", "left", "leaf"]), 0)
+            );
+            assert_eq!(r.len(), 3);
+        }
+
+        /// A culprit reached through two branches counts once; a second one
+        /// below just one branch counts too.
+        #[test]
+        fn more_is_an_exact_count_of_distinct_culprits() {
+            let d = dag(
+                &[
+                    ("s", "a"),
+                    ("a", "c1"),
+                    ("s", "b"),
+                    ("b", "c1"),
+                    ("b", "c2"),
+                ],
+                &["s"],
+            );
+            let r = report(&d, &["c1", "c2"], &["s", "a", "b"]);
+            assert_eq!(record(&r, "s").2, 1);
+            assert_eq!(record(&r, "a").2, 0);
+            assert_eq!(record(&r, "b").2, 1);
+        }
+
+        /// Past 64 culprits the bitset spans several words.
+        #[test]
+        fn more_counts_past_one_bitset_word() {
+            let names: Vec<String> = (0..70).map(|i| format!("c{i:02}")).collect();
+            let edges: Vec<(&str, &str)> = names.iter().map(|c| ("s", c.as_str())).collect();
+            let d = dag(&edges, &["s"]);
+            let culprits: Vec<&str> = names.iter().map(String::as_str).collect();
+            let r = report(&d, &culprits, &["s"]);
+            assert_eq!(
+                record(&r, "s"),
+                ("//pkg:c00".into(), names_of(&["s", "c00"]), 69)
+            );
+        }
+
+        #[test]
+        fn a_target_reaching_no_culprit_has_no_record() {
+            let d = dag(&[("s", "c"), ("other", "fine")], &["s", "other"]);
+            let r = report(&d, &["c"], &["s", "other", "never-seen"]);
+            assert!(r.get(&addr("other")).is_none());
+            assert!(r.get(&addr("never-seen")).is_none());
+            assert_eq!(r.len(), 1);
+        }
+
+        /// A file culprit is recorded at the address that led into it: the
+        /// path ends there and the root is the file.
+        #[test]
+        fn file_culprit_path_ends_at_its_entry() {
+            let d = dag(&[("s", "entry")], &["s"]);
+            let entry = addr("entry");
+            let skipped = [addr("s")];
+            let r = d.skipped_report([(Culprit::File(Arc::from("d/BUILD")), &entry)], &skipped);
+            assert_eq!(
+                record(&r, "s"),
+                ("d/BUILD".into(), names_of(&["s", "entry"]), 0)
+            );
+        }
     }
 }

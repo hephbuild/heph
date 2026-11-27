@@ -380,6 +380,10 @@ impl Tally {
                 addr,
                 error,
                 upstream_of,
+                // The report keys roots by address; the file and the path
+                // reach it in a later change.
+                upstream_file: _,
+                path: _,
                 exit_status,
                 // `exit_status` already names it.
                 exit_code: _,
@@ -1002,6 +1006,8 @@ mod tests {
         t.apply(&ev(
             end,
             BuildEventKind::ResultEnd {
+                upstream_file: None,
+                path: Vec::new(),
                 left_behind: None,
                 cancelled: false,
                 timed_out: None,
@@ -1023,6 +1029,8 @@ mod tests {
         t.apply(&ev(
             10,
             BuildEventKind::ResultEnd {
+                upstream_file: None,
+                path: Vec::new(),
                 left_behind: None,
                 cancelled: false,
                 timed_out: None,
@@ -1038,6 +1046,8 @@ mod tests {
             t.apply(&ev(
                 20,
                 BuildEventKind::ResultEnd {
+                    upstream_file: None,
+                    path: Vec::new(),
                     left_behind: None,
                     cancelled: false,
                     timed_out: None,
@@ -1075,6 +1085,8 @@ mod tests {
             t.apply(&ev(
                 5,
                 BuildEventKind::ResultEnd {
+                    upstream_file: None,
+                    path: Vec::new(),
                     left_behind: None,
                     cancelled: false,
                     timed_out: None,
@@ -1742,6 +1754,8 @@ mod tests {
         t.apply(&ev(
             5,
             BuildEventKind::ResultEnd {
+                upstream_file: None,
+                path: Vec::new(),
                 left_behind: None,
                 cancelled: false,
                 timed_out: None,
@@ -1763,6 +1777,8 @@ mod tests {
             t.apply(&ev(
                 0,
                 BuildEventKind::ResultEnd {
+                    upstream_file: None,
+                    path: Vec::new(),
                     left_behind: None,
                     cancelled: false,
                     timed_out: None,
@@ -1788,6 +1804,8 @@ mod tests {
             t.apply(&ev(
                 0,
                 BuildEventKind::ResultEnd {
+                    upstream_file: None,
+                    path: Vec::new(),
                     left_behind: None,
                     cancelled: false,
                     timed_out: None,
@@ -1812,6 +1830,8 @@ mod tests {
         t.apply(&ev(
             10,
             BuildEventKind::ResultEnd {
+                upstream_file: None,
+                path: Vec::new(),
                 left_behind: None,
                 cancelled: false,
                 timed_out: None,
@@ -1861,6 +1881,8 @@ mod tests {
         t.apply(&ev(
             5_000,
             BuildEventKind::ResultEnd {
+                upstream_file: None,
+                path: Vec::new(),
                 left_behind: None,
                 cancelled: false,
                 timed_out: None,
