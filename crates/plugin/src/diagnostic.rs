@@ -28,6 +28,19 @@ pub enum Boundary {
     Execute,
     /// `run`: the driver's run of a target.
     Run,
+    /// `resolve scratch for //p:t`: resolving the scratch slots a run names.
+    ResolveScratch,
+    /// `acquire scratch for //p:t`: taking those slots.
+    AcquireScratch,
+    /// `resolve deferred values for //p:t`: reading and substituting a def's
+    /// `${read://…}` values.
+    ResolveDeferred,
+    /// `resolve credentials for //p:t`: resolving the credentials a run names.
+    ResolveCredentials,
+    /// `credentials for //p:t`: acquiring or presenting them.
+    Credentials,
+    /// `admitting //p:t`: waiting for the run's resources.
+    Admit,
 }
 
 impl Boundary {
@@ -36,7 +49,14 @@ impl Boundary {
         match self {
             Self::GetDef => Stage::Parse,
             Self::Link | Self::Meta => Stage::Link,
-            Self::Execute | Self::Run => Stage::Run,
+            Self::Execute
+            | Self::Run
+            | Self::ResolveScratch
+            | Self::AcquireScratch
+            | Self::ResolveDeferred
+            | Self::ResolveCredentials
+            | Self::Credentials
+            | Self::Admit => Stage::Run,
         }
     }
 }
@@ -65,6 +85,16 @@ impl fmt::Display for StageFrame {
             Boundary::Meta => f.write_str("meta"),
             Boundary::Execute => write!(f, "execute {}", self.addr.format()),
             Boundary::Run => f.write_str("run"),
+            Boundary::ResolveScratch => write!(f, "resolve scratch for {}", self.addr.format()),
+            Boundary::AcquireScratch => write!(f, "acquire scratch for {}", self.addr.format()),
+            Boundary::ResolveDeferred => {
+                write!(f, "resolve deferred values for {}", self.addr.format())
+            }
+            Boundary::ResolveCredentials => {
+                write!(f, "resolve credentials for {}", self.addr.format())
+            }
+            Boundary::Credentials => write!(f, "credentials for {}", self.addr.format()),
+            Boundary::Admit => write!(f, "admitting {}", self.addr.format()),
         }
     }
 }
@@ -197,6 +227,39 @@ mod tests {
             for internal in ["get_def:", "link", "meta", "execute "] {
                 assert!(!f.starts_with(internal), "{f}");
             }
+        }
+    }
+
+    /// The run's own boundaries (scratch, deferred values, credentials,
+    /// admission) keep their text in `{:#}` but are not cause lines, so a
+    /// credential's failure prints as the credential's own error.
+    #[test]
+    fn run_preparation_boundaries_are_not_cause_lines() {
+        let a = addr("//a:x");
+        for (boundary, text) in [
+            (Boundary::ResolveScratch, "resolve scratch for //a:x"),
+            (Boundary::AcquireScratch, "acquire scratch for //a:x"),
+            (
+                Boundary::ResolveDeferred,
+                "resolve deferred values for //a:x",
+            ),
+            (
+                Boundary::ResolveCredentials,
+                "resolve credentials for //a:x",
+            ),
+            (Boundary::Credentials, "credentials for //a:x"),
+            (Boundary::Admit, "admitting //a:x"),
+        ] {
+            assert_eq!(boundary.stage(), Stage::Run, "{boundary:?}");
+            let e = with_stage(anyhow::anyhow!("credential `gh` failed"), boundary, &a);
+            let e = with_stage(shared(e), Boundary::Execute, &a);
+            assert_eq!(
+                format!("{e:#}"),
+                format!("execute //a:x: {text}: credential `gh` failed")
+            );
+            assert_eq!(cause_frames(&e), ["credential `gh` failed"], "{boundary:?}");
+            let frame = innermost_stage_frame(&e).expect("frame");
+            assert_eq!((frame.boundary, frame.stage()), (boundary, Stage::Run));
         }
     }
 

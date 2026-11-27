@@ -20,6 +20,7 @@ use hcore::hmemoizer::{downcast_chain_ref, unwrap_arc_err};
 use hmodel::htaddr::Addr;
 use hmodel::htmatcher::MatchResult;
 use hmodel::htpkg::PkgBuf;
+use hplugin::diagnostic::{Boundary, StageContext};
 
 use crate::engine::driver::sandbox::Sandbox;
 use crate::engine::link::LinkedTargetDef;
@@ -3343,8 +3344,8 @@ impl Engine {
                 let link_fut = Arc::clone(&self).link(rs.clone(), def.target_def.clone());
                 let meta_fut = Arc::clone(&self).meta(rs.clone(), addr);
                 let (link_res, meta_res) = tokio::join!(link_fut, meta_fut);
-                let def = Arc::new(link_res.with_context(|| "link")?);
-                let meta = meta_res.with_context(|| "meta")?;
+                let def = Arc::new(link_res.stage(Boundary::Link, addr)?);
+                let meta = meta_res.stage(Boundary::Meta, addr)?;
 
                 let output_names = match outputs {
                     OutputMatcher::None => anyhow::Ok(Vec::<String>::new()),
@@ -5395,7 +5396,7 @@ impl Engine {
                             },
                         )
                         .await
-                        .with_context(|| format!("execute {addr}"))?;
+                        .stage(Boundary::Execute, &addr)?;
 
                     let checked = match artifacts
                         .iter()
@@ -6151,7 +6152,7 @@ impl Engine {
             .once(
                 AddrKey(addr.clone()),
                 enclose!((self => engine, rs, addr) move || async move {
-                    engine.get_def_inner(rs, &addr, true).await.with_context(|| format!("get_def: {}", addr))
+                    engine.get_def_inner(rs, &addr, true).await.stage(Boundary::GetDef, &addr)
                 }),
             )
             .await
@@ -6167,7 +6168,7 @@ impl Engine {
         let rs = rs.with_parent(addr.clone());
         self.get_def_inner(rs, addr, false)
             .await
-            .with_context(|| format!("get_def: {}", addr))
+            .stage(Boundary::GetDef, addr)
     }
 
     async fn get_def_inner(
