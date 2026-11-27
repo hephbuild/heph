@@ -27,15 +27,10 @@ pub const TAB_STOP: usize = 8;
 /// The ellipsis a cut puts where text was removed.
 pub const ELLIPSIS: &str = "…";
 
-/// Whether `c` is a control character a terminal could act on: C0 (but tab
-/// and newline), DEL, or C1; or a bidi embedding, override or isolate,
-/// which would make the terminal draw the text after it reordered (U+202E
-/// shows `exe.txt` for `txt.exe`).
+/// Whether `c` is a control or format character a terminal could act on:
+/// [`hcore::diagnostic::is_terminal_control`], the one set every escaper uses.
 fn is_control(c: char) -> bool {
-    matches!(
-        c,
-        '\0'..='\x08' | '\x0b'..='\x1f' | '\x7f'..='\u{9f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
-    )
+    hcore::diagnostic::is_terminal_control(c)
 }
 
 /// Whether a C1 character opens a string (DCS, SOS, OSC, PM, APC) that runs

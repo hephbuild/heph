@@ -1741,6 +1741,20 @@ fn replayed_text_keeps_only_sgr() {
             "a\\u{61c}b",
             "a\\u{61c}b",
         ),
+        // U36: the set log tails and messages escape.
+        ("line separator", "a\u{2028}b", "a\\u{2028}b", "a\\u{2028}b"),
+        (
+            "paragraph separator",
+            "a\u{2029}b",
+            "a\\u{2029}b",
+            "a\\u{2029}b",
+        ),
+        (
+            "zero-width no-break space",
+            "a\u{feff}b",
+            "a\\u{feff}b",
+            "a\\u{feff}b",
+        ),
         (
             // A zero-width joiner shapes text; it reorders nothing.
             "zero-width joiner is kept",

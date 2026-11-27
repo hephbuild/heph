@@ -634,23 +634,20 @@ pub(crate) fn truncate(s: &str, max: usize) -> String {
 /// look-ahead and is never kept.
 const MAX_SGR_PARAMS: usize = 128;
 
-/// The bidirectional controls: the embedding, override and isolate controls
-/// (`U+202A`–`U+202E`, `U+2066`–`U+2069`) and the implicit marks (`U+200E`
-/// LRM, `U+200F` RLM, `U+061C` ALM). They are not control characters to
-/// `char::is_control` (they are format characters), but they reorder how the
-/// rest of a line is displayed, so recorded text could make a viewer show
-/// something it does not contain. Escaped like a control character.
-fn is_bidi_control(c: char) -> bool {
-    matches!(
-        c,
-        '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{200e}' | '\u{200f}' | '\u{061c}'
-    )
+/// Whether recorded text's `c` is escaped: a control or format character
+/// (`hcore::diagnostic::is_terminal_control`, the one set every escaper uses:
+/// the bidi controls and marks are format characters, not `char::is_control`,
+/// but they reorder how the rest of a line is displayed, so recorded text
+/// could make a viewer show something it does not contain), or a newline or
+/// tab, which only [`escape_text`] keeps.
+fn is_escaped(c: char) -> bool {
+    hcore::diagnostic::is_terminal_control(c) || c == '\n' || c == '\t'
 }
 
 /// One line of recorded text, made safe for a terminal: SGR sequences
 /// (`ESC[…m`) are dropped, every other control character — newlines included —
-/// and every bidi control is escaped (`\u{1b}`, `\n`, `\u{202e}`). `attach`
-/// keeps SGR: see [`escape_replayed`].
+/// and every format character that reorders or hides text is escaped
+/// (`\u{1b}`, `\n`, `\u{202e}`). `attach` keeps SGR: see [`escape_replayed`].
 pub(crate) fn escape(s: &str) -> Cow<'_, str> {
     escape_with(s, false, false)
 }
@@ -673,7 +670,7 @@ pub(crate) fn escape_replayed(s: &str, color: bool) -> Cow<'_, str> {
 
 fn escape_with(s: &str, keep_lines: bool, keep_sgr: bool) -> Cow<'_, str> {
     let kept = |c: char| keep_lines && (c == '\n' || c == '\t');
-    let escaped = |c: char| (c.is_control() || is_bidi_control(c)) && !kept(c);
+    let escaped = |c: char| is_escaped(c) && !kept(c);
     if !s.chars().any(escaped) {
         return Cow::Borrowed(s);
     }

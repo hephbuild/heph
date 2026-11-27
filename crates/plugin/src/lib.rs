@@ -19,6 +19,7 @@
 )]
 
 pub mod config;
+pub mod diagnostic;
 pub mod driver;
 pub mod eresult;
 pub mod error;
