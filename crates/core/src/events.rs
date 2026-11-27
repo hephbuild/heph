@@ -2121,6 +2121,35 @@ mod tests {
         );
     }
 
+    /// `LogTailData.streamed` is absent from the wire when false (a tail that
+    /// did not stream encodes as before it existed), read back when true, and
+    /// false in a tail from a host that predates it.
+    #[test]
+    fn log_tail_streamed_is_additive() {
+        let tail = |streamed: bool| {
+            serde_json::to_string(&LogTailData {
+                text: "boom\n".into(),
+                start_line: 3,
+                streamed,
+            })
+            .expect("encode")
+        };
+        assert_eq!(tail(false), r#"{"text":"boom\n","start_line":3}"#);
+        let set = tail(true);
+        assert_eq!(set, r#"{"text":"boom\n","start_line":3,"streamed":true}"#);
+        let read = |s: &str| serde_json::from_str::<LogTailData>(s).expect("decode");
+        assert!(read(&set).streamed);
+        let older = read(r#"{"text":"boom\n","start_line":3}"#);
+        assert_eq!(
+            older,
+            LogTailData {
+                text: "boom\n".into(),
+                start_line: 3,
+                streamed: false,
+            }
+        );
+    }
+
     /// `ExecuteStart.log_not_streamed` is absent from the wire when false,
     /// read back when true, defaults to false in a frame from a host that
     /// predates it, and a decoder that predates it reads the start anyway.

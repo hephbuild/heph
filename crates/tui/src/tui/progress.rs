@@ -2649,12 +2649,14 @@ pub(crate) fn prepare_note(
 /// [`left_behind_rows`]: crate::tui::failure_rows::left_behind_rows
 /// [`tail_rows`]: crate::tui::failure_rows::tail_rows
 /// [`escape_log_tail`]: crate::tui::text::escape_log_tail
+#[expect(clippy::too_many_arguments, reason = "the event's fields, one for one")]
 fn live_failure_block(
     addr: &str,
     error: &str,
     exit_status: Option<&str>,
     timed_out: Option<&hcore::events::TimedOutData>,
     tail: Option<&hcore::events::LogTailData>,
+    left_behind: Option<&hcore::events::LeftBehindData>,
     log_lines: usize,
     redact: &crate::tui::text::Redact,
 ) -> String {
@@ -2679,7 +2681,14 @@ fn live_failure_block(
     if log_lines > 0
         && let Some(tail) = tail
     {
-        let shown = tail_rows(addr, &tail.text, tail.start_line, tail.streamed, log_lines);
+        let shown = tail_rows(
+            addr,
+            &tail.text,
+            tail.start_line,
+            tail.streamed,
+            left_behind.is_some_and(crate::tui::failure_rows::log_readable),
+            log_lines,
+        );
         body.extend(
             shown
                 .note
@@ -2879,6 +2888,7 @@ impl CIAppView for CiProgressView {
                         exit_status.as_deref(),
                         timed_out.as_ref(),
                         log_tail.as_ref(),
+                        left_behind.as_deref(),
                         self.log_lines,
                         &self.core.state.redact,
                     ),
@@ -4477,7 +4487,7 @@ mod tests {
         assert_eq!(
             ci_live_log(3, &[result_start("//a:b"), end.clone()]),
             "ERROR ✗ //a:b · exit status: 1\
-             \n  │ … 2 earlier lines (heph log //a:b)\
+             \n  │ … 2 earlier lines\
              \n  │ three\
              \n  │ four\
              \n  │ five\n",
@@ -4502,10 +4512,23 @@ mod tests {
             t.streamed = true;
             t.start_line = 96;
         }
+        // Without word that the log can be read, the pointer names no command.
+        assert_eq!(
+            ci_live_log(3, std::slice::from_ref(&end)),
+            "ERROR ✗ //a:b · exit status: 1\
+             \n  │ (output not shown here: 100 lines)\n",
+        );
+        if let BuildEventKind::ResultEnd { left_behind, .. } = &mut end {
+            *left_behind = Some(Box::new(hcore::events::LeftBehindData {
+                log_readable: Some(true),
+                ..Default::default()
+            }));
+        }
         assert_eq!(
             ci_live_log(3, &[end]),
             "ERROR ✗ //a:b · exit status: 1\
-             \n  │ (output not shown here: 100 lines · heph log //a:b)\n",
+             \n  │ (output not shown here: 100 lines · heph log //a:b)\
+             \n  log: heph log //a:b\n",
         );
     }
 
@@ -4539,7 +4562,7 @@ mod tests {
         assert_eq!(
             ci_live_log(2, std::slice::from_ref(&end)),
             "ERROR ✗ //a:b · exit status: 1\
-             \n  │ … 3 earlier lines (heph log //a:b)\
+             \n  │ … 3 earlier lines\
              \n  │ four\
              \n  │ five\
              \n  full log: /h/failures/a_b/log.txt\
@@ -4610,7 +4633,7 @@ mod tests {
         assert_eq!(
             ci_live_log(2, &[timed_out]),
             "ERROR ✗ //e2e:it · timed out after 10m (its timeout)\
-             \n  │ … 1 earlier line (heph log //e2e:it)\
+             \n  │ … 1 earlier line\
              \n  │ b\\x07ell\
              \n  │ 10%\\r20%\n",
         );

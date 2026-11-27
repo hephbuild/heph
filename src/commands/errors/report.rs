@@ -187,7 +187,14 @@ impl ReportContext {
         if let Some((text, start)) = &block.tail {
             // The pointer, `(no output)` or the earlier-lines row, worded once
             // for every box (D6.1); the tail is already `--log-lines` long.
-            let shown = tail_rows(&addr, text, *start, f.streamed, usize::MAX);
+            let shown = tail_rows(
+                &addr,
+                text,
+                *start,
+                f.streamed,
+                f.points_at_log(),
+                usize::MAX,
+            );
             if let Some(note) = &shown.note {
                 body.push(paint(&self.cut_row(&clean_inline(note)), Tone::Dim, color));
             }
@@ -722,7 +729,7 @@ mod tests {
         assert_eq!(
             out,
             "\n✗ //crates/engine:test · exit status: 101\
-             \n  │ … 2 earlier lines (heph log //crates/engine:test)\
+             \n  │ … 2 earlier lines\
              \n  │ ---- stale stdout ----\
              \n  │ panicked\
              \n  │ FAILED\

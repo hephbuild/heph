@@ -1213,6 +1213,24 @@ mod tests {
         let tail = tail_of_bytes(log.as_bytes(), 1000);
         assert_eq!(tail.text.len(), TAIL_CUT_MARK.len() + TAIL_MAX_BYTES);
         assert_eq!(tail.start_line, 1);
+
+        // Exactly the cap is kept whole; one byte over is cut and marked.
+        let log = "y".repeat(TAIL_MAX_BYTES);
+        let tail = tail_of_bytes(log.as_bytes(), 1000);
+        assert_eq!((tail.text.as_str(), tail.start_line), (log.as_str(), 1));
+        let log = "y".repeat(TAIL_MAX_BYTES + 1);
+        let tail = tail_of_bytes(log.as_bytes(), 1000);
+        assert_eq!(tail.text.len(), TAIL_CUT_MARK.len() + TAIL_MAX_BYTES);
+        assert!(tail.text.starts_with(TAIL_CUT_MARK));
+
+        // The n-th break found, and the tail after it still over the cap:
+        // cut inside its first line, which is line 2.
+        let log = format!("a\n{}\nc\n", "b".repeat(TAIL_MAX_BYTES + 100));
+        let tail = tail_of_bytes(log.as_bytes(), 2);
+        assert!(tail.text.starts_with(TAIL_CUT_MARK), "the cut is marked");
+        assert!(tail.text.ends_with("b\nc"), "the last line is whole");
+        assert_eq!(tail.text.len(), TAIL_CUT_MARK.len() + TAIL_MAX_BYTES - 1);
+        assert_eq!(tail.start_line, 2);
     }
 
     /// A captured child's failure lands in the log (appended, both streams),

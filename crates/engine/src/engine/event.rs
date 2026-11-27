@@ -95,7 +95,7 @@ impl ErrorDetail {
             message: hcore::hmemoizer::chain_message(e),
             cancelled: hplugin::error::is_cancelled(e),
             kept: slot.is_some(),
-            streamed: slot.is_some_and(|s| s.streamed),
+            streamed: crate::engine::failure_slot::RunStreamed::on(e),
             left_behind: slot.map(|s| {
                 hplugin::error::left_behind(
                     s.log.as_ref(),

@@ -2231,7 +2231,7 @@ fn classify_failure_fresh(
     let slot = downcast_chain_ref::<crate::engine::failure_slot::FailureSlot>(&e);
     let fixes = slot.and_then(|s| s.fixes.clone());
     let sandbox = slot.and_then(|s| s.sandbox.clone());
-    let streamed = slot.is_some_and(|s| s.streamed);
+    let streamed = crate::engine::failure_slot::RunStreamed::on(&e);
     let fresh = rs.record_failure(
         addr.clone(),
         Arc::new(
@@ -3816,19 +3816,11 @@ impl Engine {
         // with the write.
         //
         // It runs outside the memoized execute, so a write-back that fails
-        // after a run that streamed records that here, on an empty slot, as
-        // the cache store does inside it (D6.1c).
+        // after a run that streamed is marked so here, as the cache store's
+        // failure is inside it (D6.1c).
         self.materialize_codegen(&rs, opts, &locked, &cached)
             .await
-            .map_err(|e| {
-                if streamed {
-                    e.context(
-                        crate::engine::failure_slot::FailureSlot::default().with_streamed(true),
-                    )
-                } else {
-                    e
-                }
-            })?;
+            .map_err(|e| crate::engine::failure_slot::RunStreamed::mark(e, streamed))?;
 
         // Inside `inner_result_addr`'s scope, so it lands right before this
         // target's `ResultEnd`. Every group the run produced, whichever this
@@ -5534,17 +5526,12 @@ impl Engine {
                         })
                         .with_context(|| format!("cache_locally {addr}"))
                         // A store that failed after a run that streamed: the
-                        // failure records that it streamed (D6.1c), on an
-                        // empty slot as a failure past the run does above.
+                        // failure says it streamed (D6.1c). A marker, not an
+                        // empty slot: a slot would make the failure "kept",
+                        // so a store failing under a cancel would be a stop
+                        // or a failure depending on whether a TTY was attached.
                         .map_err(|e| {
-                            if streamed {
-                                e.context(
-                                    crate::engine::failure_slot::FailureSlot::default()
-                                        .with_streamed(true),
-                                )
-                            } else {
-                                e
-                            }
+                            crate::engine::failure_slot::RunStreamed::mark(e, streamed)
                         });
 
                     // Remote push: fire-and-forget on a background task (tracked
@@ -16447,6 +16434,9 @@ mod tests {
     /// Label on a leaf whose `run` succeeds with two artifacts of one name, so
     /// the cache store refuses them: a failure after a run that went fine.
     const DUP_LABEL: &str = "terminal-test:dup";
+    /// Label on a leaf whose `run` succeeds declaring a host path that does
+    /// not exist, refused before the entry is written: a failure past the run.
+    const BADOUT_LABEL: &str = "terminal-test:badout";
 
     #[async_trait]
     impl RawDriver for TerminalDriver {
@@ -16498,11 +16488,15 @@ mod tests {
                     Some(hcore::htvalue::Value::Bool(true))
                 )
             };
-            let labels = [(flag("fail"), FAIL_LABEL), (flag("dup"), DUP_LABEL)]
-                .into_iter()
-                .filter(|&(on, _)| on)
-                .map(|(_, label)| label.to_string())
-                .collect();
+            let labels = [
+                (flag("fail"), FAIL_LABEL),
+                (flag("dup"), DUP_LABEL),
+                (flag("badout"), BADOUT_LABEL),
+            ]
+            .into_iter()
+            .filter(|&(on, _)| on)
+            .map(|(_, label)| label.to_string())
+            .collect();
             // `entrypoint = true`: invoked through `Engine::invoke`, not built.
             let entrypoint = matches!(
                 req.target_spec.config.get("entrypoint"),
@@ -16581,8 +16575,21 @@ mod tests {
             } else {
                 vec![out]
             };
+            // A host path that does not exist: refused before the entry is
+            // written, a failure past the run.
+            let host_paths = if req.target.labels.iter().any(|l| l == BADOUT_LABEL) {
+                vec![hplugin::driver::HostPath::new(
+                    &req.sandbox_dir
+                        .join("missing-host-path")
+                        .display()
+                        .to_string(),
+                )?]
+            } else {
+                vec![]
+            };
             Ok(RunResponse {
                 artifacts,
+                host_paths,
                 ..Default::default()
             })
         }
@@ -17900,10 +17907,74 @@ mod tests {
         })
     }
 
+    /// A run that streamed and failed: the slot `execute` fills says so, and
+    /// the tail is kept all the same (D6.1). The same run that did not stream
+    /// records that it did not.
+    #[tokio::test]
+    async fn failed_run_records_whether_it_streamed() -> anyhow::Result<()> {
+        for streamed in [true, false] {
+            let h = terminal_harness(vec![leaf_spec("//pkg:t", true)?])?;
+            let rs = h.engine.new_state();
+            let addr = hmodel::htaddr::parse_addr("//pkg:t")?;
+            let opts = ResultOptions {
+                interactive: Some(streaming_wrapper(streamed)),
+                ..Default::default()
+            };
+
+            Arc::clone(&h.engine)
+                .result_addr(rs.clone(), &addr, OutputMatcher::All, &opts)
+                .await
+                .err()
+                .expect("the run fails");
+
+            let recorded = rs.get_failure(&addr).expect("failure must be recorded");
+            assert_eq!(recorded.streamed, streamed);
+            let tail = recorded.log_tail.as_ref().expect("the tail is always kept");
+            assert!(tail.text.contains("line12"), "tail: {}", tail.text);
+        }
+        Ok(())
+    }
+
+    /// A run that streamed and went fine, then a host path refused before
+    /// the entry is written (a failure past the run, on the slot that carries
+    /// the sandbox's fate): it records that the run streamed.
+    #[tokio::test]
+    async fn failure_past_a_streamed_run_records_streamed() -> anyhow::Result<()> {
+        for streamed in [true, false] {
+            let mut spec = leaf_spec("//pkg:t", false)?;
+            spec.config
+                .insert("badout".to_string(), hcore::htvalue::Value::Bool(true));
+            let h = terminal_harness(vec![spec])?;
+            let rs = h.engine.new_state();
+            let addr = hmodel::htaddr::parse_addr("//pkg:t")?;
+            let opts = ResultOptions {
+                interactive: Some(streaming_wrapper(streamed)),
+                ..Default::default()
+            };
+
+            let err = Arc::clone(&h.engine)
+                .result_addr(rs.clone(), &addr, OutputMatcher::All, &opts)
+                .await
+                .err()
+                .expect("an artifact that does not exist cannot be read");
+
+            assert_eq!(h.runs.load(Ordering::SeqCst), 1, "the run itself went fine");
+            let recorded = rs.get_failure(&addr).expect("failure must be recorded");
+            let msg = format!("{:#}", recorded.source);
+            assert!(
+                msg.contains("declares host path") && !msg.contains("cache_locally"),
+                "a failure past the run: {msg} ({err:#})",
+            );
+            assert_eq!(recorded.streamed, streamed, "{msg}");
+        }
+        Ok(())
+    }
+
     /// A run that streamed and went fine, then a cache store that failed
-    /// (D6.1c, "a later step failed"): the failure records that the log
-    /// streamed, so the box points at the log instead of repeating it. The
-    /// same run that did not stream records that it did not.
+    /// (D6.1c, "a later step failed"): the failure records that the run
+    /// streamed. The same run that did not stream records that it did not.
+    /// Either way the failure is not "kept" (no slot on its chain), so
+    /// whether it is a stop under a cancel cannot depend on a TTY.
     #[tokio::test]
     async fn cache_store_failure_after_a_streamed_run_records_streamed() -> anyhow::Result<()> {
         for streamed in [true, false] {
@@ -17932,6 +18003,9 @@ mod tests {
                 "a cache-store failure: {msg} ({err:#})",
             );
             assert_eq!(recorded.streamed, streamed, "{msg}");
+            let detail = crate::engine::event::ErrorDetail::from_error(&recorded.source);
+            assert_eq!(detail.streamed, streamed, "{msg}");
+            assert!(!detail.kept, "no slot on a store failure: {msg}");
         }
         Ok(())
     }
