@@ -311,26 +311,25 @@ mod tests {
             if !ids.contains(&"arg1") && !ids.contains(&"expr") {
                 continue;
             }
+            // `run` refuses whole packages without `--allow-all`: hold its
+            // examples to the selection `execute` makes.
+            if path == "heph run" {
+                use clap::FromArgMatches as _;
+                let args = crate::commands::run::RunArgs::from_arg_matches(m)
+                    .unwrap_or_else(|e| panic!("`{example}`: {e}"));
+                crate::commands::run::selection(&args, &PkgBuf::from(""))
+                    .unwrap_or_else(|e| panic!("`{example}` is refused by `run`: {e:#}"));
+                continue;
+            }
             let get = |id| m.try_get_one::<String>(id).ok().flatten().cloned();
-            // `run` is the one selection that rejects the `all` label.
-            let allow_all = path != "heph run";
-            let matcher = resolve_matcher(
+            resolve_matcher(
                 &get("expr"),
                 &get("arg1"),
                 &get("arg2"),
                 &PkgBuf::from(""),
-                allow_all,
+                true,
             )
             .unwrap_or_else(|e| panic!("`{example}` parses but selects nothing: {e:#}"));
-            if path == "heph run" {
-                let whole = m.try_get_one::<bool>("allow_all").ok().flatten() == Some(&true);
-                crate::commands::run::refuse_whole_packages(
-                    &matcher,
-                    get("expr").as_deref(),
-                    whole,
-                )
-                .unwrap_or_else(|e| panic!("`{example}` is refused by `run`: {e:#}"));
-            }
         }
     }
 

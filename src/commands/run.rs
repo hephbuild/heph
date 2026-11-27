@@ -64,9 +64,10 @@ Query language (-e / --expr):
     heph run -e '//... && !//vendor/...' --allow-all
     heph run -e '(//a/... || //b/...) && tree_output(gen)'
 
-  `run` refuses an expression that takes whole packages (bounded only by
-  package paths or a negation, like //pkg or //pkg/...) unless --allow-all
-  is passed; `query` never asks for it.
+  `run` refuses an expression that takes whole packages unless --allow-all
+  is passed: one bounded only by package paths or a negation, like //pkg,
+  //pkg/... or !label(slow). An address, label(), driver() or tree_output()
+  joined with && bounds it. `query` never asks for the flag.
 ";
 
 #[derive(Args, Clone)]
@@ -91,13 +92,15 @@ pub struct RunArgs {
         conflicts_with = "arg1"
     )]
     pub expr: Option<String>,
-    /// Run a selection that takes whole packages, e.g. -e '//some/pkg' --allow-all
+    /// Allow a selection of every target of whole packages (-e '//pkg', -e '//pkg/...', a negation, or `all <pkg>`)
     ///
     /// A `-e` expression bounded only by package paths (`//pkg`, `//pkg/...`)
     /// or by a negation (`!label(slow)`) runs every target in those packages,
-    /// whatever they are. Without this flag `run` refuses it before anything
-    /// builds. Narrowing it with a label, a driver, a codegen tree or an address
-    /// (`-e '//pkg/... && label(test)'`) needs no flag.
+    /// whatever they are; so does the positional `all <PACKAGE_MATCHER>`.
+    /// Without this flag `run` refuses them before anything builds. An
+    /// address, `label()`, `driver()` or `tree_output()` joined with `&&`
+    /// bounds the expression (`-e '//pkg/... && label(test)'`), and needs no
+    /// flag.
     #[arg(long = "allow-all")]
     pub allow_all: bool,
     /// Force execution, ignoring any cached result
@@ -311,31 +314,42 @@ pub fn refuse_raw_with_shell(raw: bool, shell: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A selection that takes whole packages ([`Matcher::selects_whole_packages`])
-/// without `--allow-all`, refused before anything builds: `heph run -e
-/// //some/pkg` runs every target there, which is rarely what was meant.
-pub fn refuse_whole_packages(
-    m: &Matcher,
-    expr: Option<&str>,
-    allow_all: bool,
-) -> anyhow::Result<()> {
-    if allow_all || !m.selects_whole_packages() {
-        return Ok(());
-    }
-    // Only `-e` reaches here: the positional forms are an address, a label
-    // within packages, or (`all <pkg>`) refused already.
-    let formatted;
-    let shown = match expr {
-        Some(expr) => expr,
-        None => {
-            formatted = crate::htquery::format(m);
-            &formatted
-        }
+/// What `heph run` selects, from its arguments alone: the `--shell` flag and
+/// the matcher, or the refusal of a selection it will not run. Nothing has
+/// built when this fails.
+pub(crate) fn selection(
+    args: &RunArgs,
+    base_pkg: &crate::htpkg::PkgBuf,
+) -> anyhow::Result<(ShellFlag, Matcher)> {
+    let shell = resolve_shell_target(args.shell.as_deref(), base_pkg)?;
+    // `heph run --shell=//pkg:a` on its own is a complete request: it names the
+    // target to enter, so there is nothing left to ask for. Falling through to
+    // `resolve_matcher` would answer "missing TARGET_ADDRESS/LABEL" to a command
+    // line that named one.
+    let m = match (&shell, &args.expr, &args.arg1) {
+        (ShellFlag::Target(addr), None, None) => Matcher::Addr(addr.clone()),
+        _ => resolve_matcher(&args.expr, &args.arg1, &args.arg2, base_pkg, args.allow_all)?,
     };
-    anyhow::bail!(
-        "-e '{shown}' runs every target of whole packages; pass --allow-all to run them all, \
-         or narrow it to the targets you want, e.g. -e '({shown}) && label(test)'"
-    )
+    // The positional forms are an address, a label within packages, or `all
+    // <pkg>`, which `resolve_matcher` refuses without `--allow-all`: only `-e`
+    // can take whole packages past it.
+    if let Some(expr) = &args.expr {
+        refuse_whole_packages(&m, expr, args.allow_all)?;
+    }
+    Ok((shell, m))
+}
+
+/// A `-e` selection that takes whole packages
+/// ([`Matcher::selects_whole_packages`]) without `--allow-all`: `heph run -e
+/// //some/pkg` runs every target there, which is rarely what was meant.
+fn refuse_whole_packages(m: &Matcher, expr: &str, allow_all: bool) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        allow_all || !m.selects_whole_packages(),
+        "-e '{expr}' selects whole packages: no address, label(), driver() or tree_output() \
+         bounds it with &&; pass --allow-all to run every target it selects, or add such a \
+         bound to select fewer"
+    );
+    Ok(())
 }
 
 /// The mode of an entrypoint run, in the order the docs state it. `Err` is a
@@ -567,7 +581,7 @@ struct Caller {
 /// the same thing to the engine, so they get three variants rather than a
 /// `bool` plus an `Option` the reader has to recombine.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum ShellFlag {
+pub(crate) enum ShellFlag {
     /// No `--shell`.
     Absent,
     /// Bare `--shell` (`default_missing_value = ""`): the run infers its single
@@ -1472,16 +1486,7 @@ async fn execute_async(
     };
     let base_pkg = get_cwp()?;
     refuse_misplaced_tool_args(&args, &base_pkg)?;
-    let shell = resolve_shell_target(args.shell.as_deref(), &base_pkg)?;
-    // `heph run --shell=//pkg:a` on its own is a complete request: it names the
-    // target to enter, so there is nothing left to ask for. Falling through to
-    // `resolve_matcher` would answer "missing TARGET_ADDRESS/LABEL" to a command
-    // line that named one.
-    let m = match (&shell, &args.expr, &args.arg1) {
-        (ShellFlag::Target(addr), None, None) => Matcher::Addr(addr.clone()),
-        _ => resolve_matcher(&args.expr, &args.arg1, &args.arg2, &base_pkg, false)?,
-    };
-    refuse_whole_packages(&m, args.expr.as_deref(), args.allow_all)?;
+    let (shell, m) = selection(&args, &base_pkg)?;
     let shell = shell_for_selection(shell, &m);
     let (engine, shutdown) = bootstrap::new_engine(&global, session)?;
     let raw = args.raw;
@@ -2241,62 +2246,51 @@ mod tests {
         );
     }
 
-    /// The selection `execute` checks, from the command line as typed: a
-    /// package-wide `-e` is refused with a pointer at `--allow-all` and a
-    /// narrowed form, and runs with `--allow-all`; addresses, labels and the
-    /// positional `<label> <pkg>` never need it.
+    /// `selection`, which `execute` calls before anything builds, from the
+    /// command line as typed: whole packages, through `-e` or the positional
+    /// `all <pkg>`, are refused with a pointer at `--allow-all` and selected
+    /// with it; addresses, labels, `<label> <pkg>` and `--shell=ADDR` alone
+    /// never need it.
     #[test]
     fn whole_packages_need_allow_all() {
-        let check = |argv: &[&str]| {
-            let args = parse(argv);
-            let m = resolve_matcher(&args.expr, &args.arg1, &args.arg2, &PkgBuf::from(""), false)
-                .expect("resolves");
-            refuse_whole_packages(&m, args.expr.as_deref(), args.allow_all)
-        };
+        let select = |argv: &[&str]| selection(&parse(argv), &PkgBuf::from(""));
         for argv in [
             &["-e", "//some/pkg"][..],
             &["-e", "//some/..."],
             &["-e", "//... && !//vendor/..."],
             &["-e", "!label(slow)"],
+            &["--shell=//some/pkg:t", "-e", "//some/pkg"],
+            &["all", "//some/..."],
         ] {
-            let err = check(argv).expect_err("refused without --allow-all");
+            let err = select(argv).expect_err("refused without --allow-all");
             let msg = format!("{err:#}");
             assert!(msg.contains("--allow-all"), "{argv:?}: {msg}");
-            assert!(
-                msg.contains(argv[1]),
-                "{argv:?} names the expression: {msg}"
-            );
-            let mut with_all = argv.to_vec();
-            with_all.push("--allow-all");
-            check(&with_all).unwrap_or_else(|e| panic!("{with_all:?}: {e:#}"));
+            let named = argv.last().expect("an argument");
+            assert!(msg.contains(named), "{argv:?} names the selection: {msg}");
+            let mut with_flag = argv.to_vec();
+            with_flag.push("--allow-all");
+            let (_, m) = select(&with_flag).unwrap_or_else(|e| panic!("{with_flag:?}: {e:#}"));
+            assert!(m.selects_whole_packages(), "{with_flag:?}");
         }
         for argv in [
             &["//some/pkg:t"][..],
             &["test", "//some/..."],
+            &["--shell=//some/pkg:t"],
             &["-e", "//some/pkg:t"],
             &["-e", "//some/... && label(test)"],
             &["-e", "//p:fast || //p:slow"],
         ] {
-            check(argv).unwrap_or_else(|e| panic!("{argv:?}: {e:#}"));
+            select(argv).unwrap_or_else(|e| panic!("{argv:?}: {e:#}"));
         }
     }
 
-    /// The suggested narrowing in the refusal is itself an expression `run`
-    /// accepts, so following the message works.
+    /// A lone package matcher on `run` points at the form that runs it, flag
+    /// included, rather than at a `-e` that is refused in turn.
     #[test]
-    fn whole_packages_suggestion_parses_and_is_bounded() {
-        let expr = "//a/... || //b";
-        let m = crate::htquery::parse(expr, &PkgBuf::from("")).expect("parse");
-        let msg = format!(
-            "{:#}",
-            refuse_whole_packages(&m, Some(expr), false).unwrap_err()
-        );
-        let suggested = msg
-            .rsplit_once("-e '")
-            .and_then(|(_, s)| s.strip_suffix('\''))
-            .expect("a suggested -e");
-        let narrowed =
-            crate::htquery::parse(suggested, &PkgBuf::from("")).expect("suggestion parses");
-        assert!(!narrowed.selects_whole_packages(), "{suggested}");
+    fn lone_package_matcher_hint_carries_allow_all() {
+        let err = selection(&parse(&["//some/..."]), &PkgBuf::from(""))
+            .expect_err("a package is not an address");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("-e '//some/...' --allow-all"), "{msg}");
     }
 }

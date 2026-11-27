@@ -347,6 +347,11 @@ mod tests {
             ("//a/... && !label(slow)", true),
             ("//a:b || //c", true),
             ("label(test) || //c/...", true),
+            // Syntactic: a double negation is not seen through.
+            ("!!label(x)", true),
+            ("//pkg && !//pkg:x", true),
+            // A driver names a class of target, as a label does.
+            ("driver(exec)", false),
             ("//a:b", false),
             ("//a:b || //c:d", false),
             ("label(test)", false),
