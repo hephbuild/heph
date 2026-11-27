@@ -432,8 +432,8 @@ impl Engine {
                                     transitive_origin(&input.origin_id)
                                         .unwrap_or_else(|| declared_origin(&input.origin_id))
                                 },
-                                || {
-                                    Some(InputDefFailed {
+                                |e| {
+                                    e.context(InputDefFailed {
                                         input: dep.clone(),
                                         declarer: declarer.clone(),
                                         origin_id: input.origin_id.clone(),

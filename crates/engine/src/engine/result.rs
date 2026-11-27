@@ -4,8 +4,8 @@ use crate::engine::driver::targetdef::{Input, TargetDef};
 use crate::engine::driver::{ApplyTransitiveRequest, ParseRequest, outputartifact};
 use crate::engine::error::{
     CancelledError, Culprit, CycleError, FileEvalFailed, HashUnknownError, InputDefFailed,
-    MissingDep, MultiError, RevisionChangedError, ShellNeedsSingleTarget, StageFrame,
-    TargetFailure, TargetNotFoundError, UpstreamFailed,
+    MissingDep, MultiError, RevisionChangedError, ShellNeedsSingleTarget, TargetFailure,
+    TargetNotFoundError, UpstreamFailed,
 };
 use crate::engine::provider::{
     GetError, GetRequest, GetResponse, ListRequest, ProbeRequest, ProviderExecutor, State,
@@ -21,7 +21,7 @@ use hcore::hmemoizer::{downcast_chain_ref, unwrap_arc_err};
 use hmodel::htaddr::Addr;
 use hmodel::htmatcher::MatchResult;
 use hmodel::htpkg::PkgBuf;
-use hplugin::diagnostic::{Boundary, StageContext};
+use hplugin::diagnostic::{Boundary, StageContext, StageFrame};
 
 use crate::engine::driver::sandbox::Sandbox;
 use crate::engine::link::LinkedTargetDef;
@@ -2536,35 +2536,38 @@ fn is_stop(e: &anyhow::Error) -> bool {
 /// The culprit of a failure that is not a marker, a stop or a request
 /// error (D1.c rules 4–6), and the address its record carries.
 ///
-/// Walks every level of the chain (the memoizer's shared wrappers
-/// included) and keeps the innermost frame of each kind:
+/// Walks every frame of the chain, outermost first, through the memoizer's
+/// shared wrappers ([`hcore::hmemoizer::frames`]; an aggregate's members are
+/// not entered), and keeps the innermost frame of each kind:
 /// - a [`MissingDep`] blames its declarer;
-/// - else the innermost [`InputDefFailed`] input or [`StageFrame`] address
-///   is the target whose own spec or def raised the error — or, when a
-///   [`FileEvalFailed`] is on the chain, that file, entered through it;
+/// - else the innermost [`InputDefFailed`] input, or `get spec:` /
+///   `get_def:` [`StageFrame`] address, is the target whose own spec or def
+///   raised the error — or, when a [`FileEvalFailed`] is on the chain, that
+///   file, entered through it;
 /// - else the error is `addr`'s own (or its file's, for a requested target
 ///   in a BUILD file that did not evaluate).
 ///
-/// Within one level anyhow only shows the outermost frame of a type; the
-/// engine adds these frames across memoized calls, one per level.
+/// Only the spec and def boundaries name whose error it is: `link`, `meta`,
+/// `execute` and `run` frames are added by the target doing the work, over
+/// errors that may be an input's, which the frames above already name.
 fn blame(addr: &Addr, e: &anyhow::Error) -> (Culprit, Addr) {
     let mut missing: Option<&MissingDep> = None;
     let mut frame: Option<&Addr> = None;
     let mut file: Option<&FileEvalFailed> = None;
-    for level in hcore::hmemoizer::shared_levels(e) {
-        if let Some(m) = level.downcast_ref::<MissingDep>() {
+    for f in hcore::hmemoizer::frames(e) {
+        if let Some(m) = f.downcast_ref::<MissingDep>() {
             missing = Some(m);
         }
-        if let Some(i) = level.downcast_ref::<InputDefFailed>() {
+        if let Some(i) = f.downcast_ref::<InputDefFailed>() {
             frame = Some(&i.input);
         }
-        // A stage frame is added inside the def an `InputDefFailed` wraps, so
-        // on one level it is the inner of the two.
-        if let Some(s) = level.downcast_ref::<StageFrame>() {
+        if let Some(s) = f.downcast_ref::<StageFrame>()
+            && matches!(s.boundary, Boundary::GetSpec | Boundary::GetDef)
+        {
             frame = Some(&s.addr);
         }
-        if let Some(f) = level.downcast_ref::<FileEvalFailed>() {
-            file = Some(f);
+        if let Some(x) = f.downcast_ref::<FileEvalFailed>() {
+            file = Some(x);
         }
     }
     if let Some(m) = missing {
@@ -2689,8 +2692,8 @@ mod failure_fate_tests {
             &input,
             &declarer,
             || origin.to_owned(),
-            || {
-                Some(InputDefFailed {
+            |e| {
+                e.context(InputDefFailed {
                     input: input.clone(),
                     declarer: declarer.clone(),
                     origin_id: origin.to_owned(),
@@ -2709,7 +2712,6 @@ mod failure_fate_tests {
     fn broken_file(file: &str) -> anyhow::Error {
         anyhow::anyhow!("fail: boom").context(FileEvalFailed {
             file: Arc::from(file),
-            shown: format!("/ws/{file}"),
         })
     }
 
@@ -2781,10 +2783,8 @@ mod failure_fate_tests {
     /// through `//d:t`.
     #[test]
     fn d1b_attribution_broken_file() {
-        let e = broken_file("d/BUILD").context(StageFrame {
-            stage: hplugin::error::Stage::Spec,
-            addr: a("//d:t"),
-        });
+        let e =
+            hplugin::diagnostic::with_stage(broken_file("d/BUILD"), Boundary::GetSpec, &a("//d:t"));
         let e = at_input(e, "//d:t", "//c:y", "deps");
         let (e, _other) = shared(e);
         let e = at_input(e, "//c:y", "//a:x", "deps");
@@ -3824,13 +3824,7 @@ impl Engine {
             // belong.
             move |error| {
                 let blame = std::mem::take(&mut *end_blame.lock());
-                result_end_event(
-                    &end_rs,
-                    addr_str,
-                    error,
-                    blame,
-                    end_readable.get().copied(),
-                )
+                result_end_event(&end_rs, addr_str, error, blame, end_readable.get().copied())
             },
             |e| {
                 let fate = failure_fate(addr, &e);
@@ -6964,12 +6958,7 @@ impl Engine {
                                 dep,
                                 declarer,
                                 || crate::engine::deferred::declared_origin(&input.origin_id),
-                                || {
-                                    Some(hplugin::error::StageFrame {
-                                        stage: hplugin::error::Stage::Spec,
-                                        addr: dep.clone(),
-                                    })
-                                },
+                                |e| hplugin::diagnostic::with_stage(e, Boundary::GetSpec, dep),
                             )
                         })?;
 

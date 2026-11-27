@@ -564,7 +564,7 @@ impl Engine {
                             &p.addr.r#ref,
                             consumer,
                             || format!("${{{READ}://}}"),
-                            || Some(format!("{consumer}: `{}` in `{}`", r.raw, r.path)),
+                            |e| e.context(format!("{consumer}: `{}` in `{}`", r.raw, r.path)),
                         )
                     })?;
                 by_addr.insert(key, value);

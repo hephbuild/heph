@@ -377,8 +377,8 @@ impl Engine {
                         &addr,
                         consumer,
                         || crate::engine::deferred::declared_origin(&input.origin_id),
-                        || {
-                            Some(format!(
+                        |e| {
+                            e.context(format!(
                                 "{consumer} references credential {addr}, which does not resolve"
                             ))
                         },

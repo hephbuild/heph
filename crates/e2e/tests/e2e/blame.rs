@@ -27,9 +27,8 @@ use heph::htmatcher::Matcher;
 use heph::htpkg::PkgBuf;
 use heph::pluginexec;
 use heph::pluginstatictarget::Target;
-use hplugin::error::{
-    CancelledError, Culprit, CycleError, MissingDep, Stage, StageFrame, TargetFailure,
-};
+use hplugin::diagnostic::{Boundary, Stage, innermost_stage_frame};
+use hplugin::error::{CancelledError, Culprit, CycleError, MissingDep, TargetFailure};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -753,8 +752,8 @@ async fn deep_unknown_driver_blames_the_input() -> anyhow::Result<()> {
 }
 
 /// D1.c rule 5: an error under `collect_transitive_deps`' typed
-/// `StageFrame(Spec)` (the dep's own `get`) blames the dep, not the target
-/// whose def was collecting it.
+/// `get spec:` `StageFrame` (the dep's own `get`) blames the dep, not the
+/// target whose def was collecting it.
 #[tokio::test]
 async fn transitive_dep_spec_error_blames_the_dep() -> anyhow::Result<()> {
     let ws = stage_ws(
@@ -767,9 +766,10 @@ async fn transitive_dep_spec_error_blames_the_dep() -> anyhow::Result<()> {
     )?;
     let r = run(&ws.engine, "//f:l2").await;
     let f = r.assert_blames("//f:l3");
-    let frame = downcast_chain_ref::<StageFrame>(&f.source)
+    let frame = innermost_stage_frame(&f.source)
         .unwrap_or_else(|| panic!("a StageFrame on {:#}", f.source));
-    assert_eq!(frame.stage, Stage::Spec);
+    assert_eq!(frame.boundary, Boundary::GetSpec);
+    assert_eq!(frame.stage(), Stage::Spec);
     assert_eq!(frame.addr.format(), "//f:l3");
     Ok(())
 }

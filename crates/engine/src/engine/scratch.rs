@@ -348,8 +348,8 @@ impl Engine {
                         &addr,
                         consumer,
                         || crate::engine::deferred::declared_origin(&input.origin_id),
-                        || {
-                            Some(format!(
+                        |e| {
+                            e.context(format!(
                                 "{consumer} references scratch {addr}, which does not resolve"
                             ))
                         },

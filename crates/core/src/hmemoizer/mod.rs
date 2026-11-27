@@ -592,16 +592,6 @@ pub fn unwrap_arc_err(arc: Arc<anyhow::Error>) -> anyhow::Error {
 /// Use this instead of `e.downcast_ref::<T>()` when the error may have come
 /// from a [`Memoizer::once`] result; otherwise the top-level type is the
 /// internal `SharedAnyhow` wrapper and a direct downcast would fail.
-/// `e`, then each error a memoizer's shared wrapper holds beneath it,
-/// outermost first: the levels [`downcast_chain_ref`] looks through. A
-/// caller that needs the *innermost* frame of a type (anyhow's `downcast_ref`
-/// gives the outermost of each level) takes the last level that has one.
-pub fn shared_levels(e: &anyhow::Error) -> impl Iterator<Item = &anyhow::Error> {
-    std::iter::successors(Some(e), |cur| {
-        cur.downcast_ref::<SharedAnyhow>().map(|s| s.0.as_ref())
-    })
-}
-
 pub fn downcast_chain_ref<T: std::error::Error + Send + Sync + 'static>(
     e: &anyhow::Error,
 ) -> Option<&T> {
