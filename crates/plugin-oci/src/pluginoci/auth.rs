@@ -1,4 +1,5 @@
-//! Registry credentials for the in-process drivers (`oci_pull`, `oci_push`).
+//! Registry credentials for the in-process drivers (`oci_pull`, `oci_push`,
+//! `oci_exists`, `oci_tag`).
 //!
 //! Three modes, and which one applies is decided by the BUILD file, never by
 //! what happens to be configured on the host:
@@ -402,7 +403,7 @@ fn parse_helper_answer(stdout: &[u8]) -> anyhow::Result<RegistryAuth> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use hcore::hasync::StdCancellationToken;
     use hmodel::htaddr::parse_addr;
@@ -411,13 +412,13 @@ mod tests {
     /// `heph.auth.docker(registries)`: a `DOCKER_CONFIG` naming `heph`, and a
     /// `docker-credential-heph` on the mount's `path_prefix`. The shim here is a
     /// script answering with `answer` and recording what it was asked.
-    struct Presented {
+    pub(crate) struct Presented {
         dir: tempfile::TempDir,
-        mount: CredentialMount,
+        pub(crate) mount: CredentialMount,
     }
 
     impl Presented {
-        fn new(addr: &str, registries: &[&str], answer: &str) -> Self {
+        pub(crate) fn new(addr: &str, registries: &[&str], answer: &str) -> Self {
             let dir = tempfile::tempdir().expect("tempdir");
             let cfg = dir.path().join("docker");
             std::fs::create_dir_all(&cfg).expect("mkdir");

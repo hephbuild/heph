@@ -19,8 +19,7 @@ use async_trait::async_trait;
 use hcore::debug_hash::DebugHasher;
 use hcore::hasync::Cancellable;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
-use hplugin::driver::targetdef::path::{CodegenMode, Content, Path as OutPath};
-use hplugin::driver::targetdef::{Input, InputMode, Output, TargetDef};
+use hplugin::driver::targetdef::{Input, InputMode, TargetDef};
 use hplugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, Deferred,
     ParseRequest, ParseResponse, TargetAddr,
@@ -32,7 +31,7 @@ use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3Default;
 
 use super::auth::RegistryCredentials;
-use super::{archive::Layout, dep_input, dep_single_file, registry};
+use super::{archive::Layout, dep_input, dep_single_file, ref_output, registry, write_ref};
 
 /// The `origin_id` of the single image-archive dep input.
 const IMAGE_ORIGIN: &str = "image";
@@ -92,11 +91,6 @@ struct OciPushDef {
 /// gone, so neither is in the key any more.
 /// v3: the pushed reference is an output, `<name>.ref`.
 const OCI_PUSH_FORMAT_VERSION: u32 = 3;
-
-/// The output file holding the reference a push went to, in the package dir.
-fn ref_out_name(target_name: &str) -> String {
-    format!("{target_name}.ref")
-}
 
 impl Hash for OciPushDef {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -265,17 +259,7 @@ impl ManagedDriver for Driver {
                 })
                 .chain(credential_inputs)
                 .collect(),
-                outputs: vec![Output {
-                    group: String::new(),
-                    paths: vec![OutPath {
-                        content: Content::FilePath(super::ws_path(
-                            addr.package.as_str(),
-                            &ref_out_name(&addr.name),
-                        )),
-                        codegen_tree: CodegenMode::None,
-                        collect: true,
-                    }],
-                }],
+                outputs: vec![ref_output(addr)],
                 // An action with an external side effect: never cached (the
                 // default `CacheConfig::off()`), always runs.
                 hash,
@@ -336,12 +320,7 @@ impl ManagedDriver for Driver {
             .with_context(|| format!("push {dest} ({})", creds.failure_hint()))?;
         tracing::debug!(target_addr = %req.request.target.addr.format(), reference = %dest, %digest, "pushed");
 
-        let out = req
-            .sandbox_pkg_dir
-            .join(ref_out_name(&req.request.target.addr.name));
-        tokio::fs::write(&out, registry::full_ref(&dest)?)
-            .await
-            .with_context(|| format!("write the pushed reference to {out:?}"))?;
+        write_ref(&req, &registry::full_ref(&dest)?).await?;
 
         Ok(ManagedRunResponse::default())
     }
@@ -353,6 +332,7 @@ mod tests {
     use hcore::hasync::StdCancellationToken;
     use hcore::htvalue::Value;
     use hmodel::htaddr::parse_addr;
+    use hplugin::driver::targetdef::path::Content;
     use hplugin::provider::TargetSpec;
     use std::collections::HashMap;
 

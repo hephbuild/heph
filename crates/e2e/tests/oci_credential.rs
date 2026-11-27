@@ -37,7 +37,9 @@ fn workspace() -> htestkit::Workspace {
                 .with_managed_driver(Box::new(pluginoci::layer::Driver::new()))
                 .with_managed_driver(Box::new(pluginoci::image::Driver::new()))
                 .with_managed_driver(Box::new(pluginoci::push::Driver::new()))
-                .with_managed_driver(Box::new(pluginoci::pull::Driver::new())))
+                .with_managed_driver(Box::new(pluginoci::pull::Driver::new()))
+                .with_managed_driver(Box::new(pluginoci::exists::Driver::new()))
+                .with_managed_driver(Box::new(pluginoci::tag::Driver::new())))
         })
         .build()
         .expect("build workspace")
@@ -171,6 +173,48 @@ target(name = "push", driver = "oci.push", image = ":img",
         err.contains(&format!("push quay.io/acme/app:{hashout} ")),
         "the error must name the resolved reference: {err}"
     );
+    Ok(())
+}
+
+/// `oci.exists` and `oci.tag` hold their declared credentials to the same rule:
+/// an uncovered registry fails before any request, naming the registry. A tag
+/// that fell back to the host's login would move a tag as the developer.
+///
+/// `ref` comes from a `${read://…}` producer, so the error naming the resolved
+/// reference also proves the deferred value reached the driver.
+#[tokio::test]
+async fn exists_and_tag_whose_credentials_do_not_cover_the_registry_fail_before_the_network()
+-> anyhow::Result<()> {
+    let _guard = EnvVar::set("HEPH_E2E_OCI_TAG_TOKEN", "oci-tag-material");
+    let ws = workspace();
+    ws.write_build_file(
+        "auth",
+        r#"target(name = "ghcr", driver = "auth.credential",
+       sources = [heph.auth.env(["HEPH_E2E_OCI_TAG_TOKEN"])],
+       present = heph.auth.docker(["ghcr.io"]))"#,
+    );
+    ws.write_build_file(
+        "img",
+        r#"
+target(name = "built", driver = "bash", run = "echo quay.io/acme/app:build-1 > $OUT",
+       out = "built.ref")
+target(name = "exists", driver = "oci.exists", ref = "${read://img:built}",
+       credentials = ["//auth:ghcr"])
+target(name = "tag", driver = "oci.tag", ref = "${read://img:built}", tags = ["1.2"],
+       credentials = ["//auth:ghcr"])
+"#,
+    );
+    for addr in ["//img:exists", "//img:tag"] {
+        let err = match ws.run(addr).await {
+            Ok(_) => panic!("{addr}: an uncovered registry must fail"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            err.contains("no declared credential covers"),
+            "{addr}: {err}"
+        );
+        assert!(err.contains("quay.io/acme/app:build-1"), "{addr}: {err}");
+    }
     Ok(())
 }
 

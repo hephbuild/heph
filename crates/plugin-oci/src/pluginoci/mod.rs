@@ -9,6 +9,8 @@
 //!   [`docker_build`] can fold it into the cache key. Exists only for that.
 //! - [`pull`] / [`push`] — speak the OCI distribution protocol in-process (see
 //!   [`registry`]). No docker, on any host.
+//! - [`exists`] / [`tag`] — the same protocol, on an image already in a
+//!   registry: check that a reference resolves, or point more tags at it.
 //! - [`load`] — hands an image to a local docker daemon, which is the whole
 //!   point of it, so it talks to one by definition (through the API, not the CLI).
 //!
@@ -25,6 +27,7 @@ pub mod archive;
 mod auth;
 pub mod docker_build;
 pub mod exec_runner;
+pub mod exists;
 mod gzip;
 pub mod image;
 pub mod index;
@@ -35,6 +38,66 @@ pub mod pull;
 pub mod push;
 pub mod registry;
 pub mod runner;
+pub mod tag;
+
+/// Refuse, at parse, a `${…}` in a registry reference that nothing would
+/// substitute, for a driver whose `ref` takes only `${read://…}`.
+///
+/// The host resolves a `${read://pkg:name}` before the driver runs; anything
+/// else would reach the registry as part of the reference, or fail at run with
+/// a reference-parse error naming neither the field nor what it accepts. A `$$`
+/// is refused as well: no image reference contains a `$`.
+pub(crate) fn check_ref_reads(driver: &str, raw: &str) -> anyhow::Result<()> {
+    use hcore::template::Piece;
+    for piece in hcore::template::parse(raw).context("parse `ref`")? {
+        let bad = match piece {
+            Piece::Text(_) => continue,
+            Piece::Escape => "$$",
+            Piece::Ref(r) => {
+                if hcore::template::claims(r.kind, r.arg, &[hcore::template::READ_KIND]) {
+                    continue;
+                }
+                r.raw
+            }
+        };
+        anyhow::bail!(
+            "`ref` holds `{bad}`, which is not something {driver} substitutes: use \
+             `${{read://pkg:name}}` for a target's output"
+        );
+    }
+    Ok(())
+}
+
+/// The output file holding the reference a registry driver resolved, in the
+/// package dir: `<name>.ref`.
+pub(crate) fn ref_out_name(target_name: &str) -> String {
+    format!("{target_name}.ref")
+}
+
+/// The one output of a registry driver: `<name>.ref` in the package dir (see
+/// [`ref_out_name`]), collected, not codegen.
+pub(crate) fn ref_output(addr: &hmodel::htaddr::Addr) -> hplugin::driver::targetdef::Output {
+    use hplugin::driver::targetdef::path::{CodegenMode, Content, Path as OutPath};
+    hplugin::driver::targetdef::Output {
+        group: String::new(),
+        paths: vec![OutPath {
+            content: Content::FilePath(ws_path(addr.package.as_str(), &ref_out_name(&addr.name))),
+            codegen_tree: CodegenMode::None,
+            collect: true,
+        }],
+    }
+}
+
+/// Write `value`, the reference a registry driver resolved, to its
+/// [`ref_output`] in the sandbox.
+pub(crate) async fn write_ref(req: &ManagedRunRequest<'_, '_>, value: &str) -> anyhow::Result<()> {
+    let out = req
+        .sandbox_pkg_dir
+        .join(ref_out_name(&req.request.target.addr.name));
+    tokio::fs::write(&out, value)
+        .await
+        .with_context(|| format!("write the reference to {out:?}"))
+}
 
 /// Archive format an image is built/consumed as: a `format` field's type, so
 /// its schema (`"oci" | "docker"`) and its parse are one table.
@@ -558,6 +621,11 @@ mod tests {
                 vec![("image", s(":img")), ("ref", s("reg.io/a:1"))],
             ),
             ("oci.load", vec![("image", s(":img")), ("tag", s("a:dev"))]),
+            ("oci.exists", vec![("ref", s("reg.io/a:1"))]),
+            (
+                "oci.tag",
+                vec![("ref", s("reg.io/a:1")), ("tags", list(&["latest"]))],
+            ),
             (
                 "oci.layer",
                 // Uncompressed: a gzipped layer advertises a whole CPU (see
@@ -598,6 +666,8 @@ mod tests {
                         "oci.pull" => pull::Driver::new().parse(req, &ct).await,
                         "oci.push" => push::Driver::new().parse(req, &ct).await,
                         "oci.load" => load::Driver::new().parse(req, &ct).await,
+                        "oci.exists" => exists::Driver::new().parse(req, &ct).await,
+                        "oci.tag" => tag::Driver::new().parse(req, &ct).await,
                         "oci.layer" => layer::Driver::new().parse(req, &ct).await,
                         "oci.index" => index::Driver::new().parse(req, &ct).await,
                         _ => image::Driver::new().parse(req, &ct).await,

@@ -83,6 +83,9 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
         // Actions — uncached, they mutate a registry or the local daemon.
         named_managed_driver(pluginoci::push::Driver::new())?,
         named_managed_driver(pluginoci::load::Driver::new())?,
+        named_managed_driver(pluginoci::tag::Driver::new())?,
+        // A check on a registry's current state, so uncached as well.
+        named_managed_driver(pluginoci::exists::Driver::new())?,
         // Asks buildx which platform it would build by default. Depended on,
         // never named by a user.
         named_managed_driver(pluginoci::platform::Driver::new())?,
