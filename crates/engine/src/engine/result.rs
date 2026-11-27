@@ -2125,9 +2125,14 @@ async fn pull_one_remote_blob(
 /// The full freshly-produced artifact set of an executing [`LockedResolution`]
 /// cell (every output group), shared across all `(outputs, is_top)` callers and
 /// filtered per caller by [`build_eresult`].
-struct ExecutedArtifacts {
+#[derive(Clone)]
+pub(crate) struct ExecutedArtifacts {
     cached: Vec<ResultArtifact>,
     meta: Vec<ArtifactMeta>,
+    /// The run wrote some of its output to the user's terminal (D6.1). A
+    /// failure after the memoized execute, the codegen write-back, records it
+    /// from here, as the cache store records it inside. Reaches no hash (E9).
+    streamed: bool,
 }
 
 /// Whether a transparent target's inputs name exactly one distinct member addr.
@@ -3608,10 +3613,14 @@ impl Engine {
             (Some(slot), None) if !outputs.is_empty() => Some(slot.hold(&self, &rs).await?),
             _ => None,
         };
-        let (cached, meta): (Vec<ResultArtifact>, Vec<ArtifactMeta>) = match &locked.executed {
+        // `streamed`: whether the run this caller's artifacts came from wrote to
+        // the terminal. False on a hit, which ran nothing.
+        let (cached, meta, streamed): (Vec<ResultArtifact>, Vec<ArtifactMeta>, bool) = match &locked
+            .executed
+        {
             // This cell produced the artifacts; filter the full set to `outputs`.
             // Already `ResultArtifact`s (cache-backed or passthrough).
-            Some(ex) => (ex.cached.clone(), ex.meta.clone()),
+            Some(ex) => (ex.cached.clone(), ex.meta.clone(), ex.streamed),
             // Pre-existing hit: read only this caller's outputs under the shared
             // riding read. Silent — the shared cell already emitted the addr's
             // hit/miss event; re-emitting per caller would double-count. Reuse the
@@ -3687,6 +3696,7 @@ impl Engine {
                             .map(ResultArtifact::from_cache)
                             .collect(),
                         meta,
+                        false,
                     ),
                     // The entry was confirmed but its bytes are unavailable: a
                     // remote object expired before the read, a transfer failed, or
@@ -3765,7 +3775,11 @@ impl Engine {
                                 was,
                             });
                         }
-                        let (cached, meta) = self
+                        let ExecutedArtifacts {
+                            cached,
+                            meta,
+                            streamed,
+                        } = self
                             .clone()
                             .execute_and_cache_inner(rs.clone(), opts)
                             .await?;
@@ -3787,7 +3801,7 @@ impl Engine {
                                 &cached,
                             )?;
                         }
-                        (cached, meta)
+                        (cached, meta, streamed)
                     }
                 }
             }
@@ -3800,8 +3814,21 @@ impl Engine {
         // did not ask for, so it does not depend on which frame gets here first.
         // Carries the write-back guard and the fixpoint registration, which belong
         // with the write.
+        //
+        // It runs outside the memoized execute, so a write-back that fails
+        // after a run that streamed records that here, on an empty slot, as
+        // the cache store does inside it (D6.1c).
         self.materialize_codegen(&rs, opts, &locked, &cached)
-            .await?;
+            .await
+            .map_err(|e| {
+                if streamed {
+                    e.context(
+                        crate::engine::failure_slot::FailureSlot::default().with_streamed(true),
+                    )
+                } else {
+                    e
+                }
+            })?;
 
         // Inside `inner_result_addr`'s scope, so it lands right before this
         // target's `ResultEnd`. Every group the run produced, whichever this
@@ -4197,11 +4224,11 @@ impl Engine {
                     .await?,
                 )
             };
-            let (cached, meta) = self
-                .clone()
-                .execute_and_cache_inner(rs.clone(), opts)
-                .await?;
-            let executed = Arc::new(ExecutedArtifacts { cached, meta });
+            let executed = Arc::new(
+                self.clone()
+                    .execute_and_cache_inner(rs.clone(), opts)
+                    .await?,
+            );
             let (guard, handed) = match write {
                 Some(write) if durable => {
                     // Same gap-free hand-off as the miss path below.
@@ -4474,19 +4501,14 @@ impl Engine {
                                     .map(|(path, _)| crate::engine::host_paths::stale_reason(path)),
                                 stale_host_path: stale.as_ref().map(|(path, _)| path.clone()),
                             });
-                            let (cached, meta) = self
+                            let executed = self
                                 .clone()
                                 .execute_and_cache_inner(rs.clone(), opts)
                                 .await?;
                             if let Some((path, old)) = &stale {
-                                report_stale_rebuild(&rs, addr_s, path, old, &meta);
+                                report_stale_rebuild(&rs, addr_s, path, old, &executed.meta);
                             }
-                            (
-                                Some(Arc::new(ExecutedArtifacts { cached, meta })),
-                                None,
-                                known_remote(None),
-                                None,
-                            )
+                            (Some(Arc::new(executed)), None, known_remote(None), None)
                         }
                     }
                 }
@@ -5329,7 +5351,7 @@ impl Engine {
         self: Arc<Self>,
         rs: Arc<RequestState>,
         opts: &ExecuteOptions<'_>,
-    ) -> anyhow::Result<(Vec<ResultArtifact>, Vec<ArtifactMeta>)> {
+    ) -> anyhow::Result<ExecutedArtifacts> {
         let addr = opts.def.target.addr.clone();
         let hashin = opts.hashin.clone();
         let spec = Arc::clone(opts.spec);
@@ -5504,7 +5526,11 @@ impl Engine {
                             let mut produced = passthrough;
                             produced
                                 .extend(cached.into_iter().map(ResultArtifact::from_cache));
-                            (produced, artifacts_meta)
+                            ExecutedArtifacts {
+                                cached: produced,
+                                meta: artifacts_meta,
+                                streamed,
+                            }
                         })
                         .with_context(|| format!("cache_locally {addr}"))
                         // A store that failed after a run that streamed: the
@@ -16418,6 +16444,9 @@ mod tests {
     /// Label the driver stamps on a leaf whose `run` must fail; `TargetSpec`
     /// config is not visible from `run`, so the marker rides on the `TargetDef`.
     const FAIL_LABEL: &str = "terminal-test:fail";
+    /// Label on a leaf whose `run` succeeds with two artifacts of one name, so
+    /// the cache store refuses them: a failure after a run that went fine.
+    const DUP_LABEL: &str = "terminal-test:dup";
 
     #[async_trait]
     impl RawDriver for TerminalDriver {
@@ -16463,10 +16492,17 @@ mod tests {
                     runtime: true,
                 })
                 .collect();
-            let fails = matches!(
-                req.target_spec.config.get("fail"),
-                Some(hcore::htvalue::Value::Bool(true))
-            );
+            let flag = |key: &str| {
+                matches!(
+                    req.target_spec.config.get(key),
+                    Some(hcore::htvalue::Value::Bool(true))
+                )
+            };
+            let labels = [(flag("fail"), FAIL_LABEL), (flag("dup"), DUP_LABEL)]
+                .into_iter()
+                .filter(|&(on, _)| on)
+                .map(|(_, label)| label.to_string())
+                .collect();
             // `entrypoint = true`: invoked through `Engine::invoke`, not built.
             let entrypoint = matches!(
                 req.target_spec.config.get("entrypoint"),
@@ -16481,11 +16517,7 @@ mod tests {
             Ok(ParseResponse {
                 target_def: TargetDef {
                     addr: req.target_spec.addr.clone(),
-                    labels: if fails {
-                        vec![FAIL_LABEL.to_string()]
-                    } else {
-                        vec![]
-                    },
+                    labels,
                     inputs,
                     outputs: if transparent {
                         vec![]
@@ -16533,18 +16565,24 @@ mod tests {
                 )
                 .context("driver run"));
             }
+            let out = outputartifact::OutputArtifact {
+                group: "main".to_string(),
+                name: "out".to_string(),
+                r#type: outputartifact::Type::Output,
+                content: outputartifact::Content::Raw(outputartifact::ContentRaw {
+                    data: b"hi".to_vec(),
+                    path: "out".to_string(),
+                    x: false,
+                }),
+                hashout: "feedface".to_string(),
+            };
+            let artifacts = if req.target.labels.iter().any(|l| l == DUP_LABEL) {
+                vec![out.clone(), out]
+            } else {
+                vec![out]
+            };
             Ok(RunResponse {
-                artifacts: vec![outputartifact::OutputArtifact {
-                    group: "main".to_string(),
-                    name: "out".to_string(),
-                    r#type: outputartifact::Type::Output,
-                    content: outputartifact::Content::Raw(outputartifact::ContentRaw {
-                        data: b"hi".to_vec(),
-                        path: "out".to_string(),
-                        x: false,
-                    }),
-                    hashout: "feedface".to_string(),
-                }],
+                artifacts,
                 ..Default::default()
             })
         }
@@ -17848,6 +17886,53 @@ mod tests {
             .as_ref()
             .expect("a target that never streamed keeps its process log tail");
         assert!(tail.text.contains("line12"), "tail: {}", tail.text);
+        Ok(())
+    }
+
+    /// A terminal wrapper that runs the target and reports `streamed` as
+    /// given, as the CLI's tap does from the bytes it wrote.
+    fn streaming_wrapper(streamed: bool) -> InteractiveWrapper {
+        SArc::new(move |inner: InteractiveInner| {
+            Box::pin(async move {
+                inner(None, None, None, None).await?;
+                Ok(TerminalUse { streamed })
+            })
+        })
+    }
+
+    /// A run that streamed and went fine, then a cache store that failed
+    /// (D6.1c, "a later step failed"): the failure records that the log
+    /// streamed, so the box points at the log instead of repeating it. The
+    /// same run that did not stream records that it did not.
+    #[tokio::test]
+    async fn cache_store_failure_after_a_streamed_run_records_streamed() -> anyhow::Result<()> {
+        for streamed in [true, false] {
+            let mut spec = leaf_spec("//pkg:t", false)?;
+            spec.config
+                .insert("dup".to_string(), hcore::htvalue::Value::Bool(true));
+            let h = terminal_harness(vec![spec])?;
+            let rs = h.engine.new_state();
+            let addr = hmodel::htaddr::parse_addr("//pkg:t")?;
+            let opts = ResultOptions {
+                interactive: Some(streaming_wrapper(streamed)),
+                ..Default::default()
+            };
+
+            let err = Arc::clone(&h.engine)
+                .result_addr(rs.clone(), &addr, OutputMatcher::All, &opts)
+                .await
+                .err()
+                .expect("the cache store refuses two artifacts of one name");
+
+            assert_eq!(h.runs.load(Ordering::SeqCst), 1, "the run itself went fine");
+            let recorded = rs.get_failure(&addr).expect("failure must be recorded");
+            let msg = format!("{:#}", recorded.source);
+            assert!(
+                msg.contains("cache_locally") && msg.contains("duplicate cache entry name"),
+                "a cache-store failure: {msg} ({err:#})",
+            );
+            assert_eq!(recorded.streamed, streamed, "{msg}");
+        }
         Ok(())
     }
 

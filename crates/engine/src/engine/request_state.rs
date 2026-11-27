@@ -5,7 +5,7 @@ use crate::engine::meta::ResultMeta;
 use crate::engine::provider::{State, TargetSpec};
 use crate::engine::resource_pool::sampler::PoolSampler;
 use crate::engine::result::{
-    ArtifactMeta, ExtendedTargetDef, LockedResolution, OutputMatcher, ResultArtifact,
+    ExecutedArtifacts, ExtendedTargetDef, LockedResolution, OutputMatcher,
 };
 use crate::engine::spec::EngineTargetSpec;
 use hcore::hasync::StdCancellationToken;
@@ -21,7 +21,7 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 type ArcErr = Arc<anyhow::Error>;
-type ExecuteCacheResult = Result<(Vec<ResultArtifact>, Vec<ArtifactMeta>), ArcErr>;
+type ExecuteCacheResult = Result<ExecutedArtifacts, ArcErr>;
 type ProbeStatesResult = Result<Arc<Vec<State>>, ArcErr>;
 
 /// The pools a `RequestConfig` announces: each one's capacity (`None`:
@@ -373,7 +373,7 @@ pub struct RequestStateData {
         (AddrKey, OutputMatcher, bool),
         Result<Arc<crate::engine::result::MemoResult>, ArcErr>,
     >,
-    pub mem_execute_cache: Memoizer<(AddrKey, String), ExecuteCacheResult>,
+    pub(crate) mem_execute_cache: Memoizer<(AddrKey, String), ExecuteCacheResult>,
     /// Single-flights the per-addr result-LOCK + cache-fetch/execute, keyed by
     /// `Addr` ALONE (not `is_top`/`outputs`). The `(outputs, is_top)`
     /// `mem_result` cells all await this, share its one riding read guard (held
