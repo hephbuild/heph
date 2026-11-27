@@ -66,10 +66,8 @@ fn end_written_on_every_exit() {
     let status = run.wait();
     let end = last_end(&run.dir)
         .unwrap_or_else(|| panic!("Ctrl-C: no End last ({status})\n{}", run.stderr()));
-    assert_ne!(status.code(), Some(0), "{}", run.stderr());
-    if let Some(code) = status.code() {
-        assert_eq!(end["exit_code"], code, "{end}");
-    }
+    assert_eq!(status.code(), Some(130), "{}", run.stderr());
+    assert_eq!(end["exit_code"], 130, "{end}");
     assert!(lock_free(&run.dir), "Ctrl-C: lock still held");
     let entry = list_entry(&ws, &dist, &run.id);
     assert_eq!(entry["state"], "failed", "{entry}");

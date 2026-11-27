@@ -1501,6 +1501,7 @@ async fn execute_async(
     let (shell, m) = selection(&args, &base_pkg)?;
     let shell = shell_for_selection(shell, &m);
     let (engine, shutdown) = bootstrap::new_engine(&global, session)?;
+    bootstrap::cancel_on_term_and_hup(&shutdown);
     let raw = args.raw;
     let json = args.out.enabled();
     let dashboard = args.dashboard.dashboard;

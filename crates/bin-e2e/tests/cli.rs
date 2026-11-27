@@ -7,6 +7,7 @@
 
 mod common;
 
+use common::session::{Bg, SHORT, recorded};
 use common::{Dist, Workspace, describe};
 
 /// The published artifact must launch on a stock host. This is the canary for
@@ -155,4 +156,68 @@ fn piped_output_stays_plain() {
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// `slow` runs until it is stopped; `bad` fails at once.
+const CANCEL_BUILD: &str = r#"
+target(name = "slow", driver = "bash", run = "sleep 60", cache = False)
+target(name = "bad", driver = "bash", run = "exit 3", cache = False)
+"#;
+
+/// `heph run <args>` with no terminal (the line backend), stopped by `sig`
+/// once `//pkg:slow` runs and, first, once each of `after` has ended: the
+/// exit code and stderr.
+fn stopped_run(args: &[&str], after: &[&str], sig: i32) -> (Option<i32>, String) {
+    let dist = Dist::locate();
+    let ws = Workspace::new().expect("workspace");
+    ws.write("pkg/BUILD", CANCEL_BUILD).expect("write BUILD");
+    let mut run = Bg::spawn(&ws, &dist, &[&["run"], args].concat());
+    run.wait_executing("//pkg:slow");
+    for addr in after {
+        common::wait_until(&format!("{addr} to end"), SHORT, || {
+            recorded(&run.dir, "ResultEnd", addr)
+        });
+    }
+    common::signal(run.pid(), sig);
+    let status = run.wait();
+    (status.code(), run.stderr())
+}
+
+/// A Ctrl-C (SIGINT) with no terminal is a cancel, and a cancel exits 130
+/// (error-reporting I6, RUN-22), not 1.
+#[test]
+fn cancel_exits_130_non_tui() {
+    let (code, stderr) = stopped_run(&["//pkg:slow"], &[], libc::SIGINT);
+    assert_eq!(code, Some(130), "{stderr}");
+}
+
+/// A target failed, then the user stopped the rest: the stop decides the exit
+/// code (I6), while the failure's box is still printed.
+#[test]
+fn failure_then_ctrl_c_exits_130() {
+    let (code, stderr) = stopped_run(
+        &["-e", "//pkg:slow || //pkg:bad"],
+        &["//pkg:bad"],
+        libc::SIGINT,
+    );
+    assert_eq!(code, Some(130), "{stderr}");
+    assert!(
+        stderr.contains("//pkg:bad"),
+        "the failure is reported\n{stderr}"
+    );
+}
+
+/// SIGTERM is a cancel, as Ctrl-C is: heph stops the build and exits 130,
+/// rather than dying of the signal.
+#[test]
+fn sigterm_exits_130() {
+    let (code, stderr) = stopped_run(&["//pkg:slow"], &[], libc::SIGTERM);
+    assert_eq!(code, Some(130), "{stderr}");
+}
+
+/// SIGHUP (the terminal went away) is a cancel too: exit 130.
+#[test]
+fn sighup_exits_130() {
+    let (code, stderr) = stopped_run(&["//pkg:slow"], &[], libc::SIGHUP);
+    assert_eq!(code, Some(130), "{stderr}");
 }

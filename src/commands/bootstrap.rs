@@ -593,6 +593,55 @@ fn spawn_sigint_producer(trigger: ShutdownTrigger) {
     });
 }
 
+/// Make SIGTERM and SIGHUP a cancel, as Ctrl-C is (error-reporting I6): each
+/// goes through `trigger`, so it cancels the in-flight work, a second one
+/// hard-aborts, and the command exits 130.
+///
+/// Only a command that a cancel ends calls this: `heph run` and the commands
+/// built on `progress_app`. A long-lived command (`tool build-lsp`, `log -f`)
+/// keeps dying of TERM and HUP, since a cancel would not end it.
+///
+/// Armed for the rest of the process: a tokio handler is never uninstalled.
+/// While an entrypoint's tool holds the terminal, the trigger drops what these
+/// send and the relay forwards the signal to the tool instead
+/// ([`SignalRelay`]).
+pub fn cancel_on_term_and_hup(trigger: &ShutdownTrigger) {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    for (kind, name) in [
+        (SignalKind::terminate(), "SIGTERM"),
+        (SignalKind::hangup(), "SIGHUP"),
+    ] {
+        let mut listener = match signal(kind) {
+            Ok(listener) => listener,
+            Err(e) => {
+                tracing::warn!(error = %e, signal = name, "listening for the signal; it will kill heph instead of cancelling");
+                continue;
+            }
+        };
+        let trigger = trigger.clone();
+        tokio::spawn(async move {
+            while listener.recv().await.is_some() {
+                trigger.trigger();
+            }
+        });
+    }
+}
+
+/// Set by the first stop that reached the shutdown handler while heph was the
+/// run's owner (not after an entrypoint's tool exited): the user cancelled.
+static CANCEL_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the user cancelled this process's command: a Ctrl-C key, or a
+/// SIGINT, SIGTERM or SIGHUP, that got through to the shutdown handler. A
+/// stop after an entrypoint's tool exited does not count (R27), nor does a
+/// fail-fast cancellation, which never goes through the trigger. `main` reads
+/// it for the exit code: a cancelled command exits 130, even when a failure
+/// came first.
+pub fn cancel_requested() -> bool {
+    CANCEL_REQUESTED.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Single consumer for the shutdown trigger. First press broadcasts
 /// cancellation to every in-flight request, letting drivers kill+reap their
 /// children and the TUI restore the terminal before unwinding naturally.
@@ -623,6 +672,7 @@ fn spawn_shutdown_handler(engine: Weak<engine::Engine>, mut rx: mpsc::UnboundedR
                 continue;
             }
             presses += 1;
+            CANCEL_REQUESTED.store(true, std::sync::atomic::Ordering::Release);
             if presses == 1 {
                 tracing::warn!(
                     "ctrl-c received, cancelling in-flight work (press ctrl-c again to abort)"
@@ -649,7 +699,7 @@ fn spawn_shutdown_handler(engine: Weak<engine::Engine>, mut rx: mpsc::UnboundedR
 /// invocation, so the request can carry its receiver; the listeners are
 /// installed only by [`SignalRelay::install`], which the run's handover calls
 /// right before the tool is spawned (N4a: the relay runs from the spawn).
-/// Before that heph is an ordinary run: TERM and HUP end it, Ctrl-C cancels,
+/// Before that heph is an ordinary run: Ctrl-C, TERM and HUP cancel it,
 /// SIGQUIT dumps diagnostics and SIGUSR2 a profile — and nothing is queued
 /// for a tool that does not exist yet, so a QUIT sent to inspect a slow dep
 /// build cannot kill the tool later.

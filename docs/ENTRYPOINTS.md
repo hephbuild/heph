@@ -279,7 +279,7 @@ tool. A second Ctrl-C is not special.
 ### Before the tool starts
 
 Before the tool starts — dependencies building, the closure being laid out —
-heph is an ordinary run: Ctrl-C cancels it, TERM and HUP end it, SIGQUIT
+heph is an ordinary run: Ctrl-C, TERM and HUP cancel it (exit 130), SIGQUIT
 writes its diagnostic dump, as for any command. Nothing sent then is held for
 the tool. While the TUI has stepped aside, laying out a large closure prints
 nothing; it is still heph's, and Ctrl-C still cancels it.

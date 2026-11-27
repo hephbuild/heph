@@ -1037,6 +1037,27 @@ fn ctrl_c_twice_on_full_screens() {
     );
 }
 
+/// A Ctrl-C key that stops a TUI run exits 130, as a cancel does with no
+/// terminal (error-reporting I6, RUN-22), and the terminal is restored.
+#[test]
+fn cancel_exits_130_tui() {
+    let mut g = Gated::start("", &[]);
+    g.play(&[
+        Step::Until("the line", on_line),
+        Step::Keys(CTRL_C),
+        Step::Settle,
+        Step::Settle,
+        Step::OpenGate,
+    ]);
+    let ended = g.exit();
+    assert_restored(&g.pty, "ctrl-c");
+    assert!(
+        matches!(ended, common::pty::Ended::Code(130)),
+        "a cancel: {ended:?}\n{}",
+        g.pty.seen()
+    );
+}
+
 /// `--dashboard`: the alternate screen is up on the first frame, and the
 /// finished build holds until q — on the dashboard, and on the line Esc
 /// steps back to (mid-run or after the end) — then exits with the build's

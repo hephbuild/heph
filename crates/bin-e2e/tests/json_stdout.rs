@@ -221,9 +221,10 @@ fn stdout_is_only_json() {
 }
 
 /// Ctrl-C under `heph run --json`: the entries written so far stay on stdout,
-/// the list gets no `]` (D10), and the exit is the one without `--json`.
+/// the list gets no `]` (D10, error-reporting E7), and the exit is the one
+/// without `--json`: a cancel's 130 (I6).
 #[test]
-fn run_json_sigint() {
+fn cancel_json_run_exits_130_unterminated() {
     let dist = Dist::locate();
     let ws = Workspace::new().expect("workspace");
     // `slow` waits for `fast`, so `fast`'s entry is written before the signal.
@@ -289,10 +290,9 @@ target(name = "slow", driver = "bash", run = "sleep 60; echo s > $OUT", out = "s
     drop(child);
     let stderr = std::fs::read_to_string(&err_path).unwrap_or_default();
     let stdout = String::from_utf8(seen.lock().expect("stdout buffer").clone()).expect("utf-8");
-    // The exit a cancelled build run has without `--json`: `finish_exit`'s
-    // "cancelled", 1 (only an entrypoint's run maps Ctrl-C to 130).
+    // The exit a cancelled build run has without `--json`: 130.
     assert_eq!(
-        code, 1,
+        code, 130,
         "exit\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
     );
     assert!(stderr.contains("cancelled"), "{stderr}");

@@ -57,8 +57,8 @@ rejects it instead of reading a short list as whole, with or without
 - a keep-going walk that left packages it could not evaluate (`query`,
   `inspect labels`, `auth status`, …), the same gaps the text output reports;
 - a `run` that `--fail-fast` stopped before every matched target ended;
-- Ctrl-C (the command's own exit code; 130 only for a `--jq` filter it
-  stopped).
+- Ctrl-C, SIGTERM or SIGHUP (a cancel: a cancelled `run` exits 130, as a
+  `--jq` filter it stopped does).
 
 The exit code is non-zero and stderr says why. Piped, the elements printed
 before it are one per line, so a consumer that wants what there was can still
@@ -156,7 +156,7 @@ the document, inside heph: no `jq` needs to be installed.
 | 130 | Ctrl-C stopped a running `--jq` filter, one that never produces included |
 
 Ctrl-C anywhere else is the command's own cancellation, and keeps the exit
-code the command has without the flags (`run` exits 1); a list it was
+code the command has without the flags (`run` exits 130); a list it was
 printing is left without its `]`.
 
 A `--jq` runtime error is 2 even on the codegen commands, where 1 means
@@ -252,7 +252,8 @@ stderr: failure boxes, the skipped-package report. The list is closed only
 when it is whole: every matched target has its entry, the selector walk
 skipped no package, and the run was not cancelled. A failed target does not
 leave it open; `--fail-fast` stopping the walk, a skipped package and Ctrl-C
-do (a cancelled build run exits 1, with or without `--json`). A selector that
+do. A cancelled build run (Ctrl-C, SIGTERM or SIGHUP) exits 130, with or
+without `--json`, and so does one that a failure had already failed. A selector that
 matches nothing prints `[]` and fails as it does without `--json`.
 
 When the list cannot be printed whole for a reason of its own:

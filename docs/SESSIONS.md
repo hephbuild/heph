@@ -376,7 +376,7 @@ included. The recorder is its own OS thread behind an unbounded channel:
   replay reads.
 
 What a run loses: a process wedged before its first flush loses at most 250ms
-of events; a second Ctrl-C, `SIGTERM`/`SIGHUP` or `SIGKILL` loses what came
+of events; a second Ctrl-C, `SIGTERM` or `SIGHUP` (the first is a cancel), or a `SIGKILL`, loses what came
 after the last flush and writes no `End` (`lost`).
 
 ### The run's own lock-wait notice
