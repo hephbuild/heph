@@ -116,6 +116,9 @@ pub fn write<W: Write + Seek>(
             zst.finish().context("finish the zstd stream")
         }
         Format::Zip => write_zip(out, &members, cancelled),
+        Format::TarXz | Format::Gz => {
+            anyhow::bail!("{} is read only: nothing writes it", format.as_str())
+        }
     }
 }
 
@@ -357,7 +360,7 @@ fn stop_check(cancelled: &dyn Fn() -> bool) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Limits, unpack};
+    use crate::{UnpackOptions, unpack};
     use std::io::Cursor;
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -443,7 +446,7 @@ mod tests {
         let first = tree(one.path(), false);
         let second = tree(two.path(), true);
         touch_all(&second);
-        for format in Format::ALL {
+        for format in Format::WRITABLE {
             assert_eq!(
                 bytes(format, first.clone(), 0),
                 bytes(format, second.clone(), 0),
@@ -509,12 +512,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let members = tree(dir.path(), false);
         let long = format!("deep/{}.txt", "y".repeat(110));
-        for format in Format::ALL {
+        for format in Format::WRITABLE {
             let out = tempfile::tempdir().unwrap();
             let archive = out.path().join("a");
             std::fs::write(&archive, bytes(format, members.clone(), 0)).unwrap();
             let dest = out.path().join("x");
-            let n = unpack(&archive, format, 0, Limits::default(), &dest, &never)
+            let n = unpack(&archive, format, UnpackOptions::default(), &dest, &never)
                 .unwrap_or_else(|e| panic!("{}: {e:#}", format.as_str()));
             assert!(n >= 4, "{}: {n} entries", format.as_str());
             let read = |rel: &str| std::fs::read_to_string(dest.join(rel)).unwrap();
@@ -568,7 +571,7 @@ mod tests {
                 name: PathBuf::from("x"),
                 source: dir.path().join(source),
             }];
-            for format in Format::ALL {
+            for format in Format::WRITABLE {
                 let e = write(
                     Cursor::new(Vec::new()),
                     format,
@@ -583,6 +586,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_read_only_format_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let members = tree(dir.path(), false);
+        for format in Format::ALL.into_iter().filter(|f| !f.is_writable()) {
+            let r = write(
+                Cursor::new(Vec::new()),
+                format,
+                members.clone(),
+                WriteOptions::default(),
+                &never,
+            );
+            let msg = format!("{:#}", r.expect_err(format.as_str()));
+            assert!(msg.contains("read only"), "{msg}");
+        }
+    }
+
     /// The bytes themselves, pinned per format over a fixed tree at a fixed
     /// mtime. A change here changes every archive `archive.create` makes from
     /// the same files: bump `CREATE_FORMAT_VERSION` in `crates/plugin-archive`
@@ -593,7 +613,7 @@ mod tests {
     fn the_bytes_are_pinned_per_format() {
         let dir = tempfile::tempdir().unwrap();
         let members = tree(dir.path(), false);
-        let got: Vec<(&str, String)> = Format::ALL
+        let got: Vec<(&str, String)> = Format::WRITABLE
             .into_iter()
             .map(|format| {
                 let b = bytes(format, members.clone(), 1_700_000_000);
@@ -632,7 +652,7 @@ mod tests {
             b"nul\0byte",
         ];
         for name in names {
-            for format in Format::ALL {
+            for format in Format::WRITABLE {
                 let members = vec![Member {
                     name: PathBuf::from(std::ffi::OsStr::from_bytes(name)),
                     source: src.clone(),
@@ -659,7 +679,7 @@ mod tests {
                 name: PathBuf::from(ok),
                 source: src.clone(),
             }];
-            for format in Format::ALL {
+            for format in Format::WRITABLE {
                 let r = write(
                     Cursor::new(Vec::new()),
                     format,
@@ -779,7 +799,7 @@ mod tests {
                 source: dir.path().join("missing"),
             },
         ];
-        for format in Format::ALL {
+        for format in Format::WRITABLE {
             let polls = std::cell::Cell::new(0u32);
             let cancelled = || {
                 polls.set(polls.get() + 1);
@@ -814,7 +834,7 @@ mod tests {
     fn a_cancelled_write_stops() {
         let dir = tempfile::tempdir().unwrap();
         let members = tree(dir.path(), false);
-        for format in Format::ALL {
+        for format in Format::WRITABLE {
             let e = write(
                 Cursor::new(Vec::new()),
                 format,

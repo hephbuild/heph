@@ -11,7 +11,7 @@ default = ["codec"]
 # `unpack` and `write`, and the codecs they need. Off, the crate is `Format`
 # and `Limits` only: what a crate that just names a format (the `gh` plugin)
 # links.
-codec = ["dep:hcore", "dep:tar", "dep:flate2", "dep:zstd", "dep:zip"]
+codec = ["dep:hcore", "dep:tar", "dep:flate2", "dep:zstd", "dep:zip", "dep:lzma-rust2"]
 
 [dependencies]
 anyhow = "1.0.104"
@@ -27,8 +27,17 @@ tar = { version = "0.4", optional = true }
 flate2 = { version = "1.1.11", optional = true }
 zstd = { version = "0.14", optional = true }
 zip = { version = "9.8", default-features = false, features = ["deflate-flate2"], optional = true }
+# `.tar.xz`, decode only: pure Rust (no liblzma to build), the same on every
+# platform. The `xz` reader verifies each block's CRC32/CRC64/SHA-256 check,
+# the index and the footer once the stream is read to its end, which `unpack`
+# does. No `optimization`: it adds per-arch inline asm and unsafe code run on
+# hostile input, and measured no faster here; without it the crate is
+# `forbid(unsafe_code)`.
+lzma-rust2 = { version = "0.26", default-features = false, features = ["std", "xz"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"
 # The golden byte pins in `write`'s tests.
 xxhash-rust = { version = "0.8.21", features = ["xxh3"] }
+# `.tar.xz` fixtures for the unpacker's tests.
+lzma-rust2 = { version = "0.26", default-features = false, features = ["std", "xz", "encoder"] }

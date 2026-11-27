@@ -7,11 +7,14 @@ The builtin `archive` plugin has two drivers, both in-process (no host
   into a directory.
 - **`archive.create`** packs the outputs of `deps` into one archive file.
 
-The formats are `tar`, `tar.gz` (`.tgz`), `tar.zst` (`.tzst`) and `zip`. The
-code is `crates/plugin-archive` (the drivers) over `crates/archive` (the
-unpacker and the writer). `heph.gh.release_asset(..., extract = True)`
-declares an `archive.extract` ([GH_RELEASES.md](GH_RELEASES.md)), and the `tar`
-coreutil writes through the same writer as `archive.create`
+The formats are `tar`, `tar.gz` (`.tgz`), `tar.zst` (`.tzst`) and `zip`.
+`archive.extract` also reads two that `archive.create` does not write:
+`tar.xz` (`.txz`), and `gz`, one gzipped file that is not a tar
+(`tool-linux.gz`; see [A bare `gz`](#a-bare-gz)). The code is
+`crates/plugin-archive` (the drivers) over `crates/archive` (the unpacker
+and the writer). `heph.gh.release_asset(..., extract = True)` declares an
+`archive.extract` ([GH_RELEASES.md](GH_RELEASES.md)), and the `tar` coreutil
+writes through the same writer as `archive.create`
 ([COREUTILS.md](COREUTILS.md)).
 
 `archive` is a **reserved plugin name**: the plugin is compiled into heph, and
@@ -71,8 +74,9 @@ none, fails the consumer, naming the tool and the files it found.
 | Option | Default | |
 |---|---|---|
 | `src` | required | The target whose **single** output file is the archive. A target with several files is refused with the count: which one is meant would depend on walk order. |
-| `format` | inferred | `tar`, `tar.gz`, `tar.zst` or `zip`. When omitted, it is taken from the archive file's name suffix, else from its leading bytes (gzip `1f 8b`, zstd `28 b5 2f fd`, zip `PK\3\4` or `PK\5\6`, tar `ustar` at offset 257); neither → an error asking for `format`. Given, it overrides both and is hashed. Omitted, the key holds the inference rules' version (`INFERENCE_VERSION` in `crates/plugin-archive/src/extract.rs`), so a change to those rules re-keys only the targets that infer. |
-| `strip_components` | `0` | Leading path components dropped from every entry, as `tar --strip-components`. |
+| `format` | inferred | `tar`, `tar.gz`, `tar.xz`, `tar.zst`, `zip` or `gz`. When omitted, it is taken from the archive file's name suffix (the longest one that matches: `x.tar.gz` is a `tar.gz`, `x.gz` a `gz`), else from its leading bytes (gzip `1f 8b`, xz `fd 37 7a 58 5a 00`, zstd `28 b5 2f fd`, zip `PK\3\4` or `PK\5\6`, tar `ustar` at offset 257; a gzip stream sniffs as a `tar.gz`); neither → an error asking for `format`. Given, it overrides both and is hashed. Omitted, the key holds the inference rules' version (`INFERENCE_VERSION` in `crates/plugin-archive/src/extract.rs`), so a change to those rules re-keys only the targets that infer. |
+| `strip_components` | `0` | Leading path components dropped from every entry, as `tar --strip-components`. Refused with a `gz`: at parse when `format = "gz"` is named, at run when it is inferred. |
+| `executable` | `False` | With a `gz` only: its one file is `0o755` rather than `0o644`. Refused at parse with any other named `format`, and at run when an inferred one turns out not to be a `gz`. Hashed when set. |
 | `out` | the target name | A **directory**, relative to the package, the archive unpacks into. |
 | `max_bytes` | 4 GiB | The most bytes the archive may unpack to. |
 | `max_entries` | 1,000,000 | The most entries the archive may hold. |
@@ -104,6 +108,54 @@ with a unit test in `crates/archive`, not a nicety:
   `strip_components` is skipped; an archive from which nothing remains is an
   error listing its first five entries.
 
+- An xz stream's decoder may use at most 256 MiB. The decoder adds about
+  100 KiB to the dictionary, so a dictionary of 256 MiB or more is refused
+  before it is allocated, and `xz -9`'s 64 MiB is accepted. The header names
+  the size, up to 4 GiB, so the cap is what stops an archive from exhausting
+  memory rather than disk. The cap is not hashed, like the bounds above.
+- What integrity check is verified depends on the format:
+  - A `tar.xz` is read to the end of the stream, past tar's end marker, so
+    every block's check (CRC32, CRC64 or SHA-256), the index and the footer
+    are verified. Concatenated streams are read, as `xz -d` reads them. What
+    the stream decodes to after the end marker counts against `max_bytes`:
+    at least 512 bytes of zeros, and up to 10 KiB with GNU tar's record
+    padding.
+  - A bare `gz` is read to its end, so each member's CRC32 and length are
+    verified.
+  - A `tar.gz` or `tar.zst` is read only to tar's end marker, as it always
+    has been: the gzip trailer or zstd checksum of the last member or frame
+    is not verified, and bytes after the marker are not read. Pin the
+    archive's own bytes with `sha256` where it is fetched.
+  - A `zip` entry's CRC32 is verified as the entry is read.
+
+### A bare `gz`
+
+A `gz` is one file, gzip-compressed, not a tar: some projects ship a binary
+that way (`rust-analyzer-x86_64-unknown-linux-gnu.gz`). It unpacks to one
+file in `out`, named after the archive file with a trailing `.gz` removed,
+as `gzip -d` names it (`a.gz.gz` is `a.gz`; the whole name when it has no
+`.gz` or is only `.gz`). A name that leaves `.` or `..` (`..gz`) is
+refused. The name the gzip header may record is ignored: it is the archive
+author's to choose. gzip records no mode, so the file is `0o644` unless
+`executable = True`. It is held to the rules above as a tar's one file
+entry would be, so the output is bounded; `strip_components` with a `gz`
+would leave nothing, so it is refused. Concatenated gzip members are one
+file, and an empty file gzipped is one empty file.
+
+It is stricter than `gzip -d` about what follows the last member: trailing
+garbage or trailing zeros are an error, where `gzip -d` warns or ignores
+them.
+
+With `format` omitted, a `.gz` name is a bare `gz` unless the stream
+inflates to a tar (tar's `ustar` magic at offset 257 of its first 262
+inflated bytes): then it is a `tar.gz`, as a `.gz`-named tarball was before
+`gz` existed. `heph.gh.release_asset` infers from the asset's name alone,
+so a `.gz` asset that is a tarball needs `format = "tar.gz"`.
+
+Changing the gz naming rule or its mode rule changes the trees extracted
+from the same archive, and bumps `EXTRACT_FORMAT_VERSION`
+(`crates/plugin-archive/src/extract.rs`).
+
 One difference between platforms is the filesystem's: two entries whose names
 differ only by case (or Unicode normalization) both extract on Linux, while on
 macOS's case-insensitive APFS they are one file, and the second entry fails
@@ -115,7 +167,7 @@ filesystem.
 | Option | Default | |
 |---|---|---|
 | `deps` | required | Targets whose outputs are packed, at least one. `\|group` and `[filters]` pick which of a target's files. |
-| `format` | from `out` | `tar`, `tar.gz`, `tar.zst` or `zip`. Inferred from `out`'s suffix when omitted; one of the two must name it. A `format` contradicting `out`'s suffix (`zip` with `x.tar.gz`) is refused. |
+| `format` | from `out` | `tar`, `tar.gz`, `tar.zst` or `zip`. Inferred from `out`'s suffix when omitted; one of the two must name it. A `format` contradicting `out`'s suffix (`zip` with `x.tar.gz`) is refused, and so is `tar.xz` or `gz` as `format`, or implied by `out` when `format` is omitted: they are read only. With `format` set, an `out` whose suffix names only a read-only format (`x.gz`, `x.txz`) names none, and takes `format`. |
 | `out` | `<name>.<format>` | A **file**, relative to the package: the archive. It never overwrites a file a dep staged at the same path; that is an error. |
 | `strip_prefix` | none | Leading directory removed from every entry, written workspace-relative (`pkg/out`). |
 | `prefix` | none | Leading directory prepended to every entry, after `strip_prefix`. |
@@ -223,3 +275,14 @@ engine, not here:
   bytes match no format; set `format`.
 - `must produce exactly one file` (extract): `src` names a target with
   several outputs; point it at one file, with `|group` if needed.
+- `the xz stream's dictionary needs more decoder memory than the 256 MiB
+  cap` (extract, `tar.xz`): the archive was compressed with a dictionary of
+  256 MiB or more; recompress it with a smaller one (`xz -9` uses 64 MiB).
+- `` `executable` applies only to a bare `gz` `` (extract): the archive's
+  entries carry their own modes; drop `executable`. When the message says
+  the format was inferred, and the archive is one gzipped file, set
+  `format = "gz"`.
+- `` `strip_components` with `format = "gz"` `` (extract, or with a `gz`
+  asset): a bare `gz` is one file; drop `strip_components`.
+- `archive.create cannot write a "tar.xz"` (or `"gz"`): pick a written
+  format, or rename `out`.

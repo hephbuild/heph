@@ -19,6 +19,8 @@ serde = { version = "1", features = ["derive"] }
 xxhash-rust = { version = "0.8.21", features = ["xxh3", "std"] }
 
 [dev-dependencies]
+# `.gz` fixtures for format inference.
+flate2 = "1.1.11"
 hmodel = { package = "model", path = "../model" }
 serde_json = "1"
 tempfile = "3"

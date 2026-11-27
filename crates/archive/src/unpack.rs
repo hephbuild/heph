@@ -36,9 +36,21 @@
 //! - **The output is bounded.** At most [`Limits::max_bytes`] bytes written
 //!   and [`Limits::max_entries`] entries, counted while copying, so a
 //!   decompression bomb fails instead of filling the disk.
+//! - **A decoder's memory is bounded.** An xz stream whose dictionary and
+//!   decoder overhead need more than [`XZ_MEM_LIMIT_KIB`] is refused before
+//!   it is allocated.
 //! - **A cancelled run stops mid-entry.** The decompressed stream and each
 //!   entry's bytes are read through [`StopRead`], which polls the token on
 //!   every read.
+//!
+//! What integrity check is verified depends on the format. A `tar.xz` and a
+//! bare `gz` are decoded to the end of the stream, so a corrupted payload
+//! fails on the xz block check, index and footer, or on the gzip CRC32 and
+//! length; bytes an xz stream decodes to after tar's end marker count against
+//! [`Limits::max_bytes`]. A `tar.gz` and a `tar.zst` stop at tar's end
+//! marker, as they always have: their gzip trailer or zstd checksum is not
+//! verified, and bytes after the marker are not read. A `zip` entry's CRC32
+//! is checked by the zip reader as the entry is read.
 //!
 //! `strip_components` drops that many leading components from every entry, as
 //! `tar --strip-components` does — a `.` counts, as in GNU tar and bsdtar, so
@@ -47,6 +59,9 @@
 //! A hard link's target is stripped too; a symlink's is not (it is relative to
 //! the link). An archive from which nothing remains is an error, not an empty
 //! output.
+//!
+//! A bare `gz` is one entry: a file named after the archive (see
+//! [`gz_file_name`]), held to the same rules as a tar's file entry.
 
 use crate::{DIR_MODE, Format, Limits, file_mode};
 use anyhow::{Context as _, bail};
@@ -63,6 +78,33 @@ const MAX_LINK_HOPS: usize = 40;
 /// up to 4095), so one archive unpacks the same on both.
 const MAX_LINK_TARGET: usize = 1023;
 
+/// The most memory an xz stream's decoder may use, in KiB: 256 MiB. An xz
+/// block header names its dictionary size, up to 4 GiB, and the decoder
+/// allocates it, so an archive could otherwise exhaust the host's memory
+/// before writing a byte. lzma-rust2 counts ~100 KiB of decoder overhead on
+/// top of the dictionary, so a dictionary of 256 MiB or more is refused, and
+/// `xz -9`'s 64 MiB is accepted.
+///
+/// Not keyed, like [`Limits`]: it decides only whether a run fails, and a
+/// failure is never cached, so changing it needs no `EXTRACT_FORMAT_VERSION`
+/// bump (`crates/plugin-archive/src/extract.rs`).
+const XZ_MEM_LIMIT_KIB: u32 = 256 << 10;
+
+/// How [`unpack`] lays the archive out, besides the archive and the
+/// destination.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UnpackOptions {
+    /// Leading path components dropped from every entry, as `tar
+    /// --strip-components` (see the module docs).
+    pub strip_components: u32,
+    /// The mode of a [`Format::Gz`]'s one file, which gzip does not record:
+    /// `0o755` when set, else `0o644`. Only a format that
+    /// [`Format::takes_executable`] accepts it; with any other it is refused.
+    pub executable: bool,
+    /// How much the archive may unpack to.
+    pub limits: Limits,
+}
+
 /// Unpack `archive` (in `format`) into `dest`, which must not exist yet.
 /// `cancelled` is polled between entries and on every read of the archive
 /// stream and of each entry's bytes. Returns the number of entries written
@@ -70,11 +112,27 @@ const MAX_LINK_TARGET: usize = 1023;
 pub fn unpack(
     archive: &Path,
     format: Format,
-    strip_components: u32,
-    limits: Limits,
+    opts: UnpackOptions,
     dest: &Path,
     cancelled: &dyn Fn() -> bool,
 ) -> anyhow::Result<usize> {
+    let UnpackOptions {
+        strip_components,
+        executable,
+        limits,
+    } = opts;
+    if executable && !format.takes_executable() {
+        bail!(
+            "`executable` applies only to a bare `gz`; a {} records each entry's mode",
+            format.as_str()
+        );
+    }
+    // Before `dest` exists, so a name it cannot take leaves nothing behind.
+    // Only a `gz` reads it.
+    let gz_name = match format {
+        Format::Gz => gz_file_name(archive)?,
+        _ => String::new(),
+    };
     if std::fs::symlink_metadata(dest).is_ok() {
         bail!("{} already exists", dest.display());
     }
@@ -88,11 +146,30 @@ pub fn unpack(
     match format {
         Format::Tar => unpack_tar(StopRead::new(&mut reader, cancelled), &mut tree)?,
         // Multi-member: a gzip stream may be several members back to back
-        // (`cat a.gz b.gz`, pigz), and `gzip -d` reads them all.
+        // (`cat a.gz b.gz`, pigz), and `gzip -d` reads them all. Read only
+        // to tar's end marker, so the last member's trailer is not verified.
         Format::TarGz => {
             let mut gz = flate2::read::MultiGzDecoder::new(reader);
             unpack_tar(StopRead::new(&mut gz, cancelled), &mut tree)?;
         }
+        // Multi-stream, as `xz -d` reads `cat a.xz b.xz`.
+        Format::TarXz => {
+            let mut xz = lzma_rust2::XzReader::new_mem_limit(reader, true, XZ_MEM_LIMIT_KIB);
+            unpack_tar(StopRead::new(&mut xz, cancelled), &mut tree)
+                .and_then(|()| drain(&mut xz, &tree))
+                .map_err(xz_context)?;
+        }
+        Format::Gz => {
+            // Read to its end by the copy: each member's CRC32 and length are
+            // verified, and anything after the last member is an error.
+            let mut gz = flate2::read::MultiGzDecoder::new(reader);
+            tree.entry()?;
+            let mode = if executable { 0o755 } else { 0o644 };
+            // `Tree::file` reads through `StopRead` itself.
+            tree.file(&gz_name, &mut gz, mode)
+                .with_context(|| format!("gz file {gz_name:?}"))?;
+        }
+        // Read only to tar's end marker: the frame checksum is not verified.
         Format::TarZst => {
             let mut zst =
                 zstd::stream::read::Decoder::with_buffer(reader).context("open zstd stream")?;
@@ -101,6 +178,95 @@ pub fn unpack(
         Format::Zip => unpack_zip(reader, &mut tree)?,
     }
     tree.finish()
+}
+
+/// Read an xz stream past tar's end marker to its end: the block check, the
+/// index and the footer are verified only there, so stopping at the marker
+/// would extract a corrupted payload without an error. What it decodes to
+/// counts against [`Limits::max_bytes`], so trailing padding cannot be a
+/// bomb.
+fn drain(xz: &mut dyn Read, tree: &Tree<'_>) -> anyhow::Result<()> {
+    let left = tree.bytes_left();
+    let n = std::io::copy(
+        &mut StopRead::new(xz, tree.cancelled).take(left.saturating_add(1)),
+        &mut std::io::sink(),
+    )
+    .context("read the xz stream to its end")?;
+    if n > left {
+        return Err(tree.too_many_bytes());
+    }
+    Ok(())
+}
+
+/// Name the memory cap on the error lzma-rust2 gives for a dictionary over
+/// it, so the message does not rest on that crate's wording alone.
+fn xz_context(e: anyhow::Error) -> anyhow::Error {
+    let over_cap = e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::OutOfMemory)
+    });
+    if over_cap {
+        e.context(format!(
+            "the xz stream's dictionary needs more decoder memory than the {} MiB cap; \
+             recompress it with a smaller one (`xz -9` uses 64 MiB)",
+            XZ_MEM_LIMIT_KIB >> 10
+        ))
+    } else {
+        e
+    }
+}
+
+/// The name a bare `gz`'s file takes: the archive's own name with a trailing
+/// `.gz` removed (any case), as `gzip -d` names it, or the whole name when
+/// it has none or is nothing else (`.gz`). Never the name the gzip header
+/// records: that is the archive author's to choose, the archive's file name
+/// is the build's.
+///
+/// `archive.extract` keys a tree by these rules: a change to the naming rule
+/// or to a gz's mode rule bumps its `EXTRACT_FORMAT_VERSION`
+/// (`crates/plugin-archive/src/extract.rs`).
+fn gz_file_name(archive: &Path) -> anyhow::Result<String> {
+    let name = archive
+        .file_name()
+        .with_context(|| format!("{}: the archive has no file name", archive.display()))?
+        .to_str()
+        .with_context(|| {
+            format!(
+                "{}: the archive's file name is not UTF-8",
+                archive.display()
+            )
+        })?;
+    let stem = Format::Gz
+        .strip_suffix(name)
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or(name);
+    if stem == "." || stem == ".." {
+        bail!(
+            "{}: without its `.gz`, the archive's name is {stem:?}, which names no file; \
+             rename the archive",
+            archive.display()
+        );
+    }
+    Ok(stem.to_string())
+}
+
+/// Whether the gzip file at `path` inflates to a tar: its first
+/// [`Format::SNIFF_LEN`] inflated bytes carry tar's `ustar` magic, by the
+/// rule [`Format::sniff`] applies to raw bytes. A file too short to hold it,
+/// or one that does not inflate, is not a tar; only failing to open or read
+/// the file is an error.
+///
+/// `archive.extract` uses it to tell a `.gz`-named tarball from a bare `gz`
+/// when `format` is omitted, which its `INFERENCE_VERSION` keys.
+pub fn gz_holds_tar(path: &Path) -> anyhow::Result<bool> {
+    let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut head = Vec::with_capacity(Format::SNIFF_LEN);
+    // A decode error only means the head is not a tar's; an IO error on the
+    // file itself surfaces again when it is unpacked.
+    let inflated = flate2::read::MultiGzDecoder::new(std::io::BufReader::new(file))
+        .take(Format::SNIFF_LEN as u64)
+        .read_to_end(&mut head);
+    Ok(inflated.is_ok() && crate::is_tar_head(&head))
 }
 
 fn unpack_tar(reader: impl Read, tree: &mut Tree<'_>) -> anyhow::Result<()> {
@@ -660,6 +826,55 @@ mod tests {
         zstd::stream::encode_all(bytes, 3).unwrap()
     }
 
+    fn xz(bytes: &[u8]) -> Vec<u8> {
+        let opts = lzma_rust2::XzOptions::with_preset(1);
+        let mut w = lzma_rust2::XzWriter::new(Vec::new(), opts).unwrap();
+        w.write_all(bytes).unwrap();
+        w.finish().unwrap()
+    }
+
+    /// Unpack `bytes`, written to a file called `name`, into `out/`: a bare
+    /// `gz` takes its file's name from the archive's.
+    fn run_named(
+        name: &str,
+        bytes: &[u8],
+        format: Format,
+        strip: u32,
+        executable: bool,
+    ) -> (tempfile::TempDir, anyhow::Result<usize>) {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join(name);
+        std::fs::write(&archive, bytes).unwrap();
+        let out = dir.path().join("out");
+        let opts = UnpackOptions {
+            strip_components: strip,
+            executable,
+            ..UnpackOptions::default()
+        };
+        let r = unpack(&archive, format, opts, &out, &never);
+        (dir, r)
+    }
+
+    /// The files under `out/`, sorted, workspace-style (`a/b`).
+    fn listing(dir: &tempfile::TempDir) -> Vec<String> {
+        let out = dir.path().join("out");
+        let mut seen = Vec::new();
+        let mut todo = vec![out.clone()];
+        while let Some(d) = todo.pop() {
+            for e in std::fs::read_dir(&d).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    todo.push(p);
+                } else {
+                    let rel = p.strip_prefix(&out).unwrap();
+                    seen.push(rel.to_string_lossy().into_owned());
+                }
+            }
+        }
+        seen.sort();
+        seen
+    }
+
     fn zip_bytes(build: impl FnOnce(&mut zip::ZipWriter<std::io::Cursor<Vec<u8>>>)) -> Vec<u8> {
         let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
         build(&mut w);
@@ -688,7 +903,12 @@ mod tests {
         let archive = dir.path().join("archive");
         std::fs::write(&archive, bytes).unwrap();
         let out = dir.path().join("out");
-        let r = unpack(&archive, format, strip, limits, &out, cancelled);
+        let opts = UnpackOptions {
+            strip_components: strip,
+            limits,
+            ..UnpackOptions::default()
+        };
+        let r = unpack(&archive, format, opts, &out, cancelled);
         (dir, r)
     }
 
@@ -737,6 +957,367 @@ mod tests {
         let (dir, r) = run(&zst(&sample_tar()), Format::TarZst, 0);
         r.unwrap();
         assert_eq!(read(&dir, "tool-1.0/bin/tool"), "#!/bin/sh\necho hi\n");
+    }
+
+    #[test]
+    fn tar_xz_round_trips_with_modes() {
+        let (dir, r) = run(&xz(&sample_tar()), Format::TarXz, 1);
+        assert_eq!(r.unwrap(), 3);
+        assert_eq!(read(&dir, "bin/tool"), "#!/bin/sh\necho hi\n");
+        assert_eq!(mode(&dir, "bin/tool"), 0o755);
+        assert_eq!(mode(&dir, "README"), 0o644);
+    }
+
+    /// `xz -d` reads `cat a.xz b.xz` to the end; so does the unpacker.
+    #[test]
+    fn a_multi_stream_xz_is_read_to_the_end() {
+        let t = sample_tar();
+        let mut bytes = xz(&t[..1024]);
+        bytes.extend(xz(&t[1024..]));
+        let (dir, r) = run(&bytes, Format::TarXz, 0);
+        assert_eq!(r.unwrap(), 4);
+        assert_eq!(read(&dir, "tool-1.0/README"), "readme\n");
+    }
+
+    #[test]
+    fn a_truncated_or_corrupt_xz_is_an_error() {
+        let x = xz(&sample_tar());
+        let (_dir, r) = run(&x[..x.len() / 2], Format::TarXz, 0);
+        err(r);
+        // A flipped byte in the compressed data.
+        let mut bad = x.clone();
+        let mid = bad.len() / 2;
+        bad[mid] ^= 0xff;
+        let (_dir, r) = run(&bad, Format::TarXz, 0);
+        err(r);
+        // Not xz at all.
+        let (_dir, r) = run(&gz(&sample_tar()), Format::TarXz, 0);
+        err(r);
+    }
+
+    /// `len` bytes no compressor shrinks, the same on every run.
+    fn incompressible(len: usize) -> Vec<u8> {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state.to_le_bytes()[0]
+            })
+            .collect()
+    }
+
+    /// Where an xz stream's one block check (CRC64) sits: just before the
+    /// index, whose size the footer records.
+    fn xz_check_field(x: &[u8]) -> std::ops::Range<usize> {
+        let footer = x.len() - 12;
+        let backward = u32::from_le_bytes(x[footer + 4..footer + 8].try_into().unwrap());
+        let index = footer - (backward as usize + 1) * 4;
+        index - 8..index
+    }
+
+    /// What only the xz check, index and footer catch: tar stops reading at
+    /// its end marker, so these are verified because the unpacker reads the
+    /// stream past it, to its end.
+    #[test]
+    fn xz_integrity_is_verified_past_the_tar_end_marker() {
+        // LZMA2 stores an incompressible payload as is, so a flipped payload
+        // byte decodes cleanly to a wrong byte: only the check sees it.
+        let payload = incompressible(200_000);
+        let x = xz(&tar_bytes(&[E::File("r", &payload, 0o644)]));
+        let (dir, r) = run(&x, Format::TarXz, 0);
+        r.unwrap();
+        assert_eq!(std::fs::read(dir.path().join("out/r")).unwrap(), payload);
+        let at = x
+            .windows(32)
+            .position(|w| w == &payload[100_000..100_032])
+            .expect("the payload is stored uncompressed");
+        let mut flipped = x.clone();
+        flipped[at] ^= 0x01;
+        let (_dir, r) = run(&flipped, Format::TarXz, 0);
+        err(r);
+
+        // The CRC64 itself.
+        let mut crc = x.clone();
+        crc[xz_check_field(&x).start] ^= 0x01;
+        let (_dir, r) = run(&crc, Format::TarXz, 0);
+        err(r);
+
+        // A tar padded to a 10240-byte record, as GNU tar writes it, cut
+        // through the footer, or through the index.
+        let mut padded = sample_tar();
+        padded.resize(10240, 0);
+        let x = xz(&padded);
+        let (_dir, r) = run(&x, Format::TarXz, 0);
+        r.unwrap();
+        for cut in [12, 24] {
+            let (_dir, r) = run(&x[..x.len() - cut], Format::TarXz, 0);
+            err(r);
+        }
+    }
+
+    /// What an xz decodes to after tar's end marker is read, so it counts
+    /// against `max_bytes`: zeros after the marker cannot be a bomb.
+    #[test]
+    fn bytes_after_the_tar_end_marker_count_against_max_bytes() {
+        let mut t = tar_bytes(&[E::File("a", b"0123456789", 0o644)]);
+        t.resize(t.len() + (8 << 20), 0);
+        let x = xz(&t);
+        let limits = Limits {
+            max_bytes: 64 << 10,
+            ..Limits::default()
+        };
+        let (_dir, r) = run_with(&x, Format::TarXz, 0, limits, &never);
+        let msg = err(r);
+        assert!(msg.contains("`max_bytes`"), "{msg}");
+        // The same stream within the default limit unpacks.
+        let (dir, r) = run(&x, Format::TarXz, 0);
+        r.unwrap();
+        assert_eq!(read(&dir, "a"), "0123456789");
+    }
+
+    /// An xz bomb: a small stream that decodes to far more than `max_bytes`.
+    #[test]
+    fn an_xz_bomb_is_bounded() {
+        let big = vec![0u8; 32 << 20];
+        let x = xz(&tar_bytes(&[E::File("bomb", &big, 0o644)]));
+        assert!(x.len() < 64 << 10, "a bomb: {} bytes", x.len());
+        let limits = Limits {
+            max_bytes: 1 << 20,
+            ..Limits::default()
+        };
+        let (dir, r) = run_with(&x, Format::TarXz, 0, limits, &never);
+        let msg = err(r);
+        assert!(msg.contains("`max_bytes`"), "{msg}");
+        let written = std::fs::metadata(dir.path().join("out/bomb"))
+            .unwrap()
+            .len();
+        // The copy reads one byte past the budget to tell "at it" from "over".
+        assert!(written <= (1 << 20) + 1, "stopped at the budget: {written}");
+    }
+
+    /// `x` with its first block header's LZMA2 dictionary property set to
+    /// `prop`, and the header's CRC32 fixed up to match.
+    fn with_xz_dictionary(mut x: Vec<u8>, prop: u8) -> Vec<u8> {
+        // The block header follows the 12-byte stream header; its first byte
+        // is its size / 4 - 1, and its last four bytes a CRC32 of the rest.
+        let start = 12;
+        let len = (usize::from(x[start]) + 1) * 4;
+        let header = start..start + len - 4;
+        // The LZMA2 filter flags: id 0x21, one property byte, the dictionary.
+        let at = x[header.clone()]
+            .windows(2)
+            .position(|w| w == [0x21, 0x01])
+            .map(|i| start + i + 2)
+            .expect("an LZMA2 filter in the block header");
+        x[at] = prop;
+        let mut crc = flate2::Crc::new();
+        crc.update(&x[header.clone()]);
+        x[header.end..header.end + 4].copy_from_slice(&crc.sum().to_le_bytes());
+        x
+    }
+
+    /// An xz block header names its dictionary size, and the decoder would
+    /// allocate it: one over the cap is refused before anything is allocated
+    /// or written, naming the cap. A property byte `p` below 40 is a
+    /// dictionary of `(2 | (p & 1)) << (p / 2 + 11)` bytes.
+    #[test]
+    fn an_xz_dictionary_over_the_memory_limit_is_refused() {
+        // 40: the largest dictionary, 4 GiB - 1. 32: 256 MiB, which with the
+        // decoder's overhead is over the 256 MiB cap.
+        for prop in [40, 32] {
+            let x = with_xz_dictionary(xz(&sample_tar()), prop);
+            let (dir, r) = run(&x, Format::TarXz, 0);
+            let msg = err(r);
+            assert!(msg.contains("256 MiB cap"), "{prop}: {msg}");
+            assert!(listing(&dir).is_empty(), "{prop}: nothing written");
+        }
+        // 28: 64 MiB, what `xz -9` uses; 31: 192 MiB, the largest under it.
+        for prop in [28, 31] {
+            let x = with_xz_dictionary(xz(&sample_tar()), prop);
+            let (dir, r) = run(&x, Format::TarXz, 0);
+            assert_eq!(r.unwrap(), 4, "{prop}");
+            assert_eq!(read(&dir, "tool-1.0/README"), "readme\n");
+        }
+    }
+
+    /// A bare `gz` is one file, named after the archive minus `.gz`, as
+    /// `gzip -d` names it; whatever name the gzip header records is ignored.
+    #[test]
+    fn a_bare_gz_unpacks_to_one_file_named_after_the_archive() {
+        let body = b"\x7fELF not really";
+        let mut named = Vec::new();
+        flate2::GzBuilder::new()
+            .filename("evil/../../name")
+            .write(&mut named, flate2::Compression::default())
+            .write_all(body)
+            .unwrap();
+        for (archive, want) in [
+            ("tool-linux-amd64.gz", "tool-linux-amd64"),
+            ("TOOL.GZ", "TOOL"),
+            ("tool.tar.gz", "tool.tar"),
+            // `format = "gz"` on a name without the suffix keeps the name.
+            ("tool", "tool"),
+            ("tool.gzip", "tool.gzip"),
+        ] {
+            let (dir, r) = run_named(archive, &named, Format::Gz, 0, false);
+            assert_eq!(r.unwrap(), 1, "{archive}");
+            assert_eq!(listing(&dir), [want], "{archive}");
+            assert_eq!(
+                std::fs::read(dir.path().join("out").join(want)).unwrap(),
+                body
+            );
+            assert_eq!(mode(&dir, want), 0o644, "gzip records no mode");
+        }
+    }
+
+    #[test]
+    fn a_bare_gz_is_executable_only_when_asked() {
+        let (dir, r) = run_named("tool.gz", &gz(b"bin"), Format::Gz, 0, true);
+        r.unwrap();
+        assert_eq!(mode(&dir, "tool"), 0o755);
+        // An archive format carries its own modes: `executable` is refused,
+        // before anything is created.
+        for format in Format::ALL.into_iter().filter(|f| *f != Format::Gz) {
+            let (dir, r) = run_named("a", &sample_tar(), format, 0, true);
+            let msg = err(r);
+            assert!(msg.contains("only to a bare `gz`"), "{msg}");
+            assert!(!dir.path().join("out").exists(), "{}", format.as_str());
+        }
+    }
+
+    #[test]
+    fn a_bare_gz_obeys_the_tree_rules() {
+        // A multi-member stream is one file, read to the end.
+        let mut two = gz(b"one ");
+        two.extend(gz(b"two"));
+        let (dir, r) = run_named("t.gz", &two, Format::Gz, 0, false);
+        r.unwrap();
+        assert_eq!(read(&dir, "t"), "one two");
+        // `strip_components` removes its one component: nothing is left.
+        let (_dir, r) = run_named("t.gz", &gz(b"x"), Format::Gz, 1, false);
+        let msg = err(r);
+        assert!(msg.contains("nothing to extract"), "{msg}");
+        // Not gzip, empty, or truncated: errors, not an empty or short file.
+        let g = gz(&vec![b'x'; 64 << 10]);
+        for bad in [&b"plain text"[..], b"", &g[..g.len() / 2]] {
+            let (_dir, r) = run_named("t.gz", bad, Format::Gz, 0, false);
+            err(r);
+        }
+    }
+
+    /// The name corners: what is left once `.gz` is removed must name a
+    /// file, and the refusal comes before `out/` is created.
+    #[test]
+    fn a_bare_gz_name_must_leave_a_file_name() {
+        for (archive, want) in [
+            // All suffix: the whole name, as `gzip -d` cannot do better.
+            (".gz", ".gz"),
+            // Only the last `.gz` goes.
+            ("a.gz.gz", "a.gz"),
+            ("a.GZ.gz", "a.GZ"),
+        ] {
+            let (dir, r) = run_named(archive, &gz(b"x"), Format::Gz, 0, false);
+            assert_eq!(r.unwrap(), 1, "{archive}");
+            assert_eq!(listing(&dir), [want], "{archive}");
+        }
+        for archive in ["..gz", "...gz"] {
+            let (dir, r) = run_named(archive, &gz(b"x"), Format::Gz, 0, false);
+            let msg = err(r);
+            assert!(msg.contains("names no file"), "{archive}: {msg}");
+            assert!(!dir.path().join("out").exists(), "{archive}: no `out/`");
+        }
+    }
+
+    /// An empty file gzipped is one empty file, not "nothing to extract".
+    #[test]
+    fn a_bare_gz_of_nothing_is_one_empty_file() {
+        let (dir, r) = run_named("e.gz", &gz(b""), Format::Gz, 0, false);
+        assert_eq!(r.unwrap(), 1);
+        assert_eq!(listing(&dir), ["e"]);
+        assert_eq!(read(&dir, "e"), "");
+        assert_eq!(mode(&dir, "e"), 0o644);
+    }
+
+    /// A bare `gz` is read to its end, so its trailer (CRC32, then the
+    /// length) is verified, and anything after the last member is refused.
+    /// That is stricter than `gzip -d`, which warns about trailing garbage
+    /// and ignores trailing zeros.
+    #[test]
+    fn a_bare_gz_trailer_is_verified_and_nothing_may_follow_it() {
+        let g = gz(&incompressible(4096));
+        let (_dir, r) = run_named("t.gz", &g, Format::Gz, 0, false);
+        r.unwrap();
+        // The trailer cut through the length, and through the CRC32.
+        for cut in [4, 8] {
+            let (_dir, r) = run_named("t.gz", &g[..g.len() - cut], Format::Gz, 0, false);
+            err(r);
+        }
+        // A flipped CRC32 byte.
+        let mut crc = g.clone();
+        let at = crc.len() - 8;
+        crc[at] ^= 0x01;
+        let (_dir, r) = run_named("t.gz", &crc, Format::Gz, 0, false);
+        err(r);
+        // Trailing garbage, and trailing zeros.
+        for tail in [&b"garbage!"[..], &[0u8; 512][..]] {
+            let mut trailing = g.clone();
+            trailing.extend_from_slice(tail);
+            let (_dir, r) = run_named("t.gz", &trailing, Format::Gz, 0, false);
+            err(r);
+        }
+    }
+
+    /// A `.gz` named file that inflates to a tar is a `tar.gz`; one that
+    /// inflates to anything else, is too short, or is not gzip at all is not.
+    #[test]
+    fn gz_holds_tar_reads_the_inflated_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut short_tar = sample_tar();
+        short_tar.truncate(Format::SNIFF_LEN);
+        for (body, want) in [
+            (gz(&sample_tar()), true),
+            (gz(&short_tar), true),
+            (gz(b"\x7fELF a binary"), false),
+            (gz(&short_tar[..Format::SNIFF_LEN - 1]), false),
+            (gz(b""), false),
+            (b"not gzip".to_vec(), false),
+            (Vec::new(), false),
+        ] {
+            let p = dir.path().join("t.gz");
+            std::fs::write(&p, &body).unwrap();
+            assert_eq!(gz_holds_tar(&p).unwrap(), want, "{body:?}");
+        }
+        gz_holds_tar(&dir.path().join("missing.gz")).unwrap_err();
+    }
+
+    #[test]
+    fn a_bare_gz_is_bounded_and_cancellable() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("big.gz");
+        std::fs::write(&archive, gz(&vec![b'x'; 4 << 20])).unwrap();
+        let opts = UnpackOptions {
+            limits: Limits {
+                max_bytes: 1 << 20,
+                ..Limits::default()
+            },
+            ..UnpackOptions::default()
+        };
+        let out = dir.path().join("a");
+        let r = unpack(&archive, Format::Gz, opts, &out, &never);
+        assert!(err(r).contains("max_bytes"));
+        let out = dir.path().join("b");
+        let started = || out.join("big").exists();
+        let r = unpack(
+            &archive,
+            Format::Gz,
+            UnpackOptions::default(),
+            &out,
+            &started,
+        );
+        assert!(err(r).contains("cancelled"));
+        assert!(std::fs::metadata(out.join("big")).unwrap().len() < 4 << 20);
     }
 
     #[test]
@@ -968,7 +1549,13 @@ mod tests {
         std::fs::write(&archive, sample_tar()).unwrap();
         let out = dir.path().join("out");
         std::fs::create_dir(&out).unwrap();
-        let r = unpack(&archive, Format::Tar, 0, Limits::default(), &out, &never);
+        let r = unpack(
+            &archive,
+            Format::Tar,
+            UnpackOptions::default(),
+            &out,
+            &never,
+        );
         assert!(err(r).contains("already exists"));
     }
 
@@ -992,8 +1579,30 @@ mod tests {
         let r = unpack(
             &archive,
             Format::TarGz,
-            0,
-            Limits::default(),
+            UnpackOptions::default(),
+            &out,
+            &started,
+        );
+        let msg = err(r);
+        assert!(msg.contains("cancelled"), "{msg}");
+        let written = std::fs::metadata(out.join("big")).unwrap().len();
+        assert!(written < big.len() as u64, "stopped early: {written}");
+    }
+
+    /// The same for an xz stream: its decoder is read through `StopRead` too.
+    #[test]
+    fn cancellation_stops_mid_entry_in_an_xz() {
+        let big = vec![b'x'; 4 << 20];
+        let bytes = xz(&tar_bytes(&[E::File("big", &big, 0o644)]));
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("archive");
+        std::fs::write(&archive, &bytes).unwrap();
+        let out = dir.path().join("out");
+        let started = || out.join("big").exists();
+        let r = unpack(
+            &archive,
+            Format::TarXz,
+            UnpackOptions::default(),
             &out,
             &started,
         );
@@ -1360,8 +1969,23 @@ mod tests {
             ("x.tar", Some(Format::Tar)),
             ("x.zip", Some(Format::Zip)),
             ("x.tar.gz.sha256", None),
-            ("x.gz", None),
-            ("x.tar.xz", None),
+            ("x.tar.xz", Some(Format::TarXz)),
+            ("x.TXZ", Some(Format::TarXz)),
+            // The longest suffix wins: a `.tar.gz` is never a bare `gz`.
+            ("x.gz", Some(Format::Gz)),
+            ("X.GZ", Some(Format::Gz)),
+            ("x.tar.gz", Some(Format::TarGz)),
+            ("x.tgz.gz", Some(Format::Gz)),
+            ("x.tar.xz.gz", Some(Format::Gz)),
+            ("x.xz", None),
+            ("x.tar.xz.sha256", None),
+            ("a.gz.gz", Some(Format::Gz)),
+            ("x.TaR.Xz", Some(Format::TarXz)),
+            ("é.gz", Some(Format::Gz)),
+            ("é", None),
+            (".gz", None),
+            (".tgz", None),
+            ("xgz", None),
             ("x", None),
             (".tar.gz", None),
             ("", None),

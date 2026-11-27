@@ -6,7 +6,7 @@
 use crate::{FormatArg, check_rel, in_package};
 use anyhow::Context as _;
 use async_trait::async_trait;
-use harchive::{Format, Limits};
+use harchive::{Format, Limits, UnpackOptions};
 use hcore::hasync::Cancellable;
 use hcore::htvalue::signature::ParamType;
 use hdriver_support::driver_managed::{
@@ -28,17 +28,23 @@ use xxhash_rust::xxh3::Xxh3;
 pub const DRIVER_NAME: &str = "extract";
 
 /// Bump to invalidate every extracted tree when the unpacking rules change
-/// what an archive produces (modes, what is refused, link handling).
-/// A change to how an omitted `format` is inferred bumps
+/// what an archive produces (modes, what is refused, link handling, a gz's
+/// file name and mode). A change to how an omitted `format` is inferred bumps
 /// [`INFERENCE_VERSION`] instead, which moves only the inferring targets.
 const EXTRACT_FORMAT_VERSION: u32 = 1;
 
 /// Bump when the rules that infer an omitted `format` change
 /// ([`infer_format`], `Format::infer`'s suffixes, `Format::sniff`'s
-/// signatures): the same archive can then unpack as another format, so every
-/// target that infers must re-key. Hashed only when `format` is omitted, so a
-/// target that names its format keeps its key.
-const INFERENCE_VERSION: u32 = 1;
+/// signatures, `harchive::gz_holds_tar`): the same archive can then unpack
+/// as another format, so every target that infers must re-key. Hashed only
+/// when `format` is omitted, so a target that names its format keeps its
+/// key.
+///
+/// 2: `.tar.xz`/`.txz` and `.gz` suffixes, the xz signature, and the longest
+/// suffix winning; a `.gz` whose inflated head carries tar's `ustar` magic
+/// at offset 257 is a `tar.gz` (as it sniffed under 1), any other `.gz` a
+/// bare `gz`.
+const INFERENCE_VERSION: u32 = 2;
 
 /// The dep input's origin id.
 const SRC_ORIGIN: &str = "extract:src";
@@ -49,15 +55,18 @@ struct ExtractSpec {
     /// Address of the target whose single output file is the archive.
     #[spec(required)]
     src: String,
-    /// Archive format: `tar`, `tar.gz`, `tar.zst` or `zip`. When omitted,
-    /// inferred at run from the archive file's name suffix, else from its
-    /// leading bytes.
+    /// Archive format: `tar`, `tar.gz`, `tar.xz`, `tar.zst`, `zip`, or `gz`
+    /// (one gzipped file, not a tar). When omitted, inferred at run from the
+    /// archive file's name suffix, else from its leading bytes.
     #[spec(ty = FormatArg::spec_param_type())]
     format: Option<FormatArg>,
     /// Leading path components dropped from every entry, as `tar
     /// --strip-components`. An entry with no more components than this is
     /// skipped; an archive from which nothing remains is an error.
     strip_components: u32,
+    /// With a `gz` only: make its one file executable. gzip records no mode;
+    /// an archive format's entries carry their own, so it is refused with one.
+    executable: bool,
     /// Output directory, relative to the target's package. Defaults to the
     /// target name.
     #[spec(ty = ParamType::String)]
@@ -85,6 +94,9 @@ struct ExtractDef {
     /// `None`: inferred at run by [`infer_format`].
     format: Option<Format>,
     strip_components: u32,
+    /// A `gz`'s file is `0o755`. Absent from a def serialized before it was.
+    #[serde(default)]
+    executable: bool,
     limits: Limits,
     /// Package-relative output directory.
     out: String,
@@ -113,6 +125,26 @@ impl ManagedDriver for Driver {
         let spec = ExtractSpec::from(&req.target_spec.config).context("parse extract config")?;
         let out = spec.out.unwrap_or_else(|| addr.name.clone());
         check_rel(&out).with_context(|| format!("{}: `out`", addr.format()))?;
+        let format = spec.format.map(|f| f.0);
+        // With `format` omitted, both are checked at run once the format is
+        // known.
+        if let Some(f) = format {
+            if spec.executable && !f.takes_executable() {
+                anyhow::bail!(
+                    "{}: `executable` applies only to `format = \"gz\"`; a {} records each \
+                     entry's mode",
+                    addr.format(),
+                    f.as_str()
+                );
+            }
+            if f == Format::Gz && spec.strip_components > 0 {
+                anyhow::bail!(
+                    "{}: `strip_components` with `format = \"gz\"` would remove its one file, \
+                     which has no directory to strip; drop it",
+                    addr.format()
+                );
+            }
+        }
 
         let pkg = addr.package.clone();
         let src = TargetAddr::parse(&spec.src, &pkg)
@@ -134,12 +166,18 @@ impl ManagedDriver for Driver {
         // The archive's bytes reach the key through the dep's hashout, so
         // only the address goes in here — all of it: `|group` and `[filters]`
         // pick which of the dep's files are the archive.
+        // For a gz, the output file's name derives from the dep's file name,
+        // which is keyed through the dep's hashout too.
         h.update(src.to_string().as_bytes());
         h.update(b"\0");
-        let format = spec.format.map(|f| f.0);
         hash_format(&mut h, format, INFERENCE_VERSION);
         h.update(&spec.strip_components.to_le_bytes());
         h.update(out.as_bytes());
+        // Only when set, so every key from before the option stays put. `out`
+        // holds no NUL (`check_rel`), so the separator keeps the two apart.
+        if spec.executable {
+            h.update(b"\0executable");
+        }
         // Not `limits`: they decide only whether the run fails, and a failure
         // is never cached; when it succeeds the tree is the same whatever the
         // limits were, so raising one must not re-extract every archive.
@@ -152,6 +190,7 @@ impl ManagedDriver for Driver {
                 raw_def: Arc::new(ExtractDef {
                     format,
                     strip_components: spec.strip_components,
+                    executable: spec.executable,
                     limits,
                     out,
                 }),
@@ -201,7 +240,12 @@ impl ManagedDriver for Driver {
         let src =
             single_dep_file(&req.inputs, SRC_ORIGIN).with_context(|| format!("{addr}: `src`"))?;
         let dest = req.sandbox_pkg_dir.join(&def.out);
-        let (format, strip, limits) = (def.format, def.strip_components, def.limits);
+        let format = def.format;
+        let opts = UnpackOptions {
+            strip_components: def.strip_components,
+            executable: def.executable,
+            limits: def.limits,
+        };
 
         // Reading the list, sniffing, decompressing and writing are blocking
         // work; off the async workers. The token is polled on every read, so
@@ -213,12 +257,14 @@ impl ManagedDriver for Driver {
             let archive = src.single_file().with_context(|| format!("{cx}: `src`"))?;
             let format = match format {
                 Some(f) => f,
-                None => infer_format(&archive).with_context(|| format!("{cx}: `format`"))?,
+                None => {
+                    let f = infer_format(&archive).with_context(|| format!("{cx}: `format`"))?;
+                    check_inferred(f, &archive, opts).with_context(|| format!("{cx}: `format`"))?;
+                    f
+                }
             };
-            harchive::unpack(&archive, format, strip, limits, &dest, &|| {
-                token.is_cancelled()
-            })
-            .with_context(|| format!("{cx}: extract {}", format.as_str()))
+            harchive::unpack(&archive, format, opts, &dest, &|| token.is_cancelled())
+                .with_context(|| format!("{cx}: extract {}", format.as_str()))
         })
         .await?;
 
@@ -244,9 +290,38 @@ fn hash_format(h: &mut Xxh3, format: Option<Format>, inference_version: u32) {
     }
 }
 
+/// The options parse checks against a named format, checked against an
+/// inferred one, saying it was inferred: the author set no `format`, so the
+/// one the error names is the archive's, and `format` is the fix.
+fn check_inferred(
+    format: Format,
+    archive: &std::path::Path,
+    opts: UnpackOptions,
+) -> anyhow::Result<()> {
+    let name = archive.file_name().unwrap_or_default().to_string_lossy();
+    if opts.executable && !format.takes_executable() {
+        anyhow::bail!(
+            "`executable` applies only to a bare `gz`, and the format was inferred as {} from \
+             {name:?}; set `format = \"gz\"` if it is one gzipped file, or drop `executable`",
+            format.as_str()
+        );
+    }
+    if format == Format::Gz && opts.strip_components > 0 {
+        anyhow::bail!(
+            "the format was inferred as gz (one gzipped file) from {name:?}, and \
+             `strip_components` would remove that file; drop it, or set `format` if the \
+             archive is a tar"
+        );
+    }
+    Ok(())
+}
+
 /// The format of the archive at `path`, for an `extract` with no `format`:
-/// its file name's suffix, else its leading bytes. Both are the dep's
-/// content, which its hashout covers, so the answer is keyed.
+/// its file name's suffix, else its leading bytes. A `.gz` name is a bare
+/// `gz` unless the stream inflates to a tar (`harchive::gz_holds_tar`), as
+/// a `.gz`-named tarball sniffed as a `tar.gz` before names inferred `gz`.
+/// The name and the bytes are the dep's content, which its hashout covers,
+/// so the answer is keyed.
 fn infer_format(path: &std::path::Path) -> anyhow::Result<Format> {
     use std::io::Read as _;
 
@@ -255,6 +330,9 @@ fn infer_format(path: &std::path::Path) -> anyhow::Result<Format> {
         .and_then(|n| n.to_str())
         .and_then(Format::infer)
     {
+        if f == Format::Gz && harchive::gz_holds_tar(path)? {
+            return Ok(Format::TarGz);
+        }
         return Ok(f);
     }
     let mut head = Vec::with_capacity(Format::SNIFF_LEN);
@@ -476,6 +554,12 @@ mod tests {
             ("blob.bin", &[0x28, 0xb5, 0x2f, 0xfd, 0][..], Format::TarZst),
             ("blob", &b"PK\x03\x04...."[..], Format::Zip),
             ("tool.tar.gz.download", &ustar[..], Format::Tar),
+            ("blob", &b"\xfd7zXZ\x00\x00\x04"[..], Format::TarXz),
+            ("a.tar.xz", &b"junk"[..], Format::TarXz),
+            ("a.txz", &b"junk"[..], Format::TarXz),
+            // A `.gz` that is not a `.tar.gz` is one gzipped file.
+            ("tool-linux.gz", &gzip[..], Format::Gz),
+            ("a.tar.gz", &gzip[..], Format::TarGz),
         ] {
             let p = dir.path().join(name);
             std::fs::write(&p, body).unwrap();
@@ -488,6 +572,175 @@ mod tests {
             let msg = format!("{:#}", infer_format(&p).unwrap_err());
             assert!(msg.contains("set `format`"), "{name}: {msg}");
         }
+    }
+
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(bytes).unwrap();
+        e.finish().unwrap()
+    }
+
+    /// A `.gz` that inflates to a tar is a `tar.gz`, as it sniffed before
+    /// `.gz` named a bare `gz`; any other `.gz` is a bare `gz`. The name
+    /// alone decides no more than that.
+    #[test]
+    fn a_gz_name_is_a_tar_gz_when_it_inflates_to_a_tar() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ustar = vec![0u8; 1024];
+        ustar[257..262].copy_from_slice(b"ustar");
+        for (name, body, want) in [
+            ("tool.gz", gzip(&ustar), Format::TarGz),
+            ("TOOL.GZ", gzip(&ustar), Format::TarGz),
+            ("tool.gz", gzip(b"\x7fELF a binary"), Format::Gz),
+            ("tool.gz", gzip(b""), Format::Gz),
+            // Not gzip at all: still the name's `gz`, which fails at run.
+            ("tool.gz", b"plain".to_vec(), Format::Gz),
+            // A `.tar.gz` is one whatever it holds.
+            ("tool.tar.gz", gzip(b"\x7fELF"), Format::TarGz),
+        ] {
+            let p = dir.path().join(name);
+            std::fs::write(&p, &body).unwrap();
+            assert_eq!(infer_format(&p).unwrap(), want, "{name}: {body:?}");
+            std::fs::remove_file(&p).unwrap();
+        }
+    }
+
+    /// With `format` omitted, the options parse checks against a named
+    /// format are checked once it is inferred, and the error says so.
+    #[test]
+    fn options_are_checked_against_an_inferred_format() {
+        let archive = std::path::Path::new("/dl/tool.tar.xz");
+        let exe = UnpackOptions {
+            executable: true,
+            ..UnpackOptions::default()
+        };
+        let msg = format!(
+            "{:#}",
+            check_inferred(Format::TarXz, archive, exe).unwrap_err()
+        );
+        assert!(
+            msg.contains("inferred as tar.xz from \"tool.tar.xz\"")
+                && msg.contains("set `format = \"gz\"`"),
+            "{msg}"
+        );
+        check_inferred(Format::Gz, archive, exe).unwrap();
+        let strip = UnpackOptions {
+            strip_components: 1,
+            ..UnpackOptions::default()
+        };
+        let msg = format!(
+            "{:#}",
+            check_inferred(Format::Gz, archive, strip).unwrap_err()
+        );
+        assert!(msg.contains("inferred as gz"), "{msg}");
+        check_inferred(Format::TarGz, archive, strip).unwrap();
+        check_inferred(Format::Zip, archive, UnpackOptions::default()).unwrap();
+    }
+
+    /// The def hash of a target that names its format, rebuilt from the
+    /// bytes it hashed before `tar.xz`, `gz` and `executable` existed: those
+    /// must not move an existing key, `executable = False` included.
+    #[tokio::test]
+    async fn an_existing_target_keeps_its_def_hash() {
+        let pinned = |strip: u32, out: &str| {
+            let mut h = Xxh3::new();
+            h.update(&EXTRACT_FORMAT_VERSION.to_le_bytes());
+            h.update(b"//pkg:t");
+            h.update(b"\0");
+            h.update(b"//pkg:a");
+            h.update(b"\0");
+            h.update(&[1]);
+            h.update(b"tar.gz");
+            h.update(b"\0");
+            h.update(&strip.to_le_bytes());
+            h.update(out.as_bytes());
+            format!("{:016x}", h.digest()).into_bytes()
+        };
+        let base = || vec![("src", s(":a")), ("format", s("tar.gz"))];
+        let def = parse("//pkg:t", &base()).await.unwrap();
+        assert_eq!(def.hash, pinned(0, "t"));
+
+        let mut cfg = base();
+        cfg.extend([
+            ("strip_components", Value::Int(1)),
+            ("out", s("o")),
+            ("executable", Value::Bool(false)),
+        ]);
+        let def = parse("//pkg:t", &cfg).await.unwrap();
+        assert_eq!(def.hash, pinned(1, "o"));
+    }
+
+    /// `strip_components` with a named `gz` could only ever fail at run: its
+    /// one file is all there is.
+    #[tokio::test]
+    async fn strip_components_with_a_named_gz_is_refused_at_parse() {
+        let cfg = [
+            ("src", s(":a")),
+            ("format", s("gz")),
+            ("strip_components", Value::Int(1)),
+        ];
+        let Err(e) = parse("//pkg:t", &cfg).await else {
+            panic!("`strip_components` with a named gz must be refused")
+        };
+        let msg = format!("{e:#}");
+        assert!(
+            msg.contains("`strip_components` with `format = \"gz\"`"),
+            "{msg}"
+        );
+        // Inferred, it is checked at run, once the format is known.
+        parse("//pkg:t", &[cfg[0].clone(), cfg[2].clone()])
+            .await
+            .unwrap();
+    }
+
+    /// `executable` is a `gz`'s: refused at parse with a named archive
+    /// format, kept with `gz` or an inferred format (the unpacker refuses it
+    /// at run if that is not a `gz`), and keyed only when set.
+    #[tokio::test]
+    async fn executable_is_a_gz_option_and_keyed_only_when_set() {
+        let def = |cfg: Vec<(&'static str, Value)>| async move {
+            let mut full = vec![("src", s(":a"))];
+            full.extend(cfg);
+            parse("//pkg:t", &full).await
+        };
+        let exe = ("executable", Value::Bool(true));
+        for f in Format::ALL.into_iter().filter(|f| *f != Format::Gz) {
+            let Err(e) = def(vec![("format", s(f.as_str())), exe.clone()]).await else {
+                panic!("{}: `executable` must be refused", f.as_str())
+            };
+            let msg = format!("{e:#}");
+            assert!(msg.contains("only to `format = \"gz\"`"), "{msg}");
+        }
+        for format in [vec![("format", s("gz"))], vec![]] {
+            let plain = def(format.clone()).await.unwrap();
+            let mut with = format.clone();
+            with.push(exe.clone());
+            let marked = def(with).await.unwrap();
+            assert_ne!(plain.hash, marked.hash, "`executable` reaches the key");
+            let mut off = format;
+            off.push(("executable", Value::Bool(false)));
+            assert_eq!(
+                def(off).await.unwrap().hash,
+                plain.hash,
+                "`executable = False` is the default and keeps the key"
+            );
+            let raw = marked.def_de::<ExtractDef>();
+            assert!(raw.executable);
+        }
+    }
+
+    /// A def serialized before `executable` existed still deserializes.
+    #[test]
+    fn a_def_without_executable_reads_as_false() {
+        let raw: ExtractDef = serde_json::from_value(serde_json::json!({
+            "format": "tar",
+            "strip_components": 0,
+            "limits": Limits::default(),
+            "out": "o",
+        }))
+        .unwrap();
+        assert!(!raw.executable);
     }
 
     #[tokio::test]
@@ -506,6 +759,15 @@ mod tests {
             (
                 vec![("src", s(":a")), ("format", s("tar")), ("out", s("/abs"))],
                 "relative",
+            ),
+            // Would hash as `out = "o", executable = True`.
+            (
+                vec![
+                    ("src", s(":a")),
+                    ("format", s("gz")),
+                    ("out", s("o\0executable")),
+                ],
+                "NUL",
             ),
         ] {
             let Err(e) = parse("//pkg:t", &cfg).await else {
