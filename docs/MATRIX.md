@@ -47,7 +47,7 @@ several) and the cell names below are stable contracts: BUILD files and
 
 | Argument | Meaning |
 | --- | --- |
-| `axes` | A dict of axis name to a list of values, in declaration order. That order orders tuple keys. Axis names are Starlark identifiers (they become keyword arguments of `cell`). At least one axis, at least one value each, no repeated value. Values are one or more of `A-Z a-z 0-9 . _ / + -`. A string, tuple or dict where a list is expected is refused, not iterated. |
+| `axes` | A dict of axis name to a list of values, in declaration order. That order orders tuple keys. Axis names are made of `A-Z a-z 0-9 _` and do not start with a digit (they become keyword arguments of `cell`). A keyword such as `if` is allowed; a `def` cannot name it as a parameter, so read it from `**kwargs`. At least one axis, at least one value each, no repeated value. Values are one or more of `A-Z a-z 0-9 . _ / + -`. A string, tuple or dict where a list is expected is refused, not iterated. |
 | `cell` | Called once per cell, in cell order, with one keyword argument per axis. Returns any value, `None` included. Omitted: each cell's value is its dict of axis values. |
 | `default` | Which cell `.default` reads: `None` (the default: no `.default` at all) or a dict giving a value for every axis, e.g. `{"platform": heph.core.host()}`. |
 | `exclude` | A list of dicts: cells removed from the cross product. An entry names at least one axis (an empty `{}` is refused: it would match every cell), and only axes that exist. Each must match a cell of the full cross product (a stale exclude is a typo); overlapping excludes are fine, and excluding every cell with entries that each name an axis is allowed. |

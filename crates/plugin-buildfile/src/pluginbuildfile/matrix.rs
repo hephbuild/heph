@@ -41,14 +41,6 @@ pub(crate) const MAX_CELLS: u64 = 1024;
 /// How many cells the "default names no cell" error lists before eliding.
 const LISTED_CELLS: usize = 16;
 
-/// Starlark keywords: an axis named like one could not be a parameter of the
-/// cell function.
-const KEYWORDS: &[&str] = &[
-    "and", "as", "assert", "break", "class", "continue", "def", "del", "elif", "else", "except",
-    "finally", "for", "from", "global", "if", "import", "in", "is", "lambda", "load", "nonlocal",
-    "not", "or", "pass", "raise", "return", "try", "while", "with", "yield",
-];
-
 /// Where a call is, for its errors: `p/BUILD:12`.
 #[derive(Debug, Clone)]
 pub(crate) struct Site(pub String);
@@ -122,13 +114,15 @@ impl Axes {
     }
 }
 
+/// `[A-Za-z_][A-Za-z0-9_]*`. A keyword (`if`) passes: it cannot be a named
+/// parameter of a `def`, but it reaches a `**kwargs` cell, and the default
+/// cell's dict.
 fn is_identifier(s: &str) -> bool {
     let mut chars = s.chars();
     chars
         .next()
         .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-        && !KEYWORDS.contains(&s)
 }
 
 /// A value is `[A-Za-z0-9._/+-]+`, ASCII only: it ends up in target names
@@ -796,7 +790,6 @@ mod tests {
         assert!(err(&[]).contains("`axes` is empty"));
         assert!(err(&[("go", &[])]).contains("has no values"));
         assert!(err(&[("go-version", &["1"])]).contains("not a Starlark identifier"));
-        assert!(err(&[("if", &["1"])]).contains("not a Starlark identifier"));
         assert!(err(&[("1go", &["1"])]).contains("not a Starlark identifier"));
         assert!(err(&[("go", &["1", "1"])]).contains("lists \"1\" twice"));
         for bad in ["a b", "a@b", "a:b", "a|b", "a\nb", "é", "１", ""] {
@@ -1141,6 +1134,13 @@ eq(heph.core.matrix(axes = {"a": ["1"]}, exclude = [{"a": "1"}]).cells, {})
             darwin(),
         )
         .expect("**kwargs");
+        // A keyword is an axis name: it reaches `**kwargs` and the default cell.
+        eval(
+            "eq(heph.core.matrix(axes = {\"if\": [\"1\"], \"lambda\": [\"2\"]}, cell = lambda **kw: kw[\"if\"] + kw[\"lambda\"]).cells, {(\"1\", \"2\"): \"12\"})\n\
+             eq(heph.core.matrix(axes = {\"if\": [\"1\"]}).cells, {\"1\": {\"if\": \"1\"}})",
+            darwin(),
+        )
+        .expect("keyword axis");
         // `..`, `/` and `a//b` are values; their D8 names are valid target names.
         let result = eval(
             "heph.core.matrix(axes = {\"v\": [\"..\", \"/\", \"a//b\"]}, cell = lambda v: target(name = \"t.\" + v.replace(\"/\", \"-\"), driver = \"d\"))",
