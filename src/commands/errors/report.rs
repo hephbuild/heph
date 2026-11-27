@@ -832,6 +832,58 @@ mod tests {
         assert_eq!(out.matches(HOME).count(), 1, "{out}");
     }
 
+    /// D2 in the interactive report: the cause names workspace paths relative
+    /// and escapes control bytes, through a symlinked root too; the log tail
+    /// keeps its paths. Without a workspace, nothing is rewritten.
+    #[test]
+    fn report_cause_names_workspace_paths_relative() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(real.join("a")).expect("mkdir");
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let real = std::fs::canonicalize(&real).expect("canonical");
+        let file = real.join("a/BUILD");
+        let failure = || {
+            TargetFailure::new(
+                parse_addr("//p:t").expect("addr"),
+                Some(LogTail {
+                    text: format!("{}:1: tool said so\n", file.display()),
+                    start_line: 1,
+                }),
+                anyhow::anyhow!("reading {}: denied\x1b[2J", file.display()),
+            )
+        };
+        let render = |root: Option<&Path>| {
+            ReportContext::gather(
+                &[Arc::new(failure())],
+                |_| TookDown::default(),
+                |_| false,
+                None,
+            )
+            .with_width(400)
+            .with_workspace(root)
+            .render(false)
+        };
+        for root in [real.as_path(), link.as_path()] {
+            let out = render(Some(root));
+            assert!(
+                out.contains("reading a/BUILD: denied\\x1b[2J"),
+                "{root:?}: {out}"
+            );
+            assert!(
+                out.contains(&format!("{}:1: tool said so", file.display())),
+                "the log keeps its path: {out}"
+            );
+            assert!(!out.contains('\x1b'), "{out:?}");
+        }
+        let out = render(None);
+        assert!(
+            out.contains(&format!("reading {}: denied", file.display())),
+            "{out}"
+        );
+    }
+
     /// A timeout names its limit instead of an exit status; an abandoned one
     /// says the run may still be running and that its sandbox was left.
     #[test]

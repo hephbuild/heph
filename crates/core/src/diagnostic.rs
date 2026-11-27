@@ -14,20 +14,10 @@
 //!
 //! **Never hashed.** None of these types implements `Hash`, so a driver that
 //! hashes its spec or its error cannot pick one up by accident: nothing about a
-//! diagnostic reaches a def hash, `hashin` or a cache key.
-//!
-//! ```compile_fail
-//! // `no_hash_on_diagnostic`: a struct that derives `Hash` over one does not
-//! // compile.
-//! #[derive(Hash)]
-//! struct Keyed(hcore::diagnostic::Diagnostic);
-//! ```
-//!
-//! ```compile_fail
-//! // `no_hash_on_source_loc`
-//! #[derive(Hash)]
-//! struct Keyed(hcore::diagnostic::SourceLoc);
-//! ```
+//! diagnostic reaches a def hash, `hashin` or a cache key. The `compile_fail`
+//! doctests that hold this are in `hplugin::diagnostic`: this package is named
+//! `core`, so a doctest here cannot name it as `hcore` and would fail to
+//! compile whatever these types derive.
 
 use std::borrow::Cow;
 use std::fmt;
