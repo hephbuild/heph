@@ -702,7 +702,7 @@ fn served_by(events: &[BuildEvent], a: &str) -> Option<String> {
         } if addr == a => Some(if *snapshot {
             "snapshot".to_string()
         } else {
-            cache.clone()
+            cache.clone().unwrap_or_default()
         }),
         _ => None,
     })

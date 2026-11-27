@@ -1375,7 +1375,9 @@ impl TierCounts {
             BuildEventKind::RemoteCacheHit { snapshot: true, .. } => {
                 self.snapshot = self.snapshot.saturating_add(1);
             }
-            BuildEventKind::RemoteCacheHit { cache, .. } => bump(&mut self.remote, cache.clone()),
+            BuildEventKind::RemoteCacheHit { cache, .. } => {
+                bump(&mut self.remote, cache.clone().unwrap_or_default());
+            }
             BuildEventKind::RemoteTierMiss {
                 snapshot: true,
                 reason,
@@ -2977,16 +2979,23 @@ mod tests {
     fn remote_cache_hit_without_a_cache_name_decodes() {
         let old = r#"{"at_unix_ms":1,"kind":{"type":"RemoteCacheHit","addr":"//a:x"}}"#;
         let ev: BuildEvent = serde_json::from_str(old).expect("an older frame decodes");
-        let BuildEventKind::RemoteCacheHit { addr, cache } = ev.kind else {
+        let BuildEventKind::RemoteCacheHit {
+            addr,
+            cache,
+            snapshot,
+        } = ev.kind
+        else {
             panic!("not a RemoteCacheHit: {:?}", ev.kind);
         };
         assert_eq!(addr, "//a:x");
         assert_eq!(cache, None);
+        assert!(!snapshot);
         let json = serde_json::to_string(&BuildEvent {
             at_unix_ms: 1,
             kind: BuildEventKind::RemoteCacheHit {
                 addr: "//a:x".into(),
                 cache: None,
+                snapshot: false,
             },
         })
         .expect("encode");

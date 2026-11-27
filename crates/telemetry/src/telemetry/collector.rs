@@ -582,7 +582,7 @@ mod tests {
         // user configured.
         c.observe_event(&BuildEventKind::RemoteCacheHit {
             addr: addr(),
-            cache: String::new(),
+            cache: None,
             snapshot: true,
         });
         c.observe_event(&BuildEventKind::RemoteCacheMiss { addr: addr() });

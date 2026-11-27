@@ -187,11 +187,13 @@ fn snapshot(args: &SnapshotArgs, global: &GlobalOptions) -> anyhow::Result<()> {
     .and_then(|r| r);
     match res {
         Ok((dir, report)) => {
+            let mut out = std::io::stdout().lock();
             if args.json {
-                println!("{}", json_report(&dir, &report)?);
+                writeln!(out, "{}", json_report(&dir, &report)?)
+                    .context("writing the snapshot report")?;
             } else {
                 for line in human_report(&dir, &report) {
-                    println!("{line}");
+                    writeln!(out, "{line}").context("writing the snapshot report")?;
                 }
             }
             Ok(())
@@ -199,14 +201,16 @@ fn snapshot(args: &SnapshotArgs, global: &GlobalOptions) -> anyhow::Result<()> {
         Err(e) => {
             let (code, reason) = exit_code(&e);
             if args.json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "schema": SNAPSHOT_JSON_SCHEMA,
-                        "error": format!("{e:#}"),
-                        "reason": reason,
-                    })
-                );
+                let doc = serde_json::json!({
+                    "schema": SNAPSHOT_JSON_SCHEMA,
+                    "error": format!("{e:#}"),
+                    "reason": reason,
+                });
+                // The failure is what the command reports; a closed stdout
+                // must not replace it.
+                if let Err(w) = writeln!(std::io::stdout().lock(), "{doc}") {
+                    tracing::debug!(error = %w, "writing the snapshot error document");
+                }
             }
             Err(CodegenExit {
                 code,
