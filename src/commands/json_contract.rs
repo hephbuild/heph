@@ -502,6 +502,20 @@ mod tests {
             "Outcome" => Derived(crate::commands::run_json::Outcome::__OUTPUT_SHAPE),
             "CacheTier" => Derived(crate::commands::run_json::CacheTier::__OUTPUT_SHAPE),
             "RunFailure" => Derived(crate::commands::run_json::RunFailure::__OUTPUT_SHAPE),
+            // `tool cache snapshot`: the export's report.
+            "ExportOutcome" => {
+                Derived(crate::engine::cache_snapshot::ExportOutcome::__OUTPUT_SHAPE)
+            }
+            "Tally" => Derived(crate::engine::cache_snapshot::Tally::__OUTPUT_SHAPE),
+            "IncompleteJournal" => {
+                Derived(crate::engine::cache_snapshot::IncompleteJournal::__OUTPUT_SHAPE)
+            }
+            "RevisionBytes" => {
+                Derived(crate::engine::cache_snapshot::RevisionBytes::__OUTPUT_SHAPE)
+            }
+            "ScratchReport" => {
+                Derived(crate::engine::cache_snapshot::export::ScratchReport::__OUTPUT_SHAPE)
+            }
             _ => return None,
         })
     }

@@ -8,15 +8,17 @@ use crate::commands::bootstrap;
 use crate::commands::tool::codegen::CodegenExit;
 use crate::engine::CacheLatency;
 use crate::engine::Engine;
+use crate::engine::cache_snapshot::export::{LeftOut, RevisionBytes, ScratchReport};
 use crate::engine::cache_snapshot::{
-    Consumption, ExportOutcome, ExportReport, NewerJournalError, RECORDER_WAIT, RecorderAliveError,
-    SnapshotCancelled, Tally,
+    Consumption, ExportOutcome, ExportReport, IncompleteJournal, NewerJournalError, RECORDER_WAIT,
+    RecorderAliveError, SnapshotCancelled, Tally,
 };
 use crate::tui::LogSink;
 use crate::tui::session::SessionSlot;
 use hcore::hasync::{Cancellable, StdCancellationToken};
 use hcore::units::human_bytes;
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,10 +37,6 @@ const SNAPSHOT_EXIT_CODES_HELP: &str = "Exit codes:\n  \
     3    a heph process is still recording after 10s\n  \
     4    a journal from a newer heph (deleting it is safe)\n  \
     130  cancelled";
-
-/// The `--json` schema version of `snapshot`. Adding a field keeps it;
-/// removing or retyping one bumps it.
-const SNAPSHOT_JSON_SCHEMA: u32 = 1;
 
 #[derive(clap::Subcommand, Clone)]
 pub enum CacheCommands {
@@ -70,9 +68,84 @@ pub enum CacheCommands {
 
 #[derive(clap::Args, Clone, Debug)]
 pub struct SnapshotArgs {
-    /// Print the report as one JSON document
-    #[arg(long)]
-    pub json: bool,
+    #[command(flatten)]
+    pub out: output::JsonArgs<SnapshotView>,
+}
+
+/// `heph tool cache snapshot --json`: the dir written, whether the run was
+/// complete, then the export's report, field for field. Integer bytes, the
+/// top revisions by bytes, the dropped addrs sorted; no timestamps. A
+/// failure prints nothing on stdout: its exit code says which (D15).
+#[derive(Debug, Serialize, output::Record)]
+pub struct SnapshotView {
+    /// The snapshot dir written.
+    #[serde(serialize_with = "output::ser::path")]
+    dir: PathBuf,
+    /// `false` when the run was incomplete (`incomplete` says why).
+    complete: bool,
+    /// What the export did to the dir: `kind` is `written` (with its
+    /// `generation`) or `unchanged`.
+    outcome: ExportOutcome,
+    /// Recorded revisions the previous generation also held.
+    kept: Tally,
+    /// Recorded revisions the previous generation did not hold.
+    new: Tally,
+    /// On an incomplete run, previous-generation revisions the job did not
+    /// touch, carried into the new generation.
+    carried_over: Tally,
+    /// Previous-generation revisions the job did not use.
+    dropped: Tally,
+    /// Revisions that could not be written whole, by reason.
+    left_out: BTreeMap<LeftOut, Tally>,
+    /// The journals the working set was read from.
+    #[serde(serialize_with = "output::ser::paths")]
+    journals: Vec<PathBuf>,
+    /// Why the run was incomplete; empty for a complete run.
+    incomplete: Vec<IncompleteJournal>,
+    /// The largest revisions written, by bytes, ties by addr.
+    top: Vec<RevisionBytes>,
+    /// The targets of the dropped revisions, sorted.
+    dropped_addrs: Vec<String>,
+    /// The scratch slots, counted by slot.
+    scratch: ScratchReport,
+    /// Clean-up that failed after the new generation became current; the
+    /// snapshot is written and correct.
+    cleanup_errors: Vec<String>,
+}
+
+impl SnapshotView {
+    fn new(dir: PathBuf, report: ExportReport) -> Self {
+        let ExportReport {
+            outcome,
+            kept,
+            new,
+            carried_over,
+            dropped,
+            left_out,
+            journals,
+            incomplete,
+            top,
+            dropped_addrs,
+            scratch,
+            cleanup_errors,
+        } = report;
+        Self {
+            dir,
+            complete: incomplete.is_empty(),
+            outcome,
+            kept,
+            new,
+            carried_over,
+            dropped,
+            left_out,
+            journals,
+            incomplete,
+            top,
+            dropped_addrs,
+            scratch,
+            cleanup_errors,
+        }
+    }
 }
 
 /// One remote cache in `heph tool cache measure-latency --json`, fastest
@@ -186,38 +259,26 @@ fn snapshot(args: &SnapshotArgs, global: &GlobalOptions) -> anyhow::Result<()> {
     })
     .and_then(|r| r);
     match res {
+        // A `--jq` filter that fails is 2 (130 cancelled) through
+        // `output::exit_code`, which `main` reads before a `CodegenExit`.
+        Ok((dir, report)) if args.out.enabled() => args
+            .out
+            .record(&SnapshotView::new(dir, report), &output::never_cancelled),
         Ok((dir, report)) => {
             let mut out = std::io::stdout().lock();
-            if args.json {
-                writeln!(out, "{}", json_report(&dir, &report)?)
-                    .context("writing the snapshot report")?;
-            } else {
-                for line in human_report(&dir, &report) {
-                    writeln!(out, "{line}").context("writing the snapshot report")?;
-                }
+            for line in human_report(&dir, &report) {
+                writeln!(out, "{line}").context("writing the snapshot report")?;
             }
             Ok(())
         }
-        Err(e) => {
-            let (code, reason) = exit_code(&e);
-            if args.json {
-                let doc = serde_json::json!({
-                    "schema": SNAPSHOT_JSON_SCHEMA,
-                    "error": format!("{e:#}"),
-                    "reason": reason,
-                });
-                // The failure is what the command reports; a closed stdout
-                // must not replace it.
-                if let Err(w) = writeln!(std::io::stdout().lock(), "{doc}") {
-                    tracing::debug!(error = %w, "writing the snapshot error document");
-                }
-            }
-            Err(CodegenExit {
-                code,
-                error: Some(e),
-            }
-            .into())
+        // Nothing on stdout, `--json` or not: the message goes to stderr and
+        // the exit code says which failure it was (`docs/JSON_OUTPUT.md`:
+        // never a JSON error object).
+        Err(e) => Err(CodegenExit {
+            code: exit_code(&e),
+            error: Some(e),
         }
+        .into()),
     }
 }
 
@@ -257,47 +318,24 @@ async fn take_snapshot(
     Ok((dir, report))
 }
 
-/// The exit code (D15) and the `--json` `reason` for a failed snapshot: the
-/// first typed error in the chain decides; anything else is an error (2).
-fn exit_code(e: &anyhow::Error) -> (u8, &'static str) {
+/// The exit code (D15) of a failed snapshot: the first typed error in the
+/// chain decides; anything else is an error (2).
+fn exit_code(e: &anyhow::Error) -> u8 {
     for cause in e.chain() {
         if cause.is::<NotConfigured>() {
-            return (1, "not_configured");
+            return 1;
         }
         if cause.is::<RecorderAliveError>() {
-            return (3, "recorder_alive");
+            return 3;
         }
         if cause.is::<NewerJournalError>() {
-            return (4, "newer_journal");
+            return 4;
         }
         if cause.is::<SnapshotCancelled>() {
-            return (130, "cancelled");
+            return 130;
         }
     }
-    (2, "error")
-}
-
-/// The `--json` document: `schema`, `dir`, `complete`, then the export's
-/// report, field for field. Integer bytes, the top revisions by bytes, the
-/// dropped addrs sorted; no timestamps.
-#[derive(Serialize)]
-struct JsonReport<'a> {
-    schema: u32,
-    dir: &'a Path,
-    /// False when the run was incomplete (`incomplete` says why).
-    complete: bool,
-    #[serde(flatten)]
-    report: &'a ExportReport,
-}
-
-fn json_report(dir: &Path, report: &ExportReport) -> anyhow::Result<String> {
-    serde_json::to_string(&JsonReport {
-        schema: SNAPSHOT_JSON_SCHEMA,
-        dir,
-        complete: report.incomplete.is_empty(),
-        report,
-    })
-    .map_err(Into::into)
+    2
 }
 
 /// The human report, one fact per line.
@@ -420,7 +458,7 @@ mod tests {
             (SnapshotCancelled.into(), 130),
         ];
         for (e, want) in cases {
-            assert_eq!(exit_code(&e).0, want, "{e:#}");
+            assert_eq!(exit_code(&e), want, "{e:#}");
         }
     }
 
@@ -457,6 +495,11 @@ mod tests {
             },
             cleanup_errors: Vec::new(),
         };
+        // The `--json` record carries the same report: every key a field,
+        // and `complete` false.
+        let view = SnapshotView::new(PathBuf::from("/snap"), report.clone());
+        assert!(!view.complete);
+        output::check_keys(&view).expect("every key is a field");
         let lines = human_report(Path::new("/snap"), &report);
         let tail: Vec<&str> = lines
             .iter()

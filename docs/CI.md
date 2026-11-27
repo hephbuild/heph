@@ -432,28 +432,33 @@ ones included, to check it against its manifest (a raw blob's length is
 checked). That is the snapshot's CPU cost: it grows with the whole working
 set, not with what the job built.
 
-`--json` prints one document: `schema` (an integer), `dir`, `complete`, then
-the report with integer bytes, the top revisions by bytes and the dropped
-addresses, in a stable order with no timestamps. A failure prints
-`{"schema": 1, "error": "…", "reason": "…"}`. Adding a field keeps `schema`;
-removing or retyping one bumps it. Ignore fields you don't know.
+`--json` prints one object: `dir`, `complete`, then the report with integer
+bytes, the top revisions by bytes and the dropped addresses, keys in a stable
+order with no timestamps. It follows heph's rules for every command
+(`docs/JSON_OUTPUT.md`): pretty on a terminal, one line when piped;
+`--fields` picks keys (`--fields help` lists them) and `--jq` filters the
+object. A shipped key is never renamed or removed and never changes type; a
+change that would is a new key. Ignore keys you don't know.
 
 - `complete` is the machine signal for an incomplete run; each
   `incomplete[].reason` is text for a human and may change.
-- `error` is text for a human and may change. Branch on `reason`, whose set
-  can grow: treat a value you don't know like `error`.
+- `outcome.kind` is `written` (with `outcome.generation`) or `unchanged`;
+  treat a value you don't know as opaque.
 - The `left_out` keys (`trimmed`, `missing_blob`, `corrupt`, `key_mismatch`,
   `case_collision`, `unsupported`, `unknown_manifest`) are permanent: one may
   be added, none is renamed or reused.
+- A failure prints nothing on stdout and its message on stderr, with or
+  without `--json`: branch on the exit code below, which is the same either
+  way.
 
-| Exit | `reason` | Means |
-| --- | --- | --- |
-| 0 | | Written or unchanged, including an incomplete run and revisions left out (both in the report) |
-| 1 | `not_configured` | No snapshot dir is configured |
-| 2 | `error` | An I/O error, a full disk, an unwritable dir, or a usage error |
-| 3 | `recorder_alive` | A heph process is still recording after 10s; the message names it |
-| 4 | `newer_journal` | A journal from a newer heph; the message names the file, and deleting it is safe |
-| 130 | `cancelled` | Interrupted |
+| Exit | Means |
+| --- | --- |
+| 0 | Written or unchanged, including an incomplete run and revisions left out (both in the report) |
+| 1 | No snapshot dir is configured |
+| 2 | An I/O error, a full disk, an unwritable dir, or a usage error; also a `--jq` filter that failed while it ran |
+| 3 | A heph process is still recording after 10s; the message names it |
+| 4 | A journal from a newer heph; the message names the file, and deleting it is safe |
+| 130 | Interrupted |
 
 ## Troubleshooting
 

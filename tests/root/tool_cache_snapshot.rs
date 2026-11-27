@@ -59,12 +59,29 @@ impl Ws {
         cmd
     }
 
+    /// `snapshot --json` that succeeded: its exit code (0), its document and
+    /// its output.
     fn snapshot(&self, dir: Option<&Path>) -> (i32, serde_json::Value, Output) {
         let out = self.heph(dir, &["tool", "cache", "snapshot", "--json"]);
         let code = out.status.code().expect("an exit code");
         let doc = serde_json::from_slice(&out.stdout)
             .unwrap_or_else(|e| panic!("stdout is one JSON document ({e}): {}", describe(&out)));
         (code, doc, out)
+    }
+
+    /// `snapshot --json` that failed: its exit code and its stderr. A failure
+    /// prints nothing on stdout, `--json` or not (`docs/JSON_OUTPUT.md`: never
+    /// a JSON error object).
+    fn snapshot_fails(&self, dir: Option<&Path>) -> (i32, String) {
+        let out = self.heph(dir, &["tool", "cache", "snapshot", "--json"]);
+        let code = out.status.code().expect("an exit code");
+        assert_ne!(code, 0, "{}", describe(&out));
+        assert!(
+            out.stdout.is_empty(),
+            "nothing on stdout: {}",
+            describe(&out)
+        );
+        (code, String::from_utf8_lossy(&out.stderr).into_owned())
     }
 
     /// One `heph run` per address, each recording its own journal.
@@ -110,18 +127,19 @@ fn json_report_and_exit_codes() {
     let snap = ws.dir.path().join("snap");
 
     // 1: not configured.
-    let (code, doc, out) = ws.snapshot(None);
-    assert_eq!(code, 1, "{}", describe(&out));
-    assert_eq!(doc["schema"], 1, "{doc}");
-    assert_eq!(doc["reason"], "not_configured", "{doc}");
+    let (code, stderr) = ws.snapshot_fails(None);
+    assert_eq!(code, 1, "{stderr}");
+    assert!(
+        stderr.contains("no cache snapshot dir is configured"),
+        "{stderr}"
+    );
 
     // 0, written: the journals' revisions, in a new generation.
     ws.build(&snap, &["//:a", "//:b"]);
     assert_eq!(ws.journals().len(), 2);
     let (code, doc, out) = ws.snapshot(Some(&snap));
     assert_eq!(code, 0, "{}", describe(&out));
-    assert_eq!(doc["schema"], 1, "{doc}");
-    assert!(doc["schema"].is_u64(), "{doc}");
+    assert!(doc.get("schema").is_none(), "no envelope: {doc}");
     assert_eq!(doc["dir"], snap.to_str().expect("utf-8 dir"), "{doc}");
     assert_eq!(doc["outcome"]["kind"], "written", "{doc}");
     assert_eq!(doc["complete"], true, "{doc}");
@@ -148,7 +166,6 @@ fn json_report_and_exit_codes() {
     // are no others (no timestamps).
     let stdout = String::from_utf8_lossy(&out.stdout);
     let order = [
-        "schema",
         "dir",
         "complete",
         "outcome",
@@ -196,6 +213,26 @@ fn json_report_and_exit_codes() {
     let (code, doc, out) = ws.snapshot(Some(&snap));
     assert_eq!(code, 0, "{}", describe(&out));
     assert_eq!(doc["outcome"]["kind"], "unchanged", "{doc}");
+
+    // `--fields` and `--jq`, as on every command: the selected keys alone,
+    // and the filter's result.
+    let out = ws.heph(
+        Some(&snap),
+        &["tool", "cache", "snapshot", "--fields", "complete,outcome"],
+    );
+    assert!(out.status.success(), "{}", describe(&out));
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one object");
+    assert_eq!(
+        doc,
+        serde_json::json!({"complete": true, "outcome": {"kind": "unchanged"}}),
+        "{doc}"
+    );
+    let out = ws.heph(
+        Some(&snap),
+        &["tool", "cache", "snapshot", "--jq", ".outcome.kind"],
+    );
+    assert!(out.status.success(), "{}", describe(&out));
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "unchanged");
 
     // 0, incomplete: a journal without its trailer is flagged, not refused,
     // and what it didn't touch (`a`) is carried over.
@@ -246,10 +283,8 @@ fn json_report_and_exit_codes() {
     let newer = ws.dir.path().join(".heph/cache/working-set/1-newer.log");
     std::fs::write(&newer, "{\"magic\":\"heph-working-set\",\"version\":999}\n")
         .expect("write newer journal");
-    let (code, doc, out) = ws.snapshot(Some(&snap));
-    assert_eq!(code, 4, "{}", describe(&out));
-    assert_eq!(doc["reason"], "newer_journal", "{doc}");
-    let message = doc["error"].as_str().expect("error is a string");
+    let (code, message) = ws.snapshot_fails(Some(&snap));
+    assert_eq!(code, 4, "{message}");
     assert!(message.contains("1-newer.log"), "{message}");
     assert!(message.contains("Deleting it is safe"), "{message}");
     assert!(newer.exists(), "a refused journal is left in place");
@@ -259,9 +294,8 @@ fn json_report_and_exit_codes() {
     let blocked = ws.dir.path().join("blocked");
     std::fs::write(&blocked, "not a dir").expect("write blocker");
     ws.build(&blocked, &["//:b"]);
-    let (code, doc, out) = ws.snapshot(Some(&blocked));
-    assert_eq!(code, 2, "{}", describe(&out));
-    assert_eq!(doc["reason"], "error", "{doc}");
+    let (code, stderr) = ws.snapshot_fails(Some(&blocked));
+    assert_eq!(code, 2, "{stderr}");
     assert_eq!(ws.journals().len(), 1, "a failed export consumes nothing");
 
     // 2: a usage error.
@@ -318,9 +352,11 @@ fn ctrl_c_while_waiting_exits_130() {
 
     let out = child.wait_with_output().expect("wait for heph");
     assert_eq!(out.status.code(), Some(130), "{}", describe(&out));
-    let doc: serde_json::Value = serde_json::from_slice(&out.stdout)
-        .unwrap_or_else(|e| panic!("stdout is one JSON document ({e}): {}", describe(&out)));
-    assert_eq!(doc["reason"], "cancelled", "{doc}");
+    assert!(
+        out.stdout.is_empty(),
+        "nothing on stdout: {}",
+        describe(&out)
+    );
     assert!(journal.exists(), "a cancelled snapshot consumes nothing");
     drop(recorder);
 }

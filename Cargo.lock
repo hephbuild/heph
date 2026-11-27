@@ -1885,6 +1885,7 @@ dependencies = [
  "lock",
  "model",
  "object_store",
+ "output-derive",
  "parking_lot 0.13.0",
  "plugin",
  "plugin-abi",

@@ -31,6 +31,7 @@ hplugin-query = { package = "plugin-query", path = "../plugin-query" }
 hplugin-stabby = { package = "plugin-stabby", path = "../plugin-stabby", features = ["host"] }
 hplugin-abi = { package = "plugin-abi", path = "../plugin-abi", features = ["convert"] }
 htelemetry = { package = "telemetry", path = "../telemetry" }
+output-derive = { path = "../output-derive" }
 anyhow = "1.0.104"
 async-recursion = "1"
 async-stream = "0.3"

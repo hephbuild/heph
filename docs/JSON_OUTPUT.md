@@ -208,14 +208,14 @@ meant to branch on, which each command's doc names.
 | Shape | Commands |
 |---|---|
 | list | `query`; `run` (below); `inspect packages`, `labels`, `hashout`, `deps`, `revdeps`, `path`, `states`, `functions`; `auth status`; `session list`; `tool plugins`, `tool cache measure-latency`, `tool scratch ls`, `push`, `pull` |
-| record | `version`, `validate`; `inspect hashin`, `outputs`, `failure` (`null` when none); `auth explain`, `auth logout`; `session show`, `session inflight`; `tool gc`, `clean`, `build-fmt`, `resolve-plugins`, `telemetry status`, `coreutils list`, `coreutils which`, `scratch head`, `path`, `rm`; every `tool codegen` command; `tool build-lsp --explain` |
+| record | `version`, `validate`; `inspect hashin`, `outputs`, `failure` (`null` when none); `auth explain`, `auth logout`; `session show`, `session inflight`; `tool gc`, `clean`, `build-fmt`, `resolve-plugins`, `telemetry status`, `cache snapshot`, `coreutils list`, `coreutils which`, `scratch head`, `path`, `rm`; every `tool codegen` command; `tool build-lsp --explain` |
 | always JSON, unstable | `inspect spec`, `inspect def` |
 | always JSON | `tool config-schema` |
 
 The fields of each are in its `--help` and `--fields help`. Some docs say more
 about one command's document: `docs/CODEGEN.md`, `docs/SESSIONS.md`,
 `docs/CREDENTIALS.md`, `docs/FAILURE_OUTPUTS.md`, `docs/TELEMETRY.md`,
-`docs/LSP.md`.
+`docs/LSP.md`, `docs/CI.md`.
 
 ### `heph run`
 

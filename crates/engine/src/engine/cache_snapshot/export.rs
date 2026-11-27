@@ -156,7 +156,10 @@ async fn lock_dir(
 // ---------------------------------------------------------------------------
 
 /// What an export did to `<dir>`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+///
+/// This type and the others of the report derive `Shape`: `heph tool cache
+/// snapshot --json` prints them, and its field snapshot pins their keys.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, output_derive::Shape)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ExportOutcome {
     /// A new generation is current.
@@ -166,7 +169,7 @@ pub enum ExportOutcome {
 }
 
 /// A count of revisions and their bytes.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, output_derive::Shape)]
 pub struct Tally {
     pub count: u64,
     pub bytes: u64,
@@ -227,7 +230,7 @@ impl std::fmt::Display for LeftOut {
 }
 
 /// One revision of the new generation, by size.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, output_derive::Shape)]
 pub struct RevisionBytes {
     pub addr: String,
     pub hashin: String,
@@ -235,7 +238,7 @@ pub struct RevisionBytes {
 }
 
 /// A journal that made the run incomplete, and why.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, output_derive::Shape)]
 pub struct IncompleteJournal {
     pub journal: PathBuf,
     pub reason: String,
@@ -276,7 +279,7 @@ pub struct ExportReport {
 }
 
 /// What an export did with scratch slots. Bytes are the archives'.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, output_derive::Shape)]
 pub struct ScratchReport {
     /// Slots the job used, published as a new generation of its scope.
     pub new: Tally,
