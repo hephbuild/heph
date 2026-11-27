@@ -323,8 +323,6 @@ async fn deep_broken_build_blames_the_file() -> anyhow::Result<()> {
 /// U2 / D1.d: two requested targets of one broken `d/BUILD` are one
 /// failure, the file's.
 #[tokio::test]
-#[ignore = "stage A gap: a selection's probe of the broken package fails in discovery \
-            (batch.errors), before result_addr, so nothing is recorded against d/BUILD"]
 async fn broken_build_one_box_for_two_requested_targets() -> anyhow::Result<()> {
     let ws = build_ws(&[(
         "d",
@@ -340,6 +338,8 @@ async fn broken_build_one_box_for_two_requested_targets() -> anyhow::Result<()> 
     .await;
     let err = r.err.as_ref().expect("the selection must fail");
     assert_eq!(r.culprits(), ["d/BUILD"], "{}\nerr: {err:#}", r.describe());
+    // Entered through the first requested target the file holds.
+    assert_eq!(r.failures[0].addr.format(), "//d:t1", "{}", r.describe());
     Ok(())
 }
 
@@ -442,8 +442,6 @@ async fn missing_group_member_blames_group() -> anyhow::Result<()> {
 /// A dep in a target's `transitive` is that target's declaration: the
 /// consumer it is folded into did not name it.
 #[tokio::test]
-#[ignore = "stage A gap: input_defs blames the consumer //b:x; the merged input's origin \
-            `_transitive_<hash>_<i>_dep_…` does not carry the declaring //c:y"]
 async fn missing_transitive_dep_blames_declarer() -> anyhow::Result<()> {
     let ws = chain_to_c(
         r#"transitive = {"deps": ["//d:missing"]}"#,
@@ -452,6 +450,9 @@ async fn missing_transitive_dep_blames_declarer() -> anyhow::Result<()> {
     let r = run(&ws.engine, "//a:root").await;
     let m = missing_dep(r.assert_blames("//c:y"));
     assert_eq!(m.dep.format(), "//d:missing");
+    assert_eq!(m.declarer.format(), "//c:y");
+    assert_eq!(m.origin_id, "transitive.deps");
+    assert_not_blamed(&r, &["//a:root", "//b:x"]);
     Ok(())
 }
 
