@@ -46,6 +46,99 @@ pub fn left_behind_rows(addr: &str, left: &LeftBehindData) -> String {
     out
 }
 
+/// What a failure box prints of a log tail (error-reporting D6.1, D6.1b),
+/// decided here once for the three boxes (the report after the TUI, the line
+/// backend's live block, the CI end-of-run box), so they cannot word it, or
+/// count it, differently.
+#[derive(Debug, PartialEq, Eq)]
+pub struct TailRows<'a> {
+    /// The row printed before the tail's lines, or in their place: the
+    /// pointer of a tail that streamed to a terminal, `(no output)`, or
+    /// `… N earlier lines (heph log //t)` when the log has lines the tail
+    /// does not show.
+    pub note: Option<String>,
+    /// The tail's lines to show, a suffix of the tail as given (neutralize
+    /// it with [`escape_log_tail`](crate::tui::text::escape_log_tail) before
+    /// printing). Empty when `note` stands in for the tail.
+    pub shown: &'a str,
+    /// The 1-based number, in the whole log, of `shown`'s first line.
+    pub first_line: usize,
+}
+
+/// The number of lines in the log whose tail is `text`, starting at its line
+/// `start_line`: the lines before the tail plus the tail's own. A log carries
+/// no total; this is the one place it is worked out.
+pub fn log_line_count(text: &str, start_line: usize) -> usize {
+    start_line.saturating_sub(1) + text.lines().count()
+}
+
+/// What a box shows of the tail `text` of `addr`'s log, whose first line is
+/// line `start_line` of the log, showing at most `max_lines` of it.
+///
+/// The log has N lines: those before the tail (`start_line - 1`) plus the
+/// tail's own (no total is carried; the tail's start says the rest).
+/// - N = 0: `(no output)`, streamed or not.
+/// - `streamed` (its output reached a terminal while it ran, so the user saw
+///   it there): the pointer `(output not shown here: N lines · heph log //t)`
+///   and no line of the tail (U5).
+/// - Otherwise the tail's last `max_lines` lines, after an
+///   `… N earlier lines (heph log //t)` row when the log has lines before
+///   them.
+pub fn tail_rows<'a>(
+    addr: &str,
+    text: &'a str,
+    start_line: usize,
+    streamed: bool,
+    max_lines: usize,
+) -> TailRows<'a> {
+    let first = start_line.max(1);
+    let before = first - 1;
+    let in_tail = text.lines().count();
+    let total = log_line_count(text, start_line);
+    let log = || format!("heph log {}", shell_quote(addr));
+    // `1 line`, `1,500 lines`, `3 earlier lines`.
+    let lines = |n: usize, noun: &str| {
+        format!(
+            "{} {noun}{}",
+            hcore::units::thousands(n),
+            if n == 1 { "" } else { "s" }
+        )
+    };
+    if total == 0 {
+        return TailRows {
+            note: Some("(no output)".to_owned()),
+            shown: "",
+            first_line: first,
+        };
+    }
+    if streamed {
+        return TailRows {
+            note: Some(format!(
+                "(output not shown here: {} · {})",
+                lines(total, "line"),
+                log()
+            )),
+            shown: "",
+            first_line: first,
+        };
+    }
+    let skip = in_tail.saturating_sub(max_lines);
+    let shown = match skip.checked_sub(1) {
+        None => text,
+        Some(k) => text
+            .match_indices('\n')
+            .nth(k)
+            .and_then(|(i, _)| text.get(i + 1..))
+            .unwrap_or(""),
+    };
+    let earlier = before + skip;
+    TailRows {
+        note: (earlier > 0).then(|| format!("… {} ({})", lines(earlier, "earlier line"), log())),
+        shown,
+        first_line: first + skip,
+    }
+}
+
 /// A failed `in_place` run's write-back (D20): the files it changed and how
 /// to undo that, or why it changed nothing. A write-back that matched the
 /// tree already says nothing.
@@ -122,6 +215,63 @@ mod tests {
              \x20 outputs: /h/failures/p/out\n\
              \x20 fixes not written: --frozen checks the tree, it never writes it\n\
              \x20 log: heph log //p:x\n"
+        );
+    }
+
+    /// D6.1's tail rows, each case: the pointer of a streamed tail, with N
+    /// counted from the tail's start and its own lines; `(no output)` at
+    /// N = 0, streamed or not; the earlier-lines row for a tail that starts
+    /// past line 1 and for lines `max_lines` leaves out; none for a whole
+    /// log; the address quoted as a shell word.
+    #[test]
+    fn tail_rows_pointer_no_output_and_earlier_lines() {
+        let rows = |text, start, streamed, max| tail_rows("//p:t", text, start, streamed, max);
+
+        let r = rows("a\nb\n", 999, true, 1000);
+        assert_eq!(
+            r.note.as_deref(),
+            Some("(output not shown here: 1,000 lines · heph log //p:t)")
+        );
+        assert_eq!(r.shown, "", "a streamed tail shows no line of it");
+        assert_eq!(
+            rows("a", 1, true, 1000).note.as_deref(),
+            Some("(output not shown here: 1 line · heph log //p:t)")
+        );
+
+        for streamed in [false, true] {
+            let r = rows("", 1, streamed, 1000);
+            assert_eq!(
+                r.note.as_deref(),
+                Some("(no output)"),
+                "streamed {streamed}"
+            );
+            assert_eq!(r.shown, "");
+        }
+
+        let r = rows("x\ny\n", 41, false, 1000);
+        assert_eq!(
+            r.note.as_deref(),
+            Some("… 40 earlier lines (heph log //p:t)")
+        );
+        assert_eq!((r.shown, r.first_line), ("x\ny\n", 41));
+
+        let r = rows("a\nb\nc\n", 2, false, 1);
+        assert_eq!(
+            r.note.as_deref(),
+            Some("… 3 earlier lines (heph log //p:t)")
+        );
+        assert_eq!((r.shown, r.first_line), ("c\n", 4));
+
+        let r = rows("a\nb", 2, false, 1000);
+        assert_eq!(r.note.as_deref(), Some("… 1 earlier line (heph log //p:t)"));
+
+        let r = rows("a\nb\n", 1, false, 1000);
+        assert_eq!(r.note, None, "the whole log is shown");
+        assert_eq!((r.shown, r.first_line), ("a\nb\n", 1));
+
+        assert_eq!(
+            tail_rows("//p:a b", "a", 1, true, 1000).note.as_deref(),
+            Some("(output not shown here: 1 line · heph log '//p:a b')")
         );
     }
 
