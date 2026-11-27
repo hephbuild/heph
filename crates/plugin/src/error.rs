@@ -293,7 +293,10 @@ impl fmt::Display for Culprit {
 /// and the memoizer's shared wrapper, never into a struct's field, so a
 /// `source` field would hide a `CancelledError` or `CycleError` beneath it.
 /// The failure classifier blames the innermost such frame's `input` (or a
-/// deeper [`StageFrame`]'s address), never the declarer.
+/// deeper `get spec:`/`get_def:` [`StageFrame`]'s address), never the
+/// declarer.
+///
+/// [`StageFrame`]: crate::diagnostic::StageFrame
 #[derive(Debug, Clone)]
 pub struct InputDefFailed {
     pub input: Addr,
@@ -361,18 +364,18 @@ impl MissingDep {
             .is_some_and(|nf| nf.addr == *dep)
     }
 
-    /// `e` with a [`MissingDep`] when it is a not-found of `dep`, else with
-    /// what `otherwise` gives (`None` leaves `e` as it is).
-    pub fn wrap_or<C>(
+    /// `e` with a [`MissingDep`] when it is a not-found of `dep`, else `e` as
+    /// `otherwise` wraps it (a context, or a [`StageFrame`] through
+    /// [`with_stage`](crate::diagnostic::with_stage)).
+    ///
+    /// [`StageFrame`]: crate::diagnostic::StageFrame
+    pub fn wrap_or(
         e: anyhow::Error,
         dep: &Addr,
         declarer: &Addr,
         origin_id: impl FnOnce() -> String,
-        otherwise: impl FnOnce() -> Option<C>,
-    ) -> anyhow::Error
-    where
-        C: fmt::Display + fmt::Debug + Send + Sync + 'static,
-    {
+        otherwise: impl FnOnce(anyhow::Error) -> anyhow::Error,
+    ) -> anyhow::Error {
         if Self::names(&e, dep) {
             return e.context(Self {
                 dep: dep.clone(),
@@ -380,63 +383,31 @@ impl MissingDep {
                 origin_id: origin_id(),
             });
         }
-        match otherwise() {
-            Some(c) => e.context(c),
-            None => e,
-        }
+        otherwise(e)
     }
 }
 
-/// Context: the evaluation of this file failed. `file` is workspace-relative;
-/// `shown` is what the message prints, unchanged from the untyped context it
-/// replaced (`evaluating {shown}`).
+/// Context: the evaluation of this file failed. `file` is workspace-relative.
 ///
-/// A file that loads a broken file carries a plain string context instead,
-/// so the one `FileEvalFailed` on a chain is the innermost: the file that is
-/// actually broken.
+/// Data riding the chain, not text: its `Display` is empty, so the message
+/// reads as the file's own [`Diagnostic`](crate::diagnostic::Diagnostic)
+/// does (which already names the file, workspace-relative).
+///
+/// A file that loads a broken file adds none of its own, so the one
+/// `FileEvalFailed` on a chain is the innermost: the file that is actually
+/// broken.
 #[derive(Debug, Clone)]
 pub struct FileEvalFailed {
     pub file: std::sync::Arc<str>,
-    pub shown: String,
 }
 
 impl fmt::Display for FileEvalFailed {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "evaluating {}", self.shown)
+    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Ok(())
     }
 }
 
 impl std::error::Error for FileEvalFailed {}
-
-/// Which stage of a target a [`StageFrame`] was resolving.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Stage {
-    Spec,
-    Def,
-}
-
-/// Context: the engine was resolving `addr`'s own spec or def when the error
-/// below was raised, so the error is `addr`'s.
-///
-/// Minimal on purpose: only the frames the failure classifier needs today
-/// (`collect_transitive_deps`' spec lookup). The typed-diagnostics work
-/// extends the stage set and replaces the remaining string frames.
-#[derive(Debug, Clone)]
-pub struct StageFrame {
-    pub stage: Stage,
-    pub addr: Addr,
-}
-
-impl fmt::Display for StageFrame {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.stage {
-            Stage::Spec => write!(f, "get spec: {}", self.addr.format()),
-            Stage::Def => write!(f, "get_def: {}", self.addr.format()),
-        }
-    }
-}
-
-impl std::error::Error for StageFrame {}
 
 /// A target's own process exited non-zero. Carries the exit status only: the
 /// process's log rides the same error as a [`FailureArtifacts`] context (see

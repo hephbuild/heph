@@ -53,6 +53,9 @@ pub use hcore::diagnostic::{Diagnostic, Hint, HintKind, SourceLoc, Stage, escape
 /// string context it replaces had.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Boundary {
+    /// `get spec: //p:t`: looking up a runtime input's spec while collecting
+    /// its consumer's transitive deps. The error is the input's own.
+    GetSpec,
     /// `get_def: //p:t`: resolving a target's def (its spec, then the driver's
     /// parse).
     GetDef,
@@ -70,6 +73,7 @@ impl Boundary {
     /// The stage a failure under this boundary belongs to.
     pub fn stage(self) -> Stage {
         match self {
+            Self::GetSpec => Stage::Spec,
             Self::GetDef => Stage::Parse,
             Self::Link | Self::Meta => Stage::Link,
             Self::Execute | Self::Run => Stage::Run,
@@ -96,6 +100,7 @@ impl StageFrame {
 impl fmt::Display for StageFrame {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.boundary {
+            Boundary::GetSpec => write!(f, "get spec: {}", self.addr.format()),
             Boundary::GetDef => write!(f, "get_def: {}", self.addr.format()),
             Boundary::Link => f.write_str("link"),
             Boundary::Meta => f.write_str("meta"),
@@ -233,6 +238,24 @@ mod tests {
             format!("{a:#}"),
             "execute //a:t: link: get_def: //b:t: collecting: get_def: //c:t: boom"
         );
+    }
+
+    /// A transitive dep's spec lookup keeps its `get spec:` text and is a
+    /// spec-stage failure of the dep, not of its consumer.
+    #[test]
+    fn get_spec_frame_is_the_deps_spec_stage() {
+        let e = with_stage(
+            with_stage(anyhow::anyhow!("boom"), Boundary::GetSpec, &addr("//d:t")),
+            Boundary::Link,
+            &addr("//a:t"),
+        );
+        let frame = innermost_stage_frame(&e).expect("a stage frame");
+        assert_eq!(
+            (frame.boundary, frame.addr.clone(), frame.stage()),
+            (Boundary::GetSpec, addr("//d:t"), Stage::Spec)
+        );
+        assert_eq!(format!("{e:#}"), "link: get spec: //d:t: boom");
+        assert_eq!(cause_frames(&e), ["boom"]);
     }
 
     /// F2: no engine frame in what a renderer prints as the cause.

@@ -2092,11 +2092,9 @@ impl BuildFileLoader {
                 {
                     return e;
                 }
-                let shown = file_path.display().to_string();
                 let rel = file_path.strip_prefix(&self.root).unwrap_or(file_path);
                 e.context(hplugin::error::FileEvalFailed {
                     file: Arc::from(rel.to_string_lossy().as_ref()),
-                    shown,
                 })
             })?);
             self.file_cache
