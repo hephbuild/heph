@@ -60,9 +60,13 @@ Query language (-e / --expr):
 
   Examples:
     heph run -e '//some/... && label(foo)'
-    heph run -e '//app/... && !label(slow)'
-    heph run -e '//... && !//vendor/...'
+    heph run -e '//app/... && !label(slow)' --allow-all
+    heph run -e '//... && !//vendor/...' --allow-all
     heph run -e '(//a/... || //b/...) && tree_output(gen)'
+
+  `run` refuses an expression that takes whole packages (bounded only by
+  package paths or a negation, like //pkg or //pkg/...) unless --allow-all
+  is passed; `query` never asks for it.
 ";
 
 #[derive(Args, Clone)]
@@ -87,6 +91,15 @@ pub struct RunArgs {
         conflicts_with = "arg1"
     )]
     pub expr: Option<String>,
+    /// Run a selection that takes whole packages, e.g. -e '//some/pkg' --allow-all
+    ///
+    /// A `-e` expression bounded only by package paths (`//pkg`, `//pkg/...`)
+    /// or by a negation (`!label(slow)`) runs every target in those packages,
+    /// whatever they are. Without this flag `run` refuses it before anything
+    /// builds. Narrowing it with a label, a driver, a codegen tree or an address
+    /// (`-e '//pkg/... && label(test)'`) needs no flag.
+    #[arg(long = "allow-all")]
+    pub allow_all: bool,
     /// Force execution, ignoring any cached result
     ///
     /// Applies to every target the selector matches, wherever the run first
@@ -296,6 +309,33 @@ const RAW_WITH_SHELL: &str = "`--raw` and `--shell` cannot be combined: `--raw` 
 pub fn refuse_raw_with_shell(raw: bool, shell: bool) -> anyhow::Result<()> {
     anyhow::ensure!(!(raw && shell), RAW_WITH_SHELL);
     Ok(())
+}
+
+/// A selection that takes whole packages ([`Matcher::selects_whole_packages`])
+/// without `--allow-all`, refused before anything builds: `heph run -e
+/// //some/pkg` runs every target there, which is rarely what was meant.
+pub fn refuse_whole_packages(
+    m: &Matcher,
+    expr: Option<&str>,
+    allow_all: bool,
+) -> anyhow::Result<()> {
+    if allow_all || !m.selects_whole_packages() {
+        return Ok(());
+    }
+    // Only `-e` reaches here: the positional forms are an address, a label
+    // within packages, or (`all <pkg>`) refused already.
+    let formatted;
+    let shown = match expr {
+        Some(expr) => expr,
+        None => {
+            formatted = crate::htquery::format(m);
+            &formatted
+        }
+    };
+    anyhow::bail!(
+        "-e '{shown}' runs every target of whole packages; pass --allow-all to run them all, \
+         or narrow it to the targets you want, e.g. -e '({shown}) && label(test)'"
+    )
 }
 
 /// The mode of an entrypoint run, in the order the docs state it. `Err` is a
@@ -1441,6 +1481,7 @@ async fn execute_async(
         (ShellFlag::Target(addr), None, None) => Matcher::Addr(addr.clone()),
         _ => resolve_matcher(&args.expr, &args.arg1, &args.arg2, &base_pkg, false)?,
     };
+    refuse_whole_packages(&m, args.expr.as_deref(), args.allow_all)?;
     let shell = shell_for_selection(shell, &m);
     let (engine, shutdown) = bootstrap::new_engine(&global, session)?;
     let raw = args.raw;
@@ -2198,5 +2239,64 @@ mod tests {
             format!("{err:#}").contains("parse --shell=not an address"),
             "{err:#}",
         );
+    }
+
+    /// The selection `execute` checks, from the command line as typed: a
+    /// package-wide `-e` is refused with a pointer at `--allow-all` and a
+    /// narrowed form, and runs with `--allow-all`; addresses, labels and the
+    /// positional `<label> <pkg>` never need it.
+    #[test]
+    fn whole_packages_need_allow_all() {
+        let check = |argv: &[&str]| {
+            let args = parse(argv);
+            let m = resolve_matcher(&args.expr, &args.arg1, &args.arg2, &PkgBuf::from(""), false)
+                .expect("resolves");
+            refuse_whole_packages(&m, args.expr.as_deref(), args.allow_all)
+        };
+        for argv in [
+            &["-e", "//some/pkg"][..],
+            &["-e", "//some/..."],
+            &["-e", "//... && !//vendor/..."],
+            &["-e", "!label(slow)"],
+        ] {
+            let err = check(argv).expect_err("refused without --allow-all");
+            let msg = format!("{err:#}");
+            assert!(msg.contains("--allow-all"), "{argv:?}: {msg}");
+            assert!(
+                msg.contains(argv[1]),
+                "{argv:?} names the expression: {msg}"
+            );
+            let mut with_all = argv.to_vec();
+            with_all.push("--allow-all");
+            check(&with_all).unwrap_or_else(|e| panic!("{with_all:?}: {e:#}"));
+        }
+        for argv in [
+            &["//some/pkg:t"][..],
+            &["test", "//some/..."],
+            &["-e", "//some/pkg:t"],
+            &["-e", "//some/... && label(test)"],
+            &["-e", "//p:fast || //p:slow"],
+        ] {
+            check(argv).unwrap_or_else(|e| panic!("{argv:?}: {e:#}"));
+        }
+    }
+
+    /// The suggested narrowing in the refusal is itself an expression `run`
+    /// accepts, so following the message works.
+    #[test]
+    fn whole_packages_suggestion_parses_and_is_bounded() {
+        let expr = "//a/... || //b";
+        let m = crate::htquery::parse(expr, &PkgBuf::from("")).expect("parse");
+        let msg = format!(
+            "{:#}",
+            refuse_whole_packages(&m, Some(expr), false).unwrap_err()
+        );
+        let suggested = msg
+            .rsplit_once("-e '")
+            .and_then(|(_, s)| s.strip_suffix('\''))
+            .expect("a suggested -e");
+        let narrowed =
+            crate::htquery::parse(suggested, &PkgBuf::from("")).expect("suggestion parses");
+        assert!(!narrowed.selects_whole_packages(), "{suggested}");
     }
 }

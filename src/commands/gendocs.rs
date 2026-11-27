@@ -314,7 +314,7 @@ mod tests {
             let get = |id| m.try_get_one::<String>(id).ok().flatten().cloned();
             // `run` is the one selection that rejects the `all` label.
             let allow_all = path != "heph run";
-            resolve_matcher(
+            let matcher = resolve_matcher(
                 &get("expr"),
                 &get("arg1"),
                 &get("arg2"),
@@ -322,6 +322,15 @@ mod tests {
                 allow_all,
             )
             .unwrap_or_else(|e| panic!("`{example}` parses but selects nothing: {e:#}"));
+            if path == "heph run" {
+                let whole = m.try_get_one::<bool>("allow_all").ok().flatten() == Some(&true);
+                crate::commands::run::refuse_whole_packages(
+                    &matcher,
+                    get("expr").as_deref(),
+                    whole,
+                )
+                .unwrap_or_else(|e| panic!("`{example}` is refused by `run`: {e:#}"));
+            }
         }
     }
 

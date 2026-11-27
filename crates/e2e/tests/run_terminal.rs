@@ -148,6 +148,7 @@ fn raw_refused_with_shell() {
         arg1: Some("//does/not:exist".to_string()),
         arg2: None,
         expr: None,
+        allow_all: false,
         force: false,
         shell: Some(String::new()),
         cat_out: false,
