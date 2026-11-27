@@ -21,6 +21,7 @@ pub(crate) fn start(addr: &str) -> BuildEventKind {
 
 pub(crate) fn end(addr: &str, error: Option<&str>, upstream_of: Option<&str>) -> BuildEventKind {
     BuildEventKind::ResultEnd {
+        duplicate: false,
         upstream_file: None,
         path: Vec::new(),
         left_behind: None,

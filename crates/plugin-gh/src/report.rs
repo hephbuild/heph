@@ -282,6 +282,7 @@ mod tests {
             t.apply(&ev(
                 1_000,
                 BuildEventKind::ResultEnd {
+                    duplicate: false,
                     upstream_file: None,
                     path: Vec::new(),
                     left_behind: None,
@@ -304,6 +305,7 @@ mod tests {
             t.apply(&ev(
                 2_000,
                 BuildEventKind::ResultEnd {
+                    duplicate: false,
                     upstream_file: None,
                     path: Vec::new(),
                     left_behind: None,
@@ -414,6 +416,7 @@ mod tests {
         t.apply(&ev(
             0,
             BuildEventKind::ResultEnd {
+                duplicate: false,
                 upstream_file: None,
                 path: Vec::new(),
                 left_behind: None,

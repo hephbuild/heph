@@ -535,6 +535,7 @@ mod tests {
         c.observe_event(&BuildEventKind::LocalCacheMiss { addr: addr() });
         // Unrelated events must not move any counter.
         c.observe_event(&BuildEventKind::ResultEnd {
+            duplicate: false,
             upstream_file: None,
             path: Vec::new(),
             left_behind: None,

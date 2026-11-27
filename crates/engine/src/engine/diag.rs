@@ -964,10 +964,16 @@ impl hplugin::hook::Hook for DiagHook {
         let now = s.now_ms();
         match &ev.kind {
             BuildEventKind::ResultStart { addr } => s.op_start(Op::Result, addr, now),
-            BuildEventKind::ResultEnd { addr, error, .. } => {
+            BuildEventKind::ResultEnd {
+                addr,
+                error,
+                duplicate,
+                ..
+            } => {
                 s.op_end(Op::Result, addr, now);
                 s.done.fetch_add(1, Ordering::Relaxed);
-                if error.is_some() {
+                // An end that lost the culprit's claim: another counted it.
+                if error.is_some() && !duplicate {
                     s.failed.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -3089,6 +3095,7 @@ mod tests {
         }));
         assert_eq!(s.open_count(Op::Result), 1);
         h.on_event(&ev(BuildEventKind::ResultEnd {
+            duplicate: false,
             left_behind: None,
             cancelled: false,
             addr: "//a:b".into(),

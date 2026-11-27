@@ -406,6 +406,14 @@ pub enum BuildEventKind {
         /// which reported a stop as a root failure.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         cancelled: bool,
+        /// Set on a culprit's own failed end when another end (or a
+        /// [`BuildEventKind::FileFailed`]) already announced the same
+        /// culprit: this scope lost the claim. It still closes the target's
+        /// row, but a consumer neither boxes it nor counts it as a failure
+        /// (one box per culprit). Absent (false) from a host that predates
+        /// it, and on every skipped, cancelled or successful end.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        duplicate: bool,
         /// What the failed run left behind and where to read it: the rows the
         /// failure box ends with, so a consumer printing the failure as it
         /// happens prints them too. Only on a failure; `None` from a host that
@@ -788,6 +796,28 @@ pub enum BuildEventKind {
         reason: Option<String>,
         #[serde(default)]
         addr: Option<String>,
+    },
+    /// A BUILD or `.bzl` file that did not evaluate, announced once per
+    /// file however many targets reached it: the file's own failure box. A
+    /// file has no target scope, so it rides this kind rather than a
+    /// `ResultEnd` (a path never goes in an address field, where
+    /// `package_of` would misread it). Targets it took down end with
+    /// `upstream_of` = `entry` and `upstream_file` = `file`. An older
+    /// consumer reads it as [`BuildEventKind::Unknown`].
+    FileFailed {
+        /// The workspace-relative file.
+        #[serde(default)]
+        file: String,
+        /// The address that led into the file: a requested target in it, or
+        /// the innermost input that lives in it.
+        #[serde(default)]
+        entry: String,
+        /// The failure, flattened like `ResultEnd::error`.
+        #[serde(default)]
+        error: String,
+        /// The shortest path from a requested target to `entry`, inclusive.
+        #[serde(default)]
+        path: Vec<String>,
     },
     /// `heph tool codegen import` recorded `files` stamped files and skipped
     /// `skipped` whose stamp it could not read.
@@ -1194,6 +1224,7 @@ pub mod test_support {
             log_tail: None,
             timed_out: None,
             cancelled: false,
+            duplicate: false,
         };
         vec![
             // Local hit.
@@ -1351,10 +1382,12 @@ mod tests {
                 log_tail,
                 timed_out,
                 cancelled,
+                duplicate,
                 left_behind,
             } => {
                 assert_eq!(addr, "//a:x");
                 assert!(!cancelled, "an older host's stop reads as a failure");
+                assert!(!duplicate, "an older host's end is the one announcing it");
                 assert_eq!(error.as_deref(), Some("boom"));
                 assert_eq!(upstream_of, None);
                 assert_eq!(upstream_file, None);
@@ -1981,6 +2014,7 @@ mod tests {
             at_unix_ms: 7,
             kind: BuildEventKind::ResultEnd {
                 left_behind: None,
+                duplicate: false,
                 addr: "//a:x".into(),
                 error: Some("target failed".into()),
                 upstream_of: Some("//base:proto".into()),
@@ -2301,6 +2335,89 @@ mod tests {
             matches!(
                 old.as_slice(),
                 [OldKind::Unknown, OldKind::ResultStart { .. }]
+            ),
+            "{old:?}"
+        );
+    }
+
+    /// A file culprit's `FileFailed` survives the wire, and a consumer built
+    /// before it existed decodes it as `Unknown` and keeps reading; a
+    /// non-announcing `ResultEnd` reads, to that consumer, as the failed end
+    /// it was before the flag existed.
+    #[test]
+    fn older_consumer_decodes_file_culprit_as_unknown() {
+        let ev = BuildEvent {
+            at_unix_ms: 4,
+            kind: BuildEventKind::FileFailed {
+                file: "d/BUILD".into(),
+                entry: "//d:t".into(),
+                error: "evaluating d/BUILD: boom".into(),
+                path: vec!["//a:a".into(), "//d:t".into()],
+            },
+        };
+        let json = serde_json::to_string(&ev).expect("encode");
+        let back: BuildEvent = serde_json::from_str(&json).expect("decode");
+        assert!(
+            matches!(
+                &back.kind,
+                BuildEventKind::FileFailed { file, entry, path, .. }
+                    if file == "d/BUILD" && entry == "//d:t" && path.len() == 2
+            ),
+            "{back:?}"
+        );
+        let sparse = r#"{"at_unix_ms":1,"kind":{"type":"FileFailed"}}"#;
+        let ev: BuildEvent = serde_json::from_str(sparse).expect("sparse frame decodes");
+        assert!(matches!(ev.kind, BuildEventKind::FileFailed { ref file, .. } if file.is_empty()));
+
+        let dup = r#"{"at_unix_ms":6,"kind":{"type":"ResultEnd","addr":"//a:x","error":"boom","duplicate":true}}"#;
+        let new: BuildEvent = serde_json::from_str(dup).expect("new decoder");
+        assert!(matches!(
+            new.kind,
+            BuildEventKind::ResultEnd {
+                duplicate: true,
+                ..
+            }
+        ));
+
+        #[derive(serde::Deserialize)]
+        struct OldEvent {
+            kind: OldKind,
+        }
+        #[derive(serde::Deserialize, Debug)]
+        #[serde(tag = "type")]
+        enum OldKind {
+            ResultStart {
+                #[expect(dead_code, reason = "decoded only to prove the shape")]
+                addr: String,
+            },
+            ResultEnd {
+                addr: String,
+                error: Option<String>,
+            },
+            #[serde(other)]
+            Unknown,
+        }
+        let stream = [
+            json,
+            r#"{"at_unix_ms":5,"kind":{"type":"ResultStart","addr":"//a:x"}}"#.into(),
+            dup.into(),
+        ];
+        let old: Vec<OldKind> = stream
+            .iter()
+            .map(|l| {
+                serde_json::from_str::<OldEvent>(l)
+                    .expect("old decoder")
+                    .kind
+            })
+            .collect();
+        assert!(
+            matches!(
+                old.as_slice(),
+                [
+                    OldKind::Unknown,
+                    OldKind::ResultStart { .. },
+                    OldKind::ResultEnd { addr, error: Some(_) }
+                ] if addr == "//a:x"
             ),
             "{old:?}"
         );
