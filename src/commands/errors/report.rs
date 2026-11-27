@@ -30,7 +30,8 @@ use crate::engine::request_state::TookDown;
 use crate::hmemoizer::downcast_chain_ref;
 use crate::tui::failure_rows::{FIXES_SHOWN, shell_quote};
 use crate::tui::text::{
-    Redact, clean_inline, cut_right, expand_tabs, fit_styled, sanitize_log, sanitize_log_keep_sgr,
+    Redact, WorkspaceRel, clean_inline, cut_right, expand_tabs, fit_styled, message, sanitize_log,
+    sanitize_log_keep_sgr,
 };
 
 /// How many kept `failure_out` groups a block names before `+N more`.
@@ -46,6 +47,9 @@ pub struct ReportContext {
     blocks: Vec<Block>,
     /// heph's home, redacted from every error text and log line.
     redact: Redact,
+    /// The workspace, which error text names paths relative to; a log line
+    /// keeps the tool's own paths.
+    rel: WorkspaceRel,
     /// The terminal's width: a tail line is cut to it.
     width: usize,
 }
@@ -98,8 +102,16 @@ impl ReportContext {
         Self {
             blocks,
             redact: home.map(Redact::heph_home).unwrap_or_default(),
+            rel: WorkspaceRel::default(),
             width,
         }
+    }
+
+    /// Name paths under `root` relative to it in error text (D2). Reads the
+    /// filesystem once, as [`gather`](Self::gather) does: call it there.
+    pub fn with_workspace(mut self, root: Option<&Path>) -> Self {
+        self.rel = root.map(WorkspaceRel::workspace).unwrap_or_default();
+        self
     }
 
     /// Cut tail lines to `width` columns instead of the terminal's.
@@ -163,9 +175,11 @@ impl ReportContext {
         };
         if status.is_none() {
             // No status to name it: the error says what went wrong.
+            // heph's message, not the tool's output: controls escaped, not
+            // removed, and workspace paths relative (D2).
             let cause = cause_chain(&f.source);
             body.extend(
-                sanitize_log(self.redact.apply(&cause).as_bytes())
+                message(&cause, &self.redact, &self.rel)
                     .lines()
                     .map(|l| self.cut_row(l)),
             );

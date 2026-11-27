@@ -248,7 +248,8 @@ impl ManagedDriver for Driver {
         // A computed url is checked at run, once it exists (`run` repeats the
         // check for every url, so neither path can skip it).
         if !credential_inputs.is_empty() && !deferred {
-            auth::check_url(url.raw()).with_context(|| addr.format())?;
+            auth::check_url(url.raw())
+                .with_context(|| format!("{}: `url` {:?}", addr.format(), url.raw()))?;
         }
         if spec.unpinned && !sha256.is_empty() {
             anyhow::bail!(
@@ -366,13 +367,17 @@ impl ManagedDriver for Driver {
             req.request.target,
             &req.request.credentials,
         )? {
-            auth::check_url(&url).with_context(|| addr.clone())?;
+            // Each names the url as written: `url` may be a `${read://…}`
+            // reference's resolved value, which no message quotes (I7).
+            let shown = || format!("{addr}: `url` {:?}", def.url.raw());
+            auth::check_url(&url).with_context(shown)?;
             // Off the async workers: it reads the presented netrc files.
             let picked = hcore::blocking::run(enclose::enclose!(
                 (req.request.credentials => mounts, url)
                 move || auth::select_for(&mounts, &url)
             ))
-            .await?;
+            .await
+            .with_context(shown)?;
             Some(picked)
         } else {
             None
@@ -401,8 +406,9 @@ impl ManagedDriver for Driver {
         if let Some(got) =
             unverified_warning(&checked, req.request.target.cache.enabled, def.unpinned)
         {
+            let url = hfetch::redact_url(&url);
             tracing::warn!(
-                url,
+                url = &*url,
                 got,
                 "http_fetch: downloading {url} without checksum verification — set `sha256` on \
                  the target to pin its content (the fetched bytes hash to {got})"
@@ -553,8 +559,10 @@ async fn fetch_until_cancelled(
     .await
     {
         Ok(Fetched::Done(checked)) => Ok(checked),
-        Ok(Fetched::Cancelled) => anyhow::bail!("http_fetch: {url} cancelled"),
-        Err(err) => Err(err).with_context(|| format!("fetch {url}")),
+        Ok(Fetched::Cancelled) => {
+            anyhow::bail!("http_fetch: {} cancelled", hfetch::redact_url(url))
+        }
+        Err(err) => Err(err).with_context(|| format!("fetch {}", hfetch::redact_url(url))),
     }
 }
 
@@ -646,14 +654,17 @@ fn check_resolved_url(url: &str) -> anyhow::Result<()> {
         !url.is_empty(),
         "resolved to an empty value: the producer's output file is empty"
     );
+    // None of these quotes the value: it is the producer's content, and the
+    // caller's context names the reference as written (I7).
     anyhow::ensure!(
         !url.chars().any(|c| c.is_whitespace() || c.is_control()),
-        "resolved to {url:?}, which contains whitespace or a control character"
+        "resolved to a value that contains whitespace or a control character"
     );
-    let parsed = url::Url::parse(url).with_context(|| format!("resolved to {url:?}"))?;
+    let parsed = url::Url::parse(url).context("resolved to a value that is not a url")?;
     anyhow::ensure!(
         matches!(parsed.scheme(), "https" | "http"),
-        "resolved to {url:?}; only http and https are fetched"
+        "resolved to a {}:// url; only http and https are fetched",
+        parsed.scheme()
     );
     Ok(())
 }
@@ -923,7 +934,10 @@ fn verify_checksum(expected: &str, got: &str, url: &str) -> anyhow::Result<Check
         });
     }
     if got != expected {
-        anyhow::bail!("http_fetch: checksum mismatch for {url}: expected {expected}, got {got}");
+        anyhow::bail!(
+            "http_fetch: checksum mismatch for {}: expected {expected}, got {got}",
+            hfetch::redact_url(url)
+        );
     }
     Ok(Checked::Pinned)
 }
@@ -2026,6 +2040,47 @@ mod tests {
             );
             assert!(msg.contains(wants), "{resolved:?}: {msg}");
             assert!(msg.contains(REF), "names the reference: {msg}");
+        }
+    }
+
+    /// Every refusal of a resolved url, with or without credentials, names the
+    /// reference as written and never the value it resolved to, which is the
+    /// producer's content (I7).
+    #[tokio::test]
+    async fn http_auth_error_quotes_reference() {
+        let gated = parse_deferred(
+            REF,
+            &[
+                out("t"),
+                (
+                    "credentials",
+                    Value::List(vec![Value::String("//auth:netrc".to_string())]),
+                ),
+            ],
+        )
+        .await
+        .expect("parse");
+        let anonymous = parse_deferred(REF, &[out("t")]).await.expect("parse");
+        for (def, resolved) in [
+            (&gated, "http://x.example/S3CRET"),
+            (&gated, "https://u:S3CRET@x.example/asset"),
+            (&gated, "https://x/a S3CRET"),
+            (&anonymous, "ftp://x.example/S3CRET"),
+            (&anonymous, "S3CRET-relative"),
+            (&anonymous, "https://x/a\nS3CRET"),
+        ] {
+            let msg = format!("{:#}", run_resolved(def, resolved).await.unwrap_err());
+            assert!(msg.contains(REF), "names the reference: {msg}");
+            assert!(
+                !msg.contains("S3CRET"),
+                "{resolved:?}: quoted the value: {msg}"
+            );
+        }
+        // And the check itself, which parse runs on a literal url and run on a
+        // resolved one, quotes nothing.
+        for bad in ["not a url S3CRET", "S3CRET:"] {
+            let msg = format!("{:#}", auth::check_url(bad).expect_err(bad));
+            assert!(!msg.contains("S3CRET"), "{bad:?}: {msg}");
         }
     }
 
