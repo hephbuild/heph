@@ -1,7 +1,7 @@
 use crate::engine::Engine;
+use crate::engine::deferred::declared_origin;
 use crate::engine::driver::TargetAddr;
 use crate::engine::driver::targetdef::{Input, InputMode, TargetDef};
-use crate::engine::deferred::declared_origin;
 use crate::engine::error::{InputDefFailed, MissingDep};
 use crate::engine::invoke::EntrypointAsInput;
 use crate::engine::request_state::{AddrKey, RequestState};
