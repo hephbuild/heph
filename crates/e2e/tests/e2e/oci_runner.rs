@@ -300,14 +300,14 @@ async fn a_reload_under_a_fixed_tag_moves_the_fingerprint() -> anyhow::Result<()
     .await
 }
 
-/// The same reload, with `image` given as the ref and the load in `deps`. The
-/// load's output is as unchanged as above, so a cached runner would keep
-/// serving the old digest: this form is not cached either.
+/// The same reload, with `image` given as the ref. Nothing in the runner's key
+/// moves when the daemon retags it, so a cached runner would keep serving the
+/// old digest: this form is not cached either.
 #[cfg(unix)]
 #[tokio::test]
 async fn a_reload_under_a_fixed_tag_moves_a_reference_runners_fingerprint() -> anyhow::Result<()> {
     reload_moves_the_fingerprint(
-        r#"target(name = "runner", driver = "oci.runner", image = "app:dev", deps = [":load"])"#,
+        r#"target(name = "runner", driver = "oci.runner", image = "app:dev")"#,
     )
     .await
 }

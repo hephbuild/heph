@@ -76,15 +76,11 @@ pub(crate) struct TargetSpec {
     /// it loaded from its output, so the ref is written once, on the load, and
     /// whatever tag the load settled on — derived or fixed — is the one used.
     ///
-    /// A reference must already be in the daemon: depend on the `oci.load` that
-    /// puts it there via `deps`, so loading it happens first.
+    /// A reference must already be in the daemon, put there from outside the
+    /// build: the runner depends on nothing. An image the build loads is named
+    /// by its `oci.load` target instead.
     #[spec(required)]
     pub image: String,
-    /// Targets that must build first — with a reference `image`, normally the
-    /// `oci.load` that puts it in the daemon. They only order the build: the
-    /// runner is never cached, so it inspects the image again on every build
-    /// whatever they produced.
-    pub deps: Vec<String>,
     /// Extra `docker run` arguments for the held container: `--network`,
     /// additional `-v` mounts, `--user`. The workspace and heph mounts are
     /// added automatically and must not be repeated here.
@@ -178,6 +174,14 @@ impl ManagedDriver for Driver {
         req: ParseRequest,
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ParseResponse> {
+        // Refused by name rather than as an unknown key: `deps` was how a
+        // reference runner waited for its load, and the fix is one line.
+        if req.target_spec.config.contains_key("deps") {
+            anyhow::bail!(
+                "oci.runner takes no `deps`: name the `oci.load` target as `image` \
+                 (`image = \":load\"`), which depends on it"
+            );
+        }
         let spec = TargetSpec::from(&req.target_spec.config)?;
         let pkg = req.target_spec.addr.package.clone();
         if spec.image.is_empty() {
@@ -219,39 +223,25 @@ impl ManagedDriver for Driver {
         }
         let hash = format!("{:x}", h.digest()).into_bytes();
 
-        let mut inputs = spec
-            .deps
-            .iter()
-            .enumerate()
-            .map(|(i, d)| {
-                Ok(Input {
-                    r#ref: TargetAddr::parse(d, &pkg)?,
-                    mode: InputMode::Standard,
-                    origin_id: format!("oci_runner|{i}"),
-                    annotations: BTreeMap::new(),
-                    hashed: true,
-                    runtime: false,
-                })
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        if let Some(r#ref) = image_target {
-            // `runtime: true`: the run reads the ref out of the sandbox.
-            inputs.push(Input {
+        // `runtime: true`: the run reads the ref out of the sandbox.
+        let inputs = image_target
+            .into_iter()
+            .map(|r#ref| Input {
                 r#ref,
                 mode: InputMode::Standard,
                 origin_id: IMAGE_ORIGIN.to_string(),
                 annotations: BTreeMap::new(),
                 hashed: true,
                 runtime: true,
-            });
-        }
+            })
+            .collect();
 
         // Never cached, whichever way `image` is given. The answer is a fact
         // about *this* daemon's image store, and nothing in this target's key
         // follows it: a load's output is its ref, and a fixed `tag` makes that
-        // the same bytes whichever image it loaded. A target `image` (or a load
-        // in `deps` beside a reference) therefore keeps its key across a
-        // reload, and a cached runner would keep describing the old image.
+        // the same bytes whichever image it loaded. A target `image` therefore
+        // keeps its key across a reload, and a cached runner would keep
+        // describing the old image.
         // Remotely it would be worse still: one machine's resolution keying
         // another's builds.
         //
@@ -566,40 +556,33 @@ mod tests {
         Ok(())
     }
 
-    /// Naming the load both as `image` and in `deps` is two edges, not one
-    /// that either origin could shadow.
+    /// `deps` is refused with the one-line migration, in either form, rather
+    /// than as an anonymous unknown key.
     #[tokio::test]
-    async fn a_target_image_also_in_deps_is_two_edges() -> anyhow::Result<()> {
-        let def = parse(
-            "//svc:runner",
-            &[
-                ("image", s(":load")),
-                ("deps", Value::List(vec![s(":load")])),
-            ],
-        )
-        .await?;
-        let mut origins = def
-            .inputs
-            .iter()
-            .map(|i| (i.origin_id.as_str(), i.r#ref.r#ref.format()))
-            .collect::<Vec<_>>();
-        origins.sort();
-        assert_eq!(
-            origins,
-            [
-                (IMAGE_ORIGIN, "//svc:load".to_string()),
-                ("oci_runner|0", "//svc:load".to_string()),
-            ]
-        );
-        Ok(())
+    async fn deps_is_refused_with_the_migration() {
+        for image in [":load", "app:dev"] {
+            let Err(err) = parse(
+                "//svc:runner",
+                &[("image", s(image)), ("deps", Value::List(vec![s(":load")]))],
+            )
+            .await
+            else {
+                panic!("deps must be refused with image {image:?}");
+            };
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("takes no `deps`") && msg.contains("as `image`"),
+                "{msg}"
+            );
+        }
     }
 
-    /// A reference `image` adds no edge, and is not cached either: a load in
-    /// `deps` under a fixed tag writes the same ref whichever image it loaded.
+    /// A reference `image` adds no edge (the runner depends on nothing), and is
+    /// not cached either: the daemon may retag it between builds.
     #[tokio::test]
     async fn a_reference_image_adds_no_edge_and_is_uncached() -> anyhow::Result<()> {
         let def = parse("//svc:runner", &[("image", s("app:dev"))]).await?;
-        assert!(def.inputs.iter().all(|i| i.origin_id != IMAGE_ORIGIN));
+        assert!(def.inputs.is_empty(), "{} inputs", def.inputs.len());
         assert_eq!(
             def.def::<OciRunnerDef>().image,
             ImageSource::Ref("app:dev".to_string())

@@ -411,13 +411,12 @@ target(
 
 `image` is usually the `oci.load` target that puts the image in the daemon.
 The runner depends on it and inspects the ref it wrote, so the ref is stated
-once, on the load, whether its `tag` is derived or fixed. No `deps` entry is
-needed for it.
+once, on the load, whether its `tag` is derived or fixed.
 
 `image` may instead be a literal reference (`image = "myimage:dev"`), for an
-image put in the daemon from outside the build. If a load in the build puts it
-there, list that load in `deps` so it runs first — but naming the load as
-`image` says the same thing once.
+image put in the daemon from outside the build. The runner then depends on
+nothing. `oci.runner` takes no `deps`: an image the build loads is named by its
+`oci.load` target.
 
 The target named as `image` must write exactly one file holding one ref.
 `oci.load`'s `<name>.ref` is that file. Anything else (no output, two files,
