@@ -48,8 +48,14 @@ struct OciTagSpec {
     reference: Deferred<String>,
     /// The tags to add, bare (`["1.2", "latest"]`), each in the repository
     /// `ref` names. A tag that already exists is moved to this image.
+    ///
+    /// Deferrable, each one: `"${read://pkg:name}"` is the contents of that
+    /// target's single output (a version file, a computed `h1-<hash>`), and
+    /// a tag may mix it with text (`"v${read://app:version}"`). A literal
+    /// tag is checked at parse; one with a reference, once it is resolved,
+    /// at run.
     #[spec(required)]
-    tags: Vec<String>,
+    tags: Vec<Deferred<String>>,
     /// Talk to an insecure (HTTP / self-signed) registry: plain HTTP, and
     /// certificate validation off.
     insecure: bool,
@@ -77,8 +83,10 @@ struct OciTagDef {
     /// Unresolved: `Deferred` hashes and serializes as the text the BUILD file
     /// wrote.
     reference: Deferred<String>,
-    /// Checked and deduplicated, in the order written.
-    tags: Vec<String>,
+    /// Deduplicated by their text, in the order written; a literal one is
+    /// checked. Unresolved, as `reference`: a def holding only literal tags
+    /// hashes and serializes as it did when they were plain strings.
+    tags: Vec<Deferred<String>>,
     insecure: bool,
     /// Not hashed: the target is never cached, and its output is a content
     /// address, the same digest whoever tagged. A `cache` option would need
@@ -101,7 +109,8 @@ impl Hash for OciTagDef {
 const MAX_TAG_LEN: usize = 128;
 
 /// Refuse anything the distribution spec does not accept as a tag,
-/// `[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}`, at parse.
+/// `[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}`: a literal tag at parse, one read from
+/// a target's output once resolved, at run.
 ///
 /// A whole reference is the likely mistake, and gets its own message: a tag
 /// is added where the image already is, never in another repository.
@@ -124,8 +133,11 @@ fn check_tag(tag: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `tags` checked, with repeats dropped (first one wins).
-fn checked_tags(tags: Vec<String>) -> anyhow::Result<Vec<String>> {
+/// `tags` as written, checked as far as parse can, with repeats of one text
+/// dropped (first one wins). A literal tag is checked whole; one holding a
+/// `${read://…}` only for references nothing would substitute, the rest at
+/// run by [`resolved_tags`].
+fn checked_tags(tags: Vec<Deferred<String>>) -> anyhow::Result<Vec<Deferred<String>>> {
     anyhow::ensure!(
         !tags.is_empty(),
         "`tags` is empty: name at least one tag to add"
@@ -133,9 +145,31 @@ fn checked_tags(tags: Vec<String>) -> anyhow::Result<Vec<String>> {
     let mut seen = std::collections::HashSet::with_capacity(tags.len());
     let mut out = Vec::with_capacity(tags.len());
     for tag in tags {
-        check_tag(&tag)?;
-        if seen.insert(tag.clone()) {
+        if !super::check_reads("oci_tag", "tags", tag.raw())? {
+            check_tag(tag.raw())?;
+        }
+        if seen.insert(tag.raw().to_string()) {
             out.push(tag);
+        }
+    }
+    Ok(out)
+}
+
+/// The def's tags resolved and checked, with repeats dropped (first one
+/// wins): two references may read the same value.
+fn resolved_tags(
+    req: &hplugin::driver::RunRequest<'_, '_>,
+    tags: &[Deferred<String>],
+) -> anyhow::Result<Vec<String>> {
+    let mut out: Vec<String> = Vec::with_capacity(tags.len());
+    for tag in tags {
+        let value = req
+            .resolve(tag)
+            .with_context(|| format!("resolve oci_tag `tags` entry {:?}", tag.raw()))?;
+        check_tag(&value)
+            .with_context(|| format!("`tags` entry {:?} resolved to {value:?}", tag.raw()))?;
+        if !out.iter().any(|t| *t == value) {
+            out.push(value.into_owned());
         }
     }
     Ok(out)
@@ -230,6 +264,7 @@ impl ManagedDriver for Driver {
             .request
             .resolve(&def.reference)
             .context("resolve oci_tag `ref`")?;
+        let tags = resolved_tags(&req.request, &def.tags)?;
         let creds = RegistryCredentials::for_run(
             req.request.target,
             def.ambient_credentials,
@@ -237,16 +272,16 @@ impl ManagedDriver for Driver {
             &req.sandbox_dir,
             ctoken,
         )?;
-        let pinned = registry::tag(&reference, &def.tags, def.insecure, &creds)
+        let pinned = registry::tag(&reference, &tags, def.insecure, &creds)
             .await
             .with_context(|| {
                 format!(
                     "tag {reference} as {} ({})",
-                    def.tags.join(", "),
+                    tags.join(", "),
                     creds.failure_hint()
                 )
             })?;
-        tracing::debug!(target_addr = %req.request.target.addr.format(), %reference, tags = ?def.tags, %pinned, "tagged");
+        tracing::debug!(target_addr = %req.request.target.addr.format(), %reference, ?tags, %pinned, "tagged");
 
         write_ref(&req, &pinned).await?;
         Ok(ManagedRunResponse::default())
@@ -371,11 +406,91 @@ mod tests {
 
     #[test]
     fn repeated_tags_are_dropped_and_none_is_refused() {
+        let d = |t: &str| Deferred::<String>::new(t);
         assert_eq!(
-            checked_tags(vec!["b".into(), "a".into(), "b".into()]).expect("tags"),
-            ["b", "a"]
+            checked_tags(vec![d("b"), d("a"), d("b")]).expect("tags"),
+            [d("b"), d("a")]
         );
         assert!(checked_tags(vec![]).is_err());
+    }
+
+    /// A tag may be read from a target's output, whole or inside text: a
+    /// literal is checked at parse, one with a reference is not (its value
+    /// is not known yet), and any `${…}` other than a read is refused,
+    /// naming `tags`.
+    #[tokio::test]
+    async fn tags_take_reads_and_refuse_anything_else() {
+        let resp = parse(&[
+            ("ref", s("reg.io/app:1")),
+            (
+                "tags",
+                list(&["${read://app:version}", "v${read://app:version}", "latest"]),
+            ),
+        ])
+        .await
+        .expect("reads are accepted");
+        let def = resp.target_def.def_de::<OciTagDef>();
+        assert_eq!(
+            def.tags,
+            [
+                Deferred::new("${read://app:version}"),
+                Deferred::new("v${read://app:version}"),
+                Deferred::new("latest"),
+            ]
+        );
+        // The read's text is not a tag; only a literal is held to the grammar.
+        let err = parse(&[
+            ("ref", s("reg.io/app:1")),
+            ("tags", list(&["${read://app:version}", "bad tag"])),
+        ])
+        .await
+        .err()
+        .expect("a bad literal is refused");
+        assert!(format!("{err:#}").contains("not a valid tag"), "{err:#}");
+        for bad in ["${image_hashout}", "v$$1", "${resource:cpu}"] {
+            let err = parse(&[("ref", s("reg.io/app:1")), ("tags", list(&[bad]))])
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{bad:?} must be refused"));
+            assert!(
+                format!("{err:#}").contains("`tags` holds `")
+                    && format!("{err:#}").contains("not something oci_tag substitutes"),
+                "{bad:?}: {err:#}"
+            );
+        }
+    }
+
+    /// A tag that held only literals hashes as the plain string it was
+    /// before `tags` was deferrable, so no def moves on upgrade; a read moves
+    /// it by its text.
+    #[tokio::test]
+    async fn literal_tags_keep_their_def_hash() {
+        let hash = |tags: &'static [&'static str]| async move {
+            parse(&[("ref", s("reg.io/app:1")), ("tags", list(tags))])
+                .await
+                .expect("parse")
+                .target_def
+                .hash
+        };
+        let legacy = {
+            let def = OciTagDef {
+                reference: Deferred::new("reg.io/app:1"),
+                tags: Vec::new(),
+                insecure: false,
+                ambient_credentials: false,
+            };
+            let mut h = DebugHasher::new(Xxh3Default::new(), || "oci_tag_//app:tag".to_string());
+            OCI_TAG_FORMAT_VERSION.hash(&mut h);
+            def.reference.hash(&mut h);
+            vec!["1.2".to_string(), "latest".to_string()].hash(&mut h);
+            def.insecure.hash(&mut h);
+            format!("{:x}", h.finish()).into_bytes()
+        };
+        assert_eq!(hash(&["1.2", "latest"]).await, legacy);
+        assert_ne!(
+            hash(&["${read://app:version}"]).await,
+            hash(&["${read://app:other}"]).await
+        );
     }
 
     /// The order and set of tags are what the target does, so they move the
@@ -416,6 +531,17 @@ mod tests {
         tags: &[&str],
         credentials: Vec<hplugin::driver::CredentialMount>,
     ) -> (Sandbox, anyhow::Result<ManagedRunResponse>) {
+        run_with(reference, tags, credentials, &[]).await
+    }
+
+    /// [`run`], with `deferred` as the host's resolved values, keyed by the
+    /// text each field holds.
+    async fn run_with(
+        reference: &str,
+        tags: &[&str],
+        credentials: Vec<hplugin::driver::CredentialMount>,
+        deferred: &[(&str, &str)],
+    ) -> (Sandbox, anyhow::Result<ManagedRunResponse>) {
         let creds: Vec<Value> = (0..credentials.len())
             .map(|i| s(&format!("//auth:c{i}")))
             .collect();
@@ -432,8 +558,62 @@ mod tests {
         let rid = "req".to_string();
         let mut req = run_request(&rid, "hashin", &def, &sbx, &[]);
         req.request.credentials = credentials;
+        req.request.deferred = deferred
+            .iter()
+            .map(|(raw, v)| {
+                (
+                    (*raw).to_string(),
+                    hplugin::driver::DeferredValue::Ready((*v).to_string()),
+                )
+            })
+            .collect();
         let res = Driver::new().run(req, &StdCancellationToken::new()).await;
         (sbx, res)
+    }
+
+    /// A tag read from a target's output is resolved at run and moved like a
+    /// literal, beside a literal it resolves to the same value as; a value
+    /// that is not a tag fails before anything is moved, naming the field's
+    /// text.
+    #[tokio::test]
+    async fn a_read_tag_is_resolved_at_run() {
+        let reg = MockRegistry::start(None);
+        let digest = reg.put("acme/app", "build-1", &oci_manifest());
+        let source = format!("{}/acme/app:build-1", reg.host());
+        let (sbx, res) = run_with(
+            &source,
+            &["${read://app:hash}", "h1-${read://app:hash}", "abc"],
+            vec![],
+            &[
+                ("${read://app:hash}", "abc"),
+                ("h1-${read://app:hash}", "h1-abc"),
+            ],
+        )
+        .await;
+        res.expect("tag");
+        for tag in ["abc", "h1-abc"] {
+            let (_, bytes) = reg.get("acme/app", tag).expect(tag);
+            assert_eq!(bytes, oci_manifest(), "{tag}");
+        }
+        let out = std::fs::read_to_string(sbx.pkg.join("tag.ref")).expect("output");
+        assert_eq!(out, format!("{}/acme/app@{digest}", reg.host()));
+
+        // A valid tag before the bad one: every tag is checked before any
+        // moves, so `ok` is not written either.
+        let (_sbx, res) = run_with(
+            &source,
+            &["ok", "${read://app:hash}"],
+            vec![],
+            &[("${read://app:hash}", "not/a:tag")],
+        )
+        .await;
+        let msg = format!("{:#}", res.err().expect("refused"));
+        assert!(
+            msg.contains(r#"`tags` entry "${read://app:hash}" resolved to "not/a:tag""#)
+                && msg.contains("not a tag"),
+            "{msg}"
+        );
+        assert!(reg.get("acme/app", "ok").is_none());
     }
 
     /// Each tag gets the manifest's own bytes, so it resolves to the same

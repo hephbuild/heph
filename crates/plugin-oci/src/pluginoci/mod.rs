@@ -48,24 +48,33 @@ pub mod tag;
 /// a reference-parse error naming neither the field nor what it accepts. A `$$`
 /// is refused as well: no image reference contains a `$`.
 pub(crate) fn check_ref_reads(driver: &str, raw: &str) -> anyhow::Result<()> {
+    check_reads(driver, "ref", raw).map(|_| ())
+}
+
+/// [`check_ref_reads`] for any field of `driver` that takes only
+/// `${read://…}`, named `field` in the error. `true` when `raw` holds one,
+/// so its value is known only at run.
+pub(crate) fn check_reads(driver: &str, field: &str, raw: &str) -> anyhow::Result<bool> {
     use hcore::template::Piece;
-    for piece in hcore::template::parse(raw).context("parse `ref`")? {
+    let mut reads = false;
+    for piece in hcore::template::parse(raw).with_context(|| format!("parse `{field}`"))? {
         let bad = match piece {
             Piece::Text(_) => continue,
             Piece::Escape => "$$",
             Piece::Ref(r) => {
                 if hcore::template::claims(r.kind, r.arg, &[hcore::template::READ_KIND]) {
+                    reads = true;
                     continue;
                 }
                 r.raw
             }
         };
         anyhow::bail!(
-            "`ref` holds `{bad}`, which is not something {driver} substitutes: use \
+            "`{field}` holds `{bad}`, which is not something {driver} substitutes: use \
              `${{read://pkg:name}}` for a target's output"
         );
     }
-    Ok(())
+    Ok(reads)
 }
 
 /// The output file holding the reference a registry driver resolved, in the
