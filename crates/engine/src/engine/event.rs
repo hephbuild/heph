@@ -157,10 +157,6 @@ impl ErrorDetail {
         d
     }
 
-    /// Just the flattened message, for the scopes whose end events carry only
-    /// that (`ExecuteEnd`, the cache spans). Structured detail is surfaced on
-    /// `ResultEnd`, which is where a consumer reports a target's outcome; the
-    /// inner spans would only duplicate it.
     /// [`from_error`](Self::from_error) for an event: its message scrubbed
     /// of what the request was handed to scrub, and within the message cap
     /// ([`RequestStateData::scrub_event_text`], I7). Every detail an event
@@ -172,6 +168,10 @@ impl ErrorDetail {
         d
     }
 
+    /// Just the flattened message, for the scopes whose end events carry only
+    /// that (`ExecuteEnd`, the cache spans). Structured detail is surfaced on
+    /// `ResultEnd`, which is where a consumer reports a target's outcome; the
+    /// inner spans would only duplicate it.
     pub fn into_message(self) -> String {
         self.message
     }

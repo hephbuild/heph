@@ -355,9 +355,9 @@ fn fixes_rows(out: &mut String, fixes: &FixesData, inspect: Option<&str>) {
             // A path a terminal cannot show as typed goes through the list
             // too: the restore below would not paste back as written.
             let unprintable = paths.iter().any(|p| p.chars().any(char::is_control));
-            match list {
-                Some(_) if (more > 0 || unprintable) && inspect.is_some() => {
-                    let addr = shell_quote(inspect.unwrap_or_default());
+            match (list, inspect) {
+                (Some(_), Some(inspect)) if more > 0 || unprintable => {
+                    let addr = shell_quote(inspect);
                     push_full_list(out, more, &format!("heph inspect failure {addr}"));
                     out.push_str(RESTORE);
                     out.push_str(&format!(
@@ -365,7 +365,7 @@ fn fixes_rows(out: &mut String, fixes: &FixesData, inspect: Option<&str>) {
                          {addr} names>\n"
                     ));
                 }
-                Some(list) if more > 0 || unprintable => {
+                (Some(list), _) if more > 0 || unprintable => {
                     push_full_list(out, more, list);
                     // The list is one path per line, which is what git's
                     // `--pathspec-from-file` reads: no xargs word splitting.
