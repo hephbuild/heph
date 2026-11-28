@@ -2832,6 +2832,7 @@ fn failure_fate<'a>(addr: &Addr, e: &'a anyhow::Error) -> FailureFate<'a> {
     // of the cycle, not a single target's own work failing. Propagate unchanged
     // so the cycle surfaces directly to the caller (and never gets masked behind
     // an `UpstreamFailed` marker or duplicated into the failure registry).
+    // The requested target it reaches records it once ([`top_cycle`]).
     // Looked for through the walker, so a cycle that rides one member of an
     // aggregate (keep-going, beside another failing input) is found too:
     // regrouping that aggregate into culprits would record the cycle as a
@@ -2970,6 +2971,23 @@ fn failure_slot_out(e: &anyhow::Error) -> Option<std::path::PathBuf> {
 /// root cause rather than "dependency failed". The CLI renders from the registry
 /// instead, so this is purely about the value returned to direct callers. No-op
 /// for inner frames and for non-marker errors (cancellation, cycles, …).
+/// A dependency cycle reaching a requested target's own frame (D8,
+/// GRAPH-07). [`failure_fate`] propagates a cycle through every frame of it
+/// unrecorded, so it is reported once: here, at the top, where the request
+/// meets it. A stop is a stop, whatever else the chain holds.
+fn top_cycle(is_top: bool, e: &anyhow::Error) -> bool {
+    is_top
+        && downcast_chain_ref::<CycleError>(e).is_some()
+        && downcast_chain_ref::<CancelledError>(e).is_none()
+}
+
+/// Record a [`top_cycle`] as the requested target's own failure: the one
+/// root of the cycle the request reports, counted and boxed like any other.
+/// The caller announces it (the scope's end, or `fail_unscoped`'s pair).
+fn record_cycle(rs: &RequestState, addr: &Addr, e: anyhow::Error) -> (anyhow::Error, bool) {
+    record_culprit(rs, addr, e, Culprit::Target(addr.clone()), addr.clone())
+}
+
 fn surface_top(is_top: bool, rs: &RequestState, e: anyhow::Error) -> anyhow::Error {
     // A cycle in an aggregate is propagated as itself (see `failure_fate`),
     // so it is not a marker to swap for a recorded failure either.
@@ -3040,14 +3058,19 @@ impl Engine {
         // culprit (an input whose def failed, a BUILD file that did not
         // evaluate) is announced by `classify_failure_fresh`'s winner.
         let fate = failure_fate(addr, &e);
-        let own = fate.is_own(addr);
+        let cycle = top_cycle(is_top, &e);
+        let own = fate.is_own(addr) || cycle;
         let skipped = match (is_top && !own).then(|| EndBlame::of(rs, addr, &fate)) {
             Some(end @ EndBlame::Skipped { .. }) => Some(end),
             _ => None,
         };
         let detail =
             (own || skipped.is_some()).then(|| crate::engine::event::ErrorDetail::from_error(&e));
-        let (e, fresh) = classify_failure_fresh(rs, addr, e);
+        let (e, fresh) = if cycle {
+            record_cycle(rs, addr, e)
+        } else {
+            classify_failure_fresh(rs, addr, e)
+        };
         if let Some(end) = skipped
             && let Some(detail) = detail
         {
@@ -3322,6 +3345,11 @@ impl Engine {
                     // like the computation's own.
                     surface_top(is_top, &rs, classify_failure(&rs, addr, e))
                 })
+            }
+            // The scope's end already announced it (an own failure's end:
+            // no root named, not a stop); the record makes it the run's.
+            Err(e) if top_cycle(is_top, &e) => {
+                Err(surface_top(is_top, &rs, record_cycle(&rs, addr, e).0))
             }
             Err(e) => Err(surface_top(is_top, &rs, e)),
         }
