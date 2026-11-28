@@ -533,6 +533,10 @@ pub trait Provider: Send + Sync {
     /// while a diagnostic is being built, and other diagnostics about the
     /// same file wait for it.
     ///
+    /// A file that no longer reads or parses still gets an index, one whose
+    /// every [`locate`](SourceIndex::locate) is [`Located::Changed`]: `None`
+    /// says the provider cannot index the file, not that it changed.
+    ///
     /// Default: none, and diagnostics point at the call. An in-process seam:
     /// a cdylib provider keeps the default.
     fn source_index(&self, _file: &str) -> Option<Arc<dyn SourceIndex>> {
@@ -543,16 +547,71 @@ pub trait Provider: Send + Sync {
 /// What [`Provider::source_index`] returns: one source file, read as it is
 /// now. Diagnostics only (I1), like [`SpecSource`].
 pub trait SourceIndex: Send + Sync {
-    /// The span of option `field` (a driver config key, `driver`, …) in the
-    /// call at `source` that declared target `name`. `None` when the file no
-    /// longer holds that call there, the call declares another name, or it
-    /// sets no such option: the caller then points at the call.
-    fn locate(
-        &self,
-        source: &SpecSource,
-        name: &str,
-        field: &str,
-    ) -> Option<hcore::diagnostic::Span>;
+    /// What the file holds now at `source`, the call that declared target
+    /// `name`: the span of option `field` (a driver config key, `driver`,
+    /// …) in it, or the call alone (`field` `None`, or an option the call
+    /// does not set); or [`Located::Changed`] when the file no longer holds
+    /// that call there (gone, moved, declaring another name, or the file no
+    /// longer reads or parses).
+    fn locate(&self, source: &SpecSource, name: &str, field: Option<&str>) -> Located;
+}
+
+/// What [`SourceIndex::locate`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Located {
+    /// The option's span, in the call as evaluated.
+    Field(hcore::diagnostic::Span),
+    /// The call is there as evaluated, and nothing finer was found: a
+    /// diagnostic points at the call.
+    Call,
+    /// The file changed since it was evaluated, under the call: a
+    /// diagnostic points at the call as evaluated and says so.
+    Changed,
+}
+
+/// Where a diagnostic about a declaration points: its option, else its
+/// call, as the spec's [`SpecSource`] has it; and whether the file changed
+/// since it was evaluated, so the location may no longer be where the text
+/// is now ([`Located::Changed`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclAt {
+    pub loc: hcore::diagnostic::SourceLoc,
+    pub changed: bool,
+}
+
+impl DeclAt {
+    /// What a message says of a location in a file that changed.
+    pub const CHANGED: &'static str = "file changed since evaluation";
+
+    /// Where `located` points in `source`'s file.
+    pub fn new(source: &SpecSource, located: Located) -> Self {
+        match located {
+            Located::Field(span) => Self {
+                loc: span.start_in(source.file()),
+                changed: false,
+            },
+            Located::Call => Self {
+                loc: source.call_loc(),
+                changed: false,
+            },
+            Located::Changed => Self {
+                loc: source.call_loc(),
+                changed: true,
+            },
+        }
+    }
+}
+
+impl std::fmt::Display for DeclAt {
+    /// `c/BUILD:2:5`, and `, file changed since evaluation` after it when
+    /// the file changed.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.loc)?;
+        if self.changed {
+            write!(f, ", {}", Self::CHANGED)?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

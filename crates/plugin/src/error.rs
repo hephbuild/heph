@@ -364,9 +364,12 @@ pub struct MissingDep {
     /// Where the declarer declares it: its [`SpecSource`]'s call, or finer
     /// when its provider can locate the declaration's field. `None` when the
     /// declarer's spec carries no source (a provider that reports none).
+    /// The message says when the file changed since it was evaluated
+    /// ([`DeclAt::changed`]).
     ///
     /// [`SpecSource`]: crate::provider::SpecSource
-    pub at: Option<hcore::diagnostic::SourceLoc>,
+    /// [`DeclAt::changed`]: crate::provider::DeclAt::changed
+    pub at: Option<crate::provider::DeclAt>,
 }
 
 impl fmt::Display for MissingDep {
@@ -419,7 +422,7 @@ impl MissingDep {
         dep: &Addr,
         declarer: &Addr,
         origin_id: impl FnOnce() -> String,
-        at: impl FnOnce(&str) -> Option<hcore::diagnostic::SourceLoc>,
+        at: impl FnOnce(&str) -> Option<crate::provider::DeclAt>,
         otherwise: impl FnOnce(anyhow::Error) -> anyhow::Error,
     ) -> anyhow::Error {
         if Self::names(&e, dep) {

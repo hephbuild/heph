@@ -678,9 +678,9 @@ mod tests {
             &self,
             _source: &SpecSource,
             _name: &str,
-            _field: &str,
-        ) -> Option<hcore::diagnostic::Span> {
-            Some(self.0)
+            _field: Option<&str>,
+        ) -> crate::engine::provider::Located {
+            crate::engine::provider::Located::Field(self.0)
         }
     }
 
@@ -700,7 +700,7 @@ mod tests {
     /// An engine whose `//a:x` and `//b:x` name a driver no plugin registered,
     /// each declared in its own file (`a/BUILD`, `b/BUILD`) at line 2.
     fn located_engine(
-        source_index: SourceIndexFn,
+        source_index: Option<SourceIndexFn>,
     ) -> anyhow::Result<(Arc<Engine>, tempfile::TempDir)> {
         let root = tempfile::tempdir()?;
         let mut engine = Engine::new(Config::for_tests(root.path()))?;
@@ -716,7 +716,7 @@ mod tests {
                     (addr("//a:x"), source("a/BUILD", 2)),
                     (addr("//b:x"), source("b/BUILD", 2)),
                 ],
-                source_index: Some(source_index),
+                source_index,
                 ..Default::default()
             },
         )?;
@@ -746,15 +746,31 @@ mod tests {
             .take_failures()
             .iter()
             .map(|f| {
-                let loc = f.record.diagnostic.location.as_ref();
+                let d = &f.record.diagnostic;
+                assert!(
+                    !d.message.contains(crate::engine::provider::DeclAt::CHANGED),
+                    "nothing changed: {}",
+                    d.message
+                );
                 (
                     f.culprit().to_string(),
-                    loc.map(|l| (l.file.clone(), l.line, l.col)),
+                    d.location.as_ref().map(|l| (l.file.clone(), l.line, l.col)),
                 )
             })
             .collect();
         got.sort();
         (got, rs.source_index_loads())
+    }
+
+    /// A provider that reports where a target was declared but cannot index
+    /// the file (a cdylib provider keeps the default): the diagnostic points
+    /// at the declaring call, and says nothing of the file having changed.
+    #[tokio::test]
+    async fn a_source_without_an_index_points_at_the_call() -> anyhow::Result<()> {
+        let (engine, _root) = located_engine(None)?;
+        let (got, _) = locations(&engine, &["//a:x"]).await;
+        assert_eq!(got, [("//a:x".into(), Some(("a/BUILD".into(), 2, 1)))]);
+        Ok(())
     }
 
     /// The engine asks for a file's index on the blocking pool, never on a
@@ -781,7 +797,7 @@ mod tests {
                 Some(Arc::new(FixedIndex(span(3, 7))) as Arc<dyn SourceIndex>)
             }
         });
-        let (engine, _root) = located_engine(index)?;
+        let (engine, _root) = located_engine(Some(index))?;
         let (got, loads) = locations(&engine, &["//a:x", "//b:x"]).await;
         assert_eq!(
             got,

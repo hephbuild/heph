@@ -196,7 +196,9 @@ pub(crate) fn compact(
             let message = own_message(e, culprit, &mut causes, &mut more_causes, end.as_deref());
             let mut d = Diagnostic::new(stage, message);
             // The declaration the message names, for a renderer to point at.
-            d.location = missing_dep.and_then(|m| m.at.clone());
+            d.location = missing_dep
+                .and_then(|m| m.at.as_ref())
+                .map(|at| at.loc.clone());
             d
         }
     };
@@ -1328,7 +1330,12 @@ mod tests {
                 dep: addr("//d:missing"),
                 declarer: addr("//d:t"),
                 origin_id: "deps".to_owned(),
-                at: hcore::diagnostic::SourceLoc::checked("d/defs".to_owned(), 4, 5).ok(),
+                at: hcore::diagnostic::SourceLoc::checked("d/defs".to_owned(), 4, 5)
+                    .ok()
+                    .map(|loc| hplugin::provider::DeclAt {
+                        loc,
+                        changed: false,
+                    }),
             }),
             Boundary::GetDef,
             &addr("//d:t"),

@@ -2335,7 +2335,7 @@ fn culprit_location(
     culprit: &Addr,
     e: &anyhow::Error,
     stage: hcore::diagnostic::Stage,
-) -> Option<hcore::diagnostic::SourceLoc> {
+) -> Option<hplugin::provider::DeclAt> {
     let field = hplugin::htspec::error_option(e).or_else(|| {
         downcast_chain_ref::<hplugin::error::DriverNotFound>(e)
             .map(|_| hplugin::error::DriverNotFound::FIELD)
@@ -2407,8 +2407,17 @@ fn record_culprit(
         record.path = path.iter().map(Addr::format).collect();
         if record.diagnostic.location.is_none()
             && let Culprit::Target(c) = &culprit
+            && let Some(at) = culprit_location(rs, c, &e, record.diagnostic.stage)
         {
-            record.diagnostic.location = culprit_location(rs, c, &e, record.diagnostic.stage);
+            // The location is the call as evaluated, which the text may no
+            // longer be at: say so, in the message both renderers show.
+            if at.changed {
+                let message = &mut record.diagnostic.message;
+                message.push_str(" (");
+                message.push_str(hplugin::provider::DeclAt::CHANGED);
+                message.push(')');
+            }
+            record.diagnostic.location = Some(at.loc);
         }
         Arc::new(record)
     });
