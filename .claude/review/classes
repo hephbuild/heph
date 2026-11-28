@@ -1,0 +1,35 @@
+# Path classes for a review brief. A line's class decides whether the
+# triage sees it at all: every class here but `harness` is Counted (file
+# names and line counts on the page, no diff body).
+#
+# One per line: <class> <glob>. Classes: generated, lockfile, docs, test,
+# harness. Precedence in the program: harness, then generated (also by an
+# `@generated` / `Code generated ... DO NOT EDIT` marker in a file's first
+# five lines), lockfile, docs, test, then live. Inline `#[cfg(test)]` items
+# and files declared by `#[cfg(test)] mod` are found by the program, not
+# listed here.
+
+# Test support is read as code, at least Glance: a harness change can
+# weaken every test with no weakening signal.
+harness crates/testkit/
+harness **/fault_provider.rs
+harness **/*test_double*.rs
+harness **/*test_support*.rs
+
+generated gen/
+
+lockfile Cargo.lock
+lockfile **/go.sum
+lockfile devenv.lock
+lockfile flake.lock
+
+docs **/*.md
+docs docs/
+
+test **/tests/
+test **/testdata/
+test **/benches/
+test crates/e2e/
+test crates/bin-e2e/
+test crates/plugingo-e2e/
+test crates/plugin-entrypoint-test-cdylib/

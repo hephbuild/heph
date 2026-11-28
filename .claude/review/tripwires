@@ -1,0 +1,14 @@
+# Content tripwires (spec D10): a changed line matching one of these is at
+# least Glance wherever it is, protected path or not.
+#
+# One per line: <label> <path glob> <Go regexp>. The regexp runs on the
+# line's text without its +/- prefix, on added and removed lines alike.
+
+unsafe **/*.rs \bunsafe\b
+cfg-os **/*.rs cfg\((?:.*\b)?target_os\b
+cfg-arch **/*.rs cfg\((?:.*\b)?target_arch\b
+atomic-ordering **/*.rs \bOrdering::(?:Relaxed|Acquire|Release|AcqRel|SeqCst)\b
+# A dependency line in any Cargo.toml. It cannot see the section a line is
+# in, so a version or feature edit in [package] trips it too: that is Glance,
+# which is the cheap side to err on.
+dependency **/Cargo.toml ^\s*[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?\s*=\s*[\{"]

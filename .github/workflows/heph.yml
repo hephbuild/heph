@@ -303,6 +303,20 @@ jobs:
         run: go test -race ./...
         background: true
 
+      # The review-brief program (`.claude/skills/review-brief/brief`) is
+      # advisory and nothing in a build depends on it, but a broken one cuts a
+      # wrong brief silently. Same toolchain, no build of its own. Its page
+      # tests load the page in headless Chrome, which ubuntu-latest ships;
+      # BRIEF_REQUIRE_BROWSER makes a missing browser a failure, not a skip.
+      - name: Test review-brief
+        working-directory: .claude/skills/review-brief/brief
+        env:
+          CGO_ENABLED: "1"
+          GOFLAGS: "-buildvcs=false"
+          BRIEF_REQUIRE_BROWSER: "1"
+        run: go test -race ./...
+        background: true
+
       - name: Build linux/amd64
         working-directory: tools/heph-govet
         env:

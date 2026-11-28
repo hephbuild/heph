@@ -73,7 +73,8 @@ next to the code. Memory is for the user's preferences.
 
 ## 4. Print the next step
 
-End with exactly one line the user can paste into a new session:
+End with exactly one line the user can paste into a new session (two at the end of
+implementation, below):
 
 ```
 /goal implement <spec-url> (spec text: <exported .md path>)
@@ -83,5 +84,16 @@ End with exactly one line the user can paste into a new session:
 A spec with several PRs gets one line per PR, so each is built in its own context — stacked or
 not. Building every layer of a stack in one context is what grows it past 400k (CLAUDE.md, "One
 implementation context per stack layer").
+
+**At the end of implementation**, print a second line beside the follow-up prompt, for the PR or
+stack once its review board is done and its top is green on one platform:
+
+```
+/review-brief <bottom PR>
+```
+
+It runs in its own fresh session, never this one: the session that wrote the code does not
+triage it (`.claude/skills/review-brief/SKILL.md`, I6). A PR over about 1,000 lines gets a brief
+before review is requested.
 
 Do not keep working past the phase boundary in this session.
