@@ -34,10 +34,11 @@ async fn run_report(engine: &Arc<Engine>, addr: &str) -> anyhow::Result<String> 
     let home = rs.heph_home();
     Ok(ReportContext::gather(
         &failures,
-        |a| rs.took_down(a),
         |a| rs.was_cancelled(a),
         home.as_deref(),
+        rs.log_tail_lines(),
     )
+    .with_workspace(rs.workspace_root().as_deref())
     .render(false))
 }
 
@@ -118,7 +119,7 @@ async fn failure_report_points_at_any_log_the_engine_holds() -> anyhow::Result<(
     );
 
     let report =
-        ReportContext::gather(&failures, |a| rs.took_down(a), |_| false, None).render(false);
+        ReportContext::gather(&failures, |_| false, None, rs.log_tail_lines()).render(false);
     assert!(
         report.contains("\n✗ //p:t\n  │ boom\n  ╰ full log: heph log //p:t\n"),
         "{report}"
@@ -371,9 +372,9 @@ async fn failure_report_abandoned_timeout_leaves_sandbox() -> anyhow::Result<()>
     let run = crate::run_timeout::Abandoned::run(root.path(), false).await?;
     let report = ReportContext::gather(
         std::slice::from_ref(&run.failure),
-        |_| Default::default(),
         |_| false,
         Some(&run.engine.home),
+        heph::engine::Engine::DEFAULT_LOG_TAIL_LINES,
     )
     .render(false);
     run.drain().await;

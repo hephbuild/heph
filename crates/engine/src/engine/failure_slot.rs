@@ -1288,7 +1288,13 @@ mod tests {
     fn kept_groups_at_package_sorted_and_capped() {
         let dir = hcore::fsutil::tempdir().expect("tempdir");
         let pkg = dir.path().join("web");
-        for f in ["report/a", "report/deep/b", "report/deep/c", "z.txt", "a.txt"] {
+        for f in [
+            "report/a",
+            "report/deep/b",
+            "report/deep/c",
+            "z.txt",
+            "a.txt",
+        ] {
             let p = pkg.join(f);
             std::fs::create_dir_all(p.parent().expect("parent")).expect("mkdir");
             std::fs::write(&p, "x").expect("write");
