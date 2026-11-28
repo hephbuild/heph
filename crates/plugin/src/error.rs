@@ -803,8 +803,11 @@ pub struct TargetFailure {
     pub file: Option<std::sync::Arc<str>>,
     /// The shortest path from a requested target to [`addr`](Self::addr),
     /// inclusive (`[addr]` when it was itself requested), read off the
-    /// request's dependency graph when the failure was recorded. Empty when
-    /// no requested target reaches it, or when nobody computed it.
+    /// request's dependency graph when the failure was recorded, and read
+    /// again off the complete graph when the request hands its failures out
+    /// (`take_failures` / `failures`), so the reported path does not depend
+    /// on scheduling. Empty when no requested target reaches it, or when
+    /// nobody computed it.
     pub path: Vec<Addr>,
     /// The last lines of the target's process log (the full log is still saved
     /// as the `log.txt` artifact), with the real starting line number so the box

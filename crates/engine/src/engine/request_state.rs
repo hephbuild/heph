@@ -1356,18 +1356,50 @@ impl RequestState {
     }
 
     /// Drains and returns all recorded failures in insertion order, leaving the
-    /// registry empty. Called once at the end of execution to render.
+    /// registry empty. Called once at the end of execution to render. Each
+    /// failure's [`path`](TargetFailure::path) is the graph's as it is now
+    /// ([`with_final_paths`](Self::with_final_paths)).
     pub fn take_failures(&self) -> Vec<Arc<TargetFailure>> {
-        std::mem::take(&mut *self.data.failures.lock())
+        let failures = std::mem::take(&mut *self.data.failures.lock())
             .into_values()
-            .collect()
+            .collect();
+        self.with_final_paths(failures)
     }
 
     /// Every recorded failure, in insertion order, leaving the registry as
     /// it is: what `run --json` reads at request end, before `finalize`
-    /// takes them.
+    /// takes them. Paths as [`take_failures`](Self::take_failures) gives them.
     pub fn failures(&self) -> Vec<Arc<TargetFailure>> {
-        self.data.failures.lock().values().cloned().collect()
+        let failures = self.data.failures.lock().values().cloned().collect();
+        self.with_final_paths(failures)
+    }
+
+    /// `failures`, each [`path`](TargetFailure::path) recomputed on the
+    /// graph as it is now. A failure's path was read off the graph when it
+    /// was recorded, while the scheduler was still adding edges, so it
+    /// depended on what had resolved by then; at request end the graph is
+    /// complete and the shortest path is the same on every run. Called with
+    /// the failures lock released: `dep_dag` stays a leaf. A failure whose
+    /// path did not move keeps its `Arc`.
+    fn with_final_paths(&self, failures: Vec<Arc<TargetFailure>>) -> Vec<Arc<TargetFailure>> {
+        if failures.is_empty() {
+            return failures;
+        }
+        let paths: Vec<Vec<Addr>> = {
+            let dag = self.data.dep_dag.lock();
+            failures.iter().map(|f| dag.culprit_path(&f.addr)).collect()
+        };
+        failures
+            .into_iter()
+            .zip(paths)
+            .map(|(f, path)| {
+                if f.path == path {
+                    f
+                } else {
+                    Arc::new(f.as_ref().clone().with_path(path))
+                }
+            })
+            .collect()
     }
 
     /// [`take_failures`](Self::take_failures), each failure saying whether
@@ -2844,6 +2876,36 @@ mod tests {
             assert!(!requests.contains_key(&request_id));
         }
 
+        Ok(())
+    }
+
+    /// A failure recorded while the graph was still growing is handed out
+    /// with the complete graph's shortest path, not the one known when it
+    /// was recorded (CQ-M3): a shorter edge resolving later moves it, so
+    /// the end report does not depend on scheduling.
+    #[tokio::test]
+    async fn handed_out_failures_carry_the_final_shortest_path() -> anyhow::Result<()> {
+        let (_tmp, engine) = test_engine()?;
+        let rs = engine.new_state();
+        let (r, a, b, c) = (addr("r"), addr("a"), addr("b"), addr("c"));
+        rs.mark_requested(&r);
+        rs.add_dep_for_test(&r, &a)?;
+        rs.add_dep_for_test(&a, &b)?;
+        rs.add_dep_for_test(&b, &c)?;
+        let early = rs.culprit_path(&c);
+        assert_eq!(early, [r.clone(), a, b, c.clone()], "the partial graph's path");
+        rs.record_failure(
+            c.clone(),
+            Arc::new(TargetFailure::new(c.clone(), None, anyhow::anyhow!("boom")).with_path(early)),
+        );
+        // The shorter edge resolves after the failure was recorded.
+        rs.add_dep_for_test(&r, &c)?;
+
+        let final_path = [r, c];
+        let [seen] = <[_; 1]>::try_from(rs.failures()).expect("one failure");
+        assert_eq!(seen.path, final_path, "failures() reads the final graph");
+        let [taken] = <[_; 1]>::try_from(rs.take_failures()).expect("one failure");
+        assert_eq!(taken.path, final_path, "take_failures() reads the final graph");
         Ok(())
     }
 
