@@ -715,7 +715,8 @@ mod tests {
     /// `"blocked"` outcome, gained `"skipped"`, and the fields a culprit
     /// carries are nullable where a record may lack them (a BUILD file that
     /// did not evaluate has no `addr`; a target with no requested root above
-    /// it has no `root`, `more` or `path`). `inspect failure` describes a slot
+    /// it has no `root`, `more` or `path`; `root` and `root_file` are each
+    /// null when the culprit is the other kind). `inspect failure` describes a slot
     /// that may hold no record of its target. Checked over the committed
     /// snapshot and over the tables it is generated from, so neither side can
     /// drift back to contract 1 alone.
@@ -767,6 +768,7 @@ mod tests {
                 ("run", "addr"),
                 ("run", "file"),
                 ("run", "root"),
+                ("run", "root_file"),
                 ("run", "more"),
                 ("run", "path"),
                 ("run", "exit_code"),

@@ -225,7 +225,8 @@ about one command's document: `docs/CODEGEN.md`, `docs/SESSIONS.md`,
 finishes (completion order, not address order), and one per **culprit**: a
 target or BUILD file whose own failure stopped something the selection asked
 for. A culprit the selector did not match is still written, with
-`selected: false`, and always before any record naming it as `root`. Any other
+`selected: false`, and always before any record naming it as `root` or
+`root_file`. Any other
 dependency the selector did not match gets no entry.
 
 Each record is output contract 2 (`heph version --json` reports
@@ -242,9 +243,10 @@ Each record is output contract 2 (`heph version --json` reports
 | `exit_code` | yes | its process's exit code: 0 for `ran`, the code for a `failed` run; null when nothing ran or a signal ended it. Read from the run's structured exit status, never parsed out of the error text |
 | `timed_out` | yes | it failed because its run outlasted its `timeout` |
 | `error` | yes | why it failed, on one line; null on success and on `skipped`. Its wording is not contract |
-| `root` | yes | the culprit. On a failed culprit, the record itself; on `skipped`, the nearest culprit it depends on. An address, or a file's path when it does not start with `//`. Null for `ran`, `cached` and `cancelled` |
-| `more` | yes | on `skipped`: how many culprits other than `root` it also reaches; null elsewhere |
-| `path` | yes | on a failed culprit: the shortest chain of addresses from a requested target down to it. On `skipped`: from this target down to `root`'s address. Inclusive at both ends and never elided; null elsewhere |
+| `root` | yes | the culprit, when it is a target: on a failed culprit, the record itself; on `skipped`, the nearest culprit it depends on. Always an address. Null when the culprit is a file (`root_file` names it), and for `ran`, `cached` and `cancelled` |
+| `root_file` | yes | the culprit, when it is a BUILD or `.bzl` file that did not evaluate: on the file's own record, its `file`; on `skipped`, the nearest culprit it depends on. Always a workspace-relative path. Null when the culprit is a target, and for `ran`, `cached` and `cancelled`. Exactly one of `root` and `root_file` is set on a `failed` or `skipped` record that has a culprit, as `addr` and `file` are on every record |
+| `more` | yes | on `skipped`: how many culprits other than its own it also reaches; null elsewhere |
+| `path` | yes | on a failed culprit: a shortest chain of addresses from a requested target down to it (see below for when it can differ between runs). On `skipped`: from this target down to the address its culprit was recorded at. Inclusive at both ends and never elided; null elsewhere |
 | `selected` | yes | the selector matched it. False only on a culprit written because something selected depends on it; a `file` record is never selected |
 | `failure` | yes | `{log, out, fixes}`, as `heph inspect failure`; null unless it failed running |
 | `outputs` | no | its output files, the set `--list-out` prints, narrowed by `--output`. Its tier is *free* (no spec, def or hash is added), but selecting it costs what `--list-out` does: a remote hit's outputs are downloaded, which the default fields never do. That is why it is not a default |
@@ -257,21 +259,22 @@ How the outcome is decided:
   cache hit whose blobs turned out to be gone is rebuilt, and reads as a miss.
 - `failed`: its own run failed, or resolving it did (parse, hash, sandbox).
 - `skipped`: it did not run because a culprit it depends on failed (`root`
-  names it). Skipped records come from a pass over the dependency graph at the
+  or `root_file` names it). Skipped records come from a pass over the dependency graph at the
   end of the request, so they are written once the run returns, after every
   culprit, and carry `error: null`: the error is on the culprit's record.
 - `cancelled`: Ctrl-C, SIGTERM or SIGHUP stopped the run while it was pending.
 
-To find what broke, read the records with `root` set: `select(.root) |
-.root` is the set of culprits, and on a culprit's own record `.path` is how
-the selection reached it.
+To find what broke, read the culprits' own records: they are the
+`outcome: "failed"` ones, and `select(.outcome == "failed") | .addr // .file`
+names each. On a culprit's record `.path` is how the selection reached it.
+`.root // .root_file` is a skipped record's culprit.
 
 #### Migrating from contract 1
 
 - `blocked_by` is removed, and the `"blocked"` outcome is now `"skipped"`.
-  `root` replaces `blocked_by`, and names the nearest culprit, not the failed
-  dependency at the far end of the chain.
-- `root`, `more`, `path`, `selected` and `file` are added.
+  `root` (a target) or `root_file` (a file) replaces `blocked_by`, and names
+  the nearest culprit, not the failed dependency at the far end of the chain.
+- `root`, `root_file`, `more`, `path`, `selected` and `file` are added.
 - A culprit the selector did not match is now written, with
   `selected: false`. A consumer that wants only what it asked for filters on
   `.selected`.

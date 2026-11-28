@@ -75,6 +75,7 @@ run	outputs	[string]?	free	opt-in
 run	path	[string]?	free	default
 run	remote	string?	free	default
 run	root	string?	free	default
+run	root_file	string?	free	default
 run	selected	bool	free	default
 run	timed_out	bool	free	default
 session inflight	id	string	free	default

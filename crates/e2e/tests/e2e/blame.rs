@@ -423,7 +423,8 @@ async fn deep_broken_build_blames_the_file() -> anyhow::Result<()> {
     );
     assert_eq!(file["file"], "d/BUILD", "{file}");
     assert_eq!(file["outcome"], "failed", "{file}");
-    assert_eq!(file["root"], "d/BUILD", "{file}");
+    assert_eq!(file["root_file"], "d/BUILD", "{file}");
+    assert!(file["root"].is_null(), "{file}");
     assert_eq!(file["selected"], false, "{file}");
     assert_eq!(
         file["path"],
@@ -432,7 +433,8 @@ async fn deep_broken_build_blames_the_file() -> anyhow::Result<()> {
     );
     let top = json.entry("//a:t");
     assert_eq!(top["outcome"], "skipped", "{top}");
-    assert_eq!(top["root"], "d/BUILD", "{top}");
+    assert_eq!(top["root_file"], "d/BUILD", "{top}");
+    assert!(top["root"].is_null(), "{top}");
     assert_eq!(top["path"], file["path"], "{top}");
     assert_eq!(json.box_count(), 1, "{}", json.boxes);
     assert!(json.boxes.contains("d/BUILD"), "{}", json.boxes);
@@ -472,8 +474,7 @@ async fn broken_build_one_box_for_two_requested_targets() -> anyhow::Result<()> 
 /// requested target of the package the walk was scanning (`//d:t`), not one
 /// guessed from the broken file's directory, which holds none of them.
 #[tokio::test]
-async fn walk_into_broken_loaded_file_enters_through_the_scanned_package() -> anyhow::Result<()>
-{
+async fn walk_into_broken_loaded_file_enters_through_the_scanned_package() -> anyhow::Result<()> {
     let ws = build_ws(&[
         ("a", &t("t", "")),
         (
