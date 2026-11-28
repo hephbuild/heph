@@ -298,7 +298,8 @@ pub(crate) async fn show(
     } else {
         None
     };
-    let next = next_action(&entry, meta, state, &snapshot, chain_root);
+    let culprit = folded.view.state().dashboard().first_culprit();
+    let next = next_action(&entry, meta, state, culprit, chain_root);
     // A Y/N still acting on the build: shown for as long as it acts, never
     // for a run that is over.
     let standing = folded.standing.filter(|_| {
@@ -575,12 +576,15 @@ fn follow_chain<'a>(
     at
 }
 
-/// What to do next, for every state.
+/// What to do next, for every state. `culprit` is the first target that
+/// failed on its own: a failed session points at its record, never at a
+/// target a dependency took down, which has none (`inspect failure` prints
+/// `null` for it).
 fn next_action(
     entry: &SessionEntry,
     meta: &SessionMeta,
     state: SessionState,
-    snapshot: &SessionSnapshot,
+    culprit: Option<&str>,
     chain_root: Option<&SessionEntry>,
 ) -> Next {
     let id = entry.id.encode();
@@ -632,14 +636,14 @@ fn next_action(
             false,
             "ask it what it is doing",
         ),
-        SessionState::Failed => match snapshot.failed.first() {
+        SessionState::Failed => match culprit {
             Some(addr) => heph(
                 NextKind::InspectFailure,
                 &["inspect", "failure", addr],
                 true,
                 "the failed target's log and outputs",
             ),
-            None => rerun("run it again: it failed before any target did"),
+            None => rerun("run it again: no target it recorded failed on its own"),
         },
         SessionState::Lost => rerun("run it again: the process is gone"),
         SessionState::Ok => Next {
