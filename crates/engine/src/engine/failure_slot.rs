@@ -2023,32 +2023,32 @@ mod tests {
             let a = addr(&format!("//p:t{i}"));
             assert!(engine.failure_slots.read(&a).is_some(), "{a} landed");
         }
-        // Nothing is held now: grow the map to its next prune, which
-        // leaves only what that lookup holds.
-        let mut held = Vec::new();
-        let mut i = 0;
-        while held.len() < 4 * N {
-            held.push(engine.failure_slots.slot_lock(&format!("again-{i}")));
-            i += 1;
-            let len = engine
+        // Nothing is held now: lookups at new keys, each released at once,
+        // grow the map to its next prune, which drops it below its
+        // high-water mark (FQ r2).
+        let len = || {
+            engine
                 .failure_slots
                 .slot_locks
                 .lock()
                 .expect("locks")
                 .map
-                .len();
-            if len == held.len() {
-                break;
-            }
-        }
-        let len = engine
-            .failure_slots
-            .slot_locks
-            .lock()
-            .expect("locks")
-            .map
-            .len();
-        assert_eq!(len, held.len(), "the released exclusions were pruned");
+                .len()
+        };
+        let mut high = len();
+        let shrunk = (0..4 * N + SlotLocks::PRUNE_MIN).any(|i| {
+            drop(engine.failure_slots.slot_lock(&format!("again-{i}")));
+            let now = len();
+            let dropped = now < high;
+            high = high.max(now);
+            dropped
+        });
+        assert!(shrunk, "the map never pruned its released exclusions");
+        assert!(
+            len() <= 1,
+            "only the last lookup's entry is left: {}",
+            len()
+        );
         // Generous: the quadratic walk took seconds at this size.
         assert!(elapsed < std::time::Duration::from_secs(60), "{elapsed:?}");
     }
