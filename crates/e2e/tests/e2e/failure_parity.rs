@@ -280,10 +280,10 @@ target(name = "top", driver = "bash", out = "top.txt", deps = [":mid", ":other"]
 
 /// RUN-23: a failing dependency with `cache = False` reads exactly as a
 /// cached one does, in every renderer: the same box, the same report, the
-/// same records, and a slot with its log.
+/// same records, and a slot with its log. Its record's `cache` alone differs:
+/// `none` where the cached one's is `miss`, never null (U22).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "pending user decision: a cache = False culprit's run --json cache is null, or miss as a cached one's"]
-async fn uncached_dep_failure_reads_as_cached_one() -> anyhow::Result<()> {
+async fn uncached_dep_failure_reads_as_cached_one_but_cache_none() -> anyhow::Result<()> {
     let ws = Workspace::new();
     ws.write_build_file(
         "a",
@@ -303,6 +303,8 @@ target(name = "ca_top", driver = "bash", out = "o", deps = [":ca_fail"], run = "
         ws.engine.failure_slots().writes_drained().await;
         let inspect = inspect_json(&ws.engine, &fail)?;
         assert_eq!(inspect["log_lines"], 1, "{fail} keeps its log: {inspect}");
+        let want = if prefix == "nc" { "none" } else { "miss" };
+        assert_eq!(run.entry(&fail)["cache"], want, "{fail}: {:?}", run.entries);
         // The slot's directory is keyed by the address, so its path differs
         // by name alone: the `full log:` row is left out.
         let neutral = |s: &str| {
@@ -318,6 +320,8 @@ target(name = "ca_top", driver = "bash", out = "o", deps = [":ca_fail"], run = "
             .map(|e| {
                 let mut e = e.clone();
                 e["duration_ms"] = Value::Null;
+                // Asserted above, the one field that differs.
+                e["cache"] = Value::Null;
                 if e["failure"].is_object() {
                     e["failure"]["log"] = Value::Null;
                 }
