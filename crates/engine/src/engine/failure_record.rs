@@ -196,8 +196,8 @@ pub(crate) fn compact(
         ));
         rec.log = slot.log.as_ref().map(|log| LogRef {
             path: log.path().map(|p| p.display().to_string()),
-            fill_id: None,
-            lines: 0,
+            fill_id: slot.fill_id.clone(),
+            lines: slot.log_lines,
             memory_tail: log.memory_tail().map(|t| t.text.clone()),
         });
     }
