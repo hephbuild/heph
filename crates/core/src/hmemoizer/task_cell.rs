@@ -99,8 +99,8 @@ pub(crate) struct TaskCell<V> {
     /// [`Self::task_live`] reads it so that window does not read as
     /// "stranded": during it the cell is genuinely being driven, just by the
     /// caller's own stack rather than by a spawned task. The body reads it
-    /// through [`super::leave_caller_stack`], to get off that stack before it
-    /// holds its thread.
+    /// through [`super::abandoned_token`], which gets off that stack before
+    /// handing out the token a thread-holding wait would wait on.
     inline: AtomicBool,
     /// Cancelled when the cell is abandoned, just before its task is aborted
     /// ([`super::abandoned_token`]). Created on first use, by the body asking
@@ -1053,8 +1053,8 @@ mod tests {
     /// a join whose sibling fails (the engine's dep join under fail-fast),
     /// the join is stuck inside the wait, never sees the failure, never
     /// abandons the cell, and the wait never hears its token: it waited on
-    /// itself. `leave_caller_stack` moves the body onto its own task first,
-    /// so the join sees the failure and the abandonment reaches the wait.
+    /// itself. Taking the token moves the body onto its own task first, so
+    /// the join sees the failure and the abandonment reaches the wait.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_body_holding_its_thread_off_its_callers_stack_hears_a_sibling_fail() {
         let m: Arc<TaskInner<String, u32>> = Arc::new(inner("leave-stack"));
@@ -1064,8 +1064,9 @@ mod tests {
             let entered = Arc::clone(&entered);
             async move {
                 let inline_before = current_polled_inline();
-                super::super::leave_caller_stack().await;
-                let token = current_abandoned_token().expect("inside a body");
+                let token = super::super::abandoned_token()
+                    .await
+                    .expect("inside a body");
                 entered.store(true, Ordering::SeqCst);
                 tokio::task::block_in_place(|| spin_until(|| token.is_cancelled()));
                 let _sent = tx.send((inline_before, token.is_cancelled()));

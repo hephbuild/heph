@@ -213,10 +213,13 @@ fn phases() -> &'static Mutex<HashMap<u64, &'static str>> {
 ///
 /// It reaches a body only once that body has suspended: during the inline
 /// first poll the caller that holds the cell's only interest is the one
-/// driving it, so the cell cannot be abandoned until the body yields. A body
-/// that holds its thread waiting on this token must therefore call
-/// [`leave_caller_stack`] first, or it can wait for ever.
-pub fn abandoned_token() -> Option<crate::hasync::StdCancellationToken> {
+/// driving it, so the cell cannot be abandoned until the body yields. So
+/// this first moves the rest of the body off its caller's stack (see
+/// `leave_caller_stack`): a body that then holds its thread waiting on the
+/// token does so on a task the abandonment can reach, never inside the
+/// caller that would have to abandon it.
+pub async fn abandoned_token() -> Option<crate::hasync::StdCancellationToken> {
+    leave_caller_stack().await;
     task_cell::current_abandoned_token()
 }
 
@@ -242,7 +245,10 @@ pub fn is_abandoned() -> bool {
 /// wait waits on itself. Called first, the body suspends once (one task
 /// spawn), the caller's poll returns, and the wait runs on a task the
 /// abandonment can reach.
-pub async fn leave_caller_stack() {
+///
+/// Only [`abandoned_token`] calls it, so whoever can wait on the token has
+/// left the caller's stack before it can.
+async fn leave_caller_stack() {
     if task_cell::current_polled_inline() {
         tokio::task::yield_now().await;
     }
