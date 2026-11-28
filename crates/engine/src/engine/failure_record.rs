@@ -630,6 +630,22 @@ mod tests {
         MultiError((0..n).map(|i| anyhow::anyhow!(text(i))).collect()).into()
     }
 
+    /// FQ-11: the record's own cut of a memory tail keeps its end from a
+    /// char boundary when the cut point falls inside a 3-byte char.
+    #[test]
+    fn memory_tail_cap_at_char_boundary() {
+        let mut tail = "€".repeat(RECORD_CAP / 3 + 100);
+        assert_ne!(
+            (tail.len() - RECORD_CAP) % 3,
+            0,
+            "the cut falls inside a char"
+        );
+        assert!(keep_end(&mut tail, RECORD_CAP));
+        assert!(tail.len() <= RECORD_CAP && tail.len() > RECORD_CAP - 3);
+        assert!(tail.chars().all(|c| c == '€'));
+        assert!(!keep_end(&mut tail, RECORD_CAP), "within the cap: kept");
+    }
+
     #[test]
     fn message_cap_2k_at_char_boundary() {
         // Two-byte chars: the cap (less the `…`) falls inside one.

@@ -1562,6 +1562,34 @@ mod tests {
         }
     }
 
+    /// FQ-11: a memory tail whose one line is over the cap keeps its end
+    /// from a char boundary. `€` is 3 bytes and the cut point falls inside
+    /// one: the cut moves to the next char, never splits it.
+    #[test]
+    fn memory_tail_cap_at_char_boundary() {
+        let cap = hcore::failure::RECORD_CAP;
+        let line = "€".repeat(cap / 3 + 100);
+        assert_ne!((line.len() - cap) % 3, 0, "the cut falls inside a char");
+        let (tail, cut) = capped_tail(LogTail {
+            text: line.clone(),
+            start_line: 1,
+        });
+        assert!(cut);
+        assert!(tail.text.len() <= cap && tail.text.len() > cap - 3);
+        assert!(tail.text.chars().all(|c| c == '€'));
+        assert!(line.ends_with(&tail.text));
+        assert_eq!(tail.start_line, 1, "no line was dropped");
+        // Whole lines go from the front first.
+        let lines = format!("{}\n{}", "x".repeat(100), "€".repeat(cap / 3 - 10));
+        let (tail, cut) = capped_tail(LogTail {
+            text: lines,
+            start_line: 1,
+        });
+        assert!(cut);
+        assert!(tail.text.starts_with('€') && tail.text.len() <= cap);
+        assert_eq!(tail.start_line, 2);
+    }
+
     #[test]
     fn failure_tail_cases() {
         let cases: [(&str, &[u8]); 9] = [
