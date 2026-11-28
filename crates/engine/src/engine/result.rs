@@ -2417,7 +2417,8 @@ fn record_culprit(
                 .with_outputs(outputs)
                 .with_fixes(fixes)
                 .with_sandbox(sandbox)
-                .with_streamed(streamed),
+                .with_streamed(streamed)
+                .with_revision_changed(revision_changed(&e)),
         ),
     );
     if fresh && let Some(claim) = claim {
@@ -2427,6 +2428,16 @@ fn record_culprit(
         announce_culprit(rs, &culprit, &entry, detail, &path);
     }
     (UpstreamFailed { root: culprit }.into(), fresh)
+}
+
+/// The revision that changed under the request, when `e` is that failure:
+/// on its chain, or on a failure another request recorded and surfaced.
+fn revision_changed(e: &anyhow::Error) -> Option<RevisionChangedError> {
+    downcast_chain_ref::<RevisionChangedError>(e)
+        .cloned()
+        .or_else(|| {
+            downcast_chain_ref::<TargetFailure>(e).and_then(|tf| tf.revision_changed.clone())
+        })
 }
 
 /// A fresh claim's record into its culprit's failure slot, in the
