@@ -122,12 +122,17 @@ async fn failure_load_20k() {
     let started = std::time::Instant::now();
     let sampler = FdSampler::start();
     let (rs, failures) = load.run(&ws.engine).await;
+    let took = started.elapsed();
+    // The claim writes land in the background; their drain is its own
+    // figure (FQ-1: their slot exclusions were once O(n²) to look up).
+    let drain_started = std::time::Instant::now();
+    ws.engine.failure_slots().writes_drained().await;
+    let drain = drain_started.elapsed();
     let max_fds = sampler.max();
     let peak = peak_rss_bytes();
     eprintln!(
-        "failure_load_20k: {load:?}\n  took {:?}\n  failures {}\n  peak rss {} MiB (before the run {} MiB)\n  \
+        "failure_load_20k: {load:?}\n  took {took:?}\n  slot writes drained in {drain:?} more\n  failures {}\n  peak rss {} MiB (before the run {} MiB)\n  \
          fds: before {before_fds}, max during {max_fds}, held after {}",
-        started.elapsed(),
         failures.len(),
         peak / (1024 * 1024),
         before_rss / (1024 * 1024),
