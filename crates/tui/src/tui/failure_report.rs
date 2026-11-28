@@ -45,8 +45,8 @@ use serde::Serialize;
 use unicode_width::UnicodeWidthChar;
 
 use crate::tui::failure_rows::{
-    TailRows, left_behind_rows_in, log_line_count, log_readable, reached_by_rows, shell_quote,
-    tail_rows, took_down_row,
+    LogRow, TailRows, left_behind_rows_in, log_line_count, log_readable, reached_by_rows,
+    shell_quote, tail_rows, took_down_row,
 };
 use crate::tui::text::{
     ELLIPSIS, Redact, WorkspaceRel, clean_inline, cut_right, escape_control, escape_log_tail,
@@ -161,6 +161,21 @@ fn culprit_name<'a>(rec: &'a FailureRecord, ctx: &RenderCtx) -> Cow<'a, str> {
 /// The address `heph log` reads the failure's log by.
 fn log_addr(rec: &FailureRecord) -> &str {
     rec.addr.as_deref().unwrap_or(&rec.entry)
+}
+
+/// The row of a log whose slot is gone (PV-2). The slot is cleared when the
+/// target next resolves, and by `heph tool gc` or a clean
+/// (`docs/FAILURE_OUTPUTS.md`); no command reads it back.
+const LOG_CLEARED: &str = "log cleared (a later run, gc or clean removed it); re-run to regenerate";
+
+/// Why no log was kept, when the record says (PV-2): a run whose outputs are
+/// credential material keeps its log in memory only, and its tail is all the
+/// box has.
+fn none_kept_why(rec: &FailureRecord) -> Option<&'static str> {
+    rec.log
+        .as_ref()
+        .filter(|l| l.path.is_none() && l.memory_tail.is_some())
+        .map(|_| "its outputs are credential material, so no log reaches the disk")
 }
 
 /// How the run ended, for the header: its timeout, its exit, or a
@@ -278,7 +293,11 @@ pub fn render_box(rec: &FailureRecord, ctx: &RenderCtx) -> String {
     if let Some(left) = &rec.left_behind {
         // A failure before the run never had a log: no `log:` row, not even
         // `none kept`.
-        let log_row = rec.log.is_some() || rec.failed_in != FailedIn::BeforeRun;
+        let log_row = if rec.log.is_some() || rec.failed_in != FailedIn::BeforeRun {
+            LogRow::Show(none_kept_why(rec))
+        } else {
+            LogRow::Omit
+        };
         b.out.push_str(&left_behind_rows_in(
             log_addr(rec),
             left,
@@ -876,7 +895,7 @@ impl<'a> BoxWriter<'a> {
                 return;
             }
             TailRead::Cleared => {
-                self.row("log cleared");
+                self.row(LOG_CLEARED);
                 return;
             }
             TailRead::Unreadable(e) => {
