@@ -17739,7 +17739,22 @@ mod tests {
         runs: SArc<AtomicUsize>,
         shell_runs: SArc<AtomicUsize>,
         log_path: std::path::PathBuf,
+        /// Set once a `wait` leaf's run has started: what a `fail_late`
+        /// leaf waits for, so the stop lands on a run in progress.
+        waiting: SArc<std::sync::atomic::AtomicBool>,
+        /// Set when a `wait` leaf's run gave up on its stop (see
+        /// [`TerminalDriver::wait_for_stop`]).
+        never_stopped: SArc<std::sync::atomic::AtomicBool>,
     }
+
+    /// Label on a leaf whose `run` holds its thread until it is told to stop,
+    /// then reports the stop as a failure of its own (as exec reports the
+    /// signal it was killed by, and as its `block_in_place` output park on
+    /// macOS holds the thread): a run fail-fast stops.
+    const WAIT_LABEL: &str = "terminal-test:wait";
+    /// Label on a leaf that fails as `fail` does, once a `wait` leaf's run
+    /// has started.
+    const FAIL_LATE_LABEL: &str = "terminal-test:fail_late";
 
     /// Label the driver stamps on a leaf whose `run` must fail; `TargetSpec`
     /// config is not visible from `run`, so the marker rides on the `TargetDef`.
@@ -17805,6 +17820,8 @@ mod tests {
                 (flag("fail"), FAIL_LABEL),
                 (flag("dup"), DUP_LABEL),
                 (flag("badout"), BADOUT_LABEL),
+                (flag("wait"), WAIT_LABEL),
+                (flag("fail_late"), FAIL_LATE_LABEL),
             ]
             .into_iter()
             .filter(|&(on, _)| on)
@@ -17858,10 +17875,19 @@ mod tests {
         async fn run<'a, 'io>(
             &self,
             req: RunRequest<'a, 'io>,
-            _ctoken: &(dyn Cancellable + Send + Sync),
+            ctoken: &(dyn Cancellable + Send + Sync),
         ) -> anyhow::Result<RunResponse> {
             self.runs.fetch_add(1, Ordering::SeqCst);
-            if req.target.labels.iter().any(|l| l == FAIL_LABEL) {
+            let labelled = |label: &str| req.target.labels.iter().any(|l| l == label);
+            if labelled(WAIT_LABEL) {
+                return Err(self.wait_for_stop(ctoken));
+            }
+            if labelled(FAIL_LATE_LABEL) {
+                while !self.waiting.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
+            if labelled(FAIL_LABEL) || labelled(FAIL_LATE_LABEL) {
                 // In the sandbox, where the engine reads a log from.
                 std::fs::create_dir_all(&req.sandbox_dir)?;
                 let log = req.sandbox_dir.join("log.txt");
@@ -17908,11 +17934,43 @@ mod tests {
         }
         async fn run_shell<'a, 'io>(
             &self,
-            _req: RunRequest<'a, 'io>,
-            _ctoken: &(dyn Cancellable + Send + Sync),
+            req: RunRequest<'a, 'io>,
+            ctoken: &(dyn Cancellable + Send + Sync),
         ) -> anyhow::Result<RunResponse> {
             self.shell_runs.fetch_add(1, Ordering::SeqCst);
+            if req.target.labels.iter().any(|l| l == WAIT_LABEL) {
+                return Err(self.wait_for_stop(ctoken));
+            }
             Ok(RunResponse::default())
+        }
+    }
+
+    impl TerminalDriver {
+        /// A `wait` leaf's run: holds its thread until `ctoken` says stop, so
+        /// an abort of its task cannot land before it returns, then reports
+        /// the stop as the signal it died of.
+        ///
+        /// Gives up after 20s and says so in `never_stopped`: a run that is
+        /// never told to stop (one that held its caller's stack, so the
+        /// caller never heard the sibling fail) fails the test rather than
+        /// hanging it.
+        fn wait_for_stop(&self, ctoken: &(dyn Cancellable + Send + Sync)) -> anyhow::Error {
+            self.waiting.store(true, Ordering::SeqCst);
+            let started = std::time::Instant::now();
+            let stopped = tokio::task::block_in_place(|| {
+                while !ctoken.is_cancelled() {
+                    if started.elapsed() > Duration::from_secs(20) {
+                        return false;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                true
+            });
+            if !stopped {
+                self.never_stopped.store(true, Ordering::SeqCst);
+                return anyhow::anyhow!("never told to stop");
+            }
+            crate::engine::error::ProcessFailed::new("signal: interrupt", None).into()
         }
     }
 
@@ -18045,6 +18103,8 @@ mod tests {
         probe: SArc<TerminalProbe>,
         runs: SArc<AtomicUsize>,
         shell_runs: SArc<AtomicUsize>,
+        /// Set when a `wait` leaf's run gave up waiting for its stop.
+        never_stopped: SArc<std::sync::atomic::AtomicBool>,
         _root: tempfile::TempDir,
         _logs: tempfile::TempDir,
     }
@@ -18069,19 +18129,26 @@ mod tests {
             parallelism: Some(4),
             ..Config::for_tests(root.path())
         })?;
-        engine.register_driver(enclose!((runs, shell_runs, log_path) move |_| {
-            Box::new(TerminalDriver {
-                runs,
-                shell_runs,
-                log_path,
-            })
-        }))?;
+        let waiting: SArc<std::sync::atomic::AtomicBool> = SArc::default();
+        let never_stopped: SArc<std::sync::atomic::AtomicBool> = SArc::default();
+        engine.register_driver(
+            enclose!((runs, shell_runs, log_path, never_stopped) move |_| {
+                Box::new(TerminalDriver {
+                    runs,
+                    shell_runs,
+                    log_path,
+                    waiting,
+                    never_stopped,
+                })
+            }),
+        )?;
         engine.register_provider(move |_| Box::new(SpecsProvider { targets }))?;
         Ok(TerminalHarness {
             engine: Arc::new(engine),
             probe: SArc::new(TerminalProbe::default()),
             runs,
             shell_runs,
+            never_stopped,
             _root: root,
             _logs: logs,
         })
@@ -19477,6 +19544,121 @@ mod tests {
             assert_eq!(rec.failed_in, hcore::failure::FailedIn::AfterRun, "{flag}");
             assert!(!rec.told_streamed(), "{flag}: its box is printed");
             assert!(!rec.cancelled, "{flag}");
+        }
+        Ok(())
+    }
+
+    /// CQ-3: under fail-fast, a sibling fails while a run is in progress. The
+    /// stopped run reports its stop as a failure of its own (a signal), and
+    /// it is a stop all the same: its wrapper hears of no failed process (no
+    /// `✗ … exit status` line while it holds the terminal), and nothing is
+    /// kept for it. The run holds the terminal as `--shell=//pkg:wait` gives
+    /// it, the one way a target that is not the sole selection gets one.
+    /// Both shapes of the stop:
+    ///
+    /// - siblings of one selection (`root`): the request's token is
+    ///   cancelled, and the run is reported as stopped while running;
+    /// - two deps of one target (`dep`): the failing dep's error drops the
+    ///   other's caller, and its execute is abandoned with the request's
+    ///   token untouched. The line used to read the request's token alone, so
+    ///   this run was told as a failure while the keep judged it a stop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fail_fast_stopped_run_tells_no_line_and_is_a_stop() -> anyhow::Result<()> {
+        for shape in ["root", "dep"] {
+            let mut bad = leaf_spec("//pkg:bad", false)?;
+            bad.config
+                .insert("fail_late".to_string(), hcore::htvalue::Value::Bool(true));
+            let mut wait = leaf_spec("//pkg:wait", false)?;
+            wait.config
+                .insert("wait".to_string(), hcore::htvalue::Value::Bool(true));
+            let mut targets = vec![bad, wait];
+            if shape == "dep" {
+                targets.push(leaf_with_deps_spec("//top:t", &["//pkg:bad", "//pkg:wait"])?);
+            }
+            let h = terminal_harness(targets)?;
+            let heard: SArc<parking_lot::Mutex<Vec<crate::engine::RunEnd>>> = SArc::default();
+            let wrapper: InteractiveWrapper = SArc::new({
+                let heard = SArc::clone(&heard);
+                move |inner: InteractiveInner| {
+                    let heard = SArc::clone(&heard);
+                    Box::pin(async move {
+                        let end = inner(None, None, None, None).await?;
+                        heard.lock().push(end);
+                        Ok(TerminalUse { streamed: true })
+                    })
+                }
+            });
+            let wait_addr = hmodel::htaddr::parse_addr("//pkg:wait")?;
+            let rs = h.state_with(
+                ShellTarget {
+                    addr: wait_addr.clone(),
+                    terminal: Some(wrapper),
+                },
+                true,
+            );
+            let opts = ResultOptions::default();
+            let res = if shape == "root" {
+                Arc::clone(&h.engine)
+                    .result(
+                        rs.clone(),
+                        &Matcher::Package(PkgBuf::from("pkg")),
+                        OutputMatcher::All,
+                        &opts,
+                    )
+                    .await
+                    .map(drop)
+            } else {
+                Arc::clone(&h.engine)
+                    .result_addr(
+                        rs.clone(),
+                        &hmodel::htaddr::parse_addr("//top:t")?,
+                        OutputMatcher::All,
+                        &opts,
+                    )
+                    .await
+                    .map(drop)
+            };
+            assert!(res.is_err(), "{shape}: the build fails");
+            assert!(
+                !h.never_stopped.load(Ordering::SeqCst),
+                "{shape}: the run was never told to stop",
+            );
+
+            // An abandoned run goes on on its own task until it hears the
+            // stop: wait for it to come back to its wrapper.
+            let started = std::time::Instant::now();
+            while heard.lock().is_empty() {
+                assert!(
+                    started.elapsed() < Duration::from_secs(30),
+                    "{shape}: the stopped run never came back to its wrapper"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            // Again now it is back: a run that went on on its own task and
+            // gave up at 20s, never told to stop, came back too.
+            assert!(
+                !h.never_stopped.load(Ordering::SeqCst),
+                "{shape}: the run was never told to stop",
+            );
+            let end = heard.lock().pop().expect("heard");
+            assert_eq!(
+                end.exec_failure, None,
+                "{shape}: a stopped run is not told as a failed process",
+            );
+            assert!(
+                rs.get_failure(&wait_addr).is_none(),
+                "{shape}: nothing is kept for a stop",
+            );
+            assert!(
+                rs.get_failure(&hmodel::htaddr::parse_addr("//pkg:bad")?)
+                    .is_some(),
+                "{shape}: the sibling's failure is what stopped it",
+            );
+            if shape == "root" {
+                assert!(rs.was_cancelled("//pkg:wait"), "reported as stopped");
+                let stopped = rs.fail_fast_stopped().expect("fail-fast stopped a run");
+                assert_eq!(stopped.running, vec!["//pkg:wait".to_string()]);
+            }
         }
         Ok(())
     }
