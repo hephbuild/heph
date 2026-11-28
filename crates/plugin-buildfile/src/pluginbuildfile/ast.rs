@@ -75,7 +75,6 @@ fn collect_assign_target<'a>(target: &'a AstAssignTarget, names: &mut HashSet<&'
 #[cfg(test)]
 mod tests {
     use super::*;
-    use starlark::syntax::Dialect;
 
     #[test]
     fn bound_names_collects_every_binding_form() {
@@ -91,7 +90,7 @@ for loop_var in [1]:
 def fn_name(param, *args_param, **kwargs_param):
     pass
 ";
-        let ast = AstModule::parse("BUILD", content.to_string(), &Dialect::Extended).unwrap();
+        let ast = AstModule::parse("BUILD", content.to_string(), &hxstarlark_fmt::DIALECT).unwrap();
         let names = bound_names(&ast);
         for expected in [
             "imported",

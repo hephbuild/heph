@@ -363,7 +363,7 @@ mod tests {
     use hcore::htvalue::signature::ParamType;
     use hplugin::driver::{DriverField, DriverSchema};
     use hplugin::provider::{StateField, StateSchema};
-    use starlark::syntax::{AstModule, Dialect};
+    use starlark::syntax::AstModule;
     use std::path::Path;
 
     /// An engine exposing one driver (`exec` with a required string `cmd` and an
@@ -453,7 +453,7 @@ mod tests {
     /// Validate `content` the way the server does: its tokens and overlay
     /// beside its AST.
     fn validate_src(content: &str) -> Vec<lsp_types::Diagnostic> {
-        let ast = AstModule::parse("BUILD", content.to_string(), &Dialect::Extended).unwrap();
+        let ast = AstModule::parse("BUILD", content.to_string(), &hxstarlark_fmt::DIALECT).unwrap();
         let tokens = super::super::lex::lex(content);
         let overlay = site::overlay_of(&ast);
         let doc = Doc {

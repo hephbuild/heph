@@ -84,12 +84,8 @@ pub fn explain(target: &str) -> anyhow::Result<Explanation> {
         .with_context(|| format!("column {col:?} in {target:?}"))?;
     let text = std::fs::read_to_string(file).with_context(|| format!("reading {file}"))?;
     let tokens = lex::lex(&text);
-    let parsed = starlark::syntax::AstModule::parse(
-        file,
-        text.clone(),
-        &starlark::syntax::Dialect::Extended,
-    )
-    .ok();
+    let parsed =
+        starlark::syntax::AstModule::parse(file, text.clone(), &hxstarlark_fmt::DIALECT).ok();
     let overlay = parsed.as_ref().map(site::overlay_of);
     let pos = lsp_types::Position::new(line.saturating_sub(1), col.saturating_sub(1));
     let resolution = match position::to_offset(&text, pos, position::Encoding::Utf32) {

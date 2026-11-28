@@ -355,12 +355,9 @@ target(name = \"direct\", driver = \"exec\")
         let src = "load(\"//lib\", \"make_name\", greeting = \"GREETING\")\n\
                    load(\"//other\", \"x\")\n\
                    load(\"//multi\",\n    \"a\",\n    \"b\",\n)\n";
-        let ast = starlark::syntax::AstModule::parse(
-            "BUILD",
-            src.to_string(),
-            &starlark::syntax::Dialect::Extended,
-        )
-        .unwrap();
+        let ast =
+            starlark::syntax::AstModule::parse("BUILD", src.to_string(), &hxstarlark_fmt::DIALECT)
+                .unwrap();
         let m = super::super::site::overlay_of(&ast).loaded;
         // positional: local == exported
         assert_eq!(

@@ -581,7 +581,7 @@ pub(crate) mod tests {
     use hplugin::function::FunctionRegistry;
     use starlark::environment::Module;
     use starlark::eval::Evaluator;
-    use starlark::syntax::{AstModule, Dialect};
+    use starlark::syntax::AstModule;
     use starlark::typing::{AstModuleTypecheck, Interface};
     use std::collections::HashMap;
 
@@ -1124,7 +1124,7 @@ pub(crate) mod tests {
     }
 
     fn parse(name: &str, src: &str) -> AstModule {
-        AstModule::parse(name, src.to_string(), &Dialect::Extended).expect("parses")
+        AstModule::parse(name, src.to_string(), &hxstarlark_fmt::DIALECT).expect("parses")
     }
 
     /// The static typechecker's errors over `src`, given loaded interfaces.

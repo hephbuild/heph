@@ -21,7 +21,7 @@ use hplugin::provider::{ListPackagesRequest, ListRequest, Provider as EProvider}
 use starlark::docs::DocModule;
 use starlark::environment::Globals;
 use starlark::errors::EvalMessage;
-use starlark::syntax::{AstModule, Dialect};
+use starlark::syntax::AstModule;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -351,7 +351,7 @@ impl LspContext for HephLspContext {
 
         // Parse the AST for the stock analysis (symbols, hover, goto); parse
         // errors become diagnostics.
-        let ast = match AstModule::parse(&filename, content.clone(), &Dialect::Extended) {
+        let ast = match AstModule::parse(&filename, content.clone(), &hxstarlark_fmt::DIALECT) {
             Ok(ast) => ast,
             Err(e) => {
                 if staged.is_some() {

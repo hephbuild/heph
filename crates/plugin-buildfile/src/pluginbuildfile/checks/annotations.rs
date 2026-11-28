@@ -345,7 +345,7 @@ def a(x):
         assert!(parse_build_source("pkg/BUILD", slash.to_string()).is_err());
         let dialect = starlark::syntax::Dialect {
             enable_positional_only_arguments: true,
-            ..starlark::syntax::Dialect::Extended
+            ..hxstarlark_fmt::DIALECT
         };
         let ast = AstModule::parse("pkg/BUILD", slash.to_string(), &dialect).expect("parses");
         assert_eq!(check(&ast), []);
@@ -449,8 +449,12 @@ for i in []:
         ("", "0x10", true),
         ("", "10000000000000000000000", true),
         // A literal, but not one that types: heph's dialect has types, so `...`
-        // parses. (It has no f-strings: see `literal_default_typed`.)
+        // parses.
         ("", "...", false),
+        // An f-string is a string, but not a literal: the typechecker leaves
+        // the parameter `Any`, with or without a placeholder.
+        ("", "f\"a\"", false),
+        ("D = 1\n", "f\"{D}\"", false),
         // A rebound `True` is not the global.
         ("True = 0\n", "True", false),
         ("True = 0\n", "False", true),
@@ -544,8 +548,6 @@ for i in []:
         };
         assert_eq!(nested("1"), none);
         assert_eq!(nested("None").len(), 1);
-        // heph's dialect has no f-strings; a dialect that adds them needs a row.
-        assert!(parse_build_source("pkg/BUILD", "def f(x = f\"a\"):\n    pass\n".into()).is_err());
         // `*args` and `**kwargs` have no default to type them.
         assert_eq!(lines("def f(*args, **kwargs):\n    pass\n").len(), 2);
     }
