@@ -134,6 +134,96 @@ pub fn open_fds() -> usize {
     std::fs::read_dir("/dev/fd").expect("list /dev/fd").count()
 }
 
+/// The local cache directory of a load's workspace, as an fd's path names it
+/// (canonical: macOS's `/var` is `/private/var`).
+pub fn cache_dir(ws: &super::Workspace) -> std::path::PathBuf {
+    std::fs::canonicalize(ws.dir.path())
+        .expect("canonicalize the workspace")
+        .join(".heph")
+        .join("cache")
+}
+
+/// What each open fd of this process is: its path, or its kind when it has
+/// none (a pipe, a socket, a kqueue). Sorted, for a diff of two readings.
+pub fn open_fd_paths() -> Vec<String> {
+    let mut paths: Vec<String> = std::fs::read_dir("/dev/fd")
+        .expect("list /dev/fd")
+        .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<i32>().ok())
+        .filter_map(fd_path)
+        .collect();
+    paths.sort();
+    paths
+}
+
+/// The open fds whose path is not under `dir`, each with `root` (the
+/// workspace) shown as `<ws>` so two workspaces' readings diff.
+pub fn open_fd_paths_outside(dir: &std::path::Path, root: &std::path::Path) -> Vec<String> {
+    let (dir, root) = (dir.to_string_lossy(), root.to_string_lossy());
+    let mut paths: Vec<String> = open_fd_paths()
+        .into_iter()
+        .filter(|p| !p.starts_with(dir.as_ref()))
+        .map(|p| p.replacen(root.as_ref(), "<ws>", 1))
+        .collect();
+    paths.sort();
+    paths
+}
+
+/// `None` when `fd` closed since it was listed (the listing's own fd).
+fn fd_path(fd: i32) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    let path = {
+        let mut buf = vec![0u8; usize::try_from(libc::PATH_MAX).unwrap_or(1024)];
+        // SAFETY: F_GETPATH writes at most PATH_MAX bytes, NUL-terminated,
+        // into `buf`, which holds PATH_MAX.
+        let rc = unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) };
+        (rc != -1).then(|| {
+            let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            String::from_utf8_lossy(buf.get(..end).unwrap_or_default()).into_owned()
+        })
+    };
+    #[cfg(not(target_os = "macos"))]
+    let path = std::fs::read_link(format!("/proc/self/fd/{fd}"))
+        .ok()
+        .map(|p| p.display().to_string());
+    if let Some(path) = path {
+        return Some(path);
+    }
+    let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: `st` is a valid, writable `stat`.
+    if unsafe { libc::fstat(fd, st.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: fstat returned 0, so it filled `st` (zeroed before).
+    let kind = match unsafe { st.assume_init() }.st_mode & libc::S_IFMT {
+        libc::S_IFIFO => "<pipe>",
+        libc::S_IFSOCK => "<socket>",
+        libc::S_IFCHR => "<char device>",
+        libc::S_IFREG => "<file>",
+        libc::S_IFDIR => "<dir>",
+        _ => "<other>",
+    };
+    Some(kind.to_owned())
+}
+
+/// The entries of `after` with no counterpart in `before`, as a multiset.
+pub fn fd_paths_added(before: &[String], after: &[String]) -> Vec<String> {
+    let mut left: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for p in before {
+        *left.entry(p).or_default() += 1;
+    }
+    after
+        .iter()
+        .filter(|p| match left.get_mut(p.as_str()) {
+            Some(n) if *n > 0 => {
+                *n -= 1;
+                false
+            }
+            _ => true,
+        })
+        .cloned()
+        .collect()
+}
+
 /// This process's peak resident set, in bytes: `ru_maxrss` is KiB on Linux
 /// and bytes on macOS.
 pub fn peak_rss_bytes() -> u64 {
@@ -161,16 +251,31 @@ pub struct FdSampler {
 
 impl FdSampler {
     pub fn start() -> Self {
+        Self::sampling(open_fds)
+    }
+
+    /// Counts only the fds whose path is not under `dir`.
+    pub fn start_outside(dir: std::path::PathBuf) -> Self {
+        let dir = dir.to_string_lossy().into_owned();
+        Self::sampling(move || {
+            open_fd_paths()
+                .iter()
+                .filter(|p| !p.starts_with(&dir))
+                .count()
+        })
+    }
+
+    fn sampling(count: impl Fn() -> usize + Send + 'static) -> Self {
         use std::sync::atomic::Ordering;
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = Arc::clone(&stop);
         let thread = std::thread::spawn(move || {
-            let mut max = open_fds();
+            let mut max = count();
             while !flag.load(Ordering::Acquire) {
-                max = max.max(open_fds());
+                max = max.max(count());
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
-            max.max(open_fds())
+            max.max(count())
         });
         Self { stop, thread }
     }

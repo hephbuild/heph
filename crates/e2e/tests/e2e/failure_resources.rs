@@ -7,7 +7,10 @@
 //! true only with nothing else running in it: nextest's process per test
 //! (CI), or a filter that selects it alone.
 
-use crate::common::failure_load::{FailureLoad, FdSampler, open_fds, peak_rss_bytes};
+use crate::common::failure_load::{
+    FailureLoad, FdSampler, cache_dir, fd_paths_added, open_fd_paths_outside, open_fds,
+    peak_rss_bytes,
+};
 
 /// I8: what the open-fd maximum during a failing run may exceed the green
 /// baseline's by.
@@ -16,7 +19,18 @@ const FD_SLACK: usize = 16;
 /// I8: a failure holds no open file. The most fds open while 200 failures
 /// (two of them under 50-deep chains) run and are recorded is within
 /// [`FD_SLACK`] of the same load passing, and what the request holds once
-/// they are recorded is within it of what was open before the run.
+/// they are recorded is within it of what the green run held.
+///
+/// Neither count includes the local cache's files (`<home>/cache/`). Deciding
+/// a failure's `log:` row (`Engine::log_readable`) lists the target's cache
+/// entries, so a failing run reads `cache.db` where a green run of
+/// `cache = False` targets never does. Its read pool opens a connection per
+/// concurrent read (a `cache.db` and a `cache.db-wal` fd each, plus one
+/// `-shm`) and keeps it for the engine's life, up to the pool's fixed size:
+/// how many of those reads overlapped, not how many failed. Measured on this
+/// load: 9 to 31 cache fds after 200 failures (4 to 15 connections, from one
+/// run to the next), one connection after a single failure; outside the
+/// cache, the same 12 fds as the green run.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn failure_fd_count_flat() {
     let load = FailureLoad {
@@ -33,22 +47,34 @@ async fn failure_fd_count_flat() {
     };
 
     let ws = green.workspace();
-    let sampler = FdSampler::start();
+    let cache = cache_dir(&ws);
+    let root = cache
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("<ws>/.heph/cache");
+    let sampler = FdSampler::start_outside(cache.clone());
     let (rs, _) = green.run(&ws.engine).await;
     let green_max = sampler.max();
     // The engine and the request still alive, as below: what an engine
-    // keeps open after a run (its cache, its locks) is not a failure's.
-    let green_held = open_fds();
+    // keeps open after a run (its locks) is not a failure's.
+    let green_held = open_fd_paths_outside(&cache, root);
     drop((rs, ws));
 
     let ws = load.workspace();
-    let sampler = FdSampler::start();
+    let cache = cache_dir(&ws);
+    let root = cache
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("<ws>/.heph/cache");
+    let sampler = FdSampler::start_outside(cache.clone());
     let (rs, failures) = load.run(&ws.engine).await;
     let failing_max = sampler.max();
-    let held = open_fds();
+    let held = open_fd_paths_outside(&cache, root);
+    let in_cache = open_fds().saturating_sub(held.len());
+    let (green_n, held_n) = (green_held.len(), held.len());
     eprintln!(
         "failure_fd_count_flat: during the run: green max {green_max}, failing max {failing_max}; \
-         after it: green {green_held}, holding {} failures {held}",
+         after it: green {green_n}, holding {} failures {held_n} (and {in_cache} in the cache)",
         failures.len()
     );
     assert!(
@@ -56,9 +82,10 @@ async fn failure_fd_count_flat() {
         "fds open during the failing run: {failing_max}, green baseline {green_max}"
     );
     assert!(
-        held <= green_held + FD_SLACK,
-        "{} recorded failures hold {held} fds, the green run {green_held}",
-        failures.len()
+        held_n <= green_n + FD_SLACK,
+        "{} recorded failures hold {held_n} fds, the green run {green_n}; held besides: {:#?}",
+        failures.len(),
+        fd_paths_added(&green_held, &held),
     );
     drop((rs, failures));
 }
