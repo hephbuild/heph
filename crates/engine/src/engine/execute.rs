@@ -760,7 +760,14 @@ impl Engine {
             .await
             .stage(Boundary::Credentials, addr)?;
         // The secrets the log is scrubbed of are known only once presented.
-        // Set before the run, so its first byte is scrubbed.
+        // Set before the run, so its first byte is scrubbed. The target's
+        // recorded failure is scrubbed of the same values (I7).
+        rs.add_scrub(
+            addr,
+            credential_mounts
+                .iter()
+                .flat_map(|m| m.redact.iter().cloned()),
+        );
         if let Some(log) = &log {
             log.set_needles(hdriver_support::redact::Needles::new(
                 credential_mounts.iter().flat_map(|m| m.redact.iter()),

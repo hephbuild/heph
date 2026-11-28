@@ -570,6 +570,9 @@ impl Engine {
                 by_addr.insert(key, value);
             }
         }
+        // A resolved value never reaches a recorded failure (I7): the
+        // consumer's is scrubbed of every value it read.
+        rs.add_scrub(consumer, by_addr.values().cloned());
         Ok(by_addr)
     }
 
