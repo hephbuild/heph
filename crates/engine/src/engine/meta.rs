@@ -64,6 +64,9 @@ impl Engine {
         // _no_track: meta is invoked from inner_result_addr after parent was
         // already set to addr — tracked get_def would record addr→addr.
         let def = Arc::clone(&self).get_def_no_track(rs.clone(), addr).await?;
+        // `inputs_result_meta` expands under `def.target_def.addr`; it must be
+        // the addr this meta is for.
+        debug_assert_eq!(def.target_def.addr, *addr);
         let (inputs, results) = self.clone().inputs_result_meta(rs.clone(), &def).await?;
 
         // `results` is the hashed inputs' results, index for index: each is
@@ -124,9 +127,10 @@ impl Engine {
     /// order the hashed inputs appear in them.
     ///
     /// An expansion that failed is never hashed: this fails with its errors.
-    /// It first builds the hashed inputs that did resolve (D1.f), so their own
+    /// It first builds the hashed inputs that resolved (D1.f), so their own
     /// failures are found and their successes cached, as they would have been
-    /// had the broken input not been there.
+    /// had the broken input not been there. Runtime-only inputs that resolved
+    /// stay unbuilt: nothing would consume them.
     async fn inputs_result_meta(
         self: Arc<Self>,
         rc: Arc<RequestState>,

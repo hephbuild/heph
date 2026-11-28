@@ -7257,7 +7257,7 @@ impl Engine {
                         // blames its real declarer through; the id itself,
                         // which reaches the def hash, is unchanged.
                         rs.note_transitive_declarer(&hash, &spec.addr);
-                        let id = format!("_transitive_{hash}_{i}");
+                        let id = crate::engine::expand::transitive_id(&hash, i);
                         anyhow::Ok(Some((id, transitive)))
                     } else {
                         anyhow::Ok(None)

@@ -2092,6 +2092,10 @@ impl BuildFileLoader {
                 {
                     return e;
                 }
+                // A file outside the workspace (a load through an absolute or
+                // external path) keeps its absolute path, deliberately: there
+                // is no root-relative name for it, and the absolute one still
+                // tells the user which file broke.
                 let rel = file_path.strip_prefix(&self.root).unwrap_or(file_path);
                 // Nested: its empty frame is then dropped from `{:#}` too
                 // (`write_chain`), so the text reads as the diagnostic's.
