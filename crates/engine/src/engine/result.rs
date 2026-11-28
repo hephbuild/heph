@@ -7083,10 +7083,7 @@ impl Engine {
             None => {
                 // The failure points at the `driver` option: its index.
                 rs.load_source_index(addr).await;
-                return Err(hplugin::error::DriverNotFound {
-                    driver: spec.driver.clone(),
-                }
-                .into());
+                return Err(self.driver_not_found(&spec.driver));
             }
         };
 

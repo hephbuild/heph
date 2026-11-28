@@ -19,20 +19,94 @@ impl fmt::Display for TargetNotFoundError {
 impl std::error::Error for TargetNotFoundError {}
 
 /// A target names a driver no plugin registered. Typed so a diagnostic can
-/// point at the target's `driver` option ([`DriverNotFound::FIELD`]).
+/// point at the target's `driver` option ([`DriverNotFound::FIELD`]), with
+/// the registered drivers nearest the name (D4) and, for a name that is a
+/// plugin's, that plugin's drivers.
 #[derive(Debug, Clone)]
 pub struct DriverNotFound {
     pub driver: String,
+    /// The nearest registered driver names, best first.
+    pub nearest: Vec<String>,
+    /// The registered drivers of the plugin `driver` names (`archive` →
+    /// `archive.create`, `archive.extract`), sorted.
+    pub of_plugin: Vec<String>,
 }
+
+/// The most of a plugin's drivers an unknown-driver error lists.
+const PLUGIN_DRIVERS_SHOWN: usize = 5;
 
 impl DriverNotFound {
     /// The option of the declaring call that names the driver.
     pub const FIELD: &'static str = "driver";
+
+    /// `driver` is not among `registered`, the registered driver names.
+    pub fn new<'a>(driver: &str, registered: impl IntoIterator<Item = &'a str> + Clone) -> Self {
+        let nearest = hcore::suggest::suggest(driver, registered.clone())
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let mut of_plugin: Vec<String> = registered
+            .into_iter()
+            .filter(|n| {
+                n.strip_prefix(driver)
+                    .is_some_and(|rest| rest.starts_with('.'))
+            })
+            .map(str::to_owned)
+            .collect();
+        of_plugin.sort_unstable();
+        Self {
+            driver: driver.to_owned(),
+            nearest,
+            of_plugin,
+        }
+    }
+
+    /// The error, with a [`Diagnostic`](crate::diagnostic::Diagnostic)
+    /// carrying the suggestions as hints over it.
+    pub fn into_error(self) -> anyhow::Error {
+        use hcore::diagnostic::{Diagnostic, Hint, HintKind, Stage};
+        let names: Vec<&str> = self.nearest.iter().map(String::as_str).collect();
+        let mut d = Diagnostic::new(Stage::Parse, self.headline());
+        d.hints = hcore::suggest::did_you_mean(&names);
+        if let Some(text) = self.plugin_drivers() {
+            d.hints.push(Hint::new(HintKind::ValidValues, text));
+        }
+        anyhow::Error::new(self).context(d)
+    }
+
+    fn headline(&self) -> String {
+        format!(
+            "driver not found: {}",
+            hcore::diagnostic::escape_control(&self.driver)
+        )
+    }
+
+    /// "plugin `archive` has drivers: archive.create, archive.extract".
+    fn plugin_drivers(&self) -> Option<String> {
+        (!self.of_plugin.is_empty()).then(|| {
+            format!(
+                "plugin `{}` has drivers: {}",
+                hcore::diagnostic::escape_control(&self.driver),
+                hcore::suggest::listed(
+                    self.of_plugin.iter().map(String::as_str),
+                    PLUGIN_DRIVERS_SHOWN
+                )
+            )
+        })
+    }
 }
 
 impl fmt::Display for DriverNotFound {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "driver not found: {}", self.driver)
+        f.write_str(&self.headline())?;
+        let names: Vec<&str> = self.nearest.iter().map(String::as_str).collect();
+        if let Some(text) = hcore::suggest::did_you_mean_text(&names) {
+            write!(f, "; {text}")?;
+        }
+        if let Some(text) = self.plugin_drivers() {
+            write!(f, " ({text})")?;
+        }
+        Ok(())
     }
 }
 
@@ -1338,6 +1412,45 @@ impl FailureLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// D4: an unknown driver names the nearest registered one, in its text
+    /// (what a `{:#}` log shows) and as a hint on its diagnostic; a name
+    /// nothing is near gets neither.
+    #[test]
+    fn driver_not_found_suggests_the_nearest_driver() {
+        use hcore::diagnostic::{Hint, HintKind};
+        let registered = ["bash", "exec", "fs", "group"];
+        let e = DriverNotFound::new("bsh", registered.iter().copied()).into_error();
+        assert_eq!(
+            format!("{e:#}"),
+            "driver not found: bsh: driver not found: bsh; did you mean `bash`?"
+        );
+        let d = crate::diagnostic::find_diagnostic(&e).expect("a diagnostic");
+        assert_eq!(d.message, "driver not found: bsh");
+        assert_eq!(d.hints, vec![Hint::new(HintKind::DidYouMean, "bash")]);
+        assert!(
+            hcore::hmemoizer::downcast_chain_ref::<DriverNotFound>(&e).is_some(),
+            "the typed error stays on the chain, for its location"
+        );
+
+        let e = DriverNotFound::new("zzzz", registered.iter().copied());
+        assert_eq!(e.to_string(), "driver not found: zzzz");
+    }
+
+    /// A name that is a plugin's, not a driver's, lists that plugin's
+    /// drivers; a name that only starts like one (`arch` for `archive.x`)
+    /// does not.
+    #[test]
+    fn driver_not_found_lists_a_plugins_drivers() {
+        let registered = ["archive.extract", "archive.create", "archived.x", "bash"];
+        let e = DriverNotFound::new("archive", registered.iter().copied());
+        assert_eq!(
+            e.to_string(),
+            "driver not found: archive (plugin `archive` has drivers: archive.create, archive.extract)"
+        );
+        let e = DriverNotFound::new("arch", registered.iter().copied());
+        assert!(e.of_plugin.is_empty(), "{e}");
+    }
 
     /// A captured child's failure lands in the log (appended, both streams),
     /// and the error carries that log and the exit — not the output itself.

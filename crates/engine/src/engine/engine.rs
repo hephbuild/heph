@@ -1168,6 +1168,13 @@ impl Engine {
         names
     }
 
+    /// The error for a target naming `driver`, which no plugin registered:
+    /// the nearest registered names as suggestions (D4). Error path only.
+    pub(crate) fn driver_not_found(&self, driver: &str) -> anyhow::Error {
+        hplugin::error::DriverNotFound::new(driver, self.drivers_by_name.keys().map(String::as_str))
+            .into_error()
+    }
+
     /// The state schema a registered provider exposes, if any. Used by a
     /// plugin's language server to complete and document a provider's state
     /// args (e.g. `provider_state(provider="<name>", …)` in a BUILD file).

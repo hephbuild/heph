@@ -46,3 +46,21 @@ async fn unknown_option_suggests_nearest_option() {
         text(&f)
     );
 }
+
+/// OPT-28 / EVAL-14: a driver name no plugin registered suggests the nearest
+/// registered one, and still points at the `driver` option.
+#[tokio::test]
+async fn unknown_driver_suggests_nearest() {
+    let src = "# y\ntarget(name = \"y\", driver = \"bsh\", run = \"x\")\n";
+    let ws = crate::common::Workspace::new();
+    ws.write_build_file("c", src);
+    let f = fail(&ws, "//c:y").await;
+    assert_eq!(f.record.diagnostic.message, "driver not found: bsh");
+    assert_eq!(hints(&f, HintKind::DidYouMean), vec!["bash".to_owned()]);
+    assert_eq!(
+        triple(loc(&f)),
+        at("c/BUILD", src, "driver"),
+        "{}",
+        text(&f)
+    );
+}
