@@ -4,8 +4,8 @@
 )]
 
 //! `entrypoint = True` through the shipped binary: what only a real process can
-//! show. The program's exit status becomes heph's, a signal death is re-raised
-//! rather than mapped to `128 + n`, and stdin reaches the program untouched.
+//! show. A failing program makes heph exit 1 (130 when heph received the
+//! stop), its own status on stderr, and stdin reaches the program untouched.
 //!
 //! Everything about the closure, caching and refusals is in-process, in
 //! `crates/e2e/tests/entrypoint.rs`.
@@ -101,14 +101,29 @@ fn args_on_an_unresolved_target_report_the_real_error() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The program's exit code is heph's, unchanged.
+/// A program that exits 0 makes heph exit 0; any other code makes it exit 1
+/// (U15), and the program's own code is on stderr, never on stdout.
 #[test]
-fn entrypoint_exit_code_passes_through() -> anyhow::Result<()> {
+fn entrypoint_tool_exit_5_exits_1() -> anyhow::Result<()> {
     let dist = Dist::locate();
     let ws = workspace()?;
-    for code in [0, 1, 2, 42, 127, 255] {
+    let out = ws.run(&dist, &["run", "//app:code", "--", "0"])?;
+    assert_eq!(out.status.code(), Some(0), "{}", describe(&out));
+    for code in [1, 2, 5, 125, 127, 130, 255] {
         let out = ws.run(&dist, &["run", "//app:code", "--", &code.to_string()])?;
-        assert_eq!(out.status.code(), Some(code), "{}", describe(&out));
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "tool {code}\n{}",
+            describe(&out)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(&format!("✗ //app:code · exit status: {code}")),
+            "tool {code}: its status on stderr\n{}",
+            describe(&out)
+        );
+        assert!(out.stdout.is_empty(), "tool {code}\n{}", describe(&out));
     }
     Ok(())
 }
@@ -149,11 +164,12 @@ fn entrypoint_stdin_passes_through() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A program killed by a signal kills heph with the same signal — never
-/// `exit 128 + n`, which a shell reads differently — and heph dumps no core of
-/// its own even when the caller allows one.
+/// A program killed by a signal heph never received — it signals itself —
+/// makes heph exit 1, not die of the signal (U19), even an INT or a TERM:
+/// only a stop heph receives is a cancel. heph dumps no core of its own even
+/// when the caller allows one, and the signal is on stderr.
 #[test]
-fn entrypoint_signal_death_is_reraised() -> anyhow::Result<()> {
+fn entrypoint_tool_killed_by_signal_exits_1() -> anyhow::Result<()> {
     let dist = Dist::locate();
     let ws = workspace()?;
     for (name, number) in [
@@ -173,14 +189,14 @@ fn entrypoint_signal_death_is_reraised() -> anyhow::Result<()> {
             "ulimit -c \"$(ulimit -H -c)\"",
             &["run", "//app:die", "--", name],
         ))?;
-        assert_eq!(
-            out.status.signal(),
-            Some(number),
-            "SIG{name}: heph must die of it\n{}",
+        assert_eq!(out.status.code(), Some(1), "SIG{name}\n{}", describe(&out));
+        assert!(!out.status.core_dumped(), "SIG{name}: heph dumped core");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(&format!("✗ //app:die · signal: {number}")),
+            "SIG{name}: the tool's signal on stderr\n{}",
             describe(&out)
         );
-        assert!(!out.status.core_dumped(), "SIG{name}: heph dumped core");
-        assert_eq!(out.status.code(), None, "SIG{name}: not an exit code");
     }
     Ok(())
 }
@@ -389,9 +405,8 @@ fn read_pid(path: &std::path::Path) -> i32 {
 
 /// SIGTERM and SIGUSR1 sent to heph's pid reach the tool exactly once each
 /// — they are not the terminal's, so only the relay delivers them (E17) — and
-/// heph neither dies of them nor acts on them; it exits with the tool's
-/// status. A TERM that kills the tool (what `timeout` sends) leaves no tool
-/// running: heph forwards it, then dies of it as the tool did.
+/// heph does not die of them. The TERM it received is a cancel: the tool
+/// then exits 4, and heph exits 130.
 #[test]
 fn entrypoint_signal_to_heph_is_forwarded() -> anyhow::Result<()> {
     let dist = Dist::locate();
@@ -425,15 +440,26 @@ fn entrypoint_signal_to_heph_is_forwarded() -> anyhow::Result<()> {
     std::thread::sleep(Duration::from_millis(300));
     std::fs::write(&stop, b"")?;
     let out = common::wait_output(child, common::RUN_DEADLINE)?;
-    assert_eq!(out.status.code(), Some(4), "{}", describe(&out));
+    assert_eq!(out.status.code(), Some(130), "{}", describe(&out));
     assert_eq!(lines(), "ready\nterm\nusr1\n", "each delivered once");
     assert!(
         out.stdout.is_empty(),
         "heph wrote to stdout: {}",
         describe(&out)
     );
+    Ok(())
+}
 
-    // `timeout`'s shape: one TERM at heph, the tool does not trap it.
+/// A stop heph receives while the tool runs is a cancel, exit 130 (U15), even
+/// when the same signal killed the tool: `timeout`'s shape, one TERM at heph
+/// that the tool does not trap, leaves no tool running and exits 130. A
+/// signal that is no stop (USR1) leaves the tool's failure an exit 1.
+#[test]
+fn entrypoint_cancel_exits_130() -> anyhow::Result<()> {
+    let dist = Dist::locate();
+    let ws = Workspace::new()?;
+    ws.write("app/BUILD", TRAP_BUILD)?;
+
     let pid_file = ws.root().join("hold.pid");
     let mut child = ws
         .cmd(&dist, &["run", "//app:hold"])
@@ -455,22 +481,44 @@ fn entrypoint_signal_to_heph_is_forwarded() -> anyhow::Result<()> {
         );
         std::thread::sleep(Duration::from_millis(20));
     };
-    assert_eq!(
-        status.signal(),
-        Some(SIGTERM),
-        "heph dies of the tool's TERM"
-    );
+    assert_eq!(status.code(), Some(130), "a TERM at heph is a cancel");
     assert!(!common::alive(tool), "the tool is gone with heph");
+
+    let log = ws.root().join("signals.log");
+    let stop = ws.root().join("stop");
+    let lines = || std::fs::read_to_string(&log).unwrap_or_default();
+    let child = ws
+        .cmd(&dist, &["run", "//app:trap"])
+        .env("HEPH_E2E_LOG", &log)
+        .env("HEPH_E2E_STOP", &stop)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    common::wait_until("the tool to set its traps", Duration::from_secs(60), || {
+        lines() == "ready\n"
+    });
+    common::signal(i32::try_from(child.id())?, libc::SIGUSR1);
+    common::wait_until("USR1 to reach the tool", Duration::from_secs(10), || {
+        lines() == "ready\nusr1\n"
+    });
+    std::fs::write(&stop, b"")?;
+    let out = common::wait_output(child, common::RUN_DEADLINE)?;
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "USR1 is no cancel\n{}",
+        describe(&out)
+    );
     Ok(())
 }
 
-/// heph's own failure after the target resolved exits 125 with its box, so it
-/// is never read as the tool's status (R4): a program that does not exist (an
-/// error from the driver's run that carries no exit status), a dependency
-/// that fails to build, an argument the target does not take. Before
-/// resolution it is 1, as for any command.
+/// heph's own failure after the target resolved exits 1 with its box (U15):
+/// a program that does not exist (an error from the driver's run that carries
+/// no exit status), a dependency that fails to build, an argument the target
+/// does not take. Before resolution it is 1 too, as for any command.
 #[test]
-fn error_frame_without_exit_exits_125_with_box() -> anyhow::Result<()> {
+fn error_frame_without_exit_exits_1_with_box() -> anyhow::Result<()> {
     let dist = Dist::locate();
     let ws = Workspace::new()?;
     ws.write(
@@ -482,28 +530,18 @@ target(name = "broken", driver = "exec", entrypoint = True, deps = {"b": ":boom"
 target(name = "noargs", driver = "exec", entrypoint = True, run = ["/bin/true"])
 "#,
     )?;
-    for (args, code, says) in [
-        (
-            &["run", "//app:missing"][..],
-            125,
-            "heph-e2e-no-such-program",
-        ),
-        (&["run", "//app:broken"][..], 125, "//app:boom"),
+    for (args, says) in [
+        (&["run", "//app:missing"][..], "heph-e2e-no-such-program"),
+        (&["run", "//app:broken"][..], "//app:boom"),
         (
             &["run", "//app:noargs", "--", "x"][..],
-            125,
             "takes no arguments",
         ),
-        (&["run", "//app:nosuch"][..], 1, "nosuch"),
+        (&["run", "//app:nosuch"][..], "nosuch"),
     ] {
         let out = ws.run(&dist, args)?;
         let stderr = String::from_utf8_lossy(&out.stderr);
-        assert_eq!(
-            out.status.code(),
-            Some(code),
-            "{args:?}\n{}",
-            describe(&out)
-        );
+        assert_eq!(out.status.code(), Some(1), "{args:?}\n{}", describe(&out));
         // A failure is reported once: live as `✗ <addr>` when its block
         // printed as it failed, otherwise in the end-of-run `×` box.
         assert!(
@@ -755,8 +793,8 @@ impl StallingRemote {
 /// R27: once the tool has exited, signals are heph's again. With the dep's
 /// upload stalled on an unresponsive remote, heph is still finishing after
 /// the tool exits; a Ctrl-C (SIGINT at heph) or a TERM then cancels the
-/// upload, and heph exits promptly — with the tool's status, printing no
-/// cancellation of its own.
+/// upload, and heph exits promptly, printing no cancellation of its own. The
+/// stop is no cancel of the run: the tool's exit 3 makes it exit 1, not 130.
 #[test]
 fn signal_after_the_tool_exits_cancels_the_uploads() -> anyhow::Result<()> {
     let dist = Dist::locate();
@@ -803,8 +841,8 @@ target(name = "tool", driver = "bash", entrypoint = True, deps = {"d": ":dep"},
             .map_err(|e| anyhow::anyhow!("SIG{name} did not end the upload wait: {e:#}"))?;
         assert_eq!(
             out.status.code(),
-            Some(3),
-            "SIG{name}: the tool's status\n{}",
+            Some(1),
+            "SIG{name}: the tool's failure, not a cancel\n{}",
             describe(&out)
         );
         let stderr = String::from_utf8_lossy(&out.stderr).to_lowercase();

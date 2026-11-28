@@ -298,32 +298,16 @@ fn main() -> ExitCode {
     session.configure_lookup(SessionRoot::for_reading(home.as_deref()));
 
     let exec_result = cli.command.execute(sink, &session, &cli.global);
-    // An entrypoint's program ended without success: heph exits as it did.
-    // Nothing to render — the program said what it had to say.
-    let tool_exit = exec_result
-        .as_ref()
-        .err()
-        .and_then(|e| e.downcast_ref::<commands::run::ToolExit>())
-        .map(|t| t.0);
     // A `u8` rather than an `ExitCode`, which cannot be read back: the session
     // records the number.
     let code: u8 = match &exec_result {
         Ok(_) => 0,
-        Err(e) => exit_code_for(
-            e,
-            tool_exit,
-            &session,
-            commands::bootstrap::cancel_requested(),
-        ),
+        Err(e) => exit_code_for(e, &session, commands::bootstrap::cancel_requested()),
     };
     let result = ExitCode::from(code);
     // `End` and the lock release, before anything slow on the way out
-    // (telemetry, the profiler). A tool killed by a signal has no exit code;
-    // the process re-raises it below.
-    session.finish(match tool_exit {
-        Some(hcore::process::Exit::Signal(_)) => None,
-        _ => Some(i32::from(code)),
-    });
+    // (telemetry, the profiler).
+    session.finish(Some(i32::from(code)));
 
     // Best-effort, opt-out usage telemetry: spool this invocation's event and,
     // when due, spawn the detached flusher (CI sends inline). Opted out, record
@@ -347,12 +331,6 @@ fn main() -> ExitCode {
         watcher.shutdown();
     }
 
-    // Die of the signal that killed the program, rather than exit 128+N: a
-    // shell treats "killed by SIGINT" and "exited 130" differently.
-    if let Some(hcore::process::Exit::Signal(sig)) = tool_exit {
-        hexecrunner::foreground::reraise(sig);
-    }
-
     result
 }
 
@@ -360,19 +338,16 @@ fn main() -> ExitCode {
 /// first type in the chain that claims the failure decides, in this order.
 /// `cancel_requested` is [`commands::bootstrap::cancel_requested`]: the user
 /// stopped the command.
-fn exit_code_for(
-    e: &anyhow::Error,
-    tool_exit: Option<hcore::process::Exit>,
-    session: &SessionSlot,
-    cancel_requested: bool,
-) -> u8 {
-    // An entrypoint's program ended without success: heph exits as it did.
-    if let Some(exit) = tool_exit {
-        return match exit {
-            // A wait status carries 0–255, so the conversion never falls back.
-            hcore::process::Exit::Code(code) => u8::try_from(code).unwrap_or(1),
-            // Re-raised by the caller, once everything else on the way out has run.
-            _ => 1,
+fn exit_code_for(e: &anyhow::Error, session: &SessionSlot, cancel_requested: bool) -> u8 {
+    // An entrypoint's program ended without success, with a code or killed
+    // by a signal: 1, or 130 when heph received the stop that ended it
+    // (error-reporting U15, U19). Nothing to render: the program said what it
+    // had to say, and its own status is on the `✗` line and in `--json`.
+    if e.downcast_ref::<commands::run::ToolExit>().is_some() {
+        return if cancel_requested {
+            commands::run::EXIT_CANCELLED
+        } else {
+            1
         };
     }
     // `--jq`: a filter that failed while it ran is 2 on every command, so it
@@ -401,8 +376,7 @@ fn exit_code_for(
         return 1;
     }
     // heph's own failure after the target resolved to an entrypoint (or a
-    // Ctrl-C before its tool started): its box, and 125 (or 130), so it is
-    // never read as the tool's status (R4).
+    // Ctrl-C before its tool started): its box, and 1 (or 130).
     if let Some(failed) = e.downcast_ref::<commands::run::InvokeFailed>() {
         report(&failed.error, session);
         return failed.code;
@@ -610,7 +584,7 @@ mod tests {
     fn exit_code_for_maps_a_cancel_to_130() {
         use heph::engine::error::CancelledError;
         let session = SessionSlot::new();
-        let code = |e: anyhow::Error, stopped: bool| exit_code_for(&e, None, &session, stopped);
+        let code = |e: anyhow::Error, stopped: bool| exit_code_for(&e, &session, stopped);
 
         let cancel = || anyhow::Error::new(CancelledError).context("running //p:a");
         assert_eq!(code(cancel(), false), 130, "a cancel in the chain");

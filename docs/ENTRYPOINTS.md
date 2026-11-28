@@ -220,15 +220,22 @@ bytes would share one artifact, and the second would get the first's. Only
 
 | Status | When |
 |---|---|
-| the tool's code | The tool exited, with any code, 0 included. Nothing is added. |
-| the tool's signal | The tool was killed by a signal: heph dies of the same signal (no core dump of its own), so a shell sees "killed by SIGINT", not `130`. |
-| `125` | heph failed after the target resolved to an entrypoint, before the tool ran: a dependency failed to build, an argument was refused, the closure could not be materialized, a credential could not be obtained, or the program could not be started (not found, not executable). The error is shown. |
-| `130` | Ctrl-C cancelled the run before the tool started, while its dependencies were building. |
-| `1` | The target could not be resolved at all (a typo, a broken BUILD file, not an entrypoint). |
+| `0` | The tool exited 0. |
+| `130` | The run was cancelled: Ctrl-C, TERM or HUP reached heph, before the tool started or while it ran, even when the same signal then killed the tool. |
+| `1` | Any other failure: the tool exited non-zero or was killed by a signal heph did not receive; heph failed after the target resolved, before the tool ran (a dependency, a refused argument, the closure, a credential, the spawn); or the target could not be resolved at all. |
 
-The table holds in every mode. The number alone does not say who failed, since a
-tool can exit `1` or `125` itself: a failure of heph's also prints an error to
-stderr.
+The table holds in every mode. The tool's own status is printed on stderr as
+`✗ //t · exit status: N` (or `· signal: N`); a failure of heph's prints its
+error instead. A signal after the tool exited (R27) is no cancel: the status
+stays what the tool's end made it.
+
+In the PTY mode, Ctrl-C and Ctrl-\ are bytes the tool's PTY turns into
+signals; heph receives no signal, so a tool they kill makes heph exit `1`.
+Under `--raw` the terminal signals heph's group, heph included, and a run
+whose tool then fails exits `130`.
+
+Before this release the tool's code passed through, a signal death was
+re-raised, and heph's own failure after resolution exited `125`.
 
 heph writes nothing to stdout during an invocation; its progress goes to
 stderr.
@@ -254,7 +261,8 @@ tool. A second Ctrl-C is not special.
 - A signal sent to heph's own pid or to its whole group — TERM, HUP, INT, QUIT,
   USR1 or USR2 — reaches the tool's group once, with no limits. So
   `kill -INT <heph pid>` reaches the foreground work of
-  `bash -c 'sleep 100; …'`. heph then exits with the tool's status. A job in a
+  `bash -c 'sleep 100; …'`. A TERM, HUP or INT is a cancel: heph exits `130`
+  unless the tool then exits 0. A job in a
   group of its own, under `bash -i`, is not reached.
 - A resize reaches the tool once: heph copies the size to the PTY, and the kernel
   signals the tool.
@@ -265,8 +273,8 @@ tool. A second Ctrl-C is not special.
   shares heph's process group.
 - A signal sent to heph's own pid — `kill <pid>`, `timeout 10 heph run …`, a CI
   runner stopping the job — is forwarded to the tool once: TERM, HUP, INT, QUIT,
-  USR1, USR2 and WINCH. heph then exits with the tool's status, so `timeout`
-  leaves no tool behind.
+  USR1, USR2 and WINCH, so `timeout` leaves no tool behind. A TERM, HUP or
+  INT is a cancel: heph exits `130` unless the tool then exits 0.
 - Two limits of sharing the terminal's process group:
   - While heph is the terminal's foreground job, a `kill -INT`, `-QUIT` or
     `-HUP` sent to heph's pid from elsewhere is dropped: heph cannot tell it

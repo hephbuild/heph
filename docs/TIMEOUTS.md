@@ -100,7 +100,7 @@ sandbox is removed all the same, writer or not.
 
 `--shell` is never timed: it is a person at a prompt. An entrypoint
 (`heph run //x`) is held to its `timeout` like a build, and a timed-out
-entrypoint exits 125. On the caller's terminal (inherited stdio, not a PTY)
+entrypoint exits 1, as any failure does. On the caller's terminal (inherited stdio, not a PTY)
 the tool shares heph's process group, so only its direct child is killed: a
 process it forked can outlive it.
 

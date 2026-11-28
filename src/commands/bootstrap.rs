@@ -656,17 +656,59 @@ fn inherited_ignored_in(
 }
 
 /// Set by the first stop that reached the shutdown handler while heph was the
-/// run's owner (not after an entrypoint's tool exited): the user cancelled.
+/// run's owner, or by a SIGINT, SIGTERM or SIGHUP heph received while an
+/// entrypoint's tool ran ([`SignalRelay::install`]); never after the tool
+/// exited: the user cancelled.
 static CANCEL_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Whether the user cancelled this process's command: a Ctrl-C key, or a
-/// SIGINT, SIGTERM or SIGHUP, that got through to the shutdown handler. A
-/// stop after an entrypoint's tool exited does not count (R27), nor does a
-/// fail-fast cancellation, which never goes through the trigger. `main` reads
-/// it for the exit code: a cancelled command exits 130, even when a failure
-/// came first.
+/// SIGINT, SIGTERM or SIGHUP, that got through to the shutdown handler, or
+/// that heph received while an entrypoint's tool ran (the relay forwards it
+/// to the tool, and records it). A stop after the tool exited does not count
+/// (R27), nor does a fail-fast cancellation, which never goes through the
+/// trigger, nor a signal sent to the tool alone, which heph never sees. `main`
+/// reads it for the exit code: a cancelled command exits 130, even when a
+/// failure came first or the same signal killed the tool.
 pub fn cancel_requested() -> bool {
     CANCEL_REQUESTED.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// While an entrypoint's tool runs, record each SIGINT, SIGTERM and SIGHUP
+/// heph receives as a cancel, from the signal handler itself (error-reporting
+/// D7: "a Ctrl-C that heph receives is still a cancel, 130, even when the same
+/// signal killed the tool"). Not from the relay's listener task: the terminal
+/// signals heph and the tool at once, and `main` could read the flag before
+/// that task ran. Registered once per process, beside tokio's own handlers
+/// (both go through `signal-hook-registry`, which chains them).
+///
+/// A HUP heph was started with ignored (`nohup`) is no cancel, as in
+/// [`cancel_on_term_and_hup`].
+fn record_relayed_cancels() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let hup_ignored = inherited_ignored(libc::SIGHUP);
+        for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            if sig == libc::SIGHUP && hup_ignored {
+                continue;
+            }
+            // SAFETY: the action is three atomic operations, which are
+            // async-signal-safe; it allocates, locks and blocks on nothing.
+            let registered =
+                unsafe { signal_hook_registry::register(sig, record_cancel_in_handler) };
+            if let Err(e) = registered {
+                tracing::warn!(error = %e, signal = sig, "recording a relayed cancel; a signal that ends the tool will exit 1 instead of 130");
+            }
+        }
+    });
+}
+
+/// The signal handler's action: a cancel, unless the tool has exited (R27)
+/// and no other invocation's tool still runs — the same test as the relay's.
+fn record_cancel_in_handler() {
+    if hcore::shutdown::is_after_tool() && !hcore::shutdown::is_transparent() {
+        return;
+    }
+    CANCEL_REQUESTED.store(true, std::sync::atomic::Ordering::Release);
 }
 
 /// Single consumer for the shutdown trigger. First press broadcasts
@@ -737,8 +779,10 @@ fn spawn_shutdown_handler(engine: Weak<engine::Engine>, mut rx: mpsc::UnboundedR
 /// [`hcore::shutdown::tool_exited`] on — once no other invocation's tool still
 /// runs — they forward nothing, and a TERM or HUP calls `after_tool`, which
 /// cancels what heph is still finishing (uploads, cleanup) so it exits
-/// promptly, with the tool's status. Ctrl-C reaches the same cancel through
-/// the shutdown trigger.
+/// promptly. Ctrl-C reaches the same cancel through the shutdown trigger.
+///
+/// An INT, TERM or HUP heph receives while the tool runs is a cancel of the
+/// command ([`cancel_requested`]): if the tool then fails, heph exits 130.
 pub struct SignalRelay {
     tx: engine::driver::SignalSender,
     after_tool: Arc<dyn Fn() + Send + Sync>,
@@ -789,6 +833,7 @@ impl SignalRelay {
                     .with_context(|| format!("listening for signal {signo} to relay it"))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
+        record_relayed_cancels();
         for (signo, mut listener) in listeners {
             let tx = self.tx.clone();
             let after_tool = Arc::clone(&self.after_tool);

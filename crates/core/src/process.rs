@@ -20,8 +20,7 @@
 pub enum Exit {
     /// Exited with this status.
     Code(i32),
-    /// Killed by this signal number. A caller that mirrors it re-raises the
-    /// signal rather than exiting `128 + n`: a shell tells the two apart.
+    /// Killed by this signal number.
     Signal(i32),
 }
 
@@ -37,11 +36,11 @@ impl Exit {
         }
     }
 
-    /// Whether this is a status a process can end a failed run with, so heph
-    /// can exit with it: a code in 1–255 (what a wait status carries), or a
-    /// signal whose default action terminates. A driver — a plugin's above
-    /// all — that reports anything else (code 0 or 300, a SIGSTOP, a SIGCHLD,
-    /// which re-raised would not end heph) is reporting heph's own failure.
+    /// Whether this is a status a process can end a failed run with: a code
+    /// in 1–255 (what a wait status carries), or a signal whose default
+    /// action terminates. A driver — a plugin's above all — that reports
+    /// anything else (code 0 or 300, a SIGSTOP, a SIGCHLD, which ends no
+    /// process) is reporting heph's own failure.
     pub fn is_failure_status(self) -> bool {
         match self {
             Exit::Code(code) => (1..=255).contains(&code),

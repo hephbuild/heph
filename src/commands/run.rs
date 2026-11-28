@@ -200,22 +200,21 @@ pub struct RunArgs {
     /// Ctrl-Z does nothing on a plain tool, since the kernel discards it. A tool
     /// that stops itself stops heph too, which gives your shell its prompt back;
     /// the tool shows as stopped after `bg`, so run `fg`.
-    /// Otherwise, or with `--raw`, it inherits heph's fds. Exit status:
-    /// the program's own code, unchanged (0 included); killed by a signal,
-    /// and the run dies of the same signal; 125 when the run failed before
-    /// the program started (a dependency, a refused argument, the closure,
-    /// credentials, the spawn), with the error shown; 130 when Ctrl-C
-    /// cancelled it before the program started; 1 when the target could not
-    /// be resolved at all. Nothing but the program writes to stdout.
+    /// Otherwise, or with `--raw`, it inherits heph's fds. Exit status: 0
+    /// when the program exits 0; 130 when the run was cancelled (Ctrl-C,
+    /// TERM or HUP reaching heph); 1 for any other failure, the program's
+    /// own included, whose status is printed as `✗ //t · exit status: N`.
+    /// Nothing but the program writes to stdout.
     ///
     /// Until the program starts, the run is like any other: Ctrl-C cancels
     /// it, TERM and HUP end it. While the program runs, every signal is the
     /// program's: Ctrl-C, Ctrl-\ and signals sent to the run's own pid reach
     /// it once (a `kill -INT` of the pid while the run owns the terminal is
     /// taken for the terminal's own; see docs/ENTRYPOINTS.md), and the run
-    /// acts on none of them. After it exits, Ctrl-C, TERM or HUP cancel
-    /// what the run is still finishing (cache uploads); the exit status stays
-    /// the program's. A program that traps INT and QUIT is
+    /// acts on none of them, except that an INT, TERM or HUP it received
+    /// makes it a cancel (130) if the program then fails. After it exits,
+    /// Ctrl-C, TERM or HUP cancel what the run is still finishing (cache
+    /// uploads); the exit status stays as the program ended. A program that traps INT and QUIT is
     /// stopped with `kill -9` on the run's pid; its supervisor then reaps
     /// the program. `--shell` opens a shell with the same command ready, always
     /// on a PTY of heph's: `show` prints what `run` would execute. A `--shell`'s
@@ -509,9 +508,9 @@ impl Drop for WinsizeWatch {
     }
 }
 
-/// The program an entrypoint ran ended without success: heph exits as it did,
-/// with its code, or by re-raising the signal that killed it. Carried out to
-/// `main` as an error so the exit goes through its usual tail.
+/// The program an entrypoint ran ended without success, with a code or killed
+/// by a signal: heph exits 1, or 130 when it received the stop (U15, U19).
+/// Carried out to `main` as an error so the exit goes through its usual tail.
 #[derive(Debug)]
 pub struct ToolExit(pub hcore::process::Exit);
 
@@ -528,19 +527,15 @@ impl std::error::Error for ToolExit {}
 
 /// heph failed after the target resolved to an entrypoint (R4): a dep build,
 /// a refused arg, materializing the closure, credentials, the spawn itself —
-/// exit 125, with `error`'s box — or the run was cancelled before the tool
-/// ran (Ctrl-C while its deps built) — exit 130. Either way the tool's own
-/// status is not in it, so it can never be mistaken for one.
+/// exit 1, with `error`'s box — or the run was cancelled before the tool
+/// ran (Ctrl-C while its deps built) — exit 130.
 #[derive(Debug)]
 pub struct InvokeFailed {
     pub code: u8,
     pub error: anyhow::Error,
 }
 
-/// Exit status for a heph-side failure after resolution (R4): outside the
-/// range a tool usually uses for itself, as `env`/`timeout`/`git` use it.
-pub const EXIT_HEPH_FAILED: u8 = 125;
-/// Exit status for a run cancelled (Ctrl-C) before its tool started.
+/// Exit status for a cancelled run: Ctrl-C, TERM or HUP.
 pub const EXIT_CANCELLED: u8 = 130;
 
 impl std::fmt::Display for InvokeFailed {
@@ -817,8 +812,8 @@ impl RunApp {
 
 impl RunApp {
     /// An entrypoint: run it through `Engine::invoke`, the TUI paused for it,
-    /// and hand how it ended out of the app so the binary exits as it did
-    /// (R4): the tool's status as is, [`InvokeFailed`] for heph's own failure
+    /// and hand how it ended out of the app: the tool's status (which `main`
+    /// turns into 0, 1 or 130), [`InvokeFailed`] for heph's own failure
     /// after resolution, and an ordinary error before it.
     ///
     /// Signals (R9): until the tool is about to be spawned — deps building,
@@ -829,14 +824,17 @@ impl RunApp {
     /// listeners, which forward every signal heph receives into the run; the
     /// driver delivers each to the tool. Once the tool exits (R27), signals
     /// are heph's again: Ctrl-C, TERM and HUP cancel what heph is still
-    /// finishing (uploads), silently, and the exit status stays the tool's.
+    /// finishing (uploads), silently, and the exit status stays as the tool
+    /// ended. An INT, TERM or HUP heph received while the tool ran is a
+    /// cancel ([`bootstrap::cancel_requested`]).
     async fn invoke(
         self,
         ctx: AppContext,
         rs: Arc<crate::engine::request_state::RequestState>,
         addr: crate::htaddr::Addr,
     ) -> anyhow::Result<Option<hcore::process::Exit>> {
-        self.label.set(format!("Invoking {}", addr.format()));
+        let shown = addr.format();
+        self.label.set(format!("Invoking {shown}"));
         let engine = Arc::downgrade(&self.engine);
         let (relay, signals) = bootstrap::signal_relay(move || {
             if let Some(e) = engine.upgrade() {
@@ -943,16 +941,19 @@ impl RunApp {
             hcore::shutdown::tool_exited(guard);
         }
         match outcome {
-            Ok(InvokeOutcome::Exited(exit)) => Ok(Some(exit)),
+            Ok(InvokeOutcome::Exited(exit)) => {
+                // heph exits 1 or 130 for any unsuccessful end (U15, U19), so
+                // the tool's own status is said here, on stderr, once.
+                if exit != hcore::process::Exit::Code(0) {
+                    tracing::error!("✗ {shown} · {exit}");
+                }
+                Ok(Some(exit))
+            }
             Ok(InvokeOutcome::Failed(e)) => {
                 // A cancellation reaches here as the driver's bare
                 // "cancelled", not a `CancelledError`: the request's token is
                 // what says whether this was Ctrl-C.
-                let code = if cancelled {
-                    EXIT_CANCELLED
-                } else {
-                    EXIT_HEPH_FAILED
-                };
+                let code = if cancelled { EXIT_CANCELLED } else { 1 };
                 let res: anyhow::Result<()> = Err(e);
                 let finalized =
                     crate::commands::errors::finalize(&ctx, &rs, res, None, |_| Ok(())).await;

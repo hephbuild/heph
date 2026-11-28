@@ -158,9 +158,10 @@ impl std::fmt::Debug for InvokeRequest {
 /// How an invocation that got past resolution ended (R4). A failure *before*
 /// the target resolved to an entrypoint is `invoke`'s `Err` instead.
 ///
-/// For the binary: `Exited(Exit::Code(n))` exits `n` with no box (0
-/// included); `Exited(Exit::Signal(s))` re-raises `s`; `Failed` prints its box
-/// and exits 125; `invoke`'s `Err` keeps today's exit 1.
+/// For the binary: `Exited(Exit::Code(0))` exits 0; any other `Exited`
+/// prints the status on one line and exits 1 (130 when heph received the
+/// stop); `Failed` prints its box and exits 1 (130 on cancel); `invoke`'s
+/// `Err` exits 1.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum InvokeOutcome {

@@ -56,9 +56,9 @@ fn read(path: &Path) -> anyhow::Result<String> {
 /// `heph run //app:tool -- a 'b c'` from a directory below the root, under a
 /// PTY: the cdylib's tool runs in the caller's directory with the caller's
 /// environment plus `HEPH_ROOT`, gets the args byte for byte and the terminal
-/// on all three fds, and its exit code is heph's. Then a SIGTERM sent to
-/// heph's pid reaches the tool's trap through the run stream, exactly once,
-/// and the tool's later exit code is heph's.
+/// on all three fds, and its exit 42 makes heph exit 1. Then a SIGTERM sent
+/// to heph's pid reaches the tool's trap through the run stream, exactly
+/// once, and is a cancel: the tool's later exit 7 makes heph exit 130.
 #[test]
 fn cdylib_entrypoint_runs() -> anyhow::Result<()> {
     let dist = Dist::locate();
@@ -77,7 +77,7 @@ fn cdylib_entrypoint_runs() -> anyhow::Result<()> {
             ("HEPH_TEST_OUT", &out_s),
         ],
     );
-    assert_eq!(pty.wait_exit(DEADLINE), Ended::Code(42), "{}", pty.seen());
+    assert_eq!(pty.wait_exit(DEADLINE), Ended::Code(1), "{}", pty.seen());
     let seen = read(&out)?;
     let root = seen
         .lines()
@@ -121,7 +121,8 @@ fn cdylib_entrypoint_runs() -> anyhow::Result<()> {
     std::thread::sleep(Duration::from_millis(500));
     assert_eq!(read(&terms)?, "got-term\n", "one TERM, one delivery");
     std::fs::write(cwd.join("waits.stop"), b"")?;
-    assert_eq!(pty.wait_exit(DEADLINE), Ended::Code(7), "{}", pty.seen());
+    // The TERM heph received is a cancel: 130, not the tool's 7.
+    assert_eq!(pty.wait_exit(DEADLINE), Ended::Code(130), "{}", pty.seen());
     assert_eq!(read(&terms)?, "got-term\n", "one TERM, one delivery");
     assert!(pty.cursor_visible(), "cursor left hidden\n{}", pty.screen());
     Ok(())
@@ -139,7 +140,7 @@ fn tool_terminal(
     let mut pty = Pty::spawn(dist, caller, args, &[("HEPH_TEST_OUT", &out_s)]);
     // Before the exit, which closes the terminal.
     let callers = pty.tty_name();
-    assert_eq!(pty.wait_exit(DEADLINE), Ended::Code(42), "{}", pty.seen());
+    assert_eq!(pty.wait_exit(DEADLINE), Ended::Code(1), "{}", pty.seen());
     let device = read(&caller.join("out.tty"))?;
     Ok((read(&out)?, device.trim_end().into(), callers))
 }
@@ -191,7 +192,7 @@ fn cdylib_tool_stopped_resumes_on_fg() -> anyhow::Result<()> {
     pty.type_line("fg");
     pty.wait_for("resumed-after-fg", Duration::from_secs(30));
     pty.wait_prompt();
-    assert_eq!(pty.last_status(), 4, "{}", pty.seen());
+    assert_eq!(pty.last_status(), 1, "the tool's exit 4\n{}", pty.seen());
     for pid in [heph, tool] {
         assert!(!common::alive(pid), "{pid} outlived the run");
     }

@@ -378,7 +378,9 @@ fn entrypoint_ctrl_c_goes_to_tool() -> anyhow::Result<()> {
 
     pty.send(&[0x03]);
     pty.wait_for("got-int-2", Duration::from_secs(20));
-    assert_eq!(pty.wait_exit(DEADLINE), Ended::Code(7), "{}", pty.seen());
+    // The presses were bytes to the tool's PTY, no signal heph received: the
+    // tool's exit 7 is a failure, 1 (U15), not a cancel.
+    assert_eq!(pty.wait_exit(DEADLINE), Ended::Code(1), "{}", pty.seen());
 
     let seen = pty.seen();
     assert!(!seen.contains("got-usr1-2"), "USR1 delivered twice\n{seen}");
@@ -451,7 +453,8 @@ fn entrypoint_kill_under_a_terminal() -> anyhow::Result<()> {
     pty.wait_for("got-int-1", Duration::from_secs(20));
     pty.send(&[0x03]);
     pty.wait_for("got-int-2", Duration::from_secs(20));
-    assert_eq!(pty.wait_exit(DEADLINE), Ended::Code(7), "{}", pty.seen());
+    // The TERMs heph received make the run a cancel: 130, not the tool's 7.
+    assert_eq!(pty.wait_exit(DEADLINE), Ended::Code(130), "{}", pty.seen());
     assert!(
         !pty.seen().contains("got-term-4"),
         "the first TERM once, the group TERM at most twice: four is one too many\n{}",
@@ -491,24 +494,19 @@ fn supervisor_survives_ctrl_c_and_reaps_after_kill_9() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The default run: the tool has a terminal on all three fds, and its status is
-/// heph's, whether it exited or died of a signal.
+/// The default run: the tool has a terminal on all three fds, and a tool that
+/// fails makes heph exit 1, whether it exited or died of a signal (U15, U19).
 #[test]
 fn default_run_is_a_tty_with_exit_status() -> anyhow::Result<()> {
     let dist = Dist::locate();
     let ws = workspace()?;
     let mut pty = Pty::spawn(&dist, ws.root(), &["run", "//app:status"], &[]);
     pty.wait_for("all-fds-a-tty", DEADLINE);
-    assert_eq!(pty.wait_exit(DEADLINE), Ended::Code(7), "{}", pty.seen());
+    assert_eq!(pty.wait_exit(DEADLINE), Ended::Code(1), "{}", pty.seen());
 
     let mut pty = Pty::spawn(&dist, ws.root(), &["run", "//app:status", "--", "die"], &[]);
     pty.wait_for("all-fds-a-tty", DEADLINE);
-    let ended = pty.wait_exit(DEADLINE);
-    assert!(
-        matches!(&ended, Ended::Signal(name) if name.to_lowercase().contains("term")),
-        "a tool's signal death is heph's: {ended:?}\n{}",
-        pty.seen()
-    );
+    assert_eq!(pty.wait_exit(DEADLINE), Ended::Code(1), "{}", pty.seen());
     Ok(())
 }
 
@@ -524,12 +522,13 @@ fn default_run_forwards_resize() -> anyhow::Result<()> {
     pty.resize(30, 100);
     pty.wait_for("resized-to-30 100-end", SHORT);
     common::signal(tool, libc::SIGALRM);
-    assert_eq!(pty.wait_exit(DEADLINE), Ended::Code(3), "{}", pty.seen());
+    assert_eq!(pty.wait_exit(DEADLINE), Ended::Code(1), "{}", pty.seen());
     Ok(())
 }
 
 /// A Ctrl-C through the PTY: a tool that traps INT sees it, and heph runs on
-/// until the tool says otherwise.
+/// until the tool says otherwise. The presses are bytes to the tool's PTY, no
+/// signal heph receives, so the tool's exit 7 makes heph exit 1.
 #[test]
 fn default_run_ctrl_c_reaches_the_tool() -> anyhow::Result<()> {
     let dist = Dist::locate();
@@ -541,7 +540,7 @@ fn default_run_ctrl_c_reaches_the_tool() -> anyhow::Result<()> {
     assert!(common::alive(pty.pid()), "heph went with the Ctrl-C");
     pty.send(&[0x03]);
     pty.wait_for("got-int-2", SHORT);
-    assert_eq!(pty.wait_exit(DEADLINE), Ended::Code(7), "{}", pty.seen());
+    assert_eq!(pty.wait_exit(DEADLINE), Ended::Code(1), "{}", pty.seen());
     Ok(())
 }
 
@@ -571,7 +570,8 @@ fn plain_tool_under_ctrl_z_keeps_running() -> anyhow::Result<()> {
 
     pty.send(b"quit\n");
     pty.wait_prompt();
-    assert_eq!(pty.last_status(), 5, "{}", pty.seen());
+    // The tool's exit 5: a failure, 1.
+    assert_eq!(pty.last_status(), 1, "{}", pty.seen());
     Ok(())
 }
 
@@ -591,7 +591,7 @@ fn tool_handling_sigtstp_sees_it() -> anyhow::Result<()> {
 
     common::signal(tool, libc::SIGALRM);
     pty.wait_prompt();
-    assert_eq!(pty.last_status(), 3, "{}", pty.seen());
+    assert_eq!(pty.last_status(), 1, "the tool's exit 3\n{}", pty.seen());
     Ok(())
 }
 
@@ -621,7 +621,7 @@ fn self_sigstop_suspends_and_resumes() -> anyhow::Result<()> {
     pty.type_line("fg");
     pty.wait_for("resumed-after-fg", SHORT);
     pty.wait_prompt();
-    assert_eq!(pty.last_status(), 4, "{}", pty.seen());
+    assert_eq!(pty.last_status(), 1, "the tool's exit 4\n{}", pty.seen());
     assert!(!pty.alternate_screen(), "{}", pty.screen());
     assert!(pty.termios().is_cooked(), "{:?}", pty.termios());
     assert!(pty.cursor_visible(), "cursor left hidden\n{}", pty.screen());
@@ -661,7 +661,12 @@ fn tool_dies_while_heph_stopped() -> anyhow::Result<()> {
 
     pty.type_line("fg");
     pty.wait_prompt();
-    assert_eq!(pty.last_status(), 128 + libc::SIGKILL, "{}", pty.seen());
+    assert_eq!(
+        pty.last_status(),
+        1,
+        "the tool's SIGKILL, never heph's own\n{}",
+        pty.seen()
+    );
     assert!(pty.termios().is_cooked(), "{:?}", pty.termios());
     Ok(())
 }
@@ -747,7 +752,7 @@ fn resize_while_stopped_seen_once() -> anyhow::Result<()> {
 
     common::signal(tool, libc::SIGALRM);
     pty.wait_prompt();
-    assert_eq!(pty.last_status(), 8, "{}", pty.seen());
+    assert_eq!(pty.last_status(), 1, "the tool's exit 8\n{}", pty.seen());
     Ok(())
 }
 
@@ -810,7 +815,7 @@ fn bg_leaves_tool_stopped_until_fg() -> anyhow::Result<()> {
     pty.type_line("fg");
     pty.wait_for("resumed-after-fg", SHORT);
     pty.wait_prompt();
-    assert_eq!(pty.last_status(), 4, "{}", pty.seen());
+    assert_eq!(pty.last_status(), 1, "the tool's exit 4\n{}", pty.seen());
     Ok(())
 }
 
@@ -837,7 +842,7 @@ fn stop_bg_fg_keeps_the_keyboard() -> anyhow::Result<()> {
     pty.wait_for("line-[typed-after-fg]", SHORT);
     pty.type_line("quit");
     pty.wait_prompt();
-    assert_eq!(pty.last_status(), 5, "{}", pty.seen());
+    assert_eq!(pty.last_status(), 1, "the tool's exit 5\n{}", pty.seen());
     Ok(())
 }
 
@@ -869,7 +874,9 @@ fn term_while_stopped_pending_until_fg() -> anyhow::Result<()> {
 
     common::signal(tool, libc::SIGALRM);
     pty.wait_prompt();
-    assert_eq!(pty.last_status(), 8, "{}", pty.seen());
+    // The TERM heph received, late as it was, is a cancel: 130, not the
+    // tool's 8.
+    assert_eq!(pty.last_status(), 130, "{}", pty.seen());
     Ok(())
 }
 
@@ -929,7 +936,7 @@ fn stop_during_drain_is_ignored() -> anyhow::Result<()> {
         "heph left after {elapsed:?}\n{}",
         pty.seen()
     );
-    assert_eq!(pty.last_status(), 5, "{}", pty.seen());
+    assert_eq!(pty.last_status(), 1, "the tool's exit 5\n{}", pty.seen());
     let seen = pty.seen();
     assert_eq!(
         seen.matches("Stopped").count(),
@@ -950,17 +957,17 @@ fn default_run_restores_the_terminal() -> anyhow::Result<()> {
     let run = |target: &str| format!(r#""$HEPH" run //app:{target}"#);
 
     let (_, status) = run_held(&dist, &ws, &run("status"), &[], |_| {});
-    assert_eq!(status, 7, "normal exit");
+    assert_eq!(status, 1, "the tool's exit 7");
 
     let (_, status) = run_held(&dist, &ws, &run("status -- die"), &[], |_| {});
-    assert_eq!(status, 128 + libc::SIGTERM, "signal death");
+    assert_eq!(status, 1, "the tool's signal death");
 
     for (name, sig) in [("TERM", libc::SIGTERM), ("HUP", libc::SIGHUP)] {
         let (_, status) = run_held(&dist, &ws, &run("hold"), &[], |pty| {
             pty.wait_for("hold-ready", DEADLINE);
             common::signal(pty.number_after("heph-pid-"), sig);
         });
-        assert_eq!(status, 128 + sig, "{name} to heph");
+        assert_eq!(status, 130, "{name} to heph is a cancel");
     }
 
     let (pty, status) = run_held(&dist, &ws, &run("missing"), &[], |_| {});
@@ -1058,7 +1065,7 @@ fn default_run_no_log_no_redaction() -> anyhow::Result<()> {
         &[("HEPH_E2E_SECRET", SECRET)],
     );
     pty.wait_for(&format!("using {SECRET}"), DEADLINE);
-    assert_eq!(pty.wait_exit(DEADLINE), Ended::Code(3), "{}", pty.seen());
+    assert_eq!(pty.wait_exit(DEADLINE), Ended::Code(1), "{}", pty.seen());
     assert_eq!(
         logs_below(&ws.root().join(".heph/sandbox")),
         [] as [std::path::PathBuf; 0]
@@ -1248,7 +1255,8 @@ fn default_run_signals_forwarded_once() -> anyhow::Result<()> {
     assert!(!seen.contains("winch-2-"), "a resize\n{seen}");
 
     common::signal(tool, libc::SIGALRM);
-    assert_eq!(pty.wait_exit(DEADLINE), Ended::Code(8), "{}", pty.seen());
+    // The TERM, HUP and INT heph received make the run a cancel.
+    assert_eq!(pty.wait_exit(DEADLINE), Ended::Code(130), "{}", pty.seen());
     Ok(())
 }
 
@@ -1270,7 +1278,8 @@ fn relay_reaches_the_foreground_group() -> anyhow::Result<()> {
     pty.wait_for("fgwork-ready", DEADLINE);
     common::signal(pty.pid(), libc::SIGINT);
     pty.wait_for("sleep-was-cut", SHORT);
-    assert_eq!(pty.wait_exit(DEADLINE), Ended::Code(9), "{}", pty.seen());
+    // The INT heph received is a cancel: 130, not the tool's 9.
+    assert_eq!(pty.wait_exit(DEADLINE), Ended::Code(130), "{}", pty.seen());
     Ok(())
 }
 
@@ -1303,7 +1312,7 @@ fn default_run_drain_is_bounded() -> anyhow::Result<()> {
     let tool = pty.number_after("tool-pid-");
     common::wait_until("the tool to be gone", SHORT, || !common::alive(tool));
     let gone = std::time::Instant::now();
-    assert_eq!(pty.wait_exit(DEADLINE), Ended::Code(5), "{}", pty.seen());
+    assert_eq!(pty.wait_exit(DEADLINE), Ended::Code(1), "{}", pty.seen());
     let elapsed = gone.elapsed();
 
     let alive_at_exit = running(daemon_pid(&pidfile)?);
@@ -1453,7 +1462,12 @@ fn tool_closes_slave_without_exiting() -> anyhow::Result<()> {
     common::wait_until("the tool to close its stdio", SHORT, || closed.exists());
     assert!(common::alive(pty.pid()), "heph left\n{}", pty.seen());
     std::fs::write(&go, b"")?;
-    assert_eq!(pty.wait_exit(DEADLINE), Ended::Code(6), "{}", pty.seen());
+    assert_eq!(
+        pty.wait_exit(DEADLINE),
+        Ended::Code(1),
+        "the tool's exit 6\n{}",
+        pty.seen()
+    );
     Ok(())
 }
 
@@ -1507,16 +1521,13 @@ echo "waited=$?="; read -r _
     });
     pty.send(b"\n");
     pty.wait_for("waited=", SHORT);
-    assert_eq!(
-        pty.number_after("waited="),
-        128 + libc::SIGTERM,
-        "{}",
-        pty.seen()
-    );
+    // The TERM heph received is a cancel, though it also killed the tool.
+    assert_eq!(pty.number_after("waited="), 130, "{}", pty.seen());
     drop(pty);
 
     // The terminal closes, a tool that traps the hangup survives and then stops:
-    // heph never takes that first stop, and the tool's status is heph's.
+    // heph never takes that first stop. The hangup heph received is a cancel:
+    // the tool's exit 9 makes it exit 130.
     let dir = tempfile::tempdir()?;
     let go = dir.path().join("go");
     let mut pty = Pty::spawn(
@@ -1529,7 +1540,7 @@ echo "waited=$?="; read -r _
     let tool = pty.number_after("tool-pid-");
     pty.close_terminal();
     std::fs::write(&go, b"")?;
-    assert_eq!(pty.wait_exit(DEADLINE), Ended::Code(9));
+    assert_eq!(pty.wait_exit(DEADLINE), Ended::Code(130));
     assert!(!common::alive(tool), "the tool outlived heph");
 
     for name in ["stopper", "hupstop"] {

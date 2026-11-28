@@ -565,8 +565,8 @@ impl std::error::Error for FileEvalFailed {}
 ///
 /// `status` is the human text (std's `ExitStatus` display, which is not a
 /// contract and must never be parsed); `exit` is the same status as data, for
-/// a caller that mirrors it (an entrypoint's code becomes heph's exit code, its
-/// signal is re-raised). `None` when the driver did not report one — every
+/// a caller that reads it (an entrypoint's code or signal, which heph prints
+/// and which `--json` carries). `None` when the driver did not report one — every
 /// driver before the field existed, and a failure that is not a child's exit.
 ///
 /// `#[non_exhaustive]`: built with [`ProcessFailed::new`] outside this crate,
