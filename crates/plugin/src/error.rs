@@ -345,7 +345,8 @@ pub struct MissingDep {
 impl fmt::Display for MissingDep {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Until targets carry their source location, the package is the
-        // closest the message can point to: the BUILD file that declares it.
+        // closest the message can point to: whatever source its provider
+        // declared it from is that package's.
         let pkg = self.declarer.package.as_str();
         write!(
             f,
@@ -355,9 +356,9 @@ impl fmt::Display for MissingDep {
             self.origin_id,
         )?;
         if pkg.is_empty() {
-            f.write_str("the BUILD file at the workspace root)")
+            f.write_str("the root package)")
         } else {
-            write!(f, "the BUILD file in {pkg}/)")
+            write!(f, "package //{pkg})")
         }
     }
 }

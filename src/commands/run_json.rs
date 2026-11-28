@@ -9,8 +9,9 @@
 //! and forwards nothing (I4).
 //!
 //! Output contract 2 (D5): every culprit has a record, `selected: false` when
-//! the selection did not name it, and a BUILD file that did not evaluate is
-//! one with `addr: null` and `file` set. A skipped target names its culprit
+//! the selection did not name it, and a source file that did not evaluate
+//! (as its provider reported it, e.g. `d/BUILD`) is one with `addr: null` and
+//! `file` set. A skipped target names its culprit
 //! in `root` (a target) or `root_file` (a file), never both, with the full
 //! `path` to it and the count of `more` culprits it reaches: those come from
 //! the request-end pass over the dependency graph, so skipped records are
@@ -95,11 +96,11 @@ pub struct RunFailure {
 /// or `root_file`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, output::Record)]
 pub struct RunEntry {
-    /// The target's address; null for a BUILD file that did not evaluate
+    /// The target's address; null for a source file that did not evaluate
     /// (`file` names it). Read `.addr // .file`.
     pub addr: Option<String>,
-    /// The workspace-relative BUILD or `.bzl` file that did not evaluate;
-    /// null on every other record.
+    /// The workspace-relative source file that did not evaluate, as its
+    /// provider reported it (e.g. `d/BUILD`); null on every other record.
     pub file: Option<String>,
     /// How it ended: cached, ran, failed, skipped or cancelled.
     pub outcome: Outcome,
@@ -124,7 +125,7 @@ pub struct RunEntry {
     /// when the culprit is a file (`root_file`), and for ran, cached and
     /// cancelled.
     pub root: Option<String>,
-    /// The culprit when it is a BUILD or `.bzl` file that did not evaluate:
+    /// The culprit when it is a source file that did not evaluate:
     /// the file record's own `file`, or a skipped target's nearest culprit.
     /// Always a workspace-relative path; at most one of `root` and
     /// `root_file` is set, the pair mirroring `addr` and `file`.
@@ -152,7 +153,7 @@ pub struct RunEntry {
     /// On a failed culprit: the stage of the build that raised it (eval,
     /// spec, parse, link, run, cache, config or cli); null elsewhere.
     pub stage: Option<Stage>,
-    /// On a failed culprit: where in a BUILD or `.bzl` file it was raised,
+    /// On a failed culprit: where in a source file it was raised,
     /// the file workspace-relative; null when it names no place, and
     /// elsewhere.
     pub location: Option<SourceLoc>,
@@ -515,7 +516,7 @@ impl Fold {
                     }
                 }
             }
-            // A BUILD file that did not evaluate: its own record, once, and
+            // A source file that did not evaluate: its own record, once, and
             // the address that led into it is skipped because of it.
             BuildEventKind::FileFailed {
                 file,
@@ -1354,7 +1355,7 @@ mod tests {
         assert!(f.held[0].entry.selected);
     }
 
-    /// A BUILD file that did not evaluate: one record, `addr` and `root`
+    /// A source file that did not evaluate: one record, `addr` and `root`
     /// null, `file` and `root_file` the file, never selected, however many
     /// targets it took down; the requested target that led into it is held
     /// as skipped.

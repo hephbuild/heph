@@ -613,9 +613,10 @@ async fn deep_missing_dep_blames_declarer() -> anyhow::Result<()> {
 }
 
 /// PR 1's interim text: before targets carry a source location, the
-/// `MissingDep` names the declarer's BUILD file from its package.
+/// `MissingDep` names the declarer's package (U27: the engine names no
+/// provider's file kind).
 #[tokio::test]
-async fn missing_dep_interim_text_names_build_file() -> anyhow::Result<()> {
+async fn missing_dep_interim_text_names_the_package() -> anyhow::Result<()> {
     let ws = chain_to_c(r#"deps = ["//d:missing"]"#, &[("d", D_PRESENT)]);
     let r = run(&ws.engine, "//a:root").await;
     let text = crate::common::failure_text(r.assert_blames("//c:y"));
@@ -623,7 +624,7 @@ async fn missing_dep_interim_text_names_build_file() -> anyhow::Result<()> {
         text.contains("//c:y depends on //d:missing, which does not exist"),
         "{text}"
     );
-    assert!(text.contains("the BUILD file in c/"), "{text}");
+    assert!(text.contains("(`deps`, declared in package //c)"), "{text}");
     Ok(())
 }
 
