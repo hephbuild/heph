@@ -64,6 +64,19 @@ run	failure.log	string?	free	default
 run	failure.out	string?	free	default
 run	file	string?	free	default
 run	hashin	string?	built	opt-in
+run	hints	[object]	free	default
+run	hints[].kind	"declare_tool"	free	default
+run	hints[].kind	"did_you_mean"	free	default
+run	hints[].kind	"other"	free	default
+run	hints[].kind	"see_log"	free	default
+run	hints[].kind	"valid_values"	free	default
+run	hints[].kind	string	free	default
+run	hints[].text	string	free	default
+run	location	object?	free	default
+run	location.col	number	free	default
+run	location.file	string	free	default
+run	location.line	number	free	default
+run	log_replaced	bool	free	default
 run	more	number?	free	default
 run	outcome	"cached"	free	default
 run	outcome	"cancelled"	free	default
@@ -77,7 +90,18 @@ run	remote	string?	free	default
 run	root	string?	free	default
 run	root_file	string?	free	default
 run	selected	bool	free	default
+run	stage	"cache"	free	default
+run	stage	"cli"	free	default
+run	stage	"config"	free	default
+run	stage	"eval"	free	default
+run	stage	"link"	free	default
+run	stage	"parse"	free	default
+run	stage	"run"	free	default
+run	stage	"spec"	free	default
+run	stage	string?	free	default
+run	streamed	bool	free	default
 run	timed_out	bool	free	default
+run	truncated	bool	free	default
 session inflight	id	string	free	default
 session inflight	report	string	free	default
 session list	argv	[string]	free	default

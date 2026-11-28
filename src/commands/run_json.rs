@@ -30,7 +30,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use hcore::events::{BuildEvent, BuildEventKind, CacheOutcomeKind, EventReceiver, EventSender};
+use hcore::diagnostic::{Hint, SourceLoc, Stage};
+use hcore::events::{
+    BuildEvent, BuildEventKind, CacheOutcomeKind, EventReceiver, EventSender, FailureRecord,
+};
 use hplugin::error::{Culprit, TargetFailure};
 use serde::Serialize;
 
@@ -136,6 +139,24 @@ pub struct RunEntry {
     /// What its failed run left behind (as `heph inspect failure`); null
     /// unless it failed running.
     pub failure: Option<RunFailure>,
+    /// On a failed culprit: the stage of the build that raised it (eval,
+    /// spec, parse, link, run, cache, config or cli); null elsewhere.
+    pub stage: Option<Stage>,
+    /// On a failed culprit: where in a BUILD or `.bzl` file it was raised,
+    /// the file workspace-relative; null when it names no place, and
+    /// elsewhere.
+    pub location: Option<SourceLoc>,
+    /// On a failed culprit: what the user can do about it, each with its
+    /// kind; empty elsewhere. A hint's wording is not contract.
+    pub hints: Vec<Hint>,
+    /// On a failed culprit: a cap cut something from its record (the
+    /// message, its causes, a source line).
+    pub truncated: bool,
+    /// On a failed culprit: a newer failed run filled its failure slot
+    /// again, so the slot's log is no longer this failure's.
+    pub log_replaced: bool,
+    /// On a failed culprit: its run's output reached a terminal as it ran.
+    pub streamed: bool,
     /// Its output files, the set `--list-out` prints (narrowed by
     /// `--output`). Selecting it costs what `--list-out` does: a remote
     /// hit's outputs are downloaded, which the default fields never do.
@@ -253,6 +274,12 @@ fn blank(addr: Option<String>, outcome: Outcome) -> RunEntry {
         path: None,
         selected: false,
         failure: None,
+        stage: None,
+        location: None,
+        hints: Vec::new(),
+        truncated: false,
+        log_replaced: false,
+        streamed: false,
         outputs: None,
         hashin: None,
     }
@@ -281,14 +308,38 @@ impl Fold {
         crate::tui::text::message(&one_line(text), &self.redact, &self.rel).into_owned()
     }
 
-    /// A culprit's `error`: its recorded cause (the frames the box prints,
-    /// without the engine's boundary frames), else what the event said.
-    fn culprit_line(&self, f: Option<&TargetFailure>, event: Option<&str>) -> Option<String> {
-        let frames = f.map(|f| hplugin::diagnostic::cause_frames(&f.source).join(": "));
-        match frames.as_deref() {
-            Some(text) if !text.is_empty() => Some(self.line(text)),
+    /// A culprit's `error`: its record's message, the one its box leads
+    /// with, else what the event said.
+    fn culprit_line(&self, rec: Option<&FailureRecord>, event: Option<&str>) -> Option<String> {
+        match rec.map(|r| r.diagnostic.message.as_str()) {
+            Some(text) if !text.trim().is_empty() => Some(self.line(text)),
             _ => event.map(|e| self.line(e)),
         }
+    }
+
+    /// A failed culprit's `error` and contract 2 facts, from `rec`: the
+    /// record the event carried, else the request's.
+    fn culprit_facts(
+        &self,
+        entry: &mut RunEntry,
+        rec: Option<&FailureRecord>,
+        event: Option<&str>,
+    ) {
+        entry.error = self.culprit_line(rec, event);
+        let Some(rec) = rec else {
+            return;
+        };
+        let facts = crate::tui::failure_report::json_facts(rec);
+        entry.stage = Some(facts.stage);
+        entry.location = facts.location;
+        entry.hints = facts
+            .hints
+            .into_iter()
+            .map(|h| Hint::new(h.kind, self.line(&h.text)))
+            .collect();
+        entry.truncated = facts.truncated;
+        entry.log_replaced = facts.log_replaced;
+        entry.streamed = facts.streamed;
     }
 
     /// Fold one event; the entries it completes, in order.
@@ -361,6 +412,7 @@ impl Fold {
                 timed_out,
                 cancelled,
                 duplicate,
+                failure: record,
                 ..
             } => {
                 let live = self.live.remove(addr).unwrap_or_default();
@@ -434,7 +486,10 @@ impl Fold {
                                 path.clone()
                             });
                         }
-                        entry.error = self.culprit_line(failure.as_deref(), error.as_deref());
+                        let rec = record
+                            .as_deref()
+                            .or_else(|| failure.as_deref().map(|f| f.record.as_ref()));
+                        self.culprit_facts(&mut entry, rec, error.as_deref());
                         self.place(addr, entry)
                     }
                     _ => {
@@ -450,7 +505,7 @@ impl Fold {
                 entry,
                 error,
                 path,
-                failure: _,
+                failure: record,
             } => {
                 let mut ready = Vec::new();
                 if self.files.insert(file.clone()) {
@@ -462,7 +517,10 @@ impl Fold {
                         (Some(f), true) => f.path.iter().map(Addr::format).collect(),
                         _ => path.clone(),
                     });
-                    rec.error = self.culprit_line(failure.as_deref(), Some(error));
+                    let record = record
+                        .as_deref()
+                        .or_else(|| failure.as_deref().map(|f| f.record.as_ref()));
+                    self.culprit_facts(&mut rec, record, Some(error));
                     ready.push(rec);
                 }
                 if !self.done.contains(entry) {
@@ -1026,14 +1084,25 @@ mod tests {
     struct Known(Vec<Arc<TargetFailure>>);
 
     impl Known {
+        /// `a` failed with `e`, its record compacted as the engine stores it.
         fn target(mut self, a: &str, e: &str) -> Self {
             let addr = crate::htaddr::parse_addr(a).expect("addr");
-            self.0.push(Arc::new(TargetFailure::new(
-                addr,
-                None,
-                anyhow::anyhow!("{e}"),
-            )));
+            self.0.push(Arc::new(
+                TargetFailure::new(addr, None, anyhow::anyhow!("{e}"))
+                    .with_record(Arc::new(record(a, e))),
+            ));
             self
+        }
+    }
+
+    /// `a`'s record, `message` its diagnostic's.
+    fn record(a: &str, message: &str) -> FailureRecord {
+        FailureRecord {
+            addr: Some(a.to_string()),
+            entry: a.to_string(),
+            ..FailureRecord::new(
+                hcore::diagnostic::Diagnostic::new(Stage::Run, message).with_addr(a),
+            )
         }
     }
 
@@ -1100,6 +1169,15 @@ mod tests {
                 out: None,
                 fixes: None,
             }),
+            stage: Some(Stage::Eval),
+            location: SourceLoc::checked("p/BUILD".to_string(), 3, 1).ok(),
+            hints: vec![Hint::new(
+                hcore::diagnostic::HintKind::DidYouMean,
+                "did you mean",
+            )],
+            truncated: true,
+            log_replaced: true,
+            streamed: true,
             outputs: Some(vec![PathBuf::from("o.txt")]),
             hashin: Some("h".to_string()),
         })
@@ -1313,22 +1391,31 @@ mod tests {
         );
     }
 
-    /// A culprit's `error` is its recorded cause on one line, not the
-    /// event's flattened chain, with control bytes escaped.
+    /// `end` carrying `rec`, as the engine's announcing end does.
+    fn end_with(addr: &str, error: &str, rec: FailureRecord) -> BuildEventKind {
+        let mut e = end(addr, Some(error), None);
+        if let BuildEventKind::ResultEnd { failure, .. } = &mut e {
+            *failure = Some(Box::new(rec));
+        }
+        e
+    }
+
+    /// A culprit's `error` is its record's message on one line, the one its
+    /// box leads with: not the event's flattened chain, not the request's
+    /// copy when the event carries one, with control bytes escaped.
     #[test]
-    fn culprit_error_is_its_cause_on_one_line() {
-        let addr = crate::htaddr::parse_addr("//p:bad").expect("addr");
-        let e = anyhow::anyhow!("line one\n  line two\u{1b}[31m").context("outer");
-        let known = Known(vec![Arc::new(TargetFailure::new(addr, None, e))]);
+    fn culprit_error_is_its_records_message_on_one_line() {
+        let known = Known::default().target("//p:bad", "the request's copy");
+        let rec = record("//p:bad", "outer: line one\n  line two\u{1b}[31m");
         let (entries, _) = fold_with(
             vec![
                 ev(0, matched(&["//p:bad"], true)),
                 ev(
                     1,
-                    end(
+                    end_with(
                         "//p:bad",
-                        Some("get_def: //p:bad: outer: line one\n  line two"),
-                        None,
+                        "get_def: //p:bad: outer: line one\n  line two",
+                        rec,
                     ),
                 ),
             ],
@@ -1341,6 +1428,78 @@ mod tests {
         );
         assert!(error.starts_with("outer: line one line two"), "{error:?}");
         assert!(!error.contains("get_def"), "{error:?}");
+    }
+
+    /// Contract 2's failure facts on a failed culprit and a file record, from
+    /// the record the event carried: stage, location, hints (scrubbed to one
+    /// line), the caps and the log's state. Every other record has
+    /// `stage: null`, `location: null`, `hints: []` and false flags.
+    #[test]
+    fn failed_culprits_carry_the_records_facts() {
+        let mut rec = record("//p:bad", "unknown field");
+        rec.diagnostic.stage = Stage::Eval;
+        rec.diagnostic.location = SourceLoc::checked("p/BUILD".into(), 4, 5).ok();
+        rec.diagnostic.hints = vec![Hint::new(
+            hcore::diagnostic::HintKind::DidYouMean,
+            "did you mean\n`deps`?",
+        )];
+        rec.diagnostic.truncated = true;
+        rec.streamed = true;
+        let mut file_rec = record("//d:t", "evaluating d/BUILD: boom");
+        file_rec.addr = None;
+        file_rec.file = Some("d/BUILD".into());
+        file_rec.diagnostic.stage = Stage::Eval;
+        let mut file_event = file_failed("d/BUILD", "//d:t", &["//d:t"]);
+        if let BuildEventKind::FileFailed { failure, .. } = &mut file_event {
+            *failure = Some(Box::new(file_rec));
+        }
+        let (entries, _) = fold_with(
+            vec![
+                ev(0, matched(&["//p:bad", "//p:ok", "//d:t"], true)),
+                ev(1, end_with("//p:bad", "flat", rec)),
+                ev(2, end("//p:ok", None, None)),
+                ev(3, file_event),
+            ],
+            &Known::default(),
+        );
+        let bad = entries
+            .iter()
+            .find(|e| e.addr.as_deref() == Some("//p:bad"))
+            .expect("the culprit");
+        assert_eq!(bad.stage, Some(Stage::Eval));
+        let loc = bad.location.as_ref().expect("a location");
+        assert_eq!((loc.file.as_str(), loc.line, loc.col), ("p/BUILD", 4, 5));
+        assert_eq!(
+            bad.hints,
+            [Hint::new(
+                hcore::diagnostic::HintKind::DidYouMean,
+                "did you mean `deps`?"
+            )]
+        );
+        assert!(bad.truncated && bad.streamed && !bad.log_replaced);
+        let json = serde_json::to_value(bad).expect("json");
+        assert_eq!(json["stage"], "eval");
+        assert_eq!(json["location"]["line"], 4);
+        assert_eq!(json["hints"][0]["kind"], "did_you_mean");
+
+        let file = entries
+            .iter()
+            .find(|e| e.file.as_deref() == Some("d/BUILD"))
+            .expect("the file record");
+        assert_eq!(file.stage, Some(Stage::Eval));
+        assert_eq!(file.error.as_deref(), Some("evaluating d/BUILD: boom"));
+
+        let ok = entries
+            .iter()
+            .find(|e| e.addr.as_deref() == Some("//p:ok"))
+            .expect("the success");
+        let json = serde_json::to_value(ok).expect("json");
+        assert_eq!(json["stage"], serde_json::Value::Null);
+        assert_eq!(json["location"], serde_json::Value::Null);
+        assert_eq!(json["hints"], serde_json::json!([]));
+        for flag in ["truncated", "log_replaced", "streamed"] {
+            assert_eq!(json[flag], false, "{flag}");
+        }
     }
 
     /// The request-end pass: held records get `root`, `path` and `more`;

@@ -254,6 +254,12 @@ Each record is output contract 2 (`heph version --json` reports
 | `path` | yes | on a failed culprit: a shortest chain of addresses from a requested target down to it (see below for when it can differ between runs). On `skipped`: from this target down to the address its culprit was recorded at. Inclusive at both ends and never elided; null elsewhere |
 | `selected` | yes | the selector matched it. False only on a culprit written because something selected depends on it; a `file` record is never selected |
 | `failure` | yes | `{log, out, fixes}`, as `heph inspect failure`; null unless it failed running |
+| `stage` | yes | on a failed culprit (a target or a file record): the stage of the build that raised it, `eval`, `spec`, `parse`, `link`, `run`, `cache`, `config` or `cli`; null elsewhere |
+| `location` | yes | on a failed culprit: `{file, line, col}`, where in a BUILD or `.bzl` file it was raised, `file` workspace-relative; null when it names no place, and elsewhere |
+| `hints` | yes | on a failed culprit: `[{kind, text}]`, what can be done about it; `kind` is `did_you_mean`, `valid_values`, `declare_tool`, `see_log` or `other`, and `text` is not contract. Empty elsewhere |
+| `truncated` | yes | on a failed culprit: a cap cut something from its record (the message, its causes, a source line); false elsewhere |
+| `log_replaced` | yes | on a failed culprit: a newer failed run filled its failure slot again, so the slot's log is no longer this failure's; false elsewhere |
+| `streamed` | yes | on a failed culprit: its run's output reached a terminal as it ran; false elsewhere |
 | `outputs` | no | its output files, the set `--list-out` prints, narrowed by `--output`. Its tier is *free* (no spec, def or hash is added), but selecting it costs what `--list-out` does: a remote hit's outputs are downloaded, which the default fields never do. That is why it is not a default |
 | `hashin` | no (built) | its input hash |
 

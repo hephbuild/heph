@@ -502,6 +502,27 @@ mod tests {
             "Outcome" => Derived(crate::commands::run_json::Outcome::__OUTPUT_SHAPE),
             "CacheTier" => Derived(crate::commands::run_json::CacheTier::__OUTPUT_SHAPE),
             "RunFailure" => Derived(crate::commands::run_json::RunFailure::__OUTPUT_SHAPE),
+            // `hcore::diagnostic`'s, which cannot derive `output::Shape`
+            // (`hcore` does not depend on `output`): each `serde` shape.
+            "Stage" => Hand(&[
+                ("", "\"eval\""),
+                ("", "\"spec\""),
+                ("", "\"parse\""),
+                ("", "\"link\""),
+                ("", "\"run\""),
+                ("", "\"cache\""),
+                ("", "\"config\""),
+                ("", "\"cli\""),
+            ]),
+            "SourceLoc" => Hand(&[(".file", "string"), (".line", "number"), (".col", "number")]),
+            "Hint" => Hand(&[(".kind", "@HintKind"), (".text", "string")]),
+            "HintKind" => Hand(&[
+                ("", "\"did_you_mean\""),
+                ("", "\"valid_values\""),
+                ("", "\"declare_tool\""),
+                ("", "\"see_log\""),
+                ("", "\"other\""),
+            ]),
             _ => return None,
         })
     }
@@ -781,6 +802,27 @@ mod tests {
                 assert!(
                     ks.iter().all(|k| k.ends_with('?')),
                     "{source}: `{cmd} {field}` is not nullable: {ks:?}"
+                );
+            }
+            // A failure's facts (D5, PR 4), from the record its box is drawn
+            // from: null, empty or false on every other record.
+            for (field, kind) in [
+                ("stage", "string?"),
+                ("stage", "\"eval\""),
+                ("location", "object?"),
+                ("location.file", "string"),
+                ("location.line", "number"),
+                ("location.col", "number"),
+                ("hints", "[object]"),
+                ("hints[].kind", "\"did_you_mean\""),
+                ("hints[].text", "string"),
+                ("truncated", "bool"),
+                ("log_replaced", "bool"),
+                ("streamed", "bool"),
+            ] {
+                assert!(
+                    kinds(lines, "run", field).iter().any(|k| k == kind),
+                    "{source}: `run {field}` is not {kind}"
                 );
             }
         }
