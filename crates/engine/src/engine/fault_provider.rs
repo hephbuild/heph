@@ -702,16 +702,21 @@ mod tests {
     fn located_engine(
         source_index: Option<SourceIndexFn>,
     ) -> anyhow::Result<(Arc<Engine>, tempfile::TempDir)> {
-        located_engine_with("nope", source_index)
+        located_engine_with("nope", source_index, None)
     }
 
-    /// [`located_engine`] with its targets naming `driver`.
+    /// [`located_engine`] with its targets naming `driver`, and `registered`
+    /// registered.
     fn located_engine_with(
         driver: &str,
         source_index: Option<SourceIndexFn>,
+        registered: Option<Box<dyn crate::engine::driver::Driver>>,
     ) -> anyhow::Result<(Arc<Engine>, tempfile::TempDir)> {
         let root = tempfile::tempdir()?;
         let mut engine = Engine::new(Config::for_tests(root.path()))?;
+        if let Some(d) = registered {
+            engine.register_driver(move |_| d)?;
+        }
         let nope = |a: &str| pluginstatictarget::Target {
             addr: a.to_string(),
             driver: driver.to_string(),
@@ -806,7 +811,7 @@ mod tests {
                     as Arc<dyn SourceIndex>,
             )
         });
-        let (engine, _root) = located_engine_with(&"n".repeat(MESSAGE_CAP), Some(index))?;
+        let (engine, _root) = located_engine_with(&"n".repeat(MESSAGE_CAP), Some(index), None)?;
         let (_, failures) = failures(&engine, &["//a:x"]).await;
         let [f] = failures.as_slice() else {
             panic!("one failure, got {}", failures.len());
@@ -817,6 +822,93 @@ mod tests {
         assert!(d.message.ends_with(&marker), "{}", d.message);
         assert!(d.message.contains("driver not found: nnn"), "{}", d.message);
         assert!(d.truncated, "the message was cut");
+        Ok(())
+    }
+
+    /// A driver named `refuse` whose `parse` fails: with a cancellation when
+    /// it holds `true`, else with a refusal.
+    struct RefusingDriver(bool);
+
+    #[async_trait::async_trait]
+    impl crate::engine::driver::Driver for RefusingDriver {
+        fn config(
+            &self,
+            _r: crate::engine::driver::ConfigRequest,
+        ) -> anyhow::Result<crate::engine::driver::ConfigResponse> {
+            Ok(crate::engine::driver::ConfigResponse {
+                name: "refuse".to_string(),
+            })
+        }
+        fn schema(&self) -> crate::engine::driver::DriverSchema {
+            crate::engine::driver::DriverSchema::default()
+        }
+        async fn parse(
+            &self,
+            _r: crate::engine::driver::ParseRequest,
+            _c: &(dyn hcore::hasync::Cancellable + Send + Sync),
+        ) -> anyhow::Result<crate::engine::driver::ParseResponse> {
+            if self.0 {
+                return Err(hplugin::error::CancelledError.into());
+            }
+            anyhow::bail!("refused")
+        }
+        async fn apply_transitive(
+            &self,
+            _r: crate::engine::driver::ApplyTransitiveRequest,
+            _c: &(dyn hcore::hasync::Cancellable + Send + Sync),
+        ) -> anyhow::Result<crate::engine::driver::ApplyTransitiveResponse> {
+            anyhow::bail!("not under test")
+        }
+        async fn run<'a, 'io>(
+            &self,
+            _r: crate::engine::driver::RunRequest<'a, 'io>,
+            _c: &(dyn hcore::hasync::Cancellable + Send + Sync),
+        ) -> anyhow::Result<crate::engine::driver::RunResponse> {
+            anyhow::bail!("not under test")
+        }
+        async fn run_shell<'a, 'io>(
+            &self,
+            _r: crate::engine::driver::RunRequest<'a, 'io>,
+            _c: &(dyn hcore::hasync::Cancellable + Send + Sync),
+        ) -> anyhow::Result<crate::engine::driver::RunResponse> {
+            anyhow::bail!("not under test")
+        }
+    }
+
+    /// A parse refused by the driver loads the file's index, for the
+    /// diagnostic about it; a cancelled parse does not, since no diagnostic
+    /// is shown for it (FQ r2 N-2).
+    #[tokio::test]
+    async fn a_cancelled_parse_loads_no_index() -> anyhow::Result<()> {
+        use crate::engine::result::{OutputMatcher, ResultOptions};
+        let mut loads = Vec::new();
+        for cancelled in [false, true] {
+            let index = SourceIndexFn::new(|_| {
+                Some(Arc::new(FixedIndex(crate::engine::provider::Located::Call))
+                    as Arc<dyn SourceIndex>)
+            });
+            let (engine, _root) = located_engine_with(
+                "refuse",
+                Some(index),
+                Some(Box::new(RefusingDriver(cancelled))),
+            )?;
+            let rs = engine.new_state_with_events(false, None);
+            let res = Arc::clone(&engine)
+                .result(
+                    Arc::clone(&rs),
+                    &Matcher::Addr(addr("//a:x")),
+                    OutputMatcher::All,
+                    &ResultOptions::default(),
+                )
+                .await;
+            // A cancellation is not tallied as a failure.
+            assert!(
+                cancelled || res.map_or(true, |b| !b.errors.is_empty()),
+                "must fail"
+            );
+            loads.push((cancelled, rs.source_index_loads()));
+        }
+        assert_eq!(loads, [(false, 1), (true, 0)], "(cancelled, index loads)");
         Ok(())
     }
 

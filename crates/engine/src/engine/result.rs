@@ -7058,7 +7058,10 @@ impl Engine {
             Ok(res) => res,
             Err(e) => {
                 // A refused spec points at the option it names: its index.
-                rs.load_source_index(addr).await;
+                // A cancelled parse shows no diagnostic, so loads none.
+                if !crate::engine::discovery::is_cancellation(&rs, &e) {
+                    rs.load_source_index(addr).await;
+                }
                 return Err(e.context(format!("{} parse", driver.name)));
             }
         };
