@@ -89,6 +89,16 @@ fn scrub_text(needles: Option<&Arc<Needles>>, s: &str) -> String {
     }
 }
 
+/// What a `warn` or louder log line on a target's failure path prints for
+/// `e` (P21): its chain scrubbed of `scrub`, then on one line (control
+/// escaped) and within the record's message cap — the order [`compact`]
+/// keeps. The raw chain is the caller's to log at `debug`, and only there:
+/// a `warn` line reaches the same terminal the record does.
+pub(crate) fn log_line(e: &anyhow::Error, scrub: &Scrub) -> String {
+    let scrubbed = scrub_text(scrub.needles().as_ref(), &format!("{e:#}"));
+    bound_text(&scrubbed, hcore::diagnostic::MESSAGE_CAP, &mut false)
+}
+
 /// `e`, recorded against `culprit` and reached through `entry`, compacted:
 /// scrubbed of `scrub`, within every cap, with the typed facts a renderer
 /// reads. `stage_override` names the stage when the caller knows it better
