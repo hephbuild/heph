@@ -6021,6 +6021,37 @@ mod tests {
         assert_eq!(s.elapsed_ms(9_000), 7_000);
     }
 
+    /// STAGE-18: a request's `RequestConfig`, sent before anything resolves,
+    /// starts the clock on its own. Through a slow BUILD file no target event
+    /// arrives, and the line still counts the seconds; the first target event
+    /// does not move the anchor. bin-e2e: `tui_clock_ticks_during_slow_get`.
+    #[test]
+    fn elapsed_ticks_from_request_config() {
+        let mut v = TuiProgressView::new("L");
+        v.apply(&ev(
+            1_000,
+            BuildEventKind::RequestConfig {
+                max_workers: 4,
+                fail_fast: false,
+                scratch_disabled: false,
+                resources: Default::default(),
+                units: Default::default(),
+            },
+        ));
+        for (now, clock) in [(2_000, "1s · 0 done"), (4_000, "3s · 0 done")] {
+            let lines = v.snapshot_lines(now, 100);
+            let line = lines.first().map(ToString::to_string).unwrap_or_default();
+            assert!(line.contains(clock), "at {now}: {line}");
+        }
+        v.apply(&ev(6_000, result_start("//a:b")));
+        let lines = v.snapshot_lines(7_000, 100);
+        let line = lines.first().map(ToString::to_string).unwrap_or_default();
+        assert!(
+            line.starts_with("6s · ") || line.contains(" 6s · "),
+            "{line}"
+        );
+    }
+
     /// `heph session show`'s frame: the line, then the dashboard's All list
     /// with its titles, capped at 15 rows, no key hints, measured against
     /// the clock it is given.
