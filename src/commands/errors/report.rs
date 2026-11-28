@@ -84,9 +84,9 @@ impl ReportContext {
         self
     }
 
-    /// Wrap at `width` columns instead of the terminal's.
-    #[cfg(test)]
-    pub(crate) fn with_width(mut self, width: usize) -> Self {
+    /// Wrap at `width` columns instead of the terminal's: a test's report
+    /// must not depend on the terminal it ran in.
+    pub fn with_width(mut self, width: usize) -> Self {
         self.width = Some(width);
         self
     }
