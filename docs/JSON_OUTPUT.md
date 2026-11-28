@@ -300,6 +300,10 @@ the last edge: `//c:y depends on //d:t, which this file defines`. Its wording,
 the elided middle of a long path included (`… 3 more (--json has the full
 path) …`), is not contract: read `path` here, not the box.
 
+Skipped records arrive only at request end, and a skipped record's `path` is
+the full chain, so the output grows with chain depth × skipped count: for one
+deep selected chain, with the square of its depth.
+
 **A broken BUILD file reached by address.** A selection of addresses only
 (`heph run //d:t1 //d:t2`) whose BUILD file does not evaluate gets the file's
 record, `failed`, then a `skipped` record for each address, and a closed list;
