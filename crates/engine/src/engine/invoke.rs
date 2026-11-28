@@ -529,7 +529,7 @@ impl Engine {
 
         // This target runs again: its last failure no longer describes it.
         // Before the run, as a build's is cleared when its next run starts.
-        self.failure_slots.clear(addr).await;
+        rs.clear_failure(&self.failure_slots, addr).await;
 
         let ran = self
             .run_in_sandbox(
