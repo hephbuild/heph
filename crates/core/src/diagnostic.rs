@@ -142,7 +142,10 @@ impl TryFrom<RawSourceLoc> for SourceLoc {
 /// [`Stage::Run`]. Only a value that is not a string fails the decode.
 fn lenient_stage<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Stage, D::Error> {
     let name = <std::borrow::Cow<'de, str>>::deserialize(d)?;
-    Ok(Stage::from_name(&name).unwrap_or(Stage::Run))
+    Ok(Stage::from_name(&name).unwrap_or_else(|| {
+        tracing::debug!(stage = %name, "unknown diagnostic stage read as `run`");
+        Stage::Run
+    }))
 }
 
 /// [`Diagnostic::location`] decoded leniently: a location of the wrong shape,
