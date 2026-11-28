@@ -151,7 +151,12 @@ textarea#review-text { width: 100%; min-height: 8rem; font: 0.8rem var(--mono); 
       else if (k.startsWith("on")) e.addEventListener(k.slice(2), v);
       else e.setAttribute(k, v === true ? "" : String(v));
     }
-    for (const k of kids.flat()) {
+    return add(e, ...kids);
+  }
+  // add appends children to e: nested arrays flattened, null skipped. The
+  // native append would print an array or a null as text.
+  function add(e, ...kids) {
+    for (const k of kids.flat(Infinity)) {
       if (k === null || k === undefined || k === false) continue;
       e.append(typeof k === "string" || typeof k === "number" ? document.createTextNode(String(k)) : k);
     }
@@ -400,7 +405,7 @@ textarea#review-text { width: 100%; min-height: 8rem; font: 0.8rem var(--mono); 
       },
     }));
     const board = (c.board || []).map((b) => el("div", {}, el("strong", { text: b.agent + " (" + b.status + "): " }), b.said));
-    card.append(
+    add(card,
       el("div", { class: "row" },
         c.reason_title ? el("span", { class: "chip reason", text: c.reason_title }) : null,
         st.reopened ? el("span", { class: "chip reopened", text: "changed since you reviewed it" }) : null,

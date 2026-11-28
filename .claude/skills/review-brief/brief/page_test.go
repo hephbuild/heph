@@ -78,19 +78,22 @@ func servedBrief(t *testing.T, api func(w http.ResponseWriter, head string)) (di
 	f.write("src/a.rs", "fn a() {}\nconst S: &str = \"</script><b>bold</b>\";\n")
 	st := f.stack(ModeWhole, f.commit("layer"))
 	head := st.Layers[0].Head
-	srv := httptest.NewServer(nil)
+	// The handler is complete before the server starts: setting it after
+	// is a race the detector reports, as it cannot see Chrome connect later.
+	dir = filepath.Join(t.TempDir(), "brief")
+	mux := http.NewServeMux()
+	mux.Handle("/brief/", http.StripPrefix("/brief/", http.FileServer(http.Dir(dir))))
+	mux.HandleFunc("/api/pulls/", func(w http.ResponseWriter, r *http.Request) { api(w, head) })
+	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	tr, scouts := coverAll(st)
 	tr.Items[0].Tier, tr.Items[0].Reason = TierScrutinize, "security"
 	tr.Items[0].Claim, tr.Items[0].Question = hostile, hostile
-	dir = filepath.Join(t.TempDir(), "brief")
-	if err := st.Render(RenderInput{Triage: tr, Scouts: scouts, FreshnessAPI: srv.URL + "/api/pulls/"}, pagePath(t), dir); err != nil {
+	cited := LayerRef{Layer: 1, RangeRef: RangeRef{Path: "src/a.rs", Start: 2, End: 2}}
+	audit := &Audit{Format: auditFormat, Assessment: Assessment{Text: "Hangs together.", Refs: []LayerRef{cited, cited}}}
+	if err := st.Render(RenderInput{Triage: tr, Scouts: scouts, Audit: audit, FreshnessAPI: srv.URL + "/api/pulls/"}, pagePath(t), dir); err != nil {
 		t.Fatal(err)
 	}
-	mux := http.NewServeMux()
-	mux.Handle("/brief/", http.StripPrefix("/brief/", http.FileServer(http.Dir(dir))))
-	mux.HandleFunc("/api/pulls/", func(w http.ResponseWriter, r *http.Request) { api(w, head) })
-	srv.Config.Handler = mux
 	return dir, srv.URL + "/brief/index.html"
 }
 
@@ -101,10 +104,14 @@ func Test_page_draws_a_valid_brief(t *testing.T) {
 		fmt.Fprintf(w, `{"head":{"sha":%q}}`, head)
 	})
 	dom := dumpDOM(t, url)
-	for _, want := range []string{`id="ledger"`, `data-state="verified"`, "1 card open", ">current<", "<title>Review brief #1</title>"} {
+	for _, want := range []string{`id="ledger"`, `data-state="verified"`, "1 card open", ">current<", "<title>Review brief #1</title>",
+		"Cites: <code>#1 src/a.rs:2</code>, <code>#1 src/a.rs:2</code>"} {
 		if !strings.Contains(dom, want) {
 			t.Errorf("page DOM lacks %q", want)
 		}
+	}
+	if strings.Contains(dom, "[object ") {
+		t.Error("the page stringified an element instead of inserting it")
 	}
 	if strings.Contains(dom, `id="integrity-error"`) {
 		t.Error("a valid brief was refused")
