@@ -28,7 +28,7 @@ target(name = "blk", driver = "bash", run = "echo b > $OUT", out = "blk.txt", de
 "#;
 
 /// The default fields: every `free` one but `outputs`.
-const DEFAULT_KEYS: [&str; 15] = [
+const DEFAULT_KEYS: [&str; 21] = [
     "addr",
     "cache",
     "duration_ms",
@@ -36,6 +36,9 @@ const DEFAULT_KEYS: [&str; 15] = [
     "exit_code",
     "failure",
     "file",
+    "hints",
+    "location",
+    "log_replaced",
     "more",
     "outcome",
     "path",
@@ -43,7 +46,10 @@ const DEFAULT_KEYS: [&str; 15] = [
     "root",
     "root_file",
     "selected",
+    "stage",
+    "streamed",
     "timed_out",
+    "truncated",
 ];
 
 fn write_pkg(root: &Path, pkg: &str, build: &str) {
@@ -737,6 +743,9 @@ async fn unselected_culprit_emitted_selected_false() {
     );
     assert_eq!(bad["exit_code"], 3, "{bad}");
     assert!(bad["failure"]["log"].is_string(), "{bad}");
+    // The record's facts: a run failure names no place in a BUILD file.
+    assert_eq!(bad["stage"], "run", "{bad}");
+    assert!(bad["location"].is_null(), "{bad}");
     let blk = run.entry("//p:blk");
     assert_eq!(blk["outcome"], "skipped", "{blk}");
     assert_eq!(blk["selected"], true, "{blk}");
@@ -784,6 +793,10 @@ async fn file_culprit_record_shape() {
     );
     assert_eq!(file["file"], "d/BUILD", "{file}");
     assert_eq!(file["outcome"], "failed", "{file}");
+    // The record's facts: an evaluation error, where its parser stopped.
+    assert_eq!(file["stage"], "eval", "{file}");
+    assert_eq!(file["location"]["file"], "d/BUILD", "{file}");
+    assert!(file["location"]["line"].is_number(), "{file}");
     assert_eq!(
         file["root_file"], "d/BUILD",
         "a culprit is its own root: {file}"
