@@ -7267,15 +7267,16 @@ impl Engine {
                     let spec = match Arc::clone(&engine).get_spec(rs.clone(), dep).await {
                         Ok(spec) => spec,
                         Err(e) => {
-                            return Err(rs
-                                .missing_dep_or(
-                                    e,
-                                    dep,
-                                    declarer,
-                                    || crate::engine::deferred::declared_origin(&input.origin_id),
-                                    |e| hplugin::diagnostic::with_stage(e, Boundary::GetSpec, dep),
-                                )
-                                .await);
+                            // Boxed, as in `input_def`: an edge's future holds
+                            // a pointer for this failure-only path (FQ r2 N-1).
+                            return Err(Box::pin(rs.missing_dep_or(
+                                e,
+                                dep,
+                                declarer,
+                                || crate::engine::deferred::declared_origin(&input.origin_id),
+                                |e| hplugin::diagnostic::with_stage(e, Boundary::GetSpec, dep),
+                            ))
+                            .await);
                         }
                     };
 
