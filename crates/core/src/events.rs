@@ -403,8 +403,10 @@ pub enum BuildEventKind {
         /// predates it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         exit_code: Option<i32>,
-        /// The last lines of the target's process log. Only ever attached to a
-        /// failing result, so a green build pays nothing for it.
+        /// The last lines of the target's process log, from a host that
+        /// predates [`failure`](Self::ResultEnd::failure). This host always
+        /// sends `None`: the log is referenced from `failure.log`
+        /// ([`LogRef`]), and its tail is read from the file it names.
         #[serde(default)]
         log_tail: Option<LogTailData>,
         /// Set when the target failed because its run outlasted its `timeout`,

@@ -231,7 +231,8 @@ message Diagnostic {
     string text = 2;
   }
   // As hcore::diagnostic::Stage::as_str spells it (`eval`, `spec`, `parse`,
-  // `link`, `run`, …). Absent or unknown is the stage of the call that failed.
+  // `link`, `run`, …). The host sets the stage of the call that failed, over
+  // whatever the plugin sent; a plugin may leave it absent.
   string stage = 1;
   // One sentence, in the user's words. Required: a diagnostic without one is
   // dropped.
@@ -240,7 +241,8 @@ message Diagnostic {
   // Source lines around `location`, as the plugin framed them.
   string snippet = 4;
   repeated Hint hints = 5;
-  // Which plugin or driver raised it.
+  // Which plugin raised it. The host sets it to the name it loaded the plugin
+  // under, over whatever the plugin sent; a plugin may leave it absent.
   string plugin = 6;
   // The plugin cut something to fit.
   bool truncated = 7;
