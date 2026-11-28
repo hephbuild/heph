@@ -38,6 +38,7 @@ pub struct Scrub(Vec<String>);
 
 impl Scrub {
     /// The values in `values`.
+    #[cfg(test)]
     pub fn new(values: impl IntoIterator<Item = String>) -> Self {
         Self(values.into_iter().collect())
     }
@@ -53,6 +54,7 @@ impl Scrub {
     }
 
     /// Whether there is nothing to scrub.
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
