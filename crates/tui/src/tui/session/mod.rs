@@ -384,6 +384,9 @@ struct SlotInner {
     argv: Vec<String>,
     cwd: Option<String>,
     workspace_root: Option<String>,
+    /// How heph's messages name paths under that workspace, resolved
+    /// once with it: what an error rendered at exit is made relative by.
+    rel: crate::tui::text::WorkspaceRel,
     home_dir: Option<String>,
     session: Option<std::sync::Arc<Session>>,
     /// Where other sessions are read from, to name a lock's holder. Set even
@@ -472,11 +475,20 @@ impl SessionSlot {
     /// of a session opened after this. `cwd` is the directory heph works from
     /// (`HEPH_CWD` when set), not the process's own cwd.
     pub fn set_workspace(&self, cwd: &Path, root: &Path, home_dir: &Path) {
+        // Reads the filesystem: outside the lock.
+        let rel = crate::tui::text::WorkspaceRel::workspace(root);
         self.with(|s| {
             s.cwd = Some(cwd.to_string_lossy().into_owned());
             s.workspace_root = Some(root.to_string_lossy().into_owned());
+            s.rel = rel;
             s.home_dir = Some(home_dir.to_string_lossy().into_owned());
         });
+    }
+
+    /// What heph's messages name paths under the workspace relative to:
+    /// empty (nothing rewritten) until [`set_workspace`](Self::set_workspace).
+    pub fn workspace_rel(&self) -> crate::tui::text::WorkspaceRel {
+        self.with(|s| s.rel.clone())
     }
 
     /// The session, opening it on the first call. `None` when recording is off,

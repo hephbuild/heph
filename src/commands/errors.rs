@@ -156,6 +156,7 @@ impl IncompleteSelection {
         report: crate::engine::discovery::GapReport,
         cause: Option<anyhow::Error>,
         interactive: bool,
+        rel: &WorkspaceRel,
     ) -> Self {
         let mut this = Self {
             report,
@@ -169,18 +170,18 @@ impl IncompleteSelection {
             drop(write!(
                 io::stderr(),
                 "{}",
-                this.render_to_string(color_enabled())
+                this.render_to_string(color_enabled(), rel)
             ));
             this.rendered = true;
         }
         this
     }
 
-    fn render_to_string(&self, color: bool) -> String {
+    fn render_to_string(&self, color: bool, rel: &WorkspaceRel) -> String {
         let mut out = self
             .cause
             .as_ref()
-            .and_then(|c| render_anyhow_to_string(c, color))
+            .and_then(|c| render_anyhow_in(c, color, rel))
             .unwrap_or_default();
         out.push_str(&render_incomplete(&self.report, false, color));
         out
@@ -430,9 +431,13 @@ pub(crate) async fn finalize<T>(
             finish_exit(cancelled)
         }
         // What matched was processed; the run still fails for what was not.
-        Some(report) => {
-            Err(IncompleteSelection::new(report, printed.err(), ctx.interactive()).into_error())
-        }
+        Some(report) => Err(IncompleteSelection::new(
+            report,
+            printed.err(),
+            ctx.interactive(),
+            &ctx.session().workspace_rel(),
+        )
+        .into_error()),
     }
 }
 
@@ -801,7 +806,7 @@ impl std::error::Error for FailedTargets {}
 /// claimed error may still print nothing, when it was already reported at the
 /// failure site. What it printed is recorded in `session`.
 pub fn render_anyhow(e: &anyhow::Error, session: &SessionSlot) -> bool {
-    match render_anyhow_to_string(e, color_enabled()) {
+    match render_anyhow_in(e, color_enabled(), &session.workspace_rel()) {
         Some(out) => {
             eprint!("{out}");
             // An attached viewer prints the report below its summary too.
@@ -829,10 +834,13 @@ fn frozen_record(fc: &FrozenCheckError) -> hcore::failure::FailureRecord {
 /// The bytes [`render_anyhow`] would write, or `None` when the error carries
 /// nothing renderable and the caller should fall back to its own logging. Pure
 /// and colour-explicit so each arm is assertable without capturing stderr.
+/// Every line is heph's text: paths under the workspace are named relative
+/// to it by `rel` (the session's, empty before bootstrap resolved one), and
+/// control bytes are shown escaped (D2).
 ///
 /// `Some("")` is a deliberate case: [`FailedTargets::reported`] already
 /// printed at the failure site, so the error is handled but adds no output.
-fn render_anyhow_to_string(e: &anyhow::Error, color: bool) -> Option<String> {
+fn render_anyhow_in(e: &anyhow::Error, color: bool, rel: &WorkspaceRel) -> Option<String> {
     // Registry failures from `finalize`. Interactive runs deferred their render
     // to here — the viewport is torn down and nothing repaints over stderr now.
     if let Some(ft) = downcast_chain_ref::<FailedTargets>(e) {
@@ -850,10 +858,11 @@ fn render_anyhow_to_string(e: &anyhow::Error, color: bool) -> Option<String> {
         if inc.rendered {
             return Some(String::new());
         }
-        return Some(inc.render_to_string(color));
+        return Some(inc.render_to_string(color, rel));
     }
     let ctx = RenderCtx {
         color,
+        rel: rel.clone(),
         ..RenderCtx::default()
     };
     if let Some(tf) = downcast_chain_ref::<TargetFailure>(e) {
@@ -866,14 +875,15 @@ fn render_anyhow_to_string(e: &anyhow::Error, color: bool) -> Option<String> {
     }
     let frames = chain_frames(e);
     let top = frames.first()?;
-    // heph's message: controls shown escaped, never obeyed (D2).
-    let none = (Redact::default(), WorkspaceRel::default());
-    let mut out = format!("× {}\n", message(top, &none.0, &none.1));
+    // heph's message: workspace paths relative, controls shown escaped,
+    // never obeyed (D2).
+    let redact = Redact::default();
+    let mut out = format!("× {}\n", message(top, &redact, rel));
     let rest = frames.get(1..).unwrap_or(&[]);
     if !rest.is_empty() {
         out.push_str(&format!(
             "╰─▶ {}\n",
-            message(&rest.join(": "), &none.0, &none.1)
+            message(&rest.join(": "), &redact, rel)
         ));
     }
     Some(out)
@@ -888,6 +898,49 @@ mod tests {
     use hcore::events::{ExitData, FailedIn, FixesData, LeftBehindData, LogRef};
     use std::path::Path;
     use std::sync::Arc;
+
+    /// [`render_anyhow_in`] before any workspace is known.
+    fn render_anyhow_to_string(e: &anyhow::Error, color: bool) -> Option<String> {
+        render_anyhow_in(e, color, &WorkspaceRel::default())
+    }
+
+    /// Q4: what reaches `main` is heph's text, so it names paths under the
+    /// session's workspace relative to it once bootstrap set one, and shows
+    /// a control byte escaped either way — the generic chain and a target's
+    /// box alike.
+    #[test]
+    fn render_anyhow_relative_and_escaped() {
+        let ws = tempfile::tempdir().unwrap();
+        let slot = SessionSlot::new();
+        slot.set_workspace(ws.path(), ws.path(), &ws.path().join(".heph"));
+        let build = ws.path().join("a/BUILD");
+        let e = anyhow::anyhow!("denied\x1b[2J").context(format!("reading {}", build.display()));
+        assert_eq!(
+            render_anyhow_in(&e, false, &slot.workspace_rel()).as_deref(),
+            Some("× reading a/BUILD\n╰─▶ denied\\x1b[2J\n")
+        );
+        // No workspace resolved: nothing rewritten, still escaped.
+        assert_eq!(
+            render_anyhow_in(&e, false, &SessionSlot::new().workspace_rel()),
+            Some(format!(
+                "× reading {}\n╰─▶ denied\\x1b[2J\n",
+                build.display()
+            ))
+        );
+
+        let f = failure(
+            "//p:t",
+            rec(
+                "//p:t",
+                &format!("reading {}: denied\x1b[2J", build.display()),
+            ),
+        );
+        let e = anyhow::Error::new(f.as_ref().clone());
+        assert_eq!(
+            render_anyhow_in(&e, false, &slot.workspace_rel()).as_deref(),
+            Some("✗ //p:t\n  reading a/BUILD: denied\\x1b[2J\n")
+        );
+    }
 
     /// A failure of `addr` carrying `rec` as its record: what the CI box
     /// draws.
