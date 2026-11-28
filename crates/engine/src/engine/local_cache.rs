@@ -65,11 +65,35 @@ pub enum ManifestArtifactEncoding {
     Zstd,
 }
 
-#[derive(Debug, Clone, BorshSerialize, BorshDeserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ManifestArtifactType {
     Output,
     Log,
     SupportFile,
+}
+
+impl ManifestArtifactType {
+    /// Whether a dependent sees an artifact of this type: an Output (in `SRC`
+    /// and the listings) or a SupportFile (materialized into its sandbox), and
+    /// so whether its hashout is in the result's `artifacts_meta` and reaches
+    /// the dependent's key. A log is kept in the cache but surfaced to no
+    /// dependent.
+    pub(crate) const fn reaches_dependents(&self) -> bool {
+        match self {
+            Self::Output | Self::SupportFile => true,
+            Self::Log => false,
+        }
+    }
+}
+
+impl From<&outputartifact::Type> for ManifestArtifactType {
+    fn from(t: &outputartifact::Type) -> Self {
+        match t {
+            outputartifact::Type::Output => Self::Output,
+            outputartifact::Type::Log => Self::Log,
+            outputartifact::Type::SupportFile => Self::SupportFile,
+        }
+    }
 }
 
 /// Whether the caller already knows every needed blob is in the local cache.
@@ -869,11 +893,7 @@ impl Engine {
                 group: artifact.group,
                 name,
                 size,
-                r#type: match artifact.r#type {
-                    outputartifact::Type::Output => ManifestArtifactType::Output,
-                    outputartifact::Type::Log => ManifestArtifactType::Log,
-                    outputartifact::Type::SupportFile => ManifestArtifactType::SupportFile,
-                },
+                r#type: ManifestArtifactType::from(&artifact.r#type),
                 content_type,
                 encoding,
             };
@@ -1522,9 +1542,8 @@ impl Engine {
             // populates SRC/list, SupportFile only materializes into the
             // sandbox. Logs and other types are kept in the cache but not
             // surfaced to callers here.
-            match artifact.r#type {
-                ManifestArtifactType::Output | ManifestArtifactType::SupportFile => {}
-                ManifestArtifactType::Log => continue,
+            if !artifact.r#type.reaches_dependents() {
+                continue;
             }
 
             result_meta.push(ArtifactMeta {

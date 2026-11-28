@@ -727,7 +727,7 @@ impl ResultArtifact {
     fn from_run(a: outputartifact::OutputArtifact) -> Self {
         Self {
             group: a.group.clone(),
-            r#type: manifest_artifact_type(&a.r#type),
+            r#type: ManifestArtifactType::from(&a.r#type),
             content: Arc::new(a),
         }
     }
@@ -743,7 +743,7 @@ impl ResultArtifact {
     /// it falls back to carrying the raw artifact rather than panicking.
     fn passthrough(a: outputartifact::OutputArtifact) -> Self {
         let group = a.group.clone();
-        let r#type = manifest_artifact_type(&a.r#type);
+        let r#type = ManifestArtifactType::from(&a.r#type);
         let content: Arc<dyn Content> = match a.content {
             outputartifact::Content::File(f) => Arc::new(PassthroughContent {
                 source_path: f.source_path,
@@ -931,14 +931,6 @@ impl std::io::Read for VerifyingReader {
             hasher.update(chunk);
         }
         Ok(n)
-    }
-}
-
-fn manifest_artifact_type(t: &outputartifact::Type) -> ManifestArtifactType {
-    match t {
-        outputartifact::Type::Output => ManifestArtifactType::Output,
-        outputartifact::Type::Log => ManifestArtifactType::Log,
-        outputartifact::Type::SupportFile => ManifestArtifactType::SupportFile,
     }
 }
 
@@ -1717,19 +1709,8 @@ fn report_stale_rebuild(
     old: &Manifest,
     new: &[ArtifactMeta],
 ) {
-    let mut was: Vec<&str> = old
-        .artifacts
-        .iter()
-        .filter(|a| {
-            matches!(
-                a.r#type,
-                ManifestArtifactType::Output | ManifestArtifactType::SupportFile
-            )
-        })
-        .map(|a| a.hashout.as_str())
-        .collect();
+    let was = manifest_hashouts(old);
     let mut now: Vec<&str> = new.iter().map(|m| m.hashout.as_str()).collect();
-    was.sort_unstable();
     now.sort_unstable();
     if was == now {
         return;
@@ -1903,12 +1884,7 @@ fn manifest_hashouts(manifest: &Manifest) -> Vec<&str> {
     let mut out: Vec<&str> = manifest
         .artifacts
         .iter()
-        .filter(|a| {
-            matches!(
-                a.r#type,
-                ManifestArtifactType::Output | ManifestArtifactType::SupportFile
-            )
-        })
+        .filter(|a| a.r#type.reaches_dependents())
         .map(|a| a.hashout.as_str())
         .collect();
     out.sort_unstable();
@@ -2066,34 +2042,28 @@ fn reconcile_rebuilt_hashouts(
     manifest: &Manifest,
     produced: &[ResultArtifact],
 ) -> anyhow::Result<()> {
-    /// `None` for a type no read path surfaces (a log), otherwise a sortable tag
-    /// standing in for the type — `ManifestArtifactType` is not `Ord`.
-    fn tag(t: &ManifestArtifactType) -> Option<&'static str> {
-        match t {
-            ManifestArtifactType::Output => Some("output"),
-            ManifestArtifactType::SupportFile => Some("support"),
-            ManifestArtifactType::Log => None,
-        }
-    }
-
-    let mut promised: Vec<(&str, &str, &str)> = manifest
+    // A log is surfaced by no read path, so neither side compares it.
+    let mut promised: Vec<(&ManifestArtifactType, &str, &str)> = manifest
         .artifacts
         .iter()
-        .filter_map(|a| Some((tag(&a.r#type)?, a.group.as_str(), a.hashout.as_str())))
+        .filter(|a| a.r#type.reaches_dependents())
+        .map(|a| (&a.r#type, a.group.as_str(), a.hashout.as_str()))
         .collect();
     // Owned first: `hashout()` yields a `String` per artifact, which the borrowed
     // comparison tuples below then point into.
-    let rebuilt_owned: Vec<(&str, &str, String)> = produced
+    let rebuilt_owned: Vec<(&ManifestArtifactType, &str, String)> = produced
         .iter()
-        .filter_map(|a| Some((tag(&a.r#type)?, a.group.as_str(), &a.content)))
-        .map(|(tag, group, content)| {
-            let hashout = content
+        .filter(|a| a.r#type.reaches_dependents())
+        .map(|a| {
+            let group = a.group.as_str();
+            let hashout = a
+                .content
                 .hashout()
                 .with_context(|| format!("reading rebuilt hashout of {addr} group {group:?}"))?;
-            anyhow::Ok((tag, group, hashout))
+            anyhow::Ok((&a.r#type, group, hashout))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let mut rebuilt: Vec<(&str, &str, &str)> = rebuilt_owned
+    let mut rebuilt: Vec<(&ManifestArtifactType, &str, &str)> = rebuilt_owned
         .iter()
         .map(|(t, g, h)| (*t, *g, h.as_str()))
         .collect();
@@ -5429,10 +5399,7 @@ impl Engine {
 
                     let checked = match artifacts
                         .iter()
-                        .filter(|a| matches!(
-                            a.r#type,
-                            outputartifact::Type::Output | outputartifact::Type::SupportFile
-                        ))
+                        .filter(|a| ManifestArtifactType::from(&a.r#type).reaches_dependents())
                         .map(|a| Ok(ArtifactMeta { hashout: a.hashout()? }))
                         .collect::<anyhow::Result<Vec<_>>>()
                         .with_context(|| format!("read artifact metas for {addr}"))

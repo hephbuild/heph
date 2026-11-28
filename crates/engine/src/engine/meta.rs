@@ -1,3 +1,4 @@
+use crate::engine::expand::ExpandedInputs;
 use crate::engine::request_state::{AddrKey, RequestState};
 use crate::engine::result::ExtendedTargetDef;
 use crate::engine::{EResult, Engine, OutputMatcher, ResultOptions};
@@ -63,33 +64,45 @@ impl Engine {
         // _no_track: meta is invoked from inner_result_addr after parent was
         // already set to addr — tracked get_def would record addr→addr.
         let def = Arc::clone(&self).get_def_no_track(rs.clone(), addr).await?;
-        let results = self.clone().inputs_result_meta(rs.clone(), addr).await?;
+        let (inputs, results) = self.clone().inputs_result_meta(rs.clone(), addr).await?;
 
-        // Borrow the input hashouts rather than cloning each `String`: they live
-        // in `results` (held until `hashin` returns) and the hash only reads their
-        // bytes. Sorting `&str` by content yields the same order as sorting the
-        // owned strings, so the digest is byte-identical.
-        let mut hashouts: Vec<&str> = results
+        // `results` is the hashed inputs' results, index for index: each is
+        // paired with its addr, which only the `HEPH_DEBUG_HASH` trace reads.
+        let deps = inputs
             .iter()
-            .flat_map(|res| res.artifacts_meta.iter().map(|m| m.hashout.as_str()))
-            .collect();
-        hashouts.sort_unstable();
-
-        let hashin = self
-            .hashin(&def, hashouts.into_iter())
-            .with_context(|| "hashin")?;
+            .filter(|input| input.hashed)
+            .map(|input| &input.r#ref.r#ref)
+            .zip(results.iter().map(|r| &**r));
+        let hashin = self.hashin(&def, deps).with_context(|| "hashin")?;
 
         Ok(ResultMeta { hashin })
     }
 
+    /// The cache key: the driver name, a `0` byte, the def hash, then the
+    /// hashout of every artifact of the hashed deps `deps`, sorted and written
+    /// raw. The hashouts are sorted here, so neither the deps' order nor an
+    /// artifact's place in its dep's result reaches the key; they borrow from
+    /// `deps`, so collecting them allocates one `Vec`.
+    ///
+    /// A dep's addr reaches no key: under `HEPH_DEBUG_HASH` each artifact is
+    /// noted in the trace as `dep <addr>: <hashout>` (a note hashes nothing),
+    /// so a diff of two traces says which dep moved.
     pub(crate) fn hashin<'a>(
         &self,
         def: &ExtendedTargetDef,
-        results: impl Iterator<Item = &'a str>,
+        deps: impl IntoIterator<Item = (&'a Addr, &'a EResult)>,
     ) -> anyhow::Result<String> {
         let mut h = DebugHasher::new(Xxh3Default::new(), || {
             format!("hashin_{}", def.target_def.addr.format())
         });
+        let mut hashouts: Vec<&str> = Vec::new();
+        for (dep, res) in deps {
+            for m in &res.artifacts_meta {
+                h.note(|| format!("dep {dep}: {}", m.hashout));
+                hashouts.push(m.hashout.as_str());
+            }
+        }
+        hashouts.sort_unstable();
 
         // Driver name is part of the cache key: swapping drivers under the
         // same addr (e.g. `bash` → `sh`, or a custom driver re-registration)
@@ -100,18 +113,20 @@ impl Engine {
 
         Hasher::write(&mut h, &def.target_def.hash);
 
-        for hashout in results {
+        for hashout in hashouts {
             Hasher::write(&mut h, hashout.as_bytes());
         }
 
         Ok(format!("{:x}", h.finish()))
     }
 
+    /// The expanded inputs of `addr`, and the result of each hashed one, in the
+    /// order the hashed inputs appear in them.
     async fn inputs_result_meta(
         self: Arc<Self>,
         rc: Arc<RequestState>,
         addr: &Addr,
-    ) -> anyhow::Result<Vec<Arc<EResult>>> {
+    ) -> anyhow::Result<(Arc<ExpandedInputs>, Vec<Arc<EResult>>)> {
         let inputs = Arc::clone(&self)
             .expanded_inputs_for(rc.clone(), addr)
             .await?;
@@ -134,7 +149,8 @@ impl Engine {
             })
         });
 
-        crate::engine::fanout::join_all_failable(futures, fail_fast).await
+        let results = crate::engine::fanout::join_all_failable(futures, fail_fast).await?;
+        Ok((inputs, results))
     }
 }
 
@@ -144,6 +160,7 @@ mod tests {
     use crate::engine::Config;
     use crate::engine::driver::targetdef::{CacheConfig, TargetDef};
     use hmodel::htpkg::PkgBuf;
+    use hplugin::eresult::ArtifactMeta;
     use std::collections::BTreeMap;
 
     fn test_engine() -> (Engine, tempfile::TempDir) {
@@ -171,8 +188,36 @@ mod tests {
         }
     }
 
+    fn dep(hashouts: &[&str]) -> EResult {
+        EResult {
+            artifacts_meta: hashouts
+                .iter()
+                .map(|h| ArtifactMeta {
+                    hashout: (*h).to_string(),
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn dep_addr(name: &str) -> Addr {
+        Addr::new(PkgBuf::from("dep"), name.to_string(), BTreeMap::new())
+    }
+
+    /// The hashin of `def` whose hashed deps resolved to `deps`, each under the
+    /// addr `//dep:<index>`.
+    fn hashin_of(engine: &Engine, def: &ExtendedTargetDef, deps: &[EResult]) -> String {
+        let addrs: Vec<Addr> = (0..deps.len()).map(|i| dep_addr(&i.to_string())).collect();
+        engine.hashin(def, addrs.iter().zip(deps)).expect("hashin")
+    }
+
+    /// The hashin of a `bash` target whose hashed deps resolved to `deps`.
+    fn hashin_over(engine: &Engine, deps: &[EResult]) -> String {
+        hashin_of(engine, &ext_def("bash", vec![1, 2, 3]), deps)
+    }
+
     /// Golden freeze of the cache-key digest. The hashin folds driver name, the
-    /// target-def hash, and the (already-sorted) input hashouts. T1.2 switched the
+    /// target-def hash, and the sorted input hashouts. T1.2 switched the
     /// caller from cloning + `itertools::sorted()` owned `String`s to borrowing +
     /// `sort_unstable()` on `&str`; both must hash byte-identically. A change to
     /// this constant means the cache key drifted — every cached artifact across
@@ -181,10 +226,9 @@ mod tests {
     fn hashin_is_stable_and_keyed_on_driver_and_inputs() {
         let (engine, _dir) = test_engine();
         let def = ext_def("bash", vec![1, 2, 3]);
+        let deps = [dep(&["ccc", "aaa"]), dep(&["bbb"])];
 
-        let h = engine
-            .hashin(&def, ["aaa", "bbb", "ccc"].into_iter())
-            .expect("hashin");
+        let h = hashin_of(&engine, &def, &deps);
         assert_eq!(
             h, "49fb4d47cf278c4f",
             "cache-key digest must stay stable across the borrow/sort refactor"
@@ -193,20 +237,60 @@ mod tests {
         // Driver name and input hashouts both fold into the key.
         assert_ne!(
             h,
-            engine
-                .hashin(
-                    &ext_def("sh", vec![1, 2, 3]),
-                    ["aaa", "bbb", "ccc"].into_iter()
-                )
-                .unwrap(),
+            hashin_of(&engine, &ext_def("sh", vec![1, 2, 3]), &deps),
             "driver name is part of the cache key"
         );
         assert_ne!(
             h,
-            engine
-                .hashin(&def, ["aaa", "bbb", "ddd"].into_iter())
-                .unwrap(),
+            hashin_of(&engine, &def, &[dep(&["aaa", "bbb", "ddd"])]),
             "input hashouts are part of the cache key"
         );
+        // A dep's addr only names it in the debug trace.
+        let renamed = [dep_addr("other"), dep_addr("names")];
+        assert_eq!(
+            h,
+            engine.hashin(&def, renamed.iter().zip(&deps)).unwrap(),
+            "a dep's addr is not part of the cache key"
+        );
+    }
+
+    /// A target with no hashed dep, and one whose deps have no artifacts, fold
+    /// nothing after the def hash: both key as the hashing has always keyed a
+    /// dep-less target. The constant is the bare fold's (driver, `0`, def hash).
+    #[test]
+    fn hashin_of_deps_with_no_artifacts_is_that_of_no_deps() {
+        let (engine, _dir) = test_engine();
+        let none = hashin_over(&engine, &[]);
+        assert_eq!(none, "55336fc88812b4d8", "a no-dep key must not move");
+        assert_eq!(hashin_over(&engine, &[dep(&[])]), none);
+        assert_eq!(hashin_over(&engine, &[dep(&[]), dep(&[])]), none);
+    }
+
+    /// A dep with many artifacts (a big glob, an unpacked tree) keys the same
+    /// whatever order it lists them in, and however they split across deps.
+    /// The constant is the bare fold of `h00000`..`h01499`, sorted.
+    #[test]
+    fn hashin_of_a_many_artifact_dep_ignores_their_order() {
+        let (engine, _dir) = test_engine();
+        let hashouts: Vec<String> = (0..1500).map(|i| format!("h{i:05}")).collect();
+        let refs: Vec<&str> = hashouts.iter().map(String::as_str).collect();
+
+        let forward = hashin_over(&engine, &[dep(&refs)]);
+        assert_eq!(
+            forward, "322f06133ba59372",
+            "a many-artifact key must not move"
+        );
+
+        let mut reversed = refs.clone();
+        reversed.reverse();
+        assert_eq!(forward, hashin_over(&engine, &[dep(&reversed)]));
+        // A deterministic shuffle: stride through the list by a step coprime
+        // with its length.
+        let shuffled: Vec<&str> = (0..refs.len())
+            .map(|i| refs[(i * 7919) % refs.len()])
+            .collect();
+        assert_eq!(forward, hashin_over(&engine, &[dep(&shuffled)]));
+        let (a, b) = refs.split_at(700);
+        assert_eq!(forward, hashin_over(&engine, &[dep(b), dep(a)]));
     }
 }

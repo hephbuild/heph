@@ -105,6 +105,35 @@ pub async fn run_drain(engine: &Arc<Engine>, addr: &str) -> String {
     artifact_string(&result)
 }
 
+/// [`run_drain`], plus the `hashin` that same request keyed the target on —
+/// computed from its deps' results as that request resolved them (a fresh
+/// run's, a local hit's or a remote hit's), not recomputed afterwards.
+pub async fn run_drain_hashin(engine: &Arc<Engine>, addr: &str) -> (String, String) {
+    let addr = heph::htaddr::parse_addr(addr).expect("parse addr");
+    let rs = engine.new_state();
+    let result = engine
+        .clone()
+        .result_addr(
+            rs.clone(),
+            &addr,
+            heph::engine::OutputMatcher::All,
+            &heph::engine::ResultOptions::default(),
+        )
+        .await
+        .expect("run target");
+    // Memoized on `rs` by the run itself.
+    let hashin = engine
+        .clone()
+        .meta(rs.clone(), &addr)
+        .await
+        .expect("hashin of the run")
+        .hashin;
+    let out = artifact_string(&result);
+    drop(result);
+    drain(rs).await;
+    (out, hashin)
+}
+
 /// `heph r <matcher>` on one event-collecting request: the batch result and
 /// every event the request emitted, after the background work drained.
 pub async fn run_drain_events(

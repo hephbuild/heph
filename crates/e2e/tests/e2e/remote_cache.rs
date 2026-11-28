@@ -80,6 +80,72 @@ async fn remote_cache_cold_warm_hot() {
     );
 }
 
+/// A dependent's key folds its deps' hashouts, and every source of a dep's
+/// result must hand the same ones: the fresh run that built it, the local
+/// manifest a later invocation reads, and the remote manifest an empty local
+/// cache pulls. If one of them reported a hashout the others did not (a
+/// support file dropped, a log let through), the dependent would key
+/// differently per source and miss on every machine but the one that built it.
+///
+/// `dep` has two named output groups and a support file; `top` picks one of
+/// the groups. `top` prints a random value, so an unchanged output proves a
+/// cache hit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dependents_key_is_the_same_from_a_fresh_run_a_local_hit_and_a_remote_hit() {
+    let root = tempfile::tempdir().expect("root tempdir");
+    let remote = tempfile::tempdir().expect("remote tempdir");
+    let remote_uri = format!("file://{}", remote.path().display());
+    std::fs::create_dir_all(root.path().join("pkg")).expect("mkdir pkg");
+    std::fs::write(
+        root.path().join("pkg").join("BUILD"),
+        r#"
+target(
+    name = "dep",
+    driver = "bash",
+    run = "printf aye > a.txt && printf bee > b.txt && printf sea > c.txt",
+    out = {"x": "a.txt", "y": "b.txt"},
+    support_files = ["c.txt"],
+)
+target(
+    name = "top",
+    driver = "bash",
+    deps = [":dep|x"],
+    run = 'cat "$SRC" > $OUT && echo $RANDOM$RANDOM$RANDOM >> $OUT',
+    out = "top.txt",
+)
+"#,
+    )
+    .expect("write BUILD");
+
+    // Cold: `dep` and `top` execute; `top`'s key folds `dep`'s fresh metas.
+    let cold = build_engine(root.path(), &remote_uri);
+    let (out_cold, key_cold) = crate::common::run_drain_hashin(&cold, "//pkg:top").await;
+    assert!(out_cold.starts_with("aye"), "top read dep|x: {out_cold:?}");
+    drop(cold);
+
+    // Local hit: the next invocation reads `dep`'s metas from its local
+    // manifest. No remote, so nothing can come from there.
+    let local = build_engine_with_remote(root.path(), None);
+    let (out_local, key_local) = crate::common::run_drain_hashin(&local, "//pkg:top").await;
+    drop(local);
+    assert_eq!(
+        key_local, key_cold,
+        "a local hit keys `top` as the fresh run did"
+    );
+    assert_eq!(out_local, out_cold, "`top` was a local cache hit");
+
+    // Remote hit: an empty local cache pulls `dep`'s manifest, and `top`'s,
+    // from the remote.
+    std::fs::remove_dir_all(HomeDir::for_tests(root.path()).join("cache")).expect("rm local cache");
+    let warm = build_engine(root.path(), &remote_uri);
+    let (out_remote, key_remote) = crate::common::run_drain_hashin(&warm, "//pkg:top").await;
+    assert_eq!(
+        key_remote, key_cold,
+        "a remote hit keys `top` as the fresh run did"
+    );
+    assert_eq!(out_remote, out_cold, "`top` was a remote cache hit");
+}
+
 /// Total bytes of every file under `dir`.
 fn dir_bytes(dir: &Path) -> u64 {
     let mut bytes = 0;
