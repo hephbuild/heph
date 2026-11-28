@@ -1638,9 +1638,23 @@ pub type InteractiveInner = Box<
             // Live window sizes, for a build target's `--shell` (see
             // `RunRequest::winsize`). In-process only.
             Option<crate::engine::driver::WinSizeReceiver>,
-        ) -> futures::future::BoxFuture<'io, anyhow::Result<()>>
+        ) -> futures::future::BoxFuture<'io, anyhow::Result<RunEnd>>
         + Send,
 >;
+
+/// What an [`InteractiveInner`] tells the wrapper that ran it, once the run
+/// returned and before the wrapper hands the terminal back.
+///
+/// `exec_failure` is set when the run's process failed (an exit, a signal, a
+/// timeout; never a stop): the addr, the exit and the timeout as the
+/// failure's record will hold them, and nothing else. A wrapper whose run
+/// streamed prints its one line from it while it still holds the terminal
+/// (`✗ //t · exit status 1 · heph log //t`, D6.1c), and every renderer
+/// leaves that failure's box out ([`hcore::failure::FailureRecord::told_streamed`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunEnd {
+    pub exec_failure: Option<Box<hcore::failure::FailureRecord>>,
+}
 
 /// What an [`InteractiveWrapper`] reports about the run it wrapped.
 ///
@@ -17618,7 +17632,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 let res = inner(None, None, None, None).await;
                 probe.live.fetch_sub(1, Ordering::SeqCst);
-                res.map(|()| TerminalUse::default())
+                res.map(|_| TerminalUse::default())
             })
         })
     }
@@ -19188,6 +19202,63 @@ mod tests {
             assert_eq!(recorded.streamed, streamed);
             let tail = recorded_tail(&recorded).expect("the tail is always kept");
             assert!(tail.text.contains("line12"), "tail: {}", tail.text);
+        }
+        Ok(())
+    }
+
+    /// D6.1c: the wrapper hears of a failed process while it still holds the
+    /// terminal, with the status the record then holds, and that record is
+    /// one every renderer leaves out once the run streamed
+    /// (`told_streamed`). A run that went fine, then failed past the run,
+    /// tells the wrapper nothing, and its record keeps its box.
+    #[tokio::test]
+    async fn wrapper_hears_of_a_failed_process_before_it_lets_go() -> anyhow::Result<()> {
+        for fail_in_run in [true, false] {
+            let mut spec = leaf_spec("//pkg:t", fail_in_run)?;
+            if !fail_in_run {
+                spec.config
+                    .insert("badout".to_string(), hcore::htvalue::Value::Bool(true));
+            }
+            let h = terminal_harness(vec![spec])?;
+            let rs = h.engine.new_state();
+            let addr = hmodel::htaddr::parse_addr("//pkg:t")?;
+            let heard: SArc<parking_lot::Mutex<Option<crate::engine::RunEnd>>> = SArc::default();
+            let wrapper: InteractiveWrapper = SArc::new({
+                let heard = SArc::clone(&heard);
+                move |inner: InteractiveInner| {
+                    let heard = SArc::clone(&heard);
+                    Box::pin(async move {
+                        let end = inner(None, None, None, None).await?;
+                        *heard.lock() = Some(end);
+                        Ok(TerminalUse { streamed: true })
+                    })
+                }
+            });
+            let opts = ResultOptions {
+                interactive: Some(wrapper),
+                ..Default::default()
+            };
+            Arc::clone(&h.engine)
+                .result_addr(rs.clone(), &addr, OutputMatcher::All, &opts)
+                .await
+                .err()
+                .expect("the target fails");
+
+            let end = heard.lock().take().expect("the wrapper ran the target");
+            let recorded = rs.get_failure(&addr).expect("failure must be recorded");
+            if fail_in_run {
+                let told = end.exec_failure.expect("a failed process is told");
+                assert_eq!(told.addr.as_deref(), Some("//pkg:t"));
+                assert_eq!(
+                    told.exit, recorded.record.exit,
+                    "the status the record holds"
+                );
+                assert!(recorded.record.told_streamed(), "{:?}", recorded.record);
+            } else {
+                assert_eq!(end.exec_failure, None, "the process went fine");
+                assert!(recorded.record.streamed, "the run streamed");
+                assert!(!recorded.record.told_streamed(), "its box is printed");
+            }
         }
         Ok(())
     }

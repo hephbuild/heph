@@ -157,33 +157,7 @@ pub(crate) fn compact(
     rec.entry = entry.format();
     rec.causes = causes;
 
-    let local = downcast_chain_ref::<ProcessFailed>(e);
-    let exit = local
-        .and_then(|p| p.exit)
-        .or_else(|| downcast_chain_ref::<RemoteProcessFailed>(e).map(|r| r.exit));
-    rec.exit = match (exit, local) {
-        (Some(x), _) => Some(ExitData {
-            code: match x {
-                hcore::process::Exit::Code(c) => Some(c),
-                hcore::process::Exit::Signal(_) => None,
-            },
-            signal: match x {
-                hcore::process::Exit::Signal(s) => Some(s),
-                hcore::process::Exit::Code(_) => None,
-            },
-            status: x.to_string(),
-        }),
-        (None, Some(p)) => Some(ExitData {
-            code: None,
-            signal: None,
-            status: p.status.clone(),
-        }),
-        (None, None) => None,
-    };
-    rec.timed_out = crate::engine::run_timeout::timed_out(e).map(|t| hcore::events::TimedOutData {
-        timeout_ms: t.timeout.as_millis(),
-        abandoned: t.abandoned_after.is_some(),
-    });
+    (rec.exit, rec.timed_out) = exec_facts(e);
     let frozen = downcast_chain_ref::<FrozenCheckError>(e);
     rec.frozen_diff = frozen.map(|f| f.diff.clone());
     rec.cancelled = hplugin::error::is_cancelled(e);
@@ -222,6 +196,72 @@ pub(crate) fn compact(
     }
 
     bound(scrubbed(rec, &clean))
+}
+
+/// How `e`'s process ended, when `e` is a process that failed: its exit
+/// (local or remote) and its timeout. Both `None` for any other failure.
+/// What makes a record [`FailedIn::Exec`].
+fn exec_facts(e: &anyhow::Error) -> (Option<ExitData>, Option<hcore::events::TimedOutData>) {
+    let local = downcast_chain_ref::<ProcessFailed>(e);
+    let exit = local
+        .and_then(|p| p.exit)
+        .or_else(|| downcast_chain_ref::<RemoteProcessFailed>(e).map(|r| r.exit));
+    let exit = match (exit, local) {
+        (Some(x), _) => Some(ExitData {
+            code: match x {
+                hcore::process::Exit::Code(c) => Some(c),
+                hcore::process::Exit::Signal(_) => None,
+            },
+            signal: match x {
+                hcore::process::Exit::Signal(s) => Some(s),
+                hcore::process::Exit::Code(_) => None,
+            },
+            status: x.to_string(),
+        }),
+        (None, Some(p)) => Some(ExitData {
+            code: None,
+            signal: None,
+            status: p.status.clone(),
+        }),
+        (None, None) => None,
+    };
+    let timed_out = crate::engine::run_timeout::timed_out(e).map(|t| hcore::events::TimedOutData {
+        timeout_ms: t.timeout.as_millis(),
+        abandoned: t.abandoned_after.is_some(),
+    });
+    (exit, timed_out)
+}
+
+/// What a terminal wrapper is told of `addr`'s run the moment its process
+/// failed (D6.1c): a record holding the addr, the exit and the timeout as
+/// [`compact`] will record them, scrubbed of `scrub`, [`FailedIn::Exec`].
+/// Enough for the one line a streamed run gets
+/// (`tui::failure_report::streamed_exec_line`), nothing more. `None` when
+/// the run failed some other way, or was stopped: a stop is no failure.
+pub(crate) fn exec_failure(addr: &Addr, e: &anyhow::Error, scrub: &Scrub) -> Option<FailureRecord> {
+    if hplugin::error::is_cancelled(e) {
+        return None;
+    }
+    let (exit, timed_out) = exec_facts(e);
+    if exit.is_none() && timed_out.is_none() {
+        return None;
+    }
+    let needles = scrub.needles();
+    let addr = addr.format();
+    let mut rec = FailureRecord::new(Diagnostic::new(Stage::Run, String::new()));
+    rec.exit = exit.map(|mut x| {
+        x.status = bound_text(
+            &scrub_text(needles.as_ref(), &x.status),
+            hcore::diagnostic::MESSAGE_CAP,
+            &mut false,
+        );
+        x
+    });
+    rec.timed_out = timed_out;
+    rec.failed_in = FailedIn::Exec;
+    rec.entry = addr.clone();
+    rec.addr = Some(addr);
+    Some(rec)
 }
 
 /// `e`'s cause as one message, as [`cause_frames`] reads it, but with an

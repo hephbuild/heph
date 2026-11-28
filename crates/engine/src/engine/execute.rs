@@ -886,8 +886,23 @@ impl Engine {
                             w.finish().await;
                         }
                     }
+                    // What the wrapper may say of a failed process while it
+                    // still holds the terminal (D6.1c). A stop is not one.
+                    let end = crate::engine::RunEnd {
+                        exec_failure: match &res {
+                            Err(e) if !rs.ctoken().is_cancelled() => {
+                                crate::engine::failure_record::exec_failure(
+                                    &target.addr,
+                                    e,
+                                    &rs.scrub_for(&[&target.addr]),
+                                )
+                                .map(Box::new)
+                            }
+                            _ => None,
+                        },
+                    };
                     drop(tx.send(res));
-                    Ok(())
+                    Ok(end)
                 })
             }
         ));

@@ -129,6 +129,16 @@ impl FailureRecord {
         }
     }
 
+    /// The failure was already told on the terminal: its process failed
+    /// while its output streamed there, and the wrapper that lent it the
+    /// terminal printed its one line (`✗ //t · exit status 1 · heph log
+    /// //t`, D6.1c) right after that output. Every renderer leaves its box
+    /// out; `--json` still carries it. A failure after a streamed run (its
+    /// outputs, the cache store) is not: it gets its box, without the log.
+    pub fn told_streamed(&self) -> bool {
+        self.streamed && self.failed_in == FailedIn::Exec && !self.cancelled
+    }
+
     /// The bytes of text the record holds, as [`RECORD_CAP`] counts them:
     /// every text it would print about the failure. Not the path (its depth
     /// is the graph's, bounded where the request keeps it), not what was left

@@ -702,7 +702,7 @@ async fn shell_exit_1_writes_nothing() -> anyhow::Result<()> {
             let (mut out, mut err) = (tokio::io::sink(), tokio::io::sink());
             inner(Some(&mut typed), Some(&mut out), Some(&mut err), None)
                 .await
-                .map(|()| heph::engine::TerminalUse::default())
+                .map(|_| heph::engine::TerminalUse::default())
         })
     });
     let opts = ResultOptions {

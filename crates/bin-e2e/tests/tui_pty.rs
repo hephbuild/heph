@@ -2738,11 +2738,6 @@ impl Boxed {
     }
 }
 
-/// The pointer row of a streamed target whose log has one line.
-fn pointer_one_line(addr: &str) -> String {
-    format!("(output not shown here: 1 line · heph log {addr})")
-}
-
 /// Some line of `text` is a box row showing `line` from a log tail.
 fn has_tail_row(text: &str, line: &str) -> bool {
     count_tail_rows(text, line) > 0
@@ -2807,13 +2802,20 @@ fn has_bare_row(rows: &[String], line: &str) -> bool {
     rows.iter().any(|r| r == line)
 }
 
-/// The box of a streamed target: the pointer, its raw line above the report
-/// as the target wrote it, and its tail nowhere in a box.
+/// A streamed target whose process failed (D6.1c): its raw line as the
+/// target wrote it, then its one line `✗ //t · exit status 1 · heph log //t`,
+/// and no box anywhere, neither its tail nor the pointer.
 fn assert_streamed(b: &Boxed, addr: &str, line: &str) {
     let rows = b.rows();
+    let told = format!("✗ {addr} · exit status 1 · heph log {addr}");
     assert!(
-        rows.iter().any(|r| r.contains(&pointer_one_line(addr))),
-        "{addr} streamed, so its box points at `heph log` instead of a tail\n{}",
+        rows.iter().any(|r| r.trim_end() == told),
+        "{addr} streamed and its process failed, so it gets one line\n{}",
+        b.report()
+    );
+    assert!(
+        !b.pty.seen().contains("output not shown here"),
+        "{addr} was told in its one line, yet it got a box\n{}",
         b.report()
     );
     assert!(
@@ -2852,11 +2854,11 @@ fn assert_no_pointer_ever(b: &Boxed) {
     );
 }
 
-/// RUN-STDERR: a requested target writing to stderr under the TUI has the
-/// terminal lent to it, so what it printed is already on screen; its box
-/// says where the rest is instead of printing it again.
+/// RUN-STDERR, U6: a requested target writing to stderr under the TUI has the
+/// terminal lent to it, so what it printed is already on screen; its process
+/// failing gets one line pointing at `heph log`, and no box at the end.
 #[test]
-fn streamed_target_box_has_pointer_not_tail() {
+fn streamed_exec_failure_one_line_with_log_pointer() {
     let b = boxed(TTY_BUILD, r#""$HEPH" run //pkg:s"#);
     b.assert_failed();
     assert!(b.tui_engaged(), "the TUI never engaged\n{}", b.report());
@@ -3025,7 +3027,6 @@ fn tty_failing_dependency_not_streamed() {
 
 /// TTY row "requested target that printed nothing": `(no output)`.
 #[test]
-#[ignore = "needs PR 4 RUN-19: an empty log fills no slot"]
 fn tty_printed_nothing() {
     let b = boxed(TTY_BUILD, r#""$HEPH" run //pkg:empty"#);
     b.assert_failed();

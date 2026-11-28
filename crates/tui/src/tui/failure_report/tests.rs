@@ -881,7 +881,12 @@ fn totals_skipped_fail_fast_and_streamed_lines() {
         ..target("//p:a b", Diagnostic::new(Stage::Run, "m"))
     };
     assert_eq!(
-        streamed_exec_line(&rec),
+        streamed_exec_line(&rec, false),
         "✗ //p:a b · exit status 1 · heph log '//p:a b'"
+    );
+    let painted = streamed_exec_line(&rec, true);
+    assert!(
+        painted.contains("\x1b[") && painted.contains("heph log '//p:a b'"),
+        "{painted:?}"
     );
 }
