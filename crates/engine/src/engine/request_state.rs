@@ -710,11 +710,15 @@ impl TookDown {
     pub const NAMED: usize = 5;
 }
 
+/// One source file's index as its provider gave it, `None` included, loaded
+/// at most once ([`RequestState::load_source_index`]).
+type SourceIndexCell = Arc<tokio::sync::OnceCell<Option<Arc<dyn hplugin::provider::SourceIndex>>>>;
+
+/// [`RequestStateData::source_indexes`]: (provider name, file) → index.
+type SourceIndexes = FxHashMap<(String, Arc<str>), SourceIndexCell>;
+
 /// The values a request's targets were handed to scrub
 /// ([`RequestStateData::scrubs`]).
-/// [`RequestStateData::source_indexes`]: (provider name, file) → index.
-type SourceIndexes = FxHashMap<(String, Arc<str>), Option<Arc<dyn hplugin::provider::SourceIndex>>>;
-
 #[derive(Default)]
 struct Scrubs {
     by_addr: FxHashMap<Addr, crate::engine::failure_record::Scrub>,
@@ -886,8 +890,10 @@ pub struct RequestStateData {
     /// Each source file's index, by (provider, workspace-relative file), as
     /// the provider gave it ([`Provider::source_index`](hplugin::provider::Provider::source_index)),
     /// `None` included: asked once per file per request, however many
-    /// diagnostics point into it. Filled only on a failure, read only by
-    /// [`RequestState::decl_field_loc`]; never reaches a hash (I1).
+    /// diagnostics point into it. The map's lock is held only to get or
+    /// insert a file's cell, so files load in parallel. Filled only on a
+    /// failure, read only by [`RequestState::decl_field_loc`]; never reaches
+    /// a hash (I1).
     source_indexes: Mutex<SourceIndexes>,
     /// How many times a provider was asked for a source index this request:
     /// one per file is the budget ([`RequestState::source_index_loads`]).
@@ -1581,8 +1587,9 @@ impl RequestState {
     /// span its provider's [`SourceIndex`](hplugin::provider::SourceIndex)
     /// finds in the declaring call, else that call's start (its spec's
     /// [`SpecSource`](hplugin::provider::SpecSource)); `field` `None` is the
-    /// call. Error path only: the first ask for a file asks the provider for
-    /// its index, once per file per request.
+    /// call. Error path only, and never asks the provider: the index is the
+    /// one [`load_source_index`](Self::load_source_index) loaded, and a file
+    /// whose index was not loaded points at the call.
     ///
     /// Never resolves anything: a spec not yet resolved, resolved with an
     /// error, or whose provider reported no source has no location here.
@@ -1603,26 +1610,57 @@ impl RequestState {
         })
     }
 
-    /// `provider`'s index of `file`, asked of the provider at most once per
-    /// request. The lock is held across the ask, so two diagnostics racing
-    /// on one file parse it once; it is a leaf, taken on the error path only.
+    /// `provider`'s index of `file`, when [`load_source_index`]
+    /// (Self::load_source_index) loaded it.
     fn source_index(
         &self,
         provider: &str,
         file: &Arc<str>,
     ) -> Option<Arc<dyn hplugin::provider::SourceIndex>> {
-        let mut indexes = self.data.source_indexes.lock();
-        let key = (provider.to_owned(), Arc::clone(file));
-        if let Some(index) = indexes.get(&key) {
-            return index.clone();
-        }
-        let index = self.data.engine.upgrade().and_then(|engine| {
-            let p = engine.providers_by_name.get(provider)?;
+        let indexes = self.data.source_indexes.lock();
+        indexes
+            .get(&(provider.to_owned(), Arc::clone(file)))?
+            .get()
+            .cloned()
+            .flatten()
+    }
+
+    /// Load the source index of the file `addr` was declared in, for a
+    /// diagnostic about one of its options ([`decl_field_loc`]
+    /// (Self::decl_field_loc)) that the caller is about to build. Error
+    /// path only.
+    ///
+    /// The provider is asked at most once per file per request, on the
+    /// blocking pool (it may read and parse the file): racing diagnostics
+    /// on one file wait for the one ask, and different files load in
+    /// parallel. Like `decl_field_loc`, it never resolves anything.
+    pub(crate) async fn load_source_index(&self, addr: &Addr) {
+        let Some(spec) = self.resolved_spec(addr) else {
+            return;
+        };
+        let Some(source) = spec.spec.source.as_ref() else {
+            return;
+        };
+        let cell = Arc::clone(
+            self.data
+                .source_indexes
+                .lock()
+                .entry((spec.provider.clone(), Arc::clone(source.file_arc())))
+                .or_default(),
+        );
+        cell.get_or_init(|| async {
+            let provider = Arc::clone(
+                self.data
+                    .engine
+                    .upgrade()?
+                    .providers_by_name
+                    .get(&spec.provider)?,
+            );
             self.data.source_index_loads.fetch_add(1, Ordering::Relaxed);
-            p.provider.source_index(file)
-        });
-        indexes.insert(key, index.clone());
-        index
+            let file = Arc::clone(source.file_arc());
+            hcore::blocking::run(move || provider.provider.source_index(&file)).await
+        })
+        .await;
     }
 
     /// How many source indexes providers were asked for this request

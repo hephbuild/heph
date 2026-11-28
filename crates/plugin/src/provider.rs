@@ -528,6 +528,11 @@ pub trait Provider: Send + Sync {
     /// asks once per file per request, however many diagnostics point into
     /// it, so a provider may parse the file here and nowhere else.
     ///
+    /// The engine calls it on its blocking pool, so it may block (read and
+    /// parse the file). It must not call back into the engine: it runs
+    /// while a diagnostic is being built, and other diagnostics about the
+    /// same file wait for it.
+    ///
     /// Default: none, and diagnostics point at the call. An in-process seam:
     /// a cdylib provider keeps the default.
     fn source_index(&self, _file: &str) -> Option<Arc<dyn SourceIndex>> {

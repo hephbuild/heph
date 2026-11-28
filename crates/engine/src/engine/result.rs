@@ -7038,6 +7038,8 @@ impl Engine {
         let driver = match self.drivers_by_name.get(&spec.driver) {
             Some(driver) => driver,
             None => {
+                // The failure points at the `driver` option: its index.
+                rs.load_source_index(addr).await;
                 return Err(hplugin::error::DriverNotFound {
                     driver: spec.driver.clone(),
                 }
@@ -7045,7 +7047,7 @@ impl Engine {
             }
         };
 
-        let res = driver
+        let parsed = driver
             .driver
             .parse(
                 ParseRequest {
@@ -7054,8 +7056,15 @@ impl Engine {
                 },
                 rs.ctoken(),
             )
-            .await
-            .with_context(|| format!("{} parse", driver.name))?;
+            .await;
+        let res = match parsed {
+            Ok(res) => res,
+            Err(e) => {
+                // A refused spec points at the option it names: its index.
+                rs.load_source_index(addr).await;
+                return Err(e.context(format!("{} parse", driver.name)));
+            }
+        };
         let mut def = rewrite_query_inputs(res.target_def, addr, &spec.provider);
         // Expand the engine-baked `//@heph/introspect:outputs` magic input into
         // one `@heph/fs` input per declared output path of this target. Done
@@ -7248,11 +7257,13 @@ impl Engine {
                 let input_ref = &input.r#ref;
                 enclose!((self => engine, rs) async move {
                     let dep = &input_ref.r#ref;
-                    let spec = Arc::clone(&engine)
-                        .get_spec(rs.clone(), dep)
-                        .await
-                        .map_err(|e| {
-                            MissingDep::wrap_or(
+                    let spec = match Arc::clone(&engine).get_spec(rs.clone(), dep).await {
+                        Ok(spec) => spec,
+                        Err(e) => {
+                            if MissingDep::names(&e, dep) {
+                                rs.load_source_index(declarer).await;
+                            }
+                            return Err(MissingDep::wrap_or(
                                 e,
                                 dep,
                                 declarer,
@@ -7264,8 +7275,9 @@ impl Engine {
                                     )
                                 },
                                 |e| hplugin::diagnostic::with_stage(e, Boundary::GetSpec, dep),
-                            )
-                        })?;
+                            ));
+                        }
+                    };
 
                     // For transparent targets (groups), use the pre-computed applied_transitive
                     // which already recursively aggregates all nested deps' transitives.
