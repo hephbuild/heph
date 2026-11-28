@@ -21,6 +21,19 @@ use starlark::syntax::ast::AstStmt;
 use starlark::syntax::ast::StmtP;
 use starlark_syntax::syntax::module::AstModuleFields;
 
+/// The Starlark dialect heph's BUILD (and `load()`ed) files are written in:
+/// starlark's `Extended` (types, keyword-only arguments, top-level `for`/`if`)
+/// plus f-strings (`f"{name}-{version}"`).
+///
+/// Every parse of a BUILD file goes through this one constant: evaluation, the
+/// load walk, the lint and format checks, `heph tool build-fmt` and the LSP. A
+/// second copy is how one of them comes to refuse a file another accepts. It
+/// lives here because this crate is the one every other parser depends on.
+pub const DIALECT: Dialect = Dialect {
+    enable_f_strings: true,
+    ..Dialect::Extended
+};
+
 /// The directive that, when present as a leading comment, skips formatting.
 pub const COMMENT_SKIP_FILE: &str = "heph:fmt skip-file";
 
@@ -70,7 +83,7 @@ pub fn format(filename: &str, src: &str, config: Config) -> Result<String, FmtEr
         return Err(FmtError::Config("indent must be > 0".to_string()));
     }
 
-    let module = AstModule::parse(filename, src.to_string(), &Dialect::Extended)
+    let module = AstModule::parse(filename, src.to_string(), &DIALECT)
         .map_err(|e| FmtError::Parse(e.into_anyhow()))?;
 
     let codemap = module.codemap();

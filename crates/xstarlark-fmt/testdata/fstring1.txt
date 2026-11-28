@@ -1,0 +1,10 @@
+x = f"{a}-{b}"
+y = f"{ a }"   +   "z"
+target(name=f"t_{v}", deps=[f"//p:{n}"])
+----
+x = f"{a}-{b}"
+y = f"{ a }" + "z"
+target(
+  name = f"t_{v}",
+  deps = [f"//p:{n}"],
+)

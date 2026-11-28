@@ -17,7 +17,7 @@ use starlark::any::ProvidesStaticType;
 use starlark::environment::{FrozenModule, Globals, GlobalsBuilder, Module};
 use starlark::eval::{Arguments, Evaluator, FileLoader};
 use starlark::starlark_module;
-use starlark::syntax::{AstModule, Dialect};
+use starlark::syntax::AstModule;
 use starlark::values::dict::DictRef;
 use starlark::values::float::UnpackFloat;
 use starlark::values::list::{AllocList, ListRef, UnpackList};
@@ -2393,17 +2393,18 @@ pub(crate) fn rel_display(root: &Path, path: &Path) -> String {
     }
 }
 
-/// Parse a BUILD (or `load()`ed) file in the dialect evaluation uses. The one
-/// parse both evaluation and the load walk go through.
+/// Parse a BUILD (or `load()`ed) file in heph's dialect
+/// ([`hxstarlark_fmt::DIALECT`]). The one parse both evaluation and the load
+/// walk go through.
 pub(crate) fn parse_build_file(path: &Path) -> anyhow::Result<AstModule> {
-    AstModule::parse_file(path, &Dialect::Extended).map_err(starlark::Error::into_anyhow)
+    AstModule::parse_file(path, &hxstarlark_fmt::DIALECT).map_err(starlark::Error::into_anyhow)
 }
 
 /// [`parse_build_file`] over source already read, named `name` in spans and
 /// errors: the lint check reads a sandbox file and names it by its
 /// workspace-relative path. Same dialect as evaluation.
 pub(crate) fn parse_build_source(name: &str, src: String) -> anyhow::Result<AstModule> {
-    AstModule::parse(name, src, &Dialect::Extended).map_err(starlark::Error::into_anyhow)
+    AstModule::parse(name, src, &hxstarlark_fmt::DIALECT).map_err(starlark::Error::into_anyhow)
 }
 
 /// Resolve a `load()` path argument to an absolute filesystem path, rejecting
@@ -2479,7 +2480,7 @@ pub(crate) fn eval_source(
     pkg: &str,
     loader: &BuildFileLoader,
 ) -> anyhow::Result<RunResult> {
-    let ast: AstModule = AstModule::parse(filename, content, &Dialect::Extended)
+    let ast: AstModule = AstModule::parse(filename, content, &hxstarlark_fmt::DIALECT)
         .map_err(starlark::Error::into_anyhow)?;
     eval_parsed(ast, pkg, loader)
 }
@@ -3283,6 +3284,36 @@ target(name = "direct", driver = "exec")
         let result = loader.load_pkg("p").unwrap();
         assert_eq!(result.targets.len(), 1);
         assert!(result.targets[0].provenance.is_empty());
+    }
+
+    /// f-strings parse and evaluate in a BUILD file and in a file it loads:
+    /// both go through [`parse_build_file`], so both are in heph's dialect.
+    #[test]
+    fn f_strings_evaluate_in_build_and_loaded_files() {
+        let tmp = tempdir().unwrap();
+        let lib = tmp.path().join("lib");
+        fs::create_dir_all(&lib).unwrap();
+        fs::write(
+            lib.join("defs.star"),
+            "def name_of(base, v):\n    return f\"{base}-{v}\"\n",
+        )
+        .unwrap();
+        let pkg = tmp.path().join("p");
+        fs::create_dir_all(&pkg).unwrap();
+        fs::write(
+            pkg.join("BUILD"),
+            r#"load("//lib/defs.star", "name_of")
+xs = ["a", "b"]
+target(name = name_of("tool", 2), driver = "exec")
+target(name = f"{xs[0]}_{len(xs)}_{{lit}}", driver = "exec")
+"#,
+        )
+        .unwrap();
+        let loader = source_loader(tmp.path().to_path_buf());
+        let result = loader.load_pkg("p").expect("load_pkg");
+        let mut names: Vec<&str> = result.targets.iter().map(|t| t.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["a_2_{lit}", "tool-2"]);
     }
 
     #[test]

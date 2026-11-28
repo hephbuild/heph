@@ -6,12 +6,12 @@
 use std::collections::HashMap;
 
 use starlark::environment::Globals;
-use starlark::syntax::{AstModule, Dialect};
+use starlark::syntax::AstModule;
 use starlark::typing::AstModuleTypecheck;
 
 /// The static typechecker's errors for `src`, as their first lines.
 fn type_errors(src: &str) -> Vec<String> {
-    let ast = AstModule::parse("BUILD", src.to_owned(), &Dialect::Extended).expect("parses");
+    let ast = AstModule::parse("BUILD", src.to_owned(), &hxstarlark_fmt::DIALECT).expect("parses");
     let (errors, _, _, _) = ast.typecheck(&Globals::extended_internal(), &HashMap::new());
     errors
         .iter()
@@ -101,7 +101,8 @@ fn evaluation_is_unchanged_by_the_inference() {
     use starlark::eval::Evaluator;
 
     let eval = |src: &str| {
-        let ast = AstModule::parse("BUILD", src.to_owned(), &Dialect::Extended).expect("parses");
+        let ast =
+            AstModule::parse("BUILD", src.to_owned(), &hxstarlark_fmt::DIALECT).expect("parses");
         Module::with_temp_heap(|module| {
             let mut ev = Evaluator::new(&module);
             ev.eval_module(ast, &Globals::extended_internal())
