@@ -35,6 +35,7 @@ pub mod pending;
 pub mod process;
 pub mod session_record;
 pub mod shutdown;
+pub mod suggest;
 pub mod sysres;
 pub mod template;
 pub mod units;

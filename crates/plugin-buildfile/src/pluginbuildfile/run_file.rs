@@ -869,9 +869,13 @@ fn approval_from(v: htvalue::Value) -> anyhow::Result<Approval> {
                 None => vec![],
             };
             if !m.is_empty() {
-                let mut keys: Vec<&String> = m.keys().collect();
-                keys.sort();
-                anyhow::bail!("approval has unknown entries: {keys:?}");
+                let mut keys: Vec<String> = m.into_keys().collect();
+                keys.sort_unstable();
+                return Err(anyhow::Error::new(hplugin::htspec::UnknownOptions {
+                    keys,
+                    known: &["required", "notice"],
+                })
+                .context("approval"));
             }
             Ok(Approval { required, notice })
         }
@@ -911,14 +915,17 @@ fn sandbox_from(m: htvalue::Value, pkg: &PkgBuf) -> anyhow::Result<Sandbox> {
     };
 
     let mut m: HashMap<&str, &htvalue::Value> = m.iter().map(|(k, v)| (k.as_str(), v)).collect();
-    let mut unknown_keys: Vec<&str> = m
+    let mut unknown_keys: Vec<String> = m
         .keys()
-        .copied()
         .filter(|k| !SANDBOX_KEYS.contains(k))
+        .map(|k| (*k).to_owned())
         .collect();
     if !unknown_keys.is_empty() {
         unknown_keys.sort_unstable();
-        anyhow::bail!("unknown entries found: {:?}", unknown_keys)
+        anyhow::bail!(hplugin::htspec::UnknownOptions {
+            keys: unknown_keys,
+            known: SANDBOX_KEYS,
+        })
     }
 
     let mut sandbox = Sandbox::default();
@@ -1541,6 +1548,34 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
             pluginquery::query_addr(expr, extra.pkg, &[pluginquery::NO_PROVIDER_EXCLUSION])
                 .format(),
         )
+    }
+
+    /// Write the values, joined by spaces, to heph's debug log with this
+    /// call's file and line (`p/BUILD:12`); seen with debug logging on,
+    /// silent otherwise. It runs when the file is evaluated, so a run that
+    /// reuses an evaluation prints nothing again. It has no effect on any
+    /// target.
+    fn print<'v>(
+        #[starlark(args)] args: starlark::values::tuple::UnpackTuple<Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<starlark::values::none::NoneType> {
+        // Joined as starlark's own `print` does: a string bare, anything
+        // else in its repr.
+        let mut text = String::new();
+        for (i, v) in args.items.iter().enumerate() {
+            if i > 0 {
+                text.push(' ');
+            }
+            text.push_str(&v.to_str());
+        }
+        let span = eval.call_stack_top_location();
+        let site = match eval.extra.and_then(|e| e.downcast_ref::<Extra>()) {
+            Some(extra) => render_span(extra.root, span.as_ref()),
+            None => render_span(Path::new(""), span.as_ref()),
+        };
+        // The user's text is the message; shown escaped, never obeyed (D2).
+        tracing::debug!(site = %site, "{}", hcore::diagnostic::escape_control(&text));
+        Ok(starlark::values::none::NoneType)
     }
 
     /// Build a struct (dict) from keyword arguments, for nested target config.
@@ -3180,7 +3215,11 @@ pub(crate) mod tests {
             htvalue::Value::Bool(true),
         )]));
         let err = approval_from(v).unwrap_err();
-        assert!(format!("{err:#}").contains("unknown entries"), "{err:#}");
+        assert_eq!(
+            format!("{err:#}"),
+            "approval: unknown option `requierd`; did you mean `required`? \
+             (valid options: required, notice)"
+        );
     }
 
     #[test]
@@ -3830,7 +3869,10 @@ target(
 
         let near_miss = htvalue::Value::Map(HashMap::from([("dep".to_string(), address)]));
         let err = sandbox_from(near_miss, &pkg).expect_err("an unlisted key");
-        assert!(format!("{err:#}").contains("unknown entries"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("unknown option `dep`; did you mean `deps`?"),
+            "{err:#}"
+        );
     }
 
     #[test]

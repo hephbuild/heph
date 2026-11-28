@@ -1168,6 +1168,13 @@ impl Engine {
         names
     }
 
+    /// The error for a target naming `driver`, which no plugin registered:
+    /// the nearest registered names as suggestions (D4). Error path only.
+    pub(crate) fn driver_not_found(&self, driver: &str) -> anyhow::Error {
+        hplugin::error::DriverNotFound::new(driver, self.drivers_by_name.keys().map(String::as_str))
+            .into_error()
+    }
+
     /// The state schema a registered provider exposes, if any. Used by a
     /// plugin's language server to complete and document a provider's state
     /// args (e.g. `provider_state(provider="<name>", …)` in a BUILD file).
@@ -1614,7 +1621,11 @@ impl Engine {
             if self.plugins.contains_key(name) {
                 anyhow::bail!("builtin plugin '{name}' is already registered");
             }
-            anyhow::bail!("unknown builtin plugin '{name}'");
+            // The names a `builtin:` entry can still apply.
+            return Err(hconfig::unknown_builtin(
+                name,
+                self.plugin_factories.keys().map(String::as_str),
+            ));
         };
         let parts = factory(&self.plugin_init_payload(name), options)
             .with_context(|| format!("constructing builtin plugin {name:?}"))?;

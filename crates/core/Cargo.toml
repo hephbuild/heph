@@ -30,6 +30,10 @@ tempfile = "3"
 # by the engine and the renderers alike. Also what the event stream's
 # cross-version decode tests read real JSON frames with.
 serde_json = "1"
+# `suggest`: the near-miss distance (already in the tree via clap) and the
+# NFC form names are compared in.
+strsim = "0.11.1"
+unicode-normalization = "0.1.26"
 
 [dev-dependencies]
 # The paused clock (`start_paused`), for tests only.

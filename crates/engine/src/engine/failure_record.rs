@@ -524,6 +524,26 @@ pub(crate) fn locate(rec: &mut FailureRecord, at: hplugin::provider::DeclAt) {
     }
 }
 
+/// `rec`, as [`compact`] bounded it, with `hints` after its own and, when
+/// given, `message` in place of its message (D4's suggestions for a target
+/// not found): each text scrubbed as `compact` scrubs, then the whole bounded
+/// again.
+pub(crate) fn suggested(
+    mut rec: FailureRecord,
+    scrub: &Scrub,
+    message: Option<String>,
+    hints: Vec<hcore::diagnostic::Hint>,
+) -> FailureRecord {
+    if let Some(message) = message {
+        rec.diagnostic.message = scrub.apply(&message).into_owned();
+    }
+    rec.diagnostic.hints.extend(hints.into_iter().map(|mut h| {
+        h.text = scrub.apply(&h.text).into_owned();
+        h
+    }));
+    bound(rec)
+}
+
 /// `rec` within every cap, each cut marking the diagnostic `truncated`: the
 /// diagnostic's own caps, the causes (the first [`CAUSES_CAP`], each within
 /// [`CAUSE_CAP`]), the frozen diff as a snippet, the in-memory log tail (its

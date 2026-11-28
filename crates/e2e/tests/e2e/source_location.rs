@@ -20,23 +20,23 @@ use heph::htmatcher::Matcher;
 use hplugin::error::TargetFailure;
 use std::sync::Arc;
 
-fn addr(a: &str) -> Addr {
+pub(crate) fn addr(a: &str) -> Addr {
     parse_addr(a).unwrap_or_else(|e| panic!("parse {a}: {e:#}"))
 }
 
 /// A bash target writing `$OUT`, in BUILD-file syntax, with `extra` options.
-fn t(name: &str, extra: &str) -> String {
+pub(crate) fn t(name: &str, extra: &str) -> String {
     format!(
         r#"target(name = "{name}", driver = "bash", run = "echo ok > $OUT", out = "o.txt", {extra})"#
     )
 }
 
 /// `d/BUILD` evaluates and defines only `present`.
-const D_PRESENT: &str =
+pub(crate) const D_PRESENT: &str =
     r#"target(name = "present", driver = "bash", run = "echo ok > $OUT", out = "o.txt")"#;
 
 /// `targets` in request `rs`, which must fail; the failures it recorded.
-async fn fail_in(
+pub(crate) async fn fail_in(
     ws: &Workspace,
     rs: &Arc<RequestState>,
     targets: &[&str],
@@ -59,12 +59,12 @@ async fn fail_in(
 }
 
 /// `a` in a fresh request: its one recorded failure, which must blame `a`.
-async fn fail(ws: &Workspace, a: &str) -> Arc<TargetFailure> {
+pub(crate) async fn fail(ws: &Workspace, a: &str) -> Arc<TargetFailure> {
     let rs = ws.engine.new_state_with_events(false, None);
     one(fail_in(ws, &rs, &[a]).await, a)
 }
 
-fn one(failures: Vec<Arc<TargetFailure>>, a: &str) -> Arc<TargetFailure> {
+pub(crate) fn one(failures: Vec<Arc<TargetFailure>>, a: &str) -> Arc<TargetFailure> {
     match failures.as_slice() {
         [f] => {
             assert_eq!(f.culprit().to_string(), a, "{}", text(f));
@@ -74,11 +74,11 @@ fn one(failures: Vec<Arc<TargetFailure>>, a: &str) -> Arc<TargetFailure> {
     }
 }
 
-fn text(f: &TargetFailure) -> String {
+pub(crate) fn text(f: &TargetFailure) -> String {
     crate::common::failure_text(f)
 }
 
-fn loc(f: &TargetFailure) -> &SourceLoc {
+pub(crate) fn loc(f: &TargetFailure) -> &SourceLoc {
     f.record
         .diagnostic
         .location
@@ -88,7 +88,7 @@ fn loc(f: &TargetFailure) -> &SourceLoc {
 
 /// `(file, line, col)` of the first `needle` in `src`, 1-based: where a
 /// diagnostic about the option spelled `needle` points.
-fn at(file: &str, src: &str, needle: &str) -> (String, u32, u32) {
+pub(crate) fn at(file: &str, src: &str, needle: &str) -> (String, u32, u32) {
     let (i, line) = src
         .lines()
         .enumerate()
@@ -102,13 +102,13 @@ fn at(file: &str, src: &str, needle: &str) -> (String, u32, u32) {
     )
 }
 
-fn triple(l: &SourceLoc) -> (String, u32, u32) {
+pub(crate) fn triple(l: &SourceLoc) -> (String, u32, u32) {
     (l.file.clone(), l.line, l.col)
 }
 
 /// A one-target `c/BUILD` (a comment line first, so the call is on line 2)
 /// whose target `//c:y` carries `extra`; and `d/BUILD`.
-fn ws_with(extra: &str) -> (Workspace, String) {
+pub(crate) fn ws_with(extra: &str) -> (Workspace, String) {
     let src = format!("# y\n{}\n", t("y", extra));
     let ws = Workspace::new();
     ws.write_build_file("c", &src);

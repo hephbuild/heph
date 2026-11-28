@@ -1097,7 +1097,15 @@ fn load_file<T: serde::de::DeserializeOwned + Default>(path: &Path) -> anyhow::R
     if bytes.is_empty() {
         return Ok(T::default());
     }
+    // serde's unknown-key error lists every expected key; it gains the
+    // nearest one (D4, CLI-02).
     let cfg: T = serde_yaml::from_slice(&bytes)
+        .map_err(
+            |e| match crate::unknown::unknown_name_suggestion(&e.to_string()) {
+                Some(msg) => anyhow::anyhow!(msg),
+                None => anyhow::Error::new(e),
+            },
+        )
         .with_context(|| format!("parsing YAML config {}", path.display()))?;
     Ok(cfg)
 }

@@ -195,9 +195,12 @@ fn main() -> ExitCode {
     // reporter enumerate the exact args/flags set — generically, for every
     // command, with no per-command list.
     // An output flag on a command without a JSON form gets a tip naming what
-    // to use instead; the exit code stays clap's 2.
+    // to use instead, and a mistyped subcommand is offered the nearest name,
+    // never an alias; the exit code stays clap's 2.
     let matches = soft_match.unwrap_or_else(|e| {
-        commands::json_contract::with_no_json_hint(e, &Cli::command(), std::env::args_os()).exit()
+        let cmd = Cli::command();
+        let e = commands::cli_typo::with_subcommand_suggestion(e, &cmd, std::env::args_os());
+        commands::json_contract::with_no_json_hint(e, &cmd, std::env::args_os()).exit()
     });
     let cli = match Cli::from_arg_matches(&matches) {
         Ok(cli) => cli,

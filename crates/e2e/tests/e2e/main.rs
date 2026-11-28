@@ -81,5 +81,6 @@ mod run_timeout;
 mod sandbox_pool;
 mod scratch;
 mod source_location;
+mod suggestions;
 mod tool_env;
 mod workspace_cleanup;

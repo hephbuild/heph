@@ -2346,6 +2346,51 @@ fn culprit_location(
     rs.loaded_decl_field_loc(culprit, field)
 }
 
+/// The diagnostic for a spec parse that refused an option `driver` does not
+/// know (D4): "unknown option `dep` for driver `bash`", the nearest options
+/// and the valid ones as hints. Inside a nested option it names that option
+/// too (`` in `cache` ``). `None` when `e` is not about an unknown option, or
+/// came from a cdylib driver, whose error is text only (its text carries the
+/// same suggestion).
+fn unknown_option_diagnostic(
+    e: &anyhow::Error,
+    driver: &str,
+) -> Option<hplugin::diagnostic::Diagnostic> {
+    let unknown = downcast_chain_ref::<hplugin::htspec::UnknownOptions>(e)?;
+    let within = downcast_chain_ref::<hplugin::htspec::OptionContext>(e)
+        .map(|c| format!(" in `{}`", c.key))
+        .unwrap_or_default();
+    let message = format!(
+        "{}{within} for driver `{}`",
+        unknown.message(),
+        hcore::diagnostic::escape_control(driver)
+    );
+    let mut d = hplugin::diagnostic::Diagnostic::new(hcore::diagnostic::Stage::Parse, message);
+    d.hints = unknown.hints();
+    // A diagnostic replaces the chain's text in the record, so the driver's
+    // own words around the refusal (where such an option does belong) are
+    // kept as hints, after the suggestions.
+    d.hints.extend(
+        hcore::hmemoizer::frames(e)
+            .into_iter()
+            .filter(|f| {
+                !hplugin::diagnostic::is_internal_frame(f)
+                    && f.downcast_ref::<hplugin::htspec::UnknownOptions>()
+                        .is_none()
+                    && f.downcast_ref::<hplugin::htspec::OptionContext>().is_none()
+            })
+            .map(|f| f.error().to_string())
+            .filter(|text| !text.is_empty())
+            .map(|text| {
+                hcore::diagnostic::Hint::new(
+                    hcore::diagnostic::HintKind::Other,
+                    hcore::diagnostic::escape_control(&text),
+                )
+            }),
+    );
+    Some(d)
+}
+
 /// Records `e` against `culprit`, entered through `entry`, and returns the
 /// marker naming it, with whether this call's record won the claim.
 fn record_culprit(
@@ -2405,6 +2450,9 @@ fn record_culprit(
             None => rs.scrub_for(&[addr, &entry]),
         };
         let mut record = crate::engine::failure_record::compact(&e, &culprit, &entry, &scrub);
+        if let Culprit::Target(c) = &culprit {
+            record = crate::engine::not_found::suggest(rs, record, c, &e, &scrub);
+        }
         record.path = path.iter().map(Addr::format).collect();
         if record.diagnostic.location.is_none()
             && let Culprit::Target(c) = &culprit
@@ -7029,19 +7077,25 @@ impl Engine {
     ) -> anyhow::Result<Arc<ExtendedTargetDef>> {
         // Use _no_track: get_def (or get_direct_def) already updated parent=addr
         // before invoking us. Tracked get_spec here would record addr→addr.
-        let spec = Arc::clone(&self)
-            .get_spec_no_track(rs.clone(), addr)
-            .await?;
+        let spec = match Arc::clone(&self).get_spec_no_track(rs.clone(), addr).await {
+            Ok(spec) => spec,
+            Err(e) => {
+                if downcast_chain_ref::<TargetNotFoundError>(&e).is_some_and(|nf| &nf.addr == addr)
+                {
+                    // The names its record suggests from (D4). Boxed: every
+                    // `get_def` future would otherwise hold the listing's.
+                    Box::pin(self.load_not_found(&rs, &addr.package)).await;
+                }
+                return Err(e);
+            }
+        };
 
         let driver = match self.drivers_by_name.get(&spec.driver) {
             Some(driver) => driver,
             None => {
                 // The failure points at the `driver` option: its index.
                 rs.load_source_index(addr).await;
-                return Err(hplugin::error::DriverNotFound {
-                    driver: spec.driver.clone(),
-                }
-                .into());
+                return Err(self.driver_not_found(&spec.driver));
             }
         };
 
@@ -7063,7 +7117,10 @@ impl Engine {
                 if !crate::engine::discovery::is_cancellation(&rs, &e) {
                     rs.load_source_index(addr).await;
                 }
-                return Err(e.context(format!("{} parse", driver.name)));
+                return Err(match unknown_option_diagnostic(&e, &driver.name) {
+                    Some(d) => e.context(d),
+                    None => e.context(format!("{} parse", driver.name)),
+                });
             }
         };
         let mut def = rewrite_query_inputs(res.target_def, addr, &spec.provider);

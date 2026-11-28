@@ -57,16 +57,97 @@ impl std::fmt::Display for OptionContext {
 impl std::error::Error for OptionContext {}
 
 /// The error the `Spec` derive gives a config holding options it does not
-/// know, sorted. Displays as the derive always has,
-/// `unknown entries found: ["a", "b"]`.
+/// know (`keys`, sorted), with the options it does (`known`, in field order)
+/// so the error can suggest the nearest (D4).
+///
+/// Its text carries the suggestion and the valid options inline, as
+/// `unknown option `dep`; did you mean `deps`? (valid options: deps, out)`:
+/// a cdylib driver's error crosses the plugin seam as text only. A host that
+/// holds the type builds a [`Diagnostic`](hcore::diagnostic::Diagnostic) from
+/// [`UnknownOptions::message`] and [`UnknownOptions::hints`] instead.
 #[derive(Debug, Clone)]
 pub struct UnknownOptions {
     pub keys: Vec<String>,
+    pub known: &'static [&'static str],
+}
+
+/// The most valid options an unknown-option error lists.
+const VALID_OPTIONS_SHOWN: usize = 10;
+
+impl UnknownOptions {
+    /// "unknown option `dep`", or "unknown options `a`, `b`" for several.
+    pub fn message(&self) -> String {
+        let quoted: Vec<String> = self
+            .keys
+            .iter()
+            .map(|k| format!("`{}`", hcore::diagnostic::escape_control(k)))
+            .collect();
+        match quoted.as_slice() {
+            [one] => format!("unknown option {one}"),
+            many => format!("unknown options {}", many.join(", ")),
+        }
+    }
+
+    /// Each unknown key with its nearest known options, in key order; a key
+    /// with none is left out.
+    fn near_misses(&self) -> impl Iterator<Item = (&str, Vec<&'static str>)> {
+        self.keys.iter().filter_map(|k| {
+            let names = hcore::suggest::suggest(k, self.known.iter().copied());
+            (!names.is_empty()).then_some((k.as_str(), names))
+        })
+    }
+
+    /// What to do about it: for one unknown key, one
+    /// [`DidYouMean`](hcore::diagnostic::HintKind::DidYouMean) hint per near
+    /// name; for several, one sentence per key that has any (a bare name
+    /// would not say which key it replaces). Then the valid options.
+    pub fn hints(&self) -> Vec<hcore::diagnostic::Hint> {
+        use hcore::diagnostic::{Hint, HintKind, escape_control};
+        let mut hints = Vec::new();
+        for (key, names) in self.near_misses() {
+            if self.keys.len() == 1 {
+                hints.extend(hcore::suggest::did_you_mean(&names));
+            } else if let Some(text) = hcore::suggest::did_you_mean_text(&names) {
+                hints.push(Hint::new(
+                    HintKind::Other,
+                    format!("for `{}`, {text}", escape_control(key)),
+                ));
+            }
+        }
+        hints.push(Hint::new(HintKind::ValidValues, self.valid_options()));
+        hints
+    }
+
+    /// "valid options: a, b, …", or that there are none.
+    fn valid_options(&self) -> String {
+        if self.known.is_empty() {
+            return "it takes no options".to_owned();
+        }
+        format!(
+            "valid options: {}",
+            hcore::suggest::listed(self.known.iter().copied(), VALID_OPTIONS_SHOWN)
+        )
+    }
 }
 
 impl std::fmt::Display for UnknownOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "unknown entries found: {:?}", self.keys)
+        f.write_str(&self.message())?;
+        for (key, names) in self.near_misses() {
+            let Some(text) = hcore::suggest::did_you_mean_text(&names) else {
+                continue;
+            };
+            if self.keys.len() == 1 {
+                write!(f, "; {text}")?;
+            } else {
+                write!(
+                    f,
+                    "; for `{}`, {text}",
+                    hcore::diagnostic::escape_control(key)
+                )?;
+            }
+        }
+        write!(f, " ({})", self.valid_options())
     }
 }
 
@@ -789,7 +870,86 @@ mod tests {
             ("bogus".to_string(), Value::Bool(true)),
         ]))
         .unwrap_err();
-        assert!(format!("{err:#}").contains("unknown entries"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("unknown option `bogus`"),
+            "{err:#}"
+        );
+    }
+
+    /// OPT-01 (D4): a typo of an option of any `Spec`-derived driver names
+    /// the nearest option, as hints a host shows and inline in the text a
+    /// cdylib's error crosses the seam as, with the valid options listed.
+    /// Every driver's unknown-key check is this one expansion, so a derived
+    /// struct here stands for every spec driver (the spec put this test in
+    /// `htspec-derive`, which cannot run its own expansion).
+    #[test]
+    fn typo_option_did_you_mean_every_spec_driver() {
+        use hcore::diagnostic::{Hint, HintKind};
+        let err = DemoSpec::from(&HashMap::from([
+            ("run".to_string(), Value::String("x".to_string())),
+            ("dep".to_string(), Value::Null()),
+        ]))
+        .unwrap_err();
+        let unknown = hcore::hmemoizer::downcast_chain_ref::<UnknownOptions>(&err)
+            .expect("the typed error rides the chain");
+        assert_eq!(unknown.message(), "unknown option `dep`");
+        assert_eq!(
+            unknown.hints(),
+            vec![
+                Hint::new(HintKind::DidYouMean, "deps"),
+                Hint::new(
+                    HintKind::ValidValues,
+                    "valid options: run, deps, env, out, count, mode"
+                ),
+            ]
+        );
+        assert_eq!(
+            format!("{err:#}"),
+            "unknown option `dep`; did you mean `deps`? \
+             (valid options: run, deps, env, out, count, mode)"
+        );
+        assert_eq!(error_option(&err), Some("dep"), "the location stays");
+
+        // A nested `SpecStruct` uses the same expansion; a key nothing is
+        // near gets the valid options only.
+        let v = Value::Map(HashMap::from([
+            ("a".to_string(), Value::String("x".to_string())),
+            ("bees".to_string(), Value::Null()),
+        ]));
+        let err = Nested::from_spec_value(&v).unwrap_err();
+        assert_eq!(
+            format!("{err:#}"),
+            "unknown option `bees`; did you mean `bee`? (valid options: a, bee)"
+        );
+        let v = Value::Map(HashMap::from([("zzzz".to_string(), Value::Null())]));
+        let err = Nested::from_spec_value(&v).unwrap_err();
+        assert_eq!(
+            format!("{err:#}"),
+            "unknown option `zzzz` (valid options: a, bee)"
+        );
+    }
+
+    /// Several unknown keys: each near miss says which key it replaces, as a
+    /// sentence, not a bare name.
+    #[test]
+    fn several_unknown_options_each_say_their_key() {
+        use hcore::diagnostic::{Hint, HintKind};
+        let err = DemoSpec::from(&HashMap::from([
+            ("run".to_string(), Value::String("x".to_string())),
+            ("dep".to_string(), Value::Null()),
+            ("evn".to_string(), Value::Null()),
+            ("zzzz".to_string(), Value::Null()),
+        ]))
+        .unwrap_err();
+        let unknown = hcore::hmemoizer::downcast_chain_ref::<UnknownOptions>(&err).expect("typed");
+        assert_eq!(unknown.message(), "unknown options `dep`, `evn`, `zzzz`");
+        assert_eq!(
+            unknown.hints()[..2],
+            [
+                Hint::new(HintKind::Other, "for `dep`, did you mean `deps`?"),
+                Hint::new(HintKind::Other, "for `evn`, did you mean `env`?"),
+            ]
+        );
     }
 
     /// The whole message: every unknown key, sorted, known keys (a renamed one
@@ -808,7 +968,9 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             format!("{err:#}"),
-            r#"unknown entries found: ["", "Run", "outputs", "runs", "é"]"#
+            "unknown options ``, `Run`, `outputs`, `runs`, `é`; \
+             for `Run`, did you mean `run`?; for `runs`, did you mean `run`? \
+             (valid options: run, deps, env, out, count, mode)"
         );
     }
 
@@ -907,7 +1069,7 @@ mod tests {
         ]));
         assert_eq!(
             format!("{:#}", Nested::from_spec_value(&v).unwrap_err()),
-            r#"unknown entries found: ["b", "z"]"#
+            "unknown options `b`, `z` (valid options: a, bee)"
         );
     }
 
@@ -1115,7 +1277,7 @@ mod tests {
         let unknown =
             CacheCfg::from_spec_value(&cache_map(&[("bogus", Value::Bool(true))])).unwrap_err();
         assert!(
-            format!("{unknown:#}").contains("unknown entries"),
+            format!("{unknown:#}").contains("unknown option `bogus`"),
             "{unknown:#}"
         );
         let not_map = CacheCfg::from_spec_value(&Value::Bool(true)).unwrap_err();

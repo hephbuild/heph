@@ -26,12 +26,21 @@ pub fn decode_opt<T: for<'de> Deserialize<'de>>(
     }
 }
 
-/// Verify that `opts` contains only the keys listed in `allowed`. Errors otherwise.
+/// Verify that `opts` contains only the keys listed in `allowed`. Errors
+/// otherwise, naming the nearest allowed key (D4, CLI-27):
+/// "unknown option `pattern`; did you mean `patterns`? (allowed: …)".
 pub fn deny_unknown(plugin: &str, opts: &Options, allowed: &[&str]) -> anyhow::Result<()> {
     for key in opts.keys() {
         if !allowed.iter().any(|k| k == key) {
+            let dym = hcore::suggest::did_you_mean_text(&hcore::suggest::suggest(
+                key,
+                allowed.iter().copied(),
+            ))
+            .map(|d| format!("; {d}"))
+            .unwrap_or_default();
             anyhow::bail!(
-                "{plugin}: unknown option `{key}` (allowed: {})",
+                "{plugin}: unknown option `{}`{dym} (allowed: {})",
+                hcore::diagnostic::escape_control(key),
                 allowed.join(", ")
             );
         }
