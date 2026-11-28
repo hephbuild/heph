@@ -1055,6 +1055,14 @@ fn spec_path_to_target_path(
     pkg: &hmodel::htpkg::PkgBuf,
     codegen: &CodegenMode,
 ) -> anyhow::Result<Path> {
+    // The join would re-root `/tmp/o` to `<pkg>/tmp/o`, which the run never
+    // writes, and the target failed only after running, on an `lstat` (OPT-27).
+    if raw.starts_with('/') {
+        anyhow::bail!(
+            "{} is absolute; outputs are relative to the package",
+            hcore::htvalue::quote_str(raw)
+        );
+    }
     let content = spec::path_content(raw, pkg.as_str())
         .with_context(|| format!("resolving output path {raw:?} in package {pkg}"))?;
     Ok(Path {
@@ -3820,6 +3828,15 @@ mod tests {
             err.to_string().contains("resolving output path"),
             "got {err}"
         );
+
+        // An absolute path is refused, not re-rooted into the package (OPT-27).
+        for abs in ["/tmp/o", "/tmp/", "/tmp/*.o"] {
+            let err = spec_path_to_target_path(abs, &pkg, &CodegenMode::None).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!("\"{abs}\" is absolute; outputs are relative to the package"),
+            );
+        }
     }
 
     /// A package whose path holds `[ ] * ?` (Next.js `app/[slug]`): the kind

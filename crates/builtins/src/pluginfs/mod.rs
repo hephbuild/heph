@@ -531,8 +531,10 @@ impl PluginFn for GlobFn {
 
         // Only `pattern` is pattern text: the package is escaped, or
         // `app/[slug]` reads as a class and the call finds nothing.
-        let resolved = hmodel::htpkg::join_rel_checked(&escape_fs_literal(ctx.pkg), pattern)
+        let escaped_pkg = escape_fs_literal(ctx.pkg);
+        let resolved = hmodel::htpkg::join_rel_checked(&escaped_pkg, pattern)
             .context("heph.fs.glob: normalizing pattern")?;
+        refuse_leaving_package(ctx.pkg, &escaped_pkg, pattern, &resolved)?;
 
         // No user excludes, so `request_id` is irrelevant (the built-in exclude
         // path is taken). Reuses the driver's compiled glob + walk verbatim.
@@ -568,6 +570,41 @@ impl PluginFn for GlobFn {
         paths.sort();
         Ok(Value::List(paths.into_iter().map(Value::String).collect()).into())
     }
+}
+
+/// `heph.fs.glob` answers in paths relative to the calling package, so a
+/// pattern that `..`s out of it has no answer that reads right: its matches
+/// came back root-relative (`q/q.txt` from `p`), which every caller read as
+/// `p/q/q.txt`, a different and missing file (OPT-22). Refused, naming where
+/// the files are; `../p/*` that comes back into the package stays valid.
+///
+/// `escaped_pkg` and `resolved` are pattern text (the package escaped by
+/// [`escape_fs_literal`]), compared component-wise so `p` does not contain `pq`.
+fn refuse_leaving_package(
+    pkg: &str,
+    escaped_pkg: &str,
+    pattern: &str,
+    resolved: &str,
+) -> anyhow::Result<()> {
+    let inside = escaped_pkg.is_empty()
+        || resolved
+            .strip_prefix(escaped_pkg)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'));
+    if inside {
+        return Ok(());
+    }
+    // Where the files are: the pattern's literal directory, unescaped.
+    let (prefix, rest) = split_literal_prefix(resolved);
+    let dir = if rest.is_empty() {
+        path_dir(&prefix)
+    } else {
+        prefix.into_owned()
+    };
+    let dir = if dir == "." { String::new() } else { dir };
+    anyhow::bail!(
+        "heph.fs.glob({}): a glob cannot leave its package `{pkg}`; use a target in `//{dir}`",
+        hcore::htvalue::quote_str(pattern),
+    )
 }
 
 /// Lexical path cleanup, matching Go's `path.Clean`: collapses `.` and inner
@@ -1660,6 +1697,42 @@ mod tests {
 
     fn ctoken() -> StdCancellationToken {
         StdCancellationToken::new()
+    }
+
+    /// `heph.fs.glob`'s package boundary (OPT-22), on the near misses.
+    #[test]
+    fn a_glob_may_not_leave_its_package() {
+        let check = |pkg: &str, pattern: &str| {
+            let escaped = escape_fs_literal(pkg);
+            let resolved = hmodel::htpkg::join_rel_checked(&escaped, pattern).expect("resolves");
+            refuse_leaving_package(pkg, &escaped, pattern, &resolved).map_err(|e| e.to_string())
+        };
+        // Inside: plain, nested, a `..` that comes back, the root package.
+        for (pkg, pattern) in [
+            ("p", "*.txt"),
+            ("p", "a/../b/*.txt"),
+            ("p", "../p/*.txt"),
+            ("", "q/*.txt"),
+            ("app/[slug]", "*.ts"),
+        ] {
+            assert_eq!(check(pkg, pattern), Ok(()), "{pkg} {pattern}");
+        }
+        // `pq` is not inside `p`.
+        assert_eq!(
+            check("p", "../pq/*.txt").unwrap_err(),
+            "heph.fs.glob(\"../pq/*.txt\"): a glob cannot leave its package `p`; use a target in `//pq`"
+        );
+        // A literal file names its directory; a glob over the root names `//`.
+        assert_eq!(
+            check("p", "../q/q.txt").unwrap_err(),
+            "heph.fs.glob(\"../q/q.txt\"): a glob cannot leave its package `p`; use a target in `//q`"
+        );
+        assert_eq!(
+            check("p/s", "../../*").unwrap_err(),
+            "heph.fs.glob(\"../../*\"): a glob cannot leave its package `p/s`; use a target in `//`"
+        );
+        // A sibling of a metachar package is outside it, though it shares the escape.
+        assert!(check("app/[slug]", "../x/*.ts").is_err());
     }
 
     struct NoopExecutor;

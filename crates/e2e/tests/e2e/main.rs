@@ -69,6 +69,7 @@ mod oci;
 mod oci_docker;
 mod oci_image;
 mod oci_runner;
+mod option_values;
 mod output_links;
 mod plugin_buildfile;
 mod plugin_fn_declarations;
