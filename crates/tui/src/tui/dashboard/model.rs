@@ -841,6 +841,15 @@ impl Model {
         })
     }
 
+    /// The first culprit to end: a target that failed on its own, or the
+    /// entry row of a BUILD file that did not evaluate. Never a target a
+    /// dependency or a broken file took down, which has no record of its own.
+    pub fn first_culprit(&self) -> Option<&str> {
+        self.failures()
+            .find(|id| self.state(*id) == Some(RowState::Failed))
+            .map(|id| self.addr(id))
+    }
+
     /// A root failure's PHASE text.
     pub fn reason(&self, id: Id) -> Option<&str> {
         self.reasons.get(&id).map(|r| &**r)
