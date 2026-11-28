@@ -14,13 +14,13 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-fn devenv() -> String {
+pub(crate) fn devenv() -> String {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("devenv.nix");
     std::fs::read_to_string(&path).expect("read devenv.nix")
 }
 
 /// Every `scripts.<name>.exec = ''…'';` body in `devenv.nix`, by name.
-fn scripts(devenv: &str) -> Vec<(String, String)> {
+pub(crate) fn scripts(devenv: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let mut rest = devenv;
     while let Some((_, after)) = rest.split_once("scripts.") {

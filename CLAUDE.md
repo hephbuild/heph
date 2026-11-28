@@ -141,7 +141,7 @@ fix                                  # format & apply lint fixes
 gen                                  # regenerate protobuf bindings (runs buf generate)
 ```
 
-The `gen` script is a devenv-provided alias, assume its present. It must be run at the beginning of all sessions, or after any `.proto` file changes before building.
+The `gen` script is a devenv-provided alias, assume its present. It must be run at the beginning of all sessions, or after any `.proto` file changes before building. It regenerates the checkout it is run from (the cargo workspace around the current directory), not `$DEVENV_ROOT`, so in a worktree run it from inside the worktree; no `DEVENV_ROOT=` override is needed.
 
 `tst` runs every pass with `--no-fail-fast` and exits non-zero if any failed, so one red test binary no longer hides the rest; extra args pass through to every pass. Each pass is `cargo nextest run` followed by `cargo test --doc`, because nextest does not run doctests. Locally `tst` is still the whole workspace (minus `bin-e2e`). Its body spelled out as `cargo test --workspace` or `cargo nextest run --workspace` is the same suite, and the gate holds it to the same `HEPH_FULL_SUITE=1` opt-in.
 
