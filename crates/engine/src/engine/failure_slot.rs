@@ -325,6 +325,11 @@ pub struct FailureSlots {
     /// Slot names this engine knows exist: what `failures/` held when it was
     /// first listed, plus the slots filled since. Listed on first use.
     known: tokio::sync::OnceCell<std::sync::Mutex<HashSet<String>>>,
+    /// Of the known slots, each BUILD file's (`file:` manifests): the
+    /// packages it lists. Filled with `known`; a target of one of those
+    /// packages resolving means the file evaluated again, and its slot is
+    /// cleared with the target's ([`clear`](Self::clear)).
+    file_packages: std::sync::Mutex<HashMap<String, Vec<String>>>,
     /// Claim writes ([`write_claim`]) registered and not yet done.
     writes: PendingCounter,
     /// One exclusion per slot key, held by a fill, a claim write or a clear
@@ -349,6 +354,7 @@ impl FailureSlots {
         Self {
             root: home.join(FAILURES_DIR),
             known: tokio::sync::OnceCell::new(),
+            file_packages: std::sync::Mutex::default(),
             writes: PendingCounter::default(),
             slot_locks: std::sync::Mutex::default(),
             #[cfg(any(test, feature = "test-support"))]
@@ -410,6 +416,25 @@ impl FailureSlots {
             .filter(|m| m.addr.strip_prefix(FILE_ADDR_PREFIX) == Some(rel))
     }
 
+    /// The newest complete slot of a BUILD file whose manifest lists
+    /// `package`, with its directory: what `inspect failure //d:t` answers
+    /// when `d/BUILD` did not evaluate and `//d:t` has no slot of its own.
+    /// Lists `failures/`; for a command, not a build.
+    pub fn read_file_of_package(&self, package: &str) -> Option<(PathBuf, SlotManifest)> {
+        std::fs::read_dir(&self.root)
+            .ok()?
+            .filter_map(|e| {
+                let name = e.ok()?.file_name().into_string().ok()?;
+                name.starts_with("file_").then(|| self.root.join(name))
+            })
+            .filter_map(|dir| {
+                let m = read_any_manifest(&dir)?;
+                (m.addr.starts_with(FILE_ADDR_PREFIX) && m.packages.iter().any(|p| p == package))
+                    .then_some((dir, m))
+            })
+            .max_by_key(|(_, m)| m.failed_at)
+    }
+
     /// How many slots this engine has filled.
     #[cfg(any(test, feature = "test-support"))]
     pub fn fills(&self) -> u64 {
@@ -421,9 +446,36 @@ impl FailureSlots {
         self.known
             .get_or_init(|| async {
                 let root = self.root.clone();
-                std::sync::Mutex::new(hcore::blocking::run(move || list_slots(&root)).await)
+                let (slots, files) = hcore::blocking::run(move || list_slots(&root)).await;
+                self.lock_file_packages().extend(files);
+                std::sync::Mutex::new(slots)
             })
             .await
+    }
+
+    fn lock_file_packages(&self) -> std::sync::MutexGuard<'_, HashMap<String, Vec<String>>> {
+        self.file_packages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Take out of `known` (and the file map) every BUILD file slot that
+    /// lists `package`: its targets resolve, so the file evaluated again.
+    fn take_files_of(&self, known: &mut HashSet<String>, package: &str) -> Vec<String> {
+        let mut files = self.lock_file_packages();
+        if files.is_empty() {
+            return Vec::new();
+        }
+        let keys: Vec<String> = files
+            .iter()
+            .filter(|(_, pkgs)| pkgs.iter().any(|p| p == package))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in &keys {
+            files.remove(k);
+            known.remove(k);
+        }
+        keys
     }
 
     /// Remove `addr`'s slot, if this engine knows of one. The first call lists
@@ -432,10 +484,14 @@ impl FailureSlots {
     ///
     /// A claim write registered for the slot before this call
     /// ([`write_claim`]) lands first, and is then removed with it.
+    ///
+    /// The slot of each BUILD file that lists `addr`'s package goes too: the
+    /// target resolved, so its package's files evaluated (D5, "a target
+    /// fixed and rebuilt green clears its slot").
     pub async fn clear(&self, addr: &Addr) {
         let known = self.known().await;
         let pending = self.writes.load(std::sync::atomic::Ordering::Acquire) > 0;
-        let key = {
+        let keys = {
             let mut set = known
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -443,21 +499,24 @@ impl FailureSlots {
             if set.is_empty() && !pending {
                 return;
             }
+            let mut keys = self.take_files_of(&mut set, addr.package.as_str());
             let key = addr_key(addr);
-            if !set.remove(&key) && !(pending && self.slot_busy(&key)) {
-                return;
+            if set.remove(&key) || (pending && self.slot_busy(&key)) {
+                keys.push(key);
             }
-            key
+            keys
         };
-        let _excl = self.slot_lock(&key).lock_owned().await;
-        let dir = self.root.join(&key);
-        let removed = hcore::blocking::run(move || match std::fs::remove_dir_all(&dir) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            res => res.map_err(|e| (dir, e)),
-        })
-        .await;
-        if let Err((dir, e)) = removed {
-            tracing::warn!(addr = %addr, dir = %dir.display(), error = %e, "clearing a failure slot");
+        for key in keys {
+            let _excl = self.slot_lock(&key).lock_owned().await;
+            let dir = self.root.join(&key);
+            let removed = hcore::blocking::run(move || match std::fs::remove_dir_all(&dir) {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                res => res.map_err(|e| (dir, e)),
+            })
+            .await;
+            if let Err((dir, e)) = removed {
+                tracing::warn!(addr = %addr, dir = %dir.display(), error = %e, "clearing a failure slot");
+            }
         }
     }
 
@@ -700,6 +759,8 @@ pub(crate) fn write_claim(
     claim: ClaimWrite,
 ) {
     let key = claim.key();
+    let file_packages =
+        matches!(claim.culprit, hplugin::error::Culprit::File(_)).then(|| claim.packages.clone());
     let slots = &engine.failure_slots;
     let lock = slots.slot_lock(&key);
     let held = Arc::clone(&lock).try_lock_owned().ok();
@@ -717,10 +778,12 @@ pub(crate) fn write_claim(
                     hcore::blocking::run(move || (write_claim_logged(&root, &key, &claim), key))
                         .await;
                 if new_slot {
-                    engine
-                        .failure_slots
-                        .known()
-                        .await
+                    let slots = &engine.failure_slots;
+                    let known = slots.known().await;
+                    if let Some(pkgs) = file_packages {
+                        slots.lock_file_packages().insert(key.clone(), pkgs);
+                    }
+                    known
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .insert(key);
@@ -733,6 +796,9 @@ pub(crate) fn write_claim(
             if write_claim_logged(&slots.root, &key, &claim)
                 && let Some(known) = slots.known.get()
             {
+                if let Some(pkgs) = file_packages {
+                    slots.lock_file_packages().insert(key.clone(), pkgs);
+                }
                 known
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1318,15 +1384,27 @@ pub(crate) fn write_test_file_slot(root: &Path, rel: &str, failed_at: u64) -> Pa
     dir
 }
 
-/// The slot names under `root`; temporaries are not slots.
-fn list_slots(root: &Path) -> HashSet<String> {
+/// The slot names under `root`; temporaries are not slots. With them, each
+/// BUILD file slot's name and the packages its manifest lists: a file key's
+/// readable part starts `file_`, so only those manifests are read.
+fn list_slots(root: &Path) -> (HashSet<String>, HashMap<String, Vec<String>>) {
     let Ok(entries) = std::fs::read_dir(root) else {
-        return HashSet::new();
+        return Default::default();
     };
-    entries
+    let slots: HashSet<String> = entries
         .filter_map(|e| e.ok()?.file_name().into_string().ok())
         .filter(|n| !n.starts_with('.'))
-        .collect()
+        .collect();
+    let files = slots
+        .iter()
+        .filter(|n| n.starts_with("file_"))
+        .filter_map(|n| {
+            let m = read_any_manifest(&root.join(n))?;
+            (m.addr.starts_with(FILE_ADDR_PREFIX) && !m.packages.is_empty())
+                .then(|| (n.clone(), m.packages))
+        })
+        .collect();
+    (slots, files)
 }
 
 #[cfg(test)]
@@ -1990,6 +2068,35 @@ mod tests {
             Some(FailureFixes::NotWritten(FixesNotWritten::Frozen))
         );
         assert!(!slots.slot_dir(&b).exists());
+    }
+
+    /// A BUILD file's slot lists the packages reached through it; a target of
+    /// one of them resolving clears it (the file evaluated), a target of
+    /// another package does not, and a slot listing no package stays.
+    #[tokio::test]
+    async fn clear_takes_the_file_slots_of_the_targets_package() {
+        let home = tempfile::tempdir().expect("home");
+        let root = home.path().join(FAILURES_DIR);
+        let with_packages = |rel: &str, pkgs: &[&str]| {
+            let dir = write_test_file_slot(&root, rel, 1);
+            let mut m = read_any_manifest(&dir).expect("manifest");
+            m.packages = pkgs.iter().map(|p| (*p).to_owned()).collect();
+            std::fs::write(dir.join(MANIFEST), serde_json::to_vec(&m).expect("json"))
+                .expect("manifest");
+            dir
+        };
+        let d = with_packages("d/BUILD", &["d"]);
+        let defs = with_packages("lib/defs.bzl", &["e", "d"]);
+        let none = with_packages("x/BUILD", &[]);
+        let slots = FailureSlots::new(home.path());
+
+        slots.clear(&addr("//other:t")).await;
+        assert!(d.exists() && defs.exists());
+        slots.clear(&addr("//d:t")).await;
+        assert!(!d.exists(), "d/BUILD evaluated again");
+        assert!(!defs.exists(), "d loads lib/defs.bzl, which evaluated");
+        assert!(none.exists(), "a slot naming no package is gc's");
+        assert_eq!(slots.read_file("d/BUILD"), None);
     }
 
     /// D10: a slot with an `out/` and no log is a slot; I3: `clear` takes
