@@ -854,7 +854,7 @@ pub struct RequestStateData {
     /// `with_parent` / `with_skip_provider` children record into the same map.
     pub failures: Mutex<indexmap::IndexMap<Culprit, Arc<TargetFailure>>>,
     /// The secret values each target was handed this request (its
-    /// credentials' values when it ran, the deferred values it read), which
+    /// credentials' material when it ran; never a deferred value, U20), which
     /// its recorded failure is scrubbed of
     /// ([`compact`](crate::engine::failure_record::compact), I7). Request
     /// state only: never on a def, never hashed (I1), dropped with the

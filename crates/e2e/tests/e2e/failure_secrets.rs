@@ -1,11 +1,14 @@
-//! I7: nothing heph records or prints for a failure holds a secret. One
-//! request fails three ways with secrets planted in each: a fetch whose
-//! `${read://}` URL carries a password, a query and a fragment; a run handed
-//! a credential and a `${read://}` value that prints both before it exits; a
+//! I7 (narrowed by U20): nothing heph records or prints for a failure holds
+//! a secret, and a secret is what heph knows for sure is one: credential
+//! material. One request fails three ways with secrets planted in each: a
+//! fetch whose `${read://}` URL carries a password, a query and a fragment
+//! (which no message quotes a URL with, `hfetch::redact_url`); a run handed a
+//! credential and a `${read://}` value that prints both before it exits; a
 //! credential whose material is not the shape its field mapping asks for.
 //! Each output a failure reaches is then searched for every secret: stderr
 //! (the CI box and the interactive report), `run --json`, `inspect failure
-//! --json` and the slot's `diagnostic.json`.
+//! --json`, the events and the slot's `diagnostic.json`. A resolved
+//! `${read://}` value is not a secret: it is shown where it is printed.
 #![expect(
     clippy::panic_in_result_fn,
     clippy::let_underscore_must_use,
@@ -22,12 +25,12 @@ use std::io::{Read as _, Write as _};
 
 /// The `${read://}` URL's password, query and fragment.
 const URL_SECRETS: [&str; 3] = [
-    "DEFERRED-USERINFO-SECRET-1",
-    "DEFERRED-QUERY-SECRET-2",
-    "DEFERRED-FRAGMENT-SECRET-3",
+    "URL-USERINFO-SECRET-1",
+    "URL-QUERY-SECRET-2",
+    "URL-FRAGMENT-SECRET-3",
 ];
-/// A `${read://}` value the run prints.
-const READ_SECRET: &str = "DEFERRED-ENV-SECRET-4";
+/// A `${read://}` value the run prints: not a secret (U20).
+const READ_VALUE: &str = "DEFERRED-ENV-VALUE-4";
 /// A credential's material the run prints.
 const CRED_SECRET: &str = "CRED-MATERIAL-SECRET-5";
 /// Material at a field the mapping wants a string at, but is an object.
@@ -35,9 +38,7 @@ const SUBTREE_SECRET: &str = "CRED-SUBTREE-SECRET-6";
 
 /// Every planted secret.
 fn secrets() -> impl Iterator<Item = &'static str> {
-    URL_SECRETS
-        .into_iter()
-        .chain([READ_SECRET, CRED_SECRET, SUBTREE_SECRET])
+    URL_SECRETS.into_iter().chain([CRED_SECRET, SUBTREE_SECRET])
 }
 
 /// The three culprits.
@@ -72,7 +73,7 @@ fn workspace() -> Workspace {
 target(name = "url", driver = "bash", out = "url.txt",
        run = "printf '%s' 'http://heph-user:{pw}@{host}/asset?sig={query}#{fragment}' > url.txt")
 target(name = "plain", driver = "bash", out = "v.txt",
-       run = "printf '%s' '{READ_SECRET}' > v.txt")
+       run = "printf '%s' '{READ_VALUE}' > v.txt")
 "#
         ),
     );
@@ -135,8 +136,8 @@ async fn failed_run(ws: &Workspace) -> JsonRun {
     )
     .expect("//app:cred's log");
     assert!(
-        log.contains("token=[redacted]"),
-        "the run printed its credential: {log}"
+        log.contains(&format!("token=[redacted] v={READ_VALUE}")),
+        "the run printed its credential, scrubbed, and its read value, kept: {log}"
     );
     run
 }
@@ -151,12 +152,6 @@ fn assert_no<'a>(secrets: impl IntoIterator<Item = &'a str>, what: &str, text: &
     for s in secrets {
         assert!(!text.contains(s), "{what} holds {s}:\n{text}");
     }
-}
-
-/// Every planted secret but [`READ_SECRET`], which a run's log still holds
-/// verbatim until the user decides how `${read://}` values are redacted.
-fn secrets_but_read() -> impl Iterator<Item = &'static str> {
-    secrets().filter(|s| *s != READ_SECRET)
 }
 
 /// `heph inspect failure --json <addr>`.
@@ -176,7 +171,8 @@ fn inspect_json(engine: &Engine, addr: &str) -> anyhow::Result<String> {
 }
 
 /// I7 on stderr: the CI box and the interactive report hold no URL or
-/// credential secret.
+/// credential secret. The `${read://}` value the run printed is in its log
+/// tail, as printed (U20).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn no_secret_on_stderr() -> anyhow::Result<()> {
     let ws = workspace();
@@ -189,20 +185,13 @@ async fn no_secret_on_stderr() -> anyhow::Result<()> {
             run.report
         );
     }
-    assert_no(secrets_but_read(), "the CI boxes", &run.boxes);
-    assert_no(secrets_but_read(), "the report", &run.report);
-    Ok(())
-}
-
-/// I7 on stderr for a `${read://}` value the run printed: its log tail,
-/// shown in the box and the report, must not hold it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "pending user decision: redact ${read://} values in every run log, or only in the rendered tail"]
-async fn no_read_secret_on_stderr() -> anyhow::Result<()> {
-    let ws = workspace();
-    let run = failed_run(&ws).await;
-    assert_no([READ_SECRET], "the CI boxes", &run.boxes);
-    assert_no([READ_SECRET], "the report", &run.report);
+    assert_no_secret("the CI boxes", &run.boxes);
+    assert_no_secret("the report", &run.report);
+    assert!(
+        run.boxes.contains(READ_VALUE),
+        "the tail shows the read value:\n{}",
+        run.boxes
+    );
     Ok(())
 }
 
@@ -221,19 +210,39 @@ async fn no_secret_in_json() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// I7 on the event wire: a run whose program is a `${read://}` value that
-/// names no program, so the spawn error quotes the value. Neither any event
-/// as `events.ndjson` and plugin-gh read it (JSON), nor the spotlight line
-/// folded from them, nor `run --json` holds it.
+/// I7 on the event wire: no event of the failed request, as `events.ndjson`
+/// and plugin-gh read it (JSON), nor the spotlight line folded from them,
+/// holds a secret.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn no_secret_in_events() -> anyhow::Result<()> {
+    let ws = workspace();
+    let run = failed_run(&ws).await;
+    for ev in &run.events {
+        assert_no_secret("an event", &serde_json::to_string(ev)?);
+    }
+    let mut fold = heph::tui::progress::BuildState::new();
+    for ev in &run.events {
+        fold.apply(ev);
+    }
+    let at = run.events.last().map_or(0, |ev| ev.at_unix_ms);
+    let spot = fold.spotlight(at).map(|s| s.text()).unwrap_or_default();
+    assert!(spot.contains("//app:"), "the spotlight: {spot:?}");
+    assert_no_secret("the spotlight", &spot);
+    Ok(())
+}
+
+/// U20: a resolved `${read://}` value is not a secret. A run whose program
+/// is one that names no program fails with a spawn error quoting it, and the
+/// value reads as resolved in its end event, `run --json` and the CI box.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn read_value_is_shown_in_a_spawn_error() -> anyhow::Result<()> {
     let ws = Workspace::new();
     ws.write_build_file(
         "val",
         &format!(
             r#"
 target(name = "plain", driver = "bash", out = "v.txt",
-       run = "printf '%s' '{READ_SECRET}' > v.txt")
+       run = "printf '%s' '{READ_VALUE}' > v.txt")
 "#
         ),
     );
@@ -247,35 +256,19 @@ target(name = "spawn", driver = "exec", out = "o.txt", run = ["${read://val:plai
     let run = run_json(&ws.engine, &m, &["--json"], None).await;
     assert!(run.res.is_err(), "//app:spawn must fail");
     assert_eq!(run.entry("//app:spawn")["outcome"], "failed");
-    // The fixture has teeth: the failure's own chain quoted the value, which
-    // its end says scrubbed.
     let quoted = run.events.iter().any(|ev| {
         matches!(&ev.kind, heph::engine::event::BuildEventKind::ResultEnd { addr, error: Some(e), .. }
-            if addr == "//app:spawn" && e.contains("[redacted]"))
+            if addr == "//app:spawn" && e.contains(READ_VALUE))
     });
     assert!(
         quoted,
         "//app:spawn's end quotes the value: {:?}",
         run.events
     );
-    for ev in &run.events {
-        assert_no_secret("an event", &serde_json::to_string(ev)?);
-    }
-    let mut fold = heph::tui::progress::BuildState::new();
-    for ev in &run.events {
-        fold.apply(ev);
-    }
-    let at = run.events.last().map_or(0, |ev| ev.at_unix_ms);
-    let spot = fold.spotlight(at).map(|s| s.text()).unwrap_or_default();
-    assert!(spot.contains("//app:spawn"), "the spotlight: {spot:?}");
-    assert_no_secret("the spotlight", &spot);
-    assert_no_secret("run --json", &serde_json::to_string(&run.entries)?);
-    // The value is in the failure's message, not a log it printed, so the
-    // box and the report hold no `${read://}` value either (gap 2 is only
-    // about what a run prints).
-    assert!(run.boxes.contains("//app:spawn"), "a box:\n{}", run.boxes);
-    assert_no_secret("the CI box", &run.boxes);
-    assert_no_secret("the report", &run.report);
+    let entries = serde_json::to_string(&run.entries)?;
+    assert!(entries.contains(READ_VALUE), "run --json: {entries}");
+    assert!(!entries.contains("[redacted]"), "run --json: {entries}");
+    assert!(run.boxes.contains(READ_VALUE), "the CI box:\n{}", run.boxes);
     Ok(())
 }
 

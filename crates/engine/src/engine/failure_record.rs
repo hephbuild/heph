@@ -5,7 +5,8 @@
 //! [`compact`] takes the culprit's error once, when the request records it,
 //! and keeps only what the caps allow. The order is the contract (I7, E5):
 //! every text is **scrubbed first** of the secrets the request handed the
-//! culprit (its credentials' values, the deferred values it read), and only
+//! culprit (its credentials' material; a resolved deferred value is not a
+//! secret, U20), and only
 //! then escaped and cut. Cutting first could leave a secret's prefix on the
 //! near side of the cut, where no later scrub would recognise it.
 //!
@@ -29,8 +30,8 @@ use std::fmt;
 use std::sync::Arc;
 
 /// The secret values a failure's text is scrubbed of before it is recorded:
-/// the credential values a run was handed, and the deferred values a target
-/// read. Request-scoped (it lives on the `RequestState`), never on a def, so
+/// the credential material a run was handed, and nothing else: only what heph
+/// knows for sure is a secret is scrubbed (U20). Request-scoped (it lives on the `RequestState`), never on a def, so
 /// nothing about it reaches a hash.
 ///
 /// Its `Debug` says how many values it holds, never what they are.
