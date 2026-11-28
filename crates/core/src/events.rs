@@ -1005,6 +1005,10 @@ pub struct KeptGroup {
     pub files: u64,
 }
 
+/// How many written paths a failure record's [`FixesData::Written`] names
+/// when the slot's `fixes.txt` lists them all.
+pub const FIXES_PATHS_CAP: usize = 32;
+
 /// What a failed `in_place` run's write-back did, on [`LeftBehindData`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -1014,10 +1018,15 @@ pub enum FixesData {
         /// The workspace root the paths are relative to.
         root: String,
         /// Every path written, sorted; empty when the fixes matched the tree.
+        /// In a failure record, with `list` kept, the first
+        /// [`FIXES_PATHS_CAP`] only: `list` names them all (I8).
         paths: Vec<String>,
         /// The slot's `fixes.txt` listing `paths`, when kept.
         #[serde(default)]
         list: Option<String>,
+        /// How many paths past `paths` were written: in `list`, not here.
+        #[serde(default, skip_serializing_if = "is_zero_u32")]
+        paths_more: u32,
     },
     /// Nothing was written, and why, in words.
     NotWritten { reason: String },

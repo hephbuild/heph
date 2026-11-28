@@ -1130,6 +1130,7 @@ pub fn left_behind(
                 root: root.to_string_lossy().into_owned(),
                 paths: paths.clone(),
                 list: list.as_ref().map(|l| l.to_string_lossy().into_owned()),
+                paths_more: 0,
             },
             FailureFixes::NotWritten(reason) => hcore::events::FixesData::NotWritten {
                 reason: reason.to_string(),

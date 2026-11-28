@@ -237,6 +237,21 @@ pub(crate) fn compact(
                 None,
             )
         });
+        // A record names the first written paths and counts the rest, when
+        // the slot's `fixes.txt` lists them all (I8, CQ-5). Without that
+        // list every path stays: a restore hint naming fewer would leave
+        // files behind.
+        if let Some(hcore::events::FixesData::Written {
+            paths,
+            list: Some(_),
+            paths_more,
+            ..
+        }) = rec.left_behind.as_mut().and_then(|l| l.fixes.as_mut())
+            && paths.len() > hcore::events::FIXES_PATHS_CAP
+        {
+            *paths_more = count(paths.len() - hcore::events::FIXES_PATHS_CAP);
+            paths.truncate(hcore::events::FIXES_PATHS_CAP);
+        }
         rec.log = slot.log.as_ref().map(|log| LogRef {
             path: log.path().map(|p| p.display().to_string()),
             fill_id: slot.fill_id.clone(),
@@ -342,7 +357,13 @@ fn own_message(
                         .is_some());
             let text = if let Some(multi) = f.downcast_ref::<MultiError>() {
                 let room = CAUSES_CAP.saturating_sub(causes.len()).min(multi.0.len());
-                causes.extend(multi.0.iter().take(room).map(|m| cause_frames(m).join(": ")));
+                causes.extend(
+                    multi
+                        .0
+                        .iter()
+                        .take(room)
+                        .map(|m| cause_frames(m).join(": ")),
+                );
                 *more = more.saturating_add(count(multi.0.len() - room));
                 format!("{} errors", multi.0.len())
             } else if let Some(changed) = f.downcast_ref::<RevisionChangedError>()
@@ -900,9 +921,48 @@ mod tests {
                 root: "/ws".into(),
                 paths: vec!["a.go".into()],
                 list: None,
+                paths_more: 0,
             })
         );
         assert_eq!(rec.exit.and_then(|x| x.code), Some(1));
+    }
+
+    /// CQ-5: with `fixes.txt` kept, the record names the first
+    /// [`FIXES_PATHS_CAP`](hcore::events::FIXES_PATHS_CAP) paths and counts
+    /// the rest; without it, every path stays for the restore hint.
+    #[test]
+    fn fixes_paths_capped_when_the_list_is_kept() {
+        let cap = hcore::events::FIXES_PATHS_CAP;
+        let paths: Vec<String> = (0..cap + 7).map(|i| format!("f{i:03}.go")).collect();
+        for list in [Some(std::path::PathBuf::from("/slot/fixes.txt")), None] {
+            let slot = FailureSlot {
+                fixes: Some(FailureFixes::Written {
+                    root: "/ws".into(),
+                    paths: paths.clone(),
+                    list: list.clone(),
+                }),
+                ..FailureSlot::default()
+            };
+            let e = anyhow::Error::new(ProcessFailed::new("exit status: 1", Some(Exit::Code(1))))
+                .context(slot);
+            let rec = of(&e);
+            let Some(hcore::events::FixesData::Written {
+                paths: got,
+                paths_more,
+                ..
+            }) = rec.left_behind.and_then(|l| l.fixes)
+            else {
+                panic!("fixes written");
+            };
+            if list.is_some() {
+                assert_eq!(got.len(), cap);
+                assert_eq!(got.first().map(String::as_str), Some("f000.go"));
+                assert_eq!(paths_more, 7);
+            } else {
+                assert_eq!(got.len(), cap + 7, "no list: every path stays");
+                assert_eq!(paths_more, 0);
+            }
+        }
     }
 
     #[test]

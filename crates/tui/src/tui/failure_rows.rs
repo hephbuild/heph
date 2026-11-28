@@ -321,7 +321,12 @@ fn fixes_rows(out: &mut String, fixes: &FixesData, inspect: Option<&str>) {
         "  restore with (takes the index version; uncommitted edits to these files are lost):\n";
     match fixes {
         FixesData::Written { paths, .. } if paths.is_empty() => {}
-        FixesData::Written { root, paths, list } => {
+        FixesData::Written {
+            root,
+            paths,
+            list,
+            paths_more,
+        } => {
             let git = format!("git -C {} --literal-pathspecs checkout", shell_quote(root));
             out.push_str(
                 "  fixes written, target still failed (re-run to verify; \
@@ -330,7 +335,9 @@ fn fixes_rows(out: &mut String, fixes: &FixesData, inspect: Option<&str>) {
             for p in paths.iter().take(FIXES_SHOWN) {
                 out.push_str(&format!("    {}\n", crate::tui::text::clean_inline(p)));
             }
-            let more = paths.len().saturating_sub(FIXES_SHOWN);
+            // A record names the first paths and counts the rest (I8).
+            let more = paths.len().saturating_sub(FIXES_SHOWN)
+                + usize::try_from(*paths_more).unwrap_or(usize::MAX);
             // A path a terminal cannot show as typed goes through the list
             // too: the restore below would not paste back as written.
             let unprintable = paths.iter().any(|p| p.chars().any(char::is_control));

@@ -1995,6 +1995,7 @@ mod tests {
             root: "/my ws".to_owned(),
             paths: paths.to_vec(),
             list: list.then(|| format!("{SLOT}/fixes.txt")),
+            paths_more: 0,
         };
 
         // Few fixes: every path, and a restore hint naming each one. It runs

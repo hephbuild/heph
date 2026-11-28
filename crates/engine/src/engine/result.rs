@@ -19573,7 +19573,10 @@ mod tests {
                 .insert("wait".to_string(), hcore::htvalue::Value::Bool(true));
             let mut targets = vec![bad, wait];
             if shape == "dep" {
-                targets.push(leaf_with_deps_spec("//top:t", &["//pkg:bad", "//pkg:wait"])?);
+                targets.push(leaf_with_deps_spec(
+                    "//top:t",
+                    &["//pkg:bad", "//pkg:wait"],
+                )?);
             }
             let h = terminal_harness(targets)?;
             let heard: SArc<parking_lot::Mutex<Vec<crate::engine::RunEnd>>> = SArc::default();
