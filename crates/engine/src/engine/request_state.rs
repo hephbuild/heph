@@ -2893,7 +2893,11 @@ mod tests {
         rs.add_dep_for_test(&a, &b)?;
         rs.add_dep_for_test(&b, &c)?;
         let early = rs.culprit_path(&c);
-        assert_eq!(early, [r.clone(), a, b, c.clone()], "the partial graph's path");
+        assert_eq!(
+            early,
+            [r.clone(), a, b, c.clone()],
+            "the partial graph's path"
+        );
         rs.record_failure(
             c.clone(),
             Arc::new(TargetFailure::new(c.clone(), None, anyhow::anyhow!("boom")).with_path(early)),
@@ -2905,7 +2909,10 @@ mod tests {
         let [seen] = <[_; 1]>::try_from(rs.failures()).expect("one failure");
         assert_eq!(seen.path, final_path, "failures() reads the final graph");
         let [taken] = <[_; 1]>::try_from(rs.take_failures()).expect("one failure");
-        assert_eq!(taken.path, final_path, "take_failures() reads the final graph");
+        assert_eq!(
+            taken.path, final_path,
+            "take_failures() reads the final graph"
+        );
         Ok(())
     }
 

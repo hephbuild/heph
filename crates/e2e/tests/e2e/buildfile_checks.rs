@@ -178,7 +178,10 @@ async fn try_run(ws: &Ws, m: &Matcher) -> Result<Run, Unresolved> {
         .failures()
         .iter()
         .map(|f| {
-            let key = f.file.as_deref().map_or_else(|| f.addr.format(), str::to_owned);
+            let key = f
+                .file
+                .as_deref()
+                .map_or_else(|| f.addr.format(), str::to_owned);
             (key, format!("{:#}", f.source))
         })
         .collect();
@@ -909,7 +912,10 @@ def lib(name: str, **kwargs: heph.types.bash.Kwargs):
         Err(e) => (e.error, e.culprits),
         Ok(mut r) => {
             assert_fails(&r, "//pkg:build-lint-check");
-            let marker = r.failed.remove("//pkg:build-lint-check").unwrap_or_default();
+            let marker = r
+                .failed
+                .remove("//pkg:build-lint-check")
+                .unwrap_or_default();
             (marker, r.culprits)
         }
     };
