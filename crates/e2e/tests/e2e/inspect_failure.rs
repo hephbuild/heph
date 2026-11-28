@@ -75,14 +75,14 @@ target(name = "t", driver = "auth.credential", sources = ["//auth:fetch"],
     std::fs::write(ctl.path().join("fail"), "")?;
     fail(&ws.engine, "//p:t").await?;
     let v = view(&ws.engine, "//p:t")?.expect("a recorded failure");
-    assert_eq!(v.addr, "//p:t");
+    assert_eq!(v.addr.as_deref(), Some("//p:t"));
     assert!(v.slot.is_absolute(), "{}", v.slot.display());
     assert_eq!(
         v.slot,
         std::path::absolute(ws.engine.failure_slots().slot_dir(&parse_addr("//p:t")?))?
     );
-    assert!(!v.hashin.is_empty());
-    assert!(v.failed_at > 0);
+    assert!(v.hashin.as_deref().is_some_and(|h| !h.is_empty()));
+    assert!(v.failed_at.is_some_and(|t| t > 0));
     let log = v.log.as_ref().expect("a log");
     assert!(log.starts_with(&v.slot));
     assert!(std::fs::read_to_string(log)?.contains("boom"));

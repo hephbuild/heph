@@ -1179,6 +1179,9 @@ mod tests {
         apply(
             &mut m,
             BuildEventKind::ResultEnd {
+                duplicate: false,
+                upstream_file: None,
+                path: Vec::new(),
                 left_behind: None,
                 cancelled: false,
                 addr: "//p:done".into(),

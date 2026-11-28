@@ -111,6 +111,7 @@ pub(crate) fn full_document(
 fn root_json(r: &RootFailure) -> serde_json::Value {
     serde_json::json!({
         "addr": r.addr,
+        "file": r.file,
         "driver": r.driver,
         "duration_ms": r.duration_ms,
         "exit_status": r.exit_status,
@@ -207,7 +208,7 @@ pub(crate) fn annotations(roots: &[RootFailure], limit: usize) -> Vec<String> {
             }
             format!(
                 "::error title=heph {}::{}",
-                escape_annotation(&r.addr),
+                escape_annotation(r.culprit()),
                 escape_annotation(&truncate_chars(&detail, 400))
             )
         })
@@ -282,6 +283,9 @@ mod tests {
             t.apply(&ev(
                 1_000,
                 BuildEventKind::ResultEnd {
+                    duplicate: false,
+                    upstream_file: None,
+                    path: Vec::new(),
                     left_behind: None,
                     cancelled: false,
                     timed_out: None,
@@ -302,6 +306,9 @@ mod tests {
             t.apply(&ev(
                 2_000,
                 BuildEventKind::ResultEnd {
+                    duplicate: false,
+                    upstream_file: None,
+                    path: Vec::new(),
                     left_behind: None,
                     cancelled: false,
                     timed_out: None,
@@ -410,6 +417,9 @@ mod tests {
         t.apply(&ev(
             0,
             BuildEventKind::ResultEnd {
+                duplicate: false,
+                upstream_file: None,
+                path: Vec::new(),
                 left_behind: None,
                 cancelled: false,
                 timed_out: None,

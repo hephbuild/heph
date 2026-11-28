@@ -93,10 +93,21 @@ pub const SHORT: Duration = Duration::from_secs(60);
 impl Bg {
     /// Spawn `heph <args>` and wait for its session's start line.
     pub fn spawn(ws: &Workspace, dist: &Dist, args: &[&str]) -> Self {
+        Self::spawn_with(ws, dist, args, |_| {})
+    }
+
+    /// [`Bg::spawn`], with `edit` applied to the command before it spawns.
+    pub fn spawn_with(
+        ws: &Workspace,
+        dist: &Dist,
+        args: &[&str],
+        edit: impl FnOnce(&mut std::process::Command),
+    ) -> Self {
         let logs = tempfile::tempdir().expect("logs tempdir");
         let stderr = logs.path().join("stderr");
-        let child = ws
-            .cmd(dist, args)
+        let mut cmd = ws.cmd(dist, args);
+        edit(&mut cmd);
+        let child = cmd
             .stdin(Stdio::null())
             .stdout(std::fs::File::create(logs.path().join("stdout")).expect("stdout file"))
             .stderr(std::fs::File::create(&stderr).expect("stderr file"))

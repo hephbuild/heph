@@ -360,6 +360,27 @@ pub enum BuildEventKind {
         /// targets reporting the same underlying failure.
         #[serde(default)]
         upstream_of: Option<String>,
+        /// The workspace-relative BUILD/`.bzl` file that did not evaluate,
+        /// when it is why this target failed. A path never goes in an
+        /// address field. Two shapes carry it:
+        /// - beside `upstream_of`, which stays the address that led into the
+        ///   file: a target the file took down;
+        /// - on a `duplicate` end with no `upstream_of`: a target in that
+        ///   file, whose `FileFailed` was announced through another address
+        ///   (or through this one). The target was skipped because of its
+        ///   own file; it is neither a root nor a second box.
+        ///
+        /// `None` from a host that predates it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        upstream_file: Option<String>,
+        /// On a culprit's own failure: the shortest path from a requested
+        /// target to it, inclusive (`[addr]` when it was itself requested),
+        /// ties broken by address byte order. A skipped end never carries
+        /// one (it names its root in `upstream_of`): a path per skipped
+        /// target would grow the stream by skipped × depth. Empty from a host
+        /// that predates it.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        path: Vec<String>,
         /// The process's exit status as the OS reported it (e.g. `exit status:
         /// 1`), when the failure was a subprocess.
         ///
@@ -392,6 +413,19 @@ pub enum BuildEventKind {
         /// which reported a stop as a root failure.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         cancelled: bool,
+        /// Set on a culprit's own failed end when another end (or a
+        /// [`BuildEventKind::FileFailed`]) already announced the same
+        /// culprit: this scope lost the claim. It still closes the target's
+        /// row, but a consumer neither boxes it nor counts it as a failure
+        /// (one box per culprit). Absent (false) from a host that predates
+        /// it, and on every skipped, cancelled or successful end.
+        ///
+        /// Not skew-safe in the other direction: a consumer that predates
+        /// it reads a duplicate end as one more failure and double-counts
+        /// the culprit. `plugin-gh` therefore ships with the host it reads
+        /// (`docs/GHA_REPORTING.md`, §7.1).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        duplicate: bool,
         /// What the failed run left behind and where to read it: the rows the
         /// failure box ends with, so a consumer printing the failure as it
         /// happens prints them too. Only on a failure; `None` from a host that
@@ -774,6 +808,30 @@ pub enum BuildEventKind {
         reason: Option<String>,
         #[serde(default)]
         addr: Option<String>,
+    },
+    /// A BUILD or `.bzl` file that did not evaluate, announced once per
+    /// file however many targets reached it: the file's own failure box. A
+    /// file has no target scope, so it rides this kind rather than a
+    /// `ResultEnd` (a path never goes in an address field, where
+    /// `package_of` would misread it). Targets it took down end with
+    /// `upstream_of` = `entry` and `upstream_file` = `file`; a target in the
+    /// file itself ends `duplicate` with `upstream_file` = `file` and no
+    /// `upstream_of`. An older
+    /// consumer reads it as [`BuildEventKind::Unknown`].
+    FileFailed {
+        /// The workspace-relative file.
+        #[serde(default)]
+        file: String,
+        /// The address that led into the file: a requested target in it, or
+        /// the innermost input that lives in it.
+        #[serde(default)]
+        entry: String,
+        /// The failure, flattened like `ResultEnd::error`.
+        #[serde(default)]
+        error: String,
+        /// The shortest path from a requested target to `entry`, inclusive.
+        #[serde(default)]
+        path: Vec<String>,
     },
     /// `heph tool codegen import` recorded `files` stamped files and skipped
     /// `skipped` whose stamp it could not read.
@@ -1173,11 +1231,14 @@ pub mod test_support {
             addr: addr.to_string(),
             error: None,
             upstream_of: None,
+            upstream_file: None,
+            path: Vec::new(),
             exit_status: None,
             exit_code: None,
             log_tail: None,
             timed_out: None,
             cancelled: false,
+            duplicate: false,
         };
         vec![
             // Local hit.
@@ -1328,17 +1389,23 @@ mod tests {
                 addr,
                 error,
                 upstream_of,
+                upstream_file,
+                path,
                 exit_status,
                 exit_code,
                 log_tail,
                 timed_out,
                 cancelled,
+                duplicate,
                 left_behind,
             } => {
                 assert_eq!(addr, "//a:x");
                 assert!(!cancelled, "an older host's stop reads as a failure");
+                assert!(!duplicate, "an older host's end is the one announcing it");
                 assert_eq!(error.as_deref(), Some("boom"));
                 assert_eq!(upstream_of, None);
+                assert_eq!(upstream_file, None);
+                assert!(path.is_empty());
                 assert_eq!(exit_status, None);
                 assert_eq!(exit_code, None);
                 assert_eq!(log_tail, None);
@@ -1961,9 +2028,12 @@ mod tests {
             at_unix_ms: 7,
             kind: BuildEventKind::ResultEnd {
                 left_behind: None,
+                duplicate: false,
                 addr: "//a:x".into(),
                 error: Some("target failed".into()),
                 upstream_of: Some("//base:proto".into()),
+                upstream_file: Some("base/BUILD".into()),
+                path: vec!["//a:top".into(), "//a:x".into()],
                 exit_status: Some("exit status: 1".into()),
                 exit_code: Some(1),
                 log_tail: Some(LogTailData {
@@ -2002,6 +2072,45 @@ mod tests {
                         abandoned: true
                     })
                 );
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// A duplicate end naming its own broken file, with no `upstream_of`,
+    /// keeps that shape across the wire (a session records and replays it):
+    /// the file is not paired with an address on the way back.
+    #[test]
+    fn duplicate_end_with_file_round_trips() {
+        let ev = BuildEvent {
+            at_unix_ms: 7,
+            kind: BuildEventKind::ResultEnd {
+                left_behind: None,
+                duplicate: true,
+                addr: "//d:t2".into(),
+                error: Some("evaluating d/BUILD: boom".into()),
+                upstream_of: None,
+                upstream_file: Some("d/BUILD".into()),
+                path: Vec::new(),
+                exit_status: None,
+                exit_code: None,
+                log_tail: None,
+                timed_out: None,
+                cancelled: false,
+            },
+        };
+        let json = serde_json::to_string(&ev).expect("encode");
+        let back: BuildEvent = serde_json::from_str(&json).expect("decode");
+        match back.kind {
+            BuildEventKind::ResultEnd {
+                duplicate,
+                upstream_of,
+                upstream_file,
+                ..
+            } => {
+                assert!(duplicate, "{json}");
+                assert_eq!(upstream_of, None, "{json}");
+                assert_eq!(upstream_file.as_deref(), Some("d/BUILD"), "{json}");
             }
             other => panic!("wrong variant: {other:?}"),
         }
@@ -2279,6 +2388,89 @@ mod tests {
             matches!(
                 old.as_slice(),
                 [OldKind::Unknown, OldKind::ResultStart { .. }]
+            ),
+            "{old:?}"
+        );
+    }
+
+    /// A file culprit's `FileFailed` survives the wire, and a consumer built
+    /// before it existed decodes it as `Unknown` and keeps reading; a
+    /// non-announcing `ResultEnd` reads, to that consumer, as the failed end
+    /// it was before the flag existed.
+    #[test]
+    fn older_consumer_decodes_file_culprit_as_unknown() {
+        let ev = BuildEvent {
+            at_unix_ms: 4,
+            kind: BuildEventKind::FileFailed {
+                file: "d/BUILD".into(),
+                entry: "//d:t".into(),
+                error: "evaluating d/BUILD: boom".into(),
+                path: vec!["//a:a".into(), "//d:t".into()],
+            },
+        };
+        let json = serde_json::to_string(&ev).expect("encode");
+        let back: BuildEvent = serde_json::from_str(&json).expect("decode");
+        assert!(
+            matches!(
+                &back.kind,
+                BuildEventKind::FileFailed { file, entry, path, .. }
+                    if file == "d/BUILD" && entry == "//d:t" && path.len() == 2
+            ),
+            "{back:?}"
+        );
+        let sparse = r#"{"at_unix_ms":1,"kind":{"type":"FileFailed"}}"#;
+        let ev: BuildEvent = serde_json::from_str(sparse).expect("sparse frame decodes");
+        assert!(matches!(ev.kind, BuildEventKind::FileFailed { ref file, .. } if file.is_empty()));
+
+        let dup = r#"{"at_unix_ms":6,"kind":{"type":"ResultEnd","addr":"//a:x","error":"boom","duplicate":true}}"#;
+        let new: BuildEvent = serde_json::from_str(dup).expect("new decoder");
+        assert!(matches!(
+            new.kind,
+            BuildEventKind::ResultEnd {
+                duplicate: true,
+                ..
+            }
+        ));
+
+        #[derive(serde::Deserialize)]
+        struct OldEvent {
+            kind: OldKind,
+        }
+        #[derive(serde::Deserialize, Debug)]
+        #[serde(tag = "type")]
+        enum OldKind {
+            ResultStart {
+                #[expect(dead_code, reason = "decoded only to prove the shape")]
+                addr: String,
+            },
+            ResultEnd {
+                addr: String,
+                error: Option<String>,
+            },
+            #[serde(other)]
+            Unknown,
+        }
+        let stream = [
+            json,
+            r#"{"at_unix_ms":5,"kind":{"type":"ResultStart","addr":"//a:x"}}"#.into(),
+            dup.into(),
+        ];
+        let old: Vec<OldKind> = stream
+            .iter()
+            .map(|l| {
+                serde_json::from_str::<OldEvent>(l)
+                    .expect("old decoder")
+                    .kind
+            })
+            .collect();
+        assert!(
+            matches!(
+                old.as_slice(),
+                [
+                    OldKind::Unknown,
+                    OldKind::ResultStart { .. },
+                    OldKind::ResultEnd { addr, error: Some(_) }
+                ] if addr == "//a:x"
             ),
             "{old:?}"
         );

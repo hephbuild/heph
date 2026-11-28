@@ -1,5 +1,7 @@
 use crate::engine::Engine;
-use crate::engine::discovery::{Discovery, Gaps, Stage, is_cancellation, provider_of};
+use crate::engine::discovery::{
+    Discovery, Gaps, Stage, is_cancellation, provider_of, walked_package,
+};
 use crate::engine::error::{CancelledError, CycleError, TargetNotFoundError};
 use crate::engine::packages::merge_packages;
 use crate::engine::provider::ListRequest;
@@ -581,7 +583,7 @@ impl Engine {
                 });
                 return Ok(scan);
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(walked_package(e, &pkg)),
         };
 
         for (lister, provider) in self.providers.iter().enumerate() {
@@ -617,7 +619,7 @@ impl Engine {
                     scan.listing_gap = true;
                     continue;
                 }
-                Err(e) => return Err(e),
+                Err(e) => return Err(walked_package(e, &pkg)),
             };
 
             for item in raw {

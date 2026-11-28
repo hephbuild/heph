@@ -275,6 +275,10 @@ pub struct BuildState {
     /// Failures with no `upstream_of`: the roots. `errored` less this is
     /// what they took down, as the finished line splits it.
     root_failed: usize,
+    /// Targets whose row a non-announcing `ResultEnd` closed before the
+    /// announcing one arrived: that one counts the root. Bounded by the
+    /// roots, and only filled when a scope loses a culprit's claim.
+    root_pending: HashSet<String>,
     /// heph's home, redacted from every error text this state keeps (I9).
     redact: crate::tui::text::Redact,
     /// The dashboard's fold: one record per target in per-state buckets,
@@ -481,7 +485,9 @@ impl BuildState {
     ///
     /// Idempotent against the rare same-addr/different-`OutputMatcher`
     /// double-fire: `ResultStart` inserts only if absent, and a second
-    /// `ResultEnd` for an already-removed addr is a no-op.
+    /// `ResultEnd` for an already-removed addr is a no-op, except a
+    /// culprit's: a failing, non-duplicate end on a row that ended ok
+    /// reopens it as failed.
     pub fn apply(&mut self, ev: &BuildEvent) {
         // Anchor the elapsed clock to the earliest event observed.
         self.started_at_ms = Some(match self.started_at_ms {
@@ -504,6 +510,19 @@ impl BuildState {
         let was_in_flight = match &ev.kind {
             BuildEventKind::ResultEnd { addr, .. } => self.dash.in_flight(addr),
             _ => false,
+        };
+        // A culprit blamed after its own scope ended ok: the model reopens
+        // the row as failed, and the counts move it from done to errored.
+        // `Some(true)` when the ok end was counted done.
+        let reopened = match &ev.kind {
+            BuildEventKind::ResultEnd {
+                addr,
+                error: Some(_),
+                duplicate: false,
+                cancelled: false,
+                ..
+            } => self.dash.ok_end(addr),
+            _ => None,
         };
         self.dash.apply(ev, &self.redact);
         if let Some(addr) = op_addr {
@@ -532,17 +551,21 @@ impl BuildState {
                 addr,
                 error,
                 upstream_of,
+                upstream_file,
                 exit_status,
                 timed_out,
                 cancelled,
+                duplicate,
                 ..
             } => {
                 // A root failure — one no dependency caused — takes the
                 // spotlight until a newer one does. Collateral ones never do,
-                // nor a stop: Ctrl-C is not a failure to explain.
+                // nor a stop: Ctrl-C is not a failure to explain, nor an end
+                // that lost the culprit's claim: another announced it.
                 if let Some(err) = error
                     && upstream_of.is_none()
                     && !cancelled
+                    && !duplicate
                     && self
                         .spot
                         .root_failure
@@ -568,11 +591,54 @@ impl BuildState {
                     } else if error.is_some() {
                         self.errored += 1;
                         if upstream_of.is_none() {
-                            self.root_failed += 1;
+                            if *duplicate {
+                                // The row closed on a losing end; the
+                                // announcing one, still to come, is the root.
+                                // A target in a broken file has none: the
+                                // file's `FileFailed` counted the root.
+                                if upstream_file.is_none() {
+                                    self.root_pending.insert(addr.clone());
+                                }
+                            } else {
+                                self.root_failed += 1;
+                            }
                         }
                     } else {
                         self.completed += 1;
                     }
+                } else if let Some(counted_done) = reopened {
+                    if counted_done {
+                        self.completed = self.completed.saturating_sub(1);
+                    }
+                    self.errored += 1;
+                    if upstream_of.is_none() {
+                        self.root_failed += 1;
+                    }
+                } else if error.is_some()
+                    && upstream_of.is_none()
+                    && !cancelled
+                    && !duplicate
+                    && self.root_pending.remove(addr)
+                {
+                    self.root_failed += 1;
+                }
+            }
+            // A BUILD file that did not evaluate: one failure and one root,
+            // on the row of the address that led into it (folded by `dash`).
+            BuildEventKind::FileFailed { entry, error, .. } => {
+                self.errored += 1;
+                self.root_failed += 1;
+                if self
+                    .spot
+                    .root_failure
+                    .as_ref()
+                    .is_none_or(|f| f.is_replaced_by(ev.at_unix_ms, entry))
+                {
+                    self.spot.root_failure = Some(spotlight::RootFailure {
+                        at_ms: ev.at_unix_ms,
+                        addr: entry.clone(),
+                        reason: spotlight::RootFailure::reason(error, None, None, &self.redact),
+                    });
                 }
             }
             // The op timeline (folded above) tracks Execute's duration; here we
@@ -2657,10 +2723,11 @@ fn live_failure_block(
     timed_out: Option<&hcore::events::TimedOutData>,
     tail: Option<&hcore::events::LogTailData>,
     left_behind: Option<&hcore::events::LeftBehindData>,
+    (path, file): (&[String], bool),
     log_lines: usize,
     redact: &crate::tui::text::Redact,
 ) -> String {
-    use crate::tui::failure_rows::tail_rows;
+    use crate::tui::failure_rows::{reached_by_rows, tail_rows};
     use crate::tui::text::{clean_inline, escape_log_tail, expand_tabs, sanitize_log};
     let row = |line: &str| expand_tabs(&redact.apply(line)).into_owned();
 
@@ -2678,6 +2745,8 @@ fn live_failure_block(
     } else {
         body.extend(sanitize_log(error.as_bytes()).lines().map(row));
     }
+    // How the request reached the culprit (U3), as the report's body says it.
+    body.extend(reached_by_rows(path, file));
     if log_lines > 0
         && let Some(tail) = tail
     {
@@ -2872,12 +2941,19 @@ impl CIAppView for CiProgressView {
                 addr,
                 error: Some(error),
                 upstream_of: None,
+                // Set beside `upstream_of` or on a duplicate end, both of
+                // which this arm rules out.
+                upstream_file: _,
+                path,
                 exit_status,
                 // `exit_status` already names it.
                 exit_code: _,
                 log_tail,
                 timed_out,
                 cancelled: false,
+                // An end that lost the culprit's claim prints nothing: the
+                // announcing one carries the block (one box per culprit).
+                duplicate: false,
                 left_behind,
             } if !self.failures_printed.contains(addr) => {
                 self.failures_printed.insert(addr.clone());
@@ -2889,11 +2965,34 @@ impl CIAppView for CiProgressView {
                         timed_out.as_ref(),
                         log_tail.as_ref(),
                         left_behind.as_deref(),
+                        (path, false),
                         self.log_lines,
                         &self.core.state.redact,
                     ),
                     addr,
                     left_behind.as_deref(),
+                );
+                tracing::error!("{block}");
+            }
+            // A BUILD file that did not evaluate: its block, once, headed by
+            // the file (it is not a target).
+            BuildEventKind::FileFailed {
+                file,
+                entry,
+                error,
+                path,
+            } if !self.failures_printed.contains(entry) => {
+                self.failures_printed.insert(entry.clone());
+                let block = live_failure_block(
+                    file,
+                    error,
+                    None,
+                    None,
+                    None,
+                    None,
+                    (path, true),
+                    self.log_lines,
+                    &self.core.state.redact,
                 );
                 tracing::error!("{block}");
             }
@@ -3160,6 +3259,9 @@ mod tests {
     }
     fn result_end(addr: &str, error: Option<String>) -> BuildEventKind {
         BuildEventKind::ResultEnd {
+            duplicate: false,
+            upstream_file: None,
+            path: Vec::new(),
             left_behind: None,
             cancelled: false,
             addr: addr.into(),
@@ -3716,13 +3818,96 @@ mod tests {
         s.apply(&ev(1, result_start("//a:b")));
         assert_eq!(s.dash.in_flight_count(), 1);
         s.apply(&ev(2, result_end("//a:b", None)));
-        // Second ResultEnd for an already-removed addr must not double-count.
-        s.apply(&ev(3, result_end("//a:b", Some("late".into()))));
+        // A duplicate's second ResultEnd for an already-ended addr must not
+        // double-count, even failing.
+        let mut dup = result_end("//a:b", Some("late".into()));
+        if let BuildEventKind::ResultEnd { duplicate, .. } = &mut dup {
+            *duplicate = true;
+        }
+        s.apply(&ev(3, dup));
         // Nor does a start after the end reopen it.
         s.apply(&ev(4, result_start("//a:b")));
         assert_eq!(s.completed, 1);
         assert_eq!(s.errored, 0);
         assert_eq!(s.dash.in_flight_count(), 0);
+        let tabs = s.dash.counts(CountScope::All);
+        assert_eq!((tabs.done, tabs.failed), (1, 0));
+    }
+
+    /// A culprit blamed after its own scope ended ok: the blame's failing,
+    /// non-duplicate end turns its Done row into a failed root, and the
+    /// counts move it from done to errored, so done + errored stays within
+    /// the total. A duplicate's end after that changes nothing more.
+    #[test]
+    fn culprit_end_after_ok_reopens_row_as_failed() {
+        let mut s = BuildState::new();
+        s.apply(&ev(1, result_start("//a:c")));
+        s.apply(&ev(2, result_end("//a:c", None)));
+        s.apply(&ev(3, result_start("//a:ok")));
+        s.apply(&ev(4, result_end("//a:ok", None)));
+        assert_eq!((s.completed, s.errored), (2, 0));
+
+        // The blame re-runs its scope: a start that reopens nothing, then
+        // the failing end.
+        s.apply(&ev(5, result_start("//a:c")));
+        s.apply(&ev(6, result_end("//a:c", Some("c broke".into()))));
+        assert_eq!((s.completed, s.errored), (1, 1));
+        assert_eq!(s.failure_split(), (1, 0), "a root");
+        assert_eq!(s.dash.in_flight_count(), 0);
+        let tabs = s.dash.counts(CountScope::All);
+        assert_eq!((tabs.done, tabs.failed), (1, 1));
+        assert!(
+            tabs.done + tabs.failed_total() <= tabs.all(),
+            "{tabs:?} exceeds the total"
+        );
+        assert!(s.completed + s.errored <= tabs.all());
+        assert_eq!(
+            s.dash
+                .failures()
+                .map(|id| s.dash.addr(id))
+                .collect::<Vec<_>>(),
+            ["//a:c"]
+        );
+
+        // Once failed, a later end of either kind is a no-op.
+        let mut dup = result_end("//a:c", Some("c broke".into()));
+        if let BuildEventKind::ResultEnd { duplicate, .. } = &mut dup {
+            *duplicate = true;
+        }
+        s.apply(&ev(7, dup));
+        s.apply(&ev(8, result_end("//a:c", Some("c broke".into()))));
+        assert_eq!((s.completed, s.errored), (1, 1));
+        assert_eq!(s.failure_split(), (1, 0));
+        let tabs = s.dash.counts(CountScope::All);
+        assert_eq!((tabs.done, tabs.failed), (1, 1));
+    }
+
+    /// What the engine sends since CQ-M2 for a culprit whose scope already
+    /// opened: the ok end, then the blame's failing end, with no second
+    /// start. The row reopens as a failed root just the same.
+    #[test]
+    fn culprit_end_after_ok_without_a_second_start_reopens_row_as_failed() {
+        let mut s = BuildState::new();
+        s.apply(&ev(1, result_start("//a:c")));
+        s.apply(&ev(2, result_end("//a:c", None)));
+        s.apply(&ev(3, result_start("//a:ok")));
+        s.apply(&ev(4, result_end("//a:ok", None)));
+        assert_eq!((s.completed, s.errored), (2, 0));
+
+        s.apply(&ev(5, result_end("//a:c", Some("c broke".into()))));
+        assert_eq!((s.completed, s.errored), (1, 1));
+        assert_eq!(s.failure_split(), (1, 0), "a root");
+        assert_eq!(s.dash.in_flight_count(), 0);
+        let tabs = s.dash.counts(CountScope::All);
+        assert_eq!((tabs.done, tabs.failed), (1, 1));
+        assert!(s.completed + s.errored <= tabs.all());
+        assert_eq!(
+            s.dash
+                .failures()
+                .map(|id| s.dash.addr(id))
+                .collect::<Vec<_>>(),
+            ["//a:c"]
+        );
     }
 
     /// A stale entry is a miss in the counts, and the summary names it with
@@ -4450,6 +4635,9 @@ mod tests {
         tail: Option<&str>,
     ) -> BuildEventKind {
         BuildEventKind::ResultEnd {
+            duplicate: false,
+            upstream_file: None,
+            path: Vec::new(),
             left_behind: None,
             addr: addr.into(),
             error: Some(format!("{addr}: exit status: 1")),
@@ -4539,6 +4727,9 @@ mod tests {
     #[test]
     fn ci_view_live_block_carries_the_box_rows() {
         let end = BuildEventKind::ResultEnd {
+            duplicate: false,
+            upstream_file: None,
+            path: Vec::new(),
             addr: "//a:b".into(),
             error: Some("//a:b: exit status: 1".into()),
             upstream_of: None,
@@ -4589,6 +4780,141 @@ mod tests {
         assert_eq!(log.matches('✗').count(), 1, "{log}");
     }
 
+    /// An end that lost the culprit's claim prints no box, even when it
+    /// arrives before the announcing one, which then prints the only block;
+    /// the finished line counts one failure, one root. A file culprit's
+    /// `FileFailed` prints one block headed by the file.
+    #[test]
+    fn ci_view_prints_no_box_for_a_non_announcing_end() {
+        let mut dup = failed_end("//a:b", None, false, Some(TAIL));
+        if let BuildEventKind::ResultEnd { duplicate, .. } = &mut dup {
+            *duplicate = true;
+        }
+        assert_eq!(ci_live_log(1, std::slice::from_ref(&dup)), "");
+
+        let announcing = failed_end("//a:b", None, false, Some(TAIL));
+        let log = ci_live_log(1, &[dup.clone(), announcing.clone()]);
+        assert_eq!(log.matches('✗').count(), 1, "{log}");
+
+        let mut s = BuildState::default();
+        for (at, kind) in [
+            BuildEventKind::ResultStart {
+                addr: "//a:b".into(),
+            },
+            dup,
+            announcing,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            s.apply(&ev(at as u64, kind));
+        }
+        assert_eq!(s.failure_split(), (1, 0), "one root, nothing taken down");
+
+        let file = BuildEventKind::FileFailed {
+            file: "d/BUILD".into(),
+            entry: "//d:t".into(),
+            error: "evaluating d/BUILD: boom".into(),
+            path: vec!["//d:t".into()],
+        };
+        let log = ci_live_log(1, &[file.clone(), file]);
+        assert_eq!(log.matches('✗').count(), 1, "{log}");
+        assert!(log.contains("✗ d/BUILD"), "{log}");
+    }
+
+    /// A broken file announced through `//d:t1`, and `//d:t2` in the same
+    /// file ending `duplicate` with `upstream_file` and no `upstream_of`:
+    /// one block, one root and one taken down, nothing left waiting for an
+    /// announcing end that never comes, and `//d:t2`'s row is a dependency
+    /// failure under the file's row rather than a second failure. In either
+    /// order of the two events the counts agree.
+    #[test]
+    fn duplicate_end_in_a_broken_file_is_taken_down_by_it() {
+        use crate::tui::dashboard::RowState;
+        let file = BuildEventKind::FileFailed {
+            file: "d/BUILD".into(),
+            entry: "//d:t1".into(),
+            error: "evaluating d/BUILD: boom".into(),
+            path: vec!["//d:t1".into()],
+        };
+        let mut dup = failed_end("//d:t2", None, false, None);
+        if let BuildEventKind::ResultEnd {
+            duplicate,
+            upstream_file,
+            ..
+        } = &mut dup
+        {
+            *duplicate = true;
+            *upstream_file = Some("d/BUILD".into());
+        }
+        let start = BuildEventKind::ResultStart {
+            addr: "//d:t2".into(),
+        };
+        let log = ci_live_log(1, &[file.clone(), start.clone(), dup.clone()]);
+        assert_eq!(log.matches('✗').count(), 1, "{log}");
+
+        let mut s = BuildState::default();
+        for (at, kind) in [file.clone(), start.clone(), dup.clone()]
+            .into_iter()
+            .enumerate()
+        {
+            s.apply(&ev(at as u64, kind));
+        }
+        assert_eq!(s.failure_split(), (1, 1), "the file, and //d:t2 under it");
+        assert!(s.root_pending.is_empty(), "{:?}", s.root_pending);
+        let t2 = rec(&s, "//d:t2");
+        assert_eq!(t2.state, RowState::DepFailed);
+        let id = s.dash.id("//d:t2").expect("an id");
+        assert_eq!(s.dash.root_of(id), Some("//d:t1"));
+        assert_eq!(rec(&s, "//d:t1").state, RowState::Failed);
+
+        let mut s = BuildState::default();
+        for (at, kind) in [start, dup, file].into_iter().enumerate() {
+            s.apply(&ev(at as u64, kind));
+        }
+        assert_eq!(s.failure_split(), (1, 1), "the dup end first");
+        assert!(s.root_pending.is_empty(), "{:?}", s.root_pending);
+        assert_eq!(rec(&s, "//d:t2").state, RowState::DepFailed);
+    }
+
+    /// U3: a culprit three deep names how the request reached it, after the
+    /// header and before the tail; one that was itself requested gets no row.
+    /// A file culprit's block names the edge into the file.
+    #[test]
+    fn ci_view_live_block_shows_reached_by() {
+        let mut deep = failed_end("//a:t", None, false, Some("one\n"));
+        if let BuildEventKind::ResultEnd { path, .. } = &mut deep {
+            *path = vec!["//a:root".into(), "//a:mid".into(), "//a:t".into()];
+        }
+        assert_eq!(
+            ci_live_log(1, &[deep]),
+            "ERROR ✗ //a:t · exit status: 1\
+             \n  │ reached by: //a:root → //a:mid → //a:t\
+             \n  │ one\n",
+        );
+
+        let mut requested = failed_end("//a:t", None, false, Some("one\n"));
+        if let BuildEventKind::ResultEnd { path, .. } = &mut requested {
+            *path = vec!["//a:t".into()];
+        }
+        let log = ci_live_log(1, &[requested]);
+        assert!(!log.contains("reached by:"), "{log}");
+
+        let file = BuildEventKind::FileFailed {
+            file: "d/BUILD".into(),
+            entry: "//d:t".into(),
+            error: "boom".into(),
+            path: vec!["//a:root".into(), "//c:y".into(), "//d:t".into()],
+        };
+        assert_eq!(
+            ci_live_log(1, &[file]),
+            "ERROR ✗ d/BUILD\
+             \n  │ boom\
+             \n  │ reached by: //a:root → //c:y\
+             \n  │ //c:y depends on //d:t, which this file defines\n",
+        );
+    }
+
     /// Collateral failures and stops print nothing live: the root's block
     /// explains the first, and a stop is not a failure.
     #[test]
@@ -4605,6 +4931,9 @@ mod tests {
     #[test]
     fn ci_view_live_block_words_and_sanitizing() {
         let timed_out = BuildEventKind::ResultEnd {
+            duplicate: false,
+            upstream_file: None,
+            path: Vec::new(),
             left_behind: None,
             addr: "//e2e:it".into(),
             error: Some("timed out".into()),
@@ -4639,6 +4968,9 @@ mod tests {
         );
 
         let no_status = BuildEventKind::ResultEnd {
+            duplicate: false,
+            upstream_file: None,
+            path: Vec::new(),
             left_behind: None,
             addr: "//a:\x1b[2Jb".into(),
             error: Some("staging\x1b[2J failed".into()),
@@ -5974,6 +6306,9 @@ mod tests {
                 });
             }
             ev(BuildEventKind::ResultEnd {
+                duplicate: false,
+                upstream_file: None,
+                path: Vec::new(),
                 left_behind: None,
                 cancelled: false,
                 addr: a,

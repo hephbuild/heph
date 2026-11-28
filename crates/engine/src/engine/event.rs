@@ -219,19 +219,29 @@ pub async fn emit_scope<T>(
     make_end: impl FnOnce(Option<ErrorDetail>) -> BuildEventKind + Send + 'static,
     fut: impl Future<Output = anyhow::Result<T>>,
 ) -> anyhow::Result<T> {
-    emit_scope_with(rs, start, make_end, |_| None::<std::future::Ready<()>>, fut).await
+    emit_scope_with(
+        rs,
+        start,
+        make_end,
+        |e| (e, None::<std::future::Ready<()>>),
+        fut,
+    )
+    .await
 }
 
-/// [`emit_scope`], awaiting what `on_error` returns for a failure before the
-/// end event is built: for an end that carries something only an await can
-/// learn, which `on_error` leaves where `make_end` reads it. The failure is
-/// recorded first, so a scope cancelled during that await still ends as the
-/// failure it was, without what the await would have added.
+/// [`emit_scope`], handing a failure to `on_error` before the end event is
+/// built. `on_error` returns the error the scope returns (the result scope
+/// classifies it there, so its end knows whether it won the culprit's claim)
+/// and, for an end that carries something only an await can learn, a future
+/// that leaves it where `make_end` reads it. The failure's detail is taken
+/// from the error as the body returned it, first, so a scope cancelled
+/// during that await still ends as the failure it was, without what the
+/// await would have added.
 pub async fn emit_scope_with<T, F: Future<Output = ()>>(
     rs: &RequestState,
     start: BuildEventKind,
     make_end: impl FnOnce(Option<ErrorDetail>) -> BuildEventKind + Send + 'static,
-    on_error: impl FnOnce(&anyhow::Error) -> Option<F>,
+    on_error: impl FnOnce(anyhow::Error) -> (anyhow::Error, Option<F>),
     fut: impl Future<Output = anyhow::Result<T>>,
 ) -> anyhow::Result<T> {
     rs.emit(start);
@@ -240,12 +250,114 @@ pub async fn emit_scope_with<T, F: Future<Output = ()>>(
         make_end: Some(make_end),
         error: None,
     };
-    let out = fut.await; // guard still armed if this is cancelled mid-await
-    if let Err(e) = &out {
-        guard.error = Some(ErrorDetail::from_error(e));
-        if let Some(more) = on_error(e) {
-            more.await;
+    // The guard stays armed if this is cancelled mid-await, and drops at
+    // return → emits *End.
+    match fut.await {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            guard.error = Some(ErrorDetail::from_error(&e));
+            let (e, more) = on_error(e);
+            if let Some(more) = more {
+                more.await;
+            }
+            Err(e)
         }
     }
-    out // guard drops here → emits *End
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::hook::Hook;
+    use crate::engine::{Config, Engine};
+
+    /// Each `ResultStart`/`ResultEnd` a hook saw, as `(start?, error)`.
+    #[derive(Default)]
+    struct Rec {
+        seen: parking_lot::Mutex<Vec<(bool, Option<String>)>>,
+    }
+
+    impl Hook for Rec {
+        fn name(&self) -> String {
+            "rec".into()
+        }
+        fn on_event(&self, ev: &BuildEvent) {
+            match &ev.kind {
+                BuildEventKind::ResultStart { .. } => self.seen.lock().push((true, None)),
+                BuildEventKind::ResultEnd { error, .. } => {
+                    self.seen.lock().push((false, error.clone()));
+                }
+                _ => {}
+            }
+        }
+        fn on_close(&self) {}
+    }
+
+    fn end(error: Option<ErrorDetail>) -> BuildEventKind {
+        BuildEventKind::ResultEnd {
+            duplicate: false,
+            left_behind: None,
+            cancelled: false,
+            addr: "//a:b".into(),
+            error: error.map(ErrorDetail::into_message),
+            upstream_of: None,
+            upstream_file: None,
+            path: Vec::new(),
+            exit_status: None,
+            exit_code: None,
+            log_tail: None,
+            timed_out: None,
+        }
+    }
+
+    /// A scope dropped while `on_error`'s future is pending still pairs its
+    /// Start with one End, and that End is the failure the body returned:
+    /// the detail is taken before the await, so the cancel loses only what
+    /// the await would have added.
+    #[tokio::test]
+    async fn emit_scope_with_cancelled_during_on_error_still_ends() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let _rt = crate::engine::test_rt_enter();
+        let mut e = Engine::new(Config {
+            parallelism: None,
+            ..Config::for_tests(dir.path())
+        })?;
+        let rec = Arc::new(Rec::default());
+        e.register_hook(Arc::clone(&rec) as Arc<dyn Hook>)?;
+        let engine = Arc::new(e);
+        let state = engine.new_state_with_events(false, None);
+
+        let awaiting = tokio::sync::Notify::new();
+        let scope = emit_scope_with(
+            &state,
+            BuildEventKind::ResultStart {
+                addr: "//a:b".into(),
+            },
+            end,
+            |e| {
+                let more = async {
+                    awaiting.notify_one();
+                    std::future::pending::<()>().await;
+                };
+                (e, Some(more))
+            },
+            async { Err::<(), _>(anyhow::anyhow!("boom")) },
+        );
+        let cancelled = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::select! {
+                _ = scope => false,
+                () = awaiting.notified() => true,
+            }
+        })
+        .await?;
+        assert!(cancelled, "the scope ended before on_error's await");
+        // `scope` was dropped when the select returned: the cancel.
+
+        assert_eq!(
+            rec.seen.lock().clone(),
+            [(true, None), (false, Some("boom".to_string()))],
+            "one Start, one End carrying the body's failure"
+        );
+        Ok(())
+    }
 }

@@ -236,6 +236,8 @@ const OP_OPEN: u8 = 1 << 4;
 const ENDED: u8 = 1 << 5;
 /// Between its `ResultStart` and its `ResultEnd`.
 const IN_FLIGHT: u8 = 1 << 6;
+/// Its `ResultEnd` closed an in-flight scope: the end a progress line counts.
+const ENDED_IN_FLIGHT: u8 = 1 << 7;
 
 /// Wait bits.
 const WAIT_ADMISSION: u8 = 1;
@@ -471,6 +473,10 @@ pub struct Model {
     open: HashSet<Id>,
     /// How many records carry `IN_FLIGHT`.
     in_flight: usize,
+    /// Each BUILD file that did not evaluate, and the row its failure is on
+    /// (its `FileFailed` entry): the root a target in that file names. One
+    /// per broken file.
+    file_rows: HashMap<Box<str>, Id>,
     matched_seen: bool,
     matched_complete: bool,
     /// What the target screen's Overview reads beside the record: phase
@@ -588,20 +594,41 @@ impl Model {
                 addr,
                 error,
                 upstream_of,
+                upstream_file,
                 exit_status,
                 timed_out,
                 cancelled,
+                duplicate,
                 ..
             } => {
+                // A target in a broken file whose failure is another row's
+                // (its `FileFailed` entry): taken down by that file, not a
+                // second failure of it.
+                let file_root = match (duplicate, upstream_of, upstream_file) {
+                    (true, None, Some(file)) => Some(
+                        self.file_rows
+                            .get(file.as_str())
+                            .copied()
+                            .unwrap_or(NO_ROOT),
+                    ),
+                    _ => None,
+                };
                 let id = self.touch(addr);
+                // A culprit blamed after its own scope ended ok: the blame's
+                // end makes the row the failure it is. Any other second end
+                // (a duplicate's, a stop's) leaves the row as it ended.
+                let reopen = error.is_some() && !duplicate && !cancelled && self.ended_ok(id);
                 let Some(r) = self.rec_mut(id) else {
                     return;
                 };
-                if r.flags & ENDED != 0 {
+                if r.flags & ENDED != 0 && !reopen {
                     return;
                 }
                 let was_in_flight = r.flags & IN_FLIGHT != 0;
                 r.flags = (r.flags | ENDED) & !(OP_OPEN | IN_FLIGHT);
+                if was_in_flight {
+                    r.flags |= ENDED_IN_FLIGHT;
+                }
                 r.waits = 0;
                 r.end_ms = at;
                 let cached = r.flags & CACHE_HIT != 0;
@@ -611,6 +638,12 @@ impl Model {
                 }
                 let state = match (error, upstream_of) {
                     (Some(_), _) if *cancelled => RowState::Stopped,
+                    (Some(_), None) if file_root.is_some() => {
+                        if let (Some(r), Some(root)) = (self.rec_mut(id), file_root) {
+                            r.root = root;
+                        }
+                        RowState::DepFailed
+                    }
                     (Some(_), Some(root)) => {
                         let root = self.names.get(root).unwrap_or(NO_ROOT);
                         if let Some(r) = self.rec_mut(id) {
@@ -631,6 +664,35 @@ impl Model {
                     (None, _) => RowState::Done,
                 };
                 self.set_state(id, state);
+            }
+            // A BUILD file that did not evaluate: its failure is shown on the
+            // row of the address that led into it (the root its collateral
+            // names), which never had a scope of its own.
+            BuildEventKind::FileFailed {
+                file, entry, error, ..
+            } => {
+                let id = self.touch(entry);
+                if !self.file_rows.contains_key(file.as_str()) {
+                    self.file_rows.insert(file.as_str().into(), id);
+                }
+                let Some(r) = self.rec_mut(id) else {
+                    return;
+                };
+                if r.flags & ENDED != 0 {
+                    return;
+                }
+                let was_in_flight = r.flags & IN_FLIGHT != 0;
+                r.flags = (r.flags | ENDED) & !(OP_OPEN | IN_FLIGHT);
+                r.waits = 0;
+                r.end_ms = at;
+                self.open.remove(&id);
+                if was_in_flight {
+                    self.in_flight -= 1;
+                }
+                let reason = failure_reason(error, None, None, redact);
+                self.reasons.insert(id, reason.into_boxed_str());
+                self.errors.insert(id, capped_error(&redact.apply(error)));
+                self.set_state(id, RowState::Failed);
             }
             BuildEventKind::PoolUsage {
                 pool,
@@ -741,6 +803,24 @@ impl Model {
             .get(addr)
             .and_then(|id| self.record(id))
             .is_some_and(|r| r.flags & IN_FLIGHT != 0)
+    }
+
+    /// Whether row `id` ended ok: done or cached.
+    fn ended_ok(&self, id: Id) -> bool {
+        self.record(id).is_some_and(|r| {
+            r.flags & ENDED != 0 && matches!(r.state, RowState::Done | RowState::Cached)
+        })
+    }
+
+    /// `Some` when `addr` ended ok, so a culprit's failing end would reopen
+    /// it as failed (see the `ResultEnd` fold); `true` when that ok end
+    /// closed an in-flight scope, the end a progress line counted as done.
+    pub fn ok_end(&self, addr: &str) -> Option<bool> {
+        let id = self.names.get(addr)?;
+        self.ended_ok(id).then(|| {
+            self.record(id)
+                .is_some_and(|r| r.flags & ENDED_IN_FLIGHT != 0)
+        })
     }
 
     /// How many targets are between their `ResultStart` and `ResultEnd`.
@@ -1109,6 +1189,57 @@ mod tests {
         );
     }
 
+    /// A culprit blamed after its scope ended ok, as the engine sends it
+    /// since CQ-M2: the ok end, then the failing end, with no second start.
+    /// Its Done row reopens as a failed root.
+    #[test]
+    fn culprit_end_after_ok_without_a_second_start_reopens_row_as_failed() {
+        let redact = Redact::default();
+        let mut m = Model::default();
+        let end = |error: Option<&str>| BuildEventKind::ResultEnd {
+            duplicate: false,
+            upstream_file: None,
+            path: Vec::new(),
+            left_behind: None,
+            cancelled: false,
+            addr: "//a:c".into(),
+            error: error.map(str::to_owned),
+            upstream_of: None,
+            exit_status: None,
+            exit_code: None,
+            log_tail: None,
+            timed_out: None,
+        };
+        let events = [
+            BuildEventKind::ResultStart {
+                addr: "//a:c".into(),
+            },
+            end(None),
+            end(Some("c broke")),
+        ];
+        for (i, kind) in events.into_iter().enumerate() {
+            m.apply(
+                &BuildEvent {
+                    at_unix_ms: 1_000 + i as u64,
+                    kind,
+                },
+                &redact,
+            );
+            if i == 1 {
+                assert_eq!(m.ok_end("//a:c"), Some(true), "ended ok first");
+                let tabs = m.counts(CountScope::All);
+                assert_eq!((tabs.done, tabs.failed), (1, 0));
+            }
+        }
+        assert_eq!(m.in_flight_count(), 0);
+        let tabs = m.counts(CountScope::All);
+        assert_eq!((tabs.done, tabs.failed), (0, 1));
+        assert_eq!(
+            m.failures().map(|id| m.addr(id)).collect::<Vec<_>>(),
+            ["//a:c"]
+        );
+    }
+
     /// xorshift64*: the churn's seeded randomness.
     struct Rng(u64);
     impl Rng {
@@ -1229,6 +1360,9 @@ mod tests {
                     _ => (Some("boom".to_owned()), Some(addr(rng)), false),
                 };
                 BuildEventKind::ResultEnd {
+                    duplicate: false,
+                    upstream_file: None,
+                    path: Vec::new(),
                     left_behind: None,
                     cancelled,
                     addr: addr(rng),

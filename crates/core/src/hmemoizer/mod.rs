@@ -639,6 +639,23 @@ pub fn nest(e: anyhow::Error) -> anyhow::Error {
     anyhow::Error::new(SharedAnyhow(Arc::new(e)))
 }
 
+/// Another handle on `e` when `e` is exactly a shared error (a [`nest`]ed
+/// one, or a memoizer's), with no context added over it: the same inner
+/// error, owned, for a caller that must hand a member of an aggregate it
+/// only borrows to something that takes ownership. `None` otherwise.
+pub fn share(e: &anyhow::Error) -> Option<anyhow::Error> {
+    if e.chain().nth(1).is_some() {
+        return None;
+    }
+    let shared = e.downcast_ref::<SharedAnyhow>()?;
+    Some(anyhow::Error::new(SharedAnyhow(Arc::clone(&shared.0))))
+}
+
+/// Whether [`share`] would return a handle on `e`, without making one.
+pub fn is_shared(e: &anyhow::Error) -> bool {
+    e.chain().nth(1).is_none() && e.downcast_ref::<SharedAnyhow>().is_some()
+}
+
 /// One error the walker visits: a frame of an anyhow chain (a context, the
 /// error it wraps, or one of that error's `source()`s).
 #[derive(Clone, Copy)]
@@ -728,6 +745,27 @@ pub fn walk<'a, B>(
         }
     }
     std::ops::ControlFlow::Continue(())
+}
+
+/// Whether every failure `e` carries is a `T`: a `T` on its chain, or a
+/// [`MultiError`] on it whose members each are (through [`SharedAnyhow`]
+/// wrappers, as [`walk`] goes). An aggregate with no members is not, nor is
+/// a chain holding neither. Where [`find`] asks "is there a `T`", this asks
+/// "is there nothing else": one aggregate holding a `T` beside a genuine
+/// failure answers yes to the first and no here.
+pub fn only<T: std::error::Error + Send + Sync + 'static>(e: &anyhow::Error) -> bool {
+    for item in e.chain() {
+        if let Some(shared) = item.downcast_ref::<SharedAnyhow>() {
+            return only::<T>(&shared.0);
+        }
+        if item.is::<T>() {
+            return true;
+        }
+        if let Some(multi) = item.downcast_ref::<MultiError>() {
+            return !multi.0.is_empty() && multi.0.iter().all(only::<T>);
+        }
+    }
+    false
 }
 
 /// The first `T` in walk order: the outermost one.
@@ -2791,6 +2829,30 @@ mod tests {
         assert_eq!(innermost::<Marker>(&multi).map(|m| m.0), Some("second"));
         // `frames` keeps the members inside the one `MultiError` frame.
         assert_eq!(frames(&multi).len(), 2);
+        // A `Marker` beside a plain failure: found, but not the only one.
+        assert!(!only::<Marker>(&multi));
+    }
+
+    /// `only`: every failure a `T`, through contexts, shared wrappers and
+    /// nested aggregates; one other failure anywhere, or none at all, is no.
+    #[test]
+    fn only_asks_whether_every_failure_is_a_t() {
+        let m = |s: &'static str| anyhow::Error::new(Marker(s));
+        assert!(only::<Marker>(&m("a").context("ctx")));
+        assert!(only::<Marker>(&shared(m("a"))));
+        let nested = anyhow::Error::new(MultiError(vec![
+            m("a"),
+            shared(anyhow::Error::new(MultiError(vec![m("b"), m("c")]))),
+        ]))
+        .context("fanout");
+        assert!(only::<Marker>(&nested));
+        let deep_other = anyhow::Error::new(MultiError(vec![
+            m("a"),
+            anyhow::Error::new(MultiError(vec![m("b"), anyhow::anyhow!("boom")])),
+        ]));
+        assert!(!only::<Marker>(&deep_other));
+        assert!(!only::<Marker>(&anyhow::anyhow!("boom")));
+        assert!(!only::<Marker>(&anyhow::Error::new(MultiError(Vec::new()))));
     }
 
     #[test]
@@ -2858,6 +2920,25 @@ mod tests {
         let below = frames(&inline);
         assert_eq!(below[1].error().to_string(), "marker(inline)");
         assert!(below[1].downcast_ref::<Marker>().is_some());
+    }
+
+    /// A nested error hands out another owned handle on the same inner
+    /// error; one with a context over it does not (the handle would drop
+    /// the context).
+    #[test]
+    fn share_is_another_handle_on_a_nested_error_only() {
+        let e = nest(anyhow::Error::new(Marker("m")).context(Tag("t")));
+        assert!(is_shared(&e));
+        let again = share(&e).expect("a nested error is shared");
+        assert_eq!(innermost::<Marker>(&again).map(|m| m.0), Some("m"));
+        assert_eq!(format!("{again:#}"), format!("{e:#}"));
+
+        let wrapped = nest(anyhow::Error::new(Marker("m"))).context(Tag("over"));
+        assert!(!is_shared(&wrapped));
+        assert!(share(&wrapped).is_none());
+        let plain = anyhow::Error::new(Marker("m"));
+        assert!(!is_shared(&plain));
+        assert!(share(&plain).is_none());
     }
 
     #[test]

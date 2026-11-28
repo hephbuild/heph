@@ -7,6 +7,7 @@
 
 mod common;
 
+use common::session::{Bg, SHORT, recorded};
 use common::{Dist, Workspace, describe};
 
 /// The published artifact must launch on a stock host. This is the canary for
@@ -155,4 +156,139 @@ fn piped_output_stays_plain() {
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// `slow` runs until it is stopped; `bad` fails at once.
+const CANCEL_BUILD: &str = r#"
+target(name = "slow", driver = "bash", run = "sleep 60", cache = False)
+target(name = "bad", driver = "bash", run = "exit 3", cache = False)
+"#;
+
+/// `heph run <args>` with no terminal (the line backend), stopped by `sig`
+/// once `//pkg:slow` runs and, first, once each of `after` has ended: the
+/// exit code and stderr.
+fn stopped_run(args: &[&str], after: &[&str], sig: i32) -> (Option<i32>, String) {
+    let dist = Dist::locate();
+    let ws = Workspace::new().expect("workspace");
+    ws.write("pkg/BUILD", CANCEL_BUILD).expect("write BUILD");
+    let mut run = Bg::spawn(&ws, &dist, &[&["run"], args].concat());
+    run.wait_executing("//pkg:slow");
+    for addr in after {
+        common::wait_until(&format!("{addr} to end"), SHORT, || {
+            recorded(&run.dir, "ResultEnd", addr)
+        });
+    }
+    common::signal(run.pid(), sig);
+    let status = run.wait();
+    (status.code(), run.stderr())
+}
+
+/// A Ctrl-C (SIGINT) with no terminal is a cancel, and a cancel exits 130
+/// (error-reporting I6, RUN-22), not 1.
+#[test]
+fn cancel_exits_130_non_tui() {
+    let (code, stderr) = stopped_run(&["//pkg:slow"], &[], libc::SIGINT);
+    assert_eq!(code, Some(130), "{stderr}");
+}
+
+/// A target failed, then the user stopped the rest: the stop decides the exit
+/// code (I6), while the failure's box is still printed.
+#[test]
+fn failure_then_ctrl_c_exits_130() {
+    let (code, stderr) = stopped_run(
+        &["-e", "//pkg:slow || //pkg:bad"],
+        &["//pkg:bad"],
+        libc::SIGINT,
+    );
+    assert_eq!(code, Some(130), "{stderr}");
+    assert!(
+        stderr.contains("//pkg:bad"),
+        "the failure is reported\n{stderr}"
+    );
+}
+
+/// RUN-24: under `--fail-fast`, `bad`'s failure stops its sibling `slow`.
+/// That stop is heph's, not the user's, so the run exits 1, never 130,
+/// whether `slow` was running, queued or not yet started when `bad` failed.
+/// Which one it is depends on scheduling, so the run is repeated.
+#[test]
+fn fail_fast_after_failure_exits_1() {
+    let dist = Dist::locate();
+    let ws = Workspace::new().expect("workspace");
+    ws.write("pkg/BUILD", CANCEL_BUILD).expect("write BUILD");
+    for i in 0..20 {
+        let out = ws
+            .run(
+                &dist,
+                &["run", "--fail-fast", "-e", "//pkg:slow || //pkg:bad"],
+            )
+            .expect("run");
+        assert_eq!(out.status.code(), Some(1), "run {i}: {}", describe(&out));
+    }
+}
+
+/// SIGTERM is a cancel, as Ctrl-C is: heph stops the build and exits 130,
+/// rather than dying of the signal.
+#[test]
+fn sigterm_exits_130() {
+    let (code, stderr) = stopped_run(&["//pkg:slow"], &[], libc::SIGTERM);
+    assert_eq!(code, Some(130), "{stderr}");
+}
+
+/// SIGHUP (the terminal went away) is a cancel too: exit 130.
+#[test]
+fn sighup_exits_130() {
+    let (code, stderr) = stopped_run(&["//pkg:slow"], &[], libc::SIGHUP);
+    assert_eq!(code, Some(130), "{stderr}");
+}
+
+/// Started with SIGHUP ignored, as `nohup` starts it, heph leaves it ignored:
+/// a HUP mid-build changes nothing, and the run finishes and exits 0, not
+/// 130. TERM is still a cancel then (heph only keeps the ignore it was given).
+#[test]
+fn sighup_ignored_when_inherited_ignored() {
+    let dist = Dist::locate();
+    let ws = Workspace::new().expect("workspace");
+    ws.write(
+        "pkg/BUILD",
+        "target(name = \"nap\", driver = \"bash\", run = \"sleep 3\", cache = False)\n",
+    )
+    .expect("write BUILD");
+    let mut run = spawn_hup_ignored(&ws, &dist, "//pkg:nap");
+    run.wait_executing("//pkg:nap");
+    common::signal(run.pid(), libc::SIGHUP);
+    let status = run.wait();
+    assert_eq!(status.code(), Some(0), "{}", run.stderr());
+}
+
+/// Under an inherited SIGHUP ignore (`nohup`), SIGTERM is still a cancel:
+/// the HUP sent first changes nothing, the TERM after it stops the build
+/// and exits 130.
+#[test]
+fn sigterm_cancels_when_sighup_inherited_ignored() {
+    let dist = Dist::locate();
+    let ws = Workspace::new().expect("workspace");
+    ws.write("pkg/BUILD", CANCEL_BUILD).expect("write BUILD");
+    let mut run = spawn_hup_ignored(&ws, &dist, "//pkg:slow");
+    run.wait_executing("//pkg:slow");
+    common::signal(run.pid(), libc::SIGHUP);
+    common::signal(run.pid(), libc::SIGTERM);
+    let status = run.wait();
+    assert_eq!(status.code(), Some(130), "{}", run.stderr());
+}
+
+/// `heph run <addr>` started with SIGHUP ignored, as `nohup` starts it.
+fn spawn_hup_ignored(ws: &Workspace, dist: &Dist, addr: &str) -> Bg {
+    use std::os::unix::process::CommandExt as _;
+
+    Bg::spawn_with(ws, dist, &["run", addr], |cmd| {
+        let ignore_hup = || {
+            // SAFETY: setting a signal's disposition to `SIG_IGN`.
+            unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
+            Ok(())
+        };
+        // SAFETY: the closure only calls `signal(2)`, which is
+        // async-signal-safe, between fork and exec.
+        unsafe { cmd.pre_exec(ignore_hup) };
+    })
 }

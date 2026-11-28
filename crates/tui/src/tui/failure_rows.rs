@@ -46,6 +46,63 @@ pub fn left_behind_rows(addr: &str, left: &LeftBehindData) -> String {
     out
 }
 
+/// A path of more targets than this is elided in text (error-reporting U3,
+/// E3): eliding fewer would hide a single hop.
+const PATH_SHOWN_WHOLE: usize = 5;
+
+/// A culprit's path in text: whole up to [`PATH_SHOWN_WHOLE`] targets, else
+/// the requested target, the first hop and the last two, the middle counted
+/// (`a → b → … 3 more (--json has the full path) … → f → g`). The last edge
+/// is the one to edit, so it is always shown. `--json` carries the whole
+/// path; only text elides it.
+fn elide_path<S: AsRef<str>>(path: &[S]) -> String {
+    let shown = |p: &[&S]| {
+        p.iter()
+            .map(|a| crate::tui::text::clean_inline(a.as_ref()).into_owned())
+            .collect::<Vec<_>>()
+            .join(" → ")
+    };
+    match path {
+        [a, b, hidden @ .., y, z] if path.len() > PATH_SHOWN_WHOLE => format!(
+            "{} → … {} more (--json has the full path) … → {}",
+            shown(&[a, b]),
+            hidden.len(),
+            shown(&[y, z]),
+        ),
+        _ => shown(&path.iter().collect::<Vec<_>>()),
+    }
+}
+
+/// The rows a culprit's box prints for how the request reached it, from its
+/// `path` (from a requested target to the culprit, inclusive; for a BUILD
+/// file that did not evaluate, to the address that led into it), each
+/// ending in a newline and without indentation:
+/// - `reached by: //a:root → //b:x → //c:y`, elided as [`elide_path`] does;
+///   none when the culprit was itself requested (a path of one);
+/// - for a `file` culprit, the edge into it: `//c:y depends on //d:t, which
+///   this file defines`, or `//d:t was requested, which this file defines`.
+pub fn reached_by_rows<S: AsRef<str>>(path: &[S], file: bool) -> Vec<String> {
+    let mut rows = Vec::new();
+    let (to, entry) = match (file, path) {
+        (true, [to @ .., entry]) => (to, Some(entry.as_ref())),
+        _ => (path, None),
+    };
+    if to.len() > 1 {
+        rows.push(format!("reached by: {}", elide_path(to)));
+    }
+    if let Some(entry) = entry {
+        let entry = crate::tui::text::clean_inline(entry);
+        rows.push(match to.last() {
+            Some(from) => format!(
+                "{} depends on {entry}, which this file defines",
+                crate::tui::text::clean_inline(from.as_ref())
+            ),
+            None => format!("{entry} was requested, which this file defines"),
+        });
+    }
+    rows
+}
+
 /// Whether `heph log` can read the log `left` describes: the engine's answer
 /// when it gave one, else whether a log was kept on disk.
 pub fn log_readable(left: &LeftBehindData) -> bool {
@@ -208,6 +265,84 @@ fn fixes_rows(out: &mut String, fixes: &FixesData) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `reached by:` rows of a target culprit whose path has `n`
+    /// targets, named `a`, `b`, … (the culprit last).
+    fn reached(n: u8) -> Vec<String> {
+        let path: Vec<String> = (b'a'..b'a' + n)
+            .map(|c| char::from(c).to_string())
+            .collect();
+        reached_by_rows(&path, false)
+    }
+
+    /// U3: a culprit that was itself requested has no `reached by:` row.
+    #[test]
+    fn elide_path_1_targets() {
+        assert!(reached(1).is_empty());
+    }
+
+    #[test]
+    fn elide_path_2_targets() {
+        assert_eq!(reached(2), ["reached by: a → b"]);
+    }
+
+    #[test]
+    fn elide_path_3_targets() {
+        assert_eq!(reached(3), ["reached by: a → b → c"]);
+    }
+
+    #[test]
+    fn elide_path_4_targets() {
+        assert_eq!(reached(4), ["reached by: a → b → c → d"]);
+    }
+
+    /// Eliding five would hide one hop: printed whole.
+    #[test]
+    fn elide_path_5_targets() {
+        assert_eq!(reached(5), ["reached by: a → b → c → d → e"]);
+    }
+
+    /// The requested target, the first hop and the last two; at least two
+    /// hops hidden.
+    #[test]
+    fn elide_path_6_targets() {
+        assert_eq!(
+            reached(6),
+            ["reached by: a → b → … 2 more (--json has the full path) … → e → f"]
+        );
+    }
+
+    #[test]
+    fn elide_path_7_targets() {
+        assert_eq!(
+            reached(7),
+            ["reached by: a → b → … 3 more (--json has the full path) … → f → g"]
+        );
+    }
+
+    /// U2: a file culprit's path ends at the address that led into it; the
+    /// row names that edge, and `reached by:` stops at its declarer.
+    #[test]
+    fn file_culprit_rows_name_the_edge_into_the_file() {
+        let path = ["//a:root", "//b:x", "//c:y", "//d:t"];
+        assert_eq!(
+            reached_by_rows(&path, true),
+            [
+                "reached by: //a:root → //b:x → //c:y",
+                "//c:y depends on //d:t, which this file defines",
+            ]
+        );
+        assert_eq!(
+            reached_by_rows(&["//a:root", "//d:t"], true),
+            ["//a:root depends on //d:t, which this file defines"]
+        );
+        assert_eq!(
+            reached_by_rows(&["//d:t"], true),
+            ["//d:t was requested, which this file defines"]
+        );
+        assert!(reached_by_rows::<&str>(&[], true).is_empty());
+        assert!(reached_by_rows::<&str>(&[], false).is_empty());
+    }
 
     /// Every row, in the box's order and words.
     #[test]

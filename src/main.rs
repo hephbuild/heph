@@ -306,7 +306,12 @@ fn main() -> ExitCode {
     // records the number.
     let code: u8 = match &exec_result {
         Ok(_) => 0,
-        Err(e) => exit_code_for(e, tool_exit, &session),
+        Err(e) => exit_code_for(
+            e,
+            tool_exit,
+            &session,
+            commands::bootstrap::cancel_requested(),
+        ),
     };
     let result = ExitCode::from(code);
     // `End` and the lock release, before anything slow on the way out
@@ -350,10 +355,13 @@ fn main() -> ExitCode {
 
 /// The exit code for a failed command, rendering the error on the way. The
 /// first type in the chain that claims the failure decides, in this order.
+/// `cancel_requested` is [`commands::bootstrap::cancel_requested`]: the user
+/// stopped the command.
 fn exit_code_for(
     e: &anyhow::Error,
     tool_exit: Option<hcore::process::Exit>,
     session: &SessionSlot,
+    cancel_requested: bool,
 ) -> u8 {
     // An entrypoint's program ended without success: heph exits as it did.
     if let Some(exit) = tool_exit {
@@ -372,12 +380,22 @@ fn exit_code_for(
         report(e, session);
         return code;
     }
-    // `heph tool codegen`: 1 for findings, 2 for a failure (Decision 20).
+    // `heph tool codegen`: 1 for findings, 2 for a failure (Decision 20),
+    // and 130 for a cancel, as every command (I6).
     if let Some(exit) = e.downcast_ref::<commands::tool::codegen::CodegenExit>() {
         if let Some(err) = &exit.error {
             report(err, session);
         }
-        return exit.code;
+        let cancelled = cancel_requested
+            || exit
+                .error
+                .as_ref()
+                .is_some_and(hcore::hmemoizer::only::<heph::engine::error::CancelledError>);
+        return if cancelled {
+            commands::run::EXIT_CANCELLED
+        } else {
+            exit.code
+        };
     }
     // `heph session`: 125 for its own failures, else the code `attach`
     // mirrors from the session it followed. The code comes from
@@ -403,7 +421,19 @@ fn exit_code_for(
         return failed.code;
     }
     report(e, session);
-    1
+    // A cancel exits 130 (error-reporting I6), in every mode, and a failure
+    // the user then stopped too: the stop is read from the trigger, since the
+    // failure boxes carry no trace of it. Without the trigger, the error must
+    // be nothing but cancels (inside a `MultiError` or a memoizer-shared
+    // error included): a cancel beside a genuine failure is a sibling
+    // `--fail-fast` stopped, and that run failed, exit 1 (RUN-24).
+    let cancelled =
+        cancel_requested || hcore::hmemoizer::only::<heph::engine::error::CancelledError>(e);
+    if cancelled {
+        commands::run::EXIT_CANCELLED
+    } else {
+        1
+    }
 }
 
 /// Render a graphical diagnostic if the error chain carries one
@@ -582,6 +612,85 @@ fn names_command(m: &clap::ArgMatches, path: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A cancel exits 130 (I6): an error that is only a cancel (in the
+    /// chain, every member of a `MultiError`, behind a memoizer's shared
+    /// error), and any failure the user then stopped (the trigger fired). An
+    /// ordinary failure exits 1, and so does one `--fail-fast` then stopped
+    /// the siblings of (RUN-24): the cancels beside it are its doing, not the
+    /// user's.
+    #[test]
+    fn exit_code_for_maps_a_cancel_to_130() {
+        use heph::engine::error::CancelledError;
+        let session = SessionSlot::new();
+        let code = |e: anyhow::Error, stopped: bool| exit_code_for(&e, None, &session, stopped);
+
+        let cancel = || anyhow::Error::new(CancelledError).context("running //p:a");
+        assert_eq!(code(cancel(), false), 130, "a cancel in the chain");
+        let multi = anyhow::Error::new(hcore::hmemoizer::MultiError(vec![cancel(), cancel()]));
+        assert_eq!(
+            code(multi, false),
+            130,
+            "every member of a MultiError a cancel"
+        );
+        let fail_fast = || {
+            anyhow::Error::new(hcore::hmemoizer::MultiError(vec![
+                anyhow::anyhow!("boom"),
+                cancel(),
+            ]))
+        };
+        assert_eq!(
+            code(fail_fast(), false),
+            1,
+            "a failure, then the siblings --fail-fast stopped"
+        );
+        assert_eq!(
+            code(fail_fast(), true),
+            130,
+            "a failure, the fail-fast stop, then the user's stop"
+        );
+        // A second holder, so the memoizer cannot hand the error back whole.
+        let shared = Arc::new(cancel());
+        let behind = hcore::hmemoizer::unwrap_arc_err(Arc::clone(&shared));
+        assert!(
+            behind.downcast_ref::<CancelledError>().is_none(),
+            "the shared wrapper hides the type from a plain downcast"
+        );
+        assert_eq!(code(behind, false), 130, "a cancel behind SharedAnyhow");
+
+        assert_eq!(
+            code(anyhow::anyhow!("boom"), true),
+            130,
+            "a failure, then a stop"
+        );
+        assert_eq!(
+            code(anyhow::anyhow!("boom"), false),
+            1,
+            "an ordinary failure"
+        );
+    }
+
+    /// `heph tool codegen` keeps 1 for findings and 2 for a failure, but a
+    /// cancel exits 130 there too (I6): a failure that is only a cancel, or
+    /// any end the user stopped.
+    #[test]
+    fn exit_code_for_maps_a_codegen_cancel_to_130() {
+        use heph::commands::tool::codegen::{CodegenExit, wrap_exit};
+        use heph::engine::error::CancelledError;
+        let session = SessionSlot::new();
+        let code = |e: anyhow::Result<()>, stopped: bool| {
+            exit_code_for(&wrap_exit(e).unwrap_err(), None, &session, stopped)
+        };
+        let cancel = || Err(anyhow::Error::new(CancelledError).context("running //p:a"));
+        let boom = || Err(anyhow::anyhow!("boom"));
+        let findings = || Err(CodegenExit::findings().into());
+
+        assert_eq!(code(cancel(), false), 130, "a cancel");
+        assert_eq!(code(boom(), true), 130, "a failure, then a stop");
+        assert_eq!(code(findings(), true), 130, "findings of a stopped check");
+        assert_eq!(code(boom(), false), 2, "a failure");
+        assert_eq!(code(findings(), false), 1, "findings");
+    }
 
     fn soft(args: &[&str]) -> Result<clap::ArgMatches, clap::Error> {
         Cli::command().try_get_matches_from(args)

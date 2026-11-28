@@ -19,6 +19,7 @@ mod common;
 
 mod approval_gate;
 mod archive;
+mod blame;
 mod buildfile_checks;
 mod cache_load;
 mod cache_outcome;

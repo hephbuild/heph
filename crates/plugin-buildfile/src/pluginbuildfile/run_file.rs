@@ -2082,10 +2082,27 @@ impl BuildFileLoader {
             }
             self.loads.evaluation_started();
 
-            let result = Arc::new(
-                eval_file(file_path, pkg, self)
-                    .map_err(|e| eval_diagnostic(&self.root, file_path, e))?,
-            );
+            let result = Arc::new(eval_file(file_path, pkg, self).map_err(|e| {
+                let e = eval_diagnostic(&self.root, file_path, e);
+                // Only the innermost file is typed: a file that failed because
+                // one it loads did is not itself the broken one (its error
+                // already carries the loaded file's, under `load() at …`).
+                if hcore::hmemoizer::downcast_chain_ref::<hplugin::error::FileEvalFailed>(&e)
+                    .is_some()
+                {
+                    return e;
+                }
+                // A file outside the workspace (a load through an absolute or
+                // external path) keeps its absolute path, deliberately: there
+                // is no root-relative name for it, and the absolute one still
+                // tells the user which file broke.
+                let rel = file_path.strip_prefix(&self.root).unwrap_or(file_path);
+                // Nested: its empty frame is then dropped from `{:#}` too
+                // (`write_chain`), so the text reads as the diagnostic's.
+                hcore::hmemoizer::nest(e.context(hplugin::error::FileEvalFailed {
+                    file: Arc::from(rel.to_string_lossy().as_ref()),
+                }))
+            })?);
             self.file_cache
                 .lock()
                 .map_err(|_e| anyhow::anyhow!("file_cache lock poisoned"))?

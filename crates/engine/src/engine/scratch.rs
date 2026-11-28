@@ -342,8 +342,18 @@ impl Engine {
             let spec = Arc::clone(self)
                 .get_spec(rs.clone(), &addr)
                 .await
-                .with_context(|| {
-                    format!("{consumer} references scratch {addr}, which does not resolve")
+                .map_err(|e| {
+                    hplugin::error::MissingDep::wrap_or(
+                        e,
+                        &addr,
+                        consumer,
+                        || crate::engine::deferred::declared_origin(&input.origin_id),
+                        |e| {
+                            e.context(format!(
+                                "{consumer} references scratch {addr}, which does not resolve"
+                            ))
+                        },
+                    )
                 })?;
 
             // A reference to the wrong kind of target is a BUILD-file mistake

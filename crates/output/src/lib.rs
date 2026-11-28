@@ -121,7 +121,12 @@ pub use write::{Flow, ListWriter, Printer, Style};
 /// The version of the output contract `heph version --json` reports as
 /// `output_contract`. It moves only if I3 (a shipped field is never renamed,
 /// removed or retyped) is ever broken.
-pub const OUTPUT_CONTRACT: u32 = 1;
+///
+/// 2: error reporting retyped `inspect failure`'s `addr`, `hashin` and
+/// `failed_at` to nullable, and reshaped `run`: `blocked_by` and the
+/// `blocked` outcome removed, `skipped` added, `addr` nullable, and `file`,
+/// `root`, `more`, `path` and `selected` added.
+pub const OUTPUT_CONTRACT: u32 = 2;
 
 /// A type a command prints as JSON. Implemented by `#[derive(Record)]`.
 pub trait Record {

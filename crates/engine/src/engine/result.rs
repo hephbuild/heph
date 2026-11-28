@@ -3,8 +3,9 @@ use crate::engine::discovery::{Discovery, InProvider};
 use crate::engine::driver::targetdef::{Input, TargetDef};
 use crate::engine::driver::{ApplyTransitiveRequest, ParseRequest, outputartifact};
 use crate::engine::error::{
-    CancelledError, CycleError, HashUnknownError, MultiError, RevisionChangedError,
-    ShellNeedsSingleTarget, TargetFailure, TargetNotFoundError, UpstreamFailed,
+    CancelledError, Culprit, CycleError, FileEvalFailed, HashUnknownError, InputDefFailed,
+    MissingDep, MultiError, RevisionChangedError, ShellNeedsSingleTarget, TargetFailure,
+    TargetNotFoundError, UpstreamFailed,
 };
 use crate::engine::provider::{
     GetError, GetRequest, GetResponse, ListRequest, ProbeRequest, ProviderExecutor, State,
@@ -20,7 +21,7 @@ use hcore::hmemoizer::{downcast_chain_ref, unwrap_arc_err};
 use hmodel::htaddr::Addr;
 use hmodel::htmatcher::MatchResult;
 use hmodel::htpkg::PkgBuf;
-use hplugin::diagnostic::{Boundary, StageContext};
+use hplugin::diagnostic::{Boundary, StageContext, StageFrame};
 
 use crate::engine::driver::sandbox::Sandbox;
 use crate::engine::link::LinkedTargetDef;
@@ -2213,15 +2214,95 @@ fn classify_failure_fresh(
     addr: &Addr,
     e: anyhow::Error,
 ) -> (anyhow::Error, bool) {
-    match failure_fate(addr, &e) {
+    let (culprit, entry) = match failure_fate(addr, &e) {
         FailureFate::Propagate => return (e, false),
+        FailureFate::Cancelled => return (anyhow::Error::new(CancelledError), false),
         FailureFate::Upstream(root) => return (UpstreamFailed { root }.into(), false),
         FailureFate::Shell(shell) => return (anyhow::Error::new(shell.clone()), false),
-        FailureFate::Own => {}
-    }
+        FailureFate::Each {
+            members, culprit, ..
+        } => return classify_each(rs, addr, members, culprit),
+        FailureFate::Blame { culprit, entry } => (culprit, entry.clone()),
+    };
+    let e = match culprit {
+        Culprit::File(_) => first_member(e),
+        Culprit::Target(_) => e,
+    };
+    record_culprit(rs, addr, e, culprit, entry)
+}
 
-    // This target's own failure (or an aggregation of unrecorded causes): record
-    // the rich diagnostic once (first-writer-wins) and propagate a cheap marker.
+/// A keep-going fan-out's aggregate with each member shared, as an
+/// expansion's are (D1.f): the classifier can then hand a member on owned,
+/// recording each against its own culprit, or a broken file's diagnostic
+/// once ([`first_member`]). Anything but a bare aggregate (a sole error,
+/// whatever it wraps) is unchanged.
+fn shared_members(e: anyhow::Error) -> anyhow::Error {
+    // A context over an aggregate is a chain of two: downcasting it by value
+    // would drop the context.
+    if e.chain().nth(1).is_some() {
+        return e;
+    }
+    match e.downcast::<MultiError>() {
+        Ok(multi) => MultiError(
+            multi
+                .0
+                .into_iter()
+                .map(|m| {
+                    if hcore::hmemoizer::is_shared(&m) {
+                        m
+                    } else {
+                        hcore::hmemoizer::nest(m)
+                    }
+                })
+                .collect(),
+        )
+        .into(),
+        Err(e) => e,
+    }
+}
+
+/// A file culprit's error as one member: when `e` aggregates several, every
+/// one blames the file (else [`failure_fate`] would not have), each through
+/// its own entry, and each says the same evaluation error. Recording them all
+/// printed the file's diagnostic once per entry; the first one says it once,
+/// as the record's entry is the first member's. `e` itself when it holds no
+/// aggregate, or when no member can be had owned.
+fn first_member(e: anyhow::Error) -> anyhow::Error {
+    let Some(multi) = downcast_chain_ref::<MultiError>(&e) else {
+        return e;
+    };
+    if let Some(first) = unrecorded(multi).next().and_then(hcore::hmemoizer::share) {
+        return first;
+    }
+    match e.downcast::<MultiError>() {
+        Ok(multi) => {
+            let mut members = multi.0;
+            match members
+                .iter()
+                .position(|m| downcast_chain_ref::<UpstreamFailed>(m).is_none())
+            {
+                Some(i) => members.swap_remove(i),
+                None => MultiError(members).into(),
+            }
+        }
+        Err(e) => e,
+    }
+}
+
+/// Records `e` against `culprit`, entered through `entry`, and returns the
+/// marker naming it, with whether this call's record won the claim.
+fn record_culprit(
+    rs: &RequestState,
+    addr: &Addr,
+    e: anyhow::Error,
+    culprit: Culprit,
+    entry: Addr,
+) -> (anyhow::Error, bool) {
+    // A culprit's failure — this target's own, an input whose def failed, a
+    // declarer naming a missing dep, a BUILD file that did not evaluate:
+    // record the rich diagnostic once against the culprit (first-writer-wins)
+    // and propagate a cheap marker naming it. This target, when it is not the
+    // culprit, is skipped.
     // The log and its tail are always kept (D6.1): whether the output already
     // streamed to the user's terminal is recorded beside them, from what the
     // wrapper wrote, and each renderer decides what to show.
@@ -2232,10 +2313,36 @@ fn classify_failure_fresh(
     let fixes = slot.and_then(|s| s.fixes.clone());
     let sandbox = slot.and_then(|s| s.sandbox.clone());
     let streamed = crate::engine::failure_slot::RunStreamed::on(&e);
+    // Walked before the claim, never under the failures lock (`dep_dag`
+    // stays a leaf). Skipped when another caller already holds the claim:
+    // this record would be dropped.
+    let unclaimed = rs.get_culprit_failure(&culprit).is_none();
+    let path = if unclaimed {
+        rs.culprit_path(&entry)
+    } else {
+        Vec::new()
+    };
+    // A culprit that is not this target has no scope of its own to announce
+    // it (an input whose def failed, a declarer reached through a group or a
+    // transitive dep, a BUILD file): the claim's winner announces it, so
+    // every live view sees the failure once. This target's own failure is
+    // announced by its caller (its scope's end, or `fail_unscoped`).
+    let announce = (unclaimed && !matches!(&culprit, Culprit::Target(c) if c == addr)).then(|| {
+        (
+            crate::engine::event::ErrorDetail::from_error(&e),
+            path.clone(),
+            entry.clone(),
+        )
+    });
     let fresh = rs.record_failure(
-        addr.clone(),
+        culprit.clone(),
         Arc::new(
-            TargetFailure::new(addr.clone(), log_tail, e)
+            TargetFailure::new(entry, log_tail, e)
+                .with_path(path)
+                .with_file(match &culprit {
+                    Culprit::File(file) => Some(Arc::clone(file)),
+                    Culprit::Target(_) => None,
+                })
                 .with_log(log)
                 .with_outputs(outputs)
                 .with_fixes(fixes)
@@ -2243,7 +2350,180 @@ fn classify_failure_fresh(
                 .with_streamed(streamed),
         ),
     );
-    (UpstreamFailed { root: addr.clone() }.into(), fresh)
+    if fresh && let Some((detail, path, entry)) = announce {
+        announce_culprit(rs, &culprit, &entry, detail, &path);
+    }
+    (UpstreamFailed { root: culprit }.into(), fresh)
+}
+
+/// [`FailureFate::Each`]: each culprit's members recorded against it, and a
+/// marker naming the lead `culprit` returned. Fresh when the lead's record
+/// was this call's.
+///
+/// A culprit with one member goes back through the chokepoint, which sees a
+/// strictly smaller error (a member, never this aggregate). One with several
+/// is recorded directly against the culprit, through its first member's
+/// entry, as an aggregate: classifying that aggregate again would ask
+/// [`failure_fate`] the question this call is answering.
+fn classify_each(
+    rs: &RequestState,
+    addr: &Addr,
+    members: &MultiError,
+    lead: Culprit,
+) -> (anyhow::Error, bool) {
+    let mut by_culprit: Vec<(Culprit, Addr, Vec<anyhow::Error>)> = Vec::new();
+    for inner in unrecorded(members) {
+        let Some(owned) = hcore::hmemoizer::share(inner) else {
+            continue;
+        };
+        let (culprit, entry) = blame(addr, inner);
+        match by_culprit.iter_mut().find(|(c, _, _)| *c == culprit) {
+            Some((_, _, errs)) => errs.push(owned),
+            None => by_culprit.push((culprit, entry, vec![owned])),
+        }
+    }
+    let mut fresh = false;
+    for (culprit, entry, mut errs) in by_culprit {
+        let recorded = match errs.pop() {
+            Some(sole) if errs.is_empty() => classify_failure_fresh(rs, addr, sole).1,
+            // A file says its evaluation error once, through its first
+            // member's entry (see `first_member`).
+            Some(last) if matches!(culprit, Culprit::File(_)) => {
+                let first = errs.into_iter().next().unwrap_or(last);
+                record_culprit(rs, addr, first, culprit.clone(), entry).1
+            }
+            last => {
+                errs.extend(last);
+                record_culprit(rs, addr, MultiError(errs).into(), culprit.clone(), entry).1
+            }
+        };
+        if culprit == lead {
+            fresh = recorded;
+        }
+    }
+    (UpstreamFailed { root: lead }.into(), fresh)
+}
+
+/// The event that announces a culprit with no scope of its own, sent once by
+/// the claim's winner: a `FileFailed` for a BUILD file that did not evaluate
+/// (a path never goes in an address field), else a synthetic
+/// `ResultStart`/`ResultEnd` pair for the culprit target, or only the
+/// `ResultEnd` when the target's own scope already opened.
+fn announce_culprit(
+    rs: &RequestState,
+    culprit: &Culprit,
+    entry: &Addr,
+    detail: crate::engine::event::ErrorDetail,
+    path: &[Addr],
+) {
+    use crate::engine::event::BuildEventKind;
+    let path = path.iter().map(Addr::format).collect();
+    match culprit {
+        Culprit::File(file) => rs.emit(BuildEventKind::FileFailed {
+            file: file.to_string(),
+            entry: entry.format(),
+            error: detail.message,
+            path,
+        }),
+        Culprit::Target(addr) => {
+            // A culprit whose own scope already opened (its locked
+            // resolution is done: a target blamed for the `transitive` its
+            // consumer merged, after it built) has its row: a second
+            // `ResultStart` would reopen a row that already ended. Only
+            // the End, which a consumer that missed the failure (the JSON
+            // fold's culprit record) still needs.
+            let opened = rs
+                .data
+                .mem_locked_result
+                .peek(&AddrKey(addr.clone()))
+                .is_some();
+            let addr = addr.format();
+            if !opened {
+                rs.emit(BuildEventKind::ResultStart { addr: addr.clone() });
+            }
+            rs.emit(result_end_event(
+                rs,
+                addr,
+                Some(detail),
+                EndBlame::Culprit { path },
+                None,
+            ));
+        }
+    }
+}
+
+/// A selection's walk failing on a BUILD file that did not evaluate (a
+/// requested target's package probed during matcher resolution): recorded
+/// against the file (U2), through the same registry as every other culprit,
+/// so it is one failure however many requested targets the file holds, and
+/// the run reports it like any other. The record's address is the requested
+/// one that led into the file. Any other walk error, one from a matcher that
+/// names no address (a package pattern), and one from a walk of a package no
+/// named address is in, is returned unchanged.
+fn blame_walk_failure(rs: &RequestState, matcher: &Matcher, e: anyhow::Error) -> anyhow::Error {
+    let Some(file) = downcast_chain_ref::<FileEvalFailed>(&e) else {
+        return e;
+    };
+    if is_stop(&e) {
+        return e;
+    }
+    // The package the walk was scanning: the broken file may be a `.bzl`
+    // it loads, or a parent package's BUILD, anywhere in the tree. The
+    // file's own directory only when the walk did not say (a confirm's
+    // resolution, which names its target's package anyway).
+    // A scanned package no named address is in was walked for a package
+    // pattern: none of them led into the file.
+    let (pkg, any) = match downcast_chain_ref::<crate::engine::discovery::WalkedPackage>(&e) {
+        Some(w) => (w.package.as_str(), false),
+        None => (
+            std::path::Path::new(&*file.file)
+                .parent()
+                .and_then(std::path::Path::to_str)
+                .unwrap_or(""),
+            true,
+        ),
+    };
+    let Some(entry) = walk_entry(matcher, pkg, any) else {
+        return e;
+    };
+    // Named by the selection, so requested though its match never resolved:
+    // the record's path is `[entry]`.
+    rs.mark_requested(&entry);
+    classify_failure_fresh(rs, &entry, e).0
+}
+
+/// The matcher's first named address in package `pkg`, else (when `any`)
+/// its first named address: what a failed walk of `pkg` was resolving for.
+fn walk_entry(matcher: &Matcher, pkg: &str, any: bool) -> Option<Addr> {
+    fn named<'m>(m: &'m Matcher, out: &mut Vec<&'m Addr>) {
+        match m {
+            Matcher::Addr(a) => out.push(a),
+            Matcher::Or(ms) | Matcher::And(ms) => ms.iter().for_each(|m| named(m, out)),
+            Matcher::Not(_)
+            | Matcher::Label(_)
+            | Matcher::Driver(_)
+            | Matcher::Package(_)
+            | Matcher::PackagePrefix(_)
+            | Matcher::TreeOutputTo(_) => {}
+        }
+    }
+    let mut addrs = Vec::new();
+    named(matcher, &mut addrs);
+    addrs
+        .iter()
+        .find(|a| a.package.as_str() == pkg)
+        .or_else(|| addrs.first().filter(|_| any))
+        .map(|a| (*a).clone())
+}
+
+/// The address a collateral end names as `upstream_of` for `root`: the
+/// culprit target, or for a file the address that led into it (read from
+/// its record). A path never goes in an address field.
+fn upstream_addr(rs: &RequestState, root: &Culprit) -> Option<String> {
+    match root {
+        Culprit::Target(addr) => Some(addr.format()),
+        Culprit::File(_) => rs.get_culprit_failure(root).map(|f| f.addr.format()),
+    }
 }
 
 /// `addr`'s `ResultEnd`, for its result scope and for a failure
@@ -2257,12 +2537,22 @@ fn result_end_event(
     rs: &RequestState,
     addr: String,
     error: Option<crate::engine::event::ErrorDetail>,
-    upstream_of: Option<String>,
+    blame: EndBlame,
     log_readable: Option<bool>,
 ) -> crate::engine::event::BuildEventKind {
     match error {
         Some(mut d) => {
-            d.upstream_of = upstream_of;
+            d.upstream_of = None;
+            let duplicate = matches!(blame, EndBlame::Duplicate { .. });
+            let (upstream_file, path) = match blame {
+                EndBlame::Unknown => (None, Vec::new()),
+                EndBlame::Duplicate { file } => (file, Vec::new()),
+                EndBlame::Skipped { of, file } => {
+                    d.upstream_of = Some(of);
+                    (file, Vec::new())
+                }
+                EndBlame::Culprit { path } => (None, path),
+            };
             let cancelled = rs.end_is_cancelled(&addr, &d);
             // The final report's `took down:` row reads the same
             // `upstream_of` the event carries.
@@ -2275,6 +2565,8 @@ fn result_end_event(
                 addr,
                 error: Some(d.message),
                 upstream_of: d.upstream_of,
+                upstream_file,
+                path,
                 exit_status: d.exit_status,
                 exit_code: d.exit_code,
                 log_tail: crate::engine::event::ErrorDetail::result_log_tail(
@@ -2284,20 +2576,89 @@ fn result_end_event(
                 ),
                 timed_out: d.timed_out,
                 cancelled,
+                duplicate: duplicate && !cancelled,
                 left_behind: left_behind(d.left_behind, log_readable),
             }
         }
         None => crate::engine::event::BuildEventKind::ResultEnd {
             cancelled: false,
+            duplicate: false,
             addr,
             error: None,
             upstream_of: None,
+            upstream_file: None,
+            path: Vec::new(),
             exit_status: None,
             exit_code: None,
             log_tail: None,
             timed_out: None,
             left_behind: None,
         },
+    }
+}
+
+/// What a failed `ResultEnd` says about blame, decided by [`failure_fate`]
+/// when the scope fails (D1.e): a skipped end names its root and never a
+/// path; a culprit's own end carries its path from a requested target.
+#[derive(Debug, Default)]
+enum EndBlame {
+    /// Neither (a stop, a cycle, a request-shape error, or a success).
+    #[default]
+    Unknown,
+    /// Skipped because `of` failed: the culprit target, or the address that
+    /// led into `file`, a BUILD file that did not evaluate.
+    Skipped { of: String, file: Option<String> },
+    /// This end is the culprit's: the shortest path from a requested target,
+    /// inclusive.
+    Culprit { path: Vec<String> },
+    /// A culprit's own end that lost the claim (another end, a synthetic
+    /// pair or a `FileFailed` announced the culprit first): it closes the
+    /// row, flagged so no consumer boxes or counts it (D1.d). `file` is set
+    /// when the culprit is a BUILD file `addr` itself lives in: the end
+    /// names it in `upstream_file`, so a consumer can tell the target was
+    /// skipped because of its own file.
+    Duplicate { file: Option<String> },
+}
+
+impl EndBlame {
+    /// The end `fate` gives `addr`. Walks the request's `DepDag` for a
+    /// culprit's path: never call it holding the failures lock.
+    fn of(rs: &RequestState, addr: &Addr, fate: &FailureFate<'_>) -> Self {
+        match fate {
+            FailureFate::Upstream(root) => match upstream_addr(rs, root) {
+                Some(of) => Self::Skipped {
+                    of,
+                    file: root.file().map(str::to_owned),
+                },
+                None => Self::Unknown,
+            },
+            FailureFate::Blame { culprit, entry } | FailureFate::Each { culprit, entry, .. }
+                if entry != addr =>
+            {
+                Self::Skipped {
+                    of: entry.format(),
+                    file: culprit.file().map(str::to_owned),
+                }
+            }
+            // A broken file reached through `addr` itself: the file's box is
+            // its `FileFailed`, announced by the claim's winner.
+            FailureFate::Blame {
+                culprit: Culprit::File(file),
+                ..
+            }
+            | FailureFate::Each {
+                culprit: Culprit::File(file),
+                ..
+            } => Self::Duplicate {
+                file: Some(file.to_string()),
+            },
+            FailureFate::Blame { .. } | FailureFate::Each { .. } => Self::Culprit {
+                path: rs.culprit_path_strings(addr),
+            },
+            FailureFate::Propagate | FailureFate::Cancelled | FailureFate::Shell(_) => {
+                Self::Unknown
+            }
+        }
     }
 }
 
@@ -2308,13 +2669,102 @@ enum FailureFate<'a> {
     /// Not a target's failure (a stop, a cycle, a request-shape error):
     /// propagated unchanged, never recorded.
     Propagate,
+    /// A stop inside an aggregate: surfaced as a fresh `CancelledError`, so
+    /// a Ctrl-C during deps never reads as a failure of this target.
+    Cancelled,
     /// Collateral: a fresh marker naming the root, never recorded.
-    Upstream(Addr),
+    Upstream(Culprit),
     /// A request-shape error aggregated with its identical siblings,
     /// surfaced alone.
     Shell(&'a ShellNeedsSingleTarget),
-    /// This target's own failure: recorded.
-    Own,
+    /// A culprit's failure: recorded against `culprit`, with `entry` as the
+    /// record's address (the culprit target, or for a file the address that
+    /// led into it). This target's own when `culprit` is `Target(addr)`;
+    /// otherwise this target is skipped.
+    Blame { culprit: Culprit, entry: Addr },
+    /// An expansion's failures (D1.f) blaming several culprits: each member
+    /// is recorded against its own, those sharing one together. `culprit`
+    /// and `entry` are the lead's, which this target's end reads as it
+    /// would a `Blame`'s: this target's own when one member blames it, else
+    /// the first member's.
+    Each {
+        members: &'a MultiError,
+        culprit: Culprit,
+        entry: Addr,
+    },
+}
+
+impl FailureFate<'_> {
+    /// Whether this target is itself the culprit.
+    fn is_own(&self, addr: &Addr) -> bool {
+        matches!(
+            self,
+            Self::Blame { culprit: Culprit::Target(c), .. }
+                | Self::Each { culprit: Culprit::Target(c), .. } if c == addr
+        )
+    }
+}
+
+/// The members of an aggregate that are not already a recorded marker.
+fn unrecorded(multi: &MultiError) -> impl Iterator<Item = &anyhow::Error> {
+    multi
+        .0
+        .iter()
+        .filter(|inner| downcast_chain_ref::<UpstreamFailed>(inner).is_none())
+}
+
+/// A stop: a `CancelledError` on the chain, or inside any member of an
+/// aggregate on it.
+fn is_stop(e: &anyhow::Error) -> bool {
+    downcast_chain_ref::<CancelledError>(e).is_some()
+        || downcast_chain_ref::<MultiError>(e).is_some_and(|m| m.0.iter().any(is_stop))
+}
+
+/// The culprit of a failure that is not a marker, a stop or a request
+/// error (D1.c rules 4–6), and the address its record carries.
+///
+/// Walks every frame of the chain, outermost first, through the memoizer's
+/// shared wrappers ([`hcore::hmemoizer::frames`]; an aggregate's members are
+/// not entered), and keeps the innermost frame of each kind:
+/// - a [`MissingDep`] blames its declarer;
+/// - else the innermost [`InputDefFailed`] input, or `get spec:` /
+///   `get_def:` [`StageFrame`] address, is the target whose own spec or def
+///   raised the error — or, when a [`FileEvalFailed`] is on the chain, that
+///   file, entered through it;
+/// - else the error is `addr`'s own (or its file's, for a requested target
+///   in a BUILD file that did not evaluate).
+///
+/// Only the spec and def boundaries name whose error it is: `link`, `meta`,
+/// `execute` and `run` frames are added by the target doing the work, over
+/// errors that may be an input's, which the frames above already name.
+fn blame(addr: &Addr, e: &anyhow::Error) -> (Culprit, Addr) {
+    let mut missing: Option<&MissingDep> = None;
+    let mut frame: Option<&Addr> = None;
+    let mut file: Option<&FileEvalFailed> = None;
+    for f in hcore::hmemoizer::frames(e) {
+        if let Some(m) = f.downcast_ref::<MissingDep>() {
+            missing = Some(m);
+        }
+        if let Some(i) = f.downcast_ref::<InputDefFailed>() {
+            frame = Some(&i.input);
+        }
+        if let Some(s) = f.downcast_ref::<StageFrame>()
+            && matches!(s.boundary, Boundary::GetSpec | Boundary::GetDef)
+        {
+            frame = Some(&s.addr);
+        }
+        if let Some(x) = f.downcast_ref::<FileEvalFailed>() {
+            file = Some(x);
+        }
+    }
+    if let Some(m) = missing {
+        return (Culprit::Target(m.declarer.clone()), m.declarer.clone());
+    }
+    let entry = frame.unwrap_or(addr).clone();
+    match file {
+        Some(f) => (Culprit::File(Arc::clone(&f.file)), entry),
+        None => (Culprit::Target(entry.clone()), entry),
+    }
 }
 
 fn failure_fate<'a>(addr: &Addr, e: &'a anyhow::Error) -> FailureFate<'a> {
@@ -2327,7 +2777,11 @@ fn failure_fate<'a>(addr: &Addr, e: &'a anyhow::Error) -> FailureFate<'a> {
     // of the cycle, not a single target's own work failing. Propagate unchanged
     // so the cycle surfaces directly to the caller (and never gets masked behind
     // an `UpstreamFailed` marker or duplicated into the failure registry).
-    if downcast_chain_ref::<CycleError>(e).is_some() {
+    // Looked for through the walker, so a cycle that rides one member of an
+    // aggregate (keep-going, beside another failing input) is found too:
+    // regrouping that aggregate into culprits would record the cycle as a
+    // target's failure, or drop it.
+    if hcore::hmemoizer::find::<CycleError>(e).is_some() {
         return FailureFate::Propagate;
     }
 
@@ -2354,14 +2808,7 @@ fn failure_fate<'a>(addr: &Addr, e: &'a anyhow::Error) -> FailureFate<'a> {
         return FailureFate::Upstream(uf.root.clone());
     }
 
-    // Aggregation of child failures. If *every* child is already a recorded
-    // collateral marker (or a cancellation), the real root causes live in the
-    // registry downstream — this target has no own work to blame, so collapse to
-    // a cheap marker without recording. But if any child is a genuine,
-    // unrecorded cause (e.g. a `TargetNotFound` raised while resolving an input's
-    // def in `link`/`meta`, which never passes through `result_addr`), fall
-    // through and record the whole aggregation against this target so the detail
-    // (every broken input) isn't lost.
+    // Aggregation of child failures.
     if let Some(multi) = downcast_chain_ref::<MultiError>(e) {
         // A request-shape error aggregated with `fail_fast = false` is still a
         // request error, not this target's failure. Surface it alone: every
@@ -2371,23 +2818,61 @@ fn failure_fate<'a>(addr: &Addr, e: &'a anyhow::Error) -> FailureFate<'a> {
                 return FailureFate::Shell(shell);
             }
         }
-        let all_collateral = multi.0.iter().all(|inner| {
-            downcast_chain_ref::<UpstreamFailed>(inner).is_some()
-                || downcast_chain_ref::<CancelledError>(inner).is_some()
-        });
-        if all_collateral {
-            let root = multi
-                .0
-                .iter()
-                .find_map(|inner| {
-                    downcast_chain_ref::<UpstreamFailed>(inner).map(|u| u.root.clone())
-                })
-                .unwrap_or_else(|| addr.clone());
-            return FailureFate::Upstream(root);
+        // A stop among them is a stop (rule 1, RUN-22): never a failure
+        // this target is blamed for, nor collateral naming itself.
+        if multi.0.iter().any(is_stop) {
+            return FailureFate::Cancelled;
         }
+        // Every child already a recorded marker: the real causes live in the
+        // registry downstream, so collapse to a cheap marker naming one.
+        let markers: Option<Vec<&Culprit>> = multi
+            .0
+            .iter()
+            .map(|inner| downcast_chain_ref::<UpstreamFailed>(inner).map(|u| &u.root))
+            .collect();
+        if let Some(first) = markers.and_then(|m| m.first().copied().cloned()) {
+            return FailureFate::Upstream(first);
+        }
+        // Unrecorded causes (an input's def failing in `link`/`meta`, which
+        // never passes through its `result_addr`): when every one of them
+        // blames the same culprit, that culprit, entered through the first
+        // member's entry; otherwise the aggregation is recorded against this
+        // target, so no broken input is lost. Culprits alone are compared:
+        // one broken file reached through two of its targets is one culprit
+        // with two entries, and comparing entries too sent it to `Each`,
+        // whose regrouping met the same aggregate again.
+        let mut blamed = unrecorded(multi).map(|inner| blame(addr, inner));
+        if let Some(first) = blamed.next()
+            && blamed.all(|(culprit, _)| culprit == first.0)
+        {
+            let (culprit, entry) = first;
+            return FailureFate::Blame { culprit, entry };
+        }
+        // An expansion's members are shared (D1.f), so each can be recorded
+        // against its own culprit; the lead is this target when one of them
+        // blames it.
+        if unrecorded(multi).all(hcore::hmemoizer::is_shared) {
+            let mut blamed = unrecorded(multi).map(|inner| blame(addr, inner));
+            if let Some(first) = blamed.next() {
+                let own = std::iter::once(first.clone())
+                    .chain(blamed)
+                    .find(|(c, _)| matches!(c, Culprit::Target(t) if t == addr));
+                let (culprit, entry) = own.unwrap_or(first);
+                return FailureFate::Each {
+                    members: multi,
+                    culprit,
+                    entry,
+                };
+            }
+        }
+        return FailureFate::Blame {
+            culprit: Culprit::Target(addr.clone()),
+            entry: addr.clone(),
+        };
     }
 
-    FailureFate::Own
+    let (culprit, entry) = blame(addr, e);
+    FailureFate::Blame { culprit, entry }
 }
 
 /// `ResultEnd`'s `left_behind`: what the failure slot holds, plus whether the
@@ -2431,7 +2916,9 @@ fn failure_slot_out(e: &anyhow::Error) -> Option<std::path::PathBuf> {
 /// instead, so this is purely about the value returned to direct callers. No-op
 /// for inner frames and for non-marker errors (cancellation, cycles, …).
 fn surface_top(is_top: bool, rs: &RequestState, e: anyhow::Error) -> anyhow::Error {
-    if !is_top {
+    // A cycle in an aggregate is propagated as itself (see `failure_fate`),
+    // so it is not a marker to swap for a recorded failure either.
+    if !is_top || hcore::hmemoizer::find::<CycleError>(&e).is_some() {
         return e;
     }
     let is_marker = downcast_chain_ref::<UpstreamFailed>(&e).is_some()
@@ -2441,7 +2928,7 @@ fn surface_top(is_top: bool, rs: &RequestState, e: anyhow::Error) -> anyhow::Err
     }
     // Prefer the rich failure for the marker's named root.
     if let Some(tf) =
-        downcast_chain_ref::<UpstreamFailed>(&e).and_then(|uf| rs.get_failure(&uf.root))
+        downcast_chain_ref::<UpstreamFailed>(&e).and_then(|uf| rs.get_culprit_failure(&uf.root))
     {
         return anyhow::Error::new((*tf).clone());
     }
@@ -2481,16 +2968,41 @@ impl Engine {
     /// printed. When it is this target's own and this call recorded it, it
     /// gets the `ResultStart`/`ResultEnd` pair the scope would have emitted;
     /// a failure another caller recorded first was announced by that caller.
+    ///
+    /// A requested target (`is_top`) skipped because of another culprit (a
+    /// dependency's broken BUILD file, a group member's failure) gets the
+    /// pair too, with the skipped end its scope would have had: every
+    /// requested target ends (D5). Only the top frame announces it, so a
+    /// dependency reached by many callers is not announced once per caller.
     async fn fail_unscoped(
         self: &Arc<Self>,
         rs: &RequestState,
         addr: &Addr,
         e: anyhow::Error,
+        is_top: bool,
     ) -> anyhow::Error {
-        let detail = matches!(failure_fate(addr, &e), FailureFate::Own)
-            .then(|| crate::engine::event::ErrorDetail::from_error(&e));
+        // Announced here when it is this target's own failure. Any other
+        // culprit (an input whose def failed, a BUILD file that did not
+        // evaluate) is announced by `classify_failure_fresh`'s winner.
+        let fate = failure_fate(addr, &e);
+        let own = fate.is_own(addr);
+        let skipped = match (is_top && !own).then(|| EndBlame::of(rs, addr, &fate)) {
+            Some(end @ EndBlame::Skipped { .. }) => Some(end),
+            _ => None,
+        };
+        let detail =
+            (own || skipped.is_some()).then(|| crate::engine::event::ErrorDetail::from_error(&e));
         let (e, fresh) = classify_failure_fresh(rs, addr, e);
-        if let Some(detail) = detail
+        if let Some(end) = skipped
+            && let Some(detail) = detail
+        {
+            let addr_str = addr.format();
+            rs.emit(crate::engine::event::BuildEventKind::ResultStart {
+                addr: addr_str.clone(),
+            });
+            rs.emit(result_end_event(rs, addr_str, Some(detail), end, None));
+        } else if let Some(detail) = detail
+            && own
             && fresh
         {
             let addr_str = addr.format();
@@ -2498,11 +3010,12 @@ impl Engine {
                 addr: addr_str.clone(),
             });
             let readable = self.log_readable(addr).await;
+            let path = rs.culprit_path_strings(addr);
             rs.emit(result_end_event(
                 rs,
                 addr_str,
                 Some(detail),
-                None,
+                EndBlame::Culprit { path },
                 Some(readable),
             ));
         }
@@ -2546,6 +3059,8 @@ impl Engine {
         // result_addr calls under a batch `result` (which already claimed) — only
         // a genuine top-level single addr wins the claim here.
         if rs.claim_matched_stream() {
+            // Where a failure's path starts (D1.e).
+            rs.mark_requested(addr);
             rs.emit(crate::engine::event::BuildEventKind::Matched {
                 addrs: vec![addr.format()],
                 complete: true,
@@ -2582,7 +3097,7 @@ impl Engine {
         let def = match Arc::clone(&self).get_def_no_track(rs.clone(), addr).await {
             Ok(def) => def,
             Err(e) => {
-                let e = self.fail_unscoped(&rs, addr, e).await;
+                let e = self.fail_unscoped(&rs, addr, e, is_top).await;
                 return Err(surface_top(is_top, &rs, e));
             }
         };
@@ -2684,7 +3199,7 @@ impl Engine {
                 match crate::engine::fanout::join_all_failable(futures, rs.fail_fast()).await {
                     Ok(results) => results,
                     Err(e) => {
-                        let e = self.fail_unscoped(&rs, addr, e).await;
+                        let e = self.fail_unscoped(&rs, addr, e, is_top).await;
                         return Err(surface_top(is_top, &rs, e));
                     }
                 };
@@ -3026,6 +3541,8 @@ impl Engine {
                                 // render a provisional "done X / ~N" that grows while
                                 // the matcher streams.
                                 if owns_matched {
+                                    // Where a failure's path starts (D1.e).
+                                    rs.mark_requested(&addr);
                                     rs.emit(crate::engine::event::BuildEventKind::Matched {
                                         addrs: vec![addr.format()],
                                         complete: false,
@@ -3064,9 +3581,10 @@ impl Engine {
             let addr = match next {
                 Ok(addr) => addr,
                 // The matcher walk itself failed. Stop enqueuing, signal the
-                // already-spawned targets, and fall through to the drain.
+                // already-spawned targets, and fall through to the drain. A
+                // broken BUILD file is the file's failure, recorded as one.
                 Err(e) => {
-                    fatal = Some(e);
+                    fatal = Some(blame_walk_failure(&rs, matcher, e));
                     rs.ctoken().cancel();
                     break;
                 }
@@ -3190,6 +3708,18 @@ impl Engine {
             walk.abort();
         }
 
+        // Keep-going's counterpart of the failed walk's blame: a named package
+        // whose BUILD file did not evaluate is the file's failure, not a gap.
+        if walk_finished
+            && fatal.is_none()
+            && let Some(gaps) = opts.discovery.gaps()
+        {
+            let blamed = Arc::clone(&self)
+                .blame_gapped_files(&rs, matcher, gaps, owns_matched)
+                .await;
+            errors.extend(blamed);
+        }
+
         // Matcher fully resolved: mark the matched set final (drops the `~`).
         // Not on a failed walk — the set never became final, so claiming it did
         // would paint a wrong denominator over an aborting run.
@@ -3224,6 +3754,80 @@ impl Engine {
         }
 
         Ok(BatchResult { ok, errors })
+    }
+
+    /// Keep-going's counterpart of [`blame_walk_failure`] (U2, D5).
+    ///
+    /// A selection that names its targets by address only (`//d:t1
+    /// //d:t2`), whose walk could not probe a named package because a BUILD
+    /// file did not evaluate, recorded that package as a gap, and nothing in
+    /// it ran. Every named address there is the file's. The file is recorded
+    /// once, entered through the first of them, and announced as
+    /// `FileFailed`. Each address is matched and ends as a target of a broken
+    /// file does when it is built: a duplicate end naming the file. The
+    /// package is then accounted for, so its gap is withdrawn.
+    ///
+    /// Any other gap is left as the walk recorded it, and so is every gap of
+    /// a selection that names a label or a package: what else the package
+    /// held is unknown. Returns each blamed address with its marker, for the
+    /// batch's errors. The probe is memoized, so this evaluates nothing the
+    /// walk did not.
+    async fn blame_gapped_files(
+        self: Arc<Self>,
+        rs: &Arc<RequestState>,
+        matcher: &Matcher,
+        gaps: &crate::engine::discovery::Gaps,
+        owns_matched: bool,
+    ) -> Vec<(Addr, anyhow::Error)> {
+        fn named_only(m: &Matcher, out: &mut Vec<Addr>) -> bool {
+            match m {
+                Matcher::Addr(a) => {
+                    out.push(a.clone());
+                    true
+                }
+                Matcher::Or(ms) => ms.iter().all(|m| named_only(m, out)),
+                _ => false,
+            }
+        }
+        use crate::engine::event::{BuildEventKind, ErrorDetail};
+        let mut named = Vec::new();
+        if gaps.is_empty() || rs.ctoken().is_cancelled() || !named_only(matcher, &mut named) {
+            return Vec::new();
+        }
+        let mut seen = rustc_hash::FxHashSet::default();
+        let mut blamed = Vec::new();
+        for addr in named {
+            if !seen.insert(addr.clone()) {
+                continue;
+            }
+            let Err(e) = Arc::clone(&self).probe_segments(rs, &addr.package).await else {
+                continue;
+            };
+            if is_stop(&e) || hcore::hmemoizer::find::<FileEvalFailed>(&e).is_none() {
+                continue;
+            }
+            let addr_str = addr.format();
+            rs.mark_requested(&addr);
+            if owns_matched {
+                rs.emit(BuildEventKind::Matched {
+                    addrs: vec![addr_str.clone()],
+                    complete: false,
+                });
+            }
+            rs.emit(BuildEventKind::ResultStart {
+                addr: addr_str.clone(),
+            });
+            let detail = ErrorDetail::from_error(&e);
+            let end = EndBlame::of(rs, &addr, &failure_fate(&addr, &e));
+            let (marker, _) = classify_failure_fresh(rs, &addr, e);
+            rs.emit(result_end_event(rs, addr_str, Some(detail), end, None));
+            gaps.withdraw(
+                crate::engine::discovery::Stage::Probe,
+                &format!("//{}", addr.package),
+            );
+            blamed.push((addr, marker));
+        }
+        blamed
     }
 
     /// Scope this request's `--force` / `--no-scratch` to `matcher`. See
@@ -3272,10 +3876,12 @@ impl Engine {
         // never for collateral (a marker, thousands of them).
         let readable: Arc<std::sync::OnceLock<bool>> = Arc::default();
         let end_readable = Arc::clone(&readable);
-        // The root a collateral failure names, decided by the classifier's
-        // own rule when the scope fails, before its end is built.
-        let upstream: Arc<std::sync::OnceLock<String>> = Arc::default();
-        let end_upstream = Arc::clone(&upstream);
+        // The root a collateral failure names, or a culprit's path, decided
+        // by the classifier's own rule when the scope fails, before its end
+        // is built.
+        let blame: Arc<parking_lot::Mutex<EndBlame>> = Arc::default();
+        let end_blame = Arc::clone(&blame);
+        let fate_rs = Arc::clone(&rs);
         let log_engine = Arc::clone(&self);
         crate::engine::event::emit_scope_with(
             &rs,
@@ -3287,25 +3893,32 @@ impl Engine {
             // (root vs collateral), the exit status, the log tail and a timeout
             // belong.
             move |error| {
-                result_end_event(
-                    &end_rs,
-                    addr_str,
-                    error,
-                    end_upstream.get().cloned(),
-                    end_readable.get().copied(),
-                )
+                let blame = std::mem::take(&mut *end_blame.lock());
+                result_end_event(&end_rs, addr_str, error, blame, end_readable.get().copied())
             },
             |e| {
-                let fate = failure_fate(addr, e);
-                if let FailureFate::Upstream(root) = &fate {
-                    // Set once: this scope ends once.
-                    let _first: Result<(), String> = upstream.set(root.format());
-                }
-                matches!(fate, FailureFate::Own).then(|| async move {
+                let fate = failure_fate(addr, &e);
+                // A skipped target names its culprit's address (the culprit
+                // target, or the address that led into a broken file, with
+                // the file beside it); a culprit's own end, its path.
+                let end = EndBlame::of(&fate_rs, addr, &fate);
+                let own = fate.is_own(addr);
+                // Classified here, inside the scope, so its end knows whether
+                // this scope won the culprit's claim (D1.d): a culprit's own
+                // end that lost it (another scope of the same target, or a
+                // dependent that announced it first) closes non-announcing.
+                let (e, fresh) = classify_failure_fresh(&fate_rs, addr, e);
+                *blame.lock() = if own && !fresh {
+                    EndBlame::Duplicate { file: None }
+                } else {
+                    end
+                };
+                let more = (own && fresh).then_some(async move {
                     // Set once: this scope ends once.
                     let _first: Result<(), bool> =
                         readable.set(log_engine.log_readable(addr).await);
-                })
+                });
+                (e, more)
             },
             async {
                 // Use _no_track: result_addr set parent=addr before entering the memoizer,
@@ -6242,7 +6855,7 @@ impl Engine {
 
         let all_transitive = if apply_transitive {
             let sb = Arc::clone(&self)
-                .collect_transitive_deps(rs.clone(), &def.inputs)
+                .collect_transitive_deps(rs.clone(), addr, &def.inputs)
                 .await?;
 
             if sb.empty() { None } else { Some(sb) }
@@ -6381,6 +6994,7 @@ impl Engine {
     async fn collect_transitive_deps(
         self: Arc<Self>,
         rs: Arc<RequestState>,
+        declarer: &Addr,
         inputs: &[Input],
     ) -> anyhow::Result<Sandbox> {
         // Hash-only inputs (`hash_deps`) don't participate in the runtime
@@ -6404,10 +7018,19 @@ impl Engine {
             .map(|(i, input)| {
                 let input_ref = &input.r#ref;
                 enclose!((self => engine, rs) async move {
+                    let dep = &input_ref.r#ref;
                     let spec = Arc::clone(&engine)
-                        .get_spec(rs.clone(), &input_ref.r#ref)
+                        .get_spec(rs.clone(), dep)
                         .await
-                        .with_context(|| format!("get spec: {}", input_ref))?;
+                        .map_err(|e| {
+                            MissingDep::wrap_or(
+                                e,
+                                dep,
+                                declarer,
+                                || crate::engine::deferred::declared_origin(&input.origin_id),
+                                |e| hplugin::diagnostic::with_stage(e, Boundary::GetSpec, dep),
+                            )
+                        })?;
 
                     // For transparent targets (groups), use the pre-computed applied_transitive
                     // which already recursively aggregates all nested deps' transitives.
@@ -6439,7 +7062,12 @@ impl Engine {
                     if let Some(transitive) = transitive {
                         // `hash_str` digests the whole addr and formats it, so build
                         // the id only once something will actually merge under it.
-                        let id = format!("_transitive_{}_{}", spec.addr.hash_str(), i);
+                        let hash = spec.addr.hash_str();
+                        // The reverse lookup a failure of a merged input
+                        // blames its real declarer through; the id itself,
+                        // which reaches the def hash, is unchanged.
+                        rs.note_transitive_declarer(&hash, &spec.addr);
+                        let id = crate::engine::expand::transitive_id(&hash, i);
                         anyhow::Ok(Some((id, transitive)))
                     } else {
                         anyhow::Ok(None)
@@ -6447,7 +7075,9 @@ impl Engine {
                 })
             });
 
-        let results = crate::engine::fanout::join_all_failable(futures, rs.fail_fast()).await?;
+        let results = crate::engine::fanout::join_all_failable(futures, rs.fail_fast())
+            .await
+            .map_err(shared_members)?;
 
         let mut sb = Sandbox::default();
         for (id, transitive) in results.into_iter().flatten() {
@@ -6691,6 +7321,305 @@ fn rewrite_query_inputs(
         }
     }
     def
+}
+
+/// [`failure_fate`]'s rule order (D1.c) and the D1.b adversarial table, on
+/// chains built the way the engine's sites build them (`MissingDep::wrap_or`
+/// with an `InputDefFailed` fallback, one memoizer level per `get_def`).
+///
+/// Below every non-test item, as the file's other test modules are:
+/// `tests/root/cache_tier_gate.rs` reads a file's production code as what
+/// comes before its first `#[cfg(test)] mod`.
+#[cfg(test)]
+mod failure_fate_tests {
+    use super::*;
+    use hcore::hmemoizer::unwrap_arc_err;
+
+    fn a(s: &str) -> Addr {
+        hmodel::htaddr::parse_addr(s).expect("addr")
+    }
+
+    fn not_found(dep: &str) -> anyhow::Error {
+        TargetNotFoundError { addr: a(dep) }.into()
+    }
+
+    /// What `input_defs` makes of `e`, the def failure of `input` declared
+    /// by `declarer` under `origin`.
+    fn at_input(e: anyhow::Error, input: &str, declarer: &str, origin: &str) -> anyhow::Error {
+        let (input, declarer) = (a(input), a(declarer));
+        MissingDep::wrap_or(
+            e,
+            &input,
+            &declarer,
+            || origin.to_owned(),
+            |e| {
+                e.context(InputDefFailed {
+                    input: input.clone(),
+                    declarer: declarer.clone(),
+                    origin_id: origin.to_owned(),
+                })
+            },
+        )
+    }
+
+    /// `e` handed back through a memoizer cell another waiter also holds.
+    fn shared(e: anyhow::Error) -> (anyhow::Error, Arc<anyhow::Error>) {
+        let arc = Arc::new(e);
+        let other = Arc::clone(&arc);
+        (unwrap_arc_err(arc), other)
+    }
+
+    fn broken_file(file: &str) -> anyhow::Error {
+        anyhow::anyhow!("fail: boom").context(FileEvalFailed {
+            file: Arc::from(file),
+        })
+    }
+
+    #[track_caller]
+    fn blamed(addr: &str, e: &anyhow::Error) -> (Culprit, Addr) {
+        match failure_fate(&a(addr), e) {
+            FailureFate::Blame { culprit, entry } => (culprit, entry),
+            FailureFate::Propagate => panic!("propagated: {e:#}"),
+            FailureFate::Cancelled => panic!("cancelled: {e:#}"),
+            FailureFate::Upstream(root) => panic!("upstream of {root}: {e:#}"),
+            FailureFate::Shell(_) => panic!("shell: {e:#}"),
+            FailureFate::Each { culprit, .. } => panic!("each, led by {culprit}: {e:#}"),
+        }
+    }
+
+    #[track_caller]
+    fn blames_target(addr: &str, e: &anyhow::Error, culprit: &str) {
+        let (c, entry) = blamed(addr, e);
+        assert_eq!(c, Culprit::Target(a(culprit)), "{e:#}");
+        assert_eq!(entry, a(culprit), "{e:#}");
+    }
+
+    // --- D1.b: who a not-found blames ---------------------------------------
+
+    /// `//c:y` declares `//d:missing`; `d/BUILD` evaluates.
+    #[test]
+    fn d1b_attribution_declarer_of_missing_dep() {
+        let e = at_input(not_found("//d:missing"), "//d:missing", "//c:y", "deps");
+        let e = at_input(e, "//c:y", "//b:x", "deps");
+        let e = at_input(e, "//b:x", "//a:root", "deps");
+        blames_target("//a:root", &e, "//c:y");
+        let m = downcast_chain_ref::<MissingDep>(&e).expect("a MissingDep");
+        assert_eq!(m.dep, a("//d:missing"));
+    }
+
+    /// `//c:y` → `//d:t`, which declares `//e:missing`: `//d:t`.
+    #[test]
+    fn d1b_attribution_deeper_declarer() {
+        let e = at_input(not_found("//e:missing"), "//e:missing", "//d:t", "deps");
+        let e = at_input(e, "//d:t", "//c:y", "deps");
+        blames_target("//c:y", &e, "//d:t");
+    }
+
+    /// The same, `//d:t`'s failure reaching `//c:y` through a memoizer cell
+    /// shared with another waiter (`SharedAnyhow`): still `//d:t`.
+    #[test]
+    fn d1b_attribution_shared_anyhow_flattened() {
+        let e = at_input(not_found("//e:missing"), "//e:missing", "//d:t", "deps");
+        let (e, _other) = shared(e);
+        let e = at_input(e, "//d:t", "//c:y", "deps");
+        let (e, _other2) = shared(e);
+        blames_target("//c:y", &e, "//d:t");
+    }
+
+    /// `//c:y` declares `//p:ab`; the not-found raised deeper names `//p:a`
+    /// (declared by `//p:ab`): never `//c:y`.
+    #[test]
+    fn d1b_attribution_near_miss_name() {
+        let e = at_input(not_found("//p:a"), "//p:a", "//p:ab", "deps");
+        let e = at_input(e, "//p:ab", "//c:y", "deps");
+        blames_target("//c:y", &e, "//p:ab");
+        // A not-found of `//p:a` is not one of `//p:ab`, even with no
+        // declarer of its own on the chain.
+        let e = at_input(not_found("//p:a"), "//p:ab", "//c:y", "deps");
+        assert!(downcast_chain_ref::<MissingDep>(&e).is_none(), "{e:#}");
+        blames_target("//c:y", &e, "//p:ab");
+    }
+
+    /// `//c:y` → `//d:t`; `d/BUILD` does not evaluate: the file, entered
+    /// through `//d:t`.
+    #[test]
+    fn d1b_attribution_broken_file() {
+        let e =
+            hplugin::diagnostic::with_stage(broken_file("d/BUILD"), Boundary::GetSpec, &a("//d:t"));
+        let e = at_input(e, "//d:t", "//c:y", "deps");
+        let (e, _other) = shared(e);
+        let e = at_input(e, "//c:y", "//a:x", "deps");
+        let (c, entry) = blamed("//a:x", &e);
+        assert_eq!(c, Culprit::File(Arc::from("d/BUILD")), "{e:#}");
+        assert_eq!(entry, a("//d:t"), "{e:#}");
+    }
+
+    /// `//a:x` → group `//g:grp`, whose member `//d:missing` is missing:
+    /// the group, which named it.
+    #[test]
+    fn d1b_attribution_group_member() {
+        let e = at_input(not_found("//d:missing"), "//d:missing", "//g:grp", "dep||0");
+        let e = at_input(e, "//g:grp", "//a:x", "deps");
+        blames_target("//a:x", &e, "//g:grp");
+    }
+
+    /// `//c:y` declares `//d:t|out` and `//d:t` is missing: `//c:y`, the ref
+    /// compared without its output group.
+    #[test]
+    fn d1b_attribution_output_group() {
+        let r = crate::engine::driver::TargetAddr::parse("//d:t|out", &a("//c:y").package)
+            .expect("ref");
+        let e = at_input(not_found("//d:t"), &r.r#ref.format(), "//c:y", "deps");
+        let e = at_input(e, "//c:y", "//a:x", "deps");
+        blames_target("//a:x", &e, "//c:y");
+    }
+
+    /// `${read://p:missing}` in `//c:y`: `//c:y`, under `${read://}`.
+    #[test]
+    fn d1b_attribution_read_producer() {
+        let e = at_input(
+            not_found("//p:missing"),
+            "//p:missing",
+            "//c:y",
+            "${read://}",
+        );
+        let e = at_input(e, "//c:y", "//a:x", "deps");
+        blames_target("//a:x", &e, "//c:y");
+        let m = downcast_chain_ref::<MissingDep>(&e).expect("a MissingDep");
+        assert_eq!(m.origin_id, "${read://}");
+    }
+
+    /// A `CancelledError` and a not-found in one `MultiError`: a
+    /// cancellation, no culprit.
+    #[test]
+    fn d1b_attribution_cancel_and_not_found() {
+        let missing = at_input(not_found("//d:missing"), "//d:missing", "//c:y", "deps");
+        let e: anyhow::Error = MultiError(vec![anyhow::Error::new(CancelledError), missing]).into();
+        assert!(
+            matches!(failure_fate(&a("//c:y"), &e), FailureFate::Cancelled),
+            "{e:#}"
+        );
+    }
+
+    // --- D1.c rule order ----------------------------------------------------
+
+    /// A stop on the chain is propagated, whatever blame sits above it.
+    #[test]
+    fn failure_fate_top_level_cancel_propagates() {
+        let e = at_input(anyhow::Error::new(CancelledError), "//d:t", "//c:y", "deps");
+        let e = e.context(MissingDep {
+            dep: a("//d:t"),
+            declarer: a("//c:y"),
+            origin_id: "deps".to_owned(),
+        });
+        assert!(
+            matches!(failure_fate(&a("//c:y"), &e), FailureFate::Propagate),
+            "{e:#}"
+        );
+    }
+
+    /// Every member a stop: a cancellation, never `UpstreamFailed` naming
+    /// this target (RUN-22).
+    #[test]
+    fn failure_fate_all_cancelled_multi_is_cancelled() {
+        let e: anyhow::Error = MultiError(vec![
+            anyhow::Error::new(CancelledError),
+            anyhow::Error::new(CancelledError).context("meta: //d:t"),
+        ])
+        .into();
+        assert!(
+            matches!(failure_fate(&a("//c:y"), &e), FailureFate::Cancelled),
+            "{e:#}"
+        );
+    }
+
+    /// A cycle is structural: propagated, even under an input frame.
+    #[test]
+    fn failure_fate_cycle_under_input_def_propagates() {
+        let cycle: anyhow::Error = CycleError {
+            from: a("//d:t"),
+            to: a("//c:y"),
+        }
+        .into();
+        let e = at_input(cycle, "//d:t", "//c:y", "deps");
+        assert!(
+            matches!(failure_fate(&a("//c:y"), &e), FailureFate::Propagate),
+            "{e:#}"
+        );
+    }
+
+    /// A cycle in one member of an aggregate, shared or not, beside another
+    /// failing input: still a cycle, never regrouped into culprits.
+    #[test]
+    fn failure_fate_cycle_in_an_aggregate_propagates() {
+        for share in [false, true] {
+            let cycle: anyhow::Error = CycleError {
+                from: a("//d:t"),
+                to: a("//c:y"),
+            }
+            .into();
+            let cycle = at_input(cycle, "//d:t", "//c:y", "deps");
+            let other = at_input(not_found("//e:missing"), "//e:missing", "//c:y", "deps");
+            let (cycle, other) = if share {
+                (shared(cycle).0, shared(other).0)
+            } else {
+                (cycle, other)
+            };
+            let e: anyhow::Error = MultiError(vec![other, cycle]).into();
+            assert!(
+                matches!(failure_fate(&a("//c:y"), &e), FailureFate::Propagate),
+                "shared {share}: {e:#}"
+            );
+        }
+    }
+
+    /// A marker is collateral: its root, never this target, never recorded.
+    #[test]
+    fn failure_fate_marker_is_upstream() {
+        let root = Culprit::File(Arc::from("d/BUILD"));
+        let e = at_input(
+            UpstreamFailed { root: root.clone() }.into(),
+            "//c:y",
+            "//b:x",
+            "deps",
+        );
+        match failure_fate(&a("//b:x"), &e) {
+            FailureFate::Upstream(r) => assert_eq!(r, root),
+            _ => panic!("not upstream: {e:#}"),
+        }
+    }
+
+    /// A requested target in a broken file: the file, entered through the
+    /// target itself.
+    #[test]
+    fn failure_fate_file_eval_on_own_spec_blames_file() {
+        let e = broken_file("d/BUILD").context("get spec");
+        let (c, entry) = blamed("//d:t", &e);
+        assert_eq!(c, Culprit::File(Arc::from("d/BUILD")), "{e:#}");
+        assert_eq!(entry, a("//d:t"));
+    }
+
+    /// One broken file reached through two of its targets, shared or not:
+    /// one culprit, entered through the first member, never `Each` (whose
+    /// regrouping of the two met this aggregate again, without end).
+    #[test]
+    fn failure_fate_one_file_two_entries_blames_the_file() {
+        for share in [false, true] {
+            let member = |input: &str, declarer: &str| {
+                let e = at_input(broken_file("e/BUILD"), input, declarer, "deps");
+                if share { shared(e).0 } else { e }
+            };
+            let e: anyhow::Error =
+                MultiError(vec![member("//e:a", "//d:x"), member("//e:b", "//d:y")]).into();
+            let (c, entry) = blamed("//top:t", &e);
+            assert_eq!(
+                c,
+                Culprit::File(Arc::from("e/BUILD")),
+                "shared {share}: {e:#}"
+            );
+            assert_eq!(entry, a("//e:a"), "shared {share}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -11397,7 +12326,13 @@ mod tests {
         let e = e.context(slot).context("execute //pkg:a");
 
         let detail = crate::engine::event::ErrorDetail::from_error(&e);
-        let end = result_end_event(&rs, addr.format(), Some(detail), None, Some(true));
+        let end = result_end_event(
+            &rs,
+            addr.format(),
+            Some(detail),
+            EndBlame::Unknown,
+            Some(true),
+        );
         let crate::engine::event::BuildEventKind::ResultEnd {
             log_tail,
             left_behind,
@@ -11566,7 +12501,7 @@ mod tests {
         // as `exit_code`, read structured rather than parsed from the text.
         let detail = crate::engine::event::ErrorDetail::from_error(&e);
         assert_eq!(detail.exit_status.as_deref(), Some("exit status: 1"));
-        let end = result_end_event(&rs, addr.format(), Some(detail), None, None);
+        let end = result_end_event(&rs, addr.format(), Some(detail), EndBlame::Unknown, None);
         let crate::engine::event::BuildEventKind::ResultEnd { exit_code, .. } = end else {
             panic!("not a ResultEnd: {end:?}");
         };

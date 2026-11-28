@@ -12,7 +12,7 @@ use crossterm::style::Stylize;
 use crate::engine::error::{CancelledError, FrozenCheckError, LogTail, TargetFailure};
 use crate::hmemoizer::{chain_frames, downcast_chain_ref};
 use crate::tui::color::stderr_color_enabled as color_enabled;
-use crate::tui::failure_rows::{left_behind_rows, tail_rows};
+use crate::tui::failure_rows::{left_behind_rows, reached_by_rows, tail_rows};
 use crate::tui::session::SessionSlot;
 use crate::tui::text::{Redact, WorkspaceRel, clean_inline, escape_log_tail, message};
 
@@ -174,6 +174,7 @@ fn render_target_failure_in(f: &TargetFailure, color: bool, rel: &WorkspaceRel) 
             "╰─▶".to_string()
         };
         out.push_str(&format!("{arrow} generated output differs from tree\n"));
+        push_reached_by(&mut out, f);
         render_diff_box(&mut out, &fc.diff, color);
         return out;
     }
@@ -187,6 +188,7 @@ fn render_target_failure_in(f: &TargetFailure, color: bool, rel: &WorkspaceRel) 
         let cause = message(&cause, &Redact::default(), rel);
         out.push_str(&format!("{arrow} {cause}\n"));
     }
+    push_reached_by(&mut out, f);
     // The tail is read from the slot's log through the handle the engine kept
     // open, so a rerun replacing the slot meanwhile cannot swap this run's box.
     let tail = match &f.log {
@@ -200,6 +202,15 @@ fn render_target_failure_in(f: &TargetFailure, color: bool, rel: &WorkspaceRel) 
     // function both call, so the two cannot word them differently.
     out.push_str(&left_behind_rows(&f.addr.format(), &f.left_behind()));
     out
+}
+
+/// How the request reached `f`'s culprit (U3), indented as the rows the box
+/// ends with: none when it was itself requested.
+fn push_reached_by(out: &mut String, f: &TargetFailure) {
+    let path: Vec<String> = f.path.iter().map(|a| a.format()).collect();
+    for row in reached_by_rows(&path, f.file.is_some()) {
+        out.push_str(&format!("  {row}\n"));
+    }
 }
 
 /// Render each recorded target failure, separated by a blank line. Pure, so the
@@ -680,10 +691,11 @@ async fn take_failure_outcome(
 }
 
 /// Map the cancelled flag to an exit result for the no-failures path. Registry
-/// failures never reach here — they exit as [`FailedTargets`].
+/// failures never reach here — they exit as [`FailedTargets`]. A
+/// [`CancelledError`], so `main` reads it as a cancel: exit 130.
 pub(crate) fn finish_exit(cancelled: bool) -> anyhow::Result<()> {
     if cancelled {
-        anyhow::bail!("cancelled");
+        return Err(CancelledError.into());
     }
     Ok(())
 }
@@ -1031,6 +1043,7 @@ mod tests {
         // Cancellation (no registry failures) → `cancelled`.
         let e = finish_exit(true).unwrap_err();
         assert_eq!(e.to_string(), "cancelled");
+        assert!(is_cancelled(&e), "a CancelledError, so main exits 130");
 
         // Not cancelled → Ok.
         assert!(finish_exit(false).is_ok());
@@ -1069,6 +1082,42 @@ mod tests {
 × target failed: //simple_fail:d2
 ╰─▶ boom b
 "
+        );
+    }
+
+    /// U3: a culprit three deep names how the request reached it, under its
+    /// cause; one that was itself requested gets no row.
+    #[test]
+    fn failure_box_shows_reached_by() {
+        let addrs = |a: &[&str]| -> Vec<_> {
+            a.iter()
+                .map(|s| crate::htaddr::parse_addr(s).expect("addr"))
+                .collect()
+        };
+        let deep = TargetFailure::new(
+            crate::htaddr::parse_addr("//p:t").expect("addr"),
+            None,
+            anyhow::anyhow!("boom"),
+        )
+        .with_path(addrs(&["//p:root", "//p:mid", "//p:t"]));
+        assert_eq!(
+            render_target_failure(&deep, false),
+            "\
+× target failed: //p:t
+╰─▶ boom
+  reached by: //p:root → //p:mid → //p:t
+"
+        );
+
+        let requested = TargetFailure::new(
+            crate::htaddr::parse_addr("//p:t").expect("addr"),
+            None,
+            anyhow::anyhow!("boom"),
+        )
+        .with_path(addrs(&["//p:t"]));
+        assert_eq!(
+            render_target_failure(&requested, false),
+            "× target failed: //p:t\n╰─▶ boom\n"
         );
     }
 

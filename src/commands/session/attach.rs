@@ -442,7 +442,7 @@ impl App for AttachApp {
                         if let Some(tx) = &events {
                             // The renderer is gone only when the backend is
                             // tearing down; the next select ends the loop.
-                            drop(tx.send(ev));
+                            drop(tx.send(*ev));
                         }
                     }
                     // The run's own colours, on a viewer that takes colour.

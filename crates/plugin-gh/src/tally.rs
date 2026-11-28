@@ -129,7 +129,11 @@ impl PartialOrd for Completed {
 /// to fix. Collateral failures are folded into `blocked` / `blocked_by_pkg`.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RootFailure {
+    /// The culprit target; for a file culprit, the address that led into it.
     pub addr: String,
+    /// The workspace-relative BUILD/`.bzl` file that did not evaluate, when
+    /// the culprit is that file rather than a target: what a reader is shown.
+    pub file: Option<String>,
     pub message: String,
     /// The subprocess's exit status, when the failure was a subprocess.
     pub exit_status: Option<String>,
@@ -144,6 +148,14 @@ pub(crate) struct RootFailure {
     /// Where those blocked targets live, for the rollup line. Bounded by package
     /// count (~1–3k), not target count.
     pub blocked_by_pkg: FxHashMap<Box<str>, usize>,
+}
+
+impl RootFailure {
+    /// What a reader is told failed: the file, for a file culprit, else the
+    /// target.
+    pub(crate) fn culprit(&self) -> &str {
+        self.file.as_deref().unwrap_or(&self.addr)
+    }
 }
 
 /// A target whose admission has waited past the notice threshold for what it
@@ -316,6 +328,8 @@ pub(crate) struct Tally {
 /// split with it.
 #[derive(Clone, Copy)]
 pub(crate) struct Failure<'a> {
+    /// The file that did not evaluate, for a file culprit.
+    pub file: Option<&'a str>,
     pub message: &'a str,
     pub upstream_of: Option<&'a str>,
     pub exit_status: Option<&'a str>,
@@ -380,6 +394,10 @@ impl Tally {
                 addr,
                 error,
                 upstream_of,
+                // The report keys roots by address; the file and the path
+                // reach it in a later change.
+                upstream_file: _,
+                path: _,
                 exit_status,
                 // `exit_status` already names it.
                 exit_code: _,
@@ -393,10 +411,18 @@ impl Tally {
                 // The job summary names the failure; where its log is
                 // stays in the step's own output.
                 left_behind: _,
+                duplicate,
             } => {
+                // Another end announced this culprit: close the row, count
+                // nothing (one root per culprit).
+                if *duplicate {
+                    self.close(addr);
+                    return;
+                }
                 self.finish(
                     addr,
                     error.as_deref().map(|message| Failure {
+                        file: None,
                         message,
                         upstream_of: upstream_of.as_deref(),
                         exit_status: exit_status.as_deref(),
@@ -574,6 +600,28 @@ impl Tally {
             // which the SDK treats as end-of-stream and would silently truncate
             // everything after it.
             BuildEventKind::Unknown => {}
+
+            // A BUILD file that did not evaluate: one root however many
+            // targets reached it, keyed by the address that led into it,
+            // which is what the targets it took down name as `upstream_of`.
+            BuildEventKind::FileFailed {
+                entry,
+                error,
+                file,
+                // The report names no path: the job log's block has it.
+                path: _,
+            } => self.record_root(
+                entry,
+                Failure {
+                    file: Some(file.as_str()),
+                    message: error,
+                    upstream_of: None,
+                    exit_status: None,
+                    log_tail: None,
+                },
+                None,
+                ev.at_unix_ms,
+            ),
         }
     }
 
@@ -627,7 +675,8 @@ impl Tally {
         self.misses_by_pkg.insert(pkg.into(), 1);
     }
 
-    fn finish(&mut self, addr: &str, error: Option<Failure<'_>>, at: u64) {
+    /// Drop `addr`'s in-flight record and mark it done in the matched set.
+    fn close(&mut self, addr: &str) -> Option<TargetRec> {
         let rec = self.live.remove(addr);
 
         // Progress is over the matched top-level set, deduped: the memoizer can
@@ -639,6 +688,11 @@ impl Tally {
             *done = true;
             self.matched_done = self.matched_done.saturating_add(1);
         }
+        rec
+    }
+
+    fn finish(&mut self, addr: &str, error: Option<Failure<'_>>, at: u64) {
+        let rec = self.close(addr);
 
         // From its own `ExecuteStart` to its `ResultEnd`: the run and its cache
         // write, none of the wait for its deps or for admission.
@@ -702,6 +756,7 @@ impl Tally {
         self.root_index.insert(addr.into(), self.roots.len());
         self.roots.push(RootFailure {
             addr: addr.to_string(),
+            file: failure.file.map(str::to_string),
             message: failure.message.to_string(),
             exit_status: failure.exit_status.map(str::to_string),
             log_tail: failure.log_tail.cloned(),
@@ -1002,6 +1057,9 @@ mod tests {
         t.apply(&ev(
             end,
             BuildEventKind::ResultEnd {
+                duplicate: false,
+                upstream_file: None,
+                path: Vec::new(),
                 left_behind: None,
                 cancelled: false,
                 timed_out: None,
@@ -1023,6 +1081,9 @@ mod tests {
         t.apply(&ev(
             10,
             BuildEventKind::ResultEnd {
+                duplicate: false,
+                upstream_file: None,
+                path: Vec::new(),
                 left_behind: None,
                 cancelled: false,
                 timed_out: None,
@@ -1038,6 +1099,9 @@ mod tests {
             t.apply(&ev(
                 20,
                 BuildEventKind::ResultEnd {
+                    duplicate: false,
+                    upstream_file: None,
+                    path: Vec::new(),
                     left_behind: None,
                     cancelled: false,
                     timed_out: None,
@@ -1065,6 +1129,101 @@ mod tests {
         );
     }
 
+    /// A broken BUILD file is one root however many requested targets live in
+    /// it: its `FileFailed` is the root, keyed by the address that led into
+    /// it, the targets it took down count against that root, and a
+    /// non-announcing end closes its row without a second root. That end
+    /// carries the file in `upstream_file` with no `upstream_of`, as the
+    /// engine sends it, and the entry's own duplicate end (its `FileFailed`
+    /// first) counts nothing either.
+    #[test]
+    fn tally_counts_file_culprit_once() {
+        let mut t = Tally::default();
+        matched(&mut t, &["//d:t1", "//d:t2", "//a:x"], true);
+        t.apply(&ev(
+            9,
+            BuildEventKind::ResultStart {
+                addr: "//d:t1".into(),
+            },
+        ));
+        t.apply(&ev(
+            10,
+            BuildEventKind::FileFailed {
+                file: "d/BUILD".into(),
+                entry: "//d:t1".into(),
+                error: "evaluating d/BUILD: name 'nope' is not defined".into(),
+                path: vec!["//d:t1".into()],
+            },
+        ));
+        let end =
+            |addr: &str, upstream_of: Option<&str>, duplicate: bool| BuildEventKind::ResultEnd {
+                duplicate,
+                upstream_file: Some("d/BUILD".into()),
+                path: Vec::new(),
+                left_behind: None,
+                cancelled: false,
+                timed_out: None,
+                addr: addr.into(),
+                error: Some("evaluating d/BUILD: name 'nope' is not defined".into()),
+                upstream_of: upstream_of.map(str::to_owned),
+                exit_status: None,
+                exit_code: None,
+                log_tail: None,
+            };
+        t.apply(&ev(10, end("//d:t1", None, true)));
+        t.apply(&ev(
+            11,
+            BuildEventKind::ResultStart {
+                addr: "//a:x".into(),
+            },
+        ));
+        t.apply(&ev(12, end("//a:x", Some("//d:t1"), false)));
+        t.apply(&ev(
+            13,
+            BuildEventKind::ResultStart {
+                addr: "//d:t2".into(),
+            },
+        ));
+        t.apply(&ev(14, end("//d:t2", None, true)));
+
+        let c = t.counters();
+        assert_eq!(c.roots_total, 1, "one root for the file");
+        assert_eq!(c.blocked, 1);
+        let [root] = t.roots() else {
+            panic!("one root: {:?}", t.roots());
+        };
+        assert_eq!(root.addr, "//d:t1");
+        assert_eq!(root.file.as_deref(), Some("d/BUILD"));
+        assert!(root.message.contains("d/BUILD"), "{}", root.message);
+        assert_eq!(root.blocked, 1);
+        let (done, total, _) = t.progress();
+        assert_eq!(
+            (done, total),
+            (3, 3),
+            "the duplicate ends closed //d:t1 and //d:t2"
+        );
+
+        // Every surface names the file as what failed: the comment's
+        // headings, the annotation's title, and the JSON beside the address.
+        let ctx = crate::render::RenderCtx {
+            heading: "heph",
+            now_ms: 20,
+            slow_after_ms: 30_000,
+            run_url: None,
+        };
+        let live = crate::render::render_live(&t, &ctx, usize::MAX);
+        assert!(live.contains("### `d/BUILD` — failed"), "{live}");
+        let done = crate::render::render_final(&t, &ctx, usize::MAX);
+        assert!(done.contains("### `d/BUILD`\n"), "{done}");
+        let [note] = crate::report::annotations(t.roots(), 10)
+            .try_into()
+            .expect("one");
+        assert!(note.starts_with("::error title=heph d/BUILD::"), "{note}");
+        let doc = crate::report::full_document(&t, &c, 20, "run //...", None);
+        assert_eq!(doc["failures"][0]["file"], "d/BUILD");
+        assert_eq!(doc["failures"][0]["addr"], "//d:t1");
+    }
+
     #[test]
     fn duplicate_result_end_is_not_double_counted() {
         // The result memoizer keys on `(addr, outputs, is_top)`, so one addr can
@@ -1075,6 +1234,9 @@ mod tests {
             t.apply(&ev(
                 5,
                 BuildEventKind::ResultEnd {
+                    duplicate: false,
+                    upstream_file: None,
+                    path: Vec::new(),
                     left_behind: None,
                     cancelled: false,
                     timed_out: None,
@@ -1742,6 +1904,9 @@ mod tests {
         t.apply(&ev(
             5,
             BuildEventKind::ResultEnd {
+                duplicate: false,
+                upstream_file: None,
+                path: Vec::new(),
                 left_behind: None,
                 cancelled: false,
                 timed_out: None,
@@ -1763,6 +1928,9 @@ mod tests {
             t.apply(&ev(
                 0,
                 BuildEventKind::ResultEnd {
+                    duplicate: false,
+                    upstream_file: None,
+                    path: Vec::new(),
                     left_behind: None,
                     cancelled: false,
                     timed_out: None,
@@ -1788,6 +1956,9 @@ mod tests {
             t.apply(&ev(
                 0,
                 BuildEventKind::ResultEnd {
+                    duplicate: false,
+                    upstream_file: None,
+                    path: Vec::new(),
                     left_behind: None,
                     cancelled: false,
                     timed_out: None,
@@ -1812,6 +1983,9 @@ mod tests {
         t.apply(&ev(
             10,
             BuildEventKind::ResultEnd {
+                duplicate: false,
+                upstream_file: None,
+                path: Vec::new(),
                 left_behind: None,
                 cancelled: false,
                 timed_out: None,
@@ -1861,6 +2035,9 @@ mod tests {
         t.apply(&ev(
             5_000,
             BuildEventKind::ResultEnd {
+                duplicate: false,
+                upstream_file: None,
+                path: Vec::new(),
                 left_behind: None,
                 cancelled: false,
                 timed_out: None,

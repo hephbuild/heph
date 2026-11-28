@@ -53,9 +53,9 @@ mod tests {
     fn version_json() {
         let doc: serde_json::Value = serde_json::from_str(&print(&["--json"])).unwrap();
         assert_eq!(doc["version"], crate::version::reported());
-        assert_eq!(doc["output_contract"], 1);
+        assert_eq!(doc["output_contract"], 2);
         assert_eq!(doc.as_object().unwrap().len(), 2);
-        assert_eq!(print(&["--jq", ".output_contract"]), "1\n");
+        assert_eq!(print(&["--jq", ".output_contract"]), "2\n");
         assert_eq!(
             print(&["--fields", "version"]),
             format!("{{\"version\":\"{}\"}}\n", crate::version::reported())

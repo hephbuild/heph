@@ -677,11 +677,12 @@ fn ctrl_c_during_dep_build_cancels() -> anyhow::Result<()> {
 }
 
 /// Before the tool exists heph is an ordinary run (N4a: the relay starts at
-/// the spawn): a TERM or HUP while a dependency builds ends heph at once, as
-/// on any command, rather than waiting in the relay for a tool that is never
-/// spawned. Nothing ran and no invocation sandbox is left.
+/// the spawn): a TERM or HUP while a dependency builds cancels it at once, as
+/// on any run, exiting 130 (error-reporting I6), rather than waiting in the
+/// relay for a tool that is never spawned. Nothing ran and no invocation
+/// sandbox is left.
 #[test]
-fn term_or_hup_during_dep_build_ends_heph() -> anyhow::Result<()> {
+fn term_or_hup_during_dep_build_cancels_heph() -> anyhow::Result<()> {
     let dist = Dist::locate();
     for (name, sig) in [("TERM", libc::SIGTERM), ("HUP", libc::SIGHUP)] {
         let slow = SlowDep::new()?;
@@ -690,9 +691,9 @@ fn term_or_hup_during_dep_build_ends_heph() -> anyhow::Result<()> {
         let out = common::wait_output(child, Duration::from_secs(20))
             .map_err(|e| anyhow::anyhow!("SIG{name} did not end heph promptly: {e:#}"))?;
         assert_eq!(
-            out.status.signal(),
-            Some(sig),
-            "SIG{name}: heph dies of it\n{}",
+            out.status.code(),
+            Some(130),
+            "SIG{name}: a cancel\n{}",
             describe(&out)
         );
         assert!(!slow.ran.exists(), "SIG{name}: the tool ran");
