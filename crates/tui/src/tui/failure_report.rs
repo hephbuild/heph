@@ -207,6 +207,28 @@ fn message_in_header(rec: &FailureRecord) -> bool {
     }
 }
 
+/// The message a renderer shows under its header, or `None` when the
+/// header's status says all of it ([`message_in_header`]). A message that
+/// ends with the status the header carries (`<remedy>: exit status 1`:
+/// compact keeps a wrapper's words beside the exit frame) is shown without
+/// that `: <status>`, which the header already says (PV r2 M1). The record,
+/// and so `--json`, keeps the whole message.
+fn shown_message(rec: &FailureRecord) -> Option<&str> {
+    if message_in_header(rec) {
+        return None;
+    }
+    let m = rec.diagnostic.message.as_str();
+    let Some(end) = rec.process_end_message() else {
+        return Some(m);
+    };
+    Some(
+        m.trim_end()
+            .strip_suffix(end.trim())
+            .and_then(|head| head.strip_suffix(": "))
+            .unwrap_or(m),
+    )
+}
+
 /// A hint as a row: a near-miss name as the question it answers, any other
 /// kind as its own sentence.
 fn hint_text(h: &Hint, ctx: &RenderCtx) -> String {
@@ -236,8 +258,8 @@ pub fn render_box(rec: &FailureRecord, ctx: &RenderCtx) -> String {
     let status = status(rec);
     b.header(&culprit_name(rec, ctx), status.as_deref());
 
-    if !message_in_header(rec) {
-        let msg = message(&d.message, &ctx.redact, &ctx.rel);
+    if let Some(shown) = shown_message(rec) {
+        let msg = message(shown, &ctx.redact, &ctx.rel);
         for line in msg.lines() {
             b.row(line);
         }
@@ -352,8 +374,8 @@ pub fn one_line(rec: &FailureRecord, ctx: &RenderCtx) -> String {
         line.push_str(" · ");
         line.push_str(&status);
     }
-    if !message_in_header(rec) {
-        let msg = message(&rec.diagnostic.message, &ctx.redact, &ctx.rel);
+    if let Some(shown) = shown_message(rec) {
+        let msg = message(shown, &ctx.redact, &ctx.rel);
         if let Some(first) = msg.lines().next().filter(|l| !l.is_empty()) {
             line.push_str(" · ");
             line.push_str(first);
@@ -385,8 +407,8 @@ pub fn streamed_exec_line(rec: &FailureRecord, color: bool) -> String {
     // As the CI box words it: heph's home and the workspace as it does.
     let ctx = RenderCtx::default();
     let d = &rec.diagnostic;
-    if !message_in_header(rec) {
-        let msg = message(&d.message, &ctx.redact, &ctx.rel);
+    if let Some(shown) = shown_message(rec) {
+        let msg = message(shown, &ctx.redact, &ctx.rel);
         for l in msg.lines().filter(|l| !l.trim().is_empty()) {
             line.push_str("\n  ");
             line.push_str(l);
