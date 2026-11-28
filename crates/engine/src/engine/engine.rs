@@ -105,7 +105,8 @@ pub struct PluginParts {
     pub provider: Option<Box<dyn SDKProvider>>,
     pub drivers: Vec<PluginDriver>,
     /// The functions providers expose to the source files they evaluate,
-    /// `heph.<plugin>.<fn>` (in a BUILD file, say). A plugin may have
+    /// `heph.<plugin>.<fn>` (e.g. in the buildfile provider's BUILD file). A
+    /// plugin may have
     /// functions and no provider at all.
     pub functions: Vec<PluginFnDef>,
     pub hooks: Vec<Arc<dyn SDKHook>>,
@@ -1149,25 +1150,28 @@ impl Engine {
         });
     }
 
-    /// The config schema a registered driver exposes. Used by the BUILD-file LSP
-    /// to complete and document a target's driver-specific config fields. Returns
+    /// The config schema a registered driver exposes. Used by a plugin's
+    /// language server (e.g. the buildfile plugin's BUILD-file LSP) to complete
+    /// and document a target's driver-specific config fields. Returns
     /// `None` only for an unknown driver name; a known config-less driver returns
     /// `Some(DriverSchema::default())` (no fields).
     pub fn driver_schema(&self, name: &str) -> Option<crate::engine::driver::DriverSchema> {
         self.drivers_by_name.get(name).map(|d| d.driver.schema())
     }
 
-    /// Names of all registered drivers, sorted. Used by the BUILD-file LSP to
-    /// complete the `driver =` argument of a `target(...)` call.
+    /// Names of all registered drivers, sorted. Used by a plugin's language
+    /// server to complete a target's driver name (e.g. the `driver =` argument
+    /// of a `target(...)` call in a BUILD file).
     pub fn driver_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self.drivers_by_name.keys().cloned().collect();
         names.sort();
         names
     }
 
-    /// The state schema a registered provider exposes, if any. Used by the
-    /// BUILD-file LSP to complete and document `provider_state(provider="<name>", …)`
-    /// args. Returns `None` for unknown providers or providers without a schema.
+    /// The state schema a registered provider exposes, if any. Used by a
+    /// plugin's language server to complete and document a provider's state
+    /// args (e.g. `provider_state(provider="<name>", …)` in a BUILD file).
+    /// Returns `None` for unknown providers or providers without a schema.
     pub fn provider_state_schema(&self, name: &str) -> Option<provider::StateSchema> {
         self.providers_by_name
             .get(name)
@@ -1232,7 +1236,8 @@ impl Engine {
 
     /// The opening step of the codegen index: once per engine, at the start
     /// of the first request that can reach a reader (a provider call that may
-    /// evaluate BUILD files, a target run, a write-back). Opens this
+    /// evaluate its source files, e.g. BUILD files; a target run; a
+    /// write-back). Opens this
     /// checkout's db if it exists, on the blocking pool, under `rs`'s cancel
     /// token; never creates, imports or walks. A newer, corrupt or unreadable
     /// db fails the request, naming the file. A cancelled or failed step
@@ -2205,7 +2210,8 @@ mod tests {
 
         /// D6: once the registry is sealed, registering a plugin is an error
         /// naming the plugin — never a function that silently misses the
-        /// namespace every BUILD file already sees.
+        /// namespace every evaluated source file (e.g. a BUILD file) already
+        /// sees.
         #[tokio::test]
         async fn plugin_registered_after_seal_is_refused() {
             let (_root, mut e) = engine();
