@@ -2607,7 +2607,7 @@ mod tests {
         assert_eq!(format!("{scrub:?}"), "Scrub(2 values)");
         let e = anyhow::anyhow!("secret-of-a secret-of-b secret-of-c short");
         let culprit = Culprit::Target(a.clone());
-        let rec = crate::engine::failure_record::compact(&e, &culprit, &a, &scrub, None);
+        let rec = crate::engine::failure_record::compact(&e, &culprit, &a, &scrub);
         assert_eq!(
             rec.diagnostic.message,
             "[redacted] [redacted] secret-of-c short"

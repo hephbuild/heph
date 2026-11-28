@@ -14,7 +14,7 @@
 //! the run, and [`Scrub`] lives on the request, never on a def.
 
 use crate::engine::failure_slot::{FailureSlot, RunStreamed};
-use hcore::diagnostic::{bound_snippet, bound_text};
+use hcore::diagnostic::{FILE_CAP, HINT_CAP, bound_snippet, bound_text};
 use hcore::failure::{
     CAUSE_CAP, CAUSES_CAP, ExitData, FailedIn, FailureRecord, LogRef, RECORD_CAP,
 };
@@ -115,8 +115,7 @@ pub(crate) fn scrub_line(text: &str, scrub: &Scrub) -> String {
 
 /// `e`, recorded against `culprit` and reached through `entry`, compacted:
 /// scrubbed of `scrub`, within every cap, with the typed facts a renderer
-/// reads. `stage_override` names the stage when the caller knows it better
-/// than the chain does.
+/// reads.
 ///
 /// A failure that reached this request as another request's recorded
 /// [`TargetFailure`] (surfaced at that request's top) is that failure's own
@@ -129,7 +128,6 @@ pub(crate) fn compact(
     culprit: &Culprit,
     entry: &Addr,
     scrub: &Scrub,
-    stage_override: Option<Stage>,
 ) -> FailureRecord {
     let needles = scrub.needles();
     let clean = |s: &str| scrub_text(needles.as_ref(), s);
@@ -137,9 +135,6 @@ pub(crate) fn compact(
     if let Some(tf) = downcast_chain_ref::<TargetFailure>(e) {
         let mut rec = (*tf.record).clone();
         rec.surface_top = true;
-        if let Some(stage) = stage_override {
-            rec.diagnostic.stage = stage;
-        }
         return bound(scrubbed(rec, &clean));
     }
 
@@ -186,9 +181,6 @@ pub(crate) fn compact(
             Diagnostic::new(stage, message)
         }
     };
-    if let Some(stage) = stage_override {
-        diagnostic.stage = stage;
-    }
     if diagnostic.addr.is_none()
         && let Culprit::Target(addr) = culprit
     {
@@ -317,7 +309,7 @@ pub(crate) fn exec_failure(addr: &Addr, e: &anyhow::Error, scrub: &Scrub) -> Opt
     if exit.is_none() && timed_out.is_none() {
         return None;
     }
-    let full = compact(e, &Culprit::Target(addr.clone()), addr, scrub, None);
+    let full = compact(e, &Culprit::Target(addr.clone()), addr, scrub);
     let mut rec = FailureRecord::new(full.diagnostic);
     rec.exit = full.exit;
     rec.timed_out = full.timed_out;
@@ -489,13 +481,21 @@ fn scrubbed(mut rec: FailureRecord, clean: &impl Fn(&str) -> String) -> FailureR
 /// `rec` within every cap, each cut marking the diagnostic `truncated`: the
 /// diagnostic's own caps, the causes (the first [`CAUSES_CAP`], each within
 /// [`CAUSE_CAP`]), the frozen diff as a snippet, the in-memory log tail (its
-/// end kept), and then the whole within [`RECORD_CAP`] — dropping causes
-/// from the end, then the snippet, the frozen diff and the hints, and last
-/// cutting the message.
+/// end kept), each identity field within [`FILE_CAP`] and the exit status
+/// within [`HINT_CAP`], and then the whole within [`RECORD_CAP`] — dropping
+/// causes from the end, then the snippet, the frozen diff and the hints,
+/// then cutting the message, and last cutting the identity fields, least
+/// telling first.
 fn bound(mut rec: FailureRecord) -> FailureRecord {
     rec.diagnostic = rec.diagnostic.bounded();
     // Causes `compact` counted rather than formatted were cut already.
     let mut cut = rec.more_causes > 0;
+    for field in identity(&mut rec) {
+        *field = bound_text(field, FILE_CAP, &mut cut);
+    }
+    if let Some(exit) = &mut rec.exit {
+        exit.status = bound_text(&exit.status, HINT_CAP, &mut cut);
+    }
     if rec.causes.len() > CAUSES_CAP {
         let more = rec.causes.len() - CAUSES_CAP;
         rec.more_causes = rec.more_causes.saturating_add(count(more));
@@ -531,8 +531,63 @@ fn bound(mut rec: FailureRecord) -> FailureRecord {
         let room = message.len().saturating_sub(len - RECORD_CAP);
         rec.diagnostic.message = bound_text(message, room, &mut cut);
     }
+    // Only fields no per-field cap reaches together can still be over: the
+    // identity fields, each within its own cap, and the exit status.
+    let mut over = rec.text_len().saturating_sub(RECORD_CAP);
+    if over > 0 {
+        if let Some(exit) = &mut rec.exit {
+            over = shed(&mut exit.status, over, &mut cut);
+        }
+        for field in identity(&mut rec) {
+            over = shed(field, over, &mut cut);
+        }
+    }
     rec.diagnostic.truncated |= cut;
     rec
+}
+
+/// The record's identity texts, the least telling first: the order the
+/// last step of [`bound`] cuts them in. The culprit's own address comes last.
+fn identity(rec: &mut FailureRecord) -> impl Iterator<Item = &mut String> {
+    let d = &mut rec.diagnostic;
+    let (dep, declarer, origin) = match &mut rec.missing_dep {
+        Some(m) => (
+            Some(&mut m.dep),
+            Some(&mut m.declarer),
+            Some(&mut m.origin_id),
+        ),
+        None => (None, None, None),
+    };
+    [
+        rec.boundary.as_mut(),
+        origin,
+        d.location.as_mut().map(|l| &mut l.file),
+        rec.file.as_mut(),
+        declarer,
+        dep,
+        Some(&mut rec.entry),
+        d.addr.as_mut(),
+        rec.addr.as_mut(),
+    ]
+    .into_iter()
+    .flatten()
+}
+
+/// `s` shortened by up to `over` bytes, `…` marking the cut (`s` emptied
+/// when what is left would not hold it); what is still over afterwards.
+fn shed(s: &mut String, over: usize, cut: &mut bool) -> usize {
+    if over == 0 || s.is_empty() {
+        return over;
+    }
+    let before = s.len();
+    let room = before.saturating_sub(over);
+    if room < '…'.len_utf8() {
+        s.clear();
+        *cut = true;
+    } else {
+        *s = bound_text(s, room, cut);
+    }
+    over.saturating_sub(before.saturating_sub(s.len()))
 }
 
 fn count(n: usize) -> u32 {
@@ -568,7 +623,7 @@ mod tests {
 
     /// `e` compacted as the culprit `//p:t`'s own failure, nothing scrubbed.
     fn of(e: &anyhow::Error) -> FailureRecord {
-        compact(e, &target("//p:t"), &addr("//p:t"), &Scrub::default(), None)
+        compact(e, &target("//p:t"), &addr("//p:t"), &Scrub::default())
     }
 
     fn many(n: usize, text: impl Fn(usize) -> String) -> anyhow::Error {
@@ -731,15 +786,77 @@ mod tests {
             d = d.with_hint(Hint::new(HintKind::Other, "h".repeat(200)));
         }
         let mut inner = FailureRecord::new(d);
-        // Identity fields are not capped per field: here they fill the record.
+        // Identity fields, each within its own cap, fill the record.
         inner.entry = "e".repeat(6000);
+        inner.file = Some("f".repeat(FILE_CAP));
+        inner.diagnostic.location = Some(loc("l".repeat(FILE_CAP)));
+        inner.missing_dep = Some(hcore::failure::MissingDepData {
+            dep: "d".repeat(FILE_CAP),
+            declarer: "r".repeat(FILE_CAP),
+            origin_id: String::new(),
+        });
         let tf = TargetFailure::new(addr("//p:t")).with_record(Arc::new(inner));
         let rec = of(&anyhow::Error::new(tf));
         assert!(rec.text_len() <= RECORD_CAP, "{} bytes", rec.text_len());
         assert_eq!(rec.diagnostic.snippet, None);
         assert!(rec.diagnostic.hints.is_empty());
         assert!(rec.diagnostic.message.ends_with('…'));
+        assert!(rec.diagnostic.message.len() > 1000, "only cut what is over");
         assert!(rec.diagnostic.truncated);
+        // The identity fields are within their caps, and not cut further.
+        assert_eq!(rec.entry.len(), FILE_CAP);
+        assert!(rec.entry.ends_with('…'));
+        assert_eq!(rec.file, Some("f".repeat(FILE_CAP)));
+        let dep = rec.missing_dep.as_ref().expect("missing_dep");
+        assert_eq!(dep.dep, "d".repeat(FILE_CAP));
+    }
+
+    /// CQ NIT: identity fields no per-field cap holds together are cut
+    /// after the message, least telling first and the culprit's address
+    /// last, so `RECORD_CAP` holds whatever the record carries.
+    #[test]
+    fn record_total_cap_8k_cuts_identity_after_the_message() {
+        let big = |c: &str| c.repeat(6000);
+        let mut d = Diagnostic::new(Stage::Run, big("m")).with_addr(big("a"));
+        d.location = Some(loc(big("l")));
+        let mut inner = FailureRecord::new(d);
+        inner.addr = Some(format!("//p:{}", big("t")));
+        inner.file = Some(big("f"));
+        inner.entry = big("e");
+        inner.boundary = Some(big("b"));
+        inner.exit = Some(ExitData {
+            code: Some(1),
+            signal: None,
+            status: big("s"),
+        });
+        inner.missing_dep = Some(hcore::failure::MissingDepData {
+            dep: big("d"),
+            declarer: big("r"),
+            origin_id: big("o"),
+        });
+        let tf = TargetFailure::new(addr("//p:t")).with_record(Arc::new(inner));
+        let rec = of(&anyhow::Error::new(tf));
+        assert!(rec.text_len() <= RECORD_CAP, "{} bytes", rec.text_len());
+        assert!(rec.diagnostic.truncated);
+        assert_eq!(rec.diagnostic.message, "…");
+        assert_eq!(rec.exit.as_ref().map(|x| x.status.as_str()), Some(""));
+        assert_eq!(rec.boundary.as_deref(), Some(""));
+        // What is most telling is kept, within its own cap.
+        let culprit = rec.addr.as_deref().expect("addr");
+        assert!(culprit.starts_with("//p:t") && culprit.len() == FILE_CAP);
+        assert_eq!(rec.entry.len(), FILE_CAP);
+        assert_eq!(
+            rec.diagnostic.addr.as_ref().map(String::len),
+            Some(FILE_CAP)
+        );
+    }
+
+    fn loc(file: String) -> hcore::diagnostic::SourceLoc {
+        hcore::diagnostic::SourceLoc {
+            file,
+            line: 1,
+            col: 1,
+        }
     }
 
     #[test]
@@ -995,7 +1112,6 @@ mod tests {
             &target("//p:t"),
             &addr("//p:t"),
             &Scrub::new([secret.to_owned()]),
-            None,
         );
         assert!(rec.surface_top);
         assert_eq!(rec.exit.and_then(|x| x.code), Some(3));
@@ -1047,7 +1163,6 @@ mod tests {
             &target("//p:t"),
             &addr("//p:t"),
             &Scrub::new([secret.to_owned()]),
-            None,
         );
         assert_eq!(leaks(&rec), Vec::<String>::new());
         assert!(rec.diagnostic.message.contains("[redacted]"));
@@ -1095,7 +1210,6 @@ mod tests {
             &target("//p:t"),
             &addr("//p:t"),
             &Scrub::new([secret.to_owned()]),
-            None,
         );
         // `Debug` prints every field, `memory_tail` (never serialized)
         // included.
@@ -1110,14 +1224,14 @@ mod tests {
         assert_eq!(format!("{s:?}"), "Scrub(1 values)");
     }
 
-    /// The stage: the caller's override, else the diagnostic's, else the
-    /// innermost stage frame, else the culprit's kind.
+    /// The stage: the diagnostic's, else the innermost stage frame, else the
+    /// culprit's kind.
     #[test]
-    fn stage_falls_back_from_override_to_culprit() {
+    fn stage_falls_back_from_frame_to_culprit() {
         let e = anyhow::anyhow!("boom");
         assert_eq!(of(&e).diagnostic.stage, Stage::Run);
         let file = Culprit::File(Arc::from("p/BUILD"));
-        let rec = compact(&e, &file, &addr("//p:t"), &Scrub::default(), None);
+        let rec = compact(&e, &file, &addr("//p:t"), &Scrub::default());
         assert_eq!(rec.diagnostic.stage, Stage::Eval);
         assert_eq!((rec.addr, rec.file.as_deref()), (None, Some("p/BUILD")));
         let framed = hplugin::diagnostic::with_stage(
@@ -1128,14 +1242,6 @@ mod tests {
         let rec = of(&framed);
         assert_eq!(rec.diagnostic.stage, Stage::Parse);
         assert_eq!(rec.diagnostic.message, "boom");
-        let rec = compact(
-            &framed,
-            &target("//p:t"),
-            &addr("//p:t"),
-            &Scrub::default(),
-            Some(Stage::Link),
-        );
-        assert_eq!(rec.diagnostic.stage, Stage::Link);
     }
 
     /// STAGE-09: a dependent blamed for an input that does not exist failed
@@ -1162,20 +1268,13 @@ mod tests {
             Boundary::GetDef,
             &addr("//d:t"),
         );
-        let rec = compact(
-            &e,
-            &target("//d:t"),
-            &addr("//d:t"),
-            &Scrub::default(),
-            None,
-        );
+        let rec = compact(&e, &target("//d:t"), &addr("//d:t"), &Scrub::default());
         assert_eq!(rec.diagnostic.stage, Stage::Link);
         let rec = compact(
             &missing(),
             &target("//d:other"),
             &addr("//d:other"),
             &Scrub::default(),
-            None,
         );
         assert_eq!(rec.diagnostic.stage, Stage::Parse);
     }
