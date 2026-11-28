@@ -198,6 +198,58 @@ async fn no_secret_in_json() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// I7 on the event wire: a run whose program is a `${read://}` value that
+/// names no program, so the spawn error quotes the value. Neither any event
+/// as `events.ndjson` and plugin-gh read it (JSON), nor the spotlight line
+/// folded from them, nor `run --json` holds it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_secret_in_events() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "val",
+        &format!(
+            r#"
+target(name = "plain", driver = "bash", out = "v.txt",
+       run = "printf '%s' '{READ_SECRET}' > v.txt")
+"#
+        ),
+    );
+    ws.write_build_file(
+        "app",
+        r#"
+target(name = "spawn", driver = "exec", out = "o.txt", run = ["${read://val:plain}"])
+"#,
+    );
+    let m = Matcher::Addr(parse_addr("//app:spawn")?);
+    let run = run_json(&ws.engine, &m, &["--json"], None).await;
+    assert!(run.res.is_err(), "//app:spawn must fail");
+    assert_eq!(run.entry("//app:spawn")["outcome"], "failed");
+    // The fixture has teeth: the failure's own chain quoted the value, which
+    // its end says scrubbed.
+    let quoted = run.events.iter().any(|ev| {
+        matches!(&ev.kind, heph::engine::event::BuildEventKind::ResultEnd { addr, error: Some(e), .. }
+            if addr == "//app:spawn" && e.contains("[redacted]"))
+    });
+    assert!(
+        quoted,
+        "//app:spawn's end quotes the value: {:?}",
+        run.events
+    );
+    for ev in &run.events {
+        assert_no_secret("an event", &serde_json::to_string(ev)?);
+    }
+    let mut fold = heph::tui::progress::BuildState::new();
+    for ev in &run.events {
+        fold.apply(ev);
+    }
+    let at = run.events.last().map_or(0, |ev| ev.at_unix_ms);
+    let spot = fold.spotlight(at).map(|s| s.text()).unwrap_or_default();
+    assert!(spot.contains("//app:spawn"), "the spotlight: {spot:?}");
+    assert_no_secret("the spotlight", &spot);
+    assert_no_secret("run --json", &serde_json::to_string(&run.entries)?);
+    Ok(())
+}
+
 /// I7 on disk: each culprit's `diagnostic.json`, as written.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn no_secret_in_diagnostic_json() -> anyhow::Result<()> {

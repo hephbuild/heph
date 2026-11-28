@@ -158,6 +158,17 @@ impl ErrorDetail {
     /// that (`ExecuteEnd`, the cache spans). Structured detail is surfaced on
     /// `ResultEnd`, which is where a consumer reports a target's outcome; the
     /// inner spans would only duplicate it.
+    /// [`from_error`](Self::from_error) for an event: its message scrubbed
+    /// of what the request was handed to scrub, and within the message cap
+    /// ([`RequestStateData::scrub_event_text`], I7). Every detail an event
+    /// carries is built here: the event reaches `events.ndjson`, the session
+    /// store and hook plugins.
+    pub(crate) fn for_event(e: &anyhow::Error, data: &RequestStateData) -> Self {
+        let mut d = Self::from_error(e);
+        d.message = data.scrub_event_text(&d.message);
+        d
+    }
+
     pub fn into_message(self) -> String {
         self.message
     }
@@ -231,7 +242,7 @@ pub async fn emit_scope_with<T, F: Future<Output = ()>>(
     match fut.await {
         Ok(v) => Ok(v),
         Err(e) => {
-            guard.error = Some(ErrorDetail::from_error(&e));
+            guard.error = Some(ErrorDetail::for_event(&e, &rs.data));
             let (e, more) = on_error(e);
             if let Some(more) = more {
                 more.await;

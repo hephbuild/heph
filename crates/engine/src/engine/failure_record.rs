@@ -96,7 +96,14 @@ fn scrub_text(needles: Option<&Arc<Needles>>, s: &str) -> String {
 /// keeps. The raw chain is the caller's to log at `debug`, and only there:
 /// a `warn` line reaches the same terminal the record does.
 pub(crate) fn log_line(e: &anyhow::Error, scrub: &Scrub) -> String {
-    let scrubbed = scrub_text(scrub.needles().as_ref(), &format!("{e:#}"));
+    scrub_line(&format!("{e:#}"), scrub)
+}
+
+/// `text` scrubbed of `scrub`, then control-escaped and within the record's
+/// message cap: [`log_line`] for a text already formatted, such as an
+/// event's `error` (I7).
+pub(crate) fn scrub_line(text: &str, scrub: &Scrub) -> String {
+    let scrubbed = scrub_text(scrub.needles().as_ref(), text);
     bound_text(&scrubbed, hcore::diagnostic::MESSAGE_CAP, &mut false)
 }
 

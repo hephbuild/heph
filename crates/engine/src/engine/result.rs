@@ -2370,7 +2370,7 @@ fn record_culprit(
     // announced by its caller (its scope's end, or `fail_unscoped`).
     let announce = (unclaimed && !matches!(&culprit, Culprit::Target(c) if c == addr)).then(|| {
         (
-            crate::engine::event::ErrorDetail::from_error(&e),
+            crate::engine::event::ErrorDetail::for_event(&e, &rs.data),
             path.clone(),
             entry.clone(),
         )
@@ -2517,7 +2517,10 @@ fn announce_culprit(
         Culprit::File(file) => rs.emit(BuildEventKind::FileFailed {
             file: file.to_string(),
             entry: entry.format(),
-            error: detail.message,
+            error: record
+                .as_deref()
+                .and_then(record_message)
+                .unwrap_or(detail.message),
             path,
             failure: record.map(|r| Box::new((*r).clone())),
         }),
@@ -2622,6 +2625,13 @@ fn upstream_addr(rs: &RequestState, root: &Culprit) -> Option<String> {
     }
 }
 
+/// The `error` an event carries for a culprit whose record rides it: the
+/// record's message, compacted and scrubbed (I7). `None` when it is empty.
+fn record_message(r: &hcore::failure::FailureRecord) -> Option<String> {
+    let m = &r.diagnostic.message;
+    (!m.trim().is_empty()).then(|| m.clone())
+}
+
 /// `addr`'s `ResultEnd`, for its result scope and for a failure
 /// [`Engine::fail_unscoped`] reports outside one: one builder, so the two
 /// cannot disagree on what a consumer learns. `upstream_of` is
@@ -2661,6 +2671,13 @@ fn result_end_event(
                 }
                 Box::new(r)
             });
+            // A culprit's `error` is its record's message, the one its box
+            // leads with, compacted and scrubbed once (I7); any other end's
+            // was scrubbed when its detail was built (`for_event`).
+            let message = match failure.as_deref().map(record_message) {
+                Some(Some(m)) => m,
+                _ => d.message,
+            };
             // The final report's `took down:` row reads the same
             // `upstream_of` the event carries.
             if let Some(root) = &d.upstream_of
@@ -2670,7 +2687,7 @@ fn result_end_event(
             }
             crate::engine::event::BuildEventKind::ResultEnd {
                 addr,
-                error: Some(d.message),
+                error: Some(message),
                 upstream_of: d.upstream_of,
                 upstream_file,
                 path,
@@ -3136,8 +3153,8 @@ impl Engine {
             Some(end @ EndBlame::Skipped { .. }) => Some(end),
             _ => None,
         };
-        let detail =
-            (own || skipped.is_some()).then(|| crate::engine::event::ErrorDetail::from_error(&e));
+        let detail = (own || skipped.is_some())
+            .then(|| crate::engine::event::ErrorDetail::for_event(&e, &rs.data));
         let (e, fresh) = if cycle {
             record_cycle(rs, addr, e)
         } else {
@@ -3972,7 +3989,7 @@ impl Engine {
             rs.emit(BuildEventKind::ResultStart {
                 addr: addr_str.clone(),
             });
-            let detail = ErrorDetail::from_error(&e);
+            let detail = ErrorDetail::for_event(&e, &rs.data);
             let end = EndBlame::of(rs, &addr, &failure_fate(&addr, &e));
             let (marker, _) = classify_failure_fresh(rs, &addr, e);
             let end = end.with_record(rs, &addr);
