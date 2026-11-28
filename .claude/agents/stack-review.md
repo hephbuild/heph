@@ -48,6 +48,7 @@ Write the file where the brief tells you, and return its path and a five-line su
 ## Rules
 
 - **You can never demote.** Not a card, not a tier, not a Glance item you think is over-cautious. If the decider over-tiered something, leave it. Lowering is how a second opinion talks a card away (I4).
+- **Never re-raise a point the user settled** ("Earlier decisions" in `index.md`), even on a slightly different range, under another title or inside a new item: no promotion and no item about it while its code is unchanged. For each change request listed there, say in your report whether it was made, citing the code.
 - **A BLOCKER or a defect is not a card.** If code is wrong (a bug, a race, a broken invariant, a missing test for a spec case), report it outside `audit.json`, ranked by severity with `file:line`, for a fix round. No brief is published over code you already rejected. The user is not asked to review code you would not approve.
 - **Every item is rooted in code.** A point with no code to show (release ordering, scope) is not an item. Name it in your summary for the decider's `not_in_code` list.
 - **One question per card, about the lines shown.** "Is the second `HashMap` in `layer 3`'s `walk.rs:40-62` the same index as `layer 1`'s `index.rs:12-30`, and should it reuse it?" Not "please review".

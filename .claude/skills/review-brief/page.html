@@ -8,7 +8,7 @@
   --bg: #f6f7f9; --surface: #ffffff; --fg: #1b1f27; --muted: #5d6573; --line: #dde1e8;
   --accent: #2856b8;
   --t-scrutinize: #c2410c; --t-glance: #b7791f; --t-deep: #2b8a6e; --t-scout: #7fc4ad;
-  --t-counted: #a9b0bc; --t-untriaged: #a21caf;
+  --t-counted: #a9b0bc; --t-untriaged: #a21caf; --t-settled: #6b8fd6;
   --add-bg: #e7f5ec; --add-fg: #14532d; --del-bg: #fbeaea; --del-fg: #7f1d1d; --gap: #eef0f4;
   --warn-bg: #fff4e0; --warn-fg: #7a4a00; --err-bg: #fdecec; --err-fg: #8b1c1c;
   --callout-bg: #fdf1ea; --hit-bg: #e8eefb; --pre-bg: #f1f3f6;
@@ -19,7 +19,7 @@
   --bg: #12151b; --surface: #1a1e26; --fg: #e4e7ee; --muted: #9aa3b2; --line: #2c323d;
   --accent: #7ea6ff;
   --t-scrutinize: #f07a3e; --t-glance: #e0a93b; --t-deep: #3fb68f; --t-scout: #2e6f5b;
-  --t-counted: #4a5262; --t-untriaged: #d55be6;
+  --t-counted: #4a5262; --t-untriaged: #d55be6; --t-settled: #4f6fae;
   --add-bg: #13301f; --add-fg: #b7efc9; --del-bg: #3a1717; --del-fg: #f6c4c4; --gap: #20252f;
   --warn-bg: #3a2a0c; --warn-fg: #f7d79a; --err-bg: #3d1515; --err-fg: #f8b4b4;
   --callout-bg: #2a1d15; --hit-bg: #1d2a45; --pre-bg: #151920; color-scheme: dark } }
@@ -27,7 +27,7 @@
   --bg: #12151b; --surface: #1a1e26; --fg: #e4e7ee; --muted: #9aa3b2; --line: #2c323d;
   --accent: #7ea6ff;
   --t-scrutinize: #f07a3e; --t-glance: #e0a93b; --t-deep: #3fb68f; --t-scout: #2e6f5b;
-  --t-counted: #4a5262; --t-untriaged: #d55be6;
+  --t-counted: #4a5262; --t-untriaged: #d55be6; --t-settled: #4f6fae;
   --add-bg: #13301f; --add-fg: #b7efc9; --del-bg: #3a1717; --del-fg: #f6c4c4; --gap: #20252f;
   --warn-bg: #3a2a0c; --warn-fg: #f7d79a; --err-bg: #3d1515; --err-fg: #f8b4b4;
   --callout-bg: #2a1d15; --hit-bg: #1d2a45; --pre-bg: #151920; color-scheme: dark }
@@ -71,6 +71,7 @@ header.top { display: grid; gap: 0.75rem; }
 .seg-scout { background: var(--t-scout); }
 .seg-counted { background: var(--t-counted); }
 .seg-untriaged { background: repeating-linear-gradient(45deg, var(--t-untriaged) 0 4px, transparent 4px 7px); }
+.seg-settled { background: var(--t-settled); }
 .legend { display: flex; flex-wrap: wrap; gap: 0.25rem 1rem; font-size: 0.82rem; color: var(--muted); }
 .legend i { display: inline-block; width: 0.7rem; height: 0.7rem; border-radius: 2px; margin-right: 0.35rem; vertical-align: -1px; }
 
@@ -87,25 +88,34 @@ details.layer[open] > summary { margin-bottom: 1rem; }
 /* A card reads top to bottom: what changed, the decision and what each answer
    costs, what the code is for, then the evidence, then the small print. */
 .card { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 1.1rem 1.25rem; display: grid; gap: 0.9rem; min-width: 0; }
-.card[data-state="fine"] { opacity: 0.72; }
-.card[data-state="concern"] { border-color: var(--t-scrutinize); }
+.card[data-state="settled"] { opacity: 0.72; }
+.card[data-state="change"] { border-color: var(--t-scrutinize); box-shadow: inset 3px 0 0 var(--t-scrutinize); }
+details.item[data-state="settled"] { opacity: 0.8; }
+details.item[data-state="change"] { border-color: var(--t-scrutinize); box-shadow: inset 3px 0 0 var(--t-scrutinize); }
 .card-title { font-size: 1.1rem; font-weight: 600; line-height: 1.35; max-width: 70ch; }
 .prose { max-width: 70ch; line-height: 1.65; overflow-wrap: anywhere; }
 .decision { background: var(--callout-bg); border-left: 3px solid var(--t-scrutinize); border-radius: 0 6px 6px 0; padding: 0.7rem 0.9rem; display: grid; gap: 0.6rem; }
 .decision .question { font-weight: 500; max-width: 70ch; line-height: 1.55; }
 .options { list-style: none; margin: 0; padding: 0; display: grid; }
 .options li { border-top: 1px solid var(--line); }
-.options button.option { display: grid; grid-template-columns: 1.1rem minmax(7rem, 15rem) 1fr; gap: 0.15rem 0.8rem; width: 100%; text-align: left; padding: 0.45rem 0.3rem; border: 0; border-radius: 4px; background: none; font-size: 0.9rem; font-weight: 400; line-height: 1.5; color: var(--fg); }
+.options button.option { display: grid; grid-template-columns: 1.1rem minmax(7rem, 15rem) 1fr; align-items: baseline; gap: 0.15rem 0.8rem; width: 100%; text-align: left; padding: 0.45rem 0.3rem; border: 0; border-radius: 4px; background: none; font-size: 0.9rem; font-weight: 400; line-height: 1.5; color: var(--fg); }
 .options button.option:hover { background: var(--surface); }
 .options button.option::before { content: "○"; color: var(--muted); }
 .options button.option[aria-pressed="true"] { background: var(--surface); color: var(--fg); }
 .options button.option[aria-pressed="true"]::before { content: "●"; color: var(--accent); }
+.options .answer { display: grid; gap: 0.1rem; }
 .options .choice { font-weight: 600; }
+.options .kind { font-size: 0.72rem; color: var(--muted); }
+.options .kind.change { color: var(--t-scrutinize); }
 .options .impact { color: var(--muted); max-width: 62ch; }
 @media (max-width: 560px) { .options button.option { grid-template-columns: 1.1rem 1fr; } .options .impact { grid-column: 2; } }
-.review-note, .earlier-notes { display: grid; gap: 0.3rem; font-size: 0.85rem; }
+.review-note, .earlier-notes, .earlier-round { display: grid; gap: 0.3rem; font-size: 0.85rem; }
+.earlier-round { border: 1px dashed var(--line); border-radius: 6px; padding: 0.5rem 0.7rem; }
 .review-note textarea { font: inherit; font-size: 0.9rem; min-height: 2.6rem; padding: 0.4rem 0.55rem; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--fg); resize: vertical; width: 100%; max-width: 70ch; box-sizing: border-box; }
-.card[data-answered="true"][data-state="unread"] { opacity: 0.85; }.examples { display: grid; gap: 0.6rem; }
+.note-hint { color: var(--warn-fg); background: var(--warn-bg); border-radius: 4px; padding: 0.2rem 0.5rem; max-width: 70ch; }
+.chip.state-settled { color: var(--t-settled); border-color: currentColor; }
+.chip.state-change { color: var(--t-scrutinize); border-color: currentColor; font-weight: 600; }
+.examples { display: grid; gap: 0.6rem; }
 figure { margin: 0; display: grid; gap: 0.3rem; min-width: 0; }
 pre.text { margin: 0; padding: 0.6rem 0.75rem; background: var(--pre-bg); border: 1px solid var(--line); border-radius: 6px; font: 0.8rem/1.5 var(--mono); overflow-x: auto; white-space: pre; }
 .diagram svg { max-width: 100%; height: auto; }
@@ -172,6 +182,7 @@ textarea#review-text { width: 100%; min-height: 8rem; font: 0.8rem var(--mono); 
     ["glance", "Glance", "seg-glance"],
     ["deep", "AI-cleared, reported read by the decider or stack review", "seg-deep"],
     ["scout", "AI-cleared, reported read by a scout only", "seg-scout"],
+    ["settled", "Settled in an earlier round", "seg-settled"],
     ["counted", "Counted", "seg-counted"],
     ["untriaged", "Untriaged", "seg-untriaged"],
   ];
@@ -244,7 +255,7 @@ textarea#review-text { width: 100%; min-height: 8rem; font: 0.8rem var(--mono); 
         const data = await load(l.file, manifest);
         const want = manifest.sums[String(l.pr)];
         const s = data.sums;
-        const sum = s.scrutinize + s.glance + s.ai_cleared + s.counted + s.untriaged;
+        const sum = s.scrutinize + s.glance + s.ai_cleared + s.counted + s.untriaged + s.settled;
         if (!want || JSON.stringify(want) !== JSON.stringify(s) || sum !== s.total ||
             s.ai_cleared !== s.ai_cleared_read_by_decider_or_stack_review + s.ai_cleared_read_by_scout_only) {
           throw new Error("layer #" + l.pr + "'s line counts do not match the manifest or do not sum to its diff");
@@ -260,7 +271,7 @@ textarea#review-text { width: 100%; min-height: 8rem; font: 0.8rem var(--mono); 
 
   function draw(stack, layers, manifest) {
     liveHashes = new Set();
-    for (const l of stack.layers) for (const c of layers[l.pr].cards) for (const r of c.ranges) liveHashes.add(r.hash);
+    for (const l of stack.layers) for (const c of [...layers[l.pr].cards, ...layers[l.pr].settled]) for (const r of c.ranges) liveHashes.add(r.hash);
     const kids = [];
     kids.push(drawHeader(stack, layers));
     if (stack.assessment) kids.push(drawAssessment(stack));
@@ -284,12 +295,20 @@ textarea#review-text { width: 100%; min-height: 8rem; font: 0.8rem var(--mono); 
         el("code", { class: "muted", text: "head " + l.head.slice(0, 9) }),
         el("span", { class: "fresh muted", id: "fresh-" + l.pr, text: "checking freshness…" }));
     });
-    const open = stack.open_cards;
+    // The open count is live: a card the user answers is no longer open.
+    const openLine = el("strong", { id: "open-count" });
+    const update = () => {
+      let open = 0;
+      for (const l of stack.layers) for (const c of layers[l.pr].cards) if (c.tier === "scrutinize" && cardState(stack, c).state === "open") open++;
+      openLine.textContent = open + (open === 1 ? " card open" : " cards open");
+    };
+    update();
+    watchers.push(update);
     return el("header", { class: "top" },
       el("span", { class: "label", text: "Review brief · " + stack.repo }),
       el("h1", { text: stack.layers.length > 1 ? "Stack of " + stack.layers.length + " PRs under #" + stack.layers[0].pr : "PR #" + stack.layers[0].pr }),
       el("p", { class: "row" },
-        el("strong", { text: open + (open === 1 ? " card open" : " cards open") }),
+        openLine,
         el("span", { class: "muted", text: stack.mode === "whole" ? "Merge mode: whole stack. You review each change in the form that reaches " + (stack.trunk || "master") + "." : "Merge mode: per layer. Each layer's own end state is shown." })),
       el("div", { class: "layers" }, lines),
       el("p", { id: "stale-banner", class: "banner", hidden: true }));
@@ -329,29 +348,54 @@ textarea#review-text { width: 100%; min-height: 8rem; font: 0.8rem var(--mono); 
     const rows = stack.layers.map((l) => {
       const s = layers[l.pr].sums;
       const v = { scrutinize: s.scrutinize, glance: s.glance, deep: s.ai_cleared_read_by_decider_or_stack_review,
-        scout: s.ai_cleared_read_by_scout_only, counted: s.counted, untriaged: s.untriaged };
+        scout: s.ai_cleared_read_by_scout_only, settled: s.settled, counted: s.counted, untriaged: s.untriaged };
       const bar = el("div", { class: "bar", role: "img", "aria-label": "Layer #" + l.pr + " lines by tier" },
         TIERS.filter(([k]) => v[k] > 0).map(([k, name, cls]) =>
           el("span", { class: cls, style: "width:" + (100 * v[k] / Math.max(1, s.total)) + "%", title: name + ": " + fmt(v[k]) + " lines" })));
       return el("div", { class: "stack" },
         el("div", { class: "row" }, el("strong", { text: "#" + l.pr }),
           el("span", { class: "muted num", text: fmt(s.scrutinize) + " scrutinize · " + fmt(s.glance) + " glance · " + fmt(s.ai_cleared) +
-            " AI-cleared · " + fmt(s.counted) + " counted" + (s.untriaged ? " · " + fmt(s.untriaged) + " untriaged" : "") + " = " + fmt(s.total) + " changed lines" })),
+            " AI-cleared · " + (s.settled ? fmt(s.settled) + " settled earlier · " : "") + fmt(s.counted) + " counted" + (s.untriaged ? " · " + fmt(s.untriaged) + " untriaged" : "") + " = " + fmt(s.total) + " changed lines" })),
         bar);
     });
     return el("section", { id: "ledger", class: "ledger", "data-state": "verified", "aria-label": "Ledger" },
       el("h2", { text: "Ledger" }),
-      el("p", { class: "muted", text: "Every changed line of each layer is in exactly one tier, and the tiers sum to the layer's diff. \"Reported read\" means the agent reported reading those lines; the program checks the ranges it reported, not that it read them." }),
+      el("p", { class: "muted", text: "Every changed line of each layer is in exactly one tier, and the tiers sum to the layer's diff. \"Settled in an earlier round\" is code you settled on an earlier page that has not changed since: it is not asked again. \"Reported read\" means the agent reported reading those lines; the program checks the ranges it reported, not that it read them." }),
       rows,
       el("div", { class: "legend" }, TIERS.map(([, name, cls]) => el("span", {}, el("i", { class: cls }), name))));
   }
 
   function drawDecisions(stack, layers) {
     const items = stack.decisions || [];
-    return el("section", { class: "decisions stack", "aria-label": "Decisions waiting for you" },
+    if (!items.length) return el("section", { class: "decisions stack", "aria-label": "Decisions waiting for you" },
       el("h2", { text: "Decisions waiting for you" }),
-      items.length ? el("ul", {}, items.map((d) => el("li", {}, el("a", { href: "#card-" + d.layer + "-" + d.card, text: d.text }), el("span", { class: "muted", text: " · #" + d.layer }))))
-        : el("p", { class: "muted", text: "None: no open question, deviation from the spec or overruled board finding was recorded." }));
+      el("p", { class: "muted", text: "None: no open question, deviation from the spec or overruled board finding was recorded." }));
+    // Each entry follows its card's answer, live; an answered one stays in
+    // the list, marked, so the list still says what was decided.
+    const byId = {};
+    for (const l of stack.layers) for (const c of layers[l.pr].cards) byId[l.pr + "/" + c.id] = c;
+    const summary = el("p", { class: "muted" });
+    const rows = items.map((d) => {
+      const chip = el("span", { class: "chip" });
+      const li = el("li", {}, el("a", { href: "#card-" + d.layer + "-" + d.card, text: d.text }), el("span", { class: "muted", text: " · #" + d.layer + " " }), chip);
+      return { d, li, chip };
+    });
+    const update = () => {
+      let open = 0;
+      for (const { d, li, chip } of rows) {
+        const c = byId[d.layer + "/" + d.card];
+        const s = c ? cardState(stack, c).state : "open";
+        if (s === "open") open++;
+        li.dataset.state = s;
+        setStateChip(chip, s);
+      }
+      summary.textContent = open ? open + " of " + rows.length + " still need your answer." : "All " + rows.length + " answered.";
+    };
+    update();
+    watchers.push(update);
+    return el("section", { class: "decisions stack", "aria-label": "Decisions waiting for you" },
+      el("h2", { text: "Decisions waiting for you" }), summary,
+      el("ul", {}, rows.map((r) => r.li)));
   }
 
   // Diff bodies load per layer, when the layer is opened, and are checked
@@ -477,11 +521,13 @@ textarea#review-text { width: 100%; min-height: 8rem; font: 0.8rem var(--mono); 
       p.raised_by && "raised by " + p.raised_by, c.floors && c.floors.length && "floor: " + c.floors.join(", ")].filter(Boolean).join(" · ");
   }
 
-  // A card's state derives from its ranges' content hashes, so regrouping
-  // cards resets nothing and a changed range reopens its card.
-  // A card's review is its state (fine, concern or none), the answer picked
-  // from its options and the user's note, stored under each range's content
-  // hash: it is this card's alone.
+  // A card's review is its answer (the choice picked, and whether that choice
+  // keeps the code or asks for a change) and the user's note, stored under
+  // each range's content hash: it is this card's alone, so regrouping cards
+  // resets nothing and a changed range reopens its card. Its state derives
+  // from the answer: open (none yet), settled (the code stays as it is) or
+  // change (a change is requested). Glance and AI-cleared items are answered
+  // the same way, with "Fine" or "Needs a change".
   //
   // An anchor (path#symbol) is shared by every range in one function, so it
   // never holds a card's review. It records which hashes were reviewed there,
@@ -497,8 +543,53 @@ textarea#review-text { width: 100%; min-height: 8rem; font: 0.8rem var(--mono); 
     return a.hash ? { [a.hash]: a.note || "" } : {}; // the record before notes were kept per hash
   }
 
+  // The page's controls call changed() after every answer or note, so every
+  // count that depends on answers (the layer's, the top line, the decisions
+  // list) follows it.
+  const watchers = [];
+  function changed() { for (const w of watchers) w(); }
+
+  const SOMETHING_ELSE = "Something else";
+  // A Glance or AI-cleared item, or a card that offers no options.
+  const ITEM_ANSWERS = [{ choice: "Fine", impact: "", change: false }, { choice: "Needs a change", impact: "", change: true }];
+
+  // answersOf is what a card can be answered with: its options, then
+  // "Something else", which asks for a change the note describes.
+  function answersOf(c) {
+    if (!c.options || !c.options.length) return ITEM_ANSWERS;
+    return [...c.options.map((o) => ({ choice: o.choice, impact: o.impact, change: !!o.change })),
+      { choice: SOMETHING_ELSE, impact: "None of these. Say in your note what should change.", change: true }];
+  }
+
+  function changeOf(c, choice) {
+    const o = [...answersOf(c), ...ITEM_ANSWERS].find((a) => a.choice === choice);
+    return o ? o.change : null;
+  }
+
+  // recordOf reads a stored record. Records written before answers carried
+  // `change` had a `state`: concern is a change request and fine settles the
+  // code; one with only a choice takes its option's `change`.
+  function recordOf(c, s) {
+    let change = null;
+    if (typeof s.change === "boolean") change = s.change;
+    else if (s.state === "concern") change = true;
+    else if (s.state === "fine") change = false;
+    else if (s.choice) change = changeOf(c, s.choice);
+    return { choice: s.choice || null, change, note: s.note || "" };
+  }
+  const stateOf = (change) => change === true ? "change" : change === false ? "settled" : "open";
+
+  // inherit gives an item the user settled on an earlier page, code
+  // unchanged, that answer while this browser holds none for it. It is not
+  // this round's answer: its note is not copied into a review again.
+  function inherit(c, st) {
+    const e = c.earlier_round;
+    if (!e || e.code !== "unchanged" || e.decision !== "settled") return st;
+    return { ...st, state: "settled", choice: e.choice || null, change: false, inherited: true, earlierNote: e.note || "" };
+  }
+
   function cardState(stack, c) {
-    let state = null, reopened = false, surroundings = false, choice = null, note = "";
+    let state = null, reopened = false, surroundings = false, choice = null, change = null, note = "";
     let first = true;
     for (const r of c.ranges) {
       const s = store.get(stateKey(stack, r.hash));
@@ -509,22 +600,25 @@ textarea#review-text { width: 100%; min-height: 8rem; font: 0.8rem var(--mono); 
           reopened = true;
           if (n) earlier.push(n);
         }
-        return { state: null, choice: null, note: "", earlier, reopened, surroundings };
+        return inherit(c, { state: "open", choice: null, change: null, note: "", earlier, reopened, surroundings });
       }
       if (s.context !== r.context) surroundings = true;
-      state = first || state === s.state ? s.state : "mixed";
-      if (first) { choice = s.choice || null; note = s.note || ""; }
+      const v = recordOf(c, s);
+      const st = stateOf(v.change);
+      state = first || state === st ? st : "mixed";
+      if (first) { choice = v.choice; change = v.change; note = v.note; }
       first = false;
     }
-    return { state: state === "mixed" ? null : state, choice, note, earlier: [], reopened, surroundings };
+    if (state === "mixed") return { state: "open", choice: null, change: null, note, earlier: [], reopened, surroundings };
+    return { state, choice, change, note, earlier: [], reopened, surroundings };
   }
 
   function setCardReview(stack, c, patch) {
     const cur = cardState(stack, c);
-    const v = { state: cur.state, choice: cur.choice, note: cur.note, ...patch };
-    const kept = !!(v.state || v.choice || v.note);
+    const v = { choice: cur.choice, change: cur.change, note: cur.note, ...patch };
+    const kept = v.change !== null || !!v.choice || !!v.note;
     for (const r of c.ranges) {
-      if (kept) store.set(stateKey(stack, r.hash), { state: v.state, choice: v.choice, note: v.note, context: r.context });
+      if (kept) store.set(stateKey(stack, r.hash), { choice: v.choice, change: v.change, note: v.note, context: r.context });
       else store.del(stateKey(stack, r.hash));
       // Record this hash at the anchor, and drop the hashes no range has any
       // more: once a range at this place is reviewed, they are superseded.
@@ -536,45 +630,78 @@ textarea#review-text { width: 100%; min-height: 8rem; font: 0.8rem var(--mono); 
     }
   }
 
-  // A card is closed once it is marked fine or concern, or an answer is picked.
-  function isClosed(s) { return s.state === "fine" || s.state === "concern" || !!s.choice; }
+  function setStateChip(chip, state) {
+    chip.className = "chip state state-" + state;
+    chip.textContent = state === "settled" ? "settled" : state === "change" ? "change requested" : "open";
+  }
 
-  function drawCard(stack, l, manifest, c, onChange) {
+  // answerControls draws the answers and the note of a card or an item, and
+  // keeps its data-state, its state chips and its buttons in step with what
+  // is stored. Picking the selected answer again clears it.
+  function answerControls(stack, c, answers, host, chips, optionClass) {
+    const hint = el("p", { class: "note-hint", hidden: true,
+      text: "This asks for a change without saying which: write it in your note, or whoever makes the change has nothing to go on." });
+    const buttons = answers.map((a) => el("button", {
+      type: "button", class: optionClass, "data-choice": a.choice,
+      onclick: () => {
+        const again = cardState(stack, c).choice === a.choice;
+        setCardReview(stack, c, again ? { choice: null, change: null } : { choice: a.choice, change: a.change });
+        refresh(); changed();
+      },
+    }, optionClass ? [
+      el("span", { class: "answer" }, el("span", { class: "choice", text: a.choice }),
+        el("span", { class: a.change ? "kind change" : "kind", text: a.change ? "asks for a change" : "keeps the code" })),
+      el("span", { class: "impact", text: a.impact })] : a.choice));
+    const noteBox = el("textarea", { rows: 2, placeholder: "What should change, or why this answer. Kept in this browser; it goes into the copied review and the decisions for the next round.",
+      oninput: (ev) => { setCardReview(stack, c, { note: ev.currentTarget.value.trim() ? ev.currentTarget.value : "" }); refresh(); changed(); } });
+    noteBox.value = cardState(stack, c).note || "";
+    const refresh = () => {
+      const st = cardState(stack, c);
+      host.dataset.state = st.state;
+      for (const ch of chips) setStateChip(ch, st.state);
+      for (const b of buttons) b.setAttribute("aria-pressed", String(st.state !== "open" && b.dataset.choice === st.choice));
+      hint.hidden = !(st.state === "change" && !(c.options || []).some((o) => o.choice === st.choice) && !st.note.trim());
+    };
+    refresh();
+    return { buttons, noteBox, hint };
+  }
+
+  // earlierRoundOf shows the answer the user gave this code on an earlier
+  // round's page, from the decisions carried to this round.
+  function earlierRoundOf(c) {
+    const e = c.earlier_round;
+    if (!e) return null;
+    const answer = e.choice || (e.decision === "change" ? "a change" : "no change");
+    const kind = e.decision === "change" ? " (asks for a change)" : " (keeps the code)";
+    const lead = e.code === "changed" ? "In an earlier round you answered: "
+      : e.decision === "change" ? "In an earlier round you asked for a change here, and this code has not changed since. You answered: "
+      : "You settled this in an earlier round: ";
+    return el("div", { class: "earlier-round" }, el("span", { class: "label", text: "Earlier round" }),
+      el("p", {}, lead, el("strong", { text: answer }), kind, e.code === "changed" ? ". The code has changed since: check that the answer still holds." : "."),
+      e.note ? el("p", { class: "prose muted", text: e.note }) : null);
+  }
+
+  const notDone = (c) => !!c.earlier_round && c.earlier_round.decision === "change" && c.earlier_round.code === "unchanged";
+
+  function drawCard(stack, l, manifest, c) {
     const st = cardState(stack, c);
-    const card = el("article", { class: "card", id: "card-" + l.pr + "-" + c.id, "data-state": st.state || "unread", "data-answered": String(!!st.choice) });
-    const buttons = ["unread", "fine", "concern"].map((s) => el("button", {
-      type: "button", "aria-pressed": String((st.state || "unread") === s), text: s === "unread" ? "Unread" : s === "fine" ? "Fine" : "Concern",
-      onclick: (ev) => {
-        setCardReview(stack, c, { state: s === "unread" ? null : s });
-        card.dataset.state = s;
-        for (const b of buttons) b.setAttribute("aria-pressed", String(b === ev.currentTarget));
-        onChange();
-      },
-    }));
-    // Picking an answer records it; picking it again clears it.
-    const optionButtons = (c.options || []).map((o) => el("button", {
-      type: "button", class: "option", "aria-pressed": String(st.choice === o.choice),
-      onclick: (ev) => {
-        const on = ev.currentTarget.getAttribute("aria-pressed") !== "true";
-        setCardReview(stack, c, { choice: on ? o.choice : null });
-        card.dataset.answered = String(on);
-        for (const b of optionButtons) b.setAttribute("aria-pressed", String(on && b === ev.currentTarget));
-        onChange();
-      },
-    }, el("span", { class: "choice", text: o.choice }), el("span", { class: "impact", text: o.impact })));
-    const noteBox = el("textarea", { rows: 2, placeholder: "What should change, or why you picked this answer. Kept in this browser; it goes into the copied review.",
-      oninput: (ev) => { setCardReview(stack, c, { note: ev.currentTarget.value.trim() ? ev.currentTarget.value : "" }); onChange(); } });
-    noteBox.value = st.note || "";
+    const card = el("article", { class: "card", id: "card-" + l.pr + "-" + c.id, "data-state": st.state });
+    const chip = el("span", { class: "chip state" });
+    const ctl = answerControls(stack, c, answersOf(c), card, [chip], "option");
     add(card,
-      el("div", { class: "row" },
+      el("div", { class: "row" }, chip,
         c.reason_title ? el("span", { class: "chip reason", text: c.reason_title }) : null,
+        notDone(c) ? el("span", { class: "chip reopened", text: "you asked for a change here: not done yet" }) : null,
         st.reopened ? el("span", { class: "chip reopened", text: "changed since you reviewed it" }) : null,
         st.surroundings ? el("span", { class: "chip", text: "surroundings changed" }) : null),
       el("h4", { class: "card-title", text: c.title || c.claim }),
-      c.question ? el("div", { class: "decision" },
-        el("p", { class: "question", text: c.question }),
-        optionButtons.length ? el("ul", { class: "options", "aria-label": "Pick an answer; each says what it means" },
-          optionButtons.map((b) => el("li", {}, b))) : null) : null,
+      el("div", { class: "decision" },
+        c.question ? el("p", { class: "question", text: c.question }) : null,
+        el("ul", { class: "options", "aria-label": "Your answer; each says whether it keeps the code or asks for a change" },
+          ctl.buttons.map((b) => el("li", {}, b))),
+        el("label", { class: "review-note" }, el("span", { class: "label", text: "Your note" }), ctl.noteBox),
+        ctl.hint),
+      earlierRoundOf(c),
       c.context ? el("p", { class: "context prose", text: c.context }) : null,
       diagramOf(c),
       examplesOf(c),
@@ -583,9 +710,7 @@ textarea#review-text { width: 100%; min-height: 8rem; font: 0.8rem var(--mono); 
       c.title ? el("div", { class: "why" }, el("span", { class: "label", text: "Why it's flagged" }), el("p", { class: "prose", text: c.claim })) : null,
       cardFoot(c),
       st.earlier.length ? el("div", { class: "earlier-notes" }, el("span", { class: "label", text: "Your notes on the earlier code here" }),
-        st.earlier.map((n) => el("p", { class: "prose muted", text: n }))) : null,
-      el("label", { class: "review-note" }, el("span", { class: "label", text: "Your note" }), noteBox),
-      el("div", { class: "states" }, buttons));
+        st.earlier.map((n) => el("p", { class: "prose muted", text: n }))) : null);
     return card;
   }
 
@@ -610,14 +735,24 @@ textarea#review-text { width: 100%; min-height: 8rem; font: 0.8rem var(--mono); 
     return [...seen.values()].map((m) => el("div", {}, link(m.link, m.short, "mono"), " ", m.subject || ""));
   }
 
+  // drawItem draws a Glance, AI-cleared or settled-earlier item: a line that
+  // opens on its code, answered with "Fine" or "Needs a change". The code is
+  // drawn when the item is first opened; the answers are there from the start.
   function drawItem(stack, l, manifest, c) {
+    const chip = el("span", { class: "chip state" });
     const d = el("details", { class: "item", id: "card-" + l.pr + "-" + c.id },
-      el("summary", {}, el("span", { text: c.title || c.claim }), el("span", { class: "muted num", text: " · " + fmt(c.changed) + " lines" })));
+      el("summary", {}, el("span", { text: c.title || c.claim }), el("span", { class: "muted num", text: " · " + fmt(c.changed) + " lines " }), chip));
+    const ctl = answerControls(stack, c, ITEM_ANSWERS, d, [chip], null);
+    const lazy = el("div", { class: "stack" });
+    d.append(el("div", { class: "stack" }, earlierRoundOf(c), lazy,
+      el("div", { class: "states", role: "group", "aria-label": "Your answer" }, ctl.buttons),
+      el("label", { class: "review-note" }, el("span", { class: "label", text: "Your note" }), ctl.noteBox),
+      ctl.hint));
     let filled = false;
     d.addEventListener("toggle", () => {
       if (!d.open || filled) return;
       filled = true;
-      d.append(el("div", { class: "stack" },
+      lazy.append(el("div", { class: "stack" },
         c.title ? el("p", { class: "prose", text: c.claim }) : null,
         c.context ? el("p", { class: "prose muted", text: c.context }) : null,
         diagramOf(c),
@@ -636,12 +771,14 @@ textarea#review-text { width: 100%; min-height: 8rem; font: 0.8rem var(--mono); 
     const glance = data.cards.filter((c) => c.tier === "glance");
     const cleared = data.cards.filter((c) => c.tier === "ai-cleared");
     const progress = el("span", { class: "muted" });
+    // A card is closed once its answer settles it or requests a change.
     const update = () => {
-      const closed = cards.filter((c) => isClosed(cardState(stack, c))).length;
+      const closed = cards.filter((c) => cardState(stack, c).state !== "open").length;
       progress.textContent = cards.length === 0 ? "No cards in this layer." :
         closed === cards.length ? "All " + cards.length + " cards closed: this layer has none left." : closed + " of " + cards.length + " cards closed.";
     };
     update();
+    watchers.push(update);
     const body = el("div", { class: "layer-body" });
     const sec = el("details", { class: "layer", id: "layer-" + l.pr, open: cards.length > 0 || data.untriaged.length > 0 },
       el("summary", {},
@@ -655,9 +792,14 @@ textarea#review-text { width: 100%; min-height: 8rem; font: 0.8rem var(--mono); 
       if (data.overflow) body.append(el("p", { class: "banner", text: fmt(data.used.cards) + " changes in this layer need you, over its budget of " + fmt(data.budget.cards) + " cards and " + fmt(data.budget.lines) + " lines. Every one is shown: the layer is too large to review in less." }));
       if (data.confirmation) body.append(el("p", { class: "muted", text: data.confirmation }));
       body.append(el("div", { class: "stack" }, el("h3", { text: "Scrutinize" }),
-        cards.length ? cards.map((c) => drawCard(stack, l, manifest, c, update)) : el("p", { class: "muted", text: "No change in this layer needs your judgment." })));
+        cards.length ? cards.map((c) => drawCard(stack, l, manifest, c)) : el("p", { class: "muted", text: "No change in this layer needs your judgment." })));
       if (glance.length) body.append(el("div", { class: "stack" }, el("h3", { text: "Glance" }), el("div", { class: "items" }, glance.map((c) => drawItem(stack, l, manifest, c)))));
       if (cleared.length) body.append(el("div", { class: "stack" }, el("h3", { text: "AI-cleared" }), el("div", { class: "items" }, cleared.map((c) => drawItem(stack, l, manifest, c)))));
+      const settled = data.settled || [];
+      if (settled.length) body.append(el("details", { class: "item settled-earlier", id: "settled-" + l.pr },
+        el("summary", {}, el("strong", { text: "Settled earlier" }),
+          el("span", { class: "muted", text: " · " + count(settled.length, "item") + " you settled on an earlier page, whose code has not changed since. They are not asked again; \"Needs a change\" reopens one." })),
+        el("div", { class: "items" }, settled.map((c) => drawItem(stack, l, manifest, c)))));
       body.append(drawCounted(data));
     };
     if (sec.open) fill(); else sec.addEventListener("toggle", () => { if (sec.open) fill(); });
@@ -689,15 +831,40 @@ textarea#review-text { width: 100%; min-height: 8rem; font: 0.8rem var(--mono); 
       blocks);
   }
 
-  // reviewedItems is every card, in stack order, that the user marked as a
-  // concern, answered or wrote a note on.
-  function reviewedItems(stack, layers) {
+  // everyItem is every card and item of the stack, in stack order, with its
+  // state: the tiers, then what was settled earlier.
+  function everyItem(stack, layers) {
     const items = [];
-    for (const l of stack.layers) for (const c of layers[l.pr].cards) {
-      const s = cardState(stack, c);
-      if (s.state === "concern" || s.choice || s.note) items.push({ l, c, s });
-    }
+    for (const l of stack.layers) for (const c of [...layers[l.pr].cards, ...(layers[l.pr].settled || [])]) items.push({ l, c, s: cardState(stack, c) });
     return items;
+  }
+
+  // reviewedItems is what the copied review and fix prompt list: every card
+  // or item that asks for a change, and every one with a note. A card that is
+  // settled and has no note needs nothing, so it is left out; an answer
+  // carried from an earlier round is not this round's, so it is too.
+  function reviewedItems(stack, layers) {
+    return everyItem(stack, layers).filter(({ s }) => !s.inherited && (s.state === "change" || s.note));
+  }
+
+  // decisionsBlock is what "Copy decisions for the next round" copies
+  // (heph-review-brief-decisions/1, FORMAT.md): every card or item that is
+  // settled or asks for a change, so the next round does not ask it again.
+  function decisionsBlock(stack, layers) {
+    const decisions = [];
+    for (const { l, c, s } of everyItem(stack, layers)) {
+      if (s.state === "open") continue;
+      const d = { layer: l.pr, card: c.id, title: c.title || c.claim };
+      if (c.question) d.question = c.question;
+      d.decision = s.state === "change" ? "change" : "settled";
+      if (s.choice) d.choice = s.choice;
+      const note = s.inherited ? s.earlierNote : s.note;
+      if (note && note.trim()) d.note = note;
+      d.ranges = c.ranges.map((r) => ({ path: r.path, side: r.side || "new", start: r.start, end: r.end, hash: r.hash, anchor: r.anchor, changed: r.changed }));
+      decisions.push(d);
+    }
+    return { format: "heph-review-brief-decisions/1", stack_key: stack.stack_key, bottom_pr: stack.layers[0].pr,
+      heads: stack.layers.map((l) => ({ pr: l.pr, head: l.head })), copied_at: new Date().toISOString(), decisions };
   }
 
   function count(n, word) { return n + " " + word + (n === 1 ? "" : "s"); }
@@ -707,7 +874,8 @@ textarea#review-text { width: 100%; min-height: 8rem; font: 0.8rem var(--mono); 
   function reviewMarkdown({ l, c, s }) {
     const r = c.ranges[0];
     const lines = ["### #" + l.pr + " · " + (c.title || c.claim), "[`" + refText(r) + "`](" + r.link + ")" + (c.ranges.length > 1 ? " and " + (c.ranges.length - 1) + " more range" + (c.ranges.length > 2 ? "s" : "") : "")];
-    if (s.state === "concern") lines.push("**Concern.**");
+    if (s.state === "change") lines.push("**Change requested.**");
+    else if (s.state === "settled") lines.push("**No change.** The code stays as it is; the note is for the record.");
     if (c.question) lines.push("Question: " + c.question);
     if (s.choice) {
       const o = (c.options || []).find((x) => x.choice === s.choice);
@@ -727,29 +895,37 @@ textarea#review-text { width: 100%; min-height: 8rem; font: 0.8rem var(--mono); 
       if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(() => { note.textContent = "Copied."; }, fallback);
       else fallback();
     };
-    const empty = "No card has a concern, an answer or a note yet.";
+    const empty = "No card or item asks for a change or has a note yet.";
     const copyGitHub = el("button", { type: "button", text: "Copy GitHub review", onclick: () => {
       const items = reviewedItems(stack, layers);
       if (!items.length) { show(empty); return; }
-      const concerns = items.filter((i) => i.s.state === "concern").length;
-      show("Review of " + chain + ", from its review brief: " + count(concerns, "concern") + ", " + count(items.filter((i) => i.s.choice).length, "answer") + ".\n\n" +
+      const changes = items.filter((i) => i.s.state === "change").length;
+      show("Review of " + chain + ", from its review brief: " + count(changes, "change request") + ", " + count(items.filter((i) => i.s.note).length, "note") + ".\n\n" +
         items.map(reviewMarkdown).join("\n\n"));
     } });
     const copyPrompt = el("button", { type: "button", text: "Copy fix prompt", onclick: () => {
       const items = reviewedItems(stack, layers);
       if (!items.length) { show(empty); return; }
-      show("/goal apply my review of the stack " + chain + ". For each item below, change the code in the layer it names (fix a lower layer from the top branch with a fixup commit), then push. " +
-        "Where I picked an answer, carry out that answer. Where I marked a concern, address my note; if the note is missing or unclear, ask me before changing the code.\n\n" +
+      show("/goal apply my review of the stack " + chain + ". For each item below marked \"Change requested\", change the code in the layer it names (fix a lower layer from the top branch with a fixup commit), then push. " +
+        "Where I picked one of the card's answers, carry out that answer. Where I answered \"Something else\" or \"Needs a change\", do what my note says; if the note is missing or unclear, ask me before changing the code. " +
+        "An item marked \"No change\" is listed only for its note: leave its code as it is.\n\n" +
         items.map(reviewMarkdown).join("\n\n"));
+    } });
+    const copyDecisions = el("button", { type: "button", text: "Copy decisions for the next round", onclick: () => {
+      const block = decisionsBlock(stack, layers);
+      if (!block.decisions.length) { show("No card or item has an answer yet: there is nothing to carry to the next round."); return; }
+      show("```json\n" + JSON.stringify(block, null, 2) + "\n```\n");
     } });
     const nic = stack.not_in_code || [];
     return el("footer", {},
       nic.length ? el("section", { class: "notincode stack" }, el("h3", { text: "Not in the code" }),
         el("p", { text: "Points with no code to show. They are not part of what you approve." }),
         el("ul", {}, nic.map((n) => el("li", {}, n.text, " ", link(n.link, "where it was raised"))))) : null,
-      el("div", { class: "row" }, copyGitHub, copyPrompt, note),
+      el("div", { class: "row" }, copyGitHub, copyPrompt, copyDecisions, note),
       out,
-      el("p", { text: "Each card's state, the answer you picked and your note are kept in this browser only, keyed by each range's content: a rebase keeps them, and a change to the code reopens the card and shows your note on the earlier code. No agent can read them. The copied review lists every card with a concern, an answer or a note. Paste the GitHub review into the PR's \"Review changes\" box (request changes there), or paste the fix prompt into a new Claude session to have the changes made." }),
+      el("p", { text: "Your answer on each card or item is its decision: an answer that keeps the code settles it, and one that asks for a change (\"Something else\" and \"Needs a change\" included) requests the change. Answers and notes are kept in this browser only, keyed by each range's content: a rebase keeps them, and a change to the code reopens the card and shows your note on the earlier code." }),
+      el("p", { text: "The GitHub review and the fix prompt list every change request and every note; a settled card with no note is left out. Paste the review into the PR's \"Review changes\" box (request changes there), or the prompt into a new Claude session to have the changes made." }),
+      el("p", { text: "No agent can read this browser. To carry your answers to the next round, press \"Copy decisions for the next round\" and paste the block when you start the next /review-brief: what you settled is not raised again while its code is unchanged, and each change you asked for is checked." }),
       el("p", { text: "Format " + stack.format + ". Approval and merge stay on GitHub." }));
   }
 
