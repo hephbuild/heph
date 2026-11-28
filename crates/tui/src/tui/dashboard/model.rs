@@ -236,6 +236,8 @@ const OP_OPEN: u8 = 1 << 4;
 const ENDED: u8 = 1 << 5;
 /// Between its `ResultStart` and its `ResultEnd`.
 const IN_FLIGHT: u8 = 1 << 6;
+/// Its `ResultEnd` closed an in-flight scope: the end a progress line counts.
+const ENDED_IN_FLIGHT: u8 = 1 << 7;
 
 /// Wait bits.
 const WAIT_ADMISSION: u8 = 1;
@@ -612,14 +614,21 @@ impl Model {
                     _ => None,
                 };
                 let id = self.touch(addr);
+                // A culprit blamed after its own scope ended ok: the blame's
+                // end makes the row the failure it is. Any other second end
+                // (a duplicate's, a stop's) leaves the row as it ended.
+                let reopen = error.is_some() && !duplicate && !cancelled && self.ended_ok(id);
                 let Some(r) = self.rec_mut(id) else {
                     return;
                 };
-                if r.flags & ENDED != 0 {
+                if r.flags & ENDED != 0 && !reopen {
                     return;
                 }
                 let was_in_flight = r.flags & IN_FLIGHT != 0;
                 r.flags = (r.flags | ENDED) & !(OP_OPEN | IN_FLIGHT);
+                if was_in_flight {
+                    r.flags |= ENDED_IN_FLIGHT;
+                }
                 r.waits = 0;
                 r.end_ms = at;
                 let cached = r.flags & CACHE_HIT != 0;
@@ -794,6 +803,24 @@ impl Model {
             .get(addr)
             .and_then(|id| self.record(id))
             .is_some_and(|r| r.flags & IN_FLIGHT != 0)
+    }
+
+    /// Whether row `id` ended ok: done or cached.
+    fn ended_ok(&self, id: Id) -> bool {
+        self.record(id).is_some_and(|r| {
+            r.flags & ENDED != 0 && matches!(r.state, RowState::Done | RowState::Cached)
+        })
+    }
+
+    /// `Some` when `addr` ended ok, so a culprit's failing end would reopen
+    /// it as failed (see the `ResultEnd` fold); `true` when that ok end
+    /// closed an in-flight scope, the end a progress line counted as done.
+    pub fn ok_end(&self, addr: &str) -> Option<bool> {
+        let id = self.names.get(addr)?;
+        self.ended_ok(id).then(|| {
+            self.record(id)
+                .is_some_and(|r| r.flags & ENDED_IN_FLIGHT != 0)
+        })
     }
 
     /// How many targets are between their `ResultStart` and `ResultEnd`.

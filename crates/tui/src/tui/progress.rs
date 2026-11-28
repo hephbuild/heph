@@ -485,7 +485,9 @@ impl BuildState {
     ///
     /// Idempotent against the rare same-addr/different-`OutputMatcher`
     /// double-fire: `ResultStart` inserts only if absent, and a second
-    /// `ResultEnd` for an already-removed addr is a no-op.
+    /// `ResultEnd` for an already-removed addr is a no-op, except a
+    /// culprit's: a failing, non-duplicate end on a row that ended ok
+    /// reopens it as failed.
     pub fn apply(&mut self, ev: &BuildEvent) {
         // Anchor the elapsed clock to the earliest event observed.
         self.started_at_ms = Some(match self.started_at_ms {
@@ -508,6 +510,19 @@ impl BuildState {
         let was_in_flight = match &ev.kind {
             BuildEventKind::ResultEnd { addr, .. } => self.dash.in_flight(addr),
             _ => false,
+        };
+        // A culprit blamed after its own scope ended ok: the model reopens
+        // the row as failed, and the counts move it from done to errored.
+        // `Some(true)` when the ok end was counted done.
+        let reopened = match &ev.kind {
+            BuildEventKind::ResultEnd {
+                addr,
+                error: Some(_),
+                duplicate: false,
+                cancelled: false,
+                ..
+            } => self.dash.ok_end(addr),
+            _ => None,
         };
         self.dash.apply(ev, &self.redact);
         if let Some(addr) = op_addr {
@@ -590,6 +605,14 @@ impl BuildState {
                         }
                     } else {
                         self.completed += 1;
+                    }
+                } else if let Some(counted_done) = reopened {
+                    if counted_done {
+                        self.completed = self.completed.saturating_sub(1);
+                    }
+                    self.errored += 1;
+                    if upstream_of.is_none() {
+                        self.root_failed += 1;
                     }
                 } else if error.is_some()
                     && upstream_of.is_none()
@@ -3795,13 +3818,68 @@ mod tests {
         s.apply(&ev(1, result_start("//a:b")));
         assert_eq!(s.dash.in_flight_count(), 1);
         s.apply(&ev(2, result_end("//a:b", None)));
-        // Second ResultEnd for an already-removed addr must not double-count.
-        s.apply(&ev(3, result_end("//a:b", Some("late".into()))));
+        // A duplicate's second ResultEnd for an already-ended addr must not
+        // double-count, even failing.
+        let mut dup = result_end("//a:b", Some("late".into()));
+        if let BuildEventKind::ResultEnd { duplicate, .. } = &mut dup {
+            *duplicate = true;
+        }
+        s.apply(&ev(3, dup));
         // Nor does a start after the end reopen it.
         s.apply(&ev(4, result_start("//a:b")));
         assert_eq!(s.completed, 1);
         assert_eq!(s.errored, 0);
         assert_eq!(s.dash.in_flight_count(), 0);
+        let tabs = s.dash.counts(CountScope::All);
+        assert_eq!((tabs.done, tabs.failed), (1, 0));
+    }
+
+    /// A culprit blamed after its own scope ended ok: the blame's failing,
+    /// non-duplicate end turns its Done row into a failed root, and the
+    /// counts move it from done to errored, so done + errored stays within
+    /// the total. A duplicate's end after that changes nothing more.
+    #[test]
+    fn culprit_end_after_ok_reopens_row_as_failed() {
+        let mut s = BuildState::new();
+        s.apply(&ev(1, result_start("//a:c")));
+        s.apply(&ev(2, result_end("//a:c", None)));
+        s.apply(&ev(3, result_start("//a:ok")));
+        s.apply(&ev(4, result_end("//a:ok", None)));
+        assert_eq!((s.completed, s.errored), (2, 0));
+
+        // The blame re-runs its scope: a start that reopens nothing, then
+        // the failing end.
+        s.apply(&ev(5, result_start("//a:c")));
+        s.apply(&ev(6, result_end("//a:c", Some("c broke".into()))));
+        assert_eq!((s.completed, s.errored), (1, 1));
+        assert_eq!(s.failure_split(), (1, 0), "a root");
+        assert_eq!(s.dash.in_flight_count(), 0);
+        let tabs = s.dash.counts(CountScope::All);
+        assert_eq!((tabs.done, tabs.failed), (1, 1));
+        assert!(
+            tabs.done + tabs.failed_total() <= tabs.all(),
+            "{tabs:?} exceeds the total"
+        );
+        assert!(s.completed + s.errored <= tabs.all());
+        assert_eq!(
+            s.dash
+                .failures()
+                .map(|id| s.dash.addr(id))
+                .collect::<Vec<_>>(),
+            ["//a:c"]
+        );
+
+        // Once failed, a later end of either kind is a no-op.
+        let mut dup = result_end("//a:c", Some("c broke".into()));
+        if let BuildEventKind::ResultEnd { duplicate, .. } = &mut dup {
+            *duplicate = true;
+        }
+        s.apply(&ev(7, dup));
+        s.apply(&ev(8, result_end("//a:c", Some("c broke".into()))));
+        assert_eq!((s.completed, s.errored), (1, 1));
+        assert_eq!(s.failure_split(), (1, 0));
+        let tabs = s.dash.counts(CountScope::All);
+        assert_eq!((tabs.done, tabs.failed), (1, 1));
     }
 
     /// A stale entry is a miss in the counts, and the summary names it with
