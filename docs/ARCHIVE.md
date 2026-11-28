@@ -95,16 +95,24 @@ location there does not find them. A plain dependent (`deps`) gets the
 output in `$SRC` and the support files on disk beside it,
 `$(dirname "$SRC")/../include/…` here.
 
-Three rules worth knowing:
+With `support_files`, the extract declares `include`'s patterns as its
+output and `support_files`' as its support files, both below `out`, and
+heph collects them as it collects exec's `out` and `support_files`. Rules
+worth knowing:
 
-- `support_files` **widens** what is extracted: with `include = "bin/protoc"`,
-  `include/**` is extracted because `support_files` names it. Without
-  `include`, every entry is extracted and every file `support_files` does not
-  match is the output (all of it, on `PATH` as a tool would need exactly one).
-- A file **both** lists match is a support file.
-- A symlink may not cross the split: one among the output that points at a
-  support file, or the reverse, fails the run naming the link, since each
-  artifact keeps its links inside itself.
+- `support_files` **needs `include`**, which is then the output, and it
+  **widens** what is extracted: with `include = "bin/protoc"`, `include/**`
+  is extracted because `support_files` names it.
+- Every extracted file is one or the other: a file **both** lists match
+  fails the run, naming it.
+- Both lists are limited to `*`, `?`, `**` and `[…]`: no `{a,b}`, `<…>`,
+  `(?…)` or `\` escapes, since the collector would read them differently
+  from the unpacker. List each alternative as its own pattern.
+- A symlink may not point from one to the other: one among the output that
+  points at a support file, or the reverse, fails the run naming the link,
+  since each artifact keeps its links inside itself. Collecting a pattern
+  does not descend through a symlinked directory either, so a `**` over a
+  tree holding one fails, as an exec output glob does.
 
 Two known limits, both older than `support_files` and tracked in the engine:
 
@@ -115,8 +123,9 @@ Two known limits, both older than `support_files` and tracked in the engine:
   so the dependent can serve its old result. Clean the dependent after such
   a swap. Swapping exec's `out` and `support_files` has the same gap.
 - **On macOS's case-insensitive filesystem**, two directories differing
-  only by case (`include/`, `Include/`) unpack into one, and the split is
-  matched on the names as written to disk, so it can differ from Linux's.
+  only by case (`include/`, `Include/`) unpack into one, and the patterns
+  are collected on the names as written to disk, so which files are
+  collected can differ from Linux's.
   This is the sandbox case/NFC limit described under
   [Cache keys](#cache-keys).
 
@@ -147,7 +156,7 @@ none, fails the consumer, naming the tool and the files it found.
 | `format` | inferred | `tar`, `tar.gz`, `tar.xz`, `tar.zst`, `zip` or `gz`. When omitted, it is taken from the archive file's name suffix (the longest one that matches: `x.tar.gz` is a `tar.gz`, `x.gz` a `gz`), else from its leading bytes (gzip `1f 8b`, xz `fd 37 7a 58 5a 00`, zstd `28 b5 2f fd`, zip `PK\3\4` or `PK\5\6`, tar `ustar` at offset 257; a gzip stream sniffs as a `tar.gz`); neither → an error asking for `format`. Given, it overrides both and is hashed. Omitted, the key holds the inference rules' version (`INFERENCE_VERSION` in `crates/plugin-archive/src/extract.rs`), so a change to those rules re-keys only the targets that infer. |
 | `strip_components` | `0` | Leading path components dropped from every entry, as `tar --strip-components`. Refused with a `gz`: at parse when `format = "gz"` is named, at run when it is inferred. |
 | `include` | every entry | Glob patterns, a string or a list, in the syntax of `group`'s `include` (`*` within a path component, `**` across them, `{a,b}`, `[…]`), matched against each entry's path below `out` after `strip_components` (`bin/tool`). Only the files and links that match one are extracted; see [Unpacking rules](#unpacking-rules) and [Patterns](#patterns). An empty, NUL-holding or invalid pattern is refused at parse, and so is one no entry path can match (a leading `/` or `./`, a trailing `/`, a `.`, `..` or empty component). Hashed when set, sorted and deduped, with `GLOB_VERSION`. |
-| `support_files` | none | Glob patterns (a string or a list, `include`'s syntax and refusals) naming the extracted files and links that are the target's **support files**, not its output: staged beside the output for a dependent or a tool user, at the same path below `out`, but never on `PATH`, in `$TOOL`/`$SRC` or a list file. An entry matching one is extracted whether or not `include` matches it, and each must match an entry. The rest of the extracted files are the output, and at least one must be: a tree that is all support files fails the run. A symlink among the output that points at a support file fails it too, since each artifact keeps its links inside itself. Refused with a named `gz` (its one file would be the support file). Hashed when set, sorted and deduped, with `GLOB_VERSION`. |
+| `support_files` | none | Glob patterns (a string or a list, `include`'s syntax and refusals) naming the extracted files and links that are the target's **support files**, not its output: staged beside the output for a dependent or a tool user, at the same path below `out`, but never on `PATH`, in `$TOOL`/`$SRC` or a list file. An entry matching one is extracted whether or not `include` matches it, and each must match an entry. Needs `include`, whose files are then the output; a file both match fails the run. Both lists are then limited to `*`, `?`, `**` and `[…]`, and collected as output and support-file globs. A symlink among the output that points at a support file, or the reverse, fails the run, since each artifact keeps its links inside itself. Refused with a `gz` (its one file would be the support file). Hashed when set, sorted and deduped, with `GLOB_VERSION`. |
 | `executable` | `False` | `True`: every extracted regular file is `0o755`, as a `gz`'s one file (gzip records no mode) or a zip built on Windows (no Unix mode) needs. A list of glob patterns (a string or a list, `include`'s syntax and refusals): only the files that match one. Holds for every format. Hashed when set; `[]` is `False`. |
 | `out` | the target name | A **directory**, relative to the package, the archive unpacks into. |
 | `max_bytes` | 4 GiB | The most bytes the archive may decode to for its entries, written or read past: in a tar, the entries `include` or `strip_components` leave out are decoded to reach the next one, and count. A zip entry left out is never read and costs nothing. |

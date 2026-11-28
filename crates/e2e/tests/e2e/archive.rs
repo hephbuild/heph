@@ -466,11 +466,11 @@ target(name = "two", driver = "archive.extract", src = ":pack2")
     Ok(())
 }
 
-/// `support_files` splits an extracted tree per file: the binary is the
-/// output, so the extract is a tool on its own, and the support files are
-/// staged beside it in the tool tree (`$HEPH_TOOLS_DIR/<pkg>/<out>/…`) —
-/// the layout of a protoc release, `bin/protoc` and `include/`. A cache hit
-/// serves the same split.
+/// With `support_files`, `include`'s files are the output, so the extract is
+/// a tool on its own, and the support files are staged beside it in the tool
+/// tree (`$HEPH_TOOLS_DIR/<pkg>/<out>/…`) — the layout of a protoc release,
+/// `bin/protoc` and `include/`. A cache hit serves the same artifacts. With
+/// no `include`, or a file both lists match, it fails, naming why.
 #[tokio::test]
 async fn support_files_ride_beside_a_one_file_tool() -> anyhow::Result<()> {
     const SCRIPT: &str = "#!/bin/sh\ncat \"$HEPH_TOOLS_DIR/p/tool/include/a.h\"\n";
@@ -505,20 +505,32 @@ target(
     support_files = "include/**",
 )
 target(name = "use", driver = "bash", run = ["tool > $OUT"], out = "out.txt", tools = [":tool"])
-target(name = "all_support", driver = "archive.extract", src = ":pack", support_files = "**")
+target(name = "no_include", driver = "archive.extract", src = ":pack", support_files = "**")
+target(
+    name = "overlap",
+    driver = "archive.extract",
+    src = ":pack",
+    include = ["bin/tool", "include/a.h"],
+    support_files = "include/**",
+)
 "##,
     );
 
-    let err = ws
-        .run("//p:all_support")
-        .await
-        .err()
-        .ok_or_else(|| anyhow::anyhow!("an extract with no output file must fail"))?;
-    let msg = format!("{err:#}");
-    assert!(
-        msg.contains("every file under \"p/all_support\" is a support file (3 of them)"),
-        "{msg}"
-    );
+    for (addr, want) in [
+        ("//p:no_include", "`support_files` needs `include`"),
+        (
+            "//p:overlap",
+            r#""include/a.h" matches both `include` and `support_files`"#,
+        ),
+    ] {
+        let err = ws
+            .run(addr)
+            .await
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("{addr} must fail"))?;
+        let msg = format!("{err:#}");
+        assert!(msg.contains(want), "{addr}: {msg}");
+    }
 
     let tool = ws.run("//p:tool").await?;
     assert_eq!(
@@ -545,7 +557,7 @@ target(name = "all_support", driver = "archive.extract", src = ":pack", support_
     assert_eq!(
         hashouts(&again),
         hashouts(&tool),
-        "a hit serves the same split"
+        "a hit serves the same artifacts"
     );
     assert_eq!(
         files_in(&again.support_artifacts),
@@ -556,12 +568,12 @@ target(name = "all_support", driver = "archive.extract", src = ":pack", support_
 
 /// The cases `support_files` has to get right on a real release tree: a
 /// top-level directory stripped first (protoc's layout, matched after
-/// `strip_components`), a file both `include` and `support_files` match (a
-/// support file), a symlink inside one artifact (kept), and a symlink from
-/// either artifact into the other (refused, naming the link). A plain
-/// dependent gets the output in `$SRC` and the support files on disk.
+/// `strip_components`), a support file beside the output in the same
+/// directory, a symlink inside one artifact (kept), and a symlink from
+/// either artifact into the other (refused by the packer, naming the link).
+/// A plain dependent gets the output in `$SRC` and the support files on disk.
 #[tokio::test]
-async fn support_files_split_a_stripped_tree_and_refuse_links_across_it() -> anyhow::Result<()> {
+async fn support_files_divide_a_stripped_tree_and_refuse_links_across_it() -> anyhow::Result<()> {
     let ws = workspace()?;
     ws.write_build_file(
         "p",
@@ -578,7 +590,7 @@ target(
     driver = "archive.extract",
     src = ":pack",
     strip_components = 1,
-    include = "bin/**",
+    include = "bin/tool",
     support_files = ["include/**", "bin/helper"],
 )
 target(
@@ -603,7 +615,7 @@ target(
 [
     [
         target(name = n + "_pack", driver = "archive.create", deps = [":" + n], strip_prefix = "p/t", out = n + ".tar"),
-        target(name = n + "_x", driver = "archive.extract", src = ":" + n + "_pack", support_files = "include/**"),
+        target(name = n + "_x", driver = "archive.extract", src = ":" + n + "_pack", include = "bin/tool", support_files = "include/**"),
     ]
     for n in ["out_to_support", "support_to_out"]
 ]
@@ -614,7 +626,7 @@ target(
     assert_eq!(
         files(&split),
         vec![("p/split/bin/tool".to_string(), "tool".to_string(), false)],
-        "`bin/helper` matches both lists: a support file"
+        "`bin/helper` is a support file beside the output"
     );
     assert_eq!(
         files_in(&split.support_artifacts),
@@ -650,7 +662,9 @@ target(
             .ok_or_else(|| anyhow::anyhow!("{addr}: a link across the split must fail"))?;
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("split by `support_files`") && msg.contains(link),
+            msg.contains(
+                "must be relative and resolve to a file or directory packed in the same artifact"
+            ) && msg.contains(link),
             "{addr}: {msg}"
         );
     }

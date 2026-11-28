@@ -90,9 +90,9 @@
 //! apart from the rest (`archive.extract`'s `support_files`): they are
 //! patterns in `include`'s syntax, an entry matching one is extracted
 //! whether or not `include` matches it, and each must match a file or link
-//! the archive holds. What is extracted is the same tree either way; which
-//! of its files are support files the caller answers with
-//! [`Globs::is_match`] over the same paths.
+//! the archive holds. It needs `include`, and a path both match is refused:
+//! the caller collects the two lists as separate artifacts, so every
+//! extracted file must belong to exactly one.
 //!
 //! A bare `gz` is one entry: a file named after the archive (see
 //! [`gz_file_name`]), held to the same rules as a tar's file entry, `include`
@@ -169,13 +169,6 @@ impl Globs {
     /// Whether there are no patterns.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
-    }
-
-    /// Whether `path` (below the output, `/`-separated, as [`unpack`]
-    /// matches it) matches one of the patterns.
-    pub fn is_match(&self, path: &str) -> bool {
-        use wax::Program as _;
-        self.0.iter().any(|(_, glob)| glob.is_match(path))
     }
 }
 
@@ -280,6 +273,9 @@ pub fn unpack(
         executable,
         limits,
     } = opts;
+    if include.is_empty() && !support.is_empty() {
+        bail!("`support_files` needs `include`: without it every file is the output");
+    }
     // Before `dest` exists, so a name it cannot take leaves nothing behind.
     // Only a `gz` reads it.
     let gz_name = match format {
@@ -616,7 +612,8 @@ impl Selector {
 
     /// Whether `path` matches a pattern, marking none.
     fn matches(&self, path: &str) -> bool {
-        self.globs.is_match(path)
+        use wax::Program as _;
+        self.globs.0.iter().any(|(_, glob)| glob.is_match(path))
     }
 
     /// The first pattern that matched no path.
@@ -673,20 +670,28 @@ impl<'a> Tree<'a> {
 
     /// Whether the file, symlink or hard link at `comps` is extracted:
     /// always without `include`, else when its path matches a pattern of
-    /// `include` or of `support`. Every pattern that matches is marked.
-    fn included(&mut self, comps: &[String]) -> bool {
+    /// `include` or of `support`. Every pattern that matches is marked. A
+    /// path both match is refused: the caller collects each list as its own
+    /// artifact, and the file would be in both.
+    fn included(&mut self, comps: &[String]) -> anyhow::Result<bool> {
         if self.include.is_none() && self.support.is_none() {
-            return true;
+            return Ok(true);
         }
         let path = comps.join("/");
         // Both, not `||`: a pattern of each that matches is marked.
         let included = self.include.as_mut().is_none_or(|sel| sel.select(&path));
         let support = self.support.as_mut().is_some_and(|sel| sel.select(&path));
+        if included && support {
+            bail!(
+                "{path:?} matches both `include` and `support_files`; a file is either the \
+                 output or a support file, so narrow one of them"
+            );
+        }
         self.candidate_count += 1;
         if self.candidates.len() < STRIPPED_SHOWN {
             self.candidates.push(path);
         }
-        included || support
+        Ok(included || support)
     }
 
     /// Whether `path` is extracted, marking no pattern: [`Self::included`]
@@ -868,7 +873,7 @@ impl<'a> Tree<'a> {
         };
         // Left out: not written. A tar's bytes are read past and counted by
         // `unpack_tar`; a zip's are never read.
-        if !self.included(&comps) {
+        if !self.included(&comps)? {
             return Ok(());
         }
         self.parents(&comps)?;
@@ -904,7 +909,7 @@ impl<'a> Tree<'a> {
         let Some(comps) = self.entry_components(raw)? else {
             return Ok(());
         };
-        if !self.included(&comps) {
+        if !self.included(&comps)? {
             return Ok(());
         }
         if target.is_empty() {
@@ -950,7 +955,7 @@ impl<'a> Tree<'a> {
         let Some(comps) = self.entry_components(raw)? else {
             return Ok(());
         };
-        if !self.included(&comps) {
+        if !self.included(&comps)? {
             return Ok(());
         }
         let target_comps = self
@@ -1742,41 +1747,49 @@ mod tests {
             listing(&dir),
             ["bin/tool", "include/a.h", "include/sub/b.h"]
         );
-        // Without `include`, everything, as before.
+    }
+
+    /// Every extracted file is the output or a support file, never both:
+    /// `support` needs `include`, and a path both match is refused, naming it.
+    #[test]
+    fn support_needs_include_and_may_not_overlap_it() {
         let (dir, r) = run_opts(
             "t",
             &sdk_tar(),
             Format::Tar,
             supporting(&[], &["include/**"]),
         );
-        assert_eq!(r.unwrap(), 4);
-        assert_eq!(
-            listing(&dir),
-            ["README", "bin/tool", "include/a.h", "include/sub/b.h"]
+        assert!(err(r).contains("`support_files` needs `include`"));
+        assert!(!dir.path().join("out").exists());
+        let (_dir, r) = run_opts(
+            "t",
+            &sdk_tar(),
+            Format::Tar,
+            supporting(&["bin/tool", "include/a.h"], &["include/**"]),
         );
-        // `Globs::is_match` answers the caller's split over the same paths.
-        let support = globs(&["include/**"]);
-        assert!(support.is_match("include/sub/b.h") && !support.is_match("bin/tool"));
+        let msg = err(r);
+        assert!(
+            msg.contains(r#""include/a.h" matches both `include` and `support_files`"#),
+            "{msg}"
+        );
     }
 
     /// A `support` pattern that matches nothing fails like an `include` one,
-    /// naming itself as the option it came from, with `include` set or not.
+    /// naming itself as the option it came from.
     #[test]
     fn an_unmatched_support_pattern_fails_naming_itself() {
-        for include in [&["bin/tool"][..], &[]] {
-            let (_dir, r) = run_opts(
-                "t",
-                &sdk_tar(),
-                Format::Tar,
-                supporting(include, &["include/**", "lib/**"]),
-            );
-            let msg = err(r);
-            assert!(
-                msg.contains(r#"`support_files` pattern "lib/**" matches no file"#)
-                    && msg.contains(r#"["bin/tool", "include/a.h""#),
-                "{msg}"
-            );
-        }
+        let (_dir, r) = run_opts(
+            "t",
+            &sdk_tar(),
+            Format::Tar,
+            supporting(&["bin/tool"], &["include/**", "lib/**"]),
+        );
+        let msg = err(r);
+        assert!(
+            msg.contains(r#"`support_files` pattern "lib/**" matches no file"#)
+                && msg.contains(r#"["bin/tool", "include/a.h""#),
+            "{msg}"
+        );
     }
 
     /// A hard link `include` takes, whose target only `support` takes, is a

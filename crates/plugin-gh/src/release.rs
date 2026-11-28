@@ -379,7 +379,8 @@ struct ReleaseAssetArgs {
     /// unpacked files that are support files, staged beside the output but
     /// never on `PATH`: one binary as the tool, the rest of its release
     /// carried with it. Each is extracted whether or not `include` matches
-    /// it, and must match one. Default: none.
+    /// it, and must match one. Needs `include`, whose files are the output;
+    /// the extract refuses a file both match. Default: none.
     support_files: Vec<String>,
     /// `True` marks the fetched file executable, or with `extract` every
     /// unpacked file (default `False`). With `extract` only: a list of glob
