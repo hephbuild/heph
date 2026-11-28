@@ -19,6 +19,15 @@
 //! struct Keyed(plugin::diagnostic::Diagnostic, plugin::diagnostic::SourceLoc);
 //! #[derive(Clone)]
 //! struct Framed(plugin::diagnostic::StageFrame);
+//! #[derive(Clone)]
+//! struct Recorded(plugin::error::FailureRecord);
+//! # fn main() {}
+//! ```
+//!
+//! `failure_record_has_no_hash` (the compacted failure, `hcore::failure`):
+//! ```compile_fail,E0277
+//! #[derive(Hash)]
+//! struct Recorded(plugin::error::FailureRecord);
 //! # fn main() {}
 //! ```
 //!

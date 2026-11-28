@@ -841,7 +841,15 @@ pub struct TargetFailure {
     /// went to a file or a pipe.
     pub streamed: bool,
     pub source: std::sync::Arc<anyhow::Error>,
+    /// The failure compacted (D7b): scrubbed, capped, with the typed facts a
+    /// renderer reads. The engine sets it when it records the culprit
+    /// (`engine::failure_record::compact`); one built here with
+    /// [`TargetFailure::new`] and never set says only which target failed,
+    /// so no unscrubbed text can reach it.
+    pub record: std::sync::Arc<FailureRecord>,
 }
+
+pub use hcore::events::FailureRecord;
 
 /// What became of a failed run's sandbox, as the failure box reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -922,6 +930,16 @@ impl fmt::Display for FixesNotWritten {
 
 impl TargetFailure {
     pub fn new(addr: Addr, log_tail: Option<LogTail>, source: anyhow::Error) -> Self {
+        let formatted = addr.format();
+        let mut record = FailureRecord::new(
+            crate::diagnostic::Diagnostic::new(
+                crate::diagnostic::Stage::Run,
+                format!("target failed: {formatted}"),
+            )
+            .with_addr(formatted.clone()),
+        );
+        record.addr = Some(formatted.clone());
+        record.entry = formatted;
         Self {
             addr,
             file: None,
@@ -934,7 +952,14 @@ impl TargetFailure {
             log_readable: None,
             streamed: false,
             source: std::sync::Arc::new(source),
+            record: std::sync::Arc::new(record),
         }
+    }
+
+    /// The same failure with its compacted record.
+    pub fn with_record(mut self, record: std::sync::Arc<FailureRecord>) -> Self {
+        self.record = record;
+        self
     }
 
     /// The same failure, saying whether its output streamed to a terminal.
@@ -1347,6 +1372,15 @@ impl FailureLog {
     /// Where the full log is, when there is one on disk.
     pub fn path(&self) -> Option<&std::path::Path> {
         self.path.as_deref()
+    }
+
+    /// The tail held in memory, for a log with no file behind it; `None`
+    /// for one read from the slot's file. No IO.
+    pub fn memory_tail(&self) -> Option<&LogTail> {
+        match &self.source {
+            FailureLogSource::Tail(t) => Some(t),
+            FailureLogSource::Open(_) => None,
+        }
     }
 
     /// The last lines of the log, read from the open file (seek-based, see

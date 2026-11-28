@@ -18,7 +18,14 @@
 //! doctests that hold this are in `hplugin::diagnostic`: this package is named
 //! `core`, so a doctest here cannot name it as `hcore` and would fail to
 //! compile whatever these types derive.
+//!
+//! **Serialized** (`serde`) for the failure record ([`crate::failure`]) that
+//! rides the event wire and the failure slot's `diagnostic.json`. Every field
+//! but `stage` and `message` may be absent, so a sparse record decodes; a
+//! location decodes through [`SourceLoc::checked`], so a file that names an
+//! absolute or climbing path is refused there too.
 
+use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::fmt;
 use std::fmt::Write as _;
@@ -29,14 +36,18 @@ pub const MESSAGE_CAP: usize = 2048;
 /// The most hints a diagnostic keeps; the rest are counted in a `+N more` hint.
 pub const HINTS_CAP: usize = 8;
 /// The most bytes one hint's text keeps.
-pub const HINT_CAP: usize = 512;
+pub const HINT_CAP: usize = 256;
 /// The most lines a snippet keeps.
 pub const SNIPPET_LINES_CAP: usize = 10;
+/// The most chars one snippet line keeps.
+pub const SNIPPET_LINE_CAP: usize = 200;
 /// The most bytes a location's file keeps.
 pub const FILE_CAP: usize = 1024;
 
-/// Which stage of a build raised a failure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Which stage of a build raised a failure. Serialized as its
+/// [`as_str`](Stage::as_str) name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Stage {
     /// A BUILD file (or a file it loads) evaluated.
     Eval,
@@ -99,11 +110,28 @@ impl fmt::Display for Stage {
 /// `file` is never absolute and never climbs out of the workspace (`..`);
 /// [`SourceLoc::checked`] refuses one that would, and the plugin seam decodes
 /// through it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawSourceLoc")]
 pub struct SourceLoc {
     pub file: String,
     pub line: u32,
     pub col: u32,
+}
+
+/// A [`SourceLoc`] as decoded, before [`SourceLoc::checked`].
+#[derive(Deserialize)]
+struct RawSourceLoc {
+    file: String,
+    line: u32,
+    col: u32,
+}
+
+impl TryFrom<RawSourceLoc> for SourceLoc {
+    type Error = String;
+
+    fn try_from(raw: RawSourceLoc) -> Result<Self, String> {
+        Self::checked(raw.file, raw.line, raw.col)
+    }
 }
 
 impl SourceLoc {
@@ -144,8 +172,11 @@ impl fmt::Display for SourceLoc {
     }
 }
 
-/// What a [`Hint`] offers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What a [`Hint`] offers. Serialized as its [`as_str`](HintKind::as_str)
+/// name; an unknown name (a newer peer's kind) decodes as
+/// [`HintKind::Other`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum HintKind {
     /// A near-miss name: "did you mean `deps`?".
     DidYouMean,
@@ -156,6 +187,7 @@ pub enum HintKind {
     /// Where the full log is.
     SeeLog,
     /// Anything else.
+    #[serde(other)]
     Other,
 }
 
@@ -185,7 +217,7 @@ impl HintKind {
 }
 
 /// One thing the user can do about a diagnostic.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hint {
     pub kind: HintKind,
     pub text: String,
@@ -202,20 +234,27 @@ impl Hint {
 
 /// A failure in the user's words: one sentence of what is wrong, where, and
 /// what to do. See the module docs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Diagnostic {
     pub stage: Stage,
     /// The target it is about (`//pkg:name`); `None` for a file culprit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub addr: Option<String>,
     /// One sentence, in the user's words.
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub location: Option<SourceLoc>,
     /// Source lines around `location`, as the producer framed them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snippet: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hints: Vec<Hint>,
-    /// Which plugin or driver raised it.
+    /// Which plugin or driver raised it. For a plugin's diagnostic, the host
+    /// sets it (the plugin's own claim is not kept).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugin: Option<String>,
     /// A cap cut something ([`Diagnostic::bounded`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
 }
 
@@ -302,8 +341,8 @@ impl fmt::Display for Diagnostic {
 impl std::error::Error for Diagnostic {}
 
 /// `s` with control escaped and cut to `cap` bytes at a char boundary, `…`
-/// marking the cut; `cut` set when it was.
-fn bound_text(s: &str, cap: usize, cut: &mut bool) -> String {
+/// marking the cut (within `cap`); `cut` set when it was.
+pub fn bound_text(s: &str, cap: usize, cut: &mut bool) -> String {
     let escaped = escape_control(s);
     if escaped.len() <= cap {
         return escaped.into_owned();
@@ -319,9 +358,11 @@ fn bound_text(s: &str, cap: usize, cut: &mut bool) -> String {
     out
 }
 
-/// At most [`SNIPPET_LINES_CAP`] lines of `s`, each within [`MESSAGE_CAP`],
-/// with control characters escaped.
-fn bound_snippet(s: &str, cut: &mut bool) -> String {
+/// At most [`SNIPPET_LINES_CAP`] lines of `s`, each of at most
+/// [`SNIPPET_LINE_CAP`] chars, with control characters escaped; a cut line
+/// ends with `…` and cut lines are followed by a `…` line. `cut` set when
+/// anything was cut.
+pub fn bound_snippet(s: &str, cut: &mut bool) -> String {
     let mut out = String::new();
     for (i, line) in s.lines().enumerate() {
         if i == SNIPPET_LINES_CAP {
@@ -332,7 +373,19 @@ fn bound_snippet(s: &str, cut: &mut bool) -> String {
         if i > 0 {
             out.push('\n');
         }
-        out.push_str(&bound_text(line, MESSAGE_CAP, cut));
+        let line = escape_control(line);
+        match line.char_indices().nth(SNIPPET_LINE_CAP) {
+            None => out.push_str(&line),
+            Some(_) => {
+                *cut = true;
+                let end = line
+                    .char_indices()
+                    .nth(SNIPPET_LINE_CAP - 1)
+                    .map_or(line.len(), |(at, _)| at);
+                out.push_str(line.get(..end).unwrap_or_default());
+                out.push('…');
+            }
+        }
     }
     out
 }

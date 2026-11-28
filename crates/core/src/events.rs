@@ -95,6 +95,12 @@ use std::collections::BTreeMap;
 
 use crate::capacity::Unit;
 
+/// The compact failure record that rides failing events (see
+/// [`crate::failure`]).
+pub use crate::failure::{
+    CAUSE_CAP, CAUSES_CAP, ExitData, FailedIn, FailureRecord, LogRef, RECORD_CAP,
+};
+
 /// An amount of a pool, as a person reads it, by the pool's unit: `cpu` in
 /// CPUs (`4`, `0.5`), `bytes` in binary units (`2.0 GiB`), `count` as the
 /// integer. Shared by every renderer of the admission events.
