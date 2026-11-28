@@ -521,6 +521,33 @@ pub trait Provider: Send + Sync {
     fn state_schema(&self) -> Option<StateSchema> {
         None
     }
+
+    /// Optional, on the error path only: an index of the workspace-relative
+    /// source `file` that finds an option inside a call this provider
+    /// reported as a [`SpecSource`] ([`SourceIndex::locate`]). The engine
+    /// asks once per file per request, however many diagnostics point into
+    /// it, so a provider may parse the file here and nowhere else.
+    ///
+    /// Default: none, and diagnostics point at the call. An in-process seam:
+    /// a cdylib provider keeps the default.
+    fn source_index(&self, _file: &str) -> Option<Arc<dyn SourceIndex>> {
+        None
+    }
+}
+
+/// What [`Provider::source_index`] returns: one source file, read as it is
+/// now. Diagnostics only (I1), like [`SpecSource`].
+pub trait SourceIndex: Send + Sync {
+    /// The span of option `field` (a driver config key, `driver`, …) in the
+    /// call at `source` that declared target `name`. `None` when the file no
+    /// longer holds that call there, the call declares another name, or it
+    /// sets no such option: the caller then points at the call.
+    fn locate(
+        &self,
+        source: &SpecSource,
+        name: &str,
+        field: &str,
+    ) -> Option<hcore::diagnostic::Span>;
 }
 
 #[cfg(test)]
