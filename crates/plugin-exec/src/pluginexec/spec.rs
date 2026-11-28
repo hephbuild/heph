@@ -384,10 +384,8 @@ mod tests {
                 ParamType::map(str_or_list.clone()),
             ])
         );
-        assert_eq!(
-            by_name["env"].ty,
-            ParamType::union(vec![ParamType::String, ParamType::map(ParamType::String)])
-        );
+        // A dict only: a bare string names no variable (OPT-06).
+        assert_eq!(by_name["env"].ty, ParamType::map(ParamType::String));
         // Same shape as `out`: a path, a list, or a group → list dict.
         assert_eq!(by_name["failure_out"].ty, by_name["out"].ty);
         assert!(!by_name["failure_out"].doc.is_empty());

@@ -48,9 +48,12 @@ The section is derived from the target definitions, so it is the same on every
 machine, and it is committed. Only commands write it: `heph tool codegen
 gitignore`, `keep` and `discard`. A build never does. A whole-workspace
 `heph validate` fails when the section is stale, including a line whose target
-no longer exists and a BEGIN line with the old marker text. `validate` fails
+no longer exists and a BEGIN line with the old marker text. A workspace with
+no codegen target and no section passes without one. `validate` fails
 only on what the commit decides: findings local to one checkout (anything
-`codegen status` lists) are warnings pointing at `codegen status`.
+`codegen status` lists) are warnings pointing at `codegen status`. An
+`unresolved` package or target is not among them: the link check already
+fails on it.
 
 Lines mean to heph what they mean to git: heph matches them with git's rules,
 case-sensitive on every platform. A directory line such as `/p/gen` covers

@@ -141,7 +141,13 @@ fn annotate_lone_package_matcher(
     base_pkg: &PkgBuf,
     allow_all: bool,
 ) -> anyhow::Error {
-    if htpkg::parse(input, base_pkg).is_err() {
+    // `htpkg::parse` takes anything after `//`, so `//pkg:abc:x` or a
+    // trailing space would pass it (GRAPH-03): a package matcher has no
+    // `:`, `@`, `|` or whitespace.
+    let not_a_package = input
+        .chars()
+        .any(|c| matches!(c, ':' | '@' | '|') || c.is_whitespace());
+    if not_a_package || htpkg::parse(input, base_pkg).is_err() {
         return err;
     }
     let flag = if allow_all { "" } else { " --allow-all" };
@@ -442,6 +448,41 @@ mod tests {
                 "{input:?} should be quoted back behind -e: {chain}"
             );
         }
+    }
+
+    /// GRAPH-03: a malformed address was called "a package matcher" with an
+    /// `-e … --allow-all` that matches nothing. The hint is for real package
+    /// matchers only, and a malformed address keeps the parser's column.
+    #[test]
+    fn package_matcher_hint_only_for_package_matchers() {
+        let pkg = PkgBuf::from("");
+        for input in [
+            "//pkg:abc:x",
+            "//pkg::abc",
+            "//pkg:abc ",
+            "//pkg:ab c",
+            "//pkg:abc|",
+            "//pkg:abc@",
+            "//pkg:",
+        ] {
+            let err = matcher_from_args(input, &None, &pkg, false)
+                .err()
+                .unwrap_or_else(|| panic!("{input:?} unexpectedly resolved"));
+            let chain = format!("{err:#}");
+            assert!(!chain.contains("package matcher"), "{input:?}: {chain}");
+            assert!(
+                chain.contains("is not a valid address"),
+                "{input:?}: {chain}"
+            );
+        }
+        let err = matcher_from_args("//pkg", &None, &pkg, false)
+            .err()
+            .expect("a package is not an address");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("`//pkg` is a package matcher") && chain.contains("--allow-all"),
+            "{chain}"
+        );
     }
 
     #[test]

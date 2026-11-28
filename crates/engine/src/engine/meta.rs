@@ -23,6 +23,18 @@ impl Engine {
         rs: Arc<RequestState>,
         addr: &Addr,
     ) -> anyhow::Result<ResultMeta> {
+        // Called with `addr` as the parent from `inner_result_addr`, which
+        // already tracked it. Called from anywhere else (`inspect hashin`, a
+        // fixpoint check), it enters the graph here, as `result_addr` does:
+        // tracked, and parent of what it resolves. Without that the walk
+        // under it records no edge, so a cycle back to `addr` waits on this
+        // very cell instead of failing (GRAPH-06).
+        let rs = if rs.parent() == Some(addr) {
+            rs
+        } else {
+            rs.track_dep(addr).map_err(anyhow::Error::new)?;
+            rs.with_parent(addr.clone())
+        };
         let res = rs
             .data
             .mem_meta

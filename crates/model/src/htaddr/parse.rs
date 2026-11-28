@@ -19,9 +19,8 @@ impl<'de> Deserialize<'de> for Addr {
         D: serde::Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
-        parse_addr(&s)
-            .with_context(|| format!("invalid address format: {}", s))
-            .map_err(serde::de::Error::custom)
+        // The error quotes the input and says where it went wrong.
+        parse_addr(&s).map_err(|e| serde::de::Error::custom(format!("{e:#}")))
     }
 }
 
@@ -126,10 +125,104 @@ pub fn parse_addr_with_base(input: &str, base: &PkgBuf) -> anyhow::Result<Addr> 
     ))
 }
 
+/// The characters a target name may not contain: the address parser's
+/// separators (`@`, `:`, `|`, a space), and `/`, since a name is a directory
+/// component of the target's cache entry (`<home>/cache/<pkg>/__target_<name>`)
+/// and a `/` would nest it inside another target's, or `..` segments climb out.
+const NAME_FORBIDDEN: &str = "a name may not contain `@`, `:`, `|`, `/` or a space";
+
+/// Refuse a target name outside the grammar: empty, or holding one of
+/// [`NAME_FORBIDDEN`]'s characters. The message names the character and the
+/// rule. Every other name, unicode included, is valid.
+pub fn check_name(name: &str) -> anyhow::Result<()> {
+    if name.is_empty() {
+        anyhow::bail!("target name cannot be empty");
+    }
+    if let Some(c) = name
+        .chars()
+        .find(|c| matches!(c, '@' | ':' | '|' | '/' | ' '))
+    {
+        let what = if c == ' ' {
+            "a space".to_owned()
+        } else {
+            format!("`{c}`")
+        };
+        anyhow::bail!("target name `{name}` contains {what}; {NAME_FORBIDDEN}");
+    }
+    Ok(())
+}
+
+/// An address the grammar refuses, pointing at where (GRAPH-03):
+/// "`//pkg:abc:x` is not a valid address: unexpected `:` at column 10".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddrParseError {
+    /// The input, as given.
+    pub input: String,
+    /// The 1-based column, in characters, the parser stopped at.
+    pub column: usize,
+    reason: String,
+}
+
+impl std::fmt::Display for AddrParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "`{}` is not a valid address: {}",
+            self.input.escape_debug(),
+            self.reason
+        )
+    }
+}
+
+impl std::error::Error for AddrParseError {}
+
+impl AddrParseError {
+    /// The parser stopped at `rest`, a suffix of `input`, failing `code`.
+    fn at(input: &str, rest: &str, code: Option<nom::error::ErrorKind>) -> Self {
+        let offset = input.len().saturating_sub(rest.len());
+        let column = input.get(..offset).map_or(0, |s| s.chars().count()) + 1;
+        let reason = match rest.chars().next() {
+            Some(c) if c.is_whitespace() => {
+                let place = if rest.trim().is_empty() {
+                    "trailing "
+                } else if offset == 0 {
+                    "leading "
+                } else {
+                    ""
+                };
+                format!("unexpected {place}whitespace at column {column}")
+            }
+            _ if code == Some(nom::error::ErrorKind::Tag) => {
+                "an address starts with `//`, as in `//pkg:name`".to_owned()
+            }
+            Some(c) => format!("unexpected `{}` at column {column}", c.escape_debug()),
+            None => match code {
+                Some(nom::error::ErrorKind::Char) => {
+                    format!("expected `:` and a target name at column {column}")
+                }
+                Some(nom::error::ErrorKind::TakeTill1) => {
+                    format!("expected a target name at column {column}")
+                }
+                _ => format!("unexpected end at column {column}"),
+            },
+        };
+        Self {
+            input: input.to_owned(),
+            column,
+            reason,
+        }
+    }
+}
+
 pub fn parse_addr(input: &str) -> anyhow::Result<Addr> {
     let (_, (p, n, kvs)) = all_consuming(addr_parser)
         .parse(input)
-        .map_err(|e| anyhow::anyhow!("invalid address {:?}: {}", input, e))?;
+        .map_err(|e| match e {
+            nom::Err::Error(e) | nom::Err::Failure(e) => {
+                AddrParseError::at(input, e.input, Some(e.code))
+            }
+            nom::Err::Incomplete(_) => AddrParseError::at(input, "", None),
+        })?;
 
     // The absolute `//pkg:name` form has no base to resolve against, but a
     // `..` segment in `pkg` must still be bound to the workspace root — same
@@ -333,19 +426,19 @@ mod tests {
         let cases: &[(&str, &str)] = &[
             (
                 "",
-                r#"err invalid address "": Parsing Error: Error { input: "", code: Tag }"#,
+                "err `` is not a valid address: an address starts with `//`, as in `//pkg:name`",
             ),
             (
                 "/",
-                r#"err invalid address "/": Parsing Error: Error { input: "/", code: Tag }"#,
+                "err `/` is not a valid address: an address starts with `//`, as in `//pkg:name`",
             ),
             (
                 "//",
-                r#"err invalid address "//": Parsing Error: Error { input: "", code: Char }"#,
+                "err `//` is not a valid address: expected `:` and a target name at column 3",
             ),
             (
                 "//:",
-                r#"err invalid address "//:": Parsing Error: Error { input: "", code: TakeTill1 }"#,
+                "err `//:` is not a valid address: expected a target name at column 4",
             ),
             ("//:a", r#"ok //:a pkg="""#),
             ("//a:b", r#"ok //a:b pkg="a""#),
@@ -374,35 +467,39 @@ mod tests {
             ("//é/ü:ñ", r#"ok //é/ü:ñ pkg="é/ü""#),
             (
                 "//a:b ",
-                r#"err invalid address "//a:b ": Parsing Error: Error { input: " ", code: Eof }"#,
+                "err `//a:b ` is not a valid address: unexpected trailing whitespace at column 6",
             ),
             (
                 " //a:b",
-                r#"err invalid address " //a:b": Parsing Error: Error { input: " //a:b", code: Tag }"#,
+                "err ` //a:b` is not a valid address: unexpected leading whitespace at column 1",
             ),
             (
                 "//a b:c",
-                r#"err invalid address "//a b:c": Parsing Error: Error { input: " b:c", code: Char }"#,
+                "err `//a b:c` is not a valid address: unexpected whitespace at column 4",
             ),
             (
                 "//a:b|c",
-                r#"err invalid address "//a:b|c": Parsing Error: Error { input: "|c", code: Eof }"#,
+                "err `//a:b|c` is not a valid address: unexpected `|` at column 6",
             ),
             (
                 "//a:b@",
-                r#"err invalid address "//a:b@": Parsing Error: Error { input: "@", code: Eof }"#,
+                "err `//a:b@` is not a valid address: unexpected `@` at column 6",
             ),
             (
                 "//a:b@=v",
-                r#"err invalid address "//a:b@=v": Parsing Error: Error { input: "@=v", code: Eof }"#,
+                "err `//a:b@=v` is not a valid address: unexpected `@` at column 6",
             ),
             (
                 "//a:b:c",
-                r#"err invalid address "//a:b:c": Parsing Error: Error { input: ":c", code: Eof }"#,
+                "err `//a:b:c` is not a valid address: unexpected `:` at column 6",
             ),
             (
                 "//a::b",
-                r#"err invalid address "//a::b": Parsing Error: Error { input: ":b", code: TakeTill1 }"#,
+                "err `//a::b` is not a valid address: unexpected `:` at column 5",
+            ),
+            (
+                "//a\u{7}:b:c",
+                "err `//a\\u{7}:b:c` is not a valid address: unexpected `:` at column 7",
             ),
             ("//pkg:name", r#"ok //pkg:name pkg="pkg""#),
             ("//pkg:nam", r#"ok //pkg:nam pkg="pkg""#),
@@ -417,6 +514,58 @@ mod tests {
         }
     }
 
+    /// The typed error of `input`.
+    fn refused(input: &str) -> AddrParseError {
+        let e = parse_addr(input).expect_err("refused");
+        e.downcast::<AddrParseError>().expect("an AddrParseError")
+    }
+
+    /// GRAPH-03: nom's `Parsing Error: Error { input: ":x", code: Eof }`
+    /// named neither the character nor where it was.
+    #[test]
+    fn malformed_addr_double_colon_points_at_column() {
+        let e = refused("//pkg:abc:x");
+        assert_eq!(
+            e.to_string(),
+            "`//pkg:abc:x` is not a valid address: unexpected `:` at column 10"
+        );
+        assert_eq!(e.column, 10);
+    }
+
+    /// A copy-pasted trailing space says it is whitespace, and where.
+    #[test]
+    fn malformed_addr_trailing_space() {
+        let e = refused("//pkg:abc ");
+        assert_eq!(
+            e.to_string(),
+            "`//pkg:abc ` is not a valid address: unexpected trailing whitespace at column 10"
+        );
+        assert_eq!(
+            refused("//pkg:ab c").to_string(),
+            "`//pkg:ab c` is not a valid address: unexpected whitespace at column 9"
+        );
+    }
+
+    #[test]
+    fn malformed_addr_pipe_out() {
+        let e = refused("//p:t|out");
+        assert_eq!(
+            e.to_string(),
+            "`//p:t|out` is not a valid address: unexpected `|` at column 6"
+        );
+    }
+
+    /// The column counts characters, not bytes: `é` is one column.
+    #[test]
+    fn malformed_addr_unicode_column_in_chars() {
+        let e = refused("//pké:né:x");
+        assert_eq!(e.column, 9);
+        assert_eq!(
+            e.to_string(),
+            "`//pké:né:x` is not a valid address: unexpected `:` at column 9"
+        );
+    }
+
     #[test]
     fn parse_addr_with_base_golden() {
         let base = PkgBuf::from("x/y");
@@ -425,7 +574,7 @@ mod tests {
             ("", format!("err invalid address '': {bare}")),
             (
                 ":",
-                r#"err invalid address "//x/y:": Parsing Error: Error { input: "", code: TakeTill1 }"#
+                "err `//x/y:` is not a valid address: expected a target name at column 7"
                     .to_string(),
             ),
             (":a", r#"ok //x/y:a pkg="x/y""#.to_string()),

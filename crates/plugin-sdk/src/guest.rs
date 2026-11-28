@@ -53,10 +53,9 @@ impl ProviderExecutor for GuestExecutor {
             if r.ok {
                 Ok(())
             } else if r.cycle {
-                Err(anyhow::Error::new(hplugin::error::CycleError {
-                    from: addr.clone(),
-                    to: addr.clone(),
-                }))
+                Err(anyhow::Error::new(hplugin::error::CycleError::through(
+                    addr.clone(),
+                )))
             } else {
                 anyhow::bail!("{}", r.message)
             }
@@ -80,10 +79,9 @@ impl ProviderExecutor for GuestExecutor {
                     artifacts_meta: meta,
                 }))
             } else if r.cycle {
-                Err(anyhow::Error::new(hplugin::error::CycleError {
-                    from: addr.clone(),
-                    to: addr.clone(),
-                }))
+                Err(anyhow::Error::new(hplugin::error::CycleError::through(
+                    addr.clone(),
+                )))
             } else if r.cancelled {
                 Err(anyhow::Error::new(hplugin::error::CancelledError))
             } else {

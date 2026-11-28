@@ -304,20 +304,39 @@ impl fmt::Display for ShellNeedsSingleTarget {
 
 impl std::error::Error for ShellNeedsSingleTarget {}
 
+/// A dependency cycle.
+///
+/// `path` follows the dependency edges and ends on the member it starts
+/// from: `[w, x, y, z, w]`, or `[a, a]` for a target that depends on itself.
+/// A path of one member, [`CycleError::through`], is a cycle reported across
+/// the plugin seam, which carries no path: that member is in it, the rest is
+/// not known.
 #[derive(Debug, Clone)]
 pub struct CycleError {
-    pub from: Addr,
-    pub to: Addr,
+    pub path: Vec<Addr>,
+}
+
+impl CycleError {
+    /// A cycle known only to pass through `addr`.
+    pub fn through(addr: Addr) -> Self {
+        Self { path: vec![addr] }
+    }
 }
 
 impl fmt::Display for CycleError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "cyclic dependency detected: {} → {}",
-            self.from.format(),
-            self.to.format()
-        )
+        f.write_str("cyclic dependency detected")?;
+        match self.path.as_slice() {
+            [] => Ok(()),
+            [only] => write!(f, " through {}", only.format()),
+            [first, rest @ ..] => {
+                write!(f, ": {}", first.format())?;
+                for addr in rest {
+                    write!(f, " → {}", addr.format())?;
+                }
+                Ok(())
+            }
+        }
     }
 }
 
@@ -595,6 +614,48 @@ impl fmt::Display for AfterProcess {
 }
 
 impl std::error::Error for AfterProcess {}
+
+/// Hints a driver adds to its run's failure without raising a
+/// [`Diagnostic`](hcore::diagnostic::Diagnostic) of its own: the record keeps
+/// the engine's message (`exit status 127`) and appends these, each scrubbed
+/// as the record is (I7). Attached to an error, its `Display` is empty, like
+/// [`AfterProcess`]: it adds no words to the chain. As an error of its own
+/// ([`RunHints::error`]), it says its message.
+///
+/// In-process only: it does not cross the plugin seam, so only a builtin
+/// driver's hints reach the record.
+#[derive(Debug, Clone, Default)]
+pub struct RunHints {
+    pub hints: Vec<hcore::diagnostic::Hint>,
+    message: String,
+}
+
+impl RunHints {
+    /// `e` carrying `hints`; `e` itself when there are none.
+    pub fn attach(e: anyhow::Error, hints: Vec<hcore::diagnostic::Hint>) -> anyhow::Error {
+        if hints.is_empty() {
+            e
+        } else {
+            e.context(Self {
+                hints,
+                message: String::new(),
+            })
+        }
+    }
+
+    /// An error saying `message` and carrying `hints`.
+    pub fn error(message: String, hints: Vec<hcore::diagnostic::Hint>) -> anyhow::Error {
+        anyhow::Error::new(Self { hints, message })
+    }
+}
+
+impl fmt::Display for RunHints {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RunHints {}
 
 /// A run failure that crossed the plugin seam with a structured exit status
 /// ([`ProcessFailed::exit`] on the plugin's side).

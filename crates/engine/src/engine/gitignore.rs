@@ -239,9 +239,7 @@ pub fn diff_section(existing: &[u8], entries: &[GitignoreEntry]) -> SectionDiff 
         if parsed.old_marker {
             reasons.push(StaleReason::OldMarker);
         }
-        let markers = find_bytes(existing, BEGIN_MARKER_PREFIX).is_some()
-            || find_bytes(existing, END_MARKER).is_some();
-        if !parsed.present && markers {
+        if !parsed.present && has_markers(existing) {
             reasons.push(StaleReason::Malformed);
         }
         if !added.is_empty() || !removed.is_empty() || reasons.is_empty() {
@@ -411,6 +409,13 @@ fn anchored_gitignore_line(glob_text: &str) -> String {
         out.push_str("\\ ");
     }
     out
+}
+
+/// Whether the `.gitignore` text `existing` holds either heph marker, of any
+/// heph version: a section, a malformed one, or the remains of one.
+pub fn has_markers(existing: &[u8]) -> bool {
+    find_bytes(existing, BEGIN_MARKER_PREFIX).is_some()
+        || find_bytes(existing, END_MARKER).is_some()
 }
 
 /// The first offset of `needle` in `hay`.

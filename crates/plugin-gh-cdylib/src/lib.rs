@@ -70,7 +70,7 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
     let (functions, function_handle) = make_plugin_functions(&cfg.name, defs)?;
 
     let mut drivers = stabby::vec::Vec::new();
-    drivers.push(named_managed_driver(asset_url::Driver)?);
+    drivers.push(named_managed_driver(&cfg.name, asset_url::Driver)?);
 
     Ok(PluginComponents {
         hooks,

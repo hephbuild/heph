@@ -536,13 +536,26 @@ impl FromSpecValue for std::collections::HashMap<String, String> {
     }
 }
 
-/// The same lenient map, whose **values** may carry a deferred reference.
+/// An environment: `{NAME: value}`, whose **values** may carry a deferred
+/// reference.
+///
+/// Strict where [`HashMap<String, String>`] is lenient: a bare string does not
+/// become `{"": s}`. An env entry is a variable, and a variable with no name is
+/// not one (OPT-06: `env = "X"` used to set nothing, silently). `None` is still
+/// no environment.
 ///
 /// Keys stay reserved: the host's walk does not recurse into them, so a
 /// reference there would never be substituted and would name a variable
 /// literally `${read://a:b}`.
 impl FromSpecValue for std::collections::HashMap<String, crate::driver::Deferred<String>> {
     fn from_spec_value(v: &Value) -> anyhow::Result<Self> {
+        if let Value::String(_) = v {
+            anyhow::bail!(
+                "invalid: expected {{string: string}} (NAME: value), got: {}; a variable needs a name, as in {{\"NAME\": {}}}",
+                v.render(),
+                v.render()
+            );
+        }
         parse_map_string_string(v)?
             .into_iter()
             .map(|(k, v)| {
@@ -553,7 +566,7 @@ impl FromSpecValue for std::collections::HashMap<String, crate::driver::Deferred
     }
 
     fn spec_param_type() -> ParamType {
-        <std::collections::HashMap<String, String>>::spec_param_type()
+        ParamType::map(ParamType::String)
     }
 }
 
@@ -700,8 +713,8 @@ mod tests {
         assert_eq!(plain, deferred);
     }
 
-    /// An env-shaped map takes a reference in a value, never in a key, and keeps
-    /// the lenient shapes of the plain map it replaced.
+    /// An env-shaped map takes a reference in a value, never in a key, and no
+    /// bare string: a variable needs a name (OPT-06).
     #[test]
     fn a_deferred_env_map_accepts_references_in_values_only() {
         use crate::driver::Deferred;
@@ -726,13 +739,15 @@ mod tests {
             "{err}"
         );
 
-        // The bare-string shorthand still decodes, as it does for `HashMap<String, String>`.
-        let m = M::from_spec_value(&Value::String("v".to_string())).expect("bare string");
-        assert_eq!(m[""].raw(), "v");
-        assert_eq!(
-            M::spec_param_type(),
-            HashMap::<String, String>::spec_param_type()
+        // No bare-string shorthand: `env = "X"` names no variable.
+        let err = M::from_spec_value(&Value::String("X".to_string())).expect_err("bare string");
+        assert!(
+            err.to_string()
+                .contains("expected {string: string} (NAME: value), got: \"X\""),
+            "{err}"
         );
+        assert!(M::from_spec_value(&Value::Null()).expect("null").is_empty());
+        assert_eq!(M::spec_param_type(), ParamType::map(ParamType::String));
     }
 
     /// A keyed list map (`oci.image`'s `layers_by_platform`): each value takes

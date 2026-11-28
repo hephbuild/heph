@@ -2980,25 +2980,11 @@ fn is_stop(e: &anyhow::Error) -> bool {
 /// `execute` and `run` frames are added by the target doing the work, over
 /// errors that may be an input's, which the frames above already name.
 fn blame(addr: &Addr, e: &anyhow::Error) -> (Culprit, Addr) {
-    let mut missing: Option<&MissingDep> = None;
-    let mut frame: Option<&Addr> = None;
-    let mut file: Option<&FileEvalFailed> = None;
-    for f in hcore::hmemoizer::frames(e) {
-        if let Some(m) = f.downcast_ref::<MissingDep>() {
-            missing = Some(m);
-        }
-        if let Some(i) = f.downcast_ref::<InputDefFailed>() {
-            frame = Some(&i.input);
-        }
-        if let Some(s) = f.downcast_ref::<StageFrame>()
-            && matches!(s.boundary, Boundary::GetSpec | Boundary::GetDef)
-        {
-            frame = Some(&s.addr);
-        }
-        if let Some(x) = f.downcast_ref::<FileEvalFailed>() {
-            file = Some(x);
-        }
-    }
+    let ChainBlame {
+        missing,
+        frame,
+        file,
+    } = chain_blame(e);
     if let Some(m) = missing {
         return (Culprit::Target(m.declarer.clone()), m.declarer.clone());
     }
@@ -3006,6 +2992,58 @@ fn blame(addr: &Addr, e: &anyhow::Error) -> (Culprit, Addr) {
     match file {
         Some(f) => (Culprit::File(Arc::clone(&f.file)), entry),
         None => (Culprit::Target(entry.clone()), entry),
+    }
+}
+
+/// What the frames of a failure say about whose it is, innermost of each
+/// kind: the walk [`blame`] decides from.
+struct ChainBlame<'a> {
+    missing: Option<&'a MissingDep>,
+    frame: Option<&'a Addr>,
+    file: Option<&'a FileEvalFailed>,
+}
+
+fn chain_blame(e: &anyhow::Error) -> ChainBlame<'_> {
+    let mut out = ChainBlame {
+        missing: None,
+        frame: None,
+        file: None,
+    };
+    for f in hcore::hmemoizer::frames(e) {
+        if let Some(m) = f.downcast_ref::<MissingDep>() {
+            out.missing = Some(m);
+        }
+        if let Some(i) = f.downcast_ref::<InputDefFailed>() {
+            out.frame = Some(&i.input);
+        }
+        if let Some(s) = f.downcast_ref::<StageFrame>()
+            && matches!(s.boundary, Boundary::GetSpec | Boundary::GetDef)
+        {
+            out.frame = Some(&s.addr);
+        }
+        if let Some(x) = f.downcast_ref::<FileEvalFailed>() {
+            out.file = Some(x);
+        }
+    }
+    out
+}
+
+/// The culprit [`blame`] gives `e` when its chain names one: a missing
+/// dep's declarer, a file that did not evaluate, or the innermost target
+/// whose spec or def raised it. `None` for an error that names no target,
+/// which [`blame`] puts on the target that hit it.
+pub fn culprit_on_chain(e: &anyhow::Error) -> Option<Culprit> {
+    let ChainBlame {
+        missing,
+        frame,
+        file,
+    } = chain_blame(e);
+    if let Some(m) = missing {
+        return Some(Culprit::Target(m.declarer.clone()));
+    }
+    match file {
+        Some(f) => Some(Culprit::File(Arc::clone(&f.file))),
+        None => frame.map(|a| Culprit::Target(a.clone())),
     }
 }
 
@@ -7580,6 +7618,16 @@ impl Engine {
                     }));
                 }
             };
+            // Every provider's spec, not only a BUILD file's `target()`: a
+            // cdylib provider never runs that check, and a name is a directory
+            // of the cache (`__target_<name>`), where a `/` nests one target
+            // inside another and `x/../../../y` climbs out of `<home>/cache`.
+            if let Err(e) = hmodel::htaddr::check_name(&spec.addr.name) {
+                return Err(e.context(InProvider {
+                    provider: provider.name.clone(),
+                    what: format!("resolving target `{addr}`"),
+                }));
+            }
 
             return anyhow::Ok(Arc::new(EngineTargetSpec {
                 spec: Arc::new(spec),
@@ -7854,8 +7902,7 @@ mod failure_fate_tests {
     #[test]
     fn failure_fate_cycle_under_input_def_propagates() {
         let cycle: anyhow::Error = CycleError {
-            from: a("//d:t"),
-            to: a("//c:y"),
+            path: vec![a("//c:y"), a("//d:t"), a("//c:y")],
         }
         .into();
         let e = at_input(cycle, "//d:t", "//c:y", "deps");
@@ -10639,13 +10686,9 @@ mod tests {
             Box::pin(async move {
                 match (fails, kind) {
                     (false, _) => Err(GetError::NotFound),
-                    (true, FailKind::Cycle) => Err(GetError::Other(
-                        CycleError {
-                            from: addr.clone(),
-                            to: addr,
-                        }
-                        .into(),
-                    )),
+                    (true, FailKind::Cycle) => {
+                        Err(GetError::Other(CycleError::through(addr).into()))
+                    }
                     (true, FailKind::Typed) => Err(GetError::Other(ProviderBlewUp.into())),
                 }
             })

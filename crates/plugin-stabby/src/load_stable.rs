@@ -800,10 +800,7 @@ impl Provider for StableRemoteProvider {
                 Body::GetErr(ge) => match required_enum(ge.kind, "GetError.kind") {
                     Ok(pb::get_error::Kind::NotFound) => Err(GetError::NotFound),
                     Ok(pb::get_error::Kind::Cycle) => Err(GetError::Other(anyhow::Error::new(
-                        hplugin::error::CycleError {
-                            from: req.addr.clone(),
-                            to: req.addr.clone(),
-                        },
+                        hplugin::error::CycleError::through(req.addr.clone()),
                     ))),
                     Ok(pb::get_error::Kind::Cancelled) => Err(GetError::Other(anyhow::Error::new(
                         hplugin::error::CancelledError,
