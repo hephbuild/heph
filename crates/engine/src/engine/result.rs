@@ -3406,7 +3406,7 @@ impl Engine {
                     // Fail-fast: tell everything to stop, then wait for it.
                     // Failures landing after we signalled don't override it.
                     *fatal = Some(e);
-                    rs.ctoken().cancel();
+                    rs.stop_for_fail_fast();
                 }
             }
         }

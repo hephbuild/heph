@@ -24,7 +24,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::engine::error::{FailureRecord, TargetFailure};
-use crate::tui::failure_report::{RenderCtx, RenderMode, render_report};
+use crate::engine::request_state::FailFastStopped;
+use crate::tui::failure_report::{RenderCtx, RenderMode, fail_fast_lines, render_report};
 use crate::tui::text::{Redact, WorkspaceRel};
 
 /// The width a report wraps at when the terminal's is unknown.
@@ -46,6 +47,8 @@ pub struct ReportContext {
     log_lines: usize,
     /// The width to wrap at instead of the terminal's (tests).
     width: Option<usize>,
+    /// What `--fail-fast` stopped, listed after the boxes.
+    stopped: Option<FailFastStopped>,
 }
 
 impl ReportContext {
@@ -72,7 +75,14 @@ impl ReportContext {
             source_root: None,
             log_lines,
             width: None,
+            stopped: None,
         }
+    }
+
+    /// List what `--fail-fast` stopped after the boxes (RUN-24).
+    pub fn with_stopped(mut self, stopped: Option<FailFastStopped>) -> Self {
+        self.stopped = stopped;
+        self
     }
 
     /// Name paths under `root` relative to it in error text (D2), and read
@@ -123,6 +133,10 @@ impl ReportContext {
         };
         let mut out = String::from("\n");
         out.push_str(&render_report(self.records.iter().map(AsRef::as_ref), &ctx));
+        if let Some(s) = &self.stopped {
+            out.push('\n');
+            out.push_str(&fail_fast_lines(&s.running, s.queued));
+        }
         out
     }
 }
@@ -195,6 +209,31 @@ mod tests {
             .with_width(width)
             .with_redact(Redact::of([HOME.into()]))
             .render(false)
+    }
+
+    /// RUN-24: what `--fail-fast` stopped follows the boxes, a line per
+    /// target that was running, then how many never started.
+    #[test]
+    fn report_lists_what_fail_fast_stopped() {
+        let out = ReportContext::gather(
+            &[failure("//p:bad", rec("//p:bad", "boom"))],
+            |_| false,
+            None,
+            3,
+        )
+        .with_width(80)
+        .with_stopped(Some(FailFastStopped {
+            running: vec!["//p:a".into(), "//p:b".into()],
+            queued: 3,
+        }))
+        .render(false);
+        assert_eq!(
+            out,
+            "\n✗ //p:bad\n  boom\n\n\
+             stopped by --fail-fast: //p:a (was running)\n\
+             stopped by --fail-fast: //p:b (was running)\n\
+             stopped by --fail-fast: 3 queued targets never started\n"
+        );
     }
 
     /// One box per culprit, drawn from its record in report mode: what it
