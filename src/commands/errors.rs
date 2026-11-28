@@ -116,10 +116,15 @@ fn render_incomplete(
     if after_failures {
         out.push_str("  Target failures above may be the cause.\n");
     }
-    out.push_str(
+    out.push_str(if report.nothing_matched {
+        "  No target matched, so nothing ran.\n"
+    } else {
         "  Targets that matched were still processed; the skipped ones were not, and may also \
-         have matched.\n  Fix the cause and re-run, or pass --fail-fast to stop at the first one \
-         with its full error.\n",
+         have matched.\n"
+    });
+    out.push_str(
+        "  Fix the cause and re-run, or pass --fail-fast to stop at the first one with its full \
+         error.\n",
     );
     out
 }
@@ -178,7 +183,9 @@ impl IncompleteSelection {
         this
     }
 
-    fn render_to_string(&self, color: bool, rel: &WorkspaceRel) -> String {
+    /// The block, with the command's own error above it, as the user reads
+    /// it. Pure.
+    pub fn render_to_string(&self, color: bool, rel: &WorkspaceRel) -> String {
         let mut out = self
             .cause
             .as_ref()
@@ -304,6 +311,9 @@ pub fn require_non_empty_unless_incomplete(
     if gaps.is_empty() {
         require_non_empty(results)
     } else {
+        if results.is_empty() {
+            gaps.note_nothing_matched();
+        }
         Ok(results)
     }
 }
@@ -1450,10 +1460,24 @@ mod tests {
             panic!("an empty run with nothing skipped must fail");
         };
         assert!(err.to_string().contains("no targets matched"), "{err}");
+        let gaps = some_gaps();
         assert!(
-            require_non_empty_unless_incomplete(vec![], &some_gaps()).is_ok(),
+            !gaps.report().nothing_matched,
+            "unset until the command says"
+        );
+        assert!(
+            require_non_empty_unless_incomplete(vec![], &gaps).is_ok(),
             "the skips are the answer; `finalize` reports them"
         );
+        // STAGE-04: and the block they are reported in says nothing ran.
+        let report = gaps.report();
+        assert!(report.nothing_matched);
+        let block = render_incomplete(&report, false, false);
+        assert!(
+            block.contains("\n  No target matched, so nothing ran.\n  Fix the cause"),
+            "{block}"
+        );
+        assert!(!block.contains("still processed"), "{block}");
     }
 
     /// I8: after a Ctrl-C stop with two root failures seen, the interactive

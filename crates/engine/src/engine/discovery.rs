@@ -19,6 +19,7 @@ use parking_lot::Mutex;
 use rustc_hash::FxHashSet;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// What a selector walk does with a candidate it cannot resolve.
 ///
@@ -146,6 +147,9 @@ const CAUSE_MAX_CHARS: usize = 160;
 pub struct Gaps {
     selector: String,
     inner: Mutex<GapsInner>,
+    /// The command matched no target at all (STAGE-04), as the command that
+    /// knows says through [`note_nothing_matched`](Self::note_nothing_matched).
+    nothing_matched: AtomicBool,
 }
 
 #[derive(Debug, Default)]
@@ -167,7 +171,16 @@ impl Gaps {
         Arc::new(Self {
             selector: selector.into(),
             inner: Mutex::new(GapsInner::default()),
+            nothing_matched: AtomicBool::new(false),
         })
+    }
+
+    /// The command acted on no target: the report says nothing ran, rather
+    /// than that the targets that matched were still processed. Only a
+    /// command that runs what it matched says this; a query's empty answer
+    /// is an answer.
+    pub fn note_nothing_matched(&self) {
+        self.nothing_matched.store(true, Ordering::Relaxed);
     }
 
     pub fn selector(&self) -> &str {
@@ -248,6 +261,7 @@ impl Gaps {
         let inner = self.inner.lock();
         GapReport {
             selector: self.selector.clone(),
+            nothing_matched: self.nothing_matched.load(Ordering::Relaxed),
             skipped: inner.seen.len(),
             groups: inner
                 .groups
@@ -274,6 +288,9 @@ impl Gaps {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GapReport {
     pub selector: String,
+    /// The command matched no target, so nothing ran
+    /// ([`Gaps::note_nothing_matched`]).
+    pub nothing_matched: bool,
     /// Exact number of distinct skipped scopes, across every group.
     pub skipped: usize,
     pub groups: Vec<GapGroup>,
