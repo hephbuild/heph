@@ -97,6 +97,7 @@ pub use hdriver_support::driver_managed;
 pub use hdriver_support::driver_managed_os;
 mod execute;
 pub mod failure_gc;
+pub(crate) mod failure_record;
 pub mod failure_slot;
 mod host_paths;
 pub mod invoke;
