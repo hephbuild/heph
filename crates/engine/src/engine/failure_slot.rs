@@ -188,25 +188,22 @@ pub struct SlotManifest {
 /// packages its manifest lists, and the provider that evaluated it.
 #[derive(Debug, Clone, Default)]
 struct FileSlot {
+    /// The workspace-relative file the slot is about: compared as a string,
+    /// so a clear never hashes a key.
+    file: Arc<str>,
     packages: Vec<String>,
     provider: Option<String>,
 }
 
 impl FileSlot {
     /// Whether a spec `provider` resolved for a target of `package`, declared
-    /// in the file whose slot is `source_key`, says the file of slot `key`
-    /// evaluated again: the spec was declared in that very file (H-M3 rule
-    /// a), or the provider that failed on the file evaluated one of the
-    /// packages the file was reached through without error, and so loaded
-    /// every file of that package cleanly (rule b).
-    fn cleared_by(
-        &self,
-        key: &str,
-        source_key: Option<&str>,
-        package: &str,
-        provider: &str,
-    ) -> bool {
-        source_key == Some(key)
+    /// in the file `source`, says this slot's file evaluated again: the spec
+    /// was declared in that very file (H-M3 rule a), or the provider that
+    /// failed on the file evaluated one of the packages the file was reached
+    /// through without error, and so loaded every file of that package
+    /// cleanly (rule b).
+    fn cleared_by(&self, source: Option<&str>, package: &str, provider: &str) -> bool {
+        source == Some(&*self.file)
             || (self.provider.as_deref().is_none_or(|p| p == provider)
                 && self.packages.iter().any(|p| p == package))
     }
@@ -569,10 +566,10 @@ impl FailureSlots {
         let Some(spec) = spec() else {
             return Vec::new();
         };
-        let source_key = spec.spec.source.as_ref().map(|s| file_key(s.file()));
+        let source = spec.spec.source.as_ref().map(|s| s.file());
         files
             .iter()
-            .filter(|(k, f)| f.cleared_by(k, source_key.as_deref(), package, &spec.provider))
+            .filter(|(_, f)| f.cleared_by(source, package, &spec.provider))
             .map(|(k, _)| k.clone())
             .collect()
     }
@@ -990,10 +987,11 @@ pub(crate) fn write_claim(
     let claimed = Claimed::new(Arc::clone(&slots.claims), key.clone());
     // A file's slot is clearable from now, not from when it lands: a clear
     // that comes first finds it, and waits for it (CQ-4).
-    if is_file {
+    if let hplugin::error::Culprit::File(rel) = &claim.culprit {
         slots.lock_file_slots().insert(
             key.clone(),
             FileSlot {
+                file: rel.clone(),
                 packages: claim.packages.clone(),
                 provider: claim.provider.clone(),
             },
@@ -1650,8 +1648,10 @@ fn list_slots(root: &Path) -> (HashSet<String>, HashMap<String, FileSlot>) {
         .filter(|n| n.starts_with("file_"))
         .filter_map(|n| {
             let m = read_any_manifest(&root.join(n))?;
-            (m.addr.starts_with(FILE_ADDR_PREFIX) && !m.packages.is_empty()).then(|| {
+            let file = m.addr.strip_prefix(FILE_ADDR_PREFIX)?;
+            (!m.packages.is_empty()).then(|| {
                 let slot = FileSlot {
+                    file: file.into(),
                     packages: m.packages,
                     provider: m.provider,
                 };

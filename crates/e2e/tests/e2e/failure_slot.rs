@@ -873,6 +873,58 @@ async fn eval_failure_leaves_a_slot_with_diagnostic_json() -> anyhow::Result<()>
     Ok(())
 }
 
+/// H-M3 end to end: a loaded `.bzl` that does not evaluate keeps a slot
+/// naming the provider that failed on it, which the real `get` path records
+/// (`InProvider`). Once fixed, a target of a package that loads it resolves
+/// from that provider, and clears the slot, although the target is declared
+/// in the BUILD file rather than in the `.bzl` (rule b).
+#[tokio::test]
+async fn a_fixed_bzl_clears_its_slot() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_file("lib/defs.bzl", "X = broken(\n");
+    ws.write_build_file(
+        "d",
+        "load(\"//lib/defs.bzl\", \"X\")\n\ntarget(name = \"t\", driver = \"bash\", run = \"true\")\n",
+    );
+    failures(&ws.engine, "//d:t", &ResultOptions::default()).await?;
+    ws.engine.failure_slots().writes_drained().await;
+    let slots = ws.engine.failure_slots();
+    let m = slots.read_file("lib/defs.bzl").expect("the .bzl's slot");
+    assert_eq!(m.packages, ["d"]);
+    assert!(
+        slots.read_file("d/BUILD").is_none(),
+        "the culprit is the .bzl"
+    );
+
+    // Fixed, then a later `heph` (a fresh engine: the provider's evaluations
+    // live for one invocation).
+    ws.write_file("lib/defs.bzl", "X = 1\n");
+    let later = ws.reopen()?;
+    let spec = Arc::clone(&later)
+        .get_spec(later.new_state(), &parse_addr("//d:t")?)
+        .await?;
+    assert_eq!(
+        m.provider.as_deref(),
+        Some(spec.provider.as_str()),
+        "the slot names the provider the target resolves from"
+    );
+    assert_eq!(spec.source.as_ref().map(|s| s.file()), Some("d/BUILD"));
+    Arc::clone(&later)
+        .result_addr(
+            later.new_state(),
+            &parse_addr("//d:t")?,
+            OutputMatcher::All,
+            &ResultOptions::default(),
+        )
+        .await?;
+    later.failure_slots().writes_drained().await;
+    assert!(
+        later.failure_slots().read_file("lib/defs.bzl").is_none(),
+        "fixing the .bzl cleared its slot"
+    );
+    Ok(())
+}
+
 /// A run that fails having printed nothing keeps a slot with an empty
 /// `log.txt` (RUN-19), and its record names it: zero lines, its fill.
 #[tokio::test]

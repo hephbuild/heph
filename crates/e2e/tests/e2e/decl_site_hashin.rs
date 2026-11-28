@@ -99,41 +99,24 @@ fn engine(root: &std::path::Path) -> Arc<Engine> {
     e.register_plugins(&file.plugins).expect("plugins:");
     // With the provider each cdylib exports: it declares the targets a go and
     // an oci def depends on (`//@heph/go/gocache:…`, `//@heph/oci:…`), whose
-    // addresses no option names.
+    // addresses no option names. The drivers are the lists the cdylibs export.
     e.register_plugin("go", |init| {
         let go = plugingo::Provider::new(init.root.clone(), init.runtime.clone())?;
-        Ok(PluginParts::default()
+        let parts = PluginParts::default()
             .with_functions(go.functions())
-            .with_provider(Box::new(go))
-            .with_managed_driver(Box::new(plugingo::GoGolistDriver::new()))
-            .with_managed_driver(Box::new(plugingo::GoToolchainDriver))
-            .with_managed_driver(Box::new(plugingo::GoCompileDriver::new()))
-            .with_managed_driver(Box::new(plugingo::GoDownloadDriver::new()))
-            .with_managed_driver(Box::new(plugingo::GoTestmainDriver))
-            .with_managed_driver(Box::new(plugingo::GoLintDriver::new()))
-            .with_managed_driver(Box::new(plugingo::GoLintGateDriver::new()))
-            .with_managed_driver(Box::new(plugingo::GoLintFixDriver::new()))
-            .with_managed_driver(Box::new(plugingo::GoFormatDriver::fix()))
-            .with_managed_driver(Box::new(plugingo::GoFormatDriver::check())))
+            .with_provider(Box::new(go));
+        Ok(plugingo::managed_drivers(None)
+            .into_iter()
+            .fold(parts, PluginParts::with_managed_driver))
     })
     .expect("go plugin");
     let oci_home = home.clone();
     e.register_plugin("oci", move |init| {
-        Ok(PluginParts::default()
-            .with_provider(Box::new(pluginoci::platform::Provider::new(&init.name)))
-            .with_managed_driver(Box::new(pluginoci::image::Driver::new()))
-            .with_managed_driver(Box::new(pluginoci::layer::Driver::new()))
-            .with_managed_driver(Box::new(pluginoci::index::Driver::new()))
-            .with_managed_driver(Box::new(pluginoci::docker_build::Driver::new()))
-            .with_managed_driver(Box::new(pluginoci::pull::Driver::new()))
-            .with_managed_driver(Box::new(pluginoci::push::Driver::new()))
-            .with_managed_driver(Box::new(pluginoci::load::Driver::new()))
-            .with_managed_driver(Box::new(pluginoci::tag::Driver::new()))
-            .with_managed_driver(Box::new(pluginoci::exists::Driver::new()))
-            .with_managed_driver(Box::new(pluginoci::platform::Driver::new()))
-            .with_managed_driver(Box::new(pluginoci::runner::Driver::from_host_home(Ok(
-                oci_home.clone(),
-            )))))
+        let parts = PluginParts::default()
+            .with_provider(Box::new(pluginoci::platform::Provider::new(&init.name)));
+        Ok(pluginoci::managed_drivers(Ok(oci_home.clone()))
+            .into_iter()
+            .fold(parts, PluginParts::with_managed_driver))
     })
     .expect("oci plugin");
     let devenv_home = home.clone();
@@ -217,12 +200,19 @@ fn lay_out(root: &std::path::Path, drivers: &[(String, &str)], layout: Layout) {
     // `defs/` holds no BUILD file: the macros are only loaded.
 }
 
-/// What `heph query //...` lists, and the `hashin` of each fixture target, on
-/// a fresh engine over `root`.
+/// Where a target's spec says it was declared: file, line and column.
+type Declared = (String, u32, u32);
+
+/// What `heph query //...` lists, and the `hashin` and declaration site of
+/// each fixture target, on a fresh engine over `root`.
 async fn observe(
     root: &std::path::Path,
     targets: &[Addr],
-) -> (Vec<String>, BTreeMap<String, String>) {
+) -> (
+    Vec<String>,
+    BTreeMap<String, String>,
+    BTreeMap<String, Declared>,
+) {
     let engine = engine(root);
     let m = heph::htquery::parse("//...", &heph::htpkg::PkgBuf::from("")).expect("matcher");
     let mut listed: Vec<String> = Arc::clone(&engine)
@@ -233,8 +223,24 @@ async fn observe(
         .expect("query //...");
     listed.sort();
     let mut hashin = BTreeMap::new();
+    let mut declared = BTreeMap::new();
     let mut failed = Vec::new();
     for addr in targets {
+        // The test's precondition: each spec carries a source, or a driver
+        // that hashed it would hash `None` in every layout and pass.
+        match Arc::clone(&engine).get_spec(engine.new_state(), addr).await {
+            Ok(spec) => match spec.source.as_ref() {
+                Some(source) => {
+                    let call = source.call();
+                    declared.insert(
+                        addr.format(),
+                        (source.file().to_owned(), call.start_line, call.start_col),
+                    );
+                }
+                None => failed.push(format!("{}: the spec carries no source", addr.format())),
+            },
+            Err(e) => failed.push(format!("{}: spec: {e:#}", addr.format())),
+        }
         match Arc::clone(&engine).meta(engine.new_state(), addr).await {
             Ok(meta) => {
                 hashin.insert(addr.format(), meta.hashin.clone());
@@ -244,10 +250,10 @@ async fn observe(
     }
     assert!(
         failed.is_empty(),
-        "a fixture with no hashin (fix it in `fixture`):\n{}",
+        "a fixture with no source or no hashin (fix it in `fixture`):\n{}",
         failed.join("\n")
     );
-    (listed, hashin)
+    (listed, hashin, declared)
 }
 
 #[tokio::test]
@@ -272,15 +278,20 @@ async fn moved_target_same_hashin_every_registered_driver() {
     targets.extend(["//matrix:m_a", "//matrix:m_b"].map(|a| parse_addr(a).expect("addr")));
 
     lay_out(root, &drivers, Layout::Plain);
-    let (listed, plain) = observe(root, &targets).await;
+    let (listed, plain, plain_at) = observe(root, &targets).await;
     for layout in [Layout::Moved, Layout::Macro] {
         lay_out(root, &drivers, layout);
-        let (l, h) = observe(root, &targets).await;
+        let (l, h, at) = observe(root, &targets).await;
         assert_eq!(
             l, listed,
             "{layout:?}: `heph query //...` lists the same targets"
         );
         for (addr, want) in &plain {
+            assert_ne!(
+                at.get(addr),
+                plain_at.get(addr),
+                "{layout:?}: {addr} was not moved, so its hashin proves nothing"
+            );
             assert_eq!(h.get(addr), Some(want), "{layout:?}: {addr}'s hashin moved");
         }
     }
