@@ -1,5 +1,5 @@
 //! `heph tool gen-gitignore` was removed with no alias (Decision 7): a hidden
-//! stub keeps the name only to fail with exit 2 and name its replacement on
+//! stub keeps the name only to fail with exit 1 and name its replacement on
 //! stderr, swallowing an old `--json`.
 //!
 //! Drives the built `heph` binary, because what is under test is the
@@ -50,7 +50,7 @@ fn gen_gitignore_removed_fails_with_hint() {
         &["tool", "gen-gitignore", "//pkg/..."][..],
     ] {
         let (out, ws) = run(args);
-        assert_eq!(out.status.code(), Some(2), "{}", describe(&out));
+        assert_eq!(out.status.code(), Some(1), "{}", describe(&out));
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
             stderr.contains("heph tool gen-gitignore was removed")
@@ -70,7 +70,7 @@ fn gen_gitignore_removed_fails_with_hint() {
 #[test]
 fn gen_gitignore_stub_swallows_json() {
     let (out, _ws) = run(&["tool", "gen-gitignore", "--json"]);
-    assert_eq!(out.status.code(), Some(2), "{}", describe(&out));
+    assert_eq!(out.status.code(), Some(1), "{}", describe(&out));
     assert!(out.stdout.is_empty(), "{}", describe(&out));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(

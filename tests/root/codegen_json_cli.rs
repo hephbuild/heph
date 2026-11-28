@@ -1,7 +1,7 @@
 //! `heph tool codegen … --json` at the process boundary: findings (exit 1)
-//! still print their record, a failure (exit 2) leaves stdout empty and says
-//! why on stderr, and a `--jq` filter that fails while it runs is exit 2,
-//! never `--check`'s 1.
+//! still print their record, a failure (exit 1 too) leaves stdout empty and
+//! says why on stderr, and a `--jq` filter that fails while it runs is an
+//! error, never `--check`'s silent findings.
 //!
 //! Drives the built `heph` binary, because what is under test is the exit
 //! status `main` turns a `CodegenExit` into and what reaches each stream.
@@ -86,13 +86,15 @@ fn findings_print_the_record_and_exit_1() {
     );
 }
 
+/// A failure exits 1, as findings do (U15): what tells them apart under
+/// `--json` is the empty stdout (CODEGEN.md).
 #[test]
-fn a_failure_leaves_stdout_empty_and_exits_2() {
+fn tool_codegen_json_failure_empty_stdout() {
     let ws = workspace();
     std::fs::create_dir_all(ws.path().join("q")).expect("mkdir q");
     std::fs::write(ws.path().join("q/BUILD"), "target(name = \n").expect("broken BUILD");
     let out = run(ws.path(), &[&CHECK[..], &["--json"]].concat());
-    assert_eq!(out.status.code(), Some(2), "{}", describe(&out));
+    assert_eq!(out.status.code(), Some(1), "{}", describe(&out));
     assert!(out.stdout.is_empty(), "{}", describe(&out));
     assert!(
         !out.stderr.is_empty(),

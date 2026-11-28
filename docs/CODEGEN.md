@@ -305,14 +305,18 @@ workspace root (`//p/foo.go`), or absolute; a path outside the workspace is
 refused. A bare `p/foo.go` typed in a subdirectory that names nothing there,
 while `//p/foo.go` exists, is `unknown` with "did you mean //p/foo.go?".
 
-**Exit codes** (these commands differ from the rest of heph, where every error
-exits 1, so that `--check` can tell findings from failures):
+**Exit codes**, as for every heph command:
 
 | Code | Meaning |
 | --- | --- |
 | 0 | OK |
-| 1 | findings (`--check`), or a refused or unknown path |
-| 2 | an error, including a usage error (unknown flag, missing argument) |
+| 1 | findings (`--check`), a refused or unknown path, or an error |
+| 2 | a usage error (unknown flag, missing argument), before the command runs |
+| 130 | cancelled (Ctrl-C) |
+
+Findings and an error both exit 1. What tells them apart is the output:
+findings print their report (or `--json` record) on stdout, an error prints
+nothing on stdout and its message on stderr.
 
 ### `heph tool codegen gitignore [--check] [MATCHER]`
 
@@ -435,7 +439,7 @@ warning; a section line still covers it as `unrecorded`. Removed in v1.1.0.
 
 ### `heph tool gen-gitignore` (removed)
 
-Fails with exit 2: "heph tool gen-gitignore was removed; use heph tool codegen
+Fails with exit 1: "heph tool gen-gitignore was removed; use heph tool codegen
 gitignore (and --check for the up-to-date test)", on stderr, whatever it is
 given: it has no JSON form, and an old `--json` changes nothing. Nothing is
 printed on stdout.
@@ -453,11 +457,13 @@ keys they do not know, and treat a `kind`, `result`, `reason`, `status`,
 additive too.
 
 The exit code is the same with or without `--json`. Findings (`--check`) and
-refused or unknown paths print the object and exit 1. A failure (exit 2)
-prints nothing on stdout and the message on stderr, so `… --json | jq .error`
-prints nothing; branch on the exit code. A usage error is clap's, before any
-command runs, and prints nothing on stdout either. A `--jq` filter that fails
-while it runs also exits 2, never 1, so it cannot read as findings.
+refused or unknown paths print the object and exit 1. A failure exits 1 too,
+but prints nothing on stdout and the message on stderr. So under `--json`
+the rule is: exit 1 with a record on stdout is findings, exit 1 with an empty
+stdout is a failure. A usage error is clap's (exit 2), before any command
+runs, and prints nothing on stdout either. A `--jq` filter that fails while
+it runs also exits 1; results it printed before failing stay on stdout, and
+stderr names the filter (`--jq: …`).
 
 ## Upgrading from the xattr
 
@@ -482,7 +488,7 @@ is unsupported.
 
 - **`heph tool gen-gitignore` is removed**, with no alias. Use
   `heph tool codegen gitignore`, and `heph tool codegen gitignore --check` for
-  the up-to-date test. The old name exits 2 with a message naming the new one;
+  the up-to-date test. The old name exits 1 with a message naming the new one;
   scripts and CI steps that ran it go red until updated.
 - **New BEGIN marker text.** The managed section's BEGIN line now names
   `heph tool codegen gitignore`. `validate` and `--check` report a section with

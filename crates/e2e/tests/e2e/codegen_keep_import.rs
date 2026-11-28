@@ -24,7 +24,6 @@ use heph::commands::tool::codegen::import::{self as import_cmd, ImportReport};
 use heph::commands::tool::codegen::keep::{
     self as keep_cmd, Options as DiscardOptions, PathResult, PathResultKind, PathsReport, Selection,
 };
-use heph::commands::tool::codegen::{CodegenExit, wrap_exit};
 use heph::commands::tool::codegen::{Report as _, gitignore as gitignore_cmd, status, why};
 use heph::engine::event::{BuildEvent, BuildEventKind};
 use heph::engine::{Config, Engine, HomeDir, OutputMatcher, ResultOptions};
@@ -1562,7 +1561,7 @@ async fn shared_home_codegen_import_writes_its_own_db_file() -> anyhow::Result<(
     Ok(())
 }
 
-/// A home that cannot be written fails the import with exit 2, naming the
+/// A home that cannot be written fails the import with an error (exit 1), naming the
 /// path.
 #[tokio::test]
 async fn codegen_import_on_read_only_home_exits_2() -> anyhow::Result<()> {
@@ -1600,12 +1599,6 @@ async fn codegen_import_on_read_only_home_exits_2() -> anyhow::Result<()> {
     assert!(
         shown.contains(&codegen_dir.display().to_string()),
         "the error names the path: {shown}"
-    );
-    let wrapped = wrap_exit(Err(err)).expect_err("still an error");
-    assert_eq!(
-        wrapped.downcast_ref::<CodegenExit>().map(|c| c.code),
-        Some(2),
-        "{wrapped:#}"
     );
     Ok(())
 }

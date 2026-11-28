@@ -7,9 +7,11 @@
 //! a real engine; the clap layer only parses, runs it inside the TUI app and
 //! prints.
 //!
-//! Exit codes are 0 / 1 / 2 (Decision 20), unlike every other heph command:
-//! `--check` must tell findings from failures. A command ends in a typed
-//! [`CodegenExit`], which `main.rs` downcasts.
+//! Exit codes are heph's: 0, 1 for findings or a failure, 130 for a cancel
+//! (error-reporting U15). Findings end in a typed [`CodegenExit`], which
+//! `main.rs` downcasts to exit 1 without rendering anything; a failure is an
+//! ordinary error. Under `--json` they differ by stdout: findings print their
+//! record, a failure prints nothing.
 
 pub mod gitignore;
 pub mod import;
@@ -34,41 +36,18 @@ use crate::tui::{BufferedStdout, LogSink};
 pub use paths::{ResolvedPath, resolve_path, root_hint, with_hint};
 
 /// The `--help` epilogue every codegen subcommand carries.
-pub const EXIT_CODES_HELP: &str = "Exit codes:\n  0  OK\n  1  findings (--check), or a refused or unknown path\n  2  error; a usage error (an unknown flag, a missing argument) also exits 2";
+pub const EXIT_CODES_HELP: &str = "Exit codes:\n  0    OK\n  1    findings (--check), a refused or unknown path, or an error (stdout is empty)\n  2    a usage error (an unknown flag, a missing argument)\n  130  cancelled";
 
-/// How a codegen command ended, when not with 0. `main.rs` exits with
-/// `code`; `error`, when set, is rendered first (any failure that is not a
-/// finding is wrapped as code 2).
+/// A codegen command that ended with findings (or a refused path): its
+/// report is printed, `main.rs` exits 1 and renders nothing more. A failure
+/// is not one of these: it is an ordinary error, which also exits 1 (130 for
+/// a cancel), and prints nothing on stdout.
 #[derive(Debug)]
-pub struct CodegenExit {
-    pub code: u8,
-    pub error: Option<anyhow::Error>,
-}
-
-impl CodegenExit {
-    /// Findings, or a refused path: exit 1, nothing more to render.
-    pub fn findings() -> Self {
-        Self {
-            code: 1,
-            error: None,
-        }
-    }
-
-    /// A failure: exit 2, rendering `error`.
-    pub fn failed(error: anyhow::Error) -> Self {
-        Self {
-            code: 2,
-            error: Some(error),
-        }
-    }
-}
+pub struct CodegenExit;
 
 impl std::fmt::Display for CodegenExit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.error {
-            Some(e) => write!(f, "{e:#}"),
-            None => write!(f, "exit {}", self.code),
-        }
+        f.write_str("findings")
     }
 }
 
@@ -152,29 +131,15 @@ impl CodegenArgs {
         session: &Arc<SessionSlot>,
         global: &GlobalOptions,
     ) -> anyhow::Result<()> {
-        let res = match &self.command {
+        match &self.command {
             CodegenCommands::Gitignore(a) => gitignore::execute(a, sink, session, global),
             CodegenCommands::Status(a) => status::execute(a, sink, session, global),
             CodegenCommands::Keep(a) => keep::execute_keep(a, sink, session, global),
             CodegenCommands::Discard(a) => keep::execute_discard(a, sink, session, global),
             CodegenCommands::Why(a) => why::execute(a, sink, session, global),
             CodegenCommands::Import(a) => import::execute(a, sink, session, global),
-        };
-        wrap_exit(res)
-    }
-}
-
-/// Any error that is not already a [`CodegenExit`], or an output failure
-/// that decides its own code (a `--jq` runtime error), becomes one with
-/// code 2.
-pub fn wrap_exit(res: anyhow::Result<()>) -> anyhow::Result<()> {
-    res.map_err(|e| {
-        if e.downcast_ref::<CodegenExit>().is_some() || output::exit_code(&e).is_some() {
-            e
-        } else {
-            CodegenExit::failed(e).into()
         }
-    })
+    }
 }
 
 /// The removed `heph tool gen-gitignore`: kept only to fail (Decision 7).
@@ -190,17 +155,17 @@ pub struct RemovedGenGitignoreArgs {
 /// The message the removed command fails with.
 pub const GEN_GITIGNORE_REMOVED: &str = "heph tool gen-gitignore was removed; use heph tool codegen gitignore (and --check for the up-to-date test)";
 
-/// `heph tool gen-gitignore`: the removal on stderr, exit 2, nothing on
+/// `heph tool gen-gitignore`: the removal on stderr, exit 1, nothing on
 /// stdout.
 pub fn removed_gen_gitignore(_args: &RemovedGenGitignoreArgs) -> anyhow::Result<()> {
-    Err(CodegenExit::failed(anyhow::anyhow!(GEN_GITIGNORE_REMOVED)).into())
+    Err(anyhow::anyhow!(GEN_GITIGNORE_REMOVED))
 }
 
 /// Run `job` as a codegen command: bootstrap the engine, run it inside the
 /// TUI app, print its report (the text, or the record under the output
 /// flags), and end with its exit code. Findings (exit 1) print their record
-/// too; a failure (exit 2) prints nothing on stdout, and `main` renders it on
-/// stderr.
+/// too; a failure (exit 1 as well) prints nothing on stdout, and `main`
+/// renders it on stderr.
 fn run_cli<R, F, Fut>(
     title: &'static str,
     out: &output::JsonArgs<R>,
@@ -245,7 +210,7 @@ where
                 if code == 0 {
                     Ok(())
                 } else {
-                    Err(CodegenExit { code, error: None }.into())
+                    Err(CodegenExit.into())
                 }
             })
             .await
@@ -424,28 +389,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn wrap_exit_keeps_a_codegen_exit_and_wraps_anything_else_as_two() {
-        let e = wrap_exit(Err(CodegenExit::findings().into())).unwrap_err();
-        assert_eq!(e.downcast_ref::<CodegenExit>().map(|c| c.code), Some(1));
-
-        let e = wrap_exit(Err(anyhow::anyhow!("boom"))).unwrap_err();
-        let c = e.downcast_ref::<CodegenExit>().expect("wrapped");
-        assert_eq!(c.code, 2);
-        assert!(format!("{e}").contains("boom"));
-        assert!(wrap_exit(Ok(())).is_ok());
-
-        // A `--jq` runtime error keeps its own code: 2 on every command, so
-        // it is never read as `--check`'s findings.
-        let jq: anyhow::Result<()> = Err(anyhow::Error::from(output::OutputError::JqRuntime(
-            "boom".into(),
-        ))
-        .context("printing"));
-        let e = wrap_exit(jq).unwrap_err();
-        assert!(e.downcast_ref::<CodegenExit>().is_none());
-        assert_eq!(output::exit_code(&e), Some(2));
-    }
-
     fn status_report() -> status::StatusReport {
         let item = |kind, path: Option<&str>, package: Option<&str>| status::StatusItem {
             kind,
@@ -620,7 +563,8 @@ mod tests {
     }
 
     /// `--check` findings still print their record and exit 1, and a `--jq`
-    /// filter that fails at runtime is exit 2, never read as findings.
+    /// filter that fails at runtime is an error (it renders `--jq: …`), never
+    /// the silent findings exit.
     #[test]
     fn jq_runtime_error_is_not_findings() -> anyhow::Result<()> {
         let report = status_report();
@@ -631,10 +575,8 @@ mod tests {
                 .printer_to(&mut buf, output::Style::Compact)
                 .record(&report, &output::never_cancelled)
                 .unwrap_err();
-        assert_eq!(
-            output::exit_code(&wrap_exit(Err(err)).unwrap_err()),
-            Some(2)
-        );
+        assert!(err.downcast_ref::<CodegenExit>().is_none(), "{err:#}");
+        assert!(output::exit_code(&err).is_some(), "{err:#}");
         Ok(())
     }
 

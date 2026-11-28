@@ -17,11 +17,11 @@ use crate::common;
 
 use anyhow::Context as _;
 use common::Workspace;
+use heph::commands::tool::codegen::Report as _;
 use heph::commands::tool::codegen::gitignore::{self as gi, GitignoreReport};
 use heph::commands::tool::codegen::keep::PathResultKind;
 use heph::commands::tool::codegen::status::{self as st, ItemKind, StatusReport};
 use heph::commands::tool::codegen::why::{self, WhyReport};
-use heph::commands::tool::codegen::{CodegenExit, Report as _, wrap_exit};
 use heph::commands::validate::{CodegenFindings, codegen_findings};
 use heph::engine::{Engine, OutputMatcher, ResultOptions};
 use heph::htaddr::parse_addr;
@@ -145,20 +145,6 @@ async fn why_in(engine: &Arc<Engine>, cwd: &Path, paths: &[&str]) -> anyhow::Res
 async fn validate(engine: &Arc<Engine>) -> CodegenFindings {
     let rs = engine.new_state();
     codegen_findings(engine, &rs, engine.root()).await
-}
-
-/// The exit code the CLI ends with: the report's, or 2 for an error (through
-/// the same `wrap_exit` every codegen subcommand ends in).
-fn exit_of<R: heph::commands::tool::codegen::Report>(res: anyhow::Result<R>) -> u8 {
-    match res {
-        Ok(r) => r.exit_code(),
-        Err(e) => {
-            let wrapped = wrap_exit(Err(e)).expect_err("an error stays an error");
-            wrapped
-                .downcast_ref::<CodegenExit>()
-                .map_or(255, |c| c.code)
-        }
-    }
 }
 
 /// The db as another process sees it.
@@ -287,7 +273,7 @@ async fn gitignore_prints_line_diff_only() -> anyhow::Result<()> {
 }
 
 /// `--check`: clean exits 0, stale exits 1 and writes nothing, an error
-/// (a BUILD file that fails to evaluate) is a `CodegenExit` of 2.
+/// (a BUILD file that fails to evaluate) is an error, not a report.
 #[tokio::test]
 async fn gitignore_check_result_kinds() -> anyhow::Result<()> {
     let ws = Workspace::new();
@@ -315,7 +301,6 @@ async fn gitignore_check_result_kinds() -> anyhow::Result<()> {
     let e2 = ws.reopen()?;
     let res = gitignore_check(&e2).await;
     assert!(res.is_err(), "a broken BUILD file fails the check: {res:?}");
-    assert_eq!(exit_of(res), 2, "an error is not a finding");
     Ok(())
 }
 
@@ -680,7 +665,6 @@ async fn status_check_result_kinds() -> anyhow::Result<()> {
     let e2 = ws.reopen()?;
     let res = status_with(&e2, check).await;
     assert!(res.is_err(), "{res:?}");
-    assert_eq!(exit_of(res), 2);
     Ok(())
 }
 

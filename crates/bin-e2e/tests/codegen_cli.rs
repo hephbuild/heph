@@ -1,6 +1,7 @@
-//! `heph tool codegen` at the process boundary: its 0 / 1 / 2 exit codes
-//! (Decision 20) reach the shell as statuses, and commands that build no
-//! engine leave no codegen index behind (Lifecycle row 22).
+//! `heph tool codegen` at the process boundary: its exit codes (0, 1 for
+//! findings and for a failure, clap's 2 for a usage error; U15) reach the
+//! shell as statuses, and commands that build no engine leave no codegen
+//! index behind (Lifecycle row 22).
 //!
 //! Neither has an in-process form: a linked test sees a `CodegenExit` value,
 //! never the status `main` turns it into, nor clap's own usage-error exit.
@@ -27,16 +28,20 @@ fn code(ws: &Workspace, dist: &Dist, args: &[&str]) -> (Option<i32>, String) {
     (out.status.code(), describe(&out))
 }
 
+const CHECK: [&str; 4] = ["tool", "codegen", "gitignore", "--check"];
+
+/// Stale is a finding: exit 1 with the report on stdout; once written,
+/// clean is 0.
 #[test]
-fn codegen_check_exit_codes() {
+fn tool_codegen_findings_exit_1() {
     let dist = Dist::locate();
     let ws = Workspace::new().expect("workspace");
     ws.write("p/BUILD", COPY_TARGET).expect("BUILD");
-    let check = ["tool", "codegen", "gitignore", "--check"];
 
     // No section yet: stale is a finding.
-    let (c, out) = code(&ws, &dist, &check);
-    assert_eq!(c, Some(1), "stale: {out}");
+    let out = ws.run(&dist, &CHECK).expect("run heph");
+    assert_eq!(out.status.code(), Some(1), "stale: {}", describe(&out));
+    assert!(!out.stdout.is_empty(), "findings print: {}", describe(&out));
     assert!(
         !ws.root().join(".gitignore").exists(),
         "--check writes nothing"
@@ -44,16 +49,30 @@ fn codegen_check_exit_codes() {
 
     let (c, out) = code(&ws, &dist, &["tool", "codegen", "gitignore"]);
     assert_eq!(c, Some(0), "write: {out}");
-    let (c, out) = code(&ws, &dist, &check);
+    let (c, out) = code(&ws, &dist, &CHECK);
     assert_eq!(c, Some(0), "clean: {out}");
+}
+
+/// A failure exits 1 like findings (U15), with nothing on stdout; clap's
+/// usage errors keep 2.
+#[test]
+fn tool_codegen_failure_exit_1() {
+    let dist = Dist::locate();
+    let ws = Workspace::new().expect("workspace");
+    ws.write("p/BUILD", COPY_TARGET).expect("BUILD");
 
     // A BUILD file that fails to evaluate is an error, not a finding.
     ws.write("q/BUILD", "target(name = \n")
         .expect("broken BUILD");
-    let (c, out) = code(&ws, &dist, &check);
-    assert_eq!(c, Some(2), "error: {out}");
+    let out = ws.run(&dist, &CHECK).expect("run heph");
+    assert_eq!(out.status.code(), Some(1), "error: {}", describe(&out));
+    assert!(
+        out.stdout.is_empty(),
+        "an error prints no report: {}",
+        describe(&out)
+    );
 
-    // A clap usage error exits 2 as well.
+    // A clap usage error exits 2.
     let (c, out) = code(
         &ws,
         &dist,
@@ -62,10 +81,6 @@ fn codegen_check_exit_codes() {
     assert_eq!(c, Some(2), "usage error: {out}");
     let (c, out) = code(&ws, &dist, &["tool", "codegen", "why"]);
     assert_eq!(c, Some(2), "missing argument: {out}");
-
-    // Every other heph command still exits 1 on an error.
-    let (c, out) = code(&ws, &dist, &["run", "//p:missing"]);
-    assert_eq!(c, Some(1), "a non-codegen error: {out}");
 }
 
 /// Every path under `dir` (recursively), for an assertion message.
@@ -104,7 +119,7 @@ fn help_version_and_engineless_commands_create_nothing() {
     ] {
         let out = ws.run(&dist, args).expect("run heph");
         let want = if args == ["tool", "gen-gitignore"] {
-            Some(2)
+            Some(1)
         } else {
             Some(0)
         };

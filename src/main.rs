@@ -383,12 +383,12 @@ fn exit_code_for(
         report(e, session);
         return code;
     }
-    // `heph tool codegen`: 1 for findings, 2 for a failure (Decision 20).
-    if let Some(exit) = e.downcast_ref::<commands::tool::codegen::CodegenExit>() {
-        if let Some(err) = &exit.error {
-            report(err, session);
-        }
-        return exit.code;
+    // `heph tool codegen` findings: the report is printed, exit 1. Its
+    // failures are ordinary errors, below: 1, or 130 for a cancel (U15).
+    if e.downcast_ref::<commands::tool::codegen::CodegenExit>()
+        .is_some()
+    {
+        return 1;
     }
     // `heph session`: 125 for its own failures, else the code `attach`
     // mirrors from the session it followed. The code comes from
