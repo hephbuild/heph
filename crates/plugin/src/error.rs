@@ -444,6 +444,33 @@ impl std::error::Error for ProcessFailed {}
 
 pub use hcore::process::Exit;
 
+/// A run whose process exited zero, failing in a step past it: collecting
+/// its declared outputs (one missing, or of the wrong kind). The host's
+/// record reads it as `FailedIn::AfterRun`, as it does a failure while
+/// hashing the artifacts: the process went fine, so a run that streamed its
+/// output still gets its box, and that box says so rather than repeating the
+/// log. Empty `Display`: it marks a chain, it adds no words to it.
+///
+/// In-process only: it does not cross the plugin seam, where the failure is
+/// a message, so a cdylib driver's collection failure stays `BeforeRun`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AfterProcess;
+
+impl AfterProcess {
+    /// `e`, marked as failing past a process that went fine.
+    pub fn mark(e: anyhow::Error) -> anyhow::Error {
+        e.context(Self)
+    }
+}
+
+impl fmt::Display for AfterProcess {
+    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Ok(())
+    }
+}
+
+impl std::error::Error for AfterProcess {}
+
 /// A run failure that crossed the plugin seam with a structured exit status
 /// ([`ProcessFailed::exit`] on the plugin's side).
 ///

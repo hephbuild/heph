@@ -167,6 +167,7 @@ pub(crate) fn compact(
     } else if frozen.is_some()
         || downcast_chain_ref::<RunStreamed>(e).is_some()
         || downcast_chain_ref::<FailureSlot>(e).is_some_and(|s| s.after_run)
+        || downcast_chain_ref::<hplugin::error::AfterProcess>(e).is_some()
     {
         FailedIn::AfterRun
     } else {

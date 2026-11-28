@@ -534,6 +534,9 @@ pub async fn collect_outputs(
         )
     })
     .await
+    // Called once the process exited zero, so whatever fails here failed
+    // past it.
+    .map_err(hplugin::error::AfterProcess::mark)
 }
 
 /// The synchronous body of [`collect_outputs`], split out so it can be handed to
