@@ -1462,9 +1462,9 @@ target(name = "top", driver = "bash", run = "echo ok > $OUT", out = "o.txt", dep
 /// graph is built straight into a request's `DepDag` (`add_dep_for_test`),
 /// as resolution would commit it, rather than by running 20k targets: the
 /// cost under test is the request-end pass, not the build. One pass for the
-/// skipped records and one for the culprits' paths, counted; the clock only
-/// catches a hang. The pure chain, where the output itself is quadratic,
-/// is `run_json`'s `finish_pure_chain_output_size`.
+/// skipped records and one for the culprits' paths, counted, and both done
+/// within the spec's 2 s (a debug build). The pure chain, where the output
+/// itself is quadratic, is `run_json`'s `finish_pure_chain_output_size`.
 #[tokio::test]
 async fn failure_report_cost_20k() -> anyhow::Result<()> {
     const N: usize = 20_000;
@@ -1513,8 +1513,8 @@ async fn failure_report_cost_20k() -> anyhow::Result<()> {
     assert_eq!(report.len(), N, "every skipped target has a root");
     assert_eq!(report.bitset_words(), N + 5, "5 culprits: one word a node");
     assert!(
-        took < std::time::Duration::from_secs(60),
-        "a hang, not a cost: {took:?}"
+        took < std::time::Duration::from_secs(2),
+        "the request-end report took {took:?}, over 2 s"
     );
     // The spine reaches every culprit from the top; the last stretch only
     // the last culprit.
