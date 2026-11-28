@@ -54,7 +54,7 @@ use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _};
 
 /// Key-layout version. Bumping it makes every older entry invisible rather than
 /// misread, which is the right failure for a cache.
-const KEY_PREFIX: &str = "scratch/v1";
+pub(crate) const KEY_PREFIX: &str = "scratch/v1";
 
 /// Payload-format version, independent of the key layout above: one covers where
 /// entries live, the other what is inside them.
@@ -387,11 +387,11 @@ impl Engine {
         pull_snapshot(source, &format!("{}.tar.gz", head.stem), dir).await
     }
 
-    /// Publish `dir` as the next generation of `scope`'s lineage.
+    /// Publish `dir` as the next generation of `scope`'s lineage, to every
+    /// writable remote cache: `(generation, compressed bytes)`, the bytes 0
+    /// when the lineage already held these contents.
     ///
-    /// Writes into `scope` and **never** into a fallback, even the one the
-    /// directory was seeded from. That is the isolation: a PR job cannot advance
-    /// the lineage its base builds from.
+    /// [`Self::scratch_publish`] to [`ScratchDestination::Remote`].
     pub async fn scratch_push(
         &self,
         slot: &str,
@@ -400,10 +400,45 @@ impl Engine {
         parent: Option<&SnapshotMeta>,
         producer: &str,
     ) -> anyhow::Result<(u64, u64)> {
-        let backends = self.remote_caches().writable_backends();
-        if backends.is_empty() {
-            anyhow::bail!("no writable remote cache is configured");
-        }
+        let p = self
+            .scratch_publish(
+                slot,
+                scope,
+                dir,
+                parent,
+                producer,
+                ScratchDestination::Remote,
+            )
+            .await?;
+        Ok((p.generation, p.bytes))
+    }
+
+    /// Publish `dir` as the next generation of `scope`'s lineage, to `dest`.
+    ///
+    /// Writes into `scope` and **never** into a fallback, even the one the
+    /// directory was seeded from. That is the isolation: a PR job cannot advance
+    /// the lineage its base builds from. One set of rules for every
+    /// destination: `parent + 1` within `scope` (0 when the parent is another
+    /// lineage's), and no new generation for contents the lineage already holds.
+    pub async fn scratch_publish(
+        &self,
+        slot: &str,
+        scope: &str,
+        dir: &Path,
+        parent: Option<&SnapshotMeta>,
+        producer: &str,
+        dest: ScratchDestination<'_>,
+    ) -> anyhow::Result<Published> {
+        let backends = match dest {
+            ScratchDestination::Remote => {
+                let backends = self.remote_caches().writable_backends();
+                if backends.is_empty() {
+                    anyhow::bail!("no writable remote cache is configured");
+                }
+                backends
+            }
+            ScratchDestination::Dir { .. } => Vec::new(),
+        };
 
         let d = dir.to_path_buf();
         let Packed {
@@ -436,15 +471,42 @@ impl Engine {
         // Nothing to publish: this lineage already holds exactly these bytes.
         // Skipping keeps a no-op CI run from adding a generation that says
         // nothing, which would otherwise make the chain grow with every build.
-        if parent.is_some_and(|p| p.content_hash == hash && p.scope == scope) {
-            return Ok((parent.map(|p| p.generation).unwrap_or(0), 0));
-        }
-        let stem = format!("{}{:016x}.{hash}", scope_prefix(slot, scope), generation);
-        let meta = SnapshotMeta {
-            content_hash: hash.clone(),
-            ..meta
+        let unchanged = parent.filter(|p| p.content_hash == hash && p.scope == scope);
+        let (generation, meta) = match (unchanged, dest) {
+            (Some(p), ScratchDestination::Remote) => {
+                self.record_published_scratch(slot, p);
+                return Ok(Published {
+                    generation: p.generation,
+                    bytes: 0,
+                    unchanged: true,
+                });
+            }
+            // A directory starts empty: the parent's own entry goes in it,
+            // under its key, as the lineage already holds it.
+            (Some(p), ScratchDestination::Dir { .. }) => (p.generation, p.clone()),
+            (None, _) => (
+                generation,
+                SnapshotMeta {
+                    content_hash: hash.clone(),
+                    ..meta
+                },
+            ),
         };
+        let stem = format!("{}{:016x}.{hash}", scope_prefix(slot, scope), generation);
         let meta_bytes = borsh::to_vec(&meta).context("encode scratch snapshot meta")?;
+
+        if let ScratchDestination::Dir { root, prev } = dest {
+            let (root, prev) = (root.to_path_buf(), prev.map(Path::to_path_buf));
+            let bytes = hcore::blocking::run(move || {
+                write_entry_into(&root, prev.as_deref(), &stem, file, blob_len, &meta_bytes)
+            })
+            .await?;
+            return Ok(Published {
+                generation,
+                bytes,
+                unchanged: unchanged.is_some(),
+            });
+        }
 
         let mut blob = tokio::io::BufReader::with_capacity(
             SNAPSHOT_STREAM_BUF,
@@ -471,8 +533,100 @@ impl Engine {
         // Recorded locally so the next publish knows its parent, and so an
         // unchanged re-publish is recognized above.
         write_local_meta(&self.home, slot, scope, &meta);
-        Ok((generation, blob_len))
+        self.record_published_scratch(slot, &meta);
+        Ok(Published {
+            generation,
+            bytes: blob_len,
+            unchanged: false,
+        })
     }
+
+    /// Put a slot published to the remote caches in this engine's working
+    /// set, so the job's snapshot carries it. A push runs outside any
+    /// request, so it goes to the journal directly.
+    fn record_published_scratch(&self, slot: &str, meta: &SnapshotMeta) {
+        if let Some(journal) = self.working_set_journal() {
+            journal.record_scratch_now(crate::engine::cache_snapshot::RecordedScratch {
+                slot: slot.to_owned(),
+                scope: meta.scope.clone(),
+                generation: meta.generation,
+                content_hash: meta.content_hash.clone(),
+            });
+        }
+    }
+}
+
+/// Where [`Engine::scratch_publish`] writes a slot.
+#[derive(Debug, Clone, Copy)]
+pub enum ScratchDestination<'a> {
+    /// Every writable remote cache (`heph tool scratch push`). The local
+    /// lineage meta then records what was published, and the slot joins the
+    /// engine's working set. Unchanged contents write nothing: the lineage
+    /// already holds them.
+    Remote,
+    /// `root`, laid out as a remote cache is: a cache snapshot's generation
+    /// being built. It starts empty, so unchanged contents are written under
+    /// the parent's own key rather than skipped, hard-linked from `prev` (the
+    /// previous generation) when it holds that entry. Local state is not
+    /// touched.
+    Dir {
+        root: &'a Path,
+        prev: Option<&'a Path>,
+    },
+}
+
+/// What [`Engine::scratch_publish`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Published {
+    /// The generation in the scope that holds the contents.
+    pub generation: u64,
+    /// Compressed bytes written to each destination; 0 when nothing was.
+    pub bytes: u64,
+    /// The lineage already held these contents, as `generation`.
+    pub unchanged: bool,
+}
+
+/// Write one entry, `<stem>.tar.gz` then `<stem>.meta`, under `root`: the
+/// archive's bytes.
+///
+/// Payload first, meta last, as on a bucket. The archive is hard-linked from
+/// `prev` when that holds a regular file of this key and length (the key
+/// carries the content hash) under real directories, else streamed from
+/// `packed`: a symlinked slot or scope dir would lead out of `<dir>`.
+fn write_entry_into(
+    root: &Path,
+    prev: Option<&Path>,
+    stem: &str,
+    mut packed: std::fs::File,
+    len: u64,
+    meta: &[u8],
+) -> anyhow::Result<u64> {
+    let tar_rel = format!("{stem}.tar.gz");
+    let dst = root.join(&tar_rel);
+    let parent = dst.parent().context("scratch entry has no parent")?;
+    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    let linked = prev.is_some_and(|prev| {
+        let src = prev.join(&tar_rel);
+        // Every directory between `prev` and the archive is a real one;
+        // `symlink_metadata` follows all but the last component.
+        let real_dirs = src
+            .ancestors()
+            .skip(1)
+            .take_while(|a| *a != prev)
+            .all(|a| std::fs::symlink_metadata(a).is_ok_and(|m| m.is_dir()));
+        real_dirs
+            && std::fs::symlink_metadata(&src).is_ok_and(|m| m.is_file() && m.len() == len)
+            && std::fs::hard_link(&src, &dst).is_ok()
+    });
+    if !linked {
+        let mut out =
+            std::fs::File::create(&dst).with_context(|| format!("creating {}", dst.display()))?;
+        std::io::copy(&mut packed, &mut out)
+            .with_context(|| format!("writing {}", dst.display()))?;
+    }
+    let meta_path = root.join(format!("{stem}.meta"));
+    std::fs::write(&meta_path, meta).with_context(|| format!("writing {}", meta_path.display()))?;
+    Ok(len)
 }
 
 /// Stream `src` to `key` on `backend`, whole.
@@ -996,5 +1150,145 @@ mod tests {
     fn an_absent_local_meta_is_none_rather_than_an_error() {
         let tmp = tempfile::tempdir().expect("tempdir");
         assert_eq!(read_local_meta(tmp.path(), "nope", "master"), None);
+    }
+
+    /// Every regular file under `root`, as `(relative path, bytes)`, sorted.
+    fn files_under(root: &Path) -> Vec<(String, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("ls") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    let rel = path.strip_prefix(root).expect("under root");
+                    out.push((
+                        rel.to_string_lossy().into_owned(),
+                        std::fs::read(&path).expect("read"),
+                    ));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// `scratch_push` now goes through `scratch_publish` with a destination;
+    /// a bucket must get exactly what it got before: the archive `pack`
+    /// produces and the borsh meta, under `<prefix><gen:016x>.<hash>`, the
+    /// lineage meta recorded locally, and nothing at all for unchanged
+    /// contents. A snapshot generation (`Dir`) gets the same entry, byte for
+    /// byte.
+    #[tokio::test]
+    async fn push_to_a_bucket_is_unchanged_by_the_destination_refactor() {
+        let bucket = tempfile::tempdir().expect("bucket");
+        let ws = tempfile::tempdir().expect("ws");
+        let engine = Engine::new(crate::engine::Config {
+            remote_caches: vec![crate::engine::RemoteCacheDef {
+                name: "shared".to_string(),
+                uri: format!("file://{}", bucket.path().display()),
+                read: true,
+                write: true,
+                concurrency: 10,
+                endpoint: None,
+                region: None,
+            }],
+            ..crate::engine::Config::for_tests(ws.path())
+        })
+        .expect("engine");
+
+        let src = ws.path().join("slot").join("head");
+        std::fs::create_dir_all(src.join("sub")).expect("mkdir");
+        std::fs::write(src.join("a"), b"alpha").expect("write a");
+        std::fs::write(src.join("sub").join("b"), vec![7u8; 4096]).expect("write b");
+        let (digest, bytes) = pack(&src, Vec::new()).expect("pack");
+        let hash = digest.hash();
+        let archive = digest.inner;
+
+        let (generation, len) = engine
+            .scratch_push("s1", "main", &src, None, "run-1")
+            .await
+            .expect("push");
+        assert_eq!((generation, len), (0, archive.len() as u64));
+
+        let stem = format!("scratch/v1/s1/main/{:016x}.{hash}", 0);
+        let meta = SnapshotMeta {
+            format: SNAPSHOT_FORMAT,
+            scope: "main".to_string(),
+            generation: 0,
+            parent_scope: String::new(),
+            parent_generation: 0,
+            bytes,
+            heph_version: hcore::version::current().to_string(),
+            producer: "run-1".to_string(),
+            content_hash: hash.clone(),
+            produced_at: src.to_string_lossy().into_owned(),
+        };
+        let want = vec![
+            (
+                format!("{stem}.meta"),
+                borsh::to_vec(&meta).expect("encode"),
+            ),
+            (format!("{stem}.tar.gz"), archive),
+        ];
+        assert_eq!(files_under(bucket.path()), want);
+        let parent = read_local_meta(&engine.home, "s1", "main");
+        assert_eq!(parent.as_ref(), Some(&meta), "the lineage meta is recorded");
+
+        // Unchanged contents: no new generation, nothing written.
+        let again = engine
+            .scratch_push("s1", "main", &src, parent.as_ref(), "run-2")
+            .await
+            .expect("push again");
+        assert_eq!(again, (0, 0));
+        assert_eq!(files_under(bucket.path()), want);
+
+        // The same publish into a directory writes the same entry.
+        let generation_dir = tempfile::tempdir().expect("generation");
+        let published = engine
+            .scratch_publish(
+                "s1",
+                "main",
+                &src,
+                parent.as_ref(),
+                "run-2",
+                ScratchDestination::Dir {
+                    root: generation_dir.path(),
+                    prev: None,
+                },
+            )
+            .await
+            .expect("publish to a dir");
+        assert!(published.unchanged, "{published:?}");
+        assert_eq!(published.generation, 0);
+        assert_eq!(files_under(generation_dir.path()), want);
+
+        // Changed contents: `parent + 1`, in both.
+        std::fs::write(src.join("a"), b"beta").expect("rewrite a");
+        let (g1, _) = engine
+            .scratch_push("s1", "main", &src, parent.as_ref(), "run-3")
+            .await
+            .expect("push changed");
+        assert_eq!(g1, 1);
+        let next = engine
+            .scratch_publish(
+                "s1",
+                "main",
+                &src,
+                parent.as_ref(),
+                "run-3",
+                ScratchDestination::Dir {
+                    root: generation_dir.path(),
+                    prev: None,
+                },
+            )
+            .await
+            .expect("publish changed to a dir");
+        assert_eq!((next.generation, next.unchanged), (1, false));
+        assert_eq!(
+            files_under(bucket.path()),
+            files_under(generation_dir.path())
+        );
     }
 }

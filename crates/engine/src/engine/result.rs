@@ -2538,9 +2538,12 @@ impl Engine {
         // Announce worker capacity once per request. Covers the single-target
         // entry (`run` of one addr) that bypasses `Engine::result`; the once-guard
         // makes the dep recursion below a no-op.
-        rs.announce_request_config(self.max_workers, opts.no_scratch, || {
-            self.pool_announcement()
-        });
+        rs.announce_request_config(
+            self.max_workers,
+            opts.no_scratch,
+            || self.pool_announcement(),
+            self.snapshot_state.as_ref(),
+        );
 
         // Single-target entry (`run` of one addr, which bypasses `Engine::result`):
         // claim the matched stream and emit the set-of-one as already-complete
@@ -2916,9 +2919,12 @@ impl Engine {
 
         // Announce worker capacity up front so the client can paint a fixed
         // worker-slot indicator before any execute lands.
-        rs.announce_request_config(self.max_workers, opts.no_scratch, || {
-            self.pool_announcement()
-        });
+        rs.announce_request_config(
+            self.max_workers,
+            opts.no_scratch,
+            || self.pool_announcement(),
+            self.snapshot_state.as_ref(),
+        );
 
         let fail_fast = rs.fail_fast();
         let mut set: JoinSet<(Addr, anyhow::Result<Arc<EResult>>)> = JoinSet::new();
@@ -4068,7 +4074,17 @@ impl Engine {
                         shell,
                         no_scratch,
                     };
-                    let (resolution, read) = engine.resolve_locked_inner(rs, &opts).await?;
+                    let (resolution, read) =
+                        engine.resolve_locked_inner(Arc::clone(&rs), &opts).await?;
+                    // The working set: a durable revision this request hit on
+                    // any tier, or wrote — once per addr per request, here in
+                    // the cell. A shell run and a cache-off target write a tmp
+                    // revision, and a `remote_enabled = false` one never
+                    // leaves this machine, so none of them is carried.
+                    let cache = &def_owned.target.cache;
+                    if cache.enabled && cache.remote_enabled && !shell {
+                        rs.record_revision(&def_owned.target.addr, &hashin);
+                    }
                     *handoff.lock() = read;
                     anyhow::Ok(resolution)
                 }),
@@ -4425,7 +4441,7 @@ impl Engine {
                         // plain `Miss`. Only a local error the probe propagates
                         // (mirroring the manifest) returns here, before any
                         // outcome: the resolution failed, nothing was settled.
-                        crate::engine::event::emit_scope(
+                        let probe = crate::engine::event::emit_scope(
                             &rs,
                             crate::engine::event::BuildEventKind::RemoteCacheReadStart {
                                 addr: addr_s.clone(),
@@ -4434,9 +4450,20 @@ impl Engine {
                                 addr: span_addr,
                                 error: error.map(crate::engine::event::ErrorDetail::into_message),
                             },
-                            self.probe_remote_revision(ctoken, addr, opts.hashin.as_str(), &needed),
+                            self.probe_remote_revision_explained(
+                                ctoken,
+                                addr,
+                                opts.hashin.as_str(),
+                                &needed,
+                            ),
                         )
-                        .await?
+                        .await?;
+                        // Every tier passed over, and why, ahead of the hit or
+                        // miss they explain.
+                        for miss in probe.misses {
+                            rs.emit(self.remote_caches.tier_miss_event(&addr_s, miss));
+                        }
+                        probe.found
                     } else {
                         None
                     };
@@ -4446,9 +4473,14 @@ impl Engine {
                             // "already built elsewhere", execution skipped. Emit it so
                             // the cached count (TUI, GHA, telemetry) reflects remote
                             // hits, not just local ones.
+                            // Which tier served it, for per-tier hit counts:
+                            // the snapshot by flag, a user cache by name.
+                            let snapshot = self.remote_caches.served_by_snapshot(&rev);
                             rs.emit(crate::engine::event::BuildEventKind::RemoteCacheHit {
                                 addr: addr_s.clone(),
-                                cache: Some(self.remote_caches.cache_name(&rev).to_owned()),
+                                cache: (!snapshot)
+                                    .then(|| self.remote_caches.cache_name(&rev).to_owned()),
+                                snapshot,
                             });
                             rs.emit(crate::engine::event::BuildEventKind::CacheOutcome {
                                 addr: addr_s,
@@ -6006,11 +6038,17 @@ impl Engine {
             }
         ))
         .await;
-        if let Err(e) = dup {
-            // Best-effort: the primary cache entry is already written, so a
-            // failure here just means the next run re-executes instead of
-            // hitting the fixpoint. Never fail a successful build over it.
-            tracing::debug!(error = %format!("{e:#}"), %addr, "fixpoint: duplicate cache revision failed");
+        match dup {
+            // The next run computes this key, so the working set carries it.
+            // `false`: the primary was gone, nothing was filed.
+            Ok(true) if def.target.cache.remote_enabled => rs.record_revision(&addr, &fixpoint),
+            Ok(_) => {}
+            Err(e) => {
+                // Best-effort: the primary cache entry is already written, so a
+                // failure here just means the next run re-executes instead of
+                // hitting the fixpoint. Never fail a successful build over it.
+                tracing::debug!(error = %format!("{e:#}"), %addr, "fixpoint: duplicate cache revision failed");
+            }
         }
         Ok(())
     }

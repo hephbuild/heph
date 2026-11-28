@@ -134,6 +134,33 @@ pub struct Config {
     /// outside the `sandbox` pool's bound; a credential target's sandbox is
     /// removed whatever this says.
     pub keep_failed_sandboxes: bool,
+    /// Record this engine's working set in a journal under
+    /// `<home>/cache/working-set/` for `heph tool cache snapshot`. See
+    /// [`cache_snapshot`](crate::engine::cache_snapshot).
+    ///
+    /// Set by the front end when a snapshot dir is configured, and never for
+    /// a helper engine (`new_helper_engine`, the reader engine) or the
+    /// `snapshot` command's own engine. Off by default.
+    pub record_working_set: bool,
+    /// The CI cache snapshot directory, absolute and lexically normalized, or
+    /// `None` when snapshots are off: `HEPH_CACHE_SNAPSHOT` over
+    /// `cacheSnapshot.dir`, resolved by
+    /// [`resolve_cache_snapshot_dir`](crate::engine::config_yaml::resolve_cache_snapshot_dir).
+    /// It is in [`Engine::skip_dirs`], which every in-process tree walk
+    /// prunes, so no BUILD-file glob reads it as source. Not every walk: the
+    /// Go cdylib plugin builds its provider with no skip dirs at all, so its
+    /// package discovery does not prune this dir.
+    ///
+    /// [`Engine::skip_dirs`]: crate::engine::Engine::skip_dirs
+    pub cache_snapshot: Option<PathBuf>,
+    /// Whether `Engine::new` opens [`Self::cache_snapshot`]'s tier, reading it
+    /// first and reporting its state. On by default; off for the `snapshot`
+    /// command's own engine, which reads the dir directly.
+    pub snapshot_tier: bool,
+    /// The run is under CI (`CI` truthy), as the front end read it from its
+    /// environment: the engine never reads the variable. Turns on the
+    /// end-of-run reminder of a journal no snapshot has written yet.
+    pub ci: bool,
     /// Resource pools as written, each with its unit and capacity: the config
     /// file's `resources:`, with the run's overrides (`--resource`, `-j`,
     /// `HEPH_RESOURCE_<NAME>`) laid over it by the front end. A builtin absent
@@ -193,6 +220,10 @@ impl Config {
             scratch: ScratchOptions::default(),
             listed_facts_trust: Default::default(),
             keep_failed_sandboxes: false,
+            record_working_set: false,
+            cache_snapshot: None,
+            snapshot_tier: true,
+            ci: false,
             resources: BTreeMap::new(),
         }
     }
@@ -247,7 +278,20 @@ impl MemCacheOptions {
 /// [`RemoteCacheDef`]) — is exposed as an extension trait on the engine side
 /// rather than an inherent method. Bring it into scope to call `cfg.resolve(..)`.
 pub trait ConfigYamlExt {
-    fn resolve(&self, root: &Path) -> anyhow::Result<Config>;
+    /// [`resolve_with_env`](ConfigYamlExt::resolve_with_env) with no
+    /// environment: the config file alone decides.
+    fn resolve(&self, root: &Path) -> anyhow::Result<Config> {
+        self.resolve_with_env(root, None)
+    }
+
+    /// Resolve with the environment values the front end read for the
+    /// engine: `snapshot_env` is `HEPH_CACHE_SNAPSHOT`'s value when it is set.
+    /// The engine never reads the environment itself.
+    fn resolve_with_env(
+        &self,
+        root: &Path,
+        snapshot_env: Option<&std::ffi::OsStr>,
+    ) -> anyhow::Result<Config>;
 }
 
 impl ConfigYamlExt for ConfigYaml {
@@ -260,7 +304,11 @@ impl ConfigYamlExt for ConfigYaml {
     /// `providers`/`drivers` are intentionally *not* part of [`Config`] (they are
     /// applied to the engine registry separately, post-construction), so they
     /// stay on the [`ConfigYaml`].
-    fn resolve(&self, root: &Path) -> anyhow::Result<Config> {
+    fn resolve_with_env(
+        &self,
+        root: &Path,
+        snapshot_env: Option<&std::ffi::OsStr>,
+    ) -> anyhow::Result<Config> {
         let mem_cache_opts = |c: &MemCacheConfig| MemCacheOptions {
             per_entry_bytes: c.per_entry_bytes,
             capacity_bytes: c.capacity_bytes,
@@ -301,6 +349,17 @@ impl ConfigYamlExt for ConfigYaml {
             listed_facts_trust: defaults.listed_facts_trust,
             // A run's choice, like `--fail-fast`: the CLI sets it.
             keep_failed_sandboxes: defaults.keep_failed_sandboxes,
+            // Per engine, not per workspace: the front end turns it on for a
+            // build engine when a snapshot dir is configured.
+            record_working_set: defaults.record_working_set,
+            cache_snapshot: hconfig::resolve_cache_snapshot_dir(
+                root,
+                snapshot_env,
+                self.cache_snapshot.as_ref(),
+            ),
+            // Per engine and per run: the front end sets both.
+            snapshot_tier: defaults.snapshot_tier,
+            ci: defaults.ci,
             lock_backend: self
                 .lock
                 .and_then(|l| l.backend)

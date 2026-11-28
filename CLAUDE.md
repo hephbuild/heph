@@ -277,6 +277,22 @@ unlike `cache/`, losing the index **changes answers**, not just time, so no
 clean, gc or prune may touch it, and a lookup only ever reads it — no engine
 call, no def, no write — because it runs inside BUILD evaluation.
 
+### CI cache snapshots
+
+`cacheSnapshot: { dir }` (or `HEPH_CACHE_SNAPSHOT`) makes `<dir>` a read-only
+cache tier, first in the read order, and makes each build engine journal its
+working set under `<home>/cache/working-set/`; `heph tool cache snapshot`
+rewrites `<dir>` to that working set (`crates/engine/src/engine/cache_snapshot/`).
+
+Read `docs/CI.md` before touching it. The one thing to know going in: the tier
+must stay **out of every hash and of the persisted read order** — not
+`config_hash`, not `store_order`, not `measure_latency` — and is **never
+written** during a build; every per-tier rejection passes the tier over to the
+next one rather than ending the lookup. Helper engines and the snapshot
+command's own engine never record. Bumping `SNAPSHOT_FORMAT` (the
+`HEPH_SNAPSHOT` marker) or `JOURNAL_VERSION` turns every CI snapshot cold for
+one job — release-gated, like `COREUTILS_VERSION`.
+
 ### Target timeouts
 
 `timeout = "10m"` on an `exec`/`bash` target bounds its run. The driver only

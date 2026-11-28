@@ -671,14 +671,20 @@ pub enum BuildEventKind {
         error: Option<String>,
     },
     /// A remote tier had the revision. A **tier event, not a target outcome**:
-    /// count targets with [`CacheOutcome`](Self::CacheOutcome).
+    /// count targets with [`CacheOutcome`](Self::CacheOutcome). [`TierCounts`]
+    /// folds it, with the outcomes, into hits per tier.
     RemoteCacheHit {
         addr: String,
         /// The configured name of the remote cache that had it (`caches:` in
-        /// `.hephconfig`): `heph run --json` reports it. `None` from a host
-        /// that predates it.
+        /// `.hephconfig`): `heph run --json` reports it. `None` when
+        /// `snapshot` is set, and from a host that predates it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cache: Option<String>,
+        /// The CI cache snapshot's tier served it (`cacheSnapshot:`), not a
+        /// cache the user configured. A flag rather than a name, since a
+        /// user cache may be named anything, `snapshot` included.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        snapshot: bool,
     },
     /// A remote tier was consulted and did not have the revision. A **tier
     /// event, not a target outcome**: it follows a [`LocalCacheMiss`]
@@ -686,6 +692,67 @@ pub enum BuildEventKind {
     /// full miss twice. Count targets with [`CacheOutcome`](Self::CacheOutcome).
     RemoteCacheMiss {
         addr: String,
+    },
+    /// One remote tier passed over in a target's hit decision, and why: one
+    /// per tier the walk examined before the one that served it, or every
+    /// tier it examined on a full miss. A **tier event, not a target
+    /// outcome**, like [`RemoteCacheMiss`](Self::RemoteCacheMiss), which
+    /// still follows a full miss. [`TierCounts`] folds it into misses per
+    /// tier. An older consumer reads it as [`BuildEventKind::Unknown`].
+    RemoteTierMiss {
+        addr: String,
+        /// The `caches:` name of the tier; empty when `snapshot` is set.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        cache: String,
+        /// The CI cache snapshot's tier, as on
+        /// [`RemoteCacheHit`](Self::RemoteCacheHit).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        snapshot: bool,
+        #[serde(default)]
+        reason: TierMissReason,
+    },
+    /// The CI cache snapshot's tier as this engine opened it, so a log tells
+    /// "the restore missed" from "an earlier job failed" from "`hashin`
+    /// changed". Sent once per request, right after
+    /// [`RequestConfig`](Self::RequestConfig), and only when a snapshot dir
+    /// is configured. [`snapshot_state_line`] is its CI line. Every field
+    /// defaults; an older consumer reads it as [`BuildEventKind::Unknown`].
+    CacheSnapshotState {
+        /// The snapshot dir, relative to the workspace root when it is under
+        /// it.
+        #[serde(default)]
+        dir: String,
+        #[serde(default)]
+        state: SnapshotTierState,
+        /// The marker's `format`, when it was read far enough to say one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        format: Option<u64>,
+        /// The heph that wrote the snapshot, when it is served.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        heph: String,
+        /// The run that wrote it was incomplete, so it also carried over what
+        /// it restored.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        incomplete: bool,
+        /// Revisions and bytes the served generation holds, as its marker
+        /// records them; `None` for a snapshot written before the marker
+        /// carried them.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        revisions: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bytes: Option<u64>,
+        /// Why an unreadable snapshot was skipped, for a person.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    /// The run ends with revisions in its working-set journal that no
+    /// `heph tool cache snapshot` has written yet. Sent under CI only, at
+    /// most once per engine, when `heph run` ends. [`snapshot_state_line`]
+    /// is its CI line. An older consumer reads it as
+    /// [`BuildEventKind::Unknown`].
+    SnapshotJournalPending {
+        #[serde(default)]
+        revisions: u64,
     },
     /// Start of pulling a target's revision from the remote cache(s) into the
     /// local cache (one span per target, covering all of its blobs from the one
@@ -998,6 +1065,145 @@ pub enum CacheOutcomeKind {
     Unknown,
 }
 
+/// Why a remote tier did not serve a target — see
+/// [`BuildEventKind::RemoteTierMiss`]. The wire names are a stable surface:
+/// the CI line prints them as they are.
+#[derive(
+    Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TierMissReason {
+    /// The snapshot holds the target under another `hashin`: an input
+    /// changed, the same answer `heph inspect` gives.
+    SnapshotOtherHashin,
+    /// The snapshot never had the target.
+    AddrAbsent,
+    /// The tier held the revision without a blob a reader needs, and the
+    /// lookup fell through.
+    BlobMissingFellThrough,
+    /// A cache the user configured has no revision under this `hashin`.
+    /// Whether it holds the target under another is not looked up: that is
+    /// a listing per miss on a remote.
+    RevisionAbsent,
+    /// The tier answered with a manifest it cannot serve.
+    Damaged,
+    /// The read failed, or the cache's breaker is open.
+    Unreachable,
+    /// A reason this build does not know, from a newer host.
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+impl TierMissReason {
+    /// The wire name, which the CI line prints.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SnapshotOtherHashin => "snapshot_other_hashin",
+            Self::AddrAbsent => "addr_absent",
+            Self::BlobMissingFellThrough => "blob_missing_fell_through",
+            Self::RevisionAbsent => "revision_absent",
+            Self::Damaged => "damaged",
+            Self::Unreachable => "unreachable",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// What the snapshot dir gave this engine — see
+/// [`BuildEventKind::CacheSnapshotState`].
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotTierState {
+    /// A readable marker: the tier is read first.
+    Serving,
+    /// The dir does not exist: a lineage's first job, or the restore missed.
+    Absent,
+    /// The dir exists without a marker.
+    NoMarker,
+    /// The marker is unreadable, names no generation, or is a newer format.
+    Unreadable,
+    /// A state this build does not know, from a newer host.
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+/// The CI line of a [`CacheSnapshotState`](BuildEventKind::CacheSnapshotState)
+/// or a [`SnapshotJournalPending`](BuildEventKind::SnapshotJournalPending)
+/// event, and `None` for every other event. A stable surface: scripts may grep
+/// it.
+///
+/// ```text
+/// snapshot: .heph-snapshot, 1.2 GiB, 412 revisions, written by heph 0.4.1, incomplete run
+/// snapshot: .heph-snapshot absent (restore missed)
+/// snapshot: .heph-snapshot has no marker (skipped)
+/// snapshot: .heph-snapshot unreadable format 2 (skipped): newer than this heph reads (1)
+/// snapshot: journal holds 12 revisions; 'heph tool cache snapshot' writes them
+/// ```
+pub fn snapshot_state_line(kind: &BuildEventKind) -> Option<String> {
+    use std::fmt::Write as _;
+    match kind {
+        BuildEventKind::CacheSnapshotState {
+            dir,
+            state,
+            format,
+            heph,
+            incomplete,
+            revisions,
+            bytes,
+            reason,
+        } => {
+            let mut line = format!("snapshot: {dir}");
+            match state {
+                SnapshotTierState::Serving => {
+                    if let Some(bytes) = bytes {
+                        line.push_str(", ");
+                        line.push_str(&crate::units::human_bytes(*bytes));
+                    }
+                    if let Some(n) = revisions {
+                        let noun = if *n == 1 { "revision" } else { "revisions" };
+                        write!(line, ", {n} {noun}").ok()?;
+                    }
+                    if !heph.is_empty() {
+                        write!(line, ", written by heph {heph}").ok()?;
+                    }
+                    if *incomplete {
+                        line.push_str(", incomplete run");
+                    }
+                    return Some(line);
+                }
+                SnapshotTierState::Absent => line.push_str(" absent (restore missed)"),
+                SnapshotTierState::NoMarker => line.push_str(" has no marker (skipped)"),
+                SnapshotTierState::Unreadable => {
+                    line.push_str(" unreadable");
+                    if let Some(f) = format {
+                        write!(line, " format {f}").ok()?;
+                    }
+                    line.push_str(" (skipped)");
+                }
+                SnapshotTierState::Unknown => line.push_str(" not used (skipped)"),
+            }
+            if let Some(reason) = reason {
+                line.push_str(": ");
+                line.push_str(reason);
+            }
+            Some(line)
+        }
+        BuildEventKind::SnapshotJournalPending { revisions } => {
+            let noun = if *revisions == 1 {
+                "revision"
+            } else {
+                "revisions"
+            };
+            Some(format!(
+                "snapshot: journal holds {revisions} {noun}; 'heph tool cache snapshot' writes them"
+            ))
+        }
+        _ => None,
+    }
+}
+
 /// The change one event makes to [`CacheCounts`], so a consumer that keeps
 /// its counters elsewhere (telemetry's atomics) applies exactly the same
 /// mapping. Each field is `-1`, `0` or `1`.
@@ -1121,6 +1327,127 @@ impl CacheCounts {
     }
 }
 
+/// Hits per cache tier — local, the CI cache snapshot, each remote by name —
+/// and misses, so "how many hits came from the snapshot, how many from the
+/// bucket" has an answer. Folded from [`CacheOutcome`]
+/// (BuildEventKind::CacheOutcome) (local hits, misses) and from
+/// [`RemoteCacheHit`](BuildEventKind::RemoteCacheHit), which the engine emits
+/// once with each remote-hit outcome and which names the tier.
+///
+/// Attribution, not accounting: a hit later taken back
+/// ([`CacheHitRebuilt`](BuildEventKind::CacheHitRebuilt)) stays on its tier
+/// here. [`CacheCounts`] is the per-target count.
+///
+/// Misses per tier come from the tier events: a local miss is a
+/// [`LocalCacheMiss`](BuildEventKind::LocalCacheMiss), a remote tier's a
+/// [`RemoteTierMiss`](BuildEventKind::RemoteTierMiss). One target can miss
+/// on several tiers, so they do not add up to `misses`, the targets built.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TierCounts {
+    pub local: u64,
+    pub snapshot: u64,
+    /// By `caches:` name; `""` for a hit from a host that predates the name.
+    pub remote: BTreeMap<String, u64>,
+    pub misses: u64,
+    pub local_misses: u64,
+    /// The snapshot tier's misses, by reason.
+    pub snapshot_misses: BTreeMap<TierMissReason, u64>,
+    /// Each user cache's misses, by `caches:` name.
+    pub remote_misses: BTreeMap<String, u64>,
+}
+
+impl TierCounts {
+    /// Fold one event; every other event is ignored.
+    pub fn apply(&mut self, kind: &BuildEventKind) {
+        fn bump<K: Ord>(map: &mut BTreeMap<K, u64>, key: K) {
+            let n = map.entry(key).or_default();
+            *n = n.saturating_add(1);
+        }
+        match kind {
+            BuildEventKind::CacheOutcome { outcome, .. } => match outcome {
+                CacheOutcomeKind::LocalHit => self.local = self.local.saturating_add(1),
+                CacheOutcomeKind::Miss => self.misses = self.misses.saturating_add(1),
+                CacheOutcomeKind::RemoteHit | CacheOutcomeKind::Unknown => {}
+            },
+            BuildEventKind::LocalCacheMiss { .. } => {
+                self.local_misses = self.local_misses.saturating_add(1);
+            }
+            BuildEventKind::RemoteCacheHit { snapshot: true, .. } => {
+                self.snapshot = self.snapshot.saturating_add(1);
+            }
+            BuildEventKind::RemoteCacheHit { cache, .. } => {
+                bump(&mut self.remote, cache.clone().unwrap_or_default());
+            }
+            BuildEventKind::RemoteTierMiss {
+                snapshot: true,
+                reason,
+                ..
+            } => bump(&mut self.snapshot_misses, *reason),
+            BuildEventKind::RemoteTierMiss { cache, .. } => {
+                bump(&mut self.remote_misses, cache.clone());
+            }
+            _ => {}
+        }
+    }
+
+    /// The snapshot tier's misses, every reason.
+    pub fn snapshot_missed(&self) -> u64 {
+        self.snapshot_misses.values().sum()
+    }
+
+    /// The run-end CI line: hits and misses per tier, local first, then the
+    /// snapshot with its miss reasons, then each cache by name. `None` when
+    /// no remote tier was consulted: the summary line already says it all.
+    /// A stable surface: scripts may grep it.
+    ///
+    /// ```text
+    /// cache tiers: local 1 hit 3 miss · snapshot 1 hit 2 miss (addr_absent 1, snapshot_other_hashin 1) · bucket 1 hit 1 miss
+    /// ```
+    pub fn line(&self) -> Option<String> {
+        use std::fmt::Write as _;
+        let snapshot_missed = self.snapshot_missed();
+        if self.snapshot == 0
+            && snapshot_missed == 0
+            && self.remote.is_empty()
+            && self.remote_misses.is_empty()
+        {
+            return None;
+        }
+        let mut line = format!(
+            "cache tiers: local {} hit {} miss",
+            self.local, self.local_misses
+        );
+        if self.snapshot > 0 || snapshot_missed > 0 {
+            write!(
+                line,
+                " · snapshot {} hit {snapshot_missed} miss",
+                self.snapshot
+            )
+            .ok()?;
+            let mut reasons = self.snapshot_misses.iter().filter(|(_, n)| **n > 0);
+            if let Some((reason, n)) = reasons.next() {
+                write!(line, " ({} {n}", reason.as_str()).ok()?;
+                for (reason, n) in reasons {
+                    write!(line, ", {} {n}", reason.as_str()).ok()?;
+                }
+                line.push(')');
+            }
+        }
+        let names: std::collections::BTreeSet<&String> = self
+            .remote
+            .keys()
+            .chain(self.remote_misses.keys())
+            .collect();
+        for name in names {
+            let hits = self.remote.get(name).copied().unwrap_or_default();
+            let misses = self.remote_misses.get(name).copied().unwrap_or_default();
+            let name = if name.is_empty() { "remote" } else { name };
+            write!(line, " · {name} {hits} hit {misses} miss").ok()?;
+        }
+        Some(line)
+    }
+}
+
 /// Fixtures shared by every consumer's tests, so they are all checked against
 /// one event stream and one expected answer.
 #[cfg(any(test, feature = "test-support"))]
@@ -1196,7 +1523,8 @@ pub mod test_support {
                 6,
                 BuildEventKind::RemoteCacheHit {
                     addr: a("//q:remote"),
-                    cache: None,
+                    cache: Some("bucket".into()),
+                    snapshot: false,
                 },
             ),
             ev(6, outcome("//q:remote", CacheOutcomeKind::RemoteHit)),
@@ -1260,6 +1588,7 @@ pub mod test_support {
                 BuildEventKind::RemoteCacheHit {
                     addr: a("//s:gone"),
                     cache: None,
+                    snapshot: true,
                 },
             ),
             ev(23, outcome("//s:gone", CacheOutcomeKind::RemoteHit)),
@@ -2346,6 +2675,174 @@ mod tests {
         assert_eq!(c.consulted(), 7, "one count per cacheable target");
     }
 
+    /// The shared stream's remote hits are split by the tier that served them:
+    /// one from the snapshot, one from the cache named `bucket`.
+    #[test]
+    fn tier_counts_attribute_each_remote_hit_to_its_tier() {
+        let mut t = TierCounts::default();
+        for e in test_support::cache_stream() {
+            t.apply(&e.kind);
+        }
+        assert_eq!(t.local, 3, "{t:?}");
+        assert_eq!(t.snapshot, 1, "{t:?}");
+        assert_eq!(
+            t.remote,
+            BTreeMap::from([("bucket".to_string(), 1)]),
+            "{t:?}"
+        );
+        assert_eq!(t.misses, 2, "{t:?}");
+        assert_eq!(t.local_misses, 4, "{t:?}");
+    }
+
+    fn tier_miss(cache: &str, reason: TierMissReason) -> BuildEventKind {
+        BuildEventKind::RemoteTierMiss {
+            addr: "//a:x".into(),
+            cache: cache.into(),
+            snapshot: cache.is_empty(),
+            reason,
+        }
+    }
+
+    /// The run-end line: every tier that was consulted, the snapshot's miss
+    /// reasons in a fixed order, and nothing at all for a local-only run.
+    #[test]
+    fn tier_counts_line() {
+        let mut t = TierCounts::default();
+        for e in test_support::cache_stream() {
+            t.apply(&e.kind);
+        }
+        for kind in [
+            tier_miss("", TierMissReason::SnapshotOtherHashin),
+            tier_miss("", TierMissReason::AddrAbsent),
+            tier_miss("", TierMissReason::AddrAbsent),
+            tier_miss("bucket", TierMissReason::RevisionAbsent),
+            tier_miss("other", TierMissReason::Unreachable),
+        ] {
+            t.apply(&kind);
+        }
+        assert_eq!(
+            t.line().as_deref(),
+            Some(
+                "cache tiers: local 3 hit 4 miss · snapshot 1 hit 3 miss \
+                 (snapshot_other_hashin 1, addr_absent 2) · bucket 1 hit 1 miss \
+                 · other 0 hit 1 miss"
+            )
+        );
+
+        let mut local = TierCounts::default();
+        local.apply(&BuildEventKind::LocalCacheMiss {
+            addr: "//a:x".into(),
+        });
+        assert_eq!(local.line(), None, "{local:?}");
+    }
+
+    /// Each miss reason's wire name is its `as_str`, and one from a newer
+    /// host decodes as `Unknown`.
+    #[test]
+    fn tier_miss_reason_wire_names() {
+        for reason in [
+            TierMissReason::SnapshotOtherHashin,
+            TierMissReason::AddrAbsent,
+            TierMissReason::BlobMissingFellThrough,
+            TierMissReason::RevisionAbsent,
+            TierMissReason::Damaged,
+            TierMissReason::Unreachable,
+            TierMissReason::Unknown,
+        ] {
+            let json = serde_json::to_string(&reason).expect("encode");
+            assert_eq!(json, format!("\"{}\"", reason.as_str()));
+        }
+        let kind: BuildEventKind = serde_json::from_str(
+            r#"{"type":"RemoteTierMiss","addr":"//a:x","snapshot":true,"reason":"from_the_future"}"#,
+        )
+        .expect("decode");
+        assert!(
+            matches!(
+                kind,
+                BuildEventKind::RemoteTierMiss {
+                    snapshot: true,
+                    reason: TierMissReason::Unknown,
+                    ..
+                }
+            ),
+            "{kind:?}"
+        );
+    }
+
+    fn snapshot_state(state: SnapshotTierState) -> BuildEventKind {
+        BuildEventKind::CacheSnapshotState {
+            dir: ".heph-snapshot".into(),
+            state,
+            format: None,
+            heph: String::new(),
+            incomplete: false,
+            revisions: None,
+            bytes: None,
+            reason: None,
+        }
+    }
+
+    /// The start-of-run line for each state, and the journal reminder.
+    #[test]
+    fn snapshot_state_lines() {
+        let line = |kind: &BuildEventKind| snapshot_state_line(kind).expect("a snapshot line");
+        let serving = BuildEventKind::CacheSnapshotState {
+            dir: ".heph-snapshot".into(),
+            state: SnapshotTierState::Serving,
+            format: Some(1),
+            heph: "0.4.1".into(),
+            incomplete: true,
+            revisions: Some(412),
+            bytes: Some(1288490189),
+            reason: None,
+        };
+        assert_eq!(
+            line(&serving),
+            "snapshot: .heph-snapshot, 1.2 GiB, 412 revisions, written by heph 0.4.1, incomplete run"
+        );
+        assert_eq!(
+            line(&snapshot_state(SnapshotTierState::Serving)),
+            "snapshot: .heph-snapshot",
+            "a marker from before the counts says only what it has"
+        );
+        assert_eq!(
+            line(&snapshot_state(SnapshotTierState::Absent)),
+            "snapshot: .heph-snapshot absent (restore missed)"
+        );
+        assert_eq!(
+            line(&snapshot_state(SnapshotTierState::NoMarker)),
+            "snapshot: .heph-snapshot has no marker (skipped)"
+        );
+        let newer = BuildEventKind::CacheSnapshotState {
+            dir: ".heph-snapshot".into(),
+            state: SnapshotTierState::Unreadable,
+            format: Some(2),
+            heph: String::new(),
+            incomplete: false,
+            revisions: None,
+            bytes: None,
+            reason: Some("newer than this heph reads (1)".into()),
+        };
+        assert_eq!(
+            line(&newer),
+            "snapshot: .heph-snapshot unreadable format 2 (skipped): newer than this heph reads (1)"
+        );
+        assert_eq!(
+            line(&BuildEventKind::SnapshotJournalPending { revisions: 12 }),
+            "snapshot: journal holds 12 revisions; 'heph tool cache snapshot' writes them"
+        );
+        assert_eq!(
+            snapshot_state_line(&BuildEventKind::LocalCacheMiss {
+                addr: "//a:x".into()
+            }),
+            None
+        );
+        // A frame with every field missing still decodes.
+        let bare: BuildEventKind =
+            serde_json::from_str(r#"{"type":"CacheSnapshotState"}"#).expect("decode");
+        assert_eq!(line(&bare), "snapshot:  not used (skipped)");
+    }
+
     #[test]
     fn cache_counts_ignore_tier_events() {
         let c = fold(&[
@@ -2360,7 +2857,8 @@ mod tests {
             },
             BuildEventKind::RemoteCacheHit {
                 addr: "//a:z".into(),
-                cache: None,
+                cache: Some("bucket".into()),
+                snapshot: false,
             },
         ]);
         assert_eq!(c, CacheCounts::default());
@@ -2481,16 +2979,23 @@ mod tests {
     fn remote_cache_hit_without_a_cache_name_decodes() {
         let old = r#"{"at_unix_ms":1,"kind":{"type":"RemoteCacheHit","addr":"//a:x"}}"#;
         let ev: BuildEvent = serde_json::from_str(old).expect("an older frame decodes");
-        let BuildEventKind::RemoteCacheHit { addr, cache } = ev.kind else {
+        let BuildEventKind::RemoteCacheHit {
+            addr,
+            cache,
+            snapshot,
+        } = ev.kind
+        else {
             panic!("not a RemoteCacheHit: {:?}", ev.kind);
         };
         assert_eq!(addr, "//a:x");
         assert_eq!(cache, None);
+        assert!(!snapshot);
         let json = serde_json::to_string(&BuildEvent {
             at_unix_ms: 1,
             kind: BuildEventKind::RemoteCacheHit {
                 addr: "//a:x".into(),
                 cache: None,
+                snapshot: false,
             },
         })
         .expect("encode");

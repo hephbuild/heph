@@ -201,7 +201,7 @@ impl Fold {
                 live.remote = None;
                 Vec::new()
             }
-            BuildEventKind::RemoteCacheHit { addr, cache } if self.tracks(addr) => {
+            BuildEventKind::RemoteCacheHit { addr, cache, .. } if self.tracks(addr) => {
                 self.live.entry(addr.clone()).or_default().remote = cache.clone();
                 Vec::new()
             }
@@ -636,6 +636,7 @@ mod tests {
                 BuildEventKind::RemoteCacheHit {
                     addr: "//p:hit".to_string(),
                     cache: Some("r2".to_string()),
+                    snapshot: false,
                 },
             ),
             ev(4, outcome("//p:hit", CacheOutcomeKind::RemoteHit)),

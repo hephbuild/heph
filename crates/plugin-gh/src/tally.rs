@@ -470,7 +470,12 @@ impl Tally {
             | BuildEventKind::RemoteCacheHit { addr, .. } => {
                 self.ensure(addr, ev.at_unix_ms);
             }
-            BuildEventKind::RemoteCacheMiss { .. } | BuildEventKind::LocalCacheMiss { .. } => {}
+            BuildEventKind::RemoteCacheMiss { .. }
+            | BuildEventKind::LocalCacheMiss { .. }
+            | BuildEventKind::RemoteTierMiss { .. } => {}
+            // Run-level snapshot diagnostics: the CI log prints them.
+            BuildEventKind::CacheSnapshotState { .. }
+            | BuildEventKind::SnapshotJournalPending { .. } => {}
 
             BuildEventKind::CacheOutcome { addr, outcome, .. } => {
                 self.cache.apply(&ev.kind);
@@ -1191,7 +1196,8 @@ mod tests {
                 2,
                 BuildEventKind::RemoteCacheHit {
                     addr: addr.clone(),
-                    cache: None,
+                    cache: Some("bucket".into()),
+                    snapshot: false,
                 },
             ));
             t.apply(&ev(2, outcome(&addr, CacheOutcomeKind::RemoteHit)));

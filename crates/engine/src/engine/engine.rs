@@ -392,6 +392,17 @@ pub struct Engine {
     /// dead-process ones swept) on first use. Lazy, so an ordinary build never
     /// creates it.
     pub(crate) scratch_audit_ready: tokio::sync::OnceCell<PathBuf>,
+
+    /// This engine's working-set journal, when
+    /// [`Config::record_working_set`] is on. Every request but a hash-only
+    /// one holds it; no file exists until the first recording request.
+    pub(crate) working_set: Option<Arc<crate::engine::cache_snapshot::Journal>>,
+
+    /// The snapshot tier's state as this engine opened it, a
+    /// [`CacheSnapshotState`](crate::engine::event::BuildEventKind::CacheSnapshotState)
+    /// each request announces once; `None` when no snapshot dir is configured
+    /// or [`Config::snapshot_tier`] is off.
+    pub(crate) snapshot_state: Option<crate::engine::event::BuildEventKind>,
 }
 
 /// Per-process FUSE sandbox state. Owns the `<home>/sandboxfuse<pid>/`
@@ -889,9 +900,31 @@ impl Engine {
 
         // Remote caches: backends are constructed synchronously here (no
         // network); latency ordering is measured lazily on first use.
-        let remote_caches =
-            crate::engine::RemoteCacheSet::new(&cfg.remote_caches, home.to_path_buf())
-                .context("configure remote caches")?;
+        // The cache snapshot's tier is opened here, once per engine, read-only:
+        // an unusable snapshot dir is one diagnostic and no tier, never an
+        // error (I3). Helper engines read it too — reading is harmless; only
+        // recording is the build engine's.
+        // The snapshot command's own engine opens no tier: it reads the dir
+        // itself, and a tier would only log about the snapshot it replaces.
+        let snapshot_dir = cfg.cache_snapshot.as_deref().filter(|_| cfg.snapshot_tier);
+        let snapshot = snapshot_dir.map(crate::engine::cache_snapshot::open_tier);
+        let remote_caches = crate::engine::RemoteCacheSet::with_snapshot(
+            &cfg.remote_caches,
+            snapshot
+                .as_ref()
+                .and_then(|s| s.as_ref().ok())
+                .map(|g| g.path.as_path()),
+            home.to_path_buf(),
+        )
+        .context("configure remote caches")?;
+        let snapshot_state = snapshot_dir.zip(snapshot.as_ref()).map(|(dir, opened)| {
+            crate::engine::cache_snapshot::snapshot_state_event(
+                &cfg.root,
+                dir,
+                opened,
+                remote_caches.has_snapshot_tier(),
+            )
+        });
 
         // Shared cross-run filesystem-walk cache, handed to tree-walking plugins
         // via `PluginInit`. Its own sqlite db so it can be pruned independently.
@@ -1003,6 +1036,10 @@ impl Engine {
             driver_schema_slot: hplugin::driver::DriverSchemaSlot::new(),
             remote_tmp_ready: tokio::sync::OnceCell::new(),
             scratch_audit_ready: tokio::sync::OnceCell::new(),
+            working_set: cfg
+                .record_working_set
+                .then(|| Arc::new(crate::engine::cache_snapshot::Journal::new(&home))),
+            snapshot_state,
         };
         // Ended hephs' run logs, off the hot path: never awaited by a build.
         engine.run_logs.start_sweep(&engine.runtime);
@@ -1543,17 +1580,27 @@ impl Engine {
         Ok(())
     }
 
-    /// Absolute directories every plugin that walks the tree must prune by exact
-    /// path: the engine-owned home (cache/sandboxes/locks — never packages) plus
-    /// the literal (non-glob) `fs.skip` entries, resolved relative to the root.
     /// Whether anonymous usage telemetry is enabled for this engine (config
     /// `telemetry.enabled`, default `true`).
     pub fn telemetry_enabled(&self) -> bool {
         self.cfg.telemetry_enabled
     }
 
+    /// Absolute directories every plugin that walks the tree must prune by exact
+    /// path: the engine-owned home (cache/sandboxes/locks — never packages), the
+    /// CI cache snapshot dir when one is configured (I1: a root glob never reads
+    /// a snapshot, whatever its name, nor through another spelling of it:
+    /// [`snapshot_skip_dirs`](crate::engine::cache_snapshot::snapshot_skip_dirs)),
+    /// plus the literal (non-glob) `fs.skip` entries, resolved relative to the
+    /// root.
     pub fn skip_dirs(&self) -> Vec<PathBuf> {
         let mut dirs = vec![self.home.to_path_buf()];
+        if let Some(dir) = &self.cfg.cache_snapshot {
+            dirs.extend(crate::engine::cache_snapshot::snapshot_skip_dirs(
+                &self.cfg.root,
+                dir,
+            ));
+        }
         dirs.extend(
             self.cfg
                 .fs_skip

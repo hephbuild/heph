@@ -1393,6 +1393,12 @@ fn build_props(
     put("remote_cache_hits", stats.remote_cache_hits.into());
     put("remote_cache_misses", stats.remote_cache_misses.into());
     put("remote_cache_writes", stats.remote_cache_writes.into());
+    // Hits the CI cache snapshot served, kept out of `remote_cache_hits` so
+    // that counter still means the caches a user configured. Absent rather
+    // than 0 outside a snapshot job.
+    if stats.snapshot_cache_hits > 0 {
+        put("snapshot_cache_hits", stats.snapshot_cache_hits.into());
+    }
     // Approval gate: how many targets prompted, and how those prompts resolved.
     put("approvals_requested", stats.approvals_requested.into());
     put("approvals_granted", stats.approvals_granted.into());
@@ -1683,6 +1689,7 @@ mod tests {
             graph_size: 0,
             remote_cache_hits: 0,
             remote_cache_misses: 0,
+            snapshot_cache_hits: 0,
             remote_cache_writes: 0,
             approvals_requested: 0,
             approvals_granted: 0,
@@ -1776,6 +1783,7 @@ mod tests {
             graph_size: 0,
             remote_cache_hits: 2,
             remote_cache_misses: 3,
+            snapshot_cache_hits: 12,
             remote_cache_writes: 1,
             approvals_requested: 4,
             approvals_granted: 3,
@@ -1818,6 +1826,7 @@ mod tests {
         assert_eq!(n("target_remote_hits"), Some(10));
         assert_eq!(n("target_misses"), Some(11));
         assert_eq!(n("remote_cache_hits"), Some(2));
+        assert_eq!(n("snapshot_cache_hits"), Some(12));
         assert_eq!(n("remote_cache_misses"), Some(3));
         assert_eq!(n("remote_cache_writes"), Some(1));
         assert_eq!(n("approvals_requested"), Some(4));

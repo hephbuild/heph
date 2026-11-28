@@ -1147,7 +1147,7 @@ impl Engine {
 
     /// [`read_manifest_from`](Self::read_manifest_from), plus the name of the
     /// manifest it read, which says how the blobs it names are named.
-    fn read_newest_manifest(
+    pub(crate) fn read_newest_manifest(
         cache: &Arc<dyn LocalCache>,
         addr: &Addr,
         hashin: &str,

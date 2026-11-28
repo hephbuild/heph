@@ -541,6 +541,11 @@ pub struct RequestStateData {
     /// frame shell?" must be a pure function of the addr for the request's whole
     /// lifetime, so no frame can resolve before it is known.
     shell: Option<ShellTarget>,
+    /// This request's side of the engine's working-set journal: the entries it
+    /// recorded and whether it failed, flushed with an `End` line when this
+    /// drops. `None` when the engine records nothing, and for a hash-only
+    /// request (nested inside one that records).
+    journal: Option<crate::engine::cache_snapshot::RequestJournal>,
     /// Post-write `cache.history` trims held back until this request's cache
     /// read guards are gone.
     ///
@@ -1002,6 +1007,27 @@ impl RequestState {
         self.data.deferred_trims.push(addr, keep, hashin);
     }
 
+    /// Record a durable revision this request read from any tier or wrote, in
+    /// the engine's working-set journal. A no-op unless the engine records.
+    /// The caller decides what is carried: never a tmp revision, an
+    /// uncacheable target's, or one with `remote_enabled = false`.
+    pub(crate) fn record_revision(&self, addr: &Addr, hashin: &str) {
+        if let Some(journal) = &self.data.journal {
+            journal.record_revision(addr, hashin);
+        }
+    }
+
+    /// Record a scratch slot this request used, in the engine's journal.
+    /// `scratch` runs only when the engine records.
+    pub(crate) fn record_scratch(
+        &self,
+        scratch: impl FnOnce() -> crate::engine::cache_snapshot::RecordedScratch,
+    ) {
+        if let Some(journal) = &self.data.journal {
+            journal.record_scratch(scratch());
+        }
+    }
+
     /// Stop this request recording post-write trims. Used by the `heph gc`
     /// sweep for its phase-1 resolution state — see [`DeferredTrims::suppressed`].
     pub(crate) fn suppress_deferred_trims(&self) {
@@ -1076,6 +1102,9 @@ impl RequestState {
     /// waiters), the existing one is kept. Whether this call was the one
     /// that recorded it.
     pub fn record_failure(&self, addr: Addr, failure: Arc<TargetFailure>) -> bool {
+        if let Some(journal) = &self.data.journal {
+            journal.mark_failed();
+        }
         match self.data.failures.lock().entry(addr) {
             indexmap::map::Entry::Occupied(_) => false,
             indexmap::map::Entry::Vacant(v) => {
@@ -1289,11 +1318,15 @@ impl RequestState {
     ///
     /// `count` is the cpu capacity in CPUs; `pools` every pool's capacity
     /// (`None`: unbounded) and unit, called only by the announcing call.
+    /// `snapshot` is the engine's
+    /// [`CacheSnapshotState`](crate::engine::event::BuildEventKind::CacheSnapshotState),
+    /// announced right after, under the same guard.
     pub fn announce_request_config(
         &self,
         count: usize,
         scratch_disabled: bool,
         pools: impl FnOnce() -> PoolAnnouncement,
+        snapshot: Option<&crate::engine::event::BuildEventKind>,
     ) {
         if once(&self.data.workers_announced) {
             let pools = pools();
@@ -1304,6 +1337,9 @@ impl RequestState {
                 resources: pools.capacities,
                 units: pools.units,
             });
+            if let Some(snapshot) = snapshot {
+                self.emit(snapshot.clone());
+            }
         }
     }
 
@@ -1531,6 +1567,11 @@ impl Drop for RequestStateData {
                 });
             }
             self.trail_removals(&sampler);
+        }
+        // Read before the cancel below, which every request gets at its end:
+        // only a cancel that happened while it ran makes it incomplete.
+        if let Some(journal) = &self.journal {
+            journal.flush(self.ctoken.is_cancelled(), &self.bg_pending);
         }
         self.ctoken.cancel();
         // Signal end-of-stream to each hook so it can flush its final state. The
@@ -1816,6 +1857,13 @@ impl Engine {
             hash_only,
             selection: std::sync::OnceLock::new(),
             shell,
+            journal: if hash_only {
+                None
+            } else {
+                self.working_set
+                    .as_ref()
+                    .map(|j| crate::engine::cache_snapshot::RequestJournal::new(Arc::clone(j)))
+            },
             deferred_trims: DeferredTrims {
                 engine: Arc::downgrade(self),
                 bg_pending,

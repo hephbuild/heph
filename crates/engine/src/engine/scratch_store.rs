@@ -237,7 +237,7 @@ pub fn write_slot_meta(home: &Path, slot: &str, meta: &SlotMeta) {
     }
 }
 
-fn read_slot_meta(home: &Path, slot: &str) -> Option<SlotMeta> {
+pub(crate) fn read_slot_meta(home: &Path, slot: &str) -> Option<SlotMeta> {
     let bytes = std::fs::read(meta_path(home, slot)).ok()?;
     let meta = SlotMeta::try_from_slice(&bytes).ok()?;
     (meta.format == SLOT_META_FORMAT).then_some(meta)

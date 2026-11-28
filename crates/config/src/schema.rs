@@ -358,6 +358,8 @@ mod tests {
     const BOGUS_AT: &[(&str, &str)] = &[
         ("", "bogus: 1\n"),
         ("/$defs/CacheConfig", "cache:\n  bogus: 1\n"),
+        // `dir` is required; the unknown key comes first, as for MemCacheConfig.
+        ("/$defs/CacheSnapshotConfig", "cacheSnapshot:\n  bogus: 1\n"),
         ("/$defs/FsConfig", "fs:\n  bogus: 1\n"),
         ("/$defs/FuseConfig", "fuse:\n  bogus: 1\n"),
         ("/$defs/LockConfig", "lock:\n  bogus: 1\n"),
@@ -702,6 +704,10 @@ mod tests {
         "resources:\n  cpu: 8\n  memory: 24G\n  docker: 2\n  slots: {unit: cpu, value: 2}\n",
         "resources:\n  cpu: 4\n  slots: 0.5\n",
         "telemetry: ~\ncache: {spillThresholdBytes: ~}\n",
+        "cacheSnapshot:\n  dir: .heph-snapshot\n",
+        "cacheSnapshot:\n  dir: /var/cache/heph-snapshot\n",
+        "cacheSnapshot:\n  dir: \"\"\n",
+        "cacheSnapshot: ~\n",
         // A key with nothing after it but comments: serde_yaml reads the empty
         // value as an empty sequence or map.
         "plugins:\n  # - builtin: go\n",

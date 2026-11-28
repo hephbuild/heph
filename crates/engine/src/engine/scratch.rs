@@ -764,6 +764,26 @@ impl Engine {
                     };
                 }
 
+                // The working set: every slot a build used that may travel,
+                // pulled or not, so a cache snapshot carries a slot this job
+                // filled from cold as well as one it pulled. With the lineage
+                // it descends from, which the export publishes on top of.
+                if r.def.remote && !no_scratch {
+                    rs.record_scratch(|| {
+                        let scope = &self.cfg.scratch.scope;
+                        let parent =
+                            crate::engine::scratch_remote::read_local_meta(&self.home, slot, scope);
+                        crate::engine::cache_snapshot::RecordedScratch {
+                            slot: slot.to_owned(),
+                            scope: parent
+                                .as_ref()
+                                .map_or_else(|| scope.clone(), |p| p.scope.clone()),
+                            generation: parent.as_ref().map_or(0, |p| p.generation),
+                            content_hash: parent.map(|p| p.content_hash).unwrap_or_default(),
+                        }
+                    });
+                }
+
                 let prepared = cell.lock().prepared.unwrap_or(Prepared::Cold);
                 anyhow::Ok((dir, prepared))
             },

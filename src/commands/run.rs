@@ -1248,6 +1248,9 @@ impl App for RunApp {
                 res
             }
         };
+        // Under CI, a journal no `heph tool cache snapshot` writes is a
+        // working set the next job never sees: say so while the log is read.
+        self.engine.remind_unconsumed_journal(&rs);
 
         // A run with gaps skipped part of the graph, so it did not succeed:
         // the shell target may be in what it skipped.

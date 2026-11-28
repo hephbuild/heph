@@ -163,8 +163,16 @@ pub struct TelemetryCollector {
     /// Remote (shared) cache **tier events, not targets** (deprecated for hit
     /// rates): `remote_cache_misses` follows a `local_cache_misses` for the
     /// same target.
+    /// A hit the CI cache snapshot's tier served counts in
+    /// `snapshot_cache_hits` instead: the snapshot is not a cache the user
+    /// configured.
     remote_cache_hits: AtomicU64,
     remote_cache_misses: AtomicU64,
+    /// Tier events the CI cache snapshot served (`RemoteCacheHit` with
+    /// `snapshot` set). The per-target `target_remote_hits` still counts
+    /// them: the `CacheOutcome` it folds names no tier, and the TUI and the
+    /// GitHub Actions report share that fold.
+    snapshot_cache_hits: AtomicU64,
     /// Pushes to the remote cache (one per `RemoteCacheWriteStart`).
     remote_cache_writes: AtomicU64,
     /// Approval-gated targets that asked for a decision. The rest of the
@@ -218,6 +226,7 @@ impl TelemetryCollector {
             graph_size: AtomicU64::new(0),
             remote_cache_hits: AtomicU64::new(0),
             remote_cache_misses: AtomicU64::new(0),
+            snapshot_cache_hits: AtomicU64::new(0),
             remote_cache_writes: AtomicU64::new(0),
             approvals_requested: AtomicU64::new(0),
             approvals_granted: AtomicU64::new(0),
@@ -251,6 +260,9 @@ impl TelemetryCollector {
             }
             BuildEventKind::LocalCacheMiss { .. } => {
                 self.local_cache_misses.fetch_add(1, Ordering::Relaxed);
+            }
+            BuildEventKind::RemoteCacheHit { snapshot: true, .. } => {
+                self.snapshot_cache_hits.fetch_add(1, Ordering::Relaxed);
             }
             BuildEventKind::RemoteCacheHit { .. } => {
                 self.remote_cache_hits.fetch_add(1, Ordering::Relaxed);
@@ -382,6 +394,7 @@ impl TelemetryCollector {
             graph_size: self.graph_size.load(Ordering::Relaxed),
             remote_cache_hits: self.remote_cache_hits.load(Ordering::Relaxed),
             remote_cache_misses: self.remote_cache_misses.load(Ordering::Relaxed),
+            snapshot_cache_hits: self.snapshot_cache_hits.load(Ordering::Relaxed),
             remote_cache_writes: self.remote_cache_writes.load(Ordering::Relaxed),
             approvals_requested: self.approvals_requested.load(Ordering::Relaxed),
             approvals_granted: self.approvals_granted.load(Ordering::Relaxed),
@@ -432,6 +445,8 @@ pub struct TelemetrySnapshot {
     /// Tier events, not targets — see the collector's field docs.
     pub remote_cache_hits: u64,
     pub remote_cache_misses: u64,
+    /// Tier events the CI cache snapshot served; not in `remote_cache_hits`.
+    pub snapshot_cache_hits: u64,
     pub remote_cache_writes: u64,
     pub approvals_requested: u64,
     pub approvals_granted: u64,
@@ -486,10 +501,12 @@ mod tests {
             hcore::events::test_support::CACHE_STREAM_EXPECTED
         );
         assert_eq!(got.hit_rate(), fold.hit_rate());
-        // The tier counters keep their old meaning: every tier event once.
+        // The tier counters keep their old meaning: every tier event once,
+        // the snapshot tier's hit apart from the configured caches'.
         let s = c.snapshot();
         assert_eq!((s.local_cache_hits, s.local_cache_misses), (2, 4));
-        assert_eq!((s.remote_cache_hits, s.remote_cache_misses), (2, 1));
+        assert_eq!((s.remote_cache_hits, s.remote_cache_misses), (1, 1));
+        assert_eq!(s.snapshot_cache_hits, 1);
     }
 
     /// A rebuild whose hit the collector never saw cannot wrap the counter.
@@ -558,7 +575,15 @@ mod tests {
         let addr = || "//pkg:a".to_string();
         c.observe_event(&BuildEventKind::RemoteCacheHit {
             addr: addr(),
+            cache: Some("bucket".into()),
+            snapshot: false,
+        });
+        // The CI cache snapshot's tier is counted apart from the caches the
+        // user configured.
+        c.observe_event(&BuildEventKind::RemoteCacheHit {
+            addr: addr(),
             cache: None,
+            snapshot: true,
         });
         c.observe_event(&BuildEventKind::RemoteCacheMiss { addr: addr() });
         c.observe_event(&BuildEventKind::RemoteCacheMiss { addr: addr() });
@@ -570,6 +595,7 @@ mod tests {
         });
         let s = c.snapshot();
         assert_eq!(s.remote_cache_hits, 1);
+        assert_eq!(s.snapshot_cache_hits, 1);
         assert_eq!(s.remote_cache_misses, 2);
         assert_eq!(s.remote_cache_writes, 1);
     }
