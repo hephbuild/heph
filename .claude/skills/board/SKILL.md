@@ -103,7 +103,14 @@ at review so a reviewer that builds does not touch the session's tree. Model:
 
 - `product-vision` and `feature-quality`: `model: "sonnet"` at both stages. At review,
   `feature-quality` on Sonnet cost ~1.2M tokens a PR and still found the one BLOCKER.
-- `code-quality`, `hermeticity`, `compatibility`: inherit the session model — depth is the point.
+- `code-quality` and `hermeticity`: Opus, pinned in their frontmatter — depth is the point.
+  `compatibility`: Sonnet, pinned the same way.
+
+Every agent's model is pinned in `.claude/agents/<name>.md`; none inherits the session's. Do not
+pass `model` to override a pin. An inherited model follows whatever the session runs: with a
+session on Fable, `code-quality` and `hermeticity` ran on Fable at `xhigh`, and three
+`feature-quality` runs spawned outside this skill landed on Opus at about four times the tokens
+of a Sonnet run.
 
 Fix while the board runs only what no pending reviewer covers; hold the rest for the last report
 (CLAUDE.md, "Workflow").
