@@ -145,6 +145,23 @@ pub(crate) fn compact(
     let mut causes = Vec::new();
     let found = find_diagnostic(e);
     let raised = found.is_some();
+    let (exit, timed_out) = exec_facts(e);
+    // A process that ended with no diagnostic of its driver's has its end
+    // said as every renderer's header says it (`exit status 3`, `killed by
+    // signal 9 (SIGKILL)`, `timed out after 1s (its timeout)`), not as the
+    // chain's `process exited with status: …`. Only the engine's words are
+    // replaced: a timeout, and a local child's status. A cdylib's failure
+    // message is the plugin's own text (a Go test's `--- FAIL` lines), and
+    // stays.
+    let end =
+        if !raised && (timed_out.is_some() || downcast_chain_ref::<ProcessFailed>(e).is_some()) {
+            let mut ended = FailureRecord::new(Diagnostic::new(Stage::Run, String::new()));
+            ended.exit.clone_from(&exit);
+            ended.timed_out.clone_from(&timed_out);
+            ended.process_end_message()
+        } else {
+            None
+        };
     // The culprit declared a dependency on a target that does not exist.
     let missing_dep =
         downcast_chain_ref::<MissingDep>(e).filter(|m| culprit.target() == Some(&m.declarer));
@@ -163,7 +180,7 @@ pub(crate) fn compact(
                     Culprit::Target(_) => Stage::Run,
                 })
             };
-            Diagnostic::new(stage, own_message(e, &mut causes))
+            Diagnostic::new(stage, own_message(e, &mut causes, end.as_deref()))
         }
     };
     if let Some(stage) = stage_override {
@@ -187,22 +204,7 @@ pub(crate) fn compact(
         origin_id: m.origin_id.clone(),
     });
 
-    (rec.exit, rec.timed_out) = exec_facts(e);
-    // A process that ended with no diagnostic of its driver's is said as
-    // every renderer's header says it (`exit status 3`, `killed by signal 9
-    // (SIGKILL)`, `timed out after 1s (its timeout)`), not as the chain's
-    // `driver run: process exited with status: …`. Only the engine's words
-    // are replaced: a timeout, and a local child's status. A cdylib's
-    // failure message is the plugin's own text (a Go test's `--- FAIL`
-    // lines), and stays.
-    let local_or_timeout =
-        rec.timed_out.is_some() || downcast_chain_ref::<ProcessFailed>(e).is_some();
-    if !raised
-        && local_or_timeout
-        && let Some(end) = rec.process_end_message()
-    {
-        rec.diagnostic.message = end;
-    }
+    (rec.exit, rec.timed_out) = (exit, timed_out);
     let frozen = downcast_chain_ref::<FrozenCheckError>(e);
     rec.frozen_diff = frozen.map(|f| f.diff.clone());
     rec.cancelled = hplugin::error::is_cancelled(e);
@@ -309,20 +311,53 @@ pub(crate) fn exec_failure(addr: &Addr, e: &anyhow::Error, scrub: &Scrub) -> Opt
 /// `e`'s cause as one message, as [`cause_frames`] reads it, but with an
 /// aggregate said as `{n} errors` and each of its members pushed onto
 /// `causes` (its own cause frames, joined), in input order.
-fn own_message(e: &anyhow::Error, causes: &mut Vec<String>) -> String {
-    let texts: Vec<String> = hcore::hmemoizer::frames(e)
+///
+/// With `end`, the process-exit frame itself (a local [`ProcessFailed`] or
+/// the engine's timeout) is said as `end`, once, and every other frame is
+/// kept: what a driver or a wrapper said about the failure (a write-back
+/// refused, the remedy a driver layers over the exit) stays beside it.
+fn own_message(e: &anyhow::Error, causes: &mut Vec<String>, end: Option<&str>) -> String {
+    let frames: Vec<(String, bool)> = hcore::hmemoizer::frames(e)
         .into_iter()
-        .filter(|f| f.downcast_ref::<StageFrame>().is_none())
-        .map(|f| match f.downcast_ref::<MultiError>() {
-            Some(multi) => {
+        .filter(|f| !hplugin::diagnostic::is_internal_frame(f))
+        .map(|f| {
+            let is_end = end.is_some()
+                && (f.downcast_ref::<ProcessFailed>().is_some()
+                    || f.downcast_ref::<crate::engine::run_timeout::TimedOutError>()
+                        .is_some());
+            let text = if let Some(multi) = f.downcast_ref::<MultiError>() {
                 causes.extend(multi.0.iter().map(|m| cause_frames(m).join(": ")));
                 format!("{} errors", multi.0.len())
-            }
-            None => f.error().to_string(),
+            } else {
+                f.error().to_string()
+            };
+            (text, is_end)
         })
-        .filter(|s| !s.is_empty())
+        .filter(|(s, is_end)| *is_end || !s.is_empty())
         .collect();
-    hcore::hmemoizer::own_parts(texts).join(": ")
+    let mut said_end = false;
+    let mut parts = Vec::with_capacity(frames.len());
+    for (i, (text, is_end)) in frames.iter().enumerate() {
+        if *is_end && let Some(end) = end {
+            // A second exit frame (a timeout over the killed child's
+            // status) says nothing the first did not.
+            if !said_end {
+                parts.push(end);
+                said_end = true;
+            }
+            continue;
+        }
+        // Cut against the next frame's own text, before any replacement,
+        // as `own_parts` does.
+        let own = match frames.get(i + 1) {
+            Some((next, _)) => hcore::hmemoizer::own_part(text, next),
+            None => text,
+        };
+        if !own.is_empty() {
+            parts.push(own);
+        }
+    }
+    parts.join(": ")
 }
 
 /// Every text `rec` holds, scrubbed. Runs before any cap ([`bound`]).
@@ -661,13 +696,14 @@ mod tests {
     }
 
     /// RUN-14/15: a local child's end with no diagnostic is said as the box
-    /// header says it, with none of the chain's frames. A driver's own
-    /// diagnostic, and a cdylib's own message, are kept as they are.
+    /// header says it. A driver's own diagnostic, and a cdylib's own
+    /// message, are kept as they are.
     #[test]
     fn a_process_end_is_said_as_the_header_says_it() {
         let local = |exit: Exit| {
             anyhow::Error::new(ProcessFailed::new(exit.to_string(), Some(exit)))
-                .context("driver run")
+                .context(hplugin::diagnostic::DriverCall("driver run"))
+                .context(FailureSlot::default())
         };
         assert_eq!(
             of(&local(Exit::Code(3))).diagnostic.message,
@@ -689,6 +725,40 @@ mod tests {
         let rec = of(&remote);
         assert_eq!(rec.diagnostic.message, "--- FAIL: TestX\nexit status: 1");
         assert_eq!(rec.exit.and_then(|x| x.code), Some(1));
+    }
+
+    /// Only the exit frame is reworded: what a driver layered over the exit
+    /// (its remedy) and what the engine joined onto the run's error (a
+    /// refused write-back) are kept beside the status, so the message is
+    /// not the status alone and a renderer shows it.
+    #[test]
+    fn a_process_end_keeps_the_wrappers_context() {
+        let e = anyhow::Error::new(ProcessFailed::new("exit status: 1", Some(Exit::Code(1))))
+            .context("docker_build //app:img: select a builder with `builder = \"heph\"`")
+            .context(hplugin::diagnostic::DriverCall("driver run"))
+            .context(FailureSlot::default())
+            .context("//fix:upper rewrites //fix:src in place, and it changed while it ran");
+        let rec = of(&e);
+        assert_eq!(
+            rec.diagnostic.message,
+            "//fix:upper rewrites //fix:src in place, and it changed while it ran: \
+             docker_build //app:img: select a builder with `builder = \"heph\"`: exit status 1"
+        );
+        assert!(!rec.message_is_status(), "{rec:?}");
+        assert_eq!(rec.exit.and_then(|x| x.code), Some(1));
+
+        // A timeout's own frame is reworded the same way; its context stays.
+        let timeout = anyhow::Error::new(crate::engine::run_timeout::TimedOutError {
+            addr: addr("//p:t"),
+            timeout: hplugin::driver::Timeout::new(std::time::Duration::from_secs(1))
+                .expect("timeout"),
+            abandoned_after: None,
+        })
+        .context("its fixes were not written");
+        assert_eq!(
+            of(&timeout).diagnostic.message,
+            "its fixes were not written: timed out after 1s (its timeout)"
+        );
     }
 
     /// What a streamed run's wrapper is told carries a driver's own

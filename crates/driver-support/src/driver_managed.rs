@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use hcore::hartifactcontent;
 use hcore::hasync::{self, Cancellable};
 use hmodel::htaddr::Addr;
+use hplugin::diagnostic::DriverCall;
 use hplugin::driver::inputartifact;
 use hplugin::driver::outputartifact::Content::TarPath;
 use hplugin::driver::outputartifact::ContentPath;
@@ -296,17 +297,17 @@ pub async fn invoke_inner<'a, 'io>(
             driver
                 .run_shell(mreq, ctoken)
                 .await
-                .with_context(|| "driver run_shell")?
+                .context(DriverCall("driver run_shell"))?
         } else {
             run_shell_fallback(mreq, ctoken, shell_fallback)
                 .await
-                .with_context(|| "shell fallback")?
+                .context(DriverCall("shell fallback"))?
         }
     } else {
         driver
             .run(mreq, ctoken)
             .await
-            .with_context(|| "driver run")?
+            .context(DriverCall("driver run"))?
     };
     Ok(res)
 }
