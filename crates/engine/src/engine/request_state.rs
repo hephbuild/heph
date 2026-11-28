@@ -895,6 +895,10 @@ pub struct RequestStateData {
     /// failure, read only by [`RequestState::decl_field_loc`]; never reaches
     /// a hash (I1).
     source_indexes: Mutex<SourceIndexes>,
+    /// Each package's target names, listed once per request for a target
+    /// not found in it ([`Engine::load_not_found`]). Filled only on a
+    /// failure, read only by its record's suggestions; never reaches a hash.
+    not_found_listings: Mutex<FxHashMap<PkgBuf, crate::engine::not_found::ListingCell>>,
     /// How many times a provider was asked for a source index this request:
     /// one per file is the budget ([`RequestState::source_index_loads`]).
     source_index_loads: std::sync::atomic::AtomicUsize,
@@ -1592,7 +1596,7 @@ impl RequestState {
     /// The one way a `MissingDep` site locates the declaration, so none can
     /// look it up in an index it never loaded (FQ r2 N-3).
     pub(crate) async fn missing_dep_or(
-        &self,
+        self: &Arc<Self>,
         e: anyhow::Error,
         dep: &Addr,
         declarer: &Addr,
@@ -1602,6 +1606,10 @@ impl RequestState {
         use hplugin::error::MissingDep;
         if !MissingDep::names(&e, dep) {
             return otherwise(e);
+        }
+        // The names the record suggests from (D4).
+        if let Some(engine) = self.data.engine.upgrade() {
+            Box::pin(engine.load_not_found(self, &dep.package)).await;
         }
         let origin_id = origin_id();
         let field = crate::engine::deferred::origin_field(&origin_id);
@@ -1699,6 +1707,24 @@ impl RequestState {
             hcore::blocking::run(move || provider.provider.source_index(&file)).await
         })
         .await;
+    }
+
+    /// `pkg`'s cell in [`RequestStateData::not_found_listings`], created
+    /// empty on first use. The map's lock is held only to get or insert it.
+    pub(crate) fn not_found_cell(&self, pkg: &PkgBuf) -> crate::engine::not_found::ListingCell {
+        Arc::clone(
+            self.data
+                .not_found_listings
+                .lock()
+                .entry(pkg.clone())
+                .or_default(),
+        )
+    }
+
+    /// `pkg`'s listing, when [`Engine::load_not_found`] loaded it this
+    /// request: `Some(None)` for a listing that failed. Never lists.
+    pub(crate) fn not_found_listing(&self, pkg: &PkgBuf) -> Option<Option<Arc<[String]>>> {
+        self.data.not_found_listings.lock().get(pkg)?.get().cloned()
     }
 
     /// How many source indexes providers were asked for this request
@@ -2701,6 +2727,7 @@ impl Engine {
             scrubs: Mutex::new(Scrubs::default()),
             transitive_declarers: Mutex::new(FxHashMap::default()),
             source_indexes: Mutex::new(FxHashMap::default()),
+            not_found_listings: Mutex::new(FxHashMap::default()),
             source_index_loads: std::sync::atomic::AtomicUsize::new(0),
             report_passes: std::sync::atomic::AtomicUsize::new(0),
             path_passes: std::sync::atomic::AtomicUsize::new(0),

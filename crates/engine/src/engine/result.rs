@@ -2450,6 +2450,9 @@ fn record_culprit(
             None => rs.scrub_for(&[addr, &entry]),
         };
         let mut record = crate::engine::failure_record::compact(&e, &culprit, &entry, &scrub);
+        if let Culprit::Target(c) = &culprit {
+            record = crate::engine::not_found::suggest(rs, record, c, &e, &scrub);
+        }
         record.path = path.iter().map(Addr::format).collect();
         if record.diagnostic.location.is_none()
             && let Culprit::Target(c) = &culprit
@@ -7074,9 +7077,18 @@ impl Engine {
     ) -> anyhow::Result<Arc<ExtendedTargetDef>> {
         // Use _no_track: get_def (or get_direct_def) already updated parent=addr
         // before invoking us. Tracked get_spec here would record addr→addr.
-        let spec = Arc::clone(&self)
-            .get_spec_no_track(rs.clone(), addr)
-            .await?;
+        let spec = match Arc::clone(&self).get_spec_no_track(rs.clone(), addr).await {
+            Ok(spec) => spec,
+            Err(e) => {
+                if downcast_chain_ref::<TargetNotFoundError>(&e).is_some_and(|nf| &nf.addr == addr)
+                {
+                    // The names its record suggests from (D4). Boxed: every
+                    // `get_def` future would otherwise hold the listing's.
+                    Box::pin(self.load_not_found(&rs, &addr.package)).await;
+                }
+                return Err(e);
+            }
+        };
 
         let driver = match self.drivers_by_name.get(&spec.driver) {
             Some(driver) => driver,

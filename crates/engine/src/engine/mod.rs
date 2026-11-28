@@ -66,6 +66,7 @@ mod cache_db_space;
 #[cfg(test)]
 pub(crate) mod local_cache_test_double;
 mod local_cache_tmp;
+mod not_found;
 mod packages;
 mod remote_cache;
 mod states;

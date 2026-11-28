@@ -29,6 +29,13 @@ pub(super) struct PackageScan {
     listing_gap: bool,
 }
 
+impl PackageScan {
+    /// Every provider probed and listed the package: nothing was skipped.
+    pub(super) fn complete(&self) -> bool {
+        self.skipped.is_empty()
+    }
+}
+
 /// End a package walk that is failing: flag it as abandoning, which ends the
 /// [`Engine::package_scans`] source so nothing further is spawned, then join
 /// the scans already running. Called before the error propagates.
