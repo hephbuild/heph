@@ -224,6 +224,23 @@ async fn execute_async(
         move |engine, rs, ctx| async move {
             // What matched goes to stdout as it is found; what the walk could not
             // resolve is reported on stderr at the end, and fails the command.
+            // One address whose BUILD file did not evaluate: the file's box
+            // and exit 1, as `run` gives, not a gap; `--json` prints `[]`,
+            // since nothing matched (D5).
+            if !candidates
+                && let Matcher::Addr(addr) = &m
+                && Arc::clone(&engine)
+                    .record_file_culprit(rs.clone(), addr)
+                    .await
+            {
+                if json.enabled() {
+                    json.printer()
+                        .start_list()?
+                        .finish(&|| rs.ctoken().is_cancelled())?;
+                }
+                return crate::commands::errors::finalize(&ctx, &rs, Ok(()), None, |()| Ok(()))
+                    .await;
+            }
             let gaps = Gaps::new(crate::htquery::format(&m));
             let stream = select(
                 Arc::clone(&engine),

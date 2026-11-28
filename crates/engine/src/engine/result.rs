@@ -7248,6 +7248,22 @@ impl Engine {
         Ok(sb)
     }
 
+    /// For `heph query <addr>` (D5): resolve `addr`'s spec and, when it fails
+    /// because the BUILD or `.bzl` file defining it did not evaluate, record
+    /// that file as the request's culprit, as `run` does (its box, exit 1),
+    /// and return true. Any other outcome records nothing and returns false:
+    /// the walk reports it as it always did.
+    pub async fn record_file_culprit(self: Arc<Self>, rs: Arc<RequestState>, addr: &Addr) -> bool {
+        let Err(e) = Arc::clone(&self).get_spec(rs.clone(), addr).await else {
+            return false;
+        };
+        if !matches!(blame(addr, &e).0, Culprit::File(_)) {
+            return false;
+        }
+        drop(surface_top(true, &rs, classify_failure(&rs, addr, e)));
+        true
+    }
+
     /// Public, tracked. Records `parent → addr` in `dep_dag` and updates `parent`
     /// before delegating to the memoizer. External callers use this.
     ///

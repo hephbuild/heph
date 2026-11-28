@@ -180,7 +180,9 @@ where
     let found = match found {
         Ok(Some(found)) => found,
         Ok(None) => {
-            say(&mut err, &no_log(addr, opts.hashin.as_deref()));
+            let line =
+                never_ran(engine, addr).unwrap_or_else(|| no_log(addr, opts.hashin.as_deref()));
+            say(&mut err, &line);
             return Ok(Shown::Nothing);
         }
         Err(e) => {
@@ -199,6 +201,12 @@ where
                 return Ok(Shown::Nothing);
             }
             if let Some(e) = e.downcast_ref::<LogUnavailable>() {
+                if matches!(e.info.source, LogSource::FailureSlot)
+                    && let Some(line) = never_ran(engine, addr)
+                {
+                    say(&mut err, &line);
+                    return Ok(Shown::Nothing);
+                }
                 let status = Status::new(&e.info, req.sessions.as_ref());
                 say(
                     &mut err,
@@ -527,6 +535,41 @@ fn unavailable_next_step(source: &LogSource) -> &'static str {
         LogSource::Cache { remote: false } | LogSource::Live { .. } => {
             "a run that misses the cache records a new one"
         }
+    }
+}
+
+/// What `heph log` says for a culprit that failed before its process ran,
+/// read from its failure slot (or its BUILD file's): it never ran, so there
+/// is no log to produce by running it again (D5). `None` for any other
+/// target, a skipped one included: it has no slot.
+fn never_ran(engine: &Engine, addr: &Addr) -> Option<String> {
+    let view = match crate::commands::inspect::failure::inspect_view(engine, addr) {
+        Ok(view) => view?,
+        Err(e) => {
+            tracing::debug!(addr = %addr, error = %format!("{e:#}"), "reading the failure slot for heph log");
+            return None;
+        }
+    };
+    view.before_run().then(|| {
+        format!(
+            "heph: {addr} failed {}; it never ran. See `heph inspect failure {addr}`",
+            failed_while(view.stage)
+        )
+    })
+}
+
+/// When in the build a failure of `stage` before the run happened.
+fn failed_while(stage: hcore::diagnostic::Stage) -> &'static str {
+    use hcore::diagnostic::Stage;
+    match stage {
+        Stage::Eval => "while its BUILD file was evaluated",
+        Stage::Spec => "while its spec was resolved",
+        Stage::Parse => "while its driver parsed its definition",
+        Stage::Link => "while its inputs were linked",
+        Stage::Cache => "while its cache was read",
+        Stage::Config => "while .hephconfig was read",
+        Stage::Cli => "on the command line",
+        Stage::Run => "before its process started",
     }
 }
 
