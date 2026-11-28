@@ -3829,7 +3829,7 @@ mod tests {
             Ok(_) => panic!("the run must fail"),
             Err(e) => e,
         };
-        assert!(format!("{err:#}").contains("exit status: 1"), "{err:#}");
+        assert!(format!("{err:#}").contains("exit status 1"), "{err:#}");
         let hashin = engine
             .failure_slots()
             .read(&addr)

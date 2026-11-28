@@ -131,7 +131,9 @@ pub(crate) fn compact(
     }
 
     let mut causes = Vec::new();
-    let mut diagnostic = match find_diagnostic(e) {
+    let found = find_diagnostic(e);
+    let raised = found.is_some();
+    let mut diagnostic = match found {
         Some(d) => d.clone(),
         None => {
             // A dependent blamed for an input that does not exist stopped
@@ -168,6 +170,24 @@ pub(crate) fn compact(
     rec.causes = causes;
 
     (rec.exit, rec.timed_out) = exec_facts(e);
+    // A process that ended with no diagnostic of its driver's is said as
+    // every renderer's header says it (`exit status 3`, `killed by signal 9
+    // (SIGKILL)`, `timed out after 1s (its timeout)`), not as the chain's
+    // `driver run: process exited with status: …`. Only the engine's words
+    // are replaced: a timeout, and a local child's status. A cdylib's
+    // failure message is the plugin's own text (a Go test's `--- FAIL`
+    // lines), and stays.
+    let local_or_timeout =
+        rec.timed_out.is_some() || downcast_chain_ref::<ProcessFailed>(e).is_some();
+    if !raised
+        && local_or_timeout
+        && let Some(end) = rec.process_end()
+    {
+        rec.diagnostic.message = match &rec.timed_out {
+            Some(t) if t.abandoned => format!("{end}; {}", hcore::failure::ABANDONED),
+            _ => end,
+        };
+    }
     let frozen = downcast_chain_ref::<FrozenCheckError>(e);
     rec.frozen_diff = frozen.map(|f| f.diff.clone());
     rec.cancelled = hplugin::error::is_cancelled(e);
@@ -567,9 +587,47 @@ mod tests {
             abandoned_after: Some(std::time::Duration::from_secs(10)),
         });
         let rec = of(&e);
+        assert_eq!(
+            rec.diagnostic.message,
+            format!(
+                "timed out after 10s (its timeout); {}",
+                hcore::failure::ABANDONED
+            )
+        );
         let t = rec.timed_out.expect("timed out");
         assert_eq!((t.timeout_ms, t.abandoned), (10_000, true));
         assert_eq!(rec.failed_in, FailedIn::Exec);
+    }
+
+    /// RUN-14/15: a local child's end with no diagnostic is said as the box
+    /// header says it, with none of the chain's frames. A driver's own
+    /// diagnostic, and a cdylib's own message, are kept as they are.
+    #[test]
+    fn a_process_end_is_said_as_the_header_says_it() {
+        let local = |exit: Exit| {
+            anyhow::Error::new(ProcessFailed::new(exit.to_string(), Some(exit)))
+                .context("driver run")
+        };
+        assert_eq!(
+            of(&local(Exit::Code(3))).diagnostic.message,
+            "exit status 3"
+        );
+        assert_eq!(
+            of(&local(Exit::Signal(9))).diagnostic.message,
+            "killed by signal 9 (SIGKILL)"
+        );
+
+        let raised = anyhow::Error::new(Diagnostic::new(Stage::Run, "go vet found 2 issues"))
+            .context(ProcessFailed::new("exit status: 1", Some(Exit::Code(1))));
+        assert_eq!(of(&raised).diagnostic.message, "go vet found 2 issues");
+
+        let remote = anyhow::Error::new(RemoteProcessFailed::new(
+            "--- FAIL: TestX\nexit status: 1".into(),
+            Exit::Code(1),
+        ));
+        let rec = of(&remote);
+        assert_eq!(rec.diagnostic.message, "--- FAIL: TestX\nexit status: 1");
+        assert_eq!(rec.exit.and_then(|x| x.code), Some(1));
     }
 
     #[test]

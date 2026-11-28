@@ -198,8 +198,10 @@ async fn timeout_named_in_every_renderer() -> anyhow::Result<()> {
     assert!(r.run.report.contains(title), "{}", r.run.report);
     let e = r.run.entry("//a:to");
     assert_eq!(e["timed_out"], true, "{e}");
-    assert_eq!(e["error"], "timed out after 1s", "{e}");
-    assert_eq!(r.inspect["message"], "timed out after 1s", "{}", r.inspect);
+    // One wording everywhere, the box header's.
+    let said = "timed out after 1s (its timeout)";
+    assert_eq!(e["error"], said, "{e}");
+    assert_eq!(r.inspect["message"], said, "{}", r.inspect);
     Ok(())
 }
 

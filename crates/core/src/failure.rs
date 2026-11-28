@@ -160,6 +160,60 @@ impl FailureRecord {
             + self.exit.as_ref().map_or(0, |x| x.status.len())
             + opt(&self.frozen_diff)
     }
+
+    /// How the failed process ended, in the words every renderer uses: its
+    /// timeout (`timed out after 1s (its timeout)`), its exit (`exit status
+    /// 3`) or its signal (`killed by signal 9 (SIGKILL)`). `None` when the
+    /// failure is not a process that ended. A box's header, the streamed
+    /// line, and the message of a process failure whose driver raised no
+    /// diagnostic all say this, so no two of them can word it differently.
+    pub fn process_end(&self) -> Option<String> {
+        if let Some(t) = &self.timed_out {
+            return Some(format!(
+                "timed out after {} (its timeout)",
+                crate::units::format_duration(std::time::Duration::from_millis(t.timeout_ms))
+            ));
+        }
+        let exit = self.exit.as_ref()?;
+        Some(match (exit.code, exit.signal) {
+            (Some(code), _) => format!("exit status {code}"),
+            (None, Some(sig)) => match signal_name(sig) {
+                Some(name) => format!("killed by signal {sig} ({name})"),
+                None => format!("killed by signal {sig}"),
+            },
+            (None, None) => exit.status.trim().to_owned(),
+        })
+    }
+}
+
+/// What a box adds under a timeout whose run was abandoned, and what the
+/// message of such a failure ends with.
+pub const ABANDONED: &str = "abandoned: the run did not stop once cancelled and heph stopped \
+                             waiting for it, so its process may still be running";
+
+/// The name of a signal a process commonly dies of.
+pub fn signal_name(sig: i32) -> Option<&'static str> {
+    Some(match sig {
+        libc::SIGHUP => "SIGHUP",
+        libc::SIGINT => "SIGINT",
+        libc::SIGQUIT => "SIGQUIT",
+        libc::SIGILL => "SIGILL",
+        libc::SIGTRAP => "SIGTRAP",
+        libc::SIGABRT => "SIGABRT",
+        libc::SIGBUS => "SIGBUS",
+        libc::SIGFPE => "SIGFPE",
+        libc::SIGKILL => "SIGKILL",
+        libc::SIGUSR1 => "SIGUSR1",
+        libc::SIGSEGV => "SIGSEGV",
+        libc::SIGUSR2 => "SIGUSR2",
+        libc::SIGPIPE => "SIGPIPE",
+        libc::SIGALRM => "SIGALRM",
+        libc::SIGTERM => "SIGTERM",
+        libc::SIGXCPU => "SIGXCPU",
+        libc::SIGXFSZ => "SIGXFSZ",
+        libc::SIGSYS => "SIGSYS",
+        _ => return None,
+    })
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -355,6 +409,53 @@ mod tests {
         assert!(
             serde_json::from_str::<Diagnostic>(r#"{"stage":7,"message":"m"}"#).is_err(),
             "not a stage name"
+        );
+    }
+
+    /// How a process ended, in the one wording every renderer shares: a
+    /// timeout wins over the exit it caused, a signal is named when it is a
+    /// common one, a status known only as text is said as the driver spelled
+    /// it, and a failure with no process says nothing.
+    #[test]
+    fn process_end_words_each_way_a_process_ends() {
+        let exit = |code, signal, status: &str| {
+            let mut r = FailureRecord::new(Diagnostic::new(Stage::Run, "m"));
+            r.exit = Some(ExitData {
+                code,
+                signal,
+                status: status.into(),
+            });
+            r
+        };
+        let end = |r: &FailureRecord| r.process_end();
+        assert_eq!(
+            end(&exit(Some(3), None, "exit status: 3")).as_deref(),
+            Some("exit status 3")
+        );
+        assert_eq!(
+            end(&exit(None, Some(9), "signal: 9")).as_deref(),
+            Some("killed by signal 9 (SIGKILL)")
+        );
+        assert_eq!(
+            end(&exit(None, Some(64), "signal: 64")).as_deref(),
+            Some("killed by signal 64")
+        );
+        assert_eq!(
+            end(&exit(None, None, " remote: lost \n")).as_deref(),
+            Some("remote: lost")
+        );
+        let mut timed = exit(None, Some(9), "signal: 9");
+        timed.timed_out = Some(TimedOutData {
+            timeout_ms: 90_000,
+            abandoned: false,
+        });
+        assert_eq!(
+            end(&timed).as_deref(),
+            Some("timed out after 1m30s (its timeout)")
+        );
+        assert_eq!(
+            end(&FailureRecord::new(Diagnostic::new(Stage::Run, "m"))),
+            None
         );
     }
 }

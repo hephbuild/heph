@@ -133,7 +133,7 @@ async fn a_run_past_its_timeout_fails_as_timed_out() -> anyhow::Result<()> {
         let elapsed = started.elapsed();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("//p:slow timed out after 1s"),
+            msg.contains("//p:slow: timed out after 1s (its timeout)"),
             "{attempt}: {msg}"
         );
         assert!(
@@ -267,7 +267,7 @@ target(
     let engine = engine(ws.path())?;
     let err = build(&engine, "//p:bg").await.expect_err("timed out");
     assert!(
-        format!("{err:#}").contains("//p:bg timed out after 1s"),
+        format!("{err:#}").contains("//p:bg: timed out after 1s (its timeout)"),
         "{err:#}"
     );
 
@@ -429,8 +429,11 @@ async fn a_run_that_ignores_its_cancellation_is_abandoned() -> anyhow::Result<()
             .await
             .expect("an abandoned run does not hang the build")?;
     let msg = format!("{err:#}");
-    assert!(msg.contains("//p:stuck timed out after 1s"), "{msg}");
-    assert!(msg.contains("was abandoned"), "{msg}");
+    assert!(
+        msg.contains("//p:stuck: timed out after 1s (its timeout)"),
+        "{msg}"
+    );
+    assert!(msg.contains(hcore::failure::ABANDONED), "{msg}");
     assert!(
         started.elapsed() < Duration::from_secs(9),
         "abandoned after the shortened grace, not the production one: {:?}",
@@ -440,7 +443,7 @@ async fn a_run_that_ignores_its_cancellation_is_abandoned() -> anyhow::Result<()
         panic!("one failure recorded, got {}", failures.len());
     };
     let text = crate::common::failure_text(failure);
-    assert!(text.contains("was abandoned"), "{text}");
+    assert!(text.contains(hcore::failure::ABANDONED), "{text}");
     Ok(())
 }
 
@@ -538,7 +541,10 @@ target(
         let Err(err) = res else {
             anyhow::bail!("//p:deaf must fail");
         };
-        assert!(format!("{err:#}").contains("was abandoned"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains(hcore::failure::ABANDONED),
+            "{err:#}"
+        );
         let [failure] = <[_; 1]>::try_from(rs.take_failures())
             .map_err(|f| anyhow::anyhow!("one failure recorded, got {}", f.len()))?;
         Ok(Self {
@@ -779,7 +785,7 @@ target(name = "c", driver = "drops", run = "echo $T; sleep 60; echo done > $OUT"
     let started = Instant::now();
     let err = build(&engine, "//p:c").await.expect_err("timed out");
     assert!(
-        format!("{err:#}").contains("//p:c timed out after 1s"),
+        format!("{err:#}").contains("//p:c: timed out after 1s (its timeout)"),
         "{err:#}"
     );
     assert!(started.elapsed() < Duration::from_secs(9));
@@ -908,7 +914,10 @@ async fn a_process_past_its_timeout_times_out_after_a_slow_preparation() -> anyh
         .expect_err("a 60s process under a 1s timeout fails");
     let elapsed = started.elapsed();
     let msg = format!("{err:#}");
-    assert!(msg.contains("//p:padded timed out after 1s"), "{msg}");
+    assert!(
+        msg.contains("//p:padded: timed out after 1s (its timeout)"),
+        "{msg}"
+    );
     assert!(
         msg.contains("failure //p:padded"),
         "recorded as a failure: {msg}"
