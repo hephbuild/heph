@@ -2306,8 +2306,9 @@ fn record_culprit(
     // The log and its tail are always kept (D6.1): whether the output already
     // streamed to the user's terminal is recorded beside them, from what the
     // wrapper wrote, and each renderer decides what to show.
-    let log = failure_slot_log(&e);
-    let log_tail = log.as_ref().and_then(|l| l.tail().ok());
+    // The path alone: an in-memory tail (credential material) reaches
+    // renderers scrubbed, through the record's `LogRef` (E2).
+    let log = failure_slot_log(&e).map(|l| l.without_memory());
     let outputs = failure_slot_out(&e);
     let slot = downcast_chain_ref::<crate::engine::failure_slot::FailureSlot>(&e);
     let fixes = slot.and_then(|s| s.fixes.clone());
@@ -2364,7 +2365,7 @@ fn record_culprit(
                 Culprit::Target(_) => Vec::new(),
             },
         });
-    let mut failure = TargetFailure::new(entry, log_tail, e);
+    let mut failure = TargetFailure::new(entry);
     if let Some(record) = record {
         failure = failure.with_record(record);
     }
@@ -12120,9 +12121,10 @@ mod tests {
             downcast_chain_ref::<UpstreamFailed>(&err).is_none(),
             "top-level error must be surfaced as the rich cause, not the marker: {err:#}"
         );
-        downcast_chain_ref::<TargetFailure>(&err)
+        let surfaced = downcast_chain_ref::<TargetFailure>(&err)
             .expect("expected a surfaced TargetFailure at the boundary");
-        let rendered = format!("{err:#}");
+        // The aggregate's members are the record's causes (D7b).
+        let rendered = format!("{err:#}\n{}", surfaced.record.causes.join("\n"));
         assert!(
             rendered.contains("missing:a") && rendered.contains("missing:b"),
             "the surfaced failure must list every broken input, got: {rendered}"
@@ -12146,7 +12148,7 @@ mod tests {
         // (The lib harness can't spawn subprocesses, so base fails at exec spawn;
         // the dedup contract is what this exercises — see the e2e suite for real
         // process failures.)
-        use crate::engine::error::{TargetFailure, UpstreamFailed};
+        use crate::engine::error::TargetFailure;
 
         let engine = engine_with(vec![
             run_target("//d:base", &[], "exit 1"),
@@ -12176,9 +12178,10 @@ mod tests {
         );
         assert_eq!(failures[0].addr.format(), "//d:base");
         // base is recorded as its OWN failure (a genuine cause, not a marker).
+        let message = &failures[0].record.diagnostic.message;
         assert!(
-            downcast_chain_ref::<UpstreamFailed>(&failures[0].source).is_none(),
-            "root cause must be a genuine failure, not an UpstreamFailed marker"
+            !message.contains("dependency failed"),
+            "root cause must be a genuine failure, not an UpstreamFailed marker: {message}"
         );
         // The boundary surfaces a rich diagnostic to the direct caller.
         assert!(downcast_chain_ref::<TargetFailure>(&err).is_some());
@@ -12405,7 +12408,7 @@ mod tests {
         // …and the rich record carries the last 1000 lines read from the log
         // file, tagged with the real starting line number.
         let recorded = rs.get_failure(&addr).expect("failure must be recorded");
-        let tail = recorded.log_tail.as_ref().expect("log tail");
+        let tail = recorded_tail(&recorded).expect("log tail");
         let want: Vec<String> = (13..=1012).map(|i| format!("line{i}")).collect();
         assert_eq!(tail.text, want.join("\n"));
         assert_eq!(tail.start_line, 13);
@@ -12469,7 +12472,7 @@ mod tests {
 
         let _ = classify_failure(&rs, &addr, e);
         let recorded = rs.get_failure(&addr).expect("failure must be recorded");
-        let tail = recorded.log_tail.as_ref().expect("the tail is kept");
+        let tail = recorded_tail(&recorded).expect("the tail is kept");
         assert_eq!(tail.text, "line9\nline10");
         assert_eq!(tail.start_line, 1);
         assert!(recorded.streamed, "the recorded failure says it streamed");
@@ -12478,6 +12481,16 @@ mod tests {
             "the path is kept"
         );
         Ok(())
+    }
+
+    /// A recorded failure's log tail as a renderer reads it: through its
+    /// record's reference (the in-memory tail, else the slot's file).
+    fn recorded_tail(f: &TargetFailure) -> Option<hcore::failure_log::LogTail> {
+        hcore::failure_log::read_tail(
+            f.record.log.as_ref()?,
+            hcore::failure_log::TAIL_LINES_CAP,
+            hcore::failure_log::TAIL_MAX_BYTES,
+        )
     }
 
     /// A `ProcessFailed` with the run log at `path` attached, as a driver
@@ -12539,8 +12552,8 @@ mod tests {
         let _ = classify_failure(&rs, &addr, e);
         let recorded = rs.get_failure(&addr).expect("recorded");
         assert_eq!(
-            recorded.log_tail.as_ref().map(|t| t.text.as_str()),
-            Some("what the run wrote")
+            recorded_tail(&recorded).map(|t| t.text),
+            Some("what the run wrote".to_owned())
         );
         let path = recorded
             .log
@@ -12552,7 +12565,7 @@ mod tests {
         let rs = engine.new_state();
         let _ = classify_failure(&rs, &addr, process_failed_with_log(&log_path));
         let recorded = rs.get_failure(&addr).expect("recorded");
-        assert!(recorded.log_tail.is_none() && recorded.log.is_none());
+        assert!(recorded_tail(&recorded).is_none() && recorded.log.is_none());
         Ok(())
     }
 
@@ -12737,7 +12750,7 @@ mod tests {
 
         let _ = classify_failure(&rs, &addr, e);
         let recorded = rs.get_failure(&addr).expect("failure must be recorded");
-        let tail = recorded.log_tail.as_ref().expect("the remote log's tail");
+        let tail = recorded_tail(&recorded).expect("the remote log's tail");
         assert_eq!(
             tail.text, "#1 building\n\u{fffd}\nERROR: failed to solve",
             "the stray byte is replaced, the tail kept"
@@ -12803,10 +12816,7 @@ mod tests {
 
         let _ = classify_failure(&rs, &addr, e);
         let recorded = rs.get_failure(&addr).expect("failure must be recorded");
-        let tail = recorded
-            .log_tail
-            .as_ref()
-            .expect("the tail, through the wrappers");
+        let tail = recorded_tail(&recorded).expect("the tail, through the wrappers");
         assert_eq!(tail.text, "the tool said why");
         Ok(())
     }
@@ -17347,15 +17357,15 @@ mod tests {
             .err()
             .expect("frozen check on a dirty tree must error");
         drop(rs);
-        // The top-level frame surfaces the recorded `TargetFailure` whose `source`
-        // anyhow chain carries the original `FrozenCheckError`.
+        // The top-level frame surfaces the recorded `TargetFailure` whose
+        // record carries the original `FrozenCheckError`'s diff.
         let tf = err
             .downcast_ref::<TargetFailure>()
             .expect("top-level error must be a recorded TargetFailure");
         assert!(
-            downcast_chain_ref::<crate::engine::error::FrozenCheckError>(tf.source.as_ref())
-                .is_some(),
-            "frozen failure must carry a FrozenCheckError, got: {err:#}"
+            tf.record.frozen_diff.is_some(),
+            "frozen failure must carry a FrozenCheckError, got: {:?}",
+            tf.record
         );
         assert_eq!(
             std::fs::read(&tree_file)?,
@@ -17412,9 +17422,9 @@ mod tests {
             .downcast_ref::<TargetFailure>()
             .expect("top-level error must be a recorded TargetFailure");
         assert!(
-            downcast_chain_ref::<crate::engine::error::FrozenCheckError>(tf.source.as_ref())
-                .is_some(),
-            "frozen failure must carry a FrozenCheckError, got: {err:#}"
+            tf.record.frozen_diff.is_some(),
+            "frozen failure must carry a FrozenCheckError, got: {:?}",
+            tf.record
         );
         // Frozen never writes: the tree file stays non-executable.
         let mode = std::fs::metadata(&script)?.permissions().mode();
@@ -18141,10 +18151,8 @@ mod tests {
             .expect("a failing member must fail the group");
 
         let recorded = rs.get_failure(&failing).expect("failure must be recorded");
-        let tail = recorded
-            .log_tail
-            .as_ref()
-            .expect("a non-interactive member keeps its process log tail");
+        let tail =
+            recorded_tail(&recorded).expect("a non-interactive member keeps its process log tail");
         assert!(tail.text.contains("line12"), "tail: {}", tail.text);
         Ok(())
     }
@@ -19051,9 +19059,7 @@ mod tests {
             .expect("the failing root must fail the run");
 
         let recorded = rs.get_failure(&failing).expect("failure must be recorded");
-        let tail = recorded
-            .log_tail
-            .as_ref()
+        let tail = recorded_tail(&recorded)
             .expect("a target that never streamed keeps its process log tail");
         assert!(tail.text.contains("line12"), "tail: {}", tail.text);
         Ok(())
@@ -19092,7 +19098,7 @@ mod tests {
 
             let recorded = rs.get_failure(&addr).expect("failure must be recorded");
             assert_eq!(recorded.streamed, streamed);
-            let tail = recorded.log_tail.as_ref().expect("the tail is always kept");
+            let tail = recorded_tail(&recorded).expect("the tail is always kept");
             assert!(tail.text.contains("line12"), "tail: {}", tail.text);
         }
         Ok(())
@@ -19123,7 +19129,7 @@ mod tests {
 
             assert_eq!(h.runs.load(Ordering::SeqCst), 1, "the run itself went fine");
             let recorded = rs.get_failure(&addr).expect("failure must be recorded");
-            let msg = format!("{:#}", recorded.source);
+            let msg = &recorded.record.diagnostic.message;
             assert!(
                 msg.contains("declares host path") && !msg.contains("cache_locally"),
                 "a failure past the run: {msg} ({err:#})",
@@ -19160,13 +19166,13 @@ mod tests {
 
             assert_eq!(h.runs.load(Ordering::SeqCst), 1, "the run itself went fine");
             let recorded = rs.get_failure(&addr).expect("failure must be recorded");
-            let msg = format!("{:#}", recorded.source);
+            let msg = &recorded.record.diagnostic.message;
             assert!(
                 msg.contains("cache_locally") && msg.contains("duplicate cache entry name"),
                 "a cache-store failure: {msg} ({err:#})",
             );
             assert_eq!(recorded.streamed, streamed, "{msg}");
-            let detail = crate::engine::event::ErrorDetail::from_error(&recorded.source);
+            let detail = crate::engine::event::ErrorDetail::from_error(&err);
             assert_eq!(detail.streamed, streamed, "{msg}");
             assert!(!detail.kept, "no slot on a store failure: {msg}");
         }

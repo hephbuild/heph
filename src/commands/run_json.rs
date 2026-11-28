@@ -1124,8 +1124,7 @@ mod tests {
         fn target(mut self, a: &str, e: &str) -> Self {
             let addr = crate::htaddr::parse_addr(a).expect("addr");
             self.0.push(Arc::new(
-                TargetFailure::new(addr, None, anyhow::anyhow!("{e}"))
-                    .with_record(Arc::new(record(a, e))),
+                TargetFailure::new(addr).with_record(Arc::new(record(a, e))),
             ));
             self
         }
@@ -1614,13 +1613,9 @@ mod tests {
         rs.add_dep_for_test(&a("//b:z"), &a("//d:t")).expect("edge");
         rs.record_failure(
             Culprit::Target(a("//c:y")),
-            Arc::new(TargetFailure::new(
-                a("//c:y"),
-                None,
-                anyhow::anyhow!("boom"),
-            )),
+            Arc::new(TargetFailure::new(a("//c:y"))),
         );
-        let mut file = TargetFailure::new(a("//d:t"), None, anyhow::anyhow!("eval"));
+        let mut file = TargetFailure::new(a("//d:t"));
         file.file = Some(Arc::from("d/BUILD"));
         rs.record_failure(Culprit::File(Arc::from("d/BUILD")), Arc::new(file));
         let mut to_file = end("//b:z", Some("dependency failed"), Some("//d:t"));
@@ -1676,11 +1671,7 @@ mod tests {
         rs.add_dep_for_test(&a("//p:b"), &a("//p:c")).expect("edge");
         rs.record_failure(
             Culprit::Target(a("//p:c")),
-            Arc::new(TargetFailure::new(
-                a("//p:c"),
-                None,
-                anyhow::anyhow!("boom"),
-            )),
+            Arc::new(TargetFailure::new(a("//p:c"))),
         );
         let (_, mut f) = fold_with(
             vec![
@@ -1714,10 +1705,7 @@ mod tests {
         }
         rs.add_dep_for_test(&chain[n - 1], &c).expect("edge");
         rs.mark_requested(&chain[0]);
-        rs.record_failure(
-            Culprit::Target(c.clone()),
-            Arc::new(TargetFailure::new(c, None, anyhow::anyhow!("boom"))),
-        );
+        rs.record_failure(Culprit::Target(c.clone()), Arc::new(TargetFailure::new(c)));
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         let events = std::iter::once(ev(0, matched(&refs, true)))
             .chain(

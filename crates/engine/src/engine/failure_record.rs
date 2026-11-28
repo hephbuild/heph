@@ -281,7 +281,7 @@ fn bound(mut rec: FailureRecord) -> FailureRecord {
         *diff = bound_snippet(diff, &mut cut);
     }
     if let Some(tail) = rec.log.as_mut().and_then(|l| l.memory_tail.as_mut()) {
-        keep_end(tail, RECORD_CAP);
+        cut |= keep_end(tail, RECORD_CAP);
     }
 
     while rec.text_len() > RECORD_CAP && rec.causes.pop().is_some() {
@@ -311,16 +311,17 @@ fn count(n: usize) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
 }
 
-/// `s` cut to its last `cap` bytes, at a char boundary.
-fn keep_end(s: &mut String, cap: usize) {
+/// `s` cut to its last `cap` bytes, at a char boundary. True when it cut.
+fn keep_end(s: &mut String, cap: usize) -> bool {
     if s.len() <= cap {
-        return;
+        return false;
     }
     let mut start = s.len() - cap;
     while !s.is_char_boundary(start) {
         start += 1;
     }
     s.drain(..start);
+    true
 }
 
 #[cfg(test)]
@@ -440,8 +441,7 @@ mod tests {
             .map(|i| format!("{i:03}{}", "c".repeat(497)))
             .collect();
         assert!(inner.text_len() > RECORD_CAP, "the fixture is over the cap");
-        let tf = TargetFailure::new(addr("//p:t"), None, anyhow::anyhow!("inner"))
-            .with_record(Arc::new(inner.clone()));
+        let tf = TargetFailure::new(addr("//p:t")).with_record(Arc::new(inner.clone()));
         let rec = of(&anyhow::Error::new(tf));
         assert!(rec.text_len() <= RECORD_CAP, "{} bytes", rec.text_len());
         assert!(rec.diagnostic.truncated);
@@ -469,8 +469,7 @@ mod tests {
         let mut inner = FailureRecord::new(d);
         // Identity fields are not capped per field: here they fill the record.
         inner.entry = "e".repeat(6000);
-        let tf = TargetFailure::new(addr("//p:t"), None, anyhow::anyhow!("inner"))
-            .with_record(Arc::new(inner));
+        let tf = TargetFailure::new(addr("//p:t")).with_record(Arc::new(inner));
         let rec = of(&anyhow::Error::new(tf));
         assert!(rec.text_len() <= RECORD_CAP, "{} bytes", rec.text_len());
         assert_eq!(rec.diagnostic.snippet, None);
@@ -574,8 +573,7 @@ mod tests {
             status: "exit status: 3".into(),
         });
         inner.failed_in = FailedIn::Exec;
-        let tf = TargetFailure::new(addr("//q:inner"), None, anyhow::anyhow!("inner"))
-            .with_record(Arc::new(inner));
+        let tf = TargetFailure::new(addr("//q:inner")).with_record(Arc::new(inner));
         let e = anyhow::Error::new(tf).context("calling //q:inner");
         let rec = compact(
             &e,

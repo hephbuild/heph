@@ -82,7 +82,11 @@ async fn build(engine: &Arc<Engine>, addr: &str) -> anyhow::Result<String> {
         Err(e) => {
             let mut msg = format!("{e:#}");
             for f in rs.take_failures() {
-                msg.push_str(&format!("\nfailure {}: {:#}", f.addr.format(), f.source));
+                msg.push_str(&format!(
+                    "\nfailure {}: {:#}",
+                    f.addr.format(),
+                    crate::common::failure_text(&f)
+                ));
             }
             Err(anyhow::anyhow!(msg))
         }
@@ -329,22 +333,18 @@ async fn a_timed_out_target_keeps_its_log() -> anyhow::Result<()> {
         panic!("one failure recorded, got {}", failures.len());
     };
     assert!(
-        heph::engine::run_timeout::is_timed_out(&failure.source),
-        "a timeout: {:#}",
-        failure.source
+        failure.record.timed_out.is_some(),
+        "a timeout: {:?}",
+        failure.record
     );
-    assert!(
-        !hplugin::error::is_cancelled(&failure.source),
-        "{:#}",
-        failure.source
-    );
+    assert!(!failure.record.cancelled, "{:?}", failure.record);
     let log = slot_log(&engine, "//p:slow").expect("a timed-out run fills its failure slot");
     assert!(log.contains("started"), "the log before the kill: {log:?}");
     assert!(!log.contains("done"), "{log:?}");
     // Its sandbox is removed like any failed run's, and the recorded tail,
     // read from the slot's copy, survives that.
     crate::failure_slot::removed(&crate::failure_slot::sandbox_dir(&engine, "p", "slow")).await;
-    let tail = failure.log_tail.as_ref().expect("the recorded tail");
+    let tail = crate::common::failure_tail(failure).expect("the recorded tail");
     assert!(tail.text.contains("started"), "{tail:?}");
     Ok(())
 }
@@ -439,11 +439,8 @@ async fn a_run_that_ignores_its_cancellation_is_abandoned() -> anyhow::Result<()
     let [failure] = failures.as_slice() else {
         panic!("one failure recorded, got {}", failures.len());
     };
-    assert!(
-        format!("{:#}", failure.source).contains("was abandoned"),
-        "{:#}",
-        failure.source
-    );
+    let text = crate::common::failure_text(failure);
+    assert!(text.contains("was abandoned"), "{text}");
     Ok(())
 }
 
@@ -603,8 +600,8 @@ async fn an_abandoned_runs_sandbox_is_left_and_its_slot_returned() -> anyhow::Re
     assert_eq!(
         run.failure.sandbox,
         Some(hplugin::error::SandboxFate::LeftAbandoned),
-        "{:#}",
-        run.failure.source
+        "{}",
+        crate::common::failure_text(&run.failure)
     );
     Ok(())
 }
@@ -622,8 +619,8 @@ async fn an_abandoned_runs_sandbox_is_kept_under_the_flag() -> anyhow::Result<()
     assert_eq!(
         run.failure.sandbox,
         Some(hplugin::error::SandboxFate::Kept(dir)),
-        "{:#}",
-        run.failure.source
+        "{}",
+        crate::common::failure_text(&run.failure)
     );
     Ok(())
 }

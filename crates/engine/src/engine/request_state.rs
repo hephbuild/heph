@@ -3230,7 +3230,7 @@ mod tests {
         );
         rs.record_failure(
             c.clone(),
-            Arc::new(TargetFailure::new(c.clone(), None, anyhow::anyhow!("boom")).with_path(early)),
+            Arc::new(TargetFailure::new(c.clone()).with_path(early)),
         );
         // The shorter edge resolves after the failure was recorded.
         rs.add_dep_for_test(&r, &c)?;
@@ -3269,10 +3269,7 @@ mod tests {
         }
         for c in &culprits {
             rs.add_dep_for_test(&hub, c)?;
-            rs.record_failure(
-                c.clone(),
-                Arc::new(TargetFailure::new(c.clone(), None, anyhow::anyhow!("boom"))),
-            );
+            rs.record_failure(c.clone(), Arc::new(TargetFailure::new(c.clone())));
         }
         assert_eq!(rs.path_passes(), 0, "recording walks nothing");
 

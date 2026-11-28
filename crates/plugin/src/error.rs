@@ -33,9 +33,13 @@ impl fmt::Display for CancelledError {
 
 impl std::error::Error for CancelledError {}
 
-/// True if `e` (anywhere in its source chain) is a `CancelledError`.
+/// True if `e` (anywhere in its source chain) is a `CancelledError`, or a
+/// surfaced [`TargetFailure`] whose record says it was a stop: the failure it
+/// stands for is no longer on the chain (D7b), only its record's facts.
 pub fn is_cancelled(e: &anyhow::Error) -> bool {
     hcore::hmemoizer::downcast_chain_ref::<CancelledError>(e).is_some()
+        || hcore::hmemoizer::downcast_chain_ref::<TargetFailure>(e)
+            .is_some_and(|t| t.record.cancelled)
 }
 
 /// A hash-only request reached a target it would have had to *build* to answer.
@@ -768,14 +772,24 @@ impl std::error::Error for RemoteProcessFailed {}
 /// The structured exit status anywhere in `err`'s chain: a [`ProcessFailed`]
 /// from an in-process driver, or a [`RemoteProcessFailed`] from a cdylib.
 /// `None` when no process exit is behind the failure, or the driver that
-/// produced it predates [`ProcessFailed::exit`].
+/// produced it predates [`ProcessFailed::exit`]. A surfaced
+/// [`TargetFailure`] answers from its record's exit.
 pub fn process_exit(err: &anyhow::Error) -> Option<Exit> {
     // Through the walker: a failure a memoizer shared, or one under a stage
     // frame, has its process behind a `SharedAnyhow` that `chain()` stops at.
     hcore::hmemoizer::walk(err, &mut |f| {
-        let exit = match f.downcast_ref::<ProcessFailed>() {
-            Some(pf) => pf.exit,
-            None => f.downcast_ref::<RemoteProcessFailed>().map(|r| r.exit),
+        let exit = if let Some(pf) = f.downcast_ref::<ProcessFailed>() {
+            pf.exit
+        } else if let Some(r) = f.downcast_ref::<RemoteProcessFailed>() {
+            Some(r.exit)
+        } else {
+            f.downcast_ref::<TargetFailure>()
+                .and_then(|t| t.record.exit.as_ref())
+                .and_then(|x| match (x.code, x.signal) {
+                    (Some(code), _) => Some(Exit::Code(code)),
+                    (None, Some(sig)) => Some(Exit::Signal(sig)),
+                    (None, None) => None,
+                })
         };
         match exit {
             Some(exit) => std::ops::ControlFlow::Break(exit),
@@ -789,9 +803,10 @@ pub fn process_exit(err: &anyhow::Error) -> Option<Exit> {
 /// once per addr in the per-request failure registry and rendered (custom, see
 /// `commands::errors`) at the end of execution.
 ///
-/// `source` is held behind an `Arc` so the whole diagnostic is `Clone`: the
-/// outermost `result_addr` frame surfaces a clone of the recorded failure to its
-/// direct caller (in place of the lightweight `UpstreamFailed` marker that
+/// It holds no error chain (D7b): what a renderer, `is_cancelled` or
+/// `process_exit` reads of the failure is its [`record`](Self::record). The
+/// outermost `result_addr` frame surfaces a clone of the recorded failure to
+/// its direct caller (in place of the lightweight `UpstreamFailed` marker that
 /// propagates internally), while the registry keeps the original for rendering.
 #[derive(Debug, Clone)]
 pub struct TargetFailure {
@@ -809,13 +824,10 @@ pub struct TargetFailure {
     /// on scheduling. Empty when no requested target reaches it, or when
     /// nobody computed it.
     pub path: Vec<Addr>,
-    /// The last lines of the target's process log (the full log is still saved
-    /// as the `log.txt` artifact), with the real starting line number so the box
-    /// renders true file positions. Rendered as a framed `log` box.
-    pub log_tail: Option<LogTail>,
-    /// The log `log_tail` was read from: the engine's copy in the target's
-    /// failure slot (open, with its path for the box's `full log:` footer), or
-    /// the tail in memory when no copy is kept.
+    /// Where the target's log is: the engine's copy in its failure slot, for
+    /// the box's `full log:` footer. Never its text: a renderer reads the
+    /// tail through the record's [`LogRef`](hcore::failure::LogRef), which
+    /// holds the scrubbed in-memory tail of a log kept nowhere on disk.
     pub log: Option<FailureLog>,
     /// The `out/` directory of the target's failure slot, when the failed run
     /// kept `failure_out` matches there: what the box prints as `outputs:`.
@@ -840,13 +852,15 @@ pub struct TargetFailure {
     /// (D6.1). False for a target that printed nothing, and for output that
     /// went to a file or a pipe.
     pub streamed: bool,
-    pub source: std::sync::Arc<anyhow::Error>,
     /// The failure compacted (D7b): scrubbed, capped, with the typed facts a
     /// renderer reads. The engine sets it when it records the culprit
     /// (`engine::failure_record::compact`); one built here with
     /// [`TargetFailure::new`] and never set says only which target failed,
     /// so no unscrubbed text can reach it.
     pub record: std::sync::Arc<FailureRecord>,
+    /// [`record`](Self::record) was set by [`with_record`](Self::with_record):
+    /// the failure's own compacted record, not the placeholder `new` makes.
+    compacted: bool,
 }
 
 pub use hcore::events::FailureRecord;
@@ -929,7 +943,7 @@ impl fmt::Display for FixesNotWritten {
 }
 
 impl TargetFailure {
-    pub fn new(addr: Addr, log_tail: Option<LogTail>, source: anyhow::Error) -> Self {
+    pub fn new(addr: Addr) -> Self {
         let formatted = addr.format();
         let mut record = FailureRecord::new(
             crate::diagnostic::Diagnostic::new(
@@ -944,21 +958,21 @@ impl TargetFailure {
             addr,
             file: None,
             path: Vec::new(),
-            log_tail,
             log: None,
             outputs: None,
             fixes: None,
             sandbox: None,
             log_readable: None,
             streamed: false,
-            source: std::sync::Arc::new(source),
             record: std::sync::Arc::new(record),
+            compacted: false,
         }
     }
 
     /// The same failure with its compacted record.
     pub fn with_record(mut self, record: std::sync::Arc<FailureRecord>) -> Self {
         self.record = record;
+        self.compacted = true;
         self
     }
 
@@ -1085,9 +1099,14 @@ impl fmt::Display for TargetFailure {
     }
 }
 
+/// The chain the failure was recorded from is not kept (D7b): its source is
+/// the record's diagnostic, already scrubbed and bounded, so `{:#}` of a
+/// surfaced failure still says its cause. A failure never compacted has
+/// none (its diagnostic only repeats [`Display`](fmt::Display)).
 impl std::error::Error for TargetFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(self.source.as_ref().as_ref())
+        self.compacted
+            .then_some(&self.record.diagnostic as &(dyn std::error::Error + 'static))
     }
 }
 
@@ -1138,44 +1157,25 @@ pub use hcore::failure_log::{
     read_tail_at, tail_window,
 };
 
-/// A failed run's log as the diagnostic holds it: the engine's copy in the
-/// target's failure slot, kept **open** so a later rerun replacing the slot
-/// cannot swap the log this run's box shows; or, for a target whose log may
-/// not be kept on disk (its outputs are credential material) or whose copy
-/// could not be made, the tail already read into memory.
-#[derive(Clone)]
+/// A failed run's log as the diagnostic holds it: the path of the engine's
+/// copy in the target's failure slot, never an open file (E2: a rerun
+/// replacing the slot is told apart by the record's fill id, not by holding
+/// the old inode); or, for a target whose log may not be kept on disk (its
+/// outputs are credential material) or whose copy could not be made, the
+/// tail already read into memory, within [`RECORD_CAP`](hcore::failure::RECORD_CAP).
+#[derive(Debug, Clone, Default)]
 pub struct FailureLog {
     path: Option<std::path::PathBuf>,
-    source: FailureLogSource,
+    memory: Option<LogTail>,
     lines: usize,
 }
 
-#[derive(Clone)]
-enum FailureLogSource {
-    Open(std::sync::Arc<std::fs::File>),
-    Tail(LogTail),
-}
-
-impl fmt::Debug for FailureLog {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let kind = match self.source {
-            FailureLogSource::Open(_) => "open",
-            FailureLogSource::Tail(_) => "tail",
-        };
-        f.debug_struct("FailureLog")
-            .field("path", &self.path)
-            .field("source", &kind)
-            .finish()
-    }
-}
-
 impl FailureLog {
-    /// The slot's log at `path`, through `file` opened on it; its tail is the
-    /// last `lines` lines.
-    pub fn open(path: std::path::PathBuf, file: std::fs::File, lines: usize) -> Self {
+    /// The slot's log at `path`; its tail is the last `lines` lines.
+    pub fn on_disk(path: std::path::PathBuf, lines: usize) -> Self {
         Self {
             path: Some(path),
-            source: FailureLogSource::Open(std::sync::Arc::new(file)),
+            memory: None,
             lines,
         }
     }
@@ -1184,8 +1184,18 @@ impl FailureLog {
     pub fn in_memory(tail: LogTail) -> Self {
         Self {
             path: None,
-            source: FailureLogSource::Tail(tail),
+            memory: Some(tail),
             lines: 0,
+        }
+    }
+
+    /// The same log without its in-memory tail: what a holder that never
+    /// prints the tail keeps (the record holds the scrubbed copy).
+    pub fn without_memory(&self) -> Self {
+        Self {
+            path: self.path.clone(),
+            memory: None,
+            lines: self.lines,
         }
     }
 
@@ -1195,25 +1205,28 @@ impl FailureLog {
     }
 
     /// The tail held in memory, for a log with no file behind it; `None`
-    /// for one read from the slot's file. No IO.
+    /// for one on disk. No IO.
     pub fn memory_tail(&self) -> Option<&LogTail> {
-        match &self.source {
-            FailureLogSource::Tail(t) => Some(t),
-            FailureLogSource::Open(_) => None,
-        }
+        self.memory.as_ref()
     }
 
-    /// The last lines of the log, read from the open file (seek-based, see
-    /// [`read_tail_at`]) or the tail held in memory.
+    /// The last lines of the log: the tail held in memory, else read from
+    /// the slot's file at [`path`](Self::path) (seek-based, see
+    /// [`read_tail_at`]), whatever is there now.
     pub fn tail(&self) -> std::io::Result<LogTail> {
-        match &self.source {
-            FailureLogSource::Tail(t) => Ok(t.clone()),
-            FailureLogSource::Open(file) => {
-                use std::os::unix::fs::FileExt as _;
-                let len = file.metadata()?.len();
-                read_tail_at(len, |buf, off| file.read_at(buf, off), self.lines)
-            }
+        if let Some(t) = &self.memory {
+            return Ok(t.clone());
         }
+        let Some(path) = &self.path else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no log kept",
+            ));
+        };
+        use std::os::unix::fs::FileExt as _;
+        let file = std::fs::File::open(path)?;
+        let len = file.metadata()?.len();
+        read_tail_at(len, |buf, off| file.read_at(buf, off), self.lines)
     }
 }
 

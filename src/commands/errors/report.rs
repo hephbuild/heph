@@ -152,10 +152,7 @@ mod tests {
 
     /// A culprit's failure carrying `rec` as its record.
     fn failure(addr: &str, rec: FailureRecord) -> Arc<TargetFailure> {
-        Arc::new(
-            TargetFailure::new(parse_addr(addr).expect("addr"), None, anyhow::anyhow!("x"))
-                .with_record(Arc::new(rec)),
-        )
+        Arc::new(TargetFailure::new(parse_addr(addr).expect("addr")).with_record(Arc::new(rec)))
     }
 
     /// A record of `message` against `addr`, requested itself.

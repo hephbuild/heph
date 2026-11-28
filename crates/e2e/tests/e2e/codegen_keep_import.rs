@@ -95,7 +95,7 @@ async fn run_on(engine: &Arc<Engine>, addr: &str) -> anyhow::Result<()> {
             }
             let msg: Vec<String> = failures
                 .iter()
-                .map(|f| format!("{}: {:#}", f.addr.format(), f.source))
+                .map(|f| format!("{}: {:#}", f.addr.format(), crate::common::failure_text(f)))
                 .collect();
             Err(anyhow::anyhow!("{}", msg.join("\n")))
         }
