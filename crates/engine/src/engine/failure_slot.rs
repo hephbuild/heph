@@ -209,6 +209,12 @@ pub struct FailureSlot {
     ///
     /// [`TerminalUse`]: crate::engine::TerminalUse
     pub streamed: bool,
+    /// The run itself went fine and a step past it failed (hashing its
+    /// artifacts, checking the host paths it declared): the record is
+    /// [`FailedIn::AfterRun`](hcore::failure::FailedIn::AfterRun), so a run
+    /// that streamed still gets its box (D6.1c). Set by the engine
+    /// ([`after_run`](Self::after_run)), never by the fill.
+    pub after_run: bool,
     /// The id of the fill that put the slot in place, when one did: what the
     /// failure's record names its log by ([`hcore::failure::LogRef`]).
     pub fill_id: Option<String>,
@@ -232,6 +238,13 @@ impl FailureSlot {
     #[must_use]
     pub fn with_streamed(mut self, streamed: bool) -> Self {
         self.streamed = streamed;
+        self
+    }
+
+    /// The same slot, saying the failure came past a run that went fine.
+    #[must_use]
+    pub fn after_run(mut self) -> Self {
+        self.after_run = true;
         self
     }
 }
@@ -621,6 +634,7 @@ impl FailureSlots {
             fixes,
             sandbox: None,
             streamed: false,
+            after_run: false,
             fill_id: filled.fill_id,
             log_lines: filled.log_lines,
             material: fill.material,
