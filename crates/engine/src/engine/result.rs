@@ -13059,6 +13059,51 @@ mod tests {
         Ok(())
     }
 
+    /// STAGE-18: `announce_request`, called as a request starts, sends its
+    /// `RequestConfig` before anything resolves: the entrypoint lookup `run`
+    /// makes first (a spec and a def, as slow as the BUILD file) sends no
+    /// event of its own, so this is what a client's clock counts from. The
+    /// `result` call's own announcement is then a no-op.
+    #[tokio::test]
+    async fn announce_request_comes_before_resolution() -> anyhow::Result<()> {
+        let (engine, _home) = engine_with_home(vec![static_target_run("//pkg:a", "true")])?;
+        let addr = hmodel::htaddr::parse_addr("//pkg:a")?;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let rs = engine.new_state_with_events(true, Some(tx));
+
+        engine.announce_request(&rs, false);
+        let first = rx.try_recv().expect("an event before any lookup");
+        assert!(
+            matches!(first.kind, BuildEventKind::RequestConfig { .. }),
+            "{first:?}"
+        );
+        assert!(!engine.is_entrypoint(&rs, &addr).await?);
+        Arc::clone(&engine)
+            .result_addr(
+                rs.clone(),
+                &addr,
+                OutputMatcher::All,
+                &ResultOptions::default(),
+            )
+            .await?;
+        drop(rs);
+        let mut rest = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            rest.push(ev);
+        }
+        assert!(
+            !rest
+                .iter()
+                .any(|e| matches!(e.kind, BuildEventKind::RequestConfig { .. })),
+            "announced once: {rest:?}"
+        );
+        assert!(
+            rest.iter().all(|e| e.at_unix_ms >= first.at_unix_ms),
+            "{rest:?}"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn warm_cache_emits_local_cache_hit_and_no_execute() -> anyhow::Result<()> {
         let (engine, _home) = engine_with_home(vec![static_target_run("//pkg:a", "true")])?;

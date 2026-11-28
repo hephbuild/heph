@@ -768,6 +768,21 @@ impl Engine {
         ann
     }
 
+    /// Announce `rs`'s `RequestConfig` now, at the start of the request,
+    /// rather than when its first `result` call does (STAGE-18). A command
+    /// that resolves a target before building it (`run` of one address asks
+    /// whether it is an entrypoint) would otherwise send no event for as long
+    /// as that resolution takes, and a client's clock, which counts from the
+    /// first event, would read 0 through a slow BUILD file. Once per request:
+    /// the `result` call's own announcement is then a no-op.
+    pub fn announce_request(
+        &self,
+        rs: &crate::engine::request_state::RequestState,
+        no_scratch: bool,
+    ) {
+        rs.announce_request_config(self.max_workers, no_scratch, || self.pool_announcement());
+    }
+
     /// Lower the admission-wait notice threshold, so a test can see
     /// `AdmissionWaitStart/End` without waiting the production five seconds.
     #[cfg(any(test, feature = "test-support"))]
