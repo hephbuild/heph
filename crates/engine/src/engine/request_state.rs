@@ -2287,7 +2287,8 @@ pub type RequestRegistry =
 /// Where the fs plugin's codegen reads report (see
 /// [`hbuiltins::pluginfs::CodegenReport`]): an event goes on the stream of the
 /// request whose id it names, and a key fires once per request. A read with no
-/// request (a BUILD evaluation's `heph.fs.glob`), or one whose request is gone,
+/// request (a source file's `heph.fs.glob`, as the buildfile provider
+/// evaluates it), or one whose request is gone,
 /// emits nothing and dedupes engine-wide.
 ///
 /// Holds the request registry, not the engine: the fs driver that holds this
@@ -2498,7 +2499,7 @@ impl Engine {
     ) -> Arc<RequestState> {
         // A request is past registration by construction (the engine is
         // shared), so every request starts with the function registry sealed —
-        // whichever provider path it takes to a BUILD evaluation.
+        // whichever provider path it takes to a source file's evaluation.
         self.seal_functions();
         // Unique per top-level request. `with_parent`/`with_skip_provider`
         // children share this `RequestStateData` (and thus this id), so a request
