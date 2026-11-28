@@ -57,8 +57,11 @@ rejects it instead of reading a short list as whole, with or without
 - a keep-going walk that left packages it could not evaluate (`query`,
   `inspect labels`, `auth status`, …), the same gaps the text output reports;
 - a `run` that `--fail-fast` stopped before every matched target ended;
-- Ctrl-C, SIGTERM or SIGHUP (a cancel: a cancelled `run` exits 130, as a
-  `--jq` filter it stopped does).
+- a cancel: Ctrl-C, or SIGTERM or SIGHUP on a command that a cancel ends
+  (`run` and every command that can build under the progress view). A
+  cancelled command exits 130, as a `--jq` filter it stopped does.
+  `tool build-lsp` and `log -f` are not cancelled by TERM or HUP: they die of
+  it.
 
 The exit code is non-zero and stderr says why. Piped, the elements printed
 before it are one per line, so a consumer that wants what there was can still
@@ -155,9 +158,10 @@ the document, inside heph: no `jq` needs to be installed.
 | 2 | a bad `--jq` filter, an unknown `--fields` name, or an output flag on a command without JSON (or on a `run` of an entrypoint), all before anything runs; a `--jq` filter that failed while it ran |
 | 130 | Ctrl-C stopped a running `--jq` filter, one that never produces included |
 
-Ctrl-C anywhere else is the command's own cancellation, and keeps the exit
-code the command has without the flags (`run` exits 130); a list it was
-printing is left without its `]`.
+Ctrl-C anywhere else (and SIGTERM or SIGHUP, where they cancel) is the
+command's own cancellation, and keeps the exit code the command has without
+the flags: every command that cancels exits 130, where contract 1 exited 1.
+A list it was printing is left without its `]`.
 
 A `--jq` runtime error is 2 even on the codegen commands, where 1 means
 "findings", so the two never read alike. It wins over the command's own exit
@@ -259,9 +263,8 @@ How the outcome is decided:
   cache hit whose blobs turned out to be gone is rebuilt, and reads as a miss.
 - `failed`: its own run failed, or resolving it did (parse, hash, sandbox).
 - `skipped`: it did not run because a culprit it depends on failed (`root`
-  or `root_file` names it). Skipped records come from a pass over the dependency graph at the
-  end of the request, so they are written once the run returns, after every
-  culprit, and carry `error: null`: the error is on the culprit's record.
+  or `root_file` names it). It carries `error: null`: the error is on the
+  culprit's record.
 - `cancelled`: Ctrl-C, SIGTERM or SIGHUP stopped the run while it was pending.
 
 To find what broke, read the culprits' own records: they are the
@@ -269,30 +272,83 @@ To find what broke, read the culprits' own records: they are the
 names each. On a culprit's record `.path` is how the selection reached it.
 `.root // .root_file` is a skipped record's culprit.
 
+**Skipped records are a closing batch.** They come from one pass over the
+dependency graph at the end of the request, so they are all written once the
+run returns, after every other record. Within the batch the order is:
+
+1. the culprits still waiting to learn whether the selection named them, when
+   the matched set never completed (in the order they failed);
+2. the skipped records, in the order the run gave each target up (its
+   dependency's failure reached it; for a target the walk reported only
+   later, when it was matched).
+
+So every culprit precedes every record naming it. The batch is in completion
+order like the rest of the list, not address order: sort on `.addr` for a
+stable one. A reader that stops at the first failure has read none of the
+skipped records.
+
+**`path`.** A skipped record's `path` is read off the final graph, as is the
+text end report, so it is the same on every run of the same graph. A
+culprit's own record is streamed when it fails, so its `path` is *a shortest
+path known when it failed*: in rare cases, when a shorter route into it was
+discovered after it failed, it differs between runs. For a file culprit, the
+`path` ends at the address that led into the file, the target it would have
+defined and that was not found (`["//a:t", "//c:y", "//d:t"]`). The text box's
+`reached by:` row stops one hop earlier, at the declarer, and adds a row for
+the last edge: `//c:y depends on //d:t, which this file defines`. Its wording,
+the elided middle of a long path included (`… 3 more (--json has the full
+path) …`), is not contract: read `path` here, not the box.
+
+**A broken BUILD file reached by address.** A selection of addresses only
+(`heph run //d:t1 //d:t2`) whose BUILD file does not evaluate gets the file's
+record, `failed`, then a `skipped` record for each address, and a closed list;
+the run exits 1 through the failure path, with the file's failure box.
+Contract 1 reported that as a gap in the selection (a skipped package, the
+list left open). A package selection (`//w/...`) over a package whose BUILD
+does not evaluate still leaves that package a gap.
+
 #### Migrating from contract 1
 
-- `blocked_by` is removed, and the `"blocked"` outcome is now `"skipped"`.
-  `root` (a target) or `root_file` (a file) replaces `blocked_by`, and names
-  the nearest culprit, not the failed dependency at the far end of the chain.
+- `blocked_by` is removed, and the `"blocked"` outcome is now `"skipped"`:
+  a `select(.outcome == "blocked")` matches nothing now, and must become
+  `select(.outcome == "skipped")`. `root` (a target) or `root_file` (a file)
+  replaces `blocked_by`, and names the nearest culprit, not the failed
+  dependency at the far end of the chain.
 - `root`, `root_file`, `more`, `path`, `selected` and `file` are added.
 - A culprit the selector did not match is now written, with
   `selected: false`. A consumer that wants only what it asked for filters on
   `.selected`.
 - A BUILD file that did not evaluate is a record with `addr: null` and `file`
   set. Name a record with `.addr // .file`.
-- Skipped records are written at the end of the request, not as each target
-  is given up, and carry `error: null`.
-- A cancelled run (Ctrl-C, SIGTERM or SIGHUP) exits 130, also when a failure
-  had already failed it.
+- Skipped records are written at the end of the request, as a closing batch,
+  not as each target is given up, and carry `error: null`. A reader that
+  stops early (`first(select(.outcome == "failed"))`, `head -1` on `--jq`)
+  misses them.
+- An address-only selection that hits a BUILD file that does not evaluate
+  fails through the failure path (exit 1, a closed list), where it reported
+  a selection gap.
+- `heph inspect failure --json`'s `addr`, `hashin` and `failed_at` are
+  nullable. Each is always set today; a reader that indexes them must accept
+  `null`.
+- A cancelled command (Ctrl-C, SIGTERM or SIGHUP) exits 130, also when a
+  failure had already failed it. It exited 1. A cancel that `--fail-fast` made
+  after a failure is not a user's, and exits 1.
+- SIGTERM and SIGHUP used to kill heph by the signal (status 143 for TERM,
+  129 for HUP, no summary). For `heph run` and every command that can build
+  under the progress view, they now cancel as Ctrl-C does: the work in flight
+  is cancelled, the summary is printed, and the command exits 130; a second
+  one aborts. `heph tool build-lsp` and `heph log -f`, which a cancel would not
+  end, still die of them.
 
 The exit code is the one the run has without `--json`, and so is everything on
 stderr: failure boxes, the skipped-package report. The list is closed only
 when it is whole: every matched target has its entry, the selector walk
 skipped no package, and the run was not cancelled. A failed target does not
-leave it open; `--fail-fast` stopping the walk, a skipped package and Ctrl-C
-do. A cancelled build run (Ctrl-C, SIGTERM or SIGHUP) exits 130, with or
-without `--json`, and so does one that a failure had already failed. A selector that
-matches nothing prints `[]` and fails as it does without `--json`.
+leave it open; `--fail-fast` stopping the walk, a skipped package and a
+cancel do. A cancelled build run (Ctrl-C, SIGTERM or SIGHUP) exits 130, with
+or without `--json`, and so does one that a failure had already failed. A
+selector that matches nothing prints `[]` and fails as it does without
+`--json`.
 
 When the list cannot be printed whole for a reason of its own:
 
