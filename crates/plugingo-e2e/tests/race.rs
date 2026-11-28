@@ -68,8 +68,8 @@ async fn race_detects_a_real_data_race() -> anyhow::Result<()> {
 /// Strings that only a ThreadSanitizer report produces, any one of which proves
 /// the binary was instrumented and fired.
 ///
-/// It has to be a set rather than one line, because all we get is the **last 10
-/// lines** of the process log (`Engine::DEFAULT_LOG_TAIL_LINES`) and which part
+/// It has to be a set rather than one line, because all we get is the **last
+/// lines** of the process log (`Engine::DEFAULT_LOG_TAIL_LINES`, once 10) and which part
 /// of the report lands in that window varies with how deep the goroutine stacks
 /// in the final report happen to be — deeper stacks on a CI runner pushed
 /// `race detected during execution of test` out of it, failing this test while

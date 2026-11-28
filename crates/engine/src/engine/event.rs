@@ -74,6 +74,9 @@ pub struct ErrorDetail {
     /// learns whether the log can be read. Paths and clones off the slot on
     /// the chain, no IO.
     pub left_behind: Option<hcore::events::LeftBehindData>,
+    /// The run's output streamed to a terminal (the slot's, or the recorded
+    /// failure's, on the chain): carried on `ResultEnd`'s log tail.
+    pub streamed: bool,
 }
 
 impl ErrorDetail {
@@ -92,6 +95,7 @@ impl ErrorDetail {
             message: hcore::hmemoizer::chain_message(e),
             cancelled: hplugin::error::is_cancelled(e),
             kept: slot.is_some(),
+            streamed: crate::engine::failure_slot::RunStreamed::on(e),
             left_behind: slot.map(|s| {
                 hplugin::error::left_behind(
                     s.log.as_ref(),
@@ -108,9 +112,11 @@ impl ErrorDetail {
                 && let Some(t) = cause.downcast_ref::<TargetFailure>()
                 && let Some(tail) = &t.log_tail
             {
+                d.streamed |= t.streamed;
                 d.log_tail = Some(hcore::events::LogTailData {
                     text: tail.text.clone(),
                     start_line: tail.start_line,
+                    streamed: d.streamed,
                 });
             }
         }
@@ -161,23 +167,23 @@ impl ErrorDetail {
     /// The log tail `ResultEnd` carries: the recorded failure's, or else the
     /// last lines of the failure slot's log — one seek-based read bounded by
     /// the request's `--log-lines`, the same read the recorded failure makes.
-    /// None for an interactive target, whose output already went straight to
-    /// the terminal (as `classify_failure` drops it from the box).
+    /// Kept whether or not the output streamed to a terminal (D6.1):
+    /// `streamed` rides on it, and a renderer decides what to show.
     pub fn result_log_tail(
         log_tail: Option<hcore::events::LogTailData>,
         log: Option<&hplugin::error::FailureLog>,
-        interactive: bool,
+        streamed: bool,
     ) -> Option<hcore::events::LogTailData> {
-        if interactive {
-            return None;
-        }
-        log_tail.or_else(|| {
+        let mut tail = log_tail.or_else(|| {
             let tail = log?.tail().ok()?;
             Some(hcore::events::LogTailData {
                 text: tail.text,
                 start_line: tail.start_line,
+                streamed: false,
             })
-        })
+        })?;
+        tail.streamed |= streamed;
+        Some(tail)
     }
 }
 

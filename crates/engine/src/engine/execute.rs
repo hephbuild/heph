@@ -6,7 +6,7 @@ use crate::engine::link::{self, LinkedTargetDef, LinkedTargetDefInput};
 use crate::engine::provider::TargetSpec;
 use crate::engine::request_state::RequestState;
 use crate::engine::result::{OutputMatcher, ResultOptions};
-use crate::engine::{Engine, InteractiveInner, InteractiveWrapper};
+use crate::engine::{Engine, InteractiveInner, InteractiveWrapper, TerminalUse};
 use anyhow::Context;
 use async_recursion::async_recursion;
 use enclose::enclose;
@@ -41,6 +41,10 @@ pub(crate) struct Executed {
     /// The live log's guard: held until the entry that replaces it is
     /// written, then dropped to unlink it.
     pub live_log: Option<crate::engine::run_log::LiveGuard>,
+    /// The run's output reached a terminal: a failure past the run (hashing
+    /// its outputs, their host paths) carries it on its slot, so its box
+    /// leaves out the tail the user already saw.
+    pub streamed: bool,
 }
 
 impl Engine {
@@ -291,7 +295,10 @@ impl Engine {
                 // Past it the driver was called, and a managed one has made
                 // its tree.
                 let had_sandbox = managed && ran.is_ok();
-                let run = ran.and_then(|ran| ran.stage(Boundary::Run, addr));
+                // Whether the run's output reached a terminal: what a failure
+                // box reads to leave out a tail the user already saw (D6.1).
+                let streamed = ran.as_ref().is_ok_and(|(_, t)| t.streamed);
+                let run = ran.and_then(|(ran, _)| ran.stage(Boundary::Run, addr));
                 // End the live log while the sandbox still exists: a log the
                 // driver returned as an artifact is read from it.
                 let (run, live) = match live {
@@ -408,7 +415,8 @@ impl Engine {
                                 }
                                 None => self.failure_slots.fill(fill).await,
                             }
-                            .with_sandbox(fate);
+                            .with_sandbox(fate)
+                            .with_streamed(streamed);
                             Some((slot, write_back.error))
                         };
                         // Not `complete`: a failed run handed over no bridge
@@ -495,19 +503,21 @@ impl Engine {
                     sandbox_teardown,
                     res.sandbox_guards,
                     live,
+                    streamed,
                 ))
             },
         )
         .await;
         htelemetry::telemetry::record_execute_ms(exec_started.elapsed().as_millis() as u64);
         res.map(
-            |(artifacts, host_paths, teardown, sandbox_guards, live_log)| Executed {
+            |(artifacts, host_paths, teardown, sandbox_guards, live_log, streamed)| Executed {
                 artifacts,
                 host_paths,
                 teardown,
                 sandbox_guards,
                 execute_guard,
                 live_log,
+                streamed,
             },
         )
     }
@@ -696,7 +706,9 @@ impl Engine {
     /// run (preparing the sandbox, credentials, the wrapper); the inner one is
     /// the driver's `run` itself. An invocation reads a process exit off the
     /// inner one only, so a dep's or a credential source's `ProcessFailed`
-    /// further out can never pass for the tool's own exit.
+    /// further out can never pass for the tool's own exit. Beside the inner
+    /// result, what the wrapper did with the terminal: whether the run's
+    /// output streamed to one.
     ///
     /// The lease decides what "prepare" means; resolving it after the run —
     /// reclaim, keep on disk, complete — stays with the caller, which
@@ -708,7 +720,7 @@ impl Engine {
         addr: &Addr,
         lease: SandboxLease<'_>,
         run: SandboxRun,
-    ) -> anyhow::Result<anyhow::Result<RunResponse>> {
+    ) -> anyhow::Result<(anyhow::Result<RunResponse>, TerminalUse)> {
         let SandboxRun {
             driver,
             target,
@@ -756,7 +768,10 @@ impl Engine {
         }
         let exec_wrapper: InteractiveWrapper = wrapper.unwrap_or_else(|| {
             Arc::new(|inner: InteractiveInner| {
-                Box::pin(async move { inner(None, None, None, None).await })
+                Box::pin(async move {
+                    inner(None, None, None, None).await?;
+                    Ok(TerminalUse::default())
+                })
             })
         });
 
@@ -869,11 +884,13 @@ impl Engine {
         ));
 
         hcore::hmemoizer::set_phase("execute:driver_run");
-        exec_wrapper(inner).await.stage(Boundary::Run, addr)?;
+        let terminal = exec_wrapper(inner).await.stage(Boundary::Run, addr)?;
 
         hcore::hmemoizer::set_phase("execute:oneshot_rx");
-        rx.await
-            .map_err(|_recv_err| anyhow::anyhow!("wrapper never invoked inner"))
+        let res = rx
+            .await
+            .map_err(|_recv_err| anyhow::anyhow!("wrapper never invoked inner"))?;
+        Ok((res, terminal))
     }
 
     pub(crate) async fn inputs_result_exec(

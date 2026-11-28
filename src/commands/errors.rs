@@ -9,12 +9,12 @@ use std::sync::Arc;
 
 use crossterm::style::Stylize;
 
-use crate::engine::error::{CancelledError, FrozenCheckError, TargetFailure};
+use crate::engine::error::{CancelledError, FrozenCheckError, LogTail, TargetFailure};
 use crate::hmemoizer::{chain_frames, downcast_chain_ref};
 use crate::tui::color::stderr_color_enabled as color_enabled;
-use crate::tui::failure_rows::left_behind_rows;
+use crate::tui::failure_rows::{left_behind_rows, tail_rows};
 use crate::tui::session::SessionSlot;
-use crate::tui::text::{Redact, WorkspaceRel, message};
+use crate::tui::text::{Redact, WorkspaceRel, clean_inline, escape_log_tail, message};
 
 mod report;
 pub use report::ReportContext;
@@ -33,14 +33,45 @@ fn cause_chain(source: &anyhow::Error) -> String {
 /// `color`: border + `[log]` white, line numbers dim. Line numbers start at
 /// `start_line` — the real position of the first shown line in the full log — so
 /// the last 10 lines of a 100-line log read 91–100, not 1–10.
+///
+/// What is shown is [`tail_rows`]'s, as in every failure box (D6.1): a tail
+/// that streamed to a terminal is a pointer line and no box, a log with no
+/// line is `(no output)`, and a tail that starts past line 1 opens with the
+/// earlier-lines row. Its lines go through [`escape_log_tail`] (D6.1b).
 /// ```text
-///   ╭─▶[log]
-///   91 │  line one
-///   92 │  line two
-///   ╰────
+///      ╭─[log]
+///      │ … 90 earlier lines
+///   91 │ line one
+///   92 │ line two
+///      ╰────
 /// ```
-fn render_log_box(out: &mut String, log: &str, start_line: usize, color: bool) {
-    let lines: Vec<&str> = log.lines().collect();
+///
+/// [`tail_rows`]: crate::tui::failure_rows::tail_rows
+/// [`escape_log_tail`]: crate::tui::text::escape_log_tail
+fn render_log_box(out: &mut String, f: &TargetFailure, tail: &LogTail, color: bool) {
+    let shown = tail_rows(
+        &f.addr.format(),
+        &tail.text,
+        tail.start_line,
+        f.streamed,
+        f.points_at_log(),
+        usize::MAX,
+    );
+    let note = shown.note.as_deref().map(clean_inline);
+    if shown.shown.is_empty() {
+        if let Some(note) = note {
+            let note = if color {
+                note.dim().to_string()
+            } else {
+                note.into_owned()
+            };
+            out.push_str(&format!("  {note}\n"));
+        }
+        return;
+    }
+    let escaped = escape_log_tail(shown.shown, color);
+    let start_line = shown.first_line;
+    let lines: Vec<&str> = escaped.lines().collect();
     // Width is driven by the largest (last) line number, not the line count.
     let last_no = start_line + lines.len().saturating_sub(1);
     let width = last_no.to_string().len();
@@ -52,6 +83,13 @@ fn render_log_box(out: &mut String, log: &str, start_line: usize, color: bool) {
         out.push_str(&format!("  {pad}{}\n", "╭─[log]".white()));
     } else {
         out.push_str(&format!("  {pad}╭─[log]\n"));
+    }
+    if let Some(note) = note {
+        if color {
+            out.push_str(&format!("  {pad}{} {}\n", "│".white(), note.dim()));
+        } else {
+            out.push_str(&format!("  {pad}│ {note}\n"));
+        }
     }
     for (i, line) in lines.iter().enumerate() {
         let num = format!("{:>width$}", start_line + i, width = width);
@@ -156,7 +194,7 @@ fn render_target_failure_in(f: &TargetFailure, color: bool, rel: &WorkspaceRel) 
         None => f.log_tail.clone(),
     };
     if let Some(log) = &tail {
-        render_log_box(&mut out, &log.text, log.start_line, color);
+        render_log_box(&mut out, f, log, color);
     }
     // The rows the line backend's live block ends with too, from the one
     // function both call, so the two cannot word them differently.
@@ -1661,6 +1699,49 @@ mod tests {
         );
     }
 
+    /// D6.1 in the CI box: a tail that streamed to a terminal is the pointer
+    /// line and no `[log]` box; a tail past line 1 opens with the
+    /// earlier-lines row and numbers its lines from the log; control bytes
+    /// are shown escaped (D6.1b).
+    #[test]
+    fn streamed_failure_box_shows_pointer_not_tail() {
+        use crate::engine::error::LogTail;
+        let addr = crate::htaddr::parse_addr("//p:t").expect("addr");
+        let failure = |streamed| {
+            TargetFailure::new(
+                addr.clone(),
+                Some(LogTail {
+                    text: "secret\x1b[?25l\nlast\n".into(),
+                    start_line: 9,
+                }),
+                anyhow::anyhow!("boom"),
+            )
+            .with_streamed(streamed)
+        };
+        // No log `heph log` can open: the pointer names no command.
+        let unreadable = render_failures_to_string(&[Arc::new(failure(true))], false);
+        assert!(
+            unreadable.contains("  (output not shown here: 10 lines)\n"),
+            "{unreadable}"
+        );
+        let streamed =
+            render_failures_to_string(&[Arc::new(failure(true).with_log_readable(true))], false);
+        assert!(
+            streamed.contains("  (output not shown here: 10 lines · heph log //p:t)\n"),
+            "{streamed}"
+        );
+        assert!(!streamed.contains("secret"), "{streamed}");
+        assert!(!streamed.contains("[log]"), "{streamed}");
+
+        let shown = render_failures_to_string(&[Arc::new(failure(false))], false);
+        assert!(
+            shown.contains(
+                "     ╭─[log]\n     │ … 8 earlier lines\n   9 │ secret\\x1b[?25l\n  10 │ last\n"
+            ),
+            "{shown}"
+        );
+    }
+
     /// I8: the CI box gains `log: heph log <addr>` as its very last line,
     /// after the fixes, exactly where a `full log:` line is printed; a
     /// failure with no kept log (its tail in memory only) gets none.
@@ -2039,6 +2120,7 @@ mod tests {
 × target failed: //simple_fail:d1
 ╰─▶ boom
       ╭─[log]
+      │ … 97 earlier lines
    98 │ line98
    99 │ line99
   100 │ boom

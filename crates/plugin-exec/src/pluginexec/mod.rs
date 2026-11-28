@@ -1264,8 +1264,14 @@ impl SinkLoss {
 /// case. Merging the two streams into a single receiver makes fairness
 /// automatic rather than something the scheduler has to arrange.
 ///
-/// It also fixes `log.txt`: chunks are now appended in true arrival order
-/// instead of one stream's entire output followed by the other's.
+/// It also keeps `log.txt` from holding one stream's entire output followed by
+/// the other's: chunks are appended in the order this loop receives them. That
+/// is **not** the order the child wrote them in. The two pipes are drained by
+/// two threads, so each stream keeps its own order, but which of two chunks
+/// written close together on different streams lands first is a race: a
+/// compiler's `error:` line on stderr can land after the summary it printed
+/// on stdout. Keeping the streams apart is deliberate (error-reporting spec,
+/// U18); `docs/EXEC_RUNNERS.md` documents the interleaving.
 ///
 /// **Absorption is timed.** The child is throttled whenever this loop is
 /// slower than the child writes — on macOS by the bounded drain channel, on

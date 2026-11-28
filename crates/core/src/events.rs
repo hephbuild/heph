@@ -836,12 +836,18 @@ pub struct SelectionGapExample {
 /// serde derives, and `crates/plugin` depends on this crate, not the reverse.
 /// `hcore` is deliberately the lowest crate so the TUI and telemetry need no
 /// engine or plugin dependency to read events.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LogTailData {
     pub text: String,
     /// 1-based line number of `text`'s first line within the full log, so a
     /// renderer can show true file positions rather than renumbering from 1.
     pub start_line: usize,
+    /// The target's output reached a terminal while it ran, so the user saw
+    /// it there: a renderer leaves `text` out of the box and points at the
+    /// log. The tail is carried all the same. Absent on the wire when false,
+    /// so an older reader and an older stream both mean "not streamed".
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub streamed: bool,
 }
 
 /// One output group of a finished target, carried on `ResultOutputs`.
@@ -1963,6 +1969,7 @@ mod tests {
                 log_tail: Some(LogTailData {
                     text: "FAIL".into(),
                     start_line: 88,
+                    streamed: false,
                 }),
                 timed_out: Some(TimedOutData {
                     timeout_ms: 600_000,
@@ -2111,6 +2118,35 @@ mod tests {
                 ]
             ),
             "{old:?}"
+        );
+    }
+
+    /// `LogTailData.streamed` is absent from the wire when false (a tail that
+    /// did not stream encodes as before it existed), read back when true, and
+    /// false in a tail from a host that predates it.
+    #[test]
+    fn log_tail_streamed_is_additive() {
+        let tail = |streamed: bool| {
+            serde_json::to_string(&LogTailData {
+                text: "boom\n".into(),
+                start_line: 3,
+                streamed,
+            })
+            .expect("encode")
+        };
+        assert_eq!(tail(false), r#"{"text":"boom\n","start_line":3}"#);
+        let set = tail(true);
+        assert_eq!(set, r#"{"text":"boom\n","start_line":3,"streamed":true}"#);
+        let read = |s: &str| serde_json::from_str::<LogTailData>(s).expect("decode");
+        assert!(read(&set).streamed);
+        let older = read(r#"{"text":"boom\n","start_line":3}"#);
+        assert_eq!(
+            older,
+            LogTailData {
+                text: "boom\n".into(),
+                start_line: 3,
+                streamed: false,
+            }
         );
     }
 

@@ -28,10 +28,10 @@ use crate::engine::error::{
 };
 use crate::engine::request_state::TookDown;
 use crate::hmemoizer::downcast_chain_ref;
-use crate::tui::failure_rows::{FIXES_SHOWN, shell_quote};
+use crate::tui::failure_rows::{FIXES_SHOWN, log_line_count, shell_quote, tail_rows};
 use crate::tui::text::{
-    Redact, WorkspaceRel, clean_inline, cut_right, expand_tabs, fit_styled, message, sanitize_log,
-    sanitize_log_keep_sgr,
+    Redact, WorkspaceRel, clean_inline, cut_right, escape_log_tail, expand_tabs, fit_styled,
+    message, sanitize_log,
 };
 
 /// How many kept `failure_out` groups a block names before `+N more`.
@@ -184,21 +184,28 @@ impl ReportContext {
                     .map(|l| self.cut_row(l)),
             );
         }
-        match &block.tail {
-            Some((text, _)) if text.trim().is_empty() => body.push("empty log".to_owned()),
-            // In colour, the target's own SGRs stay (I13's exception, user
-            // decision 2026-11-16); heph adds none.
-            Some((text, _)) if color => body.extend(
-                sanitize_log_keep_sgr(text.as_bytes())
-                    .lines()
-                    .map(|l| self.cut_styled_row(l)),
-            ),
-            Some((text, _)) => body.extend(
-                sanitize_log(text.as_bytes())
-                    .lines()
-                    .map(|l| self.cut_row(&self.redact.apply(l))),
-            ),
-            None => {}
+        if let Some((text, start)) = &block.tail {
+            // The pointer, `(no output)` or the earlier-lines row, worded once
+            // for every box (D6.1); the tail is already `--log-lines` long.
+            let shown = tail_rows(
+                &addr,
+                text,
+                *start,
+                f.streamed,
+                f.points_at_log(),
+                usize::MAX,
+            );
+            if let Some(note) = &shown.note {
+                body.push(paint(&self.cut_row(&clean_inline(note)), Tone::Dim, color));
+            }
+            // Control bytes shown escaped; in colour, the target's own SGRs
+            // stay (D6.1b); heph adds none.
+            let escaped = escape_log_tail(shown.shown, color);
+            if color {
+                body.extend(escaped.lines().map(|l| self.cut_styled_row(l)));
+            } else {
+                body.extend(escaped.lines().map(|l| self.cut_row(&self.redact.apply(l))));
+            }
         }
 
         let td = &block.took_down;
@@ -259,7 +266,7 @@ impl ReportContext {
             let lines = block
                 .tail
                 .as_ref()
-                .map(|(text, start)| start.saturating_sub(1) + text.lines().count());
+                .map(|(text, start)| log_line_count(text, *start));
             let mut value = vec![(format!("heph log {}", shell_quote(&addr)), Tone::Bold)];
             if let Some(lines) = lines {
                 value.push((
@@ -599,10 +606,9 @@ mod tests {
     }
 
     /// In colour, a tail line keeps the target's own SGRs and ends with a
-    /// reset; every other escape still goes, a long line is cut by its text,
-    /// and a line naming heph's home is redacted and loses its colours.
-    /// Without colour, the tail is what it always was: no escape at all.
-    /// With every escape taken off, the coloured report is the plain one.
+    /// reset; every other escape is shown escaped (D6.1b), a long line is cut
+    /// by its text, and a line naming heph's home is redacted and loses its
+    /// colours. Without colour, the SGRs are shown escaped too: no ESC at all.
     #[test]
     fn report_tail_keeps_target_colours_only_in_colour() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -620,8 +626,13 @@ mod tests {
         let colored = report_in(vec![failure()], &[], true);
 
         assert!(!plain.contains('\x1b'), "{plain:?}");
-        assert!(plain.contains("  │ error: bad\n"), "{plain:?}");
-        assert!(plain.contains("  │ cleared z\n"), "{plain:?}");
+        // Without colour an SGR is shown escaped, like every other control.
+        assert!(
+            plain.contains("  │ \\x1b[31merror: bad\\x1b[0m\n"),
+            "{plain:?}"
+        );
+        let shown = "\\x1b[2Jcleared\\x1b[H \\x1b]52;c;aGk=\\x07\\u{9b}31mz";
+        assert!(plain.contains(&format!("  │ {shown}\n")), "{plain:?}");
 
         let bar = "│".dim();
         assert!(
@@ -629,7 +640,7 @@ mod tests {
             "{colored:?}"
         );
         assert!(
-            colored.contains(&format!("  {bar} cleared z\n")),
+            colored.contains(&format!("  {bar} {shown}\n")),
             "{colored:?}"
         );
         assert!(colored.contains(&format!("  {bar} plain\n")), "{colored:?}");
@@ -656,15 +667,26 @@ mod tests {
             );
         }
         assert!(!colored.contains('\u{9b}'), "{colored:?}");
+    }
 
-        let stripped: String = colored
-            .split_inclusive('\n')
-            .map(|l| {
-                let (line, nl) = l.strip_suffix('\n').map_or((l, ""), |s| (s, "\n"));
-                format!("{}{nl}", clean_inline(line))
-            })
-            .collect();
-        assert_eq!(stripped, plain);
+    /// D6.1: a target whose output streamed to a terminal gets its box, with
+    /// the pointer in place of its tail, N counted from the log; one that
+    /// printed nothing says so.
+    #[test]
+    fn streamed_failure_report_shows_pointer_not_tail() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = exited(dir.path(), "//p:t", &["secret one", "two"], 10).with_streamed(true);
+        let out = report(vec![f], &[]);
+        assert!(out.contains("✗ //p:t · exit status: 101\n"), "{out}");
+        assert!(
+            out.contains("  │ (output not shown here: 2 lines · heph log //p:t)\n"),
+            "{out}"
+        );
+        assert!(!out.contains("secret one"), "{out}");
+
+        let f = exited(dir.path(), "//p:e", &[], 10).with_streamed(true);
+        let out = report(vec![f], &[]);
+        assert!(out.contains("  │ (no output)\n"), "{out}");
     }
 
     /// One root with what it took down and a capped tail, then a second
@@ -707,6 +729,7 @@ mod tests {
         assert_eq!(
             out,
             "\n✗ //crates/engine:test · exit status: 101\
+             \n  │ … 2 earlier lines\
              \n  │ ---- stale stdout ----\
              \n  │ panicked\
              \n  │ FAILED\
@@ -735,32 +758,37 @@ mod tests {
         assert!(out.contains("heph log //p:short (1 line)"), "{out}");
     }
 
-    /// I13 for the report tail: each row of the log-text adversarial table
-    /// leaves no control byte in the report, CR keeps the last segment,
-    /// tabs expand, invalid UTF-8 shows U+FFFD, a long line is cut to the
-    /// width by display width, and an empty log says so.
+    /// D6.1b for the report tail (it superseded I13's strip there): each row
+    /// of the log-text adversarial table leaves no control byte in the
+    /// report, each shown escaped instead (`\r`, `\x1b`), tabs expand,
+    /// invalid UTF-8 shows U+FFFD, a long line is cut to the width by
+    /// display width, and a log with no line says `(no output)`.
     #[test]
     fn control_bytes_never_reach_terminal_report_tail() {
         let long = "é".repeat(1 << 20);
         let cases: Vec<(&str, Vec<u8>, &str)> = vec![
-            ("empty", b"".to_vec(), "│ empty log"),
-            ("blank lines", b"\n\n\n".to_vec(), "│ empty log"),
+            ("empty", b"".to_vec(), "│ (no output)"),
+            ("blank lines", b"\n\n\n".to_vec(), "│ \n  │ \n  │ \n"),
             ("no newline", b"last".to_vec(), "│ last"),
             ("crlf", b"a\r\nb\r\n".to_vec(), "│ a\n  │ b"),
-            ("cr progress", b"10%\r20%\r30%\n".to_vec(), "│ 30%"),
+            (
+                "cr progress",
+                b"10%\r20%\r30%\n".to_vec(),
+                "│ 10%\\r20%\\r30%",
+            ),
             (
                 "alt screen",
                 b"x\x1b[?1049l\x1b[?1003h\x1b[2Jy\n".to_vec(),
-                "│ xy",
+                "│ x\\x1b[?1049l\\x1b[?1003h\\x1b[2Jy",
             ),
             (
                 "osc",
                 b"\x1b]8;;http://e\x07link\x1b]8;;\x07 \x1b]52;c;aGk=\x07z\n".to_vec(),
-                "│ link z",
+                "│ \\x1b]8;;http://e\\x07link\\x1b]8;;\\x07 \\x1b]52;c;aGk=\\x07z",
             ),
-            ("lone csi", "a\u{9b}b\n".as_bytes().to_vec(), "│ a"),
+            ("lone csi", "a\u{9b}b\n".as_bytes().to_vec(), "│ a\\u{9b}b"),
             ("invalid utf8", b"a\xffb\n".to_vec(), "│ a\u{fffd}b"),
-            ("nul", b"a\0b\n".to_vec(), "│ ab"),
+            ("nul", b"a\0b\n".to_vec(), "│ a\\x00b"),
             ("tabs", b"a\tb\n".to_vec(), "│ a       b"),
             ("long", long.as_bytes().to_vec(), "…"),
             ("cut mid utf8", b"\xc3".to_vec(), "│ \u{fffd}"),

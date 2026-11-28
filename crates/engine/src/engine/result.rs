@@ -1620,8 +1620,19 @@ pub type InteractiveInner = Box<
         + Send,
 >;
 
+/// What an [`InteractiveWrapper`] reports about the run it wrapped.
+///
+/// `streamed` is a fact about the bytes, never about the target: the wrapper
+/// wrote at least one byte of the target's output to a terminal. A target
+/// that printed nothing, or whose output went to a file or a pipe, did not
+/// stream, however it was requested (D6.1). It reaches no hash (E9).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TerminalUse {
+    pub streamed: bool,
+}
+
 pub type InteractiveWrapper = Arc<
-    dyn Fn(InteractiveInner) -> futures::future::BoxFuture<'static, anyhow::Result<()>>
+    dyn Fn(InteractiveInner) -> futures::future::BoxFuture<'static, anyhow::Result<TerminalUse>>
         + Send
         + Sync,
 >;
@@ -2114,9 +2125,14 @@ async fn pull_one_remote_blob(
 /// The full freshly-produced artifact set of an executing [`LockedResolution`]
 /// cell (every output group), shared across all `(outputs, is_top)` callers and
 /// filtered per caller by [`build_eresult`].
-struct ExecutedArtifacts {
+#[derive(Clone)]
+pub(crate) struct ExecutedArtifacts {
     cached: Vec<ResultArtifact>,
     meta: Vec<ArtifactMeta>,
+    /// The run wrote some of its output to the user's terminal (D6.1). A
+    /// failure after the memoized execute, the codegen write-back, records it
+    /// from here, as the cache store records it inside. Reaches no hash (E9).
+    streamed: bool,
 }
 
 /// Whether a transparent target's inputs name exactly one distinct member addr.
@@ -2163,15 +2179,12 @@ fn shell_target_without_terminal(rs: &RequestState) -> Option<ShellNeedsSingleTa
 
 /// Whether this frame actually receives the terminal. The one rule: the
 /// terminal chokepoint in `inner_result_addr` hands out `ExecuteOptions` from
-/// it, and `classify_failure` reads it to decide that a target's output already
-/// streamed and its captured log tail is redundant.
+/// it.
 ///
 /// `opts.interactive` alone answers the wrong question once `--shell=ADDR` is
 /// in play: the terminal is then the request's, and only the named addr gets
-/// it. Believing `opts` in `classify_failure` says a silent target streamed,
-/// which drops the process-log tail of a failing one and renders an empty
-/// failure box — the regression #225 fixed for group members, re-entered
-/// through the other door.
+/// it. It decides who *gets* the terminal, never whether output reached it:
+/// that is the wrapper's [`TerminalUse`], recorded from the bytes it wrote.
 fn frame_gets_terminal(rs: &RequestState, addr: &Addr, opts: &ResultOptions) -> bool {
     match rs.shell_target() {
         Some(target) => target.addr == *addr,
@@ -2188,13 +2201,8 @@ fn frame_gets_terminal(rs: &RequestState, addr: &Addr, opts: &ResultOptions) -> 
 ///
 /// Every collateral hop replaces (never wraps) its incoming error with a fresh
 /// `UpstreamFailed`, so chain depth stays O(1) on any graph.
-fn classify_failure(
-    rs: &RequestState,
-    addr: &Addr,
-    interactive: bool,
-    e: anyhow::Error,
-) -> anyhow::Error {
-    classify_failure_fresh(rs, addr, interactive, e).0
+fn classify_failure(rs: &RequestState, addr: &Addr, e: anyhow::Error) -> anyhow::Error {
+    classify_failure_fresh(rs, addr, e).0
 }
 
 /// [`classify_failure`], also saying whether this call recorded the failure:
@@ -2203,7 +2211,6 @@ fn classify_failure(
 fn classify_failure_fresh(
     rs: &RequestState,
     addr: &Addr,
-    interactive: bool,
     e: anyhow::Error,
 ) -> (anyhow::Error, bool) {
     match failure_fate(addr, &e) {
@@ -2215,18 +2222,16 @@ fn classify_failure_fresh(
 
     // This target's own failure (or an aggregation of unrecorded causes): record
     // the rich diagnostic once (first-writer-wins) and propagate a cheap marker.
-    // Interactive targets stream their output straight to the user's terminal as
-    // they run, so the captured log tail is redundant — drop it from the box.
-    let log = if interactive {
-        None
-    } else {
-        failure_slot_log(&e)
-    };
+    // The log and its tail are always kept (D6.1): whether the output already
+    // streamed to the user's terminal is recorded beside them, from what the
+    // wrapper wrote, and each renderer decides what to show.
+    let log = failure_slot_log(&e);
     let log_tail = log.as_ref().and_then(|l| l.tail().ok());
     let outputs = failure_slot_out(&e);
     let slot = downcast_chain_ref::<crate::engine::failure_slot::FailureSlot>(&e);
     let fixes = slot.and_then(|s| s.fixes.clone());
     let sandbox = slot.and_then(|s| s.sandbox.clone());
+    let streamed = crate::engine::failure_slot::RunStreamed::on(&e);
     let fresh = rs.record_failure(
         addr.clone(),
         Arc::new(
@@ -2234,7 +2239,8 @@ fn classify_failure_fresh(
                 .with_log(log)
                 .with_outputs(outputs)
                 .with_fixes(fixes)
-                .with_sandbox(sandbox),
+                .with_sandbox(sandbox)
+                .with_streamed(streamed),
         ),
     );
     (UpstreamFailed { root: addr.clone() }.into(), fresh)
@@ -2252,7 +2258,6 @@ fn result_end_event(
     addr: String,
     error: Option<crate::engine::event::ErrorDetail>,
     upstream_of: Option<String>,
-    interactive: bool,
     log_readable: Option<bool>,
 ) -> crate::engine::event::BuildEventKind {
     match error {
@@ -2275,11 +2280,11 @@ fn result_end_event(
                 log_tail: crate::engine::event::ErrorDetail::result_log_tail(
                     d.log_tail,
                     d.log.as_ref(),
-                    interactive,
+                    d.streamed,
                 ),
                 timed_out: d.timed_out,
                 cancelled,
-                left_behind: left_behind(d.left_behind, log_readable, interactive),
+                left_behind: left_behind(d.left_behind, log_readable),
             }
         }
         None => crate::engine::event::BuildEventKind::ResultEnd {
@@ -2386,20 +2391,16 @@ fn failure_fate<'a>(addr: &Addr, e: &'a anyhow::Error) -> FailureFate<'a> {
 }
 
 /// `ResultEnd`'s `left_behind`: what the failure slot holds, plus whether the
-/// log can be read when that was asked. The log's path is left out for an
-/// interactive target, as [`classify_failure`] leaves it out of the box.
+/// log can be read when that was asked. The log's path is kept whether or not
+/// the output streamed: a streamed box points at it (D6.1).
 fn left_behind(
     slot: Option<hcore::events::LeftBehindData>,
     log_readable: Option<bool>,
-    interactive: bool,
 ) -> Option<Box<hcore::events::LeftBehindData>> {
     if slot.is_none() && log_readable.is_none() {
         return None;
     }
     let mut left = slot.unwrap_or_default();
-    if interactive {
-        left.log_path = None;
-    }
     left.log_readable = log_readable;
     Some(Box::new(left))
 }
@@ -2484,12 +2485,11 @@ impl Engine {
         self: &Arc<Self>,
         rs: &RequestState,
         addr: &Addr,
-        interactive: bool,
         e: anyhow::Error,
     ) -> anyhow::Error {
         let detail = matches!(failure_fate(addr, &e), FailureFate::Own)
             .then(|| crate::engine::event::ErrorDetail::from_error(&e));
-        let (e, fresh) = classify_failure_fresh(rs, addr, interactive, e);
+        let (e, fresh) = classify_failure_fresh(rs, addr, e);
         if let Some(detail) = detail
             && fresh
         {
@@ -2503,7 +2503,6 @@ impl Engine {
                 addr_str,
                 Some(detail),
                 None,
-                interactive,
                 Some(readable),
             ));
         }
@@ -2583,9 +2582,7 @@ impl Engine {
         let def = match Arc::clone(&self).get_def_no_track(rs.clone(), addr).await {
             Ok(def) => def,
             Err(e) => {
-                let e = self
-                    .fail_unscoped(&rs, addr, frame_gets_terminal(&rs, addr, opts), e)
-                    .await;
+                let e = self.fail_unscoped(&rs, addr, e).await;
                 return Err(surface_top(is_top, &rs, e));
             }
         };
@@ -2687,9 +2684,7 @@ impl Engine {
                 match crate::engine::fanout::join_all_failable(futures, rs.fail_fast()).await {
                     Ok(results) => results,
                     Err(e) => {
-                        let e = self
-                            .fail_unscoped(&rs, addr, frame_gets_terminal(&rs, addr, &opts), e)
-                            .await;
+                        let e = self.fail_unscoped(&rs, addr, e).await;
                         return Err(surface_top(is_top, &rs, e));
                     }
                 };
@@ -2724,7 +2719,6 @@ impl Engine {
         // cache (keyed by hashin, not is_top) so it costs a re-filter, not a
         // re-execute. Collapsing it is a separate simplification.
         let key = (AddrKey(addr.clone()), key_outputs, is_top);
-        let interactive = frame_gets_terminal(&rs, addr, opts);
         let opts = opts.clone();
         // Filled only if this call creates the cell: the read the computation
         // ran under, passed beside the memoized value rather than inside it.
@@ -2740,7 +2734,7 @@ impl Engine {
                             *handoff.lock() = read;
                             Ok(Arc::new(v))
                         }
-                        Err(e) => Err(classify_failure(&rs, &addr, interactive, e)),
+                        Err(e) => Err(classify_failure(&rs, &addr, e)),
                     }
                 }),
             )
@@ -2756,7 +2750,7 @@ impl Engine {
                     // A failed claim (the revision changed under a lapsed read,
                     // a cancelled re-acquire) is this addr's failure, classified
                     // like the computation's own.
-                    surface_top(is_top, &rs, classify_failure(&rs, addr, interactive, e))
+                    surface_top(is_top, &rs, classify_failure(&rs, addr, e))
                 })
             }
             Err(e) => Err(surface_top(is_top, &rs, e)),
@@ -3270,7 +3264,6 @@ impl Engine {
         opts: &ResultOptions,
     ) -> anyhow::Result<(MemoResult, Option<Arc<ResultReadGuard>>)> {
         let addr_str = addr.format();
-        let interactive = opts.interactive.is_some();
         let end_rs = Arc::clone(&rs);
         // Whether `heph log` would find this target's log, asked when its own
         // failure ends the scope: `ResultEnd` carries the answer, so a
@@ -3299,7 +3292,6 @@ impl Engine {
                     addr_str,
                     error,
                     end_upstream.get().cloned(),
-                    interactive,
                     end_readable.get().copied(),
                 )
             },
@@ -3621,10 +3613,14 @@ impl Engine {
             (Some(slot), None) if !outputs.is_empty() => Some(slot.hold(&self, &rs).await?),
             _ => None,
         };
-        let (cached, meta): (Vec<ResultArtifact>, Vec<ArtifactMeta>) = match &locked.executed {
+        // `streamed`: whether the run this caller's artifacts came from wrote to
+        // the terminal. False on a hit, which ran nothing.
+        let (cached, meta, streamed): (Vec<ResultArtifact>, Vec<ArtifactMeta>, bool) = match &locked
+            .executed
+        {
             // This cell produced the artifacts; filter the full set to `outputs`.
             // Already `ResultArtifact`s (cache-backed or passthrough).
-            Some(ex) => (ex.cached.clone(), ex.meta.clone()),
+            Some(ex) => (ex.cached.clone(), ex.meta.clone(), ex.streamed),
             // Pre-existing hit: read only this caller's outputs under the shared
             // riding read. Silent — the shared cell already emitted the addr's
             // hit/miss event; re-emitting per caller would double-count. Reuse the
@@ -3700,6 +3696,7 @@ impl Engine {
                             .map(ResultArtifact::from_cache)
                             .collect(),
                         meta,
+                        false,
                     ),
                     // The entry was confirmed but its bytes are unavailable: a
                     // remote object expired before the read, a transfer failed, or
@@ -3778,7 +3775,11 @@ impl Engine {
                                 was,
                             });
                         }
-                        let (cached, meta) = self
+                        let ExecutedArtifacts {
+                            cached,
+                            meta,
+                            streamed,
+                        } = self
                             .clone()
                             .execute_and_cache_inner(rs.clone(), opts)
                             .await?;
@@ -3800,7 +3801,7 @@ impl Engine {
                                 &cached,
                             )?;
                         }
-                        (cached, meta)
+                        (cached, meta, streamed)
                     }
                 }
             }
@@ -3813,8 +3814,13 @@ impl Engine {
         // did not ask for, so it does not depend on which frame gets here first.
         // Carries the write-back guard and the fixpoint registration, which belong
         // with the write.
+        //
+        // It runs outside the memoized execute, so a write-back that fails
+        // after a run that streamed is marked so here, as the cache store's
+        // failure is inside it (D6.1c).
         self.materialize_codegen(&rs, opts, &locked, &cached)
-            .await?;
+            .await
+            .map_err(|e| crate::engine::failure_slot::RunStreamed::mark(e, streamed))?;
 
         // Inside `inner_result_addr`'s scope, so it lands right before this
         // target's `ResultEnd`. Every group the run produced, whichever this
@@ -4210,11 +4216,11 @@ impl Engine {
                     .await?,
                 )
             };
-            let (cached, meta) = self
-                .clone()
-                .execute_and_cache_inner(rs.clone(), opts)
-                .await?;
-            let executed = Arc::new(ExecutedArtifacts { cached, meta });
+            let executed = Arc::new(
+                self.clone()
+                    .execute_and_cache_inner(rs.clone(), opts)
+                    .await?,
+            );
             let (guard, handed) = match write {
                 Some(write) if durable => {
                     // Same gap-free hand-off as the miss path below.
@@ -4487,19 +4493,14 @@ impl Engine {
                                     .map(|(path, _)| crate::engine::host_paths::stale_reason(path)),
                                 stale_host_path: stale.as_ref().map(|(path, _)| path.clone()),
                             });
-                            let (cached, meta) = self
+                            let executed = self
                                 .clone()
                                 .execute_and_cache_inner(rs.clone(), opts)
                                 .await?;
                             if let Some((path, old)) = &stale {
-                                report_stale_rebuild(&rs, addr_s, path, old, &meta);
+                                report_stale_rebuild(&rs, addr_s, path, old, &executed.meta);
                             }
-                            (
-                                Some(Arc::new(ExecutedArtifacts { cached, meta })),
-                                None,
-                                known_remote(None),
-                                None,
-                            )
+                            (Some(Arc::new(executed)), None, known_remote(None), None)
                         }
                     }
                 }
@@ -5342,7 +5343,7 @@ impl Engine {
         self: Arc<Self>,
         rs: Arc<RequestState>,
         opts: &ExecuteOptions<'_>,
-    ) -> anyhow::Result<(Vec<ResultArtifact>, Vec<ArtifactMeta>)> {
+    ) -> anyhow::Result<ExecutedArtifacts> {
         let addr = opts.def.target.addr.clone();
         let hashin = opts.hashin.clone();
         let spec = Arc::clone(opts.spec);
@@ -5380,6 +5381,7 @@ impl Engine {
                         sandbox_guards,
                         execute_guard: _execute_guard,
                         live_log: _live_log,
+                        streamed,
                     } = engine
                         .clone()
                         .execute(
@@ -5450,7 +5452,8 @@ impl Engine {
                                 .get(&spec.driver)
                                 .is_some_and(|d| d.managed);
                             let slot = crate::engine::failure_slot::FailureSlot::default()
-                                .with_sandbox(managed.then_some(fate));
+                                .with_sandbox(managed.then_some(fate))
+                                .with_streamed(streamed);
                             return Err(err.context(slot));
                         }
                     };
@@ -5515,9 +5518,21 @@ impl Engine {
                             let mut produced = passthrough;
                             produced
                                 .extend(cached.into_iter().map(ResultArtifact::from_cache));
-                            (produced, artifacts_meta)
+                            ExecutedArtifacts {
+                                cached: produced,
+                                meta: artifacts_meta,
+                                streamed,
+                            }
                         })
-                        .with_context(|| format!("cache_locally {addr}"));
+                        .with_context(|| format!("cache_locally {addr}"))
+                        // A store that failed after a run that streamed: the
+                        // failure says it streamed (D6.1c). A marker, not an
+                        // empty slot: a slot would make the failure "kept",
+                        // so a store failing under a cancel would be a stop
+                        // or a failure depending on whether a TTY was attached.
+                        .map_err(|e| {
+                            crate::engine::failure_slot::RunStreamed::mark(e, streamed)
+                        });
 
                     // Remote push: fire-and-forget on a background task (tracked
                     // by `bg_pending`, so the CLI/TUI stays open until it drains).
@@ -11323,10 +11338,11 @@ mod tests {
         let rs = engine.new_state();
         let addr = hmodel::htaddr::parse_addr("//pkg:a")?;
 
-        // A 12-line log, default tail of 10 → lines 3..=12 with start_line 3.
+        // A 1012-line log, default tail of 1000 → lines 13..=1012 with
+        // start_line 13.
         let dir = tempfile::tempdir().expect("tempdir");
         let log_path = dir.path().join("log.txt");
-        let full: String = (1..=12).map(|i| format!("line{i}\n")).collect();
+        let full: String = (1..=1012).map(|i| format!("line{i}\n")).collect();
         std::fs::write(&log_path, &full)?;
 
         let e = process_failed_with_log(&log_path).context("driver run");
@@ -11334,25 +11350,27 @@ mod tests {
             .await
             .context("execute //pkg:a");
 
-        let out = classify_failure(&rs, &addr, false, e);
+        let out = classify_failure(&rs, &addr, e);
         // Own failure → cheap marker propagated upward.
         assert!(downcast_chain_ref::<UpstreamFailed>(&out).is_some());
-        // …and the rich record carries the last 10 lines read from the log file,
-        // tagged with the real starting line number.
+        // …and the rich record carries the last 1000 lines read from the log
+        // file, tagged with the real starting line number.
         let recorded = rs.get_failure(&addr).expect("failure must be recorded");
         let tail = recorded.log_tail.as_ref().expect("log tail");
-        assert_eq!(
-            tail.text,
-            "line3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\nline11\nline12"
-        );
-        assert_eq!(tail.start_line, 3);
+        let want: Vec<String> = (13..=1012).map(|i| format!("line{i}")).collect();
+        assert_eq!(tail.text, want.join("\n"));
+        assert_eq!(tail.start_line, 13);
+        assert!(!recorded.streamed, "nothing said the output streamed");
         Ok(())
     }
 
+    /// A target whose output streamed to the terminal keeps its log, its tail
+    /// and its log path (D6.1): the fact that it streamed rides beside them,
+    /// on the recorded failure and on `ResultEnd`, and a renderer decides what
+    /// to show. Who got the terminal plays no part; only the slot's
+    /// `streamed`, which the run recorded from the bytes its wrapper wrote.
     #[tokio::test]
-    async fn classify_drops_log_tail_for_interactive_targets() -> anyhow::Result<()> {
-        // Interactive targets stream their output live to the user's terminal, so
-        // the captured log tail must NOT be re-rendered in the failure box.
+    async fn classify_keeps_log_tail_of_a_streamed_target() -> anyhow::Result<()> {
         let engine = engine_with(vec![static_target("//pkg:a", &[], &[])])?;
         let rs = engine.new_state();
         let addr = hmodel::htaddr::parse_addr("//pkg:a")?;
@@ -11361,19 +11379,51 @@ mod tests {
         let log_path = dir.path().join("log.txt");
         std::fs::write(&log_path, "line9\nline10\n")?;
 
-        let e = slotted(
-            &engine,
-            &rs,
-            &addr,
-            dir.path(),
-            process_failed_with_log(&log_path),
-        )
-        .await
-        .context("execute //pkg:a");
+        let e = process_failed_with_log(&log_path);
+        let slot = engine
+            .failure_slots
+            .fill(crate::engine::failure_slot::Fill {
+                addr: &addr,
+                hashin: "h",
+                roots: vec![dir.path().to_path_buf()],
+                err: &e,
+                lines: rs.log_tail_lines(),
+                material: false,
+                fixes: None,
+                keep_log: true,
+            })
+            .await
+            .with_streamed(true);
+        let e = e.context(slot).context("execute //pkg:a");
 
-        let _ = classify_failure(&rs, &addr, true, e);
+        let detail = crate::engine::event::ErrorDetail::from_error(&e);
+        let end = result_end_event(&rs, addr.format(), Some(detail), None, Some(true));
+        let crate::engine::event::BuildEventKind::ResultEnd {
+            log_tail,
+            left_behind,
+            ..
+        } = end
+        else {
+            panic!("not a ResultEnd: {end:?}");
+        };
+        let log_tail = log_tail.expect("ResultEnd keeps the tail");
+        assert_eq!(log_tail.text, "line9\nline10");
+        assert!(log_tail.streamed, "ResultEnd says it streamed");
+        assert!(
+            left_behind.and_then(|l| l.log_path).is_some(),
+            "and keeps the log's path"
+        );
+
+        let _ = classify_failure(&rs, &addr, e);
         let recorded = rs.get_failure(&addr).expect("failure must be recorded");
-        assert_eq!(recorded.log_tail, None);
+        let tail = recorded.log_tail.as_ref().expect("the tail is kept");
+        assert_eq!(tail.text, "line9\nline10");
+        assert_eq!(tail.start_line, 1);
+        assert!(recorded.streamed, "the recorded failure says it streamed");
+        assert!(
+            recorded.left_behind().log_path.is_some(),
+            "the path is kept"
+        );
         Ok(())
     }
 
@@ -11433,7 +11483,7 @@ mod tests {
         )
         .await;
         std::fs::write(&log_path, "rewritten later\n")?;
-        let _ = classify_failure(&rs, &addr, false, e);
+        let _ = classify_failure(&rs, &addr, e);
         let recorded = rs.get_failure(&addr).expect("recorded");
         assert_eq!(
             recorded.log_tail.as_ref().map(|t| t.text.as_str()),
@@ -11447,7 +11497,7 @@ mod tests {
         assert!(path.starts_with(engine.home.join("failures")), "{path:?}");
 
         let rs = engine.new_state();
-        let _ = classify_failure(&rs, &addr, false, process_failed_with_log(&log_path));
+        let _ = classify_failure(&rs, &addr, process_failed_with_log(&log_path));
         let recorded = rs.get_failure(&addr).expect("recorded");
         assert!(recorded.log_tail.is_none() && recorded.log.is_none());
         Ok(())
@@ -11476,14 +11526,14 @@ mod tests {
         };
 
         let e = slotted(&engine, &rs, &addr, sandbox.path(), failed()).await;
-        let _ = classify_failure(&rs, &addr, false, e);
+        let _ = classify_failure(&rs, &addr, e);
         let recorded = rs.get_failure(&addr).expect("recorded");
         let out = recorded.outputs.clone().expect("outputs");
         assert_eq!(out, engine.failure_slots.slot_dir(&addr).join("out"));
         assert!(out.join("pkg/report/index.html").is_file());
 
         let rs = engine.new_state();
-        let _ = classify_failure(&rs, &addr, false, failed());
+        let _ = classify_failure(&rs, &addr, failed());
         assert!(rs.get_failure(&addr).expect("recorded").outputs.is_none());
         Ok(())
     }
@@ -11516,13 +11566,13 @@ mod tests {
         // as `exit_code`, read structured rather than parsed from the text.
         let detail = crate::engine::event::ErrorDetail::from_error(&e);
         assert_eq!(detail.exit_status.as_deref(), Some("exit status: 1"));
-        let end = result_end_event(&rs, addr.format(), Some(detail), None, false, None);
+        let end = result_end_event(&rs, addr.format(), Some(detail), None, None);
         let crate::engine::event::BuildEventKind::ResultEnd { exit_code, .. } = end else {
             panic!("not a ResultEnd: {end:?}");
         };
         assert_eq!(exit_code, Some(1));
 
-        let _ = classify_failure(&rs, &addr, false, e);
+        let _ = classify_failure(&rs, &addr, e);
         let recorded = rs.get_failure(&addr).expect("failure must be recorded");
         let tail = recorded.log_tail.as_ref().expect("the remote log's tail");
         assert_eq!(
@@ -11588,7 +11638,7 @@ mod tests {
         assert!(hplugin::error::failure_artifacts(&e).is_some());
         assert!(!hcore::hmemoizer::chain_message(&e).contains(": :"));
 
-        let _ = classify_failure(&rs, &addr, false, e);
+        let _ = classify_failure(&rs, &addr, e);
         let recorded = rs.get_failure(&addr).expect("failure must be recorded");
         let tail = recorded
             .log_tail
@@ -16362,7 +16412,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 let res = inner(None, None, None, None).await;
                 probe.live.fetch_sub(1, Ordering::SeqCst);
-                res
+                res.map(|()| TerminalUse::default())
             })
         })
     }
@@ -16381,6 +16431,12 @@ mod tests {
     /// Label the driver stamps on a leaf whose `run` must fail; `TargetSpec`
     /// config is not visible from `run`, so the marker rides on the `TargetDef`.
     const FAIL_LABEL: &str = "terminal-test:fail";
+    /// Label on a leaf whose `run` succeeds with two artifacts of one name, so
+    /// the cache store refuses them: a failure after a run that went fine.
+    const DUP_LABEL: &str = "terminal-test:dup";
+    /// Label on a leaf whose `run` succeeds declaring a host path that does
+    /// not exist, refused before the entry is written: a failure past the run.
+    const BADOUT_LABEL: &str = "terminal-test:badout";
 
     #[async_trait]
     impl RawDriver for TerminalDriver {
@@ -16426,10 +16482,21 @@ mod tests {
                     runtime: true,
                 })
                 .collect();
-            let fails = matches!(
-                req.target_spec.config.get("fail"),
-                Some(hcore::htvalue::Value::Bool(true))
-            );
+            let flag = |key: &str| {
+                matches!(
+                    req.target_spec.config.get(key),
+                    Some(hcore::htvalue::Value::Bool(true))
+                )
+            };
+            let labels = [
+                (flag("fail"), FAIL_LABEL),
+                (flag("dup"), DUP_LABEL),
+                (flag("badout"), BADOUT_LABEL),
+            ]
+            .into_iter()
+            .filter(|&(on, _)| on)
+            .map(|(_, label)| label.to_string())
+            .collect();
             // `entrypoint = true`: invoked through `Engine::invoke`, not built.
             let entrypoint = matches!(
                 req.target_spec.config.get("entrypoint"),
@@ -16444,11 +16511,7 @@ mod tests {
             Ok(ParseResponse {
                 target_def: TargetDef {
                     addr: req.target_spec.addr.clone(),
-                    labels: if fails {
-                        vec![FAIL_LABEL.to_string()]
-                    } else {
-                        vec![]
-                    },
+                    labels,
                     inputs,
                     outputs: if transparent {
                         vec![]
@@ -16496,18 +16559,37 @@ mod tests {
                 )
                 .context("driver run"));
             }
+            let out = outputartifact::OutputArtifact {
+                group: "main".to_string(),
+                name: "out".to_string(),
+                r#type: outputartifact::Type::Output,
+                content: outputartifact::Content::Raw(outputartifact::ContentRaw {
+                    data: b"hi".to_vec(),
+                    path: "out".to_string(),
+                    x: false,
+                }),
+                hashout: "feedface".to_string(),
+            };
+            let artifacts = if req.target.labels.iter().any(|l| l == DUP_LABEL) {
+                vec![out.clone(), out]
+            } else {
+                vec![out]
+            };
+            // A host path that does not exist: refused before the entry is
+            // written, a failure past the run.
+            let host_paths = if req.target.labels.iter().any(|l| l == BADOUT_LABEL) {
+                vec![hplugin::driver::HostPath::new(
+                    &req.sandbox_dir
+                        .join("missing-host-path")
+                        .display()
+                        .to_string(),
+                )?]
+            } else {
+                vec![]
+            };
             Ok(RunResponse {
-                artifacts: vec![outputartifact::OutputArtifact {
-                    group: "main".to_string(),
-                    name: "out".to_string(),
-                    r#type: outputartifact::Type::Output,
-                    content: outputartifact::Content::Raw(outputartifact::ContentRaw {
-                        data: b"hi".to_vec(),
-                        path: "out".to_string(),
-                        x: false,
-                    }),
-                    hashout: "feedface".to_string(),
-                }],
+                artifacts,
+                host_paths,
                 ..Default::default()
             })
         }
@@ -17811,6 +17893,120 @@ mod tests {
             .as_ref()
             .expect("a target that never streamed keeps its process log tail");
         assert!(tail.text.contains("line12"), "tail: {}", tail.text);
+        Ok(())
+    }
+
+    /// A terminal wrapper that runs the target and reports `streamed` as
+    /// given, as the CLI's tap does from the bytes it wrote.
+    fn streaming_wrapper(streamed: bool) -> InteractiveWrapper {
+        SArc::new(move |inner: InteractiveInner| {
+            Box::pin(async move {
+                inner(None, None, None, None).await?;
+                Ok(TerminalUse { streamed })
+            })
+        })
+    }
+
+    /// A run that streamed and failed: the slot `execute` fills says so, and
+    /// the tail is kept all the same (D6.1). The same run that did not stream
+    /// records that it did not.
+    #[tokio::test]
+    async fn failed_run_records_whether_it_streamed() -> anyhow::Result<()> {
+        for streamed in [true, false] {
+            let h = terminal_harness(vec![leaf_spec("//pkg:t", true)?])?;
+            let rs = h.engine.new_state();
+            let addr = hmodel::htaddr::parse_addr("//pkg:t")?;
+            let opts = ResultOptions {
+                interactive: Some(streaming_wrapper(streamed)),
+                ..Default::default()
+            };
+
+            Arc::clone(&h.engine)
+                .result_addr(rs.clone(), &addr, OutputMatcher::All, &opts)
+                .await
+                .err()
+                .expect("the run fails");
+
+            let recorded = rs.get_failure(&addr).expect("failure must be recorded");
+            assert_eq!(recorded.streamed, streamed);
+            let tail = recorded.log_tail.as_ref().expect("the tail is always kept");
+            assert!(tail.text.contains("line12"), "tail: {}", tail.text);
+        }
+        Ok(())
+    }
+
+    /// A run that streamed and went fine, then a host path refused before
+    /// the entry is written (a failure past the run, on the slot that carries
+    /// the sandbox's fate): it records that the run streamed.
+    #[tokio::test]
+    async fn failure_past_a_streamed_run_records_streamed() -> anyhow::Result<()> {
+        for streamed in [true, false] {
+            let mut spec = leaf_spec("//pkg:t", false)?;
+            spec.config
+                .insert("badout".to_string(), hcore::htvalue::Value::Bool(true));
+            let h = terminal_harness(vec![spec])?;
+            let rs = h.engine.new_state();
+            let addr = hmodel::htaddr::parse_addr("//pkg:t")?;
+            let opts = ResultOptions {
+                interactive: Some(streaming_wrapper(streamed)),
+                ..Default::default()
+            };
+
+            let err = Arc::clone(&h.engine)
+                .result_addr(rs.clone(), &addr, OutputMatcher::All, &opts)
+                .await
+                .err()
+                .expect("an artifact that does not exist cannot be read");
+
+            assert_eq!(h.runs.load(Ordering::SeqCst), 1, "the run itself went fine");
+            let recorded = rs.get_failure(&addr).expect("failure must be recorded");
+            let msg = format!("{:#}", recorded.source);
+            assert!(
+                msg.contains("declares host path") && !msg.contains("cache_locally"),
+                "a failure past the run: {msg} ({err:#})",
+            );
+            assert_eq!(recorded.streamed, streamed, "{msg}");
+        }
+        Ok(())
+    }
+
+    /// A run that streamed and went fine, then a cache store that failed
+    /// (D6.1c, "a later step failed"): the failure records that the run
+    /// streamed. The same run that did not stream records that it did not.
+    /// Either way the failure is not "kept" (no slot on its chain), so
+    /// whether it is a stop under a cancel cannot depend on a TTY.
+    #[tokio::test]
+    async fn cache_store_failure_after_a_streamed_run_records_streamed() -> anyhow::Result<()> {
+        for streamed in [true, false] {
+            let mut spec = leaf_spec("//pkg:t", false)?;
+            spec.config
+                .insert("dup".to_string(), hcore::htvalue::Value::Bool(true));
+            let h = terminal_harness(vec![spec])?;
+            let rs = h.engine.new_state();
+            let addr = hmodel::htaddr::parse_addr("//pkg:t")?;
+            let opts = ResultOptions {
+                interactive: Some(streaming_wrapper(streamed)),
+                ..Default::default()
+            };
+
+            let err = Arc::clone(&h.engine)
+                .result_addr(rs.clone(), &addr, OutputMatcher::All, &opts)
+                .await
+                .err()
+                .expect("the cache store refuses two artifacts of one name");
+
+            assert_eq!(h.runs.load(Ordering::SeqCst), 1, "the run itself went fine");
+            let recorded = rs.get_failure(&addr).expect("failure must be recorded");
+            let msg = format!("{:#}", recorded.source);
+            assert!(
+                msg.contains("cache_locally") && msg.contains("duplicate cache entry name"),
+                "a cache-store failure: {msg} ({err:#})",
+            );
+            assert_eq!(recorded.streamed, streamed, "{msg}");
+            let detail = crate::engine::event::ErrorDetail::from_error(&recorded.source);
+            assert_eq!(detail.streamed, streamed, "{msg}");
+            assert!(!detail.kept, "no slot on a store failure: {msg}");
+        }
         Ok(())
     }
 

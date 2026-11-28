@@ -13,6 +13,7 @@ use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
 use crate::commands::completion::complete_target_addr;
 use crate::commands::run_json::{self, RunEntry};
+use crate::commands::terminal_tap;
 use crate::commands::utils::resolve_matcher;
 use crate::engine::{
     Discovery, Engine, Gaps, InteractiveWrapper, InvokeOutcome, InvokeRequest, OutputMatcher,
@@ -168,8 +169,9 @@ pub struct RunArgs {
     #[arg(long = "frozen")]
     pub frozen: bool,
     /// Number of trailing process-log lines to show in a failing target's
-    /// diagnostic box. The full log is always saved as the `log.txt` artifact.
-    #[arg(long = "log-lines", value_name = "N", default_value_t = 10)]
+    /// diagnostic box, at most 256 KiB of them. The full log is always saved as
+    /// the `log.txt` artifact.
+    #[arg(long = "log-lines", value_name = "N", default_value_t = Engine::DEFAULT_LOG_TAIL_LINES)]
     pub log_lines: usize,
     #[command(flatten)]
     pub dashboard: crate::commands::progress_app::DashboardArgs,
@@ -428,29 +430,29 @@ fn build_display(raw: bool, shell: bool) -> BuildDisplay {
 }
 
 /// A build target's `--raw`: the action's output goes to `streams`, through the
-/// driver's tee, so it is what `log.txt` holds, redaction included. It never
+/// driver's tee, so it is what `log.txt` holds, redaction included (heph's
+/// own line break after a line left open on a terminal aside, D6.3). It never
 /// passes stdin: the action reads /dev/null, or `printf A | heph run //x --raw`
 /// and `printf B | …` would share a hashin and B would get A's outputs.
+///
+/// Whether the output streamed is read off the bytes written to `streams`
+/// that are terminals ([`terminal_tap`]).
 pub fn plain_output_wrapper<O, E>(
     streams: impl Fn() -> (O, E) + Send + Sync + 'static,
 ) -> InteractiveWrapper
 where
-    O: tokio::io::AsyncWrite + Send + Sync + Unpin + 'static,
-    E: tokio::io::AsyncWrite + Send + Sync + Unpin + 'static,
+    O: tokio::io::AsyncWrite + std::os::fd::AsFd + Send + Sync + Unpin + 'static,
+    E: tokio::io::AsyncWrite + std::os::fd::AsFd + Send + Sync + Unpin + 'static,
 {
-    use tokio::io::AsyncWriteExt as _;
     Arc::new(move |inner| {
-        let (mut stdout, mut stderr) = streams();
+        let (stdout, stderr) = streams();
         Box::pin(async move {
+            let tap = terminal_tap::TerminalTap::new();
+            let mut stdout = terminal_tap::Tapped::new(stdout, &tap);
+            let mut stderr = terminal_tap::Tapped::new(stderr, &tap);
             let result = inner(None, Some(&mut stdout), Some(&mut stderr), None).await;
-            // A reader that went away (`| head -1`) is no failure of the run.
-            if let Err(error) = stdout.flush().await {
-                tracing::debug!(%error, "flushing stdout");
-            }
-            if let Err(error) = stderr.flush().await {
-                tracing::debug!(%error, "flushing stderr");
-            }
-            result
+            let terminal = terminal_tap::finish(&tap, &mut stdout, &mut stderr).await;
+            result.map(|()| terminal)
         })
     })
 }
@@ -896,7 +898,11 @@ impl RunApp {
                     None => None,
                 };
                 let _quiet = hengine::engine::diag::global().suppress_stall();
-                let result = inner(None, None, None, None).await;
+                // The tool holds the fds itself and is never logged (R22):
+                // there is no tail for a box to leave out.
+                let result = inner(None, None, None, None)
+                    .await
+                    .map(|()| crate::engine::TerminalUse::default());
                 // Before any error renders: this leaves the terminal cooked
                 // again, whatever the run returned.
                 let pump = session.lock().unwrap_or_else(|e| e.into_inner()).take();
@@ -1042,13 +1048,17 @@ impl App for RunApp {
                     let mut stdin = (pause_for == tui::PauseFor::Input)
                         .then(tui::tty::TtyReader::from_stdin)
                         .and_then(Result::ok);
-                    let mut stdout = tokio::io::stdout();
-                    let mut stderr = tokio::io::stderr();
+                    // Tapped: what reaches a terminal is what makes the
+                    // target's output count as streamed (D6.1), and a last
+                    // line left open is ended before the TUI comes back (D6.3).
+                    let tap = terminal_tap::TerminalTap::new();
+                    let mut stdout = terminal_tap::Tapped::new(tokio::io::stdout(), &tap);
+                    let mut stderr = terminal_tap::Tapped::new(tokio::io::stderr(), &tap);
                     // A `--shell`'s PTY is the driver's, so the size travels to it.
                     let winsize = (pause_for == tui::PauseFor::Input)
                         .then(WinsizeWatch::start)
                         .flatten();
-                    inner(
+                    let result = inner(
                         stdin
                             .as_mut()
                             .map(|s| s as &mut (dyn tokio::io::AsyncRead + Send + Sync + Unpin)),
@@ -1056,7 +1066,9 @@ impl App for RunApp {
                         Some(&mut stderr),
                         winsize.as_ref().map(|w| w.sizes.clone()),
                     )
-                    .await
+                    .await;
+                    let terminal = terminal_tap::finish(&tap, &mut stdout, &mut stderr).await;
+                    result.map(|()| terminal)
                 })
             }))
         } else {
@@ -2118,8 +2130,12 @@ mod tests {
     #[tokio::test]
     async fn record_entry_records_the_call_and_passes_it_through() -> anyhow::Result<()> {
         let reached = Arc::new(AtomicBool::new(false));
-        let terminal: InteractiveWrapper =
-            Arc::new(|inner: crate::engine::InteractiveInner| inner(None, None, None, None));
+        let terminal: InteractiveWrapper = Arc::new(|inner: crate::engine::InteractiveInner| {
+            Box::pin(async move {
+                inner(None, None, None, None).await?;
+                Ok(crate::engine::TerminalUse::default())
+            })
+        });
         let entered = Arc::new(AtomicBool::new(false));
         let wrapped = record_entry(terminal, Arc::clone(&entered));
         assert!(

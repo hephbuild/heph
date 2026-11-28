@@ -945,13 +945,17 @@ fn runs_entries(engine: &Engine) -> std::collections::BTreeSet<std::ffi::OsStrin
 /// stdout and stderr are two pipes read independently, so the target pauses
 /// before its stderr line: without it the stderr read can overtake the
 /// unread stdout lines and land anywhere in the tail.
+///
+/// The tail is the default 1000 lines (U5): of a 1500-line log, lines 501 to
+/// 1500, numbered from 501. Nothing about the run went to a terminal, so it
+/// is not marked streamed.
 #[tokio::test]
-async fn a_failed_run_result_end_carries_its_exit_and_log_tail() -> anyhow::Result<()> {
+async fn tail_is_last_1000_of_1500_lines() -> anyhow::Result<()> {
     let ws = tempfile::tempdir()?;
     std::fs::create_dir_all(ws.path().join("p"))?;
     std::fs::write(
         ws.path().join("p").join("BUILD"),
-        r#"target(name = "f", driver = "bash", out = "f.txt", run = "for i in $(seq 1 30); do echo line $i; done; sleep 0.5; echo to-stderr >&2; exit 3")"#,
+        r#"target(name = "f", driver = "bash", out = "f.txt", run = "for i in $(seq 1 1499); do echo line $i; done; sleep 0.5; echo to-stderr >&2; exit 3")"#,
     )?;
     let engine = engine(ws.path())?;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -995,9 +999,11 @@ async fn a_failed_run_result_end_carries_its_exit_and_log_tail() -> anyhow::Resu
         Engine::DEFAULT_LOG_TAIL_LINES,
         "bounded to the request's tail size: {lines:?}"
     );
-    assert_eq!(lines.last(), Some(&"to-stderr"), "{lines:?}");
-    assert_eq!(lines.first(), Some(&"line 22"), "{lines:?}");
-    assert_eq!(tail.start_line, 22);
+    assert_eq!(lines.len(), 1000);
+    assert_eq!(lines.last(), Some(&"to-stderr"));
+    assert_eq!(lines.first(), Some(&"line 501"));
+    assert_eq!(tail.start_line, 501);
+    assert!(!tail.streamed, "nothing reached a terminal");
     Ok(())
 }
 

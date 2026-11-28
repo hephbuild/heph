@@ -555,8 +555,10 @@ impl Engine {
             )
             .await;
         // The run's guards (stage holds, slots) go before the tree does; the
-        // response carries nothing else an invocation keeps.
-        let ran = ran.map(|r| r.map(drop));
+        // response carries nothing else an invocation keeps. Nor does what the
+        // wrapper did with the terminal: an invocation is never logged (R22),
+        // so there is no tail to leave out.
+        let ran = ran.map(|(r, _terminal)| r.map(drop));
         // What a failed run left for `failure_out` is in the sandbox: into the
         // failure slot before the teardown below removes it.
         let ran = match ran {

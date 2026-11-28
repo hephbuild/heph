@@ -2636,24 +2636,32 @@ pub(crate) fn prepare_note(
 ///
 /// The header names the exit status or the timeout as the report's block
 /// header does; a failure with neither shows its error as a body row, as the
-/// report's body does. Then the last `log_lines` lines of the tail the event
-/// carries (never a file read on the event path), sanitized, redacted and
-/// plain. Then the CI box's last rows ([`left_behind_rows`]) from what the
-/// event says the run left behind: the block stands in for the box, which the
-/// end of the run leaves out for it. No trailing newline: the log line adds
-/// one.
+/// report's body does. Then what [`tail_rows`] shows of the tail the event
+/// carries (never a file read on the event path), held to `log_lines`: the
+/// pointer of a tail that streamed to a terminal, `(no output)`, or the
+/// tail's last lines after an earlier-lines row, each line through
+/// [`escape_log_tail`] and redacted. Its SGRs are escaped too: the block is
+/// logged through `tracing`, whose formatter escapes every ESC anyway. Then
+/// the CI box's last rows ([`left_behind_rows`]) from what the event says the
+/// run left behind: the block stands in for the box, which the end of the run
+/// leaves out for it. No trailing newline: the log line adds one.
 ///
 /// [`left_behind_rows`]: crate::tui::failure_rows::left_behind_rows
+/// [`tail_rows`]: crate::tui::failure_rows::tail_rows
+/// [`escape_log_tail`]: crate::tui::text::escape_log_tail
+#[expect(clippy::too_many_arguments, reason = "the event's fields, one for one")]
 fn live_failure_block(
     addr: &str,
     error: &str,
     exit_status: Option<&str>,
     timed_out: Option<&hcore::events::TimedOutData>,
-    tail: Option<&str>,
+    tail: Option<&hcore::events::LogTailData>,
+    left_behind: Option<&hcore::events::LeftBehindData>,
     log_lines: usize,
     redact: &crate::tui::text::Redact,
 ) -> String {
-    use crate::tui::text::{clean_inline, expand_tabs, sanitize_log};
+    use crate::tui::failure_rows::tail_rows;
+    use crate::tui::text::{clean_inline, escape_log_tail, expand_tabs, sanitize_log};
     let row = |line: &str| expand_tabs(&redact.apply(line)).into_owned();
 
     let mut out = format!("✗ {}", clean_inline(addr));
@@ -2671,15 +2679,23 @@ fn live_failure_block(
         body.extend(sanitize_log(error.as_bytes()).lines().map(row));
     }
     if log_lines > 0
-        && let Some(text) = tail
+        && let Some(tail) = tail
     {
-        if text.trim().is_empty() {
-            body.push("empty log".to_owned());
-        } else {
-            let clean = sanitize_log(text.as_bytes());
-            let n = clean.lines().count();
-            body.extend(clean.lines().skip(n.saturating_sub(log_lines)).map(row));
-        }
+        let shown = tail_rows(
+            addr,
+            &tail.text,
+            tail.start_line,
+            tail.streamed,
+            left_behind.is_some_and(crate::tui::failure_rows::log_readable),
+            log_lines,
+        );
+        body.extend(
+            shown
+                .note
+                .as_deref()
+                .map(|note| clean_inline(note).into_owned()),
+        );
+        body.extend(escape_log_tail(shown.shown, false).lines().map(row));
     }
     for line in &body {
         out.push_str("\n  │ ");
@@ -2730,8 +2746,9 @@ pub struct CiProgressView {
 }
 
 /// `heph run --log-lines`' default: how many tail lines a failure prints live
-/// when the command has no such flag.
-const DEFAULT_LOG_LINES: usize = 10;
+/// when the command has no such flag. The same as `Engine::DEFAULT_LOG_TAIL_LINES`,
+/// which this crate cannot name.
+const DEFAULT_LOG_LINES: usize = 1000;
 
 impl CiProgressView {
     pub fn new(label: impl Into<String>) -> Self {
@@ -2870,7 +2887,8 @@ impl CIAppView for CiProgressView {
                         error,
                         exit_status.as_deref(),
                         timed_out.as_ref(),
-                        log_tail.as_ref().map(|t| t.text.as_str()),
+                        log_tail.as_ref(),
+                        left_behind.as_deref(),
                         self.log_lines,
                         &self.core.state.redact,
                     ),
@@ -4441,6 +4459,7 @@ mod tests {
             log_tail: tail.map(|text| hcore::events::LogTailData {
                 text: text.into(),
                 start_line: 1,
+                streamed: false,
             }),
             timed_out: None,
             cancelled,
@@ -4460,13 +4479,15 @@ mod tests {
     const TAIL: &str = "one\ntwo\nthree\nfour\nfive\n";
 
     /// A root failure prints its block the moment it fails: the report's
-    /// header, then exactly the last `--log-lines` lines of its tail.
+    /// header, then exactly the last `--log-lines` lines of its tail, after
+    /// the row that counts the lines it leaves out.
     #[test]
     fn ci_view_prints_a_root_failures_tail_as_it_fails() {
         let end = failed_end("//a:b", None, false, Some(TAIL));
         assert_eq!(
             ci_live_log(3, &[result_start("//a:b"), end.clone()]),
             "ERROR ✗ //a:b · exit status: 1\
+             \n  │ … 2 earlier lines\
              \n  │ three\
              \n  │ four\
              \n  │ five\n",
@@ -4476,6 +4497,39 @@ mod tests {
         assert_eq!(log.matches("  │ ").count(), 5, "{log}");
         // --log-lines 0: the header alone.
         assert_eq!(ci_live_log(0, &[end]), "ERROR ✗ //a:b · exit status: 1\n");
+    }
+
+    /// D6.1 in the line backend: a tail that streamed to a terminal is not
+    /// printed again; the block points at the log and counts it, from the
+    /// tail's start line and its own lines.
+    #[test]
+    fn ci_view_streamed_failure_shows_the_pointer_not_the_tail() {
+        let mut end = failed_end("//a:b", None, false, Some(TAIL));
+        if let BuildEventKind::ResultEnd {
+            log_tail: Some(t), ..
+        } = &mut end
+        {
+            t.streamed = true;
+            t.start_line = 96;
+        }
+        // Without word that the log can be read, the pointer names no command.
+        assert_eq!(
+            ci_live_log(3, std::slice::from_ref(&end)),
+            "ERROR ✗ //a:b · exit status: 1\
+             \n  │ (output not shown here: 100 lines)\n",
+        );
+        if let BuildEventKind::ResultEnd { left_behind, .. } = &mut end {
+            *left_behind = Some(Box::new(hcore::events::LeftBehindData {
+                log_readable: Some(true),
+                ..Default::default()
+            }));
+        }
+        assert_eq!(
+            ci_live_log(3, &[end]),
+            "ERROR ✗ //a:b · exit status: 1\
+             \n  │ (output not shown here: 100 lines · heph log //a:b)\
+             \n  log: heph log //a:b\n",
+        );
     }
 
     /// The block ends with the rows the end-of-run box would have carried,
@@ -4493,6 +4547,7 @@ mod tests {
             log_tail: Some(hcore::events::LogTailData {
                 text: TAIL.into(),
                 start_line: 1,
+                streamed: false,
             }),
             timed_out: None,
             cancelled: false,
@@ -4507,6 +4562,7 @@ mod tests {
         assert_eq!(
             ci_live_log(2, std::slice::from_ref(&end)),
             "ERROR ✗ //a:b · exit status: 1\
+             \n  │ … 3 earlier lines\
              \n  │ four\
              \n  │ five\
              \n  full log: /h/failures/a_b/log.txt\
@@ -4543,8 +4599,9 @@ mod tests {
     }
 
     /// A timeout names its limit as the report does; a failure with no
-    /// status shows its error; control bytes in the tail, the address and
-    /// the error never reach the log.
+    /// status shows its error; control bytes in the tail are shown escaped
+    /// (D6.1b), and in the address and the error removed: none reaches the
+    /// log; a target that printed nothing says so.
     #[test]
     fn ci_view_live_block_words_and_sanitizing() {
         let timed_out = BuildEventKind::ResultEnd {
@@ -4557,6 +4614,7 @@ mod tests {
             log_tail: Some(hcore::events::LogTailData {
                 text: "a\x1b[31mred\x1b[0m\r\nb\x07ell\n10%\r20%\n".into(),
                 start_line: 1,
+                streamed: false,
             }),
             timed_out: Some(hcore::events::TimedOutData {
                 timeout_ms: 600_000,
@@ -4567,16 +4625,17 @@ mod tests {
         assert_eq!(
             ci_live_log(10, std::slice::from_ref(&timed_out)),
             "ERROR ✗ //e2e:it · timed out after 10m (its timeout)\
-             \n  │ ared\
-             \n  │ bell\
-             \n  │ 20%\n",
+             \n  │ a\\x1b[31mred\\x1b[0m\
+             \n  │ b\\x07ell\
+             \n  │ 10%\\r20%\n",
         );
         // A timeout's tail is held to --log-lines like any failure's.
         assert_eq!(
             ci_live_log(2, &[timed_out]),
             "ERROR ✗ //e2e:it · timed out after 10m (its timeout)\
-             \n  │ bell\
-             \n  │ 20%\n",
+             \n  │ … 1 earlier line\
+             \n  │ b\\x07ell\
+             \n  │ 10%\\r20%\n",
         );
 
         let no_status = BuildEventKind::ResultEnd {
@@ -4587,8 +4646,9 @@ mod tests {
             exit_status: None,
             exit_code: None,
             log_tail: Some(hcore::events::LogTailData {
-                text: "\n\n".into(),
+                text: String::new(),
                 start_line: 1,
+                streamed: false,
             }),
             timed_out: None,
             cancelled: false,
@@ -4597,7 +4657,7 @@ mod tests {
             ci_live_log(10, &[no_status]),
             "ERROR ✗ //a:b\
              \n  │ staging failed\
-             \n  │ empty log\n",
+             \n  │ (no output)\n",
         );
     }
 
