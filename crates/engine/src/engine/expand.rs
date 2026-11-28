@@ -8,7 +8,6 @@ use crate::engine::request_state::{AddrKey, RequestState};
 use crate::engine::result::ExtendedTargetDef;
 use async_recursion::async_recursion;
 use enclose::enclose;
-use futures::FutureExt as _;
 use futures::stream::{FuturesOrdered, Stream, StreamExt as _};
 use hcore::hmemoizer::{nest, unwrap_arc_err};
 use hmodel::htaddr::Addr;
@@ -521,7 +520,7 @@ impl Engine {
     /// failure ([`InputDefFailed`]), never `declarer`'s.
     fn input_defs<'a>(
         self: &Arc<Self>,
-        rs: &Arc<RequestState>,
+        rs: &'a Arc<RequestState>,
         declarer: &'a Addr,
         inputs: &'a [Input],
     ) -> impl Stream<Item = anyhow::Result<(&'a Input, Arc<ExtendedTargetDef>)>> + Send + use<'a>
@@ -535,18 +534,20 @@ impl Engine {
                 // this runs for every edge, and the origin's text is only for
                 // the error.
                 let transitive = input.origin_id.contains(TRANSITIVE_PREFIX);
-                // Kept for the failure path: where the declarer declared it.
-                let rs = rs.clone();
-                Arc::clone(self)
-                    .get_def(rs.clone(), &input.r#ref.r#ref)
-                    .map(move |def| {
-                        let def = def.map_err(|e| {
+                let def = Arc::clone(self).get_def(Arc::clone(rs), &input.r#ref.r#ref);
+                async move {
+                    let def = match def.await {
+                        Ok(def) => def,
+                        Err(e) => {
                             let dep = &input.r#ref.r#ref;
                             let real = transitive
                                 .then(|| rs.transitive_declarer(&input.origin_id))
                                 .flatten();
                             let declarer = real.as_ref().unwrap_or(declarer);
-                            MissingDep::wrap_or(
+                            if MissingDep::names(&e, dep) {
+                                rs.load_source_index(declarer).await;
+                            }
+                            return Err(MissingDep::wrap_or(
                                 e,
                                 dep,
                                 declarer,
@@ -562,18 +563,19 @@ impl Engine {
                                         origin_id: input.origin_id.clone(),
                                     })
                                 },
-                            )
-                        })?;
-                        if def.target_def.entrypoint.is_some() {
-                            return Err(EntrypointAsInput {
-                                entrypoint: input.r#ref.r#ref.clone(),
-                                origin_id: input.origin_id.clone(),
-                                consumer: None,
-                            }
-                            .into());
+                            ));
                         }
-                        Ok((input, def))
-                    })
+                    };
+                    if def.target_def.entrypoint.is_some() {
+                        return Err(EntrypointAsInput {
+                            entrypoint: input.r#ref.r#ref.clone(),
+                            origin_id: input.origin_id.clone(),
+                            consumer: None,
+                        }
+                        .into());
+                    }
+                    Ok((input, def))
+                }
             })
             .collect::<FuturesOrdered<_>>()
     }
