@@ -69,7 +69,7 @@ pub(crate) struct JsonRun {
     /// The run's own result, which `finalize` turns into the exit code.
     pub(crate) res: anyhow::Result<()>,
     /// Every event the display saw.
-    events: Vec<heph::engine::event::BuildEvent>,
+    pub(crate) events: Vec<heph::engine::event::BuildEvent>,
     /// What `finalize` makes of the walk's skips: an error when it skipped
     /// part of the selection.
     pub(crate) complete: anyhow::Result<()>,

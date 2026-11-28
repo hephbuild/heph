@@ -2142,6 +2142,24 @@ impl RequestState {
 }
 
 impl RequestStateData {
+    /// `text`, an event's `error`, scrubbed of every value any target of
+    /// this request was handed to scrub, and within the record's message
+    /// cap (I7). Every value, not only the failing target's: the text of a
+    /// skipped or stopped end is another target's chain. Events reach
+    /// `events.ndjson`, the session store and hook plugins, so none carries
+    /// a text this has not seen. Called on the failure path only.
+    pub(crate) fn scrub_event_text(&self, text: &str) -> String {
+        let all = {
+            let scrubs = self.scrubs.lock();
+            let mut all = crate::engine::failure_record::Scrub::default();
+            for s in scrubs.values() {
+                all.extend_from(s);
+            }
+            all
+        };
+        crate::engine::failure_record::scrub_line(text, &all)
+    }
+
     /// Fan a fully-built event out to every registered hook and the event
     /// channel (both best-effort). The single delivery path for a `BuildEvent`,
     /// shared by [`RequestState::emit`] and [`emit_scope`](crate::engine::event::emit_scope)'s
