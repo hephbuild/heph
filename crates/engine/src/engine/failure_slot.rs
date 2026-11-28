@@ -99,15 +99,35 @@ pub fn addr_key(addr: &Addr) -> String {
         field(v);
     }
     let digest = h.digest128();
+    key_name(
+        addr.package
+            .as_str()
+            .chars()
+            .chain(std::iter::once(':'))
+            .chain(addr.name.chars()),
+        digest,
+    )
+}
 
+/// The prefix of a BUILD file's slot address in its manifest: the slot of the
+/// file at workspace-relative `rel` names `file:<rel>`.
+pub const FILE_ADDR_PREFIX: &str = "file:";
+
+/// The directory name of the slot of the BUILD file at workspace-relative
+/// `rel`, which did not evaluate: as [`addr_key`], over `file:<rel>`. Its
+/// digest never meets an address's: an address's starts with a length, and
+/// `file:` read as one is far past any name.
+pub fn file_key(rel: &str) -> String {
+    let mut h = xxhash_rust::xxh3::Xxh3::new();
+    h.update(FILE_ADDR_PREFIX.as_bytes());
+    h.update(rel.as_bytes());
+    key_name(FILE_ADDR_PREFIX.chars().chain(rel.chars()), h.digest128())
+}
+
+/// A slot's directory name: the readable part `chars` gives, then `digest`.
+fn key_name(chars: impl Iterator<Item = char>, digest: u128) -> String {
     let mut readable = String::with_capacity(READABLE_MAX);
-    for c in addr
-        .package
-        .as_str()
-        .chars()
-        .chain(std::iter::once(':'))
-        .chain(addr.name.chars())
-    {
+    for c in chars {
         if readable.len() >= READABLE_MAX {
             break;
         }
@@ -310,6 +330,19 @@ impl FailureSlots {
     /// for it (see [`read_manifest`]).
     pub fn read(&self, addr: &Addr) -> Option<SlotManifest> {
         read_manifest(&self.slot_dir(addr), addr)
+    }
+
+    /// The directory the slot of the BUILD file at workspace-relative `rel`
+    /// lives in, whether or not it exists ([`file_key`]).
+    pub fn file_slot_dir(&self, rel: &str) -> PathBuf {
+        self.root.join(file_key(rel))
+    }
+
+    /// The manifest of the slot of the BUILD file at `rel`, `None` when there
+    /// is no complete slot for it.
+    pub fn read_file(&self, rel: &str) -> Option<SlotManifest> {
+        read_any_manifest(&self.file_slot_dir(rel))
+            .filter(|m| m.addr.strip_prefix(FILE_ADDR_PREFIX) == Some(rel))
     }
 
     /// How many slots this engine has filled.
@@ -887,6 +920,31 @@ pub(crate) fn write_test_slot(root: &Path, addr: &Addr, failed_at: u64, log: &[u
     dir
 }
 
+/// Write a complete slot for the BUILD file at `rel` under `root` by hand,
+/// as a failure before the run leaves it: a manifest and `diagnostic.json`.
+#[cfg(test)]
+pub(crate) fn write_test_file_slot(root: &Path, rel: &str, failed_at: u64) -> PathBuf {
+    let dir = root.join(file_key(rel));
+    std::fs::create_dir_all(&dir).expect("mkdir slot");
+    let fill_id = new_fill_id();
+    let rec = hcore::failure::FailureRecord::new(hcore::diagnostic::Diagnostic::new(
+        hcore::diagnostic::Stage::Eval,
+        "boom",
+    ));
+    let diag = hcore::failure_log::encode_diagnostic(&rec, Some(&fill_id)).expect("encode");
+    std::fs::write(dir.join(DIAGNOSTIC), diag).expect("write diagnostic");
+    let m = SlotManifest {
+        version: MANIFEST_VERSION,
+        addr: format!("{FILE_ADDR_PREFIX}{rel}"),
+        hashin: None,
+        failed_at,
+        fill_id: Some(fill_id),
+        packages: Vec::new(),
+    };
+    std::fs::write(dir.join(MANIFEST), serde_json::to_vec(&m).expect("json")).expect("manifest");
+    dir
+}
+
 /// The slot names under `root`; temporaries are not slots.
 fn list_slots(root: &Path) -> HashSet<String> {
     let Ok(entries) = std::fs::read_dir(root) else {
@@ -1049,6 +1107,23 @@ mod tests {
         )
         .expect("m");
         assert_eq!(slots.read(&a), Some(manifest_for(&a)));
+    }
+
+    /// A file's key is readable, filesystem-safe, its own per path, and never
+    /// an address's, even one spelled like the path.
+    #[test]
+    fn file_key_is_its_own() {
+        let k = file_key("d/BUILD");
+        assert!(k.starts_with("file_d_build-"), "{k}");
+        assert!(
+            k.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-'),
+            "{k}"
+        );
+        assert_ne!(k, file_key("d/build"), "case is not folded away");
+        assert_ne!(k, file_key("d_BUILD"));
+        assert_ne!(k, addr_key(&addr("//d:BUILD")));
+        assert_ne!(k, addr_key(&addr("//file:d")));
     }
 
     /// A manifest written before `hashin` was optional, and one written for a
