@@ -74,7 +74,7 @@ pub(crate) struct JsonRun {
 impl JsonRun {
     /// How many failure boxes the text run prints.
     pub(crate) fn box_count(&self) -> usize {
-        self.boxes.matches("× target failed:").count()
+        self.boxes.lines().filter(|l| l.starts_with("✗ ")).count()
     }
 
     pub(crate) fn entry(&self, addr: &str) -> &Value {
@@ -193,6 +193,7 @@ async fn run_json_full(
         heph::commands::errors::BoxRequest {
             root: None,
             stopped: rs.fail_fast_stopped(),
+            log_lines: rs.log_tail_lines(),
         },
     ));
     let boxes = String::from_utf8(printed).expect("utf-8 boxes");

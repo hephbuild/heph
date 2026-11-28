@@ -79,13 +79,18 @@ fn ci_run_prints_a_target_failure_once() {
         ] {
             assert_eq!(err.matches(once).count(), 1, "{addr}: {once:?}\n{err}");
         }
+        // The end box is the same record's box, header and all: one
+        // header means it was left out.
+        assert_eq!(
+            err.matches("✗ //p:bad").count(),
+            1,
+            "{addr}: no end box\n{err}"
+        );
         let live = err.find("✗ //p:bad").expect("the live block");
         assert!(
             live < err.find("  log: heph log //p:bad").expect("log row"),
             "{addr}: the rows are the block's\n{err}"
         );
-        assert!(!err.contains("target failed"), "{addr}: no end box\n{err}");
-        assert!(!err.contains("╭─[log]"), "{addr}: no framed tail\n{err}");
     }
 }
 
@@ -98,14 +103,19 @@ fn ci_run_prints_a_failure_before_the_run_once_live() {
     let ws = Ws::new();
     let (out, err) = ws.run("//p:nodep");
     assert_eq!(out.status.code(), Some(1), "{err}");
-    assert_eq!(err.matches("✗ //p:nodep\n").count(), 1, "{err}");
-    let live = err.find("✗ //p:nodep").expect("the live block");
+    // One header: the live block, and no end box re-stating it.
+    assert_eq!(err.matches("✗ //p:nodep").count(), 1, "{err}");
+    let live = err.find("✗ //p:nodep\n").expect("the live block");
     let rest = err.get(live..).unwrap_or_default();
     assert!(
         rest.contains("target not found: //p:nope") && rest.contains("  log: none kept\n"),
         "{err}"
     );
-    assert!(!err.contains("target failed"), "no end box: {err}");
+    assert_eq!(
+        err.matches("target not found: //p:nope").count(),
+        1,
+        "no end box: {err}"
+    );
     assert!(err.contains("err 1"), "counted: {err}");
 }
 
