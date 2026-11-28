@@ -50,18 +50,24 @@ func fileExists(p string) bool { _, err := os.Stat(p); return err == nil }
 
 // dumpDOM loads a URL in headless Chrome and returns the DOM after the
 // page's scripts ran.
-func dumpDOM(t *testing.T, url string) string {
+func dumpDOM(t *testing.T, url string) string { return dumpDOMNet(t, url, false) }
+
+// dumpDOMNet is dumpDOM with the network reachable when online is set.
+func dumpDOMNet(t *testing.T, url string, online bool) string {
 	t.Helper()
 	chrome := chromePath(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	// No host name resolves, so no test reaches the network: the fonts and
-	// mermaid fail at once, and the page must draw without them. The fake
-	// GitHub API is served at 127.0.0.1, which needs no resolving.
-	cmd := exec.CommandContext(ctx, chrome, "--headless=new", "--disable-gpu", "--no-sandbox",
+	args := []string{"--headless=new", "--disable-gpu", "--no-sandbox",
 		"--no-first-run", "--no-default-browser-check", "--disable-extensions",
-		"--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1",
-		"--user-data-dir="+t.TempDir(), "--virtual-time-budget=10000", "--dump-dom", url)
+		"--user-data-dir=" + t.TempDir(), "--virtual-time-budget=10000", "--dump-dom", url}
+	if !online {
+		// No host name resolves, so no test reaches the network: the fonts and
+		// mermaid fail at once, and the page must draw without them. The fake
+		// GitHub API is served at 127.0.0.1, which needs no resolving.
+		args = append(args, "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1")
+	}
+	cmd := exec.CommandContext(ctx, chrome, args...)
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
@@ -163,6 +169,21 @@ func Test_card_reads_top_to_bottom(t *testing.T) {
 	text := regexp.MustCompile(`(?s)<script\b.*?</script>|<style\b.*?</style>|<[^>]*>`).ReplaceAllString(dom, " ")
 	if strings.Contains(text, "https://") || strings.Contains(text, "[object ") {
 		t.Errorf("the page shows a URL or a stringified object as text")
+	}
+}
+
+// With the network up, the pinned mermaid loads from cdnjs, passes its SRI
+// check and draws the card's diagram. It needs the network, so it runs only
+// with BRIEF_NETWORK=1.
+func Test_diagram_draws_with_mermaid(t *testing.T) {
+	if os.Getenv("BRIEF_NETWORK") != "1" {
+		t.Skip("set BRIEF_NETWORK=1 to load mermaid from cdnjs")
+	}
+	_, url := servedBrief(t, apiDown)
+	dom := dumpDOMNet(t, url, true)
+	if !regexp.MustCompile(`class="diagram"><svg`).MatchString(dom) {
+		i := strings.Index(dom, `class="diagram"`)
+		t.Fatalf("the diagram was not drawn:\n%s", dom[max(i, 0):min(max(i, 0)+400, len(dom))])
 	}
 }
 
