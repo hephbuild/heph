@@ -3123,6 +3123,49 @@ fn status_clock_ms(rows: &[String]) -> Option<(u128, String)> {
     })
 }
 
+/// How long [`tui_clock_ticks_during_slow_get`]'s evaluation aims to take:
+/// three times the second its clock must show.
+const SLOW_EVAL: Duration = Duration::from_secs(3);
+
+/// A BUILD file that spins `n` times while it evaluates, then defines `t`.
+fn spin_build(n: u64) -> String {
+    format!(
+        "def slow():\n    x = 0\n    for i in range({n}):\n        x += i\n    return x\n\n\
+         slow()\ntarget(name = \"t\", driver = \"bash\", cache = False, run = [\"echo ran\"])\n"
+    )
+}
+
+/// How many spins of [`spin_build`] take [`SLOW_EVAL`] here: the wall time
+/// of a run evaluating `PROBE` spins less that of a run evaluating none,
+/// scaled. Bounded both ways, so a noisy probe neither makes the test
+/// vacuous nor runs it for minutes.
+fn calibrated_spins(dist: &Dist, ws: &common::Workspace) -> u64 {
+    const PROBE: u64 = 5_000_000;
+    // The floor is half the fixed loop this test had before (40M, seconds
+    // in a release build); the ceiling keeps a bad probe within DEADLINE.
+    const SPINS: std::ops::RangeInclusive<u128> = 20_000_000..=400_000_000;
+    let timed = |pkg: &str, n: u64| {
+        ws.write(format!("{pkg}/BUILD"), &spin_build(n))
+            .expect("write BUILD");
+        let started = Instant::now();
+        let out = ws
+            .run(dist, &["run", &format!("//{pkg}:t")])
+            .expect("calibration run");
+        assert!(out.status.success(), "calibration run: {out:?}");
+        started.elapsed()
+    };
+    let none = timed("cal0", 0);
+    let probe = timed("cal1", PROBE);
+    let spent = probe.saturating_sub(none).as_nanos();
+    let spins = (SLOW_EVAL.as_nanos() * u128::from(PROBE))
+        .checked_div(spent)
+        .unwrap_or(u128::MAX)
+        .clamp(*SPINS.start(), *SPINS.end());
+    let spins = u64::try_from(spins).expect("within SPINS");
+    eprintln!("calibration: none {none:?}, {PROBE} spins {probe:?} → {spins} spins");
+    spins
+}
+
 /// STAGE-18: the clock ticks while the requested target's BUILD file is
 /// still evaluating, before any target event. `run` of one address asks
 /// whether it is an entrypoint first; the request's `RequestConfig` now
@@ -3130,25 +3173,18 @@ fn status_clock_ms(rows: &[String]) -> Option<(u128, String)> {
 /// not from the first target event, and the end line's time covers the
 /// evaluation too. In-process: `tui` `elapsed_ticks_from_request_config`.
 ///
-/// The BUILD file loops long enough to take seconds in a release build.
+/// The BUILD file loops for about [`SLOW_EVAL`] on this machine: the loop's
+/// length is calibrated first ([`calibrated_spins`]), so the test does not
+/// depend on how fast the runner is (FQ-4). A BUILD file cannot wait on a
+/// gate: `heph.fs.glob` sees the tree as it was when the request started,
+/// and `load` refuses anything but a file or a directory.
 #[test]
 fn tui_clock_ticks_during_slow_get() {
     let dist = Dist::locate();
     let ws = common::Workspace::new().expect("workspace");
-    ws.write(
-        "pkg/BUILD",
-        concat!(
-            "def slow():\n",
-            "    x = 0\n",
-            "    for i in range(40000000):\n",
-            "        x += i\n",
-            "    return x\n",
-            "\n",
-            "slow()\n",
-            "target(name = \"t\", driver = \"bash\", cache = False, run = [\"echo ran\"])\n",
-        ),
-    )
-    .expect("write BUILD");
+    let spins = calibrated_spins(&dist, &ws);
+    ws.write("pkg/BUILD", &spin_build(spins))
+        .expect("write BUILD");
     let home = ws.home().to_string_lossy().into_owned();
     let started = Instant::now();
     let mut pty = common::pty::Pty::script_at_cursor(
