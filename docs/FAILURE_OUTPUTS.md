@@ -60,7 +60,8 @@ There is one slot per address (per variant). It has no history:
 Each fill of a slot mints a **fill id** (a uuid) and writes it into the
 manifest. A failure's record names its log by that id, so a reader holding an
 older record can tell the slot was since filled by a newer failed run
-(`log replaced by a newer failed run`) or cleared (`log cleared`), and never
+(`log replaced by a newer failed run`) or cleared (`log cleared (…); re-run
+to regenerate`), and never
 shows the newer run's log as the older one's. A slot from an older heph has no
 fill id: its log is shown with no claim about whose it is.
 
@@ -143,7 +144,10 @@ Either way the last row
 is the
 command that prints the log without naming where it lives, printed whenever
 heph can open a log for the target — on disk or not, a remote hit's log it
-would fetch included — and `log: none kept` when it cannot. An interactive run
+would fetch included — and `log: none kept` when it cannot, followed by why
+when heph knows (`log: none kept (its outputs are credential material, so no
+log reaches the disk)`). A log whose slot is gone reads `log cleared (a later
+run, gc or clean removed it); re-run to regenerate`. An interactive run
 prints the failure report instead: one block per root failure, naming no path
 into heph's home, each ending with the same answer as `full log: heph log
 <addr>` or `full log: none kept`.

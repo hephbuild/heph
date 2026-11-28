@@ -599,6 +599,54 @@ fn no_log_line_for_failure_before_run() {
     assert!(render_box(&ran, &RenderCtx::default()).contains("  log: none kept\n"));
 }
 
+/// PV-2: `none kept` says why when the record knows. A run whose outputs
+/// are credential material keeps its log in memory only; a log with a path
+/// the engine cannot open gives no reason.
+#[test]
+fn none_kept_says_why_for_credential_material() {
+    let material = FailureRecord {
+        failed_in: FailedIn::Exec,
+        log: Some(LogRef {
+            lines: 1,
+            memory_tail: Some("x".into()),
+            ..LogRef::default()
+        }),
+        left_behind: Some(LeftBehindData {
+            log_readable: Some(false),
+            ..LeftBehindData::default()
+        }),
+        ..target("//p:t", Diagnostic::new(Stage::Run, "boom"))
+    };
+    for mode in MODES {
+        let b = render_box(
+            &material,
+            &RenderCtx {
+                mode,
+                ..RenderCtx::default()
+            },
+        );
+        assert!(
+            b.ends_with(
+                "  log: none kept (its outputs are credential material, so no log reaches \
+                 the disk)\n"
+            ),
+            "{mode:?}: {b}"
+        );
+    }
+    let on_disk = FailureRecord {
+        log: Some(LogRef {
+            path: Some("/nowhere/log.txt".into()),
+            ..LogRef::default()
+        }),
+        ..material
+    };
+    assert!(
+        render_box(&on_disk, &RenderCtx::default()).ends_with("  log: none kept\n"),
+        "{}",
+        render_box(&on_disk, &RenderCtx::default())
+    );
+}
+
 /// The rows the report had before the renderers merged (D5): what the
 /// culprit took down, and the kept `failure_out` groups, in both modes.
 #[test]
@@ -743,7 +791,11 @@ fn log_rows_follow_the_slot() {
     let mut gone = slot(&ws.path().join("d"), Some("f1"), Some("f1"), "x\n");
     gone.path = Some(ws.path().join("nowhere/log.txt").display().to_string());
     let cleared = with(gone, false);
-    assert_eq!(draw(&cleared), "✗ //p:t\n  boom\n  log cleared\n");
+    assert_eq!(
+        draw(&cleared),
+        "✗ //p:t\n  boom\n  log cleared (a later run, gc or clean removed it); re-run to \
+         regenerate\n"
+    );
     assert!(!json_facts(&cleared).log_replaced);
 
     let older = with(slot(&ws.path().join("o"), None, None, "x\n"), false);

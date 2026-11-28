@@ -25,20 +25,31 @@ pub fn shell_quote(s: &str) -> std::borrow::Cow<'_, str> {
 /// can open one; "none kept" when it cannot. A failure nobody asked the
 /// engine about points at `heph log` only beside `full log:`.
 pub fn left_behind_rows(addr: &str, left: &LeftBehindData) -> String {
-    left_behind_rows_in(addr, left, true, true)
+    left_behind_rows_in(addr, left, true, LogRow::Show(None))
+}
+
+/// What the rows end with ([`left_behind_rows_in`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogRow<'a> {
+    /// No `log:` row: a failure before the run has no log to name, or to say
+    /// none of.
+    Omit,
+    /// `log: heph log <addr>`, or `log: none kept` followed by why in
+    /// parentheses when the caller knows (PV-2).
+    Show(Option<&'a str>),
 }
 
 /// [`left_behind_rows`], for a screen that may not show the paths into
 /// heph's home (the report after the TUI, I9) when `paths` is false: no
 /// `full log:` row (the `log:` row names the command), and `outputs:` points
 /// at `heph inspect failure` instead of the slot's `out/`. A kept sandbox is
-/// named in both: the user asked for it. Without `log_row`, no `log:` row at
-/// all: a failure before the run has no log to name, or to say none of.
+/// named in both: the user asked for it. `log_row` says whether a `log:` row
+/// ends them, and why none was kept when that is known.
 pub fn left_behind_rows_in(
     addr: &str,
     left: &LeftBehindData,
     paths: bool,
-    log_row: bool,
+    log_row: LogRow<'_>,
 ) -> String {
     let mut out = String::new();
     if paths && let Some(path) = &left.log_path {
@@ -65,13 +76,16 @@ pub fn left_behind_rows_in(
     if let Some(fixes) = &left.fixes {
         fixes_rows(&mut out, fixes, (!paths).then_some(addr));
     }
-    if !log_row {
+    let LogRow::Show(why) = log_row else {
         return out;
-    }
+    };
     if log_readable(left) {
         out.push_str(&format!("  log: heph log {}\n", shell_quote(addr)));
     } else if left.log_readable == Some(false) {
-        out.push_str("  log: none kept\n");
+        match why {
+            Some(why) => out.push_str(&format!("  log: none kept ({why})\n")),
+            None => out.push_str("  log: none kept\n"),
+        }
     }
     out
 }
@@ -579,6 +593,18 @@ mod tests {
         assert_eq!(
             rows(path, Some(false)),
             "  full log: /h/log.txt\n  log: none kept\n"
+        );
+        let unreadable = LeftBehindData {
+            log_readable: Some(false),
+            ..LeftBehindData::default()
+        };
+        assert_eq!(
+            left_behind_rows_in("//p:a", &unreadable, true, LogRow::Show(Some("why"))),
+            "  log: none kept (why)\n"
+        );
+        assert_eq!(
+            left_behind_rows_in("//p:a", &unreadable, true, LogRow::Omit),
+            ""
         );
     }
 }
