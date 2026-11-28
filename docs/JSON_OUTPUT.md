@@ -287,6 +287,32 @@ To find what broke, read the culprits' own records: they are the
 names each. On a culprit's record `.path` is how the selection reached it.
 `.root // .root_file` is a skipped record's culprit.
 
+**The text lines and their fields.** What a run without `--json` prints on
+stderr (`docs/FAILURE_OUTPUTS.md`) maps onto the records as below. The
+wording of a line is not contract; its field is.
+
+| Text on stderr | In `--json` |
+|---|---|
+| a failure box's header, `✗ //p:t` (or `✗ d/BUILD`) | a record with `outcome: "failed"`, named by `.addr // .file` |
+| the one line of a failure told after its streamed output, `✗ //t · exit status 1 · heph log //t` | the same record, with `streamed: true` |
+| the box's message | `error` |
+| its source excerpt (`d/BUILD:4:5`) | `location` |
+| a hint row | `hints[].text`, with its `kind` |
+| `exit status: 1`, `timed out after 1s (its timeout)` | `exit_code`, `timed_out` |
+| `reached by: //a:root → //p:mid → //p:t` | `path` |
+| `took down: //a:x, //a:y +3 more` | the `skipped` records whose `root` (or `root_file`) is this culprit: those of matched targets only, where the row may also name a dependency between them |
+| `(output not shown here: N lines · heph log //p:t)` | `streamed: true` |
+| `log replaced by a newer failed run` | `log_replaced: true` |
+| `full log:`, `outputs:`, `fixes written:` | `failure.log`, `failure.out`, `failure.fixes` |
+| `log: heph log //p:t` | the command itself; `failure.log` is the path |
+| `– //a:root skipped: //c:y failed` | a record with `outcome: "skipped"`, `root: "//c:y"` |
+| `stopped by --fail-fast: …` | the list is left open, without its `]` |
+| the last line, `2 failed: //c:y, d/BUILD +3 more (…) · 4 skipped` | `[.[] \| select(.outcome == "failed")]` and its `length`; the skipped count is the number of `skipped` records |
+| `! selection incomplete …` | the list is left open |
+
+The totals line names at most five culprits, each cut to 120 columns, then
+`+N more`; `--json` has every one.
+
 **Skipped records are a closing batch.** They come from one pass over the
 dependency graph at the end of the request, so they are all written once the
 run returns, after every other record. Within the batch the order is:

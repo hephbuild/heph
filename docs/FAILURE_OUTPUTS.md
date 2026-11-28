@@ -152,12 +152,27 @@ prints the failure report instead: one block per root failure, naming no path
 into heph's home, each ending with the same answer as `full log: heph log
 <addr>` or `full log: none kept`.
 
+**A failure whose output streamed to the terminal gets no box.** When a
+target's process ran on the terminal heph lent it and failed there, heph
+prints one line right after that output, `✗ //t · exit status 1 · heph log
+//t`, and that line is all it says: no box as it fails, none at the end, and
+the log's tail is not repeated, since the user just saw it. `--json` and
+`heph inspect failure` still carry its record (`streamed: true`). A failure
+after such a run (storing its outputs, say) is not the process's own, and
+gets its box, with the pointer in place of the log.
+
 A script reading either shape can rely on the order of the rows and on their
 labels (`full log:`, `outputs:`, `took down:`, `fixes written:`, …): those
 are stable. The whitespace is not. A report's labels are padded to line up
 with each other, so the indentation and the gap after a label change with
 which rows a failure prints. Match a label with its colon and trim what
-follows it.
+follows it. `docs/JSON_OUTPUT.md` maps each line onto its `--json` field;
+a script is better served by that.
+
+**Migrating a CI log scraper.** heph used to print a failure through its log
+at ERROR level, so its line read `ERROR ✗ //b:x`. It now writes the box
+itself, and the line starts with `✗`. A scraper matching `^ERROR` finds
+nothing: match `^✗ ` for a failure's first line, or read `heph run --json`.
 
 ### The failed sandbox
 

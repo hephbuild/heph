@@ -991,7 +991,10 @@ fn tui_report_80_failures_50_boxes_30_lines() {
     assert_eq!(boxes, BOX_CAP);
     assert_eq!(short.len(), 30);
     assert_eq!(*short[0], "✗ //p:t50 · boom");
-    assert_eq!(lines.last(), Some(&"30 more: heph inspect failure --json"));
+    assert_eq!(
+        lines.last(),
+        Some(&"30 more: heph inspect failure --json <addr>")
+    );
     assert_eq!(lines.iter().filter(|l| **l == "  boom").count(), BOX_CAP);
     // Under the cap: boxes only.
     let out = render_report(&recs[..3], &RenderCtx::default());
@@ -1009,7 +1012,21 @@ fn totals_skipped_fail_fast_and_streamed_lines() {
     );
     assert_eq!(
         totals_line(&["a", "b", "c", "d", "e", "f", "g"], 0),
-        "7 failed: a, b, c, d, e +2 more"
+        "7 failed: a, b, c, d, e +2 more (heph inspect failure --json <addr>)"
+    );
+    // PV-3: bounded whatever the culprits' names and count.
+    let long = "x".repeat(10_000);
+    let many = vec![long.as_str(); 10_000];
+    let line = totals_line(&many, 3);
+    assert!(
+        line.len() < TOTALS_NAMED * (TOTALS_NAME_MAX + 8) + 120,
+        "{}",
+        line.len()
+    );
+    assert!(
+        line.starts_with("10,000 failed: ")
+            && line.ends_with(" +9,995 more (heph inspect failure --json <addr>) · 3 skipped"),
+        "{line}"
     );
     assert_eq!(totals_line::<&str>(&[], 1), "1 skipped");
     assert_eq!(totals_line::<&str>(&[], 0), "");

@@ -349,7 +349,7 @@ mod tests {
         assert!(
             out.ends_with(
                 "✗ //p:t49\n  boom\n\n✗ //p:t50 · boom\n✗ //p:t51 · boom\n✗ //p:t52 · boom\n\
-                 3 more: heph inspect failure --json\n"
+                 3 more: heph inspect failure --json <addr>\n"
             ),
             "{out}"
         );
