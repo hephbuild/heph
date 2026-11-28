@@ -1562,7 +1562,15 @@ impl RequestState {
                 if f.path == path {
                     f
                 } else {
-                    Arc::new(f.as_ref().clone().with_path(path))
+                    // The record says the same path as the failure it is of.
+                    let mut record = f.record.as_ref().clone();
+                    record.path = path.iter().map(Addr::format).collect();
+                    Arc::new(
+                        f.as_ref()
+                            .clone()
+                            .with_path(path)
+                            .with_record(Arc::new(record)),
+                    )
                 }
             })
             .collect()

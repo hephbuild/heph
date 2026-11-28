@@ -2334,10 +2334,25 @@ fn record_culprit(
             entry.clone(),
         )
     });
+    // Compacted once, here, for the claim's winner only: the one choke point
+    // where a failure is scrubbed and bounded (D7b, I7).
+    let record = unclaimed.then(|| {
+        let scrub = match culprit.target() {
+            Some(c) => rs.scrub_for(&[addr, &entry, c]),
+            None => rs.scrub_for(&[addr, &entry]),
+        };
+        let mut record = crate::engine::failure_record::compact(&e, &culprit, &entry, &scrub, None);
+        record.path = path.iter().map(Addr::format).collect();
+        Arc::new(record)
+    });
+    let mut failure = TargetFailure::new(entry, log_tail, e);
+    if let Some(record) = record {
+        failure = failure.with_record(record);
+    }
     let fresh = rs.record_failure(
         culprit.clone(),
         Arc::new(
-            TargetFailure::new(entry, log_tail, e)
+            failure
                 .with_path(path)
                 .with_file(match &culprit {
                     Culprit::File(file) => Some(Arc::clone(file)),
