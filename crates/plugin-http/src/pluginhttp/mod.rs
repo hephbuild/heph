@@ -378,9 +378,8 @@ impl ManagedDriver for Driver {
             req.request.target,
             &req.request.credentials,
         )? {
-            // Each names the url as written: `url` may be a `${read://…}`
-            // reference's resolved value, which no message quotes (I7). A
-            // literal one is quoted without its userinfo or query.
+            // Each names the url as written, and the checks quote the
+            // resolved one, both without userinfo or query.
             let shown = || format!("{addr}: `url` {:?}", hfetch::redact_url(def.url.raw()));
             auth::check_url(&url).with_context(shown)?;
             // Off the async workers: it reads the presented netrc files.
@@ -666,17 +665,18 @@ fn check_resolved_url(url: &str) -> anyhow::Result<()> {
         !url.is_empty(),
         "resolved to an empty value: the producer's output file is empty"
     );
-    // None of these quotes the value: it is the producer's content, and the
-    // caller's context names the reference as written (I7).
+    // The value is quoted as a url is everywhere, without its userinfo, query
+    // or fragment (`hfetch::redact_url`); a resolved value is not a secret
+    // otherwise (U20).
+    let shown = hfetch::redact_url(url);
     anyhow::ensure!(
         !url.chars().any(|c| c.is_whitespace() || c.is_control()),
-        "resolved to a value that contains whitespace or a control character"
+        "resolved to {shown:?}, which contains whitespace or a control character"
     );
-    let parsed = url::Url::parse(url).context("resolved to a value that is not a url")?;
+    let parsed = url::Url::parse(url).with_context(|| format!("resolved to {shown:?}"))?;
     anyhow::ensure!(
         matches!(parsed.scheme(), "https" | "http"),
-        "resolved to a {}:// url; only http and https are fetched",
-        parsed.scheme()
+        "resolved to {shown:?}; only http and https are fetched"
     );
     Ok(())
 }
@@ -2056,10 +2056,10 @@ mod tests {
     }
 
     /// Every refusal of a resolved url, with or without credentials, names the
-    /// reference as written and never the value it resolved to, which is the
-    /// producer's content (I7).
+    /// reference as written and the value it resolved to (not a secret, U20),
+    /// but never a url's password or query (credential material, I7).
     #[tokio::test]
-    async fn http_auth_error_quotes_reference() {
+    async fn http_url_error_quotes_value_without_password() {
         let gated = parse_deferred(
             REF,
             &[
@@ -2073,24 +2073,30 @@ mod tests {
         .await
         .expect("parse");
         let anonymous = parse_deferred(REF, &[out("t")]).await.expect("parse");
-        for (def, resolved) in [
-            (&gated, "http://x.example/S3CRET"),
-            (&gated, "https://u:S3CRET@x.example/asset"),
-            (&gated, "https://x/a S3CRET"),
-            (&anonymous, "ftp://x.example/S3CRET"),
-            (&anonymous, "S3CRET-relative"),
-            (&anonymous, "https://x/a\nS3CRET"),
+        // (the resolved value, the part of it the message shows)
+        for (def, resolved, shown) in [
+            (
+                &gated,
+                "https://u:S3CRET@x.example/asset",
+                "carries a username",
+            ),
+            (&gated, "https://x.example/a?sig=S3CRET", "\"x.example\""),
+            (&gated, "https://x/a VALUE", "VALUE"),
+            (&anonymous, "ftp://x.example/VALUE", "ftp://x.example/VALUE"),
+            (&anonymous, "VALUE-relative", "VALUE-relative"),
+            (&anonymous, "https://x/a\nVALUE", r"\nVALUE"),
         ] {
             let msg = format!("{:#}", run_resolved(def, resolved).await.unwrap_err());
             assert!(msg.contains(REF), "names the reference: {msg}");
+            assert!(msg.contains(shown), "{resolved:?}: shows {shown}: {msg}");
             assert!(
                 !msg.contains("S3CRET"),
-                "{resolved:?}: quoted the value: {msg}"
+                "{resolved:?}: quoted the password or query: {msg}"
             );
         }
         // And the check itself, which parse runs on a literal url and run on a
-        // resolved one, quotes nothing.
-        for bad in ["not a url S3CRET", "S3CRET:"] {
+        // resolved one, quotes the url without its password.
+        for bad in ["https://u:S3CRET@/x", "not a url?sig=S3CRET"] {
             let msg = format!("{:#}", auth::check_url(bad).expect_err(bad));
             assert!(!msg.contains("S3CRET"), "{bad:?}: {msg}");
         }

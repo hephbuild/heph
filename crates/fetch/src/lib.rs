@@ -189,9 +189,10 @@ pub fn check_header(name: &str, value: &str) -> anyhow::Result<String> {
 /// `url` as a message may quote it: scheme, host, port and path, without the
 /// userinfo, the query or the fragment.
 ///
-/// A presigned URL (S3's `X-Amz-Signature`, a CDN token) carries its secret in
-/// the query, and a URL a `${read://…}` reference resolved to may be one, so no
-/// error or log quotes a URL any other way (I7). Text that does not parse as a
+/// The userinfo is credential material, and a presigned URL (S3's
+/// `X-Amz-Signature`, a CDN token, the URL a release asset redirects to)
+/// carries its credential in the query, so no error or log quotes a URL any
+/// other way (I7). Text that does not parse as a
 /// URL with a host (`u:p@h/x` parses as scheme `u`) is cut at its first `?` or
 /// `#`, and to what follows its last `@`.
 pub fn redact_url(url: &str) -> std::borrow::Cow<'_, str> {
