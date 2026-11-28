@@ -11,8 +11,9 @@
 //! **Never hashed** (I1). None of these types implements `Hash`, so nothing
 //! about a diagnostic or a stage frame can reach a def hash, `hashin` or a
 //! cache key. Each refusal below follows a twin that compiles and differs only
-//! in the derive, and is pinned to `E0277` (the missing `Hash`), so it cannot
-//! pass for another reason.
+//! in the derive: the twin proves every path resolves, so the derive is the
+//! only thing left to fail. The `E0277` (the missing `Hash`) each refusal names
+//! documents the expected error; stable rustdoc does not check it.
 //!
 //! ```
 //! #[derive(Clone)]

@@ -110,8 +110,9 @@ pub struct TargetSpec {
     /// buildfile provider's `target()` call in `p/BUILD`).
     ///
     /// **Diagnostics only: never in a def, a run, an env, argv or outputs.**
-    /// Moving a declaration down a line, or into a helper, must rebuild
-    /// nothing (I1). It is skipped by serde, and [`SpecSource`] has no `Hash`,
+    /// Moving a declaration down a line, or into a helper, must not change the
+    /// moved target's `hashin` (I1); targets that read the edited file rebuild,
+    /// as for any edit. It is skipped by serde, and [`SpecSource`] has no `Hash`,
     /// so a driver that hashes its spec cannot pick it up by accident. A
     /// cdylib driver never receives it: the host leaves it out of the
     /// `ParseRequest` it sends.

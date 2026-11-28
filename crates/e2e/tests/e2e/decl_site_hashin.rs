@@ -1,6 +1,7 @@
 //! I1 (error-reporting): nothing a diagnostic carries about where a target
 //! was declared (`SpecSource`) reaches its `hashin`. Moving a target down a
-//! line, or into a macro, rebuilds nothing, for a target of every in-process
+//! line, or into a macro, leaves its `hashin` unchanged (targets that read
+//! the edited files rebuild, as for any edit), for a target of every in-process
 //! driver the engine registers, and for one a plugin function declares.
 //!
 //! The driver list is the engine's registry, not a list kept here: a driver
