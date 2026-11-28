@@ -61,7 +61,8 @@ rejects it instead of reading a short list as whole, with or without
   (`run` and every command that can build under the progress view). A
   cancelled command exits 130, as a `--jq` filter it stopped does.
   `tool build-lsp` and `log -f` are not cancelled by TERM or HUP: they die of
-  it.
+  it. A HUP that heph was started with ignored (`nohup heph run …`) stays
+  ignored and cancels nothing.
 
 The exit code is non-zero and stderr says why. Piped, the elements printed
 before it are one per line, so a consumer that wants what there was can still
