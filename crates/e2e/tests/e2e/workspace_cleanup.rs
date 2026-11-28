@@ -7,24 +7,6 @@
 
 use crate::common::Workspace;
 use std::os::unix::fs::PermissionsExt as _;
-use std::path::{Path, PathBuf};
-
-/// The first directory under `root` that its owner cannot write to.
-fn read_only_dir_under(root: &Path) -> Option<PathBuf> {
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let mode = std::fs::symlink_metadata(&dir).ok()?.permissions().mode();
-        if mode & 0o200 == 0 {
-            return Some(dir);
-        }
-        for entry in std::fs::read_dir(&dir).ok()?.flatten() {
-            if entry.file_type().is_ok_and(|t| t.is_dir()) {
-                stack.push(entry.path());
-            }
-        }
-    }
-    None
-}
 
 #[tokio::test]
 async fn dropping_a_workspace_removes_the_tools_it_staged_read_only() {
@@ -49,13 +31,19 @@ target(
     );
     ws.run("//p:use").await.expect("run //p:use");
 
+    // The run's own read-only staging lives in its sandbox, whose cleanup is
+    // fire-and-forget: whether it is still on disk here is a race, and the
+    // cleanup won it once in CI. So the test seals a tree the way staging does
+    // (`0555` directories over a file) instead of relying on that one. The run
+    // stays, so whatever it did leave behind must go too.
     let root = ws.dir.path().to_path_buf();
-    let sealed = read_only_dir_under(&root);
-    assert!(
-        sealed.is_some(),
-        "the run staged nothing read-only under {}, so this test no longer covers the leak",
-        root.display()
-    );
+    let sealed = root.join("sealed");
+    let inner = sealed.join("bin");
+    std::fs::create_dir_all(&inner).expect("mkdir sealed/bin");
+    std::fs::write(inner.join("tool"), "#!/bin/sh\n").expect("write tool");
+    for dir in [&inner, &sealed] {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).expect("seal");
+    }
 
     drop(ws);
     assert!(!root.exists(), "{} left behind", root.display());
