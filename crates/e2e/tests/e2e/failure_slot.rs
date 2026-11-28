@@ -217,6 +217,12 @@ target(name = "grp", driver = "group", deps = ["//p:a"])
             .result_addr(rs.clone(), &grp, OutputMatcher::All, &opts),
     );
     assert!(ra.is_err() && rg.is_err());
+    // The claim's diagnostic joins the one fill; writing it is no fill.
+    ws.engine.failure_slots().writes_drained().await;
+    assert!(
+        hcore::failure_log::read_diagnostic(&ws.engine.failure_slots().slot_dir(&a)).is_some(),
+        "the claim wrote its diagnostic"
+    );
     assert_eq!(ws.engine.failure_slots().fills(), 1);
     let f = rs.take_failures();
     assert!(render(&f).contains("│ once"), "{}", render(&f));
@@ -380,8 +386,11 @@ async fn failure_slot_cleared_on_cache_hit() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A rerun that fails having printed nothing replaces the slot with one
+/// whose `log.txt` is empty (RUN-19): the old run's log is never shown as
+/// the new one's.
 #[tokio::test]
-async fn failure_slot_cleared_when_rerun_fails_without_log() -> anyhow::Result<()> {
+async fn rerun_failing_without_output_replaces_the_slot() -> anyhow::Result<()> {
     let ws = Workspace::new();
     let ctl = tempfile::tempdir()?;
     toggled(&ws, ctl.path(), false);
@@ -392,7 +401,7 @@ async fn failure_slot_cleared_when_rerun_fails_without_log() -> anyhow::Result<(
     std::fs::write(ctl.path().join("noout"), "")?;
     let f = failures(&ws.engine, "//p:t", &ResultOptions::default()).await?;
     assert!(!render(&f).contains("first-marker"), "{}", render(&f));
-    assert!(!slot_exists(&ws.engine, "//p:t"));
+    assert_eq!(slot_log(&ws.engine, "//p:t").as_deref(), Some(""));
     Ok(())
 }
 
