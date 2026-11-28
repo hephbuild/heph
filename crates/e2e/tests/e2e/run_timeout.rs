@@ -929,14 +929,15 @@ async fn a_process_past_its_timeout_times_out_after_a_slow_preparation() -> anyh
 }
 
 /// The `ResultEnd` of `addr`'s timed-out run: its typed timeout and the log
-/// tail it carries. It is a root failure, not a stop: the CI view prints
-/// nothing live for a stop.
+/// tail its record names (the end carries a reference, never the text; P13),
+/// read from the failure slot. It is a root failure, not a stop: the CI view
+/// prints nothing live for a stop.
 fn timed_out_end(
     events: &[BuildEvent],
     addr: &str,
 ) -> (
     Option<hcore::events::TimedOutData>,
-    Option<hcore::events::LogTailData>,
+    Option<hcore::failure_log::LogTail>,
 ) {
     let ends: Vec<_> = events
         .iter()
@@ -944,14 +945,24 @@ fn timed_out_end(
             BuildEventKind::ResultEnd {
                 addr: a,
                 timed_out,
-                log_tail,
+                failure,
                 upstream_of,
                 cancelled,
                 ..
             } if a == addr => {
                 assert_eq!(upstream_of, &None, "{addr} is the root");
                 assert!(!cancelled, "{addr} timed out, it was not stopped");
-                Some((timed_out.clone(), log_tail.clone()))
+                let tail = failure
+                    .as_ref()
+                    .and_then(|f| f.log.as_ref())
+                    .and_then(|log| {
+                        hcore::failure_log::read_tail(
+                            log,
+                            hcore::failure_log::TAIL_LINES_CAP,
+                            hcore::failure_log::TAIL_MAX_BYTES,
+                        )
+                    });
+                Some((timed_out.clone(), tail))
             }
             _ => None,
         })
@@ -966,8 +977,8 @@ fn timed_out_end(
 /// shows under the failure's header.
 const CHATTY: &str = "for i in $(seq 1 30); do echo line $i; done; sleep 60; echo done > $OUT";
 
-/// A timed-out run's `ResultEnd` carries the last lines of what it printed,
-/// as any failure's does: the line backend prints them live under the
+/// A timed-out run's `ResultEnd` names a log holding the last lines of what
+/// it printed, as any failure's does: the line backend prints them live under the
 /// "timed out" header. Stopped within its grace, the run fills its failure
 /// slot, and the tail comes from there.
 #[tokio::test]
@@ -1056,7 +1067,7 @@ async fn timed_out_on_multi_thread(
 ) -> anyhow::Result<(
     Duration,
     Option<hcore::events::TimedOutData>,
-    Option<hcore::events::LogTailData>,
+    Option<hcore::failure_log::LogTail>,
 )> {
     let ws = tempfile::tempdir()?;
     write_build(

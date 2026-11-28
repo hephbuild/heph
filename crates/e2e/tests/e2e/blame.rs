@@ -1009,7 +1009,7 @@ async fn cycle_under_input_def_is_a_cycle_not_a_failure() -> anyhow::Result<()> 
     };
     assert_eq!(f.culprit().to_string(), "//a:root", "{}", r.describe());
     let text = crate::common::failure_text(f);
-    assert!(text.contains("cycle"), "a cycle: {text}");
+    assert!(text.contains("cyclic dependency"), "a cycle: {text}");
     Ok(())
 }
 
