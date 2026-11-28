@@ -405,6 +405,7 @@ impl Engine {
                         &addr,
                         consumer,
                         || crate::engine::deferred::declared_origin(&input.origin_id),
+                        |_| rs.decl_loc(consumer),
                         |e| {
                             e.context(format!(
                                 "{consumer} references credential {addr}, which does not resolve"

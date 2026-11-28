@@ -194,7 +194,10 @@ pub(crate) fn compact(
                 })
             };
             let message = own_message(e, culprit, &mut causes, &mut more_causes, end.as_deref());
-            Diagnostic::new(stage, message)
+            let mut d = Diagnostic::new(stage, message);
+            // The declaration the message names, for a renderer to point at.
+            d.location = missing_dep.and_then(|m| m.at.clone());
+            d
         }
     };
     if diagnostic.addr.is_none()
@@ -1325,12 +1328,21 @@ mod tests {
                 dep: addr("//d:missing"),
                 declarer: addr("//d:t"),
                 origin_id: "deps".to_owned(),
+                at: hcore::diagnostic::SourceLoc::checked("d/defs".to_owned(), 4, 5).ok(),
             }),
             Boundary::GetDef,
             &addr("//d:t"),
         );
         let rec = compact(&e, &target("//d:t"), &addr("//d:t"), &Scrub::default());
         assert_eq!(rec.diagnostic.stage, Stage::Link);
+        // The declaration the message names is the record's location.
+        let at = rec.diagnostic.location.as_ref().expect("a location");
+        assert_eq!(at.to_string(), "d/defs:4:5");
+        assert!(
+            rec.diagnostic.message.contains("declared at d/defs:4:5"),
+            "{}",
+            rec.diagnostic.message
+        );
         let rec = compact(
             &missing(),
             &target("//d:other"),

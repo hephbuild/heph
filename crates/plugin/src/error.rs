@@ -341,21 +341,31 @@ pub struct MissingDep {
     pub dep: Addr,
     pub declarer: Addr,
     pub origin_id: String,
+    /// Where the declarer declares it: its [`SpecSource`]'s call, or finer
+    /// when its provider can locate the declaration's field. `None` when the
+    /// declarer's spec carries no source (a provider that reports none).
+    ///
+    /// [`SpecSource`]: crate::provider::SpecSource
+    pub at: Option<hcore::diagnostic::SourceLoc>,
 }
 
 impl fmt::Display for MissingDep {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Until targets carry their source location, the package is the
-        // closest the message can point to: whatever source its provider
-        // declared it from is that package's.
-        let pkg = self.declarer.package.as_str();
         write!(
             f,
-            "{} depends on {}, which does not exist (`{}`, declared in ",
+            "{} depends on {}, which does not exist (`{}`, declared ",
             self.declarer.format(),
             self.dep.format(),
             self.origin_id,
         )?;
+        if let Some(at) = &self.at {
+            return write!(f, "at {at})");
+        }
+        // Without a source, the package is the closest the message can
+        // point to: whatever source its provider declared it from is that
+        // package's.
+        f.write_str("in ")?;
+        let pkg = self.declarer.package.as_str();
         if pkg.is_empty() {
             f.write_str("the root package)")
         } else {
@@ -380,19 +390,25 @@ impl MissingDep {
     /// `otherwise` wraps it (a context, or a [`StageFrame`] through
     /// [`with_stage`](crate::diagnostic::with_stage)).
     ///
+    /// `at` is asked, with the origin `origin_id` gave, where the declarer
+    /// declares it ([`MissingDep::at`]); only on the not-found path.
+    ///
     /// [`StageFrame`]: crate::diagnostic::StageFrame
     pub fn wrap_or(
         e: anyhow::Error,
         dep: &Addr,
         declarer: &Addr,
         origin_id: impl FnOnce() -> String,
+        at: impl FnOnce(&str) -> Option<hcore::diagnostic::SourceLoc>,
         otherwise: impl FnOnce(anyhow::Error) -> anyhow::Error,
     ) -> anyhow::Error {
         if Self::names(&e, dep) {
+            let origin_id = origin_id();
             return e.context(Self {
                 dep: dep.clone(),
                 declarer: declarer.clone(),
-                origin_id: origin_id(),
+                at: at(&origin_id),
+                origin_id,
             });
         }
         otherwise(e)

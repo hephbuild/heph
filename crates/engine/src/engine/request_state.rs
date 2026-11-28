@@ -1565,6 +1565,16 @@ impl RequestState {
         out
     }
 
+    /// Where `addr` was declared, for a diagnostic about it: its spec's
+    /// [`SpecSource`](hplugin::provider::SpecSource) call, when this request
+    /// already resolved the spec and its provider reported a source. Never
+    /// resolves anything: a spec not yet resolved, or resolved with an error,
+    /// has no location here.
+    pub(crate) fn decl_loc(&self, addr: &Addr) -> Option<hcore::diagnostic::SourceLoc> {
+        let spec = self.data.mem_spec.peek(&AddrKey(addr.clone()))?.ok()?;
+        Some(spec.spec.source.as_ref()?.call_loc())
+    }
+
     /// Drains and returns all recorded failures in insertion order, leaving the
     /// registry empty. Called once at the end of execution to render. Each
     /// failure's [`path`](TargetFailure::path) is the graph's as it is now

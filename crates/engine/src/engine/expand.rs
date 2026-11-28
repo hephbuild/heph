@@ -530,22 +530,21 @@ impl Engine {
             .iter()
             .map(move |input| {
                 // A dependent's merged transitive input was declared by the
-                // target it came from, not by `declarer`: keep what can look
-                // that target up (only for such an input; a failure reads it).
-                // A substring test, not `transitive_origin`: this runs for
-                // every edge, and the origin's text is only for the error.
-                let transitive = input
-                    .origin_id
-                    .contains(TRANSITIVE_PREFIX)
-                    .then(|| rs.clone());
+                // target it came from, not by `declarer`: a failure looks
+                // that target up. A substring test, not `transitive_origin`:
+                // this runs for every edge, and the origin's text is only for
+                // the error.
+                let transitive = input.origin_id.contains(TRANSITIVE_PREFIX);
+                // Kept for the failure path: where the declarer declared it.
+                let rs = rs.clone();
                 Arc::clone(self)
                     .get_def(rs.clone(), &input.r#ref.r#ref)
                     .map(move |def| {
                         let def = def.map_err(|e| {
                             let dep = &input.r#ref.r#ref;
                             let real = transitive
-                                .as_ref()
-                                .and_then(|rs| rs.transitive_declarer(&input.origin_id));
+                                .then(|| rs.transitive_declarer(&input.origin_id))
+                                .flatten();
                             let declarer = real.as_ref().unwrap_or(declarer);
                             MissingDep::wrap_or(
                                 e,
@@ -555,6 +554,7 @@ impl Engine {
                                     transitive_origin(&input.origin_id)
                                         .unwrap_or_else(|| declared_origin(&input.origin_id))
                                 },
+                                |_| rs.decl_loc(declarer),
                                 |e| {
                                     e.context(InputDefFailed {
                                         input: dep.clone(),
