@@ -668,6 +668,16 @@ impl Engine {
     /// entry mirrored: a log must never describe another run than the
     /// outputs held. `Ok(Err(reason))` when it cannot be served; nothing is
     /// written then.
+    ///
+    /// It takes the first cache [`RemoteCacheSet::locate`] finds and does not
+    /// fall through past it the way an output blob does
+    /// ([`Engine::pull_remote_blob_from_any`]). A log has an empty hashout, so
+    /// no other cache's entry can be shown to be the same log, and only
+    /// [`same_revision`] ties it to the outputs; the log is best-effort, so a
+    /// first cache that cannot serve it whole leaves it unavailable rather
+    /// than borrowed from another run.
+    ///
+    /// [`RemoteCacheSet::locate`]: crate::engine::remote_cache::RemoteCacheSet::locate
     async fn fetch_remote_log(
         self: &Arc<Self>,
         addr: &Addr,
@@ -694,9 +704,13 @@ impl Engine {
         }
         let Some(rev) = self
             .remote_caches()
-            .fetch_manifest(&ctoken, addr, hashin)
+            .locate(
+                &ctoken,
+                addr,
+                hashin,
+                crate::engine::remote_cache::Need::Manifest,
+            )
             .await
-            .with_context(|| format!("fetching the remote manifest of {addr} {hashin}"))?
         else {
             return Ok(Err(
                 "the log was never fetched for this entry, and no remote cache holds it".into(),

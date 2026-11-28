@@ -633,13 +633,20 @@ pub(crate) fn support_files_needed_for(has_output_artifact: bool, outputs: &[Str
 /// Whether one manifest artifact is a blob a caller asking for `outputs` will
 /// actually read — the single predicate behind [`Engine::needed_artifacts`] and
 /// the per-artifact gate in [`Engine::artifacts_from_manifest`], so residency is
-/// never decided against a different set than the one that gets read.
+/// never decided against a different set than the one that gets read — and
+/// behind the remote hit decision's presence check, which asks it of a remote
+/// manifest's entries, so the remote is checked for exactly what will be read.
 ///
 /// `support_needed` comes from [`support_files_needed`]; it is passed in rather
 /// than recomputed so a per-artifact loop stays linear.
-fn artifact_is_needed(a: &ManifestArtifact, outputs: &[String], support_needed: bool) -> bool {
-    match a.r#type {
-        ManifestArtifactType::Output => outputs.contains(&a.group),
+pub(crate) fn artifact_is_needed(
+    r#type: &ManifestArtifactType,
+    group: &str,
+    outputs: &[String],
+    support_needed: bool,
+) -> bool {
+    match r#type {
+        ManifestArtifactType::Output => outputs.iter().any(|o| o == group),
         ManifestArtifactType::SupportFile => support_needed,
         ManifestArtifactType::Log => false,
     }
@@ -1407,10 +1414,10 @@ impl Engine {
         manifest
             .artifacts
             .iter()
-            .filter(move |a| artifact_is_needed(a, outputs, support_needed))
+            .filter(move |a| artifact_is_needed(&a.r#type, &a.group, outputs, support_needed))
     }
 
-    /// Names of the blobs a caller asking for `outputs` needs that are not in the
+    /// The entries of the blobs a caller asking for `outputs` needs that are not in the
     /// local cache yet — exactly what has to be pulled from a remote before
     /// [`artifacts_from_manifest`](Self::artifacts_from_manifest) can serve the
     /// read.
@@ -1418,14 +1425,14 @@ impl Engine {
     /// A non-empty result is the normal state of a revision whose manifest came
     /// from a remote: the manifest records the revision's identity and hashouts,
     /// not which of its blobs happen to be resident.
-    pub(crate) async fn missing_local_blobs(
+    pub(crate) async fn missing_local_blobs<'m>(
         &self,
         _ctoken: &dyn Cancellable,
         addr: &Addr,
         hashin: &str,
-        manifest: &Manifest,
-        outputs: &[String],
-    ) -> anyhow::Result<Vec<String>> {
+        manifest: &'m Manifest,
+        outputs: &'m [String],
+    ) -> anyhow::Result<Vec<&'m ManifestArtifact>> {
         // Stays on the calling worker rather than going to `hcore::blocking`: this
         // is a walk of an already-parsed manifest plus one indexed point lookup per
         // needed artifact — no bytes read, no compression — and a `'static` job
@@ -1442,7 +1449,7 @@ impl Engine {
                     format!("probe local blob {} for {addr} {hashin}", artifact.name)
                 })?
             {
-                missing.push(artifact.name.clone());
+                missing.push(artifact);
             }
         }
         Ok(missing)
@@ -1553,7 +1560,7 @@ impl Engine {
             // Past the meta, only what this caller actually reads is probed and
             // handed back — Outputs gated on the requested groups, SupportFiles
             // gated on there being a requested group at all.
-            if !artifact_is_needed(artifact, outputs, support_needed) {
+            if !artifact_is_needed(&artifact.r#type, &artifact.group, outputs, support_needed) {
                 continue;
             }
 
@@ -3499,9 +3506,13 @@ mod tests {
         assert!(
             other
                 .remote_caches
-                .fetch_manifest(&ctoken, &addr, "HOSTLOCAL")
+                .locate(
+                    &ctoken,
+                    &addr,
+                    "HOSTLOCAL",
+                    crate::engine::remote_cache::Need::Manifest,
+                )
                 .await
-                .expect("fetch")
                 .is_none(),
             "the remote holds no manifest for a host-local entry"
         );
