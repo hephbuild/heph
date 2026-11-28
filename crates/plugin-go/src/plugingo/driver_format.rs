@@ -446,6 +446,7 @@ pub fn build_format_spec(p: FormatParams) -> TargetSpec {
         labels: listed::owned(listed::FORMAT),
         transitive: Default::default(),
         approval: Default::default(),
+        source: None,
     }
 }
 
@@ -463,6 +464,7 @@ pub fn build_format_check_spec(p: FormatParams) -> TargetSpec {
         labels: listed::owned(listed::FORMAT_CHECK),
         transitive: Default::default(),
         approval: Default::default(),
+        source: None,
     }
 }
 

@@ -266,6 +266,7 @@ fn spec(addr: Addr, kind: CheckKind, config: HashMap<String, Value>) -> TargetSp
         labels: kind.labels().iter().map(|l| (*l).to_string()).collect(),
         transitive: Default::default(),
         approval: Default::default(),
+        source: None,
     }
 }
 

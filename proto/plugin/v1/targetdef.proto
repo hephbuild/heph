@@ -24,6 +24,23 @@ message TargetSpec {
   repeated string labels = 4;
   Sandbox transitive = 5;
   Approval approval = 6;
+  // Where the provider declared the target (since 0.21.5). Diagnostics only:
+  // never in a def, a run, an env, argv or outputs, and never hashed. Absent
+  // when the provider does not know, or predates it.
+  SpecSource source = 7;
+}
+
+// Where a provider declared a target: a workspace-relative file and the span
+// of the declaring call, each line and column 1-based, columns counted in
+// chars. The host drops one whose file is absolute, climbs out with `..`, is
+// empty or holds a control character, or whose span is not 1-based and
+// ordered, and keeps the spec.
+message SpecSource {
+  string file = 1;
+  uint32 start_line = 2;
+  uint32 start_col = 3;
+  uint32 end_line = 4;
+  uint32 end_col = 5;
 }
 
 // Opaque driver-specific config blob. The host never inspects this; it is

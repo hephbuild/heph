@@ -106,6 +106,66 @@ pub struct TargetSpec {
     pub labels: Vec<String>,
     pub transitive: Sandbox,
     pub approval: Approval,
+    /// Where the provider declared the target, when it knows (e.g. the
+    /// buildfile provider's `target()` call in `p/BUILD`).
+    ///
+    /// **Diagnostics only: never in a def, a run, an env, argv or outputs.**
+    /// Moving a declaration down a line, or into a helper, must rebuild
+    /// nothing (I1). It is skipped by serde, and [`SpecSource`] has no `Hash`,
+    /// so a driver that hashes its spec cannot pick it up by accident. A
+    /// cdylib driver receives it too, and nothing checks what it does with it.
+    #[serde(skip)]
+    pub source: Option<SpecSource>,
+}
+
+/// Where a provider declared a target: a workspace-relative source file and
+/// the span of the call that declared it (the buildfile provider's
+/// `target(...)` call, say, in the `.bzl` file when a macro made it).
+///
+/// Only the file and the call are kept, one `Arc` and four `u32`s per spec: a
+/// diagnostic that wants a finer span (one keyword argument) asks the provider
+/// for it on the error path. No `Hash` (I1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpecSource {
+    file: Arc<str>,
+    call: hcore::diagnostic::Span,
+}
+
+impl SpecSource {
+    /// `file` and `call` as a source, or why not: `file` must be what a
+    /// [`SourceLoc`](hcore::diagnostic::SourceLoc) accepts (workspace-relative,
+    /// not climbing out with `..`, no control character, under the cap) and
+    /// `call` a 1-based, ordered span.
+    pub fn checked(file: Arc<str>, call: hcore::diagnostic::Span) -> Result<Self, String> {
+        hcore::diagnostic::SourceLoc::check_file(&file)?;
+        if !call.is_valid() {
+            return Err(format!(
+                "the call span {call:?} is not a 1-based, ordered span"
+            ));
+        }
+        Ok(Self { file, call })
+    }
+
+    /// The workspace-relative file the call is in.
+    pub fn file(&self) -> &str {
+        &self.file
+    }
+
+    /// The file, shared.
+    pub fn file_arc(&self) -> &Arc<str> {
+        &self.file
+    }
+
+    /// The declaring call's span.
+    pub fn call(&self) -> hcore::diagnostic::Span {
+        self.call
+    }
+
+    /// Where the declaring call starts: what a diagnostic points at when it
+    /// has nothing finer.
+    pub fn call_loc(&self) -> hcore::diagnostic::SourceLoc {
+        self.call.start_in(&self.file)
+    }
 }
 
 /// The name of a resource pool a target reserves from (`cpu`, `memory`, or a
@@ -460,5 +520,63 @@ pub trait Provider: Send + Sync {
     /// complete and document them. Default: none.
     fn state_schema(&self) -> Option<StateSchema> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hcore::diagnostic::Span;
+
+    fn span(l: u32, c: u32, el: u32, ec: u32) -> Span {
+        Span {
+            start_line: l,
+            start_col: c,
+            end_line: el,
+            end_col: ec,
+        }
+    }
+
+    /// I1: serde never carries where a target was declared, so a driver that
+    /// hashes its spec's serde form hashes the same bytes wherever the target
+    /// moves; and a payload written without the field decodes.
+    #[test]
+    fn target_spec_serde_skips_source() {
+        let mut spec = TargetSpec {
+            addr: hmodel::htaddr::parse_addr("//p:t").unwrap(),
+            driver: "exec".into(),
+            ..Default::default()
+        };
+        let bare = serde_json::to_string(&spec).unwrap();
+        spec.source = Some(SpecSource::checked("p/BUILD".into(), span(4, 1, 6, 2)).unwrap());
+        let with = serde_json::to_string(&spec).unwrap();
+        assert_eq!(bare, with, "the source is not serialized");
+        assert!(!with.contains("p/BUILD"), "{with}");
+        let back: TargetSpec = serde_json::from_str(&with).unwrap();
+        assert!(back.source.is_none());
+        assert_eq!(back.addr, spec.addr);
+    }
+
+    #[test]
+    fn spec_source_refuses_what_a_location_refuses() {
+        for file in ["", "/ws/p/BUILD", "../p/BUILD", "p/../../x", "p/\x1bBUILD"] {
+            assert!(
+                SpecSource::checked(file.into(), span(1, 1, 1, 2)).is_err(),
+                "{file:?}"
+            );
+        }
+        for bad in [
+            span(0, 1, 1, 1),
+            span(1, 0, 1, 1),
+            span(2, 1, 1, 1),
+            span(1, 5, 1, 4),
+        ] {
+            assert!(
+                SpecSource::checked("p/BUILD".into(), bad).is_err(),
+                "{bad:?}"
+            );
+        }
+        let s = SpecSource::checked("p/BUILD".into(), span(3, 5, 3, 9)).unwrap();
+        assert_eq!(s.call_loc().to_string(), "p/BUILD:3:5");
     }
 }
