@@ -63,9 +63,13 @@ impl ReportContext {
         log_lines: usize,
     ) -> Self {
         // A target a stop ended did not fail: no box, and no word about it.
+        // A process that failed while its output streamed was told then, in
+        // its one line (D6.1c): no box either.
         let records = failures
             .iter()
-            .filter(|f| !f.record.cancelled && !was_cancelled(&f.addr.format()))
+            .filter(|f| {
+                !f.record.cancelled && !f.record.told_streamed() && !was_cancelled(&f.addr.format())
+            })
             .map(|f| Arc::clone(&f.record))
             .collect();
         Self {

@@ -35,13 +35,14 @@ pub fn render_failures_to_string(failures: &[Arc<TargetFailure>], color: bool) -
 }
 
 /// Each failure's record drawn by [`render_box`] under `ctx`, a blank line
-/// between two boxes.
+/// between two boxes. A process that failed while its output streamed has
+/// no box: its one line said it then (D6.1c).
 fn render_failures<'a>(
     failures: impl Iterator<Item = &'a Arc<TargetFailure>>,
     ctx: &RenderCtx,
 ) -> String {
     let mut out = String::new();
-    for (i, f) in failures.enumerate() {
+    for (i, f) in failures.filter(|f| !f.record.told_streamed()).enumerate() {
         if i > 0 {
             out.push('\n');
         }
@@ -467,8 +468,12 @@ async fn take_failure_outcome(
     // report and the CI box point at it on the same answer. One printed
     // live carried that answer then and is not asked again — but it is
     // still taken, so the exit code and telemetry count it.
+    // A failure told in its one line after a streamed run gets no box, so
+    // no `log:` row to ask about either.
     let failures = rs
-        .take_failures_with_logs_where(|f| !printed_live.contains(&f.addr.format()))
+        .take_failures_with_logs_where(|f| {
+            !f.record.told_streamed() && !printed_live.contains(&f.addr.format())
+        })
         .await;
     if failures.is_empty() {
         return Ok(incomplete);
@@ -866,6 +871,10 @@ fn render_anyhow_in(e: &anyhow::Error, color: bool, rel: &WorkspaceRel) -> Optio
         ..RenderCtx::default()
     };
     if let Some(tf) = downcast_chain_ref::<TargetFailure>(e) {
+        // Told already, in its one line after the output (D6.1c).
+        if tf.record.told_streamed() {
+            return Some(String::new());
+        }
         return Some(render_box(&tf.record, &ctx));
     }
     // A frozen-check failure that arrived outside a `TargetFailure` still gets

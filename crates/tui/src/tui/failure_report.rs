@@ -372,16 +372,17 @@ pub fn one_line(rec: &FailureRecord, ctx: &RenderCtx) -> String {
 
 /// The one line a target whose output streamed to the terminal gets when
 /// its process fails (D6.1c, U6): `✗ //t · exit status 1 · heph log //t`,
-/// right after its output. No newline.
-pub fn streamed_exec_line(rec: &FailureRecord) -> String {
+/// right after its output; the header's red bold under `color`. No newline.
+pub fn streamed_exec_line(rec: &FailureRecord, color: bool) -> String {
     let addr = log_addr(rec);
     let mut line = format!("✗ {}", clean_inline(addr));
     if let Some(status) = status(rec) {
         line.push_str(" · ");
         line.push_str(&status);
     }
-    line.push_str(" · heph log ");
-    line.push_str(&shell_quote(addr));
+    let mut line = paint(&line, Tone::RedBold, color);
+    let pointer = format!(" · heph log {}", shell_quote(addr));
+    line.push_str(&paint(&pointer, Tone::Dim, color));
     line
 }
 

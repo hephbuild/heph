@@ -451,8 +451,7 @@ where
             let mut stdout = terminal_tap::Tapped::new(stdout, &tap);
             let mut stderr = terminal_tap::Tapped::new(stderr, &tap);
             let result = inner(None, Some(&mut stdout), Some(&mut stderr), None).await;
-            let terminal = terminal_tap::finish(&tap, &mut stdout, &mut stderr).await;
-            result.map(|()| terminal)
+            terminal_tap::finish_run(&tap, &mut stdout, &mut stderr, result).await
         })
     })
 }
@@ -902,7 +901,7 @@ impl RunApp {
                 // there is no tail for a box to leave out.
                 let result = inner(None, None, None, None)
                     .await
-                    .map(|()| crate::engine::TerminalUse::default());
+                    .map(|_| crate::engine::TerminalUse::default());
                 // Before any error renders: this leaves the terminal cooked
                 // again, whatever the run returned.
                 let pump = session.lock().unwrap_or_else(|e| e.into_inner()).take();
@@ -1068,8 +1067,9 @@ impl App for RunApp {
                         winsize.as_ref().map(|w| w.sizes.clone()),
                     )
                     .await;
-                    let terminal = terminal_tap::finish(&tap, &mut stdout, &mut stderr).await;
-                    result.map(|()| terminal)
+                    // The failure's one line, if its process failed, lands
+                    // here, before the TUI comes back over it (D6.1c).
+                    terminal_tap::finish_run(&tap, &mut stdout, &mut stderr, result).await
                 })
             }))
         } else {
@@ -2149,7 +2149,7 @@ mod tests {
         wrapped(Box::new(move |_, _, _, _| {
             Box::pin(async move {
                 target.store(true, Ordering::Relaxed);
-                Ok(())
+                Ok(crate::engine::RunEnd::default())
             })
         }))
         .await?;

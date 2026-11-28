@@ -141,6 +141,40 @@ where
     }
 }
 
+/// [`finish`], then, while the wrapper still holds the terminal, the one line
+/// a run that streamed gets when its process failed (D6.1c), on heph's
+/// stderr: `✗ //t · exit status 1 · heph log //t`. Every renderer leaves
+/// that failure's box out (`FailureRecord::told_streamed`), so this line is
+/// all the run says of it. What the wrapper hands back to the engine.
+pub async fn finish_run<O, E>(
+    tap: &TerminalTap,
+    stdout: &mut Tapped<O>,
+    stderr: &mut Tapped<E>,
+    result: anyhow::Result<crate::engine::RunEnd>,
+) -> anyhow::Result<TerminalUse>
+where
+    O: AsyncWrite + Unpin,
+    E: AsyncWrite + Unpin,
+{
+    let used = finish(tap, stdout, stderr).await;
+    let end = result?;
+    if let Some(rec) = end.exec_failure.as_deref().filter(|_| used.streamed) {
+        let color = stderr.tap.is_some() && crate::tui::color::stderr_color_enabled();
+        let line = format!(
+            "{}\n",
+            crate::tui::failure_report::streamed_exec_line(rec, color)
+        );
+        let told = async {
+            stderr.inner.write_all(line.as_bytes()).await?;
+            stderr.inner.flush().await
+        };
+        if let Err(error) = told.await {
+            tracing::debug!(%error, "telling the streamed run's failure");
+        }
+    }
+    Ok(used)
+}
+
 async fn end_line(w: &mut (impl AsyncWrite + Unpin)) -> io::Result<()> {
     w.write_all(b"\n").await?;
     w.flush().await

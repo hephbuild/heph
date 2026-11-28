@@ -2921,6 +2921,9 @@ impl CiProgressView {
     /// lock is held for it, so no line another thread logs lands inside it.
     fn print_box(&self, text: &str) {
         let text = text.trim_end_matches('\n');
+        if text.is_empty() {
+            return;
+        }
         match &self.sink {
             Some(sink) => sink.write_diagnostic(&format!("{text}\n")),
             None => tracing::error!("{text}"),
@@ -3065,6 +3068,10 @@ impl CIAppView for CiProgressView {
                 // end's own fields, its tail the one an older host sent, else
                 // read from the slot the end names (P13).
                 let block = match failure {
+                    // A process that failed while its output streamed: the
+                    // CLI's wrapper printed its one line right after that
+                    // output (D6.1c). It is still a culprit for the totals.
+                    Some(rec) if rec.told_streamed() => String::new(),
                     Some(rec) => crate::tui::failure_report::render_box(rec, &self.render_ctx()),
                     None => with_left_behind(
                         live_failure_block(
