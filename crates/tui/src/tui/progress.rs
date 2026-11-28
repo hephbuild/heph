@@ -826,6 +826,15 @@ impl BuildState {
         self.dash.matched_total()
     }
 
+    /// The selection matched `addr`: a target the user asked for, not one
+    /// of their dependencies.
+    pub fn is_matched(&self, addr: &str) -> bool {
+        self.dash
+            .id(addr)
+            .and_then(|id| self.dash.record(id))
+            .is_some_and(|r| r.matched())
+    }
+
     /// Matched-target progress as `(done, total, complete)`: how many matched
     /// top-level targets have finished, the total matched so far, and whether the
     /// matcher fully resolved (`false` ⇒ the total is provisional). `None` until
@@ -2819,6 +2828,11 @@ pub struct CiProgressView {
     /// The workspace a box names paths relative to and reads its excerpts
     /// from ([`Self::with_workspace`]).
     workspace: Option<(std::path::PathBuf, crate::tui::text::WorkspaceRel)>,
+    /// The culprits whose box went out, in print order (an address, or the
+    /// file that did not evaluate): the totals line names them.
+    culprits: Vec<String>,
+    /// Matched targets whose `skipped:` line went out: one each.
+    skipped_printed: HashSet<String>,
 }
 
 /// `heph run --log-lines`' default: how many tail lines a failure prints live
@@ -2836,6 +2850,17 @@ impl CiProgressView {
             failures_printed: HashSet::new(),
             sink: None,
             workspace: None,
+            culprits: Vec::new(),
+            skipped_printed: HashSet::new(),
+        }
+    }
+
+    /// A line of the view's own (a `skipped:` or totals line), through the
+    /// sink when it has one, as the boxes go.
+    fn print_line(&self, text: &str) {
+        match &self.sink {
+            Some(sink) => sink.write_diagnostic(&format!("{text}\n")),
+            None => tracing::info!("{text}"),
         }
     }
 
@@ -3032,6 +3057,7 @@ impl CIAppView for CiProgressView {
                     ),
                 };
                 self.print_box(&block);
+                self.culprits.push(addr.clone());
             }
             // A BUILD file that did not evaluate: its block, once, headed by
             // the file (it is not a target).
@@ -3058,6 +3084,28 @@ impl CIAppView for CiProgressView {
                     ),
                 };
                 self.print_box(&block);
+                self.culprits.push(file.clone());
+            }
+            // A target the user asked for that did not run because a culprit
+            // it depends on failed: one line naming that culprit (D6.1c), as
+            // it ends. A dependency taken down prints nothing; the culprit's
+            // box and the totals line explain it.
+            BuildEventKind::ResultEnd {
+                addr,
+                error: Some(_),
+                upstream_of,
+                upstream_file,
+                cancelled: false,
+                duplicate,
+                ..
+            } if (upstream_of.is_some() || (*duplicate && upstream_file.is_some()))
+                && self.core.state.is_matched(addr)
+                && !self.skipped_printed.contains(addr) =>
+            {
+                if let Some(root) = upstream_file.as_deref().or(upstream_of.as_deref()) {
+                    self.skipped_printed.insert(addr.clone());
+                    self.print_line(&crate::tui::failure_report::skipped_line(addr, root));
+                }
             }
             _ => {}
         }
@@ -3078,6 +3126,14 @@ impl CIAppView for CiProgressView {
             tracing::info!("{line}");
         }
         tracing::info!("{}", self.summary_line());
+        // The run's last line (D6.1c): which culprits failed and how many
+        // requested targets they kept from running, the `skipped:` lines
+        // above it. None when nothing failed.
+        let totals =
+            crate::tui::failure_report::totals_line(&self.culprits, self.skipped_printed.len());
+        if !totals.is_empty() {
+            self.print_line(&totals);
+        }
     }
 
     fn set_stopped(&mut self) {
@@ -4807,6 +4863,72 @@ mod tests {
         let log = ci_view_log_of(view, HolderNames::default(), &[ev(1, file_failed)]);
         assert_eq!(log, format!("ERROR {}\n", want.trim_end_matches('\n')));
         assert!(!log.contains("flat"), "{log}");
+    }
+
+    /// D6.1c in the line backend: a matched target a culprit took down gets
+    /// one `skipped:` line naming it (a target or a file), once; a dependency
+    /// taken down and a stop get none. The run ends with the totals line,
+    /// the culprits in print order; a run where nothing failed has none.
+    #[test]
+    fn ci_view_prints_skipped_and_totals_lines() {
+        let run = |events: &[BuildEventKind]| -> Vec<String> {
+            let sink = crate::tui::log_sink::LogSink::new_direct_with(std::sync::Arc::new(
+                crate::tui::session::SessionSlot::new(),
+            ));
+            let mut rx = sink.switch_to_buffered();
+            let mut v = CiProgressView::new("Running");
+            v.set_sink(sink);
+            for e in events {
+                v.apply(&ev(1, e.clone()));
+            }
+            v.finish();
+            let mut out = Vec::new();
+            while let Ok(line) = rx.try_recv() {
+                out.push(String::from_utf8(line.bytes).expect("utf-8"));
+            }
+            out
+        };
+        let mut dup = failed_end("//a:other", None, false, None);
+        if let BuildEventKind::ResultEnd {
+            duplicate,
+            upstream_file,
+            ..
+        } = &mut dup
+        {
+            *duplicate = true;
+            *upstream_file = Some("d/BUILD".into());
+        }
+        let lines = run(&[
+            matched(&["//a:root", "//a:other", "//a:stopped"], true),
+            failed_end("//c:y", None, false, None),
+            failed_end("//a:dep", Some("//c:y"), false, None),
+            failed_end("//a:root", Some("//c:y"), false, None),
+            failed_end("//a:root", Some("//c:y"), false, None),
+            failed_end("//a:stopped", Some("//c:y"), true, None),
+            BuildEventKind::FileFailed {
+                file: "d/BUILD".into(),
+                entry: "//d:t".into(),
+                error: "evaluating d/BUILD: boom".into(),
+                path: vec!["//d:t".into()],
+                failure: None,
+            },
+            dup,
+        ]);
+        let plain: Vec<&String> = lines.iter().filter(|l| !l.starts_with('✗')).collect();
+        // `skipped` counts the lines above it: requested targets, not the
+        // dependency taken down.
+        assert_eq!(
+            plain,
+            [
+                "– //a:root skipped: //c:y failed\n",
+                "– //a:other skipped: d/BUILD failed\n",
+                "2 failed: //c:y, d/BUILD · 2 skipped\n",
+            ],
+            "{lines:#?}"
+        );
+
+        let lines = run(&[matched(&["//a:ok"], true), result_end("//a:ok", None)]);
+        assert!(lines.is_empty(), "nothing failed: {lines:?}");
     }
 
     /// With the backend's sink, each box is one write: however many views
