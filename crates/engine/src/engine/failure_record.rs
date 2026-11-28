@@ -26,6 +26,7 @@ use hplugin::error::{
     Culprit, FailureLog, FrozenCheckError, MissingDep, ProcessFailed, RemoteProcessFailed,
     RevisionChangedError, TargetFailure,
 };
+use std::borrow::Cow;
 use std::fmt;
 use std::sync::{Arc, OnceLock};
 
@@ -80,8 +81,9 @@ impl Scrub {
             .clone()
     }
 
-    /// `s` with every value replaced.
-    pub(crate) fn apply(&self, s: &str) -> String {
+    /// `s` with every value replaced; `s` itself when there is nothing to
+    /// scrub.
+    pub(crate) fn apply<'s>(&self, s: &'s str) -> Cow<'s, str> {
         scrub_text(self.needles().as_ref(), s)
     }
 }
@@ -93,20 +95,21 @@ impl fmt::Debug for Scrub {
 }
 
 /// `s` with every scrubbed value replaced, through the same scrubber the run
-/// log's tee uses (one scrubber, as `hdriver_support::redact` asks).
-fn scrub_text(needles: Option<&Arc<Needles>>, s: &str) -> String {
+/// log's tee uses (one scrubber, as `hdriver_support::redact` asks). `s`
+/// itself, uncopied, when there is nothing to scrub (FQ r2).
+fn scrub_text<'s>(needles: Option<&Arc<Needles>>, s: &'s str) -> Cow<'s, str> {
     let Some(needles) = needles else {
-        return s.to_owned();
+        return Cow::Borrowed(s);
     };
     let mut r = Redactor::new(Arc::clone(needles));
     let mut out = r.push(s.as_bytes());
     out.extend(r.finish());
     // A needle is a whole `str` and the marker is ASCII, so the bytes stay
     // UTF-8; lossy only as a guard.
-    match String::from_utf8(out) {
+    Cow::Owned(match String::from_utf8(out) {
         Ok(s) => s,
         Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
-    }
+    })
 }
 
 /// What a `warn` or louder log line on a target's failure path prints for
@@ -143,7 +146,7 @@ pub(crate) fn compact(
     scrub: &Scrub,
 ) -> FailureRecord {
     let needles = scrub.needles();
-    let clean = |s: &str| scrub_text(needles.as_ref(), s);
+    let clean = |s: &str| scrub_text(needles.as_ref(), s).into_owned();
 
     if let Some(tf) = downcast_chain_ref::<TargetFailure>(e) {
         let mut rec = (*tf.record).clone();
@@ -1260,6 +1263,20 @@ mod tests {
             s.apply("another-secret hunter2-hunter2"),
             "[redacted] [redacted]"
         );
+    }
+
+    /// FQ r2: a scrub with nothing to scrub hands the text back uncopied.
+    #[test]
+    fn nothing_to_scrub_is_not_copied() {
+        let text = "no secret here";
+        assert!(matches!(
+            Scrub::new(Vec::<String>::new()).apply(text),
+            Cow::Borrowed(t) if std::ptr::eq(t, text)
+        ));
+        assert!(matches!(
+            Scrub::new(["hunter2-hunter2".to_owned()]).apply("hunter2-hunter2"),
+            Cow::Owned(t) if t == "[redacted]"
+        ));
     }
 
     #[test]
