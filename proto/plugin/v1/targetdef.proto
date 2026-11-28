@@ -26,7 +26,8 @@ message TargetSpec {
   Approval approval = 6;
   // Where the provider declared the target (since 0.21.5). Diagnostics only:
   // never in a def, a run, an env, argv or outputs, and never hashed. Absent
-  // when the provider does not know, or predates it.
+  // when the provider does not know, or predates it. Provider to host only:
+  // the host never sets it in the spec of a driver's ParseRequest.
   SpecSource source = 7;
 }
 

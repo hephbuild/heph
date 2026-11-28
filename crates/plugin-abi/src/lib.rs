@@ -41,7 +41,9 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// character, or whose span is incomplete, 0-based or reversed, is dropped
 /// with a `debug!` and the spec kept. The skew, both ways: a 0.21.4 provider
 /// sends none and its diagnostics have no location; a 0.21.5 provider on a
-/// 0.21.4 host has it skipped. No plugin must be rebuilt.
+/// 0.21.4 host has it skipped. It travels provider to host only: the host
+/// leaves it out of the `ParseRequest.target_spec` it sends a driver, so no
+/// cdylib driver can hash it or carry it into a run. No plugin must be rebuilt.
 ///
 /// 0.21.4 (additive, a patch): diagnostics on errors. `Error.diagnostic` (3),
 /// `GetError.diagnostic` (3) and `RunFailure.diagnostic` (6), a `Diagnostic`
