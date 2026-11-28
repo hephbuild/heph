@@ -59,8 +59,14 @@ pub struct FailureRecord {
     /// The shortest path from a requested target to the culprit, inclusive.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub path: Vec<String>,
-    /// Where in the target's life it failed.
-    #[serde(default, skip_serializing_if = "FailedIn::is_before_run")]
+    /// Where in the target's life it failed. Decoded leniently
+    /// ([`FailedIn::lenient`]): a newer host's value never ends a reader's
+    /// stream.
+    #[serde(
+        default,
+        skip_serializing_if = "FailedIn::is_before_run",
+        deserialize_with = "FailedIn::lenient"
+    )]
     pub failed_in: FailedIn,
     /// The process's exit, when the failure is a process that exited.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -264,6 +270,27 @@ impl FailedIn {
     fn is_before_run(&self) -> bool {
         matches!(self, Self::BeforeRun)
     }
+
+    /// The name [`FailedIn`] is written as.
+    fn from_name(s: &str) -> Option<Self> {
+        Some(match s {
+            "before_run" => Self::BeforeRun,
+            "exec" => Self::Exec,
+            "after_run" => Self::AfterRun,
+            _ => return None,
+        })
+    }
+
+    /// Decoded as [`lenient_stage`](crate::diagnostic) decodes a stage: an
+    /// unknown name (a newer host's) is [`AfterRun`](Self::AfterRun), which
+    /// keeps the failure's box and its log row. Never [`Exec`](Self::Exec):
+    /// under a streamed run that hides the box
+    /// ([`FailureRecord::told_streamed`]), and nothing would say the failure.
+    /// Only a value that is not a string fails the decode.
+    fn lenient<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let name = <std::borrow::Cow<'de, str>>::deserialize(d)?;
+        Ok(Self::from_name(&name).unwrap_or(Self::AfterRun))
+    }
 }
 
 /// How a failed process exited.
@@ -383,6 +410,38 @@ mod tests {
         assert!(json.contains(r#""failed_in":"exec""#), "{json}");
         let back: FailureRecord = serde_json::from_str(&json).expect("decode");
         assert_eq!(back, full);
+    }
+
+    /// A newer host's `failed_in` decodes: an older plugin-gh's event stream
+    /// must not end on it (compat F1). It reads as after the run, which
+    /// keeps the box and its log row: never `exec`, which under a streamed
+    /// run would hide the box (`told_streamed`). Absent is before the run.
+    #[test]
+    fn failed_in_unknown_decodes_as_after_run() {
+        let rec: FailureRecord = serde_json::from_str(
+            r#"{"diagnostic":{"stage":"run","message":"boom"},"failed_in":"in_orbit","streamed":true}"#,
+        )
+        .expect("an unknown failed_in decodes");
+        assert_eq!(rec.failed_in, FailedIn::AfterRun);
+        assert!(!rec.told_streamed());
+        for (name, want) in [
+            ("before_run", FailedIn::BeforeRun),
+            ("exec", FailedIn::Exec),
+            ("after_run", FailedIn::AfterRun),
+        ] {
+            let json =
+                format!(r#"{{"diagnostic":{{"stage":"run","message":"m"}},"failed_in":"{name}"}}"#);
+            let rec: FailureRecord = serde_json::from_str(&json).expect("decode");
+            assert_eq!(rec.failed_in, want, "{name}");
+        }
+        let absent: FailureRecord =
+            serde_json::from_str(r#"{"diagnostic":{"stage":"run","message":"m"}}"#)
+                .expect("decode");
+        assert_eq!(absent.failed_in, FailedIn::BeforeRun);
+        let bad = serde_json::from_str::<FailureRecord>(
+            r#"{"diagnostic":{"stage":"run","message":"m"},"failed_in":3}"#,
+        );
+        assert!(bad.is_err(), "only a value that is not a string fails");
     }
 
     /// A credential-material run's in-memory tail never rides the wire: the
