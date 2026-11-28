@@ -144,6 +144,7 @@ pub(crate) fn compact(
     }
 
     let mut causes = Vec::new();
+    let mut more_causes = 0;
     let found = find_diagnostic(e);
     let raised = found.is_some();
     let (exit, timed_out) = exec_facts(e);
@@ -181,7 +182,8 @@ pub(crate) fn compact(
                     Culprit::Target(_) => Stage::Run,
                 })
             };
-            Diagnostic::new(stage, own_message(e, culprit, &mut causes, end.as_deref()))
+            let message = own_message(e, culprit, &mut causes, &mut more_causes, end.as_deref());
+            Diagnostic::new(stage, message)
         }
     };
     if let Some(stage) = stage_override {
@@ -198,6 +200,7 @@ pub(crate) fn compact(
     rec.file = culprit.file().map(str::to_owned);
     rec.entry = entry.format();
     rec.causes = causes;
+    rec.more_causes = more_causes;
     rec.boundary = frame.map(|f| f.boundary.as_str().to_owned());
     rec.missing_dep = missing_dep.map(|m| hcore::failure::MissingDepData {
         dep: m.dep.format(),
@@ -310,8 +313,10 @@ pub(crate) fn exec_failure(addr: &Addr, e: &anyhow::Error, scrub: &Scrub) -> Opt
 }
 
 /// `e`'s cause as one message, as [`cause_frames`] reads it, but with an
-/// aggregate said as `{n} errors` and each of its members pushed onto
-/// `causes` (its own cause frames, joined), in input order.
+/// aggregate said as `{n} errors` and its members pushed onto `causes` (each
+/// one's own cause frames, joined), in input order: only the first
+/// [`CAUSES_CAP`] are formatted, and the rest are counted into `more` (CQ-6).
+/// An aggregate of thousands is said in 16 formats, not thousands.
 ///
 /// With `end`, the process-exit frame itself (a local [`ProcessFailed`] or
 /// the engine's timeout) is said as `end`, once, and every other frame is
@@ -324,6 +329,7 @@ fn own_message(
     e: &anyhow::Error,
     culprit: &Culprit,
     causes: &mut Vec<String>,
+    more: &mut u32,
     end: Option<&str>,
 ) -> String {
     let frames: Vec<(String, bool)> = hcore::hmemoizer::frames(e)
@@ -335,7 +341,9 @@ fn own_message(
                     || f.downcast_ref::<crate::engine::run_timeout::TimedOutError>()
                         .is_some());
             let text = if let Some(multi) = f.downcast_ref::<MultiError>() {
-                causes.extend(multi.0.iter().map(|m| cause_frames(m).join(": ")));
+                let room = CAUSES_CAP.saturating_sub(causes.len()).min(multi.0.len());
+                causes.extend(multi.0.iter().take(room).map(|m| cause_frames(m).join(": ")));
+                *more = more.saturating_add(count(multi.0.len() - room));
                 format!("{} errors", multi.0.len())
             } else if let Some(changed) = f.downcast_ref::<RevisionChangedError>()
                 && culprit.target() == Some(&changed.addr)
@@ -465,7 +473,8 @@ fn scrubbed(mut rec: FailureRecord, clean: &impl Fn(&str) -> String) -> FailureR
 /// cutting the message.
 fn bound(mut rec: FailureRecord) -> FailureRecord {
     rec.diagnostic = rec.diagnostic.bounded();
-    let mut cut = false;
+    // Causes `compact` counted rather than formatted were cut already.
+    let mut cut = rec.more_causes > 0;
     if rec.causes.len() > CAUSES_CAP {
         let more = rec.causes.len() - CAUSES_CAP;
         rec.more_causes = rec.more_causes.saturating_add(count(more));
@@ -594,6 +603,42 @@ mod tests {
         assert_eq!(rec.causes, want);
         assert_eq!(rec.more_causes, 4);
         assert!(rec.diagnostic.truncated);
+    }
+
+    /// CQ-6: an aggregate of thousands formats its first [`CAUSES_CAP`]
+    /// members only, and counts the rest.
+    #[test]
+    fn only_the_kept_causes_are_formatted() {
+        #[derive(Debug)]
+        struct Counted(Arc<std::sync::atomic::AtomicUsize>, usize);
+        impl std::fmt::Display for Counted {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                write!(f, "member {}", self.1)
+            }
+        }
+        impl std::error::Error for Counted {}
+
+        let formats = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let n = 5000;
+        let e: anyhow::Error = MultiError(
+            (0..n)
+                .map(|i| anyhow::Error::new(Counted(Arc::clone(&formats), i)))
+                .collect(),
+        )
+        .into();
+        let rec = of(&e);
+        assert_eq!(rec.causes.len(), CAUSES_CAP);
+        assert_eq!(rec.causes.first().map(String::as_str), Some("member 0"));
+        assert_eq!(rec.more_causes as usize, n - CAUSES_CAP);
+        assert!(rec.diagnostic.truncated);
+        let formatted = formats.load(std::sync::atomic::Ordering::Relaxed);
+        // Each kept member may be formatted a few times (its frames, then
+        // its own part); never once per member of the aggregate.
+        assert!(
+            formatted <= 4 * CAUSES_CAP,
+            "{formatted} formats for {n} members"
+        );
     }
 
     #[test]
