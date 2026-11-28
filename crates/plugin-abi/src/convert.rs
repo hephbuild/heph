@@ -799,6 +799,15 @@ pub fn sandbox_from_pb(s: pb::Sandbox) -> anyhow::Result<Sandbox> {
 // ---- TargetSpec ----
 
 pub fn target_spec_to_pb(t: &TargetSpec) -> pb::TargetSpec {
+    let mut spec = target_spec_to_pb_without_source(t);
+    spec.source = t.source.as_ref().map(spec_source_to_pb).into();
+    spec
+}
+
+/// [`target_spec_to_pb`] without where the target was declared: what a
+/// driver's parse request carries (I1), built without the source's file
+/// `String` it would drop.
+pub fn target_spec_to_pb_without_source(t: &TargetSpec) -> pb::TargetSpec {
     pb::TargetSpec {
         addr: addr_to_pb(&t.addr).into(),
         driver: Some(t.driver.clone()),
@@ -806,7 +815,6 @@ pub fn target_spec_to_pb(t: &TargetSpec) -> pb::TargetSpec {
         labels: t.labels.clone(),
         transitive: sandbox_to_pb(&t.transitive).into(),
         approval: approval_to_pb(&t.approval).into(),
-        source: t.source.as_ref().map(spec_source_to_pb).into(),
         ..Default::default()
     }
 }
