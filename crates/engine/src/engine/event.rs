@@ -46,13 +46,6 @@ pub struct ErrorDetail {
     /// The code the subprocess exited with: `None` for a signal, or when the
     /// driver reported no structured status.
     pub exit_code: Option<i32>,
-    /// The tail a recorded [`TargetFailure`](hplugin::error::TargetFailure)
-    /// on the chain already read.
-    pub log_tail: Option<hcore::events::LogTailData>,
-    /// The log `execute` kept in the failure slot, not read yet: only
-    /// `ResultEnd` reads its tail ([`result_log_tail`](Self::result_log_tail)),
-    /// so the inner scopes, which report only the message, pay no IO for it.
-    pub log: Option<hplugin::error::FailureLog>,
     /// The run outlasted the target's `timeout` (a
     /// [`TimedOutError`](crate::engine::run_timeout::TimedOutError) on the
     /// chain).
@@ -109,18 +102,11 @@ impl ErrorDetail {
             }),
             ..Self::default()
         };
-        for cause in e.chain() {
-            if d.log_tail.is_none()
-                && let Some(t) = cause.downcast_ref::<TargetFailure>()
-                && let Some(tail) = &t.log_tail
-            {
-                d.streamed |= t.streamed;
-                d.log_tail = Some(hcore::events::LogTailData {
-                    text: tail.text.clone(),
-                    start_line: tail.start_line,
-                    streamed: d.streamed,
-                });
-            }
+        // Another request's recorded failure, surfaced at its top: its
+        // record says whether its run streamed. The log itself is never
+        // read here: `ResultEnd` carries the record's reference (P13).
+        if let Some(t) = hcore::hmemoizer::downcast_chain_ref::<TargetFailure>(e) {
+            d.streamed |= t.streamed;
         }
         // Through the memoizer's shared wrappers: a run's own failure reaches
         // `ResultEnd` from the `execute` memoizer, so its `ProcessFailed` and
@@ -144,9 +130,6 @@ impl ErrorDetail {
             Some(hcore::process::Exit::Code(c)) => Some(c),
             _ => None,
         };
-        if d.log_tail.is_none() {
-            d.log = slot.and_then(|s| s.log.clone());
-        }
         // Through the memoizer's shared wrappers too: a recorded failure
         // reaches `ResultEnd` behind `TargetFailure`'s source.
         if let Some(t) = crate::engine::run_timeout::timed_out(e) {
@@ -164,28 +147,6 @@ impl ErrorDetail {
     /// inner spans would only duplicate it.
     pub fn into_message(self) -> String {
         self.message
-    }
-
-    /// The log tail `ResultEnd` carries: the recorded failure's, or else the
-    /// last lines of the failure slot's log — one seek-based read bounded by
-    /// the request's `--log-lines`, the same read the recorded failure makes.
-    /// Kept whether or not the output streamed to a terminal (D6.1):
-    /// `streamed` rides on it, and a renderer decides what to show.
-    pub fn result_log_tail(
-        log_tail: Option<hcore::events::LogTailData>,
-        log: Option<&hplugin::error::FailureLog>,
-        streamed: bool,
-    ) -> Option<hcore::events::LogTailData> {
-        let mut tail = log_tail.or_else(|| {
-            let tail = log?.tail().ok()?;
-            Some(hcore::events::LogTailData {
-                text: tail.text,
-                start_line: tail.start_line,
-                streamed: false,
-            })
-        })?;
-        tail.streamed |= streamed;
-        Some(tail)
     }
 }
 
