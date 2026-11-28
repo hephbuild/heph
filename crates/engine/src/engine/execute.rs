@@ -300,6 +300,9 @@ impl Engine {
                 // Whether the run's output reached a terminal: what a failure
                 // box reads to leave out a tail the user already saw (D6.1).
                 let streamed = ran.as_ref().is_ok_and(|(_, t)| t.streamed);
+                // The run itself failed: whether it was a stop was decided
+                // when it returned, and is on its error (CQ-3).
+                let stop_decided = matches!(&ran, Ok((Err(_), _)));
                 let run = ran.and_then(|(ran, _)| ran.stage(Boundary::Run, addr));
                 // End the live log while the sandbox still exists: a log the
                 // driver returned as an artifact is read from it.
@@ -385,8 +388,12 @@ impl Engine {
                         // request's token, or this execute abandoned by
                         // fail-fast — except for a timeout, which is a failure
                         // even when the request was cancelled during its grace.
+                        // A run that returned was decided as it returned
+                        // (the same answer its wrapper's line got); heph's
+                        // own failure around the run is judged here.
                         let cancelled = hplugin::error::is_cancelled(&err)
-                            || (crate::engine::run_timeout::stop_requested(rs.ctoken())
+                            || (!stop_decided
+                                && crate::engine::run_timeout::stop_requested(rs.ctoken())
                                 && !crate::engine::run_timeout::is_timed_out(&err));
                         let kept = if cancelled {
                             None
@@ -887,11 +894,29 @@ impl Engine {
                             w.finish().await;
                         }
                     }
+                    // Whether the run was stopped rather than failed, decided
+                    // once, here, and carried on the error, so the line the
+                    // wrapper tells and the failure the execute keeps cannot
+                    // disagree (CQ-3). A driver may report a stop as an error
+                    // of its own (exec's bare "cancelled"), so the stop
+                    // decides: the request's token, or this execute abandoned
+                    // by fail-fast. A timeout is a failure even when the
+                    // request was cancelled during its grace.
+                    let res = match res {
+                        Err(e)
+                            if !hplugin::error::is_cancelled(&e)
+                                && hcore::hasync::Cancellable::is_cancelled(&stop)
+                                && !crate::engine::run_timeout::is_timed_out(&e) =>
+                        {
+                            Err(e.context(hplugin::error::CancelledError))
+                        }
+                        res => res,
+                    };
                     // What the wrapper may say of a failed process while it
                     // still holds the terminal (D6.1c). A stop is not one.
                     let end = crate::engine::RunEnd {
                         exec_failure: match &res {
-                            Err(e) if !rs.ctoken().is_cancelled() => {
+                            Err(e) if !hplugin::error::is_cancelled(e) => {
                                 crate::engine::failure_record::exec_failure(
                                     &target.addr,
                                     e,
