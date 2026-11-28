@@ -419,6 +419,11 @@ pub enum BuildEventKind {
         /// row, but a consumer neither boxes it nor counts it as a failure
         /// (one box per culprit). Absent (false) from a host that predates
         /// it, and on every skipped, cancelled or successful end.
+        ///
+        /// Not skew-safe in the other direction: a consumer that predates
+        /// it reads a duplicate end as one more failure and double-counts
+        /// the culprit. `plugin-gh` therefore ships with the host it reads
+        /// (`docs/GHA_REPORTING.md`, §7.1).
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         duplicate: bool,
         /// What the failed run left behind and where to read it: the rows the

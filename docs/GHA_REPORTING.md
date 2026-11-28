@@ -214,6 +214,15 @@ Rules:
    not fit the section budget is dropped; its root stays listed. The fence is longer than any
    backtick run in the log, so a target's output cannot close it and render as markdown.
 4. Roots are themselves capped (10) with `…and N more root failures`.
+5. **A `ResultEnd` with `duplicate: true` never renders a row or counts a failure.** The engine
+   sets it on a culprit's end when another end, or a `FileFailed`, already announced the same
+   culprit (one box per culprit): it closes the target's row and nothing else. One with
+   `upstream_file` set and no `upstream_of` is a target of that broken file, skipped because of
+   its own file; the file's root already stands for it.
+6. **A `FileFailed` is a root**: a BUILD or `.bzl` file that did not evaluate, announced once per
+   file. Its `entry` is the address that led into it and its `file` is what a reader is shown.
+   The ends of the targets it took down carry `upstream_of: <entry>` and
+   `upstream_file: <file>`.
 
 Without rule 1, this same moment renders 4,117 rows of `dependency failed` and the actual proto
 error is off the bottom of a phone screen.
@@ -494,6 +503,30 @@ ResultEnd {
 free — the engine constructs `UpstreamFailed { root }` at that exact site
 (`crates/plugin/src/error.rs:195`).
 
+Error reporting (output contract 2) added three more, each `#[serde(default)]` and omitted when
+empty, plus one event kind:
+
+```rust
+ResultEnd {
+    // …the fields above…
+    #[serde(default)] upstream_file: Option<String>, // the BUILD/.bzl file that did not evaluate
+    #[serde(default)] path: Vec<String>,             // on a culprit's own end: requested → culprit
+    #[serde(default)] duplicate: bool,               // this culprit was already announced
+}
+FileFailed { file: String, entry: String, error: String, path: Vec<String> }
+```
+
+- `upstream_file` names a broken file in a path field, never in an address field. Beside
+  `upstream_of` (the address that led into the file) it marks a target the file took down; on a
+  `duplicate` end with no `upstream_of`, a target of the file itself.
+- `path` is the shortest path from a requested target to the culprit, as known when it failed.
+  A skipped end never carries one.
+- `duplicate` closes a row another end already reported: a consumer neither boxes it nor counts it.
+  **A consumer that predates `duplicate` counts that end again**, so `plugin-gh` must ship with the
+  host it reads (one release, not a skewed pair).
+- `FileFailed` is a file's own failure, announced once however many targets reached it. An older
+  consumer reads it as `Unknown`.
+
 ### Why retyping `error` was rejected
 
 `BuildEvent` is **already a live cross-process, cross-artifact boundary**, not the hypothetical one
@@ -753,6 +786,11 @@ line of a colon-joined chain serves it badly. Three surfaces, in priority order:
 3. **`<!-- heph:json {...} -->`** in the comment body, for an agent that fetches the comment via the
    API and has no filesystem access. The marker machinery already exists.
 
+A `failures[]` entry's `addr` is always an address: the entry it was reached through. For a target
+culprit that is the culprit; for a BUILD or `.bzl` file that did not evaluate (`file` set) it is
+the address that led into the file, a target the file would have defined. **`file`, when set, is
+what to show**: the thing that broke. Read `.file // .addr` for a name.
+
 `cache` counts **targets**: one per cacheable addr per request, so `local_hits + remote_hits +
 misses` is the number of cacheable targets the run consulted the cache for. `misses` includes
 `rebuilt` (hits whose blobs were gone, so the target built after all), and `targets.cached` is
@@ -886,7 +924,11 @@ either way.
 - **Gantt label sanitization**: a target addr's `:` never reaches the mermaid block.
 - **`parse_sections`** adversarial bodies: delimiters in content, `" -->"` in the key, newline in
   the key, empty body, container marker only.
-- **Failure dedup**: a duplicate `ResultEnd` for one addr adds no row.
+- **Failure dedup**: a duplicate `ResultEnd` for one addr adds no row, and an end with
+  `duplicate: true` neither adds a row nor counts a failure.
+- **File culprits**: a `FileFailed` is one root whose `file` is shown and whose `addr` is its
+  `entry`; the ends it took down (`upstream_of` = `entry`) count as blocked under it, and a
+  `duplicate` end naming the file closes its row and counts nothing.
 - **Out-of-band flush**: first failure flushes; a collateral failure does not; two roots within the
   10s floor coalesce.
 
