@@ -248,6 +248,14 @@ pub fn is_abandoned() -> bool {
 ///
 /// Only [`abandoned_token`] calls it, so whoever can wait on the token has
 /// left the caller's stack before it can.
+///
+/// Precondition, not checked at runtime: the yield's `Pending` must reach
+/// the memoizer's inline poll unchanged. Anything between the two that
+/// re-polls a future as soon as it wakes undoes the leave, and the body
+/// goes on on the same stack: a `FuturesUnordered`, a `try_join_all` over
+/// more than 30 futures (which is one), or a nested `block_on`, which
+/// re-polls it at once on a thread that is not a worker. Awaited straight
+/// down from the body, as an execute's awaits are, it holds.
 async fn leave_caller_stack() {
     if task_cell::current_polled_inline() {
         tokio::task::yield_now().await;
