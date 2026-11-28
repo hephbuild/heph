@@ -54,6 +54,15 @@ impl<H: Hasher> DebugHasher<H> {
         Self { inner, file }
     }
 
+    /// Write `line()` into the trace as `#:<line>`, hashing nothing: a name for
+    /// the bytes that follow, so a diff of two traces says what moved rather
+    /// than which hex did. `line` runs only while tracing.
+    pub fn note(&mut self, line: impl FnOnce() -> String) {
+        if self.file.is_some() {
+            self.log_val("#", line());
+        }
+    }
+
     fn log_bytes(&mut self, bytes: &[u8]) {
         let failed = if let Some(ref cell) = self.file {
             let mut f = cell.borrow_mut();
