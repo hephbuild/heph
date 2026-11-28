@@ -166,50 +166,15 @@ fn log_addr(rec: &FailureRecord) -> &str {
 /// How the run ended, for the header: its timeout, its exit, or a
 /// `--frozen` difference. `None` when the message says what went wrong.
 fn status(rec: &FailureRecord) -> Option<String> {
-    if let Some(t) = &rec.timed_out {
-        return Some(format!(
-            "timed out after {} (its timeout)",
-            hcore::units::format_duration(std::time::Duration::from_millis(t.timeout_ms))
-        ));
-    }
-    if let Some(exit) = &rec.exit {
-        return Some(match (exit.code, exit.signal) {
-            (Some(code), _) => format!("exit status {code}"),
-            (None, Some(sig)) => match signal_name(sig) {
-                Some(name) => format!("killed by signal {sig} ({name})"),
-                None => format!("killed by signal {sig}"),
-            },
-            (None, None) => clean_inline(exit.status.trim()).into_owned(),
+    if let Some(end) = rec.process_end() {
+        return Some(match clean_inline(&end) {
+            Cow::Borrowed(_) => end,
+            Cow::Owned(cleaned) => cleaned,
         });
     }
     rec.frozen_diff
         .as_ref()
         .map(|_| "generated output differs from tree".to_owned())
-}
-
-/// The name of a signal a process commonly dies of.
-fn signal_name(sig: i32) -> Option<&'static str> {
-    Some(match sig {
-        libc::SIGHUP => "SIGHUP",
-        libc::SIGINT => "SIGINT",
-        libc::SIGQUIT => "SIGQUIT",
-        libc::SIGILL => "SIGILL",
-        libc::SIGTRAP => "SIGTRAP",
-        libc::SIGABRT => "SIGABRT",
-        libc::SIGBUS => "SIGBUS",
-        libc::SIGFPE => "SIGFPE",
-        libc::SIGKILL => "SIGKILL",
-        libc::SIGUSR1 => "SIGUSR1",
-        libc::SIGSEGV => "SIGSEGV",
-        libc::SIGUSR2 => "SIGUSR2",
-        libc::SIGPIPE => "SIGPIPE",
-        libc::SIGALRM => "SIGALRM",
-        libc::SIGTERM => "SIGTERM",
-        libc::SIGXCPU => "SIGXCPU",
-        libc::SIGXFSZ => "SIGXFSZ",
-        libc::SIGSYS => "SIGSYS",
-        _ => return None,
-    })
 }
 
 /// A hint as a row: a near-miss name as the question it answers, any other
@@ -253,10 +218,7 @@ pub fn render_box(rec: &FailureRecord, ctx: &RenderCtx) -> String {
         b.row(&format!("+{} more", rec.more_causes));
     }
     if rec.timed_out.as_ref().is_some_and(|t| t.abandoned) {
-        b.row(
-            "abandoned: the run did not stop once cancelled and heph stopped waiting for it, \
-             so its process may still be running",
-        );
+        b.row(hcore::failure::ABANDONED);
     }
 
     let mut attached = None;
