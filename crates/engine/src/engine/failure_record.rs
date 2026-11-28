@@ -22,7 +22,8 @@ use hdriver_support::redact::{Needles, Redactor};
 use hmodel::htaddr::Addr;
 use hplugin::diagnostic::{Diagnostic, Stage, StageFrame, cause_frames, find_diagnostic};
 use hplugin::error::{
-    Culprit, FailureLog, FrozenCheckError, ProcessFailed, RemoteProcessFailed, TargetFailure,
+    Culprit, FailureLog, FrozenCheckError, MissingDep, ProcessFailed, RemoteProcessFailed,
+    TargetFailure,
 };
 use std::fmt;
 use std::sync::Arc;
@@ -133,12 +134,21 @@ pub(crate) fn compact(
     let mut diagnostic = match find_diagnostic(e) {
         Some(d) => d.clone(),
         None => {
-            let stage = hplugin::diagnostic::innermost_stage_frame(e)
-                .map(StageFrame::stage)
-                .unwrap_or(match culprit {
-                    Culprit::File(_) => Stage::Eval,
-                    Culprit::Target(_) => Stage::Run,
-                });
+            // A dependent blamed for an input that does not exist stopped
+            // linking its inputs; the innermost frame is the input's
+            // `get_def`, which would read as a parse failure.
+            let missing_dep = downcast_chain_ref::<MissingDep>(e)
+                .is_some_and(|m| culprit.target() == Some(&m.declarer));
+            let stage = if missing_dep {
+                Stage::Link
+            } else {
+                hplugin::diagnostic::innermost_stage_frame(e)
+                    .map(StageFrame::stage)
+                    .unwrap_or(match culprit {
+                        Culprit::File(_) => Stage::Eval,
+                        Culprit::Target(_) => Stage::Run,
+                    })
+            };
             Diagnostic::new(stage, own_message(e, &mut causes))
         }
     };
@@ -731,5 +741,41 @@ mod tests {
             Some(Stage::Link),
         );
         assert_eq!(rec.diagnostic.stage, Stage::Link);
+    }
+
+    /// STAGE-09: a dependent blamed for an input that does not exist failed
+    /// at link, although the innermost frame is the input's `get_def`; the
+    /// input's own not-found (no `MissingDep` naming it) stays a parse.
+    #[test]
+    fn missing_dep_is_the_declarers_link_failure() {
+        use hplugin::diagnostic::{Boundary, with_stage};
+        let missing = || {
+            with_stage(
+                anyhow::Error::new(hplugin::error::TargetNotFoundError {
+                    addr: addr("//d:missing"),
+                }),
+                Boundary::GetDef,
+                &addr("//d:missing"),
+            )
+        };
+        let e = with_stage(
+            missing().context(MissingDep {
+                dep: addr("//d:missing"),
+                declarer: addr("//d:t"),
+                origin_id: "deps".to_owned(),
+            }),
+            Boundary::GetDef,
+            &addr("//d:t"),
+        );
+        let rec = compact(&e, &target("//d:t"), &addr("//d:t"), &Scrub::default(), None);
+        assert_eq!(rec.diagnostic.stage, Stage::Link);
+        let rec = compact(
+            &missing(),
+            &target("//d:other"),
+            &addr("//d:other"),
+            &Scrub::default(),
+            None,
+        );
+        assert_eq!(rec.diagnostic.stage, Stage::Parse);
     }
 }
