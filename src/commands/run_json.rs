@@ -140,8 +140,8 @@ pub struct RunEntry {
     /// elided as text elides a path (this target, the first hop, the last
     /// two; `path_elided` counts the rest). Null elsewhere.
     pub path: Option<Vec<String>>,
-    /// On a `skipped` record whose `path` was elided: how many targets were
-    /// dropped from its middle. Absent otherwise (U23).
+    /// On a `skipped` record whose `path` was elided: how many addresses
+    /// were dropped from its middle. Absent otherwise (U23).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path_elided: Option<u64>,
     /// The selection named it. A culprit outside the selection is written

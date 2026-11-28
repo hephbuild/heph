@@ -500,10 +500,6 @@ mod tests {
         assert!(bad.is_err(), "only a value that is not a string fails");
     }
 
-    /// A credential-material run's in-memory tail never rides the wire: the
-    /// record on `ResultEnd`/`FileFailed` reaches `events.ndjson`, the
-    /// session store and hook plugins (E2, D7b). A wire copy that names one
-    /// decodes without it. In-process renderers read it off the record.
     /// The typed facts are additive: absent, a record decodes without them
     /// and encodes without the keys; a newer host's boundary name decodes as
     /// it is.
@@ -526,6 +522,10 @@ mod tests {
         );
     }
 
+    /// A credential-material run's in-memory tail never rides the wire: the
+    /// record on `ResultEnd`/`FileFailed` reaches `events.ndjson`, the
+    /// session store and hook plugins (E2, D7b). A wire copy that names one
+    /// decodes without it. In-process renderers read it off the record.
     #[test]
     fn memory_tail_never_serialized() {
         let rec = FailureRecord {
