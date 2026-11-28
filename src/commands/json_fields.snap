@@ -79,6 +79,7 @@ query	package	string	free	default
 run	addr	string?	free	default
 run	cache	"local"	free	default
 run	cache	"miss"	free	default
+run	cache	"none"	free	default
 run	cache	"remote"	free	default
 run	cache	string?	free	default
 run	duration_ms	number	free	default

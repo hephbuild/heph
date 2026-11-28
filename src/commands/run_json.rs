@@ -76,6 +76,10 @@ pub enum CacheTier {
     Remote,
     /// No cache had it, so it ran.
     Miss,
+    /// The target does not cache (`cache = False`), so no cache was
+    /// looked in and it ran (U22).
+    #[serde(rename = "none")]
+    Uncached,
 }
 
 /// What a failed run left in its failure slot, as `heph inspect failure`
@@ -106,8 +110,9 @@ pub struct RunEntry {
     pub file: Option<String>,
     /// How it ended: cached, ran, failed, skipped or cancelled.
     pub outcome: Outcome,
-    /// The cache lookup: local, remote or miss; null when no cache was
-    /// consulted (caching off, `--force`, or it failed before the lookup).
+    /// The cache lookup: local, remote or miss; none when the target does
+    /// not cache (`cache = False`) and ran; null when no cache was consulted
+    /// for another reason (`--force`, or it failed before its run).
     pub cache: Option<CacheTier>,
     /// The name of the remote cache a `remote` hit came from; null otherwise.
     pub remote: Option<String>,
@@ -392,8 +397,14 @@ impl Fold {
                 live.start_ms.get_or_insert(ev.at_unix_ms);
                 Vec::new()
             }
-            BuildEventKind::ExecuteStart { addr, .. } => {
-                self.live.entry(addr.clone()).or_default().ran = true;
+            BuildEventKind::ExecuteStart { addr, cache, .. } => {
+                let live = self.live.entry(addr.clone()).or_default();
+                live.ran = true;
+                // A target that does not cache emits no cache outcome: its
+                // record says so rather than reading as unknown (U22).
+                if !*cache {
+                    live.cache.get_or_insert(CacheTier::Uncached);
+                }
                 Vec::new()
             }
             BuildEventKind::CacheOutcome { addr, outcome, .. } => {
@@ -1918,6 +1929,38 @@ mod tests {
         );
         assert_eq!(entries[2].outcome, Outcome::Failed);
         assert!(entries[2].timed_out);
+    }
+
+    /// U22: a `cache = False` target that ran, failed or not, reads
+    /// `cache: "none"`; one that never reached its run stays null.
+    #[test]
+    fn uncached_target_reads_cache_none() {
+        let uncached = |addr: &str| {
+            let mut e = execute(addr);
+            if let BuildEventKind::ExecuteStart { cache, .. } = &mut e {
+                *cache = false;
+            }
+            e
+        };
+        let (entries, _) = fold(vec![
+            ev(0, matched(&["//p:ok", "//p:bad", "//p:early"], true)),
+            ev(1, uncached("//p:ok")),
+            ev(2, end("//p:ok", None, None)),
+            ev(3, uncached("//p:bad")),
+            ev(4, end("//p:bad", Some("exit status 3"), None)),
+            ev(5, end("//p:early", Some("parse"), None)),
+        ]);
+        let got: Vec<_> = entries.iter().map(|e| (e.outcome, e.cache)).collect();
+        assert_eq!(
+            got,
+            [
+                (Outcome::Ran, Some(CacheTier::Uncached)),
+                (Outcome::Failed, Some(CacheTier::Uncached)),
+                (Outcome::Failed, None),
+            ]
+        );
+        let json = serde_json::to_value(&entries[1]).expect("json");
+        assert_eq!(json["cache"], "none");
     }
 
     fn collected(whole: bool, cancelled: bool) -> Collected<()> {

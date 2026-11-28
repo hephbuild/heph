@@ -248,7 +248,7 @@ Each record is output contract 2 (`heph version --json` reports
 | `addr` | yes | the target's address; null for a BUILD file that did not evaluate, whose path is in `file`. Read `.addr // .file` for a name every record has |
 | `file` | yes | the workspace-relative BUILD or `.bzl` file that did not evaluate; null on every other record |
 | `outcome` | yes | `cached`, `ran`, `failed`, `skipped` or `cancelled` |
-| `cache` | yes | `local`, `remote` or `miss`; null when no cache was consulted (`--force`, caching off, or it failed before the lookup) |
+| `cache` | yes | `local`, `remote` or `miss`; `none` when the target does not cache (`cache = False`) and ran, failed run included; null when no cache was consulted for another reason (`--force`, or it failed before its run) |
 | `remote` | yes | the name of the remote cache a `remote` hit came from; null otherwise |
 | `duration_ms` | yes | from the start of its resolution to its end |
 | `exit_code` | yes | its process's exit code: 0 for `ran`, the code for a `failed` run; null when nothing ran or a signal ended it. Read from the run's structured exit status, never parsed out of the error text |
@@ -272,7 +272,8 @@ Each record is output contract 2 (`heph version --json` reports
 How the outcome is decided:
 
 - `cached`: no process ran; the result came from a cache (`cache` says which).
-- `ran`: it ran and succeeded (`cache: miss`, or null under `--force`). A
+- `ran`: it ran and succeeded (`cache: miss`, `none` for a `cache = False`
+  target, or null under `--force`). A
   cache hit whose blobs turned out to be gone is rebuilt, and reads as a miss.
 - `failed`: its own run failed, or resolving it did (parse, hash, sandbox).
 - `skipped`: it did not run because a culprit it depends on failed (`root`
